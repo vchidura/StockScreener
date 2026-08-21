@@ -1,0 +1,16 @@
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+psycopg2-binary>=2.9.9
+pandas>=2.2.0
+yfinance>=0.2.36
+finnhub-python>=2.4.19
+websocket-client>=1.7.0
+python-dotenv>=1.0.0
+pydantic>=2.5.3
+numpy>=1.26.3
+pytz>=2024.1
+requests>=2.31.0
+
+[dev]
+pytest>=7.0.0
+httpx>=0.25.0

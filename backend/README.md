@@ -92,7 +92,7 @@ Create a `.env` file:
 ```env
 DB_NAME=stocks_db
 DB_USER=vamsh100
-DB_PASSWORD=<your_app_db_password>
+DB_PASSWORD=your_app_db_password
 DB_HOST=127.0.0.1
 DB_PORT=5433
 TWELVEDATA_API_KEY=your_api_key

@@ -23,6 +23,7 @@ from research.features import load_daily_panel  # noqa: E402
 logger = logging.getLogger("market-discovery")
 MIN_PRIOR_UNIVERSE_RATIO = 0.90
 CURRENT_LOOKBACK_CALENDAR_DAYS = 550
+DISCOVERY_RETENTION_SESSIONS = 252
 
 
 def ensure_table() -> None:
@@ -129,6 +130,18 @@ def persist(states: pd.DataFrame) -> int:
                 %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb
             )
         """, rows)
+        cur.execute("""
+            WITH retained_dates AS (
+                SELECT DISTINCT trade_date
+                FROM market_discovery_states
+                ORDER BY trade_date DESC
+                LIMIT %s
+            ), cutoff AS (
+                SELECT MIN(trade_date) AS trade_date FROM retained_dates
+            )
+            DELETE FROM market_discovery_states
+            WHERE trade_date < (SELECT trade_date FROM cutoff)
+        """, (DISCOVERY_RETENTION_SESSIONS,))
     return len(rows)
 
 

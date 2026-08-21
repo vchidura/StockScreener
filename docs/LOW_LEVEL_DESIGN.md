@@ -22,20 +22,6 @@ CREATE TABLE stock_prices_hourly (
 CREATE INDEX idx_ticker_hourly ON stock_prices_hourly (ticker);
 CREATE INDEX idx_datetime_hourly ON stock_prices_hourly (datetime);
 CREATE INDEX idx_ticker_datetime_hourly ON stock_prices_hourly (ticker, datetime DESC);
-
--- Gap scan results cache
-CREATE TABLE gap_scan_results (
-    id SERIAL PRIMARY KEY,
-    scan_date TIMESTAMP DEFAULT NOW(),
-    ticker TEXT NOT NULL,
-    gap_type TEXT NOT NULL,
-    gap_low REAL,
-    gap_high REAL,
-    last_close REAL,
-    gap_diff REAL,
-    gap_date DATE,
-    UNIQUE (scan_date, ticker, gap_type)
-);
 ```
 
 ### 1.2 Planned Tables

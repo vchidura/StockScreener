@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS scanner_event_occurrences (
 
 CREATE INDEX IF NOT EXISTS idx_scanner_occurrences_time
     ON scanner_event_occurrences (signal_time DESC);
+CREATE INDEX IF NOT EXISTS idx_scanner_occurrences_trade_date
+    ON scanner_event_occurrences (trade_date DESC);
 CREATE INDEX IF NOT EXISTS idx_scanner_occurrences_event
     ON scanner_event_occurrences (event_id, signal_time);
 

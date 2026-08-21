@@ -196,18 +196,20 @@
 
 #### ✅ Day 1: Database Deployment (30 min)
 ```bash
-# Execute migration 004 (creates 5 new tables)
+# Execute migration 004 (creates 7 recommendation and context tables)
 psql -U postgres -d stock_screener -f backend/migrations/004_daily_recommendations_tracking.sql
 
 # Verify tables created
-psql -U postgres -d stock_screener -c "\dt daily_recommendations*"
+psql -U postgres -d stock_screener -c "\dt"
 ```
 
 **Expected Output**:
 ```
+opening_pattern_scores
+pattern_win_rate_priors
+pattern_analog_matches
 daily_recommendations
 recommendation_performance_log
-pattern_weight_adjustments
 sector_regime_daily
 market_context_daily
 ```
@@ -312,19 +314,8 @@ Rationale:
 ```
 
 **Step 3: Apply & Monitor**
-```
--- Insert adjustment record
-INSERT INTO pattern_weight_adjustments (
-    effective_date, pattern_name, previous_weight, new_weight,
-    reason, performance_metric, required_accuracy_threshold
-) VALUES (
-    '2026-08-14', 'volatility', 30, 25,
-    'Win rate 52% < 55% threshold', 52.0, 65.0
-);
-
--- Recompute all future recommendations with new weights
--- Monitor for 5 days to see impact
-```
+Update the recommendation scoring configuration, document the review decision,
+and monitor the next five trading days before making another change.
 
 **Step 4: Monitor Impact**
 ```
@@ -557,7 +548,7 @@ A: Yes - change `[:10]` to `[:5]` or `[:20]` in daily_recommendations_generator.
 A: Tracker script checks if trade_date exists in database; skips if no recommendations found
 
 **Q: How do I manually adjust pattern weights?**  
-A: Use pattern_weight_adjustments table - insert row, set approved=true, system uses new weights next run
+A: The generator does not currently support runtime weight overrides. Change its scoring configuration and validate the result before deployment.
 
 **Q: Can I backtest on historical data?**  
 A: Yes - run generator for past 60 days with `--date YYYY-MM-DD`, then tracker for same dates

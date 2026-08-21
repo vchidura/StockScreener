@@ -1,0 +1,92 @@
+Metadata-Version: 2.4
+Name: stock-screener-api
+Version: 1.2.0
+Summary: Stock Screener API - FastAPI backend for technical analysis
+Author-email: Vamshi <vchidurala@example.com>
+License-Expression: MIT
+Project-URL: Homepage, https://github.com/vchidurala/stock-screener-portal
+Classifier: Development Status :: 4 - Beta
+Classifier: Framework :: FastAPI
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.109.0
+Requires-Dist: uvicorn[standard]>=0.27.0
+Requires-Dist: psycopg2-binary>=2.9.9
+Requires-Dist: pandas>=2.2.0
+Requires-Dist: yfinance>=0.2.36
+Requires-Dist: finnhub-python>=2.4.19
+Requires-Dist: websocket-client>=1.7.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: pydantic>=2.5.3
+Requires-Dist: numpy>=1.26.3
+Requires-Dist: pytz>=2024.1
+Requires-Dist: requests>=2.31.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Requires-Dist: httpx>=0.25.0; extra == "dev"
+
+# Stock Screener API
+
+FastAPI backend for technical stock analysis and screening strategies.
+
+## Installation
+
+### From Wheel Package
+```bash
+pip install stock_screener_api-1.0.0-py3-none-any.whl
+```
+
+### From Source
+```bash
+pip install .
+```
+
+## Usage
+
+### Run API Server
+```bash
+# Default (port 8001)
+stock-screener
+
+# Custom port
+stock-screener --port 8080
+
+# Production with multiple workers
+stock-screener --workers 4
+
+# Development with auto-reload
+stock-screener --reload
+
+# Custom .env file
+stock-screener --env-file /path/to/.env
+```
+
+### Environment Configuration
+Create a `.env` file:
+```env
+DB_NAME=stocks_db
+DB_USER=postgres
+DB_PASSWORD=your_password
+DB_HOST=localhost
+DB_PORT=5432
+TWELVEDATA_API_KEY=your_api_key
+```
+
+## API Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/scan/gaps` | Gap up/down scanner |
+| `GET /api/scan/ma-crossover` | Moving average crossover |
+| `GET /api/scan/momentum-pullback` | Momentum pullback signals |
+| `GET /api/scan/bearish-bounce` | Bearish bounce setups |
+| `GET /api/scan/fibonacci` | Fibonacci retracement levels |
+| `GET /api/tickers` | List available tickers |
+| `GET /docs` | Interactive API documentation |
+
+## License
+
+MIT

@@ -4,6 +4,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -26,6 +27,7 @@ HORIZONS = {"1d": (5, 10, 21), "1wk": (5, 10, 21), "1h": (7, 21, 35)}
 LOOKBACK_DAYS = {"1d": 420, "1wk": 1800, "1h": 60}
 BATCH_SIZE = 10
 BACKFILL_BATCH_SIZE = 5
+OCCURRENCE_RETENTION_DATES = 252
 ACTIVE_DISCOVERY_STATES = {
     "CONTINUATION", "REVERSAL_WATCH", "EMERGING_REVERSAL",
     "REVERSAL_CONFIRMED", "CONFLICT", "LAGGARD",
@@ -121,6 +123,7 @@ def ensure_tables() -> None:
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_scanner_occurrences_time ON scanner_event_occurrences (signal_time DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_scanner_occurrences_trade_date ON scanner_event_occurrences (trade_date DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_scanner_occurrences_event ON scanner_event_occurrences (event_id, signal_time)")
 
 
@@ -295,6 +298,61 @@ def _capture_batch(panel: pd.DataFrame, interval: str, states: dict[str, str],
     return _composite_event_rows(events, interval, states, capture_date)
 
 
+def _occurrence_count_updates(
+    event_ids: dict[str, int],
+    existing_event_keys: set[str],
+    occurrence_keys: set[tuple[int, datetime]],
+    existing_occurrences: set[tuple[int, datetime]],
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]], set[tuple[int, datetime]]]:
+    newly_inserted = occurrence_keys - existing_occurrences
+    inserted_by_event = Counter(event_id for event_id, _ in newly_inserted)
+    new_event_ids = {
+        event_ids[event_key] for event_key in event_ids
+        if event_key not in existing_event_keys
+    }
+    replacements = sorted(
+        (count, event_id) for event_id, count in inserted_by_event.items()
+        if event_id in new_event_ids
+    )
+    increments = sorted(
+        (count, event_id) for event_id, count in inserted_by_event.items()
+        if event_id not in new_event_ids
+    )
+    return replacements, increments, newly_inserted
+
+
+def prune_occurrence_history(retain_dates: int = OCCURRENCE_RETENTION_DATES) -> dict:
+    """Keep recent occurrence detail plus each ticker/interval's latest row."""
+    if retain_dates < 1:
+        raise ValueError("retain_dates must be at least 1")
+    with get_db_cursor() as cur:
+        cur.execute("""
+            WITH recent_dates AS (
+                SELECT DISTINCT trade_date
+                FROM scanner_event_occurrences
+                ORDER BY trade_date DESC
+                LIMIT %s
+            ), latest_per_ticker_interval AS (
+                SELECT DISTINCT ON (e.interval, e.ticker) o.occurrence_id
+                FROM scanner_event_occurrences o
+                JOIN scanner_events e USING (event_id)
+                ORDER BY e.interval, e.ticker, o.signal_time DESC, o.occurrence_id DESC
+            ), deleted AS (
+                DELETE FROM scanner_event_occurrences o
+                WHERE o.trade_date NOT IN (SELECT trade_date FROM recent_dates)
+                  AND o.occurrence_id NOT IN (
+                      SELECT occurrence_id FROM latest_per_ticker_interval
+                  )
+                RETURNING 1
+            )
+            SELECT COUNT(*)::integer AS deleted FROM deleted
+        """, (retain_dates,))
+        deleted = int(cur.fetchone()["deleted"])
+        cur.execute("SELECT COUNT(*)::integer AS retained FROM scanner_event_occurrences")
+        retained = int(cur.fetchone()["retained"])
+    return {"retained_dates": retain_dates, "retained": retained, "deleted": deleted}
+
+
 def _persist_event_rows(rows: list[tuple]) -> dict:
     """Upsert lifecycles and insert each observed timestamp exactly once."""
     if not rows:
@@ -389,17 +447,19 @@ def _persist_event_rows(rows: list[tuple]) -> dict:
                 risk_per_share = EXCLUDED.risk_per_share,
                 metadata = EXCLUDED.metadata
         """, occurrence_rows)
-        occurrences_inserted = len(set(occurrence_keys) - existing_occurrences)
-        cur.execute("""
-            UPDATE scanner_events e SET occurrence_count = counts.n
-            FROM (
-                SELECT event_id, COUNT(*)::integer AS n
-                FROM scanner_event_occurrences
-                WHERE event_id = ANY(%s)
-                GROUP BY event_id
-            ) counts
-            WHERE e.event_id = counts.event_id
-        """, (list(event_ids.values()),))
+        replacements, increments, newly_inserted = _occurrence_count_updates(
+            event_ids, existing, set(occurrence_keys), existing_occurrences,
+        )
+        cur.executemany(
+            "UPDATE scanner_events SET occurrence_count = %s WHERE event_id = %s",
+            replacements,
+        )
+        cur.executemany("""
+            UPDATE scanner_events
+            SET occurrence_count = occurrence_count + %s
+            WHERE event_id = %s
+        """, increments)
+        occurrences_inserted = len(newly_inserted)
     return {
         "matched": len(occurrence_rows), "lifecycles": len(lifecycle_rows),
         "inserted": len(set(keys) - existing),

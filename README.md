@@ -35,7 +35,11 @@ machine-specific executables and paths.
 ### 1. Transfer the Repository
 
 Clone the repository or copy the complete `stock-screener-portal` folder,
-including `backend/backups/stocks_db_backup.dump`, to the new machine.
+including `backend/backups/stocks_db_backup_v4_2026-08-21.dump`, to the new machine.
+
+The current full dump is about 101 MiB, which exceeds GitHub's 100 MB limit
+for regular Git objects. Store it with Git LFS or transfer it separately rather
+than committing it as a normal Git blob.
 
 ```powershell
 git clone <repository-url>
@@ -69,13 +73,13 @@ Get-Service 'postgresql*'
 
 # Create the app role and database (run as the postgres superuser)
 $env:PGPASSWORD = "<postgres_admin_password>"
-& "$pg\psql.exe" -U postgres -h localhost -c "CREATE ROLE vamsh100 LOGIN SUPERUSER PASSWORD '<postgres_admin_password>';"
+& "$pg\psql.exe" -U postgres -h localhost -c "CREATE ROLE vamsh100 LOGIN SUPERUSER PASSWORD 'password1234';"
 & "$pg\psql.exe" -U postgres -h localhost -c "CREATE DATABASE stocks_db OWNER vamsh100;"
 
 # Restore the data
-$env:PGPASSWORD = "<postgres_admin_password>"
+$env:PGPASSWORD = "#password1234"
 & "$pg\pg_restore.exe" -U vamsh100 -h localhost -p 5432 -d stocks_db `
-    --no-owner --no-privileges ".\backend\backups\stocks_db_backup.dump"
+	--no-owner --no-privileges ".\backend\backups\stocks_db_backup_v4_2026-08-21.dump"
 ```
 
 Verify that the restore contains application tables and data:
@@ -113,7 +117,7 @@ Edit `backend/.env` and use the same database settings used during the restore:
 ```env
 DB_NAME=stocks_db
 DB_USER=vamsh100
-DB_PASSWORD=<postgres_admin_password>
+DB_PASSWORD=password1234
 DB_HOST=localhost
 DB_PORT=5432
 TWELVEDATA_API_KEY=
@@ -202,6 +206,42 @@ npm.cmd run dev
 
 `backend/scripts/run_scheduler.py` keeps the database current. Run it from the
 repository root so the relative paths resolve.
+
+### Create a full database backup
+
+The backup script writes to a `.partial` file, validates the PostgreSQL catalog,
+and only then publishes the final versioned dump:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+	.\backend\scripts\backup_database.ps1 -Version v4
+```
+
+Use a new version for each retained backup. Add `-Replace` only when intentionally
+rebuilding the same version; the script refuses to run while another dump is writing it.
+
+Create a complete empty portal schema containing all application tables, indexes,
+constraints, and sequences but no rows:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+	.\backend\scripts\backup_database.ps1 -Version v2 -Mode SchemaOnly
+```
+
+Use this archive to bootstrap an empty database on another machine before regenerating
+all configuration, market data, signals, and outcomes. Use the full backup when the target
+must preserve current application data.
+
+The narrower `MarketSchema` mode contains only the `selected_tickers`, daily, hourly,
+and intraday schemas:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+	.\backend\scripts\backup_database.ps1 -Version v1 -Mode MarketSchema
+```
+
+Restore either schema archive into an empty database with `pg_restore`. Neither contains
+ticker configuration, prices, signals, or outcomes.
 
 ### Run today's end-of-day update
 
@@ -357,6 +397,12 @@ is extended. Extension alone does not imply reversal; an early trigger requires 
 while confirmation requires a SMA20 break/reclaim and reversed swing structure. The overlay is
 descriptive, does not overwrite scanner evidence or Review Priority, and is persisted only when
 the current EOD snapshot runs. Existing historical rows are not rewritten.
+
+Discovery snapshots retain the latest 252 trading sessions. Older discovery rows are derived
+data and can be reconstructed from daily price history during qualification backfills. Scanner
+events and outcomes remain full-history because they supply the qualification sample. Occurrence
+detail retains 252 dates plus the latest ticker/interval row, while `scanner_events` preserves the
+lifetime observation count.
 
 Use `--dry-run` to inspect the state and overlay counts without persistence. The Dashboard, ticker
 detail and Scanner Evaluation views show current extension risk separately from historical signal

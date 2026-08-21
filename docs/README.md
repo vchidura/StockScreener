@@ -77,7 +77,7 @@ stock-screener-portal/
    TWELVEDATA_API_KEY=your_key_here
    ```
 
-3. Tables (`stock_prices_hourly`, `gap_scan_results`, `selected_tickers`) are auto-created on backend startup.
+3. The `selected_tickers` table is created on backend startup. Restore the schema archive or run migrations for the remaining tables.
 
 ---
 

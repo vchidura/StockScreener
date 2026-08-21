@@ -254,34 +254,7 @@ CREATE TABLE IF NOT EXISTS recommendation_performance_log (
 CREATE INDEX idx_perf_log_date ON recommendation_performance_log(report_date DESC);
 
 
--- Table 6 (EXISTING): Pattern Weight Adjustments (weekly reviews, manually approved or auto-applied)
-CREATE TABLE IF NOT EXISTS pattern_weight_adjustments (
-    adj_id BIGSERIAL PRIMARY KEY,
-    effective_date DATE NOT NULL,
-    pattern_name VARCHAR(50) NOT NULL,  -- 'breakout', 'vwap', 'volatility', 'trend', 'rs', 'calendar'
-    
-    -- Before and after weights
-    previous_weight INT CHECK (previous_weight >= 0 AND previous_weight <= 100),
-    new_weight INT CHECK (new_weight >= 0 AND new_weight <= 100),
-    adjustment_points INT,  -- +5, -3, etc.
-    
-    reason VARCHAR(255),  -- "Win rate dropped to 40%, lowering weight"
-    performance_metric DECIMAL(5,2),  -- Actual accuracy %
-    required_accuracy_threshold DECIMAL(5,2),  -- Minimum required accuracy %
-    
-    -- Approval tracking
-    reviewed_by VARCHAR(100) DEFAULT 'system',
-    approved BOOLEAN DEFAULT FALSE,
-    approval_date DATE,
-    
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_weight_adj_date ON pattern_weight_adjustments(effective_date DESC);
-CREATE INDEX idx_weight_adj_pattern ON pattern_weight_adjustments(pattern_name);
-
-
--- Table 7 (EXISTING): Sector-Specific Metrics (for multi-regime tracking)
+-- Table 6 (EXISTING): Sector-Specific Metrics (for multi-regime tracking)
 CREATE TABLE IF NOT EXISTS sector_regime_daily (
     sector_regime_id BIGSERIAL PRIMARY KEY,
     trade_date DATE NOT NULL,
@@ -314,7 +287,7 @@ CREATE TABLE IF NOT EXISTS sector_regime_daily (
 CREATE INDEX idx_sector_regime_date_sector ON sector_regime_daily(trade_date DESC, sector);
 
 
--- Table 8 (EXISTING): Daily Market Context Summary (SPY, QQQ, DIA, IWM at open)
+-- Table 7 (EXISTING): Daily Market Context Summary (SPY, QQQ, DIA, IWM at open)
 CREATE TABLE IF NOT EXISTS market_context_daily (
     context_id BIGSERIAL PRIMARY KEY,
     trade_date DATE NOT NULL UNIQUE,
@@ -432,13 +405,12 @@ CREATE INDEX idx_market_context_date ON market_context_daily(trade_date DESC);
 --
 -- recommendation_performance_log
 --   ├─ DEPENDS ON: daily_recommendations
---   └─ USED BY: pattern_weight_adjustments, weekly review
+--   └─ USED BY: daily_recommendations_tracker
 --
 
 
 -- Grants for application user (if using role-based access)
 -- GRANT SELECT, INSERT, UPDATE ON daily_recommendations TO stock_screener_app;
 -- GRANT SELECT, INSERT ON recommendation_performance_log TO stock_screener_app;
--- GRANT SELECT ON pattern_weight_adjustments TO stock_screener_app;
 -- GRANT SELECT ON sector_regime_daily TO stock_screener_app;
 -- GRANT SELECT ON market_context_daily TO stock_screener_app;

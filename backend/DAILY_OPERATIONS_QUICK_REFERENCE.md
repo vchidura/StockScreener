@@ -267,7 +267,7 @@ At Friday 5 PM, answer these questions:
    │  └─ Decision: Reduce weight by 5 points
    ├─ Pattern B: 48% accuracy
    │  └─ Decision: Reduce weight by 10 points
-   └─ Document in pattern_weight_adjustments table
+  └─ Document the decision in the weekly review
 
 4. Is confidence calibration ±5% error?
    ├─ YES → Calibration OK, no adjustment
@@ -331,11 +331,9 @@ DECISION:
   2. Calendar: Reduce weight from 15 → 8 (-7 points)
   3. Monitor bear recommendations (48% < 60% target)
 
-DATABASE UPDATE:
-  INSERT INTO pattern_weight_adjustments VALUES (
-    '2026-08-14', 'volatility', 20, 15,
-    'Win rate 52% < 55% threshold', 52.0, 65.0
-  )
+IMPLEMENTATION UPDATE:
+  Update the recommendation scoring configuration and record the change
+  in the weekly review before the next generator run.
   
 EXPECTED IMPACT:
   • Volatility-heavy signals now less aggressive

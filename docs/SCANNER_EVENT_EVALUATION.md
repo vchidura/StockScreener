@@ -345,7 +345,9 @@ advance `last_seen_at`, and increment `occurrence_count`.
 
 `scanner_event_occurrences` stores one unique `(event_id, signal_time)` row for each live or
 replayed appearance. This makes historical replay idempotent while preserving one lifecycle for
-an anchored setup that remains visible across adjacent bars.
+an anchored setup that remains visible across adjacent bars. The ledger retains the latest 252
+occurrence dates plus the latest row for every ticker and interval. `scanner_events.occurrence_count`
+remains a lifetime count, while old occurrence detail can be reconstructed during replay.
 
 ## Outcomes
 

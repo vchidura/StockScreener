@@ -69,7 +69,7 @@ def get_db_connection():
     try:
         yield conn
     finally:
-        _pool.putconn(conn, close=bool(conn.closed))
+        _pool.putconn(conn)
 
 
 @contextmanager
@@ -82,12 +82,10 @@ def get_db_cursor(dict_cursor=True):
             yield cursor
             conn.commit()
         except Exception:
-            if not conn.closed:
-                conn.rollback()
+            conn.rollback()
             raise
         finally:
-            if not cursor.closed:
-                cursor.close()
+            cursor.close()
 
 
 def get_distinct_tickers():
@@ -103,76 +101,6 @@ def get_latest_price_date() -> str:
         cursor.execute("SELECT MAX(datetime::date) AS latest_date FROM stock_prices_daily")
         row = cursor.fetchone()
         return str(row["latest_date"]) if row and row["latest_date"] else None
-
-
-def get_latest_quote(ticker: str) -> dict | None:
-    """Return the newest stored price and its change from the prior daily close."""
-    with get_db_cursor() as cursor:
-        cursor.execute(
-            """
-            WITH daily AS (
-                SELECT close_price, datetime AS as_of, datetime::date AS trade_date,
-                       'daily' AS source, 1 AS priority
-                FROM stock_prices_daily
-                WHERE ticker = %s
-                ORDER BY datetime DESC
-                LIMIT 1
-            ), hourly AS (
-                SELECT close_price, datetime AS as_of,
-                       (datetime AT TIME ZONE 'America/New_York')::date AS trade_date,
-                       '1h' AS source, 2 AS priority
-                FROM stock_prices_hourly
-                WHERE ticker = %s
-                ORDER BY datetime DESC
-                LIMIT 1
-            ), intraday AS (
-                SELECT close_price, datetime AS as_of,
-                       (datetime AT TIME ZONE 'America/New_York')::date AS trade_date,
-                       '5m' AS source, 3 AS priority
-                FROM stock_prices_intraday
-                WHERE ticker = %s AND interval = '5m'
-                ORDER BY datetime DESC
-                LIMIT 1
-            ), latest AS (
-                SELECT * FROM (
-                    SELECT * FROM daily
-                    UNION ALL SELECT * FROM hourly
-                    UNION ALL SELECT * FROM intraday
-                ) prices
-                ORDER BY trade_date DESC, as_of DESC, priority DESC
-                LIMIT 1
-            )
-            SELECT latest.close_price AS price, latest.as_of, latest.trade_date,
-                   latest.source, previous.close_price AS previous_close
-            FROM latest
-            LEFT JOIN LATERAL (
-                SELECT close_price
-                FROM stock_prices_daily
-                WHERE ticker = %s AND datetime::date < latest.trade_date
-                ORDER BY datetime DESC
-                LIMIT 1
-            ) previous ON TRUE
-            """,
-            (ticker, ticker, ticker, ticker),
-        )
-        row = cursor.fetchone()
-
-    if not row:
-        return None
-
-    price = float(row["price"])
-    previous_close = float(row["previous_close"]) if row["previous_close"] is not None else None
-    change = price - previous_close if previous_close is not None else None
-    return {
-        "ticker": ticker,
-        "price": price,
-        "previous_close": previous_close,
-        "change": change,
-        "change_percent": (change / previous_close * 100) if previous_close else None,
-        "as_of": row["as_of"],
-        "trade_date": row["trade_date"],
-        "source": row["source"],
-    }
 
 
 def get_stock_data(ticker: str, days: int = 365):

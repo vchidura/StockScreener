@@ -110,7 +110,9 @@ dist/
 |------|-------------|----------|
 | `stock_screener_api-1.1.0-py3-none-any.whl` | Backend API package | `backend/dist/` |
 | `frontend/dist/` | Pre-built frontend (run `npm run build` first) | `frontend/dist/` |
-| `stocks_db_backup.dump` | Database backup with all data | `backend/backups/` |
+| `stocks_db_backup_v4_2026-08-21.dump` | Database backup with all data and the cleaned 18-table schema | `backend/backups/` |
+| `stocks_db_schema_v2_2026-08-21.dump` | Complete empty 18-table application database schema | `backend/backups/` |
+| `stocks_market_schema_v1_2026-08-21.dump` | Empty ticker and market-price table schemas | `backend/backups/` |
 
 ### Prerequisites on Target Machine
 
@@ -124,7 +126,7 @@ dist/
 
 ```bash
 createdb -U postgres stocks_db
-pg_restore -U postgres -h localhost -d stocks_db stocks_db_backup.dump
+pg_restore -U postgres -h localhost -d stocks_db stocks_db_backup_v4_2026-08-21.dump
 ```
 
 ### Step 2: Install Backend API
@@ -303,26 +305,19 @@ psql -U postgres -d stocks_db -c "SELECT COUNT(DISTINCT ticker) FROM stock_price
 
 ## Database Migrations (Schema Versioning)
 
-**Purpose**: Database migrations track schema changes (CREATE TABLE, ALTER TABLE, ADD COLUMN) in version-controlled files. This is useful when:
-- You need to add new columns or tables in production
-- Multiple developers work on the database schema
-- You want rollback capability for schema changes
-
-**Note**: Migrations are for **schema evolution**, not data backup. Use the backup commands above to preserve your data.
+Migration files are plain SQL under `backend/migrations/` and are applied manually in
+numeric order. Back up the database first, then stop application writers before applying
+a schema-changing migration.
 
 ```bash
-# Install alembic
-pip install alembic
-
-# Initialize
-alembic init migrations
-
-# Create migration
-alembic revision --autogenerate -m "Initial tables"
-
-# Apply migrations
-alembic upgrade head
+# Apply the unused-table cleanup to an existing database.
+psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" \
+  -f backend/migrations/013_remove_unused_tables.sql
 ```
+
+Migration `013` is idempotent. It removes only `stock_data`, `gap_scan_results`, and
+`pattern_weight_adjustments`; use the v4 full backup as the rollback point. New databases
+can instead be restored from the complete schema archive.
 
 ---
 

@@ -13,7 +13,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 from research.scanner_events import (
     backfill_events, capture_events, ensure_tables, evaluate_outcomes,
-    qualification_backfill, reset_stale_outcomes,
+    prune_occurrence_history, qualification_backfill, reset_stale_outcomes,
 )
 
 logging.basicConfig(
@@ -33,6 +33,7 @@ def run_pipeline(intervals: tuple[str, ...] = ("1d", "1h"),
         captured = capture_events(interval, as_of=as_of)
         results[interval] = {"evaluated": evaluated, "captured": captured}
         logger.info("[%s] evaluated=%s captured=%s", interval, evaluated, captured)
+    results["retention"] = prune_occurrence_history()
     return results
 
 
@@ -117,6 +118,8 @@ def main() -> int:
                 "evaluated": evaluate_outcomes(interval),
                 "captured": capture_events(interval, as_of=args.date),
             })
+    if not args.evaluate_only:
+        print("retention", prune_occurrence_history())
     return 0
 
 
