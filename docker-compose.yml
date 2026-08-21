@@ -1,0 +1,81 @@
+version: "3.8"
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    container_name: stock-screener-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-stocks_db}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/backups/stocks_db_backup.dump:/docker-entrypoint-initdb.d/stocks_db_backup.dump:ro
+      - ./backend/scripts/00_restore_database.sh:/docker-entrypoint-initdb.d/00_restore_database.sh:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-stocks_db} && psql -U ${DB_USER:-postgres} -d ${DB_NAME:-stocks_db} -tAc \"SELECT to_regclass('public.stock_prices_daily') IS NOT NULL\" | grep -q t",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: stock-screener-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_NAME: ${DB_NAME:-stocks_db}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-changeme}
+      DB_HOST: db
+      DB_PORT: 5432
+    ports:
+      - "8001:8001"
+
+  # React Frontend (Nginx)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: stock-screener-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+
+  # Price Update Scheduler (all jobs: 5m, hourly, daily)
+  scheduler:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: stock-screener-scheduler
+    command: python scripts/run_scheduler.py
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_NAME: ${DB_NAME:-stocks_db}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-changeme}
+      DB_HOST: db
+      DB_PORT: 5432
+      TWELVEDATA_API_KEY: ${TWELVEDATA_API_KEY:-}
+
+volumes:
+  postgres_data:

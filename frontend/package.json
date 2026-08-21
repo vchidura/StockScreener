@@ -1,0 +1,30 @@
+{
+  "name": "stock-screener-portal",
+  "version": "1.0.0",
+  "description": "Stock Screener Portal with Trading Strategies",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@tanstack/react-query": "^5.96.2",
+    "@tanstack/react-table": "^8.21.3",
+    "axios": "^1.13.6",
+    "lightweight-charts": "^5.1.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-router-dom": "^7.13.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^4.7.0",
+    "typescript": "^5.9.3",
+    "vite": "^5.4.21"
+  }
+}

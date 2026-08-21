@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-screener-api"
+version = "1.2.0"
+description = "Stock Screener API - FastAPI backend for technical analysis"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "Vamshi", email = "vchidurala@example.com"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: FastAPI",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "psycopg2-binary>=2.9.9",
+    "pandas>=2.2.0",
+    "yfinance>=0.2.36",
+    "finnhub-python>=2.4.19",
+    "websocket-client>=1.7.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.5.3",
+    "numpy>=1.26.3",
+    "pytz>=2024.1",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "httpx>=0.25.0",
+]
+
+[project.scripts]
+stock-screener = "stock_screener.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/vchidurala/stock-screener-portal"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.env.example"]
