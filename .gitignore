@@ -1,0 +1,57 @@
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Logs ---
+*.log
+*.pid
+*.out
+*.err
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+backend/.venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# --- Node / Frontend ---
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# --- Local environment files (do not commit secrets) ---
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+backend/.env
+frontend/.env.local
+
+# Keep safe/shared templates tracked
+!.env.example
+!backend/.env.example
+!frontend/.env.production
+
+# --- Temporary / cache ---
+*.tmp
+*.temp
+.cache/
