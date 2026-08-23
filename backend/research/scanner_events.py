@@ -666,6 +666,11 @@ def qualification_backfill(interval: str, start: str, end: str | None = None,
         """, ("discovery-1.0-shadow", session_dates))
         persisted_dates = int(cur.fetchone()["dates"] or 0)
     if persisted_dates < len(session_dates):
+        print(
+            f"[backfill {interval}] reconstructing discovery states for"
+            f" {len(session_dates)} sessions (one-time, slow)",
+            flush=True,
+        )
         discovery_start = session_dates[0] - pd.Timedelta(days=800)
         daily_panel = load_daily_panel(
             discovery_start.isoformat(), session_dates[-1].isoformat(), daily_universe
@@ -742,6 +747,11 @@ def qualification_backfill(interval: str, start: str, end: str | None = None,
         )
         for key in totals:
             totals[key] += result[key]
+        print(
+            f"[backfill {interval}] {min(offset + batch_size, len(selected))}/{len(selected)}"
+            f" tickers | matched={totals['matched']} inserted={totals['inserted']}",
+            flush=True,
+        )
         del panel, events, batch_rows
         gc.collect()
     return {
@@ -1145,8 +1155,15 @@ def event_summary(interval: str | None = None, discovery_state: str | None = Non
                    if len(alpha) > 1 and alpha.std() else None)
         mean_alpha = float(alpha.mean()) if len(alpha) else None
         status = _promotion_status(periods, mean_alpha, alpha_t)
+        scanner_name, scanner_version, group_interval, state, direction, horizon_bars = key
         results.append({
-            **dict(zip(group_columns, key)),
+            # Cast out of numpy scalars: the groupby key is not JSON serializable.
+            "scanner_name": str(scanner_name),
+            "scanner_version": str(scanner_version),
+            "interval": str(group_interval),
+            "discovery_state": None if pd.isna(state) else str(state),
+            "direction": int(direction),
+            "horizon_bars": int(horizon_bars),
             "independent_periods": periods,
             "events": int(pd.to_numeric(sample["names"]).sum()),
             "mean_net_return": _mean(sample["net_return"]),
@@ -1600,6 +1617,7 @@ def latest_sector_performance(sessions: int = 1) -> list[dict]:
                     LIMIT 1
                 ) previous ON TRUE
                 WHERE t.sector IS NOT NULL AND BTRIM(t.sector) <> ''
+                  AND t.sector <> 'ETF'
             )
             SELECT sector, MAX(trade_date) AS trade_date,
                    COUNT(*)::integer AS tickers,

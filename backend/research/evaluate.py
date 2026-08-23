@@ -252,6 +252,30 @@ def _fit_ridge(x: np.ndarray, y: np.ndarray, alpha: float) -> np.ndarray:
         return np.linalg.pinv(xtx) @ (x.T @ y)
 
 
+def _predict_ridge(x_train: np.ndarray, y_train: np.ndarray, x_test: np.ndarray,
+                   alpha: float) -> np.ndarray:
+    beta = _fit_ridge(x_train, y_train, alpha)
+    return x_test @ beta
+
+
+def _predict_lgbm(x_train: np.ndarray, y_train: np.ndarray, x_test: np.ndarray) -> np.ndarray:
+    """Gradient-boosted trees: can learn threshold effects and feature interactions
+    (e.g. RSI < 30 AND high volatility) that a linear model averages away."""
+    try:
+        from lightgbm import LGBMRegressor
+    except ImportError as exc:
+        raise SystemExit(
+            "lightgbm is not installed. Run: pip install lightgbm"
+        ) from exc
+    model = LGBMRegressor(
+        n_estimators=200, max_depth=4, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8, min_child_samples=50,
+        verbosity=-1,
+    )
+    model.fit(x_train, y_train)
+    return model.predict(x_test)
+
+
 def purged_walk_forward(
     df: pd.DataFrame,
     feature_cols: list[str],
@@ -262,12 +286,16 @@ def purged_walk_forward(
     alpha: float = 10.0,
     expanding: bool = True,
     carry_cols: list[str] | None = None,
+    model: str = "ridge",
 ) -> pd.DataFrame:
     """
-    Roll a ridge model forward in time, never training on data at or after the
+    Roll a model forward in time, never training on data at or after the
     test window. `embargo_days` drops the bars whose forward label would overlap
-    the test period.
+    the test period. `model` is "ridge" (default, linear) or "lgbm" (gradient-
+    boosted trees, captures non-linear thresholds/interactions).
     """
+    if model not in ("ridge", "lgbm"):
+        raise ValueError(f"Unknown model: {model!r}. Use 'ridge' or 'lgbm'.")
     dates = np.array(sorted(df["date"].unique()))
     if len(dates) < train_days + embargo_days + test_days:
         logger.warning("Not enough history for walk-forward | days=%s", len(dates))
@@ -293,10 +321,14 @@ def purged_walk_forward(
 
         x_train = train[feature_cols].to_numpy(dtype=float)
         y_train = train[label_col].to_numpy(dtype=float)
-        beta = _fit_ridge(x_train, y_train, alpha)
+        x_test = test[feature_cols].to_numpy(dtype=float)
+        if model == "lgbm":
+            pred = _predict_lgbm(x_train, y_train, x_test)
+        else:
+            pred = _predict_ridge(x_train, y_train, x_test, alpha)
 
         block = test[["date", "ticker", label_col]].copy()
-        block["pred"] = test[feature_cols].to_numpy(dtype=float) @ beta
+        block["pred"] = pred
         for extra in [c for c in test.columns if c.startswith("fwd_ret_")]:
             block[extra] = test[extra].to_numpy()
         for extra in carry_cols or []:
@@ -373,7 +405,9 @@ def persist_run(record: dict) -> int | None:
                     ADD COLUMN IF NOT EXISTS top_turnover DOUBLE PRECISION,
                     ADD COLUMN IF NOT EXISTS top_alpha_return DOUBLE PRECISION,
                     ADD COLUMN IF NOT EXISTS top_alpha_t_stat DOUBLE PRECISION,
-                    ADD COLUMN IF NOT EXISTS top_alpha_sharpe DOUBLE PRECISION
+                    ADD COLUMN IF NOT EXISTS top_alpha_sharpe DOUBLE PRECISION,
+                    ADD COLUMN IF NOT EXISTS cal_years JSONB,
+                    ADD COLUMN IF NOT EXISTS cal_year_positive_pct JSONB
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_research_runs_at "
                         "ON research_runs (run_at DESC)")

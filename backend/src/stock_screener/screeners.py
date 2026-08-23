@@ -1649,36 +1649,53 @@ def _describe_active_fibonacci_leg(start_pivot, end_pivot, df: pd.DataFrame,
         ]
         scenarios = [
             {
-                "id": "continuation", "title": "Active up-leg continues",
-                "condition": "above", "trigger_price": round(end_price, 2),
+                "id": "continuation",
+                "title": "Active up-leg continues",
+                "condition": "above",
+                "trigger_price": round(end_price, 2),
                 "detail": "A higher high replaces the developing pivot and recalculates provisional supports.",
                 "levels": [],
             },
             {
-                "id": "confirmation", "title": "Developing high confirms",
+                "id": "confirmation",
+                "title": "Developing high confirms",
                 "condition": confirmation_condition,
                 "trigger_price": confirmation_price,
                 "detail": "The active up-leg becomes confirmed; its retracement supports become stable references.",
-                "levels": [{"name": name, "price": price} for name, price in zip(names, prices)],
+                "levels": [
+                    {"name": name, "price": price}
+                    for name, price in zip(names, prices)
+                ],
             },
             {
-                "id": "unconfirmed_range", "title": "Pullback remains unconfirmed",
-                "condition": "between", "lower_price": confirmation_price,
+                "id": "unconfirmed_range",
+                "title": "Pullback remains unconfirmed",
+                "condition": "between",
+                "lower_price": confirmation_price,
                 "upper_price": round(end_price, 2),
                 "detail": "No new pivot is confirmed while price remains between the reversal boundary and developing high.",
                 "levels": [],
             },
             {
-                "id": "support_hold", "title": "Confirmed pullback finds support",
+                "id": "support_hold",
+                "title": "Confirmed pullback finds support",
                 "condition": "after_confirmation",
                 "detail": "After high confirmation, a developing low may form around one of these supports; a threshold rally would confirm that low.",
-                "levels": [{"name": name, "price": price} for name, price in zip(names, prices)],
+                "levels": [
+                    {"name": name, "price": price}
+                    for name, price in zip(names, prices)
+                ],
             },
             {
-                "id": "failure", "title": "Active bullish leg fails",
-                "condition": failure_condition, "trigger_price": round(start_price, 2),
+                "id": "failure",
+                "title": "Active bullish leg fails",
+                "condition": failure_condition,
+                "trigger_price": round(start_price, 2),
                 "detail": "A break of the active-leg origin completes a 100% retracement; extensions are references, not predicted targets.",
-                "levels": [{"name": name, "price": price} for name, price in zip(extension_names, extensions)],
+                "levels": [
+                    {"name": name, "price": price}
+                    for name, price in zip(extension_names, extensions)
+                ],
             },
         ]
     else:
@@ -1689,36 +1706,53 @@ def _describe_active_fibonacci_leg(start_pivot, end_pivot, df: pd.DataFrame,
         ]
         scenarios = [
             {
-                "id": "continuation", "title": "Active down-leg continues",
-                "condition": "below", "trigger_price": round(end_price, 2),
+                "id": "continuation",
+                "title": "Active down-leg continues",
+                "condition": "below",
+                "trigger_price": round(end_price, 2),
                 "detail": "A lower low replaces the developing pivot and recalculates provisional resistances.",
                 "levels": [],
             },
             {
-                "id": "confirmation", "title": "Developing low confirms",
+                "id": "confirmation",
+                "title": "Developing low confirms",
                 "condition": confirmation_condition,
                 "trigger_price": confirmation_price,
                 "detail": "The active down-leg becomes confirmed; its retracement resistances become stable references.",
-                "levels": [{"name": name, "price": price} for name, price in zip(names, prices)],
+                "levels": [
+                    {"name": name, "price": price}
+                    for name, price in zip(names, prices)
+                ],
             },
             {
-                "id": "unconfirmed_range", "title": "Bounce remains unconfirmed",
-                "condition": "between", "lower_price": round(end_price, 2),
+                "id": "unconfirmed_range",
+                "title": "Bounce remains unconfirmed",
+                "condition": "between",
+                "lower_price": round(end_price, 2),
                 "upper_price": confirmation_price,
                 "detail": "No new pivot is confirmed while price remains between the developing low and reversal boundary.",
                 "levels": [],
             },
             {
-                "id": "resistance_hold", "title": "Confirmed bounce meets resistance",
+                "id": "resistance_hold",
+                "title": "Confirmed bounce meets resistance",
                 "condition": "after_confirmation",
                 "detail": "After low confirmation, a developing high may form around one of these resistances; a threshold decline would confirm that high.",
-                "levels": [{"name": name, "price": price} for name, price in zip(names, prices)],
+                "levels": [
+                    {"name": name, "price": price}
+                    for name, price in zip(names, prices)
+                ],
             },
             {
-                "id": "failure", "title": "Active bearish leg fails",
-                "condition": failure_condition, "trigger_price": round(start_price, 2),
+                "id": "failure",
+                "title": "Active bearish leg fails",
+                "condition": failure_condition,
+                "trigger_price": round(start_price, 2),
                 "detail": "A break of the active-leg origin completes a 100% retracement; extensions are references, not predicted targets.",
-                "levels": [{"name": name, "price": price} for name, price in zip(extension_names, extensions)],
+                "levels": [
+                    {"name": name, "price": price}
+                    for name, price in zip(extension_names, extensions)
+                ],
             },
         ]
 

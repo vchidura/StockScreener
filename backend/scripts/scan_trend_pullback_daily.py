@@ -16,6 +16,7 @@ if str(BACKEND_DIR) not in sys.path:
 from database import get_db_cursor, get_selected_tickers  # noqa: E402
 from research.features import load_daily_panel  # noqa: E402
 from research.trend_pullback import build_trend_pullback_patterns  # noqa: E402
+from research.xsmom import MODEL_VERSION  # noqa: E402
 
 
 def _production_ranks(trade_date) -> dict[str, dict]:
@@ -23,8 +24,8 @@ def _production_ranks(trade_date) -> dict[str, dict]:
         cur.execute("""
             SELECT ticker, side, decile, percentile, universe_size
             FROM cross_sectional_signals
-            WHERE trade_date = %s AND model_version = 'xsmom-1.0'
-        """, (trade_date,))
+            WHERE trade_date = %s AND model_version = %s
+        """, (trade_date, MODEL_VERSION))
         return {row["ticker"]: dict(row) for row in cur.fetchall()}
 
 

@@ -10,6 +10,15 @@ import pandas as pd
 
 ALIGNED_LONG_STATES = {"CONTINUATION", "EMERGING_REVERSAL", "REVERSAL_CONFIRMED"}
 ALIGNED_SHORT_STATES = {"CONFLICT", "LAGGARD"}
+SESSION_TIMEZONE = "America/New_York"
+
+
+def _session_hour(value) -> int | None:
+    """Hourly signal_time is stored UTC; slices are declared in exchange local time."""
+    timestamp = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+    return int(timestamp.tz_convert(SESSION_TIMEZONE).hour)
 
 
 def _metadata(value) -> dict:
@@ -52,6 +61,15 @@ def confidence_slices(row: pd.Series) -> list[str]:
     if cluster_count is not None and cluster_count >= 2:
         slices.append("level_clustered")
 
+    if str(row.get("interval") or "") == "1h":
+        session_hour = _session_hour(row.get("signal_time"))
+        if session_hour in (9, 10):
+            slices.append("hour_am_open")
+        elif session_hour in (11, 12, 13):
+            slices.append("hour_midday")
+        elif session_hour in (14, 15):
+            slices.append("hour_pm_close")
+
     aligned = (
         direction == 1 and state in ALIGNED_LONG_STATES
     ) or (
@@ -91,6 +109,15 @@ def confidence_slices(row: pd.Series) -> list[str]:
         slices.append("sector_breadth_aligned")
     if market_aligned and sector_aligned:
         slices.append("market_sector_breadth_aligned")
+
+    # Same point-in-time attachment and staleness rule as market/sector breadth.
+    trend_state = str(row.get("trend_state") or "").upper()
+    if rank_fresh and (
+        (direction == 1 and trend_state == "UPTREND")
+        or (direction == -1 and trend_state == "DOWNTREND")
+    ):
+        slices.append("daily_trend_aligned")
+
     if rank_fresh and volatility_percentile is not None:
         if volatility_percentile <= 0.35:
             slices.append("market_low_volatility")
@@ -205,6 +232,17 @@ def expand_confidence_slices(observations: pd.DataFrame) -> pd.DataFrame:
     append(overnight_gap.abs() <= 0.25, "small_overnight_gap")
     append(cluster_count >= 2, "level_clustered")
 
+    session_hour = pd.to_datetime(
+        observations.get("signal_time", pd.Series(pd.NaT, index=observations.index)),
+        utc=True, errors="coerce",
+    ).dt.tz_convert(SESSION_TIMEZONE).dt.hour
+    hourly = observations.get(
+        "interval", pd.Series("", index=observations.index)
+    ).astype(str) == "1h"
+    append(hourly & session_hour.isin([9, 10]), "hour_am_open")
+    append(hourly & session_hour.isin([11, 12, 13]), "hour_midday")
+    append(hourly & session_hour.isin([14, 15]), "hour_pm_close")
+
     aligned = (
         (direction == 1) & state.isin(ALIGNED_LONG_STATES)
     ) | (
@@ -260,6 +298,16 @@ def expand_confidence_slices(observations: pd.DataFrame) -> pd.DataFrame:
     append(
         market_aligned & sector_aligned,
         "market_sector_breadth_aligned",
+    )
+    trend_state = observations.get(
+        "trend_state", pd.Series("", index=observations.index)
+    ).fillna("").astype(str).str.upper()
+    append(
+        rank_fresh & (
+            ((direction == 1) & (trend_state == "UPTREND"))
+            | ((direction == -1) & (trend_state == "DOWNTREND"))
+        ),
+        "daily_trend_aligned",
     )
     append(
         rank_fresh & (volatility_percentile <= 0.35),

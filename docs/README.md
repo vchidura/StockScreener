@@ -44,7 +44,8 @@ stock-screener-portal/
     ├── HIGH_LEVEL_DESIGN.md
     ├── LOW_LEVEL_DESIGN.md
    ├── SIGNAL_RESEARCH.md      # Signal validation methodology & production signal
-   └── SCANNER_EVENT_EVALUATION.md # Shadow scanner lifecycle and outcome evaluation
+   ├── SCANNER_EVENT_EVALUATION.md # Shadow scanner lifecycle and outcome evaluation
+   └── MODEL_REGISTRY.md       # Model/scanner version registry & script run cadence
 ```
 
 ---

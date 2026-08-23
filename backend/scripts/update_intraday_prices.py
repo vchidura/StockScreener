@@ -281,35 +281,42 @@ def upsert_intraday(ticker: str, df: pd.DataFrame, interval_label: str) -> int:
     if df.empty:
         return 0
 
-    inserted = 0
+    from psycopg2.extras import execute_values
+
+    rows = []
+    for idx, row in df.iterrows():
+        ts_et = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+        vol = int(row["volume"]) if pd.notna(row["volume"]) else 0
+        o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+        # Reject NaN/Inf values
+        if any(math.isnan(x) or math.isinf(x) for x in (o, h, l, c)):
+            print(f"  [{ticker}] Skipping bar with NaN/Inf at {ts_et}")
+            continue
+        if not is_valid_ohlcv(o, h, l, c, vol):
+            print(f"  [{ticker}] Skipping bar with invalid OHLCV at {ts_et}")
+            continue
+        rows.append((ticker, ts_et, interval_label, o, h, l, c, vol))
+
+    if not rows:
+        return 0
+
     with get_db_cursor(dict_cursor=False) as cur:
-        for idx, row in df.iterrows():
-            ts_et = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
-            vol = int(row["volume"]) if pd.notna(row["volume"]) else 0
-            o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
-            # Reject NaN/Inf values
-            if any(math.isnan(x) or math.isinf(x) for x in (o, h, l, c)):
-                print(f"  [{ticker}] Skipping bar with NaN/Inf at {ts_et}")
-                continue
-            if not is_valid_ohlcv(o, h, l, c, vol):
-                print(f"  [{ticker}] Skipping bar with invalid OHLCV at {ts_et}")
-                continue
-            cur.execute(
-                """
-                INSERT INTO stock_prices_intraday
-                    (ticker, datetime, interval, open_price, high, low, close_price, volume)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (ticker, datetime, interval) DO UPDATE SET
-                    open_price  = EXCLUDED.open_price,
-                    high        = EXCLUDED.high,
-                    low         = EXCLUDED.low,
-                    close_price = EXCLUDED.close_price,
-                    volume      = EXCLUDED.volume
-                """,
-                (ticker, ts_et, interval_label, o, h, l, c, vol),
-            )
-            inserted += 1
-    return inserted
+        execute_values(
+            cur,
+            """
+            INSERT INTO stock_prices_intraday
+                (ticker, datetime, interval, open_price, high, low, close_price, volume)
+            VALUES %s
+            ON CONFLICT (ticker, datetime, interval) DO UPDATE SET
+                open_price  = EXCLUDED.open_price,
+                high        = EXCLUDED.high,
+                low         = EXCLUDED.low,
+                close_price = EXCLUDED.close_price,
+                volume      = EXCLUDED.volume
+            """,
+            rows,
+        )
+    return len(rows)
 
 
 # US Market hours (Eastern Time)

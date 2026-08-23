@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -75,6 +76,10 @@ def main() -> int:
         default="none",
         help="Restrict each test cross-section to its top half by activity",
     )
+    parser.add_argument(
+        "--model", choices=["ridge", "lgbm"], default="ridge",
+        help="ridge (default, linear) or lgbm (gradient-boosted trees, requires pip install lightgbm)",
+    )
     parser.add_argument("--no-log", action="store_true",
                         help="Do not record this run in research_runs")
     args = parser.parse_args()
@@ -104,7 +109,7 @@ def main() -> int:
     _rule("2. STANDALONE FEATURE IC (vs forward return)")
     print(feature_ic_scan(df, selected, ret_col).to_string())
     print("\nReference: a genuine daily equity feature sits around |IC| 0.01-0.04.")
-    _rule("3. WALK-FORWARD RIDGE (purged, no look-ahead)")
+    _rule(f"3. WALK-FORWARD {args.model.upper()} (purged, no look-ahead)")
     preds = purged_walk_forward(
         df,
         selected,
@@ -115,6 +120,7 @@ def main() -> int:
         alpha=args.alpha,
         expanding=not args.rolling,
         carry_cols=RISK_COLUMNS + ["sector", "volume_ratio", "vol_ratio", "range_pct"],
+        model=args.model,
     )
     if preds.empty:
         logger.error("Walk-forward produced no predictions.")
@@ -235,6 +241,25 @@ def main() -> int:
     print(f"\nIndependent periods: {len(rebalance_dates)}. Below ~40 the Sharpe")
     print("comparison is itself noisy; treat it as directional, not decisive.")
 
+    # Stability / Annual tracking
+    years = [d.year for d in rebalance_dates]
+    df_metrics = pd.DataFrame({
+        "year": years,
+        "base_ret": per_period_base,
+        "top_ret": per_period_top,
+        "alpha_ret": per_period_top - per_period_base
+    })
+    
+    annual_summary = df_metrics.groupby("year")["alpha_ret"].apply(
+        lambda s: (s > 0).mean() * 100
+    ).to_dict()
+    
+    annual_details = df_metrics.groupby("year")["alpha_ret"].sum().to_dict()
+    
+    print("\n  ** Annual Alpha Hit Rate (Stability) **")
+    for yr, hr in annual_summary.items():
+        print(f"    {yr}: {hr:.1f}% (net sum: {annual_details[yr]:.3f})")
+
     if not args.no_log:
         verdict = ("ALPHA" if passed
                    else "UNDERPOWERED" if underpowered
@@ -243,6 +268,8 @@ def main() -> int:
         feature_key = ",".join(sorted(selected))
         if args.activity_filter != "none":
             feature_key += f"|activity={args.activity_filter}"
+        if args.model != "ridge":
+            feature_key += f"|model={args.model}"
         run_id = persist_run({
             "features": feature_key,
             "horizon_days": args.horizon,
@@ -273,6 +300,8 @@ def main() -> int:
             "verdict": verdict,
             "checks_passed": sum(1 for _, ok in checks if ok),
             "checks_total": len(checks),
+            "cal_years": json.dumps({k: round(v, 4) for k, v in annual_details.items()}),
+            "cal_year_positive_pct": json.dumps({k: round(v, 4) for k, v in annual_summary.items()}),
         })
         if run_id:
             print(f"\nLogged as research_runs.run_id={run_id}")

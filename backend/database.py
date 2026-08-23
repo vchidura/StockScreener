@@ -58,6 +58,7 @@ if not DB_CONFIG["user"] or not DB_CONFIG["password"]:
 _pool = psycopg2.pool.ThreadedConnectionPool(
     minconn=2,
     maxconn=20,
+    options="-c timezone=UTC",
     **DB_CONFIG,
 )
 
@@ -100,7 +101,7 @@ def get_distinct_tickers():
 def get_latest_price_date() -> str:
     """Returns the latest trading date available in the database as YYYY-MM-DD."""
     with get_db_cursor() as cursor:
-        cursor.execute("SELECT MAX(datetime::date) AS latest_date FROM stock_prices_daily")
+        cursor.execute("SELECT MAX((datetime AT TIME ZONE 'UTC')::date) AS latest_date FROM stock_prices_daily")
         row = cursor.fetchone()
         return str(row["latest_date"]) if row and row["latest_date"] else None
 
@@ -111,7 +112,7 @@ def get_latest_quote(ticker: str) -> dict | None:
         cursor.execute(
             """
             WITH daily AS (
-                SELECT close_price, datetime AS as_of, datetime::date AS trade_date,
+                SELECT close_price, datetime AS as_of, (datetime AT TIME ZONE 'UTC')::date AS trade_date,
                        'daily' AS source, 1 AS priority
                 FROM stock_prices_daily
                 WHERE ticker = %s
@@ -148,7 +149,7 @@ def get_latest_quote(ticker: str) -> dict | None:
             LEFT JOIN LATERAL (
                 SELECT close_price
                 FROM stock_prices_daily
-                WHERE ticker = %s AND datetime::date < latest.trade_date
+                WHERE ticker = %s AND (datetime AT TIME ZONE 'UTC')::date < latest.trade_date
                 ORDER BY datetime DESC
                 LIMIT 1
             ) previous ON TRUE
@@ -181,10 +182,10 @@ def get_stock_data(ticker: str, days: int = 365):
         cursor.execute(
             """
             WITH ranked AS (
-                SELECT datetime::date AS trade_date,
+                SELECT (datetime AT TIME ZONE 'UTC')::date AS trade_date,
                        open_price AS open, high, low, close_price AS close, volume,
                        ROW_NUMBER() OVER (
-                           PARTITION BY datetime::date
+                           PARTITION BY (datetime AT TIME ZONE 'UTC')::date
                            ORDER BY volume DESC
                        ) AS rn
                 FROM stock_prices_daily
@@ -209,15 +210,15 @@ def get_bulk_stock_data(tickers: list, days: int = 365, end_date: str = None) ->
         cursor.execute(
             """
             WITH ranked AS (
-                SELECT ticker, datetime::date AS trade_date,
+                SELECT ticker, (datetime AT TIME ZONE 'UTC')::date AS trade_date,
                        open_price AS open, high, low, close_price AS close, volume,
                        ROW_NUMBER() OVER (
-                           PARTITION BY ticker, datetime::date
+                           PARTITION BY ticker, (datetime AT TIME ZONE 'UTC')::date
                            ORDER BY volume DESC
                        ) AS rn
                 FROM stock_prices_daily
                 WHERE ticker = ANY(%s)
-                  AND datetime::date <= COALESCE(%s, CURRENT_DATE)::date
+                  AND (datetime AT TIME ZONE 'UTC')::date <= COALESCE(%s, CURRENT_DATE)::date
                   AND datetime >= COALESCE(%s, CURRENT_DATE)::date - INTERVAL '%s days'
             )
             SELECT ticker, trade_date AS datetime, open, high, low, close, volume
@@ -260,6 +261,7 @@ def migrate_selected_tickers_metadata():
         "asset_type":        "TEXT",                    # 'Stock' or 'ETF'
         "sector":            "TEXT",                    # GICS sector
         "industry":          "TEXT",                    # GICS industry
+        "sic_code":          "TEXT",                    # Polygon SIC code, source for sector
         "market_cap":        "BIGINT",                  # market cap in USD
         "market_cap_group":  "TEXT",                    # Mega/Large/Mid/Small/Micro
         "beta":              "DOUBLE PRECISION",        # beta vs market
@@ -345,16 +347,16 @@ def get_tickers_overview(tickers: list[str], end_date: str = None) -> list[dict]
     WITH daily AS (
         SELECT
             ticker,
-            datetime::date AS trade_date,
+            (datetime AT TIME ZONE 'UTC')::date AS trade_date,
             open_price,
             high,
             low,
             close_price,
             volume,
-            ROW_NUMBER() OVER (PARTITION BY ticker, datetime::date ORDER BY datetime DESC) AS rn
+            ROW_NUMBER() OVER (PARTITION BY ticker, (datetime AT TIME ZONE 'UTC')::date ORDER BY datetime DESC) AS rn
         FROM stock_prices_daily
         WHERE ticker = ANY(%s)
-          AND datetime::date <= COALESCE(%s, CURRENT_DATE)::date
+          AND (datetime AT TIME ZONE 'UTC')::date <= COALESCE(%s, CURRENT_DATE)::date
           AND datetime >= COALESCE(%s, CURRENT_DATE)::date - INTERVAL '1600 days'
     ),
     deduped AS (
@@ -493,6 +495,42 @@ def get_tickers_overview(tickers: list[str], end_date: str = None) -> list[dict]
             "dist_200w": dist_200w,
         })
     return results
+
+
+# =============================================================================
+# DAILY DATA FUNCTIONS
+# =============================================================================
+
+def create_daily_table():
+    """Creates the stock_prices_daily table if it doesn't exist.
+
+    datetime is TIMESTAMPTZ (UTC midnight instant of the trading date), matching
+    the hourly/intraday tables. Historical rows predating this were naive UTC;
+    see migrations/013_daily_timestamptz.sql for the one-time column conversion.
+    """
+    with get_db_cursor(dict_cursor=False) as cursor:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stock_prices_daily (
+                id BIGSERIAL PRIMARY KEY,
+                ticker VARCHAR(10) NOT NULL,
+                datetime TIMESTAMPTZ NOT NULL,
+                open_price DECIMAL(12, 4) NOT NULL,
+                high DECIMAL(12, 4) NOT NULL,
+                low DECIMAL(12, 4) NOT NULL,
+                close_price DECIMAL(12, 4) NOT NULL,
+                volume BIGINT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+
+                CONSTRAINT uq_daily_ticker_datetime UNIQUE (ticker, datetime)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_daily_ticker_datetime
+                ON stock_prices_daily (ticker, datetime DESC);
+            CREATE INDEX IF NOT EXISTS idx_daily_datetime
+                ON stock_prices_daily (datetime DESC);
+            """
+        )
 
 
 # =============================================================================

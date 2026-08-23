@@ -22,11 +22,15 @@ Daily close runs once at ~4:15 PM ET after market closes.
 
 Provider notes:
   Yahoo Finance  — batch 50 tickers, no rate limit. Supports all jobs.
+  Polygon.io     — unlimited calls on Stocks Starter+. 15-min delayed data. Supports all jobs.
   Twelve Data    — 8 req/min free tier. Skips 5m candles (too slow for 400 tickers).
 
 Usage:
-    # Start scheduler (Yahoo Finance, recommended)
+    # Start scheduler (Polygon.io, default)
     python scripts/run_scheduler.py
+
+    # Start with Yahoo Finance
+    python scripts/run_scheduler.py --provider yahoo
 
     # Start with Twelve Data
     python scripts/run_scheduler.py --provider twelvedata
@@ -62,20 +66,13 @@ load_dotenv(BACKEND_DIR / ".env")
 from database import get_db_cursor, get_selected_tickers
 
 # Import reusable functions from sibling scripts
-from update_daily_prices import (
-    fetch_daily_yahoo_direct, fetch_daily_twelvedata,
-    get_existing_dates, upsert_prices,
-)
-from update_hourly_prices import (
-    fetch_hourly_yahoo_direct, fetch_hourly_candles,
-    upsert_hourly_prices,
-)
-from update_running_daily import (
-    fetch_batch_quotes,
-    upsert_intraday_price,
-)
-from update_intraday_prices import fetch_intraday_yahoo_direct, upsert_intraday
+from update_daily_prices import get_existing_dates, upsert_prices
+from update_hourly_prices import fetch_hourly_yahoo_direct, upsert_hourly_prices
+from update_running_daily import upsert_intraday_price
+from update_intraday_prices import upsert_intraday
 from validate_eod import validate_all
+
+from providers import get_provider
 
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -90,10 +87,6 @@ INTRADAY_5M_INTERVAL = 5 * 60       # 5 minutes
 DAILY_CANDLE_INTERVAL = 5 * 60      # 5 minutes (keep today's daily bar fresh)
 HOURLY_INTERVAL = 60 * 60           # 60 minutes
 LOOP_SLEEP = 30                     # main loop checks every 30 seconds
-
-# Twelve Data rate-limit sleep
-TD_RATE_LIMIT = 8
-TD_BATCH_SIZE = 8
 
 
 # ── Timezone helper ─────────────────────────────────────────────────
@@ -128,13 +121,14 @@ def is_post_close_window() -> bool:
 
 # ── Job: 5-minute intraday candles ──────────────────────────────────
 def job_intraday_5m(tickers: list[str], provider: str):
-    """Fetch today's 5m candles → stock_prices_intraday. Yahoo only."""
-    if provider != "yahoo":
-        logger.info("  [5m] Skipped — Twelve Data too slow for 5m with %d tickers", len(tickers))
+    """Fetch today's 5m candles → stock_prices_intraday."""
+    provider_obj = get_provider(provider)
+    if not provider_obj.supports_intraday():
+        logger.info("  [5m] Skipped — %s does not support 5m with %d tickers", provider, len(tickers))
         return
 
-    logger.info("  [5m] Fetching 5m candles from Yahoo Chart API...")
-    ticker_data = fetch_intraday_yahoo_direct(tickers, "5m", days=1)
+    logger.info("  [5m] Fetching 5m candles from %s...", provider)
+    ticker_data = provider_obj.fetch_intraday(tickers, "5m", days=1)
     total = 0
     success = 0
     for ticker in tickers:
@@ -148,30 +142,22 @@ def job_intraday_5m(tickers: list[str], provider: str):
 # ── Job: Today's running daily candle ───────────────────────────────
 def job_daily_candle(tickers: list[str], provider: str):
     """Update today's running daily candle → stock_prices_daily."""
-    if provider == "yahoo":
-        logger.info("  [daily-candle] Fetching from Yahoo Chart API...")
-        ticker_data = fetch_daily_yahoo_direct(tickers, days=1)
-        quotes = {}
-        for ticker, df in ticker_data.items():
-            if df.empty:
-                continue
-            row = df.iloc[-1]
-            quotes[ticker] = {
-                "open": float(row["Open"]),
-                "high": float(row["High"]),
-                "low": float(row["Low"]),
-                "close": float(row["Close"]),
-                "volume": int(row["Volume"]),
-                "datetime": df.index[-1].strftime("%Y-%m-%d"),
-            }
-    else:
-        logger.info("  [daily-candle] Fetching from Twelve Data (batch %d)...", TD_BATCH_SIZE)
-        quotes = {}
-        for i in range(0, len(tickers), TD_BATCH_SIZE):
-            batch = tickers[i : i + TD_BATCH_SIZE]
-            quotes.update(fetch_batch_quotes(batch))
-            if i + TD_BATCH_SIZE < len(tickers):
-                time.sleep(TD_RATE_LIMIT)
+    provider_obj = get_provider(provider)
+    logger.info("  [daily-candle] Fetching from %s...", provider)
+    ticker_data = provider_obj.fetch_daily(tickers, days=1)
+    quotes = {}
+    for ticker, df in ticker_data.items():
+        if df.empty:
+            continue
+        row = df.iloc[-1]
+        quotes[ticker] = {
+            "open": float(row["Open"]),
+            "high": float(row["High"]),
+            "low": float(row["Low"]),
+            "close": float(row["Close"]),
+            "volume": int(row["Volume"]),
+            "datetime": df.index[-1].strftime("%Y-%m-%d"),
+        }
 
     success = 0
     for ticker in tickers:
@@ -183,18 +169,9 @@ def job_daily_candle(tickers: list[str], provider: str):
 # ── Job: Hourly candles ─────────────────────────────────────────────
 def job_hourly(tickers: list[str], provider: str):
     """Fetch recent hourly candles → stock_prices_hourly."""
-    if provider == "yahoo":
-        logger.info("  [hourly] Fetching from Yahoo Chart API...")
-        ticker_data = fetch_hourly_yahoo_direct(tickers, days=2)
-    else:
-        logger.info("  [hourly] Fetching from Twelve Data (1 ticker at a time)...")
-        ticker_data = {}
-        for i, t in enumerate(tickers, 1):
-            df = fetch_hourly_candles(t, days=2)
-            if not df.empty:
-                ticker_data[t] = df
-            if i < len(tickers):
-                time.sleep(TD_RATE_LIMIT)
+    provider_obj = get_provider(provider)
+    logger.info("  [hourly] Fetching from %s...", provider)
+    ticker_data = provider_obj.fetch_hourly(tickers, days=2)
 
     total = 0
     success = 0
@@ -210,10 +187,7 @@ def job_hourly(tickers: list[str], provider: str):
 def job_daily_close(tickers: list[str], provider: str):
     """Final daily candle after market close → stock_prices_daily."""
     logger.info("  [daily-close] Fetching final candles from %s...", provider)
-    if provider == "yahoo":
-        ticker_data = fetch_daily_yahoo_direct(tickers, days=5)
-    else:
-        ticker_data = fetch_daily_twelvedata(tickers, days=5)
+    ticker_data = get_provider(provider).fetch_daily(tickers, days=5)
 
     end_dt = datetime.utcnow() + timedelta(days=1)
     start_dt = end_dt - timedelta(days=15)
@@ -338,14 +312,12 @@ def _fetch_and_upsert_daily_batches(
     inserted = 0
     found = 0
     tickers = sorted(required)
+    provider_obj = get_provider(provider)
     for start in range(0, len(tickers), batch_size):
         batch = tickers[start:start + batch_size]
         logger.info("  [daily-retry] Batch %d-%d/%d",
                     start + 1, start + len(batch), len(tickers))
-        if provider == "yahoo":
-            ticker_data = fetch_daily_yahoo_direct(batch, days=days)
-        else:
-            ticker_data = fetch_daily_twelvedata(batch, days=days)
+        ticker_data = provider_obj.fetch_daily(batch, days=days)
         batch_inserted, batch_found = _upsert_required_daily_rows(
             ticker_data, {ticker: required[ticker] for ticker in batch}
         )
@@ -456,7 +428,15 @@ def job_hourly_deep_backfill(tickers: list[str], provider: str, min_days: int = 
     advances the deep history erodes. This repairs it. Tickers already at or above
     `min_days` are skipped, so the weekly run is usually near-free; `force` re-pulls
     everything regardless.
+
+    This is a Yahoo-specific workaround for its rolling 730-day window; providers
+    with a fixed multi-year history window (e.g. Polygon Starter's 5 years) don't
+    erode the same way, so this job is a no-op for them.
     """
+    if provider != "yahoo":
+        logger.info("  [hourly-deep] Skipped — only needed for Yahoo's rolling 730-day window")
+        return
+
     with get_db_cursor() as cur:
         cur.execute("""
             SELECT ticker FROM stock_prices_hourly
@@ -701,6 +681,7 @@ def _detect_intraday_gaps(tickers: list[str], days: int = 2) -> dict[str, list]:
 def job_backfill(tickers: list[str], provider: str):
     """Detect and backfill gaps across all three price tables."""
     logger.info("  [backfill] Scanning for data gaps...")
+    provider_obj = get_provider(provider)
 
     # ── Daily gaps ───────────────────────────────────────────────
     daily_gaps = _detect_daily_gaps(tickers, days=7)
@@ -708,10 +689,7 @@ def job_backfill(tickers: list[str], provider: str):
         gap_tickers = list(daily_gaps.keys())
         logger.info("  [backfill] Daily gaps: %d tickers missing data", len(gap_tickers))
         # Fetch last 10 days to cover any gaps within the 7-day window
-        if provider == "yahoo":
-            ticker_data = fetch_daily_yahoo_direct(gap_tickers, days=10)
-        else:
-            ticker_data = fetch_daily_twelvedata(gap_tickers, days=10)
+        ticker_data = provider_obj.fetch_daily(gap_tickers, days=10)
 
         end_dt = datetime.utcnow() + timedelta(days=1)
         start_dt = end_dt - timedelta(days=15)
@@ -733,16 +711,7 @@ def job_backfill(tickers: list[str], provider: str):
     if hourly_gaps:
         gap_tickers = list(hourly_gaps.keys())
         logger.info("  [backfill] Hourly gaps: %d tickers missing data", len(gap_tickers))
-        if provider == "yahoo":
-            ticker_data = fetch_hourly_yahoo_direct(gap_tickers, days=5)
-        else:
-            ticker_data = {}
-            for i, t in enumerate(gap_tickers, 1):
-                df = fetch_hourly_candles(t, days=5)
-                if not df.empty:
-                    ticker_data[t] = df
-                if i < len(gap_tickers):
-                    time.sleep(TD_RATE_LIMIT)
+        ticker_data = provider_obj.fetch_hourly(gap_tickers, days=5)
 
         total_filled = 0
         for ticker in gap_tickers:
@@ -753,13 +722,13 @@ def job_backfill(tickers: list[str], provider: str):
     else:
         logger.info("  [backfill] Hourly: no gaps found")
 
-    # ── Intraday 5m gaps (Yahoo only) ───────────────────────────
-    if provider == "yahoo":
+    # ── Intraday 5m gaps ─────────────────────────────────────────
+    if provider_obj.supports_intraday():
         intraday_gaps = _detect_intraday_gaps(tickers, days=2)
         if intraday_gaps:
             gap_tickers = list(intraday_gaps.keys())
             logger.info("  [backfill] Intraday gaps: %d tickers missing data", len(gap_tickers))
-            ticker_data = fetch_intraday_yahoo_direct(gap_tickers, "5m", days=3)
+            ticker_data = provider_obj.fetch_intraday(gap_tickers, "5m", days=3)
             total_filled = 0
             for ticker in gap_tickers:
                 df = ticker_data.get(ticker)
@@ -769,7 +738,7 @@ def job_backfill(tickers: list[str], provider: str):
         else:
             logger.info("  [backfill] Intraday: no gaps found")
     else:
-        logger.info("  [backfill] Intraday: skipped (Twelve Data provider)")
+        logger.info("  [backfill] Intraday: skipped (%s provider does not support 5m)", provider)
 
     logger.info("  [backfill] Complete.")
 
@@ -783,7 +752,7 @@ def run_scheduler(tickers: list[str], provider: str):
     logger.info("  Tickers  : %d", len(tickers))
     logger.info("  Jobs     :")
     logger.info("    5m candles   → every 5 min  (market hours) %s",
-                "[yahoo only]" if provider != "yahoo" else "")
+                "" if get_provider(provider).supports_intraday() else "[unsupported by this provider]")
     logger.info("    daily candle → every 5 min  (market hours)")
     logger.info("    hourly       → every 60 min (market hours)")
     logger.info("    daily close  → once after 4:15 PM ET")
@@ -869,16 +838,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Schedule (per design):
-  5m candles   → stock_prices_intraday   (every 5 min, market hours, yahoo only)
+  5m candles   → stock_prices_intraday   (every 5 min, market hours, yahoo/polygon only)
   daily candle → stock_prices_daily      (every 5 min, market hours)
   hourly       → stock_prices_hourly     (every 60 min, market hours)
   daily close  → stock_prices_daily      (once after 4:15 PM ET)
         """,
     )
     parser.add_argument(
-        "--provider", type=str, default="yahoo",
-        choices=["yahoo", "twelvedata"],
-        help="Data provider: yahoo (default, recommended) or twelvedata",
+        "--provider", type=str, default="polygon",
+        choices=["yahoo", "twelvedata", "polygon"],
+        help="Data provider: polygon (default), yahoo, or twelvedata",
     )
     parser.add_argument(
         "--tickers", type=str, default=None,
@@ -904,14 +873,20 @@ Schedule (per design):
 
     provider = args.provider
 
-    # Validate Twelve Data API key
+    # Validate provider API keys
     if provider == "twelvedata":
         api_key = os.getenv("TWELVEDATA_API_KEY", "")
         if not api_key:
             logger.error("TWELVEDATA_API_KEY not set. Get a free key at https://twelvedata.com/")
             sys.exit(1)
         logger.warning("Twelve Data provider: 5m intraday candles will be SKIPPED (rate limit too slow).")
-        logger.warning("Use --provider yahoo for full 5m + hourly + daily support.")
+        logger.warning("Use --provider yahoo or --provider polygon for full 5m + hourly + daily support.")
+    elif provider == "polygon":
+        api_key = os.getenv("POLYGON_API_KEY", "")
+        if not api_key:
+            logger.error("POLYGON_API_KEY not set. Add it to backend/.env after subscribing at massive.com.")
+            sys.exit(1)
+        logger.warning("Polygon Stocks Starter plan data is 15-minute delayed, not real-time.")
 
     # Get tickers
     if args.tickers:

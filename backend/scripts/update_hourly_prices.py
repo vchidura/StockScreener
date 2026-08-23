@@ -364,49 +364,53 @@ def upsert_hourly_prices(ticker: str, df: pd.DataFrame) -> int:
     """
     if df.empty:
         return 0
-    
-    inserted = 0
-    with get_db_cursor(dict_cursor=False) as cursor:
-        for idx, row in df.iterrows():
-            ts = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
-            # Final safety check: skip non-regular-session bars
-            ts_et = normalize_to_et(ts)
-            if not is_valid_hourly_bar(ts_et):
-                logger.warning(f"[{ticker}] Skipping invalid hourly bar: {ts_et}")
-                continue
-            o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
-            v = int(row["volume"])
-            # Reject NaN/Inf values
-            if any(math.isnan(x) or math.isinf(x) for x in (o, h, l, c)):
-                logger.warning(f"[{ticker}] Skipping bar with NaN/Inf at {ts_et}")
-                continue
-            if not is_valid_ohlcv(o, h, l, c, v):
-                logger.warning(f"[{ticker}] Skipping bar with invalid OHLCV at {ts_et}")
-                continue
-            try:
-                cursor.execute(
-                    """
-                    INSERT INTO stock_prices_hourly
-                        (ticker, datetime, open_price, high, low, close_price, volume)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (ticker, datetime) DO UPDATE SET
-                        open_price  = EXCLUDED.open_price,
-                        high        = EXCLUDED.high,
-                        low         = EXCLUDED.low,
-                        close_price = EXCLUDED.close_price,
-                        volume      = EXCLUDED.volume
-                    """,
-                    (
-                        ticker,
-                        ts_et,
-                        o, h, l, c, v,
-                    ),
-                )
-                inserted += 1
-            except Exception as e:
-                logger.error(f"[{ticker}] DB error for {ts_et}: {e}")
-    
-    return inserted
+
+    from psycopg2.extras import execute_values
+
+    rows = []
+    for idx, row in df.iterrows():
+        ts = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+        # Final safety check: skip non-regular-session bars
+        ts_et = normalize_to_et(ts)
+        if not is_valid_hourly_bar(ts_et):
+            logger.warning(f"[{ticker}] Skipping invalid hourly bar: {ts_et}")
+            continue
+        o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+        v = int(row["volume"])
+        # Reject NaN/Inf values
+        if any(math.isnan(x) or math.isinf(x) for x in (o, h, l, c)):
+            logger.warning(f"[{ticker}] Skipping bar with NaN/Inf at {ts_et}")
+            continue
+        if not is_valid_ohlcv(o, h, l, c, v):
+            logger.warning(f"[{ticker}] Skipping bar with invalid OHLCV at {ts_et}")
+            continue
+        rows.append((ticker, ts_et, o, h, l, c, v))
+
+    if not rows:
+        return 0
+
+    try:
+        with get_db_cursor(dict_cursor=False) as cursor:
+            execute_values(
+                cursor,
+                """
+                INSERT INTO stock_prices_hourly
+                    (ticker, datetime, open_price, high, low, close_price, volume)
+                VALUES %s
+                ON CONFLICT (ticker, datetime) DO UPDATE SET
+                    open_price  = EXCLUDED.open_price,
+                    high        = EXCLUDED.high,
+                    low         = EXCLUDED.low,
+                    close_price = EXCLUDED.close_price,
+                    volume      = EXCLUDED.volume
+                """,
+                rows,
+            )
+    except Exception as e:
+        logger.error(f"[{ticker}] DB error during batch upsert: {e}")
+        return 0
+
+    return len(rows)
 
 
 def update_tickers(tickers: List[str], days: int = 5, provider: str = "yahoo") -> tuple:

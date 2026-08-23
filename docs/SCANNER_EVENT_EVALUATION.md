@@ -17,16 +17,17 @@ falsifiable setups; add one row when a setup is proposed, implemented or promote
 
 | Composite setup | Intervals | Required components | Optional context | Status |
 |---|---|---|---|---|
-| Structured trend pullback 1.0 | 1d, 1wk, 1h | MA trend + swing continuation + pullback + candle trigger | Gap/FVG/Fibonacci proximity, activity | Collecting |
+| Structured trend pullback 1.0 | 1d, 1wk, 1h | MA trend + swing continuation + pullback + candle trigger | Gap/FVG/Fibonacci proximity, activity | Monitor only: daily short, 5 bars |
 | Level retest/rejection 1.2 | 1d, 1wk, 1h | Gap/FVG/dynamic Fibonacci level + rejection or reclaim + participation | Trend/discovery alignment | Collecting |
-| Breakout expansion 1.0 | 1d, 1wk, 1h | Swing/zone break + range expansion + relative volume + strong close | MA trend, cross-sectional rank | Promising: hourly long, 7 bars |
+| Breakout expansion 1.0 | 1d, 1wk, 1h | Swing/zone break + range expansion + relative volume + strong close | MA trend, cross-sectional rank | Demoted 2026-08-22: monitor only |
 | Structure reversal 1.0 | 1d, 1wk, 1h | Reversal discovery state + swing structure flip + MA/VWAP reclaim | Gap/FVG level, activity | Collecting |
-| SMA200 reclaim rejection 1.0 | 1d, 1wk | Declining SMA200 + fresh reclaim + old-high retest + bearish strong close + participation | Sector/regime alignment | Collecting |
-| Compression breakout 0.1-shadow | 1d | Contracted range/ATR and channel + range/volume expansion + strong breakout close | Trend alignment | Failed primary qualification; shadow only |
-| Failed-breakout reversal 0.1-shadow | 1d | Fresh pivot break + next-bar close back inside + reversal candle | Level age, participation, breadth | Monitor only; raw pass did not survive FDR |
+| SMA200 reclaim rejection 1.0 | 1d, 1wk | Declining SMA200 + fresh reclaim + old-high retest + bearish strong close + participation | Sector/regime alignment | Insufficient sample: 31 daily signal days |
+| Compression breakout 0.1-shadow | 1d | Contracted range/ATR and channel + range/volume expansion + strong breakout close | Trend alignment | Monitor only: hourly long, 7 bars; 88% contained in breakout expansion |
+| Failed-breakout reversal 0.1-shadow | 1d | Fresh pivot break + next-bar close back inside + reversal candle | Level age, participation, breadth | Collecting |
 
 Statuses: `PLANNED`, `COLLECTING`, `INSUFFICIENT_SAMPLE`, `FAILED`, `PROMISING`, `VALIDATED`,
-`DEFERRED`.
+`DEFERRED`. Statuses reflect the 2026-08-22 study; no setup currently holds `PROMISING` or
+`VALIDATED`.
 
 ## Indicator Roles
 
@@ -70,15 +71,16 @@ Production implications:
 
 ## Scanner Confidence Study
 
-The expanded study evaluated 242,618 matured `next_bar_open_v2` outcomes and 1,041 baseline/filter
-rows. In addition to discovery alignment, participation, breakout-close quality, level source,
-candle triggers, and `xsmom-1.0`, it tested pullback duration, volume contraction/expansion,
-retracement speed, VWAP reclaim and swing-origin distance; failed-breakout level freshness,
-participation and follow-through failure; pivot age, overnight gap/ATR and level clustering; and
-point-in-time market breadth, sector breadth and trailing market-volatility percentile. Every
-filter was paired with its same scanner/date baseline. Daily context used that session's close;
-hourly context used the latest strictly prior daily close. Fresh context covered 233,660 outcomes
-(96.3%).
+The 2026-08-22 study evaluated 293,687 matured `next_bar_open_v2` outcomes across 1,434
+baseline/filter rows and 41 slices, on five years of daily and two years of hourly Polygon history.
+In addition to discovery alignment, participation, breakout-close quality, level source, candle
+triggers, and `xsmom-1.0`, it tested pullback duration, volume contraction/expansion, retracement
+speed, VWAP reclaim and swing-origin distance; failed-breakout level freshness, participation and
+follow-through failure; pivot age, overnight gap/ATR and level clustering; point-in-time market
+breadth, sector breadth and trailing market-volatility percentile; intraday session seasonality;
+and daily/intraday trend agreement. Every filter was paired with its same scanner/date baseline.
+Daily context used that session's close; hourly context used the latest strictly prior daily close.
+Fresh context covered 87.2% of outcomes.
 
 Qualification requires 100 events, 40 horizon-spaced periods, positive alpha with `t > 2`, and
 positive early/late alpha. Filter qualification additionally requires positive paired incremental
@@ -87,39 +89,48 @@ applied across both primary baselines and the complete filter family at `q <= 0.
 
 Primary findings:
 
-- Existing hourly long breakout expansion at seven bars is the only robust primary combination:
-  3,263 events, 459 independent periods, +0.290% net alpha, `t=3.68`, and `q=0.0147`.
-- Daily short failed-breakout reversal at ten sessions passed the raw primary gates with 3,947
-  events, 88 periods, +1.204% net alpha, and `t=2.26`, but failed FDR with `q=0.494`.
-- Compression short at ten sessions weakened from +1.958% (`t=2.44`) over 39 initial periods to
-  +1.181% (`t=1.76`) over 53 periods after extending the replay to 2023. It did not qualify.
-- No pullback-shape, VWAP, swing-origin, failed-breakout, pivot-age, gap, level-cluster, rank,
-  breadth, sector or volatility filter survived false-discovery correction. Six filters passed raw
-  gates; robust filters remain zero. The strongest raw contextual increment was hourly-short
-  structure reversal with aligned sector breadth (+1.058%, `t=3.03`, `q=0.443`). Pullback volume
-  contraction (+0.152%, `t=2.20`, `q=0.748`) and pivot age of at least ten bars (+0.807%,
-  `t=2.26`, `q=0.736`) also failed the adjusted evidence gate.
+- **No primary combination and no filter survived FDR correction.** Robust results are zero in both
+  families.
+- Three primaries cleared the raw gates: daily-short `structured_trend_pullback` at five bars
+  (3,629 events, 222 periods, +0.588%, `t=2.39`, `q=0.402`); hourly-long `compression_breakout` at
+  seven bars (678 events, 287 periods, +0.484%, `t=2.56`, `q=0.394`); and hourly-long
+  `breakout_expansion` at seven bars (3,360 events, 463 periods, +0.250%, `t=2.15`, `q=0.463`).
+- `breakout_expansion` hourly long at seven bars was the previous study's sole `ROBUST_PASS` at
+  `q=0.0147`. On the longer sample it falls to `q=0.463` and is **demoted** to monitor only. Its
+  net alpha also thinned from +0.290% to +0.250%.
+- Five filters cleared raw gates. The strongest is `structured_trend_pullback` hourly-long 21-bar
+  `pullback_vwap_reclaim`: +1.875%, `t=3.91`, absolute `q=0.042` but incremental `q=0.856`. Its
+  absolute alpha is inherited from its baseline rather than added by the filter, so it does not
+  qualify. `daily_trend_aligned` contributed one raw pass, hourly-short `breakout_expansion` at
+  seven bars (+0.327%, `t=2.11`, `q=0.589`), among the weakest of the group.
+- A 2026-08-23 rerun after the sector reclassification left all three primaries byte-identical,
+  as expected since primary rows do not use sector. Filter raw passes rose from five to seven; the
+  two additions are `rank_*` slices that moved because sector neutralization feeds `xsmom`
+  percentiles, and both carry `q >= 0.51`. Robust results remain zero in both families.
+- Intraday seasonality was directionally sensible but never significant: the morning bucket carried
+  49,087 events and a best `t=2.67` (`q=0.417`), against 17,298 midday and 17,847 close-bucket
+  events with best `t` below 1.8.
 
-Failed-breakout alpha was broad across 399 tickers but concentrated in time: 2024 and 2025 alpha
-was -0.19% and -0.53%, while 2026 contributed +6.13% over only 14 periods. This temporal
-instability prevents promotion even before untouched forward validation. Sector breadth also has
-a residual limitation: historical prices are point-in-time, but current sector classifications
-are mapped backward and do not capture classification drift.
+The family size is itself a finding. Several rows carry large raw t-statistics while no row
+survives a 1,434-member correction; see the multiplicity budget under Retirement and
+Re-specification. Sector breadth also has two residual limitations: historical prices are
+point-in-time, but current sector classifications are mapped backward and do not capture
+classification drift; and sectors below 25 names are suppressed entirely, so breadth evidence
+covers roughly 78% of the stock universe.
 
 Portal evidence states now enforce the research boundary:
 
 - `ROBUST_PASS`: primary gates and baseline FDR pass. This describes one scanner/direction/horizon,
-  not a per-trade probability.
+  not a per-trade probability. **No row currently holds this state.**
 - `MONITOR_ONLY`: raw primary pass that did not survive FDR.
 - `UNRANKED`: insufficient, negative, or unstable evidence; no confidence claim.
 
-Calibration uses expanding beta-binomial forecasts and is downstream of robust evidence. The sole
-eligible baseline has 419 out-of-sample periods, calibrated P(win) of 56.576% (95% interval 52.142%
-to 61.010%), Brier score 0.246, Brier skill of +1.5% versus a 50% forecast, and expected
-calibration error of 4.376%. Its live expected alpha is +0.290% (95% interval +0.135% to +0.444%).
-The portal exposes these metrics and its reliability curve only for `RESEARCH_CALIBRATED` rows;
-`MONITOR_ONLY` and `UNRANKED` rows remain `NOT_ELIGIBLE` with probability and live-alpha claims
-suppressed. Review Priority remains categorical and no scanner changes recommendations.
+Calibration uses expanding beta-binomial forecasts and is downstream of robust evidence. With no
+`ROBUST_PASS` row remaining, no combination is `RESEARCH_CALIBRATED` and every row is
+`NOT_ELIGIBLE`, with probability and live-alpha claims suppressed portal-wide. The previously
+published calibration for hourly-long `breakout_expansion` — 56.576% P(win) and +0.290% live
+expected alpha — is withdrawn with the demotion. Review Priority remains categorical and no scanner
+changes recommendations.
 
 ## Review Priority
 
@@ -392,6 +403,118 @@ Minimum promotion gate:
 
 Promotion never happens automatically; update the registry and model version after review.
 
+## Retirement and Re-specification
+
+Promotion has a defined gate; failure needs one too, or a scanner that never qualifies simply
+accumulates in the registry forever. These rules are precommitted before the first full-history
+qualification study so that no threshold is chosen after seeing its own result.
+
+A scanner is **retired** when it holds `UNRANKED` across three consecutive quarterly studies while
+meeting the minimum sample size in at least one of them. Retirement removes it from
+`SCANNER_VERSIONS` and stops event capture. Historical events and outcomes are retained; the
+sample stays valid evidence and deleting it would bias any later meta-analysis.
+
+Insufficient sample is not failure. A scanner below 100 events and 40 independent periods stays
+`UNRANKED` and keeps accruing indefinitely; the three-study clock does not start until it has been
+genuinely testable at least once.
+
+**Detection thresholds are never tuned in place.** Adjusting a threshold on a scanner that has
+already been measured tunes parameters on the evaluation sample, which silently inflates the
+researcher degrees of freedom the FDR correction is meant to account for. It is the same failure
+the shared, precommitted 3-ATR swing threshold exists to avoid. A revised specification therefore
+ships as a **new scanner name and version** that:
+
+- Runs alongside the original rather than replacing it, so both are counted as separate hypotheses
+- Starts at `0.1-shadow` and carries no evidence claim until it clears the promotion gate on its own
+- Is evaluated only on data not used to diagnose the original, so its first verdict is out-of-sample
+
+A scanner that reached `ROBUST_PASS` and later degrades to `UNRANKED` for two consecutive studies
+is **demoted**, not retired: the evidence state reverts, portal probability and live-alpha claims
+are suppressed, and the model version is bumped to record the change. Demotion is reversible on
+re-qualification; retirement is not.
+
+### Multiplicity budget
+
+Testing every available slice is itself a defect, not thoroughness. The 2026-08-22 study evaluated
+1,434 rows and produced zero robust results while several rows had large raw t-statistics; the
+correction was carrying a family far larger than the evidence could support. Adding four slices to
+that study also moved existing `q` values in both directions, because Benjamini-Hochberg `q`
+depends on a p-value's rank within the family. A `q` that improves after unrelated tests are added
+is not stronger evidence.
+
+Each study therefore declares its hypothesis family **before** the outcomes it will consume have
+matured:
+
+- Declare the scanner/direction/horizon rows and the slice list in this document, with the reason
+  each slice is mechanistically plausible, and record the count.
+- Prefer a small family. Ten pre-registered slices chosen on mechanism are worth more than a
+  hundred chosen for availability.
+- Slices added after seeing a result belong to the next study's family, not the current one.
+- Never select a slice for promotion because it ranked best. Rank is not a qualification criterion.
+
+**Rows that fail the sample gate do not enter the family.** A row below 100 events or 40
+independent periods cannot qualify whatever its alpha, so it is not a candidate hypothesis and must
+not consume correction budget. In the 2026-08-22 study 291 of 1,434 rows (20.3%) were ineligible on
+sample size, and five of them held p-values inside the smallest twenty — including a row with five
+independent periods that ranked first overall and therefore set the tightest Benjamini-Hochberg
+threshold for every genuine candidate beneath it. Ineligible rows are still reported as
+`UNRANKED`; they are excluded only from the correction family. This rule is decidable before any
+outcome is inspected, so applying it is not selection.
+
+**Detectors that largely contain one another are one hypothesis, not two.** Redundancy is measured
+with [analyze_scanner_redundancy.py](../backend/scripts/analyze_scanner_redundancy.py), which uses
+event identity only and never outcomes. Symmetric overlap across the seven families is low
+(maximum Jaccard 0.186), but directional coverage is not: 76.9% of daily and 88.3% of hourly
+`compression_breakout` signal days are already `breakout_expansion` days, and both cleared raw
+gates on the same hourly-long seven-bar cell. Where one detector's signal days are largely a subset
+of another's, the pair is counted once in the family and the narrower detector is treated as a
+variant rather than a peer.
+
+**A conditioning variable that cannot be measured to the precision its threshold requires is
+excluded, not reported.** `sector_breadth` is a proportion, so its standard error is `0.5/sqrt(n)`
+for a sector of `n` names, while the breadth slices trigger 0.10 away from neutral. Below `n = 25`
+the error exceeds the distance being tested and the comparison carries no information.
+`BREADTH_MIN_SECTOR_SIZE = 25` in
+[research/regime_context.py](../backend/research/regime_context.py) therefore emits `NaN` for
+undersized sectors, dropping those observations from `sector_breadth_aligned` and
+`market_sector_breadth_aligned` instead of feeding them mismeasured values. The threshold follows
+from the arithmetic above rather than from trying values, and it self-adjusts as the universe
+changes. A failed slice must fail because its mechanism is absent, not because its input was noise.
+
+### Power before re-specification
+
+Run [analyze_scanner_power.py](../backend/scripts/analyze_scanner_power.py) before concluding that
+a scanner has no edge. It converts each row's observed alpha and t-statistic into the effect the
+correction threshold demanded, and into the number of independent periods the observed effect would
+need. A null result caused by insufficient periods calls for waiting, not for changing the
+detector.
+
+The 2026-08-22 study is mostly the second case. Leading candidates need 25–60% more independent
+periods rather than a larger effect:
+
+| Row | Periods | Needed | Approximate wait |
+|---|---:|---:|---|
+| `structured_trend_pullback` `1h` long 21, `pullback_vwap_reclaim` | 119 | 117 | already sufficient |
+| `compression_breakout` `1h` long 7, `discovery_aligned` | 235 | 307 | ~4 months |
+| `breakout_expansion` `1h` short 7, `discovery_aligned` | 298 | 386 | ~9 months |
+| `structured_trend_pullback` `1d` short 5, `sector_breadth_aligned` | 178 | 221 | ~1 year |
+
+Re-specification is therefore not the indicated response to the current results. Accrue forward,
+apply the family rules above at the next study, and re-measure.
+
+### Time to testability
+
+A re-specification is an experiment with a fixed minimum cost, because the 40-independent-period
+gate cannot be reached faster than the horizon allows. Observed rates from the current sample:
+
+| Interval | Reference row | Periods | Span | Rate | Time to 40 periods |
+|---|---|---:|---|---:|---|
+| Hourly | `breakout_expansion` 7 bars | 463 | 2 years | ~231/yr | ~2 months |
+| Daily | `structured_trend_pullback` 5 bars | 222 | 5 years | ~44/yr | ~11 months |
+
+A daily variant is therefore close to a one-year commitment before it can return any verdict. Run
+few of them, and treat concurrent daily variants as competing hypotheses that enlarge the family.
+
 ## Scheduler
 
 After successful EOD validation:
@@ -468,8 +591,9 @@ Manual controls:
   discovery cohorts, not today's cohort projected backward.
 - Full-history replay, enhanced metadata refresh, occurrence repair, outcome evaluation, context
   reconstruction, FDR qualification and calibration are complete for the daily/hourly study.
-- Of 63 primary scanner/direction/horizon rows, one is `ROBUST_PASS`, one is `MONITOR_ONLY`, and 61
-  are `UNRANKED`. Of 978 non-baseline rows, six passed raw filter gates and none survived FDR.
+- Of 1,434 evaluated rows across 41 slices, three primaries and five filters passed raw gates and
+  **none survived FDR**. No row holds `ROBUST_PASS`; every row is `NOT_ELIGIBLE` for calibrated
+  probability or live-alpha display.
 - The `extension-0.1-shadow` current-position overlay is available on discovery, ticker detail and
   latest scanner rows without changing historical scanner evidence or qualification.
 - All setups remain shadow research. Neither evidence status nor calibrated research output changes
@@ -485,24 +609,19 @@ Point-in-time replay completed with zero outstanding outcomes:
 
 | Interval | Window | Sessions | Universe |
 |---|---|---:|---|
-| Daily | 2023-03-09 to 2026-08-12 | 860 | 400 data-available names |
-| Hourly | 2024-08-12 to 2026-08-12 | 502 | 391-name union of reconstructed discovery cohorts |
+| Daily | 2021-09-01 to 2026-08-21 | 1,248 | 386 data-available names |
+| Hourly | 2024-08-22 to 2026-08-21 | ~500 | 376-name union of reconstructed discovery cohorts |
 
-Of 63 scanner/direction/horizon combinations, 61 failed the raw primary gate. Daily-short
-failed-breakout reversal at ten sessions passed raw gates but did not survive FDR (`q=0.494`). The
-only robust primary pass was `breakout_expansion` 1.0, hourly long, at seven bars:
+No scanner/direction/horizon combination survived false-discovery correction. The three raw
+primary passes and five raw filter passes are listed under Scanner Confidence Study.
 
-- 3,263 events and 459 horizon-spaced periods
-- Mean net alpha: +0.290%
-- Alpha t-stat: 3.68
-- Early/late alpha: +0.145% / +0.434%
-- Hit rate: 56.9%
-- Benjamini-Hochberg adjusted `q`: 0.0147
-- Walk-forward calibrated P(win): 56.576%; live expected alpha: +0.290%
-- Largest ticker share: 1.3%; largest sector share: 28.0%
-- Positive alpha in 10 of 12 sector groups
+The previous study's sole robust result, `breakout_expansion` 1.0 hourly long at seven bars, is
+superseded. On the shorter sample it recorded 3,263 events, 459 periods, +0.290% net alpha,
+`t=3.68` and `q=0.0147`. On the full sample it records 3,360 events, 463 periods, +0.250% net
+alpha, `t=2.15` and `q=0.463` — it still clears the raw gate but no longer clears correction. Its
+regime dependence was already conditional, with negative alpha in bear regimes and no surviving
+regime filter.
 
-The regime check is conditional: alpha was positive in SPY bull (+0.210%) and mixed (+0.336%)
-regimes, but negative in bear regimes (-0.047%). No regime filter survived FDR. Therefore this
-candidate is a robust research result, not universally `VALIDATED`. Keep it shadow-only and require
-an untouched forward period before it can influence recommendations.
+This is the demotion path working as designed: a result measured on a shorter sample did not hold
+when the sample grew. Nothing is promoted, all setups remain shadow-only, and an untouched forward
+period is still required before any candidate can influence recommendations.

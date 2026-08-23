@@ -287,7 +287,7 @@ They are manual, descriptive watch scans shown later in this README.
 |------|---------|
 | `--eod-once` | Run the post-close sequence once, then exit |
 | `--tickers AAPL,MSFT` | Limit to specific tickers (default: all active) |
-| `--provider yahoo` | Data provider; `yahoo` is the default and recommended |
+| `--provider polygon` | Data provider (`polygon`, `yahoo`, or `twelvedata`); `polygon` is the default |
 | `--hourly-deep-once` | Repair eroded hourly history now, then exit |
 | `--retry-daily-failures` | Retry unresolved official daily rows, then exit |
 | `--force` | With `--hourly-deep-once`, refetch every ticker |
@@ -412,6 +412,40 @@ evidence.
 |---|---|
 | `GET /api/discovery/states?state=EMERGING_REVERSAL` | Filter the latest discovery snapshot |
 | `GET /api/stock/{ticker}/discovery-state` | Latest state, current-position overlay and transition history |
+
+### Signal research and validation
+
+`backend/scripts/run_alpha_research.py` validates a candidate cross-sectional feature/weight set
+before it can ever be promoted into the production `xsmom-1.0` signal. It is a manual research
+tool — never run by the scheduler — and only logs to the internal `research_runs` audit table.
+See [docs/SIGNAL_RESEARCH.md](docs/SIGNAL_RESEARCH.md) and
+[docs/MODEL_REGISTRY.md](docs/MODEL_REGISTRY.md) for the full promotion contract.
+
+```powershell
+.\backend\.venv\Scripts\python.exe .\backend\scripts\run_alpha_research.py --features mom_12_1 --horizon 21
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--start YYYY-MM-DD` | Start date for the evaluation window |
+| `--end YYYY-MM-DD` | End date for the evaluation window |
+| `--horizon N` | Forward return horizon in trading days (default `1`) |
+| `--train-days N` | Walk-forward training window length (default `252`) |
+| `--test-days N` | Walk-forward test window length (default `21`) |
+| `--embargo-days N` | Bars dropped between train/test to prevent label overlap leakage (default `2`) |
+| `--alpha N` | Ridge penalty, only used when `--model ridge` (default `10.0`) |
+| `--rolling` | Use a rolling training window instead of the default expanding window |
+| `--cost-bps N` | One-way transaction cost in bps applied to traded notional (default `2.0`) |
+| `--rebalance-days N` | Hold period; `1` rebalances daily (default `1`) |
+| `--features a,b,c` | Comma-separated feature subset to test (default: all daily features) |
+| `--hourly` | Include intraday features derived from hourly bars |
+| `--activity-filter {none,liquidity,composite}` | Restrict each test cross-section to its top-half by activity (default `none`) |
+| `--model {ridge,lgbm}` | `ridge` (default, linear) or `lgbm` (gradient-boosted trees; `pip install lightgbm scikit-learn` first) |
+| `--no-log` | Do not record this run in `research_runs` |
+
+The verdict is one of `ALPHA`, `PROMISING BUT UNDERPOWERED`, `RISK EXPOSURE, NOT ALPHA`, or
+`NO SIGNAL`. Only an `ALPHA` verdict justifies manually copying the validated weights into
+`backend/research/xsmom.py`'s `MODEL_WEIGHTS` — there is no automatic promotion path.
 
 
 ## Docker Alternative

@@ -88,7 +88,7 @@ def attach_xsmom_ranks(observations: pd.DataFrame,
     for column in (
         "xs_trade_date", "xs_side", "xs_decile", "xs_percentile",
         "xs_universe_size", "xs_age_days", "market_breadth",
-        "sector_breadth", "market_volatility_percentile",
+        "sector_breadth", "market_volatility_percentile", "trend_state",
     ):
         if column in out:
             out = out.drop(columns=column)
@@ -102,6 +102,7 @@ def attach_xsmom_ranks(observations: pd.DataFrame,
         out["market_breadth"] = np.nan
         out["sector_breadth"] = np.nan
         out["market_volatility_percentile"] = np.nan
+        out["trend_state"] = None
         return out
 
     out["trade_date"] = pd.to_datetime(out["trade_date"]).dt.normalize()
@@ -136,7 +137,7 @@ def attach_xsmom_ranks(observations: pd.DataFrame,
         column for column in (
             "xs_trade_date", "ticker", "xs_side", "xs_decile",
             "xs_percentile", "xs_universe_size", "market_breadth",
-            "sector_breadth", "market_volatility_percentile",
+            "sector_breadth", "market_volatility_percentile", "trend_state",
         ) if column in rank_frame
     ]
     out = out.merge(

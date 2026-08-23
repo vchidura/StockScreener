@@ -24,7 +24,7 @@ import argparse
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -50,7 +50,7 @@ def get_existing_dates(ticker: str, start_date: str, end_date: str) -> set:
     """Return the set of dates already in DB for this ticker in the given range."""
     with get_db_cursor(dict_cursor=False) as cur:
         cur.execute(
-            """SELECT datetime::date FROM stock_prices_daily
+            """SELECT (datetime AT TIME ZONE 'UTC')::date FROM stock_prices_daily
                WHERE ticker = %s AND datetime >= %s AND datetime <= %s""",
             (ticker, start_date, end_date),
         )
@@ -375,67 +375,74 @@ def fetch_daily_yfinance(tickers: list[str], days: int) -> dict[str, pd.DataFram
 def upsert_prices(ticker: str, df: pd.DataFrame, existing_dates: set) -> tuple[int, int]:
     """Upsert daily candle rows into stock_prices_daily. Returns (inserted, skipped)."""
     import math
+    from psycopg2.extras import execute_values
+
     today = datetime.utcnow().date()
-    inserted = 0
     skipped = 0
     rejected = 0
-    with get_db_cursor(dict_cursor=False) as cursor:
-        for idx, row in df.iterrows():
-            dt = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
-            # Strip timezone if present → store as naive UTC midnight
-            if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
-                dt = dt.replace(tzinfo=None)
-            dt_date = dt.date() if hasattr(dt, "date") else dt
+    rows = []
+    for idx, row in df.iterrows():
+        dt = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+        # Strip timezone if present → treat as a UTC midnight trading date
+        if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        dt_date = dt.date() if hasattr(dt, "date") else dt
 
-            # Skip dates already in the database
-            if dt_date in existing_dates:
-                skipped += 1
-                continue
+        # Skip dates already in the database
+        if dt_date in existing_dates:
+            skipped += 1
+            continue
 
-            # Skip weekend dates (Sat=5, Sun=6)
-            if hasattr(dt_date, 'weekday') and dt_date.weekday() >= 5:
-                rejected += 1
-                continue
+        # Skip weekend dates (Sat=5, Sun=6)
+        if hasattr(dt_date, 'weekday') and dt_date.weekday() >= 5:
+            rejected += 1
+            continue
 
-            # Reject future dates
-            if dt_date > today:
-                rejected += 1
-                continue
+        # Reject future dates
+        if dt_date > today:
+            rejected += 1
+            continue
 
-            vol = int(row["Volume"]) if pd.notna(row["Volume"]) else 0
-            o, h, l, c = float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
+        vol = int(row["Volume"]) if pd.notna(row["Volume"]) else 0
+        o, h, l, c = float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
 
-            # Reject NaN / Inf values
-            if any(math.isnan(x) or math.isinf(x) for x in (o, h, l, c)):
-                rejected += 1
-                continue
+        # Reject NaN / Inf values
+        if any(math.isnan(x) or math.isinf(x) for x in (o, h, l, c)):
+            rejected += 1
+            continue
 
-            # Validate OHLCV (price sanity: positive, H>=L, H>=O/C, L<=O/C)
-            if not is_valid_ohlcv(o, h, l, c, vol):
-                rejected += 1
-                continue
+        # Validate OHLCV (price sanity: positive, H>=L, H>=O/C, L<=O/C)
+        if not is_valid_ohlcv(o, h, l, c, vol):
+            rejected += 1
+            continue
 
-            # Normalize datetime to midnight (date only, no time component)
-            dt_normalized = datetime(dt_date.year, dt_date.month, dt_date.day)
+        # Normalize to midnight UTC (tz-aware, matches TIMESTAMPTZ column)
+        dt_normalized = datetime(dt_date.year, dt_date.month, dt_date.day, tzinfo=timezone.utc)
+        rows.append((ticker, dt_normalized, o, h, l, c, vol))
 
-            cursor.execute(
-                """
-                INSERT INTO stock_prices_daily
-                    (ticker, datetime, open_price, high, low, close_price, volume)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (ticker, datetime) DO UPDATE SET
-                    open_price  = EXCLUDED.open_price,
-                    high        = EXCLUDED.high,
-                    low         = EXCLUDED.low,
-                    close_price = EXCLUDED.close_price,
-                    volume      = EXCLUDED.volume
-                """,
-                (ticker, dt_normalized, o, h, l, c, vol),
-            )
-            inserted += 1
     if rejected > 0:
         print(f"    [{ticker}] {rejected} rows rejected (weekend/future/invalid)")
-    return inserted, skipped
+
+    if not rows:
+        return 0, skipped
+
+    with get_db_cursor(dict_cursor=False) as cursor:
+        execute_values(
+            cursor,
+            """
+            INSERT INTO stock_prices_daily
+                (ticker, datetime, open_price, high, low, close_price, volume)
+            VALUES %s
+            ON CONFLICT (ticker, datetime) DO UPDATE SET
+                open_price  = EXCLUDED.open_price,
+                high        = EXCLUDED.high,
+                low         = EXCLUDED.low,
+                close_price = EXCLUDED.close_price,
+                volume      = EXCLUDED.volume
+            """,
+            rows,
+        )
+    return len(rows), skipped
 
 
 # US Market hours (Eastern Time)

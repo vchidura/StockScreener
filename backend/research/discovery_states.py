@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import numpy as np
 import pandas as pd
@@ -18,6 +19,14 @@ REQUIRED_FEATURES = [
     "mom_12_6", "mom_12_1", "rev_5", "rev_21", "dist_ma50",
     "volume_ratio", "vol_ratio", "range_pct", *RISK_COLUMNS,
 ]
+
+
+def _evidence_json(payload: dict) -> str:
+    """PostgreSQL json rejects the NaN/Infinity literals json.dumps emits by default."""
+    return json.dumps({
+        key: None if isinstance(value, float) and not math.isfinite(value) else value
+        for key, value in payload.items()
+    })
 
 
 def _percentile(frame: pd.DataFrame, column: str) -> pd.Series:
@@ -230,7 +239,7 @@ def _classify_discovery_date(featured: pd.DataFrame, latest_date) -> pd.DataFram
         cross["state"] == "CONTINUATION", "CANDIDATE_ALPHA", "DISCOVERY_ONLY"
     )
     cross["evidence"] = cross.apply(
-        lambda row: json.dumps({
+        lambda row: _evidence_json({
             "activity_pct": round(float(row["activity_percentile"]), 4),
             "echo_pct": round(float(row["echo_percentile"]), 4)
                 if pd.notna(row["echo_percentile"]) else None,

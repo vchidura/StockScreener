@@ -39,7 +39,7 @@ from database import (
     migrate_selected_tickers_metadata,
 )
 
-TWELVE_DATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "90890bde745140f4993ec5641ccd2888")
+TWELVE_DATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 BASE_URL = "https://api.twelvedata.com"
 
 # Known ETFs for fallback classification

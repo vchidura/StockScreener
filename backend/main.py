@@ -17,6 +17,9 @@ from database import (
     get_latest_price_date,
     get_latest_quote,
     create_selected_tickers_table,
+    create_daily_table,
+    create_hourly_table,
+    create_intraday_table,
     get_tickers_overview,
     get_bulk_price_data,
     get_hourly_data,
@@ -162,6 +165,9 @@ async def log_requests(request: Request, call_next):
 async def startup_event():
     """Initialize database tables on startup."""
     create_selected_tickers_table()
+    create_daily_table()
+    create_hourly_table()
+    create_intraday_table()
     logger.info("Startup complete | tables initialized")
 
 
