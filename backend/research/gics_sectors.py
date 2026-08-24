@@ -28,6 +28,49 @@ IT_SOFTWARE = "IT - Software & Services"
 IT_HARDWARE = "IT - Semiconductors & Hardware"
 
 ETF_SECTOR = "ETF"
+
+# Real, market-cap-weighted sector benchmarks (all tracked with full daily/hourly history).
+# Using these instead of an equal-weight average of our own tracked names avoids both the
+# minimum-sample-size problem (an ETF represents the whole real sector) and universe imbalance
+# (e.g. Real Estate has only 6 tracked names but XLRE reflects the entire real sector).
+SECTOR_BENCHMARK_ETF: dict[str, str] = {
+    IT_SOFTWARE: "IGV",
+    IT_HARDWARE: "SMH",
+    "Financials": "XLF",
+    "Health Care": "XLV",
+    "Consumer Discretionary": "XLY",
+    "Communication Services": "XLC",
+    "Industrials": "XLI",
+    "Consumer Staples": "XLP",
+    "Energy": "XLE",
+    "Utilities": "XLU",
+    "Materials": "XLB",
+    "Real Estate": "XLRE",
+}
+
+# Broad-market benchmark for every event's "market alpha" leg, and the fallback sector benchmark
+# for ETF/unclassified tickers (an ETF's own return can't be its own benchmark).
+BROAD_MARKET_ETF = "SPY"
+
+# Used only when a ticker would otherwise be benchmarked against itself (SPY's own scanner
+# events, since BROAD_MARKET_ETF is SPY) — QQQ is the next broad-market proxy in line.
+ALTERNATE_MARKET_ETF = "QQQ"
+
+
+def sector_benchmark_ticker(sector: str | None) -> str:
+    """Sector ETF for `sector`, or the broad-market ETF when unmapped, ETF, or unclassified."""
+    if not sector:
+        return BROAD_MARKET_ETF
+    return SECTOR_BENCHMARK_ETF.get(sector, BROAD_MARKET_ETF)
+
+
+def resolve_benchmark_ticker(ticker: str, candidate: str) -> str:
+    """`candidate`, unless it equals `ticker` itself, in which case fall back off the chain."""
+    if candidate != ticker:
+        return candidate
+    return ALTERNATE_MARKET_ETF if ticker != ALTERNATE_MARKET_ETF else BROAD_MARKET_ETF
+
+
 UNCLASSIFIED_SECTOR = "Unclassified"
 
 # Foreign private issuers file 20-F rather than 10-K, so EDGAR assigns them no SIC code and

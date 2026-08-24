@@ -26,9 +26,15 @@ logger = logging.getLogger("scanner-events")
 def run_pipeline(intervals: tuple[str, ...] = ("1d", "1h"),
                  as_of: str | None = None) -> dict:
     """Evaluate prior events first, then capture the latest completed bar."""
+    valid = {"1d", "1h", "1wk"}
+    ordered = tuple(dict.fromkeys(intervals))
+    invalid = [interval for interval in ordered if interval not in valid]
+    if invalid:
+        raise ValueError(f"Unsupported interval(s): {invalid}. Valid: {sorted(valid)}")
+
     ensure_tables()
     results = {}
-    for interval in intervals:
+    for interval in ordered:
         evaluated = evaluate_outcomes(interval)
         captured = capture_events(interval, as_of=as_of)
         results[interval] = {"evaluated": evaluated, "captured": captured}

@@ -101,11 +101,11 @@ Shadow only — descriptive, does not gate recommendations. Written by
 
 | Scanner | Version | Status |
 |---|---|---|
-| `structured_trend_pullback` | `1.0` | Monitor only — raw pass, failed FDR |
-| `level_retest_rejection` | `1.2` | Collecting |
+| `structured_trend_pullback` | `1.0` | Collecting — no current ETF-benchmarked raw primary pass |
+| `level_retest_rejection` | `1.2` | Monitor only — three raw primary passes, failed FDR |
 | `breakout_expansion` | `1.0` | **Demoted 2026-08-22** — was robust, now monitor only (see below) |
 | `compression_breakout` | `0.1-shadow` | Monitor only — raw pass, failed FDR; 88% contained in `breakout_expansion` |
-| `failed_breakout_reversal` | `0.1-shadow` | Collecting |
+| `failed_breakout_reversal` | `0.1-shadow` | Monitor only — two raw primary passes, failed FDR |
 | `structure_reversal` | `1.0` | Collecting |
 | `sma200_reclaim_rejection` | `1.0` | Insufficient sample — 31 daily signal days vs 100-event gate |
 
@@ -117,6 +117,7 @@ update both together.
 Retirement, demotion and re-specification rules are precommitted in
 [SCANNER_EVENT_EVALUATION.md](SCANNER_EVENT_EVALUATION.md#retirement-and-re-specification).
 A revised detection threshold is never edited in place; it ships as a new scanner name and version.
+Promotion or demotion updates evidence status without changing that detector version.
 
 Two diagnostics support that section and should be rerun alongside each study:
 
@@ -194,48 +195,43 @@ backtesting (see repo memory / backfill decisions, currently 730 days).
 ## Latest confidence study snapshot
 
 From [research/scanner_confidence_study.json](../backend/research/scanner_confidence_study.json)
-(regenerate via `scripts/research_scanner_confidence.py`), generated 2026-08-23 after the sector
-reclassification:
+(regenerate via `scripts/research_scanner_confidence.py`), generated 2026-08-23 after the ETF
+benchmark refresh and weekly backfill:
 
 | Field | Value |
 |---|---|
 | `entry_model` | `next_bar_open_v2` |
 | `rank_overlay.model_version` | `xsmom-1.0` |
-| Observations | 293,687 matured outcomes; 87.2% fresh rank coverage |
-| Report rows | 1,434 across 41 slices |
+| Observations | 339,411 matured outcomes across `1d`, `1h` and `1wk`; 87.0% fresh rank coverage |
+| Report rows | 2,091 |
 | Qualification contract | 100 min events, 40 min independent periods, `t > 2` absolute + incremental alpha, positive early/late alpha required |
-| FDR control | Benjamini-Hochberg, `q <= 0.05` |
-| Raw passes | 3 primaries, 7 filters |
+| FDR control | Benjamini-Hochberg, `q <= 0.05`; all predeclared rows enter their family |
+| Raw passes | 7 primaries, 12 filters |
 | Robust primary results | **0** |
 | Robust filters | **0** |
 
-Three primaries cleared raw gates and none survived correction. Primary rows do not use sector, so
-these are unchanged by the reclassification — a useful consistency check on the rerun:
+Seven primaries cleared raw gates and none survived correction:
 
 | Scanner | Interval | Dir | Horizon | Events | Periods | Net alpha | `t` | `q` |
 |---|---|---|---:|---:|---:|---:|---:|---:|
-| `structured_trend_pullback` | `1d` | short | 5 | 3,629 | 222 | +0.588% | 2.39 | 0.402 |
-| `compression_breakout` | `1h` | long | 7 | 678 | 287 | +0.484% | 2.56 | 0.394 |
-| `breakout_expansion` | `1h` | long | 7 | 3,360 | 463 | +0.250% | 2.15 | 0.463 |
+| `level_retest_rejection` | `1d` | long | 5 | 20,496 | 247 | +0.402% | 2.27 | 0.284 |
+| `level_retest_rejection` | `1d` | long | 21 | 20,188 | 59 | +1.525% | 2.14 | 0.284 |
+| `breakout_expansion` | `1h` | long | 7 | 3,360 | 463 | +0.316% | 2.68 | 0.204 |
+| `compression_breakout` | `1h` | long | 7 | 678 | 287 | +0.522% | 2.71 | 0.204 |
+| `failed_breakout_reversal` | `1h` | long | 7 | 1,477 | 367 | +0.382% | 2.16 | 0.284 |
+| `failed_breakout_reversal` | `1h` | long | 21 | 1,467 | 145 | +0.909% | 2.13 | 0.284 |
+| `level_retest_rejection` | `1h` | long | 7 | 8,537 | 484 | +0.263% | 2.44 | 0.284 |
 
 `breakout_expansion` hourly long at 7 bars was the sole `ROBUST_PASS` of the previous study
-(`q=0.0147`). On the full 5-year daily / 2-year hourly sample it falls to `q=0.463`, so its
-evidence state reverts and its portal probability and live-alpha claims are suppressed. This is a
-demotion under
+(`q=0.0147`). It now records `q=0.204`, so its evidence state remains monitor-only and its portal
+probability and live-alpha claims are suppressed. This is a demotion under
 [SCANNER_EVENT_EVALUATION.md](SCANNER_EVENT_EVALUATION.md#retirement-and-re-specification),
 reversible on re-qualification.
 
-Seven filters cleared raw gates and none survived correction. The strongest,
-`structured_trend_pullback` `1h` long 21-bar `pullback_vwap_reclaim`, reached absolute `q=0.042`
-but has incremental `q=0.856` — it inherits its baseline's edge rather than adding conditional
-value, so absolute significance alone does not qualify it. Two filters appeared only after the
-sector change, both `rank_*` slices, because sector neutralization feeds `xsmom` percentiles;
-both carry `q >= 0.51` and are noise-level passes.
-
-The breadth guard cost less sample than expected: `sector_breadth_aligned` retained 92,226 events
-after roughly 22% of stocks were suppressed. Its `q` moved slightly the wrong way
-(0.456 to 0.481), which is the expected direction if the earlier value reflected noise rather
-than signal.
+Twelve filters cleared raw gates and none survived both required corrections. The strongest
+absolute result, `structured_trend_pullback` `1h` long 21-bar `pullback_vwap_reclaim`, has absolute
+`q=0.009` but incremental `q=0.793`; it inherits its baseline's edge rather than demonstrating
+incremental conditioning value.
 
 ## Confidence slices
 

@@ -35,6 +35,11 @@ costs, independent-period sampling, temporal stability, and false-discovery corr
 All thresholds above were fixed before the expanded rerun. A failed slice remains in the report and
 must not be silently retuned. New thresholds require a new scanner/study version.
 
+The declared baseline and filter families include every predeclared row even while a row is below
+the 100-event or 40-independent-period qualification floor. Those floors determine whether a row
+can earn a raw pass; they do not change family membership. This keeps correction independent of
+realized scanner frequency. Immature rows remain `UNRANKED` whatever their p-value or q-value.
+
 ## Probability Contract
 
 Scanner probability means the estimated frequency of a positive net return at one specific

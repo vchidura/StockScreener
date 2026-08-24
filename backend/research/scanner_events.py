@@ -853,90 +853,18 @@ def _bars_for_event(event: dict) -> pd.DataFrame:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     return frame
 
-
-def _benchmark_return(interval: str, signal_time: datetime, horizon: int) -> float | None:
-    table = "stock_prices_daily" if interval in DAILY_PRICE_INTERVALS else "stock_prices_hourly"
-    timestamp_expr = ("datetime AT TIME ZONE 'UTC'"
-                      if interval in DAILY_PRICE_INTERVALS else "datetime")
-    with get_db_cursor(dict_cursor=False) as cur:
-        cur.execute(f"""
-            WITH future AS (
-                SELECT ticker, open_price, close_price,
-                       ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY datetime) AS rn
-                FROM {table} WHERE {timestamp_expr} > %s
-            ), entry AS (
-                SELECT ticker, open_price FROM future WHERE rn = 1
-            ), exit AS (
-                SELECT ticker, close_price FROM future WHERE rn = %s
-            )
-            SELECT AVG(exit.close_price / NULLIF(entry.open_price, 0) - 1)
-            FROM entry JOIN exit USING (ticker)
-        """, (signal_time, horizon))
-        value = cur.fetchone()[0]
-    return float(value) if value is not None else None
-
-
-def _batched_benchmark_returns(interval: str, due: list[dict]) -> dict[tuple, float | None]:
-    """Compute all due benchmark returns in one interval-wide window-function pass."""
-    if not due:
-        return {}
-    signal_times = sorted({event["signal_time"] for event in due})
-    benchmark_keys = (
-        sorted({value.date() for value in signal_times})
-        if interval in DAILY_PRICE_INTERVALS else signal_times
-    )
-    horizons = sorted({int(event["horizon_bars"]) for event in due})
-    lead_columns = ",\n".join([
-        "LEAD(open_price, 1) OVER "
-        "(PARTITION BY ticker ORDER BY datetime) AS next_open",
-        *[
-            f"LEAD(close_price, {horizon}) OVER "
-            f"(PARTITION BY ticker ORDER BY datetime) AS exit_{horizon}"
-            for horizon in horizons
-        ],
-    ])
-    return_columns = ",\n".join(
-        f"AVG(exit_{horizon} / NULLIF(next_open, 0) - 1) AS return_{horizon}"
-        for horizon in horizons
-    )
-    start = min(signal_times)
-    end = max(signal_times) + pd.Timedelta(
-        days=45 if interval in DAILY_PRICE_INTERVALS else 14
-    )
-    table = "stock_prices_daily" if interval in DAILY_PRICE_INTERVALS else "stock_prices_hourly"
-    timestamp_expr = ("datetime AT TIME ZONE 'UTC'"
-                      if interval in DAILY_PRICE_INTERVALS else "datetime")
-    group_expr = (f"({timestamp_expr})::date"
-                  if interval in DAILY_PRICE_INTERVALS else timestamp_expr)
-    with get_db_cursor() as cur:
-        cur.execute(f"""
-            WITH bars AS (
-                  SELECT {group_expr} AS signal_key, ticker,
-                       {lead_columns}
-                FROM {table}
-                WHERE {timestamp_expr} BETWEEN %s AND %s
-            )
-            SELECT signal_key, {return_columns}
-            FROM bars
-            WHERE signal_key = ANY(%s)
-            GROUP BY signal_key
-        """, (start, end, benchmark_keys))
-        rows = cur.fetchall()
-    result: dict[tuple, float | None] = {}
-    for row in rows:
-        for horizon in horizons:
-            value = row[f"return_{horizon}"]
-            key_time = row["signal_key"] if interval == "1d" else row["signal_key"]
-            if interval in DAILY_PRICE_INTERVALS:
-                matching_signal = next(
-                    value for value in signal_times if value.date() == key_time
-                )
-            else:
-                matching_signal = key_time
-            result[(interval, matching_signal, horizon)] = (
-                float(value) if value is not None else None
-            )
-    return result
+def _etf_forward_return(etf_bars: pd.DataFrame | None, signal_time, horizon: int) -> float | None:
+    """ETF forward return using the same next-bar-open/horizon-bar-close convention as stocks,
+    so the benchmark leg of alpha lines up with how the stock's own return was measured."""
+    if etf_bars is None or etf_bars.empty:
+        return None
+    bars = etf_bars[etf_bars["bar_time"] > signal_time].head(horizon)
+    if len(bars) < horizon:
+        return None
+    entry = float(bars.iloc[0]["open"])
+    if not np.isfinite(entry) or entry <= 0:
+        return None
+    return float(bars.iloc[-1]["close"] / entry - 1)
 
 
 def _batched_forward_bars(interval: str, due: list[dict]) -> dict[str, pd.DataFrame]:
@@ -990,7 +918,35 @@ def evaluate_outcomes(interval: str, limit: int = 5000) -> dict:
     due = _due_events(interval, limit=limit)
     if not due:
         return {"due": 0, "inserted": 0}
-    benchmark_cache = _batched_benchmark_returns(interval, due)
+    from research.gics_sectors import (
+        ALTERNATE_MARKET_ETF, BROAD_MARKET_ETF, resolve_benchmark_ticker, sector_benchmark_ticker,
+    )
+
+    tickers_in_due = sorted({str(event["ticker"]) for event in due})
+    with get_db_cursor() as cur:
+        cur.execute(
+            "SELECT ticker, sector FROM selected_tickers WHERE ticker = ANY(%s)",
+            (tickers_in_due,),
+        )
+        sector_by_ticker = {row["ticker"]: row["sector"] for row in cur.fetchall()}
+    # Sector ETF per ticker, falling back to the broad-market ETF for ETFs/unclassified tickers,
+    # and to ALTERNATE_MARKET_ETF for SPY's own events (BROAD_MARKET_ETF is SPY, so a ticker never
+    # ends up benchmarked against itself on either leg).
+    market_ticker_by_ticker = {
+        ticker: resolve_benchmark_ticker(ticker, BROAD_MARKET_ETF) for ticker in tickers_in_due
+    }
+    sector_ticker_by_ticker = {
+        ticker: resolve_benchmark_ticker(ticker, sector_benchmark_ticker(sector_by_ticker.get(ticker)))
+        for ticker in tickers_in_due
+    }
+    etf_tickers_needed = sorted({
+        BROAD_MARKET_ETF, ALTERNATE_MARKET_ETF,
+        *market_ticker_by_ticker.values(), *sector_ticker_by_ticker.values(),
+    })
+    earliest_signal = min(event["signal_time"] for event in due)
+    etf_bars = _batched_forward_bars(
+        interval, [{"ticker": t, "signal_time": earliest_signal} for t in etf_tickers_needed]
+    )
     batched_bars = _batched_forward_bars(interval, due)
     rows = []
     for event in due:
@@ -1007,19 +963,22 @@ def evaluate_outcomes(interval: str, limit: int = 5000) -> dict:
         entry = float(bars.iloc[0]["open"])
         if not np.isfinite(entry) or entry <= 0:
             continue
+        horizon = int(event["horizon_bars"])
         raw_return = float(bars.iloc[-1]["close"] / entry - 1)
         signed = direction * raw_return
         cost = float(event["round_trip_cost_bps"] or 0) / 10_000.0
-        key = (interval, event["signal_time"], int(event["horizon_bars"]))
-        if key not in benchmark_cache or benchmark_cache[key] is None:
-            benchmark_cache[key] = _benchmark_return(*key)
-        benchmark = benchmark_cache[key]
-        if benchmark is None or not np.isfinite(benchmark):
-            continue
-        signed_benchmark = direction * benchmark if benchmark is not None else None
-        alpha = signed - signed_benchmark if signed_benchmark is not None else None
-        net_signed = signed - cost
+
+        market_ticker = market_ticker_by_ticker.get(str(event["ticker"]), BROAD_MARKET_ETF)
+        benchmark = _etf_forward_return(etf_bars.get(market_ticker), signal_time, horizon)
+        alpha = signed - direction * benchmark if benchmark is not None else None
         net_alpha = alpha - cost if alpha is not None else None
+
+        sector_ticker = sector_ticker_by_ticker.get(str(event["ticker"]), BROAD_MARKET_ETF)
+        sector_benchmark = _etf_forward_return(etf_bars.get(sector_ticker), signal_time, horizon)
+        sector_alpha = signed - direction * sector_benchmark if sector_benchmark is not None else None
+        sector_net_alpha = sector_alpha - cost if sector_alpha is not None else None
+
+        net_signed = signed - cost
         favorable = ((bars["high"].max() / entry - 1) if direction == 1
                      else (1 - bars["low"].min() / entry))
         adverse = ((bars["low"].min() / entry - 1) if direction == 1
@@ -1038,6 +997,7 @@ def evaluate_outcomes(interval: str, limit: int = 5000) -> dict:
             raw_return, signed, net_signed, benchmark, alpha, net_alpha,
             adverse, favorable, mae_r, mfe_r, stop_hit, target_hit, first,
             bars.iloc[0]["bar_time"], entry, OUTCOME_ENTRY_MODEL,
+            market_ticker, sector_ticker, sector_benchmark, sector_alpha, sector_net_alpha,
         ))
     inserted = 0
     if rows:
@@ -1047,12 +1007,64 @@ def evaluate_outcomes(interval: str, limit: int = 5000) -> dict:
                     event_id, horizon_bars, bars_observed, exit_time, exit_price,
                     raw_return, signed_return, net_signed_return, benchmark_return,
                     alpha_return, net_alpha_return, mae_pct, mfe_pct, mae_r, mfe_r,
-                    stop_hit, target_hit, first_hit, entry_time, entry_price, entry_model
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    stop_hit, target_hit, first_hit, entry_time, entry_price, entry_model,
+                    market_benchmark_ticker, sector_benchmark_ticker, sector_benchmark_return,
+                    sector_alpha_return, sector_net_alpha_return
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (event_id, horizon_bars) DO NOTHING
             """, rows)
             inserted = cur.rowcount
     return {"due": len(due), "inserted": inserted}
+
+
+def repair_recent_outcomes(interval: str, sessions: int = 2) -> dict:
+    """Delete outcomes for recent sessions so they can be regenerated from latest bars.
+
+    This is intended for bounded replay (for example, EOD correction of intraday
+    1h outcomes after final hourly bars are loaded).
+    """
+    if interval not in HORIZONS:
+        raise ValueError(f"Unsupported interval: {interval}")
+    if sessions < 1:
+        raise ValueError("sessions must be at least 1")
+
+    ensure_tables()
+    with get_db_cursor() as cur:
+        if interval in DAILY_PRICE_INTERVALS:
+            cur.execute("""
+                SELECT DISTINCT datetime::date AS d
+                FROM stock_prices_daily
+                ORDER BY d DESC
+                LIMIT %s
+            """, (sessions,))
+        else:
+            cur.execute("""
+                SELECT DISTINCT (datetime AT TIME ZONE 'America/New_York')::date AS d
+                FROM stock_prices_hourly
+                ORDER BY d DESC
+                LIMIT %s
+            """, (sessions,))
+        session_dates = [row["d"] for row in cur.fetchall()]
+
+    if not session_dates:
+        return {"interval": interval, "sessions": 0, "deleted": 0, "session_dates": []}
+
+    with get_db_cursor() as cur:
+        cur.execute("""
+            DELETE FROM scanner_event_outcomes o
+            USING scanner_events e
+            WHERE o.event_id = e.event_id
+              AND e.interval = %s
+              AND e.trade_date = ANY(%s)
+        """, (interval, session_dates))
+        deleted = cur.rowcount
+
+    return {
+        "interval": interval,
+        "sessions": len(session_dates),
+        "deleted": deleted,
+        "session_dates": [str(value) for value in sorted(session_dates)],
+    }
 
 
 def reset_stale_outcomes(interval: str) -> dict:
@@ -1215,16 +1227,107 @@ def _review_priority(interval: str, direction: int,
     ]
 
 
+def _ticker_breadth_stats(interval: str) -> dict[tuple, dict]:
+    """Distinct-ticker count and top-5 concentration per scanner/direction/horizon (backlog item 1, 2).
+
+    Computed separately from qualification_summary's horizon-spaced sampling, which intentionally
+    collapses same-instant tickers into one observation for independence — breadth needs the raw
+    per-ticker event counts that step discards.
+    """
+    with get_db_cursor() as cur:
+        cur.execute("""
+            SELECT e.scanner_name, e.scanner_version, e.interval, e.direction,
+                   o.horizon_bars, e.ticker, COUNT(*) AS ticker_events
+            FROM scanner_events e
+            JOIN scanner_event_outcomes o ON o.event_id = e.event_id
+            WHERE e.interval = %s
+            GROUP BY e.scanner_name, e.scanner_version, e.interval, e.direction,
+                     o.horizon_bars, e.ticker
+        """, (interval,))
+        rows = [dict(row) for row in cur.fetchall()]
+    breadth: dict[tuple, dict] = {}
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return breadth
+    group_columns = ["scanner_name", "scanner_version", "interval", "direction", "horizon_bars"]
+    for key, group in frame.groupby(group_columns, sort=True):
+        counts = group["ticker_events"].sort_values(ascending=False)
+        total = int(counts.sum())
+        breadth[key] = {
+            "distinct_tickers": int(len(counts)),
+            "top5_concentration": float(counts.head(5).sum() / total) if total else None,
+        }
+    return breadth
+
+
+def _replay_market_regime() -> dict:
+    """Point-in-time BULL/BEAR/CHOPPY per calendar day, from SPY's full daily history (backlog item 3).
+
+    Vectorized replay of screeners.analyze_market_regime's classification rules (same priority
+    order, same SMA20/50/200 + RSI thresholds) so historical qualification periods can be bucketed
+    by the market condition they occurred in, instead of only a coarse early/late split.
+    """
+    with get_db_cursor() as cur:
+        cur.execute("""
+            SELECT datetime::date AS trade_date, close_price AS close
+            FROM stock_prices_daily WHERE ticker = 'SPY' ORDER BY datetime
+        """)
+        spy = pd.DataFrame([dict(row) for row in cur.fetchall()])
+    if spy.empty:
+        return {}
+    close = spy["close"].astype(float)
+    sma20 = close.rolling(20).mean()
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+
+    above_200 = close > sma200
+    above_20 = close > sma20
+    golden = sma50 > sma200
+
+    conditions = [
+        above_200 & golden & above_20,       # Strong Bull
+        above_200 & golden & ~above_20,      # Bull
+        above_200 & ~golden,                 # Caution
+        ~above_200 & above_20 & (rsi > 40),  # Bear Rally
+        ~above_200 & ~golden & (rsi > 30),   # Bear
+        ~above_200 & (rsi <= 30),            # Strong Bear
+    ]
+    choices = ["BULL", "BULL", "CHOPPY", "BEAR", "BEAR", "BEAR"]
+    bucket = pd.Series(np.select(conditions, choices, default="CHOPPY"), index=spy.index)
+    bucket[sma200.isna()] = None
+    return dict(zip(spy["trade_date"], bucket))
+
+
+def _regime_alpha_stats(sample: pd.DataFrame, regime_by_date: dict) -> dict:
+    """Mean net alpha and period count per BULL/BEAR/CHOPPY bucket for one qualification sample."""
+    regimes = sample["trade_date"].map(regime_by_date)
+    stats: dict[str, dict] = {}
+    for bucket in ("BULL", "BEAR", "CHOPPY"):
+        bucket_alpha = pd.to_numeric(sample.loc[regimes == bucket, "net_alpha"], errors="coerce").dropna()
+        stats[bucket] = {
+            "mean_alpha": float(bucket_alpha.mean()) if len(bucket_alpha) else None,
+            "periods": int(len(bucket_alpha)),
+        }
+    return stats
+
+
 def qualification_summary(interval: str) -> list[dict]:
     """Aggregate promotion report across states using horizon-spaced portfolios."""
     if interval not in HORIZONS:
         raise ValueError(f"Unsupported interval: {interval}")
+    breadth_by_key = _ticker_breadth_stats(interval)
+    regime_by_date = _replay_market_regime()
     with get_db_cursor() as cur:
         cur.execute("""
             SELECT e.scanner_name, e.scanner_version, e.interval, e.direction,
                    o.horizon_bars, e.signal_time, e.trade_date,
                    AVG(o.net_signed_return) AS net_return,
                    AVG(o.net_alpha_return) AS net_alpha,
+                   AVG(o.sector_net_alpha_return) AS sector_net_alpha,
                    AVG(o.mae_pct) AS mae_pct, AVG(o.mfe_pct) AS mfe_pct,
                    AVG(o.mae_r) AS mae_r, AVG(o.mfe_r) AS mfe_r,
                    AVG(CASE WHEN o.first_hit = 'STOP' THEN 1.0 ELSE 0.0 END) AS stop_first,
@@ -1282,9 +1385,18 @@ def qualification_summary(interval: str) -> list[dict]:
             float(alpha.std(ddof=1) / np.sqrt(len(alpha)))
             if len(alpha) > 1 and alpha.std(ddof=1) > 0 else None
         )
+        # Sector alpha reuses the same horizon-spaced sample; it's a diagnostic, not a second gate
+        # (backlog item 9): a scanner can fail this while passing the market-alpha gate above, which
+        # would mean its edge is riding sector rotation rather than genuine stock-specific timing.
+        sector_alpha_series = pd.to_numeric(sample["sector_net_alpha"], errors="coerce").dropna()
+        sector_alpha_t = (
+            float(sector_alpha_series.mean() / (sector_alpha_series.std(ddof=1) / np.sqrt(len(sector_alpha_series))))
+            if len(sector_alpha_series) > 1 and sector_alpha_series.std(ddof=1) > 0 else None
+        )
         midpoint = max(1, periods // 2)
         early_alpha = _mean(sample.iloc[:midpoint]["net_alpha"])
         late_alpha = _mean(sample.iloc[midpoint:]["net_alpha"])
+        regime_alpha = _regime_alpha_stats(sample, regime_by_date)
         mean_alpha = _mean(alpha)
         events = int(pd.to_numeric(group["names"]).sum())
         hit_rate = float((pd.to_numeric(sample["net_return"]) > 0).mean()) \
@@ -1337,6 +1449,11 @@ def qualification_summary(interval: str) -> list[dict]:
             "mean_mfe_pct": _mean(sample["mfe_pct"]),
             "stop_first_rate": _mean(sample["stop_first"]),
             "target_first_rate": _mean(sample["target_first"]),
+            "mean_sector_alpha": _mean(sample["sector_net_alpha"]),
+            "sector_alpha_t_stat": sector_alpha_t,
+            "distinct_tickers": breadth_by_key.get(key, {}).get("distinct_tickers"),
+            "top5_concentration": breadth_by_key.get(key, {}).get("top5_concentration"),
+            "regime_alpha": regime_alpha,
             "qualification_status": "PRIMARY_PASS" if qualified else "NOT_QUALIFIED",
             "evidence_status": "MONITOR_ONLY" if qualified else "UNRANKED",
             "calibration_status": "NOT_ELIGIBLE",
@@ -1492,14 +1609,42 @@ def recent_events(interval: str | None = None, limit: int = 100) -> list[dict]:
         return [dict(row) for row in cur.fetchall()]
 
 
-def latest_ticker_signals(interval: str | None = None, limit: int = 500) -> list[dict]:
-    """Latest observed scanner occurrence for each ticker."""
+def latest_ticker_signals(
+    interval: str | None = None, limit: int = 500,
+    daily_session_lookback: int = 10, hourly_session_lookback: int = 2,
+) -> list[dict]:
+    """Latest observed scanner occurrence for each ticker, restricted to recent sessions.
+
+    Hourly gets its own, much shorter cutoff than daily/weekly: an hourly trade_date is one
+    calendar day but carries ~7 bars, so the same session count would keep far more rows than
+    the daily/weekly side needs. Bounding by trade_date lets the ranking window and per-row
+    subqueries use idx_scanner_occurrences_trade_date instead of scanning full history.
+    """
     interval_clause = "AND e.interval = %s" if interval else ""
-    params: list = [interval] if interval else []
+    params: list = [daily_session_lookback, hourly_session_lookback]
+    params += [interval] if interval else []
     params.append(limit)
     with get_db_cursor() as cur:
         cur.execute(f"""
-            WITH ranked AS (
+            WITH daily_cutoff AS (
+                SELECT MIN(trade_date) AS cutoff_date FROM (
+                    SELECT DISTINCT o.trade_date
+                    FROM scanner_event_occurrences o
+                    JOIN scanner_events e ON e.event_id = o.event_id
+                    WHERE e.interval IN ('1d', '1wk')
+                    ORDER BY o.trade_date DESC
+                    LIMIT %s
+                ) recent
+            ), hourly_cutoff AS (
+                SELECT MIN(trade_date) AS cutoff_date FROM (
+                    SELECT DISTINCT o.trade_date
+                    FROM scanner_event_occurrences o
+                    JOIN scanner_events e ON e.event_id = o.event_id
+                    WHERE e.interval = '1h'
+                    ORDER BY o.trade_date DESC
+                    LIMIT %s
+                ) recent
+            ), ranked AS (
                 SELECT e.event_id, e.scanner_name, e.scanner_version, e.interval,
                        e.ticker, o.signal_time, o.trade_date,
                        e.direction, o.trigger_type, o.discovery_state,
@@ -1525,7 +1670,10 @@ def latest_ticker_signals(interval: str | None = None, limit: int = 500) -> list
                                         ORDER BY d.trade_date DESC
                                         LIMIT 1
                                 ) current_state ON TRUE
-                WHERE TRUE {interval_clause}
+                WHERE (
+                    (e.interval = '1h' AND o.trade_date >= (SELECT cutoff_date FROM hourly_cutoff))
+                    OR (e.interval IN ('1d', '1wk') AND o.trade_date >= (SELECT cutoff_date FROM daily_cutoff))
+                ) {interval_clause}
             )
             SELECT r.event_id, r.scanner_name, r.scanner_version, r.interval,
                    r.ticker, r.signal_time, r.direction, r.trigger_type,
@@ -1636,6 +1784,198 @@ def latest_sector_performance(sessions: int = 1) -> list[dict]:
             ORDER BY average_return DESC, sector
         """, (sessions - 1,))
         return [dict(row) for row in cur.fetchall()]
+
+
+SECTOR_ROTATION_SESSIONS = (1, 5, 10, 21, 63)
+
+# Finer-grained than the rotation table: scopes only the leaders/laggards drill-down, so a
+# 1-2-3 day ladder doesn't force three near-duplicate columns onto the table itself.
+LEADER_LAGGARD_SESSIONS = (1, 2, 3, 5, 10, 21, 63)
+
+
+def _sector_ticker_returns(cur, sessions: int) -> list[dict]:
+    """Per-ticker close-to-close return over `sessions` trading sessions, with sector."""
+    cur.execute("""
+        WITH latest_date AS (
+            SELECT MAX(datetime::date) AS trade_date
+            FROM stock_prices_daily
+        ), current_bars AS (
+            SELECT DISTINCT ON (p.ticker)
+                   p.ticker, p.close_price, p.datetime::date AS trade_date
+            FROM stock_prices_daily p
+            CROSS JOIN latest_date d
+            WHERE p.datetime::date = d.trade_date
+            ORDER BY p.ticker, p.datetime DESC
+        )
+        SELECT c.ticker, t.sector, c.trade_date,
+               (c.close_price / NULLIF(previous.close_price, 0) - 1)::double precision AS return_pct
+        FROM current_bars c
+        JOIN selected_tickers t ON t.ticker = c.ticker AND t.is_active = TRUE
+        JOIN LATERAL (
+            SELECT p.close_price
+            FROM stock_prices_daily p
+            WHERE p.ticker = c.ticker AND p.datetime::date < c.trade_date
+            ORDER BY p.datetime DESC
+            OFFSET %s
+            LIMIT 1
+        ) previous ON TRUE
+        WHERE t.sector IS NOT NULL AND BTRIM(t.sector) <> ''
+          AND t.sector <> 'ETF'
+    """, (sessions - 1,))
+    return [dict(row) for row in cur.fetchall() if row["return_pct"] is not None]
+
+
+def sector_intelligence(leader_limit: int = 5) -> dict:
+    """Sector rollup beyond a plain leaderboard: rotation, discovery mix, and cross-sectional skew.
+
+    Combines four data sources already collected for scanner/discovery research so the sector
+    page adds context instead of repeating the single-session ranking table.
+    """
+    with get_db_cursor() as cur:
+        all_sessions = sorted(set(SECTOR_ROTATION_SESSIONS) | set(LEADER_LAGGARD_SESSIONS))
+        returns_by_session = {
+            sessions: _sector_ticker_returns(cur, sessions) for sessions in all_sessions
+        }
+
+        cur.execute("""
+            SELECT sector, COUNT(*)::integer AS count
+            FROM selected_tickers
+            WHERE is_active = TRUE AND sector IS NOT NULL AND BTRIM(sector) <> '' AND sector <> 'ETF'
+            GROUP BY sector
+        """)
+        sector_universe = {row["sector"]: row["count"] for row in cur.fetchall()}
+
+        cur.execute("""
+            SELECT d.trade_date FROM market_discovery_states d
+            ORDER BY d.trade_date DESC LIMIT 1
+        """)
+        discovery_row = cur.fetchone()
+        discovery_mix: dict[str, dict[str, int]] = {}
+        if discovery_row:
+            cur.execute("""
+                SELECT t.sector, d.state, COUNT(*)::integer AS count
+                FROM market_discovery_states d
+                JOIN selected_tickers t ON t.ticker = d.ticker AND t.is_active = TRUE
+                WHERE d.trade_date = %s
+                  AND t.sector IS NOT NULL AND BTRIM(t.sector) <> '' AND t.sector <> 'ETF'
+                GROUP BY t.sector, d.state
+            """, (discovery_row["trade_date"],))
+            for row in cur.fetchall():
+                discovery_mix.setdefault(row["sector"], {})[row["state"]] = row["count"]
+
+        cur.execute("SELECT MAX(trade_date) AS d FROM cross_sectional_signals")
+        xs_row = cur.fetchone()
+        xs_skew: dict[str, dict[str, float | int]] = {}
+        xs_names: dict[str, list[dict]] = {}
+        if xs_row and xs_row["d"]:
+            cur.execute("""
+                SELECT t.sector,
+                       COUNT(*) FILTER (WHERE s.side = 'LONG')::integer AS long_skew,
+                       COUNT(*) FILTER (WHERE s.side = 'SHORT')::integer AS short_skew,
+                       AVG(s.percentile)::double precision AS average_percentile,
+                       COUNT(*)::integer AS covered
+                FROM cross_sectional_signals s
+                JOIN selected_tickers t ON t.ticker = s.ticker AND t.is_active = TRUE
+                WHERE s.trade_date = %s
+                  AND t.sector IS NOT NULL AND BTRIM(t.sector) <> '' AND t.sector <> 'ETF'
+                GROUP BY t.sector
+            """, (xs_row["d"],))
+            for row in cur.fetchall():
+                xs_skew[row["sector"]] = {
+                    "long_skew": row["long_skew"], "short_skew": row["short_skew"],
+                    "average_percentile": row["average_percentile"], "covered": row["covered"],
+                }
+
+            cur.execute("""
+                SELECT t.sector, s.ticker, s.side, s.percentile
+                FROM cross_sectional_signals s
+                JOIN selected_tickers t ON t.ticker = s.ticker AND t.is_active = TRUE
+                WHERE s.trade_date = %s AND s.side IN ('LONG', 'SHORT')
+                  AND t.sector IS NOT NULL AND BTRIM(t.sector) <> '' AND t.sector <> 'ETF'
+                ORDER BY t.sector,
+                         CASE WHEN s.side = 'LONG' THEN s.percentile ELSE -s.percentile END DESC
+            """, (xs_row["d"],))
+            for row in cur.fetchall():
+                xs_names.setdefault(row["sector"], []).append({
+                    "ticker": row["ticker"], "side": row["side"], "percentile": row["percentile"],
+                })
+
+    for sector, skew in xs_skew.items():
+        names = xs_names.get(sector, [])
+        skew["net_tilt"] = (skew["long_skew"] - skew["short_skew"]) / skew["covered"] if skew["covered"] else None
+        skew["long_names"] = [n["ticker"] for n in names if n["side"] == "LONG"][:leader_limit]
+        skew["short_names"] = [n["ticker"] for n in names if n["side"] == "SHORT"][:leader_limit]
+
+    # Aggregate each session window's returns by sector (average return + positive breadth + rank).
+    session_aggregates: dict[int, dict[str, dict]] = {}
+    for sessions, rows in returns_by_session.items():
+        by_sector: dict[str, list[float]] = {}
+        for row in rows:
+            by_sector.setdefault(row["sector"], []).append(row["return_pct"])
+        aggregate = {
+            sector: {
+                "average_return": sum(values) / len(values),
+                "positive_breadth": sum(1 for v in values if v > 0) / len(values),
+                "tickers": len(values),
+            }
+            for sector, values in by_sector.items()
+        }
+        ranked = sorted(aggregate.items(), key=lambda item: item[1]["average_return"], reverse=True)
+        for rank, (sector, _) in enumerate(ranked, start=1):
+            aggregate[sector]["rank"] = rank
+        session_aggregates[sessions] = aggregate
+
+    all_sectors = sorted(set().union(
+        *[aggregate.keys() for aggregate in session_aggregates.values()],
+        discovery_mix.keys(), xs_skew.keys(),
+    ))
+
+    one_session_rows = returns_by_session.get(1, [])
+    leaders_by_sector: dict[str, dict[str, list[dict]]] = {}
+    laggards_by_sector: dict[str, dict[str, list[dict]]] = {}
+    for sessions, rows in returns_by_session.items():
+        by_sector_rows: dict[str, list[dict]] = {}
+        for row in rows:
+            by_sector_rows.setdefault(row["sector"], []).append(row)
+        for sector, sector_rows in by_sector_rows.items():
+            sector_rows = sorted(sector_rows, key=lambda row: row["return_pct"], reverse=True)
+            leaders_by_sector.setdefault(sector, {})[str(sessions)] = [
+                {"ticker": row["ticker"], "return_pct": row["return_pct"]} for row in sector_rows[:leader_limit]
+            ]
+            laggards_by_sector.setdefault(sector, {})[str(sessions)] = [
+                {"ticker": row["ticker"], "return_pct": row["return_pct"]} for row in sector_rows[-leader_limit:][::-1]
+            ]
+
+    fastest_session, slowest_session = min(SECTOR_ROTATION_SESSIONS), max(SECTOR_ROTATION_SESSIONS)
+    results = []
+    for sector in all_sectors:
+        rotation = {
+            str(sessions): session_aggregates.get(sessions, {}).get(sector)
+            for sessions in SECTOR_ROTATION_SESSIONS
+        }
+        fast_rank = (session_aggregates.get(fastest_session, {}).get(sector) or {}).get("rank")
+        slow_rank = (session_aggregates.get(slowest_session, {}).get(sector) or {}).get("rank")
+        rotation_delta = (slow_rank - fast_rank) if fast_rank is not None and slow_rank is not None else None
+        results.append({
+            "sector": sector,
+            "rotation": rotation,
+            "rotation_delta": rotation_delta,
+            "discovery_mix": discovery_mix.get(sector, {}),
+            "discovery_universe": sector_universe.get(sector, 0),
+            "cross_sectional_skew": xs_skew.get(sector),
+            "leaders": leaders_by_sector.get(sector, {}),
+            "laggards": laggards_by_sector.get(sector, {}),
+        })
+    results.sort(key=lambda row: (row["rotation"].get(str(fastest_session)) or {}).get("average_return", 0), reverse=True)
+
+    return {
+        "trade_date": one_session_rows[0]["trade_date"].isoformat() if one_session_rows else None,
+        "discovery_trade_date": discovery_row["trade_date"].isoformat() if discovery_row else None,
+        "cross_sectional_trade_date": xs_row["d"].isoformat() if xs_row and xs_row["d"] else None,
+        "sessions": list(SECTOR_ROTATION_SESSIONS),
+        "leader_sessions": list(LEADER_LAGGARD_SESSIONS),
+        "results": results,
+    }
 
 
 def ticker_events(ticker: str, limit: int = 50) -> list[dict]:

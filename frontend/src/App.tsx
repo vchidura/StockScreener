@@ -8,7 +8,8 @@ import BearishBounce from './pages/BearishBounce'
 import FibonacciScreener from './pages/FibonacciScreener'
 import TickerDetail from './pages/TickerDetail'
 import TickersOverview from './pages/TickersOverview'
-import ScannerEvaluation from './pages/ScannerEvaluation'
+import SectorIntelligence from './pages/SectorIntelligence'
+import ScannerResults from './pages/ScannerResults'
 import { getTickers } from './services/api'
 
 function TickerSearch() {
@@ -27,7 +28,15 @@ function TickerSearch() {
   useEffect(() => {
     if (!query.trim()) { setFiltered([]); setOpen(false); return }
     const q = query.toUpperCase()
-    setFiltered(tickers.filter(t => t.includes(q)).slice(0, 12))
+    const exact: string[] = []
+    const startsWith: string[] = []
+    const contains: string[] = []
+    for (const t of tickers) {
+      if (t === q) exact.push(t)
+      else if (t.startsWith(q)) startsWith.push(t)
+      else if (t.includes(q)) contains.push(t)
+    }
+    setFiltered([...exact, ...startsWith, ...contains].slice(0, 12))
     setOpen(true)
     setHighlightIdx(-1)
   }, [query, tickers])
@@ -51,8 +60,11 @@ function TickerSearch() {
     else if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx(i => Math.max(i - 1, 0)) }
     else if (e.key === 'Enter') {
       e.preventDefault()
+      const exact = query.trim().toUpperCase()
       if (highlightIdx >= 0 && filtered[highlightIdx]) goToTicker(filtered[highlightIdx])
-      else if (query.trim()) goToTicker(query.trim().toUpperCase())
+      else if (tickers.includes(exact)) goToTicker(exact)
+      else if (filtered[0]) goToTicker(filtered[0])
+      else if (exact) goToTicker(exact)
     }
     else if (e.key === 'Escape') setOpen(false)
   }
@@ -115,11 +127,6 @@ function App() {
         </div>
         <ul className="navbar-nav">
           <li>
-            <NavLink to="/" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
-              Dashboard
-            </NavLink>
-          </li>
-          <li>
             <NavLink to="/gaps" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
               Gap Strategies
             </NavLink>
@@ -150,8 +157,13 @@ function App() {
             </NavLink>
           </li>
           <li>
-            <NavLink to="/scanner-evaluation" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
-              Scanner Evaluation
+            <NavLink to="/sector-intelligence" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+              Sector Intelligence
+            </NavLink>
+          </li>
+          <li>
+            <NavLink to="/scanner-results" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+              Scanner Results
             </NavLink>
           </li>
         </ul>
@@ -166,8 +178,10 @@ function App() {
           <Route path="/bearish-bounce" element={<BearishBounce />} />
           <Route path="/fibonacci" element={<FibonacciScreener />} />
           <Route path="/overview" element={<TickersOverview />} />
-          <Route path="/scanner-evaluation" element={<ScannerEvaluation />} />
-          <Route path="/backtest" element={<Navigate to="/scanner-evaluation" replace />} />
+          <Route path="/sector-intelligence" element={<SectorIntelligence />} />
+          <Route path="/scanner-results" element={<ScannerResults />} />
+          <Route path="/scanner-evaluation" element={<Navigate to="/scanner-results" replace />} />
+          <Route path="/backtest" element={<Navigate to="/scanner-results" replace />} />
           <Route path="/ticker/:symbol" element={<TickerDetail />} />
         </Routes>
       </main>

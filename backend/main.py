@@ -3006,12 +3006,15 @@ async def scanner_events_endpoint(
 async def latest_ticker_scanner_signals(
     interval: Optional[str] = Query(default=None, regex="^(1d|1wk|1h)$"),
     limit: int = Query(default=500, ge=1, le=500),
+    sessions: int = Query(default=10, ge=1, le=252),
+    hourly_sessions: int = Query(default=2, ge=1, le=30),
 ):
-    """Latest observed scanner signal per ticker. Signals are not recommendations."""
+    """Latest observed scanner signal per ticker, within the last `sessions` daily/weekly sessions
+    or `hourly_sessions` days for hourly signals."""
     try:
         from research.scanner_events import ensure_tables, latest_ticker_signals
         ensure_tables()
-        return {"results": latest_ticker_signals(interval, limit)}
+        return {"results": latest_ticker_signals(interval, limit, sessions, hourly_sessions)}
     except Exception:
         logger.exception("Latest ticker scanner signals query failed")
         raise HTTPException(status_code=500, detail="Failed to load latest ticker scanner signals")
@@ -3030,6 +3033,17 @@ async def scanner_sector_performance(
     except Exception:
         logger.exception("Scanner sector performance query failed")
         raise HTTPException(status_code=500, detail="Failed to load sector performance")
+
+
+@app.get("/api/sector-intelligence")
+async def sector_intelligence_endpoint(leader_limit: int = Query(default=5, ge=1, le=20)):
+    """Sector rollup: rotation across horizons, discovery-state mix, and cross-sectional skew."""
+    try:
+        from research.scanner_events import sector_intelligence
+        return sector_intelligence(leader_limit)
+    except Exception:
+        logger.exception("Sector intelligence query failed")
+        raise HTTPException(status_code=500, detail="Failed to load sector intelligence")
 
 
 @app.get("/api/stock/{ticker}/scanner-events")

@@ -45,6 +45,8 @@ stock-screener-portal/
     ├── LOW_LEVEL_DESIGN.md
    ├── SIGNAL_RESEARCH.md      # Signal validation methodology & production signal
    ├── SCANNER_EVENT_EVALUATION.md # Shadow scanner lifecycle and outcome evaluation
+   ├── SCHEDULER_EXECUTION.md  # Exact runtime flow: market-hours loop, EOD, scanner lanes
+   ├── EXTENDED_HOURS_RESEARCH_DESIGN.md # Separate premarket/after-hours research pipeline
    └── MODEL_REGISTRY.md       # Model/scanner version registry & script run cadence
 ```
 

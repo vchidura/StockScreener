@@ -87,6 +87,10 @@ INTRADAY_5M_INTERVAL = 5 * 60       # 5 minutes
 DAILY_CANDLE_INTERVAL = 5 * 60      # 5 minutes (keep today's daily bar fresh)
 HOURLY_INTERVAL = 60 * 60           # 60 minutes
 LOOP_SLEEP = 30                     # main loop checks every 30 seconds
+CLOSED_LOG_INTERVAL = 10 * 60       # log closed-market heartbeat every 10 minutes
+SCANNER_INTRADAY_INTERVAL = 60 * 60  # run 1h scanner pipeline every hour during market hours
+HOURLY_SCANNER_REPAIR_SESSIONS = 2   # rebuild recent 1h outcomes from final bars at EOD
+OUTCOME_REPAIR_EVAL_LIMIT = 5000
 
 
 # ── Timezone helper ─────────────────────────────────────────────────
@@ -502,16 +506,47 @@ def job_market_discovery():
                 written, states["trade_date"].iloc[0], summary)
 
 
-def job_scanner_events():
-    """Capture shadow timing events and evaluate only newly due horizons."""
+def job_scanner_events(intervals: tuple[str, ...]):
+    """Capture/evaluate scanner events for explicit intervals only."""
     try:
         from run_scanner_event_pipeline import run_pipeline
     except ImportError:
         sys.path.insert(0, str(Path(__file__).parent))
         from run_scanner_event_pipeline import run_pipeline
-    intervals = ("1d", "1h", "1wk") if _get_et_now().weekday() == 4 else ("1d", "1h")
+
     results = run_pipeline(intervals=intervals)
-    logger.info("  [scanner-events] Done — %s", results)
+    logger.info("  [scanner-events %s] Done — %s", ",".join(intervals), results)
+
+
+def job_repair_recent_scanner_outcomes(
+    interval: str = "1h",
+    sessions: int = HOURLY_SCANNER_REPAIR_SESSIONS,
+    evaluation_limit: int = OUTCOME_REPAIR_EVAL_LIMIT,
+):
+    """Delete and regenerate recent scanner outcomes for one interval."""
+    try:
+        from research.scanner_events import evaluate_outcomes, repair_recent_outcomes
+    except ImportError:
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from research.scanner_events import evaluate_outcomes, repair_recent_outcomes
+
+    repair = repair_recent_outcomes(interval, sessions=sessions)
+    logger.info("  [scanner-repair %s] deleted=%s sessions=%s dates=%s",
+                interval, repair["deleted"], repair["sessions"], ",".join(repair["session_dates"]))
+
+    total_due = 0
+    total_inserted = 0
+    batches = 0
+    while True:
+        batch = evaluate_outcomes(interval, limit=evaluation_limit)
+        batches += 1
+        total_due += int(batch.get("due", 0))
+        total_inserted += int(batch.get("inserted", 0))
+        if int(batch.get("due", 0)) < evaluation_limit:
+            break
+
+    logger.info("  [scanner-repair %s] rebuilt inserted=%s due=%s batches=%s",
+                interval, total_inserted, total_due, batches)
 
 
 def run_eod_once(tickers: list[str], provider: str):
@@ -556,9 +591,17 @@ def run_eod_once(tickers: list[str], provider: str):
         except Exception:
             logger.exception("[JOB] Market discovery failed — validated signal is unchanged")
 
-        logger.info("[JOB] Scanner events (shadow) @ %s ET", _get_et_now().strftime("%H:%M"))
+        logger.info("[JOB] Repair hourly scanner outcomes @ %s ET", _get_et_now().strftime("%H:%M"))
         try:
-            job_scanner_events()
+            job_repair_recent_scanner_outcomes()
+        except Exception:
+            logger.exception("[JOB] Hourly scanner repair failed — continuing with standard pipeline")
+
+        eod_intervals = ("1d", "1h", "1wk") if _get_et_now().weekday() == 4 else ("1d", "1h")
+        logger.info("[JOB] Scanner events (shadow) %s @ %s ET",
+                    ",".join(eod_intervals), _get_et_now().strftime("%H:%M"))
+        try:
+            job_scanner_events(eod_intervals)
         except Exception:
             logger.exception("[JOB] Scanner event pipeline failed — recommendations are unchanged")
 
@@ -772,6 +815,8 @@ def run_scheduler(tickers: list[str], provider: str):
     last_5m = 0
     last_daily_candle = 0
     last_hourly = 0
+    last_scanner_intraday = 0
+    last_closed_log = 0
     daily_close_done_today = None  # date when daily close was last completed
 
     while True:
@@ -804,6 +849,16 @@ def run_scheduler(tickers: list[str], provider: str):
                     last_hourly = now
                     ran_job = True
 
+                # ── Intraday scanner events for day trading (hourly cadence) ──
+                if now - last_scanner_intraday >= SCANNER_INTRADAY_INTERVAL:
+                    logger.info("[JOB] Scanner events (1h intraday) @ %s ET", now_et.strftime("%H:%M"))
+                    try:
+                        job_scanner_events(("1h",))
+                    except Exception:
+                        logger.exception("[JOB] Intraday scanner event pipeline failed — continuing")
+                    last_scanner_intraday = now
+                    ran_job = True
+
                 # Reset daily close flag on new trading day
                 if daily_close_done_today != today_date:
                     daily_close_done_today = None
@@ -817,9 +872,11 @@ def run_scheduler(tickers: list[str], provider: str):
                 daily_close_done_today = today_date
 
             else:
-                day_name = now_et.strftime("%A")
-                logger.info("Market closed (%s %s ET). Sleeping...",
-                            day_name, now_et.strftime("%H:%M"))
+                if now - last_closed_log >= CLOSED_LOG_INTERVAL:
+                    day_name = now_et.strftime("%A")
+                    logger.info("Market closed (%s %s ET). Sleeping...",
+                                day_name, now_et.strftime("%H:%M"))
+                    last_closed_log = now
 
             time.sleep(LOOP_SLEEP)
 

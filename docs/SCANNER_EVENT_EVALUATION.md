@@ -17,17 +17,18 @@ falsifiable setups; add one row when a setup is proposed, implemented or promote
 
 | Composite setup | Intervals | Required components | Optional context | Status |
 |---|---|---|---|---|
-| Structured trend pullback 1.0 | 1d, 1wk, 1h | MA trend + swing continuation + pullback + candle trigger | Gap/FVG/Fibonacci proximity, activity | Monitor only: daily short, 5 bars |
-| Level retest/rejection 1.2 | 1d, 1wk, 1h | Gap/FVG/dynamic Fibonacci level + rejection or reclaim + participation | Trend/discovery alignment | Collecting |
+| Structured trend pullback 1.0 | 1d, 1wk, 1h | MA trend + swing continuation + pullback + candle trigger | Gap/FVG/Fibonacci proximity, activity | Collecting; no current raw primary pass |
+| Level retest/rejection 1.2 | 1d, 1wk, 1h | Gap/FVG/dynamic Fibonacci level + rejection or reclaim + participation | Trend/discovery alignment | Monitor only: daily long 5/21 and hourly long 7 |
 | Breakout expansion 1.0 | 1d, 1wk, 1h | Swing/zone break + range expansion + relative volume + strong close | MA trend, cross-sectional rank | Demoted 2026-08-22: monitor only |
 | Structure reversal 1.0 | 1d, 1wk, 1h | Reversal discovery state + swing structure flip + MA/VWAP reclaim | Gap/FVG level, activity | Collecting |
 | SMA200 reclaim rejection 1.0 | 1d, 1wk | Declining SMA200 + fresh reclaim + old-high retest + bearish strong close + participation | Sector/regime alignment | Insufficient sample: 31 daily signal days |
-| Compression breakout 0.1-shadow | 1d | Contracted range/ATR and channel + range/volume expansion + strong breakout close | Trend alignment | Monitor only: hourly long, 7 bars; 88% contained in breakout expansion |
-| Failed-breakout reversal 0.1-shadow | 1d | Fresh pivot break + next-bar close back inside + reversal candle | Level age, participation, breadth | Collecting |
+| Compression breakout 0.1-shadow | 1d, 1wk, 1h | Contracted range/ATR and channel + range/volume expansion + strong breakout close | Trend alignment | Monitor only: hourly long, 7 bars; 88% contained in breakout expansion |
+| Failed-breakout reversal 0.1-shadow | 1d, 1wk, 1h | Fresh pivot break + next-bar close back inside + reversal candle | Level age, participation, breadth | Monitor only: hourly long 7/21 |
 
-Statuses: `PLANNED`, `COLLECTING`, `INSUFFICIENT_SAMPLE`, `FAILED`, `PROMISING`, `VALIDATED`,
-`DEFERRED`. Statuses reflect the 2026-08-22 study; no setup currently holds `PROMISING` or
-`VALIDATED`.
+Evidence states are `ROBUST_PASS`, `MONITOR_ONLY` and `UNRANKED`; lifecycle labels include
+`PLANNED`, `COLLECTING`, `INSUFFICIENT_SAMPLE`, `FAILED`, `VALIDATED` and `DEFERRED`. Statuses above
+reflect the 2026-08-23 ETF-benchmarked all-interval study. No setup currently holds `ROBUST_PASS`
+or `VALIDATED`.
 
 ## Indicator Roles
 
@@ -70,6 +71,10 @@ Production implications:
   next-open evaluation contract.
 
 ## Scanner Confidence Study
+
+> Historical 2026-08-22 daily/hourly study snapshot. It records the pre-ETF-benchmark result and
+> remains useful as the demotion audit trail. The current ETF-benchmarked, all-interval result is
+> recorded under Current State and Full-History Qualification Result below.
 
 The 2026-08-22 study evaluated 293,687 matured `next_bar_open_v2` outcomes across 1,434
 baseline/filter rows and 41 slices, on five years of daily and two years of hourly Polygon history.
@@ -374,7 +379,9 @@ Only due, missing outcomes are evaluated. Each row records:
 
 - Actionable entry time, entry price and execution-model version
 - Direction-adjusted and net return
-- Equal-weight active-universe benchmark and net alpha
+- Market benchmark return and alpha versus SPY (QQQ fallback for SPY itself)
+- Sector benchmark return and alpha versus the mapped sector ETF, with the broad-market fallback
+  for ETF or unclassified tickers
 - MAE/MFE in percent and initial-risk units
 - Stop/target hits and first-hit ordering
 - 4 bps round-trip cost
@@ -401,7 +408,12 @@ Minimum promotion gate:
 - Benefit is not concentrated in one sector or regime
 - Timing overlays must improve risk-adjusted entry versus immediate candidate entry
 
-Promotion never happens automatically; update the registry and model version after review.
+The 100-event and 40-period values are fixed research-policy floors, not row-specific power
+estimates. Raw events describe occurrence volume; horizon-spaced periods are the observations used
+by the alpha t-statistic. Power still depends on effect size, variance and the declared FDR family.
+
+Promotion never happens automatically. Update the registry after review; change the detector
+version only when its semantic rule changes, never merely because its evidence status changes.
 
 ## Retirement and Re-specification
 
@@ -430,8 +442,10 @@ ships as a **new scanner name and version** that:
 
 A scanner that reached `ROBUST_PASS` and later degrades to `UNRANKED` for two consecutive studies
 is **demoted**, not retired: the evidence state reverts, portal probability and live-alpha claims
-are suppressed, and the model version is bumped to record the change. Demotion is reversible on
-re-qualification; retirement is not.
+are suppressed, and the study/registry records the demotion without changing the detector version.
+Demotion is reversible on re-qualification; retirement is not. A detector-version change is
+reserved for changed signal semantics and therefore starts a distinct hypothesis under a new
+scanner name and version.
 
 ### Multiplicity budget
 
@@ -452,14 +466,14 @@ matured:
 - Slices added after seeing a result belong to the next study's family, not the current one.
 - Never select a slice for promotion because it ranked best. Rank is not a qualification criterion.
 
-**Rows that fail the sample gate do not enter the family.** A row below 100 events or 40
-independent periods cannot qualify whatever its alpha, so it is not a candidate hypothesis and must
-not consume correction budget. In the 2026-08-22 study 291 of 1,434 rows (20.3%) were ineligible on
-sample size, and five of them held p-values inside the smallest twenty — including a row with five
-independent periods that ranked first overall and therefore set the tightest Benjamini-Hochberg
-threshold for every genuine candidate beneath it. Ineligible rows are still reported as
-`UNRANKED`; they are excluded only from the correction family. This rule is decidable before any
-outcome is inspected, so applying it is not selection.
+**Every predeclared row enters its FDR family, including rows below the sample gate.** The 100-event
+and 40-period floors control raw qualification, not family membership. An immature row therefore
+remains `UNRANKED` regardless of its p-value or adjusted q-value, but its declared hypothesis still
+participates in correction. This keeps family membership fixed independently of realized event
+frequency and matches the implemented primary and filter studies. Because Benjamini-Hochberg
+depends on both family size and p-value ranks, adding or removing immature rows can move existing
+q-values in either direction; do not reinterpret a changed q-value as stronger evidence unless the
+declared family itself is unchanged.
 
 **Detectors that largely contain one another are one hypothesis, not two.** Redundancy is measured
 with [analyze_scanner_redundancy.py](../backend/scripts/analyze_scanner_redundancy.py), which uses
@@ -559,9 +573,12 @@ Manual controls:
 
 ## Portal
 
-- **Scanner Evaluation page:** aggregate 48-combination qualification matrix, filters, primary
-  gate status, methodology boundary, hourly review priority and recent shadow setups. This replaces
-  the unused synthetic Backtest page.
+- **Scanner Results page:** latest signal per ticker, interval/setup/side/sector/evidence filters,
+  aggregate evidence counts, hourly review priority, and Robust/Monitor/Unranked badges. The full
+  qualification report remains available through `/api/scanner-events/qualification`; the former
+  48-combination matrix is not part of the current page.
+- **Sector Intelligence page:** sector rotation, discovery mix and cross-sectional context remain
+  separate from scanner qualification.
 - **Dashboard / Scanner Evidence:** status, sample size, net alpha, t-stat, MAE/MFE, backlog and
   recent events, plus a link to the full evaluation page.
 - **Ticker / Scanner Evidence:** lifecycle, first/last seen, occurrence count, entry/stop/target and
@@ -583,17 +600,19 @@ Manual controls:
 ## Current State
 
 - All seven composite families are connected to the shared capture/outcome pipeline.
-- Weekly capture scanned all 400 active tickers on 2026-08-14 and persisted 43 shadow setups.
-  Weekly outcomes and qualification are still collecting.
+- Weekly full-history replay is complete: 15,427 lifecycles and 45,724 evaluated outcomes across
+  5/10/21 trading-session horizons. Recent not-yet-mature horizons remain pending by design; all 39
+  weekly scanner/direction/horizon combinations are currently `UNRANKED`.
 - SMA200 reclaim rejection 1.0 first captured ZS as the only 2026-08-14 match in the 400-name
   active universe. It remains unqualified and shadow-only.
 - Daily capture scans all 400 active tickers. Hourly capture scans reconstructed point-in-time
   discovery cohorts, not today's cohort projected backward.
-- Full-history replay, enhanced metadata refresh, occurrence repair, outcome evaluation, context
-  reconstruction, FDR qualification and calibration are complete for the daily/hourly study.
-- Of 1,434 evaluated rows across 41 slices, three primaries and five filters passed raw gates and
-  **none survived FDR**. No row holds `ROBUST_PASS`; every row is `NOT_ELIGIBLE` for calibrated
-  probability or live-alpha display.
+- Full-history replay, benchmark refresh, enhanced metadata refresh, occurrence repair, outcome
+  evaluation, context reconstruction, FDR qualification and calibration are complete for the
+  daily, hourly and weekly study.
+- The 2026-08-23 confidence rerun contains 339,411 observations and 2,091 report rows: seven
+  primaries and 12 filters passed raw gates, and **none survived FDR**. No row holds `ROBUST_PASS`;
+  every row is `NOT_ELIGIBLE` for calibrated probability or live-alpha display.
 - The `extension-0.1-shadow` current-position overlay is available on discovery, ticker detail and
   latest scanner rows without changing historical scanner evidence or qualification.
 - All setups remain shadow research. Neither evidence status nor calibrated research output changes
@@ -605,22 +624,25 @@ Manual controls:
 
 ## Full-History Qualification Result
 
-Point-in-time replay completed with zero outstanding outcomes:
+Point-in-time replay completed for every matured outcome; only recent horizons that do not yet have
+enough forward sessions remain pending:
 
 | Interval | Window | Sessions | Universe |
 |---|---|---:|---|
 | Daily | 2021-09-01 to 2026-08-21 | 1,248 | 386 data-available names |
 | Hourly | 2024-08-22 to 2026-08-21 | ~500 | 376-name union of reconstructed discovery cohorts |
+| Weekly | 2021-08-23 to 2026-08-21 | ~261 completed weeks | 400 active names |
 
-No scanner/direction/horizon combination survived false-discovery correction. The three raw
-primary passes and five raw filter passes are listed under Scanner Confidence Study.
+No scanner/direction/horizon combination survived false-discovery correction. The current study
+contains seven raw primary passes and 12 raw filter passes; all remain monitor-only.
 
 The previous study's sole robust result, `breakout_expansion` 1.0 hourly long at seven bars, is
 superseded. On the shorter sample it recorded 3,263 events, 459 periods, +0.290% net alpha,
 `t=3.68` and `q=0.0147`. On the full sample it records 3,360 events, 463 periods, +0.250% net
-alpha, `t=2.15` and `q=0.463` — it still clears the raw gate but no longer clears correction. Its
-regime dependence was already conditional, with negative alpha in bear regimes and no surviving
-regime filter.
+alpha, `t=2.15` and `q=0.463` — it cleared the raw gate but no longer cleared correction. After the
+ETF benchmark refresh and all-interval rerun, the current row records +0.316% market net alpha,
+`t=2.68` and `q=0.204`; it remains monitor-only. Its regime dependence was already conditional,
+with negative alpha in bear regimes and no surviving regime filter.
 
 This is the demotion path working as designed: a result measured on a shorter sample did not hold
 when the sample grew. Nothing is promoted, all setups remain shadow-only, and an untouched forward

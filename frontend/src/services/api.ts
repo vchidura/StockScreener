@@ -1331,6 +1331,11 @@ export interface ScannerQualificationRow {
   mean_mfe_pct: number | null
   stop_first_rate: number | null
   target_first_rate: number | null
+  mean_sector_alpha: number | null
+  sector_alpha_t_stat: number | null
+  distinct_tickers: number | null
+  top5_concentration: number | null
+  regime_alpha: Record<'BULL' | 'BEAR' | 'CHOPPY', { mean_alpha: number | null; periods: number }>
   qualification_status: 'PRIMARY_PASS' | 'NOT_QUALIFIED'
   evidence_status: 'ROBUST_PASS' | 'MONITOR_ONLY' | 'UNRANKED'
   calibration_status: 'RESEARCH_CALIBRATED' | 'FAILED_DIAGNOSTICS' | 'NOT_ELIGIBLE'
@@ -1401,9 +1406,9 @@ export const getScannerEvents = async (
 }
 
 export const getLatestScannerSignals = async (
-  interval?: ScannerInterval, limit = 500,
+  interval?: ScannerInterval, limit = 500, sessions = 10, hourlySessions = 2,
 ): Promise<{ results: LatestScannerSignalRow[] }> => {
-  const params: Record<string, string | number> = { limit }
+  const params: Record<string, string | number> = { limit, sessions, hourly_sessions: hourlySessions }
   if (interval) params.interval = interval
   const response = await api.get('/scanner-events/latest-by-ticker', { params })
   return response.data
@@ -1413,6 +1418,53 @@ export const getScannerSectorPerformance = async (
   sessions: SectorPerformanceSessions = 1,
 ): Promise<{ sessions: SectorPerformanceSessions; results: SectorPerformanceRow[] }> => {
   const response = await api.get('/scanner-events/sector-performance', { params: { sessions } })
+  return response.data
+}
+
+export interface SectorRotationWindow {
+  average_return: number
+  positive_breadth: number
+  tickers: number
+  rank: number
+}
+
+export interface SectorCrossSectionalSkew {
+  long_skew: number
+  short_skew: number
+  average_percentile: number | null
+  covered: number
+  net_tilt: number | null
+  long_names: string[]
+  short_names: string[]
+}
+
+export interface SectorLeaderRow {
+  ticker: string
+  return_pct: number
+}
+
+export interface SectorIntelligenceRow {
+  sector: string
+  rotation: Record<string, SectorRotationWindow | null>
+  rotation_delta: number | null
+  discovery_mix: Partial<Record<DiscoveryState, number>>
+  discovery_universe: number
+  cross_sectional_skew: SectorCrossSectionalSkew | null
+  leaders: Record<string, SectorLeaderRow[]>
+  laggards: Record<string, SectorLeaderRow[]>
+}
+
+export interface SectorIntelligenceResponse {
+  trade_date: string | null
+  discovery_trade_date: string | null
+  cross_sectional_trade_date: string | null
+  sessions: number[]
+  leader_sessions: number[]
+  results: SectorIntelligenceRow[]
+}
+
+export const getSectorIntelligence = async (leaderLimit = 5): Promise<SectorIntelligenceResponse> => {
+  const response = await api.get('/sector-intelligence', { params: { leader_limit: leaderLimit } })
   return response.data
 }
 

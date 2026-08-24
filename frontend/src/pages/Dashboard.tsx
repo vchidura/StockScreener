@@ -657,7 +657,7 @@ function Dashboard() {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
             <h3 style={{ ...SECTION_TITLE, margin: 0 }}>Scanner Evidence <span style={SUBTITLE}>Shadow outcomes · no recommendations</span></h3>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <button onClick={() => navigate('/scanner-evaluation')} style={{ ...selectStyle, cursor: 'pointer', color: '#245f9e', fontWeight: 700 }}>
+              <button onClick={() => navigate('/scanner-results')} style={{ ...selectStyle, cursor: 'pointer', color: '#245f9e', fontWeight: 700 }}>
                 Full evaluation
               </button>
               <select value={scannerInterval} onChange={event => setScannerInterval(event.target.value as ScannerInterval)} style={selectStyle}>
