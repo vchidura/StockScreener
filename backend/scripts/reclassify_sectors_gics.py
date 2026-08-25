@@ -21,6 +21,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from database import get_db_cursor, migrate_selected_tickers_metadata  # noqa: E402
+from http_client import build_session  # noqa: E402
 from research.gics_sectors import (  # noqa: E402
     ETF_SECTOR, MANUAL_SECTORS, UNCLASSIFIED_SECTOR, sector_for_sic,
 )
@@ -29,12 +30,13 @@ load_dotenv(BACKEND_DIR / ".env")
 API_KEY = os.getenv("POLYGON_API_KEY")
 BASE_URL = "https://api.polygon.io"
 MAX_WORKERS = 20
+SESSION = build_session(pool_maxsize=MAX_WORKERS + 4)
 
 
 def fetch_reference(ticker: str) -> dict:
     """Return sic_code and sic_description for one ticker."""
     try:
-        response = requests.get(
+        response = SESSION.get(
             f"{BASE_URL}/v3/reference/tickers/{ticker}",
             params={"apiKey": API_KEY}, timeout=20,
         )

@@ -14,6 +14,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from database import get_db_cursor
+from http_client import get_session
 
 
 def get_db_daily(ticker: str, start: str, end: str) -> pd.DataFrame:
@@ -88,7 +89,7 @@ def get_stooq_daily(ticker: str, start: str, end: str) -> pd.DataFrame:
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
 
     try:
-        response = requests.get(url, timeout=20)
+        response = get_session().get(url, timeout=20)
         response.raise_for_status()
         text = response.text.strip()
         if not text or text.lower().startswith("no data"):
@@ -121,7 +122,7 @@ def get_alpha_vantage_daily(ticker: str, start: str, end: str) -> pd.DataFrame:
     }
 
     try:
-        response = requests.get(url, params=params, timeout=20)
+        response = get_session().get(url, params=params, timeout=20)
         response.raise_for_status()
         payload = response.json()
 
@@ -168,7 +169,7 @@ def get_twelve_data_daily(ticker: str, start: str, end: str) -> pd.DataFrame:
     }
 
     try:
-        response = requests.get(url, params=params, timeout=30)
+        response = get_session().get(url, params=params, timeout=30)
         response.raise_for_status()
         payload = response.json()
 

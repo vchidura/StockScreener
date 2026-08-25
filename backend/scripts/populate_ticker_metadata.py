@@ -38,6 +38,7 @@ from database import (
     create_selected_tickers_table,
     migrate_selected_tickers_metadata,
 )
+from http_client import get_session
 
 TWELVE_DATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 BASE_URL = "https://api.twelvedata.com"
@@ -84,7 +85,7 @@ def fetch_twelve_data_profile(ticker: str, retries: int = 2) -> dict:
     params = {"symbol": ticker, "apikey": TWELVE_DATA_API_KEY}
     for attempt in range(retries + 1):
         try:
-            resp = requests.get(url, params=params, timeout=15)
+            resp = get_session().get(url, params=params, timeout=15)
             if resp.status_code == 429:
                 wait = 60
                 print(f"    [RATE LIMIT] Waiting {wait}s...")

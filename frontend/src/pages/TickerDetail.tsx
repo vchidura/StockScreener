@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, CSSProperties } from 'react'
+import { useState, useEffect, useRef, useCallback, CSSProperties, Fragment } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -23,17 +23,11 @@ import {
   LatestQuote, 
   TradeSetup, 
   LevelRetest,
-  getTickerCalibration,
-  TickerCalibration,
-  RecommendationLayer,
-  getTickerSignal,
-  TickerSignalResponse,
   getTickerDiscoveryState,
   TickerDiscoveryResponse,
   getTickerScannerEvents,
   ScannerEventRow,
   ScannerInterval,
-  PatternKey
 } from '../services/api'
 
 const MARKET_TIME_ZONE = 'America/New_York'
@@ -172,6 +166,20 @@ function buildSmaSeries(
   })
 }
 
+function buildEmaSeries(
+  data: ChartDataPoint[],
+  period: number
+): Array<LineData<Time> | WhitespaceData<Time>> {
+  const alpha = 2 / (period + 1)
+  let prev: number | null = null
+  return data.map((point, index) => {
+    prev = prev === null ? point.close : alpha * point.close + (1 - alpha) * prev
+    // Seed bars are unstable, so hide them rather than draw a misleading tail.
+    if (index + 1 < period) return { time: point.time as Time }
+    return { time: point.time as Time, value: Number(prev.toFixed(4)) }
+  })
+}
+
 function buildBollingerBands(
   data: ChartDataPoint[],
   period = 20,
@@ -213,11 +221,30 @@ function buildBollingerBands(
   return { middle, upper, lower }
 }
 
-const POS = '#16a34a'
-const NEG = '#dc2626'
-const WARN = '#d97706'
+// One palette for the whole page: saturated tone is reserved for meaning, never for chrome.
+const POS = '#15803d'
+const NEG = '#b91c1c'
+const WARN = '#b45309'
+const INFO = '#1d4ed8'
 const MUTED = '#64748b'
 const INK = '#0f172a'
+const LINE = '#e2e8f0'
+const SURFACE = '#f8fafc'
+const POS_SOFT = '#dcfce7'
+const NEG_SOFT = '#fee2e2'
+const INFO_SOFT = '#eff6ff'
+const WARN_SOFT = '#fffbeb'
+
+// Overlay hues are mid-tone and equal weight so no single average dominates the candles.
+const MA_TONE: Record<string, string> = {
+  'MA 50': '#475569',
+  'MA 100': '#7c3aed',
+  'MA 200': '#0f766e',
+  'EMA 8': '#ea580c',
+  'EMA 21': '#2563eb',
+  'EMA 50': '#be185d',
+}
+const BB_TONE = '#cbd5e1'
 
 const money = (n: number | null | undefined, dp = 2) =>
   n === null || n === undefined || !Number.isFinite(n)
@@ -249,22 +276,100 @@ function sideOfBias(bias: string): 'LONG' | 'SHORT' | null {
 function gradeTone(grade: string | null | undefined): string {
   if (!grade) return MUTED
   if (grade.startsWith('A')) return POS
-  if (grade.startsWith('B')) return '#2563eb'
+  if (grade.startsWith('B')) return INFO
   return MUTED
 }
 
-/** Below this many resolved calls a per-ticker win rate is indistinguishable from chance. */
-const MIN_RELIABLE_SAMPLE = 20
-const MIN_EXECUTABLE_RR = 2
+const SETUP_INTERVALS = ['1wk', '1d', '1h'] as const
+const INTERVAL_NOUN: Record<string, string> = { '1wk': 'weekly', '1d': 'daily', '1h': 'hourly' }
 
-function wilson95(k: number, n: number): [number, number] | null {
-  if (n <= 0) return null
-  const z = 1.96
-  const p = k / n
-  const d = 1 + (z * z) / n
-  const centre = (p + (z * z) / (2 * n)) / d
-  const margin = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / d
-  return [Math.max(0, (centre - margin) * 100), Math.min(100, (centre + margin) * 100)]
+/** Reward:risk below this is not worth taking, but the plan is still shown with a warning. */
+const MIN_EXECUTABLE_RR = 2
+/** A stop closer than this many ATR sits inside normal noise and will be hit at random. */
+const MIN_STOP_ATR = 1
+
+const TILE: CSSProperties = {
+  padding: '0.7rem 0.85rem',
+  background: '#fff',
+  border: '1px solid #e2e8f0',
+  borderRadius: '0.5rem',
+}
+const LABEL: CSSProperties = {
+  fontSize: '0.66rem',
+  textTransform: 'uppercase',
+  letterSpacing: '0.05em',
+  color: MUTED,
+  fontWeight: 700,
+}
+const PANEL: CSSProperties = {
+  padding: '0.85rem',
+  background: '#fff',
+  border: '1px solid #e2e8f0',
+  borderRadius: '0.5rem',
+}
+
+function Pill({ text, tone, solid = false, title }: {
+  text: string
+  tone: string
+  solid?: boolean
+  title?: string
+}) {
+  return (
+    <span
+      title={title}
+      style={{
+        padding: '0.12rem 0.5rem',
+        borderRadius: '9999px',
+        fontSize: '0.68rem',
+        fontWeight: 700,
+        whiteSpace: 'nowrap',
+        border: `1px solid ${tone}`,
+        color: solid ? '#fff' : tone,
+        background: solid ? tone : 'transparent',
+      }}
+    >{text}</span>
+  )
+}
+
+function Tile({ label, value, tone = INK, sub, note, accent, noteTone }: {
+  label: string
+  value: string
+  tone?: string
+  sub?: string
+  note?: string
+  accent?: string
+  noteTone?: string
+}) {
+  return (
+    <div style={{ ...TILE, ...(accent ? { borderLeft: `3px solid ${accent}` } : {}) }}>
+      <div style={LABEL}>{label}</div>
+      <div style={{ fontSize: '1.05rem', fontWeight: 700, color: tone, lineHeight: 1.3, marginTop: '0.1rem' }}>{value}</div>
+      {sub && <div style={{ fontSize: '0.72rem', color: MUTED, marginTop: '0.15rem' }}>{sub}</div>}
+      {note && <div style={{ fontSize: '0.7rem', color: noteTone ?? MUTED, marginTop: '0.25rem', fontWeight: noteTone ? 600 : 400 }}>{note}</div>}
+    </div>
+  )
+}
+
+/** Horizontal 0–100 meter with optional zone bands, for RSI/Stochastic/consistency. */
+function Meter({ value, tone, bands }: { value: number; tone: string; bands?: [number, number] }) {
+  return (
+    <div style={{ position: 'relative', height: 6, background: '#e5e7eb', borderRadius: 9999, overflow: 'hidden' }}>
+      {bands && (
+        <>
+          <div style={{ position: 'absolute', left: 0, width: `${bands[0]}%`, top: 0, bottom: 0, background: POS_SOFT }} />
+          <div style={{ position: 'absolute', left: `${bands[1]}%`, right: 0, top: 0, bottom: 0, background: NEG_SOFT }} />
+        </>
+      )}
+      <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: `${Math.max(0, Math.min(100, value))}%`, background: tone, opacity: 0.85 }} />
+    </div>
+  )
+}
+
+function trendTone(state: string | null | undefined): string {
+  if (!state) return MUTED
+  if (/bullish|uptrend|recovery/i.test(state)) return POS
+  if (/bearish|downtrend/i.test(state)) return NEG
+  return MUTED
 }
 
 export interface TradePlan {
@@ -279,82 +384,73 @@ export interface TradePlan {
   riskPct: number
   rewardPct: number
   rr: number
-  fromModel: boolean
-  winRate: number | null
-  evPerShare: number | null
+  stopAtr: number | null
 }
 
-/** Derive an executable plan: model levels win, otherwise nearest technical levels. */
-function buildTradePlan(
-  setup: TradeSetup,
-  rec: RecommendationLayer | null,
-  winRate: number | null,
-): TradePlan | null {
-  const side = rec?.direction === 'BULL' ? 'LONG'
-    : rec?.direction === 'BEAR' ? 'SHORT'
-    : sideOfBias(setup.direction.bias)
+/** Nearest technical stop and first target around the last close, on the selected interval. */
+function buildTradePlan(setup: TradeSetup): TradePlan | null {
+  const side = sideOfBias(setup.direction.bias)
   if (!side) return null
 
-  const entry = rec?.levels.entry ?? setup.last_close
+  const entry = setup.last_close
   if (!Number.isFinite(entry) || entry <= 0) return null
 
   // Backend emits stops below price and targets above, so a short inverts the two lists.
   const below = [...(setup.stops ?? [])].filter(s => s.price < entry).sort((a, b) => b.price - a.price)
   const above = [...(setup.targets ?? [])].filter(t => t.price > entry).sort((a, b) => a.price - b.price)
 
-  const wellFormed = (s: number, t: number) =>
-    side === 'LONG' ? s < entry && t > entry : s > entry && t < entry
+  const stopPick = side === 'LONG' ? below[0] : above[0]
+  const targetPick = side === 'LONG' ? above[0] : below[0]
+  if (!stopPick || !targetPick) return null
 
-  const modelStop = rec?.levels.stop ?? null
-  const modelTarget = rec?.levels.target_1 ?? null
-  // Only trust model levels when they bracket entry on the correct side.
-  const fromModel = modelStop !== null && modelTarget !== null && wellFormed(modelStop, modelTarget)
+  const risk = Math.abs(entry - stopPick.price)
+  const reward = Math.abs(targetPick.price - entry)
+  if (!Number.isFinite(risk) || risk <= 0) return null
 
-  let stop: number
-  let target: number
-  let stopLabel: string
-  let targetLabel: string
-
-  if (fromModel) {
-    stop = modelStop as number
-    target = modelTarget as number
-    stopLabel = 'Model stop'
-    targetLabel = 'Model target'
-  } else {
-    const stopPick = side === 'LONG' ? below[0] : above[0]
-    const targetPick = side === 'LONG' ? above[0] : below[0]
-    if (!stopPick || !targetPick) return null
-    stop = stopPick.price
-    target = targetPick.price
-    stopLabel = `${stopPick.level} (${stopPick.source})`
-    targetLabel = `${targetPick.level} (${targetPick.source})`
-  }
-
-  const risk = Math.abs(entry - stop)
-  const reward = Math.abs(target - entry)
-  const rr = reward / risk
-  if (!Number.isFinite(risk) || risk <= 0 || !Number.isFinite(rr) || rr < MIN_EXECUTABLE_RR) return null
-
-  const wr = winRate !== null && winRate > 0 ? winRate / 100 : null
-  const evPerShare = wr === null ? null : wr * reward - (1 - wr) * risk
+  const atr = setup.technicals.atr
 
   return {
     side,
     entry,
-    stop,
-    target,
-    stopLabel,
-    targetLabel,
+    stop: stopPick.price,
+    target: targetPick.price,
+    stopLabel: `${stopPick.level} (${stopPick.source})`,
+    targetLabel: `${targetPick.level} (${targetPick.source})`,
     risk,
     reward,
     riskPct: (risk / entry) * 100,
     rewardPct: (reward / entry) * 100,
-    rr,
-    fromModel,
-    winRate,
-    evPerShare,
+    rr: reward / risk,
+    stopAtr: Number.isFinite(atr) && atr > 0 ? risk / atr : null,
   }
 }
+
+interface PlanStatus {
+  label: string
+  tone: string
+  note: string
+}
+
+function planStatusOf(plan: TradePlan, livePrice: number | null): PlanStatus {
+  if (plan.rr < 1) {
+    return { label: 'Skip', tone: NEG, note: `Reward is only ${plan.rr.toFixed(2)}R — the first target sits closer than the stop.` }
+  }
+  if (plan.stopAtr !== null && plan.stopAtr < MIN_STOP_ATR) {
+    return { label: 'Stop too tight', tone: NEG, note: `Stop is ${plan.stopAtr.toFixed(2)}× ATR from entry — inside normal bar noise, expect a random stop-out.` }
+  }
+  // A plan whose entry has already run away is a chase, not a setup.
+  if (livePrice !== null) {
+    const drift = plan.side === 'LONG' ? livePrice - plan.entry : plan.entry - livePrice
+    if (drift > plan.risk * 0.5) {
+      return { label: 'Price past entry', tone: WARN, note: `Price has already moved ${money(Math.abs(drift))} beyond the entry — remaining reward:risk is worse than shown.` }
+    }
+  }
+  if (plan.rr < MIN_EXECUTABLE_RR) {
+    return { label: 'Thin', tone: WARN, note: `${plan.rr.toFixed(2)}R is below the ${MIN_EXECUTABLE_RR}R floor — needs a tighter stop or a further target.` }
+  }
+  return { label: 'Actionable', tone: POS, note: `${plan.rr.toFixed(2)}R with the stop ${plan.stopAtr !== null ? `${plan.stopAtr.toFixed(1)}× ATR` : 'clear'} from entry.` }
+}
+
 
 function TickerDetail() {
   const { symbol } = useParams<{ symbol: string }>()
@@ -363,10 +459,12 @@ function TickerDetail() {
   const chartRef = useRef<IChartApi | null>(null)
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null)
-  const ma5SeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
   const ma50SeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
   const ma100SeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
   const ma200SeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const ema8SeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const ema21SeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const ema50SeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
   const bbMiddleSeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
   const bbUpperSeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
   const bbLowerSeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
@@ -378,7 +476,8 @@ function TickerDetail() {
   const [setupInterval, setSetupInterval] = useState('1d')
   const [chartHeight, setChartHeight] = useState(450)
   const [isFullscreen, setIsFullscreen] = useState(false)
-  const [evidenceTab, setEvidenceTab] = useState<'technicals' | 'levels' | 'signals' | 'model'>('technicals')
+  const [tab, setTab] = useState<'setup' | 'levels' | 'fibonacci' | 'scanner'>('setup')
+  const [expandedEvents, setExpandedEvents] = useState<Set<number>>(new Set())
 
   // Track previous interval to avoid showing stale data across interval switches
   const prevIntervalRef = useRef(interval)
@@ -410,26 +509,6 @@ function TickerDetail() {
   })
 
   // All 5 calibration layers arrive in a single request.
-  const { data: calibration = null, isFetching: calibrationLoading } = useQuery<TickerCalibration | null>({
-    queryKey: ['calibration', symbol],
-    queryFn: () => getTickerCalibration(symbol!),
-    enabled: !!symbol,
-  })
-
-  const patternScores = calibration?.pattern_scores ?? null
-  const analogMatches = calibration?.analogs ?? null
-  const patternPriors = calibration?.priors ?? {}
-  const tickerRec = calibration?.recommendation ?? null
-  const tickerPerf = calibration?.performance ?? null
-  const baseline = calibration?.baseline ?? null
-
-  // The only component with an out-of-sample validated edge.
-  const { data: signalResp = null } = useQuery<TickerSignalResponse | null>({
-    queryKey: ['xs-signal', symbol],
-    queryFn: () => getTickerSignal(symbol!),
-    enabled: !!symbol,
-  })
-  const xsSignal = signalResp?.signal ?? null
   const { data: discoveryResp = null } = useQuery<TickerDiscoveryResponse | null>({
     queryKey: ['market-discovery', symbol],
     queryFn: () => getTickerDiscoveryState(symbol!),
@@ -438,75 +517,21 @@ function TickerDetail() {
   const discoveryState = discoveryResp?.state ?? null
   const { data: tickerScannerEvents = { ticker: symbol ?? '', events: [] } } = useQuery<{ ticker: string; events: ScannerEventRow[] }>({
     queryKey: ['scanner-events', symbol],
-    queryFn: () => getTickerScannerEvents(symbol!, 20),
+    queryFn: () => getTickerScannerEvents(symbol!, 120),
     enabled: !!symbol,
   })
 
   const techSide = tradeSetup ? sideOfBias(tradeSetup.direction.bias) : null
-  const dailyModelSide = tickerRec?.direction === 'BULL' ? 'LONG'
-    : tickerRec?.direction === 'BEAR' ? 'SHORT'
-    : null
-  // Calibration layers are daily-only, so they must not steer an intraday plan.
-  const isDailySetup = setupInterval === '1d'
-  const modelSide = isDailySetup ? dailyModelSide : null
-  const planSide = modelSide ?? techSide
-  // Prefer this ticker's own record, but only at a sample size that means anything.
-  const sideStats = planSide === 'LONG' ? tickerPerf?.bull_stats
-    : planSide === 'SHORT' ? tickerPerf?.bear_stats
-    : null
-  const winRateBasis: 'ticker' | 'system' | null = !isDailySetup ? null
-    : sideStats && sideStats.count >= MIN_RELIABLE_SAMPLE ? 'ticker'
-    : baseline && baseline.total_recs >= MIN_RELIABLE_SAMPLE ? 'system'
-    : null
-  const sideWinRate = winRateBasis === 'ticker' ? sideStats!.win_rate
-    : winRateBasis === 'system' ? baseline!.win_rate
-    : null
   const reversalTrigger = discoveryState?.reversal_trigger ?? 'NONE'
   const extensionRisk = discoveryState?.extension_risk ?? 'NORMAL'
-  const positionBlocksPlan = planSide === 'LONG'
+  const positionBlocksPlan = techSide === 'LONG'
     ? reversalTrigger.startsWith('BEARISH')
       || (discoveryState?.trend_state === 'UPTREND' && extensionRisk !== 'NORMAL')
-    : planSide === 'SHORT'
+    : techSide === 'SHORT'
       ? reversalTrigger.startsWith('BULLISH')
         || (discoveryState?.trend_state === 'DOWNTREND' && extensionRisk !== 'NORMAL')
       : false
-  const plan = tradeSetup && !positionBlocksPlan
-    ? buildTradePlan(tradeSetup, isDailySetup ? tickerRec : null, sideWinRate)
-    : null
-  const agreement: 'aligned' | 'conflict' | 'model-only' | 'technical-only' | 'none' =
-    techSide && modelSide ? (techSide === modelSide ? 'aligned' : 'conflict')
-    : modelSide ? 'model-only'
-    : techSide ? 'technical-only'
-    : 'none'
-
-  const tileStyle: CSSProperties = {
-    padding: '0.7rem 0.85rem',
-    background: '#fff',
-    border: '1px solid #e2e8f0',
-    borderRadius: '0.5rem',
-  }
-  const labelStyle: CSSProperties = {
-    fontSize: '0.66rem',
-    textTransform: 'uppercase',
-    letterSpacing: '0.05em',
-    color: MUTED,
-    fontWeight: 700,
-  }
-  const panelStyle: CSSProperties = {
-    marginBottom: '0.85rem',
-    padding: '0.85rem',
-    background: '#fff',
-    border: '1px solid #e2e8f0',
-    borderRadius: '0.5rem',
-  }
-  const panelHeadStyle: CSSProperties = {
-    fontSize: '0.68rem',
-    textTransform: 'uppercase',
-    letterSpacing: '0.05em',
-    color: MUTED,
-    fontWeight: 700,
-    marginBottom: '0.6rem',
-  }
+  const plan = tradeSetup && !positionBlocksPlan ? buildTradePlan(tradeSetup) : null
 
   useEffect(() => {
     prevIntervalRef.current = interval
@@ -521,7 +546,10 @@ function TickerDetail() {
       },
     })
   }, [interval, period])
-  useEffect(() => { prevSetupIntervalRef.current = setupInterval }, [setupInterval])
+  useEffect(() => {
+    prevSetupIntervalRef.current = setupInterval
+    setExpandedEvents(new Set())
+  }, [setupInterval])
 
   const fitSelectedPeriod = useCallback(() => {
     if (!chartRef.current) return
@@ -542,16 +570,13 @@ function TickerDetail() {
     const chartKey = ['chart', symbol, chartRequestPeriod, interval]
     const setupKey = ['trade-setup', symbol, setupInterval]
     const quoteKey = ['latest-quote', symbol]
-    const calibrationKey = ['calibration', symbol]
     queryClient.setQueryData(chartKey, undefined)
     queryClient.setQueryData(setupKey, undefined)
     queryClient.setQueryData(quoteKey, undefined)
-    queryClient.setQueryData(calibrationKey, undefined)
     await Promise.all([
       queryClient.fetchQuery({ queryKey: chartKey, queryFn: () => getChartData(symbol!, chartRequestPeriod, interval, true) }),
       queryClient.fetchQuery({ queryKey: setupKey, queryFn: () => getTradeSetup(symbol!, setupInterval, true) }),
       queryClient.fetchQuery({ queryKey: quoteKey, queryFn: () => getLatestQuote(symbol!, true) }),
-      queryClient.fetchQuery({ queryKey: calibrationKey, queryFn: () => getTickerCalibration(symbol!, { refresh: true }) }),
     ])
   }, [symbol, chartRequestPeriod, interval, setupInterval, queryClient])
 
@@ -590,17 +615,17 @@ function TickerDetail() {
     chartRef.current = chart
 
     const candleSeries = chart.addSeries(CandlestickSeries, {
-      upColor: '#16a34a',
-      downColor: '#dc2626',
-      borderDownColor: '#dc2626',
-      borderUpColor: '#16a34a',
-      wickDownColor: '#dc2626',
-      wickUpColor: '#16a34a',
+      upColor: POS,
+      downColor: NEG,
+      borderDownColor: NEG,
+      borderUpColor: POS,
+      wickDownColor: NEG,
+      wickUpColor: POS,
     })
     candleSeriesRef.current = candleSeries
 
     const volumeSeries = chart.addSeries(HistogramSeries, {
-      color: '#26a69a',
+      color: '#cbd5e1',
       priceFormat: { type: 'volume' },
       priceScaleId: '',
     })
@@ -609,26 +634,32 @@ function TickerDetail() {
     })
     volumeSeriesRef.current = volumeSeries
 
-    ma5SeriesRef.current = chart.addSeries(LineSeries, {
-      color: '#000000', lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
-    })
     ma50SeriesRef.current = chart.addSeries(LineSeries, {
-      color: '#008000', lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+      color: MA_TONE['MA 50'], lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
     })
     ma100SeriesRef.current = chart.addSeries(LineSeries, {
-      color: '#800000', lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+      color: MA_TONE['MA 100'], lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
     })
     ma200SeriesRef.current = chart.addSeries(LineSeries, {
-      color: '#ff0000', lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+      color: MA_TONE['MA 200'], lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+    })
+    ema8SeriesRef.current = chart.addSeries(LineSeries, {
+      color: MA_TONE['EMA 8'], lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+    })
+    ema21SeriesRef.current = chart.addSeries(LineSeries, {
+      color: MA_TONE['EMA 21'], lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+    })
+    ema50SeriesRef.current = chart.addSeries(LineSeries, {
+      color: MA_TONE['EMA 50'], lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
     })
     bbMiddleSeriesRef.current = chart.addSeries(LineSeries, {
-      color: '#6b7280', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false,
+      color: BB_TONE, lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false,
     })
     bbUpperSeriesRef.current = chart.addSeries(LineSeries, {
-      color: '#2563eb', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+      color: BB_TONE, lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false,
     })
     bbLowerSeriesRef.current = chart.addSeries(LineSeries, {
-      color: '#2563eb', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+      color: BB_TONE, lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false,
     })
 
     // Crosshair legend — write directly to DOM to avoid React re-renders
@@ -641,14 +672,16 @@ function TickerDetail() {
       }
       el.style.opacity = '1'
       const seriesMap = [
-        { series: candleSeriesRef.current!, label: 'OHLC', color: '#333', isCandle: true },
-        { series: ma5SeriesRef.current!, label: 'MA 5', color: '#000000', isCandle: false },
-        { series: ma50SeriesRef.current!, label: 'MA 50', color: '#008000', isCandle: false },
-        { series: ma100SeriesRef.current!, label: 'MA 100', color: '#800000', isCandle: false },
-        { series: ma200SeriesRef.current!, label: 'MA 200', color: '#ff0000', isCandle: false },
-        { series: bbMiddleSeriesRef.current!, label: 'BB Mid', color: '#6b7280', isCandle: false },
-        { series: bbUpperSeriesRef.current!, label: 'BB Up', color: '#2563eb', isCandle: false },
-        { series: bbLowerSeriesRef.current!, label: 'BB Lo', color: '#2563eb', isCandle: false },
+        { series: candleSeriesRef.current!, label: 'OHLC', color: INK, isCandle: true },
+        { series: ma50SeriesRef.current!, label: 'MA 50', color: MA_TONE['MA 50'], isCandle: false },
+        { series: ma100SeriesRef.current!, label: 'MA 100', color: MA_TONE['MA 100'], isCandle: false },
+        { series: ma200SeriesRef.current!, label: 'MA 200', color: MA_TONE['MA 200'], isCandle: false },
+        { series: ema8SeriesRef.current!, label: 'EMA 8', color: MA_TONE['EMA 8'], isCandle: false },
+        { series: ema21SeriesRef.current!, label: 'EMA 21', color: MA_TONE['EMA 21'], isCandle: false },
+        { series: ema50SeriesRef.current!, label: 'EMA 50', color: MA_TONE['EMA 50'], isCandle: false },
+        { series: bbMiddleSeriesRef.current!, label: 'BB Mid', color: BB_TONE, isCandle: false },
+        { series: bbUpperSeriesRef.current!, label: 'BB Up', color: BB_TONE, isCandle: false },
+        { series: bbLowerSeriesRef.current!, label: 'BB Lo', color: BB_TONE, isCandle: false },
       ]
       let line1 = ''
       let line2 = ''
@@ -663,7 +696,7 @@ function TickerDetail() {
       }
       const vol = param.seriesData.get(volumeSeriesRef.current!) as any
       if (vol?.value != null) {
-        line1 += `<span style="color:#6b7280">Vol: ${(vol.value / 1e6).toFixed(2)}M</span>`
+        line1 += `<span style="color:${MUTED}">Vol: ${(vol.value / 1e6).toFixed(2)}M</span>`
       }
       el.innerHTML = line1 + '<br/>' + line2
     })
@@ -739,15 +772,17 @@ function TickerDetail() {
     const volumeData: HistogramData<Time>[] = chartData.map(d => ({
       time: d.time as Time,
       value: d.volume,
-      color: d.close >= d.open ? 'rgba(22, 163, 74, 0.5)' : 'rgba(220, 38, 38, 0.5)',
+      color: d.close >= d.open ? 'rgba(21, 128, 61, 0.28)' : 'rgba(185, 28, 28, 0.28)',
     }))
 
     candleSeriesRef.current.setData(candleData)
     volumeSeriesRef.current?.setData(volumeData)
-    ma5SeriesRef.current?.setData(buildSmaSeries(chartData, 5))
     ma50SeriesRef.current?.setData(buildSmaSeries(chartData, 50))
     ma100SeriesRef.current?.setData(buildSmaSeries(chartData, 100))
     ma200SeriesRef.current?.setData(buildSmaSeries(chartData, 200))
+    ema8SeriesRef.current?.setData(buildEmaSeries(chartData, 8))
+    ema21SeriesRef.current?.setData(buildEmaSeries(chartData, 21))
+    ema50SeriesRef.current?.setData(buildEmaSeries(chartData, 50))
 
     const bollinger = buildBollingerBands(chartData, 20, 2)
     bbMiddleSeriesRef.current?.setData(bollinger.middle)
@@ -764,6 +799,22 @@ function TickerDetail() {
   const chartPriceChangePercent = prevPrice ? (chartPriceChange / prevPrice.close) * 100 : 0
   const priceChange = latestQuote?.change ?? chartPriceChange
   const priceChangePercent = latestQuote?.change_percent ?? chartPriceChangePercent
+
+  const planStatus = plan ? planStatusOf(plan, displayPrice) : null
+  const scannerEvents = tickerScannerEvents.events.filter(e => e.interval === setupInterval)
+  const bestStrategyGrade = (() => {
+    const pullback = tradeSetup?.strategy_results.momentum_pullback
+    const bounce = tradeSetup?.strategy_results.bearish_bounce
+    if (pullback && bounce) {
+      return pullback.score >= bounce.score
+        ? `Pullback ${pullback.grade} (${pullback.score}/100)`
+        : `Bearish bounce ${bounce.grade} (${bounce.score}/100)`
+    }
+    if (pullback) return `Pullback ${pullback.grade} (${pullback.score}/100)`
+    if (bounce) return `Bearish bounce ${bounce.grade} (${bounce.score}/100)`
+    return null
+  })()
+
   return (
     <div>
       <div className="card-header" style={{ border: 'none', padding: 0, marginBottom: '1.5rem' }}>
@@ -780,7 +831,7 @@ function TickerDetail() {
                     ${displayPrice.toFixed(2)}
                   </span>
                   <span style={{ 
-                    color: priceChange >= 0 ? '#16a34a' : '#dc2626',
+                    color: priceChange >= 0 ? POS : NEG,
                     fontWeight: 500
                   }}>
                     {priceChange >= 0 ? '+' : ''}{priceChange.toFixed(2)} ({priceChangePercent >= 0 ? '+' : ''}{priceChangePercent.toFixed(2)}%)
@@ -788,7 +839,7 @@ function TickerDetail() {
                 </div>
               )}
               {(latestQuote || lastPrice) && (
-                <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '0.15rem' }}>
+                <div style={{ fontSize: '0.75rem', color: MUTED, marginTop: '0.15rem' }}>
                   As of {latestQuote
                     ? formatQuoteTime(latestQuote)
                     : formatChartTime(lastPrice!.time as Time, interval)}
@@ -799,14 +850,14 @@ function TickerDetail() {
           {visibleChartData.length > 0 && (
             <div style={{ display: 'flex', gap: '2.5rem', alignItems: 'center', marginLeft: 'auto' }}>
               {[
-                { label: 'Period High', value: `$${Math.max(...visibleChartData.map(d => d.high)).toFixed(2)}`, color: '#16a34a' },
-                { label: 'Period Low', value: `$${Math.min(...visibleChartData.map(d => d.low)).toFixed(2)}`, color: '#dc2626' },
+                { label: 'Period High', value: `$${Math.max(...visibleChartData.map(d => d.high)).toFixed(2)}`, color: POS },
+                { label: 'Period Low', value: `$${Math.min(...visibleChartData.map(d => d.low)).toFixed(2)}`, color: NEG },
                 { label: 'Avg Vol', value: `${(visibleChartData.reduce((s, d) => s + d.volume, 0) / visibleChartData.length / 1000000).toFixed(2)}M` },
                 { label: 'Points', value: `${visibleChartData.length}` },
               ].map(stat => (
                 <div key={stat.label} style={{ textAlign: 'center' }}>
-                  <div style={{ fontSize: '1.3rem', fontWeight: 600, color: stat.color || '#1e293b' }}>{stat.value}</div>
-                  <div style={{ fontSize: '0.78rem', color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.04em' }}>{stat.label}</div>
+                  <div style={{ fontSize: '1.3rem', fontWeight: 600, color: stat.color || INK }}>{stat.value}</div>
+                  <div style={{ fontSize: '0.78rem', color: MUTED, textTransform: 'uppercase', letterSpacing: '0.04em' }}>{stat.label}</div>
                 </div>
               ))}
             </div>
@@ -882,7 +933,7 @@ function TickerDetail() {
                     border: 'none',
                     borderRadius: '3px',
                     background: period === p ? '#fff' : 'transparent',
-                    color: period === p ? '#1e293b' : '#64748b',
+                    color: period === p ? INK : MUTED,
                     cursor: 'pointer',
                     boxShadow: period === p ? '0 1px 2px rgba(0,0,0,0.1)' : 'none',
                   }}
@@ -912,7 +963,7 @@ function TickerDetail() {
             {displayPrice !== null && (
               <span style={{ fontSize: '0.9rem', fontWeight: 600 }}>
                 ${displayPrice.toFixed(2)}
-                <span style={{ color: priceChange >= 0 ? '#16a34a' : '#dc2626', marginLeft: '6px', fontSize: '0.8rem' }}>
+                <span style={{ color: priceChange >= 0 ? POS : NEG, marginLeft: '6px', fontSize: '0.8rem' }}>
                   {priceChange >= 0 ? '+' : ''}{priceChange.toFixed(2)} ({priceChangePercent >= 0 ? '+' : ''}{priceChangePercent.toFixed(2)}%)
                 </span>
               </span>
@@ -991,7 +1042,7 @@ function TickerDetail() {
               zIndex: 15,
               fontSize: '0.78rem',
               lineHeight: '1.7',
-              color: '#1e293b',
+              color: INK,
               pointerEvents: 'none',
               opacity: 0.6,
               maxWidth: '60%',
@@ -1007,49 +1058,32 @@ function TickerDetail() {
             <h2 className="card-title" style={{ marginBottom: '0.1rem' }}>Trade Setup</h2>
             {tradeSetup && (
               <div style={{ fontSize: '0.72rem', color: MUTED }}>
-                {tradeSetup.date} · close {money(tradeSetup.last_close)} · {setupInterval} · {tradeSetup.momentum.state}
+                {tradeSetup.date} · close {money(tradeSetup.last_close)} · read on {INTERVAL_NOUN[setupInterval] ?? setupInterval} bars
+                {tradeSetup.ema_alignment.confirm_interval
+                  ? `, confirmed against ${INTERVAL_NOUN[tradeSetup.ema_alignment.confirm_interval] ?? tradeSetup.ema_alignment.confirm_interval}`
+                  : ''}
               </div>
             )}
           </div>
-          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
-            {tradeSetup?.golden_cross && (
-              <span
-                title={tradeSetup.golden_cross.detail}
+          <div style={{ display: 'flex', gap: '0.25rem', background: '#f1f5f9', borderRadius: '0.375rem', padding: '0.15rem' }}>
+            {SETUP_INTERVALS.map(iv => (
+              <button
+                key={iv}
+                onClick={() => setSetupInterval(iv)}
                 style={{
                   padding: '0.2rem 0.6rem',
-                  borderRadius: '0.35rem',
-                  fontWeight: 600,
-                  fontSize: '0.72rem',
-                  border: `1px solid ${tradeSetup.golden_cross.type.includes('Golden') || tradeSetup.golden_cross.type.includes('Bullish') ? POS : NEG}`,
-                  color: tradeSetup.golden_cross.type.includes('Golden') || tradeSetup.golden_cross.type.includes('Bullish') ? POS : NEG,
+                  fontSize: '0.75rem',
+                  fontWeight: setupInterval === iv ? 700 : 400,
+                  border: 'none',
+                  borderRadius: '0.25rem',
+                  background: setupInterval === iv ? INFO : 'transparent',
+                  color: setupInterval === iv ? '#fff' : MUTED,
+                  cursor: 'pointer',
                 }}
               >
-                {tradeSetup.golden_cross.type === 'Golden Cross' ? `Golden Cross${tradeSetup.golden_cross.bars_ago !== null ? ` · ${tradeSetup.golden_cross.bars_ago}b` : ''}`
-                  : tradeSetup.golden_cross.type === 'Death Cross' ? `Death Cross${tradeSetup.golden_cross.bars_ago !== null ? ` · ${tradeSetup.golden_cross.bars_ago}b` : ''}`
-                  : tradeSetup.golden_cross.type.includes('Bullish') ? '50 > 200 SMA'
-                  : '50 < 200 SMA'}
-              </span>
-            )}
-            <div style={{ display: 'flex', gap: '0.25rem', background: '#f1f5f9', borderRadius: '0.375rem', padding: '0.15rem' }}>
-              {['1d', '1h', '30m', '15m', '5m'].map(iv => (
-                <button
-                  key={iv}
-                  onClick={() => setSetupInterval(iv)}
-                  style={{
-                    padding: '0.2rem 0.5rem',
-                    fontSize: '0.75rem',
-                    fontWeight: setupInterval === iv ? 700 : 400,
-                    border: 'none',
-                    borderRadius: '0.25rem',
-                    background: setupInterval === iv ? '#2563eb' : 'transparent',
-                    color: setupInterval === iv ? '#fff' : MUTED,
-                    cursor: 'pointer',
-                  }}
-                >
-                  {iv}
-                </button>
-              ))}
-            </div>
+                {iv}
+              </button>
+            ))}
           </div>
         </div>
 
@@ -1068,394 +1102,256 @@ function TickerDetail() {
 
         {tradeSetup && (
           <>
-            {/* Verdict strip — the four questions to answer before sizing a trade */}
+            {/* Decision bar — every tile recomputes on the selected interval */}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '0.6rem', marginBottom: '0.85rem' }}>
-              <div style={{ ...tileStyle, borderLeft: `3px solid ${techSide === 'LONG' ? POS : techSide === 'SHORT' ? NEG : MUTED}` }}>
-                <div style={labelStyle}>Bias</div>
-                <div style={{ fontSize: '1.15rem', fontWeight: 700, color: techSide === 'LONG' ? POS : techSide === 'SHORT' ? NEG : MUTED }}>
-                  {techSide ?? 'NEUTRAL'}
-                </div>
-                <div style={{ fontSize: '0.72rem', color: MUTED }}>
-                  {tradeSetup.direction.conviction} · {tradeSetup.direction.bull_signals}↑ / {tradeSetup.direction.bear_signals}↓
-                </div>
-                <div style={{
-                  fontSize: '0.7rem',
-                  fontWeight: 600,
-                  marginTop: '0.3rem',
-                  color: !isDailySetup ? MUTED : agreement === 'aligned' ? POS : agreement === 'conflict' ? NEG : MUTED,
-                }}>
-                  {!isDailySetup
-                    ? (dailyModelSide ? `Daily model: ${dailyModelSide} · not this timeframe` : 'No daily model call')
-                    : agreement === 'aligned' ? `✓ Model agrees (${modelSide})`
-                    : agreement === 'conflict' ? `⚠ Model says ${modelSide}`
-                    : agreement === 'model-only' ? `Model: ${modelSide}, technicals flat`
-                    : agreement === 'technical-only' ? 'No model call today'
-                    : 'No directional call'}
-                </div>
-              </div>
+              <Tile
+                label="Bias"
+                value={techSide ?? 'NEUTRAL'}
+                tone={techSide === 'LONG' ? POS : techSide === 'SHORT' ? NEG : MUTED}
+                accent={techSide === 'LONG' ? POS : techSide === 'SHORT' ? NEG : MUTED}
+                sub={`${tradeSetup.direction.conviction} · ${tradeSetup.direction.bull_signals}↑ / ${tradeSetup.direction.bear_signals}↓`}
+                note={tradeSetup.ema_alignment.multi_tf_agree === null
+                  ? `No ${tradeSetup.ema_alignment.confirm_interval} data to confirm`
+                  : tradeSetup.ema_alignment.multi_tf_agree
+                    ? `✓ ${tradeSetup.ema_alignment.confirm_interval} agrees`
+                    : `⚠ ${tradeSetup.ema_alignment.confirm_interval} diverges`}
+                noteTone={tradeSetup.ema_alignment.multi_tf_agree === null ? MUTED
+                  : tradeSetup.ema_alignment.multi_tf_agree ? POS : WARN}
+              />
 
-              <div style={tileStyle}>
-                <div style={labelStyle}>Confidence</div>
-                <div style={{ fontSize: '1.15rem', fontWeight: 700, color: isDailySetup && tickerRec ? INK : gradeTone(tradeSetup.confluence.grade) }}>
-                  {isDailySetup && tickerRec ? `${tickerRec.predicted_confidence}%` : tradeSetup.confluence.grade}
-                </div>
-                <div style={{ fontSize: '0.72rem', color: MUTED }}>
-                  {isDailySetup && tickerRec
-                    ? `Model grade ${tickerRec.signal_grade ?? '—'}`
-                    : `Confluence · ${tradeSetup.confluence.count} signals`}
-                </div>
-                <div style={{ fontSize: '0.7rem', fontWeight: 600, marginTop: '0.3rem', color: gradeTone(tradeSetup.confluence.grade) }}>
-                  {!isDailySetup
-                    ? (tickerRec ? `Daily model: ${tickerRec.predicted_confidence}% ${tickerRec.direction}` : 'No daily model call')
-                    : tickerRec
-                      ? `Confluence ${tradeSetup.confluence.grade} · ${tradeSetup.confluence.count} signals`
-                      : 'No daily model call'}
-                </div>
-              </div>
+              <Tile
+                label="Setup quality"
+                value={tradeSetup.confluence.grade}
+                tone={gradeTone(tradeSetup.confluence.grade)}
+                sub={`${tradeSetup.confluence.count} confluence signals`}
+                note={bestStrategyGrade ?? undefined}
+              />
 
-              {(() => {
-                const tickerN = tickerPerf?.total_recs ?? 0
-                const useTicker = tickerN >= MIN_RELIABLE_SAMPLE
-                const k = useTicker ? tickerPerf!.correct_recs : baseline?.correct_recs ?? 0
-                const n = useTicker ? tickerN : baseline?.total_recs ?? 0
-                const rate = useTicker ? tickerPerf!.win_rate : baseline?.win_rate ?? 0
-                const ci = wilson95(k, n)
-                // Colour on statistical significance, not the point estimate.
-                const tone = !ci ? MUTED : ci[0] > 50 ? POS : ci[1] < 50 ? NEG : MUTED
-                return (
-                  <div style={tileStyle}>
-                    <div style={labelStyle}>Model reliability</div>
-                    <div style={{ fontSize: '1.15rem', fontWeight: 700, color: tone }}>
-                      {n > 0 ? plainPct(rate) : 'No data'}
-                    </div>
-                    <div style={{ fontSize: '0.72rem', color: MUTED }}>
-                      {ci ? `95% CI ${ci[0].toFixed(0)}–${ci[1].toFixed(0)}% · n=${n}` : 'No resolved calls yet'}
-                    </div>
-                    <div style={{ fontSize: '0.7rem', marginTop: '0.3rem', color: MUTED }}>
-                      {n === 0 ? 'Backtest has not run'
-                        : useTicker ? `${symbol} only · ${tickerPerf!.period_days}d`
-                        : `System-wide · ${baseline?.ticker_count ?? 0} tickers · ${symbol} sample too small (${tickerN})`}
-                    </div>
-                    {ci && ci[0] <= 50 && ci[1] >= 50 && (
-                      <div style={{ fontSize: '0.68rem', marginTop: '0.2rem', color: WARN }}>
-                        Not distinguishable from chance
-                      </div>
-                    )}
-                  </div>
-                )
-              })()}
+              <Tile
+                label="Trend"
+                value={tradeSetup.ema_alignment.primary}
+                tone={trendTone(tradeSetup.ema_alignment.primary)}
+                accent={trendTone(tradeSetup.ema_alignment.primary)}
+                sub={tradeSetup.golden_cross
+                  ? tradeSetup.golden_cross.type === 'Golden Cross' || tradeSetup.golden_cross.type === 'Death Cross'
+                    ? `${tradeSetup.golden_cross.type}${tradeSetup.golden_cross.bars_ago !== null ? ` · ${tradeSetup.golden_cross.bars_ago} bars ago` : ''}`
+                    : tradeSetup.golden_cross.type.includes('Bullish') ? '50 SMA above 200 SMA' : '50 SMA below 200 SMA'
+                  : '50/200 SMA needs more history'}
+                note={`Directional consistency ${plainPct(tradeSetup.technicals.trend_consistency, 0)}`}
+              />
 
-              {(() => {
-                const tone = xsSignal?.side === 'LONG' ? POS
-                  : xsSignal?.side === 'SHORT' ? NEG
-                  : MUTED
-                const rank = xsSignal && xsSignal.percentile != null
-                  ? Math.round((1 - xsSignal.percentile) * (xsSignal.universe_size - 1)) + 1
-                  : null
-                return (
-                  <div style={{ ...tileStyle, borderLeft: `3px solid ${tone}` }}>
-                    <div style={labelStyle}>Universe rank</div>
-                    <div style={{ fontSize: '1.15rem', fontWeight: 700, color: tone }}>
-                      {xsSignal ? (xsSignal.side === 'FLAT' ? `D${xsSignal.decile}` : xsSignal.side) : 'No signal'}
-                    </div>
-                    <div style={{ fontSize: '0.72rem', color: MUTED }}>
-                      {xsSignal && rank != null
-                        ? `Rank ${rank} of ${xsSignal.universe_size} · decile ${xsSignal.decile}`
-                        : 'Not scored today'}
-                    </div>
-                    <div style={{ fontSize: '0.7rem', marginTop: '0.3rem', color: MUTED }}>
-                      {xsSignal
-                        ? `${xsSignal.model_version} · ${xsSignal.horizon_days}d hold · validated`
-                        : 'Runs after each close'}
-                    </div>
-                  </div>
-                )
-              })()}
+              <Tile
+                label="Momentum"
+                value={tradeSetup.momentum.state}
+                tone={trendTone(tradeSetup.momentum.state)}
+                accent={trendTone(tradeSetup.momentum.state)}
+                sub={`RSI ${tradeSetup.technicals.rsi.toFixed(1)} · ${tradeSetup.technicals.rsi_state}`}
+                note={`Stoch %K ${tradeSetup.technicals.stoch_k.toFixed(0)} · ATR ${plainPct(tradeSetup.technicals.atr_pct)}`}
+                noteTone={tradeSetup.technicals.rsi > 70 || tradeSetup.technicals.rsi < 30 ? WARN : undefined}
+              />
 
-              {(() => {
-                const state = discoveryState?.state ?? null
-                const extension = discoveryState?.extension_risk ?? null
-                const tone = extension === 'EXHAUSTION_WATCH' ? NEG
-                  : extension === 'EXTENDED' ? WARN
-                  : discoveryState?.trend_state === 'UPTREND' ? POS
-                  : discoveryState?.trend_state === 'DOWNTREND' ? NEG
-                  : MUTED
-                const label = state ? state.replace(/_/g, ' ') : 'No state'
-                return (
-                  <div style={{ ...tileStyle, borderLeft: `3px solid ${tone}` }}>
-                    <div style={labelStyle}>Current position</div>
-                    <div style={{ fontSize: '1rem', fontWeight: 700, color: tone }}>
-                      {discoveryState?.trend_state?.replace(/_/g, ' ') ?? label}
-                      {extension && ` · ${extension.replace(/_/g, ' ')}`}
-                    </div>
-                    <div style={{ fontSize: '0.72rem', color: MUTED }}>
-                      Discovery: {label}
-                      {discoveryState?.reversal_trigger && discoveryState.reversal_trigger !== 'NONE'
-                        ? ` · ${discoveryState.reversal_trigger.replace(/_/g, ' ')}` : ''}
-                    </div>
-                    <div style={{ fontSize: '0.7rem', marginTop: '0.3rem', color: tone }} title={discoveryState?.position_guidance ?? undefined}>
-                      {discoveryState?.position_guidance ?? 'Runs after a complete close'}
-                    </div>
-                  </div>
-                )
-              })()}
-
-              <div style={{ ...tileStyle, borderLeft: `3px solid ${tradeSetup.timing.urgency === 'Immediate' ? POS : tradeSetup.timing.urgency === 'Watchlist' ? MUTED : WARN}` }}>
-                <div style={labelStyle}>Timing</div>
-                <div style={{ fontSize: '1.15rem', fontWeight: 700, color: INK }}>{tradeSetup.timing.urgency}</div>
-                <div style={{ fontSize: '0.72rem', color: MUTED }} title={tradeSetup.timing.detail}>
-                  {tradeSetup.duration.estimate}
-                </div>
-                <div style={{ fontSize: '0.7rem', marginTop: '0.3rem', color: MUTED }} title={tradeSetup.timing.detail}>
-                  {tradeSetup.timing.detail.length > 58 ? `${tradeSetup.timing.detail.slice(0, 58)}…` : tradeSetup.timing.detail}
-                </div>
-              </div>
+              <Tile
+                label="Timing"
+                value={tradeSetup.timing.urgency}
+                tone={INK}
+                accent={tradeSetup.timing.urgency === 'Immediate' ? POS : tradeSetup.timing.urgency === 'Watchlist' ? MUTED : WARN}
+                sub={tradeSetup.duration.estimate}
+                note={tradeSetup.timing.detail.length > 58 ? `${tradeSetup.timing.detail.slice(0, 58)}…` : tradeSetup.timing.detail}
+              />
             </div>
 
-            {tickerScannerEvents.events.length > 0 && (
-              <div style={{ border: '1px solid #e2e8f0', borderRadius: '0.5rem', marginBottom: '1rem', overflow: 'hidden' }}>
-                <div style={{ padding: '0.55rem 0.85rem', background: '#f8fafc', borderBottom: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', gap: '1rem', flexWrap: 'wrap' }}>
-                  <div>
-                    <strong style={{ fontSize: '0.84rem', color: INK }}>Scanner setup history</strong>
-                    <div style={{ fontSize: '0.7rem', color: MUTED, marginTop: '0.15rem' }}>
-                      Signal open/close are the matching bar (the full session for Daily, the trigger hour for Hourly). Planned stop-loss and 2R target are measured from its close; next-bar open is the no-look-ahead evaluation entry.
-                    </div>
-                  </div>
-                  <span style={{ fontSize: '0.7rem', color: WARN }}>Research signals · not recommendations</span>
-                </div>
-                <div style={{ overflowX: 'auto' }}>
-                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.75rem' }}>
-                    <thead><tr style={{ borderBottom: '1px solid #e2e8f0' }}>
-                      {['Interval', 'Scanner setup', 'Signal time', 'Last seen', 'Signal open', 'Signal close', 'Planned stop-loss', 'Planned target (2R)', 'Next-bar open', 'Exit close by horizon', 'Return / alpha', 'MAE / MFE', 'First hit'].map(label => (
-                        <th key={label} style={{ padding: '6px 8px', textAlign: label === 'Scanner setup' || label === 'First hit' ? 'left' : 'right', color: MUTED, whiteSpace: 'nowrap' }}>{label}</th>
-                      ))}
-                    </tr></thead>
-                    <tbody>{tickerScannerEvents.events.slice(0, 8).map(event => {
-                      const nextOpen = event.outcomes.find(outcome => outcome.entry_price != null)
-                      return (
-                        <tr key={event.event_id} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                        <td style={{ padding: '7px 8px', textAlign: 'right', whiteSpace: 'nowrap', fontWeight: 600 }}>
-                          {event.interval === '1d' ? 'Daily' : event.interval === '1wk' ? 'Weekly' : 'Hourly'}
-                        </td>
-                        <td style={{ padding: '7px 8px' }}>
-                          <div style={{ fontWeight: 600, color: event.direction === 1 ? POS : NEG }}>
-                            {event.direction === 1 ? 'Long' : 'Short'} · {event.trigger_type.replace(/_/g, ' ')}
-                          </div>
-                          <div style={{ color: MUTED, fontSize: '0.68rem' }}>
-                            {event.scanner_name.replace(/_/g, ' ').replace(/^sma200/i, 'SMA200')}
-                          </div>
-                        </td>
-                        <td style={{ padding: '7px 8px', textAlign: 'right', whiteSpace: 'nowrap' }}>
-                          {formatScannerEventTime(event.signal_time, event.interval)}
-                        </td>
-                        <td style={{ padding: '7px 8px', textAlign: 'right', whiteSpace: 'nowrap' }}>
-                          {formatScannerEventTime(event.last_seen_at, event.interval)}
-                          <div style={{ color: MUTED, fontSize: '0.68rem' }}>{event.occurrence_count} observation{event.occurrence_count === 1 ? '' : 's'}</div>
-                        </td>
-                        <td style={{ padding: '7px 8px', textAlign: 'right' }}>
-                          {money(event.signal_open_price)}
-                        </td>
-                        <td style={{ padding: '7px 8px', textAlign: 'right' }}>
-                          <strong>{money(event.entry_price)}</strong>
-                        </td>
-                        <td style={{ padding: '7px 8px', textAlign: 'right', whiteSpace: 'nowrap', color: NEG }}>
-                          {money(event.stop_price)}
-                        </td>
-                        <td style={{ padding: '7px 8px', textAlign: 'right', whiteSpace: 'nowrap', color: POS, fontWeight: 600 }}>
-                          {money(event.target_price)}
-                        </td>
-                        <td style={{ padding: '7px 8px', textAlign: 'right' }}>
-                          {nextOpen?.entry_price != null ? <strong>{money(nextOpen.entry_price)}</strong> : <span style={{ color: MUTED }}>Pending</span>}
-                          {nextOpen?.entry_time && <div style={{ color: MUTED, fontSize: '0.68rem', whiteSpace: 'nowrap' }}>{formatScannerEventTime(nextOpen.entry_time, event.interval)}</div>}
-                        </td>
-                        <td style={{ padding: '7px 8px', textAlign: 'right', whiteSpace: 'nowrap' }}>
-                          {event.outcomes.length === 0 ? <span style={{ color: MUTED }}>Waiting for future bars</span> : event.outcomes.map(outcome => (
-                            <div key={outcome.horizon_bars} title={formatScannerEventTime(outcome.exit_time, event.interval)}>
-                              {outcome.horizon_bars} {event.interval === '1wk' ? 'sessions' : 'bars'} · {money(outcome.exit_price)}
-                            </div>
-                          ))}
-                        </td>
-                        <td style={{ padding: '7px 8px', textAlign: 'right', whiteSpace: 'nowrap' }}>
-                          {event.outcomes.length === 0 ? '—' : event.outcomes.map(outcome => (
-                            <div key={outcome.horizon_bars}>
-                              <span style={{ color: (outcome.net_signed_return ?? 0) >= 0 ? POS : NEG }}>
-                                {outcome.net_signed_return != null ? `${(outcome.net_signed_return * 100).toFixed(1)}%` : '—'}
-                              </span>
-                              {outcome.net_alpha_return != null ? ` · α ${(outcome.net_alpha_return * 100).toFixed(1)}%` : ''}
-                            </div>
-                          ))}
-                        </td>
-                        <td style={{ padding: '7px 8px', textAlign: 'right', whiteSpace: 'nowrap' }}>
-                          {event.outcomes.length === 0 ? '—' : event.outcomes.map(outcome => (
-                            <div key={outcome.horizon_bars}>
-                              {outcome.mae_pct != null ? `${(outcome.mae_pct * 100).toFixed(1)}%` : '—'} / {outcome.mfe_pct != null ? `${(outcome.mfe_pct * 100).toFixed(1)}%` : '—'}
-                            </div>
-                          ))}
-                        </td>
-                        <td style={{ padding: '7px 8px', textAlign: 'left', whiteSpace: 'nowrap' }}>
-                          {event.outcomes.length === 0 ? 'Pending' : event.outcomes.map(outcome => (
-                            <div key={outcome.horizon_bars}>{outcome.first_hit.replace('_', ' ')}</div>
-                          ))}
-                        </td>
-                      </tr>
-                      )
-                    })}</tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-
             {/* Executable plan — levels, risk math and sizing */}
-            {plan ? (
-              <div style={{ border: '1px solid #e2e8f0', borderRadius: '0.5rem', marginBottom: '1rem', overflow: 'hidden' }}>
-                <div style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  padding: '0.45rem 0.85rem',
-                  background: plan.side === 'LONG' ? '#f0fdf4' : '#fef2f2',
-                  borderBottom: '1px solid #e2e8f0',
-                }}>
-                  <strong style={{ fontSize: '0.85rem', color: plan.side === 'LONG' ? POS : NEG }}>
-                    {plan.side} plan
-                  </strong>
-                  <span style={{ fontSize: '0.7rem', color: MUTED }}>
-                    {plan.fromModel ? 'Model levels' : 'Derived from nearest technical levels'}
-                  </span>
-                </div>
+            {plan && planStatus ? (() => {
+              const isLong = plan.side === 'LONG'
+              // Lay the ladder out on a real price axis: low price left, high price right.
+              const lo = isLong ? plan.stop : plan.target
+              const hi = isLong ? plan.target : plan.stop
+              const span = hi - lo
+              const pctOf = (p: number) => Math.max(0, Math.min(100, ((p - lo) / span) * 100))
+              const entryPct = pctOf(plan.entry)
+              const showNow = displayPrice !== null && Math.abs(displayPrice - plan.entry) > 0.005
+              const nowPct = showNow ? pctOf(displayPrice!) : null
+              const nowBeyond = showNow && (displayPrice! < lo || displayPrice! > hi)
 
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', borderBottom: '1px solid #f1f5f9' }}>
-                  {[
-                    { k: 'Entry', v: plan.entry, sub: plan.fromModel ? 'Model entry' : 'Last close', tone: INK },
-                    { k: 'Stop', v: plan.stop, sub: plan.stopLabel, tone: NEG },
-                    { k: 'Target', v: plan.target, sub: plan.targetLabel, tone: POS },
-                  ].map(x => (
-                    <div key={x.k} style={{ padding: '0.7rem 0.85rem', borderRight: '1px solid #f1f5f9' }}>
-                      <div style={labelStyle}>{x.k}</div>
-                      <div style={{ fontSize: '1.25rem', fontWeight: 700, color: x.tone }}>{money(x.v)}</div>
-                      <div style={{ fontSize: '0.7rem', color: MUTED }}>
-                        {x.k === 'Entry' ? x.sub : `${signedPct(((x.v - plan.entry) / plan.entry) * 100)} · ${x.sub}`}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', borderBottom: '1px solid #f1f5f9' }}>
-                  <div style={{ padding: '0.7rem 0.85rem', borderRight: '1px solid #f1f5f9' }}>
-                    <div style={labelStyle}>Risk / share</div>
-                    <div style={{ fontSize: '1rem', fontWeight: 700, color: NEG }}>{money(plan.risk)}</div>
-                    <div style={{ fontSize: '0.7rem', color: MUTED }}>{plainPct(plan.riskPct)} of entry</div>
-                  </div>
-                  <div style={{ padding: '0.7rem 0.85rem', borderRight: '1px solid #f1f5f9' }}>
-                    <div style={labelStyle}>Reward / share</div>
-                    <div style={{ fontSize: '1rem', fontWeight: 700, color: POS }}>{money(plan.reward)}</div>
-                    <div style={{ fontSize: '0.7rem', color: MUTED }}>{plainPct(plan.rewardPct)} of entry</div>
-                  </div>
-                  <div style={{ padding: '0.7rem 0.85rem', borderRight: '1px solid #f1f5f9' }}>
-                    <div style={labelStyle}>Reward : Risk</div>
-                    <div style={{ fontSize: '1rem', fontWeight: 700, color: plan.rr >= 2 ? POS : plan.rr >= 1 ? WARN : NEG }}>
-                      {plan.rr.toFixed(2)}R
-                    </div>
-                    <div style={{ fontSize: '0.7rem', color: MUTED }}>
-                      {plan.rr >= 2 ? 'Meets 2R floor' : plan.rr >= 1 ? 'Thin — tighten stop' : 'Below 1R — skip'}
-                    </div>
-                  </div>
-                  <div style={{ padding: '0.7rem 0.85rem' }}>
-                    <div style={labelStyle}>Expected value</div>
-                    <div style={{
-                      fontSize: '1rem',
-                      fontWeight: 700,
-                      color: plan.evPerShare === null ? MUTED : plan.evPerShare > 0 ? POS : NEG,
-                    }}>
-                      {plan.evPerShare === null ? 'n/a' : `${plan.evPerShare > 0 ? '+' : ''}${money(plan.evPerShare)}/sh`}
-                    </div>
-                    <div style={{ fontSize: '0.7rem', color: MUTED }}>
-                      {plan.winRate === null
-                        ? (isDailySetup ? 'Sample too small to estimate' : 'Daily win rate does not apply intraday')
-                        : winRateBasis === 'ticker'
-                          ? `at ${plainPct(plan.winRate)} ${symbol} ${plan.side} accuracy`
-                          : `at ${plainPct(plan.winRate)} system-wide accuracy`}
-                    </div>
-                  </div>
-                </div>
-
-                {plan.evPerShare !== null && (
-                  <div style={{ padding: '0.4rem 0.85rem', fontSize: '0.66rem', color: MUTED, borderTop: '1px solid #f1f5f9' }}>
-                    EV assumes the historical directional win rate holds and the trade resolves at stop or target; it is not a target-hit probability.
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div style={{ padding: '0.85rem', marginBottom: '1rem', border: '1px dashed #cbd5e1', borderRadius: '0.5rem', fontSize: '0.82rem', color: MUTED }}>
-                {positionBlocksPlan && planSide && discoveryState?.position_guidance
-                  ? `No executable ${planSide} plan — ${discoveryState.position_guidance}`
-                  : `No executable plan — needs a directional bias plus valid stop and first-target levels that provide at least ${MIN_EXECUTABLE_RR}R around ${money(tradeSetup.last_close)}.`}
-              </div>
-            )}
-
-            {tradeSetup.strategy_results.fibonacci && (() => {
-              const fibonacci = tradeSetup.strategy_results.fibonacci
-              const confirmedMove = fibonacci.trend_direction === 'uptrend_retracement'
-                ? `Low ${money(fibonacci.swing_low)} (${fibonacci.swing_low_date}) → High ${money(fibonacci.swing_high)} (${fibonacci.swing_high_date})`
-                : `High ${money(fibonacci.swing_high)} (${fibonacci.swing_high_date}) → Low ${money(fibonacci.swing_low)} (${fibonacci.swing_low_date})`
-              const active = fibonacci.active_leg
-              const activeMove = active
-                ? `${active.start.type === 'high' ? 'High' : 'Low'} ${money(active.start.price)} (${active.start.date}) → ${active.end.type === 'high' ? 'High' : 'Low'} ${money(active.end.price)} (${active.end.date})`
-                : null
-              return (
-                <div className="ticker-fibonacci-basis">
-                  <div>
-                    <div style={labelStyle}>Confirmed basis</div>
-                    <div className="ticker-fibonacci-basis__move">{confirmedMove}</div>
-                  </div>
-                  {active && activeMove && (
-                    <div>
-                      <div style={labelStyle}>Active provisional</div>
-                      <div className="ticker-fibonacci-basis__move">{activeMove}</div>
-                    </div>
-                  )}
-                  <div>
-                    <div style={labelStyle}>Detection</div>
-                    <div className="ticker-fibonacci-basis__value">{fibonacci.swing_detection_pct.toFixed(2)}% dynamic</div>
-                  </div>
-                  <div>
-                    <div style={labelStyle}>Confirmed reference</div>
-                    <div className="ticker-fibonacci-basis__value">
-                      {fibonacci.nearest_level} · {money(fibonacci.nearest_level_price)} · {fibonacci.distance_pct > 0 ? '+' : ''}{fibonacci.distance_pct.toFixed(2)}%
-                    </div>
-                  </div>
-                  <div>
-                    <div style={labelStyle}>{active?.level_role === 'provisional_support' ? 'Provisional support' : active ? 'Provisional resistance' : 'Developing pivot'}</div>
-                    <div className="ticker-fibonacci-basis__value">
-                      {active
-                        ? <>{active.nearest_level} · {money(active.nearest_level_price)} · {active.distance_pct > 0 ? '+' : ''}{active.distance_pct.toFixed(2)}%</>
-                        : <>{fibonacci.developing_pivot.type === 'high' ? 'High' : 'Low'} · {money(fibonacci.developing_pivot.price)} · {fibonacci.developing_pivot.date}</>}
-                    </div>
+              const endCap = (
+                p: number, role: string, tone: string, source: string, align: 'left' | 'right',
+              ) => (
+                <div style={{ textAlign: align, minWidth: 0 }}>
+                  <div style={{ ...LABEL, color: tone }}>{role}</div>
+                  <div style={{ fontSize: '1.25rem', fontWeight: 700, color: tone, lineHeight: 1.2 }}>{money(p)}</div>
+                  <div style={{ fontSize: '0.7rem', color: MUTED }}>
+                    {signedPct(((p - plan.entry) / plan.entry) * 100)} · {source}
                   </div>
                 </div>
               )
-            })()}
+
+              return (
+                <div style={{ border: '1px solid #e2e8f0', borderRadius: '0.5rem', marginBottom: '1rem', overflow: 'hidden' }}>
+                  <div style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    gap: '0.75rem',
+                    flexWrap: 'wrap',
+                    padding: '0.5rem 0.85rem',
+                    background: isLong ? POS_SOFT : NEG_SOFT,
+                    borderBottom: '1px solid #e2e8f0',
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <strong style={{ fontSize: '0.85rem', color: isLong ? POS : NEG }}>{plan.side} plan</strong>
+                      <Pill text={planStatus.label} tone={planStatus.tone} solid />
+                    </div>
+                    <span style={{ fontSize: '0.72rem', color: MUTED }}>
+                      Nearest technical stop and first target on {INTERVAL_NOUN[setupInterval] ?? setupInterval} bars
+                    </span>
+                  </div>
+
+                  <div style={{ padding: '0.9rem 0.85rem 0.5rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', marginBottom: '0.5rem' }}>
+                      {isLong
+                        ? endCap(plan.stop, 'Stop', NEG, plan.stopLabel, 'left')
+                        : endCap(plan.target, 'Target', POS, plan.targetLabel, 'left')}
+                      {isLong
+                        ? endCap(plan.target, 'Target', POS, plan.targetLabel, 'right')
+                        : endCap(plan.stop, 'Stop', NEG, plan.stopLabel, 'right')}
+                    </div>
+
+                    {/* Segment widths are the reward:risk ratio, drawn to scale. */}
+                    <div style={{ position: 'relative' }}>
+                      <div style={{ display: 'flex', height: 10, borderRadius: 5, overflow: 'hidden', background: LINE }}>
+                        <div style={{ flexGrow: isLong ? plan.risk : plan.reward, background: isLong ? '#fbcfcf' : '#bfe5cd' }} />
+                        <div style={{ flexGrow: isLong ? plan.reward : plan.risk, background: isLong ? '#bfe5cd' : '#fbcfcf' }} />
+                      </div>
+                      <div style={{
+                        position: 'absolute', left: `${entryPct}%`, top: -5, bottom: -5,
+                        width: 2, background: INK, transform: 'translateX(-1px)',
+                      }} />
+                      {nowPct !== null && (
+                        <div style={{
+                          position: 'absolute', left: `${nowPct}%`, top: -9, bottom: -9,
+                          width: 2, background: INFO, transform: 'translateX(-1px)',
+                        }} />
+                      )}
+                    </div>
+
+                    <div style={{ position: 'relative', height: nowPct !== null ? 62 : 42, marginTop: '0.4rem' }}>
+                      <div style={{
+                        position: 'absolute',
+                        top: 0,
+                        left: `${Math.max(10, Math.min(90, entryPct))}%`,
+                        transform: 'translateX(-50%)',
+                        textAlign: 'center',
+                        whiteSpace: 'nowrap',
+                      }}>
+                        <div style={LABEL}>Entry · last close</div>
+                        <div style={{ fontSize: '1rem', fontWeight: 700, color: INK }}>{money(plan.entry)}</div>
+                      </div>
+                      {nowPct !== null && (
+                        <div style={{
+                          position: 'absolute',
+                          left: `${Math.max(10, Math.min(90, nowPct))}%`,
+                          top: 42,
+                          transform: 'translateX(-50%)',
+                          whiteSpace: 'nowrap',
+                          fontSize: '0.7rem',
+                          fontWeight: 600,
+                          color: INFO,
+                        }}>
+                          ▲ now {money(displayPrice)}{nowBeyond ? ' (outside plan)' : ''}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', borderTop: '1px solid #f1f5f9' }}>
+                    {[
+                      {
+                        k: 'Reward : Risk',
+                        v: `${plan.rr.toFixed(2)}R`,
+                        tone: plan.rr >= MIN_EXECUTABLE_RR ? POS : plan.rr >= 1 ? WARN : NEG,
+                        sub: plan.rr >= MIN_EXECUTABLE_RR ? `Meets the ${MIN_EXECUTABLE_RR}R floor` : `Below the ${MIN_EXECUTABLE_RR}R floor`,
+                      },
+                      {
+                        k: 'Stop vs noise',
+                        v: plan.stopAtr === null ? 'n/a' : `${plan.stopAtr.toFixed(2)}× ATR`,
+                        tone: plan.stopAtr === null ? MUTED : plan.stopAtr >= MIN_STOP_ATR ? POS : NEG,
+                        sub: plan.stopAtr === null ? 'ATR unavailable'
+                          : plan.stopAtr >= MIN_STOP_ATR ? 'Clear of normal bar range' : 'Inside normal bar range',
+                      },
+                      {
+                        k: 'Risk / share',
+                        v: money(plan.risk),
+                        tone: NEG,
+                        sub: `${plainPct(plan.riskPct)} of entry`,
+                      },
+                      {
+                        k: 'Reward / share',
+                        v: money(plan.reward),
+                        tone: POS,
+                        sub: `${plainPct(plan.rewardPct)} of entry`,
+                      },
+                    ].map(x => (
+                      <div key={x.k} style={{ padding: '0.45rem 0.85rem', borderRight: '1px solid #f1f5f9' }}>
+                        <div style={{ ...LABEL, fontSize: '0.6rem' }}>{x.k}</div>
+                        <div style={{ fontSize: '0.85rem', fontWeight: 700, color: x.tone }}>{x.v}</div>
+                        <div style={{ fontSize: '0.65rem', color: MUTED }}>{x.sub}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div style={{ padding: '0.4rem 0.85rem', fontSize: '0.68rem', color: planStatus.tone, borderTop: '1px solid #f1f5f9', background: SURFACE }}>
+                    {planStatus.note}
+                  </div>
+                </div>
+              )
+            })() : (
+              <div style={{ padding: '0.85rem', marginBottom: '1rem', border: '1px dashed #cbd5e1', borderRadius: '0.5rem', fontSize: '0.82rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.35rem' }}>
+                  <Pill text={positionBlocksPlan ? 'Blocked' : 'No plan'} tone={positionBlocksPlan ? NEG : MUTED} solid />
+                  <strong style={{ fontSize: '0.85rem', color: INK }}>
+                    {positionBlocksPlan ? `${techSide} setup is blocked by the daily market state` : 'No executable plan on this timeframe'}
+                  </strong>
+                </div>
+                <div style={{ color: MUTED }}>
+                  {positionBlocksPlan && discoveryState?.position_guidance
+                    ? discoveryState.position_guidance
+                    : positionBlocksPlan
+                      ? `Discovery state ${(discoveryState?.state ?? 'unknown').replace(/_/g, ' ')} contradicts the ${techSide} bias.`
+                      : `Needs a directional bias plus a stop below and a first target above ${money(tradeSetup.last_close)}.`}
+                </div>
+                {positionBlocksPlan && (
+                  <div style={{ fontSize: '0.7rem', color: MUTED, marginTop: '0.35rem' }}>
+                    Discovery state is computed daily and applies to every timeframe, not just {INTERVAL_NOUN[setupInterval] ?? setupInterval} bars.
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Evidence tabs */}
             <div style={{ display: 'flex', gap: '0.25rem', borderBottom: '1px solid #e2e8f0', marginBottom: '0.85rem' }}>
               {([
-                ['technicals', 'Technicals', null],
-                ['levels', 'Levels', (tradeSetup.level_retests?.daily?.length ?? 0) + (tradeSetup.level_retests?.hourly?.length ?? 0)],
-                ['signals', 'Signals', tradeSetup.signals?.length ?? 0],
-                ['model', 'Model', patternScores?.fired_count ?? null],
+                ['setup', 'Setup', null],
+                ['levels', 'Levels', new Set([
+                  ...tradeSetup.targets.map(t => t.price.toFixed(2)),
+                  ...tradeSetup.stops.map(s => s.price.toFixed(2)),
+                  ...tradeSetup.entries.filter(e => e.zone_low !== null).map(e => e.zone_low!.toFixed(2)),
+                  ...tradeSetup.zones.map(z => z.low.toFixed(2)),
+                ]).size],
+                ['fibonacci', 'Fibonacci', null],
+                ['scanner', 'Scanner history', scannerEvents.length],
               ] as const).map(([key, label, count]) => (
                 <button
                   key={key}
-                  onClick={() => setEvidenceTab(key)}
+                  onClick={() => setTab(key)}
                   style={{
                     padding: '0.4rem 0.8rem',
                     border: 'none',
                     background: 'transparent',
                     cursor: 'pointer',
                     fontSize: '0.8rem',
-                    fontWeight: evidenceTab === key ? 700 : 500,
-                    color: evidenceTab === key ? INK : MUTED,
-                    borderBottom: `2px solid ${evidenceTab === key ? '#2563eb' : 'transparent'}`,
+                    fontWeight: tab === key ? 700 : 500,
+                    color: tab === key ? INK : MUTED,
+                    borderBottom: `2px solid ${tab === key ? INFO : 'transparent'}`,
                   }}
                 >
                   {label}{count ? ` (${count})` : ''}
@@ -1463,383 +1359,376 @@ function TickerDetail() {
               ))}
             </div>
 
-            {evidenceTab === 'technicals' && (
-              <>
-            {/* EMA / SMA Alignment + VWAP row */}
-            <div className="dashboard-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)', marginBottom: '1rem' }}>
-              <div className="stat-card" style={{ textAlign: 'center', padding: '0.75rem', borderLeft: `4px solid ${tradeSetup.ema_alignment.daily.includes('Bullish') ? '#16a34a' : tradeSetup.ema_alignment.daily.includes('Bearish') ? '#dc2626' : '#9ca3af'}` }}>
-                <div className="stat-value" style={{ fontSize: '0.95rem' }}>{tradeSetup.ema_alignment.daily}</div>
-                <div className="stat-label">Daily EMA / SMA Stack</div>
-                <table style={{ width: '100%', fontSize: '0.7rem', marginTop: '0.35rem', borderCollapse: 'collapse', color: 'var(--text-secondary)' }}>
-                  <tbody>
-                    {[
-                      { label: '8 EMA', val: tradeSetup.technicals.ema8, sma: 'MA 10', smaVal: tradeSetup.technicals.ma10 },
-                      { label: '21 EMA', val: tradeSetup.technicals.ema21, sma: 'MA 20', smaVal: tradeSetup.technicals.ma20 },
-                      { label: '50 EMA', val: tradeSetup.technicals.ema50, sma: 'MA 50', smaVal: tradeSetup.technicals.ma50 },
-                    ].map(r => (
-                      <tr key={r.label}>
-                        <td style={{ textAlign: 'left', padding: '1px 2px', fontWeight: 500 }}>{r.label}</td>
-                        <td style={{ textAlign: 'right', padding: '1px 2px', color: tradeSetup.last_close >= (r.val ?? 0) ? '#16a34a' : '#dc2626' }}>${r.val?.toFixed(2) ?? 'N/A'}</td>
-                        <td style={{ textAlign: 'left', padding: '1px 6px', fontWeight: 500 }}>{r.sma}</td>
-                        <td style={{ textAlign: 'right', padding: '1px 2px', color: tradeSetup.last_close >= (r.smaVal ?? 0) ? '#16a34a' : '#dc2626' }}>${r.smaVal?.toFixed(2) ?? 'N/A'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              <div className="stat-card" style={{ textAlign: 'center', padding: '0.75rem', borderLeft: `4px solid ${tradeSetup.ema_alignment.hourly === 'Bullish' ? '#16a34a' : tradeSetup.ema_alignment.hourly === 'Bearish' ? '#dc2626' : '#9ca3af'}` }}>
-                <div className="stat-value" style={{ fontSize: '0.95rem' }}>{tradeSetup.ema_alignment.hourly ?? 'N/A'}</div>
-                <div className="stat-label">Hourly EMA (8/21)</div>
-                {tradeSetup.ema_alignment.hourly_ema8 && tradeSetup.ema_alignment.hourly_ema21 && (
-                  <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
-                    8: ${tradeSetup.ema_alignment.hourly_ema8} | 21: ${tradeSetup.ema_alignment.hourly_ema21}
+            {tab === 'setup' && (() => {
+              const t = tradeSetup.technicals
+              const emaChips = [
+                { label: '8 EMA', value: t.ema8 },
+                { label: '21 EMA', value: t.ema21 },
+                { label: '50 EMA', value: t.ema50 },
+              ]
+
+              return (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.85rem', marginBottom: '0.85rem' }}>
+                    <div style={PANEL}>
+                      <div style={LABEL}>Trend</div>
+                      <div style={{ fontSize: '1.05rem', fontWeight: 700, color: trendTone(tradeSetup.ema_alignment.primary), margin: '0.15rem 0 0.2rem' }}>
+                        {tradeSetup.ema_alignment.primary}
+                      </div>
+                      <div style={{ fontSize: '0.75rem', color: MUTED, marginBottom: '0.6rem' }}>
+                        {tradeSetup.ema_alignment.primary_detail}
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap', marginBottom: '0.6rem' }}>
+                        {emaChips.map(chip => {
+                          const above = chip.value !== null && tradeSetup.last_close >= chip.value
+                          return (
+                            <Pill
+                              key={chip.label}
+                              text={`${chip.label} ${above ? '▲ price above' : '▼ price below'}`}
+                              tone={above ? POS : NEG}
+                              title={`${chip.label} at ${money(chip.value)}`}
+                            />
+                          )
+                        })}
+                      </div>
+
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.76rem', padding: '0.3rem 0', borderTop: '1px solid #f1f5f9' }}>
+                        <span style={{ color: MUTED }}>50 / 200 SMA</span>
+                        <span style={{ fontWeight: 600, color: tradeSetup.golden_cross ? trendTone(tradeSetup.golden_cross.type) : MUTED }}
+                          title={tradeSetup.golden_cross?.detail}>
+                          {tradeSetup.golden_cross
+                            ? `${tradeSetup.golden_cross.type}${tradeSetup.golden_cross.bars_ago !== null ? ` · ${tradeSetup.golden_cross.bars_ago} bars ago` : ''}`
+                            : 'Not enough history'}
+                        </span>
+                      </div>
+
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.76rem', padding: '0.3rem 0', borderTop: '1px solid #f1f5f9' }}>
+                        <span style={{ color: MUTED }}>
+                          {tradeSetup.ema_alignment.confirm_interval} confirmation
+                        </span>
+                        <span style={{ fontWeight: 600, color: tradeSetup.ema_alignment.multi_tf_agree === null ? MUTED : tradeSetup.ema_alignment.multi_tf_agree ? POS : WARN }}>
+                          {tradeSetup.ema_alignment.confirm === null
+                            ? 'No data'
+                            : `${tradeSetup.ema_alignment.confirm} · ${tradeSetup.ema_alignment.multi_tf_agree ? 'agrees' : 'diverges'}`}
+                        </span>
+                      </div>
+
+                      <div style={{ paddingTop: '0.5rem', borderTop: '1px solid #f1f5f9', marginTop: '0.3rem' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.76rem', marginBottom: '0.25rem' }}>
+                          <span style={{ color: MUTED }}>Directional consistency</span>
+                          <span style={{ fontWeight: 600 }}>{plainPct(t.trend_consistency, 0)} of last 14 bars</span>
+                        </div>
+                        <Meter value={t.trend_consistency} tone={trendTone(tradeSetup.ema_alignment.primary)} />
+                      </div>
+                    </div>
+
+                    <div style={PANEL}>
+                      <div style={LABEL}>Momentum</div>
+                      <div style={{ fontSize: '1.05rem', fontWeight: 700, color: trendTone(tradeSetup.momentum.state), margin: '0.15rem 0 0.2rem' }}>
+                        {tradeSetup.momentum.state}
+                      </div>
+                      <div style={{ fontSize: '0.75rem', color: MUTED, marginBottom: '0.6rem' }}>
+                        {tradeSetup.momentum.detail}
+                      </div>
+
+                      <div style={{ marginBottom: '0.55rem' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.76rem', marginBottom: '0.25rem' }}>
+                          <span style={{ color: MUTED }}>RSI (14)</span>
+                          <span style={{ fontWeight: 600, color: t.rsi > 70 ? NEG : t.rsi < 30 ? POS : INK }}>
+                            {t.rsi.toFixed(1)} · {t.rsi_state}
+                          </span>
+                        </div>
+                        <Meter value={t.rsi} tone={t.rsi > 70 ? NEG : t.rsi < 30 ? POS : INFO} bands={[30, 70]} />
+                      </div>
+
+                      <div style={{ marginBottom: '0.55rem' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.76rem', marginBottom: '0.25rem' }}>
+                          <span style={{ color: MUTED }}>Stochastic %K</span>
+                          <span style={{ fontWeight: 600 }}>{t.stoch_k.toFixed(1)}</span>
+                        </div>
+                        <Meter value={t.stoch_k} tone={t.stoch_k > 80 ? NEG : t.stoch_k < 20 ? POS : INFO} bands={[20, 80]} />
+                      </div>
+
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.76rem', padding: '0.3rem 0', borderTop: '1px solid #f1f5f9' }}>
+                        <span style={{ color: MUTED }}>Extension from 8 / 21 EMA</span>
+                        <span style={{ fontWeight: 600, color: Math.abs(t.dist_to_8ema) > 5 ? WARN : INK }}>
+                          {signedPct(t.dist_to_8ema)} / {signedPct(t.dist_to_21ema)}
+                        </span>
+                      </div>
+
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.76rem', padding: '0.3rem 0', borderTop: '1px solid #f1f5f9' }}>
+                        <span style={{ color: MUTED }}>VWAP (20 bars)</span>
+                        <span style={{ fontWeight: 600, color: t.price_vs_vwap === 'Above' ? POS : NEG }}>
+                          {money(t.vwap)} · price {t.price_vs_vwap.toLowerCase()}
+                        </span>
+                      </div>
+
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.76rem', padding: '0.3rem 0', borderTop: '1px solid #f1f5f9' }}>
+                        <span style={{ color: MUTED }}>Average true range</span>
+                        <span style={{ fontWeight: 600 }}>{money(t.atr)} · {plainPct(t.atr_pct)} of price</span>
+                      </div>
+                    </div>
                   </div>
-                )}
-                {tradeSetup.ema_alignment.multi_tf_agree !== null && (
-                  <div style={{ fontSize: '0.7rem', fontWeight: 600, marginTop: '0.15rem', color: tradeSetup.ema_alignment.multi_tf_agree ? '#16a34a' : '#dc2626' }}>
-                    {tradeSetup.ema_alignment.multi_tf_agree ? '✓ Multi-TF Aligned' : '✗ TF Divergence'}
-                  </div>
-                )}
-              </div>
-              <div className="stat-card" style={{ textAlign: 'center', padding: '0.75rem', borderLeft: `4px solid ${tradeSetup.technicals.price_vs_vwap === 'Above' ? '#16a34a' : '#dc2626'}` }}>
-                <div className="stat-value" style={{ fontSize: '0.95rem' }}>${tradeSetup.technicals.vwap}</div>
-                <div className="stat-label">VWAP(20) — Price {tradeSetup.technicals.price_vs_vwap}</div>
-                <table style={{ width: '100%', fontSize: '0.7rem', marginTop: '0.35rem', borderCollapse: 'collapse', color: 'var(--text-secondary)' }}>
-                  <tbody>
-                    {[
-                      { label: 'MA 100', val: tradeSetup.technicals.ma100 },
-                      { label: 'MA 200', val: tradeSetup.technicals.ma200 },
-                    ].map(r => {
-                      const d = r.val ? ((tradeSetup.last_close - r.val) / r.val * 100) : null
-                      return (
-                        <tr key={r.label}>
-                          <td style={{ textAlign: 'left', padding: '1px 2px', fontWeight: 500 }}>{r.label}</td>
-                          <td style={{ textAlign: 'right', padding: '1px 2px', color: d !== null ? (d >= 0 ? '#16a34a' : '#dc2626') : 'inherit' }}>
-                            ${r.val?.toFixed(2) ?? 'N/A'}
-                          </td>
-                          <td style={{ textAlign: 'right', padding: '1px 6px', color: d !== null ? (d >= 0 ? '#16a34a' : '#dc2626') : 'inherit', fontWeight: 500 }}>
-                            {d !== null ? `${d >= 0 ? '+' : ''}${d.toFixed(1)}%` : '—'}
-                          </td>
-                        </tr>
-                      )
-                    })}
-                    <tr>
-                      <td style={{ textAlign: 'left', padding: '1px 2px', fontWeight: 500 }}>Dist 8E</td>
-                      <td colSpan={2} style={{ textAlign: 'right', padding: '1px 2px', color: tradeSetup.technicals.dist_to_8ema >= 0 ? '#16a34a' : '#dc2626', fontWeight: 500 }}>
-                        {tradeSetup.technicals.dist_to_8ema > 0 ? '+' : ''}{tradeSetup.technicals.dist_to_8ema}% | 21E: {tradeSetup.technicals.dist_to_21ema > 0 ? '+' : ''}{tradeSetup.technicals.dist_to_21ema}%
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
+                </>
+              )
+            })()}
 
-            {/* Technicals row */}
-            <div className="dashboard-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)', marginBottom: '1rem' }}>
-              <div className="stat-card" style={{ textAlign: 'center', padding: '0.75rem' }}>
-                <div className="stat-value" style={{ fontSize: '1rem', color: tradeSetup.technicals.rsi > 70 ? '#dc2626' : tradeSetup.technicals.rsi < 30 ? '#16a34a' : 'inherit' }}>
-                  {tradeSetup.technicals.rsi.toFixed(1)}
-                </div>
-                <div className="stat-label">RSI ({tradeSetup.technicals.rsi_state})</div>
-              </div>
-              <div className="stat-card" style={{ textAlign: 'center', padding: '0.75rem' }}>
-                <div className="stat-value" style={{ fontSize: '1rem' }}>{tradeSetup.technicals.stoch_k.toFixed(1)}</div>
-                <div className="stat-label">Stoch %K</div>
-              </div>
-              <div className="stat-card" style={{ textAlign: 'center', padding: '0.75rem' }}>
-                <div className="stat-value" style={{ fontSize: '1rem' }}>${tradeSetup.technicals.atr.toFixed(2)}</div>
-                <div className="stat-label">ATR ({tradeSetup.technicals.atr_pct.toFixed(1)}%)</div>
-              </div>
-              <div className="stat-card" style={{ textAlign: 'center', padding: '0.75rem' }}>
-                <div className="stat-value" style={{ fontSize: '1rem' }}>{tradeSetup.technicals.trend_consistency.toFixed(0)}%</div>
-                <div className="stat-label">Trend Consistency</div>
-              </div>
-            </div>
+            {tab === 'levels' && (() => {
+              const atr = tradeSetup.technicals.atr
+              const price = tradeSetup.last_close
+              const retests: Array<LevelRetest & { tf: string }> = [
+                ...tradeSetup.level_retests.primary.map(r => ({ ...r, tf: setupInterval })),
+                ...tradeSetup.level_retests.confirm.map(r => ({ ...r, tf: tradeSetup.level_retests.confirm_interval })),
+              ]
 
-            <div style={{ fontSize: '0.75rem', color: MUTED, marginBottom: '1rem' }}>
-              {tradeSetup.momentum.state} — {tradeSetup.momentum.detail}
-            </div>
-              </>
-            )}
+              interface Row {
+                price: number
+                zoneHigh: number | null
+                name: string
+                source: string
+                role: 'Target' | 'Stop' | 'Entry' | 'Zone'
+                status: string
+                tone: string
+                detail: string
+                inPlan: boolean
+              }
 
-            {evidenceTab === 'levels' && (
-              <>
-            {/* Level Retests */}
-            {(tradeSetup.level_retests.daily.length > 0 || tradeSetup.level_retests.hourly.length > 0) && (
-              <div style={{ marginBottom: '1rem' }}>
-                <h3 style={{ fontSize: '0.95rem', fontWeight: 600, marginBottom: '0.5rem' }}>Level Retests</h3>
-                <div style={{ display: 'grid', gridTemplateColumns: tradeSetup.level_retests.hourly.length > 0 ? '1fr 1fr' : '1fr', gap: '1rem' }}>
-                  {tradeSetup.level_retests.daily.length > 0 && (
-                    <div>
-                      <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>Daily Timeframe</div>
-                      <table className="data-table">
+              const statusOfLevel = (levelPrice: number, matchName: string) => {
+                const rt = retests.find(r => r.level_name === matchName || Math.abs(r.level_price - levelPrice) < 0.01)
+                const distAtr = atr > 0 ? Math.abs(levelPrice - price) / atr : null
+                if (rt) {
+                  return {
+                    status: rt.held ? 'Held' : 'Broken',
+                    tone: rt.held ? POS : NEG,
+                    detail: `${rt.touch_type} ${rt.bars_ago} bars ago · ${signedPct(rt.bounce_pct)} · ${rt.tf}`,
+                  }
+                }
+                const detail = distAtr !== null ? `${distAtr.toFixed(1)}× ATR away` : ''
+                if (distAtr !== null && distAtr <= 0.25) return { status: 'Active', tone: WARN, detail: 'Price is sitting on this level' }
+                if (distAtr !== null && distAtr <= 1) return { status: 'Approaching', tone: INFO, detail }
+                if (distAtr !== null && distAtr <= 2) return { status: 'Near', tone: MUTED, detail }
+                return { status: 'Far', tone: MUTED, detail }
+              }
+
+              const inPlanAt = (p: number) =>
+                plan !== null && (Math.abs(plan.stop - p) < 0.01 || Math.abs(plan.target - p) < 0.01)
+
+              const seen = new Set<string>()
+              const rows: Row[] = []
+              const collect = (levels: typeof tradeSetup.targets, role: 'Target' | 'Stop') => {
+                levels.forEach(lvl => {
+                  const key = lvl.price.toFixed(2)
+                  if (seen.has(key)) return
+                  seen.add(key)
+                  rows.push({
+                    price: lvl.price,
+                    zoneHigh: null,
+                    name: lvl.level,
+                    source: lvl.source,
+                    role,
+                    ...statusOfLevel(lvl.price, lvl.level),
+                    inPlan: inPlanAt(lvl.price),
+                  })
+                })
+              }
+              collect(tradeSetup.targets, 'Target')
+              collect(tradeSetup.stops, 'Stop')
+
+              // Entry triggers carry zones (FVG, gaps) and EMAs that the target/stop lists omit.
+              tradeSetup.entries.forEach(e => {
+                if (e.zone_low === null) return
+                const key = e.zone_low.toFixed(2)
+                if (seen.has(key)) return
+                seen.add(key)
+                const zoneHigh = e.zone_high !== null && Math.abs(e.zone_high - e.zone_low) > 0.005 ? e.zone_high : null
+                const base = statusOfLevel(e.zone_low, e.strategy)
+                rows.push({
+                  price: e.zone_low,
+                  zoneHigh,
+                  name: e.strategy,
+                  source: 'Entry trigger',
+                  role: 'Entry',
+                  ...base,
+                  detail: `${e.strength} · ${e.condition}`,
+                  inPlan: inPlanAt(e.zone_low),
+                })
+              })
+
+              // Remaining unmitigated gap/FVG zones, so the table never degrades to a bare count.
+              tradeSetup.zones.forEach(z => {
+                const key = z.low.toFixed(2)
+                if (seen.has(key)) return
+                seen.add(key)
+                const inside = price >= z.low && price <= z.high
+                const nearestEdge = price < z.low ? z.low : z.high
+                const base = inside
+                  ? { status: 'Price inside', tone: WARN, detail: 'Price is trading inside this zone' }
+                  : statusOfLevel(nearestEdge, z.name)
+                rows.push({
+                  price: z.low,
+                  zoneHigh: z.high,
+                  name: z.name,
+                  source: z.source,
+                  role: 'Zone',
+                  ...base,
+                  detail: z.qualifier ? `${z.qualifier} · ${base.detail}` : base.detail,
+                  inPlan: inPlanAt(z.low),
+                })
+              })
+
+              rows.sort((a, b) => b.price - a.price)
+              const firstBelow = rows.findIndex(r => r.price < price)
+
+              const priceRow = (
+                <tr style={{ background: INFO_SOFT }}>
+                  <td colSpan={6} style={{ padding: '5px 8px', fontSize: '0.74rem', fontWeight: 700, color: INFO }}>
+                    ── Current price {money(price)} ──
+                  </td>
+                </tr>
+              )
+
+              return (
+                <>
+                  {rows.length === 0 ? (
+                    <p style={{ fontSize: '0.8rem', color: MUTED }}>No levels resolved on this timeframe.</p>
+                  ) : (
+                    <div style={{ border: '1px solid #e2e8f0', borderRadius: '0.5rem', overflow: 'hidden', marginBottom: '1rem' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem' }}>
                         <thead>
-                          <tr><th>Level</th><th>Price</th><th>Candle H/L</th><th>Touch</th><th>Held</th><th>Bounce</th></tr>
+                          <tr style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
+                            {['Price', 'Distance', 'Level', 'Source', 'Role', 'Status'].map((label, i) => (
+                              <th key={label} style={{ padding: '6px 8px', textAlign: i <= 1 ? 'right' : 'left', color: MUTED, fontWeight: 700 }}>{label}</th>
+                            ))}
+                          </tr>
                         </thead>
                         <tbody>
-                          {tradeSetup.level_retests.daily.map((rt: LevelRetest, i: number) => (
-                            <tr key={i}>
-                              <td style={{ fontWeight: 500, fontSize: '0.8rem' }}>{rt.level_name}</td>
-                              <td>${rt.level_price.toFixed(2)}</td>
-                              <td style={{ fontSize: '0.75rem' }}>H:${rt.candle_high.toFixed(2)} L:${rt.candle_low.toFixed(2)}</td>
-                              <td style={{ fontSize: '0.75rem' }}>{rt.touch_type}</td>
-                              <td>
-                                <span style={{ color: rt.held ? '#16a34a' : '#dc2626', fontWeight: 600 }}>
-                                  {rt.held ? '✓' : '✗'}
-                                </span>
-                              </td>
-                              <td style={{ color: rt.bounce_pct >= 0 ? '#16a34a' : '#dc2626', fontWeight: 500, fontSize: '0.8rem' }}>
-                                {rt.bounce_pct >= 0 ? '+' : ''}{rt.bounce_pct}%
-                              </td>
-                            </tr>
+                          {rows.map((r, i) => (
+                            <Fragment key={`${r.name}-${r.price}`}>
+                              {i === firstBelow && priceRow}
+                              <tr style={{ borderBottom: '1px solid #f1f5f9', background: r.inPlan ? WARN_SOFT : undefined }}>
+                                <td style={{ padding: '6px 8px', textAlign: 'right', fontWeight: 700, whiteSpace: 'nowrap' }}>
+                                  {r.zoneHigh !== null ? `${money(r.price)} – ${money(r.zoneHigh)}` : money(r.price)}
+                                </td>
+                                <td style={{ padding: '6px 8px', textAlign: 'right', color: r.price >= price ? POS : NEG }}>
+                                  {signedPct(((r.price - price) / price) * 100)}
+                                </td>
+                                <td style={{ padding: '6px 8px' }}>
+                                  {r.name}
+                                  {r.inPlan && <span style={{ marginLeft: '0.35rem', fontSize: '0.68rem', color: WARN, fontWeight: 700 }}>in plan</span>}
+                                </td>
+                                <td style={{ padding: '6px 8px', color: MUTED }}>{r.source}</td>
+                                <td style={{ padding: '6px 8px', color: r.role === 'Target' ? POS : r.role === 'Stop' ? NEG : r.role === 'Entry' ? INFO : MUTED, fontWeight: 600 }}>{r.role}</td>
+                                <td style={{ padding: '6px 8px' }}>
+                                  <Pill text={r.status} tone={r.tone} />
+                                  {r.detail && <div style={{ fontSize: '0.68rem', color: MUTED, marginTop: '0.15rem' }}>{r.detail}</div>}
+                                </td>
+                              </tr>
+                            </Fragment>
                           ))}
+                          {firstBelow === -1 && priceRow}
                         </tbody>
                       </table>
                     </div>
                   )}
-                  {tradeSetup.level_retests.hourly.length > 0 && (
-                    <div>
-                      <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>Hourly Timeframe</div>
-                      <table className="data-table">
-                        <thead>
-                          <tr><th>Level</th><th>Price</th><th>Candle H/L</th><th>Touch</th><th>Held</th><th>Bounce</th></tr>
-                        </thead>
-                        <tbody>
-                          {tradeSetup.level_retests.hourly.map((rt: LevelRetest, i: number) => (
-                            <tr key={i}>
-                              <td style={{ fontWeight: 500, fontSize: '0.8rem' }}>{rt.level_name}</td>
-                              <td>${rt.level_price.toFixed(2)}</td>
-                              <td style={{ fontSize: '0.75rem' }}>H:${rt.candle_high.toFixed(2)} L:${rt.candle_low.toFixed(2)}</td>
-                              <td style={{ fontSize: '0.75rem' }}>{rt.touch_type}</td>
-                              <td>
-                                <span style={{ color: rt.held ? '#16a34a' : '#dc2626', fontWeight: 600 }}>
-                                  {rt.held ? '✓' : '✗'}
-                                </span>
-                              </td>
-                              <td style={{ color: rt.bounce_pct >= 0 ? '#16a34a' : '#dc2626', fontWeight: 500, fontSize: '0.8rem' }}>
-                                {rt.bounce_pct >= 0 ? '+' : ''}{rt.bounce_pct}%
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </div>
-              </div>
+                </>
+              )
+            })()}
+
+            {tab === 'fibonacci' && !tradeSetup.strategy_results.fibonacci && (
+              <p style={{ fontSize: '0.8rem', color: MUTED }}>
+                No confirmed Fibonacci swing on {INTERVAL_NOUN[setupInterval] ?? setupInterval} bars — the zigzag needs a completed
+                leg larger than the detection threshold before levels can be drawn.
+              </p>
             )}
 
-            {/* Entry Criteria Table */}
-            {tradeSetup.entries.length > 0 && (
-              <div style={{ marginBottom: '1rem' }}>
-                <h3 style={{ fontSize: '0.95rem', fontWeight: 600, marginBottom: '0.5rem' }}>Entry Criteria</h3>
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th>Strategy</th>
-                      <th>Condition</th>
-                      <th>Price Zone</th>
-                      <th>Strength</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {tradeSetup.entries.map((e, i) => (
-                      <tr key={i}>
-                        <td style={{ fontWeight: 500 }}>{e.strategy}</td>
-                        <td>{e.condition}</td>
-                        <td>{e.price_zone}</td>
-                        <td>
-                          <span style={{
-                            padding: '0.15rem 0.5rem',
-                            borderRadius: '9999px',
-                            fontSize: '0.75rem',
-                            fontWeight: 600,
-                            background: e.strength === 'Strong' ? '#dcfce7' : e.strength === 'Moderate' ? '#fef9c3' : '#f3f4f6',
-                            color: e.strength === 'Strong' ? '#166534' : e.strength === 'Moderate' ? '#854d0e' : '#374151',
-                          }}>{e.strength}</span>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+            {tab === 'fibonacci' && tradeSetup.strategy_results.fibonacci && (() => {
+              const fib = tradeSetup.strategy_results.fibonacci
+              const active = fib.active_leg
+              const price = tradeSetup.last_close
+              const confirmedMove = fib.trend_direction === 'uptrend_retracement'
+                ? `Low ${money(fib.swing_low)} (${fib.swing_low_date}) → High ${money(fib.swing_high)} (${fib.swing_high_date})`
+                : `High ${money(fib.swing_high)} (${fib.swing_high_date}) → Low ${money(fib.swing_low)} (${fib.swing_low_date})`
 
-            {/* Targets & Stops */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginBottom: '1rem' }}>
-              {tradeSetup.targets.length > 0 && (
-                <div>
-                  <h3 style={{ fontSize: '0.95rem', fontWeight: 600, marginBottom: '0.5rem', color: '#16a34a' }}>Targets</h3>
-                  <table className="data-table">
-                    <thead>
-                      <tr><th>Level</th><th>Price</th><th>Source</th></tr>
-                    </thead>
-                    <tbody>
-                      {tradeSetup.targets.map((t, i) => (
-                        <tr key={i}>
-                          <td>{t.level}</td>
-                          <td style={{ fontWeight: 500, color: '#16a34a' }}>${t.price.toFixed(2)}</td>
-                          <td>{t.source}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-              {tradeSetup.stops.length > 0 && (
-                <div>
-                  <h3 style={{ fontSize: '0.95rem', fontWeight: 600, marginBottom: '0.5rem', color: '#dc2626' }}>Stop Levels</h3>
-                  <table className="data-table">
-                    <thead>
-                      <tr><th>Level</th><th>Price</th><th>Source</th></tr>
-                    </thead>
-                    <tbody>
-                      {tradeSetup.stops.map((s, i) => (
-                        <tr key={i}>
-                          <td>{s.level}</td>
-                          <td style={{ fontWeight: 500, color: '#dc2626' }}>${s.price.toFixed(2)}</td>
-                          <td>{s.source}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-              </>
-            )}
-
-            {evidenceTab === 'signals' && (
-              <>
-            {tradeSetup.signals.length > 0 && (
-              <div style={{ marginBottom: '1rem' }}>
-                <h3 style={{ fontSize: '0.95rem', fontWeight: 600, marginBottom: '0.5rem' }}>
-                  Signal Reasons ({tradeSetup.signals.length})
-                </h3>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
-                  {tradeSetup.signals.map((s, i) => {
-                    const bullish = /bullish|golden|above|support|oversold|held|pullback|\+/i.test(s)
-                    const bearish = /bearish|death|below|resistance|overbought|rejected/i.test(s)
-                    const tone = bullish && !bearish ? POS : bearish && !bullish ? NEG : MUTED
+              const levelGrid = (levels: typeof fib.levels, nearestName: string) => (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '0.35rem', marginTop: '0.5rem' }}>
+                  {levels.map(level => {
+                    const isNearest = level.name === nearestName
+                    const above = level.price >= price
                     return (
-                      <span key={i} style={{
-                        padding: '0.2rem 0.6rem',
-                        background: '#fff',
-                        border: `1px solid ${tone}`,
-                        color: tone,
-                        borderRadius: '0.3rem',
+                      <div key={level.name} style={{
+                        padding: '0.35rem 0.5rem',
+                        border: `1px solid ${isNearest ? INFO : LINE}`,
+                        background: isNearest ? INFO_SOFT : '#fff',
+                        borderRadius: '0.35rem',
                         fontSize: '0.74rem',
-                        fontWeight: 500,
-                      }}>{s}</span>
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.4rem' }}>
+                          <span style={{ color: MUTED }}>{level.name}</span>
+                          <strong>{money(level.price)}</strong>
+                        </div>
+                        <div style={{ color: above ? POS : NEG, fontSize: '0.68rem' }}>
+                          {signedPct(((level.price - price) / price) * 100, 2)} · {above ? 'above' : 'below'} price
+                        </div>
+                      </div>
                     )
                   })}
                 </div>
-              </div>
-            )}
+              )
 
-            {/* Strategy Results Summary */}
-            <div style={{ padding: '0.75rem 1rem', background: '#f8fafc', borderRadius: '0.5rem', border: '1px solid #e2e8f0' }}>
-              <strong style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', display: 'block', marginBottom: '0.5rem' }}>Strategy Results</strong>
-              <div className="ticker-strategy-results" style={{ fontSize: '0.8rem' }}>
-                {tradeSetup.strategy_results.ma_crossover && (
-                  <div style={{ padding: '0.5rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0' }}>
-                    <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>MA Crossover</div>
-                    <div>Signal: <strong>{tradeSetup.strategy_results.ma_crossover.signal}</strong></div>
-                    {tradeSetup.strategy_results.ma_crossover.spread_pct !== null && (
-                      <div>Spread: {tradeSetup.strategy_results.ma_crossover.spread_pct.toFixed(1)}%</div>
-                    )}
-                    {tradeSetup.strategy_results.ma_crossover.weekly_signal && (
-                      <div>Weekly: {tradeSetup.strategy_results.ma_crossover.weekly_signal}</div>
-                    )}
-                  </div>
-                )}
-                {tradeSetup.strategy_results.momentum_pullback && (
-                  <div style={{ padding: '0.5rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0' }}>
-                    <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>Momentum Pullback</div>
-                    <div>Grade: <strong>{tradeSetup.strategy_results.momentum_pullback.grade}</strong></div>
-                    <div>Score: {tradeSetup.strategy_results.momentum_pullback.score}/100</div>
-                  </div>
-                )}
-                {tradeSetup.strategy_results.bearish_bounce && (
-                  <div style={{ padding: '0.5rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0' }}>
-                    <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>Bearish Bounce</div>
-                    <div>Grade: <strong>{tradeSetup.strategy_results.bearish_bounce.grade}</strong></div>
-                    <div>Score: {tradeSetup.strategy_results.bearish_bounce.score}/100</div>
-                  </div>
-                )}
-                {tradeSetup.strategy_results.gaps && (
-                  <div style={{ padding: '0.5rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0' }}>
-                    <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>Gap Levels</div>
-                    <div>Support: {tradeSetup.strategy_results.gaps.support_count}</div>
-                    <div>Resistance: {tradeSetup.strategy_results.gaps.resistance_count}</div>
-                  </div>
-                )}
-                {tradeSetup.strategy_results.fvg && (
-                  <div style={{ padding: '0.5rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0' }}>
-                    <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>Fair Value Gaps</div>
-                    <div>Bull (unmit.): {tradeSetup.strategy_results.fvg.bull_unmitigated}</div>
-                    <div>Bear (unmit.): {tradeSetup.strategy_results.fvg.bear_unmitigated}</div>
-                  </div>
-                )}
-                {tradeSetup.strategy_results.fibonacci && (
-                  <div style={{ padding: '0.5rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', marginBottom: '0.25rem' }}>
-                      <span style={{ fontWeight: 600 }}>Fibonacci</span>
-                      <span style={{ color: 'var(--text-secondary)', fontSize: '0.65rem' }}>Context only · not scored</span>
+              return (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: active ? '1fr 1fr' : '1fr', gap: '0.85rem', marginBottom: '0.85rem' }}>
+                    <div style={PANEL}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', marginBottom: '0.35rem' }}>
+                        <span style={LABEL}>Confirmed leg</span>
+                        <Pill text="Valid basis" tone={POS} />
+                      </div>
+                      <div style={{ fontSize: '0.82rem', fontWeight: 600, color: INK }}>{confirmedMove}</div>
+                      <div style={{ fontSize: '0.74rem', color: MUTED, marginTop: '0.25rem' }}>
+                        {fib.signal} · swing {plainPct(fib.swing_size_pct, 2)} · retraced {plainPct(fib.retracement_pct, 2)} · detection {plainPct(fib.swing_detection_pct, 2)} dynamic
+                      </div>
+                      <div style={{ fontSize: '0.76rem', marginTop: '0.4rem', paddingTop: '0.4rem', borderTop: '1px solid #f1f5f9' }}>
+                        <span style={{ color: MUTED }}>Nearest reference: </span>
+                        <strong>{fib.nearest_level} · {money(fib.nearest_level_price)}</strong>
+                        <span style={{ color: fib.distance_pct >= 0 ? POS : NEG }}> · {signedPct(fib.distance_pct, 2)}</span>
+                      </div>
+                      {levelGrid(fib.levels, fib.nearest_level)}
                     </div>
-                    <div>Signal: <strong>{tradeSetup.strategy_results.fibonacci.signal}</strong></div>
-                    <div>
-                      Detection: <strong>{tradeSetup.strategy_results.fibonacci.swing_detection_pct.toFixed(2)}% dynamic</strong>
-                    </div>
-                    <div>
-                      Confirmed move: {tradeSetup.strategy_results.fibonacci.trend_direction === 'uptrend_retracement' ? (
-                        <>Low ${tradeSetup.strategy_results.fibonacci.swing_low.toFixed(2)} ({tradeSetup.strategy_results.fibonacci.swing_low_date}) → High ${tradeSetup.strategy_results.fibonacci.swing_high.toFixed(2)} ({tradeSetup.strategy_results.fibonacci.swing_high_date})</>
-                      ) : (
-                        <>High ${tradeSetup.strategy_results.fibonacci.swing_high.toFixed(2)} ({tradeSetup.strategy_results.fibonacci.swing_high_date}) → Low ${tradeSetup.strategy_results.fibonacci.swing_low.toFixed(2)} ({tradeSetup.strategy_results.fibonacci.swing_low_date})</>
-                      )}
-                    </div>
-                    <div>
-                      Developing: {tradeSetup.strategy_results.fibonacci.developing_pivot.type === 'high' ? 'High' : 'Low'}
-                      {' '}${tradeSetup.strategy_results.fibonacci.developing_pivot.price.toFixed(2)} ({tradeSetup.strategy_results.fibonacci.developing_pivot.date})
-                      {' '}· {tradeSetup.strategy_results.fibonacci.developing_pivot.move_pct_from_confirmed.toFixed(2)}% from confirmed pivot
-                    </div>
-                    <div>
-                      Size: {tradeSetup.strategy_results.fibonacci.swing_size_pct.toFixed(2)}%
-                      {' '}· Retraced: {tradeSetup.strategy_results.fibonacci.retracement_pct.toFixed(2)}%
-                    </div>
-                    <div>
-                      Nearest: {tradeSetup.strategy_results.fibonacci.nearest_level} at ${tradeSetup.strategy_results.fibonacci.nearest_level_price.toFixed(2)}
-                      {' '}({tradeSetup.strategy_results.fibonacci.distance_pct > 0 ? '+' : ''}{tradeSetup.strategy_results.fibonacci.distance_pct.toFixed(2)}%)
-                    </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '0.1rem 0.5rem', marginTop: '0.3rem', color: 'var(--text-secondary)' }}>
-                      {tradeSetup.strategy_results.fibonacci.levels.map((level) => (
-                        <span key={level.name}>{level.name}: ${level.price.toFixed(2)}</span>
-                      ))}
-                    </div>
-                    {tradeSetup.strategy_results.fibonacci.active_leg && (
-                      <>
-                        <div style={{ fontWeight: 600, marginTop: '0.45rem' }}>
-                          Active provisional {tradeSetup.strategy_results.fibonacci.active_leg.level_role === 'provisional_support' ? 'supports' : 'resistances'}
+
+                    {active && (
+                      <div style={PANEL}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', marginBottom: '0.35rem' }}>
+                          <span style={LABEL}>Active provisional leg</span>
+                          <Pill text="Unconfirmed" tone={WARN} />
                         </div>
-                        <div>
-                          {tradeSetup.strategy_results.fibonacci.active_leg.start.type === 'high' ? 'High' : 'Low'} ${tradeSetup.strategy_results.fibonacci.active_leg.start.price.toFixed(2)} ({tradeSetup.strategy_results.fibonacci.active_leg.start.date})
-                          {' '}→ {tradeSetup.strategy_results.fibonacci.active_leg.end.type === 'high' ? 'High' : 'Low'} ${tradeSetup.strategy_results.fibonacci.active_leg.end.price.toFixed(2)} ({tradeSetup.strategy_results.fibonacci.active_leg.end.date})
-                          {' '}· retraced {tradeSetup.strategy_results.fibonacci.active_leg.retracement_pct.toFixed(2)}%
+                        <div style={{ fontSize: '0.82rem', fontWeight: 600, color: INK }}>
+                          {active.start.type === 'high' ? 'High' : 'Low'} {money(active.start.price)} ({active.start.date})
+                          {' → '}{active.end.type === 'high' ? 'High' : 'Low'} {money(active.end.price)} ({active.end.date})
                         </div>
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '0.1rem 0.5rem', marginTop: '0.3rem', color: 'var(--text-secondary)' }}>
-                          {tradeSetup.strategy_results.fibonacci.active_leg.levels.map((level) => (
-                            <span key={level.name}>{level.name}: ${level.price.toFixed(2)}</span>
-                          ))}
+                        <div style={{ fontSize: '0.74rem', color: MUTED, marginTop: '0.25rem' }}>
+                          Acts as {active.level_role === 'provisional_support' ? 'support' : 'resistance'} · retraced {plainPct(active.retracement_pct, 2)}
                         </div>
-                        <div style={{ color: 'var(--text-secondary)', marginTop: '0.3rem' }}>
-                          Confirms when price moves {tradeSetup.strategy_results.fibonacci.active_leg.confirmation.condition === 'at_or_below' ? 'to or below' : 'to or above'} ${tradeSetup.strategy_results.fibonacci.active_leg.confirmation.price.toFixed(2)}.
+                        <div style={{ fontSize: '0.76rem', marginTop: '0.4rem', paddingTop: '0.4rem', borderTop: '1px solid #f1f5f9' }}>
+                          <span style={{ color: MUTED }}>Confirms when price moves </span>
+                          <strong>
+                            {active.confirmation.condition === 'at_or_below' ? 'to or below' : 'to or above'} {money(active.confirmation.price)}
+                          </strong>
                         </div>
-                      </>
+                        {levelGrid(active.levels, active.nearest_level)}
+                      </div>
                     )}
                   </div>
-                )}
-              </div>
-            </div>
+
+                  {!active && (
+                    <div style={{ ...PANEL, marginBottom: '0.85rem' }}>
+                      <div style={{ ...LABEL, marginBottom: '0.3rem' }}>Developing pivot</div>
+                      <div style={{ fontSize: '0.82rem' }}>
+                        {fib.developing_pivot.type === 'high' ? 'High' : 'Low'} {money(fib.developing_pivot.price)} ({fib.developing_pivot.date})
+                        {' · '}{plainPct(fib.developing_pivot.move_pct_from_confirmed, 2)} from the confirmed pivot
+                      </div>
+                    </div>
+                  )}
             {tradeSetup.strategy_results.fibonacci?.active_leg?.scenarios && (
               <section className="ticker-fibonacci-scenarios">
                 <div className="ticker-fibonacci-scenarios__header">
@@ -1876,314 +1765,216 @@ function TickerDetail() {
               </section>
             )}
             {!!tradeSetup.strategy_results.fibonacci?.confirmed_legs?.length && (
-              <section className="ticker-fibonacci-history">
-                <div className="ticker-fibonacci-history__header">
-                  <strong>Confirmed leg history</strong>
-                  <span>Newest six completed legs · invalidated levels are historical only</span>
-                </div>
-                <div className="ticker-fibonacci-history__columns">
-                  <span>Status</span><span>Completed move</span><span>Role</span>
-                  <span>Swing</span><span>Nearest level</span><span>Invalidation</span>
-                </div>
-                {tradeSetup.strategy_results.fibonacci?.confirmed_legs?.map((leg) => (
-                  <div className={`ticker-fibonacci-history__row ticker-fibonacci-history__row--${leg.status}`} key={`${leg.start.date}-${leg.end.date}`}>
-                    <div>
-                      <span className="ticker-fibonacci-history__status">
-                        {leg.is_primary ? 'Primary' : leg.status === 'valid' ? 'Valid' : 'Invalidated'}
+              <details>
+                <summary style={{ cursor: 'pointer', fontSize: '0.78rem', fontWeight: 700, color: MUTED, padding: '0.4rem 0' }}>
+                  Confirmed leg history ({tradeSetup.strategy_results.fibonacci.confirmed_legs.length})
+                </summary>
+                <section className="ticker-fibonacci-history">
+                  <div className="ticker-fibonacci-history__header">
+                    <strong>Confirmed leg history</strong>
+                    <span>Newest six completed legs · invalidated levels are historical only</span>
+                  </div>
+                  <div className="ticker-fibonacci-history__columns">
+                    <span>Status</span><span>Completed move</span><span>Role</span>
+                    <span>Swing</span><span>Nearest level</span><span>Invalidation</span>
+                  </div>
+                  {tradeSetup.strategy_results.fibonacci?.confirmed_legs?.map((leg) => (
+                    <div className={`ticker-fibonacci-history__row ticker-fibonacci-history__row--${leg.status}`} key={`${leg.start.date}-${leg.end.date}`}>
+                      <div>
+                        <span className="ticker-fibonacci-history__status">
+                          {leg.is_primary ? 'Primary' : leg.status === 'valid' ? 'Valid' : 'Invalidated'}
+                        </span>
+                      </div>
+                      <div>
+                        {leg.start.type === 'high' ? 'High' : 'Low'} {money(leg.start.price)} · {leg.start.date}
+                        {' '}→ {leg.end.type === 'high' ? 'High' : 'Low'} {money(leg.end.price)} · {leg.end.date}
+                      </div>
+                      <div>{leg.level_role === 'confirmed_support' ? 'Support' : 'Resistance'}</div>
+                      <div>{leg.swing_size_pct.toFixed(2)}%</div>
+                      <div>{leg.nearest_level} · {money(leg.nearest_level_price)} · {leg.distance_pct > 0 ? '+' : ''}{leg.distance_pct.toFixed(2)}%</div>
+                      <div>
+                        {leg.status === 'invalidated'
+                          ? `${leg.invalidation.date} · moved ${leg.invalidation.condition} ${money(leg.invalidation.price)}`
+                          : `Valid until ${leg.invalidation.condition} ${money(leg.invalidation.price)}`}
+                      </div>
+                    </div>
+                  ))}
+                </section>
+              </details>
+            )}
+                </>
+              )
+            })()}
+
+            {tab === 'scanner' && (() => {
+              const resolved = scannerEvents.filter(e => e.outcomes.length > 0)
+              const outcomeOf = (event: ScannerEventRow) => event.outcomes[event.outcomes.length - 1] ?? null
+              const hits = resolved.filter(e => outcomeOf(e)?.first_hit === 'TARGET').length
+              const alphas = resolved
+                .map(e => outcomeOf(e)?.net_alpha_return)
+                .filter((a): a is number => a !== null && a !== undefined)
+              const avgAlpha = alphas.length > 0 ? alphas.reduce((s, a) => s + a, 0) / alphas.length : null
+
+              const statusOf = (event: ScannerEventRow): { label: string; tone: string } => {
+                const outcome = outcomeOf(event)
+                if (!outcome) {
+                  return event.outcomes.some(o => o.entry_price != null)
+                    ? { label: 'Open', tone: INFO }
+                    : { label: 'Pending entry', tone: MUTED }
+                }
+                switch (outcome.first_hit) {
+                  case 'TARGET': return { label: 'Target hit', tone: POS }
+                  case 'STOP': return { label: 'Stopped', tone: NEG }
+                  case 'SAME_BAR': return { label: 'Both in one bar', tone: WARN }
+                  default: return { label: 'Expired flat', tone: MUTED }
+                }
+              }
+
+              const barNoun = setupInterval === '1wk' ? 'sessions' : 'bars'
+
+              return (
+                <>
+                  <div style={{
+                    display: 'flex', justifyContent: 'space-between', gap: '1rem', flexWrap: 'wrap',
+                    padding: '0.6rem 0.85rem', marginBottom: '0.75rem',
+                    background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '0.5rem',
+                  }}>
+                    <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: '0.78rem' }}>
+                        <strong>{scannerEvents.length}</strong> <span style={{ color: MUTED }}>setups on {INTERVAL_NOUN[setupInterval] ?? setupInterval} bars</span>
+                      </span>
+                      <span style={{ fontSize: '0.78rem' }}>
+                        <strong style={{ color: resolved.length === 0 ? MUTED : hits / resolved.length >= 0.5 ? POS : NEG }}>
+                          {resolved.length === 0 ? '—' : plainPct((hits / resolved.length) * 100, 0)}
+                        </strong>{' '}
+                        <span style={{ color: MUTED }}>reached target ({hits}/{resolved.length} resolved)</span>
+                      </span>
+                      <span style={{ fontSize: '0.78rem' }}>
+                        <strong style={{ color: avgAlpha === null ? MUTED : avgAlpha >= 0 ? POS : NEG }}>
+                          {avgAlpha === null ? '—' : signedPct(avgAlpha * 100, 2)}
+                        </strong>{' '}
+                        <span style={{ color: MUTED }}>average alpha vs benchmark</span>
                       </span>
                     </div>
-                    <div>
-                      {leg.start.type === 'high' ? 'High' : 'Low'} {money(leg.start.price)} · {leg.start.date}
-                      {' '}→ {leg.end.type === 'high' ? 'High' : 'Low'} {money(leg.end.price)} · {leg.end.date}
-                    </div>
-                    <div>{leg.level_role === 'confirmed_support' ? 'Support' : 'Resistance'}</div>
-                    <div>{leg.swing_size_pct.toFixed(2)}%</div>
-                    <div>{leg.nearest_level} · {money(leg.nearest_level_price)} · {leg.distance_pct > 0 ? '+' : ''}{leg.distance_pct.toFixed(2)}%</div>
-                    <div>
-                      {leg.status === 'invalidated'
-                        ? `${leg.invalidation.date} · moved ${leg.invalidation.condition} ${money(leg.invalidation.price)}`
-                        : `Valid until ${leg.invalidation.condition} ${money(leg.invalidation.price)}`}
-                    </div>
+                    <span style={{ fontSize: '0.7rem', color: WARN }}>Research signals · not recommendations</span>
                   </div>
-                ))}
-              </section>
-            )}
-              </>
-            )}
 
-            {evidenceTab === 'model' && (
-              <>
-            <div>
-
-              {/* Layer 1: Pattern Scores */}
-              {patternScores && !calibrationLoading && (
-                <div style={panelStyle}>
-                  <h3 style={panelHeadStyle}>
-                    Layer 1 · Opening pattern scores · 9:25 AM
-                  </h3>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: '0.5rem' }}>
-                    {([
-                      { key: 'breakout' as PatternKey, name: 'Breakout' },
-                      { key: 'vwap' as PatternKey, name: 'VWAP' },
-                      { key: 'volatility' as PatternKey, name: 'Volatility' },
-                      { key: 'trend' as PatternKey, name: 'Trend' },
-                      { key: 'rs' as PatternKey, name: 'RS' },
-                      { key: 'calendar' as PatternKey, name: 'Calendar' },
-                    ]).map(({ key, name }) => {
-                      const val = patternScores.patterns[key] ?? 0
-                      const fired = patternScores.fired[key]
-                      const tone = val >= 60 ? POS : val >= 40 ? WARN : NEG
-                      return (
-                        <div key={key} style={{ padding: '0.6rem', background: '#fff', borderRadius: '0.375rem', border: `1px solid ${fired ? POS : '#e2e8f0'}`, textAlign: 'center' }}>
-                          <div style={{ fontSize: '1.25rem', fontWeight: 700, color: tone }}>{val}</div>
-                          <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
-                            {name}{fired ? ' \u25cf' : ''}
-                          </div>
-                          <div style={{ marginTop: '0.35rem', height: '3px', background: '#e5e7eb', borderRadius: '9999px', overflow: 'hidden' }}>
-                            <div style={{ height: '100%', background: tone, width: `${Math.min(val, 100)}%` }} />
-                          </div>
-                        </div>
-                      )
-                    })}
-                  </div>
-                  <div style={{ marginTop: '0.6rem', display: 'flex', flexWrap: 'wrap', gap: '0.75rem', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-                    <span>{patternScores.trade_date}</span>
-                    <span>{patternScores.fired_count}/6 fired (score &gt; 60)</span>
-                    {patternScores.primary_regime && <span>Market: {patternScores.primary_regime}</span>}
-                    {patternScores.sector_regime && <span>Sector: {patternScores.sector_regime}</span>}
-                    {patternScores.market_breadth_score !== null && <span>Breadth: {patternScores.market_breadth_score}</span>}
-                  </div>
-                </div>
-              )}
-
-              {/* Layer 3: Analog Matches */}
-              {analogMatches && !calibrationLoading && (
-                <div style={panelStyle}>
-                  <h3 style={panelHeadStyle}>
-                    Layer 3 · Analog pattern matching · 9:30 AM
-                  </h3>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.5rem', marginBottom: '0.75rem' }}>
-                    <div style={{ padding: '0.6rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0', textAlign: 'center' }}>
-                      <div style={{ fontSize: '1.25rem', fontWeight: 700, color: analogMatches.analog_accuracy >= 55 ? POS : analogMatches.analog_accuracy >= 45 ? WARN : NEG }}>{analogMatches.analog_accuracy.toFixed(1)}%</div>
-                      <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>Analog Accuracy</div>
-                    </div>
-                    <div style={{ padding: '0.6rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0', textAlign: 'center' }}>
-                      <div style={{ fontSize: '1.25rem', fontWeight: 700, color: analogMatches.confidence_boost >= 0 ? POS : NEG }}>
-                        {analogMatches.confidence_boost > 0 ? '+' : ''}{analogMatches.confidence_boost}
-                      </div>
-                      <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>Confidence Boost</div>
-                    </div>
-                    <div style={{ padding: '0.6rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0', textAlign: 'center' }}>
-                      <div style={{ fontSize: '1.25rem', fontWeight: 700, color: INK }}>{analogMatches.analog_count}</div>
-                      <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
-                        Similar Days{analogMatches.sector_regime ? ` \u00b7 ${analogMatches.sector_regime}` : ''}
-                      </div>
-                    </div>
-                  </div>
-                  {analogMatches.similar_days.length > 0 && (
-                    <table className="data-table" style={{ fontSize: '0.8rem' }}>
-                      <thead>
-                        <tr><th>Analog Date</th><th>Distance</th><th>Return</th><th>Hit</th></tr>
-                      </thead>
-                      <tbody>
-                        {analogMatches.similar_days.map((d, i) => (
-                          <tr key={`${d.date}-${i}`}>
-                            <td>{d.date}</td>
-                            <td style={{ textAlign: 'center' }}>{d.distance}</td>
-                            <td style={{ textAlign: 'center', color: d.actual_return >= 0 ? '#16a34a' : '#dc2626' }}>
-                              {d.actual_return > 0 ? '+' : ''}{d.actual_return}%
-                            </td>
-                            <td style={{ textAlign: 'center', color: d.hit ? '#16a34a' : '#dc2626', fontWeight: 600 }}>
-                              {d.hit ? '\u2713' : '\u2717'}
-                            </td>
+                  {scannerEvents.length === 0 ? (
+                    <p style={{ fontSize: '0.8rem', color: MUTED }}>
+                      No scanner setups recorded for {symbol} on {INTERVAL_NOUN[setupInterval] ?? setupInterval} bars.
+                    </p>
+                  ) : (
+                    <div style={{ border: '1px solid #e2e8f0', borderRadius: '0.5rem', overflow: 'hidden' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.76rem' }}>
+                        <thead>
+                          <tr style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
+                            {['Setup', 'Signal time', 'Entry', 'Stop / target', 'Actual entry', 'Return / alpha', 'Status'].map((label, i) => (
+                              <th key={label} style={{ padding: '6px 8px', textAlign: i === 0 || i === 6 ? 'left' : 'right', color: MUTED, fontWeight: 700, whiteSpace: 'nowrap' }}>{label}</th>
+                            ))}
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                        </thead>
+                        <tbody>
+                          {scannerEvents.slice(0, 12).map(event => {
+                            const nextOpen = event.outcomes.find(o => o.entry_price != null)
+                            const outcome = outcomeOf(event)
+                            const status = statusOf(event)
+                            const open = expandedEvents.has(event.event_id)
+                            return (
+                              <Fragment key={event.event_id}>
+                                <tr
+                                  onClick={() => setExpandedEvents(prev => {
+                                    const next = new Set(prev)
+                                    if (next.has(event.event_id)) next.delete(event.event_id)
+                                    else next.add(event.event_id)
+                                    return next
+                                  })}
+                                  style={{ borderBottom: '1px solid #f1f5f9', cursor: 'pointer' }}
+                                >
+                                  <td style={{ padding: '7px 8px' }}>
+                                    <div style={{ fontWeight: 600, color: event.direction === 1 ? POS : NEG }}>
+                                      {open ? '▾' : '▸'} {event.direction === 1 ? 'Long' : 'Short'} · {event.trigger_type.replace(/_/g, ' ')}
+                                    </div>
+                                    <div style={{ color: MUTED, fontSize: '0.68rem' }}>
+                                      {event.scanner_name.replace(/_/g, ' ').replace(/^sma200/i, 'SMA200')}
+                                    </div>
+                                  </td>
+                                  <td style={{ padding: '7px 8px', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                    {formatScannerEventTime(event.signal_time, event.interval)}
+                                  </td>
+                                  <td style={{ padding: '7px 8px', textAlign: 'right' }}><strong>{money(event.entry_price)}</strong></td>
+                                  <td style={{ padding: '7px 8px', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                    <span style={{ color: NEG }}>{money(event.stop_price)}</span>
+                                    <span style={{ color: MUTED }}> / </span>
+                                    <span style={{ color: POS, fontWeight: 600 }}>{money(event.target_price)}</span>
+                                  </td>
+                                  <td style={{ padding: '7px 8px', textAlign: 'right' }}>
+                                    {nextOpen?.entry_price != null ? money(nextOpen.entry_price) : <span style={{ color: MUTED }}>Pending</span>}
+                                  </td>
+                                  <td style={{ padding: '7px 8px', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                    {!outcome ? <span style={{ color: MUTED }}>—</span> : (
+                                      <>
+                                        <span style={{ color: (outcome.net_signed_return ?? 0) >= 0 ? POS : NEG, fontWeight: 600 }}>
+                                          {outcome.net_signed_return != null ? signedPct(outcome.net_signed_return * 100) : '—'}
+                                        </span>
+                                        {outcome.net_alpha_return != null && (
+                                          <span style={{ color: MUTED }}> · α {signedPct(outcome.net_alpha_return * 100)}</span>
+                                        )}
+                                      </>
+                                    )}
+                                  </td>
+                                  <td style={{ padding: '7px 8px' }}><Pill text={status.label} tone={status.tone} /></td>
+                                </tr>
+                                {open && (
+                                  <tr style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
+                                    <td colSpan={7} style={{ padding: '8px 12px' }}>
+                                      <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap', fontSize: '0.72rem', color: MUTED, marginBottom: '0.4rem' }}>
+                                        <span>Signal bar open {money(event.signal_open_price)}</span>
+                                        <span>Last seen {formatScannerEventTime(event.last_seen_at, event.interval)}</span>
+                                        <span>{event.occurrence_count} observation{event.occurrence_count === 1 ? '' : 's'}</span>
+                                        {nextOpen?.entry_time && <span>Evaluation entry {formatScannerEventTime(nextOpen.entry_time, event.interval)}</span>}
+                                      </div>
+                                      {event.outcomes.length === 0 ? (
+                                        <div style={{ fontSize: '0.72rem', color: MUTED }}>Waiting for future bars to resolve this setup.</div>
+                                      ) : (
+                                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.72rem' }}>
+                                          <thead>
+                                            <tr style={{ color: MUTED }}>
+                                              {['Horizon', 'Exit', 'Return', 'Alpha', 'MAE / MFE', 'First hit'].map(h => (
+                                                <th key={h} style={{ padding: '3px 6px', textAlign: 'left', fontWeight: 600 }}>{h}</th>
+                                              ))}
+                                            </tr>
+                                          </thead>
+                                          <tbody>
+                                            {event.outcomes.map(o => (
+                                              <tr key={o.horizon_bars}>
+                                                <td style={{ padding: '3px 6px' }}>{o.horizon_bars} {barNoun}</td>
+                                                <td style={{ padding: '3px 6px' }} title={formatScannerEventTime(o.exit_time, event.interval)}>{money(o.exit_price)}</td>
+                                                <td style={{ padding: '3px 6px', color: (o.net_signed_return ?? 0) >= 0 ? POS : NEG }}>
+                                                  {o.net_signed_return != null ? signedPct(o.net_signed_return * 100) : '—'}
+                                                </td>
+                                                <td style={{ padding: '3px 6px' }}>{o.net_alpha_return != null ? signedPct(o.net_alpha_return * 100) : '—'}</td>
+                                                <td style={{ padding: '3px 6px' }}>
+                                                  {o.mae_pct != null ? plainPct(o.mae_pct * 100) : '—'} / {o.mfe_pct != null ? plainPct(o.mfe_pct * 100) : '—'}
+                                                </td>
+                                                <td style={{ padding: '3px 6px' }}>{o.first_hit.replace('_', ' ').toLowerCase()}</td>
+                                              </tr>
+                                            ))}
+                                          </tbody>
+                                        </table>
+                                      )}
+                                    </td>
+                                  </tr>
+                                )}
+                              </Fragment>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
                   )}
-                </div>
-              )}
-
-              {/* Layer 2: Pattern Priors */}
-              {Object.keys(patternPriors).length > 0 && (
-                <div style={panelStyle}>
-                  <h3 style={panelHeadStyle}>
-                    Layer 2 · Historical win-rate priors · Friday EOD
-                  </h3>
-                  <table className="data-table" style={{ fontSize: '0.85rem' }}>
-                    <thead>
-                      <tr>
-                        <th>Pattern</th>
-                        <th>Win Rate</th>
-                        <th>Sample Size</th>
-                        <th>Confidence Multiplier</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {Object.entries(patternPriors).map(([name, data]: [string, any]) => (
-                        <tr key={name}>
-                          <td style={{ fontWeight: 500 }}>{name}</td>
-                          <td style={{ textAlign: 'center', color: data.win_rate >= 55 ? '#059669' : data.win_rate >= 45 ? '#d97706' : '#dc2626' }}>
-                            {data.win_rate.toFixed(1)}%
-                          </td>
-                          <td style={{ textAlign: 'center' }}>{data.sample_size}</td>                          <td style={{ textAlign: 'center', fontWeight: 600, color: data.confidence_multiplier > 1 ? '#059669' : data.confidence_multiplier < 1 ? '#dc2626' : 'inherit' }}>
-                            {data.confidence_multiplier.toFixed(2)}x
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              {/* Layer 4: Current Recommendation */}
-              {tickerRec && !calibrationLoading && (
-                <div style={panelStyle}>
-                  <h3 style={panelHeadStyle}>
-                    Layer 4 · Daily recommendation · {tickerRec.trade_date}
-                  </h3>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '0.5rem', marginBottom: '0.75rem' }}>
-                    <div style={{ padding: '0.6rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0', textAlign: 'center' }}>
-                      <div style={{ fontSize: '1.1rem', fontWeight: 700, color: tickerRec.direction === 'BULL' ? POS : NEG }}>
-                        {tickerRec.direction}
-                      </div>
-                      <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>Direction</div>
-                    </div>
-                    <div style={{ padding: '0.6rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0', textAlign: 'center' }}>
-                      <div style={{ fontSize: '1.1rem', fontWeight: 700, color: INK }}>{tickerRec.predicted_confidence}%</div>
-                      <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>Confidence</div>
-                    </div>
-                    <div style={{ padding: '0.6rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0', textAlign: 'center' }}>
-                      <div style={{ fontSize: '1.1rem', fontWeight: 700, color: gradeTone(tickerRec.signal_grade) }}>{tickerRec.signal_grade || '—'}</div>
-                      <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>Signal Grade</div>
-                    </div>
-                    <div style={{ padding: '0.6rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0', textAlign: 'center' }}>
-                      <div style={{ fontSize: '1.1rem', fontWeight: 700, color: INK }}>{tickerRec.rank === null ? '—' : `#${tickerRec.rank}`}</div>
-                      <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>Rank in Category</div>
-                    </div>
-                  </div>
-                  <div style={{ padding: '0.6rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0', marginBottom: '0.75rem' }}>
-                    <div style={{ ...labelStyle, marginBottom: '0.4rem' }}>Pattern scores at signal time</div>
-                    {Object.values(tickerRec.pattern_scores).some(v => v > 0) ? (
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: '0.35rem' }}>
-                        {([
-                          { name: 'Breakout', key: 'breakout' as PatternKey },
-                          { name: 'VWAP', key: 'vwap' as PatternKey },
-                          { name: 'Volatility', key: 'volatility' as PatternKey },
-                          { name: 'Trend', key: 'trend' as PatternKey },
-                          { name: 'RS', key: 'rs' as PatternKey },
-                          { name: 'Calendar', key: 'calendar' as PatternKey },
-                        ]).map(s => {
-                          const val = tickerRec.pattern_scores[s.key] ?? 0
-                          return (
-                            <div key={s.key} style={{ textAlign: 'center', fontSize: '0.72rem' }}>
-                              <div style={{ fontWeight: 700, color: val >= 60 ? POS : val >= 40 ? WARN : NEG }}>{val}</div>
-                              <div style={{ color: 'var(--text-secondary)' }}>{s.name}</div>
-                            </div>
-                          )
-                        })}
-                      </div>
-                    ) : (
-                      <div style={{ fontSize: '0.75rem', color: MUTED }}>
-                        Not recorded — this signal was generated without opening pattern scoring.
-                      </div>
-                    )}
-                  </div>
-                  <div style={{ padding: '0.6rem', background: '#f8fafc', borderRadius: '0.375rem', border: '1px solid #e2e8f0', fontSize: '0.8rem' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.35rem' }}>
-                      <span style={{ color: MUTED }}>Calibration:</span>
-                      <strong>{tickerRec.calibration.confidence_before ?? '—'}</strong>
-                      <span style={{ color: MUTED }}>→</span>
-                      <strong style={{
-                        color: (tickerRec.calibration.confidence_after ?? 0) >= (tickerRec.calibration.confidence_before ?? 0) ? POS : NEG,
-                      }}>
-                        {tickerRec.calibration.confidence_after ?? '—'}
-                      </strong>
-                      {tickerRec.calibration.confidence_before !== null && tickerRec.calibration.confidence_after !== null && (
-                        <span style={{ color: MUTED, fontSize: '0.75rem' }}>
-                          ({tickerRec.calibration.confidence_after - tickerRec.calibration.confidence_before > 0 ? '+' : ''}
-                          {tickerRec.calibration.confidence_after - tickerRec.calibration.confidence_before})
-                        </span>
-                      )}
-                    </div>
-                    <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-                      Applied: {tickerRec.calibration.pattern_priors_applied ? '✓ Priors' : '— Priors'}
-                      {' · '}{tickerRec.calibration.analog_matching_applied ? '✓ Analogs' : '— Analogs'}
-                      {tickerRec.calibration.sources ? ` · ${tickerRec.calibration.sources}` : ''}
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* Layer 5: Historical Performance */}
-              {tickerPerf && !calibrationLoading && (
-                <div style={panelStyle}>
-                  <h3 style={panelHeadStyle}>
-                    Layer 5 · Realised performance · last {tickerPerf.period_days} days
-                  </h3>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.5rem', marginBottom: '0.75rem' }}>
-                    <div style={{ padding: '0.6rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0', textAlign: 'center' }}>
-                      <div style={{ fontSize: '1.25rem', fontWeight: 700, color: tickerPerf.total_recs === 0 ? MUTED : tickerPerf.win_rate >= 55 ? POS : tickerPerf.win_rate >= 45 ? WARN : NEG }}>
-                        {tickerPerf.win_rate.toFixed(1)}%
-                      </div>
-                      <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
-                        Overall Win Rate ({tickerPerf.correct_recs}/{tickerPerf.total_recs})
-                      </div>
-                    </div>
-                    <div style={{ padding: '0.6rem', background: '#fff', borderRadius: '0.375rem', border: '1px solid #e2e8f0' }}>
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', textAlign: 'center' }}>
-                        <div>
-                          <div style={{ fontSize: '1rem', fontWeight: 700, color: POS }}>{tickerPerf.bull_stats.win_rate.toFixed(1)}%</div>
-                          <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>BULL ({tickerPerf.bull_stats.count})</div>
-                        </div>
-                        <div>
-                          <div style={{ fontSize: '1rem', fontWeight: 700, color: '#dc2626' }}>{tickerPerf.bear_stats.win_rate.toFixed(1)}%</div>
-                          <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>BEAR ({tickerPerf.bear_stats.count})</div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                  <div style={{ padding: '0.75rem', background: '#fafafa', borderRadius: '0.375rem', border: '1px solid #e5e7eb', fontSize: '0.85rem' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.25rem' }}>
-                      <span>Avg return in call direction:</span>
-                      <strong style={{ color: (tickerPerf.returns.avg_return_directional ?? 0) >= 0 ? '#059669' : '#dc2626' }}>
-                        {tickerPerf.returns.avg_return_directional === null ? '—'
-                          : `${tickerPerf.returns.avg_return_directional > 0 ? '+' : ''}${tickerPerf.returns.avg_return_directional.toFixed(2)}%`}
-                      </strong>
-                    </div>
-                    {baseline && (
-                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-                        <span>System-wide ({baseline.total_recs} calls, {baseline.ticker_count} tickers):</span>
-                        <strong style={{ color: (baseline.avg_return_directional ?? 0) >= 0 ? '#059669' : '#dc2626' }}>
-                          {plainPct(baseline.win_rate)} win rate
-                          {baseline.avg_return_directional !== null
-                            ? ` · ${baseline.avg_return_directional > 0 ? '+' : ''}${baseline.avg_return_directional.toFixed(2)}%`
-                            : ''}
-                        </strong>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {!calibrationLoading && (() => {
-                const missing = [
-                  !patternScores && 'opening pattern scores',
-                  Object.keys(patternPriors).length === 0 && 'win-rate priors',
-                  !analogMatches && 'analog matches',
-                  !tickerRec && 'daily recommendation',
-                ].filter(Boolean) as string[]
-                if (missing.length === 0) return null
-                return (
-                  <p style={{ color: 'var(--text-secondary)', fontSize: '0.78rem', margin: 0 }}>
-                    Not recorded for {symbol} on this date: {missing.join(', ')}.
-                    {tickerRec ? ' Confidence above is uncalibrated.' : ' Layers populate at 9:25, 9:30 and 9:35 AM ET.'}
-                  </p>
-                )
-              })()}
-            </div>
-              </>
-            )}
+                </>
+              )
+            })()}
           </>
         )}
       </div>

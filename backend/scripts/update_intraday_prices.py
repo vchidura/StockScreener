@@ -36,6 +36,7 @@ from dotenv import load_dotenv
 load_dotenv(BACKEND_DIR / ".env")
 
 from database import get_db_cursor, get_selected_tickers, is_valid_ohlcv, VALID_INTRADAY_INTERVALS
+from http_client import get_session
 
 BATCH_SIZE = 50
 YAHOO_DIRECT_DELAY = 0.5  # seconds between Yahoo Chart API calls
@@ -75,11 +76,11 @@ def fetch_intraday_yahoo_direct(tickers: list[str], interval: str, days: int) ->
         )
 
         try:
-            resp = requests.get(url, headers=headers, timeout=15)
+            resp = get_session().get(url, headers=headers, timeout=15)
             if resp.status_code == 429:
                 print("rate-limited, waiting 30s...", end=" ", flush=True)
                 time.sleep(30)
-                resp = requests.get(url, headers=headers, timeout=15)
+                resp = get_session().get(url, headers=headers, timeout=15)
 
             if resp.status_code != 200:
                 print(f"HTTP {resp.status_code}")

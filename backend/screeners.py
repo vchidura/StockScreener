@@ -1532,6 +1532,7 @@ def scan_bearish_bounce(ticker: str, df: pd.DataFrame = None, interval: str = "1
 # ---------------------------------------------------------------------------
 
 _FIBONACCI_SWING_BOUNDS = {
+    "1wk": (5.0, 20.0),
     "1d": (3.0, 12.0),
     "1h": (1.5, 8.0),
     "30m": (1.0, 6.0),

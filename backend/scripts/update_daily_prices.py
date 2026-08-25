@@ -39,6 +39,7 @@ from dotenv import load_dotenv
 load_dotenv(BACKEND_DIR / ".env")
 
 from database import get_db_cursor, get_selected_tickers, is_valid_ohlcv
+from http_client import get_session
 
 BATCH_SIZE = 20  # smaller batches to avoid Yahoo rate limits
 YF_BATCH_SLEEP = 3  # seconds between yfinance batches
@@ -68,7 +69,7 @@ def _twelvedata_batch_call(symbols: str, params: dict, max_retries: int = 3) -> 
     url = "https://api.twelvedata.com/time_series"
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.get(url, params=params, timeout=60)
+            resp = get_session().get(url, params=params, timeout=60)
             resp.raise_for_status()
             payload = resp.json()
         except Exception as e:
@@ -242,11 +243,11 @@ def fetch_daily_yahoo_direct(tickers: list[str], days: int) -> dict[str, pd.Data
                f"?period1={start_ts}&period2={end_ts}&interval=1d")
 
         try:
-            resp = requests.get(url, headers=headers, timeout=15)
+            resp = get_session().get(url, headers=headers, timeout=15)
             if resp.status_code == 429:
                 print("rate-limited, waiting 30s...", end=" ", flush=True)
                 time.sleep(30)
-                resp = requests.get(url, headers=headers, timeout=15)
+                resp = get_session().get(url, headers=headers, timeout=15)
 
             if resp.status_code != 200:
                 print(f"HTTP {resp.status_code}")

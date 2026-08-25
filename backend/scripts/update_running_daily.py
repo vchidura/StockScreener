@@ -51,6 +51,7 @@ from dotenv import load_dotenv
 load_dotenv(BACKEND_DIR / ".env")
 
 from database import get_db_cursor, get_selected_tickers, is_valid_ohlcv
+from http_client import get_session
 
 # Logging setup
 logging.basicConfig(
@@ -110,7 +111,7 @@ def fetch_batch_quotes(tickers: List[str]) -> Dict[str, Dict]:
     }
     
     try:
-        resp = requests.get(url, params=params, timeout=30)
+        resp = get_session().get(url, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:

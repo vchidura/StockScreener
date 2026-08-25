@@ -673,6 +673,8 @@ export interface TradeSetupEntry {
   strategy: string
   condition: string
   price_zone: string
+  zone_low: number | null
+  zone_high: number | null
   strength: string
 }
 
@@ -680,6 +682,14 @@ export interface TradeSetupLevel {
   level: string
   price: number
   source: string
+}
+
+export interface TradeSetupZone {
+  name: string
+  low: number
+  high: number
+  source: string
+  qualifier: string
 }
 
 export interface LevelRetest {
@@ -720,16 +730,18 @@ export interface TradeSetup {
     trend_consistency: number
   }
   ema_alignment: {
-    daily: string
-    daily_detail: string
-    hourly: string | null
-    hourly_ema8: number | null
-    hourly_ema21: number | null
+    primary: string
+    primary_detail: string
+    confirm_interval: string
+    confirm: string | null
+    confirm_ema8: number | null
+    confirm_ema21: number | null
     multi_tf_agree: boolean | null
   }
   level_retests: {
-    daily: LevelRetest[]
-    hourly: LevelRetest[]
+    primary: LevelRetest[]
+    confirm: LevelRetest[]
+    confirm_interval: string
   }
   momentum: { state: string; detail: string }
   direction: { bias: string; conviction: string; bull_signals: number; bear_signals: number }
@@ -737,6 +749,7 @@ export interface TradeSetup {
   interval: string
   signals: string[]
   entries: TradeSetupEntry[]
+  zones: TradeSetupZone[]
   targets: TradeSetupLevel[]
   stops: TradeSetupLevel[]
   timing: { urgency: string; detail: string }

@@ -270,13 +270,22 @@ $env:PYTHONIOENCODING = 'utf-8'   # required: log lines contain non-ASCII charac
 | 3 | Final 5m intraday update | Tops up `stock_prices_intraday` |
 | 4 | Validation | `validate_all(days=7)` checks the last 7 sessions |
 | 5 | Conditional backfill | Runs **only** if validation reports issues |
-| 6 | Cross-sectional signal | Scores the universe with `xsmom-1.0` |
-| 7 | Market discovery | Persists shadow discovery states and the current-position overlay |
-| 8 | Deep hourly backfill | **Saturday only** — repairs the 730-day window |
+| 6 | Daily-bar guard | Blocks stages 7–9 unless each daily bar envelops its own hourly tape |
+| 7 | Cross-sectional signal | Scores the universe with `xsmom-1.0` |
+| 8 | Market discovery | Persists shadow discovery states and the current-position overlay |
+| 9 | Deep hourly backfill | **Saturday only** — repairs the 730-day window |
 
-Stages 3, 6, 7 and 8 are wrapped in `try/except`: none of them are inputs to the
+Stages 3, 7, 8 and 9 are wrapped in `try/except`: none of them are inputs to the
 price tables written in stages 1–2, so a failure is logged without invalidating
 the run.
+
+Stage 6 exists because a skipped end-of-day overwrite is silent: the intraday
+running-daily bar stays in place and looks official. A finalized daily bar always
+contains its own session, so the guard fails any ticker whose daily high/low does
+not envelop that session's hourly bars or whose volume falls below 90% of the
+hourly total. It retries the daily close once for the offending tickers, then
+queues anything still provisional in `data_ingestion_failures` and skips the
+derived stages rather than building signals from mid-session prices.
 
 The structured daily and hourly pullback scanners are **not** scheduler stages.
 They are manual, descriptive watch scans shown later in this README.

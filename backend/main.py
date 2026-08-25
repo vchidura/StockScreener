@@ -1538,9 +1538,9 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
     Runs all strategies and synthesizes momentum, direction, entry/exit criteria,
     level retest detection with candle highs/lows, and multi-timeframe EMA alignment.
 
-    interval: '1d' (daily), '1h' (hourly), '30m', '15m', '5m'
+    interval: '1wk' (weekly), '1d' (daily), '1h' (hourly), '30m', '15m', '5m'
     """
-    cache_key = f"trade_setup_v7_{ticker.upper()}_{interval}"
+    cache_key = f"trade_setup_v8_{ticker.upper()}_{interval}"
     if not refresh:
         cached = _get_cached(cache_key, "trade_setup")
         if cached is not None:
@@ -1552,7 +1552,7 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
     import pandas as pd
 
     ticker = ticker.upper()
-    valid_intervals = {"1d", "1h", "30m", "15m", "5m"}
+    valid_intervals = {"1wk", "1d", "1h", "30m", "15m", "5m"}
     if interval not in valid_intervals:
         interval = "1d"
 
@@ -1562,6 +1562,14 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
     if interval == "1d":
         frames = await loop.run_in_executor(executor, bulk_load_dataframes, [ticker], 1600)
         df = frames.get(ticker)
+    elif interval == "1wk":
+        frames = await loop.run_in_executor(executor, bulk_load_dataframes, [ticker], 4000)
+        daily_df = frames.get(ticker)
+        if daily_df is None or len(daily_df) < 60:
+            raise HTTPException(status_code=404, detail=f"Insufficient daily history for {ticker} to build weekly bars")
+        df = daily_df.resample("W-FRI").agg({
+            "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
+        }).dropna(subset=["close"])
     elif interval == "1h":
         rows = await loop.run_in_executor(executor, get_hourly_data, ticker, 500, None)
         if not rows or len(rows) < 50:
@@ -1583,19 +1591,25 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
     if df is None or len(df) < 50:
         raise HTTPException(status_code=404, detail=f"Insufficient data for {ticker} ({interval})")
 
-    # Also load hourly data for multi-timeframe retest analysis (only when on daily)
-    df_hourly = None
-    if interval == "1d":
-        hourly_rows = await loop.run_in_executor(executor, get_hourly_data, ticker, 200, None)
-        if hourly_rows and len(hourly_rows) >= 20:
-            df_hourly = pd.DataFrame(hourly_rows)
-            df_hourly['datetime'] = pd.to_datetime(df_hourly['datetime'], utc=True)
-            df_hourly.set_index('datetime', inplace=True)
-            if 'ticker' in df_hourly.columns:
-                df_hourly = df_hourly.drop(columns=['ticker'])
+    # One step down from the selected interval, used to confirm or contradict it.
+    confirm_interval = {"1wk": "1d", "1d": "1h", "1h": "1d"}.get(interval, "1h")
+    df_confirm = None
+    if confirm_interval == "1d":
+        confirm_frames = await loop.run_in_executor(executor, bulk_load_dataframes, [ticker], 400)
+        candidate = confirm_frames.get(ticker)
+        if candidate is not None and len(candidate) >= 20:
+            df_confirm = candidate
+    else:
+        confirm_rows = await loop.run_in_executor(executor, get_hourly_data, ticker, 200, None)
+        if confirm_rows and len(confirm_rows) >= 20:
+            df_confirm = pd.DataFrame(confirm_rows)
+            df_confirm['datetime'] = pd.to_datetime(df_confirm['datetime'], utc=True)
+            df_confirm.set_index('datetime', inplace=True)
+            if 'ticker' in df_confirm.columns:
+                df_confirm = df_confirm.drop(columns=['ticker'])
             for col in ['open', 'high', 'low', 'close', 'volume']:
-                if col in df_hourly.columns:
-                    df_hourly[col] = df_hourly[col].astype(float)
+                if col in df_confirm.columns:
+                    df_confirm[col] = df_confirm[col].astype(float)
 
     last_close = float(df.iloc[-1]["close"])
     last_date = df.index[-1].strftime("%Y-%m-%d") if hasattr(df.index[-1], "strftime") else str(df.index[-1])
@@ -1716,22 +1730,22 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                 golden_cross = {"type": "Below (Bearish)", "bars_ago": None,
                                 "detail": "50 SMA below 200 SMA — bearish structure, no recent cross"}
 
-    # --- Hourly EMAs for multi-timeframe ---
-    hourly_ema8 = None
-    hourly_ema21 = None
-    hourly_ema_alignment = None
-    if df_hourly is not None and len(df_hourly) >= 21:
-        ch = df_hourly["close"].values.astype(float)
+    # --- Confirmation-timeframe EMAs for multi-timeframe agreement ---
+    confirm_ema8 = None
+    confirm_ema21 = None
+    confirm_ema_alignment = None
+    if df_confirm is not None and len(df_confirm) >= 21:
+        ch = df_confirm["close"].values.astype(float)
         h_ema8 = _ema(ch, 8)
         h_ema21 = _ema(ch, 21)
-        hourly_ema8 = round(float(h_ema8[-1]), 2)
-        hourly_ema21 = round(float(h_ema21[-1]), 2)
+        confirm_ema8 = round(float(h_ema8[-1]), 2)
+        confirm_ema21 = round(float(h_ema21[-1]), 2)
         if h_ema8[-1] > h_ema21[-1]:
-            hourly_ema_alignment = "Bullish"
+            confirm_ema_alignment = "Bullish"
         elif h_ema8[-1] < h_ema21[-1]:
-            hourly_ema_alignment = "Bearish"
+            confirm_ema_alignment = "Bearish"
         else:
-            hourly_ema_alignment = "Neutral"
+            confirm_ema_alignment = "Neutral"
 
     # --- Level Retest Detection ---
     # Collect key levels to check for retests
@@ -1817,15 +1831,15 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                     })
         return retests
 
-    daily_retests = _detect_retests(c, h, l, key_levels, lookback=5, tolerance_pct=0.5)
+    primary_retests = _detect_retests(c, h, l, key_levels, lookback=5, tolerance_pct=0.5)
 
-    # Detect retests on hourly timeframe
-    hourly_retests = []
-    if df_hourly is not None and len(df_hourly) >= 10:
-        ch = df_hourly["close"].values.astype(float)
-        hh = df_hourly["high"].values.astype(float)
-        lh = df_hourly["low"].values.astype(float)
-        hourly_retests = _detect_retests(ch, hh, lh, key_levels, lookback=10, tolerance_pct=0.3)
+    # Detect retests on the confirmation timeframe
+    confirm_retests = []
+    if df_confirm is not None and len(df_confirm) >= 10:
+        ch = df_confirm["close"].values.astype(float)
+        hh = df_confirm["high"].values.astype(float)
+        lh = df_confirm["low"].values.astype(float)
+        confirm_retests = _detect_retests(ch, hh, lh, key_levels, lookback=10, tolerance_pct=0.3)
 
     # --- Momentum Assessment ---
     if ma50 and ma200:
@@ -1880,13 +1894,14 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
         elif ma["signal"] in ("Bearish Crossover", "Recent Bearish", "Below MA"):
             bear_signals += 2 if "Crossover" in ma["signal"] else 1
             signal_reasons.append(f'MA: {ma["signal"]} ({ma.get("days_since_cross", "?")}d ago)')
-        # Weekly alignment bonus
-        if ma.get("weekly_signal") in ("W-Above", "W-Bullish Cross"):
-            bull_signals += 1
-            signal_reasons.append(f'Weekly: {ma["weekly_signal"]}')
-        elif ma.get("weekly_signal") in ("W-Below", "W-Bearish Cross"):
-            bear_signals += 1
-            signal_reasons.append(f'Weekly: {ma["weekly_signal"]}')
+        # Weekly alignment bonus — redundant when the primary series is already weekly.
+        if interval != "1wk":
+            if ma.get("weekly_signal") in ("W-Above", "W-Bullish Cross"):
+                bull_signals += 1
+                signal_reasons.append(f'Weekly: {ma["weekly_signal"]}')
+            elif ma.get("weekly_signal") in ("W-Below", "W-Bearish Cross"):
+                bear_signals += 1
+                signal_reasons.append(f'Weekly: {ma["weekly_signal"]}')
 
     # EMA alignment signal
     if ema_bullish_stack:
@@ -1912,23 +1927,23 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
         bear_signals += 1
         signal_reasons.append(f"Price below VWAP(20) ${vwap}")
 
-    # Multi-timeframe EMA alignment (hourly matches daily = stronger signal)
-    if hourly_ema_alignment:
-        if hourly_ema_alignment == "Bullish" and ema_alignment in ("Bullish Stack", "Short-term Bullish"):
+    # Multi-timeframe EMA alignment (confirmation timeframe matches primary = stronger signal)
+    if confirm_ema_alignment:
+        if confirm_ema_alignment == "Bullish" and ema_alignment in ("Bullish Stack", "Short-term Bullish"):
             bull_signals += 1
-            signal_reasons.append("Multi-TF: Hourly 8/21 EMA aligns bullish with daily")
-        elif hourly_ema_alignment == "Bearish" and ema_alignment in ("Bearish Stack", "Short-term Bearish"):
+            signal_reasons.append(f"Multi-TF: {confirm_interval} 8/21 EMA aligns bullish with {interval}")
+        elif confirm_ema_alignment == "Bearish" and ema_alignment in ("Bearish Stack", "Short-term Bearish"):
             bear_signals += 1
-            signal_reasons.append("Multi-TF: Hourly 8/21 EMA aligns bearish with daily")
+            signal_reasons.append(f"Multi-TF: {confirm_interval} 8/21 EMA aligns bearish with {interval}")
 
     # Only qualified non-Fibonacci level families contribute directional votes.
     # Fibonacci retests remain available below as structural context.
-    for rt in daily_retests:
+    for rt in primary_retests:
         if rt["held"] and rt["bounce_pct"] > 0 and rt["source"] in ("Moving Average", "Gap", "FVG"):
             bull_signals += 1
             signal_reasons.append(f'Retest Held: {rt["level_name"]} (${rt["level_price"]}, bounced +{rt["bounce_pct"]}%)')
             break  # Count only 1 retest signal
-    for rt in daily_retests:
+    for rt in primary_retests:
         if rt["held"] and rt["bounce_pct"] < 0 and rt["source"] in ("Moving Average", "Gap", "FVG"):
             bear_signals += 1
             signal_reasons.append(f'Retest Rejected: {rt["level_name"]} (${rt["level_price"]}, rejected {rt["bounce_pct"]}%)')
@@ -1967,6 +1982,25 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
     if bear_fvgs:
         bear_signals += 1
         signal_reasons.append(f'Bearish FVGs: {len(bear_fvgs)} unmitigated supply zone(s)')
+
+    # Price zones as levels, so the UI never has to fall back to bare counts.
+    zones = []
+    for g in sorted(support_gaps, key=lambda g: abs(g["last_close"] - g["gap_high"]))[:3]:
+        zones.append({"name": "Gap support", "low": round(float(g["gap_low"]), 2),
+                      "high": round(float(g["gap_high"]), 2), "source": "Gap",
+                      "qualifier": g.get("gap_type", "")})
+    for g in sorted(resistance_gaps, key=lambda g: abs(g["last_close"] - g["gap_low"]))[:3]:
+        zones.append({"name": "Gap resistance", "low": round(float(g["gap_low"]), 2),
+                      "high": round(float(g["gap_high"]), 2), "source": "Gap",
+                      "qualifier": g.get("gap_type", "")})
+    for f in sorted(bull_fvgs, key=lambda f: abs(last_close - f["fvg_high"]))[:3]:
+        zones.append({"name": "FVG demand zone", "low": round(float(f["fvg_low"]), 2),
+                      "high": round(float(f["fvg_high"]), 2), "source": "FVG",
+                      "qualifier": "Unmitigated"})
+    for f in sorted(bear_fvgs, key=lambda f: abs(last_close - f["fvg_low"]))[:3]:
+        zones.append({"name": "FVG supply zone", "low": round(float(f["fvg_low"]), 2),
+                      "high": round(float(f["fvg_high"]), 2), "source": "FVG",
+                      "qualifier": "Unmitigated"})
 
     # RSI tilt
     if rsi < 35:
@@ -2010,6 +2044,8 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                 "strategy": "8 EMA Retest",
                 "condition": f"Price at 8 EMA (${ema8_val}) — pullback entry in trend",
                 "price_zone": f"${ema8_val}",
+                "zone_low": ema8_val,
+                "zone_high": ema8_val,
                 "strength": "Strong" if ema_bullish_stack else "Moderate",
             })
         elif abs(dist_to_21ema) < 0.8:
@@ -2017,6 +2053,8 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                 "strategy": "21 EMA Retest",
                 "condition": f"Price near 21 EMA (${ema21_val}) — deeper pullback entry",
                 "price_zone": f"${ema21_val}",
+                "zone_low": ema21_val,
+                "zone_high": ema21_val,
                 "strength": "Strong" if ema_bullish_stack else "Moderate",
             })
         if pullback and pullback.get("grade") in ("A+", "A", "B+"):
@@ -2024,6 +2062,8 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                 "strategy": "Momentum Pullback",
                 "condition": f'Stoch %K at {pullback.get("stoch_k", "?")} (oversold in uptrend)',
                 "price_zone": f'Near EMA21 ~${pullback.get("ema21", 0):.2f}' if pullback.get("ema21") else "Near EMA21",
+                "zone_low": round(float(pullback["ema21"]), 2) if pullback.get("ema21") else None,
+                "zone_high": round(float(pullback["ema21"]), 2) if pullback.get("ema21") else None,
                 "strength": pullback.get("grade", "?"),
             })
         if bull_fvgs:
@@ -2032,6 +2072,8 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                 "strategy": "FVG Demand Zone",
                 "condition": f'Price enters ${nearest_fvg["fvg_low"]:.2f}–${nearest_fvg["fvg_high"]:.2f}',
                 "price_zone": f'${nearest_fvg["fvg_low"]:.2f}–${nearest_fvg["fvg_high"]:.2f}',
+                "zone_low": round(float(nearest_fvg["fvg_low"]), 2),
+                "zone_high": round(float(nearest_fvg["fvg_high"]), 2),
                 "strength": "Unmitigated" if nearest_fvg.get("trend_aligned") else "Counter-trend",
             })
         if support_gaps:
@@ -2040,6 +2082,8 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                 "strategy": "Gap Support",
                 "condition": f'Price tests gap zone at ${nearest_gap["gap_low"]:.2f}–${nearest_gap["gap_high"]:.2f}',
                 "price_zone": f'${nearest_gap["gap_low"]:.2f}–${nearest_gap["gap_high"]:.2f}',
+                "zone_low": round(float(nearest_gap["gap_low"]), 2),
+                "zone_high": round(float(nearest_gap["gap_high"]), 2),
                 "strength": "Unfilled" if "Unfilled" in nearest_gap.get("gap_type", "") else "Filled retest",
             })
         if fib and fib.get("trend_direction") == "uptrend_retracement":
@@ -2050,6 +2094,8 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                     "strategy": "Fibonacci Support",
                     "condition": f'Near {nearest_fib.get("level", "?")} at ${nearest_fib.get("price", 0):.2f}',
                     "price_zone": f'${nearest_fib.get("price", 0):.2f}',
+                    "zone_low": round(float(nearest_fib.get("price", 0)), 2),
+                    "zone_high": round(float(nearest_fib.get("price", 0)), 2),
                     "strength": nearest_fib.get("level", "?"),
                 })
     elif direction == "Bearish":
@@ -2059,6 +2105,8 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                 "strategy": "8 EMA Rejection",
                 "condition": f"Price at 8 EMA (${ema8_val}) — rejection/short entry in downtrend",
                 "price_zone": f"${ema8_val}",
+                "zone_low": ema8_val,
+                "zone_high": ema8_val,
                 "strength": "Strong" if ema_bearish_stack else "Moderate",
             })
         elif abs(dist_to_21ema) < 0.8:
@@ -2066,6 +2114,8 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                 "strategy": "21 EMA Rejection",
                 "condition": f"Price near 21 EMA (${ema21_val}) — deeper bounce rejection",
                 "price_zone": f"${ema21_val}",
+                "zone_low": ema21_val,
+                "zone_high": ema21_val,
                 "strength": "Strong" if ema_bearish_stack else "Moderate",
             })
         if bounce and bounce.get("grade") in ("A+", "A", "B+"):
@@ -2073,6 +2123,8 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                 "strategy": "Bearish Bounce",
                 "condition": f'Stoch %K at {bounce.get("stoch_k", "?")} (overbought in downtrend)',
                 "price_zone": f'Near EMA21 ~${bounce.get("ema21", 0):.2f}' if bounce.get("ema21") else "Near EMA21",
+                "zone_low": round(float(bounce["ema21"]), 2) if bounce.get("ema21") else None,
+                "zone_high": round(float(bounce["ema21"]), 2) if bounce.get("ema21") else None,
                 "strength": bounce.get("grade", "?"),
             })
         if bear_fvgs:
@@ -2081,6 +2133,8 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                 "strategy": "FVG Supply Zone",
                 "condition": f'Price enters ${nearest_fvg["fvg_low"]:.2f}–${nearest_fvg["fvg_high"]:.2f}',
                 "price_zone": f'${nearest_fvg["fvg_low"]:.2f}–${nearest_fvg["fvg_high"]:.2f}',
+                "zone_low": round(float(nearest_fvg["fvg_low"]), 2),
+                "zone_high": round(float(nearest_fvg["fvg_high"]), 2),
                 "strength": "Unmitigated" if nearest_fvg.get("trend_aligned") else "Counter-trend",
             })
         if resistance_gaps:
@@ -2089,6 +2143,8 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                 "strategy": "Gap Resistance",
                 "condition": f'Price tests gap zone at ${nearest_gap["gap_low"]:.2f}–${nearest_gap["gap_high"]:.2f}',
                 "price_zone": f'${nearest_gap["gap_low"]:.2f}–${nearest_gap["gap_high"]:.2f}',
+                "zone_low": round(float(nearest_gap["gap_low"]), 2),
+                "zone_high": round(float(nearest_gap["gap_high"]), 2),
                 "strength": "Unfilled" if "Unfilled" in nearest_gap.get("gap_type", "") else "Filled retest",
             })
         if fib and fib.get("trend_direction") == "downtrend_retracement":
@@ -2099,17 +2155,21 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                     "strategy": "Fibonacci Resistance",
                     "condition": f'Near {nearest_fib.get("level", "?")} at ${nearest_fib.get("price", 0):.2f}',
                     "price_zone": f'${nearest_fib.get("price", 0):.2f}',
+                    "zone_low": round(float(nearest_fib.get("price", 0)), 2),
+                    "zone_high": round(float(nearest_fib.get("price", 0)), 2),
                     "strength": nearest_fib.get("level", "?"),
                 })
 
     # Add retest-based entries (any direction)
-    for rt in daily_retests[:2]:
+    for rt in primary_retests[:2]:
         if rt["held"] and rt["bars_ago"] <= 2:
             rt_dir = "bounced" if rt["bounce_pct"] > 0 else "rejected"
             entries.append({
                 "strategy": f"Level Retest ({rt['source']})",
                 "condition": f'{rt["level_name"]} at ${rt["level_price"]} — {rt["touch_type"]}, {rt_dir} {abs(rt["bounce_pct"])}%',
                 "price_zone": f'H:${rt["candle_high"]} / L:${rt["candle_low"]}',
+                "zone_low": rt["level_price"],
+                "zone_high": rt["level_price"],
                 "strength": "Strong" if abs(rt["bounce_pct"]) > 0.5 else "Moderate",
             })
 
@@ -2136,7 +2196,7 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
         prior_slice = slice(-(prior_bar_count + 1), -1)
         prior_high = float(np.max(h[prior_slice]))
         prior_low = float(np.min(l[prior_slice]))
-        range_label = "52-Week" if interval == "1d" else f"{prior_bar_count}-Bar"
+        range_label = "52-Week" if interval == "1d" else f"{prior_bar_count}-Week" if interval == "1wk" else f"{prior_bar_count}-Bar"
         if prior_high > last_close:
             targets.append({"level": f"Prior {range_label} High", "price": round(prior_high, 2), "source": "Price Action"})
         if prior_low < last_close:
@@ -2195,7 +2255,7 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
         else:
             timing = "Watchlist"
             timing_detail = f'Crossover was {days_since}d ago — wait for pullback to MA or new catalyst'
-    elif any(rt["held"] and rt["bars_ago"] <= 1 for rt in daily_retests):
+    elif any(rt["held"] and rt["bars_ago"] <= 1 for rt in primary_retests):
         timing = "Immediate"
         timing_detail = "Active level retest — price testing key level right now"
     elif pullback and pullback.get("grade") in ("A+", "A"):
@@ -2270,18 +2330,20 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
             "trend_consistency": trend_consistency,
         },
         "ema_alignment": {
-            "daily": ema_alignment,
-            "daily_detail": ema_alignment_detail,
-            "hourly": hourly_ema_alignment,
-            "hourly_ema8": hourly_ema8,
-            "hourly_ema21": hourly_ema21,
-            "multi_tf_agree": (hourly_ema_alignment == "Bullish" and ema_alignment in ("Bullish Stack", "Short-term Bullish"))
-                           or (hourly_ema_alignment == "Bearish" and ema_alignment in ("Bearish Stack", "Short-term Bearish"))
-                           if hourly_ema_alignment else None,
+            "primary": ema_alignment,
+            "primary_detail": ema_alignment_detail,
+            "confirm_interval": confirm_interval,
+            "confirm": confirm_ema_alignment,
+            "confirm_ema8": confirm_ema8,
+            "confirm_ema21": confirm_ema21,
+            "multi_tf_agree": (confirm_ema_alignment == "Bullish" and ema_alignment in ("Bullish Stack", "Short-term Bullish"))
+                           or (confirm_ema_alignment == "Bearish" and ema_alignment in ("Bearish Stack", "Short-term Bearish"))
+                           if confirm_ema_alignment else None,
         },
         "level_retests": {
-            "daily": daily_retests[:5],
-            "hourly": hourly_retests[:5],
+            "primary": primary_retests[:5],
+            "confirm": confirm_retests[:5],
+            "confirm_interval": confirm_interval,
         },
         "momentum": {
             "state": momentum,
@@ -2297,6 +2359,7 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
         "interval": interval,
         "signals": signal_reasons,
         "entries": entries,
+        "zones": zones,
         "targets": targets[:5],
         "stops": stops[:5],
         "timing": {

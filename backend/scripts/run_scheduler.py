@@ -204,11 +204,115 @@ def job_daily_close(tickers: list[str], provider: str):
         df = ticker_data.get(ticker)
         if df is not None and not df.empty:
             existing = get_existing_dates(ticker, start_str, end_str)
-            existing.discard(_get_et_now().date())
+            # upsert_prices skips dates already stored, so the latest session must be
+            # dropped from `existing` to overwrite the provisional running-daily bar.
+            # Derive it from the provider frame: keying off "today" silently no-ops
+            # whenever the run happens after midnight ET.
+            latest_session = max(
+                (idx.replace(tzinfo=None).date() if getattr(idx, "tzinfo", None) else idx.date())
+                for idx in df.index
+            )
+            existing.discard(latest_session)
             inserted, _ = upsert_prices(ticker, df, existing)
             total_inserted += inserted
             success += 1
     logger.info("  [daily-close] Done — +%d new rows (%d/%d tickers)", total_inserted, success, len(tickers))
+
+
+# A finalized daily bar always contains its own session; a provisional running-daily
+# bar written mid-session does not. These bounds were measured against 12 clean
+# sessions: zero high/low violations and a minimum daily/hourly volume ratio of 1.006.
+DAILY_ENVELOPE_TOLERANCE = 0.01
+DAILY_VOLUME_FLOOR = 0.90
+
+
+def _latest_daily_session():
+    """Most recent trading date in stock_prices_daily.
+
+    Derived from stored data rather than the wall clock so the guard stays correct
+    when the run happens after midnight ET.
+    """
+    with get_db_cursor() as cur:
+        cur.execute("SELECT MAX((datetime AT TIME ZONE 'UTC')::date) AS d "
+                    "FROM stock_prices_daily")
+        return cur.fetchone()["d"]
+
+
+def find_provisional_daily_rows(trade_date, tickers: list[str] | None = None) -> dict:
+    """Detect daily bars that do not envelop their own session's hourly tape.
+
+    Catches an end-of-day overwrite that was silently skipped rather than failed,
+    which leaves the intraday running-daily bar in place as if it were official.
+    """
+    ticker_clause = "AND d.ticker = ANY(%s)" if tickers else ""
+    params = [trade_date]
+    if tickers:
+        params.append(tickers)
+    params.extend([trade_date, DAILY_ENVELOPE_TOLERANCE, DAILY_ENVELOPE_TOLERANCE,
+                   DAILY_VOLUME_FLOOR])
+    with get_db_cursor() as cur:
+        cur.execute(f"""
+            WITH h AS (
+                SELECT ticker, MAX(high) AS hi, MIN(low) AS lo, SUM(volume) AS vol
+                FROM stock_prices_hourly
+                WHERE (datetime AT TIME ZONE 'America/New_York')::date = %s
+                GROUP BY ticker
+            ), d AS (
+                SELECT d.ticker, d.high, d.low, d.volume
+                FROM stock_prices_daily d
+                WHERE (d.datetime AT TIME ZONE 'UTC')::date = %s
+                  {ticker_clause}
+            )
+            SELECT d.ticker
+            FROM d JOIN h USING (ticker)
+            WHERE d.high < h.hi - %s
+               OR d.low  > h.lo + %s
+               OR d.volume < h.vol * %s
+            ORDER BY d.ticker
+        """, params)
+        provisional = [row["ticker"] for row in cur.fetchall()]
+
+        cur.execute("""
+            SELECT COUNT(*) AS n FROM stock_prices_daily d
+            WHERE (d.datetime AT TIME ZONE 'UTC')::date = %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM stock_prices_hourly h
+                  WHERE h.ticker = d.ticker
+                    AND (h.datetime AT TIME ZONE 'America/New_York')::date = %s
+              )
+        """, (trade_date, trade_date))
+        unverifiable = int(cur.fetchone()["n"])
+
+    return {"provisional": provisional, "unverifiable": unverifiable}
+
+
+def _guard_daily_session(trade_date, tickers: list[str], provider: str) -> bool:
+    """Verify the session's daily bars are final, repairing once before giving up."""
+    check = find_provisional_daily_rows(trade_date, tickers)
+    if check["unverifiable"]:
+        logger.warning("  [guard] %d tickers have no hourly bars for %s — daily bar "
+                       "cannot be verified", check["unverifiable"], trade_date)
+    if not check["provisional"]:
+        logger.info("  [guard] Daily bars for %s are final (%d tickers verified)",
+                    trade_date, len(tickers) - check["unverifiable"])
+        return True
+
+    logger.warning("  [guard] %d daily bars for %s are still provisional — retrying "
+                   "daily close", len(check["provisional"]), trade_date)
+    job_daily_close(check["provisional"], provider)
+
+    recheck = find_provisional_daily_rows(trade_date, check["provisional"])
+    if not recheck["provisional"]:
+        logger.info("  [guard] Daily bars repaired for %s", trade_date)
+        return True
+
+    logger.error("  [guard] %d daily bars remain provisional for %s: %s",
+                 len(recheck["provisional"]), trade_date,
+                 ",".join(recheck["provisional"][:20]))
+    _record_daily_failures(
+        {ticker: [trade_date] for ticker in recheck["provisional"]}, provider, 1
+    )
+    return False
 
 
 def _ensure_ingestion_failures_table() -> None:
@@ -575,9 +679,15 @@ def run_eod_once(tickers: list[str], provider: str):
         logger.info("[JOB] Re-validating after backfill @ %s ET", _get_et_now().strftime("%H:%M"))
         results = validate_all(days=7)
 
+    logger.info("[JOB] Daily-bar guard @ %s ET", _get_et_now().strftime("%H:%M"))
+    session_final = _guard_daily_session(_latest_daily_session(), tickers, provider)
+
     # Runs last: the signal reads the daily closes written above.
     if any(not result.clean for result in results):
         logger.error("[JOB] Signal skipped — EOD data remains incomplete after backfill")
+    elif not session_final:
+        logger.error("[JOB] Signal skipped — daily bars are provisional; derived data "
+                     "would be built from mid-session prices")
     else:
         logger.info("[JOB] Cross-sectional signal @ %s ET", _get_et_now().strftime("%H:%M"))
         try:

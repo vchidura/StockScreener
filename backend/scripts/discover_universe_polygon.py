@@ -37,6 +37,9 @@ load_dotenv(BACKEND_DIR / ".env")
 
 import os
 from database import get_db_cursor, create_selected_tickers_table, migrate_selected_tickers_metadata
+from http_client import build_session
+
+SESSION = build_session(pool_maxsize=32)  # sized for the 20-worker thread pool below
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
 BASE_URL = "https://api.polygon.io"
@@ -79,7 +82,7 @@ def fetch_active_common_stocks() -> set[str]:
     page = 0
     while url:
         page += 1
-        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        resp = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
             print(f"  Reference tickers HTTP {resp.status_code}: {resp.text[:200]}")
             break
@@ -99,7 +102,7 @@ def fetch_grouped_daily(trade_date: str) -> dict[str, dict]:
     """One call: close price + volume for every US stock on trade_date."""
     url = f"{BASE_URL}/v2/aggs/grouped/locale/us/market/stocks/{trade_date}"
     params = {"adjusted": "true", "apiKey": POLYGON_API_KEY}
-    resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    resp = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
     if resp.status_code != 200:
         return {}
     payload = resp.json()
@@ -143,7 +146,7 @@ def fetch_market_cap(ticker: str) -> dict | None:
     url = f"{BASE_URL}/v3/reference/tickers/{ticker}"
     params = {"apiKey": POLYGON_API_KEY}
     try:
-        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        resp = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
     except requests.RequestException:
         return None
     if resp.status_code != 200:

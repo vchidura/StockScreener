@@ -29,11 +29,20 @@ from dotenv import load_dotenv
 load_dotenv(BACKEND_DIR / ".env")
 
 from .base import PriceProvider
+from http_client import get_session
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
 POLYGON_BASE_URL = "https://api.polygon.io"
 REQUEST_TIMEOUT = 30
 REQUEST_DELAY = 0.1  # unlimited calls on Starter+, small delay is just politeness
+NETWORK_RETRIES = 3
+NETWORK_BACKOFF = 5  # seconds, multiplied by attempt number
+# Compounds with http_client.CONNECT_RETRIES: worst case is 3 x 3 = 9 attempts.
+
+
+def _redact(text: str) -> str:
+    """Strip the API key out of text destined for logs."""
+    return text.replace(POLYGON_API_KEY, "***") if POLYGON_API_KEY else text
 
 ET = ZoneInfo("America/New_York")
 # Existing schema/validation (update_hourly_prices.is_valid_hourly_bar) requires
@@ -56,10 +65,18 @@ def _get_aggs(ticker: str, multiplier: int, timespan: str, start: str, end: str)
     results: list[dict] = []
 
     while url:
-        try:
-            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        except requests.RequestException as e:
-            print(f"  [{ticker}] Polygon request failed: {e}")
+        resp = None
+        for attempt in range(1, NETWORK_RETRIES + 1):
+            try:
+                resp = get_session().get(url, params=params, timeout=REQUEST_TIMEOUT)
+                break
+            except requests.RequestException as e:
+                # DNS/connection blips are transient; a whole EOD run should not be
+                # lost because the resolver stalled for a few seconds.
+                print(f"  [{ticker}] Polygon request failed (attempt {attempt}/{NETWORK_RETRIES}): {_redact(str(e))}")
+                if attempt < NETWORK_RETRIES:
+                    time.sleep(NETWORK_BACKOFF * attempt)
+        if resp is None:
             break
 
         if resp.status_code == 429:
@@ -67,7 +84,7 @@ def _get_aggs(ticker: str, multiplier: int, timespan: str, start: str, end: str)
             time.sleep(15)
             continue
         if resp.status_code != 200:
-            print(f"  [{ticker}] Polygon HTTP {resp.status_code}: {resp.text[:200]}")
+            print(f"  [{ticker}] Polygon HTTP {resp.status_code}: {_redact(resp.text[:200])}")
             break
 
         payload = resp.json()

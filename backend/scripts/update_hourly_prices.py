@@ -55,6 +55,7 @@ from dotenv import load_dotenv
 load_dotenv(BACKEND_DIR / ".env")
 
 from database import get_db_cursor, get_selected_tickers, is_valid_ohlcv
+from http_client import get_session
 
 # Logging setup
 logging.basicConfig(
@@ -139,7 +140,7 @@ def fetch_hourly_candles(ticker: str, days: int = 5) -> pd.DataFrame:
     }
 
     try:
-        resp = requests.get(url, params=params, timeout=30)
+        resp = get_session().get(url, params=params, timeout=30)
         resp.raise_for_status()
         payload = resp.json()
     except Exception as e:
@@ -199,11 +200,11 @@ def fetch_hourly_yahoo_direct(tickers: list[str], days: int = 5) -> dict[str, pd
         )
 
         try:
-            resp = requests.get(url, headers=headers, timeout=15)
+            resp = get_session().get(url, headers=headers, timeout=15)
             if resp.status_code == 429:
                 logger.warning(f"  [{ticker}] rate-limited, waiting 30s...")
                 time.sleep(30)
-                resp = requests.get(url, headers=headers, timeout=15)
+                resp = get_session().get(url, headers=headers, timeout=15)
 
             if resp.status_code != 200:
                 logger.warning(f"  [{ticker}] HTTP {resp.status_code}")
