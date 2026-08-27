@@ -245,10 +245,10 @@ def find_provisional_daily_rows(trade_date, tickers: list[str] | None = None) ->
     which leaves the intraday running-daily bar in place as if it were official.
     """
     ticker_clause = "AND d.ticker = ANY(%s)" if tickers else ""
-    params = [trade_date]
+    params = [trade_date, trade_date]
     if tickers:
         params.append(tickers)
-    params.extend([trade_date, DAILY_ENVELOPE_TOLERANCE, DAILY_ENVELOPE_TOLERANCE,
+    params.extend([DAILY_ENVELOPE_TOLERANCE, DAILY_ENVELOPE_TOLERANCE,
                    DAILY_VOLUME_FLOOR])
     with get_db_cursor() as cur:
         cur.execute(f"""
@@ -272,15 +272,20 @@ def find_provisional_daily_rows(trade_date, tickers: list[str] | None = None) ->
         """, params)
         provisional = [row["ticker"] for row in cur.fetchall()]
 
-        cur.execute("""
+        unverifiable_params = [trade_date]
+        if tickers:
+            unverifiable_params.append(tickers)
+        unverifiable_params.append(trade_date)
+        cur.execute(f"""
             SELECT COUNT(*) AS n FROM stock_prices_daily d
             WHERE (d.datetime AT TIME ZONE 'UTC')::date = %s
+              {ticker_clause}
               AND NOT EXISTS (
                   SELECT 1 FROM stock_prices_hourly h
                   WHERE h.ticker = d.ticker
                     AND (h.datetime AT TIME ZONE 'America/New_York')::date = %s
               )
-        """, (trade_date, trade_date))
+        """, unverifiable_params)
         unverifiable = int(cur.fetchone()["n"])
 
     return {"provisional": provisional, "unverifiable": unverifiable}
@@ -313,6 +318,102 @@ def _guard_daily_session(trade_date, tickers: list[str], provider: str) -> bool:
         {ticker: [trade_date] for ticker in recheck["provisional"]}, provider, 1
     )
     return False
+
+
+def _post_run_audit(trade_date, tickers: list[str], provider: str, session_final: bool) -> dict:
+    """Final EOD sanity sweep: coverage, guard invariant, and derived-table output.
+
+    Logs one summary line every run so a silent partial failure surfaces immediately
+    instead of being discovered days later. Self-heals the two derived stages that
+    should never legitimately be empty by retrying them once; scanner events are only
+    reported since zero matches on a given day is a normal outcome, not a defect.
+    """
+    active = len(tickers)
+    with get_db_cursor() as cur:
+        cur.execute("""
+                WITH active AS (
+                     SELECT UNNEST(%s::text[]) AS ticker
+                )
+            SELECT
+                  (SELECT COUNT(DISTINCT p.ticker) FROM stock_prices_daily p
+                      JOIN active a USING (ticker)
+                      WHERE (p.datetime AT TIME ZONE 'UTC')::date = %s)               AS daily,
+                  (SELECT COUNT(DISTINCT p.ticker) FROM stock_prices_hourly p
+                      JOIN active a USING (ticker)
+                      WHERE (p.datetime AT TIME ZONE 'America/New_York')::date = %s)  AS hourly,
+                  (SELECT COUNT(DISTINCT p.ticker) FROM stock_prices_intraday p
+                      JOIN active a USING (ticker)
+                      WHERE (p.datetime AT TIME ZONE 'America/New_York')::date = %s)  AS intraday,
+                  (SELECT COUNT(*) FROM cross_sectional_signals s
+                      JOIN active a USING (ticker)
+                      WHERE s.trade_date = %s)                                       AS signals,
+                  (SELECT COUNT(*) FROM market_discovery_states m
+                      JOIN active a USING (ticker)
+                      WHERE m.trade_date = %s)                                       AS discovery,
+                  (SELECT COUNT(*) FROM scanner_events e
+                      JOIN active a USING (ticker)
+                      WHERE e.trade_date = %s)                                       AS events,
+                  (SELECT COUNT(*) FROM data_ingestion_failures f
+                      JOIN active a USING (ticker)
+                      WHERE f.resolved_at IS NULL)                                   AS unresolved
+          """, (tickers, trade_date, trade_date, trade_date, trade_date, trade_date, trade_date))
+        counts = dict(cur.fetchone())
+
+    recheck = find_provisional_daily_rows(trade_date, tickers)
+    counts["provisional"] = len(recheck["provisional"])
+
+    issues = []
+    if counts["daily"] < active:
+        issues.append(f"daily coverage {counts['daily']}/{active}")
+    if counts["hourly"] < active:
+        issues.append(f"hourly coverage {counts['hourly']}/{active}")
+    if counts["provisional"]:
+        issues.append(f"{counts['provisional']} daily bars still provisional")
+    if counts["unresolved"]:
+        issues.append(f"{counts['unresolved']} unresolved ingestion failures")
+
+    if session_final:
+        if counts["signals"] == 0:
+            logger.warning("  [audit] Cross-sectional signal produced 0 rows — retrying once")
+            try:
+                job_cross_sectional_signal()
+            except Exception:
+                logger.exception("  [audit] Signal retry failed")
+                issues.append("cross-sectional signal retry failed")
+            else:
+                with get_db_cursor() as cur:
+                    cur.execute("SELECT COUNT(*) AS n FROM cross_sectional_signals "
+                               "WHERE trade_date = %s AND ticker = ANY(%s)", (trade_date, tickers))
+                    counts["signals"] = cur.fetchone()["n"]
+                if counts["signals"] == 0:
+                    issues.append("cross-sectional signal remained empty after retry")
+        if counts["discovery"] == 0:
+            logger.warning("  [audit] Market discovery produced 0 rows — retrying once")
+            try:
+                job_market_discovery()
+            except Exception:
+                logger.exception("  [audit] Discovery retry failed")
+                issues.append("market discovery retry failed")
+            else:
+                with get_db_cursor() as cur:
+                    cur.execute("SELECT COUNT(*) AS n FROM market_discovery_states "
+                               "WHERE trade_date = %s AND ticker = ANY(%s)", (trade_date, tickers))
+                    counts["discovery"] = cur.fetchone()["n"]
+                if counts["discovery"] == 0:
+                    issues.append("market discovery remained empty after retry")
+
+    summary = (
+        f"daily={counts['daily']}/{active} hourly={counts['hourly']}/{active} "
+        f"intraday={counts['intraday']}/{active} provisional={counts['provisional']} "
+        f"signals={counts['signals']} discovery={counts['discovery']} "
+        f"events={counts['events']} unresolved_failures={counts['unresolved']}"
+    )
+    if issues:
+        logger.error("  [audit] EOD issues for %s: %s | %s", trade_date, "; ".join(issues), summary)
+    else:
+        logger.info("  [audit] EOD clean for %s | %s", trade_date, summary)
+
+    return {"counts": counts, "issues": issues}
 
 
 def _ensure_ingestion_failures_table() -> None:
@@ -722,6 +823,12 @@ def run_eod_once(tickers: list[str], provider: str):
             job_hourly_deep_backfill(tickers, provider)
         except Exception:
             logger.exception("[JOB] Deep hourly backfill failed — recent bars are still valid")
+
+    logger.info("[JOB] Post-run audit @ %s ET", _get_et_now().strftime("%H:%M"))
+    try:
+        _post_run_audit(_latest_daily_session(), tickers, provider, session_final)
+    except Exception:
+        logger.exception("[JOB] Post-run audit failed — see prior stage logs for the true state")
 
     logger.info("Daily close complete. Next jobs resume tomorrow at market open.")
     return results

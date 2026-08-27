@@ -437,6 +437,7 @@ export interface LatestQuote {
 
 export interface TickerOverviewRow {
   ticker: string
+  sector: string | null
   date: string | null
   open: number | null
   high: number | null
@@ -692,6 +693,40 @@ export interface TradeSetupZone {
   qualifier: string
 }
 
+export interface CandlestickConfirmation {
+  name: string
+  direction: 'BULLISH' | 'BEARISH' | 'NEUTRAL'
+  bar_time: string
+  open: number
+  high: number
+  low: number
+  close: number
+  interval?: '1h' | '1d' | '1wk'
+}
+
+export interface ConfluenceReference {
+  interval: '1h' | '1d' | '1wk'
+  label: string
+  low: number
+  high: number
+  price: number
+  source: string
+  family: string
+}
+
+export interface ConfluenceZone {
+  low: number
+  high: number
+  midpoint: number
+  distance_pct: number
+  role: 'ACTIVE' | 'SUPPORT' | 'RESISTANCE'
+  strength: 'STRONG_CONFLUENCE' | 'CONFLUENCE' | 'SINGLE_REFERENCE'
+  intervals: Array<'1h' | '1d' | '1wk'>
+  families: string[]
+  references: ConfluenceReference[]
+  confirmations: CandlestickConfirmation[]
+}
+
 export interface LevelRetest {
   level_name: string
   level_price: number
@@ -709,6 +744,7 @@ export interface TradeSetup {
   ticker: string
   last_close: number
   date: string
+  computed_at?: string
   technicals: {
     rsi: number
     rsi_state: string
@@ -728,6 +764,29 @@ export interface TradeSetup {
     dist_to_8ema: number
     dist_to_21ema: number
     trend_consistency: number
+    macd: number
+    macd_signal: number
+    macd_histogram: number
+    macd_histogram_previous: number
+    macd_state: 'BULLISH_RISING' | 'BULLISH_FADING' | 'BEARISH_FALLING' | 'BEARISH_IMPROVING'
+    adx: number | null
+    plus_di: number | null
+    minus_di: number | null
+    historical_volatility_pct: number | null
+    historical_volatility_percentile: number | null
+    historical_volatility_state: 'ELEVATED' | 'NORMAL' | 'QUIET' | 'UNAVAILABLE'
+    relative_volume: number | null
+    volume_trend_ratio: number | null
+    volume_trend_pct: number | null
+    volume_trend_state: 'EXPANDING' | 'STABLE' | 'CONTRACTING' | 'UNAVAILABLE'
+    volume_slope: number | null
+    volume_slope_state: 'RISING' | 'FALLING' | 'FLAT' | 'UNAVAILABLE'
+    volume_sparkline: number[]
+    cmf_20: number | null
+    volume_pressure: 'ACCUMULATION' | 'BALANCED' | 'DISTRIBUTION' | 'UNAVAILABLE'
+    range_low: number
+    range_high: number
+    range_position_pct: number
   }
   ema_alignment: {
     primary: string
@@ -748,6 +807,7 @@ export interface TradeSetup {
   golden_cross: { type: string; bars_ago: number | null; detail: string } | null
   interval: string
   signals: string[]
+  candlestick_patterns: CandlestickConfirmation[]
   entries: TradeSetupEntry[]
   zones: TradeSetupZone[]
   targets: TradeSetupLevel[]
@@ -765,13 +825,20 @@ export interface TradeSetup {
       scoring_role: 'structural_context_only'
       signal: string
       trend_direction: 'uptrend_retracement' | 'downtrend_retracement'
-      swing_basis: 'latest_valid_confirmed_leg'
+      swing_basis: 'structural_confirmed_leg'
       swing_detection_pct: number
+      scope_bars: number
       swing_high: number
       swing_low: number
       swing_high_date: string
       swing_low_date: string
       swing_size_pct: number
+      progress_reached_pct: number
+      progress_current_pct: number
+      target_kind: 'retracement' | 'extension'
+      retracement_levels: Array<{ name: string; price: number; kind: 'retracement' | 'full_retracement' }>
+      extension_levels: Array<{ name: string; price: number; kind: 'extension' }>
+      target_levels: Array<{ name: string; price: number; kind: 'retracement' | 'full_retracement' | 'extension' }>
       developing_pivot: {
         type: 'high' | 'low'
         price: number
@@ -787,6 +854,8 @@ export interface TradeSetup {
         swing_range: number
         swing_size_pct: number
         retracement_pct: number
+        progress_reached_pct: number
+        progress_current_pct: number
         levels: Array<{ name: string; price: number }>
         nearest_level: string
         nearest_level_price: number
@@ -839,6 +908,14 @@ export interface TradeSetup {
   }
 }
 
+export interface MultiTradeSetupResponse {
+  ticker: string
+  setups: Partial<Record<'1h' | '1d' | '1wk' | '1mo', TradeSetup>>
+  errors: Partial<Record<'1h' | '1d' | '1wk' | '1mo', string>>
+  confluence_zones: ConfluenceZone[]
+  as_of: string
+}
+
 export interface DailyRecommendation {
   rec_id: number
   ticker: string
@@ -860,6 +937,12 @@ export const getTradeSetup = async (ticker: string, interval: string = '1d', ref
   const params: Record<string, string | boolean> = { interval }
   if (refresh) params.refresh = true
   const response = await api.get(`/stock/${ticker}/trade-setup`, { params })
+  return response.data
+}
+
+export const getMultiTradeSetup = async (ticker: string, refresh = false): Promise<MultiTradeSetupResponse> => {
+  const params = refresh ? { refresh: true } : undefined
+  const response = await api.get(`/stock/${ticker}/trade-setup/multi`, { params })
   return response.data
 }
 
@@ -1482,9 +1565,20 @@ export const getSectorIntelligence = async (leaderLimit = 5): Promise<SectorInte
 }
 
 export const getTickerScannerEvents = async (
-  ticker: string, limit = 50,
-): Promise<{ ticker: string; events: ScannerEventRow[] }> => {
-  const response = await api.get(`/stock/${ticker}/scanner-events`, { params: { limit } })
+  ticker: string, limit = 100, dailySessions = 21, hourlySessions = 5,
+): Promise<{
+  ticker: string
+  daily_sessions: number
+  hourly_sessions: number
+  events: ScannerEventRow[]
+}> => {
+  const response = await api.get(`/stock/${ticker}/scanner-events`, {
+    params: {
+      limit,
+      daily_sessions: dailySessions,
+      hourly_sessions: hourlySessions,
+    },
+  })
   return response.data
 }
 

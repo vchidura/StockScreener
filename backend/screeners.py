@@ -1532,6 +1532,7 @@ def scan_bearish_bounce(ticker: str, df: pd.DataFrame = None, interval: str = "1
 # ---------------------------------------------------------------------------
 
 _FIBONACCI_SWING_BOUNDS = {
+    "1mo": (8.0, 30.0),
     "1wk": (5.0, 20.0),
     "1d": (3.0, 12.0),
     "1h": (1.5, 8.0),
@@ -1608,6 +1609,110 @@ def _find_zigzag_pivots(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
     return pivots
 
 
+def _compress_structural_pivots(pivots: list) -> list:
+    """Collapse nested continuation swings while preserving reversals."""
+    compressed = list(pivots)
+    changed = True
+    while changed:
+        changed = False
+        result = []
+        index = 0
+        while index < len(compressed):
+            if index + 3 < len(compressed):
+                first, second, third, fourth = compressed[index:index + 4]
+                continuing_down = (
+                    first[2] == "high" and third[2] == "high"
+                    and third[1] < first[1] and fourth[1] < second[1]
+                )
+                continuing_up = (
+                    first[2] == "low" and third[2] == "low"
+                    and third[1] > first[1] and fourth[1] > second[1]
+                )
+                if continuing_down or continuing_up:
+                    result.extend((first, fourth))
+                    index += 4
+                    changed = True
+                    continue
+            result.append(compressed[index])
+            index += 1
+        compressed = result
+    return compressed
+
+
+def _select_structural_fibonacci_legs(
+    df: pd.DataFrame,
+    pivots: list,
+    scope_bars: int = 126,
+    max_scope_bars: int = 252,
+    scope_step_bars: int = 7,
+) -> Optional[Dict]:
+    """Select one completed structural leg and its chained developing leg."""
+    if len(pivots) < 3:
+        return None
+
+    scope = min(max(3, scope_bars), len(df))
+    maximum_scope = min(max(scope, max_scope_bars), len(df))
+
+    while True:
+        cutoff = len(df) - scope
+        first_in_scope = next(
+            (index for index, pivot in enumerate(pivots) if pivot[0] >= cutoff),
+            0,
+        )
+        scoped = pivots[max(0, first_in_scope - 1):]
+        structural = _compress_structural_pivots(scoped)
+        if len(structural) < 3:
+            return None
+
+        primary_index = 0
+        primary_range = abs(structural[1][1] - structural[0][1])
+        # Promote only a completed cycle at least half as large as the current basis.
+        for index in range(1, len(structural) - 2):
+            candidate_range = abs(
+                structural[index + 1][1] - structural[index][1]
+            )
+            if candidate_range >= primary_range * 0.5:
+                primary_index = index
+                primary_range = candidate_range
+
+        start = structural[primary_index]
+        end = structural[primary_index + 1]
+        if primary_range <= 0:
+            return None
+
+        later = df.iloc[end[0]:]
+        if end[2] == "high":
+            offset = int(pd.to_numeric(later["low"], errors="coerce").argmin())
+            provisional = (
+                end[0] + offset,
+                float(pd.to_numeric(later["low"], errors="coerce").iloc[offset]),
+                "low",
+            )
+            current_progress = (end[1] - float(df["close"].iloc[-1])) / primary_range * 100
+        else:
+            offset = int(pd.to_numeric(later["high"], errors="coerce").argmax())
+            provisional = (
+                end[0] + offset,
+                float(pd.to_numeric(later["high"], errors="coerce").iloc[offset]),
+                "high",
+            )
+            current_progress = (float(df["close"].iloc[-1]) - end[1]) / primary_range * 100
+        reached_progress = abs(provisional[1] - end[1]) / primary_range * 100
+
+        if reached_progress <= 161.8 or scope >= maximum_scope:
+            return {
+                "start": start,
+                "end": end,
+                "provisional": provisional,
+                "structural_pivots": structural,
+                "primary_index": primary_index,
+                "scope_bars": scope,
+                "progress_reached_pct": round(max(0.0, reached_progress), 2),
+                "progress_current_pct": round(max(0.0, current_progress), 2),
+            }
+        scope = min(scope + scope_step_bars, maximum_scope)
+
+
 def _describe_active_fibonacci_leg(start_pivot, end_pivot, df: pd.DataFrame,
                                    last_close: float, min_swing_pct: float) -> Dict:
     """Describe the current significant ZigZag leg without treating it as confirmed."""
@@ -1618,6 +1723,8 @@ def _describe_active_fibonacci_leg(start_pivot, end_pivot, df: pd.DataFrame,
     swing_high = max(start_price, end_price)
     swing_low = min(start_price, end_price)
     swing_range = swing_high - swing_low
+    if swing_range <= 0 or swing_low <= 0:
+        return {}
     trend_direction = (
         "uptrend_retracement" if end_type == "high" else "downtrend_retracement"
     )
@@ -1640,8 +1747,8 @@ def _describe_active_fibonacci_leg(start_pivot, end_pivot, df: pd.DataFrame,
         range(len(prices)), key=lambda index: abs(last_close - prices[index])
     )
     nearest_price = prices[nearest_idx]
-    extension_names = ["127.2%", "161.8%"]
-    extension_ratios = [1.272, 1.618]
+    extension_names = ["127.2%", "138.2%", "161.8%", "200%", "261.8%"]
+    extension_ratios = [1.272, 1.382, 1.618, 2.000, 2.618]
     if trend_direction == "uptrend_retracement":
         failure_condition = "at_or_below"
         extensions = [
@@ -1696,6 +1803,7 @@ def _describe_active_fibonacci_leg(start_pivot, end_pivot, df: pd.DataFrame,
                 "levels": [
                     {"name": name, "price": price}
                     for name, price in zip(extension_names, extensions)
+                    if price > 0
                 ],
             },
         ]
@@ -1753,6 +1861,7 @@ def _describe_active_fibonacci_leg(start_pivot, end_pivot, df: pd.DataFrame,
                 "levels": [
                     {"name": name, "price": price}
                     for name, price in zip(extension_names, extensions)
+                    if price > 0
                 ],
             },
         ]
@@ -1885,23 +1994,19 @@ def scan_fibonacci(ticker: str, df: pd.DataFrame = None,
     last_close = float(closes[-1])
 
     pivots = _find_zigzag_pivots(highs, lows, closes, min_swing_pct)
-    if len(pivots) < 3:
+    selection = _select_structural_fibonacci_legs(df, pivots)
+    if selection is None:
         return None
 
-    # The final ZigZag point is still developing. Keep completed legs as
-    # history and use the newest one not invalidated by later price action.
-    confirmed_pairs = list(zip(pivots[:-2], pivots[1:-1]))
+    structural_pivots = selection["structural_pivots"]
+    confirmed_pairs = list(zip(structural_pivots[:-1], structural_pivots[1:]))
     confirmed_legs = [
         _describe_confirmed_fibonacci_leg(start, end, df, last_close)
         for start, end in confirmed_pairs
     ]
-    primary_index = next(
-        (index for index in range(len(confirmed_legs) - 1, -1, -1)
-         if confirmed_legs[index]["status"] == "valid"),
-        len(confirmed_legs) - 1,
-    )
-    p1, p2 = confirmed_pairs[primary_index]
-    developing_pivot = pivots[-1]
+    primary_index = selection["primary_index"]
+    p1, p2 = selection["start"], selection["end"]
+    developing_pivot = selection["provisional"]
     p1_idx, p1_price, p1_type = p1
     p2_idx, p2_price, p2_type = p2
     developing_idx, developing_price, developing_type = developing_pivot
@@ -2013,24 +2118,64 @@ def scan_fibonacci(ticker: str, df: pd.DataFrame = None,
                           "distance_pct": round((last_close - nr["price"]) / nr["price"] * 100, 2) if nr["price"] > 0 else 0}
 
     # Fibonacci extensions (both directions)
-    ext_ratios = [1.272, 1.618]
-    ext_names = ["127.2%", "161.8%"]
+    ext_ratios = [1.272, 1.382, 1.618, 2.000, 2.618]
+    ext_names = ["127.2%", "138.2%", "161.8%", "200%", "261.8%"]
     upside_extensions = [{"level": n, "price": round(swing_low + swing_range * r, 2)}
                          for n, r in zip(ext_names, ext_ratios)]
     downside_extensions = [{"level": n, "price": round(swing_high - swing_range * r, 2)}
                            for n, r in zip(ext_names, ext_ratios)]
+    retracement_levels = [
+        {"name": name, "price": price, "kind": "retracement"}
+        for name, price in zip(fib_names, fib_levels)
+    ] + [{
+        "name": "100%",
+        "price": round(
+            swing_low if trend_direction == "uptrend_retracement" else swing_high,
+            2,
+        ),
+        "kind": "full_retracement",
+    }]
+    directional_extensions = (
+        downside_extensions
+        if trend_direction == "uptrend_retracement"
+        else upside_extensions
+    )
+    extension_levels = [
+        {"name": level["level"], "price": level["price"], "kind": "extension"}
+        for level in directional_extensions
+        if level["price"] > 0
+    ]
+    target_kind = (
+        "extension"
+        if selection["progress_current_pct"] > 100
+        else "retracement"
+    )
+    target_levels = (
+        extension_levels if target_kind == "extension" else retracement_levels
+    )
+    if target_levels:
+        nearest_target = min(
+            target_levels, key=lambda level: abs(last_close - level["price"])
+        )
+        nearest_level_name = nearest_target["name"]
+        nearest_level_price = nearest_target["price"]
+        distance_pct = round(
+            (last_close - nearest_level_price) / nearest_level_price * 100, 2
+        ) if nearest_level_price > 0 else 0.0
 
     # Resolve swing dates
     swing_high_date = df.index[p1_idx if p1_type == 'high' else p2_idx]
     swing_low_date = df.index[p1_idx if p1_type == 'low' else p2_idx]
     developing_date = df.index[developing_idx]
-    active_start_price = round(float(pivots[-2][1]), 2)
+    active_start_price = round(float(p2[1]), 2)
     developing_move_pct = round(
         abs(developing_price - active_start_price) / active_start_price * 100, 2
     ) if active_start_price > 0 else 0.0
     active_leg = _describe_active_fibonacci_leg(
-        pivots[-2], developing_pivot, df, last_close, min_swing_pct
+        p2, developing_pivot, df, last_close, min_swing_pct
     )
+    active_leg["progress_reached_pct"] = selection["progress_reached_pct"]
+    active_leg["progress_current_pct"] = selection["progress_current_pct"]
     confirmed_history = []
     for index in range(len(confirmed_legs) - 1, max(-1, len(confirmed_legs) - 7), -1):
         leg = dict(confirmed_legs[index])
@@ -2040,7 +2185,8 @@ def scan_fibonacci(ticker: str, df: pd.DataFrame = None,
     return {
         "ticker": ticker,
         "signal": signal,
-        "swing_basis": "latest_valid_confirmed_leg",
+        "swing_basis": "structural_confirmed_leg",
+        "scope_bars": selection["scope_bars"],
         "swing_detection_pct": round(min_swing_pct, 2),
         "trend_direction": trend_direction,
         "last_close": round(last_close, 2),
@@ -2057,7 +2203,13 @@ def scan_fibonacci(ticker: str, df: pd.DataFrame = None,
         "active_leg": active_leg,
         "confirmed_legs": confirmed_history,
         "swing_size_pct": swing_size_pct,
-        "retracement_pct": round(max(0, min(retracement_pct, 100)), 2),
+        "retracement_pct": selection["progress_current_pct"],
+        "progress_reached_pct": selection["progress_reached_pct"],
+        "progress_current_pct": selection["progress_current_pct"],
+        "target_kind": target_kind,
+        "retracement_levels": retracement_levels,
+        "extension_levels": extension_levels,
+        "target_levels": target_levels,
         "fib_236": fib_levels[0],
         "fib_382": fib_levels[1],
         "fib_500": fib_levels[2],

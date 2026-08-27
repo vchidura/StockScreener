@@ -4,6 +4,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import math
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -991,6 +992,20 @@ def evaluate_outcomes(interval: str, limit: int = 5000) -> dict:
         stop_hit, target_hit, first = _first_hit(
             bars, direction, stop, target
         )
+        # raw_return/signed/net_signed are NOT NULL columns; a non-finite value here means the
+        # bar data itself is corrupt, so skip the event/horizon rather than insert a bad row.
+        if not all(math.isfinite(value) for value in (raw_return, signed, net_signed)):
+            continue
+        # The remaining columns are nullable: guard the whole insert, not just the one risk_pct
+        # division above, since corrupted price data or a future scanner change could otherwise
+        # persist a non-finite float that breaks JSON serialization on every later read.
+        (benchmark, alpha, net_alpha, adverse, favorable,
+         mae_r, mfe_r, sector_benchmark, sector_alpha, sector_net_alpha) = (
+            _finite_or_none(value) for value in (
+                benchmark, alpha, net_alpha, adverse, favorable,
+                mae_r, mfe_r, sector_benchmark, sector_alpha, sector_net_alpha,
+            )
+        )
         rows.append((
             event["event_id"], event["horizon_bars"], len(bars),
             bars.iloc[-1]["bar_time"], float(bars.iloc[-1]["close"]),
@@ -1190,7 +1205,7 @@ def event_summary(interval: str | None = None, discovery_state: str | None = Non
             "target_first_rate": _mean(sample["target_first"]),
             "promotion_status": status,
         })
-    return results
+    return [_sanitize_nonfinite(row) for row in results]
 
 
 def _review_priority(interval: str, direction: int,
@@ -1502,7 +1517,15 @@ def _apply_qualification_fdr(rows: list[dict]) -> list[dict]:
         "live_expected_alpha_ci_high",
     ):
         report.loc[unsupported, column] = None
-    return report.replace({np.nan: None}).to_dict(orient="records")
+    # The write path in evaluate_outcomes() now rejects non-finite floats before they ever reach
+    # this table, so this is belt-and-suspenders for older rows and any other insert path (for
+    # example, the arithmetic on alpha_ci_low/high just above).
+    # infer_objects() must run only after the inf->nan step: calling it after the nan->None step
+    # would re-infer an all-numeric column back to float64, silently turning None back into nan.
+    with pd.option_context("future.no_silent_downcasting", True):
+        sanitized = report.replace([np.inf, -np.inf], np.nan)
+    sanitized = sanitized.infer_objects(copy=False)
+    return sanitized.replace({np.nan: None}).to_dict(orient="records")
 
 
 def qualification_report(interval: str | None = None) -> list[dict]:
@@ -1512,12 +1535,30 @@ def qualification_report(interval: str | None = None) -> list[dict]:
         for row in qualification_summary(value)
     ]
     corrected = _apply_qualification_fdr(rows)
-    return [row for row in corrected if interval is None or row["interval"] == interval]
+    filtered = [row for row in corrected if interval is None or row["interval"] == interval]
+    return [_sanitize_nonfinite(row) for row in filtered]
 
 
 def _mean(values) -> float | None:
-    numeric = pd.to_numeric(values, errors="coerce").dropna()
+    # A zero-risk event divides to +/-inf in mae_r/mfe_r; json.dumps rejects non-finite floats.
+    numeric = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
     return float(numeric.mean()) if len(numeric) else None
+
+
+def _sanitize_nonfinite(value):
+    """Replace NaN/Infinity with None, recursing into dicts and lists.
+
+    A flat DataFrame.replace() only inspects whole cell values, so it cannot reach a non-finite
+    float nested inside a dict column such as regime_alpha. json.dumps(allow_nan=False) rejects
+    any of them wherever they occur, so this is applied as the final step before every response.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _sanitize_nonfinite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_nonfinite(item) for item in value]
+    return value
 
 
 def _promotion_status(periods: int, mean_alpha: float | None,
@@ -1978,10 +2019,30 @@ def sector_intelligence(leader_limit: int = 5) -> dict:
     }
 
 
-def ticker_events(ticker: str, limit: int = 50) -> list[dict]:
-    """Recent scanner setup lifecycles for one ticker."""
+def ticker_events(ticker: str, limit: int = 50,
+                  daily_sessions: int = 21, hourly_sessions: int = 5) -> list[dict]:
+    """Scanner lifecycles within recent stored trading-session windows."""
     with get_db_cursor() as cur:
         cur.execute("""
+            WITH daily_cutoff AS (
+                SELECT MIN(session_date) AS session_date
+                FROM (
+                    SELECT DISTINCT (datetime AT TIME ZONE 'UTC')::date AS session_date
+                    FROM stock_prices_daily
+                    WHERE ticker = %s
+                    ORDER BY session_date DESC
+                    LIMIT %s
+                ) sessions
+            ), hourly_cutoff AS (
+                SELECT MIN(session_date) AS session_date
+                FROM (
+                    SELECT DISTINCT (datetime AT TIME ZONE 'America/New_York')::date AS session_date
+                    FROM stock_prices_hourly
+                    WHERE ticker = %s
+                    ORDER BY session_date DESC
+                    LIMIT %s
+                ) sessions
+            )
             SELECT e.event_id, e.scanner_name, e.scanner_version, e.interval,
                    e.signal_time, e.last_seen_at, e.occurrence_count,
                    e.direction, e.trigger_type, e.discovery_state,
@@ -2020,13 +2081,34 @@ def ticker_events(ticker: str, limit: int = 50) -> list[dict]:
                    ) FILTER (WHERE o.outcome_id IS NOT NULL), '[]'::jsonb) AS outcomes
             FROM scanner_events e
             LEFT JOIN scanner_event_outcomes o ON o.event_id = e.event_id
+            CROSS JOIN daily_cutoff d
+            CROSS JOIN hourly_cutoff h
             WHERE e.ticker = %s
+              AND (
+                  (e.interval IN ('1d', '1wk') AND e.trade_date >= d.session_date)
+                  OR (
+                      e.interval = '1h'
+                      AND (e.signal_time AT TIME ZONE 'America/New_York')::date >= h.session_date
+                  )
+              )
             GROUP BY e.event_id
             ORDER BY e.signal_time DESC
             LIMIT %s
-        """, (ticker.upper(), limit))
+        """, (
+            ticker.upper(), daily_sessions,
+            ticker.upper(), hourly_sessions,
+            ticker.upper(), limit,
+        ))
         return [dict(row) for row in cur.fetchall()]
 
 
 def _float_or_none(value):
     return float(value) if pd.notna(value) else None
+
+
+def _finite_or_none(value):
+    """Reject NaN/Infinity in addition to None: pd.notna() alone treats Infinity as valid."""
+    if value is None or pd.isna(value):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None

@@ -387,6 +387,49 @@ body {
 }
 
 @media (max-width: 760px) {
+  .navbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.6rem;
+    padding: 0.65rem 0.75rem;
+    overflow: hidden;
+  }
+
+  .navbar > div:first-child {
+    flex-wrap: wrap;
+    gap: 0.6rem !important;
+  }
+
+  .navbar-brand {
+    font-size: 1.15rem;
+  }
+
+  .navbar input {
+    width: min(240px, calc(100vw - 1.5rem)) !important;
+  }
+
+  .navbar-nav {
+    width: 100%;
+    gap: 0.25rem;
+    overflow-x: auto;
+    padding-bottom: 0.2rem;
+  }
+
+  .nav-link {
+    display: block;
+    padding: 0.35rem 0.55rem;
+    white-space: nowrap;
+  }
+
+  .main-content {
+    padding: 0.5rem;
+    overflow-x: hidden;
+  }
+
+  .card {
+    padding: 0.75rem;
+  }
+
   .ticker-strategy-results {
     grid-template-columns: 1fr;
   }

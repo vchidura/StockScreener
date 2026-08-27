@@ -423,6 +423,7 @@ def get_tickers_overview(tickers: list[str], end_date: str = None) -> list[dict]
     )
     SELECT
         l.ticker,
+        st.sector,
         l.trade_date,
         l.open_price,
         l.high,
@@ -436,6 +437,7 @@ def get_tickers_overview(tickers: list[str], end_date: str = None) -> list[dict]
         lo.low_52w,
         w.wsma_50, w.wsma_200
     FROM latest l
+    LEFT JOIN selected_tickers st ON st.ticker = l.ticker
     LEFT JOIN prev p ON l.ticker = p.ticker
     LEFT JOIN daily_mas d ON l.ticker = d.ticker
     LEFT JOIN high_52w h ON l.ticker = h.ticker
@@ -474,6 +476,7 @@ def get_tickers_overview(tickers: list[str], end_date: str = None) -> list[dict]
 
         results.append({
             "ticker": row["ticker"],
+            "sector": row["sector"],
             "date": row["trade_date"].isoformat() if row["trade_date"] else None,
             "open": _to_float(row["open_price"]),
             "high": _to_float(row["high"]),

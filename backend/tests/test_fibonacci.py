@@ -28,10 +28,12 @@ class FibonacciSwingThresholdTests(unittest.TestCase):
         })
 
         daily_threshold = calculate_fibonacci_swing_pct(frame, "1d")
+        monthly_threshold = calculate_fibonacci_swing_pct(frame, "1mo")
         five_minute_threshold = calculate_fibonacci_swing_pct(frame, "5m")
 
         self.assertGreaterEqual(daily_threshold, 4.9)
         self.assertLessEqual(daily_threshold, 5.1)
+        self.assertEqual(monthly_threshold, 8.0)
         self.assertEqual(five_minute_threshold, 3.0)
 
     def test_scanner_levels_reproduce_from_returned_swing(self):
@@ -83,7 +85,7 @@ class FibonacciSwingThresholdTests(unittest.TestCase):
         )
 
         self.assertEqual(result["swing_detection_pct"], 5.0)
-        self.assertEqual(result["swing_basis"], "latest_valid_confirmed_leg")
+        self.assertEqual(result["swing_basis"], "structural_confirmed_leg")
         self.assertEqual(
             {result["swing_low"], result["swing_high"]},
             {round(confirmed_start[1], 2), round(confirmed_end[1], 2)},
@@ -135,7 +137,10 @@ class FibonacciSwingThresholdTests(unittest.TestCase):
         )
         failure = active_leg["scenarios"][-1]
         self.assertEqual(failure["trigger_price"], active_leg["start"]["price"])
-        self.assertEqual(len(failure["levels"]), 2)
+        self.assertEqual(
+            [level["name"] for level in failure["levels"]],
+            ["127.2%", "138.2%", "161.8%", "200%", "261.8%"],
+        )
         self.assertEqual(result["swing_size_pct"], expected_size)
         self.assertEqual(actual_levels, expected_levels)
         self.assertEqual(result["nearest_level_price"], expected_nearest)

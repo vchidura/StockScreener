@@ -1,6 +1,7 @@
 import { useState, useMemo, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { Settings } from 'lucide-react'
 import {
   getTickersOverview, TickerOverviewRow, getStreakSummary, getLatestPriceDate,
   scanAll, MarketRegime,
@@ -15,6 +16,7 @@ function TickersOverview() {
   const [sortField, setSortField] = useState<SortField>('ticker')
   const [sortDir, setSortDir] = useState<SortDir>('asc')
   const [filter, setFilter] = useState('')
+  const [sectorFilter, setSectorFilter] = useState('')
   const [maFilterIdx, setMaFilterIdx] = useState(0)
   const [maThreshold, setMaThreshold] = useState(3)
   const [presetFilter, setPresetFilter] = useState('')
@@ -212,6 +214,11 @@ function TickersOverview() {
     new_52w_high: 0.5, new_52w_low: 0.5,
   }
 
+  const sectors = useMemo(() => (
+    [...new Set(data.map(row => row.sector).filter((sector): sector is string => !!sector))]
+      .sort((a, b) => a.localeCompare(b))
+  ), [data])
+
   const applyPresetFilter = (rows: TickerOverviewRow[]): TickerOverviewRow[] => {
     const t = presetPct
     switch (presetFilter) {
@@ -259,6 +266,10 @@ function TickersOverview() {
       ? data.filter((r) => r.ticker.toLowerCase().includes(filter.toLowerCase()))
       : data
 
+    if (sectorFilter) {
+      filtered = filtered.filter(row => row.sector === sectorFilter)
+    }
+
     // Apply preset filter
     filtered = applyPresetFilter(filtered)
 
@@ -302,7 +313,7 @@ function TickersOverview() {
       const diff = (aVal as number) - (bVal as number)
       return sortDir === 'asc' ? diff : -diff
     })
-  }, [data, sortField, sortDir, filter, maFilterIdx, maThreshold, presetFilter, presetPct, streakMap])
+  }, [data, sortField, sortDir, filter, sectorFilter, maFilterIdx, maThreshold, presetFilter, presetPct, streakMap])
 
   const fmt = (val: number | null) => (val != null ? val.toFixed(2) : '—')
   const fmtVol = (val: number) => {
@@ -559,6 +570,25 @@ function TickersOverview() {
           }}
         />
         <select
+          value={sectorFilter}
+          onChange={(event) => setSectorFilter(event.target.value)}
+          aria-label="Filter by sector"
+          style={{
+            padding: '8px 12px',
+            borderRadius: '4px',
+            border: '1px solid #ccc',
+            fontSize: '14px',
+            background: sectorFilter ? '#eff6ff' : '#fff',
+            fontWeight: sectorFilter ? 600 : 400,
+            maxWidth: '220px',
+          }}
+        >
+          <option value="">All Sectors</option>
+          {sectors.map(sector => (
+            <option key={sector} value={sector}>{sector}</option>
+          ))}
+        </select>
+        <select
           value={presetFilter}
           onChange={(e) => {
             const key = e.target.value
@@ -665,48 +695,6 @@ function TickersOverview() {
 
         <div style={{ width: '1px', height: '24px', background: '#ddd' }} />
 
-        <div style={{ position: 'relative' }}>
-          <button
-            onClick={() => setShowColPicker(!showColPicker)}
-            style={{
-              padding: '6px 12px', borderRadius: '4px', border: '1px solid #ccc',
-              background: showColPicker ? '#eff6ff' : '#fff', cursor: 'pointer', fontSize: '13px',
-              fontWeight: showColPicker ? 600 : 400,
-            }}
-          >
-            ⚙ Columns {hiddenCols.size > 0 && <span style={{ color: '#ea580c', fontWeight: 700 }}>({hiddenCols.size} hidden)</span>}
-          </button>
-          {showColPicker && (
-            <div style={{
-              position: 'absolute', left: 0, top: '100%', zIndex: 50, marginTop: 4,
-              background: '#fff', border: '1px solid #e2e8f0', borderRadius: '6px',
-              padding: '12px', boxShadow: '0 4px 12px rgba(0,0,0,0.15)', minWidth: '240px',
-            }}>
-              {columnGroups.filter(g => g.key !== 'streak').map(g => (
-                <div key={g.key} style={{ marginBottom: '8px' }}>
-                  <div style={{ fontSize: '0.8rem', fontWeight: 700, color: g.bg, marginBottom: '2px', borderBottom: `2px solid ${g.bg}`, paddingBottom: '2px' }}>{g.label}</div>
-                  {columns.filter(c => c.group === g.key && c.key !== 'ticker').map(c => (
-                    <label key={c.key} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.82rem', cursor: 'pointer', padding: '2px 0' }}>
-                      <input
-                        type="checkbox"
-                        checked={!hiddenCols.has(c.key)}
-                        onChange={() => {
-                          const next = new Set(hiddenCols)
-                          if (next.has(c.key)) next.delete(c.key); else next.add(c.key)
-                          setHiddenCols(next)
-                        }}
-                      />
-                      {c.label}
-                    </label>
-                  ))}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        <div style={{ width: '1px', height: '24px', background: '#ddd' }} />
-
         <label style={{ fontSize: '0.82rem', color: '#666', whiteSpace: 'nowrap' }}>Streak:</label>
         <input
           type="number" min={2} max={10} value={streakDays}
@@ -747,6 +735,48 @@ function TickersOverview() {
             {Object.values(actionMap).filter(e => e.action === 'HOLD').length}H
           </span>
         )}
+
+        <div style={{ position: 'relative', flexShrink: 0, marginLeft: 'auto' }}>
+          <button
+            onClick={() => setShowColPicker(!showColPicker)}
+            aria-label={`Choose columns${hiddenCols.size > 0 ? ` (${hiddenCols.size} hidden)` : ''}`}
+            title={`Choose columns${hiddenCols.size > 0 ? ` (${hiddenCols.size} hidden)` : ''}`}
+            style={{
+              width: '32px', height: '32px', padding: 0, borderRadius: '4px', border: '1px solid #ccc',
+              background: showColPicker ? '#eff6ff' : '#fff', cursor: 'pointer', fontSize: '17px',
+              display: 'grid', placeItems: 'center', lineHeight: 1,
+            }}
+          >
+            <Settings size={18} strokeWidth={2} aria-hidden="true" />
+          </button>
+          {showColPicker && (
+            <div style={{
+              position: 'absolute', right: 0, top: '100%', zIndex: 50, marginTop: 4,
+              background: '#fff', border: '1px solid #e2e8f0', borderRadius: '6px',
+              padding: '12px', boxShadow: '0 4px 12px rgba(0,0,0,0.15)', minWidth: '240px',
+            }}>
+              {columnGroups.filter(g => g.key !== 'streak').map(g => (
+                <div key={g.key} style={{ marginBottom: '8px' }}>
+                  <div style={{ fontSize: '0.8rem', fontWeight: 700, color: g.bg, marginBottom: '2px', borderBottom: `2px solid ${g.bg}`, paddingBottom: '2px' }}>{g.label}</div>
+                  {columns.filter(c => c.group === g.key && c.key !== 'ticker').map(c => (
+                    <label key={c.key} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.82rem', cursor: 'pointer', padding: '2px 0' }}>
+                      <input
+                        type="checkbox"
+                        checked={!hiddenCols.has(c.key)}
+                        onChange={() => {
+                          const next = new Set(hiddenCols)
+                          if (next.has(c.key)) next.delete(c.key); else next.add(c.key)
+                          setHiddenCols(next)
+                        }}
+                      />
+                      {c.label}
+                    </label>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {loading && <p>Loading overview for all selected tickers...</p>}

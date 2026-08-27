@@ -270,12 +270,15 @@ $env:PYTHONIOENCODING = 'utf-8'   # required: log lines contain non-ASCII charac
 | 3 | Final 5m intraday update | Tops up `stock_prices_intraday` |
 | 4 | Validation | `validate_all(days=7)` checks the last 7 sessions |
 | 5 | Conditional backfill | Runs **only** if validation reports issues |
-| 6 | Daily-bar guard | Blocks stages 7–9 unless each daily bar envelops its own hourly tape |
+| 6 | Daily-bar guard | Blocks stages 7–10 unless each daily bar envelops its own hourly tape |
 | 7 | Cross-sectional signal | Scores the universe with `xsmom-1.0` |
 | 8 | Market discovery | Persists shadow discovery states and the current-position overlay |
-| 9 | Deep hourly backfill | **Saturday only** — repairs the 730-day window |
+| 9 | Hourly scanner repair | Rebuilds recent `1h` outcomes from final bars |
+| 10 | Scanner events | Captures `1d` and `1h`, plus `1wk` on Fridays |
+| 11 | Deep hourly backfill | **Saturday only** — repairs the 730-day window |
+| 12 | Post-run audit | Re-checks coverage, the guard invariant, and derived-table output; self-heals empty signal/discovery tables |
 
-Stages 3, 7, 8 and 9 are wrapped in `try/except`: none of them are inputs to the
+Stages 3 and 7–12 are wrapped in `try/except`: none of them are inputs to the
 price tables written in stages 1–2, so a failure is logged without invalidating
 the run.
 
@@ -286,6 +289,16 @@ not envelop that session's hourly bars or whose volume falls below 90% of the
 hourly total. It retries the daily close once for the offending tickers, then
 queues anything still provisional in `data_ingestion_failures` and skips the
 derived stages rather than building signals from mid-session prices.
+
+Stage 12 runs regardless of whether stage 6 passed. It re-verifies daily/hourly/
+intraday coverage against the active ticker list, re-checks the guard invariant, and
+reads back row counts for `cross_sectional_signals`, `market_discovery_states`,
+`scanner_events`, and unresolved `data_ingestion_failures`. If the signal or discovery
+tables came back empty for a session the guard cleared, it retries that stage once and
+re-checks; otherwise it logs a single `EOD clean` or `EOD issues` summary line so a
+silent partial failure is visible in that run's log instead of surfacing days later.
+Scanner-event counts are reported only, since zero matches on a given day can be a
+legitimate outcome.
 
 The structured daily and hourly pullback scanners are **not** scheduler stages.
 They are manual, descriptive watch scans shown later in this README.
@@ -485,6 +498,8 @@ documentation. The automatic database restore runs only when the
 | `GET /api/stock/{ticker}/prices` | Raw price rows |
 | `GET /api/stock/{ticker}/chart` | Candlestick chart data |
 | `GET /api/stock/{ticker}/trade-setup` | Suggested trade setup |
+| `GET /api/stock/{ticker}/trade-setup/multi` | Synchronized `1h`, `1d`, `1wk`, and monthly-context setups with cross-timeframe confluence |
+| `GET /api/stock/{ticker}/scanner-events` | Recent scanner lifecycles bounded by stored trading sessions |
 | `GET /api/scan/gaps` | Scan for gap strategies |
 | `GET /api/scan/fvg` | Scan for fair value gaps |
 | `GET /api/scan/ma-crossover` | Scan for MA crossovers |
@@ -495,7 +510,13 @@ documentation. The automatic database restore runs only when the
 | `GET /api/scan/all` | Run all screeners |
 | `GET /api/market-regime` | Current market regime |
 | `GET /api/strategies` | List available strategies |
-| `GET /api/stock/{ticker}/chart` | Get chart data |
+
+The multi-timeframe setup uses `1h`, `1d`, and `1wk` for actionable setup and
+confluence calculations. `1mo` is resampled from the same daily frame and is
+displayed as structural context only; it does not alter the active trade plan or
+scanner pipeline. Direction strength is completed-bar ADX(14) with `+DI`/`-DI`.
+HV20 is annualized 20-bar realized volatility, ranked against up to 252 rolling
+windows for that interval.
 
 ## Tech Stack
 

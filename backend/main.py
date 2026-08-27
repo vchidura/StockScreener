@@ -1,9 +1,10 @@
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional, Any, Callable
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 import logging
+import math
 import os
 import time
 import threading
@@ -109,8 +110,15 @@ _CACHE_TTLS: dict[str, int] = {
     "scan_all":         43200,   # 12h
     "streak":           86400,   # 24h
     "streak_summary":   86400,   # 24h
-    "trade_setup":      14400,   # 4h
-    "chart_daily":      86400,   # 24h
+    # The newest bar keeps moving while the market is open, so anything derived from it
+    # must expire faster than the bar it is built on.
+    "trade_setup":      900,     # 15min fallback
+    "trade_setup_1h":   300,     # 5min; the live hour is still forming
+    "trade_setup_1d":   900,     # 15min
+    "trade_setup_1wk":  900,     # 15min; the in-progress week resamples every session
+    "trade_setup_1mo":  900,     # 15min; context resampled from the daily frame
+    "trade_setup_multi": 300,    # 5min; coordinates all four setup intervals
+    "chart_daily":      900,     # 15min; today's daily bar is still forming
     "chart_intraday":   60,      # 1min; market-hours data updates every 5min
     "quote":            60,      # newest stored candle
     "prices":           86400,   # 24h
@@ -243,6 +251,224 @@ async def list_tickers(refresh: bool = False):
         clear_bulk_cache()
     selected = get_selected_tickers(active_only=True)
     result = selected if selected else get_distinct_tickers()
+    _set_cached(cache_key, result)
+    return result
+
+
+def _build_ticker_confluence_zones(setups: dict[str, dict]) -> list[dict]:
+    daily = setups.get("1d") or next(iter(setups.values()), None)
+    if not daily:
+        return []
+    current_price = float(daily["last_close"])
+    daily_atr = float(daily["technicals"].get("atr") or 0)
+    tolerance = max(current_price * 0.003, daily_atr * 0.25)
+    references = []
+
+    def family_of(source: str) -> str:
+        value = source.lower()
+        if "fib" in value:
+            return "fibonacci"
+        if "ema" in value or "sma" in value or "moving" in value:
+            return "moving_average"
+        if "gap" in value or "fvg" in value:
+            return "gap_fvg"
+        if "vwap" in value:
+            return "vwap"
+        return "price_action"
+
+    def add_reference(interval: str, label: str, low: float, high: float,
+                      source: str, family: str | None = None):
+        if not all(math.isfinite(value) and value > 0 for value in (low, high)):
+            return
+        lo, hi = sorted((float(low), float(high)))
+        references.append({
+            "interval": interval,
+            "label": label,
+            "low": round(lo, 2),
+            "high": round(hi, 2),
+            "price": round((lo + hi) / 2, 2),
+            "source": source,
+            "family": family or family_of(source),
+        })
+
+    for interval, setup in setups.items():
+        technicals = setup["technicals"]
+        for label, key, family in (
+            ("EMA 8", "ema8", "moving_average"),
+            ("EMA 21", "ema21", "moving_average"),
+            ("EMA 50", "ema50", "moving_average"),
+            ("SMA 50", "ma50", "moving_average"),
+            ("SMA 100", "ma100", "moving_average"),
+            ("SMA 200", "ma200", "moving_average"),
+            ("VWAP 20", "vwap", "vwap"),
+        ):
+            value = technicals.get(key)
+            if value is not None:
+                add_reference(interval, label, value, value, label, family)
+
+        for level in setup.get("targets", []) + setup.get("stops", []):
+            label = level["level"]
+            if level["source"] == "ATR":
+                atr = float(technicals.get("atr") or 0)
+                multiple = abs(float(level["price"]) - float(setup["last_close"])) / atr if atr > 0 else 0
+                sign = "+" if float(level["price"]) >= float(setup["last_close"]) else "−"
+                label = f"ATR {sign}{multiple:.0f}×"
+            add_reference(
+                interval, label, level["price"], level["price"],
+                level["source"],
+            )
+        for zone in setup.get("zones", []):
+            add_reference(
+                interval, zone["name"], zone["low"], zone["high"], zone["source"],
+            )
+
+        fibonacci = setup.get("strategy_results", {}).get("fibonacci")
+        if fibonacci:
+            for level in fibonacci.get("active_leg", {}).get("levels", []):
+                add_reference(
+                    interval, f"Provisional Fib {level['name']}",
+                    level["price"], level["price"], "Fibonacci provisional",
+                    "fibonacci",
+                )
+            for level in fibonacci.get("target_levels", []):
+                add_reference(
+                    interval, f"Confirmed Fib {level['name']}",
+                    level["price"], level["price"], "Fibonacci confirmed",
+                    "fibonacci",
+                )
+
+    unique = {}
+    for reference in references:
+        key = (
+            reference["interval"], reference["family"], reference["label"],
+            reference["low"], reference["high"],
+        )
+        unique[key] = reference
+    references = sorted(unique.values(), key=lambda item: item["price"])
+
+    clusters = []
+    for reference in references:
+        candidates = [
+            cluster for cluster in clusters
+            if abs(reference["price"] - cluster["center"]) <= tolerance
+        ]
+        if not candidates:
+            clusters.append({
+                "low": reference["low"],
+                "high": reference["high"],
+                "center": reference["price"],
+                "references": [reference],
+            })
+            continue
+        cluster = min(
+            candidates, key=lambda item: abs(reference["price"] - item["center"])
+        )
+        cluster["low"] = min(cluster["low"], reference["low"])
+        cluster["high"] = max(cluster["high"], reference["high"])
+        cluster["references"].append(reference)
+        cluster["center"] = sum(
+            item["price"] for item in cluster["references"]
+        ) / len(cluster["references"])
+
+    zones = []
+    for cluster in clusters:
+        low, high = cluster["low"], cluster["high"]
+        midpoint = (low + high) / 2
+        families = sorted({item["family"] for item in cluster["references"]})
+        intervals = sorted(
+            {item["interval"] for item in cluster["references"]},
+            key=lambda value: {"1h": 0, "1d": 1, "1wk": 2}.get(value, 9),
+        )
+        if low <= current_price <= high:
+            role = "ACTIVE"
+        elif high < current_price:
+            role = "SUPPORT"
+        else:
+            role = "RESISTANCE"
+        if len(intervals) >= 2 and len(families) >= 2:
+            strength = "STRONG_CONFLUENCE"
+        elif len(families) >= 2 or len(intervals) >= 2:
+            strength = "CONFLUENCE"
+        else:
+            strength = "SINGLE_REFERENCE"
+
+        confirmations = []
+        for interval, setup in setups.items():
+            for pattern in setup.get("candlestick_patterns", []):
+                if pattern["high"] >= low - tolerance and pattern["low"] <= high + tolerance:
+                    confirmations.append({**pattern, "interval": interval})
+
+        zones.append({
+            "low": round(low, 2),
+            "high": round(high, 2),
+            "midpoint": round(midpoint, 2),
+            "distance_pct": round((midpoint - current_price) / current_price * 100, 2),
+            "role": role,
+            "strength": strength,
+            "intervals": intervals,
+            "families": families,
+            "references": cluster["references"],
+            "confirmations": confirmations,
+        })
+    return sorted(zones, key=lambda zone: abs(zone["distance_pct"]))
+
+
+@app.get("/api/stock/{ticker}/trade-setup/multi")
+async def get_multi_trade_setup(ticker: str, refresh: bool = False):
+    """Return synchronized 1h/1d/1wk setups, monthly context, and confluence."""
+    symbol = ticker.upper()
+    cache_key = f"trade_setup_multi_v5_{symbol}"
+    if not refresh:
+        cached = _get_cached(cache_key, "trade_setup_multi")
+        if cached is not None:
+            return cached
+    if refresh:
+        clear_bulk_cache()
+        _invalidate_prefix(f"trade_setup_v16_{symbol}_")
+        _invalidate_prefix(cache_key)
+
+    import pandas as pd
+
+    loop = asyncio.get_event_loop()
+    daily_frames, hourly_rows = await asyncio.gather(
+        loop.run_in_executor(executor, bulk_load_dataframes, [symbol], 4000),
+        loop.run_in_executor(executor, get_hourly_data, symbol, 500, None),
+    )
+    shared_daily = daily_frames.get(symbol)
+    shared_hourly = None
+    if hourly_rows:
+        shared_hourly = pd.DataFrame(hourly_rows)
+        shared_hourly["datetime"] = pd.to_datetime(shared_hourly["datetime"], utc=True)
+        shared_hourly.set_index("datetime", inplace=True)
+        if "ticker" in shared_hourly.columns:
+            shared_hourly = shared_hourly.drop(columns=["ticker"])
+        for column in ("open", "high", "low", "close", "volume"):
+            if column in shared_hourly.columns:
+                shared_hourly[column] = shared_hourly[column].astype(float)
+    shared_frames = {"daily": shared_daily, "hourly": shared_hourly}
+
+    intervals = ("1h", "1d", "1wk", "1mo")
+    responses = await asyncio.gather(
+        *(_compute_trade_setup(symbol, interval, False, shared_frames) for interval in intervals),
+        return_exceptions=True,
+    )
+    setups = {}
+    errors = {}
+    for interval, response in zip(intervals, responses):
+        if isinstance(response, Exception):
+            errors[interval] = str(response)
+        else:
+            setups[interval] = response
+
+    result = {
+        "ticker": symbol,
+        "setups": setups,
+        "errors": errors,
+        "confluence_zones": _build_ticker_confluence_zones({
+            interval: setup for interval, setup in setups.items() if interval != "1mo"
+        }),
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }
     _set_cached(cache_key, result)
     return result
 
@@ -876,7 +1102,7 @@ async def scan_all(
 async def tickers_overview(scan_date: Optional[str] = None, refresh: bool = False):
     """Return OHLC + daily MAs + true weekly MAs for all selected tickers.
     Pass scan_date as YYYY-MM-DD for historical data."""
-    cache_key = f"overview_{scan_date or 'latest'}"
+    cache_key = f"overview_v2_{scan_date or 'latest'}"
     if not refresh:
         cached = _get_cached(cache_key, "overview")
         if cached is not None:
@@ -1533,16 +1759,23 @@ async def scan_streak_summary_endpoint(
 
 @app.get("/api/stock/{ticker}/trade-setup")
 async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = False):
+    """Public single-timeframe setup endpoint."""
+    return await _compute_trade_setup(ticker, interval, refresh)
+
+
+async def _compute_trade_setup(ticker: str, interval: str = "1d",
+                               refresh: bool = False,
+                               shared_frames: Optional[dict] = None):
     """
     Comprehensive trade setup analysis for a single ticker.
     Runs all strategies and synthesizes momentum, direction, entry/exit criteria,
     level retest detection with candle highs/lows, and multi-timeframe EMA alignment.
 
-    interval: '1wk' (weekly), '1d' (daily), '1h' (hourly), '30m', '15m', '5m'
+    interval: '1mo' (monthly), '1wk' (weekly), '1d' (daily), '1h' (hourly), '30m', '15m', '5m'
     """
-    cache_key = f"trade_setup_v8_{ticker.upper()}_{interval}"
+    cache_key = f"trade_setup_v16_{ticker.upper()}_{interval}"
     if not refresh:
-        cached = _get_cached(cache_key, "trade_setup")
+        cached = _get_cached(cache_key, f"trade_setup_{interval}")
         if cached is not None:
             return cached
     if refresh:
@@ -1552,36 +1785,52 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
     import pandas as pd
 
     ticker = ticker.upper()
-    valid_intervals = {"1wk", "1d", "1h", "30m", "15m", "5m"}
+    valid_intervals = {"1mo", "1wk", "1d", "1h", "30m", "15m", "5m"}
     if interval not in valid_intervals:
         interval = "1d"
 
     loop = asyncio.get_event_loop()
 
+    shared_daily = shared_frames.get("daily") if shared_frames else None
+    shared_hourly = shared_frames.get("hourly") if shared_frames else None
+
     # Load primary data based on interval
     if interval == "1d":
-        frames = await loop.run_in_executor(executor, bulk_load_dataframes, [ticker], 1600)
-        df = frames.get(ticker)
-    elif interval == "1wk":
-        frames = await loop.run_in_executor(executor, bulk_load_dataframes, [ticker], 4000)
-        daily_df = frames.get(ticker)
+        if shared_daily is not None:
+            df = shared_daily.tail(1600).copy()
+        else:
+            frames = await loop.run_in_executor(executor, bulk_load_dataframes, [ticker], 1600)
+            df = frames.get(ticker)
+    elif interval in ("1wk", "1mo"):
+        if shared_daily is not None:
+            daily_df = shared_daily
+        else:
+            frames = await loop.run_in_executor(executor, bulk_load_dataframes, [ticker], 4000)
+            daily_df = frames.get(ticker)
         if daily_df is None or len(daily_df) < 60:
             raise HTTPException(status_code=404, detail=f"Insufficient daily history for {ticker} to build weekly bars")
-        df = daily_df.resample("W-FRI").agg({
+        resample_rule = "W-FRI" if interval == "1wk" else "ME"
+        grouped = daily_df.resample(resample_rule)
+        df = grouped.agg({
             "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
         }).dropna(subset=["close"])
+        source_dates = grouped["close"].apply(lambda values: values.index[-1] if len(values) else pd.NaT)
+        df.index = pd.DatetimeIndex(source_dates.loc[df.index])
     elif interval == "1h":
-        rows = await loop.run_in_executor(executor, get_hourly_data, ticker, 500, None)
-        if not rows or len(rows) < 50:
-            raise HTTPException(status_code=404, detail=f"Insufficient hourly data for {ticker}")
-        df = pd.DataFrame(rows)
-        df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
-        df.set_index('datetime', inplace=True)
-        if 'ticker' in df.columns:
-            df = df.drop(columns=['ticker'])
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            if col in df.columns:
-                df[col] = df[col].astype(float)
+        if shared_hourly is not None:
+            df = shared_hourly.copy()
+        else:
+            rows = await loop.run_in_executor(executor, get_hourly_data, ticker, 500, None)
+            if not rows or len(rows) < 50:
+                raise HTTPException(status_code=404, detail=f"Insufficient hourly data for {ticker}")
+            df = pd.DataFrame(rows)
+            df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
+            df.set_index('datetime', inplace=True)
+            if 'ticker' in df.columns:
+                df = df.drop(columns=['ticker'])
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                if col in df.columns:
+                    df[col] = df[col].astype(float)
     else:
         # 5m, 15m, 30m — use SQL-based aggregation (same as scan endpoints)
         periods = 500 if interval == "5m" else 500
@@ -1592,24 +1841,36 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
         raise HTTPException(status_code=404, detail=f"Insufficient data for {ticker} ({interval})")
 
     # One step down from the selected interval, used to confirm or contradict it.
-    confirm_interval = {"1wk": "1d", "1d": "1h", "1h": "1d"}.get(interval, "1h")
+    confirm_interval = {"1mo": "1wk", "1wk": "1d", "1d": "1h", "1h": "1d"}.get(interval, "1h")
     df_confirm = None
     if confirm_interval == "1d":
-        confirm_frames = await loop.run_in_executor(executor, bulk_load_dataframes, [ticker], 400)
-        candidate = confirm_frames.get(ticker)
+        if shared_daily is not None:
+            candidate = shared_daily.tail(400).copy()
+        else:
+            confirm_frames = await loop.run_in_executor(executor, bulk_load_dataframes, [ticker], 400)
+            candidate = confirm_frames.get(ticker)
         if candidate is not None and len(candidate) >= 20:
             df_confirm = candidate
+    elif confirm_interval == "1wk":
+        candidate = daily_df.resample("W-FRI").agg({
+            "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
+        }).dropna(subset=["close"])
+        if len(candidate) >= 20:
+            df_confirm = candidate.tail(200).copy()
     else:
-        confirm_rows = await loop.run_in_executor(executor, get_hourly_data, ticker, 200, None)
-        if confirm_rows and len(confirm_rows) >= 20:
-            df_confirm = pd.DataFrame(confirm_rows)
-            df_confirm['datetime'] = pd.to_datetime(df_confirm['datetime'], utc=True)
-            df_confirm.set_index('datetime', inplace=True)
-            if 'ticker' in df_confirm.columns:
-                df_confirm = df_confirm.drop(columns=['ticker'])
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                if col in df_confirm.columns:
-                    df_confirm[col] = df_confirm[col].astype(float)
+        if shared_hourly is not None and len(shared_hourly) >= 20:
+            df_confirm = shared_hourly.tail(200).copy()
+        else:
+            confirm_rows = await loop.run_in_executor(executor, get_hourly_data, ticker, 200, None)
+            if confirm_rows and len(confirm_rows) >= 20:
+                df_confirm = pd.DataFrame(confirm_rows)
+                df_confirm['datetime'] = pd.to_datetime(df_confirm['datetime'], utc=True)
+                df_confirm.set_index('datetime', inplace=True)
+                if 'ticker' in df_confirm.columns:
+                    df_confirm = df_confirm.drop(columns=['ticker'])
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    if col in df_confirm.columns:
+                        df_confirm[col] = df_confirm[col].astype(float)
 
     last_close = float(df.iloc[-1]["close"])
     last_date = df.index[-1].strftime("%Y-%m-%d") if hasattr(df.index[-1], "strftime") else str(df.index[-1])
@@ -1617,9 +1878,9 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
     # --- Run all strategies ---
     gaps = scan_gap_strategies(ticker, df) if len(df) >= 20 else []
     fvgs = scan_fair_value_gaps(ticker, df) if len(df) >= 20 else []
-    ma = scan_moving_average_crossover(ticker, df) if len(df) >= 26 else None
-    pullback = scan_momentum_pullback(ticker, df) if len(df) >= 210 else None
-    bounce = scan_bearish_bounce(ticker, df) if len(df) >= 210 else None
+    ma = scan_moving_average_crossover(ticker, df, interval=interval) if len(df) >= 26 else None
+    pullback = scan_momentum_pullback(ticker, df, interval=interval) if len(df) >= 210 else None
+    bounce = scan_bearish_bounce(ticker, df, interval=interval) if len(df) >= 210 else None
     fib_swing_pct = calculate_fibonacci_swing_pct(df, interval)
     fib = scan_fibonacci(ticker, df, min_swing_pct=fib_swing_pct) if len(df) >= 50 else None
 
@@ -1641,10 +1902,23 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
     ema8 = _ema(c, 8)
     ema21 = _ema(c, 21)
     ema50_arr = _ema(c, 50)
+    ema12 = _ema(c, 12)
+    ema26 = _ema(c, 26)
+    macd_arr = ema12 - ema26
+    macd_signal_arr = _ema(macd_arr, 9)
+    macd_hist_arr = macd_arr - macd_signal_arr
 
     ema8_val = round(float(ema8[-1]), 2)
     ema21_val = round(float(ema21[-1]), 2)
     ema50_ema = round(float(ema50_arr[-1]), 2)
+    macd_value = round(float(macd_arr[-1]), 4)
+    macd_signal = round(float(macd_signal_arr[-1]), 4)
+    macd_histogram = round(float(macd_hist_arr[-1]), 4)
+    macd_histogram_previous = round(float(macd_hist_arr[-2]), 4)
+    if macd_value >= macd_signal:
+        macd_state = "BULLISH_RISING" if macd_histogram >= macd_histogram_previous else "BULLISH_FADING"
+    else:
+        macd_state = "BEARISH_FALLING" if macd_histogram <= macd_histogram_previous else "BEARISH_IMPROVING"
 
     # EMA alignment check (8 > 21 > 50 = fully bullish stacked)
     ema_bullish_stack = ema8[-1] > ema21[-1] > ema50_arr[-1]
@@ -1707,6 +1981,223 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
 
     # ATR%
     atr_pct = round(atr14 / last_close * 100, 2)
+
+    # Trend metrics exclude the newest bar because it may still be forming.
+    completed_volume = v[:-1] if len(v) > 1 else np.array([], dtype=float)
+    completed_high = h[:-1]
+    completed_low = l[:-1]
+    completed_close = c[:-1]
+
+    # Directional movement and realized volatility use completed bars so a
+    # forming hourly, daily, or weekly candle cannot distort the comparison.
+    plus_di_value = None
+    minus_di_value = None
+    adx_value = None
+    if len(completed_close) >= 15:
+        up_move = np.diff(completed_high)
+        down_move = -np.diff(completed_low)
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        directional_tr = np.maximum(
+            completed_high[1:] - completed_low[1:],
+            np.maximum(
+                np.abs(completed_high[1:] - completed_close[:-1]),
+                np.abs(completed_low[1:] - completed_close[:-1]),
+            ),
+        )
+        smoothed_tr = pd.Series(directional_tr).ewm(alpha=1 / 14, adjust=False).mean().to_numpy()
+        smoothed_plus_dm = pd.Series(plus_dm).ewm(alpha=1 / 14, adjust=False).mean().to_numpy()
+        smoothed_minus_dm = pd.Series(minus_dm).ewm(alpha=1 / 14, adjust=False).mean().to_numpy()
+        plus_di = np.divide(
+            100 * smoothed_plus_dm, smoothed_tr,
+            out=np.zeros_like(smoothed_plus_dm), where=smoothed_tr > 0,
+        )
+        minus_di = np.divide(
+            100 * smoothed_minus_dm, smoothed_tr,
+            out=np.zeros_like(smoothed_minus_dm), where=smoothed_tr > 0,
+        )
+        directional_sum = plus_di + minus_di
+        dx = np.divide(
+            100 * np.abs(plus_di - minus_di), directional_sum,
+            out=np.zeros_like(directional_sum), where=directional_sum > 0,
+        )
+        adx = pd.Series(dx).ewm(alpha=1 / 14, adjust=False).mean().to_numpy()
+        plus_di_value = round(float(plus_di[-1]), 1)
+        minus_di_value = round(float(minus_di[-1]), 1)
+        adx_value = round(float(adx[-1]), 1)
+
+    historical_volatility_pct = None
+    historical_volatility_percentile = None
+    historical_volatility_state = "UNAVAILABLE"
+    if len(completed_close) >= 21 and np.all(completed_close > 0):
+        periods_per_year = {
+            "1mo": 12,
+            "1wk": 52,
+            "1d": 252,
+            "1h": 252 * 6.5,
+            "30m": 252 * 13,
+            "15m": 252 * 26,
+            "5m": 252 * 78,
+        }.get(interval, 252)
+        log_returns = pd.Series(np.diff(np.log(completed_close)))
+        rolling_volatility = (
+            log_returns.rolling(20).std(ddof=1) * math.sqrt(periods_per_year) * 100
+        ).dropna()
+        if not rolling_volatility.empty:
+            volatility_history = rolling_volatility.tail(252)
+            current_volatility = float(volatility_history.iloc[-1])
+            volatility_percentile = float((volatility_history <= current_volatility).mean() * 100)
+            historical_volatility_pct = round(current_volatility, 1)
+            historical_volatility_percentile = round(volatility_percentile, 0)
+            if volatility_percentile >= 75:
+                historical_volatility_state = "ELEVATED"
+            elif volatility_percentile <= 25:
+                historical_volatility_state = "QUIET"
+            else:
+                historical_volatility_state = "NORMAL"
+
+    volume_20 = completed_volume[-20:]
+    volume_5 = completed_volume[-5:]
+    completed_volume_baseline = float(np.mean(volume_20)) if len(volume_20) > 0 else 0.0
+    prior_completed_baseline = (
+        float(np.mean(completed_volume[-21:-1]))
+        if len(completed_volume) >= 21 else
+        float(np.mean(completed_volume[:-1])) if len(completed_volume) > 1 else 0.0
+    )
+    relative_volume = (
+        round(float(completed_volume[-1]) / prior_completed_baseline, 2)
+        if len(completed_volume) > 0 and prior_completed_baseline > 0 else None
+    )
+    volume_trend_ratio = (
+        float(np.mean(volume_5)) / completed_volume_baseline
+        if len(volume_5) > 0 and completed_volume_baseline > 0 else None
+    )
+    volume_trend_pct = round((volume_trend_ratio - 1) * 100, 1) if volume_trend_ratio is not None else None
+    if volume_trend_pct is None:
+        volume_trend_state = "UNAVAILABLE"
+    elif volume_trend_pct >= 10:
+        volume_trend_state = "EXPANDING"
+    elif volume_trend_pct <= -10:
+        volume_trend_state = "CONTRACTING"
+    else:
+        volume_trend_state = "STABLE"
+
+    sparkline_volume = completed_volume[-8:]
+    volume_sparkline = [
+        round(float(value) / completed_volume_baseline, 2)
+        for value in sparkline_volume
+    ] if completed_volume_baseline > 0 else []
+    if len(volume_sparkline) >= 2:
+        x_values = np.arange(len(volume_sparkline), dtype=float)
+        volume_slope = round(float(np.polyfit(x_values, volume_sparkline, 1)[0]), 3)
+    else:
+        volume_slope = None
+    if volume_slope is None:
+        volume_slope_state = "UNAVAILABLE"
+    elif volume_slope >= 0.02:
+        volume_slope_state = "RISING"
+    elif volume_slope <= -0.02:
+        volume_slope_state = "FALLING"
+    else:
+        volume_slope_state = "FLAT"
+
+    cmf_window = min(20, len(completed_volume))
+    if cmf_window > 0 and float(np.sum(completed_volume[-cmf_window:])) > 0:
+        window_high = completed_high[-cmf_window:]
+        window_low = completed_low[-cmf_window:]
+        window_close = completed_close[-cmf_window:]
+        window_volume = completed_volume[-cmf_window:]
+        window_range = window_high - window_low
+        multiplier = np.divide(
+            ((window_close - window_low) - (window_high - window_close)),
+            window_range,
+            out=np.zeros_like(window_close, dtype=float),
+            where=window_range > 0,
+        )
+        cmf_20 = round(float(np.sum(multiplier * window_volume) / np.sum(window_volume)), 3)
+    else:
+        cmf_20 = None
+    if cmf_20 is None:
+        volume_pressure = "UNAVAILABLE"
+    elif cmf_20 > 0.1:
+        volume_pressure = "ACCUMULATION"
+    elif cmf_20 < -0.1:
+        volume_pressure = "DISTRIBUTION"
+    else:
+        volume_pressure = "BALANCED"
+    range_window = min(252, len(c))
+    range_low = float(np.min(l[-range_window:]))
+    range_high = float(np.max(h[-range_window:]))
+    range_position_pct = round(
+        (last_close - range_low) / (range_high - range_low) * 100, 1
+    ) if range_high > range_low else 50.0
+
+    # Use the prior bar so candlestick evidence never depends on a forming candle.
+    candle_patterns = []
+    completed_index = len(df) - 2
+    if completed_index >= 1:
+        previous_bar = df.iloc[completed_index - 1]
+        completed_bar = df.iloc[completed_index]
+        candle_open = float(completed_bar["open"])
+        candle_high = float(completed_bar["high"])
+        candle_low = float(completed_bar["low"])
+        candle_close = float(completed_bar["close"])
+        previous_open = float(previous_bar["open"])
+        previous_close = float(previous_bar["close"])
+        candle_range = max(candle_high - candle_low, 1e-9)
+        candle_body = abs(candle_close - candle_open)
+        upper_wick = candle_high - max(candle_open, candle_close)
+        lower_wick = min(candle_open, candle_close) - candle_low
+
+        def _record_pattern(name: str, direction: str):
+            pattern_time = df.index[completed_index]
+            candle_patterns.append({
+                "name": name,
+                "direction": direction,
+                "bar_time": pattern_time.isoformat() if hasattr(pattern_time, "isoformat") else str(pattern_time),
+                "open": round(candle_open, 2),
+                "high": round(candle_high, 2),
+                "low": round(candle_low, 2),
+                "close": round(candle_close, 2),
+            })
+
+        bullish_engulfing = (
+            previous_close < previous_open and candle_close > candle_open
+            and candle_open <= previous_close and candle_close >= previous_open
+        )
+        bearish_engulfing = (
+            previous_close > previous_open and candle_close < candle_open
+            and candle_open >= previous_close and candle_close <= previous_open
+        )
+        if bullish_engulfing:
+            _record_pattern("Bullish engulfing", "BULLISH")
+        if bearish_engulfing:
+            _record_pattern("Bearish engulfing", "BEARISH")
+        if lower_wick >= max(candle_body * 2, candle_range * 0.45) and upper_wick <= candle_range * 0.2:
+            _record_pattern("Hammer", "BULLISH")
+        if upper_wick >= max(candle_body * 2, candle_range * 0.45) and lower_wick <= candle_range * 0.2:
+            _record_pattern("Shooting star", "BEARISH")
+        if candle_body <= candle_range * 0.1:
+            _record_pattern("Doji", "NEUTRAL")
+        if completed_index >= 2:
+            first_bar = df.iloc[completed_index - 2]
+            first_open = float(first_bar["open"])
+            first_close = float(first_bar["close"])
+            first_body = abs(first_close - first_open)
+            middle_body = abs(previous_close - previous_open)
+            first_midpoint = (first_open + first_close) / 2
+            morning_star = (
+                first_close < first_open and middle_body <= first_body * 0.5
+                and candle_close > candle_open and candle_close >= first_midpoint
+            )
+            evening_star = (
+                first_close > first_open and middle_body <= first_body * 0.5
+                and candle_close < candle_open and candle_close <= first_midpoint
+            )
+            if morning_star:
+                _record_pattern("Morning star", "BULLISH")
+            if evening_star:
+                _record_pattern("Evening star", "BEARISH")
 
     # --- Golden Cross / Death Cross Detection ---
     golden_cross = None
@@ -1894,14 +2385,15 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
         elif ma["signal"] in ("Bearish Crossover", "Recent Bearish", "Below MA"):
             bear_signals += 2 if "Crossover" in ma["signal"] else 1
             signal_reasons.append(f'MA: {ma["signal"]} ({ma.get("days_since_cross", "?")}d ago)')
-        # Weekly alignment bonus — redundant when the primary series is already weekly.
-        if interval != "1wk":
-            if ma.get("weekly_signal") in ("W-Above", "W-Bullish Cross"):
+        # Higher-timeframe alignment bonus: weekly for daily setups, daily for hourly.
+        higher_timeframe_signal = ma.get("weekly_signal")
+        if interval not in ("1wk", "1mo"):
+            if higher_timeframe_signal in ("W-Above", "W-Bullish Cross", "D-Above", "D-Bullish Cross"):
                 bull_signals += 1
-                signal_reasons.append(f'Weekly: {ma["weekly_signal"]}')
-            elif ma.get("weekly_signal") in ("W-Below", "W-Bearish Cross"):
+                signal_reasons.append(f'Higher timeframe: {higher_timeframe_signal}')
+            elif higher_timeframe_signal in ("W-Below", "W-Bearish Cross", "D-Below", "D-Bearish Cross"):
                 bear_signals += 1
-                signal_reasons.append(f'Weekly: {ma["weekly_signal"]}')
+                signal_reasons.append(f'Higher timeframe: {higher_timeframe_signal}')
 
     # EMA alignment signal
     if ema_bullish_stack:
@@ -2196,7 +2688,12 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
         prior_slice = slice(-(prior_bar_count + 1), -1)
         prior_high = float(np.max(h[prior_slice]))
         prior_low = float(np.min(l[prior_slice]))
-        range_label = "52-Week" if interval == "1d" else f"{prior_bar_count}-Week" if interval == "1wk" else f"{prior_bar_count}-Bar"
+        range_label = (
+            "52-Week" if interval == "1d" else
+            f"{prior_bar_count}-Month" if interval == "1mo" else
+            f"{prior_bar_count}-Week" if interval == "1wk" else
+            f"{prior_bar_count}-Bar"
+        )
         if prior_high > last_close:
             targets.append({"level": f"Prior {range_label} High", "price": round(prior_high, 2), "source": "Price Action"})
         if prior_low < last_close:
@@ -2328,7 +2825,31 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
             "dist_to_8ema": dist_to_8ema,
             "dist_to_21ema": dist_to_21ema,
             "trend_consistency": trend_consistency,
+            "macd": macd_value,
+            "macd_signal": macd_signal,
+            "macd_histogram": macd_histogram,
+            "macd_histogram_previous": macd_histogram_previous,
+            "macd_state": macd_state,
+            "adx": adx_value,
+            "plus_di": plus_di_value,
+            "minus_di": minus_di_value,
+            "historical_volatility_pct": historical_volatility_pct,
+            "historical_volatility_percentile": historical_volatility_percentile,
+            "historical_volatility_state": historical_volatility_state,
+            "relative_volume": relative_volume,
+            "volume_trend_ratio": round(volume_trend_ratio, 2) if volume_trend_ratio is not None else None,
+            "volume_trend_pct": volume_trend_pct,
+            "volume_trend_state": volume_trend_state,
+            "volume_slope": volume_slope,
+            "volume_slope_state": volume_slope_state,
+            "volume_sparkline": volume_sparkline,
+            "cmf_20": cmf_20,
+            "volume_pressure": volume_pressure,
+            "range_low": round(range_low, 2),
+            "range_high": round(range_high, 2),
+            "range_position_pct": range_position_pct,
         },
+        "candlestick_patterns": candle_patterns,
         "ema_alignment": {
             "primary": ema_alignment,
             "primary_detail": ema_alignment_detail,
@@ -2386,6 +2907,7 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                 "trend_direction": fib.get("trend_direction"),
                 "swing_basis": fib.get("swing_basis"),
                 "swing_detection_pct": fib.get("swing_detection_pct"),
+                "scope_bars": fib.get("scope_bars"),
                 "swing_high": fib.get("swing_high"),
                 "swing_low": fib.get("swing_low"),
                 "swing_high_date": fib.get("swing_high_date"),
@@ -2398,6 +2920,12 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
                 "nearest_level_price": fib.get("nearest_level_price"),
                 "distance_pct": fib.get("distance_pct"),
                 "retracement_pct": fib.get("retracement_pct"),
+                "progress_reached_pct": fib.get("progress_reached_pct"),
+                "progress_current_pct": fib.get("progress_current_pct"),
+                "target_kind": fib.get("target_kind"),
+                "retracement_levels": fib.get("retracement_levels", []),
+                "extension_levels": fib.get("extension_levels", []),
+                "target_levels": fib.get("target_levels", []),
                 "levels": [
                     {"name": "23.6%", "price": fib.get("fib_236")},
                     {"name": "38.2%", "price": fib.get("fib_382")},
@@ -2408,6 +2936,8 @@ async def get_trade_setup(ticker: str, interval: str = "1d", refresh: bool = Fal
             } if fib else None,
         }
     }
+    # Survives caching, so the UI can show how old this read actually is.
+    result["computed_at"] = datetime.now(timezone.utc).isoformat()
     _set_cached(cache_key, result)
     return result
 
@@ -3111,13 +3641,21 @@ async def sector_intelligence_endpoint(leader_limit: int = Query(default=5, ge=1
 
 @app.get("/api/stock/{ticker}/scanner-events")
 async def ticker_scanner_events(
-    ticker: str, limit: int = Query(default=50, ge=1, le=252)
+    ticker: str,
+    limit: int = Query(default=100, ge=1, le=252),
+    daily_sessions: int = Query(default=21, ge=1, le=252),
+    hourly_sessions: int = Query(default=5, ge=1, le=30),
 ):
-    """Scanner setup lifecycles and outcomes for one ticker."""
+    """Scanner lifecycles from recent daily/weekly and hourly session windows."""
     try:
         from research.scanner_events import ensure_tables, ticker_events
         ensure_tables()
-        return {"ticker": ticker.upper(), "events": ticker_events(ticker, limit)}
+        return {
+            "ticker": ticker.upper(),
+            "daily_sessions": daily_sessions,
+            "hourly_sessions": hourly_sessions,
+            "events": ticker_events(ticker, limit, daily_sessions, hourly_sessions),
+        }
     except Exception:
         logger.exception("Ticker scanner event query failed | ticker=%s", ticker)
         raise HTTPException(status_code=500, detail="Failed to load ticker scanner events")
