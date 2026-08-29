@@ -47,6 +47,9 @@ stock-screener-portal/
    ├── SCANNER_EVENT_EVALUATION.md # Shadow scanner lifecycle and outcome evaluation
    ├── SCHEDULER_EXECUTION.md  # Exact runtime flow: market-hours loop, EOD, scanner lanes
    ├── EXTENDED_HOURS_RESEARCH_DESIGN.md # Separate premarket/after-hours research pipeline
+   ├── OPTION_CHAIN_SCANNER_IMPLEMENTATION_GUIDE.md # Start here: phased options build order
+   ├── OPTION_CHAIN_SCANNER_DESIGN.md # Normative detailed options specification
+   ├── OPTION_PLATFORM_CAPACITY_DECISION_2026-08-29.md # Measured host/database capacity record
    └── MODEL_REGISTRY.md       # Model/scanner version registry & script run cadence
 ```
 

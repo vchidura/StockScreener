@@ -444,6 +444,7 @@ def get_tickers_overview(tickers: list[str], end_date: str = None) -> list[dict]
     """
 
     with get_db_cursor() as cursor:
+        cursor.execute("SET LOCAL work_mem = '64MB'")
         cursor.execute(query, (tickers, end_date, end_date))
         rows = cursor.fetchall()
 

@@ -41,7 +41,6 @@ def _load_observations(intervals: list[str]) -> pd.DataFrame:
             FROM scanner_events e
             JOIN scanner_event_outcomes o ON o.event_id = e.event_id
             WHERE e.interval = ANY(%s) AND o.entry_model = %s
-            ORDER BY e.interval, e.signal_time, e.scanner_name, e.ticker
         """, (intervals, OUTCOME_ENTRY_MODEL))
         chunks = []
         while True:
