@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useQuery, keepPreviousData } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
+import { X } from 'lucide-react'
 import {
   getScannerEventBacklog,
   getLatestScannerSignals,
@@ -185,13 +186,26 @@ export default function ScannerResults() {
             </div>
           </div>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <input
-              aria-label="Search latest scanner signals"
-              value={signalSearch}
-              onChange={event => setSignalSearch(event.target.value)}
-              placeholder="Ticker or scanner"
-              style={{ ...control, width: 150 }}
-            />
+            <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+              <input
+                aria-label="Search latest scanner signals"
+                value={signalSearch}
+                onChange={event => setSignalSearch(event.target.value)}
+                placeholder="Ticker or scanner"
+                style={{ ...control, width: 150, paddingRight: signalSearch ? 32 : 10 }}
+              />
+              {signalSearch && (
+                <button
+                  type="button"
+                  aria-label="Clear scanner search"
+                  title="Clear search"
+                  onClick={() => setSignalSearch('')}
+                  style={{ position: 'absolute', right: 3, width: 28, height: 28, display: 'grid', placeItems: 'center', border: 0, background: 'transparent', color: colors.muted, cursor: 'pointer', padding: 0 }}
+                >
+                  <X size={14} aria-hidden="true" />
+                </button>
+              )}
+            </div>
             <select aria-label="Signal interval" value={signalInterval} onChange={event => setSignalInterval(event.target.value as typeof signalInterval)} style={control}>
               <option value="all">Latest any interval</option><option value="1d">Latest daily</option><option value="1wk">Latest weekly</option><option value="1h">Latest hourly</option>
             </select>

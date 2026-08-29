@@ -424,6 +424,118 @@ export interface ChartDataPoint {
   volume: number
 }
 
+export interface FormingPatternLine {
+  role: 'resistance' | 'support' | 'neckline' | 'structure' | 'rim' | 'cup' | 'handle' | 'flagpole'
+  points: Array<{ time: number; price: number }>
+}
+
+export interface FormingChartPattern {
+  type: 'ASCENDING_TRIANGLE' | 'DESCENDING_TRIANGLE' | 'SYMMETRICAL_TRIANGLE'
+    | 'RISING_WEDGE' | 'FALLING_WEDGE' | 'BULL_PENNANT' | 'BEAR_PENNANT'
+    | 'BULL_FLAG' | 'BEAR_FLAG' | 'CUP_AND_HANDLE'
+    | 'HEAD_AND_SHOULDERS' | 'INVERSE_HEAD_AND_SHOULDERS' | 'TRIPLE_TOP' | 'TRIPLE_BOTTOM'
+  name: string
+  status: 'FORMING'
+  bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL'
+  grade: 'STRONG_GEOMETRY' | 'VALID_GEOMETRY'
+  start_time: number
+  end_time: number
+  formation_bars: number
+  upper_touches: number
+  lower_touches: number
+  contraction_pct: number | null
+  apex_bars_ahead: number | null
+  fit_error_atr: number | null
+  flagpole_atr: number | null
+  invalidation_price: number | null
+  readiness: 'AT_EDGE' | 'NEAR_EDGE' | 'FORMING'
+  boundary_role: 'resistance' | 'support'
+  boundary_price: number
+  edge_distance_atr: number
+  edge_distance_pct: number | null
+  lines: FormingPatternLine[]
+}
+
+export interface ChartPatternsResponse {
+  ticker: string
+  interval: string
+  status: 'FORMING_RESEARCH'
+  last_close: number | null
+  patterns: FormingChartPattern[]
+  computed_at: string
+}
+
+export interface PriceChannel {
+  type: 'RISING_CHANNEL' | 'FALLING_CHANNEL'
+  name: string
+  bias: 'BULLISH' | 'BEARISH'
+  grade: 'STRONG_GEOMETRY' | 'VALID_GEOMETRY'
+  position: 'NEAR_SUPPORT' | 'NEAR_RESISTANCE' | 'MID_CHANNEL'
+  start_time: number
+  end_time: number
+  formation_bars: number
+  upper_touches: number
+  lower_touches: number
+  support_price: number
+  resistance_price: number
+  support_distance_atr: number
+  resistance_distance_atr: number
+  support_distance_pct: number | null
+  resistance_distance_pct: number | null
+  width_atr: number
+  slope_atr_per_bar: number
+  fit_error_atr: number
+  lines: Array<{
+    role: 'resistance' | 'support'
+    points: Array<{ time: number; price: number }>
+  }>
+}
+
+export interface PriceChannelResponse {
+  ticker: string
+  interval: string
+  status: 'CHANNEL_RESEARCH'
+  last_close: number | null
+  channel: PriceChannel | null
+  computed_at: string
+}
+
+export interface PatternWatchRow {
+  ticker: string
+  sector: string | null
+  interval: string
+  last_close: number | null
+  pattern: FormingChartPattern
+  channel: PriceChannel | null
+}
+
+export interface CrossFramePatternGroup {
+  interval: '5m' | '15m' | '30m' | '1h' | '1d' | '1wk'
+  tier: 'CONTEXT' | 'SETUP' | 'TRIGGER'
+  bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' | 'MIXED'
+  primary_pattern_type: FormingChartPattern['type']
+  primary_pattern_name: string
+  readiness: FormingChartPattern['readiness']
+  pattern_types: FormingChartPattern['type'][]
+  pattern_count: number
+}
+
+export interface CrossFramePatternSummary {
+  state: 'ALIGNED_BULLISH' | 'ALIGNED_BEARISH' | 'COUNTERTREND' | 'MIXED' | 'NEUTRAL' | 'SINGLE_FRAME'
+  dominant_bias: 'BULLISH' | 'BEARISH' | null
+  directional_frames: number
+  frames: CrossFramePatternGroup[]
+}
+
+export interface PatternWatchResponse {
+  interval: string
+  scanned: number
+  matched_tickers: number
+  results: PatternWatchRow[]
+  cross_frame: CrossFramePatternSummary | null
+  computed_at: string
+}
+
 export interface LatestQuote {
   ticker: string
   price: number
@@ -654,6 +766,48 @@ export const getChartData = async (
   return response.data
 }
 
+export const getChartPatterns = async (
+  ticker: string,
+  interval = '1d',
+  refresh = false,
+): Promise<ChartPatternsResponse> => {
+  const params: Record<string, string | boolean> = { interval }
+  if (refresh) params.refresh = true
+  const response = await api.get(`/stock/${ticker}/chart-patterns`, { params })
+  return response.data
+}
+
+export const getPriceChannel = async (
+  ticker: string,
+  interval = '1d',
+  refresh = false,
+): Promise<PriceChannelResponse> => {
+  const params: Record<string, string | boolean> = { interval }
+  if (refresh) params.refresh = true
+  const response = await api.get(`/stock/${ticker}/price-channel`, { params })
+  return response.data
+}
+
+export const scanChartPatterns = async (
+  interval = '1d',
+  refresh = false,
+): Promise<PatternWatchResponse> => {
+  const params: Record<string, string | boolean> = { interval }
+  if (refresh) params.refresh = true
+  const response = await api.get('/chart-patterns/scan', { params })
+  return response.data
+}
+
+export const scanTickerChartPatterns = async (
+  ticker: string,
+  refresh = false,
+): Promise<PatternWatchResponse> => {
+  const response = await api.get(`/chart-patterns/ticker/${ticker}`, {
+    params: refresh ? { refresh: true } : undefined,
+  })
+  return response.data
+}
+
 export const getLatestQuote = async (ticker: string, refresh = false): Promise<LatestQuote> => {
   const params: Record<string, boolean> = {}
   if (refresh) params.refresh = true
@@ -691,6 +845,28 @@ export interface TradeSetupZone {
   high: number
   source: string
   qualifier: string
+  pivot_time?: string
+  pivot_type?: 'high' | 'low'
+  volume_ratio?: number
+  bars_ago?: number
+  fibonacci_levels?: Array<{ name: string; price: number }>
+}
+
+export interface StructuralPattern {
+  type: 'HEAD_AND_SHOULDERS' | 'DOUBLE_TOP' | 'DOUBLE_BOTTOM'
+  name: string
+  direction: 'BULLISH' | 'BEARISH'
+  status: 'CONFIRMED'
+  confirmation_time: string
+  bars_ago: number
+  neckline: number
+  target: number
+  invalidation: number
+  pivots: Array<{
+    type: 'high' | 'low'
+    price: number
+    time: string
+  }>
 }
 
 export interface CandlestickConfirmation {
@@ -712,6 +888,7 @@ export interface ConfluenceReference {
   price: number
   source: string
   family: string
+  qualifier: string | null
 }
 
 export interface ConfluenceZone {
@@ -808,6 +985,7 @@ export interface TradeSetup {
   interval: string
   signals: string[]
   candlestick_patterns: CandlestickConfirmation[]
+  structural_patterns: StructuralPattern[]
   entries: TradeSetupEntry[]
   zones: TradeSetupZone[]
   targets: TradeSetupLevel[]

@@ -9,7 +9,7 @@ if str(BACKEND_DIR) not in sys.path:
 from main import _build_ticker_confluence_zones
 
 
-def setup(interval: str, close: float, ema21: float, fib: float, pattern=None):
+def setup(interval: str, close: float, ema21: float, fib: float, pattern=None, zones=None):
     return {
         "last_close": close,
         "technicals": {
@@ -24,7 +24,7 @@ def setup(interval: str, close: float, ema21: float, fib: float, pattern=None):
         },
         "targets": [],
         "stops": [],
-        "zones": [],
+        "zones": zones or [],
         "candlestick_patterns": [pattern] if pattern else [],
         "strategy_results": {
             "fibonacci": {
@@ -72,6 +72,30 @@ class TickerConfluenceTests(unittest.TestCase):
         nearby = [zone for zone in zones if 97.5 <= zone["midpoint"] <= 100.0]
 
         self.assertGreaterEqual(len(nearby), 2)
+
+    def test_preserves_volume_pivot_family_and_fibonacci_overlap_evidence(self):
+        volume_zone = {
+            "name": "Volume pivot demand",
+            "low": 99.9,
+            "high": 100.1,
+            "source": "Volume Pivot",
+            "qualifier": "Pivot volume 1.80x its prior 20-bar median (+80%); near Fib 61.8%",
+        }
+        setups = {
+            "1d": setup("1d", 101.0, 95.0, 100.0, zones=[volume_zone]),
+        }
+
+        zones = _build_ticker_confluence_zones(setups)
+        zone = min(zones, key=lambda item: abs(item["midpoint"] - 100.0))
+        volume_reference = next(
+            reference for reference in zone["references"]
+            if reference["family"] == "volume_pivot"
+        )
+
+        self.assertIn("fibonacci", zone["families"])
+        self.assertIn("volume_pivot", zone["families"])
+        self.assertEqual(zone["strength"], "CONFLUENCE")
+        self.assertEqual(volume_reference["qualifier"], volume_zone["qualifier"])
 
 
 if __name__ == "__main__":

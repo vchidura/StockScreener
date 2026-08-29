@@ -497,6 +497,10 @@ documentation. The automatic database restore runs only when the
 | `GET /api/latest-price-date` | Latest trading date in the DB |
 | `GET /api/stock/{ticker}/prices` | Raw price rows |
 | `GET /api/stock/{ticker}/chart` | Candlestick chart data |
+| `GET /api/stock/{ticker}/chart-patterns` | On-demand forming chart geometry for one selected interval |
+| `GET /api/stock/{ticker}/price-channel` | Primary active directional channel for one selected interval |
+| `GET /api/chart-patterns/scan` | Bulk forming-pattern discovery across the active ticker universe |
+| `GET /api/chart-patterns/ticker/{ticker}` | Forming-pattern comparison across all chart intervals for one ticker |
 | `GET /api/stock/{ticker}/trade-setup` | Suggested trade setup |
 | `GET /api/stock/{ticker}/trade-setup/multi` | Synchronized `1h`, `1d`, `1wk`, and monthly-context setups with cross-timeframe confluence |
 | `GET /api/stock/{ticker}/scanner-events` | Recent scanner lifecycles bounded by stored trading sessions |
@@ -517,6 +521,75 @@ displayed as structural context only; it does not alter the active trade plan or
 scanner pipeline. Direction strength is completed-bar ADX(14) with `+DI`/`-DI`.
 HV20 is annualized 20-bar realized volatility, ranked against up to 252 rolling
 windows for that interval.
+
+The ticker Levels view also detects active double tops, double bottoms, and
+head-and-shoulders patterns from completed five-bar pivots. A pattern is shown
+only after a completed close breaks its neckline and is retired after reaching
+its measured target or invalidation. Volume-supported pivot zones require pivot
+volume of at least 1.25 times the prior 20-bar median and are highlighted when
+they overlap Fibonacci levels. These zones are liquidity proxies from OHLCV
+data, not proof of institutional participation.
+
+The chart's automatic-pattern overlay is off by default and queried only when
+enabled. It measures up to three current forming candidates for the selected
+chart interval: ascending, descending, and symmetrical triangles; rising and
+falling wedges; bull and bear pennants; bull and bear flags; cup and handle;
+standard or inverse head and shoulders; and triple tops or bottoms. These dashed
+guides are chart-only research and do not alter
+scanner events, directional bias, confluence, or the trade plan. Changing the
+chart interval replaces the geometry; toggling it off hides the guides, while
+the eraser also clears the cached candidate selection.
+
+Pattern discovery and ticker detail share the same input contract: up to 301
+rows are loaded, the newest row is conservatively excluded, and at most 300
+completed bars are analyzed. Weekly bars are Friday-anchored in both paths.
+This keeps a Pattern Watch result reproducible when opened on its ticker chart.
+
+The **Pattern Watch** page is the discovery surface for these unconfirmed
+formations. It scans one selected interval in bulk, supports pattern, sector,
+ticker, and same-interval price-channel context filters, and opens the chosen
+candidate directly on its ticker chart with the correct interval and overlays
+enabled. Its **Price channel** column reports a channel only when the same
+ticker and interval also pass the conservative channel detector. It labels that
+channel as aligned, opposing, or neutral context relative to the pattern and
+shows whether price is near channel support, near resistance, or mid-channel.
+Channel context does not increase pattern readiness or geometry quality. Pattern
+Watch is separate from Scanner Results because forming geometry has not produced
+a confirmed breakout event or completed outcome evidence.
+
+Selecting **All intervals** changes the search to exact-ticker mode. After an
+active symbol is entered, Pattern Watch measures only that ticker from 5-minute
+through weekly intervals and lists each timeframe separately. This avoids
+rescanning the entire universe six times just to compare one ticker.
+
+Cross-frame interpretation counts at most one directional vote per interval;
+several pattern labels on one frame are primary/alternative interpretations,
+not separate confirmation. A neutral best candidate does not contribute a
+directional vote. The summary is **Aligned bullish/bearish** when at least two
+directional frames agree, **Countertrend** only when lower tiers oppose a clean
+higher-tier direction, **Mixed** for same-tier or within-frame conflicts,
+**Single frame** when only one directional frame is active, and **Neutral**
+when no best candidate is directional. These labels are descriptive and carry
+no confidence score or scanner authority.
+
+On a ticker chart, the automatic-pattern menu groups candidates by interval and
+marks one primary interpretation per frame; other labels are alternatives.
+Choosing a candidate from another interval switches the chart and its default
+visible period before drawing that candidate. **Best** and **Show all** remain
+scoped to the currently displayed interval, and geometry from different
+intervals is never drawn on the chart at the same time.
+
+The chart also has an independent price-channel overlay for `5m` through weekly
+intervals. It draws at most one active rising or falling channel on the selected
+interval; Pattern and Channel can be viewed separately or together. A channel
+requires at least five alternating confirmed pivots with two touches on each
+side, 20–160 completed bars, ATR-normalized parallel slopes and fit, stable
+width, and no decisive completed close outside either boundary after its latest
+anchor. A rejected fit is shown as no reliable directional channel rather than
+forcing lines onto the chart. The summary reports whether price is near support,
+near resistance, or mid-channel and names the completed-close boundary that
+would break the channel. Channel geometry is descriptive chart context only and
+does not alter pattern grouping, scanner evidence, confluence, or trade plans.
 
 ## Tech Stack
 

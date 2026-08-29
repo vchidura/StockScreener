@@ -941,18 +941,22 @@ def _aggregate_from_5m(
     with get_db_cursor() as cursor:
         cursor.execute(
             """
-            WITH base AS (
-                SELECT ticker, datetime, open_price, high, low, close_price, volume,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY ticker ORDER BY datetime DESC
-                       ) AS rn
-                FROM stock_prices_intraday
-                WHERE ticker = ANY(%(tickers)s)
-                  AND interval = '5m'
-                  AND datetime <= COALESCE(%(end_dt)s, NOW())
+            WITH requested AS (
+                SELECT UNNEST(%(tickers)s::text[]) AS ticker
             ),
             filtered AS (
-                SELECT * FROM base WHERE rn <= %(raw_limit)s
+                SELECT bars.*
+                FROM requested
+                CROSS JOIN LATERAL (
+                    SELECT p.ticker, p.datetime, p.open_price, p.high, p.low,
+                           p.close_price, p.volume
+                    FROM stock_prices_intraday p
+                    WHERE p.ticker = requested.ticker
+                      AND p.interval = '5m'
+                      AND p.datetime <= COALESCE(%(end_dt)s, NOW())
+                    ORDER BY p.datetime DESC
+                    LIMIT %(raw_limit)s
+                ) bars
             ),
             bucketed AS (
                 SELECT ticker,

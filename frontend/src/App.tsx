@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Routes, Route, NavLink, Navigate, useNavigate } from 'react-router-dom'
+import { X } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import GapScreener from './pages/GapScreener'
 import MAScreener from './pages/MAScreener'
@@ -10,6 +11,7 @@ import TickerDetail from './pages/TickerDetail'
 import TickersOverview from './pages/TickersOverview'
 import SectorIntelligence from './pages/SectorIntelligence'
 import ScannerResults from './pages/ScannerResults'
+import PatternWatch from './pages/PatternWatch'
 import { getTickers } from './services/api'
 
 function TickerSearch() {
@@ -55,6 +57,12 @@ function TickerSearch() {
     setOpen(false)
   }
 
+  const clearSearch = () => {
+    setQuery('')
+    setOpen(false)
+    setHighlightIdx(-1)
+  }
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx(i => Math.min(i + 1, filtered.length - 1)) }
     else if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx(i => Math.max(i - 1, 0)) }
@@ -73,13 +81,14 @@ function TickerSearch() {
     <div ref={wrapperRef} style={{ position: 'relative' }}>
       <input
         type="text"
+        aria-label="Search ticker"
         value={query}
         onChange={e => setQuery(e.target.value)}
         onFocus={() => query.trim() && filtered.length > 0 && setOpen(true)}
         onKeyDown={handleKeyDown}
         placeholder="Search ticker..."
         style={{
-          padding: '0.5rem 1rem',
+          padding: query ? '0.5rem 2.5rem 0.5rem 1rem' : '0.5rem 1rem',
           fontSize: '1.05rem',
           border: '1px solid #d1d5db',
           borderRadius: '0.375rem',
@@ -87,6 +96,17 @@ function TickerSearch() {
           outline: 'none',
         }}
       />
+      {query && (
+        <button
+          type="button"
+          aria-label="Clear ticker search"
+          title="Clear search"
+          onClick={clearSearch}
+          style={{ position: 'absolute', top: '50%', right: 4, transform: 'translateY(-50%)', width: 30, height: 30, display: 'grid', placeItems: 'center', border: 0, background: 'transparent', color: '#64748b', cursor: 'pointer', padding: 0 }}
+        >
+          <X size={15} aria-hidden="true" />
+        </button>
+      )}
       {open && filtered.length > 0 && (
         <ul style={{
           position: 'absolute', top: '100%', left: 0, right: 0,
@@ -162,6 +182,11 @@ function App() {
             </NavLink>
           </li>
           <li>
+            <NavLink to="/pattern-watch" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+              Pattern Watch
+            </NavLink>
+          </li>
+          <li>
             <NavLink to="/scanner-results" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
               Scanner Results
             </NavLink>
@@ -179,6 +204,7 @@ function App() {
           <Route path="/fibonacci" element={<FibonacciScreener />} />
           <Route path="/overview" element={<TickersOverview />} />
           <Route path="/sector-intelligence" element={<SectorIntelligence />} />
+          <Route path="/pattern-watch" element={<PatternWatch />} />
           <Route path="/scanner-results" element={<ScannerResults />} />
           <Route path="/scanner-evaluation" element={<Navigate to="/scanner-results" replace />} />
           <Route path="/backtest" element={<Navigate to="/scanner-results" replace />} />

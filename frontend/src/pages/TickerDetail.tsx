@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef, useCallback, CSSProperties, Fragment } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useState, useEffect, useRef, useCallback, useMemo, CSSProperties, Fragment } from 'react'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { Eraser, ScanLine, TrendingUp } from 'lucide-react'
 import {
   createChart,
   IChartApi,
@@ -13,13 +14,20 @@ import {
   CandlestickSeries,
   HistogramSeries,
   LineSeries,
+  LineType,
   TickMarkType,
 } from 'lightweight-charts'
 import { 
-  getChartData, 
+  getChartData,
+  getChartPatterns,
+  getPriceChannel,
+  scanTickerChartPatterns,
   getLatestQuote, 
   getMultiTradeSetup,
-  ChartDataPoint, 
+  ChartDataPoint,
+  FormingChartPattern,
+  PriceChannel,
+  CrossFramePatternSummary,
   LatestQuote, 
   TradeSetup, 
   MultiTradeSetupResponse,
@@ -30,6 +38,7 @@ import {
   ScannerEventRow,
   ScannerInterval,
 } from '../services/api'
+import { formingPatternRead } from '../utils/formingPatterns'
 
 const MARKET_TIME_ZONE = 'America/New_York'
 const SESSION_BARS: Record<string, number> = {
@@ -277,6 +286,15 @@ const signedPct = (n: number | null | undefined, dp = 1) =>
 const plainPct = (n: number | null | undefined, dp = 1) =>
   n === null || n === undefined || !Number.isFinite(n) ? '—' : `${n.toFixed(dp)}%`
 
+const ordinal = (n: number) => {
+  const value = Math.round(n)
+  const remainder100 = value % 100
+  const suffix = remainder100 >= 11 && remainder100 <= 13
+    ? 'th'
+    : value % 10 === 1 ? 'st' : value % 10 === 2 ? 'nd' : value % 10 === 3 ? 'rd' : 'th'
+  return `${value}${suffix}`
+}
+
 function formatScannerEventTime(value: string, interval: ScannerInterval): string {
   return new Intl.DateTimeFormat(undefined, {
     timeZone: interval === '1h' ? MARKET_TIME_ZONE : 'UTC',
@@ -311,7 +329,79 @@ function gradeTone(grade: string | null | undefined): string {
 }
 
 const SETUP_INTERVALS = ['1wk', '1d', '1h'] as const
-const INTERVAL_NOUN: Record<string, string> = { '1wk': 'weekly', '1d': 'daily', '1h': 'hourly' }
+const CHART_INTERVALS = ['1m', '5m', '15m', '30m', '1h', '1d', '1wk'] as const
+const INTERVAL_NOUN: Record<string, string> = { '1mo': 'monthly', '1wk': 'weekly', '1d': 'daily', '1h': 'hourly' }
+const PATTERN_INTERVAL_LABEL: Record<string, string> = {
+  '1m': '1 minute', '5m': '5 minute', '15m': '15 minute',
+  '30m': '30 minute', '1h': 'Hourly', '1d': 'Daily', '1wk': 'Weekly',
+}
+const PATTERN_INTERVAL_ORDER = ['1wk', '1d', '1h', '30m', '15m', '5m'] as const
+
+const patternChoiceValue = (interval: string, type: string) => `frame|${interval}|${type}`
+
+const parsePatternChoice = (value: string) => {
+  const [prefix, interval, type] = value.split('|')
+  return prefix === 'frame' && interval && type ? { interval, type } : null
+}
+
+function crossFrameReading(summary: CrossFramePatternSummary | null | undefined) {
+  if (!summary) return null
+  if (summary.state === 'ALIGNED_BULLISH' || summary.state === 'ALIGNED_BEARISH') {
+    const bullish = summary.state === 'ALIGNED_BULLISH'
+    return {
+      label: bullish ? 'Aligned bullish' : 'Aligned bearish',
+      detail: `${summary.directional_frames} timeframes agree; highest active frame leads`,
+      tone: bullish ? POS : NEG,
+    }
+  }
+  if (summary.state === 'COUNTERTREND') {
+    const highest = summary.frames.find(frame => frame.bias === summary.dominant_bias)
+    const bias = summary.dominant_bias === 'BULLISH' ? 'bullish' : 'bearish'
+    return {
+      label: 'Countertrend',
+      detail: `${highest ? PATTERN_INTERVAL_LABEL[highest.interval] : 'Higher frame'} is ${bias}; lower frames oppose`,
+      tone: WARN,
+    }
+  }
+  if (summary.state === 'MIXED') {
+    return { label: 'Mixed', detail: 'Opposing frame biases; do not count as confirmation', tone: WARN }
+  }
+  if (summary.state === 'SINGLE_FRAME') {
+    return { label: 'Single frame', detail: 'No cross-frame confirmation yet', tone: INFO }
+  }
+  return { label: 'Neutral', detail: 'No directional agreement across frames', tone: MUTED }
+}
+
+function priceChannelReading(channel: PriceChannel) {
+  if (channel.position === 'NEAR_SUPPORT') {
+    return {
+      position: `Near support $${channel.support_price.toFixed(2)}`,
+      distance: channel.support_distance_pct,
+      watch: `Watch for support to hold; a completed close below $${channel.support_price.toFixed(2)} breaks the channel`,
+    }
+  }
+  if (channel.position === 'NEAR_RESISTANCE') {
+    return {
+      position: `Near resistance $${channel.resistance_price.toFixed(2)}`,
+      distance: channel.resistance_distance_pct,
+      watch: `Watch for rejection or a completed close above $${channel.resistance_price.toFixed(2)} to break the channel`,
+    }
+  }
+  return {
+    position: `Mid-channel · support $${channel.support_price.toFixed(2)} · resistance $${channel.resistance_price.toFixed(2)}`,
+    distance: null,
+    watch: 'No boundary decision yet; monitor the next approach to support or resistance',
+  }
+}
+
+const defaultPeriodForInterval = (interval: string) => {
+  if (interval === '5m') return '5d'
+  if (interval === '15m' || interval === '30m') return '1mo'
+  if (interval === '1h') return '3mo'
+  if (interval === '1m') return '1d'
+  if (interval === '1wk') return '2y'
+  return '1y'
+}
 
 /** Reward:risk below this is not worth taking, but the plan is still shown with a warning. */
 const MIN_EXECUTABLE_RR = 2
@@ -473,7 +563,51 @@ function VolatilityTrack({ value, percentile, state, atrPct }: {
         <div style={{ width: `${boundedPercentile}%`, height: '100%', background: tone }} />
       </div>
       <div style={{ color: MUTED, fontSize: '0.68rem' }}>
-        {percentile.toFixed(0)}th pct · ATR {plainPct(atrPct, 1)}
+        {ordinal(percentile)} percentile · ATR {plainPct(atrPct, 1)}
+      </div>
+    </div>
+  )
+}
+
+function StructureRead({ setup, currentPrice }: {
+  setup: TradeSetup
+  currentPrice: number | null
+}) {
+  const pattern = setup.structural_patterns[0] ?? null
+  const volumePivots = setup.zones.filter(zone => zone.source === 'Volume Pivot')
+  const fibonacciPivots = volumePivots.filter(zone => (zone.fibonacci_levels?.length ?? 0) > 0)
+  const referencePrice = currentPrice ?? setup.last_close
+  const necklineHolds = pattern
+    ? pattern.direction === 'BULLISH'
+      ? referencePrice >= pattern.neckline
+      : referencePrice <= pattern.neckline
+    : null
+  const tone = pattern?.direction === 'BULLISH' ? POS : pattern?.direction === 'BEARISH' ? NEG : MUTED
+  const title = pattern
+    ? `${pattern.name}: neckline ${money(pattern.neckline)}, target ${money(pattern.target)}, invalidation ${money(pattern.invalidation)}. ${pattern.bars_ago} bars since confirmation.`
+    : 'No active confirmed double-top, double-bottom, or head-and-shoulders pattern.'
+
+  return (
+    <div style={{ minWidth: 155 }} title={title}>
+      {pattern ? (
+        <>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.35rem' }}>
+            <strong style={{ color: tone }}>{pattern.name}</strong>
+            {setup.structural_patterns.length > 1 && (
+              <span style={{ color: MUTED, fontSize: '0.66rem' }}>+{setup.structural_patterns.length - 1}</span>
+            )}
+          </div>
+          <div style={{ color: necklineHolds ? tone : WARN, fontSize: '0.68rem', fontWeight: 600 }}>
+            Neckline {money(pattern.neckline)} · {necklineHolds ? 'holds' : 'weakened'}
+          </div>
+          <div style={{ color: MUTED, fontSize: '0.66rem' }}>Target {money(pattern.target)}</div>
+        </>
+      ) : (
+        <div style={{ color: MUTED, fontSize: '0.7rem' }}>No active pattern</div>
+      )}
+      <div style={{ color: fibonacciPivots.length > 0 ? INFO : MUTED, fontSize: '0.66rem', marginTop: '0.2rem' }}>
+        {volumePivots.length} volume pivot{volumePivots.length === 1 ? '' : 's'}
+        {fibonacciPivots.length > 0 ? ` · ${fibonacciPivots.length} near Fib` : ''}
       </div>
     </div>
   )
@@ -701,6 +835,10 @@ function evaluatePlan(
 function TickerDetail() {
   const { symbol } = useParams<{ symbol: string }>()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const requestedInterval = searchParams.get('interval')
+  const initialInterval = requestedInterval && (CHART_INTERVALS as readonly string[]).includes(requestedInterval)
+    ? requestedInterval : '1d'
   const chartContainerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
@@ -715,16 +853,24 @@ function TickerDetail() {
   const bbUpperSeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
   const bbLowerSeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
   const rsiSeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const patternSeriesRef = useRef<ISeriesApi<'Line'>[]>([])
+  const channelSeriesRef = useRef<ISeriesApi<'Line'>[]>([])
   const rsiPaneIndexRef = useRef<number | null>(null)
   const legendRef = useRef<HTMLDivElement>(null)
 
   const queryClient = useQueryClient()
-  const [period, setPeriod] = useState('1y')
-  const [interval, setInterval] = useState('1d')
-  const [setupInterval, setSetupInterval] = useState('1d')
+  const [period, setPeriod] = useState(() => defaultPeriodForInterval(initialInterval))
+  const [interval, setInterval] = useState(initialInterval)
+  const [setupInterval, setSetupInterval] = useState(() => (SETUP_INTERVALS as readonly string[]).includes(initialInterval) ? initialInterval : '1d')
   const [chartHeight, setChartHeight] = useState(450)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [showRsi, setShowRsi] = useState(false)
+  const [showAutoPatterns, setShowAutoPatterns] = useState(() => searchParams.get('patterns') === 'on')
+  const [showPriceChannel, setShowPriceChannel] = useState(() => searchParams.get('channel') === 'on' && initialInterval !== '1m')
+  const [patternSelection, setPatternSelection] = useState(() => {
+    const requestedPattern = searchParams.get('pattern')
+    return requestedPattern ? patternChoiceValue(initialInterval, requestedPattern) : 'best'
+  })
   const [tab, setTab] = useState<'timeframes' | 'levels' | 'fibonacci' | 'scanner'>('timeframes')
   const [expandedEvents, setExpandedEvents] = useState<Set<number>>(new Set())
 
@@ -732,6 +878,8 @@ function TickerDetail() {
   const prevIntervalRef = useRef(interval)
   const intervalRef = useRef(interval)
   const periodRef = useRef(period)
+  const patternScopeRef = useRef(`${symbol}-${interval}`)
+  const pendingPatternSelectionRef = useRef<{ scope: string; selection: string } | null>(null)
   const chartRequestPeriod = interval === '1h' ? '2y' : interval === '1wk' ? '5y' : period
 
   const { data: chartData = [], isFetching: loading } = useQuery<ChartDataPoint[]>({
@@ -741,6 +889,62 @@ function TickerDetail() {
     placeholderData: (prev) => prevIntervalRef.current === interval ? prev : undefined,
   })
   const visibleChartData = getVisibleChartData(chartData, period, interval)
+
+  const { data: chartPatterns = null, isFetching: patternLoading } = useQuery({
+    queryKey: ['chart-patterns', symbol, interval],
+    queryFn: () => getChartPatterns(symbol!, interval),
+    enabled: !!symbol && showAutoPatterns,
+    staleTime: interval in SESSION_BARS ? 60_000 : 300_000,
+  })
+  const { data: crossFramePatterns = null, isFetching: crossFrameLoading } = useQuery({
+    queryKey: ['chart-patterns', symbol, 'all'],
+    queryFn: () => scanTickerChartPatterns(symbol!),
+    enabled: !!symbol && showAutoPatterns,
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+  })
+  const { data: priceChannelResponse = null, isFetching: channelLoading } = useQuery({
+    queryKey: ['price-channel', symbol, interval],
+    queryFn: () => getPriceChannel(symbol!, interval),
+    enabled: !!symbol && showPriceChannel && interval !== '1m',
+    staleTime: interval in SESSION_BARS ? 60_000 : 300_000,
+  })
+  const priceChannel = priceChannelResponse?.channel ?? null
+  const availablePatterns = chartPatterns?.patterns ?? []
+  const displayedPatterns = useMemo(() => {
+    if (patternSelection === 'all') return availablePatterns
+    if (patternSelection === 'best') return availablePatterns.slice(0, 1)
+    const choice = parsePatternChoice(patternSelection)
+    const selected = choice?.interval === interval
+      ? availablePatterns.find(pattern => pattern.type === choice.type)
+      : undefined
+    return selected
+      ? [selected]
+      : availablePatterns.slice(0, 1)
+  }, [availablePatterns, interval, patternSelection])
+  const patternGroups = useMemo(() => {
+    const grouped = new Map<string, FormingChartPattern[]>()
+    for (const row of crossFramePatterns?.results ?? []) {
+      if (row.interval !== interval) {
+        grouped.set(row.interval, [...(grouped.get(row.interval) ?? []), row.pattern])
+      }
+    }
+    if (availablePatterns.length > 0) grouped.set(interval, availablePatterns)
+    const orderedIntervals = [interval, ...PATTERN_INTERVAL_ORDER.filter(value => value !== interval)]
+    return orderedIntervals
+      .filter(value => grouped.has(value))
+      .map(value => {
+        const patterns = grouped.get(value) ?? []
+        const frame = crossFramePatterns?.cross_frame?.frames.find(item => item.interval === value)
+        return {
+          interval: value,
+          patterns,
+          bias: frame?.bias,
+          primaryType: frame?.primary_pattern_type ?? patterns[0]?.type,
+        }
+      })
+  }, [availablePatterns, crossFramePatterns?.cross_frame?.frames, crossFramePatterns?.results, interval])
+  const crossFrameView = crossFrameReading(crossFramePatterns?.cross_frame)
 
   const { data: latestQuote = null } = useQuery({
     queryKey: ['latest-quote', symbol],
@@ -797,6 +1001,56 @@ function TickerDetail() {
   useEffect(() => {
     setExpandedEvents(new Set())
   }, [setupInterval])
+  useEffect(() => {
+    if (interval === '1m') setShowPriceChannel(false)
+  }, [interval])
+  useEffect(() => {
+    const scope = `${symbol}-${interval}`
+    if (scope !== patternScopeRef.current) {
+      patternScopeRef.current = scope
+      const pending = pendingPatternSelectionRef.current
+      setPatternSelection(pending?.scope === scope ? pending.selection : 'best')
+      pendingPatternSelectionRef.current = null
+    }
+  }, [symbol, interval])
+
+  const clearPatternSeries = useCallback(() => {
+    const chart = chartRef.current
+    if (chart) {
+      for (const series of patternSeriesRef.current) {
+        try {
+          chart.removeSeries(series)
+        } catch {
+          // The chart may already be disposed during route teardown.
+        }
+      }
+    }
+    patternSeriesRef.current = []
+  }, [])
+
+  const clearChannelSeries = useCallback(() => {
+    const chart = chartRef.current
+    if (chart) {
+      for (const series of channelSeriesRef.current) {
+        try {
+          chart.removeSeries(series)
+        } catch {
+          // The chart may already be disposed during route teardown.
+        }
+      }
+    }
+    channelSeriesRef.current = []
+  }, [])
+
+  const clearResearchOverlays = useCallback(() => {
+    clearPatternSeries()
+    clearChannelSeries()
+    setShowAutoPatterns(false)
+    setShowPriceChannel(false)
+    setPatternSelection('best')
+    queryClient.removeQueries({ queryKey: ['chart-patterns', symbol] })
+    queryClient.removeQueries({ queryKey: ['price-channel', symbol] })
+  }, [clearChannelSeries, clearPatternSeries, queryClient, symbol])
 
   const fitSelectedPeriod = useCallback(() => {
     if (!chartRef.current) return
@@ -817,25 +1071,64 @@ function TickerDetail() {
     const chartKey = ['chart', symbol, chartRequestPeriod, interval]
     const setupKey = ['trade-setup-multi', symbol]
     const quoteKey = ['latest-quote', symbol]
+    const patternKey = ['chart-patterns', symbol, interval]
+    const crossPatternKey = ['chart-patterns', symbol, 'all']
+    const channelKey = ['price-channel', symbol, interval]
     queryClient.setQueryData(chartKey, undefined)
     queryClient.setQueryData(setupKey, undefined)
     queryClient.setQueryData(quoteKey, undefined)
-    await Promise.all([
+    queryClient.removeQueries({ queryKey: patternKey, exact: true })
+    queryClient.removeQueries({ queryKey: crossPatternKey, exact: true })
+    queryClient.removeQueries({ queryKey: channelKey, exact: true })
+    const requests: Promise<unknown>[] = [
       queryClient.fetchQuery({ queryKey: chartKey, queryFn: () => getChartData(symbol!, chartRequestPeriod, interval, true) }),
       queryClient.fetchQuery({ queryKey: setupKey, queryFn: () => getMultiTradeSetup(symbol!, true) }),
       queryClient.fetchQuery({ queryKey: quoteKey, queryFn: () => getLatestQuote(symbol!, true) }),
-    ])
-  }, [symbol, chartRequestPeriod, interval, queryClient])
+    ]
+    await Promise.all(requests)
+    if (showAutoPatterns) {
+      await queryClient.fetchQuery({
+        queryKey: crossPatternKey,
+        queryFn: () => scanTickerChartPatterns(symbol!, true),
+      })
+      await queryClient.fetchQuery({
+        queryKey: patternKey,
+        queryFn: () => getChartPatterns(symbol!, interval),
+      })
+    }
+    if (showPriceChannel && interval !== '1m') {
+      await queryClient.fetchQuery({
+        queryKey: channelKey,
+        queryFn: () => getPriceChannel(symbol!, interval, true),
+      })
+    }
+  }, [symbol, chartRequestPeriod, interval, queryClient, showAutoPatterns, showPriceChannel])
 
-  const handleChartIntervalChange = useCallback((nextInterval: string) => {
+  const handleChartIntervalChange = useCallback((nextInterval: string, nextPattern?: string) => {
+    if (nextPattern) {
+      pendingPatternSelectionRef.current = {
+        scope: `${symbol}-${nextInterval}`,
+        selection: nextPattern,
+      }
+      setPatternSelection(nextPattern)
+    } else {
+      pendingPatternSelectionRef.current = null
+    }
     setInterval(nextInterval)
     if ((SETUP_INTERVALS as readonly string[]).includes(nextInterval)) {
       setSetupInterval(nextInterval)
     }
-    if (nextInterval in SESSION_BARS) setPeriod('1d')
-    else if (nextInterval === '1d') setPeriod('1y')
-    else if (nextInterval === '1wk') setPeriod('2y')
-  }, [])
+    setPeriod(defaultPeriodForInterval(nextInterval))
+  }, [symbol])
+
+  const handlePatternSelectionChange = useCallback((selection: string) => {
+    const choice = parsePatternChoice(selection)
+    if (choice && choice.interval !== interval) {
+      handleChartIntervalChange(choice.interval, selection)
+      return
+    }
+    setPatternSelection(selection)
+  }, [handleChartIntervalChange, interval])
 
   // Effect 1: Create chart once on mount
   useEffect(() => {
@@ -968,6 +1261,8 @@ function TickerDetail() {
 
     return () => {
       window.removeEventListener('resize', handleResize)
+      patternSeriesRef.current = []
+      channelSeriesRef.current = []
       if (chartRef.current) {
         chartRef.current.remove()
         chartRef.current = null
@@ -1050,6 +1345,68 @@ function TickerDetail() {
   }, [chartData, fitSelectedPeriod])
 
   useEffect(() => {
+    clearPatternSeries()
+    const chart = chartRef.current
+    if (!chart || !showAutoPatterns) return
+
+    const roleTone: Record<string, string> = {
+      resistance: NEG,
+      support: POS,
+      neckline: WARN,
+      structure: '#7c3aed',
+      rim: WARN,
+      cup: INFO,
+      handle: '#0f766e',
+      flagpole: MUTED,
+    }
+    displayedPatterns.forEach((pattern, patternIndex) => {
+      pattern.lines.forEach(line => {
+        const series = chart.addSeries(LineSeries, {
+          color: roleTone[line.role] ?? INFO,
+          lineWidth: patternIndex === 0 ? 2 : 1,
+          lineStyle: 2,
+          lineType: line.role === 'cup' ? LineType.Curved : LineType.Simple,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+          title: '',
+        })
+        series.setData(line.points.map(point => ({
+          time: point.time as Time,
+          value: point.price,
+        })))
+        patternSeriesRef.current.push(series)
+      })
+    })
+
+    return clearPatternSeries
+  }, [clearPatternSeries, displayedPatterns, showAutoPatterns])
+
+  useEffect(() => {
+    clearChannelSeries()
+    const chart = chartRef.current
+    if (!chart || !showPriceChannel || !priceChannel) return
+
+    priceChannel.lines.forEach(line => {
+      const series = chart.addSeries(LineSeries, {
+        color: line.role === 'support' ? POS : NEG,
+        lineWidth: 2,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+        title: '',
+      })
+      series.setData(line.points.map(point => ({
+        time: point.time as Time,
+        value: point.price,
+      })))
+      channelSeriesRef.current.push(series)
+    })
+
+    return clearChannelSeries
+  }, [clearChannelSeries, priceChannel, showPriceChannel])
+
+  useEffect(() => {
     const chart = chartRef.current
     if (!chart) return
     if (!showRsi) {
@@ -1094,6 +1451,14 @@ function TickerDetail() {
     ? evaluatePlan(plan, tradeSetup, displayPrice, discoveryState, discoveryStale)
     : null
   const scannerEvents = tickerScannerEvents.events
+  const structureTimeframes = ['1mo', '1wk', '1d', '1h'] as const
+  const selectedStructuralPatterns = (tradeSetup?.structural_patterns ?? []).slice(0, 2)
+    .map(pattern => ({ ...pattern, timeframe: setupInterval, selected: true }))
+  const contextualStructuralPatterns = structureTimeframes
+    .filter(timeframe => timeframe !== setupInterval)
+    .flatMap(timeframe => (setups[timeframe]?.structural_patterns ?? []).slice(0, 1)
+      .map(pattern => ({ ...pattern, timeframe, selected: false })))
+  const visibleStructuralPatterns = [...selectedStructuralPatterns, ...contextualStructuralPatterns]
   const bestStrategyGrade = (() => {
     const pullback = tradeSetup?.strategy_results.momentum_pullback
     const bounce = tradeSetup?.strategy_results.bearish_bounce
@@ -1120,6 +1485,16 @@ function TickerDetail() {
     add(activeZones[0])
     add(supports[0])
     add(resistances[0])
+    confluenceZones
+      .filter(zone => zone.families.includes('volume_pivot') && zone.families.includes('fibonacci'))
+      .sort((a, b) => {
+        const aSelected = a.references.some(reference => reference.interval === setupInterval && reference.family === 'volume_pivot')
+        const bSelected = b.references.some(reference => reference.interval === setupInterval && reference.family === 'volume_pivot')
+        if (aSelected !== bSelected) return aSelected ? -1 : 1
+        return Math.abs(a.distance_pct) - Math.abs(b.distance_pct)
+      })
+      .slice(0, 2)
+      .forEach(add)
 
     const preferredRole = techSide === 'LONG' ? 'RESISTANCE'
       : techSide === 'SHORT' ? 'SUPPORT' : null
@@ -1301,6 +1676,66 @@ function TickerDetail() {
           border: '1px solid #e2e8f0',
         }}>
           <button
+            onClick={() => setShowAutoPatterns(value => !value)}
+            title="Toggle automatic forming-pattern trendlines"
+            aria-label="Toggle automatic forming-pattern trendlines"
+            aria-pressed={showAutoPatterns}
+            style={{
+              width: 30,
+              height: 28,
+              border: 'none',
+              borderRadius: '4px',
+              background: showAutoPatterns ? INFO_SOFT : 'transparent',
+              color: showAutoPatterns ? INFO : MUTED,
+              cursor: 'pointer',
+              display: 'grid',
+              placeItems: 'center',
+            }}
+          >
+            <ScanLine size={17} strokeWidth={2} aria-hidden="true" />
+          </button>
+          <button
+            onClick={() => setShowPriceChannel(value => !value)}
+            disabled={interval === '1m'}
+            title={interval === '1m' ? 'Price channels are available from 5 minutes through weekly' : 'Toggle selected-interval price channel'}
+            aria-label="Toggle selected-interval price channel"
+            aria-pressed={showPriceChannel}
+            style={{
+              width: 30,
+              height: 28,
+              border: 'none',
+              borderRadius: '4px',
+              background: showPriceChannel ? INFO_SOFT : 'transparent',
+              color: showPriceChannel ? INFO : MUTED,
+              cursor: interval === '1m' ? 'default' : 'pointer',
+              opacity: interval === '1m' ? 0.35 : 1,
+              display: 'grid',
+              placeItems: 'center',
+            }}
+          >
+            <TrendingUp size={17} strokeWidth={2} aria-hidden="true" />
+          </button>
+          <button
+            onClick={clearResearchOverlays}
+            disabled={!showAutoPatterns && !showPriceChannel}
+            title="Erase pattern and channel overlays"
+            aria-label="Erase pattern and channel overlays"
+            style={{
+              width: 30,
+              height: 28,
+              border: 'none',
+              borderRadius: '4px',
+              background: 'transparent',
+              color: MUTED,
+              cursor: showAutoPatterns || showPriceChannel ? 'pointer' : 'default',
+              opacity: showAutoPatterns || showPriceChannel ? 1 : 0.35,
+              display: 'grid',
+              placeItems: 'center',
+            }}
+          >
+            <Eraser size={16} strokeWidth={2} aria-hidden="true" />
+          </button>
+          <button
             onClick={() => setShowRsi(value => !value)}
             title="Toggle RSI (14) pane"
             aria-pressed={showRsi}
@@ -1350,6 +1785,65 @@ function TickerDetail() {
             </button>
           ))}
         </div>
+        {showAutoPatterns && (
+          <div style={{
+            position: 'absolute',
+            top: 44,
+            right: 12,
+            zIndex: 21,
+            display: 'grid',
+            gap: '0.4rem',
+            padding: '0.3rem 0.4rem',
+            border: `1px solid ${LINE}`,
+            borderRadius: '5px',
+            background: 'rgba(255,255,255,0.94)',
+            boxShadow: '0 1px 4px rgba(0,0,0,0.1)',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+              <span style={{ color: MUTED, fontSize: '0.68rem', whiteSpace: 'nowrap' }}>
+                {patternLoading
+                  ? 'Measuring current frame…'
+                  : availablePatterns.length === 0
+                    ? `No pattern · ${interval}`
+                    : `${availablePatterns.length} possible · ${interval}`}
+              </span>
+              {patternGroups.length > 0 && (
+              <select
+                aria-label="Possible patterns across intervals"
+                title="Possible patterns across intervals; the current interval's primary pattern is shown by default"
+                value={patternSelection}
+                onChange={event => handlePatternSelectionChange(event.target.value)}
+                style={{ border: `1px solid ${LINE}`, borderRadius: 4, padding: '2px 4px', fontSize: '0.68rem', background: '#fff', maxWidth: 250 }}
+              >
+                <option value="best">Possible patterns</option>
+                {availablePatterns.length > 1 && <option value="all">Show all on {PATTERN_INTERVAL_LABEL[interval] ?? interval}</option>}
+                {patternGroups.map(group => (
+                  <optgroup
+                    key={group.interval}
+                    label={`${PATTERN_INTERVAL_LABEL[group.interval] ?? group.interval}${group.bias ? ` · ${group.bias === 'MIXED' ? 'Mixed' : group.bias.charAt(0) + group.bias.slice(1).toLowerCase()}` : ''}`}
+                  >
+                    {group.patterns.map(pattern => (
+                      <option
+                        key={`${group.interval}-${pattern.type}-${pattern.start_time}`}
+                        value={patternChoiceValue(group.interval, pattern.type)}
+                      >
+                        {pattern.type === group.primaryType ? 'Primary' : 'Alternative'} · {pattern.name} · {pattern.bias === 'BULLISH' ? 'Bullish' : pattern.bias === 'BEARISH' ? 'Bearish' : 'Neutral'} · {pattern.readiness === 'AT_EDGE' ? 'At edge' : pattern.readiness === 'NEAR_EDGE' ? 'Near edge' : 'Forming'}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+              )}
+            </div>
+            <div style={{ color: crossFrameView?.tone ?? MUTED, fontSize: '0.66rem', fontWeight: 700, whiteSpace: 'nowrap' }}>
+              {crossFrameLoading
+                ? 'Cross-frame · measuring…'
+                : crossFrameView
+                  ? `Cross-frame · ${crossFrameView.label} · ${crossFrameView.detail}`
+                  : 'Cross-frame · no supported-frame patterns'}
+            </div>
+          </div>
+        )}
         {loading && (
           <div className="loading" style={{ position: 'absolute', inset: 0, zIndex: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(255,255,255,0.7)' }}>
             <div className="spinner"></div>
@@ -1380,6 +1874,82 @@ function TickerDetail() {
               maxWidth: '60%',
             }}
           />
+          {(showPriceChannel || (showAutoPatterns && displayedPatterns.length > 0)) && (
+            <div style={{
+              position: 'absolute',
+              left: 10,
+              top: 84,
+              zIndex: 15,
+              maxWidth: 'min(430px, 72%)',
+              pointerEvents: 'none',
+              display: 'grid',
+              gap: '0.25rem',
+            }}>
+              {showPriceChannel && (
+                <div style={{
+                  padding: '0.3rem 0.45rem',
+                  borderLeft: `3px solid ${priceChannel?.bias === 'BULLISH' ? POS : priceChannel?.bias === 'BEARISH' ? NEG : MUTED}`,
+                  background: 'rgba(255,255,255,0.88)',
+                  fontSize: '0.68rem',
+                }}>
+                  {channelLoading ? (
+                    <strong>Measuring directional channel…</strong>
+                  ) : priceChannel ? (() => {
+                    const read = priceChannelReading(priceChannel)
+                    return (
+                      <>
+                        <div>
+                          <strong>{priceChannel.name}</strong>
+                          <span style={{ color: priceChannel.bias === 'BULLISH' ? POS : NEG, fontWeight: 700 }}>
+                            {` · ${priceChannel.bias === 'BULLISH' ? 'Bullish' : 'Bearish'} structure`}
+                          </span>
+                        </div>
+                        <div style={{ color: MUTED, marginTop: '0.12rem' }}>
+                          <strong style={{ color: INK }}>{read.position}</strong>
+                          {read.distance !== null ? ` · ${read.distance.toFixed(2)}% away` : ''}
+                        </div>
+                        <div style={{ color: MUTED, marginTop: '0.12rem' }}>{read.watch}</div>
+                      </>
+                    )
+                  })() : (
+                    <span style={{ color: MUTED }}>No reliable directional channel on {PATTERN_INTERVAL_LABEL[interval] ?? interval}</span>
+                  )}
+                </div>
+              )}
+              {displayedPatterns.map((pattern: FormingChartPattern) => {
+                const read = formingPatternRead(pattern)
+                const readiness = pattern.readiness === 'AT_EDGE'
+                  ? 'At edge' : pattern.readiness === 'NEAR_EDGE' ? 'Near edge' : 'Forming'
+                return (
+                  <div
+                    key={`${pattern.type}-${pattern.start_time}`}
+                    style={{
+                      padding: '0.3rem 0.45rem',
+                      borderLeft: `3px solid ${pattern.bias === 'BULLISH' ? POS : pattern.bias === 'BEARISH' ? NEG : INFO}`,
+                      background: 'rgba(255,255,255,0.88)',
+                      fontSize: '0.68rem',
+                    }}
+                  >
+                    <div>
+                      <strong>{pattern.name}</strong>
+                      <span style={{ color: pattern.bias === 'BULLISH' ? POS : pattern.bias === 'BEARISH' ? NEG : INFO, fontWeight: 700 }}>
+                        {` · Bias: ${pattern.bias === 'BULLISH' ? 'Bullish' : pattern.bias === 'BEARISH' ? 'Bearish' : 'Neutral'}`}
+                      </span>
+                    </div>
+                    <div style={{ color: MUTED, marginTop: '0.12rem' }}>
+                      <strong style={{ color: INK }}>{`${readiness} of ${pattern.boundary_role} $${pattern.boundary_price.toFixed(2)}`}</strong>
+                      {pattern.edge_distance_pct !== null ? ` · ${pattern.edge_distance_pct.toFixed(2)}% away` : ''}
+                    </div>
+                    <div style={{ color: MUTED, marginTop: '0.12rem' }}>
+                      <strong style={{ color: INK }}>Break watch:</strong> {read.watch}
+                    </div>
+                    <div style={{ color: MUTED, marginTop: '0.12rem' }}>{read.outcome}</div>
+                    <div style={{ color: MUTED, marginTop: '0.12rem' }}>{read.invalidation}</div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
         </div>
       </div>
 
@@ -1669,13 +2239,14 @@ function TickerDetail() {
 
             {tab === 'timeframes' && (
               <div style={{ border: `1px solid ${LINE}`, borderRadius: '0.5rem', maxWidth: '100%', overflowX: 'auto', marginBottom: '0.85rem' }}>
-                <table style={{ width: '100%', minWidth: 900, borderCollapse: 'collapse', fontSize: '0.76rem' }}>
+                <table style={{ width: '100%', minWidth: 1080, borderCollapse: 'collapse', fontSize: '0.76rem' }}>
                   <thead>
                     <tr style={{ background: SURFACE, borderBottom: `1px solid ${LINE}` }}>
                       {[
                         ['TF', 'Candle interval'],
                         ['Bias', 'Directional technical vote'],
                         ['Trend', 'EMA stack and 14-bar directional consistency'],
+                        ['Structure', 'Newest active confirmed chart pattern plus elevated-volume pivot count and Fibonacci overlap'],
                         ['Direction', 'Completed-bar ADX(14) trend strength with +DI and −DI directional control'],
                         ['Momentum', 'RSI and MACD state'],
                         ['Volume flow', '5-vs-20 completed-bar volume, completed-bar RVOL, 8-bar slope and CMF'],
@@ -1689,7 +2260,7 @@ function TickerDetail() {
                     {(['1mo', '1wk', '1d', '1h'] as const).map(timeframe => {
                       const setup = setups[timeframe]
                       if (!setup) return (
-                        <tr key={timeframe}><td style={{ padding: '9px' }}>{timeframe}</td><td colSpan={6} style={{ color: MUTED }}>Unavailable</td></tr>
+                        <tr key={timeframe}><td style={{ padding: '9px' }}>{timeframe}</td><td colSpan={7} style={{ color: MUTED }}>Unavailable</td></tr>
                       )
                       const side = sideOfBias(setup.direction.bias)
                       const macdLabel = setup.technicals.macd_state.replace(/_/g, ' ').toLowerCase()
@@ -1702,6 +2273,9 @@ function TickerDetail() {
                           <td style={{ padding: '9px' }}>
                             <strong style={{ color: trendTone(setup.ema_alignment.primary) }}>{setup.ema_alignment.primary}</strong>
                             <div style={{ color: MUTED, fontSize: '0.68rem' }}>{plainPct(setup.technicals.trend_consistency, 0)} consistency</div>
+                          </td>
+                          <td style={{ padding: '9px' }}>
+                            <StructureRead setup={setup} currentPrice={displayPrice} />
                           </td>
                           <td style={{ padding: '9px' }}>
                             <DirectionStrengthTrack
@@ -1768,12 +2342,89 @@ function TickerDetail() {
 
               return (
                 <>
+                  <div style={{ borderTop: `1px solid ${LINE}`, borderBottom: `1px solid ${LINE}`, marginBottom: '0.75rem' }}>
+                    <div style={{ padding: '0.45rem 0.7rem', background: SURFACE, display: 'flex', justifyContent: 'space-between', gap: '1rem', flexWrap: 'wrap' }}>
+                      <strong style={{ fontSize: '0.76rem' }}>Confirmed price structures</strong>
+                      <span style={{ color: MUTED, fontSize: '0.68rem' }}>{setupInterval} selected · other timeframes are context</span>
+                    </div>
+                    {selectedStructuralPatterns.length === 0 && (
+                      <div style={{ padding: '0.55rem 0.7rem', color: MUTED, fontSize: '0.72rem', borderBottom: visibleStructuralPatterns.length > 0 ? `1px solid ${LINE}` : undefined }}>
+                        No active confirmed structure on {INTERVAL_NOUN[setupInterval] ?? setupInterval} bars.
+                      </div>
+                    )}
+                    {visibleStructuralPatterns.length === 0 ? (
+                      <div style={{ padding: '0.65rem 0.7rem', color: MUTED, fontSize: '0.74rem' }}>
+                        No active head-and-shoulders, double-top, or double-bottom context on other timeframes.
+                      </div>
+                    ) : (
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(215px, 1fr))' }}>
+                        {visibleStructuralPatterns.map(pattern => {
+                          const tone = pattern.direction === 'BULLISH' ? POS : NEG
+                          const breakDirection = pattern.direction === 'BULLISH' ? 'above' : 'below'
+                          const failureDirection = pattern.direction === 'BULLISH' ? 'below' : 'above'
+                          const targetDistance = displayPrice && displayPrice > 0
+                            ? (pattern.target - displayPrice) / displayPrice * 100 : null
+                          const targetLocation = targetDistance === null ? null
+                            : `${plainPct(Math.abs(targetDistance))} ${targetDistance >= 0 ? 'above' : 'below'} live price`
+                          const necklineHolds = displayPrice === null
+                            ? null
+                            : pattern.direction === 'BULLISH'
+                              ? displayPrice >= pattern.neckline
+                              : displayPrice <= pattern.neckline
+                          const necklineStatus = necklineHolds === null ? null
+                            : necklineHolds ? 'NECKLINE HOLDS'
+                              : pattern.direction === 'BULLISH' ? 'BACK BELOW NECKLINE' : 'BACK ABOVE NECKLINE'
+                          const pivots = pattern.pivots
+                            .map(pivot => `${pivot.type} ${money(pivot.price)}`)
+                            .join(' · ')
+                          return (
+                            <div
+                              key={`${pattern.timeframe}-${pattern.type}-${pattern.confirmation_time}`}
+                              title={pivots}
+                              style={{
+                                padding: '0.65rem 0.7rem',
+                                borderTop: `${pattern.selected ? 3 : 1}px solid ${tone}`,
+                                background: pattern.selected ? INFO_SOFT : '#fff',
+                                minWidth: 0,
+                              }}
+                            >
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.3rem' }}>
+                                <Pill text={`${pattern.timeframe}${pattern.selected ? ' · SELECTED' : ' · CONTEXT'}`} tone={pattern.selected ? INFO : MUTED} />
+                                <strong style={{ color: tone }}>{pattern.name}</strong>
+                                {necklineStatus && (
+                                  <Pill
+                                    text={necklineStatus}
+                                    tone={necklineHolds ? tone : WARN}
+                                    title={necklineHolds
+                                      ? 'Live price remains on the confirmed side of the neckline.'
+                                      : 'Live price crossed back through the neckline; the pattern is weakened but has not reached its invalidation level.'}
+                                  />
+                                )}
+                              </div>
+                              <div style={{ fontSize: '0.7rem', color: INK }}>
+                                Confirmed: close {breakDirection} {money(pattern.neckline)}
+                              </div>
+                              <div style={{ fontSize: '0.68rem', color: MUTED, marginTop: '0.15rem' }}>
+                                Measured target {money(pattern.target)}{targetLocation ? ` · ${targetLocation}` : ''}
+                              </div>
+                              <div style={{ fontSize: '0.68rem', color: MUTED, marginTop: '0.15rem' }}>
+                                Pattern fails on close {failureDirection} {money(pattern.invalidation)}
+                              </div>
+                              <div style={{ fontSize: '0.66rem', color: MUTED, marginTop: '0.15rem' }}>
+                                Break occurred {pattern.bars_ago} {INTERVAL_NOUN[pattern.timeframe] ?? pattern.timeframe} bars ago
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
                   {rows.length === 0 ? (
                     <p style={{ fontSize: '0.8rem', color: MUTED }}>No cross-timeframe zones resolved.</p>
                   ) : (
                     <div style={{ border: '1px solid #e2e8f0', borderRadius: '0.5rem', maxWidth: '100%', overflowX: 'auto', marginBottom: '1rem' }}>
                       <div style={{ padding: '0.5rem 0.75rem', background: SURFACE, borderBottom: `1px solid ${LINE}`, fontSize: '0.72rem', color: MUTED }}>
-                        Showing {rows.length} nearest zones of {confluenceZones.length} · all contributing levels remain summarized in each zone
+                        Showing {rows.length} nearest cross-timeframe zones of {confluenceZones.length} · {setupInterval} evidence is listed first · volume pivots are liquidity proxies
                       </div>
                       <table style={{ width: '100%', minWidth: 900, borderCollapse: 'collapse', fontSize: '0.78rem' }}>
                         <thead>
@@ -1788,8 +2439,28 @@ function TickerDetail() {
                             const strengthTone = zone.strength === 'STRONG_CONFLUENCE' ? POS
                               : zone.strength === 'CONFLUENCE' ? INFO : MUTED
                             const roleTone = zone.role === 'SUPPORT' ? POS : zone.role === 'RESISTANCE' ? NEG : WARN
-                            const evidence = zone.references.slice(0, 4)
+                            const orderedReferences = [...zone.references].sort((a, b) => {
+                              const aSelected = a.interval === setupInterval
+                              const bSelected = b.interval === setupInterval
+                              return aSelected === bSelected ? 0 : aSelected ? -1 : 1
+                            })
+                            const evidence = orderedReferences.slice(0, 4)
                               .map(reference => `${reference.interval} ${reference.label}`)
+                            const volumeReference = orderedReferences.find(reference => reference.family === 'volume_pivot')
+                            const fibVolumeOverlap = zone.families.includes('volume_pivot') && zone.families.includes('fibonacci')
+                            const distanceLabel = Math.abs(zone.distance_pct) < 0.05
+                              ? 'at current price'
+                              : `${plainPct(Math.abs(zone.distance_pct))} ${zone.distance_pct > 0 ? 'above' : 'below'}`
+                            const strengthDescription = zone.strength === 'STRONG_CONFLUENCE'
+                              ? 'At least two timeframes and two independent evidence families overlap here.'
+                              : zone.strength === 'CONFLUENCE'
+                                ? 'Multiple timeframes or independent evidence families overlap here.'
+                                : 'One evidence source defines this level.'
+                            const roleDescription = zone.role === 'SUPPORT'
+                              ? 'This zone is below current price and may act as demand on a pullback.'
+                              : zone.role === 'RESISTANCE'
+                                ? 'This zone is above current price and may cap an advance.'
+                                : 'Current price is trading inside this zone.'
                             return (
                             <Fragment key={`${zone.low}-${zone.high}`}>
                               {i === firstBelow && priceRow}
@@ -1797,16 +2468,20 @@ function TickerDetail() {
                                 <td style={{ padding: '6px 8px', textAlign: 'right', fontWeight: 700, whiteSpace: 'nowrap' }}>
                                   {Math.abs(zone.high - zone.low) > 0.005 ? `${money(zone.low)}–${money(zone.high)}` : money(zone.midpoint)}
                                 </td>
-                                <td style={{ padding: '6px 8px', textAlign: 'right', color: zone.distance_pct >= 0 ? POS : NEG }}>
-                                  {signedPct(zone.distance_pct)}
+                                <td style={{ padding: '6px 8px', textAlign: 'right', color: MUTED, whiteSpace: 'nowrap' }}>
+                                  {distanceLabel}
                                 </td>
-                                <td style={{ padding: '6px 8px' }}><Pill text={zone.role.replace(/_/g, ' ')} tone={roleTone} /></td>
+                                <td style={{ padding: '6px 8px' }}><Pill text={zone.role.replace(/_/g, ' ')} tone={roleTone} title={roleDescription} /></td>
                                 <td style={{ padding: '6px 8px' }}>
-                                  <Pill text={zone.strength.replace(/_/g, ' ')} tone={strengthTone} />
-                                  <div style={{ color: MUTED, fontSize: '0.68rem', marginTop: '0.15rem' }}>{zone.intervals.join(' · ')} · {zone.families.length} families</div>
+                                  <Pill text={zone.strength.replace(/_/g, ' ')} tone={strengthTone} title={strengthDescription} />
+                                  {fibVolumeOverlap && <div style={{ marginTop: '0.2rem' }}><Pill text="FIB + VOLUME PIVOT" tone={INFO} title="An elevated-volume swing pivot overlaps a Fibonacci retracement in this price zone." /></div>}
+                                  <div style={{ color: MUTED, fontSize: '0.68rem', marginTop: '0.15rem' }}>
+                                    {zone.intervals.length} timeframe{zone.intervals.length === 1 ? '' : 's'} · {zone.families.length} evidence type{zone.families.length === 1 ? '' : 's'}
+                                  </div>
                                 </td>
                                 <td style={{ padding: '6px 8px' }}>
                                   <div>{evidence.join(' · ')}</div>
+                                  {volumeReference?.qualifier && <div style={{ color: INFO, fontSize: '0.68rem', marginTop: '0.15rem' }}>{volumeReference.qualifier}</div>}
                                   {zone.references.length > evidence.length && <div style={{ color: MUTED, fontSize: '0.68rem' }}>+{zone.references.length - evidence.length} more references</div>}
                                 </td>
                                 <td style={{ padding: '6px 8px' }}>

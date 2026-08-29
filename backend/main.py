@@ -39,6 +39,9 @@ from screeners import (
     analyze_market_regime,
     clear_bulk_cache,
 )
+from research.price_structures import analyze_price_structures
+from research.forming_patterns import detect_forming_patterns, summarize_cross_frame_patterns
+from research.price_channels import detect_price_channel
 
 app = FastAPI(
     title="Stock Screener API",
@@ -93,6 +96,10 @@ logger.info("ThreadPoolExecutor | workers=%s | cpu_cores=%s", _num_workers, os.c
 # Force refresh (?refresh=true) bypasses and also invalidates bulk_load_dataframes.
 _result_cache: dict[str, tuple[float, Any]] = {}
 _result_cache_lock = threading.Lock()
+CHART_PATTERN_DETAIL_CACHE = "chart_patterns_v9"
+CHART_PATTERN_TICKER_CACHE = "chart_pattern_ticker_v7"
+CHART_PATTERN_SCAN_CACHE = "chart_pattern_scan_v7"
+PRICE_CHANNEL_CACHE = "price_channel_v1"
 
 # TTL in seconds per cache-key prefix
 _CACHE_TTLS: dict[str, int] = {
@@ -120,6 +127,8 @@ _CACHE_TTLS: dict[str, int] = {
     "trade_setup_multi": 300,    # 5min; coordinates all four setup intervals
     "chart_daily":      900,     # 15min; today's daily bar is still forming
     "chart_intraday":   60,      # 1min; market-hours data updates every 5min
+    "chart_pattern_scan": 300,   # 5min; on-demand universe research view
+    "chart_pattern_ticker": 60,  # 1min; cross-frame reading includes intraday bars
     "quote":            60,      # newest stored candle
     "prices":           86400,   # 24h
     "calibration":      900,     # 15min; layers land at 9:25/9:30/9:35 AM ET
@@ -207,6 +216,32 @@ def _load_intraday_frames(tickers: List[str], interval: str, limit: int = 200) -
     return frames
 
 
+PATTERN_WATCH_INTERVALS = ("5m", "15m", "30m", "1h", "1d", "1wk")
+PATTERN_FRAME_ROWS = 301
+
+
+def _load_pattern_frames(tickers: List[str], interval: str) -> dict:
+    """Load one consistent detector window, including the newest excluded row."""
+    if interval in ("1d", "1wk"):
+        days = 2500 if interval == "1wk" else 500
+        frames = bulk_load_dataframes(tickers, days)
+        if interval == "1wk":
+            frames = {
+                ticker: frame.resample("W-FRI").agg({
+                    "open": "first", "high": "max", "low": "min",
+                    "close": "last", "volume": "sum",
+                }).dropna(subset=["close"])
+                for ticker, frame in frames.items()
+            }
+    else:
+        frames = _load_intraday_frames(tickers, interval, PATTERN_FRAME_ROWS)
+    return {
+        ticker: frame.tail(PATTERN_FRAME_ROWS)
+        for ticker, frame in frames.items()
+        if frame is not None and not frame.empty
+    }
+
+
 def resolve_tickers(tickers: Optional[str] = None, limit: Optional[int] = None) -> List[str]:
     """
     Resolve scan tickers in priority order:
@@ -268,6 +303,8 @@ def _build_ticker_confluence_zones(setups: dict[str, dict]) -> list[dict]:
         value = source.lower()
         if "fib" in value:
             return "fibonacci"
+        if "volume pivot" in value:
+            return "volume_pivot"
         if "ema" in value or "sma" in value or "moving" in value:
             return "moving_average"
         if "gap" in value or "fvg" in value:
@@ -277,7 +314,8 @@ def _build_ticker_confluence_zones(setups: dict[str, dict]) -> list[dict]:
         return "price_action"
 
     def add_reference(interval: str, label: str, low: float, high: float,
-                      source: str, family: str | None = None):
+                      source: str, family: str | None = None,
+                      qualifier: str | None = None):
         if not all(math.isfinite(value) and value > 0 for value in (low, high)):
             return
         lo, hi = sorted((float(low), float(high)))
@@ -289,6 +327,7 @@ def _build_ticker_confluence_zones(setups: dict[str, dict]) -> list[dict]:
             "price": round((lo + hi) / 2, 2),
             "source": source,
             "family": family or family_of(source),
+            "qualifier": qualifier,
         })
 
     for interval, setup in setups.items():
@@ -320,6 +359,7 @@ def _build_ticker_confluence_zones(setups: dict[str, dict]) -> list[dict]:
         for zone in setup.get("zones", []):
             add_reference(
                 interval, zone["name"], zone["low"], zone["high"], zone["source"],
+                qualifier=zone.get("qualifier"),
             )
 
         fibonacci = setup.get("strategy_results", {}).get("fibonacci")
@@ -417,14 +457,14 @@ def _build_ticker_confluence_zones(setups: dict[str, dict]) -> list[dict]:
 async def get_multi_trade_setup(ticker: str, refresh: bool = False):
     """Return synchronized 1h/1d/1wk setups, monthly context, and confluence."""
     symbol = ticker.upper()
-    cache_key = f"trade_setup_multi_v5_{symbol}"
+    cache_key = f"trade_setup_multi_v11_{symbol}"
     if not refresh:
         cached = _get_cached(cache_key, "trade_setup_multi")
         if cached is not None:
             return cached
     if refresh:
         clear_bulk_cache()
-        _invalidate_prefix(f"trade_setup_v16_{symbol}_")
+        _invalidate_prefix(f"trade_setup_v22_{symbol}_")
         _invalidate_prefix(cache_key)
 
     import pandas as pd
@@ -573,6 +613,256 @@ async def get_chart_data(ticker: str, period: str = "1y", interval: str = "1d", 
         })
     _set_cached(cache_key, records)
     return records
+
+
+def _pattern_reference_close(frame) -> float | None:
+    """Return the last valid close before the deliberately excluded newest bar."""
+    if frame is None or len(frame) < 2 or "close" not in frame.columns:
+        return None
+    for value in reversed(frame.iloc[:-1]["close"].tolist()):
+        try:
+            close = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(close):
+            return round(close, 2)
+    return None
+
+
+@app.get("/api/stock/{ticker}/chart-patterns")
+async def get_chart_patterns(
+    ticker: str,
+    interval: str = Query(default="1d", regex="^(1m|5m|15m|30m|1h|1d|1wk)$"),
+    refresh: bool = False,
+):
+    """Current chart-only formations for one interval, using completed bars."""
+    symbol = ticker.upper()
+    prefix = "chart_daily" if interval in ("1d", "1wk") else "chart_intraday"
+    cache_key = f"{CHART_PATTERN_DETAIL_CACHE}_{symbol}_{interval}"
+    if not refresh:
+        cached = _get_cached(cache_key, prefix)
+        if cached is not None:
+            return cached
+    if refresh:
+        clear_bulk_cache()
+        _invalidate_prefix(cache_key)
+        _invalidate_prefix(f"{CHART_PATTERN_TICKER_CACHE}_{symbol}")
+
+    frame = _load_pattern_frames([symbol], interval).get(symbol)
+    patterns = detect_forming_patterns(frame) if frame is not None else []
+    result = {
+        "ticker": symbol,
+        "interval": interval,
+        "status": "FORMING_RESEARCH",
+        "last_close": _pattern_reference_close(frame),
+        "patterns": patterns,
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _set_cached(cache_key, result)
+    return result
+
+
+@app.get("/api/stock/{ticker}/price-channel")
+async def get_price_channel(
+    ticker: str,
+    interval: str = Query(default="1d", regex="^(5m|15m|30m|1h|1d|1wk)$"),
+    refresh: bool = False,
+):
+    """Primary active directional price channel for one completed-bar interval."""
+    symbol = ticker.upper()
+    prefix = "chart_daily" if interval in ("1d", "1wk") else "chart_intraday"
+    cache_key = f"{PRICE_CHANNEL_CACHE}_{symbol}_{interval}"
+    if not refresh:
+        cached = _get_cached(cache_key, prefix)
+        if cached is not None:
+            return cached
+    if refresh:
+        clear_bulk_cache()
+        _invalidate_prefix(cache_key)
+
+    frame = _load_pattern_frames([symbol], interval).get(symbol)
+    channel = detect_price_channel(frame) if frame is not None else None
+    result = {
+        "ticker": symbol,
+        "interval": interval,
+        "status": "CHANNEL_RESEARCH",
+        "last_close": _pattern_reference_close(frame),
+        "channel": channel,
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _set_cached(cache_key, result)
+    return result
+
+
+@app.get("/api/chart-patterns/ticker/{ticker}")
+async def scan_ticker_chart_patterns(ticker: str, refresh: bool = False):
+    """Find current forming patterns for one ticker across Pattern Watch intervals."""
+    symbol = ticker.upper()
+    cache_key = f"{CHART_PATTERN_TICKER_CACHE}_{symbol}"
+    if not refresh:
+        cached = _get_cached(cache_key, "chart_pattern_ticker")
+        if cached is not None:
+            return cached
+    if refresh:
+        clear_bulk_cache()
+        _invalidate_prefix(cache_key)
+        _invalidate_prefix(f"{CHART_PATTERN_DETAIL_CACHE}_{symbol}_")
+        _invalidate_prefix(f"{PRICE_CHANNEL_CACHE}_{symbol}_")
+
+    intervals = PATTERN_WATCH_INTERVALS
+    responses, channel_responses = await asyncio.gather(
+        asyncio.gather(*(
+        get_chart_patterns(symbol, interval, False)
+        for interval in intervals
+        )),
+        asyncio.gather(*(
+            get_price_channel(symbol, interval, False)
+            for interval in intervals
+        )),
+    )
+    channel_by_interval = {
+        response["interval"]: response["channel"]
+        for response in channel_responses
+    }
+
+    from database import get_db_cursor
+    with get_db_cursor() as cursor:
+        cursor.execute(
+            "SELECT sector FROM selected_tickers WHERE ticker = %s",
+            (symbol,),
+        )
+        sector_row = cursor.fetchone()
+    sector = sector_row["sector"] if sector_row else None
+
+    rows = [
+        {
+            "ticker": symbol,
+            "sector": sector,
+            "interval": response["interval"],
+            "last_close": response["last_close"],
+            "pattern": pattern,
+            "channel": channel_by_interval.get(response["interval"]),
+        }
+        for response in responses
+        for pattern in response["patterns"]
+    ]
+    readiness_rank = {"AT_EDGE": 0, "NEAR_EDGE": 1, "FORMING": 2}
+    grade_rank = {"STRONG_GEOMETRY": 0, "VALID_GEOMETRY": 1}
+    rows.sort(key=lambda row: (
+        readiness_rank[row["pattern"]["readiness"]],
+        grade_rank[row["pattern"]["grade"]],
+        row["pattern"]["edge_distance_atr"],
+        -(row["pattern"]["upper_touches"] + row["pattern"]["lower_touches"]),
+        intervals.index(row["interval"]),
+    ))
+    result = {
+        "interval": "all",
+        "scanned": 1,
+        "matched_tickers": 1 if rows else 0,
+        "results": rows,
+        "cross_frame": summarize_cross_frame_patterns(rows),
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _set_cached(cache_key, result)
+    return result
+
+
+@app.get("/api/chart-patterns/scan")
+async def scan_chart_patterns(
+    interval: str = Query(default="1d", regex="^(5m|15m|30m|1h|1d|1wk)$"),
+    limit: int = Query(default=1000, ge=1, le=1500),
+    refresh: bool = False,
+):
+    """Find current forming chart patterns across the active ticker universe."""
+    cache_key = f"{CHART_PATTERN_SCAN_CACHE}_{interval}_{limit}"
+    if not refresh:
+        cached = _get_cached(cache_key, "chart_pattern_scan")
+        if cached is not None:
+            return cached
+    if refresh:
+        clear_bulk_cache()
+        _invalidate_prefix(f"{CHART_PATTERN_SCAN_CACHE}_")
+        _invalidate_prefix(f"{CHART_PATTERN_DETAIL_CACHE}_")
+        _invalidate_prefix(f"{CHART_PATTERN_TICKER_CACHE}_")
+        _invalidate_prefix(f"{PRICE_CHANNEL_CACHE}_")
+
+    selected = get_selected_tickers(active_only=True)
+    if not selected:
+        return {
+            "interval": interval, "scanned": 0, "matched_tickers": 0,
+            "results": [], "cross_frame": None,
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    loop = asyncio.get_event_loop()
+    frames = await loop.run_in_executor(
+        executor, _load_pattern_frames, selected, interval,
+    )
+
+    from database import get_db_cursor
+    with get_db_cursor() as cursor:
+        cursor.execute(
+            "SELECT ticker, sector FROM selected_tickers WHERE ticker = ANY(%s)",
+            (selected,),
+        )
+        sector_by_ticker = {
+            row["ticker"]: row["sector"] for row in cursor.fetchall()
+        }
+
+    frame_items = [
+        (ticker, frame) for ticker, frame in frames.items()
+        if frame is not None and not frame.empty
+    ]
+    pattern_detections = await asyncio.gather(*(
+        loop.run_in_executor(executor, detect_forming_patterns, frame)
+        for _, frame in frame_items
+    ))
+    channel_frame_items = [
+        (ticker, frame)
+        for (ticker, frame), patterns in zip(frame_items, pattern_detections)
+        if patterns
+    ]
+    channel_detections = await asyncio.gather(*(
+        loop.run_in_executor(executor, detect_price_channel, frame)
+        for _, frame in channel_frame_items
+    ))
+    channel_by_ticker = {
+        ticker: channel
+        for (ticker, _), channel in zip(channel_frame_items, channel_detections)
+    }
+    rows = []
+    for (ticker, frame), patterns in zip(frame_items, pattern_detections):
+        channel = channel_by_ticker.get(ticker)
+        for pattern in patterns:
+            rows.append({
+                "ticker": ticker,
+                "sector": sector_by_ticker.get(ticker),
+                "interval": interval,
+                "last_close": _pattern_reference_close(frame),
+                "pattern": pattern,
+                "channel": channel,
+            })
+    readiness_rank = {"AT_EDGE": 0, "NEAR_EDGE": 1, "FORMING": 2}
+    grade_rank = {"STRONG_GEOMETRY": 0, "VALID_GEOMETRY": 1}
+    rows.sort(key=lambda row: (
+        readiness_rank[row["pattern"]["readiness"]],
+        grade_rank[row["pattern"]["grade"]],
+        row["pattern"]["edge_distance_atr"],
+        -(row["pattern"]["upper_touches"] + row["pattern"]["lower_touches"]),
+        row["ticker"],
+    ))
+    matched_tickers = len({row["ticker"] for row in rows})
+    rows = rows[:limit]
+    result = {
+        "interval": interval,
+        "scanned": len(frames),
+        "matched_tickers": matched_tickers,
+        "results": rows,
+        "cross_frame": None,
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _set_cached(cache_key, result)
+    return result
 
 
 @app.get("/api/scan/gaps")
@@ -1773,13 +2063,14 @@ async def _compute_trade_setup(ticker: str, interval: str = "1d",
 
     interval: '1mo' (monthly), '1wk' (weekly), '1d' (daily), '1h' (hourly), '30m', '15m', '5m'
     """
-    cache_key = f"trade_setup_v16_{ticker.upper()}_{interval}"
+    cache_key = f"trade_setup_v22_{ticker.upper()}_{interval}"
     if not refresh:
         cached = _get_cached(cache_key, f"trade_setup_{interval}")
         if cached is not None:
             return cached
     if refresh:
         clear_bulk_cache()
+        _invalidate_prefix(f"trade_setup_multi_v11_{ticker.upper()}")
 
     import numpy as np
     import pandas as pd
@@ -1954,6 +2245,17 @@ async def _compute_trade_setup(ticker: str, interval: str = "1d",
     # ATR(14)
     tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
     atr14 = float(np.mean(tr[-14:])) if len(tr) >= 14 else float(np.mean(tr))
+
+    structure_fibonacci_levels = []
+    if fib:
+        structure_fibonacci_levels.extend(fib.get("retracement_levels", []))
+        structure_fibonacci_levels.extend(
+            fib.get("active_leg", {}).get("levels", [])
+            if fib.get("active_leg") else []
+        )
+    structure_analysis = analyze_price_structures(df, structure_fibonacci_levels)
+    structural_patterns = structure_analysis["patterns"]
+    volume_pivot_zones = structure_analysis["volume_pivot_zones"]
 
     # Stochastic %K(14,3)
     if len(c) >= 17:
@@ -2493,6 +2795,7 @@ async def _compute_trade_setup(ticker: str, interval: str = "1d",
         zones.append({"name": "FVG supply zone", "low": round(float(f["fvg_low"]), 2),
                       "high": round(float(f["fvg_high"]), 2), "source": "FVG",
                       "qualifier": "Unmitigated"})
+    zones.extend(volume_pivot_zones)
 
     # RSI tilt
     if rsi < 35:
@@ -2850,6 +3153,7 @@ async def _compute_trade_setup(ticker: str, interval: str = "1d",
             "range_position_pct": range_position_pct,
         },
         "candlestick_patterns": candle_patterns,
+        "structural_patterns": structural_patterns,
         "ema_alignment": {
             "primary": ema_alignment,
             "primary_detail": ema_alignment_detail,
