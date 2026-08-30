@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Routes, Route, NavLink, Navigate, useNavigate } from 'react-router-dom'
-import { X } from 'lucide-react'
+import { FlaskConical, X } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import GapScreener from './pages/GapScreener'
 import MAScreener from './pages/MAScreener'
@@ -12,6 +12,7 @@ import TickersOverview from './pages/TickersOverview'
 import SectorIntelligence from './pages/SectorIntelligence'
 import ScannerResults from './pages/ScannerResults'
 import PatternWatch from './pages/PatternWatch'
+import OptionsResearchWorkspace from './pages/OptionsResearchWorkspace'
 import { getTickers } from './services/api'
 
 function TickerSearch() {
@@ -191,6 +192,11 @@ function App() {
               Scanner Results
             </NavLink>
           </li>
+          <li>
+            <NavLink to="/options" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+              <FlaskConical size={15} aria-hidden="true" /> Options Research
+            </NavLink>
+          </li>
         </ul>
       </nav>
       
@@ -206,6 +212,7 @@ function App() {
           <Route path="/sector-intelligence" element={<SectorIntelligence />} />
           <Route path="/pattern-watch" element={<PatternWatch />} />
           <Route path="/scanner-results" element={<ScannerResults />} />
+          <Route path="/options/*" element={<OptionsResearchWorkspace />} />
           <Route path="/scanner-evaluation" element={<Navigate to="/scanner-results" replace />} />
           <Route path="/backtest" element={<Navigate to="/scanner-results" replace />} />
           <Route path="/ticker/:symbol" element={<TickerDetail />} />

@@ -248,8 +248,9 @@ They protect correctness rather than increase throughput.
 All of the following are required before calling the workstation an all-session paper
 environment:
 
-1. Activate Polygon Options Developer and verify chain plus delayed-trade access. The
-   API key returned HTTP 403 for the option-chain probe during the assessment.
+1. Keep Polygon Options Developer chain and delayed-trade entitlement under automated
+   startup verification. It was activated and returned HTTP 200 on 2026-08-29; option
+   quotes returned the expected Developer-tier HTTP 403 denial.
 2. Verify the separately configured stock provider supplies delayed one-minute
    underlying bars aligned with option marks.
 3. Disable Windows sleep and hibernation while connected to AC power.

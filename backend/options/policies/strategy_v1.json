@@ -1,0 +1,44 @@
+{
+  "strategy_version": "phase2_v1",
+  "gamma_squeeze": {
+    "maximum_moneyness_fraction": 0.02,
+    "minimum_volume_oi_ratio": 1.5,
+    "minimum_gamma": 0.05,
+    "maximum_per_side": 1,
+    "stop_loss_fraction": 0.35,
+    "take_profit_fraction": 0.5,
+    "trailing_activation_fraction": 0.25,
+    "trailing_distance_fraction": 0.2
+  },
+  "income_wheel": {
+    "minimum_dte": 7,
+    "maximum_dte": 30,
+    "exit_dte": 21,
+    "maximum_candidates": 3,
+    "take_profit_fraction": 0.5,
+    "stop_loss_multiple": 2.0
+  },
+  "spreads": {
+    "maximum_wings_per_short_strike": 5,
+    "maximum_per_structure_expiration": 3,
+    "maximum_center_distance_fraction": 0.02
+  },
+  "flow": {
+    "minimum_print_notional": "50000",
+    "minimum_sweep_prints": 10,
+    "minimum_distinct_exchanges": 2,
+    "sweep_window_seconds": 180,
+    "minimum_volume_oi_ratio": 3.0,
+    "maximum_candidates": 20
+  },
+  "smile": {
+    "minimum_strikes": 7,
+    "minimum_absolute_robust_z": 2.5,
+    "maximum_candidates_per_expiration_type": 10
+  },
+  "scenarios": {
+    "spot_shock_fractions": [-0.1, -0.05, 0.0, 0.05, 0.1],
+    "iv_shock_fractions": [-0.2, 0.0, 0.2],
+    "time_fractions_remaining": [1.0, 0.5, 0.0]
+  }
+}

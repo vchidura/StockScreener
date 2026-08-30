@@ -31,8 +31,12 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pydantic>=2.5.3",
     "numpy>=1.26.3",
+    "scipy==1.17.1",
     "pytz>=2024.1",
     "requests>=2.31.0",
+    "polygon-api-client==1.16.3",
+    "pyarrow==25.0.1",
+    "exchange-calendars==4.13.2",
 ]
 
 [project.optional-dependencies]

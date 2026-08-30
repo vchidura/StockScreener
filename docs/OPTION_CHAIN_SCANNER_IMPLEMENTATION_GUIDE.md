@@ -6,6 +6,10 @@ Detailed specification: [OPTION_CHAIN_SCANNER_DESIGN.md](OPTION_CHAIN_SCANNER_DE
 
 Capacity decision: [OPTION_PLATFORM_CAPACITY_DECISION_2026-08-29.md](OPTION_PLATFORM_CAPACITY_DECISION_2026-08-29.md)
 
+Latest Phase 0 evidence: [OPTION_PHASE0_VALIDATION_2026-08-29.md](OPTION_PHASE0_VALIDATION_2026-08-29.md)
+
+Implemented pipeline walkthrough: [OPTION_PIPELINE_CURRENT_STATE.md](OPTION_PIPELINE_CURRENT_STATE.md)
+
 ## 1. Purpose and Authority
 
 Use this guide to plan and sequence implementation. It intentionally does not repeat
@@ -26,17 +30,24 @@ Developer implementation.
 flowchart LR
     P0[Phase 0<br/>Developer entitlement] --> P1[Phase 1<br/>Market data]
     P1 --> P2[Phase 2<br/>Signals and context]
-    P2 --> P3[Phase 3<br/>Paper proxy]
+    P2 --> HR[Advanced-target<br/>historical strategy replay]
+    HR --> P3[Phase 3<br/>Paper proxy]
     P3 --> P4A[Phase 4A<br/>Advanced shadow]
     P4A --> P4B[Phase 4B<br/>Authorized broker]
 ```
 
 - Developer is the initial Polygon tier: delayed snapshots, aggregates, OI, and
-  individual trades; no option quotes.
+  individual trades; no option quotes. It bootstraps ingestion and operational
+  correctness but is not the final production data plane.
 - Developer simulations are `PAPER_PROXY` and every fill/report carries
   `RESEARCH_DELAYED_PROXY`.
-- Advanced adds real-time option trades and quotes. It must run in quote-backed shadow
-  mode before any broker adapter is authorized.
+- Historical strategy replay targets the Advanced information set and combines
+  point-in-time equity-scanner evidence with historical option quotes, trades,
+  aggregates, references, and underlying data. It does not impose Developer's
+  15-minute delay; it does impose source-time availability, bar finalization, and
+  explicit processing/order latency.
+- Advanced is the final production tier. It adds real-time option trades and quotes
+  and must run in quote-backed shadow mode before any broker adapter is authorized.
 - A real-time underlying stock/ETF feed is independently required for Advanced live
   eligibility.
 
@@ -52,9 +63,12 @@ flowchart TB
     R --> PD[PolygonDeveloperEngine]
     PD --> N[Normalizer and filters]
     N --> G[Local IV and Gamma]
+    G --> API15[Phase 1 read APIs]
+    API15 --> UI15[Options Research portal]
     G --> M16[Migration 016<br/>signals and context]
     M16 --> S[Six strategy modules]
-    S --> API[Read APIs]
+    S --> API16[Candidate and signal APIs]
+    API16 --> UI16[Weekly Candidates portal]
     S --> M17[Migration 017<br/>paper execution]
     M17 --> E[ExecutionManager and paper ledger]
     E --> A[Advanced adapter and shadow]
@@ -78,6 +92,10 @@ Deliver a read-only command that checks, without logging credentials:
 6. Actual page counts, payload sizes, missing marks, and provider IV/Greek coverage.
 
 Stop if snapshots, trades, aggregate marks, or aligned underlying data are unavailable.
+
+The 2026-08-29 weekend probe passed these entitlement and static-data checks and is a
+conditional GO for Phase 1. Complete the open-session gates in the dated validation
+record before marking Phase 0 fully accepted.
 
 Authoritative references: sections 3, 7.1, 8, and 18 Phase 0.
 
@@ -193,7 +211,147 @@ Do not add Roaring bitmaps in Developer mode.
 
 References: sections 12.1-12.3.
 
+### Slice 6: Phase 1 read APIs and portal
+
+Phase 1 ends with a capability-aware research surface over durable PostgreSQL state.
+The primary experience organizes delayed market evidence for investigation; raw chain
+rows and pipeline diagnostics remain available as secondary tools. Do not build any
+view against in-process queues, transient provider payloads, frontend-derived strategy
+rules, or mock recommendations. Apply migration 015 and wire the read-only pipeline
+before treating these pages as data-connected.
+
+Backend read APIs:
+
+- `GET /api/options/health`: startup mode, delayed entitlement result, scheduler
+  leader/heartbeat, newest complete cycle by underlying, oldest durable work age,
+  partition readiness, and archive/reconciliation state.
+- `GET /api/options/universe` and `GET /api/options/universe/runs`: active fixed or
+  ranked members, asset cohort, effective date, source run, score, completeness, and
+  exclusion/disabled reasons.
+- `GET /api/options/chain/{underlyer}`: newest complete causally visible matrix,
+  contract filter fields, display/model marks, local Greeks, source/observation times,
+  and row-level quality reasons. Incomplete batches are diagnostic records and cannot
+  be returned as the current clean chain.
+- `GET /api/options/analysis/{underlyer}`: chain health, contract economics,
+  expiration ATM IV, 25-Delta skew/risk reversal, term structure, activity ratios,
+  OI concentration/walls, policy/model versions, and caveats.
+- Add read-only ingestion/work, archive-manifest, reconciliation, and dry-run
+  retention-report endpoints when their operational pages are connected. Add their
+  exact response schemas to detailed design section 15 in the same change; Phase 1
+  exposes no retention-delete endpoint.
+
+Portal information architecture:
+
+- Add one top-level `Options Research` navigation entry at `/options`. Use local tabs
+  or a compact secondary navigation for the option pages so the existing global
+  navbar does not gain one item per view.
+- `/options`: the default `Market Structure Workbench`. It uses the Phase 2 workspace
+  shape where that shape is capability-neutral: a compact evidence bar, explicit
+  filters, grouped research lenses, dense evidence rows, and a right-side evidence
+  drawer on desktop or full-screen evidence sheet on mobile. It is not the Phase 2
+  Strategy Workbench and contains no candidate list.
+- The four Phase 1 lenses are `Income Evidence`, `Directional Context`,
+  `Volatility & Range`, and `OI & Activity`. They are saved views over persisted
+  contract and expiration analysis, not persona assignments, strategy archetypes,
+  suitability assessments, or ranks. A lens may filter by explicit facts such as
+  contract type, expiration, DTE, moneyness, or data-quality state. It cannot select
+  a Delta target, infer direction, assemble legs, score opportunity, or promote a row.
+- `/options/explorer/:underlyer?`: the secondary dense chain explorer with underlying,
+  expiration, call/put, DTE, moneyness, liquidity inputs, mark quality, and
+  IV-convergence controls. Preserve URL/query state for reload and sharing. Show
+  rejected and pending-reference counts separately from the retained matrix.
+- `/options/operations`: the secondary operational workspace. It contains health,
+  fixed/advisory universe state, latest complete cycles, ingestion page/row counts,
+  retries, failure categories, unknown-reference/new-series state, trade
+  watermark/backfill state, durable work leases/age, and partition readiness. The UI
+  cannot edit or automatically promote the allowlist.
+- `/options/archive`: archive enabled/disabled state, manifest integrity,
+  reconciliation outcomes, active holds, storage totals, and retention dry-run results.
+  This page has no delete, release-hold, or purge command in Phase 1.
+
+Phase 1 evidence drawer:
+
+- Selecting a retained contract opens a stable detail surface with contract identity,
+  expiration, source-time display/model marks, intrinsic/extrinsic value, breakeven,
+  local Greeks, volume/OI activity, mark provenance, source and observation times,
+  model/policy versions, and row-level quality reasons.
+- The drawer may include expiration-level skew, term, breadth, and OI concentration
+  context only when those persisted analytics passed their required quality gates.
+  OI concentration is never labeled support, resistance, dealer positioning, max
+  pain, target pin, or expected pinning.
+- Phase 2-shaped sections whose evidence does not yet exist remain visible only as
+  concise capability states with exact prerequisites. In particular, strategy thesis,
+  ordered legs, net premium, bounded maximum loss, scenario results, trend/event
+  context, suppressions, management policy, and execution eligibility require
+  migration 016 outputs and cannot be synthesized from a Phase 1 row.
+
+Display and interaction contract:
+
+- Every option page shows `15-MINUTE DELAYED RESEARCH DATA` and exposes both source
+  market time and first-observed time in America/New_York, with UTC available in a
+  detail view or tooltip. Never label Developer data real-time.
+- Keep `display_mark` and `model_mark` visibly distinct. A display fallback cannot be
+  styled as model-valid, executable, bid/ask, midpoint, spread, or NBBO data.
+- Missing values render as unavailable with their reason; do not coerce missing
+  volume, OI, Greeks, ratios, or quote fields to zero. Stale, incomplete, failed, and
+  reference-pending states remain visible and cannot silently fall back to an older
+  clean matrix for a new decision.
+- A lens with no model-valid rows explains the blocking quality gate and may still
+  show clearly labeled source observations. It must not loosen the gate, substitute
+  provider Greeks for failed local Greeks, or rank source-only rows as opportunities.
+- Use compact tables and stable responsive dimensions consistent with the existing
+  operational portal. Loading, no-migration, no-complete-batch, delayed/stale,
+  degraded, failed, and API-unavailable states each need explicit UI treatment.
+- Phase 1 pages describe observations and analysis, not trades. They contain no Buy,
+  Sell, Execute, Paper Trade, or `Recommended Options` control or heading.
+
+Candidate and recommendation boundary:
+
+- Do not derive candidate, opportunity, confidence, or `next weekly recommended
+  options` lists directly from chain rows, highest IV, volume/OI, OI concentration,
+  or local Greeks. Those are analysis inputs, not a directional thesis, bounded-risk
+  package, scenario result, or idempotent signal.
+- Add `/options/candidates` only in Phase 2 after migration 016, point-in-time event
+  and trend context, strategy modules, deterministic candidate selection, scenario
+  analysis, suppressions, and decision evidence are implemented. In Developer mode,
+  title the view `Weekly Research Candidates`, show the source matrix and delayed-data
+  label, and keep execution eligibility null or `PAPER_PROXY` as specified. A
+  candidate is not broker authorization.
+- The page may group candidates by next listed weekly expiration, but `weekly` means
+  the option expiration cohort. It does not mean the system can forecast the next
+  week, and it must not reuse the equity scanner's `1wk` horizon semantics.
+
+Done when:
+
+- Every page reads durable state through a typed API and exposes its `as_of`,
+  `observed_at`, policy hash, and model version where applicable.
+- The default page presents useful evidence before operational tables, all lens and
+  filter state is URL-addressable, and selecting a row opens the evidence drawer
+  without changing its meaning or order.
+- Incomplete/future-visible data fails closed, delayed-data labeling is present on
+  every option route, and no Phase 1 view presents an option as a recommendation.
+- Desktop and mobile route, table, loading, empty, stale, degraded, and failure states
+  pass frontend tests and browser screenshots without overlap or clipped controls.
+- Existing equity scanner pages and terminology remain unchanged.
+
+References: detailed sections 3, 7.3, 8, 10.1, 12, 15-18, and 23.
+
 ## 6. Phase 2: Signals and Context
+
+Implementation status: migration 016, the provider-neutral strategy contracts,
+deterministic payoff/scenario engine, six strategy modules, durable strategy work,
+candidate/signal persistence, read APIs, and the Strategy Workbench are implemented.
+The market-data policy and strategy policy are independently versioned so a strategy
+revision can replay immutable matrices without changing or refetching their Phase 1
+ingestion cohort. Use `run_option_pipeline.py --strategies-only` for that replay.
+
+The first persisted 13-underlying cohort is intentionally all `SUPPRESSED`: its
+weekend Developer observations failed the Phase 1 local-model quality gate. The portal
+therefore demonstrates complete reason-coded decision handling but contains no
+selected recommendation, scenario package, or signal event from that cohort. A future
+passing open-session matrix can produce selected delayed research candidates; context,
+event-calendar, account/risk, and quote limitations remain separate reason-coded
+eligibility gates.
 
 Implement migration 016 before strategy output:
 
@@ -221,6 +379,17 @@ Implement the common candidate selector before module-specific output:
 - Selected, suppressed, and rejected candidate persistence with reasons
 - Output caps and byte-equivalent replay ordering
 
+A recommendation requires more than finding high-volume or high-IV contracts. It needs:
+
+- A directional, income, or neutral strategy thesis
+- Point-in-time trend and event-calendar context
+- Deterministic candidate ranking
+- Complete option legs for spreads
+- Net premium and bounded maximum loss
+- Scenario analysis
+- Suppression reasons and immutable decision evidence
+- Migration 016 candidate/signal persistence
+
 For spreads, enumerate only actual listed farther-OTM wings from the same expiration
 and matrix. Use the generic terminal-payoff evaluator as the max-loss authority and
 assert vertical, iron-condor, and butterfly formulas against it. Reject unbounded,
@@ -243,6 +412,140 @@ strategy version declare them.
 deterministic strategy invocation, transactional event/suppression/outbox persistence,
 lease acknowledgement, and metrics. It does not fetch market data or mutate accounts.
 
+### Phase 2 portal slice: Strategy Workbench
+
+Build `/options/candidates` as an institutional research workbench over persisted
+migration 016 candidates and evidence. It is not an order-entry screen. Use one dense
+workspace with a sticky command bar, grouped opportunity tables, and a right-side
+detail drawer on desktop; use a full-screen detail sheet on mobile. Compact rows may
+become cards only on narrow screens.
+
+This is an evidence-backed upgrade to the Phase 1 Market Structure Workbench, not a
+frontend relabeling of its rows. Reuse the shell, delayed-data status treatment,
+filters, responsive drawer behavior, and provenance vocabulary. Replace
+capability-neutral evidence lenses with persona presets and opportunity suites only
+for records persisted by migration 016. Phase 1 chain rows never appear in this route
+unless referenced by a persisted candidate or suppression record.
+
+The command bar contains:
+
+- source matrix time, first-observed time, `15-MINUTE DELAYED RESEARCH DATA`, policy
+  and model versions, and stale/degraded state;
+- a default `All underlyings` plus `Selected` view. Underlying and candidate-status
+  controls are server-side filters; `Suppressed`, `Rejected`, and `All decisions`
+  remain available for explanation and audit;
+- persona presets for `Income`, `Defined-Risk Income`, `Momentum`, and `Neutral / Vol`;
+- structure-risk filters for `CASH_SECURED`, `DEFINED_RISK_CREDIT`, and
+  `PREMIUM_AT_RISK_DEBIT`; undefined-risk short-option structures never appear;
+- underlying, expiration, DTE, strategy, candidate status, data quality, and maximum
+  loss/capital-at-risk controls; and
+- stable sorting by strategy rank, maximum loss, return on risk, expiration, and
+  underlying. Persona presets are saved views, not investor-suitability assessments.
+
+All normalization, Greeks, strategy evaluation, structure construction, payoff,
+scenario, ranking, and suppression logic runs in the backend durable pipeline. The
+frontend only requests typed persisted candidate pages and details, displays
+backend-computed status totals, and preserves filter/page state in the URL. It never
+loads raw chains to recreate candidate logic. Use bounded server-side pagination so
+an all-underlying view does not grow with chain size.
+
+Opportunity suites:
+
+1. **Income Generation / Wheel** shows the cash-secured put strike and expiration,
+   local put Delta, distance from a policy-defined approximately 0.30-Delta research
+   target, modeled net credit, cash collateral, gross return on collateral if the put
+   expires worthless, distance OTM, and point-in-time IV regime. The current Wheel
+   strategy does not become a 0.30-Delta selector merely because the UI displays that
+   reference; selection requires a reviewed target/tolerance and new strategy/policy
+   version. IV rank/percentile requires completed-session historical IV rollups,
+   lookback/sample metadata, and a versioned formula; it is unavailable until those
+   inputs exist.
+2. **Defined-Risk Hedged Income** shows ordered multi-leg rows such as
+   `SELL AAPL 210 PUT / BUY AAPL 205 PUT`, net credit, width, maximum profit, maximum
+   loss, credit-to-max-loss return on risk, breakevens, and scenario worst loss. An
+   adjacent compact strike chart shows call/put OI concentration clusters, spot, short
+   strikes, and protective wings. Label clusters `OI concentration`, never structural
+   floor/ceiling, dealer positioning, max pain, or expected pinning.
+3. **High-Momentum Directional** supports long single-leg calls/puts and defined-risk
+   debit verticals; `naked` never means an uncovered short option. Show the exact
+   finalized trend and activity evidence used by the strategy. Version 1 may show the
+   designed finalized daily 50-EMA and one-hour 20-EMA context. A five-minute
+   close/EMA/volume trigger is added only after migration 016 stores that finalized
+   point-in-time bar and a strategy version names it. Volume greater than OI and
+   sweep-like clusters are activity evidence, not institutional ownership or trade
+   direction. Choosing a long single leg in low IV or a debit vertical in high IV
+   requires a versioned directional structure selector, historical IV context, and
+   scenario comparison; the UI cannot infer the structure from an adjective such as
+   `cheap` or `expensive`.
+4. **Advanced Neutral** initially supports defined-risk butterflies and iron condors
+   from actual listed legs. Show the center strike or OI concentration center, distance
+   from spot, symmetric wings, bounded payoff, DTE, exchange cutoff countdown, and
+   source-time local Theta per day. Do not call the center a target pin price or use an
+   OI-only max-pain calculation. Calendar spreads are not in version 1; add them only
+   with a separately reviewed multi-expiration strategy, cross-expiration mark
+   coherence, dividend/event treatment, and full-repricing scenarios.
+
+Opportunity rows emphasize structure identity, candidate status, source age, quality,
+maximum loss/capital commitment, net premium, return on risk, primary trigger, and
+blocked reason. Do not publish a hand-built confidence score. Selected, suppressed,
+and rejected rows remain inspectable so absence of a recommendation is explainable.
+
+The candidate detail drawer contains these sections:
+
+- `Structure`: canonical ordered legs, side, ratio, multiplier, expiration, strike,
+  source-time model mark, and a `Copy structure` action. Under Developer this copies a
+  research leg specification, not broker syntax or a live limit price. Broker-ticket
+  copy is enabled only in a later quote-backed mode with current validity evidence.
+- `Risk and payoff`: modeled debit/credit, collateral, maximum profit/loss,
+  breakevens, return on collateral/risk, deterministic terminal payoff, and the
+  spot/IV/time full-repricing grid. Maximum loss is visually dominant and never hidden
+  behind premium collected.
+- `Trend and context`: finalized daily and hourly trend inputs, event blackout state,
+  source bars, timestamps, and exact pass/fail reasons actually used by the strategy.
+- `Liquidity and marketability`: Developer shows volume/OI and
+  `QUOTE_LIQUIDITY_NOT_AVAILABLE`. Advanced may show bid, ask, sizes, midpoint, and
+  spread/midpoint bands: at most 2% is efficient, above 2% through 5% is caution, and
+  above 5% fails the pricing gate. Color is supplemented by text and numeric values.
+- `Flow and volatility`: volume/OI activity, qualifying print count, exchanges,
+  notional, local IV/Greeks, and historical IV context with lookback/sample size. Do
+  not use `institutional sweep` or infer aggressor side without quote/participant
+  evidence.
+- `Management policy`: only the strategy's persisted stop, target, trailing, DTE, and
+  technical invalidation rules. Wheel/credit 50% profit capture and 0-DTE trailing
+  rules are not applied universally.
+- `Evidence`: candidate/signal IDs, matrix and decision context, policy/model/strategy
+  versions, quality flags, suppressions, validity history, and scenario provenance.
+
+Implementation order:
+
+1. Extend migration 016 and typed contracts for persona tags, strategy archetype,
+   structure-risk class, historical IV context, persisted rank components, and the
+   evidence fields above. Presentation tags come from a versioned strategy registry,
+   not frontend inference.
+2. Implement and validate any new 0.30-Delta Wheel, IV-regime structure selector, or
+   five-minute trigger as strategy changes before exposing their labels in the UI.
+3. Add typed list/detail/scenario/validity APIs with server-side filters and stable
+   pagination. Every displayed explanation must be reconstructible from immutable
+   decision evidence.
+4. Build the workbench shell and grouped tables, then the detail drawer, OI/payoff
+   graphics, loading/empty/stale/failure states, and saved URL filters.
+5. Add Advanced quote-liquidity fields later without changing the candidate/leg/risk
+   layout. Do not add automatic execution controls in this portal slice.
+
+Done when:
+
+- the same candidate payload renders identically regardless of input order, every
+  grouping/filter is derived from persisted typed fields, and replay reproduces rank
+  and explanations;
+- maximum loss and source age remain visible at desktop and mobile widths, long leg
+  text never truncates ambiguously, and the detail view has keyboard/focus coverage;
+- Developer never renders bid/ask spread quality, a live-price claim, broker ticket,
+  max pain, target pin, institutional direction, or undefined-risk recommendation;
+- scenario, context, IV-regime, Delta-target, and management values are null with an
+  exact reason when their prerequisites are absent; and
+- browser screenshots cover all four suites, selected/suppressed/rejected rows, the
+  detail drawer, long multi-leg names, stale data, and unavailable Advanced-only fields.
+
 Done when:
 
 - Forward and replay processing expose identical facts at every decision time.
@@ -256,7 +559,7 @@ Done when:
 the fill and every derived report use `RESEARCH_DELAYED_PROXY` as the data-quality
 label. They are related but are not interchangeable columns.
 
-References: sections 7.4, 11, 12 migration 016, and 18 Phase 2.
+References: sections 7.4, 10.2, 11, 12 migration 016, 15, and 18 Phase 2.
 
 ## 7. Phase 3: Paper Proxy
 
@@ -272,9 +575,20 @@ Implement migration 017 and then:
 - Performance metrics separated by strategy/version and data quality
 - Pre-trade `PortfolioRiskAnalyzer` with signed Greek telemetry and full-repricing
   stress for existing plus proposed positions
+- `PortfolioMarginHealthAnalyzer` with immutable authoritative account snapshots,
+  current and broker-what-if projected maintenance-margin utilization, and a strict
+  35% portfolio-secured put gate. Exactly 35% passes; above 35%, stale/missing NLV,
+  unreconciled state, or an estimate-only requirement blocks new portfolio-secured
+  put signals. The 20% strike-notional estimate remains display-only.
 
 Done when a forced restart reconstructs cash, margin, orders, positions, settlements,
 and P&L exactly from immutable records.
+
+The margin monitor is also done only when account updates invalidate affected
+recommendations, every pass/block references one immutable account snapshot and risk
+policy hash, and the portal distinguishes cash-secured requirement, planning estimate,
+broker requirement, current utilization, and projected utilization without coercing
+unavailable values to zero.
 
 References: sections 12 migration 017, 13, and 18 Phase 3.
 

@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "policy_version": "developer_v1",
+  "contract_filter": {
+    "minimum_dte": 0,
+    "maximum_dte": 45,
+    "strike_corridor_fraction": "0.15",
+    "minimum_day_volume": 20,
+    "minimum_open_interest": 100,
+    "maximum_unknown_references": 20,
+    "maximum_unknown_reference_fraction": "0.01",
+    "reference_admission_budget_seconds": 5,
+    "required_exercise_style": "AMERICAN",
+    "required_shares_per_contract": 100
+  },
+  "model_quality": {
+    "maximum_developer_source_age_seconds": 1800,
+    "maximum_option_spot_skew_seconds": 60,
+    "intrinsic_price_tolerance": "0.01",
+    "minimum_iv_success_fraction": "0.95",
+    "minimum_iv": "0.01",
+    "maximum_iv": "5.00",
+    "newton_iterations": 20,
+    "price_error_tolerance": 0.000001,
+    "minimum_vega": 0.00000001,
+    "use_brent_fallback": true,
+    "allowed_model_mark_sources": [
+      "DEVELOPER_ALIGNED_AGG_CLOSE"
+    ],
+    "display_only_mark_sources": [
+      "DISPLAY_DAY_CLOSE",
+      "DISPLAY_DAY_VWAP"
+    ]
+  },
+  "provider_requests": {
+    "request_timeout_seconds": 30,
+    "maximum_rate_limit_retries": 3,
+    "default_retry_after_seconds": 15
+  },
+  "oi_walls": {
+    "percentile": 0.9,
+    "minimum_robust_z": 2.5,
+    "maximum_clusters_per_expiration_type": 5,
+    "allow_zero_mad_fallback": false
+  },
+  "analysis": {
+    "maximum_delta_interpolation_gap": 0.15
+  },
+  "archive": {
+    "maximum_queue_items": 100000,
+    "maximum_queue_bytes": 268435456,
+    "maximum_rows_per_file": 100000,
+    "maximum_buffer_age_seconds": 60,
+    "stale_partial_grace_seconds": 600
+  },
+  "capacity": {
+    "maximum_contracts_per_order": 10,
+    "maximum_positions": 20,
+    "maximum_orders_per_cycle": 20,
+    "maximum_pages_per_batch": 40,
+    "maximum_contracts_per_batch": 10000,
+    "maximum_page_bytes": 10485760,
+    "maximum_batch_bytes": 67108864,
+    "maximum_trade_events_per_request": 500000,
+    "maximum_work_attempts": 5
+  },
+  "retention": {
+    "raw_troubleshooting_days": 30,
+    "normalized_intraday_days": 90,
+    "one_second_aggregate_days": 30,
+    "one_minute_aggregate_years": 2,
+    "daily_research_years": 7,
+    "ledger_audit_years": 7,
+    "contract_metadata_indefinite": true
+  }
+}

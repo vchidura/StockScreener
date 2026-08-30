@@ -42,6 +42,7 @@ from screeners import (
 from research.price_structures import analyze_price_structures
 from research.forming_patterns import detect_forming_patterns, summarize_cross_frame_patterns
 from research.price_channels import detect_price_channel
+from options.api import router as options_router
 
 app = FastAPI(
     title="Stock Screener API",
@@ -84,6 +85,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(options_router)
 
 # Thread pool for parallel scanning — sized to CPU cores
 # I/O-bound work (DB queries) benefits from 2× core count
