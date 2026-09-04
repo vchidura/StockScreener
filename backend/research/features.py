@@ -49,27 +49,41 @@ def load_daily_panel(start: str | None = None, end: str | None = None,
     clauses = []
     params: list = []
     if start:
-        clauses.append("datetime >= %s")
+        clauses.append("session_date >= %s")
         params.append(start)
     if end:
-        clauses.append("datetime <= %s")
+        clauses.append("session_date <= %s")
         params.append(end)
     if tickers:
         clauses.append("ticker = ANY(%s)")
         params.append(tickers)
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    where = f"AND {' AND '.join(clauses)}" if clauses else ""
 
     sql = f"""
-        SELECT ticker,
-               datetime::date AS date,
+         SELECT DISTINCT ON (ticker, session_date)
+             ticker,
+             session_date AS date,
                open_price AS open,
-               high,
-               low,
+             high_price AS high,
+             low_price AS low,
                close_price AS close,
                volume
-        FROM stock_prices_daily
+         FROM equity_bar_revisions
+         WHERE interval = '1d'
+           AND session_scope = 'RTH'
+           AND adjusted = FALSE
+           AND is_final = TRUE
+           AND COALESCE(replay_available_at, system_observed_at) <= NOW()
         {where}
-        ORDER BY ticker, datetime
+         ORDER BY ticker, session_date,
+               CASE
+                WHEN source_kind = 'RECONCILED' THEN 0
+                WHEN source_kind = 'DERIVED' THEN 1
+                WHEN source_kind = 'NATIVE_REST' THEN 2
+                ELSE 3
+               END,
+               COALESCE(replay_available_at, system_observed_at) DESC,
+               created_at DESC
     """
     with get_db_cursor() as cur:
         cur.execute(sql, params)
@@ -175,18 +189,40 @@ def load_hourly_features(start: str | None = None, end: str | None = None,
     clauses = []
     params: list = []
     if start:
-        clauses.append("datetime >= %s")
+        clauses.append("bar_start >= %s")
         params.append(start)
     if end:
-        clauses.append("datetime <= %s")
+        clauses.append("bar_start <= %s")
         params.append(end)
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    where = f"AND {' AND '.join(clauses)}" if clauses else ""
     params.append(min_bars)
 
     sql = f"""
-        WITH bars AS (
+                WITH canonical_hourly AS (
+                        SELECT DISTINCT ON (ticker, bar_start)
+                                     ticker, session_date AS d, bar_start AS datetime,
+                                     open_price, high_price AS high, low_price AS low,
+                                     close_price, volume
+                        FROM equity_bar_revisions
+                        WHERE interval = '1h'
+                            AND session_scope = 'RTH'
+                            AND adjusted = FALSE
+                            AND is_final = TRUE
+                            AND COALESCE(replay_available_at, system_observed_at) <= NOW()
+                            {where}
+                        ORDER BY ticker, bar_start,
+                                         CASE
+                                                 WHEN source_kind = 'RECONCILED' THEN 0
+                                                 WHEN source_kind = 'DERIVED' THEN 1
+                                                 WHEN source_kind = 'NATIVE_REST' THEN 2
+                                                 ELSE 3
+                                         END,
+                                         COALESCE(replay_available_at, system_observed_at) DESC,
+                                         created_at DESC
+                ),
+                bars AS (
             SELECT ticker,
-                   (datetime AT TIME ZONE 'America/New_York')::date AS d,
+                                     d,
                    datetime,
                    open_price, high, low, close_price, volume,
                    ROW_NUMBER() OVER (
@@ -196,8 +232,7 @@ def load_hourly_features(start: str | None = None, end: str | None = None,
                    COUNT(*) OVER (
                        PARTITION BY ticker, (datetime AT TIME ZONE 'America/New_York')::date
                    ) AS n_bars
-            FROM stock_prices_hourly
-            {where}
+            FROM canonical_hourly
         ),
         agg AS (
             SELECT ticker, d,
@@ -236,10 +271,26 @@ def load_hourly_features(start: str | None = None, end: str | None = None,
                  / NULLIF(agg.pv_sum / NULLIF(agg.vol_sum, 0), 0) - 1   AS vwap_dev,
                agg.intraday_vol,
                dd.close_price / NULLIF(agg.last_open, 0) - 1            AS last_hour_ret
-        FROM agg
-        -- Anchor to the official close; the last 1h bar misses the closing auction.
-        JOIN stock_prices_daily dd
-          ON dd.ticker = agg.ticker AND dd.datetime::date = agg.d
+                FROM agg
+                JOIN (
+                        SELECT DISTINCT ON (ticker, session_date)
+                                     ticker, session_date, close_price
+                        FROM equity_bar_revisions
+                        WHERE interval = '1d'
+                            AND session_scope = 'RTH'
+                            AND adjusted = FALSE
+                            AND is_final = TRUE
+                            AND COALESCE(replay_available_at, system_observed_at) <= NOW()
+                        ORDER BY ticker, session_date,
+                                         CASE
+                                                 WHEN source_kind = 'RECONCILED' THEN 0
+                                                 WHEN source_kind = 'DERIVED' THEN 1
+                                                 WHEN source_kind = 'NATIVE_REST' THEN 2
+                                                 ELSE 3
+                                         END,
+                                         COALESCE(replay_available_at, system_observed_at) DESC,
+                                         created_at DESC
+                ) dd ON dd.ticker = agg.ticker AND dd.session_date = agg.d
         WHERE agg.n_bars >= %s
         ORDER BY agg.ticker, agg.d
     """

@@ -52,7 +52,9 @@ class OptionIngestionRepository(PostgresRepository):
                     provider,
                     underlying,
                     scheduled_cycle,
-                    request_filter_sha256
+                    request_filter_sha256,
+                    policy_sha256,
+                    configuration_sha256
                 ) DO NOTHING
                 RETURNING batch_id
                 """,
@@ -85,12 +87,16 @@ class OptionIngestionRepository(PostgresRepository):
                   AND underlying = %s
                   AND scheduled_cycle = %s
                   AND request_filter_sha256 = %s
+                                    AND policy_sha256 = %s
+                                    AND configuration_sha256 = %s
                 """,
                 (
                     batch.provider,
                     batch.underlyer,
                     batch.scheduled_cycle,
                     batch.request_filter_sha256,
+                                        batch.policy_sha256,
+                                        configuration_sha256,
                 ),
             )
             existing = cursor.fetchone()

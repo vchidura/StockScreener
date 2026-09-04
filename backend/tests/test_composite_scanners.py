@@ -11,12 +11,30 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from research.composite_scanners import (
+    COMPOSITE_OUTCOME_HORIZONS,
+    COMPOSITE_SCANNER_REGISTRY,
     build_composite_scanner_events,
     _compression_breakout_events,
     _failed_breakout_reversal_events,
     _point_in_time_vwap,
     _pullback_metadata,
 )
+
+
+def test_composite_registry_declares_versions_intervals_and_plan_contracts():
+    assert len(COMPOSITE_SCANNER_REGISTRY) == 7
+    assert COMPOSITE_SCANNER_REGISTRY["level_retest_rejection"].source_version == "1.2"
+    assert COMPOSITE_SCANNER_REGISTRY["sma200_reclaim_rejection"].supported_intervals == (
+        "1d", "1wk",
+    )
+    assert all(
+        registration.outcome_modes == (
+            "DIRECTIONAL_HORIZON", "RECOMMENDATION_PLAN",
+        )
+        for registration in COMPOSITE_SCANNER_REGISTRY.values()
+    )
+    assert COMPOSITE_OUTCOME_HORIZONS["1h"] == {"7h": 7, "21h": 21, "35h": 35}
+    assert COMPOSITE_OUTCOME_HORIZONS["1d"] == {"5d": 5, "10d": 10, "21d": 21}
 
 
 def _failed_breakout_frame() -> pd.DataFrame:

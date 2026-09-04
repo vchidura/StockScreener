@@ -8,7 +8,7 @@ UNVALIDATED SHADOW MODEL. Not run through run_alpha_research.py's 5-gate
 contract (see docs/SIGNAL_RESEARCH.md, docs/MODEL_REGISTRY.md). Writes to the
 same `cross_sectional_signals` table as xsmom-1.0 but under a distinct
 model_version, so it never overwrites or competes with the production signal.
-Do not wire this into run_scheduler.py or the portal's primary recommendation
+Do not wire this into the canonical ingestion worker or the portal's primary recommendation
 views until it has been validated and formally promoted.
 
 Model (meanrev-1.0-shadow):

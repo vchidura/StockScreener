@@ -171,6 +171,51 @@ class OptionWorkItemRepository(PostgresRepository):
             row = cursor.fetchone()
         return _work_item(row) if row else None
 
+    def latest_due_cycle(
+        self,
+        policy_sha256: str,
+        configuration_sha256: str,
+    ):
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT MAX(pending.scheduled_cycle) AS scheduled_cycle
+                FROM (
+                    SELECT ingestion.scheduled_cycle
+                    FROM option_work_items AS work
+                    JOIN option_ingestion_runs AS ingestion
+                      ON work.subject_id = ingestion.batch_id::text
+                    WHERE work.stage = 'NORMALIZE'
+                      AND work.status = 'RETRY'
+                      AND work.next_attempt_at <= NOW()
+                      AND work.attempt_count < work.maximum_attempts
+                      AND ingestion.policy_sha256 = %s
+                      AND ingestion.configuration_sha256 = %s
+                    UNION ALL
+                    SELECT ingestion.scheduled_cycle
+                    FROM option_work_items AS work
+                    JOIN option_analysis_runs AS analysis
+                      ON work.subject_id = analysis.matrix_id::text
+                    JOIN option_ingestion_runs AS ingestion
+                      ON ingestion.batch_id = analysis.batch_id
+                    WHERE work.stage = 'STRATEGY'
+                      AND work.status = 'RETRY'
+                      AND work.next_attempt_at <= NOW()
+                      AND work.attempt_count < work.maximum_attempts
+                      AND ingestion.policy_sha256 = %s
+                      AND ingestion.configuration_sha256 = %s
+                ) AS pending
+                """,
+                (
+                    policy_sha256,
+                    configuration_sha256,
+                    policy_sha256,
+                    configuration_sha256,
+                ),
+            )
+            row = cursor.fetchone()
+        return row["scheduled_cycle"] if row else None
+
     def complete(self, work_id: UUID, lease_owner: str) -> bool:
         with self._cursor() as cursor:
             cursor.execute(
@@ -216,6 +261,29 @@ class OptionWorkItemRepository(PostgresRepository):
                   AND lease_owner = %s
                 """,
                 (retry_seconds, error, work_id, lease_owner),
+            )
+            return cursor.rowcount == 1
+
+    def terminal_fail(
+        self,
+        work_id: UUID,
+        lease_owner: str,
+        error: str,
+    ) -> bool:
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE option_work_items
+                SET status = 'TERMINAL_FAILED',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    last_error = %s,
+                    updated_at = NOW()
+                WHERE work_id = %s
+                  AND status = 'CLAIMED'
+                  AND lease_owner = %s
+                """,
+                (error, work_id, lease_owner),
             )
             return cursor.rowcount == 1
 

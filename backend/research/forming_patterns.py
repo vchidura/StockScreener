@@ -667,12 +667,24 @@ def _forming_cup_handle(frame: pd.DataFrame, atr: pd.Series, pivots: list[dict])
     return candidates
 
 
-def detect_forming_patterns(frame: pd.DataFrame, max_patterns: int = 3) -> list[dict]:
-    """Return the best current chart-only formations from completed bars."""
+def detect_forming_patterns(
+    frame: pd.DataFrame,
+    max_patterns: int = 3,
+    *,
+    input_includes_forming_bar: bool = True,
+) -> list[dict]:
+    """Return the best current chart-only formations from completed bars.
+
+    Request-time legacy frames include a newest bar that may still be forming. A
+    finalized-bar worker sets ``input_includes_forming_bar=False`` so the newest
+    sealed bar remains eligible.
+    """
     required = {"open", "high", "low", "close", "volume"}
     if frame is None or len(frame) < 30 or not required.issubset(frame.columns):
         return []
-    completed = frame.iloc[:-1].tail(300).copy()
+    completed = (
+        frame.iloc[:-1] if input_includes_forming_bar else frame
+    ).tail(300).copy()
     for column in required:
         completed[column] = pd.to_numeric(completed[column], errors="coerce")
     completed = completed.dropna(subset=list(required))

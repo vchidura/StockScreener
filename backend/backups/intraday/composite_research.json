@@ -1,0 +1,35 @@
+{
+  "adapter_summary": {
+    "direction_counts": {
+      "LONG": 145880,
+      "SHORT": 141147
+    },
+    "lane_counts": {
+      "breakout_expansion": 27576,
+      "compression_breakout": 2705,
+      "failed_breakout_reversal": 33558,
+      "level_retest_rejection": 171804,
+      "sma200_reclaim_rejection": 116,
+      "structure_reversal": 13675,
+      "structured_trend_pullback": 37593
+    }
+  },
+  "bar_lineage": "ADJUSTED",
+  "candidate_count": 247758,
+  "event_count": 287027,
+  "events_output": "C:\\Users\\vachi\\source\\repo\\StockScreener\\backend\\backups\\intraday\\composite_events_1d.jsonl",
+  "exclusion_counts": {
+    "CORPORATE_ACTION": 19,
+    "INSUFFICIENT_HISTORY": 0,
+    "NOT_IN_UNIVERSE": 147651
+  },
+  "first_session": "2022-07-22",
+  "last_session": "2026-09-03",
+  "sessions": 1034,
+  "shard_count": 1,
+  "shard_index": 0,
+  "source_name": "COMPOSITE_SCANNERS",
+  "source_version": "composite_scanners_daily_v1",
+  "union_tickers": 2919,
+  "universe_policy_version": "liquid_us_common_stocks_v2"
+}

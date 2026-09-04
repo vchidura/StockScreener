@@ -1,0 +1,56 @@
+{
+  "available_by": "2026-09-03T15:11:01.866543+00:00",
+  "bars_scanned": 638980,
+  "detector_policy": {
+    "atr_period": 14,
+    "benchmark_adverse_return": 0.003,
+    "close_location_bearish": 0.35,
+    "close_location_bullish": 0.65,
+    "detector_policy_version": "intraday_scanner_policy_v1",
+    "ema_fast": 8,
+    "ema_mid": 21,
+    "ema_slow": 55,
+    "invalidation_buffer_atr": 0.1,
+    "minimum_history_bars": 60,
+    "opening_range_bars": 1,
+    "opening_range_breakout_buffer_atr": 0.1,
+    "pullback_max_bars": 2,
+    "pullback_touch_atr": 0.5,
+    "relative_volume_multiple": 1.0,
+    "resumption_close_location": 0.6,
+    "reward_to_risk": 2.0,
+    "trend_age_bars": 4,
+    "volume_baseline_sessions": 20,
+    "vwap_policy_version": "session_cumulative_bar_vwap_v1"
+  },
+  "diagnostics": {},
+  "direction_counts": {
+    "CONTROL_LOOKAHEAD_ORACLE:LONG": 7665,
+    "CONTROL_LOOKAHEAD_ORACLE:SHORT": 7413,
+    "CONTROL_RANDOM_DIRECTION:LONG": 7596,
+    "CONTROL_RANDOM_DIRECTION:SHORT": 7679
+  },
+  "event_counts": {
+    "CONTROL_LOOKAHEAD_ORACLE": 15078,
+    "CONTROL_RANDOM_DIRECTION": 15275
+  },
+  "events": 30353,
+  "first_signal_time": "2021-09-10T18:00:00+00:00",
+  "interval": "30m",
+  "last_signal_time": "2026-09-02T19:00:00+00:00",
+  "limitations": [
+    "FIXED_COHORT_EXPLORATORY",
+    "SURVIVORSHIP_BIASED_UNIVERSE",
+    "NO_POINT_IN_TIME_INTRADAY_MEMBERSHIP"
+  ],
+  "missing_benchmark_bars": [],
+  "output": "backups\\intraday\\control_events.jsonl",
+  "scanners": {
+    "CONTROL_LOOKAHEAD_ORACLE": "lookahead_oracle_v1",
+    "CONTROL_RANDOM_DIRECTION": "random_direction_v1"
+  },
+  "securities": 40,
+  "skipped_tickers_without_bars": [],
+  "universe_policy_version": "polygon_reference_v1",
+  "universe_run_id": "53e7bc91-b142-560e-a93c-a056c6638459"
+}

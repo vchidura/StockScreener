@@ -1,7 +1,7 @@
 """
 Build the initial trading universe directly from Polygon.io (massive.com) reference
 data — no pre-existing price history required (unlike add_more_tickers.py, which
-needs stock_prices_hourly to already be populated).
+uses Polygon reference data and canonical equity history when available).
 
 Pipeline:
   1. List all active US common stocks (v3/reference/tickers, type=CS)
@@ -36,7 +36,7 @@ from dotenv import load_dotenv
 load_dotenv(BACKEND_DIR / ".env")
 
 import os
-from database import get_db_cursor, create_selected_tickers_table, migrate_selected_tickers_metadata
+from database import get_db_cursor
 from http_client import build_session
 
 SESSION = build_session(pool_maxsize=32)  # sized for the 20-worker thread pool below
@@ -169,10 +169,20 @@ def main():
     parser.add_argument("--min-price", type=float, default=5.0)
     parser.add_argument("--lookback-days", type=int, default=20, help="Trading days used to average price/volume")
     parser.add_argument("--no-etfs", action="store_true", help="Skip adding the curated ETF list")
+    parser.add_argument("--if-empty", action="store_true", help="Exit successfully when an active universe already exists")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     _require_key()
+    if args.if_empty:
+        with get_db_cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS count FROM selected_tickers WHERE is_active = TRUE"
+            )
+            existing = int(cursor.fetchone()["count"])
+        if existing:
+            print(f"Universe already contains {existing} active tickers; skipping discovery.")
+            return
 
     print(f"Step 1: Listing active US common stocks...")
     stock_universe = fetch_active_common_stocks()
@@ -230,9 +240,6 @@ def main():
             print(f"  ... and {len(final_stocks) - 20} more")
         print(f"  Plus ETFs: {', '.join(etfs)}")
         return
-
-    create_selected_tickers_table()
-    migrate_selected_tickers_metadata()
 
     with get_db_cursor(dict_cursor=False) as cur:
         for row in final_stocks:

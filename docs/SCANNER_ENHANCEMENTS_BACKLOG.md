@@ -1,5 +1,15 @@
 # Scanner Evaluation Enhancements Backlog
 
+> Archived backlog: implementation references below describe the retired scanner-event ledger.
+> Canonical sector-primary evidence superseded that runtime in migration 038. Open ideas require a
+> new canonical study and must not restore the deleted scripts or tables.
+>
+> Status 2026-09-03: items 1 and 2 (ticker breadth, top-5 concentration) were re-implemented in the
+> canonical runtime and are stored in `equity_qualification_metrics_v3`. Item 3
+> (regime-conditioned alpha) was **not** ported and is absent from the canonical runtime, which
+> still returns `regime_alpha` empty. Read the "[Implemented]" markers below as applying to the
+> retired runtime only.
+
 Running list of methodology gaps identified during portal review. Items 1, 2, 3, 4, 6, 7, 8, 9, 10,
 11, 12 were implemented and backfilled on 2026-08-23 (see "Execution checklist" below for what
 shipped and how it was verified). Item 5 remains open for a later pass. See
@@ -161,7 +171,7 @@ are validated against real qualification output.
 ## Execution checklist (2026-08-23 — items 1, 2, 3, 4, 6, 7, 8, 9, 10, 11; 5 deferred)
 
 - [x] `research/gics_sectors.py`: `SECTOR_BENCHMARK_ETF` map + `BROAD_MARKET_ETF` + `sector_benchmark_ticker()` (item 4, 7, 11)
-- [x] `migrations/014_scanner_etf_benchmark.sql`: add `market_benchmark_ticker`, `sector_benchmark_ticker`,
+- [x] Historical migration 014, now consolidated in `000_canonical_schema.sql`: add `market_benchmark_ticker`, `sector_benchmark_ticker`,
       `sector_benchmark_return`, `sector_alpha_return`, `sector_net_alpha_return` to `scanner_event_outcomes`,
       plus column comments documenting the definition change (item 4, 9). Applied to the live DB.
 - [x] `research/scanner_events.py`: removed `_benchmark_return`/`_batched_benchmark_returns` (universe-average),

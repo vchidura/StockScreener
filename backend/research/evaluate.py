@@ -377,40 +377,6 @@ def persist_run(record: dict) -> int | None:
         from database import get_db_cursor
 
         with get_db_cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS research_runs (
-                    run_id SERIAL PRIMARY KEY,
-                    run_at TIMESTAMPTZ DEFAULT NOW(),
-                    features TEXT NOT NULL,
-                    horizon_days SMALLINT NOT NULL,
-                    rebalance_days SMALLINT NOT NULL,
-                    cost_bps REAL NOT NULL,
-                    neutralised BOOLEAN NOT NULL DEFAULT TRUE,
-                    data_start DATE, data_end DATE,
-                    rows_used INTEGER, tickers INTEGER, test_periods INTEGER,
-                    ic_mean DOUBLE PRECISION, ic_ir DOUBLE PRECISION,
-                    ic_t_stat DOUBLE PRECISION, decile_spread DOUBLE PRECISION,
-                    ls_net_return DOUBLE PRECISION, ls_net_sharpe DOUBLE PRECISION,
-                    turnover DOUBLE PRECISION,
-                    base_return DOUBLE PRECISION, base_sharpe DOUBLE PRECISION,
-                    verdict VARCHAR(32), checks_passed SMALLINT, checks_total SMALLINT
-                )
-            """)
-            cur.execute("""
-                ALTER TABLE research_runs
-                    ADD COLUMN IF NOT EXISTS activity_filter VARCHAR(32)
-                        NOT NULL DEFAULT 'none',
-                    ADD COLUMN IF NOT EXISTS top_net_return DOUBLE PRECISION,
-                    ADD COLUMN IF NOT EXISTS top_net_sharpe DOUBLE PRECISION,
-                    ADD COLUMN IF NOT EXISTS top_turnover DOUBLE PRECISION,
-                    ADD COLUMN IF NOT EXISTS top_alpha_return DOUBLE PRECISION,
-                    ADD COLUMN IF NOT EXISTS top_alpha_t_stat DOUBLE PRECISION,
-                    ADD COLUMN IF NOT EXISTS top_alpha_sharpe DOUBLE PRECISION,
-                    ADD COLUMN IF NOT EXISTS cal_years JSONB,
-                    ADD COLUMN IF NOT EXISTS cal_year_positive_pct JSONB
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_research_runs_at "
-                        "ON research_runs (run_at DESC)")
             cur.execute(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema = current_schema() AND table_name = 'research_runs'"

@@ -657,7 +657,7 @@ function Dashboard() {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
             <h3 style={{ ...SECTION_TITLE, margin: 0 }}>Scanner Evidence <span style={SUBTITLE}>Shadow outcomes · no recommendations</span></h3>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <button onClick={() => navigate('/scanner-results')} style={{ ...selectStyle, cursor: 'pointer', color: '#245f9e', fontWeight: 700 }}>
+              <button onClick={() => navigate('/stock-research/research')} style={{ ...selectStyle, cursor: 'pointer', color: '#245f9e', fontWeight: 700 }}>
                 Full evaluation
               </button>
               <select value={scannerInterval} onChange={event => setScannerInterval(event.target.value as ScannerInterval)} style={selectStyle}>
@@ -694,13 +694,13 @@ function Dashboard() {
                 {scannerSummary.results.length > 0 && (
                   <table style={{ width: '100%', fontSize: '0.76rem', borderCollapse: 'collapse', marginBottom: '9px' }}>
                     <thead><tr style={{ borderBottom: '1px solid #e2e8f0' }}>
-                      {['State', 'Side', 'Horizon', 'Periods', 'Alpha', 't', 'MAE/MFE'].map(label => (
-                        <th key={label} style={{ textAlign: label === 'State' ? 'left' : 'right', padding: '4px 2px', color: '#64748b' }}>{label}</th>
+                      {['Scanner', 'Side', 'Horizon', 'Periods', 'Alpha', 't', 'MAE/MFE'].map(label => (
+                        <th key={label} style={{ textAlign: label === 'Scanner' ? 'left' : 'right', padding: '4px 2px', color: '#64748b' }}>{label}</th>
                       ))}
                     </tr></thead>
                     <tbody>{scannerSummary.results.slice(0, 6).map(row => (
-                      <tr key={`${row.discovery_state}-${row.direction}-${row.horizon_bars}`} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                        <td style={{ padding: '4px 2px' }}>{row.discovery_state?.replace(/_/g, ' ') ?? 'Unclassified'}</td>
+                      <tr key={`${row.scanner_name}-${row.scanner_version}-${row.outcome_policy_key}-${row.direction}-${row.horizon_bars}`} style={{ borderBottom: '1px solid #f1f5f9' }}>
+                        <td style={{ padding: '4px 2px' }}>{row.scanner_name.replace(/_/g, ' ')}<div style={{ color: '#94a3b8', fontSize: '0.64rem' }}>{row.return_mode === 'RECOMMENDATION_PLAN' ? 'Plan' : 'Horizon'}</div></td>
                         <td style={{ textAlign: 'right' }}>{row.direction === 1 ? 'Bull' : 'Bear'}</td>
                         <td style={{ textAlign: 'right' }}>{row.horizon_bars}{row.interval === '1wk' ? ' sessions' : ' bars'}</td>
                         <td style={{ textAlign: 'right' }}>{row.independent_periods}</td>

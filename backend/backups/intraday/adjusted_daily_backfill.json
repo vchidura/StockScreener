@@ -1,0 +1,14 @@
+{
+  "start": "2021-08-01",
+  "end": "2026-09-03",
+  "sessions": 1279,
+  "universe_members": 386,
+  "securities_selected": 350,
+  "common_stock_only": true,
+  "mode": "APPLY",
+  "bars_normalized": 418009,
+  "bars_inserted": 414648,
+  "sessions_without_rows": 0,
+  "sessions_not_entitled": 25,
+  "first_entitled_session": "2021-09-07"
+}

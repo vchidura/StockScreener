@@ -1,0 +1,85 @@
+{
+  "available_by": "2026-09-03T15:14:26.528295+00:00",
+  "evaluate": {
+    "policies": [
+      {
+        "batches": 4,
+        "due": 15076,
+        "horizon_key": "120m",
+        "maturity_cutoff": "2026-09-02T18:00:00+00:00",
+        "pending": 0,
+        "persisted": 15076,
+        "policy_key": "CONTROL_LOOKAHEAD_ORACLE:lookahead_oracle_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "CONTROL_LOOKAHEAD_ORACLE"
+      },
+      {
+        "batches": 4,
+        "due": 15078,
+        "horizon_key": "30m",
+        "maturity_cutoff": "2026-09-02T19:30:00+00:00",
+        "pending": 0,
+        "persisted": 15078,
+        "policy_key": "CONTROL_LOOKAHEAD_ORACLE:lookahead_oracle_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "CONTROL_LOOKAHEAD_ORACLE"
+      },
+      {
+        "batches": 4,
+        "due": 15078,
+        "horizon_key": "60m",
+        "maturity_cutoff": "2026-09-02T19:00:00+00:00",
+        "pending": 0,
+        "persisted": 15078,
+        "policy_key": "CONTROL_LOOKAHEAD_ORACLE:lookahead_oracle_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "CONTROL_LOOKAHEAD_ORACLE"
+      },
+      {
+        "batches": 4,
+        "due": 15273,
+        "horizon_key": "120m",
+        "maturity_cutoff": "2026-09-02T18:00:00+00:00",
+        "pending": 0,
+        "persisted": 15273,
+        "policy_key": "CONTROL_RANDOM_DIRECTION:random_direction_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "CONTROL_RANDOM_DIRECTION"
+      },
+      {
+        "batches": 4,
+        "due": 15275,
+        "horizon_key": "30m",
+        "maturity_cutoff": "2026-09-02T19:30:00+00:00",
+        "pending": 0,
+        "persisted": 15275,
+        "policy_key": "CONTROL_RANDOM_DIRECTION:random_direction_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "CONTROL_RANDOM_DIRECTION"
+      },
+      {
+        "batches": 4,
+        "due": 15275,
+        "horizon_key": "60m",
+        "maturity_cutoff": "2026-09-02T19:00:00+00:00",
+        "pending": 0,
+        "persisted": 15275,
+        "policy_key": "CONTROL_RANDOM_DIRECTION:random_direction_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "CONTROL_RANDOM_DIRECTION"
+      }
+    ]
+  },
+  "events_file": "backups\\intraday\\control_events.jsonl",
+  "events_loaded": 30353,
+  "interval": "30m",
+  "limitations": [
+    "FIXED_COHORT_EXPLORATORY",
+    "SURVIVORSHIP_BIASED_UNIVERSE",
+    "NO_POINT_IN_TIME_INTRADAY_MEMBERSHIP"
+  ],
+  "persist_evidence": {
+    "events": 30353,
+    "evidence_inserted": 30353
+  }
+}

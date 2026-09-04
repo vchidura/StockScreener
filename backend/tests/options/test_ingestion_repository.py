@@ -171,6 +171,25 @@ def test_existing_ingestion_slot_rejects_different_evidence_cohort():
     connection.rollback.assert_called_once_with()
 
 
+def test_ingestion_slot_identity_includes_policy_and_configuration():
+    source = (
+        BACKEND_DIR / "options" / "repositories" / "ingestion.py"
+    ).read_text(encoding="utf-8")
+    schema = " ".join((
+        BACKEND_DIR / "migrations" / "000_canonical_schema.sql"
+    ).read_text(encoding="utf-8").split())
+
+    identity = (
+        "provider, underlying, scheduled_cycle, request_filter_sha256, "
+        "policy_sha256, configuration_sha256"
+    )
+    assert identity in schema
+    assert "request_filter_sha256,\n                    policy_sha256" in source
+    assert 'BASELINE_VERSION = "000_canonical_schema"' in (
+        BACKEND_DIR / "stock_screener" / "schema.py"
+    ).read_text(encoding="utf-8")
+
+
 def test_normalization_telemetry_updates_only_complete_batch():
     repository, connection, cursor = _repository()
     cursor.rowcount = 1

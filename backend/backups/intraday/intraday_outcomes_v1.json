@@ -1,0 +1,279 @@
+{
+  "available_by": "2026-09-03T07:37:00.198560+00:00",
+  "evaluate": {
+    "policies": [
+      {
+        "batches": 15,
+        "due": 70799,
+        "horizon_key": "120m",
+        "maturity_cutoff": "2026-09-02T18:00:00+00:00",
+        "pending": 0,
+        "persisted": 70799,
+        "policy_key": "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL:failed_opening_breakout_v1:30m:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL"
+      },
+      {
+        "batches": 15,
+        "due": 70816,
+        "horizon_key": "30m",
+        "maturity_cutoff": "2026-09-02T19:30:00+00:00",
+        "pending": 0,
+        "persisted": 70816,
+        "policy_key": "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL:failed_opening_breakout_v1:30m:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL"
+      },
+      {
+        "batches": 15,
+        "due": 70809,
+        "horizon_key": "60m",
+        "maturity_cutoff": "2026-09-02T19:00:00+00:00",
+        "pending": 0,
+        "persisted": 70809,
+        "policy_key": "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL:failed_opening_breakout_v1:30m:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL"
+      },
+      {
+        "batches": 15,
+        "due": 70799,
+        "horizon_key": "120m",
+        "maturity_cutoff": "2026-09-02T18:00:00+00:00",
+        "pending": 0,
+        "persisted": 70799,
+        "policy_key": "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL:failed_opening_breakout_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL"
+      },
+      {
+        "batches": 15,
+        "due": 70816,
+        "horizon_key": "30m",
+        "maturity_cutoff": "2026-09-02T19:30:00+00:00",
+        "pending": 0,
+        "persisted": 70816,
+        "policy_key": "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL:failed_opening_breakout_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL"
+      },
+      {
+        "batches": 15,
+        "due": 70809,
+        "horizon_key": "60m",
+        "maturity_cutoff": "2026-09-02T19:00:00+00:00",
+        "pending": 0,
+        "persisted": 70809,
+        "policy_key": "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL:failed_opening_breakout_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL"
+      },
+      {
+        "batches": 20,
+        "due": 97856,
+        "horizon_key": "120m",
+        "maturity_cutoff": "2026-09-02T18:00:00+00:00",
+        "pending": 0,
+        "persisted": 97856,
+        "policy_key": "INTRADAY_OPENING_RANGE_BREAKOUT_CONTINUATION:opening_range_breakout_v1:30m:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "INTRADAY_OPENING_RANGE_BREAKOUT_CONTINUATION"
+      },
+      {
+        "batches": 20,
+        "due": 97867,
+        "horizon_key": "30m",
+        "maturity_cutoff": "2026-09-02T19:30:00+00:00",
+        "pending": 0,
+        "persisted": 97867,
+        "policy_key": "INTRADAY_OPENING_RANGE_BREAKOUT_CONTINUATION:opening_range_breakout_v1:30m:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "INTRADAY_OPENING_RANGE_BREAKOUT_CONTINUATION"
+      },
+      {
+        "batches": 20,
+        "due": 97861,
+        "horizon_key": "60m",
+        "maturity_cutoff": "2026-09-02T19:00:00+00:00",
+        "pending": 0,
+        "persisted": 97861,
+        "policy_key": "INTRADAY_OPENING_RANGE_BREAKOUT_CONTINUATION:opening_range_breakout_v1:30m:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "INTRADAY_OPENING_RANGE_BREAKOUT_CONTINUATION"
+      },
+      {
+        "batches": 20,
+        "due": 97856,
+        "horizon_key": "120m",
+        "maturity_cutoff": "2026-09-02T18:00:00+00:00",
+        "pending": 0,
+        "persisted": 97856,
+        "policy_key": "INTRADAY_OPENING_RANGE_BREAKOUT_CONTINUATION:opening_range_breakout_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "INTRADAY_OPENING_RANGE_BREAKOUT_CONTINUATION"
+      },
+      {
+        "batches": 20,
+        "due": 97867,
+        "horizon_key": "30m",
+        "maturity_cutoff": "2026-09-02T19:30:00+00:00",
+        "pending": 0,
+        "persisted": 97867,
+        "policy_key": "INTRADAY_OPENING_RANGE_BREAKOUT_CONTINUATION:opening_range_breakout_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "INTRADAY_OPENING_RANGE_BREAKOUT_CONTINUATION"
+      },
+      {
+        "batches": 20,
+        "due": 97861,
+        "horizon_key": "60m",
+        "maturity_cutoff": "2026-09-02T19:00:00+00:00",
+        "pending": 0,
+        "persisted": 97861,
+        "policy_key": "INTRADAY_OPENING_RANGE_BREAKOUT_CONTINUATION:opening_range_breakout_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "INTRADAY_OPENING_RANGE_BREAKOUT_CONTINUATION"
+      },
+      {
+        "batches": 4,
+        "due": 16174,
+        "horizon_key": "120m",
+        "maturity_cutoff": "2026-09-02T18:00:00+00:00",
+        "pending": 0,
+        "persisted": 16174,
+        "policy_key": "INTRADAY_TREND_PULLBACK:intraday_trend_pullback_v1:30m:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "INTRADAY_TREND_PULLBACK"
+      },
+      {
+        "batches": 4,
+        "due": 16176,
+        "horizon_key": "30m",
+        "maturity_cutoff": "2026-09-02T19:30:00+00:00",
+        "pending": 0,
+        "persisted": 16176,
+        "policy_key": "INTRADAY_TREND_PULLBACK:intraday_trend_pullback_v1:30m:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "INTRADAY_TREND_PULLBACK"
+      },
+      {
+        "batches": 4,
+        "due": 16174,
+        "horizon_key": "60m",
+        "maturity_cutoff": "2026-09-02T19:00:00+00:00",
+        "pending": 0,
+        "persisted": 16174,
+        "policy_key": "INTRADAY_TREND_PULLBACK:intraday_trend_pullback_v1:30m:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "INTRADAY_TREND_PULLBACK"
+      },
+      {
+        "batches": 4,
+        "due": 16174,
+        "horizon_key": "120m",
+        "maturity_cutoff": "2026-09-02T18:00:00+00:00",
+        "pending": 0,
+        "persisted": 16174,
+        "policy_key": "INTRADAY_TREND_PULLBACK:intraday_trend_pullback_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "INTRADAY_TREND_PULLBACK"
+      },
+      {
+        "batches": 4,
+        "due": 16176,
+        "horizon_key": "30m",
+        "maturity_cutoff": "2026-09-02T19:30:00+00:00",
+        "pending": 0,
+        "persisted": 16176,
+        "policy_key": "INTRADAY_TREND_PULLBACK:intraday_trend_pullback_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "INTRADAY_TREND_PULLBACK"
+      },
+      {
+        "batches": 4,
+        "due": 16174,
+        "horizon_key": "60m",
+        "maturity_cutoff": "2026-09-02T19:00:00+00:00",
+        "pending": 0,
+        "persisted": 16174,
+        "policy_key": "INTRADAY_TREND_PULLBACK:intraday_trend_pullback_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "INTRADAY_TREND_PULLBACK"
+      },
+      {
+        "batches": 23,
+        "due": 111333,
+        "horizon_key": "120m",
+        "maturity_cutoff": "2026-09-02T18:00:00+00:00",
+        "pending": 0,
+        "persisted": 111333,
+        "policy_key": "INTRADAY_VWAP_RECLAIM_REJECTION:vwap_reclaim_rejection_v1:30m:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "INTRADAY_VWAP_RECLAIM_REJECTION"
+      },
+      {
+        "batches": 23,
+        "due": 111353,
+        "horizon_key": "30m",
+        "maturity_cutoff": "2026-09-02T19:30:00+00:00",
+        "pending": 0,
+        "persisted": 111353,
+        "policy_key": "INTRADAY_VWAP_RECLAIM_REJECTION:vwap_reclaim_rejection_v1:30m:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "INTRADAY_VWAP_RECLAIM_REJECTION"
+      },
+      {
+        "batches": 23,
+        "due": 111347,
+        "horizon_key": "60m",
+        "maturity_cutoff": "2026-09-02T19:00:00+00:00",
+        "pending": 0,
+        "persisted": 111347,
+        "policy_key": "INTRADAY_VWAP_RECLAIM_REJECTION:vwap_reclaim_rejection_v1:30m:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "INTRADAY_VWAP_RECLAIM_REJECTION"
+      },
+      {
+        "batches": 23,
+        "due": 111333,
+        "horizon_key": "120m",
+        "maturity_cutoff": "2026-09-02T18:00:00+00:00",
+        "pending": 0,
+        "persisted": 111333,
+        "policy_key": "INTRADAY_VWAP_RECLAIM_REJECTION:vwap_reclaim_rejection_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "INTRADAY_VWAP_RECLAIM_REJECTION"
+      },
+      {
+        "batches": 23,
+        "due": 111353,
+        "horizon_key": "30m",
+        "maturity_cutoff": "2026-09-02T19:30:00+00:00",
+        "pending": 0,
+        "persisted": 111353,
+        "policy_key": "INTRADAY_VWAP_RECLAIM_REJECTION:vwap_reclaim_rejection_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "INTRADAY_VWAP_RECLAIM_REJECTION"
+      },
+      {
+        "batches": 23,
+        "due": 111347,
+        "horizon_key": "60m",
+        "maturity_cutoff": "2026-09-02T19:00:00+00:00",
+        "pending": 0,
+        "persisted": 111347,
+        "policy_key": "INTRADAY_VWAP_RECLAIM_REJECTION:vwap_reclaim_rejection_v1:30m:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "INTRADAY_VWAP_RECLAIM_REJECTION"
+      }
+    ]
+  },
+  "events_file": "backups\\intraday\\intraday_events_v1.jsonl",
+  "events_loaded": 296694,
+  "interval": "30m",
+  "limitations": [
+    "FIXED_COHORT_EXPLORATORY",
+    "SURVIVORSHIP_BIASED_UNIVERSE",
+    "NO_POINT_IN_TIME_INTRADAY_MEMBERSHIP"
+  ]
+}

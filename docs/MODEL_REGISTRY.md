@@ -35,12 +35,12 @@ unless explicitly called by one of its jobs.
 | `run_scheduler.py` | Orchestrates all daily jobs below; loops during market hours | **Continuous daemon** (start once, runs all day) |
 | `update_daily_prices.py` / `update_hourly_prices.py` / `update_intraday_prices.py` / `update_running_daily.py` | Provider fetch + upsert for daily/hourly/5m/running-candle bars | Called by scheduler jobs every 5-60 min during market hours; not run manually in normal operation |
 | `validate_eod.py` | Post-close data-quality check (duplicates, NULL/zero OHLCV, missing/sparse sessions) | Called automatically by scheduler after daily close; can also be run standalone for ad-hoc checks |
-| `run_scanner_event_pipeline.py` | Captures new composite-scanner events + evaluates matured outcomes | Called daily by scheduler's `job_scanner_events()` |
+| `run_equity_worker.py` | Captures canonical composite evidence and matures prospective outcomes | Resident canonical equity worker |
 | `generate_cross_sectional_signal.py` | Scores the universe with `xsmom.py`'s **current** `MODEL_VERSION`/`MODEL_WEIGHTS`, writes `cross_sectional_signals` | Called daily by scheduler's `job_cross_sectional_signal()` |
 | `generate_market_discovery.py` | Persists `discovery-1.0-shadow` / `extension-0.1-shadow` states | Called daily by scheduler's `job_market_discovery()` |
 | `run_alpha_research.py` | Validates a candidate cross-sectional feature/weight set against the 5-gate contract (`--model ridge` default or `--model lgbm` for non-linear/tree-based) | **Manual only** — run whenever testing a new signal idea; never automatic |
 | `generate_meanrev_signal_shadow.py` | Scores/writes the unvalidated `meanrev-1.0-shadow` model to `cross_sectional_signals` under its own `model_version` | **Manual only** — shadow scaffold, not wired into the scheduler or portal |
-| `research_scanner_confidence.py` | Regenerates `scanner_confidence_study.json` — FDR-controlled confidence slices for composite scanners | **Manual only** — rerun after adding new slices or enough new outcome history accrues |
+| `run_historical_signal_research.py` / `run_historical_signal_outcomes.py` | Replays registered scanners from canonical point-in-time inputs and publishes FDR-controlled qualification revisions | **Manual/checkpoint only** |
 | `scan_trend_pullback_daily.py` / `scan_hourly_trend_pullback.py` | Descriptive watch scans (`UNVALIDATED_TIMING`), not scheduler stages | **Manual only**, per README |
 | `discover_universe_polygon.py` | One-time/occasional universe (re)build from Polygon reference data | **Manual only** — run to seed or refresh `selected_tickers` |
 | `add_more_tickers.py` / `populate_ticker_metadata.py` | Incrementally expand/enrich the ticker universe from existing DB history | **Manual only** |
@@ -119,12 +119,12 @@ Retirement, demotion and re-specification rules are precommitted in
 A revised detection threshold is never edited in place; it ships as a new scanner name and version.
 Promotion or demotion updates evidence status without changing that detector version.
 
-Two diagnostics support that section and should be rerun alongside each study:
+Two diagnostics support that section and belong in each study implementation:
 
-| Script | Question | Uses outcomes? |
+| Diagnostic | Question | Uses outcomes? |
 |---|---|---|
-| [analyze_scanner_redundancy.py](../backend/scripts/analyze_scanner_redundancy.py) | Are these detectors independent hypotheses? | No — event identity only |
-| [analyze_scanner_power.py](../backend/scripts/analyze_scanner_power.py) | Is a null result "no edge" or "not enough periods"? | No — reuses published study statistics |
+| Event-identity redundancy | Are these detectors independent hypotheses? | No, event identity only |
+| Statistical power | Is a null result "no edge" or "not enough periods"? | No, reuses published study statistics |
 
 ## Sector classification
 
@@ -184,54 +184,13 @@ not tuned. Undersized sectors emit `NaN` and drop out of `sector_breadth_aligned
 
 | Constant | Value | Defined in |
 |---|---|---|
-| `OUTCOME_ENTRY_MODEL` | `next_bar_open_v2` | [research/scanner_events.py](../backend/research/scanner_events.py) |
-| `HORIZONS` | `{"1d": (5, 10, 21), "1wk": (5, 10, 21), "1h": (7, 21, 35)}` | [research/scanner_events.py](../backend/research/scanner_events.py) |
-| `LOOKBACK_DAYS` | `{"1d": 420, "1wk": 1800, "1h": 60}` | [research/scanner_events.py](../backend/research/scanner_events.py) |
+| `OUTCOME_ENTRY_MODEL` | `NEXT_ACTIONABLE_BAR_OPEN_V1` | [equity/outcomes.py](../backend/equity/outcomes.py) |
+| Composite horizons | Registered by interval | [research/composite_scanners.py](../backend/research/composite_scanners.py) |
 
-`LOOKBACK_DAYS["1h"] = 60` is the **operational** rolling window the live scanner-event pipeline
-actually needs — separate from how much raw `stock_prices_hourly` history is kept for research
-backtesting (see repo memory / backfill decisions, currently 730 days).
-
-## Latest confidence study snapshot
-
-From [research/scanner_confidence_study.json](../backend/research/scanner_confidence_study.json)
-(regenerate via `scripts/research_scanner_confidence.py`), generated 2026-08-23 after the ETF
-benchmark refresh and weekly backfill:
-
-| Field | Value |
-|---|---|
-| `entry_model` | `next_bar_open_v2` |
-| `rank_overlay.model_version` | `xsmom-1.0` |
-| Observations | 339,411 matured outcomes across `1d`, `1h` and `1wk`; 87.0% fresh rank coverage |
-| Report rows | 2,091 |
-| Qualification contract | 100 min events, 40 min independent periods, `t > 2` absolute + incremental alpha, positive early/late alpha required |
-| FDR control | Benjamini-Hochberg, `q <= 0.05`; all predeclared rows enter their family |
-| Raw passes | 7 primaries, 12 filters |
-| Robust primary results | **0** |
-| Robust filters | **0** |
-
-Seven primaries cleared raw gates and none survived correction:
-
-| Scanner | Interval | Dir | Horizon | Events | Periods | Net alpha | `t` | `q` |
-|---|---|---|---:|---:|---:|---:|---:|---:|
-| `level_retest_rejection` | `1d` | long | 5 | 20,496 | 247 | +0.402% | 2.27 | 0.284 |
-| `level_retest_rejection` | `1d` | long | 21 | 20,188 | 59 | +1.525% | 2.14 | 0.284 |
-| `breakout_expansion` | `1h` | long | 7 | 3,360 | 463 | +0.316% | 2.68 | 0.204 |
-| `compression_breakout` | `1h` | long | 7 | 678 | 287 | +0.522% | 2.71 | 0.204 |
-| `failed_breakout_reversal` | `1h` | long | 7 | 1,477 | 367 | +0.382% | 2.16 | 0.284 |
-| `failed_breakout_reversal` | `1h` | long | 21 | 1,467 | 145 | +0.909% | 2.13 | 0.284 |
-| `level_retest_rejection` | `1h` | long | 7 | 8,537 | 484 | +0.263% | 2.44 | 0.284 |
-
-`breakout_expansion` hourly long at 7 bars was the sole `ROBUST_PASS` of the previous study
-(`q=0.0147`). It now records `q=0.204`, so its evidence state remains monitor-only and its portal
-probability and live-alpha claims are suppressed. This is a demotion under
-[SCANNER_EVENT_EVALUATION.md](SCANNER_EVENT_EVALUATION.md#retirement-and-re-specification),
-reversible on re-qualification.
-
-Twelve filters cleared raw gates and none survived both required corrections. The strongest
-absolute result, `structured_trend_pullback` `1h` long 21-bar `pullback_vwap_reclaim`, has absolute
-`q=0.009` but incremental `q=0.793`; it inherits its baseline's edge rather than demonstrating
-incremental conditioning value.
+Current qualification state is read from append-only `equity_qualification_revisions` under the
+sector-primary methodology. Generated scanner-confidence JSON from the retired event ledger is
+not a model input and is no longer tracked. Current daily scanner families remain `UNRANKED` and
+cannot influence recommendations.
 
 ## Confidence slices
 

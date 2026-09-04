@@ -383,7 +383,7 @@ price ingestion.
 ### Storage
 
 `cross_sectional_signals`, unique on `(trade_date, ticker, model_version)`, idempotent upsert.
-Migration: `backend/migrations/005_cross_sectional_signals.sql`.
+Schema: `backend/migrations/000_canonical_schema.sql`.
 
 Stamping `model_version` means a future `xsmom-2.0` coexists rather than overwriting history.
 
@@ -567,4 +567,4 @@ python backend/scripts/update_hourly_prices.py --backfill --days 730
 | `backend/research/evaluate.py` | IC, deciles, purged walk-forward, costs, neutralization |
 | `backend/scripts/run_alpha_research.py` | The gate — run this before promoting anything |
 | `backend/scripts/generate_cross_sectional_signal.py` | Daily production signal |
-| `backend/migrations/005_cross_sectional_signals.sql` | Signal table |
+| `backend/migrations/000_canonical_schema.sql` | Canonical signal and platform schema |

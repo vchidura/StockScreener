@@ -139,6 +139,7 @@ def test_source_skew_over_sixty_seconds_retains_diagnostic_but_blocks_strategy()
 
     assert result.snapshots[0].model_mark is None
     assert result.snapshots[0].iv_failure_reason == "MODEL_MARK_UNAVAILABLE"
+    assert result.matrix_snapshots == ()
     assert result.strategy_eligible is False
 
 

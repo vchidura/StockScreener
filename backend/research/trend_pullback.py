@@ -19,31 +19,43 @@ def load_hourly_panel(
         sys.path.insert(0, str(backend_dir))
     from database import get_db_cursor
 
-    clauses = [
-        "EXTRACT(ISODOW FROM datetime AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5",
-        "EXTRACT(HOUR FROM datetime AT TIME ZONE 'America/New_York') BETWEEN 9 AND 15",
-        "EXTRACT(MINUTE FROM datetime AT TIME ZONE 'America/New_York') = 30",
-    ]
+    clauses = []
     params: list = []
     if start:
-        clauses.append("datetime >= %s")
+        clauses.append("bar_start >= %s")
         params.append(start)
     if end:
-        clauses.append("datetime < (%s::date + INTERVAL '1 day')")
+        clauses.append("bar_start < (%s::date + INTERVAL '1 day')")
         params.append(end)
     if tickers:
         clauses.append("ticker = ANY(%s)")
         params.append(tickers)
 
+    filters = f"AND {' AND '.join(clauses)}" if clauses else ""
     with get_db_cursor() as cur:
         cur.execute(
             f"""
-                SELECT ticker,
-                       datetime AT TIME ZONE 'America/New_York' AS date,
-                       open_price AS open, high, low, close_price AS close, volume
-                FROM stock_prices_hourly
-                WHERE {' AND '.join(clauses)}
-                ORDER BY ticker, datetime
+                SELECT DISTINCT ON (ticker, bar_start)
+                       ticker,
+                       bar_start AT TIME ZONE 'America/New_York' AS date,
+                       open_price AS open, high_price AS high, low_price AS low,
+                       close_price AS close, volume
+                FROM equity_bar_revisions
+                WHERE interval = '1h'
+                  AND session_scope = 'RTH'
+                  AND adjusted = FALSE
+                  AND is_final = TRUE
+                  AND COALESCE(replay_available_at, system_observed_at) <= NOW()
+                  {filters}
+                ORDER BY ticker, bar_start,
+                         CASE
+                             WHEN source_kind = 'RECONCILED' THEN 0
+                             WHEN source_kind = 'DERIVED' THEN 1
+                             WHEN source_kind = 'NATIVE_REST' THEN 2
+                             ELSE 3
+                         END,
+                         COALESCE(replay_available_at, system_observed_at) DESC,
+                         created_at DESC
             """,
             params,
         )

@@ -1,5 +1,9 @@
 # Extended Hours Trend-Following Scanner — Design v2
 
+> Historical design note: references to the regular-session scanner-event pipeline describe the
+> pre-migration baseline. That pipeline was retired during canonical consolidation; any future extended-hours
+> implementation must publish through canonical equity evidence and outcomes.
+
 Purpose: define a production-grade store and scanner for premarket and after-hours trade
 setups, built on a trend-following methodology, with strict separation from the current
 regular-session pipelines.

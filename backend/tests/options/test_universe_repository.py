@@ -17,6 +17,7 @@ from options.domain import (
     DecisionContext,
     OptionUniverseCandidate,
     OptionUniverseMode,
+    UniverseRunStatus,
 )
 from options.repositories.universe import OptionUniverseRepository
 
@@ -95,3 +96,25 @@ def test_active_member_read_requires_context_and_filters_observation_time():
     assert parameters[-1] == context.observed_time
     signature = inspect.signature(repository.list_active)
     assert signature.parameters["context"].default is inspect.Parameter.empty
+
+
+def test_complete_run_allows_only_monotonic_terminal_upgrade():
+    repository, connection, cursor = _repository()
+    cursor.rowcount = 1
+    run_id = uuid4()
+    completed_at = datetime(2026, 8, 31, 20, 15, tzinfo=UTC)
+
+    repository.complete_run(
+        run_id,
+        UniverseRunStatus.COMPLETE,
+        1.0,
+        completed_at,
+    )
+
+    sql, parameters = cursor.execute.call_args.args
+    assert "status = 'DEGRADED'" in sql
+    assert "completeness_fraction < %s" in sql
+    assert parameters == (
+        "COMPLETE", 1.0, completed_at, run_id, "COMPLETE", 1.0,
+    )
+    connection.commit.assert_called_once_with()

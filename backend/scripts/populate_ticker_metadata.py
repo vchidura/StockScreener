@@ -9,7 +9,7 @@ Adds: asset_type, sector, industry, market_cap, market_cap_group,
 Sources:
   - Twelve Data /stocks and /etfs endpoints for reference data (type, exchange)
   - Twelve Data /profile endpoint for sector, industry, market cap, etc.
-  - Database for avg_volume_90d (computed from stock_prices_hourly)
+    - Database for avg_volume_90d (computed from canonical hourly bars)
 
 Usage:
   python scripts/populate_ticker_metadata.py            # all active tickers
@@ -35,8 +35,6 @@ if str(BACKEND_DIR) not in sys.path:
 from database import (
     get_db_cursor,
     get_selected_tickers,
-    create_selected_tickers_table,
-    migrate_selected_tickers_metadata,
 )
 from http_client import get_session
 
@@ -121,7 +119,7 @@ def get_db_computed_metrics(ticker: str) -> dict:
             WITH daily AS (
                 SELECT close_price, volume,
                        LAG(close_price) OVER (ORDER BY datetime) AS prev_close
-                FROM stock_prices_hourly
+                FROM equity_canonical_hourly_bars
                 WHERE ticker = %s AND datetime >= NOW() - INTERVAL '90 days'
                 ORDER BY datetime
             )
@@ -332,10 +330,6 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Preview without writing to DB")
     parser.add_argument("--batch-size", type=int, default=50, help="Pause every N tickers (default: 50)")
     args = parser.parse_args()
-
-    # Ensure schema is up to date
-    create_selected_tickers_table()
-    migrate_selected_tickers_metadata()
 
     # Determine which tickers to process
     if args.ticker:

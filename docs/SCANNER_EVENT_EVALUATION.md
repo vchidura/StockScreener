@@ -1,5 +1,9 @@
 # Scanner Event Evaluation
 
+> Historical registry: operational commands and ledger references in this document capture the
+> pre-migration implementation. Canonical consolidation retired those surfaces; current scanner research is
+> owned by canonical equity evidence, outcomes and qualification revisions.
+
 ## Goal
 
 Measure whether scanner setups add directional or entry-timing value before they can influence
@@ -11,24 +15,28 @@ in [SCANNER_LITERATURE_REVIEW.md](SCANNER_LITERATURE_REVIEW.md).
 
 ## Composite Setup Registry
 
-MA crossover, gap, Fibonacci, momentum pullback and bearish bounce do not need separate promotion
-lanes. Most describe trend, location or timing. Combine them by role into a small number of
-falsifiable setups; add one row when a setup is proposed, implemented or promoted.
+Composite setups and exact product-page strategies are separate hypotheses when their observable
+trigger rules differ. Indicators still combine by role rather than vote count, but qualification
+evidence cannot transfer between a composite scanner and a similarly named product strategy.
 
 | Composite setup | Intervals | Required components | Optional context | Status |
 |---|---|---|---|---|
 | Structured trend pullback 1.0 | 1d, 1wk, 1h | MA trend + swing continuation + pullback + candle trigger | Gap/FVG/Fibonacci proximity, activity | Collecting; no current raw primary pass |
-| Level retest/rejection 1.2 | 1d, 1wk, 1h | Gap/FVG/dynamic Fibonacci level + rejection or reclaim + participation | Trend/discovery alignment | Monitor only: daily long 5/21 and hourly long 7 |
+| Level retest/rejection 1.2 | 1d, 1wk, 1h | Gap/FVG/dynamic Fibonacci level + rejection or reclaim + participation | Trend/discovery alignment | Daily unranked in all 12 lanes on the 2026-09-04 point-in-time rerun; hourly long 7 still monitor only |
 | Breakout expansion 1.0 | 1d, 1wk, 1h | Swing/zone break + range expansion + relative volume + strong close | MA trend, cross-sectional rank | Demoted 2026-08-22: monitor only |
 | Structure reversal 1.0 | 1d, 1wk, 1h | Reversal discovery state + swing structure flip + MA/VWAP reclaim | Gap/FVG level, activity | Collecting |
 | SMA200 reclaim rejection 1.0 | 1d, 1wk | Declining SMA200 + fresh reclaim + old-high retest + bearish strong close + participation | Sector/regime alignment | Insufficient sample: 31 daily signal days |
 | Compression breakout 0.1-shadow | 1d, 1wk, 1h | Contracted range/ATR and channel + range/volume expansion + strong breakout close | Trend alignment | Monitor only: hourly long, 7 bars; 88% contained in breakout expansion |
 | Failed-breakout reversal 0.1-shadow | 1d, 1wk, 1h | Fresh pivot break + next-bar close back inside + reversal candle | Level age, participation, breadth | Monitor only: hourly long 7/21 |
+| MA crossover 9/21 1.0 | 1d | Fresh SMA9/SMA21 sign change | Weekly MA state and spread diagnostics | 27,167 events; all six cells unranked |
+| Momentum pullback 2.0 | 1d | Product EMA stack + Stochastic/ADX/EMA21/RSI gates; first match per episode | Grade and score diagnostics | 14,507 episodes; all three cells unranked |
+| Bearish bounce 2.0 | 1d | Inverted product EMA stack + Stochastic/ADX/EMA21/RSI gates; first match per episode | Grade and score diagnostics | 9,184 episodes; all three cells unranked |
 
 Evidence states are `ROBUST_PASS`, `MONITOR_ONLY` and `UNRANKED`; lifecycle labels include
 `PLANNED`, `COLLECTING`, `INSUFFICIENT_SAMPLE`, `FAILED`, `VALIDATED` and `DEFERRED`. Statuses above
-reflect the 2026-08-23 ETF-benchmarked all-interval study. No setup currently holds `ROBUST_PASS`
-or `VALIDATED`.
+reflect the 2026-08-23 ETF-benchmarked all-interval study, except `level_retest_rejection` daily,
+which reflects the 2026-09-04 point-in-time rerun recorded at the end of this document. No setup
+currently holds `ROBUST_PASS` or `VALIDATED`.
 
 ## Indicator Roles
 
@@ -46,6 +54,62 @@ Indicators are evidence with distinct jobs, not equal-weight votes.
 Do not award extra confidence merely because correlated trend indicators agree. MA crossover, EMA
 stack and ADX should form one structure gate, not three independent votes. Gap, FVG and Fibonacci
 can be stored as location variants so their incremental value can be measured.
+
+## Exact MA9/21 Crossover Study
+
+`ma-crossover-9-21-v1` emits only the completed session where SMA9 changes sides relative to
+SMA21. It does not repeat `Recent Bullish`, `Recent Bearish`, `Above MA`, or `Below MA` display
+states as new research events. Entry is the next session open with 4 bps round-trip cost and
+5/10/21-session SPY alpha.
+
+The 300-session point-in-time replay emitted 27,167 events: 13,236 bullish and 13,931 bearish.
+Outcome batching drained the full mature cohort rather than truncating at 10,000 subjects. All six
+cells are `UNRANKED`:
+
+| Direction | 5 sessions: alpha / periods / t / q | 10 sessions: alpha / periods / t / q | 21 sessions: alpha / periods / t / q |
+|---|---:|---:|---:|
+| Bearish cross | +0.590% / 59 / +1.88 / 0.225 | +0.803% / 29 / +1.78 / 0.225 | -0.775% / 14 / -0.61 / 0.801 |
+| Bullish cross | -0.248% / 59 / -1.11 / 0.537 | -0.119% / 29 / -0.23 / 0.820 | -0.427% / 14 / -0.43 / 0.801 |
+
+Bullish crosses had positive raw returns at 10 and 21 sessions but negative alpha, indicating that
+the observed gains did not add timing value beyond broad-market movement. Bearish 5/10-session
+alpha is promising descriptively but misses the `t > 2` and FDR gates; the 10-session cell is also
+below the 40-period floor.
+
+## Exact Momentum Pullback Study
+
+`momentum-pullback-v2` calls the product page scanner on the latest 210 completed daily bars and
+emits only the first session of each contiguous match episode. It retains the product grade and
+score as diagnostics but does not select a grade after observing outcomes. The unchanged
+historical universe still uses only its causal 20-session liquidity lookback.
+
+The 300-session replay emitted 14,507 long episodes across 2,049 tickers. Grade distribution was
+6 A, 152 B+, 1,532 B, and 12,817 C; no A+ episode occurred. All three primary cells are `UNRANKED`:
+
+| Horizon | Events | Independent periods | Mean alpha | t | FDR q | State |
+|---:|---:|---:|---:|---:|---:|---|
+| 5 sessions | 14,239 | 59 | -0.015% | -0.08 | 0.934 | UNRANKED |
+| 10 sessions | 13,840 | 29 | +0.120% | +0.32 | 0.934 | UNRANKED |
+| 21 sessions | 13,311 | 14 | -1.336% | -1.24 | 0.644 | UNRANKED |
+
+The small positive 10-session alpha is underpowered and statistically weak. A high-grade-only
+study, if pursued, must be predeclared as a new filter family and needs substantially more history
+because only 158 A/B+ episodes are present.
+
+## Exact Bearish Bounce Study
+
+`bearish-bounce-v2` applies the mirrored product page scanner to deterministic 210-bar windows and
+emits the first session of each contiguous match episode. The replay produced 9,184 short episodes
+across 1,542 tickers: 5 A, 103 B+, 916 B, and 8,160 C. All three cells are `UNRANKED`:
+
+| Horizon | Events | Independent periods | Mean alpha | t | FDR q | State |
+|---:|---:|---:|---:|---:|---:|---|
+| 5 sessions | 9,111 | 59 | +0.056% | +0.20 | 0.960 | UNRANKED |
+| 10 sessions | 8,993 | 29 | -0.026% | -0.05 | 0.960 | UNRANKED |
+| 21 sessions | 8,652 | 14 | -1.199% | -0.85 | 0.960 | UNRANKED |
+
+The page-wide setup supplies no stable short timing edge. A high-grade study cannot be inferred
+from these primary results and is not testable from this window: only 108 A/B+ episodes exist.
 
 ## Fibonacci Scoring Evaluation
 
@@ -228,10 +292,150 @@ Daily evaluation loads 400 earlier calendar days as indicator warm-up; hourly lo
 pivot state. The scanners do not intrinsically require January 2023; use the longest clean period
 available and compare early/late subperiods.
 
-Qualification replay reconstructs discovery states for each date and uses symbols with sufficient
-stored bars on that date. This removes current-cohort selection from the replay. It cannot recover
-delisted or formerly eligible symbols that were never loaded into this database, so residual
-survivorship risk remains.
+The legacy qualification replay reconstructs discovery states for each date and uses symbols with
+sufficient stored bars on that date. It cannot recover delisted or formerly eligible symbols that
+were never loaded into the database. The generic historical-research universe below supplies that
+missing membership and price input for newly versioned studies.
+
+### Generic Historical Research Universe
+
+`prepare_historical_signal_research.py` removes that residual limitation for future studies. It
+uses Massive's dated ticker reference, unadjusted grouped daily bars, and a frozen
+`liquid_us_common_stocks_v2` policy to persist one replay-explicit universe per session. The policy
+uses only preceding sessions: active US common stock, latest prior close at least `$5`, median
+20-session dollar volume at least `$20M`, and at least 90% lookback coverage.
+
+Policy v2 preserves provider ticker case during grouped-market joins. This is required because
+mixed-case preferred-share notation can otherwise collide with a different uppercase common-stock
+symbol. The v1 pilot is superseded, its ingestion segment is quarantined, and its grouped bars are
+excluded from replay selection.
+
+Historical reference and corporate-action downloads retain their actual observation time and are
+labeled `HISTORICAL_RECONSTRUCTED`; policy-derived `replay_available_at` makes them visible only to
+replay reads. They never masquerade as facts observed by the live system on the historical date.
+Splits and dividends are reusable data-validity inputs for every signal family: split gaps can be
+excluded, while ex-dividend events can be stratified under a predeclared policy.
+
+The optional daily price phase reuses the same checksummed grouped-market responses. It persists
+provider-native, unadjusted `1d` bars only for the union of admitted historical members, with XNYS
+session bounds and replay availability at the session close. It does not alter live current-bar
+projections or fetch per-ticker intraday history.
+
+The first 100 sessions are an engineering and frequency pilot, not a qualification window. The
+same cached input layer can support gap, MA, momentum, pattern, or future registered signal
+adapters. Detector occurrence identity, outcomes, horizon spacing, FDR family, and prospective
+promotion remain signal-specific contracts.
+
+The first completed v2 pilot covers 100 research sessions from 2026-04-09 through 2026-08-31,
+plus 20 warm-up sessions. It persisted 187,998 memberships across 2,199 distinct historically
+eligible common stocks, 2,230 split/dividend facts, and 259,522 exact-ticker daily bars. The
+`gap-formation-v1` adapter emitted 5,902 deterministic formation subjects: 3,515 formation-hold
+and 2,387 fade-reversal hypotheses. Twelve split/symbol/merger/spinoff candidates were excluded,
+83 ex-dividend events were retained as labeled context, and immediate-previous-session continuity
+removed three discontinuities. Fourteen events exceeded a 50% opening gap; none exceeded 100%,
+and the maximum was 98.86%. These are frequency and data-quality results, not performance evidence.
+
+### Gap Formation Durable Outcome Study
+
+The qualification-sized study covers 300 research sessions from 2025-06-23 through 2026-08-31,
+plus 20 warm-up sessions. The bounded `gap-formation-v2` adapter always evaluates a formation bar
+with exactly 20 preceding bars, so adding older history cannot change overlapping events. The
+unbounded v1 replay and its qualifications remain immutable audit evidence but are superseded.
+
+The v2 subjects are persisted as replay-only `SCANNER_RESULT` evidence in four lanes. Only
+`GAP_BREAKAWAY_HOLD`, `GAP_CONTINUATION_HOLD`, and `GAP_FADE_REVERSAL` receive the primary
+`NEXT_ACTIONABLE_BAR_OPEN_V1` policy. `GAP_FORMATION_CONTROL` remains evidence-only. The policy
+uses predeclared 5-, 10-, and 21-session horizons, 4 bps round-trip cost, and SPY alpha; sector
+alpha is not claimed. Each horizon uses its own maturity cutoff and XNYS-session spacing. The
+5-session result remains directly comparable with the first bounded-cohort publication; 10 and
+21 sessions test delayed formation follow-through without changing the detector.
+
+The clean cohort persisted 16,281 evidence subjects and 32,602 mature coverage outcomes across
+the three horizons: 32,543 entered and 59 unavailable. Qualification is restricted to
+deterministic evidence IDs in the
+supplied event file, so subjects retained from superseded replays cannot enter the calculation.
+The event-weighted diagnostics below describe the 5-session horizon and do not satisfy the
+independence rule:
+
+| Lane | Direction | Entered | Net return | SPY net alpha | MAE | MFE | Net win rate |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Breakaway hold | Short | 583 | -0.630% | -0.289% | -5.571% | +4.602% | 47.5% |
+| Breakaway hold | Long | 559 | -0.560% | -1.235% | -5.168% | +4.729% | 46.5% |
+| Continuation hold | Short | 1,056 | -0.746% | -0.439% | -6.473% | +5.517% | 48.6% |
+| Continuation hold | Long | 2,170 | +0.306% | -0.222% | -5.619% | +6.468% | 52.1% |
+| Fade reversal | Short | 3,549 | -1.064% | -0.421% | -6.748% | +5.569% | 46.1% |
+| Fade reversal | Long | 3,263 | +0.649% | +0.098% | -5.090% | +6.007% | 50.8% |
+
+Qualification equal-weights names at each signal timestamp and then applies spacing by actual XNYS
+sessions. All cells clear the 100-event floor. Only 5-session cells clear the fixed 40-period
+floor; 10-session cells have 28–29 periods and 21-session cells have 13–14. Every cell remains
+`UNRANKED`:
+
+Net return, hit rate, MAE, MFE, and stop/target-first rates use that same timestamp-equal-weighted,
+horizon-spaced portfolio sample. They are not raw event averages, so the Research matrix can
+compare them directly with each cell's alpha and qualification state.
+
+| Lane | Direction | 5 sessions: alpha / periods / t / q | 10 sessions: alpha / periods / t / q | 21 sessions: alpha / periods / t / q |
+|---|---:|---:|---:|---:|
+| Breakaway hold | Short | -0.229% / 53 / -0.24 / 0.940 | -0.101% / 28 / -0.08 / 0.940 | -4.271% / 13 / -1.35 / 0.402 |
+| Breakaway hold | Long | -1.219% / 52 / -2.22 / 0.123 | -3.427% / 28 / -2.69 / 0.093 | -3.332% / 13 / -1.76 / 0.279 |
+| Continuation hold | Short | +0.126% / 55 / +0.20 / 0.940 | -1.151% / 29 / -0.80 / 0.638 | -7.158% / 14 / -1.02 / 0.556 |
+| Continuation hold | Long | -0.651% / 59 / -0.92 / 0.584 | +0.172% / 29 / +0.13 / 0.940 | +0.365% / 14 / +0.12 / 0.940 |
+| Fade reversal | Short | -0.803% / 59 / -1.13 / 0.518 | -2.289% / 29 / -1.44 / 0.384 | -1.184% / 14 / -0.47 / 0.886 |
+| Fade reversal | Long | -0.783% / 58 / -1.45 / 0.384 | -2.164% / 29 / -2.56 / 0.093 | +2.286% / 14 / +2.21 / 0.123 |
+
+No lane is `MONITOR_ONLY` or `ROBUST_PASS`; none may affect equity direction, recommendations, or
+options. The identical durable run inserts zero duplicate evidence, outcomes, and qualification
+revisions. The positive 21-session fade-reversal long result is underpowered and does not survive
+FDR. Longer-horizon values are useful accrual evidence, not promotion evidence. This
+formation-follow-through result does not evaluate the separate inside-gap fill-target hypothesis.
+
+### Confirmed Breakaway and Gap-Entry Fill Studies
+
+Two separately versioned adapters test the next gap hypotheses without changing the formation
+baseline:
+
+- `gap-breakaway-confirmation-v2` waits up to five sessions for a breakaway gap-up to close above
+  its formation high or a breakaway gap-down to close below its formation low. It emits only the
+  first confirmation, enters at the next actionable open, uses the opposite formation extreme as
+  invalidation, and evaluates 5/10/21-session outcomes.
+- `gap-entry-fill-v2` emits when price first closes inside a still-unfilled gap from the original
+  outside edge. A prior gap-up is tested short toward the prior high; a prior gap-down is tested
+  long toward the prior low. It records one event per entry episode, limits gap age to 60 sessions,
+  rejects next-open entries already outside the stop/target bracket, and evaluates
+  1/3/5/10/21-session outcomes.
+
+Version 2 excludes splits, symbol changes, spinoffs, and mergers anywhere from gap formation
+through confirmation or entry because unadjusted price levels are otherwise incomparable. Version
+1 remains audit-only.
+
+For gap entry, target-hit rate directly measures whether the far range-gap edge was reached within
+the horizon. Net return and alpha answer different questions: return measures directional payoff,
+while alpha measures timing value beyond SPY. Option suitability requires a later joined study of
+move magnitude and time-to-move against entry premium, implied move, IV change, bid/ask spread,
+and expiration. These stock studies cannot directly publish an option recommendation.
+
+The action-safe 300-session replay emitted 452 confirmed-breakaway events (222 long, 230 short).
+Confirmation
+did not rescue next-open continuation: 5-session short/long alpha was -0.569%/-1.175% over 44/43
+independent periods, and both longer horizons were negative with fewer than 40 periods. All six
+cells are `UNRANKED`.
+
+The action-safe first-entry replay emitted 4,644 events (2,379 short entries into prior gap-ups and
+2,265 long entries into prior gap-downs). Approximately 1,100–1,200 observations per horizon were retained as
+`NOT_TRIGGERED` because the next open had already crossed the stop or target. Among actionable
+entries, the independent-period target-hit curve was:
+
+| Fill direction | 1 session | 3 sessions | 5 sessions | 10 sessions | 21 sessions |
+|---|---:|---:|---:|---:|---:|
+| Short prior gap-up | 21.5% | 38.2% | 50.3% | 58.3% | 67.9% |
+| Long prior gap-down | 18.0% | 33.4% | 40.1% | 50.8% | 60.2% |
+
+Eventual fill does not imply a viable fixed near-edge stop: 21-session stop-hit was 90.7% short and
+89.2% long, and stop-first exceeded target-first at every horizon. Short fill alpha remained near
+zero through ten sessions and was negative at 21; long fill alpha was negative at every horizon.
+All ten cells are `UNRANKED`. The next research version should test wider volatility-normalized
+invalidation and intraday entry timing rather than tune the current threshold in place.
 
 ## Dynamic Fibonacci Swings
 
@@ -476,8 +680,7 @@ q-values in either direction; do not reinterpret a changed q-value as stronger e
 declared family itself is unchanged.
 
 **Detectors that largely contain one another are one hypothesis, not two.** Redundancy is measured
-with [analyze_scanner_redundancy.py](../backend/scripts/analyze_scanner_redundancy.py), which uses
-event identity only and never outcomes. Symmetric overlap across the seven families is low
+from event identity only and never outcomes. Symmetric overlap across the seven families is low
 (maximum Jaccard 0.186), but directional coverage is not: 76.9% of daily and 88.3% of hourly
 `compression_breakout` signal days are already `breakout_expansion` days, and both cleared raw
 gates on the same hourly-long seven-bar cell. Where one detector's signal days are largely a subset
@@ -497,8 +700,8 @@ changes. A failed slice must fail because its mechanism is absent, not because i
 
 ### Power before re-specification
 
-Run [analyze_scanner_power.py](../backend/scripts/analyze_scanner_power.py) before concluding that
-a scanner has no edge. It converts each row's observed alpha and t-statistic into the effect the
+Assess statistical power before concluding that a scanner has no edge. Convert each row's observed
+alpha and t-statistic into the effect the
 correction threshold demanded, and into the number of independent periods the observed effect would
 need. A null result caused by insufficient periods calls for waiting, not for changing the
 detector.
@@ -573,10 +776,13 @@ Manual controls:
 
 ## Portal
 
-- **Scanner Results page:** latest signal per ticker, interval/setup/side/sector/evidence filters,
-  aggregate evidence counts, hourly review priority, and Robust/Monitor/Unranked badges. The full
-  qualification report remains available through `/api/scanner-events/qualification`; the former
-  48-combination matrix is not part of the current page.
+- **Stock Research Opportunity Board:** latest signal per ticker, interval/setup/side/sector/evidence
+  filters, hourly review priority, and Robust/Monitor/Unranked badges.
+- **Stock Research / Research:** a frame-selected scanner/side matrix from
+  `/api/scanner-events/qualification`; its three horizon columns retain sample, alpha, stability,
+  path-risk, and evidence state without combining daily, weekly, and hourly experiments. The
+  materialized qualification snapshot combines the composite-scanner ledger with the latest
+  separately FDR-qualified durable equity studies, including the gap formation lanes.
 - **Sector Intelligence page:** sector rotation, discovery mix and cross-sectional context remain
   separate from scanner qualification.
 - **Dashboard / Scanner Evidence:** status, sample size, net alpha, t-stat, MAE/MFE, backlog and
@@ -647,3 +853,44 @@ with negative alpha in bear regimes and no surviving regime filter.
 This is the demotion path working as designed: a result measured on a shorter sample did not hold
 when the sample grew. Nothing is promoted, all setups remain shadow-only, and an untouched forward
 period is still required before any candidate can influence recommendations.
+
+## Level Retest/Rejection 1.2 Daily, Point-In-Time Rerun 2026-09-04
+
+Supersedes the "monitor only: daily long 5/21" status recorded above for this scanner. Report
+identity `9d4eea4cf554accc`, evaluation version `composite_scanners_daily_qualification_v1`.
+
+This is the first study run on reconstructed point-in-time universes rather than a fixed
+present-day cohort, and on a split-adjusted bar lineage with sector benchmarks present in the same
+lineage. Detection and outcome evaluation both read the adjusted lineage.
+
+| | |
+|---|---|
+| Window | 2022-07-22 to 2026-08-27, 1,034 research sessions |
+| Universe | 1,034 reconstructed universes, 2,919-ticker union, 1,294-1,956 members per session |
+| Events | 171,804 of 287,027 composite events, filtered to this scanner |
+| Outcomes | 1,019,802 revisions; 1,005,664 scored observations |
+| Cohort breadth | 2,451 distinct tickers, top-5 concentration 0.5% |
+| Family | 12 lanes: 2 directions x 3 horizons x 2 return modes |
+
+Every lane is `UNRANKED`, and every mean net alpha is negative:
+
+| Mode | Direction | 5d | 10d | 21d |
+|---|---|---:|---:|---:|
+| SIGNED | long | -0.00099 | -0.00014 | -0.01360 |
+| SIGNED | short | -0.00137 | -0.00172 | -0.00714 |
+| PLAN | long | -0.00182 | -0.00167 | -0.00734 |
+| PLAN | short | -0.00115 | -0.00049 | -0.00503 |
+
+Independent periods are 206, 103 and 49 for the three horizons, all above the 40-period floor, so
+these are verdicts rather than insufficient-sample rows. The largest t-statistics are at 21d and
+negative: `t=-2.56` and `t=-2.42` at `q=0.062`.
+
+Two observations the row counts do not show. Both directions are negative, which is not what an
+inverted detector looks like - an inverted signal would lose on one side and win on the other.
+Losing on both means the setup selects names that subsequently underperform their sector whichever
+way it points. And the effect worsens with horizon, which argues against the setup needing more
+time to resolve. Costs do not explain it: 4 bps is 0.04% against alphas reaching -1.4%.
+
+The prior monitor-only status for this scanner came from a shorter fixed-cohort study. Reconstructed
+universes admit names that were liquid at the time and are not today, and reject names that were
+not yet liquid; on the corrected sample the scanner does not qualify in any lane.

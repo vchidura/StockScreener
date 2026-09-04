@@ -256,15 +256,10 @@ def download_historical_data(
     interval: str = "1d",
     prefer_db: bool = True,
 ) -> Optional[pd.DataFrame]:
-    """Reads historical data from the appropriate database table based on interval.
-    
-    Routes to:
-      - stock_prices_daily for '1d', '1wk'
-      - stock_prices_hourly for '1h' 
-      - stock_prices_intraday for '1m', '5m', '15m', '30m'
-    
+    """Read historical data from canonical finalized interval revisions.
+
     The prefer_db parameter is kept for API compatibility.
-    Use update scripts to populate/refresh DB data.
+    Canonical ingestion and derivation workers populate the source revisions.
     """
     # Map period to number of candles
     period_map = {
@@ -278,14 +273,27 @@ def download_historical_data(
     if interval in candles_per_day:
         periods = periods * candles_per_day[interval]
     
-    # For weekly, fetch more daily data to aggregate
+    # Convert the day-oriented period request to a direct weekly bar count.
     if interval == "1wk":
-        periods = periods * 7
+        periods = max(1, periods // 7)
     
     try:
-        if interval in ("1d", "1wk"):
+        if interval == "1d":
             # Use existing daily data function
             df = get_data_from_db(ticker, periods)
+        elif interval == "1wk":
+            from database import _canonical_interval_rows
+            rows = _canonical_interval_rows([ticker], interval, periods).get(ticker.upper())
+            if not rows:
+                return None
+            df = pd.DataFrame(rows)
+            df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
+            df.set_index('datetime', inplace=True)
+            if 'ticker' in df.columns:
+                df = df.drop(columns=['ticker'])
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                if col in df.columns:
+                    df[col] = df[col].astype(float)
         elif interval == "1h":
             # Use hourly data
             from database import get_hourly_data
@@ -328,16 +336,6 @@ def download_historical_data(
             logger.warning("No DB data for %s (interval=%s, periods=%d)", ticker, interval, periods)
             return None
         
-        # Aggregate to weekly if requested
-        if interval == "1wk" and not df.empty:
-            df = df.resample('W').agg({
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last',
-                'volume': 'sum'
-            }).dropna()
-        
         return df
         
     except Exception as e:
@@ -345,16 +343,27 @@ def download_historical_data(
         return None
 
 
-def identify_gap_up(df: pd.DataFrame, gap_threshold: float = 0.01) -> List[Dict]:
-    """Identifies gap-up patterns where current open > previous high (vectorized).
-    Only includes gaps where the zone survived end-of-day (curr_low > prev_high)."""
+def _gap_candidate_mask(df: pd.DataFrame, session_start_only: bool) -> np.ndarray:
+    mask = np.ones(max(len(df) - 1, 0), dtype=bool)
+    if session_start_only and len(df) > 1:
+        dates = pd.DatetimeIndex(pd.to_datetime(df.index)).normalize()
+        mask &= np.asarray(dates[1:] != dates[:-1])
+    return mask
+
+
+def identify_gap_up(
+    df: pd.DataFrame,
+    gap_threshold: float = 0.01,
+    *,
+    session_start_only: bool = False,
+) -> List[Dict]:
+    """Identify opens above the previous high, including formation-bar fills."""
     prev_high = df["high"].values[:-1]
+    prev_close = df["close"].values[:-1]
     curr_open = df["open"].values[1:]
     curr_low = df["low"].values[1:]
     gap_pct = (curr_open - prev_high) / prev_high
-    # Gap must open above prev high AND the day's low must stay above prev high
-    # (otherwise the gap was filled on the same day — no valid zone exists)
-    mask = (gap_pct >= gap_threshold) & (curr_low > prev_high)
+    mask = (gap_pct >= gap_threshold) & _gap_candidate_mask(df, session_start_only)
     indices = np.where(mask)[0] + 1  # +1 to get actual df position
 
     gaps = []
@@ -364,23 +373,28 @@ def identify_gap_up(df: pd.DataFrame, gap_threshold: float = 0.01) -> List[Dict]
             "index": int(idx),
             "date": dates[idx],
             "prev_high": float(prev_high[idx - 1]),
+            "previous_close": float(prev_close[idx - 1]),
             "gap_open": float(curr_open[idx - 1]),
             "gap_low": float(curr_low[idx - 1]),
-            "gap_pct": round(float(gap_pct[idx - 1]) * 100, 2)
+            "gap_pct": round(float(gap_pct[idx - 1]) * 100, 2),
+            "range_gap_survived": bool(curr_low[idx - 1] > prev_high[idx - 1]),
         })
     return gaps
 
 
-def identify_gap_down(df: pd.DataFrame, gap_threshold: float = 0.01) -> List[Dict]:
-    """Identifies gap-down patterns where current open < previous low (vectorized).
-    Only includes gaps where the zone survived end-of-day (curr_high < prev_low)."""
+def identify_gap_down(
+    df: pd.DataFrame,
+    gap_threshold: float = 0.01,
+    *,
+    session_start_only: bool = False,
+) -> List[Dict]:
+    """Identify opens below the previous low, including formation-bar fills."""
     prev_low = df["low"].values[:-1]
+    prev_close = df["close"].values[:-1]
     curr_open = df["open"].values[1:]
     curr_high = df["high"].values[1:]
     gap_pct = (prev_low - curr_open) / prev_low
-    # Gap must open below prev low AND the day's high must stay below prev low
-    # (otherwise the gap was filled on the same day — no valid zone exists)
-    mask = (gap_pct >= gap_threshold) & (curr_high < prev_low)
+    mask = (gap_pct >= gap_threshold) & _gap_candidate_mask(df, session_start_only)
     indices = np.where(mask)[0] + 1
 
     gaps = []
@@ -390,11 +404,158 @@ def identify_gap_down(df: pd.DataFrame, gap_threshold: float = 0.01) -> List[Dic
             "index": int(idx),
             "date": dates[idx],
             "prev_low": float(prev_low[idx - 1]),
+            "previous_close": float(prev_close[idx - 1]),
             "gap_open": float(curr_open[idx - 1]),
             "gap_high": float(curr_high[idx - 1]),
-            "gap_pct": round(float(gap_pct[idx - 1]) * 100, 2)
+            "gap_pct": round(float(gap_pct[idx - 1]) * 100, 2),
+            "range_gap_survived": bool(curr_high[idx - 1] < prev_low[idx - 1]),
         })
     return gaps
+
+
+def _gap_lifecycle(df: pd.DataFrame, gap: Dict, direction: str) -> Dict:
+    gap_index = gap["index"]
+    gap_open = gap["gap_open"]
+    previous_close = gap["previous_close"]
+    if direction == "UP":
+        path = df["low"].values[gap_index:]
+        fill_progress = gap_open - float(np.min(path))
+        filled_offsets = np.where(path <= previous_close)[0]
+        opening_gap = gap_open - previous_close
+    else:
+        path = df["high"].values[gap_index:]
+        fill_progress = float(np.max(path)) - gap_open
+        filled_offsets = np.where(path >= previous_close)[0]
+        opening_gap = previous_close - gap_open
+
+    fill_pct = round(max(0.0, min(100.0, fill_progress / opening_gap * 100)), 2)
+    first_fill_index = (
+        gap_index + int(filled_offsets[0]) if len(filled_offsets) else None
+    )
+    if first_fill_index == gap_index:
+        lifecycle = "SAME_SESSION_FADE"
+    elif first_fill_index is not None:
+        lifecycle = "FILLED"
+    elif fill_pct > 0:
+        lifecycle = "PARTIALLY_FILLED"
+    else:
+        lifecycle = "OPEN"
+
+    latest_close = float(df.iloc[-1]["close"])
+    if first_fill_index is not None and (
+        (direction == "UP" and latest_close < previous_close)
+        or (direction == "DOWN" and latest_close > previous_close)
+    ):
+        lifecycle = "FAILED"
+
+    dates = df.index
+    first_fill_date = dates[first_fill_index] if first_fill_index is not None else None
+    normalized_dates = pd.DatetimeIndex(pd.to_datetime(dates[gap_index:])).normalize()
+    return {
+        "gap_direction": direction,
+        "gap_lifecycle": lifecycle,
+        "fill_pct": fill_pct,
+        "first_fill_date": (
+            first_fill_date.strftime("%Y-%m-%d")
+            if hasattr(first_fill_date, "strftime") else None
+        ),
+        "fill_target": round(float(previous_close), 2),
+        "gap_age_bars": len(df) - 1 - gap_index,
+        "gap_age_sessions": max(len(normalized_dates.unique()) - 1, 0),
+        "range_gap_survived": gap["range_gap_survived"],
+    }
+
+
+def _classify_gap(
+    df: pd.DataFrame,
+    gap: Dict,
+    direction: str,
+    atr_lookup: np.ndarray,
+) -> Dict:
+    gap_index = gap["index"]
+    prior = df.iloc[max(0, gap_index - 20):gap_index]
+    reason_codes = []
+    if len(prior) < 10:
+        return {
+            "gap_classification": "UNCLASSIFIED",
+            "classification_confidence": "LIMITED",
+            "classification_reason_codes": ["INSUFFICIENT_FORMATION_HISTORY"],
+            "formation_trend": "UNKNOWN",
+            "formation_relative_volume": None,
+        }
+
+    gap_open = gap["gap_open"]
+    breaks_range = (
+        gap_open > float(prior["high"].max())
+        if direction == "UP"
+        else gap_open < float(prior["low"].min())
+    )
+    if breaks_range:
+        reason_codes.append("BREAKS_20_BAR_RANGE")
+
+    relative_volume = None
+    if "volume" in df.columns:
+        average_volume = float(prior["volume"].mean())
+        formation_volume = float(df.iloc[gap_index]["volume"])
+        if average_volume > 0:
+            relative_volume = round(formation_volume / average_volume, 2)
+            if relative_volume >= 1.5:
+                reason_codes.append("ELEVATED_FORMATION_VOLUME")
+            elif relative_volume < 0.8:
+                reason_codes.append("LIGHT_FORMATION_VOLUME")
+
+    previous_close = float(prior.iloc[-1]["close"])
+    start_close = float(prior.iloc[0]["close"])
+    prior_return = (previous_close / start_close - 1) if start_close else 0.0
+    moving_average = float(prior["close"].mean())
+    if prior_return >= 0.03 and previous_close >= moving_average:
+        formation_trend = "BULLISH"
+    elif prior_return <= -0.03 and previous_close <= moving_average:
+        formation_trend = "BEARISH"
+    else:
+        formation_trend = "SIDEWAYS"
+    reason_codes.append(f"FORMATION_TREND_{formation_trend}")
+
+    trend_aligned = (
+        (direction == "UP" and formation_trend == "BULLISH")
+        or (direction == "DOWN" and formation_trend == "BEARISH")
+    )
+    atr_at_gap = float(atr_lookup[gap_index])
+    extension_atr = (
+        abs(previous_close - moving_average) / atr_at_gap
+        if atr_at_gap > 0 else 0.0
+    )
+    if extension_atr >= 2.0:
+        reason_codes.append("EXTENDED_FROM_20_BAR_MEAN")
+
+    if (
+        trend_aligned
+        and extension_atr >= 2.0
+        and relative_volume is not None
+        and relative_volume < 0.8
+    ):
+        classification = "EXHAUSTION_WATCH"
+        confidence = "MODERATE"
+    elif trend_aligned:
+        classification = "CONTINUATION"
+        confidence = "MODERATE"
+    elif breaks_range and relative_volume is not None and relative_volume >= 1.5:
+        classification = "BREAKAWAY"
+        confidence = "MODERATE"
+    elif not breaks_range and formation_trend == "SIDEWAYS":
+        classification = "COMMON"
+        confidence = "LIMITED"
+    else:
+        classification = "UNCLASSIFIED"
+        confidence = "LIMITED"
+
+    return {
+        "gap_classification": classification,
+        "classification_confidence": confidence,
+        "classification_reason_codes": reason_codes,
+        "formation_trend": formation_trend,
+        "formation_relative_volume": relative_volume,
+    }
 
 
 def check_gap_status(df: pd.DataFrame, gap_ups: List[Dict], gap_downs: List[Dict], entry_threshold: float = 0.02) -> List[Dict]:
@@ -418,6 +579,28 @@ def check_gap_status(df: pd.DataFrame, gap_ups: List[Dict], gap_downs: List[Dict
         gap_high = gap["prev_high"]    # prev_high
         gi = gap["index"]
 
+        if gi == len(df) - 1:
+            lifecycle = _gap_lifecycle(df, gap, "UP")
+            signal_type = (
+                "Same-Session Fade (Gap Up)"
+                if lifecycle["gap_lifecycle"] in ("SAME_SESSION_FADE", "FAILED")
+                else "New Gap Up"
+            )
+            signals.append({
+                "gap_type": signal_type,
+                "gap_date": gap["date"],
+                "gap_low": gap_high if gap["range_gap_survived"] else gap["previous_close"],
+                "gap_high": gap_low if gap["range_gap_survived"] else gap["gap_open"],
+                "last_close": last_close,
+                "gap_pct": gap["gap_pct"],
+                "gap_index": gi,
+                "gap_direction": "UP",
+            })
+            continue
+
+        if not gap["range_gap_survived"]:
+            continue
+
         # Check if gap is still unfilled (price hasn't gone below gap_high)
         gap_filled = low_arr[gi:].min() <= gap_high
 
@@ -435,6 +618,7 @@ def check_gap_status(df: pd.DataFrame, gap_ups: List[Dict], gap_downs: List[Dict
                         "last_close": last_close,
                         "gap_pct": gap["gap_pct"],
                         "gap_index": gi,
+                        "gap_direction": "UP",
                     })
             elif abs(last_close - gap_low) / gap_low <= entry_threshold:
                 key = ("At Support (Unfilled Gap Up)", gap["date"])
@@ -448,6 +632,7 @@ def check_gap_status(df: pd.DataFrame, gap_ups: List[Dict], gap_downs: List[Dict
                         "last_close": last_close,
                         "gap_pct": gap["gap_pct"],
                         "gap_index": gi,
+                        "gap_direction": "UP",
                     })
         else:
             # Gap was filled — check inside zone first, then edge proximity
@@ -463,6 +648,7 @@ def check_gap_status(df: pd.DataFrame, gap_ups: List[Dict], gap_downs: List[Dict
                         "last_close": last_close,
                         "gap_pct": gap["gap_pct"],
                         "gap_index": gi,
+                        "gap_direction": "UP",
                     })
             elif abs(last_close - gap_low) / gap_low <= entry_threshold:
                 key = ("At Support (Filled Gap Up)", gap["date"])
@@ -476,6 +662,7 @@ def check_gap_status(df: pd.DataFrame, gap_ups: List[Dict], gap_downs: List[Dict
                         "last_close": last_close,
                         "gap_pct": gap["gap_pct"],
                         "gap_index": gi,
+                        "gap_direction": "UP",
                     })
 
     # Check gap-downs (potential resistance levels)
@@ -483,6 +670,28 @@ def check_gap_status(df: pd.DataFrame, gap_ups: List[Dict], gap_downs: List[Dict
         gap_high_val = gap["gap_high"]  # curr_high at gap day
         gap_low_val = gap["prev_low"]   # prev_low
         gi = gap["index"]
+
+        if gi == len(df) - 1:
+            lifecycle = _gap_lifecycle(df, gap, "DOWN")
+            signal_type = (
+                "Same-Session Fade (Gap Down)"
+                if lifecycle["gap_lifecycle"] in ("SAME_SESSION_FADE", "FAILED")
+                else "New Gap Down"
+            )
+            signals.append({
+                "gap_type": signal_type,
+                "gap_date": gap["date"],
+                "gap_low": gap_high_val if gap["range_gap_survived"] else gap["gap_open"],
+                "gap_high": gap_low_val if gap["range_gap_survived"] else gap["previous_close"],
+                "last_close": last_close,
+                "gap_pct": gap["gap_pct"],
+                "gap_index": gi,
+                "gap_direction": "DOWN",
+            })
+            continue
+
+        if not gap["range_gap_survived"]:
+            continue
 
         gap_filled = high_arr[gi:].max() >= gap_low_val
 
@@ -499,8 +708,9 @@ def check_gap_status(df: pd.DataFrame, gap_ups: List[Dict], gap_downs: List[Dict
                         "last_close": last_close,
                         "gap_pct": gap["gap_pct"],
                         "gap_index": gi,
+                        "gap_direction": "DOWN",
                     })
-            elif abs(last_close - gap_low_val) / gap_low_val <= entry_threshold:
+            elif last_close <= gap_high_val and abs(last_close - gap_high_val) / gap_high_val <= entry_threshold:
                 key = ("At Resistance (Unfilled Gap Down)", gap["date"])
                 if key not in seen:
                     seen.add(key)
@@ -512,6 +722,7 @@ def check_gap_status(df: pd.DataFrame, gap_ups: List[Dict], gap_downs: List[Dict
                         "last_close": last_close,
                         "gap_pct": gap["gap_pct"],
                         "gap_index": gi,
+                        "gap_direction": "DOWN",
                     })
         else:
             # Gap was filled — check inside zone first, then edge proximity
@@ -527,6 +738,7 @@ def check_gap_status(df: pd.DataFrame, gap_ups: List[Dict], gap_downs: List[Dict
                         "last_close": last_close,
                         "gap_pct": gap["gap_pct"],
                         "gap_index": gi,
+                        "gap_direction": "DOWN",
                     })
             elif last_close <= gap_high_val and abs(last_close - gap_high_val) / gap_high_val <= entry_threshold:
                 key = ("At Resistance (Filled Gap Down)", gap["date"])
@@ -540,12 +752,19 @@ def check_gap_status(df: pd.DataFrame, gap_ups: List[Dict], gap_downs: List[Dict
                         "last_close": last_close,
                         "gap_pct": gap["gap_pct"],
                         "gap_index": gi,
+                        "gap_direction": "DOWN",
                     })
 
     return signals
 
 
-def scan_gap_strategies(ticker: str, df: pd.DataFrame = None, min_atr_ratio: float = 0.5) -> List[Dict]:
+def scan_gap_strategies(
+    ticker: str,
+    df: pd.DataFrame = None,
+    min_atr_ratio: float = 0.5,
+    *,
+    interval: str = "1d",
+) -> List[Dict]:
     """
     Scans a ticker for gap-based strategies.
     Returns a list of all relevant gap signals for the ticker.
@@ -554,7 +773,7 @@ def scan_gap_strategies(ticker: str, df: pd.DataFrame = None, min_atr_ratio: flo
     if df is None:
         df = download_historical_data(ticker, period="1y", interval="1d")
     
-    if df is None or len(df) < 20:
+    if df is None or len(df) < 20 or interval in ("1wk", "1mo"):
         return []
     
     # Normalize column names
@@ -574,8 +793,13 @@ def scan_gap_strategies(ticker: str, df: pd.DataFrame = None, min_atr_ratio: flo
     # Pad index 0 so atr_lookup[i] corresponds to df row i (row 0 has no ATR)
     atr_lookup = np.concatenate(([np.nan], atr_arr))
 
-    gap_ups = identify_gap_up(df, gap_threshold=0.01)
-    gap_downs = identify_gap_down(df, gap_threshold=0.01)
+    session_start_only = interval != "1d"
+    gap_ups = identify_gap_up(
+        df, gap_threshold=0.01, session_start_only=session_start_only
+    )
+    gap_downs = identify_gap_down(
+        df, gap_threshold=0.01, session_start_only=session_start_only
+    )
     
     signals = check_gap_status(df, gap_ups, gap_downs)
 
@@ -606,6 +830,11 @@ def scan_gap_strategies(ticker: str, df: pd.DataFrame = None, min_atr_ratio: flo
         trend = "N/A"
 
     close_arr = df["close"].values
+    gap_events = {
+        ("UP", gap["index"]): gap for gap in gap_ups
+    } | {
+        ("DOWN", gap["index"]): gap for gap in gap_downs
+    }
 
     results = []
     for s in signals:
@@ -626,6 +855,14 @@ def scan_gap_strategies(ticker: str, df: pd.DataFrame = None, min_atr_ratio: flo
         # Skip gaps smaller than min_atr_ratio × ATR (noise)
         if gap_atr_ratio < min_atr_ratio:
             continue
+
+        direction = s["gap_direction"]
+        gap_event = gap_events[(direction, gi)]
+        lifecycle = _gap_lifecycle(df, gap_event, direction)
+        classification = _classify_gap(df, gap_event, direction, atr_lookup)
+        previous_close = gap_event["previous_close"]
+        gap_open = gap_event["gap_open"]
+        opening_gap_pct = abs(gap_open - previous_close) / previous_close * 100
 
         is_inside = "In Gap" in s["gap_type"]
 
@@ -662,6 +899,10 @@ def scan_gap_strategies(ticker: str, df: pd.DataFrame = None, min_atr_ratio: flo
             "gap_atr_ratio": gap_atr_ratio,
             "gap_date": s["gap_date"].strftime("%Y-%m-%d") if hasattr(s["gap_date"], "strftime") else str(s["gap_date"]),
             "entry_direction": entry_dir,
+            "opening_gap_pct": round(opening_gap_pct, 2),
+            "full_gap_pct": s["gap_pct"],
+            **lifecycle,
+            **classification,
         })
     return results
 
@@ -1098,6 +1339,7 @@ def scan_momentum_pullback(ticker: str, df: pd.DataFrame = None, interval: str =
     if df is None or len(df) < min_bars:
         return None
 
+    df = df.tail(min_bars).copy()
     df.columns = [col.lower() for col in df.columns]
     close = df["close"]
     high = df["high"]
@@ -1331,6 +1573,7 @@ def scan_bearish_bounce(ticker: str, df: pd.DataFrame = None, interval: str = "1
     if df is None or len(df) < min_bars:
         return None
 
+    df = df.tail(min_bars).copy()
     df.columns = [col.lower() for col in df.columns]
     close = df["close"]
     high = df["high"]

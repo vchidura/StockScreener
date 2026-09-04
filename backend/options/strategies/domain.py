@@ -86,6 +86,19 @@ class StrategyContextSnapshot:
     source_bar_keys: tuple[str, ...]
     policy_version: str
     policy_sha256: str
+    equity_context_snapshot_id: UUID | None = None
+    equity_context_status: str | None = None
+    qualified_direction: str | None = None
+    company_name: str | None = None
+    market_cap: Decimal | None = None
+    shares_outstanding: Decimal | None = None
+    free_float: Decimal | None = None
+    dividend_yield: float | None = None
+    enterprise_value: Decimal | None = None
+    ebitda: Decimal | None = None
+    operating_income: Decimal | None = None
+    free_cash_flow: Decimal | None = None
+    equity_reason_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.underlyer.strip():
@@ -101,8 +114,23 @@ class StrategyContextSnapshot:
             (self.daily_ema_50, "daily_ema_50"),
             (self.hourly_close, "hourly_close"),
             (self.hourly_ema_20, "hourly_ema_20"),
+            (self.market_cap, "market_cap"),
+            (self.shares_outstanding, "shares_outstanding"),
+            (self.free_float, "free_float"),
+            (self.enterprise_value, "enterprise_value"),
+            (self.ebitda, "ebitda"),
+            (self.operating_income, "operating_income"),
+            (self.free_cash_flow, "free_cash_flow"),
         ):
             _finite_decimal(value, name)
+        if self.dividend_yield is not None:
+            _finite_float(self.dividend_yield, "dividend_yield")
+            if not 0 <= self.dividend_yield <= 1:
+                raise ValueError("dividend_yield must be in [0, 1]")
+        if self.qualified_direction not in (None, "BULLISH", "BEARISH", "NEUTRAL"):
+            raise ValueError("qualified_direction is invalid")
+        if type(self.equity_reason_codes) is not tuple:
+            raise TypeError("equity_reason_codes must be a tuple")
         object.__setattr__(self, "market_data_time", market_time)
         object.__setattr__(self, "observed_time", observed_time)
 
@@ -147,6 +175,27 @@ def candidate_identity(
     )
     digest = hashlib.sha256(payload.encode("ascii")).hexdigest()
     return uuid5(NAMESPACE_URL, f"option-candidate:{digest}"), digest
+
+
+def signal_identity_sha256(
+    underlyer: str,
+    strategy_name: str,
+    strategy_version: str,
+    policy_sha256: str,
+    structure_type: StructureType,
+    ordered_legs: tuple[tuple[int, str, int, int], ...],
+) -> str:
+    payload = canonical_json(
+        {
+            "underlyer": underlyer,
+            "strategy_name": strategy_name,
+            "strategy_version": strategy_version,
+            "policy_sha256": policy_sha256,
+            "structure_type": structure_type.value,
+            "ordered_legs": ordered_legs,
+        }
+    )
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

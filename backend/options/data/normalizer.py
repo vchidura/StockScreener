@@ -419,7 +419,14 @@ class DeveloperOptionNormalizer:
         return DeveloperNormalizationResult(
             snapshots=tuple(snapshots),
             matrix_snapshots=tuple(
-                sorted(latest.values(), key=lambda item: item.contract_id)
+                sorted(
+                    (
+                        snapshot
+                        for snapshot in latest.values()
+                        if snapshot.model_mark is not None
+                    ),
+                    key=lambda item: item.contract_id,
+                )
             ),
             received_count=len(inputs),
             retained_count=len(snapshots),

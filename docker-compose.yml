@@ -3,24 +3,26 @@ version: "3.8"
 services:
   # PostgreSQL Database
   db:
-    image: postgres:15-alpine
+    image: postgres:17-alpine
     container_name: stock-screener-db
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${DB_NAME:-stocks_db}
-      POSTGRES_USER: ${DB_USER:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?POSTGRES_ADMIN_PASSWORD is required}
+      APP_DB_USER: ${DB_USER:?DB_USER is required}
+      APP_DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./backend/backups/stocks_db_backup.dump:/docker-entrypoint-initdb.d/stocks_db_backup.dump:ro
-      - ./backend/scripts/00_restore_database.sh:/docker-entrypoint-initdb.d/00_restore_database.sh:ro
+      - ./backend/migrations/000_canonical_schema.sql:/docker-entrypoint-initdb.d/00_canonical_schema.sql:ro
+      - ./backend/scripts/01_configure_app_role.sh:/docker-entrypoint-initdb.d/01_configure_app_role.sh:ro
     ports:
       - "5432:5432"
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-stocks_db} && psql -U ${DB_USER:-postgres} -d ${DB_NAME:-stocks_db} -tAc \"SELECT to_regclass('public.stock_prices_daily') IS NOT NULL\" | grep -q t",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB && psql -U $$POSTGRES_USER -d $$POSTGRES_DB -tAc \"SELECT EXISTS (SELECT 1 FROM public.schema_migrations WHERE version = '000_canonical_schema') AND to_regclass('public.equity_bar_revisions') IS NOT NULL AND to_regclass('public.equity_current_bar_projection') IS NOT NULL AND to_regclass('public.equity_canonical_bars') IS NOT NULL\" | grep -q t",
         ]
       interval: 10s
       timeout: 5s
@@ -38,11 +40,54 @@ services:
       db:
         condition: service_healthy
     environment:
+      APP_ENV: ${APP_ENV:-production}
       DB_NAME: ${DB_NAME:-stocks_db}
-      DB_USER: ${DB_USER:-postgres}
-      DB_PASSWORD: ${DB_PASSWORD:-changeme}
+      DB_USER: ${DB_USER:?DB_USER is required}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
       DB_HOST: db
       DB_PORT: 5432
+      POLYGON_API_KEY: ${POLYGON_API_KEY:?POLYGON_API_KEY is required}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,http://127.0.0.1}
+      OPTION_DATA_ENGINE: ${OPTION_DATA_ENGINE:-polygon_developer}
+      OPTION_UNDERLYING_DATA_PROVIDER: ${OPTION_UNDERLYING_DATA_PROVIDER:-polygon_stocks}
+      OPTION_EQUITY_CONTEXT_ENABLED: ${OPTION_EQUITY_CONTEXT_ENABLED:-false}
+      OPTION_EXECUTION_ENGINE: ${OPTION_EXECUTION_ENGINE:-paper_proxy}
+      OPTION_UNIVERSE_MODE: ${OPTION_UNIVERSE_MODE:-fixed}
+      OPTION_FIXED_STOCK_UNDERLYERS: ${OPTION_FIXED_STOCK_UNDERLYERS:-AAPL,AMD,AMZN,GOOGL,META,MSFT,NVDA,PLTR,SOFI,TSLA}
+      OPTION_FIXED_ETF_UNDERLYERS: ${OPTION_FIXED_ETF_UNDERLYERS:-SPY,QQQ,IWM}
+      OPTION_STOCK_UNIVERSE_SIZE: ${OPTION_STOCK_UNIVERSE_SIZE:-10}
+      OPTION_ETF_UNIVERSE_SIZE: ${OPTION_ETF_UNIVERSE_SIZE:-3}
+      OPTION_POLL_SECONDS: ${OPTION_POLL_SECONDS:-900}
+      OPTION_WORKER_POLL_SECONDS: ${OPTION_WORKER_POLL_SECONDS:-15}
+      OPTION_SLOT_SECONDS: ${OPTION_SLOT_SECONDS:-900}
+      OPTION_PROVIDER_DELAY_SECONDS: ${OPTION_PROVIDER_DELAY_SECONDS:-900}
+      OPTION_PUBLICATION_GRACE_SECONDS: ${OPTION_PUBLICATION_GRACE_SECONDS:-30}
+      OPTION_STARTING_CASH: ${OPTION_STARTING_CASH:-250000}
+      OPTION_RISK_FREE_RATE: ${OPTION_RISK_FREE_RATE:-0.04}
+      OPTION_RISK_FREE_RATE_SOURCE: ${OPTION_RISK_FREE_RATE_SOURCE:-manual_config_v1}
+      OPTION_DEFAULT_DIVIDEND_YIELD: ${OPTION_DEFAULT_DIVIDEND_YIELD:-0}
+      OPTION_POLICY_FILE: ${OPTION_POLICY_FILE:-options/policies/developer_v1.json}
+      OPTION_STRATEGY_POLICY_FILE: ${OPTION_STRATEGY_POLICY_FILE:-options/policies/strategy_v1.json}
+      OPTION_RAW_ARCHIVE_ROOT: ${OPTION_RAW_ARCHIVE_ROOT:-option-raw}
+      OPTION_START_READ_ONLY: ${OPTION_START_READ_ONLY:-true}
+      OPTION_RAW_ARCHIVE_ENABLED: ${OPTION_RAW_ARCHIVE_ENABLED:-false}
+      EQUITY_MATERIALIZATION_INTERVALS: ${EQUITY_MATERIALIZATION_INTERVALS:-5m,15m,30m,1h,1d,1wk,1mo}
+      EQUITY_WORKER_POLL_SECONDS: ${EQUITY_WORKER_POLL_SECONDS:-15}
+      EQUITY_NATIVE_FETCH_WORKERS: ${EQUITY_NATIVE_FETCH_WORKERS:-8}
+      EQUITY_PROVIDER_DELAY_MINUTES: ${EQUITY_PROVIDER_DELAY_MINUTES:-15}
+      EQUITY_PUBLICATION_GRACE_SECONDS: ${EQUITY_PUBLICATION_GRACE_SECONDS:-600}
+      EQUITY_STALE_RUN_MINUTES: ${EQUITY_STALE_RUN_MINUTES:-60}
+      EQUITY_PORTAL_SNAPSHOT_POLL_SECONDS: ${EQUITY_PORTAL_SNAPSHOT_POLL_SECONDS:-60}
+      EQUITY_STREAM_FLUSH_SECONDS: ${EQUITY_STREAM_FLUSH_SECONDS:-1}
+      EQUITY_STREAM_MAX_RECONNECTS: ${EQUITY_STREAM_MAX_RECONNECTS:-20}
+      EQUITY_MATERIALIZED_30M_SETUP_ENABLED: ${EQUITY_MATERIALIZED_30M_SETUP_ENABLED:-true}
+      EQUITY_MATERIALIZED_1H_SETUP_ENABLED: ${EQUITY_MATERIALIZED_1H_SETUP_ENABLED:-true}
+      EQUITY_MATERIALIZED_1D_SETUP_ENABLED: ${EQUITY_MATERIALIZED_1D_SETUP_ENABLED:-true}
+      EQUITY_MATERIALIZED_1WK_SETUP_ENABLED: ${EQUITY_MATERIALIZED_1WK_SETUP_ENABLED:-true}
+      EQUITY_MATERIALIZED_1MO_SETUP_ENABLED: ${EQUITY_MATERIALIZED_1MO_SETUP_ENABLED:-true}
+      EQUITY_MATERIALIZED_PATTERN_WATCH_ENABLED: ${EQUITY_MATERIALIZED_PATTERN_WATCH_ENABLED:-true}
+      EQUITY_MATERIALIZED_PORTAL_SNAPSHOTS_ENABLED: ${EQUITY_MATERIALIZED_PORTAL_SNAPSHOTS_ENABLED:-true}
+      EQUITY_MATERIALIZED_SCANNER_PAGE_SNAPSHOTS_ENABLED: ${EQUITY_MATERIALIZED_SCANNER_PAGE_SNAPSHOTS_ENABLED:-true}
     ports:
       - "8001:8001"
 
@@ -58,24 +103,167 @@ services:
     ports:
       - "80:80"
 
-  # Price Update Scheduler (all jobs: 5m, hourly, daily)
-  scheduler:
+  # Build the initial selected universe from Polygon only when the table is empty.
+  equity-universe-bootstrap:
+    profiles: ["equity"]
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: stock-screener-scheduler
-    command: python scripts/run_scheduler.py
-    restart: unless-stopped
+    command:
+      - python
+      - scripts/discover_universe_polygon.py
+      - --if-empty
+      - --target-size
+      - ${EQUITY_UNIVERSE_TARGET_SIZE:-350}
+      - --lookback-days
+      - ${EQUITY_UNIVERSE_LOOKBACK_DAYS:-20}
+    restart: "no"
     depends_on:
       db:
         condition: service_healthy
     environment:
       DB_NAME: ${DB_NAME:-stocks_db}
-      DB_USER: ${DB_USER:-postgres}
-      DB_PASSWORD: ${DB_PASSWORD:-changeme}
+      DB_USER: ${DB_USER:?DB_USER is required}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
       DB_HOST: db
       DB_PORT: 5432
-      TWELVEDATA_API_KEY: ${TWELVEDATA_API_KEY:-}
+      POLYGON_API_KEY: ${POLYGON_API_KEY:?POLYGON_API_KEY is required}
+
+  # Finalized equity evidence worker. Enable explicitly with: docker compose --profile equity up -d
+  equity-worker:
+    profiles: ["equity"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: stock-screener-equity-worker
+    command: python scripts/run_equity_worker.py
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      equity-universe-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DB_NAME: ${DB_NAME:-stocks_db}
+      DB_USER: ${DB_USER:?DB_USER is required}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      DB_HOST: db
+      DB_PORT: 5432
+      POLYGON_API_KEY: ${POLYGON_API_KEY:?POLYGON_API_KEY is required}
+      EQUITY_MATERIALIZATION_INTERVALS: ${EQUITY_MATERIALIZATION_INTERVALS:-5m,15m,30m,1h,1d,1wk,1mo}
+      EQUITY_WORKER_POLL_SECONDS: ${EQUITY_WORKER_POLL_SECONDS:-15}
+      EQUITY_NATIVE_FETCH_WORKERS: ${EQUITY_NATIVE_FETCH_WORKERS:-8}
+      EQUITY_PROVIDER_DELAY_MINUTES: ${EQUITY_PROVIDER_DELAY_MINUTES:-15}
+      EQUITY_STALE_RUN_MINUTES: ${EQUITY_STALE_RUN_MINUTES:-60}
+      EQUITY_WORKER_LOCK_NAME: ${EQUITY_WORKER_LOCK_NAME:-stock-screener:equity-materialization-worker}
+
+  equity-portal-worker:
+    profiles: ["equity"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: stock-screener-equity-portal-worker
+    command: python scripts/refresh_equity_portal_snapshots.py --continuous
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      equity-universe-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DB_NAME: ${DB_NAME:-stocks_db}
+      DB_USER: ${DB_USER:?DB_USER is required}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      DB_HOST: db
+      DB_PORT: 5432
+      EQUITY_PORTAL_SNAPSHOT_POLL_SECONDS: ${EQUITY_PORTAL_SNAPSHOT_POLL_SECONDS:-60}
+
+  option-worker:
+    profiles: ["options"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: stock-screener-option-worker
+    command: python scripts/run_option_worker.py
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DB_NAME: ${DB_NAME:-stocks_db}
+      DB_USER: ${DB_USER:?DB_USER is required}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      DB_HOST: db
+      DB_PORT: 5432
+      POLYGON_API_KEY: ${POLYGON_API_KEY:?POLYGON_API_KEY is required}
+      OPTION_DATA_ENGINE: ${OPTION_DATA_ENGINE:-polygon_developer}
+      OPTION_UNDERLYING_DATA_PROVIDER: ${OPTION_UNDERLYING_DATA_PROVIDER:-polygon_stocks}
+      OPTION_EQUITY_CONTEXT_ENABLED: ${OPTION_EQUITY_CONTEXT_ENABLED:-false}
+      OPTION_EXECUTION_ENGINE: ${OPTION_EXECUTION_ENGINE:-paper_proxy}
+      OPTION_UNIVERSE_MODE: ${OPTION_UNIVERSE_MODE:-fixed}
+      OPTION_FIXED_STOCK_UNDERLYERS: ${OPTION_FIXED_STOCK_UNDERLYERS:-AAPL,AMD,AMZN,GOOGL,META,MSFT,NVDA,PLTR,SOFI,TSLA}
+      OPTION_FIXED_ETF_UNDERLYERS: ${OPTION_FIXED_ETF_UNDERLYERS:-SPY,QQQ,IWM}
+      OPTION_STOCK_UNIVERSE_SIZE: ${OPTION_STOCK_UNIVERSE_SIZE:-10}
+      OPTION_ETF_UNIVERSE_SIZE: ${OPTION_ETF_UNIVERSE_SIZE:-3}
+      OPTION_STARTING_CASH: ${OPTION_STARTING_CASH:-250000}
+      OPTION_RISK_FREE_RATE: ${OPTION_RISK_FREE_RATE:-0.04}
+      OPTION_RISK_FREE_RATE_SOURCE: ${OPTION_RISK_FREE_RATE_SOURCE:-manual_config_v1}
+      OPTION_DEFAULT_DIVIDEND_YIELD: ${OPTION_DEFAULT_DIVIDEND_YIELD:-0}
+      OPTION_POLICY_FILE: ${OPTION_POLICY_FILE:-options/policies/developer_v1.json}
+      OPTION_STRATEGY_POLICY_FILE: ${OPTION_STRATEGY_POLICY_FILE:-options/policies/strategy_v1.json}
+      OPTION_RAW_ARCHIVE_ENABLED: ${OPTION_RAW_ARCHIVE_ENABLED:-false}
+      OPTION_RAW_ARCHIVE_ROOT: ${OPTION_RAW_ARCHIVE_ROOT:-option-raw}
+      OPTION_START_READ_ONLY: ${OPTION_START_READ_ONLY:-true}
+      OPTION_POLL_SECONDS: ${OPTION_POLL_SECONDS:-900}
+      OPTION_WORKER_POLL_SECONDS: ${OPTION_WORKER_POLL_SECONDS:-15}
+      OPTION_SLOT_SECONDS: ${OPTION_SLOT_SECONDS:-900}
+      OPTION_PROVIDER_DELAY_SECONDS: ${OPTION_PROVIDER_DELAY_SECONDS:-900}
+      OPTION_PUBLICATION_GRACE_SECONDS: ${OPTION_PUBLICATION_GRACE_SECONDS:-30}
+
+  # One-shot schema upgrade using the bootstrap administrator; never used by runtime services.
+  equity-migrate:
+    profiles: ["maintenance"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python scripts/run_equity_materialization.py --apply-migration
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DB_NAME: ${DB_NAME:-stocks_db}
+      DB_USER: ${POSTGRES_ADMIN_USER:-postgres}
+      DB_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?POSTGRES_ADMIN_PASSWORD is required}
+      DB_HOST: db
+      DB_PORT: 5432
+
+  # Advanced minute stream. Keep disabled until the explicit stream gate passes.
+  equity-stream-worker:
+    profiles: ["equity-stream"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: stock-screener-equity-stream-worker
+    command: python scripts/run_equity_stream_worker.py
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DB_NAME: ${DB_NAME:-stocks_db}
+      DB_USER: ${DB_USER:?DB_USER is required}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      DB_HOST: db
+      DB_PORT: 5432
+      POLYGON_API_KEY: ${POLYGON_API_KEY:?POLYGON_API_KEY is required}
+      EQUITY_STREAM_WORKER_LOCK_NAME: ${EQUITY_STREAM_WORKER_LOCK_NAME:-stock-screener:equity-stream-worker}
+      EQUITY_STREAM_FLUSH_SECONDS: ${EQUITY_STREAM_FLUSH_SECONDS:-1}
+      EQUITY_STREAM_MAX_RECONNECTS: ${EQUITY_STREAM_MAX_RECONNECTS:-20}
 
 volumes:
   postgres_data:

@@ -5,6 +5,7 @@ import socket
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Callable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from options.analytics.analysis_engine import OptionAnalysisEngine
@@ -32,10 +33,13 @@ from options.domain import (
 from options.repositories.analysis import OptionAnalysisRepository
 from options.repositories.catalog import OptionContractCatalogRepository
 from options.repositories.ingestion import OptionIngestionRepository
+from options.repositories.outcomes import OptionOutcomeRepository
 from options.repositories.snapshots import OptionSnapshotRepository
 from options.repositories.universe import OptionUniverseRepository
 from options.repositories.work_items import OptionWorkItemRepository
 from options.strategy_orchestration import OptionStrategyPipeline
+from equity.domain import DecisionWatermark, EvidenceType
+from equity.repositories import EquityEvidenceRepository
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +53,7 @@ class UnderlyingCycleResult:
     retained_count: int
     iv_convergence_fraction: float | None
     reasons: tuple[str, ...]
+    retryable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +63,10 @@ class ManualCycleResult:
     started_at: datetime
     completed_at: datetime
     results: tuple[UnderlyingCycleResult, ...]
+
+
+class TerminalOptionQualityError(RuntimeError):
+    pass
 
 
 class ManualOptionPipeline:
@@ -76,6 +85,8 @@ class ManualOptionPipeline:
         normalizer: DeveloperOptionNormalizer | None = None,
         analysis_engine: OptionAnalysisEngine | None = None,
         strategy_pipeline: OptionStrategyPipeline | None = None,
+        equity_evidence_repository: EquityEvidenceRepository | None = None,
+        outcome_repository: OptionOutcomeRepository | None = None,
         clock=None,
     ) -> None:
         self.configuration = configuration
@@ -90,13 +101,25 @@ class ManualOptionPipeline:
         self.normalizer = normalizer or DeveloperOptionNormalizer(configuration.policy)
         self.analysis_engine = analysis_engine or OptionAnalysisEngine(configuration.policy)
         self.strategy_pipeline = strategy_pipeline
+        self.outcome_repository = outcome_repository
+        self.equity_evidence_repository = (
+            equity_evidence_repository or EquityEvidenceRepository()
+        )
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def latest_due_retry_cycle(self) -> datetime | None:
+        return self.work_repository.latest_due_cycle(
+            self.configuration.policy_sha256,
+            self.configuration.configuration_sha256,
+        )
 
     def run_once(
         self,
         underlyers: tuple[str, ...] | None = None,
         *,
         as_of: datetime | None = None,
+        cycle_time: datetime | None = None,
+        progress_callback: Callable[[], object] | None = None,
     ) -> ManualCycleResult:
         started_at = _as_utc(self.clock(), "clock")
         self.work_repository.recover_expired_claims()
@@ -105,13 +128,20 @@ class ManualOptionPipeline:
         if unknown:
             raise ValueError(f"underlyers are not configured: {sorted(unknown)}")
         as_of = _as_utc(as_of, "as_of") if as_of is not None else started_at
-        as_of_session = self.calendar.latest_completed_session(as_of)
-        cycle_time = self.calendar.expiration_cutoff(as_of_session) + timedelta(minutes=15)
+        if cycle_time is None:
+            as_of_session = self.calendar.latest_completed_session(as_of)
+            cycle_time = self.calendar.expiration_cutoff(as_of_session) + timedelta(minutes=15)
+        else:
+            cycle_time = _as_utc(cycle_time, "cycle_time")
+            if cycle_time > as_of:
+                raise ValueError("cycle_time cannot be later than as_of")
+            as_of_session = self.calendar.session_for_slot(cycle_time)
         universe_run_id = uuid5(
             NAMESPACE_URL,
             (
-                f"option-universe:{as_of_session}:"
-                f"{self.configuration.configuration_sha256}:{started_at.isoformat()}"
+                f"option-universe:{as_of_session}:{cycle_time.isoformat()}:"
+                f"{self.configuration.configuration_sha256}:"
+                f"{','.join(requested)}"
             ),
         )
         universe_members = self._persist_fixed_universe(
@@ -120,17 +150,24 @@ class ManualOptionPipeline:
             requested,
             started_at,
         )
-        results = tuple(
-            self._run_underlying(
+        results = []
+        for underlyer in requested:
+            if progress_callback is not None:
+                progress_callback()
+            results.append(self._run_underlying(
                 underlyer,
                 universe_members[underlyer],
                 as_of_session,
                 cycle_time,
-            )
-            for underlyer in requested
-        )
+            ))
+        if progress_callback is not None:
+            progress_callback()
+        results = tuple(results)
         completed_at = _as_utc(self.clock(), "clock")
-        completed_count = sum(result.status in {"COMPLETE", "DEGRADED"} for result in results)
+        completed_count = sum(
+            result.status in {"COMPLETE", "DEGRADED", "ALREADY_COMPLETED"}
+            for result in results
+        )
         universe_status = (
             UniverseRunStatus.COMPLETE
             if completed_count == len(results)
@@ -219,6 +256,18 @@ class ManualOptionPipeline:
             corridor = self.configuration.policy.contract_filter.strike_corridor_fraction
             strike_min = spot.price * (Decimal("1") - corridor)
             strike_max = spot.price * (Decimal("1") + corridor)
+            if self.outcome_repository is not None:
+                followup = self.outcome_repository.retained_leg_bounds(
+                    underlyer,
+                    available_by=_as_utc(self.clock(), "clock"),
+                )
+                if followup is not None:
+                    strike_min = min(strike_min, followup["minimum_strike"])
+                    strike_max = max(strike_max, followup["maximum_strike"])
+                    expiration_through = max(
+                        expiration_through,
+                        followup["expiration_through"],
+                    )
             references = self.engine.list_option_references(
                 underlyer,
                 as_of_session,
@@ -236,14 +285,48 @@ class ManualOptionPipeline:
                 strike_max,
             )
             batch_id = batch.batch_id
+            matrix_id = uuid5(
+                NAMESPACE_URL,
+                f"option-matrix:{batch_id}:{self.configuration.policy_sha256}",
+            )
             business_key = f"normalize:{batch_id}"
             work_item = self.work_repository.claim_by_business_key(
                 business_key,
                 lease_owner,
                 timedelta(minutes=10),
             )
+            existing_analysis = self.analysis_repository.get(
+                matrix_id,
+                DecisionContext(
+                    _as_utc(self.clock(), "clock"),
+                    _as_utc(self.clock(), "clock"),
+                ),
+            )
             if work_item is None:
+                existing_work = self.work_repository.get_by_business_key(business_key)
+                if (
+                    existing_work is not None
+                    and existing_work.status.value == "COMPLETED"
+                    and existing_analysis is not None
+                    and existing_analysis.status not in (
+                        AnalysisStatus.PENDING, AnalysisStatus.RUNNING,
+                    )
+                ):
+                    self._ensure_persisted_strategy(existing_analysis, asset_type)
+                    return self._existing_result(
+                        existing_analysis, batch_id, asset_type,
+                    )
                 raise RuntimeError("normalization work item could not be claimed")
+            if (
+                existing_analysis is not None
+                and existing_analysis.status not in (
+                    AnalysisStatus.PENDING, AnalysisStatus.RUNNING,
+                )
+            ):
+                self._ensure_persisted_strategy(existing_analysis, asset_type)
+                if not self.work_repository.complete(work_item.work_id, lease_owner):
+                    raise RuntimeError("normalization work lease expired before acknowledgement")
+                return self._existing_result(existing_analysis, batch_id, asset_type)
             raw_rows = self._raw_observations(batch)
             catalog_observed_time = max(
                 [
@@ -272,19 +355,43 @@ class ManualOptionPipeline:
                     self.configuration.policy.contract_filter.maximum_unknown_reference_fraction
                 ),
             )
-            mark_times = [row.option_mark_time for row in raw_rows if row.option_mark_time]
-            bars: tuple[UnderlyingMinuteBar, ...] = ()
-            if mark_times:
-                bars = self.engine.get_underlying_minute_bars(
-                    underlyer,
-                    min(mark_times) - timedelta(minutes=1),
-                    max(mark_times),
-                )
-            observed_time = max(
+            bar_window_observed_at = max(
                 catalog_observed_time,
                 _as_utc(self.clock(), "clock"),
             )
+            mark_window = _fresh_mark_window(
+                raw_rows,
+                bar_window_observed_at,
+                self.configuration.policy.model_quality.maximum_developer_source_age_seconds,
+            )
+            bars: tuple[UnderlyingMinuteBar, ...] = ()
+            if mark_window is not None:
+                bars = self.engine.get_underlying_minute_bars(
+                    underlyer,
+                    mark_window[0] - timedelta(minutes=1),
+                    mark_window[1],
+                )
+            observed_time = max(
+                bar_window_observed_at,
+                _as_utc(self.clock(), "clock"),
+            )
             context = DecisionContext(cycle_time, observed_time)
+            dividend_yield = float(
+                self.configuration.settings.default_dividend_yield
+            )
+            dividend_quality_flags = (
+                DataQualityFlag.DIVIDEND_YIELD_DEFAULTED,
+            )
+            if self.configuration.settings.equity_context_enabled:
+                fundamental_evidence = self.equity_evidence_repository.list_as_of(
+                    underlyer,
+                    DecisionWatermark(context.market_time, context.observed_time),
+                    evidence_types=(EvidenceType.FUNDAMENTAL_SNAPSHOT,),
+                )
+                dividend_yield, dividend_quality_flags = _resolve_dividend_yield(
+                    fundamental_evidence,
+                    dividend_yield,
+                )
             normalization_inputs = tuple(
                 DeveloperNormalizationInput(
                     raw=row,
@@ -294,12 +401,8 @@ class ManualOptionPipeline:
                         catalog[row.contract_ticker].expiration_date
                     ),
                     risk_free_rate=float(self.configuration.settings.risk_free_rate),
-                    dividend_yield=float(
-                        self.configuration.settings.default_dividend_yield
-                    ),
-                    input_quality_flags=(
-                        DataQualityFlag.DIVIDEND_YIELD_DEFAULTED,
-                    ),
+                    dividend_yield=dividend_yield,
+                    input_quality_flags=dividend_quality_flags,
                     normalized_observed_at=observed_time,
                 )
                 for row in raw_rows
@@ -316,7 +419,9 @@ class ManualOptionPipeline:
             if unknown_count:
                 rejected_counts["UNKNOWN_REFERENCE"] = unknown_count
             if not normalized.matrix_snapshots:
-                raise RuntimeError("normalization produced no retained contracts")
+                raise TerminalOptionQualityError(
+                    "normalization produced no retained contracts"
+                )
             matrix_market_time = max(
                 snapshot.market_data_time
                 for snapshot in normalized.matrix_snapshots
@@ -330,10 +435,6 @@ class ManualOptionPipeline:
                 unknown_reference_count=unknown_count,
                 market_data_time=matrix_market_time,
                 first_observed_at=observed_time,
-            )
-            matrix_id = uuid5(
-                NAMESPACE_URL,
-                f"option-matrix:{batch_id}:{self.configuration.policy_sha256}",
             )
             analysis = self.analysis_engine.analyze(
                 matrix_id,
@@ -390,13 +491,21 @@ class ManualOptionPipeline:
                 reasons=analysis.chain_health.reasons,
             )
         except Exception as exc:
+            retryable = not isinstance(exc, TerminalOptionQualityError)
             if work_item is not None:
-                self.work_repository.retry(
-                    work_item.work_id,
-                    lease_owner,
-                    str(exc),
-                    timedelta(minutes=5),
-                )
+                if retryable:
+                    self.work_repository.retry(
+                        work_item.work_id,
+                        lease_owner,
+                        str(exc),
+                        timedelta(minutes=5),
+                    )
+                else:
+                    self.work_repository.terminal_fail(
+                        work_item.work_id,
+                        lease_owner,
+                        str(exc),
+                    )
             return UnderlyingCycleResult(
                 underlyer=underlyer,
                 asset_type=asset_type,
@@ -407,7 +516,38 @@ class ManualOptionPipeline:
                 retained_count=0,
                 iv_convergence_fraction=None,
                 reasons=(type(exc).__name__,),
+                retryable=retryable,
             )
+
+    @staticmethod
+    def _existing_result(
+        analysis: OptionAnalysisRun,
+        batch_id: UUID,
+        asset_type: AssetType,
+    ) -> UnderlyingCycleResult:
+        health = json.loads(analysis.chain_health_json)
+        return UnderlyingCycleResult(
+            underlyer=analysis.underlyer,
+            asset_type=asset_type,
+            batch_id=batch_id,
+            matrix_id=analysis.matrix_id,
+            status="ALREADY_COMPLETED",
+            received_count=analysis.received_contract_count,
+            retained_count=int(health.get("retained_count") or 0),
+            iv_convergence_fraction=analysis.iv_convergence_fraction,
+            reasons=tuple(analysis.quality_reasons),
+        )
+
+    def _ensure_persisted_strategy(
+        self,
+        analysis: OptionAnalysisRun,
+        asset_type: AssetType,
+    ) -> None:
+        if self.strategy_pipeline is None:
+            return
+        result = self.strategy_pipeline.process_persisted(analysis, asset_type)
+        if result.status not in {"COMPLETE", "ALREADY_COMPLETED"}:
+            raise RuntimeError(f"strategy pipeline failed: {result.error}")
 
     @staticmethod
     def _raw_observations(batch) -> tuple[RawDeveloperOptionObservation, ...]:
@@ -466,6 +606,45 @@ class ManualOptionPipeline:
         if status == "COMPLETE" or status == "DEGRADED":
             return AnalysisStatus.COMPLETE
         return AnalysisStatus.MODEL_QUALITY_FAILED
+
+
+def _fresh_mark_window(
+    rows: tuple[RawDeveloperOptionObservation, ...],
+    observed_at: datetime,
+    maximum_source_age_seconds: int,
+) -> tuple[datetime, datetime] | None:
+    observed_at = _as_utc(observed_at, "observed_at")
+    earliest = observed_at - timedelta(seconds=maximum_source_age_seconds)
+    marks = [
+        row.option_mark_time
+        for row in rows
+        if row.option_mark_time is not None
+        and earliest <= row.option_mark_time <= observed_at
+    ]
+    return (min(marks), max(marks)) if marks else None
+
+
+def _resolve_dividend_yield(
+    fundamental_evidence,
+    default_yield: float,
+) -> tuple[float, tuple[DataQualityFlag, ...]]:
+    ordered = sorted(
+        fundamental_evidence,
+        key=lambda row: (row.market_time, row.observed_at),
+        reverse=True,
+    )
+    for evidence in ordered:
+        payload = json.loads(evidence.payload_json)
+        value = payload.get("dividend_yield")
+        if value is None:
+            continue
+        try:
+            dividend_yield = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= dividend_yield <= 1:
+            return dividend_yield, ()
+    return default_yield, (DataQualityFlag.DIVIDEND_YIELD_DEFAULTED,)
 
 
 def _as_utc(value: datetime, name: str) -> datetime:

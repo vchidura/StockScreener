@@ -92,69 +92,103 @@ def get_db_cursor(dict_cursor=True):
 
 
 def get_distinct_tickers():
-    """Fetches distinct tickers from the database."""
+    """Fetch active tickers from the configured universe projection."""
     with get_db_cursor() as cursor:
-        cursor.execute("SELECT DISTINCT ticker FROM stock_prices_daily ORDER BY ticker")
+        cursor.execute(
+            """
+            SELECT ticker
+            FROM selected_tickers
+            WHERE is_active = TRUE
+            ORDER BY ticker
+            """
+        )
         return [row["ticker"] for row in cursor.fetchall()]
 
 
 def get_latest_price_date() -> str:
     """Returns the latest trading date available in the database as YYYY-MM-DD."""
     with get_db_cursor() as cursor:
-        cursor.execute("SELECT MAX((datetime AT TIME ZONE 'UTC')::date) AS latest_date FROM stock_prices_daily")
+        cursor.execute(
+            """
+            SELECT MAX(session_date) AS latest_date
+            FROM equity_bar_revisions
+            WHERE interval = '1d'
+              AND session_scope = 'RTH'
+              AND adjusted = FALSE
+              AND is_final = TRUE
+            """
+        )
         row = cursor.fetchone()
         return str(row["latest_date"]) if row and row["latest_date"] else None
 
 
 def get_latest_quote(ticker: str) -> dict | None:
-    """Return the newest stored price and its change from the prior daily close."""
+    """Return the newest canonical final price and change from the prior daily close."""
     with get_db_cursor() as cursor:
         cursor.execute(
             """
-            WITH daily AS (
-                SELECT close_price, datetime AS as_of, (datetime AT TIME ZONE 'UTC')::date AS trade_date,
-                       'daily' AS source, 1 AS priority
-                FROM stock_prices_daily
+            WITH visible AS (
+                SELECT DISTINCT ON (interval, bar_start)
+                       close_price, bar_end AS as_of, session_date AS trade_date,
+                       interval AS source, source_kind, bar_start
+                FROM equity_bar_revisions
                 WHERE ticker = %s
-                ORDER BY datetime DESC
-                LIMIT 1
-            ), hourly AS (
-                SELECT close_price, datetime AS as_of,
-                       (datetime AT TIME ZONE 'America/New_York')::date AS trade_date,
-                       '1h' AS source, 2 AS priority
-                FROM stock_prices_hourly
-                WHERE ticker = %s
-                ORDER BY datetime DESC
-                LIMIT 1
-            ), intraday AS (
-                SELECT close_price, datetime AS as_of,
-                       (datetime AT TIME ZONE 'America/New_York')::date AS trade_date,
-                       '5m' AS source, 3 AS priority
-                FROM stock_prices_intraday
-                WHERE ticker = %s AND interval = '5m'
-                ORDER BY datetime DESC
-                LIMIT 1
+                  AND interval IN ('1m', '5m', '15m', '30m', '1h', '1d')
+                  AND session_scope = 'RTH'
+                  AND adjusted = FALSE
+                  AND is_final = TRUE
+                  AND COALESCE(replay_available_at, system_observed_at) <= NOW()
+                ORDER BY interval, bar_start,
+                         CASE
+                             WHEN source_kind = 'RECONCILED' THEN 0
+                             WHEN interval IN ('1m', '5m', '15m', '30m')
+                                  AND source_kind = 'NATIVE_REST' THEN 1
+                             WHEN interval IN ('1m', '5m', '15m', '30m')
+                                  AND source_kind = 'REALTIME_STREAM' THEN 2
+                             WHEN interval IN ('1h', '1d')
+                                  AND source_kind = 'DERIVED' THEN 1
+                             WHEN source_kind = 'NATIVE_REST' THEN 2
+                             WHEN source_kind = 'DERIVED' THEN 3
+                             ELSE 4
+                         END,
+                         COALESCE(replay_available_at, system_observed_at) DESC,
+                         created_at DESC
             ), latest AS (
-                SELECT * FROM (
-                    SELECT * FROM daily
-                    UNION ALL SELECT * FROM hourly
-                    UNION ALL SELECT * FROM intraday
-                ) prices
-                ORDER BY trade_date DESC, as_of DESC, priority DESC
+                SELECT close_price, as_of, trade_date, source
+                FROM visible
+                ORDER BY as_of DESC,
+                         CASE source
+                             WHEN '1m' THEN 1 WHEN '5m' THEN 2 WHEN '15m' THEN 3
+                             WHEN '30m' THEN 4 WHEN '1h' THEN 5 ELSE 6
+                         END
+                LIMIT 1
+            ), previous AS (
+                SELECT DISTINCT ON (session_date) session_date, close_price
+                FROM equity_bar_revisions
+                WHERE ticker = %s
+                  AND interval = '1d'
+                  AND session_scope = 'RTH'
+                  AND adjusted = FALSE
+                  AND is_final = TRUE
+                  AND session_date < (SELECT trade_date FROM latest)
+                  AND COALESCE(replay_available_at, system_observed_at) <= NOW()
+                ORDER BY session_date DESC,
+                         CASE
+                             WHEN source_kind = 'RECONCILED' THEN 0
+                             WHEN source_kind = 'DERIVED' THEN 1
+                             WHEN source_kind = 'NATIVE_REST' THEN 2
+                             ELSE 3
+                         END,
+                         COALESCE(replay_available_at, system_observed_at) DESC,
+                         created_at DESC
                 LIMIT 1
             )
             SELECT latest.close_price AS price, latest.as_of, latest.trade_date,
                    latest.source, previous.close_price AS previous_close
             FROM latest
-            LEFT JOIN LATERAL (
-                SELECT close_price
-                FROM stock_prices_daily
-                WHERE ticker = %s AND (datetime AT TIME ZONE 'UTC')::date < latest.trade_date
-                ORDER BY datetime DESC
-                LIMIT 1
-            ) previous ON TRUE
+            LEFT JOIN previous ON TRUE
             """,
-            (ticker, ticker, ticker, ticker),
+            (ticker.upper(), ticker.upper()),
         )
         row = cursor.fetchone()
 
@@ -165,7 +199,7 @@ def get_latest_quote(ticker: str) -> dict | None:
     previous_close = float(row["previous_close"]) if row["previous_close"] is not None else None
     change = price - previous_close if previous_close is not None else None
     return {
-        "ticker": ticker,
+        "ticker": ticker.upper(),
         "price": price,
         "previous_close": previous_close,
         "change": change,
@@ -177,25 +211,38 @@ def get_latest_quote(ticker: str) -> dict | None:
 
 
 def get_stock_data(ticker: str, days: int = 365):
-    """Fetches stock price data for a ticker (one row per day)."""
+    """Fetch canonical finalized daily data for a ticker."""
     with get_db_cursor() as cursor:
         cursor.execute(
             """
-            WITH ranked AS (
-                SELECT (datetime AT TIME ZONE 'UTC')::date AS trade_date,
-                       open_price AS open, high, low, close_price AS close, volume,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY (datetime AT TIME ZONE 'UTC')::date
-                           ORDER BY volume DESC
-                       ) AS rn
-                FROM stock_prices_daily
-                WHERE ticker = %s AND datetime >= NOW() - INTERVAL '%s days'
+            WITH canonical AS (
+                SELECT DISTINCT ON (session_date)
+                       session_date AS trade_date, open_price AS open,
+                       high_price AS high, low_price AS low,
+                       close_price AS close, volume
+                FROM equity_bar_revisions
+                WHERE ticker = %s
+                  AND interval = '1d'
+                  AND session_scope = 'RTH'
+                  AND adjusted = FALSE
+                  AND is_final = TRUE
+                  AND session_date >= CURRENT_DATE - %s
+                  AND COALESCE(replay_available_at, system_observed_at) <= NOW()
+                ORDER BY session_date,
+                         CASE
+                             WHEN source_kind = 'RECONCILED' THEN 0
+                             WHEN source_kind = 'DERIVED' THEN 1
+                             WHEN source_kind = 'NATIVE_REST' THEN 2
+                             ELSE 3
+                         END,
+                         COALESCE(replay_available_at, system_observed_at) DESC,
+                         created_at DESC
             )
             SELECT trade_date AS datetime, open, high, low, close, volume
-            FROM ranked WHERE rn = 1
+            FROM canonical
             ORDER BY trade_date ASC
             """,
-            (ticker, days),
+            (ticker.upper(), days),
         )
         return cursor.fetchall()
 
@@ -209,23 +256,35 @@ def get_bulk_stock_data(tickers: list, days: int = 365, end_date: str = None) ->
     with get_db_cursor() as cursor:
         cursor.execute(
             """
-            WITH ranked AS (
-                SELECT ticker, (datetime AT TIME ZONE 'UTC')::date AS trade_date,
-                       open_price AS open, high, low, close_price AS close, volume,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY ticker, (datetime AT TIME ZONE 'UTC')::date
-                           ORDER BY volume DESC
-                       ) AS rn
-                FROM stock_prices_daily
+                        WITH canonical AS (
+                                SELECT DISTINCT ON (ticker, session_date)
+                                             ticker, session_date AS trade_date, open_price AS open,
+                                             high_price AS high, low_price AS low,
+                                             close_price AS close, volume
+                                FROM equity_bar_revisions
                 WHERE ticker = ANY(%s)
-                  AND (datetime AT TIME ZONE 'UTC')::date <= COALESCE(%s, CURRENT_DATE)::date
-                  AND datetime >= COALESCE(%s, CURRENT_DATE)::date - INTERVAL '%s days'
+                                    AND interval = '1d'
+                                    AND session_scope = 'RTH'
+                                    AND adjusted = FALSE
+                                    AND is_final = TRUE
+                                    AND session_date <= COALESCE(%s, CURRENT_DATE)::date
+                                    AND session_date >= COALESCE(%s, CURRENT_DATE)::date - %s
+                                    AND COALESCE(replay_available_at, system_observed_at) <= NOW()
+                                ORDER BY ticker, session_date,
+                                                 CASE
+                                                         WHEN source_kind = 'RECONCILED' THEN 0
+                                                         WHEN source_kind = 'DERIVED' THEN 1
+                                                         WHEN source_kind = 'NATIVE_REST' THEN 2
+                                                         ELSE 3
+                                                 END,
+                                                 COALESCE(replay_available_at, system_observed_at) DESC,
+                                                 created_at DESC
             )
             SELECT ticker, trade_date AS datetime, open, high, low, close, volume
-            FROM ranked WHERE rn = 1
+                        FROM canonical
             ORDER BY ticker, trade_date ASC
             """,
-            (tickers, end_date, end_date, days),
+                        ([ticker.upper() for ticker in tickers], end_date, end_date, days),
         )
         rows = cursor.fetchall()
 
@@ -238,63 +297,59 @@ def get_bulk_stock_data(tickers: list, days: int = 365, end_date: str = None) ->
     return result
 
 
-def create_selected_tickers_table():
-    """Creates selected_tickers table used to control scanner scope."""
-    with get_db_cursor(dict_cursor=False) as cursor:
+def require_canonical_schema() -> None:
+    """Fail closed when the canonical baseline has not been installed."""
+    required = (
+        "schema_migrations",
+        "selected_tickers",
+        "equity_bar_revisions",
+        "equity_current_bar_projection",
+        "equity_evidence",
+        "option_contract_catalog",
+    )
+    with get_db_cursor() as cursor:
         cursor.execute(
             """
-            CREATE TABLE IF NOT EXISTS selected_tickers (
-                id SERIAL PRIMARY KEY,
-                ticker TEXT NOT NULL UNIQUE,
-                is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_selected_tickers_active
-                ON selected_tickers (is_active, ticker);
+            SELECT relation_name
+            FROM unnest(%s::text[]) AS relation_name
+            WHERE to_regclass('public.' || relation_name) IS NULL
+            ORDER BY relation_name
+            """,
+            (list(required),),
+        )
+        missing = [row["relation_name"] for row in cursor.fetchall()]
+    if missing:
+        raise RuntimeError(
+            "canonical database schema is not installed; missing: "
+            + ", ".join(missing)
+        )
+    with get_db_cursor() as cursor:
+        cursor.execute(
             """
+            SELECT EXISTS (
+                       SELECT 1 FROM schema_migrations WHERE version = %s
+                   ) AS installed,
+                   EXISTS (
+                       SELECT 1
+                       FROM pg_proc
+                       WHERE oid = to_regprocedure(
+                           'public.ensure_option_market_data_partitions(date)'
+                       )
+                         AND prosecdef = TRUE
+                         AND proconfig @> ARRAY['search_path=pg_catalog, public']
+                   ) AS partition_maintenance_ready
+            """,
+            ("000_canonical_schema",),
         )
-
-
-def migrate_selected_tickers_metadata():
-    """Add metadata columns to selected_tickers if they don't exist."""
-    columns = {
-        "asset_type":        "TEXT",                    # 'Stock' or 'ETF'
-        "sector":            "TEXT",                    # GICS sector
-        "industry":          "TEXT",                    # GICS industry
-        "sic_code":          "TEXT",                    # Polygon SIC code, source for sector
-        "market_cap":        "BIGINT",                  # market cap in USD
-        "market_cap_group":  "TEXT",                    # Mega/Large/Mid/Small/Micro
-        "beta":              "DOUBLE PRECISION",        # beta vs market
-        "avg_volume_90d":    "BIGINT",                  # 90-day avg daily volume
-        "float_shares":      "BIGINT",                  # float shares outstanding
-        "short_percent":     "DOUBLE PRECISION",        # short interest %
-        "institutional_pct": "DOUBLE PRECISION",        # institutional ownership %
-        "dividend_yield":    "DOUBLE PRECISION",        # annual dividend yield
-        "pe_ratio":          "DOUBLE PRECISION",        # trailing P/E ratio
-        "exchange":          "TEXT",                    # NYSE, NASDAQ, etc.
-        "metadata_updated":  "TIMESTAMP",              # when metadata was last refreshed
-    }
-    with get_db_cursor(dict_cursor=False) as cursor:
-        for col_name, col_type in columns.items():
-            cursor.execute(
-                f"""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM information_schema.columns
-                        WHERE table_name = 'selected_tickers' AND column_name = '{col_name}'
-                    ) THEN
-                        ALTER TABLE selected_tickers ADD COLUMN {col_name} {col_type};
-                    END IF;
-                END $$;
-                """
-            )
-        # Index on sector and market_cap_group for fast filtering
-        cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_selected_tickers_sector ON selected_tickers (sector);"
+        schema = cursor.fetchone()
+        installed = bool(schema["installed"])
+    if not installed:
+        raise RuntimeError(
+            "canonical database schema version is not recorded: 000_canonical_schema"
         )
-        cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_selected_tickers_cap_group ON selected_tickers (market_cap_group);"
+    if not schema["partition_maintenance_ready"]:
+        raise RuntimeError(
+            "canonical option partition maintenance is not installed securely"
         )
 
 
@@ -345,27 +400,32 @@ def get_tickers_overview(tickers: list[str], end_date: str = None) -> list[dict]
 
     query = """
     WITH daily AS (
-        SELECT
-            ticker,
-            (datetime AT TIME ZONE 'UTC')::date AS trade_date,
-            open_price,
-            high,
-            low,
-            close_price,
-            volume,
-            ROW_NUMBER() OVER (PARTITION BY ticker, (datetime AT TIME ZONE 'UTC')::date ORDER BY datetime DESC) AS rn
-        FROM stock_prices_daily
+        SELECT DISTINCT ON (ticker, session_date)
+            ticker, session_date AS trade_date, open_price,
+            high_price AS high, low_price AS low, close_price, volume
+        FROM equity_bar_revisions
         WHERE ticker = ANY(%s)
-          AND (datetime AT TIME ZONE 'UTC')::date <= COALESCE(%s, CURRENT_DATE)::date
-          AND datetime >= COALESCE(%s, CURRENT_DATE)::date - INTERVAL '1600 days'
-    ),
-    deduped AS (
-        SELECT * FROM daily WHERE rn = 1
+          AND interval = '1d'
+          AND session_scope = 'RTH'
+          AND adjusted = FALSE
+          AND is_final = TRUE
+          AND session_date <= COALESCE(%s, CURRENT_DATE)::date
+          AND session_date >= COALESCE(%s, CURRENT_DATE)::date - 1600
+          AND COALESCE(replay_available_at, system_observed_at) <= NOW()
+        ORDER BY ticker, session_date,
+                 CASE
+                     WHEN source_kind = 'RECONCILED' THEN 0
+                     WHEN source_kind = 'DERIVED' THEN 1
+                     WHEN source_kind = 'NATIVE_REST' THEN 2
+                     ELSE 3
+                 END,
+                 COALESCE(replay_available_at, system_observed_at) DESC,
+                 created_at DESC
     ),
     ranked AS (
         SELECT *,
             ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY trade_date DESC) AS day_rank
-        FROM deduped
+        FROM daily
     ),
     latest AS (
         SELECT ticker, trade_date, open_price, high, low, close_price, volume
@@ -395,23 +455,31 @@ def get_tickers_overview(tickers: list[str], end_date: str = None) -> list[dict]
         FROM ranked WHERE day_rank <= 252
         GROUP BY ticker
     ),
-    -- For weekly SMAs we need weekly closes (last trading day of each ISO week)
-    weekly AS (
-        SELECT
-            ticker,
-            EXTRACT(ISOYEAR FROM trade_date) AS iso_year,
-            EXTRACT(WEEK FROM trade_date) AS iso_week,
-            close_price,
-            ROW_NUMBER() OVER (
-                PARTITION BY ticker, EXTRACT(ISOYEAR FROM trade_date), EXTRACT(WEEK FROM trade_date)
-                ORDER BY trade_date DESC
-            ) AS wrn
-        FROM deduped
+    canonical_weekly AS (
+        SELECT DISTINCT ON (ticker, bar_start)
+            ticker, bar_start, close_price
+        FROM equity_bar_revisions
+        WHERE ticker = ANY(%s)
+          AND interval = '1wk'
+          AND session_scope = 'RTH'
+          AND adjusted = FALSE
+          AND is_final = TRUE
+          AND session_date <= COALESCE(%s, CURRENT_DATE)::date
+          AND COALESCE(replay_available_at, system_observed_at) <= NOW()
+        ORDER BY ticker, bar_start,
+                 CASE
+                     WHEN source_kind = 'RECONCILED' THEN 0
+                     WHEN source_kind = 'DERIVED' THEN 1
+                     WHEN source_kind = 'NATIVE_REST' THEN 2
+                     ELSE 3
+                 END,
+                 COALESCE(replay_available_at, system_observed_at) DESC,
+                 created_at DESC
     ),
     weekly_close AS (
-        SELECT ticker, iso_year, iso_week, close_price,
-            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY iso_year DESC, iso_week DESC) AS week_rank
-        FROM weekly WHERE wrn = 1
+        SELECT ticker, close_price,
+            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY bar_start DESC) AS week_rank
+        FROM canonical_weekly
     ),
     weekly_mas AS (
         SELECT
@@ -448,7 +516,11 @@ def get_tickers_overview(tickers: list[str], end_date: str = None) -> list[dict]
 
     with get_db_cursor() as cursor:
         cursor.execute("SET LOCAL work_mem = '64MB'")
-        cursor.execute(query, (tickers, end_date, end_date))
+        normalized_tickers = [ticker.upper() for ticker in tickers]
+        cursor.execute(
+            query,
+            (normalized_tickers, end_date, end_date, normalized_tickers, end_date),
+        )
         rows = cursor.fetchall()
 
     results = []
@@ -502,71 +574,81 @@ def get_tickers_overview(tickers: list[str], end_date: str = None) -> list[dict]
 
 
 # =============================================================================
-# DAILY DATA FUNCTIONS
-# =============================================================================
-
-def create_daily_table():
-    """Creates the stock_prices_daily table if it doesn't exist.
-
-    datetime is TIMESTAMPTZ (UTC midnight instant of the trading date), matching
-    the hourly/intraday tables. Historical rows predating this were naive UTC;
-    see migrations/013_daily_timestamptz.sql for the one-time column conversion.
-    """
-    with get_db_cursor(dict_cursor=False) as cursor:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS stock_prices_daily (
-                id BIGSERIAL PRIMARY KEY,
-                ticker VARCHAR(10) NOT NULL,
-                datetime TIMESTAMPTZ NOT NULL,
-                open_price DECIMAL(12, 4) NOT NULL,
-                high DECIMAL(12, 4) NOT NULL,
-                low DECIMAL(12, 4) NOT NULL,
-                close_price DECIMAL(12, 4) NOT NULL,
-                volume BIGINT NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-
-                CONSTRAINT uq_daily_ticker_datetime UNIQUE (ticker, datetime)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_daily_ticker_datetime
-                ON stock_prices_daily (ticker, datetime DESC);
-            CREATE INDEX IF NOT EXISTS idx_daily_datetime
-                ON stock_prices_daily (datetime DESC);
-            """
-        )
-
-
-# =============================================================================
 # HOURLY DATA FUNCTIONS (true hourly candles)
 # =============================================================================
 
-def create_hourly_table():
-    """Creates the stock_prices_hourly table for TRUE hourly candles."""
-    with get_db_cursor(dict_cursor=False) as cursor:
+_CANONICAL_INTERVAL_ALIASES = {
+    "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m",
+    "1hour": "1h", "1day": "1d",
+}
+
+
+def _canonical_interval_rows(
+    tickers: list[str],
+    interval: str,
+    periods: int,
+    end_datetime=None,
+) -> dict[str, list]:
+    if not tickers:
+        return {}
+    canonical_interval = _CANONICAL_INTERVAL_ALIASES.get(interval, interval)
+    if canonical_interval not in {"1m", "5m", "15m", "30m", "1h", "1wk", "1mo"}:
+        raise ValueError(f"unsupported canonical interval: {interval}")
+    if periods <= 0:
+        raise ValueError("periods must be positive")
+    with get_db_cursor() as cursor:
         cursor.execute(
             """
-            CREATE TABLE IF NOT EXISTS stock_prices_hourly (
-                id BIGSERIAL PRIMARY KEY,
-                ticker VARCHAR(10) NOT NULL,
-                datetime TIMESTAMPTZ NOT NULL,
-                open_price DECIMAL(12, 4) NOT NULL,
-                high DECIMAL(12, 4) NOT NULL,
-                low DECIMAL(12, 4) NOT NULL,
-                close_price DECIMAL(12, 4) NOT NULL,
-                volume BIGINT NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                
-                CONSTRAINT uq_hourly_ticker_datetime UNIQUE (ticker, datetime)
-            );
-            
-            CREATE INDEX IF NOT EXISTS idx_hourly_ticker_datetime 
-                ON stock_prices_hourly (ticker, datetime DESC);
-            CREATE INDEX IF NOT EXISTS idx_hourly_datetime 
-                ON stock_prices_hourly (datetime DESC);
-            """
+            WITH canonical AS (
+                SELECT DISTINCT ON (ticker, bar_start)
+                       ticker, bar_start AS datetime, open_price AS open,
+                       high_price AS high, low_price AS low,
+                       close_price AS close, volume
+                FROM equity_bar_revisions
+                WHERE ticker = ANY(%s)
+                  AND interval = %s
+                  AND session_scope = 'RTH'
+                  AND adjusted = FALSE
+                  AND is_final = TRUE
+                  AND bar_end <= COALESCE(%s, NOW())
+                  AND COALESCE(replay_available_at, system_observed_at) <= NOW()
+                ORDER BY ticker, bar_start,
+                         CASE
+                             WHEN source_kind = 'RECONCILED' THEN 0
+                             WHEN interval IN ('1m', '5m', '15m', '30m')
+                                  AND source_kind = 'NATIVE_REST' THEN 1
+                             WHEN interval IN ('1m', '5m', '15m', '30m')
+                                  AND source_kind = 'REALTIME_STREAM' THEN 2
+                             WHEN interval IN ('1h', '1wk', '1mo')
+                                  AND source_kind = 'DERIVED' THEN 1
+                             WHEN source_kind = 'NATIVE_REST' THEN 2
+                             WHEN source_kind = 'DERIVED' THEN 3
+                             ELSE 4
+                         END,
+                         COALESCE(replay_available_at, system_observed_at) DESC,
+                         created_at DESC
+            ), ranked AS (
+                SELECT canonical.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY ticker ORDER BY datetime DESC
+                       ) AS recency_rank
+                FROM canonical
+            )
+            SELECT ticker, datetime, open, high, low, close, volume
+            FROM ranked
+            WHERE recency_rank <= %s
+            ORDER BY ticker, datetime
+            """,
+            (
+                [ticker.upper() for ticker in tickers], canonical_interval,
+                end_datetime, periods,
+            ),
         )
-
+        rows = cursor.fetchall()
+    result = {}
+    for row in rows:
+        result.setdefault(row["ticker"], []).append(row)
+    return result
 
 def get_hourly_data(ticker: str, periods: int = 100, end_datetime=None) -> list:
     """
@@ -577,21 +659,9 @@ def get_hourly_data(ticker: str, periods: int = 100, end_datetime=None) -> list:
         periods: Number of hourly candles to fetch
         end_datetime: End datetime (default: now)
     """
-    with get_db_cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT datetime, open_price as open, high, low, 
-                   close_price as close, volume
-            FROM stock_prices_hourly
-            WHERE ticker = %s
-              AND datetime <= COALESCE(%s, NOW())
-            ORDER BY datetime DESC
-            LIMIT %s
-            """,
-            (ticker, end_datetime, periods),
-        )
-        rows = cursor.fetchall()
-    return list(reversed(rows))
+    return _canonical_interval_rows(
+        [ticker], "1h", periods, end_datetime
+    ).get(ticker.upper(), [])
 
 
 def get_bulk_hourly_data(tickers: list, periods: int = 100, end_datetime=None) -> dict:
@@ -599,87 +669,12 @@ def get_bulk_hourly_data(tickers: list, periods: int = 100, end_datetime=None) -
     Fetch hourly data for multiple tickers in a single query.
     Returns: {ticker: [rows...]} dict
     """
-    if not tickers:
-        return {}
-    
-    with get_db_cursor() as cursor:
-        cursor.execute(
-            """
-            WITH ranked AS (
-                SELECT ticker, datetime, open_price as open, high, low,
-                       close_price as close, volume,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY ticker 
-                           ORDER BY datetime DESC
-                       ) AS rn
-                FROM stock_prices_hourly
-                WHERE ticker = ANY(%s)
-                  AND datetime <= COALESCE(%s, NOW())
-            )
-            SELECT ticker, datetime, open, high, low, close, volume
-            FROM ranked
-            WHERE rn <= %s
-            ORDER BY ticker, datetime ASC
-            """,
-            (tickers, end_datetime, periods),
-        )
-        rows = cursor.fetchall()
-    
-    result = {}
-    for row in rows:
-        t = row["ticker"]
-        if t not in result:
-            result[t] = []
-        result[t].append(row)
-    return result
-
-
-def cleanup_old_hourly_data(retention_days: int = 90) -> int:
-    """Delete hourly data older than retention_days."""
-    with get_db_cursor(dict_cursor=False) as cursor:
-        cursor.execute(
-            """
-            DELETE FROM stock_prices_hourly 
-            WHERE datetime < NOW() - INTERVAL '%s days'
-            """,
-            (retention_days,)
-        )
-        return cursor.rowcount if hasattr(cursor, 'rowcount') else 0
+    return _canonical_interval_rows(tickers, "1h", periods, end_datetime)
 
 
 # =============================================================================
-# INTRADAY DATA FUNCTIONS (for future real-time scaling)
+# INTRADAY DATA FUNCTIONS
 # =============================================================================
-
-def create_intraday_table():
-    """Creates the stock_prices_intraday table if it doesn't exist."""
-    with get_db_cursor(dict_cursor=False) as cursor:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS stock_prices_intraday (
-                id BIGSERIAL PRIMARY KEY,
-                ticker VARCHAR(10) NOT NULL,
-                datetime TIMESTAMPTZ NOT NULL,
-                interval VARCHAR(5) NOT NULL DEFAULT '5min',
-                open_price DECIMAL(12, 4) NOT NULL,
-                high DECIMAL(12, 4) NOT NULL,
-                low DECIMAL(12, 4) NOT NULL,
-                close_price DECIMAL(12, 4) NOT NULL,
-                volume BIGINT NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                
-                CONSTRAINT uq_intraday_ticker_datetime_interval 
-                    UNIQUE (ticker, datetime, interval)
-            );
-            
-            CREATE INDEX IF NOT EXISTS idx_intraday_ticker_datetime 
-                ON stock_prices_intraday (ticker, datetime DESC);
-            CREATE INDEX IF NOT EXISTS idx_intraday_datetime 
-                ON stock_prices_intraday (datetime DESC);
-            CREATE INDEX IF NOT EXISTS idx_intraday_interval_datetime 
-                ON stock_prices_intraday (interval, datetime DESC);
-            """
-        )
 
 
 def get_intraday_data(
@@ -700,24 +695,9 @@ def get_intraday_data(
     Returns:
         List of dicts with datetime, open, high, low, close, volume
     """
-    with get_db_cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT datetime, open_price as open, high, low, 
-                   close_price as close, volume
-            FROM stock_prices_intraday
-            WHERE ticker = %s
-              AND interval = %s
-              AND datetime <= COALESCE(%s, NOW())
-            ORDER BY datetime DESC
-            LIMIT %s
-            """,
-            (ticker, interval, end_datetime, periods),
-        )
-        rows = cursor.fetchall()
-    
-    # Reverse to chronological order
-    return list(reversed(rows))
+    return _canonical_interval_rows(
+        [ticker], interval, periods, end_datetime
+    ).get(ticker.upper(), [])
 
 
 def get_bulk_intraday_data(
@@ -732,135 +712,11 @@ def get_bulk_intraday_data(
     Returns:
         {ticker: [rows...]} dict
     """
-    if not tickers:
-        return {}
-    
-    with get_db_cursor() as cursor:
-        cursor.execute(
-            """
-            WITH ranked AS (
-                SELECT ticker, datetime, open_price as open, high, low,
-                       close_price as close, volume,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY ticker 
-                           ORDER BY datetime DESC
-                       ) AS rn
-                FROM stock_prices_intraday
-                WHERE ticker = ANY(%s)
-                  AND interval = %s
-                  AND datetime <= COALESCE(%s, NOW())
-            )
-            SELECT ticker, datetime, open, high, low, close, volume
-            FROM ranked
-            WHERE rn <= %s
-            ORDER BY ticker, datetime ASC
-            """,
-            (tickers, interval, end_datetime, periods),
-        )
-        rows = cursor.fetchall()
-    
-    result = {}
-    for row in rows:
-        t = row["ticker"]
-        if t not in result:
-            result[t] = []
-        result[t].append(row)
-    return result
-
-
-def upsert_intraday_price(
-    ticker: str,
-    dt,
-    interval: str,
-    open_price: float,
-    high: float,
-    low: float,
-    close_price: float,
-    volume: int
-) -> bool:
-    """
-    Upsert a single intraday candle.
-    Normalizes timestamp to US/Eastern before inserting.
-    """
-    try:
-        from datetime import datetime as _dt
-        # Validate interval
-        if interval not in VALID_INTRADAY_INTERVALS:
-            return False
-        # Validate OHLCV
-        if not is_valid_ohlcv(open_price, high, low, close_price, volume):
-            return False
-        # Normalize to ET
-        if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
-            dt = dt.astimezone(_ET)
-        elif isinstance(dt, _dt):
-            dt = dt.replace(tzinfo=_ET)
-
-        with get_db_cursor(dict_cursor=False) as cursor:
-            cursor.execute(
-                """
-                INSERT INTO stock_prices_intraday
-                    (ticker, datetime, interval, open_price, high, low, close_price, volume)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (ticker, datetime, interval) DO UPDATE SET
-                    open_price  = EXCLUDED.open_price,
-                    high        = EXCLUDED.high,
-                    low         = EXCLUDED.low,
-                    close_price = EXCLUDED.close_price,
-                    volume      = EXCLUDED.volume
-                """,
-                (ticker, dt, interval, open_price, high, low, close_price, volume),
-            )
-        return True
-    except Exception:
-        return False
-
-
-def cleanup_old_intraday_data(retention_days: int = 7) -> int:
-    """
-    Delete intraday data older than retention_days.
-    
-    Returns:
-        Number of rows deleted
-    """
-    with get_db_cursor(dict_cursor=False) as cursor:
-        cursor.execute(
-            """
-            DELETE FROM stock_prices_intraday 
-            WHERE datetime < NOW() - INTERVAL '%s days'
-            """,
-            (retention_days,)
-        )
-        # Note: For psycopg2, rowcount gives us the deleted count
-        return cursor.rowcount if hasattr(cursor, 'rowcount') else 0
-
-
-def get_intraday_stats() -> list:
-    """
-    Get statistics about intraday data by interval.
-    
-    Returns:
-        List of dicts with interval, ticker_count, total_rows, oldest/newest data
-    """
-    with get_db_cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT 
-                interval,
-                COUNT(DISTINCT ticker) AS ticker_count,
-                COUNT(*) AS total_rows,
-                MIN(datetime) AS oldest_data,
-                MAX(datetime) AS newest_data
-            FROM stock_prices_intraday
-            GROUP BY interval
-            ORDER BY interval
-            """
-        )
-        return cursor.fetchall()
+    return _canonical_interval_rows(tickers, interval, periods, end_datetime)
 
 
 # =============================================================================
-# UNIFIED QUERY LAYER (routes to appropriate table based on interval)
+# UNIFIED CANONICAL QUERY LAYER
 # =============================================================================
 
 def get_price_data(
@@ -882,7 +738,6 @@ def get_price_data(
         List of dicts with datetime, open, high, low, close, volume
     """
     if interval == "1day":
-        # Query daily table (stock_prices_daily)
         return get_stock_data(ticker, days=periods)
     elif interval == "1hour":
         return get_hourly_data(ticker, periods, end_datetime)
@@ -914,7 +769,6 @@ def get_bulk_price_data(
     elif interval in ("1h", "1hour"):
         return get_bulk_hourly_data(tickers, periods, end_datetime)
     elif interval in ("15m", "30m"):
-        # Aggregate from 5m base data
         return _aggregate_from_5m(tickers, interval, periods, end_datetime)
     else:
         # 5m (or 1m) — query intraday table directly
@@ -927,78 +781,9 @@ def _aggregate_from_5m(
     periods: int = 100,
     end_datetime=None
 ) -> dict:
-    """
-    Aggregate 5m candles into 15m or 30m candles using SQL.
-    Groups 5m bars by floored timestamps (e.g. 3 bars → 15m, 6 bars → 30m).
-    """
-    if not tickers:
-        return {}
-
-    # minutes per target bar
-    minutes = 15 if target_interval == "15m" else 30
-    # fetch more 5m bars to produce enough aggregated bars
-    raw_limit = periods * (minutes // 5) + 10
-
-    with get_db_cursor() as cursor:
-        cursor.execute(
-            """
-            WITH requested AS (
-                SELECT UNNEST(%(tickers)s::text[]) AS ticker
-            ),
-            filtered AS (
-                SELECT bars.*
-                FROM requested
-                CROSS JOIN LATERAL (
-                    SELECT p.ticker, p.datetime, p.open_price, p.high, p.low,
-                           p.close_price, p.volume
-                    FROM stock_prices_intraday p
-                    WHERE p.ticker = requested.ticker
-                      AND p.interval = '5m'
-                      AND p.datetime <= COALESCE(%(end_dt)s, NOW())
-                    ORDER BY p.datetime DESC
-                    LIMIT %(raw_limit)s
-                ) bars
-            ),
-            bucketed AS (
-                SELECT ticker,
-                       date_trunc('hour', datetime)
-                         + (FLOOR(EXTRACT(MINUTE FROM datetime) / %(minutes)s) * %(minutes)s)
-                         * INTERVAL '1 minute' AS bucket,
-                       open_price, high, low, close_price, volume, datetime
-                FROM filtered
-            ),
-            aggregated AS (
-                SELECT ticker, bucket AS datetime,
-                       (ARRAY_AGG(open_price ORDER BY datetime ASC))[1] AS open,
-                       MAX(high) AS high,
-                       MIN(low) AS low,
-                       (ARRAY_AGG(close_price ORDER BY datetime DESC))[1] AS close,
-                       SUM(volume) AS volume,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY ticker ORDER BY bucket DESC
-                       ) AS rn
-                FROM bucketed
-                GROUP BY ticker, bucket
-            )
-            SELECT ticker, datetime, open, high, low, close, volume
-            FROM aggregated
-            WHERE rn <= %(periods)s
-            ORDER BY ticker, datetime ASC
-            """,
-            {
-                "tickers": tickers,
-                "end_dt": end_datetime,
-                "raw_limit": raw_limit,
-                "minutes": minutes,
-                "periods": periods,
-            },
-        )
-        rows = cursor.fetchall()
-
-    result = {}
-    for row in rows:
-        t = row["ticker"]
-        if t not in result:
-            result[t] = []
-        result[t].append(row)
-    return result
+    """Compatibility wrapper returning exact canonical target-interval bars."""
+    if target_interval not in ("15m", "30m"):
+        raise ValueError("target_interval must be 15m or 30m")
+    return _canonical_interval_rows(
+        tickers, target_interval, periods, end_datetime
+    )

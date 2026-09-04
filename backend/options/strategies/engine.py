@@ -38,6 +38,16 @@ class StrategyScanResult:
     scenarios: tuple[ScenarioResult, ...]
 
 
+def _quadratic_coefficient_payload(coefficients: np.ndarray) -> dict[str, float]:
+    if coefficients.shape != (3,):
+        raise ValueError("quadratic fit must contain exactly three coefficients")
+    return {
+        "quadratic": float(coefficients[0]),
+        "linear": float(coefficients[1]),
+        "intercept": float(coefficients[2]),
+    }
+
+
 class OptionStrategyEngine:
     def __init__(
         self,
@@ -109,6 +119,14 @@ class OptionStrategyEngine:
     ) -> tuple[OptionCandidate, ...]:
         registration = REGISTRY_BY_NAME["INCOME_WHEEL"]
         policy = self.policy.income_wheel
+        direction_block = self._direction_block(
+            context,
+            allowed=frozenset({"BULLISH", "NEUTRAL"}),
+        )
+        if direction_block:
+            return (
+                self._suppressed(matrix_id, snapshots[0], registration, direction_block),
+            )
         eligible = [
             snapshot
             for snapshot in snapshots
@@ -201,6 +219,14 @@ class OptionStrategyEngine:
     ) -> tuple[OptionCandidate, ...]:
         registration = REGISTRY_BY_NAME["ZERO_DTE_GAMMA_SQUEEZE"]
         policy = self.policy.gamma_squeeze
+        direction_block = self._direction_block(
+            context,
+            allowed=frozenset({"BULLISH", "BEARISH"}),
+        )
+        if direction_block:
+            return (
+                self._suppressed(matrix_id, snapshots[0], registration, direction_block),
+            )
         eligible = [
             snapshot
             for snapshot in snapshots
@@ -210,6 +236,17 @@ class OptionStrategyEngine:
             and snapshot.day_volume is not None
             and snapshot.day_volume / max(snapshot.open_interest, 1) >= policy.minimum_volume_oi_ratio
             and float(snapshot.local_gamma) > policy.minimum_gamma
+            and (
+                context.equity_context_snapshot_id is None
+                or (
+                    context.qualified_direction == "BULLISH"
+                    and snapshot.contract_type is ContractType.CALL
+                )
+                or (
+                    context.qualified_direction == "BEARISH"
+                    and snapshot.contract_type is ContractType.PUT
+                )
+            )
         ]
         outputs: list[OptionCandidate] = []
         for contract_type in (ContractType.CALL, ContractType.PUT):
@@ -351,6 +388,36 @@ class OptionStrategyEngine:
                     structures.append((float(wall["maximum_robust_z"]), legs, structure, {"center": str(center), "width": str(widths[0])}))
         if not structures:
             return (self._suppressed(matrix_id, snapshots[0], registration, ("NO_BOUNDED_LISTED_STRUCTURE",)),)
+        direction_block = self._direction_block(
+            context,
+            allowed=frozenset({"BULLISH", "BEARISH", "NEUTRAL"}),
+        )
+        if direction_block:
+            return (
+                self._suppressed(matrix_id, snapshots[0], registration, direction_block),
+            )
+        if context.equity_context_snapshot_id is not None:
+            allowed_structures = {
+                "BULLISH": frozenset({StructureType.PUT_CREDIT_VERTICAL}),
+                "BEARISH": frozenset({StructureType.CALL_CREDIT_VERTICAL}),
+                "NEUTRAL": frozenset({
+                    StructureType.IRON_CONDOR,
+                    StructureType.CALL_BUTTERFLY,
+                    StructureType.PUT_BUTTERFLY,
+                }),
+            }[context.qualified_direction]
+            structures = [
+                item for item in structures if item[2] in allowed_structures
+            ]
+            if not structures:
+                return (
+                    self._suppressed(
+                        matrix_id,
+                        snapshots[0],
+                        registration,
+                        ("NO_STRUCTURE_FOR_QUALIFIED_DIRECTION",),
+                    ),
+                )
         structures.sort(key=_structure_sort)
         counts: dict[tuple[StructureType, object], int] = defaultdict(int)
         candidates: list[OptionCandidate] = []
@@ -528,7 +595,7 @@ class OptionStrategyEngine:
                 if abs(score) < policy.minimum_absolute_robust_z or not neighbors_consistent:
                     continue
                 row = rows[index]
-                outputs.append((abs(score), row, {"expiration_date": expiration_date.isoformat(), "contract_type": contract_type.value, "robust_residual_z": score, "neighboring_consistency": True, "fit_coefficients": coefficients.tolist(), "input_count": len(rows)}))
+                outputs.append((abs(score), row, {"expiration_date": expiration_date.isoformat(), "contract_type": contract_type.value, "robust_residual_z": score, "neighboring_consistency": True, "fit_coefficients": _quadratic_coefficient_payload(coefficients), "input_count": len(rows)}))
         outputs.sort(key=lambda item: (-item[0], item[1].expiration_date, item[1].contract_type.value, item[1].contract_id))
         if not outputs:
             return (self._suppressed(matrix_id, snapshots[0], registration, ("NO_VALID_SMILE_DISTORTION",)),)
@@ -617,7 +684,28 @@ class OptionStrategyEngine:
 
     @staticmethod
     def _capability_reasons(context: StrategyContextSnapshot) -> tuple[str, ...]:
-        return tuple(dict.fromkeys((*context.reason_codes, "QUOTE_LIQUIDITY_NOT_AVAILABLE", "PAPER_RISK_ENGINE_NOT_IMPLEMENTED")))
+        return tuple(dict.fromkeys((
+            *context.reason_codes,
+            *context.equity_reason_codes,
+            "QUOTE_LIQUIDITY_NOT_AVAILABLE",
+            "PAPER_RISK_ENGINE_NOT_IMPLEMENTED",
+        )))
+
+    @staticmethod
+    def _direction_block(
+        context: StrategyContextSnapshot,
+        *,
+        allowed: frozenset[str],
+    ) -> tuple[str, ...]:
+        if context.equity_context_snapshot_id is None:
+            return ()
+        if context.equity_context_status == "CONFLICTED":
+            return ("EQUITY_DIRECTION_CONFLICT",)
+        if context.qualified_direction is None:
+            return ("QUALIFIED_EQUITY_DIRECTION_UNAVAILABLE",)
+        if context.qualified_direction not in allowed:
+            return ("QUALIFIED_EQUITY_DIRECTION_OPPOSES_STRATEGY",)
+        return ()
 
 
 def _leg(snapshot: OptionContractSnapshot, index: int, side: OptionSide, ratio: int = 1) -> CandidateLeg:

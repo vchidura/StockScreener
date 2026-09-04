@@ -1,5 +1,8 @@
 # Option Chain Scanner Implementation Guide
 
+> Schema note: migration numbers below are historical phase labels. Fresh databases install the
+> consolidated `backend/migrations/000_canonical_schema.sql` baseline.
+
 Status: implementation entry point
 
 Detailed specification: [OPTION_CHAIN_SCANNER_DESIGN.md](OPTION_CHAIN_SCANNER_DESIGN.md)

@@ -2,7 +2,7 @@
 
 Status: code-derived baseline for review
 
-As of: 2026-08-30
+As of: 2026-09-02
 
 Related documents:
 
@@ -80,18 +80,18 @@ flowchart LR
 
 Important current boundaries:
 
-- The option process is not yet a resident scheduler. `OPTION_POLL_SECONDS=900` is
-  configured, but no loop invokes the option pipeline every 15 minutes.
-- A manual cycle uses the latest completed exchange session close plus 15 minutes as
-  its requested cycle time. It is not currently an open-session rolling 15-minute
-  cycle.
+- `run_option_worker.py` is the resident XNYS-aware delayed-slot scheduler;
+   `run_option_worker.py --once` processes one latest observable slot and exits.
+- Open-session cycles are anchored to the XNYS open, use the configured 15-minute
+   slot and provider delay, and prioritize durable retries from the current session.
 - Strategy calculations run only in the backend. The frontend reads persisted rows.
 - The candidate API returns only the newest persisted matrix per underlying for the
   active strategy-policy hash.
-- Older matrices and candidates remain in PostgreSQL, but no historical candidate API
-  or historical range-replay command exposes them yet.
-- The schema contains `option_signal_decay_outcomes`, but no implemented evaluator
-  currently populates it.
+- Older matrices and candidates remain in PostgreSQL. The Signal Ledger exposes
+   durable events, and the Performance view exposes 7/14/30/60-day structured-signal
+   checkpoint history; a general historical candidate-cohort browser remains absent.
+- The worker matures `option_signal_decay_outcomes` at 15m/30m/60m/close/next-open
+   when a coherent later package mark exists. Missing packages remain pending.
 - `SELECTED` means selected by a research module. It does not mean broker-authorized,
   suitable for an account, or executable. Execution eligibility is null in the
   current read-only Developer mode.
@@ -705,7 +705,7 @@ inferred.
 
 | Persisted object | Main table | Historical use |
 |---|---|---|
-| Raw provider page | Migration 015 raw-page tables | Reconstruct and audit provider input. |
+| Raw provider page | Canonical baseline raw-page tables | Reconstruct and audit provider input. |
 | Contract catalog/version | `option_contract_catalog`, catalog versions | Resolve stable contract identity and metadata as known at the time. |
 | Normalized snapshot revisions | `option_chain_snapshots` and fact keys | Replay model and strategy inputs by batch. |
 | Ingestion batch | `option_ingestion_runs` | Measure completeness, freshness, rejection, and provider reliability. |
@@ -718,8 +718,8 @@ inferred.
 | Suppression | `option_signal_suppressions` | Analyze which gates prevent selection and their frequency. |
 | Scenario grid | `option_scenario_results` | Compare ex-ante modeled risk across candidate cohorts. |
 | Research artifacts | `option_flow_windows`, `option_volatility_surfaces` | Study activity clusters and smile residuals. |
-| Blocked signal | `option_signal_events`, legs, occurrences | Preserve selected structured research events; currently blocked in read-only mode. |
-| Realized follow-up | `option_signal_decay_outcomes` | Schema exists, but no current writer populates it. |
+| Blocked signal | `option_signal_events`, legs, occurrences | Preserve one lifecycle event per contiguous semantic package; each matrix-specific rediscovery is a candidate-linked occurrence. A package absent from an intervening matrix starts a new event if it later returns. |
+| Realized follow-up | `option_signal_decay_outcomes` | The worker matures coherent 15m/30m/60m/close/next-open delayed-proxy package marks under a versioned commission-only policy. Selected candidate-leg strike/expiration bounds remain in the 60-day future chain collection window; missing coherent packages stay pending. |
 
 ## 8. Current Versus Historical Use
 
@@ -730,8 +730,40 @@ strategy-policy hash. It then returns persisted candidates from only those matri
 The default UI applies `All underlyings` and `Selected`; status, persona, and other
 filters are SQL filters over this latest cohort.
 
-This is suitable for a current research dashboard once an autonomous pipeline creates
-fresh matrices. It is not yet a history browser.
+This is suitable for the current research dashboard. Candidate Audit is intentionally
+latest-matrix only; Signal Ledger and Performance provide durable structured-signal
+history without changing candidate selection semantics.
+
+Performance defaults to the historical `OPPORTUNITY_BOARD` cohort: the top-ranked
+selected structured candidate for each strategy, candidate kind, and matrix, matching
+the board's default `per_strategy=1` presentation at that decision time. This avoids reconstructing
+history from today's latest board. Operators can switch to `ALL_SIGNALS` to inspect
+every retained structured signal, including candidates that ranked below the displayed
+board contract. Both cohorts remain blocked research records until execution gates pass.
+
+Candidates remain immutable matrix-level decisions. When the same strategy version,
+policy, underlying, structure, and ordered contract package is selected in the next
+matrix, persistence reuses the original signal event, increments its occurrence count,
+and writes a new `option_signal_occurrences` row linked to the new candidate. This keeps
+recommendation and Performance sample counts from growing merely because an unchanged
+package survived another scan while retaining every matrix observation for audit.
+
+The Opportunity Board is optimized for current structured decisions:
+
+- its primary filter is structured strategy, currently Income Wheel or Defined-Risk
+   Hedged Income; underlyer-level coverage detail remains in Operations;
+- the latest persisted matrix for each underlyer remains visible until a newer matrix
+   replaces it, with source time and nominal validity-window state shown explicitly;
+- replaced Board signals remain inline for 14 calendar days, newest first, with at most
+   12 prior rows shown to preserve scan density; the full count links to paginated
+   Performance history, where 7/14/30/60-day windows are available;
+- research-only volume/OI and volatility-smile findings are excluded because they do
+   not define package legs, management levels, or recommendation events. They remain
+   available through Candidate Audit and their source evidence through Research.
+
+Universe coverage remains an exception metric on the Board. Complete coverage occupies
+one compact value; missing matrices produce a warning, while per-underlyer operational
+details stay in Operations rather than displacing current structures.
 
 ### 8.2 What can already be queried historically
 
@@ -756,15 +788,25 @@ Useful current studies include:
 6. Context availability and its relationship to selection frequency.
 7. Provider freshness, reference drift, and model-quality reliability.
 
-These studies explain pipeline behavior, but without future outcome marks they cannot
-establish recommendation effectiveness.
+These studies explain pipeline behavior. The Performance view adds causal delayed-proxy
+checkpoint observations, but meaningful effectiveness claims still require sufficient
+coverage, controlled comparisons, and out-of-sample qualification.
 
-### 8.3 What is missing for outcome research
+### 8.3 Implemented outcome tracking and remaining limits
 
-To evaluate whether persisted candidates improve recommendations, add a causal outcome
-pipeline that populates `option_signal_decay_outcomes` at 15 minutes, 30 minutes, 60
-minutes, close, and next open. Each outcome must use only observations available by
-its own observed time and preserve missing/stale reasons instead of imputing a price.
+The causal outcome service populates `option_signal_decay_outcomes` at 15 minutes,
+30 minutes, 60 minutes, close, and next open. Each outcome uses observations available
+by its own observed time; unavailable coherent packages remain visibly pending rather
+than receiving an imputed price. Fully measured candidates no longer consume the
+bounded maturity queue. Selected candidate-leg bounds remain eligible for follow-up
+collection for 60 days.
+
+Opening Performance is a read-only database operation. It neither calls the provider
+nor compares the signal with a navigation-time current mark. For `ALL_SIGNALS`, entry
+is the lifecycle's original package; for `OPPORTUNITY_BOARD`, entry is the first
+occurrence that actually ranked onto the Board. Displayed P&L compares that cohort entry
+with outcomes already materialized by the option worker at the named checkpoint; a
+current-mark valuation would be a separate mode and is not included.
 
 For multi-leg structures, outcome measurement needs a coherent package valuation at
 the horizon. The current Developer mode has no quotes, so outcomes produced by that
@@ -791,14 +833,14 @@ Recommended evaluation outputs:
 
 ### 8.4 Required historical interfaces
 
-The following are not implemented today:
+The following remain unimplemented:
 
 1. Candidate list with `as_of`, `from`, `to`, matrix ID, and strategy-version filters.
 2. Analysis-run and candidate-cohort history endpoints.
 3. Historical range replay across every compatible matrix.
-4. Outcome materialization and evaluation jobs.
-5. Strategy comparison reports across policy versions.
-6. Frontend cohort and outcome views.
+4. Strategy comparison reports across policy versions.
+5. Fill/quote-backed realized P&L; Developer outcomes remain delayed proxies.
+6. Historical candidate-detail retrieval beyond structured signals and checkpoints.
 
 A historical replay must write a new strategy version or research-run identity. It
 must never overwrite the original decision evidence. Threshold exploration should

@@ -4,7 +4,7 @@ Compute Opening Pattern Scores (9:25 AM)
 
 Purpose:
   For each tracked ticker, compute 6 independent pattern scores based on opening price action
-  (5-min, 15-min, 30-min candles from stock_prices_intraday table)
+    (canonical finalized 5m, 15m, and 30m candles)
   
   Stores raw scores in opening_pattern_scores table BEFORE recommendations are generated.
   This decouples pattern scoring from recommendation logic, enabling:
@@ -25,7 +25,7 @@ Output:
 Dependencies:
   - database.py: get_db_cursor, get_selected_tickers
   - screeners.py: analyze_market_regime
-  - stock_prices_intraday table
+    - equity_canonical_bars view
 """
 
 import sys
@@ -73,7 +73,7 @@ SECTOR_MAPPING = {
 
 def get_intraday_patterns(ticker: str, trade_date: str) -> dict:
     """
-    Load 5-min, 15-min, 30-min bars from stock_prices_intraday.
+    Load canonical 5m, 15m, and 30m bars.
     Compute opening patterns (first 2 hours: 9:30 AM - 11:30 AM).
     Return pattern metrics needed for scoring.
     """
@@ -81,13 +81,15 @@ def get_intraday_patterns(ticker: str, trade_date: str) -> dict:
         # Get intraday bars for the trade date (first 2 hours only)
         cur.execute("""
             SELECT 
-                datetime AT TIME ZONE 'America/New_York' AS datetime_et,
-                open_price, high, low, close_price, volume, interval
-            FROM stock_prices_intraday
+                                bar_start AT TIME ZONE 'America/New_York' AS datetime_et,
+                                open_price, high_price AS high, low_price AS low,
+                                close_price, volume, interval
+                        FROM equity_canonical_bars
             WHERE ticker = %s 
-              AND DATE(datetime AT TIME ZONE 'America/New_York') = %s
-              AND EXTRACT(HOUR FROM datetime AT TIME ZONE 'America/New_York') < 12
-            ORDER BY interval ASC, datetime ASC
+                            AND interval IN ('5m', '15m', '30m')
+                            AND DATE(bar_start AT TIME ZONE 'America/New_York') = %s
+                            AND EXTRACT(HOUR FROM bar_start AT TIME ZONE 'America/New_York') < 12
+                        ORDER BY interval ASC, bar_start ASC
         """, (ticker, trade_date))
         
         rows = cur.fetchall()
@@ -256,9 +258,10 @@ def _compute_rs_score(ticker: str, trade_date: str) -> int:
     with get_db_cursor() as cur:
         # Get ticker intraday return (today open to latest)
         cur.execute("""
-            SELECT open_price, close_price FROM stock_prices_intraday
-            WHERE ticker = %s AND DATE(datetime AT TIME ZONE 'America/New_York') = %s
-            ORDER BY datetime DESC LIMIT 1
+                        SELECT open_price, close_price FROM equity_canonical_bars
+                        WHERE ticker = %s AND interval = '5m'
+                            AND DATE(bar_start AT TIME ZONE 'America/New_York') = %s
+                        ORDER BY bar_start DESC LIMIT 1
         """, (ticker, trade_date))
         
         ticker_row = cur.fetchone()
@@ -271,9 +274,10 @@ def _compute_rs_score(ticker: str, trade_date: str) -> int:
         sector, _, sector_etf = SECTOR_MAPPING.get(ticker, ('unknown', 'SPY', 'XLK'))
         
         cur.execute("""
-            SELECT open_price, close_price FROM stock_prices_intraday
-            WHERE ticker = %s AND DATE(datetime AT TIME ZONE 'America/New_York') = %s
-            ORDER BY datetime DESC LIMIT 1
+                        SELECT open_price, close_price FROM equity_canonical_bars
+                        WHERE ticker = %s AND interval = '5m'
+                            AND DATE(bar_start AT TIME ZONE 'America/New_York') = %s
+                        ORDER BY bar_start DESC LIMIT 1
         """, (sector_etf, trade_date))
         
         sector_row = cur.fetchone()

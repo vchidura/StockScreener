@@ -20,7 +20,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from database import get_db_cursor, migrate_selected_tickers_metadata  # noqa: E402
+from database import get_db_cursor  # noqa: E402
 from http_client import build_session  # noqa: E402
 from research.gics_sectors import (  # noqa: E402
     ETF_SECTOR, MANUAL_SECTORS, UNCLASSIFIED_SECTOR, sector_for_sic,
@@ -81,7 +81,6 @@ def main() -> int:
         print("POLYGON_API_KEY is required", file=sys.stderr)
         return 1
 
-    migrate_selected_tickers_metadata()
     universe = load_universe()
     stocks = [row["ticker"] for row in universe if row["asset_type"] != "ETF"]
     etfs = [row for row in universe if row["asset_type"] == "ETF"]

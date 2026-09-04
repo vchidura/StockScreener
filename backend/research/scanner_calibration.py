@@ -57,7 +57,9 @@ def walk_forward_calibration(
     else:
         curve_frame["bin"] = "all"
     curve = []
-    for _, group in curve_frame.groupby("bin", observed=False, sort=True):
+    for _, group in curve_frame.groupby("bin", observed=True, sort=True):
+        if group.empty:
+            continue
         curve.append({
             "count": int(len(group)),
             "mean_predicted": float(group["predicted"].mean()),

@@ -1,0 +1,12 @@
+{
+  "start": "2021-08-01",
+  "end": "2026-09-03",
+  "universe_members": 386,
+  "splits_fetched": 6477,
+  "dividends_fetched": 0,
+  "actions_matched_to_universe": 59,
+  "splits_matched_to_universe": 59,
+  "distinct_split_tickers": 52,
+  "mode": "APPLY",
+  "inserted": 59
+}

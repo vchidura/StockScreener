@@ -74,6 +74,33 @@ def test_expired_claim_recovery_is_bounded_by_attempt_count():
     assert "lease_expires_at <= NOW()" in sql
 
 
+def test_terminal_quality_failure_is_not_scheduled_for_retry():
+    cursor = MagicMock()
+    cursor.closed = False
+    cursor.rowcount = 1
+    connection = MagicMock()
+    connection.closed = False
+    connection.cursor.return_value = cursor
+
+    @contextmanager
+    def connection_factory():
+        yield connection
+
+    repository = OptionWorkItemRepository(connection_factory)
+    work_id = uuid4()
+
+    assert repository.terminal_fail(
+        work_id, "worker-1", "normalization produced no retained contracts"
+    ) is True
+
+    sql, parameters = cursor.execute.call_args.args
+    assert "status = 'TERMINAL_FAILED'" in sql
+    assert "next_attempt_at" not in sql
+    assert parameters == (
+        "normalization produced no retained contracts", work_id, "worker-1",
+    )
+
+
 def test_exact_business_key_claim_does_not_take_unrelated_work():
     cursor = MagicMock()
     cursor.closed = False
@@ -133,3 +160,29 @@ def test_exact_business_key_lookup_returns_terminal_failure_state():
     assert item is not None
     assert item.status is WorkStatus.TERMINAL_FAILED
     assert item.last_error == "strategy failed"
+
+
+def test_latest_due_cycle_covers_normalization_and_strategy_retries():
+    cursor = MagicMock()
+    cursor.closed = False
+    due = datetime(2026, 8, 31, 19, 45, tzinfo=timezone.utc)
+    cursor.fetchone.return_value = {"scheduled_cycle": due}
+    connection = MagicMock()
+    connection.closed = False
+    connection.cursor.return_value = cursor
+
+    @contextmanager
+    def connection_factory():
+        yield connection
+
+    result = OptionWorkItemRepository(connection_factory).latest_due_cycle(
+        "a" * 64,
+        "b" * 64,
+    )
+
+    assert result == due
+    sql, parameters = cursor.execute.call_args.args
+    assert "work.stage = 'NORMALIZE'" in sql
+    assert "work.stage = 'STRATEGY'" in sql
+    assert sql.count("work.next_attempt_at <= NOW()") == 2
+    assert parameters == ("a" * 64, "b" * 64, "a" * 64, "b" * 64)

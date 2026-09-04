@@ -6,7 +6,14 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from psycopg2.extras import Json, execute_values
 
-from options.strategies.domain import CandidateKind, CandidateStatus, OptionCandidate, OptionSide, StrategyContextSnapshot
+from options.strategies.domain import (
+    CandidateKind,
+    CandidateStatus,
+    OptionCandidate,
+    OptionSide,
+    StrategyContextSnapshot,
+    signal_identity_sha256,
+)
 from options.strategies.engine import StrategyScanResult
 from options.strategies.registry import STRATEGY_REGISTRY
 from options.errors import DuplicateFactConflict
@@ -120,10 +127,10 @@ class OptionStrategyRepository(PostgresRepository):
                 hourly_ema_20, hourly_ema_20_input_bars, hourly_window_start,
                 trend_state, earnings_blackout_state, fed_blackout_state,
                 quote_spread_state, reason_codes, source_bar_keys,
-                policy_version, policy_sha256
+                policy_version, policy_sha256, equity_context_snapshot_id
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL,
-                %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s
             ) ON CONFLICT (matrix_id) DO NOTHING
             """,
             (
@@ -147,6 +154,7 @@ class OptionStrategyRepository(PostgresRepository):
                 Json(list(context.source_bar_keys)),
                 context.policy_version,
                 context.policy_sha256,
+                context.equity_context_snapshot_id,
             ),
         )
 
@@ -186,6 +194,38 @@ class OptionStrategyRepository(PostgresRepository):
                 Json({
                     "status": context.status.value,
                     "trend_state": context.trend_state,
+                    "equity_context_snapshot_id": (
+                        str(context.equity_context_snapshot_id)
+                        if context.equity_context_snapshot_id else None
+                    ),
+                    "equity_context_status": context.equity_context_status,
+                    "qualified_direction": context.qualified_direction,
+                    "company_name": context.company_name,
+                    "market_cap": (
+                        str(context.market_cap) if context.market_cap is not None else None
+                    ),
+                    "shares_outstanding": (
+                        str(context.shares_outstanding)
+                        if context.shares_outstanding is not None else None
+                    ),
+                    "free_float": (
+                        str(context.free_float) if context.free_float is not None else None
+                    ),
+                    "dividend_yield": context.dividend_yield,
+                    "enterprise_value": (
+                        str(context.enterprise_value)
+                        if context.enterprise_value is not None else None
+                    ),
+                    "ebitda": str(context.ebitda) if context.ebitda is not None else None,
+                    "operating_income": (
+                        str(context.operating_income)
+                        if context.operating_income is not None else None
+                    ),
+                    "free_cash_flow": (
+                        str(context.free_cash_flow)
+                        if context.free_cash_flow is not None else None
+                    ),
+                    "equity_reason_codes": context.equity_reason_codes,
                     "earnings_blackout_state": context.earnings_blackout_state,
                     "fed_blackout_state": context.fed_blackout_state,
                     "reason_codes": context.reason_codes,
@@ -320,10 +360,64 @@ class OptionStrategyRepository(PostgresRepository):
 
     @staticmethod
     def _persist_signal(cursor, candidate: OptionCandidate) -> None:
+        signal_identity_key = signal_identity_sha256(
+            candidate.underlyer,
+            candidate.strategy_name,
+            candidate.strategy_version,
+            candidate.policy_sha256,
+            candidate.structure_type,
+            tuple(
+                (leg.contract_id, leg.side.value, leg.ratio, leg.multiplier)
+                for leg in candidate.legs
+            ),
+        )
         idempotency_key = hashlib.sha256(
             f"signal:{candidate.identity_sha256}".encode("ascii")
         ).hexdigest()
         event_id = uuid5(NAMESPACE_URL, f"option-signal:{idempotency_key}")
+        cursor.execute(
+            """
+            SELECT event_id
+            FROM option_signal_occurrences
+            WHERE source_candidate_id = %s
+            """,
+            (candidate.candidate_id,),
+        )
+        existing_occurrence = cursor.fetchone()
+        if existing_occurrence:
+            return
+        cursor.execute(
+            """
+            WITH previous_matrix AS (
+                SELECT matrix_id
+                FROM option_analysis_runs
+                WHERE underlying = %s
+                  AND market_time < %s
+                ORDER BY market_time DESC, observed_time DESC, matrix_id DESC
+                LIMIT 1
+            )
+            SELECT signal.event_id
+            FROM option_signal_events AS signal
+            JOIN option_signal_occurrences AS occurrence USING (event_id)
+            JOIN option_strategy_candidates AS occurrence_candidate
+              ON occurrence_candidate.candidate_id = occurrence.source_candidate_id
+            WHERE signal.signal_identity_key = %s
+              AND occurrence_candidate.matrix_id = (
+                  SELECT matrix_id FROM previous_matrix
+              )
+            ORDER BY occurrence.market_data_time DESC, occurrence.occurrence_id
+            LIMIT 1
+            """,
+            (
+                candidate.underlyer,
+                candidate.market_data_time,
+                signal_identity_key,
+            ),
+        )
+        continuing_signal = cursor.fetchone()
+        new_event = continuing_signal is None
+        if continuing_signal:
+            event_id = continuing_signal["event_id"]
         action = "SELL" if candidate.net_premium and candidate.net_premium > 0 else "BUY"
         premium_magnitude = abs(candidate.net_premium or 0)
         stop_loss = None
@@ -342,40 +436,46 @@ class OptionStrategyRepository(PostgresRepository):
                 if action == "SELL"
                 else 1 + _decimal_policy_value(candidate.management_policy["take_profit_fraction"])
             )
-        cursor.execute(
-            """
-            INSERT INTO option_signal_events (
-                event_id, idempotency_key, source_candidate_id, underlying,
-                strategy_name, strategy_version, market_data_time, observed_time,
-                action, net_premium, stop_loss, take_profit, valid_until,
-                confidence, data_quality, execution_eligibility, status,
-                blocked_reasons, expected_leg_count, metadata
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, NULL, 'RESEARCH_DELAYED', %s, %s, %s, %s, %s
-            ) ON CONFLICT (event_id) DO NOTHING
-            """,
-            (
-                event_id,
-                idempotency_key,
-                candidate.candidate_id,
-                candidate.underlyer,
-                candidate.strategy_name,
-                candidate.strategy_version,
-                candidate.market_data_time,
-                candidate.observed_time,
-                action,
-                candidate.net_premium,
-                stop_loss,
-                take_profit,
-                candidate.valid_until,
-                candidate.execution_eligibility.value if candidate.execution_eligibility else None,
-                "READY" if candidate.execution_eligibility else "BLOCKED",
-                list(candidate.reason_codes),
-                len(candidate.legs),
-                Json({"structure_type": candidate.structure_type.value}),
-            ),
-        )
+        if new_event:
+            cursor.execute(
+                """
+                INSERT INTO option_signal_events (
+                    event_id, idempotency_key, signal_identity_key,
+                    source_candidate_id, underlying, strategy_name,
+                    strategy_version, market_data_time, observed_time,
+                    action, net_premium, stop_loss, take_profit, valid_until,
+                    confidence, data_quality, execution_eligibility, status,
+                    blocked_reasons, expected_leg_count, metadata
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, NULL, 'RESEARCH_DELAYED', %s, %s, %s, %s, %s
+                ) ON CONFLICT (event_id) DO NOTHING
+                """,
+                (
+                    event_id,
+                    idempotency_key,
+                    signal_identity_key,
+                    candidate.candidate_id,
+                    candidate.underlyer,
+                    candidate.strategy_name,
+                    candidate.strategy_version,
+                    candidate.market_data_time,
+                    candidate.observed_time,
+                    action,
+                    candidate.net_premium,
+                    stop_loss,
+                    take_profit,
+                    candidate.valid_until,
+                    candidate.execution_eligibility.value if candidate.execution_eligibility else None,
+                    "READY" if candidate.execution_eligibility else "BLOCKED",
+                    list(candidate.reason_codes),
+                    len(candidate.legs),
+                    Json({
+                        "structure_type": candidate.structure_type.value,
+                        "latest_candidate_id": str(candidate.candidate_id),
+                    }),
+                ),
+            )
         execute_values(
             cursor,
             """
@@ -396,13 +496,15 @@ class OptionStrategyRepository(PostgresRepository):
         cursor.execute(
             """
             INSERT INTO option_signal_occurrences (
-                occurrence_id, event_id, market_data_time, observed_time,
-                source_batch_id, mark_diagnostics, trigger_diagnostics
+                occurrence_id, event_id, source_candidate_id, market_data_time,
+                observed_time, source_batch_id, mark_diagnostics,
+                trigger_diagnostics
             ) VALUES (
-                %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
                 (SELECT batch_id FROM option_analysis_runs WHERE matrix_id = %s),
                 %s, %s
-            ) ON CONFLICT (event_id, market_data_time) DO NOTHING
+            ) ON CONFLICT (source_candidate_id) DO NOTHING
+            RETURNING occurrence_id
             """,
             (
                 uuid5(
@@ -410,6 +512,7 @@ class OptionStrategyRepository(PostgresRepository):
                     f"option-signal-occurrence:{event_id}:{candidate.market_data_time.isoformat()}",
                 ),
                 event_id,
+                candidate.candidate_id,
                 candidate.market_data_time,
                 candidate.observed_time,
                 candidate.matrix_id,
@@ -420,6 +523,46 @@ class OptionStrategyRepository(PostgresRepository):
                 Json(dict(candidate.primary_evidence)),
             ),
         )
+        occurrence_inserted = cursor.fetchone() is not None
+        if occurrence_inserted and not new_event:
+            cursor.execute(
+                """
+                UPDATE option_signal_events
+                SET occurrence_count = (
+                        SELECT COUNT(*)
+                        FROM option_signal_occurrences
+                        WHERE event_id = %s
+                    ),
+                    valid_until = GREATEST(valid_until, %s),
+                    execution_eligibility = %s,
+                    status = %s,
+                    blocked_reasons = %s,
+                    metadata = metadata || jsonb_build_object(
+                        'latest_candidate_id', %s::TEXT,
+                        'latest_market_data_time', %s::TIMESTAMPTZ,
+                        'latest_observed_time', %s::TIMESTAMPTZ,
+                        'latest_net_premium', %s::TEXT,
+                        'latest_stop_loss', %s::TEXT,
+                        'latest_take_profit', %s::TEXT
+                    ),
+                    updated_at = NOW()
+                WHERE event_id = %s
+                """,
+                (
+                    event_id,
+                    candidate.valid_until,
+                    candidate.execution_eligibility.value if candidate.execution_eligibility else None,
+                    "READY" if candidate.execution_eligibility else "BLOCKED",
+                    list(candidate.reason_codes),
+                    str(candidate.candidate_id),
+                    candidate.market_data_time,
+                    candidate.observed_time,
+                    candidate.net_premium,
+                    stop_loss,
+                    take_profit,
+                    event_id,
+                ),
+            )
 
     @staticmethod
     def _persist_research_artifact(cursor, candidate: OptionCandidate) -> None:

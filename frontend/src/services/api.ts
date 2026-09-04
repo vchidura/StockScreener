@@ -24,6 +24,21 @@ export interface GapResult {
   gap_atr_ratio: number
   gap_date: string
   entry_direction: string | null
+  gap_direction?: 'UP' | 'DOWN'
+  gap_lifecycle?: 'OPEN' | 'PARTIALLY_FILLED' | 'FILLED' | 'SAME_SESSION_FADE' | 'FAILED'
+  gap_classification?: 'BREAKAWAY' | 'CONTINUATION' | 'EXHAUSTION_WATCH' | 'COMMON' | 'UNCLASSIFIED'
+  classification_confidence?: 'MODERATE' | 'LIMITED'
+  classification_reason_codes?: string[]
+  formation_trend?: 'BULLISH' | 'BEARISH' | 'SIDEWAYS' | 'UNKNOWN'
+  formation_relative_volume?: number | null
+  opening_gap_pct?: number
+  full_gap_pct?: number
+  fill_pct?: number
+  fill_target?: number
+  first_fill_date?: string | null
+  gap_age_bars?: number
+  gap_age_sessions?: number
+  range_gap_survived?: boolean
 }
 
 export interface FVGResult {
@@ -547,6 +562,23 @@ export interface LatestQuote {
   source: '5m' | '1h' | 'daily'
 }
 
+export interface EquitySecurityProfileResponse {
+  ticker: string
+  security: {
+    company_name: string | null
+    primary_exchange: string | null
+    sector: string | null
+    industry: string | null
+    market_cap: number | string | null
+    free_float: number | string | null
+    weighted_shares: number | string | null
+    cik: string | null
+    composite_figi: string | null
+    share_class_figi: string | null
+  } | null
+  fundamental_reports: Array<Record<string, unknown>>
+}
+
 export interface TickerOverviewRow {
   ticker: string
   sector: string | null
@@ -812,6 +844,15 @@ export const getLatestQuote = async (ticker: string, refresh = false): Promise<L
   const params: Record<string, boolean> = {}
   if (refresh) params.refresh = true
   const response = await api.get(`/stock/${ticker}/quote`, { params })
+  return response.data
+}
+
+export const getEquitySecurityProfile = async (
+  ticker: string,
+): Promise<EquitySecurityProfileResponse> => {
+  const response = await api.get(`/equity/security/${ticker}`, {
+    params: { report_limit: 12 },
+  })
   return response.data
 }
 
@@ -1088,8 +1129,26 @@ export interface TradeSetup {
 
 export interface MultiTradeSetupResponse {
   ticker: string
-  setups: Partial<Record<'1h' | '1d' | '1wk' | '1mo', TradeSetup>>
-  errors: Partial<Record<'1h' | '1d' | '1wk' | '1mo', string>>
+  setups: Partial<Record<'30m' | '1h' | '1d' | '1wk' | '1mo', TradeSetup>>
+  errors: Partial<Record<'30m' | '1h' | '1d' | '1wk' | '1mo', string>>
+  setup_sources: Partial<Record<
+    '30m' | '1h' | '1d' | '1wk' | '1mo',
+    'MATERIALIZED_CURRENT_PROJECTION' | 'LEGACY_REQUEST_TIME'
+  >>
+  setup_read_metrics?: Partial<Record<'30m' | '1h' | '1d' | '1wk' | '1mo', {
+    status: 'READY' | 'MISSING' | 'STALE'
+    read_mode: 'MATERIALIZED'
+    source: 'MATERIALIZED_CURRENT_PROJECTION'
+    process_started_at: string
+    analysis_run_id?: string
+    evidence_id?: string
+    expected_market_time?: string
+    market_time?: string
+    observed_at?: string
+    published_at?: string
+    projection_read_latency_ms?: number
+    staleness_seconds?: number
+  }>>
   confluence_zones: ConfluenceZone[]
   as_of: string
 }
@@ -1482,7 +1541,7 @@ export interface ScannerEventOutcome {
   first_hit: 'STOP' | 'TARGET' | 'SAME_BAR' | 'NONE'
 }
 
-export type ScannerInterval = '1d' | '1wk' | '1h'
+export type ScannerInterval = '1d' | '1wk' | '1h' | '30m'
 
 export interface ScannerEventRow {
   event_id: number
@@ -1509,7 +1568,7 @@ export interface ScannerEventRow {
 }
 
 export interface LatestScannerSignalRow {
-  event_id: number
+  event_id: number | string
   scanner_name: string
   scanner_version: string
   interval: ScannerInterval
@@ -1572,6 +1631,8 @@ export interface ScannerEventSummaryRow {
   stop_first_rate: number | null
   target_first_rate: number | null
   promotion_status: ScannerPromotionStatus
+  outcome_policy_key: string
+  return_mode: 'DIRECTIONAL_HORIZON' | 'RECOMMENDATION_PLAN'
 }
 
 export interface ScannerBacklogRow {
@@ -1587,6 +1648,8 @@ export interface ScannerQualificationRow {
   interval: ScannerInterval
   direction: 1 | -1
   horizon_bars: number
+  outcome_policy_key: string
+  return_mode: 'DIRECTIONAL_HORIZON' | 'RECOMMENDATION_PLAN'
   events: number
   independent_periods: number
   mean_net_return: number | null
@@ -1605,10 +1668,14 @@ export interface ScannerQualificationRow {
   mean_mfe_pct: number | null
   stop_first_rate: number | null
   target_first_rate: number | null
+  stop_hit_rate?: number | null
+  target_hit_rate?: number | null
   mean_sector_alpha: number | null
   sector_alpha_t_stat: number | null
   distinct_tickers: number | null
   top5_concentration: number | null
+  first_signal_time: string | null
+  last_signal_time: string | null
   regime_alpha: Record<'BULL' | 'BEAR' | 'CHOPPY', { mean_alpha: number | null; periods: number }>
   qualification_status: 'PRIMARY_PASS' | 'NOT_QUALIFIED'
   evidence_status: 'ROBUST_PASS' | 'MONITOR_ONLY' | 'UNRANKED'
@@ -1632,7 +1699,27 @@ export interface ScannerQualificationRow {
   }>
 }
 
-export interface ScannerQualificationResponse {
+export type ScannerReadSource =
+  | 'CANONICAL_EQUITY_RESEARCH'
+  | 'MATERIALIZED_ANALYSIS_EVIDENCE'
+  | 'MATERIALIZED_CURRENT_PROJECTION'
+  | 'MATERIALIZED_SCANNER_PORTAL_PROJECTION'
+  | 'DURABLE_SCANNER_EVENT_LEDGER'
+  | 'LEGACY_SELF_INITIALIZING_LEDGER'
+
+export interface ScannerReadMetadata {
+  read_source: ScannerReadSource
+  read_metrics?: {
+    snapshot_id: string
+    payload_sha256: string
+    generated_at: string
+    published_at: string
+    projection_read_latency_ms: number
+    source_manifest: Record<string, string | number>
+  }
+}
+
+export interface ScannerQualificationResponse extends ScannerReadMetadata {
   entry_model: string
   gates: {
     minimum_events: number
@@ -1649,14 +1736,14 @@ export interface ScannerQualificationResponse {
 
 export const getScannerEventSummary = async (
   interval?: ScannerInterval, minPeriods = 1,
-): Promise<{ results: ScannerEventSummaryRow[] }> => {
+): Promise<{ results: ScannerEventSummaryRow[] } & ScannerReadMetadata> => {
   const params: Record<string, string | number> = { min_periods: minPeriods }
   if (interval) params.interval = interval
   const response = await api.get('/scanner-events/summary', { params })
   return response.data
 }
 
-export const getScannerEventBacklog = async (): Promise<{ results: ScannerBacklogRow[] }> => {
+export const getScannerEventBacklog = async (): Promise<{ results: ScannerBacklogRow[] } & ScannerReadMetadata> => {
   const response = await api.get('/scanner-events/backlog')
   return response.data
 }
@@ -1672,7 +1759,7 @@ export const getScannerQualification = async (
 
 export const getScannerEvents = async (
   interval?: ScannerInterval, limit = 100,
-): Promise<{ results: ScannerEventRow[] }> => {
+): Promise<{ results: ScannerEventRow[] } & ScannerReadMetadata> => {
   const params: Record<string, string | number> = { limit }
   if (interval) params.interval = interval
   const response = await api.get('/scanner-events', { params })
@@ -1681,7 +1768,7 @@ export const getScannerEvents = async (
 
 export const getLatestScannerSignals = async (
   interval?: ScannerInterval, limit = 500, sessions = 10, hourlySessions = 2,
-): Promise<{ results: LatestScannerSignalRow[] }> => {
+): Promise<{ results: LatestScannerSignalRow[] } & ScannerReadMetadata> => {
   const params: Record<string, string | number> = { limit, sessions, hourly_sessions: hourlySessions }
   if (interval) params.interval = interval
   const response = await api.get('/scanner-events/latest-by-ticker', { params })
@@ -1749,7 +1836,7 @@ export const getTickerScannerEvents = async (
   daily_sessions: number
   hourly_sessions: number
   events: ScannerEventRow[]
-}> => {
+} & ScannerReadMetadata> => {
   const response = await api.get(`/stock/${ticker}/scanner-events`, {
     params: {
       limit,
@@ -1898,11 +1985,61 @@ export interface OptionAnalysisData {
   quote_liquidity: 'NOT_AVAILABLE'
 }
 
+export interface OptionExclusionReason {
+  code: string
+  label: string
+  count: number
+}
+
+export interface OptionIngestionRun {
+  batch_id: string
+  underlying: string
+  asset_type: 'STOCK' | 'ETF'
+  scheduled_cycle: string
+  status: string
+  page_count: number
+  terminal_page_received: boolean
+  received_row_count: number
+  catalog_row_count: number
+  retained_row_count: number
+  excluded_row_count: number
+  catalog_coverage_fraction: number
+  retention_fraction: number
+  rejected_counts: Record<string, number>
+  exclusion_breakdown: OptionExclusionReason[]
+  unknown_reference_count: number
+  retry_count: number
+  error_category: string | null
+  failure_reason: string | null
+  market_data_time: string | null
+  first_observed_at: string | null
+  completed_at: string | null
+}
+
+export interface OptionPolicyCriterion {
+  label: string
+  detail: string
+}
+
 export interface OptionDataQualityData {
-  runs: Array<Record<string, unknown>>
+  runs: OptionIngestionRun[]
   work: Array<Record<string, unknown>>
   new_series: Array<Record<string, unknown>>
   trade_backfills: Array<Record<string, unknown>>
+  definitions: {
+    received: string
+    catalog: string
+    retained: string
+    excluded: string
+    unknown_references: string
+  }
+  retention_criteria: OptionPolicyCriterion[]
+  model_eligibility_criteria: OptionPolicyCriterion[]
+  unknown_reference_gate: {
+    maximum_count: number
+    maximum_fraction: number
+    rule: string
+  }
 }
 
 export type OptionCandidateStatus = 'SELECTED' | 'SUPPRESSED' | 'REJECTED'
@@ -1968,6 +2105,8 @@ export interface OptionCandidateRow {
   observed_time: string
   valid_until: string | null
   presentation_metadata: Record<string, unknown>
+  source_contract_id: number | null
+  source_contract_ticker: string | null
   legs: OptionCandidateLeg[]
 }
 
@@ -1983,6 +2122,38 @@ export interface OptionCandidatesData {
     rejected: number
   }
   quote_liquidity: 'NOT_AVAILABLE'
+  execution_mode: 'READ_ONLY_RESEARCH'
+}
+
+export interface OptionOpportunityUnderlyer {
+  underlying: string
+  matrix_id: string
+  analysis_status: string
+  market_data_time: string
+  observed_time: string
+  matrix_age_seconds: number
+  structured_count: number
+  research_count: number
+  suppressed_count: number
+  recommendation_count: number
+  blocked_count: number
+}
+
+export interface OptionOpportunityRow extends OptionCandidateRow {
+  strategy_position: number
+  signal_id: string | null
+  signal_status: OptionSignalStatus | null
+  signal_blocked_reasons: string[] | null
+  window_state: 'ACTIVE' | 'ELAPSED' | 'UNBOUNDED'
+}
+
+export interface OptionOpportunitiesData {
+  underlyers: OptionOpportunityUnderlyer[]
+  structured: OptionOpportunityRow[]
+  research_highlights: OptionOpportunityRow[]
+  configured_underlyer_count: number
+  covered_underlyer_count: number
+  selection_basis: 'BACKEND_STRATEGY_RANK'
   execution_mode: 'READ_ONLY_RESEARCH'
 }
 
@@ -2027,6 +2198,152 @@ export interface OptionCandidateDetailData {
   execution_mode: 'READ_ONLY_RESEARCH'
 }
 
+export type OptionSignalStatus = 'PENDING' | 'READY' | 'BLOCKED' | 'EXPIRED'
+
+export interface OptionSignalLeg {
+  leg_index: number
+  contract_id: number
+  contract_ticker: string
+  action: 'BUY' | 'SELL'
+  ratio: number
+  multiplier: number
+  model_mark: string
+  local_iv: number
+  local_gamma: number
+  expiration_date: string
+  strike: string
+}
+
+export interface OptionSignalRow {
+  event_id: string
+  source_candidate_id: string
+  underlying: string
+  strategy_name: string
+  strategy_version: string
+  market_data_time: string
+  observed_time: string
+  action: 'BUY' | 'SELL'
+  net_premium: string
+  stop_loss: string | null
+  take_profit: string | null
+  valid_until: string
+  confidence: number | null
+  data_quality: string
+  execution_eligibility: 'PAPER_PROXY' | 'LIVE_CANDIDATE' | null
+  status: OptionSignalStatus
+  blocked_reasons: string[]
+  occurrence_count: number
+  expected_leg_count: number
+  metadata: Record<string, unknown>
+  candidate_kind: 'RESEARCH_ONLY' | 'SINGLE_CONTRACT' | 'MULTI_LEG'
+  structure_type: string
+  structure_risk_class: string
+  expiration_date: string | null
+  maximum_profit: string | null
+  maximum_loss: string | null
+  return_on_risk: number | null
+  breakevens: string[]
+  legs: OptionSignalLeg[]
+}
+
+export interface OptionSignalsData {
+  rows: OptionSignalRow[]
+  total: number
+  limit: number
+  offset: number
+  status_counts: {
+    pending: number
+    ready: number
+    blocked: number
+    expired: number
+  }
+  execution_mode: 'READ_ONLY_RESEARCH'
+}
+
+export type OptionPerformanceCheckpointStatus = 'AVAILABLE' | 'PENDING' | 'NOT_DUE'
+export type OptionPerformanceMeasurement = '15MIN' | '30MIN' | '60MIN' | 'CLOSE' | 'NEXT_OPEN'
+
+export interface OptionPerformanceOutcome {
+  outcome_id: string
+  measurement_type: OptionPerformanceMeasurement
+  market_time: string
+  observed_time: string
+  entry_net_premium: string
+  exit_net_premium: string
+  gross_pnl: string
+  estimated_cost: string
+  net_pnl: string
+  capital_at_risk: string
+  net_return: string
+  availability_flag: 'RESEARCH_DELAYED_PROXY'
+  quality_flags: string[]
+}
+
+export interface OptionPerformanceCheckpoint {
+  measurement_type: OptionPerformanceMeasurement
+  checkpoint_time: string
+  status: OptionPerformanceCheckpointStatus
+  outcome: OptionPerformanceOutcome | null
+}
+
+export interface OptionPerformanceRow {
+  event_id: string
+  source_candidate_id: string
+  performance_candidate_id: string
+  underlying: string
+  strategy_name: string
+  strategy_version: string
+  market_data_time: string
+  observed_time: string
+  action: 'BUY' | 'SELL'
+  net_premium: string
+  stop_loss: string | null
+  take_profit: string | null
+  valid_until: string
+  data_quality: string
+  execution_eligibility: 'PAPER_PROXY' | 'LIVE_CANDIDATE' | null
+  status: OptionSignalStatus
+  blocked_reasons: string[]
+  structure_type: string
+  structure_risk_class: string
+  candidate_rank: number
+  expiration_date: string | null
+  maximum_profit: string | null
+  maximum_loss: string | null
+  return_on_risk: number | null
+  return_on_collateral: number | null
+  breakevens: string[]
+  capital_at_risk: string | null
+  checkpoints: OptionPerformanceCheckpoint[]
+}
+
+export interface OptionPerformanceSummary {
+  measurement_type: OptionPerformanceMeasurement
+  available_count: number
+  positive_count: number
+  negative_count: number
+  mean_net_return: string | null
+  aggregate_net_pnl: string | null
+}
+
+export interface OptionPerformanceData {
+  rows: OptionPerformanceRow[]
+  total: number
+  limit: number
+  offset: number
+  days: number
+  cohort: 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS'
+  measured_signals: number
+  signals_with_management_plan: number
+  measurement_count: number
+  measurement_summary: OptionPerformanceSummary[]
+  valuation_mode: 'RESEARCH_DELAYED_PROXY'
+  materialization_owner: 'OPTION_WORKER'
+  entry_basis: 'FIRST_BOARD_OCCURRENCE' | 'ORIGINAL_SIGNAL_PACKAGE'
+  navigation_revalues: false
+  current_mark_included: false
+}
+
 export const getOptionHealth = async (): Promise<OptionsEnvelope<OptionHealthData>> => {
   const response = await api.get('/options/health')
   return response.data
@@ -2069,10 +2386,40 @@ export const getOptionCandidates = async (params?: {
   return response.data
 }
 
+export const getOptionOpportunities = async (params?: {
+  underlyer?: string
+  per_strategy?: number
+}): Promise<OptionsEnvelope<OptionOpportunitiesData>> => {
+  const response = await api.get('/options/opportunities', { params })
+  return response.data
+}
+
 export const getOptionCandidate = async (
   candidateId: string,
 ): Promise<OptionsEnvelope<OptionCandidateDetailData>> => {
   const response = await api.get(`/options/candidates/${candidateId}`)
+  return response.data
+}
+
+export const getOptionSignals = async (params?: {
+  underlyer?: string
+  status?: OptionSignalStatus
+  limit?: number
+  offset?: number
+}): Promise<OptionsEnvelope<OptionSignalsData>> => {
+  const response = await api.get('/options/signals', { params })
+  return response.data
+}
+
+export const getOptionPerformance = async (params?: {
+  underlyer?: string
+  strategy?: string
+  cohort?: 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS'
+  days?: number
+  limit?: number
+  offset?: number
+}): Promise<OptionsEnvelope<OptionPerformanceData>> => {
+  const response = await api.get('/options/performance', { params })
   return response.data
 }
 

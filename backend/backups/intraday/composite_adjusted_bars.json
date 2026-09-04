@@ -1,0 +1,19 @@
+{
+  "start": "2021-09-07",
+  "end": "2026-09-03",
+  "sessions": 1254,
+  "universe_members": 2919,
+  "member_source": "RECONSTRUCTED_UNIVERSES",
+  "securities_selected": 2933,
+  "common_stock_only": true,
+  "mode": "APPLY",
+  "bars_normalized": 3139570,
+  "bars_inserted": 17500,
+  "sessions_without_rows": 0,
+  "sessions_not_entitled": 0,
+  "bars_out_of_range": 200,
+  "tickers_out_of_range": {
+    "MULN": 200
+  },
+  "first_entitled_session": null
+}

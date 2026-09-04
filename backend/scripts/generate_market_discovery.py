@@ -26,49 +26,16 @@ CURRENT_LOOKBACK_CALENDAR_DAYS = 550
 DISCOVERY_RETENTION_SESSIONS = 252
 
 
-def ensure_table() -> None:
-    with get_db_cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS market_discovery_states (
-                discovery_id BIGSERIAL PRIMARY KEY,
-                trade_date DATE NOT NULL,
-                ticker VARCHAR(16) NOT NULL,
-                model_version VARCHAR(32) NOT NULL,
-                state VARCHAR(32) NOT NULL,
-                validation_status VARCHAR(32) NOT NULL,
-                activity_percentile DOUBLE PRECISION,
-                echo_percentile DOUBLE PRECISION,
-                older_momentum_percentile DOUBLE PRECISION,
-                long_momentum_percentile DOUBLE PRECISION,
-                recent_21d_percentile DOUBLE PRECISION,
-                recent_21d_return DOUBLE PRECISION,
-                recent_5d_return DOUBLE PRECISION,
-                close_price DOUBLE PRECISION,
-                sma_20 DOUBLE PRECISION,
-                sma_50 DOUBLE PRECISION,
-                higher_swing_high BOOLEAN,
-                higher_swing_low BOOLEAN,
-                evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (trade_date, ticker, model_version)
-            )
-        """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_discovery_date_state "
-                    "ON market_discovery_states (trade_date DESC, state)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_discovery_ticker_date "
-                    "ON market_discovery_states (ticker, trade_date DESC)")
-
-
 def compute(as_of: str | None = None) -> pd.DataFrame:
     with get_db_cursor() as cur:
         if as_of:
             cur.execute(
-                "SELECT MAX(datetime)::date AS latest FROM stock_prices_daily "
+                "SELECT MAX(datetime)::date AS latest FROM equity_canonical_daily_bars "
                 "WHERE datetime::date <= %s",
                 (as_of,),
             )
         else:
-            cur.execute("SELECT MAX(datetime)::date AS latest FROM stock_prices_daily")
+            cur.execute("SELECT MAX(datetime)::date AS latest FROM equity_canonical_daily_bars")
         row = cur.fetchone()
     latest = row["latest"] if row else None
     if latest is None:
@@ -173,7 +140,6 @@ def main() -> int:
         "recent_21d_percentile", "recent_21d_return",
     ]].to_string(index=False))
     if not args.dry_run:
-        ensure_table()
         print("persisted", persist(states), "rows")
     return 0
 

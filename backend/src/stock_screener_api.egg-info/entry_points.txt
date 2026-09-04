@@ -1,2 +1,0 @@
-[console_scripts]
-stock-screener = stock_screener.cli:main

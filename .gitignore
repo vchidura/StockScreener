@@ -32,6 +32,18 @@ build/
 dist/
 *.egg-info/
 
+# Local database backup media
+backend/backups/*.dump
+backend/backups/*.partial
+backend/backups/*.dump.partial
+
+# Study working data. Event files reach hundreds of megabytes and are
+# reproducible from retained bars, universes and versioned detectors; the small
+# JSON reports beside them are the durable record and stay tracked.
+backend/backups/**/*.jsonl
+backend/backups/**/*.log
+backend/backups/**/*.err
+
 # --- Node / Frontend ---
 node_modules/
 frontend/node_modules/
@@ -44,6 +56,7 @@ frontend/dist/
 .env.test.local
 .env.production.local
 backend/.env
+backend/.env.production
 frontend/.env.local
 
 # Keep safe/shared templates tracked
@@ -55,3 +68,9 @@ frontend/.env.local
 *.tmp
 *.temp
 .cache/
+
+# One-time research/cutover report outputs
+docs/equity_*parity*.json
+docs/equity_portal_cutover_soak.json
+backend/research/fibonacci_scoring_*.json
+backend/research/scanner_confidence_study.json

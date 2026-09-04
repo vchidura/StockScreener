@@ -23,6 +23,7 @@ import {
   getPriceChannel,
   scanTickerChartPatterns,
   getLatestQuote, 
+  getEquitySecurityProfile,
   getMultiTradeSetup,
   ChartDataPoint,
   FormingChartPattern,
@@ -328,7 +329,8 @@ function gradeTone(grade: string | null | undefined): string {
   return MUTED
 }
 
-const SETUP_INTERVALS = ['1wk', '1d', '1h'] as const
+const SETUP_INTERVALS = ['1mo', '1wk', '1d', '1h'] as const
+type SetupTimeframe = '30m' | '1h' | '1d' | '1wk' | '1mo'
 const CHART_INTERVALS = ['1m', '5m', '15m', '30m', '1h', '1d', '1wk'] as const
 const INTERVAL_NOUN: Record<string, string> = { '1mo': 'monthly', '1wk': 'weekly', '1d': 'daily', '1h': 'hourly' }
 const PATTERN_INTERVAL_LABEL: Record<string, string> = {
@@ -879,10 +881,15 @@ function TickerDetail() {
   const intervalRef = useRef(interval)
   const periodRef = useRef(period)
   const patternScopeRef = useRef(`${symbol}-${interval}`)
+  const initialSetupSyncRef = useRef(false)
   const pendingPatternSelectionRef = useRef<{ scope: string; selection: string } | null>(null)
   const chartRequestPeriod = interval === '1h' ? '2y' : interval === '1wk' ? '5y' : period
 
-  const { data: chartData = [], isFetching: loading } = useQuery<ChartDataPoint[]>({
+  const {
+    data: chartData = [],
+    isFetching: loading,
+    isError: chartError,
+  } = useQuery<ChartDataPoint[]>({
     queryKey: ['chart', symbol, chartRequestPeriod, interval],
     queryFn: () => getChartData(symbol!, chartRequestPeriod, interval),
     enabled: !!symbol,
@@ -952,6 +959,12 @@ function TickerDetail() {
     enabled: !!symbol,
     refetchInterval: 60_000,
   })
+  const { data: securityProfile = null } = useQuery({
+    queryKey: ['equity-security-profile', symbol],
+    queryFn: () => getEquitySecurityProfile(symbol!),
+    enabled: !!symbol,
+    staleTime: 24 * 60 * 60 * 1000,
+  })
 
   const { data: multiSetup = null, isFetching: setupLoading } = useQuery<MultiTradeSetupResponse | null>({
     queryKey: ['trade-setup-multi', symbol],
@@ -960,9 +973,29 @@ function TickerDetail() {
     staleTime: 0,
     refetchInterval: 120_000,
   })
-  const tradeSetup = multiSetup?.setups[setupInterval as '1h' | '1d' | '1wk'] ?? null
+  const tradeSetup = multiSetup?.setups[setupInterval as SetupTimeframe] ?? null
+  const tradeSetupError = multiSetup?.errors[setupInterval as SetupTimeframe] ?? null
   const setups = multiSetup?.setups ?? {}
+  const selectableSetupIntervals: readonly string[] = setups['30m']
+    ? [...SETUP_INTERVALS, '30m']
+    : SETUP_INTERVALS
+  const setupTimeframes: SetupTimeframe[] = setups['30m']
+    ? ['1mo', '1wk', '1d', '1h', '30m']
+    : ['1mo', '1wk', '1d', '1h']
+  const fibonacciTimeframes = setupTimeframes.filter(timeframe => timeframe !== '1mo')
   const confluenceZones = multiSetup?.confluence_zones ?? []
+
+  useEffect(() => {
+    if (initialSetupSyncRef.current) return
+    if (initialInterval !== '30m' || interval !== '30m') {
+      initialSetupSyncRef.current = true
+      return
+    }
+    if (setups['30m']) {
+      setSetupInterval('30m')
+      initialSetupSyncRef.current = true
+    }
+  }, [initialInterval, interval, setups])
 
   const { data: discoveryResp = null } = useQuery<TickerDiscoveryResponse | null>({
     queryKey: ['market-discovery', symbol],
@@ -1115,11 +1148,11 @@ function TickerDetail() {
       pendingPatternSelectionRef.current = null
     }
     setInterval(nextInterval)
-    if ((SETUP_INTERVALS as readonly string[]).includes(nextInterval)) {
+    if (selectableSetupIntervals.includes(nextInterval)) {
       setSetupInterval(nextInterval)
     }
     setPeriod(defaultPeriodForInterval(nextInterval))
-  }, [symbol])
+  }, [selectableSetupIntervals, symbol])
 
   const handlePatternSelectionChange = useCallback((selection: string) => {
     const choice = parsePatternChoice(selection)
@@ -1451,10 +1484,9 @@ function TickerDetail() {
     ? evaluatePlan(plan, tradeSetup, displayPrice, discoveryState, discoveryStale)
     : null
   const scannerEvents = tickerScannerEvents.events
-  const structureTimeframes = ['1mo', '1wk', '1d', '1h'] as const
   const selectedStructuralPatterns = (tradeSetup?.structural_patterns ?? []).slice(0, 2)
     .map(pattern => ({ ...pattern, timeframe: setupInterval, selected: true }))
-  const contextualStructuralPatterns = structureTimeframes
+  const contextualStructuralPatterns = setupTimeframes
     .filter(timeframe => timeframe !== setupInterval)
     .flatMap(timeframe => (setups[timeframe]?.structural_patterns ?? []).slice(0, 1)
       .map(pattern => ({ ...pattern, timeframe, selected: false })))
@@ -1524,6 +1556,11 @@ function TickerDetail() {
             </button>
             <div>
               <h1 style={{ fontSize: '1.75rem', fontWeight: 700 }}>{symbol}</h1>
+              {securityProfile?.security?.company_name && (
+                <div style={{ fontSize: '0.9rem', color: MUTED, marginTop: '0.1rem' }}>
+                  {securityProfile.security.company_name}
+                </div>
+              )}
               {displayPrice !== null && (
                 <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.75rem', marginTop: '0.25rem' }}>
                   <span style={{ fontSize: '1.5rem', fontWeight: 600 }}>
@@ -1850,6 +1887,15 @@ function TickerDetail() {
             <span>Loading chart data...</span>
           </div>
         )}
+        {chartError && !loading && chartData.length === 0 && (
+          <div style={{ position: 'absolute', inset: 0, zIndex: 10, display: 'grid', placeItems: 'center', background: 'rgba(255,255,255,0.92)', textAlign: 'center', padding: 24 }}>
+            <div>
+              <strong style={{ color: INK }}>Chart data is not current yet.</strong>
+              <div style={{ color: MUTED, fontSize: '0.78rem', marginTop: 5 }}>The latest completed market interval has not been published.</div>
+              <button type="button" onClick={() => void handleRefresh()} style={{ marginTop: 12, border: 0, borderRadius: 5, padding: '7px 12px', background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>Retry</button>
+            </div>
+          </div>
+        )}
         <div style={{ position: 'relative', flex: isFullscreen ? 1 : undefined }}>
           <div 
             ref={chartContainerRef} 
@@ -1992,7 +2038,8 @@ function TickerDetail() {
 
         {!setupLoading && !tradeSetup && (
           <p style={{ color: 'var(--text-secondary)', padding: '1rem' }}>
-            No trade setup data available.
+            <strong style={{ color: INK }}>Setup unavailable.</strong>{' '}
+            {tradeSetupError ?? `No ${INTERVAL_NOUN[setupInterval] ?? setupInterval} setup data is available.`}
           </p>
         )}
 
@@ -2257,7 +2304,7 @@ function TickerDetail() {
                     </tr>
                   </thead>
                   <tbody>
-                    {(['1mo', '1wk', '1d', '1h'] as const).map(timeframe => {
+                    {setupTimeframes.map(timeframe => {
                       const setup = setups[timeframe]
                       if (!setup) return (
                         <tr key={timeframe}><td style={{ padding: '9px' }}>{timeframe}</td><td colSpan={7} style={{ color: MUTED }}>Unavailable</td></tr>
@@ -2631,7 +2678,7 @@ function TickerDetail() {
               const currentRowIndex = fibMapRows.findIndex(row => row.price < price)
               const fibMatchTolerance = Math.max(price * 0.003, tradeSetup.technicals.atr * 0.25)
               const matchingFibTimeframes = (levelPrice: number) =>
-                (['1wk', '1d', '1h'] as const).filter(timeframe => {
+                fibonacciTimeframes.filter(timeframe => {
                   if (timeframe === setupInterval) return false
                   const otherFib = setups[timeframe]?.strategy_results.fibonacci
                   if (!otherFib) return false

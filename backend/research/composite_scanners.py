@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -9,14 +10,42 @@ import pandas as pd
 from research.trend_pullback import build_trend_pullback_patterns
 
 
+@dataclass(frozen=True, slots=True)
+class CompositeScannerRegistration:
+    source_name: str
+    source_version: str
+    supported_intervals: tuple[str, ...]
+    outcome_modes: tuple[str, ...] = (
+        "DIRECTIONAL_HORIZON", "RECOMMENDATION_PLAN",
+    )
+    required_plan_fields: tuple[str, ...] = ("stop_price", "target_price")
+
+
+_COMMON_INTERVALS = ("30m", "1h", "1d", "1wk")
+COMPOSITE_SCANNER_REGISTRY = {
+    registration.source_name: registration
+    for registration in (
+        CompositeScannerRegistration("structured_trend_pullback", "1.0", _COMMON_INTERVALS),
+        CompositeScannerRegistration("level_retest_rejection", "1.2", _COMMON_INTERVALS),
+        CompositeScannerRegistration("breakout_expansion", "1.0", _COMMON_INTERVALS),
+        CompositeScannerRegistration("compression_breakout", "0.1-shadow", _COMMON_INTERVALS),
+        CompositeScannerRegistration("failed_breakout_reversal", "0.1-shadow", _COMMON_INTERVALS),
+        CompositeScannerRegistration("structure_reversal", "1.0", _COMMON_INTERVALS),
+        CompositeScannerRegistration(
+            "sma200_reclaim_rejection", "1.0", ("1d", "1wk")
+        ),
+    )
+}
 SCANNER_VERSIONS = {
-    "structured_trend_pullback": "1.0",
-    "level_retest_rejection": "1.2",
-    "breakout_expansion": "1.0",
-    "compression_breakout": "0.1-shadow",
-    "failed_breakout_reversal": "0.1-shadow",
-    "structure_reversal": "1.0",
-    "sma200_reclaim_rejection": "1.0",
+    source_name: registration.source_version
+    for source_name, registration in COMPOSITE_SCANNER_REGISTRY.items()
+}
+
+COMPOSITE_OUTCOME_HORIZONS = {
+    "30m": {"30m": 1, "60m": 2, "120m": 4},
+    "1h": {"7h": 7, "21h": 21, "35h": 35},
+    "1d": {"5d": 5, "10d": 10, "21d": 21},
+    "1wk": {"5wk": 5, "10wk": 10, "21wk": 21},
 }
 
 FIB_SWING_ATR_MULTIPLE = 3.0

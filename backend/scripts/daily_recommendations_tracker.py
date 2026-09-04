@@ -17,7 +17,7 @@ Output:
 import sys
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -29,6 +29,7 @@ from psycopg2.extras import RealDictCursor
 # Add backend to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from database import get_db_cursor
+from equity.repositories import EquityBarRepository
 
 # Logging setup
 logging.basicConfig(
@@ -64,50 +65,33 @@ def get_daily_recommendations(trade_date: datetime) -> List[Dict]:
         return []
 
 
-def get_closing_prices(tickers: List[str], trade_date: datetime) -> Dict[str, Decimal]:
-    """Fetch closing prices for tickers on a specific date"""
+def get_daily_prices(tickers: List[str], trade_date: datetime):
+    """Fetch canonical finalized daily bars for a specific session."""
     try:
-        with get_db_cursor() as ctx:
-            cur = ctx.__enter__()
-            
-            cur.execute("""
-                SELECT ticker, close_price
-                FROM stock_prices_daily
-                WHERE ticker = ANY(%s) AND date_trunc('day', datetime AT TIME ZONE 'America/New_York') = %s
-            """, (tickers, trade_date.date()))
-            
-            prices = {}
-            for row in cur.fetchall():
-                prices[row[0]] = row[1]
-            
-            ctx.__exit__(None, None, None)
-            return prices
+        return EquityBarRepository().daily_session_bars(
+            tickers,
+            trade_date.date(),
+            observed_by=datetime.now(timezone.utc),
+        )
     except Exception as e:
-        logger.error(f"Error fetching closing prices: {e}")
+        logger.error(f"Error fetching canonical daily prices: {e}")
         return {}
+
+
+def get_closing_prices(tickers: List[str], trade_date: datetime) -> Dict[str, Decimal]:
+    """Fetch closing prices for tickers on a specific date."""
+    return {
+        ticker: bar.close_price
+        for ticker, bar in get_daily_prices(tickers, trade_date).items()
+    }
 
 
 def get_daily_open_prices(tickers: List[str], trade_date: datetime) -> Dict[str, Decimal]:
-    """Fetch opening prices for tickers on a specific date"""
-    try:
-        with get_db_cursor() as ctx:
-            cur = ctx.__enter__()
-            
-            cur.execute("""
-                SELECT ticker, open_price
-                FROM stock_prices_daily
-                WHERE ticker = ANY(%s) AND date_trunc('day', datetime AT TIME ZONE 'America/New_York') = %s
-            """, (tickers, trade_date.date()))
-            
-            prices = {}
-            for row in cur.fetchall():
-                prices[row[0]] = row[1]
-            
-            ctx.__exit__(None, None, None)
-            return prices
-    except Exception as e:
-        logger.error(f"Error fetching opening prices: {e}")
-        return {}
+    """Fetch opening prices for tickers on a specific date."""
+    return {
+        ticker: bar.open_price
+        for ticker, bar in get_daily_prices(tickers, trade_date).items()
+    }
 
 
 def compute_actual_return(entry_price: Decimal, close_price: Decimal) -> float:
@@ -144,8 +128,13 @@ def track_daily_performance(trade_date: datetime, lookback_days: int = 20) -> Di
     
     # 2. Fetch closing prices
     tickers = list(set(r['ticker'] for r in recommendations))
-    close_prices = get_closing_prices(tickers, trade_date)
-    open_prices = get_daily_open_prices(tickers, trade_date)
+    daily_prices = get_daily_prices(tickers, trade_date)
+    close_prices = {
+        ticker: bar.close_price for ticker, bar in daily_prices.items()
+    }
+    open_prices = {
+        ticker: bar.open_price for ticker, bar in daily_prices.items()
+    }
     
     if not close_prices:
         logger.warning(f"No closing prices found for {trade_date.date()}")

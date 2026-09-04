@@ -4,9 +4,17 @@ import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-quer
 import { scanGaps, scanFVG, GapScanResponse, GapResult, FVGScanResponse, FVGResult, getLatestPriceDate } from '../services/api'
 import StreakPanel from '../components/StreakPanel'
 
-type TabKey = 'support' | 'resistance' | 'inside-gap' | 'fvg'
+type TabKey = 'new' | 'support' | 'resistance' | 'fills' | 'fvg'
+type GapClassFilter = 'all' | NonNullable<GapResult['gap_classification']>
+type GapAgeFilter = 'all' | '5' | '20' | '60' | '252'
 
 const TABS: { key: TabKey; label: string; types: string[]; color: string }[] = [
+  {
+    key: 'new',
+    label: 'New Gaps',
+    types: ['New Gap Up', 'New Gap Down'],
+    color: '#0f766e',
+  },
   {
     key: 'support',
     label: 'Support Zones',
@@ -20,9 +28,14 @@ const TABS: { key: TabKey; label: string; types: string[]; color: string }[] = [
     color: 'var(--danger)',
   },
   {
-    key: 'inside-gap',
-    label: 'Inside Gap',
-    types: ['Possible Upside (In Gap Down)', 'Possible Downside (In Gap Up)'],
+    key: 'fills',
+    label: 'Fills & Fades',
+    types: [
+      'Possible Upside (In Gap Down)',
+      'Possible Downside (In Gap Up)',
+      'Same-Session Fade (Gap Up)',
+      'Same-Session Fade (Gap Down)',
+    ],
     color: '#2196f3',
   },
   {
@@ -34,19 +47,23 @@ const TABS: { key: TabKey; label: string; types: string[]; color: string }[] = [
 ]
 
 const STRATEGY_TOOLTIP =
-  'Gaps occur when a stock opens significantly above its previous high (gap up) or below its previous low (gap down). ' +
-  'Unfilled gaps often act as strong support or resistance levels.\n\n' +
-  'Support Zones: Price is near or at an unfilled/filled gap-up level — potential buying opportunity.\n' +
-  'Resistance Zones: Price is near or at an unfilled/filled gap-down level — potential selling pressure.\n' +
-  'Inside Gap: Price is currently sitting inside an unfilled gap zone — breakout or reversal likely.'
+  'Opening gaps are classified from formation-time price structure and volume, then tracked through their fill lifecycle.\n\n' +
+  'Breakaway: clears a 20-bar range with elevated formation volume.\n' +
+  'Continuation: aligns with an established formation-time trend.\n' +
+  'Exhaustion Watch: trend-aligned but extended, with light formation volume; reversal still requires confirmation.\n' +
+  'Common: no range break or established trend. Classifications are research heuristics, not probability estimates.'
 
 const TYPE_TOOLTIPS: Record<string, string> = {
-  'At Support (Unfilled Gap Up)': 'Pristine gap-up zone — never breached since formation. Price is near this level, acting as strong support. Higher probability bounce.',
-  'At Support (Filled Gap Up)': 'Gap-up zone that was previously breached but price has returned to retest it. Weaker support — watch for confirmation before entry.',
-  'At Resistance (Unfilled Gap Down)': 'Pristine gap-down zone — never breached since formation. Price is near this ceiling, acting as strong resistance. High probability rejection.',
-  'At Resistance (Filled Gap Down)': 'Gap-down zone that was previously breached but price has returned to retest it. Weaker resistance — watch for rejection confirmation.',
-  'Possible Upside (In Gap Down)': 'Price is sitting inside an unfilled gap-down zone. If it fills upward through the gap, expect a breakout rally toward the upper gap edge.',
-  'Possible Downside (In Gap Up)': 'Price is sitting inside an unfilled gap-up zone. If it breaks down through the gap, expect a drop toward the lower gap edge.',
+  'New Gap Up': 'A new session opened above the prior high. Use class, volume, and fill state to assess whether it held or faded.',
+  'New Gap Down': 'A new session opened below the prior low. Use class, volume, and fill state to assess whether it held or faded.',
+  'Same-Session Fade (Gap Up)': 'The opening gap up returned to the previous close during its formation session.',
+  'Same-Session Fade (Gap Down)': 'The opening gap down returned to the previous close during its formation session.',
+  'At Support (Unfilled Gap Up)': 'The full-range gap-up zone has not been breached and price is testing its upper edge. Confirmation is still required.',
+  'At Support (Filled Gap Up)': 'The full-range gap-up zone was previously crossed and price has returned to retest it.',
+  'At Resistance (Unfilled Gap Down)': 'The full-range gap-down zone has not been breached and price is approaching its lower, nearest edge.',
+  'At Resistance (Filled Gap Down)': 'The full-range gap-down zone was previously crossed and price has returned to retest it.',
+  'Possible Upside (In Gap Down)': 'Price is inside a prior gap-down zone and progressing toward the previous session level.',
+  'Possible Downside (In Gap Up)': 'Price is inside a prior gap-up zone and progressing toward the previous session level.',
 }
 
 const InfoIcon = ({ tooltip }: { tooltip: string }) => (
@@ -79,7 +96,7 @@ interface TickerGroup {
   all: GapResult[]
 }
 
-type SortKey = 'ticker' | 'gap_date' | 'gap_diff' | 'gap_pct' | 'last_close' | 'trend'
+type SortKey = 'ticker' | 'gap_date' | 'gap_pct' | 'last_close' | 'trend' | 'fill_pct' | 'gap_age_sessions' | 'formation_relative_volume' | 'gap_classification'
 type FvgSortKey = 'ticker' | 'fvg_pct' | 'fvg_size' | 'last_close' | 'streak_count' | 'gap_date' | 'proximity' | 'trend'
 type SortDir = 'asc' | 'desc'
 
@@ -99,6 +116,8 @@ function GapScreener() {
   const [fvgPreset, setFvgPreset] = useState<'none' | 'high-bull' | 'high-bear' | 'streak'>('none')
   const [fvgSortKey, setFvgSortKey] = useState<FvgSortKey>('streak_count')
   const [fvgSortDir, setFvgSortDir] = useState<SortDir>('desc')
+  const [gapClassFilter, setGapClassFilter] = useState<GapClassFilter>('all')
+  const [gapAgeFilter, setGapAgeFilter] = useState<GapAgeFilter>('20')
 
   const { data, error: queryError, isFetching: loading } = useQuery<GapScanResponse>({
     queryKey: ['scan', 'gaps', interval, scanDate],
@@ -154,7 +173,7 @@ function GapScreener() {
   /** Assign each ticker to exactly one tab based on its most recent gap,
       and gather ALL gaps for that ticker into the expandable list. */
   const allTickerAssignments = useMemo(() => {
-    if (!data?.results) return { support: [] as TickerGroup[], resistance: [] as TickerGroup[], 'inside-gap': [] as TickerGroup[], fvg: [] as TickerGroup[] }
+    if (!data?.results) return { new: [] as TickerGroup[], support: [] as TickerGroup[], resistance: [] as TickerGroup[], fills: [] as TickerGroup[], fvg: [] as TickerGroup[] }
 
     // Gather all gaps per ticker
     const tickerGaps = new Map<string, GapResult[]>()
@@ -163,7 +182,7 @@ function GapScreener() {
       tickerGaps.get(r.ticker)!.push(r)
     }
 
-    const assigned: Record<TabKey, TickerGroup[]> = { support: [], resistance: [], 'inside-gap': [], fvg: [] }
+    const assigned: Record<TabKey, TickerGroup[]> = { new: [], support: [], resistance: [], fills: [], fvg: [] }
 
     for (const [ticker, gaps] of tickerGaps) {
       // Most recent gap determines which tab the ticker belongs to
@@ -239,6 +258,13 @@ function GapScreener() {
   const tickerGroups = useMemo((): TickerGroup[] => {
     let groups = allTickerAssignments[activeTab] ?? []
     if (filter) groups = groups.filter(g => g.ticker.toLowerCase().includes(filter.toLowerCase()))
+    if (gapClassFilter !== 'all') {
+      groups = groups.filter(g => (g.best.gap_classification ?? 'UNCLASSIFIED') === gapClassFilter)
+    }
+    if (gapAgeFilter !== 'all') {
+      const maximumAge = Number(gapAgeFilter)
+      groups = groups.filter(g => g.best.gap_age_sessions != null && g.best.gap_age_sessions <= maximumAge)
+    }
 
     const sorted = [...groups]
     sorted.sort((a, b) => {
@@ -248,7 +274,7 @@ function GapScreener() {
       return sortDir === 'asc' ? (av as number) - (bv as number) : (bv as number) - (av as number)
     })
     return sorted
-  }, [allTickerAssignments, activeTab, filter, sortKey, sortDir])
+  }, [allTickerAssignments, activeTab, filter, gapClassFilter, gapAgeFilter, sortKey, sortDir])
 
   const toggleExpand = (ticker: string) => {
     setExpandedTickers(prev => {
@@ -313,6 +339,20 @@ function GapScreener() {
     const isInside = r.gap_type.includes('In Gap')
     const isSupport = r.gap_type.includes('Support')
 
+    if (r.gap_type.startsWith('New Gap') || r.gap_type.startsWith('Same-Session Fade')) {
+      const isUp = r.gap_direction === 'UP' || r.gap_type.includes('Gap Up')
+      const isFade = r.gap_type.startsWith('Same-Session Fade')
+      return (
+        <span style={{
+          display: 'inline-block', padding: '2px 8px', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 600,
+          background: isFade ? '#fff7ed' : isUp ? '#ecfdf5' : '#fef2f2',
+          color: isFade ? '#c2410c' : isUp ? '#047857' : '#b91c1c',
+        }}>
+          {isFade ? 'Same-session fade' : isUp ? 'Gap up' : 'Gap down'}
+        </span>
+      )
+    }
+
     if (isInside) {
       const isRally = r.entry_direction === 'rally'
       // Compute how far through the gap zone the price is
@@ -344,8 +384,8 @@ function GapScreener() {
     const strengthLabel = isFilled
       ? 'Retest'
       : isSupport
-        ? (trendConfirmsSupport ? 'Strong Support' : 'Support')
-        : (trendConfirmsResistance ? 'Strong Resistance' : 'Resistance')
+        ? (trendConfirmsSupport ? 'Trend-aligned Support' : 'Support Zone')
+        : (trendConfirmsResistance ? 'Trend-aligned Resistance' : 'Resistance Zone')
     const strengthBg = isFilled ? '#fff3e0' : (isSupport ? '#e8f5e9' : '#ffebee')
     const strengthColor = isFilled ? '#e65100' : (isSupport ? '#2e7d32' : '#c62828')
 
@@ -372,20 +412,61 @@ function GapScreener() {
     )
   }
 
+  const getClassificationBadge = (r: GapResult) => {
+    const value = r.gap_classification ?? 'UNCLASSIFIED'
+    const labels: Record<string, string> = {
+      BREAKAWAY: 'Breakaway',
+      CONTINUATION: 'Continuation',
+      EXHAUSTION_WATCH: 'Exhaustion watch',
+      COMMON: 'Common',
+      UNCLASSIFIED: 'Unclassified',
+    }
+    const colors: Record<string, [string, string]> = {
+      BREAKAWAY: ['#ecfdf5', '#047857'],
+      CONTINUATION: ['#eff6ff', '#1d4ed8'],
+      EXHAUSTION_WATCH: ['#fff7ed', '#c2410c'],
+      COMMON: ['#f3f4f6', '#4b5563'],
+      UNCLASSIFIED: ['#f8fafc', '#64748b'],
+    }
+    const [background, color] = colors[value]
+    const reasons = r.classification_reason_codes?.map(code => code.toLowerCase().replace(/_/g, ' ')).join('; ')
+    return (
+      <span
+        title={`${labels[value]} · ${r.classification_confidence?.toLowerCase() ?? 'legacy'} evidence${reasons ? ` · ${reasons}` : ''}`}
+        style={{ display: 'inline-block', padding: '2px 8px', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 600, background, color }}
+      >
+        {labels[value]}
+      </span>
+    )
+  }
+
+  const lifecycleLabel = (r: GapResult) => {
+    const labels: Record<string, string> = {
+      OPEN: 'Open',
+      PARTIALLY_FILLED: 'Partial',
+      FILLED: 'Filled',
+      SAME_SESSION_FADE: 'Same-session',
+      FAILED: 'Failed',
+    }
+    const label = r.gap_lifecycle ? labels[r.gap_lifecycle] : 'Legacy'
+    const fillTarget = r.fill_target != null ? `Fill target $${r.fill_target.toFixed(2)}` : 'Fill target unavailable'
+    return <span title={`${fillTarget}${r.first_fill_date ? ` · first filled ${r.first_fill_date}` : ''}`}>{label}</span>
+  }
+
   return (
     <div>
       {/* Header */}
-      <div className="card-header" style={{ border: 'none', padding: 0, marginBottom: '1.5rem' }}>
+      <div className="card-header gap-page-header" style={{ border: 'none', padding: 0, marginBottom: '1.5rem' }}>
         <div>
           <h1 style={{ fontSize: '1.75rem', fontWeight: 700 }}>
             Gap Strategies
             <InfoIcon tooltip={STRATEGY_TOOLTIP} />
           </h1>
           <p style={{ color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
-            Identify unfilled gaps that act as support and resistance levels
+            Classify opening gaps, track fills, and monitor actionable support or resistance retests
           </p>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+        <div className="gap-page-controls" style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
             <label style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Scan Date:</label>
             <input
@@ -421,7 +502,7 @@ function GapScreener() {
                   cursor: 'pointer',
                   fontWeight: interval === iv ? 600 : 400,
                 }}
-                title={iv === '1d' ? 'Daily candles' : iv === '1h' ? 'Hourly candles' : `${iv} candles (intraday)`}
+                title={iv === '1d' ? 'Daily session gaps' : `${iv} bars; only new-session openings qualify as traditional gaps`}
               >
                 {iv}
               </button>
@@ -451,7 +532,7 @@ function GapScreener() {
       {!loading && data && (
         <>
           {/* Tabs */}
-          <div style={{
+          <div className="gap-tabs" style={{
             display: 'flex',
             gap: '0',
             borderBottom: '2px solid var(--border)',
@@ -533,11 +614,39 @@ function GapScreener() {
                 style={{ minWidth: '150px' }}
               >
                 <option value="none">All Presets</option>
-                <option value="high-bull">🟢 High-Prob Bullish</option>
-                <option value="high-bear">🔴 High-Prob Bearish</option>
+                <option value="high-bull">Aligned Bullish</option>
+                <option value="high-bear">Aligned Bearish</option>
                 <option value="streak">📊 Streak Signals (≥3)</option>
               </select>
             </>)}
+            {activeTab !== 'fvg' && (
+              <>
+                <select
+                  value={gapClassFilter}
+                  onChange={(e) => setGapClassFilter(e.target.value as GapClassFilter)}
+                  style={{ minWidth: '165px' }}
+                  aria-label="Gap classification"
+                >
+                  <option value="all">All Gap Classes</option>
+                  <option value="BREAKAWAY">Breakaway</option>
+                  <option value="CONTINUATION">Continuation</option>
+                  <option value="EXHAUSTION_WATCH">Exhaustion Watch</option>
+                  <option value="COMMON">Common</option>
+                  <option value="UNCLASSIFIED">Unclassified</option>
+                </select>
+                <select
+                  value={gapAgeFilter}
+                  onChange={(e) => setGapAgeFilter(e.target.value as GapAgeFilter)}
+                  aria-label="Maximum gap age"
+                >
+                  <option value="5">Age ≤ 5 sessions</option>
+                  <option value="20">Age ≤ 20 sessions</option>
+                  <option value="60">Age ≤ 60 sessions</option>
+                  <option value="252">Age ≤ 1 trading year</option>
+                  <option value="all">All Ages</option>
+                </select>
+              </>
+            )}
             <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
               {activeTab === 'fvg'
                 ? `${fvgData?.total_scanned ?? 0} scanned · ${fvgTickerGroups.length} tickers with FVGs`
@@ -559,12 +668,24 @@ function GapScreener() {
                       Status
                       <InfoIcon tooltip={
                         activeTab === 'support'
-                          ? 'Strong Support = pristine gap zone never breached (high confidence bounce). Retest = gap was filled before, price revisiting (weaker). Proximity: At Edge (<0.3%), Testing (<0.8%), Approaching (<2%).'
+                          ? 'Unfilled Zone = full-range gap not crossed. Retest = gap was crossed before and price is revisiting. Proximity: At Edge (<0.3%), Testing (<0.8%), Approaching (<2%).'
                           : activeTab === 'resistance'
-                          ? 'Strong Resistance = pristine gap zone never breached (high confidence rejection). Retest = gap was filled before, price revisiting (weaker). Proximity: At Edge (<0.3%), Testing (<0.8%), Approaching (<2%).'
-                          : 'Gap Fill Rally = price inside gap-down zone, may break upward. Gap Fill Drop = price inside gap-up zone, may break down. Position: Near Top / Mid-Zone / Near Bottom within the gap.'
+                          ? 'Unfilled Zone = full-range gap not crossed. Retest = gap was crossed before and price is revisiting. Proximity: At Edge (<0.3%), Testing (<0.8%), Approaching (<2%).'
+                          : activeTab === 'new'
+                          ? 'New gap direction and formation-session state. Use the class, lifecycle, and formation volume columns for context.'
+                          : 'Price is traversing a prior gap or has returned to the previous close in the formation session. Position badges show location within the zone.'
                       } />
                     </span>
+                  </th>
+                  <th onClick={() => handleSort('gap_classification')} style={thStyle()}>
+                    <span style={{ whiteSpace: 'nowrap' }}>
+                      Class{sortArrow('gap_classification')}
+                      <InfoIcon tooltip="Formation-time heuristic based on the prior 20-bar range, trend, extension, and relative volume. Exhaustion remains a watch state until reversal is confirmed." />
+                    </span>
+                  </th>
+                  <th style={{ whiteSpace: 'nowrap' }}>
+                    Lifecycle
+                    <InfoIcon tooltip="Fill is measured from the opening price back to the previous close: Open, Partial, Filled, Same-session fade, or Failed." />
                   </th>
                   <th style={{ whiteSpace: 'nowrap', textAlign: 'center' }}>
                     <span style={{ whiteSpace: 'nowrap' }}>
@@ -584,19 +705,25 @@ function GapScreener() {
                   <th onClick={() => handleSort('last_close')} style={thStyle('right')}>
                     Close{sortArrow('last_close')}
                   </th>
-                  <th style={thStyle('right')}>Open</th>
-                  <th style={thStyle('right')}>High</th>
-                  <th style={thStyle('right')}>Low</th>
-                  <th onClick={() => handleSort('gap_diff')} style={thStyle('right')}>
+                  <th onClick={() => handleSort('fill_pct')} style={thStyle('right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>
-                      Gap Size{sortArrow('gap_diff')}
-                      <InfoIcon tooltip="Absolute dollar size of the gap zone (High - Low)." />
+                      Fill %{sortArrow('fill_pct')}
+                      <InfoIcon tooltip="How far price has traveled from the opening price back toward the previous close, capped at 100%." />
+                    </span>
+                  </th>
+                  <th onClick={() => handleSort('gap_age_sessions')} style={thStyle('right')}>
+                    Age{sortArrow('gap_age_sessions')}
+                  </th>
+                  <th onClick={() => handleSort('formation_relative_volume')} style={thStyle('right')}>
+                    <span style={{ whiteSpace: 'nowrap' }}>
+                      Form Vol{sortArrow('formation_relative_volume')}
+                      <InfoIcon tooltip="Formation-bar volume divided by the preceding 20-bar average. It describes participation, not trader identity." />
                     </span>
                   </th>
                   <th onClick={() => handleSort('gap_pct')} style={thStyle('right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>
-                      Gap %{sortArrow('gap_pct')}
-                      <InfoIcon tooltip="Gap size as a percentage of the previous day's price. Larger gaps are more significant." />
+                      Full Gap %{sortArrow('gap_pct')}
+                      <InfoIcon tooltip="Opening price beyond the previous high or low as a percentage of that range edge. Opening gap versus previous close is available in the class tooltip data." />
                     </span>
                   </th>
                   <th onClick={() => handleSort('trend')} style={thStyle('center')}>
@@ -610,7 +737,7 @@ function GapScreener() {
               <tbody>
                 {tickerGroups.length === 0 ? (
                   <tr>
-                    <td colSpan={11} style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-secondary)' }}>
+                    <td colSpan={13} style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-secondary)' }}>
                       No gap signals found in this category
                     </td>
                   </tr>
@@ -633,6 +760,8 @@ function GapScreener() {
                             {getSubtypeBadge(g.best)}
                           </span>
                         </td>
+                        <td>{getClassificationBadge(g.best)}</td>
+                        <td style={{ fontSize: '0.8rem' }}>{lifecycleLabel(g.best)}</td>
                         <td style={{ textAlign: 'center' }}>
                           {hasMore ? (
                             <span
@@ -661,10 +790,9 @@ function GapScreener() {
                         <td>{g.best.gap_date}</td>
                         <td style={{ textAlign: 'right' }}>{gapRange(g.best)}</td>
                         <td style={{ textAlign: 'right' }}>${g.best.last_close.toFixed(2)}</td>
-                        <td style={{ textAlign: 'right' }}>${g.best.current_open?.toFixed(2) ?? '—'}</td>
-                        <td style={{ textAlign: 'right' }}>${g.best.current_high?.toFixed(2) ?? '—'}</td>
-                        <td style={{ textAlign: 'right' }}>${g.best.current_low?.toFixed(2) ?? '—'}</td>
-                        <td style={{ textAlign: 'right' }}>${g.best.gap_diff.toFixed(2)}</td>
+                        <td style={{ textAlign: 'right' }}>{g.best.fill_pct != null ? `${g.best.fill_pct.toFixed(0)}%` : '—'}</td>
+                        <td style={{ textAlign: 'right' }}>{g.best.gap_age_sessions ?? '—'}</td>
+                        <td style={{ textAlign: 'right' }}>{g.best.formation_relative_volume != null ? `${g.best.formation_relative_volume.toFixed(2)}x` : '—'}</td>
                         <td style={{
                           textAlign: 'right',
                           color: g.best.gap_pct >= 3 ? 'var(--danger)' : g.best.gap_pct >= 2 ? '#ff9800' : 'inherit',
@@ -715,14 +843,15 @@ function GapScreener() {
                                 {getSubtypeBadge(r)}
                               </span>
                             </td>
+                            <td>{getClassificationBadge(r)}</td>
+                            <td style={{ fontSize: '0.8rem' }}>{lifecycleLabel(r)}</td>
                             <td></td>
                             <td>{r.gap_date}</td>
                             <td style={{ textAlign: 'right' }}>{gapRange(r)}</td>
                             <td style={{ textAlign: 'right' }}>${r.last_close.toFixed(2)}</td>
-                            <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>—</td>
-                            <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>—</td>
-                            <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>—</td>
-                            <td style={{ textAlign: 'right' }}>${r.gap_diff.toFixed(2)}</td>
+                            <td style={{ textAlign: 'right' }}>{r.fill_pct != null ? `${r.fill_pct.toFixed(0)}%` : '—'}</td>
+                            <td style={{ textAlign: 'right' }}>{r.gap_age_sessions ?? '—'}</td>
+                            <td style={{ textAlign: 'right' }}>{r.formation_relative_volume != null ? `${r.formation_relative_volume.toFixed(2)}x` : '—'}</td>
                             <td style={{
                               textAlign: 'right',
                               color: r.gap_pct >= 3 ? 'var(--danger)' : r.gap_pct >= 2 ? '#ff9800' : 'inherit',
@@ -751,9 +880,9 @@ function GapScreener() {
             color: 'var(--text-secondary)', lineHeight: 1.5, flexWrap: 'wrap',
           }}>
             <span><strong>Pro tips:</strong></span>
-            <span>🟢 <strong>Buy the dip</strong> — Bullish + Unmitigated + Trend-aligned + Streak ≥2. Enter at FVG zone with stop below.</span>
-            <span>🔴 <strong>Short the rip</strong> — Bearish + Unmitigated + Trend-aligned + Streak ≥2. Enter at FVG zone with stop above.</span>
-            <span>📊 <strong>Structure bias</strong> — Streak ≥3 = strong directional flow. Higher ATR ratio = more institutional significance.</span>
+            <span><strong>Aligned bullish</strong> — Bullish + Unmitigated + Trend-aligned + Streak ≥2. Require a held retest before treating the zone as support.</span>
+            <span><strong>Aligned bearish</strong> — Bearish + Unmitigated + Trend-aligned + Streak ≥2. Require a rejected retest before treating the zone as resistance.</span>
+            <span><strong>Sequence</strong> — Streak ≥3 means repeated same-direction imbalances. Higher ATR ratio means a larger move relative to recent range.</span>
             <span>🎯 <strong>Best on intraday</strong> — FVGs work best on 5m/15m for precise entries within daily-timeframe context.</span>
             <span>🔎 <strong>Multi-timeframe</strong> — Find an unmitigated daily bullish FVG in an uptrend, then drop to 5m/15m to time your entry as price enters the zone.</span>
           </div>
@@ -768,7 +897,7 @@ function GapScreener() {
                   </th>
                   <th onClick={() => handleFvgSort('streak_count')} style={thStyle('center')}>
                     Streak{fvgSortArrow('streak_count')}
-                    <InfoIcon tooltip="Consecutive same-direction FVGs from most recent. High streak = strong institutional flow. Shows direction and count." />
+                    <InfoIcon tooltip="Consecutive same-direction FVGs from most recent. A higher streak records repeated directional imbalance; it is not proof of participant identity." />
                   </th>
                   <th style={{ whiteSpace: 'nowrap', textAlign: 'center' }}>
                     FVGs

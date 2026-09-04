@@ -9,7 +9,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from options.analytics.analysis_engine import OptionAnalysisSnapshot
 from options.analytics.chain_analysis import ChainHealth
 from options.config import OptionRuntimeConfiguration
-from options.domain import AssetType, OptionContractSnapshot, WorkStage
+from options.domain import AssetType, OptionAnalysisRun, OptionContractSnapshot, WorkStage
 from options.repositories.strategies import OptionStrategyRepository
 from options.repositories.analysis import OptionAnalysisRepository
 from options.repositories.snapshots import OptionSnapshotRepository
@@ -87,40 +87,52 @@ class OptionStrategyPipeline:
             run = self.analysis_repository.get_latest(underlyer, read_context)
             if run is None:
                 continue
-            if run.policy_sha256 != self.configuration.policy_sha256:
-                results.append(
-                    StrategyMatrixResult(
-                        run.matrix_id,
-                        underlyer,
-                        "POLICY_MISMATCH",
-                        0,
-                        0,
-                        0,
-                        0,
-                        "analysis market-data policy does not match the running policy",
-                    )
-                )
-                continue
-            snapshots = self.snapshot_repository.list_for_batch(run.batch_id, run.context)
-            expirations = self.analysis_repository.list_expirations(run.matrix_id, run.context)
-            health = ChainHealth(**json.loads(run.chain_health_json))
             asset_type = (
                 AssetType.ETF
                 if underlyer in self.configuration.settings.fixed_etf_underlyers
                 else AssetType.STOCK
             )
-            results.append(
-                self.process_matrix(
-                    run.matrix_id,
-                    underlyer,
-                    run.context,
-                    health,
-                    expirations,
-                    snapshots,
-                    asset_type,
-                )
-            )
+            results.append(self.process_persisted(run, asset_type))
         return tuple(results)
+
+    def process_persisted(
+        self,
+        run: OptionAnalysisRun,
+        asset_type: AssetType,
+    ) -> StrategyMatrixResult:
+        if run.policy_sha256 != self.configuration.policy_sha256:
+            return StrategyMatrixResult(
+                run.matrix_id,
+                run.underlyer,
+                "POLICY_MISMATCH",
+                0,
+                0,
+                0,
+                0,
+                "analysis market-data policy does not match the running policy",
+            )
+        snapshots = tuple(
+            snapshot
+            for snapshot in self.snapshot_repository.list_for_batch(
+                run.batch_id,
+                run.context,
+            )
+            if snapshot.model_mark is not None
+        )
+        expirations = self.analysis_repository.list_expirations(
+            run.matrix_id,
+            run.context,
+        )
+        health = ChainHealth(**json.loads(run.chain_health_json))
+        return self.process_matrix(
+            run.matrix_id,
+            run.underlyer,
+            run.context,
+            health,
+            expirations,
+            snapshots,
+            asset_type,
+        )
 
     def process_matrix(
         self,
@@ -190,6 +202,9 @@ class OptionStrategyPipeline:
                 ),
                 policy_version=self.configuration.strategy_policy.strategy_version,
                 policy_sha256=self.configuration.strategy_policy_sha256,
+                equity_context_enabled=(
+                    self.configuration.settings.equity_context_enabled
+                ),
             )
             trades = self.trade_repository.list_for_underlyer(
                 underlyer,

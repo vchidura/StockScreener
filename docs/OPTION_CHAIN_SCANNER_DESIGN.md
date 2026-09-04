@@ -1,5 +1,9 @@
 # Option Chain Scanner: Production Design and Implementation Plan
 
+> Schema note: migration numbers in this design identify historical implementation phases. Their
+> final tables, constraints, functions, and indexes are consolidated in
+> `backend/migrations/000_canonical_schema.sql`.
+
 Status: proposed v3 - Advanced production target with Developer bootstrap
 
 Document role: this is the normative detailed specification. Implementers should start

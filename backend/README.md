@@ -1,119 +1,87 @@
 # Stock Screener API
 
-FastAPI backend for technical stock analysis and screening strategies.
+FastAPI backend, canonical equity materialization workers, and read-only option
+research APIs for the Stock Screener Portal.
 
-## Installation
+Use the root [README](../README.md) for development startup and the
+[deployment guide](../docs/DEPLOYMENT.md) for production configuration,
+database role isolation, backups, and Compose profiles.
 
-For complete new-machine setup, including PostgreSQL installation, database
-restore, frontend dependencies, and startup verification, follow the
-[root setup guide](../README.md#new-machine-setup-windows).
+## Install
 
-## Local Database Topology
-
-The verified Windows development environment uses the native PostgreSQL 17
-binaries and a project-owned cluster:
-
-- Data directory: `%LOCALAPPDATA%\stock-screener-portal\postgres-data`
-- Application listener: `127.0.0.1:5433`
-- Backend database and user: `stocks_db` / `vamsh100`
-- Cluster process: started with `pg_ctl`, not Docker or the Windows service
-
-The installer-managed PostgreSQL Windows service listens separately on port
-`5432` and is not used by this backend. Docker Compose is another independent
-alternative: containers use `db:5432`. Do not point the native backend at the
-Windows service or mix native and Compose connection settings.
-
-### From Wheel Package
-```bash
-pip install stock_screener_api-1.0.0-py3-none-any.whl
-```
-
-### From Source
-```bash
-pip install .
-```
-
-## Usage
-
-### Run Backend and Frontend Locally
-
-The backend requires PostgreSQL and a configured `backend/.env` file. From the
-repository root, copy `backend/.env.example` to `backend/.env` and update the
-database credentials. For the project-owned native cluster, set the host to
-`127.0.0.1` and the port to `5433` as shown below.
-
-Start the isolated database after a reboot if it is not already running:
+From the repository root:
 
 ```powershell
-$pg = "C:\Program Files\PostgreSQL\17\bin"
-$dataDir = Join-Path $env:LOCALAPPDATA "stock-screener-portal\postgres-data"
-$logFile = Join-Path $env:LOCALAPPDATA "stock-screener-portal\postgres.log"
-& "$pg\pg_ctl.exe" start -D $dataDir -l $logFile -w
-& "$pg\pg_isready.exe" -h 127.0.0.1 -p 5433 -d stocks_db
+python -m venv .\backend\.venv
+.\backend\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\backend\.venv\Scripts\python.exe -m pip install -r .\backend\requirements.txt
+Copy-Item .\backend\.env.example .\backend\.env
 ```
 
-Start the API in one PowerShell terminal:
+Set real database credentials and `POLYGON_API_KEY` in `backend/.env`. Do not
+commit that file. The complete worker, materialized read, options safety, and
+CORS contract is documented in the template.
+
+Production must use `APP_ENV=production` and a non-owner, non-superuser
+`DB_USER`. Options must remain read-only and the Advanced stream profile must
+remain disabled until their explicit gates pass.
+
+## Validate Configuration
 
 ```powershell
-cd backend
-.\.venv\Scripts\python.exe -m uvicorn main:app --reload --host 127.0.0.1 --port 8001
+.\backend\.venv\Scripts\python.exe .\backend\scripts\validate_cutover_environment.py
+.\backend\.venv\Scripts\python.exe .\backend\scripts\validate_equity_storage.py
 ```
 
-Start the portal in a second PowerShell terminal:
+The first command validates the active environment without printing secrets.
+The second validates immutable bars, publications, evidence ownership, and all
+20 portal snapshots.
+
+## Run From Source
+
+Start each long-running process separately from the repository root:
 
 ```powershell
-cd frontend
-npm.cmd run dev
+# API
+.\backend\.venv\Scripts\python.exe -m uvicorn main:app `
+  --app-dir backend --reload --host 127.0.0.1 --port 8001
+
+# Canonical equity worker
+.\backend\.venv\Scripts\python.exe .\backend\scripts\run_equity_worker.py
+
+# Portal snapshot worker
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\refresh_equity_portal_snapshots.py --continuous
 ```
 
-Open `http://127.0.0.1:5174`. The frontend proxies API requests to
-`http://127.0.0.1:8001`.
+The API is available at `http://127.0.0.1:8001`; OpenAPI documentation is at
+`http://127.0.0.1:8001/docs`.
 
-### Run API Server
-```bash
-# Default (port 8001)
-stock-screener
+## Build Package
 
-# Custom port
-stock-screener --port 8080
+The backend root modules are the source of truth. Preview and build the wheel:
 
-# Production with multiple workers
-stock-screener --workers 4
-
-# Development with auto-reload
-stock-screener --reload
-
-# Custom .env file
-stock-screener --env-file /path/to/.env
+```powershell
+Set-Location backend
+.\.venv\Scripts\python.exe build_wheel.py --check
+.\.venv\Scripts\python.exe build_wheel.py
 ```
 
-### Environment Configuration
-Create a `.env` file:
-```env
-DB_NAME=stocks_db
-DB_USER=vamsh100
-DB_PASSWORD=your_app_db_password
-DB_HOST=127.0.0.1
-DB_PORT=5433
-TWELVEDATA_API_KEY=your_api_key
-```
+The backend root modules and package directories are the only wheel inputs; no
+generated source copy is tracked.
 
-For Docker Compose only, the backend container receives `DB_HOST=db` and
-`DB_PORT=5432` from `docker-compose.yml`; these are internal container-network
-settings and should not replace the native values above.
+## Key Endpoints
 
-## API Endpoints
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/health` | Canonical storage, portal snapshot, and role readiness |
+| `GET /api/tickers` | Active ticker universe |
+| `GET /api/stock/{ticker}/chart` | Canonical chart bars |
+| `GET /api/stock/{ticker}/trade-setup/multi` | Materialized multi-interval setup |
+| `GET /api/chart-patterns/scan` | Materialized Pattern Watch scan |
+| `GET /api/scan/*` | Worker-published scanner pages |
+| `GET /api/sector-intelligence` | Worker-published sector view |
+| `GET /api/options/health` | Read-only option research readiness |
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/scan/gaps` | Gap up/down scanner |
-| `GET /api/scan/ma-crossover` | Moving average crossover |
-| `GET /api/scan/momentum-pullback` | Momentum pullback signals |
-| `GET /api/scan/bearish-bounce` | Bearish bounce setups |
-| `GET /api/scan/fibonacci` | Fibonacci retracement levels |
-| `GET /api/tickers` | List available tickers |
-| `GET /docs` | Interactive API documentation |
-
-## License
-
-MIT
+Legacy `stock_prices_*` and scanner-event tables are not part of the canonical
+baseline and must not be recreated.

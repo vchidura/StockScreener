@@ -1,0 +1,26 @@
+{
+  "tickers": [
+    "APO",
+    "GLW",
+    "CRM",
+    "CVX",
+    "CRH",
+    "DELL",
+    "CMG",
+    "DDOG",
+    "APP",
+    "CCL"
+  ],
+  "events_checked": {
+    "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL": 3813,
+    "INTRADAY_OPENING_RANGE_BREAKOUT_CONTINUATION": 5555,
+    "INTRADAY_TREND_PULLBACK": 960,
+    "INTRADAY_VWAP_RECLAIM_REJECTION": 6122
+  },
+  "total_events": 16450,
+  "failures": {
+    "INTRADAY_FAILED_OPENING_BREAKOUT_REVERSAL:close_exactly_at_level_boundary": 89
+  },
+  "total_failures": 89,
+  "verdict": "FAIL"
+}

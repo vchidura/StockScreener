@@ -1,7 +1,24 @@
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from equity.api import (
+    current_chart_bar_projection,
+    current_pattern_watch_projection,
+    current_trade_setup_projection,
+    router as equity_materialization_router,
+)
+from equity.technicals import (
+    assess_momentum,
+    compute_ema_confirmation,
+    compute_trade_setup_technicals,
+    detect_golden_cross,
+    detect_level_retests,
+    detect_setup_candlesticks,
+    exponential_moving_average,
+)
+from equity.portal_snapshots import current as current_equity_portal_snapshot
 from typing import List, Optional, Any, Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import copy
 import asyncio
 import logging
 import math
@@ -17,10 +34,7 @@ from database import (
     get_stock_data,
     get_latest_price_date,
     get_latest_quote,
-    create_selected_tickers_table,
-    create_daily_table,
-    create_hourly_table,
-    create_intraday_table,
+    require_canonical_schema,
     get_tickers_overview,
     get_bulk_price_data,
     get_hourly_data,
@@ -43,6 +57,14 @@ from research.price_structures import analyze_price_structures
 from research.forming_patterns import detect_forming_patterns, summarize_cross_frame_patterns
 from research.price_channels import detect_price_channel
 from options.api import router as options_router
+from equity.setup_composition import (
+    compose_fibonacci_context,
+    compose_setup_confluence,
+    compose_setup_direction,
+    compose_setup_duration,
+    compose_setup_timing,
+    compose_trade_levels,
+)
 
 app = FastAPI(
     title="Stock Screener API",
@@ -55,6 +77,31 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("stock-screener-api")
+MATERIALIZED_30M_SETUP_ENABLED = os.getenv(
+    "EQUITY_MATERIALIZED_30M_SETUP_ENABLED", "true"
+).lower() == "true"
+MATERIALIZED_1H_SETUP_ENABLED = os.getenv(
+    "EQUITY_MATERIALIZED_1H_SETUP_ENABLED", "true"
+).lower() == "true"
+MATERIALIZED_1D_SETUP_ENABLED = os.getenv(
+    "EQUITY_MATERIALIZED_1D_SETUP_ENABLED", "true"
+).lower() == "true"
+MATERIALIZED_1WK_SETUP_ENABLED = os.getenv(
+    "EQUITY_MATERIALIZED_1WK_SETUP_ENABLED", "true"
+).lower() == "true"
+MATERIALIZED_1MO_SETUP_ENABLED = os.getenv(
+    "EQUITY_MATERIALIZED_1MO_SETUP_ENABLED", "true"
+).lower() == "true"
+MATERIALIZED_PATTERN_WATCH_ENABLED = os.getenv(
+    "EQUITY_MATERIALIZED_PATTERN_WATCH_ENABLED", "true"
+).lower() == "true"
+MATERIALIZED_PORTAL_SNAPSHOTS_ENABLED = os.getenv(
+    "EQUITY_MATERIALIZED_PORTAL_SNAPSHOTS_ENABLED", "true"
+).lower() == "true"
+MATERIALIZED_SCANNER_PAGE_SNAPSHOTS_ENABLED = os.getenv(
+    "EQUITY_MATERIALIZED_SCANNER_PAGE_SNAPSHOTS_ENABLED", "true"
+).lower() == "true"
+API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 
 DEFAULT_TEST_TICKERS = ["AAPL", "MSFT", "AMZN", "NVDA", "TSLA"]
 
@@ -85,6 +132,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(equity_materialization_router)
 
 app.include_router(options_router)
 
@@ -107,7 +155,6 @@ PRICE_CHANNEL_CACHE = "price_channel_v1"
 # TTL in seconds per cache-key prefix
 _CACHE_TTLS: dict[str, int] = {
     "tickers":          86400,   # 24h
-    "latest_price":     21600,   # 6h
     "strategies":       86400,   # 24h
     "market_regime":    43200,   # 12h
     "overview":         86400,   # 24h
@@ -157,6 +204,21 @@ def _set_cached(key: str, value: Any) -> None:
         _result_cache[key] = (time.time(), value)
 
 
+def _portal_snapshot_payload(snapshot_type: str):
+    projection = current_equity_portal_snapshot(snapshot_type)
+    if projection is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Published {snapshot_type} portal snapshot is unavailable",
+        )
+    if not projection["is_fresh"]:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Published {snapshot_type} portal snapshot is stale",
+        )
+    return projection["payload"]
+
+
 def _invalidate_prefix(prefix: str) -> None:
     """Remove all cache entries whose key starts with prefix."""
     with _result_cache_lock:
@@ -183,12 +245,9 @@ async def log_requests(request: Request, call_next):
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database tables on startup."""
-    create_selected_tickers_table()
-    create_daily_table()
-    create_hourly_table()
-    create_intraday_table()
-    logger.info("Startup complete | tables initialized")
+    """Require the administrator-installed canonical database baseline."""
+    require_canonical_schema()
+    logger.info("Startup complete | canonical equity schema required")
 
 
 def _load_intraday_frames(tickers: List[str], interval: str, limit: int = 200) -> dict:
@@ -275,6 +334,69 @@ def resolve_tickers(tickers: Optional[str] = None, limit: Optional[int] = None) 
 async def root():
     """Health check endpoint."""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+
+@app.get("/api/health")
+async def api_health():
+    """Report API liveness and canonical equity storage readiness."""
+    from database import get_db_cursor
+
+    with get_db_cursor() as cursor:
+        cursor.execute(
+            """
+                        SELECT role.rolsuper AS role_is_superuser,
+                                     current_user = pg_get_userbyid(database.datdba)
+                                             AS role_owns_database,
+                                     EXISTS (
+                                             SELECT 1
+                                             FROM pg_class relation
+                                             JOIN pg_namespace namespace
+                                                 ON namespace.oid = relation.relnamespace
+                                             WHERE namespace.nspname = 'public'
+                                                 AND relation.relkind IN ('r', 'p', 'v', 'm', 'S')
+                                                 AND relation.relowner = role.oid
+                                     ) AS role_owns_public_relations,
+                   to_regclass('public.equity_bar_revisions') IS NOT NULL
+                       AS bar_revisions_ready,
+                   to_regclass('public.equity_current_bar_projection') IS NOT NULL
+                       AS bar_projection_ready,
+                   to_regclass('public.equity_canonical_bars') IS NOT NULL
+                       AS canonical_view_ready,
+                   to_regclass('public.stock_prices_daily') IS NULL
+                       AND to_regclass('public.stock_prices_hourly') IS NULL
+                       AND to_regclass('public.stock_prices_intraday') IS NULL
+                                             AS legacy_public_relations_absent,
+                                     (
+                                             SELECT COUNT(*) = 20
+                                             FROM equity_portal_current_projections projection
+                                             JOIN equity_portal_snapshots snapshot
+                                                 ON snapshot.snapshot_id = projection.snapshot_id
+                                             CROSS JOIN equity_portal_source_state source
+                                             WHERE source.singleton = TRUE
+                                                 AND snapshot.source_generation = source.generation
+                                     ) AS portal_snapshots_ready
+                        FROM pg_roles role
+                        CROSS JOIN pg_database database
+            WHERE role.rolname = current_user
+                            AND database.datname = current_database()
+            """
+        )
+        storage = dict(cursor.fetchone())
+    storage["restricted_role_ready"] = not any((
+        storage.pop("role_is_superuser"),
+        storage.pop("role_owns_database"),
+        storage.pop("role_owns_public_relations"),
+    ))
+    canonical_ready = all(
+        value for key, value in storage.items() if key != "restricted_role_ready"
+    )
+    production = os.getenv("APP_ENV", "development").lower() == "production"
+    ready = canonical_ready and (storage["restricted_role_ready"] or not production)
+    return {
+        "status": "healthy" if ready else "degraded",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "canonical_storage": storage,
+    }
 
 
 @app.get("/api/tickers", response_model=List[str])
@@ -458,13 +580,17 @@ def _build_ticker_confluence_zones(setups: dict[str, dict]) -> list[dict]:
 
 @app.get("/api/stock/{ticker}/trade-setup/multi")
 async def get_multi_trade_setup(ticker: str, refresh: bool = False):
-    """Return synchronized 1h/1d/1wk setups, monthly context, and confluence."""
+    """Return synchronized 1h/1d/1wk/1mo setups and confluence."""
     symbol = ticker.upper()
-    cache_key = f"trade_setup_multi_v11_{symbol}"
+    materialized_intervals = _materialized_setup_intervals()
+    cache_key = (
+        f"trade_setup_multi_v13_{symbol}_"
+        f"{','.join(materialized_intervals) or 'legacy'}"
+    )
     if not refresh:
         cached = _get_cached(cache_key, "trade_setup_multi")
         if cached is not None:
-            return cached
+            return _with_materialized_setups(cached)
     if refresh:
         clear_bulk_cache()
         _invalidate_prefix(f"trade_setup_v22_{symbol}_")
@@ -490,44 +616,104 @@ async def get_multi_trade_setup(ticker: str, refresh: bool = False):
                 shared_hourly[column] = shared_hourly[column].astype(float)
     shared_frames = {"daily": shared_daily, "hourly": shared_hourly}
 
-    intervals = ("1h", "1d", "1wk", "1mo")
+    intervals = tuple(
+        interval for interval in ("1h", "1d", "1wk", "1mo")
+        if interval not in materialized_intervals
+    )
     responses = await asyncio.gather(
         *(_compute_trade_setup(symbol, interval, False, shared_frames) for interval in intervals),
         return_exceptions=True,
     )
     setups = {}
     errors = {}
+    setup_sources = {}
     for interval, response in zip(intervals, responses):
         if isinstance(response, Exception):
             errors[interval] = str(response)
         else:
             setups[interval] = response
+            setup_sources[interval] = "LEGACY_REQUEST_TIME"
 
     result = {
         "ticker": symbol,
         "setups": setups,
         "errors": errors,
+        "setup_sources": setup_sources,
         "confluence_zones": _build_ticker_confluence_zones({
             interval: setup for interval, setup in setups.items() if interval != "1mo"
         }),
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
     _set_cached(cache_key, result)
+    return _with_materialized_setups(result)
+
+
+def _materialized_setup_intervals() -> tuple[str, ...]:
+    return tuple(
+        interval for interval, enabled in (
+            ("30m", MATERIALIZED_30M_SETUP_ENABLED),
+            ("1h", MATERIALIZED_1H_SETUP_ENABLED),
+            ("1d", MATERIALIZED_1D_SETUP_ENABLED),
+            ("1wk", MATERIALIZED_1WK_SETUP_ENABLED),
+            ("1mo", MATERIALIZED_1MO_SETUP_ENABLED),
+        )
+        if enabled
+    )
+
+
+def _with_materialized_setups(legacy_result: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(legacy_result)
+    intervals = _materialized_setup_intervals()
+    if not intervals:
+        return result
+    read_metrics = result.setdefault("setup_read_metrics", {})
+    for interval in intervals:
+        result["setups"].pop(interval, None)
+        result["setup_sources"].pop(interval, None)
+        result["errors"].pop(interval, None)
+        projection = current_trade_setup_projection(result["ticker"], interval)
+        metrics = {
+            "process_started_at": API_PROCESS_STARTED_AT.isoformat(),
+            "read_mode": "MATERIALIZED",
+            "source": "MATERIALIZED_CURRENT_PROJECTION",
+        }
+        if projection is None:
+            result["errors"][interval] = (
+                f"Published materialized {interval} setup unavailable"
+            )
+            read_metrics[interval] = {**metrics, "status": "MISSING"}
+            continue
+        metrics.update({
+            "analysis_run_id": str(projection["analysis_run_id"]),
+            "evidence_id": str(projection["evidence_id"]),
+            "expected_market_time": projection["expected_market_time"].isoformat(),
+            "market_time": projection["market_time"].isoformat(),
+            "observed_at": projection["observed_at"].isoformat(),
+            "projection_read_latency_ms": projection["read_latency_ms"],
+            "published_at": projection["published_at"].isoformat(),
+            "staleness_seconds": projection["staleness_seconds"],
+            "status": "READY" if projection["is_fresh"] else "STALE",
+        })
+        read_metrics[interval] = metrics
+        if not projection["is_fresh"]:
+            result["errors"][interval] = (
+                f"Published materialized {interval} setup is stale for the latest completed slot"
+            )
+            continue
+        result["setups"][interval] = projection["payload"]
+        result["setup_sources"][interval] = "MATERIALIZED_CURRENT_PROJECTION"
+    result["confluence_zones"] = _build_ticker_confluence_zones({
+        interval: setup
+        for interval, setup in result["setups"].items()
+        if interval != "1mo"
+    })
     return result
 
 
 @app.get("/api/latest-price-date")
 async def latest_price_date(refresh: bool = False):
-    """Return the latest trading date available in the database."""
-    cache_key = "latest_price"
-    if not refresh:
-        cached = _get_cached(cache_key, "latest_price")
-        if cached is not None:
-            return cached
-    date = get_latest_price_date()
-    result = {"latest_date": date}
-    _set_cached(cache_key, result)
-    return result
+    """Return the latest canonical daily date without process-local caching."""
+    return {"latest_date": get_latest_price_date()}
 
 
 @app.get("/api/stock/{ticker}/prices")
@@ -565,15 +751,74 @@ async def get_ticker_quote(ticker: str, refresh: bool = False):
 
 @app.get("/api/stock/{ticker}/chart")
 async def get_chart_data(ticker: str, period: str = "1y", interval: str = "1d", refresh: bool = False):
-    """Get chart data for a ticker. Uses DB first, falls back to Yahoo."""
+    """Get chart bars from exact materialized inputs or the legacy price store."""
     prefix = "chart_daily" if interval in ("1d", "1wk") else "chart_intraday"
-    cache_key = f"{prefix}_{ticker.upper()}_{interval}_{period}"
-    if not refresh:
+    materialized_chart = (
+        MATERIALIZED_PATTERN_WATCH_ENABLED
+        and interval in ("5m", "15m", "30m", "1h", "1d", "1wk")
+    ) or (
+        interval == "30m" and (
+            MATERIALIZED_30M_SETUP_ENABLED
+        )
+    )
+    source_key = "materialized" if materialized_chart else "legacy"
+    cache_key = f"{prefix}_{ticker.upper()}_{interval}_{period}_{source_key}"
+    if not refresh and not materialized_chart:
         cached = _get_cached(cache_key, prefix)
         if cached is not None:
             return cached
     if refresh:
         clear_bulk_cache()
+    if materialized_chart:
+        calendar_period_days = {
+            "1d": 1, "5d": 5, "1mo": 30, "3mo": 90,
+            "6mo": 180, "1y": 365, "2y": 730,
+            "4y": 1460, "5y": 1825,
+        }
+        requested_days = calendar_period_days.get(period, 365)
+        bars_per_day = {
+            "5m": 78, "15m": 26, "30m": 13, "1h": 7, "1d": 1,
+        }.get(
+            interval, 1
+        )
+        requested_bars = (
+            requested_days // 7 + 2
+            if interval == "1wk"
+            else requested_days * bars_per_day
+        )
+        projection = current_chart_bar_projection(
+            ticker,
+            interval,
+            limit=requested_bars,
+        )
+        if projection is None and interval in ("1d", "1wk"):
+            materialized_chart = False
+            cache_key = f"{prefix}_{ticker.upper()}_{interval}_{period}_legacy"
+        elif projection is None or not projection["is_fresh"]:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "MATERIALIZED_CHART_BARS_UNAVAILABLE",
+                    "interval": interval,
+                    "reason": "MISSING" if projection is None else "STALE",
+                },
+            )
+        if materialized_chart:
+            bars = projection["bars"]
+            if bars:
+                cutoff = (
+                    bars[-1]["bar_start"] - timedelta(days=requested_days)
+                ).replace(hour=0, minute=0, second=0, microsecond=0)
+                bars = tuple(row for row in bars if row["bar_start"] >= cutoff)
+            records = [{
+                "time": int(row["bar_start"].timestamp()),
+                "open": round(float(row["open_price"]), 2),
+                "high": round(float(row["high_price"]), 2),
+                "low": round(float(row["low_price"]), 2),
+                "close": round(float(row["close_price"]), 2),
+                "volume": int(row["volume"]),
+            } for row in bars]
+            return records
     df = download_historical_data(
         ticker.upper(),
         period=period,
@@ -632,6 +877,33 @@ def _pattern_reference_close(frame) -> float | None:
     return None
 
 
+def _materialized_pattern_report(interval: str, ticker: str | None = None) -> dict:
+    report = current_pattern_watch_projection(interval, ticker=ticker)
+    if not report["is_fresh"]:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "MATERIALIZED_PATTERN_WATCH_UNAVAILABLE",
+                "interval": interval,
+                "expected_market_time": report["expected_market_time"].isoformat(),
+                "market_times": [value.isoformat() for value in report["market_times"]],
+            },
+        )
+    return report
+
+
+def _sort_pattern_watch_rows(rows: list[dict], intervals=PATTERN_WATCH_INTERVALS) -> None:
+    readiness_rank = {"AT_EDGE": 0, "NEAR_EDGE": 1, "FORMING": 2}
+    grade_rank = {"STRONG_GEOMETRY": 0, "VALID_GEOMETRY": 1}
+    rows.sort(key=lambda row: (
+        readiness_rank[row["pattern"]["readiness"]],
+        grade_rank[row["pattern"]["grade"]],
+        row["pattern"]["edge_distance_atr"],
+        -(row["pattern"]["upper_touches"] + row["pattern"]["lower_touches"]),
+        intervals.index(row["interval"]),
+    ))
+
+
 @app.get("/api/stock/{ticker}/chart-patterns")
 async def get_chart_patterns(
     ticker: str,
@@ -640,6 +912,22 @@ async def get_chart_patterns(
 ):
     """Current chart-only formations for one interval, using completed bars."""
     symbol = ticker.upper()
+    if MATERIALIZED_PATTERN_WATCH_ENABLED:
+        report = _materialized_pattern_report(interval, symbol)
+        return {
+            "ticker": symbol,
+            "interval": interval,
+            "status": "FORMING_RESEARCH",
+            "last_close": report["last_closes"].get(symbol),
+            "patterns": [row["pattern"] for row in report["results"]],
+            "computed_at": report["computed_at"],
+            "read_source": "MATERIALIZED_CURRENT_PROJECTION",
+            "read_metrics": {
+                "analysis_run_id": report["analysis_run_id"],
+                "expected_market_time": report["expected_market_time"].isoformat(),
+                "projection_read_latency_ms": report["read_latency_ms"],
+            },
+        }
     prefix = "chart_daily" if interval in ("1d", "1wk") else "chart_intraday"
     cache_key = f"{CHART_PATTERN_DETAIL_CACHE}_{symbol}_{interval}"
     if not refresh:
@@ -673,6 +961,22 @@ async def get_price_channel(
 ):
     """Primary active directional price channel for one completed-bar interval."""
     symbol = ticker.upper()
+    if MATERIALIZED_PATTERN_WATCH_ENABLED:
+        report = _materialized_pattern_report(interval, symbol)
+        return {
+            "ticker": symbol,
+            "interval": interval,
+            "status": "CHANNEL_RESEARCH",
+            "last_close": report["last_closes"].get(symbol),
+            "channel": report["channels"].get(symbol),
+            "computed_at": report["computed_at"],
+            "read_source": "MATERIALIZED_CURRENT_PROJECTION",
+            "read_metrics": {
+                "analysis_run_id": report["analysis_run_id"],
+                "expected_market_time": report["expected_market_time"].isoformat(),
+                "projection_read_latency_ms": report["read_latency_ms"],
+            },
+        }
     prefix = "chart_daily" if interval in ("1d", "1wk") else "chart_intraday"
     cache_key = f"{PRICE_CHANNEL_CACHE}_{symbol}_{interval}"
     if not refresh:
@@ -701,6 +1005,32 @@ async def get_price_channel(
 async def scan_ticker_chart_patterns(ticker: str, refresh: bool = False):
     """Find current forming patterns for one ticker across Pattern Watch intervals."""
     symbol = ticker.upper()
+    if MATERIALIZED_PATTERN_WATCH_ENABLED:
+        reports = [
+            _materialized_pattern_report(interval, symbol)
+            for interval in PATTERN_WATCH_INTERVALS
+        ]
+        rows = [row for report in reports for row in report["results"]]
+        _sort_pattern_watch_rows(rows)
+        return {
+            "interval": "all",
+            "scanned": 1,
+            "matched_tickers": 1 if rows else 0,
+            "results": rows,
+            "cross_frame": summarize_cross_frame_patterns(rows),
+            "computed_at": max(
+                report["computed_at"] for report in reports if report["computed_at"]
+            ),
+            "read_source": "MATERIALIZED_CURRENT_PROJECTION",
+            "read_metrics": {
+                report_interval: {
+                    "analysis_run_id": report["analysis_run_id"],
+                    "expected_market_time": report["expected_market_time"].isoformat(),
+                    "projection_read_latency_ms": report["read_latency_ms"],
+                }
+                for report_interval, report in zip(PATTERN_WATCH_INTERVALS, reports)
+            },
+        }
     cache_key = f"{CHART_PATTERN_TICKER_CACHE}_{symbol}"
     if not refresh:
         cached = _get_cached(cache_key, "chart_pattern_ticker")
@@ -749,15 +1079,7 @@ async def scan_ticker_chart_patterns(ticker: str, refresh: bool = False):
         for response in responses
         for pattern in response["patterns"]
     ]
-    readiness_rank = {"AT_EDGE": 0, "NEAR_EDGE": 1, "FORMING": 2}
-    grade_rank = {"STRONG_GEOMETRY": 0, "VALID_GEOMETRY": 1}
-    rows.sort(key=lambda row: (
-        readiness_rank[row["pattern"]["readiness"]],
-        grade_rank[row["pattern"]["grade"]],
-        row["pattern"]["edge_distance_atr"],
-        -(row["pattern"]["upper_touches"] + row["pattern"]["lower_touches"]),
-        intervals.index(row["interval"]),
-    ))
+    _sort_pattern_watch_rows(rows, intervals)
     result = {
         "interval": "all",
         "scanned": 1,
@@ -777,6 +1099,24 @@ async def scan_chart_patterns(
     refresh: bool = False,
 ):
     """Find current forming chart patterns across the active ticker universe."""
+    if MATERIALIZED_PATTERN_WATCH_ENABLED:
+        report = _materialized_pattern_report(interval)
+        rows = report["results"][:limit]
+        _sort_pattern_watch_rows(rows, (interval,))
+        return {
+            "interval": interval,
+            "scanned": report["scanned"],
+            "matched_tickers": len({row["ticker"] for row in rows}),
+            "results": rows,
+            "cross_frame": None,
+            "computed_at": report["computed_at"],
+            "read_source": "MATERIALIZED_CURRENT_PROJECTION",
+            "read_metrics": {
+                "analysis_run_id": report["analysis_run_id"],
+                "expected_market_time": report["expected_market_time"].isoformat(),
+                "projection_read_latency_ms": report["read_latency_ms"],
+            },
+        }
     cache_key = f"{CHART_PATTERN_SCAN_CACHE}_{interval}_{limit}"
     if not refresh:
         cached = _get_cached(cache_key, "chart_pattern_scan")
@@ -881,6 +1221,11 @@ async def scan_gaps(
     Pass scan_date as YYYY-MM-DD to run the scan as of that historical date.
     interval: 5m, 15m, 30m, 1h, 1d (default)
     """
+    if (
+        MATERIALIZED_SCANNER_PAGE_SNAPSHOTS_ENABLED
+        and tickers is None and scan_date is None and interval == "1d"
+    ):
+        return _portal_snapshot_payload("SCAN_GAPS_1D")
     cache_key = f"gaps_{interval}_{scan_date or 'latest'}"
     if not refresh:
         cached = _get_cached(cache_key, "gaps")
@@ -905,7 +1250,7 @@ async def scan_gaps(
     for ticker in ticker_list:
         df = frames.get(ticker)
         if df is not None and len(df) >= 20:
-            gaps = scan_gap_strategies(ticker, df)
+            gaps = scan_gap_strategies(ticker, df, interval=interval)
             results.extend(gaps)
 
     # Group results by gap_type
@@ -950,6 +1295,12 @@ async def scan_fvg_endpoint(
     interval: 5m, 15m, 30m, 1h, 1d (default)
     lookback: Number of bars to scan (default 50)
     """
+    if (
+        MATERIALIZED_SCANNER_PAGE_SNAPSHOTS_ENABLED
+        and tickers is None and scan_date is None
+        and interval == "1d" and lookback == 50
+    ):
+        return _portal_snapshot_payload("SCAN_FVG_1D_50")
     cache_key = f"fvg_{interval}_{scan_date or 'latest'}_{lookback}"
     if not refresh:
         cached = _get_cached(cache_key, "fvg")
@@ -1018,6 +1369,12 @@ async def scan_ma_crossover(
             - '1h': Hourly candles
             - '30m'/'15m'/'5m': Intraday candles
     """
+    if (
+        MATERIALIZED_SCANNER_PAGE_SNAPSHOTS_ENABLED
+        and tickers is None and scan_date is None and interval == "1d"
+        and short_period == 9 and long_period == 21
+    ):
+        return _portal_snapshot_payload("SCAN_MA_1D_9_21")
     cache_key = f"ma_{interval}_{scan_date or 'latest'}_{short_period}_{long_period}"
     if not refresh:
         cached = _get_cached(cache_key, "ma")
@@ -1113,6 +1470,11 @@ async def scan_momentum(
     
     interval: 5m, 15m, 30m, 1h, 1d (default)
     """
+    if (
+        MATERIALIZED_SCANNER_PAGE_SNAPSHOTS_ENABLED
+        and tickers is None and scan_date is None and interval == "1d"
+    ):
+        return _portal_snapshot_payload("SCAN_MOMENTUM_1D")
     cache_key = f"momentum_{interval}_{scan_date or 'latest'}"
     if not refresh:
         cached = _get_cached(cache_key, "momentum")
@@ -1174,6 +1536,11 @@ async def scan_bearish_bounce_endpoint(
     
     interval: 5m, 15m, 30m, 1h, 1d (default)
     """
+    if (
+        MATERIALIZED_SCANNER_PAGE_SNAPSHOTS_ENABLED
+        and tickers is None and scan_date is None and interval == "1d"
+    ):
+        return _portal_snapshot_payload("SCAN_BEARISH_1D")
     cache_key = f"bearish_{interval}_{scan_date or 'latest'}"
     if not refresh:
         cached = _get_cached(cache_key, "bearish")
@@ -1232,6 +1599,12 @@ async def scan_fibonacci_endpoint(
     
     interval: 5m, 15m, 30m, 1h, 1d (default)
     """
+    if (
+        MATERIALIZED_SCANNER_PAGE_SNAPSHOTS_ENABLED
+        and tickers is None and scan_date is None and interval == "1d"
+        and min_swing_pct == 5.0
+    ):
+        return _portal_snapshot_payload("SCAN_FIBONACCI_1D_5")
     cache_key = f"fibonacci_{interval}_{scan_date or 'latest'}_{min_swing_pct}"
     if not refresh:
         cached = _get_cached(cache_key, "fibonacci")
@@ -1284,6 +1657,8 @@ async def scan_fibonacci_endpoint(
 @app.get("/api/market-regime")
 async def market_regime_endpoint(refresh: bool = False):
     """Analyze SPY + QQQ to determine overall market regime."""
+    if MATERIALIZED_PORTAL_SNAPSHOTS_ENABLED:
+        return _portal_snapshot_payload("MARKET_REGIME")
     cache_key = "market_regime"
     if not refresh:
         cached = _get_cached(cache_key, "market_regime")
@@ -1309,6 +1684,11 @@ async def scan_all(
 ):
     """Run all 5 scans in a single request with one shared data load.
     Returns combined results keyed by strategy name."""
+    if (
+        MATERIALIZED_SCANNER_PAGE_SNAPSHOTS_ENABLED
+        and tickers is None and scan_date is None and min_swing_pct == 5.0
+    ):
+        return _portal_snapshot_payload("SCAN_ALL_1D_5")
     cache_key = f"scan_all_{scan_date or 'latest'}_{min_swing_pct}"
     if not refresh:
         cached = _get_cached(cache_key, "scan_all")
@@ -1395,6 +1775,8 @@ async def scan_all(
 async def tickers_overview(scan_date: Optional[str] = None, refresh: bool = False):
     """Return OHLC + daily MAs + true weekly MAs for all selected tickers.
     Pass scan_date as YYYY-MM-DD for historical data."""
+    if MATERIALIZED_PORTAL_SNAPSHOTS_ENABLED and scan_date is None:
+        return _portal_snapshot_payload("TICKER_OVERVIEW")
     cache_key = f"overview_v2_{scan_date or 'latest'}"
     if not refresh:
         cached = _get_cached(cache_key, "overview")
@@ -1431,6 +1813,19 @@ async def scan_streak_endpoint(
     valid = {"gaps", "ma-crossover", "momentum-pullback", "bearish-bounce", "fibonacci"}
     if strategy not in valid:
         raise HTTPException(status_code=400, detail=f"Invalid strategy. Must be one of: {', '.join(sorted(valid))}")
+    if (
+        MATERIALIZED_SCANNER_PAGE_SNAPSHOTS_ENABLED
+        and days == 5 and tickers is None
+        and short_period == 9 and long_period == 21
+    ):
+        snapshot_type = {
+            "gaps": "STREAK_GAPS_5",
+            "ma-crossover": "STREAK_MA_5",
+            "momentum-pullback": "STREAK_MOMENTUM_5",
+            "bearish-bounce": "STREAK_BEARISH_5",
+            "fibonacci": "STREAK_FIBONACCI_5",
+        }[strategy]
+        return _portal_snapshot_payload(snapshot_type)
 
     cache_key = f"streak_{strategy}_{days}_{short_period}_{long_period}"
     if not refresh:
@@ -1957,6 +2352,11 @@ async def scan_streak_summary_endpoint(
 
     Returns a map of ticker -> {strategy: consistency%} for multi-strategy badges.
     """
+    if (
+        MATERIALIZED_SCANNER_PAGE_SNAPSHOTS_ENABLED
+        and days == 3 and fib_swing_pct == 5.0
+    ):
+        return _portal_snapshot_payload("STREAK_SUMMARY_3_5")
     cache_key = f"streak_summary_{days}_{fib_swing_pct}"
     if not refresh:
         cached = _get_cached(cache_key, "streak_summary")
@@ -2170,7 +2570,10 @@ async def _compute_trade_setup(ticker: str, interval: str = "1d",
     last_date = df.index[-1].strftime("%Y-%m-%d") if hasattr(df.index[-1], "strftime") else str(df.index[-1])
 
     # --- Run all strategies ---
-    gaps = scan_gap_strategies(ticker, df) if len(df) >= 20 else []
+    gaps = (
+        scan_gap_strategies(ticker, df, interval=interval)
+        if len(df) >= 20 else []
+    )
     fvgs = scan_fair_value_gaps(ticker, df) if len(df) >= 20 else []
     ma = scan_moving_average_crossover(ticker, df, interval=interval) if len(df) >= 26 else None
     pullback = scan_momentum_pullback(ticker, df, interval=interval) if len(df) >= 210 else None
@@ -2178,76 +2581,31 @@ async def _compute_trade_setup(ticker: str, interval: str = "1d",
     fib_swing_pct = calculate_fibonacci_swing_pct(df, interval)
     fib = scan_fibonacci(ticker, df, min_swing_pct=fib_swing_pct) if len(df) >= 50 else None
 
-    # --- Compute core technicals ---
-    c = df["close"].values.astype(float)
-    h = df["high"].values.astype(float)
-    l = df["low"].values.astype(float)
-    v = df["volume"].values.astype(float) if "volume" in df.columns else np.zeros(len(c))
-
-    # EMAs (8, 21, 50)
-    def _ema(arr, span):
-        alpha = 2.0 / (span + 1)
-        out = np.empty_like(arr, dtype=float)
-        out[0] = arr[0]
-        for i in range(1, len(arr)):
-            out[i] = alpha * arr[i] + (1 - alpha) * out[i - 1]
-        return out
-
-    ema8 = _ema(c, 8)
-    ema21 = _ema(c, 21)
-    ema50_arr = _ema(c, 50)
-    ema12 = _ema(c, 12)
-    ema26 = _ema(c, 26)
-    macd_arr = ema12 - ema26
-    macd_signal_arr = _ema(macd_arr, 9)
-    macd_hist_arr = macd_arr - macd_signal_arr
-
-    ema8_val = round(float(ema8[-1]), 2)
-    ema21_val = round(float(ema21[-1]), 2)
-    ema50_ema = round(float(ema50_arr[-1]), 2)
-    macd_value = round(float(macd_arr[-1]), 4)
-    macd_signal = round(float(macd_signal_arr[-1]), 4)
-    macd_histogram = round(float(macd_hist_arr[-1]), 4)
-    macd_histogram_previous = round(float(macd_hist_arr[-2]), 4)
-    if macd_value >= macd_signal:
-        macd_state = "BULLISH_RISING" if macd_histogram >= macd_histogram_previous else "BULLISH_FADING"
-    else:
-        macd_state = "BEARISH_FALLING" if macd_histogram <= macd_histogram_previous else "BEARISH_IMPROVING"
-
-    # EMA alignment check (8 > 21 > 50 = fully bullish stacked)
-    ema_bullish_stack = ema8[-1] > ema21[-1] > ema50_arr[-1]
-    ema_bearish_stack = ema8[-1] < ema21[-1] < ema50_arr[-1]
-    if ema_bullish_stack:
-        ema_alignment = "Bullish Stack"
-        ema_alignment_detail = "8 EMA > 21 EMA > 50 EMA — short-term momentum aligned with trend"
-    elif ema_bearish_stack:
-        ema_alignment = "Bearish Stack"
-        ema_alignment_detail = "8 EMA < 21 EMA < 50 EMA — bearish momentum aligned with downtrend"
-    elif ema8[-1] > ema21[-1]:
-        ema_alignment = "Short-term Bullish"
-        ema_alignment_detail = "8 EMA > 21 EMA but not fully stacked — short-term momentum up, trend uncertain"
-    elif ema8[-1] < ema21[-1]:
-        ema_alignment = "Short-term Bearish"
-        ema_alignment_detail = "8 EMA < 21 EMA but not fully stacked — short-term weakness, trend uncertain"
-    else:
-        ema_alignment = "Neutral"
-        ema_alignment_detail = "EMAs converging — no clear alignment"
-
-    # Price-to-EMA distances
-    dist_to_8ema = round((last_close - ema8[-1]) / ema8[-1] * 100, 2)
-    dist_to_21ema = round((last_close - ema21[-1]) / ema21[-1] * 100, 2)
-
-    # RSI(14)
-    delta = np.diff(c)
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
-    avg_gain = np.mean(gain[-14:])
-    avg_loss = np.mean(loss[-14:])
-    rsi = round(100 - 100 / (1 + avg_gain / avg_loss), 1) if avg_loss > 0 else 100.0
-
-    # ATR(14)
-    tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
-    atr14 = float(np.mean(tr[-14:])) if len(tr) >= 14 else float(np.mean(tr))
+    technicals = compute_trade_setup_technicals(df, interval)
+    c = technicals.close
+    h = technicals.high
+    l = technicals.low
+    v = technicals.volume
+    ema8 = technicals.ema8
+    ema_bullish_stack = technicals.ema_bullish_stack
+    ema_bearish_stack = technicals.ema_bearish_stack
+    ema_alignment = technicals.ema_alignment
+    ema_alignment_detail = technicals.ema_alignment_detail
+    ema8_val = technicals.ema8_value
+    ema21_val = technicals.ema21_value
+    ema50_ema = technicals.ema50_value
+    macd_value = technicals.macd
+    macd_signal = technicals.macd_signal
+    macd_histogram = technicals.macd_histogram
+    macd_histogram_previous = technicals.macd_histogram_previous
+    macd_state = technicals.macd_state
+    dist_to_8ema = technicals.distance_to_ema8
+    dist_to_21ema = technicals.distance_to_ema21
+    rsi = technicals.rsi
+    atr14 = technicals.atr14
+    vwap = technicals.vwap
+    ma50 = technicals.ma50
+    ma200 = technicals.ma200
 
     structure_fibonacci_levels = []
     if fib:
@@ -2260,288 +2618,12 @@ async def _compute_trade_setup(ticker: str, interval: str = "1d",
     structural_patterns = structure_analysis["patterns"]
     volume_pivot_zones = structure_analysis["volume_pivot_zones"]
 
-    # Stochastic %K(14,3)
-    if len(c) >= 17:
-        highs_14 = np.array([np.max(h[i-14:i]) for i in range(14, len(h)+1)])
-        lows_14 = np.array([np.min(l[i-14:i]) for i in range(14, len(l)+1)])
-        raw_k = np.where(highs_14 - lows_14 > 0, (c[13:] - lows_14) / (highs_14 - lows_14) * 100, 50)
-        stoch_k = round(float(np.mean(raw_k[-3:])), 1) if len(raw_k) >= 3 else round(float(raw_k[-1]), 1)
-    else:
-        stoch_k = 50.0
-
-    # VWAP (Volume-Weighted Average Price — trailing 20 day)
-    vwap_window = min(20, len(c))
-    if np.sum(v[-vwap_window:]) > 0:
-        vwap = round(float(np.sum(c[-vwap_window:] * v[-vwap_window:]) / np.sum(v[-vwap_window:])), 2)
-    else:
-        vwap = round(float(np.mean(c[-vwap_window:])), 2)
-    price_vs_vwap = "Above" if last_close > vwap else "Below"
-
-    # MAs
-    ma10 = float(np.mean(c[-10:])) if len(c) >= 10 else None
-    ma20 = float(np.mean(c[-20:])) if len(c) >= 20 else None
-    ma50 = float(np.mean(c[-50:])) if len(c) >= 50 else None
-    ma100 = float(np.mean(c[-100:])) if len(c) >= 100 else None
-    ma200 = float(np.mean(c[-200:])) if len(c) >= 200 else None
-
-    # ATR%
-    atr_pct = round(atr14 / last_close * 100, 2)
-
-    # Trend metrics exclude the newest bar because it may still be forming.
-    completed_volume = v[:-1] if len(v) > 1 else np.array([], dtype=float)
-    completed_high = h[:-1]
-    completed_low = l[:-1]
-    completed_close = c[:-1]
-
-    # Directional movement and realized volatility use completed bars so a
-    # forming hourly, daily, or weekly candle cannot distort the comparison.
-    plus_di_value = None
-    minus_di_value = None
-    adx_value = None
-    if len(completed_close) >= 15:
-        up_move = np.diff(completed_high)
-        down_move = -np.diff(completed_low)
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-        directional_tr = np.maximum(
-            completed_high[1:] - completed_low[1:],
-            np.maximum(
-                np.abs(completed_high[1:] - completed_close[:-1]),
-                np.abs(completed_low[1:] - completed_close[:-1]),
-            ),
-        )
-        smoothed_tr = pd.Series(directional_tr).ewm(alpha=1 / 14, adjust=False).mean().to_numpy()
-        smoothed_plus_dm = pd.Series(plus_dm).ewm(alpha=1 / 14, adjust=False).mean().to_numpy()
-        smoothed_minus_dm = pd.Series(minus_dm).ewm(alpha=1 / 14, adjust=False).mean().to_numpy()
-        plus_di = np.divide(
-            100 * smoothed_plus_dm, smoothed_tr,
-            out=np.zeros_like(smoothed_plus_dm), where=smoothed_tr > 0,
-        )
-        minus_di = np.divide(
-            100 * smoothed_minus_dm, smoothed_tr,
-            out=np.zeros_like(smoothed_minus_dm), where=smoothed_tr > 0,
-        )
-        directional_sum = plus_di + minus_di
-        dx = np.divide(
-            100 * np.abs(plus_di - minus_di), directional_sum,
-            out=np.zeros_like(directional_sum), where=directional_sum > 0,
-        )
-        adx = pd.Series(dx).ewm(alpha=1 / 14, adjust=False).mean().to_numpy()
-        plus_di_value = round(float(plus_di[-1]), 1)
-        minus_di_value = round(float(minus_di[-1]), 1)
-        adx_value = round(float(adx[-1]), 1)
-
-    historical_volatility_pct = None
-    historical_volatility_percentile = None
-    historical_volatility_state = "UNAVAILABLE"
-    if len(completed_close) >= 21 and np.all(completed_close > 0):
-        periods_per_year = {
-            "1mo": 12,
-            "1wk": 52,
-            "1d": 252,
-            "1h": 252 * 6.5,
-            "30m": 252 * 13,
-            "15m": 252 * 26,
-            "5m": 252 * 78,
-        }.get(interval, 252)
-        log_returns = pd.Series(np.diff(np.log(completed_close)))
-        rolling_volatility = (
-            log_returns.rolling(20).std(ddof=1) * math.sqrt(periods_per_year) * 100
-        ).dropna()
-        if not rolling_volatility.empty:
-            volatility_history = rolling_volatility.tail(252)
-            current_volatility = float(volatility_history.iloc[-1])
-            volatility_percentile = float((volatility_history <= current_volatility).mean() * 100)
-            historical_volatility_pct = round(current_volatility, 1)
-            historical_volatility_percentile = round(volatility_percentile, 0)
-            if volatility_percentile >= 75:
-                historical_volatility_state = "ELEVATED"
-            elif volatility_percentile <= 25:
-                historical_volatility_state = "QUIET"
-            else:
-                historical_volatility_state = "NORMAL"
-
-    volume_20 = completed_volume[-20:]
-    volume_5 = completed_volume[-5:]
-    completed_volume_baseline = float(np.mean(volume_20)) if len(volume_20) > 0 else 0.0
-    prior_completed_baseline = (
-        float(np.mean(completed_volume[-21:-1]))
-        if len(completed_volume) >= 21 else
-        float(np.mean(completed_volume[:-1])) if len(completed_volume) > 1 else 0.0
-    )
-    relative_volume = (
-        round(float(completed_volume[-1]) / prior_completed_baseline, 2)
-        if len(completed_volume) > 0 and prior_completed_baseline > 0 else None
-    )
-    volume_trend_ratio = (
-        float(np.mean(volume_5)) / completed_volume_baseline
-        if len(volume_5) > 0 and completed_volume_baseline > 0 else None
-    )
-    volume_trend_pct = round((volume_trend_ratio - 1) * 100, 1) if volume_trend_ratio is not None else None
-    if volume_trend_pct is None:
-        volume_trend_state = "UNAVAILABLE"
-    elif volume_trend_pct >= 10:
-        volume_trend_state = "EXPANDING"
-    elif volume_trend_pct <= -10:
-        volume_trend_state = "CONTRACTING"
-    else:
-        volume_trend_state = "STABLE"
-
-    sparkline_volume = completed_volume[-8:]
-    volume_sparkline = [
-        round(float(value) / completed_volume_baseline, 2)
-        for value in sparkline_volume
-    ] if completed_volume_baseline > 0 else []
-    if len(volume_sparkline) >= 2:
-        x_values = np.arange(len(volume_sparkline), dtype=float)
-        volume_slope = round(float(np.polyfit(x_values, volume_sparkline, 1)[0]), 3)
-    else:
-        volume_slope = None
-    if volume_slope is None:
-        volume_slope_state = "UNAVAILABLE"
-    elif volume_slope >= 0.02:
-        volume_slope_state = "RISING"
-    elif volume_slope <= -0.02:
-        volume_slope_state = "FALLING"
-    else:
-        volume_slope_state = "FLAT"
-
-    cmf_window = min(20, len(completed_volume))
-    if cmf_window > 0 and float(np.sum(completed_volume[-cmf_window:])) > 0:
-        window_high = completed_high[-cmf_window:]
-        window_low = completed_low[-cmf_window:]
-        window_close = completed_close[-cmf_window:]
-        window_volume = completed_volume[-cmf_window:]
-        window_range = window_high - window_low
-        multiplier = np.divide(
-            ((window_close - window_low) - (window_high - window_close)),
-            window_range,
-            out=np.zeros_like(window_close, dtype=float),
-            where=window_range > 0,
-        )
-        cmf_20 = round(float(np.sum(multiplier * window_volume) / np.sum(window_volume)), 3)
-    else:
-        cmf_20 = None
-    if cmf_20 is None:
-        volume_pressure = "UNAVAILABLE"
-    elif cmf_20 > 0.1:
-        volume_pressure = "ACCUMULATION"
-    elif cmf_20 < -0.1:
-        volume_pressure = "DISTRIBUTION"
-    else:
-        volume_pressure = "BALANCED"
-    range_window = min(252, len(c))
-    range_low = float(np.min(l[-range_window:]))
-    range_high = float(np.max(h[-range_window:]))
-    range_position_pct = round(
-        (last_close - range_low) / (range_high - range_low) * 100, 1
-    ) if range_high > range_low else 50.0
-
-    # Use the prior bar so candlestick evidence never depends on a forming candle.
-    candle_patterns = []
-    completed_index = len(df) - 2
-    if completed_index >= 1:
-        previous_bar = df.iloc[completed_index - 1]
-        completed_bar = df.iloc[completed_index]
-        candle_open = float(completed_bar["open"])
-        candle_high = float(completed_bar["high"])
-        candle_low = float(completed_bar["low"])
-        candle_close = float(completed_bar["close"])
-        previous_open = float(previous_bar["open"])
-        previous_close = float(previous_bar["close"])
-        candle_range = max(candle_high - candle_low, 1e-9)
-        candle_body = abs(candle_close - candle_open)
-        upper_wick = candle_high - max(candle_open, candle_close)
-        lower_wick = min(candle_open, candle_close) - candle_low
-
-        def _record_pattern(name: str, direction: str):
-            pattern_time = df.index[completed_index]
-            candle_patterns.append({
-                "name": name,
-                "direction": direction,
-                "bar_time": pattern_time.isoformat() if hasattr(pattern_time, "isoformat") else str(pattern_time),
-                "open": round(candle_open, 2),
-                "high": round(candle_high, 2),
-                "low": round(candle_low, 2),
-                "close": round(candle_close, 2),
-            })
-
-        bullish_engulfing = (
-            previous_close < previous_open and candle_close > candle_open
-            and candle_open <= previous_close and candle_close >= previous_open
-        )
-        bearish_engulfing = (
-            previous_close > previous_open and candle_close < candle_open
-            and candle_open >= previous_close and candle_close <= previous_open
-        )
-        if bullish_engulfing:
-            _record_pattern("Bullish engulfing", "BULLISH")
-        if bearish_engulfing:
-            _record_pattern("Bearish engulfing", "BEARISH")
-        if lower_wick >= max(candle_body * 2, candle_range * 0.45) and upper_wick <= candle_range * 0.2:
-            _record_pattern("Hammer", "BULLISH")
-        if upper_wick >= max(candle_body * 2, candle_range * 0.45) and lower_wick <= candle_range * 0.2:
-            _record_pattern("Shooting star", "BEARISH")
-        if candle_body <= candle_range * 0.1:
-            _record_pattern("Doji", "NEUTRAL")
-        if completed_index >= 2:
-            first_bar = df.iloc[completed_index - 2]
-            first_open = float(first_bar["open"])
-            first_close = float(first_bar["close"])
-            first_body = abs(first_close - first_open)
-            middle_body = abs(previous_close - previous_open)
-            first_midpoint = (first_open + first_close) / 2
-            morning_star = (
-                first_close < first_open and middle_body <= first_body * 0.5
-                and candle_close > candle_open and candle_close >= first_midpoint
-            )
-            evening_star = (
-                first_close > first_open and middle_body <= first_body * 0.5
-                and candle_close < candle_open and candle_close <= first_midpoint
-            )
-            if morning_star:
-                _record_pattern("Morning star", "BULLISH")
-            if evening_star:
-                _record_pattern("Evening star", "BEARISH")
-
-    # --- Golden Cross / Death Cross Detection ---
-    golden_cross = None
-    if ma50 is not None and ma200 is not None and len(c) >= 201:
-        # Check last 20 bars for a crossing event
-        ma50_arr = np.array([float(np.mean(c[max(0, i-49):i+1])) for i in range(max(0, len(c)-20), len(c))])
-        ma200_arr = np.array([float(np.mean(c[max(0, i-199):i+1])) for i in range(max(0, len(c)-20), len(c))])
-        for j in range(1, len(ma50_arr)):
-            if ma50_arr[j] > ma200_arr[j] and ma50_arr[j-1] <= ma200_arr[j-1]:
-                golden_cross = {"type": "Golden Cross", "bars_ago": len(ma50_arr) - 1 - j,
-                                "detail": f"50 SMA crossed above 200 SMA {len(ma50_arr) - 1 - j} bars ago — bullish"}
-            elif ma50_arr[j] < ma200_arr[j] and ma50_arr[j-1] >= ma200_arr[j-1]:
-                golden_cross = {"type": "Death Cross", "bars_ago": len(ma50_arr) - 1 - j,
-                                "detail": f"50 SMA crossed below 200 SMA {len(ma50_arr) - 1 - j} bars ago — bearish"}
-        # Also check current relative position if no recent cross
-        if golden_cross is None:
-            if ma50 > ma200:
-                golden_cross = {"type": "Above (Bullish)", "bars_ago": None,
-                                "detail": "50 SMA above 200 SMA — bullish structure, no recent cross"}
-            else:
-                golden_cross = {"type": "Below (Bearish)", "bars_ago": None,
-                                "detail": "50 SMA below 200 SMA — bearish structure, no recent cross"}
-
-    # --- Confirmation-timeframe EMAs for multi-timeframe agreement ---
-    confirm_ema8 = None
-    confirm_ema21 = None
-    confirm_ema_alignment = None
-    if df_confirm is not None and len(df_confirm) >= 21:
-        ch = df_confirm["close"].values.astype(float)
-        h_ema8 = _ema(ch, 8)
-        h_ema21 = _ema(ch, 21)
-        confirm_ema8 = round(float(h_ema8[-1]), 2)
-        confirm_ema21 = round(float(h_ema21[-1]), 2)
-        if h_ema8[-1] > h_ema21[-1]:
-            confirm_ema_alignment = "Bullish"
-        elif h_ema8[-1] < h_ema21[-1]:
-            confirm_ema_alignment = "Bearish"
-        else:
-            confirm_ema_alignment = "Neutral"
+    candle_patterns = detect_setup_candlesticks(df)
+    golden_cross = detect_golden_cross(technicals)
+    confirmation = compute_ema_confirmation(df_confirm)
+    confirm_ema8 = confirmation.ema8
+    confirm_ema21 = confirmation.ema21
+    confirm_ema_alignment = confirmation.alignment
 
     # --- Level Retest Detection ---
     # Collect key levels to check for retests
@@ -2572,62 +2654,9 @@ async def _compute_trade_setup(ticker: str, interval: str = "1d",
             for ft in tgt_list[:3]:
                 key_levels.append({"price": ft.get("price", 0), "name": f'Fib {ft.get("level", "?")}', "source": "Fibonacci"})
 
-    # Detect retests on daily timeframe (last 5 candles)
-    def _detect_retests(close_arr, high_arr, low_arr, levels, lookback=5, tolerance_pct=0.5):
-        """
-        Check if any of the last `lookback` candles retested a key level.
-        A retest = the candle's high or low came within tolerance_pct of the level.
-        Returns list of retest events with candle highs/lows.
-        """
-        retests = []
-        n = len(close_arr)
-        if n < lookback:
-            lookback = n
-        seen_levels = set()
-        for i in range(n - lookback, n):
-            candle_high = float(high_arr[i])
-            candle_low = float(low_arr[i])
-            candle_close = float(close_arr[i])
-            for lv in levels:
-                lvl_price = lv["price"]
-                if lvl_price <= 0:
-                    continue
-                tol = lvl_price * tolerance_pct / 100
-                level_key = f'{lv["name"]}_{lvl_price:.2f}'
-                if level_key in seen_levels:
-                    continue
-                touched = False
-                touch_type = ""
-                # Did the candle wick touch the level?
-                if abs(candle_low - lvl_price) <= tol:
-                    touched = True
-                    touch_type = "Low touched"
-                elif abs(candle_high - lvl_price) <= tol:
-                    touched = True
-                    touch_type = "High touched"
-                elif candle_low <= lvl_price <= candle_high:
-                    touched = True
-                    touch_type = "Pierced"
-                if touched:
-                    # Did price bounce (close away from level)?
-                    bounce_pct = round((candle_close - lvl_price) / lvl_price * 100, 2)
-                    held = abs(bounce_pct) >= 0.1  # closed at least 0.1% away
-                    seen_levels.add(level_key)
-                    retests.append({
-                        "level_name": lv["name"],
-                        "level_price": round(lvl_price, 2),
-                        "source": lv["source"],
-                        "candle_high": round(candle_high, 2),
-                        "candle_low": round(candle_low, 2),
-                        "candle_close": round(candle_close, 2),
-                        "touch_type": touch_type,
-                        "held": held,
-                        "bounce_pct": bounce_pct,
-                        "bars_ago": n - 1 - i,
-                    })
-        return retests
-
-    primary_retests = _detect_retests(c, h, l, key_levels, lookback=5, tolerance_pct=0.5)
+    primary_retests = detect_level_retests(
+        c, h, l, key_levels, lookback=5, tolerance_pct=0.5
+    )
 
     # Detect retests on the confirmation timeframe
     confirm_retests = []
@@ -2635,526 +2664,67 @@ async def _compute_trade_setup(ticker: str, interval: str = "1d",
         ch = df_confirm["close"].values.astype(float)
         hh = df_confirm["high"].values.astype(float)
         lh = df_confirm["low"].values.astype(float)
-        confirm_retests = _detect_retests(ch, hh, lh, key_levels, lookback=10, tolerance_pct=0.3)
-
-    # --- Momentum Assessment ---
-    if ma50 and ma200:
-        if last_close > ma50 and ma50 > ma200:
-            momentum = "Strong Uptrend"
-            momentum_detail = "Price > 50MA > 200MA — full bullish alignment"
-        elif last_close > ma50 and ma50 < ma200:
-            momentum = "Recovery"
-            momentum_detail = "Price above 50MA but 50MA still below 200MA — early recovery or bear rally"
-        elif last_close < ma50 and ma50 > ma200:
-            momentum = "Weakening"
-            momentum_detail = "Price fell below 50MA but MAs still bullish — pullback or trend break starting"
-        elif last_close < ma50 and ma50 < ma200:
-            momentum = "Strong Downtrend"
-            momentum_detail = "Price < 50MA < 200MA — full bearish alignment"
-        else:
-            momentum = "Sideways"
-            momentum_detail = "MAs tangled — no clear directional trend"
-    elif ma50:
-        momentum = "Uptrend" if last_close > ma50 else "Downtrend"
-        momentum_detail = f"Price {'above' if last_close > ma50 else 'below'} 50MA (insufficient data for 200MA)"
-    else:
-        momentum = "Insufficient Data"
-        momentum_detail = "Not enough history to assess trend structure"
-
-    # Refine with RSI
-    if rsi < 30:
-        rsi_state = "Oversold"
-    elif rsi > 70:
-        rsi_state = "Overbought"
-    elif rsi < 40:
-        rsi_state = "Weak"
-    elif rsi > 60:
-        rsi_state = "Strong"
-    else:
-        rsi_state = "Neutral"
-
-    # Trend consistency (directional days / 14)
-    up_days = sum(1 for i in range(-14, 0) if c[i] > c[i-1]) if len(c) >= 15 else 0
-    trend_consistency = round(max(up_days, 14 - up_days) / 14 * 100, 0)
-
-    # --- Direction Bias ---
-    bull_signals = 0
-    bear_signals = 0
-    signal_reasons = []
-
-    # MA signals
-    if ma:
-        if ma["signal"] in ("Bullish Crossover", "Recent Bullish", "Above MA"):
-            bull_signals += 2 if "Crossover" in ma["signal"] else 1
-            signal_reasons.append(f'MA: {ma["signal"]} ({ma.get("days_since_cross", "?")}d ago)')
-        elif ma["signal"] in ("Bearish Crossover", "Recent Bearish", "Below MA"):
-            bear_signals += 2 if "Crossover" in ma["signal"] else 1
-            signal_reasons.append(f'MA: {ma["signal"]} ({ma.get("days_since_cross", "?")}d ago)')
-        # Higher-timeframe alignment bonus: weekly for daily setups, daily for hourly.
-        higher_timeframe_signal = ma.get("weekly_signal")
-        if interval not in ("1wk", "1mo"):
-            if higher_timeframe_signal in ("W-Above", "W-Bullish Cross", "D-Above", "D-Bullish Cross"):
-                bull_signals += 1
-                signal_reasons.append(f'Higher timeframe: {higher_timeframe_signal}')
-            elif higher_timeframe_signal in ("W-Below", "W-Bearish Cross", "D-Below", "D-Bearish Cross"):
-                bear_signals += 1
-                signal_reasons.append(f'Higher timeframe: {higher_timeframe_signal}')
-
-    # EMA alignment signal
-    if ema_bullish_stack:
-        bull_signals += 1
-        signal_reasons.append("EMA Stack: 8 > 21 > 50 (bullish alignment)")
-    elif ema_bearish_stack:
-        bear_signals += 1
-        signal_reasons.append("EMA Stack: 8 < 21 < 50 (bearish alignment)")
-
-    # Price vs 8 EMA (immediate momentum)
-    if last_close > ema8[-1] * 1.005:
-        bull_signals += 1
-        signal_reasons.append(f"Price above 8 EMA by {dist_to_8ema}%")
-    elif last_close < ema8[-1] * 0.995:
-        bear_signals += 1
-        signal_reasons.append(f"Price below 8 EMA by {abs(dist_to_8ema)}%")
-
-    # VWAP bias
-    if last_close > vwap:
-        bull_signals += 1
-        signal_reasons.append(f"Price above VWAP(20) ${vwap}")
-    else:
-        bear_signals += 1
-        signal_reasons.append(f"Price below VWAP(20) ${vwap}")
-
-    # Multi-timeframe EMA alignment (confirmation timeframe matches primary = stronger signal)
-    if confirm_ema_alignment:
-        if confirm_ema_alignment == "Bullish" and ema_alignment in ("Bullish Stack", "Short-term Bullish"):
-            bull_signals += 1
-            signal_reasons.append(f"Multi-TF: {confirm_interval} 8/21 EMA aligns bullish with {interval}")
-        elif confirm_ema_alignment == "Bearish" and ema_alignment in ("Bearish Stack", "Short-term Bearish"):
-            bear_signals += 1
-            signal_reasons.append(f"Multi-TF: {confirm_interval} 8/21 EMA aligns bearish with {interval}")
-
-    # Only qualified non-Fibonacci level families contribute directional votes.
-    # Fibonacci retests remain available below as structural context.
-    for rt in primary_retests:
-        if rt["held"] and rt["bounce_pct"] > 0 and rt["source"] in ("Moving Average", "Gap", "FVG"):
-            bull_signals += 1
-            signal_reasons.append(f'Retest Held: {rt["level_name"]} (${rt["level_price"]}, bounced +{rt["bounce_pct"]}%)')
-            break  # Count only 1 retest signal
-    for rt in primary_retests:
-        if rt["held"] and rt["bounce_pct"] < 0 and rt["source"] in ("Moving Average", "Gap", "FVG"):
-            bear_signals += 1
-            signal_reasons.append(f'Retest Rejected: {rt["level_name"]} (${rt["level_price"]}, rejected {rt["bounce_pct"]}%)')
-            break
-
-    # Momentum pullback (bullish signal)
-    if pullback:
-        grade = pullback.get("grade", "C")
-        bull_signals += 2 if grade in ("A+", "A") else 1
-        signal_reasons.append(f'Momentum Pullback: Grade {grade} (score {pullback.get("score", 0)})')
-
-    # Bearish bounce (bearish signal)
-    if bounce:
-        grade = bounce.get("grade", "C")
-        bear_signals += 2 if grade in ("A+", "A") else 1
-        signal_reasons.append(f'Bearish Bounce: Grade {grade} (score {bounce.get("score", 0)})')
-
-    # Gap support/resistance
-    support_gaps = [g for g in gaps if "Support" in g.get("gap_type", "")]
-    resistance_gaps = [g for g in gaps if "Resistance" in g.get("gap_type", "")]
-    if support_gaps:
-        bull_signals += 1
-        nearest = min(support_gaps, key=lambda g: abs(g["last_close"] - g["gap_high"]))
-        signal_reasons.append(f'Gap Support: ${nearest["gap_low"]:.2f}–${nearest["gap_high"]:.2f}')
-    if resistance_gaps:
-        bear_signals += 1
-        nearest = min(resistance_gaps, key=lambda g: abs(g["last_close"] - g["gap_low"]))
-        signal_reasons.append(f'Gap Resistance: ${nearest["gap_low"]:.2f}–${nearest["gap_high"]:.2f}')
-
-    # FVG signals
-    bull_fvgs = [f for f in fvgs if f.get("fvg_type") == "Bullish FVG" and f.get("status") == "Unmitigated"]
-    bear_fvgs = [f for f in fvgs if f.get("fvg_type") == "Bearish FVG" and f.get("status") == "Unmitigated"]
-    if bull_fvgs:
-        bull_signals += 1
-        signal_reasons.append(f'Bullish FVGs: {len(bull_fvgs)} unmitigated demand zone(s)')
-    if bear_fvgs:
-        bear_signals += 1
-        signal_reasons.append(f'Bearish FVGs: {len(bear_fvgs)} unmitigated supply zone(s)')
-
-    # Price zones as levels, so the UI never has to fall back to bare counts.
-    zones = []
-    for g in sorted(support_gaps, key=lambda g: abs(g["last_close"] - g["gap_high"]))[:3]:
-        zones.append({"name": "Gap support", "low": round(float(g["gap_low"]), 2),
-                      "high": round(float(g["gap_high"]), 2), "source": "Gap",
-                      "qualifier": g.get("gap_type", "")})
-    for g in sorted(resistance_gaps, key=lambda g: abs(g["last_close"] - g["gap_low"]))[:3]:
-        zones.append({"name": "Gap resistance", "low": round(float(g["gap_low"]), 2),
-                      "high": round(float(g["gap_high"]), 2), "source": "Gap",
-                      "qualifier": g.get("gap_type", "")})
-    for f in sorted(bull_fvgs, key=lambda f: abs(last_close - f["fvg_high"]))[:3]:
-        zones.append({"name": "FVG demand zone", "low": round(float(f["fvg_low"]), 2),
-                      "high": round(float(f["fvg_high"]), 2), "source": "FVG",
-                      "qualifier": "Unmitigated"})
-    for f in sorted(bear_fvgs, key=lambda f: abs(last_close - f["fvg_low"]))[:3]:
-        zones.append({"name": "FVG supply zone", "low": round(float(f["fvg_low"]), 2),
-                      "high": round(float(f["fvg_high"]), 2), "source": "FVG",
-                      "qualifier": "Unmitigated"})
-    zones.extend(volume_pivot_zones)
-
-    # RSI tilt
-    if rsi < 35:
-        bull_signals += 1
-        signal_reasons.append(f'RSI: {rsi} (oversold — bounce potential)')
-    elif rsi > 65:
-        bear_signals += 1
-        signal_reasons.append(f'RSI: {rsi} (overbought — pullback risk)')
-
-    # Golden / Death Cross signal
-    if golden_cross:
-        if golden_cross["type"] == "Golden Cross":
-            bull_signals += 2
-            signal_reasons.append(f'Golden Cross: {golden_cross["detail"]}')
-        elif golden_cross["type"] == "Death Cross":
-            bear_signals += 2
-            signal_reasons.append(f'Death Cross: {golden_cross["detail"]}')
-
-    total_signals = bull_signals + bear_signals
-    if total_signals == 0:
-        direction = "Neutral"
-        conviction = "None"
-    elif bull_signals > bear_signals:
-        ratio = bull_signals / total_signals
-        direction = "Bullish"
-        conviction = "High" if ratio >= 0.75 else "Moderate" if ratio >= 0.6 else "Low"
-    elif bear_signals > bull_signals:
-        ratio = bear_signals / total_signals
-        direction = "Bearish"
-        conviction = "High" if ratio >= 0.75 else "Moderate" if ratio >= 0.6 else "Low"
-    else:
-        direction = "Neutral"
-        conviction = "Conflicted"
-
-    # --- Entry Criteria ---
-    entries = []
-    if direction == "Bullish":
-        # EMA retest entry
-        if abs(dist_to_8ema) < 0.5:
-            entries.append({
-                "strategy": "8 EMA Retest",
-                "condition": f"Price at 8 EMA (${ema8_val}) — pullback entry in trend",
-                "price_zone": f"${ema8_val}",
-                "zone_low": ema8_val,
-                "zone_high": ema8_val,
-                "strength": "Strong" if ema_bullish_stack else "Moderate",
-            })
-        elif abs(dist_to_21ema) < 0.8:
-            entries.append({
-                "strategy": "21 EMA Retest",
-                "condition": f"Price near 21 EMA (${ema21_val}) — deeper pullback entry",
-                "price_zone": f"${ema21_val}",
-                "zone_low": ema21_val,
-                "zone_high": ema21_val,
-                "strength": "Strong" if ema_bullish_stack else "Moderate",
-            })
-        if pullback and pullback.get("grade") in ("A+", "A", "B+"):
-            entries.append({
-                "strategy": "Momentum Pullback",
-                "condition": f'Stoch %K at {pullback.get("stoch_k", "?")} (oversold in uptrend)',
-                "price_zone": f'Near EMA21 ~${pullback.get("ema21", 0):.2f}' if pullback.get("ema21") else "Near EMA21",
-                "zone_low": round(float(pullback["ema21"]), 2) if pullback.get("ema21") else None,
-                "zone_high": round(float(pullback["ema21"]), 2) if pullback.get("ema21") else None,
-                "strength": pullback.get("grade", "?"),
-            })
-        if bull_fvgs:
-            nearest_fvg = max(bull_fvgs, key=lambda f: f["fvg_low"])
-            entries.append({
-                "strategy": "FVG Demand Zone",
-                "condition": f'Price enters ${nearest_fvg["fvg_low"]:.2f}–${nearest_fvg["fvg_high"]:.2f}',
-                "price_zone": f'${nearest_fvg["fvg_low"]:.2f}–${nearest_fvg["fvg_high"]:.2f}',
-                "zone_low": round(float(nearest_fvg["fvg_low"]), 2),
-                "zone_high": round(float(nearest_fvg["fvg_high"]), 2),
-                "strength": "Unmitigated" if nearest_fvg.get("trend_aligned") else "Counter-trend",
-            })
-        if support_gaps:
-            nearest_gap = min(support_gaps, key=lambda g: abs(g["last_close"] - g["gap_high"]))
-            entries.append({
-                "strategy": "Gap Support",
-                "condition": f'Price tests gap zone at ${nearest_gap["gap_low"]:.2f}–${nearest_gap["gap_high"]:.2f}',
-                "price_zone": f'${nearest_gap["gap_low"]:.2f}–${nearest_gap["gap_high"]:.2f}',
-                "zone_low": round(float(nearest_gap["gap_low"]), 2),
-                "zone_high": round(float(nearest_gap["gap_high"]), 2),
-                "strength": "Unfilled" if "Unfilled" in nearest_gap.get("gap_type", "") else "Filled retest",
-            })
-        if fib and fib.get("trend_direction") == "uptrend_retracement":
-            fib_targets = fib.get("support_targets", [])
-            if fib_targets:
-                nearest_fib = fib_targets[0]
-                entries.append({
-                    "strategy": "Fibonacci Support",
-                    "condition": f'Near {nearest_fib.get("level", "?")} at ${nearest_fib.get("price", 0):.2f}',
-                    "price_zone": f'${nearest_fib.get("price", 0):.2f}',
-                    "zone_low": round(float(nearest_fib.get("price", 0)), 2),
-                    "zone_high": round(float(nearest_fib.get("price", 0)), 2),
-                    "strength": nearest_fib.get("level", "?"),
-                })
-    elif direction == "Bearish":
-        # EMA rejection entry
-        if abs(dist_to_8ema) < 0.5:
-            entries.append({
-                "strategy": "8 EMA Rejection",
-                "condition": f"Price at 8 EMA (${ema8_val}) — rejection/short entry in downtrend",
-                "price_zone": f"${ema8_val}",
-                "zone_low": ema8_val,
-                "zone_high": ema8_val,
-                "strength": "Strong" if ema_bearish_stack else "Moderate",
-            })
-        elif abs(dist_to_21ema) < 0.8:
-            entries.append({
-                "strategy": "21 EMA Rejection",
-                "condition": f"Price near 21 EMA (${ema21_val}) — deeper bounce rejection",
-                "price_zone": f"${ema21_val}",
-                "zone_low": ema21_val,
-                "zone_high": ema21_val,
-                "strength": "Strong" if ema_bearish_stack else "Moderate",
-            })
-        if bounce and bounce.get("grade") in ("A+", "A", "B+"):
-            entries.append({
-                "strategy": "Bearish Bounce",
-                "condition": f'Stoch %K at {bounce.get("stoch_k", "?")} (overbought in downtrend)',
-                "price_zone": f'Near EMA21 ~${bounce.get("ema21", 0):.2f}' if bounce.get("ema21") else "Near EMA21",
-                "zone_low": round(float(bounce["ema21"]), 2) if bounce.get("ema21") else None,
-                "zone_high": round(float(bounce["ema21"]), 2) if bounce.get("ema21") else None,
-                "strength": bounce.get("grade", "?"),
-            })
-        if bear_fvgs:
-            nearest_fvg = min(bear_fvgs, key=lambda f: f["fvg_high"])
-            entries.append({
-                "strategy": "FVG Supply Zone",
-                "condition": f'Price enters ${nearest_fvg["fvg_low"]:.2f}–${nearest_fvg["fvg_high"]:.2f}',
-                "price_zone": f'${nearest_fvg["fvg_low"]:.2f}–${nearest_fvg["fvg_high"]:.2f}',
-                "zone_low": round(float(nearest_fvg["fvg_low"]), 2),
-                "zone_high": round(float(nearest_fvg["fvg_high"]), 2),
-                "strength": "Unmitigated" if nearest_fvg.get("trend_aligned") else "Counter-trend",
-            })
-        if resistance_gaps:
-            nearest_gap = min(resistance_gaps, key=lambda g: abs(g["last_close"] - g["gap_low"]))
-            entries.append({
-                "strategy": "Gap Resistance",
-                "condition": f'Price tests gap zone at ${nearest_gap["gap_low"]:.2f}–${nearest_gap["gap_high"]:.2f}',
-                "price_zone": f'${nearest_gap["gap_low"]:.2f}–${nearest_gap["gap_high"]:.2f}',
-                "zone_low": round(float(nearest_gap["gap_low"]), 2),
-                "zone_high": round(float(nearest_gap["gap_high"]), 2),
-                "strength": "Unfilled" if "Unfilled" in nearest_gap.get("gap_type", "") else "Filled retest",
-            })
-        if fib and fib.get("trend_direction") == "downtrend_retracement":
-            fib_targets = fib.get("resistance_targets", [])
-            if fib_targets:
-                nearest_fib = fib_targets[0]
-                entries.append({
-                    "strategy": "Fibonacci Resistance",
-                    "condition": f'Near {nearest_fib.get("level", "?")} at ${nearest_fib.get("price", 0):.2f}',
-                    "price_zone": f'${nearest_fib.get("price", 0):.2f}',
-                    "zone_low": round(float(nearest_fib.get("price", 0)), 2),
-                    "zone_high": round(float(nearest_fib.get("price", 0)), 2),
-                    "strength": nearest_fib.get("level", "?"),
-                })
-
-    # Add retest-based entries (any direction)
-    for rt in primary_retests[:2]:
-        if rt["held"] and rt["bars_ago"] <= 2:
-            rt_dir = "bounced" if rt["bounce_pct"] > 0 else "rejected"
-            entries.append({
-                "strategy": f"Level Retest ({rt['source']})",
-                "condition": f'{rt["level_name"]} at ${rt["level_price"]} — {rt["touch_type"]}, {rt_dir} {abs(rt["bounce_pct"])}%',
-                "price_zone": f'H:${rt["candle_high"]} / L:${rt["candle_low"]}',
-                "zone_low": rt["level_price"],
-                "zone_high": rt["level_price"],
-                "strength": "Strong" if abs(rt["bounce_pct"]) > 0.5 else "Moderate",
-            })
-
-    # --- Exit / Target Levels ---
-    targets = []
-    stops = []
-    if fib:
-        for rt in fib.get("resistance_targets", [])[:2]:
-            targets.append({"level": rt.get("level", "?"), "price": round(rt.get("price", 0), 2), "source": "Fibonacci"})
-        for st in fib.get("support_targets", [])[:2]:
-            stops.append({"level": st.get("level", "?"), "price": round(st.get("price", 0), 2), "source": "Fibonacci"})
-        for ext in fib.get("upside_extensions", []):
-            targets.append({"level": ext.get("level", "?"), "price": round(ext.get("price", 0), 2), "source": "Fib Extension"})
-    if resistance_gaps:
-        nearest_res = min(resistance_gaps, key=lambda g: abs(g["last_close"] - g["gap_low"]))
-        targets.append({"level": "Gap Resistance", "price": round(nearest_res["gap_low"], 2), "source": "Gap"})
-    if support_gaps:
-        nearest_sup = min(support_gaps, key=lambda g: abs(g["last_close"] - g["gap_high"]))
-        stops.append({"level": "Gap Support", "price": round(nearest_sup["gap_low"], 2), "source": "Gap"})
-
-    # Preserve known price barriers before considering synthetic ATR levels.
-    prior_bar_count = min(252, len(h) - 1)
-    if prior_bar_count > 0:
-        prior_slice = slice(-(prior_bar_count + 1), -1)
-        prior_high = float(np.max(h[prior_slice]))
-        prior_low = float(np.min(l[prior_slice]))
-        range_label = (
-            "52-Week" if interval == "1d" else
-            f"{prior_bar_count}-Month" if interval == "1mo" else
-            f"{prior_bar_count}-Week" if interval == "1wk" else
-            f"{prior_bar_count}-Bar"
+        confirm_retests = detect_level_retests(
+            ch, hh, lh, key_levels, lookback=10, tolerance_pct=0.3
         )
-        if prior_high > last_close:
-            targets.append({"level": f"Prior {range_label} High", "price": round(prior_high, 2), "source": "Price Action"})
-        if prior_low < last_close:
-            stops.append({"level": f"Prior {range_label} Low", "price": round(prior_low, 2), "source": "Price Action"})
 
-    # ATR-based stops/targets
-    targets.append({"level": "ATR Target (2R)", "price": round(last_close + 2 * atr14, 2), "source": "ATR"})
-    stops.append({"level": "ATR Stop (1R)", "price": round(last_close - atr14, 2), "source": "ATR"})
+    momentum_assessment = assess_momentum(technicals)
+    momentum = momentum_assessment["state"]
+    momentum_detail = momentum_assessment["detail"]
 
-    # --- Key stop levels (curated — only crucial indicators) ---
-    # Nearest significant MA/EMA below price (pick closest one from each group)
-    ema_below = [(v, n) for v, n in [(ema8_val, "8 EMA"), (ema21_val, "21 EMA"), (ema50_ema, "50 EMA")] if v < last_close]
-    if ema_below:
-        nearest_ema = max(ema_below, key=lambda x: x[0])  # closest below = highest value
-        stops.append({"level": nearest_ema[1], "price": nearest_ema[0], "source": "EMA"})
+    direction_composition = compose_setup_direction(
+        interval=interval,
+        technicals=technicals,
+        confirmation=confirmation,
+        confirmation_interval=confirm_interval,
+        primary_retests=primary_retests,
+        moving_average=ma,
+        momentum_pullback=pullback,
+        bearish_bounce=bounce,
+        gaps=gaps,
+        fair_value_gaps=fvgs,
+        golden_cross=golden_cross,
+        volume_pivot_zones=volume_pivot_zones,
+    )
+    direction = direction_composition.direction
+    conviction = direction_composition.conviction
+    bull_signals = direction_composition.bull_signals
+    bear_signals = direction_composition.bear_signals
+    signal_reasons = list(direction_composition.signal_reasons)
+    support_gaps = list(direction_composition.support_gaps)
+    resistance_gaps = list(direction_composition.resistance_gaps)
+    bull_fvgs = list(direction_composition.bull_fvgs)
+    bear_fvgs = list(direction_composition.bear_fvgs)
+    zones = list(direction_composition.zones)
 
-    sma_below = [(v, n) for v, n in [(ma50, "50 SMA"), (ma200, "200 SMA")] if v and v < last_close]
-    if sma_below:
-        nearest_sma = max(sma_below, key=lambda x: x[0])
-        stops.append({"level": nearest_sma[1], "price": round(nearest_sma[0], 2), "source": "SMA"})
+    trade_levels = compose_trade_levels(
+        interval=interval,
+        technicals=technicals,
+        direction=direction_composition,
+        primary_retests=primary_retests,
+        momentum_pullback=pullback,
+        bearish_bounce=bounce,
+        fibonacci=fib,
+    )
+    entries = list(trade_levels.entries)
+    targets = list(trade_levels.targets)
+    stops = list(trade_levels.stops)
 
-    # Most recent swing low only
-    swing_lookback = min(20, len(l) - 2)
-    for i in range(len(l) - 1, max(0, len(l) - swing_lookback) - 1, -1):
-        if i > 0 and i < len(l) - 1 and l[i] < l[i-1] and l[i] < l[i+1] and float(l[i]) < last_close:
-            stops.append({"level": f"Swing Low ({len(l) - 1 - i}b ago)", "price": round(float(l[i]), 2), "source": "Price Action"})
-            break  # only the most recent one
-
-    # VWAP only if it's meaningfully below price (> 0.5% away to avoid noise)
-    if vwap < last_close and (last_close - vwap) / vwap * 100 > 0.5:
-        stops.append({"level": "VWAP(20)", "price": vwap, "source": "VWAP"})
-
-    # De-duplicate stops by price
-    seen_prices = set()
-    unique_stops = []
-    for s in stops:
-        price_key = round(s["price"], 2)
-        if price_key not in seen_prices:
-            seen_prices.add(price_key)
-            unique_stops.append(s)
-    stops = unique_stops
-
-    # Sort targets ascending, stops descending
-    targets.sort(key=lambda t: t["price"])
-    stops.sort(key=lambda s: s["price"], reverse=True)
-
-    # --- Timing Assessment ---
-    if ma and ma.get("days_since_cross") is not None:
-        days_since = ma["days_since_cross"]
-        if days_since <= 3:
-            timing = "Immediate"
-            timing_detail = f'Fresh MA crossover {days_since}d ago — entry window open now'
-        elif days_since <= 7:
-            timing = "This Week"
-            timing_detail = f'Recent crossover {days_since}d ago — still early but monitor price action'
-        else:
-            timing = "Watchlist"
-            timing_detail = f'Crossover was {days_since}d ago — wait for pullback to MA or new catalyst'
-    elif any(rt["held"] and rt["bars_ago"] <= 1 for rt in primary_retests):
-        timing = "Immediate"
-        timing_detail = "Active level retest — price testing key level right now"
-    elif pullback and pullback.get("grade") in ("A+", "A"):
-        timing = "Immediate"
-        timing_detail = f'A-grade pullback setup active — optimal entry window'
-    elif bounce and bounce.get("grade") in ("A+", "A"):
-        timing = "Immediate"
-        timing_detail = f'A-grade bearish bounce active — optimal short window'
-    elif rsi < 30 or rsi > 70:
-        timing = "Near-term"
-        timing_detail = f'RSI at extreme ({rsi}) — mean reversion likely within 1–5 days'
-    elif abs(dist_to_8ema) < 0.3:
-        timing = "This Week"
-        timing_detail = f"Price hugging 8 EMA — decision point imminent"
-    else:
-        timing = "Watchlist"
-        timing_detail = "No immediate catalyst — add to watchlist and wait for entry trigger"
-
-    # --- Duration Estimate ---
-    if ma and ma.get("ma_spread_pct") is not None:
-        spread = abs(ma["ma_spread_pct"])
-        if spread >= 3:
-            duration = "Extended (weeks to months)"
-            duration_detail = f'Wide MA spread ({spread:.1f}%) — strong trend likely continues'
-        elif spread >= 1:
-            duration = "Medium (days to weeks)"
-            duration_detail = f'Moderate MA spread ({spread:.1f}%) — trend has room but watch for narrowing'
-        else:
-            duration = "Short (1–5 days)"
-            duration_detail = f'Narrow MA spread ({spread:.1f}%) — crossover or reversal imminent'
-    else:
-        duration = "Unknown"
-        duration_detail = "Insufficient MA data to estimate duration"
-
-    # --- Confluence Score ---
-    confluence_count = len(signal_reasons)
-    if confluence_count >= 7:
-        confluence_grade = "A+"
-    elif confluence_count >= 5:
-        confluence_grade = "A"
-    elif confluence_count >= 4:
-        confluence_grade = "B+"
-    elif confluence_count >= 3:
-        confluence_grade = "B"
-    elif confluence_count >= 2:
-        confluence_grade = "B-"
-    else:
-        confluence_grade = "C"
+    timing = compose_setup_timing(
+        technicals=technicals,
+        moving_average=ma,
+        primary_retests=primary_retests,
+        momentum_pullback=pullback,
+        bearish_bounce=bounce,
+    )
+    duration = compose_setup_duration(ma)
+    confluence = compose_setup_confluence(signal_reasons)
 
     result = {
         "ticker": ticker,
         "last_close": round(last_close, 2),
         "date": last_date,
-        "technicals": {
-            "rsi": rsi,
-            "rsi_state": rsi_state,
-            "stoch_k": stoch_k,
-            "atr": round(atr14, 2),
-            "atr_pct": atr_pct,
-            "ma10": round(ma10, 2) if ma10 else None,
-            "ma20": round(ma20, 2) if ma20 else None,
-            "ma50": round(ma50, 2) if ma50 else None,
-            "ma100": round(ma100, 2) if ma100 else None,
-            "ma200": round(ma200, 2) if ma200 else None,
-            "ema8": ema8_val,
-            "ema21": ema21_val,
-            "ema50": ema50_ema,
-            "vwap": vwap,
-            "price_vs_vwap": price_vs_vwap,
-            "dist_to_8ema": dist_to_8ema,
-            "dist_to_21ema": dist_to_21ema,
-            "trend_consistency": trend_consistency,
-            "macd": macd_value,
-            "macd_signal": macd_signal,
-            "macd_histogram": macd_histogram,
-            "macd_histogram_previous": macd_histogram_previous,
-            "macd_state": macd_state,
-            "adx": adx_value,
-            "plus_di": plus_di_value,
-            "minus_di": minus_di_value,
-            "historical_volatility_pct": historical_volatility_pct,
-            "historical_volatility_percentile": historical_volatility_percentile,
-            "historical_volatility_state": historical_volatility_state,
-            "relative_volume": relative_volume,
-            "volume_trend_ratio": round(volume_trend_ratio, 2) if volume_trend_ratio is not None else None,
-            "volume_trend_pct": volume_trend_pct,
-            "volume_trend_state": volume_trend_state,
-            "volume_slope": volume_slope,
-            "volume_slope_state": volume_slope_state,
-            "volume_sparkline": volume_sparkline,
-            "cmf_20": cmf_20,
-            "volume_pressure": volume_pressure,
-            "range_low": round(range_low, 2),
-            "range_high": round(range_high, 2),
-            "range_position_pct": range_position_pct,
-        },
+        "technicals": technicals.payload(),
         "candlestick_patterns": candle_patterns,
         "structural_patterns": structural_patterns,
         "ema_alignment": {
@@ -3190,57 +2760,16 @@ async def _compute_trade_setup(ticker: str, interval: str = "1d",
         "zones": zones,
         "targets": targets[:5],
         "stops": stops[:5],
-        "timing": {
-            "urgency": timing,
-            "detail": timing_detail,
-        },
-        "duration": {
-            "estimate": duration,
-            "detail": duration_detail,
-        },
-        "confluence": {
-            "grade": confluence_grade,
-            "count": confluence_count,
-        },
+        "timing": timing,
+        "duration": duration,
+        "confluence": confluence,
         "strategy_results": {
             "ma_crossover": {"signal": ma["signal"], "spread_pct": ma.get("ma_spread_pct"), "days_since_cross": ma.get("days_since_cross"), "weekly_signal": ma.get("weekly_signal"), "markers": ma.get("markers", [])} if ma else None,
             "momentum_pullback": {"grade": pullback.get("grade"), "score": pullback.get("score")} if pullback else None,
             "bearish_bounce": {"grade": bounce.get("grade"), "score": bounce.get("score")} if bounce else None,
             "gaps": {"support_count": len(support_gaps), "resistance_count": len(resistance_gaps)} if gaps else None,
             "fvg": {"bull_unmitigated": len(bull_fvgs), "bear_unmitigated": len(bear_fvgs), "total": len(fvgs)} if fvgs else None,
-            "fibonacci": {
-                "scoring_role": "structural_context_only",
-                "signal": fib.get("signal"),
-                "trend_direction": fib.get("trend_direction"),
-                "swing_basis": fib.get("swing_basis"),
-                "swing_detection_pct": fib.get("swing_detection_pct"),
-                "scope_bars": fib.get("scope_bars"),
-                "swing_high": fib.get("swing_high"),
-                "swing_low": fib.get("swing_low"),
-                "swing_high_date": fib.get("swing_high_date"),
-                "swing_low_date": fib.get("swing_low_date"),
-                "swing_size_pct": fib.get("swing_size_pct"),
-                "developing_pivot": fib.get("developing_pivot"),
-                "active_leg": fib.get("active_leg"),
-                "confirmed_legs": fib.get("confirmed_legs", []),
-                "nearest_level": fib.get("nearest_level"),
-                "nearest_level_price": fib.get("nearest_level_price"),
-                "distance_pct": fib.get("distance_pct"),
-                "retracement_pct": fib.get("retracement_pct"),
-                "progress_reached_pct": fib.get("progress_reached_pct"),
-                "progress_current_pct": fib.get("progress_current_pct"),
-                "target_kind": fib.get("target_kind"),
-                "retracement_levels": fib.get("retracement_levels", []),
-                "extension_levels": fib.get("extension_levels", []),
-                "target_levels": fib.get("target_levels", []),
-                "levels": [
-                    {"name": "23.6%", "price": fib.get("fib_236")},
-                    {"name": "38.2%", "price": fib.get("fib_382")},
-                    {"name": "50.0%", "price": fib.get("fib_500")},
-                    {"name": "61.8%", "price": fib.get("fib_618")},
-                    {"name": "78.6%", "price": fib.get("fib_786")},
-                ],
-            } if fib else None,
+            "fibonacci": compose_fibonacci_context(fib),
         }
     }
     # Survives caching, so the UI can show how old this read actually is.
@@ -3831,15 +3360,19 @@ async def ticker_discovery_state(ticker: str, limit: int = Query(default=30, ge=
 
 @app.get("/api/scanner-events/summary")
 async def scanner_event_summary(
-    interval: Optional[str] = Query(default=None, regex="^(1d|1wk|1h)$"),
+    interval: Optional[str] = Query(default=None, regex="^(1d|1wk|1h|30m)$"),
     discovery_state: Optional[str] = None,
     min_periods: int = Query(default=20, ge=1, le=1000),
 ):
     """Horizon-spaced scanner utility metrics. No result is a recommendation."""
     try:
-        from research.scanner_events import ensure_tables, event_summary
-        ensure_tables()
-        return {"results": event_summary(interval, discovery_state, min_periods)}
+        from equity.scanner_research import event_summary
+        return {
+            "results": event_summary(interval, discovery_state, min_periods),
+            "read_source": "CANONICAL_EQUITY_RESEARCH",
+        }
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Scanner event summary query failed")
         raise HTTPException(status_code=500, detail="Failed to load scanner event summary")
@@ -3847,14 +3380,13 @@ async def scanner_event_summary(
 
 @app.get("/api/scanner-events/qualification")
 async def scanner_event_qualification(
-    interval: Optional[str] = Query(default=None, regex="^(1d|1wk|1h)$"),
+    interval: Optional[str] = Query(default=None, regex="^(1d|1wk|1h|30m)$"),
 ):
     """Aggregate full-history qualification results. No result is a recommendation."""
     try:
-        from research.scanner_events import (
-            OUTCOME_ENTRY_MODEL, ensure_tables, qualification_report,
+        from equity.scanner_research import (
+            OUTCOME_ENTRY_MODEL, qualification_report,
         )
-        ensure_tables()
         results = qualification_report(interval)
         return {
             "entry_model": OUTCOME_ENTRY_MODEL,
@@ -3869,7 +3401,10 @@ async def scanner_event_qualification(
                 "maximum_expected_calibration_error": 0.05,
             },
             "results": results,
+            "read_source": "CANONICAL_EQUITY_RESEARCH",
         }
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Scanner qualification query failed")
         raise HTTPException(status_code=500, detail="Failed to load scanner qualification")
@@ -3879,9 +3414,11 @@ async def scanner_event_qualification(
 async def scanner_event_backlog():
     """Pending and evaluated event/horizon pairs."""
     try:
-        from research.scanner_events import ensure_tables, pending_outcome_counts
-        ensure_tables()
-        return {"results": pending_outcome_counts()}
+        from equity.scanner_research import pending_outcome_counts
+        return {
+            "results": pending_outcome_counts(),
+            "read_source": "CANONICAL_EQUITY_RESEARCH",
+        }
     except Exception:
         logger.exception("Scanner event backlog query failed")
         raise HTTPException(status_code=500, detail="Failed to load scanner event backlog")
@@ -3889,14 +3426,16 @@ async def scanner_event_backlog():
 
 @app.get("/api/scanner-events")
 async def scanner_events_endpoint(
-    interval: Optional[str] = Query(default=None, regex="^(1d|1wk|1h)$"),
+    interval: Optional[str] = Query(default=None, regex="^(1d|1wk|1h|30m)$"),
     limit: int = Query(default=100, ge=1, le=500),
 ):
     """Latest shadow scanner setup lifecycles and completed outcomes."""
     try:
-        from research.scanner_events import ensure_tables, recent_events
-        ensure_tables()
-        return {"results": recent_events(interval, limit)}
+        from equity.scanner_research import recent_events
+        return {
+            "results": recent_events(interval, limit),
+            "read_source": "CANONICAL_EQUITY_RESEARCH",
+        }
     except Exception:
         logger.exception("Scanner event list query failed")
         raise HTTPException(status_code=500, detail="Failed to load scanner events")
@@ -3904,7 +3443,7 @@ async def scanner_events_endpoint(
 
 @app.get("/api/scanner-events/latest-by-ticker")
 async def latest_ticker_scanner_signals(
-    interval: Optional[str] = Query(default=None, regex="^(1d|1wk|1h)$"),
+    interval: Optional[str] = Query(default=None, regex="^(1d|1wk|1h|30m)$"),
     limit: int = Query(default=500, ge=1, le=500),
     sessions: int = Query(default=10, ge=1, le=252),
     hourly_sessions: int = Query(default=2, ge=1, le=30),
@@ -3912,9 +3451,11 @@ async def latest_ticker_scanner_signals(
     """Latest observed scanner signal per ticker, within the last `sessions` daily/weekly sessions
     or `hourly_sessions` days for hourly signals."""
     try:
-        from research.scanner_events import ensure_tables, latest_ticker_signals
-        ensure_tables()
-        return {"results": latest_ticker_signals(interval, limit, sessions, hourly_sessions)}
+        from equity.scanner_research import latest_ticker_signals
+        return {
+            "results": latest_ticker_signals(interval, limit, sessions, hourly_sessions),
+            "read_source": "CANONICAL_EQUITY_RESEARCH",
+        }
     except Exception:
         logger.exception("Latest ticker scanner signals query failed")
         raise HTTPException(status_code=500, detail="Failed to load latest ticker scanner signals")
@@ -3927,8 +3468,13 @@ async def scanner_sector_performance(
     """Equal-weight sector performance over 1, 5, 10, or 21 sessions."""
     if sessions not in (1, 5, 10, 21):
         raise HTTPException(status_code=422, detail="sessions must be 1, 5, 10, or 21")
+    if MATERIALIZED_PORTAL_SNAPSHOTS_ENABLED:
+        return {
+            "sessions": sessions,
+            "results": _portal_snapshot_payload(f"SECTOR_PERFORMANCE_{sessions}"),
+        }
     try:
-        from research.scanner_events import latest_sector_performance
+        from equity.sector_research import latest_sector_performance
         return {"sessions": sessions, "results": latest_sector_performance(sessions)}
     except Exception:
         logger.exception("Scanner sector performance query failed")
@@ -3938,8 +3484,10 @@ async def scanner_sector_performance(
 @app.get("/api/sector-intelligence")
 async def sector_intelligence_endpoint(leader_limit: int = Query(default=5, ge=1, le=20)):
     """Sector rollup: rotation across horizons, discovery-state mix, and cross-sectional skew."""
+    if MATERIALIZED_PORTAL_SNAPSHOTS_ENABLED and leader_limit == 5:
+        return _portal_snapshot_payload("SECTOR_INTELLIGENCE")
     try:
-        from research.scanner_events import sector_intelligence
+        from equity.sector_research import sector_intelligence
         return sector_intelligence(leader_limit)
     except Exception:
         logger.exception("Sector intelligence query failed")
@@ -3955,13 +3503,13 @@ async def ticker_scanner_events(
 ):
     """Scanner lifecycles from recent daily/weekly and hourly session windows."""
     try:
-        from research.scanner_events import ensure_tables, ticker_events
-        ensure_tables()
+        from equity.scanner_research import ticker_events
         return {
             "ticker": ticker.upper(),
             "daily_sessions": daily_sessions,
             "hourly_sessions": hourly_sessions,
             "events": ticker_events(ticker, limit, daily_sessions, hourly_sessions),
+            "read_source": "CANONICAL_EQUITY_RESEARCH",
         }
     except Exception:
         logger.exception("Ticker scanner event query failed | ticker=%s", ticker)

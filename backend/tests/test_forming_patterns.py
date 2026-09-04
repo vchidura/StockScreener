@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -54,6 +55,20 @@ def pattern_record(pattern_type: str, bias: str) -> dict:
 
 
 class FormingPatternTests(unittest.TestCase):
+    def test_finalized_worker_frame_keeps_the_newest_bar(self):
+        source = frame_from_close(list(np.linspace(90, 100, 30)))
+
+        with patch(
+            "research.forming_patterns._confirmed_pivots", return_value=[]
+        ) as pivots:
+            detect_forming_patterns(
+                source,
+                input_includes_forming_bar=False,
+            )
+
+        completed = pivots.call_args.args[0]
+        self.assertEqual(completed.index[-1], source.index[-1])
+
     def test_cross_frame_summary_counts_one_directional_vote_per_interval(self):
         rows = [
             {"interval": "1d", "pattern": {**pattern_record("RISING_WEDGE", "BEARISH"), "readiness": "FORMING"}},

@@ -176,11 +176,41 @@ class OptionUniverseRepository(PostgresRepository):
                     completeness_fraction = %s,
                     completed_at = %s,
                     updated_at = NOW()
-                WHERE run_id = %s AND status = 'RUNNING'
+                                WHERE run_id = %s
+                                    AND (
+                                        status = 'RUNNING'
+                                        OR (
+                                                status = 'DEGRADED'
+                                                AND %s = 'COMPLETE'
+                                                AND completeness_fraction < %s
+                                        )
+                                    )
                 """,
-                (status.value, completeness_fraction, completed_at, run_id),
+                                (
+                                        status.value,
+                                        completeness_fraction,
+                                        completed_at,
+                                        run_id,
+                                        status.value,
+                                        completeness_fraction,
+                                ),
             )
             if cursor.rowcount != 1:
+                cursor.execute(
+                    """
+                    SELECT status, completeness_fraction
+                    FROM option_universe_runs
+                    WHERE run_id = %s
+                    """,
+                    (run_id,),
+                )
+                existing = cursor.fetchone()
+                if (
+                    existing
+                    and existing["status"] == status.value
+                    and existing["completeness_fraction"] == completeness_fraction
+                ):
+                    return
                 raise InvalidBatchTransition("universe run is missing or not RUNNING")
 
     def list_active(

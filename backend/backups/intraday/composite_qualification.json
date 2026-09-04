@@ -1,0 +1,1386 @@
+{
+  "events": 171804,
+  "outcomes": {
+    "policies": [
+      {
+        "batches": 35,
+        "due": 170318,
+        "horizon_key": "10d",
+        "maturity_cutoff": "2026-08-20T20:00:00+00:00",
+        "pending": 0,
+        "persisted": 170318,
+        "policy_key": "level_retest_rejection:1.2:1d:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "batches": 35,
+        "due": 168648,
+        "horizon_key": "21d",
+        "maturity_cutoff": "2026-08-05T20:00:00+00:00",
+        "pending": 0,
+        "persisted": 168648,
+        "policy_key": "level_retest_rejection:1.2:1d:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "batches": 35,
+        "due": 170935,
+        "horizon_key": "5d",
+        "maturity_cutoff": "2026-08-27T20:00:00+00:00",
+        "pending": 0,
+        "persisted": 170935,
+        "policy_key": "level_retest_rejection:1.2:1d:SIGNED:SECTOR_PRIMARY",
+        "policy_version": "directional_outcome_v3_sector",
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "batches": 35,
+        "due": 170318,
+        "horizon_key": "10d",
+        "maturity_cutoff": "2026-08-20T20:00:00+00:00",
+        "pending": 0,
+        "persisted": 170318,
+        "policy_key": "level_retest_rejection:1.2:1d:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "batches": 35,
+        "due": 168648,
+        "horizon_key": "21d",
+        "maturity_cutoff": "2026-08-05T20:00:00+00:00",
+        "pending": 0,
+        "persisted": 168648,
+        "policy_key": "level_retest_rejection:1.2:1d:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "batches": 35,
+        "due": 170935,
+        "horizon_key": "5d",
+        "maturity_cutoff": "2026-08-27T20:00:00+00:00",
+        "pending": 0,
+        "persisted": 170935,
+        "policy_key": "level_retest_rejection:1.2:1d:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+        "policy_version": "recommendation_plan_sector_v1",
+        "source_name": "level_retest_rejection"
+      }
+    ]
+  },
+  "qualification": {
+    "inserted_revisions": 12,
+    "observations": 1005664,
+    "outcome_policy_keys": [
+      "level_retest_rejection:1.2:1d:RECOMMENDATION_PLAN:SECTOR_PRIMARY",
+      "level_retest_rejection:1.2:1d:SIGNED:SECTOR_PRIMARY"
+    ],
+    "report_identity": "9d4eea4cf554accc0ef6d1fa2d61474e26574baf043f689ebbafe7bf1ead3c9a",
+    "results": [
+      {
+        "alpha_fdr_q": 0.8863761211194204,
+        "alpha_t_stat": -0.23718735673364566,
+        "direction": -1,
+        "horizon_key": "10d",
+        "independent_periods": 103,
+        "mean_net_alpha": -0.0004852938872347629,
+        "metrics": {
+          "alpha_p_value": 0.8125114443594688,
+          "calibration_curve": [
+            {
+              "count": 13,
+              "maximum_prediction": 0.3888888888888889,
+              "mean_predicted": 0.381523567599958,
+              "minimum_prediction": 0.37373737373737376,
+              "observed_frequency": 0.46153846153846156
+            },
+            {
+              "count": 12,
+              "maximum_prediction": 0.4025974025974026,
+              "mean_predicted": 0.39799802940932144,
+              "minimum_prediction": 0.3894736842105263,
+              "observed_frequency": 0.5
+            },
+            {
+              "count": 13,
+              "maximum_prediction": 0.410958904109589,
+              "mean_predicted": 0.40710975627482326,
+              "minimum_prediction": 0.40336134453781514,
+              "observed_frequency": 0.38461538461538464
+            },
+            {
+              "count": 12,
+              "maximum_prediction": 0.4186046511627907,
+              "mean_predicted": 0.4147500736448518,
+              "minimum_prediction": 0.4111111111111111,
+              "observed_frequency": 0.4166666666666667
+            },
+            {
+              "count": 13,
+              "maximum_prediction": 0.4375,
+              "mean_predicted": 0.4265040001114971,
+              "minimum_prediction": 0.4189189189189189,
+              "observed_frequency": 0.15384615384615385
+            }
+          ],
+          "cohort_sha256": "b1e6e41091af51210a6224aa62f6cba934c6ddf2e0ffaa61ca99417cda359e97",
+          "distinct_tickers": 2451,
+          "early_alpha": 0.0022009060776553902,
+          "early_net_return": -0.0006494504082560793,
+          "first_signal_time": "2022-07-22T20:00:00+00:00",
+          "hit_rate": 0.3883495145631068,
+          "hit_rate_ci_high": 0.4848657659277437,
+          "hit_rate_ci_low": 0.29986199561845933,
+          "last_signal_time": "2026-08-20T20:00:00+00:00",
+          "late_alpha": -0.0031198361604924136,
+          "late_net_return": -0.004780084924877987,
+          "live_expected_alpha": -0.0004852938872347629,
+          "live_expected_alpha_ci_high": 0.0035249368100459424,
+          "live_expected_alpha_ci_low": -0.004495524584515468,
+          "mean_mae_pct": -0.04201889085973408,
+          "mean_market_net_alpha": 4.362902570803812e-05,
+          "mean_mfe_pct": 0.044824250797177605,
+          "mean_net_return": -0.0027348192904341293,
+          "mean_sector_net_alpha": -0.0004852938872347629,
+          "minimum_events": 100,
+          "minimum_independent_periods": 40,
+          "net_return_p_value": 0.27916740822457475,
+          "net_return_t_stat": -1.0821915819699826,
+          "primary_benchmark": "SECTOR",
+          "publication_metadata": {
+            "available_by": "2026-09-04T14:16:36.545184+00:00",
+            "eligible_event_count": 171804,
+            "event_count": 171804,
+            "event_file_sha256": "e5da9103471608a3fbbdf7becb894f220ca058e8e81c6d7600b6d1d9d93b892e",
+            "horizon_sessions": [
+              5,
+              10,
+              21
+            ],
+            "maximum_signal_time": "2026-09-03T20:00:00+00:00",
+            "minimum_signal_time": "2022-07-22T20:00:00+00:00",
+            "round_trip_cost_bps": 4.0,
+            "source_names": [
+              "level_retest_rejection"
+            ],
+            "source_versions": [
+              "1.2"
+            ],
+            "universe_policy_versions": [
+              "liquid_us_common_stocks_v2"
+            ],
+            "universe_run_ids_sha256": "c7f94df5140573d515bda1a3a3f6d5a70c5ccfa1ba7f80e1eccb86544fe3231f"
+          },
+          "qualification_metrics_version": "equity_qualification_metrics_v3",
+          "raw_pass": false,
+          "research_scope": "EQUITY_SIGNAL",
+          "sector_alpha_t_stat": -0.23718735673364566,
+          "stop_first_rate": 0.4893698207008992,
+          "stop_hit_rate": 0.493488880303777,
+          "target_first_rate": 0.2043414635006531,
+          "target_hit_rate": 0.2084605231035309,
+          "top5_concentration": 0.005083694978301302
+        },
+        "qualification_state": "UNRANKED",
+        "sample_size": 80650,
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "alpha_fdr_q": 0.5814805852301328,
+        "alpha_t_stat": -0.698975800436277,
+        "direction": -1,
+        "horizon_key": "10d",
+        "independent_periods": 103,
+        "mean_net_alpha": -0.0017170067921682731,
+        "metrics": {
+          "alpha_p_value": 0.484567154358444,
+          "calibration_curve": [
+            {
+              "count": 13,
+              "maximum_prediction": 0.4019607843137255,
+              "mean_predicted": 0.3957537122564905,
+              "minimum_prediction": 0.3888888888888889,
+              "observed_frequency": 0.46153846153846156
+            },
+            {
+              "count": 12,
+              "maximum_prediction": 0.4117647058823529,
+              "mean_predicted": 0.4074278929313427,
+              "minimum_prediction": 0.4020618556701031,
+              "observed_frequency": 0.4166666666666667
+            },
+            {
+              "count": 14,
+              "maximum_prediction": 0.42857142857142855,
+              "mean_predicted": 0.4218600715577308,
+              "minimum_prediction": 0.41379310344827586,
+              "observed_frequency": 0.35714285714285715
+            },
+            {
+              "count": 11,
+              "maximum_prediction": 0.4431818181818182,
+              "mean_predicted": 0.43783419905940874,
+              "minimum_prediction": 0.43209876543209874,
+              "observed_frequency": 0.36363636363636365
+            },
+            {
+              "count": 13,
+              "maximum_prediction": 0.46875,
+              "mean_predicted": 0.45635306900206984,
+              "minimum_prediction": 0.4444444444444444,
+              "observed_frequency": 0.23076923076923078
+            }
+          ],
+          "cohort_sha256": "b1e6e41091af51210a6224aa62f6cba934c6ddf2e0ffaa61ca99417cda359e97",
+          "distinct_tickers": 2451,
+          "early_alpha": 0.0015497485576939113,
+          "early_net_return": -0.0037546866627917196,
+          "first_signal_time": "2022-07-22T20:00:00+00:00",
+          "hit_rate": 0.39805825242718446,
+          "hit_rate_ci_high": 0.4946131431416146,
+          "hit_rate_ci_low": 0.3088339434875273,
+          "last_signal_time": "2026-08-20T20:00:00+00:00",
+          "late_alpha": -0.004920939923763878,
+          "late_net_return": -0.01064568326048404,
+          "live_expected_alpha": -0.0017170067921682731,
+          "live_expected_alpha_ci_high": 0.0030976567634931505,
+          "live_expected_alpha_ci_low": -0.006531670347829696,
+          "mean_mae_pct": -0.06445690177048047,
+          "mean_market_net_alpha": -0.0005402398112630442,
+          "mean_mfe_pct": 0.058574397036251544,
+          "mean_net_return": -0.007233636401432503,
+          "mean_sector_net_alpha": -0.0017170067921682731,
+          "minimum_events": 100,
+          "minimum_independent_periods": 40,
+          "net_return_p_value": 0.04076687509216481,
+          "net_return_t_stat": -2.045893245045692,
+          "primary_benchmark": "SECTOR",
+          "publication_metadata": {
+            "available_by": "2026-09-04T14:16:36.545184+00:00",
+            "eligible_event_count": 171804,
+            "event_count": 171804,
+            "event_file_sha256": "e5da9103471608a3fbbdf7becb894f220ca058e8e81c6d7600b6d1d9d93b892e",
+            "horizon_sessions": [
+              5,
+              10,
+              21
+            ],
+            "maximum_signal_time": "2026-09-03T20:00:00+00:00",
+            "minimum_signal_time": "2022-07-22T20:00:00+00:00",
+            "round_trip_cost_bps": 4.0,
+            "source_names": [
+              "level_retest_rejection"
+            ],
+            "source_versions": [
+              "1.2"
+            ],
+            "universe_policy_versions": [
+              "liquid_us_common_stocks_v2"
+            ],
+            "universe_run_ids_sha256": "c7f94df5140573d515bda1a3a3f6d5a70c5ccfa1ba7f80e1eccb86544fe3231f"
+          },
+          "qualification_metrics_version": "equity_qualification_metrics_v3",
+          "raw_pass": false,
+          "research_scope": "EQUITY_SIGNAL",
+          "sector_alpha_t_stat": -0.698975800436277,
+          "stop_first_rate": 0.4930273504908636,
+          "stop_hit_rate": 0.5411550087944813,
+          "target_first_rate": 0.20812254788487347,
+          "target_hit_rate": 0.28452173749691884,
+          "top5_concentration": 0.005033333736645332
+        },
+        "qualification_state": "UNRANKED",
+        "sample_size": 82649,
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "alpha_fdr_q": 0.06232132570848581,
+        "alpha_t_stat": -2.5597905898738436,
+        "direction": -1,
+        "horizon_key": "21d",
+        "independent_periods": 49,
+        "mean_net_alpha": -0.005030957003903017,
+        "metrics": {
+          "alpha_p_value": 0.010473525290310093,
+          "calibration_curve": [
+            {
+              "count": 2,
+              "maximum_prediction": 0.40298507462686567,
+              "mean_predicted": 0.4000219490781387,
+              "minimum_prediction": 0.39705882352941174,
+              "observed_frequency": 0.0
+            },
+            {
+              "count": 2,
+              "maximum_prediction": 0.4090909090909091,
+              "mean_predicted": 0.40615835777126097,
+              "minimum_prediction": 0.4032258064516129,
+              "observed_frequency": 0.5
+            },
+            {
+              "count": 1,
+              "maximum_prediction": 0.4098360655737705,
+              "mean_predicted": 0.4098360655737705,
+              "minimum_prediction": 0.4098360655737705,
+              "observed_frequency": 0.0
+            },
+            {
+              "count": 2,
+              "maximum_prediction": 0.4153846153846154,
+              "mean_predicted": 0.414041514041514,
+              "minimum_prediction": 0.4126984126984127,
+              "observed_frequency": 0.5
+            },
+            {
+              "count": 2,
+              "maximum_prediction": 0.421875,
+              "mean_predicted": 0.41927083333333337,
+              "minimum_prediction": 0.4166666666666667,
+              "observed_frequency": 0.0
+            }
+          ],
+          "cohort_sha256": "b1e6e41091af51210a6224aa62f6cba934c6ddf2e0ffaa61ca99417cda359e97",
+          "distinct_tickers": 2440,
+          "early_alpha": -0.00661034870166629,
+          "early_net_return": -0.012657610011569573,
+          "first_signal_time": "2022-07-22T20:00:00+00:00",
+          "hit_rate": 0.3469387755102041,
+          "hit_rate_ci_high": 0.48688805713027256,
+          "hit_rate_ci_low": 0.22924392834538948,
+          "last_signal_time": "2026-08-05T20:00:00+00:00",
+          "late_alpha": -0.0035147409740502746,
+          "late_net_return": -0.006221315249396393,
+          "live_expected_alpha": -0.005030957003903017,
+          "live_expected_alpha_ci_high": -0.0011788154394104756,
+          "live_expected_alpha_ci_low": -0.008883098568395559,
+          "mean_mae_pct": -0.050251905267961784,
+          "mean_market_net_alpha": -0.005228393970524543,
+          "mean_mfe_pct": 0.04664147855575806,
+          "mean_net_return": -0.009373786153317949,
+          "mean_sector_net_alpha": -0.005030957003903017,
+          "minimum_events": 100,
+          "minimum_independent_periods": 40,
+          "net_return_p_value": 0.01268222737138558,
+          "net_return_t_stat": -2.492570155790727,
+          "primary_benchmark": "SECTOR",
+          "publication_metadata": {
+            "available_by": "2026-09-04T14:16:36.545184+00:00",
+            "eligible_event_count": 171804,
+            "event_count": 171804,
+            "event_file_sha256": "e5da9103471608a3fbbdf7becb894f220ca058e8e81c6d7600b6d1d9d93b892e",
+            "horizon_sessions": [
+              5,
+              10,
+              21
+            ],
+            "maximum_signal_time": "2026-09-03T20:00:00+00:00",
+            "minimum_signal_time": "2022-07-22T20:00:00+00:00",
+            "round_trip_cost_bps": 4.0,
+            "source_names": [
+              "level_retest_rejection"
+            ],
+            "source_versions": [
+              "1.2"
+            ],
+            "universe_policy_versions": [
+              "liquid_us_common_stocks_v2"
+            ],
+            "universe_run_ids_sha256": "c7f94df5140573d515bda1a3a3f6d5a70c5ccfa1ba7f80e1eccb86544fe3231f"
+          },
+          "qualification_metrics_version": "equity_qualification_metrics_v3",
+          "raw_pass": false,
+          "research_scope": "EQUITY_SIGNAL",
+          "sector_alpha_t_stat": -2.5597905898738436,
+          "stop_first_rate": 0.6016348841147814,
+          "stop_hit_rate": 0.6042479391484068,
+          "target_first_rate": 0.22011747243485286,
+          "target_hit_rate": 0.2227305274684782,
+          "top5_concentration": 0.005099675475197033
+        },
+        "qualification_state": "UNRANKED",
+        "sample_size": 79809,
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "alpha_fdr_q": 0.1433863350426272,
+        "alpha_t_stat": -1.9791826553097687,
+        "direction": -1,
+        "horizon_key": "21d",
+        "independent_periods": 49,
+        "mean_net_alpha": -0.007139316180154071,
+        "metrics": {
+          "alpha_p_value": 0.04779544501420907,
+          "calibration_curve": [
+            {
+              "count": 2,
+              "maximum_prediction": 0.39705882352941174,
+              "mean_predicted": 0.3952507232401157,
+              "minimum_prediction": 0.39344262295081966,
+              "observed_frequency": 0.5
+            },
+            {
+              "count": 2,
+              "maximum_prediction": 0.40298507462686567,
+              "mean_predicted": 0.4014925373134328,
+              "minimum_prediction": 0.4,
+              "observed_frequency": 0.0
+            },
+            {
+              "count": 1,
+              "maximum_prediction": 0.4032258064516129,
+              "mean_predicted": 0.4032258064516129,
+              "minimum_prediction": 0.4032258064516129,
+              "observed_frequency": 1.0
+            },
+            {
+              "count": 2,
+              "maximum_prediction": 0.4126984126984127,
+              "mean_predicted": 0.41089466089466087,
+              "minimum_prediction": 0.4090909090909091,
+              "observed_frequency": 0.5
+            },
+            {
+              "count": 2,
+              "maximum_prediction": 0.421875,
+              "mean_predicted": 0.41862980769230773,
+              "minimum_prediction": 0.4153846153846154,
+              "observed_frequency": 0.0
+            }
+          ],
+          "cohort_sha256": "b1e6e41091af51210a6224aa62f6cba934c6ddf2e0ffaa61ca99417cda359e97",
+          "distinct_tickers": 2436,
+          "early_alpha": -0.005531604935881875,
+          "early_net_return": -0.01728002663108282,
+          "first_signal_time": "2022-07-22T20:00:00+00:00",
+          "hit_rate": 0.3469387755102041,
+          "hit_rate_ci_high": 0.48688805713027256,
+          "hit_rate_ci_low": 0.22924392834538948,
+          "last_signal_time": "2026-08-05T20:00:00+00:00",
+          "late_alpha": -0.008682718974655376,
+          "late_net_return": -0.01950655164863978,
+          "live_expected_alpha": -0.007139316180154071,
+          "live_expected_alpha_ci_high": -6.919575667457302e-05,
+          "live_expected_alpha_ci_low": -0.014209436603633569,
+          "mean_mae_pct": -0.10585274918887433,
+          "mean_market_net_alpha": -0.004785654743552312,
+          "mean_mfe_pct": 0.07388493200231562,
+          "mean_net_return": -0.018416008782897595,
+          "mean_sector_net_alpha": -0.007139316180154071,
+          "minimum_events": 100,
+          "minimum_independent_periods": 40,
+          "net_return_p_value": 0.022874817878311582,
+          "net_return_t_stat": -2.2755189389510515,
+          "primary_benchmark": "SECTOR",
+          "publication_metadata": {
+            "available_by": "2026-09-04T14:16:36.545184+00:00",
+            "eligible_event_count": 171804,
+            "event_count": 171804,
+            "event_file_sha256": "e5da9103471608a3fbbdf7becb894f220ca058e8e81c6d7600b6d1d9d93b892e",
+            "horizon_sessions": [
+              5,
+              10,
+              21
+            ],
+            "maximum_signal_time": "2026-09-03T20:00:00+00:00",
+            "minimum_signal_time": "2022-07-22T20:00:00+00:00",
+            "round_trip_cost_bps": 4.0,
+            "source_names": [
+              "level_retest_rejection"
+            ],
+            "source_versions": [
+              "1.2"
+            ],
+            "universe_policy_versions": [
+              "liquid_us_common_stocks_v2"
+            ],
+            "universe_run_ids_sha256": "c7f94df5140573d515bda1a3a3f6d5a70c5ccfa1ba7f80e1eccb86544fe3231f"
+          },
+          "qualification_metrics_version": "equity_qualification_metrics_v3",
+          "raw_pass": false,
+          "research_scope": "EQUITY_SIGNAL",
+          "sector_alpha_t_stat": -1.9791826553097687,
+          "stop_first_rate": 0.6040909352957283,
+          "stop_hit_rate": 0.6765560526487386,
+          "target_first_rate": 0.21983624420234907,
+          "target_hit_rate": 0.37287970531294407,
+          "top5_concentration": 0.005066017302774073
+        },
+        "qualification_state": "UNRANKED",
+        "sample_size": 81721,
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "alpha_fdr_q": 0.3126085560604141,
+        "alpha_t_stat": -1.3335389843116268,
+        "direction": -1,
+        "horizon_key": "5d",
+        "independent_periods": 206,
+        "mean_net_alpha": -0.0011478970885218564,
+        "metrics": {
+          "alpha_p_value": 0.18235499103524155,
+          "calibration_curve": [
+            {
+              "count": 34,
+              "maximum_prediction": 0.41361256544502617,
+              "mean_predicted": 0.4092833011280397,
+              "minimum_prediction": 0.4009009009009009,
+              "observed_frequency": 0.4117647058823529
+            },
+            {
+              "count": 33,
+              "maximum_prediction": 0.42962962962962964,
+              "mean_predicted": 0.42075793697725944,
+              "minimum_prediction": 0.41397849462365593,
+              "observed_frequency": 0.3333333333333333
+            },
+            {
+              "count": 33,
+              "maximum_prediction": 0.44339622641509435,
+              "mean_predicted": 0.43748374690855646,
+              "minimum_prediction": 0.4303030303030303,
+              "observed_frequency": 0.42424242424242425
+            },
+            {
+              "count": 34,
+              "maximum_prediction": 0.46153846153846156,
+              "mean_predicted": 0.45054067478665205,
+              "minimum_prediction": 0.4434782608695652,
+              "observed_frequency": 0.38235294117647056
+            },
+            {
+              "count": 32,
+              "maximum_prediction": 0.4883720930232558,
+              "mean_predicted": 0.47164740897611723,
+              "minimum_prediction": 0.46236559139784944,
+              "observed_frequency": 0.375
+            }
+          ],
+          "cohort_sha256": "b1e6e41091af51210a6224aa62f6cba934c6ddf2e0ffaa61ca99417cda359e97",
+          "distinct_tickers": 2456,
+          "early_alpha": 0.0005042091630726768,
+          "early_net_return": -0.0016133216799263765,
+          "first_signal_time": "2022-07-22T20:00:00+00:00",
+          "hit_rate": 0.39805825242718446,
+          "hit_rate_ci_high": 0.4661804653723758,
+          "hit_rate_ci_low": 0.3336684289498454,
+          "last_signal_time": "2026-08-27T20:00:00+00:00",
+          "late_alpha": -0.00280000334011639,
+          "late_net_return": -0.0036204787598917145,
+          "live_expected_alpha": -0.0011478970885218564,
+          "live_expected_alpha_ci_high": 0.0005392514088010218,
+          "live_expected_alpha_ci_low": -0.0028350455858447347,
+          "mean_mae_pct": -0.03511412940067412,
+          "mean_market_net_alpha": -0.0005732710361859796,
+          "mean_mfe_pct": 0.03499706076193733,
+          "mean_net_return": -0.0026169002199090455,
+          "mean_sector_net_alpha": -0.0011478970885218564,
+          "minimum_events": 100,
+          "minimum_independent_periods": 40,
+          "net_return_p_value": 0.06216352895943622,
+          "net_return_t_stat": -1.8651275412469819,
+          "primary_benchmark": "SECTOR",
+          "publication_metadata": {
+            "available_by": "2026-09-04T14:16:36.545184+00:00",
+            "eligible_event_count": 171804,
+            "event_count": 171804,
+            "event_file_sha256": "e5da9103471608a3fbbdf7becb894f220ca058e8e81c6d7600b6d1d9d93b892e",
+            "horizon_sessions": [
+              5,
+              10,
+              21
+            ],
+            "maximum_signal_time": "2026-09-03T20:00:00+00:00",
+            "minimum_signal_time": "2022-07-22T20:00:00+00:00",
+            "round_trip_cost_bps": 4.0,
+            "source_names": [
+              "level_retest_rejection"
+            ],
+            "source_versions": [
+              "1.2"
+            ],
+            "universe_policy_versions": [
+              "liquid_us_common_stocks_v2"
+            ],
+            "universe_run_ids_sha256": "c7f94df5140573d515bda1a3a3f6d5a70c5ccfa1ba7f80e1eccb86544fe3231f"
+          },
+          "qualification_metrics_version": "equity_qualification_metrics_v3",
+          "raw_pass": false,
+          "research_scope": "EQUITY_SIGNAL",
+          "sector_alpha_t_stat": -1.3335389843116268,
+          "stop_first_rate": 0.3821097260676971,
+          "stop_hit_rate": 0.3858363250353738,
+          "target_first_rate": 0.13582945730242868,
+          "target_hit_rate": 0.1395560562701054,
+          "top5_concentration": 0.0050790904597132975
+        },
+        "qualification_state": "UNRANKED",
+        "sample_size": 80920,
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "alpha_fdr_q": 0.33678915612107674,
+        "alpha_t_stat": -1.214580567651512,
+        "direction": -1,
+        "horizon_key": "5d",
+        "independent_periods": 206,
+        "mean_net_alpha": -0.0013735305633535068,
+        "metrics": {
+          "alpha_p_value": 0.22452610408071783,
+          "calibration_curve": [
+            {
+              "count": 34,
+              "maximum_prediction": 0.4230769230769231,
+              "mean_predicted": 0.4188113764374546,
+              "minimum_prediction": 0.41007194244604317,
+              "observed_frequency": 0.6470588235294118
+            },
+            {
+              "count": 33,
+              "maximum_prediction": 0.42696629213483145,
+              "mean_predicted": 0.42515058121087174,
+              "minimum_prediction": 0.4233128834355828,
+              "observed_frequency": 0.45454545454545453
+            },
+            {
+              "count": 33,
+              "maximum_prediction": 0.43,
+              "mean_predicted": 0.42845301177446643,
+              "minimum_prediction": 0.4270833333333333,
+              "observed_frequency": 0.36363636363636365
+            },
+            {
+              "count": 33,
+              "maximum_prediction": 0.4375,
+              "mean_predicted": 0.43246271095504646,
+              "minimum_prediction": 0.43010752688172044,
+              "observed_frequency": 0.30303030303030304
+            },
+            {
+              "count": 33,
+              "maximum_prediction": 0.46511627906976744,
+              "mean_predicted": 0.4487255482457863,
+              "minimum_prediction": 0.43790849673202614,
+              "observed_frequency": 0.30303030303030304
+            }
+          ],
+          "cohort_sha256": "b1e6e41091af51210a6224aa62f6cba934c6ddf2e0ffaa61ca99417cda359e97",
+          "distinct_tickers": 2458,
+          "early_alpha": 0.0009591240673569762,
+          "early_net_return": -0.0016410497427166368,
+          "first_signal_time": "2022-07-22T20:00:00+00:00",
+          "hit_rate": 0.4174757281553398,
+          "hit_rate_ci_high": 0.48572648198408674,
+          "hit_rate_ci_low": 0.3522464324672351,
+          "last_signal_time": "2026-08-27T20:00:00+00:00",
+          "late_alpha": -0.0037061851940639896,
+          "late_net_return": -0.005785732179467818,
+          "live_expected_alpha": -0.0013735305633535068,
+          "live_expected_alpha_ci_high": 0.0008429711458565298,
+          "live_expected_alpha_ci_low": -0.0035900322725635437,
+          "mean_mae_pct": -0.04434565795521967,
+          "mean_market_net_alpha": -0.0003107314685808547,
+          "mean_mfe_pct": 0.04085475469899504,
+          "mean_net_return": -0.0037133909610922284,
+          "mean_sector_net_alpha": -0.0013735305633535068,
+          "minimum_events": 100,
+          "minimum_independent_periods": 40,
+          "net_return_p_value": 0.04971594090149711,
+          "net_return_t_stat": -1.962399930132182,
+          "primary_benchmark": "SECTOR",
+          "publication_metadata": {
+            "available_by": "2026-09-04T14:16:36.545184+00:00",
+            "eligible_event_count": 171804,
+            "event_count": 171804,
+            "event_file_sha256": "e5da9103471608a3fbbdf7becb894f220ca058e8e81c6d7600b6d1d9d93b892e",
+            "horizon_sessions": [
+              5,
+              10,
+              21
+            ],
+            "maximum_signal_time": "2026-09-03T20:00:00+00:00",
+            "minimum_signal_time": "2022-07-22T20:00:00+00:00",
+            "round_trip_cost_bps": 4.0,
+            "source_names": [
+              "level_retest_rejection"
+            ],
+            "source_versions": [
+              "1.2"
+            ],
+            "universe_policy_versions": [
+              "liquid_us_common_stocks_v2"
+            ],
+            "universe_run_ids_sha256": "c7f94df5140573d515bda1a3a3f6d5a70c5ccfa1ba7f80e1eccb86544fe3231f"
+          },
+          "qualification_metrics_version": "equity_qualification_metrics_v3",
+          "raw_pass": false,
+          "research_scope": "EQUITY_SIGNAL",
+          "sector_alpha_t_stat": -1.214580567651512,
+          "stop_first_rate": 0.38979170766462634,
+          "stop_hit_rate": 0.4078188237276776,
+          "target_first_rate": 0.13916634249234316,
+          "target_hit_rate": 0.17550554128952234,
+          "top5_concentration": 0.005026458215305987
+        },
+        "qualification_state": "UNRANKED",
+        "sample_size": 82961,
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "alpha_fdr_q": 0.3126085560604141,
+        "alpha_t_stat": -1.342749973227056,
+        "direction": 1,
+        "horizon_key": "10d",
+        "independent_periods": 103,
+        "mean_net_alpha": -0.0016707895286472729,
+        "metrics": {
+          "alpha_p_value": 0.1793529471917683,
+          "calibration_curve": [
+            {
+              "count": 13,
+              "maximum_prediction": 0.43023255813953487,
+              "mean_predicted": 0.42639239706550985,
+              "minimum_prediction": 0.421875,
+              "observed_frequency": 0.6153846153846154
+            },
+            {
+              "count": 12,
+              "maximum_prediction": 0.43548387096774194,
+              "mean_predicted": 0.4332852828860974,
+              "minimum_prediction": 0.4307692307692308,
+              "observed_frequency": 0.4166666666666667
+            },
+            {
+              "count": 13,
+              "maximum_prediction": 0.4423076923076923,
+              "mean_predicted": 0.43905958081794544,
+              "minimum_prediction": 0.43661971830985913,
+              "observed_frequency": 0.46153846153846156
+            },
+            {
+              "count": 12,
+              "maximum_prediction": 0.44871794871794873,
+              "mean_predicted": 0.44567777809371706,
+              "minimum_prediction": 0.44285714285714284,
+              "observed_frequency": 0.3333333333333333
+            },
+            {
+              "count": 13,
+              "maximum_prediction": 0.46,
+              "mean_predicted": 0.4536699875949052,
+              "minimum_prediction": 0.4489795918367347,
+              "observed_frequency": 0.3076923076923077
+            }
+          ],
+          "cohort_sha256": "b1e6e41091af51210a6224aa62f6cba934c6ddf2e0ffaa61ca99417cda359e97",
+          "distinct_tickers": 2481,
+          "early_alpha": -0.002815699684413385,
+          "early_net_return": 0.0007087866182899495,
+          "first_signal_time": "2022-07-22T20:00:00+00:00",
+          "hit_rate": 0.4174757281553398,
+          "hit_rate_ci_high": 0.5139983727274672,
+          "hit_rate_ci_low": 0.3268873640675524,
+          "last_signal_time": "2026-08-20T20:00:00+00:00",
+          "late_alpha": -0.0005478968758766634,
+          "late_net_return": 0.0011902048235759841,
+          "live_expected_alpha": -0.0016707895286472729,
+          "live_expected_alpha_ci_high": 0.0007680468455426243,
+          "live_expected_alpha_ci_low": -0.00410962590283717,
+          "mean_mae_pct": -0.039826211834535136,
+          "mean_market_net_alpha": -0.002023572996871324,
+          "mean_mfe_pct": 0.04638643624404374,
+          "mean_net_return": 0.0009518327025120249,
+          "mean_sector_net_alpha": -0.0016707895286472729,
+          "minimum_events": 100,
+          "minimum_independent_periods": 40,
+          "net_return_p_value": 0.670107213235926,
+          "net_return_t_stat": 0.42600086839117457,
+          "primary_benchmark": "SECTOR",
+          "publication_metadata": {
+            "available_by": "2026-09-04T14:16:36.545184+00:00",
+            "eligible_event_count": 171804,
+            "event_count": 171804,
+            "event_file_sha256": "e5da9103471608a3fbbdf7becb894f220ca058e8e81c6d7600b6d1d9d93b892e",
+            "horizon_sessions": [
+              5,
+              10,
+              21
+            ],
+            "maximum_signal_time": "2026-09-03T20:00:00+00:00",
+            "minimum_signal_time": "2022-07-22T20:00:00+00:00",
+            "round_trip_cost_bps": 4.0,
+            "source_names": [
+              "level_retest_rejection"
+            ],
+            "source_versions": [
+              "1.2"
+            ],
+            "universe_policy_versions": [
+              "liquid_us_common_stocks_v2"
+            ],
+            "universe_run_ids_sha256": "c7f94df5140573d515bda1a3a3f6d5a70c5ccfa1ba7f80e1eccb86544fe3231f"
+          },
+          "qualification_metrics_version": "equity_qualification_metrics_v3",
+          "raw_pass": false,
+          "research_scope": "EQUITY_SIGNAL",
+          "sector_alpha_t_stat": -1.342749973227056,
+          "stop_first_rate": 0.47347784671180193,
+          "stop_hit_rate": 0.4750963165565351,
+          "target_first_rate": 0.20032123679675531,
+          "target_hit_rate": 0.20193970664148844,
+          "top5_concentration": 0.004971157904610045
+        },
+        "qualification_state": "UNRANKED",
+        "sample_size": 85292,
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "alpha_fdr_q": 0.9441973441444625,
+        "alpha_t_stat": -0.06999537083032632,
+        "direction": 1,
+        "horizon_key": "10d",
+        "independent_periods": 103,
+        "mean_net_alpha": -0.000136760728866367,
+        "metrics": {
+          "alpha_p_value": 0.9441973441444624,
+          "calibration_curve": [
+            {
+              "count": 13,
+              "maximum_prediction": 0.5151515151515151,
+              "mean_predicted": 0.5086072704235904,
+              "minimum_prediction": 0.5,
+              "observed_frequency": 0.6923076923076923
+            },
+            {
+              "count": 12,
+              "maximum_prediction": 0.5238095238095238,
+              "mean_predicted": 0.5198181299848147,
+              "minimum_prediction": 0.5161290322580645,
+              "observed_frequency": 0.5833333333333334
+            },
+            {
+              "count": 13,
+              "maximum_prediction": 0.5283018867924528,
+              "mean_predicted": 0.5264142345529986,
+              "minimum_prediction": 0.5242718446601942,
+              "observed_frequency": 0.6923076923076923
+            },
+            {
+              "count": 12,
+              "maximum_prediction": 0.5327102803738317,
+              "mean_predicted": 0.5308555636643192,
+              "minimum_prediction": 0.5288461538461539,
+              "observed_frequency": 0.4166666666666667
+            },
+            {
+              "count": 13,
+              "maximum_prediction": 0.5454545454545454,
+              "mean_predicted": 0.5381511631742786,
+              "minimum_prediction": 0.5333333333333333,
+              "observed_frequency": 0.38461538461538464
+            }
+          ],
+          "cohort_sha256": "b1e6e41091af51210a6224aa62f6cba934c6ddf2e0ffaa61ca99417cda359e97",
+          "distinct_tickers": 2482,
+          "early_alpha": -0.0025720780825647578,
+          "early_net_return": 0.0012078515167282659,
+          "first_signal_time": "2022-07-22T20:00:00+00:00",
+          "hit_rate": 0.5436893203883495,
+          "hit_rate_ci_high": 0.6365776165476932,
+          "hit_rate_ci_low": 0.4476593463255318,
+          "last_signal_time": "2026-08-20T20:00:00+00:00",
+          "late_alpha": 0.0022517235987993636,
+          "late_net_return": 0.0074538739143607475,
+          "live_expected_alpha": -0.000136760728866367,
+          "live_expected_alpha_ci_high": 0.0036927929315871758,
+          "live_expected_alpha_ci_low": -0.00396631438931991,
+          "mean_mae_pct": -0.057037699851658054,
+          "mean_market_net_alpha": -0.001343229565102307,
+          "mean_mfe_pct": 0.06314521821901359,
+          "mean_net_return": 0.004361183212620391,
+          "mean_sector_net_alpha": -0.000136760728866367,
+          "minimum_events": 100,
+          "minimum_independent_periods": 40,
+          "net_return_p_value": 0.23073635925431257,
+          "net_return_t_stat": 1.1984641815113606,
+          "primary_benchmark": "SECTOR",
+          "publication_metadata": {
+            "available_by": "2026-09-04T14:16:36.545184+00:00",
+            "eligible_event_count": 171804,
+            "event_count": 171804,
+            "event_file_sha256": "e5da9103471608a3fbbdf7becb894f220ca058e8e81c6d7600b6d1d9d93b892e",
+            "horizon_sessions": [
+              5,
+              10,
+              21
+            ],
+            "maximum_signal_time": "2026-09-03T20:00:00+00:00",
+            "minimum_signal_time": "2022-07-22T20:00:00+00:00",
+            "round_trip_cost_bps": 4.0,
+            "source_names": [
+              "level_retest_rejection"
+            ],
+            "source_versions": [
+              "1.2"
+            ],
+            "universe_policy_versions": [
+              "liquid_us_common_stocks_v2"
+            ],
+            "universe_run_ids_sha256": "c7f94df5140573d515bda1a3a3f6d5a70c5ccfa1ba7f80e1eccb86544fe3231f"
+          },
+          "qualification_metrics_version": "equity_qualification_metrics_v3",
+          "raw_pass": false,
+          "research_scope": "EQUITY_SIGNAL",
+          "sector_alpha_t_stat": -0.06999537083032632,
+          "stop_first_rate": 0.4801966145505551,
+          "stop_hit_rate": 0.508596058342681,
+          "target_first_rate": 0.20137057245031487,
+          "target_hit_rate": 0.28418290794398093,
+          "top5_concentration": 0.004932817542976172
+        },
+        "qualification_state": "UNRANKED",
+        "sample_size": 87374,
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "alpha_fdr_q": 0.06232132570848581,
+        "alpha_t_stat": -2.4186007237118106,
+        "direction": 1,
+        "horizon_key": "21d",
+        "independent_periods": 49,
+        "mean_net_alpha": -0.007343717706631817,
+        "metrics": {
+          "alpha_p_value": 0.015580331427121452,
+          "calibration_curve": [
+            {
+              "count": 2,
+              "maximum_prediction": 0.4411764705882353,
+              "mean_predicted": 0.43933823529411764,
+              "minimum_prediction": 0.4375,
+              "observed_frequency": 1.0
+            },
+            {
+              "count": 2,
+              "maximum_prediction": 0.4461538461538462,
+              "mean_predicted": 0.44529914529914527,
+              "minimum_prediction": 0.4444444444444444,
+              "observed_frequency": 0.5
+            },
+            {
+              "count": 1,
+              "maximum_prediction": 0.44776119402985076,
+              "mean_predicted": 0.44776119402985076,
+              "minimum_prediction": 0.44776119402985076,
+              "observed_frequency": 0.0
+            },
+            {
+              "count": 2,
+              "maximum_prediction": 0.45161290322580644,
+              "mean_predicted": 0.4508064516129032,
+              "minimum_prediction": 0.45,
+              "observed_frequency": 0.5
+            },
+            {
+              "count": 2,
+              "maximum_prediction": 0.45901639344262296,
+              "mean_predicted": 0.45678092399403875,
+              "minimum_prediction": 0.45454545454545453,
+              "observed_frequency": 0.0
+            }
+          ],
+          "cohort_sha256": "b1e6e41091af51210a6224aa62f6cba934c6ddf2e0ffaa61ca99417cda359e97",
+          "distinct_tickers": 2474,
+          "early_alpha": -0.00837203200593256,
+          "early_net_return": 0.0013483478143783275,
+          "first_signal_time": "2022-07-22T20:00:00+00:00",
+          "hit_rate": 0.42857142857142855,
+          "hit_rate_ci_high": 0.5672950690998263,
+          "hit_rate_ci_low": 0.30023319078881594,
+          "last_signal_time": "2026-08-05T20:00:00+00:00",
+          "late_alpha": -0.006356535979303102,
+          "late_net_return": -0.004510196175776986,
+          "live_expected_alpha": -0.007343717706631817,
+          "live_expected_alpha_ci_high": -0.0013924721935202255,
+          "live_expected_alpha_ci_low": -0.013294963219743407,
+          "mean_mae_pct": -0.046466415346166585,
+          "mean_market_net_alpha": -0.007877416725720038,
+          "mean_mfe_pct": 0.05290132319447018,
+          "mean_net_return": -0.001640705241823363,
+          "mean_sector_net_alpha": -0.007343717706631817,
+          "minimum_events": 100,
+          "minimum_independent_periods": 40,
+          "net_return_p_value": 0.6476774272781156,
+          "net_return_t_stat": -0.45699112125600316,
+          "primary_benchmark": "SECTOR",
+          "publication_metadata": {
+            "available_by": "2026-09-04T14:16:36.545184+00:00",
+            "eligible_event_count": 171804,
+            "event_count": 171804,
+            "event_file_sha256": "e5da9103471608a3fbbdf7becb894f220ca058e8e81c6d7600b6d1d9d93b892e",
+            "horizon_sessions": [
+              5,
+              10,
+              21
+            ],
+            "maximum_signal_time": "2026-09-03T20:00:00+00:00",
+            "minimum_signal_time": "2022-07-22T20:00:00+00:00",
+            "round_trip_cost_bps": 4.0,
+            "source_names": [
+              "level_retest_rejection"
+            ],
+            "source_versions": [
+              "1.2"
+            ],
+            "universe_policy_versions": [
+              "liquid_us_common_stocks_v2"
+            ],
+            "universe_run_ids_sha256": "c7f94df5140573d515bda1a3a3f6d5a70c5ccfa1ba7f80e1eccb86544fe3231f"
+          },
+          "qualification_metrics_version": "equity_qualification_metrics_v3",
+          "raw_pass": false,
+          "research_scope": "EQUITY_SIGNAL",
+          "sector_alpha_t_stat": -2.4186007237118106,
+          "stop_first_rate": 0.5671408407010019,
+          "stop_hit_rate": 0.5696781782509857,
+          "target_first_rate": 0.2738926149129706,
+          "target_hit_rate": 0.27642995246295443,
+          "top5_concentration": 0.004975006514889484
+        },
+        "qualification_state": "UNRANKED",
+        "sample_size": 84422,
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "alpha_fdr_q": 0.2194258189090764,
+        "alpha_t_stat": -1.687915636738409,
+        "direction": 1,
+        "horizon_key": "21d",
+        "independent_periods": 49,
+        "mean_net_alpha": -0.013598494808700463,
+        "metrics": {
+          "alpha_p_value": 0.0914274245454485,
+          "calibration_curve": [
+            {
+              "count": 2,
+              "maximum_prediction": 0.5081967213114754,
+              "mean_predicted": 0.5040983606557377,
+              "minimum_prediction": 0.5,
+              "observed_frequency": 1.0
+            },
+            {
+              "count": 2,
+              "maximum_prediction": 0.515625,
+              "mean_predicted": 0.5151654411764706,
+              "minimum_prediction": 0.5147058823529411,
+              "observed_frequency": 1.0
+            },
+            {
+              "count": 1,
+              "maximum_prediction": 0.5161290322580645,
+              "mean_predicted": 0.5161290322580645,
+              "minimum_prediction": 0.5161290322580645,
+              "observed_frequency": 1.0
+            },
+            {
+              "count": 2,
+              "maximum_prediction": 0.5230769230769231,
+              "mean_predicted": 0.5227324913892077,
+              "minimum_prediction": 0.5223880597014925,
+              "observed_frequency": 0.5
+            },
+            {
+              "count": 2,
+              "maximum_prediction": 0.5303030303030303,
+              "mean_predicted": 0.527056277056277,
+              "minimum_prediction": 0.5238095238095238,
+              "observed_frequency": 0.0
+            }
+          ],
+          "cohort_sha256": "b1e6e41091af51210a6224aa62f6cba934c6ddf2e0ffaa61ca99417cda359e97",
+          "distinct_tickers": 2470,
+          "early_alpha": -0.02144347500135387,
+          "early_net_return": -0.007334053920271048,
+          "first_signal_time": "2022-07-22T20:00:00+00:00",
+          "hit_rate": 0.5306122448979592,
+          "hit_rate_ci_high": 0.6629649630682484,
+          "hit_rate_ci_low": 0.39380863983661896,
+          "last_signal_time": "2026-08-05T20:00:00+00:00",
+          "late_alpha": -0.00606731382375319,
+          "late_net_return": 0.003194526364138229,
+          "live_expected_alpha": -0.013598494808700463,
+          "live_expected_alpha_ci_high": 0.002192015833499105,
+          "live_expected_alpha_ci_low": -0.029389005450900032,
+          "mean_mae_pct": -0.08592762949577556,
+          "mean_market_net_alpha": -0.015592683324713636,
+          "mean_mfe_pct": 0.0901104230078912,
+          "mean_net_return": -0.0019623292853683558,
+          "mean_sector_net_alpha": -0.013598494808700463,
+          "minimum_events": 100,
+          "minimum_independent_periods": 40,
+          "net_return_p_value": 0.8395344699524043,
+          "net_return_t_stat": -0.20248898347040212,
+          "primary_benchmark": "SECTOR",
+          "publication_metadata": {
+            "available_by": "2026-09-04T14:16:36.545184+00:00",
+            "eligible_event_count": 171804,
+            "event_count": 171804,
+            "event_file_sha256": "e5da9103471608a3fbbdf7becb894f220ca058e8e81c6d7600b6d1d9d93b892e",
+            "horizon_sessions": [
+              5,
+              10,
+              21
+            ],
+            "maximum_signal_time": "2026-09-03T20:00:00+00:00",
+            "minimum_signal_time": "2022-07-22T20:00:00+00:00",
+            "round_trip_cost_bps": 4.0,
+            "source_names": [
+              "level_retest_rejection"
+            ],
+            "source_versions": [
+              "1.2"
+            ],
+            "universe_policy_versions": [
+              "liquid_us_common_stocks_v2"
+            ],
+            "universe_run_ids_sha256": "c7f94df5140573d515bda1a3a3f6d5a70c5ccfa1ba7f80e1eccb86544fe3231f"
+          },
+          "qualification_metrics_version": "equity_qualification_metrics_v3",
+          "raw_pass": false,
+          "research_scope": "EQUITY_SIGNAL",
+          "sector_alpha_t_stat": -1.687915636738409,
+          "stop_first_rate": 0.5736905003441806,
+          "stop_hit_rate": 0.6474444796145435,
+          "target_first_rate": 0.2711685274387795,
+          "target_hit_rate": 0.427220439850088,
+          "top5_concentration": 0.004965162843452698
+        },
+        "qualification_state": "UNRANKED",
+        "sample_size": 86402,
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "alpha_fdr_q": 0.06232132570848581,
+        "alpha_t_stat": -2.438585707916694,
+        "direction": 1,
+        "horizon_key": "5d",
+        "independent_periods": 206,
+        "mean_net_alpha": -0.0018192055976896083,
+        "metrics": {
+          "alpha_p_value": 0.014744861684267585,
+          "calibration_curve": [
+            {
+              "count": 34,
+              "maximum_prediction": 0.4370860927152318,
+              "mean_predicted": 0.41934334379132165,
+              "minimum_prediction": 0.3968253968253968,
+              "observed_frequency": 0.5294117647058824
+            },
+            {
+              "count": 33,
+              "maximum_prediction": 0.45045045045045046,
+              "mean_predicted": 0.44466075909801855,
+              "minimum_prediction": 0.43790849673202614,
+              "observed_frequency": 0.5151515151515151
+            },
+            {
+              "count": 33,
+              "maximum_prediction": 0.4578313253012048,
+              "mean_predicted": 0.4547970740970291,
+              "minimum_prediction": 0.4506172839506173,
+              "observed_frequency": 0.5151515151515151
+            },
+            {
+              "count": 34,
+              "maximum_prediction": 0.4626865671641791,
+              "mean_predicted": 0.4605129717131917,
+              "minimum_prediction": 0.45794392523364486,
+              "observed_frequency": 0.47058823529411764
+            },
+            {
+              "count": 32,
+              "maximum_prediction": 0.4696969696969697,
+              "mean_predicted": 0.46517369806375025,
+              "minimum_prediction": 0.4627659574468085,
+              "observed_frequency": 0.28125
+            }
+          ],
+          "cohort_sha256": "b1e6e41091af51210a6224aa62f6cba934c6ddf2e0ffaa61ca99417cda359e97",
+          "distinct_tickers": 2489,
+          "early_alpha": -0.001503089781259684,
+          "early_net_return": 0.0002876670991364594,
+          "first_signal_time": "2022-07-22T20:00:00+00:00",
+          "hit_rate": 0.44660194174757284,
+          "hit_rate_ci_high": 0.5148504002955442,
+          "hit_rate_ci_low": 0.38030854434942885,
+          "last_signal_time": "2026-08-27T20:00:00+00:00",
+          "late_alpha": -0.002135321414119533,
+          "late_net_return": -0.001275557210014979,
+          "live_expected_alpha": -0.0018192055976896083,
+          "live_expected_alpha_ci_high": -0.0003570289926615269,
+          "live_expected_alpha_ci_low": -0.0032813822027176896,
+          "mean_mae_pct": -0.03303158154611238,
+          "mean_market_net_alpha": -0.0021609299144350006,
+          "mean_mfe_pct": 0.036727748769297686,
+          "mean_net_return": -0.0004939450554392597,
+          "mean_sector_net_alpha": -0.0018192055976896083,
+          "minimum_events": 100,
+          "minimum_independent_periods": 40,
+          "net_return_p_value": 0.6926814842652051,
+          "net_return_t_stat": -0.39521871199688596,
+          "primary_benchmark": "SECTOR",
+          "publication_metadata": {
+            "available_by": "2026-09-04T14:16:36.545184+00:00",
+            "eligible_event_count": 171804,
+            "event_count": 171804,
+            "event_file_sha256": "e5da9103471608a3fbbdf7becb894f220ca058e8e81c6d7600b6d1d9d93b892e",
+            "horizon_sessions": [
+              5,
+              10,
+              21
+            ],
+            "maximum_signal_time": "2026-09-03T20:00:00+00:00",
+            "minimum_signal_time": "2022-07-22T20:00:00+00:00",
+            "round_trip_cost_bps": 4.0,
+            "source_names": [
+              "level_retest_rejection"
+            ],
+            "source_versions": [
+              "1.2"
+            ],
+            "universe_policy_versions": [
+              "liquid_us_common_stocks_v2"
+            ],
+            "universe_run_ids_sha256": "c7f94df5140573d515bda1a3a3f6d5a70c5ccfa1ba7f80e1eccb86544fe3231f"
+          },
+          "qualification_metrics_version": "equity_qualification_metrics_v3",
+          "raw_pass": false,
+          "research_scope": "EQUITY_SIGNAL",
+          "sector_alpha_t_stat": -2.438585707916694,
+          "stop_first_rate": 0.36531595892278773,
+          "stop_hit_rate": 0.36740536053860007,
+          "target_first_rate": 0.1400704451228568,
+          "target_hit_rate": 0.1421598467386691,
+          "top5_concentration": 0.0049608385568045196
+        },
+        "qualification_state": "UNRANKED",
+        "sample_size": 85671,
+        "source_name": "level_retest_rejection"
+      },
+      {
+        "alpha_fdr_q": 0.4488420358013799,
+        "alpha_t_stat": -0.9608421795384964,
+        "direction": 1,
+        "horizon_key": "5d",
+        "independent_periods": 206,
+        "mean_net_alpha": -0.0009913476156708963,
+        "metrics": {
+          "alpha_p_value": 0.3366315268510349,
+          "calibration_curve": [
+            {
+              "count": 34,
+              "maximum_prediction": 0.4891304347826087,
+              "mean_predicted": 0.4687915809703823,
+              "minimum_prediction": 0.44047619047619047,
+              "observed_frequency": 0.5294117647058824
+            },
+            {
+              "count": 33,
+              "maximum_prediction": 0.5151515151515151,
+              "mean_predicted": 0.5076601759665083,
+              "minimum_prediction": 0.48936170212765956,
+              "observed_frequency": 0.7272727272727273
+            },
+            {
+              "count": 33,
+              "maximum_prediction": 0.5220125786163522,
+              "mean_predicted": 0.5182691772281846,
+              "minimum_prediction": 0.5153061224489796,
+              "observed_frequency": 0.45454545454545453
+            },
+            {
+              "count": 33,
+              "maximum_prediction": 0.5325443786982249,
+              "mean_predicted": 0.5278218241372583,
+              "minimum_prediction": 0.5222222222222223,
+              "observed_frequency": 0.5454545454545454
+            },
+            {
+              "count": 33,
+              "maximum_prediction": 0.5461538461538461,
+              "mean_predicted": 0.5380224108832372,
+              "minimum_prediction": 0.5327102803738317,
+              "observed_frequency": 0.45454545454545453
+            }
+          ],
+          "cohort_sha256": "b1e6e41091af51210a6224aa62f6cba934c6ddf2e0ffaa61ca99417cda359e97",
+          "distinct_tickers": 2492,
+          "early_alpha": -0.0002335748623694349,
+          "early_net_return": 0.002412744437394291,
+          "first_signal_time": "2022-07-22T20:00:00+00:00",
+          "hit_rate": 0.529126213592233,
+          "hit_rate_ci_high": 0.5961309649197615,
+          "hit_rate_ci_low": 0.4610550652738897,
+          "last_signal_time": "2026-08-27T20:00:00+00:00",
+          "late_alpha": -0.0017491203689723575,
+          "late_net_return": -0.00024382027696684183,
+          "live_expected_alpha": -0.0009913476156708963,
+          "live_expected_alpha_ci_high": 0.0010308797262305824,
+          "live_expected_alpha_ci_low": -0.003013574957572375,
+          "mean_mae_pct": -0.040798617971792586,
+          "mean_market_net_alpha": -0.001577037436603944,
+          "mean_mfe_pct": 0.04354941228225813,
+          "mean_net_return": 0.0010844620802137243,
+          "mean_sector_net_alpha": -0.0009913476156708963,
+          "minimum_events": 100,
+          "minimum_independent_periods": 40,
+          "net_return_p_value": 0.5702410248682861,
+          "net_return_t_stat": 0.5676965643129639,
+          "primary_benchmark": "SECTOR",
+          "publication_metadata": {
+            "available_by": "2026-09-04T14:16:36.545184+00:00",
+            "eligible_event_count": 171804,
+            "event_count": 171804,
+            "event_file_sha256": "e5da9103471608a3fbbdf7becb894f220ca058e8e81c6d7600b6d1d9d93b892e",
+            "horizon_sessions": [
+              5,
+              10,
+              21
+            ],
+            "maximum_signal_time": "2026-09-03T20:00:00+00:00",
+            "minimum_signal_time": "2022-07-22T20:00:00+00:00",
+            "round_trip_cost_bps": 4.0,
+            "source_names": [
+              "level_retest_rejection"
+            ],
+            "source_versions": [
+              "1.2"
+            ],
+            "universe_policy_versions": [
+              "liquid_us_common_stocks_v2"
+            ],
+            "universe_run_ids_sha256": "c7f94df5140573d515bda1a3a3f6d5a70c5ccfa1ba7f80e1eccb86544fe3231f"
+          },
+          "qualification_metrics_version": "equity_qualification_metrics_v3",
+          "raw_pass": false,
+          "research_scope": "EQUITY_SIGNAL",
+          "sector_alpha_t_stat": -0.9608421795384964,
+          "stop_first_rate": 0.37288894834633257,
+          "stop_hit_rate": 0.38798117338803845,
+          "target_first_rate": 0.14207518052564513,
+          "target_hit_rate": 0.1777088763564389,
+          "top5_concentration": 0.004920665656715228
+        },
+        "qualification_state": "UNRANKED",
+        "sample_size": 87793,
+        "source_name": "level_retest_rejection"
+      }
+    ],
+    "revisions": 12,
+    "states": {
+      "MONITOR_ONLY": 0,
+      "ROBUST_PASS": 0,
+      "UNRANKED": 12
+    }
+  }
+}

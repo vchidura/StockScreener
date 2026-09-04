@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from enum import Enum
 
 from .config import DataEngine, ExecutionEngine, OptionRuntimeConfiguration
@@ -32,3 +33,26 @@ def build_option_startup_state(
         mode=OptionServiceMode.READ_ONLY,
         configuration=configuration,
     )
+
+
+def ensure_option_partitions(as_of: datetime) -> None:
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise ValueError("as_of must be timezone-aware")
+    observed = as_of.astimezone(timezone.utc)
+    current_month = date(observed.year, observed.month, 1)
+    next_month = (
+        date(observed.year + 1, 1, 1)
+        if observed.month == 12
+        else date(observed.year, observed.month + 1, 1)
+    )
+    from database import get_db_cursor
+
+    with get_db_cursor() as cursor:
+        cursor.execute(
+            "SELECT ensure_option_market_data_partitions(%s)",
+            (current_month,),
+        )
+        cursor.execute(
+            "SELECT ensure_option_market_data_partitions(%s)",
+            (next_month,),
+        )

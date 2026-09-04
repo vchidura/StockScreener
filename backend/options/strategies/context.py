@@ -1,13 +1,45 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from decimal import Decimal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from options.domain import AssetType, DecisionContext
 from options.repositories.base import ConnectionFactory, PostgresRepository
+from equity.domain import DecisionWatermark, EquityContextSnapshot
+from equity.repositories import EquityEvidenceRepository
 
 from .domain import StrategyContextSnapshot, StrategyContextStatus
+
+
+_CANONICAL_CLOSE_QUERY = """
+    WITH visible AS (
+        SELECT DISTINCT ON (bar_start)
+               bar_start AS datetime, close_price
+        FROM equity_bar_revisions
+        WHERE ticker = %s
+          AND interval = %s
+          AND session_scope = 'RTH'
+          AND adjusted = FALSE
+          AND is_final = TRUE
+          AND bar_end <= %s
+          AND COALESCE(replay_available_at, system_observed_at) <= %s
+        ORDER BY bar_start,
+                 CASE
+                     WHEN source_kind = 'RECONCILED' THEN 0
+                     WHEN interval IN ('1h', '1d') AND source_kind = 'DERIVED' THEN 1
+                     WHEN source_kind = 'NATIVE_REST' THEN 2
+                     ELSE 3
+                 END,
+                 COALESCE(replay_available_at, system_observed_at) DESC,
+                 created_at DESC
+    )
+    SELECT datetime, close_price
+    FROM visible
+    ORDER BY datetime DESC
+    LIMIT %s
+"""
 
 
 def exponential_average(values: tuple[Decimal, ...], span: int) -> Decimal | None:
@@ -34,6 +66,7 @@ def build_strategy_context(
     fed_blackout: bool | None,
     policy_version: str,
     policy_sha256: str,
+    equity_context: EquityContextSnapshot | None = None,
 ) -> StrategyContextSnapshot:
     daily_values = tuple(Decimal(str(row["close_price"])) for row in daily_bars)
     hourly_values = tuple(Decimal(str(row["close_price"])) for row in hourly_bars)
@@ -110,12 +143,37 @@ def build_strategy_context(
         source_bar_keys=source_bar_keys,
         policy_version=policy_version,
         policy_sha256=policy_sha256,
+        equity_context_snapshot_id=(
+            equity_context.equity_context_snapshot_id if equity_context else None
+        ),
+        equity_context_status=(equity_context.status.value if equity_context else None),
+        qualified_direction=(equity_context.qualified_direction if equity_context else None),
+        company_name=(
+            json.loads(equity_context.summary_json).get("company_name")
+            if equity_context else None
+        ),
+        market_cap=(equity_context.market_cap if equity_context else None),
+        shares_outstanding=(equity_context.shares_outstanding if equity_context else None),
+        free_float=(equity_context.free_float if equity_context else None),
+        dividend_yield=(equity_context.dividend_yield if equity_context else None),
+        enterprise_value=(equity_context.enterprise_value if equity_context else None),
+        ebitda=(equity_context.ebitda if equity_context else None),
+        operating_income=(equity_context.operating_income if equity_context else None),
+        free_cash_flow=(equity_context.free_cash_flow if equity_context else None),
+        equity_reason_codes=(equity_context.reason_codes if equity_context else ()),
     )
 
 
 class OptionStrategyContextRepository(PostgresRepository):
-    def __init__(self, connection_factory: ConnectionFactory | None = None) -> None:
+    def __init__(
+        self,
+        connection_factory: ConnectionFactory | None = None,
+        equity_context_repository: EquityEvidenceRepository | None = None,
+    ) -> None:
         super().__init__(connection_factory)
+        self.equity_context_repository = equity_context_repository or EquityEvidenceRepository(
+            connection_factory
+        )
 
     def build(
         self,
@@ -127,30 +185,23 @@ class OptionStrategyContextRepository(PostgresRepository):
         event_calendar_available: bool,
         policy_version: str,
         policy_sha256: str,
+        equity_context_enabled: bool = False,
     ) -> StrategyContextSnapshot:
         with self._cursor() as cursor:
             cursor.execute(
-                """
-                SELECT datetime, close_price
-                FROM stock_prices_daily
-                WHERE ticker = %s
-                  AND datetime <= %s
-                ORDER BY datetime DESC
-                LIMIT 100
-                """,
-                                (underlyer, decision_context.market_time),
+                _CANONICAL_CLOSE_QUERY,
+                (
+                    underlyer, "1d", decision_context.market_time,
+                    decision_context.observed_time, 100,
+                ),
             )
             daily = tuple(reversed(cursor.fetchall()))
             cursor.execute(
-                """
-                SELECT datetime, close_price
-                FROM stock_prices_hourly
-                WHERE ticker = %s
-                  AND datetime <= %s
-                ORDER BY datetime DESC
-                LIMIT 20
-                """,
-                                (underlyer, decision_context.market_time),
+                _CANONICAL_CLOSE_QUERY,
+                (
+                    underlyer, "1h", decision_context.market_time,
+                    decision_context.observed_time, 20,
+                ),
             )
             hourly = tuple(reversed(cursor.fetchall()))
             earnings_blackout = None
@@ -185,6 +236,16 @@ class OptionStrategyContextRepository(PostgresRepository):
                 events = cursor.fetchall()
                 earnings_blackout = any(row["event_type"] == "EARNINGS" for row in events)
                 fed_blackout = any(row["event_type"] == "FED_RATE_DECISION" for row in events)
+        equity_context = None
+        if equity_context_enabled:
+            equity_context = self.equity_context_repository.get_context_as_of(
+                underlyer,
+                "INTRADAY_30M",
+                DecisionWatermark(
+                    decision_context.market_time,
+                    decision_context.observed_time,
+                ),
+            )
         return build_strategy_context(
             matrix_id,
             underlyer,
@@ -193,9 +254,10 @@ class OptionStrategyContextRepository(PostgresRepository):
             daily,
             hourly,
             event_calendar_available=event_calendar_available,
-            bar_observation_times_available=False,
+            bar_observation_times_available=bool(daily and hourly),
             earnings_blackout=earnings_blackout,
             fed_blackout=fed_blackout,
             policy_version=policy_version,
             policy_sha256=policy_sha256,
+            equity_context=equity_context,
         )

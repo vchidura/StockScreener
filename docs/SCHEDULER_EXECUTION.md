@@ -2,7 +2,8 @@
 
 Purpose: provide a precise, operations-oriented description of what the scheduler executes, when it executes, and why outcomes appear when they do.
 
-Scope: current behavior implemented by backend/scripts/run_scheduler.py, backend/scripts/run_scanner_event_pipeline.py, and backend/research/scanner_events.py.
+Scope: legacy scheduler behavior retained for price/discovery jobs. Scanner capture and outcomes are
+owned by `run_equity_worker.py`; the former scanner-event pipeline and ledger are retired.
 
 ## 1) Process lifecycle
 
@@ -32,7 +33,7 @@ During each market-hours loop pass, jobs are checked and potentially run in this
 1. Intraday 5m candles
 2. Running daily candle
 3. Hourly candles
-4. Scanner events lane for interval set (1h only, intraday)
+4. Canonical equity worker runs independently under XNYS-aligned interval scheduling
 
 Each job updates its own last-run timestamp only after the function call returns.
 
@@ -49,19 +50,14 @@ Operational implication:
 
 - If scheduler starts at 11:17 ET on a weekday, 5m, daily-running, hourly, and intraday 1h scanner checks are all immediately eligible.
 
-## 5) Intraday 1h scanner lane behavior
+## 5) Canonical scanner behavior
 
-The market-hours scanner lane calls scanner pipeline with interval set (1h) only.
+The canonical equity worker publishes bars, matures previously captured outcomes, materializes new
+evidence, and atomically advances current projections. It never writes `scanner_events*`.
 
-Pipeline order for each interval is strict:
-
-1. evaluate_outcomes(interval)
-2. capture_events(interval)
-
-Reasoning:
-
-- Evaluate-first guarantees that only already-matured prior events are evaluated.
-- Newly captured events from this pass are not evaluated in the same pass.
+Native and derived intervals use the same latest-completed XNYS watermark as read freshness. A
+restart before the open, after midnight UTC, or during a weekend therefore repairs the prior
+completed session before waiting for a new intraday boundary.
 
 ## 6) What makes a 1h outcome "due"
 

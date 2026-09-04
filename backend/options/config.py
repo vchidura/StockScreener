@@ -39,6 +39,7 @@ class OptionSettings(_FrozenModel):
     data_engine: DataEngine = DataEngine.POLYGON_DEVELOPER
     underlying_data_provider: str = "polygon_stocks"
     event_calendar_provider: str | None = None
+    equity_context_enabled: bool = False
     execution_engine: ExecutionEngine = ExecutionEngine.PAPER_PROXY
     universe_mode: UniverseMode = UniverseMode.FIXED
     fixed_stock_underlyers: tuple[str, ...] = (
@@ -120,6 +121,7 @@ class OptionSettings(_FrozenModel):
             "data_engine": self.data_engine.value,
             "underlying_data_provider": self.underlying_data_provider,
             "event_calendar_provider": self.event_calendar_provider,
+            "equity_context_enabled": self.equity_context_enabled,
             "execution_engine": self.execution_engine.value,
             "universe_mode": self.universe_mode.value,
             "fixed_stock_underlyers": self.fixed_stock_underlyers,
@@ -397,6 +399,7 @@ def load_option_runtime_configuration(
             "OPTION_UNDERLYING_DATA_PROVIDER", "polygon_stocks"
         ),
         "event_calendar_provider": environ.get("OPTION_EVENT_CALENDAR_PROVIDER"),
+        "equity_context_enabled": environ.get("OPTION_EQUITY_CONTEXT_ENABLED", "false"),
         "execution_engine": environ.get(
             "OPTION_EXECUTION_ENGINE", ExecutionEngine.PAPER_PROXY.value
         ),

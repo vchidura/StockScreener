@@ -19,6 +19,7 @@ A comprehensive reference for every trading strategy implemented in the screener
 11. [Filters & Presets](#11-filters--presets)
 12. [Cross-Strategy Signal Confluence](#12-cross-strategy-signal-confluence)
 13. [Practical Playbook](#13-practical-playbook)
+14. [Proposed Intraday Scanner Research](#14-proposed-intraday-scanner-research)
 
 ---
 
@@ -26,48 +27,85 @@ A comprehensive reference for every trading strategy implemented in the screener
 
 ### What It Detects
 
-Price gaps occur when a stock opens significantly above its previous high (gap up) or below its previous low (gap down), creating zones where no trading occurred. These gaps act as **support** (gap-up zones) or **resistance** (gap-down zones) because institutional orders cluster at these levels.
+The scanner records a gap event when a new session opens significantly above the previous high or below the previous low. It separates formation-time classification from the gap's evolving fill lifecycle. Results are research heuristics and location evidence; they are not qualified probability estimates.
 
 ### How Gaps Are Identified
 
-- **Gap Up**: Current open > previous high AND current low > previous high (zone survived intraday — not a fake gap).
-- **Gap Down**: Current open < previous low AND current high < previous low.
-- **ATR Filter**: Gap size must be ≥ 0.5× ATR(14) to filter out noise.
+- **Gap Up**: Current open is at least 1% above the previous high.
+- **Gap Down**: Current open is at least 1% below the previous low.
+- **Formation fills retained**: A gap that returns to the previous close during its formation session is recorded as a same-session fade rather than discarded.
+- **ATR filter**: The reported gap zone must be at least 0.5× ATR(14).
+- **Intraday boundary rule**: 5m, 15m, 30m, and 1h scans evaluate only the first bar of a new session. Adjacent bars within one session are not treated as opening gaps.
+- **Weekly/monthly rule**: Aggregated weekly and monthly candles are not evaluated as session-opening gaps.
+
+### Formation Classification
+
+| Class | Implemented evidence | Interpretation |
+|-------|----------------------|----------------|
+| Breakaway | Opens beyond the prior 20-bar range with formation volume ≥1.5× the preceding 20-bar average, without an established aligned trend | Potential transition out of a prior range |
+| Continuation | Gap direction agrees with the established formation-time 20-bar trend | Potential continuation within an existing trend |
+| Exhaustion Watch | Trend-aligned, at least 2 ATR from the 20-bar mean, and formation volume <0.8× average | Extension risk; reversal must still be confirmed by later price action |
+| Common | Sideways formation context and no break of the prior 20-bar range | Gap without a strong trend or breakout context |
+| Unclassified | Insufficient or conflicting formation evidence | Do not force a directional interpretation |
+
+Classification confidence describes the completeness of rule evidence, not expected profitability.
+
+### Fill Lifecycle
+
+Fill progress is measured from the opening price back to the previous close, matching the conventional gap-fill target.
+
+| Lifecycle | Meaning |
+|-----------|---------|
+| Open | Price has not moved back into the opening gap |
+| Partially Filled | Price moved toward the previous close but has not reached it |
+| Filled | Price reached the previous close after the formation session |
+| Same-Session Fade | Price reached the previous close during the formation session |
+| Failed | Price filled and closed through the previous close against the original gap direction |
 
 ### Signal Types
 
 | Signal | When It Fires | What It Means |
 |--------|---------------|---------------|
-| At Support (Unfilled Gap Up) | Price near a gap-up zone that was never breached | **Strongest support** — pristine zone. Institutional buy orders likely resting here. |
-| At Support (Filled Gap Up) | Price near a gap-up zone that was filled before | Weaker support on retest. May hold but needs confirmation (volume, candle pattern). |
-| At Resistance (Unfilled Gap Down) | Price near a gap-down zone that was never breached | **Strongest resistance** — pristine zone. Sellers likely to defend. |
-| At Resistance (Filled Gap Down) | Price near a gap-down zone that was filled before | Weaker resistance on retest. Watch for breakout or rejection. |
-| Possible Downside (In Gap Up) | Price is sitting inside a gap-up zone | Dangerous position — if gap support breaks, fast move down likely. |
-| Possible Upside (In Gap Down) | Price is sitting inside a gap-down zone | If resistance clears, short squeeze / fast move up likely. |
+| New Gap Up / Down | A qualifying gap formed on the current scan bar | Inspect class, relative volume, and fill state before forming a thesis |
+| Same-Session Fade | The current opening gap reached the previous close in the same session | The opening move did not preserve its gap through the session |
+| At Support (Unfilled/Filled Gap Up) | Price is near a surviving or previously crossed gap-up zone | Location evidence for a possible support test; confirmation is required |
+| At Resistance (Unfilled/Filled Gap Down) | Price is near a surviving or previously crossed gap-down zone | Location evidence for a possible resistance test; confirmation is required |
+| Possible Downside (In Gap Up) | Price is inside a prior gap-up zone | The prior gap is being traversed downward |
+| Possible Upside (In Gap Down) | Price is inside a prior gap-down zone | The prior gap is being traversed upward |
 
 ### Key Fields
 
 | Field | Description |
 |-------|-------------|
 | `gap_low` / `gap_high` | Boundaries of the gap zone |
-| `gap_pct` | Gap size as percentage of price |
+| `gap_pct` | Legacy compatibility alias for `full_gap_pct` |
 | `gap_atr_ratio` | Gap size relative to ATR(14) — higher = more significant |
 | `gap_date` | When the gap formed |
 | `trend` | 50/200 SMA trend context (Bullish / Bearish / Neutral-Bullish / Neutral-Bearish) |
 | `entry_direction` | For inside-gap signals: did price enter via rally (from below) or drop (from above) |
+| `gap_classification` | Breakaway / Continuation / Exhaustion Watch / Common / Unclassified |
+| `classification_reason_codes` | Observable rules that led to the classification |
+| `gap_lifecycle` / `fill_pct` | Current fill state and progress toward the previous close |
+| `opening_gap_pct` | Open versus the previous close |
+| `full_gap_pct` | Open beyond the previous high or low |
+| `formation_relative_volume` | Formation volume versus the preceding 20-bar average |
+| `gap_age_sessions` | Number of sessions since formation |
 
 ### How Gaps Help You Trade
 
-- **Buy at unfilled gap-up support** with a stop just below the gap zone. The gap acts as a floor.
-- **Short at unfilled gap-down resistance** with a stop just above the gap zone. The gap acts as a ceiling.
-- **Inside-gap entries** are breakout/breakdown setups: wait for price to exit the gap zone, then trade in the direction of the exit.
-- A **filled gap retesting** is a second-chance entry — lower conviction than pristine, but still actionable with volume confirmation.
-- Gaps with high `gap_atr_ratio` (≥1.5) are **institutional-grade** and tend to hold longer.
+- Use gap class to separate breakout, continuation, extension-risk, and context-poor events.
+- Use lifecycle and fill percentage to distinguish a held opening move from a partial fill, completed fill, or failure.
+- Treat support and resistance rows as locations to monitor, not unconditional entries.
+- Require independent confirmation such as a held/rejected retest, aligned trend, and observed participation.
+- Validate each class with forward fill rate, time-to-fill, MFE, MAE, and return studies before promoting it to qualified directional evidence.
 
 ### UI: Gap Screener
 
-- **3 tabs**: Support Zones, Resistance Zones, Inside Gap
-- **Status badges**: Strength (Strong Support / Retest), Proximity (At Edge / Testing / Approaching / Broken)
+- **5 tabs**: New Gaps, Support Zones, Resistance Zones, Fills & Fades, and Fair Value Gaps
+- **Classification filter**: Breakaway, Continuation, Exhaustion Watch, Common, or Unclassified
+- **Age filter**: Defaults to gaps formed within 20 sessions, with 5/60/252-session and all-age options
+- **Evidence columns**: Classification, lifecycle, fill percentage, age, and formation relative volume
+- **Status badges**: Zone type and proximity (At Edge / Testing / Approaching / Broken)
 - **Expandable rows**: Click a ticker to see all its active gaps, not just the primary one
 - **Cross-tab ticker search**: Type a ticker and the UI automatically switches to the tab containing it
 
@@ -275,6 +313,10 @@ Stocks in **strong uptrends** that are experiencing a temporary pullback to opti
 
 All three pillars must pass for a stock to appear in results:
 
+Daily calculations use the latest 210 completed bars, hourly calculations use 200 bars, and
+intraday calculations use 100 bars. Fixed windows keep a historical signal reproducible when
+older data is later added.
+
 #### Pillar 1: Trend Anchor (Must Pass)
 
 Confirms the stock is in a genuine uptrend, not a random bounce.
@@ -331,6 +373,9 @@ Ranks how good the pullback entry is on a 0–100 scale:
 The mirror image of Momentum Pullback: stocks in **confirmed downtrends** bouncing up toward resistance levels — identifying optimal short-entry or exit-long opportunities.
 
 ### The 3-Pillar Methodology (Inverted)
+
+Bearish Bounce uses the same fixed 210/200/100-bar daily/hourly/intraday calculation windows as
+Momentum Pullback.
 
 #### Pillar 1: Trend Anchor (Inverted)
 
@@ -1038,4 +1083,35 @@ When strategies disagree, exercise caution:
 
 ---
 
-*Last updated: April 2026*
+## 14. Proposed Intraday Scanner Research
+
+The next intraday research portfolio is designed around finalized canonical `30m` bars. These are
+predeclared hypotheses, not implemented or qualified recommendations.
+
+| Priority | Scanner | Initial horizons |
+|---:|---|---|
+| 1 | Opening Range Breakout | `+30m`, `+60m`, close, next open |
+| 2 | VWAP Reclaim/Rejection | `+30m`, `+60m`, close |
+| 3 | Intraday Trend Pullback | `+30m`, `+60m`, `+120m` |
+| 4 | Failed Opening Breakout | `+30m`, `+60m`, close |
+| 5 | Relative-Strength Continuation | `+60m`, close, next open |
+| 6 | Volatility Compression Expansion | `+30m`, `+60m`, `+120m` |
+| 7 | Power-Hour Continuation/Reversal | close-to-next-open diagnostic, next close |
+| 8 | Gap-and-Go / Gap-Fade | `+30m`, `+60m`, close |
+
+Opening Range Breakout, VWAP Reclaim/Rejection, and Intraday Trend Pullback are the recommended
+first implementations because their event boundaries and causal next-bar entries fit the stored
+`30m` data most directly. Continuation, failure, long, and short variants remain separate study
+hypotheses. Repeated matching bars within one episode do not create additional signals.
+
+The five-year `30m` dataset covers the current 386-member cohort and supports mechanics validation
+and fixed-cohort exploration. It does not establish historical liquid-universe performance without
+point-in-time intraday membership, corporate-action and symbol-change treatment, historical sector
+mappings, delisting-aware outcomes, and causally available benchmark bars.
+
+See [INTRADAY_STRATEGIES_DESIGN.md](INTRADAY_STRATEGIES_DESIGN.md) for trigger definitions,
+required evidence, outcome timing, FDR qualification, data limitations, and implementation order.
+
+---
+
+*Last updated: September 2026*

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import { Routes, Route, NavLink, Navigate, useNavigate } from 'react-router-dom'
-import { FlaskConical, X } from 'lucide-react'
+import { Routes, Route, NavLink, Navigate, useLocation, useNavigate } from 'react-router-dom'
+import { BarChart3, ChevronDown, FlaskConical, X } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import GapScreener from './pages/GapScreener'
 import MAScreener from './pages/MAScreener'
@@ -136,6 +136,78 @@ function TickerSearch() {
   )
 }
 
+const STRATEGY_ROUTES = [
+  { to: '/gaps', label: 'Gap & Imbalance' },
+  { to: '/ma-crossover', label: 'MA Crossover' },
+  { to: '/momentum-pullback', label: 'Momentum Pullback' },
+  { to: '/bearish-bounce', label: 'Bearish Bounce' },
+  { to: '/fibonacci', label: 'Fibonacci' },
+]
+
+function StrategyMenu() {
+  const location = useLocation()
+  const menuRef = useRef<HTMLLIElement>(null)
+  const [open, setOpen] = useState(false)
+  const [position, setPosition] = useState({ top: 0, left: 0 })
+  const active = STRATEGY_ROUTES.some(route => location.pathname.startsWith(route.to))
+
+  useEffect(() => {
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) setOpen(false)
+    }
+    const closeMenu = () => setOpen(false)
+    document.addEventListener('mousedown', closeOnOutsideClick)
+    window.addEventListener('resize', closeMenu)
+    window.addEventListener('scroll', closeMenu, true)
+    return () => {
+      document.removeEventListener('mousedown', closeOnOutsideClick)
+      window.removeEventListener('resize', closeMenu)
+      window.removeEventListener('scroll', closeMenu, true)
+    }
+  }, [])
+
+  const toggleMenu = () => {
+    if (!open && menuRef.current) {
+      const rect = menuRef.current.getBoundingClientRect()
+      setPosition({
+        top: rect.bottom + 6,
+        left: Math.min(rect.left, window.innerWidth - 232),
+      })
+    }
+    setOpen(value => !value)
+  }
+
+  return (
+    <li ref={menuRef} className="nav-menu" onKeyDown={(event) => event.key === 'Escape' && setOpen(false)}>
+      <button
+        type="button"
+        className={`nav-link nav-menu-button ${active ? 'active' : ''}`}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={toggleMenu}
+      >
+        Strategies
+        <ChevronDown size={15} aria-hidden="true" />
+      </button>
+      {open && (
+        <div className="nav-dropdown" role="menu" style={position}>
+          {STRATEGY_ROUTES.map(route => (
+            <NavLink
+              key={route.to}
+              to={route.to}
+              role="menuitem"
+              className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
+              onClick={() => setOpen(false)}
+            >
+              {route.label}
+            </NavLink>
+          ))}
+        </div>
+      )}
+    </li>
+  )
+}
+
 function App() {
   return (
     <div className="app">
@@ -147,31 +219,7 @@ function App() {
           <TickerSearch />
         </div>
         <ul className="navbar-nav">
-          <li>
-            <NavLink to="/gaps" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
-              Gap Strategies
-            </NavLink>
-          </li>
-          <li>
-            <NavLink to="/ma-crossover" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
-              MA Crossover
-            </NavLink>
-          </li>
-          <li>
-            <NavLink to="/momentum-pullback" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
-              Momentum Pullback
-            </NavLink>
-          </li>
-          <li>
-            <NavLink to="/bearish-bounce" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
-              Bearish Bounce
-            </NavLink>
-          </li>
-          <li>
-            <NavLink to="/fibonacci" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
-              Fibonacci
-            </NavLink>
-          </li>
+          <StrategyMenu />
           <li>
             <NavLink to="/overview" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
               All Tickers
@@ -188,8 +236,8 @@ function App() {
             </NavLink>
           </li>
           <li>
-            <NavLink to="/scanner-results" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
-              Scanner Results
+            <NavLink to="/stock-research" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+              <BarChart3 size={15} aria-hidden="true" /> Stock Research
             </NavLink>
           </li>
           <li>
@@ -211,10 +259,11 @@ function App() {
           <Route path="/overview" element={<TickersOverview />} />
           <Route path="/sector-intelligence" element={<SectorIntelligence />} />
           <Route path="/pattern-watch" element={<PatternWatch />} />
-          <Route path="/scanner-results" element={<ScannerResults />} />
+          <Route path="/stock-research/*" element={<ScannerResults />} />
           <Route path="/options/*" element={<OptionsResearchWorkspace />} />
-          <Route path="/scanner-evaluation" element={<Navigate to="/scanner-results" replace />} />
-          <Route path="/backtest" element={<Navigate to="/scanner-results" replace />} />
+          <Route path="/scanner-results" element={<Navigate to="/stock-research" replace />} />
+          <Route path="/scanner-evaluation" element={<Navigate to="/stock-research/research" replace />} />
+          <Route path="/backtest" element={<Navigate to="/stock-research/research" replace />} />
           <Route path="/ticker/:symbol" element={<TickerDetail />} />
         </Routes>
       </main>

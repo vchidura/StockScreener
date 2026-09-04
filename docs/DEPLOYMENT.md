@@ -1,544 +1,253 @@
-# Stock Screener Portal - Deployment Guide
+# Stock Screener Canonical Deployment
 
-## Quick Start with Docker Compose
+This guide is the production source of truth for the immutable equity platform.
+Fresh PostgreSQL 17 databases are initialized from `000_canonical_schema.sql`.
+Legacy price, scanner-event, archive, and cutover-only relations are not part of
+the final schema.
 
-### Prerequisites
-- Docker and Docker Compose installed
-- Git (to clone the repository)
+## Runtime Topology
 
-### 1. Configure Environment
-```bash
-cd stock-screener-portal
-cp .env.example .env
-# Edit .env with your database credentials
+| Service | Compose profile | Responsibility |
+|---|---|---|
+| `db` | default | PostgreSQL 17 and transactional baseline initialization |
+| `backend` | default | FastAPI canonical read API |
+| `frontend` | default | Nginx frontend and same-origin `/api` proxy |
+| `equity-universe-bootstrap` | `equity` | Idempotent Polygon stock/ETF universe discovery |
+| `equity-worker` | `equity` | REST ingestion, derivation, analysis, and publication |
+| `equity-portal-worker` | `equity` | Generation-aware portal snapshots |
+| `option-worker` | `options` | Delayed option ingestion, factor analysis, strategies, and recommendation publication |
+| `equity-migrate` | `maintenance` | One-shot migrations with the bootstrap administrator |
+| `equity-stream-worker` | `equity-stream` | Reserved Advanced stream; keep disabled |
+
+Options remain a read-only research surface. Do not enable equity option
+context, raw option archival, broker execution, or the Advanced stock stream
+until their separate acceptance gates pass.
+
+## Required Environment
+
+Copy the tracked template and edit only the ignored file:
+
+```powershell
+Copy-Item .\backend\.env.example .\backend\.env
 ```
 
-### 2. Build and Run
-```bash
-# Build and start all services
-docker-compose up -d --build
+Never commit `backend/.env`. The validator reports presence and state without
+printing credentials or API keys.
 
-# Check status
-docker-compose ps
+### Core Settings
 
-# View logs
-docker-compose logs -f
-```
+| Variable | Requirement |
+|---|---|
+| `APP_ENV` | `development` locally; `production` for deployment |
+| `DB_NAME` | Application database name |
+| `DB_USER` | Restricted runtime login; never a production superuser |
+| `DB_PASSWORD` | Strong runtime-role password |
+| `DB_HOST` | `127.0.0.1` locally; Compose overrides it to `db` |
+| `DB_PORT` | Native listener port; Compose overrides it to `5432` |
+| `POLYGON_API_KEY` | Required for equity ingestion and options metadata |
+| `CORS_ORIGINS` | Comma-separated exact browser origins |
 
-### 3. Access the Application
-- **Frontend**: http://localhost
-- **Backend API**: http://localhost:8001/docs (Swagger UI)
+Use the deployed HTTPS origin in production CORS. Development validation
+requires both `http://127.0.0.1:5174` and `http://localhost:5174`.
 
----
+### Compose Bootstrap Settings
 
-## Production Deployment Options
+These are used only by PostgreSQL bootstrap and the migration service:
 
-### Option 1: VPS/Cloud VM (DigitalOcean, Linode, AWS EC2)
+| Variable | Requirement |
+|---|---|
+| `POSTGRES_ADMIN_USER` | Bootstrap administrator, normally `postgres` |
+| `POSTGRES_ADMIN_PASSWORD` | Strong password distinct from the runtime password |
 
-1. **Provision a VM** with Docker installed (Ubuntu recommended)
-2. **Clone the repo** and configure `.env`
-3. **Run Docker Compose**:
-   ```bash
-   docker-compose up -d --build
-   ```
-4. **Configure firewall** to allow ports 80 (HTTP), 443 (HTTPS)
-5. **Add SSL** with nginx reverse proxy + Let's Encrypt
+`POSTGRES_ADMIN_USER` and `DB_USER` must differ. On an empty volume, Compose
+applies the canonical baseline as the administrator, creates `DB_USER` as
+`NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION`, and grants public-schema
+data access without schema ownership.
 
-### Option 2: Cloud Container Services
+### Canonical Worker Settings
 
-#### AWS (ECS/Fargate)
-- Push images to ECR
-- Create ECS task definitions for frontend/backend
-- Use RDS PostgreSQL for database
-- Use ALB for load balancing
-
-#### Azure Container Apps
-- Push images to Azure Container Registry
-- Deploy as Container Apps
-- Use Azure Database for PostgreSQL
-
-#### Google Cloud Run
-- Push images to Artifact Registry
-- Deploy as Cloud Run services
-- Use Cloud SQL for PostgreSQL
-
-### Option 3: Kubernetes (Advanced)
-```bash
-# Create namespace
-kubectl create namespace stock-screener
-
-# Apply manifests
-kubectl apply -f k8s/ -n stock-screener
-```
-
----
-
-## Standalone Deployment (Wheel Package — No Source Code)
-
-Deploy the portal using only pre-built artifacts. No repository clone or source code needed.
-
-### Building the Wheel Package
-
-The backend root files (`database.py`, `screeners.py`, `main.py`, `models.py`) are the
-production source of truth. The build script syncs them into `src/stock_screener/`,
-converts bare imports to relative package imports, and produces the `.whl`.
-
-```bash
-cd stock-screener-portal/backend
-
-# Preview what will be synced (no files changed)
-python build_wheel.py --check
-
-# Build the wheel
-python build_wheel.py
-```
-
-Output lands in `backend/dist/`:
-```
-dist/
-  stock_screener_api-1.1.0-py3-none-any.whl
-  stock_screener_api-1.1.0.tar.gz
-```
-
-> **Note**: Always edit the root-level files (`backend/database.py`, etc.) during
-> development. Never edit `src/stock_screener/` directly — those copies are
-> overwritten on every build.
-
-### Artifacts to Ship
-
-| File | Description | Location |
-|------|-------------|----------|
-| `stock_screener_api-1.1.0-py3-none-any.whl` | Backend API package | `backend/dist/` |
-| `frontend/dist/` | Pre-built frontend (run `npm run build` first) | `frontend/dist/` |
-| `stocks_db_backup_v4_2026-08-21.dump` | Database backup with all data and the cleaned 18-table schema | `backend/backups/` |
-| `stocks_db_schema_v2_2026-08-21.dump` | Complete empty 18-table application database schema | `backend/backups/` |
-| `stocks_market_schema_v1_2026-08-21.dump` | Empty ticker and market-price table schemas | `backend/backups/` |
-
-### Prerequisites on Target Machine
-
-| Dependency | Version | Purpose |
-|-----------|---------|---------|
-| Python | 3.10+ | Backend runtime |
-| PostgreSQL | 14+ | Database (includes `pg_restore`, `psql`) |
-| nginx (optional) | any | Serve frontend + proxy API |
-
-### Step 1: Restore Database
-
-```bash
-createdb -U postgres stocks_db
-pg_restore -U postgres -h localhost -d stocks_db stocks_db_backup_v4_2026-08-21.dump
-```
-
-### Step 2: Install Backend API
-
-```bash
-python -m venv venv
-
-# Windows
-venv\Scripts\activate
-# Linux/Mac
-source venv/bin/activate
-
-pip install stock_screener_api-1.1.0-py3-none-any.whl
-```
-
-### Step 3: Configure Environment
-
-Create a `.env` file in the directory you'll run from:
+The only common worker overrides are universe sizing and provider entitlement delay:
 
 ```env
-DB_NAME=stocks_db
-DB_USER=postgres
-DB_PASSWORD=your_password
-DB_HOST=localhost
-DB_PORT=5432
+EQUITY_UNIVERSE_TARGET_SIZE=350
+EQUITY_UNIVERSE_LOOKBACK_DAYS=20
+EQUITY_PROVIDER_DELAY_MINUTES=15
 ```
 
-### Step 4: Start Backend API
+Intervals, polling, worker counts, publication grace, stale-run age, locks, and stream behavior
+have tested defaults. Omit them unless a measured capacity or entitlement decision requires an
+override. The `equity-stream` profile must remain disabled.
 
-```bash
-# Default (port 8001)
-stock-screener
+The options worker uses XNYS-open-anchored slots, processes the latest observable boundary, and
+prioritizes any due durable retry from the current session. Keep provider delay explicit when it
+reflects the subscription; other cadence values may use defaults:
 
-# Custom port
-stock-screener --port 8080
-
-# Development mode with auto-reload
-stock-screener --reload
-
-# Custom .env file path
-stock-screener --env-file /path/to/.env
+```env
+OPTION_PROVIDER_DELAY_SECONDS=900
 ```
 
-API available at `http://localhost:8001/docs` (Swagger UI).
+Each due slot runs the configured option universe through references, chain
+ingestion, normalization, local IV/Greeks, chain/expiration analysis, strategy
+context, six strategy modules, payoff/scenarios, and atomic persistence.
+`option_strategy_candidates` retains every selected/suppressed/rejected decision;
+selected structured candidates publish `option_signal_events` and ordered legs for
+the Recommendations portal. Read-only mode prevents broker execution.
+The worker maintains only current and next month option partitions once per UTC month through the
+baseline's constrained security-definer function; the runtime role retains no general schema
+creation privilege.
 
-### Step 5: Serve Frontend
+### Canonical Reads
 
-Copy the `frontend/dist/` folder to the target machine, then:
+Canonical setup, Pattern Watch, portal snapshot, and scanner-page reads default to enabled and do
+not need `.env` entries. The readiness validator rejects an explicit `false` override.
 
-```bash
-# Quick option — Python built-in server
-cd dist
-python -m http.server 5174
+### Option Safety Gates
+
+Keep these values until the option platform is explicitly promoted:
+
+```env
+OPTION_DATA_ENGINE=polygon_developer
+OPTION_EXECUTION_ENGINE=paper_proxy
+OPTION_START_READ_ONLY=true
+OPTION_EQUITY_CONTEXT_ENABLED=false
+OPTION_RAW_ARCHIVE_ENABLED=false
 ```
 
-For production, use nginx to serve the frontend and proxy API calls:
+The remaining option universe, policy, cadence, and rate settings are listed
+in `backend/.env.example` and forwarded to the API container.
 
-```nginx
-server {
-    listen 80;
+## Preflight Validation
 
-    location / {
-        root /path/to/frontend/dist;
-        try_files $uri $uri/ /index.html;
-    }
+With the target database reachable through `backend/.env`, run:
 
-    location /api/ {
-        proxy_pass http://localhost:8001;
-    }
-}
+```powershell
+.\backend\.venv\Scripts\python.exe .\backend\scripts\validate_cutover_environment.py
+.\backend\.venv\Scripts\python.exe .\backend\scripts\validate_equity_storage.py
 ```
 
-### Access the Application
+Expected results:
 
-- **Frontend**: http://localhost (nginx) or http://localhost:5174 (Python server)
-- **Backend API**: http://localhost:8001/docs
+- Environment status is `PASS`.
+- Production reports `role_is_superuser: false`.
+- All materialized flags and option guards pass.
+- All eight canonical intervals contain 386 current members.
+- All 20 portal snapshots are fresh.
+- Analysis evidence and current projection mismatch lists are empty.
+- Retired legacy price, scanner-event, and cutover-only relations are absent.
 
----
+The current development database may warn that its local role is a superuser.
+That warning is permitted only while `APP_ENV=development`.
 
-## Patching / Upgrading After Code Changes
+## Production Compose Startup
 
-Use these steps to deploy new code changes to a running server.
+Set `APP_ENV=production`, use a restricted `DB_USER`, and run from the
+repository root:
 
-### Standalone (Wheel) Deployment
-
-#### 1. Rebuild the wheel after code changes
-
-```bash
-cd stock-screener-portal/backend
-python build_wheel.py
+```powershell
+docker compose --env-file backend/.env --profile equity up -d --build
+docker compose --env-file backend/.env --profile options up -d --build
+docker compose --env-file backend/.env ps
 ```
 
-#### 2. Copy artifacts to the server
+Do not add `--profile equity-stream`.
 
-Manually copy the built artifacts to the server
+The baseline and role scripts run only when `postgres_data` is first initialized.
+The equity profile runs Polygon universe discovery only while `selected_tickers`
+is empty. For long-range historical ingestion before continuous workers start,
+follow [Fresh Database Setup](FRESH_DATABASE_SETUP.md). Treat volume deletion as
+destructive and take a verified backup first.
 
-- **Backend wheel**: `backend/stock_screener_api-<version>-py3-none-any.whl` → server deploy directory
-- **Frontend files**: `portal/` folder → server frontend directory
+Validate inside the deployed API container:
 
-#### 3. Upgrade the backend on the server
+```powershell
+docker compose --env-file backend/.env exec backend `
+  python scripts/validate_cutover_environment.py
 
-```bash
-# Activate the virtual environment
-source venv/bin/activate          # Linux/Mac
-# or: venv\Scripts\activate       # Windows
-
-# Reinstall the wheel (--force-reinstall overwrites same version number)
-pip install --force-reinstall stock_screener_api-*.whl
-
-# Restart the backend process
-# If using systemd:
-sudo systemctl restart stock-screener
-
-# If running manually:
-stock-screener                    # or: uvicorn main:app --host 0.0.0.0 --port 8001
+Invoke-RestMethod http://localhost:8001/api/health
 ```
 
-#### 4. Frontend
+`/api/health` must report `healthy`, all canonical storage fields must be
+`true`, and `restricted_role_ready` must be `true` in production.
 
-No restart needed — nginx serves the new static files automatically.
-If using Python's built-in server, restart it:
+## Schema Installation
 
-```bash
-cd dist
-python -m http.server 5174
+Runtime services cannot alter schema. The maintenance service applies the
+baseline to an empty database, records an already-complete schema, or exits
+without work when the baseline version is present:
+
+```powershell
+docker compose --env-file backend/.env --profile maintenance run --rm equity-migrate
+docker compose --env-file backend/.env restart backend equity-worker equity-portal-worker
 ```
 
----
+It rejects partially initialized databases. Never grant the runtime role schema
+ownership merely to make installation convenient. Future schema changes must be
+added as reviewed migrations after the baseline rather than editing a deployed
+database manually.
 
-## Database Backup & Data Export
+## Native Development Startup
 
-Use these commands to backup your local database and restore it on the hosted server.
+For Windows development, use the DB host and port in `backend/.env`, then start
+these processes in separate terminals:
 
-### Export Local Database (with all data)
+```powershell
+# API
+.\backend\.venv\Scripts\python.exe -m uvicorn main:app `
+  --app-dir backend --host 127.0.0.1 --port 8001
 
-```bash
-# From your local machine - create a full backup (schema + data)
-cd stock-screener-portal/backend
+# Canonical materialization worker
+.\backend\.venv\Scripts\python.exe .\backend\scripts\run_equity_worker.py
 
-# Option 1: Custom format (recommended - compressed, flexible restore)
-pg_dump -U vamsh100 -h localhost -d stocks_db -F c -f stocks_db_backup.dump
+# Portal snapshot worker
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\refresh_equity_portal_snapshots.py --continuous
 
-# Option 2: Plain SQL format (portable, human-readable)
-pg_dump -U vamsh100 -h localhost -d stocks_db > stocks_db_backup.sql
+# Delayed option analysis and recommendation worker
+.\backend\.venv\Scripts\python.exe .\backend\scripts\run_option_worker.py
 
-# Option 3: Data only (if schema already exists on target)
-pg_dump -U vamsh100 -h localhost -d stocks_db --data-only > stocks_db_data.sql
+# Frontend
+Set-Location frontend
+npm.cmd run dev
 ```
 
-### Restore to Hosted Database
+Do not start the removed legacy scheduler. The canonical equity worker owns
+ongoing equity ingestion and materialization.
 
-```bash
-# For Docker Compose deployment - copy backup to server first
-scp stocks_db_backup.sql user@your-server:/path/to/stock-screener-portal/
+## Backup and Restore Verification
 
-# On server: Start DB container, then restore
-docker-compose up -d db
-docker-compose exec -T db psql -U postgres -d stocks_db < stocks_db_backup.sql
+Create a new versioned full dump; do not overwrite the previous known-good
+dump:
 
-# For managed PostgreSQL (Neon, Supabase, RDS, etc.)
-psql "postgresql://user:password@your-host.com/stocks_db" < stocks_db_backup.sql
-
-# For custom format (.dump files)
-pg_restore -U postgres -h your-host.com -d stocks_db stocks_db_backup.dump
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\backup_database.ps1 `
+  -Version fresh-canonical -Mode Full
 ```
 
-### Verify Data After Restore
+The backup script writes a `.partial` file, validates its catalog, atomically
+publishes the dump, and prints its SHA-256 checksum.
 
-```bash
-# Check row counts
-psql -U postgres -d stocks_db -c "SELECT COUNT(*) FROM stock_prices_hourly;"
-psql -U postgres -d stocks_db -c "SELECT COUNT(DISTINCT ticker) FROM stock_prices_hourly;"
+Restore it into a temporary isolated database and compare critical canonical,
+research, portal, and option table counts:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\verify_database_backup.ps1 `
+  -BackupPath C:\Backups\StockScreener\stocks_db_backup_current.dump
 ```
 
----
-
-## Database Migrations (Schema Versioning)
-
-Migration files are plain SQL under `backend/migrations/` and are applied manually in
-numeric order. Back up the database first, then stop application writers before applying
-a schema-changing migration.
-
-```bash
-# Apply the unused-table cleanup to an existing database.
-psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" \
-  -f backend/migrations/013_remove_unused_tables.sql
-```
-
-Migration `013` is idempotent. It removes only `stock_data`, `gap_scan_results`, and
-`pattern_weight_adjustments`; use the v4 full backup as the rollback point. New databases
-can instead be restored from the complete schema archive.
-
----
-
-## Scheduled Data Updates
-
-The scheduler runs four jobs to keep all price tables fresh. One unified background process handles everything.
-
-### Data Architecture
-
-| Interval | Source Table | Update Frequency | Notes |
-|----------|-------------|-----------------|-------|
-| 5m | `stock_prices_intraday` | Every 5 min | Base intraday interval (15m/30m aggregated on the fly) |
-| 1h | `stock_prices_hourly` | Every 60 min | 2+ years of history |
-| 1d (running bar) | `stock_prices_daily` | Every 5 min | Today's candle updated throughout the day |
-| 1d (final close) | `stock_prices_daily` | Once at ~4:15 PM ET | Final daily candle after market close |
-
-### Option 1: Unified Scheduler (Recommended)
-
-Single background process that runs all jobs automatically:
-
-```bash
-cd stock-screener-portal/backend
-
-# Start with Yahoo Finance (default, recommended — no API key needed)
-python scripts/run_scheduler.py
-
-# Start with Twelve Data (5m candles skipped due to rate limit)
-python scripts/run_scheduler.py --provider twelvedata
-
-# Specific tickers only
-python scripts/run_scheduler.py --tickers AAPL,MSFT,NVDA
-
-# Run as background process (Windows)
-start /B python scripts/run_scheduler.py
-
-# Run as background process (Linux/Mac)
-nohup python scripts/run_scheduler.py >> /var/log/scheduler.log 2>&1 &
-```
-
-The scheduler handles market hours automatically:
-- **9:30 AM - 4:00 PM ET (weekdays)**: Runs 5m, daily candle, and hourly jobs
-- **~4:15 PM ET**: Runs final daily close + last hourly update
-- **After hours/weekends**: Sleeps and logs status
-
-### Option 2: Individual Scripts (Standalone)
-
-Each script can also run independently with `--continuous` mode:
-
-```bash
-# 5m intraday candles — every 5 min during market hours
-python scripts/backfill_intraday.py --continuous
-
-# Hourly candles — every 60 min during market hours
-python scripts/update_hourly_prices.py --continuous
-
-# Daily candle update — every 5 min during market hours
-python scripts/update_intraday_prices.py --continuous
-
-# Daily close — runs after market close each day
-python scripts/update_daily_prices.py --continuous
-```
-
-### Option 3: Windows Task Scheduler
-
-1. Open Task Scheduler, Create Task
-2. **Triggers**: Daily, Start: 9:25 AM, Stop: 6:00 PM, Days: Monday-Friday
-3. **Actions**:
-   ```
-   Program: C:\path\to\python.exe
-   Arguments: scripts/run_scheduler.py
-   Start in: C:\path\to\stock-screener-portal\backend
-   ```
-
-### Option 4: Linux/Mac Cron
-
-```bash
-crontab -e
-
-# Start scheduler at 9:25 AM ET, Mon-Fri (it handles its own schedule)
-25 9 * * 1-5 cd /path/to/backend && /path/to/python scripts/run_scheduler.py >> /var/log/scheduler.log 2>&1
-```
-
-### Option 5: Docker Compose
-
-Add to `docker-compose.yml`:
-```yaml
-  scheduler:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    container_name: stock-screener-scheduler
-    command: python scripts/run_scheduler.py
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      DB_NAME: ${DB_NAME:-stocks_db}
-      DB_USER: ${DB_USER:-postgres}
-      DB_PASSWORD: ${DB_PASSWORD:-changeme}
-      DB_HOST: db
-      DB_PORT: 5432
-      TWELVEDATA_API_KEY: ${TWELVEDATA_API_KEY:-}
-    restart: unless-stopped
-```
-
-### Backfill Commands
-
-One-time commands to populate historical data:
-
-```bash
-cd stock-screener-portal/backend
-
-# Daily prices — last 30 days (or any range)
-python scripts/update_daily_prices.py --days 30 --force
-
-# Hourly prices — last 90 days
-python scripts/update_hourly_prices.py --backfill --days 90 --force
-
-# 5m intraday candles — last 7 days (yfinance limit)
-python scripts/backfill_intraday.py --interval 5m --days 7 --force
-```
-
-### Provider Comparison
-
-| Provider | API Key | Rate Limit | 5m Candles | Best For |
-|----------|---------|------------|------------|----------|
-| Yahoo Finance | Not needed | Generous | Yes (batch 50) | Recommended for all jobs |
-| Twelve Data | Required (free: 800/day) | 8 req/min | Too slow (skipped) | Fallback only |
-
-All scripts accept `--provider {yahoo,twelvedata}` to choose at runtime.
-
-### Environment Variables for Schedulers
-
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `TWELVEDATA_API_KEY` | API key from twelvedata.com | Only for `--provider twelvedata` |
-| `DB_*` | Database credentials | Yes |
-
-### Database Setup (Intraday Table)
-
-Run the migration to create the intraday table (if not already done):
-```bash
-psql -U $DB_USER -d $DB_NAME -f migrations/001_add_intraday_table.sql
-```
-
----
-
-## SSL/HTTPS Configuration
-
-### Using Nginx + Let's Encrypt (Certbot)
-
-1. Install certbot on your server
-2. Update nginx.conf:
-```nginx
-server {
-    listen 443 ssl;
-    server_name yourdomain.com;
-    
-    ssl_certificate /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/yourdomain.com/privkey.pem;
-    
-    # ... rest of config
-}
-
-server {
-    listen 80;
-    server_name yourdomain.com;
-    return 301 https://$server_name$request_uri;
-}
-```
-
----
-
-## Environment Variables Reference
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DB_NAME` | PostgreSQL database name | `stocks_db` |
-| `DB_USER` | Database user | `postgres` |
-| `DB_PASSWORD` | Database password | - |
-| `DB_HOST` | Database host | `db` (Docker) / `localhost` |
-| `DB_PORT` | Database port | `5432` |
-| `CORS_ORIGINS` | Allowed origins (comma-separated) | localhost URLs |
-
----
-
-## Useful Commands
-
-```bash
-# Stop all services
-docker-compose down
-
-# Rebuild specific service
-docker-compose build backend
-docker-compose up -d backend
-
-# View backend logs
-docker-compose logs -f backend
-
-# Access PostgreSQL CLI
-docker-compose exec db psql -U postgres -d stocks_db
-
-# Backup database
-docker-compose exec db pg_dump -U postgres stocks_db > backup.sql
-
-# Restore database
-cat backup.sql | docker-compose exec -T db psql -U postgres stocks_db
-```
-
----
-
-## Monitoring (Optional)
-
-Add monitoring with Prometheus + Grafana:
-
-```yaml
-# Add to docker-compose.yml
-prometheus:
-  image: prom/prometheus
-  volumes:
-    - ./prometheus.yml:/etc/prometheus/prometheus.yml
-  ports:
-    - "9090:9090"
-```
+The verifier also runs the canonical storage validator inside the temporary
+database and always drops that database in a `finally` block. Retain the
+checksum, `CANONICAL_RESTORE_VALIDATED`, and `RESTORE_VERIFIED` output with
+deployment evidence.
+
+## Frontend and Network
+
+Production frontend builds use `VITE_API_BASE_URL=/api`. Nginx proxies that
+same-origin path to `backend:8001`, so no browser-visible backend hostname or
+API secret is required. Terminate TLS at the deployment ingress and set
+`CORS_ORIGINS` to exact allowed origins.
+
+Expose PostgreSQL only when operationally required. The API port may also be
+kept private when all traffic enters through frontend Nginx or another reverse
+proxy.

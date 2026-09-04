@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
@@ -30,7 +30,8 @@ ET = ZoneInfo("America/New_York")
 DECIMAL_SCALE = Decimal("0.00000001")
 _UUID_TEXT = r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 _ARCHIVE_FILENAME = re.compile(
-    rf"^part-(?P<writer>{_UUID_TEXT})-(?P<sequence>[0-9]{{8}})-(?P<file>{_UUID_TEXT})\.parquet$",
+    rf"^part-(?P<writer>{_UUID_TEXT})-(?P<sequence>[0-9]{{8}})"
+    rf"(?:-(?P<file>{_UUID_TEXT}))?\.parquet$",
     re.IGNORECASE,
 )
 
@@ -212,22 +213,21 @@ class ParquetRawMarketArchive(RawMarketArchive):
             / f"hour={partition.market_hour:02d}"
         )
         directory.mkdir(parents=True, exist_ok=True)
-        filename = (
-            f"part-{self.writer_instance_id}-{sequence:08d}-{file_id}.parquet"
-        )
+        filename = f"part-{self.writer_instance_id}-{sequence:08d}.parquet"
         final_path = directory / filename
         partial_path = final_path.with_suffix(final_path.suffix + ".partial")
         table = pa.Table.from_pylist(
             [_trade_record(event) for event in events],
             schema=TRADE_SCHEMA,
         )
-        pq.write_table(
-            table,
-            partial_path,
-            compression="zstd",
-            version="2.6",
-            write_statistics=True,
-        )
+        with partial_path.open("wb") as sink:
+            pq.write_table(
+                table,
+                sink,
+                compression="zstd",
+                version="2.6",
+                write_statistics=True,
+            )
         self._validate_partial(partial_path, events)
         payload_sha256 = _file_sha256(partial_path)
         byte_size = partial_path.stat().st_size
@@ -257,14 +257,15 @@ class ParquetRawMarketArchive(RawMarketArchive):
         partial_path: Path,
         events: tuple[OptionTradeEvent, ...],
     ) -> None:
-        parquet_file = pq.ParquetFile(partial_path)
-        if not parquet_file.schema_arrow.equals(TRADE_SCHEMA, check_metadata=True):
-            raise ArchiveValidationError("Parquet trade schema does not match version 1")
-        if parquet_file.metadata.num_rows != len(events):
-            raise ArchiveValidationError("Parquet trade row count does not match input")
-        timestamp_table = parquet_file.read(
-            columns=["sip_timestamp", "first_observed_at", "revised_observed_at"]
-        )
+        with partial_path.open("rb") as source:
+            parquet_file = pq.ParquetFile(source)
+            if not parquet_file.schema_arrow.equals(TRADE_SCHEMA, check_metadata=True):
+                raise ArchiveValidationError("Parquet trade schema does not match version 1")
+            if parquet_file.metadata.num_rows != len(events):
+                raise ArchiveValidationError("Parquet trade row count does not match input")
+            timestamp_table = parquet_file.read(
+                columns=["sip_timestamp", "first_observed_at", "revised_observed_at"]
+            )
         _validate_observation_times(timestamp_table)
         timestamps = timestamp_table.column("sip_timestamp").to_pylist()
         if not timestamps:
@@ -514,7 +515,12 @@ def _inspect_trade_file(root: Path, path: Path) -> RawFileManifest:
         UUID(filename_match.group("writer"))
         if int(filename_match.group("sequence")) <= 0:
             raise ValueError("sequence must be positive")
-        file_id = UUID(filename_match.group("file"))
+        file_id_text = filename_match.group("file")
+        file_id = (
+            UUID(file_id_text)
+            if file_id_text
+            else uuid5(NAMESPACE_URL, f"option-raw-file:{object_key}")
+        )
         market_date = date.fromisoformat(parts["market_date"])
         underlyer = parts["underlying"]
         market_hour = int(parts["hour"])

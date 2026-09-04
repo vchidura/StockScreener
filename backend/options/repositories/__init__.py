@@ -3,6 +3,7 @@ from .analysis import OptionAnalysisRepository
 from .ingestion import OptionIngestionRepository
 from .leadership import OptionSchedulerLeadership
 from .new_series import OptionNewSeriesRepository
+from .outcomes import OptionOutcomeRepository
 from .retention import OptionRetentionRepository
 from .snapshots import OptionSnapshotRepository
 from .trades import OptionTradeRepository
@@ -16,6 +17,7 @@ __all__ = [
 	"OptionIngestionRepository",
 	"OptionSchedulerLeadership",
 	"OptionNewSeriesRepository",
+	"OptionOutcomeRepository",
 	"OptionRetentionRepository",
 	"OptionSnapshotRepository",
 	"OptionTradeRepository",

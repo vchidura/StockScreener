@@ -1,7 +1,7 @@
 """
 Add more tickers to selected_tickers table.
 
-Scans tickers already in the DB (stock_prices_hourly) that are NOT yet
+Scans tickers already in the canonical hourly view that are NOT yet
 in selected_tickers, ranks them by composite score, and adds the top N.
 
 Unlike filter_top_tickers.py, this script:
@@ -40,7 +40,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from database import get_db_cursor, create_selected_tickers_table, get_selected_tickers
+from database import get_db_cursor, get_selected_tickers
 
 DEFAULT_ADD_N = 215
 MIN_AVG_VOLUME = 100_000
@@ -64,7 +64,7 @@ WEIGHTS_ENRICHED = {
 
 def fetch_unselected_ticker_metrics(existing: set) -> pd.DataFrame:
     """
-    Query stock_prices_hourly for per-ticker metrics (last 90 days),
+    Query canonical hourly bars for per-ticker metrics (last 90 days),
     excluding tickers already in selected_tickers.
     """
     query = """
@@ -79,7 +79,7 @@ def fetch_unselected_ticker_metrics(existing: set) -> pd.DataFrame:
             COUNT(*)                                     AS data_days,
             MIN(datetime)                                AS first_date,
             MAX(datetime)                                AS last_date
-        FROM stock_prices_hourly
+        FROM equity_canonical_hourly_bars
         WHERE datetime >= NOW() - INTERVAL '90 days'
         GROUP BY ticker
         HAVING COUNT(*) >= 20
@@ -163,8 +163,6 @@ def rank_tickers(df: pd.DataFrame, top_n: int, enriched: bool) -> pd.DataFrame:
 
 def add_selected_tickers(tickers: list) -> int:
     """ADD tickers to selected_tickers without deactivating existing ones."""
-    create_selected_tickers_table()
-
     with get_db_cursor(dict_cursor=False) as cursor:
         added = 0
         for ticker in tickers:

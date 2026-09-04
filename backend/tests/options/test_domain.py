@@ -25,6 +25,7 @@ from options.domain import (
     reference_drift_failed,
 )
 from options.errors import ContextViolation
+from options.strategies.domain import StructureType, signal_identity_sha256
 
 
 UTC = timezone.utc
@@ -182,4 +183,32 @@ def test_new_series_transitions_and_reference_drift_boundaries():
         10_000,
         maximum_unknown_references=20,
         maximum_unknown_reference_fraction=Decimal("0.01"),
+    )
+
+
+def test_signal_identity_tracks_the_package_not_the_analysis_matrix():
+    package = signal_identity_sha256(
+        "SPY",
+        "INCOME_WHEEL",
+        "1.0",
+        HASH,
+        StructureType.CASH_SECURED_PUT,
+        ((101, "SELL", 1, 100),),
+    )
+
+    assert package == signal_identity_sha256(
+        "SPY",
+        "INCOME_WHEEL",
+        "1.0",
+        HASH,
+        StructureType.CASH_SECURED_PUT,
+        ((101, "SELL", 1, 100),),
+    )
+    assert package != signal_identity_sha256(
+        "SPY",
+        "INCOME_WHEEL",
+        "1.0",
+        HASH,
+        StructureType.CASH_SECURED_PUT,
+        ((102, "SELL", 1, 100),),
     )

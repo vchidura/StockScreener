@@ -1,11 +1,12 @@
 import { useMemo, useState } from 'react'
 import { useQuery, keepPreviousData } from '@tanstack/react-query'
-import { useNavigate } from 'react-router-dom'
-import { X } from 'lucide-react'
+import { NavLink, useLocation, useNavigate } from 'react-router-dom'
+import { BarChart3, Radar, X } from 'lucide-react'
 import {
   getScannerEventBacklog,
   getLatestScannerSignals,
   getScannerQualification,
+  ScannerQualificationRow,
   ScannerInterval,
 } from '../services/api'
 
@@ -24,6 +25,18 @@ const scannerLabels: Record<string, string> = {
   sma200_reclaim_rejection: 'SMA200 reclaim rejection',
   structure_reversal: 'Structure reversal',
   structured_trend_pullback: 'Structured trend pullback',
+}
+
+const researchScannerLabels: Record<string, string> = {
+  ...scannerLabels,
+  gap_breakaway_hold: 'Gap breakaway hold',
+  gap_breakaway_confirmation: 'Gap breakaway confirmation',
+  gap_continuation_hold: 'Gap continuation hold',
+  gap_entry_fill: 'Gap entry fill',
+  gap_fade_reversal: 'Gap fade reversal',
+  ma_crossover_9_21: 'MA crossover 9/21',
+  momentum_pullback: 'Momentum pullback',
+  bearish_bounce: 'Bearish bounce',
 }
 
 const scannerMeta: Record<string, { direction: string; description: string }> = {
@@ -67,16 +80,18 @@ const money = (value: number | null) => value == null
   : new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(value)
 
 const intervalLabel = (interval: ScannerInterval) => (
-  interval === '1d' ? 'Daily' : interval === '1wk' ? 'Weekly' : 'Hourly'
+  interval === '1d' ? 'Daily' : interval === '1wk' ? 'Weekly' : interval === '1h' ? 'Hourly' : '30 minute'
 )
 
+const intraday = (interval: ScannerInterval) => interval === '1h' || interval === '30m'
+
 const horizonLabel = (interval: ScannerInterval, horizon: number) => (
-  `${horizon} ${interval === '1wk' ? 'sessions' : 'bars'}`
+  `${horizon} ${intraday(interval) ? (horizon === 1 ? 'bar' : 'bars') : (horizon === 1 ? 'session' : 'sessions')}`
 )
 
 const signalTime = (value: string, interval: ScannerInterval) => new Intl.DateTimeFormat('en-US', {
   timeZone: 'America/New_York', month: 'short', day: 'numeric', year: 'numeric',
-  ...(interval === '1h' ? { hour: 'numeric', minute: '2-digit' } as const : {}),
+  ...(intraday(interval) ? { hour: 'numeric', minute: '2-digit' } as const : {}),
 }).format(new Date(value))
 
 const reviewPriorityBadge = (tier: 'HIGHER' | 'STANDARD' | 'LOWER' | 'UNRANKED') => {
@@ -86,8 +101,16 @@ const reviewPriorityBadge = (tier: 'HIGHER' | 'STANDARD' | 'LOWER' | 'UNRANKED')
   return { label: 'Unranked', color: colors.muted, bg: colors.canvas }
 }
 
+const evidenceBadge = (state: ScannerQualificationRow['evidence_status']) => {
+  if (state === 'ROBUST_PASS') return { label: 'Robust', color: colors.green, bg: colors.greenSoft }
+  if (state === 'MONITOR_ONLY') return { label: 'Monitor', color: colors.amber, bg: colors.amberSoft }
+  return { label: 'Unranked', color: colors.muted, bg: colors.canvas }
+}
+
 export default function ScannerResults() {
   const navigate = useNavigate()
+  const location = useLocation()
+  const researchView = location.pathname.endsWith('/research')
   const [signalInterval, setSignalInterval] = useState<'all' | ScannerInterval>('all')
   const [signalSide, setSignalSide] = useState<'all' | 'long' | 'short'>('all')
   const [signalEvidence, setSignalEvidence] = useState<'all' | 'robust' | 'monitor' | 'unranked'>('all')
@@ -95,6 +118,9 @@ export default function ScannerResults() {
   const [signalSector, setSignalSector] = useState('all')
   const [signalScanner, setSignalScanner] = useState('all')
   const [signalSearch, setSignalSearch] = useState('')
+  const [researchInterval, setResearchInterval] = useState<ScannerInterval>('1d')
+  const [researchEvidence, setResearchEvidence] = useState<'all' | 'ROBUST_PASS' | 'MONITOR_ONLY' | 'UNRANKED'>('all')
+  const [researchScanner, setResearchScanner] = useState('all')
 
   const qualification = useQuery({
     queryKey: ['scanner-qualification'],
@@ -103,11 +129,13 @@ export default function ScannerResults() {
   const backlog = useQuery({
     queryKey: ['scanner-events', 'backlog'],
     queryFn: () => getScannerEventBacklog(),
+    enabled: researchView,
   })
   const latestSignals = useQuery({
     queryKey: ['scanner-events', 'latest-by-ticker', signalInterval],
     queryFn: () => getLatestScannerSignals(signalInterval === 'all' ? undefined : signalInterval),
     placeholderData: keepPreviousData,
+    enabled: !researchView,
   })
 
   const allRows = qualification.data?.results ?? []
@@ -135,6 +163,36 @@ export default function ScannerResults() {
   })
   const totalEvents = allRows.reduce((sum, row) => sum + row.events, 0)
   const pending = (backlog.data?.results ?? []).reduce((sum, row) => sum + row.pending, 0)
+  const researchRows = allRows.filter(row => (
+    row.interval === researchInterval
+    && (researchEvidence === 'all' || row.evidence_status === researchEvidence)
+    && (researchScanner === 'all' || row.scanner_name === researchScanner)
+  ))
+  const researchHorizons = Array.from(new Set(
+    allRows.filter(row => row.interval === researchInterval).map(row => row.horizon_bars),
+  )).sort((left, right) => left - right)
+  const researchGroups = Array.from(researchRows.reduce((groups, row) => {
+    const key = `${row.scanner_name}|${row.scanner_version}|${row.direction}|${row.return_mode}`
+    const group = groups.get(key) ?? {
+      scannerName: row.scanner_name,
+      scannerVersion: row.scanner_version,
+      direction: row.direction,
+      returnMode: row.return_mode,
+      rows: [] as ScannerQualificationRow[],
+    }
+    group.rows.push(row)
+    groups.set(key, group)
+    return groups
+  }, new Map<string, {
+    scannerName: string
+    scannerVersion: string
+    direction: 1 | -1
+    returnMode: ScannerQualificationRow['return_mode']
+    rows: ScannerQualificationRow[]
+  }>()).values())
+  const researchScanners = Array.from(new Set(allRows.map(row => row.scanner_name))).sort()
+  const qualifiedPeriods = allRows.filter(row => row.events >= (qualification.data?.gates.minimum_events ?? 100)
+    && row.independent_periods >= (qualification.data?.gates.minimum_independent_periods ?? 40)).length
 
   const panel: React.CSSProperties = {
     background: colors.panel, border: `1px solid ${colors.line}`, borderRadius: 7,
@@ -144,25 +202,44 @@ export default function ScannerResults() {
     color: colors.ink, padding: '7px 10px', fontSize: 13,
   }
 
-  if (latestSignals.isLoading) return <div style={{ padding: 24, color: colors.muted }}>Loading scanner results…</div>
-  if (latestSignals.isError) return <div style={{ padding: 24, color: colors.red }}>Scanner results could not be loaded.</div>
+  const loading = researchView ? qualification.isLoading || backlog.isLoading : latestSignals.isLoading
+  const errored = researchView ? qualification.isError || backlog.isError : latestSignals.isError
+
+  if (loading) return <div style={{ padding: 24, color: colors.muted }}>Loading stock research…</div>
+  if (errored) return <div style={{ padding: 24, color: colors.red }}>Stock research could not be loaded.</div>
 
   return (
-    <div style={{ color: colors.ink, opacity: latestSignals.isFetching ? 0.6 : 1, transition: 'opacity 0.15s' }}>
+    <div style={{ color: colors.ink, opacity: latestSignals.isFetching || qualification.isFetching ? 0.6 : 1, transition: 'opacity 0.15s' }}>
       <header style={{ padding: '10px 2px 18px', borderBottom: `1px solid ${colors.line}`, marginBottom: 16 }}>
-        <div style={{ color: colors.blue, fontSize: 12, fontWeight: 700, textTransform: 'uppercase' }}>Signal review · developing page</div>
-        <h1 style={{ fontSize: 26, lineHeight: 1.15, margin: '4px 0 5px', letterSpacing: 0 }}>Scanner Results</h1>
+        <div style={{ color: colors.blue, fontSize: 12, fontWeight: 700, textTransform: 'uppercase' }}>Equity signal research</div>
+        <h1 style={{ fontSize: 26, lineHeight: 1.15, margin: '4px 0 5px', letterSpacing: 0 }}>Stock Research</h1>
         <p style={{ margin: 0, color: colors.muted, fontSize: 14 }}>
-          Each ticker's latest scanner signal, for understanding what the shadow scanners are currently finding.
-          This page is intentionally detailed while the presentation is still evolving; expect it to be simplified later.
+          Review current scanner opportunities separately from historical outcome evidence and statistical qualification.
         </p>
       </header>
 
+      <nav aria-label="Stock research views" style={{ display: 'flex', gap: 4, borderBottom: `1px solid ${colors.line}`, marginBottom: 16 }}>
+        {[
+          { to: '/stock-research', label: 'Opportunity Board', icon: Radar, end: true },
+          { to: '/stock-research/research', label: 'Research', icon: BarChart3, end: false },
+        ].map(item => {
+          const Icon = item.icon
+          return <NavLink key={item.to} to={item.to} end={item.end} style={({ isActive }) => ({
+            display: 'inline-flex', alignItems: 'center', gap: 7, padding: '10px 14px',
+            color: isActive ? colors.blue : colors.muted, fontSize: 13, fontWeight: 750,
+            textDecoration: 'none', borderBottom: `2px solid ${isActive ? colors.blue : 'transparent'}`,
+            marginBottom: -1,
+          })}><Icon size={15} aria-hidden="true" />{item.label}</NavLink>
+        })}
+      </nav>
+
+      {researchView ? <>
       <section style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(175px, 1fr))', gap: 10, marginBottom: 16 }}>
         {[
           ['Combinations', allRows.length.toString(), 'scanner × side × horizon'],
           ['Robust scanners', robustRows.length.toString(), 'after family-wise FDR'],
           ['Monitor only', monitorRows.length.toString(), 'raw pass; not robust'],
+          ['Sample-ready', qualifiedPeriods.toString(), 'event and independent-period floors'],
           ['Event outcomes', compact(totalEvents), 'across all combinations'],
           ['Pending', compact(pending), pending === 0 ? 'all due outcomes complete' : 'future bars required'],
         ].map(([label, value, detail]) => (
@@ -173,6 +250,81 @@ export default function ScannerResults() {
           </div>
         ))}
       </section>
+
+      <section style={{ ...panel, marginBottom: 16 }}>
+        <div style={{ padding: '12px 14px', borderBottom: `1px solid ${colors.line}`, display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+          <div>
+            <h2 style={{ fontSize: 16, margin: 0, letterSpacing: 0 }}>Historical qualification matrix</h2>
+            <div style={{ color: colors.muted, fontSize: 11, marginTop: 2 }}>One scanner, side and return mode per row, with frame-specific horizons kept separate. Returns are net of the recorded cost model and sector-primary benchmark.</div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <select aria-label="Research interval" value={researchInterval} onChange={event => setResearchInterval(event.target.value as ScannerInterval)} style={control}>
+              <option value="1d">Daily frame</option><option value="1wk">Weekly frame</option><option value="1h">Hourly frame</option><option value="30m">30 minute frame</option>
+            </select>
+            <select aria-label="Research scanner" value={researchScanner} onChange={event => setResearchScanner(event.target.value)} style={control}>
+              <option value="all">All scanners</option>
+              {researchScanners.map(name => <option key={name} value={name}>{researchScannerLabels[name] ?? name.replace(/_/g, ' ')}</option>)}
+            </select>
+            <select aria-label="Research evidence" value={researchEvidence} onChange={event => setResearchEvidence(event.target.value as typeof researchEvidence)} style={control}>
+              <option value="all">All evidence states</option><option value="ROBUST_PASS">Robust</option><option value="MONITOR_ONLY">Monitor only</option><option value="UNRANKED">Unranked</option>
+            </select>
+          </div>
+        </div>
+        <div style={{ overflowX: 'auto', maxHeight: 690, overflowY: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+            <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}><tr style={{ background: '#f8fafc', color: colors.muted }}>
+              <th style={{ textAlign: 'left', padding: '9px 10px', whiteSpace: 'nowrap', borderBottom: `1px solid ${colors.line}` }}>Scanner</th>
+              <th style={{ textAlign: 'left', padding: '9px 10px', whiteSpace: 'nowrap', borderBottom: `1px solid ${colors.line}` }}>Side</th>
+              <th style={{ textAlign: 'left', padding: '9px 10px', whiteSpace: 'nowrap', borderBottom: `1px solid ${colors.line}` }}>Return</th>
+              {researchHorizons.map(horizon => <th key={horizon} style={{ textAlign: 'left', padding: '9px 10px', minWidth: 205, whiteSpace: 'nowrap', borderBottom: `1px solid ${colors.line}` }}>{horizonLabel(researchInterval, horizon)}</th>)}
+            </tr></thead>
+            <tbody>
+              {researchGroups.length === 0 && <tr><td colSpan={3 + researchHorizons.length} style={{ padding: 18, color: colors.muted }}>No historical combinations match these filters.</td></tr>}
+              {researchGroups.map(group => <tr key={`${group.scannerName}-${group.scannerVersion}-${group.direction}-${group.returnMode}`} style={{ borderBottom: `1px solid ${colors.line}` }}>
+                <td style={{ padding: '10px', minWidth: 180, verticalAlign: 'top' }}><strong>{researchScannerLabels[group.scannerName] ?? group.scannerName.replace(/_/g, ' ')}</strong><div style={{ color: colors.muted, fontSize: 10 }}>{group.scannerVersion}</div></td>
+                <td style={{ padding: '10px', verticalAlign: 'top', color: group.direction === 1 ? colors.green : colors.red, fontWeight: 700 }}>{group.direction === 1 ? 'Long' : 'Short'}</td>
+                <td style={{ padding: '10px', minWidth: 105, verticalAlign: 'top', color: colors.muted }}>{group.returnMode === 'RECOMMENDATION_PLAN' ? 'Stop / target plan' : 'Horizon close'}</td>
+                {researchHorizons.map(horizon => {
+                  const row = group.rows.find(item => item.horizon_bars === horizon)
+                  if (!row) return <td key={horizon} style={{ padding: '10px', color: colors.muted, verticalAlign: 'top' }}>No matching result</td>
+                  const badge = evidenceBadge(row.evidence_status)
+                  return <td key={horizon} style={{ padding: '10px', verticalAlign: 'top' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                      <strong style={{ color: (row.mean_net_alpha ?? 0) > 0 ? colors.green : colors.red }}>α {pct(row.mean_net_alpha)}</strong>
+                      <span style={{ background: badge.bg, color: badge.color, borderRadius: 4, padding: '2px 5px', fontSize: 10, fontWeight: 700 }}>{badge.label}</span>
+                    </div>
+                    <div style={{ marginTop: 5 }}>Return {pct(row.mean_net_return)} · hit {pct(row.hit_rate, 1)}</div>
+                    <div style={{ color: colors.muted, marginTop: 3 }}>{row.events.toLocaleString()} events · {row.independent_periods} periods</div>
+                    <div style={{ color: colors.muted, marginTop: 3 }}>t {row.alpha_t_stat == null ? '—' : row.alpha_t_stat.toFixed(2)} · q {row.alpha_fdr_q == null ? '—' : row.alpha_fdr_q.toFixed(3)}</div>
+                    <div style={{ color: colors.muted, marginTop: 3 }}>Early/late α {pct(row.early_alpha)} / {pct(row.late_alpha)}</div>
+                    <div style={{ color: colors.muted, marginTop: 3 }}>MAE/MFE {pct(row.mean_mae_pct)} / {pct(row.mean_mfe_pct)}</div>
+                    {(row.stop_hit_rate != null || row.target_hit_rate != null) && <div style={{ color: colors.muted, marginTop: 3 }}>Stop/target hit {pct(row.stop_hit_rate ?? null, 1)} / {pct(row.target_hit_rate ?? null, 1)}</div>}
+                    {(
+                      row.stop_hit_rate === undefined
+                        ? row.stop_first_rate != null || row.target_first_rate != null
+                        : row.stop_hit_rate != null || row.target_hit_rate != null
+                    ) && <div style={{ color: colors.muted, marginTop: 3 }}>Stop/target first {pct(row.stop_first_rate, 1)} / {pct(row.target_first_rate, 1)}</div>}
+                  </td>
+                })}
+              </tr>)}
+            </tbody>
+          </table>
+        </div>
+        <div style={{ padding: '8px 14px', color: colors.muted, fontSize: 11, borderTop: `1px solid ${colors.line}` }}>
+          Showing {researchGroups.length} scanner/side rows containing {researchRows.length} of {allRows.length} combinations · {intervalLabel(researchInterval)} frame · entry model {qualification.data?.entry_model?.replace(/_/g, ' ')}.
+        </div>
+      </section>
+
+      <section style={{ ...panel, padding: 14 }}>
+        <h2 style={{ fontSize: 16, margin: '0 0 8px', letterSpacing: 0 }}>Qualification policy</h2>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(185px, 1fr))', gap: 10, color: colors.muted, fontSize: 12 }}>
+          <div><strong style={{ color: colors.ink }}>Sample floors</strong><br />{qualification.data?.gates.minimum_events} events · {qualification.data?.gates.minimum_independent_periods} independent periods</div>
+          <div><strong style={{ color: colors.ink }}>Alpha evidence</strong><br />t-stat &gt; {qualification.data?.gates.minimum_alpha_t_stat} · positive early and late halves</div>
+          <div><strong style={{ color: colors.ink }}>Multiplicity</strong><br />FDR q ≤ {qualification.data?.gates.maximum_false_discovery_rate}</div>
+          <div><strong style={{ color: colors.ink }}>Calibration</strong><br />{qualification.data?.gates.minimum_calibration_oos_periods} out-of-sample periods required</div>
+        </div>
+      </section>
+      </> : <>
 
       <section style={{ ...panel, marginBottom: 16 }}>
         <div style={{ padding: '12px 14px', borderBottom: `1px solid ${colors.line}`, display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
@@ -207,7 +359,7 @@ export default function ScannerResults() {
               )}
             </div>
             <select aria-label="Signal interval" value={signalInterval} onChange={event => setSignalInterval(event.target.value as typeof signalInterval)} style={control}>
-              <option value="all">Latest any interval</option><option value="1d">Latest daily</option><option value="1wk">Latest weekly</option><option value="1h">Latest hourly</option>
+              <option value="all">Latest any interval</option><option value="1d">Latest daily</option><option value="1wk">Latest weekly</option><option value="1h">Latest hourly</option><option value="30m">Latest 30 minute</option>
             </select>
             <select aria-label="Signal setup" value={signalScanner} onChange={event => setSignalScanner(event.target.value)} style={control}>
               <option value="all">All setups</option>
@@ -279,7 +431,7 @@ export default function ScannerResults() {
                     <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap' }}>{signalTime(row.signal_time, row.interval)}</td>
                     <td style={{ textAlign: 'right', padding: '9px 10px' }}>{intervalLabel(row.interval)}</td>
                     <td style={{ padding: '9px 10px', minWidth: 185 }}>
-                      <div style={{ color: row.direction === 1 ? colors.green : colors.red, fontWeight: 700 }}>{row.direction === 1 ? 'Long' : 'Short'} · {row.trigger_type.replace(/_/g, ' ')}</div>
+                      <div style={{ color: row.direction === 1 ? colors.green : colors.red, fontWeight: 700 }}>{row.direction === 1 ? 'Long' : 'Short'} · {(row.trigger_type || row.scanner_name).replace(/_/g, ' ')}</div>
                       <div style={{ color: colors.muted, fontSize: 11 }}>{scannerLabels[row.scanner_name] ?? row.scanner_name}</div>
                     </td>
                     <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap' }}>{money(row.signal_open_price)}</td>
@@ -346,6 +498,7 @@ export default function ScannerResults() {
           ))}
         </ul>
       </section>
+      </>}
     </div>
   )
 }

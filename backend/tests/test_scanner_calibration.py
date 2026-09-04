@@ -1,5 +1,7 @@
 import sys
 import unittest
+from unittest.mock import patch
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +42,22 @@ class ScannerCalibrationTests(unittest.TestCase):
         self.assertEqual(result["calibration_oos_periods"], 0)
         self.assertIsNone(result["calibrated_win_probability"])
         self.assertEqual(result["calibration_curve"], [])
+
+    def test_calibration_curve_omits_unused_categorical_bins(self):
+        returns = pd.Series([
+            0.01 if index % 3 else -0.01 for index in range(100)
+        ])
+        categories = pd.Categorical(
+            ["populated"] * 60,
+            categories=["populated", "unused"],
+        )
+
+        with patch("research.scanner_calibration.pd.qcut", return_value=categories):
+            result = walk_forward_calibration(returns, returns)
+
+        self.assertEqual(len(result["calibration_curve"]), 1)
+        self.assertEqual(result["calibration_curve"][0]["count"], 60)
+        json.dumps(result, allow_nan=False)
 
 
 if __name__ == "__main__":

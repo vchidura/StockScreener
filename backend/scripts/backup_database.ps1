@@ -108,9 +108,14 @@ try {
         $dumpArgs += @(
             "--schema-only",
             "--table=public.selected_tickers",
-            "--table=public.stock_prices_daily",
-            "--table=public.stock_prices_hourly",
-            "--table=public.stock_prices_intraday"
+            "--table=public.equity_ingestion_segments",
+            "--table=public.equity_bar_revisions",
+            "--table=public.equity_bar_publications",
+            "--table=public.equity_bar_publication_members",
+            "--table=public.equity_current_bar_projection",
+            "--table=public.equity_canonical_bars",
+            "--table=public.equity_canonical_daily_bars",
+            "--table=public.equity_canonical_hourly_bars"
         )
     }
     & $pgDump @dumpArgs

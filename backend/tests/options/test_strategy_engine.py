@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+import numpy as np
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(BACKEND_DIR) not in sys.path:
@@ -22,7 +23,10 @@ from options.domain import (
     TradeClassificationStatus,
 )
 from options.strategies.domain import CandidateStatus, StrategyContextSnapshot, StrategyContextStatus
-from options.strategies.engine import OptionStrategyEngine
+from options.strategies.engine import (
+    OptionStrategyEngine,
+    _quadratic_coefficient_payload,
+)
 
 
 UTC = timezone.utc
@@ -161,6 +165,16 @@ def test_healthy_matrix_selects_deterministic_wheel_candidates_and_scenarios():
         )
 
 
+def test_smile_fit_coefficients_match_durable_object_contract():
+    payload = _quadratic_coefficient_payload(np.asarray([1.5, -0.25, 0.3]))
+
+    assert payload == {
+        "quadratic": 1.5,
+        "linear": -0.25,
+        "intercept": 0.3,
+    }
+
+
 def test_failed_chain_persists_one_suppression_for_each_registered_strategy():
     configuration = load_option_runtime_configuration({"POLYGON_API_KEY": "test"}, BACKEND_DIR)
     engine = OptionStrategyEngine(
@@ -249,3 +263,82 @@ def test_sweep_like_cluster_is_research_only_and_preserves_event_keys():
     assert sweep[0].primary_evidence["qualifying_print_count"] == 10
     assert len(sweep[0].primary_evidence["contributing_event_keys"]) == 10
     assert sweep[0].primary_evidence["aggressor_side"] is None
+
+
+def test_linked_equity_context_routes_gamma_to_qualified_direction():
+    configuration = load_option_runtime_configuration({"POLYGON_API_KEY": "test"}, BACKEND_DIR)
+    engine = OptionStrategyEngine(
+        configuration.strategy_policy,
+        configuration.strategy_policy_sha256,
+    )
+    matrix_id = uuid4()
+    call = replace(
+        snapshot(20, "100", "1.50", 0.30, ContractType.CALL),
+        calendar_dte=0, local_gamma=0.10, day_volume=400, open_interest=100,
+    )
+    put = replace(
+        snapshot(21, "100", "1.50", 0.30, ContractType.PUT),
+        calendar_dte=0, local_gamma=0.10, day_volume=400, open_interest=100,
+    )
+    context = replace(
+        strategy_context(matrix_id),
+        equity_context_snapshot_id=uuid4(),
+        equity_context_status="COMPLETE",
+        qualified_direction="BULLISH",
+    )
+
+    candidates = engine._gamma_squeeze(matrix_id, (call, put), context)
+
+    selected = [item for item in candidates if item.status is CandidateStatus.SELECTED]
+    assert len(selected) == 1
+    assert selected[0].legs[0].contract_type is ContractType.CALL
+    assert selected[0].primary_evidence["directional_thesis"] == "BULLISH"
+
+
+def test_linked_bearish_context_suppresses_income_wheel():
+    configuration = load_option_runtime_configuration({"POLYGON_API_KEY": "test"}, BACKEND_DIR)
+    engine = OptionStrategyEngine(
+        configuration.strategy_policy,
+        configuration.strategy_policy_sha256,
+    )
+    matrix_id = uuid4()
+    context = replace(
+        strategy_context(matrix_id),
+        equity_context_snapshot_id=uuid4(),
+        equity_context_status="COMPLETE",
+        qualified_direction="BEARISH",
+    )
+
+    candidates = engine._income_wheel(
+        matrix_id,
+        (snapshot(30, "95", "2.50", 0.35),),
+        context,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].status is CandidateStatus.SUPPRESSED
+    assert "QUALIFIED_EQUITY_DIRECTION_OPPOSES_STRATEGY" in candidates[0].reason_codes
+
+
+def test_linked_context_without_qualified_direction_fails_closed():
+    configuration = load_option_runtime_configuration({"POLYGON_API_KEY": "test"}, BACKEND_DIR)
+    engine = OptionStrategyEngine(
+        configuration.strategy_policy,
+        configuration.strategy_policy_sha256,
+    )
+    matrix_id = uuid4()
+    context = replace(
+        strategy_context(matrix_id),
+        equity_context_snapshot_id=uuid4(),
+        equity_context_status="DEGRADED",
+        qualified_direction=None,
+    )
+
+    candidates = engine._income_wheel(
+        matrix_id,
+        (snapshot(40, "95", "2.50", 0.35),),
+        context,
+    )
+
+    assert candidates[0].status is CandidateStatus.SUPPRESSED
+    assert "QUALIFIED_EQUITY_DIRECTION_UNAVAILABLE" in candidates[0].reason_codes

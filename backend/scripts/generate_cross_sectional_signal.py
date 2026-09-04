@@ -43,33 +43,6 @@ logger = logging.getLogger("xs-signal")
 MIN_PRIOR_UNIVERSE_RATIO = 0.90
 
 
-def ensure_table() -> None:
-    with get_db_cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS cross_sectional_signals (
-                signal_id       SERIAL PRIMARY KEY,
-                trade_date      DATE         NOT NULL,
-                ticker          VARCHAR(16)  NOT NULL,
-                model_version   VARCHAR(32)  NOT NULL,
-                horizon_days    SMALLINT     NOT NULL,
-                raw_score       DOUBLE PRECISION,
-                neutral_score   DOUBLE PRECISION,
-                percentile      DOUBLE PRECISION,
-                decile          SMALLINT,
-                side            VARCHAR(5),
-                universe_size   INTEGER      NOT NULL,
-                created_at      TIMESTAMPTZ  DEFAULT NOW(),
-                CONSTRAINT uq_xs_signal UNIQUE (trade_date, ticker, model_version)
-            )
-        """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_xs_signals_date "
-                    "ON cross_sectional_signals (trade_date DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_xs_signals_ticker "
-                    "ON cross_sectional_signals (ticker, trade_date DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_xs_signals_date_side "
-                    "ON cross_sectional_signals (trade_date DESC, side)")
-
-
 def compute_signal(as_of: str | None) -> pd.DataFrame:
     """Score the latest cross-section. Returns one row per ticker."""
     cross = prepare_live_cross_section(as_of, feature_cols=MODEL_FEATURES)
@@ -166,7 +139,6 @@ def main() -> int:
         print("\n[dry-run] nothing written")
         return 0
 
-    ensure_table()
     written = persist(cross)
     logger.info("Persisted %s rows to cross_sectional_signals", written)
     return 0

@@ -71,6 +71,49 @@ body {
   background: #eff6ff;
 }
 
+.nav-menu-button {
+  border: 0;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.nav-dropdown {
+  position: fixed;
+  z-index: 300;
+  width: 224px;
+  padding: 6px;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.16);
+}
+
+.nav-dropdown .nav-link {
+  width: 100%;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.gap-page-header {
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.gap-page-controls {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.gap-tabs {
+  overflow-x: auto;
+}
+
+.gap-tabs > button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 @media (max-width: 1500px) and (min-width: 761px) {
   .navbar {
     flex-direction: column;
@@ -448,6 +491,20 @@ body {
   .main-content {
     padding: 0.5rem;
     overflow-x: hidden;
+  }
+
+  .gap-page-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .gap-page-controls {
+    align-items: flex-start !important;
+    justify-content: flex-start;
+  }
+
+  .gap-page-controls > div {
+    flex-wrap: wrap;
   }
 
   .card {
