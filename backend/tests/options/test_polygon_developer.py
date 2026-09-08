@@ -1,5 +1,6 @@
 import json
 import sys
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -49,9 +50,11 @@ class FakeIngestionRepository:
         self.pages = []
         self.failed = []
         self.completed = []
+        self.batches = []
 
     def begin_batch(self, batch, asset_type, policy_version, configuration_sha256):
         self.batch = batch
+        self.batches.append(batch)
         self.asset_type = asset_type
         return batch.batch_id
 
@@ -381,6 +384,31 @@ def test_delayed_trades_persist_raw_then_events_and_advance_complete_cursor():
     assert ingestion.completed[0][-1].value == "CLASSIFY_TRADES"
     expected_overlap = int((NOW.timestamp() - 30) * 1_000_000_000)
     assert transport.requests[0][1]["timestamp.gte"] == str(expected_overlap)
+
+
+def test_trade_batch_identity_includes_the_contract_ticker():
+    engine, ingestion, _, _ = _engine(
+        [
+            _response({"request_id": "trade-1", "status": "DELAYED", "results": []}),
+            _response({"request_id": "trade-2", "status": "DELAYED", "results": []}),
+        ]
+    )
+    first = _contract()
+    second = replace(
+        first,
+        contract_id=43,
+        contract_ticker="O:SPY260904C00655000",
+        strike=Decimal("655"),
+    )
+
+    engine.get_option_trades(first, NOW.replace(minute=0), NOW, None)
+    engine.get_option_trades(second, NOW.replace(minute=0), NOW, None)
+
+    assert len(ingestion.batches) == 2
+    assert (
+        ingestion.batches[0].request_filter_sha256
+        != ingestion.batches[1].request_filter_sha256
+    )
 
 
 def test_entitlement_probe_requires_expected_quote_denial():

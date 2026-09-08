@@ -3,8 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
-from options.config import DeveloperPolicy
-from options.domain import DecisionContext, OptionContractSnapshot, OptionExpirationAnalytics
+from options.config import DeveloperPolicy, GammaExposurePolicy
+from options.domain import (
+    AssetType,
+    DecisionContext,
+    GammaScope,
+    OptionContractSnapshot,
+    OptionExpirationAnalytics,
+)
 
 from .chain_analysis import (
     ChainHealth,
@@ -14,6 +20,7 @@ from .chain_analysis import (
     analyze_expirations,
     build_chain_health,
 )
+from .gamma_exposure import GammaExposureInput, ScopedGammaProfile, build_gamma_profile
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,11 +41,17 @@ class OptionAnalysisSnapshot:
     contracts: tuple[ContractAnalysis, ...]
     expirations: tuple[OptionExpirationAnalytics, ...]
     underlying: UnderlyingAnalysis
+    gamma_profiles: tuple[ScopedGammaProfile, ...] = ()
 
 
 class OptionAnalysisEngine:
-    def __init__(self, policy: DeveloperPolicy) -> None:
+    def __init__(
+        self,
+        policy: DeveloperPolicy,
+        gamma_policy: GammaExposurePolicy | None = None,
+    ) -> None:
         self.policy = policy
+        self.gamma_policy = gamma_policy
 
     def analyze(
         self,
@@ -51,6 +64,8 @@ class OptionAnalysisEngine:
         unknown_reference_count: int,
         reference_drift_failed: bool,
         batch_complete: bool,
+        asset_type: AssetType | None = None,
+        execution_lag_exceeded: bool = False,
     ) -> OptionAnalysisSnapshot:
         if not snapshots:
             raise ValueError("analysis requires at least one normalized snapshot")
@@ -76,6 +91,7 @@ class OptionAnalysisEngine:
             minimum_iv_convergence_fraction=float(
                 self.policy.model_quality.minimum_iv_success_fraction
             ),
+            execution_lag_exceeded=execution_lag_exceeded,
         )
         contract_analyses = tuple(analyze_contract(snapshot) for snapshot in converged)
         expiration_inputs = tuple(
@@ -117,6 +133,7 @@ class OptionAnalysisEngine:
                 for reason in expiration.quality_reasons
             )
         )
+        underlyer = next(iter(underlyers))
         return OptionAnalysisSnapshot(
             matrix_id=matrix_id,
             context=context,
@@ -124,7 +141,7 @@ class OptionAnalysisEngine:
             contracts=contract_analyses,
             expirations=expiration_analyses,
             underlying=UnderlyingAnalysis(
-                underlyer=next(iter(underlyers)),
+                underlyer=underlyer,
                 total_day_volume=sum(snapshot.day_volume or 0 for snapshot in snapshots),
                 total_open_interest=sum(
                     snapshot.open_interest or 0 for snapshot in snapshots
@@ -137,4 +154,57 @@ class OptionAnalysisEngine:
                 ),
                 caveats=caveats,
             ),
+            gamma_profiles=self._gamma_profiles(converged, underlyer, asset_type, context),
+        )
+
+    def _gamma_profiles(
+        self,
+        converged: tuple[OptionContractSnapshot, ...],
+        underlyer: str,
+        asset_type: AssetType | None,
+        context: DecisionContext,
+    ) -> tuple[ScopedGammaProfile, ...]:
+        if self.gamma_policy is None or not converged:
+            return ()
+        policy = self.gamma_policy
+        convention = policy.convention_for(
+            underlyer, asset_type.value if asset_type is not None else None
+        )
+        rows = tuple(
+            GammaExposureInput(
+                contract_id=snapshot.contract_id,
+                contract_type=snapshot.contract_type,
+                expiration_date=snapshot.expiration_date,
+                strike=snapshot.strike,
+                # Missing open interest carries no exposure and is filtered by the
+                # policy floor rather than substituted into the aggregation.
+                open_interest=snapshot.open_interest or 0,
+                local_iv=snapshot.local_iv,
+                time_to_expiration_years=snapshot.time_to_expiration_years,
+                risk_free_rate=snapshot.risk_free_rate,
+                dividend_yield=snapshot.dividend_yield,
+            )
+            for snapshot in converged
+        )
+        spot = converged[0].spot
+        market_date = context.market_time.date()
+        return tuple(
+            ScopedGammaProfile(
+                scope=scope,
+                profile=build_gamma_profile(
+                    rows,
+                    spot,
+                    convention=convention,
+                    scope=scope,
+                    shares_per_contract=policy.shares_per_contract,
+                    minimum_open_interest=policy.minimum_open_interest,
+                    maximum_dte=policy.maximum_dte,
+                    market_date=market_date,
+                    minimum_contracts_for_profile=policy.minimum_contracts_for_profile,
+                    volatility_assumption=policy.volatility_assumption,
+                    flip_search_fraction=policy.flip_search_fraction,
+                    flip_grid_points=policy.flip_grid_points,
+                ),
+            )
+            for scope in GammaScope
         )

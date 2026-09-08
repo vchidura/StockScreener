@@ -1,0 +1,170 @@
+{
+  "generated_at": "2026-09-05T16:36:36.121381-07:00",
+  "strategy_policy_version": "phase2_v1",
+  "minimum_absolute_robust_z": 2.5,
+  "minimum_strikes": 7,
+  "max_gap_minutes": 30,
+  "coverage": {
+    "underlyings": 13,
+    "complete_matrices": 247,
+    "sessions": 2,
+    "fitted_groups": 708,
+    "fitted_contract_observations": 7617
+  },
+  "survival": {
+    "lag_1": {
+      "followed": 15,
+      "survived": 1,
+      "survival_rate": 0.0667
+    },
+    "lag_2": {
+      "followed": 19,
+      "survived": 1,
+      "survival_rate": 0.0526
+    },
+    "lag_3": {
+      "followed": 16,
+      "survived": 1,
+      "survival_rate": 0.0625
+    }
+  },
+  "unconditional_base_rate_lag_1": {
+    "followed": 413,
+    "became_kink": 10,
+    "rate": 0.0242
+  },
+  "follow_through_coverage_lag_1": {
+    "kinks_in_a_followable_window": 177,
+    "present_in_next_fitted_set": 15,
+    "absent_from_next_fitted_set": 162,
+    "coverage": 0.0847,
+    "note": "A contract disappears when its expiration/type group drops below minimum_strikes or its MAD collapses to zero in the later matrix, so the fitted universe itself is unstable between slots."
+  },
+  "abs_z_ratio_vs_entry": {
+    "lag_1": {
+      "count": 15,
+      "median": 0.3978,
+      "p25": 0.1858,
+      "p75": 0.926,
+      "min": 0.0,
+      "max": 0.967
+    },
+    "lag_2": {
+      "count": 19,
+      "median": 0.2242,
+      "p25": 0.0376,
+      "p75": 0.3405,
+      "min": 0.0177,
+      "max": 1.3411
+    },
+    "lag_3": {
+      "count": 16,
+      "median": 0.1705,
+      "p25": 0.0943,
+      "p75": 0.5794,
+      "min": 0.0,
+      "max": 0.8246
+    }
+  },
+  "sign_flip": {
+    "lag_1": {
+      "followed": 15,
+      "flipped": 3,
+      "rate": 0.2
+    },
+    "lag_2": {
+      "followed": 19,
+      "flipped": 9,
+      "rate": 0.4737
+    },
+    "lag_3": {
+      "followed": 16,
+      "flipped": 7,
+      "rate": 0.4375
+    }
+  },
+  "detection_rate_by_strike_count": {
+    "07-09": {
+      "evaluated": 2002,
+      "qualifying": 63,
+      "rate": 0.0315
+    },
+    "10-19": {
+      "evaluated": 3632,
+      "qualifying": 147,
+      "rate": 0.0405
+    },
+    "20-39": {
+      "evaluated": 567,
+      "qualifying": 32,
+      "rate": 0.0564
+    }
+  },
+  "per_underlyer": {
+    "AAPL": {
+      "matrices": 18,
+      "kinks": 0,
+      "pairs": 15
+    },
+    "AMD": {
+      "matrices": 22,
+      "kinks": 6,
+      "pairs": 18
+    },
+    "AMZN": {
+      "matrices": 18,
+      "kinks": 0,
+      "pairs": 14
+    },
+    "GOOGL": {
+      "matrices": 19,
+      "kinks": 3,
+      "pairs": 15
+    },
+    "IWM": {
+      "matrices": 20,
+      "kinks": 17,
+      "pairs": 14
+    },
+    "META": {
+      "matrices": 20,
+      "kinks": 22,
+      "pairs": 16
+    },
+    "MSFT": {
+      "matrices": 21,
+      "kinks": 5,
+      "pairs": 18
+    },
+    "NVDA": {
+      "matrices": 19,
+      "kinks": 1,
+      "pairs": 16
+    },
+    "PLTR": {
+      "matrices": 20,
+      "kinks": 0,
+      "pairs": 17
+    },
+    "QQQ": {
+      "matrices": 22,
+      "kinks": 113,
+      "pairs": 19
+    },
+    "SOFI": {
+      "matrices": 17,
+      "kinks": 0,
+      "pairs": 12
+    },
+    "SPY": {
+      "matrices": 12,
+      "kinks": 75,
+      "pairs": 7
+    },
+    "TSLA": {
+      "matrices": 19,
+      "kinks": 0,
+      "pairs": 15
+    }
+  }
+}

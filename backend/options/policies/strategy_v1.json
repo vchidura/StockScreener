@@ -1,5 +1,5 @@
 {
-  "strategy_version": "phase2_v1",
+  "strategy_version": "phase2_v3",
   "gamma_squeeze": {
     "maximum_moneyness_fraction": 0.02,
     "minimum_volume_oi_ratio": 1.5,
@@ -22,6 +22,34 @@
     "maximum_wings_per_short_strike": 5,
     "maximum_per_structure_expiration": 3,
     "maximum_center_distance_fraction": 0.02
+  },
+  "long_premium": {
+    "minimum_dte": 1,
+    "maximum_dte": 45,
+    "near_lane_maximum_dte": 7,
+    "short_lane_maximum_dte": 21,
+    "minimum_absolute_delta": 0.30,
+    "maximum_absolute_delta": 0.60,
+    "maximum_breakeven_expected_move_ratio": 1.0,
+    "minimum_open_interest": 250,
+    "minimum_day_volume": 100,
+    "maximum_candidates_per_lane_side": 1
+  },
+  "debit_spread": {
+    "minimum_dte": 1,
+    "maximum_dte": 60,
+    "near_lane_maximum_dte": 7,
+    "short_lane_maximum_dte": 21,
+    "minimum_long_absolute_delta": 0.45,
+    "maximum_long_absolute_delta": 0.70,
+    "minimum_width_fraction": 0.005,
+    "maximum_width_fraction": 0.10,
+    "maximum_breakeven_expected_move_ratio": 0.75,
+    "maximum_target_expected_move_ratio": 1.0,
+    "minimum_return_on_risk": 1.0,
+    "minimum_open_interest": 250,
+    "minimum_day_volume": 100,
+    "maximum_candidates_per_lane_side": 1
   },
   "flow": {
     "minimum_print_notional": "50000",

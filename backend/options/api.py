@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
@@ -12,6 +13,7 @@ from database import get_db_cursor
 from options.calendar import OptionExchangeCalendar
 from options.config import load_option_runtime_configuration
 from options.outcomes import delayed_proxy_commission_policy, measurement_checkpoints
+from options.repositories.gamma import SQL_LATEST_BY_UNDERLYING
 
 
 DATA_TIER_LABEL = "15-MINUTE DELAYED RESEARCH DATA"
@@ -84,6 +86,14 @@ def _schema_available(cursor) -> bool:
 def _strategy_schema_available(cursor) -> bool:
     cursor.execute(
         "SELECT to_regclass('public.option_strategy_candidates') IS NOT NULL AS ready"
+    )
+    row = cursor.fetchone()
+    return bool(row and row["ready"])
+
+
+def _current_mark_schema_available(cursor) -> bool:
+    cursor.execute(
+        "SELECT to_regclass('public.option_signal_current_marks') IS NOT NULL AS ready"
     )
     row = cursor.fetchone()
     return bool(row and row["ready"])
@@ -636,9 +646,104 @@ def option_data_quality(
     )
 
 
+@router.get("/gamma", response_model=OptionsEnvelope)
+def option_gamma(
+    underlyer: str | None = Query(default=None, min_length=1, max_length=16),
+    scope: Literal["TOTAL", "ZERO_DTE", "WEEKLY", "MONTHLY"] = Query(default="TOTAL"),
+    include_curve: bool = Query(default=False),
+) -> OptionsEnvelope:
+    """Latest gamma exposure profile per underlying for the active gamma policy."""
+    configuration = _configuration()
+    policy_sha256 = configuration.gamma_policy_sha256
+    normalized = underlyer.strip().upper() if underlyer else None
+    with get_db_cursor() as cursor:
+        cursor.execute(
+            "SELECT to_regclass('public.option_gamma_profiles') IS NOT NULL AS ready"
+        )
+        row = cursor.fetchone()
+        if not (row and row["ready"]):
+            return _envelope(
+                available=False,
+                reason="GAMMA_PROFILE_SCHEMA_UNAVAILABLE",
+                policy_sha256=policy_sha256,
+            )
+        cursor.execute(SQL_LATEST_BY_UNDERLYING, (policy_sha256, scope, normalized, normalized))
+        rows = [dict(item) for item in cursor.fetchall()]
+        curves: dict[str, list[dict[str, Any]]] = {}
+        if include_curve and rows:
+            cursor.execute(
+                """
+                SELECT underlying, strike_profile
+                FROM option_gamma_profiles
+                WHERE gamma_profile_id = ANY(%s)
+                """,
+                ([item["gamma_profile_id"] for item in rows],),
+            )
+            for item in cursor.fetchall():
+                payload = item["strike_profile"]
+                curves[item["underlying"]] = (
+                    json.loads(payload) if isinstance(payload, str) else payload
+                )
+
+    profiles = []
+    latest_market_time: datetime | None = None
+    for item in rows:
+        market_time = item["market_data_time"]
+        if latest_market_time is None or market_time > latest_market_time:
+            latest_market_time = market_time
+        profiles.append(
+            {
+                "gamma_profile_id": str(item["gamma_profile_id"]),
+                "matrix_id": str(item["matrix_id"]),
+                "underlying": item["underlying"],
+                "scope": item["scope"],
+                "market_data_time": market_time,
+                "observed_time": item["first_observed_at"],
+                "spot": item["spot"],
+                "dealer_convention": item["dealer_convention"],
+                "volatility_assumption": item["volatility_assumption"],
+                "net_gamma_shares_per_point": item["net_gamma_shares_per_point"],
+                "net_gamma_notional_per_percent": item["net_gamma_notional_per_percent"],
+                "absolute_gamma_notional_per_percent": item[
+                    "absolute_gamma_notional_per_percent"
+                ],
+                "call_gamma_notional_per_percent": item["call_gamma_notional_per_percent"],
+                "put_gamma_notional_per_percent": item["put_gamma_notional_per_percent"],
+                "flip_spot": item["flip_spot"],
+                "regime_at_spot": item["regime_at_spot"],
+                "sign_change_count": item["sign_change_count"],
+                "peak_gamma_strike": item["peak_gamma_strike"],
+                "strike_count": item["strike_count"],
+                "contributing_contract_count": item["contributing_contract_count"],
+                "eligible_contract_count": item["eligible_contract_count"],
+                "coverage_fraction": item["coverage_fraction"],
+                "quality_reasons": list(item["quality_reasons"] or ()),
+                "strike_profile": curves.get(item["underlying"]),
+            }
+        )
+
+    return _envelope(
+        available=bool(profiles),
+        reason=None if profiles else "NO_GAMMA_PROFILE_FOR_POLICY",
+        as_of=latest_market_time,
+        policy_sha256=policy_sha256,
+        data={
+            "scope": scope,
+            "gamma_policy_version": configuration.gamma_policy.gamma_policy_version,
+            "gamma_policy_sha256": policy_sha256,
+            "dealer_convention_note": (
+                "Open interest does not identify who is long or short. The signed "
+                "values apply a versioned dealer assumption; call and put gamma are "
+                "measured unsigned."
+            ),
+            "wall_gates_enabled": configuration.gamma_policy.require_gamma_wall,
+            "profiles": profiles,
+        },
+    )
+
+
 @router.get("/candidates", response_model=OptionsEnvelope)
-def option_candidates(
-    underlyer: str | None = None,
+def option_candidates(    underlyer: str | None = None,
     persona: Literal["INCOME", "DEFINED_RISK_INCOME", "MOMENTUM", "NEUTRAL_VOL"] | None = None,
     status: Literal["SELECTED", "SUPPRESSED", "REJECTED"] | None = None,
     strategy: str | None = None,
@@ -836,6 +941,62 @@ def option_opportunities(
     requested_underlyer = underlyer.strip().upper() if underlyer else None
     underlyer_clause = "AND candidate.underlying = %s" if requested_underlyer else ""
     underlyer_params = [requested_underlyer] if requested_underlyer else []
+    opportunity_ctes = """
+            WITH policy_candidates AS MATERIALIZED (
+                SELECT candidate.*
+                FROM option_strategy_candidates AS candidate
+                WHERE candidate.policy_sha256 = %s
+                  AND candidate.market_data_time <= NOW()
+                  AND candidate.observed_time <= NOW()
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM option_candidate_legs AS causal_leg
+                      WHERE causal_leg.candidate_id = candidate.candidate_id
+                        AND (
+                            causal_leg.source_market_time > NOW()
+                            OR causal_leg.quote_time > NOW()
+                            OR causal_leg.underlying_quote_time > NOW()
+                        )
+                  )
+            ), candidate_contracts AS MATERIALIZED (
+                SELECT candidate.candidate_id, candidate.matrix_id,
+                       candidate.status, candidate.market_data_time,
+                       candidate.observed_time, leg.contract_id
+                FROM policy_candidates AS candidate
+                JOIN option_candidate_legs AS leg
+                  ON leg.candidate_id = candidate.candidate_id
+                UNION
+                SELECT candidate.candidate_id, candidate.matrix_id,
+                       candidate.status, candidate.market_data_time,
+                       candidate.observed_time,
+                       (candidate.rank_components->>'contract_id')::BIGINT
+                FROM policy_candidates AS candidate
+                WHERE candidate.rank_components->>'contract_id' IS NOT NULL
+            ), first_selected_contracts AS MATERIALIZED (
+                SELECT DISTINCT ON (contract_id)
+                       contract_id, matrix_id, market_data_time, observed_time
+                FROM candidate_contracts
+                WHERE status = 'SELECTED'
+                ORDER BY contract_id, market_data_time, observed_time, matrix_id
+            )
+    """
+    first_matrix_contract_clause = """
+                NOT EXISTS (
+                    SELECT 1
+                    FROM candidate_contracts AS current_contract
+                    JOIN first_selected_contracts AS first_contract
+                      USING (contract_id)
+                    WHERE current_contract.candidate_id = candidate.candidate_id
+                      AND first_contract.matrix_id <> candidate.matrix_id
+                      AND (
+                          first_contract.market_data_time < candidate.market_data_time
+                          OR (
+                              first_contract.market_data_time = candidate.market_data_time
+                              AND first_contract.observed_time < candidate.observed_time
+                          )
+                      )
+                )
+    """
     with get_db_cursor() as cursor:
         if not _strategy_schema_available(cursor):
             return _envelope(
@@ -856,23 +1017,10 @@ def option_opportunities(
             )
         cursor.execute(
             f"""
-            WITH latest AS (
+            {opportunity_ctes}, latest AS (
                 SELECT DISTINCT ON (candidate.underlying)
                     candidate.underlying, candidate.matrix_id
-                FROM option_strategy_candidates AS candidate
-                WHERE candidate.policy_sha256 = %s
-                  AND candidate.market_data_time <= NOW()
-                  AND candidate.observed_time <= NOW()
-                                    AND NOT EXISTS (
-                                            SELECT 1
-                                            FROM option_candidate_legs AS causal_leg
-                                            WHERE causal_leg.candidate_id = candidate.candidate_id
-                                                AND (
-                                                        causal_leg.source_market_time > NOW()
-                                                        OR causal_leg.quote_time > NOW()
-                                                        OR causal_leg.underlying_quote_time > NOW()
-                                                )
-                                    )
+                FROM policy_candidates AS candidate
                 ORDER BY candidate.underlying,
                          candidate.market_data_time DESC,
                          candidate.observed_time DESC,
@@ -899,23 +1047,14 @@ def option_opportunities(
                    COUNT(signal.event_id) FILTER (
                        WHERE signal.status = 'BLOCKED'
                    ) AS blocked_count
-            FROM option_strategy_candidates AS candidate
+            FROM policy_candidates AS candidate
             JOIN latest USING (underlying, matrix_id)
             JOIN option_analysis_runs AS analysis USING (matrix_id)
                         LEFT JOIN option_signal_occurrences AS signal_occurrence
                             ON signal_occurrence.source_candidate_id = candidate.candidate_id
                         LEFT JOIN option_signal_events AS signal
                             ON signal.event_id = signal_occurrence.event_id
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM option_candidate_legs AS causal_leg
-                WHERE causal_leg.candidate_id = candidate.candidate_id
-                  AND (
-                      causal_leg.source_market_time > NOW()
-                      OR causal_leg.quote_time > NOW()
-                      OR causal_leg.underlying_quote_time > NOW()
-                  )
-            ) {underlyer_clause}
+            WHERE {first_matrix_contract_clause} {underlyer_clause}
             GROUP BY candidate.underlying, candidate.matrix_id, analysis.status
             ORDER BY candidate.underlying
             """,
@@ -927,23 +1066,10 @@ def option_opportunities(
         underlyers = cursor.fetchall()
         cursor.execute(
             f"""
-            WITH latest AS (
+            {opportunity_ctes}, latest AS (
                 SELECT DISTINCT ON (candidate.underlying)
                     candidate.underlying, candidate.matrix_id
-                FROM option_strategy_candidates AS candidate
-                WHERE candidate.policy_sha256 = %s
-                  AND candidate.market_data_time <= NOW()
-                  AND candidate.observed_time <= NOW()
-                                    AND NOT EXISTS (
-                                            SELECT 1
-                                            FROM option_candidate_legs AS causal_leg
-                                            WHERE causal_leg.candidate_id = candidate.candidate_id
-                                                AND (
-                                                        causal_leg.source_market_time > NOW()
-                                                        OR causal_leg.quote_time > NOW()
-                                                        OR causal_leg.underlying_quote_time > NOW()
-                                                )
-                                    )
+                FROM policy_candidates AS candidate
                 ORDER BY candidate.underlying,
                          candidate.market_data_time DESC,
                          candidate.observed_time DESC,
@@ -963,7 +1089,7 @@ def option_opportunities(
                            ORDER BY candidate.candidate_rank,
                                     candidate.candidate_id
                        ) AS strategy_position
-                FROM option_strategy_candidates AS candidate
+                FROM policy_candidates AS candidate
                 JOIN latest USING (underlying, matrix_id)
                 JOIN option_strategy_registry AS registry
                   ON registry.strategy_name = candidate.strategy_name
@@ -976,16 +1102,7 @@ def option_opportunities(
                                     ON source_contract.contract_id =
                                          (candidate.rank_components->>'contract_id')::BIGINT
                 WHERE candidate.status = 'SELECTED'
-                                    AND NOT EXISTS (
-                                            SELECT 1
-                                            FROM option_candidate_legs AS causal_leg
-                                            WHERE causal_leg.candidate_id = candidate.candidate_id
-                                                AND (
-                                                        causal_leg.source_market_time > NOW()
-                                                        OR causal_leg.quote_time > NOW()
-                                                        OR causal_leg.underlying_quote_time > NOW()
-                                                )
-                                    )
+                  AND {first_matrix_contract_clause}
                   {underlyer_clause}
             )
             SELECT ranked.*,
@@ -1011,6 +1128,12 @@ def option_opportunities(
                                    'local_iv', leg.local_iv,
                                    'local_delta', leg.local_delta,
                                    'local_gamma', leg.local_gamma,
+                                   'local_theta_per_day', leg.local_theta_per_day,
+                                   'local_vega_per_vol_point', leg.local_vega_per_vol_point,
+                                   'local_rho_per_rate_point', leg.local_rho_per_rate_point,
+                                   'spot', leg.spot,
+                                   'day_volume', entry_snapshot.day_volume,
+                                   'open_interest', entry_snapshot.open_interest,
                                    'source_market_time', leg.source_market_time,
                                    'mark_source', leg.mark_source,
                                    'quality_flags', leg.quality_flags,
@@ -1021,6 +1144,8 @@ def option_opportunities(
                                ) ORDER BY leg.leg_index
                            )
                            FROM option_candidate_legs AS leg
+                           LEFT JOIN option_chain_snapshots AS entry_snapshot
+                             ON entry_snapshot.snapshot_id = leg.snapshot_id
                            WHERE leg.candidate_id = ranked.candidate_id
                        ),
                        '[]'::jsonb
@@ -1160,6 +1285,17 @@ def option_candidate_detail(candidate_id: UUID) -> OptionsEnvelope:
             (str(candidate_id),),
         )
         scenarios = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT ledger_version, gate_name, verdict, blocking,
+                   reason_codes, evidence, evaluated_at
+            FROM option_candidate_execution_gates
+            WHERE candidate_id = %s
+            ORDER BY gate_name
+            """,
+            (str(candidate_id),),
+        )
+        execution_gates = cursor.fetchall()
     return _envelope(
         available=True,
         as_of=candidate["market_data_time"],
@@ -1170,6 +1306,7 @@ def option_candidate_detail(candidate_id: UUID) -> OptionsEnvelope:
             "candidate": candidate,
             "legs": legs,
             "scenarios": scenarios,
+            "execution_gates": execution_gates,
             "quote_liquidity": "NOT_AVAILABLE",
             "execution_mode": "READ_ONLY_RESEARCH",
         },
@@ -1330,6 +1467,7 @@ def option_signals(
 def option_performance(
     underlyer: str | None = None,
     strategy: str | None = None,
+    expiration: str | None = None,
     cohort: Literal["OPPORTUNITY_BOARD", "ALL_SIGNALS"] = "OPPORTUNITY_BOARD",
     days: int = Query(default=14, ge=1, le=60),
     limit: int = Query(default=100, ge=1, le=200),
@@ -1349,6 +1487,9 @@ def option_performance(
     if strategy:
         clauses.append("candidate.strategy_name = %s")
         params.append(strategy.strip().upper())
+    if expiration:
+        clauses.append("candidate.expiration_date = %s::date")
+        params.append(expiration)
     candidate_join_sql = """
         JOIN option_strategy_candidates AS candidate
           ON candidate.candidate_id = signal.source_candidate_id
@@ -1380,6 +1521,9 @@ def option_performance(
             ) AS candidate ON TRUE
         """
     where_sql = " AND ".join(clauses)
+    current_mark_select_sql = "NULL::jsonb AS current_mark"
+    current_mark_join_sql = ""
+    current_mark_params: tuple[object, ...] = ()
     with get_db_cursor() as cursor:
         if not _strategy_schema_available(cursor):
             return _envelope(
@@ -1402,6 +1546,65 @@ def option_performance(
                     "current_mark_included": False,
                 },
             )
+        current_marks_available = _current_mark_schema_available(cursor)
+        if current_marks_available:
+            current_mark_select_sql = """
+                CASE WHEN current_mark.candidate_id IS NULL THEN NULL
+                     ELSE jsonb_build_object(
+                         'market_time', current_mark.market_time,
+                         'observed_time', current_mark.observed_time,
+                         'entry_net_premium', current_mark.entry_net_premium,
+                         'exit_net_premium', current_mark.exit_net_premium,
+                         'gross_pnl', current_mark.gross_pnl,
+                         'estimated_cost', current_mark.estimated_cost,
+                         'net_pnl', current_mark.net_pnl,
+                         'capital_at_risk', current_mark.capital_at_risk,
+                         'net_return', current_mark.net_return,
+                         'availability_flag', current_mark.availability_flag,
+                         'legs', COALESCE(
+                             (
+                                 SELECT jsonb_agg(
+                                     jsonb_build_object(
+                                         'contract_id', leg.contract_id,
+                                         'contract_ticker', leg.contract_ticker,
+                                         'side', leg.side,
+                                         'ratio', leg.ratio,
+                                         'multiplier', leg.multiplier,
+                                         'entry_mark', leg.model_mark,
+                                         'current_mark', snapshot.model_mark,
+                                         'spot', snapshot.spot,
+                                         'day_volume', snapshot.day_volume,
+                                         'open_interest', snapshot.open_interest,
+                                         'gross_pnl',
+                                             (CASE WHEN leg.side = 'SELL' THEN 1 ELSE -1 END)
+                                             * (leg.model_mark - snapshot.model_mark)
+                                             * leg.ratio * leg.multiplier,
+                                         'estimated_cost', 1.30::numeric * leg.ratio,
+                                         'net_pnl',
+                                             (CASE WHEN leg.side = 'SELL' THEN 1 ELSE -1 END)
+                                             * (leg.model_mark - snapshot.model_mark)
+                                             * leg.ratio * leg.multiplier
+                                             - 1.30::numeric * leg.ratio
+                                     ) ORDER BY leg.leg_index
+                                 )
+                                 FROM option_candidate_legs AS leg
+                                 JOIN option_chain_snapshots AS snapshot
+                                   ON snapshot.contract_id = leg.contract_id
+                                  AND snapshot.snapshot_id = ANY(current_mark.source_snapshot_ids)
+                                 WHERE leg.candidate_id = candidate.candidate_id
+                             ),
+                             '[]'::jsonb
+                         ),
+                         'quality_flags', current_mark.quality_flags
+                     )
+                END AS current_mark
+            """
+            current_mark_join_sql = """
+                LEFT JOIN option_signal_current_marks AS current_mark
+                  ON current_mark.candidate_id = candidate.candidate_id
+                 AND current_mark.valuation_policy_sha256 = %s
+            """
+            current_mark_params = (policy.policy_sha256,)
         cursor.execute(
             f"""
             SELECT COUNT(DISTINCT signal.event_id) AS total,
@@ -1463,6 +1666,37 @@ def option_performance(
                        (
                            SELECT jsonb_agg(
                                jsonb_build_object(
+                                   'leg_index', leg.leg_index,
+                                   'contract_ticker', leg.contract_ticker,
+                                   'side', leg.side,
+                                   'ratio', leg.ratio,
+                                   'strike', leg.strike,
+                                   'contract_type', leg.contract_type,
+                                   'expiration_date', leg.expiration_date,
+                                   'model_mark', leg.model_mark,
+                                   'local_iv', leg.local_iv,
+                                   'local_delta', leg.local_delta,
+                                   'local_gamma', leg.local_gamma,
+                                   'local_theta_per_day', leg.local_theta_per_day,
+                                   'local_vega_per_vol_point', leg.local_vega_per_vol_point,
+                                   'local_rho_per_rate_point', leg.local_rho_per_rate_point,
+                                   'spot', leg.spot,
+                                   'day_volume', entry_snapshot.day_volume,
+                                   'open_interest', entry_snapshot.open_interest
+                               ) ORDER BY leg.leg_index
+                           )
+                           FROM option_candidate_legs AS leg
+                           LEFT JOIN option_chain_snapshots AS entry_snapshot
+                             ON entry_snapshot.snapshot_id = leg.snapshot_id
+                           WHERE leg.candidate_id = candidate.candidate_id
+                       ),
+                       '[]'::jsonb
+                   ) AS legs,
+                   {current_mark_select_sql},
+                   COALESCE(
+                       (
+                           SELECT jsonb_agg(
+                               jsonb_build_object(
                                    'outcome_id', outcome.outcome_id,
                                    'measurement_type', outcome.measurement_type,
                                    'market_time', outcome.market_time,
@@ -1489,11 +1723,12 @@ def option_performance(
                    ) AS outcomes
             FROM option_signal_events AS signal
             {candidate_join_sql}
+                        {current_mark_join_sql}
             WHERE {where_sql}
             ORDER BY candidate.market_data_time DESC, signal.event_id
             LIMIT %s OFFSET %s
             """,
-            (policy.policy_sha256, *params, limit, offset),
+            (policy.policy_sha256, *current_mark_params, *params, limit, offset),
         )
         rows = [dict(row) for row in cursor.fetchall()]
 
@@ -1532,6 +1767,6 @@ def option_performance(
                 else "ORIGINAL_SIGNAL_PACKAGE"
             ),
             "navigation_revalues": False,
-            "current_mark_included": False,
+            "current_mark_included": current_marks_available,
         },
     )

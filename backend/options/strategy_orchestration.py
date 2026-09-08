@@ -8,10 +8,12 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from options.analytics.analysis_engine import OptionAnalysisSnapshot
 from options.analytics.chain_analysis import ChainHealth
+from options.analytics.gamma_exposure import ScopedGammaProfile
 from options.config import OptionRuntimeConfiguration
 from options.domain import AssetType, OptionAnalysisRun, OptionContractSnapshot, WorkStage
 from options.repositories.strategies import OptionStrategyRepository
 from options.repositories.analysis import OptionAnalysisRepository
+from options.repositories.gamma import OptionGammaProfileRepository
 from options.repositories.snapshots import OptionSnapshotRepository
 from options.repositories.trades import OptionTradeRepository
 from options.repositories.work_items import OptionWorkItemRepository
@@ -42,6 +44,7 @@ class OptionStrategyPipeline:
         analysis_repository: OptionAnalysisRepository | None = None,
         snapshot_repository: OptionSnapshotRepository | None = None,
         trade_repository: OptionTradeRepository | None = None,
+        gamma_repository: OptionGammaProfileRepository | None = None,
         engine: OptionStrategyEngine | None = None,
     ) -> None:
         self.configuration = configuration
@@ -51,9 +54,13 @@ class OptionStrategyPipeline:
         self.analysis_repository = analysis_repository or OptionAnalysisRepository()
         self.snapshot_repository = snapshot_repository or OptionSnapshotRepository()
         self.trade_repository = trade_repository or OptionTradeRepository()
+        self.gamma_repository = gamma_repository or OptionGammaProfileRepository()
         self.engine = engine or OptionStrategyEngine(
             configuration.strategy_policy,
             configuration.strategy_policy_sha256,
+            configuration.gamma_policy,
+            configuration.gamma_policy_sha256,
+            read_only=configuration.settings.start_read_only,
         )
 
     def process(
@@ -70,6 +77,7 @@ class OptionStrategyPipeline:
             analysis.expirations,
             snapshots,
             asset_type,
+            gamma_profiles=analysis.gamma_profiles,
         )
 
     def run_latest(
@@ -132,6 +140,10 @@ class OptionStrategyPipeline:
             expirations,
             snapshots,
             asset_type,
+            gamma_profiles=self.gamma_repository.profiles_by_matrix(
+                run.matrix_id,
+                self.configuration.gamma_policy_sha256,
+            ),
         )
 
     def process_matrix(
@@ -143,6 +155,7 @@ class OptionStrategyPipeline:
         expirations,
         snapshots: tuple[OptionContractSnapshot, ...],
         asset_type: AssetType,
+        gamma_profiles: tuple[ScopedGammaProfile, ...] = (),
     ) -> StrategyMatrixResult:
         business_key = f"strategy:{matrix_id}:{self.engine.strategy_version}"
         work_id = uuid5(NAMESPACE_URL, f"option-work:{business_key}")
@@ -218,6 +231,7 @@ class OptionStrategyPipeline:
                 expirations,
                 context,
                 trades,
+                gamma_profiles,
             )
             if self.configuration.settings.start_read_only and any(
                 candidate.execution_eligibility is not None

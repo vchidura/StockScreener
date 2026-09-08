@@ -80,6 +80,22 @@ def test_long_option_proxy_return_uses_capital_at_risk():
     assert result.net_return == Decimal("0.1974")
 
 
+def test_long_option_price_movement_is_contract_multiplier_times_mark_change():
+    batch_id = uuid4()
+    result = evaluate_delayed_proxy_outcome(
+        candidate_id=uuid4(), event_id=None, measurement_type="60MIN",
+        market_time=datetime(2026, 8, 31, 20, 30, tzinfo=UTC),
+        observed_time=datetime(2026, 8, 31, 20, 45, tzinfo=UTC),
+        capital_at_risk=Decimal("350"),
+        legs=(leg(OptionSide.BUY, "3.50", "3.20", batch_id=batch_id),),
+        policy=delayed_proxy_commission_policy(),
+    )
+
+    assert result.gross_pnl == Decimal("-30.00")
+    assert result.estimated_cost == Decimal("1.30")
+    assert result.net_pnl == Decimal("-31.30")
+
+
 def test_proxy_outcome_requires_one_coherent_batch():
     with pytest.raises(ValueError, match="coherent source batch"):
         evaluate_delayed_proxy_outcome(
@@ -220,6 +236,52 @@ def test_retained_leg_bounds_cover_selected_unexpired_contract_packages():
     )
 
 
+def test_current_mark_legs_require_observation_after_detection():
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    connection = MagicMock(closed=False)
+    connection.cursor.return_value = cursor
+
+    @contextmanager
+    def factory():
+        yield connection
+
+    repository = OptionOutcomeRepository(factory)
+
+    assert repository.current_mark_legs(
+        uuid4(), available_by=datetime(2026, 9, 4, 20, 0, tzinfo=UTC)
+    ) == ()
+
+    compact = " ".join(cursor.execute.call_args.args[0].split())
+    assert "snapshot.mark_market_data_time > leg.entry_market_time" in compact
+    assert "HAVING COUNT(DISTINCT snapshot.contract_id)" in compact
+
+
+def test_current_mark_candidates_prioritize_unmarked_packages():
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    connection = MagicMock(closed=False)
+    connection.cursor.return_value = cursor
+
+    @contextmanager
+    def factory():
+        yield connection
+
+    repository = OptionOutcomeRepository(factory)
+    available_by = datetime(2026, 9, 4, 20, 0, tzinfo=UTC)
+
+    assert repository.list_current_candidates(
+        valuation_policy_sha256="a" * 64,
+        available_by=available_by,
+    ) == ()
+
+    sql, parameters = cursor.execute.call_args.args
+    compact = " ".join(sql.split())
+    assert "LEFT JOIN option_signal_current_marks AS current_mark" in compact
+    assert "ORDER BY current_mark.candidate_id IS NULL DESC" in compact
+    assert parameters == ("a" * 64, available_by, available_by, 60, available_by, 1000)
+
+
 def test_checkpoint_legs_require_one_complete_causal_snapshot_batch():
     batch_id = uuid4()
     snapshot_ids = (uuid4(), uuid4())
@@ -323,6 +385,22 @@ def test_option_outcome_service_matures_available_uncompleted_measurements():
             self.persisted.extend(outcomes)
             return len(outcomes)
 
+        def current_marks_available(self):
+            return False
+
+        def delete_non_causal_current_marks(self):
+            return 0
+
+        def list_current_candidates(self, **kwargs):
+            return ()
+
+        def current_mark_legs(self, *args, **kwargs):
+            return ()
+
+        def persist_current_marks(self, outcomes):
+            assert outcomes == []
+            return 0
+
     repository = Repository()
     service = OptionOutcomeService(repository)
 
@@ -357,6 +435,22 @@ def test_option_outcome_service_keeps_missing_checkpoint_pending():
             assert outcomes == []
             return 0
 
+        def current_marks_available(self):
+            return False
+
+        def delete_non_causal_current_marks(self):
+            return 0
+
+        def list_current_candidates(self, **kwargs):
+            return ()
+
+        def current_mark_legs(self, *args, **kwargs):
+            return ()
+
+        def persist_current_marks(self, outcomes):
+            assert outcomes == []
+            return 0
+
     result = OptionOutcomeService(Repository()).mature(
         available_by=datetime(2026, 8, 31, 19, 20, tzinfo=UTC)
     )
@@ -364,3 +458,54 @@ def test_option_outcome_service_keeps_missing_checkpoint_pending():
     assert result.due_measurements == 1
     assert result.available_measurements == 0
     assert result.pending == 1
+
+
+def test_option_outcome_service_persists_latest_coherent_current_mark():
+    candidate_id = uuid4()
+    batch_id = uuid4()
+
+    class Repository:
+        def list_pending_candidates(self, **kwargs):
+            return ()
+
+        def persist_decay_outcomes(self, outcomes):
+            assert outcomes == []
+            return 0
+
+        def current_marks_available(self):
+            return True
+
+        def delete_non_causal_current_marks(self):
+            return 0
+
+        def list_current_candidates(self, **kwargs):
+            return ({
+                "candidate_id": candidate_id,
+                "event_id": uuid4(),
+                "market_data_time": datetime(2026, 8, 31, 19, 0, tzinfo=UTC),
+                "capital_at_risk": Decimal("500"),
+            },)
+
+        def current_mark_legs(self, actual_candidate_id, *, available_by):
+            assert actual_candidate_id == candidate_id
+            return (OptionOutcomeLeg(
+                contract_id=42, side=OptionSide.BUY, ratio=1, multiplier=100,
+                entry_mark=Decimal("5"), exit_mark=Decimal("6"),
+                source_snapshot_id=uuid4(), source_batch_id=batch_id,
+                source_market_time=available_by - timedelta(minutes=15),
+                source_observed_time=available_by,
+            ),)
+
+        def persist_current_marks(self, outcomes):
+            self.outcomes = tuple(outcomes)
+            return len(self.outcomes)
+
+    repository = Repository()
+    result = OptionOutcomeService(repository).mature(
+        available_by=datetime(2026, 8, 31, 20, 15, tzinfo=UTC)
+    )
+
+    assert result.current_candidates == 1
+    assert result.current_persisted == 1
+    assert repository.outcomes[0].measurement_type == "CURRENT"
+    assert repository.outcomes[0].net_pnl == Decimal("98.70")

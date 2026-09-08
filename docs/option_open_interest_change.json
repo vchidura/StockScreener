@@ -1,0 +1,181 @@
+{
+  "generated_at": "2026-09-08T14:19:05.307016+00:00",
+  "minimum_change": 1000,
+  "underlyers": {
+    "SPY": {
+      "settlement_session": "2026-09-04",
+      "prior_settlement_session": "2026-09-03",
+      "sessions_spanned": 1,
+      "summary": {
+        "contract_count": 3088,
+        "call_change": 178921,
+        "put_change": 416859,
+        "opening_contract_count": 1519,
+        "unwinding_contract_count": 516,
+        "total_open_interest": 5529767,
+        "prior_total_open_interest": 4933987
+      },
+      "confirmation_counts": {
+        "PREDOMINANTLY_OPENING": 0,
+        "MIXED": 0,
+        "PREDOMINANTLY_CHURN": 0,
+        "VOLUME_UNAVAILABLE": 3088,
+        "NO_VOLUME_RECORDED": 0
+      },
+      "largest_changes": [
+        {
+          "contract_id": 7943,
+          "contract_type": "PUT",
+          "strike": 760.0,
+          "expiration_date": "2026-09-18",
+          "prior_open_interest": 70613,
+          "open_interest": 114364,
+          "change": 43751,
+          "change_fraction": 0.6195884610482489,
+          "flow": "OPENING",
+          "confirmation": "VOLUME_UNAVAILABLE",
+          "opening_share": null,
+          "session_volume_is_final": false,
+          "reasons": []
+        },
+        {
+          "contract_id": 7928,
+          "contract_type": "PUT",
+          "strike": 745.0,
+          "expiration_date": "2026-09-18",
+          "prior_open_interest": 20766,
+          "open_interest": 56931,
+          "change": 36165,
+          "change_fraction": 1.7415486853510547,
+          "flow": "OPENING",
+          "confirmation": "VOLUME_UNAVAILABLE",
+          "opening_share": null,
+          "session_volume_is_final": false,
+          "reasons": []
+        },
+        {
+          "contract_id": 7257,
+          "contract_type": "CALL",
+          "strike": 777.0,
+          "expiration_date": "2026-09-11",
+          "prior_open_interest": 2789,
+          "open_interest": 17836,
+          "change": 15047,
+          "change_fraction": 5.395123700250986,
+          "flow": "OPENING",
+          "confirmation": "VOLUME_UNAVAILABLE",
+          "opening_share": null,
+          "session_volume_is_final": false,
+          "reasons": []
+        },
+        {
+          "contract_id": 6602,
+          "contract_type": "PUT",
+          "strike": 739.0,
+          "expiration_date": "2026-09-08",
+          "prior_open_interest": 684,
+          "open_interest": 15253,
+          "change": 14569,
+          "change_fraction": 21.299707602339183,
+          "flow": "OPENING",
+          "confirmation": "VOLUME_UNAVAILABLE",
+          "opening_share": null,
+          "session_volume_is_final": false,
+          "reasons": []
+        },
+        {
+          "contract_id": 6598,
+          "contract_type": "PUT",
+          "strike": 735.0,
+          "expiration_date": "2026-09-08",
+          "prior_open_interest": 1113,
+          "open_interest": 14439,
+          "change": 13326,
+          "change_fraction": 11.973045822102426,
+          "flow": "OPENING",
+          "confirmation": "VOLUME_UNAVAILABLE",
+          "opening_share": null,
+          "session_volume_is_final": false,
+          "reasons": []
+        },
+        {
+          "contract_id": 6586,
+          "contract_type": "PUT",
+          "strike": 723.0,
+          "expiration_date": "2026-09-08",
+          "prior_open_interest": 18,
+          "open_interest": 13218,
+          "change": 13200,
+          "change_fraction": null,
+          "flow": "OPENING",
+          "confirmation": "VOLUME_UNAVAILABLE",
+          "opening_share": null,
+          "session_volume_is_final": false,
+          "reasons": [
+            "PRIOR_OPEN_INTEREST_BELOW_FLOOR"
+          ]
+        },
+        {
+          "contract_id": 7930,
+          "contract_type": "PUT",
+          "strike": 747.0,
+          "expiration_date": "2026-09-18",
+          "prior_open_interest": 3906,
+          "open_interest": 16336,
+          "change": 12430,
+          "change_fraction": 3.182283666154634,
+          "flow": "OPENING",
+          "confirmation": "VOLUME_UNAVAILABLE",
+          "opening_share": null,
+          "session_volume_is_final": false,
+          "reasons": []
+        },
+        {
+          "contract_id": 6610,
+          "contract_type": "PUT",
+          "strike": 747.0,
+          "expiration_date": "2026-09-08",
+          "prior_open_interest": 810,
+          "open_interest": 12418,
+          "change": 11608,
+          "change_fraction": 14.330864197530865,
+          "flow": "OPENING",
+          "confirmation": "VOLUME_UNAVAILABLE",
+          "opening_share": null,
+          "session_volume_is_final": false,
+          "reasons": []
+        },
+        {
+          "contract_id": 9349,
+          "contract_type": "PUT",
+          "strike": 680.0,
+          "expiration_date": "2026-10-16",
+          "prior_open_interest": 37379,
+          "open_interest": 26319,
+          "change": -11060,
+          "change_fraction": -0.29588806549131863,
+          "flow": "UNWINDING",
+          "confirmation": "VOLUME_UNAVAILABLE",
+          "opening_share": null,
+          "session_volume_is_final": false,
+          "reasons": []
+        },
+        {
+          "contract_id": 6596,
+          "contract_type": "PUT",
+          "strike": 733.0,
+          "expiration_date": "2026-09-08",
+          "prior_open_interest": 436,
+          "open_interest": 11362,
+          "change": 10926,
+          "change_fraction": 25.059633027522935,
+          "flow": "OPENING",
+          "confirmation": "VOLUME_UNAVAILABLE",
+          "opening_share": null,
+          "session_volume_is_final": false,
+          "reasons": []
+        }
+      ]
+    }
+  }
+}

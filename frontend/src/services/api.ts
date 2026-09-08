@@ -2059,6 +2059,13 @@ export interface OptionCandidateLeg {
   local_iv: number | null
   local_delta: number | null
   local_gamma: number | null
+  // Only the opportunities endpoint projects these.
+  local_theta_per_day?: number | null
+  local_vega_per_vol_point?: number | null
+  local_rho_per_rate_point?: number | null
+  spot?: string | null
+  day_volume?: number | null
+  open_interest?: number | null
   source_market_time: string
   mark_source: string
   quality_flags: string[]
@@ -2175,6 +2182,16 @@ export interface OptionScenarioResult {
   quality_flags: string[]
 }
 
+export interface OptionExecutionGate {
+  ledger_version: string
+  gate_name: string
+  verdict: 'PASS' | 'FAIL' | 'UNAVAILABLE'
+  blocking: boolean
+  reason_codes: string[]
+  evidence: Record<string, unknown>
+  evaluated_at: string
+}
+
 export interface OptionCandidateDetailData {
   candidate: Omit<OptionCandidateRow, 'legs'> & {
     context_status: string | null
@@ -2194,6 +2211,7 @@ export interface OptionCandidateDetailData {
   }
   legs: OptionCandidateLeg[]
   scenarios: OptionScenarioResult[]
+  execution_gates: OptionExecutionGate[]
   quote_liquidity: 'NOT_AVAILABLE'
   execution_mode: 'READ_ONLY_RESEARCH'
 }
@@ -2286,6 +2304,35 @@ export interface OptionPerformanceCheckpoint {
   outcome: OptionPerformanceOutcome | null
 }
 
+export interface OptionPerformanceCurrentMark {
+  market_time: string
+  observed_time: string
+  entry_net_premium: string
+  exit_net_premium: string
+  gross_pnl: string
+  estimated_cost: string
+  net_pnl: string
+  capital_at_risk: string
+  net_return: string
+  availability_flag: 'RESEARCH_DELAYED_PROXY'
+  legs: Array<{
+    contract_id: number
+    contract_ticker: string
+    side: 'BUY' | 'SELL'
+    ratio: number
+    multiplier: number
+    entry_mark: string
+    current_mark: string
+    spot: string | null
+    day_volume: number | null
+    open_interest: number | null
+    gross_pnl: string
+    estimated_cost: string
+    net_pnl: string
+  }>
+  quality_flags: string[]
+}
+
 export interface OptionPerformanceRow {
   event_id: string
   source_candidate_id: string
@@ -2308,6 +2355,26 @@ export interface OptionPerformanceRow {
   structure_risk_class: string
   candidate_rank: number
   expiration_date: string | null
+  legs: Array<{
+    leg_index: number
+    contract_ticker: string
+    side: 'BUY' | 'SELL'
+    ratio: number
+    strike: string
+    contract_type: 'CALL' | 'PUT'
+    expiration_date: string
+    model_mark: string
+    local_iv: number | null
+    local_delta: number | null
+    local_gamma: number | null
+    local_theta_per_day: number | null
+    local_vega_per_vol_point: number | null
+    local_rho_per_rate_point: number | null
+    spot: string | null
+    day_volume: number | null
+    open_interest: number | null
+  }>
+  current_mark: OptionPerformanceCurrentMark | null
   maximum_profit: string | null
   maximum_loss: string | null
   return_on_risk: number | null
@@ -2341,7 +2408,7 @@ export interface OptionPerformanceData {
   materialization_owner: 'OPTION_WORKER'
   entry_basis: 'FIRST_BOARD_OCCURRENCE' | 'ORIGINAL_SIGNAL_PACKAGE'
   navigation_revalues: false
-  current_mark_included: false
+  current_mark_included: boolean
 }
 
 export const getOptionHealth = async (): Promise<OptionsEnvelope<OptionHealthData>> => {
@@ -2369,6 +2436,63 @@ export const getOptionAnalysis = async (underlyer: string): Promise<OptionsEnvel
 
 export const getOptionDataQuality = async (): Promise<OptionsEnvelope<OptionDataQualityData>> => {
   const response = await api.get('/options/data-quality')
+  return response.data
+}
+
+export interface OptionGammaStrike {
+  strike: string
+  call_open_interest: number
+  put_open_interest: number
+  call_contract_count: number
+  put_contract_count: number
+  call_gamma_shares_per_point: number
+  put_gamma_shares_per_point: number
+  call_gamma_notional_per_percent: number
+  put_gamma_notional_per_percent: number
+}
+
+export interface OptionGammaProfile {
+  gamma_profile_id: string
+  matrix_id: string
+  underlying: string
+  scope: string
+  market_data_time: string
+  observed_time: string
+  spot: string
+  dealer_convention: string
+  volatility_assumption: string
+  net_gamma_shares_per_point: number
+  net_gamma_notional_per_percent: number
+  absolute_gamma_notional_per_percent: number
+  call_gamma_notional_per_percent: number
+  put_gamma_notional_per_percent: number
+  flip_spot: string | null
+  regime_at_spot: string
+  sign_change_count: number
+  peak_gamma_strike: string | null
+  strike_count: number
+  contributing_contract_count: number
+  eligible_contract_count: number
+  coverage_fraction: number
+  quality_reasons: string[]
+  strike_profile: OptionGammaStrike[] | null
+}
+
+export interface OptionGammaData {
+  scope: string
+  gamma_policy_version: string
+  gamma_policy_sha256: string
+  dealer_convention_note: string
+  wall_gates_enabled: boolean
+  profiles: OptionGammaProfile[]
+}
+
+export const getOptionGamma = async (params?: {
+  underlyer?: string
+  scope?: string
+  include_curve?: boolean
+}): Promise<OptionsEnvelope<OptionGammaData>> => {
+  const response = await api.get('/options/gamma', { params })
   return response.data
 }
 
@@ -2414,6 +2538,7 @@ export const getOptionSignals = async (params?: {
 export const getOptionPerformance = async (params?: {
   underlyer?: string
   strategy?: string
+  expiration?: string
   cohort?: 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS'
   days?: number
   limit?: number

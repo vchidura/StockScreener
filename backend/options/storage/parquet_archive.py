@@ -62,10 +62,16 @@ TRADE_SCHEMA = pa.schema(
         pa.field("payload_sha256", pa.string(), nullable=False),
         pa.field("raw_batch_id", pa.string(), nullable=False),
         pa.field("classification_status", pa.string(), nullable=False),
+        pa.field(
+            "classification_reasons",
+            pa.list_(pa.field("element", pa.string(), nullable=True)),
+            nullable=False,
+        ),
+        pa.field("semantics_version", pa.string()),
     ],
     metadata={
         b"schema_name": b"option_trade_event",
-        b"schema_version": b"1",
+        b"schema_version": b"2",
     },
 )
 
@@ -239,7 +245,7 @@ class ParquetRawMarketArchive(RawMarketArchive):
             underlyer=partition.underlyer,
             market_hour=partition.market_hour,
             object_key=final_path.relative_to(self.root).as_posix(),
-            schema_version=1,
+            schema_version=2,
             row_count=len(events),
             minimum_source_time=events[0].sip_timestamp,
             maximum_source_time=events[-1].sip_timestamp,
@@ -260,7 +266,7 @@ class ParquetRawMarketArchive(RawMarketArchive):
         with partial_path.open("rb") as source:
             parquet_file = pq.ParquetFile(source)
             if not parquet_file.schema_arrow.equals(TRADE_SCHEMA, check_metadata=True):
-                raise ArchiveValidationError("Parquet trade schema does not match version 1")
+                raise ArchiveValidationError("Parquet trade schema does not match version 2")
             if parquet_file.metadata.num_rows != len(events):
                 raise ArchiveValidationError("Parquet trade row count does not match input")
             timestamp_table = parquet_file.read(
@@ -445,6 +451,11 @@ def estimate_trade_event_bytes(event: OptionTradeEvent) -> int:
         + len(event.underlyer.encode("utf-8"))
         + len(event.payload_sha256)
         + len(event.conditions) * 4
+        + sum(len(reason.encode("utf-8")) for reason in event.classification_reasons)
+        + (
+            len(event.semantics_version.encode("utf-8"))
+            if event.semantics_version else 0
+        )
         + (len(event.provider_trade_id.encode("utf-8")) if event.provider_trade_id else 0)
     )
 
@@ -472,6 +483,8 @@ def _trade_record(event: OptionTradeEvent) -> dict[str, object]:
         "payload_sha256": event.payload_sha256,
         "raw_batch_id": str(event.raw_batch_id),
         "classification_status": event.classification_status.value,
+        "classification_reasons": list(event.classification_reasons),
+        "semantics_version": event.semantics_version,
     }
 
 
@@ -528,7 +541,7 @@ def _inspect_trade_file(root: Path, path: Path) -> RawFileManifest:
         raise ArchiveValidationError("raw archive path is malformed") from exc
     parquet_file = pq.ParquetFile(path)
     if not parquet_file.schema_arrow.equals(TRADE_SCHEMA, check_metadata=True):
-        raise ArchiveValidationError("Parquet trade schema does not match version 1")
+        raise ArchiveValidationError("Parquet trade schema does not match version 2")
     timestamp_table = parquet_file.read(
         columns=["sip_timestamp", "first_observed_at", "revised_observed_at"]
     )
@@ -543,7 +556,7 @@ def _inspect_trade_file(root: Path, path: Path) -> RawFileManifest:
         underlyer=underlyer,
         market_hour=market_hour,
         object_key=object_key,
-        schema_version=1,
+        schema_version=2,
         row_count=parquet_file.metadata.num_rows,
         minimum_source_time=min(timestamps),
         maximum_source_time=max(timestamps),

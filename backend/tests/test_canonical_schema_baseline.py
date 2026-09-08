@@ -17,10 +17,15 @@ def normalized_sql() -> str:
     return " ".join(baseline_sql().split())
 
 
-def test_baseline_is_the_only_schema_migration() -> None:
-    assert sorted(path.name for path in MIGRATIONS_DIR.glob("*.sql")) == [
-        "000_canonical_schema.sql"
-    ]
+def test_baseline_plus_numbered_incremental_migrations() -> None:
+    names = sorted(path.name for path in MIGRATIONS_DIR.glob("*.sql"))
+    assert names[0] == "000_canonical_schema.sql"
+    # Everything after the baseline must be an ordered, uniquely numbered increment.
+    increments = names[1:]
+    assert all(re.fullmatch(r"\d{3}_[a-z0-9_]+\.sql", name) for name in increments)
+    prefixes = [name[:3] for name in increments]
+    assert len(set(prefixes)) == len(prefixes)
+    assert all(prefix > "000" for prefix in prefixes)
     runner = (
         BACKEND_DIR / "scripts" / "run_equity_materialization.py"
     ).read_text(encoding="utf-8")

@@ -35,7 +35,7 @@ def test_recurring_package_reuses_event_and_records_candidate_occurrence():
         policy_sha256="a" * 64,
         structure_type=StructureType.CASH_SECURED_PUT,
         legs=(leg,),
-        net_premium=Decimal("2.00"),
+        net_premium=Decimal("-2.00"),
         management_policy={},
         market_data_time=market_time,
         observed_time=market_time + timedelta(minutes=15),
@@ -58,6 +58,11 @@ def test_recurring_package_reuses_event_and_records_candidate_occurrence():
     assert not any("INSERT INTO option_signal_events" in sql for sql in statements)
     assert any("INSERT INTO option_signal_occurrences" in sql for sql in statements)
     assert any("occurrence_count" in sql and "UPDATE option_signal_events" in sql for sql in statements)
+    update_sql = next(
+        sql for sql in statements
+        if "occurrence_count" in sql and "UPDATE option_signal_events" in sql
+    )
+    assert "'latest_net_premium', CAST(%s AS TEXT)" in update_sql
     occurrence_call = next(
         call for call in cursor.execute.call_args_list
         if "INSERT INTO option_signal_occurrences" in call.args[0]

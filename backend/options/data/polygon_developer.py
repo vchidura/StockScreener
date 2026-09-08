@@ -21,6 +21,7 @@ from options.domain import (
     OptionContractCatalogEntry,
     DataCapability,
     OptionContractReference,
+    OptionDailyAggregate,
     OptionTradeCursor,
     OptionTradeEvent,
     OptionTradeFetchResult,
@@ -37,6 +38,7 @@ from options.analytics.marks import UnderlyingMinuteBar
 
 from .base import BaseDataEngine
 from .base import validate_developer_capabilities
+from .trade_classification import classify_option_trade
 from .polygon_http import (
     PolygonHttpResponse,
     PolygonHttpTransport,
@@ -215,6 +217,62 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
             except (KeyError, TypeError, ValueError):
                 continue
             bars[market_time] = bar
+        return tuple(bars[key] for key in sorted(bars))
+
+    def get_option_daily_aggregates(
+        self,
+        contract_ticker: str,
+        start: date,
+        end: date,
+    ) -> tuple[OptionDailyAggregate, ...]:
+        """Daily settlement bars for one contract, including expired ones.
+
+        These are trade-based: a session with no print yields no bar, so the returned
+        series is not continuous. The entitlement also truncates roughly four years back,
+        returning HTTP 403 beyond that rather than an empty result.
+        """
+        if end < start:
+            raise ValueError("end cannot precede start")
+        path = (
+            f"/v2/aggs/ticker/{quote(contract_ticker, safe=':')}/range/1/day/"
+            f"{start.isoformat()}/{end.isoformat()}"
+        )
+        payload, _ = self._request_json(
+            f"{self.base_url}{path}",
+            {"adjusted": "true", "sort": "asc", "limit": "50000"},
+        )
+        self._validate_provider_status(payload, {"OK", "DELAYED"}, "option aggregates")
+        results = payload.get("results")
+        if results is None:
+            return ()
+        if not isinstance(results, list):
+            raise OptionProviderError(
+                ProviderErrorCategory.SCHEMA,
+                "Polygon option aggregate response results must be an array",
+            )
+        bars: dict[date, OptionDailyAggregate] = {}
+        for row in results:
+            if not isinstance(row, dict) or not isinstance(row.get("t"), int):
+                continue
+            # Stamped at the session open in UTC; local conversion would shift the date.
+            session = _from_milliseconds(row["t"]).date()
+            if not start <= session <= end:
+                continue
+            try:
+                bars[session] = OptionDailyAggregate(
+                    contract_ticker=contract_ticker,
+                    session_date=session,
+                    open=Decimal(str(row["o"])),
+                    high=Decimal(str(row["h"])),
+                    low=Decimal(str(row["l"])),
+                    close=Decimal(str(row["c"])),
+                    volume=int(row.get("v") or 0),
+                    transaction_count=(
+                        int(row["n"]) if isinstance(row.get("n"), int) else None
+                    ),
+                )
+            except (KeyError, TypeError, ValueError, ArithmeticError):
+                continue
         return tuple(bars[key] for key in sorted(bars))
 
     def get_option_reference(
@@ -617,7 +675,10 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
             "sort": "timestamp",
             "order": "asc",
         }
-        request_filter_sha256 = _sha256_json(filters)
+        request_filter_sha256 = _sha256_json({
+            "contract_ticker": contract.contract_ticker,
+            "filters": filters,
+        })
         started_at = _as_utc(self.clock(), "clock")
         initial_batch = RawOptionBatch(
             batch_id=uuid4(),
@@ -1082,6 +1143,7 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
                 "payload_sha256": payload_sha256,
             }
         )
+        classification = classify_option_trade(conditions, correction)
         return OptionTradeEvent(
             trade_event_id=uuid5(NAMESPACE_URL, event_identity),
             provider="polygon",
@@ -1102,6 +1164,9 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
             notional=price * size * contract.shares_per_contract,
             payload_sha256=payload_sha256,
             raw_batch_id=batch_id,
+            classification_status=classification.status,
+            classification_reasons=classification.reasons,
+            semantics_version=classification.semantics_version,
             provider_trade_id=(str(row["id"]) if row.get("id") is not None else None),
         )
 

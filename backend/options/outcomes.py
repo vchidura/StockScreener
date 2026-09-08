@@ -12,6 +12,7 @@ from options.strategies.domain import OptionSide
 
 
 MEASUREMENT_TYPES = frozenset(("15MIN", "30MIN", "60MIN", "CLOSE", "NEXT_OPEN"))
+CURRENT_MARK_MEASUREMENT = "CURRENT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,7 +132,7 @@ def evaluate_delayed_proxy_outcome(
     legs: tuple[OptionOutcomeLeg, ...],
     policy: OptionOutcomePolicy,
 ) -> OptionDecayOutcome:
-    if measurement_type not in MEASUREMENT_TYPES:
+    if measurement_type not in MEASUREMENT_TYPES | {CURRENT_MARK_MEASUREMENT}:
         raise ValueError("measurement_type is invalid")
     market_utc = _utc(market_time, "market_time")
     observed_utc = _utc(observed_time, "observed_time")

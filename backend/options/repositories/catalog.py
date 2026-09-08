@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Collection
 
 from psycopg2.extras import Json
@@ -19,6 +22,48 @@ from options.domain import (
 from options.errors import DuplicateFactConflict
 
 from .base import ConnectionFactory, PostgresRepository
+
+# Marks a catalog version learned by asking the reference endpoint about the past rather
+# than by observing the contract in a live chain. Without it, a backfilled contract and
+# one that was seen live and later expired are indistinguishable.
+HISTORICAL_BACKFILL_REASON = "HISTORICAL_REFERENCE_BACKFILL"
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalContractAdmission:
+    """An expired contract admitted so its settlement marks have somewhere to live."""
+
+    contract_ticker: str
+    underlying: str
+    asset_type: AssetType
+    contract_type: ContractType
+    expiration_date: date
+    strike: Decimal
+    valid_from: datetime
+    valid_to: datetime
+    shares_per_contract: int = 100
+    exercise_style: ExerciseStyle = ExerciseStyle.AMERICAN
+    provider: str = "polygon"
+    primary_exchange: str | None = None
+
+    def payload_sha256(self) -> str:
+        payload = json.dumps(
+            {
+                "contract_ticker": self.contract_ticker,
+                "underlying": self.underlying,
+                "contract_type": self.contract_type.value,
+                "expiration_date": self.expiration_date.isoformat(),
+                "strike": str(self.strike),
+                "shares_per_contract": self.shares_per_contract,
+                "exercise_style": self.exercise_style.value,
+                "provider": self.provider,
+                "source": HISTORICAL_BACKFILL_REASON,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
 
 
 _CATALOG_SELECT = """
@@ -163,6 +208,105 @@ class OptionContractCatalogRepository(PostgresRepository):
         with self._cursor() as cursor:
             contract_id, _ = _upsert_reference(cursor, reference)
             return contract_id
+
+    def admit_historical_contracts(
+        self,
+        admissions: Collection[HistoricalContractAdmission],
+        observed_at: datetime,
+    ) -> dict[str, int]:
+        """Admit expired contracts so historical marks have a contract to hang from.
+
+        Written as `EXPIRED`, never `VALIDATED_ACTIVE`, so `get_by_ticker` cannot return
+        them and no live cycle can select them. `first_observed_at` is when the backfill
+        ran, which is the truth and is also what keeps these contracts invisible to a
+        replay of any earlier decision. `valid_from`/`valid_to` describe when the terms
+        held in the market, a separate axis from when they became known.
+
+        `expired_at` stays NULL: the catalog constrains it to be at or after
+        `catalog_admitted_at`, so a contract that expired before it was admitted cannot
+        carry one. Eligibility is the guard instead.
+        """
+        admitted: dict[str, int] = {}
+        with self._cursor() as cursor:
+            for item in admissions:
+                cursor.execute(
+                    """
+                    INSERT INTO option_contract_catalog (
+                        contract_ticker, underlying, asset_type,
+                        first_observed_at, catalog_admitted_at
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (contract_ticker) DO NOTHING
+                    RETURNING contract_id
+                    """,
+                    (
+                        item.contract_ticker,
+                        item.underlying,
+                        item.asset_type.value,
+                        observed_at,
+                        observed_at,
+                    ),
+                )
+                inserted = cursor.fetchone()
+                if inserted:
+                    contract_id = inserted["contract_id"]
+                else:
+                    cursor.execute(
+                        "SELECT contract_id FROM option_contract_catalog"
+                        " WHERE contract_ticker = %s",
+                        (item.contract_ticker,),
+                    )
+                    existing = cursor.fetchone()
+                    if not existing:
+                        raise DuplicateFactConflict(
+                            "catalog conflict could not be resolved"
+                        )
+                    contract_id = existing["contract_id"]
+
+                cursor.execute(
+                    """
+                    INSERT INTO option_contract_catalog_versions (
+                        contract_id, provider, provider_version,
+                        provider_contract_type, contract_type, expiration_date, strike,
+                        provider_exercise_style, exercise_style, shares_per_contract,
+                        primary_exchange, correction, additional_underlyings,
+                        adjustment_metadata, eligibility_status, exclusion_reasons,
+                        valid_from, valid_to, first_observed_at, revised_observed_at,
+                        refreshed_at, payload_sha256
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    ON CONFLICT (
+                        contract_id, provider, payload_sha256, first_observed_at
+                    ) DO NOTHING
+                    """,
+                    (
+                        contract_id,
+                        item.provider,
+                        None,
+                        item.contract_type.value.lower(),
+                        item.contract_type.value,
+                        item.expiration_date,
+                        item.strike,
+                        item.exercise_style.value.lower(),
+                        item.exercise_style.value,
+                        item.shares_per_contract,
+                        item.primary_exchange,
+                        None,
+                        Json([]),
+                        Json({}),
+                        CatalogEligibility.EXPIRED.value,
+                        [HISTORICAL_BACKFILL_REASON],
+                        item.valid_from,
+                        item.valid_to,
+                        observed_at,
+                        None,
+                        observed_at,
+                        item.payload_sha256(),
+                    ),
+                )
+                admitted[item.contract_ticker] = contract_id
+        return admitted
 
     def upsert_references(
         self,

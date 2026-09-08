@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from statistics import median
 from typing import Iterable
@@ -12,7 +14,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import numpy as np
 
 from options.analytics.chain_analysis import ChainHealth
-from options.config import StrategyPolicy
+from options.config import GammaExposurePolicy, StrategyPolicy
 from options.domain import ContractType, OptionContractSnapshot, OptionExpirationAnalytics, OptionTradeEvent
 
 from .domain import (
@@ -28,7 +30,19 @@ from .domain import (
     candidate_identity,
 )
 from .payoff import PayoffSummary, evaluate_terminal_payoff
+from .gates import ExecutionGateLedger, evaluate_execution_gates
 from .registry import REGISTRY_BY_NAME, STRATEGY_REGISTRY, StrategyRegistration
+from options.analytics.gamma_exposure import (
+    GammaWall,
+    ScopedGammaProfile,
+    detect_gamma_walls,
+)
+from options.analytics.smile import (
+    SmileInput,
+    coefficient_payload,
+    fit_smile_groups,
+    qualifying_distortions,
+)
 from .scenarios import build_scenario_grid
 
 
@@ -36,16 +50,15 @@ from .scenarios import build_scenario_grid
 class StrategyScanResult:
     candidates: tuple[OptionCandidate, ...]
     scenarios: tuple[ScenarioResult, ...]
+    candidate_gate_ledgers: tuple[tuple[UUID, ExecutionGateLedger], ...] = ()
 
 
 def _quadratic_coefficient_payload(coefficients: np.ndarray) -> dict[str, float]:
     if coefficients.shape != (3,):
         raise ValueError("quadratic fit must contain exactly three coefficients")
-    return {
-        "quadratic": float(coefficients[0]),
-        "linear": float(coefficients[1]),
-        "intercept": float(coefficients[2]),
-    }
+    return coefficient_payload(
+        (float(coefficients[0]), float(coefficients[1]), float(coefficients[2]))
+    )
 
 
 class OptionStrategyEngine:
@@ -53,10 +66,30 @@ class OptionStrategyEngine:
         self,
         policy: StrategyPolicy,
         policy_sha256: str,
+        gamma_policy: GammaExposurePolicy | None = None,
+        gamma_policy_sha256: str | None = None,
+        read_only: bool = True,
+        quotes_available: bool = False,
+        risk_engine_available: bool = False,
     ) -> None:
         self.policy = policy
-        self.policy_sha256 = policy_sha256
+        self.gamma_policy = gamma_policy
+        self.read_only = read_only
+        self.quotes_available = quotes_available
+        self.risk_engine_available = risk_engine_available
         self.strategy_version = policy.strategy_version
+        # The gamma policy only enters strategy identity when it actually gates
+        # selection, so leaving the walls disabled preserves the published hash.
+        if gamma_policy is not None and gamma_policy.require_gamma_wall:
+            if not gamma_policy_sha256:
+                raise ValueError(
+                    "enabling gamma wall gates requires the gamma policy hash"
+                )
+            self.policy_sha256 = hashlib.sha256(
+                f"{policy_sha256}:{gamma_policy_sha256}".encode("utf-8")
+            ).hexdigest()
+        else:
+            self.policy_sha256 = policy_sha256
 
     def scan(
         self,
@@ -66,6 +99,7 @@ class OptionStrategyEngine:
         expirations: tuple[OptionExpirationAnalytics, ...],
         context: StrategyContextSnapshot,
         trades: tuple[OptionTradeEvent, ...] = (),
+        gamma_profiles: tuple[ScopedGammaProfile, ...] = (),
     ) -> StrategyScanResult:
         if not snapshots:
             raise ValueError("strategy scan requires a complete non-empty matrix")
@@ -81,7 +115,7 @@ class OptionStrategyEngine:
                 self._suppressed(matrix_id, snapshots[0], registration, reasons)
                 for registration in STRATEGY_REGISTRY
             )
-            return StrategyScanResult(candidates, ())
+            return self._scan_result(candidates, (), context)
 
         valid = tuple(
             snapshot
@@ -97,7 +131,9 @@ class OptionStrategyEngine:
         )
         outputs: list[OptionCandidate] = []
         outputs.extend(self._income_wheel(matrix_id, valid, context))
-        outputs.extend(self._gamma_squeeze(matrix_id, valid, context))
+        outputs.extend(self._gamma_squeeze(matrix_id, valid, context, gamma_profiles))
+        outputs.extend(self._long_premium(matrix_id, valid, context))
+        outputs.extend(self._debit_spread(matrix_id, valid, context))
         outputs.extend(self._spread_and_range(matrix_id, valid, expirations, context))
         outputs.extend(self._sweep_like(matrix_id, snapshots, trades, context))
         outputs.extend(self._volume_oi(matrix_id, snapshots, context))
@@ -109,7 +145,25 @@ class OptionStrategyEngine:
             if candidate.status is CandidateStatus.SELECTED and candidate.legs
             for scenario in build_scenario_grid(candidate, self.policy.scenarios)
         )
-        return StrategyScanResult(candidates, scenarios)
+        return self._scan_result(candidates, scenarios, context)
+
+    def _scan_result(
+        self,
+        candidates: tuple[OptionCandidate, ...],
+        scenarios: tuple[ScenarioResult, ...],
+        context: StrategyContextSnapshot,
+    ) -> StrategyScanResult:
+        return StrategyScanResult(
+            candidates,
+            scenarios,
+            tuple(
+                (
+                    candidate.candidate_id,
+                    self.execution_gate_ledger(context, candidate.candidate_kind),
+                )
+                for candidate in candidates
+            ),
+        )
 
     def _income_wheel(
         self,
@@ -216,6 +270,7 @@ class OptionStrategyEngine:
         matrix_id: UUID,
         snapshots: tuple[OptionContractSnapshot, ...],
         context: StrategyContextSnapshot,
+        gamma_profiles: tuple[ScopedGammaProfile, ...] = (),
     ) -> tuple[OptionCandidate, ...]:
         registration = REGISTRY_BY_NAME["ZERO_DTE_GAMMA_SQUEEZE"]
         policy = self.policy.gamma_squeeze
@@ -227,6 +282,20 @@ class OptionStrategyEngine:
             return (
                 self._suppressed(matrix_id, snapshots[0], registration, direction_block),
             )
+        walls: tuple[GammaWall, ...] = ()
+        wall_evidence: dict[str, object] = {}
+        gamma_policy = self.gamma_policy
+        require_wall = gamma_policy is not None and gamma_policy.require_gamma_wall
+        if require_wall:
+            blocked, walls, wall_evidence = self._gamma_wall_gate(
+                gamma_policy, gamma_profiles
+            )
+            if blocked:
+                return (
+                    self._suppressed(matrix_id, snapshots[0], registration, blocked),
+                )
+        wall_strikes = {wall.strike: wall for wall in walls}
+        surge_by_strike = _strike_volume_surge(snapshots)
         eligible = [
             snapshot
             for snapshot in snapshots
@@ -236,6 +305,14 @@ class OptionStrategyEngine:
             and snapshot.day_volume is not None
             and snapshot.day_volume / max(snapshot.open_interest, 1) >= policy.minimum_volume_oi_ratio
             and float(snapshot.local_gamma) > policy.minimum_gamma
+            and (
+                not require_wall
+                or (
+                    snapshot.strike in wall_strikes
+                    and surge_by_strike.get(snapshot.strike, 0.0)
+                    >= gamma_policy.minimum_volume_surge_ratio
+                )
+            )
             and (
                 context.equity_context_snapshot_id is None
                 or (
@@ -253,6 +330,7 @@ class OptionStrategyEngine:
             rows = [row for row in eligible if row.contract_type is contract_type]
             rows.sort(
                 key=lambda row: (
+                    -(wall_strikes[row.strike].gamma_share if row.strike in wall_strikes else 0.0),
                     -(row.day_volume / max(row.open_interest or 0, 1)),
                     -float(row.local_gamma),
                     -(row.day_volume or 0),
@@ -263,6 +341,7 @@ class OptionStrategyEngine:
                 rank = len(outputs) + 1
                 structure = StructureType.LONG_CALL if contract_type is ContractType.CALL else StructureType.LONG_PUT
                 leg = _leg(row, 0, OptionSide.BUY)
+                wall = wall_strikes.get(row.strike)
                 outputs.append(
                     self._candidate(
                         matrix_id,
@@ -284,6 +363,17 @@ class OptionStrategyEngine:
                         primary_evidence={
                             "directional_thesis": "BULLISH" if contract_type is ContractType.CALL else "BEARISH",
                             "moneyness_fraction": abs(float(row.strike / row.spot) - 1),
+                            **(
+                                {
+                                    "gamma_wall_strike": str(wall.strike),
+                                    "gamma_wall_share": wall.gamma_share,
+                                    "gamma_wall_distance_fraction": wall.distance_to_spot_fraction,
+                                    "volume_surge_ratio": surge_by_strike.get(row.strike, 0.0),
+                                    **wall_evidence,
+                                }
+                                if wall is not None
+                                else {}
+                            ),
                         },
                         capital_at_risk=evaluate_terminal_payoff((leg,)).maximum_loss,
                         reason_codes=self._capability_reasons(context),
@@ -306,11 +396,391 @@ class OptionStrategyEngine:
             ),
         )
 
-    def _spread_and_range(
+    @staticmethod
+    def _gamma_wall_gate(
+        policy: GammaExposurePolicy,
+        gamma_profiles: tuple[ScopedGammaProfile, ...],
+    ) -> tuple[tuple[str, ...], tuple[GammaWall, ...], dict[str, object]]:
+        scoped = next(
+            (item for item in gamma_profiles if item.scope is policy.gamma_wall_scope),
+            None,
+        )
+        if scoped is None:
+            return ("GAMMA_PROFILE_UNAVAILABLE",), (), {}
+        profile = scoped.profile
+        if profile.contributing_contract_count == 0:
+            return ("GAMMA_PROFILE_EMPTY",), (), {}
+        if (
+            policy.required_regime is not None
+            and profile.flip.regime_at_spot is not policy.required_regime
+        ):
+            return ("GAMMA_REGIME_NOT_SQUEEZE_PRONE",), (), {}
+        walls = detect_gamma_walls(
+            profile,
+            minimum_share=policy.minimum_wall_gamma_share,
+            maximum_distance_fraction=policy.wall_proximity_fraction,
+        )
+        if not walls:
+            return ("NO_PROXIMATE_GAMMA_WALL",), (), {}
+        evidence: dict[str, object] = {
+            "gamma_scope": scoped.scope.value,
+            "gamma_regime": profile.flip.regime_at_spot.value,
+            "gamma_flip_spot": (
+                str(profile.flip.flip_spot) if profile.flip.flip_spot is not None else None
+            ),
+            "dealer_convention": profile.convention.value,
+            "gamma_wall_count": len(walls),
+        }
+        return (), walls, evidence
+
+    def _long_premium(
         self,
         matrix_id: UUID,
         snapshots: tuple[OptionContractSnapshot, ...],
-        expirations: tuple[OptionExpirationAnalytics, ...],
+        context: StrategyContextSnapshot,
+    ) -> tuple[OptionCandidate, ...]:
+        registration = REGISTRY_BY_NAME["DIRECTIONAL_LONG_PREMIUM"]
+        policy = self.policy.long_premium
+        direction_block = self._direction_block(
+            context,
+            allowed=frozenset({"BULLISH", "BEARISH"}),
+        )
+        if direction_block:
+            return (
+                self._suppressed(matrix_id, snapshots[0], registration, direction_block),
+            )
+        scored: list[tuple[str, ContractType, float, OptionContractSnapshot, dict[str, object]]] = []
+        for row in snapshots:
+            if not policy.minimum_dte <= row.calendar_dte <= policy.maximum_dte:
+                continue
+            absolute_delta = abs(float(row.local_delta))
+            if not (
+                policy.minimum_absolute_delta
+                <= absolute_delta
+                <= policy.maximum_absolute_delta
+            ):
+                continue
+            if (row.open_interest or 0) < policy.minimum_open_interest:
+                continue
+            if (row.day_volume or 0) < policy.minimum_day_volume:
+                continue
+            if (
+                context.equity_context_snapshot_id is not None
+                and not (
+                    (
+                        context.qualified_direction == "BULLISH"
+                        and row.contract_type is ContractType.CALL
+                    )
+                    or (
+                        context.qualified_direction == "BEARISH"
+                        and row.contract_type is ContractType.PUT
+                    )
+                )
+            ):
+                continue
+            economics = _long_premium_economics(row)
+            if economics is None:
+                continue
+            required_move, expected_move, ratio = economics
+            if ratio > policy.maximum_breakeven_expected_move_ratio:
+                continue
+            lane = _dte_lane(row.calendar_dte, policy)
+            scored.append((
+                lane,
+                row.contract_type,
+                ratio,
+                row,
+                {
+                    "directional_thesis": (
+                        "BULLISH" if row.contract_type is ContractType.CALL else "BEARISH"
+                    ),
+                    "dte_lane": lane,
+                    "absolute_delta": absolute_delta,
+                    "breakeven": str(row.single_contract_breakeven),
+                    "required_move_fraction": required_move,
+                    "expected_move_fraction": expected_move,
+                    "breakeven_expected_move_ratio": ratio,
+                    "iv_context": None,
+                    "iv_context_reason": "INSUFFICIENT_COMPLETED_SESSION_HISTORY",
+                },
+            ))
+        if not scored:
+            return (
+                self._suppressed(
+                    matrix_id,
+                    snapshots[0],
+                    registration,
+                    ("NO_LONG_PREMIUM_WITHIN_EXPECTED_MOVE",),
+                ),
+            )
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                item[1].value,
+                item[2],
+                -(item[3].open_interest or 0),
+                -(item[3].day_volume or 0),
+                item[3].contract_id,
+            )
+        )
+        outputs: list[OptionCandidate] = []
+        emitted: dict[tuple[str, ContractType], int] = defaultdict(int)
+        for lane, contract_type, ratio, row, evidence in scored:
+            key = (lane, contract_type)
+            if emitted[key] >= policy.maximum_candidates_per_lane_side:
+                continue
+            emitted[key] += 1
+            structure = (
+                StructureType.LONG_CALL
+                if contract_type is ContractType.CALL
+                else StructureType.LONG_PUT
+            )
+            leg = _leg(row, 0, OptionSide.BUY)
+            payoff = evaluate_terminal_payoff((leg,))
+            outputs.append(
+                self._candidate(
+                    matrix_id,
+                    registration,
+                    structure,
+                    StructureRiskClass.PREMIUM_AT_RISK_DEBIT,
+                    len(outputs) + 1,
+                    (leg,),
+                    payoff,
+                    context,
+                    primary_metric_name="breakeven_expected_move_ratio",
+                    primary_metric_value=ratio,
+                    rank_components={
+                        "breakeven_expected_move_ratio": ratio,
+                        "absolute_delta": abs(float(row.local_delta)),
+                        "open_interest": row.open_interest,
+                        "day_volume": row.day_volume,
+                        "contract_id": row.contract_id,
+                    },
+                    primary_evidence=evidence,
+                    capital_at_risk=payoff.maximum_loss,
+                    reason_codes=self._capability_reasons(context),
+                    management_policy={
+                        "dte_lane": lane,
+                        "maximum_breakeven_expected_move_ratio": (
+                            policy.maximum_breakeven_expected_move_ratio
+                        ),
+                    },
+                )
+            )
+        return tuple(outputs)
+
+    def _debit_spread(
+        self,
+        matrix_id: UUID,
+        snapshots: tuple[OptionContractSnapshot, ...],
+        context: StrategyContextSnapshot,
+    ) -> tuple[OptionCandidate, ...]:
+        registration = REGISTRY_BY_NAME["DIRECTIONAL_DEBIT_SPREAD"]
+        policy = self.policy.debit_spread
+        direction_block = self._direction_block(
+            context,
+            allowed=frozenset({"BULLISH", "BEARISH"}),
+        )
+        if direction_block:
+            return (
+                self._suppressed(matrix_id, snapshots[0], registration, direction_block),
+            )
+        by_expiration: dict[
+            tuple[date, ContractType], list[OptionContractSnapshot]
+        ] = defaultdict(list)
+        for row in snapshots:
+            if not policy.minimum_dte <= row.calendar_dte <= policy.maximum_dte:
+                continue
+            if (row.open_interest or 0) < policy.minimum_open_interest:
+                continue
+            if (row.day_volume or 0) < policy.minimum_day_volume:
+                continue
+            by_expiration[(row.expiration_date, row.contract_type)].append(row)
+        scored: list[
+            tuple[str, ContractType, float, float, tuple[CandidateLeg, ...], PayoffSummary, dict[str, object]]
+        ] = []
+        for (_, contract_type), rows in by_expiration.items():
+            if (
+                context.equity_context_snapshot_id is not None
+                and not (
+                    (
+                        context.qualified_direction == "BULLISH"
+                        and contract_type is ContractType.CALL
+                    )
+                    or (
+                        context.qualified_direction == "BEARISH"
+                        and contract_type is ContractType.PUT
+                    )
+                )
+            ):
+                continue
+            for long_row in rows:
+                absolute_delta = abs(float(long_row.local_delta))
+                if not (
+                    policy.minimum_long_absolute_delta
+                    <= absolute_delta
+                    <= policy.maximum_long_absolute_delta
+                ):
+                    continue
+                spot = float(long_row.spot)
+                if spot <= 0 or long_row.local_iv is None:
+                    continue
+                if long_row.time_to_expiration_years <= 0:
+                    continue
+                expected_move = float(long_row.local_iv) * math.sqrt(
+                    long_row.time_to_expiration_years
+                )
+                if expected_move <= 0:
+                    continue
+                for short_row in rows:
+                    if short_row.contract_id == long_row.contract_id:
+                        continue
+                    # The short wing must be further out of the money than the long leg.
+                    if contract_type is ContractType.CALL:
+                        if short_row.strike <= long_row.strike:
+                            continue
+                    elif short_row.strike >= long_row.strike:
+                        continue
+                    width_fraction = float(
+                        abs(short_row.strike - long_row.strike) / long_row.spot
+                    )
+                    if not (
+                        policy.minimum_width_fraction
+                        <= width_fraction
+                        <= policy.maximum_width_fraction
+                    ):
+                        continue
+                    target_ratio = (
+                        abs(float(short_row.strike) - spot) / spot
+                    ) / expected_move
+                    if target_ratio > policy.maximum_target_expected_move_ratio:
+                        continue
+                    legs = (
+                        _leg(long_row, 0, OptionSide.BUY),
+                        _leg(short_row, 1, OptionSide.SELL),
+                    )
+                    payoff = evaluate_terminal_payoff(legs)
+                    if payoff.net_premium >= 0:
+                        continue
+                    if (
+                        not payoff.bounded_maximum_loss
+                        or payoff.maximum_loss is None
+                        or payoff.maximum_loss <= 0
+                        or payoff.maximum_profit is None
+                        or payoff.maximum_profit <= 0
+                    ):
+                        continue
+                    return_on_risk = float(payoff.maximum_profit / payoff.maximum_loss)
+                    if return_on_risk < policy.minimum_return_on_risk:
+                        continue
+                    if len(payoff.breakevens) != 1:
+                        continue
+                    required_move = abs(float(payoff.breakevens[0]) - spot) / spot
+                    breakeven_ratio = required_move / expected_move
+                    if breakeven_ratio > policy.maximum_breakeven_expected_move_ratio:
+                        continue
+                    lane = _dte_lane(long_row.calendar_dte, policy)
+                    scored.append((
+                        lane,
+                        contract_type,
+                        breakeven_ratio,
+                        return_on_risk,
+                        legs,
+                        payoff,
+                        {
+                            "directional_thesis": (
+                                "BULLISH"
+                                if contract_type is ContractType.CALL
+                                else "BEARISH"
+                            ),
+                            "dte_lane": lane,
+                            "long_strike": str(long_row.strike),
+                            "short_strike": str(short_row.strike),
+                            "long_absolute_delta": absolute_delta,
+                            "short_absolute_delta": abs(float(short_row.local_delta)),
+                            "net_debit_per_contract": str(-payoff.net_premium),
+                            "width_fraction": width_fraction,
+                            "breakeven": str(payoff.breakevens[0]),
+                            "required_move_fraction": required_move,
+                            "expected_move_fraction": expected_move,
+                            "breakeven_expected_move_ratio": breakeven_ratio,
+                            "target_expected_move_ratio": target_ratio,
+                            "return_on_risk": return_on_risk,
+                            "iv_context": None,
+                            "iv_context_reason": "INSUFFICIENT_COMPLETED_SESSION_HISTORY",
+                        },
+                    ))
+        if not scored:
+            return (
+                self._suppressed(
+                    matrix_id,
+                    snapshots[0],
+                    registration,
+                    ("NO_DEBIT_SPREAD_WITHIN_EXPECTED_MOVE",),
+                ),
+            )
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                item[1].value,
+                -item[3],
+                item[2],
+                item[4][0].contract_id,
+                item[4][1].contract_id,
+            )
+        )
+        outputs: list[OptionCandidate] = []
+        emitted: dict[tuple[str, ContractType], int] = defaultdict(int)
+        for lane, contract_type, breakeven_ratio, return_on_risk, legs, payoff, evidence in scored:
+            key = (lane, contract_type)
+            if emitted[key] >= policy.maximum_candidates_per_lane_side:
+                continue
+            emitted[key] += 1
+            structure = (
+                StructureType.CALL_DEBIT_VERTICAL
+                if contract_type is ContractType.CALL
+                else StructureType.PUT_DEBIT_VERTICAL
+            )
+            outputs.append(
+                self._candidate(
+                    matrix_id,
+                    registration,
+                    structure,
+                    StructureRiskClass.PREMIUM_AT_RISK_DEBIT,
+                    len(outputs) + 1,
+                    legs,
+                    payoff,
+                    context,
+                    primary_metric_name="return_on_risk",
+                    primary_metric_value=return_on_risk,
+                    rank_components={
+                        "return_on_risk": return_on_risk,
+                        "breakeven_expected_move_ratio": breakeven_ratio,
+                        "target_expected_move_ratio": evidence[
+                            "target_expected_move_ratio"
+                        ],
+                        "width_fraction": evidence["width_fraction"],
+                        "ordered_contract_ids": [leg.contract_id for leg in legs],
+                    },
+                    primary_evidence=evidence,
+                    capital_at_risk=payoff.maximum_loss,
+                    return_on_risk=return_on_risk,
+                    reason_codes=self._capability_reasons(context),
+                    management_policy={
+                        "dte_lane": lane,
+                        "minimum_return_on_risk": policy.minimum_return_on_risk,
+                        "maximum_breakeven_expected_move_ratio": (
+                            policy.maximum_breakeven_expected_move_ratio
+                        ),
+                    },
+                )
+            )
+        return tuple(outputs)
+
+    def _spread_and_range(
+        self,
+        matrix_id: UUID,
+        snapshots: tuple[OptionContractSnapshot, ...],        expirations: tuple[OptionExpirationAnalytics, ...],
         context: StrategyContextSnapshot,
     ) -> tuple[OptionCandidate, ...]:
         registration = REGISTRY_BY_NAME["SPREAD_RANGE_LOCATOR"]
@@ -572,30 +1042,38 @@ class OptionStrategyEngine:
     def _smile(self, matrix_id: UUID, snapshots: tuple[OptionContractSnapshot, ...], context: StrategyContextSnapshot) -> tuple[OptionCandidate, ...]:
         registration = REGISTRY_BY_NAME["VOLATILITY_SMILE_DISTORTION"]
         policy = self.policy.smile
-        groups: dict[tuple[object, ContractType], list[OptionContractSnapshot]] = defaultdict(list)
-        for row in snapshots:
-            groups[(row.expiration_date, row.contract_type)].append(row)
+        by_contract = {row.contract_id: row for row in snapshots}
+        fits = fit_smile_groups(
+            tuple(
+                SmileInput(
+                    contract_id=row.contract_id,
+                    contract_type=row.contract_type,
+                    expiration_date=row.expiration_date,
+                    strike=row.strike,
+                    spot=row.spot,
+                    local_iv=float(row.local_iv),
+                )
+                for row in snapshots
+            ),
+            minimum_strikes=policy.minimum_strikes,
+        )
         outputs: list[tuple[float, OptionContractSnapshot, dict[str, object]]] = []
-        for (expiration_date, contract_type), rows in sorted(groups.items(), key=lambda item: item[0]):
-            rows = sorted(rows, key=lambda row: (row.strike, row.contract_id))
-            if len({row.strike for row in rows}) < policy.minimum_strikes or not any(row.strike < row.spot for row in rows) or not any(row.strike > row.spot for row in rows):
-                continue
-            x = np.asarray([np.log(float(row.strike / row.spot)) for row in rows], dtype=np.float64)
-            y = np.asarray([float(row.local_iv) for row in rows], dtype=np.float64)
-            coefficients = np.polyfit(x, y, 2)
-            residuals = y - np.polyval(coefficients, x)
-            residual_median = float(np.median(residuals))
-            mad = float(np.median(np.abs(residuals - residual_median)))
-            if mad == 0:
-                continue
-            robust = (residuals - residual_median) / (1.4826 * mad)
-            for index in range(1, len(rows) - 1):
-                score = float(robust[index])
-                neighbors_consistent = np.sign(robust[index - 1]) == np.sign(score) or np.sign(robust[index + 1]) == np.sign(score)
-                if abs(score) < policy.minimum_absolute_robust_z or not neighbors_consistent:
-                    continue
-                row = rows[index]
-                outputs.append((abs(score), row, {"expiration_date": expiration_date.isoformat(), "contract_type": contract_type.value, "robust_residual_z": score, "neighboring_consistency": True, "fit_coefficients": _quadratic_coefficient_payload(coefficients), "input_count": len(rows)}))
+        for fit in fits:
+            for entry in qualifying_distortions(
+                fit, minimum_absolute_robust_z=policy.minimum_absolute_robust_z
+            ):
+                outputs.append((
+                    abs(entry.robust_z),
+                    by_contract[entry.contract_id],
+                    {
+                        "expiration_date": fit.expiration_date.isoformat(),
+                        "contract_type": fit.contract_type.value,
+                        "robust_residual_z": entry.robust_z,
+                        "neighboring_consistency": True,
+                        "fit_coefficients": coefficient_payload(fit.coefficients),
+                        "input_count": fit.input_count,
+                    },
+                ))
         outputs.sort(key=lambda item: (-item[0], item[1].expiration_date, item[1].contract_type.value, item[1].contract_id))
         if not outputs:
             return (self._suppressed(matrix_id, snapshots[0], registration, ("NO_VALID_SMILE_DISTORTION",)),)
@@ -682,14 +1160,22 @@ class OptionStrategyEngine:
         candidate_id, identity = candidate_identity(matrix_id, registration.strategy_name, self.strategy_version, structure, (), "SUPPRESSION")
         return OptionCandidate(candidate_id, identity, matrix_id, registration.strategy_name, self.strategy_version, reference.underlyer, CandidateKind.RESEARCH_ONLY, registration.strategy_archetype, registration.persona_tags, structure, StructureRiskClass.RESEARCH_CONTEXT, None, 1, CandidateStatus.SUPPRESSED, None, None, {"suppression_rank": 1}, {"source_contract_count": 0}, (), None, None, None, None, None, None, None, (), None, tuple(dict.fromkeys(reasons)), None, {}, self.policy_sha256, reference.model_version, None, None, reference.market_data_time, reference.first_observed_at, None)
 
-    @staticmethod
-    def _capability_reasons(context: StrategyContextSnapshot) -> tuple[str, ...]:
-        return tuple(dict.fromkeys((
-            *context.reason_codes,
-            *context.equity_reason_codes,
-            "QUOTE_LIQUIDITY_NOT_AVAILABLE",
-            "PAPER_RISK_ENGINE_NOT_IMPLEMENTED",
-        )))
+    def _capability_reasons(self, context: StrategyContextSnapshot) -> tuple[str, ...]:
+        return self.execution_gate_ledger(context).reason_codes
+
+    def execution_gate_ledger(
+        self,
+        context: StrategyContextSnapshot,
+        candidate_kind: CandidateKind = CandidateKind.MULTI_LEG,
+    ) -> ExecutionGateLedger:
+        return evaluate_execution_gates(
+            candidate_kind=candidate_kind,
+            context_reason_codes=tuple(context.reason_codes),
+            equity_reason_codes=tuple(context.equity_reason_codes),
+            quotes_available=self.quotes_available,
+            risk_engine_available=self.risk_engine_available,
+            read_only=self.read_only,
+        )
 
     @staticmethod
     def _direction_block(
@@ -710,6 +1196,47 @@ class OptionStrategyEngine:
 
 def _leg(snapshot: OptionContractSnapshot, index: int, side: OptionSide, ratio: int = 1) -> CandidateLeg:
     return CandidateLeg(index, snapshot.snapshot_id, snapshot.contract_id, snapshot.contract_ticker, side, ratio, snapshot.shares_per_contract, snapshot.expiration_date, snapshot.strike, snapshot.contract_type, snapshot.spot, snapshot.time_to_expiration_years, snapshot.risk_free_rate, snapshot.dividend_yield, snapshot.model_mark, snapshot.local_iv, snapshot.local_delta, snapshot.local_gamma, snapshot.local_theta_per_day, snapshot.local_vega_per_vol_point, snapshot.local_rho_per_rate_point, snapshot.market_data_time, snapshot.mark_source.value, snapshot.model_version, tuple(flag.value for flag in snapshot.quality_flags))
+
+
+def _dte_lane(calendar_dte: int, policy) -> str:
+    if calendar_dte <= policy.near_lane_maximum_dte:
+        return "NEAR"
+    if calendar_dte <= policy.short_lane_maximum_dte:
+        return "SHORT"
+    return "MEDIUM"
+
+
+def _long_premium_economics(
+    row: OptionContractSnapshot,
+) -> tuple[float, float, float] | None:
+    """Breakeven distance versus the one-sigma move implied over the option's life."""
+    if row.single_contract_breakeven is None or row.local_iv is None:
+        return None
+    spot = float(row.spot)
+    if spot <= 0 or row.time_to_expiration_years <= 0:
+        return None
+    expected_move = float(row.local_iv) * math.sqrt(row.time_to_expiration_years)
+    if expected_move <= 0:
+        return None
+    required_move = abs(float(row.single_contract_breakeven) - spot) / spot
+    return required_move, expected_move, required_move / expected_move
+
+
+def _strike_volume_surge(
+    snapshots: tuple[OptionContractSnapshot, ...],
+) -> dict[Decimal, float]:
+    """Per-strike day volume relative to the median strike, over 0-DTE contracts."""
+    totals: dict[Decimal, int] = {}
+    for snapshot in snapshots:
+        if snapshot.calendar_dte != 0 or snapshot.day_volume is None:
+            continue
+        totals[snapshot.strike] = totals.get(snapshot.strike, 0) + snapshot.day_volume
+    if not totals:
+        return {}
+    baseline = median(totals.values())
+    if baseline <= 0:
+        return {strike: 0.0 for strike in totals}
+    return {strike: volume / baseline for strike, volume in totals.items()}
 
 
 def _structure_sort(item: tuple[float, tuple[CandidateLeg, ...], StructureType, dict[str, object]]) -> tuple[object, ...]:

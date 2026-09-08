@@ -15,6 +15,7 @@ from options.strategies.domain import (
     signal_identity_sha256,
 )
 from options.strategies.engine import StrategyScanResult
+from options.strategies.gates import ExecutionGateLedger
 from options.strategies.registry import STRATEGY_REGISTRY
 from options.errors import DuplicateFactConflict
 
@@ -32,6 +33,12 @@ class OptionStrategyRepository(PostgresRepository):
     ) -> int:
         if any(candidate.matrix_id != context.matrix_id for candidate in result.candidates):
             raise ValueError("all candidates must belong to the context matrix")
+        gate_ledgers = dict(result.candidate_gate_ledgers)
+        if len(gate_ledgers) != len(result.candidate_gate_ledgers):
+            raise ValueError("candidate gate ledgers must have unique candidate ids")
+        candidate_ids = {candidate.candidate_id for candidate in result.candidates}
+        if gate_ledgers and set(gate_ledgers) != candidate_ids:
+            raise ValueError("candidate gate ledgers must cover the complete result")
         evidence_ids = {
             candidate.candidate_id: uuid5(
                 NAMESPACE_URL,
@@ -46,6 +53,11 @@ class OptionStrategyRepository(PostgresRepository):
                 evidence_id = evidence_ids[candidate.candidate_id]
                 self._persist_evidence(cursor, context, candidate, evidence_id)
                 self._persist_candidate(cursor, context, candidate, evidence_id)
+                ledger = gate_ledgers.get(candidate.candidate_id)
+                if ledger is not None:
+                    self._persist_gate_ledger(
+                        cursor, candidate.candidate_id, context.observed_time, ledger
+                    )
                 self._persist_legs(cursor, candidate)
                 if candidate.status is not CandidateStatus.SELECTED:
                     self._persist_suppression(cursor, context, candidate)
@@ -55,6 +67,37 @@ class OptionStrategyRepository(PostgresRepository):
                     self._persist_research_artifact(cursor, candidate)
             self._persist_scenarios(cursor, result)
         return len(result.candidates)
+
+    @staticmethod
+    def _persist_gate_ledger(
+        cursor,
+        candidate_id: UUID,
+        evaluated_at,
+        ledger: ExecutionGateLedger,
+    ) -> None:
+        execute_values(
+            cursor,
+            """
+            INSERT INTO option_candidate_execution_gates (
+                candidate_id, ledger_version, gate_name, verdict, blocking,
+                reason_codes, evidence, evaluated_at
+            ) VALUES %s
+            ON CONFLICT (candidate_id, ledger_version, gate_name) DO NOTHING
+            """,
+            [
+                (
+                    candidate_id,
+                    ledger.ledger_version,
+                    result.gate.value,
+                    result.verdict.value,
+                    result.blocking,
+                    list(result.reason_codes),
+                    Json(dict(result.evidence or {})),
+                    evaluated_at,
+                )
+                for result in ledger.results
+            ],
+        )
 
     @staticmethod
     def _persist_registry(
@@ -538,12 +581,12 @@ class OptionStrategyRepository(PostgresRepository):
                     status = %s,
                     blocked_reasons = %s,
                     metadata = metadata || jsonb_build_object(
-                        'latest_candidate_id', %s::TEXT,
+                        'latest_candidate_id', CAST(%s AS TEXT),
                         'latest_market_data_time', %s::TIMESTAMPTZ,
                         'latest_observed_time', %s::TIMESTAMPTZ,
-                        'latest_net_premium', %s::TEXT,
-                        'latest_stop_loss', %s::TEXT,
-                        'latest_take_profit', %s::TEXT
+                        'latest_net_premium', CAST(%s AS TEXT),
+                        'latest_stop_loss', CAST(%s AS TEXT),
+                        'latest_take_profit', CAST(%s AS TEXT)
                     ),
                     updated_at = NOW()
                 WHERE event_id = %s

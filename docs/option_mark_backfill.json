@@ -1,0 +1,15 @@
+{
+  "generated_at": "2026-09-07T06:38:36.232093+00:00",
+  "moneyness_band": 0.1,
+  "lookback_days": 400,
+  "window_days": 90,
+  "contracts_selected": 849,
+  "contracts_fetched": 849,
+  "contracts_with_no_bars": 18,
+  "contracts_blocked_by_entitlement": 0,
+  "failures": {},
+  "marks_written": 13604,
+  "distinct_sessions_by_underlying": {
+    "SPY": 304
+  }
+}

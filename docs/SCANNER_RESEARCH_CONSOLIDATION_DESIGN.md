@@ -833,6 +833,11 @@ development environment.
 
 ## Study Driver Simplification
 
+> Executing two full studies on 2026-09-03/04 produced a longer, prioritized list of defects than
+> the review below, including several that silently produced an empty result. That backlog is
+> [RESEARCH_HARNESS_ENHANCEMENTS.md](RESEARCH_HARNESS_ENHANCEMENTS.md); this section remains the
+> architectural target it works toward.
+
 A study currently spans four scripts whose flags must agree by hand: `prepare_historical_signal_research.py`,
 `run_historical_signal_research.py`, optionally `merge_historical_signal_research.py`, then
 `run_historical_signal_outcomes.py`, followed by `purge_research_scanner_data.py`. Running and

@@ -22,6 +22,7 @@ database role, Compose profile, validation, backup, and restore contract.
 - [STRATEGIES.md](STRATEGIES.md): strategy behavior
 - [SIGNAL_RESEARCH.md](SIGNAL_RESEARCH.md): signal validation methodology
 - [BACKTEST_WALKTHROUGH.md](BACKTEST_WALKTHROUGH.md): how a study runs end to end, followed on one real signal
+- [RESEARCH_HARNESS_ENHANCEMENTS.md](RESEARCH_HARNESS_ENHANCEMENTS.md): prioritized fixes from operating the pipeline, to complete before the next study
 - [SCANNER_LITERATURE_REVIEW.md](SCANNER_LITERATURE_REVIEW.md): research basis
 - [SCANNER_EVENT_EVALUATION.md](SCANNER_EVENT_EVALUATION.md): event and outcome evaluation
 - [SCANNER_RESEARCH_CONSOLIDATION_DESIGN.md](SCANNER_RESEARCH_CONSOLIDATION_DESIGN.md): scanner study summaries, recent signal retention, return qualification, and legacy cleanup
@@ -33,6 +34,7 @@ database role, Compose profile, validation, backup, and restore contract.
 ## Options Research
 
 - [OPTION_PIPELINE_CURRENT_STATE.md](OPTION_PIPELINE_CURRENT_STATE.md): current implementation state
+- [OPTION_ADVANCED_UPGRADE_REGISTER.md](OPTION_ADVANCED_UPGRADE_REGISTER.md): decisions deferred by the Developer entitlement and what to enable when real-time data arrives
 - [OPTION_RESEARCH_DESIGN.md](OPTION_RESEARCH_DESIGN.md): what equity research must add for option relevance, and the option-native demand study
 - [OPTION_CHAIN_SCANNER_IMPLEMENTATION_GUIDE.md](OPTION_CHAIN_SCANNER_IMPLEMENTATION_GUIDE.md): phased build order
 - [OPTION_CHAIN_SCANNER_DESIGN.md](OPTION_CHAIN_SCANNER_DESIGN.md): normative design

@@ -1,5 +1,11 @@
 from .catalog import OptionContractCatalogRepository
 from .analysis import OptionAnalysisRepository
+from .daily_facts import (
+	DailyMarkRecord,
+	DailyOpenInterestRecord,
+	OptionDailyFactRepository,
+)
+from .gamma import GammaProfileRecord, OptionGammaProfileRepository
 from .ingestion import OptionIngestionRepository
 from .leadership import OptionSchedulerLeadership
 from .new_series import OptionNewSeriesRepository
@@ -14,6 +20,11 @@ from .work_items import OptionWorkItemRepository
 __all__ = [
 	"OptionContractCatalogRepository",
 	"OptionAnalysisRepository",
+	"DailyMarkRecord",
+	"DailyOpenInterestRecord",
+	"OptionDailyFactRepository",
+	"GammaProfileRecord",
+	"OptionGammaProfileRepository",
 	"OptionIngestionRepository",
 	"OptionSchedulerLeadership",
 	"OptionNewSeriesRepository",

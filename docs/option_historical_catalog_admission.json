@@ -1,0 +1,12 @@
+{
+  "generated_at": "2026-09-07T03:58:33.100855+00:00",
+  "months": 12,
+  "strikes_per_expiration": 11,
+  "moneyness_band": 0.1,
+  "reference_requests": 12,
+  "already_catalogued": 0,
+  "admitted": 121,
+  "admitted_by_underlying": {
+    "SPY": 121
+  }
+}

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from options.calendar import OptionExchangeCalendar
 from options.outcomes import (
+    CURRENT_MARK_MEASUREMENT,
     delayed_proxy_commission_policy,
     evaluate_delayed_proxy_outcome,
     measurement_checkpoints,
@@ -19,6 +20,8 @@ class OptionOutcomeRunResult:
     available_measurements: int
     persisted: int
     pending: int
+    current_candidates: int = 0
+    current_persisted: int = 0
 
 
 class OptionOutcomeService:
@@ -74,12 +77,38 @@ class OptionOutcomeService:
                     policy=self.policy,
                 ))
         persisted = self.repository.persist_decay_outcomes(outcomes)
+        current_outcomes = []
+        current_persisted = 0
+        if self.repository.current_marks_available():
+            self.repository.delete_non_causal_current_marks()
+            for candidate in self.repository.list_current_candidates(
+                valuation_policy_sha256=self.policy.policy_sha256,
+                available_by=available_utc,
+                limit=limit,
+            ):
+                legs = self.repository.current_mark_legs(
+                    candidate["candidate_id"], available_by=available_utc
+                )
+                if not legs:
+                    continue
+                current_outcomes.append(evaluate_delayed_proxy_outcome(
+                    candidate_id=candidate["candidate_id"],
+                    event_id=candidate.get("event_id"),
+                    measurement_type=CURRENT_MARK_MEASUREMENT,
+                    market_time=max(row.source_market_time for row in legs),
+                    observed_time=max(row.source_observed_time for row in legs),
+                    capital_at_risk=candidate["capital_at_risk"], legs=legs,
+                    policy=self.policy,
+                ))
+            current_persisted = self.repository.persist_current_marks(current_outcomes)
         return OptionOutcomeRunResult(
             candidates=len(candidates),
             due_measurements=due,
             available_measurements=len(outcomes),
             persisted=persisted,
             pending=pending,
+            current_candidates=len(current_outcomes),
+            current_persisted=current_persisted,
         )
 
 

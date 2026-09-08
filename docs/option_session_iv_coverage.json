@@ -1,0 +1,108 @@
+{
+  "measured_on": "2026-09-06",
+  "months_sampled": 24,
+  "window_days": 60,
+  "underlyers": {
+    "SPY": {
+      "expirations_used": 22,
+      "contracts_probed": 110,
+      "strikes_per_expiration": 5,
+      "scored_sessions": 524,
+      "sessions_with_any_print": 522,
+      "sessions_with_bracketing_strikes": 516,
+      "single_strike_coverage": 0.9961832061068703,
+      "interpolation_coverage": 0.9847328244274809,
+      "mean_strikes_printing_per_session": 4.91412213740458,
+      "uncovered_sessions": [
+        "2025-03-26",
+        "2025-03-27"
+      ],
+      "first_session": "2024-07-22",
+      "last_session": "2026-08-21"
+    },
+    "QQQ": {
+      "expirations_used": 22,
+      "contracts_probed": 110,
+      "strikes_per_expiration": 5,
+      "scored_sessions": 524,
+      "sessions_with_any_print": 521,
+      "sessions_with_bracketing_strikes": 479,
+      "single_strike_coverage": 0.9942748091603053,
+      "interpolation_coverage": 0.9141221374045801,
+      "mean_strikes_printing_per_session": 4.580152671755725,
+      "uncovered_sessions": [
+        "2025-03-25",
+        "2025-03-26",
+        "2025-04-01"
+      ],
+      "first_session": "2024-07-22",
+      "last_session": "2026-08-21"
+    },
+    "IWM": {
+      "expirations_used": 22,
+      "contracts_probed": 110,
+      "strikes_per_expiration": 5,
+      "scored_sessions": 524,
+      "sessions_with_any_print": 523,
+      "sessions_with_bracketing_strikes": 520,
+      "single_strike_coverage": 0.9980916030534351,
+      "interpolation_coverage": 0.9923664122137404,
+      "mean_strikes_printing_per_session": 4.900763358778626,
+      "uncovered_sessions": [
+        "2025-03-25"
+      ],
+      "first_session": "2024-07-22",
+      "last_session": "2026-08-21"
+    },
+    "NVDA": {
+      "expirations_used": 22,
+      "contracts_probed": 110,
+      "strikes_per_expiration": 5,
+      "scored_sessions": 524,
+      "sessions_with_any_print": 524,
+      "sessions_with_bracketing_strikes": 505,
+      "single_strike_coverage": 1.0,
+      "interpolation_coverage": 0.9637404580152672,
+      "mean_strikes_printing_per_session": 4.763358778625954,
+      "uncovered_sessions": [],
+      "first_session": "2024-07-22",
+      "last_session": "2026-08-21"
+    },
+    "SOFI": {
+      "expirations_used": 22,
+      "contracts_probed": 63,
+      "strikes_per_expiration": 5,
+      "scored_sessions": 524,
+      "sessions_with_any_print": 504,
+      "sessions_with_bracketing_strikes": 312,
+      "single_strike_coverage": 0.9618320610687023,
+      "interpolation_coverage": 0.5954198473282443,
+      "mean_strikes_printing_per_session": 2.631679389312977,
+      "uncovered_sessions": [
+        "2024-07-22",
+        "2024-07-23",
+        "2024-07-24",
+        "2024-07-25",
+        "2024-07-26",
+        "2024-07-29",
+        "2024-07-30",
+        "2024-07-31",
+        "2024-08-01",
+        "2024-08-02",
+        "2024-08-05",
+        "2024-08-06",
+        "2024-08-07",
+        "2024-08-08",
+        "2024-08-09",
+        "2024-08-12",
+        "2024-08-13",
+        "2024-08-14",
+        "2024-08-15",
+        "2024-08-16"
+      ],
+      "first_session": "2024-07-22",
+      "last_session": "2026-08-21"
+    }
+  },
+  "request_count": 623
+}

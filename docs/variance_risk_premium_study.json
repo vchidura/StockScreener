@@ -1,0 +1,294 @@
+{
+  "generated_at": "2026-09-07T06:47:41.702345+00:00",
+  "underlying": "SPY",
+  "status": "PRELIMINARY_RESEARCH_ONLY",
+  "forecast_policy_version": "vol_forecast_v1",
+  "forecast_policy_sha256": "ebcda5516f9cf8acfb8d208211905201bf26a0cc29148519548da6a35d8d91ae",
+  "iv_method": "LOCAL_BLACK_SCHOLES_ATM_CALL_PUT_MEDIAN_TOTAL_VARIANCE_INTERPOLATION",
+  "maximum_absolute_log_moneyness": 0.03,
+  "contracts_per_side": 2,
+  "mark_source": "PROVIDER_DAILY_AGGREGATE_ADJUSTED",
+  "risk_free_rate": 0.04,
+  "risk_free_rate_reason": "STATIC_CONFIGURATION_NOT_DATED_CURVE",
+  "dividend_yield_method": "TRAILING_365_DAY_CASH_DIVIDENDS_OVER_UNADJUSTED_SPOT",
+  "dividend_covered_sessions": 1183,
+  "option_mark_adjustment_reason": "EXISTING_BACKFILL_USED_ADJUSTED_TRUE",
+  "graduation_blockers": [
+    "STATIC_RISK_FREE_RATE",
+    "OPTION_MARK_POLICY_NOT_VERSIONED",
+    "SPY_ONLY_HISTORY",
+    "NO_STRATEGY_PNL_LINK"
+  ],
+  "reference_semantics": "IMMUTABLE_CONTRACT_TERMS_RECONSTRUCTED_WHERE_NOT_KNOWN_LIVE",
+  "input_counts": {
+    "mark_rows": 13604,
+    "solver_inputs": 12936,
+    "solver_converged": 12537,
+    "skipped_no_spot": 0,
+    "skipped_expired": 668,
+    "historically_reconstructed_reference_rows": 7939,
+    "mark_source_count": 1,
+    "sessions_with_contract_iv": 303,
+    "expiration_points": 453,
+    "rejected_expirations": 274,
+    "maximum_expiration_maturity_years": 0.24121004566210047,
+    "sessions_with_lower_expiration": {
+      "7": 87,
+      "21": 171,
+      "45": 220
+    },
+    "sessions_with_upper_expiration": {
+      "7": 199,
+      "21": 168,
+      "45": 88
+    }
+  },
+  "horizons": {
+    "7": {
+      "overlapping": {
+        "observations": 64,
+        "first_session": "2025-09-09",
+        "last_session": "2026-08-24",
+        "mean_implied_volatility": 0.1369087466575223,
+        "mean_forecast_realized_volatility": 0.11296074214850096,
+        "mean_actual_realized_volatility": 0.10780584710358958,
+        "mean_forecast_variance_premium": 0.005951766320190932,
+        "mean_realized_variance_premium": 0.0063201018189227715,
+        "median_forecast_richness_ratio": 1.2237468573183725,
+        "median_realized_richness_ratio": 1.2946815688083575,
+        "forecast_positive_rate": 0.859375,
+        "climatology_positive_rate": 0.296875,
+        "realized_positive_rate": 0.859375,
+        "premium_sign_accuracy": 0.71875,
+        "climatology_sign_accuracy": 0.4375,
+        "forecast_realized_premium_correlation": 0.055471216293217954,
+        "premium_rmse": 0.010158417242824706,
+        "climatology_premium_rmse": 0.010807872762173447,
+        "richness_quintiles": [
+          {
+            "quintile": 1,
+            "observations": 13,
+            "mean_forecast_richness_ratio": 0.9455588802053557,
+            "mean_realized_variance_premium": 0.006447834511051105,
+            "positive_realized_premium_rate": 1.0
+          },
+          {
+            "quintile": 2,
+            "observations": 13,
+            "mean_forecast_richness_ratio": 1.1497146261674334,
+            "mean_realized_variance_premium": 0.007133115921437791,
+            "positive_realized_premium_rate": 0.8461538461538461
+          },
+          {
+            "quintile": 3,
+            "observations": 13,
+            "mean_forecast_richness_ratio": 1.2269046612981944,
+            "mean_realized_variance_premium": 0.007604412257668402,
+            "positive_realized_premium_rate": 0.8461538461538461
+          },
+          {
+            "quintile": 4,
+            "observations": 13,
+            "mean_forecast_richness_ratio": 1.344392316112657,
+            "mean_realized_variance_premium": 0.007531001011234083,
+            "positive_realized_premium_rate": 0.8461538461538461
+          },
+          {
+            "quintile": 5,
+            "observations": 12,
+            "mean_forecast_richness_ratio": 1.5640405358610108,
+            "mean_realized_variance_premium": 0.0025978156910807858,
+            "positive_realized_premium_rate": 0.75
+          }
+        ]
+      },
+      "independent": {
+        "observations": 16,
+        "first_session": "2025-09-09",
+        "last_session": "2026-08-20",
+        "mean_implied_volatility": 0.13713624571940852,
+        "mean_forecast_realized_volatility": 0.10977150499054868,
+        "mean_actual_realized_volatility": 0.10508528410042478,
+        "mean_forecast_variance_premium": 0.006890399079757168,
+        "mean_realized_variance_premium": 0.006864602404672309,
+        "median_forecast_richness_ratio": 1.2921799186508145,
+        "median_realized_richness_ratio": 1.37846456772252,
+        "forecast_positive_rate": 0.875,
+        "climatology_positive_rate": 0.3125,
+        "realized_positive_rate": 0.875,
+        "premium_sign_accuracy": 0.75,
+        "climatology_sign_accuracy": 0.4375,
+        "forecast_realized_premium_correlation": 0.05339070997550231,
+        "premium_rmse": 0.011305944672889798,
+        "climatology_premium_rmse": 0.011292584375374313
+      },
+      "confidence_status": "INSUFFICIENT_INDEPENDENT_PERIODS",
+      "matched_iv_sessions": 64,
+      "rv_forecast_sessions": 989
+    },
+    "21": {
+      "overlapping": {
+        "observations": 117,
+        "first_session": "2025-08-27",
+        "last_session": "2026-08-04",
+        "mean_implied_volatility": 0.13762726165415737,
+        "mean_forecast_realized_volatility": 0.12656642901623574,
+        "mean_actual_realized_volatility": 0.11635469178235794,
+        "mean_forecast_variance_premium": 0.0028507205919329594,
+        "mean_realized_variance_premium": 0.005156656396165609,
+        "median_forecast_richness_ratio": 1.106228742071001,
+        "median_realized_richness_ratio": 1.13765172856824,
+        "forecast_positive_rate": 0.6752136752136753,
+        "climatology_positive_rate": 0.24786324786324787,
+        "realized_positive_rate": 0.8632478632478633,
+        "premium_sign_accuracy": 0.6752136752136753,
+        "climatology_sign_accuracy": 0.38461538461538464,
+        "forecast_realized_premium_correlation": 0.053291334372240574,
+        "premium_rmse": 0.008359071572235073,
+        "climatology_premium_rmse": 0.00935743117843476,
+        "richness_quintiles": [
+          {
+            "quintile": 1,
+            "observations": 24,
+            "mean_forecast_richness_ratio": 0.8492625106852428,
+            "mean_realized_variance_premium": 0.004794365419135332,
+            "positive_realized_premium_rate": 0.7916666666666666
+          },
+          {
+            "quintile": 2,
+            "observations": 24,
+            "mean_forecast_richness_ratio": 0.9958880556395252,
+            "mean_realized_variance_premium": 0.006430663298298364,
+            "positive_realized_premium_rate": 0.8333333333333334
+          },
+          {
+            "quintile": 3,
+            "observations": 23,
+            "mean_forecast_richness_ratio": 1.107737675925983,
+            "mean_realized_variance_premium": 0.00441026499561293,
+            "positive_realized_premium_rate": 0.8260869565217391
+          },
+          {
+            "quintile": 4,
+            "observations": 23,
+            "mean_forecast_richness_ratio": 1.2247723801655317,
+            "mean_realized_variance_premium": 0.006797178310752,
+            "positive_realized_premium_rate": 0.8695652173913043
+          },
+          {
+            "quintile": 5,
+            "observations": 23,
+            "mean_forecast_richness_ratio": 1.381663359290883,
+            "mean_realized_variance_premium": 0.0033111701341988686,
+            "positive_realized_premium_rate": 1.0
+          }
+        ]
+      },
+      "independent": {
+        "observations": 9,
+        "first_session": "2025-08-27",
+        "last_session": "2026-07-31",
+        "mean_implied_volatility": 0.1369527688468846,
+        "mean_forecast_realized_volatility": 0.12729631014455917,
+        "mean_actual_realized_volatility": 0.10931717142545695,
+        "mean_forecast_variance_premium": 0.002630949198261269,
+        "mean_realized_variance_premium": 0.006627111180545008,
+        "median_forecast_richness_ratio": 1.0336215767512238,
+        "median_realized_richness_ratio": 1.2637611316705475,
+        "forecast_positive_rate": 0.6666666666666666,
+        "climatology_positive_rate": 0.1111111111111111,
+        "realized_positive_rate": 0.8888888888888888,
+        "premium_sign_accuracy": 0.5555555555555556,
+        "climatology_sign_accuracy": 0.2222222222222222,
+        "forecast_realized_premium_correlation": 0.23684546152197872,
+        "premium_rmse": 0.007545245622632554,
+        "climatology_premium_rmse": 0.010582571134386872
+      },
+      "confidence_status": "INSUFFICIENT_INDEPENDENT_PERIODS",
+      "matched_iv_sessions": 117,
+      "rv_forecast_sessions": 961
+    },
+    "45": {
+      "overlapping": {
+        "observations": 86,
+        "first_session": "2025-08-27",
+        "last_session": "2026-06-16",
+        "mean_implied_volatility": 0.1416178780664517,
+        "mean_forecast_realized_volatility": 0.13261304692789044,
+        "mean_actual_realized_volatility": 0.12727538564910776,
+        "mean_forecast_variance_premium": 0.0023184213841671163,
+        "mean_realized_variance_premium": 0.0035933101694546094,
+        "median_forecast_richness_ratio": 1.0695040904481143,
+        "median_realized_richness_ratio": 1.0984848054072551,
+        "forecast_positive_rate": 0.627906976744186,
+        "climatology_positive_rate": 0.09302325581395349,
+        "realized_positive_rate": 0.8023255813953488,
+        "premium_sign_accuracy": 0.5697674418604651,
+        "climatology_sign_accuracy": 0.29069767441860467,
+        "forecast_realized_premium_correlation": -0.09797495567037791,
+        "premium_rmse": 0.007749666952843834,
+        "climatology_premium_rmse": 0.00897329630862995,
+        "richness_quintiles": [
+          {
+            "quintile": 1,
+            "observations": 18,
+            "mean_forecast_richness_ratio": 0.9005255836391401,
+            "mean_realized_variance_premium": 0.004212407484876727,
+            "positive_realized_premium_rate": 0.8333333333333334
+          },
+          {
+            "quintile": 2,
+            "observations": 17,
+            "mean_forecast_richness_ratio": 0.9822849496270233,
+            "mean_realized_variance_premium": 0.003008994874494536,
+            "positive_realized_premium_rate": 0.6470588235294118
+          },
+          {
+            "quintile": 3,
+            "observations": 17,
+            "mean_forecast_richness_ratio": 1.0703359762966165,
+            "mean_realized_variance_premium": 0.0053509080925854755,
+            "positive_realized_premium_rate": 0.8823529411764706
+          },
+          {
+            "quintile": 4,
+            "observations": 17,
+            "mean_forecast_richness_ratio": 1.1894160032604035,
+            "mean_realized_variance_premium": 0.003083852354572809,
+            "positive_realized_premium_rate": 0.8823529411764706
+          },
+          {
+            "quintile": 5,
+            "observations": 17,
+            "mean_forecast_richness_ratio": 1.277903865650095,
+            "mean_realized_variance_premium": 0.0022739705516010194,
+            "positive_realized_premium_rate": 0.7647058823529411
+          }
+        ]
+      },
+      "independent": {
+        "observations": 4,
+        "first_session": "2025-08-27",
+        "last_session": "2026-05-05",
+        "mean_implied_volatility": 0.13648012291855952,
+        "mean_forecast_realized_volatility": 0.12650595314281726,
+        "mean_actual_realized_volatility": 0.12563412356126097,
+        "mean_forecast_variance_premium": 0.0027786622405750715,
+        "mean_realized_variance_premium": 0.002848413576585035,
+        "median_forecast_richness_ratio": 1.0897172792070733,
+        "median_realized_richness_ratio": 1.0450735095757615,
+        "forecast_positive_rate": 0.75,
+        "climatology_positive_rate": 0.25,
+        "realized_positive_rate": 0.75,
+        "premium_sign_accuracy": 0.5,
+        "climatology_sign_accuracy": 0.5,
+        "forecast_realized_premium_correlation": 0.6168158590391181,
+        "premium_rmse": 0.003969679702513839,
+        "climatology_premium_rmse": 0.008868866288906867
+      },
+      "confidence_status": "INSUFFICIENT_INDEPENDENT_PERIODS",
+      "matched_iv_sessions": 86,
+      "rv_forecast_sessions": 913
+    }
+  }
+}

@@ -136,6 +136,7 @@ def build_chain_health(
     reference_drift_failed: bool,
     batch_complete: bool = True,
     minimum_iv_convergence_fraction: float = 0.95,
+    execution_lag_exceeded: bool = False,
 ) -> ChainHealth:
     catalog_coverage = catalog_matched_count / received_count if received_count else 0.0
     mark_alignment = mark_aligned_count / retained_count if retained_count else 0.0
@@ -153,6 +154,10 @@ def build_chain_health(
         reasons.append("DATA_QUALITY_GATE_FAILED")
     if mark_alignment < 1.0:
         reasons.append("PARTIAL_MARK_ALIGNMENT")
+    # A run far behind its slot pairs marks against an increasingly stale bar set, so it
+    # is degraded rather than trusted for selection.
+    if execution_lag_exceeded:
+        reasons.append("EXECUTION_LAG_EXCEEDED")
     status = "FAILED" if any(
         reason in {
             "INCOMPLETE_MATRIX",

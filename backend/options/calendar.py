@@ -41,6 +41,54 @@ class OptionExchangeCalendar:
             timezone.utc
         )
 
+    def sessions_between(self, start: date, end: date) -> int:
+        """Exchange sessions from `start` to `end`, counting `end` and not `start`.
+
+        Consecutive sessions return 1, including across a weekend or holiday. A larger
+        value means sessions were missed, which calendar-day distance cannot reveal.
+        """
+        if end <= start:
+            raise ValueError("end must follow start")
+        sessions = self._calendar.sessions_in_range(
+            pd.Timestamp(start), pd.Timestamp(end)
+        )
+        return max(len(sessions) - 1, 1)
+
+    def previous_session(self, session_date: date) -> date:
+        session = self._calendar.date_to_session(
+            pd.Timestamp(session_date), direction="none"
+        )
+        return self._calendar.previous_session(session).date()
+
+    @staticmethod
+    def third_friday(year: int, month: int) -> date:
+        """Standard monthly expiration date."""
+        for day in range(15, 22):
+            candidate = date(year, month, day)
+            if candidate.weekday() == 4:
+                return candidate
+        raise ValueError("no third Friday found")
+
+    @classmethod
+    def monthly_expirations(cls, count: int, before: date) -> list[date]:
+        """The `count` most recent standard monthly expirations strictly before `before`.
+
+        Not calendar-adjusted: a third Friday that fell on a holiday still names the
+        contract series, which is what the reference endpoint is keyed by.
+        """
+        if count < 1:
+            raise ValueError("count must be positive")
+        expirations: list[date] = []
+        year, month = before.year, before.month
+        while len(expirations) < count:
+            candidate = cls.third_friday(year, month)
+            if candidate < before:
+                expirations.append(candidate)
+            month -= 1
+            if month == 0:
+                year, month = year - 1, 12
+        return sorted(expirations)
+
     def latest_completed_session(self, as_of: datetime) -> date:
         if as_of.tzinfo is None or as_of.utcoffset() is None:
             raise ValueError("as_of must be timezone-aware")

@@ -134,6 +134,43 @@ states:
 - `ALREADY_APPLIED`
 - `ADOPTED_EXISTING_SCHEMA`
 
+After the baseline has been installed, apply each checked-in incremental migration once, in
+numeric order, with the administrator-only runner. It executes the SQL in one transaction,
+records the migration version, and refreshes the restricted runtime role grants. The current
+post-baseline option chain is:
+
+```powershell
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\020_option_current_marks.sql `
+  --verify-table option_signal_current_marks
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\021_option_gamma_profiles.sql `
+  --verify-table option_gamma_profiles
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\022_option_daily_contract_facts.sql `
+  --verify-table option_daily_contract_facts
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\023_option_daily_facts_mark_provenance.sql `
+  --verify-table option_daily_contract_facts
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\024_option_open_interest_provenance.sql `
+  --verify-table option_daily_contract_facts
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\025_option_candidate_execution_gates.sql `
+  --verify-table option_candidate_execution_gates
+```
+
 It rejects partially initialized schemas. To intentionally replace an existing database, stop the
 API and all workers first, keep the external backup, and provide the exact database name twice:
 

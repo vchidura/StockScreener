@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "forecast_policy_version": "vol_forecast_v1",
+  "variance_source": "INTRADAY_PATH",
+  "daily_estimator": "GARMAN_KLASS",
+  "intraday_interval": "30m",
+  "include_overnight_variance": false,
+  "har_lags": [1, 5, 22],
+  "horizon_sessions": 21,
+  "minimum_training_sessions": 252,
+  "refit_every_sessions": 21,
+  "minimum_session_bars": 4,
+  "maximum_session_gap_days": 7,
+  "session_scope": "RTH",
+  "adjusted_bars_for_label": true,
+  "trading_days_per_year": 252
+}

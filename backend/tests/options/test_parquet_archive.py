@@ -11,7 +11,8 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from options.domain import OptionTradeEvent
+from options.domain import OptionTradeEvent, TradeClassificationStatus
+from options.data.trade_classification import TRADE_SEMANTICS_VERSION
 from options.storage import (
     ArchiveReconciler,
     BoundedTradeArchiveQueue,
@@ -82,6 +83,12 @@ def _event(sequence=1, seconds=0):
         notional=Decimal("250.00000000"),
         payload_sha256="a" * 64,
         raw_batch_id=uuid4(),
+        classification_status=TradeClassificationStatus.INCLUDED,
+        classification_reasons=(
+            "PROVIDER_CONSOLIDATED_VOLUME_ELIGIBLE",
+            "AGGRESSOR_SIDE_UNAVAILABLE",
+        ),
+        semantics_version=TRADE_SEMANTICS_VERSION,
         provider_trade_id="provider-metadata",
     )
 
@@ -104,6 +111,12 @@ def test_trade_archive_writes_validated_zstd_file_before_manifest(tmp_path):
     parquet_file = pq.ParquetFile(final_path)
     assert parquet_file.schema_arrow.equals(TRADE_SCHEMA, check_metadata=True)
     assert parquet_file.metadata.num_rows == 2
+    archived = pq.read_table(final_path).to_pylist()
+    assert archived[0]["classification_reasons"] == [
+        "PROVIDER_CONSOLIDATED_VOLUME_ELIGIBLE",
+        "AGGRESSOR_SIDE_UNAVAILABLE",
+    ]
+    assert archived[0]["semantics_version"] == TRADE_SEMANTICS_VERSION
     assert {
         parquet_file.metadata.row_group(0).column(index).compression
         for index in range(parquet_file.metadata.num_columns)

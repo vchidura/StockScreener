@@ -293,6 +293,51 @@ def passes_convergence_gate(
     return bool(results) and convergence_fraction(results) >= minimum_fraction
 
 
+def black_scholes_gamma(
+    spot: np.ndarray,
+    strike: np.ndarray,
+    maturity: np.ndarray,
+    rate: np.ndarray,
+    dividend: np.ndarray,
+    volatility: np.ndarray,
+) -> np.ndarray:
+    """Vectorized gamma; identical for calls and puts. Invalid inputs yield NaN."""
+    spot = np.asarray(spot, dtype=np.float64)
+    strike = np.asarray(strike, dtype=np.float64)
+    maturity = np.asarray(maturity, dtype=np.float64)
+    rate = np.asarray(rate, dtype=np.float64)
+    dividend = np.asarray(dividend, dtype=np.float64)
+    volatility = np.asarray(volatility, dtype=np.float64)
+    valid = (
+        np.isfinite(spot)
+        & np.isfinite(strike)
+        & np.isfinite(maturity)
+        & np.isfinite(rate)
+        & np.isfinite(dividend)
+        & np.isfinite(volatility)
+        & (spot > 0)
+        & (strike > 0)
+        & (maturity > 0)
+        & (volatility > 0)
+    )
+    safe_spot = np.where(valid, spot, 1.0)
+    safe_strike = np.where(valid, strike, 1.0)
+    safe_maturity = np.where(valid, maturity, 1.0)
+    safe_volatility = np.where(valid, volatility, 1.0)
+    root_time = np.sqrt(safe_maturity)
+    d1 = (
+        np.log(safe_spot / safe_strike)
+        + (rate - dividend + 0.5 * safe_volatility * safe_volatility) * safe_maturity
+    ) / (safe_volatility * root_time)
+    normal_d1 = np.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi)
+    gamma = (
+        np.exp(-dividend * safe_maturity)
+        * normal_d1
+        / (safe_spot * safe_volatility * root_time)
+    )
+    return np.where(valid, gamma, np.nan)
+
+
 def _price_and_vega(spot, strike, maturity, rate, dividend, volatility, is_call):
     root_time = np.sqrt(maturity)
     d1 = (

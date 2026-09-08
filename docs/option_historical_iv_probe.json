@@ -1,0 +1,101 @@
+{
+  "probed_on": "2026-09-06",
+  "risk_free_rate": 0.04,
+  "dividend_yield": 0.0,
+  "underlyers": {
+    "SPY": {
+      "attempted": 2395,
+      "solved": 2333,
+      "converged": 2282,
+      "convergence_rate": 0.9781397342477497,
+      "contracts_with_no_bar": 0,
+      "marks_below_intrinsic": 62,
+      "failures": {
+        "BELOW_NO_ARBITRAGE_BOUND": 51
+      },
+      "atm_iv_median": 0.1583518750636564,
+      "atm_observations": 856,
+      "iv_by_moneyness_bucket": {
+        "above_1.03": {
+          "count": 200,
+          "median_iv": 0.1663536722337005
+        },
+        "atm_0.97_1.03": {
+          "count": 1680,
+          "median_iv": 0.1586275714293272
+        },
+        "below_0.97": {
+          "count": 402,
+          "median_iv": 0.19892565317277847
+        }
+      },
+      "iv_range": [
+        0.08776676239685939,
+        1.062144017185469
+      ]
+    },
+    "NVDA": {
+      "attempted": 1990,
+      "solved": 1931,
+      "converged": 1923,
+      "convergence_rate": 0.9958570688762299,
+      "contracts_with_no_bar": 0,
+      "marks_below_intrinsic": 59,
+      "failures": {
+        "BELOW_NO_ARBITRAGE_BOUND": 8
+      },
+      "atm_iv_median": 0.3769614048016374,
+      "atm_observations": 212,
+      "iv_by_moneyness_bucket": {
+        "above_1.03": {
+          "count": 302,
+          "median_iv": 0.35414712317266983
+        },
+        "atm_0.97_1.03": {
+          "count": 707,
+          "median_iv": 0.3810171731317072
+        },
+        "below_0.97": {
+          "count": 914,
+          "median_iv": 0.4216348877522493
+        }
+      },
+      "iv_range": [
+        0.0597300305078214,
+        1.9428216968734064
+      ]
+    },
+    "SOFI": {
+      "attempted": 2023,
+      "solved": 1948,
+      "converged": 1940,
+      "convergence_rate": 0.9958932238193019,
+      "contracts_with_no_bar": 0,
+      "marks_below_intrinsic": 75,
+      "failures": {
+        "BELOW_NO_ARBITRAGE_BOUND": 8
+      },
+      "atm_iv_median": 0.6204881994294069,
+      "atm_observations": 129,
+      "iv_by_moneyness_bucket": {
+        "above_1.03": {
+          "count": 738,
+          "median_iv": 0.6259221954054931
+        },
+        "atm_0.97_1.03": {
+          "count": 423,
+          "median_iv": 0.6126042245517568
+        },
+        "below_0.97": {
+          "count": 779,
+          "median_iv": 0.6592648347528617
+        }
+      },
+      "iv_range": [
+        0.21414538470500255,
+        3.77988035809163
+      ]
+    }
+  },
+  "request_count": 243
+}

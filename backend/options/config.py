@@ -12,6 +12,15 @@ from typing import Any, Mapping
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from options.domain import (
+    DealerConvention,
+    GammaRegime,
+    GammaScope,
+    VarianceEstimator,
+    VarianceSource,
+    VolatilityAssumption,
+)
+
 
 class DataEngine(str, Enum):
     POLYGON_DEVELOPER = "polygon_developer"
@@ -64,9 +73,20 @@ class OptionSettings(_FrozenModel):
     default_dividend_yield: Decimal = Field(default=Decimal("0"), ge=0, le=1)
     policy_file: Path = Path("options/policies/developer_v1.json")
     strategy_policy_file: Path = Path("options/policies/strategy_v1.json")
+    gamma_policy_file: Path = Path("options/policies/gamma_policy_v1.json")
     raw_archive_enabled: bool = False
     raw_archive_root: Path = Path("option-raw")
     start_read_only: bool = True
+    # Beyond this the run is behind its slot far enough that marks begin falling outside
+    # the source-age window, so the matrix is degraded rather than trusted.
+    maximum_execution_lag_seconds: int = Field(default=1800, gt=0)
+    # Trade ingestion is opt-in because enabling it multiplies provider requests per
+    # cycle. These knobs are intentionally absent from fingerprint_payload: they bound
+    # operational cost, and the watchlist rule must be versioned separately before any
+    # measured study depends on sweep detections.
+    trade_ingestion_enabled: bool = False
+    trade_watchlist_per_underlyer: int = Field(default=15, gt=0, le=200)
+    trade_lookback_seconds: int = Field(default=3600, gt=0)
 
     @field_validator("fixed_stock_underlyers", "fixed_etf_underlyers", mode="before")
     @classmethod
@@ -136,6 +156,7 @@ class OptionSettings(_FrozenModel):
             "raw_archive_enabled": self.raw_archive_enabled,
             "raw_archive_root": str(self.raw_archive_root),
             "start_read_only": self.start_read_only,
+            "maximum_execution_lag_seconds": self.maximum_execution_lag_seconds,
         }
 
 
@@ -260,6 +281,68 @@ class SpreadStrategyPolicy(_FrozenModel):
     maximum_center_distance_fraction: float = Field(gt=0, lt=1)
 
 
+class LongPremiumPolicy(_FrozenModel):
+    minimum_dte: int = Field(ge=1)
+    maximum_dte: int = Field(gt=1)
+    near_lane_maximum_dte: int = Field(gt=0)
+    short_lane_maximum_dte: int = Field(gt=0)
+    minimum_absolute_delta: float = Field(gt=0, lt=1)
+    maximum_absolute_delta: float = Field(gt=0, lt=1)
+    # Breakeven distance divided by the one-sigma move implied over the option's life.
+    # At 1.0 the contract only breaks even on a one-standard-deviation move.
+    maximum_breakeven_expected_move_ratio: float = Field(gt=0)
+    minimum_open_interest: int = Field(ge=0)
+    minimum_day_volume: int = Field(ge=0)
+    maximum_candidates_per_lane_side: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _validate_bands(self) -> "LongPremiumPolicy":
+        if self.maximum_dte < self.minimum_dte:
+            raise ValueError("long premium maximum_dte must not be less than minimum_dte")
+        if self.maximum_absolute_delta <= self.minimum_absolute_delta:
+            raise ValueError("long premium delta band must be increasing")
+        if not self.minimum_dte <= self.near_lane_maximum_dte <= self.short_lane_maximum_dte:
+            raise ValueError("long premium lane boundaries must be ordered")
+        if self.short_lane_maximum_dte > self.maximum_dte:
+            raise ValueError("long premium lanes must fit inside the DTE range")
+        return self
+
+
+class DebitSpreadPolicy(_FrozenModel):
+    minimum_dte: int = Field(ge=1)
+    maximum_dte: int = Field(gt=1)
+    near_lane_maximum_dte: int = Field(gt=0)
+    short_lane_maximum_dte: int = Field(gt=0)
+    minimum_long_absolute_delta: float = Field(gt=0, lt=1)
+    maximum_long_absolute_delta: float = Field(gt=0, lt=1)
+    minimum_width_fraction: float = Field(gt=0, lt=1)
+    maximum_width_fraction: float = Field(gt=0, lt=1)
+    # Same metric as the long-premium module so the two directional families rank
+    # on one comparable scale, measured against the spread breakeven.
+    maximum_breakeven_expected_move_ratio: float = Field(gt=0)
+    # Distance to the short strike divided by the implied move. Above 1.0 the
+    # maximum profit is only reached on a larger than one-sigma move.
+    maximum_target_expected_move_ratio: float = Field(gt=0)
+    minimum_return_on_risk: float = Field(gt=0)
+    minimum_open_interest: int = Field(ge=0)
+    minimum_day_volume: int = Field(ge=0)
+    maximum_candidates_per_lane_side: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _validate_bands(self) -> "DebitSpreadPolicy":
+        if self.maximum_dte < self.minimum_dte:
+            raise ValueError("debit spread maximum_dte must not be less than minimum_dte")
+        if self.maximum_long_absolute_delta <= self.minimum_long_absolute_delta:
+            raise ValueError("debit spread long delta band must be increasing")
+        if self.maximum_width_fraction <= self.minimum_width_fraction:
+            raise ValueError("debit spread width band must be increasing")
+        if not self.minimum_dte <= self.near_lane_maximum_dte <= self.short_lane_maximum_dte:
+            raise ValueError("debit spread lane boundaries must be ordered")
+        if self.short_lane_maximum_dte > self.maximum_dte:
+            raise ValueError("debit spread lanes must fit inside the DTE range")
+        return self
+
+
 class FlowStrategyPolicy(_FrozenModel):
     minimum_print_notional: Decimal = Field(gt=0)
     minimum_sweep_prints: int = Field(gt=0)
@@ -300,9 +383,111 @@ class StrategyPolicy(_FrozenModel):
     gamma_squeeze: GammaSqueezePolicy
     income_wheel: IncomeWheelPolicy
     spreads: SpreadStrategyPolicy
+    long_premium: LongPremiumPolicy
+    debit_spread: DebitSpreadPolicy
     flow: FlowStrategyPolicy
     smile: SmileStrategyPolicy
     scenarios: ScenarioPolicy
+
+
+class GammaExposurePolicy(_FrozenModel):
+    schema_version: int = Field(gt=0)
+    gamma_policy_version: str = Field(min_length=1)
+    shares_per_contract: int = Field(gt=0)
+    minimum_open_interest: int = Field(ge=0)
+    maximum_dte: int = Field(ge=0)
+    minimum_contracts_for_profile: int = Field(gt=0)
+    volatility_assumption: VolatilityAssumption
+    flip_search_fraction: float = Field(gt=0, lt=1)
+    flip_grid_points: int = Field(ge=3)
+    default_convention: DealerConvention
+    asset_type_conventions: dict[str, DealerConvention]
+    underlyer_conventions: dict[str, DealerConvention]
+    # Squeeze-detector gates. These live here rather than on the strategy policy so
+    # revising them cannot alter an already-published strategy policy identity.
+    require_gamma_wall: bool = False
+    gamma_wall_scope: GammaScope = GammaScope.ZERO_DTE
+    wall_proximity_fraction: float = Field(default=0.01, gt=0, lt=1)
+    minimum_wall_gamma_share: float = Field(default=0.05, gt=0, le=1)
+    minimum_volume_surge_ratio: float = Field(default=2.0, gt=0)
+    required_regime: GammaRegime | None = None
+
+    @field_validator("asset_type_conventions", "underlyer_conventions", mode="before")
+    @classmethod
+    def _normalize_keys(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            return {str(key).strip().upper(): item for key, item in value.items()}
+        return value
+
+    @model_validator(mode="after")
+    def _validate_grid(self) -> "GammaExposurePolicy":
+        if self.flip_grid_points % 2 == 0:
+            raise ValueError("flip_grid_points must be odd so the grid includes spot")
+        return self
+
+    def convention_for(self, underlyer: str, asset_type: str | None) -> DealerConvention:
+        override = self.underlyer_conventions.get(underlyer.strip().upper())
+        if override is not None:
+            return override
+        if asset_type is not None:
+            by_asset = self.asset_type_conventions.get(asset_type.strip().upper())
+            if by_asset is not None:
+                return by_asset
+        return self.default_convention
+
+
+class VolatilityForecastPolicy(_FrozenModel):
+    """Specification of the realized-volatility forecast.
+
+    Carries its own hash, deliberately outside `configuration_sha256`, so revising the
+    forecast cannot invalidate ingestion identity or orphan the strategy cohort.
+    """
+
+    schema_version: int = Field(gt=0)
+    forecast_policy_version: str = Field(min_length=1)
+
+    variance_source: VarianceSource
+    daily_estimator: VarianceEstimator
+    intraday_interval: str = Field(min_length=2)
+    # Summing the overnight gap into session variance adds a single squared return to an
+    # otherwise low-noise measurement, and that noise measurably degrades the forecast.
+    include_overnight_variance: bool
+
+    har_lags: tuple[int, ...]
+    horizon_sessions: int = Field(gt=0)
+    minimum_training_sessions: int = Field(gt=0)
+    refit_every_sessions: int = Field(gt=0)
+
+    minimum_session_bars: int = Field(gt=0)
+    maximum_session_gap_days: int = Field(gt=0)
+    session_scope: str = Field(min_length=1)
+    adjusted_bars_for_label: bool
+    trading_days_per_year: int = Field(gt=0)
+
+    @field_validator("har_lags")
+    @classmethod
+    def _validate_lags(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if len(value) < 2:
+            raise ValueError("har_lags needs at least two horizons")
+        if any(lag <= 0 for lag in value):
+            raise ValueError("har_lags must be positive")
+        if list(value) != sorted(set(value)):
+            raise ValueError("har_lags must be strictly increasing")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> "VolatilityForecastPolicy":
+        if (
+            self.variance_source is VarianceSource.INTRADAY_PATH
+            and self.include_overnight_variance
+        ):
+            # Permitted by the model but measured to be worse; require it to be explicit
+            # rather than an accident of copying the daily configuration.
+            raise ValueError(
+                "intraday variance with overnight summed in measured worse than "
+                "open-to-close alone; set include_overnight_variance false"
+            )
+        return self
 
 
 class DeveloperPolicy(_FrozenModel):
@@ -333,12 +518,28 @@ class StrategyPolicyArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class GammaPolicyArtifact:
+    policy: GammaExposurePolicy
+    sha256: str
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class VolatilityForecastPolicyArtifact:
+    policy: VolatilityForecastPolicy
+    sha256: str
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
 class OptionRuntimeConfiguration:
     settings: OptionSettings
     policy: DeveloperPolicy
     policy_sha256: str
     strategy_policy: StrategyPolicy
     strategy_policy_sha256: str
+    gamma_policy: GammaExposurePolicy
+    gamma_policy_sha256: str
     configuration_sha256: str
 
     def metadata(self) -> dict[str, object]:
@@ -349,6 +550,8 @@ class OptionRuntimeConfiguration:
             "policy_sha256": self.policy_sha256,
             "strategy_policy_version": self.strategy_policy.strategy_version,
             "strategy_policy_sha256": self.strategy_policy_sha256,
+            "gamma_policy_version": self.gamma_policy.gamma_policy_version,
+            "gamma_policy_sha256": self.gamma_policy_sha256,
             "configuration_sha256": self.configuration_sha256,
         }
 
@@ -381,6 +584,28 @@ def load_strategy_policy(path: Path) -> StrategyPolicyArtifact:
     policy = StrategyPolicy.model_validate(payload)
     canonical_payload = policy.model_dump(mode="json")
     return StrategyPolicyArtifact(policy=policy, sha256=_sha256(canonical_payload), path=path)
+
+
+def load_gamma_policy(path: Path) -> GammaPolicyArtifact:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unable to load option gamma policy from {path}") from exc
+    policy = GammaExposurePolicy.model_validate(payload)
+    canonical_payload = policy.model_dump(mode="json")
+    return GammaPolicyArtifact(policy=policy, sha256=_sha256(canonical_payload), path=path)
+
+
+def load_volatility_forecast_policy(path: Path) -> VolatilityForecastPolicyArtifact:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unable to load volatility forecast policy from {path}") from exc
+    policy = VolatilityForecastPolicy.model_validate(payload)
+    canonical_payload = policy.model_dump(mode="json")
+    return VolatilityForecastPolicyArtifact(
+        policy=policy, sha256=_sha256(canonical_payload), path=path
+    )
 
 
 def load_option_runtime_configuration(
@@ -426,9 +651,22 @@ def load_option_runtime_configuration(
         "strategy_policy_file": environ.get(
             "OPTION_STRATEGY_POLICY_FILE", "options/policies/strategy_v1.json"
         ),
+        "gamma_policy_file": environ.get(
+            "OPTION_GAMMA_POLICY_FILE", "options/policies/gamma_policy_v1.json"
+        ),
         "raw_archive_enabled": environ.get("OPTION_RAW_ARCHIVE_ENABLED", "false"),
         "raw_archive_root": environ.get("OPTION_RAW_ARCHIVE_ROOT", "option-raw"),
         "start_read_only": environ.get("OPTION_START_READ_ONLY", "true"),
+        "maximum_execution_lag_seconds": environ.get(
+            "OPTION_MAXIMUM_EXECUTION_LAG_SECONDS", "1800"
+        ),
+        "trade_ingestion_enabled": environ.get(
+            "OPTION_TRADE_INGESTION_ENABLED", "false"
+        ),
+        "trade_watchlist_per_underlyer": environ.get(
+            "OPTION_TRADE_WATCHLIST_PER_UNDERLYER", "15"
+        ),
+        "trade_lookback_seconds": environ.get("OPTION_TRADE_LOOKBACK_SECONDS", "3600"),
     }
     settings = OptionSettings.model_validate(values)
     policy_path = settings.policy_file
@@ -437,6 +675,9 @@ def load_option_runtime_configuration(
     strategy_policy_path = settings.strategy_policy_file
     if not strategy_policy_path.is_absolute():
         strategy_policy_path = (backend_dir / strategy_policy_path).resolve()
+    gamma_policy_path = settings.gamma_policy_file
+    if not gamma_policy_path.is_absolute():
+        gamma_policy_path = (backend_dir / gamma_policy_path).resolve()
     archive_root = settings.raw_archive_root
     if not archive_root.is_absolute():
         archive_root = (backend_dir / archive_root).resolve()
@@ -444,12 +685,14 @@ def load_option_runtime_configuration(
         update={
             "policy_file": policy_path,
             "strategy_policy_file": strategy_policy_path,
+            "gamma_policy_file": gamma_policy_path,
             "raw_archive_root": archive_root,
         }
     )
 
     artifact = load_developer_policy(policy_path)
     strategy_artifact = load_strategy_policy(strategy_policy_path)
+    gamma_artifact = load_gamma_policy(gamma_policy_path)
     configuration_payload = {
         **settings.fingerprint_payload(),
         "policy_version": artifact.policy.policy_version,
@@ -462,5 +705,7 @@ def load_option_runtime_configuration(
         policy_sha256=artifact.sha256,
         strategy_policy=strategy_artifact.policy,
         strategy_policy_sha256=strategy_artifact.sha256,
+        gamma_policy=gamma_artifact.policy,
+        gamma_policy_sha256=gamma_artifact.sha256,
         configuration_sha256=_sha256(configuration_payload),
     )

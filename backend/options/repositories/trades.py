@@ -59,6 +59,8 @@ class OptionTradeRepository(PostgresRepository):
                     event.payload_sha256,
                     event.raw_batch_id,
                     event.classification_status.value,
+                    list(event.classification_reasons),
+                    event.semantics_version,
                 )
                 for event in ordered
             ]
@@ -70,12 +72,19 @@ class OptionTradeRepository(PostgresRepository):
                     sip_timestamp, sequence_number, participant_timestamp,
                     first_observed_at, revised_observed_at, exchange, conditions,
                     correction, provider_trade_id, price, size, shares_per_contract,
-                    notional, payload_sha256, raw_batch_id, classification_status
+                    notional, payload_sha256, raw_batch_id, classification_status,
+                    classification_reasons, semantics_version
                 ) VALUES %s
                 ON CONFLICT (
                     provider, contract_id, sip_timestamp, sequence_number,
                     participant_timestamp, payload_sha256
-                ) DO NOTHING
+                                ) DO UPDATE
+                                SET classification_status = EXCLUDED.classification_status,
+                                        classification_reasons = EXCLUDED.classification_reasons,
+                                        semantics_version = EXCLUDED.semantics_version,
+                                        updated_at = NOW()
+                                WHERE option_trade_events.classification_status = 'PENDING'
+                                    AND EXCLUDED.classification_status <> 'PENDING'
                 """,
                 values,
                 page_size=2000,
@@ -161,7 +170,8 @@ class OptionTradeRepository(PostgresRepository):
                     sequence_number, participant_timestamp, first_observed_at,
                     revised_observed_at, exchange, conditions, correction,
                     provider_trade_id, price, size, shares_per_contract, notional,
-                    payload_sha256, raw_batch_id, classification_status
+                    payload_sha256, raw_batch_id, classification_status,
+                    classification_reasons, semantics_version
                 FROM option_trade_events
                 WHERE contract_id = %s
                   AND sip_timestamp BETWEEN %s AND %s
@@ -187,7 +197,8 @@ class OptionTradeRepository(PostgresRepository):
                     sip_timestamp, sequence_number, participant_timestamp,
                     first_observed_at, revised_observed_at, exchange, conditions,
                     correction, provider_trade_id, price, size, shares_per_contract,
-                    notional, payload_sha256, raw_batch_id, classification_status
+                    notional, payload_sha256, raw_batch_id, classification_status,
+                    classification_reasons, semantics_version
                 FROM option_trade_events
                 WHERE underlying = %s
                   AND sip_timestamp BETWEEN %s AND %s
@@ -230,4 +241,6 @@ def _trade_event(row: dict[str, Any]) -> OptionTradeEvent:
         payload_sha256=row["payload_sha256"],
         raw_batch_id=row["raw_batch_id"],
         classification_status=TradeClassificationStatus(row["classification_status"]),
+        classification_reasons=tuple(row["classification_reasons"]),
+        semantics_version=row["semantics_version"],
     )

@@ -86,6 +86,50 @@ class ExerciseStyle(str, Enum):
     EUROPEAN = "EUROPEAN"
 
 
+class DealerConvention(str, Enum):
+    """Assumed dealer side of open interest; not measurable from OI alone."""
+
+    DEALER_LONG_CALLS_SHORT_PUTS = "DEALER_LONG_CALLS_SHORT_PUTS"
+    DEALER_SHORT_CALLS_LONG_PUTS = "DEALER_SHORT_CALLS_LONG_PUTS"
+
+
+class VolatilityAssumption(str, Enum):
+    """How each contract's IV is carried when spot is shocked."""
+
+    STICKY_STRIKE = "STICKY_STRIKE"
+
+
+class VarianceEstimator(str, Enum):
+    """Per-session variance estimators built from one daily bar."""
+
+    CLOSE_TO_CLOSE = "CLOSE_TO_CLOSE"
+    PARKINSON = "PARKINSON"
+    GARMAN_KLASS = "GARMAN_KLASS"
+    ROGERS_SATCHELL = "ROGERS_SATCHELL"
+
+
+class VarianceSource(str, Enum):
+    """Whether session variance is read from one daily bar or an intraday path."""
+
+    DAILY_RANGE = "DAILY_RANGE"
+    INTRADAY_PATH = "INTRADAY_PATH"
+
+
+class GammaRegime(str, Enum):
+    POSITIVE_GAMMA = "POSITIVE_GAMMA"
+    NEGATIVE_GAMMA = "NEGATIVE_GAMMA"
+    UNDETERMINED = "UNDETERMINED"
+
+
+class GammaScope(str, Enum):
+    """Expiration slice a gamma profile aggregates over."""
+
+    TOTAL = "TOTAL"
+    ZERO_DTE = "ZERO_DTE"
+    WEEKLY = "WEEKLY"
+    MONTHLY = "MONTHLY"
+
+
 class MarkSource(str, Enum):
     DEVELOPER_ALIGNED_AGG_CLOSE = "DEVELOPER_ALIGNED_AGG_CLOSE"
     ADVANCED_NBBO_MIDPOINT = "ADVANCED_NBBO_MIDPOINT"
@@ -107,6 +151,7 @@ class DataQualityFlag(str, Enum):
     MISSING_ALIGNED_SPOT = "MISSING_ALIGNED_SPOT"
     NON_POSITIVE_MARK = "NON_POSITIVE_MARK"
     DIVIDEND_YIELD_DEFAULTED = "DIVIDEND_YIELD_DEFAULTED"
+    MARK_TIME_FROM_RELEASE_STAMP = "MARK_TIME_FROM_RELEASE_STAMP"
     REFERENCE_PENDING = "REFERENCE_PENDING"
     UNKNOWN_TRADE_CONDITION = "UNKNOWN_TRADE_CONDITION"
     UNKNOWN_CORRECTION = "UNKNOWN_CORRECTION"
@@ -644,6 +689,36 @@ class SpotPrice:
 
 
 @dataclass(frozen=True, slots=True)
+class OptionDailyAggregate:
+    """One settlement session's bar for a single contract.
+
+    Trade-based, so a session with no print produces no bar at all. The close is a
+    settlement-style mark and is not interchangeable with the intraday mark the live
+    pipeline computes.
+    """
+
+    contract_ticker: str
+    session_date: date
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: int
+    transaction_count: int | None = None
+
+    def __post_init__(self) -> None:
+        _non_empty(self.contract_ticker, "contract_ticker")
+        for name in ("open", "high", "low", "close"):
+            _positive_decimal(getattr(self, name), name)
+        if self.high < self.low:
+            raise ValueError("high cannot be below low")
+        if self.volume < 0:
+            raise ValueError("volume cannot be negative")
+        if self.transaction_count is not None and self.transaction_count < 0:
+            raise ValueError("transaction_count cannot be negative")
+
+
+@dataclass(frozen=True, slots=True)
 class OptionTradeCursor:
     sip_timestamp: datetime
     sequence_number: int
@@ -1013,6 +1088,8 @@ class OptionTradeEvent:
     payload_sha256: str
     raw_batch_id: UUID
     classification_status: TradeClassificationStatus = TradeClassificationStatus.PENDING
+    classification_reasons: tuple[str, ...] = ()
+    semantics_version: str | None = None
     provider_trade_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -1028,6 +1105,10 @@ class OptionTradeEvent:
             raise ValueError("sequence_number cannot be negative")
         if type(self.conditions) is not tuple:
             raise TypeError("conditions must be a tuple")
+        if type(self.classification_reasons) is not tuple:
+            raise TypeError("classification_reasons must be a tuple")
+        if self.semantics_version is not None:
+            _non_empty(self.semantics_version, "semantics_version")
         if self.size <= 0 or self.shares_per_contract <= 0:
             raise ValueError("size and shares_per_contract must be positive")
         _positive_decimal(self.price, "price")

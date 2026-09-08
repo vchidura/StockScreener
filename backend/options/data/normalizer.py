@@ -40,6 +40,7 @@ class RawDeveloperOptionObservation:
     revised_observed_at: datetime | None
     raw_payload_json: str
     raw_payload_sha256: str
+    mark_time_from_release_stamp: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,11 +83,19 @@ def parse_polygon_snapshot(
         else {}
     )
     greeks = payload.get("greeks") if isinstance(payload.get("greeks"), dict) else {}
-    option_mark_time = _provider_timestamp(day.get("last_updated"))
+    # `day.close` is the last trade price, so its market time is that trade's SIP
+    # timestamp. `day.last_updated` is a delayed-release stamp carrying the provider
+    # delay, which would misalign every mark against the underlying bar clock.
+    last_trade = payload.get("last_trade")
+    option_mark_time = (
+        _provider_timestamp(last_trade.get("sip_timestamp"))
+        if isinstance(last_trade, dict)
+        else None
+    )
+    mark_time_from_release_stamp = False
     if option_mark_time is None:
-        last_trade = payload.get("last_trade")
-        if isinstance(last_trade, dict):
-            option_mark_time = _provider_timestamp(last_trade.get("sip_timestamp"))
+        option_mark_time = _provider_timestamp(day.get("last_updated"))
+        mark_time_from_release_stamp = option_mark_time is not None
     raw_payload_json = _canonical_json(payload)
     return RawDeveloperOptionObservation(
         contract_ticker=str(details["ticker"]),
@@ -106,6 +115,7 @@ def parse_polygon_snapshot(
         ),
         raw_payload_json=raw_payload_json,
         raw_payload_sha256=_sha256(raw_payload_json),
+        mark_time_from_release_stamp=mark_time_from_release_stamp,
     )
 
 
@@ -222,6 +232,11 @@ class DeveloperOptionNormalizer:
                     + marks.quality_flags
                     + economics.quality_flags
                     + item.input_quality_flags
+                    + (
+                        (DataQualityFlag.MARK_TIME_FROM_RELEASE_STAMP,)
+                        if raw.mark_time_from_release_stamp
+                        else ()
+                    )
                 )
             )
             prepared.append(

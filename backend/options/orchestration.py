@@ -5,7 +5,7 @@ import socket
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Callable
+from typing import Callable, Mapping
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from options.analytics.analysis_engine import OptionAnalysisEngine
@@ -22,9 +22,12 @@ from options.data.polygon_developer import PolygonDeveloperEngine
 from options.domain import (
     AnalysisStatus,
     AssetType,
+    ContractType,
     DataQualityFlag,
     DecisionContext,
     OptionAnalysisRun,
+    OptionContractCatalogEntry,
+    OptionContractSnapshot,
     OptionUniverseMember,
     OptionUniverseMode,
     UniverseRunStatus,
@@ -32,14 +35,32 @@ from options.domain import (
 )
 from options.repositories.analysis import OptionAnalysisRepository
 from options.repositories.catalog import OptionContractCatalogRepository
+from options.repositories.daily_facts import (
+    DailyOpenInterestRecord,
+    OptionDailyFactRepository,
+)
+from options.repositories.gamma import GammaProfileRecord, OptionGammaProfileRepository
 from options.repositories.ingestion import OptionIngestionRepository
 from options.repositories.outcomes import OptionOutcomeRepository
 from options.repositories.snapshots import OptionSnapshotRepository
+from options.repositories.trades import OptionTradeRepository
 from options.repositories.universe import OptionUniverseRepository
 from options.repositories.work_items import OptionWorkItemRepository
 from options.strategy_orchestration import OptionStrategyPipeline
 from equity.domain import DecisionWatermark, EvidenceType
 from equity.repositories import EquityEvidenceRepository
+
+# Overlap re-requested on the next cycle so a restart cannot skip prints that
+# arrived out of order at the watermark boundary.
+_TRADE_CURSOR_OVERLAP_SECONDS = 60
+
+
+@dataclass(frozen=True, slots=True)
+class TradeIngestionResult:
+    watchlist_count: int
+    requested_count: int
+    persisted_count: int
+    reasons: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +102,9 @@ class ManualOptionPipeline:
         ingestion_repository: OptionIngestionRepository | None = None,
         snapshot_repository: OptionSnapshotRepository | None = None,
         analysis_repository: OptionAnalysisRepository | None = None,
+        gamma_repository: OptionGammaProfileRepository | None = None,
+        daily_fact_repository: OptionDailyFactRepository | None = None,
+        trade_repository: OptionTradeRepository | None = None,
         work_repository: OptionWorkItemRepository | None = None,
         normalizer: DeveloperOptionNormalizer | None = None,
         analysis_engine: OptionAnalysisEngine | None = None,
@@ -97,9 +121,14 @@ class ManualOptionPipeline:
         self.ingestion_repository = ingestion_repository or OptionIngestionRepository()
         self.snapshot_repository = snapshot_repository or OptionSnapshotRepository()
         self.analysis_repository = analysis_repository or OptionAnalysisRepository()
+        self.gamma_repository = gamma_repository or OptionGammaProfileRepository()
+        self.daily_fact_repository = daily_fact_repository or OptionDailyFactRepository()
+        self.trade_repository = trade_repository or OptionTradeRepository()
         self.work_repository = work_repository or OptionWorkItemRepository()
         self.normalizer = normalizer or DeveloperOptionNormalizer(configuration.policy)
-        self.analysis_engine = analysis_engine or OptionAnalysisEngine(configuration.policy)
+        self.analysis_engine = analysis_engine or OptionAnalysisEngine(
+            configuration.policy, configuration.gamma_policy
+        )
         self.strategy_pipeline = strategy_pipeline
         self.outcome_repository = outcome_repository
         self.equity_evidence_repository = (
@@ -409,6 +438,9 @@ class ManualOptionPipeline:
                 if row.contract_ticker in catalog
             )
             normalized = self.normalizer.normalize(batch_id, normalization_inputs)
+            open_interest_captured = self._capture_open_interest(
+                raw_rows, catalog, underlyer, cycle_time, observed_time, batch_id
+            )
             self.snapshot_repository.persist(
                 normalized.snapshots,
                 asset_type,
@@ -426,7 +458,14 @@ class ManualOptionPipeline:
                 snapshot.market_data_time
                 for snapshot in normalized.matrix_snapshots
             )
-            context = DecisionContext(matrix_market_time, observed_time)
+            trade_ingestion = self._ingest_trades(
+                normalized.matrix_snapshots, catalog, matrix_market_time
+            )
+            decision_observed_time = max(
+                observed_time,
+                _as_utc(self.clock(), "clock"),
+            )
+            context = DecisionContext(matrix_market_time, decision_observed_time)
             self.ingestion_repository.record_normalization(
                 batch_id,
                 catalog_row_count=len(catalog),
@@ -435,6 +474,13 @@ class ManualOptionPipeline:
                 unknown_reference_count=unknown_count,
                 market_data_time=matrix_market_time,
                 first_observed_at=observed_time,
+            )
+            execution_lag = (
+                decision_observed_time - cycle_time
+            ).total_seconds()
+            execution_lag_exceeded = (
+                execution_lag
+                > self.configuration.settings.maximum_execution_lag_seconds
             )
             analysis = self.analysis_engine.analyze(
                 matrix_id,
@@ -445,6 +491,8 @@ class ManualOptionPipeline:
                 unknown_reference_count=unknown_count,
                 reference_drift_failed=drift_failed,
                 batch_complete=True,
+                asset_type=asset_type,
+                execution_lag_exceeded=execution_lag_exceeded,
             )
             started_at = _as_utc(self.clock(), "clock")
             running = self._analysis_run(
@@ -456,6 +504,12 @@ class ManualOptionPipeline:
             )
             self.analysis_repository.start(running)
             self.analysis_repository.persist_expirations(analysis.expirations)
+            self._persist_gamma_profiles(
+                analysis,
+                underlyer,
+                matrix_market_time,
+                decision_observed_time,
+            )
             terminal_status = self._analysis_status(analysis.chain_health.status)
             completed_at = _as_utc(self.clock(), "clock")
             self.analysis_repository.finish(
@@ -488,7 +542,15 @@ class ManualOptionPipeline:
                 received_count=normalized.received_count,
                 retained_count=normalized.retained_count,
                 iv_convergence_fraction=normalized.iv_convergence_fraction,
-                reasons=analysis.chain_health.reasons,
+                reasons=(
+                    analysis.chain_health.reasons
+                    + trade_ingestion.reasons
+                    + (
+                        ()
+                        if open_interest_captured
+                        else ("NO_SETTLED_OPEN_INTEREST_CAPTURED",)
+                    )
+                ),
             )
         except Exception as exc:
             retryable = not isinstance(exc, TerminalOptionQualityError)
@@ -518,6 +580,158 @@ class ManualOptionPipeline:
                 reasons=(type(exc).__name__,),
                 retryable=retryable,
             )
+
+    def _trade_watchlist(
+        self,
+        snapshots: tuple[OptionContractSnapshot, ...],
+        catalog: Mapping[str, OptionContractCatalogEntry],
+    ) -> tuple[OptionContractCatalogEntry, ...]:
+        """Bounded set of contracts worth pulling prints for.
+
+        Scoped to the shape the sweep detector can actually use - out-of-the-money
+        calls with observed activity - and capped so provider cost stays proportional
+        to the universe rather than the chain.
+        """
+        eligible = [
+            snapshot
+            for snapshot in snapshots
+            if snapshot.contract_type is ContractType.CALL
+            and snapshot.strike > snapshot.spot
+            and snapshot.day_volume
+            and snapshot.contract_ticker in catalog
+        ]
+        eligible.sort(
+            key=lambda snapshot: (
+                -(snapshot.day_volume or 0),
+                -(snapshot.open_interest or 0),
+                snapshot.expiration_date,
+                snapshot.contract_id,
+            )
+        )
+        limit = self.configuration.settings.trade_watchlist_per_underlyer
+        seen: set[int] = set()
+        selected: list[OptionContractCatalogEntry] = []
+        for snapshot in eligible:
+            if snapshot.contract_id in seen:
+                continue
+            seen.add(snapshot.contract_id)
+            selected.append(catalog[snapshot.contract_ticker])
+            if len(selected) >= limit:
+                break
+        return tuple(selected)
+
+    def _capture_open_interest(
+        self,
+        raw_rows: tuple[RawDeveloperOptionObservation, ...],
+        catalog: Mapping[str, OptionContractCatalogEntry],
+        underlyer: str,
+        cycle_time: datetime,
+        observed_time: datetime,
+        batch_id,
+    ) -> int:
+        """Retain the settled open interest carried by this cycle's chain snapshot.
+
+        Taken from the full raw chain rather than the corridor-filtered matrix: the
+        provider already returned every contract, and anything discarded here can never
+        be recovered because no endpoint serves open interest for a past session.
+
+        The provider reports the prior session's settled quantity even at the current
+        session's closing slot, so wall-clock close detection is not the fact boundary.
+        """
+        observed_session = self.calendar.session_for_slot(cycle_time)
+        settlement_session = self.calendar.previous_session(observed_session)
+        records = [
+            DailyOpenInterestRecord(
+                contract_id=catalog[row.contract_ticker].contract_id,
+                settlement_session=settlement_session,
+                underlying=underlyer,
+                open_interest=row.open_interest,
+                observed_at=observed_time,
+                observed_session=observed_session,
+                batch_id=batch_id,
+            )
+            for row in raw_rows
+            if row.open_interest is not None and row.contract_ticker in catalog
+        ]
+        return self.daily_fact_repository.persist_open_interest(records)
+
+    def _ingest_trades(
+        self,
+        snapshots: tuple[OptionContractSnapshot, ...],
+        catalog: Mapping[str, OptionContractCatalogEntry],
+        market_time: datetime,
+    ) -> TradeIngestionResult:
+        if not self.configuration.settings.trade_ingestion_enabled:
+            return TradeIngestionResult(0, 0, 0, ("TRADE_INGESTION_DISABLED",))
+        contracts = self._trade_watchlist(snapshots, catalog)
+        if not contracts:
+            return TradeIngestionResult(0, 0, 0, ("NO_TRADE_WATCHLIST_CONTRACT",))
+        lookback = timedelta(
+            seconds=self.configuration.settings.trade_lookback_seconds
+        )
+        reasons: list[str] = []
+        requested = 0
+        persisted = 0
+        for contract in contracts:
+            cursor = self.trade_repository.get_cursor("polygon", contract.contract_id)
+            try:
+                result = self.engine.get_option_trades(
+                    contract,
+                    market_time - lookback,
+                    market_time,
+                    cursor,
+                )
+            except Exception as exc:  # provider failure must not fail the matrix
+                reasons.append(f"TRADE_FETCH_FAILED:{type(exc).__name__}")
+                continue
+            requested += 1
+            if not result.events:
+                continue
+            persisted += self.trade_repository.persist(result.events)
+            latest = max(
+                result.events,
+                key=lambda event: (event.sip_timestamp, event.sequence_number),
+            )
+            if result.complete:
+                self.trade_repository.advance_cursor(
+                    "polygon",
+                    contract.contract_id,
+                    latest.sip_timestamp,
+                    latest.sequence_number,
+                    _TRADE_CURSOR_OVERLAP_SECONDS,
+                    result.request_ids[-1] if result.request_ids else None,
+                )
+            else:
+                reasons.append("TRADE_FETCH_INCOMPLETE")
+        return TradeIngestionResult(
+            len(contracts), requested, persisted, tuple(dict.fromkeys(reasons))
+        )
+
+    def _persist_gamma_profiles(        self,
+        analysis,
+        underlyer: str,
+        market_time: datetime,
+        observed_time: datetime,
+    ) -> None:
+        if not analysis.gamma_profiles:
+            return
+        self.gamma_repository.persist(
+            [
+                GammaProfileRecord(
+                    matrix_id=analysis.matrix_id,
+                    underlying=underlyer,
+                    scope=scoped.scope,
+                    market_data_time=market_time,
+                    first_observed_at=observed_time,
+                    profile=scoped.profile,
+                    gamma_policy_version=(
+                        self.configuration.gamma_policy.gamma_policy_version
+                    ),
+                    gamma_policy_sha256=self.configuration.gamma_policy_sha256,
+                )
+                for scoped in analysis.gamma_profiles
+            ]
+        )
 
     @staticmethod
     def _existing_result(

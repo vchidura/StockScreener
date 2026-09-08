@@ -31,6 +31,7 @@ from options.domain import (
 )
 from options.orchestration import (
     ManualOptionPipeline,
+    TradeIngestionResult,
     _fresh_mark_window,
     _resolve_dividend_yield,
 )
@@ -46,6 +47,9 @@ HASH = "a" * 64
 class FakeCalendar:
     def latest_completed_session(self, as_of):
         return date(2026, 8, 28)
+
+    def previous_session(self, session_date):
+        return session_date - timedelta(days=1)
 
     def expiration_cutoff(self, value):
         if value == date(2026, 8, 28):
@@ -207,6 +211,24 @@ class FakeSnapshotRepository:
         return self.snapshots
 
 
+class FakeGammaRepository:
+    def __init__(self):
+        self.records = []
+
+    def persist(self, records):
+        self.records.extend(records)
+        return len(records)
+
+
+class FakeDailyFactRepository:
+    def __init__(self):
+        self.open_interest = []
+
+    def persist_open_interest(self, records):
+        self.open_interest.extend(records)
+        return len(records)
+
+
 class FakeAnalysisRepository:
     def __init__(self, existing=None):
         self.finished = None
@@ -242,6 +264,8 @@ def test_manual_pipeline_runs_complete_fixture_cycle():
         universe_repository=universe,
         ingestion_repository=ingestion,
         snapshot_repository=snapshots,
+        gamma_repository=FakeGammaRepository(),
+        daily_fact_repository=FakeDailyFactRepository(),
         analysis_repository=analyses,
         work_repository=work,
         clock=lambda: OBSERVED_AT,
@@ -260,6 +284,54 @@ def test_manual_pipeline_runs_complete_fixture_cycle():
     assert DataQualityFlag.DIVIDEND_YIELD_DEFAULTED in snapshots.snapshots[0].quality_flags
 
 
+def test_strategy_watermark_includes_same_cycle_trade_ingestion():
+    configuration = load_option_runtime_configuration(
+        {"POLYGON_API_KEY": "test-secret"}, BACKEND_DIR
+    )
+    tick = 0
+
+    def advancing_clock():
+        nonlocal tick
+        tick += 1
+        return OBSERVED_AT + timedelta(seconds=tick)
+
+    strategy_calls = []
+    strategy_pipeline = SimpleNamespace(
+        process=lambda analysis, snapshots, asset_type: (
+            strategy_calls.append(analysis.context)
+            or SimpleNamespace(status="COMPLETE", error=None)
+        )
+    )
+    pipeline = ManualOptionPipeline(
+        configuration,
+        FakeEngine(),
+        calendar=FakeCalendar(),
+        catalog_repository=FakeCatalogRepository(),
+        universe_repository=FakeUniverseRepository(),
+        ingestion_repository=FakeIngestionRepository(),
+        snapshot_repository=FakeSnapshotRepository(),
+        gamma_repository=FakeGammaRepository(),
+        daily_fact_repository=FakeDailyFactRepository(),
+        analysis_repository=FakeAnalysisRepository(),
+        work_repository=FakeWorkRepository(),
+        strategy_pipeline=strategy_pipeline,
+        clock=advancing_clock,
+    )
+    ingestion_watermarks = []
+    pipeline._ingest_trades = lambda *args: (
+        ingestion_watermarks.append(advancing_clock())
+        or TradeIngestionResult(1, 1, 1, ())
+    )
+
+    result = pipeline.run_once(
+        ("SPY",), as_of=OBSERVED_AT, cycle_time=MARKET_TIME
+    )
+
+    assert result.results[0].status == "COMPLETE"
+    assert len(strategy_calls) == 1
+    assert strategy_calls[0].observed_time >= ingestion_watermarks[0]
+
+
 def test_explicit_cycle_time_uses_intraday_slot_identity():
     configuration = load_option_runtime_configuration(
         {"POLYGON_API_KEY": "test-secret"}, BACKEND_DIR
@@ -273,6 +345,8 @@ def test_explicit_cycle_time_uses_intraday_slot_identity():
         universe_repository=universe,
         ingestion_repository=FakeIngestionRepository(),
         snapshot_repository=FakeSnapshotRepository(),
+        gamma_repository=FakeGammaRepository(),
+        daily_fact_repository=FakeDailyFactRepository(),
         analysis_repository=FakeAnalysisRepository(),
         work_repository=FakeWorkRepository(),
         clock=lambda: OBSERVED_AT,
@@ -298,6 +372,8 @@ def test_manual_pipeline_reports_progress_between_underlyers():
         universe_repository=FakeUniverseRepository(),
         ingestion_repository=FakeIngestionRepository(),
         snapshot_repository=FakeSnapshotRepository(),
+        gamma_repository=FakeGammaRepository(),
+        daily_fact_repository=FakeDailyFactRepository(),
         analysis_repository=FakeAnalysisRepository(),
         work_repository=FakeWorkRepository(),
         clock=lambda: OBSERVED_AT,
@@ -339,6 +415,8 @@ def test_manual_pipeline_extends_chain_to_retained_candidate_legs():
         universe_repository=FakeUniverseRepository(),
         ingestion_repository=FakeIngestionRepository(),
         snapshot_repository=FakeSnapshotRepository(),
+        gamma_repository=FakeGammaRepository(),
+        daily_fact_repository=FakeDailyFactRepository(),
         analysis_repository=FakeAnalysisRepository(),
         work_repository=FakeWorkRepository(),
         outcome_repository=OutcomeRepository(),
@@ -374,6 +452,8 @@ def test_empty_normalized_matrix_is_terminal_quality_failure():
         universe_repository=FakeUniverseRepository(),
         ingestion_repository=FakeIngestionRepository(),
         snapshot_repository=FakeSnapshotRepository(),
+        gamma_repository=FakeGammaRepository(),
+        daily_fact_repository=FakeDailyFactRepository(),
         analysis_repository=FakeAnalysisRepository(),
         work_repository=work,
         normalizer=EmptyNormalizer(),
@@ -402,6 +482,8 @@ def test_explicit_terminal_slot_restart_returns_already_completed():
         universe_repository=FakeUniverseRepository(),
         ingestion_repository=FakeIngestionRepository(),
         snapshot_repository=FakeSnapshotRepository(),
+        gamma_repository=FakeGammaRepository(),
+        daily_fact_repository=FakeDailyFactRepository(),
         analysis_repository=first_analyses,
         work_repository=FakeWorkRepository(),
         clock=lambda: OBSERVED_AT,
@@ -422,6 +504,8 @@ def test_explicit_terminal_slot_restart_returns_already_completed():
         universe_repository=FakeUniverseRepository(),
         ingestion_repository=FakeIngestionRepository(),
         snapshot_repository=FakeSnapshotRepository(),
+        gamma_repository=FakeGammaRepository(),
+        daily_fact_repository=FakeDailyFactRepository(),
         analysis_repository=FakeAnalysisRepository(first_analyses.finished),
         work_repository=CompletedWorkRepository(),
         strategy_pipeline=strategy_pipeline,

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "gamma_policy_version": "gamma_v1",
+  "shares_per_contract": 100,
+  "minimum_open_interest": 1,
+  "maximum_dte": 45,
+  "minimum_contracts_for_profile": 20,
+  "volatility_assumption": "STICKY_STRIKE",
+  "flip_search_fraction": 0.2,
+  "flip_grid_points": 81,
+  "default_convention": "DEALER_LONG_CALLS_SHORT_PUTS",
+  "asset_type_conventions": {
+    "ETF": "DEALER_LONG_CALLS_SHORT_PUTS",
+    "STOCK": "DEALER_SHORT_CALLS_LONG_PUTS"
+  },
+  "underlyer_conventions": {},
+  "require_gamma_wall": false,
+  "gamma_wall_scope": "ZERO_DTE",
+  "wall_proximity_fraction": 0.01,
+  "minimum_wall_gamma_share": 0.05,
+  "minimum_volume_surge_ratio": 2.0,
+  "required_regime": null
+}

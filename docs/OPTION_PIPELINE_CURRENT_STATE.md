@@ -2,7 +2,7 @@
 
 Status: code-derived baseline for review
 
-As of: 2026-09-02
+As of: 2026-09-08
 
 Related documents:
 
@@ -17,7 +17,7 @@ today. It is intentionally descriptive rather than aspirational. Its main goals 
 
 1. Make every transformation from provider observation to persisted strategy candidate
    inspectable.
-2. Dissect source normalization and all six strategy modules closely enough to review
+2. Dissect source normalization and all eight strategy modules closely enough to review
    their assumptions and thresholds.
 3. Identify which persisted records already support historical research.
 4. Separate current behavior from proposed improvements needed for current monitoring,
@@ -51,7 +51,8 @@ results; they are not unmeasured inputs or recommendation labels.
 
 ## 2. Executive Summary
 
-The implemented pipeline is a controlled one-shot backend process:
+The implemented pipeline supports both controlled one-shot execution and a resident,
+XNYS-aware delayed-slot worker:
 
 ```powershell
 cd backend
@@ -61,7 +62,7 @@ cd backend
 One invocation processes the configured 13-underlying universe serially. For each
 underlying it fetches a bounded Polygon chain, validates catalog references, aligns
 option marks with underlying minute bars, solves local IV and Greeks, builds chain and
-expiration analytics, evaluates six strategy modules, and persists the complete
+expiration analytics, evaluates eight strategy modules, and persists the complete
 decision graph in PostgreSQL.
 
 ```mermaid
@@ -71,7 +72,7 @@ flowchart LR
     P --> N[Normalize and align observations]
     N --> A[Chain and expiration analysis]
     A --> X[Strategy context]
-    X --> S[Six strategy modules]
+   X --> S[Eight strategy modules]
     S --> R[Payoff and scenario analysis]
     R --> D[(PostgreSQL decision graph)]
     D --> API[FastAPI latest-matrix queries]
@@ -92,24 +93,34 @@ Important current boundaries:
    checkpoint history; a general historical candidate-cohort browser remains absent.
 - The worker matures `option_signal_decay_outcomes` at 15m/30m/60m/close/next-open
    when a coherent later package mark exists. Missing packages remain pending.
+- The worker maintains a delayed coherent-package current-mark projection for selected
+   structured candidates without performing browser-time provider calls.
+- Trade ingestion is wired and opt-in. The local validation configuration processes a
+   bounded 15-contract watchlist per underlying and classifies provider conditions
+   fail-closed; aggressor direction remains unavailable without contemporaneous NBBO.
+- Every candidate persists six versioned execution-gate verdicts in the same transaction.
 - `SELECTED` means selected by a research module. It does not mean broker-authorized,
-  suitable for an account, or executable. Execution eligibility is null in the
-  current read-only Developer mode.
+  suitable for an account, or executable. The gate ledger derives null execution
+  eligibility in the current read-only Developer mode.
 
-### 2.1 Current local cohort
+### 2.1 Current validated cohort
 
-The persisted local cohort observed on 2026-08-30 contains:
+The first coherent post-fix market-session cohort was validated on 2026-09-08 at the
+10:30 ET delayed slot:
 
-- 13 ingestion and analysis runs, one for each configured underlying.
-- 15,290 catalog contracts and 8,974 normalized snapshots.
-- 78 strategy decisions: one suppression for each of six strategies across 13
-   underlyings.
-- Zero selected candidate legs, scenarios, or signal events from the live cohort.
+- 13/13 analyses were `COMPLETE`, with 4,947 snapshots, 4,857 model marks and
+   4,816 converged local-IV rows.
+- Median absolute option/spot skew was 31.4 seconds; every persisted model row stayed
+   within the 60-second policy limit.
+- 14,484 retained OI facts were assigned to the prior settlement session with no
+   conflicting revisions, and all four gamma scopes were persisted for every matrix.
+- The bounded trade watchlist produced 195 complete contract-scoped batches and the
+   sweep detector consumed classified same-cycle evidence.
+- 1,202 candidates persisted exactly 7,212 execution-gate rows, six per candidate.
+- 617 immutable 15-minute outcomes and 1,314 current marks had zero noncausal marks.
 
-This result is not evidence that every strategy threshold failed independently. Chain
-health failed first because the completed-session source observations produced no
-valid aligned model marks. The shared gate therefore suppressed all six modules before
-their individual selectors ran.
+The cohort remains research-only. Event-calendar, quote-liquidity, risk-engine and
+read-only gates block execution, and one session cannot support a performance claim.
 
 ## 3. Current Entry Points
 
@@ -256,7 +267,7 @@ The context can therefore be `DEGRADED` or `FAILED`. Current strategies carry th
 reason codes into selected research candidates; most do not use trend or event state
 as a hard selection predicate.
 
-### Step 10: Run all six strategy modules
+### Step 10: Run all eight strategy modules
 
 The strategy engine is dissected in section 6. A hard chain-health gate runs first. If
 health is not exactly `COMPLETE`, each strategy emits one reason-coded `SUPPRESSED`
@@ -479,7 +490,7 @@ These are review questions, not implemented changes:
 8. Should normalization metrics report exact duplicate count separately instead of
    silently skipping duplicates within the call?
 
-## 6. Deep Dive: Six Strategy Modules
+## 6. Deep Dive: Eight Strategy Modules
 
 Primary code:
 
@@ -491,7 +502,7 @@ Primary code:
 
 ### 6.1 Shared gate and semantics
 
-If chain health is not `COMPLETE`, all six modules emit one suppression using the
+If chain health is not `COMPLETE`, all eight modules emit one suppression using the
 chain-health reasons plus `NO_STRATEGY_WORK`.
 
 For a complete chain, every structure-producing leg must have an accepted model mark,
@@ -499,9 +510,10 @@ converged local IV, and complete local Greeks. Candidate IDs are deterministic o
 matrix, strategy name/version, structure, ordered contract IDs, and trigger type.
 
 All ordinary `_candidate()` outputs currently start as `SELECTED`. Context limitations
-are added as reason codes but do not automatically change status. Every selected
-candidate has `execution_eligibility = null` and a nominal `valid_until` 900 seconds
-after matrix market time.
+are added as reason codes but do not automatically change status. Every candidate carries
+a six-gate `gate_ledger_v1`; the current quote, paper-risk and read-only verdicts keep
+`execution_eligibility = null`. Structured candidates have a nominal `valid_until`
+900 seconds after matrix market time.
 
 This means `SELECTED` should currently be read as "the module's deterministic research
 selection," not "all context, suitability, marketability, and execution gates passed."
@@ -615,7 +627,45 @@ and return on risk.
 5. Iron-condor compatibility currently checks strike order and payoff, but not balanced
    width, target Delta, or a range forecast.
 
-### 6.5 Sweep-Like Cluster
+### 6.5 Directional Long Premium
+
+**Purpose today:** select long calls or puts whose expiration breakeven remains inside
+the option-implied move, separated into near, short and medium DTE lanes.
+
+The module requires a bullish or bearish strategy context. With qualified equity context
+present, bullish context admits calls and bearish context admits puts. Contracts require
+1-45 DTE, absolute Delta from 0.30 through 0.60, OI at least 250, day volume at least 100,
+and a breakeven-to-expected-move ratio no greater than 1.0. The expected move is the local
+IV times square root of time, not a physical-measure forecast.
+
+Rows rank within DTE lane and option side by the lower breakeven ratio, then OI, volume
+and contract ID. At most one candidate per lane and side is emitted. Maximum loss and
+capital at risk equal the premium debit.
+
+**No-match suppression:** `NO_LONG_PREMIUM_WITHIN_EXPECTED_MOVE`.
+
+**Research boundary:** IV regime is explicitly unavailable. The realized-volatility and
+variance-risk-premium studies remain outside selection until their written graduation
+criteria clear on out-of-sample performance.
+
+### 6.6 Directional Debit Spread
+
+**Purpose today:** construct bullish call or bearish put debit verticals whose breakeven
+and short-wing target fit inside the option-implied move.
+
+Both listed legs must share expiration and type and independently satisfy the OI 250 and
+day-volume 100 floors. The long leg requires absolute Delta from 0.45 through 0.70. The
+short wing is farther out of the money, 0.5%-10% of spot away, and no farther than one
+expected move. The package must be a positive debit with bounded positive maximum loss,
+positive maximum profit, exactly one breakeven, return on risk at least 1.0, and a
+breakeven no farther than 0.75 expected moves.
+
+Rows rank within lane and side by higher return on risk, lower breakeven ratio, then
+ordered contract IDs. At most one candidate per lane and side is emitted.
+
+**No-match suppression:** `NO_DEBIT_SPREAD_WITHIN_EXPECTED_MOVE`.
+
+### 6.7 Sweep-Like Cluster
 
 **Purpose today:** detect concentrated delayed option prints without claiming
 institutional ownership or aggressor direction.
@@ -634,23 +684,24 @@ legs or payoff scenarios, and records no aggressor side or institutional owner.
 **No-match suppression:** `TRADE_WINDOW_NOT_AVAILABLE` when no trades were loaded,
 otherwise `NO_QUALIFYING_SWEEP_LIKE_WINDOW`.
 
-**Important current ingestion boundary:** the one-shot chain path does not fetch new
-option trades. Strategy processing only reads trade events already present in
-PostgreSQL from the preceding eight market-time hours. The provider implements trade
-fetching and cursor persistence, but it is not wired into `ManualOptionPipeline`.
+Trade ingestion is wired before analysis and advances the final strategy decision
+watermark so same-cycle classified trades are visible. It remains disabled by default
+because the 15-contract by 13-underlying watchlist creates 195 provider batches per slot.
+The 2026-09-08 validation completed that workload within the 15-minute cadence. Provider
+conditions are classified under `massive_options_conditions_v1`; canceled, corrected,
+unknown and non-volume prints fail closed. Aggressor side remains unavailable.
 
 **Questions for evaluation:**
 
-1. Wire and validate incremental watchlist trade ingestion before treating this module
-   as current-session evidence.
-2. Review Polygon trade condition and correction semantics before counting every
-   persisted print equally.
+1. Move the watchlist rule into versioned policy before a measured study depends on
+   sweep detection coverage.
+2. Reconcile prints with contemporaneous NBBO before claiming aggressor direction.
 3. Decide whether puts and non-OTM contracts need separately named detectors rather
    than silently excluding them.
 4. Evaluate recurrence across contracts and expirations, not only the best window per
    contract.
 
-### 6.6 Three-Times Volume/OI
+### 6.8 Three-Times Volume/OI
 
 **Purpose today:** identify unusual cumulative day activity.
 
@@ -675,7 +726,7 @@ not independently a directional recommendation.
 4. Measure whether this evidence improves a structure strategy before promoting it
    beyond research context.
 
-### 6.7 Volatility Smile Distortion
+### 6.9 Volatility Smile Distortion
 
 **Purpose today:** find local-IV observations far from a quadratic smile fit.
 
@@ -720,6 +771,10 @@ inferred.
 | Research artifacts | `option_flow_windows`, `option_volatility_surfaces` | Study activity clusters and smile residuals. |
 | Blocked signal | `option_signal_events`, legs, occurrences | Preserve one lifecycle event per contiguous semantic package; each matrix-specific rediscovery is a candidate-linked occurrence. A package absent from an intervening matrix starts a new event if it later returns. |
 | Realized follow-up | `option_signal_decay_outcomes` | The worker matures coherent 15m/30m/60m/close/next-open delayed-proxy package marks under a versioned commission-only policy. Selected candidate-leg strike/expiration bounds remain in the 60-day future chain collection window; missing coherent packages stay pending. |
+| Current simulated close | `option_signal_current_marks` | Maintain the latest coherent delayed-proxy package valuation without rewriting immutable checkpoints. |
+| Daily contract evidence | `option_daily_contract_facts` | Retain first-observed prior-session OI, revisions and historical daily marks for causal forward research. |
+| Gamma profile | `option_gamma_profiles` | Preserve unsigned call/put exposure plus versioned assumed dealer-sign interpretations for each matrix and scope. |
+| Execution gates | `option_candidate_execution_gates` | Audit six versioned `PASS` / `FAIL` / `UNAVAILABLE` verdicts persisted atomically with each candidate. |
 
 ## 8. Current Versus Historical Use
 
@@ -750,8 +805,8 @@ package survived another scan while retaining every matrix observation for audit
 
 The Opportunity Board is optimized for current structured decisions:
 
-- its primary filter is structured strategy, currently Income Wheel or Defined-Risk
-   Hedged Income; underlyer-level coverage detail remains in Operations;
+- its primary filter spans every structured strategy; underlyer-level coverage detail
+   remains in Operations;
 - the latest persisted matrix for each underlyer remains visible until a newer matrix
    replaces it, with source time and nominal validity-window state shown explicitly;
 - replaced Board signals remain inline for 14 calendar days, newest first, with at most
@@ -801,12 +856,36 @@ than receiving an imputed price. Fully measured candidates no longer consume the
 bounded maturity queue. Selected candidate-leg bounds remain eligible for follow-up
 collection for 60 days.
 
-Opening Performance is a read-only database operation. It neither calls the provider
-nor compares the signal with a navigation-time current mark. For `ALL_SIGNALS`, entry
-is the lifecycle's original package; for `OPPORTUNITY_BOARD`, entry is the first
-occurrence that actually ranked onto the Board. Displayed P&L compares that cohort entry
-with outcomes already materialized by the option worker at the named checkpoint; a
-current-mark valuation would be a separate mode and is not included.
+Opening Performance is a read-only database operation and never calls the provider or
+revalues a contract in the request. For `ALL_SIGNALS`, entry is the lifecycle's original
+package; for `OPPORTUNITY_BOARD`, entry is the first occurrence that actually ranked onto
+the Board. Immutable checkpoint P&L and the separate current simulated-close value both
+come from worker-materialized rows.
+
+### 8.3.1 Current mark-to-market enhancement
+
+The option worker also maintains `option_signal_current_marks`, a mutable latest
+coherent-package projection for selected, unexpired structured candidates within the
+60-day follow-up window. It uses the same causal delayed source facts and commission
+policy as checkpoint outcomes, but replaces its row only when a newer market and
+observation time is available. This is unrealized mark-to-market P/L, not realized
+P/L: realized P/L requires a persisted exit or expiration settlement event. Performance
+must read this worker-owned projection and must never request or calculate a browser-time
+contract price.
+
+The current product view treats the delayed coherent package mark as the best available
+current price and presents its entry-to-current result as **current simulated-close P/L**:
+the hypothetical net P/L if the package were closed at that delayed mark under the
+commission-only policy. It is never a broker fill or an execution claim. This convention
+keeps the displayed value useful while preserving the distinction between a valuation and
+terminal realized P/L.
+
+`POLYGON_ADVANCED` does not automatically change this valuation. The current data-engine
+factory intentionally rejects that mode until an Advanced engine is implemented. Enabling
+it requires a separate versioned quote valuation policy, coherent all-leg quote watermark,
+side-aware bid/ask close rules, quote spread and staleness gates, and persisted quote
+provenance. Only that path may be described as quote-backed simulated close P/L; actual
+realized P/L still requires a persisted fill, close, or expiration-settlement event.
 
 For multi-leg structures, outcome measurement needs a coherent package valuation at
 the horizon. The current Developer mode has no quotes, so outcomes produced by that
@@ -860,12 +939,13 @@ This sequence is proposed work, not current behavior.
 
 ### Priority 1: Make current data genuinely current
 
-1. Implement a separate resident option scheduler using the configured 900-second
-   cadence and PostgreSQL leadership heartbeat.
-2. Derive delayed open-session slots from the exchange calendar instead of always
-   using the latest completed-session close.
-3. Wire incremental option-trade ingestion for the bounded watchlist.
-4. Add candidate-page polling or invalidation after a committed cycle.
+Completed: resident scheduling with PostgreSQL leadership, delayed XNYS-open slot
+derivation, bounded incremental trade ingestion, and per-underlying durable publication.
+
+Remaining: replace request-time latest-matrix reconstruction with an atomic all-universe
+current-board projection and add publication-driven client invalidation. The read-only
+board may currently show a temporary mix of completed underlyings while a slot is still
+processing; this must not become an execution contract.
 
 ### Priority 2: Complete causal inputs
 
@@ -878,9 +958,10 @@ This sequence is proposed work, not current behavior.
 
 1. Build the Advanced-target historical replay from point-in-time equity evidence,
    option quotes/trades/aggregates, contract references, and underlying data.
-2. Populate candidate decay outcomes and strategy-specific terminal outcomes.
-3. Build coverage, success-rate, calibration, and performance reports by strategy
-   version.
+2. Extend the implemented forward candidate checkpoints and coherent current marks with
+   historical replay outcomes.
+3. Extend the implemented structure-matched baseline and confidence report across replayed
+   strategy versions, with calibration and strategy-specific terminal definitions.
 4. Use walk-forward train/validation/test periods and review module thresholds only
    after measuring both selections and suppressions.
 

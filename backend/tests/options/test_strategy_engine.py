@@ -27,6 +27,7 @@ from options.strategies.engine import (
     OptionStrategyEngine,
     _quadratic_coefficient_payload,
 )
+from options.strategies.registry import STRATEGY_REGISTRY
 
 
 UTC = timezone.utc
@@ -196,10 +197,22 @@ def test_failed_chain_persists_one_suppression_for_each_registered_strategy():
 
     result = engine.scan(matrix_id, rows, health, (), strategy_context(matrix_id))
 
-    assert len(result.candidates) == 6
+    # One suppression per registered strategy, so adding a module cannot silently
+    # bypass the shared chain-health gate.
+    assert len(result.candidates) == len(STRATEGY_REGISTRY)
+    assert {item.strategy_name for item in result.candidates} == {
+        registration.strategy_name for registration in STRATEGY_REGISTRY
+    }
     assert all(item.status is CandidateStatus.SUPPRESSED for item in result.candidates)
     assert all("DATA_QUALITY_GATE_FAILED" in item.reason_codes for item in result.candidates)
     assert result.scenarios == ()
+    assert {candidate_id for candidate_id, _ in result.candidate_gate_ledgers} == {
+        candidate.candidate_id for candidate in result.candidates
+    }
+    assert all(
+        len(ledger.results) == 6
+        for _, ledger in result.candidate_gate_ledgers
+    )
 
 
 def test_sweep_like_cluster_is_research_only_and_preserves_event_keys():

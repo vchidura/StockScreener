@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import {
@@ -19,6 +19,7 @@ import {
   PanelRightClose,
   Radar,
   Search,
+  Settings,
   ShieldCheck,
   TrendingUp,
 } from 'lucide-react'
@@ -28,6 +29,7 @@ import {
   getOptionCandidates,
   getOptionChain,
   getOptionDataQuality,
+  getOptionGamma,
   getOptionHealth,
   getOptionOpportunities,
   getOptionPerformance,
@@ -42,11 +44,12 @@ import {
   OptionChainData,
   OptionChainRow,
   OptionDataQualityData,
+  OptionGammaData,
+  OptionGammaStrike,
   OptionExclusionReason,
   OptionHealthData,
   OptionOpportunitiesData,
   OptionOpportunityRow,
-  OptionPerformanceCheckpoint,
   OptionPerformanceData,
   OptionPerformanceMeasurement,
   OptionPerformanceRow,
@@ -58,7 +61,7 @@ import {
 import './OptionsResearchWorkspace.css'
 
 type WorkspaceView = 'opportunities' | 'research' | 'candidates' | 'recommendations' | 'performance' | 'explorer' | 'operations'
-type ResearchLens = 'income' | 'directional' | 'volatility' | 'activity'
+type ResearchLens = 'income' | 'directional' | 'volatility' | 'activity' | 'gamma'
 type OperationsSection = 'health' | 'universe' | 'quality'
 type ContractTypeFilter = 'ALL' | 'CALL' | 'PUT'
 
@@ -68,6 +71,7 @@ const lenses: Array<{ value: ResearchLens; label: string; icon: typeof Activity 
   { value: 'directional', label: 'Directional Context', icon: TrendingUp },
   { value: 'volatility', label: 'Volatility & Range', icon: BarChart3 },
   { value: 'activity', label: 'OI & Activity', icon: Activity },
+  { value: 'gamma', label: 'Gamma Exposure', icon: Radar },
 ]
 
 const candidateSuites: Array<{ value: OptionCandidatePersona; label: string; detail: string }> = [
@@ -97,6 +101,11 @@ const lensCopy: Record<ResearchLens, { title: string; detail: string; unavailabl
     title: 'Open-interest and activity evidence',
     detail: 'Review volume and open interest in deterministic chain order. Activity is not trade direction or institutional ownership.',
     unavailable: 'Aggressor side, sweep classification, OI-based strategy claims, and quote marketability are not available.',
+  },
+  gamma: {
+    title: 'Chain gamma exposure',
+    detail: 'Per-strike call and put gamma are measured unsigned; the net value applies a versioned dealer assumption that open interest cannot confirm.',
+    unavailable: 'Dealer positioning is modeled, not observed. Regime and flip levels are research context, not a directional recommendation.',
   },
 }
 
@@ -180,6 +189,19 @@ function StatePanel({ title, detail, warning = false }: { title: string; detail:
 
 function Metric({ label, value, detail }: { label: string; value: string; detail: string }) {
   return <div className="options-metric"><span>{label}</span><strong>{value}</strong><small>{detail}</small></div>
+}
+
+type TableColumn<TRow> = { key: string; label: string; fixed?: boolean; className?: string; render: (row: TRow) => ReactNode }
+
+function ColumnSettings({ columns, hidden, onToggle }: { columns: { key: string; label: string; fixed?: boolean }[]; hidden: Set<string>; onToggle: (key: string) => void }) {
+  const [open, setOpen] = useState(false)
+  const selectable = columns.filter(column => !column.fixed && column.label)
+  const hiddenCount = selectable.filter(column => hidden.has(column.key)).length
+  const title = `Choose columns${hiddenCount ? ` (${hiddenCount} hidden)` : ''}`
+  return <div className="options-column-settings">
+    <button type="button" className={`options-icon-button ${open ? 'is-open' : ''}`} title={title} aria-label={title} aria-expanded={open} onClick={() => setOpen(!open)}><Settings size={15} /></button>
+    {open && <div className="options-column-menu">{selectable.map(column => <label key={column.key}><input type="checkbox" checked={!hidden.has(column.key)} onChange={() => onToggle(column.key)} />{column.label}</label>)}</div>}
+  </div>
 }
 
 function Field({ label, value, title }: { label: string; value: string; title?: string }) {
@@ -276,8 +298,32 @@ function OpportunityCommandBar({ strategies, strategy, dataTier, onStrategy }: {
   </section>
 }
 
-function LatestOpportunityTable({ rows, onSelect, onTicker }: { rows: OptionOpportunityRow[]; onSelect: (candidateId: string) => void; onTicker: (ticker: string) => void }) {
-  return <div className="options-table-wrap"><table className="options-table options-table--opportunities"><thead><tr><th>Source</th><th>Underlying</th><th>Strategy</th><th>Structure</th><th>Ordered legs</th><th>Expiration</th><th>Net premium</th><th>Maximum loss</th><th>Modeled return</th><th>Window</th><th>Signal</th><th>Research gates</th><th aria-label="Details" /></tr></thead><tbody>{rows.map(row => { const reasons = candidateReasons(row); const returnMetric = row.return_on_risk ?? row.return_on_collateral; return <tr key={row.candidate_id}><td>{dateTime(row.market_data_time)}<small className="options-cell-subtitle">{age(row.market_data_time)}</small></td><td><button type="button" className="options-ticker-link" onClick={() => onTicker(row.underlying)}>{row.underlying}</button><small className="options-cell-subtitle">Latest matrix</small></td><td>{row.display_name}<small className="options-cell-subtitle">Rank #{row.candidate_rank}</small></td><td>{readable(row.structure_type)}<small className="options-cell-subtitle">{readable(row.structure_risk_class)}</small></td><td className="options-leg-cell">{row.legs.map(leg => `${leg.side} ${leg.ratio} ${leg.contract_ticker}`).join(' / ') || 'No legs'}</td><td>{row.expiration_date || 'Unavailable'}</td><td>{money(row.net_premium)}</td><td className="options-risk-cell">{money(row.maximum_loss)}</td><td>{returnMetric == null ? 'Unavailable' : pct(returnMetric)}<small className="options-cell-subtitle">{row.return_on_collateral != null ? 'On collateral' : 'On risk'}</small></td><td><Status value={`WINDOW ${row.window_state}`} /></td><td><Status value={row.signal_status || 'RESEARCH ONLY'} /></td><td>{reasons.length ? readable(reasons[0]) : 'None'}{reasons.length > 1 && <small className="options-cell-subtitle">+{reasons.length - 1} more</small>}</td><td><button type="button" className="options-icon-button" title="Review opportunity evidence" aria-label={`Review opportunity evidence ${row.candidate_id}`} onClick={() => onSelect(row.candidate_id)}><Eye size={15} /></button></td></tr> })}</tbody></table></div>
+function LatestOpportunityTable({ rows, hidden, onSelect, onTicker }: { rows: OptionOpportunityRow[]; hidden: Set<string>; onSelect: (candidateId: string) => void; onTicker: (ticker: string) => void }) {
+  const columns = opportunityColumns(onSelect, onTicker)
+  const visible = columns.filter(column => !hidden.has(column.key))
+  return <div className="options-table-wrap"><table className="options-table options-table--opportunities"><thead><tr>{visible.map(column => <th key={column.key} aria-label={column.label ? undefined : 'Details'}>{column.label}</th>)}</tr></thead><tbody>{rows.map(row => <tr key={row.candidate_id}>{visible.map(column => <td key={column.key} className={column.className}>{column.render(row)}</td>)}</tr>)}</tbody></table></div>
+}
+
+function opportunityColumns(onSelect: (candidateId: string) => void, onTicker: (ticker: string) => void): TableColumn<OptionOpportunityRow>[] {
+  return [
+    { key: 'source', label: 'Source', render: row => <>{dateTime(row.market_data_time)}<small className="options-cell-subtitle">{age(row.market_data_time)}</small></> },
+    { key: 'underlying', label: 'Underlying', render: row => <><button type="button" className="options-ticker-link" onClick={() => onTicker(row.underlying)}>{row.underlying}</button><small className="options-cell-subtitle">Latest matrix</small></> },
+    { key: 'strategy', label: 'Strategy', render: row => <>{row.display_name}<small className="options-cell-subtitle">Rank #{row.candidate_rank}</small></> },
+    { key: 'structure', label: 'Structure', render: row => <>{readable(row.structure_type)}<small className="options-cell-subtitle">{readable(row.structure_risk_class)}</small></> },
+    { key: 'legs', label: 'Ordered legs', className: 'options-leg-cell', render: row => <div className="options-leg-lines">{row.legs.map(leg => <span key={leg.leg_index} title={leg.contract_ticker}>{leg.side === 'SELL' ? 'Sell' : 'Buy'} {leg.ratio} {money(leg.strike)} {leg.contract_type === 'CALL' ? 'Call' : 'Put'}</span>)}</div> },
+    { key: 'expiration', label: 'Expiration', render: row => row.expiration_date || 'Unavailable' },
+    { key: 'net_premium', label: 'Net premium', render: row => <div className="options-performance-result"><strong>{money(row.net_premium)}</strong><div className="options-leg-detail">{row.legs.map(leg => <span key={leg.leg_index}>{money(leg.model_mark)}</span>)}</div></div> },
+    { key: 'maximum_loss', label: 'Maximum loss', className: 'options-risk-cell', render: row => money(row.maximum_loss) },
+    { key: 'modeled_return', label: 'Modeled return', render: row => { const metric = row.return_on_risk ?? row.return_on_collateral; return <>{metric == null ? 'Unavailable' : pct(metric)}<small className="options-cell-subtitle">{row.return_on_collateral != null ? 'On collateral' : 'On risk'}</small></> } },
+    { key: 'stock_price', label: 'Stock price', render: row => <LegStockPrice legs={row.legs} /> },
+    { key: 'day_volume', label: 'Volume', render: row => <LegLiquidity legs={row.legs} field="day_volume" /> },
+    { key: 'open_interest', label: 'Open interest', render: row => <LegLiquidity legs={row.legs} field="open_interest" /> },
+    ...greekColumns.map(column => ({ key: column.key, label: column.label, render: (row: OptionOpportunityRow) => <LegGreek legs={row.legs} column={column} /> })),
+    { key: 'window', label: 'Window', render: row => <Status value={`WINDOW ${row.window_state}`} /> },
+    { key: 'signal', label: 'Signal', render: row => <Status value={row.signal_status || 'RESEARCH ONLY'} /> },
+    { key: 'gates', label: 'Research gates', render: row => { const reasons = candidateReasons(row); return <>{reasons.length ? readable(reasons[0]) : 'None'}{reasons.length > 1 && <small className="options-cell-subtitle">+{reasons.length - 1} more</small>}</> } },
+    { key: 'details', label: '', fixed: true, render: row => <button type="button" className="options-icon-button" title="Review opportunity evidence" aria-label={`Review opportunity evidence ${row.candidate_id}`} onClick={() => onSelect(row.candidate_id)}><Eye size={15} /></button> },
+  ]
 }
 
 function PriorBoardSignals({ history, loading, error, currentCandidateIds, onOpenHistory, onTicker }: {
@@ -320,9 +366,11 @@ function OpportunityBoard({ envelope, history, historyLoading, historyError, str
   const blocked = latestStructured.filter(row => row.signal_status === 'BLOCKED').length
   const coverageExceptions = Math.max(0, data.configured_underlyer_count - data.covered_underlyer_count)
   const currentCandidateIds = new Set(latestStructured.map(row => row.candidate_id))
+  const [hiddenBoardColumns, setHiddenBoardColumns] = useState<Set<string>>(new Set([...greekColumns.map(column => column.key), 'stock_price', 'day_volume', 'open_interest']))
+  const toggleBoardColumn = (key: string) => setHiddenBoardColumns(current => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next })
   return <>
     {coverageExceptions > 0 && <StatePanel title="Universe coverage is incomplete" detail={`${coverageExceptions} configured underlyer${coverageExceptions === 1 ? '' : 's'} lack a current matrix. Inspect Operations before relying on the slate.`} warning />}
-    <section className="options-panel options-opportunity-section"><div className="options-panel__header"><div><h3>Latest surfaced structures</h3><p>Current matrix per underlyer, rank one per strategy. Active windows sort first; ranks are not comparable across strategies.</p></div><div className="options-board-summary"><span><strong>{latestStructured.length}</strong> surfaced</span><span><strong>{activeWindows}</strong> active</span><span><strong>{blocked}</strong> blocked</span><span className={coverageExceptions ? 'has-exception' : ''}><strong>{coverageExceptions}</strong> coverage gaps</span></div></div>{latestStructured.length ? <LatestOpportunityTable rows={latestStructured} onSelect={onSelect} onTicker={onTicker} /> : <div className="options-empty-block">No structured selections are present for this filter. Detector findings and suppressions remain available.</div>}</section>
+    <section className="options-panel options-opportunity-section"><div className="options-panel__header"><div><h3>Latest surfaced structures</h3><p>Current matrix per underlyer, rank one per strategy. Active windows sort first; ranks are not comparable across strategies.</p></div><div className="options-board-summary"><span><strong>{latestStructured.length}</strong> surfaced</span><span><strong>{activeWindows}</strong> active</span><span><strong>{blocked}</strong> blocked</span><span className={coverageExceptions ? 'has-exception' : ''}><strong>{coverageExceptions}</strong> coverage gaps</span><ColumnSettings columns={opportunityColumns(onSelect, onTicker)} hidden={hiddenBoardColumns} onToggle={toggleBoardColumn} /></div></div>{latestStructured.length ? <LatestOpportunityTable rows={latestStructured} hidden={hiddenBoardColumns} onSelect={onSelect} onTicker={onTicker} /> : <div className="options-empty-block">No structured selections are present for this filter. Detector findings and suppressions remain available.</div>}</section>
     <PriorBoardSignals history={history} loading={historyLoading} error={historyError} currentCandidateIds={currentCandidateIds} onOpenHistory={onOpenHistory} onTicker={onTicker} />
   </>
 }
@@ -389,19 +437,20 @@ function RecommendationWorkbench({ envelope, onOffsetChange }: {
   </>
 }
 
-function PerformanceCommandBar({ members, underlyer, cohort, days, onUnderlyer, onCohort, onDays }: {
+function PerformanceCommandBar({ members, strategies, underlyer, strategy, expiration, onUnderlyer, onStrategy, onExpiration }: {
   members: OptionUniverseRow[]
+  strategies: Array<{ value: string; label: string }>
   underlyer: string
-  cohort: 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS'
-  days: number
+  strategy: string
+  expiration: string
   onUnderlyer: (value: string) => void
-  onCohort: (value: 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS') => void
-  onDays: (value: number) => void
+  onStrategy: (value: string) => void
+  onExpiration: (value: string) => void
 }) {
   return <section className="options-recommendation-command options-performance-command" aria-label="Signal performance filters">
     <label>Underlying<select value={underlyer} onChange={event => onUnderlyer(event.target.value)}><option value="ALL">All underlyings</option>{members.map(row => <option key={row.ticker} value={row.ticker}>{row.ticker}</option>)}</select></label>
-    <label>Signal cohort<select value={cohort} onChange={event => onCohort(event.target.value as 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS')}><option value="OPPORTUNITY_BOARD">Opportunity Board surfaced</option><option value="ALL_SIGNALS">All structured signals</option></select></label>
-    <label>History window<select value={days} onChange={event => onDays(Number(event.target.value))}><option value={7}>Last 7 days</option><option value={14}>Last 14 days</option><option value={30}>Last 30 days</option><option value={60}>Last 60 days</option></select></label>
+    <label>Strategy<select value={strategy} onChange={event => onStrategy(event.target.value)}><option value="ALL">All strategies</option>{strategies.map(row => <option key={row.value} value={row.value}>{row.label}</option>)}</select></label>
+    <label>Expiration<input type="date" value={expiration} onChange={event => onExpiration(event.target.value)} /></label>
     <div className="options-capability"><History size={14} /><span>Delayed proxy marks / no fill claim</span></div>
   </section>
 }
@@ -410,11 +459,85 @@ const checkpointLabels: Record<OptionPerformanceMeasurement, string> = {
   '15MIN': '15m', '30MIN': '30m', '60MIN': '60m', 'CLOSE': 'Close', 'NEXT_OPEN': 'Next open',
 }
 
-function PerformanceCheckpoint({ checkpoint }: { checkpoint?: OptionPerformanceCheckpoint }) {
-  if (!checkpoint) return <span className="options-performance-pending">Not scheduled</span>
-  if (!checkpoint.outcome) return <><Status value={checkpoint.status} /><small className="options-cell-subtitle">{dateTime(checkpoint.checkpoint_time)}</small></>
-  const netPnl = Number(checkpoint.outcome.net_pnl)
-  return <div className={`options-performance-result ${netPnl >= 0 ? 'options-performance-result--positive' : 'options-performance-result--negative'}`}><strong>{signedMoney(checkpoint.outcome.net_pnl)}</strong><small>{pct(Number(checkpoint.outcome.net_return))}</small></div>
+function PerformanceCurrentMark({ mark }: { mark: OptionPerformanceRow['current_mark'] }) {
+  if (!mark) return <span className="options-performance-pending">Pending</span>
+  const grossPnl = Number(mark.gross_pnl)
+  return <div className={`options-performance-result ${grossPnl >= 0 ? 'options-performance-result--positive' : 'options-performance-result--negative'}`}><strong>{signedMoney(mark.gross_pnl)}</strong><small>Net {signedMoney(mark.net_pnl)} after {money(mark.estimated_cost)} costs</small><small>{dateTime(mark.market_time)}</small><div className="options-leg-detail">{mark.legs.map(leg => <span key={leg.contract_id}>{leg.side === 'SELL' ? 'Sell' : 'Buy'} {leg.ratio} · {money(leg.entry_mark)} → {money(leg.current_mark)} · {signedMoney(leg.gross_pnl)}</span>)}</div></div>
+}
+
+// Package premium is positive for a net credit and negative for a net debit.
+function PerformancePackagePremium({ mark, phase }: { mark: OptionPerformanceRow['current_mark']; phase: 'entry' | 'current' }) {
+  if (!mark) return <span className="options-performance-pending">Pending</span>
+  const premium = Number(phase === 'entry' ? mark.entry_net_premium : mark.exit_net_premium)
+  return <div className="options-performance-result"><strong>{premium >= 0 ? `Credit ${money(Math.abs(premium))}` : `Debit ${money(Math.abs(premium))}`}</strong><div className="options-leg-detail">{mark.legs.map(leg => <span key={leg.contract_id}>{money(phase === 'entry' ? leg.entry_mark : leg.current_mark)}</span>)}</div></div>
+}
+
+type GreekKey = 'local_iv' | 'local_delta' | 'local_gamma' | 'local_theta_per_day' | 'local_vega_per_vol_point' | 'local_rho_per_rate_point'
+type LegLike = { leg_index: number; side: 'BUY' | 'SELL'; ratio: number; spot?: string | null; day_volume?: number | null } & { [K in GreekKey]?: number | null } & { open_interest?: number | null }
+
+// IV is ratio-weighted; the rest are signed position sums so short legs offset long legs.
+const greekColumns: { key: GreekKey; label: string; weighted?: boolean }[] = [
+  { key: 'local_iv', label: 'IV', weighted: true },
+  { key: 'local_delta', label: 'Delta' },
+  { key: 'local_gamma', label: 'Gamma' },
+  { key: 'local_theta_per_day', label: 'Theta / day' },
+  { key: 'local_vega_per_vol_point', label: 'Vega' },
+  { key: 'local_rho_per_rate_point', label: 'Rho' },
+]
+
+function packageGreek(legs: LegLike[], key: GreekKey, weighted?: boolean) {
+  const usable = legs.filter(leg => leg[key] != null)
+  if (!usable.length) return null
+  if (weighted) {
+    const weight = usable.reduce((total, leg) => total + leg.ratio, 0)
+    return weight ? usable.reduce((total, leg) => total + Number(leg[key]) * leg.ratio, 0) / weight : null
+  }
+  return usable.reduce((total, leg) => total + (leg.side === 'BUY' ? 1 : -1) * leg.ratio * Number(leg[key]), 0)
+}
+
+function LegGreek({ legs, column }: { legs: LegLike[]; column: typeof greekColumns[number] }) {
+  const value = packageGreek(legs, column.key, column.weighted)
+  if (value == null) return <span className="options-performance-pending">Unavailable</span>
+  return <div className="options-performance-result"><strong>{column.weighted ? pct(value) : value.toFixed(4)}</strong><div className="options-leg-detail">{legs.map(leg => <span key={leg.leg_index}>{leg[column.key] == null ? '—' : column.weighted ? pct(Number(leg[column.key])) : Number(leg[column.key]).toFixed(4)}</span>)}</div></div>
+}
+
+// All legs share one underlying, so the first leg carries the package spot.
+function LegStockPrice({ legs, currentLegs }: { legs: LegLike[]; currentLegs?: { spot?: string | null }[] }) {
+  const detection = legs.find(leg => leg.spot != null)?.spot
+  const current = currentLegs?.find(leg => leg.spot != null)?.spot
+  if (detection == null) return <span className="options-performance-pending">Unavailable</span>
+  return <div className="options-performance-result"><strong>{money(current ?? detection)}</strong><small>{current == null ? 'At detection' : `Detected ${money(detection)}`}</small></div>
+}
+
+// One value per leg, ordered to match the legs column.
+function LegLiquidity({ legs, field }: { legs: LegLike[]; field: 'day_volume' | 'open_interest' }) {
+  if (!legs.length) return <span className="options-performance-pending">Unavailable</span>
+  return <div className="options-leg-lines">{legs.map(leg => <span key={leg.leg_index}>{leg[field] == null ? 'Unavailable' : integer(leg[field]!)}</span>)}</div>
+}
+
+function PerformanceLegs({ row }: { row: OptionPerformanceRow }) {  if (!row.legs.length) return <span className="options-performance-pending">No legs</span>
+  return <div className="options-leg-lines">{row.legs.map(leg => <span key={leg.leg_index} title={leg.contract_ticker}>{leg.side === 'SELL' ? 'Sell' : 'Buy'} {leg.ratio} {money(leg.strike)} {leg.contract_type === 'CALL' ? 'Call' : 'Put'}</span>)}</div>
+}
+
+function performanceColumns(): TableColumn<OptionPerformanceRow>[] {
+  return [
+    { key: 'signal_time', label: 'Signal time', render: row => <>{dateTime(row.market_data_time)}<small className="options-cell-subtitle">Valid to {dateTime(row.valid_until)}</small></> },
+    { key: 'underlying', label: 'Underlying', className: 'options-symbol', render: row => row.underlying },
+    { key: 'strategy', label: 'Strategy', render: row => <>{readable(row.strategy_name)}<small className="options-cell-subtitle">{readable(row.strategy_version)}</small></> },
+    { key: 'status', label: 'Status', render: row => <Status value={row.status} /> },
+    { key: 'structure', label: 'Structure', render: row => readable(row.structure_type) },
+    { key: 'legs', label: 'Ordered legs', render: row => <PerformanceLegs row={row} /> },
+    { key: 'expiration', label: 'Expiration', render: row => row.expiration_date || 'No expiration' },
+    { key: 'stop_target', label: 'Premium stop / target', render: row => <>{row.stop_loss == null || row.take_profit == null ? 'Not defined' : `${money(row.stop_loss)} / ${money(row.take_profit)}`}<small className="options-cell-subtitle">Option premium levels</small></> },
+    { key: 'detection_price', label: 'Detection price', render: row => <PerformancePackagePremium mark={row.current_mark} phase="entry" /> },
+    { key: 'current_price', label: 'Current price', render: row => <PerformancePackagePremium mark={row.current_mark} phase="current" /> },
+    { key: 'current_pnl', label: 'Current P&L', render: row => <PerformanceCurrentMark mark={row.current_mark} /> },
+    { key: 'stock_price', label: 'Stock price', render: row => <LegStockPrice legs={row.legs} currentLegs={row.current_mark?.legs} /> },
+    { key: 'day_volume', label: 'Volume', render: row => <LegLiquidity legs={row.legs} field="day_volume" /> },
+    { key: 'open_interest', label: 'Open interest', render: row => <LegLiquidity legs={row.legs} field="open_interest" /> },
+    ...greekColumns.map(column => ({ key: column.key, label: column.label, render: (row: OptionPerformanceRow) => <LegGreek legs={row.legs} column={column} /> })),
+    { key: 'blocked', label: 'Blocked reason', render: row => <>{row.blocked_reasons.length ? readable(row.blocked_reasons[0]) : 'None'}{row.blocked_reasons.length > 1 && <small className="options-cell-subtitle">+{row.blocked_reasons.length - 1} more</small>}</> },
+  ]
 }
 
 function PerformanceWorkbench({ envelope, onOffsetChange }: {
@@ -425,14 +548,15 @@ function PerformanceWorkbench({ envelope, onOffsetChange }: {
   const rows = data?.rows || []
   const firstRow = rows.length && data ? data.offset + 1 : 0
   const lastRow = data ? data.offset + rows.length : 0
-  const checkpoint = (row: OptionPerformanceRow, measurement: OptionPerformanceMeasurement) => row.checkpoints.find(item => item.measurement_type === measurement)
+  const columns = performanceColumns()
+  const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set([...greekColumns.map(column => column.key), 'stock_price', 'day_volume', 'open_interest']))
+  const toggleColumn = (key: string) => setHiddenColumns(current => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next })
+  const visible = columns.filter(column => !hiddenColumns.has(column.key))
   return <>
-    <section className="options-candidate-intro"><div><span>Delayed proxy tracking</span><h2>Signal performance</h2><p>Fixed checkpoints compare the cohort entry package with later worker observations. Opening this view does not fetch a current mark or revalue P&amp;L.</p></div><div><strong>{data?.cohort === 'ALL_SIGNALS' ? 'All structured signals' : 'Opportunity Board surfaced'}</strong><span>{data?.days || 14}-day history · commission included; fills unavailable</span></div></section>
-    <section className="options-metrics-grid"><Metric label="Retained signals" value={integer(data?.total || 0)} detail="Structured signal events in this window" /><Metric label="Measured signals" value={integer(data?.measured_signals || 0)} detail="At least one coherent checkpoint" /><Metric label="Management plans" value={integer(data?.signals_with_management_plan || 0)} detail="Both premium stop and target defined" /><Metric label="Measurements" value={integer(data?.measurement_count || 0)} detail="Available delayed-proxy outcomes" /></section>
+    <section className="options-candidate-intro"><div><span>Delayed proxy tracking</span><h2>Signal performance</h2><p>Fixed checkpoints are immutable; current simulated-close P&amp;L is refreshed by the worker from a coherent delayed package. Opening this view only reads persisted values.</p></div><div><strong>{data?.cohort === 'ALL_SIGNALS' ? 'All structured signals' : 'Opportunity Board surfaced'}</strong><span>{data?.days || 14}-day history · commission included; fills unavailable</span></div></section>
     {!envelope?.available && <StatePanel title="No signal history in this window" detail="Continuous option collection must observe selected structures before checkpoint tracking can begin." warning />}
     {envelope?.available && data?.measurement_count === 0 && <StatePanel title="Checkpoint outcomes are pending" detail="Signals are retained, but later coherent observations for their exact legs have not matured yet." />}
-    {!!data?.measurement_summary.length && <section className="options-performance-summary"><div className="options-panel__header"><div><h3>Checkpoint summary</h3><p>Each horizon is summarized independently; values are not added across horizons.</p></div><span>{data.valuation_mode.replace(/_/g, ' ')}</span></div><div>{data.measurement_summary.map(row => <div key={row.measurement_type}><span>{checkpointLabels[row.measurement_type]}</span><strong>{signedMoney(row.aggregate_net_pnl)}</strong><small>{row.available_count} measured · {row.positive_count} positive · mean {row.mean_net_return == null ? 'Unavailable' : pct(Number(row.mean_net_return))}</small></div>)}</div></section>}
-    <section className="options-panel"><div className="options-panel__header"><div><h3>Signal checkpoint ledger</h3><p>Premium stops and targets appear only when the strategy defines a management policy.</p></div><span>{rows.length} shown</span></div><div className="options-table-wrap"><table className="options-table options-table--performance"><thead><tr><th>Signal time</th><th>Underlying</th><th>Strategy</th><th>Board rank</th><th>Status</th><th>Structure</th><th>Premium stop / target</th><th>Maximum loss</th><th>Modeled payoff</th><th>15m P&amp;L</th><th>30m P&amp;L</th><th>60m P&amp;L</th><th>Close P&amp;L</th><th>Next-open P&amp;L</th><th>Blocked reason</th></tr></thead><tbody>{rows.length ? rows.map(row => <tr key={row.event_id}><td>{dateTime(row.market_data_time)}<small className="options-cell-subtitle">Valid to {dateTime(row.valid_until)}</small></td><td className="options-symbol">{row.underlying}</td><td>{readable(row.strategy_name)}<small className="options-cell-subtitle">{readable(row.strategy_version)}</small></td><td>#{row.candidate_rank}</td><td><Status value={row.status} /></td><td>{readable(row.structure_type)}<small className="options-cell-subtitle">{row.expiration_date || 'No expiration'}</small></td><td>{row.stop_loss == null || row.take_profit == null ? 'Not defined' : `${money(row.stop_loss)} / ${money(row.take_profit)}`}<small className="options-cell-subtitle">Option premium levels</small></td><td className="options-risk-cell">{money(row.maximum_loss)}</td><td>{money(row.maximum_profit)}<small className="options-cell-subtitle">RoR {row.return_on_risk == null ? 'Unavailable' : pct(row.return_on_risk)}</small></td><td><PerformanceCheckpoint checkpoint={checkpoint(row, '15MIN')} /></td><td><PerformanceCheckpoint checkpoint={checkpoint(row, '30MIN')} /></td><td><PerformanceCheckpoint checkpoint={checkpoint(row, '60MIN')} /></td><td><PerformanceCheckpoint checkpoint={checkpoint(row, 'CLOSE')} /></td><td><PerformanceCheckpoint checkpoint={checkpoint(row, 'NEXT_OPEN')} /></td><td>{row.blocked_reasons.length ? readable(row.blocked_reasons[0]) : 'None'}{row.blocked_reasons.length > 1 && <small className="options-cell-subtitle">+{row.blocked_reasons.length - 1} more</small>}</td></tr>) : <tr><td colSpan={15} className="options-empty-cell">No retained structured signals match this history window.</td></tr>}</tbody></table></div>{data && <div className="options-pagination"><span>{data.total ? `Showing ${firstRow}-${lastRow} of ${data.total}` : '0 results'}</span><div><button type="button" aria-label="Previous performance page" title="Previous page" disabled={data.offset === 0} onClick={() => onOffsetChange(Math.max(0, data.offset - data.limit))}><ChevronLeft size={16} /></button><button type="button" aria-label="Next performance page" title="Next page" disabled={lastRow >= data.total} onClick={() => onOffsetChange(data.offset + data.limit)}><ChevronRight size={16} /></button></div></div>}</section>
+    <section className="options-panel"><div className="options-panel__header"><div><h3>Signal ledger</h3><p>Detection and current package prices come from worker-materialized delayed marks.</p></div><div className="options-panel-tools"><span>{rows.length} shown</span><ColumnSettings columns={columns} hidden={hiddenColumns} onToggle={toggleColumn} /></div></div><div className="options-table-wrap"><table className="options-table options-table--performance"><thead><tr>{visible.map(column => <th key={column.key}>{column.label}</th>)}</tr></thead><tbody>{rows.length ? rows.map(row => <tr key={row.event_id}>{visible.map(column => <td key={column.key} className={column.className}>{column.render(row)}</td>)}</tr>) : <tr><td colSpan={visible.length} className="options-empty-cell">No retained structured signals match this history window.</td></tr>}</tbody></table></div>{data && <div className="options-pagination"><span>{data.total ? `Showing ${firstRow}-${lastRow} of ${data.total}` : '0 results'}</span><div><button type="button" aria-label="Previous performance page" title="Previous page" disabled={data.offset === 0} onClick={() => onOffsetChange(Math.max(0, data.offset - data.limit))}><ChevronLeft size={16} /></button><button type="button" aria-label="Next performance page" title="Next page" disabled={lastRow >= data.total} onClick={() => onOffsetChange(data.offset + data.limit)}><ChevronRight size={16} /></button></div></div>}</section>
   </>
 }
 
@@ -451,11 +575,13 @@ function CandidateDrawer({ envelope, loading, error, onClose }: { envelope?: Opt
   const data = envelope?.data
   const candidate = data?.candidate
   const researchOnly = candidate?.candidate_kind === 'RESEARCH_ONLY'
+  const gates = data?.execution_gates || []
+  const quoteGate = gates.find(gate => gate.gate_name === 'QUOTE_LIQUIDITY')
   return <div className="options-drawer-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}><aside className="options-drawer options-drawer--candidate" role="dialog" aria-modal="true" aria-labelledby="candidate-drawer-title"><header><div><span>{researchOnly ? 'Research-only detector finding' : 'Structured research candidate'}</span><h2 id="candidate-drawer-title">{loading ? 'Loading evidence' : candidate?.display_name || 'Candidate unavailable'}</h2><p>{researchOnly ? 'Selected evidence record; no directional package or execution claim.' : 'Delayed research record. Candidate state is not broker authorization.'}</p></div><button type="button" className="options-icon-button" title="Close candidate" aria-label="Close candidate drawer" autoFocus onClick={onClose} onKeyDown={event => { if (event.key === 'Escape') onClose() }}><PanelRightClose size={18} /></button></header>{loading && <StatePanel title="Loading candidate evidence" detail="Reading immutable decision and scenario records." />}{error && <StatePanel title="Candidate evidence unavailable" detail="The detail API could not load this persisted decision." warning />}{!loading && candidate && data && <div className="options-drawer__body">
     <section><h3>{researchOnly ? 'Finding' : 'Structure'}</h3><div className="options-field-grid"><Field label="Status" value={readable(candidate.status)} /><Field label="Decision type" value={researchOnly ? (candidate.status === 'SELECTED' ? 'Research finding' : 'Suppression record') : readable(candidate.candidate_kind)} />{!researchOnly && <Field label="Structure" value={readable(candidate.structure_type)} />}<Field label="Risk class" value={readable(candidate.structure_risk_class)} /><Field label="Source contract" value={candidate.source_contract_ticker || 'Not contract-specific'} /><Field label="Source contract ID" value={candidate.source_contract_id == null ? 'Unavailable' : String(candidate.source_contract_id)} /><Field label="Expiration" value={candidate.expiration_date || 'Unavailable'} /><Field label="Rank" value={String(candidate.candidate_rank)} /><Field label="Primary evidence" value={candidate.primary_metric_name && candidate.primary_metric_value != null ? `${readable(candidate.primary_metric_name)} ${number(candidate.primary_metric_value)}` : 'Unavailable'} /><Field label="Eligibility" value={candidate.execution_eligibility || 'Not eligible'} /></div>{data.legs.length ? <div className="options-leg-stack">{data.legs.map(leg => <div key={leg.leg_index}><span>{leg.side} {leg.ratio}</span><strong>{leg.contract_ticker}</strong><small>{leg.contract_type} {money(leg.strike)} / model {money(leg.model_mark)}</small></div>)}</div> : <p className="options-section-note">{researchOnly && candidate.status === 'SELECTED' ? 'This row is one contract-level detector result. The same detector selected different source contracts; they are not duplicate strategy executions. No option legs, direction, or recommendation event are constructed by design.' : 'No option package was created because the required quality or strategy gates did not pass.'}</p>}</section>
     <section><h3>Risk and payoff</h3><div className="options-field-grid"><Field label="Net premium" value={money(candidate.net_premium)} /><Field label="Maximum loss" value={money(candidate.maximum_loss)} /><Field label="Maximum profit" value={money(candidate.maximum_profit)} /><Field label="Capital at risk" value={money(candidate.capital_at_risk)} /><Field label="Return on risk" value={candidate.return_on_risk == null ? 'Unavailable' : pct(candidate.return_on_risk)} /><Field label="Breakevens" value={candidate.breakevens.length ? candidate.breakevens.map(value => money(value)).join(', ') : 'Unavailable'} /></div>{data.scenarios.length ? <div className="options-scenario-wrap"><table className="options-scenario-table"><thead><tr><th>Spot shock</th><th>IV shock</th><th>Time left</th><th>Repriced</th><th>P&amp;L</th></tr></thead><tbody>{data.scenarios.map(row => <tr key={row.scenario_result_id}><td>{pct(row.spot_shock_fraction)}</td><td>{pct(row.iv_shock_fraction)}</td><td>{pct(row.time_fraction_remaining)}</td><td>{money(row.repriced_value)}</td><td>{money(row.profit_loss)}</td></tr>)}</tbody></table></div> : <p className="options-section-note">{researchOnly ? 'Research-only findings do not define premium, payoff, breakevens, or scenario grids because no option structure is constructed.' : 'Scenario results are unavailable because no complete strategy package passed selection.'}</p>}</section>
     <section><h3>Trend and context</h3><div className="options-field-grid"><Field label="Context status" value={candidate.context_status ? readable(candidate.context_status) : 'Unavailable'} /><Field label="Trend state" value={candidate.trend_state || 'Unavailable'} /><Field label="Earnings blackout" value={candidate.earnings_blackout_state || 'Unavailable'} /><Field label="Fed blackout" value={candidate.fed_blackout_state || 'Unavailable'} /></div></section>
-    <section><h3>Liquidity and marketability</h3><div className="options-field-grid"><Field label="Quote liquidity" value="Not available" /><Field label="Quote spread" value="Not available" /><Field label="Signal state" value={candidate.signal_status ? readable(candidate.signal_status) : 'No signal'} /><Field label="Execution mode" value={readable(data.execution_mode)} /></div></section>
+    <section><h3>Execution gates</h3>{gates.length ? <div className="options-field-grid">{gates.map(gate => <Field key={`${gate.ledger_version}:${gate.gate_name}`} label={readable(gate.gate_name)} value={`${readable(gate.verdict)}${gate.reason_codes.length ? ` · ${gate.reason_codes.map(readable).join(', ')}` : ''}`} title={`${gate.ledger_version} · evaluated ${dateTime(gate.evaluated_at)}`} />)}</div> : <p className="options-section-note">Gate verdicts were not recorded for this earlier candidate.</p>}<div className="options-field-grid"><Field label="Quote liquidity" value={quoteGate ? readable(quoteGate.verdict) : 'Not recorded'} /><Field label="Signal state" value={candidate.signal_status ? readable(candidate.signal_status) : 'No signal'} /><Field label="Execution mode" value={readable(data.execution_mode)} /></div></section>
     <section><h3>Management policy</h3>{Object.keys(candidate.management_policy).length ? <div className="options-field-grid">{Object.entries(candidate.management_policy).map(([key, value]) => <Field key={key} label={readable(key)} value={String(value)} />)}</div> : <p className="options-section-note">No management policy is attached to this suppressed or research-only record.</p>}</section>
     <section><h3>Decision evidence</h3><div className="options-field-grid"><Field label="Candidate ID" value={candidate.candidate_id} /><Field label="Matrix ID" value={candidate.matrix_id} /><Field label="Strategy version" value={candidate.strategy_version} /><Field label="Model version" value={candidate.model_version} /><Field label="Source market time" value={dateTime(candidate.market_data_time)} title={candidate.market_data_time} /><Field label="First observed" value={dateTime(candidate.observed_time)} title={candidate.observed_time} /></div>{candidate.reason_codes.length > 0 && <div className="options-reason-list">{candidate.reason_codes.map(reason => <span key={reason}>{readable(reason)}</span>)}</div>}</section>
   </div>}</aside></div>
@@ -531,11 +657,86 @@ function ExpirationEvidence({ envelope }: { envelope?: OptionsEnvelope<OptionAna
   </>
 }
 
-function ResearchWorkbench({ lens, chain, analysis, onSelect, onExplore }: { lens: ResearchLens; chain?: OptionsEnvelope<OptionChainData>; analysis?: OptionsEnvelope<OptionAnalysisData>; onSelect: (row: OptionChainRow) => void; onExplore: () => void }) {
+function GammaRegimeBadge({ regime }: { regime: string }) {
+  const tone = regime === 'NEGATIVE_GAMMA' ? 'options-gamma-badge--negative' : regime === 'POSITIVE_GAMMA' ? 'options-gamma-badge--positive' : 'options-gamma-badge--unknown'
+  const label = regime === 'NEGATIVE_GAMMA' ? 'Negative gamma' : regime === 'POSITIVE_GAMMA' ? 'Positive gamma' : 'Undetermined'
+  return <span className={`options-gamma-badge ${tone}`}>{label}</span>
+}
+
+function GammaCurve({ rows, spot, flip }: { rows: OptionGammaStrike[]; spot: number; flip: number | null }) {
+  const peak = Math.max(...rows.map(row => Math.max(row.call_gamma_notional_per_percent, row.put_gamma_notional_per_percent)), 1)
+  return <div className="options-gamma-curve" role="img" aria-label="Per-strike call and put gamma exposure">
+    {rows.map(row => {
+      const strike = Number(row.strike)
+      const call = (row.call_gamma_notional_per_percent / peak) * 100
+      const put = (row.put_gamma_notional_per_percent / peak) * 100
+      const isSpot = Math.abs(strike - spot) < 1e-9
+      const isFlip = flip != null && Math.abs(strike - flip) < 1e-9
+      return <div key={row.strike} className={`options-gamma-bar${isSpot ? ' is-spot' : ''}${isFlip ? ' is-flip' : ''}`} title={`Strike ${row.strike} · calls ${compactNotional(row.call_gamma_notional_per_percent)} · puts ${compactNotional(row.put_gamma_notional_per_percent)}`}>
+        <span className="options-gamma-bar__call" style={{ height: `${call}%` }} />
+        <span className="options-gamma-bar__put" style={{ height: `${put}%` }} />
+      </div>
+    })}
+  </div>
+}
+
+function compactNotional(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) return 'Unavailable'
+  const abs = Math.abs(value)
+  if (abs >= 1e9) return `${(value / 1e9).toFixed(2)}B`
+  if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`
+  if (abs >= 1e3) return `${(value / 1e3).toFixed(2)}K`
+  return value.toFixed(2)
+}
+
+function GammaEvidence({ envelope, underlyer }: { envelope?: OptionsEnvelope<OptionGammaData>; underlyer: string }) {
+  if (!envelope?.available) return <StatePanel title="No gamma profile persisted" detail={envelope?.reason === 'NO_GAMMA_PROFILE_FOR_POLICY' ? 'The active gamma policy has not produced a profile for this underlying yet. Profiles are written by the option worker per slot.' : 'The gamma profile table is not available in this database.'} warning />
+  const data = envelope.data
+  const profile = data.profiles.find(item => item.underlying === underlyer) || data.profiles[0]
+  if (!profile) return <StatePanel title="No gamma profile persisted" detail="No profile matched the active gamma policy." warning />
+  const spot = Number(profile.spot)
+  const flip = profile.flip_spot != null ? Number(profile.flip_spot) : null
+  return <>
+    <section className="options-metrics-grid">
+      <Metric label="Regime at spot" value={profile.regime_at_spot === 'NEGATIVE_GAMMA' ? 'Negative' : profile.regime_at_spot === 'POSITIVE_GAMMA' ? 'Positive' : 'Undetermined'} detail="Modeled dealer positioning" />
+      <Metric label="Gamma flip" value={flip != null ? money(profile.flip_spot) : 'None in range'} detail={`Spot ${money(profile.spot)}`} />
+      <Metric label="Net gamma / 1% move" value={compactNotional(profile.net_gamma_notional_per_percent)} detail="Signed by dealer assumption" />
+      <Metric label="Chain coverage" value={pct(profile.coverage_fraction)} detail={`${integer(profile.contributing_contract_count)} of ${integer(profile.eligible_contract_count)} contracts`} />
+    </section>
+    <section className="options-panel">
+      <div className="options-panel__header">
+        <div><h3>Gamma exposure by strike <GammaRegimeBadge regime={profile.regime_at_spot} /></h3><p>{data.dealer_convention_note}</p></div>
+        <span>{readable(profile.scope)} · {readable(profile.dealer_convention)}</span>
+      </div>
+      {profile.strike_profile?.length ? <GammaCurve rows={profile.strike_profile} spot={spot} flip={flip} /> : <div className="options-empty-block">Curve not requested for this view.</div>}
+      <div className="options-gamma-legend"><span><i className="options-gamma-swatch options-gamma-swatch--call" />Call gamma</span><span><i className="options-gamma-swatch options-gamma-swatch--put" />Put gamma</span><span><i className="options-gamma-swatch options-gamma-swatch--spot" />Spot</span><span><i className="options-gamma-swatch options-gamma-swatch--flip" />Flip level</span></div>
+      <div className="options-field-grid">
+        <Field label="Peak gamma strike" value={money(profile.peak_gamma_strike)} />
+        <Field label="Call gamma / 1%" value={compactNotional(profile.call_gamma_notional_per_percent)} />
+        <Field label="Put gamma / 1%" value={compactNotional(profile.put_gamma_notional_per_percent)} />
+        <Field label="Unsigned total / 1%" value={compactNotional(profile.absolute_gamma_notional_per_percent)} />
+        <Field label="Strikes" value={integer(profile.strike_count)} />
+        <Field label="Sign changes searched" value={integer(profile.sign_change_count)} />
+        <Field label="Volatility assumption" value={readable(profile.volatility_assumption)} />
+        <Field label="Wall gates" value={data.wall_gates_enabled ? 'Enabled' : 'Disabled'} />
+        <Field label="Gamma policy" value={data.gamma_policy_version} title={data.gamma_policy_sha256} />
+        <Field label="Source market time" value={dateTime(profile.market_data_time)} title={profile.market_data_time} />
+        <Field label="Quality reasons" value={profile.quality_reasons.length ? profile.quality_reasons.map(readable).join(', ') : 'None'} />
+      </div>
+      <p className="options-section-note">Open interest states how many contracts exist, never who holds them. Signed values apply a versioned dealer assumption and are modeled research context, not observed positioning or a trade recommendation. Open interest is prior-session settled, so intraday values are stale.</p>
+    </section>
+  </>
+}
+
+function ResearchWorkbench({ lens, chain, analysis, gamma, underlyer, onSelect, onExplore }: { lens: ResearchLens; chain?: OptionsEnvelope<OptionChainData>; analysis?: OptionsEnvelope<OptionAnalysisData>; gamma?: OptionsEnvelope<OptionGammaData>; underlyer: string; onSelect: (row: OptionChainRow) => void; onExplore: () => void }) {
   if (!chain?.available) return <StatePanel title="No complete evidence matrix" detail="A complete delayed ingestion is required before retained observations can be investigated." warning />
   const analysisStatus = chain.data.analysis?.status || 'UNANALYZED'
   const reasons = chain.data.analysis?.quality_reasons || []
   const modelValidShown = chain.data.rows.filter(row => row.model_mark != null && row.iv_converged).length
+  if (lens === 'gamma') return <>
+    <LensHeader lens={lens} />
+    <GammaEvidence envelope={gamma} underlyer={underlyer} />
+  </>
   return <>
     <LensHeader lens={lens} />
     <section className="options-metrics-grid">
@@ -635,10 +836,6 @@ export default function OptionsResearchWorkspace() {
   const candidateOffset = view === 'candidates' && Number.isFinite(requestedOffset) && requestedOffset > 0 ? Math.floor(requestedOffset) : 0
   const recommendationOffset = view === 'recommendations' && Number.isFinite(requestedOffset) && requestedOffset > 0 ? Math.floor(requestedOffset) : 0
   const performanceOffset = view === 'performance' && Number.isFinite(requestedOffset) && requestedOffset > 0 ? Math.floor(requestedOffset) : 0
-  const requestedDays = Number(searchParams.get('days') || 14)
-  const performanceDays = [7, 14, 30, 60].includes(requestedDays) ? requestedDays : 14
-  const requestedPerformanceCohort = searchParams.get('cohort')
-  const performanceCohort: 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS' = requestedPerformanceCohort === 'ALL_SIGNALS' ? 'ALL_SIGNALS' : 'OPPORTUNITY_BOARD'
   const opportunityStrategy = (searchParams.get('strategy') || 'ALL').toUpperCase()
   const effectiveType = contractType === 'ALL' ? (view === 'research' && lens === 'income' ? 'PUT' : undefined) : contractType
   const [selectedRow, setSelectedRow] = useState<OptionChainRow | null>(null)
@@ -652,15 +849,16 @@ export default function OptionsResearchWorkspace() {
 
   const health = useQuery({ queryKey: ['options', 'health'], queryFn: getOptionHealth, refetchInterval: 60_000 })
   const universe = useQuery({ queryKey: ['options', 'universe'], queryFn: getOptionUniverse })
-  const opportunities = useQuery({ queryKey: ['options', 'opportunities'], queryFn: () => getOptionOpportunities({ per_strategy: 1 }), enabled: view === 'opportunities' })
+  const opportunities = useQuery({ queryKey: ['options', 'opportunities'], queryFn: () => getOptionOpportunities({ per_strategy: 1 }), enabled: view === 'opportunities' || view === 'performance' })
   const opportunityHistory = useQuery({ queryKey: ['options', 'opportunity-history', opportunityStrategy], queryFn: () => getOptionPerformance({ strategy: opportunityStrategy === 'ALL' ? undefined : opportunityStrategy, cohort: 'OPPORTUNITY_BOARD', days: 14, limit: 200, offset: 0 }), enabled: view === 'opportunities', refetchInterval: 60_000 })
   const chain = useQuery({ queryKey: ['options', 'chain', underlyer, expiration, effectiveType, offset], queryFn: () => getOptionChain(underlyer, { expiration: expiration || undefined, contract_type: effectiveType, limit: 100, offset }), enabled: view === 'research' || view === 'explorer' })
   const analysis = useQuery({ queryKey: ['options', 'analysis', underlyer], queryFn: () => getOptionAnalysis(underlyer), enabled: view === 'research' })
   const quality = useQuery({ queryKey: ['options', 'data-quality'], queryFn: getOptionDataQuality, enabled: view === 'operations' && section === 'quality' })
+  const gamma = useQuery({ queryKey: ['options', 'gamma', underlyer], queryFn: () => getOptionGamma({ underlyer, scope: 'TOTAL', include_curve: true }), enabled: view === 'research' && lens === 'gamma' })
   const candidates = useQuery({ queryKey: ['options', 'candidates', underlyer, candidatePersona, candidateStatus, candidateOffset], queryFn: () => getOptionCandidates({ underlyer: underlyer === 'ALL' ? undefined : underlyer, persona: candidatePersona, status: candidateStatus === 'ALL' ? undefined : candidateStatus, limit: 100, offset: candidateOffset }), enabled: view === 'candidates' })
   const candidateDetail = useQuery({ queryKey: ['options', 'candidate', selectedCandidateId], queryFn: () => getOptionCandidate(selectedCandidateId!), enabled: (view === 'candidates' || view === 'opportunities') && selectedCandidateId != null })
   const recommendations = useQuery({ queryKey: ['options', 'recommendations', underlyer, signalStatus, recommendationOffset], queryFn: () => getOptionSignals({ underlyer: underlyer === 'ALL' ? undefined : underlyer, status: signalStatus === 'ALL' ? undefined : signalStatus, limit: 100, offset: recommendationOffset }), enabled: view === 'recommendations' })
-  const performance = useQuery({ queryKey: ['options', 'performance', underlyer, performanceCohort, performanceDays, performanceOffset], queryFn: () => getOptionPerformance({ underlyer: underlyer === 'ALL' ? undefined : underlyer, cohort: performanceCohort, days: performanceDays, limit: 100, offset: performanceOffset }), enabled: view === 'performance', refetchInterval: 60_000 })
+  const performance = useQuery({ queryKey: ['options', 'performance', underlyer, opportunityStrategy, expiration, performanceOffset], queryFn: () => getOptionPerformance({ underlyer: underlyer === 'ALL' ? undefined : underlyer, strategy: opportunityStrategy === 'ALL' ? undefined : opportunityStrategy, expiration: expiration || undefined, cohort: 'OPPORTUNITY_BOARD', days: 60, limit: 20, offset: performanceOffset }), enabled: view === 'performance', refetchInterval: 60_000 })
   const members = universe.data?.data || [{ ticker: 'SPY', asset_type: 'ETF' as const }]
   const opportunityStrategies = Array.from(new Map((opportunities.data?.data.structured || []).map(row => [row.strategy_name, row.display_name])).entries()).map(([value, label]) => ({ value, label })).sort((left, right) => left.label.localeCompare(right.label))
   const loading = health.isLoading || universe.isLoading || (view === 'opportunities' && opportunities.isLoading) || ((view === 'research' || view === 'explorer') && chain.isLoading) || (view === 'research' && analysis.isLoading) || (view === 'candidates' && candidates.isLoading) || (view === 'recommendations' && recommendations.isLoading) || (view === 'performance' && performance.isLoading) || (view === 'operations' && section === 'quality' && quality.isLoading)
@@ -700,11 +898,11 @@ export default function OptionsResearchWorkspace() {
     {(view === 'research' || view === 'explorer') && <EvidenceBar view={view} lens={lens} members={members} underlyer={underlyer} expiration={expiration} contractType={contractType} onUnderlyer={changeUnderlyer} onLens={changeLens} onExpiration={value => updateSearch({ expiration: value, offset: null })} onContractType={value => updateSearch({ type: value === 'ALL' ? null : value, offset: null })} />}
     {view === 'candidates' && <CandidateCommandBar members={members} underlyer={underlyer} persona={candidatePersona} status={candidateStatus} onUnderlyer={value => updateSearch({ underlyer: value === 'ALL' ? null : value, candidate: null, offset: null })} onPersona={value => updateSearch({ persona: value, candidate: null, offset: null })} onStatus={value => updateSearch({ status: value, candidate: null, offset: null })} />}
     {view === 'recommendations' && <RecommendationCommandBar members={members} underlyer={underlyer} status={signalStatus} onUnderlyer={value => updateSearch({ underlyer: value === 'ALL' ? null : value, offset: null })} onStatus={value => updateSearch({ signal_status: value === 'ALL' ? null : value, offset: null })} />}
-    {view === 'performance' && <PerformanceCommandBar members={members} underlyer={underlyer} cohort={performanceCohort} days={performanceDays} onUnderlyer={value => updateSearch({ underlyer: value === 'ALL' ? null : value, offset: null })} onCohort={value => updateSearch({ cohort: value === 'OPPORTUNITY_BOARD' ? null : value, offset: null })} onDays={value => updateSearch({ days: String(value), offset: null })} />}
+    {view === 'performance' && <PerformanceCommandBar members={members} strategies={opportunityStrategies} underlyer={underlyer} strategy={opportunityStrategy} expiration={expiration} onUnderlyer={value => updateSearch({ underlyer: value === 'ALL' ? null : value, offset: null })} onStrategy={value => updateSearch({ strategy: value === 'ALL' ? null : value, offset: null })} onExpiration={value => updateSearch({ expiration: value || null, offset: null })} />}
     {loading && <StatePanel title="Loading durable option evidence" detail="Reading the latest causally visible PostgreSQL records." />}
     {errored && <StatePanel title="Options API unavailable" detail="The portal could not read the options service. Existing equity pages remain available." warning />}
     {!loading && !errored && view === 'opportunities' && <OpportunityBoard envelope={opportunities.data} history={opportunityHistory.data} historyLoading={opportunityHistory.isLoading} historyError={opportunityHistory.isError} strategy={opportunityStrategy} onSelect={candidateId => updateSearch({ candidate: candidateId })} onOpenHistory={() => navigate('/options/performance')} onTicker={ticker => navigate(`/ticker/${ticker}`)} />}
-    {!loading && !errored && view === 'research' && <ResearchWorkbench lens={lens} chain={chain.data} analysis={analysis.data} onSelect={setSelectedRow} onExplore={() => navigate(`/options/explorer/${underlyer}${expiration ? `?expiration=${expiration}` : ''}`)} />}
+    {!loading && !errored && view === 'research' && <ResearchWorkbench lens={lens} chain={chain.data} analysis={analysis.data} gamma={gamma.data} underlyer={underlyer} onSelect={setSelectedRow} onExplore={() => navigate(`/options/explorer/${underlyer}${expiration ? `?expiration=${expiration}` : ''}`)} />}
     {!loading && !errored && view === 'candidates' && <CandidateWorkbench envelope={candidates.data} persona={candidatePersona} status={candidateStatus} onOffsetChange={value => updateSearch({ offset: value > 0 ? String(value) : null, candidate: null })} onSelect={candidateId => updateSearch({ candidate: candidateId })} />}
     {!loading && !errored && view === 'recommendations' && <RecommendationWorkbench envelope={recommendations.data} onOffsetChange={value => updateSearch({ offset: value > 0 ? String(value) : null })} />}
     {!loading && !errored && view === 'performance' && <PerformanceWorkbench envelope={performance.data} onOffsetChange={value => updateSearch({ offset: value > 0 ? String(value) : null })} />}

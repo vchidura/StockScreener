@@ -61,6 +61,82 @@ class OptionOutcomeRepository(PostgresRepository):
             )
             return len(inserted)
 
+    def persist_current_marks(
+        self,
+        outcomes: Sequence[OptionDecayOutcome],
+    ) -> int:
+        if not outcomes:
+            return 0
+        with self._cursor() as cursor:
+            execute_values(
+                cursor,
+                """
+                INSERT INTO option_signal_current_marks (
+                    candidate_id, event_id, market_time, observed_time, mark,
+                    net_return, availability_flag, quality_flags, entry_net_premium,
+                    exit_net_premium, gross_pnl, estimated_cost, net_pnl,
+                    capital_at_risk, valuation_policy_version,
+                    valuation_policy_sha256, source_snapshot_ids, source_batch_id
+                ) VALUES %s
+                ON CONFLICT (candidate_id, valuation_policy_sha256) DO UPDATE SET
+                    event_id = EXCLUDED.event_id,
+                    market_time = EXCLUDED.market_time,
+                    observed_time = EXCLUDED.observed_time,
+                    mark = EXCLUDED.mark,
+                    net_return = EXCLUDED.net_return,
+                    availability_flag = EXCLUDED.availability_flag,
+                    quality_flags = EXCLUDED.quality_flags,
+                    entry_net_premium = EXCLUDED.entry_net_premium,
+                    exit_net_premium = EXCLUDED.exit_net_premium,
+                    gross_pnl = EXCLUDED.gross_pnl,
+                    estimated_cost = EXCLUDED.estimated_cost,
+                    net_pnl = EXCLUDED.net_pnl,
+                    capital_at_risk = EXCLUDED.capital_at_risk,
+                    valuation_policy_version = EXCLUDED.valuation_policy_version,
+                    source_snapshot_ids = EXCLUDED.source_snapshot_ids,
+                    source_batch_id = EXCLUDED.source_batch_id,
+                    updated_at = NOW()
+                WHERE option_signal_current_marks.market_time < EXCLUDED.market_time
+                   OR (
+                       option_signal_current_marks.market_time = EXCLUDED.market_time
+                       AND option_signal_current_marks.observed_time < EXCLUDED.observed_time
+                   )
+                """,
+                [
+                    (
+                        row.candidate_id, row.event_id, row.market_time,
+                        row.observed_time, row.exit_net_premium, row.net_return,
+                        row.availability_flag, list(row.quality_flags),
+                        row.entry_net_premium, row.exit_net_premium, row.gross_pnl,
+                        row.estimated_cost, row.net_pnl, row.capital_at_risk,
+                        row.valuation_policy_version, row.valuation_policy_sha256,
+                        list(row.source_snapshot_ids), row.source_batch_id,
+                    )
+                    for row in outcomes
+                ],
+            )
+            return cursor.rowcount
+
+    def current_marks_available(self) -> bool:
+        with self._cursor() as cursor:
+            cursor.execute(
+                "SELECT to_regclass('public.option_signal_current_marks') IS NOT NULL AS ready"
+            )
+            row = cursor.fetchone()
+        return bool(row and row["ready"])
+
+    def delete_non_causal_current_marks(self) -> int:
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM option_signal_current_marks AS current_mark
+                USING option_strategy_candidates AS candidate
+                WHERE candidate.candidate_id = current_mark.candidate_id
+                  AND current_mark.market_time <= candidate.market_data_time
+                """
+            )
+            return cursor.rowcount
+
     def retained_leg_bounds(
         self,
         underlyer: str,
@@ -145,6 +221,52 @@ class OptionOutcomeRepository(PostgresRepository):
             )
             return tuple(dict(row) for row in cursor.fetchall())
 
+    def list_current_candidates(
+        self,
+        *,
+        valuation_policy_sha256: str,
+        available_by,
+        retention_days: int = OPTION_OUTCOME_RETENTION_DAYS,
+        limit: int = 1000,
+    ) -> tuple[dict[str, Any], ...]:
+        if retention_days <= 0 or limit <= 0:
+            raise ValueError("retention_days and limit must be positive")
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT candidate.candidate_id, signal.event_id,
+                       candidate.market_data_time, candidate.capital_at_risk
+                FROM option_strategy_candidates AS candidate
+                LEFT JOIN option_signal_occurrences AS signal_occurrence
+                  ON signal_occurrence.source_candidate_id = candidate.candidate_id
+                LEFT JOIN option_signal_events AS signal
+                  ON signal.event_id = signal_occurrence.event_id
+                                LEFT JOIN option_signal_current_marks AS current_mark
+                                    ON current_mark.candidate_id = candidate.candidate_id
+                                 AND current_mark.valuation_policy_sha256 = %s
+                WHERE candidate.status = 'SELECTED'
+                  AND candidate.candidate_kind IN ('SINGLE_CONTRACT', 'MULTI_LEG')
+                  AND candidate.capital_at_risk > 0
+                  AND candidate.market_data_time <= %s
+                  AND candidate.market_data_time > %s - (%s * INTERVAL '1 day')
+                  AND EXISTS (
+                      SELECT 1 FROM option_candidate_legs AS leg
+                      WHERE leg.candidate_id = candidate.candidate_id
+                        AND leg.expiration_date >=
+                            (%s AT TIME ZONE 'America/New_York')::DATE
+                  )
+                ORDER BY current_mark.candidate_id IS NULL DESC,
+                         current_mark.market_time NULLS FIRST,
+                         candidate.market_data_time, candidate.candidate_id
+                LIMIT %s
+                """,
+                (
+                    valuation_policy_sha256, available_by, available_by,
+                    retention_days, available_by, limit,
+                ),
+            )
+            return tuple(dict(row) for row in cursor.fetchall())
+
     def checkpoint_legs(
         self,
         candidate_id: UUID,
@@ -210,6 +332,68 @@ class OptionOutcomeRepository(PostgresRepository):
                 exit_mark=Decimal(row["exit_mark"]),
                 source_snapshot_id=row["snapshot_id"],
                 source_batch_id=row["batch_id"],
+                source_market_time=row["mark_market_data_time"],
+                source_observed_time=row["first_observed_at"],
+            )
+            for row in rows
+        )
+
+    def current_mark_legs(
+        self,
+        candidate_id: UUID,
+        *,
+        available_by,
+    ) -> tuple[OptionOutcomeLeg, ...]:
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                WITH candidate_legs AS (
+                    SELECT leg.candidate_id, leg.contract_id, leg.side, leg.ratio,
+                           leg.multiplier, leg.model_mark AS entry_mark,
+                           candidate.market_data_time AS entry_market_time
+                    FROM option_candidate_legs AS leg
+                    JOIN option_strategy_candidates AS candidate
+                      ON candidate.candidate_id = leg.candidate_id
+                    WHERE leg.candidate_id = %s
+                ), latest_batch AS (
+                    SELECT snapshot.batch_id,
+                           MAX(snapshot.mark_market_data_time) AS market_time,
+                           MAX(snapshot.first_observed_at) AS observed_time
+                    FROM option_chain_snapshots AS snapshot
+                    JOIN candidate_legs AS leg USING (contract_id)
+                    WHERE snapshot.model_mark IS NOT NULL
+                      AND snapshot.first_observed_at <= %s
+                      AND snapshot.mark_market_data_time > leg.entry_market_time
+                    GROUP BY snapshot.batch_id
+                    HAVING COUNT(DISTINCT snapshot.contract_id) =
+                           (SELECT COUNT(*) FROM candidate_legs)
+                    ORDER BY market_time DESC, observed_time DESC, snapshot.batch_id DESC
+                    LIMIT 1
+                )
+                SELECT DISTINCT ON (leg.contract_id)
+                       leg.contract_id, leg.side, leg.ratio, leg.multiplier,
+                       leg.entry_mark, snapshot.model_mark AS exit_mark,
+                       snapshot.snapshot_id, snapshot.batch_id,
+                       snapshot.mark_market_data_time, snapshot.first_observed_at,
+                       snapshot.revision
+                FROM candidate_legs AS leg
+                JOIN option_chain_snapshots AS snapshot USING (contract_id)
+                JOIN latest_batch AS batch USING (batch_id)
+                WHERE snapshot.first_observed_at <= %s
+                ORDER BY leg.contract_id, snapshot.first_observed_at DESC,
+                         snapshot.revision DESC, snapshot.snapshot_id
+                """,
+                (candidate_id, available_by, available_by),
+            )
+            rows = cursor.fetchall()
+        return tuple(
+            OptionOutcomeLeg(
+                contract_id=int(row["contract_id"]),
+                side=OptionSide(row["side"]), ratio=int(row["ratio"]),
+                multiplier=int(row["multiplier"]),
+                entry_mark=Decimal(row["entry_mark"]),
+                exit_mark=Decimal(row["exit_mark"]),
+                source_snapshot_id=row["snapshot_id"], source_batch_id=row["batch_id"],
                 source_market_time=row["mark_market_data_time"],
                 source_observed_time=row["first_observed_at"],
             )
