@@ -1,0 +1,872 @@
+.ticker-workspace {
+  padding: 12px 14px 24px;
+}
+
+.ticker-tabs {
+  display: flex;
+  gap: 2px;
+  margin-bottom: 12px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--tm-line);
+}
+
+.ticker-tabs a {
+  flex: 0 0 auto;
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 14px;
+  color: var(--tm-muted);
+  border-bottom: 2px solid transparent;
+  font-size: 12.5px;
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.ticker-tabs a:hover {
+  color: var(--tm-ink);
+}
+
+.ticker-tabs a.is-active {
+  color: var(--tm-ink-strong);
+  border-bottom-color: var(--tm-accent);
+}
+
+.ticker-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+}
+
+.ticker-body--with-rail {
+  grid-template-columns: minmax(0, 1fr) 268px;
+}
+
+.ticker-main {
+  min-width: 0;
+}
+
+/* Ticker view panels */
+.tk-views {
+  display: grid;
+  gap: 12px;
+}
+
+/* Levels and Fibonacci pair the chart with the ladder, which is itself a price axis. */
+@media (min-width: 1200px) {
+  .tk-views--split {
+    grid-template-columns: minmax(0, 1fr) 460px;
+    align-items: start;
+  }
+}
+
+.tk-chart-shell.is-collapsed {
+  height: 0;
+  overflow: hidden;
+}
+
+.tk-toggle {
+  min-height: 28px;
+  padding: 4px 10px;
+  color: var(--tm-muted);
+  background: var(--tm-surface);
+  border: 1px solid var(--tm-line);
+  border-radius: 5px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.tk-toggle:hover {
+  color: var(--tm-ink);
+  border-color: var(--tm-line-strong);
+}
+
+.tk-panel {
+  background: var(--tm-surface);
+  border: 1px solid var(--tm-line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.tk-panel__bar,
+.tk-analysis-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-height: 44px;
+  padding: 7px 10px;
+  background: var(--tm-surface-sunken);
+  border-bottom: 1px solid var(--tm-line);
+}
+
+.tk-panel__body {
+  padding: 12px;
+}
+
+.tk-chart {
+  position: relative;
+}
+
+.tk-segment {
+  display: inline-flex;
+}
+
+.tk-segment button {
+  min-height: 28px;
+  padding: 4px 9px;
+  color: var(--tm-muted);
+  background: var(--tm-surface);
+  border: 1px solid var(--tm-line);
+  border-right: 0;
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+
+.tk-segment button:first-child {
+  border-radius: 5px 0 0 5px;
+}
+
+.tk-segment button:last-child {
+  border-right: 1px solid var(--tm-line);
+  border-radius: 0 5px 5px 0;
+}
+
+.tk-segment button:hover {
+  color: var(--tm-ink);
+}
+
+.tk-segment button.is-active {
+  color: var(--tm-on-accent);
+  background: var(--tm-accent);
+  border-color: var(--tm-accent);
+}
+
+.tk-select {
+  min-height: 28px;
+  padding: 4px 8px;
+  color: var(--tm-ink);
+  background: var(--tm-surface);
+  border: 1px solid var(--tm-line);
+  border-radius: 5px;
+  font: inherit;
+  font-size: 11.5px;
+}
+
+.tk-action {
+  min-height: 28px;
+  padding: 4px 12px;
+  color: var(--tm-on-accent);
+  background: var(--tm-accent);
+  border: 0;
+  border-radius: 5px;
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.tk-action:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.tk-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin-left: auto;
+}
+
+.tk-stats > div {
+  display: grid;
+  gap: 1px;
+  text-align: right;
+}
+
+.tk-stats span {
+  color: var(--tm-faint);
+  font-size: 8.5px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.tk-stats strong {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tk-field {
+  display: grid;
+  gap: 3px;
+}
+
+.tk-field > span {
+  color: var(--tm-faint);
+  font-size: 8.5px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.tk-analysis-meta {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.tk-analysis-meta span {
+  color: var(--tm-muted);
+  font-size: 10.5px;
+}
+
+.tk-analysis-bar > :last-child {
+  margin-left: auto;
+}
+
+/* Hairline metric grid: the 1px gap over a line-coloured background draws the dividers. */
+.tk-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 1px;
+  margin-bottom: 12px;
+  background: var(--tm-line);
+  border: 1px solid var(--tm-line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+/* Entity rail */
+.ticker-entity {
+  align-self: start;
+  background: var(--tm-surface);
+  border: 1px solid var(--tm-line);
+  border-radius: 8px;
+}
+
+.ticker-entity__head {
+  display: grid;
+  gap: 2px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--tm-line);
+}
+
+.ticker-entity__head strong {
+  font-size: 13px;
+  line-height: 1.3;
+}
+
+.ticker-entity__head span {
+  color: var(--tm-faint);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.ticker-entity__rows {
+  margin: 0;
+  padding: 6px 13px 10px;
+}
+
+.ticker-entity__rows > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--tm-line);
+}
+
+.ticker-entity__rows > div:last-child {
+  border-bottom: 0;
+}
+
+.ticker-entity__rows dt {
+  color: var(--tm-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.ticker-entity__rows dd {
+  margin: 0;
+  color: var(--tm-ink);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.ticker-entity__empty,
+.ticker-panel__empty {
+  margin: 0;
+  padding: 14px 13px;
+  color: var(--tm-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ticker-entity__note {
+  padding: 10px 13px;
+  color: var(--tm-faint);
+  border-top: 1px solid var(--tm-line);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+/* Financials */
+.ticker-panel {
+  margin-top: 14px;
+  background: var(--tm-surface);
+  border: 1px solid var(--tm-line);
+  border-radius: 8px;
+}
+
+.ticker-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--tm-line);
+}
+
+.ticker-panel__head h2 {
+  margin: 0 0 2px;
+  font-size: 14px;
+}
+
+.ticker-panel__head p {
+  margin: 0;
+  color: var(--tm-muted);
+  font-size: 11px;
+}
+
+.ticker-panel__count {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  color: var(--tm-muted);
+  border: 1px solid var(--tm-line-strong);
+  border-radius: 99px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.ticker-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.ticker-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+
+.ticker-table th {
+  height: 32px;
+  padding: 6px 10px;
+  color: var(--tm-muted);
+  background: var(--tm-surface-sunken);
+  border-bottom: 1px solid var(--tm-line);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.ticker-table td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--tm-line);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ticker-table tbody tr:hover {
+  background: var(--tm-surface-raised);
+}
+
+.ticker-table .is-strong {
+  font-weight: 700;
+}
+
+.ticker-table__note {
+  display: block;
+  color: var(--tm-faint);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+/* Price ladder */
+.tk-ladder {
+  position: relative;
+  border: 1px solid var(--tm-line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+/* The rail sits under the price column and reads as a continuous axis. */
+.tk-ladder::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 116px;
+  width: 1px;
+  background: var(--tm-line);
+}
+
+.tk-ladder__row {
+  display: grid;
+  grid-template-columns: 116px minmax(0, 1fr);
+  gap: 12px;
+  width: 100%;
+  padding: 8px 10px 8px 0;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--tm-line);
+  font: inherit;
+  text-align: left;
+}
+
+.tk-ladder__row.is-clickable {
+  cursor: pointer;
+}
+
+.tk-ladder__row.is-clickable:hover {
+  background: var(--tm-surface-raised);
+}
+
+.tk-ladder__row.is-selected {
+  background: var(--tm-accent-soft);
+  box-shadow: inset 3px 0 0 var(--tm-accent);
+}
+
+.tk-ladder__row:last-child {
+  border-bottom: 0;
+}
+
+.tk-ladder__row.is-emphasis {
+  background: var(--tm-warn-soft);
+}
+
+.tk-ladder__price {
+  display: grid;
+  gap: 1px;
+  padding-right: 12px;
+  text-align: right;
+}
+
+.tk-ladder__price strong {
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.tk-ladder__price span {
+  color: var(--tm-faint);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.tk-ladder__body {
+  min-width: 0;
+}
+
+.tk-ladder__title {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.tk-ladder__title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tk-ladder__selected-label {
+  flex: none;
+  padding: 1px 5px;
+  color: var(--tm-accent);
+  border: 1px solid var(--tm-accent);
+  border-radius: 3px;
+  font-size: 8.5px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.tk-ladder__detail {
+  margin-top: 2px;
+  color: var(--tm-muted);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.tk-ladder__note {
+  margin-top: 3px;
+  color: var(--tm-faint);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.tk-ladder__badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.tk-ladder__badges span {
+  padding: 1px 5px;
+  border: 1px solid;
+  border-radius: 3px;
+  font-size: 8.5px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.tk-ladder__marker {
+  position: relative;
+  z-index: 1;
+  padding: 5px 10px;
+  background: var(--tm-accent-soft);
+  border-top: 1px solid var(--tm-accent);
+  border-bottom: 1px solid var(--tm-accent);
+  color: var(--tm-accent);
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.tk-ladder__empty {
+  margin: 0;
+  padding: 14px 12px;
+  color: var(--tm-muted);
+  font-size: 12px;
+}
+
+.tk-subpanel {
+  margin-bottom: 12px;
+  border: 1px solid var(--tm-line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.tk-subpanel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 7px 10px;
+  background: var(--tm-surface-sunken);
+  border-bottom: 1px solid var(--tm-line);
+}
+
+.tk-subpanel__head strong {
+  font-size: 12px;
+}
+
+.tk-subpanel__head span {
+  color: var(--tm-muted);
+  font-size: 10.5px;
+}
+
+.tk-subpanel__head > div:first-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.tk-structure-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.tk-structure-card {
+  min-width: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--tm-line);
+}
+
+.tk-structure-card:last-child {
+  border-bottom: 0;
+}
+
+.tk-structure-card__head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 5px;
+}
+
+.tk-level-selection {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin-left: auto;
+}
+
+.tk-level-selection > span {
+  overflow: hidden;
+  color: var(--tm-accent);
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tk-level-selection > button {
+  display: grid;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  padding: 0;
+  color: var(--tm-muted);
+  background: var(--tm-surface);
+  border: 1px solid var(--tm-line-strong);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.tk-level-selection > button:hover {
+  color: var(--tm-ink);
+  border-color: var(--tm-accent);
+}
+
+/* Cross-timeframe matrix */
+.tk-agreement {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  background: var(--tm-surface-sunken);
+  border: 1px solid var(--tm-line);
+  border-radius: 6px;
+}
+
+.tk-agreement__bar {
+  display: flex;
+  width: 160px;
+  height: 8px;
+  overflow: hidden;
+  background: var(--tm-line);
+  border-radius: 99px;
+}
+
+.tk-agreement__bar span {
+  display: block;
+  height: 100%;
+}
+
+.tk-agreement strong {
+  font-size: 12px;
+}
+
+.tk-agreement small {
+  color: var(--tm-muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.tk-matrix-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--tm-line);
+  border-radius: 6px;
+}
+
+.tk-matrix {
+  width: 100%;
+  min-width: 1080px;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 11.5px;
+}
+
+.tk-matrix thead th {
+  padding: 7px 9px;
+  color: var(--tm-muted);
+  background: var(--tm-surface-sunken);
+  border-bottom: 1px solid var(--tm-line);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.tk-matrix td {
+  padding: 9px;
+  background: var(--tm-surface);
+  border-bottom: 1px solid var(--tm-line);
+  vertical-align: top;
+}
+
+.tk-matrix tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+/* The interval column stays readable while the evidence columns scroll under it. */
+.tk-matrix__tf {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  border-right: 1px solid var(--tm-line);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.tk-matrix thead .tk-matrix__tf {
+  z-index: 3;
+}
+
+.tk-matrix td.tk-matrix__tf span {
+  display: block;
+  color: var(--tm-faint);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.tk-matrix tr.is-primary td {
+  background: var(--tm-accent-soft);
+}
+
+/* Scanner ledger */
+.tk-ledger-summary__counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1px;
+  background: var(--tm-line);
+  border: 1px solid var(--tm-line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.tk-ledger-summary__counts > div {
+  flex: 1 1 120px;
+  display: grid;
+  gap: 1px;
+  padding: 8px 10px;
+  background: var(--tm-surface);
+}
+
+.tk-ledger-summary__counts span {
+  color: var(--tm-faint);
+  font-size: 8.5px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.tk-ledger-summary__counts strong {
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tk-ledger-summary p {
+  margin: 8px 0 12px;
+  color: var(--tm-muted);
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+
+.tk-ledger-summary a {
+  color: var(--tm-accent);
+  font-weight: 700;
+}
+
+.tk-matrix--ledger {
+  min-width: 920px;
+}
+
+.tk-matrix th.is-num,
+.tk-matrix td.is-num {
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.tk-matrix tbody tr.is-clickable {
+  cursor: pointer;
+}
+
+.tk-matrix tbody tr.is-clickable:hover td {
+  background: var(--tm-surface-raised);
+}
+
+.tk-matrix tbody tr.is-detail td {
+  background: var(--tm-surface-sunken);
+}
+
+.tk-detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 6px;
+  color: var(--tm-muted);
+  font-size: 10.5px;
+}
+
+.tk-detail-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10.5px;
+}
+
+.tk-detail-table th {
+  padding: 3px 6px;
+  color: var(--tm-faint);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.tk-detail-table td {
+  padding: 3px 6px;
+  border-top: 1px solid var(--tm-line);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 1100px) {
+  .ticker-body--with-rail {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 760px) {
+  .ticker-workspace {
+    padding: 8px 8px 20px;
+    /* Tables and the chart keep their own scrollers; the page itself must not scroll sideways. */
+    overflow-x: hidden;
+  }
+}

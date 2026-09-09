@@ -1,8 +1,11 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-query'
-import { scanMomentumPullback, MomentumPullbackScanResponse, getLatestPriceDate } from '../services/api'
-import StreakPanel from '../components/StreakPanel'
+import { scanMomentumPullback, MomentumPullbackScanResponse } from '../services/api'
+import { ScanInterval, SCAN_INTERVALS, intervalSemantics, isPublishedSnapshot } from './strategyShared'
+import { usePublishPageContext } from '../layout/pageContext'
+import { useSessionDate } from '../layout/sessionDate'
+import { CommandBar, CommandGroup, CommandSpacer } from '../layout/PageChrome'
 
 const STRATEGY_TOOLTIP =
   'Finds stocks in strong uptrends with optimal pullback entries. Trade WITH the trend, enter ON the pullback.\n\n' +
@@ -24,9 +27,9 @@ const PILLAR_TOOLTIPS = {
 const GRADE_COLORS: Record<string, { bg: string; text: string }> = {
   'A+': { bg: '#00c853', text: '#fff' },
   'A':  { bg: '#4caf50', text: '#fff' },
-  'B+': { bg: '#ff9800', text: '#fff' },
+  'B+': { bg: '#ff9800', text: '#1a1200' },
   'B':  { bg: '#ffc107', text: '#000' },
-  'C':  { bg: '#9e9e9e', text: '#fff' },
+  'C':  { bg: '#9e9e9e', text: '#14181c' },
 }
 
 const InfoIcon = ({ tooltip }: { tooltip: string }) => (
@@ -63,10 +66,8 @@ function MomentumPullback() {
   const [gradeFilter, setGradeFilter] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('score')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
-  const [scanDate, setScanDate] = useState('')
-  const [latestDate, setLatestDate] = useState('')
-  const [interval, setInterval] = useState<'5m' | '15m' | '30m' | '1h' | '1d'>('1d')
-
+  const { pinned: scanDate } = useSessionDate()
+  const [interval, setInterval] = useState<ScanInterval>('1d')
   const { data, isFetching: loading } = useQuery<MomentumPullbackScanResponse>({
     queryKey: ['scan', 'momentum-pullback', interval, scanDate],
     queryFn: () => scanMomentumPullback(undefined, scanDate || undefined, interval),
@@ -78,8 +79,6 @@ function MomentumPullback() {
     queryClient.setQueryData(key, undefined)
     await queryClient.fetchQuery({ queryKey: key, queryFn: () => scanMomentumPullback(undefined, scanDate || undefined, interval, true) })
   }, [interval, scanDate, queryClient])
-
-  useEffect(() => { getLatestPriceDate().then(setLatestDate).catch(() => {}) }, [])
 
   const filtered = useMemo(() => {
     if (!data?.results) return []
@@ -121,68 +120,75 @@ function MomentumPullback() {
     </span>
   )
 
+  const semantics = intervalSemantics(interval)
+  const published = isPublishedSnapshot(interval, scanDate)
+
+  usePublishPageContext({
+    eyebrow: 'Trend strategy · long setups',
+    title: 'Momentum Pullback',
+    detail: STRATEGY_TOOLTIP.split('\n')[0],
+    status: [
+      { label: 'Interval', value: interval },
+    ],
+    session: interval,
+  })
+
+  /** Renders a pass/fail mark, or a neutral dash when the test never ran. */
+  const gateMark = (ok: boolean, evaluated: boolean, why: string) =>
+    evaluated ? checkMark(ok) : (
+      <span style={{ color: 'var(--tm-faint)', fontWeight: 700 }} title={why}>–</span>
+    )
+
   return (
     <div>
-      {/* Header */}
-      <div className="card-header" style={{ border: 'none', padding: 0, marginBottom: '1.5rem' }}>
-        <div>
-          <h1 style={{ fontSize: '1.75rem', fontWeight: 700 }}>
-            📈 Momentum Pullback
-            <InfoIcon tooltip={STRATEGY_TOOLTIP} />
-          </h1>
-          <p style={{ margin: '0.25rem 0 0', color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
-            Finds elite stocks in strong uptrends with optimal pullback entry opportunities.
-          </p>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-            <label style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Scan Date:</label>
-            <input
-              type="date"
-              value={scanDate || latestDate}
-              onChange={(e) => { setScanDate(e.target.value); }}
-              style={{ padding: '0.35rem 0.5rem', borderRadius: '6px', border: '1px solid var(--border)', fontSize: '0.85rem' }}
-            />
-            {scanDate && (
-              <button
-                className="btn btn-secondary"
-                onClick={() => setScanDate('')}
-                style={{ padding: '0.25rem 0.5rem', fontSize: '0.8rem' }}
-                title="Reset to latest"
-              >
-                ✕
-              </button>
-            )}
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
-            <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Interval:</label>
-            {(['5m', '15m', '30m', '1h', '1d'] as const).map((iv) => (
-              <button
-                key={iv}
-                onClick={() => { setInterval(iv); }}
-                style={{
-                  padding: '0.25rem 0.5rem',
-                  fontSize: '0.78rem',
-                  borderRadius: '4px',
-                  border: interval === iv ? '2px solid var(--primary-color)' : '1px solid var(--border)',
-                  background: interval === iv ? 'var(--primary-color)' : 'transparent',
-                  color: interval === iv ? '#fff' : 'var(--text-secondary)',
-                  cursor: 'pointer',
-                  fontWeight: interval === iv ? 600 : 400,
-                }}
-                title={iv === '1d' ? 'Daily candles' : iv === '1h' ? 'Hourly candles' : `${iv} candles (intraday)`}
-              >
-                {iv}
-              </button>
-            ))}
-          </div>
-          <button className="btn btn-primary" onClick={handleRefresh} disabled={loading}>
-            {loading ? 'Scanning...' : 'Refresh'}
-          </button>
-        </div>
-      </div>
+      <CommandBar>
+        <CommandGroup label="Interval">
+          {SCAN_INTERVALS.map((iv) => (
+            <button
+              key={iv}
+              type="button"
+              className={interval === iv ? 'is-active' : undefined}
+              onClick={() => setInterval(iv)}
+              title={intervalSemantics(iv).candle}
+            >
+              {iv}
+            </button>
+          ))}
+        </CommandGroup>
+        <CommandSpacer />
+        <span className="tm-commandbar__note">{filtered.length} of {data?.results.length ?? 0} matches</span>
+        <button type="button" className="tm-commandbar__action" onClick={handleRefresh} disabled={loading}>
+          {loading ? 'Scanning…' : 'Refresh'}
+        </button>
+      </CommandBar>
 
-      <StreakPanel strategy="momentum-pullback" />
+      {/* Provenance + interval semantics */}
+      <div
+        style={{
+          display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: '0.5rem',
+          margin: '0 0 1rem', padding: '0.6rem 0.75rem', borderRadius: '6px',
+          background: published ? 'var(--tm-accent-soft)' : 'var(--tm-warn-soft)',
+          border: `1px solid ${published ? 'var(--tm-accent)' : 'var(--tm-warn)'}`,
+          fontSize: '0.82rem',
+        }}
+      >
+        <strong style={{ color: published ? 'var(--tm-accent)' : 'var(--tm-warn)' }}>
+          {published ? 'Published daily snapshot' : 'Live scan'}
+        </strong>
+        <span style={{ color: 'var(--text-secondary)' }}>
+          {published
+            ? 'Precomputed nightly across the full universe on daily candles.'
+            : `Computed on request over the full universe using ${semantics.candle.toLowerCase()}.`}
+        </span>
+        <span style={{ color: 'var(--text-secondary)' }}>
+          Trend gate: {semantics.trendRule}.
+        </span>
+        {semantics.caveat && (
+          <span style={{ width: '100%', color: 'var(--tm-warn)', marginTop: '0.15rem' }}>
+            {semantics.caveat}
+          </span>
+        )}
+      </div>
 
       {/* Methodology card */}
       <div className="card" style={{ marginBottom: '1.5rem', background: 'var(--bg-secondary)', border: '1px solid var(--border)' }}>
@@ -200,12 +206,16 @@ function MomentumPullback() {
               {checkMark(true)} <strong>Daily Stack:</strong> EMA 8 {'>'} 21 {'>'} 34 {'>'} 55 {'>'} 89
               <InfoIcon tooltip={PILLAR_TOOLTIPS.dailyStack} />
             </p>
-            <p style={{ fontSize: '0.85rem', margin: '0.25rem 0' }}>
-              {checkMark(true)} <strong>Weekly Stack:</strong> EMA 8 {'>'} 21 {'>'} 34
+            <p style={{ fontSize: '0.85rem', margin: '0.25rem 0', opacity: semantics.higherTfLabel ? 1 : 0.55 }}>
+              {gateMark(true, !!semantics.higherTfLabel, 'Not evaluated at this interval')}{' '}
+              <strong>Higher timeframe:</strong>{' '}
+              {semantics.higherTfLabel ?? 'not evaluated at this interval'}
               <InfoIcon tooltip={PILLAR_TOOLTIPS.weeklyStack} />
             </p>
-            <p style={{ fontSize: '0.85rem', margin: '0.25rem 0' }}>
-              {checkMark(true)} <strong>SMA 200:</strong> Price above 200-day MA
+            <p style={{ fontSize: '0.85rem', margin: '0.25rem 0', opacity: semantics.baselineLabel ? 1 : 0.55 }}>
+              {gateMark(true, !!semantics.baselineLabel, 'Not evaluated at this interval')}{' '}
+              <strong>Baseline:</strong>{' '}
+              {semantics.baselineLabel ? `Price above the ${semantics.baselineLabel}` : 'not evaluated at this interval'}
               <InfoIcon tooltip={PILLAR_TOOLTIPS.sma200} />
             </p>
           </div>
@@ -220,7 +230,7 @@ function MomentumPullback() {
               <InfoIcon tooltip={PILLAR_TOOLTIPS.adx} />
             </p>
             <p style={{ fontSize: '0.85rem', margin: '0.25rem 0' }}>
-              <span style={{ color: '#ff9800', fontWeight: 700 }}>!</span> <strong>Rubber Band:</strong> Within 1 ATR of EMA 21
+              <span style={{ color: 'var(--tm-warn)', fontWeight: 700 }}>!</span> <strong>Rubber Band:</strong> Within 1 ATR of EMA 21
               <InfoIcon tooltip={PILLAR_TOOLTIPS.rubberBand} />
             </p>
           </div>
@@ -286,7 +296,13 @@ function MomentumPullback() {
                     <span style={{ whiteSpace: 'nowrap' }}>RSI{sortArrow('rsi')}<InfoIcon tooltip="Relative Strength Index (14-period). Below 30 = oversold, above 70 = overbought. In a momentum pullback context, RSI 30-50 confirms the pullback without breaking the trend." /></span>
                   </th>
                   <th onClick={() => handleSort('sma200')} style={thStyle('sma200', 'center')}>
-                    <span style={{ whiteSpace: 'nowrap' }}>{'>'}200 SMA{sortArrow('sma200')}<InfoIcon tooltip={PILLAR_TOOLTIPS.sma200} /></span>
+                    <span style={{ whiteSpace: 'nowrap', opacity: semantics.baselineLabel ? 1 : 0.55 }}>
+                      {semantics.baselineLabel ? `>${semantics.baselineLabel}` : '>SMA n/a'}
+                      {sortArrow('sma200')}
+                      <InfoIcon tooltip={semantics.baselineLabel
+                        ? PILLAR_TOOLTIPS.sma200
+                        : 'Not evaluated at this interval — the intraday scan skips the 200-period baseline entirely and tightens the EMA stack requirement instead.'} />
+                    </span>
                   </th>
                   <th onClick={() => handleSort('stoch_k')} style={thStyle('stoch_k', 'right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>Stoch %K{sortArrow('stoch_k')}<InfoIcon tooltip={PILLAR_TOOLTIPS.stochastic} /></span>
@@ -353,7 +369,7 @@ function MomentumPullback() {
                           {r.rsi.toFixed(1)}
                         </td>
                         <td style={{ textAlign: 'center' }}>
-                          {checkMark(r.above_sma200)}
+                          {gateMark(r.above_sma200, !!semantics.baselineLabel, 'Not evaluated at this interval')}
                           {r.sma200 != null && (
                             <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginLeft: '4px' }}>
                               ${r.sma200.toFixed(0)}

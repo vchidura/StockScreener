@@ -2,12 +2,46 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+import os
+from typing import Any
 
 import exchange_calendars
 import pandas as pd
 
 
 INTERVAL_MINUTES = {"5m": 5, "15m": 15, "30m": 30, "1h": 60}
+
+
+def max_serveable_stale_sessions() -> int:
+    return int(os.getenv("EQUITY_MAX_SERVEABLE_STALE_SESSIONS", "3"))
+
+
+def staleness_state(
+    market_time: datetime,
+    expected_market_time: datetime,
+    *,
+    is_fresh: bool,
+    max_stale_sessions: int | None = None,
+) -> dict[str, Any]:
+    """Classify a projection as READY, serveable STALE, or EXPIRED (fail closed)."""
+    limit = (
+        max_serveable_stale_sessions()
+        if max_stale_sessions is None
+        else max_stale_sessions
+    )
+    sessions = sessions_elapsed(market_time, expected_market_time)
+    if is_fresh:
+        status = "READY"
+    elif sessions <= limit:
+        status = "STALE"
+    else:
+        status = "EXPIRED"
+    return {
+        "status": status,
+        "is_serveable": status != "EXPIRED",
+        "staleness_sessions": sessions,
+        "max_serveable_stale_sessions": limit,
+    }
 
 
 def latest_expected_market_time(
@@ -56,6 +90,25 @@ def latest_expected_market_time(
     if interval == "1h" and now_utc >= session_close:
         return session_close
     return session_open + pd.Timedelta(minutes=completed_minutes).to_pytimedelta()
+
+
+def sessions_elapsed(
+    earlier: datetime,
+    later: datetime,
+    *,
+    calendar_name: str = "XNYS",
+) -> int:
+    """Count exchange sessions crossed between two market times."""
+    if earlier.tzinfo is None or later.tzinfo is None:
+        raise ValueError("market times must be timezone-aware")
+    if later <= earlier:
+        return 0
+    calendar = exchange_calendars.get_calendar(calendar_name)
+    sessions = calendar.sessions_in_range(
+        pd.Timestamp(earlier.astimezone(timezone.utc).date()),
+        pd.Timestamp(later.astimezone(timezone.utc).date()),
+    )
+    return max(0, len(sessions) - 1)
 
 
 def _completed_session_time(calendar, session: pd.Timestamp, interval: str) -> datetime:

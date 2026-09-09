@@ -1,11 +1,14 @@
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from auth.api import router as account_router
 from equity.api import (
     current_chart_bar_projection,
     current_pattern_watch_projection,
     current_trade_setup_projection,
+    current_trade_setup_projections,
     router as equity_materialization_router,
 )
+from equity.charting import fold_latest_session_bars
 from equity.technicals import (
     assess_momentum,
     compute_ema_confirmation,
@@ -34,6 +37,8 @@ from database import (
     get_stock_data,
     get_latest_price_date,
     get_latest_quote,
+    get_market_data_currency,
+    get_trading_sessions,
     require_canonical_schema,
     get_tickers_overview,
     get_bulk_price_data,
@@ -136,6 +141,8 @@ app.include_router(equity_materialization_router)
 
 app.include_router(options_router)
 
+app.include_router(account_router)
+
 # Thread pool for parallel scanning — sized to CPU cores
 # I/O-bound work (DB queries) benefits from 2× core count
 _num_workers = min(os.cpu_count() * 2, 32)
@@ -211,10 +218,13 @@ def _portal_snapshot_payload(snapshot_type: str):
             status_code=503,
             detail=f"Published {snapshot_type} portal snapshot is unavailable",
         )
-    if not projection["is_fresh"]:
+    if not projection["is_serveable"]:
         raise HTTPException(
             status_code=503,
-            detail=f"Published {snapshot_type} portal snapshot is stale",
+            detail=(
+                f"Published {snapshot_type} portal snapshot is stale beyond "
+                f"{projection['max_serveable_stale_sessions']} sessions"
+            ),
         )
     return projection["payload"]
 
@@ -716,6 +726,21 @@ async def latest_price_date(refresh: bool = False):
     return {"latest_date": get_latest_price_date()}
 
 
+@app.get("/api/trading-sessions")
+async def trading_sessions(
+    interval: str = Query(default="1d", pattern="^(5m|15m|30m|1h|1d)$"),
+    limit: int = Query(default=260, ge=1, le=2600),
+):
+    """Selectable scan sessions for an interval, oldest first, plus how current our bars are."""
+    currency = get_market_data_currency()
+    return {
+        "interval": interval,
+        "sessions": get_trading_sessions(interval, limit),
+        "data_as_of": currency["as_of"] if currency else None,
+        "data_interval": currency["interval"] if currency else None,
+    }
+
+
 @app.get("/api/stock/{ticker}/prices")
 async def get_ticker_prices(ticker: str, days: int = Query(default=365, ge=1, le=3650), refresh: bool = False):
     """Get historical price data for a ticker."""
@@ -747,6 +772,33 @@ async def get_ticker_quote(ticker: str, refresh: bool = False):
         raise HTTPException(status_code=404, detail=f"No price found for ticker {ticker}")
     _set_cached(cache_key, quote)
     return quote
+
+
+def _with_current_session_bars(ticker: str, interval: str, bars):
+    """Merge display-only session candles from fresh, finalized 5m bars."""
+    try:
+        source = current_chart_bar_projection(ticker, "5m", limit=78)
+        if source is None or not source["is_fresh"]:
+            return bars
+        folded = fold_latest_session_bars(
+            source["bars"],
+            target_interval=interval,
+            observed_at=datetime.now(timezone.utc),
+        )
+    except Exception:
+        logger.exception("5m display fold failed for %s %s chart", ticker, interval)
+        return bars
+    if not folded:
+        return bars
+    merged = {row["bar_start"]: row for row in folded}
+    merged.update({row["bar_start"]: row for row in bars})
+    appended = len(merged) - len(bars)
+    if appended:
+        logger.info(
+            "chart %s %s merged %s display candle(s) from finalized 5m bars",
+            ticker, interval, appended,
+        )
+    return tuple(merged[key] for key in sorted(merged))
 
 
 @app.get("/api/stock/{ticker}/chart")
@@ -794,30 +846,42 @@ async def get_chart_data(ticker: str, period: str = "1y", interval: str = "1d", 
         if projection is None and interval in ("1d", "1wk"):
             materialized_chart = False
             cache_key = f"{prefix}_{ticker.upper()}_{interval}_{period}_legacy"
-        elif projection is None or not projection["is_fresh"]:
+        elif projection is None or not projection["is_serveable"]:
             raise HTTPException(
                 status_code=503,
                 detail={
                     "code": "MATERIALIZED_CHART_BARS_UNAVAILABLE",
                     "interval": interval,
-                    "reason": "MISSING" if projection is None else "STALE",
+                    "reason": "MISSING" if projection is None else "EXPIRED",
                 },
             )
         if materialized_chart:
             bars = projection["bars"]
+            if interval in ("15m", "30m", "1h", "1d"):
+                bars = _with_current_session_bars(ticker, interval, bars)
             if bars:
                 cutoff = (
                     bars[-1]["bar_start"] - timedelta(days=requested_days)
                 ).replace(hour=0, minute=0, second=0, microsecond=0)
                 bars = tuple(row for row in bars if row["bar_start"] >= cutoff)
-            records = [{
-                "time": int(row["bar_start"].timestamp()),
-                "open": round(float(row["open_price"]), 2),
-                "high": round(float(row["high_price"]), 2),
-                "low": round(float(row["low_price"]), 2),
-                "close": round(float(row["close_price"]), 2),
-                "volume": int(row["volume"]),
-            } for row in bars]
+            records = []
+            for row in bars:
+                record = {
+                    "time": int(row["bar_start"].timestamp()),
+                    "open": round(float(row["open_price"]), 2),
+                    "high": round(float(row["high_price"]), 2),
+                    "low": round(float(row["low_price"]), 2),
+                    "close": round(float(row["close_price"]), 2),
+                    "volume": int(row["volume"]),
+                }
+                if row.get("derived"):
+                    record.update({
+                        "derived": True,
+                        "provisional": bool(row.get("provisional")),
+                        "source_interval": row.get("source_interval"),
+                        "available_through": int(row["bar_end"].timestamp()),
+                    })
+                records.append(record)
             return records
     df = download_historical_data(
         ticker.upper(),
@@ -879,12 +943,14 @@ def _pattern_reference_close(frame) -> float | None:
 
 def _materialized_pattern_report(interval: str, ticker: str | None = None) -> dict:
     report = current_pattern_watch_projection(interval, ticker=ticker)
-    if not report["is_fresh"]:
+    if not report["is_serveable"]:
         raise HTTPException(
             status_code=503,
             detail={
                 "code": "MATERIALIZED_PATTERN_WATCH_UNAVAILABLE",
                 "interval": interval,
+                "reason": "EXPIRED",
+                "staleness_sessions": report["staleness_sessions"],
                 "expected_market_time": report["expected_market_time"].isoformat(),
                 "market_times": [value.isoformat() for value in report["market_times"]],
             },
@@ -1794,6 +1860,86 @@ async def tickers_overview(scan_date: Optional[str] = None, refresh: bool = Fals
     results = await loop.run_in_executor(executor, get_tickers_overview, selected, scan_date)
     _set_cached(cache_key, results)
     return results
+
+
+SETUP_SUMMARY_INTERVALS = ("30m", "1h", "1d", "1wk", "1mo")
+
+
+def _setup_summary_row(row: dict) -> dict:
+    """Flatten one published setup payload into the columns the overview table reads."""
+    payload = row["payload"] or {}
+    technicals = payload.get("technicals") or {}
+    momentum = payload.get("momentum") or {}
+    direction = payload.get("direction") or {}
+    alignment = payload.get("ema_alignment") or {}
+    return {
+        "ticker": row["ticker"],
+        "trend": alignment.get("primary"),
+        "trend_detail": alignment.get("primary_detail"),
+        "confirm_trend": alignment.get("confirm"),
+        "confirm_interval": alignment.get("confirm_interval"),
+        "multi_tf_agree": alignment.get("multi_tf_agree"),
+        "momentum": momentum.get("state"),
+        "momentum_detail": momentum.get("detail"),
+        "bias": direction.get("bias"),
+        "conviction": direction.get("conviction"),
+        "bull_signals": direction.get("bull_signals"),
+        "bear_signals": direction.get("bear_signals"),
+        "rsi": technicals.get("rsi"),
+        "rsi_state": technicals.get("rsi_state"),
+        "stoch_k": technicals.get("stoch_k"),
+        "adx": technicals.get("adx"),
+        "macd_state": technicals.get("macd_state"),
+        "macd_histogram": technicals.get("macd_histogram"),
+        "trend_consistency": technicals.get("trend_consistency"),
+        "atr_pct": technicals.get("atr_pct"),
+        "relative_volume": technicals.get("relative_volume"),
+        "volume_trend_state": technicals.get("volume_trend_state"),
+        "volume_pressure": technicals.get("volume_pressure"),
+        "historical_volatility_pct": technicals.get("historical_volatility_pct"),
+        "historical_volatility_state": technicals.get("historical_volatility_state"),
+        "range_position_pct": technicals.get("range_position_pct"),
+        "price_vs_vwap": technicals.get("price_vs_vwap"),
+        "golden_cross": (payload.get("golden_cross") or {}).get("type"),
+        "signals": payload.get("signals") or [],
+    }
+
+
+@app.get("/api/tickers/setup-summary")
+async def tickers_setup_summary(
+    interval: str = Query(default="1d", regex="^(30m|1h|1d|1wk|1mo)$"),
+):
+    """Universe-wide published trade-setup state for the All Tickers table.
+
+    Read-only projection of what the analysis worker already published; it runs no
+    scan. Descriptive state only, not a ranking or a recommendation.
+    """
+    report = current_trade_setup_projections(interval)
+    if not report["is_serveable"]:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "MATERIALIZED_TRADE_SETUP_UNAVAILABLE",
+                "interval": interval,
+                "reason": "EXPIRED",
+                "staleness_sessions": report["staleness_sessions"],
+                "expected_market_time": report["expected_market_time"].isoformat(),
+                "market_times": [value.isoformat() for value in report["market_times"]],
+            },
+        )
+    return {
+        "interval": interval,
+        "source": "MATERIALIZED_CURRENT_PROJECTION",
+        "analysis_run_id": report["analysis_run_id"],
+        "computed_at": report["computed_at"],
+        "is_fresh": report["is_fresh"],
+        "staleness_sessions": report["staleness_sessions"],
+        "market_time": (
+            report["market_times"][-1].isoformat() if report["market_times"] else None
+        ),
+        "count": len(report["rows"]),
+        "results": [_setup_summary_row(row) for row in report["rows"]],
+    }
 
 
 @app.get("/api/scan/streak")

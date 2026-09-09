@@ -1,8 +1,10 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-query'
-import { scanFibonacci, FibonacciScanResponse, FibTarget, FibExtension, getLatestPriceDate } from '../services/api'
-import StreakPanel from '../components/StreakPanel'
+import { scanFibonacci, FibonacciScanResponse, FibTarget, FibExtension } from '../services/api'
+import { usePublishPageContext } from '../layout/pageContext'
+import { CommandBar, CommandField, CommandGroup, CommandSpacer } from '../layout/PageChrome'
+import { useSessionDate } from '../layout/sessionDate'
 
 const STRATEGY_TOOLTIP =
   'Fibonacci Retracement uses the golden ratio (and related ratios) to identify likely support/resistance levels after a significant price swing.\n\n' +
@@ -80,8 +82,7 @@ function FibonacciScreener() {
   const [maxRetrace, setMaxRetrace] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('distance_pct')
   const [sortDir, setSortDir] = useState<SortDir>('asc')
-  const [scanDate, setScanDate] = useState('')
-  const [latestDate, setLatestDate] = useState('')
+  const { pinned: scanDate } = useSessionDate()
   const [minSwing, setMinSwing] = useState(5)
   const [interval, setInterval] = useState<'5m' | '15m' | '30m' | '1h' | '1d'>('1d')
 
@@ -96,8 +97,6 @@ function FibonacciScreener() {
     queryClient.setQueryData(key, undefined)
     await queryClient.fetchQuery({ queryKey: key, queryFn: () => scanFibonacci(undefined, scanDate || undefined, minSwing, interval, true) })
   }, [interval, scanDate, minSwing, queryClient])
-
-  useEffect(() => { getLatestPriceDate().then(setLatestDate).catch(() => {}) }, [])
 
   const filtered = useMemo(() => {
     if (!data?.results) return []
@@ -117,6 +116,16 @@ function FibonacciScreener() {
     })
     return items
   }, [data, filter, signalFilter, trendFilter, zoneFilter, maxDistance, minRetrace, maxRetrace, sortKey, sortDir])
+
+  usePublishPageContext({
+    eyebrow: 'Level strategy · retracements',
+    title: 'Fibonacci Retracement',
+    detail: STRATEGY_TOOLTIP.split('\n')[0],
+    status: [
+      { label: 'Interval', value: interval },
+    ],
+    session: interval,
+  })
 
   const allSignals = useMemo(() => {
     if (!data?.results) return []
@@ -176,92 +185,50 @@ function FibonacciScreener() {
 
   return (
     <div>
-      {/* Header */}
-      <div className="card-header" style={{ border: 'none', padding: 0, marginBottom: '1.5rem' }}>
-        <div>
-          <h1 style={{ fontSize: '1.75rem', fontWeight: 700 }}>
-            📐 Fibonacci Retracement
-            <InfoIcon tooltip={STRATEGY_TOOLTIP} />
-          </h1>
-          <p style={{ margin: '0.25rem 0 0', color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
-            Identifies key support &amp; resistance levels from zigzag price swings.
-          </p>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-            <label style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Swing:</label>
-            {SWING_PRESETS.map(p => (
-              <button
-                key={p.value}
-                title={p.tip}
-                onClick={() => setMinSwing(p.value)}
-                className={minSwing === p.value ? 'btn btn-primary' : 'btn btn-secondary'}
-                style={{
-                  padding: '0.25rem 0.55rem', fontSize: '0.78rem', fontWeight: 600,
-                  borderRadius: '14px', whiteSpace: 'nowrap',
-                  ...(minSwing === p.value ? {} : { opacity: 0.7 }),
-                }}
-              >
-                {p.label}
-              </button>
-            ))}
-            <input
-              type="number"
-              min={3}
-              max={15}
-              step={1}
-              value={minSwing}
-              onChange={(e) => setMinSwing(Number(e.target.value))}
-              style={{ width: '45px', padding: '0.3rem 0.4rem', borderRadius: '6px', border: '1px solid var(--border)', fontSize: '0.82rem', textAlign: 'center' }}
-            />
-            <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>%</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-            <label style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Scan Date:</label>
-            <input
-              type="date"
-              value={scanDate || latestDate}
-              onChange={(e) => { setScanDate(e.target.value); }}
-              style={{ padding: '0.35rem 0.5rem', borderRadius: '6px', border: '1px solid var(--border)', fontSize: '0.85rem' }}
-            />
-            {scanDate && (
-              <button
-                className="btn btn-secondary"
-                onClick={() => setScanDate('')}
-                style={{ padding: '0.25rem 0.5rem', fontSize: '0.8rem' }}
-                title="Reset to latest"
-              >
-                ✕
-              </button>
-            )}
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
-            <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Interval:</label>
-            {(['5m', '15m', '30m', '1h', '1d'] as const).map((iv) => (
-              <button
-                key={iv}
-                onClick={() => { setInterval(iv); }}
-                style={{
-                  padding: '0.25rem 0.5rem',
-                  fontSize: '0.78rem',
-                  borderRadius: '4px',
-                  border: interval === iv ? '2px solid var(--primary-color)' : '1px solid var(--border)',
-                  background: interval === iv ? 'var(--primary-color)' : 'transparent',
-                  color: interval === iv ? '#fff' : 'var(--text-secondary)',
-                  cursor: 'pointer',
-                  fontWeight: interval === iv ? 600 : 400,
-                }}
-                title={iv === '1d' ? 'Daily candles' : iv === '1h' ? 'Hourly candles' : `${iv} candles (intraday)`}
-              >
-                {iv}
-              </button>
-            ))}
-          </div>
-          <button className="btn btn-primary" onClick={handleRefresh} disabled={loading}>
-            {loading ? 'Scanning...' : 'Refresh'}
-          </button>
-        </div>
-      </div>
+      <CommandBar>
+        <CommandGroup label="Min swing">
+          {SWING_PRESETS.map(p => (
+            <button
+              key={p.value}
+              type="button"
+              title={p.tip}
+              className={minSwing === p.value ? 'is-active' : undefined}
+              onClick={() => setMinSwing(p.value)}
+            >
+              {p.label}
+            </button>
+          ))}
+        </CommandGroup>
+        <CommandField label="Swing %">
+          <input
+            type="number"
+            min={3}
+            max={15}
+            step={1}
+            value={minSwing}
+            onChange={(e) => setMinSwing(Number(e.target.value))}
+            style={{ width: 58, textAlign: 'center' }}
+          />
+        </CommandField>
+        <CommandGroup label="Interval">
+          {(['5m', '15m', '30m', '1h', '1d'] as const).map((iv) => (
+            <button
+              key={iv}
+              type="button"
+              className={interval === iv ? 'is-active' : undefined}
+              onClick={() => setInterval(iv)}
+              title={iv === '1d' ? 'Daily candles' : iv === '1h' ? 'Hourly candles' : `${iv} candles (intraday)`}
+            >
+              {iv}
+            </button>
+          ))}
+        </CommandGroup>
+        <CommandSpacer />
+        <span className="tm-commandbar__note">{filtered.length} matches</span>
+        <button type="button" className="tm-commandbar__action" onClick={handleRefresh} disabled={loading}>
+          {loading ? 'Scanning…' : 'Refresh'}
+        </button>
+      </CommandBar>
 
       {/* Methodology card */}
       <div className="card" style={{ marginBottom: '1.5rem', background: 'var(--bg-secondary)', border: '1px solid var(--border)' }}>
@@ -476,7 +443,7 @@ function FibonacciScreener() {
                         <td style={{ textAlign: 'center' }}>
                           <span
                             title={LEVEL_TOOLTIPS[r.nearest_level] || ''}
-                            style={{ cursor: 'help', fontWeight: 700, color: r.nearest_level === '61.8%' ? '#b8860b' : 'inherit' }}
+                            style={{ cursor: 'help', fontWeight: 700, color: r.nearest_level === '61.8%' ? 'var(--tm-warn)' : 'inherit' }}
                           >
                             {r.nearest_level}
                           </span>
@@ -492,7 +459,7 @@ function FibonacciScreener() {
                         </td>
                         <td style={{
                           textAlign: 'right',
-                          color: r.swing_size_pct >= 15 ? 'var(--success)' : r.swing_size_pct >= 10 ? 'var(--warning, #ff9800)' : 'var(--text-secondary)',
+                          color: r.swing_size_pct >= 15 ? 'var(--success)' : r.swing_size_pct >= 10 ? 'var(--tm-warn)' : 'var(--text-secondary)',
                           fontWeight: r.swing_size_pct >= 15 ? 700 : 400,
                         }}>
                           {r.swing_size_pct.toFixed(1)}%
@@ -505,7 +472,7 @@ function FibonacciScreener() {
 
                               {/* Support Fibonacci Levels (from Swing High) */}
                               <div>
-                                <div style={{ fontWeight: 700, fontSize: '0.85rem', marginBottom: '0.5rem', color: '#2e7d32' }}>
+                                <div style={{ fontWeight: 700, fontSize: '0.85rem', marginBottom: '0.5rem', color: 'var(--tm-pos)' }}>
                                   🟢 Support Levels <span style={{ fontWeight: 400, fontSize: '0.75rem', color: 'var(--text-secondary)' }}>(from Swing High)</span>
                                 </div>
                                 <div style={{ fontSize: '0.8rem', lineHeight: '1.8' }}>
@@ -523,10 +490,10 @@ function FibonacciScreener() {
                                         background: isNearest ? 'rgba(76, 175, 80, 0.12)' : undefined,
                                         padding: '0.1rem 0.25rem',
                                         borderRadius: '4px',
-                                        borderLeft: isNearest ? '3px solid #2e7d32' : isGolden ? '3px solid #b8860b' : '3px solid transparent',
+                                        borderLeft: isNearest ? '3px solid var(--tm-pos)' : isGolden ? '3px solid var(--tm-warn)' : '3px solid transparent',
                                         opacity: isActive ? 1 : 0.5,
                                       }}>
-                                        <span style={{ color: isGolden ? '#b8860b' : '#2e7d32', fontWeight: isNearest || isGolden ? 700 : 400 }}>
+                                        <span style={{ color: isGolden ? 'var(--tm-warn)' : 'var(--tm-pos)', fontWeight: isNearest || isGolden ? 700 : 400 }}>
                                           S {lv.name}{isNearest ? ' ◀' : ''}
                                         </span>
                                         <span style={{ fontWeight: isNearest ? 700 : 400 }}>${lv.price.toFixed(2)}</span>
@@ -538,14 +505,14 @@ function FibonacciScreener() {
                                     <span style={{ fontWeight: 600 }}>${r.swing_low.toFixed(2)} <span style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>{r.swing_low_date}</span></span>
                                   </div>
                                   <div style={{ marginTop: '0.4rem', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-                                    Nearest: <strong style={{ color: '#2e7d32' }}>S {r.nearest_support.name}</strong> ({r.nearest_support.distance_pct > 0 ? '+' : ''}{r.nearest_support.distance_pct.toFixed(1)}%)
+                                    Nearest: <strong style={{ color: 'var(--tm-pos)' }}>S {r.nearest_support.name}</strong> ({r.nearest_support.distance_pct > 0 ? '+' : ''}{r.nearest_support.distance_pct.toFixed(1)}%)
                                   </div>
                                 </div>
                               </div>
 
                               {/* Resistance Fibonacci Levels (from Swing Low) */}
                               <div>
-                                <div style={{ fontWeight: 700, fontSize: '0.85rem', marginBottom: '0.5rem', color: '#c62828' }}>
+                                <div style={{ fontWeight: 700, fontSize: '0.85rem', marginBottom: '0.5rem', color: 'var(--tm-neg)' }}>
                                   🔴 Resistance Levels <span style={{ fontWeight: 400, fontSize: '0.75rem', color: 'var(--text-secondary)' }}>(from Swing Low)</span>
                                 </div>
                                 <div style={{ fontSize: '0.8rem', lineHeight: '1.8' }}>
@@ -563,10 +530,10 @@ function FibonacciScreener() {
                                         background: isNearest ? 'rgba(198, 40, 40, 0.1)' : undefined,
                                         padding: '0.1rem 0.25rem',
                                         borderRadius: '4px',
-                                        borderLeft: isNearest ? '3px solid #c62828' : isGolden ? '3px solid #b8860b' : '3px solid transparent',
+                                        borderLeft: isNearest ? '3px solid var(--tm-neg)' : isGolden ? '3px solid var(--tm-warn)' : '3px solid transparent',
                                         opacity: isActive ? 1 : 0.5,
                                       }}>
-                                        <span style={{ color: isGolden ? '#b8860b' : '#c62828', fontWeight: isNearest || isGolden ? 700 : 400 }}>
+                                        <span style={{ color: isGolden ? 'var(--tm-warn)' : 'var(--tm-neg)', fontWeight: isNearest || isGolden ? 700 : 400 }}>
                                           R {lv.name}{isNearest ? ' ◀' : ''}
                                         </span>
                                         <span style={{ fontWeight: isNearest ? 700 : 400 }}>${lv.price.toFixed(2)}</span>
@@ -578,7 +545,7 @@ function FibonacciScreener() {
                                     <span style={{ fontWeight: 600 }}>${r.swing_low.toFixed(2)}</span>
                                   </div>
                                   <div style={{ marginTop: '0.4rem', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-                                    Nearest: <strong style={{ color: '#c62828' }}>R {r.nearest_resistance.name}</strong> ({r.nearest_resistance.distance_pct > 0 ? '+' : ''}{r.nearest_resistance.distance_pct.toFixed(1)}%)
+                                    Nearest: <strong style={{ color: 'var(--tm-neg)' }}>R {r.nearest_resistance.name}</strong> ({r.nearest_resistance.distance_pct > 0 ? '+' : ''}{r.nearest_resistance.distance_pct.toFixed(1)}%)
                                   </div>
                                 </div>
                               </div>
@@ -590,7 +557,7 @@ function FibonacciScreener() {
                                 </div>
                                 <div style={{ marginBottom: '0.5rem' }}>
                                   {r.support_targets.length > 0
-                                    ? r.support_targets.map(t => targetPill(t, '#e8f5e9'))
+                                    ? r.support_targets.map(t => targetPill(t, 'var(--tm-pos-soft)'))
                                     : <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Price below all support levels</span>
                                   }
                                 </div>
@@ -600,7 +567,7 @@ function FibonacciScreener() {
                                 </div>
                                 <div style={{ marginBottom: '0.5rem' }}>
                                   {r.resistance_targets.length > 0
-                                    ? r.resistance_targets.map(t => targetPill(t, '#ffebee'))
+                                    ? r.resistance_targets.map(t => targetPill(t, 'var(--tm-neg-soft)'))
                                     : <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Price above all resistance levels</span>
                                   }
                                 </div>
@@ -632,7 +599,6 @@ function FibonacciScreener() {
           </div>
         </>
       )}
-      <StreakPanel strategy="fibonacci" />
     </div>
   )
 }

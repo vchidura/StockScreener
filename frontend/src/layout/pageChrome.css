@@ -1,0 +1,218 @@
+/* Shared page chrome: the control strip under the context bar, and the column picker.
+   Table rules here make wide tables shrink to the viewport instead of overflowing. */
+
+.tm-commandbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  margin-bottom: 12px;
+  background: var(--tm-surface);
+  border: 1px solid var(--tm-line);
+  border-radius: 7px;
+}
+
+.tm-commandbar__field {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.tm-commandbar__field > span {
+  color: var(--tm-faint);
+  font-size: 8.5px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.tm-commandbar__field select,
+.tm-commandbar__field input {
+  min-height: 30px;
+  padding: 4px 8px;
+  color: var(--tm-ink);
+  background: var(--tm-surface-raised);
+  border: 1px solid var(--tm-line);
+  border-radius: 5px;
+  font: inherit;
+  font-size: 12px;
+}
+
+.tm-commandbar__group {
+  display: inline-flex;
+}
+
+.tm-commandbar__group button {
+  min-height: 30px;
+  padding: 4px 9px;
+  color: var(--tm-muted);
+  background: var(--tm-surface-raised);
+  border: 1px solid var(--tm-line);
+  border-right: 0;
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.tm-commandbar__group button:first-child { border-radius: 5px 0 0 5px; }
+.tm-commandbar__group button:last-child { border-right: 1px solid var(--tm-line); border-radius: 0 5px 5px 0; }
+
+.tm-commandbar__group button.is-active {
+  color: var(--tm-on-accent);
+  background: var(--tm-accent);
+  border-color: var(--tm-accent);
+}
+
+.tm-commandbar__spacer { margin-left: auto; }
+
+.tm-commandbar__action {
+  min-height: 30px;
+  padding: 4px 14px;
+  color: var(--tm-on-accent);
+  background: var(--tm-accent);
+  border: 1px solid var(--tm-accent);
+  border-radius: 5px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.tm-commandbar__action:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.tm-commandbar__note {
+  color: var(--tm-muted);
+  font-size: 11.5px;
+}
+
+/* ── Column picker ── */
+
+.tm-columns { position: relative; flex-shrink: 0; }
+
+.tm-columns__button {
+  position: relative;
+  min-height: 30px;
+  min-width: 32px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 7px;
+  color: var(--tm-muted);
+  background: var(--tm-surface-raised);
+  border: 1px solid var(--tm-line);
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.tm-columns__button:hover,
+.tm-columns__button.is-open {
+  color: var(--tm-accent);
+  border-color: var(--tm-accent);
+}
+
+.tm-columns__button i {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 15px;
+  padding: 0 3px;
+  color: var(--tm-on-accent);
+  background: var(--tm-accent);
+  border-radius: 8px;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 800;
+  line-height: 15px;
+  text-align: center;
+}
+
+.tm-columns__menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 60;
+  display: grid;
+  gap: 2px;
+  min-width: 200px;
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  background: var(--tm-float);
+  border: 1px solid var(--tm-line);
+  border-radius: 6px;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
+}
+
+.tm-columns__menu label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 2px 0;
+  font-size: 11.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.tm-columns__menu label.is-locked {
+  color: var(--tm-faint);
+  cursor: not-allowed;
+}
+
+.tm-columns__actions {
+  display: flex;
+  gap: 6px;
+  padding-bottom: 6px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--tm-line);
+}
+
+.tm-columns__actions button {
+  flex: 1;
+  padding: 3px 6px;
+  color: var(--tm-accent);
+  background: transparent;
+  border: 1px solid var(--tm-line);
+  border-radius: 4px;
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.tm-columns__actions button:hover { border-color: var(--tm-accent); }
+
+/* ── Responsive tables ──
+   Wide research tables previously forced horizontal overflow because every cell was
+   nowrap. Cells may now wrap and columns share the available width. */
+
+.tm-fit {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.tm-fit > table {
+  width: 100%;
+  table-layout: auto;
+}
+
+.tm-fit th,
+.tm-fit td {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+/* Numeric and badge cells stay on one line so figures remain comparable. */
+.tm-fit th.tm-nowrap,
+.tm-fit td.tm-nowrap,
+.tm-fit .tm-nowrap {
+  white-space: nowrap;
+}
+
+/* The default .data-table padding costs ~32px per column, which alone overflows a
+   13-column table. Dense pages get tighter gutters. */
+.tm-fit .data-table th,
+.tm-fit .data-table td {
+  padding: 7px 9px;
+}

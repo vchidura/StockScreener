@@ -1,0 +1,160 @@
+/* Theme tokens for the AlphaScreener Pro terminal.
+   Dark is the product default; light is a supported secondary theme.
+   `.tm-legacy` pins light values for page bodies not yet migrated to the terminal theme,
+   so an unmigrated page stays internally consistent inside the dark shell. */
+
+:root {
+  color-scheme: dark;
+
+  --tm-canvas: #0a0e14;
+  --tm-surface: #111823;
+  --tm-surface-raised: #18202c;
+  --tm-surface-sunken: #070b10;
+  --tm-line: #1f2a38;
+  --tm-line-strong: #2d3c4f;
+
+  --tm-ink: #e6edf5;
+  --tm-ink-strong: #ffffff;
+  --tm-muted: #8896a8;
+  --tm-faint: #6b7a8c;
+
+  --tm-accent: #4d9dff;
+  --tm-accent-strong: #6fb1ff;
+  --tm-accent-soft: rgba(77, 157, 255, 0.14);
+  --tm-on-accent: #05121f;
+
+  --tm-pos: #35c88a;
+  --tm-pos-soft: rgba(53, 200, 138, 0.15);
+  --tm-neg: #f26d6d;
+  --tm-neg-soft: rgba(242, 109, 109, 0.15);
+  --tm-warn: #eab34a;
+  --tm-warn-soft: rgba(234, 179, 74, 0.15);
+  --tm-info: #56b6e8;
+  --tm-info-soft: rgba(86, 182, 232, 0.15);
+  --tm-alt: #a78bfa;
+  --tm-alt-soft: rgba(167, 139, 250, 0.15);
+
+  --tm-rail-width: 232px;
+  --tm-rail-width-collapsed: 64px;
+  --tm-topbar-height: 48px;
+  --tm-font-mono: ui-monospace, 'Cascadia Mono', 'SF Mono', Menlo, Consolas, monospace;
+
+  --tm-scrim: rgba(10, 14, 20, 0.72);
+  --tm-float: rgba(24, 32, 44, 0.94);
+
+  /* lightweight-charts cannot read CSS variables, so these are resolved in JS on theme change. */
+  --tm-chart-bg: #111823;
+  --tm-chart-text: #b6c2d1;
+  --tm-chart-grid: #18212e;
+  --tm-chart-border: #253243;
+  --tm-chart-up: #35c88a;
+  --tm-chart-down: #f26d6d;
+  --tm-chart-up-fill: rgba(53, 200, 138, 0.3);
+  --tm-chart-down-fill: rgba(242, 109, 109, 0.3);
+  --tm-chart-bb: #46586f;
+  --tm-chart-ma50: #94a3b8;
+  --tm-chart-ma100: #a78bfa;
+  --tm-chart-ma200: #2dd4bf;
+  --tm-chart-ema8: #fb923c;
+  --tm-chart-ema21: #60a5fa;
+  --tm-chart-ema50: #f472b6;
+
+  /* Aliases kept for pre-terminal page styles. Custom properties substitute at the point of
+     use, so these resolve against whichever theme block applies to the consuming element. */
+  --bg-color: var(--tm-canvas);
+  --card-bg: var(--tm-surface);
+  --text-primary: var(--tm-ink);
+  --text-secondary: var(--tm-muted);
+  --border-color: var(--tm-line);
+  --primary-color: var(--tm-accent);
+  --primary-hover: var(--tm-accent-strong);
+  --success-color: var(--tm-pos);
+  --warning-color: var(--tm-warn);
+  --danger-color: var(--tm-neg);
+
+  /* Short forms already referenced by the strategy pages; previously undefined, so they
+     resolved to nothing and silently dropped the background or colour. */
+  --primary: var(--tm-accent);
+  --success: var(--tm-pos);
+  --warning: var(--tm-warn);
+  --danger: var(--tm-neg);
+  --border: var(--tm-line);
+  --bg-secondary: var(--tm-surface-sunken);
+}
+
+:root[data-theme='light'],
+.tm-legacy {
+  color-scheme: light;
+
+  --tm-canvas: #f8fafc;
+  --tm-surface: #ffffff;
+  --tm-surface-raised: #ffffff;
+  --tm-surface-sunken: #f1f5f9;
+  --tm-line: #e2e8f0;
+  --tm-line-strong: #cbd5e1;
+
+  --tm-ink: #1e293b;
+  --tm-ink-strong: #0f172a;
+  --tm-muted: #64748b;
+  --tm-faint: #6b7a8f;
+
+  --tm-accent: #2563eb;
+  --tm-accent-strong: #1d4ed8;
+  --tm-accent-soft: #eff6ff;
+  --tm-on-accent: #ffffff;
+
+  --tm-pos: #16a34a;
+  --tm-pos-soft: #dcfce7;
+  --tm-neg: #dc2626;
+  --tm-neg-soft: #fee2e2;
+  --tm-warn: #a16207;
+  --tm-warn-soft: #fef3c7;
+  --tm-info: #0284c7;
+  --tm-info-soft: #e0f2fe;
+  --tm-alt: #7c3aed;
+  --tm-alt-soft: #f3e8ff;
+
+  --tm-scrim: rgba(255, 255, 255, 0.72);
+  --tm-float: rgba(255, 255, 255, 0.94);
+
+  --tm-chart-bg: #ffffff;
+  --tm-chart-text: #334155;
+  --tm-chart-grid: #f0f0f0;
+  --tm-chart-border: #e0e0e0;
+  --tm-chart-up: #15803d;
+  --tm-chart-down: #b91c1c;
+  --tm-chart-up-fill: rgba(21, 128, 61, 0.28);
+  --tm-chart-down-fill: rgba(185, 28, 28, 0.28);
+  --tm-chart-bb: #cbd5e1;
+  --tm-chart-ma50: #475569;
+  --tm-chart-ma100: #7c3aed;
+  --tm-chart-ma200: #0f766e;
+  --tm-chart-ema8: #ea580c;
+  --tm-chart-ema21: #2563eb;
+  --tm-chart-ema50: #be185d;
+
+  /* Repeated per theme on purpose: a custom property containing var() is substituted on the
+     element that declares it, so aliases defined only on :root would freeze the dark values. */
+  --bg-color: var(--tm-canvas);
+  --card-bg: var(--tm-surface);
+  --text-primary: var(--tm-ink);
+  --text-secondary: var(--tm-muted);
+  --border-color: var(--tm-line);
+  --primary-color: var(--tm-accent);
+  --primary-hover: var(--tm-accent-strong);
+  --success-color: var(--tm-pos);
+  --warning-color: var(--tm-warn);
+  --danger-color: var(--tm-neg);
+
+  --primary: var(--tm-accent);
+  --success: var(--tm-pos);
+  --warning: var(--tm-warn);
+  --danger: var(--tm-neg);
+  --border: var(--tm-line);
+  --bg-secondary: var(--tm-surface-sunken);
+}
+
+.tm-legacy {
+  background: var(--tm-canvas);
+  color: var(--tm-ink);
+}

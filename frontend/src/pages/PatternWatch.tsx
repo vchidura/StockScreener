@@ -4,12 +4,35 @@ import { ExternalLink, RefreshCw, Search, X } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
 import { CrossFramePatternSummary, FormingChartPattern, PriceChannel, getTickers, scanChartPatterns, scanTickerChartPatterns } from '../services/api'
 import { formingPatternRead } from '../utils/formingPatterns'
+import { usePublishPageContext } from '../layout/pageContext'
+import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
+
+/** Secondary geometry detail starts hidden so the 15-column table fits a laptop screen. */
+const PATTERN_COLUMNS: ColumnSpec[] = [
+  { key: 'ticker', label: 'Ticker', locked: true },
+  { key: 'sector', label: 'Sector', hiddenByDefault: true },
+  { key: 'pattern', label: 'Pattern', locked: true },
+  { key: 'frame', label: 'Frame' },
+  { key: 'bias', label: 'Bias' },
+  { key: 'readiness', label: 'Readiness' },
+  { key: 'read', label: 'Brief read' },
+  { key: 'channel', label: 'Price channel', hiddenByDefault: true },
+  { key: 'geometry', label: 'Geometry' },
+  { key: 'touches', label: 'Touches' },
+  { key: 'contraction', label: 'Contraction', hiddenByDefault: true },
+  { key: 'apex', label: 'Apex', hiddenByDefault: true },
+  { key: 'age', label: 'Age' },
+  { key: 'close', label: 'Analyzed close' },
+  { key: 'open', label: 'Open chart', locked: true },
+]
+
+const LEFT_ALIGNED = new Set(['ticker', 'sector', 'pattern', 'frame', 'bias', 'readiness', 'read', 'channel', 'geometry'])
 
 const colors = {
-  ink: '#172033', muted: '#667085', line: '#d8dee8', panel: '#ffffff',
-  canvas: '#f5f7fa', green: '#147d64', greenSoft: '#e7f5f0',
-  red: '#bd3c3c', redSoft: '#faeceb', amber: '#9a6700', amberSoft: '#fff4d6',
-  blue: '#245f9e', blueSoft: '#eaf2fb',
+  ink: 'var(--tm-ink)', muted: 'var(--tm-muted)', line: 'var(--tm-line)', panel: 'var(--tm-surface)',
+  canvas: 'var(--tm-canvas)', green: 'var(--tm-pos)', greenSoft: 'var(--tm-pos-soft)',
+  red: 'var(--tm-neg)', redSoft: 'var(--tm-neg-soft)', amber: 'var(--tm-warn)', amberSoft: 'var(--tm-warn-soft)',
+  blue: 'var(--tm-accent)', blueSoft: 'var(--tm-accent-soft)',
 }
 
 const intervalLabels: Record<string, string> = {
@@ -144,6 +167,17 @@ export default function PatternWatch() {
       && (sector === 'all' || (sector === 'unclassified' ? !row.sector : row.sector === sector))
   })
   const visibleTickers = new Set(rows.map(row => row.ticker)).size
+  const columns = useColumnPreferences('pattern-watch', PATTERN_COLUMNS)
+  const show = columns.isVisible
+
+  usePublishPageContext({
+    eyebrow: 'Chart research · forming geometry',
+    title: 'Pattern Watch',
+    detail: 'Unconfirmed formations measured from completed candles. Not scanner signals or recommendations.',
+    status: [
+      { label: 'Interval', value: intervalLabels[interval] ?? interval },
+    ],
+  })
 
   const refresh = async () => {
     if (awaitingAllTicker) return
@@ -166,18 +200,11 @@ export default function PatternWatch() {
 
   const control: React.CSSProperties = {
     height: 34, border: `1px solid ${colors.line}`, borderRadius: 5,
-    background: '#fff', color: colors.ink, padding: '0 9px', fontSize: 12.5,
+    background: 'var(--tm-surface)', color: colors.ink, padding: '0 9px', fontSize: 12.5,
   }
 
   return (
     <div style={{ color: colors.ink }}>
-      <header style={{ padding: '10px 2px 16px', borderBottom: `1px solid ${colors.line}`, marginBottom: 14 }}>
-        <div style={{ color: colors.blue, fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>Chart research · forming geometry</div>
-        <h1 style={{ fontSize: 25, lineHeight: 1.15, margin: '4px 0 5px', letterSpacing: 0 }}>Pattern Watch</h1>
-        <p style={{ margin: 0, color: colors.muted, fontSize: 13.5 }}>
-          Current unconfirmed formations measured from completed candles. Open a candidate to inspect its automatic chart lines; these are not scanner signals or recommendations.
-        </p>
-      </header>
 
       <section style={{ background: colors.panel, border: `1px solid ${colors.line}`, borderRadius: 7, marginBottom: 14 }}>
         <div style={{ padding: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', borderBottom: `1px solid ${colors.line}` }}>
@@ -238,6 +265,13 @@ export default function PatternWatch() {
               ? `${rows.length} candidates · ${visibleTickers} tickers shown · ${patterns.data.matched_tickers}/${patterns.data.scanned} matched`
               : awaitingAllTicker ? 'Enter an exact active ticker' : 'Loading universe…'}
           </span>
+          <ColumnPicker
+            columns={PATTERN_COLUMNS}
+            hidden={columns.hidden}
+            onToggle={columns.toggle}
+            onShowAll={columns.showAll}
+            onReset={columns.reset}
+          />
         </div>
 
         <div style={{ padding: '7px 12px', background: colors.amberSoft, color: colors.amber, fontSize: 11, borderBottom: `1px solid ${colors.line}` }}>
@@ -246,21 +280,23 @@ export default function PatternWatch() {
             : 'Ordered by readiness: At edge → Near edge → Forming, then geometry quality, boundary distance, and touches. React only after a completed close confirms the boundary break.'}
         </div>
 
-        <div style={{ overflowX: 'auto', maxHeight: 690, overflowY: 'auto' }}>
-          <table style={{ width: '100%', minWidth: 1510, borderCollapse: 'collapse', fontSize: 12 }}>
+        <div className="tm-fit" style={{ maxHeight: 690, overflowY: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
             <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}>
               <tr style={{ background: colors.canvas, color: colors.muted }}>
-                {['Ticker', 'Sector', 'Pattern', 'Frame', 'Bias', 'Readiness', 'Brief read', 'Price channel', 'Geometry', 'Touches', 'Contraction', 'Apex', 'Age', 'Analyzed close', ''].map(label => (
-                  <th key={label} style={{ textAlign: ['Ticker', 'Sector', 'Pattern', 'Frame', 'Bias', 'Readiness', 'Brief read', 'Price channel', 'Geometry'].includes(label) ? 'left' : 'right', padding: '8px 9px', borderBottom: `1px solid ${colors.line}`, whiteSpace: 'nowrap' }}>{label}</th>
+                {columns.visibleColumns.map(column => (
+                  <th key={column.key} style={{ textAlign: LEFT_ALIGNED.has(column.key) ? 'left' : 'right', padding: '8px 9px', borderBottom: `1px solid ${colors.line}`, whiteSpace: 'nowrap' }}>
+                    {column.key === 'open' ? '' : column.label}
+                  </th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {awaitingAllTicker && <tr><td colSpan={15} style={{ padding: 18, color: colors.muted }}>Enter an exact active ticker to compare its forming patterns across all intervals.</td></tr>}
-              {!awaitingAllTicker && patterns.isLoading && <tr><td colSpan={15} style={{ padding: 18, color: colors.muted }}>Measuring the active universe…</td></tr>}
-              {patterns.isError && <tr><td colSpan={15} style={{ padding: 18, color: colors.red }}>Pattern Watch could not be loaded.</td></tr>}
+              {awaitingAllTicker && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>Enter an exact active ticker to compare its forming patterns across all intervals.</td></tr>}
+              {!awaitingAllTicker && patterns.isLoading && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>Measuring the active universe…</td></tr>}
+              {patterns.isError && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.red }}>Pattern Watch could not be loaded.</td></tr>}
               {!awaitingAllTicker && !patterns.isLoading && !patterns.isError && rows.length === 0 && (
-                <tr><td colSpan={15} style={{ padding: 18, color: colors.muted }}>No forming candidates match this interval and filter set.</td></tr>
+                <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>No forming candidates match this interval and filter set.</td></tr>
               )}
               {rows.map(row => {
                 const pattern = row.pattern
@@ -270,7 +306,7 @@ export default function PatternWatch() {
                 const channelContext = channelView(pattern, channel)
                 return (
                   <tr key={`${row.ticker}-${row.interval}-${pattern.type}-${pattern.start_time}`} style={{ borderBottom: `1px solid ${colors.line}` }}>
-                    <td style={{ padding: '8px 9px' }}>
+                    {show('ticker') && <td style={{ padding: '8px 9px' }}>
                       <Link
                         to={patternUrl(row.ticker, pattern, row.interval, channel)}
                         title={`Open ${row.ticker} ${pattern.name} chart`}
@@ -278,25 +314,25 @@ export default function PatternWatch() {
                       >
                         {row.ticker}
                       </Link>
-                    </td>
-                    <td style={{ padding: '8px 9px', color: colors.muted, maxWidth: 180 }}>{row.sector ?? 'Unclassified / ETF'}</td>
-                    <td style={{ padding: '8px 9px', fontWeight: 700 }}>{pattern.name}</td>
-                    <td style={{ padding: '8px 9px', color: colors.blue, fontWeight: 700, whiteSpace: 'nowrap' }}>{intervalLabels[row.interval] ?? row.interval}</td>
-                    <td style={{ padding: '8px 9px', color: biasTone(pattern.bias), fontWeight: 700 }}>{pattern.bias.toLowerCase()}</td>
-                    <td style={{ padding: '8px 9px', minWidth: 175 }}>
+                    </td>}
+                    {show('sector') && <td style={{ padding: '8px 9px', color: colors.muted, maxWidth: 180 }}>{row.sector ?? 'Unclassified / ETF'}</td>}
+                    {show('pattern') && <td style={{ padding: '8px 9px', fontWeight: 700 }}>{pattern.name}</td>}
+                    {show('frame') && <td style={{ padding: '8px 9px', color: colors.blue, fontWeight: 700, whiteSpace: 'nowrap' }}>{intervalLabels[row.interval] ?? row.interval}</td>}
+                    {show('bias') && <td style={{ padding: '8px 9px', color: biasTone(pattern.bias), fontWeight: 700 }}>{pattern.bias.toLowerCase()}</td>}
+                    {show('readiness') && <td style={{ padding: '8px 9px', minWidth: 175 }}>
                       <span style={{ padding: '2px 5px', borderRadius: 4, color: readiness.color, background: readiness.background, fontWeight: 700 }}>
                         {readiness.label}
                       </span>
                       <div style={{ color: colors.muted, fontSize: 10.5, marginTop: 3 }}>
                         {pattern.edge_distance_atr?.toFixed(2) ?? '—'} ATR ({edgePercent(pattern.edge_distance_pct)}) to {pattern.boundary_role ?? 'boundary'} {money(pattern.boundary_price)}
                       </div>
-                    </td>
-                    <td style={{ padding: '8px 9px', minWidth: 235, lineHeight: 1.35 }}>
+                    </td>}
+                    {show('read') && <td style={{ padding: '8px 9px', minWidth: 235, lineHeight: 1.35 }}>
                       <div>{read.watch}</div>
                       <div style={{ color: colors.muted, fontSize: 10.5, marginTop: 2 }}>{read.outcome}</div>
                       <div style={{ color: colors.muted, fontSize: 10.5, marginTop: 2 }}>{read.invalidation} · then remove from watch</div>
-                    </td>
-                    <td style={{ padding: '8px 9px', minWidth: 190, lineHeight: 1.35 }}>
+                    </td>}
+                    {show('channel') && <td style={{ padding: '8px 9px', minWidth: 190, lineHeight: 1.35 }}>
                       {channel && channelContext ? (
                         <>
                           <div style={{ fontWeight: 700 }}>{channel.name}</div>
@@ -304,22 +340,22 @@ export default function PatternWatch() {
                           <div style={{ color: channelContext.relationColor, fontSize: 10.5, fontWeight: 700 }}>{channelContext.relationLabel}</div>
                         </>
                       ) : <span style={{ color: colors.muted }}>—</span>}
-                    </td>
-                    <td style={{ padding: '8px 9px' }}>
+                    </td>}
+                    {show('geometry') && <td style={{ padding: '8px 9px' }}>
                       <span style={{ padding: '2px 5px', borderRadius: 4, background: pattern.grade === 'STRONG_GEOMETRY' ? colors.greenSoft : colors.blueSoft, color: pattern.grade === 'STRONG_GEOMETRY' ? colors.green : colors.blue, fontWeight: 700 }}>
                         {pattern.grade === 'STRONG_GEOMETRY' ? 'Strong' : 'Valid'}
                       </span>
-                    </td>
-                    <td style={{ padding: '8px 9px', textAlign: 'right' }}>{pattern.upper_touches + pattern.lower_touches}</td>
-                    <td style={{ padding: '8px 9px', textAlign: 'right' }}>{numberOrDash(pattern.contraction_pct, '%')}</td>
-                    <td style={{ padding: '8px 9px', textAlign: 'right' }}>{numberOrDash(pattern.apex_bars_ahead, ' bars')}</td>
-                    <td style={{ padding: '8px 9px', textAlign: 'right' }}>{pattern.formation_bars} bars</td>
-                    <td style={{ padding: '8px 9px', textAlign: 'right', fontWeight: 700 }}>{money(row.last_close)}</td>
-                    <td style={{ padding: '8px 9px', textAlign: 'right' }}>
+                    </td>}
+                    {show('touches') && <td style={{ padding: '8px 9px', textAlign: 'right' }}>{pattern.upper_touches + pattern.lower_touches}</td>}
+                    {show('contraction') && <td style={{ padding: '8px 9px', textAlign: 'right' }}>{numberOrDash(pattern.contraction_pct, '%')}</td>}
+                    {show('apex') && <td style={{ padding: '8px 9px', textAlign: 'right' }}>{numberOrDash(pattern.apex_bars_ahead, ' bars')}</td>}
+                    {show('age') && <td style={{ padding: '8px 9px', textAlign: 'right' }}>{pattern.formation_bars} bars</td>}
+                    {show('close') && <td style={{ padding: '8px 9px', textAlign: 'right', fontWeight: 700 }}>{money(row.last_close)}</td>}
+                    {show('open') && <td style={{ padding: '8px 9px', textAlign: 'right' }}>
                       <button type="button" onClick={() => openPattern(row.ticker, pattern, row.interval, channel)} title={`Open ${row.ticker} ${pattern.name} chart`} aria-label={`Open ${row.ticker} ${pattern.name} chart`} style={{ border: 0, background: 'transparent', color: colors.blue, cursor: 'pointer', display: 'inline-grid', placeItems: 'center' }}>
                         <ExternalLink size={16} aria-hidden="true" />
                       </button>
-                    </td>
+                    </td>}
                   </tr>
                 )
               })}

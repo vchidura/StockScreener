@@ -750,11 +750,58 @@ def test_stale_analysis_recovery_terminal_fails_unresolved_work():
     assert result[0]["analysis_run_id"] == run_id
 
 
-def test_stale_analysis_recovery_rejects_nonpositive_age():
+def test_stale_analysis_recovery_rejects_negative_age():
     repository, _, _ = _repository(EquityAnalysisRepository)
 
-    with pytest.raises(ValueError, match="stale_after must be positive"):
-        repository.fail_stale_runs(stale_after=timedelta(0))
+    with pytest.raises(ValueError, match="stale_after must not be negative"):
+        repository.fail_stale_runs(stale_after=timedelta(seconds=-1))
+
+
+def test_lease_expired_analysis_run_can_be_reopened():
+    repository, _, cursor = _repository(EquityAnalysisRepository)
+    run_id = uuid4()
+    cursor.fetchone.return_value = {
+        "status": "FAILED",
+        "expired": 97,
+        "ineligible": 0,
+    }
+    cursor.rowcount = 1
+
+    assert repository.restart_lease_expired_run(run_id) is True
+
+    select_sql, select_parameters = cursor.execute.call_args_list[0].args
+    member_sql, member_parameters = cursor.execute.call_args_list[1].args
+    run_sql, run_parameters = cursor.execute.call_args_list[2].args
+    assert "WITH locked_run AS" in select_sql
+    assert "FOR UPDATE" in select_sql
+    assert "failure_reason = %s" in select_sql
+    assert "SET status = 'PENDING'" in member_sql
+    assert "failure_reason = NULL" in member_sql
+    assert "SET completed_members = 0" in run_sql
+    assert "status = 'RUNNING'" in run_sql
+    assert select_parameters == (
+        run_id,
+        "ANALYSIS_RUN_LEASE_EXPIRED",
+        "ANALYSIS_RUN_LEASE_EXPIRED",
+    )
+    assert member_parameters == (run_id,)
+    assert run_parameters == (run_id,)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"status": "COMPLETE", "expired": 0, "ineligible": 0},
+        {"status": "FAILED", "expired": 0, "ineligible": 1},
+        {"status": "FAILED", "expired": 1, "ineligible": 1},
+    ],
+)
+def test_analysis_run_reopen_rejects_non_lease_failures(row):
+    repository, _, cursor = _repository(EquityAnalysisRepository)
+    cursor.fetchone.return_value = row
+
+    assert repository.restart_lease_expired_run(uuid4()) is False
+    assert cursor.execute.call_count == 1
 
 
 def test_stale_ingestion_recovery_terminal_fails_writing_segments():
@@ -777,11 +824,11 @@ def test_stale_ingestion_recovery_terminal_fails_writing_segments():
     assert result[0]["ingestion_segment_id"] == segment_id
 
 
-def test_stale_ingestion_recovery_rejects_nonpositive_age():
+def test_stale_ingestion_recovery_rejects_negative_age():
     repository, _, _ = _repository(EquityIngestionRepository)
 
-    with pytest.raises(ValueError, match="stale_after must be positive"):
-        repository.fail_stale_segments(stale_after=timedelta(0))
+    with pytest.raises(ValueError, match="stale_after must not be negative"):
+        repository.fail_stale_segments(stale_after=timedelta(seconds=-1))
 
 
 def test_existing_analysis_run_is_returned_without_member_mutation():

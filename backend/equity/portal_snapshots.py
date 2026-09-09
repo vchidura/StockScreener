@@ -10,6 +10,7 @@ from uuid import NAMESPACE_URL, uuid5
 from psycopg2.extras import Json
 
 from database import get_db_cursor
+from .calendar import staleness_state
 from .polygon import sha256_json
 
 
@@ -131,6 +132,13 @@ def current(snapshot_type: str) -> dict[str, Any] | None:
         return None
     result = dict(row)
     result["read_latency_ms"] = round((time.perf_counter() - started) * 1000, 3)
+    result.update(
+        staleness_state(
+            result["generated_at"],
+            datetime.now(timezone.utc),
+            is_fresh=bool(result["is_fresh"]),
+        )
+    )
     return result
 
 

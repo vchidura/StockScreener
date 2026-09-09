@@ -1055,8 +1055,8 @@ class EquityIngestionRepository(_Repository):
         stale_after: timedelta,
         reason: str = "INGESTION_SEGMENT_STALE",
     ) -> tuple[dict[str, Any], ...]:
-        if stale_after <= timedelta(0):
-            raise ValueError("stale_after must be positive")
+        if stale_after < timedelta(0):
+            raise ValueError("stale_after must not be negative")
         with self._cursor() as cursor:
             cursor.execute(
                 """
@@ -1619,8 +1619,8 @@ class EquityAnalysisRepository(_Repository):
         stale_after: timedelta,
         reason: str = "ANALYSIS_RUN_LEASE_EXPIRED",
     ) -> tuple[dict[str, Any], ...]:
-        if stale_after <= timedelta(0):
-            raise ValueError("stale_after must be positive")
+        if stale_after < timedelta(0):
+            raise ValueError("stale_after must not be negative")
         with self._cursor() as cursor:
             cursor.execute(
                 """
@@ -1738,6 +1738,82 @@ class EquityAnalysisRepository(_Repository):
                 ],
             )
             return run
+
+    def restart_lease_expired_run(
+        self,
+        analysis_run_id: UUID,
+        *,
+        reason: str = "ANALYSIS_RUN_LEASE_EXPIRED",
+    ) -> bool:
+        """Reopen an interrupted deterministic run so projections can be rebuilt."""
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                WITH locked_run AS (
+                    SELECT analysis_run_id, status
+                    FROM equity_analysis_runs
+                    WHERE analysis_run_id = %s
+                    FOR UPDATE
+                )
+                SELECT run.status,
+                       COUNT(*) FILTER (
+                           WHERE member.status = 'FAILED'
+                             AND member.failure_reason = %s
+                       ) AS expired,
+                       COUNT(*) FILTER (
+                           WHERE member.status NOT IN ('COMPLETE', 'FAILED')
+                              OR (
+                                  member.status = 'FAILED'
+                                  AND member.failure_reason IS DISTINCT FROM %s
+                              )
+                       ) AS ineligible
+                                FROM locked_run AS run
+                JOIN equity_analysis_members AS member
+                  ON member.analysis_run_id = run.analysis_run_id
+                GROUP BY run.status
+                """,
+                                (analysis_run_id, reason, reason),
+            )
+            row = cursor.fetchone()
+            if (
+                row is None
+                or row["status"] != "FAILED"
+                or row["expired"] <= 0
+                or row["ineligible"] > 0
+            ):
+                return False
+            cursor.execute(
+                """
+                UPDATE equity_analysis_members
+                SET status = 'PENDING',
+                    latest_bar_revision_id = NULL,
+                    source_bar_count = 0,
+                    evidence_count = 0,
+                    failure_reason = NULL,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    completed_at = NULL
+                WHERE analysis_run_id = %s
+                """,
+                (analysis_run_id,),
+            )
+            cursor.execute(
+                """
+                UPDATE equity_analysis_runs
+                SET completed_members = 0,
+                    no_match_members = 0,
+                    insufficient_members = 0,
+                    failed_members = 0,
+                    output_sha256 = NULL,
+                    status = 'RUNNING',
+                    completed_at = NULL,
+                    published_at = NULL
+                WHERE analysis_run_id = %s
+                  AND status = 'FAILED'
+                """,
+                (analysis_run_id,),
+            )
+            return cursor.rowcount == 1
 
     def complete_member(
         self,

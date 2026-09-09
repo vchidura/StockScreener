@@ -122,6 +122,54 @@ def get_latest_price_date() -> str:
         return str(row["latest_date"]) if row and row["latest_date"] else None
 
 
+def get_trading_sessions(interval: str = "1d", limit: int = 260) -> list[str]:
+    """Return the most recent sessions that have bars for `interval`, oldest first.
+
+    Sourced from stored bars rather than an exchange calendar, so weekends,
+    holidays, and any session we never ingested are all absent by construction.
+    Interval matters: today appears for intraday intervals as soon as bars land,
+    but only after the close for 1d.
+    """
+    with get_db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT DISTINCT session_date
+            FROM equity_bar_revisions
+            WHERE interval = %s
+              AND session_scope = 'RTH'
+              AND adjusted = FALSE
+              AND is_final = TRUE
+            ORDER BY session_date DESC
+            LIMIT %s
+            """,
+            (interval, limit),
+        )
+        return [str(row["session_date"]) for row in reversed(cursor.fetchall())]
+
+
+def get_market_data_currency() -> dict | None:
+    """Newest stored bar across tracked intervals, so the portal can state its data age."""
+    with get_db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT interval, MAX(bar_end) AS as_of
+            FROM equity_bar_revisions
+            WHERE interval IN ('1m', '5m', '15m', '30m', '1h', '1d')
+              AND session_scope = 'RTH'
+              AND adjusted = FALSE
+              AND is_final = TRUE
+              AND session_date >= CURRENT_DATE - 7
+            GROUP BY interval
+            ORDER BY as_of DESC
+            LIMIT 1
+            """
+        )
+        row = cursor.fetchone()
+        if not row or not row["as_of"]:
+            return None
+        return {"as_of": row["as_of"].isoformat(), "interval": row["interval"]}
+
+
 def get_latest_quote(ticker: str) -> dict | None:
     """Return the newest canonical final price and change from the prior daily close."""
     with get_db_cursor() as cursor:

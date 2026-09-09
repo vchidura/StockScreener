@@ -7,12 +7,13 @@ import {
   getTickersOverview,
   DiscoveryState,
 } from '../services/api'
+import { usePublishPageContext } from '../layout/pageContext'
 
 const colors = {
-  ink: '#172033', muted: '#667085', line: '#d8dee8', panel: '#ffffff',
-  canvas: '#f5f7fa', green: '#147d64', greenSoft: '#e7f5f0',
-  red: '#bd3c3c', redSoft: '#faeceb', amber: '#9a6700', amberSoft: '#fff4d6',
-  blue: '#245f9e', blueSoft: '#eaf2fb',
+  ink: 'var(--tm-ink)', muted: 'var(--tm-muted)', line: 'var(--tm-line)', panel: 'var(--tm-surface)',
+  canvas: 'var(--tm-canvas)', green: 'var(--tm-pos)', greenSoft: 'var(--tm-pos-soft)',
+  red: 'var(--tm-neg)', redSoft: 'var(--tm-neg-soft)', amber: 'var(--tm-warn)', amberSoft: 'var(--tm-warn-soft)',
+  blue: 'var(--tm-accent)', blueSoft: 'var(--tm-accent-soft)',
 }
 
 const discoveryOrder: DiscoveryState[] = [
@@ -20,10 +21,10 @@ const discoveryOrder: DiscoveryState[] = [
 ]
 const discoveryStyle: Record<DiscoveryState, { label: string; color: string }> = {
   REVERSAL_CONFIRMED: { label: 'Reversal confirmed', color: colors.green },
-  EMERGING_REVERSAL: { label: 'Emerging reversal', color: '#3d9a6e' },
+  EMERGING_REVERSAL: { label: 'Emerging reversal', color: 'var(--tm-pos)' },
   REVERSAL_WATCH: { label: 'Reversal watch', color: colors.amber },
   CONTINUATION: { label: 'Continuation', color: colors.blue },
-  CONFLICT: { label: 'Conflict', color: '#8b6bbf' },
+  CONFLICT: { label: 'Conflict', color: 'var(--tm-alt)' },
   LAGGARD: { label: 'Laggard', color: colors.red },
   NEUTRAL: { label: 'Neutral', color: colors.muted },
 }
@@ -38,13 +39,13 @@ const pct = (value: number | null | undefined, digits = 2) =>
   value == null ? '—' : `${(value * 100).toFixed(digits)}%`
 
 const REGIME_STYLE: Record<string, { icon: string; color: string; bg: string }> = {
-  'Strong Bull': { icon: '🟢', color: '#065f46', bg: '#d1fae5' },
-  'Bull':        { icon: '🟩', color: '#1a7d3f', bg: '#e6f4ea' },
-  'Caution':     { icon: '🟡', color: '#b08a1a', bg: '#fff8e6' },
-  'Bear Rally':  { icon: '🟠', color: '#c4723a', bg: '#fdf3ec' },
-  'Bear':        { icon: '🔴', color: '#b8524e', bg: '#fdecea' },
-  'Strong Bear': { icon: '⛔', color: '#7f1d1d', bg: '#fecaca' },
-  'Unknown':     { icon: '⚪', color: '#94a3b8', bg: '#f1f5f9' },
+  'Strong Bull': { icon: '🟢', color: 'var(--tm-pos)', bg: 'var(--tm-pos-soft)' },
+  'Bull':        { icon: '🟩', color: 'var(--tm-pos)', bg: 'var(--tm-pos-soft)' },
+  'Caution':     { icon: '🟡', color: 'var(--tm-warn)', bg: 'var(--tm-warn-soft)' },
+  'Bear Rally':  { icon: '🟠', color: 'var(--tm-warn)', bg: 'var(--tm-warn-soft)' },
+  'Bear':        { icon: '🔴', color: 'var(--tm-neg)', bg: 'var(--tm-neg-soft)' },
+  'Strong Bear': { icon: '⛔', color: 'var(--tm-neg)', bg: 'var(--tm-neg-soft)' },
+  'Unknown':     { icon: '⚪', color: 'var(--tm-muted)', bg: 'var(--tm-surface-sunken)' },
 }
 
 export default function SectorIntelligence() {
@@ -89,19 +90,24 @@ export default function SectorIntelligence() {
     background: colors.panel, border: `1px solid ${colors.line}`, borderRadius: 7,
   }
 
+  // Published above the early returns so the hook order stays stable while loading.
+  usePublishPageContext({
+    eyebrow: 'Market · sector intelligence',
+    title: 'Sector Intelligence',
+    detail: 'Regime context, rank movement across horizons, discovery-state mix, and cross-sectional momentum extremes.',
+    status: [
+      {
+        label: 'Market',
+        value: marketRegime.data?.regime && marketRegime.data.regime !== 'Unknown' ? marketRegime.data.regime : '—',
+      },
+    ],
+  })
+
   if (intelligence.isLoading) return <div style={{ padding: 24, color: colors.muted }}>Loading sector intelligence…</div>
   if (intelligence.isError) return <div style={{ padding: 24, color: colors.red }}>Sector intelligence could not be loaded.</div>
 
   return (
     <div style={{ color: colors.ink }}>
-      <header style={{ padding: '10px 2px 18px', borderBottom: `1px solid ${colors.line}`, marginBottom: 16 }}>
-        <div style={{ color: colors.blue, fontSize: 12, fontWeight: 700, textTransform: 'uppercase' }}>Sector intelligence</div>
-        <h1 style={{ fontSize: 26, lineHeight: 1.15, margin: '4px 0 5px', letterSpacing: 0 }}>Sector Rotation, Discovery & Momentum Skew</h1>
-        <p style={{ margin: 0, color: colors.muted, fontSize: 14 }}>
-          Beyond a same-day leaderboard: market regime context, rank movement across horizons, the discovery-state mix
-          each sector is currently in, and how many of its names sit at the extremes of the cross-sectional momentum ranking.
-        </p>
-      </header>
 
       {marketRegime.data && marketRegime.data.regime !== 'Unknown' && (() => {
         const rs = REGIME_STYLE[marketRegime.data.regime] || REGIME_STYLE['Unknown']
@@ -111,7 +117,7 @@ export default function SectorIntelligence() {
         const colColor = (value: number) => value >= 0 ? colors.green : colors.red
 
         return (
-          <section style={{ ...panel, marginBottom: 16, padding: '12px 14px', background: rs.bg, border: `1px solid ${rs.color}30` }}>
+          <section style={{ ...panel, marginBottom: 16, padding: '12px 14px', background: rs.bg, border: `1px solid ${rs.color}` }}>
             <div style={{ color: rs.color, fontSize: 11, fontWeight: 800, textTransform: 'uppercase' }}>Market regime</div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap', marginTop: 4 }}>
               <div style={{ flex: '0 1 auto', minWidth: 200 }}>
@@ -185,7 +191,7 @@ export default function SectorIntelligence() {
                   ] as [string, number][]).map(([label, value]) => (
                     <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                       <span style={{ fontSize: 11, color: colors.muted, fontWeight: 600 }}>{label}</span>
-                      <div style={{ width: 60, height: 8, background: '#e5e7eb', borderRadius: 4, overflow: 'hidden' }}>
+                      <div style={{ width: 60, height: 8, background: 'var(--tm-line)', borderRadius: 4, overflow: 'hidden' }}>
                         <div style={{ width: `${value}%`, height: '100%', background: value >= 60 ? colors.green : value >= 40 ? colors.amber : colors.red }} />
                       </div>
                       <span style={{ fontSize: 11, fontWeight: 700, color: value >= 60 ? colors.green : value >= 40 ? colors.amber : colors.red }} title={`of ${breadth.total} tickers`}>{value}%</span>
@@ -208,7 +214,7 @@ export default function SectorIntelligence() {
         </div>
         <div style={{ overflowX: 'auto' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-            <thead><tr style={{ background: '#f8fafc', color: colors.muted }}>
+            <thead><tr style={{ background: 'var(--tm-surface-sunken)', color: colors.muted }}>
               {['Sector', ...rotationWindows.map(session => windowLabels[session]), 'Rotation', 'Breadth (1d)', 'Breadth (1w)', 'Breadth (1mo)'].map(label => (
                 <th key={label} style={{ textAlign: label === 'Sector' ? 'left' : 'right', padding: '9px 10px', whiteSpace: 'nowrap', borderBottom: `1px solid ${colors.line}` }}>{label}</th>
               ))}
@@ -270,7 +276,7 @@ export default function SectorIntelligence() {
             </div>
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 1.4fr) minmax(200px, 1fr) minmax(260px, 1.4fr)', gap: 20 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 20 }}>
             <div>
               <div style={{ color: colors.muted, fontSize: 11, textTransform: 'uppercase', fontWeight: 700, marginBottom: 6 }}>Discovery-state mix</div>
               {discoveryOrder.filter(state => (detail.discovery_mix[state] ?? 0) > 0).length === 0 && (
@@ -350,7 +356,7 @@ export default function SectorIntelligence() {
                   aria-label="Leaders/laggards horizon"
                   value={horizon}
                   onChange={event => setHorizon(event.target.value)}
-                  style={{ border: `1px solid ${colors.line}`, borderRadius: 5, background: '#fff', color: colors.ink, padding: '3px 6px', fontSize: 11 }}
+                  style={{ border: `1px solid ${colors.line}`, borderRadius: 5, background: 'var(--tm-surface)', color: colors.ink, padding: '3px 6px', fontSize: 11 }}
                 >
                   {leaderWindows.map(session => (
                     <option key={session} value={session}>{windowLabels[session]}</option>

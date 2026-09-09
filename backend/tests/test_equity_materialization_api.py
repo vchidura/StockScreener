@@ -24,6 +24,7 @@ def test_materialized_equity_router_exposes_read_only_reporting_surfaces():
 
     assert paths == {
         "/api/equity/health",
+        "/api/equity/materialization-status",
         "/api/equity/current",
         "/api/equity/security/{ticker}",
         "/api/equity/context/{ticker}",

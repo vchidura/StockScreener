@@ -4,7 +4,16 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Stock Screener Portal</title>
+    <title>AlphaScreener Pro</title>
+    <script>
+      // Applied before first paint so a stored light theme does not flash dark.
+      try {
+        document.documentElement.dataset.theme =
+          localStorage.getItem('alphascreener.theme') === 'light' ? 'light' : 'dark'
+      } catch (error) {
+        document.documentElement.dataset.theme = 'dark'
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

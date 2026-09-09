@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react'
 import { useQuery, keepPreviousData } from '@tanstack/react-query'
 import { NavLink, useLocation, useNavigate } from 'react-router-dom'
-import { BarChart3, Radar, X } from 'lucide-react'
+import { BarChart3, History, Radar, X } from 'lucide-react'
+import PersistenceView from './research/PersistenceView'
 import {
   getScannerEventBacklog,
   getLatestScannerSignals,
@@ -9,12 +10,29 @@ import {
   ScannerQualificationRow,
   ScannerInterval,
 } from '../services/api'
+import { usePublishPageContext } from '../layout/pageContext'
+import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
+
+/** Entry-plan detail starts hidden so the board fits without horizontal scrolling. */
+const BOARD_COLUMNS: ColumnSpec[] = [
+  { key: 'ticker', label: 'Ticker', locked: true },
+  { key: 'signal_time', label: 'Latest signal' },
+  { key: 'frame', label: 'Frame', hiddenByDefault: true },
+  { key: 'side', label: 'Side / setup', locked: true },
+  { key: 'signal_open', label: 'Signal open', hiddenByDefault: true },
+  { key: 'signal_close', label: 'Signal close' },
+  { key: 'stop', label: 'Planned stop' },
+  { key: 'target', label: 'Planned target' },
+  { key: 'next_open', label: 'Next-bar open', hiddenByDefault: true },
+  { key: 'priority', label: 'Review priority' },
+  { key: 'evidence', label: 'Evidence' },
+]
 
 const colors = {
-  ink: '#172033', muted: '#667085', line: '#d8dee8', panel: '#ffffff',
-  canvas: '#f5f7fa', green: '#147d64', greenSoft: '#e7f5f0',
-  red: '#bd3c3c', redSoft: '#faeceb', amber: '#9a6700', amberSoft: '#fff4d6',
-  blue: '#245f9e', blueSoft: '#eaf2fb',
+  ink: 'var(--tm-ink)', muted: 'var(--tm-muted)', line: 'var(--tm-line)', panel: 'var(--tm-surface)',
+  canvas: 'var(--tm-canvas)', green: 'var(--tm-pos)', greenSoft: 'var(--tm-pos-soft)',
+  red: 'var(--tm-neg)', redSoft: 'var(--tm-neg-soft)', amber: 'var(--tm-warn)', amberSoft: 'var(--tm-warn-soft)',
+  blue: 'var(--tm-accent)', blueSoft: 'var(--tm-accent-soft)',
 }
 
 const scannerLabels: Record<string, string> = {
@@ -111,6 +129,7 @@ export default function ScannerResults() {
   const navigate = useNavigate()
   const location = useLocation()
   const researchView = location.pathname.endsWith('/research')
+  const persistenceView = location.pathname.endsWith('/persistence')
   const [signalInterval, setSignalInterval] = useState<'all' | ScannerInterval>('all')
   const [signalSide, setSignalSide] = useState<'all' | 'long' | 'short'>('all')
   const [signalEvidence, setSignalEvidence] = useState<'all' | 'robust' | 'monitor' | 'unranked'>('all')
@@ -125,6 +144,7 @@ export default function ScannerResults() {
   const qualification = useQuery({
     queryKey: ['scanner-qualification'],
     queryFn: () => getScannerQualification(),
+    enabled: !persistenceView,
   })
   const backlog = useQuery({
     queryKey: ['scanner-events', 'backlog'],
@@ -135,7 +155,7 @@ export default function ScannerResults() {
     queryKey: ['scanner-events', 'latest-by-ticker', signalInterval],
     queryFn: () => getLatestScannerSignals(signalInterval === 'all' ? undefined : signalInterval),
     placeholderData: keepPreviousData,
-    enabled: !researchView,
+    enabled: !researchView && !persistenceView,
   })
 
   const allRows = qualification.data?.results ?? []
@@ -198,30 +218,40 @@ export default function ScannerResults() {
     background: colors.panel, border: `1px solid ${colors.line}`, borderRadius: 7,
   }
   const control: React.CSSProperties = {
-    border: `1px solid ${colors.line}`, borderRadius: 5, background: '#fff',
+    border: `1px solid ${colors.line}`, borderRadius: 5, background: 'var(--tm-surface)',
     color: colors.ink, padding: '7px 10px', fontSize: 13,
   }
 
   const loading = researchView ? qualification.isLoading || backlog.isLoading : latestSignals.isLoading
   const errored = researchView ? qualification.isError || backlog.isError : latestSignals.isError
 
+  const board = useColumnPreferences('opportunity-board', BOARD_COLUMNS)
+  const showBoard = board.isVisible
+
+  // Published above the early returns so the hook order stays stable while loading.
+  usePublishPageContext({
+    eyebrow: 'Equity signal research',
+    title: 'Stock Research',
+    detail: 'Current scanner opportunities, historical outcome evidence, and statistical qualification.',
+    status: [
+      {
+        label: 'View',
+        value: persistenceView ? 'Persistence' : researchView ? 'Research' : 'Opportunity Board',
+      },
+    ],
+  })
+
   if (loading) return <div style={{ padding: 24, color: colors.muted }}>Loading stock research…</div>
   if (errored) return <div style={{ padding: 24, color: colors.red }}>Stock research could not be loaded.</div>
 
   return (
     <div style={{ color: colors.ink, opacity: latestSignals.isFetching || qualification.isFetching ? 0.6 : 1, transition: 'opacity 0.15s' }}>
-      <header style={{ padding: '10px 2px 18px', borderBottom: `1px solid ${colors.line}`, marginBottom: 16 }}>
-        <div style={{ color: colors.blue, fontSize: 12, fontWeight: 700, textTransform: 'uppercase' }}>Equity signal research</div>
-        <h1 style={{ fontSize: 26, lineHeight: 1.15, margin: '4px 0 5px', letterSpacing: 0 }}>Stock Research</h1>
-        <p style={{ margin: 0, color: colors.muted, fontSize: 14 }}>
-          Review current scanner opportunities separately from historical outcome evidence and statistical qualification.
-        </p>
-      </header>
 
       <nav aria-label="Stock research views" style={{ display: 'flex', gap: 4, borderBottom: `1px solid ${colors.line}`, marginBottom: 16 }}>
         {[
           { to: '/stock-research', label: 'Opportunity Board', icon: Radar, end: true },
           { to: '/stock-research/research', label: 'Research', icon: BarChart3, end: false },
+          { to: '/stock-research/persistence', label: 'Persistence', icon: History, end: false },
         ].map(item => {
           const Icon = item.icon
           return <NavLink key={item.to} to={item.to} end={item.end} style={({ isActive }) => ({
@@ -233,7 +263,7 @@ export default function ScannerResults() {
         })}
       </nav>
 
-      {researchView ? <>
+      {persistenceView ? <PersistenceView /> : researchView ? <>
       <section style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(175px, 1fr))', gap: 10, marginBottom: 16 }}>
         {[
           ['Combinations', allRows.length.toString(), 'scanner × side × horizon'],
@@ -270,18 +300,18 @@ export default function ScannerResults() {
             </select>
           </div>
         </div>
-        <div style={{ overflowX: 'auto', maxHeight: 690, overflowY: 'auto' }}>
+        <div className="tm-fit" style={{ maxHeight: 690, overflowY: 'auto' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-            <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}><tr style={{ background: '#f8fafc', color: colors.muted }}>
+            <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}><tr style={{ background: 'var(--tm-surface-sunken)', color: colors.muted }}>
               <th style={{ textAlign: 'left', padding: '9px 10px', whiteSpace: 'nowrap', borderBottom: `1px solid ${colors.line}` }}>Scanner</th>
               <th style={{ textAlign: 'left', padding: '9px 10px', whiteSpace: 'nowrap', borderBottom: `1px solid ${colors.line}` }}>Side</th>
               <th style={{ textAlign: 'left', padding: '9px 10px', whiteSpace: 'nowrap', borderBottom: `1px solid ${colors.line}` }}>Return</th>
-              {researchHorizons.map(horizon => <th key={horizon} style={{ textAlign: 'left', padding: '9px 10px', minWidth: 205, whiteSpace: 'nowrap', borderBottom: `1px solid ${colors.line}` }}>{horizonLabel(researchInterval, horizon)}</th>)}
+              {researchHorizons.map(horizon => <th key={horizon} style={{ textAlign: 'left', padding: '9px 10px', borderBottom: `1px solid ${colors.line}` }}>{horizonLabel(researchInterval, horizon)}</th>)}
             </tr></thead>
             <tbody>
               {researchGroups.length === 0 && <tr><td colSpan={3 + researchHorizons.length} style={{ padding: 18, color: colors.muted }}>No historical combinations match these filters.</td></tr>}
               {researchGroups.map(group => <tr key={`${group.scannerName}-${group.scannerVersion}-${group.direction}-${group.returnMode}`} style={{ borderBottom: `1px solid ${colors.line}` }}>
-                <td style={{ padding: '10px', minWidth: 180, verticalAlign: 'top' }}><strong>{researchScannerLabels[group.scannerName] ?? group.scannerName.replace(/_/g, ' ')}</strong><div style={{ color: colors.muted, fontSize: 10 }}>{group.scannerVersion}</div></td>
+                <td style={{ padding: '10px', minWidth: 140, verticalAlign: 'top' }}><strong>{researchScannerLabels[group.scannerName] ?? group.scannerName.replace(/_/g, ' ')}</strong><div style={{ color: colors.muted, fontSize: 10 }}>{group.scannerVersion}</div></td>
                 <td style={{ padding: '10px', verticalAlign: 'top', color: group.direction === 1 ? colors.green : colors.red, fontWeight: 700 }}>{group.direction === 1 ? 'Long' : 'Short'}</td>
                 <td style={{ padding: '10px', minWidth: 105, verticalAlign: 'top', color: colors.muted }}>{group.returnMode === 'RECOMMENDATION_PLAN' ? 'Stop / target plan' : 'Horizon close'}</td>
                 {researchHorizons.map(horizon => {
@@ -381,21 +411,30 @@ export default function ScannerResults() {
             </select>
           </div>
         </div>
-        <div style={{ padding: '8px 14px', background: colors.amberSoft, color: colors.amber, fontSize: 11, borderBottom: `1px solid ${colors.line}` }}>
-          Hourly review priority reflects directional discovery-state alignment, not conviction or trade approval. Daily and weekly signals remain unranked. Planned levels use the signal close; next-bar open is the first no-look-ahead evaluation price.
+        <div style={{ padding: '8px 14px', background: colors.amberSoft, color: colors.amber, fontSize: 11, borderBottom: `1px solid ${colors.line}`, display: 'flex', alignItems: 'flex-start', gap: 12 }}>
+          <span>
+            Hourly review priority reflects directional discovery-state alignment, not conviction or trade approval. Daily and weekly signals remain unranked. Planned levels use the signal close; next-bar open is the first no-look-ahead evaluation price.
+          </span>
+          <ColumnPicker
+            columns={BOARD_COLUMNS}
+            hidden={board.hidden}
+            onToggle={board.toggle}
+            onShowAll={board.showAll}
+            onReset={board.reset}
+          />
         </div>
-        <div style={{ overflowX: 'auto', maxHeight: 640, overflowY: 'auto' }}>
+        <div className="tm-fit" style={{ maxHeight: 640, overflowY: 'auto' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-            <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}><tr style={{ background: '#f8fafc', color: colors.muted }}>
-              {['Ticker', 'Latest signal', 'Frame', 'Side / setup', 'Signal open', 'Signal close', 'Planned stop', 'Planned target', 'Next-bar open', 'Review priority', 'Evidence'].map(label => (
-                <th key={label} style={{ textAlign: label === 'Ticker' || label === 'Side / setup' || label === 'Review priority' || label === 'Evidence' ? 'left' : 'right', padding: '9px 10px', whiteSpace: 'nowrap', borderBottom: `1px solid ${colors.line}` }}>{label}</th>
+            <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}><tr style={{ background: 'var(--tm-surface-sunken)', color: colors.muted }}>
+              {board.visibleColumns.map(column => (
+                <th key={column.key} style={{ textAlign: ['ticker', 'side', 'priority', 'evidence'].includes(column.key) ? 'left' : 'right', padding: '9px 10px', whiteSpace: 'nowrap', borderBottom: `1px solid ${colors.line}` }}>{column.label}</th>
               ))}
             </tr></thead>
             <tbody>
-              {latestSignals.isLoading && <tr><td colSpan={11} style={{ padding: 18, color: colors.muted }}>Loading latest scanner signals…</td></tr>}
-              {latestSignals.isError && <tr><td colSpan={11} style={{ padding: 18, color: colors.red }}>Latest scanner signals could not be loaded.</td></tr>}
+              {latestSignals.isLoading && <tr><td colSpan={board.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>Loading latest scanner signals…</td></tr>}
+              {latestSignals.isError && <tr><td colSpan={board.visibleColumns.length} style={{ padding: 18, color: colors.red }}>Latest scanner signals could not be loaded.</td></tr>}
               {!latestSignals.isLoading && !latestSignals.isError && latestRows.length === 0 && (
-                <tr><td colSpan={11} style={{ padding: 18, color: colors.muted }}>No scanner signals match these filters.</td></tr>
+                <tr><td colSpan={board.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>No scanner signals match these filters.</td></tr>
               )}
               {latestRows.map(row => {
                 const evidenceKey = `${row.scanner_name}|${row.interval}|${row.direction}`
@@ -419,7 +458,7 @@ export default function ScannerResults() {
                 ))
                 return (
                   <tr key={row.ticker} style={{ borderBottom: `1px solid ${colors.line}` }}>
-                    <td style={{ padding: '9px 10px' }}>
+                    {showBoard('ticker') && <td style={{ padding: '9px 10px' }}>
                       <button
                         type="button"
                         onClick={() => navigate(`/ticker/${row.ticker}`)}
@@ -427,19 +466,19 @@ export default function ScannerResults() {
                       >
                         {row.ticker}
                       </button>
-                    </td>
-                    <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap' }}>{signalTime(row.signal_time, row.interval)}</td>
-                    <td style={{ textAlign: 'right', padding: '9px 10px' }}>{intervalLabel(row.interval)}</td>
-                    <td style={{ padding: '9px 10px', minWidth: 185 }}>
+                    </td>}
+                    {showBoard('signal_time') && <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap' }}>{signalTime(row.signal_time, row.interval)}</td>}
+                    {showBoard('frame') && <td style={{ textAlign: 'right', padding: '9px 10px' }}>{intervalLabel(row.interval)}</td>}
+                    {showBoard('side') && <td style={{ padding: '9px 10px', minWidth: 165 }}>
                       <div style={{ color: row.direction === 1 ? colors.green : colors.red, fontWeight: 700 }}>{row.direction === 1 ? 'Long' : 'Short'} · {(row.trigger_type || row.scanner_name).replace(/_/g, ' ')}</div>
                       <div style={{ color: colors.muted, fontSize: 11 }}>{scannerLabels[row.scanner_name] ?? row.scanner_name}</div>
-                    </td>
-                    <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap' }}>{money(row.signal_open_price)}</td>
-                    <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap', fontWeight: 700 }}>{money(row.signal_close_price)}</td>
-                    <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap', color: colors.red }}>{money(row.stop_price)}</td>
-                    <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap', color: colors.green }}>{money(row.target_price)}</td>
-                    <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap' }}>{row.next_open_price == null ? <span style={{ color: colors.muted }}>Awaiting bar</span> : money(row.next_open_price)}</td>
-                    <td style={{ padding: '9px 10px', minWidth: 185 }}>
+                    </td>}
+                    {showBoard('signal_open') && <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap' }}>{money(row.signal_open_price)}</td>}
+                    {showBoard('signal_close') && <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap', fontWeight: 700 }}>{money(row.signal_close_price)}</td>}
+                    {showBoard('stop') && <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap', color: colors.red }}>{money(row.stop_price)}</td>}
+                    {showBoard('target') && <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap', color: colors.green }}>{money(row.target_price)}</td>}
+                    {showBoard('next_open') && <td style={{ textAlign: 'right', padding: '9px 10px', whiteSpace: 'nowrap' }}>{row.next_open_price == null ? <span style={{ color: colors.muted }}>Awaiting bar</span> : money(row.next_open_price)}</td>}
+                    {showBoard('priority') && <td style={{ padding: '9px 10px', minWidth: 165 }}>
                       <span style={{ background: priority.bg, color: priority.color, borderRadius: 4, padding: '3px 6px', fontWeight: 700 }}>
                         {priority.label}
                       </span>
@@ -450,8 +489,8 @@ export default function ScannerResults() {
                           {row.reversal_trigger && row.reversal_trigger !== 'NONE' ? ` · ${row.reversal_trigger.replace(/_/g, ' ')}` : ''}
                         </div>
                       )}
-                    </td>
-                    <td style={{ padding: '9px 10px', whiteSpace: 'nowrap' }}>
+                    </td>}
+                    {showBoard('evidence') && <td style={{ padding: '9px 10px', whiteSpace: 'nowrap' }}>
                       <span style={{ background: hasRobustEvidence ? colors.greenSoft : colors.amberSoft, color: hasRobustEvidence ? colors.green : colors.amber, borderRadius: 4, padding: '3px 6px', fontWeight: 700 }}>
                         {hasRobustEvidence
                           ? `Robust · ${evidenceHorizons.map(value => horizonLabel(row.interval, value)).join(' / ')}`
@@ -469,7 +508,7 @@ export default function ScannerResults() {
                           {breadthEvidence.distinct_tickers ?? '—'} tickers ({pct(breadthEvidence.top5_concentration, 0)} top-5) · sector α {pct(breadthEvidence.mean_sector_alpha, 2)}
                         </div>
                       )}
-                    </td>
+                    </td>}
                   </tr>
                 )
               })}

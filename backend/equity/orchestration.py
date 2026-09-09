@@ -1088,17 +1088,22 @@ class EquityMaterializationService:
             members=securities,
         )
         if not run_record.get("was_created", True):
-            return AnalysisRunResult(
-                analysis_run_id=run_record["analysis_run_id"],
-                interval=interval,
-                status=run_record["status"],
-                completed=run_record.get("completed_members", 0),
-                insufficient=run_record.get("insufficient_members", 0),
-                failed=run_record.get("failed_members", 0),
-                evidence_count=0,
-                inserted_evidence_count=0,
-                context_count=0,
+            restart = getattr(
+                self.analysis_repository, "restart_lease_expired_run", None
             )
+            restarted = bool(restart and restart(run_id))
+            if not restarted:
+                return AnalysisRunResult(
+                    analysis_run_id=run_record["analysis_run_id"],
+                    interval=interval,
+                    status=run_record["status"],
+                    completed=run_record.get("completed_members", 0),
+                    insufficient=run_record.get("insufficient_members", 0),
+                    failed=run_record.get("failed_members", 0),
+                    evidence_count=0,
+                    inserted_evidence_count=0,
+                    context_count=0,
+                )
         run_watermark = DecisionWatermark(
             watermark.market_time,
             run_record["observed_at"],

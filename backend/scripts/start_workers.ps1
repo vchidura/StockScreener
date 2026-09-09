@@ -53,7 +53,8 @@ function Start-Worker {
     param(
         [string]$Title,
         [string]$ScriptName,
-        [string[]]$Arguments = @()
+        [string[]]$Arguments = @(),
+        [switch]$Wait
     )
 
     $scriptPath = Join-Path $scripts $ScriptName
@@ -65,9 +66,12 @@ function Start-Worker {
     # -u keeps progress unbuffered so a stalled run is distinguishable from a healthy one.
     $argList = @("-X", "utf8", "-u", $scriptPath) + $Arguments
 
-    if ($NoNewWindow) {
+    if ($NoNewWindow -or $Wait) {
         Write-Output "==> $Title"
         & $python @argList
+        if ($LASTEXITCODE -ne 0) {
+            throw "$Title failed with exit code $LASTEXITCODE"
+        }
         return
     }
 
@@ -78,20 +82,61 @@ function Start-Worker {
     Write-Output ("Started {0}" -f $Title)
 }
 
+$oneShotFailures = [System.Collections.Generic.List[string]]::new()
+
+function Invoke-OneShotWorker {
+    param(
+        [string]$Title,
+        [string]$ScriptName,
+        [string[]]$Arguments = @()
+    )
+    try {
+        Start-Worker -Title $Title -ScriptName $ScriptName `
+            -Arguments $Arguments -Wait
+    }
+    catch {
+        $oneShotFailures.Add(("{0}: {1}" -f $Title, $_.Exception.Message))
+        Write-Warning $oneShotFailures[$oneShotFailures.Count - 1]
+    }
+}
+
 $env:PYTHONIOENCODING = "utf-8"
 $modeArgs = if ($Once) { @("--once") } else { @() }
 
 if ($Only -in @("All", "Equity")) {
-    Start-Worker -Title "equity-worker" -ScriptName "run_equity_worker.py" -Arguments $modeArgs
+    if ($Once) {
+        Invoke-OneShotWorker -Title "equity-worker" `
+            -ScriptName "run_equity_worker.py" -Arguments $modeArgs
+    }
+    else {
+        Start-Worker -Title "equity-worker" -ScriptName "run_equity_worker.py"
+    }
 
     # The snapshot publisher has no --once; it is either a single pass or continuous.
     $snapshotArgs = if ($Once) { @() } else { @("--continuous") }
-    Start-Worker -Title "equity-portal-snapshots" `
-        -ScriptName "refresh_equity_portal_snapshots.py" -Arguments $snapshotArgs
+    if ($Once) {
+        Invoke-OneShotWorker -Title "equity-portal-snapshots" `
+            -ScriptName "refresh_equity_portal_snapshots.py"
+    }
+    else {
+        Start-Worker -Title "equity-portal-snapshots" `
+            -ScriptName "refresh_equity_portal_snapshots.py" `
+            -Arguments $snapshotArgs
+    }
 }
 
 if ($Only -in @("All", "Options")) {
-    Start-Worker -Title "option-worker" -ScriptName "run_option_worker.py" -Arguments $modeArgs
+    if ($Once) {
+        Invoke-OneShotWorker -Title "option-worker" `
+            -ScriptName "run_option_worker.py" -Arguments $modeArgs
+    }
+    else {
+        Start-Worker -Title "option-worker" -ScriptName "run_option_worker.py"
+    }
+}
+
+if ($oneShotFailures.Count -gt 0) {
+    throw "One-shot worker failures: $($oneShotFailures -join '; ')"
 }
 
 Write-Output ""

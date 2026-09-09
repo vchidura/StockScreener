@@ -118,6 +118,36 @@ Monitor run/member status from another terminal without starting work:
   .\backend\scripts\report_equity_analysis_status.py
 ```
 
+After an interrupted worker, run one catch-up pass from the repository root:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Only Equity -Once
+```
+
+One-shot mode runs equity materialization to completion before refreshing portal
+snapshots, so a newly published daily or weekly cohort cannot leave the portal
+generation stale. Continuous mode still runs both workers independently.
+
+One-shot invocation is safe for intermittent operation. Each native `5m`, `15m`,
+and `30m` request re-reads the available session-to-date range and persists bars
+idempotently, so repeated runs do not duplicate data and an after-close run fills
+the complete session. Run the close pass after the configured provider delay
+(15 minutes by default), not exactly at the closing bell. Each invocation
+materializes analysis only at its latest due watermark; sparse operation therefore
+does not reconstruct every skipped intraday signal evaluation. Use continuous mode
+when every 5m/15m/30m signal checkpoint is required.
+
+Ticker charts keep canonical history unchanged and may add current-session
+`15m`, `30m`, `1h`, or `1d` display candles composed directly from fresh,
+finalized `5m` bars. The latest candle is labeled **Developing candle** until
+its target window closes and is replaced by the canonical bar when publication
+catches up. These rows are response-only: scanners, patterns, setups, evidence,
+outcomes, and current projections continue to use canonical finalized bars.
+Missing or stale `5m` input disables the display fold rather than fabricating a
+candle. A developing `5m` candle is unavailable while the Advanced `1m` stream
+remains disabled.
+
 `run_option_worker.py` performs delayed option-chain ingestion, normalization,
 local IV/Greeks, chain and expiration analysis, six strategy modules, payoff and
 scenario analysis, and atomic candidate/recommendation persistence. It runs on

@@ -44,6 +44,7 @@ LOGGER = logging.getLogger("equity-worker")
 POLL_SECONDS = int(os.getenv("EQUITY_WORKER_POLL_SECONDS", "15"))
 HEARTBEAT_SECONDS = int(os.getenv("EQUITY_WORKER_HEARTBEAT_SECONDS", "300"))
 STALE_RUN_MINUTES = int(os.getenv("EQUITY_STALE_RUN_MINUTES", "60"))
+INTERVAL_RETRY_SECONDS = int(os.getenv("EQUITY_INTERVAL_RETRY_SECONDS", "300"))
 NATIVE_FETCH_WORKERS = int(os.getenv("EQUITY_NATIVE_FETCH_WORKERS", "8"))
 PROVIDER_DELAY_MINUTES = int(os.getenv("EQUITY_PROVIDER_DELAY_MINUTES", "15"))
 WORKER_LOCK_NAME = os.getenv(
@@ -177,6 +178,123 @@ def ingest_due_interval(
         return None
 
 
+def materialize_due_interval(
+    service: EquityMaterializationService,
+    reference: ReferenceRefreshResult,
+    *,
+    interval: str,
+    slot: datetime,
+    observed_at: datetime,
+    once: bool,
+) -> bool:
+    """Materialize one due interval. False means the slot should be retried later."""
+    LOGGER.info("materializing interval=%s slot=%s", interval, slot.isoformat())
+    ingestion = ingest_due_interval(
+        service,
+        reference.revisions,
+        interval=interval,
+        slot=slot,
+        observed_at=observed_at,
+        once=once,
+    )
+    if ingestion is None:
+        return False
+    LOGGER.info(
+        "ingestion complete interval=%s slot=%s bars=%s inserted=%s missing=%s",
+        interval,
+        slot.isoformat(),
+        ingestion.bar_count,
+        ingestion.inserted_count,
+        len(ingestion.missing_tickers),
+    )
+    missing_fraction = (
+        len(ingestion.missing_tickers) / len(reference.revisions)
+        if reference.revisions else 1.0
+    )
+    if missing_fraction > 0.05:
+        LOGGER.error(
+            "interval=%s slot=%s missing %.1f%% of tickers; analysis will fail closed",
+            interval,
+            slot.isoformat(),
+            missing_fraction * 100,
+        )
+    elif ingestion.missing_tickers:
+        LOGGER.warning(
+            "interval=%s slot=%s missing tickers=%s",
+            interval,
+            slot.isoformat(),
+            ",".join(ingestion.missing_tickers[:20]),
+        )
+    publication = service.publish_canonical_interval(
+        reference.revisions,
+        interval=interval,
+        watermark=DecisionWatermark(slot, observed_at),
+    )
+    if publication.status == "FAILED":
+        LOGGER.error(
+            "canonical publication failed interval=%s slot=%s "
+            "selected=%s missing=%s failed=%s",
+            interval,
+            slot.isoformat(),
+            publication.selected,
+            publication.missing,
+            publication.failed,
+        )
+        return True
+    LOGGER.info(
+        "publication complete interval=%s slot=%s status=%s selected=%s missing=%s",
+        interval,
+        slot.isoformat(),
+        publication.status,
+        publication.selected,
+        publication.missing,
+    )
+    LOGGER.info(
+        "maturing outcomes interval=%s slot=%s",
+        interval,
+        slot.isoformat(),
+    )
+    outcome_runs = mature_prospective_scanner_outcomes(
+        service,
+        interval,
+        available_by=observed_at,
+    )
+    if outcome_runs:
+        LOGGER.info(
+            "outcomes interval=%s due=%s persisted=%s pending=%s",
+            interval,
+            sum(row.due for row in outcome_runs),
+            sum(row.persisted for row in outcome_runs),
+            sum(row.pending for row in outcome_runs),
+        )
+    LOGGER.info(
+        "materializing analysis interval=%s slot=%s members=%s",
+        interval,
+        slot.isoformat(),
+        len(reference.revisions),
+    )
+    analysis = service.materialize_interval(
+        reference.revisions,
+        universe_run_id=reference.universe_run_id,
+        interval=interval,
+        watermark=DecisionWatermark(slot, observed_at),
+    )
+    LOGGER.info(
+        "ingestion=%s publication=%s analysis=%s",
+        ingestion,
+        publication,
+        analysis,
+    )
+    if analysis.status == "RUNNING":
+        LOGGER.warning(
+            "analysis remains non-terminal interval=%s slot=%s; retrying later",
+            interval,
+            slot.isoformat(),
+        )
+        return False
+    return True
+
+
 def run_worker(*, once: bool = False) -> None:
     invalid = set(INTERVALS) - SUPPORTED_INTERVALS
     if invalid:
@@ -190,7 +308,8 @@ def run_worker(*, once: bool = False) -> None:
     tickers = tuple(get_selected_tickers(active_only=True))
     if not tickers:
         raise RuntimeError("no active selected_tickers are configured")
-    stale_after = timedelta(minutes=STALE_RUN_MINUTES)
+    # Acquiring advisory leadership proves no prior worker can still own its RUNNING rows.
+    stale_after = timedelta(0)
     analysis_repository = EquityAnalysisRepository()
     recovered_runs = analysis_repository.fail_stale_runs(
         stale_after=stale_after
@@ -208,6 +327,8 @@ def run_worker(*, once: bool = False) -> None:
     )
     reference = None
     reference_checked_at = None
+    retry_after: dict[str, datetime] = {}
+    once_failures: list[str] = []
     completed = analysis_repository.latest_published_market_times(INTERVALS)
     provider_delay = timedelta(minutes=PROVIDER_DELAY_MINUTES)
     last_heartbeat_at = datetime.now(timezone.utc)
@@ -223,6 +344,9 @@ def run_worker(*, once: bool = False) -> None:
             slot = latest_due_slot(now, interval, provider_delay=provider_delay)
             if slot is None or completed.get(interval) == slot:
                 continue
+            retry_at = retry_after.get(interval)
+            if retry_at is not None and now < retry_at:
+                continue
             if (
                 reference is None
                 or reference_checked_at is None
@@ -232,106 +356,55 @@ def run_worker(*, once: bool = False) -> None:
                     service, tickers, now, slot.date()
                 )
                 reference_checked_at = now
-            LOGGER.info("materializing interval=%s slot=%s", interval, slot.isoformat())
-            ingestion = ingest_due_interval(
-                service,
-                reference.revisions,
-                interval=interval,
-                slot=slot,
-                observed_at=now,
-                once=once,
-            )
-            if ingestion is None:
-                break
-            LOGGER.info(
-                "ingestion complete interval=%s slot=%s bars=%s inserted=%s missing=%s",
-                interval,
-                slot.isoformat(),
-                ingestion.bar_count,
-                ingestion.inserted_count,
-                len(ingestion.missing_tickers),
-            )
-            missing_fraction = (
-                len(ingestion.missing_tickers) / len(reference.revisions)
-                if reference.revisions else 1.0
-            )
-            if missing_fraction > 0.05:
-                LOGGER.error(
-                    "interval=%s slot=%s missing %.1f%% of tickers; analysis will fail closed",
-                    interval,
-                    slot.isoformat(),
-                    missing_fraction * 100,
+            try:
+                finished = materialize_due_interval(
+                    service,
+                    reference,
+                    interval=interval,
+                    slot=slot,
+                    observed_at=now,
+                    once=once,
                 )
-            elif ingestion.missing_tickers:
-                LOGGER.warning(
-                    "interval=%s slot=%s missing tickers=%s",
-                    interval,
-                    slot.isoformat(),
-                    ",".join(ingestion.missing_tickers[:20]),
+            except Exception as exc:
+                if once:
+                    LOGGER.exception(
+                        "interval=%s slot=%s failed; continuing one-shot pass",
+                        interval,
+                        slot.isoformat(),
+                    )
+                else:
+                    LOGGER.exception(
+                        "interval=%s slot=%s failed; retrying after %ss and "
+                        "continuing with the remaining intervals",
+                        interval,
+                        slot.isoformat(),
+                        INTERVAL_RETRY_SECONDS,
+                    )
+                if once:
+                    once_failures.append(
+                        f"{interval}@{slot.isoformat()}:{type(exc).__name__}"
+                    )
+                    continue
+                retry_after[interval] = now + timedelta(
+                    seconds=INTERVAL_RETRY_SECONDS
                 )
-            publication = service.publish_canonical_interval(
-                reference.revisions,
-                interval=interval,
-                watermark=DecisionWatermark(slot, now),
-            )
-            if publication.status == "FAILED":
-                LOGGER.error(
-                    "canonical publication failed interval=%s slot=%s "
-                    "selected=%s missing=%s failed=%s",
-                    interval,
-                    slot.isoformat(),
-                    publication.selected,
-                    publication.missing,
-                    publication.failed,
-                )
-                completed[interval] = slot
                 continue
-            LOGGER.info(
-                "publication complete interval=%s slot=%s status=%s selected=%s missing=%s",
-                interval,
-                slot.isoformat(),
-                publication.status,
-                publication.selected,
-                publication.missing,
-            )
-            LOGGER.info(
-                "maturing outcomes interval=%s slot=%s",
-                interval,
-                slot.isoformat(),
-            )
-            outcome_runs = mature_prospective_scanner_outcomes(
-                service,
-                interval,
-                available_by=now,
-            )
-            if outcome_runs:
-                LOGGER.info(
-                    "outcomes interval=%s due=%s persisted=%s pending=%s",
-                    interval,
-                    sum(row.due for row in outcome_runs),
-                    sum(row.persisted for row in outcome_runs),
-                    sum(row.pending for row in outcome_runs),
+            retry_after.pop(interval, None)
+            if finished:
+                completed[interval] = slot
+            elif once:
+                once_failures.append(
+                    f"{interval}@{slot.isoformat()}:NON_TERMINAL"
                 )
-            LOGGER.info(
-                "materializing analysis interval=%s slot=%s members=%s",
-                interval,
-                slot.isoformat(),
-                len(reference.revisions),
-            )
-            analysis = service.materialize_interval(
-                reference.revisions,
-                universe_run_id=reference.universe_run_id,
-                interval=interval,
-                watermark=DecisionWatermark(slot, now),
-            )
-            LOGGER.info(
-                "ingestion=%s publication=%s analysis=%s",
-                ingestion,
-                publication,
-                analysis,
-            )
-            completed[interval] = slot
+            else:
+                retry_after[interval] = now + timedelta(
+                    seconds=INTERVAL_RETRY_SECONDS
+                )
         if once:
+            if once_failures:
+                raise RuntimeError(
+                    "one-shot equity intervals failed: " + ", ".join(once_failures)
+                )
             return
         heartbeat_at = datetime.now(timezone.utc)
         if heartbeat_at - last_heartbeat_at >= timedelta(seconds=HEARTBEAT_SECONDS):

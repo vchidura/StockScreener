@@ -1,8 +1,28 @@
 import { useState, useEffect, useMemo, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-query'
-import { scanMACrossover, MAScanResponse, MAResult, getLatestPriceDate } from '../services/api'
-import StreakPanel from '../components/StreakPanel'
+import { scanMACrossover, MAScanResponse, MAResult } from '../services/api'
+import { usePublishPageContext } from '../layout/pageContext'
+import { CommandBar, CommandField, CommandGroup, CommandSpacer, ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
+import { useSessionDate } from '../layout/sessionDate'
+
+/** Weekly-confirmation and provenance columns start hidden so the table fits a laptop screen. */
+const MA_COLUMNS: ColumnSpec[] = [
+  { key: 'ticker', label: 'Ticker', locked: true },
+  { key: 'signal', label: 'Signal', locked: true },
+  { key: 'markers', label: 'Markers', hiddenByDefault: true },
+  { key: 'last_close', label: 'Last close' },
+  { key: 'short_ma', label: 'Short MA' },
+  { key: 'long_ma', label: 'Long MA' },
+  { key: 'ma_spread_pct', label: 'Spread %' },
+  { key: 'days_since_cross', label: 'Days since cross' },
+  { key: 'crossover_date', label: 'Cross date', hiddenByDefault: true },
+  { key: 'price_change_since_cross_pct', label: 'Since cross %' },
+  { key: 'weekly_short_ma', label: 'W-Short MA', hiddenByDefault: true },
+  { key: 'weekly_long_ma', label: 'W-Long MA', hiddenByDefault: true },
+  { key: 'weekly_spread_pct', label: 'W-Spread %', hiddenByDefault: true },
+  { key: 'weekly_signal', label: 'W-Signal' },
+]
 
 type TabKey = 'bullish-cross' | 'bearish-cross' | 'bullish-trend' | 'bearish-trend'
 
@@ -10,7 +30,7 @@ const TABS: { key: TabKey; label: string; signals: string[]; color: string }[] =
   { key: 'bullish-cross',  label: 'Bullish Crossover',  signals: ['Bullish Crossover', 'Recent Bullish'],   color: 'var(--success)' },
   { key: 'bearish-cross',  label: 'Bearish Crossover',  signals: ['Bearish Crossover', 'Recent Bearish'],   color: 'var(--danger)' },
   { key: 'bullish-trend',  label: 'Bullish Trend',      signals: ['Above MA'],                              color: '#2196f3' },
-  { key: 'bearish-trend',  label: 'Bearish Trend',      signals: ['Below MA'],                              color: '#ff9800' },
+  { key: 'bearish-trend',  label: 'Bearish Trend',      signals: ['Below MA'],                              color: 'var(--tm-warn)' },
 ]
 
 const STRATEGY_TOOLTIP =
@@ -98,8 +118,7 @@ function MAScreener() {
   const [activeTab, setActiveTab] = useState<TabKey>('bullish-cross')
   const [sortKey, setSortKey] = useState<SortKey | null>(null)
   const [sortDir, setSortDir] = useState<SortDir>('asc')
-  const [scanDate, setScanDate] = useState('')
-  const [latestDate, setLatestDate] = useState('')
+  const { pinned: scanDate } = useSessionDate()
   const [interval, setInterval] = useState<'5m' | '15m' | '30m' | '1h' | '1d'>('1d')
 
   const { data, isFetching: loading } = useQuery<MAScanResponse>({
@@ -113,8 +132,6 @@ function MAScreener() {
     queryClient.setQueryData(key, undefined)
     await queryClient.fetchQuery({ queryKey: key, queryFn: () => scanMACrossover(undefined, shortPeriod, longPeriod, scanDate || undefined, interval, true) })
   }, [interval, scanDate, shortPeriod, longPeriod, queryClient])
-
-  useEffect(() => { getLatestPriceDate().then(setLatestDate).catch(() => {}) }, [])
 
   const getTabItems = (tab: typeof TABS[number]): MAResult[] => {
     if (!data?.results_by_signal) return []
@@ -200,6 +217,19 @@ function MAScreener() {
 
   const spreadColor = (pct: number) => (pct >= 0 ? 'var(--success)' : 'var(--danger)')
 
+  const columns = useColumnPreferences('ma-crossover', MA_COLUMNS)
+  const show = columns.isVisible
+
+  usePublishPageContext({
+    eyebrow: 'Trend strategy · moving averages',
+    title: 'MA Crossover',
+    detail: STRATEGY_TOOLTIP.split('\n')[0],
+    status: [
+      { label: 'Interval', value: interval },
+    ],
+    session: interval,
+  })
+
   const handleSort = (key: SortKey) => {
     if (sortKey === key) {
       setSortDir(d => d === 'asc' ? 'desc' : 'asc')
@@ -240,92 +270,55 @@ function MAScreener() {
 
   return (
     <div>
-      {/* Header */}
-      <div className="card-header" style={{ border: 'none', padding: 0, marginBottom: '1rem' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-          <h1 style={{ fontSize: '1.5rem', fontWeight: 700, margin: 0 }}>
-            MA Crossover
-            <InfoIcon tooltip={STRATEGY_TOOLTIP} />
-          </h1>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-            <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Short:</label>
-            <input
-              type="number"
-              value={shortPeriod}
-              onChange={(e) => setShortPeriod(Number(e.target.value))}
-              min={2}
-              max={50}
-              style={{ width: '60px', padding: '0.3rem 0.4rem', borderRadius: '6px', border: '1px solid var(--border)', fontSize: '0.85rem' }}
-              title={`Short MA (${shortPeriod}): Fast-moving average period in days.`}
-            />
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-            <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Long:</label>
-            <input
-              type="number"
-              value={longPeriod}
-              onChange={(e) => setLongPeriod(Number(e.target.value))}
-              min={5}
-              max={200}
-              style={{ width: '60px', padding: '0.3rem 0.4rem', borderRadius: '6px', border: '1px solid var(--border)', fontSize: '0.85rem' }}
-              title={`Long MA (${longPeriod}): Slow-moving average period in days.`}
-            />
-          </div>
-          <button className="btn btn-secondary" onClick={() => handleRefresh()} style={{ padding: '0.3rem 0.7rem', fontSize: '0.82rem' }}>
-            Apply
-          </button>
-          <div style={{ width: '1px', height: '20px', background: 'var(--border)' }} />
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-            <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Date:</label>
-            <input
-              type="date"
-              value={scanDate || latestDate}
-              onChange={(e) => { setScanDate(e.target.value); }}
-              style={{ padding: '0.3rem 0.4rem', borderRadius: '6px', border: '1px solid var(--border)', fontSize: '0.85rem' }}
-            />
-            {scanDate && (
-              <button
-                className="btn btn-secondary"
-                onClick={() => setScanDate('')}
-                style={{ padding: '0.2rem 0.4rem', fontSize: '0.78rem' }}
-                title="Reset to latest"
-              >
-                ✕
-              </button>
-            )}
-          </div>
-          <div style={{ width: '1px', height: '20px', background: 'var(--border)' }} />
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
-            <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Interval:</label>
-            {(['5m', '15m', '30m', '1h', '1d'] as const).map((iv) => (
-              <button
-                key={iv}
-                onClick={() => { setInterval(iv); }}
-                style={{
-                  padding: '0.25rem 0.5rem',
-                  fontSize: '0.78rem',
-                  borderRadius: '4px',
-                  border: interval === iv ? '2px solid var(--primary-color)' : '1px solid var(--border)',
-                  background: interval === iv ? 'var(--primary-color)' : 'transparent',
-                  color: interval === iv ? '#fff' : 'var(--text-secondary)',
-                  cursor: 'pointer',
-                  fontWeight: interval === iv ? 600 : 400,
-                }}
-                title={iv === '1d' ? 'Daily candles' : iv === '1h' ? 'Hourly candles' : `${iv} candles (intraday)`}
-              >
-                {iv}
-              </button>
-            ))}
-          </div>
-          <button className="btn btn-primary" onClick={handleRefresh} disabled={loading} style={{ padding: '0.3rem 0.7rem', fontSize: '0.82rem' }}>
-            {loading ? 'Scanning...' : 'Refresh'}
-          </button>
-        </div>
-      </div>
-
-      <StreakPanel strategy="ma-crossover" shortPeriod={shortPeriod} longPeriod={longPeriod} />
+      <CommandBar>
+        <CommandField label="Short MA">
+          <input
+            type="number"
+            value={shortPeriod}
+            onChange={(e) => setShortPeriod(Number(e.target.value))}
+            min={2}
+            max={50}
+            style={{ width: 64 }}
+            title={`Short MA (${shortPeriod}): fast-moving average period in bars.`}
+          />
+        </CommandField>
+        <CommandField label="Long MA">
+          <input
+            type="number"
+            value={longPeriod}
+            onChange={(e) => setLongPeriod(Number(e.target.value))}
+            min={5}
+            max={200}
+            style={{ width: 64 }}
+            title={`Long MA (${longPeriod}): slow-moving average period in bars.`}
+          />
+        </CommandField>
+        <CommandGroup label="Interval">
+          {(['5m', '15m', '30m', '1h', '1d'] as const).map((iv) => (
+            <button
+              key={iv}
+              type="button"
+              className={interval === iv ? 'is-active' : undefined}
+              onClick={() => setInterval(iv)}
+              title={iv === '1d' ? 'Daily candles' : iv === '1h' ? 'Hourly candles' : `${iv} candles (intraday)`}
+            >
+              {iv}
+            </button>
+          ))}
+        </CommandGroup>
+        <CommandSpacer />
+        <span className="tm-commandbar__note">{tabItems.length} matches</span>
+        <ColumnPicker
+          columns={MA_COLUMNS}
+          hidden={columns.hidden}
+          onToggle={columns.toggle}
+          onShowAll={columns.showAll}
+          onReset={columns.reset}
+        />
+        <button type="button" className="tm-commandbar__action" onClick={handleRefresh} disabled={loading}>
+          {loading ? 'Scanning…' : 'Refresh'}
+        </button>
+      </CommandBar>
 
       {loading && (
         <div className="loading">
@@ -340,6 +333,7 @@ function MAScreener() {
           <div style={{
             display: 'flex',
             gap: '0',
+            flexWrap: 'wrap',
             borderBottom: '2px solid var(--border)',
             marginBottom: '1rem',
           }}>
@@ -361,7 +355,7 @@ function MAScreener() {
                 <span style={{
                   marginLeft: '0.5rem',
                   background: 'var(--primary-color)',
-                  color: '#fff',
+                  color: 'var(--tm-on-accent)',
                   borderRadius: '10px',
                   padding: '2px 8px',
                   fontSize: '0.8rem',
@@ -403,8 +397,8 @@ function MAScreener() {
                   {tab.label}
                   <span style={{
                     marginLeft: '0.5rem',
-                    background: isActive ? tab.color : (isCrossTab && filteredCount > 0) ? tab.color : 'var(--border)',
-                    color: isActive || (isCrossTab && filteredCount > 0) ? '#fff' : 'var(--text-secondary)',
+                    background: isActive || (isCrossTab && filteredCount > 0) ? (tab.color ?? 'var(--tm-accent)') : 'var(--tm-line)',
+                    color: isActive || (isCrossTab && filteredCount > 0) ? 'var(--tm-on-accent)' : 'var(--text-secondary)',
                     borderRadius: '10px',
                     padding: '2px 8px',
                     fontSize: '0.8rem',
@@ -474,50 +468,50 @@ function MAScreener() {
           </div>
 
           {/* Active tab table */}
-          <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
+          <div className="card tm-fit" style={{ padding: 0 }}>
             <table className="data-table">
               <thead>
                 <tr>
-                  <th onClick={() => handleSort('ticker')} style={thStyle('ticker')}>
+                  {show('ticker') && <th onClick={() => handleSort('ticker')} style={thStyle('ticker')}>
                     Ticker{sortArrow('ticker')}
-                  </th>
-                  <th>Signal</th>
-                  <th style={{ whiteSpace: 'nowrap' }}>Markers<InfoIcon tooltip={MARKERS_LEGEND} /></th>
-                  <th onClick={() => handleSort('last_close')} style={thStyle('last_close', 'right')}>
+                  </th>}
+                  {show('signal') && <th>Signal</th>}
+                  {show('markers') && <th className="tm-nowrap">Markers<InfoIcon tooltip={MARKERS_LEGEND} /></th>}
+                  {show('last_close') && <th onClick={() => handleSort('last_close')} style={thStyle('last_close', 'right')}>
                     Last Close{sortArrow('last_close')}
-                  </th>
-                  <th onClick={() => handleSort('short_ma')} style={thStyle('short_ma', 'right')}>
+                  </th>}
+                  {show('short_ma') && <th onClick={() => handleSort('short_ma')} style={thStyle('short_ma', 'right')}>
                     Short MA ({shortPeriod}){sortArrow('short_ma')}
-                  </th>
-                  <th onClick={() => handleSort('long_ma')} style={thStyle('long_ma', 'right')}>
+                  </th>}
+                  {show('long_ma') && <th onClick={() => handleSort('long_ma')} style={thStyle('long_ma', 'right')}>
                     Long MA ({longPeriod}){sortArrow('long_ma')}
-                  </th>
-                  <th onClick={() => handleSort('ma_spread_pct')} style={thStyle('ma_spread_pct', 'right')}>
-                    <span style={{ whiteSpace: 'nowrap' }}>Spread %{sortArrow('ma_spread_pct')}<InfoIcon tooltip="Percentage gap between the short and long MAs. Wider spread = stronger trend momentum. Narrowing spread warns the crossover may reverse." /></span>
-                  </th>
-                  <th onClick={() => handleSort('days_since_cross')} style={thStyle('days_since_cross', 'center')}>
+                  </th>}
+                  {show('ma_spread_pct') && <th onClick={() => handleSort('ma_spread_pct')} style={thStyle('ma_spread_pct', 'right')}>
+                    <span className="tm-nowrap">Spread %{sortArrow('ma_spread_pct')}<InfoIcon tooltip="Percentage gap between the short and long MAs. Wider spread = stronger trend momentum. Narrowing spread warns the crossover may reverse." /></span>
+                  </th>}
+                  {show('days_since_cross') && <th onClick={() => handleSort('days_since_cross')} style={thStyle('days_since_cross', 'center')}>
                     Days{sortArrow('days_since_cross')}
-                  </th>
-                  <th>Cross Date</th>
-                  <th onClick={() => handleSort('price_change_since_cross_pct')} style={thStyle('price_change_since_cross_pct', 'right')}>
+                  </th>}
+                  {show('crossover_date') && <th>Cross Date</th>}
+                  {show('price_change_since_cross_pct') && <th onClick={() => handleSort('price_change_since_cross_pct')} style={thStyle('price_change_since_cross_pct', 'right')}>
                     Since Cross %{sortArrow('price_change_since_cross_pct')}
-                  </th>
-                  <th onClick={() => handleSort('weekly_short_ma')} style={{ ...thStyle('weekly_short_ma', 'right'), borderLeft: '2px solid var(--border)' }}>
+                  </th>}
+                  {show('weekly_short_ma') && <th onClick={() => handleSort('weekly_short_ma')} style={{ ...thStyle('weekly_short_ma', 'right'), borderLeft: '2px solid var(--border)' }}>
                     W-Short ({shortPeriod}){sortArrow('weekly_short_ma')}
-                  </th>
-                  <th onClick={() => handleSort('weekly_long_ma')} style={thStyle('weekly_long_ma', 'right')}>
+                  </th>}
+                  {show('weekly_long_ma') && <th onClick={() => handleSort('weekly_long_ma')} style={thStyle('weekly_long_ma', 'right')}>
                     W-Long ({longPeriod}){sortArrow('weekly_long_ma')}
-                  </th>
-                  <th onClick={() => handleSort('weekly_spread_pct')} style={thStyle('weekly_spread_pct', 'right')}>
-                    <span style={{ whiteSpace: 'nowrap' }}>W-Spread %{sortArrow('weekly_spread_pct')}<InfoIcon tooltip="Weekly MA spread: percentage gap between the weekly short and long SMAs. Computed from true weekly closes (last trading day of each week). Confirms whether the daily signal aligns with the broader weekly trend." /></span>
-                  </th>
-                  <th style={{ whiteSpace: 'nowrap' }}>W-Signal<InfoIcon tooltip="Weekly crossover signal using true weekly closes.\nW-Bullish Cross: Weekly short SMA just crossed above weekly long SMA.\nW-Bearish Cross: Weekly short SMA just crossed below weekly long SMA.\nW-Above: Weekly short SMA is above weekly long SMA (weekly uptrend).\nW-Below: Weekly short SMA is below weekly long SMA (weekly downtrend)." /></th>
+                  </th>}
+                  {show('weekly_spread_pct') && <th onClick={() => handleSort('weekly_spread_pct')} style={thStyle('weekly_spread_pct', 'right')}>
+                    <span className="tm-nowrap">W-Spread %{sortArrow('weekly_spread_pct')}<InfoIcon tooltip="Weekly MA spread: percentage gap between the weekly short and long SMAs. Computed from true weekly closes (last trading day of each week). Confirms whether the daily signal aligns with the broader weekly trend." /></span>
+                  </th>}
+                  {show('weekly_signal') && <th className="tm-nowrap">W-Signal<InfoIcon tooltip="Weekly crossover signal using true weekly closes.\nW-Bullish Cross: Weekly short SMA just crossed above weekly long SMA.\nW-Bearish Cross: Weekly short SMA just crossed below weekly long SMA.\nW-Above: Weekly short SMA is above weekly long SMA (weekly uptrend).\nW-Below: Weekly short SMA is below weekly long SMA (weekly downtrend)." /></th>}
                 </tr>
               </thead>
               <tbody>
                 {tabItems.length === 0 ? (
                   <tr>
-                    <td colSpan={14} style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-secondary)' }}>
+                    <td colSpan={columns.visibleColumns.length} style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-secondary)' }}>
                       {isCrossTab
                         ? 'No results match the current filters across any tab'
                         : `No ${activeTabDef.label.toLowerCase()} signals found`}
@@ -526,12 +520,12 @@ function MAScreener() {
                 ) : (
                   tabItems.map((r, idx) => (
                     <tr key={idx}>
-                      <td>
+                      {show('ticker') && <td>
                         <span className="ticker" onClick={() => navigate(`/ticker/${r.ticker}`)}>
                           {r.ticker}
                         </span>
-                      </td>
-                      <td>
+                      </td>}
+                      {show('signal') && <td>
                         {(() => {
                           const isRecent = r.signal.startsWith('Recent')
                           const isBullish = r.signal.includes('Bullish')
@@ -543,7 +537,7 @@ function MAScreener() {
                               padding: '3px 8px',
                               borderRadius: '4px',
                               background: isRecent ? 'transparent' : color,
-                              color: isRecent ? color : '#fff',
+                              color: isRecent ? color : 'var(--tm-on-accent)',
                               border: isRecent ? `1.5px solid ${color}` : 'none',
                               whiteSpace: 'nowrap',
                             }}>
@@ -551,8 +545,8 @@ function MAScreener() {
                             </span>
                           )
                         })()}
-                      </td>
-                      <td>
+                      </td>}
+                      {show('markers') && <td>
                         <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
                           {r.markers?.map((m, i) => {
                             const mc = MARKER_COLORS[m] || { bg: '#eee', text: '#333' }
@@ -572,18 +566,18 @@ function MAScreener() {
                             )
                           })}
                         </div>
-                      </td>
-                      <td style={{ textAlign: 'right' }}>${r.last_close.toFixed(2)}</td>
-                      <td style={{ textAlign: 'right' }}>${r.short_ma.toFixed(2)}</td>
-                      <td style={{ textAlign: 'right' }}>${r.long_ma.toFixed(2)}</td>
-                      <td style={{ textAlign: 'right', color: spreadColor(r.ma_spread_pct), fontWeight: 600 }}>
+                      </td>}
+                      {show('last_close') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>${r.last_close.toFixed(2)}</td>}
+                      {show('short_ma') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>${r.short_ma.toFixed(2)}</td>}
+                      {show('long_ma') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>${r.long_ma.toFixed(2)}</td>}
+                      {show('ma_spread_pct') && <td className="tm-nowrap" style={{ textAlign: 'right', color: spreadColor(r.ma_spread_pct), fontWeight: 600 }}>
                         {r.ma_spread_pct > 0 ? '+' : ''}{r.ma_spread_pct.toFixed(2)}%
-                      </td>
-                      <td style={{ textAlign: 'center' }}>
+                      </td>}
+                      {show('days_since_cross') && <td style={{ textAlign: 'center' }}>
                         {r.days_since_cross != null ? r.days_since_cross : '—'}
-                      </td>
-                      <td>{r.crossover_date ?? '—'}</td>
-                      <td style={{
+                      </td>}
+                      {show('crossover_date') && <td className="tm-nowrap">{r.crossover_date ?? '—'}</td>}
+                      {show('price_change_since_cross_pct') && <td className="tm-nowrap" style={{
                         textAlign: 'right',
                         color: r.price_change_since_cross_pct != null
                           ? spreadColor(r.price_change_since_cross_pct)
@@ -593,14 +587,14 @@ function MAScreener() {
                         {r.price_change_since_cross_pct != null
                           ? `${r.price_change_since_cross_pct > 0 ? '+' : ''}${r.price_change_since_cross_pct.toFixed(2)}%`
                           : '—'}
-                      </td>
-                      <td style={{ textAlign: 'right', borderLeft: '2px solid var(--border)' }}>
+                      </td>}
+                      {show('weekly_short_ma') && <td className="tm-nowrap" style={{ textAlign: 'right', borderLeft: '2px solid var(--border)' }}>
                         {r.weekly_short_ma != null ? `$${r.weekly_short_ma.toFixed(2)}` : '—'}
-                      </td>
-                      <td style={{ textAlign: 'right' }}>
+                      </td>}
+                      {show('weekly_long_ma') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>
                         {r.weekly_long_ma != null ? `$${r.weekly_long_ma.toFixed(2)}` : '—'}
-                      </td>
-                      <td style={{
+                      </td>}
+                      {show('weekly_spread_pct') && <td className="tm-nowrap" style={{
                         textAlign: 'right',
                         color: r.weekly_spread_pct != null ? spreadColor(r.weekly_spread_pct) : 'inherit',
                         fontWeight: 600,
@@ -608,8 +602,8 @@ function MAScreener() {
                         {r.weekly_spread_pct != null
                           ? `${r.weekly_spread_pct > 0 ? '+' : ''}${r.weekly_spread_pct.toFixed(2)}%`
                           : '—'}
-                      </td>
-                      <td>
+                      </td>}
+                      {show('weekly_signal') && <td>
                         {r.weekly_signal ? (() => {
                           const isBull = r.weekly_signal.includes('Bullish') || r.weekly_signal === 'W-Above'
                           const isCross = r.weekly_signal.includes('Cross')
@@ -621,7 +615,7 @@ function MAScreener() {
                               padding: '2px 7px',
                               borderRadius: '4px',
                               background: isCross ? color : 'transparent',
-                              color: isCross ? '#fff' : color,
+                              color: isCross ? 'var(--tm-on-accent)' : color,
                               border: isCross ? 'none' : `1.5px solid ${color}`,
                               whiteSpace: 'nowrap',
                             }}>
@@ -629,7 +623,7 @@ function MAScreener() {
                             </span>
                           )
                         })() : '—'}
-                      </td>
+                      </td>}
                     </tr>
                   ))
                 )}

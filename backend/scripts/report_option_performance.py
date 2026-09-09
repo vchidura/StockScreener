@@ -684,10 +684,7 @@ def main() -> int:
     if not args.no_write:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         target = args.output_dir / f"{date.today().isoformat()}.json"
-        target.write_text(
-            json.dumps(report, indent=2, default=str, allow_nan=False),
-            encoding="utf-8",
-        )
+        target.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         print(f"Wrote {target}")
     return 0
 

@@ -1,8 +1,27 @@
 import { useState, useEffect, useMemo, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-query'
-import { scanGaps, scanFVG, GapScanResponse, GapResult, FVGScanResponse, FVGResult, getLatestPriceDate } from '../services/api'
-import StreakPanel from '../components/StreakPanel'
+import { usePublishPageContext } from '../layout/pageContext'
+import { CommandBar, CommandGroup, CommandSpacer, ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
+import { useSessionDate } from '../layout/sessionDate'
+
+/** Provenance and secondary context start hidden so the 13-column table fits a laptop screen. */
+const GAP_COLUMNS: ColumnSpec[] = [
+  { key: 'ticker', label: 'Ticker', locked: true },
+  { key: 'status', label: 'Status', locked: true },
+  { key: 'class', label: 'Class' },
+  { key: 'lifecycle', label: 'Lifecycle' },
+  { key: 'count', label: 'Gap count' },
+  { key: 'gap_date', label: 'Gap date', hiddenByDefault: true },
+  { key: 'range', label: 'Gap range' },
+  { key: 'close', label: 'Close' },
+  { key: 'fill_pct', label: 'Fill %' },
+  { key: 'age', label: 'Age' },
+  { key: 'form_vol', label: 'Formation volume', hiddenByDefault: true },
+  { key: 'gap_pct', label: 'Full gap %' },
+  { key: 'trend', label: 'Trend', hiddenByDefault: true },
+]
+import { scanGaps, scanFVG, GapScanResponse, GapResult, FVGScanResponse, FVGResult } from '../services/api'
 
 type TabKey = 'new' | 'support' | 'resistance' | 'fills' | 'fvg'
 type GapClassFilter = 'all' | NonNullable<GapResult['gap_classification']>
@@ -108,8 +127,7 @@ function GapScreener() {
   const [sortKey, setSortKey] = useState<SortKey>('gap_pct')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
   const [expandedTickers, setExpandedTickers] = useState<Set<string>>(new Set())
-  const [scanDate, setScanDate] = useState('')
-  const [latestDate, setLatestDate] = useState('')
+  const { pinned: scanDate } = useSessionDate()
   const [interval, setInterval] = useState<'5m' | '15m' | '30m' | '1h' | '1d'>('1d')
   const [fvgFilter, setFvgFilter] = useState<'all' | 'bullish' | 'bearish'>('all')
   const [fvgStatusFilter, setFvgStatusFilter] = useState<'all' | 'unmitigated' | 'partial' | 'mitigated'>('all')
@@ -141,7 +159,6 @@ function GapScreener() {
     ])
   }, [interval, scanDate, queryClient])
 
-  useEffect(() => { getLatestPriceDate().then(setLatestDate).catch(() => {}) }, [])
   useEffect(() => { setExpandedTickers(new Set()) }, [activeTab])
 
   // Cross-tab ticker search: auto-switch to tab containing searched ticker
@@ -295,6 +312,19 @@ function GapScreener() {
     return sortDir === 'asc' ? ' ↑' : ' ↓'
   }
 
+  const gapColumns = useColumnPreferences('gaps', GAP_COLUMNS)
+  const showGap = gapColumns.isVisible
+
+  usePublishPageContext({
+    eyebrow: 'Imbalance strategy · gaps and FVGs',
+    title: 'Gap & Imbalance',
+    detail: STRATEGY_TOOLTIP.split('\n')[0],
+    status: [
+      { label: 'Interval', value: interval },
+    ],
+    session: interval,
+  })
+
   const thStyle = (align: 'left' | 'right' | 'center' = 'left'): React.CSSProperties => ({
     textAlign: align, cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap',
   })
@@ -327,11 +357,11 @@ function GapScreener() {
     const edge = isSupport ? r.gap_high : r.gap_low
     const dist = Math.abs(r.last_close - edge) / edge
     // Support broken: price fell below the gap zone floor
-    if (isSupport && r.last_close < r.gap_low) return { label: 'Broken', color: '#c62828' }
-    if (dist < 0.003) return { label: 'At Edge', color: '#d32f2f' }      // < 0.3%
-    if (dist < 0.008) return { label: 'Testing', color: '#e65100' }       // < 0.8%
-    if (isFilled && isResistance) return { label: 'Gap Filled', color: '#757575' }
-    return { label: 'Approaching', color: '#1565c0' }                     // 0.8% - 2%
+    if (isSupport && r.last_close < r.gap_low) return { label: 'Broken', color: 'var(--tm-neg)' }
+    if (dist < 0.003) return { label: 'At Edge', color: 'var(--tm-neg)' }      // < 0.3%
+    if (dist < 0.008) return { label: 'Testing', color: 'var(--tm-warn)' }       // < 0.8%
+    if (isFilled && isResistance) return { label: 'Gap Filled', color: 'var(--tm-faint)' }
+    return { label: 'Approaching', color: 'var(--tm-accent)' }                     // 0.8% - 2%
   }
 
   const getSubtypeBadge = (r: GapResult) => {
@@ -403,7 +433,7 @@ function GapScreener() {
         {prox.label && (
           <span style={{
             display: 'inline-block', padding: '1px 6px', borderRadius: '3px', fontSize: '0.7rem', fontWeight: 500,
-            background: '#f5f5f5', color: prox.color,
+            background: 'var(--tm-surface-sunken)', color: prox.color,
           }}>
             {prox.label}
           </span>
@@ -455,66 +485,33 @@ function GapScreener() {
 
   return (
     <div>
-      {/* Header */}
-      <div className="card-header gap-page-header" style={{ border: 'none', padding: 0, marginBottom: '1.5rem' }}>
-        <div>
-          <h1 style={{ fontSize: '1.75rem', fontWeight: 700 }}>
-            Gap Strategies
-            <InfoIcon tooltip={STRATEGY_TOOLTIP} />
-          </h1>
-          <p style={{ color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
-            Classify opening gaps, track fills, and monitor actionable support or resistance retests
-          </p>
-        </div>
-        <div className="gap-page-controls" style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-            <label style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Scan Date:</label>
-            <input
-              type="date"
-              value={scanDate || latestDate}
-              onChange={(e) => { setScanDate(e.target.value); }}
-              style={{ padding: '0.35rem 0.5rem', borderRadius: '6px', border: '1px solid var(--border)', fontSize: '0.85rem' }}
-            />
-            {scanDate && (
-              <button
-                className="btn btn-secondary"
-                onClick={() => setScanDate('')}
-                style={{ padding: '0.25rem 0.5rem', fontSize: '0.8rem' }}
-                title="Reset to latest"
-              >
-                ✕
-              </button>
-            )}
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
-            <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Interval:</label>
-            {(['5m', '15m', '30m', '1h', '1d'] as const).map((iv) => (
-              <button
-                key={iv}
-                onClick={() => { setInterval(iv); }}
-                style={{
-                  padding: '0.25rem 0.5rem',
-                  fontSize: '0.78rem',
-                  borderRadius: '4px',
-                  border: interval === iv ? '2px solid var(--primary-color)' : '1px solid var(--border)',
-                  background: interval === iv ? 'var(--primary-color)' : 'transparent',
-                  color: interval === iv ? '#fff' : 'var(--text-secondary)',
-                  cursor: 'pointer',
-                  fontWeight: interval === iv ? 600 : 400,
-                }}
-                title={iv === '1d' ? 'Daily session gaps' : `${iv} bars; only new-session openings qualify as traditional gaps`}
-              >
-                {iv}
-              </button>
-            ))}
-          </div>
-          <button className="btn btn-primary" onClick={handleRefresh} disabled={loading}>
-            {loading ? 'Scanning...' : 'Refresh'}
-          </button>
-        </div>
-      </div>
-
-      <StreakPanel strategy="gaps" />
+      <CommandBar>
+        <CommandGroup label="Interval">
+          {(['5m', '15m', '30m', '1h', '1d'] as const).map((iv) => (
+            <button
+              key={iv}
+              type="button"
+              className={interval === iv ? 'is-active' : undefined}
+              onClick={() => setInterval(iv)}
+              title={iv === '1d' ? 'Daily session gaps' : `${iv} bars; only new-session openings qualify as traditional gaps`}
+            >
+              {iv}
+            </button>
+          ))}
+        </CommandGroup>
+        <CommandSpacer />
+        <span className="tm-commandbar__note">{tickerGroups.length} tickers</span>
+        <ColumnPicker
+          columns={GAP_COLUMNS}
+          hidden={gapColumns.hidden}
+          onToggle={gapColumns.toggle}
+          onShowAll={gapColumns.showAll}
+          onReset={gapColumns.reset}
+        />
+        <button type="button" className="tm-commandbar__action" onClick={handleRefresh} disabled={loading}>
+          {loading ? 'Scanning…' : 'Refresh'}
+        </button>
+      </CommandBar>
 
       {loading && (
         <div className="loading">
@@ -524,7 +521,7 @@ function GapScreener() {
       )}
 
       {error && (
-        <div className="card" style={{ padding: '1rem', background: '#fff3f3', color: '#c00', border: '1px solid #fcc' }}>
+        <div className="card" style={{ padding: '1rem', background: 'var(--tm-neg-soft)', color: 'var(--tm-neg)', border: '1px solid var(--tm-neg)' }}>
           <strong>Error:</strong> {error}
         </div>
       )}
@@ -562,7 +559,7 @@ function GapScreener() {
                   <span style={{
                     marginLeft: '0.5rem',
                     background: isActive ? tab.color : 'var(--border)',
-                    color: isActive ? '#fff' : 'var(--text-secondary)',
+                    color: isActive ? 'var(--tm-on-accent)' : 'var(--text-secondary)',
                     borderRadius: '10px',
                     padding: '2px 8px',
                     fontSize: '0.8rem',
@@ -656,7 +653,7 @@ function GapScreener() {
 
           {/* Results table — Traditional Gaps */}
           {activeTab !== 'fvg' && (
-          <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
+          <div className="card tm-fit" style={{ padding: 0 }}>
             <table className="data-table">
               <thead>
                 <tr>
@@ -677,67 +674,67 @@ function GapScreener() {
                       } />
                     </span>
                   </th>
-                  <th onClick={() => handleSort('gap_classification')} style={thStyle()}>
+                  {showGap('class') && <th onClick={() => handleSort('gap_classification')} style={thStyle()}>
                     <span style={{ whiteSpace: 'nowrap' }}>
                       Class{sortArrow('gap_classification')}
                       <InfoIcon tooltip="Formation-time heuristic based on the prior 20-bar range, trend, extension, and relative volume. Exhaustion remains a watch state until reversal is confirmed." />
                     </span>
-                  </th>
-                  <th style={{ whiteSpace: 'nowrap' }}>
+                  </th>}
+                  {showGap('lifecycle') && <th style={{ whiteSpace: 'nowrap' }}>
                     Lifecycle
                     <InfoIcon tooltip="Fill is measured from the opening price back to the previous close: Open, Partial, Filled, Same-session fade, or Failed." />
-                  </th>
-                  <th style={{ whiteSpace: 'nowrap', textAlign: 'center' }}>
+                  </th>}
+                  {showGap('count') && <th style={{ whiteSpace: 'nowrap', textAlign: 'center' }}>
                     <span style={{ whiteSpace: 'nowrap' }}>
                       Gaps
                       <InfoIcon tooltip="Number of gap zones near current price for this ticker. Click count to expand and see all gaps." />
                     </span>
-                  </th>
-                  <th onClick={() => handleSort('gap_date')} style={thStyle()}>
+                  </th>}
+                  {showGap('gap_date') && <th onClick={() => handleSort('gap_date')} style={thStyle()}>
                     Gap Date{sortArrow('gap_date')}
-                  </th>
-                  <th style={thStyle('right')}>
+                  </th>}
+                  {showGap('range') && <th style={thStyle('right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>
                       Gap Range
                       <InfoIcon tooltip="The price range of the gap zone shown directionally. Gap Up (support): low → high. Gap Down (resistance): high → low. The first price is the reference edge nearest to the current price." />
                     </span>
-                  </th>
-                  <th onClick={() => handleSort('last_close')} style={thStyle('right')}>
+                  </th>}
+                  {showGap('close') && <th onClick={() => handleSort('last_close')} style={thStyle('right')}>
                     Close{sortArrow('last_close')}
-                  </th>
-                  <th onClick={() => handleSort('fill_pct')} style={thStyle('right')}>
+                  </th>}
+                  {showGap('fill_pct') && <th onClick={() => handleSort('fill_pct')} style={thStyle('right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>
                       Fill %{sortArrow('fill_pct')}
                       <InfoIcon tooltip="How far price has traveled from the opening price back toward the previous close, capped at 100%." />
                     </span>
-                  </th>
-                  <th onClick={() => handleSort('gap_age_sessions')} style={thStyle('right')}>
+                  </th>}
+                  {showGap('age') && <th onClick={() => handleSort('gap_age_sessions')} style={thStyle('right')}>
                     Age{sortArrow('gap_age_sessions')}
-                  </th>
-                  <th onClick={() => handleSort('formation_relative_volume')} style={thStyle('right')}>
+                  </th>}
+                  {showGap('form_vol') && <th onClick={() => handleSort('formation_relative_volume')} style={thStyle('right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>
                       Form Vol{sortArrow('formation_relative_volume')}
                       <InfoIcon tooltip="Formation-bar volume divided by the preceding 20-bar average. It describes participation, not trader identity." />
                     </span>
-                  </th>
-                  <th onClick={() => handleSort('gap_pct')} style={thStyle('right')}>
+                  </th>}
+                  {showGap('gap_pct') && <th onClick={() => handleSort('gap_pct')} style={thStyle('right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>
                       Full Gap %{sortArrow('gap_pct')}
                       <InfoIcon tooltip="Opening price beyond the previous high or low as a percentage of that range edge. Opening gap versus previous close is available in the class tooltip data." />
                     </span>
-                  </th>
-                  <th onClick={() => handleSort('trend')} style={thStyle('center')}>
+                  </th>}
+                  {showGap('trend') && <th onClick={() => handleSort('trend')} style={thStyle('center')}>
                     <span style={{ whiteSpace: 'nowrap' }}>
                       Trend{sortArrow('trend')}
                       <InfoIcon tooltip="Bigger-picture trend based on price vs 50-day and 200-day moving averages.\nBullish: Price > 50MA > 200MA.\nBearish: Price < 50MA < 200MA.\nNeutral-Bullish: Price > 50MA but 50MA < 200MA.\nNeutral-Bearish: Price < 50MA but 50MA > 200MA." />
                     </span>
-                  </th>
+                  </th>}
                 </tr>
               </thead>
               <tbody>
                 {tickerGroups.length === 0 ? (
                   <tr>
-                    <td colSpan={13} style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-secondary)' }}>
+                    <td colSpan={gapColumns.visibleColumns.length} style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-secondary)' }}>
                       No gap signals found in this category
                     </td>
                   </tr>
@@ -750,19 +747,19 @@ function GapScreener() {
                     // Primary row (nearest gap)
                     rows.push(
                       <tr key={g.ticker}>
-                        <td>
+                        {showGap('ticker') && <td>
                           <span className="ticker" onClick={() => navigate(`/ticker/${g.ticker}`)}>
                             {g.ticker}
                           </span>
-                        </td>
-                        <td>
+                        </td>}
+                        {showGap('status') && <td>
                           <span title={TYPE_TOOLTIPS[g.best.gap_type] ?? g.best.gap_type}>
                             {getSubtypeBadge(g.best)}
                           </span>
-                        </td>
-                        <td>{getClassificationBadge(g.best)}</td>
-                        <td style={{ fontSize: '0.8rem' }}>{lifecycleLabel(g.best)}</td>
-                        <td style={{ textAlign: 'center' }}>
+                        </td>}
+                        {showGap('class') && <td>{getClassificationBadge(g.best)}</td>}
+                        {showGap('lifecycle') && <td style={{ fontSize: '0.8rem' }}>{lifecycleLabel(g.best)}</td>}
+                        {showGap('count') && <td style={{ textAlign: 'center' }}>
                           {hasMore ? (
                             <span
                               onClick={() => toggleExpand(g.ticker)}
@@ -786,21 +783,21 @@ function GapScreener() {
                           ) : (
                             <span style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>1</span>
                           )}
-                        </td>
-                        <td>{g.best.gap_date}</td>
-                        <td style={{ textAlign: 'right' }}>{gapRange(g.best)}</td>
-                        <td style={{ textAlign: 'right' }}>${g.best.last_close.toFixed(2)}</td>
-                        <td style={{ textAlign: 'right' }}>{g.best.fill_pct != null ? `${g.best.fill_pct.toFixed(0)}%` : '—'}</td>
-                        <td style={{ textAlign: 'right' }}>{g.best.gap_age_sessions ?? '—'}</td>
-                        <td style={{ textAlign: 'right' }}>{g.best.formation_relative_volume != null ? `${g.best.formation_relative_volume.toFixed(2)}x` : '—'}</td>
-                        <td style={{
+                        </td>}
+                        {showGap('gap_date') && <td className="tm-nowrap">{g.best.gap_date}</td>}
+                        {showGap('range') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>{gapRange(g.best)}</td>}
+                        {showGap('close') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>${g.best.last_close.toFixed(2)}</td>}
+                        {showGap('fill_pct') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>{g.best.fill_pct != null ? `${g.best.fill_pct.toFixed(0)}%` : '—'}</td>}
+                        {showGap('age') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>{g.best.gap_age_sessions ?? '—'}</td>}
+                        {showGap('form_vol') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>{g.best.formation_relative_volume != null ? `${g.best.formation_relative_volume.toFixed(2)}x` : '—'}</td>}
+                        {showGap('gap_pct') && <td className="tm-nowrap" style={{
                           textAlign: 'right',
-                          color: g.best.gap_pct >= 3 ? 'var(--danger)' : g.best.gap_pct >= 2 ? '#ff9800' : 'inherit',
+                          color: g.best.gap_pct >= 3 ? 'var(--danger)' : g.best.gap_pct >= 2 ? 'var(--tm-warn)' : 'inherit',
                           fontWeight: g.best.gap_pct >= 2 ? 600 : 400,
                         }}>
                           {g.best.gap_pct.toFixed(2)}%
-                        </td>
-                        <td style={{ textAlign: 'center' }}>
+                        </td>}
+                        {showGap('trend') && <td style={{ textAlign: 'center' }}>
                           {g.best.trend && g.best.trend !== 'N/A' ? (
                             <span style={{
                               display: 'inline-block',
@@ -825,7 +822,7 @@ function GapScreener() {
                           ) : (
                             <span style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>—</span>
                           )}
-                        </td>
+                        </td>}
                       </tr>
                     )
 
@@ -835,31 +832,31 @@ function GapScreener() {
                       others.forEach((r, idx) => {
                         rows.push(
                           <tr key={`${g.ticker}-exp-${idx}`} style={{ background: 'var(--bg-secondary)' }}>
-                            <td style={{ paddingLeft: '2rem' }}>
+                            {showGap('ticker') && <td style={{ paddingLeft: '2rem' }}>
                               <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>↳</span>
-                            </td>
-                            <td>
+                            </td>}
+                            {showGap('status') && <td>
                               <span title={TYPE_TOOLTIPS[r.gap_type] ?? r.gap_type}>
                                 {getSubtypeBadge(r)}
                               </span>
-                            </td>
-                            <td>{getClassificationBadge(r)}</td>
-                            <td style={{ fontSize: '0.8rem' }}>{lifecycleLabel(r)}</td>
-                            <td></td>
-                            <td>{r.gap_date}</td>
-                            <td style={{ textAlign: 'right' }}>{gapRange(r)}</td>
-                            <td style={{ textAlign: 'right' }}>${r.last_close.toFixed(2)}</td>
-                            <td style={{ textAlign: 'right' }}>{r.fill_pct != null ? `${r.fill_pct.toFixed(0)}%` : '—'}</td>
-                            <td style={{ textAlign: 'right' }}>{r.gap_age_sessions ?? '—'}</td>
-                            <td style={{ textAlign: 'right' }}>{r.formation_relative_volume != null ? `${r.formation_relative_volume.toFixed(2)}x` : '—'}</td>
-                            <td style={{
+                            </td>}
+                            {showGap('class') && <td>{getClassificationBadge(r)}</td>}
+                            {showGap('lifecycle') && <td style={{ fontSize: '0.8rem' }}>{lifecycleLabel(r)}</td>}
+                            {showGap('count') && <td></td>}
+                            {showGap('gap_date') && <td className="tm-nowrap">{r.gap_date}</td>}
+                            {showGap('range') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>{gapRange(r)}</td>}
+                            {showGap('close') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>${r.last_close.toFixed(2)}</td>}
+                            {showGap('fill_pct') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>{r.fill_pct != null ? `${r.fill_pct.toFixed(0)}%` : '—'}</td>}
+                            {showGap('age') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>{r.gap_age_sessions ?? '—'}</td>}
+                            {showGap('form_vol') && <td className="tm-nowrap" style={{ textAlign: 'right' }}>{r.formation_relative_volume != null ? `${r.formation_relative_volume.toFixed(2)}x` : '—'}</td>}
+                            {showGap('gap_pct') && <td className="tm-nowrap" style={{
                               textAlign: 'right',
-                              color: r.gap_pct >= 3 ? 'var(--danger)' : r.gap_pct >= 2 ? '#ff9800' : 'inherit',
+                              color: r.gap_pct >= 3 ? 'var(--danger)' : r.gap_pct >= 2 ? 'var(--tm-warn)' : 'inherit',
                               fontWeight: r.gap_pct >= 2 ? 600 : 400,
                             }}>
                               {r.gap_pct.toFixed(2)}%
-                            </td>
-                            <td></td>
+                            </td>}
+                            {showGap('trend') && <td></td>}
                           </tr>
                         )
                       })
@@ -886,7 +883,7 @@ function GapScreener() {
             <span>🎯 <strong>Best on intraday</strong> — FVGs work best on 5m/15m for precise entries within daily-timeframe context.</span>
             <span>🔎 <strong>Multi-timeframe</strong> — Find an unmitigated daily bullish FVG in an uptrend, then drop to 5m/15m to time your entry as price enters the zone.</span>
           </div>
-          <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
+          <div className="card tm-fit" style={{ padding: 0 }}>
             <table className="data-table">
               <thead>
                 <tr>
@@ -1001,7 +998,7 @@ function GapScreener() {
                           <td style={{ textAlign: 'right' }}>${r.fvg_size.toFixed(2)}</td>
                           <td style={{
                             textAlign: 'right',
-                            color: r.fvg_pct >= 2 ? 'var(--danger)' : r.fvg_pct >= 1 ? '#ff9800' : 'inherit',
+                            color: r.fvg_pct >= 2 ? 'var(--danger)' : r.fvg_pct >= 1 ? 'var(--tm-warn)' : 'inherit',
                             fontWeight: r.fvg_pct >= 1 ? 600 : 400,
                           }}>
                             {r.fvg_pct.toFixed(2)}%

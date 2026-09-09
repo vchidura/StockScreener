@@ -58,6 +58,7 @@ import {
   OptionsEnvelope,
   OptionUniverseRow,
 } from '../services/api'
+import { usePublishPageContext } from '../layout/pageContext'
 import './OptionsResearchWorkspace.css'
 
 type WorkspaceView = 'opportunities' | 'research' | 'candidates' | 'recommendations' | 'performance' | 'explorer' | 'operations'
@@ -244,25 +245,6 @@ const workspaceHeaderCopy: Record<WorkspaceView, { eyebrow: string; title: strin
     title: 'Option operations',
     detail: 'Monitor universe coverage, ingestion quality, partitions, safety gates, and runtime readiness.',
   },
-}
-
-function WorkspaceHeader({ view, sourceTime, observedTime }: {
-  view: WorkspaceView
-  sourceTime?: string | null
-  observedTime?: string | null
-}) {
-  const copy = workspaceHeaderCopy[view]
-  return <header className="options-workspace-header">
-    <div>
-      <div className="options-workspace-header__eyebrow">{copy.eyebrow}</div>
-      <h1>{copy.title}</h1>
-      <p>{copy.detail}</p>
-    </div>
-    <div className="options-workspace-header__status">
-      <div><span>Source</span><strong title={sourceTime || undefined}>{dateTime(sourceTime)}</strong><small>{age(sourceTime)}</small></div>
-      <div><span>Observed</span><strong title={observedTime || undefined}>{dateTime(observedTime)}</strong><small>{age(observedTime)}</small></div>
-    </div>
-  </header>
 }
 
 function WorkspaceNavigation({ view, underlyer, navigate }: { view: WorkspaceView; underlyer: string; navigate: ReturnType<typeof useNavigate> }) {
@@ -889,9 +871,15 @@ export default function OptionsResearchWorkspace() {
           : view === 'recommendations' ? recommendations.data
             : view === 'performance' ? performance.data
               : quality.data || health.data
+  const sourceTime = activeEnvelope?.as_of || health.data?.as_of
+  usePublishPageContext({
+    ...workspaceHeaderCopy[view],
+    status: [
+      { label: 'Source', value: dateTime(sourceTime), note: age(sourceTime), title: sourceTime || undefined },
+    ],
+  })
 
   return <div className="options-workspace">
-    <WorkspaceHeader view={view} sourceTime={activeEnvelope?.as_of || health.data?.as_of} observedTime={activeEnvelope?.observed_at || health.data?.observed_at} />
     <WorkspaceNavigation view={view} underlyer={underlyer} navigate={navigate} />
     {(view === 'candidates' || view === 'recommendations' || view === 'performance') && <DecisionNavigation view={view} underlyer={underlyer} navigate={navigate} />}
     {view === 'opportunities' && <OpportunityCommandBar strategies={opportunityStrategies} strategy={opportunityStrategy} dataTier={opportunities.data?.data_tier || health.data?.data_tier || delayedLabel} onStrategy={value => updateSearch({ strategy: value === 'ALL' ? null : value, underlyer: null, candidate: null })} />}

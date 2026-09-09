@@ -8,7 +8,11 @@ from typing import Any
 
 from fastapi import APIRouter, Query
 
-from .calendar import latest_expected_market_time
+from .calendar import (
+    latest_expected_market_time,
+    max_serveable_stale_sessions,
+    staleness_state,
+)
 
 
 router = APIRouter(prefix="/api/equity", tags=["equity-materialization"])
@@ -104,6 +108,80 @@ def current_trade_setup_projection(
     return result
 
 
+def current_trade_setup_projections(
+    interval: str,
+    *,
+    now: datetime | None = None,
+    provider_delay_minutes: int | None = None,
+    publication_grace_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Universe-wide published trade setups for one interval.
+
+    Freshness follows the same single-cohort rule as pattern watch: every row must
+    share one market time and one analysis run, so a partially republished cohort
+    reads as stale instead of mixing generations.
+    """
+    from database import get_db_cursor
+
+    started = perf_counter()
+    with get_db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT projection.ticker, projection.payload,
+                   projection.analysis_run_id, projection.market_time,
+                   projection.observed_at, projection.published_at,
+                   selected.sector
+            FROM equity_current_projection AS projection
+            LEFT JOIN selected_tickers AS selected
+              ON selected.ticker = projection.ticker
+            WHERE projection.interval_key = %s
+              AND projection.projection_type = 'TRADE_SETUP'
+              AND projection.source_name = 'EQUITY_SETUP'
+            ORDER BY projection.ticker
+            """,
+            (interval,),
+        )
+        rows = [dict(row) for row in cursor.fetchall()]
+
+    current_time = now or datetime.now(timezone.utc)
+    expected_market_time = expected_materialized_market_time(
+        current_time, interval,
+        provider_delay_minutes=provider_delay_minutes,
+    )
+    minimum_fresh_market_time = minimum_fresh_materialized_market_time(
+        current_time, interval,
+        provider_delay_minutes=provider_delay_minutes,
+        publication_grace_seconds=publication_grace_seconds,
+    )
+    market_times = {row["market_time"] for row in rows}
+    analysis_run_ids = {row["analysis_run_id"] for row in rows}
+    is_fresh = bool(
+        rows
+        and len(market_times) == 1
+        and minimum_fresh_market_time <= next(iter(market_times)) <= expected_market_time
+        and len(analysis_run_ids) == 1
+    )
+    return {
+        "analysis_run_id": (
+            str(next(iter(analysis_run_ids))) if len(analysis_run_ids) == 1 else None
+        ),
+        "computed_at": (
+            max(row["published_at"] for row in rows).isoformat() if rows else None
+        ),
+        "expected_market_time": expected_market_time,
+        "minimum_fresh_market_time": minimum_fresh_market_time,
+        "is_fresh": is_fresh,
+        **staleness_state(
+            max(market_times) if market_times else expected_market_time,
+            expected_market_time,
+            is_fresh=is_fresh,
+        ),
+        "market_times": tuple(sorted(market_times)),
+        "read_latency_ms": round((perf_counter() - started) * 1000, 3),
+        "rows": rows,
+    }
+
+
 def current_pattern_watch_projection(
     interval: str,
     *,
@@ -191,6 +269,11 @@ def current_pattern_watch_projection(
         "expected_market_time": expected_market_time,
         "minimum_fresh_market_time": minimum_fresh_market_time,
         "is_fresh": is_fresh,
+        **staleness_state(
+            max(market_times) if market_times else expected_market_time,
+            expected_market_time,
+            is_fresh=is_fresh,
+        ),
         "market_times": tuple(sorted(market_times)),
         "read_latency_ms": round((perf_counter() - started) * 1000, 3),
         "results": results,
@@ -266,6 +349,10 @@ def current_chart_bar_projection(
         publication_grace_seconds=publication_grace_seconds,
     )
     metadata = rows[0]
+    is_fresh = (
+        minimum_fresh_market_time <= metadata["market_time"] <= expected_market_time
+        and rows[-1]["bar_end"] == metadata["market_time"]
+    )
     return {
         "analysis_run_id": metadata["analysis_run_id"],
         "evidence_id": metadata["evidence_id"],
@@ -274,9 +361,9 @@ def current_chart_bar_projection(
         "published_at": metadata["published_at"],
         "expected_market_time": expected_market_time,
         "minimum_fresh_market_time": minimum_fresh_market_time,
-        "is_fresh": (
-            minimum_fresh_market_time <= metadata["market_time"] <= expected_market_time
-            and rows[-1]["bar_end"] == metadata["market_time"]
+        "is_fresh": is_fresh,
+        **staleness_state(
+            metadata["market_time"], expected_market_time, is_fresh=is_fresh,
         ),
         "read_latency_ms": round((perf_counter() - started) * 1000, 3),
         "bars": tuple({
@@ -322,6 +409,74 @@ def equity_materialization_health() -> dict[str, Any]:
             result["recent_runs"] = [dict(row) for row in cursor.fetchall()]
     result["checked_at"] = datetime.now(timezone.utc)
     return result
+
+
+@router.get("/materialization-status")
+def equity_materialization_status() -> dict[str, Any]:
+    """Cheap per-interval freshness read that drives the portal staleness banner."""
+    from database import get_db_cursor
+
+    with get_db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT interval_key,
+                   max(market_time) AS market_time,
+                   max(published_at) AS published_at
+            FROM equity_current_projection
+            GROUP BY interval_key
+            """
+        )
+        projection_rows = [dict(row) for row in cursor.fetchall()]
+
+    now = datetime.now(timezone.utc)
+    intervals: dict[str, Any] = {}
+    for row in projection_rows:
+        interval = row["interval_key"]
+        try:
+            expected = expected_materialized_market_time(now, interval)
+            minimum_fresh = minimum_fresh_materialized_market_time(now, interval)
+        except ValueError:
+            continue
+        market_time = row["market_time"]
+        intervals[interval] = {
+            "market_time": market_time,
+            "published_at": row["published_at"],
+            "expected_market_time": expected,
+            **staleness_state(
+                market_time,
+                expected,
+                is_fresh=minimum_fresh <= market_time <= expected,
+            ),
+        }
+
+    ranking = {"READY": 0, "STALE": 1, "EXPIRED": 2}
+    worst = max(
+        (entry["status"] for entry in intervals.values()),
+        key=lambda status: ranking[status],
+        default="UNAVAILABLE",
+    )
+    stale = [
+        entry for entry in intervals.values() if entry["status"] != "READY"
+    ]
+    return {
+        "status": worst,
+        "checked_at": now,
+        "max_serveable_stale_sessions": max_serveable_stale_sessions(),
+        "staleness_sessions": max(
+            (entry["staleness_sessions"] for entry in stale), default=0
+        ),
+        "last_market_time": max(
+            (entry["market_time"] for entry in intervals.values()), default=None
+        ),
+        "oldest_stale_market_time": min(
+            (entry["market_time"] for entry in stale), default=None
+        ),
+        "stale_intervals": sorted(
+            interval for interval, entry in intervals.items()
+            if entry["status"] != "READY"
+        ),
+        "intervals": intervals,
+    }
 
 
 @router.get("/current")

@@ -9,6 +9,21 @@ const api = axios.create({
   timeout: 120000,
 })
 
+export interface MaterializationStatus {
+  status: 'READY' | 'STALE' | 'EXPIRED' | 'UNAVAILABLE'
+  checked_at: string
+  max_serveable_stale_sessions: number
+  staleness_sessions: number
+  last_market_time: string | null
+  oldest_stale_market_time: string | null
+  stale_intervals: string[]
+}
+
+export const fetchMaterializationStatus = async (): Promise<MaterializationStatus> => {
+  const response = await api.get('/equity/materialization-status')
+  return response.data
+}
+
 export interface GapResult {
   ticker: string
   gap_type: string
@@ -437,6 +452,10 @@ export interface ChartDataPoint {
   low: number
   close: number
   volume: number
+  derived?: boolean
+  provisional?: boolean
+  source_interval?: '5m'
+  available_through?: number
 }
 
 export interface FormingPatternLine {
@@ -562,21 +581,46 @@ export interface LatestQuote {
   source: '5m' | '1h' | 'daily'
 }
 
+export interface FundamentalReport {
+  timeframe: string | null
+  fiscal_year: number | null
+  fiscal_quarter: number | null
+  period_end: string | null
+  filing_date: string | null
+  revenue: number | string | null
+  gross_profit: number | string | null
+  operating_income: number | string | null
+  ebitda: number | string | null
+  net_income: number | string | null
+  diluted_eps: number | null
+  total_assets: number | string | null
+  total_liabilities: number | string | null
+  total_equity: number | string | null
+  operating_cash_flow: number | string | null
+  free_cash_flow: number | string | null
+  source: string | null
+  quality_codes: string[] | null
+}
+
 export interface EquitySecurityProfileResponse {
   ticker: string
   security: {
     company_name: string | null
+    security_type: string | null
     primary_exchange: string | null
     sector: string | null
     industry: string | null
+    sic_description: string | null
+    list_date: string | null
     market_cap: number | string | null
     free_float: number | string | null
+    free_float_percent: number | null
     weighted_shares: number | string | null
     cik: string | null
     composite_figi: string | null
     share_class_figi: string | null
   } | null
-  fundamental_reports: Array<Record<string, unknown>>
+  fundamental_reports: FundamentalReport[]
 }
 
 export interface TickerOverviewRow {
@@ -769,6 +813,58 @@ export const getStreakSummary = async (days: number = 3, fibSwingPct: number = 5
   return response.data
 }
 
+export type SetupSummaryInterval = '30m' | '1h' | '1d' | '1wk' | '1mo'
+
+/** Published per-ticker setup state; descriptive only, never a ranking. */
+export interface SetupSummaryRow {
+  ticker: string
+  trend: string | null
+  trend_detail: string | null
+  confirm_trend: string | null
+  confirm_interval: string | null
+  multi_tf_agree: boolean | null
+  momentum: string | null
+  momentum_detail: string | null
+  bias: string | null
+  conviction: string | null
+  bull_signals: number | null
+  bear_signals: number | null
+  rsi: number | null
+  rsi_state: string | null
+  stoch_k: number | null
+  adx: number | null
+  macd_state: string | null
+  macd_histogram: number | null
+  trend_consistency: number | null
+  atr_pct: number | null
+  relative_volume: number | null
+  volume_trend_state: string | null
+  volume_pressure: string | null
+  historical_volatility_pct: number | null
+  historical_volatility_state: string | null
+  range_position_pct: number | null
+  price_vs_vwap: string | null
+  golden_cross: string | null
+  signals: string[]
+}
+
+export interface SetupSummaryResponse {
+  interval: SetupSummaryInterval
+  source: string
+  analysis_run_id: string | null
+  computed_at: string | null
+  is_fresh: boolean
+  staleness_sessions: number
+  market_time: string | null
+  count: number
+  results: SetupSummaryRow[]
+}
+
+export const getSetupSummary = async (interval: SetupSummaryInterval = '1d'): Promise<SetupSummaryResponse> => {
+  const response = await api.get('/tickers/setup-summary', { params: { interval } })
+  return response.data
+}
+
 // Get Tickers
 export const getTickers = async (refresh = false): Promise<string[]> => {
   const params: Record<string, boolean> = {}
@@ -783,6 +879,19 @@ export const getLatestPriceDate = async (refresh = false): Promise<string> => {
   if (refresh) params.refresh = true
   const response = await api.get('/latest-price-date', { params })
   return response.data.latest_date
+}
+
+// Selectable scan sessions, oldest first (weekends, holidays and un-ingested days absent)
+export interface TradingSessionsResponse {
+  interval: string
+  sessions: string[]
+  data_as_of: string | null
+  data_interval: string | null
+}
+
+export const getTradingSessions = async (interval = '1d', limit = 260): Promise<TradingSessionsResponse> => {
+  const response = await api.get('/trading-sessions', { params: { interval, limit } })
+  return response.data
 }
 
 // Get Chart Data
@@ -2545,6 +2654,39 @@ export const getOptionPerformance = async (params?: {
   offset?: number
 }): Promise<OptionsEnvelope<OptionPerformanceData>> => {
   const response = await api.get('/options/performance', { params })
+  return response.data
+}
+
+export interface AccountEnvelope {
+  available: boolean
+  status: 'DISABLED'
+  reason: string
+  generated_at: string
+  planned_capabilities: string[]
+  user: null
+}
+
+// The credential routes answer 501 by design, so the typed envelope arrives on the error path.
+const postAccountRequest = async (path: string, payload: unknown): Promise<AccountEnvelope> => {
+  try {
+    const response = await api.post<AccountEnvelope>(path, payload)
+    return response.data
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response?.status === 501 && error.response.data) {
+      return error.response.data as AccountEnvelope
+    }
+    throw error
+  }
+}
+
+export const requestSignIn = (payload: { email: string; password: string }) =>
+  postAccountRequest('/auth/signin', payload)
+
+export const requestSignUp = (payload: { email: string; display_name: string; password: string }) =>
+  postAccountRequest('/auth/signup', payload)
+
+export const getAccountSession = async (): Promise<AccountEnvelope> => {
+  const response = await api.get<AccountEnvelope>('/auth/session')
   return response.data
 }
 

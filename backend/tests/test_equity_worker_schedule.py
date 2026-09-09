@@ -191,3 +191,153 @@ def test_worker_skips_scanner_outcomes_for_non_scanner_interval():
     assert mature_prospective_scanner_outcomes(
         Service(), "15m", available_by=datetime(2026, 9, 1, tzinfo=UTC)
     ) == ()
+
+
+class _StopWorkerLoop(Exception):
+    pass
+
+
+def _stub_worker_dependencies(monkeypatch, intervals):
+    from types import SimpleNamespace
+
+    import scripts.run_equity_worker as worker
+
+    class _Analysis:
+        def fail_stale_runs(self, *, stale_after):
+            return ()
+
+        def latest_published_market_times(self, requested):
+            return {}
+
+    class _Ingestion:
+        def fail_stale_segments(self, *, stale_after):
+            return ()
+
+    monkeypatch.setattr(worker, "INTERVALS", intervals)
+    monkeypatch.setattr(worker, "get_selected_tickers", lambda active_only=True: ("AAPL",))
+    monkeypatch.setattr(worker, "EquityAnalysisRepository", _Analysis)
+    monkeypatch.setattr(worker, "EquityIngestionRepository", _Ingestion)
+    monkeypatch.setattr(worker, "PolygonEquityClient", lambda: object())
+    monkeypatch.setattr(
+        worker, "EquityMaterializationService",
+        lambda client, native_fetch_workers=None: object(),
+    )
+    monkeypatch.setattr(
+        worker, "load_or_refresh_reference",
+        lambda *args, **kwargs: SimpleNamespace(revisions=(), universe_run_id="universe"),
+    )
+    monkeypatch.setattr(
+        worker, "latest_due_slot",
+        lambda now, interval, provider_delay=None: datetime(2026, 9, 8, 20, 0, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        worker.time, "sleep",
+        lambda _seconds: (_ for _ in ()).throw(_StopWorkerLoop()),
+    )
+    return worker
+
+
+def test_failing_interval_does_not_starve_later_intervals(monkeypatch):
+    worker = _stub_worker_dependencies(monkeypatch, ("30m", "1h", "1d", "1wk"))
+    processed = []
+
+    def materialize(service, reference, *, interval, slot, observed_at, once):
+        processed.append(interval)
+        if interval == "1h":
+            raise RuntimeError("hourly close bucket failed")
+        return True
+
+    monkeypatch.setattr(worker, "materialize_due_interval", materialize)
+
+    with pytest.raises(_StopWorkerLoop):
+        worker.run_worker()
+
+    assert processed == ["30m", "1h", "1d", "1wk"]
+
+
+def test_failed_interval_is_not_marked_complete_and_backs_off(monkeypatch):
+    worker = _stub_worker_dependencies(monkeypatch, ("1h", "1d"))
+    monkeypatch.setattr(worker, "INTERVAL_RETRY_SECONDS", 300)
+    attempts = []
+
+    def materialize(service, reference, *, interval, slot, observed_at, once):
+        attempts.append(interval)
+        if interval == "1h":
+            raise RuntimeError("still failing")
+        return True
+
+    monkeypatch.setattr(worker, "materialize_due_interval", materialize)
+
+    sleeps = {"count": 0}
+
+    def sleep(_seconds):
+        sleeps["count"] += 1
+        if sleeps["count"] >= 2:
+            raise _StopWorkerLoop()
+
+    monkeypatch.setattr(worker.time, "sleep", sleep)
+
+    with pytest.raises(_StopWorkerLoop):
+        worker.run_worker()
+
+    # 1h backs off after failing, 1d completes once and is not repeated.
+    assert attempts == ["1h", "1d"]
+
+
+def test_retryable_interval_result_backs_off_without_starving_later_interval(monkeypatch):
+    worker = _stub_worker_dependencies(monkeypatch, ("1h", "1d"))
+    monkeypatch.setattr(worker, "INTERVAL_RETRY_SECONDS", 300)
+    attempts = []
+
+    def materialize(service, reference, *, interval, slot, observed_at, once):
+        attempts.append(interval)
+        return interval != "1h"
+
+    monkeypatch.setattr(worker, "materialize_due_interval", materialize)
+    sleeps = {"count": 0}
+
+    def sleep(_seconds):
+        sleeps["count"] += 1
+        if sleeps["count"] >= 2:
+            raise _StopWorkerLoop()
+
+    monkeypatch.setattr(worker.time, "sleep", sleep)
+
+    with pytest.raises(_StopWorkerLoop):
+        worker.run_worker()
+
+    assert attempts == ["1h", "1d"]
+
+
+def test_one_shot_reports_failure_after_attempting_later_intervals(monkeypatch):
+    worker = _stub_worker_dependencies(monkeypatch, ("1h", "1d", "1wk"))
+    attempts = []
+
+    def materialize(service, reference, *, interval, slot, observed_at, once):
+        attempts.append(interval)
+        if interval == "1h":
+            raise RuntimeError("hourly failed")
+        return True
+
+    monkeypatch.setattr(worker, "materialize_due_interval", materialize)
+
+    with pytest.raises(RuntimeError, match="1h@.*RuntimeError"):
+        worker.run_worker(once=True)
+
+    assert attempts == ["1h", "1d", "1wk"]
+
+
+def test_one_shot_reports_non_terminal_after_attempting_daily(monkeypatch):
+    worker = _stub_worker_dependencies(monkeypatch, ("1h", "1d"))
+    attempts = []
+
+    def materialize(service, reference, *, interval, slot, observed_at, once):
+        attempts.append(interval)
+        return interval != "1h"
+
+    monkeypatch.setattr(worker, "materialize_due_interval", materialize)
+
+    with pytest.raises(RuntimeError, match="1h@.*NON_TERMINAL"):
+        worker.run_worker(once=True)
+
+    assert attempts == ["1h", "1d"]
