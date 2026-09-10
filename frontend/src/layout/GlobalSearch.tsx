@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Command, Search, X } from 'lucide-react'
 import { getTickers } from '../services/api'
-import { NAV_ITEMS } from './navigation'
+import { NAV_ITEMS, readLastStockSymbol } from './navigation'
 
 type SearchResult = {
   kind: 'page' | 'ticker'
@@ -62,7 +62,12 @@ export default function GlobalSearch() {
     const lower = trimmed.toLowerCase()
     const pages: SearchResult[] = NAV_ITEMS
       .filter(item => item.label.toLowerCase().includes(lower))
-      .map(item => ({ kind: 'page', label: item.label, hint: 'Page', to: item.to }))
+      .map(item => ({
+        kind: 'page',
+        label: item.label,
+        hint: 'Page',
+        to: item.activeFor === 'ticker' ? `/ticker/${readLastStockSymbol()}` : item.to,
+      }))
     const symbols: SearchResult[] = rankTickers(tickers, upper)
       .slice(0, 10)
       .map(ticker => ({ kind: 'ticker', label: ticker, hint: 'Ticker', to: `/ticker/${ticker}` }))

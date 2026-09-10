@@ -7,9 +7,12 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
+
+import exchange_calendars
+import pandas as pd
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
@@ -59,6 +62,12 @@ INTERVALS = tuple(
 INTERVAL_MINUTES = {"5m": 5, "15m": 15, "30m": 30}
 SUPPORTED_INTERVALS = frozenset((*INTERVAL_MINUTES, *DERIVATION_SOURCES))
 SCANNER_POLICY_EFFECTIVE_FROM = datetime(2026, 8, 30, tzinfo=timezone.utc)
+DERIVED_REPAIR_SOURCE_LIMITS = {
+    "1h": lambda sessions: 13 * sessions,
+    "1d": lambda sessions: 13 * sessions,
+    "1wk": lambda sessions: sessions + 5,
+    "1mo": lambda sessions: sessions + 23,
+}
 
 
 def latest_completed_slot(now: datetime, interval: str) -> datetime | None:
@@ -83,6 +92,89 @@ def latest_due_slot(
     if interval in DERIVATION_SOURCES:
         return latest_expected_market_time(observable_now, interval)
     raise ValueError(f"unsupported worker interval: {interval}")
+
+
+def repair_session_bounds(
+    now: datetime,
+    session_count: int,
+    *,
+    provider_delay: timedelta,
+) -> tuple[date, date]:
+    if session_count <= 0:
+        raise ValueError("repair session count must be positive")
+    latest = latest_due_slot(now, "5m", provider_delay=provider_delay)
+    if latest is None:
+        raise RuntimeError("no observable equity session is available")
+    calendar = exchange_calendars.get_calendar("XNYS")
+    session = calendar.date_to_session(pd.Timestamp(latest.date()), direction="previous")
+    end = session.date()
+    for _ in range(session_count - 1):
+        session = calendar.previous_session(session)
+    return session.date(), end
+
+
+def repair_recent_sessions(
+    service: EquityMaterializationService,
+    revisions,
+    *,
+    now: datetime,
+    session_count: int,
+    provider_delay: timedelta,
+    intervals=INTERVALS,
+) -> tuple[object, ...]:
+    """Idempotently refetch recent native bars and rebuild bounded derivations."""
+    start, end = repair_session_bounds(
+        now, session_count, provider_delay=provider_delay
+    )
+    results = []
+    LOGGER.info(
+        "repairing recent equity sessions start=%s end=%s sessions=%s",
+        start,
+        end,
+        session_count,
+    )
+    for interval in intervals:
+        if interval not in INTERVAL_MINUTES:
+            continue
+        result = service.ingest_native_interval(
+            revisions,
+            interval=interval,
+            start=start,
+            end=end,
+            observed_at=now,
+        )
+        results.append(result)
+        LOGGER.info(
+            "repair ingestion interval=%s bars=%s inserted=%s missing=%s",
+            interval,
+            result.bar_count,
+            result.inserted_count,
+            len(result.missing_tickers),
+        )
+    for interval in intervals:
+        if interval not in DERIVATION_SOURCES:
+            continue
+        market_time = latest_due_slot(now, interval, provider_delay=provider_delay)
+        if market_time is None:
+            continue
+        result = service.derive_interval(
+            revisions,
+            target_interval=interval,
+            watermark=DecisionWatermark(market_time, now),
+            include_history=True,
+            source_limit_per_ticker=DERIVED_REPAIR_SOURCE_LIMITS[interval](
+                session_count
+            ),
+        )
+        results.append(result)
+        LOGGER.info(
+            "repair derivation interval=%s bars=%s inserted=%s missing=%s",
+            interval,
+            result.bar_count,
+            result.inserted_count,
+            len(result.missing_tickers),
+        )
+    return tuple(results)
 
 
 def load_or_refresh_reference(
@@ -295,7 +387,7 @@ def materialize_due_interval(
     return True
 
 
-def run_worker(*, once: bool = False) -> None:
+def run_worker(*, once: bool = False, repair_sessions: int = 0) -> None:
     invalid = set(INTERVALS) - SUPPORTED_INTERVALS
     if invalid:
         raise ValueError(f"unsupported EQUITY_MATERIALIZATION_INTERVALS: {sorted(invalid)}")
@@ -305,6 +397,8 @@ def run_worker(*, once: bool = False) -> None:
         raise ValueError("EQUITY_WORKER_HEARTBEAT_SECONDS must be positive")
     if PROVIDER_DELAY_MINUTES < 0:
         raise ValueError("EQUITY_PROVIDER_DELAY_MINUTES must not be negative")
+    if repair_sessions < 0:
+        raise ValueError("repair_sessions must not be negative")
     tickers = tuple(get_selected_tickers(active_only=True))
     if not tickers:
         raise RuntimeError("no active selected_tickers are configured")
@@ -322,15 +416,33 @@ def run_worker(*, once: bool = False) -> None:
             "terminal-failed stale analysis runs=%s ingestion segments=%s",
             len(recovered_runs), len(recovered_segments),
         )
+    provider_delay = timedelta(minutes=PROVIDER_DELAY_MINUTES)
     service = EquityMaterializationService(
         PolygonEquityClient(), native_fetch_workers=NATIVE_FETCH_WORKERS
     )
     reference = None
     reference_checked_at = None
+    if repair_sessions:
+        repair_now = datetime.now(timezone.utc)
+        repair_slot = latest_due_slot(
+            repair_now, "5m", provider_delay=provider_delay
+        )
+        if repair_slot is None:
+            raise RuntimeError("no observable equity session is available")
+        reference = load_or_refresh_reference(
+            service, tickers, repair_now, repair_slot.date()
+        )
+        reference_checked_at = repair_now
+        repair_recent_sessions(
+            service,
+            reference.revisions,
+            now=repair_now,
+            session_count=repair_sessions,
+            provider_delay=provider_delay,
+        )
     retry_after: dict[str, datetime] = {}
     once_failures: list[str] = []
     completed = analysis_repository.latest_published_market_times(INTERVALS)
-    provider_delay = timedelta(minutes=PROVIDER_DELAY_MINUTES)
     last_heartbeat_at = datetime.now(timezone.utc)
     LOGGER.info(
         "worker started intervals=%s provider_delay_minutes=%s resumed_intervals=%s",
@@ -429,6 +541,13 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Process each configured interval once, then exit.",
     )
+    result.add_argument(
+        "--repair-sessions",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Idempotently refetch and rederive the latest N XNYS sessions first.",
+    )
     return result
 
 
@@ -442,7 +561,7 @@ def main() -> int:
         if not is_leader:
             LOGGER.error("another equity materialization worker holds leadership")
             return 2
-        run_worker(once=args.once)
+        run_worker(once=args.once, repair_sessions=args.repair_sessions)
     return 0
 
 

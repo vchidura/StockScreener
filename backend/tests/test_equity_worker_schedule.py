@@ -16,6 +16,8 @@ from scripts.run_equity_worker import (
     latest_due_slot,
     mature_prospective_scanner_outcomes,
     parser,
+    repair_recent_sessions,
+    repair_session_bounds,
 )
 from equity.orchestration import IngestionCoverageError
 
@@ -114,7 +116,62 @@ def test_latest_due_slot_rejects_negative_provider_delay():
 def test_worker_once_flag_is_opt_in():
     assert parser().parse_args([]).once is False
     assert parser().parse_args(["--once"]).once is True
+    assert parser().parse_args(["--repair-sessions", "3"]).repair_sessions == 3
     assert HEARTBEAT_SECONDS > 0
+
+
+def test_repair_session_bounds_skip_weekends_and_holidays():
+    assert repair_session_bounds(
+        datetime(2026, 9, 8, 13, 35, tzinfo=UTC),
+        3,
+        provider_delay=timedelta(minutes=15),
+    ) == (datetime(2026, 9, 2).date(), datetime(2026, 9, 4).date())
+
+
+def test_repair_recent_sessions_refetches_native_and_bounds_derivations():
+    from types import SimpleNamespace
+
+    class Service:
+        def __init__(self):
+            self.native_calls = []
+            self.derived_calls = []
+
+        def ingest_native_interval(self, revisions, **kwargs):
+            self.native_calls.append((revisions, kwargs))
+            return SimpleNamespace(
+                bar_count=10, inserted_count=0, missing_tickers=()
+            )
+
+        def derive_interval(self, revisions, **kwargs):
+            self.derived_calls.append((revisions, kwargs))
+            return SimpleNamespace(
+                bar_count=10, inserted_count=0, missing_tickers=()
+            )
+
+    service = Service()
+    now = datetime(2026, 9, 8, 21, 0, tzinfo=UTC)
+
+    repair_recent_sessions(
+        service,
+        ("AAPL",),
+        now=now,
+        session_count=3,
+        provider_delay=timedelta(minutes=15),
+        intervals=("5m", "15m", "30m", "1h", "1d", "1wk", "1mo"),
+    )
+
+    assert [call[1]["interval"] for call in service.native_calls] == [
+        "5m", "15m", "30m"
+    ]
+    assert all(call[1]["start"] == datetime(2026, 9, 3).date() for call in service.native_calls)
+    assert all(call[1]["end"] == datetime(2026, 9, 8).date() for call in service.native_calls)
+    assert [call[1]["target_interval"] for call in service.derived_calls] == [
+        "1h", "1d", "1wk", "1mo"
+    ]
+    assert [call[1]["source_limit_per_ticker"] for call in service.derived_calls] == [
+        39, 39, 8, 26
+    ]
+    assert all(call[1]["include_history"] is True for call in service.derived_calls)
 
 
 def test_continuous_worker_retries_native_coverage_failure(caplog):

@@ -12,6 +12,8 @@ import SectorIntelligence from './pages/SectorIntelligence'
 import ScannerResults from './pages/ScannerResults'
 import PatternWatch from './pages/PatternWatch'
 import TickerWorkspace from './pages/ticker/TickerWorkspace'
+import OptionsActivityPage from './pages/OptionsActivityPage'
+import OptionsFlowPage from './pages/OptionsFlowPage'
 import OptionsResearchWorkspace from './pages/OptionsResearchWorkspace'
 import Account from './pages/auth/Account'
 import SignIn from './pages/auth/SignIn'
@@ -30,6 +32,8 @@ function PortalRoutes() {
       <Route path="/sector-intelligence" element={<SectorIntelligence />} />
       <Route path="/pattern-watch" element={<PatternWatch />} />
       <Route path="/stock-research/*" element={<ScannerResults />} />
+      <Route path="/options/activity" element={<OptionsActivityPage />} />
+      <Route path="/options/flow" element={<OptionsFlowPage />} />
       <Route path="/options/*" element={<OptionsResearchWorkspace />} />
       <Route path="/account" element={<Account />} />
       <Route path="/scanner-results" element={<Navigate to="/stock-research" replace />} />

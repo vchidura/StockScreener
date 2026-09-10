@@ -200,8 +200,19 @@ def test_pending_option_candidates_are_bounded_to_selected_contract_packages():
     assert "candidate.candidate_kind IN ('SINGLE_CONTRACT', 'MULTI_LEG')" in compact
     assert "candidate.capital_at_risk > 0" in compact
     assert "outcome.valuation_policy_sha256 = %s" in compact
+    assert (
+        "snapshot.mark_market_data_time >= candidate.market_data_time + "
+        "INTERVAL '15 minutes'"
+    ) in compact
+    assert "HAVING COUNT(DISTINCT snapshot.contract_id)" in compact
     assert "HAVING COUNT(DISTINCT outcome.measurement_type) < 5" in compact
-    assert parameters == ("a" * 64, available_by, available_by, 60, 1000)
+    assert (
+        "ORDER BY COUNT(DISTINCT outcome.measurement_type), "
+        "candidate.market_data_time DESC"
+    ) in compact
+    assert parameters == (
+        "a" * 64, available_by, available_by, 60, available_by, 1000,
+    )
 
 
 def test_retained_leg_bounds_cover_selected_unexpired_contract_packages():
@@ -278,8 +289,16 @@ def test_current_mark_candidates_prioritize_unmarked_packages():
     sql, parameters = cursor.execute.call_args.args
     compact = " ".join(sql.split())
     assert "LEFT JOIN option_signal_current_marks AS current_mark" in compact
-    assert "ORDER BY current_mark.candidate_id IS NULL DESC" in compact
-    assert parameters == ("a" * 64, available_by, available_by, 60, available_by, 1000)
+    assert "snapshot.mark_market_data_time > candidate.market_data_time" in compact
+    assert "HAVING COUNT(DISTINCT snapshot.contract_id)" in compact
+    assert "PARTITION BY current_mark.candidate_id IS NULL" in compact
+    assert "THEN candidate.market_data_time END DESC" in compact
+    assert "current_mark.market_time NULLS FIRST" in compact
+    assert "WHERE queue_rank <= %s" in compact
+    assert parameters == (
+        "a" * 64, available_by, available_by, 60,
+        available_by, available_by, 1000,
+    )
 
 
 def test_checkpoint_legs_require_one_complete_causal_snapshot_batch():

@@ -1,0 +1,115 @@
+{
+  "overlap": {
+    "all_signals_14d": 14325,
+    "board_performance_14d": 1191,
+    "intersection": 1191,
+    "all_only": 13134,
+    "board_only": 0,
+    "raw_board_occurrences_14d": 2301,
+    "events_with_board_occurrence_14d": 1191,
+    "recurring_events_excluded_by_first_entry": 0
+  },
+  "all_signal_rank_buckets": [
+    {
+      "rank_bucket": "1",
+      "events": 1048
+    },
+    {
+      "rank_bucket": "2-3",
+      "events": 2114
+    },
+    {
+      "rank_bucket": "4-10",
+      "events": 2951
+    },
+    {
+      "rank_bucket": "11-25",
+      "events": 2860
+    },
+    {
+      "rank_bucket": "26+",
+      "events": 5352
+    }
+  ],
+  "all_signals_by_strategy": [
+    {
+      "strategy_name": "SPREAD_RANGE_LOCATOR",
+      "events": 10467
+    },
+    {
+      "strategy_name": "DIRECTIONAL_DEBIT_SPREAD",
+      "events": 1678
+    },
+    {
+      "strategy_name": "DIRECTIONAL_LONG_PREMIUM",
+      "events": 1281
+    },
+    {
+      "strategy_name": "INCOME_WHEEL",
+      "events": 830
+    },
+    {
+      "strategy_name": "ZERO_DTE_GAMMA_SQUEEZE",
+      "events": 69
+    }
+  ],
+  "board_by_strategy_kind": [
+    {
+      "strategy_name": "SPREAD_RANGE_LOCATOR",
+      "candidate_kind": "MULTI_LEG",
+      "events": 336
+    },
+    {
+      "strategy_name": "DIRECTIONAL_DEBIT_SPREAD",
+      "candidate_kind": "MULTI_LEG",
+      "events": 303
+    },
+    {
+      "strategy_name": "INCOME_WHEEL",
+      "candidate_kind": "SINGLE_CONTRACT",
+      "events": 302
+    },
+    {
+      "strategy_name": "DIRECTIONAL_LONG_PREMIUM",
+      "candidate_kind": "SINGLE_CONTRACT",
+      "events": 207
+    },
+    {
+      "strategy_name": "ZERO_DTE_GAMMA_SQUEEZE",
+      "candidate_kind": "SINGLE_CONTRACT",
+      "events": 43
+    }
+  ],
+  "board_signal_status": [
+    {
+      "status": "BLOCKED",
+      "events": 1191
+    }
+  ],
+  "board_recurrence": [
+    {
+      "occurrence_bucket": "1",
+      "events": 653,
+      "recorded_occurrences": 653,
+      "actual_occurrences": "653"
+    },
+    {
+      "occurrence_bucket": "2-4",
+      "events": 371,
+      "recorded_occurrences": 969,
+      "actual_occurrences": "969"
+    },
+    {
+      "occurrence_bucket": "5+",
+      "events": 167,
+      "recorded_occurrences": 1738,
+      "actual_occurrences": "1738"
+    }
+  ],
+  "current_board": {
+    "structured": 2,
+    "research_highlights": 13,
+    "covered_underlyers": 12,
+    "configured_underlyers": 13
+  }
+}

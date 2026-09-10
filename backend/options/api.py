@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
@@ -474,6 +474,414 @@ def option_analysis(underlyer: str) -> OptionsEnvelope:
             "analysis": analysis,
             "expirations": expirations,
             "quote_liquidity": "NOT_AVAILABLE",
+        },
+    )
+
+
+@router.get("/flow", response_model=OptionsEnvelope)
+def option_flow(
+    underlyer: str | None = None,
+    session_date: date | None = None,
+) -> OptionsEnvelope:
+    configuration = _configuration()
+    requested = underlyer.strip().upper() if underlyer else "SPY"
+    with get_db_cursor() as cursor:
+        if not _schema_available(cursor):
+            return _envelope(
+                available=False,
+                reason="MIGRATION_015_NOT_APPLIED",
+                data={"underlyers": [], "selected": requested},
+            )
+        cursor.execute(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (run.underlying)
+                    run.underlying, run.asset_type, run.batch_id,
+                    run.scheduled_cycle, run.market_data_time,
+                    run.first_observed_at, run.received_row_count,
+                    run.retained_row_count, analysis.matrix_id,
+                    analysis.model_version
+                FROM option_ingestion_runs AS run
+                JOIN option_analysis_runs AS analysis USING (batch_id)
+                WHERE run.status = 'COMPLETE'
+                  AND analysis.status = 'COMPLETE'
+                  AND analysis.policy_sha256 = %s
+                  AND run.retained_row_count > 0
+                                    AND (
+                                            %s::date IS NULL
+                                            OR (run.market_data_time AT TIME ZONE 'America/New_York')::date
+                                                    = %s::date
+                                    )
+                ORDER BY run.underlying, run.scheduled_cycle DESC,
+                         run.completed_at DESC, analysis.observed_time DESC
+            )
+            SELECT latest.underlying, latest.asset_type, latest.batch_id,
+                   latest.matrix_id, latest.scheduled_cycle,
+                   latest.market_data_time, latest.first_observed_at,
+                   latest.received_row_count, latest.retained_row_count,
+                   latest.model_version, MAX(snapshot.spot) AS spot,
+                   COUNT(*) AS contract_count,
+                   COUNT(DISTINCT snapshot.expiration_date) AS expiration_count,
+                   COUNT(DISTINCT snapshot.strike) AS strike_count,
+                   COUNT(*) FILTER (WHERE snapshot.contract_type = 'CALL')
+                       AS call_contract_count,
+                   COUNT(*) FILTER (WHERE snapshot.contract_type = 'PUT')
+                       AS put_contract_count,
+                   COALESCE(SUM(snapshot.day_volume) FILTER (
+                       WHERE snapshot.contract_type = 'CALL'
+                   ), 0) AS call_volume,
+                   COALESCE(SUM(snapshot.day_volume) FILTER (
+                       WHERE snapshot.contract_type = 'PUT'
+                   ), 0) AS put_volume,
+                   COALESCE(SUM(snapshot.open_interest) FILTER (
+                       WHERE snapshot.contract_type = 'CALL'
+                   ), 0) AS call_open_interest,
+                   COALESCE(SUM(snapshot.open_interest) FILTER (
+                       WHERE snapshot.contract_type = 'PUT'
+                   ), 0) AS put_open_interest,
+                   COALESCE(SUM(
+                       snapshot.day_volume
+                       * COALESCE(snapshot.model_mark, snapshot.display_mark)
+                       * snapshot.shares_per_contract
+                   ) FILTER (WHERE snapshot.contract_type = 'CALL'), 0)
+                       AS call_premium_activity,
+                   COALESCE(SUM(
+                       snapshot.day_volume
+                       * COALESCE(snapshot.model_mark, snapshot.display_mark)
+                       * snapshot.shares_per_contract
+                   ) FILTER (WHERE snapshot.contract_type = 'PUT'), 0)
+                       AS put_premium_activity,
+                   COUNT(*) FILTER (
+                       WHERE snapshot.day_volume IS NOT NULL
+                         AND COALESCE(snapshot.model_mark, snapshot.display_mark) IS NOT NULL
+                   ) AS premium_activity_contract_count
+            FROM latest
+            JOIN option_chain_snapshots AS snapshot USING (batch_id)
+            GROUP BY latest.underlying, latest.asset_type, latest.batch_id,
+                     latest.matrix_id, latest.scheduled_cycle,
+                     latest.market_data_time, latest.first_observed_at,
+                     latest.received_row_count, latest.retained_row_count,
+                     latest.model_version
+            ORDER BY latest.underlying
+            """,
+            (configuration.policy_sha256, session_date, session_date),
+        )
+        summaries = [dict(row) for row in cursor.fetchall()]
+        if summaries and requested not in {row["underlying"] for row in summaries}:
+            requested = summaries[0]["underlying"]
+        selected_summary = next(
+            (row for row in summaries if row["underlying"] == requested), None
+        )
+
+        oi_by_underlying: dict[str, dict[str, object]] = {}
+        cursor.execute(
+            """
+            WITH ranked_sessions AS (
+                SELECT underlying, settlement_session,
+                       DENSE_RANK() OVER (
+                           PARTITION BY underlying
+                           ORDER BY settlement_session DESC
+                       ) AS session_rank
+                FROM (
+                    SELECT DISTINCT underlying, settlement_session
+                    FROM option_daily_contract_facts
+                    WHERE open_interest IS NOT NULL
+                      AND open_interest_observed_session <= COALESCE(
+                          %s::date,
+                          (NOW() AT TIME ZONE 'America/New_York')::date
+                      )
+                ) AS sessions
+            ), current_rows AS (
+                SELECT fact.underlying, fact.contract_id,
+                       fact.settlement_session,
+                       COALESCE(
+                           fact.open_interest_revised_value,
+                           fact.open_interest
+                       ) AS open_interest
+                FROM option_daily_contract_facts AS fact
+                JOIN ranked_sessions AS ranked
+                  ON ranked.underlying = fact.underlying
+                 AND ranked.settlement_session = fact.settlement_session
+                 AND ranked.session_rank = 1
+                WHERE fact.open_interest IS NOT NULL
+            ), prior_rows AS (
+                SELECT fact.underlying, fact.contract_id,
+                       fact.settlement_session,
+                       COALESCE(
+                           fact.open_interest_revised_value,
+                           fact.open_interest
+                       ) AS open_interest
+                FROM option_daily_contract_facts AS fact
+                JOIN ranked_sessions AS ranked
+                  ON ranked.underlying = fact.underlying
+                 AND ranked.settlement_session = fact.settlement_session
+                 AND ranked.session_rank = 2
+                WHERE fact.open_interest IS NOT NULL
+            ), paired AS (
+                SELECT current.underlying, current.contract_id,
+                       current.settlement_session AS settlement_session,
+                       prior.settlement_session AS prior_settlement_session,
+                       catalog.contract_type,
+                       current.open_interest - prior.open_interest AS oi_change
+                FROM current_rows AS current
+                JOIN prior_rows AS prior
+                  ON prior.underlying = current.underlying
+                 AND prior.contract_id = current.contract_id
+                                JOIN LATERAL (
+                                        SELECT version.contract_type
+                                        FROM option_contract_catalog_versions AS version
+                                        WHERE version.contract_id = current.contract_id
+                                            AND version.contract_type IS NOT NULL
+                                            AND version.valid_from
+                                                    < current.settlement_session + INTERVAL '1 day'
+                                            AND (
+                                                    version.valid_to IS NULL
+                                                    OR version.valid_to >= current.settlement_session
+                                            )
+                                        ORDER BY version.valid_from DESC,
+                                                         version.catalog_version_id DESC
+                                        LIMIT 1
+                                ) AS catalog ON TRUE
+            ), current_counts AS (
+                SELECT underlying, COUNT(*) AS current_contract_count
+                FROM current_rows
+                GROUP BY underlying
+            )
+            SELECT paired.underlying,
+                   MAX(paired.settlement_session) AS settlement_session,
+                   MAX(paired.prior_settlement_session) AS prior_settlement_session,
+                   COUNT(*) AS matched_contract_count,
+                   current_counts.current_contract_count,
+                   COALESCE(SUM(paired.oi_change) FILTER (
+                       WHERE paired.contract_type = 'CALL'
+                   ), 0) AS call_open_interest_change,
+                   COALESCE(SUM(paired.oi_change) FILTER (
+                       WHERE paired.contract_type = 'PUT'
+                   ), 0) AS put_open_interest_change
+            FROM paired
+            JOIN current_counts USING (underlying)
+            GROUP BY paired.underlying, current_counts.current_contract_count
+            ORDER BY paired.underlying
+            """,
+            (session_date,),
+        )
+        for row in cursor.fetchall():
+            item = dict(row)
+            for field in (
+                "matched_contract_count",
+                "current_contract_count",
+                "call_open_interest_change",
+                "put_open_interest_change",
+            ):
+                item[field] = int(item[field] or 0)
+            current_count = item["current_contract_count"] or 0
+            item["matched_coverage_fraction"] = (
+                item["matched_contract_count"] / current_count
+                if current_count
+                else 0.0
+            )
+            item["total_open_interest_change"] = (
+                item["call_open_interest_change"]
+                + item["put_open_interest_change"]
+            )
+            oi_by_underlying[item["underlying"]] = item
+
+        for summary in summaries:
+            for field in (
+                "call_volume",
+                "put_volume",
+                "call_open_interest",
+                "put_open_interest",
+            ):
+                summary[field] = int(summary[field] or 0)
+            total_volume = summary["call_volume"] + summary["put_volume"]
+            total_oi = summary["call_open_interest"] + summary["put_open_interest"]
+            summary["total_volume"] = total_volume
+            summary["total_open_interest"] = total_oi
+            summary["total_premium_activity"] = (
+                summary["call_premium_activity"]
+                + summary["put_premium_activity"]
+            )
+            summary["put_call_volume_ratio"] = (
+                summary["put_volume"] / summary["call_volume"]
+                if summary["call_volume"]
+                else None
+            )
+            summary["put_call_open_interest_ratio"] = (
+                summary["put_open_interest"] / summary["call_open_interest"]
+                if summary["call_open_interest"]
+                else None
+            )
+            summary["retention_fraction"] = (
+                summary["retained_row_count"] / summary["received_row_count"]
+                if summary["received_row_count"]
+                else 0.0
+            )
+            summary["open_interest_change"] = oi_by_underlying.get(
+                summary["underlying"]
+            )
+
+        expirations: list[dict[str, object]] = []
+        strikes: list[dict[str, object]] = []
+        top_contracts: list[dict[str, object]] = []
+        if selected_summary is not None:
+            batch_id = selected_summary["batch_id"]
+            cursor.execute(
+                """
+                SELECT expiration_date, MIN(calendar_dte) AS calendar_dte,
+                       COUNT(*) AS contract_count,
+                       COALESCE(SUM(day_volume) FILTER (
+                           WHERE contract_type = 'CALL'
+                       ), 0) AS call_volume,
+                       COALESCE(SUM(day_volume) FILTER (
+                           WHERE contract_type = 'PUT'
+                       ), 0) AS put_volume,
+                       COALESCE(SUM(open_interest) FILTER (
+                           WHERE contract_type = 'CALL'
+                       ), 0) AS call_open_interest,
+                       COALESCE(SUM(open_interest) FILTER (
+                           WHERE contract_type = 'PUT'
+                       ), 0) AS put_open_interest,
+                       COALESCE(SUM(
+                           day_volume * COALESCE(model_mark, display_mark)
+                           * shares_per_contract
+                       ) FILTER (WHERE contract_type = 'CALL'), 0)
+                           AS call_premium_activity,
+                       COALESCE(SUM(
+                           day_volume * COALESCE(model_mark, display_mark)
+                           * shares_per_contract
+                       ) FILTER (WHERE contract_type = 'PUT'), 0)
+                           AS put_premium_activity
+                FROM option_chain_snapshots
+                WHERE batch_id = %s
+                GROUP BY expiration_date
+                ORDER BY expiration_date
+                """,
+                (batch_id,),
+            )
+            expirations = [dict(row) for row in cursor.fetchall()]
+            for expiration in expirations:
+                for field in (
+                    "call_volume",
+                    "put_volume",
+                    "call_open_interest",
+                    "put_open_interest",
+                ):
+                    expiration[field] = int(expiration[field] or 0)
+            cursor.execute(
+                """
+                SELECT expiration_date, strike, COUNT(*) AS contract_count,
+                       COALESCE(SUM(day_volume) FILTER (
+                           WHERE contract_type = 'CALL'
+                       ), 0) AS call_volume,
+                       COALESCE(SUM(day_volume) FILTER (
+                           WHERE contract_type = 'PUT'
+                       ), 0) AS put_volume,
+                       COALESCE(SUM(open_interest) FILTER (
+                           WHERE contract_type = 'CALL'
+                       ), 0) AS call_open_interest,
+                       COALESCE(SUM(open_interest) FILTER (
+                           WHERE contract_type = 'PUT'
+                       ), 0) AS put_open_interest
+                FROM option_chain_snapshots
+                WHERE batch_id = %s
+                GROUP BY expiration_date, strike
+                ORDER BY expiration_date, strike
+                """,
+                (batch_id,),
+            )
+            strikes = [dict(row) for row in cursor.fetchall()]
+            for strike in strikes:
+                for field in (
+                    "call_volume",
+                    "put_volume",
+                    "call_open_interest",
+                    "put_open_interest",
+                ):
+                    strike[field] = int(strike[field] or 0)
+            cursor.execute(
+                """
+                SELECT contract_id, contract_ticker, contract_type,
+                       expiration_date, calendar_dte, strike, spot,
+                       day_volume, open_interest, model_mark, display_mark,
+                       local_iv, local_delta,
+                       CASE
+                           WHEN open_interest IS NOT NULL
+                           THEN day_volume::DOUBLE PRECISION
+                                / GREATEST(open_interest, 1)
+                           ELSE NULL
+                       END AS volume_open_interest_ratio,
+                       day_volume * COALESCE(model_mark, display_mark)
+                           * shares_per_contract AS premium_activity,
+                       ABS(strike / spot - 1) AS moneyness_fraction
+                FROM option_chain_snapshots
+                WHERE batch_id = %s
+                  AND day_volume IS NOT NULL
+                ORDER BY premium_activity DESC NULLS LAST,
+                         day_volume DESC, contract_id
+                LIMIT 24
+                """,
+                (batch_id,),
+            )
+            top_contracts = [dict(row) for row in cursor.fetchall()]
+
+    newest_market = max(
+        (row["market_data_time"] for row in summaries if row["market_data_time"]),
+        default=None,
+    )
+    newest_observed = max(
+        (row["first_observed_at"] for row in summaries if row["first_observed_at"]),
+        default=None,
+    )
+    return _envelope(
+        available=bool(summaries),
+        reason=None if summaries else "NO_COMPLETE_MATRIX",
+        as_of=newest_market,
+        observed_at=newest_observed,
+        model_version=(selected_summary or {}).get("model_version"),
+        data={
+            "underlyers": summaries,
+            "selected": requested,
+            "session_date": (
+                session_date.isoformat()
+                if session_date is not None
+                else (
+                    OptionExchangeCalendar()
+                    .session_for_market_time(newest_market)
+                    .isoformat()
+                    if newest_market is not None
+                    else None
+                )
+            ),
+            "selected_summary": selected_summary,
+            "expirations": expirations,
+            "strikes": strikes,
+            "top_contracts": top_contracts,
+            "directional_flow_available": False,
+            "quote_liquidity": "NOT_AVAILABLE",
+            "trade_tape_scope": "EXCLUDED_FROM_TOTALS_WATCHLIST_BIASED",
+            "definitions": {
+                "volume": (
+                    "Cumulative provider day volume summed across retained "
+                    "standard contracts in the latest complete matrix."
+                ),
+                "open_interest": (
+                    "Latest provider open interest, representing the prior "
+                    "completed settlement."
+                ),
+                "premium_activity": (
+                    "Estimated activity = day volume x latest aligned mark x "
+                    "contract multiplier. It is not transacted premium or net flow."
+                ),
+                "open_interest_change": (
+                    "Change across contracts present in both latest captured "
+                    "settlements. It identifies positioning change, not trade direction."
+                ),
+                "coverage": (
+                    "Totals cover the configured DTE, strike corridor, standard-contract "
+                    "and liquidity-retained matrix rather than the provider's full chain."
+                ),
+            },
         },
     )
 
@@ -1468,11 +1876,15 @@ def option_performance(
     underlyer: str | None = None,
     strategy: str | None = None,
     expiration: str | None = None,
-    cohort: Literal["OPPORTUNITY_BOARD", "ALL_SIGNALS"] = "OPPORTUNITY_BOARD",
+    cohort: Literal[
+        "RANK_LEADERS", "OPPORTUNITY_BOARD", "ALL_SIGNALS"
+    ] = "RANK_LEADERS",
     days: int = Query(default=14, ge=1, le=60),
     limit: int = Query(default=100, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> OptionsEnvelope:
+    rank_leader_cohort = cohort in {"RANK_LEADERS", "OPPORTUNITY_BOARD"}
+    normalized_cohort = "RANK_LEADERS" if rank_leader_cohort else "ALL_SIGNALS"
     policy = delayed_proxy_commission_policy()
     generated_at = datetime.now(timezone.utc)
     cutoff = generated_at - timedelta(days=days)
@@ -1494,7 +1906,7 @@ def option_performance(
         JOIN option_strategy_candidates AS candidate
           ON candidate.candidate_id = signal.source_candidate_id
     """
-    if cohort == "OPPORTUNITY_BOARD":
+    if rank_leader_cohort:
         candidate_join_sql = """
             JOIN LATERAL (
                 SELECT occurrence_candidate.*
@@ -1532,15 +1944,24 @@ def option_performance(
                 policy_sha256=policy.policy_sha256,
                 data={
                     "rows": [], "total": 0, "limit": limit, "offset": offset,
-                    "days": days, "cohort": cohort, "measured_signals": 0,
+                    "days": days, "cohort": normalized_cohort,
+                    "requested_cohort": cohort, "measured_signals": 0,
                     "signals_with_management_plan": 0,
                     "measurement_count": 0, "measurement_summary": [],
                     "valuation_mode": "RESEARCH_DELAYED_PROXY",
                     "materialization_owner": "OPTION_WORKER",
                     "entry_basis": (
-                        "FIRST_BOARD_OCCURRENCE"
-                        if cohort == "OPPORTUNITY_BOARD"
+                        "FIRST_RAW_RANK_LEADER_OCCURRENCE"
+                        if rank_leader_cohort
                         else "ORIGINAL_SIGNAL_PACKAGE"
+                    ),
+                    "board_membership_exact": False,
+                    "cohort_definition": (
+                        "Unique structured signal events whose raw rank was lowest "
+                        "within a matrix, strategy and candidate kind. This does not "
+                        "reconstruct historical Opportunity Board membership."
+                        if rank_leader_cohort
+                        else "All persisted structured signal events in the requested window."
                     ),
                     "navigation_revalues": False,
                     "current_mark_included": False,
@@ -1752,7 +2173,8 @@ def option_performance(
             "limit": limit,
             "offset": offset,
             "days": days,
-            "cohort": cohort,
+            "cohort": normalized_cohort,
+            "requested_cohort": cohort,
             "measured_signals": summary["measured_signals"],
             "signals_with_management_plan": summary[
                 "signals_with_management_plan"
@@ -1762,9 +2184,17 @@ def option_performance(
             "valuation_mode": "RESEARCH_DELAYED_PROXY",
             "materialization_owner": "OPTION_WORKER",
             "entry_basis": (
-                "FIRST_BOARD_OCCURRENCE"
-                if cohort == "OPPORTUNITY_BOARD"
+                "FIRST_RAW_RANK_LEADER_OCCURRENCE"
+                if rank_leader_cohort
                 else "ORIGINAL_SIGNAL_PACKAGE"
+            ),
+            "board_membership_exact": False,
+            "cohort_definition": (
+                "Unique structured signal events whose raw rank was lowest within "
+                "a matrix, strategy and candidate kind. This does not reconstruct "
+                "historical Opportunity Board membership."
+                if rank_leader_cohort
+                else "All persisted structured signal events in the requested window."
             ),
             "navigation_revalues": False,
             "current_mark_included": current_marks_available,

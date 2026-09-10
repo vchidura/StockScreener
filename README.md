@@ -87,26 +87,65 @@ For a complete historical bootstrap before starting workers, follow
 `bootstrap_fresh_data.py` driver can execute the same ingestion phases manually
 without Docker.
 
-After bootstrap, start these in separate terminals:
+### Daily Market-Day Startup
+
+After the one-time bootstrap, start PostgreSQL and run the following commands
+from the repository root on each market day. Start them before the opening bell
+and leave the worker windows running until at least 15 minutes after the close so
+the final delayed provider data can be ingested.
+
+Terminal 1 starts the API and explicitly loads the backend environment file:
 
 ```powershell
-# API
 .\backend\.venv\Scripts\python.exe -m uvicorn main:app `
-  --app-dir backend --reload --host 127.0.0.1 --port 8001
+  --app-dir backend --env-file .\backend\.env `
+  --reload --host 127.0.0.1 --port 8001
+```
 
-# Canonical ingestion/materialization
-.\backend\.venv\Scripts\python.exe .\backend\scripts\run_equity_worker.py
+Terminal 2 launches the continuous equity ingestion/materialization worker,
+equity portal snapshot publisher, and delayed option pipeline in separate worker
+windows:
 
-# Portal snapshots
-.\backend\.venv\Scripts\python.exe `
-  .\backend\scripts\refresh_equity_portal_snapshots.py --continuous
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1
+```
 
-# Delayed options ingestion, analysis, strategies, and recommendation publication
-.\backend\.venv\Scripts\python.exe .\backend\scripts\run_option_worker.py
+Do not also start `run_equity_worker.py`,
+`refresh_equity_portal_snapshots.py`, or `run_option_worker.py` manually when
+using `start_workers.ps1`; the launcher refuses duplicate workers.
 
-# Frontend
+Terminal 3 starts the frontend:
+
+```powershell
 Set-Location frontend
 npm.cmd run dev
+```
+
+Open `http://127.0.0.1:5174`. The Vite development server proxies `/api` to
+`http://127.0.0.1:8001`.
+
+### Same-Session Recovery And Verification
+
+If the continuous workers were interrupted or were not running during the
+current session, stop any remaining worker windows and run one catch-up pass
+from the repository root after the configured 15-minute provider delay:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Once
+```
+
+This re-reads all available native equity bars for the current session, processes
+only the latest due equity analysis watermark and latest observable option slot,
+then exits. It does not reconstruct skipped intraday equity analyses or option
+matrices. Verify both pipelines without starting additional work:
+
+```powershell
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\run_equity_materialization.py --coverage-report
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\run_option_pipeline.py --status
 ```
 
 `run_equity_worker.py` performs ingestion, canonical publication, and the v16
@@ -118,25 +157,46 @@ Monitor run/member status from another terminal without starting work:
   .\backend\scripts\report_equity_analysis_status.py
 ```
 
-After an interrupted worker, run one catch-up pass from the repository root:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
-  .\backend\scripts\start_workers.ps1 -Only Equity -Once
-```
-
 One-shot mode runs equity materialization to completion before refreshing portal
 snapshots, so a newly published daily or weekly cohort cannot leave the portal
 generation stale. Continuous mode still runs both workers independently.
 
-One-shot invocation is safe for intermittent operation. Each native `5m`, `15m`,
-and `30m` request re-reads the available session-to-date range and persists bars
-idempotently, so repeated runs do not duplicate data and an after-close run fills
-the complete session. Run the close pass after the configured provider delay
-(15 minutes by default), not exactly at the closing bell. Each invocation
-materializes analysis only at its latest due watermark; sparse operation therefore
-does not reconstruct every skipped intraday signal evaluation. Use continuous mode
-when every 5m/15m/30m signal checkpoint is required.
+One-shot invocation is safe for intermittent same-session price-bar capture. Each
+native `5m`, `15m`, and `30m` request re-reads the available session-to-date range
+and persists bars idempotently, so repeated runs do not duplicate data and an
+after-close run fills the complete equity session. Run the close pass after the
+configured provider delay (15 minutes by default), not exactly at the closing
+bell. Use continuous mode when every 5m/15m/30m equity signal checkpoint or every
+15-minute option matrix is required.
+
+### Recent-Session Repair
+
+There is no need to query the database for each missing equity bar before
+repairing a short recent gap. Provider fetches and canonical persistence are
+idempotent: existing revisions are retained and only missing revisions are
+inserted. Stop the continuous workers, choose how many recent XNYS sessions to
+repair, and run one command from the repository root:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Once -RepairSessions 3
+```
+
+`-RepairSessions 3` re-fetches `5m`, `15m`, and `30m` bars for the latest three
+exchange sessions, rebuilds recent `1h`, `1d`, `1wk`, and `1mo` derivations from
+bounded source tails, then runs the normal latest-watermark equity publication,
+analysis, portal snapshot refresh, and latest delayed option cycle. The accepted
+range is 1-30 sessions. Restart the continuous workers afterward.
+
+This repairs equity price history but does not retroactively create `ORIGINAL`
+analysis runs for every skipped intraday checkpoint. Use continuous mode when
+every signal checkpoint is required.
+
+The delayed option worker and `run_option_pipeline.py` accept no historical date;
+they can process only the latest observable current-session slot and durable
+current-session retries. A missed prior option session, or its skipped 15-minute
+matrices, cannot be reconstructed by the current daily commands. Do not represent
+a later option snapshot as if it had been observed at the missed watermark.
 
 Ticker charts keep canonical history unchanged and may add current-session
 `15m`, `30m`, `1h`, or `1d` display candles composed directly from fresh,
@@ -163,8 +223,26 @@ available at `/options/research`. Decisions combines Candidate Audit and Signal 
 the full matrix Explorer remains available contextually from Research rather than as a
 primary tab.
 
-Open `http://127.0.0.1:5174`. The Vite development server proxies `/api` to
-`http://127.0.0.1:8001`.
+Stocks and options have separate primary navigation sections. **Stocks** links Overview
+to the most recently opened `/ticker/{symbol}` workspace, falling back to `/ticker/SPY`
+before any symbol has been visited. Global ticker search opens the searched symbol on the
+same Overview tab and updates that remembered destination. Stock Research lives beside
+Overview at `/stock-research`. There is no separate global Research section.
+
+Sidebar product sections are collapsible disclosures. The active route's section opens
+automatically, multiple sections may remain open, and expansion state persists locally.
+The compact desktop rail shows one icon per section and opens labeled flyout navigation;
+the mobile drawer uses the same controls as ordinary expand/collapse disclosures.
+
+The **Options** section exposes Options Research, Option Activity, and Options Flow as
+equal-level pages. `/options/activity` compares cumulative call
+and put volume, open interest, estimated premium activity, and matched settlement-to-
+settlement OI change across the 13 configured underlyings. The shared header session
+selector reads each underlying's last complete 15-minute matrix within that exchange
+session. `/options/flow` drills into one ticker selected in-page with expiry concentration,
+strike concentration, and high-activity contracts. Developer data has no contemporaneous
+option NBBO, so neither surface infers buyer/seller aggressor direction; estimated premium
+activity remains distinct from executable or net premium flow.
 
 Do not start a legacy scheduler or the Advanced stream worker.
 

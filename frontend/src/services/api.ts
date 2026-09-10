@@ -2094,6 +2094,105 @@ export interface OptionAnalysisData {
   quote_liquidity: 'NOT_AVAILABLE'
 }
 
+export interface OptionFlowOpenInterestChange {
+  settlement_session: string
+  prior_settlement_session: string
+  matched_contract_count: number
+  current_contract_count: number
+  matched_coverage_fraction: number
+  call_open_interest_change: number
+  put_open_interest_change: number
+  total_open_interest_change: number
+}
+
+export interface OptionFlowSummary {
+  underlying: string
+  asset_type: 'STOCK' | 'ETF'
+  batch_id: string
+  matrix_id: string
+  scheduled_cycle: string
+  market_data_time: string
+  first_observed_at: string
+  received_row_count: number
+  retained_row_count: number
+  retention_fraction: number
+  model_version: string
+  spot: string
+  contract_count: number
+  expiration_count: number
+  strike_count: number
+  call_contract_count: number
+  put_contract_count: number
+  call_volume: number
+  put_volume: number
+  total_volume: number
+  call_open_interest: number
+  put_open_interest: number
+  total_open_interest: number
+  call_premium_activity: string
+  put_premium_activity: string
+  total_premium_activity: string
+  premium_activity_contract_count: number
+  put_call_volume_ratio: number | null
+  put_call_open_interest_ratio: number | null
+  open_interest_change: OptionFlowOpenInterestChange | null
+}
+
+export interface OptionFlowExpiration {
+  expiration_date: string
+  calendar_dte: number
+  contract_count: number
+  call_volume: number
+  put_volume: number
+  call_open_interest: number
+  put_open_interest: number
+  call_premium_activity: string
+  put_premium_activity: string
+}
+
+export interface OptionFlowStrike {
+  expiration_date: string
+  strike: string
+  contract_count: number
+  call_volume: number
+  put_volume: number
+  call_open_interest: number
+  put_open_interest: number
+}
+
+export interface OptionFlowContract {
+  contract_id: number
+  contract_ticker: string
+  contract_type: 'CALL' | 'PUT'
+  expiration_date: string
+  calendar_dte: number
+  strike: string
+  spot: string
+  day_volume: number
+  open_interest: number | null
+  model_mark: string | null
+  display_mark: string | null
+  local_iv: number | null
+  local_delta: number | null
+  volume_open_interest_ratio: number | null
+  premium_activity: string | null
+  moneyness_fraction: string
+}
+
+export interface OptionFlowData {
+  underlyers: OptionFlowSummary[]
+  selected: string
+  session_date: string | null
+  selected_summary: OptionFlowSummary | null
+  expirations: OptionFlowExpiration[]
+  strikes: OptionFlowStrike[]
+  top_contracts: OptionFlowContract[]
+  directional_flow_available: false
+  quote_liquidity: 'NOT_AVAILABLE'
+  trade_tape_scope: 'EXCLUDED_FROM_TOTALS_WATCHLIST_BIASED'
+  definitions: Record<string, string>
+}
+
 export interface OptionExclusionReason {
   code: string
   label: string
@@ -2508,14 +2607,17 @@ export interface OptionPerformanceData {
   limit: number
   offset: number
   days: number
-  cohort: 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS'
+  cohort: 'RANK_LEADERS' | 'ALL_SIGNALS'
+  requested_cohort: 'RANK_LEADERS' | 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS'
   measured_signals: number
   signals_with_management_plan: number
   measurement_count: number
   measurement_summary: OptionPerformanceSummary[]
   valuation_mode: 'RESEARCH_DELAYED_PROXY'
   materialization_owner: 'OPTION_WORKER'
-  entry_basis: 'FIRST_BOARD_OCCURRENCE' | 'ORIGINAL_SIGNAL_PACKAGE'
+  entry_basis: 'FIRST_RAW_RANK_LEADER_OCCURRENCE' | 'ORIGINAL_SIGNAL_PACKAGE'
+  board_membership_exact: false
+  cohort_definition: string
   navigation_revalues: false
   current_mark_included: boolean
 }
@@ -2540,6 +2642,14 @@ export const getOptionChain = async (
 
 export const getOptionAnalysis = async (underlyer: string): Promise<OptionsEnvelope<OptionAnalysisData>> => {
   const response = await api.get(`/options/analysis/${underlyer}`)
+  return response.data
+}
+
+export const getOptionFlow = async (
+  underlyer?: string,
+  sessionDate?: string,
+): Promise<OptionsEnvelope<OptionFlowData>> => {
+  const response = await api.get('/options/flow', { params: { underlyer, session_date: sessionDate } })
   return response.data
 }
 
@@ -2648,7 +2758,7 @@ export const getOptionPerformance = async (params?: {
   underlyer?: string
   strategy?: string
   expiration?: string
-  cohort?: 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS'
+  cohort?: 'RANK_LEADERS' | 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS'
   days?: number
   limit?: number
   offset?: number

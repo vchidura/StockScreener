@@ -209,14 +209,32 @@ class OptionOutcomeRepository(PostgresRepository):
                   AND candidate.capital_at_risk > 0
                   AND candidate.market_data_time <= %s
                   AND candidate.market_data_time > %s - (%s * INTERVAL '1 day')
+                                    AND EXISTS (
+                                            SELECT 1
+                                            FROM option_chain_snapshots AS snapshot
+                                            JOIN option_candidate_legs AS observed_leg
+                                                ON observed_leg.contract_id = snapshot.contract_id
+                                            WHERE observed_leg.candidate_id = candidate.candidate_id
+                                                AND snapshot.model_mark IS NOT NULL
+                                                AND snapshot.first_observed_at <= %s
+                                                AND snapshot.mark_market_data_time >=
+                                                        candidate.market_data_time + INTERVAL '15 minutes'
+                                            GROUP BY snapshot.batch_id
+                                            HAVING COUNT(DISTINCT snapshot.contract_id) = (
+                                                    SELECT COUNT(*)
+                                                    FROM option_candidate_legs AS required_leg
+                                                    WHERE required_leg.candidate_id = candidate.candidate_id
+                                            )
+                                    )
                 GROUP BY candidate.candidate_id, signal.event_id
                                 HAVING COUNT(DISTINCT outcome.measurement_type) < 5
-                ORDER BY candidate.market_data_time, candidate.candidate_id
+                                    ORDER BY COUNT(DISTINCT outcome.measurement_type),
+                                             candidate.market_data_time DESC, candidate.candidate_id
                 LIMIT %s
                 """,
                 (
                     valuation_policy_sha256, available_by, available_by,
-                    retention_days, limit,
+                                        retention_days, available_by, limit,
                 ),
             )
             return tuple(dict(row) for row in cursor.fetchall())
@@ -234,35 +252,66 @@ class OptionOutcomeRepository(PostgresRepository):
         with self._cursor() as cursor:
             cursor.execute(
                 """
-                SELECT candidate.candidate_id, signal.event_id,
-                       candidate.market_data_time, candidate.capital_at_risk
-                FROM option_strategy_candidates AS candidate
-                LEFT JOIN option_signal_occurrences AS signal_occurrence
-                  ON signal_occurrence.source_candidate_id = candidate.candidate_id
-                LEFT JOIN option_signal_events AS signal
-                  ON signal.event_id = signal_occurrence.event_id
-                                LEFT JOIN option_signal_current_marks AS current_mark
-                                    ON current_mark.candidate_id = candidate.candidate_id
-                                 AND current_mark.valuation_policy_sha256 = %s
-                WHERE candidate.status = 'SELECTED'
-                  AND candidate.candidate_kind IN ('SINGLE_CONTRACT', 'MULTI_LEG')
-                  AND candidate.capital_at_risk > 0
-                  AND candidate.market_data_time <= %s
-                  AND candidate.market_data_time > %s - (%s * INTERVAL '1 day')
-                  AND EXISTS (
-                      SELECT 1 FROM option_candidate_legs AS leg
-                      WHERE leg.candidate_id = candidate.candidate_id
-                        AND leg.expiration_date >=
-                            (%s AT TIME ZONE 'America/New_York')::DATE
-                  )
-                ORDER BY current_mark.candidate_id IS NULL DESC,
-                         current_mark.market_time NULLS FIRST,
-                         candidate.market_data_time, candidate.candidate_id
-                LIMIT %s
+                                WITH candidate_queue AS (
+                                        SELECT candidate.candidate_id, signal.event_id,
+                                                     candidate.market_data_time,
+                                                     candidate.capital_at_risk,
+                                                     current_mark.candidate_id IS NULL AS mark_missing,
+                                                     ROW_NUMBER() OVER (
+                                                             PARTITION BY current_mark.candidate_id IS NULL
+                                                             ORDER BY
+                                                                     CASE WHEN current_mark.candidate_id IS NULL
+                                                                             THEN candidate.market_data_time END DESC,
+                                                                     current_mark.market_time NULLS FIRST,
+                                                                     candidate.market_data_time DESC,
+                                                                     candidate.candidate_id
+                                                     ) AS queue_rank
+                                        FROM option_strategy_candidates AS candidate
+                                        LEFT JOIN option_signal_occurrences AS signal_occurrence
+                                            ON signal_occurrence.source_candidate_id = candidate.candidate_id
+                                        LEFT JOIN option_signal_events AS signal
+                                            ON signal.event_id = signal_occurrence.event_id
+                                        LEFT JOIN option_signal_current_marks AS current_mark
+                                            ON current_mark.candidate_id = candidate.candidate_id
+                                         AND current_mark.valuation_policy_sha256 = %s
+                                        WHERE candidate.status = 'SELECTED'
+                                            AND candidate.candidate_kind IN ('SINGLE_CONTRACT', 'MULTI_LEG')
+                                            AND candidate.capital_at_risk > 0
+                                            AND candidate.market_data_time <= %s
+                                            AND candidate.market_data_time >
+                                                    %s - (%s * INTERVAL '1 day')
+                                            AND EXISTS (
+                                                    SELECT 1 FROM option_candidate_legs AS leg
+                                                    WHERE leg.candidate_id = candidate.candidate_id
+                                                        AND leg.expiration_date >=
+                                                                (%s AT TIME ZONE 'America/New_York')::DATE
+                                            )
+                                            AND EXISTS (
+                                                    SELECT 1
+                                                    FROM option_chain_snapshots AS snapshot
+                                                    JOIN option_candidate_legs AS observed_leg
+                                                        ON observed_leg.contract_id = snapshot.contract_id
+                                                    WHERE observed_leg.candidate_id = candidate.candidate_id
+                                                        AND snapshot.model_mark IS NOT NULL
+                                                        AND snapshot.first_observed_at <= %s
+                                                        AND snapshot.mark_market_data_time >
+                                                                candidate.market_data_time
+                                                    GROUP BY snapshot.batch_id
+                                                    HAVING COUNT(DISTINCT snapshot.contract_id) = (
+                                                            SELECT COUNT(*)
+                                                            FROM option_candidate_legs AS required_leg
+                                                            WHERE required_leg.candidate_id = candidate.candidate_id
+                                                    )
+                                            )
+                                )
+                                SELECT candidate_id, event_id, market_data_time, capital_at_risk
+                                FROM candidate_queue
+                                WHERE queue_rank <= %s
+                                ORDER BY mark_missing DESC, queue_rank
                 """,
                 (
                     valuation_policy_sha256, available_by, available_by,
-                    retention_days, available_by, limit,
+                    retention_days, available_by, available_by, limit,
                 ),
             )
             return tuple(dict(row) for row in cursor.fetchall())

@@ -20,6 +20,9 @@ param(
 
     [switch]$Once,
 
+    [ValidateRange(0, 30)]
+    [int]$RepairSessions = 0,
+
     # Run in this window instead of spawning separate ones. Only valid with -Only.
     [switch]$NoNewWindow
 )
@@ -35,6 +38,9 @@ if (-not (Test-Path $python -PathType Leaf)) {
 }
 if ($NoNewWindow -and $Only -eq "All") {
     throw "-NoNewWindow requires -Only Equity or -Only Options"
+}
+if ($RepairSessions -gt 0 -and $Only -eq "Options") {
+    throw "-RepairSessions applies only to the equity worker"
 }
 
 $running = Get-CimInstance Win32_Process -Filter "Name like '%python%'" -ErrorAction SilentlyContinue
@@ -102,14 +108,19 @@ function Invoke-OneShotWorker {
 
 $env:PYTHONIOENCODING = "utf-8"
 $modeArgs = if ($Once) { @("--once") } else { @() }
+$equityArgs = @($modeArgs)
+if ($RepairSessions -gt 0) {
+    $equityArgs += @("--repair-sessions", $RepairSessions.ToString())
+}
 
 if ($Only -in @("All", "Equity")) {
     if ($Once) {
         Invoke-OneShotWorker -Title "equity-worker" `
-            -ScriptName "run_equity_worker.py" -Arguments $modeArgs
+            -ScriptName "run_equity_worker.py" -Arguments $equityArgs
     }
     else {
-        Start-Worker -Title "equity-worker" -ScriptName "run_equity_worker.py"
+        Start-Worker -Title "equity-worker" -ScriptName "run_equity_worker.py" `
+            -Arguments $equityArgs
     }
 
     # The snapshot publisher has no --once; it is either a single pass or continuous.

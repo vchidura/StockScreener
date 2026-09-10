@@ -17,6 +17,7 @@ from options.api import (
     option_candidate_detail,
     option_candidates,
     option_data_quality,
+    option_flow,
     option_gamma,
     option_health,
     option_opportunities,
@@ -97,6 +98,33 @@ def test_options_universe_returns_configured_or_persisted_members():
     assert {row["ticker"] for row in payload["data"]} >= {"AAPL", "SPY", "IWM"}
 
 
+def test_options_flow_exposes_activity_without_inferred_direction():
+    payload = option_flow(underlyer="SPY").model_dump(mode="json")
+    data = payload["data"]
+
+    assert data["selected"]
+    assert data["session_date"]
+    assert data["directional_flow_available"] is False
+    assert data["quote_liquidity"] == "NOT_AVAILABLE"
+    assert data["trade_tape_scope"] == "EXCLUDED_FROM_TOTALS_WATCHLIST_BIASED"
+    assert "not transacted premium or net flow" in data["definitions"]["premium_activity"]
+    for row in data["underlyers"]:
+        assert row["total_volume"] == row["call_volume"] + row["put_volume"]
+        assert row["total_open_interest"] == (
+            row["call_open_interest"] + row["put_open_interest"]
+        )
+        assert 0 <= row["retention_fraction"] <= 1
+    if data["selected_summary"]:
+        assert data["selected_summary"]["underlying"] == data["selected"]
+        assert all(row["contract_count"] > 0 for row in data["expirations"])
+        strikes = [
+            (row["expiration_date"], float(row["strike"]))
+            for row in data["strikes"]
+        ]
+        assert strikes == sorted(strikes)
+        assert len(data["top_contracts"]) <= 24
+
+
 def test_candidate_workbench_exposes_typed_delayed_research_contract():
     payload = option_candidates(limit=5, offset=0).model_dump(mode="json")
     assert payload["reason"] in {None, "NO_STRATEGY_RESULTS"}
@@ -152,16 +180,21 @@ def test_recommendation_api_exposes_persisted_signal_contract():
 
 def test_performance_api_exposes_checkpoint_and_management_contract():
     payload = option_performance(
-        cohort="OPPORTUNITY_BOARD", days=14, limit=5, offset=0
+        cohort="RANK_LEADERS", days=14, limit=5, offset=0
     ).model_dump(mode="json")
 
     assert payload["reason"] in {None, "NO_SIGNAL_PERFORMANCE"}
     assert payload["data"]["days"] == 14
-    assert payload["data"]["cohort"] == "OPPORTUNITY_BOARD"
+    assert payload["data"]["cohort"] == "RANK_LEADERS"
+    assert payload["data"]["requested_cohort"] == "RANK_LEADERS"
     assert payload["data"]["limit"] == 5
     assert payload["data"]["valuation_mode"] == "RESEARCH_DELAYED_PROXY"
     assert payload["data"]["materialization_owner"] == "OPTION_WORKER"
-    assert payload["data"]["entry_basis"] == "FIRST_BOARD_OCCURRENCE"
+    assert payload["data"]["entry_basis"] == "FIRST_RAW_RANK_LEADER_OCCURRENCE"
+    assert payload["data"]["board_membership_exact"] is False
+    assert "does not reconstruct historical Opportunity Board membership" in (
+        payload["data"]["cohort_definition"]
+    )
     assert payload["data"]["navigation_revalues"] is False
     assert isinstance(payload["data"]["current_mark_included"], bool)
     assert isinstance(payload["data"]["measurement_summary"], list)
@@ -182,7 +215,7 @@ def test_performance_api_exposes_checkpoint_and_management_contract():
 
 def test_performance_api_can_include_all_structured_signals():
     board = option_performance(
-        cohort="OPPORTUNITY_BOARD", days=14, limit=200, offset=0
+        cohort="RANK_LEADERS", days=14, limit=200, offset=0
     ).model_dump(mode="json")
     all_signals = option_performance(
         cohort="ALL_SIGNALS", days=14, limit=200, offset=0
@@ -195,7 +228,7 @@ def test_performance_api_can_include_all_structured_signals():
 
 def test_performance_api_can_filter_historical_board_by_strategy():
     payload = option_performance(
-        strategy="income_wheel", cohort="OPPORTUNITY_BOARD",
+        strategy="income_wheel", cohort="RANK_LEADERS",
         days=14, limit=200, offset=0,
     ).model_dump(mode="json")
 
@@ -203,6 +236,16 @@ def test_performance_api_can_filter_historical_board_by_strategy():
         row["strategy_name"] == "INCOME_WHEEL"
         for row in payload["data"]["rows"]
     )
+
+
+def test_legacy_opportunity_board_cohort_is_an_alias_for_rank_leaders():
+    payload = option_performance(
+        cohort="OPPORTUNITY_BOARD", days=14, limit=1, offset=0
+    ).model_dump(mode="json")
+
+    assert payload["data"]["cohort"] == "RANK_LEADERS"
+    assert payload["data"]["requested_cohort"] == "OPPORTUNITY_BOARD"
+    assert payload["data"]["board_membership_exact"] is False
 
 
 def test_performance_checkpoints_distinguish_available_pending_and_not_due():
@@ -322,6 +365,7 @@ def test_options_routes_are_registered_on_main_app():
         "/api/options/universe",
         "/api/options/chain/{underlyer}",
         "/api/options/analysis/{underlyer}",
+        "/api/options/flow",
         "/api/options/data-quality",
         "/api/options/opportunities",
         "/api/options/candidates",
