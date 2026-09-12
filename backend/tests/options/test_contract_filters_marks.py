@@ -18,11 +18,18 @@ from options.analytics import (
     select_developer_marks,
 )
 from options.domain import ContractType, DataQualityFlag, ExerciseStyle
+from options.config import load_option_runtime_configuration
 
 
 UTC = timezone.utc
 MARKET_TIME = datetime(2026, 8, 31, 14, 0, tzinfo=UTC)
 CUTOFF = datetime(2026, 8, 31, 20, 0, tzinfo=UTC)
+
+
+def _valuation_policy():
+    return load_option_runtime_configuration(
+        {"POLYGON_API_KEY": "test-secret"}, BACKEND_DIR
+    ).valuation_policy
 
 
 def _filter(expiration_days, **overrides):
@@ -100,6 +107,7 @@ def test_developer_mark_uses_backward_bar_with_inclusive_sixty_second_skew():
         UnderlyingMinuteBar(Decimal("101"), mark_time + timedelta(seconds=1)),
     )
     result = select_developer_marks(
+        policy=_valuation_policy(),
         day_close=Decimal("2.50"),
         day_vwap=Decimal("2.40"),
         option_mark_time=mark_time,
@@ -113,6 +121,7 @@ def test_developer_mark_uses_backward_bar_with_inclusive_sixty_second_skew():
 
 def test_day_vwap_is_display_only_and_never_a_model_mark():
     result = select_developer_marks(
+        policy=_valuation_policy(),
         day_close=None,
         day_vwap=Decimal("2.40"),
         option_mark_time=MARKET_TIME,

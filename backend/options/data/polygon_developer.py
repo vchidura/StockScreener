@@ -224,6 +224,8 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
         contract_ticker: str,
         start: date,
         end: date,
+        *,
+        adjusted: bool = False,
     ) -> tuple[OptionDailyAggregate, ...]:
         """Daily settlement bars for one contract, including expired ones.
 
@@ -239,7 +241,11 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
         )
         payload, _ = self._request_json(
             f"{self.base_url}{path}",
-            {"adjusted": "true", "sort": "asc", "limit": "50000"},
+            {
+                "adjusted": "true" if adjusted else "false",
+                "sort": "asc",
+                "limit": "50000",
+            },
         )
         self._validate_provider_status(payload, {"OK", "DELAYED"}, "option aggregates")
         results = payload.get("results")

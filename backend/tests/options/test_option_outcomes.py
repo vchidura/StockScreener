@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -13,6 +14,7 @@ from options.outcomes import (
     measurement_checkpoints,
 )
 from options.outcome_service import OptionOutcomeService
+from options.domain import MarkSource
 from options.repositories.outcomes import OptionOutcomeRepository
 from options.strategies.domain import OptionSide
 from unittest.mock import MagicMock, patch
@@ -23,6 +25,7 @@ UTC = timezone.utc
 
 def leg(side, entry, exit_, *, ratio=1, batch_id=None):
     market_time = datetime(2026, 8, 31, 20, 30, tzinfo=UTC)
+    policy = delayed_proxy_commission_policy()
     return OptionOutcomeLeg(
         contract_id=42 + ratio,
         side=side,
@@ -34,6 +37,10 @@ def leg(side, entry, exit_, *, ratio=1, batch_id=None):
         source_batch_id=batch_id or uuid4(),
         source_market_time=market_time,
         source_observed_time=market_time + timedelta(minutes=15),
+        entry_mark_source=MarkSource.DEVELOPER_ALIGNED_AGG_CLOSE,
+        exit_mark_source=MarkSource.DEVELOPER_ALIGNED_AGG_CLOSE,
+        entry_valuation_policy_sha256=policy.policy_sha256,
+        exit_valuation_policy_sha256=policy.policy_sha256,
     )
 
 
@@ -120,6 +127,38 @@ def test_proxy_policy_is_deterministic_and_commission_only():
     assert len(first.policy_sha256) == 64
 
 
+def test_proxy_outcome_rejects_mixed_valuation_policy_hashes():
+    policy = delayed_proxy_commission_policy()
+    invalid_leg = replace(
+        leg(OptionSide.BUY, "5", "6"),
+        exit_valuation_policy_sha256="b" * 64,
+    )
+
+    with pytest.raises(ValueError, match="must match the valuation policy"):
+        evaluate_delayed_proxy_outcome(
+            candidate_id=uuid4(), event_id=None, measurement_type="60MIN",
+            market_time=datetime(2026, 8, 31, 20, 30, tzinfo=UTC),
+            observed_time=datetime(2026, 8, 31, 20, 45, tzinfo=UTC),
+            capital_at_risk=Decimal("500"), legs=(invalid_leg,), policy=policy,
+        )
+
+
+def test_proxy_outcome_rejects_disallowed_mark_source():
+    policy = delayed_proxy_commission_policy()
+    invalid_leg = replace(
+        leg(OptionSide.BUY, "5", "6"),
+        exit_mark_source=MarkSource.ADVANCED_NBBO_MIDPOINT,
+    )
+
+    with pytest.raises(ValueError, match="exit mark source"):
+        evaluate_delayed_proxy_outcome(
+            candidate_id=uuid4(), event_id=None, measurement_type="60MIN",
+            market_time=datetime(2026, 8, 31, 20, 30, tzinfo=UTC),
+            observed_time=datetime(2026, 8, 31, 20, 45, tzinfo=UTC),
+            capital_at_risk=Decimal("500"), legs=(invalid_leg,), policy=policy,
+        )
+
+
 def test_option_outcome_repository_persists_policy_aware_package_return():
     cursor = MagicMock()
     connection = MagicMock()
@@ -155,6 +194,14 @@ def test_option_outcome_repository_persists_policy_aware_package_return():
     assert "valuation_policy_sha256" in sql
     assert "source_snapshot_ids" in sql
     assert "candidate_id, measurement_type, valuation_policy_sha256" in sql
+    assert values[6] == outcome.exit_net_premium
+    assert values[7:12] == (
+        outcome.net_return,
+        outcome.availability_flag,
+        list(outcome.quality_flags),
+        outcome.entry_net_premium,
+        outcome.exit_net_premium,
+    )
     assert values[14:18] == (
         outcome.net_pnl,
         outcome.capital_at_risk,
@@ -210,8 +257,11 @@ def test_pending_option_candidates_are_bounded_to_selected_contract_packages():
         "ORDER BY COUNT(DISTINCT outcome.measurement_type), "
         "candidate.market_data_time DESC"
     ) in compact
+    assert "entry_leg.valuation_policy_sha256 IS DISTINCT FROM %s" in compact
+    assert "snapshot.valuation_policy_sha256 = %s" in compact
     assert parameters == (
-        "a" * 64, available_by, available_by, 60, available_by, 1000,
+        "a" * 64, available_by, available_by, 60,
+        "a" * 64, "a" * 64, available_by, 1000,
     )
 
 
@@ -260,7 +310,8 @@ def test_current_mark_legs_require_observation_after_detection():
     repository = OptionOutcomeRepository(factory)
 
     assert repository.current_mark_legs(
-        uuid4(), available_by=datetime(2026, 9, 4, 20, 0, tzinfo=UTC)
+        uuid4(), available_by=datetime(2026, 9, 4, 20, 0, tzinfo=UTC),
+        valuation_policy_sha256="a" * 64,
     ) == ()
 
     compact = " ".join(cursor.execute.call_args.args[0].split())
@@ -295,9 +346,11 @@ def test_current_mark_candidates_prioritize_unmarked_packages():
     assert "THEN candidate.market_data_time END DESC" in compact
     assert "current_mark.market_time NULLS FIRST" in compact
     assert "WHERE queue_rank <= %s" in compact
+    assert "entry_leg.valuation_policy_sha256 IS DISTINCT FROM %s" in compact
+    assert "snapshot.valuation_policy_sha256 = %s" in compact
     assert parameters == (
         "a" * 64, available_by, available_by, 60,
-        available_by, available_by, 1000,
+        "a" * 64, available_by, "a" * 64, available_by, 1000,
     )
 
 
@@ -317,6 +370,10 @@ def test_checkpoint_legs_require_one_complete_causal_snapshot_batch():
             "batch_id": batch_id,
             "mark_market_data_time": datetime(2026, 8, 31, 19, 30, tzinfo=UTC),
             "first_observed_at": datetime(2026, 8, 31, 20, 0, tzinfo=UTC),
+            "entry_mark_source": "DEVELOPER_ALIGNED_AGG_CLOSE",
+            "exit_mark_source": "DEVELOPER_ALIGNED_AGG_CLOSE",
+            "entry_valuation_policy_sha256": "a" * 64,
+            "exit_valuation_policy_sha256": "a" * 64,
         },
         {
             "contract_id": 42,
@@ -329,6 +386,10 @@ def test_checkpoint_legs_require_one_complete_causal_snapshot_batch():
             "batch_id": batch_id,
             "mark_market_data_time": datetime(2026, 8, 31, 19, 30, tzinfo=UTC),
             "first_observed_at": datetime(2026, 8, 31, 20, 0, tzinfo=UTC),
+            "entry_mark_source": "DEVELOPER_ALIGNED_AGG_CLOSE",
+            "exit_mark_source": "DEVELOPER_ALIGNED_AGG_CLOSE",
+            "entry_valuation_policy_sha256": "a" * 64,
+            "exit_valuation_policy_sha256": "a" * 64,
         },
     ]
     connection = MagicMock(closed=False)
@@ -343,7 +404,8 @@ def test_checkpoint_legs_require_one_complete_causal_snapshot_batch():
     available_by = datetime(2026, 8, 31, 20, 0, tzinfo=UTC)
 
     result = repository.checkpoint_legs(
-        uuid4(), checkpoint_time=checkpoint, available_by=available_by
+        uuid4(), checkpoint_time=checkpoint, available_by=available_by,
+        valuation_policy_sha256="a" * 64,
     )
 
     assert len(result) == 2
@@ -391,13 +453,22 @@ def test_option_outcome_service_matures_available_uncompleted_measurements():
                 "completed_measurements": ("15MIN",),
             },)
 
-        def checkpoint_legs(self, candidate_id, *, checkpoint_time, available_by):
+        def checkpoint_legs(
+            self, candidate_id, *, checkpoint_time, available_by,
+            valuation_policy_sha256,
+        ):
+            policy = delayed_proxy_commission_policy()
+            assert valuation_policy_sha256 == policy.policy_sha256
             return (OptionOutcomeLeg(
                 contract_id=42, side=OptionSide.BUY, ratio=1, multiplier=100,
                 entry_mark=Decimal("5"), exit_mark=Decimal("6"),
                 source_snapshot_id=uuid4(), source_batch_id=batch_id,
                 source_market_time=checkpoint_time,
                 source_observed_time=checkpoint_time + timedelta(minutes=15),
+                entry_mark_source=MarkSource.DEVELOPER_ALIGNED_AGG_CLOSE,
+                exit_mark_source=MarkSource.DEVELOPER_ALIGNED_AGG_CLOSE,
+                entry_valuation_policy_sha256=policy.policy_sha256,
+                exit_valuation_policy_sha256=policy.policy_sha256,
             ),)
 
         def persist_decay_outcomes(self, outcomes):
@@ -505,14 +576,23 @@ def test_option_outcome_service_persists_latest_coherent_current_mark():
                 "capital_at_risk": Decimal("500"),
             },)
 
-        def current_mark_legs(self, actual_candidate_id, *, available_by):
+        def current_mark_legs(
+            self, actual_candidate_id, *, available_by,
+            valuation_policy_sha256,
+        ):
             assert actual_candidate_id == candidate_id
+            policy = delayed_proxy_commission_policy()
+            assert valuation_policy_sha256 == policy.policy_sha256
             return (OptionOutcomeLeg(
                 contract_id=42, side=OptionSide.BUY, ratio=1, multiplier=100,
                 entry_mark=Decimal("5"), exit_mark=Decimal("6"),
                 source_snapshot_id=uuid4(), source_batch_id=batch_id,
                 source_market_time=available_by - timedelta(minutes=15),
                 source_observed_time=available_by,
+                entry_mark_source=MarkSource.DEVELOPER_ALIGNED_AGG_CLOSE,
+                exit_mark_source=MarkSource.DEVELOPER_ALIGNED_AGG_CLOSE,
+                entry_valuation_policy_sha256=policy.policy_sha256,
+                exit_valuation_policy_sha256=policy.policy_sha256,
             ),)
 
         def persist_current_marks(self, outcomes):

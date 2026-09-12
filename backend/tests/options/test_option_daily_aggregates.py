@@ -58,6 +58,7 @@ def test_request_targets_the_daily_aggregate_endpoint():
     url, params = transport.requests[0]
     assert "/v2/aggs/ticker/O:SPY240906C00540000/range/1/day/2024-07-08/2024-09-06" in url
     assert params["sort"] == "asc"
+    assert params["adjusted"] == "false"
 
 
 def test_missing_results_is_an_empty_series_not_an_error():

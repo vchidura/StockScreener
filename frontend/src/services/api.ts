@@ -1968,6 +1968,48 @@ export interface OptionsEnvelope<T> {
   data: T
 }
 
+export type OptionEventWindowState = 'BLOCKED' | 'CLEAR' | 'UNAVAILABLE' | 'NOT_APPLICABLE'
+
+export interface OptionCalendarEvent {
+  market_event_id: string
+  event_type: 'EARNINGS' | 'FED_RATE_DECISION'
+  affected_underlying: string | null
+  scheduled_time: string
+  source: string
+  source_key: string
+  announcement_time: string | null
+  source_observed_at: string
+  first_observed_at: string
+  confidence: string | number | null
+  status: string
+  payload_sha256: string
+}
+
+export interface OptionCalendarCoverage {
+  coverage_id: string
+  event_type: 'EARNINGS' | 'FED_RATE_DECISION'
+  affected_underlying: string | null
+  window_start: string
+  window_end: string
+  source: string
+  source_key: string
+  source_observed_at: string
+  first_observed_at: string
+  payload_sha256: string
+}
+
+export interface OptionTickerCalendarData {
+  underlyer: string
+  asset_type: 'STOCK' | 'ETF'
+  configured_source: string | null
+  decision_window_start: string
+  decision_window_end: string
+  earnings_state: OptionEventWindowState
+  fed_state: OptionEventWindowState
+  events: OptionCalendarEvent[]
+  coverage: OptionCalendarCoverage[]
+}
+
 export interface OptionHealthUnderlying {
   underlying: string
   status: string
@@ -1998,6 +2040,26 @@ export interface OptionHealthData {
     reason: string | null
     candidate_count: number
     strategy_policy_sha256?: string
+  }
+  board_publication: {
+    schema_ready: boolean
+    publishable: boolean
+    expected_underlyings: number
+    covered_underlyings: number
+    missing_underlyings: string[]
+    latest_candidate_cycle: string | null
+    selector_version: string
+    selector_sha256: string
+    latest_publication: {
+      publication_id: string
+      scheduled_cycle: string
+      published_at: string
+      covered_underlying_count: number
+      expected_underlying_count: number
+      selector_version: string
+      selector_sha256: string
+      selection_evidence: Record<string, unknown>
+    } | null
   }
 }
 
@@ -2054,6 +2116,8 @@ export interface OptionChainRow {
 }
 
 export interface OptionChainData {
+  serving_mode: 'CURRENT_POLICY' | 'HISTORICAL_PREVIOUS_POLICY'
+  active_policy_sha256: string
   underlyer: string
   batch: Record<string, unknown>
   analysis: { status: string; quality_reasons: string[]; iv_convergence_fraction: number | null; matrix_id: string } | null
@@ -2088,6 +2152,8 @@ export interface OptionExpirationAnalysis {
 }
 
 export interface OptionAnalysisData {
+  serving_mode: 'CURRENT_POLICY' | 'HISTORICAL_PREVIOUS_POLICY'
+  active_policy_sha256: string
   underlyer: string
   analysis: Record<string, unknown>
   expirations: OptionExpirationAnalysis[]
@@ -2180,6 +2246,9 @@ export interface OptionFlowContract {
 }
 
 export interface OptionFlowData {
+  serving_mode: 'CURRENT_POLICY' | 'HISTORICAL_PREVIOUS_POLICY'
+  active_policy_sha256: string
+  active_configuration_sha256: string
   underlyers: OptionFlowSummary[]
   selected: string
   session_date: string | null
@@ -2326,6 +2395,8 @@ export interface OptionCandidateRow {
 }
 
 export interface OptionCandidatesData {
+  serving_mode: 'CURRENT_POLICY' | 'HISTORICAL_PREVIOUS_POLICY'
+  active_policy_sha256: string
   title: 'Weekly Research Candidates'
   rows: OptionCandidateRow[]
   total: number
@@ -2356,6 +2427,8 @@ export interface OptionOpportunityUnderlyer {
 
 export interface OptionOpportunityRow extends OptionCandidateRow {
   strategy_position: number
+  raw_candidate_rank: number
+  board_selection_evidence: Record<string, unknown>
   signal_id: string | null
   signal_status: OptionSignalStatus | null
   signal_blocked_reasons: string[] | null
@@ -2363,13 +2436,86 @@ export interface OptionOpportunityRow extends OptionCandidateRow {
 }
 
 export interface OptionOpportunitiesData {
+  serving_mode: 'CURRENT_POLICY' | 'HISTORICAL_PREVIOUS_POLICY'
+  active_configuration_sha256: string
   underlyers: OptionOpportunityUnderlyer[]
   structured: OptionOpportunityRow[]
   research_highlights: OptionOpportunityRow[]
   configured_underlyer_count: number
   covered_underlyer_count: number
-  selection_basis: 'BACKEND_STRATEGY_RANK'
+  selection_basis: 'IMMUTABLE_BOARD_PUBLICATION'
+  publication_id?: string
+  scheduled_cycle?: string
+  published_at?: string
+  selector_version?: string
+  selector_sha256?: string
+  selection_evidence?: {
+    input_selected_candidates?: number
+    prior_contract_excluded_candidates?: number
+    surviving_candidates?: number
+    persisted_members?: number
+    by_strategy?: Record<string, Record<string, number>>
+  }
   execution_mode: 'READ_ONLY_RESEARCH'
+}
+
+export type OptionScreenerScope = 'ALL' | 'STRUCTURED' | 'RESEARCH' | 'BOARD'
+export type OptionScreenerSort = 'PREMIUM_ACTIVITY' | 'VOLUME' | 'OPEN_INTEREST' | 'VOLUME_OI' | 'OI_CHANGE' | 'IV'
+
+export interface OptionScreenerRow {
+  snapshot_id: string
+  contract_id: number
+  contract_ticker: string
+  underlying: string
+  contract_type: 'CALL' | 'PUT'
+  expiration_date: string
+  calendar_dte: number
+  strike: string
+  spot: string
+  model_mark: string | null
+  display_mark: string | null
+  mark: string | null
+  day_volume: number | null
+  open_interest: number | null
+  local_iv: number | null
+  local_delta: number | null
+  local_gamma: number | null
+  market_data_time: string
+  first_observed_at: string
+  strategy_names: string[]
+  candidate_count: number
+  structured_candidate_count: number
+  research_candidate_count: number
+  best_candidate_rank: number
+  board_position: number | null
+  board_publication_id: string | null
+  premium_activity: string | null
+  volume_open_interest_ratio: number | null
+  otm_fraction: string
+  previous_mark: string | null
+  mark_change_fraction: string | null
+  previous_iv: number | null
+  iv_change: number | null
+  oi_settlement_session: string | null
+  prior_oi_settlement_session: string | null
+  open_interest_change: number | null
+  open_interest_change_fraction: number | null
+}
+
+export interface OptionScreenerData {
+  serving_mode: 'CURRENT_POLICY' | 'HISTORICAL_PREVIOUS_POLICY'
+  active_policy_sha256: string
+  rows: OptionScreenerRow[]
+  underlyers: string[]
+  total: number
+  limit: number
+  offset: number
+  scope: OptionScreenerScope
+  session_date: string | null
+  sort: OptionScreenerSort
+  directional_flow_available: false
+  quote_liquidity: 'NOT_AVAILABLE'
+  definitions: Record<string, string>
 }
 
 export interface OptionScenarioResult {
@@ -2420,6 +2566,32 @@ export interface OptionCandidateDetailData {
   legs: OptionCandidateLeg[]
   scenarios: OptionScenarioResult[]
   execution_gates: OptionExecutionGate[]
+  market_event_evidence: Array<{
+    market_event_id: string
+    event_type: 'EARNINGS' | 'FED_RATE_DECISION'
+    affected_underlying: string | null
+    scheduled_time: string
+    source: string
+    source_key: string
+    announcement_time: string | null
+    source_observed_at: string | null
+    first_observed_at: string
+    confidence: 'CONFIRMED' | 'ESTIMATED' | 'UNKNOWN'
+    status: 'SCHEDULED' | 'COMPLETED' | 'CANCELED' | 'REVISED'
+    payload_sha256: string
+  }>
+  event_coverage_evidence: Array<{
+    coverage_id: string
+    event_type: 'EARNINGS' | 'FED_RATE_DECISION'
+    affected_underlying: string | null
+    window_start: string
+    window_end: string
+    source: string
+    source_key: string
+    source_observed_at: string | null
+    first_observed_at: string
+    payload_sha256: string
+  }>
   quote_liquidity: 'NOT_AVAILABLE'
   execution_mode: 'READ_ONLY_RESEARCH'
 }
@@ -2607,16 +2779,16 @@ export interface OptionPerformanceData {
   limit: number
   offset: number
   days: number
-  cohort: 'RANK_LEADERS' | 'ALL_SIGNALS'
-  requested_cohort: 'RANK_LEADERS' | 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS'
+  cohort: 'BOARD_PUBLICATIONS' | 'RANK_LEADERS' | 'ALL_SIGNALS'
+  requested_cohort: 'BOARD_PUBLICATIONS' | 'RANK_LEADERS' | 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS'
   measured_signals: number
   signals_with_management_plan: number
   measurement_count: number
   measurement_summary: OptionPerformanceSummary[]
   valuation_mode: 'RESEARCH_DELAYED_PROXY'
   materialization_owner: 'OPTION_WORKER'
-  entry_basis: 'FIRST_RAW_RANK_LEADER_OCCURRENCE' | 'ORIGINAL_SIGNAL_PACKAGE'
-  board_membership_exact: false
+  entry_basis: 'FIRST_PUBLISHED_BOARD_MEMBERSHIP' | 'FIRST_RAW_RANK_LEADER_OCCURRENCE' | 'ORIGINAL_SIGNAL_PACKAGE'
+  board_membership_exact: boolean
   cohort_definition: string
   navigation_revalues: false
   current_mark_included: boolean
@@ -2629,6 +2801,16 @@ export const getOptionHealth = async (): Promise<OptionsEnvelope<OptionHealthDat
 
 export const getOptionUniverse = async (): Promise<OptionsEnvelope<OptionUniverseRow[]>> => {
   const response = await api.get('/options/universe')
+  return response.data
+}
+
+export const getOptionEventCalendar = async (
+  underlyer: string,
+  daysForward = 30,
+): Promise<OptionsEnvelope<OptionTickerCalendarData>> => {
+  const response = await api.get(`/options/calendar/${underlyer}`, {
+    params: { days_forward: daysForward },
+  })
   return response.data
 }
 
@@ -2737,6 +2919,25 @@ export const getOptionOpportunities = async (params?: {
   return response.data
 }
 
+export const getOptionScreener = async (params?: {
+  session_date?: string
+  scope?: OptionScreenerScope
+  underlyer?: string
+  contract_type?: 'CALL' | 'PUT'
+  strategy?: string
+  minimum_dte?: number
+  maximum_dte?: number
+  minimum_volume?: number
+  minimum_open_interest?: number
+  minimum_volume_oi_ratio?: number
+  sort?: OptionScreenerSort
+  limit?: number
+  offset?: number
+}): Promise<OptionsEnvelope<OptionScreenerData>> => {
+  const response = await api.get('/options/screener', { params })
+  return response.data
+}
+
 export const getOptionCandidate = async (
   candidateId: string,
 ): Promise<OptionsEnvelope<OptionCandidateDetailData>> => {
@@ -2758,7 +2959,7 @@ export const getOptionPerformance = async (params?: {
   underlyer?: string
   strategy?: string
   expiration?: string
-  cohort?: 'RANK_LEADERS' | 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS'
+  cohort?: 'BOARD_PUBLICATIONS' | 'RANK_LEADERS' | 'OPPORTUNITY_BOARD' | 'ALL_SIGNALS'
   days?: number
   limit?: number
   offset?: number

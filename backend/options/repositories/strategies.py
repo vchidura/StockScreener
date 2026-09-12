@@ -49,6 +49,7 @@ class OptionStrategyRepository(PostgresRepository):
         with self._cursor() as cursor:
             self._persist_registry(cursor, context, result)
             self._persist_context(cursor, context)
+            self._persist_event_lineage(cursor, context)
             for candidate in result.candidates:
                 evidence_id = evidence_ids[candidate.candidate_id]
                 self._persist_evidence(cursor, context, candidate, evidence_id)
@@ -174,7 +175,7 @@ class OptionStrategyRepository(PostgresRepository):
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL,
                 %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            ) ON CONFLICT (matrix_id) DO NOTHING
+            ) ON CONFLICT (matrix_id, policy_sha256) DO NOTHING
             """,
             (
                 context.context_snapshot_id,
@@ -200,6 +201,37 @@ class OptionStrategyRepository(PostgresRepository):
                 context.equity_context_snapshot_id,
             ),
         )
+
+    @staticmethod
+    def _persist_event_lineage(cursor, context: StrategyContextSnapshot) -> None:
+        if context.market_event_ids:
+            execute_values(
+                cursor,
+                """
+                INSERT INTO option_context_market_event_evidence (
+                    context_snapshot_id, market_event_id
+                ) VALUES %s
+                ON CONFLICT (context_snapshot_id, market_event_id) DO NOTHING
+                """,
+                [
+                    (context.context_snapshot_id, market_event_id)
+                    for market_event_id in context.market_event_ids
+                ],
+            )
+        if context.event_coverage_ids:
+            execute_values(
+                cursor,
+                """
+                INSERT INTO option_context_event_coverage_evidence (
+                    context_snapshot_id, coverage_id
+                ) VALUES %s
+                ON CONFLICT (context_snapshot_id, coverage_id) DO NOTHING
+                """,
+                [
+                    (context.context_snapshot_id, coverage_id)
+                    for coverage_id in context.event_coverage_ids
+                ],
+            )
 
     @staticmethod
     def _persist_evidence(cursor, context, candidate, evidence_id) -> None:
@@ -271,6 +303,12 @@ class OptionStrategyRepository(PostgresRepository):
                     "equity_reason_codes": context.equity_reason_codes,
                     "earnings_blackout_state": context.earnings_blackout_state,
                     "fed_blackout_state": context.fed_blackout_state,
+                    "market_event_ids": [
+                        str(value) for value in context.market_event_ids
+                    ],
+                    "event_coverage_ids": [
+                        str(value) for value in context.event_coverage_ids
+                    ],
                     "reason_codes": context.reason_codes,
                 }),
                 Json(dict(candidate.rank_components)),
@@ -358,7 +396,8 @@ class OptionStrategyRepository(PostgresRepository):
                 spot, time_to_expiration_years, risk_free_rate, dividend_yield,
                 model_mark, local_iv, local_delta, local_gamma, local_theta_per_day,
                 local_vega_per_vol_point, local_rho_per_rate_point,
-                source_market_time, mark_source, model_version, quality_flags
+                source_market_time, mark_source, model_version, quality_flags,
+                valuation_policy_version, valuation_policy_sha256
             ) VALUES %s
             ON CONFLICT (candidate_id, leg_index) DO NOTHING
             """,
@@ -373,6 +412,7 @@ class OptionStrategyRepository(PostgresRepository):
                     leg.local_theta_per_day, leg.local_vega_per_vol_point,
                     leg.local_rho_per_rate_point, leg.source_market_time,
                     leg.mark_source, leg.model_version, list(leg.quality_flags),
+                    leg.valuation_policy_version, leg.valuation_policy_sha256,
                 )
                 for leg in candidate.legs
             ],

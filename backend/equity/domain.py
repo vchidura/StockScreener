@@ -196,6 +196,46 @@ class EquityCorporateAction:
 
 
 @dataclass(frozen=True, slots=True)
+class EquityCorporateActionCoverage:
+    coverage_id: UUID
+    action_type: str
+    ticker: str
+    window_start: date
+    window_end: date
+    source: str
+    source_key: str
+    first_observed_at: datetime
+    availability_mode: BarAvailabilityMode
+    replay_available_at: datetime | None
+    payload_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.action_type not in ("SPLIT", "DIVIDEND"):
+            raise ValueError("invalid corporate-action coverage type")
+        if self.window_end < self.window_start:
+            raise ValueError("corporate-action coverage window is invalid")
+        _non_empty(self.ticker, "ticker")
+        _non_empty(self.source, "source")
+        _non_empty(self.source_key, "source_key")
+        _sha256(self.payload_sha256, "payload_sha256")
+        replay = (
+            _as_utc(self.replay_available_at, "replay_available_at")
+            if self.replay_available_at else None
+        )
+        if self.availability_mode is BarAvailabilityMode.HISTORICAL_RECONSTRUCTED:
+            if replay is None:
+                raise ValueError("reconstructed coverage requires replay availability")
+        elif replay is not None:
+            raise ValueError("live coverage cannot set replay availability")
+        object.__setattr__(self, "ticker", self.ticker.upper())
+        object.__setattr__(
+            self, "first_observed_at",
+            _as_utc(self.first_observed_at, "first_observed_at"),
+        )
+        object.__setattr__(self, "replay_available_at", replay)
+
+
+@dataclass(frozen=True, slots=True)
 class FundamentalReport:
     fundamental_report_id: UUID
     security_id: UUID

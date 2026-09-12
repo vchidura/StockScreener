@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from options.config import ValuationPolicy
 from options.domain import ContractType, DataQualityFlag, MarkSource
 
 
@@ -33,6 +34,8 @@ class DeveloperMarkResult:
     source_skew_seconds: float | None
     source_age_seconds: float | None
     quality_flags: tuple[DataQualityFlag, ...]
+    valuation_policy_version: str
+    valuation_policy_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,14 +49,15 @@ class ContractEconomics:
 
 def select_developer_marks(
     *,
+    policy: ValuationPolicy,
     day_close: Decimal | None,
     day_vwap: Decimal | None,
     option_mark_time: datetime | None,
     underlying_bars: tuple[UnderlyingMinuteBar, ...],
     observed_at: datetime,
-    maximum_source_skew_seconds: int = 60,
-    maximum_source_age_seconds: int = 1800,
 ) -> DeveloperMarkResult:
+    if policy.primary_model_mark_source is not MarkSource.DEVELOPER_ALIGNED_AGG_CLOSE:
+        raise ValueError("Developer marks require DEVELOPER_ALIGNED_AGG_CLOSE policy")
     observed_at = _as_utc(observed_at, "observed_at")
     flags: list[DataQualityFlag] = []
     display_mark = day_close if _positive(day_close) else None
@@ -74,10 +78,12 @@ def select_developer_marks(
             None,
             None,
             tuple(flags),
+            policy.policy_version,
+            policy.policy_sha256,
         )
     option_mark_time = _as_utc(option_mark_time, "option_mark_time")
     source_age_seconds = (observed_at - option_mark_time).total_seconds()
-    if source_age_seconds < 0 or source_age_seconds > maximum_source_age_seconds:
+    if source_age_seconds < 0 or source_age_seconds > policy.maximum_source_age_seconds:
         flags.append(DataQualityFlag.STALE_MARK)
     if not _positive(day_close):
         flags.append(DataQualityFlag.NON_POSITIVE_MARK)
@@ -91,7 +97,7 @@ def select_developer_marks(
         source_skew_seconds = (
             option_mark_time - aligned_bar.market_data_time
         ).total_seconds()
-        if source_skew_seconds > maximum_source_skew_seconds:
+        if source_skew_seconds > policy.maximum_option_spot_skew_seconds:
             flags.append(DataQualityFlag.OPTION_SPOT_SKEW)
     model_mark = day_close if _positive(day_close) else None
     if any(
@@ -119,6 +125,8 @@ def select_developer_marks(
         source_skew_seconds=source_skew_seconds,
         source_age_seconds=source_age_seconds,
         quality_flags=tuple(dict.fromkeys(flags)),
+        valuation_policy_version=policy.policy_version,
+        valuation_policy_sha256=policy.policy_sha256,
     )
 
 

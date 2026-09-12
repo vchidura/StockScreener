@@ -53,6 +53,17 @@ class MatchedHorizonIv:
 
 
 @dataclass(frozen=True, slots=True)
+class MatchedMaturityIv:
+    target_maturity_years: float
+    implied_volatility: float
+    lower_expiration: date
+    upper_expiration: date
+    lower_maturity_years: float
+    upper_maturity_years: float
+    source_contract_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class VarianceRiskPremiumObservation:
     implied_volatility: float
     forecast_realized_volatility: float
@@ -139,6 +150,29 @@ def interpolate_total_variance(
     if horizon_sessions < 1 or trading_days_per_year < 1:
         raise ValueError("horizon and trading_days_per_year must be positive")
     target = horizon_sessions / trading_days_per_year
+    matched = interpolate_total_variance_at_maturity(points, target)
+    if matched is None:
+        return None
+    return MatchedHorizonIv(
+        horizon_sessions=horizon_sessions,
+        target_maturity_years=matched.target_maturity_years,
+        implied_volatility=matched.implied_volatility,
+        lower_expiration=matched.lower_expiration,
+        upper_expiration=matched.upper_expiration,
+        lower_maturity_years=matched.lower_maturity_years,
+        upper_maturity_years=matched.upper_maturity_years,
+        source_contract_count=matched.source_contract_count,
+    )
+
+
+def interpolate_total_variance_at_maturity(
+    points: tuple[ExpirationIvPoint, ...],
+    target_maturity_years: float,
+) -> MatchedMaturityIv | None:
+    """Interpolate total variance at an explicit year-fraction maturity."""
+    if target_maturity_years <= 0 or not math.isfinite(target_maturity_years):
+        raise ValueError("target maturity must be positive and finite")
+    target = target_maturity_years
     ordered = sorted(points, key=lambda point: point.maturity_years)
     if not ordered or target < ordered[0].maturity_years or target > ordered[-1].maturity_years:
         return None
@@ -165,8 +199,7 @@ def interpolate_total_variance(
             return None
         implied = math.sqrt(target_variance / target)
 
-    return MatchedHorizonIv(
-        horizon_sessions=horizon_sessions,
+    return MatchedMaturityIv(
         target_maturity_years=target,
         implied_volatility=implied,
         lower_expiration=lower.expiration_date,

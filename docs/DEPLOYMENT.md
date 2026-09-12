@@ -14,7 +14,9 @@ the final schema.
 | `frontend` | default | Nginx frontend and same-origin `/api` proxy |
 | `equity-universe-bootstrap` | `equity` | Idempotent Polygon stock/ETF universe discovery |
 | `equity-worker` | `equity` | REST ingestion, derivation, analysis, and publication |
+| `corporate-action-worker` | `equity` | Bounded live split and dividend refresh for active securities |
 | `equity-portal-worker` | `equity` | Generation-aware portal snapshots |
+| `market-event-worker` | `calendar`, `options` | Resident shared Finnhub earnings and official FOMC calendar observations |
 | `option-worker` | `options` | Delayed option ingestion, factor analysis, strategies, and recommendation publication |
 | `equity-migrate` | `maintenance` | One-shot migrations with the bootstrap administrator |
 | `equity-stream-worker` | `equity-stream` | Reserved Advanced stream; keep disabled |
@@ -22,6 +24,26 @@ the final schema.
 Options remain a read-only research surface. Do not enable equity option
 context, raw option archival, broker execution, or the Advanced stock stream
 until their separate acceptance gates pass.
+The options profile includes the calendar worker because option-context coverage
+expires after 12 hours. The standalone `calendar` profile remains available for
+calendar-only operation.
+
+The public-calendar probe mirrors the production request budget without writes:
+
+```powershell
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\probe_finnhub_earnings_contract.py
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\probe_market_event_materialization.py
+```
+
+The first probe requires exact agreement between bounded and global Finnhub responses.
+The second writes through the real repository inside a transaction and verifies rollback.
+Date revisions and removals remain observable through append-only event revisions;
+continue monitoring them as evidence rather than allowing coverage to go stale.
+Calendar coverage expires after 12 hours by default
+(`OPTION_EVENT_CALENDAR_MAX_AGE_SECONDS=43200`). A stopped or failed manual worker therefore
+returns `UNAVAILABLE`; an old successful observation cannot keep producing `CLEAR`.
 
 ## Required Environment
 
@@ -153,9 +175,12 @@ Do not add `--profile equity-stream`.
 
 The baseline and role scripts run only when `postgres_data` is first initialized.
 The equity profile runs Polygon universe discovery only while `selected_tickers`
-is empty. For long-range historical ingestion before continuous workers start,
-follow [Fresh Database Setup](FRESH_DATABASE_SETUP.md). Treat volume deletion as
-destructive and take a verified backup first.
+is empty. It also runs `corporate-action-worker`, which refreshes a 30-day
+lookback and 365-day forward window every six hours under advisory leadership.
+These facts are append-only input evidence; their presence does not enable
+dividend-aware option valuation by itself. For long-range historical ingestion
+before continuous workers start, follow [Fresh Database Setup](FRESH_DATABASE_SETUP.md).
+Treat volume deletion as destructive and take a verified backup first.
 
 Validate inside the deployed API container:
 
@@ -201,6 +226,9 @@ these processes in separate terminals:
 # Portal snapshot worker
 .\backend\.venv\Scripts\python.exe `
   .\backend\scripts\refresh_equity_portal_snapshots.py --continuous
+
+# Shared market-event worker remains manual until the live provider contract passes.
+.\backend\.venv\Scripts\python.exe .\backend\scripts\run_market_event_worker.py --once
 
 # Delayed option analysis and recommendation worker
 .\backend\.venv\Scripts\python.exe .\backend\scripts\run_option_worker.py

@@ -1,12 +1,23 @@
 {
-  "generated_at": "2026-09-07T03:58:33.100855+00:00",
-  "months": 12,
+  "generated_at": "2026-09-11T19:56:23.693384+00:00",
+  "months": 24,
   "strikes_per_expiration": 11,
   "moneyness_band": 0.1,
-  "reference_requests": 12,
+  "reference_requests": 288,
   "already_catalogued": 0,
-  "admitted": 121,
+  "admitted": 2894,
   "admitted_by_underlying": {
-    "SPY": 121
+    "AAPL": 242,
+    "AMD": 242,
+    "AMZN": 242,
+    "GOOGL": 242,
+    "IWM": 242,
+    "META": 242,
+    "MSFT": 242,
+    "NVDA": 242,
+    "PLTR": 242,
+    "QQQ": 242,
+    "SOFI": 232,
+    "TSLA": 242
   }
 }

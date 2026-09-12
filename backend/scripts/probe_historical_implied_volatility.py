@@ -121,7 +121,7 @@ def _contracts(probe: Probe, underlyer: str, expiration: date, spot: float, band
 def _bars(probe: Probe, contract: str, start: date, end: date) -> dict[date, float]:
     status, payload = probe.get(
         f"/v2/aggs/ticker/{contract}/range/1/day/{start.isoformat()}/{end.isoformat()}",
-        {"adjusted": "true", "sort": "asc", "limit": "5000"},
+        {"adjusted": "false", "sort": "asc", "limit": "5000"},
     )
     results = payload.get("results") if isinstance(payload, dict) else None
     if status != 200 or not isinstance(results, list):

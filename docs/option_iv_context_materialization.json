@@ -1,0 +1,1158 @@
+{
+  "active_configuration_sha256": "7fbbaa3ca2cf13446743b1da38b7b87e5ca86cb9e6e4c8861d1fcd1abf8e90e2",
+  "active_policy_sha256": "4d9a5228503a51ea2fa1939316b00a7810b0d6c9192e1e503554f9c83c291123",
+  "contexts": 39,
+  "generated_at": "2026-09-11 22:05:39.994122+00:00",
+  "historical_diagnostics": [
+    {
+      "expiration_point_count": 261,
+      "mark_rows": 4462,
+      "matched_sessions": {
+        "21D": 42,
+        "45D": 21,
+        "7D": 31
+      },
+      "sessions_with_expiration_points": 184,
+      "sessions_with_solved_contracts": 249,
+      "skipped_expired_rows": 211,
+      "skipped_missing_rate_rows": 0,
+      "skipped_missing_spot_rows": 0,
+      "solver_converged_rows": 4141,
+      "solver_failure_rows": {
+        "BELOW_NO_ARBITRAGE_BOUND": 110
+      },
+      "underlying": "AAPL",
+      "valuation_input_rows": 4251
+    },
+    {
+      "expiration_point_count": 138,
+      "mark_rows": 4172,
+      "matched_sessions": {
+        "21D": 16,
+        "45D": 0,
+        "7D": 14
+      },
+      "sessions_with_expiration_points": 105,
+      "sessions_with_solved_contracts": 249,
+      "skipped_expired_rows": 259,
+      "skipped_missing_rate_rows": 0,
+      "skipped_missing_spot_rows": 0,
+      "solver_converged_rows": 3825,
+      "solver_failure_rows": {
+        "BELOW_NO_ARBITRAGE_BOUND": 88
+      },
+      "underlying": "AMD",
+      "valuation_input_rows": 3913
+    },
+    {
+      "expiration_point_count": 251,
+      "mark_rows": 4402,
+      "matched_sessions": {
+        "21D": 38,
+        "45D": 25,
+        "7D": 31
+      },
+      "sessions_with_expiration_points": 178,
+      "sessions_with_solved_contracts": 249,
+      "skipped_expired_rows": 197,
+      "skipped_missing_rate_rows": 0,
+      "skipped_missing_spot_rows": 0,
+      "solver_converged_rows": 4112,
+      "solver_failure_rows": {
+        "BELOW_NO_ARBITRAGE_BOUND": 93
+      },
+      "underlying": "AMZN",
+      "valuation_input_rows": 4205
+    },
+    {
+      "expiration_point_count": 232,
+      "mark_rows": 4321,
+      "matched_sessions": {
+        "21D": 38,
+        "45D": 14,
+        "7D": 27
+      },
+      "sessions_with_expiration_points": 162,
+      "sessions_with_solved_contracts": 249,
+      "skipped_expired_rows": 198,
+      "skipped_missing_rate_rows": 0,
+      "skipped_missing_spot_rows": 0,
+      "solver_converged_rows": 4036,
+      "solver_failure_rows": {
+        "BELOW_NO_ARBITRAGE_BOUND": 87
+      },
+      "underlying": "GOOGL",
+      "valuation_input_rows": 4123
+    },
+    {
+      "expiration_point_count": 318,
+      "mark_rows": 8483,
+      "matched_sessions": {
+        "21D": 55,
+        "45D": 24,
+        "7D": 36
+      },
+      "sessions_with_expiration_points": 202,
+      "sessions_with_solved_contracts": 250,
+      "skipped_expired_rows": 514,
+      "skipped_missing_rate_rows": 0,
+      "skipped_missing_spot_rows": 0,
+      "solver_converged_rows": 7729,
+      "solver_failure_rows": {
+        "BELOW_NO_ARBITRAGE_BOUND": 240
+      },
+      "underlying": "IWM",
+      "valuation_input_rows": 7969
+    },
+    {
+      "expiration_point_count": 181,
+      "mark_rows": 4787,
+      "matched_sessions": {
+        "21D": 9,
+        "45D": 6,
+        "7D": 20
+      },
+      "sessions_with_expiration_points": 162,
+      "sessions_with_solved_contracts": 249,
+      "skipped_expired_rows": 291,
+      "skipped_missing_rate_rows": 0,
+      "skipped_missing_spot_rows": 0,
+      "solver_converged_rows": 4360,
+      "solver_failure_rows": {
+        "BELOW_NO_ARBITRAGE_BOUND": 136
+      },
+      "underlying": "META",
+      "valuation_input_rows": 4496
+    },
+    {
+      "expiration_point_count": 201,
+      "mark_rows": 4759,
+      "matched_sessions": {
+        "21D": 27,
+        "45D": 4,
+        "7D": 30
+      },
+      "sessions_with_expiration_points": 149,
+      "sessions_with_solved_contracts": 249,
+      "skipped_expired_rows": 261,
+      "skipped_missing_rate_rows": 0,
+      "skipped_missing_spot_rows": 0,
+      "solver_converged_rows": 4352,
+      "solver_failure_rows": {
+        "BELOW_NO_ARBITRAGE_BOUND": 146
+      },
+      "underlying": "MSFT",
+      "valuation_input_rows": 4498
+    },
+    {
+      "expiration_point_count": 278,
+      "mark_rows": 4448,
+      "matched_sessions": {
+        "21D": 63,
+        "45D": 36,
+        "7D": 38
+      },
+      "sessions_with_expiration_points": 177,
+      "sessions_with_solved_contracts": 249,
+      "skipped_expired_rows": 185,
+      "skipped_missing_rate_rows": 0,
+      "skipped_missing_spot_rows": 0,
+      "solver_converged_rows": 4202,
+      "solver_failure_rows": {
+        "BELOW_NO_ARBITRAGE_BOUND": 61
+      },
+      "underlying": "NVDA",
+      "valuation_input_rows": 4263
+    },
+    {
+      "expiration_point_count": 163,
+      "mark_rows": 3197,
+      "matched_sessions": {
+        "21D": 11,
+        "45D": 3,
+        "7D": 14
+      },
+      "sessions_with_expiration_points": 150,
+      "sessions_with_solved_contracts": 247,
+      "skipped_expired_rows": 137,
+      "skipped_missing_rate_rows": 0,
+      "skipped_missing_spot_rows": 0,
+      "solver_converged_rows": 3018,
+      "solver_failure_rows": {
+        "BELOW_NO_ARBITRAGE_BOUND": 42
+      },
+      "underlying": "PLTR",
+      "valuation_input_rows": 3060
+    },
+    {
+      "expiration_point_count": 322,
+      "mark_rows": 13529,
+      "matched_sessions": {
+        "21D": 69,
+        "45D": 37,
+        "7D": 40
+      },
+      "sessions_with_expiration_points": 189,
+      "sessions_with_solved_contracts": 250,
+      "skipped_expired_rows": 1044,
+      "skipped_missing_rate_rows": 0,
+      "skipped_missing_spot_rows": 0,
+      "solver_converged_rows": 12106,
+      "solver_failure_rows": {
+        "BELOW_NO_ARBITRAGE_BOUND": 379
+      },
+      "underlying": "QQQ",
+      "valuation_input_rows": 12485
+    },
+    {
+      "expiration_point_count": 219,
+      "mark_rows": 3327,
+      "matched_sessions": {
+        "21D": 45,
+        "45D": 21,
+        "7D": 26
+      },
+      "sessions_with_expiration_points": 168,
+      "sessions_with_solved_contracts": 247,
+      "skipped_expired_rows": 117,
+      "skipped_missing_rate_rows": 0,
+      "skipped_missing_spot_rows": 0,
+      "solver_converged_rows": 3152,
+      "solver_failure_rows": {
+        "BELOW_NO_ARBITRAGE_BOUND": 58
+      },
+      "underlying": "SOFI",
+      "valuation_input_rows": 3210
+    },
+    {
+      "expiration_point_count": 360,
+      "mark_rows": 14816,
+      "matched_sessions": {
+        "21D": 83,
+        "45D": 41,
+        "7D": 43
+      },
+      "sessions_with_expiration_points": 214,
+      "sessions_with_solved_contracts": 250,
+      "skipped_expired_rows": 1046,
+      "skipped_missing_rate_rows": 0,
+      "skipped_missing_spot_rows": 0,
+      "solver_converged_rows": 13143,
+      "solver_failure_rows": {
+        "BELOW_NO_ARBITRAGE_BOUND": 627
+      },
+      "underlying": "SPY",
+      "valuation_input_rows": 13770
+    },
+    {
+      "expiration_point_count": 158,
+      "mark_rows": 4688,
+      "matched_sessions": {
+        "21D": 7,
+        "45D": 6,
+        "7D": 15
+      },
+      "sessions_with_expiration_points": 132,
+      "sessions_with_solved_contracts": 249,
+      "skipped_expired_rows": 223,
+      "skipped_missing_rate_rows": 0,
+      "skipped_missing_spot_rows": 0,
+      "solver_converged_rows": 4417,
+      "solver_failure_rows": {
+        "BELOW_NO_ARBITRAGE_BOUND": 48
+      },
+      "underlying": "TSLA",
+      "valuation_input_rows": 4465
+    }
+  ],
+  "inserted": 0,
+  "matrices": 13,
+  "maximum_absolute_log_moneyness": 0.03,
+  "ready": 0,
+  "reasons": {
+    "CURRENT_COMPARABLE_IV_UNAVAILABLE": 13,
+    "INSUFFICIENT_IV_COVERAGE": 39,
+    "INSUFFICIENT_IV_SAMPLE_SESSIONS": 39
+  },
+  "source_configuration_sha256s": [
+    "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+    "aec7d06f3ea82e2077535552906ef055de2c598da76922c58f1a6366b54863f8"
+  ],
+  "source_policy_sha256s": [
+    "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd"
+  ],
+  "status": "VALIDATION_PREVIOUS_COHORT",
+  "underlyings": [
+    {
+      "coverage_fraction": 0.12301587301587301,
+      "current_comparable_iv": 0.24521544023547598,
+      "dividend_action_count": 9,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "7D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.3018604341066133,
+      "minimum_iv": 0.19411240230934762,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 434,
+      "sample_count": 31,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "AAPL"
+    },
+    {
+      "coverage_fraction": 0.16666666666666666,
+      "current_comparable_iv": 0.24185933313422156,
+      "dividend_action_count": 9,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "21D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.3110992527337781,
+      "minimum_iv": 0.21578239355346945,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 574,
+      "sample_count": 42,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "AAPL"
+    },
+    {
+      "coverage_fraction": 0.08333333333333333,
+      "current_comparable_iv": null,
+      "dividend_action_count": 9,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "45D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.28231724597411306,
+      "minimum_iv": 0.22964556980217313,
+      "null_reason_codes": [
+        "CURRENT_COMPARABLE_IV_UNAVAILABLE",
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 294,
+      "sample_count": 21,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "AAPL"
+    },
+    {
+      "coverage_fraction": 0.05555555555555555,
+      "current_comparable_iv": 0.4762592566496375,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "7D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.6748397360257193,
+      "minimum_iv": 0.4157475679442535,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 196,
+      "sample_count": 14,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "AMD"
+    },
+    {
+      "coverage_fraction": 0.06349206349206349,
+      "current_comparable_iv": 0.48276863546657217,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "21D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.8746781588257082,
+      "minimum_iv": 0.5425926525209122,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 224,
+      "sample_count": 16,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "AMD"
+    },
+    {
+      "coverage_fraction": 0.0,
+      "current_comparable_iv": null,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "45D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": null,
+      "minimum_iv": null,
+      "null_reason_codes": [
+        "CURRENT_COMPARABLE_IV_UNAVAILABLE",
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 0,
+      "sample_count": 0,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "AMD"
+    },
+    {
+      "coverage_fraction": 0.12301587301587301,
+      "current_comparable_iv": 0.27412309006699753,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "7D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.4399446474216415,
+      "minimum_iv": 0.24422061628425376,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 420,
+      "sample_count": 31,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "AMZN"
+    },
+    {
+      "coverage_fraction": 0.15079365079365079,
+      "current_comparable_iv": 0.28552444591377485,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "21D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.45354047775940987,
+      "minimum_iv": 0.23293189837266864,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 518,
+      "sample_count": 38,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "AMZN"
+    },
+    {
+      "coverage_fraction": 0.0992063492063492,
+      "current_comparable_iv": null,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "45D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.41395944451513755,
+      "minimum_iv": 0.29265724685482025,
+      "null_reason_codes": [
+        "CURRENT_COMPARABLE_IV_UNAVAILABLE",
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 350,
+      "sample_count": 25,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "AMZN"
+    },
+    {
+      "coverage_fraction": 0.10714285714285714,
+      "current_comparable_iv": 0.26763447222191844,
+      "dividend_action_count": 9,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "7D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.40701089175606087,
+      "minimum_iv": 0.24363577468669353,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 378,
+      "sample_count": 27,
+      "source_configuration_sha256": "aec7d06f3ea82e2077535552906ef055de2c598da76922c58f1a6366b54863f8",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "GOOGL"
+    },
+    {
+      "coverage_fraction": 0.15079365079365079,
+      "current_comparable_iv": 0.27592810245739335,
+      "dividend_action_count": 9,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "21D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.40004474948272356,
+      "minimum_iv": 0.273730736119259,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 532,
+      "sample_count": 38,
+      "source_configuration_sha256": "aec7d06f3ea82e2077535552906ef055de2c598da76922c58f1a6366b54863f8",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "GOOGL"
+    },
+    {
+      "coverage_fraction": 0.05555555555555555,
+      "current_comparable_iv": null,
+      "dividend_action_count": 9,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "45D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.3746565852753322,
+      "minimum_iv": 0.3168708397982969,
+      "null_reason_codes": [
+        "CURRENT_COMPARABLE_IV_UNAVAILABLE",
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 196,
+      "sample_count": 14,
+      "source_configuration_sha256": "aec7d06f3ea82e2077535552906ef055de2c598da76922c58f1a6366b54863f8",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "GOOGL"
+    },
+    {
+      "coverage_fraction": 0.14285714285714285,
+      "current_comparable_iv": 0.18499327089064893,
+      "dividend_action_count": 8,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "7D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.3788864228058335,
+      "minimum_iv": 0.12661433689484108,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 490,
+      "sample_count": 36,
+      "source_configuration_sha256": "aec7d06f3ea82e2077535552906ef055de2c598da76922c58f1a6366b54863f8",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "IWM"
+    },
+    {
+      "coverage_fraction": 0.21825396825396826,
+      "current_comparable_iv": 0.1766640892934245,
+      "dividend_action_count": 8,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "21D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.29189488102430516,
+      "minimum_iv": 0.15232866805535641,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 742,
+      "sample_count": 55,
+      "source_configuration_sha256": "aec7d06f3ea82e2077535552906ef055de2c598da76922c58f1a6366b54863f8",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "IWM"
+    },
+    {
+      "coverage_fraction": 0.09523809523809523,
+      "current_comparable_iv": null,
+      "dividend_action_count": 8,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "45D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.23686023877671666,
+      "minimum_iv": 0.19874305523814728,
+      "null_reason_codes": [
+        "CURRENT_COMPARABLE_IV_UNAVAILABLE",
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 336,
+      "sample_count": 24,
+      "source_configuration_sha256": "aec7d06f3ea82e2077535552906ef055de2c598da76922c58f1a6366b54863f8",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "IWM"
+    },
+    {
+      "coverage_fraction": 0.07936507936507936,
+      "current_comparable_iv": 0.34873174519372513,
+      "dividend_action_count": 8,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "7D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.48860971367814116,
+      "minimum_iv": 0.2581053190370448,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 280,
+      "sample_count": 20,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "META"
+    },
+    {
+      "coverage_fraction": 0.03571428571428571,
+      "current_comparable_iv": 0.3574104179823988,
+      "dividend_action_count": 8,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "21D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.3915291306429316,
+      "minimum_iv": 0.2897071267144292,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 126,
+      "sample_count": 9,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "META"
+    },
+    {
+      "coverage_fraction": 0.023809523809523808,
+      "current_comparable_iv": null,
+      "dividend_action_count": 8,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "45D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.38496330544723273,
+      "minimum_iv": 0.3059161383503092,
+      "null_reason_codes": [
+        "CURRENT_COMPARABLE_IV_UNAVAILABLE",
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 84,
+      "sample_count": 6,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "META"
+    },
+    {
+      "coverage_fraction": 0.11904761904761904,
+      "current_comparable_iv": 0.22622285050254048,
+      "dividend_action_count": 9,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "7D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.37586542216783203,
+      "minimum_iv": 0.19033389802331574,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 420,
+      "sample_count": 30,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "MSFT"
+    },
+    {
+      "coverage_fraction": 0.10714285714285714,
+      "current_comparable_iv": 0.2352547242676162,
+      "dividend_action_count": 9,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "21D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.42580517686203256,
+      "minimum_iv": 0.19136325178544056,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 378,
+      "sample_count": 27,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "MSFT"
+    },
+    {
+      "coverage_fraction": 0.015873015873015872,
+      "current_comparable_iv": null,
+      "dividend_action_count": 9,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "45D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.2778118419527665,
+      "minimum_iv": 0.23963523725002173,
+      "null_reason_codes": [
+        "CURRENT_COMPARABLE_IV_UNAVAILABLE",
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 56,
+      "sample_count": 4,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "MSFT"
+    },
+    {
+      "coverage_fraction": 0.15079365079365079,
+      "current_comparable_iv": 0.3065600977604625,
+      "dividend_action_count": 9,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "7D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.7737172899157013,
+      "minimum_iv": 0.2864368720662967,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 518,
+      "sample_count": 38,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "NVDA"
+    },
+    {
+      "coverage_fraction": 0.25,
+      "current_comparable_iv": 0.31636866172204525,
+      "dividend_action_count": 9,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "21D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.5817694478113344,
+      "minimum_iv": 0.3158374850885077,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 868,
+      "sample_count": 63,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "NVDA"
+    },
+    {
+      "coverage_fraction": 0.14285714285714285,
+      "current_comparable_iv": null,
+      "dividend_action_count": 9,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "45D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.5089124375407416,
+      "minimum_iv": 0.3539886272384117,
+      "null_reason_codes": [
+        "CURRENT_COMPARABLE_IV_UNAVAILABLE",
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 504,
+      "sample_count": 36,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "NVDA"
+    },
+    {
+      "coverage_fraction": 0.05555555555555555,
+      "current_comparable_iv": 0.43675899722713996,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "7D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.6133036203181566,
+      "minimum_iv": 0.4175145381449009,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 196,
+      "sample_count": 14,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "PLTR"
+    },
+    {
+      "coverage_fraction": 0.04365079365079365,
+      "current_comparable_iv": 0.44723732454665993,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "21D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.5677978517896075,
+      "minimum_iv": 0.4349982220202976,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 154,
+      "sample_count": 11,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "PLTR"
+    },
+    {
+      "coverage_fraction": 0.011904761904761904,
+      "current_comparable_iv": null,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "45D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.5795032048633253,
+      "minimum_iv": 0.4993285779742613,
+      "null_reason_codes": [
+        "CURRENT_COMPARABLE_IV_UNAVAILABLE",
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 42,
+      "sample_count": 3,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "PLTR"
+    },
+    {
+      "coverage_fraction": 0.15873015873015872,
+      "current_comparable_iv": 0.16913668107025118,
+      "dividend_action_count": 8,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "7D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.31026769801455234,
+      "minimum_iv": 0.11785567202412914,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 546,
+      "sample_count": 40,
+      "source_configuration_sha256": "aec7d06f3ea82e2077535552906ef055de2c598da76922c58f1a6366b54863f8",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "QQQ"
+    },
+    {
+      "coverage_fraction": 0.27380952380952384,
+      "current_comparable_iv": 0.17222610630843382,
+      "dividend_action_count": 8,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "21D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.3141743833461228,
+      "minimum_iv": 0.1382740276500558,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 952,
+      "sample_count": 69,
+      "source_configuration_sha256": "aec7d06f3ea82e2077535552906ef055de2c598da76922c58f1a6366b54863f8",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "QQQ"
+    },
+    {
+      "coverage_fraction": 0.14682539682539683,
+      "current_comparable_iv": null,
+      "dividend_action_count": 8,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "45D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.29196141364342365,
+      "minimum_iv": 0.17797385584449207,
+      "null_reason_codes": [
+        "CURRENT_COMPARABLE_IV_UNAVAILABLE",
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 518,
+      "sample_count": 37,
+      "source_configuration_sha256": "aec7d06f3ea82e2077535552906ef055de2c598da76922c58f1a6366b54863f8",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "QQQ"
+    },
+    {
+      "coverage_fraction": 0.10317460317460317,
+      "current_comparable_iv": 0.44067214835996227,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "7D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.8699636478580948,
+      "minimum_iv": 0.4155595591442318,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 364,
+      "sample_count": 26,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "SOFI"
+    },
+    {
+      "coverage_fraction": 0.17857142857142858,
+      "current_comparable_iv": 0.46352521379783995,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "21D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.8632379855392316,
+      "minimum_iv": 0.4258873628947011,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 630,
+      "sample_count": 45,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "SOFI"
+    },
+    {
+      "coverage_fraction": 0.08333333333333333,
+      "current_comparable_iv": null,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "45D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.7603454758455132,
+      "minimum_iv": 0.5910719167651638,
+      "null_reason_codes": [
+        "CURRENT_COMPARABLE_IV_UNAVAILABLE",
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 294,
+      "sample_count": 21,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "SOFI"
+    },
+    {
+      "coverage_fraction": 0.17063492063492064,
+      "current_comparable_iv": 0.1269863960644746,
+      "dividend_action_count": 8,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "7D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.2933773835864556,
+      "minimum_iv": 0.08917599852494651,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 588,
+      "sample_count": 43,
+      "source_configuration_sha256": "aec7d06f3ea82e2077535552906ef055de2c598da76922c58f1a6366b54863f8",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "SPY"
+    },
+    {
+      "coverage_fraction": 0.32936507936507936,
+      "current_comparable_iv": 0.121530105839325,
+      "dividend_action_count": 8,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "21D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.1915411639921073,
+      "minimum_iv": 0.10469037635725595,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 1148,
+      "sample_count": 83,
+      "source_configuration_sha256": "aec7d06f3ea82e2077535552906ef055de2c598da76922c58f1a6366b54863f8",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "SPY"
+    },
+    {
+      "coverage_fraction": 0.1626984126984127,
+      "current_comparable_iv": null,
+      "dividend_action_count": 8,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "45D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.16151613291087694,
+      "minimum_iv": 0.12126113584019337,
+      "null_reason_codes": [
+        "CURRENT_COMPARABLE_IV_UNAVAILABLE",
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 574,
+      "sample_count": 41,
+      "source_configuration_sha256": "aec7d06f3ea82e2077535552906ef055de2c598da76922c58f1a6366b54863f8",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "SPY"
+    },
+    {
+      "coverage_fraction": 0.05952380952380952,
+      "current_comparable_iv": 0.3807999045346333,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "7D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.5810130946501985,
+      "minimum_iv": 0.35622476139070924,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 210,
+      "sample_count": 15,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "TSLA"
+    },
+    {
+      "coverage_fraction": 0.027777777777777776,
+      "current_comparable_iv": 0.3916958663753625,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "21D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.5634343576910429,
+      "minimum_iv": 0.3833764917096184,
+      "null_reason_codes": [
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 98,
+      "sample_count": 7,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "TSLA"
+    },
+    {
+      "coverage_fraction": 0.023809523809523808,
+      "current_comparable_iv": null,
+      "dividend_action_count": 0,
+      "dividend_coverage_count": 1,
+      "empirical_percentile": null,
+      "expiration_bucket": "45D",
+      "lookback_end_date": "2026-09-10",
+      "lookback_start_date": "2025-09-10",
+      "maximum_iv": 0.4767657045646976,
+      "minimum_iv": 0.4339933904190466,
+      "null_reason_codes": [
+        "CURRENT_COMPARABLE_IV_UNAVAILABLE",
+        "INSUFFICIENT_IV_SAMPLE_SESSIONS",
+        "INSUFFICIENT_IV_COVERAGE"
+      ],
+      "range_position_rank": null,
+      "rate_observation_count": 84,
+      "sample_count": 6,
+      "source_configuration_sha256": "729b6626443e868c9e4c75e077064c74f5687109e53477fa6b313de4134c1ab0",
+      "source_policy_sha256": "7c5f8e0d3381931ae96051c8fb2ac1af706e11284091e0c5ae32def66aa340fd",
+      "underlying": "TSLA"
+    }
+  ]
+}

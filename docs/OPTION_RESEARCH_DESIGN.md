@@ -6,7 +6,9 @@ document; the normative build specification is
 [OPTION_CHAIN_SCANNER_DESIGN.md](OPTION_CHAIN_SCANNER_DESIGN.md) and the implemented behaviour is
 described in [OPTION_PIPELINE_CURRENT_STATE.md](OPTION_PIPELINE_CURRENT_STATE.md). The equity
 qualification machinery referred to throughout is walked through in
-[BACKTEST_WALKTHROUGH.md](BACKTEST_WALKTHROUGH.md).
+[BACKTEST_WALKTHROUGH.md](BACKTEST_WALKTHROUGH.md). The shared decision standard for
+whether an option strategy graduates from research is
+[OPTION_STRATEGY_QUALIFICATION_STANDARD.md](OPTION_STRATEGY_QUALIFICATION_STANDARD.md).
 
 ## Current State, Verified 2026-09-04
 

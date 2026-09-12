@@ -8,6 +8,7 @@ import {
   LayoutDashboard,
   Radar,
   Route,
+  ScanSearch,
   Sigma,
   Star,
   Table2,
@@ -112,6 +113,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { to: '/options', label: 'Options Research', icon: FlaskConical, end: true },
       { to: '/options/activity', label: 'Option Activity', icon: Activity },
       { to: '/options/flow', label: 'Options Flow', icon: Route },
+      { to: '/options/screener', label: 'Options Screener', icon: ScanSearch },
     ],
   },
 ]

@@ -82,6 +82,23 @@ def test_clean_context_passes_its_gates():
     assert ledger.verdict_for(ExecutionGate.EQUITY_DIRECTION) is GateVerdict.PASS
 
 
+def test_directional_candidate_reports_equity_direction_unavailable():
+    ledger = _ledger(equity_direction_required=True)
+
+    assert ledger.verdict_for(ExecutionGate.EQUITY_DIRECTION) is GateVerdict.UNAVAILABLE
+    assert "QUALIFIED_EQUITY_DIRECTION_UNAVAILABLE" in ledger.reason_codes
+    assert ExecutionGate.EQUITY_DIRECTION in ledger.unavailable_gates
+
+
+def test_available_qualified_direction_passes_directional_gate():
+    ledger = _ledger(
+        equity_direction_required=True,
+        equity_direction_available=True,
+    )
+
+    assert ledger.verdict_for(ExecutionGate.EQUITY_DIRECTION) is GateVerdict.PASS
+
+
 def test_eligibility_is_earned_only_when_every_gate_passes():
     ledger = _ledger(
         quotes_available=True, risk_engine_available=True, read_only=False

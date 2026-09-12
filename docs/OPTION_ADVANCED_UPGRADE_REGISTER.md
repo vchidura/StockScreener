@@ -71,16 +71,45 @@ that currently suppress most of the chain.
 Code: [backend/options/analytics/greeks.py](../backend/options/analytics/greeks.py),
 [backend/options/analytics/marks.py](../backend/options/analytics/marks.py).
 
-### 3.2 Valuation policy seam — **not yet built**
+### 3.2 Valuation policy seam — **implemented for Developer**
 
-`model_mark` selection and outcome valuation are still direct implementations rather
-than a versioned interface. Before Advanced lands, both should sit behind one
-`ValuationPolicy` with a policy hash and `mark_source` provenance, so
+`model_mark` selection and outcome valuation now use one immutable `ValuationPolicy`
+artifact with a policy hash and `mark_source` provenance, so
 `DEVELOPER_ALIGNED_AGG_CLOSE` and `ADVANCED_NBBO_MIDPOINT` are interchangeable and can
 run side by side for shadow comparison.
 
-**IDENTITY** — introducing the seam changes how marks are produced and will bump the
-market-data policy hash.
+The first policy is `option_valuation_v1`, hash `86a5db37…c7cd`. It preserves current
+Developer behavior: a positive aligned aggregate close, maximum source age 1,800 seconds,
+maximum option/spot skew 60 seconds, $0.01 intrinsic-price tolerance, $0.65 commission per
+contract per side, and unavailable slippage. Normalized snapshots and candidate legs persist
+the valuation version/hash. Outcome queues require both entry legs and later exit snapshots
+to match that hash and use an allowed source; mixed or legacy null-provenance packages are
+not reinterpreted.
+
+The effective market-data policy hash now combines the Developer policy hash and valuation
+policy hash (`7c5f8e0d…40fd`). **This intentionally starts a new matrix lineage even though v1
+preserves numeric behavior.** Historical rows remain immutable.
+
+Migration 029 also includes `configuration_sha256` in Board publication uniqueness and current
+Board reads. The phase2_v4 revision `7f1ae6e2…` remains valid historical evidence under its
+original configuration, but it is not advertised as the current Board after the valuation-policy
+cutover. A new current Board will publish only after one complete 13-underlying cycle under
+configuration `c93e8186…`.
+
+**Serving behavior during that cold start:** current-policy data is always preferred. Until it
+exists, Flow, Activity, Research, Candidate Audit, Screener and Opportunity Board may serve the
+latest coherent prior-policy cohort only with `serving_mode=HISTORICAL_PREVIOUS_POLICY`; every
+portal surface renders an explicit warning. This avoids both a broken empty workspace and silent
+cross-policy mixing.
+
+This fallback was validated across all option routes on desktop and 390px mobile with no failed
+requests, console errors or document overflow. Migration 029 now removes the exact legacy
+three-column Board uniqueness and leaves only the configuration-aware constraint. Board gate
+completeness is scoped to `gate_ledger_v2`, so a future ledger revision cannot invalidate older
+candidate graphs by making the raw gate-row count exceed six.
+
+Still Advanced-gated: the `ADVANCED_NBBO_MIDPOINT` implementation, side-aware executable
+marks/slippage, quote freshness/spread verdicts, and dual-policy shadow comparison.
 
 ### 3.3 Execution gate ledger — **persisted and surfaced**
 
@@ -92,7 +121,7 @@ blocked but not which checks ran, which passed, or which could not be evaluated.
 [backend/options/strategies/gates.py](../backend/options/strategies/gates.py) replaces
 that with named gates — `CANDIDATE_KIND`, `STRATEGY_CONTEXT`, `EQUITY_DIRECTION`,
 `QUOTE_LIQUIDITY`, `RISK_ENGINE`, `READ_ONLY_MODE` — each reporting `PASS`, `FAIL` or
-`UNAVAILABLE`, versioned as `gate_ledger_v1`.
+`UNAVAILABLE`, versioned as `gate_ledger_v2`.
 
 **`UNAVAILABLE` is deliberately distinct from `FAIL`.** Unavailable means the check could
 not run on this entitlement; failed means it ran and the candidate lost. That distinction
@@ -164,6 +193,7 @@ Trade ingestion is now wired into the cycle but ships **disabled**:
 | `OPTION_TRADE_INGESTION_ENABLED` | `false` | Enabling multiplies provider requests per cycle |
 | `OPTION_TRADE_WATCHLIST_PER_UNDERLYER` | `15` | Bounds cost; watchlist is OTM calls with observed volume, ranked by day volume |
 | `OPTION_TRADE_LOOKBACK_SECONDS` | `3600` | Window requested when no cursor exists |
+| `OPTION_TRADE_INGESTION_BUDGET_SECONDS` | `120` | Stops remaining optional pulls for one underlying after the elapsed budget |
 
 These are deliberately **excluded from `fingerprint_payload`**, so tuning them does not
 disturb any persisted hash. That is a pragmatic choice, not a correct one: the watchlist
@@ -175,6 +205,14 @@ per-contract cursor becomes a stream sequence watermark.
 
 Enabled in the local `.env` as of 2026-09-05 so the first post-fix session populates
 `option_trade_events`; `.env.example` still ships it disabled.
+
+**Timeout resilience 2026-09-10.** Option-trade requests inherit the shared transport's
+two transient retries and 30-second timeout. Exhaustion is wrapped as `OptionProviderError`,
+reason-coded `TRADE_FETCH_FAILED:OptionProviderError`, and caught per contract; the matrix
+continues and the failed contract cursor does not advance, so the next cycle re-requests the
+overlap. A 120-second per-underlying budget now stops launching additional optional watchlist
+requests after repeated slow failures and records `TRADE_INGESTION_BUDGET_EXCEEDED`. Both knobs
+remain operational and outside strategy/configuration identity.
 
 **Validated 2026-09-08.** `massive_options_conditions_v1` classifies official provider
 conditions fail-closed: consolidated-volume-eligible conditions are `INCLUDED`, canceled
@@ -313,26 +351,86 @@ new model-valid rate and confirm the population shifts toward liquid contracts.
 watermark) was 4% at 30 minutes and 121 of 3,028 selected candidates before the fix, and
 that cohort was liquidity-biased. S4 should restart from post-fix data.
 
-### 3.10 Point-in-time inputs still missing
+### 3.10 Point-in-time inputs
 
 | Input | Current | Needed |
 |---|---|---|
-| Risk-free rate | Static 4% (`OPTION_RISK_FREE_RATE`) | Dated curve per session |
-| Dividend yield | 0% default, flagged | Point-in-time per underlying and ex-date |
-| Event calendar | Unconfigured | Earnings and Fed dates, point-in-time |
+| Risk-free rate | Dated U.S. Treasury par-yield curve active | Continue resident daily refresh |
+| Dividend yield | Coverage-backed discrete cash flows active | Add American early-assignment treatment |
+| Event calendar | `public_calendar_v1` active | Finnhub earnings plus official Fed dates, point-in-time |
 | Valuation model | European Black-Scholes | American / dividend-aware for ITM puts |
 
-None of these are Advanced-gated — they are separate data sources and can be built now.
-All are **IDENTITY** changes to the market-data policy.
+None of these are Advanced-gated. The first three inputs are implemented with direct
+provenance and fail-closed coverage. The remaining American-model change is a future
+**IDENTITY** change to the market-data policy.
+
+**Event-calendar integration completed and validated 2026-09-11.** Migration 030 adds append-only,
+point-in-time coverage facts alongside the existing event ledger. The controlled JSON importer
+validates event scope, timestamps, immutable identities and source-key uniqueness before writes.
+Strategy context now requires the configured source to cover the complete one-day-prior through
+72-hour-forward blackout window before absence can mean `CLEAR`; otherwise earnings/Fed remains
+`UNAVAILABLE`. `public_calendar_v1` combines Finnhub earnings with the official Federal Reserve
+FOMC calendar. The durable observation contains 350 company earnings-coverage facts, one global
+Fed coverage fact, 106 earnings events and one FOMC event. All 13 option contexts rebuilt against
+that observation: ten stocks are `CLEAR/CLEAR`, three ETFs are `NOT_APPLICABLE/CLEAR`, and all
+13 carry direct coverage lineage (23 links). No event link is expected until an event enters the
+decision blackout window.
+
+Migrations 032 and 034 complete causal lineage: source-declared publication time is separate
+from actual platform receipt, and every new strategy context links the exact event revisions
+and coverage revisions used in its decision. Active and canceled events explain `BLOCKED` or
+`CLEAR`; coverage links prove when absence could safely mean clear. Candidate detail exposes
+the linked source keys, scheduled/coverage windows, source times and receipt times. Source facts
+survive derived-layer purges; context links are rebuilt with the derived graph.
+
+Coverage expires after 12 hours, so a stopped manual calendar worker cannot leave false `CLEAR`
+states indefinitely. The worker remains an explicit `calendar` profile until a later real
+Finnhub revision/removal observation validates the reconciliation behavior outside fixtures.
 
 ### 3.11 IV rank and percentile
 
-`iv_regime` is hard-coded `None` with reason `INSUFFICIENT_COMPLETED_SESSION_HISTORY`.
-The schema is already there and unused: `option_iv_context_snapshots` exists with
-`range_position_rank`, `empirical_percentile`, `sample_count`, `coverage_fraction` and a
-FK from `option_strategy_candidates.iv_context_id`, but has **zero application code**.
+`iv_regime` remains hard-coded `None` with reason
+`INSUFFICIENT_COMPLETED_SESSION_HISTORY` until materialization passes. The persistence
+schema, pure rank/percentile analytics, provenance-complete repository, dry-run materializer,
+strict acceptance artifact and dynamic health readiness are implemented. Candidate evidence
+is intentionally not wired yet.
 
-Not Advanced-gated. Buildable now from persisted `option_expiration_analytics`.
+Not Advanced-gated. The source is policy-aligned settlement marks plus a current complete
+intraday matrix, not `option_expiration_analytics` alone.
+
+**Readiness audited 2026-09-11.** The historical option aggregate path was requesting
+`adjusted=true` despite pairing marks with nominal strikes and unadjusted underlying closes.
+Future fetches now use `adjusted=false`. `option_settlement_valuation_v1`, hash
+`e88adb1a…8d51`, defines the separate settlement source and requires a 252-session lookback,
+at least 200 sessions and 80% coverage. Migration 031 persists adjustment mode and settlement
+valuation identity without rewriting old facts.
+
+The read-only artifact `docs/option_iv_context_readiness.json` reports settlement-mark
+readiness separately from IV-context readiness. Policy reconstruction is complete: 124,052
+marks cover all 13 underlyings, with 248-251 marked sessions in the exact latest 252-session
+window. Dated Treasury inputs and historical/live dividend coverage also pass. The only
+readiness blocker is `COMPARABLE_IV_SERIES_NOT_MATERIALIZED`.
+
+Migration 033 adds immutable `option_daily_contract_mark_revisions` keyed by contract,
+settlement session and valuation-policy hash. Corrected unadjusted marks can now coexist with
+legacy adjusted facts, repeated writes are idempotent, payload conflicts fail, and backfill
+counts report actual inserted revisions instead of attempted rows.
+
+**Measured remaining dependency:** the first strict dry run built 39 records with zero inserts,
+but matched-IV sample coverage was only 14-43 sessions for 7D, 7-83 for 21D and 0-41 for
+45D. Sensitivity at 6% and 10% ATM bands still produced zero ready contexts, proving this is
+not fixed by relabeling farther strikes as ATM. Historical admission had monthly expirations
+only and sampled contracts around the future expiry close. It now supports additive weekly
+expirations and balanced calls/puts around contemporaneous 7/21/45-day spot anchors. Backfill
+only those new contracts, then rerun the dry-run acceptance artifact.
+
+The live Developer collection horizon is now 60 calendar DTE. The prior 45-DTE ceiling could
+not bracket a 45-day target on any of 13 latest complete matrices. This is an intentional new
+market-policy identity; settlement policy `e88adb1a...8d51` and its 124,052 marks are unchanged.
+
+Migration 032 separates source-declared event time from system receipt time. The importer stamps
+actual receipt as `first_observed_at`; source time is retained separately and can no longer make
+coverage or events retroactively visible to an earlier decision.
 
 ### 3.12 Read model and measurement
 
@@ -369,6 +467,101 @@ Before an Advanced-backed board can become execution-facing, replace this read p
 5. a gate that prevents mixed-revision underlyings from entering any execution consumer.
 
 Advanced entitlement alone must not enable any of these behaviours automatically.
+
+**Performance cohort mismatch confirmed 2026-09-10.** The live Board applies the active
+strategy-policy hash, causal leg timestamps, each underlying's latest matrix, prior-contract
+exclusion, and then reranks the survivors. The former `OPPORTUNITY_BOARD` performance cohort
+did none of that: it selected the lowest raw `candidate_rank` within each matrix/strategy/kind
+and followed the first occurrence of that signal. Therefore it did not identify candidates
+actually displayed on the Board. In a live check, the Board had two structured survivors at
+raw ranks 2 and 4, while the reconstructed 14-day cohort held 1,446 raw rank-leading events.
+
+The API and UI now call this cohort `RANK_LEADERS`, with entry basis
+`FIRST_RAW_RANK_LEADER_OCCURRENCE`, `board_membership_exact=false`, and an explicit definition.
+Legacy requests for `OPPORTUNITY_BOARD` are accepted only as a backward-compatible alias and
+normalize to `RANK_LEADERS`; they do not restore the incorrect claim. Existing P&L remains useful
+for raw selector research, but it cannot license Opportunity Board admission or presentation.
+
+Exact historical Board membership cannot be reconstructed as an audit fact after the fact.
+Migration 026 should persist an immutable all-universe Board publication header and ordered
+candidate membership rows, including selector/policy hashes and source matrix IDs. Exact Board
+performance begins prospectively from the first such publication; the current cohort must never
+be relabeled or backfilled as though it had been published.
+
+**Implemented 2026-09-10.** Migration 026 is applied. `option_board_publications` requires
+a complete configured universe and records source matrices, selector/configuration/strategy
+hashes, market/observation/publication times, and funnel evidence. `option_board_members`
+records positions 1–3 per underlying/strategy/kind plus raw rank and selection evidence.
+`OptionBoardPublicationRepository` owns both the versioned selector and atomic inserts;
+`ManualOptionPipeline` invokes it only for full configured-universe cycles. Controlled
+underlying subsets never publish. `/opportunities` reads only the latest complete publication,
+and `BOARD_PUBLICATIONS` performance reads exact position-one memberships prospectively.
+
+The active market-hours worker was started before this code and therefore cannot execute the
+new hook until restart. No historical publication was fabricated; the first live publication
+is deliberately pending the next worker restart/complete cycle. The recovery CLI
+`publish_option_board.py` is dry-run by default and can publish the newest already-complete
+configured-universe cycle with `--apply`.
+
+**Selector optimization to measure next, not change in v1:** v1 preserves the previous global
+prior-contract exclusion exactly. Any contract used by any earlier selected candidate under the
+active strategy policy excludes every later candidate containing that contract, even across
+strategies. This can starve the Board and promote deep raw ranks. Use immutable publication
+funnel evidence to compare pre-registered shadow variants:
+
+1. same-strategy contract episode with one- or two-slot disappearance grace (preferred prior);
+2. same-session global contract exclusion;
+3. immediately-previous-matrix exclusion; and
+4. no exclusion control.
+
+Compare survivor count, rank displacement, recurrence, package coherence and baseline-adjusted
+outcomes. A winner becomes selector v2 with a new hash; v1 publications remain immutable.
+
+**Shadow study completed 2026-09-10.** `report_option_board_selector_shadow.py` loaded
+54,819 candidate observations across three sessions and exactly reproduced the first v1
+publication (40/40 members, zero position mismatches). Key selection results:
+
+| Variant | Excluded | Position-one | Structured | Repeat fraction | Median / p90 raw rank |
+|---|---:|---:|---:|---:|---:|
+| Lifetime global v1 | 90.3% | 1,387 | 516 | 0.0% | 3 / 17 |
+| Same-session global | 82.8% | 1,917 | 930 | 12.4% | 2 / 17 |
+| Previous matrix | 67.5% | 3,272 | 2,079 | 42.5% | 2 / 9 |
+| Same-strategy grace 1 | 70.2% | 3,206 | 2,020 | 34.1% | 2 / 13 |
+| Same-strategy grace 2 | 73.9% | 2,983 | 1,821 | 27.8% | 2 / 15 |
+| No exclusion | 0% | 4,128 | 2,800 | 70.5% | 1 / 1 |
+
+The delayed-mark outcome rows span only three independent sessions and are explicitly not
+baseline-adjusted, so no variant graduates. Keep selector v1, accumulate immutable publications,
+and rerun after at least 40 independent periods with exact same-structure controls. Artifact:
+`docs/option_board_selector_shadow.json`.
+
+### 3.12.1 Correctness revisions after publication
+
+- **Wheel entry boundary:** new entries now require `calendar_dte > exit_dte`; contracts
+   already at/below the management exit boundary produce `NO_WHEEL_CONTRACT_ABOVE_EXIT_DTE`
+   instead of selected candidates carrying a warning. This deliberately bumps strategy identity
+   to `phase2_v4`, hash `c4a46268…e6bc6`.
+- **Directional gate semantics:** gate ledger v2 keeps broad directional observations for
+   measurement but reports `EQUITY_DIRECTION = UNAVAILABLE` when a candidate requires direction
+   and no qualified equity direction exists. It no longer records a false PASS.
+- **Trade timeout containment:** optional trade ingestion has a 120-second per-underlying
+   budget and leaves failed contract cursors unchanged for overlap retry.
+- **Manual-cycle watermark:** a latest-completed-session run now uses the actual session close
+   as `cycle_time`; the previous close-plus-15-minute value violated the exchange-slot contract
+   during normalization.
+- **Versioned context identity:** migration 027 replaces the one-context-per-matrix constraint
+   with `UNIQUE (matrix_id, policy_sha256)`, matching the deterministic context ID and allowing
+   immutable strategy-policy replays such as phase2_v3 and phase2_v4 to coexist.
+- **Coherent strategy replay:** full-universe `--strategies-only` now selects the newest single
+   complete configured-universe scheduled cycle. It no longer combines independently latest
+   matrices that can never satisfy immutable Board publication.
+
+Phase2_v4 activation published revision `7f1ae6e2…` for the 2026-09-10 16:45Z cycle:
+13/13 underlyers and 238 members. Its prior-contract exclusion count is zero because selector v1
+scopes contract history to the active strategy-policy hash. Treat the large first revision as a
+version cold start, not evidence that selector quality improved; subsequent v4 publications and
+the planned 40-period shadow comparison determine whether this reset behavior needs a selector
+version change.
 
 ### 3.13 Historical open interest — **not purchasable at any tier**
 
@@ -421,9 +614,10 @@ variant with its own hash, not as a silent swap.
 `(contract_id, settlement_session)`. OI capture reads the full raw chain, not the filtered
 strategy corridor. Migration 024 records the observation session, enforces
 `settlement_session < open_interest_observed_session`, preserves the first value for causal
-replay and records later conflicting observations as revisions. The recovered cohort has
-30,212 OI facts from two non-consecutive settlement sessions; the first real live writer
-run remains a Tuesday verification item.
+replay and records later conflicting observations as revisions. Current live state
+(2026-09-11) is 96,199 OI facts across six settlement sessions and all 13 configured
+underlyers. The writer is operational; independent history remains too short for robust
+OI-dependent strategy inference.
 
 ### 3.14 Historical backtesting and confidence scoring — **historical replay not built**
 
@@ -615,15 +809,15 @@ directional, and must remain `RESEARCH_CONTEXT` until §3.14 gates are cleared.
 
 | | |
 |---|---|
-| Data | `option_daily_contract_facts` mark columns; 13,604 SPY marks across 304 sessions |
+| Data | 124,052 policy-aligned settlement marks across all 13 underlyings |
 | Validated | 97.8–99.6% solver convergence, skew and level orderings economically correct |
-| State | Matched-horizon pure layer built; SPY study only. `option_iv_context_snapshots` still has zero rows and zero code |
+| State | Raw mark/rate/dividend readiness passes; strict matched-IV history needs additive weekly expirations; persisted contexts remain empty |
 
 *Act when all of:*
-1. Marks are backfilled for every configured underlying, not SPY alone.
-2. The IV series is written under valuation policy impl #2 (§3.2), distinct from the
+1. Marks are backfilled for every configured underlying. **Complete.**
+2. The IV series is written under `option_settlement_valuation_v1`, distinct from the
    intraday mark policy. A settlement close and a 15-minute mark are different valuation
-   policies and must never share one.
+   policies and never share one. **Policy/provenance and all-underlying backfill complete.**
 3. `option_iv_context_snapshots` is populated and `iv_regime` stops being hard-coded
    `None` with `INSUFFICIENT_COMPLETED_SESSION_HISTORY`.
 
@@ -730,25 +924,83 @@ recorded event-calendar, quote, risk-engine and read-only gates.
 
 ## 4. Ordering when Advanced arrives
 
-1. Build the valuation seam (§3.2) and gate ledger (§3.3) **before** buying the
-   entitlement, so the switch is configuration rather than surgery. **Gate ledger done
-   2026-09-07; valuation seam remains.**
-2. Build the retained daily open-interest table (§3.13) immediately and independently —
+1. Persist immutable all-universe Board revisions and exact ordered membership (§3.12),
+   then make the Opportunity Board read that projection. This must precede opportunity-
+   admission calibration; reconstructed raw rank leaders are not actual Board history.
+2. Build the valuation seam (§3.2) and gate ledger (§3.3) **before** buying the
+   entitlement, so the switch is configuration rather than surgery. **Completed: gate
+   ledger v2 plus migrations 025, 028 and 029.**
+3. Build the retained daily open-interest table (§3.13) immediately and independently —
    it is the only input that cannot be acquired retroactively. **Done 2026-09-06**
    (migrations 022 and 024); capture runs every cycle and 30,212 facts were recovered
    from retained raw pages.
-3. Build the replay harness and measurement contract (§3.14) on Developer data. This does
+4. Build the replay harness and measurement contract (§3.14) on Developer data. This does
    not wait for Advanced, and six of eight strategies can be scored without it.
-4. Consider one month of Advanced *for research backfill* (§3.14) — quote flat files back
+5. Consider one month of Advanced *for research backfill* (§3.14) — quote flat files back
    to 2022-03-07 — before, and separately from, the live-trading subscription.
-5. Stand up the Advanced data engine and options WebSocket; recompute IV from NBBO mid.
-6. Run `advanced_shadow` execution alongside the delayed proxy and compare.
-7. Only then let quote gates return verdicts and authorise a live adapter.
+6. Stand up the Advanced data engine and options WebSocket; recompute IV from NBBO mid.
+7. Run `advanced_shadow` execution alongside the delayed proxy and compare.
+8. Only then let quote gates return verdicts and authorise a live adapter.
 
 Automatic trading must remain gated on measured, out-of-sample evidence per
 [OPTION_RESEARCH_DESIGN.md](OPTION_RESEARCH_DESIGN.md). Detection improvements do not
 substitute for calibration. §3.16 records the specific trigger for each research input
 that is currently waiting outside signal detection.
+
+## 4.1 Current pending queue — 2026-09-11
+
+### Buildable now
+
+1. **Historical option replay (§3.14):** port the equity point-in-time replay harness for the
+   six non-OI-dependent strategies after policy-aligned settlement marks exist. Forward outcomes
+   exist; historical selection replay does not.
+2. **Comparable-IV data completion (§3.11):** admit recent weekly expirations with horizon-aligned
+   strike sampling, backfill only those newly admitted contracts, and require the dry-run artifact
+   to pass all 39 ticker/bucket contexts before applying or wiring evidence.
+
+### Completed this pass
+
+1. **Frontend bundle split:** route-level lazy loading reduced the initial/shared production
+   chunk from 980.59 kB to 363.70 kB; the Vite 500 kB chunk warning no longer fires.
+2. **Ticker event reference:** `/api/options/calendar/{underlyer}` and the ticker right rail
+   expose coverage-aware Earnings/Fed states and upcoming dates without treating absent,
+   uncovered events as CLEAR.
+3. **Event calendar activation:** `public_calendar_v1` is configured, durably populated and
+   consumed by all 13 option contexts with direct coverage lineage and 12-hour freshness.
+4. **Point-in-time rates:** 9,169 Treasury observations across 673 dates are persisted and
+   interpolated by contract maturity with immutable observation lineage.
+5. **Point-in-time dividends:** exact historical/live corporate-action coverage and discrete
+   cash-flow conversion are wired; the resident refresh covers all 386 active securities.
+6. **Settlement marks:** 124,052 unadjusted, policy-aligned marks span all 13 underlyings.
+7. **Comparable-IV foundation:** migrations 038, analytics, repository, dry-run/apply materializer,
+   strict artifact and dynamic health readiness are built. Live/persisted acceptance remains gated.
+
+### Data/configuration required
+
+1. **Matched-IV density:** add recent weekly expirations and horizon-anchor contracts. Do not
+   refetch the completed monthly contracts; the marks writer skips policy-complete contracts.
+2. **Market-hours acceptance:** run the active 60-DTE policy inside the delayed close/intraday
+   source-age window, then require a 39/39 dry run before `--apply`.
+
+### Evidence accumulation required
+
+1. **Board/selector:** 13 publications now exist; retain selector v1 until
+   at least 40 independent periods support a versioned change.
+2. **Outcome calibration:** 21,891 delayed outcomes currently span only four independent
+   sessions. Continue forward collection; row count is not a substitute for session count.
+3. **OI strategies:** 96,606 OI facts still span only six captured settlements and remain
+   descriptive. Continue daily capture or
+   price a historical OI vendor before promoting OI-dependent strategies.
+
+### Advanced entitlement required
+
+`ADVANCED_NBBO_MIDPOINT`, quote spread/size gates, aggressor-side classification, quote/trade
+WebSockets, side-aware slippage and Advanced shadow comparison remain blocked on quote access.
+
+### Live execution future work
+
+The paper `ExecutionManager`, order/fill/position ledger, portfolio risk and margin engine,
+broker adapter and live authorization remain intentionally unbuilt. Read-only mode stays on.
 
 ## 5. Change log
 
@@ -763,3 +1015,4 @@ that is currently waiting outside signal detection.
 | 2026-09-08 | Completed first post-fix market-session validation (§3.17). Mark alignment, OI attribution, gamma scopes, contract-scoped trade batches, classified sweep evidence, candidates, gate ledgers, outcomes and current marks all passed. Fixed same-cycle trade visibility, debit-signal continuation casts, trade-batch identity and missing trade classification. First 617 structure baselines are explicitly one-session `NOT_ROBUST`. |
 | 2026-09-08 | Hardened performance reporting after review: mixed-horizon inference fails closed, unavailable statistics serialize as JSON `null`, all auxiliary report sections follow strategy/horizon scope, and separate horizon summaries preserve valid inference. Recorded the current Opportunity Board freshness limitation and the atomic publication contract required before an Advanced-backed execution view. |
 | 2026-09-08 | Completed pre-commit read-model and research-lineage review. Replaced the Opportunity Board's quadratic prior-contract correlation (107 seconds live) with an equivalent set-based first-selection query (0.48 seconds), and regenerated the realized-volatility artifact using adjusted daily bars only; IWM is explicitly excluded instead of entering the pooled study under a different lineage. |
+| 2026-09-10 | Confirmed the reconstructed performance cohort was not actual Opportunity Board membership. Renamed it `RANK_LEADERS`, retained the old parameter only as an explicit alias, and moved prospective immutable Board publication ahead of admission calibration and Advanced work. Migration 026, selector repository, full-cycle publication hook, immutable Board reads, exact prospective performance cohort and Options Screener were implemented. First publication `21af1de7…` covers all 13 names with 40 members. Selector shadow study kept v1; Wheel phase2_v4 and gate ledger v2 correctness changes landed. |

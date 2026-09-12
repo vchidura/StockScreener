@@ -135,6 +135,8 @@ class OptionSnapshotRepository(PostgresRepository):
                     snapshot.revision,
                     policy_version,
                     policy_sha256,
+                    snapshot.valuation_policy_version,
+                    snapshot.valuation_policy_sha256,
                 )
                 for snapshot in ordered
             ]
@@ -155,7 +157,8 @@ class OptionSnapshotRepository(PostgresRepository):
                     provider_gamma, risk_free_rate, dividend_yield, iv_converged,
                     iv_solver, iv_iteration_count, iv_price_error, iv_failure_reason,
                     model_version, quality_flags, raw_payload_sha256,
-                    normalized_payload_sha256, revision, policy_version, policy_sha256
+                    normalized_payload_sha256, revision, policy_version, policy_sha256,
+                    valuation_policy_version, valuation_policy_sha256
                 ) VALUES %s
                 ON CONFLICT (
                     contract_id, provider, market_data_time, normalized_payload_sha256,
@@ -189,7 +192,8 @@ class OptionSnapshotRepository(PostgresRepository):
                     risk_free_rate, dividend_yield, iv_converged, iv_solver,
                     iv_iteration_count, iv_price_error, iv_failure_reason, model_version,
                     quality_flags, batch_id, raw_payload_sha256,
-                    normalized_payload_sha256, revision
+                    normalized_payload_sha256, revision,
+                    valuation_policy_version, valuation_policy_sha256
                 FROM option_chain_snapshots
                 WHERE batch_id = %s
                   AND market_data_time <= %s
@@ -260,4 +264,6 @@ def _snapshot(row: dict[str, Any]) -> OptionContractSnapshot:
         raw_payload_sha256=row["raw_payload_sha256"],
         normalized_payload_sha256=row["normalized_payload_sha256"],
         revision=row["revision"],
+        valuation_policy_version=row["valuation_policy_version"],
+        valuation_policy_sha256=row["valuation_policy_sha256"],
     )

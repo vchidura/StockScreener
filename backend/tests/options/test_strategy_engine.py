@@ -131,10 +131,10 @@ def test_healthy_matrix_selects_deterministic_wheel_candidates_and_scenarios():
     )
     matrix_id = uuid4()
     rows = (
-        snapshot(1, "95", "2.50", 0.35),
-        snapshot(2, "90", "1.25", 0.30),
-        snapshot(3, "97", "3.00", 0.40),
-        snapshot(4, "85", "0.75", 0.25),
+        replace(snapshot(1, "95", "2.50", 0.35), calendar_dte=22),
+        replace(snapshot(2, "90", "1.25", 0.30), calendar_dte=22),
+        replace(snapshot(3, "97", "3.00", 0.40), calendar_dte=22),
+        replace(snapshot(4, "85", "0.75", 0.25), calendar_dte=22),
     )
     health = build_chain_health(
         received_count=4,
@@ -331,6 +331,25 @@ def test_linked_bearish_context_suppresses_income_wheel():
     assert len(candidates) == 1
     assert candidates[0].status is CandidateStatus.SUPPRESSED
     assert "QUALIFIED_EQUITY_DIRECTION_OPPOSES_STRATEGY" in candidates[0].reason_codes
+
+
+def test_income_wheel_rejects_entry_at_or_below_exit_dte():
+    configuration = load_option_runtime_configuration({"POLYGON_API_KEY": "test"}, BACKEND_DIR)
+    engine = OptionStrategyEngine(
+        configuration.strategy_policy,
+        configuration.strategy_policy_sha256,
+    )
+    matrix_id = uuid4()
+
+    candidates = engine._income_wheel(
+        matrix_id,
+        (snapshot(35, "95", "2.50", 0.35),),
+        strategy_context(matrix_id),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].status is CandidateStatus.SUPPRESSED
+    assert "NO_WHEEL_CONTRACT_ABOVE_EXIT_DTE" in candidates[0].reason_codes
 
 
 def test_linked_context_without_qualified_direction_fails_closed():

@@ -27,6 +27,8 @@ load_dotenv(BACKEND_DIR / ".env")
 
 # Ordered children first so every foreign key is satisfied at each step.
 DERIVED_TABLES: tuple[str, ...] = (
+    "option_board_members",
+    "option_board_publications",
     "option_candidate_execution_gates",
     "option_recommendation_validity_current",
     "option_recommendation_validity_events",
@@ -40,6 +42,8 @@ DERIVED_TABLES: tuple[str, ...] = (
     "option_candidate_legs",
     "option_strategy_candidates",
     "option_decision_evidence",
+    "option_context_market_event_evidence",
+    "option_context_event_coverage_evidence",
     "option_gamma_profiles",
     "option_volatility_surfaces",
     "option_flow_windows",
@@ -60,6 +64,7 @@ RETAINED_TABLES: tuple[str, ...] = (
     "option_contract_catalog_versions",
     "option_contract_discoveries",
     "option_daily_contract_facts",
+    "option_daily_contract_mark_revisions",
     "option_universe_runs",
     "option_universe_members",
     "option_universe_candidates",
@@ -67,6 +72,8 @@ RETAINED_TABLES: tuple[str, ...] = (
     "option_trade_cursors",
     "option_trade_watchlist",
     "option_provider_trade_semantics",
+    "option_market_events",
+    "option_event_calendar_coverage",
 )
 
 # Work items are keyed to superseded batches and matrices; only these stages are cleared.

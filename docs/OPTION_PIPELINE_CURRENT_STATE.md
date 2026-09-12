@@ -71,7 +71,7 @@ flowchart LR
     P --> N[Normalize and align observations]
     N --> A[Chain and expiration analysis]
     A --> X[Strategy context]
-    X --> S[Six strategy modules]
+   X --> S[Eight strategy modules]
     S --> R[Payoff and scenario analysis]
     R --> D[(PostgreSQL decision graph)]
     D --> API[FastAPI latest-matrix queries]
@@ -80,18 +80,20 @@ flowchart LR
 
 Important current boundaries:
 
-- The option process is not yet a resident scheduler. `OPTION_POLL_SECONDS=900` is
-  configured, but no loop invokes the option pipeline every 15 minutes.
-- A manual cycle uses the latest completed exchange session close plus 15 minutes as
-  its requested cycle time. It is not currently an open-session rolling 15-minute
-  cycle.
+- `run_option_worker.py` is the resident scheduler. It processes XNYS-open-anchored
+   15-minute slots after provider delay and publication grace under PostgreSQL advisory
+   leadership.
+- A manual latest-completed-session cycle uses the actual session close as market time;
+   observation delay is represented separately. The resident worker supplies rolling
+   open-session slots.
 - Strategy calculations run only in the backend. The frontend reads persisted rows.
-- The candidate API returns only the newest persisted matrix per underlying for the
-  active strategy-policy hash.
+- Current serving APIs prefer the active market/configuration policy. During a policy
+   cold start they may serve one coherent prior-policy cohort only with explicit
+   `HISTORICAL_PREVIOUS_POLICY` metadata and portal warnings.
 - Older matrices and candidates remain in PostgreSQL, but no historical candidate API
   or historical range-replay command exposes them yet.
-- The schema contains `option_signal_decay_outcomes`, but no implemented evaluator
-  currently populates it.
+- `OptionOutcomeService` materializes coherent package outcomes at 15/30/60 minutes,
+   close and next open, plus current package marks, under a versioned valuation policy.
 - `SELECTED` means selected by a research module. It does not mean broker-authorized,
   suitable for an account, or executable. Execution eligibility is null in the
   current read-only Developer mode.
@@ -135,29 +137,37 @@ one-shot cycle exits.
 
 ### Step 1: Load immutable configuration
 
-The process loads environment-backed settings, `developer_v1.json`, and
-`strategy_v1.json`. It computes independent SHA-256 fingerprints for market-data and
-strategy policy. These hashes become part of persisted evidence and replay identity.
+The process loads environment-backed settings, `developer_v1.json`,
+`valuation_v1.json`, and `strategy_v1.json`. It computes separate Developer, valuation,
+and strategy SHA-256 fingerprints. The effective market-data policy hash combines the
+Developer and valuation hashes; these identities become part of persisted evidence and
+replay identity.
 
-Current defaults include:
+The current configured runtime includes:
 
 - 10 stocks: AAPL, AMD, AMZN, GOOGL, META, MSFT, NVDA, PLTR, SOFI, and TSLA.
 - 3 ETFs: SPY, QQQ, and IWM.
 - 15-minute configured poll interval.
 - Polygon Developer data engine.
 - Read-only startup.
-- Static 4% risk-free rate and 0% default dividend yield.
+- A 60-calendar-DTE collection horizon. This deliberately exceeds the 45-day
+   comparable-IV target so total variance can be interpolated without extrapolation.
+- Dated U.S. Treasury par-yield curves and coverage-backed Polygon discrete dividends.
+   If either configured source is unavailable, valuation fails closed rather than
+   silently substituting the old static 4%/0% assumptions.
 
 ### Step 2: Choose the cycle timestamp
 
-`ManualOptionPipeline.run_once()` asks the XNYS calendar for the latest completed
-session, obtains that session's close, and adds 15 minutes. This `cycle_time` is passed
-to the provider as the requested as-of time.
+`run_option_worker.py` derives XNYS-open-anchored 15-minute slots from the current
+exchange session. A slot becomes observable after the configured 900-second provider
+delay and 30-second publication grace. `--once` processes the latest observable slot;
+resident mode polls under PostgreSQL leadership. Matrix market time remains data-derived,
+not copied from the scheduler label.
 
-This is appropriate for the completed-session validation path that exists today. It
-does not produce rolling intraday matrices while the market is open. An autonomous
-open-session scheduler needs a distinct delayed-slot calculation based on the current
-exchange session, provider delay, and completed interval.
+The valuation policy independently limits source age to 1,800 seconds. For a 20:00 UTC
+close, the normal acceptance window therefore begins around 20:15:30 and ends when the
+actual option marks exceed 30 minutes of age. A later replay must fail `STALE_MARK`; it
+must not weaken the age gate or relabel a stale close as current.
 
 ### Step 3: Persist the fixed universe run
 
@@ -373,10 +383,12 @@ This distinction is central:
 | Field | Purpose | Current source rules |
 |---|---|---|
 | `display_mark` | Show a source observation in research UI. | Positive day close, otherwise positive day VWAP with `FALLBACK_MARK`. |
-| `model_mark` | Drive IV, Greeks, premium, payoff, scenarios, and structure selection. | Positive day close only, with acceptable age and an aligned underlying minute close. |
+| `model_mark` | Drive IV, Greeks, premium, payoff, scenarios, and structure selection. | `option_valuation_v1`: positive day close only, with acceptable age and an aligned underlying minute close. |
 
 The day VWAP can never silently become a model mark. A display mark can remain visible
-even when the contract is not model-valid.
+even when the contract is not model-valid. Every new normalized snapshot records
+`valuation_policy_version` and `valuation_policy_sha256`; candidate legs retain the same
+identity.
 
 ### 5.5 Align the underlying price causally
 
@@ -425,6 +437,23 @@ If the model mark is more than $0.01 below intrinsic value, the row receives
 `BELOW_INTRINSIC_MARK` and its model mark is removed. The retained source observation
 remains useful diagnostically but cannot drive local valuation or strategy pricing.
 
+Entry and outcome marks must use sources allowed by the same valuation policy and carry
+its exact hash. Legacy rows with null provenance remain readable but are excluded from
+new-policy outcome queues.
+
+Current Opportunity Board reads also require the active configuration hash. A market-data or
+valuation-policy change therefore leaves prior publications available for historical evaluation
+without presenting them as the current Board.
+
+During a policy cold start, portal reads prefer active-policy matrices and publications, then
+fall back to the latest coherent prior-policy cohort with an explicit
+`HISTORICAL_PREVIOUS_POLICY` label. Different policy cohorts are never merged into one response.
+
+Event-calendar context uses the same point-in-time rule. A configured source name alone is not
+evidence that no event exists: an append-only coverage fact must span the complete blackout
+window before earnings or Fed state can be `CLEAR`. With no configured source or incomplete
+coverage, the state remains `UNAVAILABLE`.
+
 ### 5.8 Solve local IV and Greeks
 
 Rows with an accepted model mark are sent to one vectorized Black-Scholes European
@@ -441,6 +470,40 @@ point, and Rho per rate point. A failed row stores no local Greeks, records iter
 price error and failure reason, and adds `NON_CONVERGED_IV`.
 
 Provider IV and Gamma remain diagnostic fields and never replace a local failure.
+
+Historical daily option aggregates are a separate valuation domain. New backfill requests use
+unadjusted option bars so nominal strikes, option marks and unadjusted underlying closes share
+one price basis. New daily marks persist `option_settlement_valuation_v1` provenance; the older
+SPY-only adjusted cohort remains immutable and is excluded from IV-context readiness.
+Settlement marks are stored in an immutable revision ledger keyed by valuation policy; the
+original daily-fact columns remain a compatibility projection for open-interest research.
+
+The policy-aligned settlement reconstruction now contains 124,052 marks across all 13
+configured underlyings. In the exact latest 252-session exchange window, each underlying
+has marks on 248 through 251 sessions, so raw mark-history readiness passes. Dated Treasury
+history and historical/live dividend coverage also pass.
+
+`materialize_option_iv_context.py` is dry-run by default and writes a strict acceptance
+artifact before `--apply`. It computes 7D/21D/45D **calendar-day** ATM IV by interpolating
+total variance; these buckets are intentionally distinct from 7/21/45 trading-session
+realized-volatility forecast horizons. It uses one matrix-relative maturity per current
+expiration and an exact trailing 252-session exchange window.
+
+The 2026-09-11 prior-cohort validation built all 39 ticker/bucket records with zero writes,
+but none met the 200-session matched-IV floor. At the strict 3% ATM band, observed history
+ranged from 14-43 sessions for 7D, 7-83 for 21D, and 0-41 for 45D. Widening the validation
+band to 6% and 10% still left every bucket below the floor, so relaxing ATM would hide a
+contract-universe gap. Historical admission had sampled only monthly expirations and
+11 contracts around the future expiry-day close. The repair is additive weekly-expiration
+admission with calls and puts sampled around contemporaneous 7/21/45-day spot anchors,
+followed by marks for only the newly admitted contracts. Existing completed contracts are
+not refetched.
+
+Event source timestamps and platform observation timestamps are distinct. Imported source time
+is retained as provenance, while causal visibility always uses the actual platform receipt time.
+Each strategy context also has foreign-key-backed links to the exact market-event and coverage
+revisions used to derive its blackout states. Candidate detail serves those rows directly rather
+than reconstructing lineage under the current calendar.
 
 ### 5.9 Build immutable snapshots
 
@@ -467,16 +530,13 @@ These are review questions, not implemented changes:
 2. Is a day aggregate close with its reported `last_updated` sufficiently precise for
    intraday option modeling, or should Developer mode construct marks from bounded
    option aggregates/trades instead?
-3. Should rate inputs come from a dated curve rather than one static risk-free rate?
-4. Should dividend yield be point-in-time per underlying, especially around ex-dividend
-   dates?
-5. Should American-style dividend-sensitive contracts use a different model, with the
+3. Should American-style dividend-sensitive contracts use a different model, with the
    existing European model retained as a versioned baseline?
-6. Are 30-minute source age and 60-second spot skew appropriate for each strategy, or
+4. Are 30-minute source age and 60-second spot skew appropriate for each strategy, or
    should model validity and strategy freshness be distinct policies?
-7. Should missing volume and OI be tolerated for model analytics but excluded from
+5. Should missing volume and OI be tolerated for model analytics but excluded from
    activity-dependent strategies through explicit module gates?
-8. Should normalization metrics report exact duplicate count separately instead of
+6. Should normalization metrics report exact duplicate count separately instead of
    silently skipping duplicates within the call?
 
 ## 6. Deep Dive: Six Strategy Modules
@@ -814,23 +874,38 @@ backtest.
 
 ## 9. Priority Improvement Sequence
 
-This sequence is proposed work, not current behavior.
+### Priority 1: Complete comparable-IV acceptance
 
-### Priority 1: Make current data genuinely current
+1. Admit a one-year weekly-expiration history with the horizon-anchor sampler. This is
+   additive and must not refetch the completed monthly contracts.
+2. Backfill settlement marks only for the newly admitted contracts while the intraday
+   option worker remains stopped.
+3. Re-run the materializer without `--apply`; require all 39 contexts to satisfy current
+   IV, at least 200 samples, and at least 80% exact-window coverage.
+4. During the next market session, run a punctual delayed one-shot under the active
+   60-DTE policy, validate all 13 current matrices, then apply the contexts.
+5. Attach IV context as candidate evidence only after that acceptance. Introducing a
+   selection threshold remains a separate strategy-policy identity change.
 
-1. Implement a separate resident option scheduler using the configured 900-second
-   cadence and PostgreSQL leadership heartbeat.
-2. Derive delayed open-session slots from the exchange calendar instead of always
-   using the latest completed-session close.
-3. Wire incremental option-trade ingestion for the bounded watchlist.
-4. Add candidate-page polling or invalidation after a committed cycle.
+Use dry runs first. The weekly admission is additive, and the marks command skips every
+contract already complete under the active settlement policy:
 
-### Priority 2: Complete causal inputs
+```powershell
+.\backend\.venv\Scripts\python.exe .\backend\scripts\admit_historical_option_contracts.py --months 0 --weekly-expirations 54 --strikes 12
+.\backend\.venv\Scripts\python.exe .\backend\scripts\admit_historical_option_contracts.py --months 0 --weekly-expirations 54 --strikes 12 --apply
+.\backend\.venv\Scripts\python.exe .\backend\scripts\backfill_option_daily_marks.py --lookback-days 400 --window-days 60 --maximum-contracts 250
+.\backend\.venv\Scripts\python.exe .\backend\scripts\backfill_option_daily_marks.py --lookback-days 400 --window-days 60 --maximum-contracts 250 --apply
+.\backend\.venv\Scripts\python.exe .\backend\scripts\materialize_option_iv_context.py
+```
 
-1. Add observed-at semantics to daily and hourly bars used by strategy context.
-2. Configure and persist a point-in-time event calendar.
-3. Version point-in-time rates and dividend inputs.
-4. Validate the source used to construct Developer model marks during an open session.
+Repeat only the bounded marks `--apply` command until its dry run selects zero pending
+contracts. Do not use `--refetch-existing` for this completion.
+
+### Priority 2: Build historical replay
+
+1. Port the equity point-in-time replay harness for the six non-OI-dependent strategies.
+2. Preserve settlement and intraday valuation policies as separate cohorts.
+3. Keep event, rate, dividend, contract-term and Board-publication lineage causal.
 
 ### Priority 3: Measure before retuning
 

@@ -802,6 +802,46 @@ CREATE TABLE public.equity_corporate_actions (
     CONSTRAINT equity_corporate_actions_raw_payload_check CHECK ((jsonb_typeof(raw_payload) = 'object'::text))
 );
 
+CREATE TABLE public.equity_corporate_action_coverage (
+    coverage_id uuid NOT NULL PRIMARY KEY,
+    action_type character varying(24) NOT NULL,
+    ticker character varying(32) NOT NULL,
+    window_start date NOT NULL,
+    window_end date NOT NULL,
+    source character varying(64) NOT NULL,
+    source_key character varying(256) NOT NULL,
+    first_observed_at timestamp with time zone NOT NULL,
+    availability_mode character varying(32) NOT NULL,
+    replay_available_at timestamp with time zone,
+    payload_sha256 character(64) NOT NULL,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    UNIQUE (source, source_key, first_observed_at),
+    CHECK (action_type IN ('SPLIT', 'DIVIDEND')),
+    CHECK (window_end >= window_start),
+    CHECK (
+        availability_mode IN ('LIVE_OBSERVED', 'HISTORICAL_RECONSTRUCTED')
+        AND (
+            (availability_mode = 'LIVE_OBSERVED' AND replay_available_at IS NULL)
+            OR (
+                availability_mode = 'HISTORICAL_RECONSTRUCTED'
+                AND replay_available_at IS NOT NULL
+                AND replay_available_at <= first_observed_at
+            )
+        )
+    ),
+    CHECK (payload_sha256 ~ '^[0-9a-f]{64}$')
+);
+
+CREATE INDEX idx_equity_corporate_action_coverage_asof
+    ON public.equity_corporate_action_coverage
+        (source, action_type, ticker, first_observed_at DESC);
+
+CREATE TABLE public.equity_corporate_action_coverage_members (
+    coverage_id uuid NOT NULL,
+    corporate_action_id uuid NOT NULL,
+    PRIMARY KEY (coverage_id, corporate_action_id)
+);
+
 
 --
 -- Name: equity_current_bar_projection; Type: TABLE; Schema: public; Owner: -
@@ -1521,6 +1561,8 @@ CREATE TABLE public.option_candidate_legs (
     mark_source character varying(40) NOT NULL,
     model_version character varying(64) NOT NULL,
     quality_flags text[] DEFAULT ARRAY[]::text[] NOT NULL,
+    valuation_policy_version character varying(64),
+    valuation_policy_sha256 character(64),
     quote_bid numeric(20,8),
     quote_ask numeric(20,8),
     quote_bid_size integer,
@@ -1544,7 +1586,9 @@ CREATE TABLE public.option_candidate_legs (
     CONSTRAINT option_candidate_legs_side_check CHECK (((side)::text = ANY ((ARRAY['BUY'::character varying, 'SELL'::character varying])::text[]))),
     CONSTRAINT option_candidate_legs_spot_check CHECK ((spot > (0)::numeric)),
     CONSTRAINT option_candidate_legs_strike_check CHECK ((strike > (0)::numeric)),
-    CONSTRAINT option_candidate_legs_time_to_expiration_years_check CHECK ((time_to_expiration_years > (0)::double precision))
+    CONSTRAINT option_candidate_legs_time_to_expiration_years_check CHECK ((time_to_expiration_years > (0)::double precision)),
+    CONSTRAINT option_candidate_legs_valuation_policy_check CHECK (((valuation_policy_version IS NULL) = (valuation_policy_sha256 IS NULL))),
+    CONSTRAINT option_candidate_legs_valuation_policy_sha256_check CHECK (((valuation_policy_sha256 IS NULL) OR (valuation_policy_sha256 ~ '^[0-9a-f]{64}$'::text)))
 );
 
 
@@ -1608,6 +1652,8 @@ CREATE TABLE public.option_chain_snapshots (
     revision integer DEFAULT 1 NOT NULL,
     policy_version character varying(64) NOT NULL,
     policy_sha256 character(64) NOT NULL,
+    valuation_policy_version character varying(64),
+    valuation_policy_sha256 character(64),
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT option_chain_snapshots_ask_check CHECK (((ask IS NULL) OR (ask >= (0)::numeric))),
@@ -1637,7 +1683,9 @@ CREATE TABLE public.option_chain_snapshots (
     CONSTRAINT option_chain_snapshots_shares_per_contract_check CHECK ((shares_per_contract > 0)),
     CONSTRAINT option_chain_snapshots_spot_check CHECK ((spot > (0)::numeric)),
     CONSTRAINT option_chain_snapshots_strike_check CHECK ((strike > (0)::numeric)),
-    CONSTRAINT option_chain_snapshots_time_to_expiration_years_check CHECK ((time_to_expiration_years > (0)::double precision))
+    CONSTRAINT option_chain_snapshots_time_to_expiration_years_check CHECK ((time_to_expiration_years > (0)::double precision)),
+    CONSTRAINT option_chain_snapshots_valuation_policy_check CHECK (((valuation_policy_version IS NULL) = (valuation_policy_sha256 IS NULL))),
+    CONSTRAINT option_chain_snapshots_valuation_policy_sha256_check CHECK (((valuation_policy_sha256 IS NULL) OR (valuation_policy_sha256 ~ '^[0-9a-f]{64}$'::text)))
 )
 PARTITION BY RANGE (first_observed_at);
 
@@ -2023,6 +2071,15 @@ CREATE TABLE public.option_iv_context_snapshots (
     empirical_percentile double precision,
     calculation_version character varying(64) NOT NULL,
     first_observed_time timestamp with time zone NOT NULL,
+    settlement_valuation_policy_version character varying(64),
+    settlement_valuation_policy_sha256 character(64),
+    rate_source character varying(64),
+    rate_observation_ids uuid[] DEFAULT ARRAY[]::uuid[] NOT NULL,
+    dividend_source character varying(64),
+    dividend_coverage_ids uuid[] DEFAULT ARRAY[]::uuid[] NOT NULL,
+    dividend_action_ids uuid[] DEFAULT ARRAY[]::uuid[] NOT NULL,
+    history_availability_mode character varying(32)
+        DEFAULT 'HISTORICAL_RECONSTRUCTED' NOT NULL,
     null_reason_codes text[] DEFAULT ARRAY[]::text[] NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT option_iv_context_snapshots_check CHECK (((lookback_end_date IS NULL) OR (lookback_start_date IS NULL) OR (lookback_end_date >= lookback_start_date))),
@@ -2031,6 +2088,13 @@ CREATE TABLE public.option_iv_context_snapshots (
     CONSTRAINT option_iv_context_snapshots_empirical_percentile_check CHECK (((empirical_percentile IS NULL) OR ((empirical_percentile >= (0)::double precision) AND (empirical_percentile <= (1)::double precision)))),
     CONSTRAINT option_iv_context_snapshots_range_position_rank_check CHECK (((range_position_rank IS NULL) OR ((range_position_rank >= (0)::double precision) AND (range_position_rank <= (1)::double precision)))),
     CONSTRAINT option_iv_context_snapshots_sample_count_check CHECK (((sample_count IS NULL) OR (sample_count >= 0)))
+    ,CONSTRAINT ck_option_iv_context_policy_sha CHECK (
+        settlement_valuation_policy_sha256 IS NULL
+        OR settlement_valuation_policy_sha256 ~ '^[0-9a-f]{64}$'
+    )
+    ,CONSTRAINT ck_option_iv_context_history_mode CHECK (
+        history_availability_mode = 'HISTORICAL_RECONSTRUCTED'
+    )
 );
 
 
@@ -2047,6 +2111,7 @@ CREATE TABLE public.option_market_events (
     source_key character varying(256) NOT NULL,
     announcement_time timestamp with time zone,
     first_observed_at timestamp with time zone NOT NULL,
+    source_observed_at timestamp with time zone,
     revised_observed_at timestamp with time zone,
     confidence character varying(24) NOT NULL,
     status character varying(24) NOT NULL,
@@ -2060,6 +2125,97 @@ CREATE TABLE public.option_market_events (
     CONSTRAINT option_market_events_payload_sha256_check CHECK ((payload_sha256 ~ '^[0-9a-f]{64}$'::text)),
     CONSTRAINT option_market_events_status_check CHECK (((status)::text = ANY ((ARRAY['SCHEDULED'::character varying, 'COMPLETED'::character varying, 'CANCELED'::character varying, 'REVISED'::character varying])::text[])))
 );
+
+
+--
+-- Name: option_risk_free_rate_observations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.option_risk_free_rate_observations (
+    rate_observation_id uuid NOT NULL,
+    rate_date date NOT NULL,
+    tenor_days integer NOT NULL,
+    annual_rate double precision NOT NULL,
+    source character varying(64) NOT NULL,
+    source_key character varying(128) NOT NULL,
+    source_observed_at timestamp with time zone,
+    first_observed_at timestamp with time zone NOT NULL,
+    availability_mode character varying(32) NOT NULL,
+    replay_available_at timestamp with time zone,
+    payload_sha256 character(64) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    PRIMARY KEY (rate_observation_id),
+    UNIQUE (source, source_key, first_observed_at),
+    CHECK (tenor_days > 0),
+    CHECK (annual_rate > -0.10 AND annual_rate < 1.0),
+    CHECK (availability_mode IN ('LIVE_OBSERVED', 'HISTORICAL_RECONSTRUCTED')),
+    CHECK (payload_sha256 ~ '^[0-9a-f]{64}$'),
+    CHECK (
+        (availability_mode = 'LIVE_OBSERVED' AND replay_available_at IS NULL)
+        OR (
+            availability_mode = 'HISTORICAL_RECONSTRUCTED'
+            AND replay_available_at IS NOT NULL
+            AND replay_available_at <= first_observed_at
+        )
+    )
+);
+
+CREATE INDEX idx_option_rate_curve_asof
+    ON public.option_risk_free_rate_observations
+        (source, rate_date DESC, first_observed_at DESC, tenor_days);
+
+
+--
+-- Name: option_event_calendar_coverage; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.option_event_calendar_coverage (
+    coverage_id uuid PRIMARY KEY,
+    event_type character varying(32) NOT NULL,
+    affected_underlying character varying(16),
+    window_start timestamp with time zone NOT NULL,
+    window_end timestamp with time zone NOT NULL,
+    source character varying(64) NOT NULL,
+    source_key character varying(256) NOT NULL,
+    first_observed_at timestamp with time zone NOT NULL,
+    source_observed_at timestamp with time zone,
+    payload_sha256 character(64) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    UNIQUE (source, source_key, first_observed_at),
+    CHECK (window_end > window_start),
+    CHECK (event_type IN ('EARNINGS', 'FED_RATE_DECISION')),
+    CHECK (
+        (event_type = 'FED_RATE_DECISION' AND affected_underlying IS NULL)
+        OR (event_type = 'EARNINGS' AND affected_underlying IS NOT NULL)
+    ),
+    CHECK (payload_sha256 ~ '^[0-9a-f]{64}$')
+);
+
+CREATE INDEX idx_option_event_calendar_coverage_lookup
+    ON public.option_event_calendar_coverage
+        (source, event_type, affected_underlying, first_observed_at DESC);
+
+CREATE TABLE public.option_context_market_event_evidence (
+    context_snapshot_id uuid NOT NULL,
+    market_event_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    PRIMARY KEY (context_snapshot_id, market_event_id)
+);
+
+CREATE INDEX idx_option_context_market_event_reverse
+    ON public.option_context_market_event_evidence
+        (market_event_id, context_snapshot_id);
+
+CREATE TABLE public.option_context_event_coverage_evidence (
+    context_snapshot_id uuid NOT NULL,
+    coverage_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    PRIMARY KEY (context_snapshot_id, coverage_id)
+);
+
+CREATE INDEX idx_option_context_event_coverage_reverse
+    ON public.option_context_event_coverage_evidence
+        (coverage_id, context_snapshot_id);
 
 
 --
@@ -3632,11 +3788,12 @@ ALTER TABLE ONLY public.option_chain_snapshots
 
 
 --
--- Name: option_context_snapshots option_context_snapshots_matrix_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: option_context_snapshots option_context_snapshots_matrix_policy_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.option_context_snapshots
-    ADD CONSTRAINT option_context_snapshots_matrix_id_key UNIQUE (matrix_id);
+    ADD CONSTRAINT option_context_snapshots_matrix_policy_key
+    UNIQUE (matrix_id, policy_sha256);
 
 
 --
@@ -3732,7 +3889,10 @@ ALTER TABLE ONLY public.option_ingestion_runs
 --
 
 ALTER TABLE ONLY public.option_iv_context_snapshots
-    ADD CONSTRAINT option_iv_context_snapshots_matrix_id_expiration_bucket_key UNIQUE (matrix_id, expiration_bucket);
+    ADD CONSTRAINT uq_option_iv_context_policy UNIQUE (
+        matrix_id, expiration_bucket, calculation_version,
+        settlement_valuation_policy_sha256
+    );
 
 
 --
@@ -4953,6 +5113,16 @@ ALTER TABLE ONLY public.equity_bar_revisions
 -- Name: equity_context_evidence equity_context_evidence_equity_context_snapshot_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
+ALTER TABLE ONLY public.equity_corporate_action_coverage_members
+    ADD CONSTRAINT equity_corporate_action_coverage_members_coverage_fkey
+    FOREIGN KEY (coverage_id)
+    REFERENCES public.equity_corporate_action_coverage(coverage_id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.equity_corporate_action_coverage_members
+    ADD CONSTRAINT equity_corporate_action_coverage_members_action_fkey
+    FOREIGN KEY (corporate_action_id)
+    REFERENCES public.equity_corporate_actions(corporate_action_id);
+
 ALTER TABLE ONLY public.equity_context_evidence
     ADD CONSTRAINT equity_context_evidence_equity_context_snapshot_id_fkey FOREIGN KEY (equity_context_snapshot_id) REFERENCES public.equity_context_snapshots(equity_context_snapshot_id) ON DELETE CASCADE;
 
@@ -5267,6 +5437,26 @@ ALTER TABLE ONLY public.option_context_snapshots
 
 ALTER TABLE ONLY public.option_context_snapshots
     ADD CONSTRAINT option_context_snapshots_matrix_id_fkey FOREIGN KEY (matrix_id) REFERENCES public.option_analysis_runs(matrix_id);
+
+ALTER TABLE ONLY public.option_context_market_event_evidence
+    ADD CONSTRAINT option_context_market_event_evidence_context_fkey
+    FOREIGN KEY (context_snapshot_id)
+    REFERENCES public.option_context_snapshots(context_snapshot_id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.option_context_market_event_evidence
+    ADD CONSTRAINT option_context_market_event_evidence_event_fkey
+    FOREIGN KEY (market_event_id)
+    REFERENCES public.option_market_events(market_event_id);
+
+ALTER TABLE ONLY public.option_context_event_coverage_evidence
+    ADD CONSTRAINT option_context_event_coverage_evidence_context_fkey
+    FOREIGN KEY (context_snapshot_id)
+    REFERENCES public.option_context_snapshots(context_snapshot_id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.option_context_event_coverage_evidence
+    ADD CONSTRAINT option_context_event_coverage_evidence_coverage_fkey
+    FOREIGN KEY (coverage_id)
+    REFERENCES public.option_event_calendar_coverage(coverage_id);
 
 
 --

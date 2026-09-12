@@ -41,9 +41,10 @@ def _snapshot():
         0.04,
         0.0,
     )
-    snapshot = DeveloperOptionNormalizer(configuration.policy).normalize(
-        uuid4(), (item,)
-    ).matrix_snapshots[0]
+    snapshot = DeveloperOptionNormalizer(
+        configuration.policy,
+        configuration.valuation_policy,
+    ).normalize(uuid4(), (item,)).matrix_snapshots[0]
     return configuration, snapshot
 
 

@@ -103,8 +103,8 @@ Terminal 1 starts the API and explicitly loads the backend environment file:
 ```
 
 Terminal 2 launches the continuous equity ingestion/materialization worker,
-equity portal snapshot publisher, and delayed option pipeline in separate worker
-windows:
+corporate-action refresh, equity portal snapshot publisher, and delayed option
+pipeline in separate worker windows:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
@@ -112,8 +112,35 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 ```
 
 Do not also start `run_equity_worker.py`,
-`refresh_equity_portal_snapshots.py`, or `run_option_worker.py` manually when
-using `start_workers.ps1`; the launcher refuses duplicate workers.
+`run_corporate_action_worker.py`, `refresh_equity_portal_snapshots.py`, or
+`run_option_worker.py` manually when using `start_workers.ps1`; the launcher
+refuses duplicate workers and each mutating worker also takes advisory leadership.
+
+The corporate-action worker polls Polygon every six hours by default and retains
+live-observed splits and dividends for the union of portal and ranked-universe
+securities. It looks back 30 days and forward 365 days. This supplies future
+ex-date facts but does not yet activate dividend-aware option valuation: option
+snapshots continue to carry `DIVIDEND_YIELD_DEFAULTED` until causal coverage,
+discrete cash-flow treatment, and early-assignment gates are implemented.
+
+The shared Finnhub earnings and Federal Reserve calendar worker starts with the
+Options/All worker set. Its provider contract and rollback-only persistence path
+can be revalidated without retaining another observation:
+
+```powershell
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\probe_finnhub_earnings_contract.py
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\probe_market_event_materialization.py
+```
+
+Both commands do not retain data; the materialization probe always rolls back.
+The 12-hour expiry on calendar coverage makes stale observations return
+`UNAVAILABLE` rather than continuing to report `CLEAR` if the resident worker
+fails.
+observing a real Finnhub date revision or removal. See
+[Calendar deployment details](docs/DEPLOYMENT.md) for the measured request budget
+and Compose `calendar` profile.
 
 Terminal 3 starts the frontend:
 
@@ -223,16 +250,11 @@ available at `/options/research`. Decisions combines Candidate Audit and Signal 
 the full matrix Explorer remains available contextually from Research rather than as a
 primary tab.
 
-Stocks and options have separate primary navigation sections. **Stocks** links Overview
-to the most recently opened `/ticker/{symbol}` workspace, falling back to `/ticker/SPY`
-before any symbol has been visited. Global ticker search opens the searched symbol on the
-same Overview tab and updates that remembered destination. Stock Research lives beside
-Overview at `/stock-research`. There is no separate global Research section.
-
-Sidebar product sections are collapsible disclosures. The active route's section opens
-automatically, multiple sections may remain open, and expansion state persists locally.
-The compact desktop rail shows one icon per section and opens labeled flyout navigation;
-the mobile drawer uses the same controls as ordinary expand/collapse disclosures.
+Stocks and options have separate primary navigation sections. **Stocks / Tickers** links
+Overview to `/ticker/SPY` by default and keeps that item active for any `/ticker/{symbol}`
+workspace; global ticker search continues to open the searched symbol on the same Overview
+tab. Stock Research lives beside Overview at `/stock-research`. There is no separate global
+Research section.
 
 The **Options** section exposes Options Research, Option Activity, and Options Flow as
 equal-level pages. `/options/activity` compares cumulative call

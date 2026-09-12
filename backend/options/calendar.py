@@ -60,6 +60,21 @@ class OptionExchangeCalendar:
         )
         return self._calendar.previous_session(session).date()
 
+    def trailing_sessions_before(self, before: date, count: int) -> tuple[date, ...]:
+        """Return exactly `count` exchange sessions strictly before a date."""
+        if count < 1:
+            raise ValueError("session count must be positive")
+        session = self._calendar.date_to_session(
+            pd.Timestamp(before), direction="previous"
+        )
+        if session.date() >= before:
+            session = self._calendar.previous_session(session)
+        sessions = [session.date()]
+        for _ in range(count - 1):
+            session = self._calendar.previous_session(session)
+            sessions.append(session.date())
+        return tuple(reversed(sessions))
+
     @staticmethod
     def third_friday(year: int, month: int) -> date:
         """Standard monthly expiration date."""
@@ -88,6 +103,16 @@ class OptionExchangeCalendar:
             if month == 0:
                 year, month = year - 1, 12
         return sorted(expirations)
+
+    @staticmethod
+    def weekly_expirations(count: int, before: date) -> list[date]:
+        """The `count` most recent Friday option-series dates before `before`."""
+        if count < 1:
+            raise ValueError("count must be positive")
+        candidate = before - timedelta(days=1)
+        while candidate.weekday() != 4:
+            candidate -= timedelta(days=1)
+        return sorted(candidate - timedelta(days=7 * index) for index in range(count))
 
     def latest_completed_session(self, as_of: datetime) -> date:
         if as_of.tzinfo is None or as_of.utcoffset() is None:

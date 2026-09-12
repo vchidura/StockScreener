@@ -255,6 +255,28 @@ def test_provider_failure_is_reason_coded_and_does_not_abort_the_matrix():
     assert any(reason.startswith("TRADE_FETCH_FAILED") for reason in result.reasons)
 
 
+def test_trade_ingestion_budget_stops_remaining_optional_requests():
+    snapshots, catalog = _chain()
+    configuration = _configuration(
+        POLYGON_API_KEY="test-secret",
+        OPTION_TRADE_INGESTION_ENABLED="true",
+        OPTION_TRADE_WATCHLIST_PER_UNDERLYER="2",
+        OPTION_TRADE_INGESTION_BUDGET_SECONDS="1",
+    )
+    engine = MagicMock()
+    engine.get_option_trades.return_value = _fetch_result([])
+    trades = MagicMock()
+    trades.get_cursor.return_value = None
+    pipeline = _pipeline(configuration, engine=engine, trades=trades)
+    pipeline.monotonic = MagicMock(side_effect=(0.0, 0.0, 2.0))
+
+    result = pipeline._ingest_trades(snapshots, catalog, MARKET_TIME)
+
+    assert engine.get_option_trades.call_count == 1
+    assert result.requested_count == 1
+    assert "TRADE_INGESTION_BUDGET_EXCEEDED" in result.reasons
+
+
 def test_empty_watchlist_is_reason_coded():
     engine = MagicMock()
     trades = MagicMock()
@@ -271,6 +293,7 @@ def test_settings_stay_out_of_the_configuration_fingerprint():
         OPTION_TRADE_INGESTION_ENABLED="true",
         OPTION_TRADE_WATCHLIST_PER_UNDERLYER="40",
         OPTION_TRADE_LOOKBACK_SECONDS="900",
+        OPTION_TRADE_INGESTION_BUDGET_SECONDS="30",
     )
     assert tuned.configuration_sha256 == baseline.configuration_sha256
     assert tuned.policy_sha256 == baseline.policy_sha256

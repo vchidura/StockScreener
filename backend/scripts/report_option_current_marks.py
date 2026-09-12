@@ -16,11 +16,11 @@ if str(BACKEND_DIR) not in sys.path:
 load_dotenv(BACKEND_DIR / ".env")
 
 from database import get_db_cursor  # noqa: E402
-from options.outcomes import delayed_proxy_commission_policy  # noqa: E402
+from options.config import load_option_runtime_configuration  # noqa: E402
 
 
 def main() -> int:
-    policy = delayed_proxy_commission_policy()
+    policy = load_option_runtime_configuration().valuation_policy
     with get_db_cursor() as cursor:
         cursor.execute(
             """

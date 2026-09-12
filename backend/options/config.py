@@ -16,6 +16,7 @@ from options.domain import (
     DealerConvention,
     GammaRegime,
     GammaScope,
+    MarkSource,
     VarianceEstimator,
     VarianceSource,
     VolatilityAssumption,
@@ -48,6 +49,7 @@ class OptionSettings(_FrozenModel):
     data_engine: DataEngine = DataEngine.POLYGON_DEVELOPER
     underlying_data_provider: str = "polygon_stocks"
     event_calendar_provider: str | None = None
+    event_calendar_max_age_seconds: int = Field(default=43200, ge=3600)
     equity_context_enabled: bool = False
     execution_engine: ExecutionEngine = ExecutionEngine.PAPER_PROXY
     universe_mode: UniverseMode = UniverseMode.FIXED
@@ -71,7 +73,13 @@ class OptionSettings(_FrozenModel):
     risk_free_rate: Decimal = Field(default=Decimal("0.04"), ge=Decimal("-0.10"), le=1)
     risk_free_rate_source: str = "manual_config_v1"
     default_dividend_yield: Decimal = Field(default=Decimal("0"), ge=0, le=1)
+    dividend_input_source: str | None = None
+    dividend_input_max_age_seconds: int = Field(default=43200, ge=3600)
     policy_file: Path = Path("options/policies/developer_v1.json")
+    valuation_policy_file: Path = Path("options/policies/valuation_v1.json")
+    settlement_valuation_policy_file: Path = Path(
+        "options/policies/settlement_valuation_v1.json"
+    )
     strategy_policy_file: Path = Path("options/policies/strategy_v1.json")
     gamma_policy_file: Path = Path("options/policies/gamma_policy_v1.json")
     raw_archive_enabled: bool = False
@@ -87,6 +95,7 @@ class OptionSettings(_FrozenModel):
     trade_ingestion_enabled: bool = False
     trade_watchlist_per_underlyer: int = Field(default=15, gt=0, le=200)
     trade_lookback_seconds: int = Field(default=3600, gt=0)
+    trade_ingestion_budget_seconds: int = Field(default=120, gt=0)
 
     @field_validator("fixed_stock_underlyers", "fixed_etf_underlyers", mode="before")
     @classmethod
@@ -102,7 +111,9 @@ class OptionSettings(_FrozenModel):
             return normalized
         return value
 
-    @field_validator("underlying_data_provider", "event_calendar_provider")
+    @field_validator(
+        "underlying_data_provider", "event_calendar_provider", "dividend_input_source"
+    )
     @classmethod
     def _normalize_provider(cls, value: str | None) -> str | None:
         if value is None:
@@ -141,6 +152,7 @@ class OptionSettings(_FrozenModel):
             "data_engine": self.data_engine.value,
             "underlying_data_provider": self.underlying_data_provider,
             "event_calendar_provider": self.event_calendar_provider,
+            "event_calendar_max_age_seconds": self.event_calendar_max_age_seconds,
             "equity_context_enabled": self.equity_context_enabled,
             "execution_engine": self.execution_engine.value,
             "universe_mode": self.universe_mode.value,
@@ -153,6 +165,8 @@ class OptionSettings(_FrozenModel):
             "risk_free_rate": str(self.risk_free_rate),
             "risk_free_rate_source": self.risk_free_rate_source,
             "default_dividend_yield": str(self.default_dividend_yield),
+            "dividend_input_source": self.dividend_input_source,
+            "dividend_input_max_age_seconds": self.dividend_input_max_age_seconds,
             "raw_archive_enabled": self.raw_archive_enabled,
             "raw_archive_root": str(self.raw_archive_root),
             "start_read_only": self.start_read_only,
@@ -180,9 +194,6 @@ class ContractFilterPolicy(_FrozenModel):
 
 
 class ModelQualityPolicy(_FrozenModel):
-    maximum_developer_source_age_seconds: int = Field(gt=0)
-    maximum_option_spot_skew_seconds: int = Field(ge=0)
-    intrinsic_price_tolerance: Decimal = Field(ge=0)
     minimum_iv_success_fraction: Decimal = Field(ge=0, le=1)
     minimum_iv: Decimal = Field(gt=0)
     maximum_iv: Decimal = Field(gt=0)
@@ -190,16 +201,71 @@ class ModelQualityPolicy(_FrozenModel):
     price_error_tolerance: float = Field(gt=0)
     minimum_vega: float = Field(gt=0)
     use_brent_fallback: bool
-    allowed_model_mark_sources: tuple[str, ...]
-    display_only_mark_sources: tuple[str, ...]
 
     @model_validator(mode="after")
     def _validate_iv_range(self) -> "ModelQualityPolicy":
         if self.maximum_iv <= self.minimum_iv:
             raise ValueError("maximum_iv must be greater than minimum_iv")
-        if set(self.allowed_model_mark_sources) & set(self.display_only_mark_sources):
-            raise ValueError("model and display-only mark sources must not overlap")
         return self
+
+
+class ValuationPolicy(_FrozenModel):
+    schema_version: int = Field(gt=0)
+    policy_version: str = Field(min_length=1)
+    primary_model_mark_source: MarkSource
+    maximum_source_age_seconds: int = Field(gt=0)
+    maximum_option_spot_skew_seconds: int = Field(ge=0)
+    intrinsic_price_tolerance: Decimal = Field(ge=0)
+    allowed_entry_mark_sources: tuple[MarkSource, ...]
+    allowed_exit_mark_sources: tuple[MarkSource, ...]
+    display_only_mark_sources: tuple[MarkSource, ...]
+    commission_per_contract_per_side: Decimal = Field(ge=0)
+    slippage_model: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_sources(self) -> "ValuationPolicy":
+        entry_sources = set(self.allowed_entry_mark_sources)
+        exit_sources = set(self.allowed_exit_mark_sources)
+        display_sources = set(self.display_only_mark_sources)
+        if self.primary_model_mark_source not in entry_sources:
+            raise ValueError("primary model mark source must be allowed for entry")
+        if self.primary_model_mark_source not in exit_sources:
+            raise ValueError("primary model mark source must be allowed for exit")
+        if (entry_sources | exit_sources) & display_sources:
+            raise ValueError("valuation and display-only mark sources must not overlap")
+        return self
+
+    @property
+    def policy_sha256(self) -> str:
+        return _sha256(self.model_dump(mode="json"))
+
+
+class SettlementValuationPolicy(_FrozenModel):
+    schema_version: int = Field(gt=0)
+    policy_version: str = Field(min_length=1)
+    mark_source: str = Field(min_length=1)
+    option_aggregates_adjusted: bool
+    underlying_closes_adjusted: bool
+    price_field: str = Field(min_length=1)
+    model_version: str = Field(min_length=1)
+    iv_context_calculation_version: str = Field(min_length=1)
+    iv_lookback_sessions: int = Field(gt=0)
+    minimum_iv_sample_sessions: int = Field(gt=0)
+    minimum_iv_coverage_fraction: float = Field(gt=0, le=1)
+
+    @model_validator(mode="after")
+    def _require_nominal_price_basis(self) -> "SettlementValuationPolicy":
+        if self.option_aggregates_adjusted or self.underlying_closes_adjusted:
+            raise ValueError("settlement IV requires unadjusted option and underlying prices")
+        if self.price_field != "close":
+            raise ValueError("settlement valuation price_field must be close")
+        if self.minimum_iv_sample_sessions > self.iv_lookback_sessions:
+            raise ValueError("minimum IV samples cannot exceed lookback sessions")
+        return self
+
+    @property
+    def policy_sha256(self) -> str:
+        return _sha256(self.model_dump(mode="json"))
 
 
 class CapacityPolicy(_FrozenModel):
@@ -535,7 +601,12 @@ class VolatilityForecastPolicyArtifact:
 class OptionRuntimeConfiguration:
     settings: OptionSettings
     policy: DeveloperPolicy
+    developer_policy_sha256: str
     policy_sha256: str
+    valuation_policy: ValuationPolicy
+    valuation_policy_sha256: str
+    settlement_valuation_policy: SettlementValuationPolicy
+    settlement_valuation_policy_sha256: str
     strategy_policy: StrategyPolicy
     strategy_policy_sha256: str
     gamma_policy: GammaExposurePolicy
@@ -547,7 +618,16 @@ class OptionRuntimeConfiguration:
             **self.settings.fingerprint_payload(),
             "policy_version": self.policy.policy_version,
             "policy_schema_version": self.policy.schema_version,
+            "developer_policy_sha256": self.developer_policy_sha256,
             "policy_sha256": self.policy_sha256,
+            "valuation_policy_version": self.valuation_policy.policy_version,
+            "valuation_policy_sha256": self.valuation_policy_sha256,
+            "settlement_valuation_policy_version": (
+                self.settlement_valuation_policy.policy_version
+            ),
+            "settlement_valuation_policy_sha256": (
+                self.settlement_valuation_policy_sha256
+            ),
             "strategy_policy_version": self.strategy_policy.strategy_version,
             "strategy_policy_sha256": self.strategy_policy_sha256,
             "gamma_policy_version": self.gamma_policy.gamma_policy_version,
@@ -574,6 +654,24 @@ def load_developer_policy(path: Path) -> PolicyArtifact:
     policy = DeveloperPolicy.model_validate(payload)
     canonical_payload = policy.model_dump(mode="json")
     return PolicyArtifact(policy=policy, sha256=_sha256(canonical_payload), path=path)
+
+
+def load_valuation_policy(path: Path) -> ValuationPolicy:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unable to load option valuation policy from {path}") from exc
+    return ValuationPolicy.model_validate(payload)
+
+
+def load_settlement_valuation_policy(path: Path) -> SettlementValuationPolicy:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"unable to load option settlement valuation policy from {path}"
+        ) from exc
+    return SettlementValuationPolicy.model_validate(payload)
 
 
 def load_strategy_policy(path: Path) -> StrategyPolicyArtifact:
@@ -624,6 +722,9 @@ def load_option_runtime_configuration(
             "OPTION_UNDERLYING_DATA_PROVIDER", "polygon_stocks"
         ),
         "event_calendar_provider": environ.get("OPTION_EVENT_CALENDAR_PROVIDER"),
+        "event_calendar_max_age_seconds": environ.get(
+            "OPTION_EVENT_CALENDAR_MAX_AGE_SECONDS", "43200"
+        ),
         "equity_context_enabled": environ.get("OPTION_EQUITY_CONTEXT_ENABLED", "false"),
         "execution_engine": environ.get(
             "OPTION_EXECUTION_ENGINE", ExecutionEngine.PAPER_PROXY.value
@@ -645,8 +746,19 @@ def load_option_runtime_configuration(
             "OPTION_RISK_FREE_RATE_SOURCE", "manual_config_v1"
         ),
         "default_dividend_yield": environ.get("OPTION_DEFAULT_DIVIDEND_YIELD", "0"),
+        "dividend_input_source": environ.get("OPTION_DIVIDEND_INPUT_SOURCE"),
+        "dividend_input_max_age_seconds": environ.get(
+            "OPTION_DIVIDEND_INPUT_MAX_AGE_SECONDS", "43200"
+        ),
         "policy_file": environ.get(
             "OPTION_POLICY_FILE", "options/policies/developer_v1.json"
+        ),
+        "valuation_policy_file": environ.get(
+            "OPTION_VALUATION_POLICY_FILE", "options/policies/valuation_v1.json"
+        ),
+        "settlement_valuation_policy_file": environ.get(
+            "OPTION_SETTLEMENT_VALUATION_POLICY_FILE",
+            "options/policies/settlement_valuation_v1.json",
         ),
         "strategy_policy_file": environ.get(
             "OPTION_STRATEGY_POLICY_FILE", "options/policies/strategy_v1.json"
@@ -667,11 +779,22 @@ def load_option_runtime_configuration(
             "OPTION_TRADE_WATCHLIST_PER_UNDERLYER", "15"
         ),
         "trade_lookback_seconds": environ.get("OPTION_TRADE_LOOKBACK_SECONDS", "3600"),
+        "trade_ingestion_budget_seconds": environ.get(
+            "OPTION_TRADE_INGESTION_BUDGET_SECONDS", "120"
+        ),
     }
     settings = OptionSettings.model_validate(values)
     policy_path = settings.policy_file
     if not policy_path.is_absolute():
         policy_path = (backend_dir / policy_path).resolve()
+    valuation_policy_path = settings.valuation_policy_file
+    if not valuation_policy_path.is_absolute():
+        valuation_policy_path = (backend_dir / valuation_policy_path).resolve()
+    settlement_valuation_policy_path = settings.settlement_valuation_policy_file
+    if not settlement_valuation_policy_path.is_absolute():
+        settlement_valuation_policy_path = (
+            backend_dir / settlement_valuation_policy_path
+        ).resolve()
     strategy_policy_path = settings.strategy_policy_file
     if not strategy_policy_path.is_absolute():
         strategy_policy_path = (backend_dir / strategy_policy_path).resolve()
@@ -684,6 +807,8 @@ def load_option_runtime_configuration(
     settings = settings.model_copy(
         update={
             "policy_file": policy_path,
+            "valuation_policy_file": valuation_policy_path,
+            "settlement_valuation_policy_file": settlement_valuation_policy_path,
             "strategy_policy_file": strategy_policy_path,
             "gamma_policy_file": gamma_policy_path,
             "raw_archive_root": archive_root,
@@ -691,18 +816,36 @@ def load_option_runtime_configuration(
     )
 
     artifact = load_developer_policy(policy_path)
+    valuation_policy = load_valuation_policy(valuation_policy_path)
+    settlement_valuation_policy = load_settlement_valuation_policy(
+        settlement_valuation_policy_path
+    )
     strategy_artifact = load_strategy_policy(strategy_policy_path)
     gamma_artifact = load_gamma_policy(gamma_policy_path)
     configuration_payload = {
         **settings.fingerprint_payload(),
         "policy_version": artifact.policy.policy_version,
         "policy_schema_version": artifact.policy.schema_version,
-        "policy_sha256": artifact.sha256,
+        "developer_policy_sha256": artifact.sha256,
+        "valuation_policy_sha256": valuation_policy.policy_sha256,
     }
+    policy_sha256 = _sha256(
+        {
+            "developer_policy_sha256": artifact.sha256,
+            "valuation_policy_sha256": valuation_policy.policy_sha256,
+        }
+    )
     return OptionRuntimeConfiguration(
         settings=settings,
         policy=artifact.policy,
-        policy_sha256=artifact.sha256,
+        developer_policy_sha256=artifact.sha256,
+        policy_sha256=policy_sha256,
+        valuation_policy=valuation_policy,
+        valuation_policy_sha256=valuation_policy.policy_sha256,
+        settlement_valuation_policy=settlement_valuation_policy,
+        settlement_valuation_policy_sha256=(
+            settlement_valuation_policy.policy_sha256
+        ),
         strategy_policy=strategy_artifact.policy,
         strategy_policy_sha256=strategy_artifact.sha256,
         gamma_policy=gamma_artifact.policy,

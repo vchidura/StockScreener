@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -67,6 +67,8 @@ def build_strategy_context(
     policy_version: str,
     policy_sha256: str,
     equity_context: EquityContextSnapshot | None = None,
+    market_event_ids: tuple[UUID, ...] = (),
+    event_coverage_ids: tuple[UUID, ...] = (),
 ) -> StrategyContextSnapshot:
     daily_values = tuple(Decimal(str(row["close_price"])) for row in daily_bars)
     hourly_values = tuple(Decimal(str(row["close_price"])) for row in hourly_bars)
@@ -161,6 +163,8 @@ def build_strategy_context(
         operating_income=(equity_context.operating_income if equity_context else None),
         free_cash_flow=(equity_context.free_cash_flow if equity_context else None),
         equity_reason_codes=(equity_context.reason_codes if equity_context else ()),
+        market_event_ids=market_event_ids,
+        event_coverage_ids=event_coverage_ids,
     )
 
 
@@ -182,7 +186,8 @@ class OptionStrategyContextRepository(PostgresRepository):
         asset_type: AssetType,
         decision_context: DecisionContext,
         *,
-        event_calendar_available: bool,
+        event_calendar_provider: str | None,
+        event_calendar_max_age_seconds: int = 43200,
         policy_version: str,
         policy_sha256: str,
         equity_context_enabled: bool = False,
@@ -206,26 +211,77 @@ class OptionStrategyContextRepository(PostgresRepository):
             hourly = tuple(reversed(cursor.fetchall()))
             earnings_blackout = None
             fed_blackout = None
-            if event_calendar_available:
+            market_event_ids: tuple[UUID, ...] = ()
+            event_coverage_ids: tuple[UUID, ...] = ()
+            event_calendar_available = False
+            if event_calendar_provider is not None:
+                window_start = decision_context.market_time - timedelta(days=1)
+                window_end = decision_context.market_time + timedelta(hours=72)
                 cursor.execute(
                     """
                     WITH latest AS (
                         SELECT DISTINCT ON (source, source_key)
-                            event_type, affected_underlying, scheduled_time, status
+                            coverage_id, event_type, affected_underlying,
+                            window_start, window_end
+                        FROM option_event_calendar_coverage
+                        WHERE source = %s
+                          AND first_observed_at <= %s
+                                                    AND first_observed_at >= %s
+                        ORDER BY source, source_key, first_observed_at DESC
+                    )
+                    SELECT coverage_id, event_type, affected_underlying
+                    FROM latest
+                    WHERE window_start <= %s
+                      AND window_end >= %s
+                      AND (
+                          (event_type = 'EARNINGS' AND affected_underlying = %s)
+                          OR (event_type = 'FED_RATE_DECISION'
+                              AND affected_underlying IS NULL)
+                      )
+                    """,
+                    (
+                        event_calendar_provider,
+                        decision_context.observed_time,
+                        decision_context.observed_time - timedelta(
+                            seconds=event_calendar_max_age_seconds
+                        ),
+                        window_start,
+                        window_end,
+                        underlyer,
+                    ),
+                )
+                coverage = cursor.fetchall()
+                event_coverage_ids = tuple(sorted(
+                    {row["coverage_id"] for row in coverage}, key=str
+                ))
+                covered_types = {row["event_type"] for row in coverage}
+                earnings_covered = (
+                    asset_type is AssetType.ETF or "EARNINGS" in covered_types
+                )
+                fed_covered = "FED_RATE_DECISION" in covered_types
+                event_calendar_available = earnings_covered and fed_covered
+                cursor.execute(
+                    """
+                    WITH latest AS (
+                        SELECT DISTINCT ON (source, source_key)
+                            market_event_id, event_type, affected_underlying,
+                            scheduled_time, status
                         FROM option_market_events
-                        WHERE first_observed_at <= %s
+                        WHERE source = %s
+                          AND first_observed_at <= %s
                           AND COALESCE(revised_observed_at, first_observed_at) <= %s
                         ORDER BY source, source_key,
                                  COALESCE(revised_observed_at, first_observed_at) DESC
                     )
-                    SELECT event_type, affected_underlying, scheduled_time
+                          SELECT market_event_id, event_type,
+                                  affected_underlying, scheduled_time, status
                     FROM latest
-                    WHERE status NOT IN ('CANCELED')
-                      AND scheduled_time BETWEEN %s - INTERVAL '1 day'
+                              WHERE scheduled_time BETWEEN %s - INTERVAL '1 day'
                                              AND %s + INTERVAL '72 hours'
                       AND (affected_underlying IS NULL OR affected_underlying = %s)
                     """,
                     (
+                        event_calendar_provider,
                         decision_context.observed_time,
                         decision_context.observed_time,
                         decision_context.market_time,
@@ -234,8 +290,29 @@ class OptionStrategyContextRepository(PostgresRepository):
                     ),
                 )
                 events = cursor.fetchall()
-                earnings_blackout = any(row["event_type"] == "EARNINGS" for row in events)
-                fed_blackout = any(row["event_type"] == "FED_RATE_DECISION" for row in events)
+                market_event_ids = tuple(sorted(
+                    {
+                        row["market_event_id"]
+                        for row in events
+                        if (
+                            row["event_type"] == "EARNINGS" and earnings_covered
+                            or row["event_type"] == "FED_RATE_DECISION" and fed_covered
+                        )
+                    },
+                    key=str,
+                ))
+                active_events = [
+                    row for row in events if row["status"] != "CANCELED"
+                ]
+                if earnings_covered:
+                    earnings_blackout = any(
+                        row["event_type"] == "EARNINGS" for row in active_events
+                    )
+                if fed_covered:
+                    fed_blackout = any(
+                        row["event_type"] == "FED_RATE_DECISION"
+                        for row in active_events
+                    )
         equity_context = None
         if equity_context_enabled:
             equity_context = self.equity_context_repository.get_context_as_of(
@@ -260,4 +337,6 @@ class OptionStrategyContextRepository(PostgresRepository):
             policy_version=policy_version,
             policy_sha256=policy_sha256,
             equity_context=equity_context,
+            market_event_ids=market_event_ids,
+            event_coverage_ids=event_coverage_ids,
         )

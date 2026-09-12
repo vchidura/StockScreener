@@ -10,10 +10,13 @@ import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
+load_dotenv(BACKEND_DIR / ".env")
 
 from database import get_db_connection, get_selected_tickers, get_tickers_overview
 from equity.portal_snapshots import SNAPSHOT_TYPES, current, publish, source_manifest

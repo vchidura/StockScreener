@@ -34,6 +34,7 @@ database role, Compose profile, validation, backup, and restore contract.
 ## Options Research
 
 - [OPTION_PIPELINE_CURRENT_STATE.md](OPTION_PIPELINE_CURRENT_STATE.md): current implementation state
+- [OPTION_STRATEGY_QUALIFICATION_STANDARD.md](OPTION_STRATEGY_QUALIFICATION_STANDARD.md): common evidence, confidence, promotion, and stop rules for deciding whether an option strategy works
 - [OPTION_ADVANCED_UPGRADE_REGISTER.md](OPTION_ADVANCED_UPGRADE_REGISTER.md): decisions deferred by the Developer entitlement and what to enable when real-time data arrives
 - [OPTION_RESEARCH_DESIGN.md](OPTION_RESEARCH_DESIGN.md): what equity research must add for option relevance, and the option-native demand study
 - [OPTION_CHAIN_SCANNER_IMPLEMENTATION_GUIDE.md](OPTION_CHAIN_SCANNER_IMPLEMENTATION_GUIDE.md): phased build order
@@ -41,6 +42,8 @@ database role, Compose profile, validation, backup, and restore contract.
 - [OPTION_PHASE0_VALIDATION_2026-08-29.md](OPTION_PHASE0_VALIDATION_2026-08-29.md): provider entitlement evidence
 - [OPTION_PLATFORM_CAPACITY_DECISION_2026-08-29.md](OPTION_PLATFORM_CAPACITY_DECISION_2026-08-29.md): measured capacity decision
 - [optionchain-scanners.md](optionchain-scanners.md): scanner reference
+- [option_iv_context_readiness.json](option_iv_context_readiness.json): exact-window settlement/rate/dividend readiness
+- [option_iv_context_materialization.json](option_iv_context_materialization.json): strict per-ticker 7D/21D/45D IV-context dry-run acceptance
 
 Options remain read-only. Equity context, raw option archival, broker
 execution, and Advanced streaming remain disabled until separately promoted.

@@ -10,6 +10,14 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from scripts import refresh_equity_portal_snapshots as worker
+def test_worker_loads_backend_environment_before_database_import():
+    source = Path(worker.__file__).read_text(encoding="utf-8")
+
+    load_position = source.index('load_dotenv(BACKEND_DIR / ".env")')
+    database_position = source.index("from database import")
+    assert load_position < database_position
+
+
 
 
 def test_one_shot_skips_refresh_when_current_snapshot_is_fresh(monkeypatch):

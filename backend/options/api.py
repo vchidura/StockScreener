@@ -10,10 +10,17 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from database import get_db_cursor
+from equity.domain import DecisionWatermark
+from equity.repositories import EquityReferenceRepository
 from options.calendar import OptionExchangeCalendar
 from options.config import load_option_runtime_configuration
-from options.outcomes import delayed_proxy_commission_policy, measurement_checkpoints
+from options.outcomes import measurement_checkpoints
+from options.repositories.board import (
+    BOARD_SELECTOR_SHA256,
+    BOARD_SELECTOR_VERSION,
+)
 from options.repositories.gamma import SQL_LATEST_BY_UNDERLYING
+from security_types import is_earnings_applicable_security_type
 
 
 DATA_TIER_LABEL = "15-MINUTE DELAYED RESEARCH DATA"
@@ -99,6 +106,68 @@ def _current_mark_schema_available(cursor) -> bool:
     return bool(row and row["ready"])
 
 
+def _board_schema_available(cursor) -> bool:
+    cursor.execute(
+        "SELECT to_regclass('public.option_board_publications') IS NOT NULL "
+        "AND to_regclass('public.option_board_members') IS NOT NULL AS ready"
+    )
+    row = cursor.fetchone()
+    return bool(row and row["ready"])
+
+
+def _iv_context_schema_available(cursor) -> bool:
+    cursor.execute(
+        """
+        SELECT to_regclass('public.option_iv_context_snapshots') IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'public'
+                 AND table_name = 'option_iv_context_snapshots'
+                 AND column_name = 'settlement_valuation_policy_sha256'
+           ) AS ready
+        """
+    )
+    row = cursor.fetchone()
+    return bool(row and row["ready"])
+
+
+def _event_window_state(
+    event_type: str,
+    coverage: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    *,
+    not_applicable: bool = False,
+) -> str:
+    if not_applicable:
+        return "NOT_APPLICABLE"
+    if not any(row["event_type"] == event_type for row in coverage):
+        return "UNAVAILABLE"
+    if any(
+        row["event_type"] == event_type and row["status"] != "CANCELED"
+        for row in events
+    ):
+        return "BLOCKED"
+    return "CLEAR"
+
+
+def _event_asset_type(
+    symbol: str,
+    observed_at: datetime,
+    fallback_etfs: tuple[str, ...],
+) -> str:
+    reference = EquityReferenceRepository().get_security_as_of(
+        symbol,
+        DecisionWatermark(observed_at, observed_at),
+    )
+    if reference is not None and reference.security_type:
+        return (
+            "ETF"
+            if not is_earnings_applicable_security_type(reference.security_type)
+            else "STOCK"
+        )
+    return "ETF" if symbol in fallback_etfs else "STOCK"
+
+
 def _performance_checkpoints(
     row: dict[str, Any],
     *,
@@ -174,6 +243,42 @@ def option_health() -> OptionsEnvelope:
                 },
             )
         strategy_ready = _strategy_schema_available(cursor)
+        expected_iv_contexts = len(configuration.settings.underlyers) * 3
+        ready_iv_contexts = 0
+        if _iv_context_schema_available(cursor):
+            cursor.execute(
+                """
+                WITH latest AS (
+                    SELECT DISTINCT ON (
+                        context.underlying, context.expiration_bucket
+                    ) context.null_reason_codes
+                    FROM option_iv_context_snapshots AS context
+                    JOIN option_analysis_runs AS analysis USING (matrix_id)
+                    JOIN option_ingestion_runs AS ingestion USING (batch_id)
+                    WHERE context.settlement_valuation_policy_sha256 = %s
+                      AND context.calculation_version = %s
+                      AND ingestion.configuration_sha256 = %s
+                      AND analysis.policy_sha256 = %s
+                      AND analysis.status = 'COMPLETE'
+                    ORDER BY context.underlying, context.expiration_bucket,
+                             analysis.market_time DESC, analysis.observed_time DESC
+                )
+                SELECT COUNT(*) FILTER (
+                    WHERE cardinality(null_reason_codes) = 0
+                ) AS ready_count
+                FROM latest
+                """,
+                (
+                    configuration.settlement_valuation_policy_sha256,
+                    (
+                        configuration.settlement_valuation_policy
+                        .iv_context_calculation_version
+                    ),
+                    configuration.configuration_sha256,
+                    configuration.policy_sha256,
+                ),
+            )
+            ready_iv_contexts = int(cursor.fetchone()["ready_count"] or 0)
         candidate_count = 0
         if strategy_ready:
             cursor.execute(
@@ -181,6 +286,85 @@ def option_health() -> OptionsEnvelope:
                 (configuration.strategy_policy_sha256,),
             )
             candidate_count = cursor.fetchone()["count"]
+        board_publication = {
+            "schema_ready": False,
+            "publishable": False,
+            "expected_underlyings": len(configuration.settings.underlyers),
+            "covered_underlyings": 0,
+            "missing_underlyings": list(configuration.settings.underlyers),
+            "latest_candidate_cycle": None,
+            "latest_publication": None,
+            "selector_version": BOARD_SELECTOR_VERSION,
+            "selector_sha256": BOARD_SELECTOR_SHA256,
+        }
+        if strategy_ready and _board_schema_available(cursor):
+            board_publication["schema_ready"] = True
+            cursor.execute(
+                """
+                WITH cycle_state AS (
+                    SELECT run.scheduled_cycle,
+                           ARRAY_AGG(DISTINCT analysis.underlying
+                                     ORDER BY analysis.underlying) FILTER (
+                               WHERE analysis.status = 'COMPLETE'
+                                 AND EXISTS (
+                                     SELECT 1
+                                     FROM option_strategy_candidates AS candidate
+                                     WHERE candidate.matrix_id = analysis.matrix_id
+                                       AND candidate.policy_sha256 = %s
+                                 )
+                           ) AS covered_underlyings
+                    FROM option_ingestion_runs AS run
+                    JOIN option_analysis_runs AS analysis USING (batch_id)
+                                        WHERE run.configuration_sha256 = %s
+                                            AND analysis.underlying = ANY(%s)
+                    GROUP BY run.scheduled_cycle
+                )
+                SELECT scheduled_cycle,
+                       COALESCE(covered_underlyings, ARRAY[]::TEXT[])
+                           AS covered_underlyings
+                FROM cycle_state
+                ORDER BY scheduled_cycle DESC
+                LIMIT 1
+                """,
+                (
+                    configuration.strategy_policy_sha256,
+                    configuration.configuration_sha256,
+                    list(configuration.settings.underlyers),
+                ),
+            )
+            cycle = cursor.fetchone()
+            if cycle:
+                covered = tuple(cycle["covered_underlyings"] or ())
+                missing = sorted(set(configuration.settings.underlyers) - set(covered))
+                board_publication.update(
+                    {
+                        "latest_candidate_cycle": cycle["scheduled_cycle"],
+                        "covered_underlyings": len(covered),
+                        "missing_underlyings": missing,
+                        "publishable": not missing,
+                    }
+                )
+            cursor.execute(
+                """
+                SELECT publication_id, scheduled_cycle, published_at,
+                       covered_underlying_count, expected_underlying_count,
+                       selector_version, selector_sha256, selection_evidence
+                FROM option_board_publications
+                WHERE status = 'COMPLETE'
+                  AND strategy_policy_sha256 = %s
+                                    AND configuration_sha256 = %s
+                ORDER BY scheduled_cycle DESC, published_at DESC
+                LIMIT 1
+                """,
+                (
+                    configuration.strategy_policy_sha256,
+                    configuration.configuration_sha256,
+                ),
+            )
+            latest_publication = cursor.fetchone()
+            board_publication["latest_publication"] = (
+                dict(latest_publication) if latest_publication else None
+            )
         cursor.execute(
             """
             WITH latest AS (
@@ -252,6 +436,38 @@ def option_health() -> OptionsEnvelope:
             "archive_enabled": configuration.settings.raw_archive_enabled,
             "risk_free_rate": str(configuration.settings.risk_free_rate),
             "risk_free_rate_source": configuration.settings.risk_free_rate_source,
+            "valuation_policy_version": configuration.valuation_policy.policy_version,
+            "valuation_policy_sha256": configuration.valuation_policy_sha256,
+            "settlement_valuation_policy": {
+                "version": (
+                    configuration.settlement_valuation_policy.policy_version
+                ),
+                "sha256": configuration.settlement_valuation_policy_sha256,
+                "mark_source": (
+                    configuration.settlement_valuation_policy.mark_source
+                ),
+                "adjusted": (
+                    configuration.settlement_valuation_policy
+                    .option_aggregates_adjusted
+                ),
+                "iv_context_ready": ready_iv_contexts == expected_iv_contexts,
+                "ready_iv_contexts": ready_iv_contexts,
+                "expected_iv_contexts": expected_iv_contexts,
+            },
+            "event_calendar": {
+                "configured_source": (
+                    configuration.settings.event_calendar_provider
+                ),
+                "maximum_age_seconds": (
+                    configuration.settings.event_calendar_max_age_seconds
+                ),
+                "coverage_required": True,
+                "status": (
+                    "CONFIGURED_COVERAGE_REQUIRED"
+                    if configuration.settings.event_calendar_provider
+                    else "UNCONFIGURED"
+                ),
+            },
             "default_dividend_yield": str(
                 configuration.settings.default_dividend_yield
             ),
@@ -270,6 +486,7 @@ def option_health() -> OptionsEnvelope:
                 "candidate_count": candidate_count,
                 "strategy_policy_sha256": configuration.strategy_policy_sha256,
             },
+            "board_publication": board_publication,
         },
     )
 
@@ -337,6 +554,7 @@ def option_chain(
     limit: int = Query(default=500, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
 ) -> OptionsEnvelope:
+    configuration = _configuration()
     ticker = underlyer.strip().upper()
     with get_db_cursor() as cursor:
         if not _schema_available(cursor):
@@ -345,14 +563,20 @@ def option_chain(
             """
             SELECT batch_id, scheduled_cycle, market_data_time, first_observed_at,
                    retained_row_count, received_row_count, unknown_reference_count,
-                   completed_at
-            FROM option_ingestion_runs
-            WHERE underlying = %s AND status = 'COMPLETE'
-              AND retained_row_count > 0
-            ORDER BY scheduled_cycle DESC, completed_at DESC
+                                     completed_at, configuration_sha256, policy_sha256,
+                                     (configuration_sha256 = %s AND policy_sha256 = %s)
+                                             AS current_policy
+                        FROM option_ingestion_runs
+                        WHERE underlying = %s AND status = 'COMPLETE'
+                            AND retained_row_count > 0
+                        ORDER BY current_policy DESC, scheduled_cycle DESC, completed_at DESC
             LIMIT 1
             """,
-            (ticker,),
+                        (
+                                configuration.configuration_sha256,
+                                configuration.policy_sha256,
+                                ticker,
+                        ),
         )
         batch = cursor.fetchone()
         if not batch:
@@ -418,6 +642,12 @@ def option_chain(
         observed_at=batch["first_observed_at"] or batch["completed_at"],
         model_version=rows[0]["model_version"] if rows else None,
         data={
+            "serving_mode": (
+                "CURRENT_POLICY"
+                if batch["current_policy"]
+                else "HISTORICAL_PREVIOUS_POLICY"
+            ),
+            "active_policy_sha256": configuration.policy_sha256,
             "underlyer": ticker,
             "batch": batch,
             "analysis": analysis,
@@ -432,19 +662,31 @@ def option_chain(
 
 @router.get("/analysis/{underlyer}", response_model=OptionsEnvelope)
 def option_analysis(underlyer: str) -> OptionsEnvelope:
+    configuration = _configuration()
     ticker = underlyer.strip().upper()
     with get_db_cursor() as cursor:
         if not _schema_available(cursor):
             return _envelope(available=False, reason="MIGRATION_015_NOT_APPLIED", data={})
         cursor.execute(
             """
-            SELECT *
-            FROM option_analysis_runs
-            WHERE underlying = %s AND status <> 'RUNNING'
-            ORDER BY market_time DESC, observed_time DESC
+            SELECT analysis.*,
+                   ingestion.configuration_sha256,
+                   (
+                       analysis.policy_sha256 = %s
+                       AND ingestion.configuration_sha256 = %s
+                   ) AS current_policy
+            FROM option_analysis_runs AS analysis
+            JOIN option_ingestion_runs AS ingestion USING (batch_id)
+            WHERE analysis.underlying = %s AND analysis.status <> 'RUNNING'
+            ORDER BY current_policy DESC,
+                     analysis.market_time DESC, analysis.observed_time DESC
             LIMIT 1
             """,
-            (ticker,),
+            (
+                configuration.policy_sha256,
+                configuration.configuration_sha256,
+                ticker,
+            ),
         )
         analysis = cursor.fetchone()
         if not analysis:
@@ -470,6 +712,12 @@ def option_analysis(underlyer: str) -> OptionsEnvelope:
         policy_sha256=analysis["policy_sha256"],
         model_version=analysis["model_version"],
         data={
+            "serving_mode": (
+                "CURRENT_POLICY"
+                if analysis["current_policy"]
+                else "HISTORICAL_PREVIOUS_POLICY"
+            ),
+            "active_policy_sha256": configuration.policy_sha256,
             "underlyer": ticker,
             "analysis": analysis,
             "expirations": expirations,
@@ -500,26 +748,33 @@ def option_flow(
                     run.scheduled_cycle, run.market_data_time,
                     run.first_observed_at, run.received_row_count,
                     run.retained_row_count, analysis.matrix_id,
-                    analysis.model_version
+                    analysis.model_version, analysis.policy_sha256,
+                    run.configuration_sha256,
+                    (
+                        analysis.policy_sha256 = %s
+                        AND run.configuration_sha256 = %s
+                    ) AS current_policy
                 FROM option_ingestion_runs AS run
                 JOIN option_analysis_runs AS analysis USING (batch_id)
                 WHERE run.status = 'COMPLETE'
                   AND analysis.status = 'COMPLETE'
-                  AND analysis.policy_sha256 = %s
                   AND run.retained_row_count > 0
                                     AND (
                                             %s::date IS NULL
                                             OR (run.market_data_time AT TIME ZONE 'America/New_York')::date
                                                     = %s::date
                                     )
-                ORDER BY run.underlying, run.scheduled_cycle DESC,
+                ORDER BY run.underlying, current_policy DESC,
+                         run.scheduled_cycle DESC,
                          run.completed_at DESC, analysis.observed_time DESC
             )
             SELECT latest.underlying, latest.asset_type, latest.batch_id,
                    latest.matrix_id, latest.scheduled_cycle,
                    latest.market_data_time, latest.first_observed_at,
                    latest.received_row_count, latest.retained_row_count,
-                   latest.model_version, MAX(snapshot.spot) AS spot,
+                   latest.model_version, latest.policy_sha256,
+                   latest.configuration_sha256, latest.current_policy,
+                   MAX(snapshot.spot) AS spot,
                    COUNT(*) AS contract_count,
                    COUNT(DISTINCT snapshot.expiration_date) AS expiration_count,
                    COUNT(DISTINCT snapshot.strike) AS strike_count,
@@ -561,10 +816,16 @@ def option_flow(
                      latest.matrix_id, latest.scheduled_cycle,
                      latest.market_data_time, latest.first_observed_at,
                      latest.received_row_count, latest.retained_row_count,
-                     latest.model_version
+                     latest.model_version, latest.policy_sha256,
+                     latest.configuration_sha256, latest.current_policy
             ORDER BY latest.underlying
             """,
-            (configuration.policy_sha256, session_date, session_date),
+            (
+                configuration.policy_sha256,
+                configuration.configuration_sha256,
+                session_date,
+                session_date,
+            ),
         )
         summaries = [dict(row) for row in cursor.fetchall()]
         if summaries and requested not in {row["underlying"] for row in summaries}:
@@ -840,6 +1101,13 @@ def option_flow(
         observed_at=newest_observed,
         model_version=(selected_summary or {}).get("model_version"),
         data={
+            "serving_mode": (
+                "CURRENT_POLICY"
+                if selected_summary and selected_summary["current_policy"]
+                else "HISTORICAL_PREVIOUS_POLICY"
+            ),
+            "active_policy_sha256": configuration.policy_sha256,
+            "active_configuration_sha256": configuration.configuration_sha256,
             "underlyers": summaries,
             "selected": requested,
             "session_date": (
@@ -893,6 +1161,7 @@ def option_data_quality(
     configuration = _configuration()
     contract_policy = configuration.policy.contract_filter
     model_policy = configuration.policy.model_quality
+    valuation_policy = configuration.valuation_policy
     with get_db_cursor() as cursor:
         if not _schema_available(cursor):
             return _envelope(available=False, reason="MIGRATION_015_NOT_APPLIED", data={})
@@ -1024,14 +1293,14 @@ def option_data_quality(
                     "label": "Source freshness",
                     "detail": (
                         "Option mark no older than "
-                        f"{model_policy.maximum_developer_source_age_seconds // 60} minutes."
+                        f"{valuation_policy.maximum_source_age_seconds // 60} minutes."
                     ),
                 },
                 {
                     "label": "Option/spot skew",
                     "detail": (
                         "Prior underlying minute close within "
-                        f"{model_policy.maximum_option_spot_skew_seconds} seconds."
+                        f"{valuation_policy.maximum_option_spot_skew_seconds} seconds."
                     ),
                 },
                 {
@@ -1043,6 +1312,22 @@ def option_data_quality(
                     ),
                 },
             ],
+            "valuation_policy": {
+                "version": valuation_policy.policy_version,
+                "sha256": valuation_policy.policy_sha256,
+                "primary_model_mark_source": (
+                    valuation_policy.primary_model_mark_source.value
+                ),
+                "allowed_entry_mark_sources": [
+                    source.value
+                    for source in valuation_policy.allowed_entry_mark_sources
+                ],
+                "allowed_exit_mark_sources": [
+                    source.value
+                    for source in valuation_policy.allowed_exit_mark_sources
+                ],
+                "slippage_model": valuation_policy.slippage_model,
+            },
             "unknown_reference_gate": {
                 "maximum_count": contract_policy.maximum_unknown_references,
                 "maximum_fraction": float(
@@ -1225,13 +1510,21 @@ def option_candidates(    underlyer: str | None = None,
         cursor.execute(
             f"""
             WITH latest AS (
-                SELECT DISTINCT ON (underlying)
-                    underlying, matrix_id
-                FROM option_strategy_candidates
-                WHERE policy_sha256 = %s
-                                    AND market_data_time <= NOW()
-                                    AND observed_time <= NOW()
-                ORDER BY underlying, market_data_time DESC, observed_time DESC
+                SELECT DISTINCT ON (candidate.underlying)
+                    candidate.underlying, candidate.matrix_id,
+                    (
+                        analysis.policy_sha256 = %s
+                        AND ingestion.configuration_sha256 = %s
+                    ) AS current_policy
+                FROM option_strategy_candidates AS candidate
+                JOIN option_analysis_runs AS analysis USING (matrix_id)
+                JOIN option_ingestion_runs AS ingestion USING (batch_id)
+                WHERE candidate.policy_sha256 = %s
+                  AND candidate.market_data_time <= NOW()
+                  AND candidate.observed_time <= NOW()
+                ORDER BY candidate.underlying, current_policy DESC,
+                         candidate.market_data_time DESC,
+                         candidate.observed_time DESC
             )
             SELECT
                 COUNT(*) AS total,
@@ -1242,22 +1535,35 @@ def option_candidates(    underlyer: str | None = None,
             JOIN latest USING (underlying, matrix_id)
             WHERE {summary_where_sql}
             """,
-            (configuration.strategy_policy_sha256, *params),
+            (
+                configuration.policy_sha256,
+                configuration.configuration_sha256,
+                configuration.strategy_policy_sha256,
+                *params,
+            ),
         )
         status_counts = dict(cursor.fetchone())
         total = status_counts[status.lower()] if status else status_counts["total"]
         cursor.execute(
             f"""
             WITH latest AS (
-                SELECT DISTINCT ON (underlying)
-                    underlying, matrix_id
-                FROM option_strategy_candidates
-                WHERE policy_sha256 = %s
-                                    AND market_data_time <= NOW()
-                                    AND observed_time <= NOW()
-                ORDER BY underlying, market_data_time DESC, observed_time DESC
+                SELECT DISTINCT ON (candidate.underlying)
+                    candidate.underlying, candidate.matrix_id,
+                    (
+                        analysis.policy_sha256 = %s
+                        AND ingestion.configuration_sha256 = %s
+                    ) AS current_policy
+                FROM option_strategy_candidates AS candidate
+                JOIN option_analysis_runs AS analysis USING (matrix_id)
+                JOIN option_ingestion_runs AS ingestion USING (batch_id)
+                WHERE candidate.policy_sha256 = %s
+                  AND candidate.market_data_time <= NOW()
+                  AND candidate.observed_time <= NOW()
+                ORDER BY candidate.underlying, current_policy DESC,
+                         candidate.market_data_time DESC,
+                         candidate.observed_time DESC
             )
-            SELECT candidate.*, registry.display_name,
+            SELECT candidate.*, latest.current_policy, registry.display_name,
                    registry.presentation_metadata,
                      source_contract.contract_id AS source_contract_id,
                      source_contract.contract_ticker AS source_contract_ticker,
@@ -1279,6 +1585,8 @@ def option_candidates(    underlyer: str | None = None,
                                'local_gamma', leg.local_gamma,
                                'source_market_time', leg.source_market_time,
                                'mark_source', leg.mark_source,
+                               'valuation_policy_version', leg.valuation_policy_version,
+                               'valuation_policy_sha256', leg.valuation_policy_sha256,
                                'quality_flags', leg.quality_flags,
                                'quote_bid', leg.quote_bid,
                                'quote_ask', leg.quote_ask,
@@ -1299,8 +1607,9 @@ def option_candidates(    underlyer: str | None = None,
                             ON source_contract.contract_id =
                                  (candidate.rank_components->>'contract_id')::BIGINT
             WHERE {where_sql}
-            GROUP BY candidate.candidate_id, registry.strategy_name,
-                                         registry.strategy_version, source_contract.contract_id
+            GROUP BY candidate.candidate_id, latest.current_policy,
+                     registry.strategy_name, registry.strategy_version,
+                     source_contract.contract_id
             ORDER BY
                 CASE candidate.status
                     WHEN 'SELECTED' THEN 0 WHEN 'SUPPRESSED' THEN 1 ELSE 2
@@ -1311,9 +1620,23 @@ def option_candidates(    underlyer: str | None = None,
                 candidate.candidate_id
             LIMIT %s OFFSET %s
             """,
-            (configuration.strategy_policy_sha256, *filtered_params, limit, offset),
+            (
+                configuration.policy_sha256,
+                configuration.configuration_sha256,
+                configuration.strategy_policy_sha256,
+                *filtered_params,
+                limit,
+                offset,
+            ),
         )
-        rows = cursor.fetchall()
+        rows = [dict(row) for row in cursor.fetchall()]
+    serving_mode = (
+        "CURRENT_POLICY"
+        if rows and all(row["current_policy"] for row in rows)
+        else "HISTORICAL_PREVIOUS_POLICY"
+    )
+    for row in rows:
+        row.pop("current_policy", None)
     newest_market = max((row["market_data_time"] for row in rows), default=None)
     newest_observed = max((row["observed_time"] for row in rows), default=None)
     return _envelope(
@@ -1324,6 +1647,8 @@ def option_candidates(    underlyer: str | None = None,
         policy_sha256=configuration.strategy_policy_sha256,
         model_version=rows[0]["model_version"] if rows else None,
         data={
+            "serving_mode": serving_mode,
+            "active_policy_sha256": configuration.policy_sha256,
             "title": "Weekly Research Candidates",
             "rows": rows,
             "total": total,
@@ -1347,69 +1672,11 @@ def option_opportunities(
 ) -> OptionsEnvelope:
     configuration = _configuration()
     requested_underlyer = underlyer.strip().upper() if underlyer else None
-    underlyer_clause = "AND candidate.underlying = %s" if requested_underlyer else ""
-    underlyer_params = [requested_underlyer] if requested_underlyer else []
-    opportunity_ctes = """
-            WITH policy_candidates AS MATERIALIZED (
-                SELECT candidate.*
-                FROM option_strategy_candidates AS candidate
-                WHERE candidate.policy_sha256 = %s
-                  AND candidate.market_data_time <= NOW()
-                  AND candidate.observed_time <= NOW()
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM option_candidate_legs AS causal_leg
-                      WHERE causal_leg.candidate_id = candidate.candidate_id
-                        AND (
-                            causal_leg.source_market_time > NOW()
-                            OR causal_leg.quote_time > NOW()
-                            OR causal_leg.underlying_quote_time > NOW()
-                        )
-                  )
-            ), candidate_contracts AS MATERIALIZED (
-                SELECT candidate.candidate_id, candidate.matrix_id,
-                       candidate.status, candidate.market_data_time,
-                       candidate.observed_time, leg.contract_id
-                FROM policy_candidates AS candidate
-                JOIN option_candidate_legs AS leg
-                  ON leg.candidate_id = candidate.candidate_id
-                UNION
-                SELECT candidate.candidate_id, candidate.matrix_id,
-                       candidate.status, candidate.market_data_time,
-                       candidate.observed_time,
-                       (candidate.rank_components->>'contract_id')::BIGINT
-                FROM policy_candidates AS candidate
-                WHERE candidate.rank_components->>'contract_id' IS NOT NULL
-            ), first_selected_contracts AS MATERIALIZED (
-                SELECT DISTINCT ON (contract_id)
-                       contract_id, matrix_id, market_data_time, observed_time
-                FROM candidate_contracts
-                WHERE status = 'SELECTED'
-                ORDER BY contract_id, market_data_time, observed_time, matrix_id
-            )
-    """
-    first_matrix_contract_clause = """
-                NOT EXISTS (
-                    SELECT 1
-                    FROM candidate_contracts AS current_contract
-                    JOIN first_selected_contracts AS first_contract
-                      USING (contract_id)
-                    WHERE current_contract.candidate_id = candidate.candidate_id
-                      AND first_contract.matrix_id <> candidate.matrix_id
-                      AND (
-                          first_contract.market_data_time < candidate.market_data_time
-                          OR (
-                              first_contract.market_data_time = candidate.market_data_time
-                              AND first_contract.observed_time < candidate.observed_time
-                          )
-                      )
-                )
-    """
     with get_db_cursor() as cursor:
-        if not _strategy_schema_available(cursor):
+        if not _strategy_schema_available(cursor) or not _board_schema_available(cursor):
             return _envelope(
                 available=False,
-                reason="MIGRATION_016_NOT_APPLIED",
+                reason="BOARD_PUBLICATION_SCHEMA_UNAVAILABLE",
                 policy_sha256=configuration.strategy_policy_sha256,
                 data={
                     "underlyers": [],
@@ -1419,158 +1686,188 @@ def option_opportunities(
                         configuration.settings.underlyers
                     ),
                     "covered_underlyer_count": 0,
-                    "selection_basis": "BACKEND_STRATEGY_RANK",
+                    "selection_basis": "IMMUTABLE_BOARD_PUBLICATION",
                     "execution_mode": "READ_ONLY_RESEARCH",
                 },
             )
         cursor.execute(
-            f"""
-            {opportunity_ctes}, latest AS (
-                SELECT DISTINCT ON (candidate.underlying)
-                    candidate.underlying, candidate.matrix_id
-                FROM policy_candidates AS candidate
-                ORDER BY candidate.underlying,
-                         candidate.market_data_time DESC,
-                         candidate.observed_time DESC,
-                         candidate.matrix_id DESC
-            )
-            SELECT candidate.underlying, candidate.matrix_id,
-                   analysis.status AS analysis_status,
-                   MAX(candidate.market_data_time) AS market_data_time,
-                   MAX(candidate.observed_time) AS observed_time,
-                   EXTRACT(EPOCH FROM (NOW() - MAX(candidate.market_data_time)))
-                       AS matrix_age_seconds,
-                   COUNT(*) FILTER (
-                       WHERE candidate.status = 'SELECTED'
-                         AND candidate.candidate_kind <> 'RESEARCH_ONLY'
-                   ) AS structured_count,
-                   COUNT(*) FILTER (
-                       WHERE candidate.status = 'SELECTED'
-                         AND candidate.candidate_kind = 'RESEARCH_ONLY'
-                   ) AS research_count,
-                   COUNT(*) FILTER (
-                       WHERE candidate.status = 'SUPPRESSED'
-                   ) AS suppressed_count,
-                   COUNT(signal.event_id) AS recommendation_count,
-                   COUNT(signal.event_id) FILTER (
-                       WHERE signal.status = 'BLOCKED'
-                   ) AS blocked_count
-            FROM policy_candidates AS candidate
-            JOIN latest USING (underlying, matrix_id)
-            JOIN option_analysis_runs AS analysis USING (matrix_id)
-                        LEFT JOIN option_signal_occurrences AS signal_occurrence
-                            ON signal_occurrence.source_candidate_id = candidate.candidate_id
-                        LEFT JOIN option_signal_events AS signal
-                            ON signal.event_id = signal_occurrence.event_id
-            WHERE {first_matrix_contract_clause} {underlyer_clause}
-            GROUP BY candidate.underlying, candidate.matrix_id, analysis.status
-            ORDER BY candidate.underlying
+            """
+            SELECT *
+            FROM option_board_publications
+            WHERE status = 'COMPLETE'
+              AND strategy_policy_sha256 = %s
+              AND selector_sha256 = %s
+                        ORDER BY (configuration_sha256 = %s) DESC,
+                                         scheduled_cycle DESC, published_at DESC
+            LIMIT 1
             """,
             (
                 configuration.strategy_policy_sha256,
+                BOARD_SELECTOR_SHA256,
+                configuration.configuration_sha256,
+            ),
+        )
+        publication = cursor.fetchone()
+        if not publication:
+            return _envelope(
+                available=False,
+                reason="NO_COMPLETE_BOARD_PUBLICATION",
+                policy_sha256=configuration.strategy_policy_sha256,
+                data={
+                    "underlyers": [],
+                    "structured": [],
+                    "research_highlights": [],
+                    "configured_underlyer_count": len(
+                        configuration.settings.underlyers
+                    ),
+                    "covered_underlyer_count": 0,
+                    "selection_basis": "IMMUTABLE_BOARD_PUBLICATION",
+                    "selector_version": BOARD_SELECTOR_VERSION,
+                    "selector_sha256": BOARD_SELECTOR_SHA256,
+                    "execution_mode": "READ_ONLY_RESEARCH",
+                },
+            )
+        underlyer_clause = "AND analysis.underlying = %s" if requested_underlyer else ""
+        underlyer_params = [requested_underlyer] if requested_underlyer else []
+        cursor.execute(
+            f"""
+            WITH source_matrices AS (
+                SELECT UNNEST(%s::UUID[]) AS matrix_id
+            )
+            SELECT analysis.underlying, analysis.matrix_id,
+                   analysis.status AS analysis_status,
+                   analysis.market_time AS market_data_time,
+                   analysis.observed_time,
+                   EXTRACT(EPOCH FROM (NOW() - analysis.market_time))
+                       AS matrix_age_seconds,
+                   COUNT(member.candidate_id) FILTER (
+                       WHERE member.board_position <= %s
+                         AND member.candidate_kind <> 'RESEARCH_ONLY'
+                   ) AS structured_count,
+                   COUNT(member.candidate_id) FILTER (
+                       WHERE member.board_position <= %s
+                         AND member.candidate_kind = 'RESEARCH_ONLY'
+                   ) AS research_count,
+                   (
+                       SELECT COUNT(*)
+                       FROM option_strategy_candidates AS suppressed
+                       WHERE suppressed.matrix_id = analysis.matrix_id
+                         AND suppressed.status = 'SUPPRESSED'
+                   ) AS suppressed_count,
+                   COUNT(DISTINCT signal.event_id) FILTER (
+                       WHERE member.board_position <= %s
+                   ) AS recommendation_count,
+                   COUNT(DISTINCT signal.event_id) FILTER (
+                       WHERE member.board_position <= %s
+                         AND signal.status = 'BLOCKED'
+                   ) AS blocked_count
+            FROM source_matrices
+            JOIN option_analysis_runs AS analysis USING (matrix_id)
+            LEFT JOIN option_board_members AS member
+              ON member.publication_id = %s
+             AND member.source_matrix_id = analysis.matrix_id
+            LEFT JOIN option_signal_occurrences AS signal_occurrence
+              ON signal_occurrence.source_candidate_id = member.candidate_id
+            LEFT JOIN option_signal_events AS signal
+              ON signal.event_id = signal_occurrence.event_id
+            WHERE TRUE {underlyer_clause}
+            GROUP BY analysis.underlying, analysis.matrix_id, analysis.status,
+                     analysis.market_time, analysis.observed_time
+            ORDER BY analysis.underlying
+            """,
+            (
+                publication["source_matrix_ids"],
+                per_strategy,
+                per_strategy,
+                per_strategy,
+                per_strategy,
+                publication["publication_id"],
                 *underlyer_params,
             ),
         )
         underlyers = cursor.fetchall()
         cursor.execute(
             f"""
-            {opportunity_ctes}, latest AS (
-                SELECT DISTINCT ON (candidate.underlying)
-                    candidate.underlying, candidate.matrix_id
-                FROM policy_candidates AS candidate
-                ORDER BY candidate.underlying,
-                         candidate.market_data_time DESC,
-                         candidate.observed_time DESC,
-                         candidate.matrix_id DESC
-            ), ranked AS (
-                SELECT candidate.*, registry.display_name,
+            SELECT candidate.*, registry.display_name,
                        registry.presentation_metadata,
                        source_contract.contract_id AS source_contract_id,
                        source_contract.contract_ticker AS source_contract_ticker,
                        signal.event_id AS signal_id,
                        signal.status AS signal_status,
                        signal.blocked_reasons AS signal_blocked_reasons,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY candidate.underlying,
-                                        candidate.strategy_name,
-                                        candidate.candidate_kind
-                           ORDER BY candidate.candidate_rank,
-                                    candidate.candidate_id
-                       ) AS strategy_position
-                FROM policy_candidates AS candidate
-                JOIN latest USING (underlying, matrix_id)
-                JOIN option_strategy_registry AS registry
+                       member.board_position AS strategy_position,
+                       member.raw_candidate_rank,
+                       member.selection_evidence AS board_selection_evidence,
+                       CASE
+                           WHEN candidate.valid_until IS NULL THEN 'UNBOUNDED'
+                           WHEN candidate.valid_until > NOW() THEN 'ACTIVE'
+                           ELSE 'ELAPSED'
+                       END AS window_state,
+                       COALESCE(
+                           (
+                               SELECT jsonb_agg(
+                                   jsonb_build_object(
+                                       'leg_index', leg.leg_index,
+                                       'contract_id', leg.contract_id,
+                                       'contract_ticker', leg.contract_ticker,
+                                       'side', leg.side,
+                                       'ratio', leg.ratio,
+                                       'multiplier', leg.multiplier,
+                                       'expiration_date', leg.expiration_date,
+                                       'strike', leg.strike,
+                                       'contract_type', leg.contract_type,
+                                       'model_mark', leg.model_mark,
+                                       'local_iv', leg.local_iv,
+                                       'local_delta', leg.local_delta,
+                                       'local_gamma', leg.local_gamma,
+                                       'local_theta_per_day', leg.local_theta_per_day,
+                                       'local_vega_per_vol_point', leg.local_vega_per_vol_point,
+                                       'local_rho_per_rate_point', leg.local_rho_per_rate_point,
+                                       'spot', leg.spot,
+                                       'day_volume', entry_snapshot.day_volume,
+                                       'open_interest', entry_snapshot.open_interest,
+                                       'source_market_time', leg.source_market_time,
+                                       'mark_source', leg.mark_source,
+                                       'valuation_policy_version', leg.valuation_policy_version,
+                                       'valuation_policy_sha256', leg.valuation_policy_sha256,
+                                       'quality_flags', leg.quality_flags,
+                                       'quote_bid', leg.quote_bid,
+                                       'quote_ask', leg.quote_ask,
+                                       'quote_midpoint', leg.quote_midpoint,
+                                       'quote_spread_midpoint', leg.quote_spread_midpoint
+                                   ) ORDER BY leg.leg_index
+                               )
+                               FROM option_candidate_legs AS leg
+                               LEFT JOIN option_chain_snapshots AS entry_snapshot
+                                 ON entry_snapshot.snapshot_id = leg.snapshot_id
+                               WHERE leg.candidate_id = candidate.candidate_id
+                           ),
+                           '[]'::jsonb
+                       ) AS legs
+            FROM option_board_members AS member
+            JOIN option_strategy_candidates AS candidate USING (candidate_id)
+            JOIN option_strategy_registry AS registry
                   ON registry.strategy_name = candidate.strategy_name
                  AND registry.strategy_version = candidate.strategy_version
-                                LEFT JOIN option_signal_occurrences AS signal_occurrence
-                                    ON signal_occurrence.source_candidate_id = candidate.candidate_id
-                                LEFT JOIN option_signal_events AS signal
-                                    ON signal.event_id = signal_occurrence.event_id
-                                LEFT JOIN option_contract_catalog AS source_contract
-                                    ON source_contract.contract_id =
-                                         (candidate.rank_components->>'contract_id')::BIGINT
-                WHERE candidate.status = 'SELECTED'
-                  AND {first_matrix_contract_clause}
-                  {underlyer_clause}
-            )
-            SELECT ranked.*,
-                   CASE
-                       WHEN ranked.valid_until IS NULL THEN 'UNBOUNDED'
-                       WHEN ranked.valid_until > NOW() THEN 'ACTIVE'
-                       ELSE 'ELAPSED'
-                   END AS window_state,
-                   COALESCE(
-                       (
-                           SELECT jsonb_agg(
-                               jsonb_build_object(
-                                   'leg_index', leg.leg_index,
-                                   'contract_id', leg.contract_id,
-                                   'contract_ticker', leg.contract_ticker,
-                                   'side', leg.side,
-                                   'ratio', leg.ratio,
-                                   'multiplier', leg.multiplier,
-                                   'expiration_date', leg.expiration_date,
-                                   'strike', leg.strike,
-                                   'contract_type', leg.contract_type,
-                                   'model_mark', leg.model_mark,
-                                   'local_iv', leg.local_iv,
-                                   'local_delta', leg.local_delta,
-                                   'local_gamma', leg.local_gamma,
-                                   'local_theta_per_day', leg.local_theta_per_day,
-                                   'local_vega_per_vol_point', leg.local_vega_per_vol_point,
-                                   'local_rho_per_rate_point', leg.local_rho_per_rate_point,
-                                   'spot', leg.spot,
-                                   'day_volume', entry_snapshot.day_volume,
-                                   'open_interest', entry_snapshot.open_interest,
-                                   'source_market_time', leg.source_market_time,
-                                   'mark_source', leg.mark_source,
-                                   'quality_flags', leg.quality_flags,
-                                   'quote_bid', leg.quote_bid,
-                                   'quote_ask', leg.quote_ask,
-                                   'quote_midpoint', leg.quote_midpoint,
-                                   'quote_spread_midpoint', leg.quote_spread_midpoint
-                               ) ORDER BY leg.leg_index
-                           )
-                           FROM option_candidate_legs AS leg
-                           LEFT JOIN option_chain_snapshots AS entry_snapshot
-                             ON entry_snapshot.snapshot_id = leg.snapshot_id
-                           WHERE leg.candidate_id = ranked.candidate_id
-                       ),
-                       '[]'::jsonb
-                   ) AS legs
-            FROM ranked
-            WHERE ranked.strategy_position <= %s
+            LEFT JOIN option_signal_occurrences AS signal_occurrence
+              ON signal_occurrence.source_candidate_id = candidate.candidate_id
+            LEFT JOIN option_signal_events AS signal
+              ON signal.event_id = signal_occurrence.event_id
+            LEFT JOIN option_contract_catalog AS source_contract
+              ON source_contract.contract_id =
+                   (candidate.rank_components->>'contract_id')::BIGINT
+            WHERE member.publication_id = %s
+              AND member.board_position <= %s
+              {"AND candidate.underlying = %s" if requested_underlyer else ""}
             ORDER BY
-                CASE WHEN ranked.candidate_kind = 'RESEARCH_ONLY' THEN 1 ELSE 0 END,
-                ranked.candidate_rank,
-                ranked.underlying,
-                ranked.strategy_name,
-                ranked.candidate_id
+                CASE WHEN candidate.candidate_kind = 'RESEARCH_ONLY' THEN 1 ELSE 0 END,
+                member.board_position, candidate.underlying,
+                candidate.strategy_name, candidate.candidate_id
             """,
             (
-                configuration.strategy_policy_sha256,
-                *underlyer_params,
+                publication["publication_id"],
                 per_strategy,
+                *underlyer_params,
             ),
         )
         rows = cursor.fetchall()
@@ -1580,19 +1877,11 @@ def option_opportunities(
     research_highlights = [
         row for row in rows if row["candidate_kind"] == "RESEARCH_ONLY"
     ]
-    newest_market = max(
-        (row["market_data_time"] for row in underlyers),
-        default=None,
-    )
-    newest_observed = max(
-        (row["observed_time"] for row in underlyers),
-        default=None,
-    )
     return _envelope(
         available=bool(underlyers),
-        reason=None if underlyers else "NO_OPPORTUNITY_RESULTS",
-        as_of=newest_market,
-        observed_at=newest_observed,
+        reason=None if underlyers else "NO_PUBLISHED_UNDERLYING",
+        as_of=publication["market_data_time"],
+        observed_at=publication["observed_time"],
         policy_sha256=configuration.strategy_policy_sha256,
         model_version=(rows[0]["model_version"] if rows else None),
         data={
@@ -1600,9 +1889,381 @@ def option_opportunities(
             "structured": structured,
             "research_highlights": research_highlights,
             "configured_underlyer_count": len(configuration.settings.underlyers),
-            "covered_underlyer_count": len(underlyers),
-            "selection_basis": "BACKEND_STRATEGY_RANK",
+            "covered_underlyer_count": publication["covered_underlying_count"],
+            "selection_basis": "IMMUTABLE_BOARD_PUBLICATION",
+            "publication_id": publication["publication_id"],
+            "scheduled_cycle": publication["scheduled_cycle"],
+            "published_at": publication["published_at"],
+            "selector_version": publication["selector_version"],
+            "selector_sha256": publication["selector_sha256"],
+            "selection_evidence": publication["selection_evidence"],
+            "serving_mode": (
+                "CURRENT_POLICY"
+                if publication.get("configuration_sha256")
+                    == configuration.configuration_sha256
+                else "HISTORICAL_PREVIOUS_POLICY"
+            ),
+            "active_configuration_sha256": configuration.configuration_sha256,
             "execution_mode": "READ_ONLY_RESEARCH",
+        },
+    )
+
+
+@router.get("/screener", response_model=OptionsEnvelope)
+def option_screener(
+    session_date: date | None = None,
+    scope: Literal["ALL", "STRUCTURED", "RESEARCH", "BOARD"] = "ALL",
+    underlyer: str | None = None,
+    contract_type: Literal["CALL", "PUT"] | None = None,
+    strategy: str | None = None,
+    minimum_dte: int = Query(default=0, ge=0, le=365),
+    maximum_dte: int = Query(default=60, ge=0, le=365),
+    minimum_volume: int = Query(default=0, ge=0),
+    minimum_open_interest: int = Query(default=0, ge=0),
+    minimum_volume_oi_ratio: float = Query(default=0, ge=0),
+    sort: Literal[
+        "PREMIUM_ACTIVITY", "VOLUME", "OPEN_INTEREST",
+        "VOLUME_OI", "OI_CHANGE", "IV",
+    ] = "PREMIUM_ACTIVITY",
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> OptionsEnvelope:
+    if maximum_dte < minimum_dte:
+        return _envelope(
+            available=False,
+            reason="INVALID_DTE_RANGE",
+            data={"rows": [], "underlyers": [], "total": 0, "limit": limit, "offset": offset},
+        )
+    configuration = _configuration()
+    normalized_underlyer = underlyer.strip().upper() if underlyer else None
+    normalized_strategy = strategy.strip().upper() if strategy else None
+    sort_sql = {
+        "PREMIUM_ACTIVITY": "premium_activity DESC NULLS LAST",
+        "VOLUME": "day_volume DESC NULLS LAST",
+        "OPEN_INTEREST": "open_interest DESC NULLS LAST",
+        "VOLUME_OI": "volume_open_interest_ratio DESC NULLS LAST",
+        "OI_CHANGE": "ABS(open_interest_change) DESC NULLS LAST",
+        "IV": "local_iv DESC NULLS LAST",
+    }[sort]
+    with get_db_cursor() as cursor:
+        if not _strategy_schema_available(cursor) or not _board_schema_available(cursor):
+            return _envelope(
+                available=False,
+                reason="BOARD_PUBLICATION_SCHEMA_UNAVAILABLE",
+                data={
+                    "rows": [],
+                    "underlyers": list(configuration.settings.underlyers),
+                    "total": 0,
+                    "limit": limit,
+                    "offset": offset,
+                },
+            )
+        query = f"""
+            WITH latest_matrices AS MATERIALIZED (
+                SELECT DISTINCT ON (candidate.underlying)
+                       candidate.underlying, candidate.matrix_id,
+                       candidate.market_data_time, candidate.observed_time,
+                       (
+                           analysis.policy_sha256 = %s
+                           AND ingestion.configuration_sha256 = %s
+                       ) AS current_policy
+                FROM option_strategy_candidates AS candidate
+                JOIN option_analysis_runs AS analysis USING (matrix_id)
+                JOIN option_ingestion_runs AS ingestion USING (batch_id)
+                WHERE candidate.policy_sha256 = %s
+                  AND candidate.market_data_time <= NOW()
+                  AND candidate.observed_time <= NOW()
+                  AND (
+                      %s::date IS NULL
+                      OR (candidate.market_data_time AT TIME ZONE 'America/New_York')::date
+                          = %s::date
+                  )
+                ORDER BY candidate.underlying, current_policy DESC,
+                         candidate.market_data_time DESC,
+                         candidate.observed_time DESC, candidate.matrix_id DESC
+            ), latest_publication AS (
+                SELECT publication_id
+                FROM option_board_publications
+                                WHERE status = 'COMPLETE'
+                  AND strategy_policy_sha256 = %s
+                  AND selector_sha256 = %s
+                  AND (
+                      %s::date IS NULL
+                      OR as_of_session = %s::date
+                  )
+                ORDER BY (configuration_sha256 = %s) DESC,
+                         scheduled_cycle DESC, published_at DESC
+                LIMIT 1
+            ), candidate_pool AS MATERIALIZED (
+                  SELECT candidate.*,
+                       board.board_position,
+                      board.publication_id AS board_publication_id,
+                      latest.current_policy
+                FROM option_strategy_candidates AS candidate
+                JOIN latest_matrices AS latest USING (matrix_id)
+                LEFT JOIN option_board_members AS board
+                                    ON board.candidate_id = candidate.candidate_id
+                                 AND board.publication_id =
+                                         (SELECT publication_id FROM latest_publication)
+                WHERE %s <> 'BOARD'
+                  AND candidate.status = 'SELECTED'
+                  AND (
+                      %s = 'ALL'
+                      OR %s = 'STRUCTURED'
+                         AND candidate.candidate_kind <> 'RESEARCH_ONLY'
+                      OR %s = 'RESEARCH'
+                         AND candidate.candidate_kind = 'RESEARCH_ONLY'
+                  )
+                  AND (%s IS NULL OR candidate.underlying = %s)
+                  AND (%s IS NULL OR candidate.strategy_name = %s)
+                UNION ALL
+                  SELECT candidate.*,
+                       board.board_position,
+                      board.publication_id AS board_publication_id,
+                      COALESCE(
+                          (SELECT configuration_sha256 = %s
+                        FROM option_board_publications
+                        WHERE publication_id = board.publication_id),
+                          FALSE
+                      ) AS current_policy
+                FROM option_board_members AS board
+                JOIN option_strategy_candidates AS candidate USING (candidate_id)
+                    WHERE board.publication_id =
+                        (SELECT publication_id FROM latest_publication)
+                  AND %s = 'BOARD'
+                  AND (%s IS NULL OR candidate.underlying = %s)
+                  AND (%s IS NULL OR candidate.strategy_name = %s)
+            ), detected AS MATERIALIZED (
+                SELECT candidate.candidate_id, candidate.matrix_id,
+                       candidate.underlying, candidate.strategy_name,
+                       candidate.candidate_kind, candidate.candidate_rank,
+                       candidate.board_position, candidate.board_publication_id,
+                       candidate.current_policy,
+                       leg.snapshot_id, leg.contract_id
+                FROM candidate_pool AS candidate
+                JOIN option_candidate_legs AS leg USING (candidate_id)
+                UNION ALL
+                SELECT candidate.candidate_id, candidate.matrix_id,
+                       candidate.underlying, candidate.strategy_name,
+                       candidate.candidate_kind, candidate.candidate_rank,
+                       candidate.board_position, candidate.board_publication_id,
+                       candidate.current_policy,
+                       snapshot.snapshot_id, snapshot.contract_id
+                FROM candidate_pool AS candidate
+                JOIN option_analysis_runs AS analysis USING (matrix_id)
+                JOIN option_chain_snapshots AS snapshot
+                  ON snapshot.batch_id = analysis.batch_id
+                 AND snapshot.contract_id =
+                     (candidate.rank_components->>'contract_id')::BIGINT
+                WHERE candidate.candidate_kind = 'RESEARCH_ONLY'
+                  AND candidate.rank_components->>'contract_id' IS NOT NULL
+            ), grouped AS (
+                SELECT snapshot.snapshot_id, snapshot.contract_id,
+                       snapshot.contract_ticker, snapshot.underlying,
+                       snapshot.contract_type, snapshot.expiration_date,
+                       snapshot.calendar_dte, snapshot.strike, snapshot.spot,
+                       snapshot.model_mark, snapshot.display_mark,
+                       snapshot.day_volume, snapshot.open_interest,
+                       snapshot.local_iv, snapshot.local_delta,
+                       snapshot.local_gamma, snapshot.market_data_time,
+                       snapshot.first_observed_at, snapshot.shares_per_contract,
+                       ARRAY_AGG(DISTINCT detected.strategy_name
+                                 ORDER BY detected.strategy_name) AS strategy_names,
+                       COUNT(DISTINCT detected.candidate_id) AS candidate_count,
+                       COUNT(DISTINCT detected.candidate_id) FILTER (
+                           WHERE detected.candidate_kind <> 'RESEARCH_ONLY'
+                       ) AS structured_candidate_count,
+                       COUNT(DISTINCT detected.candidate_id) FILTER (
+                           WHERE detected.candidate_kind = 'RESEARCH_ONLY'
+                       ) AS research_candidate_count,
+                       MIN(detected.candidate_rank) AS best_candidate_rank,
+                       MIN(detected.board_position) AS board_position,
+                       MIN(detected.board_publication_id::TEXT)::UUID
+                           AS board_publication_id,
+                       BOOL_AND(detected.current_policy) AS current_policy
+                FROM detected
+                JOIN option_chain_snapshots AS snapshot USING (snapshot_id)
+                GROUP BY snapshot.snapshot_id, snapshot.contract_id,
+                         snapshot.contract_ticker, snapshot.underlying,
+                         snapshot.contract_type, snapshot.expiration_date,
+                         snapshot.calendar_dte, snapshot.strike, snapshot.spot,
+                         snapshot.model_mark, snapshot.display_mark,
+                         snapshot.day_volume, snapshot.open_interest,
+                         snapshot.local_iv, snapshot.local_delta,
+                         snapshot.local_gamma, snapshot.market_data_time,
+                         snapshot.first_observed_at, snapshot.shares_per_contract
+            ), oi_sessions AS (
+                SELECT underlying, settlement_session,
+                       DENSE_RANK() OVER (
+                           PARTITION BY underlying ORDER BY settlement_session DESC
+                       ) AS session_rank
+                FROM (
+                    SELECT DISTINCT underlying, settlement_session
+                    FROM option_daily_contract_facts
+                    WHERE open_interest IS NOT NULL
+                      AND open_interest_observed_session <= COALESCE(
+                          %s::date,
+                          (NOW() AT TIME ZONE 'America/New_York')::date
+                      )
+                ) AS sessions
+            ), current_oi AS (
+                SELECT fact.underlying, fact.contract_id,
+                       fact.settlement_session,
+                       COALESCE(fact.open_interest_revised_value, fact.open_interest)
+                           AS open_interest
+                FROM option_daily_contract_facts AS fact
+                JOIN oi_sessions AS session
+                  ON session.underlying = fact.underlying
+                 AND session.settlement_session = fact.settlement_session
+                 AND session.session_rank = 1
+            ), prior_oi AS (
+                SELECT fact.underlying, fact.contract_id,
+                       fact.settlement_session,
+                       COALESCE(fact.open_interest_revised_value, fact.open_interest)
+                           AS open_interest
+                FROM option_daily_contract_facts AS fact
+                JOIN oi_sessions AS session
+                  ON session.underlying = fact.underlying
+                 AND session.settlement_session = fact.settlement_session
+                 AND session.session_rank = 2
+            ), enriched AS (
+                SELECT grouped.*,
+                       COALESCE(grouped.model_mark, grouped.display_mark) AS mark,
+                       grouped.day_volume
+                           * COALESCE(grouped.model_mark, grouped.display_mark)
+                           * grouped.shares_per_contract AS premium_activity,
+                       grouped.day_volume::DOUBLE PRECISION
+                           / GREATEST(grouped.open_interest, 1)
+                           AS volume_open_interest_ratio,
+                       CASE grouped.contract_type
+                           WHEN 'CALL' THEN (grouped.strike - grouped.spot) / grouped.spot
+                           ELSE (grouped.spot - grouped.strike) / grouped.spot
+                       END AS otm_fraction,
+                       previous.mark AS previous_mark,
+                       CASE WHEN previous.mark > 0 THEN
+                           (COALESCE(grouped.model_mark, grouped.display_mark)
+                               - previous.mark) / previous.mark
+                       END AS mark_change_fraction,
+                       previous.local_iv AS previous_iv,
+                       grouped.local_iv - previous.local_iv AS iv_change,
+                       current_oi.settlement_session AS oi_settlement_session,
+                       prior_oi.settlement_session AS prior_oi_settlement_session,
+                       current_oi.open_interest - prior_oi.open_interest
+                           AS open_interest_change,
+                       CASE WHEN prior_oi.open_interest > 0 THEN
+                           (current_oi.open_interest - prior_oi.open_interest)::DOUBLE PRECISION
+                               / prior_oi.open_interest
+                       END AS open_interest_change_fraction
+                FROM grouped
+                LEFT JOIN LATERAL (
+                    SELECT COALESCE(prior.model_mark, prior.display_mark) AS mark,
+                           prior.local_iv
+                    FROM option_analysis_runs AS prior_analysis
+                    JOIN option_chain_snapshots AS prior
+                      ON prior.batch_id = prior_analysis.batch_id
+                     AND prior.contract_id = grouped.contract_id
+                    WHERE prior_analysis.underlying = grouped.underlying
+                      AND prior_analysis.status = 'COMPLETE'
+                      AND prior_analysis.market_time < grouped.market_data_time
+                    ORDER BY prior_analysis.market_time DESC,
+                             prior_analysis.observed_time DESC
+                    LIMIT 1
+                ) AS previous ON TRUE
+                LEFT JOIN current_oi
+                  ON current_oi.underlying = grouped.underlying
+                 AND current_oi.contract_id = grouped.contract_id
+                LEFT JOIN prior_oi
+                  ON prior_oi.underlying = grouped.underlying
+                 AND prior_oi.contract_id = grouped.contract_id
+            )
+            SELECT enriched.*, COUNT(*) OVER() AS filtered_total
+            FROM enriched
+            WHERE calendar_dte BETWEEN %s AND %s
+              AND (%s IS NULL OR contract_type = %s)
+              AND COALESCE(day_volume, 0) >= %s
+              AND COALESCE(open_interest, 0) >= %s
+              AND COALESCE(volume_open_interest_ratio, 0) >= %s
+            ORDER BY {sort_sql}, underlying, expiration_date, strike,
+                     contract_type, contract_id
+            LIMIT %s OFFSET %s
+        """
+        cursor.execute(
+            query,
+            (
+                configuration.policy_sha256,
+                configuration.configuration_sha256,
+                configuration.strategy_policy_sha256,
+                session_date, session_date,
+                configuration.strategy_policy_sha256,
+                BOARD_SELECTOR_SHA256,
+                session_date, session_date,
+                configuration.configuration_sha256,
+                scope, scope, scope, scope,
+                normalized_underlyer, normalized_underlyer,
+                normalized_strategy, normalized_strategy,
+                scope,
+                configuration.configuration_sha256,
+                normalized_underlyer, normalized_underlyer,
+                normalized_strategy, normalized_strategy,
+                session_date,
+                minimum_dte, maximum_dte,
+                contract_type, contract_type,
+                minimum_volume, minimum_open_interest,
+                minimum_volume_oi_ratio,
+                limit, offset,
+            ),
+        )
+        rows = [dict(row) for row in cursor.fetchall()]
+    total = int(rows[0]["filtered_total"]) if rows else 0
+    serving_mode = (
+        "CURRENT_POLICY"
+        if rows and all(row["current_policy"] for row in rows)
+        else "HISTORICAL_PREVIOUS_POLICY"
+    )
+    for row in rows:
+        row.pop("filtered_total", None)
+        row.pop("current_policy", None)
+    newest_market = max(
+        (row["market_data_time"] for row in rows), default=None
+    )
+    newest_observed = max(
+        (row["first_observed_at"] for row in rows), default=None
+    )
+    return _envelope(
+        available=bool(rows),
+        reason=None if rows else "NO_DETECTED_CONTRACTS",
+        as_of=newest_market,
+        observed_at=newest_observed,
+        policy_sha256=configuration.strategy_policy_sha256,
+        data={
+            "serving_mode": serving_mode,
+            "active_policy_sha256": configuration.policy_sha256,
+            "rows": rows,
+            "underlyers": list(configuration.settings.underlyers),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "scope": scope,
+            "session_date": session_date.isoformat() if session_date else None,
+            "sort": sort,
+            "directional_flow_available": False,
+            "quote_liquidity": "NOT_AVAILABLE",
+            "definitions": {
+                "detected_contract": (
+                    "A contract referenced by a selected structured candidate leg "
+                    "or selected research-only detector in the latest matrix."
+                ),
+                "mark_change": "Change from the same contract's prior complete matrix mark.",
+                "iv_change": "Local implied-volatility change from the prior complete matrix.",
+                "open_interest_change": (
+                    "Latest matched settlement change known by the selected session; "
+                    "it does not identify buyer or seller direction."
+                ),
+                "premium_activity": (
+                    "Day volume x latest aligned mark x multiplier; estimated activity, "
+                    "not transacted premium or executable flow."
+                ),
+            },
         },
     )
 
@@ -1704,6 +2365,39 @@ def option_candidate_detail(candidate_id: UUID) -> OptionsEnvelope:
             (str(candidate_id),),
         )
         execution_gates = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT event.market_event_id, event.event_type,
+                   event.affected_underlying, event.scheduled_time,
+                   event.source, event.source_key, event.announcement_time,
+                   event.source_observed_at, event.first_observed_at,
+                   event.confidence, event.status, event.payload_sha256
+            FROM option_context_market_event_evidence AS link
+            JOIN option_market_events AS event USING (market_event_id)
+            WHERE link.context_snapshot_id = %s
+            ORDER BY event.event_type, event.scheduled_time,
+                     event.source, event.source_key, event.market_event_id
+            """,
+            (candidate["context_snapshot_id"],),
+        )
+        market_event_evidence = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT coverage.coverage_id, coverage.event_type,
+                   coverage.affected_underlying, coverage.window_start,
+                   coverage.window_end, coverage.source, coverage.source_key,
+                   coverage.source_observed_at, coverage.first_observed_at,
+                   coverage.payload_sha256
+            FROM option_context_event_coverage_evidence AS link
+            JOIN option_event_calendar_coverage AS coverage USING (coverage_id)
+            WHERE link.context_snapshot_id = %s
+            ORDER BY coverage.event_type, coverage.affected_underlying,
+                     coverage.window_start, coverage.source, coverage.source_key,
+                     coverage.coverage_id
+            """,
+            (candidate["context_snapshot_id"],),
+        )
+        event_coverage_evidence = cursor.fetchall()
     return _envelope(
         available=True,
         as_of=candidate["market_data_time"],
@@ -1715,6 +2409,8 @@ def option_candidate_detail(candidate_id: UUID) -> OptionsEnvelope:
             "legs": legs,
             "scenarios": scenarios,
             "execution_gates": execution_gates,
+            "market_event_evidence": market_event_evidence,
+            "event_coverage_evidence": event_coverage_evidence,
             "quote_liquidity": "NOT_AVAILABLE",
             "execution_mode": "READ_ONLY_RESEARCH",
         },
@@ -1877,15 +2573,24 @@ def option_performance(
     strategy: str | None = None,
     expiration: str | None = None,
     cohort: Literal[
-        "RANK_LEADERS", "OPPORTUNITY_BOARD", "ALL_SIGNALS"
-    ] = "RANK_LEADERS",
+        "BOARD_PUBLICATIONS", "RANK_LEADERS",
+        "OPPORTUNITY_BOARD", "ALL_SIGNALS"
+    ] = "BOARD_PUBLICATIONS",
     days: int = Query(default=14, ge=1, le=60),
     limit: int = Query(default=100, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> OptionsEnvelope:
+    configuration = _configuration()
+    exact_board_cohort = cohort == "BOARD_PUBLICATIONS"
     rank_leader_cohort = cohort in {"RANK_LEADERS", "OPPORTUNITY_BOARD"}
-    normalized_cohort = "RANK_LEADERS" if rank_leader_cohort else "ALL_SIGNALS"
-    policy = delayed_proxy_commission_policy()
+    normalized_cohort = (
+        "BOARD_PUBLICATIONS"
+        if exact_board_cohort
+        else "RANK_LEADERS"
+        if rank_leader_cohort
+        else "ALL_SIGNALS"
+    )
+    policy = configuration.valuation_policy
     generated_at = datetime.now(timezone.utc)
     cutoff = generated_at - timedelta(days=days)
     clauses = [
@@ -1906,7 +2611,33 @@ def option_performance(
         JOIN option_strategy_candidates AS candidate
           ON candidate.candidate_id = signal.source_candidate_id
     """
-    if rank_leader_cohort:
+    candidate_join_params: tuple[object, ...] = ()
+    if exact_board_cohort:
+        candidate_join_sql = """
+            JOIN LATERAL (
+                SELECT member_candidate.*
+                FROM option_board_members AS member
+                JOIN option_board_publications AS publication
+                  USING (publication_id)
+                JOIN option_strategy_candidates AS member_candidate
+                  ON member_candidate.candidate_id = member.candidate_id
+                JOIN option_signal_occurrences AS board_occurrence
+                  ON board_occurrence.source_candidate_id = member.candidate_id
+                 AND board_occurrence.event_id = signal.event_id
+                WHERE member.board_position = 1
+                  AND publication.status = 'COMPLETE'
+                  AND publication.selector_sha256 = %s
+                  AND publication.strategy_policy_sha256 = %s
+                ORDER BY publication.scheduled_cycle,
+                         publication.published_at, member.candidate_id
+                LIMIT 1
+            ) AS candidate ON TRUE
+        """
+        candidate_join_params = (
+            BOARD_SELECTOR_SHA256,
+            configuration.strategy_policy_sha256,
+        )
+    elif rank_leader_cohort:
         candidate_join_sql = """
             JOIN LATERAL (
                 SELECT occurrence_candidate.*
@@ -1937,10 +2668,17 @@ def option_performance(
     current_mark_join_sql = ""
     current_mark_params: tuple[object, ...] = ()
     with get_db_cursor() as cursor:
-        if not _strategy_schema_available(cursor):
+        if (
+            not _strategy_schema_available(cursor)
+            or (exact_board_cohort and not _board_schema_available(cursor))
+        ):
             return _envelope(
                 available=False,
-                reason="MIGRATION_016_NOT_APPLIED",
+                reason=(
+                    "BOARD_PUBLICATION_SCHEMA_UNAVAILABLE"
+                    if exact_board_cohort
+                    else "MIGRATION_016_NOT_APPLIED"
+                ),
                 policy_sha256=policy.policy_sha256,
                 data={
                     "rows": [], "total": 0, "limit": limit, "offset": offset,
@@ -1951,12 +2689,20 @@ def option_performance(
                     "valuation_mode": "RESEARCH_DELAYED_PROXY",
                     "materialization_owner": "OPTION_WORKER",
                     "entry_basis": (
+                        "FIRST_PUBLISHED_BOARD_MEMBERSHIP"
+                        if exact_board_cohort
+                        else
                         "FIRST_RAW_RANK_LEADER_OCCURRENCE"
                         if rank_leader_cohort
                         else "ORIGINAL_SIGNAL_PACKAGE"
                     ),
-                    "board_membership_exact": False,
+                    "board_membership_exact": exact_board_cohort,
                     "cohort_definition": (
+                        "Candidates persisted at position one in immutable complete "
+                        "Opportunity Board publications. Coverage begins with the first "
+                        "prospective publication."
+                        if exact_board_cohort
+                        else
                         "Unique structured signal events whose raw rank was lowest "
                         "within a matrix, strategy and candidate kind. This does not "
                         "reconstruct historical Opportunity Board membership."
@@ -2042,7 +2788,7 @@ def option_performance(
              AND outcome.valuation_policy_sha256 = %s
             WHERE {where_sql}
             """,
-            (policy.policy_sha256, *params),
+            (*candidate_join_params, policy.policy_sha256, *params),
         )
         summary = dict(cursor.fetchone())
         cursor.execute(
@@ -2064,7 +2810,7 @@ def option_performance(
                 WHEN '15MIN' THEN 1 WHEN '30MIN' THEN 2 WHEN '60MIN' THEN 3
                 WHEN 'CLOSE' THEN 4 WHEN 'NEXT_OPEN' THEN 5 ELSE 6 END
             """,
-            (policy.policy_sha256, *params),
+            (*candidate_join_params, policy.policy_sha256, *params),
         )
         measurement_summary = [dict(row) for row in cursor.fetchall()]
         cursor.execute(
@@ -2149,7 +2895,14 @@ def option_performance(
             ORDER BY candidate.market_data_time DESC, signal.event_id
             LIMIT %s OFFSET %s
             """,
-            (policy.policy_sha256, *current_mark_params, *params, limit, offset),
+            (
+                policy.policy_sha256,
+                *candidate_join_params,
+                *current_mark_params,
+                *params,
+                limit,
+                offset,
+            ),
         )
         rows = [dict(row) for row in cursor.fetchall()]
 
@@ -2184,12 +2937,20 @@ def option_performance(
             "valuation_mode": "RESEARCH_DELAYED_PROXY",
             "materialization_owner": "OPTION_WORKER",
             "entry_basis": (
+                "FIRST_PUBLISHED_BOARD_MEMBERSHIP"
+                if exact_board_cohort
+                else
                 "FIRST_RAW_RANK_LEADER_OCCURRENCE"
                 if rank_leader_cohort
                 else "ORIGINAL_SIGNAL_PACKAGE"
             ),
-            "board_membership_exact": False,
+            "board_membership_exact": exact_board_cohort,
             "cohort_definition": (
+                "Candidates persisted at position one in immutable complete "
+                "Opportunity Board publications. Coverage begins with the first "
+                "prospective publication."
+                if exact_board_cohort
+                else
                 "Unique structured signal events whose raw rank was lowest within "
                 "a matrix, strategy and candidate kind. This does not reconstruct "
                 "historical Opportunity Board membership."
@@ -2199,4 +2960,120 @@ def option_performance(
             "navigation_revalues": False,
             "current_mark_included": current_marks_available,
         },
+    )
+
+
+@router.get("/calendar/{underlyer}", response_model=OptionsEnvelope)
+def option_event_calendar_reference(
+    underlyer: str,
+    days_forward: int = Query(default=30, ge=3, le=120),
+) -> OptionsEnvelope:
+    configuration = _configuration()
+    symbol = underlyer.strip().upper()
+    source = configuration.settings.event_calendar_provider
+    maximum_age = timedelta(
+        seconds=configuration.settings.event_calendar_max_age_seconds
+    )
+    now = datetime.now(timezone.utc)
+    decision_start = now - timedelta(days=1)
+    decision_end = now + timedelta(hours=72)
+    upcoming_end = now + timedelta(days=days_forward)
+    asset_type = _event_asset_type(
+        symbol,
+        now,
+        configuration.settings.fixed_etf_underlyers,
+    )
+    empty = {
+        "underlyer": symbol,
+        "asset_type": asset_type,
+        "configured_source": source,
+        "decision_window_start": decision_start,
+        "decision_window_end": decision_end,
+        "earnings_state": "NOT_APPLICABLE" if asset_type == "ETF" else "UNAVAILABLE",
+        "fed_state": "UNAVAILABLE",
+        "events": [],
+        "coverage": [],
+    }
+    if source is None:
+        return _envelope(
+            available=False,
+            reason="EVENT_CALENDAR_UNCONFIGURED",
+            data=empty,
+        )
+    with get_db_cursor() as cursor:
+        cursor.execute(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (source, source_key) *
+                FROM option_event_calendar_coverage
+                WHERE source = %s
+                  AND first_observed_at <= %s
+                                    AND first_observed_at >= %s
+                ORDER BY source, source_key, first_observed_at DESC
+            )
+            SELECT coverage_id, event_type, affected_underlying,
+                   window_start, window_end, source, source_key,
+                   source_observed_at, first_observed_at, payload_sha256
+            FROM latest
+            WHERE window_start <= %s
+              AND window_end >= %s
+              AND (
+                  (event_type = 'EARNINGS' AND affected_underlying = %s)
+                  OR (event_type = 'FED_RATE_DECISION'
+                      AND affected_underlying IS NULL)
+              )
+            ORDER BY event_type, affected_underlying, source_key
+            """,
+            (source, now, now - maximum_age, decision_start, decision_end, symbol),
+        )
+        coverage = [dict(row) for row in cursor.fetchall()]
+        cursor.execute(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (source, source_key) *
+                FROM option_market_events
+                WHERE source = %s
+                  AND first_observed_at <= %s
+                  AND COALESCE(revised_observed_at, first_observed_at) <= %s
+                ORDER BY source, source_key,
+                         COALESCE(revised_observed_at, first_observed_at) DESC
+            )
+            SELECT market_event_id, event_type, affected_underlying,
+                   scheduled_time, source, source_key, announcement_time,
+                   source_observed_at, first_observed_at,
+                   confidence, status, payload_sha256
+            FROM latest
+            WHERE scheduled_time BETWEEN %s AND %s
+              AND (affected_underlying IS NULL OR affected_underlying = %s)
+            ORDER BY scheduled_time, event_type, source_key
+            """,
+            (source, now, now, decision_start, upcoming_end, symbol),
+        )
+        events = [dict(row) for row in cursor.fetchall()]
+    decision_events = [
+        row for row in events if row["scheduled_time"] <= decision_end
+    ]
+    data = {
+        **empty,
+        "earnings_state": _event_window_state(
+            "EARNINGS", coverage, decision_events,
+            not_applicable=asset_type == "ETF",
+        ),
+        "fed_state": _event_window_state(
+            "FED_RATE_DECISION", coverage, decision_events
+        ),
+        "events": events,
+        "coverage": coverage,
+    }
+    available = data["fed_state"] != "UNAVAILABLE" and (
+        asset_type == "ETF" or data["earnings_state"] != "UNAVAILABLE"
+    )
+    return _envelope(
+        available=available,
+        reason=None if available else "EVENT_CALENDAR_COVERAGE_INCOMPLETE",
+        observed_at=max(
+            [row["first_observed_at"] for row in events + coverage],
+            default=None,
+        ),
+        data=data,
     )

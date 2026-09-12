@@ -47,6 +47,7 @@ export default function OptionsActivityPage() {
       <div><strong>Session-comparable activity</strong><span>Each row uses that underlying's last complete 15-minute matrix in the selected session. Volume is cumulative for the day; OI change uses only settlements known by that date.</span></div>
       <span className="flow-delay"><Clock3 size={13} />15-minute delayed</span>
     </section>
+    {data.serving_mode === 'HISTORICAL_PREVIOUS_POLICY' && <section className="flow-state flow-state--warning"><AlertTriangle size={20} /><div><strong>Historical policy matrices</strong><span>The active valuation policy has not completed the tracked universe yet. Rows below use each underlying's latest prior-policy matrix.</span></div></section>}
     <TickerBoard rows={data.underlyers} selected="" onSelect={underlyer => navigate(`/options/flow?underlyer=${underlyer}`)} />
   </div>
 }

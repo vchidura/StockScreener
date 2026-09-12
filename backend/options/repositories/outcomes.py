@@ -7,6 +7,7 @@ from uuid import UUID
 
 from psycopg2.extras import execute_values
 
+from options.domain import MarkSource
 from options.outcomes import OptionDecayOutcome, OptionOutcomeLeg
 from options.strategies.domain import OptionSide
 
@@ -209,6 +210,12 @@ class OptionOutcomeRepository(PostgresRepository):
                   AND candidate.capital_at_risk > 0
                   AND candidate.market_data_time <= %s
                   AND candidate.market_data_time > %s - (%s * INTERVAL '1 day')
+                                    AND NOT EXISTS (
+                                            SELECT 1
+                                            FROM option_candidate_legs AS entry_leg
+                                            WHERE entry_leg.candidate_id = candidate.candidate_id
+                                                AND entry_leg.valuation_policy_sha256 IS DISTINCT FROM %s
+                                    )
                                     AND EXISTS (
                                             SELECT 1
                                             FROM option_chain_snapshots AS snapshot
@@ -216,6 +223,7 @@ class OptionOutcomeRepository(PostgresRepository):
                                                 ON observed_leg.contract_id = snapshot.contract_id
                                             WHERE observed_leg.candidate_id = candidate.candidate_id
                                                 AND snapshot.model_mark IS NOT NULL
+                                                AND snapshot.valuation_policy_sha256 = %s
                                                 AND snapshot.first_observed_at <= %s
                                                 AND snapshot.mark_market_data_time >=
                                                         candidate.market_data_time + INTERVAL '15 minutes'
@@ -234,7 +242,8 @@ class OptionOutcomeRepository(PostgresRepository):
                 """,
                 (
                     valuation_policy_sha256, available_by, available_by,
-                                        retention_days, available_by, limit,
+                    retention_days, valuation_policy_sha256,
+                    valuation_policy_sha256, available_by, limit,
                 ),
             )
             return tuple(dict(row) for row in cursor.fetchall())
@@ -280,6 +289,13 @@ class OptionOutcomeRepository(PostgresRepository):
                                             AND candidate.market_data_time <= %s
                                             AND candidate.market_data_time >
                                                     %s - (%s * INTERVAL '1 day')
+                                            AND NOT EXISTS (
+                                                    SELECT 1
+                                                    FROM option_candidate_legs AS entry_leg
+                                                    WHERE entry_leg.candidate_id = candidate.candidate_id
+                                                        AND entry_leg.valuation_policy_sha256
+                                                            IS DISTINCT FROM %s
+                                            )
                                             AND EXISTS (
                                                     SELECT 1 FROM option_candidate_legs AS leg
                                                     WHERE leg.candidate_id = candidate.candidate_id
@@ -293,6 +309,7 @@ class OptionOutcomeRepository(PostgresRepository):
                                                         ON observed_leg.contract_id = snapshot.contract_id
                                                     WHERE observed_leg.candidate_id = candidate.candidate_id
                                                         AND snapshot.model_mark IS NOT NULL
+                                                        AND snapshot.valuation_policy_sha256 = %s
                                                         AND snapshot.first_observed_at <= %s
                                                         AND snapshot.mark_market_data_time >
                                                                 candidate.market_data_time
@@ -311,7 +328,8 @@ class OptionOutcomeRepository(PostgresRepository):
                 """,
                 (
                     valuation_policy_sha256, available_by, available_by,
-                    retention_days, available_by, available_by, limit,
+                    retention_days, valuation_policy_sha256, available_by,
+                    valuation_policy_sha256, available_by, limit,
                 ),
             )
             return tuple(dict(row) for row in cursor.fetchall())
@@ -322,6 +340,7 @@ class OptionOutcomeRepository(PostgresRepository):
         *,
         checkpoint_time,
         available_by,
+        valuation_policy_sha256: str,
         maximum_mark_lag: timedelta = timedelta(minutes=15),
     ) -> tuple[OptionOutcomeLeg, ...]:
         if maximum_mark_lag <= timedelta(0):
@@ -331,9 +350,12 @@ class OptionOutcomeRepository(PostgresRepository):
                 """
                 WITH candidate_legs AS (
                     SELECT candidate_id, contract_id, side, ratio, multiplier,
-                           model_mark AS entry_mark
+                              model_mark AS entry_mark,
+                              mark_source AS entry_mark_source,
+                              valuation_policy_sha256 AS entry_valuation_policy_sha256
                     FROM option_candidate_legs
                     WHERE candidate_id = %s
+                         AND valuation_policy_sha256 = %s
                 ), eligible_batches AS (
                     SELECT snapshot.batch_id,
                            MAX(snapshot.mark_market_data_time) AS market_time,
@@ -341,6 +363,7 @@ class OptionOutcomeRepository(PostgresRepository):
                     FROM option_chain_snapshots AS snapshot
                     JOIN candidate_legs AS leg USING (contract_id)
                     WHERE snapshot.model_mark IS NOT NULL
+                                            AND snapshot.valuation_policy_sha256 = %s
                       AND snapshot.mark_market_data_time >= %s
                       AND snapshot.mark_market_data_time <= %s + %s
                       AND snapshot.first_observed_at <= %s
@@ -353,6 +376,11 @@ class OptionOutcomeRepository(PostgresRepository):
                     SELECT DISTINCT ON (leg.contract_id)
                            leg.contract_id, leg.side, leg.ratio, leg.multiplier,
                            leg.entry_mark, snapshot.model_mark AS exit_mark,
+                           leg.entry_mark_source,
+                           snapshot.mark_source AS exit_mark_source,
+                           leg.entry_valuation_policy_sha256,
+                           snapshot.valuation_policy_sha256
+                               AS exit_valuation_policy_sha256,
                            snapshot.snapshot_id, snapshot.batch_id,
                            snapshot.mark_market_data_time,
                            snapshot.first_observed_at, snapshot.revision
@@ -366,7 +394,8 @@ class OptionOutcomeRepository(PostgresRepository):
                 SELECT * FROM selected ORDER BY contract_id
                 """,
                 (
-                    candidate_id, checkpoint_time, checkpoint_time,
+                    candidate_id, valuation_policy_sha256,
+                    valuation_policy_sha256, checkpoint_time, checkpoint_time,
                     maximum_mark_lag, available_by, available_by,
                 ),
             )
@@ -383,6 +412,10 @@ class OptionOutcomeRepository(PostgresRepository):
                 source_batch_id=row["batch_id"],
                 source_market_time=row["mark_market_data_time"],
                 source_observed_time=row["first_observed_at"],
+                entry_mark_source=MarkSource(row["entry_mark_source"]),
+                exit_mark_source=MarkSource(row["exit_mark_source"]),
+                entry_valuation_policy_sha256=row["entry_valuation_policy_sha256"],
+                exit_valuation_policy_sha256=row["exit_valuation_policy_sha256"],
             )
             for row in rows
         )
@@ -392,6 +425,7 @@ class OptionOutcomeRepository(PostgresRepository):
         candidate_id: UUID,
         *,
         available_by,
+        valuation_policy_sha256: str,
     ) -> tuple[OptionOutcomeLeg, ...]:
         with self._cursor() as cursor:
             cursor.execute(
@@ -399,11 +433,14 @@ class OptionOutcomeRepository(PostgresRepository):
                 WITH candidate_legs AS (
                     SELECT leg.candidate_id, leg.contract_id, leg.side, leg.ratio,
                            leg.multiplier, leg.model_mark AS entry_mark,
+                           leg.mark_source AS entry_mark_source,
+                           leg.valuation_policy_sha256 AS entry_valuation_policy_sha256,
                            candidate.market_data_time AS entry_market_time
                     FROM option_candidate_legs AS leg
                     JOIN option_strategy_candidates AS candidate
                       ON candidate.candidate_id = leg.candidate_id
                     WHERE leg.candidate_id = %s
+                                            AND leg.valuation_policy_sha256 = %s
                 ), latest_batch AS (
                     SELECT snapshot.batch_id,
                            MAX(snapshot.mark_market_data_time) AS market_time,
@@ -411,6 +448,7 @@ class OptionOutcomeRepository(PostgresRepository):
                     FROM option_chain_snapshots AS snapshot
                     JOIN candidate_legs AS leg USING (contract_id)
                     WHERE snapshot.model_mark IS NOT NULL
+                                            AND snapshot.valuation_policy_sha256 = %s
                       AND snapshot.first_observed_at <= %s
                       AND snapshot.mark_market_data_time > leg.entry_market_time
                     GROUP BY snapshot.batch_id
@@ -422,6 +460,11 @@ class OptionOutcomeRepository(PostgresRepository):
                 SELECT DISTINCT ON (leg.contract_id)
                        leg.contract_id, leg.side, leg.ratio, leg.multiplier,
                        leg.entry_mark, snapshot.model_mark AS exit_mark,
+                       leg.entry_mark_source,
+                       snapshot.mark_source AS exit_mark_source,
+                       leg.entry_valuation_policy_sha256,
+                       snapshot.valuation_policy_sha256
+                           AS exit_valuation_policy_sha256,
                        snapshot.snapshot_id, snapshot.batch_id,
                        snapshot.mark_market_data_time, snapshot.first_observed_at,
                        snapshot.revision
@@ -432,7 +475,10 @@ class OptionOutcomeRepository(PostgresRepository):
                 ORDER BY leg.contract_id, snapshot.first_observed_at DESC,
                          snapshot.revision DESC, snapshot.snapshot_id
                 """,
-                (candidate_id, available_by, available_by),
+                (
+                    candidate_id, valuation_policy_sha256,
+                    valuation_policy_sha256, available_by, available_by,
+                ),
             )
             rows = cursor.fetchall()
         return tuple(
@@ -445,6 +491,10 @@ class OptionOutcomeRepository(PostgresRepository):
                 source_snapshot_id=row["snapshot_id"], source_batch_id=row["batch_id"],
                 source_market_time=row["mark_market_data_time"],
                 source_observed_time=row["first_observed_at"],
+                entry_mark_source=MarkSource(row["entry_mark_source"]),
+                exit_mark_source=MarkSource(row["exit_mark_source"]),
+                entry_valuation_policy_sha256=row["entry_valuation_policy_sha256"],
+                exit_valuation_policy_sha256=row["exit_valuation_policy_sha256"],
             )
             for row in rows
         )

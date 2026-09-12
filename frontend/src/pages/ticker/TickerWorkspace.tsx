@@ -4,7 +4,7 @@ import TickerDetail, { type TickerView } from '../TickerDetail'
 import EntityRail from './EntityRail'
 import FinancialsView from './FinancialsView'
 import { usePublishPageContext } from '../../layout/pageContext'
-import { getEquitySecurityProfile, getLatestQuote } from '../../services/api'
+import { getEquitySecurityProfile, getLatestQuote, getOptionEventCalendar } from '../../services/api'
 import { formatQuoteTime } from './tickerShared'
 import './ticker.css'
 
@@ -33,6 +33,16 @@ export default function TickerWorkspace() {
     queryFn: () => getLatestQuote(symbol),
     enabled: !!symbol,
     refetchInterval: 60_000,
+  })
+  const {
+    data: calendar = null,
+    isFetching: calendarLoading,
+    isError: calendarError,
+  } = useQuery({
+    queryKey: ['option-event-calendar', symbol, 30],
+    queryFn: () => getOptionEventCalendar(symbol, 30),
+    enabled: !!symbol && active === 'overview',
+    staleTime: 15 * 60 * 1000,
   })
 
   const company = profile?.security?.company_name ?? null
@@ -77,7 +87,15 @@ export default function TickerWorkspace() {
           <TickerDetail view={active} />
           {active === 'financials' && <FinancialsView profile={profile} loading={profileLoading} />}
         </div>
-        {active === 'overview' && <EntityRail profile={profile} loading={profileLoading} />}
+        {active === 'overview' && (
+          <EntityRail
+            profile={profile}
+            loading={profileLoading}
+            calendar={calendar}
+            calendarLoading={calendarLoading}
+            calendarError={calendarError}
+          />
+        )}
       </div>
     </div>
   )

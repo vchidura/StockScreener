@@ -16,6 +16,7 @@ def test_environment_example_contains_only_required_and_intentional_overrides():
         "CORS_ORIGINS", "EQUITY_PROVIDER_DELAY_MINUTES",
         "OPTION_PROVIDER_DELAY_SECONDS", "OPTION_START_READ_ONLY",
         "OPTION_EQUITY_CONTEXT_ENABLED", "OPTION_RAW_ARCHIVE_ENABLED",
+        "OPTION_VALUATION_POLICY_FILE",
     ):
         assert f"{name}=" in source
     assert "EQUITY_UNIVERSE_TARGET_SIZE=350" in source
@@ -90,13 +91,26 @@ def test_compose_forwards_complete_option_and_worker_contract():
 
     assert "OPTION_FIXED_STOCK_UNDERLYERS:" in source
     assert "OPTION_POLICY_FILE:" in source
+    assert source.count("\n      OPTION_VALUATION_POLICY_FILE:") == 2
+    assert source.count("\n      OPTION_SETTLEMENT_VALUATION_POLICY_FILE:") == 2
+    assert source.count("\n      OPTION_EVENT_CALENDAR_PROVIDER:") == 2
+    assert source.count("\n      OPTION_EVENT_CALENDAR_MAX_AGE_SECONDS:") == 2
     assert source.count(
         "OPTION_POLL_SECONDS: ${OPTION_POLL_SECONDS:-900}"
     ) == 2
     assert "EQUITY_MATERIALIZATION_INTERVALS:" in source
-    assert source.count("APP_ENV: ${APP_ENV:-production}") == 6
+    assert source.count("APP_ENV: ${APP_ENV:-production}") == 9
     assert "equity-migrate:" in source
     assert "option-worker:" in source
+    assert "market-event-worker:" in source
+    assert "corporate-action-worker:" in source
+    assert "EQUITY_CORPORATE_ACTION_POLL_SECONDS:" in source
+    assert "option-model-input-worker:" in source
+    assert "OPTION_MODEL_INPUT_POLL_SECONDS:" in source
+    assert 'profiles: ["calendar", "options"]' in source
+    assert "FINNHUB_API_KEY: ${FINNHUB_API_KEY:?FINNHUB_API_KEY is required}" in source
+    assert "MARKET_EVENT_POLL_SECONDS: ${MARKET_EVENT_POLL_SECONDS:-21600}" in source
+    assert "MARKET_EVENT_HORIZON_DAYS: ${MARKET_EVENT_HORIZON_DAYS:-45}" in source
     assert 'profiles: ["options"]' in source
     assert "DB_USER: ${POSTGRES_ADMIN_USER:-postgres}" in source
 

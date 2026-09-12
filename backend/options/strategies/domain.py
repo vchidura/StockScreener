@@ -99,6 +99,8 @@ class StrategyContextSnapshot:
     operating_income: Decimal | None = None
     free_cash_flow: Decimal | None = None
     equity_reason_codes: tuple[str, ...] = ()
+    market_event_ids: tuple[UUID, ...] = ()
+    event_coverage_ids: tuple[UUID, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.underlyer.strip():
@@ -131,6 +133,14 @@ class StrategyContextSnapshot:
             raise ValueError("qualified_direction is invalid")
         if type(self.equity_reason_codes) is not tuple:
             raise TypeError("equity_reason_codes must be a tuple")
+        for value, name in (
+            (self.market_event_ids, "market_event_ids"),
+            (self.event_coverage_ids, "event_coverage_ids"),
+        ):
+            if type(value) is not tuple or any(type(item) is not UUID for item in value):
+                raise TypeError(f"{name} must be a tuple of UUIDs")
+            if len(value) != len(set(value)):
+                raise ValueError(f"{name} must not contain duplicates")
         object.__setattr__(self, "market_data_time", market_time)
         object.__setattr__(self, "observed_time", observed_time)
 
@@ -225,6 +235,8 @@ class CandidateLeg:
     mark_source: str
     model_version: str
     quality_flags: tuple[str, ...]
+    valuation_policy_version: str | None = None
+    valuation_policy_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.leg_index < 0:
@@ -262,6 +274,15 @@ class CandidateLeg:
         )
         if type(self.quality_flags) is not tuple:
             raise TypeError("quality_flags must be a tuple")
+        if (self.valuation_policy_version is None) != (
+            self.valuation_policy_sha256 is None
+        ):
+            raise ValueError("valuation policy version and hash must be recorded together")
+        if self.valuation_policy_sha256 is not None and (
+            len(self.valuation_policy_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.valuation_policy_sha256)
+        ):
+            raise ValueError("valuation_policy_sha256 must be a SHA-256 digest")
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "policy_version": "option_settlement_valuation_v1",
+  "mark_source": "PROVIDER_DAILY_AGGREGATE_UNADJUSTED",
+  "option_aggregates_adjusted": false,
+  "underlying_closes_adjusted": false,
+  "price_field": "close",
+  "model_version": "black_scholes_european_v1",
+  "iv_context_calculation_version": "settlement_iv_context_v1",
+  "iv_lookback_sessions": 252,
+  "minimum_iv_sample_sessions": 200,
+  "minimum_iv_coverage_fraction": 0.8
+}

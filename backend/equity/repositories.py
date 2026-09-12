@@ -360,6 +360,55 @@ class EquityCorporateActionRepository(_Repository):
             )
             return len(inserted)
 
+    def persist_coverage(
+        self,
+        coverage,
+        actions: Sequence[EquityCorporateAction],
+    ) -> int:
+        if not coverage:
+            return 0
+        action_ids_by_scope = {}
+        for action in actions:
+            action_ids_by_scope.setdefault(
+                (action.ticker, action.action_type), []
+            ).append(action.corporate_action_id)
+        inserted = 0
+        with self._cursor() as cursor:
+            for row in coverage:
+                cursor.execute(
+                    """
+                    INSERT INTO equity_corporate_action_coverage (
+                        coverage_id, action_type, ticker, window_start,
+                        window_end, source, source_key, first_observed_at,
+                        availability_mode, replay_available_at, payload_sha256
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (source, source_key, first_observed_at) DO NOTHING
+                    RETURNING coverage_id
+                    """,
+                    (
+                        row.coverage_id, row.action_type, row.ticker,
+                        row.window_start, row.window_end, row.source,
+                        row.source_key, row.first_observed_at,
+                        row.availability_mode.value, row.replay_available_at,
+                        row.payload_sha256,
+                    ),
+                )
+                inserted += cursor.fetchone() is not None
+                member_ids = action_ids_by_scope.get(
+                    (row.ticker, row.action_type), ()
+                )
+                if member_ids:
+                    execute_values(
+                        cursor,
+                        """
+                        INSERT INTO equity_corporate_action_coverage_members (
+                            coverage_id, corporate_action_id
+                        ) VALUES %s ON CONFLICT DO NOTHING
+                        """,
+                        [(row.coverage_id, action_id) for action_id in member_ids],
+                    )
+        return inserted
+
     def list_for_replay(
         self,
         tickers: Sequence[str],
@@ -384,6 +433,56 @@ class EquityCorporateActionRepository(_Repository):
                 ),
             )
             return tuple(dict(row) for row in cursor.fetchall())
+
+    def latest_covered_actions(
+        self,
+        ticker: str,
+        action_type: str,
+        *,
+        window_start,
+        window_end,
+        observed_at,
+        maximum_age,
+        include_reconstructed: bool = False,
+    ) -> tuple[dict[str, Any] | None, tuple[dict[str, Any], ...]]:
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM equity_corporate_action_coverage
+                WHERE source = 'POLYGON_CORPORATE_ACTIONS_V1'
+                  AND ticker = %s
+                  AND action_type = %s
+                  AND window_start <= %s
+                  AND window_end >= %s
+                  AND first_observed_at <= %s
+                  AND first_observed_at >= %s
+                  AND (%s OR availability_mode = 'LIVE_OBSERVED')
+                ORDER BY first_observed_at DESC
+                LIMIT 1
+                """,
+                (
+                    ticker.upper(), action_type, window_start, window_end,
+                    observed_at, observed_at - maximum_age,
+                    include_reconstructed,
+                ),
+            )
+            coverage = cursor.fetchone()
+            if coverage is None:
+                return None, ()
+            cursor.execute(
+                """
+                SELECT action.*
+                FROM equity_corporate_action_coverage_members AS member
+                JOIN equity_corporate_actions AS action
+                  USING (corporate_action_id)
+                WHERE member.coverage_id = %s
+                  AND action.effective_date BETWEEN %s AND %s
+                ORDER BY action.effective_date, action.source_key
+                """,
+                (coverage["coverage_id"], window_start, window_end),
+            )
+            return dict(coverage), tuple(dict(row) for row in cursor.fetchall())
 
 
 class EquityBarRepository(_Repository):

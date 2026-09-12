@@ -76,7 +76,10 @@ def _normalizer():
     configuration = load_option_runtime_configuration(
         {"POLYGON_API_KEY": "test-secret"}, BACKEND_DIR
     )
-    return DeveloperOptionNormalizer(configuration.policy)
+    return DeveloperOptionNormalizer(
+        configuration.policy,
+        configuration.valuation_policy,
+    )
 
 
 def test_developer_fixture_maps_every_snapshot_field_without_fabricating_quotes():
@@ -99,6 +102,10 @@ def test_developer_fixture_maps_every_snapshot_field_without_fabricating_quotes(
     assert snapshot.contract_id == 42
     assert snapshot.model_mark == Decimal("2.5")
     assert snapshot.bid is None and snapshot.ask is None and snapshot.midpoint is None
+    assert snapshot.valuation_policy_version == "option_valuation_v1"
+    assert snapshot.valuation_policy_sha256 == (
+        _normalizer().valuation_policy.policy_sha256
+    )
     assert snapshot.local_iv is not None and snapshot.iv_converged is True
     assert snapshot.provider_iv == 0.3
     assert snapshot.provider_gamma == 0.02
@@ -141,6 +148,27 @@ def test_source_skew_over_sixty_seconds_retains_diagnostic_but_blocks_strategy()
     assert result.snapshots[0].iv_failure_reason == "MODEL_MARK_UNAVAILABLE"
     assert result.matrix_snapshots == ()
     assert result.strategy_eligible is False
+
+
+def test_stale_mark_without_fetched_bars_reports_source_age_failure():
+    raw = parse_polygon_snapshot(_payload(), OBSERVED_AT)
+    item = DeveloperNormalizationInput(
+        raw,
+        _catalog(),
+        (),
+        datetime(2026, 9, 4, 20, 0, tzinfo=UTC),
+        0.04,
+        0.0,
+        normalized_observed_at=(
+            MARKET_TIME
+            + timedelta(seconds=_normalizer().valuation_policy.maximum_source_age_seconds + 1)
+        ),
+    )
+
+    result = _normalizer().normalize(uuid4(), (item,))
+
+    assert result.snapshots == ()
+    assert result.rejected_counts == (("STALE_MARK", 1),)
 
 
 def test_duplicate_delivery_and_input_order_do_not_change_normalized_facts():

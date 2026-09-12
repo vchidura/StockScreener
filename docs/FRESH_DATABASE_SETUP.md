@@ -169,7 +169,101 @@ post-baseline option chain is:
   .\backend\scripts\apply_incremental_migration.py `
   .\backend\migrations\025_option_candidate_execution_gates.sql `
   --verify-table option_candidate_execution_gates
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\026_option_board_publications.sql `
+  --verify-table option_board_publications
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\027_option_context_policy_identity.sql `
+  --verify-table option_context_snapshots
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\028_option_valuation_provenance.sql `
+  --verify-table option_chain_snapshots
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\029_option_board_configuration_identity.sql `
+  --verify-table option_board_publications
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\030_option_event_calendar_coverage.sql `
+  --verify-table option_event_calendar_coverage
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\031_option_daily_mark_valuation_provenance.sql `
+  --verify-table option_daily_contract_facts
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\032_option_event_source_observation.sql `
+  --verify-table option_event_calendar_coverage
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\033_option_daily_mark_revisions.sql `
+  --verify-table option_daily_contract_mark_revisions
+
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\apply_incremental_migration.py `
+  .\backend\migrations\034_option_context_event_lineage.sql `
+  --verify-table option_context_market_event_evidence
 ```
+
+Event-calendar files are validated before they are persisted. Import the facts first, then set
+`OPTION_EVENT_CALENDAR_PROVIDER` to the document's normalized `source`; configuring a source
+without coverage deliberately leaves event gates unavailable.
+
+```powershell
+# Validate only
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\import_option_event_calendar.py `
+  .\path\to\event-calendar.json
+
+# Persist append-only events and coverage
+.\backend\.venv\Scripts\python.exe `
+  .\backend\scripts\import_option_event_calendar.py `
+  .\path\to\event-calendar.json --apply
+```
+
+The document format is:
+
+```json
+{
+  "schema_version": 1,
+  "source": "verified_calendar",
+  "observed_at": "2026-09-10T12:00:00Z",
+  "coverage": [
+    {
+      "source_key": "fed-2026-q3",
+      "event_type": "FED_RATE_DECISION",
+      "affected_underlying": null,
+      "window_start": "2026-07-01T00:00:00Z",
+      "window_end": "2026-10-01T00:00:00Z"
+    }
+  ],
+  "events": [
+    {
+      "source_key": "fomc-2026-09",
+      "event_type": "FED_RATE_DECISION",
+      "affected_underlying": null,
+      "scheduled_time": "2026-09-16T18:00:00Z",
+      "announcement_time": "2025-12-01T12:00:00Z",
+      "confidence": "CONFIRMED",
+      "status": "SCHEDULED"
+    }
+  ]
+}
+```
+
+Earnings coverage is ticker-specific and requires `affected_underlying`; Fed coverage is
+global and requires it to be `null`. Each source key may appear only once per document.
 
 It rejects partially initialized schemas. To intentionally replace an existing database, stop the
 API and all workers first, keep the external backup, and provide the exact database name twice:

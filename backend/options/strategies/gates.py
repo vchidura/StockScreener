@@ -19,7 +19,7 @@ from typing import Mapping
 
 from .domain import CandidateKind, ExecutionEligibility
 
-GATE_LEDGER_VERSION = "gate_ledger_v1"
+GATE_LEDGER_VERSION = "gate_ledger_v2"
 
 
 class ExecutionGate(str, Enum):
@@ -93,6 +93,8 @@ def evaluate_execution_gates(
     candidate_kind: CandidateKind,
     context_reason_codes: tuple[str, ...] = (),
     equity_reason_codes: tuple[str, ...] = (),
+    equity_direction_required: bool = False,
+    equity_direction_available: bool = False,
     quotes_available: bool = False,
     risk_engine_available: bool = False,
     read_only: bool = True,
@@ -125,13 +127,31 @@ def evaluate_execution_gates(
             tuple(context_reason_codes),
         )
     )
-    results.append(
-        GateResult(
+    if equity_reason_codes:
+        equity_direction_result = GateResult(
             ExecutionGate.EQUITY_DIRECTION,
-            GateVerdict.FAIL if equity_reason_codes else GateVerdict.PASS,
+            GateVerdict.FAIL,
             tuple(equity_reason_codes),
+            {"required": equity_direction_required},
         )
-    )
+    elif equity_direction_required and not equity_direction_available:
+        equity_direction_result = GateResult(
+            ExecutionGate.EQUITY_DIRECTION,
+            GateVerdict.UNAVAILABLE,
+            ("QUALIFIED_EQUITY_DIRECTION_UNAVAILABLE",),
+            {"required": True},
+        )
+    else:
+        equity_direction_result = GateResult(
+            ExecutionGate.EQUITY_DIRECTION,
+            GateVerdict.PASS,
+            (),
+            {
+                "required": equity_direction_required,
+                "available": equity_direction_available,
+            },
+        )
+    results.append(equity_direction_result)
     results.append(
         GateResult(
             ExecutionGate.QUOTE_LIQUIDITY,

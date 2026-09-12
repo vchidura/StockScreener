@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from .base import PostgresRepository
 
 OPEN_INTEREST_SOURCE_CHAIN_SNAPSHOT = "PROVIDER_CHAIN_SNAPSHOT"
 MARK_SOURCE_DAILY_AGGREGATE = "PROVIDER_DAILY_AGGREGATE"
+MARK_SOURCE_DAILY_AGGREGATE_UNADJUSTED = "PROVIDER_DAILY_AGGREGATE_UNADJUSTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,11 +33,74 @@ class DailyMarkRecord:
     underlying: str
     close: Decimal
     observed_at: datetime
+    mark_source: str
+    mark_adjusted: bool
+    valuation_policy_version: str
+    valuation_policy_sha256: str
     open: Decimal | None = None
     high: Decimal | None = None
     low: Decimal | None = None
     volume: int | None = None
     transaction_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.close <= 0:
+            raise ValueError("daily mark close must be positive")
+        if self.mark_adjusted:
+            raise ValueError("nominal-strike option marks must be unadjusted")
+        if self.mark_source != MARK_SOURCE_DAILY_AGGREGATE_UNADJUSTED:
+            raise ValueError("daily mark source must identify unadjusted aggregates")
+        if not self.mark_source.strip() or not self.valuation_policy_version.strip():
+            raise ValueError("daily mark provenance cannot be blank")
+        if len(self.valuation_policy_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in self.valuation_policy_sha256
+        ):
+            raise ValueError("valuation_policy_sha256 must be a SHA-256 digest")
+
+    @property
+    def payload_sha256(self) -> str:
+        payload = {
+            "contract_id": self.contract_id,
+            "settlement_session": self.settlement_session.isoformat(),
+            "underlying": self.underlying,
+            "open": str(self.open) if self.open is not None else None,
+            "high": str(self.high) if self.high is not None else None,
+            "low": str(self.low) if self.low is not None else None,
+            "close": str(self.close),
+            "volume": self.volume,
+            "transaction_count": self.transaction_count,
+            "mark_source": self.mark_source,
+            "mark_adjusted": self.mark_adjusted,
+            "valuation_policy_version": self.valuation_policy_version,
+            "valuation_policy_sha256": self.valuation_policy_sha256,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
+        ).hexdigest()
+
+    @property
+    def mark_revision_id(self) -> UUID:
+        return uuid5(
+            NAMESPACE_URL,
+            (
+                f"option-daily-mark:{self.contract_id}:"
+                f"{self.settlement_session}:{self.valuation_policy_sha256}"
+            ),
+        )
+
+
+SQL_INSERT_MARK_REVISION = """
+INSERT INTO option_daily_contract_mark_revisions (
+    mark_revision_id, contract_id, settlement_session, underlying,
+    mark_open, mark_high, mark_low, mark_close, mark_volume,
+    mark_transaction_count, mark_source, mark_adjusted,
+    mark_observed_at, valuation_policy_version,
+    valuation_policy_sha256, payload_sha256
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (contract_id, settlement_session, valuation_policy_sha256) DO NOTHING
+RETURNING mark_revision_id
+"""
 
 
 # Re-observing the same settlement session must not rewrite a value that is already
@@ -88,8 +155,10 @@ SQL_UPSERT_MARK = """
 INSERT INTO option_daily_contract_facts (
     contract_id, settlement_session, underlying,
     mark_open, mark_high, mark_low, mark_close,
-    mark_volume, mark_transaction_count, mark_source, mark_observed_at
-) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    mark_volume, mark_transaction_count, mark_source, mark_observed_at,
+    mark_adjusted, mark_valuation_policy_version,
+    mark_valuation_policy_sha256
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (contract_id, settlement_session) DO UPDATE
 SET mark_open = COALESCE(option_daily_contract_facts.mark_open, EXCLUDED.mark_open),
     mark_high = COALESCE(option_daily_contract_facts.mark_high, EXCLUDED.mark_high),
@@ -107,6 +176,17 @@ SET mark_open = COALESCE(option_daily_contract_facts.mark_open, EXCLUDED.mark_op
     ),
     mark_observed_at = COALESCE(
         option_daily_contract_facts.mark_observed_at, EXCLUDED.mark_observed_at
+    ),
+    mark_adjusted = COALESCE(
+        option_daily_contract_facts.mark_adjusted, EXCLUDED.mark_adjusted
+    ),
+    mark_valuation_policy_version = COALESCE(
+        option_daily_contract_facts.mark_valuation_policy_version,
+        EXCLUDED.mark_valuation_policy_version
+    ),
+    mark_valuation_policy_sha256 = COALESCE(
+        option_daily_contract_facts.mark_valuation_policy_sha256,
+        EXCLUDED.mark_valuation_policy_sha256
     ),
     updated_at = now()
 WHERE option_daily_contract_facts.mark_close IS NULL
@@ -261,7 +341,51 @@ class OptionDailyFactRepository(PostgresRepository):
     def persist_marks(self, records: Sequence[DailyMarkRecord]) -> int:
         if not records:
             return 0
+        inserted = 0
         with self._cursor() as cursor:
+            for record in records:
+                cursor.execute(
+                    SQL_INSERT_MARK_REVISION,
+                    (
+                        record.mark_revision_id,
+                        record.contract_id,
+                        record.settlement_session,
+                        record.underlying,
+                        record.open,
+                        record.high,
+                        record.low,
+                        record.close,
+                        record.volume,
+                        record.transaction_count,
+                        record.mark_source,
+                        record.mark_adjusted,
+                        record.observed_at,
+                        record.valuation_policy_version,
+                        record.valuation_policy_sha256,
+                        record.payload_sha256,
+                    ),
+                )
+                if cursor.fetchone():
+                    inserted += 1
+                    continue
+                cursor.execute(
+                    """
+                    SELECT payload_sha256
+                    FROM option_daily_contract_mark_revisions
+                    WHERE contract_id = %s
+                      AND settlement_session = %s
+                      AND valuation_policy_sha256 = %s
+                    """,
+                    (
+                        record.contract_id,
+                        record.settlement_session,
+                        record.valuation_policy_sha256,
+                    ),
+                )
+                if cursor.fetchone()["payload_sha256"] != record.payload_sha256:
+                    raise ValueError(
+                        "daily mark policy key has different immutable payload"
+                    )
             cursor.executemany(
                 SQL_UPSERT_MARK,
                 [
@@ -275,13 +399,16 @@ class OptionDailyFactRepository(PostgresRepository):
                         record.close,
                         record.volume,
                         record.transaction_count,
-                        MARK_SOURCE_DAILY_AGGREGATE,
+                        record.mark_source,
                         record.observed_at,
+                        record.mark_adjusted,
+                        record.valuation_policy_version,
+                        record.valuation_policy_sha256,
                     )
                     for record in records
                 ],
             )
-        return len(records)
+        return inserted
 
     def session_coverage(
         self, underlying: str, start: date, end: date

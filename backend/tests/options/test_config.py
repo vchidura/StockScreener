@@ -9,7 +9,11 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from options.config import load_developer_policy, load_option_runtime_configuration
+from options.config import (
+    load_developer_policy,
+    load_option_runtime_configuration,
+    load_valuation_policy,
+)
 
 
 def _environment(**overrides: str) -> dict[str, str]:
@@ -38,9 +42,29 @@ def test_runtime_configuration_is_frozen_read_only_and_secret_safe():
         "IWM",
     )
     assert runtime.settings.policy_file == BACKEND_DIR / "options/policies/developer_v1.json"
+    assert runtime.settings.valuation_policy_file == (
+        BACKEND_DIR / "options/policies/valuation_v1.json"
+    )
+    assert runtime.settings.settlement_valuation_policy_file == (
+        BACKEND_DIR / "options/policies/settlement_valuation_v1.json"
+    )
     assert "test-secret" not in repr(runtime)
     assert "polygon_api_key" not in runtime.metadata()
     assert len(runtime.policy_sha256) == 64
+    assert runtime.developer_policy_sha256 == load_developer_policy(
+        runtime.settings.policy_file
+    ).sha256
+    assert runtime.valuation_policy.policy_version == "option_valuation_v1"
+    assert runtime.valuation_policy_sha256 == runtime.valuation_policy.policy_sha256
+    assert runtime.settlement_valuation_policy.policy_version == (
+        "option_settlement_valuation_v1"
+    )
+    assert runtime.settlement_valuation_policy.option_aggregates_adjusted is False
+    assert runtime.policy.contract_filter.maximum_dte == 60
+    assert runtime.settlement_valuation_policy_sha256 == (
+        runtime.settlement_valuation_policy.policy_sha256
+    )
+    assert runtime.policy_sha256 != runtime.developer_policy_sha256
     assert len(runtime.configuration_sha256) == 64
 
     with pytest.raises(ValidationError):
@@ -59,6 +83,23 @@ def test_policy_fingerprint_uses_canonical_validated_content(tmp_path: Path):
     reformatted = load_developer_policy(reformatted_path)
 
     assert original.sha256 == reformatted.sha256
+
+
+def test_valuation_policy_fingerprint_uses_canonical_validated_content(
+    tmp_path: Path,
+):
+    original_path = BACKEND_DIR / "options/policies/valuation_v1.json"
+    payload = json.loads(original_path.read_text(encoding="utf-8"))
+    reformatted_path = tmp_path / "valuation.json"
+    reformatted_path.write_text(
+        json.dumps(payload, indent=4, sort_keys=True), encoding="utf-8"
+    )
+
+    original = load_valuation_policy(original_path)
+    reformatted = load_valuation_policy(reformatted_path)
+
+    assert original == reformatted
+    assert original.policy_sha256 == reformatted.policy_sha256
 
 
 def test_fixed_universe_rejects_overlap_and_wrong_cohort_size():

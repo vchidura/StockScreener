@@ -232,6 +232,75 @@ class OptionAnalysisRepository(PostgresRepository):
             row = cursor.fetchone()
         return _analysis_run(row) if row else None
 
+    def list_latest_complete_cycle(
+        self,
+        underlyers: tuple[str, ...],
+        context: DecisionContext,
+        policy_sha256: str,
+    ) -> tuple[OptionAnalysisRun, ...]:
+        if not underlyers:
+            return ()
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                WITH latest_cycle AS (
+                    SELECT ingestion.scheduled_cycle
+                    FROM option_ingestion_runs AS ingestion
+                    JOIN option_analysis_runs AS analysis USING (batch_id)
+                    WHERE analysis.underlying = ANY(%s)
+                      AND analysis.status = 'COMPLETE'
+                      AND analysis.policy_sha256 = %s
+                      AND analysis.market_time <= %s
+                      AND analysis.observed_time <= %s
+                    GROUP BY ingestion.scheduled_cycle
+                    HAVING COUNT(DISTINCT analysis.underlying) = %s
+                    ORDER BY ingestion.scheduled_cycle DESC
+                    LIMIT 1
+                ), cycle_runs AS (
+                    SELECT DISTINCT ON (analysis.underlying)
+                        analysis.matrix_id, analysis.batch_id,
+                        analysis.underlying, analysis.market_time,
+                        analysis.observed_time, analysis.status,
+                        analysis.received_contract_count,
+                        analysis.eligible_contract_count,
+                        analysis.unknown_reference_count,
+                        analysis.iv_attempt_count,
+                        analysis.iv_converged_count,
+                        analysis.iv_convergence_fraction,
+                        analysis.quality_reasons, analysis.chain_health,
+                        analysis.policy_version, analysis.policy_sha256,
+                        analysis.model_version, analysis.started_at,
+                        analysis.completed_at
+                    FROM option_analysis_runs AS analysis
+                    JOIN option_ingestion_runs AS ingestion USING (batch_id)
+                    JOIN latest_cycle USING (scheduled_cycle)
+                    WHERE analysis.underlying = ANY(%s)
+                      AND analysis.status = 'COMPLETE'
+                      AND analysis.policy_sha256 = %s
+                      AND analysis.market_time <= %s
+                      AND analysis.observed_time <= %s
+                    ORDER BY analysis.underlying,
+                             analysis.observed_time DESC, analysis.matrix_id
+                )
+                SELECT *
+                FROM cycle_runs
+                ORDER BY underlying
+                """,
+                (
+                    list(underlyers),
+                    policy_sha256,
+                    context.market_time,
+                    context.observed_time,
+                    len(underlyers),
+                    list(underlyers),
+                    policy_sha256,
+                    context.market_time,
+                    context.observed_time,
+                ),
+            )
+            rows = cursor.fetchall()
+        return tuple(_analysis_run(row) for row in rows)
+
     def list_expirations(
         self,
         matrix_id: UUID,

@@ -5,7 +5,10 @@
 .DESCRIPTION
     Launches the canonical continuous workers:
       - equity materialization   (ingest, publish, analyze every due interval)
+            - corporate actions       (refresh upcoming splits and dividends)
       - equity portal snapshots  (publishes the 20 generation-aware snapshots)
+            - market events           (refresh earnings and FOMC coverage)
+            - option model inputs     (refresh official Treasury curves)
       - delayed option pipeline  (ingest, analyze, strategies, recommendations)
 
     Mutating equity phases take a PostgreSQL advisory lock, so a second
@@ -123,6 +126,15 @@ if ($Only -in @("All", "Equity")) {
             -Arguments $equityArgs
     }
 
+    if ($Once) {
+        Invoke-OneShotWorker -Title "corporate-action-worker" `
+            -ScriptName "run_corporate_action_worker.py" -Arguments $modeArgs
+    }
+    else {
+        Start-Worker -Title "corporate-action-worker" `
+            -ScriptName "run_corporate_action_worker.py"
+    }
+
     # The snapshot publisher has no --once; it is either a single pass or continuous.
     $snapshotArgs = if ($Once) { @() } else { @("--continuous") }
     if ($Once) {
@@ -137,6 +149,24 @@ if ($Only -in @("All", "Equity")) {
 }
 
 if ($Only -in @("All", "Options")) {
+    if ($Once) {
+        Invoke-OneShotWorker -Title "market-event-worker" `
+            -ScriptName "run_market_event_worker.py" -Arguments $modeArgs
+    }
+    else {
+        Start-Worker -Title "market-event-worker" `
+            -ScriptName "run_market_event_worker.py"
+    }
+
+    if ($Once) {
+        Invoke-OneShotWorker -Title "option-model-input-worker" `
+            -ScriptName "run_option_model_input_worker.py" -Arguments $modeArgs
+    }
+    else {
+        Start-Worker -Title "option-model-input-worker" `
+            -ScriptName "run_option_model_input_worker.py"
+    }
+
     if ($Once) {
         Invoke-OneShotWorker -Title "option-worker" `
             -ScriptName "run_option_worker.py" -Arguments $modeArgs

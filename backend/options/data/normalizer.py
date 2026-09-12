@@ -16,7 +16,11 @@ from options.analytics.marks import (
     calculate_contract_economics,
     select_developer_marks,
 )
-from options.config import DeveloperPolicy
+from options.config import DeveloperPolicy, ValuationPolicy
+from options.model_inputs import (
+    DividendCashFlow,
+    equivalent_continuous_dividend_yield,
+)
 from options.domain import (
     CatalogEligibility,
     DataQualityFlag,
@@ -51,6 +55,8 @@ class DeveloperNormalizationInput:
     expiration_cutoff: datetime
     risk_free_rate: float
     dividend_yield: float
+    dividend_cash_flows: tuple[DividendCashFlow, ...] = ()
+    dividend_coverage_available: bool = False
     input_quality_flags: tuple[DataQualityFlag, ...] = ()
     normalized_observed_at: datetime | None = None
 
@@ -123,10 +129,12 @@ class DeveloperOptionNormalizer:
     def __init__(
         self,
         policy: DeveloperPolicy,
+        valuation_policy: ValuationPolicy,
         *,
         model_version: str = "black_scholes_european_v1",
     ) -> None:
         self.policy = policy
+        self.valuation_policy = valuation_policy
         self.model_version = model_version
 
     def normalize(
@@ -174,20 +182,20 @@ class DeveloperOptionNormalizer:
                 _increment(rejected, DataQualityFlag.MISSING_MARK_TIMESTAMP.value)
                 continue
             marks = select_developer_marks(
+                policy=self.valuation_policy,
                 day_close=raw.day_close,
                 day_vwap=raw.day_vwap,
                 option_mark_time=raw.option_mark_time,
                 underlying_bars=item.underlying_bars,
                 observed_at=normalized_observed_at,
-                maximum_source_skew_seconds=(
-                    self.policy.model_quality.maximum_option_spot_skew_seconds
-                ),
-                maximum_source_age_seconds=(
-                    self.policy.model_quality.maximum_developer_source_age_seconds
-                ),
             )
             if marks.aligned_spot is None or marks.spot_market_data_time is None:
-                _increment(rejected, DataQualityFlag.MISSING_ALIGNED_SPOT.value)
+                reason = (
+                    DataQualityFlag.STALE_MARK
+                    if DataQualityFlag.STALE_MARK in marks.quality_flags
+                    else DataQualityFlag.MISSING_ALIGNED_SPOT
+                )
+                _increment(rejected, reason.value)
                 continue
             filtered = filter_contract(
                 contract_type=catalog.contract_type,
@@ -217,13 +225,24 @@ class DeveloperOptionNormalizer:
                 _as_utc(item.expiration_cutoff, "expiration_cutoff")
                 - raw.option_mark_time
             ).total_seconds() / (365.0 * 24.0 * 60.0 * 60.0)
+            dividend_yield = (
+                equivalent_continuous_dividend_yield(
+                    spot=marks.aligned_spot,
+                    valuation_date=raw.option_mark_time.date(),
+                    expiration_date=catalog.expiration_date,
+                    risk_free_rate=item.risk_free_rate,
+                    cash_flows=item.dividend_cash_flows,
+                )
+                if item.dividend_coverage_available
+                else item.dividend_yield
+            )
             economics = calculate_contract_economics(
                 contract_type=catalog.contract_type,
                 strike=catalog.strike,
                 spot=marks.aligned_spot,
                 model_mark=marks.model_mark,
                 intrinsic_price_tolerance=(
-                    self.policy.model_quality.intrinsic_price_tolerance
+                    self.valuation_policy.intrinsic_price_tolerance
                 ),
             )
             quality_flags = tuple(
@@ -246,6 +265,7 @@ class DeveloperOptionNormalizer:
                     "filter": filtered,
                     "economics": economics,
                     "maturity": maturity,
+                    "dividend_yield": dividend_yield,
                     "quality_flags": quality_flags,
                     "normalized_observed_at": normalized_observed_at,
                 }
@@ -260,7 +280,7 @@ class DeveloperOptionNormalizer:
                         model_mark=economics.model_mark,
                         time_to_expiration_years=float(maturity),
                         risk_free_rate=item.risk_free_rate,
-                        dividend_yield=item.dividend_yield,
+                        dividend_yield=dividend_yield,
                     )
                 )
 
@@ -333,6 +353,8 @@ class DeveloperOptionNormalizer:
                 "model_mark": str(economics.model_mark) if economics.model_mark else None,
                 "mark_market_data_time": raw.option_mark_time.isoformat(),
                 "mark_source": marks.mark_source.value,
+                "valuation_policy_version": marks.valuation_policy_version,
+                "valuation_policy_sha256": marks.valuation_policy_sha256,
                 "day_volume": raw.day_volume,
                 "open_interest": raw.open_interest,
                 "local_iv": local_values[0],
@@ -355,7 +377,7 @@ class DeveloperOptionNormalizer:
                 "provider_iv": raw.provider_iv,
                 "provider_gamma": raw.provider_gamma,
                 "risk_free_rate": item.risk_free_rate,
-                "dividend_yield": item.dividend_yield,
+                "dividend_yield": values["dividend_yield"],
                 "iv_converged": iv_converged,
                 "iv_solver": iv_solver,
                 "iv_iteration_count": iv_iterations,
@@ -410,7 +432,7 @@ class DeveloperOptionNormalizer:
                     provider_iv=raw.provider_iv,
                     provider_gamma=raw.provider_gamma,
                     risk_free_rate=item.risk_free_rate,
-                    dividend_yield=item.dividend_yield,
+                    dividend_yield=values["dividend_yield"],
                     iv_converged=iv_converged,
                     iv_solver=iv_solver,
                     iv_iteration_count=iv_iterations,
@@ -422,6 +444,8 @@ class DeveloperOptionNormalizer:
                     raw_payload_sha256=raw.raw_payload_sha256,
                     normalized_payload_sha256=normalized_payload_sha256,
                     revision=revision,
+                    valuation_policy_version=marks.valuation_policy_version,
+                    valuation_policy_sha256=marks.valuation_policy_sha256,
                 )
             )
         latest: dict[tuple[str, datetime], OptionContractSnapshot] = {}

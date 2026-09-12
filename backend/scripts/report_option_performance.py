@@ -51,7 +51,7 @@ from options.analytics.performance import (  # noqa: E402
     summarize_option_confidence,
 )
 from options.calendar import OptionExchangeCalendar  # noqa: E402
-from options.outcomes import delayed_proxy_commission_policy  # noqa: E402
+from options.outcomes import configured_valuation_policy  # noqa: E402
 
 DEFAULT_OUTPUT_DIR = BACKEND_DIR.parent / "docs" / "option_performance"
 
@@ -364,7 +364,7 @@ def _structure_baseline_pairs(
     for values in by_strike.values():
         values.sort(key=lambda row: row["strike"])
 
-    commission = delayed_proxy_commission_policy().commission_per_contract_per_side
+    commission = configured_valuation_policy().commission_per_contract_per_side
     pairs: list[BaselinePair] = []
     rejected_unbounded = 0
     exact_packages = 0

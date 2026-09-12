@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from options.calendar import OptionExchangeCalendar
+from options.config import ValuationPolicy
 from options.outcomes import (
     CURRENT_MARK_MEASUREMENT,
-    delayed_proxy_commission_policy,
+    configured_valuation_policy,
     evaluate_delayed_proxy_outcome,
     measurement_checkpoints,
 )
@@ -30,10 +31,11 @@ class OptionOutcomeService:
         repository: OptionOutcomeRepository | None = None,
         *,
         calendar: OptionExchangeCalendar | None = None,
+        policy: ValuationPolicy | None = None,
     ) -> None:
         self.repository = repository or OptionOutcomeRepository()
         self.calendar = calendar or OptionExchangeCalendar()
-        self.policy = delayed_proxy_commission_policy()
+        self.policy = policy or configured_valuation_policy()
 
     def mature(
         self,
@@ -62,6 +64,7 @@ class OptionOutcomeService:
                     candidate["candidate_id"],
                     checkpoint_time=checkpoint,
                     available_by=available_utc,
+                    valuation_policy_sha256=self.policy.policy_sha256,
                 )
                 if not legs:
                     pending += 1
@@ -87,7 +90,9 @@ class OptionOutcomeService:
                 limit=limit,
             ):
                 legs = self.repository.current_mark_legs(
-                    candidate["candidate_id"], available_by=available_utc
+                    candidate["candidate_id"],
+                    available_by=available_utc,
+                    valuation_policy_sha256=self.policy.policy_sha256,
                 )
                 if not legs:
                     continue

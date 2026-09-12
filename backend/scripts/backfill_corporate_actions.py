@@ -30,6 +30,7 @@ from equity.repositories import (
     EquityReferenceRepository,
     EquityUniverseRepository,
 )
+from scripts.run_corporate_action_worker import build_coverage
 
 
 def parser() -> argparse.ArgumentParser:
@@ -112,7 +113,18 @@ def main() -> int:
         "mode": "APPLY" if arguments.apply else "DRY_RUN",
     }
     if arguments.apply:
-        report["inserted"] = EquityCorporateActionRepository().persist(actions)
+        repository = EquityCorporateActionRepository()
+        report["inserted"] = repository.persist(actions)
+        coverage = build_coverage(
+            security_ids,
+            start=start,
+            end=end,
+            observed_at=observed_at,
+            availability_mode=BarAvailabilityMode.HISTORICAL_RECONSTRUCTED,
+        )
+        report["coverage_inserted"] = repository.persist_coverage(
+            coverage, actions
+        )
     else:
         report["note"] = "nothing written; re-run with --apply"
 

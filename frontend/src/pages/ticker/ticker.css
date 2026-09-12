@@ -315,6 +315,111 @@
   line-height: 1.5;
 }
 
+.ticker-entity__section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 13px 5px;
+  border-top: 1px solid var(--tm-line);
+}
+
+.ticker-entity__section-head strong {
+  font-size: 11px;
+}
+
+.ticker-entity__section-head span,
+.ticker-calendar__events > span {
+  color: var(--tm-faint);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.ticker-entity__rows--calendar {
+  padding-bottom: 6px;
+}
+
+.ticker-calendar__state::before {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  background: currentColor;
+  border-radius: 50%;
+  content: '';
+  vertical-align: 1px;
+}
+
+.ticker-calendar__state.is-clear {
+  color: var(--tm-pos);
+}
+
+.ticker-calendar__state.is-blocked {
+  color: var(--tm-neg);
+}
+
+.ticker-calendar__state.is-unavailable {
+  color: var(--tm-warn);
+}
+
+.ticker-calendar__state.is-not_applicable {
+  color: var(--tm-faint);
+}
+
+.ticker-calendar__events {
+  display: grid;
+  gap: 0;
+  padding: 7px 13px 9px;
+  border-top: 1px solid var(--tm-line);
+}
+
+.ticker-calendar__events > span {
+  margin-bottom: 4px;
+}
+
+.ticker-calendar__event {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 1px 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--tm-line);
+}
+
+.ticker-calendar__event:last-child {
+  border-bottom: 0;
+}
+
+.ticker-calendar__event strong {
+  min-width: 0;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.ticker-calendar__event time {
+  color: var(--tm-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.ticker-calendar__event small {
+  grid-column: 1 / -1;
+  color: var(--tm-faint);
+  font-size: 9px;
+  text-transform: capitalize;
+}
+
+.ticker-calendar__message {
+  margin: 0;
+  padding: 8px 13px 10px;
+  color: var(--tm-muted);
+  border-top: 1px solid var(--tm-line);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
 .ticker-entity__note {
   padding: 10px 13px;
   color: var(--tm-faint);

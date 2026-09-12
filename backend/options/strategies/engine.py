@@ -159,7 +159,14 @@ class OptionStrategyEngine:
             tuple(
                 (
                     candidate.candidate_id,
-                    self.execution_gate_ledger(context, candidate.candidate_kind),
+                    self.execution_gate_ledger(
+                        context,
+                        candidate.candidate_kind,
+                        equity_direction_required=(
+                            candidate.primary_evidence.get("directional_thesis")
+                            in {"BULLISH", "BEARISH"}
+                        ),
+                    ),
                 )
                 for candidate in candidates
             ),
@@ -181,13 +188,18 @@ class OptionStrategyEngine:
             return (
                 self._suppressed(matrix_id, snapshots[0], registration, direction_block),
             )
-        eligible = [
+        dte_eligible = [
             snapshot
             for snapshot in snapshots
             if snapshot.contract_type is ContractType.PUT
             and policy.minimum_dte <= snapshot.calendar_dte <= policy.maximum_dte
             and snapshot.strike < snapshot.spot
             and snapshot.model_mark is not None
+        ]
+        eligible = [
+            snapshot
+            for snapshot in dte_eligible
+            if snapshot.calendar_dte > policy.exit_dte
         ]
         eligible.sort(
             key=lambda row: (
@@ -206,7 +218,11 @@ class OptionStrategyEngine:
                     matrix_id,
                     snapshots[0],
                     registration,
-                    ("NO_ELIGIBLE_WHEEL_CONTRACT",),
+                    (
+                        "NO_WHEEL_CONTRACT_ABOVE_EXIT_DTE"
+                        if dte_eligible
+                        else "NO_ELIGIBLE_WHEEL_CONTRACT"
+                    ,),
                 ),
             )
         results = []
@@ -215,8 +231,6 @@ class OptionStrategyEngine:
             payoff = evaluate_terminal_payoff((leg,))
             collateral = snapshot.strike * snapshot.shares_per_contract
             reasons = self._capability_reasons(context)
-            if snapshot.calendar_dte <= policy.exit_dte:
-                reasons = (*reasons, "DTE_AT_OR_BELOW_EXIT_BOUNDARY")
             results.append(
                 self._candidate(
                     matrix_id,
@@ -1167,11 +1181,15 @@ class OptionStrategyEngine:
         self,
         context: StrategyContextSnapshot,
         candidate_kind: CandidateKind = CandidateKind.MULTI_LEG,
+        *,
+        equity_direction_required: bool = False,
     ) -> ExecutionGateLedger:
         return evaluate_execution_gates(
             candidate_kind=candidate_kind,
             context_reason_codes=tuple(context.reason_codes),
             equity_reason_codes=tuple(context.equity_reason_codes),
+            equity_direction_required=equity_direction_required,
+            equity_direction_available=context.qualified_direction is not None,
             quotes_available=self.quotes_available,
             risk_engine_available=self.risk_engine_available,
             read_only=self.read_only,
@@ -1195,7 +1213,7 @@ class OptionStrategyEngine:
 
 
 def _leg(snapshot: OptionContractSnapshot, index: int, side: OptionSide, ratio: int = 1) -> CandidateLeg:
-    return CandidateLeg(index, snapshot.snapshot_id, snapshot.contract_id, snapshot.contract_ticker, side, ratio, snapshot.shares_per_contract, snapshot.expiration_date, snapshot.strike, snapshot.contract_type, snapshot.spot, snapshot.time_to_expiration_years, snapshot.risk_free_rate, snapshot.dividend_yield, snapshot.model_mark, snapshot.local_iv, snapshot.local_delta, snapshot.local_gamma, snapshot.local_theta_per_day, snapshot.local_vega_per_vol_point, snapshot.local_rho_per_rate_point, snapshot.market_data_time, snapshot.mark_source.value, snapshot.model_version, tuple(flag.value for flag in snapshot.quality_flags))
+    return CandidateLeg(index, snapshot.snapshot_id, snapshot.contract_id, snapshot.contract_ticker, side, ratio, snapshot.shares_per_contract, snapshot.expiration_date, snapshot.strike, snapshot.contract_type, snapshot.spot, snapshot.time_to_expiration_years, snapshot.risk_free_rate, snapshot.dividend_yield, snapshot.model_mark, snapshot.local_iv, snapshot.local_delta, snapshot.local_gamma, snapshot.local_theta_per_day, snapshot.local_vega_per_vol_point, snapshot.local_rho_per_rate_point, snapshot.market_data_time, snapshot.mark_source.value, snapshot.model_version, tuple(flag.value for flag in snapshot.quality_flags), snapshot.valuation_policy_version, snapshot.valuation_policy_sha256)
 
 
 def _dte_lane(calendar_dte: int, policy) -> str:

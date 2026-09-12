@@ -975,6 +975,8 @@ class OptionContractSnapshot:
     raw_payload_sha256: str
     normalized_payload_sha256: str
     revision: int = 1
+    valuation_policy_version: str | None = None
+    valuation_policy_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.contract_id <= 0:
@@ -1022,6 +1024,12 @@ class OptionContractSnapshot:
             _optional_float(value, name)
         if self.iv_iteration_count < 0:
             raise ValueError("iv_iteration_count cannot be negative")
+        if (self.valuation_policy_version is None) != (
+            self.valuation_policy_sha256 is None
+        ):
+            raise ValueError("valuation policy version and hash must be recorded together")
+        if self.valuation_policy_sha256 is not None:
+            _sha256(self.valuation_policy_sha256, "valuation_policy_sha256")
         if self.iv_converged and (self.local_iv is None or self.iv_solver is None):
             raise ValueError("converged IV requires local_iv and iv_solver")
         if not self.iv_converged and self.iv_failure_reason is None:

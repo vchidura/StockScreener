@@ -224,10 +224,10 @@ def test_v1_policy_keeps_per_contract_selection_without_a_profile():
 
 def test_strategy_policy_identity_is_pinned():
     # Deliberate bumps go here together with a strategy_version change; the repository
-    # rejects a hash move without one. Last bumped for phase2_v3 (debit spread module).
+    # rejects a hash move without one. Last bumped for phase2_v4 (wheel entry boundary).
     policy, sha = _policy("strategy_v1.json")
-    assert policy.strategy_version == "phase2_v3"
-    assert sha == "2409bcf43995743737459e33115baac9157f952786fe0f032de91b8415f32d74"
+    assert policy.strategy_version == "phase2_v4"
+    assert sha == "c4a46268cbef4cb44994fe5524dc2499ef90d36853cd3d50b07a3126a31e6bc6"
 
 
 def test_wall_gates_are_absent_from_the_strategy_policy():

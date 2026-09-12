@@ -1,0 +1,234 @@
+{
+  "generated_at": "2026-09-11 22:12:30.227580+00:00",
+  "mark_history_ready": true,
+  "iv_context_ready": false,
+  "blockers": [
+    "COMPARABLE_IV_SERIES_NOT_MATERIALIZED"
+  ],
+  "settlement_valuation_policy_version": "option_settlement_valuation_v1",
+  "settlement_valuation_policy_sha256": "e88adb1accfe71607715957abac2ec7e2b46264bd12a76b7e2e308ba077d8d51",
+  "mark_source": "PROVIDER_DAILY_AGGREGATE_UNADJUSTED",
+  "option_aggregates_adjusted": false,
+  "iv_context_calculation_version": "settlement_iv_context_v1",
+  "required_lookback_sessions": 252,
+  "lookback_start_session": "2025-09-11",
+  "lookback_end_session": "2026-09-11",
+  "minimum_sample_sessions": 200,
+  "minimum_coverage_fraction": 0.8,
+  "dated_rates_ready": true,
+  "risk_free_rate_source": "us_treasury_par_yield_v1",
+  "rate_history": {
+    "observation_count": 9169,
+    "rate_dates": 673,
+    "rate_start": "2024-01-02",
+    "rate_end": "2026-09-10"
+  },
+  "dated_dividends_ready": true,
+  "dividend_input_source": "polygon_corporate_actions_v1",
+  "dividend_coverage": {
+    "AAPL": {
+      "live": true,
+      "historical": true
+    },
+    "AMD": {
+      "live": true,
+      "historical": true
+    },
+    "AMZN": {
+      "live": true,
+      "historical": true
+    },
+    "GOOGL": {
+      "live": true,
+      "historical": true
+    },
+    "IWM": {
+      "live": true,
+      "historical": true
+    },
+    "META": {
+      "live": true,
+      "historical": true
+    },
+    "MSFT": {
+      "live": true,
+      "historical": true
+    },
+    "NVDA": {
+      "live": true,
+      "historical": true
+    },
+    "PLTR": {
+      "live": true,
+      "historical": true
+    },
+    "QQQ": {
+      "live": true,
+      "historical": true
+    },
+    "SOFI": {
+      "live": true,
+      "historical": true
+    },
+    "SPY": {
+      "live": true,
+      "historical": true
+    },
+    "TSLA": {
+      "live": true,
+      "historical": true
+    }
+  },
+  "missing_underlyings": [],
+  "underlyings": [
+    {
+      "underlying": "AAPL",
+      "all_marks": 8621,
+      "all_sessions": 536,
+      "policy_marks": 4446,
+      "policy_sessions": 250,
+      "policy_coverage_fraction": 0.9920634920634921,
+      "policy_start": "2025-09-11",
+      "policy_end": "2026-09-09",
+      "mark_history_ready": true
+    },
+    {
+      "underlying": "AMD",
+      "all_marks": 7325,
+      "all_sessions": 536,
+      "policy_marks": 4159,
+      "policy_sessions": 250,
+      "policy_coverage_fraction": 0.9920634920634921,
+      "policy_start": "2025-09-11",
+      "policy_end": "2026-09-09",
+      "mark_history_ready": true
+    },
+    {
+      "underlying": "AMZN",
+      "all_marks": 8579,
+      "all_sessions": 536,
+      "policy_marks": 4386,
+      "policy_sessions": 250,
+      "policy_coverage_fraction": 0.9920634920634921,
+      "policy_start": "2025-09-11",
+      "policy_end": "2026-09-09",
+      "mark_history_ready": true
+    },
+    {
+      "underlying": "GOOGL",
+      "all_marks": 8257,
+      "all_sessions": 536,
+      "policy_marks": 4305,
+      "policy_sessions": 250,
+      "policy_coverage_fraction": 0.9920634920634921,
+      "policy_start": "2025-09-11",
+      "policy_end": "2026-09-09",
+      "mark_history_ready": true
+    },
+    {
+      "underlying": "META",
+      "all_marks": 8454,
+      "all_sessions": 536,
+      "policy_marks": 4771,
+      "policy_sessions": 250,
+      "policy_coverage_fraction": 0.9920634920634921,
+      "policy_start": "2025-09-11",
+      "policy_end": "2026-09-09",
+      "mark_history_ready": true
+    },
+    {
+      "underlying": "MSFT",
+      "all_marks": 8599,
+      "all_sessions": 536,
+      "policy_marks": 4744,
+      "policy_sessions": 250,
+      "policy_coverage_fraction": 0.9920634920634921,
+      "policy_start": "2025-09-11",
+      "policy_end": "2026-09-09",
+      "mark_history_ready": true
+    },
+    {
+      "underlying": "NVDA",
+      "all_marks": 8877,
+      "all_sessions": 536,
+      "policy_marks": 4432,
+      "policy_sessions": 250,
+      "policy_coverage_fraction": 0.9920634920634921,
+      "policy_start": "2025-09-11",
+      "policy_end": "2026-09-09",
+      "mark_history_ready": true
+    },
+    {
+      "underlying": "PLTR",
+      "all_marks": 6151,
+      "all_sessions": 534,
+      "policy_marks": 3182,
+      "policy_sessions": 248,
+      "policy_coverage_fraction": 0.9841269841269841,
+      "policy_start": "2025-09-11",
+      "policy_end": "2026-09-04",
+      "mark_history_ready": true
+    },
+    {
+      "underlying": "SOFI",
+      "all_marks": 5683,
+      "all_sessions": 534,
+      "policy_marks": 3312,
+      "policy_sessions": 248,
+      "policy_coverage_fraction": 0.9841269841269841,
+      "policy_start": "2025-09-11",
+      "policy_end": "2026-09-04",
+      "mark_history_ready": true
+    },
+    {
+      "underlying": "TSLA",
+      "all_marks": 8382,
+      "all_sessions": 536,
+      "policy_marks": 4681,
+      "policy_sessions": 250,
+      "policy_coverage_fraction": 0.9920634920634921,
+      "policy_start": "2025-09-11",
+      "policy_end": "2026-09-09",
+      "mark_history_ready": true
+    },
+    {
+      "underlying": "SPY",
+      "all_marks": 17539,
+      "all_sessions": 307,
+      "policy_marks": 14795,
+      "policy_sessions": 251,
+      "policy_coverage_fraction": 0.996031746031746,
+      "policy_start": "2025-09-11",
+      "policy_end": "2026-09-10",
+      "mark_history_ready": true
+    },
+    {
+      "underlying": "QQQ",
+      "all_marks": 16576,
+      "all_sessions": 537,
+      "policy_marks": 13520,
+      "policy_sessions": 251,
+      "policy_coverage_fraction": 0.996031746031746,
+      "policy_start": "2025-09-11",
+      "policy_end": "2026-09-10",
+      "mark_history_ready": true
+    },
+    {
+      "underlying": "IWM",
+      "all_marks": 13545,
+      "all_sessions": 537,
+      "policy_marks": 8467,
+      "policy_sessions": 251,
+      "policy_coverage_fraction": 0.996031746031746,
+      "policy_start": "2025-09-11",
+      "policy_end": "2026-09-10",
+      "mark_history_ready": true
+    }
+  ],
+  "materialized_contexts": {
+    "context_count": 0,
+    "underlying_count": 0,
+    "ready_context_count": 0,
+    "ready_underlying_count": 0
+  }
+}

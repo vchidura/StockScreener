@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import socket
+import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -12,6 +14,11 @@ from options.analytics.analysis_engine import OptionAnalysisEngine
 from options.analytics.marks import UnderlyingMinuteBar
 from options.calendar import OptionExchangeCalendar
 from options.config import OptionRuntimeConfiguration
+from options.model_inputs import (
+    DividendCashFlow,
+    TREASURY_CURVE_SOURCE,
+    interpolate_rate,
+)
 from options.data.normalizer import (
     DeveloperNormalizationInput,
     DeveloperOptionNormalizer,
@@ -34,6 +41,10 @@ from options.domain import (
     reference_drift_failed,
 )
 from options.repositories.analysis import OptionAnalysisRepository
+from options.repositories.board import (
+    BoardPublicationResult,
+    OptionBoardPublicationRepository,
+)
 from options.repositories.catalog import OptionContractCatalogRepository
 from options.repositories.daily_facts import (
     DailyOpenInterestRecord,
@@ -41,6 +52,7 @@ from options.repositories.daily_facts import (
 )
 from options.repositories.gamma import GammaProfileRecord, OptionGammaProfileRepository
 from options.repositories.ingestion import OptionIngestionRepository
+from options.repositories.model_inputs import OptionModelInputRepository
 from options.repositories.outcomes import OptionOutcomeRepository
 from options.repositories.snapshots import OptionSnapshotRepository
 from options.repositories.trades import OptionTradeRepository
@@ -48,11 +60,15 @@ from options.repositories.universe import OptionUniverseRepository
 from options.repositories.work_items import OptionWorkItemRepository
 from options.strategy_orchestration import OptionStrategyPipeline
 from equity.domain import DecisionWatermark, EvidenceType
-from equity.repositories import EquityEvidenceRepository
+from equity.repositories import (
+    EquityCorporateActionRepository,
+    EquityEvidenceRepository,
+)
 
 # Overlap re-requested on the next cycle so a restart cannot skip prints that
 # arrived out of order at the watermark boundary.
 _TRADE_CURSOR_OVERLAP_SECONDS = 60
+LOGGER = logging.getLogger("option-pipeline")
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +100,7 @@ class ManualCycleResult:
     started_at: datetime
     completed_at: datetime
     results: tuple[UnderlyingCycleResult, ...]
+    board_publication: BoardPublicationResult | None = None
 
 
 class TerminalOptionQualityError(RuntimeError):
@@ -111,6 +128,9 @@ class ManualOptionPipeline:
         strategy_pipeline: OptionStrategyPipeline | None = None,
         equity_evidence_repository: EquityEvidenceRepository | None = None,
         outcome_repository: OptionOutcomeRepository | None = None,
+        board_repository: OptionBoardPublicationRepository | None = None,
+        model_input_repository: OptionModelInputRepository | None = None,
+        corporate_action_repository: EquityCorporateActionRepository | None = None,
         clock=None,
     ) -> None:
         self.configuration = configuration
@@ -125,12 +145,28 @@ class ManualOptionPipeline:
         self.daily_fact_repository = daily_fact_repository or OptionDailyFactRepository()
         self.trade_repository = trade_repository or OptionTradeRepository()
         self.work_repository = work_repository or OptionWorkItemRepository()
-        self.normalizer = normalizer or DeveloperOptionNormalizer(configuration.policy)
+        self.normalizer = normalizer or DeveloperOptionNormalizer(
+            configuration.policy,
+            configuration.valuation_policy,
+        )
         self.analysis_engine = analysis_engine or OptionAnalysisEngine(
             configuration.policy, configuration.gamma_policy
         )
         self.strategy_pipeline = strategy_pipeline
         self.outcome_repository = outcome_repository
+        self.board_repository = board_repository or OptionBoardPublicationRepository()
+        self.model_input_repository = model_input_repository
+        if (
+            self.model_input_repository is None
+            and configuration.settings.risk_free_rate_source == TREASURY_CURVE_SOURCE
+        ):
+            self.model_input_repository = OptionModelInputRepository()
+        self.corporate_action_repository = corporate_action_repository
+        if (
+            self.corporate_action_repository is None
+            and configuration.settings.dividend_input_source is not None
+        ):
+            self.corporate_action_repository = EquityCorporateActionRepository()
         self.equity_evidence_repository = (
             equity_evidence_repository or EquityEvidenceRepository()
         )
@@ -159,7 +195,7 @@ class ManualOptionPipeline:
         as_of = _as_utc(as_of, "as_of") if as_of is not None else started_at
         if cycle_time is None:
             as_of_session = self.calendar.latest_completed_session(as_of)
-            cycle_time = self.calendar.expiration_cutoff(as_of_session) + timedelta(minutes=15)
+            cycle_time = self.calendar.expiration_cutoff(as_of_session)
         else:
             cycle_time = _as_utc(cycle_time, "cycle_time")
             if cycle_time > as_of:
@@ -208,12 +244,29 @@ class ManualOptionPipeline:
             completed_count / len(results) if results else 0.0,
             completed_at,
         )
+        board_publication = None
+        if (
+            self.strategy_pipeline is not None
+            and len(requested) == len(self.configuration.settings.underlyers)
+            and set(requested) == set(self.configuration.settings.underlyers)
+        ):
+            board_publication = self.board_repository.publish_complete_cycle(
+                scheduled_cycle=cycle_time,
+                as_of_session=as_of_session,
+                expected_underlyers=self.configuration.settings.underlyers,
+                strategy_policy_sha256=(
+                    self.configuration.strategy_policy_sha256
+                ),
+                configuration_sha256=self.configuration.configuration_sha256,
+                published_at=completed_at,
+            )
         return ManualCycleResult(
             universe_run_id=universe_run_id,
             as_of_session=as_of_session,
             started_at=started_at,
             completed_at=completed_at,
             results=results,
+            board_publication=board_publication,
         )
 
     def _persist_fixed_universe(
@@ -391,7 +444,7 @@ class ManualOptionPipeline:
             mark_window = _fresh_mark_window(
                 raw_rows,
                 bar_window_observed_at,
-                self.configuration.policy.model_quality.maximum_developer_source_age_seconds,
+                self.configuration.valuation_policy.maximum_source_age_seconds,
             )
             bars: tuple[UnderlyingMinuteBar, ...] = ()
             if mark_window is not None:
@@ -405,13 +458,68 @@ class ManualOptionPipeline:
                 _as_utc(self.clock(), "clock"),
             )
             context = DecisionContext(cycle_time, observed_time)
+            rate_curve = ()
+            if self.configuration.settings.risk_free_rate_source == TREASURY_CURVE_SOURCE:
+                if self.model_input_repository is None:
+                    raise RuntimeError("Treasury rate repository is unavailable")
+                rate_curve = self.model_input_repository.latest_curve(
+                    source=TREASURY_CURVE_SOURCE,
+                    market_date=context.market_time.date(),
+                    observed_at=context.observed_time,
+                )
+                if not rate_curve:
+                    raise TerminalOptionQualityError(
+                        "risk-free Treasury curve is unavailable"
+                    )
             dividend_yield = float(
                 self.configuration.settings.default_dividend_yield
             )
             dividend_quality_flags = (
                 DataQualityFlag.DIVIDEND_YIELD_DEFAULTED,
             )
-            if self.configuration.settings.equity_context_enabled:
+            dividend_cash_flows: tuple[DividendCashFlow, ...] = ()
+            dividend_coverage_available = False
+            if self.configuration.settings.dividend_input_source is not None:
+                if self.corporate_action_repository is None:
+                    raise RuntimeError("corporate-action repository is unavailable")
+                maximum_expiration = (
+                    context.market_time.date()
+                    + timedelta(
+                        days=self.configuration.policy.contract_filter.maximum_dte
+                    )
+                )
+                coverage, dividend_actions = (
+                    self.corporate_action_repository.latest_covered_actions(
+                        underlyer,
+                        "DIVIDEND",
+                        window_start=context.market_time.date(),
+                        window_end=maximum_expiration,
+                        observed_at=context.observed_time,
+                        maximum_age=timedelta(
+                            seconds=(
+                                self.configuration.settings
+                                .dividend_input_max_age_seconds
+                            )
+                        ),
+                    )
+                )
+                if coverage is None:
+                    raise TerminalOptionQualityError(
+                        "dividend corporate-action coverage is unavailable"
+                    )
+                dividend_cash_flows = tuple(
+                    DividendCashFlow(
+                        ex_date=row["ex_date"],
+                        cash_amount=Decimal(str(row["cash_amount"])),
+                    )
+                    for row in dividend_actions
+                    if row.get("ex_date") is not None
+                    and row.get("cash_amount") is not None
+                    and Decimal(str(row["cash_amount"])) > 0
+                )
+                dividend_quality_flags = ()
+                dividend_coverage_available = True
+            elif self.configuration.settings.equity_context_enabled:
                 fundamental_evidence = self.equity_evidence_repository.list_as_of(
                     underlyer,
                     DecisionWatermark(context.market_time, context.observed_time),
@@ -429,8 +537,23 @@ class ManualOptionPipeline:
                     expiration_cutoff=self.calendar.expiration_cutoff(
                         catalog[row.contract_ticker].expiration_date
                     ),
-                    risk_free_rate=float(self.configuration.settings.risk_free_rate),
+                    risk_free_rate=(
+                        interpolate_rate(
+                            rate_curve,
+                            max(
+                                (
+                                    catalog[row.contract_ticker].expiration_date
+                                    - context.market_time.date()
+                                ).days,
+                                1,
+                            ),
+                        )
+                        if rate_curve
+                        else float(self.configuration.settings.risk_free_rate)
+                    ),
                     dividend_yield=dividend_yield,
+                    dividend_cash_flows=dividend_cash_flows,
+                    dividend_coverage_available=dividend_coverage_available,
                     input_quality_flags=dividend_quality_flags,
                     normalized_observed_at=observed_time,
                 )
@@ -450,22 +573,14 @@ class ManualOptionPipeline:
             rejected_counts = dict(normalized.rejected_counts)
             if unknown_count:
                 rejected_counts["UNKNOWN_REFERENCE"] = unknown_count
-            if not normalized.matrix_snapshots:
-                raise TerminalOptionQualityError(
-                    "normalization produced no retained contracts"
+            matrix_market_time = (
+                max(
+                    snapshot.market_data_time
+                    for snapshot in normalized.matrix_snapshots
                 )
-            matrix_market_time = max(
-                snapshot.market_data_time
-                for snapshot in normalized.matrix_snapshots
+                if normalized.matrix_snapshots
+                else None
             )
-            trade_ingestion = self._ingest_trades(
-                normalized.matrix_snapshots, catalog, matrix_market_time
-            )
-            decision_observed_time = max(
-                observed_time,
-                _as_utc(self.clock(), "clock"),
-            )
-            context = DecisionContext(matrix_market_time, decision_observed_time)
             self.ingestion_repository.record_normalization(
                 batch_id,
                 catalog_row_count=len(catalog),
@@ -475,6 +590,18 @@ class ManualOptionPipeline:
                 market_data_time=matrix_market_time,
                 first_observed_at=observed_time,
             )
+            if not normalized.matrix_snapshots:
+                raise TerminalOptionQualityError(
+                    "normalization produced no retained contracts"
+                )
+            trade_ingestion = self._ingest_trades(
+                normalized.matrix_snapshots, catalog, matrix_market_time
+            )
+            decision_observed_time = max(
+                observed_time,
+                _as_utc(self.clock(), "clock"),
+            )
+            context = DecisionContext(matrix_market_time, decision_observed_time)
             execution_lag = (
                 decision_observed_time - cycle_time
             ).total_seconds()
@@ -577,7 +704,7 @@ class ManualOptionPipeline:
                 received_count=0,
                 retained_count=0,
                 iv_convergence_fraction=None,
-                reasons=(type(exc).__name__,),
+                reasons=(type(exc).__name__, str(exc)),
                 retryable=retryable,
             )
 
@@ -672,7 +799,23 @@ class ManualOptionPipeline:
         reasons: list[str] = []
         requested = 0
         persisted = 0
+        monotonic = getattr(self, "monotonic", time.monotonic)
+        started_monotonic = monotonic()
         for contract in contracts:
+            if (
+                monotonic() - started_monotonic
+                >= self.configuration.settings.trade_ingestion_budget_seconds
+            ):
+                reasons.append("TRADE_INGESTION_BUDGET_EXCEEDED")
+                LOGGER.warning(
+                    "option trade ingestion budget exceeded underlyer=%s "
+                    "budget_seconds=%s completed_contracts=%s watchlist=%s",
+                    snapshots[0].underlyer,
+                    self.configuration.settings.trade_ingestion_budget_seconds,
+                    requested,
+                    len(contracts),
+                )
+                break
             cursor = self.trade_repository.get_cursor("polygon", contract.contract_id)
             try:
                 result = self.engine.get_option_trades(
@@ -683,6 +826,13 @@ class ManualOptionPipeline:
                 )
             except Exception as exc:  # provider failure must not fail the matrix
                 reasons.append(f"TRADE_FETCH_FAILED:{type(exc).__name__}")
+                LOGGER.warning(
+                    "option trade fetch skipped; continuing contract=%s "
+                    "underlyer=%s error=%s",
+                    contract.contract_ticker,
+                    contract.underlyer,
+                    type(exc).__name__,
+                )
                 continue
             requested += 1
             if not result.events:

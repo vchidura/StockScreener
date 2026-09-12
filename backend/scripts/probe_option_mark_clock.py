@@ -117,6 +117,16 @@ def main() -> int:
             f"{(probed_at - latest_bar_time).total_seconds():.1f}s"
         )
     print(f"contracts returned        {len(rows)}\n")
+    trade_times = [row["last_trade_sip"] for row in rows if row["last_trade_sip"]]
+    print(f"contracts with SIP time   {len(trade_times)}")
+    if trade_times:
+        newest_trade = max(trade_times)
+        print(f"oldest last trade SIP     {min(trade_times)}")
+        print(f"newest last trade SIP     {newest_trade}")
+        print(
+            f"newest trade age          "
+            f"{(probed_at - newest_trade).total_seconds():.1f}s\n"
+        )
 
     header = (
         f"{'ticker':<24}{'vol':>8}  {'day.last_updated':<26}"

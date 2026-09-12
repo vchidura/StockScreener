@@ -2,32 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from options.calendar import OptionExchangeCalendar
+from options.config import ValuationPolicy, load_valuation_policy
+from options.domain import MarkSource
 from options.strategies.domain import OptionSide
 
 
 MEASUREMENT_TYPES = frozenset(("15MIN", "30MIN", "60MIN", "CLOSE", "NEXT_OPEN"))
 CURRENT_MARK_MEASUREMENT = "CURRENT"
-
-
-@dataclass(frozen=True, slots=True)
-class OptionOutcomePolicy:
-    policy_version: str
-    commission_per_contract_per_side: Decimal
-    policy_sha256: str
-
-    def __post_init__(self) -> None:
-        if not self.policy_version.strip():
-            raise ValueError("policy_version cannot be blank")
-        if self.commission_per_contract_per_side < 0:
-            raise ValueError("commission cannot be negative")
-        if len(self.policy_sha256) != 64:
-            raise ValueError("policy_sha256 must be a SHA-256 digest")
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,12 +31,24 @@ class OptionOutcomeLeg:
     source_batch_id: UUID
     source_market_time: datetime
     source_observed_time: datetime
+    entry_mark_source: MarkSource
+    exit_mark_source: MarkSource
+    entry_valuation_policy_sha256: str
+    exit_valuation_policy_sha256: str
 
     def __post_init__(self) -> None:
         if self.contract_id <= 0 or self.ratio <= 0 or self.multiplier <= 0:
             raise ValueError("leg identifiers, ratio, and multiplier must be positive")
         if self.entry_mark <= 0 or self.exit_mark <= 0:
             raise ValueError("entry and exit marks must be positive")
+        for value in (
+            self.entry_valuation_policy_sha256,
+            self.exit_valuation_policy_sha256,
+        ):
+            if len(value) != 64 or any(
+                character not in "0123456789abcdef" for character in value
+            ):
+                raise ValueError("valuation policy hashes must be SHA-256 digests")
         object.__setattr__(
             self, "source_market_time",
             _utc(self.source_market_time, "source_market_time"),
@@ -81,23 +82,18 @@ class OptionDecayOutcome:
     source_batch_id: UUID
 
 
-def delayed_proxy_commission_policy(
-    commission_per_contract_per_side: Decimal = Decimal("0.65"),
-) -> OptionOutcomePolicy:
-    payload = {
-        "commission_per_contract_per_side": str(
-            commission_per_contract_per_side
-        ),
-        "mark_model": "DEVELOPER_ALIGNED_AGG_CLOSE_PACKAGE",
-        "policy_version": "option_delayed_proxy_commission_v1",
-        "slippage_model": "UNAVAILABLE",
-    }
-    digest = hashlib.sha256(_canonical_json(payload).encode("ascii")).hexdigest()
-    return OptionOutcomePolicy(
-        policy_version=payload["policy_version"],
-        commission_per_contract_per_side=commission_per_contract_per_side,
-        policy_sha256=digest,
+def configured_valuation_policy() -> ValuationPolicy:
+    backend_dir = Path(__file__).resolve().parent.parent
+    path = Path(
+        os.getenv("OPTION_VALUATION_POLICY_FILE", "options/policies/valuation_v1.json")
     )
+    if not path.is_absolute():
+        path = backend_dir / path
+    return load_valuation_policy(path.resolve())
+
+
+def delayed_proxy_commission_policy() -> ValuationPolicy:
+    return configured_valuation_policy()
 
 
 def measurement_checkpoints(
@@ -130,7 +126,7 @@ def evaluate_delayed_proxy_outcome(
     observed_time: datetime,
     capital_at_risk: Decimal,
     legs: tuple[OptionOutcomeLeg, ...],
-    policy: OptionOutcomePolicy,
+    policy: ValuationPolicy,
 ) -> OptionDecayOutcome:
     if measurement_type not in MEASUREMENT_TYPES | {CURRENT_MARK_MEASUREMENT}:
         raise ValueError("measurement_type is invalid")
@@ -142,6 +138,16 @@ def evaluate_delayed_proxy_outcome(
         raise ValueError("capital_at_risk must be positive")
     if not legs:
         raise ValueError("option outcome requires at least one leg")
+    for leg in legs:
+        if (
+            leg.entry_valuation_policy_sha256 != policy.policy_sha256
+            or leg.exit_valuation_policy_sha256 != policy.policy_sha256
+        ):
+            raise ValueError("outcome marks must match the valuation policy")
+        if leg.entry_mark_source not in policy.allowed_entry_mark_sources:
+            raise ValueError("entry mark source is not allowed by the valuation policy")
+        if leg.exit_mark_source not in policy.allowed_exit_mark_sources:
+            raise ValueError("exit mark source is not allowed by the valuation policy")
     batch_ids = {leg.source_batch_id for leg in legs}
     if len(batch_ids) != 1:
         raise ValueError("option outcome legs must use one coherent source batch")
@@ -181,7 +187,7 @@ def evaluate_delayed_proxy_outcome(
         availability_flag="RESEARCH_DELAYED_PROXY",
         quality_flags=(
             "COMMISSION_ONLY_COST_MODEL",
-            "DEVELOPER_ALIGNED_AGG_CLOSE",
+            policy.primary_model_mark_source.value,
             "QUOTE_LIQUIDITY_NOT_AVAILABLE",
         ),
         valuation_policy_version=policy.policy_version,

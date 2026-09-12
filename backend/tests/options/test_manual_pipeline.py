@@ -32,6 +32,7 @@ from options.domain import (
 from options.orchestration import (
     ManualOptionPipeline,
     TradeIngestionResult,
+    UnderlyingCycleResult,
     _fresh_mark_window,
     _resolve_dividend_yield,
 )
@@ -57,6 +58,8 @@ class FakeCalendar:
         return datetime.combine(value, datetime.min.time(), tzinfo=UTC).replace(hour=20)
 
     def session_for_slot(self, value):
+        if value > self.expiration_cutoff(value.date()):
+            raise ValueError("slot must not exceed its session close")
         return value.date()
 
 
@@ -229,6 +232,15 @@ class FakeDailyFactRepository:
         return len(records)
 
 
+class FakeBoardRepository:
+    def __init__(self):
+        self.calls = []
+
+    def publish_complete_cycle(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(status="PUBLISHED", member_count=3)
+
+
 class FakeAnalysisRepository:
     def __init__(self, existing=None):
         self.finished = None
@@ -390,6 +402,55 @@ def test_manual_pipeline_reports_progress_between_underlyers():
     assert heartbeats == [OBSERVED_AT, OBSERVED_AT]
 
 
+def test_board_publication_runs_only_for_complete_configured_universe():
+    configuration = load_option_runtime_configuration(
+        {"POLYGON_API_KEY": "test-secret"}, BACKEND_DIR
+    )
+    board = FakeBoardRepository()
+    strategy_pipeline = SimpleNamespace()
+    pipeline = ManualOptionPipeline(
+        configuration,
+        FakeEngine(),
+        calendar=FakeCalendar(),
+        catalog_repository=FakeCatalogRepository(),
+        universe_repository=FakeUniverseRepository(),
+        ingestion_repository=FakeIngestionRepository(),
+        snapshot_repository=FakeSnapshotRepository(),
+        gamma_repository=FakeGammaRepository(),
+        daily_fact_repository=FakeDailyFactRepository(),
+        analysis_repository=FakeAnalysisRepository(),
+        work_repository=FakeWorkRepository(),
+        strategy_pipeline=strategy_pipeline,
+        board_repository=board,
+        clock=lambda: OBSERVED_AT,
+    )
+    pipeline._run_underlying = lambda underlyer, asset_type, session, cycle: (
+        UnderlyingCycleResult(
+            underlyer, asset_type, uuid4(), uuid4(), "COMPLETE",
+            1, 1, 1.0, (),
+        )
+    )
+
+    partial = pipeline.run_once(
+        (configuration.settings.underlyers[0],),
+        as_of=OBSERVED_AT,
+        cycle_time=MARKET_TIME,
+    )
+    complete = pipeline.run_once(
+        configuration.settings.underlyers,
+        as_of=OBSERVED_AT,
+        cycle_time=MARKET_TIME,
+    )
+
+    assert partial.board_publication is None
+    assert len(board.calls) == 1
+    assert board.calls[0]["expected_underlyers"] == (
+        configuration.settings.underlyers
+    )
+    assert board.calls[0]["scheduled_cycle"] == MARKET_TIME
+    assert complete.board_publication.status == "PUBLISHED"
+
+
 def test_manual_pipeline_extends_chain_to_retained_candidate_legs():
     configuration = load_option_runtime_configuration(
         {"POLYGON_API_KEY": "test-secret"}, BACKEND_DIR
@@ -425,7 +486,12 @@ def test_manual_pipeline_extends_chain_to_retained_candidate_legs():
 
     pipeline.run_once(("SPY",), as_of=OBSERVED_AT)
 
-    expected = (date(2026, 10, 12), Decimal("75"), Decimal("130"))
+    expected = (
+        MARKET_TIME.date()
+        + timedelta(days=configuration.policy.contract_filter.maximum_dte),
+        Decimal("75"),
+        Decimal("130"),
+    )
     assert engine.reference_bounds == expected
     assert engine.chain_bounds == expected
 
@@ -464,7 +530,10 @@ def test_empty_normalized_matrix_is_terminal_quality_failure():
 
     assert result.results[0].status == "FAILED"
     assert result.results[0].retryable is False
-    assert result.results[0].reasons == ("TerminalOptionQualityError",)
+    assert result.results[0].reasons == (
+        "TerminalOptionQualityError",
+        "normalization produced no retained contracts",
+    )
     assert work.terminal_error == "normalization produced no retained contracts"
 
 

@@ -8,6 +8,7 @@ from options.analytics.volatility_risk_premium import (
     ExpirationIvPoint,
     calculate_variance_risk_premium,
     interpolate_total_variance,
+    interpolate_total_variance_at_maturity,
     summarize_expiration_atm_iv,
 )
 from options.domain import ContractType
@@ -110,6 +111,16 @@ def test_total_variance_interpolation_refuses_extrapolation():
         _expiration(date(2026, 3, 6), 50 / 252, 0.32),
     )
     assert interpolate_total_variance(points, 21) is None
+
+
+def test_calendar_maturity_does_not_expand_days_into_trading_sessions():
+    exact = _expiration(date(2026, 2, 14), 45 / 365, 0.31)
+
+    calendar_match = interpolate_total_variance_at_maturity((exact,), 45 / 365)
+
+    assert calendar_match is not None
+    assert calendar_match.implied_volatility == pytest.approx(0.31)
+    assert interpolate_total_variance((exact,), 45) is None
 
 
 def test_variance_risk_premium_reports_forecast_and_realized_spreads():

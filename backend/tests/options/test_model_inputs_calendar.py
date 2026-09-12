@@ -59,3 +59,29 @@ def test_model_assumptions_are_fingerprinted_and_missing_dividend_is_explicit():
     assert normalization_input.input_quality_flags == (
         DataQualityFlag.DIVIDEND_YIELD_DEFAULTED,
     )
+
+
+def test_event_calendar_freshness_is_fingerprinted():
+    baseline = load_option_runtime_configuration(
+        {"POLYGON_API_KEY": "secret"}, BACKEND_DIR
+    )
+    changed = load_option_runtime_configuration(
+        {
+            "POLYGON_API_KEY": "secret",
+            "OPTION_EVENT_CALENDAR_MAX_AGE_SECONDS": "21600",
+        },
+        BACKEND_DIR,
+    )
+
+    assert baseline.settings.event_calendar_max_age_seconds == 43200
+    assert baseline.configuration_sha256 != changed.configuration_sha256
+
+
+def test_iv_readiness_requires_dated_model_inputs():
+    source = (
+        BACKEND_DIR / "scripts" / "report_option_iv_context_readiness.py"
+    ).read_text(encoding="utf-8")
+
+    assert "POINT_IN_TIME_RATES_NOT_CONFIGURED" in source
+    assert "POINT_IN_TIME_DIVIDENDS_NOT_CONFIGURED" in source
+    assert 'risk_free_rate_source != "manual_config_v1"' in source

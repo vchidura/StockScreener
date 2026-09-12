@@ -2,8 +2,9 @@ import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -13,15 +14,19 @@ if str(BACKEND_DIR) not in sys.path:
 
 from main import app
 from options.api import (
+    _event_asset_type,
+    _event_window_state,
     _performance_checkpoints,
     option_candidate_detail,
     option_candidates,
     option_data_quality,
+    option_event_calendar_reference,
     option_flow,
     option_gamma,
     option_health,
     option_opportunities,
     option_performance,
+    option_screener,
     option_signals,
     option_universe,
 )
@@ -36,12 +41,78 @@ def test_options_health_exposes_delayed_read_only_contract():
     assert payload["data_tier"] == "15-MINUTE DELAYED RESEARCH DATA"
     assert payload["data"]["read_only"] is True
     assert payload["data"]["schema_ready"] is True
+    assert payload["data"]["valuation_policy_version"] == "option_valuation_v1"
+    assert len(payload["data"]["valuation_policy_sha256"]) == 64
+    settlement = payload["data"]["settlement_valuation_policy"]
+    assert settlement["version"] == "option_settlement_valuation_v1"
+    assert settlement["adjusted"] is False
+    assert settlement["iv_context_ready"] is False
+    assert payload["data"]["event_calendar"]["coverage_required"] is True
+    assert payload["data"]["event_calendar"]["maximum_age_seconds"] == 43200
+    assert payload["data"]["event_calendar"]["status"] in {
+        "UNCONFIGURED", "CONFIGURED_COVERAGE_REQUIRED",
+    }
     workbench = payload["data"]["candidate_workbench"]
     # An empty cohort is a legitimate state after a purge, so assert the shape of the
     # contract rather than the presence of rows.
     assert isinstance(workbench["available"], bool)
     assert workbench["candidate_count"] >= 0
     assert workbench["available"] is (workbench["candidate_count"] > 0)
+    publication = payload["data"]["board_publication"]
+    assert publication["expected_underlyings"] == 13
+    assert len(publication["selector_sha256"]) == 64
+    assert publication["publishable"] is (
+        publication["covered_underlyings"] == publication["expected_underlyings"]
+    )
+
+
+def test_ticker_event_calendar_fails_closed_when_source_is_unconfigured(monkeypatch):
+    monkeypatch.setattr(
+        "options.api._configuration",
+        lambda: SimpleNamespace(
+            settings=SimpleNamespace(
+                event_calendar_provider=None,
+                event_calendar_max_age_seconds=43200,
+                fixed_etf_underlyers=("SPY", "QQQ", "IWM"),
+            ),
+            policy_sha256="a" * 64,
+        ),
+    )
+    payload = option_event_calendar_reference(
+        "AAPL", days_forward=30
+    ).model_dump(mode="json")
+
+    assert payload["available"] is False
+    assert payload["reason"] == "EVENT_CALENDAR_UNCONFIGURED"
+    assert payload["data"]["earnings_state"] == "UNAVAILABLE"
+    assert payload["data"]["fed_state"] == "UNAVAILABLE"
+    assert payload["data"]["events"] == []
+
+
+def test_event_window_state_requires_coverage_before_absence_means_clear():
+    assert _event_window_state("EARNINGS", [], []) == "UNAVAILABLE"
+    coverage = [{"event_type": "EARNINGS"}]
+    assert _event_window_state("EARNINGS", coverage, []) == "CLEAR"
+    assert _event_window_state(
+        "EARNINGS",
+        coverage,
+        [{"event_type": "EARNINGS", "status": "SCHEDULED"}],
+    ) == "BLOCKED"
+    assert _event_window_state(
+        "EARNINGS",
+        coverage,
+        [{"event_type": "EARNINGS", "status": "CANCELED"}],
+    ) == "CLEAR"
+
+
+def test_event_asset_type_uses_equity_reference_outside_option_universe(monkeypatch):
+    reference = type("Reference", (), {"security_type": "ETF"})()
+    monkeypatch.setattr(
+        "options.api.EquityReferenceRepository.get_security_as_of",
+        lambda self, symbol, context: reference,
+    )
+
+    assert _event_asset_type("ARKK", datetime.now(timezone.utc), ()) == "ETF"
 
 
 def test_options_gamma_returns_profiles_for_the_active_policy():
@@ -102,6 +173,8 @@ def test_options_flow_exposes_activity_without_inferred_direction():
     payload = option_flow(underlyer="SPY").model_dump(mode="json")
     data = payload["data"]
 
+    if data["session_date"] is None:
+        pytest.skip("no completed matrix under the active market-data policy")
     assert data["selected"]
     assert data["session_date"]
     assert data["directional_flow_available"] is False
@@ -131,6 +204,9 @@ def test_candidate_workbench_exposes_typed_delayed_research_contract():
     assert payload["data"]["title"] == "Weekly Research Candidates"
     assert payload["data"]["quote_liquidity"] == "NOT_AVAILABLE"
     assert payload["data"]["execution_mode"] == "READ_ONLY_RESEARCH"
+    assert payload["data"]["serving_mode"] in {
+        "CURRENT_POLICY", "HISTORICAL_PREVIOUS_POLICY",
+    }
     assert payload["data"]["limit"] == 5
     assert set(payload["data"]["status_counts"]) == {
         "selected",
@@ -143,6 +219,8 @@ def test_candidate_workbench_exposes_typed_delayed_research_contract():
         ).model_dump(mode="json")
         assert detail["available"] is True
         assert detail["data"]["execution_mode"] == "READ_ONLY_RESEARCH"
+        assert isinstance(detail["data"]["market_event_evidence"], list)
+        assert isinstance(detail["data"]["event_coverage_evidence"], list)
 
 
 def test_research_findings_expose_distinct_source_contracts():
@@ -176,6 +254,40 @@ def test_recommendation_api_exposes_persisted_signal_contract():
     for row in payload["data"]["rows"]:
         assert isinstance(row["legs"], list)
         assert row["expected_leg_count"] == len(row["legs"])
+
+
+def test_options_screener_exposes_detected_contract_metrics():
+    payload = option_screener(
+        session_date=None,
+        scope="ALL",
+        underlyer=None,
+        contract_type=None,
+        strategy=None,
+        minimum_dte=0,
+        maximum_dte=60,
+        minimum_volume=0,
+        minimum_open_interest=0,
+        minimum_volume_oi_ratio=0,
+        sort="PREMIUM_ACTIVITY",
+        limit=5,
+        offset=0,
+    ).model_dump(mode="json")
+
+    assert payload["reason"] in {None, "NO_DETECTED_CONTRACTS"}
+    assert payload["data"]["scope"] == "ALL"
+    assert payload["data"]["sort"] == "PREMIUM_ACTIVITY"
+    assert payload["data"]["directional_flow_available"] is False
+    assert payload["data"]["quote_liquidity"] == "NOT_AVAILABLE"
+    assert payload["data"]["serving_mode"] in {
+        "CURRENT_POLICY", "HISTORICAL_PREVIOUS_POLICY",
+    }
+    assert "not transacted premium" in payload["data"]["definitions"]["premium_activity"]
+    contract_ids = [row["contract_id"] for row in payload["data"]["rows"]]
+    assert len(contract_ids) == len(set(contract_ids))
+    for row in payload["data"]["rows"]:
+        assert row["contract_type"] in {"CALL", "PUT"}
+        assert row["calendar_dte"] >= 0
+        assert row["strategy_names"]
 
 
 def test_performance_api_exposes_checkpoint_and_management_contract():
@@ -248,6 +360,20 @@ def test_legacy_opportunity_board_cohort_is_an_alias_for_rank_leaders():
     assert payload["data"]["board_membership_exact"] is False
 
 
+def test_exact_board_performance_is_prospective_publication_membership():
+    payload = option_performance(
+        cohort="BOARD_PUBLICATIONS", days=14, limit=1, offset=0
+    ).model_dump(mode="json")
+
+    assert payload["data"]["cohort"] == "BOARD_PUBLICATIONS"
+    assert payload["data"]["requested_cohort"] == "BOARD_PUBLICATIONS"
+    assert payload["data"]["entry_basis"] == "FIRST_PUBLISHED_BOARD_MEMBERSHIP"
+    assert payload["data"]["board_membership_exact"] is True
+    assert "Coverage begins with the first prospective publication" in (
+        payload["data"]["cohort_definition"]
+    )
+
+
 def test_performance_checkpoints_distinguish_available_pending_and_not_due():
     market_time = datetime(2026, 9, 2, 14, 0, tzinfo=UTC)
     outcome = {"measurement_type": "15MIN", "net_pnl": "10.00"}
@@ -273,9 +399,13 @@ def test_performance_checkpoints_distinguish_available_pending_and_not_due():
 def test_opportunity_board_separates_structures_from_research_detectors():
     payload = option_opportunities(per_strategy=1).model_dump(mode="json")
 
-    assert payload["reason"] in {None, "NO_OPPORTUNITY_RESULTS"}
-    assert payload["data"]["selection_basis"] == "BACKEND_STRATEGY_RANK"
+    assert payload["reason"] in {None, "NO_COMPLETE_BOARD_PUBLICATION"}
+    assert payload["data"]["selection_basis"] == "IMMUTABLE_BOARD_PUBLICATION"
     assert payload["data"]["execution_mode"] == "READ_ONLY_RESEARCH"
+    if payload["available"]:
+        assert payload["data"]["serving_mode"] in {
+            "CURRENT_POLICY", "HISTORICAL_PREVIOUS_POLICY",
+        }
     assert payload["data"]["configured_underlyer_count"] == 13
     assert payload["data"]["covered_underlyer_count"] == len(
         payload["data"]["underlyers"]
@@ -297,12 +427,29 @@ def test_opportunity_board_separates_structures_from_research_detectors():
         assert isinstance(row["legs"], list)
 
 
-def test_opportunity_board_excludes_contracts_selected_by_earlier_matrix():
+def test_opportunity_board_reads_immutable_publication_members():
     cursor = MagicMock()
-    cursor.fetchone.return_value = {"ready": True}
+    publication_id = uuid4()
+    matrix_id = uuid4()
+    cursor.fetchone.side_effect = [
+        {"ready": True},
+        {"ready": True},
+        {
+            "publication_id": publication_id,
+            "source_matrix_ids": [matrix_id],
+            "market_data_time": datetime(2026, 9, 4, 15, 0, tzinfo=UTC),
+            "observed_time": datetime(2026, 9, 4, 15, 15, tzinfo=UTC),
+            "covered_underlying_count": 1,
+            "scheduled_cycle": datetime(2026, 9, 4, 15, 0, tzinfo=UTC),
+            "published_at": datetime(2026, 9, 4, 15, 16, tzinfo=UTC),
+            "selector_version": "option_board_selector_v1",
+            "selector_sha256": "b" * 64,
+            "selection_evidence": {"persisted_members": 0},
+        },
+    ]
     cursor.fetchall.side_effect = [[{
         "underlying": "SPY",
-        "matrix_id": "current-matrix",
+        "matrix_id": matrix_id,
         "analysis_status": "COMPLETE",
         "market_data_time": datetime(2026, 9, 4, 15, 0, tzinfo=UTC),
         "observed_time": datetime(2026, 9, 4, 15, 15, tzinfo=UTC),
@@ -322,14 +469,13 @@ def test_opportunity_board_excludes_contracts_selected_by_earlier_matrix():
         result = option_opportunities(per_strategy=1)
 
     assert result.data["structured"] == []
+    assert result.data["publication_id"] == publication_id
+    assert result.data["selection_basis"] == "IMMUTABLE_BOARD_PUBLICATION"
     opportunity_sql = cursor.execute.call_args_list[-1].args[0]
-    assert "candidate_contracts AS MATERIALIZED" in opportunity_sql
-    assert "first_selected_contracts AS MATERIALIZED" in opportunity_sql
-    assert "first_contract.matrix_id <> candidate.matrix_id" in opportunity_sql
-    assert "first_contract.market_data_time < candidate.market_data_time" in opportunity_sql
-    assert "current_contract.candidate_id = candidate.candidate_id" in opportunity_sql
-    assert "candidate.rank_components->>'contract_id' IS NOT NULL" in opportunity_sql
-    assert "FROM policy_candidates AS candidate" in opportunity_sql
+    assert "FROM option_board_members AS member" in opportunity_sql
+    assert "member.publication_id = %s" in opportunity_sql
+    assert "member.board_position <= %s" in opportunity_sql
+    assert "first_selected_contracts" not in opportunity_sql
 
 
 def test_data_quality_explains_retention_and_unknown_references():
@@ -368,6 +514,7 @@ def test_options_routes_are_registered_on_main_app():
         "/api/options/flow",
         "/api/options/data-quality",
         "/api/options/opportunities",
+        "/api/options/screener",
         "/api/options/candidates",
         "/api/options/candidates/{candidate_id}",
         "/api/options/scenarios/{candidate_id}",

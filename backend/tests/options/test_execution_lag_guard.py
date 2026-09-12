@@ -57,7 +57,7 @@ def test_default_lag_ceiling_matches_the_source_age_window():
         {"POLYGON_API_KEY": "test-secret"}, BACKEND_DIR
     )
     assert configuration.settings.maximum_execution_lag_seconds == (
-        configuration.policy.model_quality.maximum_developer_source_age_seconds
+        configuration.valuation_policy.maximum_source_age_seconds
     )
 
 

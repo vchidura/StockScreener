@@ -84,7 +84,10 @@ def main() -> int:
         worker = OptionMaterializationWorker(
             pipeline,
             underlyers=underlyers,
-            outcome_service=OptionOutcomeService(outcome_repository),
+            outcome_service=OptionOutcomeService(
+                outcome_repository,
+                policy=configuration.valuation_policy,
+            ),
             partition_maintainer=ensure_option_partitions,
         )
         if args.once:

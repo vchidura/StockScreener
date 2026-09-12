@@ -90,11 +90,23 @@ class OptionStrategyPipeline:
             raise ValueError(f"underlyers are not configured: {sorted(unknown)}")
         now = datetime.now(timezone.utc)
         read_context = _read_context(now)
+        if set(requested) == set(self.configuration.settings.underlyers):
+            runs = self.analysis_repository.list_latest_complete_cycle(
+                tuple(requested),
+                read_context,
+                self.configuration.policy_sha256,
+            )
+        else:
+            runs = tuple(
+                run
+                for underlyer in requested
+                if (run := self.analysis_repository.get_latest(
+                    underlyer, read_context
+                )) is not None
+            )
         results: list[StrategyMatrixResult] = []
-        for underlyer in requested:
-            run = self.analysis_repository.get_latest(underlyer, read_context)
-            if run is None:
-                continue
+        for run in runs:
+            underlyer = run.underlyer
             asset_type = (
                 AssetType.ETF
                 if underlyer in self.configuration.settings.fixed_etf_underlyers
@@ -210,8 +222,11 @@ class OptionStrategyPipeline:
                 underlyer,
                 asset_type,
                 decision_context,
-                event_calendar_available=(
-                    self.configuration.settings.event_calendar_provider is not None
+                event_calendar_provider=(
+                    self.configuration.settings.event_calendar_provider
+                ),
+                event_calendar_max_age_seconds=(
+                    self.configuration.settings.event_calendar_max_age_seconds
                 ),
                 policy_version=self.configuration.strategy_policy.strategy_version,
                 policy_sha256=self.configuration.strategy_policy_sha256,

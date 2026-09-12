@@ -8,13 +8,27 @@ import pytest
 from database import get_db_connection
 from options.calendar import OptionExchangeCalendar
 from options.repositories.daily_facts import (
-    MARK_SOURCE_DAILY_AGGREGATE,
+    MARK_SOURCE_DAILY_AGGREGATE_UNADJUSTED,
     OPEN_INTEREST_SOURCE_CHAIN_SNAPSHOT,
     READ_QUERIES,
     DailyMarkRecord,
     DailyOpenInterestRecord,
     OptionDailyFactRepository,
 )
+
+
+SETTLEMENT_POLICY_VERSION = "option_settlement_valuation_v1"
+SETTLEMENT_POLICY_SHA256 = "a" * 64
+
+
+def _mark_record(**values):
+    return DailyMarkRecord(
+        mark_source=MARK_SOURCE_DAILY_AGGREGATE_UNADJUSTED,
+        mark_adjusted=False,
+        valuation_policy_version=SETTLEMENT_POLICY_VERSION,
+        valuation_policy_sha256=SETTLEMENT_POLICY_SHA256,
+        **values,
+    )
 
 
 @pytest.fixture
@@ -156,7 +170,7 @@ def test_marks_and_open_interest_share_one_row(rolled_back_repository):
     )
     repository.persist_marks(
         [
-            DailyMarkRecord(
+            _mark_record(
                 contract_id=contract_id,
                 settlement_session=session,
                 underlying=underlying,
@@ -181,7 +195,7 @@ def test_marks_and_open_interest_share_one_row(rolled_back_repository):
     assert len(rows) == 1
     assert rows[0][0] == 250
     assert rows[0][1] == Decimal("1.25000000")
-    assert rows[0][2] == MARK_SOURCE_DAILY_AGGREGATE
+    assert rows[0][2] == MARK_SOURCE_DAILY_AGGREGATE_UNADJUSTED
 
 
 def test_marks_may_exist_without_open_interest(rolled_back_repository):
@@ -192,7 +206,7 @@ def test_marks_may_exist_without_open_interest(rolled_back_repository):
     session = date(1999, 1, 7)
     repository.persist_marks(
         [
-            DailyMarkRecord(
+            _mark_record(
                 contract_id=contract_id,
                 settlement_session=session,
                 underlying=underlying,
@@ -208,6 +222,62 @@ def test_marks_may_exist_without_open_interest(rolled_back_repository):
             (contract_id, session),
         )
         assert cursor.fetchone() == (None, Decimal("2.50000000"))
+
+
+def test_settlement_mark_revisions_are_idempotent_and_policy_versioned(
+    rolled_back_repository,
+):
+    repository, connection = rolled_back_repository
+    with connection.cursor() as cursor:
+        contract_id, underlying = _contract(cursor)
+    values = {
+        "contract_id": contract_id,
+        "settlement_session": date(1999, 1, 8),
+        "underlying": underlying,
+        "close": Decimal("2.75"),
+        "observed_at": datetime(1999, 1, 9, 14, 0, tzinfo=timezone.utc),
+    }
+    first = _mark_record(**values)
+    second_policy = DailyMarkRecord(
+        **values,
+        mark_source=MARK_SOURCE_DAILY_AGGREGATE_UNADJUSTED,
+        mark_adjusted=False,
+        valuation_policy_version="option_settlement_valuation_v2",
+        valuation_policy_sha256="b" * 64,
+    )
+
+    assert repository.persist_marks((first,)) == 1
+    assert repository.persist_marks((first,)) == 0
+    assert repository.persist_marks((second_policy,)) == 1
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*), COUNT(DISTINCT valuation_policy_sha256)
+            FROM option_daily_contract_mark_revisions
+            WHERE contract_id = %s AND settlement_session = %s
+            """,
+            (contract_id, values["settlement_session"]),
+        )
+        assert cursor.fetchone() == (2, 2)
+
+
+def test_settlement_mark_revision_rejects_changed_payload_for_same_policy(
+    rolled_back_repository,
+):
+    repository, connection = rolled_back_repository
+    with connection.cursor() as cursor:
+        contract_id, underlying = _contract(cursor)
+    values = {
+        "contract_id": contract_id,
+        "settlement_session": date(1999, 1, 9),
+        "underlying": underlying,
+        "observed_at": datetime(1999, 1, 10, 14, 0, tzinfo=timezone.utc),
+    }
+    assert repository.persist_marks((_mark_record(close=Decimal("2.75"), **values),)) == 1
+
+    with pytest.raises(ValueError, match="different immutable payload"):
+        repository.persist_marks((_mark_record(close=Decimal("2.80"), **values),))
 
 
 def test_an_empty_row_is_rejected(rolled_back_repository):
@@ -267,6 +337,32 @@ def test_mark_volume_without_provenance_is_rejected(rolled_back_repository):
                     OPEN_INTEREST_SOURCE_CHAIN_SNAPSHOT,
                     datetime(1999, 1, 11, 14, 0, tzinfo=timezone.utc),
                     5000,
+                ),
+            )
+    connection.rollback()
+
+
+def test_unadjusted_mark_without_valuation_identity_is_rejected(
+    rolled_back_repository,
+):
+    _, connection = rolled_back_repository
+    with connection.cursor() as cursor:
+        contract_id, underlying = _contract(cursor)
+        with pytest.raises(Exception):
+            cursor.execute(
+                """
+                INSERT INTO option_daily_contract_facts (
+                    contract_id, settlement_session, underlying,
+                    mark_close, mark_source, mark_observed_at, mark_adjusted
+                ) VALUES (%s, %s, %s, %s, %s, %s, FALSE)
+                """,
+                (
+                    contract_id,
+                    date(1999, 1, 11),
+                    underlying,
+                    Decimal("1.00"),
+                    MARK_SOURCE_DAILY_AGGREGATE_UNADJUSTED,
+                    datetime(1999, 1, 12, 14, 0, tzinfo=timezone.utc),
                 ),
             )
     connection.rollback()
@@ -357,7 +453,7 @@ def test_detail_read_reports_volume_finality(rolled_back_repository):
 
     repository.persist_marks(
         [
-            DailyMarkRecord(
+            _mark_record(
                 contract_id=contract_id,
                 settlement_session=current,
                 underlying=underlying,
@@ -403,4 +499,10 @@ def test_table_is_classified_as_retained_provider_evidence():
     from scripts.purge_option_derived_layer import DERIVED_TABLES, RETAINED_TABLES
 
     assert "option_daily_contract_facts" in RETAINED_TABLES
+    assert "option_daily_contract_mark_revisions" in RETAINED_TABLES
+    assert "option_market_events" in RETAINED_TABLES
+    assert "option_event_calendar_coverage" in RETAINED_TABLES
     assert "option_daily_contract_facts" not in DERIVED_TABLES
+    assert "option_daily_contract_mark_revisions" not in DERIVED_TABLES
+    assert "option_context_market_event_evidence" in DERIVED_TABLES
+    assert "option_context_event_coverage_evidence" in DERIVED_TABLES

@@ -51,6 +51,8 @@ services:
       OPTION_DATA_ENGINE: ${OPTION_DATA_ENGINE:-polygon_developer}
       OPTION_UNDERLYING_DATA_PROVIDER: ${OPTION_UNDERLYING_DATA_PROVIDER:-polygon_stocks}
       OPTION_EQUITY_CONTEXT_ENABLED: ${OPTION_EQUITY_CONTEXT_ENABLED:-false}
+      OPTION_EVENT_CALENDAR_PROVIDER: ${OPTION_EVENT_CALENDAR_PROVIDER:-}
+      OPTION_EVENT_CALENDAR_MAX_AGE_SECONDS: ${OPTION_EVENT_CALENDAR_MAX_AGE_SECONDS:-43200}
       OPTION_EXECUTION_ENGINE: ${OPTION_EXECUTION_ENGINE:-paper_proxy}
       OPTION_UNIVERSE_MODE: ${OPTION_UNIVERSE_MODE:-fixed}
       OPTION_FIXED_STOCK_UNDERLYERS: ${OPTION_FIXED_STOCK_UNDERLYERS:-AAPL,AMD,AMZN,GOOGL,META,MSFT,NVDA,PLTR,SOFI,TSLA}
@@ -67,6 +69,8 @@ services:
       OPTION_RISK_FREE_RATE_SOURCE: ${OPTION_RISK_FREE_RATE_SOURCE:-manual_config_v1}
       OPTION_DEFAULT_DIVIDEND_YIELD: ${OPTION_DEFAULT_DIVIDEND_YIELD:-0}
       OPTION_POLICY_FILE: ${OPTION_POLICY_FILE:-options/policies/developer_v1.json}
+      OPTION_VALUATION_POLICY_FILE: ${OPTION_VALUATION_POLICY_FILE:-options/policies/valuation_v1.json}
+      OPTION_SETTLEMENT_VALUATION_POLICY_FILE: ${OPTION_SETTLEMENT_VALUATION_POLICY_FILE:-options/policies/settlement_valuation_v1.json}
       OPTION_STRATEGY_POLICY_FILE: ${OPTION_STRATEGY_POLICY_FILE:-options/policies/strategy_v1.json}
       OPTION_RAW_ARCHIVE_ROOT: ${OPTION_RAW_ARCHIVE_ROOT:-option-raw}
       OPTION_START_READ_ONLY: ${OPTION_START_READ_ONLY:-true}
@@ -180,6 +184,82 @@ services:
       DB_PORT: 5432
       EQUITY_PORTAL_SNAPSHOT_POLL_SECONDS: ${EQUITY_PORTAL_SNAPSHOT_POLL_SECONDS:-60}
 
+  corporate-action-worker:
+    profiles: ["equity"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: stock-screener-corporate-action-worker
+    command: python scripts/run_corporate_action_worker.py
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      equity-universe-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DB_NAME: ${DB_NAME:-stocks_db}
+      DB_USER: ${DB_USER:?DB_USER is required}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      DB_HOST: db
+      DB_PORT: 5432
+      POLYGON_API_KEY: ${POLYGON_API_KEY:?POLYGON_API_KEY is required}
+      EQUITY_CORPORATE_ACTION_POLL_SECONDS: ${EQUITY_CORPORATE_ACTION_POLL_SECONDS:-21600}
+      EQUITY_CORPORATE_ACTION_LOOKBACK_DAYS: ${EQUITY_CORPORATE_ACTION_LOOKBACK_DAYS:-30}
+      EQUITY_CORPORATE_ACTION_HORIZON_DAYS: ${EQUITY_CORPORATE_ACTION_HORIZON_DAYS:-365}
+      EQUITY_CORPORATE_ACTION_RETRY_SECONDS: ${EQUITY_CORPORATE_ACTION_RETRY_SECONDS:-300}
+      EQUITY_CORPORATE_ACTION_WORKER_LOCK_NAME: ${EQUITY_CORPORATE_ACTION_WORKER_LOCK_NAME:-stock-screener:equity-corporate-action-worker}
+
+  # Shared earnings/FOMC calendar facts for the complete equity universe.
+  market-event-worker:
+    profiles: ["calendar", "options"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: stock-screener-market-event-worker
+    command: python scripts/run_market_event_worker.py
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      equity-universe-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DB_NAME: ${DB_NAME:-stocks_db}
+      DB_USER: ${DB_USER:?DB_USER is required}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      DB_HOST: db
+      DB_PORT: 5432
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:?FINNHUB_API_KEY is required}
+      MARKET_EVENT_POLL_SECONDS: ${MARKET_EVENT_POLL_SECONDS:-21600}
+      MARKET_EVENT_LOOKBACK_DAYS: ${MARKET_EVENT_LOOKBACK_DAYS:-1}
+      MARKET_EVENT_HORIZON_DAYS: ${MARKET_EVENT_HORIZON_DAYS:-45}
+      MARKET_EVENT_WORKER_LOCK_NAME: ${MARKET_EVENT_WORKER_LOCK_NAME:-stock-screener:market-event-worker}
+
+  option-model-input-worker:
+    profiles: ["options"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: stock-screener-option-model-input-worker
+    command: python scripts/run_option_model_input_worker.py
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DB_NAME: ${DB_NAME:-stocks_db}
+      DB_USER: ${DB_USER:?DB_USER is required}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      DB_HOST: db
+      DB_PORT: 5432
+      OPTION_MODEL_INPUT_POLL_SECONDS: ${OPTION_MODEL_INPUT_POLL_SECONDS:-21600}
+      OPTION_MODEL_INPUT_RETRY_SECONDS: ${OPTION_MODEL_INPUT_RETRY_SECONDS:-300}
+      OPTION_MODEL_INPUT_WORKER_LOCK_NAME: ${OPTION_MODEL_INPUT_WORKER_LOCK_NAME:-stock-screener:option-model-input-worker}
+
   option-worker:
     profiles: ["options"]
     build:
@@ -202,6 +282,8 @@ services:
       OPTION_DATA_ENGINE: ${OPTION_DATA_ENGINE:-polygon_developer}
       OPTION_UNDERLYING_DATA_PROVIDER: ${OPTION_UNDERLYING_DATA_PROVIDER:-polygon_stocks}
       OPTION_EQUITY_CONTEXT_ENABLED: ${OPTION_EQUITY_CONTEXT_ENABLED:-false}
+      OPTION_EVENT_CALENDAR_PROVIDER: ${OPTION_EVENT_CALENDAR_PROVIDER:-}
+      OPTION_EVENT_CALENDAR_MAX_AGE_SECONDS: ${OPTION_EVENT_CALENDAR_MAX_AGE_SECONDS:-43200}
       OPTION_EXECUTION_ENGINE: ${OPTION_EXECUTION_ENGINE:-paper_proxy}
       OPTION_UNIVERSE_MODE: ${OPTION_UNIVERSE_MODE:-fixed}
       OPTION_FIXED_STOCK_UNDERLYERS: ${OPTION_FIXED_STOCK_UNDERLYERS:-AAPL,AMD,AMZN,GOOGL,META,MSFT,NVDA,PLTR,SOFI,TSLA}
@@ -213,6 +295,8 @@ services:
       OPTION_RISK_FREE_RATE_SOURCE: ${OPTION_RISK_FREE_RATE_SOURCE:-manual_config_v1}
       OPTION_DEFAULT_DIVIDEND_YIELD: ${OPTION_DEFAULT_DIVIDEND_YIELD:-0}
       OPTION_POLICY_FILE: ${OPTION_POLICY_FILE:-options/policies/developer_v1.json}
+      OPTION_VALUATION_POLICY_FILE: ${OPTION_VALUATION_POLICY_FILE:-options/policies/valuation_v1.json}
+      OPTION_SETTLEMENT_VALUATION_POLICY_FILE: ${OPTION_SETTLEMENT_VALUATION_POLICY_FILE:-options/policies/settlement_valuation_v1.json}
       OPTION_STRATEGY_POLICY_FILE: ${OPTION_STRATEGY_POLICY_FILE:-options/policies/strategy_v1.json}
       OPTION_RAW_ARCHIVE_ENABLED: ${OPTION_RAW_ARCHIVE_ENABLED:-false}
       OPTION_RAW_ARCHIVE_ROOT: ${OPTION_RAW_ARCHIVE_ROOT:-option-raw}

@@ -1,5 +1,5 @@
 {
-  "strategy_version": "phase2_v3",
+  "strategy_version": "phase2_v4",
   "gamma_squeeze": {
     "maximum_moneyness_fraction": 0.02,
     "minimum_volume_oi_ratio": 1.5,

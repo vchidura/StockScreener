@@ -94,6 +94,8 @@ def _snapshot():
         batch_id=uuid4(),
         raw_payload_sha256=HASH,
         normalized_payload_sha256=HASH,
+        valuation_policy_version="option_valuation_v1",
+        valuation_policy_sha256=HASH,
     )
 
 
@@ -121,10 +123,12 @@ def test_snapshot_bulk_write_checks_partition_and_keeps_quote_columns():
     values = bulk_insert.call_args_list[1].args[2]
     assert "option_snapshot_fact_keys" in registry_sql
     assert "bid, ask, midpoint" in sql
+    assert "valuation_policy_version, valuation_policy_sha256" in sql
     assert "ON CONFLICT" in sql
     assert "market_data_time, normalized_payload_sha256" in sql
     assert values[0][4] == "ETF"
     assert values[0][23] == "DEVELOPER_ALIGNED_AGG_CLOSE"
+    assert values[0][-2:] == ("option_valuation_v1", HASH)
     connection.commit.assert_called_once_with()
 
 

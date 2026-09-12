@@ -218,6 +218,7 @@ export default function OptionsFlowPage() {
         <div><strong>Activity, not buyer/seller premium flow</strong><span>Developer data has no NBBO aggressor side. Put bars are plotted opposite calls for comparison only; estimated premium activity uses the latest aligned mark.</span></div>
         <span className="flow-delay"><Clock3 size={13} />15-minute delayed</span>
       </section>
+      {data.serving_mode === 'HISTORICAL_PREVIOUS_POLICY' && <section className="flow-state flow-state--warning"><AlertTriangle size={20} /><div><strong>Historical policy matrix</strong><span>The active valuation policy has not completed this underlying yet. Activity below uses the latest prior-policy matrix.</span></div></section>}
 
       <section className="flow-command" aria-label="Options flow filters">
         <label>Underlying<select value={data.selected} onChange={event => setSearchParams({ underlyer: event.target.value })}>{data.underlyers.map(row => <option key={row.underlying} value={row.underlying}>{row.underlying} · {row.asset_type}</option>)}</select></label>

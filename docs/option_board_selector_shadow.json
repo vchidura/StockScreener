@@ -1,0 +1,482 @@
+{
+  "generated_at": "2026-09-11 05:33:51.103422+00:00",
+  "evaluation_start": "2026-08-12 05:33:51.103422+00:00",
+  "days": 30,
+  "strategy_policy_sha256": "2409bcf43995743737459e33115baac9157f952786fe0f032de91b8415f32d74",
+  "valuation_policy_sha256": "2578a9fafacfdf138b3d66e5b70869125d81eb7665230e61d1aa10766f71417a",
+  "candidate_observations_loaded": 54819,
+  "candidate_sessions": 3,
+  "variants": {
+    "LIFETIME_GLOBAL": {
+      "input_candidates": 54819,
+      "excluded_candidates": 49489,
+      "exclusion_fraction": 0.9027709370838578,
+      "surviving_candidates": 5330,
+      "member_occurrences": 2759,
+      "position_one_members": 1387,
+      "structured_position_one": 516,
+      "research_position_one": 871,
+      "distinct_sessions": 3,
+      "underlying_coverage": 13,
+      "strategy_coverage": 8,
+      "by_strategy": {
+        "DIRECTIONAL_DEBIT_SPREAD": 67,
+        "DIRECTIONAL_LONG_PREMIUM": 144,
+        "INCOME_WHEEL": 157,
+        "SPREAD_RANGE_LOCATOR": 143,
+        "SWEEP_LIKE_CLUSTER": 5,
+        "VOLATILITY_SMILE_DISTORTION": 473,
+        "VOLUME_OI_ANOMALY": 393,
+        "ZERO_DTE_GAMMA_SQUEEZE": 5
+      },
+      "by_candidate_kind": {
+        "MULTI_LEG": 210,
+        "RESEARCH_ONLY": 871,
+        "SINGLE_CONTRACT": 306
+      },
+      "raw_rank": {
+        "median": 3,
+        "p90": 17.0,
+        "maximum": 93,
+        "above_one": 961
+      },
+      "logical_packages": 2759,
+      "recurring_packages": 0,
+      "repeated_occurrences": 0,
+      "repeat_fraction": 0.0,
+      "measured_structured_candidates": 107,
+      "outcomes_by_horizon": {
+        "15MIN": {
+          "outcomes": 87,
+          "independent_sessions": 3,
+          "mean_net_return": -0.045954410229885057,
+          "positive_fraction": 0.3563218390804598,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "30MIN": {
+          "outcomes": 68,
+          "independent_sessions": 3,
+          "mean_net_return": -0.07581974397058823,
+          "positive_fraction": 0.35294117647058826,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "60MIN": {
+          "outcomes": 64,
+          "independent_sessions": 2,
+          "mean_net_return": -0.043018537031250005,
+          "positive_fraction": 0.390625,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "CLOSE": {
+          "outcomes": 3,
+          "independent_sessions": 1,
+          "mean_net_return": 0.10501293,
+          "positive_fraction": 1.0,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "NEXT_OPEN": {
+          "outcomes": 9,
+          "independent_sessions": 1,
+          "mean_net_return": 0.04199165888888889,
+          "positive_fraction": 0.3333333333333333,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        }
+      }
+    },
+    "SAME_SESSION_GLOBAL": {
+      "input_candidates": 54819,
+      "excluded_candidates": 45364,
+      "exclusion_fraction": 0.8275233039639541,
+      "surviving_candidates": 9455,
+      "member_occurrences": 4044,
+      "position_one_members": 1917,
+      "structured_position_one": 930,
+      "research_position_one": 987,
+      "distinct_sessions": 3,
+      "underlying_coverage": 13,
+      "strategy_coverage": 8,
+      "by_strategy": {
+        "DIRECTIONAL_DEBIT_SPREAD": 163,
+        "DIRECTIONAL_LONG_PREMIUM": 254,
+        "INCOME_WHEEL": 235,
+        "SPREAD_RANGE_LOCATOR": 262,
+        "SWEEP_LIKE_CLUSTER": 8,
+        "VOLATILITY_SMILE_DISTORTION": 559,
+        "VOLUME_OI_ANOMALY": 420,
+        "ZERO_DTE_GAMMA_SQUEEZE": 16
+      },
+      "by_candidate_kind": {
+        "MULTI_LEG": 425,
+        "RESEARCH_ONLY": 987,
+        "SINGLE_CONTRACT": 505
+      },
+      "raw_rank": {
+        "median": 2,
+        "p90": 17.0,
+        "maximum": 90,
+        "above_one": 1185
+      },
+      "logical_packages": 3543,
+      "recurring_packages": 427,
+      "repeated_occurrences": 501,
+      "repeat_fraction": 0.12388724035608309,
+      "measured_structured_candidates": 299,
+      "outcomes_by_horizon": {
+        "15MIN": {
+          "outcomes": 228,
+          "independent_sessions": 3,
+          "mean_net_return": -0.03149434978070176,
+          "positive_fraction": 0.44298245614035087,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "30MIN": {
+          "outcomes": 140,
+          "independent_sessions": 3,
+          "mean_net_return": -0.0528807715,
+          "positive_fraction": 0.45714285714285713,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "60MIN": {
+          "outcomes": 108,
+          "independent_sessions": 3,
+          "mean_net_return": -0.012683800277777778,
+          "positive_fraction": 0.42592592592592593,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "CLOSE": {
+          "outcomes": 3,
+          "independent_sessions": 1,
+          "mean_net_return": 0.10501293,
+          "positive_fraction": 1.0,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "NEXT_OPEN": {
+          "outcomes": 9,
+          "independent_sessions": 1,
+          "mean_net_return": 0.04199165888888889,
+          "positive_fraction": 0.3333333333333333,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        }
+      }
+    },
+    "PREVIOUS_MATRIX_GLOBAL": {
+      "input_candidates": 54819,
+      "excluded_candidates": 36989,
+      "exclusion_fraction": 0.674747806417483,
+      "surviving_candidates": 17830,
+      "member_occurrences": 7541,
+      "position_one_members": 3272,
+      "structured_position_one": 2079,
+      "research_position_one": 1193,
+      "distinct_sessions": 3,
+      "underlying_coverage": 13,
+      "strategy_coverage": 8,
+      "by_strategy": {
+        "DIRECTIONAL_DEBIT_SPREAD": 445,
+        "DIRECTIONAL_LONG_PREMIUM": 536,
+        "INCOME_WHEEL": 536,
+        "SPREAD_RANGE_LOCATOR": 539,
+        "SWEEP_LIKE_CLUSTER": 13,
+        "VOLATILITY_SMILE_DISTORTION": 608,
+        "VOLUME_OI_ANOMALY": 572,
+        "ZERO_DTE_GAMMA_SQUEEZE": 23
+      },
+      "by_candidate_kind": {
+        "MULTI_LEG": 984,
+        "RESEARCH_ONLY": 1193,
+        "SINGLE_CONTRACT": 1095
+      },
+      "raw_rank": {
+        "median": 2.0,
+        "p90": 9.0,
+        "maximum": 88,
+        "above_one": 1758
+      },
+      "logical_packages": 4338,
+      "recurring_packages": 1541,
+      "repeated_occurrences": 3203,
+      "repeat_fraction": 0.42474472881580694,
+      "measured_structured_candidates": 523,
+      "outcomes_by_horizon": {
+        "15MIN": {
+          "outcomes": 405,
+          "independent_sessions": 3,
+          "mean_net_return": 0.35709584975308645,
+          "positive_fraction": 0.4469135802469136,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "30MIN": {
+          "outcomes": 264,
+          "independent_sessions": 3,
+          "mean_net_return": -0.02536649454545455,
+          "positive_fraction": 0.3939393939393939,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "60MIN": {
+          "outcomes": 173,
+          "independent_sessions": 3,
+          "mean_net_return": 0.31297455976878613,
+          "positive_fraction": 0.3699421965317919,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "CLOSE": {
+          "outcomes": 3,
+          "independent_sessions": 1,
+          "mean_net_return": 0.10501293,
+          "positive_fraction": 1.0,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "NEXT_OPEN": {
+          "outcomes": 20,
+          "independent_sessions": 2,
+          "mean_net_return": 0.0014305254999999995,
+          "positive_fraction": 0.3,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        }
+      }
+    },
+    "SAME_STRATEGY_GRACE_1": {
+      "input_candidates": 54819,
+      "excluded_candidates": 38496,
+      "exclusion_fraction": 0.7022382750506211,
+      "surviving_candidates": 16323,
+      "member_occurrences": 7318,
+      "position_one_members": 3206,
+      "structured_position_one": 2020,
+      "research_position_one": 1186,
+      "distinct_sessions": 3,
+      "underlying_coverage": 13,
+      "strategy_coverage": 8,
+      "by_strategy": {
+        "DIRECTIONAL_DEBIT_SPREAD": 468,
+        "DIRECTIONAL_LONG_PREMIUM": 524,
+        "INCOME_WHEEL": 467,
+        "SPREAD_RANGE_LOCATOR": 498,
+        "SWEEP_LIKE_CLUSTER": 16,
+        "VOLATILITY_SMILE_DISTORTION": 613,
+        "VOLUME_OI_ANOMALY": 557,
+        "ZERO_DTE_GAMMA_SQUEEZE": 63
+      },
+      "by_candidate_kind": {
+        "MULTI_LEG": 966,
+        "RESEARCH_ONLY": 1186,
+        "SINGLE_CONTRACT": 1054
+      },
+      "raw_rank": {
+        "median": 2.0,
+        "p90": 13.0,
+        "maximum": 107,
+        "above_one": 1816
+      },
+      "logical_packages": 4823,
+      "recurring_packages": 1456,
+      "repeated_occurrences": 2495,
+      "repeat_fraction": 0.34094014758130636,
+      "measured_structured_candidates": 533,
+      "outcomes_by_horizon": {
+        "15MIN": {
+          "outcomes": 412,
+          "independent_sessions": 3,
+          "mean_net_return": 0.16309096213592236,
+          "positive_fraction": 0.4174757281553398,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "30MIN": {
+          "outcomes": 274,
+          "independent_sessions": 3,
+          "mean_net_return": 0.08860175945255475,
+          "positive_fraction": 0.39416058394160586,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "60MIN": {
+          "outcomes": 195,
+          "independent_sessions": 3,
+          "mean_net_return": 0.24777760594871792,
+          "positive_fraction": 0.36923076923076925,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "CLOSE": {
+          "outcomes": 3,
+          "independent_sessions": 1,
+          "mean_net_return": 0.10501293,
+          "positive_fraction": 1.0,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "NEXT_OPEN": {
+          "outcomes": 18,
+          "independent_sessions": 2,
+          "mean_net_return": 0.01409426111111111,
+          "positive_fraction": 0.2777777777777778,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        }
+      }
+    },
+    "SAME_STRATEGY_GRACE_2": {
+      "input_candidates": 54819,
+      "excluded_candidates": 40535,
+      "exclusion_fraction": 0.7394334081249202,
+      "surviving_candidates": 14284,
+      "member_occurrences": 6624,
+      "position_one_members": 2983,
+      "structured_position_one": 1821,
+      "research_position_one": 1162,
+      "distinct_sessions": 3,
+      "underlying_coverage": 13,
+      "strategy_coverage": 8,
+      "by_strategy": {
+        "DIRECTIONAL_DEBIT_SPREAD": 418,
+        "DIRECTIONAL_LONG_PREMIUM": 484,
+        "INCOME_WHEEL": 413,
+        "SPREAD_RANGE_LOCATOR": 450,
+        "SWEEP_LIKE_CLUSTER": 16,
+        "VOLATILITY_SMILE_DISTORTION": 612,
+        "VOLUME_OI_ANOMALY": 534,
+        "ZERO_DTE_GAMMA_SQUEEZE": 56
+      },
+      "by_candidate_kind": {
+        "MULTI_LEG": 868,
+        "RESEARCH_ONLY": 1162,
+        "SINGLE_CONTRACT": 953
+      },
+      "raw_rank": {
+        "median": 2,
+        "p90": 15.0,
+        "maximum": 71,
+        "above_one": 1750
+      },
+      "logical_packages": 4781,
+      "recurring_packages": 1238,
+      "repeated_occurrences": 1843,
+      "repeat_fraction": 0.2782306763285024,
+      "measured_structured_candidates": 479,
+      "outcomes_by_horizon": {
+        "15MIN": {
+          "outcomes": 372,
+          "independent_sessions": 3,
+          "mean_net_return": 0.18384861661290322,
+          "positive_fraction": 0.41397849462365593,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "30MIN": {
+          "outcomes": 240,
+          "independent_sessions": 3,
+          "mean_net_return": 0.106767348625,
+          "positive_fraction": 0.425,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "60MIN": {
+          "outcomes": 175,
+          "independent_sessions": 3,
+          "mean_net_return": 0.2826315917142857,
+          "positive_fraction": 0.38285714285714284,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "CLOSE": {
+          "outcomes": 3,
+          "independent_sessions": 1,
+          "mean_net_return": 0.10501293,
+          "positive_fraction": 1.0,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "NEXT_OPEN": {
+          "outcomes": 19,
+          "independent_sessions": 2,
+          "mean_net_return": 0.017720904736842104,
+          "positive_fraction": 0.3157894736842105,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        }
+      }
+    },
+    "NO_EXCLUSION": {
+      "input_candidates": 54819,
+      "excluded_candidates": 0,
+      "exclusion_fraction": 0.0,
+      "surviving_candidates": 54819,
+      "member_occurrences": 11781,
+      "position_one_members": 4128,
+      "structured_position_one": 2800,
+      "research_position_one": 1328,
+      "distinct_sessions": 3,
+      "underlying_coverage": 13,
+      "strategy_coverage": 8,
+      "by_strategy": {
+        "DIRECTIONAL_DEBIT_SPREAD": 639,
+        "DIRECTIONAL_LONG_PREMIUM": 639,
+        "INCOME_WHEEL": 639,
+        "SPREAD_RANGE_LOCATOR": 638,
+        "SWEEP_LIKE_CLUSTER": 101,
+        "VOLATILITY_SMILE_DISTORTION": 616,
+        "VOLUME_OI_ANOMALY": 611,
+        "ZERO_DTE_GAMMA_SQUEEZE": 245
+      },
+      "by_candidate_kind": {
+        "MULTI_LEG": 1277,
+        "RESEARCH_ONLY": 1328,
+        "SINGLE_CONTRACT": 1523
+      },
+      "raw_rank": {
+        "median": 1.0,
+        "p90": 1.0,
+        "maximum": 1,
+        "above_one": 0
+      },
+      "logical_packages": 3476,
+      "recurring_packages": 1707,
+      "repeated_occurrences": 8305,
+      "repeat_fraction": 0.7049486461251168,
+      "measured_structured_candidates": 744,
+      "outcomes_by_horizon": {
+        "15MIN": {
+          "outcomes": 606,
+          "independent_sessions": 3,
+          "mean_net_return": 0.22449277282178218,
+          "positive_fraction": 0.41914191419141916,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "30MIN": {
+          "outcomes": 386,
+          "independent_sessions": 3,
+          "mean_net_return": 0.13678866880829016,
+          "positive_fraction": 0.39896373056994816,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "60MIN": {
+          "outcomes": 258,
+          "independent_sessions": 3,
+          "mean_net_return": 0.22083708903100774,
+          "positive_fraction": 0.42248062015503873,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "CLOSE": {
+          "outcomes": 3,
+          "independent_sessions": 1,
+          "mean_net_return": 0.10501293,
+          "positive_fraction": 1.0,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        },
+        "NEXT_OPEN": {
+          "outcomes": 24,
+          "independent_sessions": 2,
+          "mean_net_return": 0.10593402208333332,
+          "positive_fraction": 0.375,
+          "inference": "DESCRIPTIVE_ONLY_NOT_BASELINE_ADJUSTED"
+        }
+      }
+    }
+  },
+  "latest_publication_comparison": {
+    "publication_id": "21af1de7-4612-501a-b896-16a0470d754d",
+    "scheduled_cycle": "2026-09-10 16:45:00+00:00",
+    "persisted_members": 40,
+    "shadow_members": 40,
+    "intersection": 40,
+    "persisted_only": 0,
+    "shadow_only": 0,
+    "position_mismatches": 0
+  },
+  "interpretation": {
+    "selection_metrics": "Comparable across variants under identical candidate inputs.",
+    "outcomes": "Descriptive delayed-mark outcomes only. No selector may graduate without same-structure baseline adjustment and at least 40 independent periods.",
+    "recommended_action": "KEEP_SELECTOR_V1_AND_ACCUMULATE_PUBLICATIONS"
+  }
+}
