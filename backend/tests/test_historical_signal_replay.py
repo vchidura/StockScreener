@@ -1,9 +1,12 @@
 from datetime import date, datetime, timezone
+from dataclasses import replace
+from types import SimpleNamespace
 import json
 from unittest.mock import patch
 from uuid import uuid4
 
 import pandas as pd
+import pytest
 
 from research.historical_signal_replay import (
     BearishBounceAdapter,
@@ -79,6 +82,48 @@ def test_gap_adapter_emits_deterministic_formation_event() -> None:
     assert summary["extreme_gap_counts"]["at_least_100_pct"] == 0
 
 
+def test_strict_daily_replay_retains_denominator_and_versions_inputs():
+    import exchange_calendars
+    from research.historical_signal_replay import evaluate_strict_daily_signals
+
+    calendar = exchange_calendars.get_calendar("XNYS")
+    frame = gap_frame()
+    sessions = calendar.sessions_in_range("2026-07-30", "2026-08-27")
+    assert len(sessions) == len(frame)
+    frame.index = [session.date() for session in sessions]
+    identity = uuid4()
+    cutoff = datetime(2026, 9, 12, tzinfo=UTC)
+    frame["security_id"] = identity
+    frame["ticker"] = "AAPL"
+    frame["bar_start"] = [calendar.session_open(session) for session in sessions]
+    frame["bar_end"] = [calendar.session_close(session) for session in sessions]
+    frame["replay_available_at"] = frame["bar_end"]
+    frame["system_observed_at"] = cutoff
+    frame["created_at"] = cutoff
+    frame["payload_sha256"] = "a" * 64
+    members = {session: frozenset({"AAPL", "MISSING"}) for session in frame.index}
+    arguments = dict(members_by_session=members, universe_ids_by_session={session: uuid4() for session in members},
+                     universe_policy_version="test", actions_by_session_ticker={
+                         (frame.index[0], "AAPL"): ({"action_type": "DIVIDEND", "effective_date": frame.index[0], "security_id": identity},)
+                     }, source_cutoff=cutoff,
+                     member_security_ids={(session, ticker): identity for session, tickers in members.items() for ticker in tickers})
+    result = evaluate_strict_daily_signals(GapFormationV2Adapter(), {"AAPL": frame}, **arguments)
+    assert len(result.coverage) == len(members) * 2
+    assert sum(row["state"] == "MISSING_SIGNAL_BAR" for row in result.coverage) == len(members)
+    assert len(result.events) == 1
+    assert result.events[0].payload["security_id"] == str(identity)
+    revised = frame.copy()
+    revised.iloc[0, revised.columns.get_loc("bar_revision_id")] = uuid4()
+    assert evaluate_strict_daily_signals(GapFormationV2Adapter(), {"AAPL": revised}, **arguments).events[0].event_id != result.events[0].event_id
+    broken = frame.drop(frame.index[10])
+    assert not evaluate_strict_daily_signals(GapFormationV2Adapter(), {"AAPL": broken}, **arguments).events
+    mismatched = frame.copy()
+    mismatched.iloc[-1, mismatched.columns.get_loc("security_id")] = uuid4()
+    rejected = evaluate_strict_daily_signals(GapFormationV2Adapter(), {"AAPL": mismatched}, **arguments)
+    assert not rejected.events
+    assert any(row["state"] == "IDENTITY_MISMATCH" for row in rejected.coverage)
+
+
 def test_generic_runner_excludes_split_date_before_adapter_evaluation() -> None:
     frame = gap_frame()
     signal_date = frame.index[-1]
@@ -97,6 +142,99 @@ def test_generic_runner_excludes_split_date_before_adapter_evaluation() -> None:
 
     assert result.events == ()
     assert result.exclusion_counts["CORPORATE_ACTION"] == 1
+
+
+def test_security_replay_uses_own_history_and_own_actions_for_reused_ticker():
+    frame = gap_frame()
+    healthpeak, physicians = uuid4(), uuid4()
+    frame["security_id"] = healthpeak
+    frame["source_ticker"] = ["PEAK"] * 20 + ["DOC"]
+    arguments = dict(
+        members_by_session={frame.index[-1]: frozenset({"DOC"})},
+        universe_ids_by_session={frame.index[-1]: uuid4()}, universe_policy_version="test",
+        actions_by_session_ticker={}, frames_by_security={healthpeak: frame},
+        member_security_ids={(frame.index[-1], "DOC"): healthpeak},
+        actions_by_session_security={(frame.index[-1], physicians): ({"action_type": "MERGER"},)},
+        price_manifest_sha256="a" * 64,
+        action_manifest_sha256="c" * 64,
+    )
+    result = evaluate_historical_signals(GapFormationAdapter(), {}, **arguments)
+    assert len(result.events) == 1
+    event = result.events[0]
+    assert event.ticker == "DOC"
+    assert event.payload["security_id"] == str(healthpeak)
+    assert event.source_bar_revision_ids == tuple(frame["bar_revision_id"])
+    assert event.payload["price_manifest_sha256"] == "a" * 64
+    assert event.payload["action_manifest_sha256"] == "c" * 64
+    assert evaluate_historical_signals(GapFormationAdapter(), {}, **arguments).events == result.events
+    arguments["action_manifest_sha256"] = "d" * 64
+    assert evaluate_historical_signals(GapFormationAdapter(), {}, **arguments).events[0].event_id != event.event_id
+    arguments["action_manifest_sha256"] = "c" * 64
+    arguments["price_manifest_sha256"] = "b" * 64
+    assert evaluate_historical_signals(GapFormationAdapter(), {}, **arguments).events[0].event_id != event.event_id
+    arguments["actions_by_session_security"][(frame.index[-1], healthpeak)] = ({"action_type": "SYMBOL_CHANGE"},)
+    assert evaluate_historical_signals(GapFormationAdapter(), {}, **arguments).exclusion_counts["CORPORATE_ACTION"] == 1
+
+
+@pytest.mark.parametrize("failure", ["mixed_frame", "missing_member", "missing_frame", "missing_date", "duplicate_date", "mixed_mode"])
+def test_security_replay_rejects_incomplete_or_mixed_identity(failure):
+    frame = gap_frame()
+    identity = uuid4()
+    frame["security_id"] = identity
+    arguments = dict(members_by_session={frame.index[-1]: frozenset({"DOC"})},
+                     universe_ids_by_session={frame.index[-1]: uuid4()}, universe_policy_version="test",
+                     actions_by_session_ticker={}, frames_by_security={identity: frame},
+                     member_security_ids={(frame.index[-1], "DOC"): identity},
+                     actions_by_session_security={}, price_manifest_sha256="a" * 64, action_manifest_sha256="b" * 64)
+    if failure == "mixed_frame":
+        frame.iloc[0, frame.columns.get_loc("security_id")] = uuid4()
+    elif failure == "missing_member":
+        arguments["member_security_ids"] = {}
+    elif failure == "missing_frame":
+        arguments["frames_by_security"] = {}
+    elif failure == "missing_date":
+        arguments["frames_by_security"] = {identity: frame.iloc[:-1]}
+    elif failure == "duplicate_date":
+        arguments["frames_by_security"] = {identity: pd.concat([frame, frame.iloc[-1:]])}
+    else:
+        arguments["actions_by_session_ticker"] = {(frame.index[-1], "DOC"): ()}
+    with pytest.raises(ValueError):
+        evaluate_historical_signals(GapFormationAdapter(), {}, **arguments)
+
+
+def test_security_aware_events_cannot_enter_legacy_outcome_persistence_or_evaluation():
+    from scripts import run_historical_signal_outcomes as outcomes
+
+    events = (SimpleNamespace(payload={"price_manifest_sha256": "a" * 64}),)
+    with patch.object(outcomes, "EquityUniverseRepository") as repository:
+        with pytest.raises(ValueError, match="version-aware outcome prices"):
+            outcomes.persist_evidence(events)
+        repository.assert_not_called()
+    with pytest.raises(ValueError, match="version-aware outcome prices"):
+        outcomes.evaluate(events, horizon_sessions=[21], round_trip_cost_bps=4,
+                          available_by=datetime(2026, 9, 12, tzinfo=UTC))
+
+
+def test_security_replay_truncates_prices_and_future_action_context():
+    frame = gap_frame()
+    identity = uuid4()
+    frame["security_id"] = identity
+    signal_date = frame.index[-1]
+    arguments = dict(members_by_session={signal_date: frozenset({"DOC"})},
+                     universe_ids_by_session={signal_date: uuid4()}, universe_policy_version="test",
+                     actions_by_session_ticker={}, member_security_ids={(signal_date, "DOC"): identity},
+                     actions_by_session_security={}, price_manifest_sha256="a" * 64, action_manifest_sha256="b" * 64)
+    original = evaluate_historical_signals(GapFormationV2Adapter(), {}, frames_by_security={identity: frame}, **arguments)
+    extended = append_bar(frame, open=1000, high=1002, low=999, close=1001)
+    extended["security_id"] = identity
+    arguments["actions_by_session_security"] = {(extended.index[-1], identity): ({"action_type": "MERGER"},)}
+    adapter = GapFormationV2Adapter()
+    with patch.object(adapter, "evaluate", wraps=adapter.evaluate) as evaluate:
+        repeated = evaluate_historical_signals(adapter, {}, frames_by_security={identity: extended}, **arguments)
+    assert original.events
+    assert repeated.events == original.events
+    assert evaluate.call_args.args[1].index[-1] == signal_date
+    assert evaluate.call_args.args[2].corporate_actions_by_date == {}
 
 
 def test_gap_adapter_requires_immediately_previous_trading_session() -> None:
@@ -451,3 +589,6 @@ def test_product_pullback_adapter_suppresses_contiguous_match() -> None:
     from research.historical_signal_replay import _collapse_contiguous_events
 
     assert _collapse_contiguous_events((first, second)) == (first,)
+    first_security = replace(first, payload=dict(first.payload, security_id=str(uuid4())))
+    reused_ticker_security = replace(second, payload=dict(second.payload, security_id=str(uuid4())))
+    assert _collapse_contiguous_events((first_security, reused_ticker_security)) == (first_security, reused_ticker_security)

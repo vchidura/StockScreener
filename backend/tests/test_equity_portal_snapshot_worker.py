@@ -20,6 +20,22 @@ def test_worker_loads_backend_environment_before_database_import():
 
 
 
+def test_snapshot_refresh_waits_for_matching_daily_context(monkeypatch):
+    connection = MagicMock()
+    manager = MagicMock()
+    manager.__enter__.return_value = connection
+    monkeypatch.setattr(worker, "get_db_connection", lambda: manager)
+    monkeypatch.setattr(worker, "refresh_current_daily_signals", lambda: {"status": "WAITING_FOR_COMPLETE_DAILY_PUBLICATION"})
+    manifest = MagicMock()
+    monkeypatch.setattr(worker, "source_manifest", manifest)
+
+    with pytest.raises(worker.SourceGenerationChanged, match="daily signal context"):
+        worker.refresh_once()
+
+    manifest.assert_not_called()
+    assert "pg_advisory_unlock" in connection.cursor.return_value.execute.call_args.args[0]
+
+
 def test_one_shot_skips_refresh_when_current_snapshot_is_fresh(monkeypatch):
     monkeypatch.setattr(worker, "current", lambda _: {"is_fresh": True})
     with patch.object(worker, "refresh_once") as refresh:

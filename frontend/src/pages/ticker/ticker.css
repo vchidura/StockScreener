@@ -864,101 +864,10 @@
   background: var(--tm-accent-soft);
 }
 
-/* Scanner ledger */
-.tk-ledger-summary__counts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 1px;
-  background: var(--tm-line);
-  border: 1px solid var(--tm-line);
-  border-radius: 6px;
-  overflow: hidden;
-}
-
-.tk-ledger-summary__counts > div {
-  flex: 1 1 120px;
-  display: grid;
-  gap: 1px;
-  padding: 8px 10px;
-  background: var(--tm-surface);
-}
-
-.tk-ledger-summary__counts span {
-  color: var(--tm-faint);
-  font-size: 8.5px;
-  font-weight: 800;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-
-.tk-ledger-summary__counts strong {
-  font-size: 16px;
-  font-variant-numeric: tabular-nums;
-}
-
-.tk-ledger-summary p {
-  margin: 8px 0 12px;
-  color: var(--tm-muted);
-  font-size: 10.5px;
-  line-height: 1.55;
-}
-
-.tk-ledger-summary a {
-  color: var(--tm-accent);
-  font-weight: 700;
-}
-
-.tk-matrix--ledger {
-  min-width: 920px;
-}
-
 .tk-matrix th.is-num,
 .tk-matrix td.is-num {
   text-align: right;
   white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-
-.tk-matrix tbody tr.is-clickable {
-  cursor: pointer;
-}
-
-.tk-matrix tbody tr.is-clickable:hover td {
-  background: var(--tm-surface-raised);
-}
-
-.tk-matrix tbody tr.is-detail td {
-  background: var(--tm-surface-sunken);
-}
-
-.tk-detail-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 16px;
-  margin-bottom: 6px;
-  color: var(--tm-muted);
-  font-size: 10.5px;
-}
-
-.tk-detail-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 10.5px;
-}
-
-.tk-detail-table th {
-  padding: 3px 6px;
-  color: var(--tm-faint);
-  font-size: 9px;
-  font-weight: 800;
-  letter-spacing: 0.06em;
-  text-align: left;
-  text-transform: uppercase;
-}
-
-.tk-detail-table td {
-  padding: 3px 6px;
-  border-top: 1px solid var(--tm-line);
   font-variant-numeric: tabular-nums;
 }
 

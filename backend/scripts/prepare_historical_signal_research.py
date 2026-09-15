@@ -198,7 +198,7 @@ def status_report(policy_version: str) -> dict[str, Any]:
                 MIN(admitted_members) AS minimum_members,
                 MAX(admitted_members) AS maximum_members,
                 MAX(policy_sha256) AS policy_sha256
-            FROM equity_universe_runs
+            FROM equity_original_universe_runs
             WHERE availability_mode = 'HISTORICAL_RECONSTRUCTED'
               AND policy_version = %s
             """,
@@ -213,7 +213,7 @@ def status_report(policy_version: str) -> dict[str, Any]:
                        WHERE reference.security_revision_id IS NULL
                    ) AS orphaned_members
             FROM equity_universe_members member
-            JOIN equity_universe_runs run
+            JOIN equity_original_universe_runs run
               ON run.universe_run_id = member.universe_run_id
             LEFT JOIN equity_security_reference_revisions reference
               ON reference.security_revision_id = member.security_revision_id

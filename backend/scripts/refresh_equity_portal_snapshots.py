@@ -23,6 +23,7 @@ from equity.portal_snapshots import SNAPSHOT_TYPES, current, publish, source_man
 from equity.portal_scanners import compute_default_scanner_snapshots
 from equity.sector_research import latest_sector_performance, sector_intelligence
 from screeners import analyze_market_regime, bulk_load_dataframes
+from scripts.refresh_daily_signal_context import refresh_current_daily_signals
 
 
 LOCK_NAME = "stock-screener:equity-portal-snapshot-refresh"
@@ -75,6 +76,9 @@ def refresh_once() -> dict:
         lock_cursor = lock_connection.cursor()
         lock_cursor.execute("SELECT pg_advisory_lock(hashtext(%s))", (LOCK_NAME,))
         try:
+            signal_context = refresh_current_daily_signals()
+            if signal_context["status"] not in ("PUBLISHED", "ALREADY_PRESENT"):
+                raise SourceGenerationChanged(f"daily signal context: {signal_context['status']}")
             manifest = source_manifest()
             tickers = get_selected_tickers(True)
             overview = get_tickers_overview(tickers)

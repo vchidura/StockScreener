@@ -183,6 +183,49 @@
 
 .tm-columns__actions button:hover { border-color: var(--tm-accent); }
 
+.tm-columns__menu--grouped {
+  width: min(330px, calc(100vw - 32px));
+  min-width: 0;
+}
+
+.tm-columns__group {
+  min-width: 0;
+  margin: 0;
+  padding: 0 0 8px;
+  border: 0;
+}
+
+.tm-columns__group + .tm-columns__group { margin-top: 5px; }
+
+.tm-columns__group legend {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 0 0 5px;
+  color: var(--tm-text);
+  font-size: 11.5px;
+  font-weight: 700;
+}
+
+.tm-columns__group legend span {
+  flex-shrink: 0;
+  color: var(--tm-muted);
+  font-size: 10.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.tm-columns__menu--grouped label {
+  align-items: flex-start;
+  white-space: normal;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.tm-columns__menu--grouped input { flex-shrink: 0; margin-top: 2px; }
+
 /* ── Responsive tables ──
    Wide research tables previously forced horizontal overflow because every cell was
    nowrap. Cells may now wrap and columns share the available width. */

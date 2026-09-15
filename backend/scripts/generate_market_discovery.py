@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import logging
 import sys
 from pathlib import Path
@@ -26,7 +27,14 @@ CURRENT_LOOKBACK_CALENDAR_DAYS = 550
 DISCOVERY_RETENTION_SESSIONS = 252
 
 
-def compute(as_of: str | None = None) -> pd.DataFrame:
+def compute(as_of: str | None = None, *, panel: pd.DataFrame | None = None) -> pd.DataFrame:
+    if panel is not None:
+        if as_of is None:
+            raise ValueError("as_of is required with a supplied discovery panel")
+        dates = pd.to_datetime(panel["date"])
+        end = pd.Timestamp(as_of)
+        start = end - pd.Timedelta(days=CURRENT_LOOKBACK_CALENDAR_DAYS)
+        return classify_discovery_states(panel.loc[(dates >= start) & (dates <= end)])
     with get_db_cursor() as cur:
         if as_of:
             cur.execute(
@@ -45,7 +53,7 @@ def compute(as_of: str | None = None) -> pd.DataFrame:
     return classify_discovery_states(panel)
 
 
-def persist(states: pd.DataFrame) -> int:
+def persist(states: pd.DataFrame, *, cursor=None, retain_history: bool = False) -> int:
     if states.empty:
         return 0
     trade_date = states["trade_date"].iloc[0]
@@ -68,7 +76,7 @@ def persist(states: pd.DataFrame) -> int:
         )
         for _, row in states.iterrows()
     ]
-    with get_db_cursor() as cur:
+    with (nullcontext(cursor) if cursor is not None else get_db_cursor()) as cur:
         cur.execute("""
             SELECT COUNT(*) AS names
             FROM market_discovery_states
@@ -97,6 +105,8 @@ def persist(states: pd.DataFrame) -> int:
                 %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb
             )
         """, rows)
+        if retain_history:
+            return len(rows)
         cur.execute("""
             WITH retained_dates AS (
                 SELECT DISTINCT trade_date

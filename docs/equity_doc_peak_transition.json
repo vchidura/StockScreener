@@ -1,0 +1,59 @@
+{
+  "transition_version": "healthpeak_physicians_2024_v1",
+  "review_status": "SOURCE_FACTS_VERIFIED",
+  "reviewed_on": "2026-09-12",
+  "sources": [
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/1574540/000110465924029662/tm247597d1_8k.htm",
+      "accession_number": "0001104659-24-029662",
+      "filing_date": "2024-03-01",
+      "sections": ["Item 2.01", "Item 3.01", "Item 3.03", "Item 8.01"],
+      "facts": ["Physicians Realty common shares cancelled and ceased to exist at merger effective time", "NYSE delisting requested on March 1", "0.674 exchange ratio and cash in lieu of fractional shares", "Healthpeak expected to trade as DOC at March 4 open"]
+    },
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/765880/000110465924029661/tm247564d1_8k.htm",
+      "accession_number": "0001104659-24-029661",
+      "filing_date": "2024-03-01",
+      "sections": ["Introductory Note", "Item 2.01", "Item 8.01"],
+      "facts": ["Merger closed March 1, 2024", "0.674 Healthpeak common shares per Physicians Realty common share", "Cash in lieu of fractional shares", "Healthpeak expected to trade as DOC at March 4 NYSE open"]
+    },
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/765880/000110465924029669/tm247564d2_ex99-1.htm",
+      "accession_number": "0001104659-24-029669",
+      "filing_date": "2024-03-01",
+      "sections": ["Executive Summary, page 3"],
+      "facts": ["Merger closed March 1; Healthpeak trading under DOC beginning March 4"]
+    }
+  ],
+  "merger": {
+    "effective_date": "2024-03-01",
+    "predecessor_ticker": "DOC",
+    "predecessor_cik": "0001574540",
+    "successor_cik": "0000765880",
+    "successor_shares_per_predecessor_share": "0.674",
+    "fractional_share_treatment": "CASH_IN_LIEU",
+    "fractional_cash_price": null,
+    "last_predecessor_trading_session": null
+  },
+  "symbol_change": {
+    "effective_session": "2024-03-04",
+    "previous_ticker": "PEAK",
+    "new_ticker": "DOC",
+    "cik": "0000765880",
+    "composite_figi": "BBG000BKYDP9",
+    "share_class_figi": "BBG001S5RTS2",
+    "identifier_source": "Retained dated Polygon PEAK overview 2024-03-01; CIK corroborated by Healthpeak SEC filing identity",
+    "history_rule": "Healthpeak DOC uses PEAK prices before March 4, never Physicians Realty DOC prices",
+    "price_conversion": "NONE_FOR_HEALTHPEAK_SYMBOL_CHANGE"
+  },
+  "repair_authorized": false,
+  "readiness": "NOT_CERTIFIED",
+  "limitations": [
+    "Source facts do not certify retained provider prices or all dated references",
+    "Corporate conversion of old DOC holdings is not a security-ID relink or a split",
+    "No original reference, universe, bar or published study may be overwritten",
+    "Corrected universes require version-aware readers before publication",
+    "Cash-in-lieu settlement price and dividend-inclusive returns remain unverified",
+    "Exact predecessor trading-stop time is not stated in the reviewed closing 8-K; direct SEC Form 25 XML retrieval was denied with HTTP 403"
+  ]
+}

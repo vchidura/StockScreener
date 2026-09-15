@@ -68,7 +68,11 @@ export function StalenessBanner() {
           ? `Published analysis is more than ${status.max_serveable_stale_sessions} trading sessions old and is no longer served. Start the equity worker to resume updates.`
           : describe(status)}
       </span>
-      <span className="tm-staleness__hint">Trade setup levels stay hidden until data is current.</span>
+      <span className="tm-staleness__hint">
+        {status.status === 'EXPIRED'
+          ? 'Expired setup timeframes are unavailable.'
+          : `Retained setups: up to ${status.max_serveable_stale_sessions} sessions old.`}
+      </span>
     </div>
   )
 }

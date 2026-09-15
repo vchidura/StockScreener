@@ -5,9 +5,7 @@ import {
   Activity,
   AlertTriangle,
   BarChart3,
-  Clock3,
   Database,
-  Info,
   Layers3,
   Radio,
 } from 'lucide-react'
@@ -196,10 +194,6 @@ export default function OptionsFlowPage() {
     eyebrow: 'Delayed options activity',
     title: 'Options Flow',
     detail: 'Call and put activity, positioning change, and contract concentration for one selected underlying.',
-    status: [
-      { label: 'Underlying', value: data?.selected || ticker },
-      { label: 'Source', value: formatDateTime(flow.data?.as_of), note: flow.data?.data_tier || 'Loading' },
-    ],
     session: '1d',
   })
 
@@ -213,13 +207,6 @@ export default function OptionsFlowPage() {
   const selectedExpiration = data.expirations.find(row => row.expiration_date === strikeExpiration)
   return (
     <div className="options-flow-page">
-      <section className="flow-capability">
-        <Info size={16} />
-        <div><strong>Activity, not buyer/seller premium flow</strong><span>Developer data has no NBBO aggressor side. Put bars are plotted opposite calls for comparison only; estimated premium activity uses the latest aligned mark.</span></div>
-        <span className="flow-delay"><Clock3 size={13} />15-minute delayed</span>
-      </section>
-      {data.serving_mode === 'HISTORICAL_PREVIOUS_POLICY' && <section className="flow-state flow-state--warning"><AlertTriangle size={20} /><div><strong>Historical policy matrix</strong><span>The active valuation policy has not completed this underlying yet. Activity below uses the latest prior-policy matrix.</span></div></section>}
-
       <section className="flow-command" aria-label="Options flow filters">
         <label>Underlying<select value={data.selected} onChange={event => setSearchParams({ underlyer: event.target.value })}>{data.underlyers.map(row => <option key={row.underlying} value={row.underlying}>{row.underlying} · {row.asset_type}</option>)}</select></label>
         <div className="flow-command__measure"><span>Chart measure</span><ProfileToggle value={profileMetric} onChange={setProfileMetric} /></div>

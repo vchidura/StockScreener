@@ -138,6 +138,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(equity_materialization_router)
+from equity.stock_discovery_api import router as stock_discovery_router
+app.include_router(stock_discovery_router)
+from equity.screening_api import router as screening_router
+app.include_router(screening_router)
 
 app.include_router(options_router)
 
@@ -702,12 +706,15 @@ def _with_materialized_setups(legacy_result: dict[str, Any]) -> dict[str, Any]:
             "projection_read_latency_ms": projection["read_latency_ms"],
             "published_at": projection["published_at"].isoformat(),
             "staleness_seconds": projection["staleness_seconds"],
-            "status": "READY" if projection["is_fresh"] else "STALE",
+            "status": projection["status"],
+            "is_serveable": projection["is_serveable"],
+            "staleness_sessions": projection["staleness_sessions"],
+            "max_serveable_stale_sessions": projection["max_serveable_stale_sessions"],
         })
         read_metrics[interval] = metrics
-        if not projection["is_fresh"]:
+        if not projection["is_serveable"]:
             result["errors"][interval] = (
-                f"Published materialized {interval} setup is stale for the latest completed slot"
+                f"Published materialized {interval} setup is outside the permitted freshness window"
             )
             continue
         result["setups"][interval] = projection["payload"]
@@ -3504,109 +3511,6 @@ async def ticker_discovery_state(ticker: str, limit: int = Query(default=30, ge=
         raise HTTPException(status_code=500, detail="Failed to load ticker discovery state")
 
 
-@app.get("/api/scanner-events/summary")
-async def scanner_event_summary(
-    interval: Optional[str] = Query(default=None, regex="^(1d|1wk|1h|30m)$"),
-    discovery_state: Optional[str] = None,
-    min_periods: int = Query(default=20, ge=1, le=1000),
-):
-    """Horizon-spaced scanner utility metrics. No result is a recommendation."""
-    try:
-        from equity.scanner_research import event_summary
-        return {
-            "results": event_summary(interval, discovery_state, min_periods),
-            "read_source": "CANONICAL_EQUITY_RESEARCH",
-        }
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Scanner event summary query failed")
-        raise HTTPException(status_code=500, detail="Failed to load scanner event summary")
-
-
-@app.get("/api/scanner-events/qualification")
-async def scanner_event_qualification(
-    interval: Optional[str] = Query(default=None, regex="^(1d|1wk|1h|30m)$"),
-):
-    """Aggregate full-history qualification results. No result is a recommendation."""
-    try:
-        from equity.scanner_research import (
-            OUTCOME_ENTRY_MODEL, qualification_report,
-        )
-        results = qualification_report(interval)
-        return {
-            "entry_model": OUTCOME_ENTRY_MODEL,
-            "gates": {
-                "minimum_events": 100,
-                "minimum_independent_periods": 40,
-                "minimum_alpha_t_stat": 2.0,
-                "requires_positive_early_late_alpha": True,
-                "maximum_false_discovery_rate": 0.05,
-                "minimum_calibration_oos_periods": 100,
-                "maximum_brier_score": 0.25,
-                "maximum_expected_calibration_error": 0.05,
-            },
-            "results": results,
-            "read_source": "CANONICAL_EQUITY_RESEARCH",
-        }
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Scanner qualification query failed")
-        raise HTTPException(status_code=500, detail="Failed to load scanner qualification")
-
-
-@app.get("/api/scanner-events/backlog")
-async def scanner_event_backlog():
-    """Pending and evaluated event/horizon pairs."""
-    try:
-        from equity.scanner_research import pending_outcome_counts
-        return {
-            "results": pending_outcome_counts(),
-            "read_source": "CANONICAL_EQUITY_RESEARCH",
-        }
-    except Exception:
-        logger.exception("Scanner event backlog query failed")
-        raise HTTPException(status_code=500, detail="Failed to load scanner event backlog")
-
-
-@app.get("/api/scanner-events")
-async def scanner_events_endpoint(
-    interval: Optional[str] = Query(default=None, regex="^(1d|1wk|1h|30m)$"),
-    limit: int = Query(default=100, ge=1, le=500),
-):
-    """Latest shadow scanner setup lifecycles and completed outcomes."""
-    try:
-        from equity.scanner_research import recent_events
-        return {
-            "results": recent_events(interval, limit),
-            "read_source": "CANONICAL_EQUITY_RESEARCH",
-        }
-    except Exception:
-        logger.exception("Scanner event list query failed")
-        raise HTTPException(status_code=500, detail="Failed to load scanner events")
-
-
-@app.get("/api/scanner-events/latest-by-ticker")
-async def latest_ticker_scanner_signals(
-    interval: Optional[str] = Query(default=None, regex="^(1d|1wk|1h|30m)$"),
-    limit: int = Query(default=500, ge=1, le=500),
-    sessions: int = Query(default=10, ge=1, le=252),
-    hourly_sessions: int = Query(default=2, ge=1, le=30),
-):
-    """Latest observed scanner signal per ticker, within the last `sessions` daily/weekly sessions
-    or `hourly_sessions` days for hourly signals."""
-    try:
-        from equity.scanner_research import latest_ticker_signals
-        return {
-            "results": latest_ticker_signals(interval, limit, sessions, hourly_sessions),
-            "read_source": "CANONICAL_EQUITY_RESEARCH",
-        }
-    except Exception:
-        logger.exception("Latest ticker scanner signals query failed")
-        raise HTTPException(status_code=500, detail="Failed to load latest ticker scanner signals")
-
-
 @app.get("/api/scanner-events/sector-performance")
 async def scanner_sector_performance(
     sessions: int = Query(default=1),
@@ -3638,28 +3542,6 @@ async def sector_intelligence_endpoint(leader_limit: int = Query(default=5, ge=1
     except Exception:
         logger.exception("Sector intelligence query failed")
         raise HTTPException(status_code=500, detail="Failed to load sector intelligence")
-
-
-@app.get("/api/stock/{ticker}/scanner-events")
-async def ticker_scanner_events(
-    ticker: str,
-    limit: int = Query(default=100, ge=1, le=252),
-    daily_sessions: int = Query(default=21, ge=1, le=252),
-    hourly_sessions: int = Query(default=5, ge=1, le=30),
-):
-    """Scanner lifecycles from recent daily/weekly and hourly session windows."""
-    try:
-        from equity.scanner_research import ticker_events
-        return {
-            "ticker": ticker.upper(),
-            "daily_sessions": daily_sessions,
-            "hourly_sessions": hourly_sessions,
-            "events": ticker_events(ticker, limit, daily_sessions, hourly_sessions),
-            "read_source": "CANONICAL_EQUITY_RESEARCH",
-        }
-    except Exception:
-        logger.exception("Ticker scanner event query failed | ticker=%s", ticker)
-        raise HTTPException(status_code=500, detail="Failed to load ticker scanner events")
 
 
 @app.get("/api/stock/{ticker}/cross-sectional-signal")

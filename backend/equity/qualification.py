@@ -12,8 +12,9 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import numpy as np
 import pandas as pd
 import exchange_calendars
+from scipy.stats import t as student_t
 
-from research.scanner_calibration import walk_forward_calibration
+from research.scanner_calibration import _utc_timestamps, walk_forward_calibration
 from research.scanner_confidence import _benjamini_hochberg
 
 from .polygon import canonical_json, sha256_json
@@ -72,7 +73,10 @@ def qualify_outcomes(
     if missing:
         raise ValueError(f"qualification observations are missing: {sorted(missing)}")
     frame = observations.copy()
-    frame["signal_time"] = pd.to_datetime(frame["signal_time"], utc=True)
+    policy_ids = _qualification_policy_ids(frame)
+    has_timing = _qualification_timing(frame)
+    if not has_timing:
+        frame["signal_time"] = pd.to_datetime(frame["signal_time"], utc=True)
     for column in ("net_return", "net_alpha", "mae_pct", "mfe_pct"):
         if column not in frame:
             frame[column] = np.nan
@@ -120,7 +124,14 @@ def qualify_outcomes(
     ]
     candidates = []
     for key, group in frame.groupby(grouping, dropna=False, sort=True):
-        portfolio = group.groupby("signal_time", as_index=False).agg(
+        time_key = "signal_market_time" if has_timing else "signal_time"
+        timing_aggregations = {
+            "signal_time": ("signal_time", "max"),
+            "entry_time": ("entry_time", "min"),
+            "exit_time": ("exit_time", "max"),
+            "outcome_available_at": ("outcome_available_at", "max"),
+        } if has_timing else {}
+        portfolio = group.groupby(time_key, as_index=False).agg(
             net_return=("net_return", "mean"),
             market_net_alpha=("net_alpha", "mean"),
             sector_net_alpha=("sector_net_alpha", "mean"),
@@ -132,7 +143,10 @@ def qualify_outcomes(
             stop_hit_rate=("stop_hit_rate", "mean"),
             target_hit_rate=("target_hit_rate", "mean"),
             names=("ticker", "nunique"),
+            **timing_aggregations,
         )
+        if has_timing and (portfolio["signal_time"] >= portfolio["entry_time"]).any():
+            raise ValueError("signal cohort must be fully observed before its earliest entry")
         independent = _independent_periods(
             portfolio, int(key[5]), interval=None if pd.isna(key[2]) else str(key[2])
         )
@@ -165,8 +179,13 @@ def qualify_outcomes(
             and early_alpha is not None and early_alpha > 0
             and late_alpha is not None and late_alpha > 0
         )
+        calibration_timing = {
+            "prediction_times": independent["signal_time"],
+            "outcome_available_at": independent["outcome_available_at"],
+        } if has_timing else {}
         calibration = walk_forward_calibration(
-            independent["net_return"], independent["primary_alpha"]
+            independent["net_return"], independent["primary_alpha"],
+            **calibration_timing,
         )
         wins = int((independent["net_return"] > 0).sum())
         hit_ci_low, hit_ci_high = _wilson_interval(wins, periods)
@@ -188,7 +207,10 @@ def qualify_outcomes(
             ),
             "mean_net_return": mean_return,
             "net_return_t_stat": return_t,
-            "net_return_p_value": _normal_p_value(return_t),
+            "net_return_p_value": (
+                _student_t_p_value(return_t, periods) if has_timing
+                else _normal_p_value(return_t)
+            ),
             "early_net_return": early_return,
             "late_net_return": late_return,
             "mean_net_alpha": mean_alpha,
@@ -196,7 +218,10 @@ def qualify_outcomes(
             "mean_sector_net_alpha": _mean(independent["sector_net_alpha"]),
             "primary_benchmark": _single_value(group["primary_benchmark"]),
             "alpha_t_stat": alpha_t,
-            "alpha_p_value": _normal_p_value(alpha_t),
+            "alpha_p_value": (
+                _student_t_p_value(alpha_t, periods) if has_timing
+                else _normal_p_value(alpha_t)
+            ),
             "early_alpha": early_alpha,
             "late_alpha": late_alpha,
             "hit_rate": hit_rate,
@@ -208,6 +233,17 @@ def qualify_outcomes(
             "target_hit_rate": target_hit_rate,
             "raw_pass": raw_pass,
             "calibration": calibration,
+            "timing_metrics": {
+                "timing_contract": "MARKET_DECISION_ENTRY_AVAILABILITY_V1",
+                "independence_basis": "MARKET_HORIZON_AND_NONOVERLAPPING_PATHS",
+                "inference_method": "STUDENT_T_TWO_SIDED",
+                "inference_degrees_of_freedom": max(0, periods - 1),
+                "probability_target": "EQUAL_WEIGHT_SIGNAL_COHORT_NET_WIN",
+                "calibration_oos_periods": calibration["calibration_oos_periods"],
+                "first_market_time": group["signal_market_time"].min().isoformat(),
+                "last_market_time": group["signal_market_time"].max().isoformat(),
+                "latest_outcome_available_at": group["outcome_available_at"].max().isoformat(),
+            } if has_timing else {},
         })
 
     p_values = pd.Series(
@@ -262,6 +298,12 @@ def qualify_outcomes(
             "qualification_metrics_version": "equity_qualification_metrics_v3",
             "research_scope": research_scope,
         }
+        if policy_ids:
+            metrics["outcome_policy_id"] = policy_ids[key[6]]
+            metrics["qualification_metrics_version"] = "equity_qualification_metrics_v4"
+        if has_timing:
+            metrics.update(row["timing_metrics"])
+            metrics["qualification_metrics_version"] = "equity_qualification_metrics_v5"
         prepared.append({
             "key": [_json_scalar(value) for value in key],
             "source_name": str(key[0]),
@@ -451,6 +493,57 @@ def qualify_option_conditioning(
     return _prepared_revisions(prepared, report_identity)
 
 
+def _qualification_timing(frame: pd.DataFrame) -> bool:
+    columns = {"signal_market_time", "entry_time", "exit_time", "outcome_available_at"}
+    if not columns.intersection(frame.columns):
+        if {"outcome_id", "subject_evidence_id"} & set(frame.columns):
+            raise ValueError("persisted qualification observations require explicit timing")
+        return False
+    missing = columns - set(frame.columns)
+    if missing:
+        raise ValueError(f"qualification timing columns are missing: {sorted(missing)}")
+    for column in sorted(columns | {"signal_time"}):
+        frame[column] = _utc_timestamps(frame[column], column)
+    invalid = (
+        (frame["signal_market_time"] > frame["signal_time"])
+        | (frame["signal_time"] >= frame["entry_time"])
+        | (frame["entry_time"] >= frame["exit_time"])
+        | (frame["exit_time"] > frame["outcome_available_at"])
+    )
+    if invalid.any():
+        raise ValueError(
+            "qualification timing requires market <= decision < entry < exit <= availability"
+        )
+    return True
+
+
+def _qualification_policy_ids(frame: pd.DataFrame) -> dict[str, str]:
+    if "outcome_policy_id" not in frame:
+        if {"outcome_id", "subject_evidence_id"} & set(frame.columns):
+            raise ValueError("persisted qualification observations require outcome_policy_id")
+        return {}
+    if (
+        frame["policy_key"].isna().any()
+        or frame["policy_key"].astype(str).str.strip().eq("").any()
+        or frame["outcome_policy_id"].isna().any()
+    ):
+        raise ValueError("qualification policy_key and outcome_policy_id must be known")
+    try:
+        identities = frame["outcome_policy_id"].map(str)
+        normalized = {value: str(UUID(value)) for value in identities.unique()}
+        frame["outcome_policy_id"] = identities.map(normalized)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("qualification outcome_policy_id must be a valid UUID") from exc
+    counts = frame.groupby("policy_key")["outcome_policy_id"].nunique()
+    conflicts = sorted(counts[counts > 1].index)
+    if conflicts:
+        raise ValueError(
+            "qualification requires one outcome_policy_id per policy_key; "
+            f"select exact policy revisions for: {conflicts}"
+        )
+    return frame.groupby("policy_key")["outcome_policy_id"].first().to_dict()
+
+
 def _cohort_sha256(frame: pd.DataFrame) -> str:
     identity_columns = [
         column for column in (
@@ -460,7 +553,8 @@ def _cohort_sha256(frame: pd.DataFrame) -> str:
             "net_alpha", "mae_pct", "mfe_pct", "first_hit", "stop_hit",
             "target_hit", "has_bracket", "conditioned_return",
             "control_return", "incremental_return", "sector_net_alpha",
-            "primary_benchmark",
+            "primary_benchmark", "outcome_policy_id", "signal_market_time",
+            "entry_time", "exit_time", "outcome_available_at",
         )
         if column in frame.columns
     ]
@@ -579,8 +673,9 @@ def _independent_periods(
     ordered = portfolio.sort_values("signal_time").reset_index(drop=True)
     if ordered.empty:
         return ordered
+    time_key = "signal_market_time" if "signal_market_time" in ordered else "signal_time"
     if interval == "1d":
-        signal_dates = pd.to_datetime(ordered["signal_time"], utc=True).dt.date
+        signal_dates = pd.to_datetime(ordered[time_key], utc=True).dt.date
         calendar = exchange_calendars.get_calendar("XNYS")
         sessions = calendar.sessions_in_range(
             pd.Timestamp(signal_dates.min()), pd.Timestamp(signal_dates.max())
@@ -594,19 +689,24 @@ def _independent_periods(
         except KeyError as exc:
             raise ValueError("daily signal_time must fall on an XNYS session") from exc
     elif interval in ("5m", "15m", "30m", "1h"):
-        ordinals = _intraday_bar_ordinals(ordered["signal_time"], interval)
+        ordinals = _intraday_bar_ordinals(ordered[time_key], interval)
     else:
         unique_times = {
             timestamp: ordinal
-            for ordinal, timestamp in enumerate(sorted(ordered["signal_time"].unique()))
+            for ordinal, timestamp in enumerate(sorted(ordered[time_key].unique()))
         }
-        ordinals = [unique_times[value] for value in ordered["signal_time"]]
+        ordinals = [unique_times[value] for value in ordered[time_key]]
     selected = []
     last_ordinal = -horizon_bars
+    last_exit = None
     for index, ordinal in enumerate(ordinals):
-        if ordinal - last_ordinal >= horizon_bars:
+        if ordinal - last_ordinal >= horizon_bars and (
+            last_exit is None or ordered.loc[index, "entry_time"] >= last_exit
+        ):
             selected.append(index)
             last_ordinal = ordinal
+            if "exit_time" in ordered:
+                last_exit = ordered.loc[index, "exit_time"]
     return ordered.loc[selected].reset_index(drop=True)
 
 
@@ -674,6 +774,12 @@ def _t_stat(values: pd.Series) -> float | None:
     if not math.isfinite(standard_deviation) or standard_deviation <= 0:
         return None
     return float(numeric.mean() / (standard_deviation / np.sqrt(len(numeric))))
+
+
+def _student_t_p_value(t_stat: float | None, periods: int) -> float | None:
+    if t_stat is None or not math.isfinite(t_stat) or periods < 2:
+        return None
+    return float(2 * student_t.sf(abs(t_stat), df=periods - 1))
 
 
 def _normal_p_value(t_stat: float | None) -> float | None:

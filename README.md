@@ -11,6 +11,12 @@ bars, reproducible analysis evidence, and worker-published scanner views.
   `5m`, `15m`, `30m`, `1h`, `1d`, `1wk`, and `1mo` cohorts.
 - The portal worker publishes 20 generation-aware snapshots so expensive GET
   routes remain read-only and fast.
+- Stock Screener uses worker-published immutable screening snapshots, pairing the
+  last completed daily anchor with newly published completed hourly context.
+  These are delayed observations, not live quotes.
+- Stock Alerts distinguishes frozen backtested results, forward shadow records,
+  and legacy daily discovery. The native launcher starts the multi-model forward
+  shadow worker; this is unqualified paper monitoring, not brokerage execution.
 - A single transactional baseline creates the final schema for fresh databases;
   legacy price and scanner relations are absent.
 - Options remain read-only with equity context and raw archival disabled.
@@ -90,9 +96,65 @@ without Docker.
 ### Daily Market-Day Startup
 
 After the one-time bootstrap, start PostgreSQL and run the following commands
-from the repository root on each market day. Start them before the opening bell
-and leave the worker windows running until at least 15 minutes after the close so
-the final delayed provider data can be ingested.
+from the repository root on each market day. Start before the XNYS opening bell
+(normally 09:30 America/New_York). Keep workers running through the actual exchange
+close, including early-close sessions, plus the configured provider delay
+(15 minutes by default) **and until final publication/analysis completes**.
+Normally that means after 16:15 ET, not stopping exactly at 16:00 or 16:15.
+Schedulers determine due sessions and slots; the launcher does not stop workers
+at the closing bell. Local time zones and daylight-saving changes do not change
+the exchange schedule.
+
+#### Resident Worker Checklist
+
+The native launcher's default `-Only All` starts eight worker windows. Use
+`-Only Equity` for the five equity-side workers or `-Only Options` for the three
+options/calendar workers. Use `-Worker` for a single worker from the table below.
+Provider refresh cadences below are defaults, not a
+promise that every cycle produces a new publication.
+
+| Worker | Launch Set | `-Worker` Value | Purpose And Cadence |
+|---|---|---|---|
+| [run_equity_worker.py](backend/scripts/run_equity_worker.py) | Equity | `Equity` | REST bar ingestion, canonical publication, v16 analysis and daily signal context; checks due watermarks every 15 seconds with the configured provider delay |
+| [run_corporate_action_worker.py](backend/scripts/run_corporate_action_worker.py) | Equity | `CorporateActions` | Upcoming/recent split and dividend observations; refreshes every 6 hours, retries failures after 5 minutes |
+| [run_stock_idea_worker.py](backend/scripts/run_stock_idea_worker.py) | Equity | `StockAlerts` | Multi-model forward shadow alerts after completed source ingestion; bounded XNYS 30m publication windows, shared 30m/1h/daily decisions, actual input times and isolated paper plans |
+| [refresh_equity_portal_snapshots.py](backend/scripts/refresh_equity_portal_snapshots.py) | Equity | `Portal` | Refreshes the 20 portal/scanner snapshots when missing or stale; checks every 60 seconds with `--continuous`; does not publish the separate Stock Screener snapshot |
+| [run_screening_worker.py](backend/scripts/run_screening_worker.py) | Equity | `Screening` | Checks retained daily/hourly publications every 60 seconds; prepares a daily anchor when a new complete daily cohort arrives and appends hourly-context revisions without provider calls |
+| [run_market_event_worker.py](backend/scripts/run_market_event_worker.py) | Options | `MarketEvents` | Shared Finnhub earnings and official FOMC calendar coverage; refreshes every 6 hours |
+| [run_option_model_input_worker.py](backend/scripts/run_option_model_input_worker.py) | Options | `OptionInputs` | Official Treasury curve observations; refreshes every 6 hours, retries failures after 5 minutes; does not itself change option valuation policy |
+| [run_option_worker.py](backend/scripts/run_option_worker.py) | Options | `Options` | Delayed option ingestion, analysis, strategy/recommendation publication and paper-outcome processing; due XNYS-open-anchored 15-minute slots |
+
+All workers require the configured application database and installed schema.
+Equity ingestion/corporate actions/options need their Polygon/Massive entitlements;
+earnings coverage needs `FINNHUB_API_KEY` (without it, earnings are unavailable,
+not cleared). Treasury/FOMC refresh needs access to the official public sources.
+The default **All** set includes calendar support. For an equity-only deployment
+that also needs shared earnings/FOMC coverage, run the calendar worker separately:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Worker MarketEvents
+```
+
+Do not start a second calendar worker if the Options/All set is already running.
+Do not run native and Compose copies against the same database. An Options-only
+launch does not supply equity ingestion: retain/start the equity side separately
+when fresh underlying prices are needed, without enabling the separate
+`OPTION_EQUITY_CONTEXT_ENABLED` gate.
+
+#### Start And Preview
+
+Inspect the commands first without launching workers, inspecting current processes,
+reading the database or making provider requests:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Plan
+```
+
+`-Plan` also accepts `-Only` or `-Worker`, `-Once`, and the opt-in switches described below.
+It checks command selection and script paths, not provider credentials, enrollment
+or runtime health. ExecutionPolicy Bypass applies only to that PowerShell process.
 
 Terminal 1 starts the API and explicitly loads the backend environment file:
 
@@ -102,19 +164,50 @@ Terminal 1 starts the API and explicitly loads the backend environment file:
   --reload --host 127.0.0.1 --port 8001
 ```
 
-Terminal 2 launches the continuous equity ingestion/materialization worker,
-corporate-action refresh, equity portal snapshot publisher, and delayed option
-pipeline in separate worker windows:
+Terminal 2 launches the complete resident set in separate worker windows:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
   .\backend\scripts\start_workers.ps1
 ```
 
-Do not also start `run_equity_worker.py`,
-`run_corporate_action_worker.py`, `refresh_equity_portal_snapshots.py`, or
-`run_option_worker.py` manually when using `start_workers.ps1`; the launcher
-refuses duplicate workers and each mutating worker also takes advisory leadership.
+Do not launch the checklist scripts manually as well. Continuous startup skips
+already-running script names; one-shot recovery reports them as failures rather
+than claiming a completed pass. The major materialization/publisher workers also
+use database leadership locks, but those are not a replacement for one operator
+owning startup. Close each worker window or use Ctrl+C to stop it; closing the
+launcher terminal does not stop its child worker windows.
+
+To start the three independently in separate worker windows, run these from the
+repository root:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Worker MarketEvents
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Worker Screening
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Worker StockAlerts
+```
+
+Append `-Plan` to preview any one command without launching it. Append
+`-NoNewWindow` to run a **single** selected worker in the current terminal (use a
+different terminal per resident worker). Append `-Once` for a single cycle;
+the launcher supplies the appropriate entry-point flags automatically.
+
+`-Worker Equity` means ingestion only, unlike `-Only Equity`, which starts all
+five equity-side workers. A single-worker launch does **not** start dependencies:
+Screening, StockAlerts and Portal need ongoing equity ingestion for fresh facts.
+Calendar and Treasury refresh should remain resident when their freshness is
+required, although they poll only every six hours by default.
+
+Do not combine `-Worker` with `-Only`, `-IncludePaperStudy` or `-PublishScreening`.
+Bounded `-RepairSessions` is allowed only for `-Worker Equity` or an equity-containing
+set. Ordinary StockAlerts restarts resume the retained policy and checkpoint;
+do not repeat one-time policy-migration or retry-window flags.
+
+For a worker **set**, `-NoNewWindow` still requires `-Once`: a resident worker
+never returns to start its siblings. Single-worker selection is the exception.
 
 The corporate-action worker polls Polygon every six hours by default and retains
 live-observed splits and dividends for the union of portal and ranked-universe
@@ -137,8 +230,7 @@ can be revalidated without retaining another observation:
 Both commands do not retain data; the materialization probe always rolls back.
 The 12-hour expiry on calendar coverage makes stale observations return
 `UNAVAILABLE` rather than continuing to report `CLEAR` if the resident worker
-fails.
-observing a real Finnhub date revision or removal. See
+fails. Date revisions and removals remain append-only observations. See
 [Calendar deployment details](docs/DEPLOYMENT.md) for the measured request budget
 and Compose `calendar` profile.
 
@@ -151,6 +243,162 @@ npm.cmd run dev
 
 Open `http://127.0.0.1:5174`. The Vite development server proxies `/api` to
 `http://127.0.0.1:8001`.
+
+#### Screening, Alerts And Optional Research
+
+**Stock Screener:** the screening worker is now included in Equity/All. During the
+session it pairs the last completed daily screening snapshot with the latest
+published completed hour. A new complete daily source automatically produces the
+next daily anchor. Existing daily facts, ranks, gap episodes and source cutoffs are
+copied unchanged into each hourly revision; both source times are displayed.
+The active page refreshes retained results every 60 seconds. Publication depends
+on ingestion completing, not just on the clock reaching an hourly boundary.
+
+If the other workers are already running, start only the new publisher; do not
+stop or duplicate ingestion:
+
+```powershell
+.\backend\.venv\Scripts\python.exe -u .\backend\scripts\run_screening_worker.py
+```
+
+Use `--status` to inspect the retained publication, `--measure` for a read-only
+preparation, or `--once` to publish one due update and exit. Status reports the
+retained snapshot, not a worker heartbeat. `SCREENING_WORKER_POLL_SECONDS` defaults
+to 60 (minimum 15). The worker uses advisory leadership and an idempotent daily/hourly
+pair key; no duplicate snapshots are written on idle polls. It performs no provider
+backfill or research/alert-engine work. Delayed or missing source data stays stale
+or UNKNOWN, including corporate actions between the daily and hourly dates.
+
+The original [prepare_stock_screening.py](backend/scripts/prepare_stock_screening.py)
+remains available for explicit daily rebuilds and bounded historical work. Normal
+market-day operation no longer requires running it after close. For a forced
+daily rebuild during sequential recovery, stop resident workers first and use:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Only Equity -Once -PublishScreening
+```
+
+`-PublishScreening` still requires `-Once` and Equity/All; it now forces the daily
+rebuild before the normal screening-worker pass. The pass is skipped if an earlier
+equity step failed or was already running. Inspect
+the Stock Screener session/publication details or the read-only
+`GET /api/stocks/screening/catalog`; a successful worker launch is not proof of
+fresh screening data.
+
+**Stock Alerts:** [run_stock_idea_worker.py](backend/scripts/run_stock_idea_worker.py)
+replaces the legacy daily discovery worker in Equity/All launches. It enrolls the
+latest complete tracked daily cohort once, warms up from already-stored canonical
+bars, and publishes only post-enrollment resumption/acceptance/failure plans.
+The initial cohort is 386 tracked instruments, including ETFs, not the full market.
+The active `stock_ideas_source_ready_v2` timing policy waits for a COMPLETE native
+30m publication covering the enrolled security IDs, with both publication/creation
+timestamps visible. Checking begins after the provider delay (15 minutes); the
+intraday dispatch deadline is bar end +29m55s. The closing window also requires the
+completed daily publication and is bounded at close +59m55s. Actual input-read and
+publication times control decisions and paper entries; setup expiry is unchanged.
+Unavailable inputs at the final deadline produce a missed run, not backdated alerts.
+Daily context refreshes every five minutes, including late post-close arrivals.
+Paper marks refresh from stored bars when positions are active; no quotes are fetched.
+
+The original retained state and view remain under
+`backend/backups/equity-shadow/stock-ideas-forward-v1/`. The corrected quality-v2
+worker now defaults to a SEPARATE `stock-ideas-forward-v2/` directory, gates on
+current eligible native prices and remaining entry slots, and strengthens intraday
+breakout confirmation. The launcher explicitly passes `--quality-version 2`, and
+the API's default SHADOW reader now uses the same v2 directory. No old checkpoint,
+published plan or paper result is migrated. A mismatched existing store/view is
+rejected, not overwritten. No environment override is needed for the default
+V2 installation. If `STOCK_ALERT_SHADOW_VIEW` is set, keep it pointed at the SAME
+approved V2 view for both worker and API; pointing the V2 worker at a V1 view is
+rejected. An absent V2 view stays unavailable rather than silently showing V1.
+Source implementation does not establish
+current runtime state: a code commit does not enroll or start a worker or switch
+the API reader. Check processes and the served policy ID before relying on a future
+market session; see the [dated operational check](docs/STOCK_ALERT_CONTEXT_ENHANCEMENT_DESIGN.md#september-15-operational-check).
+Offline inspection:
+
+```powershell
+.\backend\.venv\Scripts\python.exe .\backend\scripts\run_stock_idea_worker.py --plan
+.\backend\.venv\Scripts\python.exe .\backend\scripts\run_stock_idea_worker.py --status
+.\backend\.venv\Scripts\python.exe .\backend\scripts\run_stock_idea_worker.py --quality-version 1 --status
+```
+
+`--plan` is offline and `--status` reads the retained view, not a process heartbeat.
+The final command inspects the original v1 directory; the default status may be
+NOT_ENROLLED for v2. See [the working enhancement plan](docs/STOCK_ALERT_CONTEXT_ENHANCEMENT_DESIGN.md)
+for the exact confirmation rules, isolated rollout and staged context work.
+`--once` performs one cycle and exits; it does not wait for the next scheduled run.
+New enrollments use source-readiness by default. Existing fixed-cutoff checkpoints
+require explicit `--enable-source-readiness`; the approved activation is recorded
+without rewriting their earlier runs. An explicitly requested `--retry-window`
+appends one current-time retry of an empty incomplete run, never changes its
+original record or extends setup expiry, and leaves the next normal boundary intact.
+Use the ordinary command without retry flags for subsequent resident starts.
+The old daily worker source was archived; its stored records remain readable.
+Backtested history stays frozen; neither [run_stock_idea_replay.py](backend/scripts/run_stock_idea_replay.py)
+nor [prepare_stock_alert_view.py](backend/scripts/prepare_stock_alert_view.py) is a
+market-hours service. An empty run or degraded coverage is not evidence of no setups
+in the full market. Continuous cadence and strategy effectiveness are separate checks.
+No automatic alerts across saved screeners, AI alerts, email delivery or broker
+orders are enabled by this launcher. See the
+[agentic roadmap](docs/STOCK_SCREENER_WORKSPACE_DESIGN.md#agentic-screener-roadmap)
+for future work, not startup prerequisites.
+
+#### Local State And Another Machine
+
+All of `backend/backups/` is intentionally Git-ignored, including JSON views,
+SQLite worker state and historical reports. Git commits must not delete these
+local files. The earlier index-only untracking preserved them on disk; it does
+not erase copies from older Git history. Backend source, tests, migrations and
+portable configuration are still versioned.
+
+Before pulling the untracking commit into another existing checkout, back up any
+local data that was previously tracked: Git applies tracked deletions when updating
+that checkout. The verified index-only operation preserved this machine's copies;
+it is not a substitute for safeguarding other checkouts.
+
+Some ignored files are operational inputs: the SHADOW and REPLAY alert readers
+read saved views, forward workers resume their SQLite checkpoint, and the optional
+ridge observer needs its enrolled manifest. They are not required to install the
+code, but a fresh clone cannot display old alerts or resume those studies without
+the corresponding data. Use one of these explicit setup paths:
+
+- Restore a consistent PostgreSQL backup and the required local state/views into
+  the same paths (or approved configured paths), preserving policy and source hashes.
+  Take SQLite backups using its backup facilities or while the writer is stopped;
+  do not copy only a live database file while ignoring its journal/WAL state.
+- For a genuinely new environment, install the canonical schema, configure provider
+  access, establish complete source history/publications, and let the authorized
+  publishers create new views and a NEW V2 enrollment. Missing historical views
+  remain unavailable; never fabricate old alerts or inherit an old study's results.
+
+Do not ignore every JSON file: [stock_idea_pilot_config.json](docs/stock_idea_pilot_config.json)
+is read by the forward configuration builder, and the replay evaluation plan and
+retained sample/config/model inputs have separate uses. Large generated reports
+under `docs/` are not covered by the backups ignore rule; exclude or archive them
+only under an explicit evidence-retention decision. A code checkout is not a market-
+data backup. Keep local data separately backed up; no cleanup/commit command here
+is permission to remove it.
+
+**Optional enrolled paper study:** [run_equity_paper_tracker.py](backend/scripts/run_equity_paper_tracker.py)
+observes the fixed ridge/momentum/SPY study, not general stock alerts. Check its
+state before adding the watcher:
+
+```powershell
+.\backend\.venv\Scripts\python.exe .\backend\scripts\run_equity_paper_tracker.py --status
+.\backend\.venv\Scripts\python.exe .\backend\scripts\run_equity_paper_tracker.py --check-inputs
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Only Equity -IncludePaperStudy
+```
+
+This switch requires an existing default study manifest; it never enrolls or
+changes the study. It passes `--watch` normally or `--once` with launcher `-Once`.
+The observer uses retained inputs and writes research records, not broker orders;
+its frozen deadlines cannot be repaired by starting late. Review the
+[paper-study policy](docs/EQUITY_FORWARD_PAPER_STUDY.md) before opting in.
+Advanced streaming, historical replays/backtests, universe bootstraps and source
+repairs are not ordinary resident market-hours workers and remain excluded.
 
 ### Same-Session Recovery And Verification
 
@@ -186,7 +434,12 @@ Monitor run/member status from another terminal without starting work:
 
 One-shot mode runs equity materialization to completion before refreshing portal
 snapshots, so a newly published daily or weekly cohort cannot leave the portal
-generation stale. Continuous mode still runs both workers independently.
+generation stale after a successful pass. Corporate actions and daily discovery
+run between those steps; market events and Treasury inputs run before the option
+cycle. A failed step is reported while independent steps are still attempted;
+the launcher exits with an error if any failed. Continuous workers start
+independently, so check their first successful cycles rather than assuming a
+completed dependency chain from the order windows opened.
 
 One-shot invocation is safe for intermittent same-session price-bar capture. Each
 native `5m`, `15m`, and `30m` request re-reads the available session-to-date range

@@ -1,5 +1,8 @@
 from datetime import datetime, timezone
+from dataclasses import replace
 from uuid import uuid4
+import pytest
+from equity.polygon import sha256_json
 
 from scripts import run_corporate_action_worker
 
@@ -77,6 +80,9 @@ def test_refresh_persists_normalized_live_actions(monkeypatch):
             self.coverage = tuple(coverage)
             return len(coverage)
 
+        def persist_observation(self, coverage, actions):
+            return self.persist(actions), self.persist_coverage(coverage, actions)
+
     repository = Repository()
     result = run_corporate_action_worker.refresh_corporate_actions(
         observed_at=OBSERVED_AT,
@@ -102,6 +108,8 @@ def test_refresh_persists_normalized_live_actions(monkeypatch):
         and row.replay_available_at is None
         for row in repository.coverage
     )
+    assert all(row.response_action_count == 1 and row.security_id == security_id for row in repository.coverage)
+    assert all(row.source_key.endswith(":response-v2") for row in repository.coverage)
 
 
 def test_reconstructed_coverage_is_replay_explicit():
@@ -118,6 +126,22 @@ def test_reconstructed_coverage_is_replay_explicit():
         and row.replay_available_at == OBSERVED_AT
         for row in rows
     )
+    assert all(row.response_action_count is None for row in rows)
+
+
+def test_response_bound_coverage_distinguishes_empty_and_changed_response():
+    identity = uuid4()
+    arguments = dict(start=OBSERVED_AT.date(), end=OBSERVED_AT.date(), observed_at=OBSERVED_AT)
+    empty = run_corporate_action_worker.build_coverage({"AAPL": identity}, responses={"SPLIT": [], "DIVIDEND": []}, **arguments)
+    assert all(row.response_action_count == 0 and row.response_sha256 == sha256_json([]) for row in empty)
+    changed = run_corporate_action_worker.build_coverage(
+        {"AAPL": identity}, responses={"SPLIT": [], "DIVIDEND": [{"ticker": "AAPL", "id": "raw"}]}, **arguments,
+    )
+    assert changed[1].coverage_id != empty[1].coverage_id
+    with pytest.raises(ValueError, match="requires security, count and checksum"):
+        replace(empty[0], security_id=None)
+    with pytest.raises(ValueError, match="response count"):
+        replace(empty[0], response_action_count=True)
 
 
 def test_native_worker_launcher_includes_corporate_action_refresh():

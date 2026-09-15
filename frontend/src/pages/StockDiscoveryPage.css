@@ -1,0 +1,55 @@
+.stock-discovery { display: grid; gap: 8px; min-width: 0; color: var(--tm-ink); }
+.sd-nav { display: flex; gap: 4px; border-bottom: 1px solid var(--tm-line); }
+.sd-nav a { display: inline-flex; align-items: center; gap: 7px; padding: 8px 12px; font-size: 12px; color: var(--tm-muted); text-decoration: none; border-bottom: 2px solid transparent; }
+.sd-nav a.active { color: var(--tm-accent); border-bottom-color: var(--tm-accent); }
+.sd-toolbar { display: flex; justify-content: space-between; gap: 8px; min-width: 0; border: 1px solid var(--tm-line); background: var(--tm-surface-sunken); }
+.sd-presets { display: flex; flex-wrap: wrap; gap: 2px; min-width: 0; }
+.sd-presets button { min-height: 34px; padding: 6px 10px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--tm-muted); font: inherit; font-size: 11px; cursor: pointer; }
+.sd-presets button.active { color: var(--tm-on-accent); background: var(--tm-accent); }
+.sd-tools { display: flex; flex-shrink: 0; align-items: center; gap: 4px; padding: 3px; }
+.sd-tools > button, .sd-pager button, .sd-expand { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border: 1px solid var(--tm-line); border-radius: 3px; background: var(--tm-surface); color: var(--tm-muted); cursor: pointer; }
+.sd-tools button:hover, .sd-pager button:hover { color: var(--tm-ink); background: var(--tm-surface-raised); }
+.stock-discovery button:disabled { opacity: .45; cursor: not-allowed; }
+.stock-discovery :is(button,a,input,select):focus-visible { outline: 2px solid var(--tm-accent); outline-offset: 2px; }
+.sd-filters { display: grid; grid-template-columns: minmax(150px,1.4fr) minmax(120px,1fr) repeat(3,minmax(90px,.7fr)) minmax(135px,1fr) auto; gap: 10px; align-items: end; padding: 10px; border: 1px solid var(--tm-line); background: var(--tm-surface); }
+.sd-filters label { display: grid; gap: 5px; min-width: 0; color: var(--tm-muted); font-size: 10px; }
+.sd-filters input, .sd-filters select { width: 100%; min-width: 0; height: 32px; padding: 4px 7px; border: 1px solid var(--tm-line); border-radius: 3px; font: inherit; font-size: 11px; color: var(--tm-ink); background: var(--tm-surface-sunken); }
+.sd-filters .sd-checkbox { display: flex; gap: 6px; align-items: center; min-height: 32px; white-space: nowrap; }
+.sd-checkbox input { width: 15px; height: 15px; accent-color: var(--tm-accent); }
+.sd-alert-filters { grid-template-columns: repeat(5, minmax(0,1fr)); }
+.sd-metrics { display: flex; flex-wrap: wrap; align-items: center; border-block: 1px solid var(--tm-line); background: var(--tm-surface); }
+.sd-metrics > span { padding: 6px 10px; font-size: 11px; color: var(--tm-muted); border-right: 1px solid var(--tm-line); }
+.sd-metrics strong { color: var(--tm-ink); font-size: 13px; }
+.sd-metrics .sd-timestamp { margin-left: auto; border-right: 0; }
+.sd-table-panel { min-width: 0; border: 1px solid var(--tm-line); background: var(--tm-surface); }
+.sd-table-scroll { width: 100%; overflow: auto; max-height: calc(100vh - 300px); }
+.sd-table-panel table { min-width: 1000px; width: 100%; border-collapse: separate; border-spacing: 0; font-size: 11px; font-variant-numeric: tabular-nums; }
+.sd-table-panel th { position: sticky; top: 0; z-index: 1; padding: 9px 8px; white-space: nowrap; text-align: left; color: var(--tm-muted); background: var(--tm-surface-sunken); border-bottom: 1px solid var(--tm-line); font-size: 10px; }
+.sd-table-panel th button { padding: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.sd-table-panel td { padding: 8px; height: 44px; vertical-align: middle; white-space: nowrap; border-bottom: 1px solid var(--tm-line); }
+.sd-table-panel tbody tr:hover { background: var(--tm-accent-soft); }
+.sd-table-panel td svg { vertical-align: middle; margin-right: 3px; }
+.sd-symbol a { color: var(--tm-accent); font-weight: 750; text-decoration: none; }
+.sd-symbol a:hover { text-decoration: underline; }
+.sd-table-panel small { display: block; font-size: 9px; color: var(--tm-muted); margin-top: 3px; max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+.sd-rank { width: 64px; min-width: 64px; font-weight: 700; }
+.sd-rank-meter { display: block; height: 3px; width: 38px; margin-top: 5px; background: var(--tm-line); }
+.sd-rank-meter i { display: block; height: 100%; background: var(--tm-accent); }
+.sd-positive { color: var(--tm-pos) !important; }
+.sd-negative { color: var(--tm-neg) !important; }
+.sd-warning { color: var(--tm-warn) !important; }
+.sd-paper-badge { padding: 5px 8px; color: var(--tm-warn); font-size: 10px; white-space: nowrap; }
+.sd-criteria { white-space: normal !important; min-width: 150px; max-width: 230px; }
+.sd-criteria span { display: block; line-height: 1.5; }
+.sd-pager { display: flex; justify-content: space-between; align-items: center; padding: 7px 10px; font-size: 11px; color: var(--tm-muted); }
+.sd-pager > div { display: flex; gap: 5px; }
+.sd-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; min-height: 260px; padding: 30px 12px; color: var(--tm-muted); text-align: center; font-size: 12px; }
+.sd-empty svg { color: var(--tm-accent); }
+.sd-notice { display: flex; gap: 8px; align-items: center; padding: 12px; color: var(--tm-warn); border: 1px solid var(--tm-line); font-size: 12px; }
+.sd-notice button { color: var(--tm-ink); background: var(--tm-surface-raised); border: 1px solid var(--tm-line); padding: 4px 8px; cursor: pointer; }
+.sd-detail td { white-space: normal; background: var(--tm-surface-sunken); }
+.sd-detail dl { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 14px; padding: 8px; margin: 0; }
+.sd-detail dt { color: var(--tm-muted); font-size: 10px; margin-bottom: 5px; }
+.sd-detail dd { margin: 0; overflow-wrap: anywhere; }
+@media(max-width:1200px) { .sd-toolbar { flex-wrap: wrap; } .sd-tools { margin-left: auto; } .sd-filters { grid-template-columns: repeat(3,minmax(0,1fr)); } }
+@media(max-width:650px) { .sd-filters { grid-template-columns: repeat(2,minmax(0,1fr)); } .sd-metrics .sd-timestamp { margin-left: 0; } .sd-table-scroll { max-height: 65vh; } .sd-presets button { padding: 5px 8px; font-size: 10px; } .sd-tools { flex-wrap: wrap; } .sd-detail dl { grid-template-columns: repeat(2,minmax(0,1fr)); } .sd-nav a { font-size: 11px; padding-inline: 8px; } }

@@ -33,6 +33,7 @@ export function CommandSpacer() {
 export type ColumnSpec = {
   key: string
   label: string
+  group?: string
   /** Identity columns that must always render. */
   locked?: boolean
   /** Hidden on first load so wide tables fit; the picker re-enables them. */
@@ -90,12 +91,14 @@ export function ColumnPicker({
   onToggle,
   onShowAll,
   onReset,
+  children,
 }: {
   columns: ColumnSpec[]
   hidden: Set<string>
   onToggle: (key: string) => void
   onShowAll: () => void
   onReset: () => void
+  children?: ReactNode
 }) {
   const [open, setOpen] = useState(false)
   const container = useRef<HTMLDivElement>(null)
@@ -116,6 +119,13 @@ export function ColumnPicker({
 
   const hiddenCount = columns.filter(column => hidden.has(column.key)).length
   const title = `Choose columns${hiddenCount ? ` (${hiddenCount} hidden)` : ''}`
+  const groups = columns.some(column => column.group) ? [...new Set(columns.map(column => column.group || 'Other'))] : []
+  const choice = (column: ColumnSpec) => (
+    <label key={column.key} className={column.locked ? 'is-locked' : undefined}>
+      <input type="checkbox" checked={!hidden.has(column.key)} disabled={column.locked} onChange={() => onToggle(column.key)} />
+      {column.label}
+    </label>
+  )
 
   return (
     <div className="tm-columns" ref={container}>
@@ -131,22 +141,20 @@ export function ColumnPicker({
         {hiddenCount > 0 && <i>{hiddenCount}</i>}
       </button>
       {open && (
-        <div className="tm-columns__menu">
+        <div className={`tm-columns__menu${groups.length ? ' tm-columns__menu--grouped' : ''}`}>
           <div className="tm-columns__actions">
             <button type="button" onClick={onShowAll}>Show all</button>
             <button type="button" onClick={onReset}>Reset to fit</button>
           </div>
-          {columns.map(column => (
-            <label key={column.key} className={column.locked ? 'is-locked' : undefined}>
-              <input
-                type="checkbox"
-                checked={!hidden.has(column.key)}
-                disabled={column.locked}
-                onChange={() => onToggle(column.key)}
-              />
-              {column.label}
-            </label>
-          ))}
+          {groups.length ? groups.map(group => {
+            const members = columns.filter(column => (column.group || 'Other') === group)
+            const selected = members.filter(column => !hidden.has(column.key)).length
+            return <fieldset key={group} className="tm-columns__group" aria-label={group}>
+              <legend>{group}<span title={`${selected} of ${members.length} columns shown`}>{selected} / {members.length}</span></legend>
+              {members.map(choice)}
+            </fieldset>
+          }) : columns.map(choice)}
+          {children}
         </div>
       )}
     </div>

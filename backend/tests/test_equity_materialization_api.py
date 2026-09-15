@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
@@ -93,6 +95,7 @@ def test_current_trade_setup_projection_returns_exact_published_row():
     assert {key: result[key] for key in expected} == expected
     assert result["expected_market_time"] == market_time
     assert result["is_fresh"] is True
+    assert result["is_serveable"] is True
     assert result["staleness_seconds"] == 0
     assert result["read_latency_ms"] >= 0
     query, parameters = cursor.execute.call_args.args
@@ -128,6 +131,41 @@ def test_current_trade_setup_projection_rejects_wrong_future_watermark():
     )
     assert result["staleness_seconds"] == 0
     assert result["is_fresh"] is False
+    assert result["is_serveable"] is False
+
+
+@pytest.mark.parametrize("day,sessions,serveable", [(11, 1, True), (9, 3, True), (8, 4, False)])
+def test_current_trade_setup_projection_uses_bounded_stale_policy(day, sessions, serveable):
+    cursor = MagicMock()
+    market_time = datetime(2026, 9, day, 20, 0, tzinfo=timezone.utc)
+    payload = {"ticker": "RBLX", "interval": "1d", "last_close": 45.48}
+    cursor.fetchone.return_value = {
+        "payload": payload,
+        "evidence_id": "evidence-id",
+        "analysis_run_id": "run-id",
+        "market_time": market_time,
+        "observed_at": market_time,
+        "published_at": market_time,
+    }
+
+    @contextmanager
+    def get_cursor():
+        yield cursor
+
+    with (
+        patch("database.get_db_cursor", get_cursor),
+        patch.dict("os.environ", {"EQUITY_MAX_SERVEABLE_STALE_SESSIONS": "3"}),
+    ):
+        result = current_trade_setup_projection(
+            "RBLX", "1d", now=datetime(2026, 9, 14, 21, 0, tzinfo=timezone.utc),
+        )
+
+    assert result["payload"] is payload
+    assert result["is_fresh"] is False
+    assert result["is_serveable"] is serveable
+    assert result["staleness_sessions"] == sessions
+    assert result["max_serveable_stale_sessions"] == 3
+    assert result["status"] == ("STALE" if serveable else "EXPIRED")
 
 
 def test_expected_materialized_market_time_respects_provider_delay():

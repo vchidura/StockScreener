@@ -61,8 +61,8 @@ def source_manifest() -> dict[str, Any]:
     return {"source_generation": int(source["generation"]), "bars": bars}
 
 
-def publish(payloads: Mapping[str, Any], manifest: Mapping[str, Any]) -> list[str]:
-    unknown = set(payloads) - SNAPSHOT_TYPES
+def publish(payloads: Mapping[str, Any], manifest: Mapping[str, Any], *, promote_current: bool = True) -> list[str]:
+    unknown = set(payloads) - SNAPSHOT_TYPES - {"SCREENING_DAILY_V1"}
     if unknown:
         raise ValueError(f"unsupported equity portal snapshots: {sorted(unknown)}")
     generated_at = datetime.now(timezone.utc)
@@ -92,18 +92,19 @@ def publish(payloads: Mapping[str, Any], manifest: Mapping[str, Any]) -> list[st
                     manifest_sha256, Json(payload), payload_sha256, generated_at,
                 ),
             )
-            cursor.execute(
-                """
-                INSERT INTO equity_portal_current_projections (
-                    snapshot_type, snapshot_id, published_at
-                ) VALUES (%s,%s,%s)
-                ON CONFLICT (snapshot_type) DO UPDATE SET
-                    snapshot_id = EXCLUDED.snapshot_id,
-                    published_at = EXCLUDED.published_at
-                WHERE equity_portal_current_projections.published_at <= EXCLUDED.published_at
-                """,
-                (snapshot_type, snapshot_id, generated_at),
-            )
+            if promote_current:
+                cursor.execute(
+                    """
+                    INSERT INTO equity_portal_current_projections (
+                        snapshot_type, snapshot_id, published_at
+                    ) VALUES (%s,%s,%s)
+                    ON CONFLICT (snapshot_type) DO UPDATE SET
+                        snapshot_id = EXCLUDED.snapshot_id,
+                        published_at = EXCLUDED.published_at
+                    WHERE equity_portal_current_projections.published_at <= EXCLUDED.published_at
+                    """,
+                    (snapshot_type, snapshot_id, generated_at),
+                )
             published.append(str(snapshot_id))
     return published
 

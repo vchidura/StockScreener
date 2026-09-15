@@ -208,6 +208,64 @@ def select_historical_members(
     )
 
 
+def select_universe_revisions(runs, *, revision_cutoff=None, pinned_run_ids=None):
+    if len({row["policy_sha256"] for row in runs}) > 1:
+        raise ValueError("mixed universe policies cannot form one revision selection")
+    if revision_cutoff is not None and revision_cutoff.utcoffset() is None:
+        raise ValueError("universe revision cutoff must be timezone-aware")
+    if revision_cutoff is not None and pinned_run_ids is not None:
+        raise ValueError("select revisions by cutoff or exact pins, not both")
+    by_id = {str(row["universe_run_id"]): row for row in runs}
+    if len(by_id) != len(runs):
+        raise ValueError("duplicate universe run ID")
+    roots = {}
+    successors = {}
+    for row in runs:
+        key = (row["effective_from"], row["policy_sha256"])
+        parent_id = row.get("supersedes_universe_run_id")
+        if parent_id is None:
+            if key in roots:
+                raise ValueError("ambiguous original universe for policy/session")
+            roots[key] = row
+            continue
+        parent = by_id.get(str(parent_id))
+        if parent is None:
+            raise ValueError("missing parent universe revision")
+        if key != (parent["effective_from"], parent["policy_sha256"]):
+            raise ValueError("universe revision changes policy or effective session")
+        published_at = row.get("revision_published_at")
+        parent_time = parent.get("revision_published_at") or parent["observed_at"]
+        if published_at is None or published_at.utcoffset() is None or published_at <= parent_time:
+            raise ValueError("universe revision publication must follow its parent")
+        if row["observed_at"] > published_at:
+            raise ValueError("universe revision cannot be published before observation")
+        if str(parent_id) in successors:
+            raise ValueError("branched universe revision chain")
+        successors[str(parent_id)] = row
+    if pinned_run_ids is not None:
+        pins = [str(value) for value in pinned_run_ids]
+        if len(set(pins)) != len(pins) or any(value not in by_id for value in pins):
+            raise ValueError("duplicate or unknown pinned universe revision")
+        selected = [by_id[value] for value in pins]
+        selected_keys = {(row["effective_from"], row["policy_sha256"]) for row in selected}
+        if len(selected_keys) != len(selected) or selected_keys != set(roots):
+            raise ValueError("universe pins must select exactly one revision per requested session")
+    else:
+        selected = []
+        for root in roots.values():
+            current = root
+            if revision_cutoff is not None:
+                if root["observed_at"] > revision_cutoff:
+                    raise ValueError("original universe was not observed by revision cutoff")
+                while str(current["universe_run_id"]) in successors:
+                    successor = successors[str(current["universe_run_id"])]
+                    if successor["revision_published_at"] > revision_cutoff:
+                        break
+                    current = successor
+            selected.append(current)
+    return tuple(sorted(selected, key=lambda row: (row["effective_from"], row["policy_sha256"])))
+
+
 def _decimal(value: Any) -> Decimal | None:
     if value is None:
         return None

@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { Link, useLocation, useParams } from 'react-router-dom'
+import { Link, Navigate, useLocation, useParams } from 'react-router-dom'
 import TickerDetail, { type TickerView } from '../TickerDetail'
 import EntityRail from './EntityRail'
 import FinancialsView from './FinancialsView'
@@ -13,7 +13,6 @@ const VIEWS: Array<{ value: TickerView; label: string }> = [
   { value: 'timeframes', label: 'Timeframes' },
   { value: 'levels', label: 'Levels' },
   { value: 'fibonacci', label: 'Fibonacci' },
-  { value: 'scanner', label: 'Scanner history' },
   { value: 'financials', label: 'Financials' },
 ]
 
@@ -66,6 +65,8 @@ export default function TickerWorkspace() {
       },
     ],
   })
+
+  if (view === 'scanner') return <Navigate to={`/ticker/${symbol}${location.search}`} replace />
 
   return (
     <div className="ticker-workspace">

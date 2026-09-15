@@ -13,14 +13,45 @@ def walk_forward_calibration(
     net_returns: pd.Series,
     net_alpha: pd.Series,
     min_train_periods: int = MIN_TRAIN_PERIODS,
+    *,
+    prediction_times: pd.Series | None = None,
+    outcome_available_at: pd.Series | None = None,
 ) -> dict:
-    """Evaluate expanding base-rate forecasts without using future outcomes."""
+    """Use strictly earlier available labels, or legacy preordered independent periods."""
+    if (prediction_times is None) != (outcome_available_at is None):
+        raise ValueError("prediction_times and outcome_available_at must be supplied together")
     frame = pd.DataFrame({
         "net_return": pd.to_numeric(net_returns, errors="coerce"),
         "net_alpha": pd.to_numeric(net_alpha, errors="coerce"),
-    }).dropna()
+    })
+    if prediction_times is not None:
+        if not all(
+            values.index.equals(net_returns.index)
+            for values in (net_alpha, prediction_times, outcome_available_at)
+        ):
+            raise ValueError("calibration returns and timestamps must have matching indexes")
+        frame["prediction_time"] = _utc_timestamps(prediction_times, "prediction_times")
+        frame["outcome_available_at"] = _utc_timestamps(
+            outcome_available_at, "outcome_available_at"
+        )
+        if (frame["outcome_available_at"] <= frame["prediction_time"]).any():
+            raise ValueError("outcome_available_at must be after its prediction_time")
+    frame = frame.dropna()
     periods = len(frame)
-    if periods <= min_train_periods:
+    outcomes = (frame["net_return"].to_numpy(dtype=float) > 0).astype(float)
+    if prediction_times is not None:
+        availability = frame["outcome_available_at"].array.asi8
+        available_order = np.argsort(availability, kind="stable")
+        known_counts = np.searchsorted(
+            availability[available_order], frame["prediction_time"].array.asi8,
+            side="left",
+        )
+        cumulative_wins = np.r_[0.0, np.cumsum(outcomes[available_order])]
+    else:
+        known_counts = np.arange(periods)
+        cumulative_wins = np.r_[0.0, np.cumsum(outcomes)]
+    eligible = known_counts >= min_train_periods
+    if not eligible.any():
         return {
             "calibration_oos_periods": 0,
             "calibrated_win_probability": None,
@@ -35,17 +66,12 @@ def walk_forward_calibration(
             "live_expected_alpha_ci_high": None,
         }
 
-    outcomes = (frame["net_return"].to_numpy(dtype=float) > 0).astype(float)
-    predictions = []
-    realized = []
     prior_wins = PRIOR_STRENGTH / 2.0
-    for position in range(min_train_periods, periods):
-        wins = float(outcomes[:position].sum())
-        predictions.append((wins + prior_wins) / (position + PRIOR_STRENGTH))
-        realized.append(outcomes[position])
-
-    predicted = np.asarray(predictions, dtype=float)
-    observed = np.asarray(realized, dtype=float)
+    predicted = (
+        (cumulative_wins[known_counts[eligible]] + prior_wins)
+        / (known_counts[eligible] + PRIOR_STRENGTH)
+    )
+    observed = outcomes[eligible]
     brier_score = float(np.mean((predicted - observed) ** 2))
     curve_frame = pd.DataFrame({"predicted": predicted, "observed": observed})
     unique_predictions = int(curve_frame["predicted"].nunique())
@@ -111,3 +137,17 @@ def walk_forward_calibration(
             if alpha_standard_error is not None else None
         ),
     }
+
+
+def _utc_timestamps(values: pd.Series, name: str) -> pd.Series:
+    if values.isna().any():
+        raise ValueError(f"{name} must contain known timezone-aware timestamps")
+    if isinstance(values.dtype, pd.DatetimeTZDtype):
+        return values.astype("datetime64[ns, UTC]")
+    timestamps = [pd.Timestamp(value) for value in values]
+    if any(pd.isna(value) or value.tzinfo is None for value in timestamps):
+        raise ValueError(f"{name} must contain known timezone-aware timestamps")
+    return pd.Series(
+        pd.to_datetime(timestamps, utc=True), index=values.index,
+        dtype="datetime64[ns, UTC]",
+    )

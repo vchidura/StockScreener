@@ -8,9 +8,6 @@ import {
   getCrossSectionalSignals,
   getSignalSectors,
   getDiscoveryStates,
-  getScannerEventSummary,
-  getScannerEventBacklog,
-  getScannerEvents,
   TickerOverviewRow,
   MarketRegime,
   DailyRecommendationsResponse,
@@ -18,10 +15,6 @@ import {
   SectorCoverage,
   DiscoveryResponse,
   DiscoveryState,
-  ScannerEventSummaryRow,
-  ScannerBacklogRow,
-  ScannerEventRow,
-  ScannerInterval,
 } from '../services/api'
 import { usePublishPageContext } from '../layout/pageContext'
 import { CommandBar, CommandSpacer } from '../layout/PageChrome'
@@ -88,19 +81,6 @@ function Dashboard() {
   const { data: discovery = null, isFetching: discoveryLoading } = useQuery<DiscoveryResponse>({
     queryKey: ['market-discovery', discoveryState, signalSector],
     queryFn: () => getDiscoveryStates(discoveryState, 100, signalSector || undefined),
-  })
-  const [scannerInterval, setScannerInterval] = useState<ScannerInterval>('1d')
-  const { data: scannerSummary = { results: [] } } = useQuery<{ results: ScannerEventSummaryRow[] }>({
-    queryKey: ['scanner-events', 'summary', scannerInterval],
-    queryFn: () => getScannerEventSummary(scannerInterval, 1),
-  })
-  const { data: scannerBacklog = { results: [] } } = useQuery<{ results: ScannerBacklogRow[] }>({
-    queryKey: ['scanner-events', 'backlog'],
-    queryFn: () => getScannerEventBacklog(),
-  })
-  const { data: scannerEvents = { results: [] } } = useQuery<{ results: ScannerEventRow[] }>({
-    queryKey: ['scanner-events', 'latest', scannerInterval],
-    queryFn: () => getScannerEvents(scannerInterval, 20),
   })
   type StratEntry = { strategy: string; direction: 'buy' | 'sell' | 'hold'; weight: number }
   type FibWatchEntry = { ticker: string; signal: string; nearest_level: string; distance_pct: number; trend: string }
@@ -646,71 +626,6 @@ function Dashboard() {
             )}
         </div>
 
-        {/* Scanner context */}
-        <div style={CARD}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-            <h3 style={{ ...SECTION_TITLE, margin: 0 }}>Scanner Evidence <span style={SUBTITLE}>Shadow outcomes · no recommendations</span></h3>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <button onClick={() => navigate('/stock-research/research')} style={{ ...selectStyle, cursor: 'pointer', color: 'var(--tm-accent)', fontWeight: 700 }}>
-                Full evaluation
-              </button>
-              <select value={scannerInterval} onChange={event => setScannerInterval(event.target.value as ScannerInterval)} style={selectStyle}>
-                <option value="1d">Daily</option>
-                <option value="1wk">Weekly</option>
-                <option value="1h">Hourly</option>
-              </select>
-            </div>
-          </div>
-          {scannerSummary.results.length === 0 && scannerEvents.results.length === 0
-            ? emptySlate('Collecting shadow events — metrics appear as horizons mature')
-            : (
-              <>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px', marginBottom: '10px' }}>
-                  {(() => {
-                    const best = [...scannerSummary.results].sort((a, b) => (b.alpha_t_stat ?? -99) - (a.alpha_t_stat ?? -99))[0]
-                    const backlog = scannerBacklog.results.filter(row => row.interval === scannerInterval)
-                    const pending = backlog.reduce((sum, row) => sum + row.pending, 0)
-                    const evaluated = backlog.reduce((sum, row) => sum + row.evaluated, 0)
-                    const cards = [
-                      ['Events', scannerEvents.results.length.toString()],
-                      ['Evaluated', evaluated.toString()],
-                      ['Pending', pending.toString()],
-                      ['Status', best?.promotion_status ?? 'COLLECTING'],
-                    ]
-                    return cards.map(([label, value]) => (
-                      <div key={label} style={{ background: 'var(--tm-surface-sunken)', padding: '7px', borderRadius: '6px' }}>
-                        <div style={{ fontSize: '0.66rem', color: 'var(--tm-faint)' }}>{label}</div>
-                        <div style={{ fontSize: '0.82rem', fontWeight: 700, color: 'var(--tm-ink)' }}>{value}</div>
-                      </div>
-                    ))
-                  })()}
-                </div>
-                {scannerSummary.results.length > 0 && (
-                  <table style={{ width: '100%', fontSize: '0.76rem', borderCollapse: 'collapse', marginBottom: '9px' }}>
-                    <thead><tr style={{ borderBottom: '1px solid var(--tm-line)' }}>
-                      {['Scanner', 'Side', 'Horizon', 'Periods', 'Alpha', 't', 'MAE/MFE'].map(label => (
-                        <th key={label} style={{ textAlign: label === 'Scanner' ? 'left' : 'right', padding: '4px 2px', color: 'var(--tm-muted)' }}>{label}</th>
-                      ))}
-                    </tr></thead>
-                    <tbody>{scannerSummary.results.slice(0, 6).map(row => (
-                      <tr key={`${row.scanner_name}-${row.scanner_version}-${row.outcome_policy_key}-${row.direction}-${row.horizon_bars}`} style={{ borderBottom: '1px solid var(--tm-line)' }}>
-                        <td style={{ padding: '4px 2px' }}>{row.scanner_name.replace(/_/g, ' ')}<div style={{ color: 'var(--tm-faint)', fontSize: '0.64rem' }}>{row.return_mode === 'RECOMMENDATION_PLAN' ? 'Plan' : 'Horizon'}</div></td>
-                        <td style={{ textAlign: 'right' }}>{row.direction === 1 ? 'Bull' : 'Bear'}</td>
-                        <td style={{ textAlign: 'right' }}>{row.horizon_bars}{row.interval === '1wk' ? ' sessions' : ' bars'}</td>
-                        <td style={{ textAlign: 'right' }}>{row.independent_periods}</td>
-                        <td style={{ textAlign: 'right' }}>{row.mean_net_alpha != null ? `${(row.mean_net_alpha * 100).toFixed(2)}%` : '—'}</td>
-                        <td style={{ textAlign: 'right' }}>{row.alpha_t_stat?.toFixed(2) ?? '—'}</td>
-                        <td style={{ textAlign: 'right' }}>{row.mean_mae_pct != null && row.mean_mfe_pct != null ? `${(row.mean_mae_pct * 100).toFixed(1)} / ${(row.mean_mfe_pct * 100).toFixed(1)}%` : '—'}</td>
-                      </tr>
-                    ))}</tbody>
-                  </table>
-                )}
-                <div style={{ fontSize: '0.7rem', color: 'var(--tm-faint)' }}>
-                  Horizon-spaced portfolio observations; promotion remains blocked until sample, alpha and stability gates pass.
-                </div>
-              </>
-            )}
-        </div>
       </div>
 
       {/* ─── VALIDATED CROSS-SECTIONAL SIGNAL ─── */}

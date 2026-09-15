@@ -226,6 +226,113 @@ def test_entry_outside_required_bracket_is_not_triggered():
     assert result.quality_codes == ("ENTRY_OUTSIDE_BRACKET",)
 
 
+@pytest.fixture
+def daily_case():
+    import exchange_calendars
+
+    calendar = exchange_calendars.get_calendar("XNYS")
+    signal_time = calendar.session_close("2026-08-28").to_pydatetime()
+    event = replace(subject(stop="90", target="150"), interval="1d", market_time=signal_time,
+                    observed_at=signal_time, valid_until=signal_time + timedelta(days=30))
+    daily_policy = default_directional_policy(source_name=event.source_name, source_version=event.source_version,
+                                             interval="1d", horizons={"5d": 5}, effective_from=signal_time)
+    bars = tuple(replace(bar(calendar.session_open(session).to_pydatetime(), 100, 112, 99, 101 + index),
+                         interval="1d", security_id=event.security_id,
+                         bar_end=calendar.session_close(session).to_pydatetime(),
+                         system_observed_at=calendar.session_close(session).to_pydatetime())
+                 for index, session in enumerate(calendar.sessions_in_range("2026-08-31", "2026-09-08")))
+    return event, daily_policy, bars
+
+
+@pytest.mark.parametrize("failure,code", [
+    ("gap", "DAILY_OUTCOME_SESSION_MISSING"),
+    ("identity", "OUTCOME_SECURITY_IDENTITY_MISMATCH"),
+    ("clock", "DAILY_OUTCOME_CLOCK_INVALID"),
+])
+def test_daily_outcome_rejects_invalid_interior_path(daily_case, failure, code):
+    event, daily_policy, bars = daily_case
+    if failure == "gap":
+        bars = bars[:2] + bars[3:]
+    elif failure == "identity":
+        bars = bars[:2] + (replace(bars[2], security_id=uuid4()),) + bars[3:]
+    else:
+        bars = bars[:2] + (replace(bars[2], bar_end=bars[2].bar_end - timedelta(minutes=30)),) + bars[3:]
+    result = evaluate_directional_outcome(event, daily_policy, "5d", bars)
+    assert result.entry_status == "UNAVAILABLE"
+    assert result.quality_codes == (code,)
+    assert result.net_return is None
+
+
+def test_daily_zero_volume_is_no_fill_not_missing_price(daily_case):
+    event, daily_policy, bars = daily_case
+    result = evaluate_directional_outcome(event, daily_policy, "5d", (replace(bars[0], volume=Decimal("0")),) + bars[1:])
+    assert result.entry_status == "NOT_TRIGGERED"
+    assert result.quality_codes == ("ZERO_VOLUME_ENTRY_NO_FILL",)
+    assert result.net_return is None
+
+
+def test_daily_benchmark_requires_matching_complete_path(daily_case):
+    event, daily_policy, bars = daily_case
+    for benchmark in (bars[1:5], bars[:4], bars[:2] + bars[3:5]):
+        result = evaluate_directional_outcome(event, daily_policy, "5d", bars, market_bars=benchmark)
+        assert result.entry_status == "ENTERED"
+        assert result.market_return is None
+        assert result.net_alpha is None
+    assert evaluate_directional_outcome(event, daily_policy, "5d", bars, market_bars=bars[:5]).market_return == 0.05
+
+
+def test_daily_plan_can_exit_before_later_missing_session(daily_case):
+    event, _, bars = daily_case
+    daily_policy = recommendation_plan_policy(source_name=event.source_name, source_version=event.source_version,
+                                               interval="1d", horizons={"5d": 5}, effective_from=event.observed_at)
+    event = replace(event, payload_json=canonical_json({"stop_price": 90, "target_price": 105}))
+    result = evaluate_directional_outcome(event, daily_policy, "5d", bars[:2] + bars[3:])
+    assert result.entry_status == "ENTERED"
+    assert result.exit_time == bars[0].bar_end
+
+
+def test_daily_outcome_availability_includes_late_known_input(daily_case):
+    event, daily_policy, bars = daily_case
+    later = bars[-1].system_observed_at + timedelta(days=2)
+    path = (replace(bars[0], system_observed_at=later),) + bars[1:]
+    result = evaluate_directional_outcome(event, daily_policy, "5d", path)
+    assert result.outcome_available_at == later
+
+
+def test_frozen_action_barrier_is_relative_to_each_signal(daily_case):
+    from scripts.run_historical_signal_outcomes import FrozenDailyBars
+
+    event, _, bars = daily_case
+    reader = FrozenDailyBars(event.observed_at, bars[-1].system_observed_at)
+    reader.paths["AAPL"] = (tuple(row.bar_start for row in bars), bars)
+    reader.action_dates["AAPL"] = [bars[2].session_date]
+    before = reader.list_final_after("AAPL", "1d", after=event.observed_at, available_by=bars[-1].system_observed_at,
+                                     limit=5, historical_reconstructed_only=True, adjusted=True)
+    assert "UNSUPPORTED_REPLAY_CORPORATE_ACTION" in before[2].quality_codes
+    after = reader.list_final_after("AAPL", "1d", after=bars[2].bar_end, available_by=bars[-1].system_observed_at,
+                                    limit=5, historical_reconstructed_only=True, adjusted=True)
+    assert all("UNSUPPORTED_REPLAY_CORPORATE_ACTION" not in row.quality_codes for row in after)
+
+
+def test_verified_evidence_reuse_refuses_changed_payload(monkeypatch):
+    from contextlib import nullcontext
+    from unittest.mock import MagicMock
+    from equity.repositories import EquityEvidenceRepository
+
+    event = subject()
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [dict(evidence_id=event.evidence_id, security_id=event.security_id,
+                                        security_revision_id=event.security_revision_id,
+                                        payload_sha256="changed", source_revision_ids=event.source_revision_ids)]
+    repository = EquityEvidenceRepository()
+    monkeypatch.setattr(repository, "_cursor", lambda: nullcontext(cursor))
+    monkeypatch.setattr("equity.repositories.execute_values", lambda *args, **kwargs: [])
+    with pytest.raises(ValueError, match="differs"):
+        repository.persist((event,), verify_existing=True)
+    cursor.fetchall.return_value[0]["payload_sha256"] = event.payload_sha256
+    assert repository.persist((event,), verify_existing=True) == 0
+
+
 def test_outcome_policy_requires_named_positive_horizon_mapping():
     with pytest.raises(ValueError, match="non-empty JSON object"):
         replace(policy(), horizons_json="[]")

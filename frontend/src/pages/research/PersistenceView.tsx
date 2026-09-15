@@ -1,6 +1,7 @@
 import { Fragment, useMemo, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
+import { ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react'
 import { scanStreak, getTickersOverview, type StreakResult, type TickerOverviewRow } from '../../services/api'
 import './persistence.css'
 
@@ -162,20 +163,21 @@ export default function PersistenceView() {
   })
 
   // Shared query key with the other pages, so this is normally already cached.
-  const { data: overview = [] } = useQuery<TickerOverviewRow[]>({
+  const overviewQuery = useQuery<TickerOverviewRow[]>({
     queryKey: ['tickers', 'overview'],
     queryFn: () => getTickersOverview(),
     staleTime: 5 * 60 * 1000,
   })
+  const overview = overviewQuery.data ?? []
 
   const loading = queries.some(query => query.isLoading)
   const failed = STRATEGIES.filter((_, index) => queries[index].isError).map(item => item.label)
-  const dataStamp = queries.map(query => query.dataUpdatedAt).join(',')
+  const dataStamp = queries.map(query => `${query.dataUpdatedAt}:${query.status}`).join(',')
 
   const allRows = useMemo<Row[]>(() => queries.flatMap((query, index) => {
     const meta = STRATEGIES[index]
     const dates = query.data?.scan_dates ?? []
-    return (query.data?.results ?? []).map(result => ({
+    return (query.isError ? [] : query.data?.results ?? []).map(result => ({
       key: `${result.ticker}:${meta.value}`,
       ticker: result.ticker,
       strategy: meta.value,
@@ -196,8 +198,12 @@ export default function PersistenceView() {
   }, [allRows])
 
   const coverage = useMemo(() => {
-    const universe = overview.length || strategyCount.size
-    if (!universe) return null
+    const universe = overview.length
+    if (!universe || overviewQuery.isError || queries.some(query => !query.data || query.isError)) return null
+    const dates = queries[0].data?.scan_dates ?? []
+    if (dates.length !== PUBLISHED_DAYS || queries.some(query => query.data?.scan_dates.join(',') !== dates.join(','))) return null
+    const members = new Set(overview.map(row => row.ticker))
+    if ([...strategyCount.keys()].some(ticker => !members.has(ticker))) return null
     const counts = STRATEGIES.map((_, index) => queries[index].data?.results.length ?? 0)
     const probabilities = counts.map(count => count / universe)
     const expected = poissonBinomial(probabilities).map(value => value * universe)
@@ -206,7 +212,7 @@ export default function PersistenceView() {
     observed[0] = universe - strategyCount.size
     return { universe, counts, probabilities, expected, observed }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [overview.length, strategyCount, dataStamp])
+  }, [overview, overviewQuery.isError, strategyCount, dataStamp])
 
   const term = search.trim().toUpperCase()
   const filtered = useMemo(() => allRows.filter(row =>
@@ -242,23 +248,27 @@ export default function PersistenceView() {
 
   return (
     <div className="pv">
-      <p className="pv-note">
-        Persistence counts how often a ticker appeared in a strategy scan over the last {PUBLISHED_DAYS} sessions,
-        and how that signal moved while it persisted. It is a description of recurrence, not evidence of an edge —
-        statistical qualification lives in the Research view. A ticker missing from a strategy may simply lack the
-        history that strategy requires, so an absent row is not a negative reading.
-      </p>
+      <div className="pv-status">
+        <span className="pv-note">Recurrence only. Not a trading qualification.</span>
+        <button type="button" className="pv-refresh" aria-label="Reload persistence" title="Reload persistence"
+          disabled={queries.some(query => query.isFetching) || overviewQuery.isFetching}
+          onClick={() => { queries.forEach(query => { void query.refetch() }); void overviewQuery.refetch() }}>
+          <RefreshCw size={15} aria-hidden="true" />
+        </button>
+      </div>
 
       <section className="pv-panel">
         <div className="pv-panel__head">
           <div>
             <h2>Coverage this window</h2>
-            <p>How selective each scan is, and whether appearing in several of them means anything.</p>
+            <p>{coverage ? queries[0].data?.scan_dates.join(' / ') : 'Five-session source window'}</p>
           </div>
           {failed.length > 0 && <span className="pv-unavailable">Unavailable: {failed.join(', ')}</span>}
         </div>
-        {loading || !coverage ? (
+        {loading || overviewQuery.isLoading ? (
           <p className="pv-empty">Loading coverage…</p>
+        ) : !coverage ? (
+          <p className="pv-empty" role="status">Coverage unavailable: missing or nonmatching source windows.</p>
         ) : (
           <div className="pv-coverage">
             <div className="pv-rates">
@@ -288,17 +298,12 @@ export default function PersistenceView() {
                     {coverage.observed.map((value, k) => <td key={k}>{value}</td>)}
                   </tr>
                   <tr>
-                    <td>If independent</td>
+                    <td>Independence reference</td>
                     {coverage.expected.map((value, k) => <td key={k}>{value.toFixed(0)}</td>)}
                   </tr>
                 </tbody>
               </table>
-              <p>
-                These two rows track each other closely, so matching several scans is mostly explained by how often
-                each scan fires on its own rather than by the strategies agreeing. Use the strategy-count filter to
-                narrow the list, not to rank it. Long and short strategies never co-occur by construction, so a high
-                count mixes directions.
-              </p>
+              <p>Strategy overlap is not independent confirmation. Missing observations are not negative signals.</p>
             </div>
           </div>
         )}
@@ -308,7 +313,6 @@ export default function PersistenceView() {
         <div className="pv-panel__head">
           <div>
             <h2>Persistence detail</h2>
-            <p>One row per ticker and strategy. Trajectory columns use each strategy&apos;s own vocabulary.</p>
           </div>
         </div>
         <div className="pv-controls">
@@ -361,7 +365,7 @@ export default function PersistenceView() {
         {loading ? (
           <p className="pv-empty">Loading persistence across all strategies…</p>
         ) : ordered.length === 0 ? (
-          <p className="pv-empty">No rows match these filters in the published window.</p>
+          <p className="pv-empty">{failed.length ? 'No matching rows from available sources.' : 'No rows match these filters in the published window.'}</p>
         ) : (
           <>
             <div className="pv-table-wrap">
@@ -461,8 +465,8 @@ export default function PersistenceView() {
                   {safePage * PAGE_SIZE + 1}–{Math.min(ordered.length, (safePage + 1) * PAGE_SIZE)} of {ordered.length}
                 </span>
                 <div>
-                  <button type="button" onClick={() => setPage(safePage - 1)} disabled={safePage === 0}>Previous</button>
-                  <button type="button" onClick={() => setPage(safePage + 1)} disabled={safePage >= pageCount - 1}>Next</button>
+                  <button type="button" aria-label="Previous page" title="Previous page" onClick={() => setPage(safePage - 1)} disabled={safePage === 0}><ChevronLeft size={16} /></button>
+                  <button type="button" aria-label="Next page" title="Next page" onClick={() => setPage(safePage + 1)} disabled={safePage >= pageCount - 1}><ChevronRight size={16} /></button>
                 </div>
               </div>
             )}

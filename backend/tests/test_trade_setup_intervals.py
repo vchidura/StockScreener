@@ -14,8 +14,9 @@ if str(BACKEND_DIR) not in sys.path:
 import main
 
 
-def materialized_projection(payload, *, fresh=True):
+def materialized_projection(payload, *, fresh=True, serveable=None):
     market_time = datetime(2026, 8, 28, 20, 0, tzinfo=timezone.utc)
+    serveable = fresh if serveable is None else serveable
     return {
         "payload": payload,
         "evidence_id": "evidence-id",
@@ -25,6 +26,10 @@ def materialized_projection(payload, *, fresh=True):
         "published_at": market_time,
         "expected_market_time": market_time,
         "is_fresh": fresh,
+        "is_serveable": serveable,
+        "status": "READY" if fresh else "STALE" if serveable else "EXPIRED",
+        "staleness_sessions": 0 if fresh else 1 if serveable else 4,
+        "max_serveable_stale_sessions": 3,
         "read_latency_ms": 1.25,
         "staleness_seconds": 0 if fresh else 1800,
     }
@@ -124,7 +129,7 @@ class TradeSetupIntervalTests(unittest.IsolatedAsyncioTestCase):
             "Published materialized 30m setup unavailable",
         )
 
-    async def test_multi_setup_reports_stale_projection_without_fallback(self):
+    async def test_multi_setup_reports_expired_projection_without_fallback(self):
         async def compute(_symbol, interval, _refresh, _shared_frames):
             return {"ticker": "AAPL", "interval": interval}
 
@@ -147,8 +152,39 @@ class TradeSetupIntervalTests(unittest.IsolatedAsyncioTestCase):
             result = await main.get_multi_trade_setup("AAPL")
 
         self.assertNotIn("30m", result["setups"])
-        self.assertEqual(result["setup_read_metrics"]["30m"]["status"], "STALE")
-        self.assertIn("is stale", result["errors"]["30m"])
+        self.assertEqual(result["setup_read_metrics"]["30m"]["status"], "EXPIRED")
+        self.assertFalse(result["setup_read_metrics"]["30m"]["is_serveable"])
+        self.assertIn("outside the permitted freshness window", result["errors"]["30m"])
+
+    def test_multi_setup_serves_exact_bounded_stale_projection_with_metadata(self):
+        payload = {"ticker": "RBLX", "interval": "1d", "last_close": 45.48}
+        cached = {
+            "ticker": "RBLX", "setups": {}, "setup_sources": {},
+            "errors": {"1d": "Previous unavailable read"}, "confluence_zones": [],
+        }
+        with (
+            patch.object(main, "_materialized_setup_intervals", return_value=("1d",)),
+            patch.object(main, "current_trade_setup_projection", return_value=materialized_projection(
+                payload, fresh=False, serveable=True,
+            )),
+            patch.object(main, "_build_ticker_confluence_zones", return_value=[]) as confluence,
+            patch.object(main, "_compute_trade_setup", new=AsyncMock()) as compute,
+        ):
+            result = main._with_materialized_setups(cached)
+
+        self.assertIs(result["setups"]["1d"], payload)
+        self.assertEqual(result["setup_sources"]["1d"], "MATERIALIZED_CURRENT_PROJECTION")
+        self.assertNotIn("1d", result["errors"])
+        metrics = result["setup_read_metrics"]["1d"]
+        self.assertEqual(metrics["status"], "STALE")
+        self.assertTrue(metrics["is_serveable"])
+        self.assertEqual(metrics["staleness_sessions"], 1)
+        self.assertEqual(metrics["max_serveable_stale_sessions"], 3)
+        self.assertEqual(metrics["analysis_run_id"], "run-id")
+        self.assertEqual(cached["setups"], {})
+        self.assertIn("1d", cached["errors"])
+        confluence.assert_called_once_with({"1d": payload})
+        compute.assert_not_called()
 
     async def test_multi_setup_injects_exact_materialized_30m_projection(self):
         materialized = {"ticker": "AAPL", "interval": "30m", "last_close": 100.0}

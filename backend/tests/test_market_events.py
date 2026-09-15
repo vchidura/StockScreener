@@ -120,6 +120,22 @@ def test_finnhub_earnings_client_paces_bounded_request_windows():
     assert FINNHUB_REQUEST_INTERVAL_SECONDS == 2.1
 
 
+def test_finnhub_earnings_client_accepts_truncated_global_response():
+    first = _earnings_row("2026-09-11")
+    second = _earnings_row("2026-10-22")
+    session = _Session([
+        _Response({"earningsCalendar": [first]}),
+        _Response({"earningsCalendar": [second]}),
+        _Response({"earningsCalendar": [first]}),
+    ])
+
+    rows = FinnhubEarningsClient(
+        "secret", session, sleep=lambda _: None
+    ).fetch(date(2026, 9, 10), date(2026, 10, 26))
+
+    assert rows == (first, second)
+
+
 def test_finnhub_earnings_client_rejects_incomplete_bounded_response():
     first = _earnings_row("2026-09-11")
     second = _earnings_row("2026-10-22")

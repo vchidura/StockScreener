@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -35,6 +36,7 @@ from equity.repositories import (
     EquityUniverseRepository,
 )
 from equity.outcomes import default_directional_policy
+from equity.historical_universe import select_universe_revisions
 
 
 UTC = timezone.utc
@@ -108,6 +110,155 @@ def _context(**overrides):
     return EquityContextSnapshot(**values)
 
 
+@pytest.mark.parametrize("duplicate", ["security_id", "ticker"])
+def test_universe_rejects_duplicate_members_before_writing(duplicate):
+    repository, _, cursor = _repository(EquityUniverseRepository)
+    first = SimpleNamespace(security_id=uuid4(), ticker="FIRST")
+    second = SimpleNamespace(security_id=uuid4(), ticker="SECOND")
+    setattr(second, duplicate, getattr(first, duplicate))
+
+    with pytest.raises(ValueError, match="duplicate"):
+        repository.persist_complete_run(
+            universe_run_id=uuid4(), source="TEST", mode="RANKED",
+            effective_from=_watermark().market_time, observed_at=_watermark().observed_time,
+            policy_version="test", policy_sha256=HASH, members=(first, second), configuration={},
+        )
+
+    cursor.execute.assert_not_called()
+
+
+@pytest.mark.parametrize("stored, expected_error", [(1503, True), (1504, False)])
+def test_historical_resume_verifies_stored_membership_count(stored, expected_error):
+    repository, _, cursor = _repository(EquityUniverseRepository)
+    run_id = uuid4()
+    cursor.fetchone.return_value = {
+        "universe_run_id": run_id, "admitted_members": 1504, "stored_member_count": stored,
+    }
+    arguments = {"policy_sha256": HASH, "effective_from": _watermark().market_time}
+    if expected_error:
+        with pytest.raises(ValueError, match="refusing to resume"):
+            repository.get_reconstructed_session(**arguments)
+    else:
+        assert repository.get_reconstructed_session(**arguments) == {
+            "universe_run_id": run_id, "admitted_members": 1504,
+        }
+    assert "COUNT(*) FROM equity_universe_members" in cursor.execute.call_args.args[0]
+
+
+@pytest.fixture
+def universe_revision_chain():
+    observed = datetime(2026, 9, 4, tzinfo=UTC)
+    original = {"universe_run_id": uuid4(), "effective_from": datetime(2024, 3, 4, tzinfo=UTC),
+                "policy_sha256": HASH, "observed_at": observed, "supersedes_universe_run_id": None,
+                "revision_published_at": None}
+    correction = original | {"universe_run_id": uuid4(), "observed_at": observed + timedelta(days=8),
+                             "supersedes_universe_run_id": original["universe_run_id"],
+                             "revision_published_at": observed + timedelta(days=8, hours=1)}
+    return original, correction
+
+
+def test_universe_revisions_default_to_original_and_pins_do_not_upgrade(universe_revision_chain):
+    original, correction = universe_revision_chain
+    assert select_universe_revisions(universe_revision_chain) == (original,)
+    assert select_universe_revisions(universe_revision_chain, pinned_run_ids=[original["universe_run_id"]]) == (original,)
+    assert select_universe_revisions(universe_revision_chain, pinned_run_ids=[correction["universe_run_id"]]) == (correction,)
+
+
+@pytest.mark.parametrize("offset, corrected", [(-1, False), (0, True), (1, True)])
+def test_universe_revision_visibility_uses_publication_cutoff(universe_revision_chain, offset, corrected):
+    original, correction = universe_revision_chain
+    cutoff = correction["revision_published_at"] + timedelta(seconds=offset)
+    assert select_universe_revisions(universe_revision_chain, revision_cutoff=cutoff) == ((correction if corrected else original),)
+
+
+@pytest.mark.parametrize("failure", ["root", "parent", "branch", "policy", "date", "time", "observed"])
+def test_universe_revision_graph_rejects_ambiguity_and_invalid_lineage(universe_revision_chain, failure):
+    original, correction = [dict(row) for row in universe_revision_chain]
+    rows = [original, correction]
+    if failure == "root":
+        rows.append(original | {"universe_run_id": uuid4()})
+    elif failure == "parent":
+        correction["supersedes_universe_run_id"] = uuid4()
+    elif failure == "branch":
+        rows.append(correction | {"universe_run_id": uuid4()})
+    elif failure == "policy":
+        correction["policy_sha256"] = "b" * 64
+    elif failure == "date":
+        correction["effective_from"] += timedelta(days=1)
+    elif failure == "time":
+        correction["revision_published_at"] = original["observed_at"]
+    else:
+        correction["observed_at"] = correction["revision_published_at"] + timedelta(seconds=1)
+    with pytest.raises(ValueError):
+        select_universe_revisions(rows)
+
+
+@pytest.mark.parametrize("pins", [[], ["unknown"]])
+def test_universe_revision_pins_must_cover_requested_sessions(universe_revision_chain, pins):
+    with pytest.raises(ValueError):
+        select_universe_revisions(universe_revision_chain, pinned_run_ids=pins)
+
+
+def test_universe_revision_cutoff_does_not_backdate_observation(universe_revision_chain):
+    original, _ = universe_revision_chain
+    with pytest.raises(ValueError, match="not observed"):
+        select_universe_revisions(universe_revision_chain, revision_cutoff=original["effective_from"])
+    with pytest.raises(ValueError, match="timezone-aware"):
+        select_universe_revisions(universe_revision_chain, revision_cutoff=datetime(2026, 9, 12))
+
+
+def test_multiple_corrections_follow_cutoff_but_exact_pins_stay_fixed(universe_revision_chain):
+    original, correction = universe_revision_chain
+    later = correction | {"universe_run_id": uuid4(), "supersedes_universe_run_id": correction["universe_run_id"],
+                          "revision_published_at": correction["revision_published_at"] + timedelta(hours=1)}
+    rows = [later, original, correction]
+    assert select_universe_revisions(rows, revision_cutoff=correction["revision_published_at"]) == (correction,)
+    assert select_universe_revisions(rows, revision_cutoff=later["revision_published_at"]) == (later,)
+    assert select_universe_revisions(rows, pinned_run_ids=[correction["universe_run_id"]]) == (correction,)
+    with pytest.raises(ValueError, match="not both"):
+        select_universe_revisions(rows, pinned_run_ids=[original["universe_run_id"]], revision_cutoff=later["revision_published_at"])
+
+
+def test_repository_returns_only_selected_complete_universe_revision(universe_revision_chain):
+    repository, _, cursor = _repository(EquityUniverseRepository)
+    rows = [row | {"status": "COMPLETE", "admitted_members": 1, "stored_member_count": 1}
+        for row in universe_revision_chain]
+    cursor.fetchall.return_value = rows
+    assert repository.list_reconstructed_revisions(policy_version="test") == (rows[0],)
+    assert repository.list_reconstructed_revisions(policy_version="test", revision_cutoff=rows[1]["revision_published_at"]) == (rows[1],)
+    rows[1]["stored_member_count"] = 0
+    with pytest.raises(ValueError, match="incomplete"):
+        repository.list_reconstructed_revisions(
+            policy_version="test", pinned_run_ids=[rows[1]["universe_run_id"]],
+        )
+
+
+def test_audited_count_discrepancy_is_explicit_exact_and_original_only(universe_revision_chain):
+    repository, _, cursor = _repository(EquityUniverseRepository)
+    original, correction = universe_revision_chain
+    row = dict(original, status="COMPLETE", admitted_members=1504, stored_member_count=1503)
+    audit = dict(session="2024-03-04", policy_sha256=HASH, declared_members=1504, stored_members=1503)
+    allowed = {str(row["universe_run_id"]): audit}
+    cursor.fetchall.return_value = [row]
+    with pytest.raises(ValueError, match="declared=1504, stored=1503"):
+        repository.list_reconstructed_revisions(policy_version="test")
+    selected = repository.list_reconstructed_revisions(policy_version="test", audited_count_discrepancies=allowed)
+    assert selected[0]["member_count_discrepancy"] == audit
+    assert selected[0]["stored_member_count"] == 1503
+    assert "member_count_discrepancy" not in row
+    for changes in ({"stored_member_count": 1502}, {"admitted_members": 1505}, {"status": "DEGRADED"},
+                    {"policy_sha256": "f" * 64}, {"effective_from": row["effective_from"] + timedelta(days=1)},
+                    {"universe_run_id": uuid4()}):
+        cursor.fetchall.return_value = [dict(row, **changes)]
+        with pytest.raises(ValueError, match="incomplete"):
+            repository.list_reconstructed_revisions(policy_version="test", audited_count_discrepancies=allowed)
+    revised = dict(correction, status="COMPLETE", admitted_members=1504, stored_member_count=1503)
+    cursor.fetchall.return_value = [row, revised]
+    with pytest.raises(ValueError, match="incomplete"):
+        repository.list_reconstructed_revisions(policy_version="test", pinned_run_ids=[revised["universe_run_id"]],
+                                               audited_count_discrepancies={str(revised["universe_run_id"]): audit})
+
+
 def test_reference_read_requires_both_watermarks():
     repository, connection, cursor = _repository(EquityReferenceRepository)
     context = _watermark()
@@ -150,7 +301,12 @@ def test_replay_members_prefer_point_in_time_classified_security_revision():
     assert "candidate.sector IS NOT NULL" in sql
     assert "member.ticker = ANY(%s::TEXT[])" in sql
     assert "reference.observed_at <=" not in sql
-    assert parameters == (universe_run_id, ["AAPL", "MSFT"], ["AAPL", "MSFT"])
+    assert parameters == (None, None, None, universe_run_id, ["AAPL", "MSFT"], ["AAPL", "MSFT"])
+    cutoff = "2026-09-12T00:00:00+00:00"
+    repository.members_for_replay(universe_run_id, ("AAPL",), observed_by=cutoff)
+    query, parameters = cursor.execute.call_args.args
+    assert "candidate.observed_at<=%s AND candidate.created_at<=%s" in query
+    assert parameters[:3] == (cutoff, cutoff, cutoff)
 
 
 def test_historical_sector_candidates_exclude_existing_point_in_time_classification():
@@ -198,6 +354,26 @@ def test_corporate_action_persistence_is_idempotent_by_action_identity():
 
     sql = " ".join(execute_values.call_args.args[1].split())
     assert "ON CONFLICT (corporate_action_id) DO NOTHING" in sql
+
+
+def test_action_and_coverage_observation_share_one_transaction():
+    repository, connection, cursor = _repository(EquityCorporateActionRepository)
+    with patch.object(repository, "persist", return_value=1) as actions, \
+            patch.object(repository, "persist_coverage", return_value=2) as coverage:
+        assert repository.persist_observation(["coverage"], ["action"]) == (1, 2)
+        actions.assert_called_once_with(["action"], cursor=cursor)
+        coverage.assert_called_once_with(["coverage"], ["action"], cursor=cursor)
+    connection.commit.assert_called_once_with()
+
+
+def test_failed_coverage_rolls_back_action_observation():
+    repository, connection, _ = _repository(EquityCorporateActionRepository)
+    with patch.object(repository, "persist", return_value=1), \
+            patch.object(repository, "persist_coverage", side_effect=ValueError("bad response")):
+        with pytest.raises(ValueError, match="bad response"):
+            repository.persist_observation(["coverage"], ["action"])
+    connection.commit.assert_not_called()
+    connection.rollback.assert_called_once_with()
 
 
 def test_corporate_action_replay_read_uses_availability_watermark():
@@ -446,6 +622,7 @@ def test_qualification_observations_are_scoped_to_declared_sources():
     policy_keys = (
         "GAP_BREAKAWAY_HOLD:gap_formation_v2:1d:SIGNED:SECTOR_PRIMARY",
     )
+    policy_ids = (uuid4(),)
 
     assert repository.qualification_observations(
         available_by=_watermark().observed_time,
@@ -453,6 +630,7 @@ def test_qualification_observations_are_scoped_to_declared_sources():
         source_names=sources,
         subject_evidence_ids=subject_ids,
         outcome_policy_keys=policy_keys,
+        outcome_policy_ids=policy_ids,
     ) == []
 
     sql, parameters = cursor.execute.call_args.args
@@ -462,6 +640,11 @@ def test_qualification_observations_are_scoped_to_declared_sources():
     assert "outcome.outcome_revision = 1" not in sql
     assert "outcome.outcome_revision DESC" in sql
     assert "outcome.outcome_id" in sql
+    assert "outcome.outcome_id, outcome.outcome_policy_id," in " ".join(sql.split())
+    assert "evidence.observed_at AS signal_time" in sql
+    assert "evidence.market_time AS signal_market_time" in sql
+    assert "outcome.entry_time, outcome.exit_time" in sql
+    assert "outcome.outcome_available_at," in sql
     assert "outcome.subject_evidence_id" in sql
     assert "outcome.sector_net_alpha" in sql
     assert "AS primary_benchmark" in sql
@@ -469,9 +652,23 @@ def test_qualification_observations_are_scoped_to_declared_sources():
     assert "outcome.subject_evidence_id = ANY(%s::UUID[])" in sql
     assert "evidence.source_name = ANY(%s::TEXT[])" in sql
     assert "policy.policy_key = ANY(%s::TEXT[])" in sql
+    assert "OR outcome.outcome_policy_id = ANY(%s::UUID[])" in sql
     assert parameters[3:5] == (list(subject_ids), list(subject_ids))
     assert parameters[5:7] == (list(sources), list(sources))
     assert parameters[7:9] == (list(policy_keys), list(policy_keys))
+    assert parameters[9:11] == (list(policy_ids), list(policy_ids))
+
+
+def test_qualification_observations_preserve_policy_identity_without_an_id_filter():
+    repository, _, cursor = _repository(EquityOutcomeRepository)
+    policy_id = uuid4()
+    cursor.fetchall.return_value = [{"outcome_policy_id": policy_id}]
+
+    rows = repository.qualification_observations(available_by=_watermark().observed_time)
+
+    assert rows == [{"outcome_policy_id": policy_id}]
+    _, parameters = cursor.execute.call_args.args
+    assert parameters[9:11] == ([], [])
 
 
 def test_canonical_publication_is_atomic_and_advances_current_pointer():

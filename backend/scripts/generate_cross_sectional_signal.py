@@ -17,6 +17,7 @@ periods, so treat this as a monitored signal rather than a settled result.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import logging
 import sys
 from pathlib import Path
@@ -43,9 +44,9 @@ logger = logging.getLogger("xs-signal")
 MIN_PRIOR_UNIVERSE_RATIO = 0.90
 
 
-def compute_signal(as_of: str | None) -> pd.DataFrame:
+def compute_signal(as_of: str | None, *, panel: pd.DataFrame | None = None) -> pd.DataFrame:
     """Score the latest cross-section. Returns one row per ticker."""
-    cross = prepare_live_cross_section(as_of, feature_cols=MODEL_FEATURES)
+    cross = prepare_live_cross_section(as_of, feature_cols=MODEL_FEATURES, panel=panel)
     if cross.empty:
         return cross
 
@@ -54,7 +55,7 @@ def compute_signal(as_of: str | None) -> pd.DataFrame:
     return cross.reset_index(drop=True)
 
 
-def persist(cross: pd.DataFrame) -> int:
+def persist(cross: pd.DataFrame, *, cursor=None) -> int:
     trade_date = cross["date"].iloc[0]
     if hasattr(trade_date, "date"):
         trade_date = trade_date.date()
@@ -74,7 +75,7 @@ def persist(cross: pd.DataFrame) -> int:
         )
         for _, r in cross.iterrows()
     ]
-    with get_db_cursor() as cur:
+    with (nullcontext(cursor) if cursor is not None else get_db_cursor()) as cur:
         cur.execute("""
             SELECT universe_size
             FROM cross_sectional_signals

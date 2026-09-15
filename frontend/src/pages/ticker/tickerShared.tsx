@@ -4,7 +4,6 @@ import {
   CrossFramePatternSummary,
   LatestQuote,
   PriceChannel,
-  ScannerInterval,
   TradeSetup,
 } from '../../services/api'
 import {
@@ -258,16 +257,6 @@ export const ordinal = (n: number) => {
     ? 'th'
     : value % 10 === 1 ? 'st' : value % 10 === 2 ? 'nd' : value % 10 === 3 ? 'rd' : 'th'
   return `${value}${suffix}`
-}
-
-export function formatScannerEventTime(value: string, interval: ScannerInterval): string {
-  return new Intl.DateTimeFormat(undefined, {
-    timeZone: interval === '1h' ? MARKET_TIME_ZONE : 'UTC',
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-    ...(interval === '1h' ? { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' } as const : {}),
-  }).format(new Date(value))
 }
 
 export function relativeAge(iso: string | null | undefined): string | null {

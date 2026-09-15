@@ -1,0 +1,26 @@
+{
+  "experiment_id": "equity_ridge_final_event_execution_sensitivity_v1",
+  "frozen_on": "2026-09-12",
+  "purpose": "FINAL_BOUNDED_SENSITIVITY_AND_EXPLORATORY_RESEARCH_CLOSEOUT",
+  "input_ridge_report": "equity_ridge_challenger_results.json",
+  "input_ridge_config_sha256": "be1b44081289cca693b274b29d51258c947e0f826ffd4fb5a44af283513ce191",
+  "input_path_review": "equity_ridge_path_validation.json",
+  "input_followup_review": "equity_ridge_validation_followup.json",
+  "strategies": ["EQUAL_WEIGHT_75_CASH_25", "FEATURE_READY_75_CASH_25", "SPY_75_CASH_25", "RIDGE_75_CASH_25"],
+  "cost_bps": [0, 4, 10, 25],
+  "missing_return_scenarios": [-1.0, -0.25, 0.0, 0.25],
+  "research_drawdown_limit_pct": 20.0,
+  "treatments": [
+    {"sample": 1, "ticker": "KAR", "session": "2025-12-11", "kind": "SYMBOL_CONTINUATION", "successor": "OPLN"},
+    {"sample": 2, "ticker": "MNMD", "session": "2026-01-13", "kind": "SYMBOL_CONTINUATION", "successor": "DFTX"},
+    {"sample": 2, "ticker": "SATS", "session": "2026-06-15", "kind": "SYMBOL_CONTINUATION", "successor": "ECHO"},
+    {"sample": 2, "ticker": "CLSK", "session": "2024-11-07", "kind": "UNFILLED_CASH", "intended_entry": "2024-11-08", "source": "https://www.sec.gov/Archives/edgar/data/827876/000095017024127680/clsk-20241115.htm"}
+  ],
+  "model_policy": "Reuse all 34 saved ridge fits, candidate scores, selections and original training labels unchanged. No refit, model variants, new features, search or live publication",
+  "continuation_policy": "Conditionally treat the three reviewed old/new symbol joins as the same shares; use only recorded raw daily closes normalized to the verified original entry. Preserve original share quantities and fees. This is a retrospective event-path sensitivity, not a certified official-date correction",
+  "no_fill_policy": "For CLSK on the specified entry only, leave its intended allocation in zero-return cash through the original exit, charge no entry or exit fee, do not delay the buy, replace the stock or redistribute its weight",
+  "unresolved_policy": "Keep QMMM and every other untreated unresolved position on the original declared valuation scenarios; no terminal liquidation price is invented. Cash/no-fill treatment is not applied to QMMM's already entered holding",
+  "comparison_policy": "Apply a treatment to every portfolio holding the same sample/ticker/decision, including momentum and eligible-stock controls; SPY unchanged. Preserve all 34 common evaluation dates and the existing development/later split",
+  "reporting": "Show original and sensitivity results separately, effective exposure for no-fill windows, remaining unresolved weights, reviewed-path counts, return dependence and the unchanged fixed-SPY-plus-20%-drawdown objective",
+  "limitations": ["KAR and SATS official transition dates remain unverified; provider handovers are not legal effective dates", "MNMD official DFTX start is January 13, provider handover January 15; retain the documented vendor lag", "New evidence is used for retrospective evaluation only, not claimed available at original signal time", "The frozen model still reflects omitted unresolved training labels", "Unresolved valuation scenarios and daily closes cannot certify drawdown or future performance", "No new database reads, provider requests, production corrections or further historical variants are part of closeout"]
+}

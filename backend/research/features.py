@@ -36,7 +36,8 @@ FEATURE_COLUMNS = [
 
 
 def load_daily_panel(start: str | None = None, end: str | None = None,
-                     tickers: list[str] | None = None) -> pd.DataFrame:
+                     tickers: list[str] | None = None, *,
+                     available_by=None) -> pd.DataFrame:
     """Load the full daily panel in one query. Returns long format sorted by ticker, date."""
     import sys
     from pathlib import Path
@@ -57,6 +58,9 @@ def load_daily_panel(start: str | None = None, end: str | None = None,
     if tickers:
         clauses.append("ticker = ANY(%s)")
         params.append(tickers)
+    if available_by is not None:
+        clauses.append("COALESCE(replay_available_at, system_observed_at) <= %s")
+        params.append(available_by)
     where = f"AND {' AND '.join(clauses)}" if clauses else ""
 
     sql = f"""
@@ -426,7 +430,8 @@ def prepare_dataset(start: str | None = None, end: str | None = None,
 
 def prepare_live_cross_section(as_of: str | None = None, lookback_days: int = 500,
                                min_names: int = 50,
-                               feature_cols: list[str] | None = None) -> pd.DataFrame:
+                               feature_cols: list[str] | None = None, *,
+                               panel: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Features for the most recent trading day at or before `as_of`, with no labels.
 
@@ -436,7 +441,11 @@ def prepare_live_cross_section(as_of: str | None = None, lookback_days: int = 50
     start = None
     if as_of:
         start = (pd.Timestamp(as_of) - pd.Timedelta(days=lookback_days * 2)).strftime("%Y-%m-%d")
-    panel = load_daily_panel(start, as_of)
+    if panel is None:
+        panel = load_daily_panel(start, as_of)
+    elif as_of:
+        dates = pd.to_datetime(panel["date"])
+        panel = panel.loc[(dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(as_of))]
     if panel.empty:
         return panel
 

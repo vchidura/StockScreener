@@ -29,6 +29,23 @@ def test_cli_requires_explicit_qualification_effective_time() -> None:
     assert args.source_version == "gap_formation_v1"
 
 
+def test_strict_policies_do_not_reuse_legacy_or_other_cutoff_results():
+    from equity.outcomes import default_directional_policy
+    from scripts.run_historical_signal_outcomes import strict_outcome_policy
+    from datetime import timedelta
+
+    start = datetime(2022, 9, 7, tzinfo=timezone.utc)
+    cutoff = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    policy = default_directional_policy(source_name="breakout_expansion", source_version="1.0",
+                                        interval="1d", horizons={"5d": 5}, effective_from=start)
+    strict = strict_outcome_policy(policy, cutoff, start)
+    assert strict.outcome_policy_id != policy.outcome_policy_id
+    assert strict == strict_outcome_policy(policy, cutoff, start)
+    assert strict_outcome_policy(policy, cutoff + timedelta(seconds=1), start).outcome_policy_id != strict.outcome_policy_id
+    assert json.loads(strict.missingness_policy_json)["source_cutoff"] == cutoff.isoformat()
+    assert strict.effective_from == start
+
+
 def test_event_loader_reports_invalid_line(tmp_path) -> None:
     path = tmp_path / "events.jsonl"
     path.write_text(json.dumps({"event_id": "bad"}) + "\n", encoding="utf-8")

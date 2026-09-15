@@ -98,10 +98,16 @@ def current_trade_setup_projection(
     staleness_seconds = max(
         0, int((expected_market_time - result["market_time"]).total_seconds())
     )
+    is_fresh = minimum_fresh_market_time <= result["market_time"] <= expected_market_time
+    availability = staleness_state(
+        result["market_time"], expected_market_time, is_fresh=is_fresh,
+    )
     result.update({
         "expected_market_time": expected_market_time,
         "minimum_fresh_market_time": minimum_fresh_market_time,
-        "is_fresh": minimum_fresh_market_time <= result["market_time"] <= expected_market_time,
+        "is_fresh": is_fresh,
+        **availability,
+        "is_serveable": availability["is_serveable"] and result["market_time"] <= expected_market_time,
         "read_latency_ms": round((perf_counter() - started) * 1000, 3),
         "staleness_seconds": staleness_seconds,
     })

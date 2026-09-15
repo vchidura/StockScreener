@@ -18,7 +18,14 @@ judged on the distribution, not the best case.
 
 ## The Pipeline
 
-Seven stages, driven by `scripts/run_composite_study.ps1`. Only stage 1 and stage 3 call Polygon;
+Historical description: the seven-stage launcher is now retained only in the
+external source archive, batch `equity-retirement-2026-09-14`; see the
+[archive instructions](LEGACY_CLEANUP_AUDIT.md#external-archive).
+It is superseded, not a current launch recommendation; do not execute it from the
+archive. Shared research tools and the original evidence remain in place; see the
+[cleanup audit](LEGACY_CLEANUP_AUDIT.md).
+
+Seven stages were driven by that launcher. Only stage 1 and stage 3 call Polygon;
 everything after reads the database, and the outcome runner is constructed with a `None` client so
 a network call would raise rather than silently succeed.
 

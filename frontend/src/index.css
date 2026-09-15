@@ -338,21 +338,6 @@ body {
   font-weight: 600;
 }
 
-.scanner-evaluation-bottom {
-  display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
-  gap: 16px;
-}
-
-.scanner-evaluation-event {
-  display: grid;
-  grid-template-columns: 70px minmax(130px, 1fr) 70px 90px;
-  gap: 8px;
-  align-items: center;
-  padding: 7px 0;
-  font-size: 12px;
-}
-
 @media (max-width: 760px) {
   .main-content {
     padding: 0.5rem;
@@ -417,18 +402,6 @@ body {
     gap: 0.2rem;
   }
 
-  .scanner-evaluation-bottom {
-    grid-template-columns: 1fr;
-  }
-
-  .scanner-evaluation-event {
-    grid-template-columns: 64px minmax(120px, 1fr);
-  }
-
-  .scanner-evaluation-event > :nth-child(3),
-  .scanner-evaluation-event > :nth-child(4) {
-    text-align: left !important;
-  }
 }
 
 .strategy-card {

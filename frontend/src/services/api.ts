@@ -1245,7 +1245,7 @@ export interface MultiTradeSetupResponse {
     'MATERIALIZED_CURRENT_PROJECTION' | 'LEGACY_REQUEST_TIME'
   >>
   setup_read_metrics?: Partial<Record<'30m' | '1h' | '1d' | '1wk' | '1mo', {
-    status: 'READY' | 'MISSING' | 'STALE'
+    status: 'READY' | 'MISSING' | 'STALE' | 'EXPIRED'
     read_mode: 'MATERIALIZED'
     source: 'MATERIALIZED_CURRENT_PROJECTION'
     process_started_at: string
@@ -1257,6 +1257,9 @@ export interface MultiTradeSetupResponse {
     published_at?: string
     projection_read_latency_ms?: number
     staleness_seconds?: number
+    is_serveable?: boolean
+    staleness_sessions?: number
+    max_serveable_stale_sessions?: number
   }>>
   confluence_zones: ConfluenceZone[]
   as_of: string
@@ -1627,82 +1630,6 @@ export const getTickerDiscoveryState = async (ticker: string): Promise<TickerDis
   return response.data
 }
 
-export type ScannerPromotionStatus =
-  | 'COLLECTING'
-  | 'INSUFFICIENT_SAMPLE'
-  | 'FAILED'
-  | 'PROMISING'
-  | 'VALIDATED'
-
-export interface ScannerEventOutcome {
-  horizon_bars: number
-  entry_time?: string
-  entry_price?: number
-  entry_model?: string
-  exit_time: string
-  exit_price?: number
-  net_signed_return: number | null
-  net_alpha_return: number | null
-  mae_pct: number | null
-  mfe_pct: number | null
-  mae_r: number | null
-  mfe_r: number | null
-  first_hit: 'STOP' | 'TARGET' | 'SAME_BAR' | 'NONE'
-}
-
-export type ScannerInterval = '1d' | '1wk' | '1h' | '30m'
-
-export interface ScannerEventRow {
-  event_id: number
-  scanner_name: string
-  scanner_version: string
-  interval: ScannerInterval
-  ticker?: string
-  signal_time: string
-  last_seen_at: string
-  occurrence_count: number
-  direction: 1 | -1
-  trigger_type: string
-  discovery_state: DiscoveryState | null
-  validation_status: 'UNVALIDATED_TIMING'
-  signal_open_price: number | null
-  entry_price: number
-  atr_at_signal: number | null
-  reference_level: number | null
-  stop_price: number | null
-  target_price: number | null
-  risk_per_share: number | null
-  metadata: Record<string, unknown>
-  outcomes: ScannerEventOutcome[]
-}
-
-export interface LatestScannerSignalRow {
-  event_id: number | string
-  scanner_name: string
-  scanner_version: string
-  interval: ScannerInterval
-  ticker: string
-  signal_time: string
-  direction: 1 | -1
-  trigger_type: string
-  sector: string | null
-  discovery_state: DiscoveryState | null
-  current_discovery_state: DiscoveryState | null
-  trend_state: TrendState | null
-  extension_risk: ExtensionRisk | null
-  reversal_trigger: ReversalTrigger | null
-  position_guidance: string | null
-  validation_status: 'UNVALIDATED_TIMING'
-  signal_open_price: number | null
-  signal_close_price: number
-  stop_price: number | null
-  target_price: number | null
-  next_open_price: number | null
-  next_open_time: string | null
-  review_priority_tier: 'HIGHER' | 'STANDARD' | 'LOWER' | 'UNRANKED'
-  review_priority_reasons: string[]
-}
-
 export interface SectorPerformanceRow {
   sector: string
   trade_date: string
@@ -1719,170 +1646,6 @@ export interface SectorPerformanceRow {
 }
 
 export type SectorPerformanceSessions = 1 | 5 | 10 | 21
-
-export interface ScannerEventSummaryRow {
-  scanner_name: string
-  scanner_version: string
-  interval: ScannerInterval
-  discovery_state: DiscoveryState | null
-  direction: 1 | -1
-  horizon_bars: number
-  independent_periods: number
-  events: number
-  mean_net_return: number | null
-  mean_net_alpha: number | null
-  alpha_t_stat: number | null
-  hit_rate: number | null
-  mean_mae_pct: number | null
-  mean_mfe_pct: number | null
-  mean_mae_r: number | null
-  mean_mfe_r: number | null
-  stop_first_rate: number | null
-  target_first_rate: number | null
-  promotion_status: ScannerPromotionStatus
-  outcome_policy_key: string
-  return_mode: 'DIRECTIONAL_HORIZON' | 'RECOMMENDATION_PLAN'
-}
-
-export interface ScannerBacklogRow {
-  interval: ScannerInterval
-  horizon_bars: number
-  pending: number
-  evaluated: number
-}
-
-export interface ScannerQualificationRow {
-  scanner_name: string
-  scanner_version: string
-  interval: ScannerInterval
-  direction: 1 | -1
-  horizon_bars: number
-  outcome_policy_key: string
-  return_mode: 'DIRECTIONAL_HORIZON' | 'RECOMMENDATION_PLAN'
-  events: number
-  independent_periods: number
-  mean_net_return: number | null
-  mean_net_alpha: number | null
-  alpha_t_stat: number | null
-  alpha_p_value: number | null
-  alpha_fdr_q: number | null
-  alpha_ci_low: number | null
-  alpha_ci_high: number | null
-  early_alpha: number | null
-  late_alpha: number | null
-  hit_rate: number | null
-  hit_rate_ci_low: number | null
-  hit_rate_ci_high: number | null
-  mean_mae_pct: number | null
-  mean_mfe_pct: number | null
-  stop_first_rate: number | null
-  target_first_rate: number | null
-  stop_hit_rate?: number | null
-  target_hit_rate?: number | null
-  mean_sector_alpha: number | null
-  sector_alpha_t_stat: number | null
-  distinct_tickers: number | null
-  top5_concentration: number | null
-  first_signal_time: string | null
-  last_signal_time: string | null
-  regime_alpha: Record<'BULL' | 'BEAR' | 'CHOPPY', { mean_alpha: number | null; periods: number }>
-  qualification_status: 'PRIMARY_PASS' | 'NOT_QUALIFIED'
-  evidence_status: 'ROBUST_PASS' | 'MONITOR_ONLY' | 'UNRANKED'
-  calibration_status: 'RESEARCH_CALIBRATED' | 'FAILED_DIAGNOSTICS' | 'NOT_ELIGIBLE'
-  calibration_oos_periods: number
-  calibrated_win_probability: number | null
-  calibrated_win_probability_ci_low: number | null
-  calibrated_win_probability_ci_high: number | null
-  brier_score: number | null
-  brier_skill_score_vs_50: number | null
-  expected_calibration_error: number | null
-  live_expected_alpha: number | null
-  live_expected_alpha_ci_low: number | null
-  live_expected_alpha_ci_high: number | null
-  calibration_curve: Array<{
-    count: number
-    mean_predicted: number
-    observed_frequency: number
-    minimum_prediction: number
-    maximum_prediction: number
-  }>
-}
-
-export type ScannerReadSource =
-  | 'CANONICAL_EQUITY_RESEARCH'
-  | 'MATERIALIZED_ANALYSIS_EVIDENCE'
-  | 'MATERIALIZED_CURRENT_PROJECTION'
-  | 'MATERIALIZED_SCANNER_PORTAL_PROJECTION'
-  | 'DURABLE_SCANNER_EVENT_LEDGER'
-  | 'LEGACY_SELF_INITIALIZING_LEDGER'
-
-export interface ScannerReadMetadata {
-  read_source: ScannerReadSource
-  read_metrics?: {
-    snapshot_id: string
-    payload_sha256: string
-    generated_at: string
-    published_at: string
-    projection_read_latency_ms: number
-    source_manifest: Record<string, string | number>
-  }
-}
-
-export interface ScannerQualificationResponse extends ScannerReadMetadata {
-  entry_model: string
-  gates: {
-    minimum_events: number
-    minimum_independent_periods: number
-    minimum_alpha_t_stat: number
-    requires_positive_early_late_alpha: boolean
-    maximum_false_discovery_rate: number
-    minimum_calibration_oos_periods: number
-    maximum_brier_score: number
-    maximum_expected_calibration_error: number
-  }
-  results: ScannerQualificationRow[]
-}
-
-export const getScannerEventSummary = async (
-  interval?: ScannerInterval, minPeriods = 1,
-): Promise<{ results: ScannerEventSummaryRow[] } & ScannerReadMetadata> => {
-  const params: Record<string, string | number> = { min_periods: minPeriods }
-  if (interval) params.interval = interval
-  const response = await api.get('/scanner-events/summary', { params })
-  return response.data
-}
-
-export const getScannerEventBacklog = async (): Promise<{ results: ScannerBacklogRow[] } & ScannerReadMetadata> => {
-  const response = await api.get('/scanner-events/backlog')
-  return response.data
-}
-
-export const getScannerQualification = async (
-  interval?: ScannerInterval,
-): Promise<ScannerQualificationResponse> => {
-  const response = await api.get('/scanner-events/qualification', {
-    params: interval ? { interval } : undefined,
-  })
-  return response.data
-}
-
-export const getScannerEvents = async (
-  interval?: ScannerInterval, limit = 100,
-): Promise<{ results: ScannerEventRow[] } & ScannerReadMetadata> => {
-  const params: Record<string, string | number> = { limit }
-  if (interval) params.interval = interval
-  const response = await api.get('/scanner-events', { params })
-  return response.data
-}
-
-export const getLatestScannerSignals = async (
-  interval?: ScannerInterval, limit = 500, sessions = 10, hourlySessions = 2,
-): Promise<{ results: LatestScannerSignalRow[] } & ScannerReadMetadata> => {
-  const params: Record<string, string | number> = { limit, sessions, hourly_sessions: hourlySessions }
-  if (interval) params.interval = interval
-  const response = await api.get('/scanner-events/latest-by-ticker', { params })
-  return response.data
-}
 
 export const getScannerSectorPerformance = async (
   sessions: SectorPerformanceSessions = 1,
@@ -1935,24 +1698,6 @@ export interface SectorIntelligenceResponse {
 
 export const getSectorIntelligence = async (leaderLimit = 5): Promise<SectorIntelligenceResponse> => {
   const response = await api.get('/sector-intelligence', { params: { leader_limit: leaderLimit } })
-  return response.data
-}
-
-export const getTickerScannerEvents = async (
-  ticker: string, limit = 100, dailySessions = 21, hourlySessions = 5,
-): Promise<{
-  ticker: string
-  daily_sessions: number
-  hourly_sessions: number
-  events: ScannerEventRow[]
-} & ScannerReadMetadata> => {
-  const response = await api.get(`/stock/${ticker}/scanner-events`, {
-    params: {
-      limit,
-      daily_sessions: dailySessions,
-      hourly_sessions: hourlySessions,
-    },
-  })
   return response.data
 }
 

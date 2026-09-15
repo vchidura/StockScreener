@@ -95,7 +95,7 @@ class FinnhubEarningsClient:
             global_rows = self._fetch_chunk(start, end)
             bounded_facts = Counter(_canonical_provider_row(row) for row in rows)
             global_facts = Counter(_canonical_provider_row(row) for row in global_rows)
-            if bounded_facts != global_facts:
+            if global_facts - bounded_facts:
                 raise ValueError(
                     "Finnhub global and bounded earnings responses disagree"
                 )

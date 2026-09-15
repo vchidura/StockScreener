@@ -1,8 +1,9 @@
 """Generic adapters over reconstructed historical research inputs."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
+import hashlib
 import json
 import threading
 from typing import Any, Mapping, Protocol, Sequence
@@ -120,6 +121,10 @@ class HistoricalReplayResult:
     events: tuple[HistoricalSignalEvent, ...]
     candidate_count: int
     exclusion_counts: Mapping[str, int]
+    coverage: tuple[Mapping[str, Any], ...] = ()
+
+
+DAILY_REPLAY_CONTRACT = "DAILY_IDENTITY_REPLAY_V3"
 
 
 class GapFormationAdapter:
@@ -1119,22 +1124,65 @@ def evaluate_historical_signals(
     actions_by_session_ticker: Mapping[
         tuple[date, str], tuple[Mapping[str, Any], ...]
     ],
+    frames_by_security: Mapping[UUID, pd.DataFrame] | None = None,
+    member_security_ids: Mapping[tuple[date, str], UUID] | None = None,
+    actions_by_session_security: Mapping[tuple[date, UUID], tuple[Mapping[str, Any], ...]] | None = None,
+    price_manifest_sha256: str | None = None,
+    action_manifest_sha256: str | None = None,
+    collapse_matches: bool = True,
+    evaluation_states: dict | None = None,
 ) -> HistoricalReplayResult:
+    identity_mode = frames_by_security is not None
+    identity_arguments = (member_security_ids, actions_by_session_security, price_manifest_sha256, action_manifest_sha256)
+    if identity_mode != all(value is not None for value in identity_arguments) \
+            or (not identity_mode and any(value is not None for value in identity_arguments)):
+        raise ValueError("security-aware replay requires frames, membership, actions and price provenance together")
+    if identity_mode:
+        if frames_by_ticker or actions_by_session_ticker:
+            raise ValueError("cannot mix ticker-only and security-aware replay inputs")
+        for digest in (price_manifest_sha256, action_manifest_sha256):
+            if len(digest) != 64 or any(value not in "0123456789abcdef" for value in digest):
+                raise ValueError("security-aware replay requires valid price and action manifest hashes")
+        expected_members = {(session, ticker) for session, tickers in members_by_session.items() for ticker in tickers}
+        if set(member_security_ids) != expected_members:
+            raise ValueError("security identity must cover every dated universe member")
+        if len({(session, identity) for (session, _), identity in member_security_ids.items()}) != len(member_security_ids):
+            raise ValueError("a security cannot have multiple member tickers in one session")
+        dates_by_listing = {}
+        for (session, ticker), identity in member_security_ids.items():
+            dates_by_listing.setdefault((ticker, identity), set()).add(session)
+        sources = []
+        for (ticker, identity), member_dates in sorted(dates_by_listing.items(), key=lambda item: (item[0][0], str(item[0][1]))):
+            if identity not in frames_by_security:
+                raise ValueError("missing security price frame")
+            source = frames_by_security[identity]
+            if source.empty or not source.index.is_unique or "security_id" not in source \
+                    or any(value != identity for value in source["security_id"]):
+                raise ValueError("price frame must contain exactly one security and unique sessions")
+            if not member_dates.issubset({_date(value) for value in source.index}):
+                raise ValueError("missing price for a dated universe member")
+            sources.append((ticker, identity, source))
+    else:
+        sources = [(ticker, None, source) for ticker, source in sorted(frames_by_ticker.items())]
     events = []
     candidate_count = 0
     exclusions = {"CORPORATE_ACTION": 0, "NOT_IN_UNIVERSE": 0, "INSUFFICIENT_HISTORY": 0}
-    for ticker, source in sorted(frames_by_ticker.items()):
+    for ticker, identity, source in sources:
         frame = source.sort_index()
         ticker_actions = {
             action_date: actions
-            for (action_date, action_ticker), actions in actions_by_session_ticker.items()
-            if action_ticker == ticker
+            for (action_date, action_key), actions in (
+                actions_by_session_security if identity_mode else actions_by_session_ticker
+            ).items()
+            if action_key == (identity if identity_mode else ticker)
         }
         positions = {_date(value): position for position, value in enumerate(frame.index)}
         for signal_date in adapter.candidate_dates(frame):
             members = members_by_session.get(signal_date)
             universe_run_id = universe_ids_by_session.get(signal_date)
-            if members is None or universe_run_id is None or ticker not in members:
+            if members is None or universe_run_id is None or ticker not in members or (
+                identity_mode and member_security_ids.get((signal_date, ticker)) != identity
+            ):
                 exclusions["NOT_IN_UNIVERSE"] += 1
                 continue
             position = positions[signal_date]
@@ -1144,15 +1192,19 @@ def evaluate_historical_signals(
                 truncated = truncated.iloc[-int(maximum_bars):]
             if len(truncated) < adapter.minimum_bars:
                 exclusions["INSUFFICIENT_HISTORY"] += 1
+                if evaluation_states is not None:
+                    evaluation_states[(ticker, signal_date)] = "INSUFFICIENT_HISTORY"
                 continue
-            actions = actions_by_session_ticker.get((signal_date, ticker), ())
+            actions = ticker_actions.get(signal_date, ())
             action_types = {str(row.get("action_type")) for row in actions}
             if action_types & adapter.excluded_action_types:
                 exclusions["CORPORATE_ACTION"] += 1
+                if evaluation_states is not None:
+                    evaluation_states[(ticker, signal_date)] = "CORPORATE_ACTION"
                 continue
             candidate_count += 1
             signal_time = truncated.iloc[-1]["bar_end"]
-            events.extend(adapter.evaluate(
+            evaluated = adapter.evaluate(
                 ticker,
                 truncated,
                 HistoricalSignalContext(
@@ -1161,13 +1213,141 @@ def evaluate_historical_signals(
                     universe_run_id=universe_run_id,
                     universe_policy_version=universe_policy_version,
                     corporate_actions=actions,
-                    corporate_actions_by_date=ticker_actions,
+                    corporate_actions_by_date=(
+                        {action_date: values for action_date, values in ticker_actions.items() if action_date <= signal_date}
+                        if identity_mode else ticker_actions
+                    ),
                 ),
-            ))
+            )
+            if evaluation_states is not None:
+                evaluation_states[(ticker, signal_date)] = "MATCH" if evaluated else "CANDIDATE_REJECTED"
+            for event in evaluated:
+                if identity_mode:
+                    if event.ticker != ticker or event.signal_date != signal_date or event.universe_run_id != universe_run_id:
+                        raise ValueError("adapter event disagrees with security-aware replay context")
+                    source_ids = tuple(UUID(str(value)) for value in truncated["bar_revision_id"])
+                    digest = sha256_json({"adapter_event_id": str(event.event_id), "security_id": str(identity),
+                                          "price_manifest_sha256": price_manifest_sha256,
+                                          "action_manifest_sha256": action_manifest_sha256,
+                                          "source_bar_revision_ids": [str(value) for value in source_ids]})
+                    event = replace(
+                        event, event_id=uuid5(NAMESPACE_URL, f"security-historical-signal:{digest}"),
+                        source_bar_revision_ids=source_ids,
+                        payload=dict(event.payload, security_id=str(identity), price_manifest_sha256=price_manifest_sha256,
+                                     action_manifest_sha256=action_manifest_sha256),
+                    )
+                events.append(event)
     events.sort(key=lambda row: (row.signal_time, row.ticker, row.event_id.hex))
-    if getattr(adapter, "collapse_contiguous_matches", False):
+    if collapse_matches and getattr(adapter, "collapse_contiguous_matches", False):
         events = list(_collapse_contiguous_events(events))
     return HistoricalReplayResult(tuple(events), candidate_count, exclusions)
+
+
+def evaluate_strict_daily_signals(
+    adapter, frames_by_ticker, *, members_by_session, universe_ids_by_session,
+    universe_policy_version, actions_by_session_ticker, member_security_ids,
+    source_cutoff,
+):
+    cutoff = pd.Timestamp(source_cutoff)
+    if cutoff.tzinfo is None:
+        raise ValueError("source cutoff must be timezone-aware")
+    calendar = exchange_calendars.get_calendar("XNYS")
+    coverage, events, states, fingerprints = {}, [], {}, {}
+    candidates = 0
+    exclusions = {}
+    for session, tickers in members_by_session.items():
+        for ticker in tickers:
+            coverage[(ticker, session)] = dict(
+                ticker=ticker, session=session.isoformat(), adapter=adapter.source_name,
+                adapter_version=adapter.source_version, universe_run_id=str(universe_ids_by_session[session]),
+                security_id=str(member_security_ids[(session, ticker)]), state="MISSING_SIGNAL_BAR",
+                warmup_bars=0, detection_count=0, event_count=0, event_ids=[],
+            )
+    for ticker, source in sorted(frames_by_ticker.items()):
+        if not source.index.is_unique:
+            raise ValueError(f"duplicate ticker/session prices: {ticker}")
+        ticker_actions = {key: actions for key, actions in actions_by_session_ticker.items() if key[1] == ticker}
+        frame = source.sort_index().copy()
+        segments, segment, previous, identity = [], [], None, None
+        digest = hashlib.sha256()
+        for session, row in frame.iterrows():
+            session = _date(session)
+            member_identity = member_security_ids.get((session, ticker))
+            valid_session = calendar.is_session(pd.Timestamp(session))
+            prices = np.asarray([row[column] for column in ("open", "high", "low", "close", "volume")], dtype=float)
+            valid_prices = (np.isfinite(prices).all() and min(prices[:4]) > 0 and prices[4] >= 0
+                            and prices[1] >= max(prices[0], prices[2], prices[3])
+                            and prices[2] <= min(prices[0], prices[1], prices[3]))
+            row_identity = row["security_id"]
+            reason = None
+            if not valid_session or not valid_prices:
+                reason = "INVALID_PRICE_INPUT"
+            elif pd.Timestamp(row["bar_start"]) != calendar.session_open(pd.Timestamp(session)) \
+                    or pd.Timestamp(row["bar_end"]) != calendar.session_close(pd.Timestamp(session)) \
+                    or pd.Timestamp(row["replay_available_at"]) != pd.Timestamp(row["bar_end"]) \
+                    or not pd.Timestamp(row["bar_end"]) <= pd.Timestamp(row["system_observed_at"]) <= cutoff \
+                    or pd.Timestamp(row["created_at"]) > cutoff:
+                reason = "INVALID_PRICE_CLOCK"
+            elif row_identity is None or (member_identity is not None and row_identity != member_identity) \
+                    or bool(row.get("identity_disagreement", False)):
+                reason = "IDENTITY_MISMATCH"
+            contiguous = previous is not None and valid_session and calendar.next_session(pd.Timestamp(previous)).date() == session
+            if reason or row_identity != identity or not contiguous:
+                if segment:
+                    segments.append(frame.loc[segment])
+                segment, digest = [], hashlib.sha256()
+            previous, identity = (session, row_identity) if reason is None else (None, None)
+            item = coverage.get((ticker, session))
+            if reason:
+                if item is not None:
+                    item["state"] = reason
+                continue
+            segment.append(session)
+            digest.update((str(row["bar_revision_id"]) + ":" + str(row["payload_sha256"]) + "\n").encode("ascii"))
+            fingerprints[(ticker, session)] = digest.hexdigest()
+            if item is not None:
+                item.update(state="NO_SIGNAL" if len(segment) >= adapter.minimum_bars else "INSUFFICIENT_HISTORY",
+                            warmup_bars=len(segment))
+        if segment:
+            segments.append(frame.loc[segment])
+        for valid_frame in segments:
+            result = evaluate_historical_signals(
+                adapter, {ticker: valid_frame}, members_by_session=members_by_session,
+                universe_ids_by_session=universe_ids_by_session, universe_policy_version=universe_policy_version,
+                actions_by_session_ticker=ticker_actions, collapse_matches=False,
+                evaluation_states=states,
+            )
+            candidates += result.candidate_count
+            for key, count in result.exclusion_counts.items():
+                exclusions[key] = exclusions.get(key, 0) + count
+            for event in result.events:
+                item = coverage[(ticker, event.signal_date)]
+                action_rows = [dict(action) for (action_date, action_ticker), actions in sorted(ticker_actions.items())
+                               if action_ticker == ticker and action_date <= event.signal_date for action in actions]
+                lineage = dict(replay_contract=DAILY_REPLAY_CONTRACT, source_cutoff=cutoff.isoformat(),
+                               security_id=item["security_id"], input_prefix_sha256=fingerprints[(ticker, event.signal_date)],
+                               action_context_sha256=sha256_json(json.loads(json.dumps(action_rows, default=str))))
+                payload = dict(event.payload, **lineage)
+                event = replace(event, event_id=uuid5(NAMESPACE_URL, "strict-daily-event:" + sha256_json({
+                    "adapter_event_id": str(event.event_id), "payload": payload,
+                })), payload=payload)
+                events.append(event)
+                item["detection_count"] += 1
+    for key, state in states.items():
+        if key in coverage:
+            coverage[key]["state"] = state
+    if getattr(adapter, "collapse_contiguous_matches", False):
+        events = list(_collapse_contiguous_events(events))
+    for event in events:
+        item = coverage[(event.ticker, event.signal_date)]
+        item["event_count"] += 1
+        item["event_ids"].append(str(event.event_id))
+    for item in coverage.values():
+        if item["detection_count"] and not item["event_count"]:
+            item["state"] = "MATCH_CONTINUATION"
+    events.sort(key=lambda row: (row.signal_time, row.ticker, row.event_id.hex))
+    ordered = tuple(coverage[key] for key in sorted(coverage, key=lambda key: (key[1], key[0])))
+    return HistoricalReplayResult(tuple(events), candidates, exclusions, ordered)
 
 
 def _date(value: Any) -> date:
@@ -1181,9 +1361,9 @@ def _collapse_contiguous_events(
 ) -> tuple[HistoricalSignalEvent, ...]:
     calendar = exchange_calendars.get_calendar("XNYS")
     kept = []
-    last_match: dict[tuple[str, str, int], date] = {}
+    last_match: dict[tuple[str, str, int, str | None], date] = {}
     for event in sorted(events, key=lambda row: (row.ticker, row.signal_date, row.event_id.hex)):
-        key = (event.source_name, event.ticker, event.direction)
+        key = (event.source_name, event.ticker, event.direction, event.payload.get("security_id"))
         previous = last_match.get(key)
         expected_previous = pd.Timestamp(
             calendar.previous_session(pd.Timestamp(event.signal_date))

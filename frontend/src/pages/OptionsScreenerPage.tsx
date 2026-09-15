@@ -100,10 +100,6 @@ export default function OptionsScreenerPage() {
     eyebrow: 'Contract discovery',
     title: 'Options Screener',
     detail: 'Filter contracts referenced by persisted strategy detections without inferring executable or buyer/seller flow.',
-    status: [
-      { label: 'Matches', value: data ? integer.format(data.total) : 'Loading' },
-      { label: 'Scope', value: preset.label },
-    ],
     session: '1d',
   })
 
@@ -130,7 +126,6 @@ export default function OptionsScreenerPage() {
     </section>}
     {query.isLoading && <div className="screener-state"><Database size={18} /><span>Loading detected contracts…</span></div>}
     {query.isError && <div className="screener-state is-warning"><AlertTriangle size={18} /><span>Options Screener data is unavailable.</span></div>}
-    {!query.isLoading && !query.isError && data?.serving_mode === 'HISTORICAL_PREVIOUS_POLICY' && <div className="screener-state is-warning"><AlertTriangle size={18} /><span>Showing the latest prior-policy detections while the active valuation policy builds its first complete cohort.</span></div>}
     {!query.isLoading && !query.isError && <>
       <section className="screener-summary"><span><strong>{data?.total || 0}</strong> matched</span><span className="is-call"><strong>{calls}</strong> calls shown</span><span className="is-put"><strong>{puts}</strong> puts shown</span><span><strong>{rows.filter(row => row.board_position != null).length}</strong> published Board rows shown</span></section>
       <section className="screener-table-panel">

@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from 'react'
-import { Link, useParams, useSearchParams } from 'react-router-dom'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useParams, useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Eraser, ScanLine, TrendingUp, X } from 'lucide-react'
 import {
@@ -27,8 +27,6 @@ import {
   MultiTradeSetupResponse,
   getTickerDiscoveryState,
   TickerDiscoveryResponse,
-  getTickerScannerEvents,
-  ScannerEventRow,
 } from '../services/api'
 import { formingPatternRead } from '../utils/formingPatterns'
 
@@ -70,7 +68,6 @@ import {
   defaultPeriodForInterval,
   formatChartTick,
   formatChartTime,
-  formatScannerEventTime,
   getVisibleChartData,
   gradeTone,
   money,
@@ -88,8 +85,9 @@ import { NO_TREND_ADX, trendLabel } from './setupPresentation'
 import { buildTradePlan, evaluatePlan } from './ticker/tickerPlan'
 import PriceLadder, { type LadderBadge, type LadderRow } from './ticker/PriceLadder'
 import { resolveChartTheme, useChartTheme } from './ticker/chartTheme'
+import { confluenceZonesAtPrice, fibonacciPriceContext } from './ticker/priceContext'
 
-export type TickerView = 'overview' | 'timeframes' | 'levels' | 'fibonacci' | 'scanner' | 'financials'
+export type TickerView = 'overview' | 'timeframes' | 'levels' | 'fibonacci' | 'financials'
 
 const DEVELOPING_CANDLE_INTERVALS = new Set(['15m', '30m', '1h', '1d'])
 
@@ -145,7 +143,6 @@ function TickerDetail({ view }: { view: TickerView }) {
     const requestedPattern = searchParams.get('pattern')
     return requestedPattern ? patternChoiceValue(initialInterval, requestedPattern) : 'best'
   })
-  const [expandedEvents, setExpandedEvents] = useState<Set<number>>(new Set())
   const [chartOverrides, setChartOverrides] = useState<Partial<Record<TickerView, boolean>>>({})
   const [selectedLevel, setSelectedLevel] = useState<{ key: string; price: number; label: string } | null>(null)
 
@@ -268,6 +265,7 @@ function TickerDetail({ view }: { view: TickerView }) {
   const setupInterval = analysis.interval
   const tradeSetup = multiSetup?.setups[setupInterval as SetupTimeframe] ?? null
   const tradeSetupError = multiSetup?.errors[setupInterval as SetupTimeframe] ?? null
+  const setupReadMetrics = multiSetup?.setup_read_metrics?.[setupInterval as SetupTimeframe]
   const setupTimeframes: SetupTimeframe[] = setups['30m']
     ? ['1mo', '1wk', '1d', '1h', '30m']
     : ['1mo', '1wk', '1d', '1h']
@@ -281,13 +279,6 @@ function TickerDetail({ view }: { view: TickerView }) {
     enabled: !!symbol,
   })
   const discoveryState = discoveryResp?.state ?? null
-  const { data: tickerScannerEvents = {
-    ticker: symbol ?? '', daily_sessions: 21, hourly_sessions: 5, events: [],
-  } } = useQuery({
-    queryKey: ['scanner-events', symbol, 21, 5],
-    queryFn: () => getTickerScannerEvents(symbol!, 100, 21, 5),
-    enabled: !!symbol,
-  })
 
   const techSide = tradeSetup ? sideOfBias(tradeSetup.direction.bias) : null
   const discoveryAgeDays = discoveryState?.trade_date
@@ -310,7 +301,6 @@ function TickerDetail({ view }: { view: TickerView }) {
     })
   }, [interval, period])
   useEffect(() => {
-    setExpandedEvents(new Set())
   }, [setupInterval])
   useEffect(() => {
     if (interval === '1m') setShowPriceChannel(false)
@@ -823,7 +813,6 @@ function TickerDetail({ view }: { view: TickerView }) {
   const verdict = plan && tradeSetup
     ? evaluatePlan(plan, tradeSetup, displayPrice, discoveryState, discoveryStale)
     : null
-  const scannerEvents = tickerScannerEvents.events
   const selectedStructuralPatterns = (tradeSetup?.structural_patterns ?? []).slice(0, 2)
     .map(pattern => ({ ...pattern, timeframe: setupInterval, selected: true }))
   const contextualStructuralPatterns = setupTimeframes
@@ -844,20 +833,21 @@ function TickerDetail({ view }: { view: TickerView }) {
     return null
   })()
   const visibleConfluenceZones = (() => {
+    const currentZones = confluenceZonesAtPrice(confluenceZones, displayPrice ?? tradeSetup?.last_close ?? null)
     const selected = new Map<string, (typeof confluenceZones)[number]>()
     const add = (zone: (typeof confluenceZones)[number] | undefined) => {
       if (zone) selected.set(`${zone.low}-${zone.high}`, zone)
     }
-    const supports = confluenceZones.filter(zone => zone.role === 'SUPPORT')
+    const supports = currentZones.filter(zone => zone.role === 'SUPPORT')
       .sort((a, b) => Math.abs(a.distance_pct) - Math.abs(b.distance_pct))
-    const resistances = confluenceZones.filter(zone => zone.role === 'RESISTANCE')
+    const resistances = currentZones.filter(zone => zone.role === 'RESISTANCE')
       .sort((a, b) => Math.abs(a.distance_pct) - Math.abs(b.distance_pct))
-    const activeZones = confluenceZones.filter(zone => zone.role === 'ACTIVE')
+    const activeZones = currentZones.filter(zone => zone.role === 'ACTIVE')
       .sort((a, b) => Math.abs(a.distance_pct) - Math.abs(b.distance_pct))
     add(activeZones[0])
     add(supports[0])
     add(resistances[0])
-    confluenceZones
+    currentZones
       .filter(zone => zone.families.includes('volume_pivot') && zone.families.includes('fibonacci'))
       .sort((a, b) => {
         const aSelected = a.references.some(reference => reference.interval === setupInterval && reference.family === 'volume_pivot')
@@ -870,7 +860,7 @@ function TickerDetail({ view }: { view: TickerView }) {
 
     const preferredRole = techSide === 'LONG' ? 'RESISTANCE'
       : techSide === 'SHORT' ? 'SUPPORT' : null
-    confluenceZones
+    currentZones
       .filter(zone => !selected.has(`${zone.low}-${zone.high}`))
       .sort((a, b) => {
         const score = (zone: (typeof confluenceZones)[number]) => {
@@ -1361,6 +1351,13 @@ function TickerDetail({ view }: { view: TickerView }) {
               Follow chart
             </button>
           )}
+          {tradeSetup && setupReadMetrics?.status === 'STALE' && (
+            <Pill
+              text="Stale analysis"
+              tone={WARN}
+              title={`Last published ${analysisLabel} analysis at ${setupReadMetrics.market_time ?? tradeSetup.date}. Awaiting the next completed publication; signals and swing anchors have not been recalculated at the current quote.`}
+            />
+          )}
           {tradeSetup && (
             <div className="tk-analysis-meta">
               <span>{tradeSetup.date} · close {money(tradeSetup.last_close)}</span>
@@ -1748,7 +1745,7 @@ function TickerDetail({ view }: { view: TickerView }) {
             })()}
 
             {view === 'levels' && (() => {
-              const price = tradeSetup.last_close
+              const price = displayPrice ?? tradeSetup.last_close
               const rows = visibleConfluenceZones
 
               return (
@@ -1855,7 +1852,7 @@ function TickerDetail({ view }: { view: TickerView }) {
                     </div>
                     <PriceLadder
                       price={price}
-                      priceCaption={`Last ${INTERVAL_NOUN[setupInterval] ?? setupInterval} close ${money(price)}${displayPrice !== null && Math.abs(displayPrice - price) > 0.005 ? ` · live ${money(displayPrice)}` : ''}`}
+                      priceCaption={`${displayPrice === null ? 'Analysis close' : 'Current'} ${money(price)} · ${setupInterval} analysis ${tradeSetup.date}`}
                       emptyMessage="No cross-timeframe zones resolved."
                       selectedKey={selectedLevel?.key ?? null}
                       onSelect={handleLevelSelect}
@@ -1925,11 +1922,18 @@ function TickerDetail({ view }: { view: TickerView }) {
             {view === 'fibonacci' && tradeSetup.strategy_results.fibonacci && (() => {
               const fib = tradeSetup.strategy_results.fibonacci
               const active = fib.active_leg
-              const price = tradeSetup.last_close
+              const price = displayPrice ?? tradeSetup.last_close
+              const priceContext = fibonacciPriceContext(fib, price)
               const confirmedMove = fib.trend_direction === 'uptrend_retracement'
                 ? `Low ${money(fib.swing_low)} (${fib.swing_low_date}) → High ${money(fib.swing_high)} (${fib.swing_high_date})`
                 : `High ${money(fib.swing_high)} (${fib.swing_high_date}) → Low ${money(fib.swing_low)} (${fib.swing_low_date})`
-              const activeProgress = active?.retracement_pct ?? 0
+              const activeStatus = priceContext.activeState === 'EXTENDED'
+                ? active?.end.type === 'high' ? 'Above published high' : 'Below published low'
+                : priceContext.activeState === 'RETRACED' ? 'Published move fully retraced'
+                  : priceContext.activeState === 'WITHIN' ? 'Within published move' : 'Unavailable'
+              const currentRetracement = priceContext.activeState === 'WITHIN'
+                ? `${plainPct(priceContext.activeRetracementPct!, 2)} provisional retracement`
+                : activeStatus
 
               interface FibMapRow {
                 price: number
@@ -1979,7 +1983,9 @@ function TickerDetail({ view }: { view: TickerView }) {
                   price: active.end.price,
                   label: `Provisional ${active.end.type}`,
                   source: 'Developing extreme',
-                  meaning: active.end.type === 'high' ? 'Recovery high to exceed' : 'Decline low to break',
+                  meaning: priceContext.activeState === 'EXTENDED'
+                    ? active.end.type === 'high' ? 'Published high already exceeded' : 'Published low already broken'
+                    : active.end.type === 'high' ? 'Published recovery high to exceed' : 'Published decline low to break',
                   tone: WARN,
                 },
                 ...confirmedContinuationRows,
@@ -1987,12 +1993,12 @@ function TickerDetail({ view }: { view: TickerView }) {
                   price: level.price,
                   label: level.name,
                   source: 'Provisional retracement',
-                  meaning: level.name === active.nearest_level
-                    ? `Nearest level · ${level.price <= price ? 'support' : 'resistance'}`
+                  meaning: level.name === priceContext.nearestLevel
+                    ? `Nearest provisional level · ${level.price <= price ? 'support' : 'resistance'}`
                     : level.name === '50.0%' || level.name === '61.8%'
                       ? `Golden zone · ${level.price <= price ? 'support' : 'resistance'}`
                       : level.price <= price ? 'Potential support' : 'Potential resistance',
-                  tone: level.name === active.nearest_level ? INFO : MUTED,
+                  tone: level.name === priceContext.nearestLevel ? INFO : MUTED,
                 })),
                 {
                   price: active.start.price,
@@ -2053,11 +2059,11 @@ function TickerDetail({ view }: { view: TickerView }) {
 
               return (
                 <>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.85rem', marginBottom: '0.85rem' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: '0.85rem', marginBottom: '0.85rem' }}>
                     <div style={PANEL}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', marginBottom: '0.35rem' }}>
                         <span style={LABEL}>Confirmed structural leg</span>
-                        <Pill text="Fibonacci basis" tone={INFO} />
+                        <Pill text={`Basis ${tradeSetup.date}`} tone={INFO} />
                       </div>
                       <div style={{ fontSize: '0.82rem', fontWeight: 600, color: INK }}>{confirmedMove}</div>
                       <div style={{ fontSize: '0.74rem', color: MUTED, marginTop: '0.25rem' }}>
@@ -2067,8 +2073,8 @@ function TickerDetail({ view }: { view: TickerView }) {
 
                     <div style={PANEL}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', marginBottom: '0.35rem' }}>
-                        <span style={LABEL}>Provisional move</span>
-                        <Pill text="In progress" tone={WARN} />
+                        <span style={LABEL}>Published provisional move</span>
+                        <Pill text={activeStatus} tone={WARN} />
                       </div>
                       {active ? (
                         <>
@@ -2077,8 +2083,8 @@ function TickerDetail({ view }: { view: TickerView }) {
                           {' → '}{active.end.type === 'high' ? 'High' : 'Low'} {money(active.end.price)} ({active.end.date})
                         </div>
                         <div style={{ display: 'flex', gap: '1.25rem', flexWrap: 'wrap', marginTop: '0.45rem', fontSize: '0.76rem' }}>
-                          <span><span style={{ color: MUTED }}>Reached </span><strong>{plainPct(fib.progress_reached_pct, 2)}</strong></span>
-                          <span><span style={{ color: MUTED }}>Current </span><strong>{plainPct(fib.progress_current_pct, 2)}</strong></span>
+                          <span><span style={{ color: MUTED }}>Reached at analysis </span><strong>{plainPct(fib.progress_reached_pct, 2)}</strong></span>
+                          <span><span style={{ color: MUTED }}>{displayPrice === null ? 'At analysis close ' : 'Current '}</span><strong>{priceContext.progressCurrentPct === null ? 'Unavailable' : plainPct(priceContext.progressCurrentPct, 2)}</strong></span>
                         </div>
                         </>
                       ) : <span style={{ fontSize: '0.76rem', color: MUTED }}>No developing move.</span>}
@@ -2093,7 +2099,7 @@ function TickerDetail({ view }: { view: TickerView }) {
                       </div>
                       <PriceLadder
                         price={price}
-                        priceCaption={`Current ${money(price)} · ${plainPct(activeProgress, 2)} provisional retracement`}
+                        priceCaption={`${displayPrice === null ? 'Analysis close' : 'Current'} ${money(price)} · ${currentRetracement}`}
                         emptyMessage="No Fibonacci levels resolved."
                         selectedKey={selectedLevel?.key ?? null}
                         onSelect={handleLevelSelect}
@@ -2117,176 +2123,6 @@ function TickerDetail({ view }: { view: TickerView }) {
               )
             })()}
 
-            {view === 'scanner' && (() => {
-              const outcomeOf = (event: ScannerEventRow) => event.outcomes[event.outcomes.length - 1] ?? null
-
-              const statusOf = (event: ScannerEventRow): { key: string; label: string; tone: string } => {
-                const outcome = outcomeOf(event)
-                if (!outcome) {
-                  return event.outcomes.some(o => o.entry_price != null)
-                    ? { key: 'OPEN', label: 'Open', tone: INFO }
-                    : { key: 'PENDING', label: 'Pending entry', tone: MUTED }
-                }
-                switch (outcome.first_hit) {
-                  case 'TARGET': return { key: 'TARGET', label: 'Target hit', tone: POS }
-                  case 'STOP': return { key: 'STOP', label: 'Stopped', tone: NEG }
-                  case 'SAME_BAR': return { key: 'SAME_BAR', label: 'Both in one bar', tone: WARN }
-                  default: return { key: 'EXPIRED', label: 'Expired flat', tone: MUTED }
-                }
-              }
-
-              const counts = scannerEvents.reduce<Record<string, number>>((totals, event) => {
-                const { key } = statusOf(event)
-                totals[key] = (totals[key] ?? 0) + 1
-                return totals
-              }, {})
-              const countTiles = [
-                { key: 'TARGET', label: 'Target hit', tone: POS },
-                { key: 'STOP', label: 'Stopped', tone: NEG },
-                { key: 'SAME_BAR', label: 'Both in one bar', tone: WARN },
-                { key: 'EXPIRED', label: 'Expired flat', tone: MUTED },
-                { key: 'OPEN', label: 'Open', tone: INFO },
-                { key: 'PENDING', label: 'Pending entry', tone: MUTED },
-              ].filter(tile => (counts[tile.key] ?? 0) > 0)
-
-              return (
-                <>
-                  <div className="tk-ledger-summary">
-                    <div className="tk-ledger-summary__counts">
-                      <div>
-                        <span>Setups</span>
-                        <strong>{scannerEvents.length}</strong>
-                      </div>
-                      {countTiles.map(tile => (
-                        <div key={tile.key}>
-                          <span>{tile.label}</span>
-                          <strong style={{ color: tile.tone }}>{counts[tile.key]}</strong>
-                        </div>
-                      ))}
-                    </div>
-                    <p>
-                      Daily and weekly cover the last {tickerScannerEvents.daily_sessions} sessions, hourly the last{' '}
-                      {tickerScannerEvents.hourly_sessions}. These are recorded outcomes for {symbol} alone — a history,
-                      not evidence of an edge. Sample sizes this small cannot support a hit rate or an average return,
-                      so qualification is published separately in <Link to="/stock-research/research">Stock Research</Link>.
-                    </p>
-                  </div>
-
-                  {scannerEvents.length === 0 ? (
-                    <p className="tk-ladder__empty">
-                      No scanner setups recorded for {symbol} in the last {tickerScannerEvents.daily_sessions} daily/weekly sessions or {tickerScannerEvents.hourly_sessions} hourly sessions.
-                    </p>
-                  ) : (
-                    <div className="tk-matrix-wrap">
-                      <table className="tk-matrix tk-matrix--ledger">
-                        <thead>
-                          <tr>
-                            {['TF', 'Setup', 'Signal time', 'Entry', 'Stop / target', 'Actual entry', 'Return / alpha', 'Status'].map((label, i) => (
-                              <th key={label} className={i >= 2 && i <= 6 ? 'is-num' : undefined}>{label}</th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {scannerEvents.map(event => {
-                            const nextOpen = event.outcomes.find(o => o.entry_price != null)
-                            const outcome = outcomeOf(event)
-                            const status = statusOf(event)
-                            const open = expandedEvents.has(event.event_id)
-                            return (
-                              <Fragment key={event.event_id}>
-                                <tr
-                                  className={`is-clickable${event.interval === setupInterval ? ' is-primary' : ''}`}
-                                  onClick={() => setExpandedEvents(prev => {
-                                    const next = new Set(prev)
-                                    if (next.has(event.event_id)) next.delete(event.event_id)
-                                    else next.add(event.event_id)
-                                    return next
-                                  })}
-                                >
-                                  <td style={{ fontWeight: 700, color: event.interval === setupInterval ? INFO : MUTED }}>{event.interval}</td>
-                                  <td>
-                                    <div style={{ fontWeight: 600, color: event.direction === 1 ? POS : NEG }}>
-                                      {open ? '▾' : '▸'} {event.direction === 1 ? 'Long' : 'Short'} · {event.trigger_type.replace(/_/g, ' ')}
-                                    </div>
-                                    <div style={{ color: MUTED, fontSize: '10px' }}>
-                                      {event.scanner_name.replace(/_/g, ' ').replace(/^sma200/i, 'SMA200')}
-                                    </div>
-                                  </td>
-                                  <td className="is-num">{formatScannerEventTime(event.signal_time, event.interval)}</td>
-                                  <td className="is-num"><strong>{money(event.entry_price)}</strong></td>
-                                  <td className="is-num">
-                                    <span style={{ color: NEG }}>{money(event.stop_price)}</span>
-                                    <span style={{ color: MUTED }}> / </span>
-                                    <span style={{ color: POS, fontWeight: 600 }}>{money(event.target_price)}</span>
-                                  </td>
-                                  <td className="is-num">
-                                    {nextOpen?.entry_price != null ? money(nextOpen.entry_price) : <span style={{ color: MUTED }}>Pending</span>}
-                                  </td>
-                                  <td className="is-num">
-                                    {!outcome ? <span style={{ color: MUTED }}>—</span> : (
-                                      <>
-                                        <span style={{ color: (outcome.net_signed_return ?? 0) >= 0 ? POS : NEG, fontWeight: 600 }}>
-                                          {outcome.net_signed_return != null ? signedPct(outcome.net_signed_return * 100) : '—'}
-                                        </span>
-                                        {outcome.net_alpha_return != null && (
-                                          <span style={{ color: MUTED }}> · α {signedPct(outcome.net_alpha_return * 100)}</span>
-                                        )}
-                                      </>
-                                    )}
-                                  </td>
-                                  <td><Pill text={status.label} tone={status.tone} /></td>
-                                </tr>
-                                {open && (
-                                  <tr className="is-detail">
-                                    <td colSpan={8}>
-                                      <div className="tk-detail-meta">
-                                        <span>Signal bar open {money(event.signal_open_price)}</span>
-                                        <span>Last seen {formatScannerEventTime(event.last_seen_at, event.interval)}</span>
-                                        <span>{event.occurrence_count} observation{event.occurrence_count === 1 ? '' : 's'}</span>
-                                        {nextOpen?.entry_time && <span>Evaluation entry {formatScannerEventTime(nextOpen.entry_time, event.interval)}</span>}
-                                      </div>
-                                      {event.outcomes.length === 0 ? (
-                                        <div className="tk-detail-meta">Waiting for future bars to resolve this setup.</div>
-                                      ) : (
-                                        <table className="tk-detail-table">
-                                          <thead>
-                                            <tr>
-                                              {['Horizon', 'Exit', 'Return', 'Alpha', 'MAE / MFE', 'First hit'].map(h => (
-                                                <th key={h}>{h}</th>
-                                              ))}
-                                            </tr>
-                                          </thead>
-                                          <tbody>
-                                            {event.outcomes.map(o => (
-                                              <tr key={o.horizon_bars}>
-                                                <td>{o.horizon_bars} {event.interval === '1wk' ? 'sessions' : 'bars'}</td>
-                                                <td title={formatScannerEventTime(o.exit_time, event.interval)}>{money(o.exit_price)}</td>
-                                                <td style={{ color: (o.net_signed_return ?? 0) >= 0 ? POS : NEG }}>
-                                                  {o.net_signed_return != null ? signedPct(o.net_signed_return * 100) : '—'}
-                                                </td>
-                                                <td>{o.net_alpha_return != null ? signedPct(o.net_alpha_return * 100) : '—'}</td>
-                                                <td>
-                                                  {o.mae_pct != null ? plainPct(o.mae_pct * 100) : '—'} / {o.mfe_pct != null ? plainPct(o.mfe_pct * 100) : '—'}
-                                                </td>
-                                                <td>{o.first_hit.replace('_', ' ').toLowerCase()}</td>
-                                              </tr>
-                                            ))}
-                                          </tbody>
-                                        </table>
-                                      )}
-                                    </td>
-                                  </tr>
-                                )}
-                              </Fragment>
-                            )
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </>
-              )
-            })()}
           </>
         )}
         </div>

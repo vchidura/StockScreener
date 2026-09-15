@@ -4,6 +4,7 @@ import {
   BarChart3,
   Bell,
   FlaskConical,
+  History,
   Layers,
   LayoutDashboard,
   Radar,
@@ -90,7 +91,9 @@ export const NAV_GROUPS: NavGroup[] = [
     icon: BarChart3,
     items: [
       { to: `/ticker/${DEFAULT_STOCK_SYMBOL}`, label: 'Overview', icon: Activity, activeFor: 'ticker' },
-      { to: '/stock-research', label: 'Stock Research', icon: BarChart3 },
+      { to: '/stocks/screener', label: 'Stock Screener', icon: ScanSearch },
+      { to: '/stocks/alerts', label: 'Stock Alerts', icon: Bell },
+      { to: '/stocks/persistence', label: 'Persistence', icon: History },
     ],
   },
   {

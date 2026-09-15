@@ -11,12 +11,14 @@ const BearishBounce = lazy(() => import('./pages/BearishBounce'))
 const FibonacciScreener = lazy(() => import('./pages/FibonacciScreener'))
 const TickersOverview = lazy(() => import('./pages/TickersOverview'))
 const SectorIntelligence = lazy(() => import('./pages/SectorIntelligence'))
-const ScannerResults = lazy(() => import('./pages/ScannerResults'))
+const PersistencePage = lazy(() => import('./pages/PersistencePage'))
 const PatternWatch = lazy(() => import('./pages/PatternWatch'))
 const TickerWorkspace = lazy(() => import('./pages/ticker/TickerWorkspace'))
 const OptionsActivityPage = lazy(() => import('./pages/OptionsActivityPage'))
 const OptionsFlowPage = lazy(() => import('./pages/OptionsFlowPage'))
 const OptionsScreenerPage = lazy(() => import('./pages/OptionsScreenerPage'))
+const StockScreenerPage = lazy(() => import('./pages/StockScreeningPage'))
+const StockAlertsPage = lazy(() => import('./pages/StockAlertsPage'))
 const OptionsResearchWorkspace = lazy(() => import('./pages/OptionsResearchWorkspace'))
 const Account = lazy(() => import('./pages/auth/Account'))
 const SignIn = lazy(() => import('./pages/auth/SignIn'))
@@ -44,15 +46,18 @@ function PortalRoutes() {
         <Route path="/overview" element={<TickersOverview />} />
         <Route path="/sector-intelligence" element={<SectorIntelligence />} />
         <Route path="/pattern-watch" element={<PatternWatch />} />
-        <Route path="/stock-research/*" element={<ScannerResults />} />
+        <Route path="/stocks/persistence" element={<PersistencePage />} />
+        <Route path="/stock-research/*" element={<Navigate to="/stocks/persistence" replace />} />
         <Route path="/options/activity" element={<OptionsActivityPage />} />
         <Route path="/options/flow" element={<OptionsFlowPage />} />
         <Route path="/options/screener" element={<OptionsScreenerPage />} />
+        <Route path="/stocks/screener" element={<StockScreenerPage />} />
+        <Route path="/stocks/alerts" element={<StockAlertsPage />} />
         <Route path="/options/*" element={<OptionsResearchWorkspace />} />
         <Route path="/account" element={<Account />} />
-        <Route path="/scanner-results" element={<Navigate to="/stock-research" replace />} />
-        <Route path="/scanner-evaluation" element={<Navigate to="/stock-research/research" replace />} />
-        <Route path="/backtest" element={<Navigate to="/stock-research/research" replace />} />
+        <Route path="/scanner-results" element={<Navigate to="/stocks/persistence" replace />} />
+        <Route path="/scanner-evaluation" element={<Navigate to="/stocks/persistence" replace />} />
+        <Route path="/backtest" element={<Navigate to="/stocks/persistence" replace />} />
         <Route path="/ticker/:symbol" element={<TickerWorkspace />} />
         <Route path="/ticker/:symbol/:view" element={<TickerWorkspace />} />
       </Routes>

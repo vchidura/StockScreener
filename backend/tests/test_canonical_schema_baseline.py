@@ -33,6 +33,32 @@ def test_baseline_plus_numbered_incremental_migrations() -> None:
     assert "MIGRATION_PATHS" not in runner
 
 
+def test_universe_revision_migration_enforces_linear_immutable_complete_history():
+    sql = (MIGRATIONS_DIR / "039_equity_universe_revisions.sql").read_text(encoding="utf-8")
+    assert sql.strip() in baseline_sql()
+    assert "supersedes_universe_run_id uuid" in sql
+    assert "uq_equity_universe_revision_successor" in sql
+    assert "FOR UPDATE" in sql
+    assert "NEW.policy_sha256 <> parent.policy_sha256" in sql
+    assert "NEW.replay_available_at IS DISTINCT FROM parent.replay_available_at" in sql
+    assert "published universe revision lineage is immutable" in sql
+    assert "published universe revision members are immutable" in sql
+    assert "DEFERRABLE INITIALLY DEFERRED" in sql
+    assert "member_count <> run.admitted_members" in sql
+    assert "CREATE OR REPLACE VIEW public.equity_original_universe_runs" in sql
+
+
+def test_action_coverage_response_migration_matches_baseline():
+    sql = (MIGRATIONS_DIR / "040_equity_action_coverage_responses.sql").read_text(encoding="utf-8")
+    assert sql.strip() in baseline_sql()
+    assert "response_action_count integer" in sql
+    assert "response_sha256 character(64)" in sql
+    assert "DEFERRABLE INITIALLY DEFERRED" in sql
+    assert "action.security_id = coverage.security_id" in sql
+    assert "linked_count <> coverage.response_action_count" in sql
+    assert "response-bound action coverage is immutable" in sql
+
+
 def test_baseline_creates_final_canonical_inventory() -> None:
     created = set(re.findall(
         r"CREATE TABLE public\.(\w+)", baseline_sql(), re.IGNORECASE
@@ -178,11 +204,13 @@ def test_option_schema_keeps_partition_and_proxy_contracts() -> None:
 def test_runtime_sources_do_not_reference_retired_scanner_modules() -> None:
     for relative in (
         "main.py",
-        "equity/scanner_research.py",
+        "equity/stock_alert_views.py",
+        "equity/sector_research.py",
         "scripts/refresh_equity_portal_snapshots.py",
     ):
         source = (BACKEND_DIR / relative).read_text(encoding="utf-8")
         assert "research.scanner_events" not in source
+        assert "equity.scanner_research" not in source
         assert "equity.legacy" not in source
 
 

@@ -6,6 +6,8 @@ As of: 2026-08-30
 
 Related documents:
 
+- [Equity Context / Contract Alert Shadow Study](OPTION_EQUITY_ALERT_SHADOW.md)
+   (2026-09-12 read-only addition; production candidate selection is unchanged).
 - [Option Chain Scanner Design](OPTION_CHAIN_SCANNER_DESIGN.md)
 - [Option Chain Scanner Implementation Guide](OPTION_CHAIN_SCANNER_IMPLEMENTATION_GUIDE.md)
 - [Phase 0 Validation](OPTION_PHASE0_VALIDATION_2026-08-29.md)

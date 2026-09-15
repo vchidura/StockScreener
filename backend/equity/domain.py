@@ -208,8 +208,18 @@ class EquityCorporateActionCoverage:
     availability_mode: BarAvailabilityMode
     replay_available_at: datetime | None
     payload_sha256: str
+    security_id: UUID | None = None
+    response_action_count: int | None = None
+    response_sha256: str | None = None
 
     def __post_init__(self) -> None:
+        response = (self.security_id, self.response_action_count, self.response_sha256)
+        if any(value is not None for value in response):
+            if any(value is None for value in response) or not isinstance(self.security_id, UUID):
+                raise ValueError("response-bound coverage requires security, count and checksum")
+            if type(self.response_action_count) is not int or self.response_action_count < 0:
+                raise ValueError("invalid coverage response count")
+            _sha256(self.response_sha256, "response_sha256")
         if self.action_type not in ("SPLIT", "DIVIDEND"):
             raise ValueError("invalid corporate-action coverage type")
         if self.window_end < self.window_start:

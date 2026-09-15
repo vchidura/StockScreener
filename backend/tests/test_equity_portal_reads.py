@@ -324,79 +324,16 @@ class MaterializedPatternReadTests(unittest.IsolatedAsyncioTestCase):
                 await main.scan_chart_patterns("30m", 1000)
         self.assertEqual(error.exception.status_code, 503)
 
-class DurableScannerReadTests(unittest.IsolatedAsyncioTestCase):
-    async def test_summary_uses_canonical_equity_research(self):
-        rows = [{"interval": "1d", "independent_periods": 50}]
-        with patch(
-            "equity.scanner_research.event_summary", return_value=rows,
-        ) as compute:
-            result = await main.scanner_event_summary(
-                interval="1d", discovery_state=None, min_periods=40,
-            )
-
-        self.assertEqual(result["results"], rows)
-        self.assertEqual(result["read_source"], "CANONICAL_EQUITY_RESEARCH")
-        compute.assert_called_once_with("1d", None, 40)
-
-    async def test_qualification_uses_durable_canonical_revisions(self):
-        rows = [{"interval": "1d", "evidence_status": "UNRANKED"}]
-        with patch(
-            "equity.scanner_research.qualification_report", return_value=rows,
-        ) as compute:
-            result = await main.scanner_event_qualification(interval="1d")
-
-        self.assertEqual(result["results"], rows)
-        self.assertEqual(result["read_source"], "CANONICAL_EQUITY_RESEARCH")
-        compute.assert_called_once_with("1d")
-
-    async def test_backlog_and_recent_events_use_canonical_tables(self):
-        backlog = [{"interval": "1d", "horizon_bars": 5, "pending": 1}]
-        events = [{"event_id": "evidence-id", "interval": "1d"}]
-        with (
-            patch(
-                "equity.scanner_research.pending_outcome_counts",
-                return_value=backlog,
-            ),
-            patch("equity.scanner_research.recent_events", return_value=events),
-        ):
-            backlog_result = await main.scanner_event_backlog()
-            event_result = await main.scanner_events_endpoint(
-                interval="1d", limit=100,
-            )
-
-        self.assertEqual(backlog_result["results"], backlog)
-        self.assertEqual(event_result["results"], events)
-        self.assertEqual(
-            backlog_result["read_source"], "CANONICAL_EQUITY_RESEARCH"
-        )
-        self.assertEqual(
-            event_result["read_source"], "CANONICAL_EQUITY_RESEARCH"
-        )
-
-    async def test_latest_and_ticker_history_use_original_canonical_evidence(self):
-        latest = [{"ticker": "AAPL", "interval": "1h"}]
-        history = [{"event_id": "evidence-id", "interval": "1d"}]
-        with (
-            patch("equity.scanner_research.latest_ticker_signals", return_value=latest) as current,
-            patch("equity.scanner_research.ticker_events", return_value=history) as ticker,
-        ):
-            latest_result = await main.latest_ticker_scanner_signals(
-                interval="1h", limit=500, sessions=10, hourly_sessions=2,
-            )
-            ticker_result = await main.ticker_scanner_events(
-                "aapl", limit=100, daily_sessions=21, hourly_sessions=5,
-            )
-
-        self.assertEqual(latest_result["results"], latest)
-        self.assertEqual(ticker_result["events"], history)
-        self.assertEqual(
-            latest_result["read_source"], "CANONICAL_EQUITY_RESEARCH"
-        )
-        self.assertEqual(
-            ticker_result["read_source"], "CANONICAL_EQUITY_RESEARCH"
-        )
-        current.assert_called_once_with("1h", 500, 10, 2)
-        ticker.assert_called_once_with("aapl", 100, 21, 5)
+class ScannerRetirementTests(unittest.TestCase):
+    def test_research_routes_retired_but_shared_readers_remain(self):
+        paths = {route.path for route in main.app.routes}
+        for path in ("/api/scanner-events/qualification", "/api/scanner-events/latest-by-ticker",
+                     "/api/scanner-events/summary", "/api/scanner-events/backlog",
+                     "/api/scanner-events", "/api/stock/{ticker}/scanner-events"):
+            self.assertNotIn(path, paths)
+        for path in ("/api/scanner-events/sector-performance", "/api/scan/streak",
+                     "/api/stocks/alert-view", "/api/stocks/screening/query"):
+            self.assertIn(path, paths)
 
 
 if __name__ == "__main__":

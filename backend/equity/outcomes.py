@@ -306,6 +306,24 @@ def evaluate_directional_outcome(
             sector_benchmark_ticker=sector_benchmark_ticker,
             quality_code="NEXT_DAILY_ENTRY_SESSION_MISSING",
         )
+    path_problem = None
+    if policy.interval == "1d":
+        valid_path, path_problem = _daily_path_prefix(path, subject.security_id, entry.session_date)
+        if not valid_path:
+            return _unavailable(
+                subject, policy, horizon_key, outcome_revision, path,
+                market_benchmark_ticker=market_benchmark_ticker,
+                sector_benchmark_ticker=sector_benchmark_ticker,
+                quality_code=path_problem,
+            )
+        path = valid_path
+    if entry.volume == 0:
+        return _not_triggered(
+            subject, policy, horizon_key, outcome_revision, entry,
+            quality_code="ZERO_VOLUME_ENTRY_NO_FILL",
+            market_benchmark_ticker=market_benchmark_ticker,
+            sector_benchmark_ticker=sector_benchmark_ticker,
+        )
     entry_price = entry.open_price
     stop = _decimal(payload.get("stop_price"))
     target = _decimal(payload.get("target_price"))
@@ -337,6 +355,7 @@ def evaluate_directional_outcome(
             subject, policy, horizon_key, outcome_revision, path,
             market_benchmark_ticker=market_benchmark_ticker,
             sector_benchmark_ticker=sector_benchmark_ticker,
+            quality_code=path_problem or "OUTCOME_HORIZON_INCOMPLETE",
         )
     if plan_exit is None:
         evaluated_path = path
@@ -383,6 +402,12 @@ def evaluate_directional_outcome(
     quality_codes = (
         ("SAME_BAR_PATH_AMBIGUOUS",) if first_hit == "SAME_BAR" else ()
     )
+    if market_return is None and market_benchmark_ticker:
+        quality_codes += ("MARKET_BENCHMARK_PATH_UNAVAILABLE",)
+    if sector_return is None and sector_benchmark_ticker:
+        quality_codes += ("SECTOR_BENCHMARK_PATH_UNAVAILABLE",)
+    contributing_benchmarks = tuple(row for row in (*market_bars, *sector_bars)
+                                    if entry.bar_start <= row.bar_start and row.bar_end <= exit_bar.bar_end)
     identity = sha256_json({
         "horizon": horizon_key,
         "path": [str(row.bar_revision_id) for row in evaluated_path],
@@ -425,11 +450,11 @@ def evaluate_directional_outcome(
         first_hit=first_hit,
         outcome_category=category,
         is_stale=False,
-        outcome_available_at=exit_bar.system_observed_at,
+        outcome_available_at=max(row.system_observed_at for row in (*evaluated_path, *contributing_benchmarks)),
         quality_codes=quality_codes,
         path_bar_ids=tuple(row.bar_revision_id for row in evaluated_path),
         benchmark_bar_ids=tuple(dict.fromkeys(
-            row.bar_revision_id for row in (*market_bars, *sector_bars)
+            row.bar_revision_id for row in contributing_benchmarks
         )),
     )
 
@@ -632,9 +657,37 @@ def _benchmark_return(
         row for row in sorted(bars, key=lambda item: item.bar_start)
         if row.bar_start >= entry_time and row.bar_end <= exit_time
     )
-    if not path:
+    if not path or path[0].bar_start != entry_time or path[-1].bar_end != exit_time:
         return None
+    if path[0].interval == "1d":
+        valid_path, problem = _daily_path_prefix(path, path[0].security_id, path[0].session_date)
+        if problem or len(valid_path) != len(path) or any(row.volume == 0 for row in path):
+            return None
     return float(path[-1].close_price / path[0].open_price - Decimal("1"))
+
+
+def _daily_path_prefix(bars, security_id, first_session):
+    calendar = exchange_calendars.get_calendar("XNYS")
+    expected = pd.Timestamp(first_session)
+    valid = []
+    for bar in bars:
+        if "REPLAY_MEMBER_IDENTITY_MISMATCH" in bar.quality_codes:
+            return tuple(valid), "REPLAY_MEMBER_IDENTITY_MISMATCH"
+        if "UNSUPPORTED_REPLAY_CORPORATE_ACTION" in bar.quality_codes:
+            return tuple(valid), "UNSUPPORTED_REPLAY_CORPORATE_ACTION"
+        if bar.security_id != security_id:
+            return tuple(valid), "OUTCOME_SECURITY_IDENTITY_MISMATCH"
+        if not calendar.is_session(expected) or bar.session_date != expected.date():
+            return tuple(valid), "DAILY_OUTCOME_SESSION_MISSING"
+        if bar.interval != "1d" or not bar.is_final \
+                or bar.bar_start != calendar.session_open(expected).to_pydatetime() \
+                or bar.bar_end != calendar.session_close(expected).to_pydatetime():
+            return tuple(valid), "DAILY_OUTCOME_CLOCK_INVALID"
+        if valid and bar.volume == 0:
+            return tuple(valid), "DAILY_OUTCOME_NON_TRADING_BAR"
+        valid.append(bar)
+        expected = calendar.next_session(expected)
+    return tuple(valid), None
 
 
 def _decimal(value) -> Decimal | None:

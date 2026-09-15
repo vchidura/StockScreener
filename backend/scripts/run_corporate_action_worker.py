@@ -30,7 +30,7 @@ from equity.domain import (  # noqa: E402
     EquityCorporateActionCoverage,
 )
 from equity.leadership import try_advisory_leadership  # noqa: E402
-from equity.polygon import PolygonEquityClient, normalize_corporate_actions  # noqa: E402
+from equity.polygon import PolygonEquityClient, normalize_corporate_actions, sha256_json  # noqa: E402
 from equity.repositories import (  # noqa: E402
     EquityCorporateActionRepository,
     EquityReferenceRepository,
@@ -81,7 +81,10 @@ def build_coverage(
     end,
     observed_at: datetime,
     availability_mode: BarAvailabilityMode = BarAvailabilityMode.LIVE_OBSERVED,
+    responses=None,
 ) -> tuple[EquityCorporateActionCoverage, ...]:
+    if responses is not None and set(responses) != {"SPLIT", "DIVIDEND"}:
+        raise ValueError("coverage requires both completed split and dividend responses")
     rows = []
     for ticker in sorted(tickers):
         for action_type in ("SPLIT", "DIVIDEND"):
@@ -96,10 +99,19 @@ def build_coverage(
             source_key = (
                 f"polygon:{action_type.lower()}:{ticker}:{start}:{end}"
             )
+            response_fields = {}
+            revision_key = f"{source_key}:{observed_at.isoformat()}:{digest}"
+            if responses is not None:
+                hashes = sorted(sha256_json(row) for row in responses[action_type]
+                                if str(row.get("ticker") or "").upper() == ticker)
+                response_fields = dict(security_id=tickers[ticker], response_action_count=len(hashes),
+                                       response_sha256=sha256_json(hashes))
+                source_key += ":response-v2"
+                revision_key = f"{source_key}:{observed_at.isoformat()}:{digest}:{tickers[ticker]}:{response_fields['response_sha256']}"
             rows.append(EquityCorporateActionCoverage(
                 coverage_id=uuid5(
                     NAMESPACE_URL,
-                    f"equity-action-coverage:{source_key}:{observed_at.isoformat()}:{digest}",
+                    f"equity-action-coverage:{revision_key}",
                 ),
                 action_type=action_type,
                 ticker=ticker,
@@ -115,6 +127,7 @@ def build_coverage(
                     else None
                 ),
                 payload_sha256=digest,
+                **response_fields,
             ))
     return tuple(rows)
 
@@ -152,14 +165,14 @@ def refresh_corporate_actions(
         ),
     )
     repository = repository or EquityCorporateActionRepository()
-    inserted = repository.persist(actions)
     coverage = build_coverage(
         security_ids,
         start=start,
         end=end,
         observed_at=observed_at,
+        responses={"SPLIT": split_rows, "DIVIDEND": dividend_rows},
     )
-    inserted_coverage = repository.persist_coverage(coverage, actions)
+    inserted, inserted_coverage = repository.persist_observation(coverage, actions)
     return CorporateActionRefreshResult(
         universe_size=len(security_ids),
         split_rows=len(split_rows),

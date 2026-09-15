@@ -71,7 +71,7 @@ class EquityReferenceRepository(_Repository):
                     SELECT DISTINCT ON (member.security_id, member.ticker)
                         member.security_id, member.ticker, member.effective_from
                     FROM equity_universe_members AS member
-                    JOIN equity_universe_runs AS run
+                    JOIN equity_original_universe_runs AS run
                       ON run.universe_run_id = member.universe_run_id
                     WHERE run.availability_mode = 'HISTORICAL_RECONSTRUCTED'
                       AND run.policy_version = %s
@@ -323,12 +323,13 @@ class EquityReferenceRepository(_Repository):
 
 
 class EquityCorporateActionRepository(_Repository):
-    def persist(self, actions: Sequence[EquityCorporateAction]) -> int:
+    def persist(self, actions: Sequence[EquityCorporateAction], *, cursor=None) -> int:
         if not actions:
             return 0
         import json
+        from contextlib import nullcontext
 
-        with self._cursor() as cursor:
+        with (self._cursor() if cursor is None else nullcontext(cursor)) as cursor:
             inserted = execute_values(
                 cursor,
                 """
@@ -364,24 +365,38 @@ class EquityCorporateActionRepository(_Repository):
         self,
         coverage,
         actions: Sequence[EquityCorporateAction],
+        *, cursor=None,
     ) -> int:
         if not coverage:
             return 0
+        import json
+        from dataclasses import asdict
+        from contextlib import nullcontext
+        from .historical_actions import validate_action_coverage
+
         action_ids_by_scope = {}
+        actions_by_scope = {}
         for action in actions:
             action_ids_by_scope.setdefault(
                 (action.ticker, action.action_type), []
             ).append(action.corporate_action_id)
+            actions_by_scope.setdefault((action.ticker, action.action_type), []).append(
+                dict(asdict(action), raw_payload=json.loads(action.raw_payload_json))
+            )
+        for row in coverage:
+            if row.response_action_count is not None:
+                validate_action_coverage(asdict(row), actions_by_scope.get((row.ticker, row.action_type), []))
         inserted = 0
-        with self._cursor() as cursor:
+        with (self._cursor() if cursor is None else nullcontext(cursor)) as cursor:
             for row in coverage:
                 cursor.execute(
                     """
                     INSERT INTO equity_corporate_action_coverage (
                         coverage_id, action_type, ticker, window_start,
                         window_end, source, source_key, first_observed_at,
-                        availability_mode, replay_available_at, payload_sha256
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        availability_mode, replay_available_at, payload_sha256,
+                        security_id, response_action_count, response_sha256
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (source, source_key, first_observed_at) DO NOTHING
                     RETURNING coverage_id
                     """,
@@ -391,9 +406,18 @@ class EquityCorporateActionRepository(_Repository):
                         row.source_key, row.first_observed_at,
                         row.availability_mode.value, row.replay_available_at,
                         row.payload_sha256,
+                        row.security_id, row.response_action_count, row.response_sha256,
                     ),
                 )
                 inserted += cursor.fetchone() is not None
+                if row.response_action_count is not None:
+                    cursor.execute(
+                        "SELECT * FROM equity_corporate_action_coverage WHERE source=%s AND source_key=%s AND first_observed_at=%s",
+                        (row.source, row.source_key, row.first_observed_at),
+                    )
+                    stored = cursor.fetchone()
+                    if stored is None or str(stored["coverage_id"]) != str(row.coverage_id):
+                        raise ValueError("coverage observation identity conflict")
                 member_ids = action_ids_by_scope.get(
                     (row.ticker, row.action_type), ()
                 )
@@ -407,7 +431,20 @@ class EquityCorporateActionRepository(_Repository):
                         """,
                         [(row.coverage_id, action_id) for action_id in member_ids],
                     )
+                if row.response_action_count is not None:
+                    cursor.execute(
+                        """SELECT action.* FROM equity_corporate_action_coverage_members AS member
+                           JOIN equity_corporate_actions AS action USING (corporate_action_id)
+                           WHERE member.coverage_id=%s""", (row.coverage_id,),
+                    )
+                    validate_action_coverage(dict(stored), [dict(action) for action in cursor.fetchall()])
         return inserted
+
+    def persist_observation(self, coverage, actions):
+        with self._cursor() as cursor:
+            inserted_actions = self.persist(actions, cursor=cursor)
+            inserted_coverage = self.persist_coverage(coverage, actions, cursor=cursor)
+        return inserted_actions, inserted_coverage
 
     def list_for_replay(
         self,
@@ -600,6 +637,7 @@ class EquityBarRepository(_Repository):
         session_scope: BarSessionScope = BarSessionScope.RTH,
         adjusted: bool = False,
         historical_reconstructed_only: bool = False,
+        source_observed_by=None,
     ) -> tuple[EquityBarRevision, ...]:
         if limit <= 0:
             raise ValueError("limit must be positive")
@@ -627,6 +665,7 @@ class EquityBarRepository(_Repository):
                       )
                       AND bar_start > %s
                       AND COALESCE(replay_available_at, system_observed_at) <= %s
+                      AND (%s::timestamptz IS NULL OR (system_observed_at<=%s AND created_at<=%s))
                     ORDER BY ticker, interval, bar_start,
                             CASE
                                WHEN source_kind = 'RECONCILED' THEN 0
@@ -649,7 +688,7 @@ class EquityBarRepository(_Repository):
                 (
                     ticker.upper(), interval, session_scope.value, adjusted,
                     historical_reconstructed_only,
-                    after, available_by, limit,
+                    after, available_by, source_observed_by, source_observed_by, source_observed_by, limit,
                 ),
             )
             return tuple(_bar_from_row(row) for row in cursor.fetchall())
@@ -1247,7 +1286,7 @@ class EquityIngestionRepository(_Repository):
 
 
 class EquityEvidenceRepository(_Repository):
-    def persist(self, evidence: Sequence[EquityEvidence]) -> int:
+    def persist(self, evidence: Sequence[EquityEvidence], *, verify_existing: bool = False) -> int:
         if not evidence:
             return 0
         with self._cursor() as cursor:
@@ -1285,6 +1324,24 @@ class EquityEvidenceRepository(_Repository):
                 ],
                 fetch=True,
             )
+            if verify_existing:
+                expected = {str(row.evidence_id): row for row in evidence}
+                for offset in range(0, len(evidence), 5000):
+                    cursor.execute(
+                        "SELECT evidence_id,payload_sha256,security_id,security_revision_id,source_revision_ids "
+                        "FROM equity_evidence WHERE evidence_id=ANY(%s::uuid[])",
+                        ([str(row.evidence_id) for row in evidence[offset:offset + 5000]],),
+                    )
+                    actual = cursor.fetchall()
+                    if len(actual) != len(evidence[offset:offset + 5000]):
+                        raise ValueError("persisted replay evidence count mismatch")
+                    for row in actual:
+                        wanted = expected[str(row["evidence_id"])]
+                        if row["payload_sha256"] != wanted.payload_sha256 \
+                                or str(row["security_id"]) != str(wanted.security_id) \
+                                or str(row["security_revision_id"]) != str(wanted.security_revision_id) \
+                                or tuple(map(str, row["source_revision_ids"])) != tuple(map(str, wanted.source_revision_ids)):
+                            raise ValueError("existing replay evidence differs from the requested payload or sources")
             return len(inserted)
 
     def list_as_of(
@@ -1513,6 +1570,46 @@ class EquityEvidenceRepository(_Repository):
 
 
 class EquityUniverseRepository(_Repository):
+    def list_reconstructed_revisions(
+        self, *, policy_version, start_date=None, end_date=None,
+        revision_cutoff=None, pinned_run_ids=None,
+        audited_count_discrepancies: Mapping[str, Mapping[str, Any]] | None = None,
+    ):
+        from .historical_universe import select_universe_revisions
+
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT run.*, (
+                    SELECT COUNT(*) FROM equity_universe_members AS member
+                    WHERE member.universe_run_id = run.universe_run_id
+                ) AS stored_member_count
+                FROM equity_universe_runs AS run
+                WHERE run.availability_mode = 'HISTORICAL_RECONSTRUCTED'
+                  AND run.policy_version = %s AND run.status IN ('COMPLETE', 'DEGRADED')
+                  AND (%s::DATE IS NULL OR run.effective_from::DATE >= %s::DATE)
+                  AND (%s::DATE IS NULL OR run.effective_from::DATE <= %s::DATE)
+                ORDER BY run.effective_from, run.observed_at, run.universe_run_id
+                """, (policy_version, start_date, start_date, end_date, end_date),
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+        selected = select_universe_revisions(rows, revision_cutoff=revision_cutoff, pinned_run_ids=pinned_run_ids)
+        for index, row in enumerate(selected):
+            if row["status"] != "COMPLETE" or row["stored_member_count"] != row["admitted_members"]:
+                audited = (audited_count_discrepancies or {}).get(str(row["universe_run_id"]))
+                actual = dict(session=row["effective_from"].date().isoformat(), policy_sha256=row["policy_sha256"],
+                              declared_members=row["admitted_members"], stored_members=row["stored_member_count"])
+                if audited == actual and row["status"] == "COMPLETE" and row.get("supersedes_universe_run_id") is None:
+                    selected = (*selected[:index], dict(row, member_count_discrepancy=actual), *selected[index + 1:])
+                    continue
+                raise ValueError(
+                    "selected universe revision is incomplete; refusing research replay: "
+                    f"session={row['effective_from'].date().isoformat()}, "
+                    f"run={row['universe_run_id']}, status={row['status']}, "
+                    f"declared={row['admitted_members']}, stored={row['stored_member_count']}"
+                )
+        return selected
+
     def persist_complete_run(
         self,
         *,
@@ -1530,6 +1627,10 @@ class EquityUniverseRepository(_Repository):
         source_request_sha256: str | None = None,
         member_metadata: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
+        if len({row.security_id for row in members}) != len(members):
+            raise ValueError("complete universe cannot contain duplicate security IDs")
+        if len({row.ticker for row in members}) != len(members):
+            raise ValueError("complete universe cannot contain duplicate tickers")
         if (
             availability_mode is BarAvailabilityMode.HISTORICAL_RECONSTRUCTED
             and replay_available_at is None
@@ -1586,7 +1687,7 @@ class EquityUniverseRepository(_Repository):
         with self._cursor() as cursor:
             cursor.execute(
                 """
-                SELECT * FROM equity_universe_runs
+                SELECT * FROM equity_original_universe_runs
                 WHERE effective_from <= %s
                   AND observed_at <= %s
                                     AND availability_mode = 'LIVE_OBSERVED'
@@ -1606,7 +1707,7 @@ class EquityUniverseRepository(_Repository):
         with self._cursor() as cursor:
             cursor.execute(
                 """
-                SELECT * FROM equity_universe_runs
+                SELECT * FROM equity_original_universe_runs
                 WHERE effective_from <= %s
                   AND COALESCE(replay_available_at, observed_at) <= %s
                   AND status IN ('COMPLETE', 'DEGRADED')
@@ -1629,18 +1730,27 @@ class EquityUniverseRepository(_Repository):
         with self._cursor() as cursor:
             cursor.execute(
                 """
-                SELECT * FROM equity_universe_runs
-                WHERE policy_sha256 = %s
-                  AND effective_from = %s
-                  AND availability_mode = 'HISTORICAL_RECONSTRUCTED'
-                  AND status IN ('COMPLETE', 'DEGRADED')
-                ORDER BY observed_at DESC
+                                SELECT run.*, (
+                                        SELECT COUNT(*) FROM equity_universe_members AS member
+                                        WHERE member.universe_run_id = run.universe_run_id
+                                ) AS stored_member_count
+                                FROM equity_original_universe_runs AS run
+                                WHERE run.policy_sha256 = %s
+                                    AND run.effective_from = %s
+                                    AND run.availability_mode = 'HISTORICAL_RECONSTRUCTED'
+                                    AND run.status IN ('COMPLETE', 'DEGRADED')
+                                ORDER BY run.observed_at DESC
                 LIMIT 1
                 """,
                 (policy_sha256, effective_from),
             )
             row = cursor.fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        result = dict(row)
+        if result.pop("stored_member_count") != result["admitted_members"]:
+            raise ValueError("historical universe member count mismatch; refusing to resume")
+        return result
 
     def member_tickers(self, universe_run_id: UUID) -> frozenset[str]:
         with self._cursor() as cursor:
@@ -1657,6 +1767,7 @@ class EquityUniverseRepository(_Repository):
         self,
         universe_run_id: UUID,
         tickers: Sequence[str] = (),
+        observed_by=None,
     ) -> tuple[SecurityReferenceRevision, ...]:
         normalized_tickers = sorted({ticker.upper() for ticker in tickers})
         with self._cursor() as cursor:
@@ -1670,9 +1781,10 @@ class EquityUniverseRepository(_Repository):
                                         WHERE candidate.security_id = member.security_id
                                             AND candidate.ticker = member.ticker
                                             AND candidate.effective_from <= member.effective_from
+                                            AND (%s::timestamptz IS NULL OR (candidate.observed_at<=%s AND candidate.created_at<=%s))
                                         ORDER BY (candidate.sector IS NOT NULL) DESC,
                                                          candidate.effective_from DESC,
-                                                         candidate.observed_at DESC
+                                                         candidate.observed_at DESC, candidate.security_revision_id
                                         LIMIT 1
                                 ) AS reference ON TRUE
                 WHERE member.universe_run_id = %s
@@ -1680,7 +1792,7 @@ class EquityUniverseRepository(_Repository):
                                        OR member.ticker = ANY(%s::TEXT[]))
                 ORDER BY member.member_rank, member.ticker
                 """,
-                                (universe_run_id, normalized_tickers, normalized_tickers),
+                                (observed_by, observed_by, observed_by, universe_run_id, normalized_tickers, normalized_tickers),
             )
             return tuple(_security_from_row(row) for row in cursor.fetchall())
 
@@ -2283,6 +2395,7 @@ class EquityOutcomeRepository(_Repository):
         source_names: Sequence[str] = (),
         subject_evidence_ids: Sequence[UUID] = (),
         outcome_policy_keys: Sequence[str] = (),
+        outcome_policy_ids: Sequence[UUID] = (),
     ) -> list[dict[str, Any]]:
         with self._cursor() as cursor:
             cursor.execute(
@@ -2297,7 +2410,11 @@ class EquityOutcomeRepository(_Repository):
                                             evidence.direction, outcome.horizon_key,
                                             (policy.horizons ->> outcome.horizon_key)::INTEGER AS horizon_bars,
                                             policy.policy_key, evidence.observed_at AS signal_time,
+                                            evidence.market_time AS signal_market_time,
+                                            outcome.entry_time, outcome.exit_time,
+                                            outcome.outcome_available_at,
                                             outcome.outcome_id,
+                                            outcome.outcome_policy_id,
                                             outcome.subject_evidence_id,
                                             outcome.net_return, outcome.net_alpha,
                                             outcome.sector_net_alpha,
@@ -2325,6 +2442,8 @@ class EquityOutcomeRepository(_Repository):
                                                      OR evidence.source_name = ANY(%s::TEXT[]))
                                             AND (cardinality(%s::TEXT[]) = 0
                                                      OR policy.policy_key = ANY(%s::TEXT[]))
+                                            AND (cardinality(%s::UUID[]) = 0
+                                                     OR outcome.outcome_policy_id = ANY(%s::UUID[]))
                                         ORDER BY outcome.subject_evidence_id,
                                             outcome.outcome_policy_id, outcome.horizon_key,
                                             outcome.outcome_revision DESC,
@@ -2337,6 +2456,7 @@ class EquityOutcomeRepository(_Repository):
                     list(subject_evidence_ids), list(subject_evidence_ids),
                     list(source_names), list(source_names),
                     list(outcome_policy_keys), list(outcome_policy_keys),
+                    list(outcome_policy_ids), list(outcome_policy_ids),
                 ),
             )
             return [dict(row) for row in cursor.fetchall()]

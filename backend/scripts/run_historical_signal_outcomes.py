@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
+from dataclasses import replace
 import hashlib
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import exchange_calendars
 import pandas as pd
@@ -30,6 +33,7 @@ from equity.orchestration import EquityMaterializationService
 from equity.outcomes import recommendation_plan_policy
 from equity.qualification import qualify_outcomes
 from equity.repositories import (
+    EquityBarRepository,
     EquityEvidenceRepository,
     EquityOutcomeRepository,
     EquityUniverseRepository,
@@ -38,7 +42,8 @@ from research.composite_scanners import (
     COMPOSITE_OUTCOME_HORIZONS,
     COMPOSITE_SCANNER_REGISTRY,
 )
-from research.historical_signal_replay import HistoricalSignalEvent
+from research.historical_signal_replay import HistoricalSignalEvent, DAILY_REPLAY_CONTRACT
+from equity.polygon import canonical_json, sha256_json
 
 
 LOCK_NAME = "stock-screener:historical-signal-outcomes"
@@ -66,6 +71,9 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--output", type=Path)
     result.add_argument("--source-version", default="gap_formation_v1")
+    result.add_argument("--strict-daily", action="store_true")
+    result.add_argument("--source-cutoff")
+    result.add_argument("--study-start")
     result.add_argument(
         "--adjusted", action="store_true",
         help="Read outcome paths from the split-adjusted bar lineage. Required "
@@ -100,7 +108,14 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def persist_evidence(events: tuple[HistoricalSignalEvent, ...]) -> dict[str, int]:
+def require_legacy_price_contract(events):
+    if any(row.payload.get("price_manifest_sha256") is not None for row in events):
+        raise ValueError("security-aware events require version-aware outcome prices and merger settlement support")
+
+
+def persist_evidence(events: tuple[HistoricalSignalEvent, ...], *, source_cutoff=None) -> dict[str, int]:
+    require_legacy_price_contract(events)
+    validate_replay_contract(events, source_cutoff)
     universe_repository = EquityUniverseRepository()
     securities = {}
     tickers_by_run = {}
@@ -110,6 +125,7 @@ def persist_evidence(events: tuple[HistoricalSignalEvent, ...]) -> dict[str, int
         for security in universe_repository.members_for_replay(
             universe_run_id,
             sorted(tickers_by_run[universe_run_id]),
+            **({"observed_by": source_cutoff} if source_cutoff else {}),
         ):
             securities[(universe_run_id, security.ticker)] = security
     missing = [
@@ -126,11 +142,13 @@ def persist_evidence(events: tuple[HistoricalSignalEvent, ...]) -> dict[str, int
         )
         for event in events
     )
-    inserted = EquityEvidenceRepository().persist(evidence)
+    if source_cutoff and any(str(row.security_id) != event.payload["security_id"] for row, event in zip(evidence, events)):
+        raise ValueError("replay member/reference security identity mismatch")
+    inserted = EquityEvidenceRepository().persist(evidence, **({"verify_existing": True} if source_cutoff else {}))
     return {"events": len(events), "evidence_inserted": inserted}
 
 
-def maturity_cutoff(horizon_sessions: int) -> datetime:
+def maturity_cutoff(horizon_sessions: int, *, source_cutoff=None) -> datetime:
     if horizon_sessions <= 0:
         raise ValueError("--horizon-sessions must be positive")
     with get_db_cursor() as cursor:
@@ -142,15 +160,101 @@ def maturity_cutoff(horizon_sessions: int) -> datetime:
               AND interval = '1d'
               AND quality_codes @>
                   ARRAY['GROUPED_DAILY_EXACT_TICKER_V2']::TEXT[]
+                            AND (%s::timestamptz IS NULL OR (adjusted=TRUE AND system_observed_at<=%s AND created_at<=%s))
             ORDER BY session_date
-            """
+                        """, (source_cutoff, source_cutoff, source_cutoff),
         )
         sessions = [row["session_date"] for row in cursor.fetchall()]
     if len(sessions) <= horizon_sessions:
         raise ValueError("insufficient daily sessions for requested outcome horizon")
     cutoff_date = sessions[-(horizon_sessions + 1)]
     calendar = exchange_calendars.get_calendar("XNYS")
+    if source_cutoff:
+        cutoff_date = calendar.session_offset(pd.Timestamp(sessions[-1]), -horizon_sessions).date()
     return calendar.session_close(pd.Timestamp(cutoff_date)).to_pydatetime()
+
+
+def validate_replay_contract(events, source_cutoff):
+    strict = any(event.payload.get("replay_contract") == DAILY_REPLAY_CONTRACT for event in events)
+    if strict != (source_cutoff is not None):
+        raise ValueError("strict daily events require their explicit source cutoff")
+    if strict:
+        for event in events:
+            if event.payload.get("replay_contract") != DAILY_REPLAY_CONTRACT \
+                    or _utc(event.payload.get("source_cutoff")) != source_cutoff:
+                raise ValueError("mixed replay contracts or source cutoffs")
+            UUID(event.payload["security_id"])
+            for name in ("input_prefix_sha256", "action_context_sha256"):
+                digest = event.payload[name]
+                if len(digest) != 64 or any(value not in "0123456789abcdef" for value in digest):
+                    raise ValueError("invalid replay source fingerprint")
+
+
+def strict_outcome_policy(policy, source_cutoff, study_start):
+    calculator_hash = sha256_json({str(path.relative_to(BACKEND_DIR)): _file_sha256(path) for path in (
+        Path(__file__), BACKEND_DIR / "equity" / "outcomes.py", BACKEND_DIR / "equity" / "orchestration.py",
+        BACKEND_DIR / "equity" / "repositories.py", BACKEND_DIR / "equity" / "historical_research.py",
+    )})
+    contract = dict(contract="HISTORICAL_DAILY_OUTCOME_INTEGRITY_V1", source_cutoff=source_cutoff.isoformat(),
+                    study_start=study_start.isoformat(), calculator_sha256=calculator_hash)
+    digest = sha256_json(dict(base_policy=policy.policy_sha256, **contract))
+    return replace(policy, outcome_policy_id=uuid5(NAMESPACE_URL, "strict-daily-policy:" + digest),
+                   policy_key=policy.policy_key + ":REPLAY:" + digest[:20],
+                   policy_version="historical_daily_integrity_v1", policy_sha256=digest,
+                   effective_from=study_start,
+                   missingness_policy_json=canonical_json(dict(json.loads(policy.missingness_policy_json), **contract)))
+
+
+class FrozenDailyBars(EquityBarRepository):
+    def __init__(self, first_signal, source_cutoff, universe_policy_version="liquid_us_common_stocks_v2"):
+        super().__init__()
+        self.first_signal = first_signal
+        self.source_cutoff = source_cutoff
+        self.universe_policy_version = universe_policy_version
+        self.paths = {}
+        self.action_dates = {}
+
+    def list_final_after(self, ticker, interval, *, after, available_by, limit,
+                         historical_reconstructed_only=False, adjusted=False):
+        if interval != "1d" or not adjusted or not historical_reconstructed_only:
+            raise ValueError("frozen daily paths require reconstructed adjusted daily bars")
+        if ticker not in self.paths:
+            rows = super().list_final_after(ticker, interval, after=self.first_signal,
+                                           available_by=self.source_cutoff, source_observed_by=self.source_cutoff,
+                                           limit=6001, adjusted=True, historical_reconstructed_only=True)
+            if len(rows) > 6000:
+                raise ValueError("frozen daily price range exceeds the 6000-session safety bound")
+            with get_db_cursor() as cursor:
+                cursor.execute("SET TRANSACTION READ ONLY")
+                cursor.execute("""
+                    SELECT effective_date FROM equity_corporate_actions
+                    WHERE ticker=%s AND action_type IN ('MERGER','SYMBOL_CHANGE','SPINOFF')
+                      AND effective_date>%s::date AND effective_date<=%s::date
+                      AND first_observed_at<=%s AND created_at<=%s
+                """, (ticker, self.first_signal, self.source_cutoff, self.source_cutoff, self.source_cutoff))
+                self.action_dates[ticker] = sorted({row["effective_date"] for row in cursor.fetchall()})
+                cursor.execute("""
+                    SELECT run.effective_from::date AS session_date,MIN(member.security_id::text) AS security_id,
+                           COUNT(DISTINCT member.security_id) AS identities
+                    FROM equity_original_universe_runs run JOIN equity_universe_members member USING(universe_run_id)
+                    WHERE member.ticker=%s AND run.policy_version=%s
+                      AND run.effective_from::date>%s::date AND run.effective_from::date<=%s::date
+                      AND run.created_at<=%s AND run.observed_at<=%s
+                    GROUP BY run.effective_from::date
+                """, (ticker, self.universe_policy_version, self.first_signal, self.source_cutoff, self.source_cutoff, self.source_cutoff))
+                identities = {row["session_date"]: row for row in cursor.fetchall()}
+            rows = tuple(replace(row, quality_codes=(*row.quality_codes, "REPLAY_MEMBER_IDENTITY_MISMATCH"))
+                         if row.session_date in identities and (identities[row.session_date]["identities"] != 1
+                            or identities[row.session_date]["security_id"] != str(row.security_id)) else row for row in rows)
+            self.paths[ticker] = (tuple(row.bar_start for row in rows), rows)
+        starts, rows = self.paths[ticker]
+        offset = bisect_right(starts, after)
+        path = rows[offset:offset + limit]
+        barrier = next((session for session in self.action_dates[ticker] if session > after.date()), None)
+        if barrier is not None:
+            path = tuple(replace(row, quality_codes=(*row.quality_codes, "UNSUPPORTED_REPLAY_CORPORATE_ACTION"))
+                         if row.session_date >= barrier else row for row in path)
+        return path
 
 
 def evaluate(
@@ -160,7 +264,13 @@ def evaluate(
     round_trip_cost_bps: float,
     available_by: datetime,
     adjusted: bool = False,
+    source_cutoff=None,
+    study_start=None,
 ) -> dict:
+    require_legacy_price_contract(events)
+    validate_replay_contract(events, source_cutoff)
+    if source_cutoff and (not adjusted or study_start is None):
+        raise ValueError("strict outcomes require adjusted bars and a fixed study start")
     eligible = tuple(row for row in events if row.payload.get("qualification_eligible"))
     if not eligible:
         raise ValueError("event input has no qualification-eligible subjects")
@@ -224,15 +334,20 @@ def evaluate(
             for source_name in source_names
             if source_name.startswith("GAP_")
         ))
+    if source_cutoff:
+        policies = tuple(strict_outcome_policy(policy, source_cutoff, study_start) for policy in policies)
     service = EquityMaterializationService(
         None,
-        outcome_path_cache_size=100000,
+        outcome_path_cache_size=0 if source_cutoff else 100000,
         outcome_path_prefetch_limit=max(int(value) for value in horizon_sessions),
+        **({"bar_repository": FrozenDailyBars(effective_from, source_cutoff, _single({event.universe_policy_version for event in eligible}, "universe policy"))} if source_cutoff else {}),
     )
     results = []
+    cutoffs = {int(value): maturity_cutoff(int(value), **({"source_cutoff": source_cutoff} if source_cutoff else {}))
+               for value in horizon_sessions}
     for policy in policies:
         for horizon_key, horizon_count in json.loads(policy.horizons_json).items():
-            cutoff = maturity_cutoff(int(horizon_count))
+            cutoff = cutoffs[int(horizon_count)]
             due = persisted = pending = batches = 0
             source_subject_ids = subject_ids_by_source[policy.source_name]
             for offset in range(0, len(source_subject_ids), 5000):
@@ -258,6 +373,7 @@ def evaluate(
                         f"{policy.policy_key} {horizon_key}"
                     )
             results.append({
+                "outcome_policy_id": str(policy.outcome_policy_id),
                 "source_name": policy.source_name,
                 "policy_key": run.policy_key,
                 "policy_version": policy.policy_version,
@@ -270,6 +386,7 @@ def evaluate(
             })
     return {
         "policies": results,
+        "source_cutoff": source_cutoff.isoformat() if source_cutoff else None,
     }
 
 
@@ -604,13 +721,19 @@ def main() -> int:
     if operations["qualify"] and not args.qualification_effective_from:
         parser().error("--qualification-effective-from is required for qualification")
     events = load_events(args.events)
+    source_cutoff = _utc(args.source_cutoff) if args.source_cutoff else None
+    if args.strict_daily and (source_cutoff is None or not args.study_start or operations["qualify"]):
+        parser().error("strict daily outcomes require cutoff/study start and cannot publish qualifications")
+    if source_cutoff and not args.strict_daily:
+        parser().error("--source-cutoff requires --strict-daily")
+    validate_replay_contract(events, source_cutoff)
     available_by = _utc(args.available_by)
     report = {"events": len(events)}
     with try_advisory_leadership(LOCK_NAME) as is_leader:
         if not is_leader:
             raise RuntimeError("another historical outcome job owns leadership")
         if operations["persist_evidence"]:
-            report["evidence"] = persist_evidence(events)
+            report["evidence"] = persist_evidence(events, source_cutoff=source_cutoff)
         if operations["evaluate"]:
             report["outcomes"] = evaluate(
                 events,
@@ -618,6 +741,8 @@ def main() -> int:
                 round_trip_cost_bps=args.round_trip_cost_bps,
                 available_by=available_by,
                 adjusted=args.adjusted,
+                source_cutoff=source_cutoff,
+                study_start=datetime.fromisoformat(args.study_start).replace(tzinfo=timezone.utc) if args.study_start else None,
             )
         if operations["qualify"]:
             report["qualification"] = qualify(

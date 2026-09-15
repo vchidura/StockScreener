@@ -9,6 +9,7 @@ BASELINE_VERSION = "000_canonical_schema"
 BASELINE_MIGRATION = BACKEND_DIR / "migrations" / f"{BASELINE_VERSION}.sql"
 REQUIRED_SCHEMA_RELATIONS = (
     "selected_tickers",
+    "equity_original_universe_runs",
     "equity_bar_revisions",
     "equity_current_bar_projection",
     "equity_evidence",

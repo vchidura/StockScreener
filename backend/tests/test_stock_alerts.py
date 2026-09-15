@@ -1,0 +1,355 @@
+from copy import deepcopy
+
+import pytest
+
+from research.stock_alerts import alert_page, price_return_fields, risk_fields, session_dates
+
+
+def snapshot():
+    return dict(source="REPLAY", source_id="test", source_label="Historical replay", as_of="2026-09-13T00:00:00Z",
+        sessions=session_dates("2026-09-03"), hit_coverage="RETAINED_VALID_CANDIDATES",
+        publications=[dict(run_id="one", session="2026-09-02", published_at="2026-09-02T14:17:00Z"),
+                      dict(run_id="empty", session="2026-09-02", published_at="2026-09-02T14:47:00Z")],
+        alerts=[dict(alert_id="plan", run_id="one", security_id="A", ticker="A", model="resumption", interval="30m",
+                     direction=1, lane="TRADE", status="CLOSED", published_at="2026-09-02T14:17:00Z",
+                     trigger_price=100., entry_price=101., stop=99., target=105., latest_price=110., paper_return=.02)],
+        observations=[dict(security_id="A", direction=direction, session=session, run_id=run, at=at, models=[model], intervals=[interval], valid=valid)
+            for direction, session, run, at, model, interval, valid in [
+                (1, "2026-09-01", "prior", "2026-09-01T14:17:00Z", "resumption", "30m", True),
+                (1, "2026-09-02", "one", "2026-09-02T14:17:00Z", "resumption", "30m", True),
+                (1, "2026-09-02", "one", "2026-09-02T14:17:00Z", "failure", "1h", True),
+                (-1, "2026-09-02", "short", "2026-09-02T14:47:00Z", "failure", "1h", True),
+                (1, "2026-09-02", "stale", "2026-09-02T15:17:00Z", "failure", "30m", False),
+                (1, "2026-09-03", "future", "2026-09-03T14:17:00Z", "resumption", "30m", True)]])
+
+
+def test_latest_publication_never_falls_back_to_a_nonempty_run():
+    data = snapshot()
+    result = alert_page(data, session="2026-09-02")
+    assert result["run"]["run_id"] == "empty" and not result["rows"]
+    assert alert_page(data, session="2026-09-02", run="one")["total"] == 1
+    assert alert_page(data, session="2026-09-03")["run"] is None
+
+
+def test_forward_reader_preserves_readiness_window_without_fabricating_a_fixed_time():
+    data = dict(snapshot(), source="SHADOW", publication_mode="SOURCE_READINESS", next_publication_at=None,
+        publication_window_start="2026-09-14T16:15:00Z", publication_deadline="2026-09-14T16:29:55Z")
+    result = alert_page(data)
+    assert result["next_publication_at"] is None and result["publication_mode"] == "SOURCE_READINESS"
+    assert result["publication_window_start"] == data["publication_window_start"]
+    assert result["publication_deadline"] == data["publication_deadline"]
+
+
+def test_history_keeps_frozen_plan_and_distinct_valid_window_hits():
+    data = snapshot()
+    original = deepcopy(data)
+    result = alert_page(data, session="2026-09-02", view="history")
+    row = result["rows"][0]
+    assert row["hits"] == 2 and row["hit_intervals"] == ["1h", "30m"]
+    assert row["entry_price"] == 101. and row["latest_price"] == 110. and row["paper_return"] == .02
+    assert data == original
+
+
+def test_history_withholds_latest_run_before_filters_then_releases_it_after_next_run():
+    data = dict(snapshot(), source="SHADOW")
+    data["publications"] = data["publications"][:1]
+    data["alerts"][0]["triggered_at"] = "2026-09-02T14:00:00Z"
+    original = deepcopy(data)
+    assert alert_page(data, session="2026-09-02", view="history")["rows"] == []
+    assert data == original
+    data["publications"].append(dict(run_id="two", session="2026-09-02", published_at="2026-09-02T14:47:00Z"))
+    data["alerts"].append(dict(data["alerts"][0], alert_id="new", run_id="two", ticker="B", security_id="B"))
+    history = alert_page(data, session="2026-09-02", view="history", search="B", run="one")
+    assert not history["rows"] and history["withheld_run"]["run_id"] == "two"
+    assert [row["run_id"] for row in history["runs"]] == ["one"]
+    assert [row["alert_id"] for row in alert_page(data, session="2026-09-02", view="history")["rows"]] == ["plan"]
+    data["publications"].append(dict(run_id="three-empty", session="2026-09-02", published_at="2026-09-02T15:17:00Z"))
+    assert alert_page(data, session="2026-09-02", view="history")["total"] == 2
+    assert alert_page(data, session="2026-09-02")["total"] == 0
+    assert data["alerts"][0] == original["alerts"][0]
+
+
+def test_history_preserves_older_same_ticker_alerts_and_all_previous_session_runs():
+    data = dict(snapshot(), source="SHADOW")
+    data["alerts"].append(dict(data["alerts"][0], alert_id="latest-plan", run_id="empty"))
+    history = alert_page(data, session="2026-09-02", view="history", search="A")
+    assert [row["alert_id"] for row in history["rows"]] == ["plan"]
+    data["publications"].append(dict(run_id="next-day", session="2026-09-03", published_at="2026-09-03T14:17:00Z"))
+    history = alert_page(data, session="2026-09-02", view="history")
+    assert history["total"] == 2 and history["withheld_run"] is None
+
+
+def test_history_defaults_to_actual_trigger_time_descending_not_publication_or_string_order():
+    data = snapshot()
+    baseline = data["alerts"][0]
+    data["alerts"] = [dict(baseline, alert_id=key, triggered_at=stamp) for key, stamp in [
+        ("earlier", "2026-09-02T10:00:00-04:00"), ("newer", "2026-09-02 14:30:00+00:00"),
+        ("missing", None), ("invalid", "bad-time")]]
+    history = alert_page(data, session="2026-09-02", view="history", limit=1)
+    assert history["sort"] == "triggered_at" and history["descending"] is True
+    assert history["rows"][0]["alert_id"] == "newer" and history["total"] == 4
+    assert alert_page(data, session="2026-09-02", view="history", offset=1, limit=1)["rows"][0]["alert_id"] == "earlier"
+    ascending = alert_page(data, session="2026-09-02", view="history", sort="triggered_at", descending=False)
+    assert [row["alert_id"] for row in ascending["rows"]] == ["earlier", "newer", "invalid", "missing"]
+
+
+def test_frozen_replay_history_includes_its_final_run_without_waiting_for_another():
+    data = snapshot()
+    data["alerts"].append(dict(data["alerts"][0], alert_id="final-plan", run_id="empty"))
+    original = deepcopy(data)
+    result = alert_page(data, session="2026-09-02", view="history")
+    assert result["total"] == 2 and result["withheld_run"] is None
+    assert len(result["runs"]) == 2 and data == original
+
+
+def test_day_history_routes_pre_enrollment_dates_to_frozen_replay_without_relabeling(monkeypatch):
+    from equity import stock_alert_views as views
+    replay = snapshot()
+    original_replay = deepcopy(replay)
+    shadow = dict(snapshot(), source="SHADOW", sessions=session_dates("2026-09-14"),
+        enrolled_at="2026-09-14T14:50:00Z", publications=[], alerts=[])
+    original_shadow = deepcopy(shadow)
+    calls = []
+    def load(source):
+        calls.append(source)
+        return replay
+    monkeypatch.setattr(views, "load_alert_view", load)
+    result = views.history_snapshot_for_date(shadow, "2026-09-02")
+    assert result["source"] == "REPLAY" and result["as_of"] == replay["as_of"]
+    assert result["sessions"] == shadow["sessions"]
+    assert result["alerts"] == replay["alerts"] and result["publications"] == replay["publications"]
+    assert views.current_history_prices(result, "2026-09-02") is result
+    assert views.history_snapshot_for_date(shadow, "2026-09-14") is shadow
+    assert views.history_snapshot_for_date(shadow) is shadow
+    assert views.history_snapshot_for_date(shadow, "2026-08-03") is shadow
+    assert views.history_snapshot_for_date(replay, "2026-09-02") is replay
+    assert calls == ["REPLAY"] and shadow == original_shadow and replay == original_replay
+
+
+def test_day_history_never_substitutes_backtests_for_real_empty_runs_or_uncovered_dates(monkeypatch):
+    from equity import stock_alert_views as views
+    replay = snapshot()
+    shadow = dict(snapshot(), source="SHADOW", sessions=session_dates("2026-09-14"),
+        enrolled_at="2026-09-14T14:50:00Z", alerts=[])
+    monkeypatch.setattr(views, "load_alert_view", lambda source: replay)
+    assert views.history_snapshot_for_date(shadow, "2026-09-02") is shadow
+    assert views.history_snapshot_for_date(shadow, "2026-09-10") is shadow
+    assert views.history_snapshot_for_date(shadow, "2026-09-14") is shadow
+
+
+@pytest.mark.parametrize("direction,current,expected", [(1, 110., .1), (-1, 110., -.1), (-1, 90., .1), (1, 100., 0.)])
+def test_price_return_is_available_without_a_paper_entry(direction, current, expected):
+    row = dict(lane="TRADE", direction=direction, trigger_price=100., latest_price=current,
+        triggered_at="2026-09-14T15:30:00Z", latest_price_at="2026-09-14T16:15:00Z",
+        status="PENDING", entry_price=None, paper_return=None)
+    original = deepcopy(row)
+    result = price_return_fields(row)
+    assert result["price_return"] == pytest.approx(expected)
+    assert result["price_return_status"] == "AVAILABLE" and row == original
+
+
+@pytest.mark.parametrize("changes", [dict(latest_price=None), dict(trigger_price=0), dict(latest_price=float("nan")),
+    dict(direction=0), dict(lane="WATCH"), dict(latest_price_at=None), dict(latest_price_at="not a date"),
+    dict(latest_price_at="2026-09-14T15:00:00Z"), dict(price_comparison_block="SPLIT"), dict(reason="IDENTITY_UNAVAILABLE")])
+def test_price_return_keeps_missing_and_incomparable_inputs_unavailable(changes):
+    row = dict(lane="TRADE", direction=1, trigger_price=100., latest_price=101.,
+        triggered_at="2026-09-14T15:30:00Z", latest_price_at="2026-09-14T16:15:00Z", status="PENDING")
+    assert price_return_fields(row | changes)["price_return"] is None
+
+
+def test_live_price_comparison_never_rewrites_closed_paper_results_and_is_sortable():
+    data = snapshot()
+    data["alerts"][0].update(triggered_at="2026-09-02T14:00:00Z", latest_price_at="2026-09-03T20:00:00Z")
+    original = deepcopy(data)
+    result = alert_page(data, session="2026-09-02", view="history", sort="price_return")
+    assert result["rows"][0]["price_return"] == pytest.approx(.1)
+    assert result["rows"][0]["paper_return"] == .02
+    assert data == original
+
+
+def test_current_history_prices_are_identity_bound_read_only_and_do_not_mutate_snapshot(monkeypatch):
+    from contextlib import contextmanager
+    from datetime import datetime, timedelta, timezone
+    from equity import stock_alert_views as views
+    now = datetime(2026, 9, 14, 16, 30, tzinfo=timezone.utc)
+    data = dict(snapshot(), source="SHADOW")
+    data["alerts"][0].update(triggered_at="2026-09-02T14:00:00Z", latest_price_at="2026-09-03T20:00:00Z")
+    original = deepcopy(data)
+    queries = []
+    class Cursor:
+        def execute(self, query, parameters=None):
+            queries.append((query, parameters))
+        def fetchall(self):
+            if "equity_corporate_actions" in queries[-1][0]:
+                return [dict(security_id="A", effective_date=now.date(), action_type="SPLIT")]
+            return [dict(security_id="A", latest_price=112., latest_price_at=now - timedelta(minutes=15),
+                latest_price_revision_id="fresh", latest_price_interval="5m",
+                latest_price_observed_at=now, latest_price_created_at=now)]
+    @contextmanager
+    def cursor():
+        yield Cursor()
+    monkeypatch.setattr(views, "get_db_cursor", cursor)
+    refreshed = views.current_history_prices(data, "2026-09-02", now=now)
+    row = refreshed["alerts"][0]
+    assert row["latest_price"] == 112. and row["latest_price_interval"] == "5m"
+    assert row["paper_return"] == .02 and row["price_comparison_block"] == "KNOWN_CORPORATE_ACTION"
+    assert price_return_fields(row)["price_return"] is None and data == original
+    assert "READ ONLY" in queries[0][0]
+    assert "bar.security_id=requested.security_id::uuid" in queries[2][0]
+    assert queries[2][1][-2:] == (now, now)
+    assert queries[2][1][-3] <= now - timedelta(minutes=15)
+    assert views.current_history_prices(original | dict(source="REPLAY"), "2026-09-02", now=now)["alerts"][0]["latest_price"] == 110.
+    assert len(queries) == 4
+
+
+def test_current_price_failure_preserves_alerts_and_paper_results(monkeypatch):
+    from contextlib import contextmanager
+    from psycopg2 import OperationalError
+    from equity import stock_alert_views as views
+    @contextmanager
+    def unavailable():
+        raise OperationalError("test unavailable")
+        yield
+    monkeypatch.setattr(views, "get_db_cursor", unavailable)
+    data = dict(snapshot(), source="SHADOW")
+    result = views.current_history_prices(data, "2026-09-02")
+    assert result["alerts"][0]["paper_return"] == .02
+    assert result["alerts"][0]["latest_price"] is None
+    assert data["alerts"][0]["latest_price"] == 110.
+
+
+def test_history_navigation_contains_21_exchange_sessions_without_purging():
+    data = snapshot()
+    assert len(data["sessions"]) == 21
+    assert len(session_dates("2026-09-08")) == 21 and "2026-09-07" not in session_dates("2026-09-08")
+    with pytest.raises(ValueError, match="21-session"):
+        alert_page(data, session="2026-01-01")
+    with pytest.raises(ValueError, match="publication"):
+        alert_page(data, session="2026-09-03", run="one")
+
+
+def test_risk_is_directional_distance_not_a_confidence_rating():
+    assert risk_fields(100., 98., 104., 1) == dict(risk_pct=.02, reward_risk=2.)
+    assert risk_fields(100., 102., 96., -1) == dict(risk_pct=.02, reward_risk=2.)
+    assert risk_fields(100., None, None, 0) == dict(risk_pct=None, reward_risk=None)
+
+
+def test_source_reader_never_labels_replay_as_shadow(tmp_path):
+    import json
+    from research.stock_alerts import load_snapshot, SCHEMA
+    path = tmp_path / "view.json"
+    path.write_text(json.dumps(dict(snapshot(), schema=SCHEMA)))
+    with pytest.raises(ValueError, match="source mismatch"):
+        load_snapshot(path, "SHADOW")
+    assert load_snapshot(path, "REPLAY")["source"] == "REPLAY"
+    assert load_snapshot(None, "SHADOW")["status"] == "AWAITING_PUBLICATION"
+
+
+def test_shadow_reader_uses_quality_v2_store_without_legacy_fallback(monkeypatch, tmp_path):
+    from pathlib import Path
+    from equity import stock_alert_views as views
+    from scripts.run_stock_idea_worker import QUALITY_ROOT
+    calls = []
+    monkeypatch.delenv("STOCK_ALERT_SHADOW_VIEW", raising=False)
+    monkeypatch.setattr(views, "load_snapshot", lambda path, source: calls.append((Path(path), source)) or {"status": "AWAITING_PUBLICATION"})
+    assert views.load_alert_view("SHADOW")["status"] == "AWAITING_PUBLICATION"
+    assert calls == [(QUALITY_ROOT / "alerts-view.json", "SHADOW")]
+    custom = tmp_path / "approved-view.json"
+    monkeypatch.setenv("STOCK_ALERT_SHADOW_VIEW", str(custom))
+    views.load_alert_view("SHADOW")
+    assert calls[-1] == (custom, "SHADOW")
+
+
+def test_replay_builder_retains_watch_and_frozen_trade_return():
+    from research.stock_alerts import replay_snapshot
+    from test_stock_idea_engine import candidate, NOW
+    from research.stock_idea_engine import candidate_record
+    from test_stock_idea_replay import CONFIG
+    trade = candidate()
+    publication = dict(arm="PRIORITY", window_key="2026-08-03T14:00:00+00:00", deadline=NOW.isoformat(), session="2026-08-03",
+        expected_members=["A"], missing_members=[], coverage="PUBLISHED", selected=[trade.episode_id, "watch"],
+        dispositions=[dict(episode_id=trade.episode_id, security_id="A", direction=1, model="resumption", interval="30m", reason=None),
+                      dict(episode_id="watch", security_id="A", direction=1, model="discovery", interval="1d", reason=None)],
+        outcomes={trade.episode_id: dict(candidate=candidate_record(trade), state="CLOSED", net_by_cost_bps={"10": .02},
+                                       entry_price=100., exit_price=102.1)})
+    result = replay_snapshot([publication], CONFIG, NOW.isoformat(), "test")
+    assert len(result["alerts"]) == 2
+    assert result["alerts"][0]["paper_return"] == .02
+    assert result["alerts"][1]["lane"] == "WATCH" and result["alerts"][1]["paper_return"] is None
+
+
+def test_alert_view_route_defaults_to_shadow_and_never_calls_capture(monkeypatch):
+    from fastapi import FastAPI, HTTPException
+    from equity.stock_discovery_api import router, alert_view
+    import equity.stock_alert_views as views
+    from research.stock_alerts import empty_snapshot
+    monkeypatch.setattr(views, "load_alert_view", lambda source: snapshot() if source == "REPLAY" else empty_snapshot(source))
+    app = FastAPI()
+    app.include_router(router)
+    args = dict(run=None, search="", offset=0, limit=100)
+    assert alert_view(**args)["source"] == "SHADOW"
+    assert alert_view(**args, source="REPLAY", session_date="2026-09-02", view="history")["total"] == 1
+    with pytest.raises(HTTPException) as error:
+        alert_view(**args, source="REPLAY", session_date="2026-01-01")
+    assert error.value.status_code == 422
+    parameters = app.openapi()["paths"]["/api/stocks/alert-view"]["get"]["parameters"]
+    assert next(parameter for parameter in parameters if parameter["name"] == "source")["schema"]["default"] == "SHADOW"
+
+
+@pytest.mark.parametrize("direction,expected_status", [("-1", 200), ("0", 200), ("1", 200), ("2", 422), ("-2", 422), ("1.5", 422), ("short", 422)])
+def test_alert_direction_query_parses_http_values_and_rejects_invalid_sides(monkeypatch, direction, expected_status):
+    import asyncio
+    import json
+    from urllib.parse import urlencode
+    from fastapi import FastAPI
+    from equity.stock_discovery_api import router
+    import equity.stock_alert_views as views
+
+    monkeypatch.setattr(views, "load_alert_view", lambda source: snapshot())
+    app = FastAPI()
+    app.include_router(router)
+    messages = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    query = urlencode(dict(source="REPLAY", view="history", session_date="2026-09-02", direction=direction))
+    scope = dict(type="http", http_version="1.1", method="GET", scheme="http", path="/api/stocks/alert-view",
+                 root_path="", query_string=query.encode(), headers=[], server=("test", 80), client=("test", 123))
+    asyncio.run(app(scope, receive, send))
+    assert next(message["status"] for message in messages if message["type"] == "http.response.start") == expected_status
+    if expected_status == 200:
+        data = json.loads(b"".join(message.get("body", b"") for message in messages if message["type"] == "http.response.body"))
+        assert len(data["sessions"]) == 21
+        assert data["total"] == (1 if direction == "1" else 0)
+        assert all(row["direction"] == int(direction) for row in data["rows"])
+
+
+def test_enrichment_is_prefix_causal_and_does_not_reprice_closed_plans():
+    from research.stock_alerts import enrich_replay
+    from test_stock_idea_replay import full_fixture
+    fixture, config = full_fixture()
+    data = snapshot()
+    data["alerts"][0].update(triggered_at="2026-08-03T14:00:00+00:00", published_at="2026-08-03T14:17:00+00:00", indicators={})
+    original = enrich_replay(deepcopy(data), fixture, config)
+    changed = deepcopy(fixture)
+    last = [bar for bar in changed["bars"] if bar["interval"] == "30m"][-1]
+    last.update(close=200., high=201.)
+    enriched = enrich_replay(deepcopy(data), changed, config)
+    assert enriched["alerts"][0]["indicators"] == original["alerts"][0]["indicators"]
+    assert enriched["alerts"][0]["latest_price"] == 200.
+    assert enriched["alerts"][0]["paper_return"] == .02
+    assert enriched["alerts"][0]["stop"] == 99. and enriched["alerts"][0]["target"] == 105.
+
+
+def test_filtering_and_indicator_sort_never_change_the_original_run():
+    data = snapshot()
+    data["alerts"][0]["indicators"] = dict(rsi=55.)
+    data["alerts"].append(dict(data["alerts"][0], alert_id="second", ticker="B", security_id="B", indicators=dict(rsi=70.)))
+    result = alert_page(data, session="2026-09-02", view="history", sort="rsi")
+    assert [row["ticker"] for row in result["rows"]] == ["B", "A"]
+    assert not alert_page(data, session="2026-09-02", search="A")["rows"]
+    assert alert_page(data, session="2026-09-02", view="history", direction=-1)["total"] == 0
