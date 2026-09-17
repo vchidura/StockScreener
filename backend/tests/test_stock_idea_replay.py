@@ -11,7 +11,7 @@ from research.stock_idea_replay import available_at, derive_hours, execution_tim
 from test_stock_idea_engine import NOW, candidate
 
 
-CONFIG = json.loads((Path(__file__).resolve().parents[2] / "docs/stock_idea_pilot_config.json").read_text())
+CONFIG = json.loads((Path(__file__).resolve().parents[2] / "backend/research/inputs/stock_idea_pilot_config.json").read_text())
 
 
 def bars(session="2026-08-03"):
@@ -225,7 +225,7 @@ def test_offline_plan_does_not_import_database():
     assert plan["windows"] == 312 and not plan["writes_database"] and not plan["downloads"]
 
 
-EVALUATION = json.loads((Path(__file__).resolve().parents[2] / "docs/stock_idea_evaluation_plan.json").read_text())
+EVALUATION = json.loads((Path(__file__).resolve().parents[2] / "backend/research/inputs/stock_idea_evaluation_plan.json").read_text())
 
 
 def test_holm_preserves_the_full_declared_family_including_missing_claims():

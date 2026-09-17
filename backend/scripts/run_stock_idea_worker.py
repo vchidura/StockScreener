@@ -23,7 +23,16 @@ from research.stock_idea_replay import session_windows, utc
 
 DEFAULT_ROOT = BACKEND / "backups/equity-shadow/stock-ideas-forward-v1"
 QUALITY_ROOT = BACKEND / "backups/equity-shadow/stock-ideas-forward-v2"
+SWING_ROOT = BACKEND / "backups/equity-shadow/stock-ideas-swing-v1"
 FRAME_CACHE = {}
+
+
+def worker_paths(state_dir, quality_version, swing):
+    root = state_dir or (SWING_ROOT if swing else QUALITY_ROOT if quality_version == 2 else DEFAULT_ROOT)
+    if swing and root.resolve() in (QUALITY_ROOT.resolve(), DEFAULT_ROOT.resolve()):
+        raise ValueError("swing requires a separate store; existing intraday stores cannot be reused")
+    view = root / "alerts-view.json" if swing else Path(os.getenv("STOCK_ALERT_SHADOW_VIEW") or root / "alerts-view.json")
+    return root, view
 
 
 def validate_view_policy(path, policy):
@@ -56,6 +65,12 @@ def inspect_source_readiness(path):
     result["prospective_source_probe"] = dict(boundary=latest_source_boundary.isoformat(),
         ready=forward_input_readiness(prospective, latest_source_boundary, now) is not None,
         scope="RETAINED_SOURCE_MEMBERSHIP_ONLY_NOT_FUTURE_PUBLICATION_GUARANTEE")
+    excluded = [member for member in prospective if state.get("identity_breaks", {}).get(member["security_id"]) == "IDENTITY_CHANGED"]
+    if excluded:
+        diagnostic_members = [member for member in prospective if member not in excluded]
+        result["identity_exclusion_diagnostic"] = dict(diagnostic_only=True, policy_changed=False, excluded_members=excluded,
+            remaining_members=len(diagnostic_members), boundary=latest_source_boundary.isoformat(),
+            source_ready=bool(diagnostic_members) and forward_input_readiness(diagnostic_members, latest_source_boundary, now) is not None)
     return result
 
 
@@ -206,8 +221,16 @@ def main(argv=None):
     parser.add_argument("--enable-source-readiness", action="store_true")
     parser.add_argument("--retry-window", help="Append a current-time retry of a retained empty, incomplete window")
     parser.add_argument("--quality-version", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--swing", action="store_true", help="Separate daily-owned swing policy; never redirects the current shadow reader")
+    parser.add_argument("--activate-swing-shadow", action="store_true", help="Explicitly authorize running the separate unqualified swing shadow policy")
     parser.add_argument("--state-dir", type=Path)
     args = parser.parse_args(argv)
+    if args.activate_swing_shadow and (not args.swing or args.plan or args.status or args.check_readiness):
+        parser.error("Swing activation requires --swing in a writer mode, not plan/status/readiness")
+    if args.swing and (args.quality_version != 2 or args.retry_window or args.enable_source_readiness or args.reconcile_history or args.recover_corrections):
+        parser.error("Swing requires quality v2 and does not support legacy replay/recovery or dispatch-policy changes")
+    if args.swing and not (args.plan or args.status or args.check_readiness or args.activate_swing_shadow):
+        parser.error("Swing is inactive by default; preview with --swing --plan, or explicitly --activate-swing-shadow")
     quarantine = bool(args.quarantine_security_id or args.quarantine_ticker)
     if args.recover_corrections != bool(args.expected_correction_hash):
         parser.error("Correction recovery requires its reviewed inventory hash and no standalone hash")
@@ -219,11 +242,11 @@ def main(argv=None):
         parser.error("Quarantine requires exact security ID and ticker, and cannot be combined with other operation modes")
     if args.check_readiness and (args.once or args.status or args.plan or args.retry_window or args.enable_source_readiness):
         parser.error("Readiness inspection cannot be combined with writer modes")
-    args.state_dir = args.state_dir or (QUALITY_ROOT if args.quality_version == 2 else DEFAULT_ROOT)
-    view_path = Path(os.getenv("STOCK_ALERT_SHADOW_VIEW") or args.state_dir / "alerts-view.json")
+    args.state_dir, view_path = worker_paths(args.state_dir, args.quality_version, args.swing)
     if args.plan:
         print(json.dumps(dict(mode="PLAN_ONLY", state_dir=str(args.state_dir), view=str(view_path),
-            policy=forward_config(quality_version=args.quality_version), brokerage_orders=False, replay=False), indent=2))
+            policy=forward_config(quality_version=args.quality_version, swing=args.swing), brokerage_orders=False, replay=False,
+            reader_redirected=False, activation_required=args.swing), indent=2))
         return 0
     if args.status:
         if not view_path.is_file():
@@ -234,18 +257,19 @@ def main(argv=None):
         return 0
     from dotenv import load_dotenv
     load_dotenv(BACKEND / ".env")
-    view_path = Path(os.getenv("STOCK_ALERT_SHADOW_VIEW") or args.state_dir / "alerts-view.json")
+    _, view_path = worker_paths(args.state_dir, args.quality_version, args.swing)
     from database import get_db_connection
     from equity.stock_idea_forward_source import enrolled_members, read_forward_inputs
     if args.check_readiness:
         print(json.dumps(inspect_source_readiness(args.state_dir / "forward.sqlite"), indent=2), flush=True)
         return 0
-    config = forward_config(quality_version=args.quality_version)
+    config = forward_config(quality_version=args.quality_version, swing=args.swing)
     validate_view_policy(view_path, config)
     store = ForwardStore(args.state_dir / "forward.sqlite", config)
+    lock_name = "stock-idea-forward-shadow-worker" if not args.swing else "stock-idea-swing-shadow:" + str(args.state_dir.resolve())
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT pg_try_advisory_lock(hashtext('stock-idea-forward-shadow-worker'))")
+            cursor.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (lock_name,))
             acquired = cursor.fetchone()[0]
             connection.commit()
             if not acquired:
@@ -302,6 +326,8 @@ def main(argv=None):
             if state is not None and state.get("dispatch_policy") is not None and state["dispatch_policy"] != READINESS_POLICY:
                 raise ValueError("unsupported retained dispatch policy; explicit policy activation is required")
             sources = runtime_sources()
+            if args.swing:
+                sources["research/stock_idea_swing.py"] = config["swing_source_sha256"]
             runtime_at = datetime.now(timezone.utc).isoformat()
             if state is not None:
                 if state.get("runtime_sources") != sources:
@@ -346,7 +372,7 @@ def main(argv=None):
                 threading.Event().wait(1)
         finally:
             with connection.cursor() as cursor:
-                cursor.execute("SELECT pg_advisory_unlock(hashtext('stock-idea-forward-shadow-worker'))")
+                cursor.execute("SELECT pg_advisory_unlock(hashtext(%s))", (lock_name,))
                 connection.commit()
 
 

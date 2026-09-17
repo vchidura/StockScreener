@@ -40,9 +40,9 @@ def runtime_sources():
     return {path: hashlib.sha256((backend / path).read_bytes()).hexdigest() for path in paths}
 
 
-def forward_config(*, quality_version=1):
+def forward_config(*, quality_version=1, swing=False):
     root = Path(__file__).resolve().parents[2]
-    config = json.loads((root / "docs/stock_idea_pilot_config.json").read_text(encoding="utf-8"))
+    config = json.loads((root / "backend/research/inputs/stock_idea_pilot_config.json").read_text(encoding="utf-8"))
     config = dict(config, policy_version=FORWARD_VERSION, classification="FORWARD_SHADOW_UNQUALIFIED",
         availability="ACTUAL_OBSERVED_AND_CREATED", retained_live_from="1900-01-01T00:00:00+00:00",
         dispatch_grace_seconds=DISPATCH_GRACE_SECONDS, universe="ENROLLED_TRACKED_DAILY_PUBLICATION",
@@ -55,6 +55,18 @@ def forward_config(*, quality_version=1):
         config.update(policy_version=QUALITY_VERSION, execution_quality="CURRENT_NATIVE_PRICE_AND_ENTRY_SLOT_V2")
         config["models"]["acceptance"].update(intraday_version="range_breakout_acceptance_intraday_v2",
             confirmation_policy=dict(ACCEPTANCE_CONFIRMATION_V2))
+    if swing:
+        if quality_version != 2:
+            raise ValueError("swing policy requires quality version 2")
+        from research.stock_idea_swing import HORIZONS, SWING_POLICY, SWING_VERSION
+        config.update(policy_version=SWING_VERSION, holding_policy=SWING_POLICY,
+            swing_source_sha256=hashlib.sha256((root / "backend/research/stock_idea_swing.py").read_bytes()).hexdigest(),
+            confirmation_window="NEXT_SESSION_ONLY", swing_bracket="FROZEN_DAILY_STOP_TARGET",
+            preconfirmation_path="COMPLETE_NATIVE_30M_NO_BRACKET_TOUCH", holding_count="ENTRY_SESSION_IS_SESSION_ONE",
+            daily_entry="NEXT_NATIVE_OPEN_AFTER_INTRADAY_CONFIRMATION",
+            candidate_lifetime="NEXT_SESSION_SETUP_WITH_FROZEN_CONFIRMATION_EXPIRY")
+        for model in HORIZONS:
+            config["models"][model].pop("time_cap_minutes", None)
     return config
 
 
@@ -295,10 +307,16 @@ def forward_decision(state, packets, *, boundary, actual_time, members, policy_h
                   else replace(candidate, health="STALE") if candidate.security_id in quarantined
                   or candidate.interval != "1d" and candidate.security_id not in ready
                   else candidate for candidate in pending.values()]
+    swing_state, swing_evidence, swing_diagnostics = None, {}, []
+    decision_state = dict(state, bars=corrected_detector_inputs(state, recoveries)) if recoveries else state
+    if config.get("holding_policy") == "DAILY_SETUP_NEXT_SESSION_CONFIRMATION_V1":
+        from research.stock_idea_swing import swing_candidates
+        swing_state, candidates, swing_evidence, swing_diagnostics = swing_candidates(decision_state, candidates,
+            boundary=boundary, cutoff=cutoff, actual_time=actual_time, ready=ready, invalidated=invalidated,
+            may_seed=actual_time <= latest_dispatch, config=config)
     original_candidates = {candidate.episode_id: candidate for candidate in candidates}
     decision_prices = {}
     if config.get("execution_quality") == "CURRENT_NATIVE_PRICE_AND_ENTRY_SLOT_V2":
-        decision_state = dict(state, bars=corrected_detector_inputs(state, recoveries)) if recoveries else state
         checked = [decision_candidate(candidate, decision_state, boundary=boundary, cutoff=cutoff, actual_time=actual_time, config=config)
                    for candidate in candidates]
         candidates = [candidate for candidate, _ in checked]
@@ -312,9 +330,14 @@ def forward_decision(state, packets, *, boundary, actual_time, members, policy_h
         policy_hash=policy_hash, revision_ids=revision_ids, updates=updates,
         max_active_positions=config["max_active_positions_per_arm"])
     result_state = state | result_state
+    if swing_state is not None:
+        result_state["swing_setup_book"] = swing_state
+        publication.update(swing_evidence=swing_evidence, swing_diagnostics=swing_diagnostics)
     for episode_id in publication["selected"]:
         if episode_id in result_state.get("positions", {}):
             result_state["positions"][episode_id]["candidate"] = candidate_record(original_candidates[episode_id])
+            if episode_id in swing_evidence:
+                result_state["positions"][episode_id]["swing_evidence"] = swing_evidence[episode_id]
             security = original_candidates[episode_id].security_id
             if security in recoveries:
                 result_state["positions"][episode_id]["correction_recovery_generation"] = recoveries[security]["generation_id"]
@@ -841,6 +864,9 @@ def shadow_snapshot(state, publications, config, now):
     snapshot["worker"] = dict(checked_at=now.isoformat(), next_boundary=state["next_boundary"],
         enrolled_members=len(state["members"]), identity_breaks=state.get("identity_breaks", {}),
         last_source_read=state.get("last_source_read"))
+    if config.get("holding_policy") == "DAILY_SETUP_NEXT_SESSION_CONFIRMATION_V1":
+        snapshot["source_label"] = "Daily-owned swing shadow / intraday-confirmed entries"
+        snapshot["worker"]["pending_swing_setups"] = sum(not saved.get("candidate") for saved in state.get("swing_setup_book", {}).values())
     if state.get("correction_recovery_history"):
         recovery = state["correction_recovery_history"][-1]
         snapshot["worker"]["correction_recovery"] = dict(generation_id=recovery["generation_id"],

@@ -31,6 +31,136 @@ def test_latest_publication_never_falls_back_to_a_nonempty_run():
     assert alert_page(data, session="2026-09-03")["run"] is None
 
 
+def combined_fixture():
+    from research.stock_alert_results import combine_snapshots, namespace_snapshot, strategy_instance
+    sources, instances = [], []
+    for stream in ("intraday", "swing"):
+        instance = strategy_instance(dict(policy_version=stream), dict(enrolled_at="2026-09-01T00:00:00Z", members=["A"]), stream)
+        data = dict(snapshot(), source="SHADOW", source_id=stream)
+        if stream == "swing":
+            data["publications"] = data["publications"][:1]
+            data["alerts"][0].update(trade_style="SWING", hold="21 sessions", status="OPEN")
+        sources.append(namespace_snapshot(instance, data))
+        instances.append(instance)
+    return combine_snapshots(sources, instances), sources
+
+
+def test_combined_latest_is_per_strategy_and_does_not_fall_back_to_nonempty():
+    combined, sources = combined_fixture()
+    page = alert_page(combined, session="2026-09-02")
+    assert page["total"] == 1 and page["rows"][0]["trade_style"] == "SWING"
+    assert len(page["latest_runs"]) == 2 and len({row["run_id"] for row in combined["publications"]}) == 3
+    assert sources[0]["alerts"][0]["alert_id"] != sources[1]["alerts"][0]["alert_id"]
+    history = alert_page(combined, session="2026-09-02", view="history")
+    assert history["total"] == 1 and history["rows"][0]["original_source_id"] == "intraday"
+
+
+def test_combined_recurrence_and_filters_are_instance_scoped_and_pagination_is_global():
+    combined, _ = combined_fixture()
+    for row in combined["alerts"]:
+        row["status"] = "OPEN"
+    page = alert_page(combined, session="2026-09-02", view="open", limit=1)
+    assert page["total"] == 2 and len(page["rows"]) == 1
+    assert page["rows"][0]["hits"] == 2
+    assert alert_page(combined, session="2026-09-02", view="open", trade_type="SWING")["total"] == 1
+    assert alert_page(combined, session="2026-09-02", view="open", trade_type="INTRADAY")["total"] == 1
+    combined["alerts"][0]["run_id"] = "older-than-navigation"
+    assert alert_page(combined, view="open")["total"] == 2
+
+
+def test_combined_missing_stream_retains_other_results_and_never_nets_opposed_plans():
+    from research.stock_alert_results import combine_snapshots
+    combined, sources = combined_fixture()
+    partial = combine_snapshots(sources[:1], [dict(stream="intraday"), dict(stream="swing", error="MISSING")])
+    assert partial["status"] == "PARTIAL" and len(partial["alerts"]) == 1
+    for row, direction in zip(combined["alerts"], [1, -1]):
+        row.update(status="OPEN", direction=direction)
+    page = alert_page(combined, view="open")
+    assert page["total"] == 2 and all(row["opposing_exposure"] for row in page["rows"])
+
+
+def test_combined_context_uses_original_instance_ids_without_changing_rows(monkeypatch):
+    from contextlib import contextmanager
+    import equity.stock_alert_results as repository
+    from research.stock_alert_annotations import binding
+    from research.stock_idea_engine import digest
+    combined, _ = combined_fixture()
+    row = combined["alerts"][1]
+    row.update(triggered_at="2026-09-02T14:00:00Z", policy_version="swing")
+    original = row | dict(alert_id=row["original_alert_id"], run_id=row["original_run_id"])
+    bundle = dict(schema="stock_alert_publication_context_v1", source_id="swing", run_id="one",
+        input_cutoff="2026-09-02T14:16:00Z", publication_at=row["published_at"], assembled_at="2026-09-02T15:00:00Z",
+        capture_mode="RECONSTRUCTED_FROM_RETAINED_ASOF_INPUTS", source_publication_sha256="source",
+        rows={"plan": dict(binding=binding(original), factors={})})
+    bundle["bundle_sha256"] = digest(bundle)
+    class Cursor:
+        def execute(self, query, params=None):
+            if params:
+                assert params == (row["strategy_instance_id"], "one")
+        def fetchone(self):
+            return dict(payload=bundle)
+    @contextmanager
+    def cursor():
+        yield Cursor()
+    monkeypatch.setattr(repository, "get_db_cursor", cursor)
+    page = dict(combined=True, rows=[row])
+    result = repository.attach_shared_context(page)
+    assert result["rows"][0]["context"]["status"] == "AVAILABLE"
+    assert page["rows"][0] == row and "context" not in row
+    bundle["source_id"] = "wrong"
+    result = repository.attach_shared_context(page)
+    assert result["rows"][0]["context"]["status"] == "UNAVAILABLE" and len(result["rows"]) == 1
+
+
+def test_shared_result_contract_preserves_plan_and_terminal_outcome_but_allows_live_quote_changes():
+    from research.stock_alert_results import validate_result_transition, namespace_snapshot, strategy_instance
+    data = dict(snapshot(), source="SHADOW", source_id="policy")
+    original = deepcopy(data)
+    instance = strategy_instance(dict(policy_version="policy"), dict(enrolled_at="2026-09-01T00:00:00Z", members=["A"]), "intraday")
+    namespace_snapshot(instance, data)
+    assert data == original
+    row = data["alerts"][0]
+    validate_result_transition(row, row | dict(latest_price=120.))
+    for change in (dict(stop=80.), dict(paper_return=.9), dict(status="OPEN"), dict(hold="21 sessions")):
+        with pytest.raises(ValueError):
+            validate_result_transition(row, row | change)
+    opened = row | dict(status="OPEN", entry_at="2026-09-02T14:30:00Z", exit_due_at="2026-09-02T20:00:00Z")
+    for change in (dict(entry_price=102.), dict(entry_at=None), dict(exit_due_at="2026-09-03T20:00:00Z")):
+        with pytest.raises(ValueError):
+            validate_result_transition(opened, opened | change)
+
+
+def test_result_source_capture_preserves_source_files_and_rejects_altered_plan(tmp_path):
+    import json
+    from datetime import datetime, timezone
+    from research.stock_idea_forward import ForwardStore, forward_config
+    from research.stock_idea_engine import candidate_record
+    from test_stock_idea_engine import candidate
+    from equity.stock_alert_results import capture_result_source
+    policy = forward_config(quality_version=2)
+    store = ForwardStore(tmp_path / "forward.sqlite", policy)
+    plan = candidate()
+    data = dict(snapshot(), source="SHADOW", source_id=policy["policy_version"], enrolled_at="2026-09-01T00:00:00Z")
+    row = data["alerts"][0]
+    row.update(**{field: getattr(plan, field) for field in ("security_id", "ticker", "model", "interval", "direction", "stop", "target", "policy_version")},
+        trigger_price=plan.price, triggered_at=plan.trigger_at.isoformat())
+    store.save(dict(enrolled_at=data["enrolled_at"], members=["A"], positions={"plan": dict(candidate=candidate_record(plan))}))
+    import sqlite3
+    with sqlite3.connect(store.path) as connection:
+        for run in data["publications"]:
+            publication = dict(window_key=run["run_id"], selected=["plan"] if run["run_id"] == "one" else [], actual_publication_at=run["published_at"])
+            connection.execute("INSERT INTO forward_publications VALUES(?,?)", (run["run_id"], store.encode(publication)))
+    view = tmp_path / "alerts-view.json"
+    view.write_text(json.dumps(data))
+    before = (store.path.read_bytes(), view.read_bytes())
+    capture = capture_result_source(tmp_path, "intraday", datetime(2026, 9, 17, tzinfo=timezone.utc))
+    assert capture["snapshot"] == data and (store.path.read_bytes(), view.read_bytes()) == before
+    data["alerts"][0]["stop"] = 12.
+    view.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="retained ledger"):
+        capture_result_source(tmp_path, "intraday", datetime(2026, 9, 17, tzinfo=timezone.utc))
+
+
 def annotation_fixture():
     from research.stock_alert_context import observation
     data = dict(snapshot(), source="SHADOW")
@@ -494,11 +624,11 @@ def test_shadow_reader_uses_quality_v2_store_without_legacy_fallback(monkeypatch
     calls = []
     monkeypatch.delenv("STOCK_ALERT_SHADOW_VIEW", raising=False)
     monkeypatch.setattr(views, "load_snapshot", lambda path, source: calls.append((Path(path), source)) or {"status": "AWAITING_PUBLICATION"})
-    assert views.load_alert_view("SHADOW")["status"] == "AWAITING_PUBLICATION"
+    assert views.load_alert_view("SHADOW", combined=False)["status"] == "AWAITING_PUBLICATION"
     assert calls == [(QUALITY_ROOT / "alerts-view.json", "SHADOW")]
     custom = tmp_path / "approved-view.json"
     monkeypatch.setenv("STOCK_ALERT_SHADOW_VIEW", str(custom))
-    views.load_alert_view("SHADOW")
+    views.load_alert_view("SHADOW", combined=False)
     assert calls[-1] == (custom, "SHADOW")
 
 

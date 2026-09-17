@@ -4,6 +4,8 @@ export type AlertSource = 'SHADOW' | 'REPLAY' | 'LEGACY'
 
 export interface AlertPublication {
   run_id: string
+  strategy_instance_id?: string
+  strategy_label?: string
   session: string
   trigger_at: string
   published_at: string
@@ -77,6 +79,12 @@ export interface AlertPublicationContext {
 
 export interface AlertPlanRow {
   alert_id: string
+  strategy_instance_id?: string
+  strategy_label?: string
+  original_alert_id?: string
+  original_source_id?: string
+  original_run_id?: string
+  opposing_exposure?: boolean
   run_id: string
   security_id: string
   ticker: string
@@ -96,6 +104,13 @@ export interface AlertPlanRow {
   reward_risk: number | null
   entry_risk: { risk_pct: number | null; reward_risk: number | null } | null
   hold: string
+  trade_style?: 'SWING' | 'INTRADAY'
+  setup_interval?: string
+  confirmation_interval?: string
+  daily_setup_at?: string
+  daily_setup_id?: string
+  holding_sessions?: number
+  holding_count?: string
   exit_due_at: string | null
   status: string
   reason: string | null
@@ -144,7 +159,12 @@ export interface AlertViewResponse {
   status: string
   sessions: string[]
   session: string | null
-  view: 'latest' | 'history'
+  view: 'latest' | 'history' | 'open'
+  combined?: boolean
+  latest_runs?: AlertPublication[]
+  strategy_streams?: Array<{ stream: string; label: string; instance_id?: string; source_id?: string; status: string; error?: string | null;
+    as_of?: string; checked_at?: string; imported_at?: string; source_age_seconds?: number; projector_stale?: boolean;
+    publication_window_start?: string; publication_deadline?: string }>
   run: AlertPublication | null
   runs: AlertPublication[]
   withheld_run?: AlertPublication | null

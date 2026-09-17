@@ -12,6 +12,285 @@ def packet(model="resumption"):
                 ready=True, candidates=[original], updates=[], revision_ids=["one"])
 
 
+def swing_pair(model="resumption", direction=1, session="2026-09-04"):
+    from dataclasses import replace
+    import exchange_calendars
+    from research.stock_idea_swing import HORIZONS
+    calendar = exchange_calendars.get_calendar("XNYS")
+    closing = calendar.session_close(session).to_pydatetime()
+    opening = calendar.session_open(calendar.next_session(session)).to_pydatetime()
+    daily = replace(candidate(model=model, direction=direction), interval="1d", horizon=f"DAILY_{HORIZONS[model]}",
+        trigger_at=closing, available_at=closing + timedelta(minutes=15), expires_at=opening,
+        price=100., stop=90. if direction == 1 else 110., target=120. if direction == 1 else 80.,
+        reference=100., activation_atr=5., revision_ids=("daily",))
+    confirmation = replace(candidate(model=model, direction=direction), trigger_at=opening + timedelta(minutes=30),
+        available_at=opening + timedelta(minutes=45), expires_at=opening + timedelta(hours=1),
+        price=101. if direction == 1 else 99., revision_ids=("intraday",))
+    return daily, confirmation, opening + timedelta(minutes=47)
+
+
+@pytest.mark.parametrize("model,sessions", [("failure", 5), ("acceptance", 10), ("resumption", 21)])
+@pytest.mark.parametrize("direction", [1, -1])
+def test_swing_confirmation_preserves_daily_geometry_and_counts_trading_sessions(model, sessions, direction):
+    from copy import deepcopy
+    import exchange_calendars
+    from research.stock_idea_swing import SWING_POLICY, bind_swing_candidate
+    from research.stock_idea_replay import execution_times
+    daily, confirmation, cutoff = swing_pair(model, direction)
+    original = deepcopy((daily, confirmation))
+    bound, evidence = bind_swing_candidate(daily, confirmation, cutoff)
+    assert (bound.stop, bound.target, bound.activation_atr, bound.reference) == (daily.stop, daily.target, daily.activation_atr, daily.reference)
+    assert bound.price == confirmation.price and bound.interval == "30m" and bound.horizon == f"DAILY_{sessions}"
+    assert bound.revision_ids == ("daily", "intraday") and evidence["daily_episode_id"] == daily.episode_id
+    assert (daily, confirmation) == original
+    config = forward_config(quality_version=2) | dict(holding_policy=SWING_POLICY)
+    opening, ending = execution_times(bound, cutoff, config)
+    calendar = exchange_calendars.get_calendar("XNYS")
+    assert str(opening.date()) == "2026-09-08"
+    assert len(calendar.sessions_in_range(opening.date(), ending.date())) == sessions
+    assert ending == calendar.session_close(ending.date()).to_pydatetime()
+    raw_open, raw_end = execution_times(confirmation, cutoff, forward_config(quality_version=2))
+    assert raw_open == opening and raw_end.date() == opening.date()
+
+
+@pytest.mark.parametrize("change", [dict(security_id="OTHER"), dict(ticker="OTHER"), dict(direction=-1),
+    dict(model="failure"), dict(health="STALE"), dict(selection_block="REVIEW"), dict(revision_ids=()), dict(price=121.)])
+def test_swing_rejects_mismatched_or_unusable_confirmations(change):
+    from dataclasses import replace
+    from research.stock_idea_swing import bind_swing_candidate
+    daily, confirmation, cutoff = swing_pair()
+    assert bind_swing_candidate(daily, replace(confirmation, **change), cutoff) is None
+
+
+def test_swing_confirmation_is_causal_and_cannot_be_delayed_to_another_session():
+    from dataclasses import replace
+    from research.stock_idea_swing import bind_swing_candidate
+    daily, confirmation, cutoff = swing_pair()
+    assert bind_swing_candidate(daily, replace(confirmation, available_at=cutoff + timedelta(seconds=1)), cutoff) is None
+    assert bind_swing_candidate(daily, confirmation, confirmation.expires_at) is None
+    assert bind_swing_candidate(daily, replace(confirmation, trigger_at=confirmation.trigger_at + timedelta(days=1)), cutoff + timedelta(days=1)) is None
+
+
+def seed_swing_setup():
+    from research.stock_idea_swing import SWING_VERSION
+    daily, confirmation, cutoff = swing_pair()
+    config = forward_config(quality_version=2, swing=True)
+    state = dict(enrolled_at=(daily.trigger_at - timedelta(days=1)).isoformat(), bars={})
+    daily_packet = dict(packet(), interval="1d", market_time=daily.trigger_at, available_at=daily.available_at, candidates=[daily])
+    native_packet = dict(daily_packet, interval="30m", candidates=[])
+    seeded, publication, _ = forward_decision(state, [daily_packet, native_packet], boundary=daily.trigger_at,
+        actual_time=daily.trigger_at + timedelta(minutes=17), members=[dict(security_id="A")], policy_hash=SWING_VERSION, config=config)
+    assert not publication["selected"] and daily.episode_id in seeded["swing_setup_book"]
+    seeded["bars"] = {"A|30m": {"confirmation": decision_bar(confirmation, confirmation.trigger_at, confirmation.price)}}
+    return seeded, daily, confirmation, cutoff, config
+
+
+def test_swing_forward_waits_for_confirmation_and_retains_daily_plan_across_restart(tmp_path):
+    from copy import deepcopy
+    from research.stock_idea_engine import candidate_record
+    from research.stock_idea_forward import update_positions
+    from research.stock_idea_replay import execution_times
+    state, daily, confirmation, cutoff, config = seed_swing_setup()
+    original = deepcopy(state)
+    store = ForwardStore(tmp_path / "swing/forward.sqlite", config)
+    store.save(state)
+    restored = store.load()
+    packets = [dict(packet(), market_time=confirmation.trigger_at, available_at=confirmation.available_at, candidates=[confirmation])]
+    changed, result, _ = forward_decision(restored, packets, boundary=confirmation.trigger_at, actual_time=cutoff,
+        members=[dict(security_id="A")], policy_hash=store.policy_hash, config=config)
+    assert len(result["selected"]) == 1 and state == original
+    selected = result["selected"][0]
+    position = changed["positions"][selected]
+    assert position["candidate"]["stop"] == daily.stop and position["candidate"]["target"] == daily.target
+    assert position["swing_evidence"]["daily_setup"] == candidate_record(daily)
+    assert position["swing_evidence"]["confirmation"] == candidate_record(confirmation)
+    from research.stock_idea_engine import read_candidate
+    opening, ending = execution_times(read_candidate(position["candidate"]), cutoff, config)
+    assert ending.date() > opening.date() and changed["swing_setup_book"][daily.episode_id]["candidate"]["policy_version"] == config["policy_version"]
+    store.save(changed, result)
+    from research.stock_idea_engine import digest
+    assert digest(store.load()["positions"][selected]) == digest(position)
+    with pytest.raises(ValueError, match="preserve the old store"):
+        ForwardStore(store.path, forward_config(quality_version=2))
+    closed = dict(position, state="CLOSED", exit_at=cutoff.isoformat(), exit_price=100.)
+    assert update_positions(dict(positions={selected: closed}), config, cutoff + timedelta(days=30))["positions"][selected] == closed
+
+
+@pytest.mark.parametrize("defect", ["missing", "identity", "daily-stop", "daily-target", "late-bar", "no-confirmation"])
+def test_swing_forward_rejects_broken_preentry_path_or_absent_confirmation(defect):
+    state, daily, confirmation, cutoff, config = seed_swing_setup()
+    bar = state["bars"]["A|30m"]["confirmation"]
+    if defect == "missing":
+        state["bars"] = {}
+    elif defect == "identity":
+        bar["ticker"] = "REUSED"
+    elif defect == "daily-stop":
+        bar["low"] = daily.stop
+    elif defect == "daily-target":
+        bar["high"] = daily.target
+    elif defect == "late-bar":
+        bar["created_at"] = (cutoff + timedelta(seconds=1)).isoformat()
+    packets = [dict(packet(), market_time=confirmation.trigger_at, available_at=confirmation.available_at,
+        candidates=[] if defect == "no-confirmation" else [confirmation])]
+    changed, result, _ = forward_decision(state, packets, boundary=confirmation.trigger_at, actual_time=cutoff,
+        members=[dict(security_id="A")], policy_hash="swing", config=config)
+    assert not result["selected"]
+    assert all(row["status"] != "CONFIRMED" for row in result["swing_diagnostics"])
+    if defect in ("daily-stop", "daily-target"):
+        assert daily.episode_id not in changed["swing_setup_book"]
+
+
+@pytest.mark.parametrize("model", ["failure", "acceptance", "resumption"])
+def test_swing_keeps_position_overnight_and_exits_at_session_horizon(model):
+    import exchange_calendars
+    from research.stock_idea_engine import candidate_record
+    from research.stock_idea_swing import bind_swing_candidate
+    from research.stock_idea_replay import execution_times, mark_position
+    from test_stock_idea_replay import bars
+    daily, confirmation, cutoff = swing_pair(model)
+    bound, evidence = bind_swing_candidate(daily, confirmation, cutoff)
+    config = forward_config(quality_version=2, swing=True)
+    opening, ending = execution_times(bound, cutoff, config)
+    calendar = exchange_calendars.get_calendar("XNYS")
+    path = [bar for session in calendar.sessions_in_range(opening.date(), ending.date()) for bar in bars(str(session.date()))]
+    position = dict(state="PENDING", candidate=candidate_record(bound), publication_at=cutoff.isoformat(), swing_evidence=evidence)
+    first_close = calendar.session_close(opening.date()).to_pydatetime()
+    assert mark_position(position, path, [], first_close + timedelta(minutes=17), config)["state"] == "OPEN"
+    result = mark_position(position, path, [], ending + timedelta(minutes=17), config)
+    assert result["state"] == "CLOSED" and result["exit_at"] == ending.isoformat()
+    assert result["reason"] == "TIME_OR_SESSION_CLOSE"
+    from research.stock_alerts import replay_snapshot
+    publication = dict(arm="PRIORITY", window_key=confirmation.trigger_at.isoformat(), deadline=cutoff.isoformat(),
+        session=str(confirmation.trigger_at.date()), coverage="PUBLISHED", expected_members=["A"], missing_members=[],
+        selected=[bound.episode_id], dispositions=[dict(episode_id=bound.episode_id, security_id="A", model=model,
+            direction=1, interval="30m", selection="SELECTED", reason=None)], outcomes={bound.episode_id: result})
+    projected = replay_snapshot([publication], config, ending.isoformat(), "swing")["alerts"][0]
+    assert projected["hold"] == f"{evidence['holding_sessions']} sessions" and projected["trade_style"] == "SWING"
+    assert projected["daily_setup_at"] == evidence["daily_setup"]["trigger_at"]
+    assert projected["indicator_interval"] == "1d" and projected["indicator_at"] == evidence["daily_setup"]["trigger_at"]
+    assert projected["indicators"]["atr_pct"] == daily.activation_atr / daily.price
+
+
+@pytest.mark.parametrize("direction", [1, -1])
+def test_swing_overnight_gap_exit_keeps_daily_stop_and_real_gap_loss(direction):
+    from research.stock_idea_engine import candidate_record
+    from research.stock_idea_swing import bind_swing_candidate
+    from research.stock_idea_replay import mark_position, utc
+    from test_stock_idea_replay import bars
+    daily, confirmation, cutoff = swing_pair("resumption", direction)
+    bound, _ = bind_swing_candidate(daily, confirmation, cutoff)
+    path = bars("2026-09-08") + bars("2026-09-09")
+    gap = 85. if direction == 1 else 115.
+    path[13].update(open=gap, close=gap, high=gap + 1, low=gap - 1)
+    position = dict(state="PENDING", candidate=candidate_record(bound), publication_at=cutoff.isoformat())
+    result = mark_position(position, path, [], utc("2026-09-09T21:00:00Z"), forward_config(quality_version=2, swing=True))
+    assert result["reason"] == "STOP_GAP" and result["exit_price"] == gap and result["gross"] < -.1
+    assert result["candidate"]["stop"] == daily.stop
+
+
+def test_swing_cli_is_opt_in_separate_and_plan_only(tmp_path, monkeypatch, capsys):
+    import json
+    from scripts.run_stock_idea_worker import main, worker_paths, QUALITY_ROOT
+    from research.stock_idea_swing import SWING_VERSION
+    legacy_view = tmp_path / "legacy-view.json"
+    legacy_view.write_text("unchanged")
+    monkeypatch.setenv("STOCK_ALERT_SHADOW_VIEW", str(legacy_view))
+    assert main(["--swing", "--plan", "--state-dir", str(tmp_path / "swing")]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["policy"]["policy_version"] == SWING_VERSION and result["activation_required"]
+    assert result["policy"]["daily_entry"] == "NEXT_NATIVE_OPEN_AFTER_INTRADAY_CONFIRMATION"
+    assert all("time_cap_minutes" not in model for model in result["policy"]["models"].values())
+    assert result["view"] == str(tmp_path / "swing/alerts-view.json") and not (tmp_path / "swing").exists()
+    assert legacy_view.read_text() == "unchanged"
+    with pytest.raises(ValueError, match="separate store"):
+        worker_paths(QUALITY_ROOT, 2, True)
+    for args in (["--swing"], ["--swing", "--quality-version", "1", "--plan"], ["--activate-swing-shadow"],
+                 ["--swing", "--retry-window", "2026-09-08T14:00:00Z"],
+                 ["--swing", "--quarantine-security-id", "OLD", "--quarantine-ticker", "OKE"],
+                 ["--swing", "--activate-swing-shadow", "--quarantine-security-id", "OLD"]):
+        with pytest.raises(SystemExit):
+            main(args)
+
+
+def test_swing_never_converts_an_intraday_signal_without_a_retained_daily_setup():
+    _, confirmation, cutoff = swing_pair()
+    state = dict(enrolled_at=(confirmation.trigger_at - timedelta(days=1)).isoformat(),
+        bars={"A|30m": {"bar": decision_bar(confirmation, confirmation.trigger_at, confirmation.price)}})
+    packets = [dict(packet(), market_time=confirmation.trigger_at, available_at=confirmation.available_at, candidates=[confirmation])]
+    changed, result, _ = forward_decision(state, packets, boundary=confirmation.trigger_at, actual_time=cutoff,
+        members=[dict(security_id="A")], policy_hash="swing", config=forward_config(quality_version=2, swing=True))
+    assert not result["selected"] and not changed["swing_setup_book"] and not result["candidates"]
+
+
+def test_swing_missed_closing_publication_cannot_seed_a_retroactive_daily_setup():
+    daily, _, _ = swing_pair()
+    state = dict(enrolled_at=(daily.trigger_at - timedelta(days=1)).isoformat())
+    closing = dict(packet(), market_time=daily.trigger_at, available_at=daily.available_at, candidates=[])
+    daily_packet = dict(closing, interval="1d", candidates=[daily])
+    changed, result, _ = forward_decision(state, [closing, daily_packet], boundary=daily.trigger_at,
+        actual_time=daily.trigger_at + timedelta(hours=2), members=[dict(security_id="A")], policy_hash="swing",
+        config=forward_config(quality_version=2, swing=True))
+    assert result["coverage"] == "MISSED_PUBLICATION" and not changed["swing_setup_book"]
+
+
+def test_swing_first_confirmation_is_not_replaced_or_reselected():
+    from dataclasses import replace
+    from research.stock_idea_engine import digest
+    state, daily, confirmation, cutoff, config = seed_swing_setup()
+    packets = [dict(packet(), market_time=confirmation.trigger_at, available_at=confirmation.available_at, candidates=[confirmation])]
+    changed, result, _ = forward_decision(state, packets, boundary=confirmation.trigger_at, actual_time=cutoff,
+        members=[dict(security_id="A")], policy_hash="swing", config=config)
+    selected = result["selected"][0]
+    original_position = digest(changed["positions"][selected])
+    later = replace(confirmation, interval="1h", trigger_at=confirmation.trigger_at + timedelta(minutes=30),
+        expires_at=confirmation.expires_at + timedelta(hours=1), available_at=confirmation.available_at + timedelta(minutes=30))
+    changed["bars"]["A|30m"]["later"] = decision_bar(later, later.trigger_at, later.price)
+    later_packets = [dict(packet(), market_time=later.trigger_at, available_at=later.available_at, candidates=[later])]
+    final, followup, _ = forward_decision(changed, later_packets, boundary=later.trigger_at, actual_time=cutoff + timedelta(minutes=30),
+        members=[dict(security_id="A")], policy_hash="swing", config=config)
+    assert not followup["selected"] and len(final["positions"]) == 1
+    assert digest(final["positions"][selected]) == original_position
+    assert final["swing_setup_book"][daily.episode_id]["candidate"]["interval"] == "30m"
+
+
+@pytest.mark.parametrize("defect", ["daily-invalidated", "action", "identity-risk", "expired-session"])
+def test_swing_setup_invalidation_and_action_risk_fail_closed(defect):
+    from research.stock_idea_swing import swing_candidates
+    state, daily, confirmation, cutoff, config = seed_swing_setup()
+    invalidated = {daily.episode_id} if defect == "daily-invalidated" else set()
+    ready = set() if defect == "identity-risk" else {"A"}
+    if defect == "action":
+        state["actions"] = [dict(security_id="A", action_type="SPLIT", effective_date=str(confirmation.trigger_at.date()),
+            first_observed_at=cutoff.isoformat(), created_at=cutoff.isoformat())]
+    now = cutoff + timedelta(days=1) if defect == "expired-session" else cutoff
+    book, candidates, _, diagnostics = swing_candidates(state, [confirmation], boundary=confirmation.trigger_at,
+        cutoff=cutoff, actual_time=now, ready=ready, invalidated=invalidated, may_seed=False, config=config)
+    assert not candidates and diagnostics
+    if defect != "identity-risk":
+        assert daily.episode_id not in book
+
+
+def test_swing_readiness_identity_diagnostic_never_changes_enrollment(tmp_path, monkeypatch):
+    from scripts.run_stock_idea_worker import inspect_source_readiness
+    import equity.api
+    import equity.stock_idea_forward_source
+    boundary = candidate().trigger_at
+    store = ForwardStore(tmp_path / "forward.sqlite", forward_config(quality_version=2, swing=True))
+    state = dict(enrolled_at=(boundary - timedelta(days=1)).isoformat(), next_boundary=boundary.isoformat(),
+        members=[dict(security_id="A", ticker="A"), dict(security_id="OLD", ticker="OKE")], identity_breaks={"OLD": "IDENTITY_CHANGED"})
+    store.save(state)
+    before = store.path.read_bytes()
+    monkeypatch.setattr(equity.api, "expected_materialized_market_time", lambda *args: boundary)
+    monkeypatch.setattr(equity.stock_idea_forward_source, "forward_input_readiness",
+        lambda members, *args, **kwargs: dict(ready=True) if members == [state["members"][0]] else None)
+    result = inspect_source_readiness(store.path)
+    assert result["enrolled_members"] == result["future_members"] == 2
+    assert not result["prospective_source_probe"]["ready"]
+    assert result["identity_exclusion_diagnostic"] == dict(diagnostic_only=True, policy_changed=False,
+        excluded_members=[state["members"][1]], remaining_members=1, boundary=boundary.isoformat(), source_ready=True)
+    assert store.path.read_bytes() == before
+
+
 def test_prospective_identity_quarantine_preserves_enrollment_positions_and_old_windows():
     from copy import deepcopy
     from research.stock_idea_forward import READINESS_POLICY, alert_selection_cohort, quarantine_alert_member
@@ -89,13 +368,14 @@ def test_alert_quarantine_does_not_make_another_missing_member_ready():
     assert publication["missing_members"] == ["B"]
 
 
-def test_quarantine_store_backs_up_and_preserves_other_tables(tmp_path):
+@pytest.mark.parametrize("swing", [False, True])
+def test_quarantine_store_backs_up_and_preserves_other_tables(tmp_path, swing):
     import hashlib
     import sqlite3
     from contextlib import closing
     from research.stock_idea_forward import READINESS_POLICY
     boundary = candidate().trigger_at
-    config = forward_config()
+    config = forward_config(quality_version=2, swing=True) if swing else forward_config()
     store = ForwardStore(tmp_path / "forward.sqlite", config)
     original = dict(enrolled_at=(boundary - timedelta(hours=1)).isoformat(), dispatch_policy=READINESS_POLICY,
         members=[dict(security_id="A", ticker="A"), dict(security_id="OKE", ticker="OKE")],

@@ -92,7 +92,7 @@ def test_config_file_and_implementation_have_same_nine_trials():
     import json
     import pytest
     from scripts.run_equity_strategy_v2 import validate_configuration
-    config = json.loads((Path(__file__).resolve().parents[2] / "docs" / "equity_strategy_v2_config.json").read_text())
+    config = json.loads((Path(__file__).resolve().parents[2] / "backend/research/inputs/equity_strategy_v2_config.json").read_text())
     validate_configuration(config)
     for family, values in config["parameter_grid"].items():
         trials = [trial for trial in CONFIGURATIONS if trial.family == family]

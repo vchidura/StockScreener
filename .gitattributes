@@ -2,7 +2,5 @@
 *.sql text eol=lf
 *.ps1 text eol=crlf
 
-# Frozen observer inputs are verified by raw-file SHA-256.
-docs/equity_price_diagnostic_results.json -text whitespace=trailing-space,space-before-tab,cr-at-eol
-docs/equity_price_replication_results.json -text whitespace=trailing-space,space-before-tab,cr-at-eol
-docs/equity_ridge_challenger_results.json -text whitespace=trailing-space,space-before-tab,cr-at-eol
+# Frozen research inputs are verified by raw-file SHA-256.
+backend/research/inputs/*.json -text whitespace=trailing-space,space-before-tab,cr-at-eol

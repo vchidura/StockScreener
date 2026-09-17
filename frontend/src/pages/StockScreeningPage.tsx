@@ -7,6 +7,7 @@ import { ColumnPicker, type ColumnSpec } from '../layout/PageChrome'
 import { getGapDetails, getHourlyDetails, getScreeningCatalog, queryScreening } from '../services/screening'
 import { appliedScreeningColumns, comparisonDate, compileDraft, DEFAULT_COLUMNS, downloadText, emptyDraft, emptyPredicate, filterLabel, formatValue, hasDraftFilter, hourlyContextTiming, hourlyObservedBehavior, hourlyTimestamp, newComparisonReason, newOnlyRequest, removeDraftFilter, resultCsv, ruleIdentity, screeningColumns, screeningColumnGroup, screeningColumnPresets, screeningDisplayColumns, screeningFieldHelp, screeningTimeframeLabel, screeningValueClass, selectedScreeningColumnPreset, type Draft, type FieldHelpScope, type FieldSpec, type GapDetails, type HourlyDetails, type ScreeningRequest, type ScreeningRow } from './screeningModel'
 import { useScreenLibrary } from './useScreenLibrary'
+import { dailyCoverageNotice } from './screeningModel'
 import ScreenLibrary, { Modal } from './ScreenLibrary'
 import './StockScreeningPage.css'
 
@@ -31,6 +32,7 @@ export default function StockScreeningPage() {
   const dailyRequest = { ...request, generation: null }
   const query = useQuery({ queryKey: ['screening-query', dailyRequest], queryFn: ({ signal }) => queryScreening(dailyRequest, signal), enabled: !!catalog?.publications.length && library.ready, staleTime: 60_000, gcTime: 60_000, refetchInterval: 60_000, refetchOnWindowFocus: false })
   const result = query.data
+  const coverageNotice = dailyCoverageNotice(result?.generation)
   const expandedRow = result?.rows.find(row => row.security_id === expanded)
   const gapQuery = useQuery({ queryKey: ['screening-gap-details', result?.generation.generation, expandedRow?.security_id, request.predicate.gap || null],
     queryFn: ({ signal }) => getGapDetails(result!.generation.generation, expandedRow!.security_id, request.predicate.gap || null, signal),
@@ -195,6 +197,7 @@ export default function StockScreeningPage() {
         </>}{draftChanged && <small className="sw-draft-status">Unapplied changes</small>}</div>
         {hourlySource && (columns.includes('hourly') || request.predicate.hourly) && <div className="sw-hourly-status" role="status">{hourlyContextTiming(result?.generation.market_time, hourlySource)}{result?.hourly_stale || hourlySource.status !== 'READY' ? ' / Stale or unavailable' : ''}{request.predicate.hourly && ' / New comparison unavailable for hourly rules'}</div>}
         {result?.stale && <div className="sw-warning" role="status"><AlertTriangle size={16} />Stale screening publication: {result.generation.session}</div>}
+        {coverageNotice && <div className="sw-warning" role="status" aria-label="Daily source coverage"><AlertTriangle size={16} /><span>{coverageNotice}</span></div>}
         {(catalogQuery.isError || query.isError) && <div role="alert" className="sw-warning"><AlertTriangle size={16} />Screening publication unavailable. <button type="button" onClick={() => { void catalogQuery.refetch(); void query.refetch() }}>Retry</button></div>}
         {catalog?.status === 'AWAITING_FIRST_PUBLICATION' ? <div className="sw-empty">Awaiting first daily screening publication</div> : query.isFetching && !result ? <div className="sw-empty" role="status">Loading published screening facts...</div> : result && <>
           <div className="sw-table-scroll"><table><thead><tr><th aria-label="Match explanation" />{columns.map(key => <th key={key} data-column={key}><span className="sw-column-heading"><span>{specs.find(spec => spec.key === key)?.label || key}</span><FieldHelpButton field={key} spec={catalog?.fields[key]} /></span></th>)}</tr></thead><tbody>

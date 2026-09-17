@@ -414,7 +414,7 @@ def signal_conflicts(events):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-dir", type=Path, required=True)
-    parser.add_argument("--config", type=Path, default=BACKEND_DIR.parent / "docs" / "equity_strategy_v2_config.json")
+    parser.add_argument("--config", type=Path, default=BACKEND_DIR / "research/inputs/equity_strategy_v2_config.json")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--workers", type=int, choices=range(1, 5), default=4)
     parser.add_argument("--pilot", action="store_true")

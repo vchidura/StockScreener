@@ -1,0 +1,19 @@
+{
+  "study_id": "equity_retained_signal_scorecard_v1",
+  "frozen_on": "2026-09-12",
+  "daily_horizons": [5, 10, 21],
+  "later_start": "2025-01-01",
+  "minimum_events": 100,
+  "minimum_independent_periods": 40,
+  "sample_manifests": ["equity_price_diagnostic_results.sample.json", "equity_price_replication_results.sample.json"],
+  "inventory_scope": "Every retained top-level evidence source/version/type/role/timeframe/direction/origin, plus every registered composite scanner cell even if empty. Bundled feature columns are listed separately, not assumed independently evaluated",
+  "daily_scope": "Current seven registered daily composite scanners, both directions, 5/10/21-session directional and recommendation-plan policies. Exact policy IDs, historical/live origin, run purpose and sample remain separate",
+  "sampling": "All retained tickers plus each original disjoint 300-ticker manifest, filtered within existing ledger events. This is not a new all-date replay or certification of retained universe coverage",
+  "lifecycle": "Use first retained occurrence for each security/source/version/direction/origin/run-purpose/lifecycle key. Never choose occurrences by their outcomes. Missing lifecycle keys remain distinct and do not imply independence",
+  "availability": "Only evidence and latest outcome revisions observed/created by this report cutoff. Retain stale, not-entered and unavailable outcomes in counts; exclude them from performance metrics with explicit reasons",
+  "policy_identity": "No cost or benchmark revisions are pooled. Live evidence must satisfy the recorded policy effective window. Reconstructed ledger groups with retained outcomes explicitly referencing the exact policy/horizon are reported retrospectively across their full lifecycle-event denominator, including missing outcomes; counts outside the policy effective window remain explicit and block certification. No database policy dates are changed",
+  "statistics": "Equal-weight signal-date cohorts, then existing XNYS horizon spacing plus non-overlapping execution paths. Report returns, primary benchmark excess, MAE/MFE, hit-rate uncertainty, early/late and fixed later-period views",
+  "multiple_testing": "Benjamini-Hochberg over all daily registry cells and exact retained policy revisions within each sample/origin/run-purpose family; unmeasurable cells use p=1 internally. No p/q claim of independent trials",
+  "scores": "Separate coverage and empirical evidence state. No arbitrary numeric quality score, individual-stock probability, live qualification publication or use of the 20% portfolio limit as a detector-quality gate",
+  "limitations": ["Ledger coverage does not certify a complete historical replay or no-signal control population", "Existing published qualifications describe their original cohorts, not these newly filtered samples", "An evidence research pass is not deployability, input certification or probability calibration", "Retained price-return, corporate-action, timing and benchmark quality flags remain attached", "Bearish signed returns are directional evidence, not a borrow-cost/short-sale simulation", "No new bars, provider calls, model fits, schema changes, live rankings, option gates or paper-tracker changes"]
+}

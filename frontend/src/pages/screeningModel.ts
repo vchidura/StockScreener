@@ -43,11 +43,19 @@ export interface GapEpisode {
 }
 export interface GapDetails { generation: string; security_id: string; session: string; source_cutoff: string; status: string; reason: string; episode_count: number; matching_episodes: GapEpisode[] }
 export interface ScreeningResult {
-  generation: { generation: string; daily_generation?: string; session: string; market_time: string; observed_at: string; source_cutoff: string; source_publication_id: string; rank_population: number; expected_members: number; field_coverage: Record<string, number>; pattern_coverage: Record<string, number>; capture_mode: string; action_coverage: string; persistence_status: string; hourly_source?: HourlySource; hourly_coverage?: Record<string, number> }
+  generation: { generation: string; daily_generation?: string; session: string; market_time: string; observed_at: string; source_cutoff: string; source_publication_id: string; source_publication_status?: string; source_selected_members?: number; source_unavailable_members?: Array<{ ticker: string; security_id: string; status: string }>; rank_population: number; expected_members: number; field_coverage: Record<string, number>; pattern_coverage: Record<string, number>; capture_mode: string; action_coverage: string; persistence_status: string; hourly_source?: HourlySource; hourly_coverage?: Record<string, number> }
   rows: ScreeningRow[]; matched_count: number; unknown_count: number; nonmatch_count: number; universe_count: number; predicate_hash: string; stale: boolean
   result_count?: number; new_only?: boolean
   hourly_stale?: boolean
   comparison?: { status: string; current_session: string; previous_session: string | null; previous_generation: string | null; new_count: number | null; unavailable_count: number }
+}
+
+export function dailyCoverageNotice(generation?: Pick<ScreeningResult['generation'], 'session' | 'expected_members' | 'source_publication_status' | 'source_selected_members' | 'source_unavailable_members'>): string | null {
+  if (generation?.source_publication_status !== 'DEGRADED') return null
+  const selected = generation.source_selected_members
+  const count = typeof selected === 'number' && Number.isInteger(selected) && selected >= 0 && selected <= generation.expected_members ? selected : 'Unknown'
+  const missing = generation.source_unavailable_members?.map(member => member.ticker).join(', ')
+  return `Partial daily coverage (${generation.session}): ${count} / ${generation.expected_members} source members available. ${missing ? `${missing} unavailable.` : 'Unavailable members not identified.'}`
 }
 
 export function newOnlyRequest(request: ScreeningRequest, enabled: boolean): ScreeningRequest {

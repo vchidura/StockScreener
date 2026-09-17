@@ -195,6 +195,15 @@ def derive_hours(bars, config):
 def execution_times(candidate, publication, config):
     calendar = exchange_calendars.get_calendar("XNYS")
     session = str(candidate.trigger_at.date())
+    if config.get("holding_policy") == "DAILY_SETUP_NEXT_SESSION_CONFIRMATION_V1":
+        horizon = config["models"][candidate.model]["daily_horizon_sessions"]
+        if (candidate.policy_version != "stock_ideas_forward_swing_v1" or candidate.interval not in ("30m", "1h")
+                or candidate.horizon != f"DAILY_{horizon}"):
+            raise ValueError("swing execution requires a daily-owned confirmed candidate")
+        windows = session_windows(session)
+        opening = next((start for start, _ in windows if start > publication), None)
+        ending = calendar.session_close(calendar.session_offset(session, horizon - 1)).to_pydatetime()
+        return opening, ending
     if candidate.interval == "1d":
         entry_session = str(calendar.next_session(session).date())
         opening = session_windows(entry_session)[0][0]
@@ -395,7 +404,7 @@ def summarize(publications, outcomes, config, evaluation_plan=None):
     from collections import Counter
     from research.stock_idea_evaluation import block_statistics
     if evaluation_plan is None:
-        evaluation_plan = json.loads((Path(__file__).resolve().parents[2] / "docs/stock_idea_evaluation_plan.json").read_text(encoding="utf-8"))
+        evaluation_plan = json.loads((Path(__file__).resolve().parents[2] / "backend/research/inputs/stock_idea_evaluation_plan.json").read_text(encoding="utf-8"))
     calendar = exchange_calendars.get_calendar("XNYS")
     sessions = [str(session.date()) for session in calendar.sessions_in_range(config["start"], config["end"])]
     blocks = [sessions[index:index + config["bootstrap_block_sessions"]]
@@ -476,7 +485,7 @@ def write_once(path, value):
 def run_replay(bundle, config, output, workers=1, evaluation_plan=None):
     from research.stock_idea_evaluation import evaluate_publications, validate_plan
     if evaluation_plan is None:
-        evaluation_plan = json.loads((Path(__file__).resolve().parents[2] / "docs/stock_idea_evaluation_plan.json").read_text(encoding="utf-8"))
+        evaluation_plan = json.loads((Path(__file__).resolve().parents[2] / "backend/research/inputs/stock_idea_evaluation_plan.json").read_text(encoding="utf-8"))
     validate_plan(evaluation_plan, config)
     if bundle.get("evaluation_plan_sha256", digest(evaluation_plan)) != digest(evaluation_plan):
         raise ValueError("frozen inputs are bound to a different evaluation protocol")

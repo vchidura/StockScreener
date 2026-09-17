@@ -33,6 +33,17 @@
 .mc-table th:first-child, .mc-table td:first-child { padding-left: 8px; }
 .mc-table thead th { background: var(--tm-surface-sunken); color: var(--tm-muted); font-size: 11px; font-weight: 600; }
 .mc-table tbody th { font-weight: 600; }
+.mc-column-label { display: inline-flex; align-items: center; gap: 3px; }
+.mc-column-help { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 28px; flex: 0 0 26px; padding: 0; border: 0; border-radius: 3px; color: var(--tm-muted); background: none; }
+.mc-column-help:hover, .mc-column-help:focus-visible { color: var(--tm-accent); background: var(--tm-accent-soft); }
+.mc-close-date { display: block; font-size: 10px; font-weight: 400; }
+.mc-stock-scroll { max-height: min(65vh, 760px); overflow: auto; scrollbar-gutter: stable; }
+.mc-stocks { min-width: 1450px; }
+.mc-stocks tbody th { position: sticky; left: 0; z-index: 1; background: var(--tm-surface); }
+.mc-stocks thead th { position: sticky; top: 0; z-index: 2; }
+.mc-stocks thead th:first-child { left: 0; z-index: 3; }
+.mc-column-tooltip { position: fixed; z-index: 1500; box-sizing: border-box; width: 330px; max-width: calc(100vw - 16px); max-height: calc(100dvh - 16px); overflow-y: auto; padding: 12px; border: 1px solid var(--tm-line); border-radius: 4px; background: var(--tm-surface); color: var(--tm-ink); font-family: inherit; font-size: 12px; line-height: 1.55; letter-spacing: 0; overflow-wrap: anywhere; box-shadow: 0 4px 16px #0003; }
+.mc-column-tooltip p { margin: 6px 0 0; }
 .mc-table tr.mc-selected { background: var(--tm-accent-soft); }
 .mc-table .mc-state { white-space: normal; min-width: 195px; max-width: 260px; line-height: 1.45; }
 .mc-state small { display: block; color: var(--tm-muted); font-size: 11px; margin-top: 3px; }

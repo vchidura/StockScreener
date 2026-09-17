@@ -209,7 +209,7 @@ def run_report(config_path, output_path=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=BACKEND_DIR.parent / "docs" / "option_equity_shadow_config.json")
+    parser.add_argument("--config", type=Path, default=BACKEND_DIR / "research/inputs/option_equity_shadow_config.json")
     parser.add_argument("--output", type=Path, default=BACKEND_DIR.parent / "docs" / "option_equity_shadow_results.json")
     parser.add_argument("--no-write", action="store_true")
     args = parser.parse_args()

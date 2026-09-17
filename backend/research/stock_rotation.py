@@ -11,10 +11,11 @@ import exchange_calendars
 import pandas as pd
 
 from research.gics_sectors import SECTOR_BENCHMARK_ETF, sector_for_sic
-from research.stock_alert_context import daily_price_context, dated_reference, market_context, observation, same_time_volume_context, utc
+from research.stock_alert_context import SPLIT_PRICE_BASIS, daily_price_context, dated_reference, market_context, observation, same_time_volume_context, utc
 
 
 VERSION = "stock_rotation_v1"
+SPLIT_VERSION = "stock_rotation_reviewed_splits_v2"
 SCHEMA = "stock_rotation_snapshot_v1"
 HISTORY_SESSIONS = 5
 BOND_PROXY_VERSION = "bond_etf_relative_performance_price_v1"
@@ -459,8 +460,12 @@ def tracked_breadth(members, session):
 
 
 def build_rotation_snapshot(members, facts, cutoff):
+    from research.stock_idea_engine import digest
     calendar = exchange_calendars.get_calendar("XNYS")
     cutoff = utc(cutoff)
+    split_reviews = facts.get("split_reviews")
+    price_basis = "RAW_ACTION_GATED" if split_reviews is None else SPLIT_PRICE_BASIS
+    review_hash = digest(split_reviews) if split_reviews is not None else None
     session = calendar.date_to_session(cutoff.date(), direction="previous")
     if calendar.session_close(session).to_pydatetime() > cutoff:
         session = calendar.previous_session(session)
@@ -482,7 +487,8 @@ def build_rotation_snapshot(members, facts, cutoff):
             return observation("UNAVAILABLE", "SECURITY_REFERENCE_UNAVAILABLE", session=target)
         key = (identity, target)
         if key not in cache:
-            cache[key] = daily_price_context(by_security[identity], identity, target, cutoff, facts["actions"])
+            cache[key] = daily_price_context(by_security[identity], identity, target, cutoff, facts["actions"],
+                expected_ticker=ticker, split_reviews=split_reviews)
         return cache[key]
     def compact(context_value):
         from research.stock_idea_engine import digest
@@ -498,7 +504,7 @@ def build_rotation_snapshot(members, facts, cutoff):
         history = []
         for target in dates:
             value = relative_rotation(context(ticker, target), context("SPY", target))
-            value.update(session=target, series_key=ticker + ":SPY:RAW_ACTION_GATED")
+            value.update(session=target, series_key=ticker + ":SPY:" + price_basis + (":" + review_hash if review_hash else ""))
             history.append(value)
         history = summarize_rotation_history(history)
         sectors.append(dict(ticker=ticker, sector=name, context=compact(context(ticker, dates[-1])),
@@ -579,8 +585,9 @@ def build_rotation_snapshot(members, facts, cutoff):
             additional["intraday_volume"].update(value=dict(ready_proxies=len(ready), expected_proxies=len(volumes)),
                 source_revision_ids=sorted({revision for value in ready for revision in value["source_revision_ids"]}),
                 market_time=facts["volume_boundary"], available_at=max(value["available_at"] for value in ready))
-    return dict(schema=SCHEMA, calculation_version=VERSION, as_of=cutoff.isoformat(), session=dates[-1],
-        history_sessions=dates, capture_mode="RECONSTRUCTED_AS_OF_CAPTURE", price_basis="RAW_ACTION_GATED",
+    return dict(schema=SCHEMA, calculation_version=VERSION if split_reviews is None else SPLIT_VERSION, as_of=cutoff.isoformat(), session=dates[-1],
+        history_sessions=dates, capture_mode="RECONSTRUCTED_AS_OF_CAPTURE", price_basis=price_basis,
+        split_reviews=split_reviews, split_review_sha256=review_hash,
         mapping_basis="SIC_DERIVED_PROXY_NOT_LICENSED_GICS", refresh_mode="ONE_SHOT_CAPTURE",
         market=compact(market_context(benchmarks["SPY"], benchmarks["QQQ"])),
         benchmarks={ticker: compact(value) for ticker, value in benchmarks.items()}, sectors=sectors, stocks=stocks,
@@ -593,17 +600,44 @@ def build_rotation_snapshot(members, facts, cutoff):
             expected_stocks=len(stocks), stock_states=dict(Counter(row["relative"]["status"] for row in stocks))),
         lineage=lineage, warnings=["Price leadership, not fund flows or expected returns",
             "Five-session trails are reconstructed at capture time; persistence is bounded to that history",
-            "Raw prices are action-gated, not total returns; ETF distributions can affect comparisons",
+            "Prices are action-gated, with only explicitly reviewed splits adjusted; cash distributions excluded, not total returns",
             "Annotations only; no alert selection or probability model"])
+
+
+def split_basis_comparison(raw, reviewed):
+    from research.stock_idea_engine import digest
+    if raw["session"] != reviewed["session"] or raw["as_of"] != reviewed["as_of"]:
+        raise ValueError("split comparison must use the same capture")
+    unchanged = []
+    for before, after in zip(raw["sectors"], reviewed["sectors"]):
+        if before["ticker"] != after["ticker"]:
+            raise ValueError("split comparison population differs")
+        if before["context"]["status"] == "READY":
+            if (before["context"]["value"] != after["context"]["value"]
+                    or before["context"]["lineage_ref"] != after["context"]["lineage_ref"]
+                    or [row["value"] for row in before["history"]] != [row["value"] for row in after["history"]]):
+                raise ValueError("previously ready proxy changed under split policy")
+            unchanged.append(before["ticker"])
+    for ticker in ("SPY", "QQQ"):
+        if raw["benchmarks"][ticker]["value"] != reviewed["benchmarks"][ticker]["value"]:
+            raise ValueError("benchmark values changed under sector split policy")
+    return dict(status="SAME_INPUT_COMPARISON", raw_snapshot_sha256=digest(raw),
+        raw_coverage=raw["coverage"], reviewed_coverage=reviewed["coverage"], unchanged_ready_proxies=unchanged,
+        benchmark_values_unchanged=True, live_gate_enabled=False)
 
 
 def verify_rotation_snapshot(snapshot):
     from research.stock_idea_engine import digest
-    if snapshot.get("schema") != SCHEMA or snapshot.get("calculation_version") != VERSION:
+    if snapshot.get("schema") != SCHEMA or snapshot.get("calculation_version") not in (VERSION, SPLIT_VERSION):
         raise ValueError("incompatible rotation snapshot")
     if snapshot.get("snapshot_sha256") != digest({key: value for key, value in snapshot.items() if key != "snapshot_sha256"}):
         raise ValueError("rotation snapshot hash mismatch")
     cutoff = utc(snapshot["as_of"])
+    if snapshot["calculation_version"] == SPLIT_VERSION:
+        if (snapshot.get("price_basis") != SPLIT_PRICE_BASIS or not isinstance(snapshot.get("split_reviews"), list)
+                or snapshot.get("split_review_sha256") != digest(snapshot["split_reviews"])
+                or any(utc(review["reviewed_at"]) > cutoff for review in snapshot["split_reviews"])):
+            raise ValueError("reviewed split policy is invalid or after cutoff")
     if snapshot["database_snapshot"]["read_only"] != "on" or snapshot["database_snapshot"]["isolation"] != "repeatable read":
         raise ValueError("rotation capture must use a read-only consistent snapshot")
     if not snapshot.get("original_publications_unchanged"):
@@ -653,6 +687,16 @@ def verify_rotation_snapshot(snapshot):
                 raise ValueError("rotation fact exceeds capture cutoff")
         if factor["status"] in ("READY", "PARTIAL") and (factor["value"] is None or not lineage[factor["lineage_ref"]]):
             raise ValueError("ready rotation fact lacks evidence")
+        for adjustment in factor.get("split_adjustments", []):
+            review = next((row for row in snapshot.get("split_reviews") or [] if digest(row) == adjustment["review_sha256"]), None)
+            if (review is None or adjustment["action_revision_id"] != review["action_revision_id"]
+                    or review["status"] != "REVIEWED" or adjustment["effective_date"] != review["effective_date"]
+                    or adjustment["evidence_url"] != review["evidence_url"] or adjustment["reviewed_at"] != review["reviewed_at"]
+                    or utc(factor["available_at"]) < utc(review["reviewed_at"])
+                    or "split-review:" + adjustment["review_sha256"] not in lineage[factor["lineage_ref"]]
+                    or adjustment["action_revision_id"] not in lineage[factor["lineage_ref"]]
+                    or not math.isclose(adjustment["price_factor"], float(review["split_from"]) / float(review["split_to"]), rel_tol=1e-12)):
+                raise ValueError("split adjustment lineage does not match review")
     return dict(status="VERIFIED", fact_records=len(factors), source_lineage_sets=len(lineage),
         original_publications_unchanged=True, coverage=snapshot["coverage"])
 
@@ -698,7 +742,7 @@ def load_rotation_page(path, expected_session, now):
         raise ValueError("rotation snapshot is from a future capture")
     stale = snapshot["session"] < expected_session
     fields = ("schema", "calculation_version", "session", "as_of", "generated_at", "history_sessions", "capture_mode", "price_basis",
-        "mapping_basis", "refresh_mode", "market", "benchmarks", "sectors", "stocks", "coverage", "warnings", "snapshot_sha256", "additional_context", "intraday_volumes", "score_components", "sector_option_activity", "etf_creations")
+        "mapping_basis", "refresh_mode", "market", "benchmarks", "sectors", "stocks", "coverage", "warnings", "snapshot_sha256", "additional_context", "intraday_volumes", "score_components", "sector_option_activity", "etf_creations", "split_review_sha256")
     result = dict({field: snapshot.get(field) for field in fields}, status="STALE" if stale else "AVAILABLE",
         stale=stale, capture_age_seconds=age, expected_session=expected_session)
     from equity.api import expected_materialized_market_time
@@ -720,8 +764,10 @@ def load_rotation_page(path, expected_session, now):
     return result
 
 
-def rotation_refresh_due(snapshot, expected_session, expected_boundary, now, *, macro_configured=False, macro_states=None):
+def rotation_refresh_due(snapshot, expected_session, expected_boundary, now, *, macro_configured=False, macro_states=None, split_review_sha256=None):
     if not snapshot or "additional_context" not in snapshot:
+        return True
+    if snapshot.get("split_review_sha256") != split_review_sha256:
         return True
     age = (utc(now) - utc(snapshot["as_of"])).total_seconds()
     if age < 300:

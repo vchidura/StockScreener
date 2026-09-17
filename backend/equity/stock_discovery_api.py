@@ -95,24 +95,28 @@ def alerts(search: str = Query("", max_length=80), direction: Literal[-1, 0, 1] 
 
 @router.get("/alert-view")
 def alert_view(source: Literal["SHADOW", "REPLAY", "LEGACY"] = "SHADOW", session_date: date | None = None,
-               view: Literal["latest", "history"] = "latest", run: str | None = Query(None, max_length=150),
+               view: Literal["latest", "history", "open"] = "latest", run: str | None = Query(None, max_length=150),
                search: str = Query("", max_length=80), direction: Annotated[int | None, Query(ge=-1, le=1)] = None,
                model: str | None = None, interval: str | None = None, status: str | None = None,
                lane: Literal["TRADE", "WATCH"] | None = None, sort: str | None = None, descending: bool = True,
-               offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=200)):
+               offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=200),
+               trade_type: Literal["INTRADAY", "SWING"] | None = None, combined: bool | None = None):
+    from psycopg2 import Error as DatabaseError
     from equity.stock_alert_views import attach_alert_context, current_history_prices, history_snapshot_for_date, load_alert_view
     from research.stock_alerts import alert_page
     try:
-        snapshot = load_alert_view(source)
+        snapshot = load_alert_view(source) if combined is None else load_alert_view(source, combined=combined)
         if view == "history":
             snapshot = history_snapshot_for_date(snapshot, str(session_date) if session_date else None)
             snapshot = current_history_prices(snapshot, str(session_date) if session_date else None)
-    except (ValueError, OSError) as error:
+        elif view == "open":
+            snapshot = current_history_prices(snapshot, view="open")
+    except (ValueError, OSError, DatabaseError) as error:
         raise HTTPException(status_code=503, detail="Retained alert source is unavailable or incompatible") from error
     try:
         page = alert_page(snapshot, session=str(session_date) if session_date else None, view=view, run=run,
             search=search, direction=direction, model=model, interval=interval, status=status, lane=lane,
-            sort=sort, descending=descending, offset=offset, limit=limit)
+            sort=sort, descending=descending, offset=offset, limit=limit, trade_type=trade_type)
         return attach_alert_context(page)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error

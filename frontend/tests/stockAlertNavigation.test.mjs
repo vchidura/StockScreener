@@ -8,7 +8,21 @@ const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.Modu
 const { resolveAlertRoute, alertSourceParams, alertTabParams, alertTradeFilters, alertSort } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`)
 const presentationSource = readFileSync(new URL('../src/pages/stockAlertPresentation.ts', import.meta.url), 'utf8')
 const presentation = ts.transpileModule(presentationSource, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } })
-const { alertColumnLayout, alertRiskAssessment, unavailableAlertProbability } = await import(`data:text/javascript;base64,${Buffer.from(presentation.outputText).toString('base64')}`)
+const { alertColumnLayout, alertPlanTiming, alertRiskAssessment, unavailableAlertProbability } = await import(`data:text/javascript;base64,${Buffer.from(presentation.outputText).toString('base64')}`)
+
+test('swing entry timeframe cannot be mistaken for an intraday holding cap', () => {
+  const row = { interval: '30m', confirmation_interval: '30m', lane: 'TRADE', trade_style: 'SWING', holding_sessions: 21, hold: '21 sessions' }
+  assert.deepEqual(alertPlanTiming(row), { style: 'Swing', interval: 'Swing / 1d setup / 30m confirmation', hold: '21 trading sessions' })
+  for (const holding_sessions of [5, 10]) assert.equal(alertPlanTiming({ ...row, holding_sessions }).hold, `${holding_sessions} trading sessions`)
+  assert.equal(alertPlanTiming({ ...row, holding_sessions: undefined, hold: '' }).hold, 'Unavailable')
+})
+
+test('existing intraday daily and watch holding labels are preserved', () => {
+  const intraday = { interval: '1h', lane: 'TRADE', hold: '120 min / close' }
+  assert.deepEqual(alertPlanTiming(intraday), { style: 'Intraday', interval: 'Intraday / 1h', hold: '120 min / close' })
+  assert.deepEqual(alertPlanTiming({ ...intraday, interval: '1d', hold: '10 sessions' }), { style: 'Swing', interval: 'Swing / 1d', hold: '10 sessions' })
+  assert.equal(alertPlanTiming({ ...intraday, lane: 'WATCH' }).hold, 'Watch only')
+})
 
 test('sidebar Latest Run stays shadow while Day History defaults to backtested data', () => {
   const latest = new URLSearchParams()
@@ -134,4 +148,14 @@ test('risk assessment quantifies both directions without inventing low risk or a
     assert.equal(invalid.label, 'Unavailable')
     assert.equal(invalid.stopDistance, null)
   }
+})
+
+test('open positions use forward results without a historical date or stale run filter', () => {
+  const current = new URLSearchParams('source=REPLAY&view=history&session_date=2026-08-18&run=old&status=CLOSED&trade_type=SWING&offset=100')
+  const open = alertTabParams(current, 'open')
+  assert.deepEqual(resolveAlertRoute(open), { source: 'SHADOW', view: 'open' })
+  assert.equal(open.get('trade_type'), 'SWING')
+  for (const key of ['session_date', 'run', 'offset', 'status']) assert.equal(open.has(key), false)
+  assert.deepEqual(resolveAlertRoute(new URLSearchParams('source=REPLAY&view=open')), { source: 'SHADOW', view: 'open' })
+  assert.equal(alertTabParams(open, 'latest', true).get('source'), 'SHADOW')
 })

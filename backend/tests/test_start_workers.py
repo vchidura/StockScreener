@@ -15,6 +15,9 @@ EQUITY = ["run_equity_worker.py", "run_corporate_action_worker.py", "run_stock_i
 OPTIONS = ["run_market_event_worker.py", "run_option_model_input_worker.py", "run_option_worker.py"]
 WORKERS = dict(zip(["Equity", "CorporateActions", "StockAlerts", "Portal", "Screening", "MarketEvents", "OptionInputs", "Options"], EQUITY + OPTIONS))
 WORKERS["AlertContext"] = "run_stock_alert_context_worker.py"
+WORKERS["MarketContext"] = "prepare_stock_alert_context.py"
+WORKERS["SwingAlerts"] = "run_stock_idea_worker.py"
+WORKERS["AlertResults"] = "project_stock_alert_results.py"
 
 
 def run_test_command(command, cwd):
@@ -76,12 +79,18 @@ def test_research_watcher_is_opt_in_and_never_enrolls():
 def test_single_worker_plan_starts_only_selected_entry_point(name, script, once):
     arguments = ["-Worker", name, "-NoNewWindow"] + (["-Once"] if once else [])
     result = preview(*arguments)
+    if name == "MarketContext" and once:
+        assert result.returncode != 0 and "continuous only" in result.stderr
+        assert ' -X utf8 -u ' not in result.stdout
+        return
     lines = worker_lines(result)
     assert len(lines) == 1 and script in lines[0]
-    assert ("--once" in lines[0]) == (once and name != "Portal")
-    assert ("--continuous" in lines[0]) == (not once and name == "Portal")
+    assert ("--once" in lines[0]) == (once and name not in ("Portal", "AlertResults"))
+    assert ("--continuous" in lines[0]) == (not once and name in ("Portal", "MarketContext", "AlertResults"))
     assert "--retry-window" not in lines[0] and "--enable-source-readiness" not in lines[0]
-    assert ("--quality-version 2" in lines[0]) == (name == "StockAlerts")
+    assert ("--quality-version 2" in lines[0]) == (name in ("StockAlerts", "SwingAlerts"))
+    assert ("--swing" in lines[0]) == (name == "SwingAlerts")
+    assert ("--activate-swing-shadow" in lines[0]) == (name == "SwingAlerts")
     assert "Dependencies are not started automatically" in result.stdout
 
 
@@ -147,7 +156,7 @@ def test_one_shot_duplicates_fail_and_do_not_publish_screening():
     assert "MOCK_START " not in result.stdout
 
 
-@pytest.mark.parametrize("name", ["MarketEvents", "Screening", "StockAlerts", "AlertContext"])
+@pytest.mark.parametrize("name", ["MarketEvents", "Screening", "StockAlerts", "AlertContext", "MarketContext", "AlertResults"])
 def test_single_worker_launch_and_duplicate_handling(name):
     result = mocked_start("-Worker", name)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -158,6 +167,45 @@ def test_single_worker_launch_and_duplicate_handling(name):
     assert "MOCK_START " not in duplicate.stdout
     once = mocked_start("-Worker", name, "-Once", running=[WORKERS[name]])
     assert once.returncode != 0 and "MOCK_START " not in once.stdout
+
+
+def test_market_context_keeps_reviewed_configuration_and_uses_a_separate_window(tmp_path):
+    scripts = tmp_path / "repo with spaces" / "backend" / "scripts"
+    scripts.mkdir(parents=True)
+    launcher = scripts / LAUNCHER.name
+    shutil.copyfile(LAUNCHER, launcher)
+    (scripts / WORKERS["MarketContext"]).touch()
+    result = mocked_start("-Worker", "MarketContext", running=EQUITY + [WORKERS["AlertContext"]], launcher=launcher)
+    assert result.returncode == 0, result.stdout + result.stderr
+    launches = [json.loads(line.removeprefix("MOCK_START ")) for line in result.stdout.splitlines() if line.startswith("MOCK_START ")]
+    assert len(launches) == 1
+    launch = launches[0]
+    assert launch["executable"] == "powershell.exe" and "-NoExit" in launch["arguments"]
+    assert launch["directory"] == str(scripts.parent.parent)
+    command = launch["arguments"][-1]
+    assert "WindowTitle = 'market-context-worker'" in command
+    for flag in ("--rotation-only", "--state-dir", "--split-review", "--publish-rotation-view", "--fetch-macro", "--continuous"):
+        assert f"'{flag}'" in command
+    for path in ("backups/equity-shadow/stock-ideas-forward-v2", "research/stock_sector_split_reviews.json"):
+        assert f"'{scripts.parent / path}'" in command
+    assert "--once" not in command and "--shadow-events" not in command
+
+
+@pytest.mark.parametrize("selection,other,same", [
+    ("SwingAlerts", "run_stock_idea_worker.py --quality-version 2", "run_stock_idea_worker.py --swing --activate-swing-shadow"),
+    ("StockAlerts", "run_stock_idea_worker.py --swing --activate-swing-shadow", "run_stock_idea_worker.py --quality-version 2"),
+])
+def test_swing_and_intraday_workers_are_independent_but_duplicate_modes_are_skipped(selection, other, same):
+    result = mocked_start("-Worker", selection, running=[other])
+    assert result.returncode == 0, result.stdout + result.stderr
+    launches = [json.loads(line.removeprefix("MOCK_START ")) for line in result.stdout.splitlines() if line.startswith("MOCK_START ")]
+    assert len(launches) == 1
+    assert ("'--swing'" in launches[0]["arguments"][-1]) == (selection == "SwingAlerts")
+    duplicate = mocked_start("-Worker", selection, running=[other, same])
+    assert duplicate.returncode == 0 and "already running" in duplicate.stdout and "MOCK_START " not in duplicate.stdout
+    once = mocked_start("-Worker", selection, "-Once", running=[same])
+    assert once.returncode != 0 and "MOCK_START " not in once.stdout
+    assert all("--swing" not in line for line in worker_lines(preview("-Only", "All")))
 
 
 def test_unenrolled_study_fails_before_starting_any_worker():

@@ -28,6 +28,7 @@ export interface RotationFact<Value> {
   input_sessions?: Array<string | null>
   input_market_times?: Array<string | null>
   action_review?: Array<{ type: string; effective_date: string; split_from?: number | null; split_to?: number | null; source?: string | null; revision_id: string }>
+  split_adjustments?: Array<{ action_revision_id: string; effective_date: string; price_factor: number; reviewed_at: string; review_sha256: string; evidence_url: string }>
   coverage?: Array<{ available: number | null; expected: number | null }>
   source_url?: string
   lineage_ref: string
@@ -52,6 +53,7 @@ export interface RotationValues {
   relative5: number
   relative20: number
   relative_change5: number
+  benchmark_return5?: number | null
   absolute_return5: number
   absolute_return20: number
   emerging_leadership: boolean
@@ -109,6 +111,8 @@ export interface BondComparisonView {
 
 export interface MarketConditionsResponse {
   status: string
+  price_basis?: string
+  split_review_sha256?: string | null
   session?: string
   as_of?: string
   capture_age_seconds?: number

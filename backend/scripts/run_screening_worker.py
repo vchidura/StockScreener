@@ -30,20 +30,39 @@ def manifest(payload):
     return dict({name: value for name, value in payload.items() if name not in {'rows', 'lineage', 'hourly_lineage'}}, source_generation=0)
 
 
+def approved_anchor_source(source, anchor, now):
+    source_id = str(source['publication_id']) if source else None
+    approval = (anchor or {}).get('partial_source_approval')
+    if not approval:
+        return source_id
+    if (approval.get('version') != 'screening_partial_source_approval_v1'
+            or approval.get('approval_sha256') != digest({key: value for key, value in approval.items() if key != 'approval_sha256'})
+            or datetime.fromisoformat(approval['approved_at']) > now
+            or approval['session'] != anchor['session'] or approval['source_publication_id'] != anchor['source_publication_id']
+            or approval['selected_members'] != anchor['source_selected_members'] or approval['expected_members'] != anchor['expected_members']
+            or approval['unavailable_members'] != anchor['source_unavailable_members']):
+        raise ValueError('Partial anchor approval does not match retained publication')
+    if source is None or source['market_time'] < datetime.fromisoformat(anchor['market_time']):
+        return anchor['source_publication_id']
+    return source_id
+
+
 def load_daily_anchor(now):
     with get_db_cursor() as cursor:
         cursor.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
         cursor.execute("SET LOCAL statement_timeout='15s'")
-        cursor.execute("""SELECT publication_id FROM equity_bar_publications
+        cursor.execute("""SELECT publication_id,market_time FROM equity_bar_publications
             WHERE interval='1d' AND session_scope='RTH' AND adjusted=FALSE AND status='COMPLETE'
             AND expected_members=selected_members AND market_time<=%s AND published_at<=%s AND created_at<=%s
             ORDER BY market_time DESC,published_at DESC,created_at DESC LIMIT 1""", (now, now, now))
         source = cursor.fetchone()
         cursor.execute("""SELECT payload FROM equity_portal_snapshots WHERE snapshot_type=%s
             AND NOT (source_manifest ? 'hourly_refresh_policy') AND generated_at<=%s
+            AND (source_manifest->>'source_publication_status' IS DISTINCT FROM 'DEGRADED' OR source_manifest ? 'partial_source_approval')
             ORDER BY source_manifest->>'session' DESC,generated_at DESC,snapshot_id LIMIT 1""", (SNAPSHOT_TYPE, now))
         anchor = cursor.fetchone()
-    return str(source['publication_id']) if source else None, anchor['payload'] if anchor else None
+    payload = anchor['payload'] if anchor else None
+    return approved_anchor_source(source, payload, now), payload
 
 
 def prepare_pair(anchor, now):

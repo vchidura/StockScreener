@@ -37,18 +37,24 @@ def publication_order(publication):
 
 def history_publications(snapshot, session):
     publications = snapshot.get("publications", [])
-    latest = max(publications, key=publication_order, default=None) if snapshot["source"] != "REPLAY" else None
+    latest_by_strategy = {}
+    if snapshot["source"] != "REPLAY":
+        for publication in sorted(publications, key=publication_order):
+            latest_by_strategy[publication.get("strategy_instance_id")] = publication["run_id"]
+    withheld = set(latest_by_strategy.values())
     return sorted((item for item in publications if item["session"] == session
-        and (latest is None or item["run_id"] != latest["run_id"])), key=publication_order)
+        and item["run_id"] not in withheld), key=publication_order)
 
 
 def alert_page(snapshot, *, session=None, view="latest", run=None, search="", direction=None,
                model=None, interval=None, status=None, lane=None, sort=None, descending=True,
-               offset=0, limit=100):
-    if view not in ("latest", "history"):
+               offset=0, limit=100, trade_type=None):
+    if view not in ("latest", "history", "open") or (view == "open" and snapshot["source"] != "SHADOW"):
         raise ValueError("unsupported alert view")
+    if trade_type not in (None, "INTRADAY", "SWING"):
+        raise ValueError("unsupported trade type")
     dates = snapshot.get("sessions", [])
-    if session and session not in dates:
+    if view != "open" and session and session not in dates:
         raise ValueError("session outside the retained 21-session navigation window")
     selected_date = session or (dates[-1] if dates else None)
     publications = sorted((item for item in snapshot.get("publications", []) if item["session"] == selected_date),
@@ -56,37 +62,55 @@ def alert_page(snapshot, *, session=None, view="latest", run=None, search="", di
     if run and not any(item["run_id"] == run for item in publications):
         raise ValueError("publication does not belong to selected session")
     selected_run = next((item for item in publications if item["run_id"] == run), None) if run else (publications[-1] if publications else None)
+    latest_by_strategy = {}
+    for publication in publications:
+        latest_by_strategy[publication.get("strategy_instance_id")] = publication
+    latest_runs = [selected_run] if run and selected_run else list(latest_by_strategy.values())
+    if snapshot.get("combined") and not run:
+        selected_run = None
     withheld_run = None
     if view == "history":
         previous = history_publications(snapshot, selected_date)
         retained_ids = {item["run_id"] for item in previous}
         withheld_run = next((item for item in publications if item["run_id"] not in retained_ids), None)
         publications = previous
-    eligible_runs = {item["run_id"] for item in publications} if view == "history" else ({selected_run["run_id"]} if selected_run else set())
+    eligible_runs = {item["run_id"] for item in publications} if view == "history" else {item["run_id"] for item in latest_runs}
     hit_windows = defaultdict(dict)
     if selected_date:
         hit_dates = set(session_dates(selected_date))
         for hit in snapshot.get("observations", []):
             if hit["session"] not in hit_dates or not hit["valid"]:
                 continue
-            key = (hit["security_id"], hit["direction"])
+            key = (hit.get("strategy_instance_id"), hit["security_id"], hit["direction"])
             window = hit_windows[key].setdefault(hit["run_id"], dict(at=hit["at"], models=set(), intervals=set()))
             window["models"].update(hit["models"])
             window["intervals"].update(hit["intervals"])
     rows = []
+    active_sides = defaultdict(set)
+    for item in snapshot.get("alerts", []):
+        if item["status"] in ("PENDING", "OPEN", "UNRESOLVED"):
+            active_sides[item["security_id"]].add(item["direction"])
     for original in snapshot.get("alerts", []):
-        if original["run_id"] not in eligible_runs:
+        if view == "open":
+            if original["status"] not in ("PENDING", "OPEN", "UNRESOLVED"):
+                continue
+        elif original["run_id"] not in eligible_runs:
             continue
+        style = original.get("trade_style") or ("SWING" if original["interval"] == "1d" else "INTRADAY")
         if (search and search.casefold() not in (original["ticker"] + " " + (original.get("company_name") or "")).casefold()
                 or direction is not None and original["direction"] != direction
                 or model and original["model"] != model or interval and original["interval"] != interval
-                or status and original["status"] != status or lane and original["lane"] != lane):
+                or status and original["status"] != status or lane and original["lane"] != lane
+                or trade_type and style != trade_type):
             continue
         row = dict(original)
+        if snapshot.get("combined"):
+            row["opposing_exposure"] = -row["direction"] in active_sides[row["security_id"]]
         row.update(price_return_fields(row))
-        windows = hit_windows[(row["security_id"], row["direction"])]
-        if view == "latest" and selected_run:
-            windows = {key: value for key, value in windows.items() if value["at"] <= selected_run["published_at"]}
+        windows = hit_windows[(row.get("strategy_instance_id"), row["security_id"], row["direction"])]
+        row_run = next((item for item in latest_runs if item["run_id"] == row["run_id"]), None)
+        if view == "latest" and row_run:
+            windows = {key: value for key, value in windows.items() if value["at"] <= row_run["published_at"]}
         details = sorted(windows.values(), key=lambda item: item["at"])
         row.update(hits=len(windows) if snapshot.get("hit_coverage") else None,
             first_seen=details[0]["at"] if details else None, last_seen=details[-1]["at"] if details else None,
@@ -115,6 +139,8 @@ def alert_page(snapshot, *, session=None, view="latest", run=None, search="", di
         withheld_run=withheld_run, sort=sort, descending=descending,
         total=len(rows), rows=(present + missing)[offset:offset + limit], offset=offset, limit=limit,
         counts=counts, hit_coverage=snapshot.get("hit_coverage"), warnings=snapshot.get("warnings", []),
+        combined=snapshot.get("combined", False), strategy_streams=snapshot.get("strategy_streams", []),
+        latest_runs=latest_runs, trade_type=trade_type,
         next_publication_at=snapshot.get("next_publication_at"),
         publication_mode=snapshot.get("publication_mode"), publication_window_start=snapshot.get("publication_window_start"),
         publication_deadline=snapshot.get("publication_deadline"),
@@ -218,6 +244,7 @@ def replay_snapshot(publications, config, source_cutoff, source_id):
             model = candidate["model"]
             interval = candidate["interval"]
             horizon = config["models"][model]
+            swing = position.get("swing_evidence")
             warnings = ["Paper only", "Stop gaps can exceed planned risk", "Action coverage not certified"]
             if candidate["direction"] == -1:
                 warnings.append("Short borrow unverified")
@@ -233,7 +260,7 @@ def replay_snapshot(publications, config, source_cutoff, source_id):
                 entry_price=position.get("entry_price"), entry_at=position.get("entry_at"), stop=candidate["stop"], target=candidate["target"],
                 **risk_fields(candidate["price"], candidate["stop"], candidate["target"], candidate["direction"]),
                 entry_risk=risk_fields(position.get("entry_price"), candidate["stop"], candidate["target"], candidate["direction"]),
-                hold=f"{horizon['daily_horizon_sessions']} sessions" if interval == "1d" else f"{horizon['time_cap_minutes']} min / close",
+                hold=f"{horizon['daily_horizon_sessions']} sessions" if interval == "1d" or swing else f"{horizon['time_cap_minutes']} min / close",
                 exit_due_at=position.get("planned_exit_at"), status=state, reason=position.get("reason"),
                 exit_at=position.get("exit_at"), exit_price=position.get("exit_price"), paper_return=net,
                 mark_price=position.get("mark_price"), mark_at=position.get("mark_at"), latest_price=None, latest_price_at=None,
@@ -242,6 +269,13 @@ def replay_snapshot(publications, config, source_cutoff, source_id):
                     extension_atr=candidate["extension"]), indicator_at=candidate["trigger_at"], indicator_interval=interval,
                 daily_context_at=None, indicator_status="RETAINED_CANDIDATE_FIELDS", warnings=warnings,
                 policy_version=candidate["policy_version"]))
+            if swing:
+                alerts[-1].update(trade_style="SWING", setup_interval="1d", confirmation_interval=interval,
+                    daily_setup_at=swing["daily_setup"]["trigger_at"], daily_setup_id=swing["daily_episode_id"],
+                    holding_sessions=swing["holding_sessions"], holding_count="ENTRY_SESSION_IS_SESSION_ONE",
+                    indicator_at=swing["daily_setup"]["trigger_at"], indicator_interval="1d",
+                    daily_context_at=swing["daily_setup"]["trigger_at"], indicator_status="FROZEN_DAILY_SETUP_FIELDS")
+                alerts[-1]["indicators"]["atr_pct"] = swing["daily_setup"]["activation_atr"] / swing["daily_setup"]["price"]
     return dict(schema=SCHEMA, source="REPLAY", source_id=source_id, source_label="Historical replay / covered universe",
         status="READY", as_of=source_cutoff, sessions=session_dates(config["end"]), publications=records, alerts=alerts,
         observations=observations, hit_coverage="Retained valid candidate windows only; no pre-pilot observation history",

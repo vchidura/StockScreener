@@ -18,7 +18,7 @@ from research.paper_tracker import PaperLedger, check_current_inputs, freeze_man
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", type=Path, default=BACKEND_DIR / "backups" / "equity-paper" / "ridge_forward_v1")
-    parser.add_argument("--source", type=Path, default=BACKEND_DIR.parent / "docs" / "equity_ridge_challenger_results.json")
+    parser.add_argument("--source", type=Path, default=BACKEND_DIR / "research/inputs/equity_ridge_challenger_results.json")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--enroll", action="store_true")
     mode.add_argument("--once", action="store_true")

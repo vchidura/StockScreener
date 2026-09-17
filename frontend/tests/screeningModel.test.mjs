@@ -8,6 +8,17 @@ const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.Modu
 const model = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`)
 const catalog = { fields: { price: { type: 'number', unit: 'USD', label: 'Close' }, change: { type: 'number', unit: 'fraction', label: 'Change' }, instrument_type: { type: 'category', options: ['CS', 'ETF', 'ETV'] } }, patterns: { doji: { direction: 0 } } }
 
+test('partial daily coverage identifies missing source members without changing the universe', () => {
+  const generation = { session: '2026-09-16', expected_members: 386, source_selected_members: 385,
+    source_publication_status: 'DEGRADED', source_unavailable_members: [{ ticker: 'OKE', security_id: 'oke', status: 'MISSING' }] }
+  const original = structuredClone(generation)
+  assert.equal(model.dailyCoverageNotice(generation), 'Partial daily coverage (2026-09-16): 385 / 386 source members available. OKE unavailable.')
+  assert.deepEqual(generation, original)
+  assert.equal(model.dailyCoverageNotice({ ...generation, source_publication_status: 'COMPLETE' }), null)
+  assert.equal(model.dailyCoverageNotice(undefined), null)
+  assert.match(model.dailyCoverageNotice({ ...generation, source_selected_members: undefined }), /Unknown \/ 386/)
+})
+
 test('draft zero, empty, percent units and inclusive ranges remain distinct', () => {
   const draft = model.emptyDraft()
   draft.fields.change = { min: '0', max: '5', values: [] }

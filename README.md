@@ -24,8 +24,21 @@ bars, reproducible analysis evidence, and worker-published scanner views.
 
 See [Equity Materialization Design](docs/EQUITY_ANALYSIS_MATERIALIZATION_DESIGN.md)
 and [Option Chain Scanner Design](docs/OPTION_CHAIN_SCANNER_DESIGN.md) for system
-design. The authoritative setup and production runbook is
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+design when the local documentation archive is present. The local production
+runbook is [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md); the startup commands below
+remain in the tracked README.
+
+## Local Documentation And Research Inputs
+
+The root `docs/` directory is local-only and ignored by Git, including existing
+research reports and operator notes. Untracking it does not delete local files.
+Documentation links into that directory require the local archive; a fresh checkout
+does not include it. Runtime and test dependencies are retained under
+`backend/research/inputs/`, with exact frozen bytes protected by Git attributes.
+The reviewed ETF split configuration remains tracked separately at
+[backend/research/stock_sector_split_reviews.json](backend/research/stock_sector_split_reviews.json).
+Backups, source ledgers, database files and worker-generated views remain ignored
+and must not be treated as disposable cleanup artifacts.
 
 ## Prerequisites
 
@@ -193,7 +206,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 Append `-Plan` to preview any one command without launching it. Append
 `-NoNewWindow` to run a **single** selected worker in the current terminal (use a
 different terminal per resident worker). Append `-Once` for a single cycle;
-the launcher supplies the appropriate entry-point flags automatically.
+the launcher supplies the appropriate entry-point flags automatically, except
+MarketContext, which is continuous-only through this launcher.
 
 The provider-free alert-context annotator is an additional **opt-in** worker,
 excluded from the default All/Equity sets:
@@ -224,6 +238,113 @@ facts are pinned to a verified archived snapshot completed before the original c
 with matching session/universe and stock identity. Old alert context is never replaced.
 See [progression results](docs/STOCK_ALERT_CONTEXT_ENHANCEMENT_DESIGN.md#context-progression-milestone)
 for remaining coverage gaps and the prerequisites for any live gate proposal.
+
+The separately approved Market Conditions split basis is opt-in via
+`prepare_stock_alert_context.py --rotation-only --split-review backend/research/stock_sector_split_reviews.json`.
+The four exact issuer-reviewed ETF actions adjust copied context history only;
+raw bars and alert plans are untouched, and unreviewed actions still block.
+The approved continuous refresher retains its prior state directory, publish and
+FRED arguments with this flag added. See [reviewed split results](docs/STOCK_ALERT_CONTEXT_ENHANCEMENT_DESIGN.md#reviewed-sector-split-milestone)
+for the12/12coverage check and still-pending prospective/disjoint evaluation.
+
+Start this refresher independently in its own `market-context-worker` PowerShell
+window, without restarting any already-running worker group:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Worker MarketContext
+```
+
+This opt-in entry retains `--rotation-only`, the original v2 state directory,
+the pinned split review, `--publish-rotation-view --fetch-macro --continuous`.
+It is excluded from default `All`/`Equity` sets and does not start dependencies
+or the separate AlertContext annotator. An existing preparation script is skipped,
+including one already running through the **Watch stored market conditions** task.
+It does not transfer or restart that process. Append `-Plan` for a no-side-effect
+preview or `-NoNewWindow` to run in the calling terminal. `-Once` is rejected;
+use the bounded capture CLI with an explicit new output for one-shot work.
+The **Start standalone market context worker** VS Code task calls this same entry.
+
+The daily-owned swing alert policy is a separate, inactive-by-default experiment:
+
+```powershell
+.\backend\.venv\Scripts\python.exe backend/scripts/run_stock_idea_worker.py --swing --plan
+```
+
+A completed daily trigger owns its original stop, target, ATR and maximum holding
+period: reversal5, acceptance10, resumption21 **trading sessions**, with the entry
+session counting as one. Same-model, same-direction 30m or hourly confirmation is
+required in the next trading session; it times entry without replacing the daily
+bracket. Missed daily publications cannot seed setups. Missing/invalid preconfirmation
+bars, bracket breaches, identity/action risk, late signals and no remaining entry
+slot fail closed. Stops/targets remain active overnight, including gap losses.
+
+`--swing` ignores `STOCK_ALERT_SHADOW_VIEW` and uses the separate
+`backend/backups/equity-shadow/stock-ideas-swing-v1` store/view. It cannot reuse the
+v1/v2 default stores and is not started by the default worker groups. Actual writer
+execution additionally requires `--activate-swing-shadow`; no activation or reader
+cutover is performed by preview. Starting this experiment enrolls a new dated cohort,
+not a retroactive clone of old alerts or their recovery overlays. Existing plans and
+closed/no-fill outcomes retain their original policies. The shared results reader
+below presents both streams without merging their checkpoints. Prospective collection
+and disjoint outcome evaluation are still required; this is not a qualified strategy.
+
+After explicit activation approval, start only the swing worker in its own window:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Worker SwingAlerts
+.\backend\.venv\Scripts\python.exe backend/scripts/run_stock_idea_worker.py --swing --status
+```
+
+`-Worker SwingAlerts` explicitly supplies `--swing --activate-swing-shadow` and
+opens `stock-swing-shadow-worker`; it is excluded from the default All/Equity groups.
+Duplicate checks distinguish swing and intraday modes, so the two can run independently.
+`-Plan` remains side-effect free. A separately approved exact-identity quarantine
+can use the normal quarantine flags together with the swing activation flags;
+it preserves the enrollment and existing records, taking effect only at a future
+boundary. Read-only `--swing --check-readiness` may report an identity-exclusion
+diagnostic, but never activates one. The existing annotator retains its original
+source; absent swing context remains explicitly unavailable.
+
+### Combined Alert Results
+
+The Stock Alerts page now reads a shared PostgreSQL results repository for forward
+results. Both workers keep their separate SQLite checkpoints, policy manifests,
+enrollments, risk rules and positions. The results-only projector checks each stream
+every60seconds, with an independent lock and no source-ledger writes or provider calls.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Worker AlertResults
+```
+
+This opens `stock-alert-results-projector` separately; it is opt-in, not part of
+All/Equity, and does not start or restart strategy workers. Durable status is at
+`backend/backups/stock-alert-results/projector-status.json`; API stream statuses
+show independent source and import timestamps, errors and projector staleness.
+
+- Trade type: All / Intraday / Swing. Plan IDs, original policies and outcomes
+  stay distinct even for the same stock, direction or publication timestamp.
+- Latest Run selects the latest publication per strategy, including empty/missed
+  publications; it never falls back to an older nonempty run. Day History excludes
+  each strategy's latest publication and combines the remaining selected-session rows.
+- Open Positions includes pending/open/unresolved plans outside the21-session date
+  navigator. Sorting/pagination are global; recurrence remains strategy-specific.
+- Opposing exposure is an annotation, not netting or a new selection gate. Returns
+  are per-plan, not a combined portfolio return. Replay/legacy remain explicit sources.
+- Publications/plans/context are immutable; row/mark updates are append-only revisions.
+  Known entry/exit clocks and settled outcomes cannot be rewritten. Imports retain
+  source payloads and hashes; corrupt/missing streams do not erase other results.
+
+Deploy schema042 with the existing `apply_incremental_migration.py` administrator
+runner. `project_stock_alert_results.py --verify` imports and reconciles both streams,
+then repeats the import to check idempotency. Add `--publish-reader` only for an
+approved cutover after successful reconciliation. `--check-storage` tests database
+immutability guards in rolled-back transactions. GET never imports or detects.
+The activation marker is `backend/backups/stock-alert-results/reader.json`.
+`?combined=false` explicitly reads the original intraday snapshot for comparison;
+an approved rollback removes that marker without deleting shared or original evidence.
 
 `-Worker Equity` means ingestion only, unlike `-Only Equity`, which starts all
 five equity-side workers. A single-worker launch does **not** start dependencies:
@@ -298,6 +419,30 @@ to 60 (minimum 15). The worker uses advisory leadership and an idempotent daily/
 pair key; no duplicate snapshots are written on idle polls. It performs no provider
 backfill or research/alert-engine work. Delayed or missing source data stays stale
 or UNKNOWN, including corporate actions between the daily and hourly dates.
+
+An explicitly approved partial daily anchor can be published for one session without
+relaxing the worker's general complete-source requirement. The approval binds the
+source publication, session, selected count and unavailable identities. Missing
+members remain in the universe as UNKNOWN, never assigned substitute prices.
+The worker can refresh hourly context against this exact anchor until a complete
+source for the same or a later session becomes available. Other degraded sessions
+are not automatically approved.
+
+September 16, 2026 was approved with385available of386members and OKE unavailable:
+
+```powershell
+.\backend\.venv\Scripts\python.exe backend/scripts/prepare_stock_screening.py `
+  --session 2026-09-16 --allow-degraded --approve-partial-current `
+  --expected-unavailable OKE --expected-selected 385
+```
+
+The command above measures without writing. Adding `--publish` creates and promotes
+the approved anchor; it is a one-time operator action, not a routine restart command.
+Historical `--session --allow-degraded --publish` without the explicit approval flag
+still never promotes a current pointer. Only Screening was reloaded for this change;
+original source publications, all280prior snapshots and other workers were retained.
+The page displays partial source coverage separately from freshness and field-level
+availability. Current session does not imply all indicators are available.
 
 The original [prepare_stock_screening.py](backend/scripts/prepare_stock_screening.py)
 remains available for explicit daily rebuilds and bounded historical work. Normal

@@ -12,6 +12,7 @@ import pandas as pd
 VERSION = "stock_alert_context_v1"
 READINESS_VERSION = "stock_alert_context_readiness_v1"
 DAILY_SAMPLES = 253
+SPLIT_PRICE_BASIS = "REVIEWED_SPLIT_ADJUSTED_PRICE_V1"
 
 
 def utc(value):
@@ -78,7 +79,49 @@ def financial_context(reports, security_id, reference, cutoff):
     return result
 
 
-def daily_price_context(bars, security_id, session, cutoff, actions=(), *, include_history=False, expected_ticker=None):
+def reviewed_split_history(ordered, actions, reviews, cutoff):
+    from research.stock_idea_engine import digest
+    reviewed, slots = [], set()
+    for action in actions:
+        slot = (str(action["security_id"]), str(action["effective_date"]))
+        if action["action_type"] != "SPLIT" or slot in slots:
+            raise ValueError("unreviewed or ambiguous corporate action")
+        slots.add(slot)
+        matches = [review for review in reviews if review.get("action_revision_id") == str(action["revision_id"])]
+        if len(matches) != 1:
+            raise ValueError("exact split review required")
+        review = matches[0]
+        if (review.get("status") != "REVIEWED" or not review.get("evidence_url")
+            or len(review.get("evidence_sha256", "")) != 64
+            or utc(review["evidence_observed_at"]) > utc(review["reviewed_at"])
+            or max(utc(action[field]) for field in ("first_observed_at", "created_at")) > utc(review["reviewed_at"])
+                or utc(review["reviewed_at"]) > cutoff or not action.get("payload_sha256")
+                or review.get("action_payload_sha256") != action["payload_sha256"]
+                or str(review.get("security_id")) != str(action["security_id"])
+                or review.get("ticker") != ordered[-1]["ticker"] or action.get("ticker") != review["ticker"]
+                or str(review.get("effective_date")) != str(action["effective_date"])):
+            raise ValueError("split review identity, evidence or availability mismatch")
+        before, after = float(action["split_from"]), float(action["split_to"])
+        if (not all(math.isfinite(value) and value > 0 for value in (before, after))
+                or before != float(review["split_from"]) or after != float(review["split_to"])):
+            raise ValueError("invalid split terms")
+        reviewed.append((action, review, before / after))
+    adjusted = []
+    for bar in ordered:
+        if bar.get("adjusted", False) or bar.get("context_split_factor", 1) != 1:
+            raise ValueError("source bars must remain unadjusted")
+        factor = math.prod(ratio for action, _, ratio in reviewed if bar["session"] < str(action["effective_date"]))
+        transformed = dict(bar, **{field: float(bar[field]) * factor for field in ("open", "high", "low", "close")},
+            volume=float(bar["volume"]) / factor, context_split_factor=factor)
+        if not all(math.isfinite(transformed[field]) for field in ("open", "high", "low", "close", "volume")):
+            raise ValueError("split adjustment is not finite")
+        adjusted.append(transformed)
+    return adjusted, [dict(action_revision_id=str(action["revision_id"]), effective_date=str(action["effective_date"]),
+        price_factor=ratio, reviewed_at=review["reviewed_at"], review_sha256=digest(review),
+        evidence_url=review["evidence_url"]) for action, review, ratio in reviewed]
+
+
+def daily_price_context(bars, security_id, session, cutoff, actions=(), *, include_history=False, expected_ticker=None, split_reviews=None):
     cutoff = utc(cutoff)
     calendar = exchange_calendars.get_calendar("XNYS")
     ending = calendar.date_to_session(session, direction="previous")
@@ -101,7 +144,8 @@ def daily_price_context(bars, security_id, session, cutoff, actions=(), *, inclu
     ordered = [timely[item][1] for item in expected if item in timely]
     result = observation("INSUFFICIENT_HISTORY", "MISSING_EXPECTED_DAILY_HISTORY", expected_observations=DAILY_SAMPLES,
         stored_observations=len(stored), timely_observations=len(ordered), late_revisions=late,
-        coverage_fraction=len(ordered) / DAILY_SAMPLES, session=str(ending.date()), price_basis="RAW_ACTION_GATED")
+        coverage_fraction=len(ordered) / DAILY_SAMPLES, session=str(ending.date()),
+        price_basis="RAW_ACTION_GATED" if split_reviews is None else SPLIT_PRICE_BASIS)
     if ordered:
         result.update(market_time=ordered[-1]["bar_end"], observed_at=max(utc(bar["system_observed_at"]) for bar in ordered).isoformat(),
             created_at=max(utc(bar["created_at"]) for bar in ordered).isoformat(),
@@ -113,6 +157,7 @@ def daily_price_context(bars, security_id, session, cutoff, actions=(), *, inclu
         prices = [bar[key] for key in ("open", "high", "low", "close")]
         session_open, session_close = calendar.session_open(bar["session"]), calendar.session_close(bar["session"])
         if (any(not math.isfinite(value) or value <= 0 for value in prices) or not math.isfinite(bar["volume"]) or bar["volume"] < 0
+            or (split_reviews is not None and (bar.get("adjusted", False) or bar.get("context_split_factor", 1) != 1))
                 or bar["high"] < max(prices) or bar["low"] > min(prices)
                 or utc(bar["bar_start"]) != session_open or utc(bar["bar_end"]) != session_close):
             return result | dict(status="UNAVAILABLE", reason_codes=["INVALID_DAILY_BAR"])
@@ -122,7 +167,18 @@ def daily_price_context(bars, security_id, session, cutoff, actions=(), *, inclu
         and action["action_type"] in ("SPLIT", "MERGER", "SPINOFF", "SYMBOL_CHANGE")
         and expected[0] < str(action["effective_date"]) <= expected[-1]
         and max(utc(action["first_observed_at"]), utc(action["created_at"])) <= cutoff]
-    if relevant:
+    if relevant and split_reviews is not None:
+        try:
+            ordered, adjustments = reviewed_split_history(ordered, relevant, split_reviews, cutoff)
+        except (ValueError, KeyError, TypeError, OverflowError, ZeroDivisionError):
+            return result | dict(status="UNAVAILABLE", reason_codes=["SPLIT_REVIEW_REQUIRED_OR_INVALID"],
+                action_revision_ids=[str(action["revision_id"]) for action in relevant])
+        result.update(split_adjustments=adjustments, adjustment_anchor_session=str(ending.date()),
+            available_at=max([utc(result["available_at"])] + [utc(item["reviewed_at"]) for item in adjustments]
+                + [utc(action[field]) for action in relevant for field in ("first_observed_at", "created_at")]).isoformat(),
+            source_revision_ids=sorted(set(result["source_revision_ids"] + [str(action["revision_id"]) for action in relevant]
+                + ["split-review:" + item["review_sha256"] for item in adjustments])))
+    elif relevant:
         return result | dict(status="UNAVAILABLE", reason_codes=["CORPORATE_ACTION_REVIEW"],
             action_revision_ids=[str(action["revision_id"]) for action in relevant],
             action_review=[dict(type=action["action_type"], effective_date=str(action["effective_date"]),

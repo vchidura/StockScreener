@@ -725,6 +725,51 @@ def test_missing_source_member_is_retained_as_unknown_not_filled_from_other_bars
     assert evaluate(projected, Predicate())[0] == "UNKNOWN"
 
 
+def partial_anchor_fixture():
+    from datetime import datetime, timezone
+    from scripts.prepare_stock_screening import approve_partial_source
+    missing = dict(security_id="oke", ticker="OKE", status="MISSING")
+    payload = dict(session="2026-09-16", market_time="2026-09-16T20:00:00+00:00", source_publication_id="partial-source",
+        source_publication_status="DEGRADED", source_selected_members=385, expected_members=386,
+        source_unavailable_members=[missing], generation="original",
+        rows=[dict(security_id="oke", eligible=False, source_bar_id=None, values=dict(price=None))])
+    return approve_partial_source(payload, ["OKE"], 385, datetime(2026, 9, 17, 17, tzinfo=timezone.utc))
+
+
+def test_partial_current_approval_keeps_unknown_member_and_does_not_approve_other_coverage():
+    from copy import deepcopy
+    from datetime import datetime, timezone
+    from scripts.prepare_stock_screening import approve_partial_source
+    anchor = partial_anchor_fixture()
+    original = deepcopy(anchor)
+    for changes in (dict(source_selected_members=384), dict(source_unavailable_members=[]), dict(source_publication_status="COMPLETE"),
+                    dict(rows=[dict(security_id="oke", eligible=True, source_bar_id="wrong", values=dict(price=10.))])):
+        with pytest.raises(ValueError):
+            approve_partial_source(anchor | changes, ["OKE"], 385, datetime(2026, 9, 17, 17, tzinfo=timezone.utc))
+    assert anchor == original and anchor["rows"][0]["values"]["price"] is None
+
+
+def test_worker_uses_only_exact_approved_partial_anchor_until_a_complete_newer_source():
+    from copy import deepcopy
+    from datetime import datetime, timezone
+    from scripts.run_screening_worker import approved_anchor_source
+    anchor = partial_anchor_fixture()
+    now = datetime(2026, 9, 17, 18, tzinfo=timezone.utc)
+    old = dict(publication_id="old", market_time=datetime(2026, 9, 15, 20, tzinfo=timezone.utc))
+    assert approved_anchor_source(old, anchor, now) == "partial-source"
+    assert approved_anchor_source(None, anchor, now) == "partial-source"
+    assert approved_anchor_source(old | dict(publication_id="complete", market_time=datetime(2026, 9, 16, 20, tzinfo=timezone.utc)), anchor, now) == "complete"
+    unapproved = {key: value for key, value in anchor.items() if key != "partial_source_approval"}
+    assert approved_anchor_source(old, unapproved, now) == "old"
+    for changes in (dict(session="2026-09-17"), dict(source_publication_id="other"), dict(source_unavailable_members=[])):
+        with pytest.raises(ValueError):
+            approved_anchor_source(old, anchor | changes, now)
+    tampered = deepcopy(anchor)
+    tampered["partial_source_approval"]["selected_members"] = 384
+    with pytest.raises(ValueError):
+        approved_anchor_source(old, tampered, now)
+
+
 def test_source_membership_requires_every_expected_member_and_consistent_selected_ids():
     from equity.screening_projection import validate_publication_members
     publication = dict(expected_members=2, selected_members=1)

@@ -225,7 +225,7 @@ def test_identity_review_enforces_read_only_and_cannot_certify_empty_data(monkey
 
 @pytest.fixture
 def transition_inputs():
-    manifest = json.loads((Path(__file__).resolve().parents[2] / "docs" / "equity_doc_peak_transition.json").read_text())
+    manifest = json.loads((Path(__file__).resolve().parents[2] / "backend/research/inputs/equity_doc_peak_transition.json").read_text())
     change = manifest["symbol_change"]
     references = [{"ticker": ticker, "type": "CS", "active": True,
                    "cik": change["cik"] if ticker == "PEAK" else manifest["merger"]["predecessor_cik"],

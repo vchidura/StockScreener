@@ -259,7 +259,7 @@ def run_report(config_path, output_path=None, *, batch_dir=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=BACKEND_DIR.parent / "docs" / "equity_signal_scorecard_config.json")
+    parser.add_argument("--config", type=Path, default=BACKEND_DIR / "research/inputs/equity_signal_scorecard_config.json")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--batch-dir", type=Path)
     parser.add_argument("--no-write", action="store_true")

@@ -15,6 +15,8 @@
 
         -Only Equity selects the first five; -Only Options selects the last three.
         -Worker selects one resident worker without starting its dependencies.
+        -Worker MarketContext starts the reviewed Market Conditions refresher in
+        its own window; context workers are excluded from default worker sets.
         -Plan prints the selected commands without starting processes or contacting
         providers/the database. -Once executes sequentially and aggregates failures.
         -NoNewWindow requires -Once or a single -Worker selection.
@@ -39,7 +41,7 @@ param(
     [ValidateSet("All", "Equity", "Options")]
     [string]$Only = "All",
 
-    [ValidateSet("Equity", "CorporateActions", "StockAlerts", "AlertContext", "Portal", "Screening", "MarketEvents", "OptionInputs", "Options")]
+    [ValidateSet("Equity", "CorporateActions", "StockAlerts", "SwingAlerts", "AlertResults", "AlertContext", "MarketContext", "Portal", "Screening", "MarketEvents", "OptionInputs", "Options")]
     [string]$Worker,
 
     [switch]$Once,
@@ -67,7 +69,10 @@ $workerScripts = @{
     Equity = "run_equity_worker.py"
     CorporateActions = "run_corporate_action_worker.py"
     StockAlerts = "run_stock_idea_worker.py"
+    SwingAlerts = "run_stock_idea_worker.py"
+    AlertResults = "project_stock_alert_results.py"
     AlertContext = "run_stock_alert_context_worker.py"
+    MarketContext = "prepare_stock_alert_context.py"
     Portal = "refresh_equity_portal_snapshots.py"
     Screening = "run_screening_worker.py"
     MarketEvents = "run_market_event_worker.py"
@@ -83,6 +88,9 @@ if ($Worker -and $PSBoundParameters.ContainsKey("Only")) {
 }
 if ($ShadowEvents -and $Worker -ne "AlertContext") {
     throw "-ShadowEvents requires -Worker AlertContext and never enables a live gate"
+}
+if ($Once -and $Worker -eq "MarketContext") {
+    throw "-Worker MarketContext is continuous only; use the bounded context capture CLI with a new --output for one-shot work"
 }
 if ($Worker -and ($IncludePaperStudy -or $PublishScreening)) {
     throw "-Worker cannot be combined with -IncludePaperStudy or -PublishScreening"
@@ -109,10 +117,14 @@ if ($IncludePaperStudy -and -not $Plan) {
 $running = if ($Plan) { @() } else { Get-CimInstance Win32_Process -Filter "Name like '%python%'" -ErrorAction SilentlyContinue }
 
 function Test-AlreadyRunning {
-    param([string]$ScriptName)
+    param([string]$ScriptName, [string[]]$Arguments = @())
     $match = $running | Where-Object { $_.CommandLine -and $_.CommandLine -like "*$ScriptName*" }
+    if ($ScriptName -eq "run_stock_idea_worker.py") {
+        $swing = $Arguments -contains "--swing"
+        $match = $match | Where-Object { ($_.CommandLine -match '(^|\s)"?--swing"?(?=\s|$)') -eq $swing }
+    }
     if ($match) {
-        Write-Warning ("{0} already running (PID {1}); skipping." -f $ScriptName, $match.ProcessId)
+        Write-Warning ("{0} already running (PID {1}); skipping." -f $ScriptName, ($match.ProcessId -join ', '))
         return $true
     }
     return $false
@@ -135,7 +147,7 @@ function Start-Worker {
         Write-Output ("{0}: `"{1}`" -X utf8 -u `"{2}`" {3}" -f $Title, $python, $scriptPath, ($Arguments -join ' '))
         return
     }
-    if (Test-AlreadyRunning -ScriptName $ScriptName) {
+    if (Test-AlreadyRunning -ScriptName $ScriptName -Arguments $Arguments) {
         if ($Once) { throw "$Title was not run; stop the existing worker before a one-shot recovery" }
         return
     }
@@ -186,6 +198,23 @@ if ($RepairSessions -gt 0) {
     $equityArgs += @("--repair-sessions", $RepairSessions.ToString())
 }
 
+if ($Worker -eq "MarketContext") {
+    $marketContextArgs = @(
+        "--rotation-only",
+        "--state-dir", (Join-Path $repoRoot "backend\backups\equity-shadow\stock-ideas-forward-v2"),
+        "--split-review", (Join-Path $repoRoot "backend\research\stock_sector_split_reviews.json"),
+        "--publish-rotation-view", "--fetch-macro", "--continuous"
+    )
+    Start-Worker -Title "market-context-worker" `
+        -ScriptName "prepare_stock_alert_context.py" -Arguments $marketContextArgs
+}
+
+if ($Worker -eq "AlertResults") {
+    $resultArgs = if ($Once) { @("--verify") } else { @("--continuous") }
+    Start-Worker -Title "stock-alert-results-projector" `
+        -ScriptName "project_stock_alert_results.py" -Arguments $resultArgs -Wait:$Once
+}
+
 if ($Worker -eq "AlertContext") {
     $contextArgs = @()
     if ($ShadowEvents) { $contextArgs += "--shadow-events" }
@@ -204,7 +233,13 @@ if ($Worker -eq "AlertContext") {
     }
 }
 
-if ($Only -in @("All", "Equity")) {
+if ($Worker -eq "SwingAlerts") {
+    $swingArgs = @("--quality-version", "2", "--swing", "--activate-swing-shadow") + $modeArgs
+    Start-Worker -Title "stock-swing-shadow-worker" `
+        -ScriptName "run_stock_idea_worker.py" -Arguments $swingArgs -Wait:$Once
+}
+
+if ($Worker -ne "SwingAlerts" -and $Only -in @("All", "Equity")) {
     if ($Once) {
         Invoke-OneShotWorker -Title "equity-worker" `
             -ScriptName "run_equity_worker.py" -Arguments $equityArgs
@@ -321,7 +356,10 @@ if ($Worker) {
     switch ($Worker) {
         "Equity" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_equity_materialization.py --coverage-report" }
         "StockAlerts" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_stock_idea_worker.py --status" }
+        "SwingAlerts" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_stock_idea_worker.py --swing --status" }
+        "AlertResults" { Write-Output "  Inspect stock-alert-results-projector and GET /api/stocks/alert-view?combined=true for independent stream freshness." }
         "AlertContext" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_stock_alert_context_worker.py --status" }
+        "MarketContext" { Write-Output "  Inspect market-context-worker for WAITING_FOR_NEXT_SOURCE_WINDOW or a verified capture; GET /api/stocks/market-conditions for source dates and coverage." }
         "Screening" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_screening_worker.py --status" }
         "Options" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_option_pipeline.py --status" }
         default { Write-Output "  Inspect the selected worker's console for a successful refresh or an error." }

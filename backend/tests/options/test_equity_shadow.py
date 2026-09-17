@@ -169,7 +169,7 @@ def test_readonly_report_handles_no_candidates_without_touching_workers(monkeypa
     manager = MagicMock()
     manager.__enter__.return_value = cursor
     monkeypatch.setattr(script, "get_db_cursor", lambda: manager)
-    config_path = Path(__file__).resolve().parents[3] / "docs" / "option_equity_shadow_config.json"
+    config_path = Path(__file__).resolve().parents[3] / "backend/research/inputs/option_equity_shadow_config.json"
     output = tmp_path / "report.json"
     result = script.run_report(config_path, output)
     assert result["raw_candidate_rows"] == 0 and result["summaries"] == []
@@ -184,7 +184,7 @@ def test_report_retains_long_horizon_and_reduces_repeats_before_row_limit():
     import json
     from pathlib import Path
     from scripts.report_option_equity_shadow import SQL_CANDIDATES
-    config = json.loads((Path(__file__).resolve().parents[3] / "docs" / "option_equity_shadow_config.json").read_text())
+    config = json.loads((Path(__file__).resolve().parents[3] / "backend/research/inputs/option_equity_shadow_config.json").read_text())
     target = horizon_exit(clock(11), 21)
     assert target - timedelta(days=config["lookback_calendar_days"]) < clock(11)
     assert target - timedelta(days=30) > clock(11)

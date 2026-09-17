@@ -12,10 +12,14 @@ from database import get_db_cursor
 from research.stock_alerts import SCHEMA, empty_snapshot, history_publications, load_snapshot, session_dates
 
 
-def load_alert_view(source):
+def load_alert_view(source, *, combined=None):
     if source == "LEGACY":
         return legacy_view()
     if source == "SHADOW":
+        marker = Path(__file__).resolve().parents[1] / "backups/stock-alert-results/reader.json"
+        if combined is True or (combined is None and marker.is_file()):
+            from equity.stock_alert_results import load_shared_results
+            return load_shared_results()
         path = os.getenv("STOCK_ALERT_SHADOW_VIEW") or str(Path(__file__).resolve().parents[1] / "backups/equity-shadow/stock-ideas-forward-v2/alerts-view.json")
         return load_snapshot(path, source)
     path = os.getenv("STOCK_ALERT_REPLAY_VIEW") or str(Path(__file__).resolve().parents[1] / "backups/stock-idea-independent-v1/alerts-view.json")
@@ -23,13 +27,16 @@ def load_alert_view(source):
 
 
 def attach_alert_context(page):
+    if page.get("combined"):
+        from equity.stock_alert_results import attach_shared_context
+        return attach_shared_context(page)
     from research.stock_alert_annotations import attach_publication_context
     path = os.getenv("STOCK_ALERT_SHADOW_VIEW") or str(Path(__file__).resolve().parents[1] / "backups/equity-shadow/stock-ideas-forward-v2/alerts-view.json")
     return attach_publication_context(page, Path(path).parent / "alert-context")
 
 
 def history_snapshot_for_date(snapshot, session=None):
-    if snapshot["source"] != "SHADOW":
+    if snapshot["source"] != "SHADOW" or snapshot.get("combined"):
         return snapshot
     dates = snapshot.get("sessions", [])
     selected = session or (dates[-1] if dates else None)
@@ -50,15 +57,16 @@ def history_snapshot_for_date(snapshot, session=None):
     return dict(replay, sessions=list(dates or replay.get("sessions", [])))
 
 
-def current_history_prices(snapshot, session=None, *, now=None):
+def current_history_prices(snapshot, session=None, *, now=None, view="history"):
     if snapshot["source"] != "SHADOW":
         return snapshot
     dates = snapshot.get("sessions", [])
     selected_date = session or (dates[-1] if dates else None)
-    if selected_date not in dates:
+    if view != "open" and selected_date not in dates:
         return snapshot
     runs = {row["run_id"] for row in history_publications(snapshot, selected_date)}
-    selected = [row for row in snapshot.get("alerts", []) if row["run_id"] in runs]
+    selected = [row for row in snapshot.get("alerts", []) if row["status"] in ("PENDING", "OPEN", "UNRESOLVED")] if view == "open" else [row for row in snapshot.get("alerts", []) if row["run_id"] in runs]
+    selected_ids = {row["alert_id"] for row in selected}
     identities = sorted({(row["security_id"], row["ticker"]) for row in selected})
     if not identities:
         return snapshot
@@ -108,7 +116,7 @@ def current_history_prices(snapshot, session=None, *, now=None):
         quotes, failed = {}, True
     records = []
     for original in snapshot.get("alerts", []):
-        if original["run_id"] not in runs:
+        if original["alert_id"] not in selected_ids:
             records.append(original)
             continue
         quote = quotes.get(original["security_id"], {})

@@ -146,7 +146,7 @@ def read_frozen_prices(plan):
     from research.frozen_daily_study import load_samples
     from database import get_db_cursor
 
-    samples, _ = load_samples(BACKEND_DIR.parent / "docs")
+    samples, _ = load_samples(BACKEND_DIR / "research/inputs")
     tickers = sorted(set(samples["1"]) | set(samples["2"]))
     after = datetime.fromisoformat(plan["start"]).replace(tzinfo=timezone.utc) - timedelta(days=740)
     reader = FrozenDailyBars(after, _utc(plan["source_cutoff"]))

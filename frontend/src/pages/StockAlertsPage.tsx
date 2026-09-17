@@ -6,7 +6,7 @@ import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/P
 import { usePublishPageContext } from '../layout/pageContext'
 import { getAlertView, type AlertContextFactor, type AlertPlanRow } from '../services/stockDiscovery'
 import { alertSort, alertSourceParams, alertTabParams, alertTradeFilters, legacyAlertStatuses, resolveAlertRoute, tradeAlertModels, tradeAlertStatuses, type AlertView } from './stockAlertNavigation'
-import { alertColumnLayout, alertRiskAssessment, unavailableAlertProbability } from './stockAlertPresentation'
+import { alertColumnLayout, alertPlanTiming, alertRiskAssessment, unavailableAlertProbability } from './stockAlertPresentation'
 import './StockDiscoveryPage.css'
 import './StockAlertsPage.css'
 
@@ -20,7 +20,8 @@ const models: Record<string, string> = { resumption: 'Trend resumption', accepta
 type AlertColumn = ColumnSpec & { history?: boolean; tip?: string; indicator?: boolean }
 const columns: AlertColumn[] = [
   { key: 'ticker', label: 'Stock', group: 'Alert details', locked: true }, { key: 'direction', label: 'Direction', group: 'Alert details', locked: true },
-  { key: 'model', label: 'Model / interval', group: 'Alert details' }, { key: 'published_at', label: 'Published (ET)', group: 'Alert details' },
+  { key: 'trade_style', label: 'Trade type', group: 'Alert details', locked: true, tip: 'Independent original plan: intraday minute cap or swing trading-session horizon. Shared display does not merge positions, quotas or performance.' },
+  { key: 'model', label: 'Model / interval', group: 'Alert details', tip: 'Swing: the daily setup owns the bracket and session horizon; intraday confirmation only times entry. Intraday: a separate short-duration plan.' }, { key: 'published_at', label: 'Published (ET)', group: 'Alert details' },
   { key: 'triggered_at', label: 'Triggered (ET)', group: 'Alert details', history: true, tip: 'Original trigger-bar timestamp, separate from when the alert was published' },
   { key: 'trigger_price', label: 'Trigger price', group: 'Trade plan', tip: 'Completed trigger-bar price, not an executable fill' },
   { key: 'latest_price', label: 'Current price', group: 'Price comparison', history: true, tip: 'Latest eligible stored completed-bar price; delayed, not a real-time quote. Replay prices stay frozen at cutoff.' },
@@ -30,7 +31,7 @@ const columns: AlertColumn[] = [
   { key: 'reward_risk', label: 'Reward/risk', group: 'Trade plan', tip: 'Frozen trigger-price target room divided by stop risk' },
   { key: 'success_probability', label: 'Success probability', group: 'Trade plan', hiddenByDefault: true, tip: unavailableAlertProbability.reason },
   { key: 'risk_assessment', label: 'Risk assessment', group: 'Trade plan', hiddenByDefault: true, tip: 'Original stop distance and retained cautions; not a calibrated risk score or maximum-loss guarantee' },
-  { key: 'hold', label: 'Maximum hold', group: 'Trade plan' }, { key: 'hits', label: 'Hits', group: 'Alert details', tip: 'Distinct valid stock/direction publication windows over 21 sessions; not confidence' },
+  { key: 'hold', label: 'Maximum hold', group: 'Trade plan', tip: 'Swing limits count trading sessions, not calendar days; the entry session counts as session one. Intraday limits run from entry until the minute cap or session close. Stop or target exits can occur earlier; gaps can exceed stop risk.' }, { key: 'hits', label: 'Hits', group: 'Alert details', tip: 'Distinct valid stock/direction publication windows over 21 sessions; not confidence' },
   { key: 'paper_return', label: 'Paper P/L %', group: 'Paper outcomes', history: true },
   { key: 'status', label: 'Status', group: 'Alert details' }, { key: 'exit_price', label: 'Fixed exit', group: 'Paper outcomes', history: true, hiddenByDefault: true },
   { key: 'rsi', label: 'RSI14 (trigger)', group: 'Momentum', hiddenByDefault: true, indicator: true, tip: '14-bar simple rolling RSI, frozen at trigger; unavailable if the denominator is zero' },
@@ -155,15 +156,17 @@ export default function StockAlertsPage() {
   const selectedPreset = Object.entries(presets).find(([, keys]) =>
     effectiveColumns.every(column => !hidden.has(column.key) === (keys.includes(column.key) || !!column.locked)))?.[0] || ''
   const filters = alertTradeFilters(params, requestedSource)
-  const args = { source: requestedSource, view, session_date: params.get('session_date') || undefined,
+  const tradeType = params.get('trade_type') === 'SWING' ? 'SWING' : params.get('trade_type') === 'INTRADAY' ? 'INTRADAY' : undefined
+  const args = { source: requestedSource, view, session_date: view === 'open' ? undefined : params.get('session_date') || undefined,
+    trade_type: tradeType, combined: params.has('combined') ? params.get('combined') === 'true' : undefined,
     run: view === 'latest' ? params.get('run') || undefined : undefined, search,
     interval: params.get('interval') || undefined, ...filters, sort, descending, offset, limit: 100 }
   const query = useQuery({ queryKey: ['stock-alert-view', args], queryFn: () => getAlertView(args), refetchInterval: requestedSource === 'REPLAY' ? false : 30_000 })
   const data = query.data
   const source = data?.source || requestedSource
-  const sourceLabel = source === 'REPLAY' ? 'Backtested history' : source === 'LEGACY' ? 'Legacy daily history' : 'Forward shadow'
+  const sourceLabel = source === 'REPLAY' ? 'Backtested history' : source === 'LEGACY' ? 'Legacy daily history' : data?.combined ? 'Intraday + swing shadow' : data?.source_id === 'stock_ideas_forward_swing_v1' ? 'Swing shadow' : 'Forward shadow'
   const rows = data?.rows || []
-  const displayedRuns = view === 'history' ? data?.runs || [] : data?.run ? [data.run] : []
+  const displayedRuns = view === 'history' ? data?.runs || [] : view === 'open' ? [] : data?.latest_runs || (data?.run ? [data.run] : [])
   const incompleteCoverage = displayedRuns.some(run => (run.missing ?? 0) > 0 || run.status === 'MISSED_PUBLICATION')
   const dataWarnings = data?.warnings.filter(warning => /stale|missing|unavailable/i.test(warning)) || []
   const update = (values: Record<string, string | null>) => {
@@ -187,6 +190,8 @@ export default function StockAlertsPage() {
     }
   }
   const value = (row: AlertPlanRow, key: string): unknown => {
+    if (key === 'trade_style') return alertPlanTiming(row).style
+    if (key === 'hold') return alertPlanTiming(row).hold
     if (key === 'success_probability') return unavailableAlertProbability.label
     if (key === 'risk_assessment') {
       const assessment = alertRiskAssessment(row)
@@ -195,14 +200,15 @@ export default function StockAlertsPage() {
     return key in row ? row[key as keyof AlertPlanRow] : row.indicators[key]
   }
   const sortColumn = (key: string) => {
-    if (['hold', 'status', 'exit_price', 'sector', 'success_probability', 'risk_assessment'].includes(key)) return
+    if (['trade_style', 'hold', 'status', 'exit_price', 'sector', 'success_probability', 'risk_assessment'].includes(key)) return
     update({ sort: key, ascending: sort === key && descending ? '1' : null })
   }
   const cell = (row: AlertPlanRow, column: AlertColumn): ReactNode => {
     const item = value(row, column.key)
     if (column.key === 'ticker') return <><Link to={`/ticker/${encodeURIComponent(row.ticker)}`}>{row.ticker || 'N/A'}</Link><small>{row.lane === 'WATCH' ? 'Watch only' : row.indicators.sector || row.company_name}</small></>
     if (column.key === 'direction') return <span className={tone(row.direction)}>{row.direction === 1 ? <ArrowUp size={13} /> : row.direction === -1 ? <ArrowDown size={13} /> : null}{row.direction === 1 ? 'Long' : row.direction === -1 ? 'Short' : 'Context'}</span>
-    if (column.key === 'model') return <>{models[row.model] || readable(row.model)}<small>{row.interval}</small></>
+    if (column.key === 'model') return <>{models[row.model] || readable(row.model)}<small>{alertPlanTiming(row).interval}</small></>
+    if (column.key === 'trade_style') return <>{alertPlanTiming(row).style}<small>{row.strategy_label}{row.opposing_exposure ? ' / Opposing exposure' : ''}</small></>
     if (column.key === 'published_at') return <span title={`Trigger ${time(row.triggered_at)} ET`}>{time(row.published_at)}</span>
     if (column.key === 'triggered_at') return <span title={row.triggered_at}>{time(row.triggered_at)}</span>
     if (column.key === 'hits') return <span title={`${data?.hit_coverage || 'No retained recurrence data'}. Models: ${row.hit_models.map(model => models[model] || model).join(', ')}`}>{number(row.hits, 0)}</span>
@@ -235,12 +241,14 @@ export default function StockAlertsPage() {
       <div className="sd-presets" role="tablist" aria-label="Alert views" onKeyDown={event => {
         if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
         event.preventDefault()
-        const next = event.key === 'Home' ? 'latest' : event.key === 'End' ? 'history' : view === 'latest' ? 'history' : 'latest'
+        const views: AlertView[] = source === 'SHADOW' ? ['latest', 'history', 'open'] : ['latest', 'history']
+        const next = views[event.key === 'Home' ? 0 : event.key === 'End' ? views.length - 1 : (views.indexOf(view) + (event.key === 'ArrowRight' ? 1 : views.length - 1)) % views.length]
         changeView(next)
         event.currentTarget.querySelector<HTMLButtonElement>(`#sa-${next}`)?.focus()
       }}>
         <button role="tab" id="sa-latest" tabIndex={view === 'latest' ? 0 : -1} aria-controls="sa-results" aria-selected={view === 'latest'} className={view === 'latest' ? 'active' : ''} onClick={() => changeView('latest')}>Latest Run</button>
         <button role="tab" id="sa-history" tabIndex={view === 'history' ? 0 : -1} aria-controls="sa-results" aria-selected={view === 'history'} className={view === 'history' ? 'active' : ''} onClick={() => changeView('history')}>Day History</button>
+        {source === 'SHADOW' && <button role="tab" id="sa-open" tabIndex={view === 'open' ? 0 : -1} aria-controls="sa-results" aria-selected={view === 'open'} className={view === 'open' ? 'active' : ''} onClick={() => changeView('open')}>Open Positions</button>}
       </div>
       <div className="sd-tools">
         <label className="sa-preset"><span className="sa-sr-only">Column preset</span><select aria-label="Column preset" value={selectedPreset} onChange={event => choosePreset(event.target.value)}><option value="" disabled>Custom columns</option><option value="plan">Trade plan</option><option value="trend">Trend</option><option value="momentum">Momentum</option><option value="liquidity">Liquidity</option></select></label>
@@ -249,6 +257,19 @@ export default function StockAlertsPage() {
         <button type="button" title="Refresh retained alerts" aria-label="Refresh retained alerts" disabled={query.isFetching} onClick={() => void query.refetch()}><RefreshCw size={16} /></button>
       </div>
     </section>
+    {data?.combined && <section className="sa-streams" aria-label="Strategy publication status">{data.strategy_streams?.map(stream => {
+      const latest = data.latest_runs?.find(run => run.strategy_instance_id === stream.instance_id)
+      return <div key={stream.stream}><strong>{stream.label}</strong><span className={stream.error || stream.projector_stale ? 'sd-negative' : ''}>{readable(stream.status)}{stream.error ? ` / ${readable(stream.error)}` : ''}</span>
+        <span>Source {time(stream.as_of)} ET / Imported {time(stream.imported_at)} ET</span>
+        <span>{latest ? `${readable(latest.status)} / ${latest.selected} selected / ${time(latest.published_at)} ET` : 'No publication for selected session'}</span>
+        {stream.publication_deadline && <span>Next window {time(stream.publication_window_start)} to {time(stream.publication_deadline)} ET</span>}
+      </div>
+    })}</section>}
+    <div className="sa-trade-types" role="group" aria-label="Trade type">
+      {([['', 'All'], ['INTRADAY', 'Intraday'], ['SWING', 'Swing']] as const).map(([key, label]) =>
+        <button key={label} type="button" aria-pressed={(tradeType || '') === key} onClick={() => update({ trade_type: key || null, run: null })}>{label}</button>)}
+      {view === 'open' && <span>All retained open, pending and unresolved positions</span>}
+    </div>
     <section className="sd-filters sa-filters" aria-label="Alert filters">
       <label>Stock<input value={params.get('search') || ''} placeholder="Ticker or company" onChange={event => update({ search: event.target.value })} /></label>
       <label>Direction<select value={filters.direction || ''} onChange={event => update({ direction: event.target.value })}><option value="">All</option><option value="1">Long</option><option value="-1">Short</option></select></label>
@@ -277,7 +298,7 @@ export default function StockAlertsPage() {
             <div><dt>Paper policy</dt><dd>{data?.outcome_policy || 'Unavailable'}</dd></div>
             <div><dt>Study / policy</dt><dd>{data?.source_id || 'Unavailable'}</dd></div>
           </dl>
-          {view === 'latest' && !!data?.runs.length && <label className="sa-run-selector">Publication (ET)<select aria-label="Publication run" value={params.get('run') || ''} onChange={event => update({ run: event.target.value })}><option value="">Latest publication</option>{[...data.runs].reverse().map(run => <option key={run.run_id} value={run.run_id}>{time(run.published_at)} / {run.selected} selected</option>)}</select></label>}
+          {view === 'latest' && !!data?.runs.length && <label className="sa-run-selector">Publication (ET)<select aria-label="Publication run" value={params.get('run') || ''} onChange={event => update({ run: event.target.value })}><option value="">{data.combined ? 'Latest per strategy' : 'Latest publication'}</option>{[...data.runs].reverse().map(run => <option key={run.run_id} value={run.run_id}>{run.strategy_label ? `${run.strategy_label} / ` : ''}{time(run.published_at)} / {run.selected} selected</option>)}</select></label>}
           {!!data?.warnings.length && <ul className="sa-run-notes">{data.warnings.map(warning => <li key={warning}>{warning}</li>)}</ul>}
           <nav className="sa-record-links" aria-label="Historical records">
             {source !== 'LEGACY' && <Link to={`?${alertSourceParams('LEGACY', 'history')}`}>Legacy daily history</Link>}
@@ -288,7 +309,7 @@ export default function StockAlertsPage() {
     </div>
     {(incompleteCoverage || dataWarnings.length > 0) && <div className="sa-data-warning" role="note"><AlertTriangle size={14} /><span>{incompleteCoverage ? 'Some alert inputs were unavailable at publication time. ' : ''}{dataWarnings.join(' / ')}</span></div>}
     {query.isError && <div className="sd-notice" role="alert"><AlertTriangle size={16} />Alert view unavailable<button onClick={() => void query.refetch()}>Retry</button>{params.get('session_date') && <button onClick={() => update({ session_date: null, run: null })}>Latest session</button>}</div>}
-    <section id="sa-results" role="tabpanel" aria-labelledby={view === 'latest' ? 'sa-latest' : 'sa-history'} className="sd-table-panel">
+    <section id="sa-results" role="tabpanel" aria-labelledby={`sa-${view}`} className="sd-table-panel">
       {data?.publication_mode === 'SOURCE_READINESS' && <div className="sa-data-warning" role="status"><Clock size={14} /><span>Next publication after inputs complete: {time(data.publication_window_start)} to {time(data.publication_deadline)} ET</span></div>}
       {query.isLoading ? <div className="sd-empty" role="status">Loading retained alerts...</div> : query.isError ? null : !rows.length ? <div className="sd-empty"><Bell size={24} /><strong>{data?.status === 'WAITING_FOR_PUBLICATION' ? 'Waiting for the next forward publication' : data?.status === 'AWAITING_PUBLICATION' ? source === 'SHADOW' ? 'No shadow publications yet' : 'Awaiting retained publications' : !data?.runs.length ? view === 'history' && data?.withheld_run ? 'No earlier runs for this session' : 'No publication recorded for this session' : view === 'latest' && data?.run?.selected === 0 ? 'No new alerts in this publication' : view === 'history' && data?.runs.every(run => run.selected === 0) ? data?.withheld_run ? 'No alerts in earlier runs' : 'No alerts published for this session' : 'No matching alerts'}</strong>{data?.next_publication_at && <span>Next publication {time(data.next_publication_at)} ET</span>}{source === 'SHADOW' && data?.status === 'AWAITING_PUBLICATION' && <button type="button" className="sa-history-action" onClick={() => setParams(alertSourceParams('REPLAY', 'history'))}><History size={16} />View backtested history</button>}</div> :
         <div className="sd-table-scroll sa-scroll"><table><thead><tr><th aria-label="Plan details" />{visible.map(column => <th key={column.key} aria-sort={sort === column.key ? descending ? 'descending' : 'ascending' : undefined}><button type="button" title={column.tip || column.label} onClick={() => sortColumn(column.key)}>{column.key === 'latest_price' && source === 'REPLAY' ? 'Price at cutoff' : column.label}{sort === column.key && (descending ? <ArrowDown size={11} /> : <ArrowUp size={11} />)}</button></th>)}</tr></thead><tbody>
@@ -296,7 +317,14 @@ export default function StockAlertsPage() {
             {visible.map(column => <td key={column.key} className={column.key === 'ticker' ? 'sd-symbol' : ''} title={column.indicator ? `${column.tip || column.label}. ${column.key === 'momentum' || column.key === 'liquidity' || column.key === 'rs_percentile' ? time(row.daily_context_at) : `${row.indicator_interval} ${time(row.indicator_at)}`} ET; ${readable(row.indicator_status)}` : column.tip}>{cell(row, column)}</td>)}
           </tr>{expanded === row.alert_id && <tr className="sd-detail"><td colSpan={visible.length + 1}><dl>
             <div><dt>Trigger / published (ET)</dt><dd>{time(row.triggered_at)} / {time(row.published_at)}</dd></div>
+            {row.trade_style === 'SWING' && <><div><dt>Daily setup (ET)</dt><dd>{time(row.daily_setup_at)}</dd></div>
+              <div><dt>Entry confirmation</dt><dd>{row.confirmation_interval || row.interval} / {time(row.triggered_at)} ET</dd></div>
+              <div><dt>Holding policy</dt><dd>{alertPlanTiming(row).hold}; entry session counts as one</dd></div>
+              <div><dt>Daily setup ID</dt><dd>{row.daily_setup_id || 'Unavailable'}</dd></div></>}
             <div><dt>Original bracket</dt><dd>{price(row.stop)} stop / {price(row.target)} target</dd></div>
+            {row.strategy_instance_id && <><div><dt>Strategy instance</dt><dd>{row.strategy_instance_id}</dd></div>
+              <div><dt>Original alert / run</dt><dd>{row.original_alert_id} / {row.original_run_id}</dd></div>
+              <div><dt>Exposure</dt><dd>{row.opposing_exposure ? 'Opposite-direction open or pending plan also retained; positions not netted' : 'Independent strategy plan'}</dd></div></>}
             <div><dt>Entry risk / reward-risk</dt><dd>{percent(row.entry_risk?.risk_pct)} / {number(row.entry_risk?.reward_risk)}x</dd></div>
             <div><dt>Latest eligible exit (ET)</dt><dd>{time(row.exit_due_at)}</dd></div>
             <div><dt>First / last seen (ET)</dt><dd>{time(row.first_seen)} / {time(row.last_seen)}</dd></div>

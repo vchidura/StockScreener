@@ -1,7 +1,7 @@
 """Prepare bounded retained daily screening facts; historical writes never promote current."""
 import argparse
 from collections import Counter
-from datetime import date
+from datetime import date, datetime, timezone
 import json
 from pathlib import Path
 import sys
@@ -61,13 +61,39 @@ def preservation_state():
     return snapshots, pointers, source
 
 
-def prepare_one(session, *, publish_result=False, allow_degraded=False):
+def approve_partial_source(payload, expected_unavailable, expected_selected, approved_at):
+    unavailable = payload["source_unavailable_members"]
+    if (payload["source_publication_status"] != "DEGRADED" or payload["source_selected_members"] != expected_selected
+            or expected_selected <= 0 or expected_selected + len(unavailable) != payload["expected_members"]
+            or sorted(member["ticker"] for member in unavailable) != sorted(expected_unavailable)
+            or len(set(expected_unavailable)) != len(expected_unavailable) or not unavailable):
+        raise ValueError("Partial publication differs from the explicitly approved coverage")
+    missing_ids = {member["security_id"] for member in unavailable}
+    retained = [row for row in payload["rows"] if row["security_id"] in missing_ids]
+    if len(retained) != len(unavailable) or any(row["eligible"] or row["source_bar_id"] is not None or row["values"].get("price") is not None for row in retained):
+        raise ValueError("Unavailable source members must remain unknown and unselected")
+    approval = dict(version="screening_partial_source_approval_v1", approved_at=approved_at.isoformat(),
+        session=payload["session"], source_publication_id=payload["source_publication_id"],
+        selected_members=expected_selected, expected_members=payload["expected_members"],
+        unavailable_members=unavailable, scope="EXACT_SESSION_AND_SOURCE_PUBLICATION",
+        original_generation=payload["generation"])
+    approval["approval_sha256"] = digest(approval)
+    payload = dict(payload, partial_source_approval=approval)
+    payload["generation"] = digest({key: value for key, value in payload.items() if key != "generation"})
+    return payload
+
+
+def prepare_one(session, *, publish_result=False, allow_degraded=False, approve_partial=False, expected_unavailable=(), expected_selected=None):
     started = time.perf_counter()
     payload = build_latest(session, allow_degraded=allow_degraded)
+    if approve_partial:
+        if session is None or not allow_degraded:
+            raise ValueError("Partial current approval requires one explicit session and allow-degraded")
+        payload = approve_partial_source(payload, expected_unavailable, expected_selected, datetime.now(timezone.utc))
     prepared_seconds = time.perf_counter() - started
     manifest = {name: value for name, value in payload.items() if name not in {"rows", "lineage", "hourly_lineage"}}
     manifest["source_generation"] = 0
-    identifiers = publish({SNAPSHOT_TYPE: payload}, manifest, promote_current=session is None) if publish_result else []
+    identifiers = publish({SNAPSHOT_TYPE: payload}, manifest, promote_current=session is None or approve_partial) if publish_result else []
     durations = []
     for _ in range(40):
         started = time.perf_counter()
@@ -76,7 +102,8 @@ def prepare_one(session, *, publish_result=False, allow_degraded=False):
     return dict(status="PUBLISHED" if publish_result else "MEASURED_NO_WRITES", snapshot_ids=identifiers,
         generation=payload["generation"], session=payload["session"], source_cutoff=payload["source_cutoff"],
         source_publication_id=payload["source_publication_id"], source_status=payload["source_publication_status"],
-        source_unavailable_members=payload["source_unavailable_members"], promoted_current=publish_result and session is None,
+        source_unavailable_members=payload["source_unavailable_members"], promoted_current=publish_result and (session is None or approve_partial),
+        partial_source_approval=payload.get("partial_source_approval"),
         expected_members=payload["expected_members"], eligible=sum(row["eligible"] for row in payload["rows"]),
         field_coverage=payload["field_coverage"], pattern_coverage=payload["pattern_coverage"],
         gap_coverage=payload.get("gap_coverage"),
@@ -96,8 +123,15 @@ def main(argv=None):
     parser.add_argument("--end-session", type=date.fromisoformat)
     parser.add_argument("--missing-only", action="store_true")
     parser.add_argument("--allow-degraded", action="store_true")
+    parser.add_argument("--approve-partial-current", action="store_true")
+    parser.add_argument("--expected-unavailable", nargs="+", default=[])
+    parser.add_argument("--expected-selected", type=int)
     args = parser.parse_args(argv)
     sessions = preparation_sessions(args.session, args.start_session, args.end_session)
+    if args.approve_partial_current and (args.session is None or not args.allow_degraded or not args.expected_unavailable or args.expected_selected is None or args.missing_only):
+        parser.error("Partial approval requires --session, --allow-degraded, --expected-unavailable and --expected-selected; no missing-only")
+    if not args.approve_partial_current and (args.expected_unavailable or args.expected_selected is not None):
+        parser.error("Expected partial coverage requires --approve-partial-current")
     if sessions == [None] and (args.missing_only or args.allow_degraded):
         parser.error("missing-only and allow-degraded require explicit date bounds")
     before = preservation_state() if args.publish and sessions != [None] else None
@@ -106,12 +140,16 @@ def main(argv=None):
         if existing:
             print(json.dumps(dict(status="SKIPPED_EXISTING", session=str(session), snapshots=existing)), flush=True)
             continue
-        print(json.dumps(prepare_one(session, publish_result=args.publish, allow_degraded=args.allow_degraded), indent=2), flush=True)
+        print(json.dumps(prepare_one(session, publish_result=args.publish, allow_degraded=args.allow_degraded,
+            approve_partial=args.approve_partial_current, expected_unavailable=args.expected_unavailable,
+            expected_selected=args.expected_selected), indent=2), flush=True)
     if before is not None:
         after = preservation_state()
-        if not all(after[0].get(key) == value for key, value in before[0].items()) or before[1:] != after[1:]:
+        if not all(after[0].get(key) == value for key, value in before[0].items()) or (not args.approve_partial_current and before[1:] != after[1:]):
             raise RuntimeError("Existing snapshot, pointer or source-generation preservation check failed")
-        print(json.dumps(dict(status="PRESERVATION_PASS", prior_snapshots=len(before[0]), new_snapshots=len(after[0]) - len(before[0]), current_pointers_unchanged=True, source_generation_unchanged=True)), flush=True)
+        print(json.dumps(dict(status="PRESERVATION_PASS", prior_snapshots=len(before[0]), new_snapshots=len(after[0]) - len(before[0]),
+            prior_snapshots_unchanged=True, current_pointers_unchanged=before[1] == after[1], source_generation_unchanged=before[2] == after[2],
+            approved_current_publication=args.approve_partial_current)), flush=True)
 
 
 if __name__ == "__main__":

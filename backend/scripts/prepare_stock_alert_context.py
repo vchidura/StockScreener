@@ -155,7 +155,7 @@ def capture(cursor, members, publications, audit_cutoff, configuration, *, marke
         if len(result["native_bars"]) > 40000:
             raise ValueError("native window audit exceeds bounded session scope")
     cursor.execute("""SELECT corporate_action_id::text AS revision_id,security_id::text,ticker,action_type,effective_date,
-        first_observed_at,created_at,split_from::float8,split_to::float8,source FROM equity_corporate_actions WHERE ticker=ANY(%s::text[]) AND effective_date>=%s
+        first_observed_at,created_at,split_from::float8,split_to::float8,source,payload_sha256 FROM equity_corporate_actions WHERE ticker=ANY(%s::text[]) AND effective_date>=%s
           AND effective_date<=%s AND first_observed_at<=%s AND created_at<=%s ORDER BY effective_date""",
         (names, start, end + timedelta(days=45), audit_cutoff, audit_cutoff))
     result["actions"] = [dict(row) for row in cursor.fetchall()]
@@ -456,6 +456,7 @@ def write_rotation_snapshot(snapshot, args):
     print(json.dumps(dict(verified, output=str(args.output), view_published=args.publish_rotation_view,
         bytes=len(payload.encode("utf-8")), session=snapshot["session"], as_of=snapshot["as_of"],
         input_counts=snapshot["input_counts"], elapsed_seconds=snapshot["elapsed_seconds"],
+        split_validation=snapshot.get("split_validation"),
         additional_context={key: dict(status=value["status"], value=value["value"], reasons=value["reason_codes"],
             coverage=[value.get("timely_observations"), value.get("expected_observations")]) for key, value in snapshot.get("additional_context", {}).items()}), indent=2), flush=True)
 
@@ -481,9 +482,23 @@ def load_etf_creation_records(path):
     return records, None
 
 
+def load_context_split_reviews(path, cutoff):
+    if path.stat().st_size > 100_000:
+        raise ValueError("split review exceeds bounded size")
+    record = json.loads(path.read_text(encoding="utf-8"))
+    reviews = record.get("reviews")
+    if (record.get("schema") != "stock_sector_split_review_v1" or not isinstance(reviews, list) or len(reviews) != 4
+            or record.get("scope") != "MARKET_CONDITIONS_CONTEXT_ONLY" or record.get("live_gate_enabled") is not False
+            or record.get("reviews_sha256") != digest(reviews)
+            or {row["ticker"] for row in reviews} != {"XLY", "XLE", "XLU", "XLB"}
+            or any(row["status"] != "REVIEWED" or utc(row["reviewed_at"]) > cutoff for row in reviews)):
+        raise ValueError("four-proxy split review is invalid or not available")
+    return reviews
+
+
 def prepare_rotation(args, state, policy, publications, retained):
     from dotenv import load_dotenv
-    from research.stock_rotation import build_rotation_snapshot
+    from research.stock_rotation import build_rotation_snapshot, split_basis_comparison
     load_dotenv(BACKEND / ".env")
     from database import get_db_cursor
     from equity.market_context_source import collect_fred_context
@@ -495,8 +510,16 @@ def prepare_rotation(args, state, policy, publications, retained):
         cutoff = datetime.now(timezone.utc)
         facts = capture(cursor, state["members"], publications, cutoff, None, market_only=True)
     facts["macro_context"] = macro
+    if getattr(args, "split_review", None):
+        facts["split_reviews"] = load_context_split_reviews(args.split_review, cutoff)
     facts["etf_records"], facts["etf_records_error"] = load_etf_creation_records(BACKEND / "backups/stock-rotation/etf-nav-shares.json")
+    original_facts_hash = digest(facts)
     snapshot = build_rotation_snapshot(state["members"], facts, cutoff)
+    if "split_reviews" in facts:
+        raw = build_rotation_snapshot(state["members"], {key: value for key, value in facts.items() if key != "split_reviews"}, cutoff)
+        snapshot["split_validation"] = split_basis_comparison(raw, snapshot)
+    if digest(facts) != original_facts_hash:
+        raise ValueError("context calculation mutated source facts")
     if getattr(args, "continuous", False):
         snapshot["refresh_mode"] = "CONTINUOUS_SOURCE_WINDOW_REFRESH"
     _, _, _, after = read_enrollment(args.state_dir / "forward.sqlite", args.session.isoformat())
@@ -539,7 +562,9 @@ def monitor_rotation(args):
                 expected = expected_materialized_market_time(now, "1d").date().isoformat()
                 boundary = expected_materialized_market_time(now, "30m")
                 configuration = source_configuration()
-                if rotation_refresh_due(snapshot, expected, boundary, now, macro_configured=configuration["api_key_configured"], macro_states=configuration["series"]):
+                review_hash = digest(load_context_split_reviews(args.split_review, now)) if args.split_review else None
+                if rotation_refresh_due(snapshot, expected, boundary, now, macro_configured=configuration["api_key_configured"],
+                    macro_states=configuration["series"], split_review_sha256=review_hash):
                     attempt = argparse.Namespace(**vars(args))
                     attempt.session = now.date()
                     attempt.output = BACKEND / "backups/stock-rotation/captures" / (now.strftime("%Y%m%dT%H%M%S%fZ") + ".json")
@@ -783,6 +808,7 @@ def review_sector_actions(cursor, cutoff):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session", type=date.fromisoformat)
+    parser.add_argument("--split-review", type=Path, help="Explicit four-proxy reviewed split manifest for rotation only; never changes source bars")
     parser.add_argument("--review-sector-actions", action="store_true", help="Read the four blocked ETF action terms and adjacent raw bars; no repairs or providers")
     parser.add_argument("--fundamentals-pilot", action="store_true", help="Acquire at most two quarterly rows per statement for five enrolled stocks; stop on denial; no pagination/retries")
     parser.add_argument("--state-dir", type=Path, default=BACKEND / "backups/equity-shadow/stock-ideas-forward-v1")
@@ -801,6 +827,8 @@ def main():
     parser.add_argument("--oas-reference", type=Path, help="Exact retained FRED credit receipt for the bond study; approval remains required")
     parser.add_argument("--publish-bond-comparison", action="store_true", help="Publish only the separate verified bond comparison summary")
     args = parser.parse_args()
+    if args.split_review and (not args.rotation_only or args.verify or args.rotation_from):
+        parser.error("Split review requires a new rotation capture or its continuous worker")
     if args.review_sector_actions:
         if any((args.fundamentals_pilot, args.company_context, args.freeze_alert_context, args.verify, args.rotation_only,
                 args.continuous, args.fetch_macro, args.rotation_from, args.publish_rotation_view, args.bond_study,

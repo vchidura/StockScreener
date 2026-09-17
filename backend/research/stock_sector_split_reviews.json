@@ -1,0 +1,53 @@
+{
+  "schema": "stock_sector_split_review_v1",
+  "scope": "MARKET_CONDITIONS_CONTEXT_ONLY",
+  "live_gate_enabled": false,
+  "reviews_sha256": "b0885eb02ff47858bca85c2d41eaa8202fe202b2c0deed1fd6952f937a5f2b03",
+  "review_basis": "Visual review of issuer IRS Form 8937 page 1, sections 8 and 14-16. Each confirms a two-for-one split effective December 5, 2025 for shares held after the December 4 close. Exact retained actions and adjacent raw bars corroborate the terms. Not historical availability or total-return certification.",
+  "reviews": [
+    {
+      "ticker": "XLB", "security_id": "2e61271b-4db0-52b6-ad9b-6f986763384c",
+      "action_revision_id": "aefe99d5-6782-5d12-a4fa-0dfb28018a4c",
+      "action_payload_sha256": "00ffa5eabafd6e6967103b7595c23fd87cf9ab3c6ccec1acaa5ed490474a7d45",
+      "effective_date": "2025-12-05", "split_from": 1, "split_to": 2, "status": "REVIEWED",
+      "reviewed_at": "2026-09-17T06:37:44.005169+00:00",
+      "evidence_observed_at": "2026-09-17T06:25:23.219399+00:00",
+      "evidence_url": "https://www.ssga.com/library-content/products/fund-docs/etfs/us/tax-documents/us-tax-form-state-street-materials-select-sector-spdr-etf-2025.pdf",
+      "evidence_sha256": "87eb7c0227f6fc9f0b8b9d4095abe5681fffd25b9fb77b43899ff77f67d76ca3",
+      "issuer_cusip": "81369Y100"
+    },
+    {
+      "ticker": "XLE", "security_id": "f67898d8-8dd2-5d03-a527-f6e9e1e29865",
+      "action_revision_id": "47fad713-e13a-52f2-819c-18719ec05bc0",
+      "action_payload_sha256": "b8c81dad1d40d097e51d8685dcc8c5c491103f2e061668b49fb8cc3491fbf477",
+      "effective_date": "2025-12-05", "split_from": 1, "split_to": 2, "status": "REVIEWED",
+      "reviewed_at": "2026-09-17T06:37:44.005169+00:00",
+      "evidence_observed_at": "2026-09-17T06:25:26.386055+00:00",
+      "evidence_url": "https://www.ssga.com/library-content/products/fund-docs/etfs/us/tax-documents/us-tax-form-state-street-energy-select-sector-spdr-etf-2025.pdf",
+      "evidence_sha256": "5d53632d054a6a4170b8ead14b8a19775eb71b63a9ed634dbb2c6a05677bd112",
+      "issuer_cusip": "81369Y506"
+    },
+    {
+      "ticker": "XLU", "security_id": "e609afce-9cae-5e07-a0db-13b0b991b1a3",
+      "action_revision_id": "57ec96f6-7c5f-5012-935d-3260b8f9087d",
+      "action_payload_sha256": "ae7437515ef54cbbebd42a34b99ca7e37da5461482b3ccf2c3034747c6e0aba2",
+      "effective_date": "2025-12-05", "split_from": 1, "split_to": 2, "status": "REVIEWED",
+      "reviewed_at": "2026-09-17T06:37:44.005169+00:00",
+      "evidence_observed_at": "2026-09-17T06:25:29.085920+00:00",
+      "evidence_url": "https://www.ssga.com/library-content/products/fund-docs/etfs/us/tax-documents/us-tax-form-state-street-utilities-select-sector-spdr-etf-2025.pdf",
+      "evidence_sha256": "c08c796d26c7e79f09f2933aa02dfb2a921b3ec4f008e05e3f845689d3ed5d06",
+      "issuer_cusip": "81369Y886"
+    },
+    {
+      "ticker": "XLY", "security_id": "9de92e0f-cfb1-5de2-8c48-7e0db5236556",
+      "action_revision_id": "3d33b862-d5ab-5270-87ef-662a6cfbe95f",
+      "action_payload_sha256": "7bb4ada49dd06b618e87c0294d2c10c5a459637b90eb115c82152f8593e6580f",
+      "effective_date": "2025-12-05", "split_from": 1, "split_to": 2, "status": "REVIEWED",
+      "reviewed_at": "2026-09-17T06:37:44.005169+00:00",
+      "evidence_observed_at": "2026-09-17T06:25:32.119113+00:00",
+      "evidence_url": "https://www.ssga.com/library-content/products/fund-docs/etfs/us/tax-documents/us-tax-form-state-street-consumer-discretionary-select-sector-spdr-etf-2025.pdf",
+      "evidence_sha256": "d89456146795c55b96e90e421a7578e7c3e529a625be28f31224cdd99389cc55",
+      "issuer_cusip": "81369Y407"
+    }
+  ]
+}

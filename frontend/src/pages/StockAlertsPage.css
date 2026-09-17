@@ -1,3 +1,11 @@
+.sa-streams { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 12px 0; border-block: 1px solid var(--tm-line); }
+.sa-streams > div { display: flex; flex-direction: column; gap: 5px; min-width: 0; font-size: 11px; color: var(--tm-muted); overflow-wrap: anywhere; }
+.sa-streams strong { color: var(--tm-ink); font-size: 13px; }
+.sa-trade-types { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 12px 0; }
+.sa-trade-types button { min-width: 64px; height: 32px; padding: 0 12px; border: 1px solid var(--tm-line); border-radius: 3px; background: var(--tm-surface); color: var(--tm-muted); font: inherit; font-size: 12px; cursor: pointer; }
+.sa-trade-types button[aria-pressed=true] { color: var(--tm-accent); background: var(--tm-accent-soft); border-color: var(--tm-accent); }
+.sa-trade-types span { margin-left: 8px; font-size: 11px; color: var(--tm-muted); }
+@media (max-width: 650px) { .sa-streams { grid-template-columns: 1fr; } .stock-alerts .sd-presets { flex-wrap: wrap; } }
 .stock-alerts { letter-spacing: 0; }
 .stock-alerts .sa-toolbar { align-items: center; }
 .sa-preset { display: flex; align-items: center; gap: 8px; color: var(--tm-muted); font-size: 11px; padding: 3px 6px; }

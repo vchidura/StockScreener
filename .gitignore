@@ -54,7 +54,7 @@ backend/scripts/_*.py
 # Default raw provider archive. Parquet objects are retained market data, not source.
 backend/option-raw/
 
-# Local documentation and research artifacts; already-tracked files remain tracked.
+# Local documentation and research artifacts. Required program inputs live in backend/research/inputs/.
 /docs/
 
 # Local backups, forward state and study artifacts are retained outside Git.

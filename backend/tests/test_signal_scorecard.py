@@ -48,10 +48,10 @@ from pathlib import Path
 
 def test_retained_sample_reader_preserves_original_membership_and_hashes():
     from research.frozen_daily_study import ROOT, SAMPLE_FILES, file_sha256, load_samples
-    samples, hashes = load_samples(ROOT / "docs")
+    samples, hashes = load_samples(ROOT / "backend/research/inputs")
     assert len(samples["1"]) == len(samples["2"]) == 300
     assert not set(samples["1"]) & set(samples["2"])
-    assert hashes == {name: file_sha256(ROOT / "docs" / name) for name in SAMPLE_FILES.values()}
+    assert hashes == {name: file_sha256(ROOT / "backend/research/inputs" / name) for name in SAMPLE_FILES.values()}
 
 
 def test_retained_completion_reader_rejects_changed_commands_and_artifacts(tmp_path):
@@ -258,8 +258,8 @@ def test_scorecard_runner_uses_readonly_snapshot_and_keeps_empty_registry(monkey
     from unittest.mock import MagicMock
     import scripts.report_equity_signal_scorecard as script
 
-    docs = Path(__file__).resolve().parents[2] / "docs"
-    config = json.loads((docs / "equity_signal_scorecard_config.json").read_text())
+    inputs = Path(__file__).resolve().parents[2] / "backend/research/inputs"
+    config = json.loads((inputs / "equity_signal_scorecard_config.json").read_text())
     for index, name in enumerate(config["sample_manifests"]):
         (tmp_path / name).write_text(json.dumps(dict(sampled_tickers=[f"S{index}_{number}" for number in range(300)])))
     path = tmp_path / "config.json"

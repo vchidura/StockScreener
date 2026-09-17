@@ -1,9 +1,11 @@
-import { useDeferredValue, useState } from 'react'
+import { useDeferredValue, useId, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { ArrowDownWideNarrow, ArrowUpWideNarrow, ChevronRight, RefreshCw, Search, X } from 'lucide-react'
+import { ArrowDownWideNarrow, ArrowUpWideNarrow, ChevronRight, Info, RefreshCw, Search, X } from 'lucide-react'
 import { getMarketConditions, type RotationFact, type RotationPrices, type SectorRotationRow } from '../services/api'
 import { usePublishPageContext } from '../layout/pageContext'
+import { compareStockDivergence, stockDivergenceColumns, type StockDivergenceSort } from './stockDivergence'
 import './MarketConditionsPage.css'
 
 const states: Record<string, string> = {
@@ -56,6 +58,54 @@ function Range({ values }: { values: RotationPrices | null }) {
   </div>
 }
 
+function ColumnHelp({ label, help }: { label: string; help: string }) {
+  const id = useId()
+  const trigger = useRef<HTMLButtonElement>(null)
+  const tooltip = useRef<HTMLDivElement>(null)
+  const [open, setOpen] = useState(false)
+  const [position, setPosition] = useState({ left: 0, top: 0 })
+  useLayoutEffect(() => {
+    if (!open || !trigger.current || !tooltip.current) return
+    const dismiss = () => setOpen(false)
+    const place = () => {
+      if (!trigger.current || !tooltip.current) return
+      const anchor = trigger.current.getBoundingClientRect()
+      const bounds = tooltip.current.getBoundingClientRect()
+      if (anchor.right <= 0 || anchor.left >= window.innerWidth || anchor.bottom <= 0 || anchor.top >= window.innerHeight) {
+        dismiss()
+        return
+      }
+      setPosition({ left: Math.max(8, Math.min(anchor.left, window.innerWidth - bounds.width - 8)),
+        top: anchor.bottom + bounds.height <= window.innerHeight - 8 ? anchor.bottom : Math.max(8, anchor.top - bounds.height) })
+    }
+    place()
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') dismiss() }
+    const outside = (event: Event) => {
+      if (event.target instanceof Node && !trigger.current?.contains(event.target) && !tooltip.current?.contains(event.target)) dismiss()
+    }
+    document.addEventListener('keydown', escape)
+    document.addEventListener('pointerdown', outside)
+    window.addEventListener('scroll', place, true)
+    window.addEventListener('resize', dismiss)
+    return () => {
+      document.removeEventListener('keydown', escape)
+      document.removeEventListener('pointerdown', outside)
+      window.removeEventListener('scroll', place, true)
+      window.removeEventListener('resize', dismiss)
+    }
+  }, [open])
+  const leave = (target: EventTarget | null) => {
+    if (document.activeElement !== trigger.current && !(target instanceof Node && (trigger.current?.contains(target) || tooltip.current?.contains(target)))) setOpen(false)
+  }
+  return <>
+    <button ref={trigger} type="button" className="mc-column-help" aria-label={`About ${label}`} aria-describedby={open ? id : undefined}
+      onMouseEnter={() => setOpen(true)} onMouseLeave={event => leave(event.relatedTarget)}
+      onFocus={() => setOpen(true)} onBlur={() => setOpen(false)} onClick={() => setOpen(true)}><Info size={13} aria-hidden="true" /></button>
+    {open && createPortal(<div ref={tooltip} id={id} role="tooltip" className="mc-column-tooltip" style={position}
+      onMouseLeave={event => leave(event.relatedTarget)}><strong>{label}</strong><p>{help}</p></div>, document.body)}
+  </>
+}
+
 export default function MarketConditionsPage() {
   const query = useQuery({ queryKey: ['stored-market-conditions'], queryFn: getMarketConditions, staleTime: 60_000, refetchInterval: 60_000 })
   const [tab, setTab] = useState<ConditionsTab>('rotation')
@@ -65,6 +115,8 @@ export default function MarketConditionsPage() {
   const [descending, setDescending] = useState(true)
   const [selected, setSelected] = useState<string | null>(null)
   const [sectorFilter, setSectorFilter] = useState('')
+  const [stockSort, setStockSort] = useState<StockDivergenceSort>('relative5')
+  const [stockDescending, setStockDescending] = useState(true)
   const [comparisonSample, setComparisonSample] = useState<'rolling' | 'nonoverlapping' | 'first_half' | 'second_half'>('rolling')
   const data = query.data
   const comparison = data?.bond_comparison
@@ -82,7 +134,7 @@ export default function MarketConditionsPage() {
   })
   const stocks = (data?.stocks ?? []).filter(row => row.security_type !== 'ETF' && (!sectorFilter || row.proxy === sectorFilter)
     && `${row.ticker} ${row.sector ?? ''} ${row.proxy ?? ''}`.toLowerCase().includes(deferredSearch))
-    .sort((left, right) => left.ticker.localeCompare(right.ticker))
+    .sort((left, right) => compareStockDivergence(left, right, stockSort, stockDescending))
   usePublishPageContext({ eyebrow: 'Market', title: 'Market Conditions', status: [
     { label: 'Source session', value: data?.session ?? 'Unavailable' },
     { label: 'Market', value: data?.market?.value?.direction ?? 'Unavailable' },
@@ -133,9 +185,16 @@ export default function MarketConditionsPage() {
             <option value="relative5">5-session vs SPY</option><option value="relative20">20-session vs SPY</option><option value="return1">Day change</option><option value="ticker">Ticker</option>
           </select>
           <button className="mc-icon" type="button" title={descending ? 'Sort ascending' : 'Sort descending'} aria-label={descending ? 'Sort ascending' : 'Sort descending'} onClick={() => setDescending(!descending)}>{descending ? <ArrowDownWideNarrow size={18} /> : <ArrowUpWideNarrow size={18} />}</button>
-        </> : <select aria-label="Filter stock sector" value={sectorFilter} onChange={event => setSectorFilter(event.target.value)}>
+        </> : <><select aria-label="Filter stock sector" value={sectorFilter} onChange={event => setSectorFilter(event.target.value)}>
           <option value="">All sectors</option>{sectors.map(row => <option key={row.ticker} value={row.ticker}>{row.sector} ({row.ticker})</option>)}
-        </select>}
+        </select>
+          <select aria-label="Sort stocks" value={stockSort} onChange={event => setStockSort(event.target.value as StockDivergenceSort)}>
+            <option value="relative5">5-session vs sector</option><option value="relative20">20-session vs sector</option>
+            <option value="relative_change5">Relative change 5</option><option value="return5">Stock 5-session return</option>
+            <option value="close">Closing price</option><option value="ticker">Ticker</option>
+          </select>
+          <button className="mc-icon" type="button" title={stockDescending ? 'Sort stocks ascending' : 'Sort stocks descending'} aria-label={stockDescending ? 'Sort stocks ascending' : 'Sort stocks descending'} onClick={() => setStockDescending(!stockDescending)}>{stockDescending ? <ArrowDownWideNarrow size={18} /> : <ArrowUpWideNarrow size={18} />}</button>
+        </>}
         <span className="mc-muted">{tab === 'rotation' ? filteredSectors.length : stocks.length} {(tab === 'rotation' ? filteredSectors.length : stocks.length) === 1 ? 'row' : 'rows'}</span>
       </div>}
 
@@ -161,14 +220,33 @@ export default function MarketConditionsPage() {
             </p>)}
             <p>Adjustment review pending. Original price history retained.</p>
           </div>}
+          {detail.context.split_adjustments?.map(adjustment => <div className="mc-action-review" key={adjustment.review_sha256}>
+            <strong>Reviewed split / {adjustment.effective_date} / price factor {adjustment.price_factor}</strong>
+            <p>Reviewed {adjustment.reviewed_at} / <a href={adjustment.evidence_url} target="_blank" rel="noreferrer">Issuer Form 8937</a></p>
+            <p>Source action <code>{adjustment.action_revision_id}</code></p>
+          </div>)}
           <div className="mc-table-scroll" tabIndex={0} aria-label={`${detail.ticker} rotation history`}><table className="mc-table mc-history"><thead><tr><th>Session</th><th>Absolute 5-session return</th><th>20-session vs SPY (pp)</th><th>Relative change 5 (pp)</th><th>State</th></tr></thead>
             <tbody>{detail.history.map(row => <tr key={row.session}><th scope="row">{row.session}</th><td className={tone(row.value?.absolute_return5)}>{percent(row.value?.absolute_return5)}</td><td className={tone(row.value?.relative20)}>{percent(row.value?.relative20, '')}</td><td className={tone(row.value?.relative_change5)}>{percent(row.value?.relative_change5, '')}</td><td>{row.value ? states[row.value.state] : 'Unavailable'}</td></tr>)}</tbody>
           </table></div>
         </section>}
       </>}
 
-      {tab === 'stocks' && <div className="mc-table-scroll" tabIndex={0} aria-label="Stock divergence table"><table className="mc-table mc-stocks"><thead><tr><th>Stock</th><th>Sector proxy</th><th>Absolute 5 sessions</th><th>5 vs sector (pp)</th><th>Relative state</th><th>5-session divergence</th></tr></thead>
-        <tbody>{stocks.map(row => <tr key={row.security_id}><th scope="row"><Link to={`/ticker/${row.ticker}`}>{row.ticker}</Link></th><td>{row.proxy ?? 'Unavailable'}</td><td className={tone(row.context.value?.return5)}>{percent(row.context.value?.return5)}</td><td className={tone(row.relative.value?.relative5)}>{percent(row.relative.value?.relative5, '')}</td><td>{row.relative.value ? states[row.relative.value.state] : 'Unavailable'}</td><td className="mc-state">{row.divergence.value?.labels.map(words).join('; ') ?? 'Unavailable'}{!row.relative.value && <small>{row.context.reason_codes.map(words).join(', ') || row.relative.reason_codes.map(words).join(', ')}</small>}</td></tr>)}</tbody>
+      {tab === 'stocks' && <div className="mc-table-scroll mc-stock-scroll" tabIndex={0} aria-label="Stock divergence table"><table className="mc-table mc-stocks"><thead><tr>
+        {stockDivergenceColumns.map(column => <th scope="col" key={column.key} aria-sort={column.key === stockSort ? stockDescending ? 'descending' : 'ascending' : undefined}>
+          <span className="mc-column-label">{column.label}<ColumnHelp label={column.label} help={column.help} /></span>
+          {column.key === 'close' && <time className="mc-close-date" dateTime={data.session}>{data.session}</time>}
+        </th>)}
+      </tr></thead>
+        <tbody>{stocks.map(row => <tr key={row.security_id}>
+          <th scope="row"><Link to={`/ticker/${row.ticker}`}>{row.ticker}</Link></th><td>{price(row.context.value?.close)}</td><td>{row.proxy ?? 'Unavailable'}</td>
+          <td className={tone(row.context.value?.return5)}>{percent(row.context.value?.return5)}</td>
+          <td className={tone(row.relative.value?.benchmark_return5)}>{percent(row.relative.value?.benchmark_return5)}</td>
+          <td className={tone(row.relative.value?.relative5)}>{percent(row.relative.value?.relative5, '')}</td>
+          <td className={tone(row.relative.value?.relative20)}>{percent(row.relative.value?.relative20, '')}</td>
+          <td className={tone(row.relative.value?.relative_change5)}>{percent(row.relative.value?.relative_change5, '')}</td>
+          <td className="mc-state">{row.relative.value ? states[row.relative.value.state] : 'Unavailable'}</td>
+          <td className="mc-state">{row.divergence.value?.labels.map(words).join('; ') ?? 'Unavailable'}{!row.relative.value && <small>{row.context.reason_codes.map(words).join(', ') || row.relative.reason_codes.map(words).join(', ')}</small>}</td>
+        </tr>)}</tbody>
       </table>{!stocks.length && <div className="mc-empty">No matching stocks.</div>}</div>}
 
       {tab === 'indicators' && <div className="mc-indicators">
@@ -255,6 +333,6 @@ export default function MarketConditionsPage() {
         <p className="mc-muted">Split-adjusted share-count change times same-session NAV. Daily estimate, not all capital entering a sector; unavailable without authorized paired source records.</p>
       </div>}
     </section>
-    <details className="mc-provenance"><summary>Coverage and provenance</summary><dl><div><dt>Price basis</dt><dd>Raw, action-gated; not total returns</dd></div><div><dt>Sector mapping</dt><dd>Dated SIC-derived proxies; not licensed GICS</dd></div><div><dt>Refresh mode</dt><dd>{words(data.refresh_mode ?? 'ONE_SHOT_CAPTURE')}</dd></div><div><dt>Snapshot</dt><dd className="mc-hash">{data.snapshot_sha256}</dd></div></dl><ul>{data.warnings?.map(warning => <li key={warning}>{warning}</li>)}</ul></details>
+    <details className="mc-provenance"><summary>Coverage and provenance</summary><dl><div><dt>Price basis</dt><dd>{data.price_basis === 'REVIEWED_SPLIT_ADJUSTED_PRICE_V1' ? 'Reviewed split-adjusted prices; distributions excluded, not total returns' : 'Raw, action-gated; not total returns'}</dd></div><div><dt>Sector mapping</dt><dd>Dated SIC-derived proxies; not licensed GICS</dd></div><div><dt>Refresh mode</dt><dd>{words(data.refresh_mode ?? 'ONE_SHOT_CAPTURE')}</dd></div><div><dt>Snapshot</dt><dd className="mc-hash">{data.snapshot_sha256}</dd></div></dl><ul>{data.warnings?.map(warning => <li key={warning}>{warning}</li>)}</ul></details>
   </div>
 }
