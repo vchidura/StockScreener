@@ -14,6 +14,7 @@ pytestmark = pytest.mark.skipif(os.name != "nt" or not POWERSHELL, reason="Windo
 EQUITY = ["run_equity_worker.py", "run_corporate_action_worker.py", "run_stock_idea_worker.py", "refresh_equity_portal_snapshots.py", "run_screening_worker.py"]
 OPTIONS = ["run_market_event_worker.py", "run_option_model_input_worker.py", "run_option_worker.py"]
 WORKERS = dict(zip(["Equity", "CorporateActions", "StockAlerts", "Portal", "Screening", "MarketEvents", "OptionInputs", "Options"], EQUITY + OPTIONS))
+WORKERS["AlertContext"] = "run_stock_alert_context_worker.py"
 
 
 def run_test_command(command, cwd):
@@ -84,6 +85,15 @@ def test_single_worker_plan_starts_only_selected_entry_point(name, script, once)
     assert "Dependencies are not started automatically" in result.stdout
 
 
+def test_shadow_event_diagnostics_are_explicit_and_cannot_target_alert_selection():
+    lines = worker_lines(preview("-Worker", "AlertContext", "-ShadowEvents"))
+    assert len(lines) == 1 and "--shadow-events" in lines[0] and "run_stock_alert_context_worker.py" in lines[0]
+    assert "--shadow-events" not in " ".join(worker_lines(preview("-Worker", "AlertContext")))
+    assert preview("-Worker", "StockAlerts", "-ShadowEvents").returncode != 0
+    launched = mocked_start("-Worker", "AlertContext", "-ShadowEvents")
+    assert launched.returncode == 0 and "--shadow-events" in launched.stdout
+
+
 def test_single_ingestion_worker_can_explicitly_request_bounded_repair():
     lines = worker_lines(preview("-Worker", "Equity", "-Once", "-RepairSessions", "3"))
     assert len(lines) == 1 and "--once --repair-sessions 3" in lines[0]
@@ -137,7 +147,7 @@ def test_one_shot_duplicates_fail_and_do_not_publish_screening():
     assert "MOCK_START " not in result.stdout
 
 
-@pytest.mark.parametrize("name", ["MarketEvents", "Screening", "StockAlerts"])
+@pytest.mark.parametrize("name", ["MarketEvents", "Screening", "StockAlerts", "AlertContext"])
 def test_single_worker_launch_and_duplicate_handling(name):
     result = mocked_start("-Worker", name)
     assert result.returncode == 0, result.stdout + result.stderr

@@ -4,7 +4,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Bell, ChevronDown, ChevronRight, Clock, Download, History, RefreshCw, ShieldAlert } from 'lucide-react'
 import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
 import { usePublishPageContext } from '../layout/pageContext'
-import { getAlertView, type AlertPlanRow } from '../services/stockDiscovery'
+import { getAlertView, type AlertContextFactor, type AlertPlanRow } from '../services/stockDiscovery'
 import { alertSort, alertSourceParams, alertTabParams, alertTradeFilters, legacyAlertStatuses, resolveAlertRoute, tradeAlertModels, tradeAlertStatuses, type AlertView } from './stockAlertNavigation'
 import { alertColumnLayout, alertRiskAssessment, unavailableAlertProbability } from './stockAlertPresentation'
 import './StockDiscoveryPage.css'
@@ -66,6 +66,81 @@ function exportAlerts(rows: AlertPlanRow[], visible: AlertColumn[], value: (row:
   anchor.download = 'stock-alerts.csv'
   anchor.click()
   URL.revokeObjectURL(url)
+}
+
+function contextValue(key: string, factor: AlertContextFactor): ReactNode {
+  const value = factor.value
+  if (!value) return 'Unavailable'
+  if (key === 'market') return value.direction ? readable(value.direction) : 'Unavailable'
+  if (key === 'spy' || key === 'qqq') return <>{value.direction ? readable(value.direction) : 'Unavailable'} / 1 session {percent(value.return1)} / 5 sessions {percent(value.return5)} / 20 sessions {percent(value.return20)}</>
+  if (key === 'sector_rotation' || key === 'stock_relative_rotation') return <>
+    {value.state ? readable(value.state) : 'Unavailable'} / 5-session relative {number((value.relative5 ?? NaN) * 100)} pp
+    <p>20-session relative {number((value.relative20 ?? NaN) * 100)} pp / relative change {number((value.relative_change5 ?? NaN) * 100)} pp</p>
+    {factor.persistence && <p>{readable(factor.persistence.status)} ({factor.persistence.observations}) / reconstructed trail</p>}
+  </>
+  if (key === 'stock_divergence') return value.labels?.map(readable).join('; ') || 'Unavailable'
+  if (key === 'tracked_breadth') return <>{value.advancing} advancing / {value.declining} declining
+    <p>Above SMA50 {number((value.above_sma50_fraction ?? NaN) * 100)}% / SMA200 {number((value.above_sma200_fraction ?? NaN) * 100)}%</p>
+    <p>Coverage {factor.timely_observations ?? 'Unknown'} / {factor.expected_observations ?? 'Unknown'}</p></>
+  if (key === 'spy_realized_volatility') return <>{number((value.annualized_volatility20 ?? NaN) * 100)}% annualized / 20 daily returns</>
+  if (key === 'vix' || key === 'credit') return <>{number(value.level)} {key === 'credit' ? 'bps' : 'points'} / percentile {number((value.percentile ?? NaN) * 100)}%</>
+  if (key === 'conditions_score') return <>{number(value.score, 1)} / 100 / development only</>
+  if (key === 'market_volume' || key === 'sector_volume') return <>{number(value.relative_volume)}x / same elapsed session time</>
+  if (key === 'event_shadow') return <>{value.disposition ? readable(value.disposition) : 'Unknown'} / live gate disabled
+    {!!value.blocking_factors?.length && <p>Holding-window events: {value.blocking_factors.join(', ')}</p>}
+    {!!value.unknown_factors?.length && <p>Uncertain: {value.unknown_factors.join(', ')}</p>}</>
+  if (key === 'stock_daily') return <>{value.direction ? readable(value.direction) : 'Unavailable'} / 20-session return {percent(value.return20)}</>
+  if (key === 'sector') return <>{value.direction ? readable(value.direction) : 'Unavailable'} / stock vs sector {number((value.stock_minus_sector20 ?? NaN) * 100)} pp / sector vs SPY {number((value.sector_minus_spy20 ?? NaN) * 100)} pp (20 sessions)</>
+  if (key === 'financials') return value.reports?.map(report => <div className="sa-financial-report" key={report.report_id}>
+    <strong>{readable(report.timeframe)} / {report.period_end}</strong>
+    <p>Filed {report.filing_date} / {report.age_days} days since period end{report.stale ? ' / Stale' : ''}</p>
+    <p>{readable(report.units)}</p>
+    <p>Cash {number(report.metrics.cash_and_equivalents)} / current debt {number(report.metrics.current_debt)} / long-term debt {number(report.metrics.long_term_debt)}</p>
+    <p>Operating cash flow {number(report.metrics.operating_cash_flow)} / capex {number(report.metrics.capital_expenditures)} / reported free cash flow {number(report.metrics.free_cash_flow)}</p>
+    <p>{report.source}{report.accession_number ? ` / ${report.accession_number}` : ''}</p>
+  </div>) || 'Unavailable'
+  if (value.events?.length) return <>{value.events.map((event, index) => <p key={`${event.type}-${event.scheduled_time}-${index}`}>
+    {readable(event.type)} / {time(event.scheduled_time)} ET / {readable(event.confidence)}
+    {event.relative_timing && <small>{readable(event.relative_timing)}</small>}
+  </p>)}{value.timing_uncertain && <span>Event timing uncertain</span>}</>
+  return value.coverage_complete ? 'No known event in the holding horizon' : 'Event coverage unknown'
+}
+
+function SavedAlertContext({ row }: { row: AlertPlanRow }) {
+  const context = row.context
+  const labels: [string, string][] = [['market', 'Market'], ['stock_daily', 'Ticker daily'], ['sector', 'Sector'],
+    ['earnings', 'Earnings'], ['fomc', 'FOMC'], ['financials', 'Financials / debt / cash flow'],
+    ['sector_rotation', 'Sector rotation vs SPY'], ['stock_relative_rotation', 'Ticker rotation vs sector'],
+    ['stock_divergence', 'Five-session divergence'], ['tracked_breadth', 'Tracked-stock breadth'],
+    ['spy', 'SPY'], ['qqq', 'QQQ'], ['spy_realized_volatility', 'SPY realized volatility'],
+    ['vix', 'VIX'], ['credit', 'High-yield OAS'], ['conditions_score', 'Development conditions score'],
+    ['market_volume', 'SPY comparable volume'], ['sector_volume', 'Sector comparable volume'], ['event_shadow', 'Event shadow study']]
+  return <section className="sa-context" aria-label={`Saved context for ${row.ticker}`}>
+    <h3>Publication context</h3>
+    {context?.status !== 'AVAILABLE' ? <p className="sa-context-meta">{context?.reason ? readable(context.reason) : 'No saved publication context'}</p> : <>
+      <p className="sa-context-meta">Retained as-of evidence / cutoff {time(context.input_cutoff)} ET / assembled {time(context.assembled_at)} ET</p>
+      <dl className="sa-context-grid">{labels.filter(([key], index) => index < 6 || key in context.factors).map(([key, label]) => {
+        const factor = context.factors[key]
+        return <div key={key}><dt>{label}</dt><dd>
+          <span className="sa-context-status">{factor ? readable(factor.status) : 'Not covered'}</span>
+          {factor && <div>{contextValue(key, factor)}</div>}
+          {factor && <details className="sa-context-evidence"><summary>Source evidence ({factor.source_revision_ids.length})</summary>
+            <p>Market/event time {time(factor.market_time)} ET</p>
+            <p>Observed {time(factor.observed_at)} ET / available {time(factor.available_at)} ET</p>
+            {factor.source_snapshot_sha256 && <><p>Archived Market Conditions / session {factor.source_snapshot_session}</p><code>{factor.source_snapshot_sha256}</code><p>Source lineage</p><code>{factor.source_lineage_ref}</code></>}
+            {factor.reason_codes.length > 0 && <p>{factor.reason_codes.map(readable).join('; ')}</p>}
+            <code>{factor.source_revision_ids.join(', ') || 'No eligible source revisions'}</code>
+          </details>}
+        </dd></div>
+      })}</dl>
+      <details className="sa-context-evidence"><summary>Publication provenance</summary>
+        <p>{context.capture_mode ? readable(context.capture_mode) : 'Unavailable'}</p>
+        <p>Published {time(context.publication_at)} ET</p>
+        <p>Context hash <code>{context.bundle_sha256}</code></p>
+        <p>Original publication hash <code>{context.source_publication_sha256}</code></p>
+      </details>
+    </>}
+  </section>
 }
 
 export default function StockAlertsPage() {
@@ -230,7 +305,7 @@ export default function StockAlertsPage() {
             <div><dt>Indicator snapshot</dt><dd>{row.indicator_interval} / {time(row.indicator_at)} ET / {readable(row.indicator_status)}</dd></div>
             {view === 'history' && <><div><dt>Paper mark (ET)</dt><dd>{price(row.mark_price)} / {time(row.mark_at)}</dd></div><div><dt>Fixed exit (ET)</dt><dd>{price(row.exit_price)} / {time(row.exit_at)}</dd></div></>}
             <div><dt>Policy</dt><dd>{row.policy_version}</dd></div><div><dt>Recurrence coverage</dt><dd>{data?.hit_coverage || 'Unavailable in this source'}</dd></div>
-          </dl></td></tr>}</Fragment>)}
+          </dl><SavedAlertContext row={row} /></td></tr>}</Fragment>)}
         </tbody></table></div>}
       <footer className="sd-pager"><span>{data?.total ? `${offset + 1}-${offset + rows.length} of ${data.total}` : '0 results'}</span><div><button title="Previous page" aria-label="Previous page" disabled={!offset} onClick={() => update({ offset: String(Math.max(0, offset - 100)) })}><ArrowLeft size={16} /></button><button title="Next page" aria-label="Next page" disabled={offset + rows.length >= (data?.total || 0)} onClick={() => update({ offset: String(offset + 100) })}><ArrowRight size={16} /></button></div></footer>
     </section>

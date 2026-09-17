@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
 from pathlib import Path
 import sys
+import sqlite3
 import threading
 import time
 
@@ -16,7 +18,7 @@ sys.path.insert(0, str(BACKEND))
 
 from research.stock_idea_engine import digest
 from research.stock_idea_forward import (ForwardPublicationLate, ForwardStore, READINESS_POLICY, advance_detectors, forward_config, forward_decision,
-    next_boundary, packet_record, publish_view, readiness_deadline, restore_packet, runtime_sources, shadow_snapshot, update_positions, window_clock)
+    alert_selection_cohort, next_boundary, packet_record, publish_view, readiness_deadline, restore_packet, runtime_sources, shadow_snapshot, update_positions, window_clock)
 from research.stock_idea_replay import session_windows, utc
 
 DEFAULT_ROOT = BACKEND / "backups/equity-shadow/stock-ideas-forward-v1"
@@ -31,6 +33,32 @@ def validate_view_policy(path, policy):
             raise ValueError("view belongs to a different policy; choose a separate shadow view path")
 
 
+def inspect_source_readiness(path):
+    from equity.api import expected_materialized_market_time
+    from equity.stock_idea_forward_source import forward_input_readiness
+    now = datetime.now(timezone.utc)
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+        connection.execute("PRAGMA query_only=ON")
+        row = connection.execute("SELECT payload FROM forward_checkpoint WHERE singleton=1").fetchone()
+        if not row:
+            return dict(status="NOT_ENROLLED")
+        state = ForwardStore.decode(row[0])
+    pending = utc(state.get("retry_boundary", state["next_boundary"]))
+    latest_source_boundary = expected_materialized_market_time(now, "30m")
+    prospective, cohort = alert_selection_cohort(state, next_boundary(now))
+    pending_members, pending_cohort = alert_selection_cohort(state, pending)
+    result = dict(checked_at=now.isoformat(), enrolled_members=len(state["members"]), pending_boundary=pending.isoformat(),
+        pending_deadline=readiness_deadline(pending).isoformat(), pending_members=len(pending_members),
+        pending_cohort=pending_cohort, future_members=len(prospective), future_cohort=cohort,
+        identity_breaks=state.get("identity_breaks", {}))
+    result["pending_source_ready"] = forward_input_readiness(pending_members, pending, now,
+        include_daily=pending == session_windows(str(pending.date()))[-1][1]) is not None
+    result["prospective_source_probe"] = dict(boundary=latest_source_boundary.isoformat(),
+        ready=forward_input_readiness(prospective, latest_source_boundary, now) is not None,
+        scope="RETAINED_SOURCE_MEMBERSHIP_ONLY_NOT_FUTURE_PUBLICATION_GUARANTEE")
+    return result
+
+
 def readiness_cycle(store, state, config, view_path, *, clock, read_inputs, read_readiness=None):
     from equity.stock_idea_forward_source import forward_input_readiness
     read_readiness = read_readiness or forward_input_readiness
@@ -42,7 +70,8 @@ def readiness_cycle(store, state, config, view_path, *, clock, read_inputs, read
     if now <= deadline and now - utc(state.get("last_readiness_check", "1900-01-01T00:00:00Z")) < timedelta(seconds=10):
         return state, dict(status="WAITING_FOR_SOURCE_PUBLICATION", boundary=boundary.isoformat(), deadline=deadline.isoformat())
     state["last_readiness_check"] = now.isoformat()
-    readiness = read_readiness(state["members"], boundary, now, include_daily=include_daily) if now <= deadline else None
+    selection_members, cohort = alert_selection_cohort(state, boundary)
+    readiness = read_readiness(selection_members, boundary, now, include_daily=include_daily) if now <= deadline else None
     if not readiness and now <= deadline:
         return state, dict(status="WAITING_FOR_SOURCE_PUBLICATION", boundary=boundary.isoformat(), deadline=deadline.isoformat())
     if readiness:
@@ -58,6 +87,8 @@ def readiness_cycle(store, state, config, view_path, *, clock, read_inputs, read
         if include_daily:
             state["last_daily_read"] = cutoff.isoformat()
         readiness["input_cutoff"] = cutoff.isoformat()
+        if cohort:
+            readiness["alert_cohort_generation"] = cohort["generation_id"]
         store.save(state)
     else:
         readiness = dict(input_cutoff=deadline.isoformat(), publications=[], reason="SOURCE_NOT_READY_BEFORE_DEADLINE")
@@ -83,7 +114,8 @@ def readiness_cycle(store, state, config, view_path, *, clock, read_inputs, read
     publish_view(view_path, shadow_snapshot(state, store.publications(), config, clock()))
     return state, dict(status=publication["coverage"], boundary=boundary.isoformat(), retry_of=retry,
         published_at=publication["actual_publication_at"], candidates=len(publication["dispositions"]),
-        selected=len(publication["selected"]), missing_members=len(publication["missing_members"]), dispatch_policy=READINESS_POLICY["version"])
+        selected=len(publication["selected"]), missing_members=len(publication["missing_members"]), dispatch_policy=READINESS_POLICY["version"],
+        selection_members=len(selection_members), cohort_generation=cohort["generation_id"] if cohort else None)
 
 
 def cycle(store, state, config, view_path, *, clock=lambda: datetime.now(timezone.utc), read_inputs=None):
@@ -165,11 +197,28 @@ def main(argv=None):
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--plan", action="store_true")
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--check-readiness", action="store_true", help="Inspect cohort and source readiness without checkpoint writes")
+    parser.add_argument("--reconcile-history", action="store_true", help="Back up and reconcile missing retained 30m history for future detectors only")
+    parser.add_argument("--recover-corrections", action="store_true", help="Activate reviewed canonical corrections for future detectors, preserving original bars and positions")
+    parser.add_argument("--expected-correction-hash", help="Required reviewed inventory SHA256 for --recover-corrections")
+    parser.add_argument("--quarantine-security-id", help="Explicitly quarantine an enrolled identity from future alert selection only")
+    parser.add_argument("--quarantine-ticker", help="Exact enrolled ticker paired with the quarantined security ID")
     parser.add_argument("--enable-source-readiness", action="store_true")
     parser.add_argument("--retry-window", help="Append a current-time retry of a retained empty, incomplete window")
     parser.add_argument("--quality-version", type=int, choices=(1, 2), default=2)
     parser.add_argument("--state-dir", type=Path)
     args = parser.parse_args(argv)
+    quarantine = bool(args.quarantine_security_id or args.quarantine_ticker)
+    if args.recover_corrections != bool(args.expected_correction_hash):
+        parser.error("Correction recovery requires its reviewed inventory hash and no standalone hash")
+    if args.recover_corrections and (quarantine or args.reconcile_history or args.once or args.status or args.plan or args.check_readiness or args.retry_window or args.enable_source_readiness):
+        parser.error("Correction recovery cannot be combined with other operation modes")
+    if args.reconcile_history and (quarantine or args.once or args.status or args.plan or args.check_readiness or args.retry_window or args.enable_source_readiness):
+        parser.error("History reconciliation cannot be combined with other operation modes")
+    if quarantine and (not args.quarantine_security_id or not args.quarantine_ticker or args.once or args.status or args.plan or args.check_readiness or args.retry_window or args.enable_source_readiness):
+        parser.error("Quarantine requires exact security ID and ticker, and cannot be combined with other operation modes")
+    if args.check_readiness and (args.once or args.status or args.plan or args.retry_window or args.enable_source_readiness):
+        parser.error("Readiness inspection cannot be combined with writer modes")
     args.state_dir = args.state_dir or (QUALITY_ROOT if args.quality_version == 2 else DEFAULT_ROOT)
     view_path = Path(os.getenv("STOCK_ALERT_SHADOW_VIEW") or args.state_dir / "alerts-view.json")
     if args.plan:
@@ -188,6 +237,9 @@ def main(argv=None):
     view_path = Path(os.getenv("STOCK_ALERT_SHADOW_VIEW") or args.state_dir / "alerts-view.json")
     from database import get_db_connection
     from equity.stock_idea_forward_source import enrolled_members, read_forward_inputs
+    if args.check_readiness:
+        print(json.dumps(inspect_source_readiness(args.state_dir / "forward.sqlite"), indent=2), flush=True)
+        return 0
     config = forward_config(quality_version=args.quality_version)
     validate_view_policy(view_path, config)
     store = ForwardStore(args.state_dir / "forward.sqlite", config)
@@ -201,6 +253,30 @@ def main(argv=None):
                 return 0
         try:
             state = store.load()
+            if args.recover_corrections:
+                if state is None:
+                    raise ValueError("correction recovery requires an enrolled checkpoint")
+                now = datetime.now(timezone.utc)
+                members, _ = alert_selection_cohort(state, next_boundary(now))
+                batch = read_forward_inputs(members, now, after=now)
+                state, result = store.recover_corrections(batch, config, now, args.expected_correction_hash,
+                    clock=lambda: datetime.now(timezone.utc))
+                print(json.dumps(result, indent=2), flush=True)
+                return 0
+            if args.reconcile_history:
+                if state is None:
+                    raise ValueError("history reconciliation requires an enrolled checkpoint")
+                now = datetime.now(timezone.utc)
+                members, _ = alert_selection_cohort(state, next_boundary(now))
+                batch = read_forward_inputs(members, now, after=now)
+                state, result = store.reconcile_retained_history(batch, config, now, clock=lambda: datetime.now(timezone.utc))
+                print(json.dumps(result, indent=2), flush=True)
+                return 0
+            if quarantine:
+                state, result = store.activate_identity_quarantine(args.quarantine_security_id, args.quarantine_ticker, datetime.now(timezone.utc))
+                publish_view(view_path, shadow_snapshot(state, store.publications(), config, datetime.now(timezone.utc)))
+                print(json.dumps(result, indent=2), flush=True)
+                return 0
             if args.retry_window:
                 if state is None:
                     raise ValueError("retry requires an enrolled checkpoint")

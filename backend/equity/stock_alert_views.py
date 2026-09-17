@@ -22,6 +22,12 @@ def load_alert_view(source):
     return load_snapshot(path, source)
 
 
+def attach_alert_context(page):
+    from research.stock_alert_annotations import attach_publication_context
+    path = os.getenv("STOCK_ALERT_SHADOW_VIEW") or str(Path(__file__).resolve().parents[1] / "backups/equity-shadow/stock-ideas-forward-v2/alerts-view.json")
+    return attach_publication_context(page, Path(path).parent / "alert-context")
+
+
 def history_snapshot_for_date(snapshot, session=None):
     if snapshot["source"] != "SHADOW":
         return snapshot

@@ -27,7 +27,7 @@ def enrolled_members(now):
 
 
 def read_forward_inputs(members, now, *, bootstrap=False, include_daily=False, after=None):
-    native_start = now - timedelta(days=100) if bootstrap else (after - timedelta(hours=1) if after else now - timedelta(days=2))
+    native_start = now - timedelta(days=100) if bootstrap else min(now - timedelta(days=7), after - timedelta(hours=1) if after else now)
     action_start = now - timedelta(days=450)
     daily_start = action_start if bootstrap else min(now - timedelta(days=7), after - timedelta(days=1) if after else now)
     names = sorted({member["ticker"] for member in members} | {"SPY"})

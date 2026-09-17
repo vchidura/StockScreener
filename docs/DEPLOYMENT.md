@@ -21,6 +21,14 @@ the final schema.
 | `equity-migrate` | `maintenance` | One-shot migrations with the bootstrap administrator |
 | `equity-stream-worker` | `equity-stream` | Reserved Advanced stream; keep disabled |
 
+Native Windows additionally supports the explicit `-Worker AlertContext` launcher
+selection. This provider-free annotator is not in the default worker sets or a new
+Compose service. It follows the configured shadow reader ledger, uses an independent
+advisory lock and writes only immutable context/evidence plus its own status. See
+[automatic annotation](STOCK_ALERT_CONTEXT_ENHANCEMENT_DESIGN.md#automatic-annotation-and-financial-pilot)
+for activation, bounded catch-up and source-access limits. It never changes alert
+selection or introduces a provider requirement into publication.
+
 Options remain a read-only research surface. Do not enable equity option
 context, raw option archival, broker execution, or the Advanced stock stream
 until their separate acceptance gates pass.

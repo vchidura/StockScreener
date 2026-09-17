@@ -1,5 +1,6 @@
 """Read-only stock discovery and paper alert ledger endpoints."""
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Query
@@ -10,6 +11,18 @@ from equity.stock_discovery import ALERT_SOURCE, MARK_SOURCE, VERSION, filter_st
 from equity.stock_discovery_service import load_snapshot
 
 router = APIRouter(prefix="/api/stocks", tags=["stock-discovery"])
+
+
+@router.get("/market-conditions")
+def market_conditions():
+    from research.stock_rotation import load_rotation_page
+    now = datetime.now(timezone.utc)
+    expected = expected_materialized_market_time(now, "1d").date().isoformat()
+    path = Path(__file__).resolve().parents[1] / "backups/stock-rotation/latest.json"
+    try:
+        return load_rotation_page(path, expected, now)
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        raise HTTPException(status_code=503, detail="Stored market conditions are unavailable or incompatible") from error
 
 
 @router.get("/screener")
@@ -87,7 +100,7 @@ def alert_view(source: Literal["SHADOW", "REPLAY", "LEGACY"] = "SHADOW", session
                model: str | None = None, interval: str | None = None, status: str | None = None,
                lane: Literal["TRADE", "WATCH"] | None = None, sort: str | None = None, descending: bool = True,
                offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=200)):
-    from equity.stock_alert_views import current_history_prices, history_snapshot_for_date, load_alert_view
+    from equity.stock_alert_views import attach_alert_context, current_history_prices, history_snapshot_for_date, load_alert_view
     from research.stock_alerts import alert_page
     try:
         snapshot = load_alert_view(source)
@@ -97,8 +110,9 @@ def alert_view(source: Literal["SHADOW", "REPLAY", "LEGACY"] = "SHADOW", session
     except (ValueError, OSError) as error:
         raise HTTPException(status_code=503, detail="Retained alert source is unavailable or incompatible") from error
     try:
-        return alert_page(snapshot, session=str(session_date) if session_date else None, view=view, run=run,
+        page = alert_page(snapshot, session=str(session_date) if session_date else None, view=view, run=run,
             search=search, direction=direction, model=model, interval=interval, status=status, lane=lane,
             sort=sort, descending=descending, offset=offset, limit=limit)
+        return attach_alert_context(page)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error

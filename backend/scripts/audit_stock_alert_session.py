@@ -324,16 +324,212 @@ def verify_quality_fixes(policy, state, publications, session):
         outcomes_recomputed=False, winners_reselected=False, classification="RETAINED_CASE_REGRESSION_NOT_PERFORMANCE_STUDY")
 
 
+def verify_history_reconciliation(policy, state, publications, state_dir):
+    from research.stock_idea_forward import digest
+    record = next((row for row in reversed(state.get("input_reconciliation_history", [])) if row.get("backup")), None)
+    if record is None:
+        raise ValueError("no backed-up history reconciliation is retained")
+    backup_path = state_dir / record["backup"]
+    assert hashlib.sha256(backup_path.read_bytes()).hexdigest() == record["backup_sha256"]
+    before_policy, before, before_publications, _ = load_retained(backup_path)
+    assert before_policy == policy and publications == before_publications
+    allowed = {"bars", "detectors", "pending_candidates", "prepared_packets", "detector_recovery_boundaries", "input_reconciliation_history"}
+    assert {key: value for key, value in state.items() if key not in allowed} == {key: value for key, value in before.items() if key not in allowed}
+    for key, rows in before["bars"].items():
+        assert all(state["bars"][key].get(start) == bar for start, bar in rows.items())
+    with closing(sqlite3.connect(backup_path.resolve().as_uri() + "?mode=ro", uri=True)) as original, closing(sqlite3.connect((state_dir / "forward.sqlite").resolve().as_uri() + "?mode=ro", uri=True)) as current:
+        assert original.execute("SELECT * FROM forward_outbox ORDER BY 1").fetchall() == current.execute("SELECT * FROM forward_outbox ORDER BY 1").fetchall()
+    added = {bar["revision_id"] for key, rows in state["bars"].items() for start, bar in rows.items() if start not in before["bars"].get(key, {})}
+    assert added == {revision for revisions in record["inserted_revision_ids"].values() for revision in revisions}
+    ready = Counter()
+    for security in record["inserted_revision_ids"]:
+        native = sorted(state["bars"][security + "|30m"].values(), key=lambda bar: bar["bar_start"])
+        actions = [action for action in state.get("actions", []) if action["security_id"] == security]
+        for interval, source in (("30m", native), ("1h", derive_hours(native, policy))):
+            frame = build_frame(source, policy, actions=actions)
+            ready[interval] += int(not frame.empty and bool(frame.ready.iloc[-1]))
+            assert not state["detectors"][security + "|" + interval]["states"]
+        assert state["detector_recovery_boundaries"][security] == record["effective_boundary"]
+    return dict(status="HISTORY_PRESERVATION_VERIFIED", inserted_bars=len(added), affected_members=len(record["inserted_revision_ids"]),
+        effective_boundary=record["effective_boundary"], feature_ready=dict(ready), warmup_requirement=policy["feature_warmup_bars"],
+        original_publications=len(publications), positions=len(state.get("positions", {})),
+        backup_sha256=record["backup_sha256"], restored_revision_sha256=digest(sorted(added)),
+        existing_bars_unchanged=True, other_checkpoint_fields_unchanged=True, outbox_unchanged=True)
+
+
+def verify_correction_recovery(policy, state, publications, state_dir):
+    from research.stock_idea_forward import active_correction_recoveries, alert_selection_cohort, corrected_detector_inputs, correction_inventory_hash
+    history = state.get("correction_recovery_history", [])
+    if not history:
+        raise ValueError("no backed-up correction recovery retained")
+    record = history[-1]
+    backup_path = state_dir / record["backup"]
+    assert hashlib.sha256(backup_path.read_bytes()).hexdigest() == record["backup_sha256"]
+    prior_policy, prior, prior_publications, _ = load_retained(backup_path)
+    assert policy == prior_policy and publications == prior_publications
+    allowed = {"detectors", "pending_candidates", "prepared_packets", "detector_recovery_boundaries", "correction_recovery_history"}
+    assert {key: value for key, value in state.items() if key not in allowed} == {key: value for key, value in prior.items() if key not in allowed}
+    assert correction_inventory_hash(state) == record["inventory_sha256"]
+    assert history[:-1] == prior.get("correction_recovery_history", [])
+    with closing(sqlite3.connect(backup_path.resolve().as_uri() + "?mode=ro", uri=True)) as original, closing(sqlite3.connect((state_dir / "forward.sqlite").resolve().as_uri() + "?mode=ro", uri=True)) as current:
+        for table in ("forward_manifest", "forward_publications", "forward_outbox"):
+            assert original.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall() == current.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+    affected = {pair["security_id"] for pair in record["pairs"]}
+    for key, detector in prior.get("detectors", {}).items():
+        security, interval = key.split("|", 1)
+        if security in affected and interval in ("30m", "1h"):
+            assert state["detectors"][key] == dict(detector, states={})
+        else:
+            assert state["detectors"][key] == detector
+    assert state.get("pending_candidates", {}) == {key: value for key, value in prior.get("pending_candidates", {}).items() if value["security_id"] not in affected}
+    assert state.get("prepared_packets", []) == [packet for packet in prior.get("prepared_packets", []) if packet["security_id"] not in affected]
+    effective, activated = utc(record["effective_boundary"]), utc(record["activated_at"])
+    recovered = active_correction_recoveries(state, effective, activated)
+    assert affected <= set(recovered)
+    assert not affected.intersection(active_correction_recoveries(state, activated, activated))
+    for security in affected:
+        assert state["detector_recovery_boundaries"][security] == record["effective_boundary"]
+    inputs = corrected_detector_inputs(state, recovered)
+    ready, model_ready, unavailable = Counter(), Counter(), []
+    prior_session = str(exchange_calendars.get_calendar("XNYS").previous_session(str(effective.date())).date())
+    members, _ = alert_selection_cohort(state, effective)
+    for member in members:
+        security = member["security_id"]
+        native = sorted(inputs.get(security + "|30m", {}).values(), key=lambda bar: bar["bar_start"])
+        actions = [action for action in state.get("actions", []) if action["security_id"] == security]
+        for interval, rows in (("30m", native), ("1h", derive_hours(native, policy))):
+            frame = build_frame(rows, policy, actions=actions)
+            feature_ready = not frame.empty and bool(frame.ready.iloc[-1])
+            ready[interval] += int(feature_ready)
+            eligible = feature_ready and (security not in state.get("identity_breaks", {}) or security in recovered) and security + "|" + prior_session in state.get("contexts", {})
+            model_ready[interval] += int(eligible)
+            if interval == "30m" and not eligible:
+                unavailable.append(member["ticker"])
+    return dict(status="CORRECTION_PRESERVATION_VERIFIED", generation_id=record["generation_id"],
+        reviewed_pairs=len(record["pairs"]), recovered_members=len(affected), effective_boundary=record["effective_boundary"],
+        prospective_feature_ready=dict(ready), prospective_model_ready_on_retained_inputs=dict(model_ready),
+        still_unavailable_30m=unavailable, active_cohort=len(members), warmup_requirement=policy["feature_warmup_bars"],
+        original_publications=len(publications), original_positions=len(state.get("positions", {})),
+        original_bars_and_corrections_unchanged=True, protected_checkpoint_fields_unchanged=True, outbox_unchanged=True,
+        backup_sha256=record["backup_sha256"], future_publication_not_simulated=True)
+
+
+def publication_summary(state, publications, session):
+    from research.stock_idea_forward import active_correction_recoveries, correction_inventory_hash
+    now = datetime.now(timezone.utc)
+    records = [record for record in publications if record["session"] == session]
+    names = {member["security_id"]: member["ticker"] for member in state["members"]}
+    recovered = active_correction_recoveries(state, now, now)
+    breaks = {security: reason for security, reason in state.get("identity_breaks", {}).items() if security not in recovered}
+    latest = records[-1] if records else None
+    missing = latest["missing_members"] if latest else []
+    missing_reasons = {security: "RECOVERED_FOR_FUTURE_RUNS" if security in recovered
+        and latest and utc(latest.get("market_time", latest["window_key"])) < utc(recovered[security]["effective_boundary"])
+        else breaks.get(security, "MODEL_INPUT_NOT_READY") for security in missing}
+    reasons = Counter(missing_reasons.values())
+    setups = Counter()
+    for key, detector in state.get("detectors", {}).items():
+        security, interval = key.split("|", 1)
+        if security in breaks:
+            continue
+        for model, saved in detector.get("states", {}).items():
+            lifecycle = saved.get("lifecycle")
+            if lifecycle:
+                setups[f"{interval}:{model}:{lifecycle['setup']}"] += 1
+    return dict(checked_at=datetime.now(timezone.utc).isoformat(), last_source_read=state.get("last_source_read"),
+        runtime_matches_disk=state.get("runtime_sources") == runtime_sources(), next_boundary=state.get("next_boundary"),
+        runs=[dict(boundary=record["window_key"], status=record["coverage"], actual_publication_at=record["actual_publication_at"],
+            expected=len(record["expected_members"]), missing=len(record["missing_members"]),
+            candidates=len(record.get("candidates", {})), selected=len(record["selected"]),
+            dispositions=dict(Counter(item["reason"] for item in record["dispositions"]))) for record in records],
+        current_missing_reasons=dict(reasons), missing_reason_samples={reason: [names.get(security, security) for security in missing
+            if missing_reasons[security] == reason][:8] for reason in reasons},
+        current_identity_breaks=dict(Counter(breaks.values())), detector_setups=dict(setups),
+        correction_inventory_sha256=correction_inventory_hash(state),
+        active_correction_recoveries=len(recovered), correction_recovery=[dict(generation_id=record["generation_id"],
+            activated_at=record["activated_at"], effective_boundary=record["effective_boundary"],
+            members=len({pair["security_id"] for pair in record["pairs"]})) for record in state.get("correction_recovery_history", [])],
+        correction_count=len(state.get("corrections", [])), correction_samples=[dict(record, ticker=names.get(record["security_id"]))
+            for record in state.get("corrections", [])[:3]],
+        recovery=[dict(observed_at=record["observed_at"], effective_boundary=record["effective_boundary"],
+            members=len(record["inserted_revision_ids"])) for record in state.get("input_reconciliation_history", [])],
+        latest_source_readiness=latest.get("source_readiness") if latest else None,
+        note="Missing reasons and detector setups reflect the current retained checkpoint; runs are immutable publication records")
+
+
+def summarize_correction_rows(corrections, rows):
+    indexed = {row["revision_id"]: row for row in rows}
+    counts, samples = Counter(), []
+    identity_fields = ("security_id", "ticker", "interval", "bar_start", "bar_end", "session_scope", "adjusted", "is_final")
+    value_fields = ("open", "high", "low", "close", "volume")
+    for correction in corrections:
+        original = indexed.get(correction["original_revision_id"])
+        revised = indexed.get(correction["revision_id"])
+        changed = []
+        if not original or not revised:
+            reason = "REVISION_UNAVAILABLE_AT_CUTOFF"
+        elif any(original[field] != revised[field] for field in identity_fields):
+            reason = "IDENTITY_OR_BAR_CLOCK_CHANGED"
+        else:
+            changed = [field for field in value_fields if original[field] != revised[field]]
+            reason = "+".join(changed) if changed else "IDENTICAL_OHLCV_NEW_REVISION"
+        counts[reason] += 1
+        if len(samples) < 4 and original and revised:
+            samples.append(dict(ticker=original["ticker"], interval=original["interval"], bar_end=original["bar_end"], reason=reason,
+                changes={field: dict(original=original[field], revised=revised[field]) for field in changed},
+                original_created_at=original["created_at"], revised_created_at=revised["created_at"]))
+    return dict(correction_pairs=len(corrections), revision_rows=len(rows), change_types=dict(counts), samples=samples)
+
+
+def inspect_corrections(state, cutoff):
+    from dotenv import load_dotenv
+    load_dotenv(BACKEND / ".env")
+    from database import get_db_cursor
+    corrections = state.get("corrections", [])
+    if len(corrections) > 1000:
+        raise ValueError("correction audit exceeds 1000-pair bound")
+    revisions = sorted({record[key] for record in corrections for key in ("original_revision_id", "revision_id")})
+    with get_db_cursor() as cursor:
+        cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        cursor.execute("SET LOCAL statement_timeout='15s'")
+        cursor.execute("""SELECT bar_revision_id::text AS revision_id,security_id::text,ticker,interval,
+            bar_start,bar_end,session_scope,adjusted,is_final,
+            open_price::float8 AS open,high_price::float8 AS high,low_price::float8 AS low,
+            close_price::float8 AS close,volume::float8,system_observed_at,created_at
+            FROM equity_bar_revisions WHERE bar_revision_id=ANY(%s::uuid[])
+                AND system_observed_at<=%s AND created_at<=%s""", (revisions, cutoff, cutoff))
+        rows = [dict(row) for row in cursor.fetchall()]
+    return summarize_correction_rows(corrections, rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session", type=date.fromisoformat, required=True)
     parser.add_argument("--state-dir", type=Path, default=BACKEND / "backups/equity-shadow/stock-ideas-forward-v1")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--verify-quality-fixes", action="store_true")
+    parser.add_argument("--verify-history-reconciliation", action="store_true")
+    parser.add_argument("--verify-correction-recovery", action="store_true")
+    parser.add_argument("--publication-summary", action="store_true")
+    parser.add_argument("--inspect-corrections", action="store_true")
     args = parser.parse_args()
+    if args.inspect_corrections and not args.publication_summary:
+        parser.error("Correction inspection requires --publication-summary")
     if args.output and args.output.exists():
         parser.error("Use a new output path; audit reports are not overwritten")
     policy, state, publications, hashes = load_retained(args.state_dir / "forward.sqlite")
+    if args.verify_correction_recovery:
+        print(json.dumps(verify_correction_recovery(policy, state, publications, args.state_dir), indent=2), flush=True)
+        return
+    if args.publication_summary:
+        result = publication_summary(state, publications, args.session.isoformat())
+        if args.inspect_corrections:
+            result["correction_values"] = inspect_corrections(state, utc(state["last_source_read"]))
+        print(json.dumps(clean(result), indent=2), flush=True)
+        return
+    if args.verify_history_reconciliation:
+        print(json.dumps(verify_history_reconciliation(policy, state, publications, args.state_dir), indent=2), flush=True)
+        return
     result = (verify_quality_fixes(policy, state, publications, args.session.isoformat()) if args.verify_quality_fixes
         else audit(policy, state, publications, args.session.isoformat(), {"SPGI", "RMD"}))
     _, _, _, after = load_retained(args.state_dir / "forward.sqlite")

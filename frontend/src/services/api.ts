@@ -9,6 +9,132 @@ const api = axios.create({
   timeout: 120000,
 })
 
+export interface RotationFact<Value> {
+  status: string
+  value: Value | null
+  reason_codes: string[]
+  available_at?: string | null
+  market_time?: string | null
+  session?: string
+  timely_observations?: number
+  expected_observations?: number
+  last_attempt_at?: string | null
+  last_fetch_error?: string
+  units?: string
+  boundary?: string
+  weight?: number
+  method?: string
+  input_statuses?: string[]
+  input_sessions?: Array<string | null>
+  input_market_times?: Array<string | null>
+  action_review?: Array<{ type: string; effective_date: string; split_from?: number | null; split_to?: number | null; source?: string | null; revision_id: string }>
+  coverage?: Array<{ available: number | null; expected: number | null }>
+  source_url?: string
+  lineage_ref: string
+}
+
+export interface RotationPrices {
+  close: number
+  direction: string
+  ema50: number
+  ema50_change10: number
+  return1: number
+  return5: number
+  return20: number
+  volume: number
+  range252_low: number
+  range252_high: number
+}
+
+export interface RotationValues {
+  state: string
+  relative1: number
+  relative5: number
+  relative20: number
+  relative_change5: number
+  absolute_return5: number
+  absolute_return20: number
+  emerging_leadership: boolean
+}
+
+export interface RotationObservation extends RotationFact<RotationValues> {
+  persistence?: { status: string; observations: number; confirmed_state: string | null }
+}
+
+export interface SectorRotationRow {
+  ticker: string
+  sector: string
+  context: RotationFact<RotationPrices>
+  rotation: RotationObservation
+  history: RotationObservation[]
+}
+
+export interface StockDivergenceRow {
+  security_id: string
+  security_type: string | null
+  ticker: string
+  sector: string | null
+  proxy: string | null
+  context: RotationFact<RotationPrices>
+  relative: RotationObservation
+  divergence: RotationFact<{ labels: string[]; stock_return: number; sector_return: number }>
+}
+
+export interface BondComparisonStatistics {
+  expected_pairs: number
+  matched_pairs: number
+  coverage_fraction: number | null
+  pearson: number | null
+  spearman: number | null
+  directional_agreement: number | null
+  nonzero_pairs: number
+  tied_or_zero_pairs: number
+  correlation_status: string
+}
+
+export interface BondComparisonView {
+  status: string
+  reason_codes?: string[]
+  period_start?: string
+  period_end?: string
+  cutoff?: string
+  report_sha256?: string
+  input_sha256?: string
+  reference?: { status: string; series_id: string; received_at: string | null; last_observation?: string; response_sha256: string | null }
+  summary?: Record<string, Record<'rolling' | 'nonoverlapping' | 'first_half' | 'second_half', BondComparisonStatistics>>
+  current_proxy?: RotationFact<Record<string, number | string | null>>
+  limitations?: string[]
+  largest_direction_disagreements?: Array<{ session: string; start_session: string; horizon: number; hyg_return: number; lqd_return: number; proxy_pp: number; oas_change_bps: number; known_distribution_dates: string[] }>
+}
+
+export interface MarketConditionsResponse {
+  status: string
+  session?: string
+  as_of?: string
+  capture_age_seconds?: number
+  stale?: boolean
+  expected_session?: string
+  market?: RotationFact<{ direction: string }>
+  benchmarks: Record<string, RotationFact<RotationPrices>>
+  sectors: SectorRotationRow[]
+  stocks: StockDivergenceRow[]
+  coverage?: { expected_sectors: number; ready_sectors: number; expected_stocks: number; stock_states: Record<string, number> }
+  warnings?: string[]
+  snapshot_sha256?: string
+  refresh_mode?: string
+  additional_context?: Record<string, RotationFact<Record<string, number | string | null>>>
+  intraday_volumes?: Record<string, RotationFact<{ cumulative_volume: number; average_volume20: number; relative_volume: number }>>
+  bond_comparison?: BondComparisonView
+  score_components?: Record<string, RotationFact<{ score: number; weight: number; contribution: number }>>
+  sector_option_activity?: Record<string, RotationFact<{ call_volume: number; put_volume: number; call_premium: number; put_premium: number; put_call_volume_ratio: number | null }>>
+  etf_creations?: Record<string, RotationFact<{ net_creations_usd: number; share_change: number; nav: number; shares_outstanding: number; previous_session: string }>>
+}
+
+export const getMarketConditions = async (): Promise<MarketConditionsResponse> => {
+  const response = await api.get('/stocks/market-conditions')
+  return response.data
+}
+
 export interface MaterializationStatus {
   status: 'READY' | 'STALE' | 'EXPIRED' | 'UNAVAILABLE'
   checked_at: string

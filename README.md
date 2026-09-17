@@ -195,6 +195,36 @@ Append `-Plan` to preview any one command without launching it. Append
 different terminal per resident worker). Append `-Once` for a single cycle;
 the launcher supplies the appropriate entry-point flags automatically.
 
+The provider-free alert-context annotator is an additional **opt-in** worker,
+excluded from the default All/Equity sets:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Worker AlertContext
+.\backend\.venv\Scripts\python.exe backend/scripts/run_stock_alert_context_worker.py --status
+```
+
+It checks every 60 seconds and annotates at most one selected publication per cycle,
+using only retained cutoff-eligible inputs. It follows `STOCK_ALERT_SHADOW_VIEW` and
+pins its first activation to that ledger's enrollment/policy. Earlier publications
+are not automatically annotated; current/previous trading sessions form the bounded
+catch-up window. Missing financials cannot block alerts. It never fetches providers,
+writes the alert ledger or changes plans. A new enrollment/policy requires explicit
+annotation reactivation; do not delete the activation record to bypass a mismatch.
+The separate one-shot financial pilot and its access limitations are documented in
+[the context runbook](docs/STOCK_ALERT_CONTEXT_ENHANCEMENT_DESIGN.md#automatic-annotation-and-financial-pilot).
+
+For the separately approved event shadow study, use `-Worker AlertContext -ShadowEvents`.
+This adds `--shadow-events` to the annotator, not Stock Alerts. It pins a separate
+prospective activation and records all retained candidates from completed publications,
+including suppressions, under `event-shadow`. Confirmed events inside the planned
+holding window produce WOULD_BLOCK; missing coverage or uncertain timing stays UNKNOWN.
+No live gate, selection change or quota-refill simulation is enabled. Shared market
+facts are pinned to a verified archived snapshot completed before the original cutoff,
+with matching session/universe and stock identity. Old alert context is never replaced.
+See [progression results](docs/STOCK_ALERT_CONTEXT_ENHANCEMENT_DESIGN.md#context-progression-milestone)
+for remaining coverage gaps and the prerequisites for any live gate proposal.
+
 `-Worker Equity` means ingestion only, unlike `-Only Equity`, which starts all
 five equity-side workers. A single-worker launch does **not** start dependencies:
 Screening, StockAlerts and Portal need ongoing equity ingestion for fresh facts.
@@ -305,17 +335,12 @@ The original retained state and view remain under
 `backend/backups/equity-shadow/stock-ideas-forward-v1/`. The corrected quality-v2
 worker now defaults to a SEPARATE `stock-ideas-forward-v2/` directory, gates on
 current eligible native prices and remaining entry slots, and strengthens intraday
-breakout confirmation. The launcher explicitly passes `--quality-version 2`, and
-the API's default SHADOW reader now uses the same v2 directory. No old checkpoint,
-published plan or paper result is migrated. A mismatched existing store/view is
-rejected, not overwritten. No environment override is needed for the default
-V2 installation. If `STOCK_ALERT_SHADOW_VIEW` is set, keep it pointed at the SAME
-approved V2 view for both worker and API; pointing the V2 worker at a V1 view is
-rejected. An absent V2 view stays unavailable rather than silently showing V1.
-Source implementation does not establish
-current runtime state: a code commit does not enroll or start a worker or switch
-the API reader. Check processes and the served policy ID before relying on a future
-market session; see the [dated operational check](docs/STOCK_ALERT_CONTEXT_ENHANCEMENT_DESIGN.md#september-15-operational-check).
+breakout confirmation. It is implemented but not enrolled or activated. No old
+checkpoint, published plan or paper result is migrated. A mismatched existing
+store/view is rejected, not overwritten. The reader continues serving the old
+view unless `STOCK_ALERT_SHADOW_VIEW` is explicitly changed during an approved
+cutover. Keep that variable pointed at the NEW view for both worker and reader;
+pointing v2 at the v1 view is rejected. The application is currently paused.
 Offline inspection:
 
 ```powershell
@@ -335,7 +360,59 @@ without rewriting their earlier runs. An explicitly requested `--retry-window`
 appends one current-time retry of an empty incomplete run, never changes its
 original record or extends setup expiry, and leaves the next normal boundary intact.
 Use the ordinary command without retry flags for subsequent resident starts.
-The old daily worker source was archived; its stored records remain readable.
+For an explicitly approved identity quarantine, stop only the Stock Alerts worker
+and use the one-shot `--quarantine-security-id <enrolled-id> --quarantine-ticker
+<enrolled-ticker>` operation. It requires a recorded `IDENTITY_CHANGED` break,
+creates a consistent SQLite backup, and appends a hash-linked alert-only cohort
+revision starting at the next strictly future market boundary. Original enrollment,
+past publications, input checkpoints and paper positions remain retained; shared
+universe/identity tables and other page readers are not changed. Existing unresolved
+positions stay identity-gated. Resume the ordinary worker command without quarantine
+flags; the exclusion persists in the checkpoint. Do not delete a member or substitute
+its new security ID by ticker. `--check-readiness` inspects the pending cohort and a
+retained-source probe without writes, but does not guarantee future alerts. Current
+OKE activation and verification are recorded in
+[the downstream publication checkpoint](docs/agent-context/downstream-publications.md).
+Incremental alert reads revisit seven calendar days of retained native history
+(up to 800 bars per ticker), keeping actual observed/created cutoffs. Missing bars
+inserted behind a detector cursor reset only that security's intraday setup state;
+evaluation resumes at the next strictly future boundary with the same 200-bar
+warmup. Existing bar revisions still trigger correction quarantine, never overwrite.
+For an explicitly approved repair of an existing checkpoint, stop only Stock Alerts,
+run `run_stock_idea_worker.py --quality-version 2 --reconcile-history`, then verify
+with `audit_stock_alert_session.py --session YYYY-MM-DD --state-dir <v2-state-dir>
+--verify-history-reconciliation` **before restarting**. This is a bounded stored-data
+repair, not a provider backfill or alert retry. A consistent SQLite backup and report
+are retained under the state directory's `history-backups`; original bars, enrollment,
+quarantine, positions, publications, outbox and scheduled boundary are preserved.
+Intraday pending setups for affected securities are discarded rather than replayed;
+recovery revision IDs and the future effective boundary are retained. Resume the
+ordinary standalone StockAlerts command without maintenance flags after verification.
+Older gaps outside seven days need a separately scoped audit; this is not unlimited
+historical coverage or a guarantee of qualifying alerts.
+For an empty live run, use `audit_stock_alert_session.py --session YYYY-MM-DD
+--state-dir <v2-state-dir> --publication-summary`. Optional `--inspect-corrections`
+compares at most 1,000 flagged revision pairs with bounded read-only database queries.
+The summary separates immutable publication/candidate counts from current model-input
+blocks and watch states. Neither option retries publications or changes worker state.
+Reviewed same-security corrections can be admitted for future detectors using
+`run_stock_idea_worker.py --quality-version 2 --recover-corrections
+--expected-correction-hash <correction_inventory_sha256>` only after approval and
+stopping Stock Alerts. The inventory hash comes from the read-only summary; a
+changed inventory, identity/clock change, invalid/future bar, older-than-seven-day
+correction or ambiguous multiple revision chain is refused. No tolerance threshold
+or volume-only exemption is used. Only the exact current canonical revision pairs
+are retained in a hash-checked overlay under `correction_recovery_history`.
+The operation backs up SQLite under `correction-backups` and resets affected pending
+setups at the next strictly future boundary. Original bars, corrections, identity
+flags, positions, enrollment, prior publications and outbox remain unchanged.
+Run the same audit script with `--verify-correction-recovery` **before restarting**
+to verify preservation and prospective model-input coverage, then resume the ordinary
+standalone worker. New alerts/positions record the recovery generation; pre-recovery
+positions remain under their original correction hold. An additional unreviewed
+revision or identity change blocks the security again and needs a new scoped review.
+This does not replay old signals or promise that a pending setup will confirm.
+The old worker script and records remain available but are no longer launched.
 Backtested history stays frozen; neither [run_stock_idea_replay.py](backend/scripts/run_stock_idea_replay.py)
 nor [prepare_stock_alert_view.py](backend/scripts/prepare_stock_alert_view.py) is a
 market-hours service. An empty run or degraded coverage is not evidence of no setups
@@ -344,42 +421,6 @@ No automatic alerts across saved screeners, AI alerts, email delivery or broker
 orders are enabled by this launcher. See the
 [agentic roadmap](docs/STOCK_SCREENER_WORKSPACE_DESIGN.md#agentic-screener-roadmap)
 for future work, not startup prerequisites.
-
-#### Local State And Another Machine
-
-All of `backend/backups/` is intentionally Git-ignored, including JSON views,
-SQLite worker state and historical reports. Git commits must not delete these
-local files. The earlier index-only untracking preserved them on disk; it does
-not erase copies from older Git history. Backend source, tests, migrations and
-portable configuration are still versioned.
-
-Before pulling the untracking commit into another existing checkout, back up any
-local data that was previously tracked: Git applies tracked deletions when updating
-that checkout. The verified index-only operation preserved this machine's copies;
-it is not a substitute for safeguarding other checkouts.
-
-Some ignored files are operational inputs: the SHADOW and REPLAY alert readers
-read saved views, forward workers resume their SQLite checkpoint, and the optional
-ridge observer needs its enrolled manifest. They are not required to install the
-code, but a fresh clone cannot display old alerts or resume those studies without
-the corresponding data. Use one of these explicit setup paths:
-
-- Restore a consistent PostgreSQL backup and the required local state/views into
-  the same paths (or approved configured paths), preserving policy and source hashes.
-  Take SQLite backups using its backup facilities or while the writer is stopped;
-  do not copy only a live database file while ignoring its journal/WAL state.
-- For a genuinely new environment, install the canonical schema, configure provider
-  access, establish complete source history/publications, and let the authorized
-  publishers create new views and a NEW V2 enrollment. Missing historical views
-  remain unavailable; never fabricate old alerts or inherit an old study's results.
-
-Do not ignore every JSON file: [stock_idea_pilot_config.json](docs/stock_idea_pilot_config.json)
-is read by the forward configuration builder, and the replay evaluation plan and
-retained sample/config/model inputs have separate uses. Large generated reports
-under `docs/` are not covered by the backups ignore rule; exclude or archive them
-only under an explicit evidence-retention decision. A code checkout is not a market-
-data backup. Keep local data separately backed up; no cleanup/commit command here
-is permission to remove it.
 
 **Optional enrolled paper study:** [run_equity_paper_tracker.py](backend/scripts/run_equity_paper_tracker.py)
 observes the fixed ridge/momentum/SPY study, not general stock alerts. Check its

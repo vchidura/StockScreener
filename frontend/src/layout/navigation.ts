@@ -81,6 +81,7 @@ export const NAV_GROUPS: NavGroup[] = [
     icon: Layers,
     items: [
       { to: '/overview', label: 'All Tickers', icon: Table2 },
+      { to: '/market-conditions', label: 'Market Conditions', icon: Activity },
       { to: '/sector-intelligence', label: 'Sector Intelligence', icon: Layers },
       { to: '/pattern-watch', label: 'Pattern Watch', icon: Radar },
     ],

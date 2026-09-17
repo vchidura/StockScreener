@@ -39,12 +39,14 @@ param(
     [ValidateSet("All", "Equity", "Options")]
     [string]$Only = "All",
 
-    [ValidateSet("Equity", "CorporateActions", "StockAlerts", "Portal", "Screening", "MarketEvents", "OptionInputs", "Options")]
+    [ValidateSet("Equity", "CorporateActions", "StockAlerts", "AlertContext", "Portal", "Screening", "MarketEvents", "OptionInputs", "Options")]
     [string]$Worker,
 
     [switch]$Once,
 
     [switch]$Plan,
+
+    [switch]$ShadowEvents,
 
     [switch]$IncludePaperStudy,
 
@@ -65,6 +67,7 @@ $workerScripts = @{
     Equity = "run_equity_worker.py"
     CorporateActions = "run_corporate_action_worker.py"
     StockAlerts = "run_stock_idea_worker.py"
+    AlertContext = "run_stock_alert_context_worker.py"
     Portal = "refresh_equity_portal_snapshots.py"
     Screening = "run_screening_worker.py"
     MarketEvents = "run_market_event_worker.py"
@@ -77,6 +80,9 @@ if (-not $Plan -and -not (Test-Path $python -PathType Leaf)) {
 }
 if ($Worker -and $PSBoundParameters.ContainsKey("Only")) {
     throw "Choose -Worker for a single worker or -Only for a worker set, not both"
+}
+if ($ShadowEvents -and $Worker -ne "AlertContext") {
+    throw "-ShadowEvents requires -Worker AlertContext and never enables a live gate"
 }
 if ($Worker -and ($IncludePaperStudy -or $PublishScreening)) {
     throw "-Worker cannot be combined with -IncludePaperStudy or -PublishScreening"
@@ -178,6 +184,24 @@ $stockAlertArgs = @("--quality-version", "2") + $modeArgs
 $equityArgs = @($modeArgs)
 if ($RepairSessions -gt 0) {
     $equityArgs += @("--repair-sessions", $RepairSessions.ToString())
+}
+
+if ($Worker -eq "AlertContext") {
+    $contextArgs = @()
+    if ($ShadowEvents) { $contextArgs += "--shadow-events" }
+    if ($Once) {
+        $contextArgs += "--once"
+        Start-Worker -Title "stock-alert-context-worker" `
+            -ScriptName "run_stock_alert_context_worker.py" -Arguments $contextArgs -Wait
+    }
+    elseif ($ShadowEvents) {
+        Start-Worker -Title "stock-alert-context-worker" `
+            -ScriptName "run_stock_alert_context_worker.py" -Arguments $contextArgs
+    }
+    else {
+        Start-Worker -Title "stock-alert-context-worker" `
+            -ScriptName "run_stock_alert_context_worker.py"
+    }
 }
 
 if ($Only -in @("All", "Equity")) {
@@ -297,6 +321,7 @@ if ($Worker) {
     switch ($Worker) {
         "Equity" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_equity_materialization.py --coverage-report" }
         "StockAlerts" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_stock_idea_worker.py --status" }
+        "AlertContext" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_stock_alert_context_worker.py --status" }
         "Screening" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_screening_worker.py --status" }
         "Options" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_option_pipeline.py --status" }
         default { Write-Output "  Inspect the selected worker's console for a successful refresh or an error." }

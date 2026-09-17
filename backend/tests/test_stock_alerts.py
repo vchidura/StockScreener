@@ -31,6 +31,120 @@ def test_latest_publication_never_falls_back_to_a_nonempty_run():
     assert alert_page(data, session="2026-09-03")["run"] is None
 
 
+def annotation_fixture():
+    from research.stock_alert_context import observation
+    data = dict(snapshot(), source="SHADOW")
+    row = data["alerts"][0]
+    row.update(triggered_at="2026-09-02T14:00:00Z", policy_version="quality2")
+    candidate = dict(row, price=row["trigger_price"], trigger_at=row["triggered_at"])
+    cutoff = "2026-09-02T14:16:00Z"
+    publication = dict(policy_version="test", window_key="one", selected=["plan"], input_deadline=cutoff,
+        actual_publication_at=row["published_at"], candidates={"plan": candidate})
+    factor = observation("READY")
+    factor.update(value=dict(direction="MIXED"), source_revision_ids=["evidence"],
+        observed_at="2026-09-02T13:00:00Z", created_at="2026-09-02T13:01:00Z", available_at="2026-09-02T13:01:00Z")
+    annotation = dict(alert_id="plan", source_id="test", run_id="one", input_cutoff=cutoff,
+        security_id="A", ticker="A", factors=dict(earnings=observation("UNAVAILABLE", "EVENT_COVERAGE_UNKNOWN")))
+    return data, publication, annotation, dict(market=factor)
+
+
+def test_publication_context_is_immutable_optional_and_plan_bound(tmp_path):
+    from research.stock_alert_annotations import attach_publication_context, context_path, freeze_publication_context
+    data, publication, annotation, shared = annotation_fixture()
+    original = deepcopy((data, publication, annotation, shared))
+    args = (tmp_path, publication, [annotation], shared)
+    kwargs = dict(assembled_at="2026-09-03T00:00:00Z", manifest_sha256="manifest")
+    page = alert_page(data, session="2026-09-02", run="one")
+    missing = attach_publication_context(page, tmp_path)
+    assert missing["rows"][0]["context"]["reason"] == "NO_SAVED_PUBLICATION_CONTEXT"
+    assert freeze_publication_context(*args, **kwargs) == "CREATED"
+    path = context_path(tmp_path, "test", "one")
+    retained = path.read_bytes()
+    shared["market"]["value"]["direction"] = "DOWN"
+    assert freeze_publication_context(*args, **(kwargs | dict(assembled_at="2026-09-04T00:00:00Z"))) == "PRESERVED"
+    assert path.read_bytes() == retained
+    result = attach_publication_context(page, tmp_path)
+    assert result["rows"][0]["context"]["factors"]["market"]["value"]["direction"] == "MIXED"
+    assert result["rows"][0]["context"]["factors"]["earnings"]["status"] == "UNAVAILABLE"
+    assert {key: value for key, value in result["rows"][0].items() if key != "context"} == page["rows"][0]
+    for change in (dict(security_id="B"), dict(stop=80.), dict(published_at="2026-09-02T14:18:00Z"), dict(policy_version="other")):
+        changed = dict(page, rows=[page["rows"][0] | change])
+        assert attach_publication_context(changed, tmp_path)["rows"][0]["context"]["status"] == "UNAVAILABLE"
+    assert attach_publication_context(page | dict(source="REPLAY"), tmp_path) == page | dict(source="REPLAY")
+    assert (data, publication, annotation) == original[:3]
+
+
+@pytest.mark.parametrize("corrupt", ['{"broken":true}', 'null', '[]', '{'])
+def test_publication_context_rejects_future_evidence_and_corruption_without_losing_alert(tmp_path, corrupt):
+    from research.stock_alert_annotations import attach_publication_context, context_path, freeze_publication_context
+    data, publication, annotation, shared = annotation_fixture()
+    kwargs = dict(assembled_at="2026-09-03T00:00:00Z", manifest_sha256="manifest")
+    shared["market"]["created_at"] = "2026-09-03T00:00:00Z"
+    with pytest.raises(ValueError, match="post-cutoff"):
+        freeze_publication_context(tmp_path, publication, [annotation], shared, **kwargs)
+    assert not list(tmp_path.iterdir())
+    page = alert_page(data, session="2026-09-02", run="one")
+    path = context_path(tmp_path, "test", "one")
+    path.write_text(corrupt, encoding="utf-8")
+    result = attach_publication_context(page, tmp_path)
+    assert result["total"] == page["total"] == 1
+    assert result["rows"][0]["context"]["reason"] == "INVALID_SAVED_PUBLICATION_CONTEXT"
+    assert result["rows"][0]["paper_return"] == page["rows"][0]["paper_return"]
+
+
+def test_context_api_attachment_respects_source_path_and_is_read_only(tmp_path, monkeypatch):
+    from equity.stock_alert_views import attach_alert_context
+    from research.stock_alert_annotations import freeze_publication_context
+    data, publication, annotation, shared = annotation_fixture()
+    page = alert_page(data, session="2026-09-02", run="one")
+    monkeypatch.setenv("STOCK_ALERT_SHADOW_VIEW", str(tmp_path / "alerts-view.json"))
+    original = deepcopy(page)
+    freeze_publication_context(tmp_path / "alert-context", publication, [annotation], shared,
+        assembled_at="2026-09-03T00:00:00Z", manifest_sha256="manifest")
+    before = {path.name: path.read_bytes() for path in (tmp_path / "alert-context").iterdir()}
+    assert attach_alert_context(page)["rows"][0]["context"]["status"] == "AVAILABLE"
+    assert page == original
+    assert before == {path.name: path.read_bytes() for path in (tmp_path / "alert-context").iterdir()}
+
+
+def test_verified_artifact_to_frozen_context_rejects_changed_evidence_and_publications(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from research.stock_alert_context import READINESS_VERSION, VERSION, utc
+    from research.stock_alert_annotations import attach_publication_context
+    from research.stock_idea_engine import digest
+    from scripts import prepare_stock_alert_context as capture
+    data, publication, annotation, shared = annotation_fixture()
+    members = [dict(security_id="A", ticker="A")]
+    member = dict(members[0], factors=annotation["factors"])
+    bundle = dict(shared, spy=shared["market"], qqq=shared["market"], cutoff=annotation["input_cutoff"],
+        prior_session="2026-09-01", members=[member])
+    manifest = dict(schema_version=READINESS_VERSION, database_snapshot=dict(read_only="on", isolation="repeatable read"),
+        original_publications_unchanged=True, observations={"one": bundle}, universe_sha256=digest(members),
+        baseline_policy_sha256=digest({}), company_context_only=True, session="2026-09-02",
+        publication_hashes={"one": digest(publication)})
+    annotations = dict(schema_version=VERSION, readiness_manifest_sha256=digest(manifest), annotations_only=True,
+        publication_contexts={"one": {key: value for key, value in bundle.items() if key != "members"}},
+        rows=[annotation | dict(market_ref="one", capture_mode="RECONSTRUCTED_FROM_RETAINED_ASOF_INPUTS")])
+    output = tmp_path / "capture.json"
+    output.write_text(json.dumps(manifest), encoding="utf-8")
+    output.with_suffix(".annotations.json").write_text(json.dumps(annotations), encoding="utf-8")
+    monkeypatch.setattr(capture, "read_enrollment", lambda *args: (dict(members=members), {}, [publication], {}))
+    args = SimpleNamespace(output=output, state_dir=tmp_path, session=utc("2026-09-02T00:00:00Z").date())
+    capture.freeze_alert_context(args)
+    page = alert_page(data, session="2026-09-02", run="one")
+    assert attach_publication_context(page, tmp_path / "alert-context")["rows"][0]["context"]["status"] == "AVAILABLE"
+    annotations["rows"][0]["factors"]["earnings"]["reason_codes"] = ["UNSUPPORTED_CHANGE"]
+    output.with_suffix(".annotations.json").write_text(json.dumps(annotations), encoding="utf-8")
+    with pytest.raises(AssertionError, match="annotation facts"):
+        capture.freeze_alert_context(args)
+    annotations["rows"][0]["factors"]["earnings"]["reason_codes"] = ["EVENT_COVERAGE_UNKNOWN"]
+    output.with_suffix(".annotations.json").write_text(json.dumps(annotations), encoding="utf-8")
+    publication["candidates"]["plan"]["stop"] = 80.
+    with pytest.raises(ValueError, match="publication hash"):
+        capture.freeze_alert_context(args)
+
+
 def test_forward_reader_preserves_readiness_window_without_fabricating_a_fixed_time():
     data = dict(snapshot(), source="SHADOW", publication_mode="SOURCE_READINESS", next_publication_at=None,
         publication_window_start="2026-09-14T16:15:00Z", publication_deadline="2026-09-14T16:29:55Z")
@@ -38,6 +152,134 @@ def test_forward_reader_preserves_readiness_window_without_fabricating_a_fixed_t
     assert result["next_publication_at"] is None and result["publication_mode"] == "SOURCE_READINESS"
     assert result["publication_window_start"] == data["publication_window_start"]
     assert result["publication_deadline"] == data["publication_deadline"]
+
+
+def test_event_shadow_retains_suppressed_candidates_and_cannot_change_baseline(tmp_path):
+    from research.stock_alert_annotations import context_path, freeze_event_shadow, read_event_shadow
+    _, publication, annotation, _ = annotation_fixture()
+    publication["candidates"]["suppressed"] = dict(publication["candidates"]["plan"], security_id="B", ticker="B")
+    publication["dispositions"] = [dict(episode_id="suppressed", selection="SUPPRESSED", reason="MODEL_QUOTA")]
+    unknown = dict(status="UNAVAILABLE", reason_codes=["EVENT_COVERAGE_UNKNOWN"], value=None)
+    annotation["factors"]["fomc"] = unknown
+    second = dict(annotation, alert_id="suppressed", security_id="B", ticker="B")
+    rows = [annotation, second]
+    original = deepcopy(publication)
+    kwargs = dict(assembled_at="2026-09-03T00:00:00Z", manifest_sha256="manifest")
+    assert freeze_event_shadow(tmp_path, publication, rows, **kwargs) == "CREATED"
+    path = context_path(tmp_path, "test", "one")
+    record = read_event_shadow(path)
+    assert len(record["rows"]) == 2 and not record["live_gate_enabled"] and not record["preselection_latency_validated"]
+    assert record["rows"][1]["baseline_reason"] == "MODEL_QUOTA"
+    assert record["rows"][1]["decision"]["disposition"] == "UNKNOWN"
+    assert freeze_event_shadow(tmp_path, publication, rows, **kwargs) == "PRESERVED" and publication == original
+    with pytest.raises(ValueError, match="all retained candidates"):
+        freeze_event_shadow(tmp_path, publication, [annotation], **kwargs)
+
+
+def test_context_worker_is_prospective_and_preserves_existing_bundles(tmp_path):
+    from scripts.run_stock_alert_context_worker import pending_publications
+    from research.stock_alert_annotations import freeze_publication_context
+    _, publication, annotation, shared = annotation_fixture()
+    activation = dict(activated_at="2026-09-02T14:16:30Z")
+    earlier = dict(publication, window_key="earlier", actual_publication_at="2026-09-02T14:16:00Z")
+    empty = dict(publication, window_key="empty", selected=[])
+    assert pending_publications([earlier, publication, empty], activation, tmp_path) == [publication]
+    freeze_publication_context(tmp_path, publication, [annotation], shared,
+        assembled_at="2026-09-03T00:00:00Z", manifest_sha256="manifest")
+    assert pending_publications([publication], activation, tmp_path) == []
+    publication["candidates"]["plan"]["stop"] = 80.
+    with pytest.raises(ValueError, match="publication changed"):
+        pending_publications([publication], activation, tmp_path)
+
+
+@pytest.mark.parametrize("model,interval", [("resumption", "30m"), ("discovery", "1d")])
+@pytest.mark.parametrize("shadow_only", [False, True])
+def test_context_worker_builds_nonempty_evidence_once_without_mutating_ledger(tmp_path, monkeypatch, model, interval, shadow_only):
+    from contextlib import contextmanager
+    from datetime import timedelta
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import database
+    import options.config
+    from research.stock_idea_engine import candidate_record
+    from research.stock_idea_forward import forward_config
+    from research.stock_alert_annotations import context_path, read_context, read_event_shadow
+    from scripts import run_stock_alert_context_worker as worker
+    from test_stock_idea_engine import NOW, candidate
+    plan, policy = candidate(model=model, interval=interval), forward_config()
+    state = dict(enrolled_at=(NOW - timedelta(hours=1)).isoformat(), members=[dict(security_id=plan.security_id, ticker=plan.ticker)])
+    publication = dict(window_key=NOW.isoformat(), session=NOW.date().isoformat(), input_deadline=NOW.isoformat(),
+        actual_publication_at=NOW.isoformat(), market_time=plan.trigger_at.isoformat(), policy_version=policy["policy_version"],
+        selected=[plan.episode_id], candidates={plan.episode_id: candidate_record(plan)})
+    activation = dict(activated_at=(NOW - timedelta(seconds=1)).isoformat(), ledger_identity=worker.ledger_identity(state, policy))
+    if shadow_only:
+        publication["selected"] = []
+    before = deepcopy((state, policy, publication))
+    cursor = MagicMock()
+    @contextmanager
+    def database_cursor():
+        yield cursor
+    monkeypatch.setattr(database, "get_db_cursor", database_cursor)
+    monkeypatch.setattr(options.config, "load_option_runtime_configuration", lambda: SimpleNamespace(
+        settings=SimpleNamespace(event_calendar_max_age_seconds=43200, underlyers=()), settlement_valuation_policy=None))
+    facts = dict(bars=[], references=[], actions=[], events=[], event_coverage=[], iv=[], activity=[], fundamentals=[],
+        transaction=dict(read_only="on", isolation="repeatable read"))
+    captured = MagicMock(return_value=facts)
+    monkeypatch.setattr(worker, "capture", captured)
+    monkeypatch.setattr(worker, "read_enrollment", lambda *args: (state, policy, [publication], {}))
+    status = worker.produce_cycle(tmp_path, activation, NOW, shadow_activation=activation if shadow_only else None)
+    assert status["status"] == ("CONTEXT_EMPTY" if shadow_only else "CONTEXT_CREATED") and status["alerts"] == (0 if shadow_only else 1)
+    assert "READ ONLY" in cursor.execute.call_args_list[0].args[0]
+    assert captured.call_args.kwargs == dict(company_only=True)
+    path = context_path(tmp_path / ("event-shadow" if shadow_only else "alert-context"), publication["policy_version"], publication["window_key"])
+    retained = path.read_bytes()
+    if shadow_only:
+        record = read_event_shadow(path)
+        assert len(record["rows"]) == 1 and not record["rows"][0]["baseline_selected"] and not record["live_gate_enabled"]
+        assert worker.produce_cycle(tmp_path, activation, NOW, shadow_activation=activation)["pending_publications"] == 0
+        assert captured.call_count == 1 and path.read_bytes() == retained and (state, policy, publication) == before
+        return
+    bundle = read_context(path)
+    assert bundle["rows"][plan.episode_id]["factors"]["financials"]["status"] == "UNAVAILABLE"
+    if model == "discovery":
+        assert bundle["rows"][plan.episode_id]["factors"]["earnings"]["status"] == "NOT_APPLICABLE"
+    assert worker.produce_cycle(tmp_path, activation, NOW)["status"] == "WAITING_FOR_SELECTED_PUBLICATION"
+    assert captured.call_count == 1 and path.read_bytes() == retained
+    assert (state, policy, publication) == before
+
+
+def test_context_worker_empty_cycles_never_capture_and_changed_enrollment_blocks(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+    from scripts import run_stock_alert_context_worker as worker
+    state = dict(enrolled_at="2026-09-02T13:00:00Z", members=[dict(security_id="A", ticker="A")])
+    activation = dict(activated_at="2026-09-02T14:16:30Z", ledger_identity=worker.ledger_identity(state, {}))
+    monkeypatch.setattr(worker, "read_enrollment", lambda *args: (state, {}, [], {}))
+    builder = MagicMock()
+    status = worker.produce_cycle(tmp_path, activation, worker.utc("2026-09-02T15:00:00Z"), builder=builder)
+    assert status["status"] == "WAITING_FOR_SELECTED_PUBLICATION" and not status["provider_requests"] and not status["ledger_writes"]
+    builder.assert_not_called()
+    state["members"].append(dict(security_id="B", ticker="B"))
+    with pytest.raises(ValueError, match="enrollment or policy changed"):
+        worker.produce_cycle(tmp_path, activation, worker.utc("2026-09-02T15:00:00Z"), builder=builder)
+
+
+def test_context_progression_review_is_read_only_and_keeps_baseline_suppressions(tmp_path, monkeypatch):
+    from scripts import run_stock_alert_context_worker as worker
+    _, publication, annotation, _ = annotation_fixture()
+    publication["selected"] = []
+    publication["dispositions"] = [dict(episode_id="plan", selection="SUPPRESSED", reason="EXPIRED")]
+    annotation["factors"].update(fomc=dict(status="UNAVAILABLE"), spy=dict(status="NOT_COVERED"))
+    original = deepcopy(publication)
+    monkeypatch.setattr(worker, "read_enrollment", lambda *args: ({}, {}, [publication], {}))
+    calls = []
+    def builder(*args, **kwargs):
+        calls.append(kwargs)
+        return {}, dict(rows=[annotation])
+    result = worker.review_session(tmp_path, "2026-09-02", builder=builder)
+    assert result["summary"] == dict(candidate_occurrences=1, unique_candidates=1, baseline_selected=0,
+        shadow_decisions=dict(UNKNOWN=1), archived_context_present=0)
+    assert result["rows"][0]["baseline_reason"] == "EXPIRED" and result["original_publications_unchanged"]
+    assert calls == [dict(include_candidates=True)] and publication == original and not list(tmp_path.iterdir())
 
 
 def test_history_keeps_frozen_plan_and_distinct_valid_window_hits():

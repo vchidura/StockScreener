@@ -14,6 +14,67 @@ export interface AlertPublication {
   conflicts: number | null
 }
 
+export interface AlertContextFactor {
+  status: string
+  reason_codes: string[]
+  market_time?: string | null
+  observed_at?: string | null
+  created_at?: string | null
+  available_at?: string | null
+  source_revision_ids: string[]
+  source_snapshot_sha256?: string
+  source_snapshot_session?: string
+  source_lineage_ref?: string
+  persistence?: { status: string; observations: number }
+  expected_observations?: number
+  timely_observations?: number
+  value: {
+    direction?: string
+    return1?: number
+    return5?: number
+    return20?: number
+    state?: string
+    relative5?: number
+    relative20?: number
+    relative_change5?: number
+    labels?: string[]
+    advancing?: number
+    declining?: number
+    above_sma50_fraction?: number
+    above_sma200_fraction?: number
+    annualized_volatility20?: number
+    level?: number
+    percentile?: number
+    score?: number
+    relative_volume?: number
+    disposition?: string
+    live_gate_enabled?: boolean
+    blocking_factors?: string[]
+    unknown_factors?: string[]
+    stock_minus_sector20?: number
+    sector_minus_spy20?: number
+    risk?: string
+    coverage_complete?: boolean
+    timing_uncertain?: boolean
+    events?: { type: string; scheduled_time: string; confidence: string; relative_timing?: string }[]
+    reports?: { report_id: string; timeframe: string; period_end: string; filing_date: string; age_days: number;
+      stale: boolean; source: string; accession_number: string | null; quality_codes: string[]; units: string;
+      metrics: Record<string, number | null> }[]
+  } | null
+}
+
+export interface AlertPublicationContext {
+  status: 'AVAILABLE' | 'UNAVAILABLE'
+  reason: string | null
+  input_cutoff?: string
+  publication_at?: string
+  assembled_at?: string
+  capture_mode?: string
+  bundle_sha256?: string
+  source_publication_sha256?: string
+  factors: Record<string, AlertContextFactor>
+}
+
 export interface AlertPlanRow {
   alert_id: string
   run_id: string
@@ -66,6 +127,7 @@ export interface AlertPlanRow {
   indicator_status: string
   warnings: string[]
   policy_version: string
+  context?: AlertPublicationContext
 }
 
 export interface AlertViewResponse {

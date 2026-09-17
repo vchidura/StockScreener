@@ -30,6 +30,7 @@ DATA_DELAY_MINUTES = 17
 DISPATCH_GRACE_SECONDS = 5
 READINESS_POLICY = dict(version="stock_ideas_source_ready_v2", intraday_wait_minutes=30,
     closing_wait_minutes=60, dispatch_grace_seconds=5, source_gate="COMPLETE_ENROLLED_30M_AND_CLOSING_DAILY")
+COHORT_QUARANTINE_VERSION = "stock_alert_prospective_identity_quarantine_v1"
 
 
 def runtime_sources():
@@ -110,8 +111,147 @@ def readiness_deadline(boundary):
     return boundary + timedelta(minutes=minutes) - timedelta(seconds=DISPATCH_GRACE_SECONDS)
 
 
+def alert_selection_cohort(state, boundary):
+    members = state["members"]
+    enrolled_hash = digest(members)
+    parent, excluded, active = enrolled_hash, {}, None
+    prior_activation = utc(state["enrolled_at"])
+    for record in state.get("alert_cohort_history", []):
+        body = {key: value for key, value in record.items() if key != "generation_id"}
+        if record.get("version") != COHORT_QUARANTINE_VERSION or record.get("generation_id") != digest(body):
+            raise ValueError("invalid alert cohort revision")
+        activated = utc(record["activated_at"])
+        if record["enrolled_universe_sha256"] != enrolled_hash or record["parent_generation"] != parent or activated < prior_activation:
+            raise ValueError("alert cohort enrollment or history mismatch")
+        if utc(record["effective_boundary"]) != next_boundary(activated):
+            raise ValueError("alert cohort exclusion must start at a future boundary")
+        member = record["excluded_member"]
+        identity = member["security_id"]
+        if member not in members or identity in excluded or record["reason"] != "IDENTITY_CHANGED":
+            raise ValueError("invalid alert identity quarantine member")
+        excluded[identity] = member
+        remaining = [item for item in members if item["security_id"] not in excluded]
+        if not remaining or record["selection_universe_sha256"] != digest(remaining):
+            raise ValueError("alert selection cohort does not reconcile")
+        if utc(record["effective_boundary"]) <= utc(boundary):
+            active = dict(record, excluded_members=list(excluded.values()), eligible_members=len(remaining))
+        parent, prior_activation = record["generation_id"], activated
+    if active is None:
+        return members, None
+    excluded_ids = {member["security_id"] for member in active["excluded_members"]}
+    return [member for member in members if member["security_id"] not in excluded_ids], active
+
+
+def quarantine_alert_member(state, security_id, ticker, activated_at):
+    activated_at = utc(activated_at)
+    if state.get("dispatch_policy") != READINESS_POLICY:
+        raise ValueError("identity quarantine requires source-ready dispatch")
+    members, _ = alert_selection_cohort(state, next_boundary(activated_at))
+    enrolled = next((member for member in state["members"] if member["security_id"] == security_id and member["ticker"] == ticker), None)
+    if enrolled is None or state.get("identity_breaks", {}).get(security_id) != "IDENTITY_CHANGED":
+        raise ValueError("quarantine requires the exact enrolled identity and recorded identity break")
+    existing = next((record for record in state.get("alert_cohort_history", []) if record["excluded_member"]["security_id"] == security_id), None)
+    if existing:
+        return state, existing
+    if activated_at <= utc(state["enrolled_at"]) or (state.get("last_boundary") and activated_at <= utc(state["last_boundary"])):
+        raise ValueError("quarantine activation cannot predate enrollment or processed boundaries")
+    if len(members) <= 1:
+        raise ValueError("cannot quarantine the entire alert cohort")
+    history = state.get("alert_cohort_history", [])
+    record = dict(version=COHORT_QUARANTINE_VERSION, activated_at=activated_at.isoformat(),
+        effective_boundary=next_boundary(activated_at).isoformat(), excluded_member=dict(enrolled), reason="IDENTITY_CHANGED",
+        authorization="EXPLICIT_OPERATOR_QUARANTINE", enrolled_universe_sha256=digest(state["members"]),
+        parent_generation=history[-1]["generation_id"] if history else digest(state["members"]),
+        selection_universe_sha256=digest([member for member in members if member["security_id"] != security_id]))
+    record["generation_id"] = digest(record)
+    changed = dict(state, alert_cohort_history=history + [record])
+    alert_selection_cohort(changed, next_boundary(activated_at))
+    return changed, record
+
+
+def active_correction_recoveries(state, boundary, known_at):
+    recovered = {}
+    for record in state.get("correction_recovery_history", []):
+        body = {key: value for key, value in record.items() if key != "generation_id"}
+        if record.get("version") != "stock_alert_correction_recovery_v1" or digest(body) != record.get("generation_id"):
+            raise ValueError("invalid correction recovery record")
+        if record["enrollment_sha256"] != digest(state["members"]):
+            raise ValueError("correction recovery enrollment mismatch")
+        if utc(record["effective_boundary"]) != next_boundary(utc(record["activated_at"])):
+            raise ValueError("correction recovery must start at a future boundary")
+        if utc(record["activated_at"]) > known_at or utc(record["effective_boundary"]) > boundary:
+            continue
+        pairs = {tuple(pair[key] for key in ("security_id", "original_revision_id", "revision_id")) for pair in record["pairs"]}
+        for security in {pair[0] for pair in pairs}:
+            pending = {tuple(pair[key] for key in ("security_id", "original_revision_id", "revision_id"))
+                for pair in state.get("corrections", []) if pair["security_id"] == security}
+            if pending and pending <= pairs and state.get("identity_breaks", {}).get(security) == "INPUT_CORRECTION_REVIEW":
+                recovered[security] = record
+    return recovered
+
+
+def correction_inventory_hash(state):
+    return digest(sorted(state.get("corrections", []), key=lambda pair: (pair["security_id"], pair["original_revision_id"], pair["revision_id"])))
+
+
+def correction_recovery_record(state, revised_bars, config, activated_at):
+    members, _ = alert_selection_cohort(state, next_boundary(activated_at))
+    active = {member["security_id"]: member["ticker"] for member in members}
+    recovered = active_correction_recoveries(state, next_boundary(activated_at), activated_at)
+    pairs = [pair for pair in state.get("corrections", []) if pair["security_id"] in active and pair["security_id"] not in recovered]
+    if not pairs or len(pairs) > 1000:
+        raise ValueError("correction recovery requires 1-1000 unresolved reviewed pairs")
+    selected = {bar["revision_id"]: bar for bar in revised_bars}
+    originals = {bar["revision_id"]: bar for rows in state.get("bars", {}).values() for bar in rows.values()}
+    accepted, slots = {}, set()
+    for pair in pairs:
+        security = pair["security_id"]
+        original, revised = originals.get(pair["original_revision_id"]), selected.get(pair["revision_id"])
+        if state.get("identity_breaks", {}).get(security) != "INPUT_CORRECTION_REVIEW" or not original or not revised:
+            raise ValueError("every correction needs exact retained and current source revisions")
+        fields = ("security_id", "ticker", "interval", "session")
+        if (any(original[field] != revised[field] for field in fields) or revised["ticker"] != active[security]
+                or revised["interval"] != "30m" or any(utc(original[field]) != utc(revised[field]) for field in ("bar_start", "bar_end"))
+                or not valid_bar(revised) or available_at(revised, config) > activated_at
+                or utc(revised["bar_start"]) < activated_at - timedelta(days=7)
+                or (utc(revised["bar_start"]), utc(revised["bar_end"])) not in session_windows(revised["session"])):
+            raise ValueError("correction changes identity/clock or violates bounded causal input rules")
+        slot = (security, revised["bar_start"])
+        if slot in slots:
+            raise ValueError("multiple correction revisions for one slot require separate review")
+        slots.add(slot)
+        accepted[revised["revision_id"]] = dict(revised)
+    record = dict(version="stock_alert_correction_recovery_v1", activated_at=activated_at.isoformat(),
+        effective_boundary=next_boundary(activated_at).isoformat(), authorization="EXPLICIT_OPERATOR_CORRECTION_RECOVERY",
+        pairs=sorted(pairs, key=lambda pair: (pair["security_id"], pair["original_revision_id"], pair["revision_id"])),
+        revised_bars=[accepted[key] for key in sorted(accepted)], enrollment_sha256=digest(state["members"]))
+    record["generation_id"] = digest(record)
+    return record
+
+
+def corrected_detector_inputs(state, recoveries):
+    inputs = dict(state.get("bars", {}))
+    for security, record in recoveries.items():
+        key = security + "|30m"
+        retained = dict(inputs.get(key, {}))
+        replacements = {pair["original_revision_id"]: pair["revision_id"] for pair in record["pairs"] if pair["security_id"] == security}
+        revised = {bar["revision_id"]: bar for bar in record["revised_bars"]}
+        for start, bar in retained.items():
+            if bar["revision_id"] in replacements:
+                retained[start] = revised[replacements[bar["revision_id"]]]
+        inputs[key] = retained
+    return inputs
+
+
 def forward_decision(state, packets, *, boundary, actual_time, members, policy_hash, config, readiness=None):
     cutoff, latest_dispatch = window_clock(boundary)
+    cohort = None
+    if state.get("alert_cohort_history"):
+        members, cohort = alert_selection_cohort(state, boundary)
+        if cohort:
+            if utc(cohort["activated_at"]) > actual_time:
+                raise ValueError("alert cohort was not active at publication time")
+            policy_hash = digest(dict(base_policy_hash=policy_hash, alert_cohort_generation=cohort["generation_id"]))
     if readiness is not None:
         if state.get("dispatch_policy") != READINESS_POLICY:
             raise ValueError("source-ready dispatch must be explicitly enabled")
@@ -127,15 +267,22 @@ def forward_decision(state, packets, *, boundary, actual_time, members, policy_h
     if boundary <= enrollment:
         raise ValueError("pre-enrollment windows cannot become forward publications")
     expected = {member["security_id"] for member in members}
-    quarantined = state.get("identity_breaks", {})
+    recoveries = active_correction_recoveries(state, boundary, cutoff)
+    quarantined = {security: reason for security, reason in state.get("identity_breaks", {}).items() if security not in recoveries}
+    if recoveries:
+        policy_hash = digest(dict(base_policy_hash=policy_hash,
+            correction_recoveries=sorted({record["generation_id"] for record in recoveries.values()})))
     pending = {key: read_candidate(value) for key, value in state.get("pending_candidates", {}).items()}
     updates, revision_ids, ready = [], set(), set()
     for packet in sorted(packets, key=lambda item: (item["security_id"], item["interval"])):
         if packet["market_time"] != boundary or packet["available_at"] > cutoff:
             continue
+        recovery_boundary = state.get("detector_recovery_boundaries", {}).get(packet["security_id"])
+        if packet["interval"] in ("30m", "1h") and recovery_boundary and boundary < utc(recovery_boundary):
+            continue
         revision_ids.update(packet["revision_ids"])
         updates.extend(packet["updates"])
-        if packet["interval"] == "30m" and packet["ready"] and packet["security_id"] not in quarantined:
+        if packet["interval"] == "30m" and packet["ready"] and packet["security_id"] not in quarantined and packet["security_id"] in expected:
             ready.add(packet["security_id"])
         for candidate in packet["candidates"]:
             if candidate.trigger_at > enrollment and candidate.available_at <= cutoff:
@@ -144,13 +291,15 @@ def forward_decision(state, packets, *, boundary, actual_time, members, policy_h
                    if update.get("episode_id") and update["kind"] in ("INVALIDATED", "EXPIRED", "DATA_RISK")}
     for episode_id in invalidated:
         pending.pop(episode_id, None)
-    candidates = [replace(candidate, health="STALE") if candidate.security_id in quarantined
+    candidates = [replace(candidate, health="STALE", selection_block="OUTSIDE_ACTIVE_ALERT_COHORT") if candidate.security_id not in expected
+                  else replace(candidate, health="STALE") if candidate.security_id in quarantined
                   or candidate.interval != "1d" and candidate.security_id not in ready
                   else candidate for candidate in pending.values()]
     original_candidates = {candidate.episode_id: candidate for candidate in candidates}
     decision_prices = {}
     if config.get("execution_quality") == "CURRENT_NATIVE_PRICE_AND_ENTRY_SLOT_V2":
-        checked = [decision_candidate(candidate, state, boundary=boundary, cutoff=cutoff, actual_time=actual_time, config=config)
+        decision_state = dict(state, bars=corrected_detector_inputs(state, recoveries)) if recoveries else state
+        checked = [decision_candidate(candidate, decision_state, boundary=boundary, cutoff=cutoff, actual_time=actual_time, config=config)
                    for candidate in candidates]
         candidates = [candidate for candidate, _ in checked]
         decision_prices = {candidate.episode_id: evidence for candidate, evidence in checked}
@@ -166,6 +315,9 @@ def forward_decision(state, packets, *, boundary, actual_time, members, policy_h
     for episode_id in publication["selected"]:
         if episode_id in result_state.get("positions", {}):
             result_state["positions"][episode_id]["candidate"] = candidate_record(original_candidates[episode_id])
+            security = original_candidates[episode_id].security_id
+            if security in recoveries:
+                result_state["positions"][episode_id]["correction_recovery_generation"] = recoveries[security]["generation_id"]
     publication.update(input_deadline=cutoff.isoformat(), scheduled_publication_at=cutoff.isoformat(),
         latest_dispatch_at=latest_dispatch.isoformat(), actual_publication_at=actual_time.isoformat(),
         source="SHADOW", arm="PRIORITY", session=str(boundary.date()),
@@ -177,6 +329,16 @@ def forward_decision(state, packets, *, boundary, actual_time, members, policy_h
     if readiness is not None:
         publication.update(dispatch_policy=READINESS_POLICY, source_readiness=readiness,
             scheduled_publication_at=None, earliest_publication_at=(boundary + timedelta(minutes=config["provider_delay_minutes"])).isoformat())
+    if cohort:
+        publication["alert_selection_cohort"] = cohort
+    if recoveries:
+        publication["correction_recovery"] = [dict(generation_id=generation, effective_boundary=record["effective_boundary"],
+            activated_at=record["activated_at"]) for generation, record in sorted(
+                {record["generation_id"]: record for record in recoveries.values()}.items())]
+    if state.get("input_reconciliation_history"):
+        publication["input_reconciliation"] = [dict(version=record["version"], observed_at=record["observed_at"],
+            effective_boundary=record["effective_boundary"], revision_sha256=digest(record["inserted_revision_ids"]))
+            for record in state["input_reconciliation_history"] if utc(record["effective_boundary"]) <= boundary]
     result_state["pending_candidates"] = {key: candidate_record(candidate) for key, candidate in pending.items()
                                            if candidate.expires_at > actual_time and key not in invalidated}
     result_state["last_boundary"] = boundary.isoformat()
@@ -267,6 +429,152 @@ class ForwardStore:
     def publications(self):
         with closing(sqlite3.connect(self.path)) as connection:
             return [self.decode(row[0]) for row in connection.execute("SELECT payload FROM forward_publications ORDER BY window_key")]
+
+    def activate_identity_quarantine(self, security_id, ticker, activated_at):
+        state = self.load()
+        if state is None:
+            raise ValueError("identity quarantine requires an existing enrollment")
+        changed, record = quarantine_alert_member(state, security_id, ticker, activated_at)
+        if changed is state:
+            return state, dict(status="QUARANTINE_ALREADY_RECORDED", revision=record)
+        backup_path = self.path.parent / "quarantine-backups" / record["generation_id"] / "forward.sqlite"
+        backup_path.parent.mkdir(parents=True, exist_ok=False)
+        with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)) as source:
+            source.execute("PRAGMA query_only=ON")
+            with closing(sqlite3.connect(backup_path)) as target:
+                source.backup(target)
+        preservation = dict(generation_id=record["generation_id"], backup=str(backup_path.relative_to(self.path.parent)).replace("\\", "/"),
+            backup_sha256=hashlib.sha256(backup_path.read_bytes()).hexdigest(),
+            enrolled_members_sha256=digest(state["members"]), positions_sha256=digest(state.get("positions", {})),
+            original_checkpoint_sha256=digest(state))
+        changed["alert_quarantine_preservation"] = state.get("alert_quarantine_preservation", []) + [preservation]
+        self.save(changed)
+        with closing(sqlite3.connect(backup_path.resolve().as_uri() + "?mode=ro", uri=True)) as before, closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)) as after:
+            for table in ("forward_manifest", "forward_input_checkpoint", "forward_publications", "forward_outbox"):
+                if before.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall() != after.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall():
+                    raise ValueError("quarantine preservation check failed: " + table)
+        restored = self.load()
+        unchanged = {key: value for key, value in state.items() if key not in ("alert_cohort_history", "alert_quarantine_preservation")}
+        if any(restored.get(key) != value for key, value in unchanged.items()) or restored != changed:
+            raise ValueError("quarantine changed unrelated checkpoint state")
+        return restored, dict(status="QUARANTINE_ACTIVATED", revision=record, preservation=preservation,
+            preserved_tables=["forward_manifest", "forward_input_checkpoint", "forward_publications", "forward_outbox"],
+            original_enrollment_unchanged=True, positions_unchanged=True, next_boundary_unchanged=True)
+
+    def reconcile_retained_history(self, batch, config, observed_at, *, clock):
+        state = self.load()
+        if state is None:
+            raise ValueError("history reconciliation requires an existing enrollment")
+        members, _ = alert_selection_cohort(state, next_boundary(observed_at))
+        active = {member["security_id"]: member["ticker"] for member in members}
+        missing = []
+        for bar in batch["bars"]:
+            if bar["interval"] != "30m" or active.get(bar["security_id"]) != bar["ticker"]:
+                continue
+            retained = state.get("bars", {}).get(bar["security_id"] + "|30m", {})
+            if (retained and bar["bar_start"] not in retained and valid_bar(bar) and available_at(bar, config) <= observed_at
+                    and utc(bar["bar_start"]) >= observed_at - timedelta(days=7)
+                    and utc(bar["bar_end"]) <= max(utc(row["bar_end"]) for row in retained.values())):
+                missing.append(bar)
+        if not missing:
+            return state, dict(status="NO_MISSING_RETAINED_HISTORY", checked_at=observed_at.isoformat())
+        generation = digest(dict(observed_at=observed_at.isoformat(), revision_ids=sorted(bar["revision_id"] for bar in missing)))
+        backup_path = self.path.parent / "history-backups" / generation / "forward.sqlite"
+        backup_path.parent.mkdir(parents=True, exist_ok=False)
+        with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)) as source:
+            source.execute("PRAGMA query_only=ON")
+            with closing(sqlite3.connect(backup_path)) as target:
+                source.backup(target)
+        cache = {}
+        rebuilt, _ = advance_detectors(state, dict(bars=missing, actions=state.get("actions", [])), config, observed_at, frame_cache=cache)
+        allowed = ("bars", "detectors", "pending_candidates", "prepared_packets", "detector_recovery_boundaries", "input_reconciliation_history")
+        changed = state | {key: rebuilt[key] for key in allowed}
+        affected = {bar["security_id"] for bar in missing}
+        effective = next_boundary(clock()).isoformat()
+        changed["detector_recovery_boundaries"].update({security: effective for security in affected})
+        record = changed["input_reconciliation_history"][-1]
+        record.update(effective_boundary=effective, backup=str(backup_path.relative_to(self.path.parent)).replace("\\", "/"),
+            backup_sha256=hashlib.sha256(backup_path.read_bytes()).hexdigest(), authorization="EXPLICIT_OPERATOR_RECONCILIATION")
+        for key, rows in state.get("bars", {}).items():
+            if any(changed["bars"][key].get(start) != bar for start, bar in rows.items()):
+                raise ValueError("history reconciliation changed an existing bar")
+        ready = {}
+        for interval in ("30m", "1h"):
+            ready[interval] = sum(bool(cache[(security, interval)][1].ready.iloc[-1]) for security in active
+                if (security, interval) in cache and not cache[(security, interval)][1].empty)
+        self.save(changed)
+        with closing(sqlite3.connect(backup_path.resolve().as_uri() + "?mode=ro", uri=True)) as before, closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)) as after:
+            for table in ("forward_manifest", "forward_publications", "forward_outbox"):
+                if before.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall() != after.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall():
+                    raise ValueError("history preservation failed: " + table)
+        restored = self.load()
+        if restored != self.decode(self.encode(changed)):
+            raise ValueError("reconciled checkpoint roundtrip failed")
+        report = dict(status="HISTORY_RECONCILED", generation_id=generation, observed_at=observed_at.isoformat(),
+            effective_boundary=effective, inserted_bars=len(missing), affected_members=len(affected), feature_ready=ready,
+            backup=record["backup"], backup_sha256=record["backup_sha256"],
+            preserved_tables=["forward_manifest", "forward_publications", "forward_outbox"],
+            existing_bars_unchanged=True, positions_unchanged=True, enrollment_unchanged=True, quarantine_unchanged=True,
+            next_boundary_unchanged=True, unchanged_checkpoint_fields=sorted(set(state) - set(allowed)))
+        (backup_path.parent / "reconciliation.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        return restored, report
+
+    def recover_corrections(self, batch, config, observed_at, expected_hash, *, clock):
+        state = self.load()
+        if state is None or correction_inventory_hash(state) != expected_hash:
+            raise ValueError("reviewed correction inventory changed; audit before recovery")
+        members, _ = alert_selection_cohort(state, next_boundary(observed_at))
+        active = {member["security_id"] for member in members}
+        recovered = active_correction_recoveries(state, next_boundary(observed_at), observed_at)
+        affected = {pair["security_id"] for pair in state.get("corrections", []) if pair["security_id"] in active} - set(recovered)
+        if not affected:
+            return state, dict(status="CORRECTIONS_ALREADY_RECOVERED", inventory_sha256=expected_hash)
+        record = correction_recovery_record(state, batch["bars"], config, observed_at)
+        backup_path = self.path.parent / "correction-backups" / record["generation_id"] / "forward.sqlite"
+        backup_path.parent.mkdir(parents=True, exist_ok=False)
+        with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)) as source:
+            source.execute("PRAGMA query_only=ON")
+            with closing(sqlite3.connect(backup_path)) as target:
+                source.backup(target)
+        changed = deepcopy(state)
+        changed["pending_candidates"] = {key: value for key, value in changed.get("pending_candidates", {}).items() if value["security_id"] not in affected}
+        changed["prepared_packets"] = [packet for packet in changed.get("prepared_packets", []) if packet["security_id"] not in affected]
+        for security in affected:
+            for interval in ("30m", "1h"):
+                detector = changed.get("detectors", {}).get(security + "|" + interval)
+                if detector is not None:
+                    detector["states"] = {}
+        activated = clock()
+        if activated < observed_at:
+            raise ValueError("correction activation cannot predate source capture")
+        record.update(source_cutoff=observed_at.isoformat(), activated_at=activated.isoformat(),
+            effective_boundary=next_boundary(activated).isoformat(), inventory_sha256=expected_hash,
+            backup=str(backup_path.relative_to(self.path.parent)).replace("\\", "/"),
+            backup_sha256=hashlib.sha256(backup_path.read_bytes()).hexdigest())
+        record["generation_id"] = digest({key: value for key, value in record.items() if key != "generation_id"})
+        changed.setdefault("correction_recovery_history", []).append(record)
+        changed.setdefault("detector_recovery_boundaries", {}).update({security: record["effective_boundary"] for security in affected})
+        if not affected <= set(active_correction_recoveries(changed, utc(record["effective_boundary"]), activated)):
+            raise ValueError("not every reviewed member is prospectively recoverable")
+        allowed = {"detectors", "pending_candidates", "prepared_packets", "detector_recovery_boundaries", "correction_recovery_history"}
+        if {key: value for key, value in changed.items() if key not in allowed} != {key: value for key, value in state.items() if key not in allowed}:
+            raise ValueError("correction recovery changed protected state")
+        self.save(changed)
+        with closing(sqlite3.connect(backup_path.resolve().as_uri() + "?mode=ro", uri=True)) as before, closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)) as after:
+            for table in ("forward_manifest", "forward_publications", "forward_outbox"):
+                if before.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall() != after.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall():
+                    raise ValueError("correction preservation failed: " + table)
+        restored = self.load()
+        if restored != self.decode(self.encode(changed)):
+            raise ValueError("correction recovery checkpoint roundtrip failed")
+        report = dict(status="CORRECTIONS_RECOVERED_PROSPECTIVELY", generation_id=record["generation_id"],
+            activated_at=record["activated_at"], effective_boundary=record["effective_boundary"],
+            reviewed_pairs=len(record["pairs"]), recovered_members=len(affected), inventory_sha256=expected_hash,
+            backup=record["backup"], backup_sha256=record["backup_sha256"], original_bars_unchanged=True,
+            original_corrections_unchanged=True, positions_unchanged=True, previous_publications_unchanged=True,
+            outbox_unchanged=True, enrollment_and_quarantine_unchanged=True, next_boundary_unchanged=True)
+        (backup_path.parent / "recovery.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        return restored, report
 
 
 @lru_cache(maxsize=6)
@@ -370,6 +678,8 @@ def advance_detectors(state, batch, config, cutoff, *, bootstrap=False, frame_ca
     state = deepcopy(state)
     inputs = state.setdefault("bars", {})
     identities = {member["ticker"]: member["security_id"] for member in state["members"]}
+    prior_latest = {key: max(utc(bar["bar_end"]) for bar in rows.values()) for key, rows in inputs.items() if rows}
+    inserted_history = {}
     corrections = []
     for bar in batch["bars"]:
         if available_at(bar, config) > cutoff or not valid_bar(bar):
@@ -383,11 +693,28 @@ def advance_detectors(state, batch, config, cutoff, *, bootstrap=False, frame_ca
         if old and old["revision_id"] != bar["revision_id"] and not bootstrap:
             corrections.append(dict(kind="LATE_INPUT_CORRECTION", security_id=bar["security_id"],
                                     original_revision_id=old["revision_id"], revision_id=bar["revision_id"]))
-            state.setdefault("identity_breaks", {})[bar["security_id"]] = "INPUT_CORRECTION_REVIEW"
+            if state.setdefault("identity_breaks", {}).get(bar["security_id"]) != "IDENTITY_CHANGED":
+                state["identity_breaks"][bar["security_id"]] = "INPUT_CORRECTION_REVIEW"
             continue
+        if not bootstrap and not old and bar["interval"] == "30m" and key in prior_latest and utc(bar["bar_end"]) <= prior_latest[key]:
+            inserted_history.setdefault(bar["security_id"], []).append(bar["revision_id"])
         retained[bar["bar_start"]] = bar
+    if inserted_history:
+        effective = next_boundary(cutoff).isoformat()
+        state.setdefault("detector_recovery_boundaries", {}).update({security: effective for security in inserted_history})
+        state.setdefault("input_reconciliation_history", []).append(dict(version="stock_alert_late_history_v1",
+            observed_at=cutoff.isoformat(), effective_boundary=effective,
+            inserted_revision_ids={security: sorted(revisions) for security, revisions in sorted(inserted_history.items())}))
+        state["pending_candidates"] = {key: value for key, value in state.get("pending_candidates", {}).items()
+            if value["security_id"] not in inserted_history or value["interval"] == "1d"}
+        state["prepared_packets"] = [packet for packet in state.get("prepared_packets", [])
+            if packet["security_id"] not in inserted_history or packet["interval"] == "1d"]
     state["actions"] = batch["actions"]
-    grouped = {tuple(key.split("|", 1)): sorted(rows.values(), key=lambda bar: bar["bar_start"]) for key, rows in inputs.items()}
+    state["corrections"] = list({digest(item): item for item in state.get("corrections", []) + corrections}.values())
+    recoveries = active_correction_recoveries(state, cutoff, cutoff)
+    detector_inputs = corrected_detector_inputs(state, recoveries) if recoveries else inputs
+    detector_blocks = {security: reason for security, reason in state.get("identity_breaks", {}).items() if security not in recoveries}
+    grouped = {tuple(key.split("|", 1)): sorted(rows.values(), key=lambda bar: bar["bar_start"]) for key, rows in detector_inputs.items()}
     cache = frame_cache if frame_cache is not None else {}
 
     def cached_frame(key, bars):
@@ -401,7 +728,7 @@ def advance_detectors(state, batch, config, cutoff, *, bootstrap=False, frame_ca
 
     frames = {key: cached_frame(key, bars) for key, bars in grouped.items() if bars}
     new_context = daily_rank_context({key: frame for key, frame in frames.items()
-        if key[0] not in state.get("identity_breaks", {})}, state["members"], cutoff)
+        if key[0] not in detector_blocks}, state["members"], cutoff)
     stored_context = state.setdefault("contexts", {})
     for key, row in serialize_contexts(new_context).items():
         stored_context[key] = row
@@ -418,12 +745,18 @@ def advance_detectors(state, batch, config, cutoff, *, bootstrap=False, frame_ca
             if frame is None or frame.empty:
                 continue
             key = f"{security}|{interval}"
-            saved = detectors.get(key, {})
+            saved = {} if security in inserted_history else detectors.get(key, {})
             initial = {(model, int(direction)): value for name, value in saved.get("states", {}).items() for model, direction in [name.split(":")]}
+            after_ordinal = saved.get("ordinal")
+            effective = state.get("detector_recovery_boundaries", {}).get(security)
+            if effective:
+                suppressed = frame.loc[frame.bar_end.lt(utc(effective)), "ordinal"]
+                if not suppressed.empty:
+                    after_ordinal = max(after_ordinal if after_ordinal is not None else -1, int(suppressed.max()))
             sink = {}
             observations = intraday_observations(frame, interval, contexts, config, initial_state=initial,
-                after_ordinal=saved.get("ordinal"), state_sink=sink)
-            if security in state.get("identity_breaks", {}):
+                after_ordinal=after_ordinal, state_sink=sink)
+            if security in detector_blocks:
                 for packet in observations:
                     packet.update(ready=False, candidates=[])
             for packet in observations:
@@ -435,7 +768,7 @@ def advance_detectors(state, batch, config, cutoff, *, bootstrap=False, frame_ca
             latest = daily.bar_end.iloc[-1].isoformat()
             if state.setdefault("daily_processed", {}).get(security) != latest:
                 observations = daily_observations(daily, contexts, config) + higher_context_observations(daily, config)
-                if security in state.get("identity_breaks", {}):
+                if security in detector_blocks:
                     for packet in observations:
                         packet.update(ready=False, candidates=[])
                 packets.extend(packet for packet in observations if packet["market_time"] > utc(state["enrolled_at"])
@@ -445,7 +778,6 @@ def advance_detectors(state, batch, config, cutoff, *, bootstrap=False, frame_ca
         for packet in packets:
             packet["updates"].extend(item for item in corrections if item["security_id"] == packet["security_id"])
     state["last_source_read"] = cutoff.isoformat()
-    state["corrections"] = list({digest(item): item for item in state.get("corrections", []) + corrections}.values())
     return state, packets
 
 
@@ -462,14 +794,17 @@ def restore_packet(packet):
 
 def update_positions(state, config, now):
     from research.stock_idea_replay import mark_position
+    recoveries = active_correction_recoveries(state, now, now)
+    corrected = corrected_detector_inputs(state, recoveries) if recoveries else state.get("bars", {})
     for episode_id, position in state.get("positions", {}).items():
         if position["state"] in ("CLOSED", "NO_FILL"):
             continue
         security = position["candidate"]["security_id"]
-        if security in state.get("identity_breaks", {}):
+        recovered_position = security in recoveries and position.get("correction_recovery_generation") == recoveries[security]["generation_id"]
+        if security in state.get("identity_breaks", {}) and not recovered_position:
             position.update(state="UNRESOLVED", reason=state["identity_breaks"][security])
             continue
-        bars = list(state["bars"].get(f"{security}|30m", {}).values())
+        bars = list((corrected if recovered_position else state["bars"]).get(f"{security}|30m", {}).values())
         state["positions"][episode_id] = mark_position(position, bars, state.get("actions", []), now, config)
     return state
 
@@ -506,6 +841,19 @@ def shadow_snapshot(state, publications, config, now):
     snapshot["worker"] = dict(checked_at=now.isoformat(), next_boundary=state["next_boundary"],
         enrolled_members=len(state["members"]), identity_breaks=state.get("identity_breaks", {}),
         last_source_read=state.get("last_source_read"))
+    if state.get("correction_recovery_history"):
+        recovery = state["correction_recovery_history"][-1]
+        snapshot["worker"]["correction_recovery"] = dict(generation_id=recovery["generation_id"],
+            effective_boundary=recovery["effective_boundary"], activated_at=recovery["activated_at"],
+            reviewed_members=len({pair["security_id"] for pair in recovery["pairs"]}),
+            active_members=len(active_correction_recoveries(state, now, now)))
+    if state.get("alert_cohort_history"):
+        members, cohort = alert_selection_cohort(state, utc(state.get("retry_boundary", state["next_boundary"])))
+        snapshot["worker"].update(selection_members=len(members), alert_selection_cohort=cohort,
+            alert_cohort_history=state["alert_cohort_history"])
+        latest = state["alert_cohort_history"][-1]
+        names = ", ".join(record["excluded_member"]["ticker"] for record in state["alert_cohort_history"])
+        snapshot["warnings"].append(f"Alert-only identity quarantine: {names}; latest effective boundary {latest['effective_boundary']}. Original enrollment and positions retained.")
     if state.get("dispatch_policy") == READINESS_POLICY:
         boundary = utc(state.get("retry_boundary", state["next_boundary"]))
         snapshot.update(publication_mode="SOURCE_READINESS", next_publication_at=None,
@@ -513,6 +861,10 @@ def shadow_snapshot(state, publications, config, now):
             publication_deadline=readiness_deadline(boundary).isoformat())
         snapshot["worker"]["dispatch_policy"] = READINESS_POLICY
     for record, publication in zip(snapshot["publications"], publications):
+        if publication.get("correction_recovery"):
+            record["correction_recovery"] = publication["correction_recovery"]
+        if publication.get("alert_selection_cohort"):
+            record["alert_selection_cohort"] = publication["alert_selection_cohort"]
         if publication.get("retry_of"):
             record.update(trigger_at=publication["market_time"], retry_of=publication["retry_of"])
             snapshot["warnings"].append("A source-ready retry preserves the earlier incomplete run")

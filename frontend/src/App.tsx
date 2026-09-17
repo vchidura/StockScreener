@@ -11,6 +11,7 @@ const BearishBounce = lazy(() => import('./pages/BearishBounce'))
 const FibonacciScreener = lazy(() => import('./pages/FibonacciScreener'))
 const TickersOverview = lazy(() => import('./pages/TickersOverview'))
 const SectorIntelligence = lazy(() => import('./pages/SectorIntelligence'))
+const MarketConditionsPage = lazy(() => import('./pages/MarketConditionsPage'))
 const PersistencePage = lazy(() => import('./pages/PersistencePage'))
 const PatternWatch = lazy(() => import('./pages/PatternWatch'))
 const TickerWorkspace = lazy(() => import('./pages/ticker/TickerWorkspace'))
@@ -45,6 +46,7 @@ function PortalRoutes() {
         <Route path="/fibonacci" element={<FibonacciScreener />} />
         <Route path="/overview" element={<TickersOverview />} />
         <Route path="/sector-intelligence" element={<SectorIntelligence />} />
+        <Route path="/market-conditions" element={<MarketConditionsPage />} />
         <Route path="/pattern-watch" element={<PatternWatch />} />
         <Route path="/stocks/persistence" element={<PersistencePage />} />
         <Route path="/stock-research/*" element={<Navigate to="/stocks/persistence" replace />} />
