@@ -104,7 +104,10 @@ def prepare_import(monkeypatch, tmp_path, *, apply=False, reconstructed=True):
     arguments = SimpleNamespace(
         start="2024-03-01", end="2024-03-04", calendar="XNYS", limit_sessions=None,
         from_reconstructed_universes=reconstructed, policy_version="test",
-        include_non_common=False, apply=apply, output=tmp_path / "report.json", reference_cache_dir=tmp_path,
+        include_non_common=False, include_non_common_ticker=[], apply=apply,
+        ticker=[], skip_benchmarks=False,
+        security_type=None, fetch_missing_reference_cache=False,
+        output=tmp_path / "report.json", reference_cache_dir=tmp_path,
     )
     monkeypatch.setattr(importer, "parser", lambda: SimpleNamespace(parse_args=lambda: arguments))
     monkeypatch.setattr(importer, "reconstructed_union", lambda policy: ("TEST",))
@@ -230,6 +233,87 @@ def test_dated_type_exclusions_are_distinct_from_unresolved_tickers(tmp_path):
     identity = importer.dated_security_ids(tmp_path, date(2024, 3, 4), ("FUND",), observed_at=OBSERVED_AT)
     assert identity.excluded_tickers == frozenset({"FUND"})
     assert importer.validate_price_identities([{"T": "FUND"}], ("FUND",), identity, date(2024, 3, 4)) == set()
+
+
+def test_one_explicit_selected_etf_can_be_included_without_admitting_all_etfs(tmp_path):
+    write_references(tmp_path, "2024-03-04", [], "CS")
+    write_references(tmp_path, "2024-03-04", [
+        reference("IWM", type="ETF", composite_figi="IWM_ID"),
+        reference("OTHER", type="ETF", composite_figi="OTHER_ID"),
+    ], "ETF")
+    identity = importer.dated_security_ids(
+        tmp_path, date(2024, 3, 4), ("IWM", "OTHER"), observed_at=OBSERVED_AT,
+        allowed_non_common_tickers=("IWM",),
+    )
+    assert set(identity.security_ids) == {"IWM"}
+    assert identity.excluded_tickers == frozenset({"OTHER"})
+
+    with pytest.raises(ValueError, match="selected universe"):
+        importer.dated_security_ids(
+            tmp_path, date(2024, 3, 4), ("IWM",), observed_at=OBSERVED_AT,
+            allowed_non_common_tickers=("OTHER",),
+        )
+
+
+def test_targeted_iwm_dry_run_keeps_provider_and_repository_closed(monkeypatch, tmp_path):
+    arguments, _, client, repository = prepare_import(monkeypatch, tmp_path)
+    arguments.ticker = ["iwm"]
+    arguments.skip_benchmarks = True
+    arguments.include_non_common_ticker = ["iwm"]
+    arguments.security_type = ["ETF"]
+    monkeypatch.setattr(importer, "reconstructed_union", lambda policy: ("TEST", "IWM"))
+    cache_type = "ETF-subset-" + sha256_json(("IWM",))[:16]
+    for session in ("2024-03-01", "2024-03-04"):
+        write_references(
+            tmp_path, session,
+            [reference("IWM", type="ETF", composite_figi="IWM_ID")], cache_type,
+        )
+
+    assert importer.main() == 0
+
+    report = json.loads(arguments.output.read_text())
+    assert report["explicit_tickers"] == ["IWM"]
+    assert report["explicit_non_common_tickers"] == ["IWM"]
+    assert report["benchmarks_included"] is False
+    assert report["securities_requested"] == 1
+    assert report["identity_preflight"]["status"] == "READY_FOR_PRICE_VALIDATION"
+    client.assert_not_called()
+    repository.assert_not_called()
+
+
+def test_skip_benchmarks_or_out_of_universe_ticker_fails_before_provider(monkeypatch, tmp_path):
+    arguments, _, client, repository = prepare_import(monkeypatch, tmp_path)
+    arguments.skip_benchmarks = True
+    with pytest.raises(SystemExit, match="requires"):
+        importer.main()
+    arguments.ticker = ["OTHER"]
+    with pytest.raises(SystemExit, match="selected universe"):
+        importer.main()
+    client.assert_not_called()
+    repository.assert_not_called()
+
+
+def test_ticker_scoped_reference_cache_never_uses_full_type_cache_key(monkeypatch, tmp_path):
+    fetch = MagicMock(return_value=[reference("IWM", type="ETF", composite_figi="IWM_ID")])
+    identity = importer.dated_security_ids(
+        tmp_path, date(2024, 3, 4), ("IWM",), observed_at=OBSERVED_AT,
+        security_types=("ETF",), allowed_non_common_tickers=("IWM",),
+        reference_fetcher=fetch, cache_scope_tickers=("IWM",),
+    )
+    assert set(identity.security_ids) == {"IWM"}
+    fetch.assert_called_once_with("ETF", date(2024, 3, 4), ("IWM",))
+    paths = list(tmp_path.glob("*.json"))
+    assert len(paths) == 1 and "subset" in paths[0].name
+    assert not (tmp_path / "tickers-ETF_2024-03-04.json").exists()
+
+
+def test_reference_fetch_and_price_apply_cannot_be_combined(monkeypatch, tmp_path):
+    arguments, _, client, repository = prepare_import(monkeypatch, tmp_path, apply=True)
+    arguments.fetch_missing_reference_cache = True
+    with pytest.raises(SystemExit, match="separate stages"):
+        importer.main()
+    client.assert_not_called()
+    repository.assert_not_called()
 
 
 def test_unfinished_session_cannot_be_persisted_as_final(monkeypatch, tmp_path):

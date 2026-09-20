@@ -433,6 +433,18 @@ def equity_materialization_status() -> dict[str, Any]:
             """
         )
         projection_rows = [dict(row) for row in cursor.fetchall()]
+        cursor.execute(
+            """
+            SELECT interval, status, market_time, expected_members,
+                   completed_members, no_match_members,
+                   insufficient_members, failed_members, created_at
+            FROM equity_analysis_runs
+            WHERE status IN ('PENDING', 'RUNNING')
+            ORDER BY created_at
+            LIMIT 20
+            """
+        )
+        active_runs = [dict(row) for row in cursor.fetchall()]
 
     now = datetime.now(timezone.utc)
     intervals: dict[str, Any] = {}
@@ -481,6 +493,9 @@ def equity_materialization_status() -> dict[str, Any]:
             interval for interval, entry in intervals.items()
             if entry["status"] != "READY"
         ),
+        "pipeline_active": bool(active_runs),
+        "active_intervals": sorted({row["interval"] for row in active_runs}),
+        "active_runs": active_runs,
         "intervals": intervals,
     }
 
@@ -591,6 +606,7 @@ def equity_context_history(
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
     from database import get_db_cursor
+    from .repositories import LEGACY_CONTEXT_COLUMNS, legacy_context_predicate
 
     clauses = ["ticker = %s"]
     parameters: list[Any] = [ticker.upper()]
@@ -599,9 +615,10 @@ def equity_context_history(
         parameters.append(strategy_horizon)
     parameters.append(limit)
     with get_db_cursor() as cursor:
+        clauses.append(legacy_context_predicate(cursor))
         cursor.execute(
             f"""
-            SELECT * FROM equity_context_snapshots
+            SELECT {', '.join(LEGACY_CONTEXT_COLUMNS)} FROM equity_context_snapshots
             WHERE {' AND '.join(clauses)}
             ORDER BY market_time DESC, observed_at DESC
             LIMIT %s

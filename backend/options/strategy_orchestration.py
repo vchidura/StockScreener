@@ -11,12 +11,21 @@ from options.analytics.chain_analysis import ChainHealth
 from options.analytics.gamma_exposure import ScopedGammaProfile
 from options.config import OptionRuntimeConfiguration
 from options.domain import AssetType, OptionAnalysisRun, OptionContractSnapshot, WorkStage
+from options.evidence_runtime import EvidenceRuntimeMonitor
 from options.repositories.strategies import OptionStrategyRepository
 from options.repositories.analysis import OptionAnalysisRepository
 from options.repositories.gamma import OptionGammaProfileRepository
 from options.repositories.snapshots import OptionSnapshotRepository
 from options.repositories.trades import OptionTradeRepository
 from options.repositories.work_items import OptionWorkItemRepository
+from options.package_assessment_service import (
+    OptionPackageAssessmentService,
+    PackageAssessmentRunResult,
+)
+from options.stock_behavior_shadow import (
+    OptionStockBehaviorShadowService,
+    StockBehaviorShadowResult,
+)
 from options.strategies.context import OptionStrategyContextRepository
 from options.strategies.engine import OptionStrategyEngine
 
@@ -31,6 +40,14 @@ class StrategyMatrixResult:
     suppressed_count: int
     scenario_count: int
     error: str | None = None
+    stock_behavior_shadow_status: str = "DISABLED"
+    stock_behavior_assessment_count: int = 0
+    stock_behavior_assessment_inserted: int = 0
+    stock_behavior_assessment_error: str | None = None
+    package_assessment_status: str = "DISABLED"
+    package_assessment_count: int = 0
+    package_assessment_inserted: int = 0
+    package_assessment_error: str | None = None
 
 
 class OptionStrategyPipeline:
@@ -46,8 +63,11 @@ class OptionStrategyPipeline:
         trade_repository: OptionTradeRepository | None = None,
         gamma_repository: OptionGammaProfileRepository | None = None,
         engine: OptionStrategyEngine | None = None,
+        stock_behavior_shadow_service: OptionStockBehaviorShadowService | None = None,
+        package_assessment_service: OptionPackageAssessmentService | None = None,
     ) -> None:
         self.configuration = configuration
+        self.evidence_runtime = EvidenceRuntimeMonitor()
         self.context_repository = context_repository or OptionStrategyContextRepository()
         self.strategy_repository = strategy_repository or OptionStrategyRepository()
         self.work_repository = work_repository or OptionWorkItemRepository()
@@ -55,6 +75,26 @@ class OptionStrategyPipeline:
         self.snapshot_repository = snapshot_repository or OptionSnapshotRepository()
         self.trade_repository = trade_repository or OptionTradeRepository()
         self.gamma_repository = gamma_repository or OptionGammaProfileRepository()
+        self.stock_behavior_shadow_service = (
+            stock_behavior_shadow_service
+            or (
+                OptionStockBehaviorShadowService(
+                    launch=configuration.stock_behavior_shadow_launch,
+                )
+                if configuration.settings.stock_behavior_shadow_enabled
+                else None
+            )
+        )
+        self.package_assessment_service = (
+            package_assessment_service
+            or (
+                OptionPackageAssessmentService(
+                    valuation_policy_sha256=configuration.valuation_policy_sha256,
+                )
+                if configuration.settings.package_assessments_enabled
+                else None
+            )
+        )
         self.engine = engine or OptionStrategyEngine(
             configuration.strategy_policy,
             configuration.strategy_policy_sha256,
@@ -258,6 +298,12 @@ class OptionStrategyPipeline:
             self.strategy_repository.persist(context, result)
             if not self.work_repository.complete(work_item.work_id, lease_owner):
                 raise RuntimeError("strategy work lease expired before acknowledgement")
+            shadow_result, shadow_error = self._persist_stock_behavior_shadow(
+                context, result.candidates,
+            )
+            package_result, package_error = self._persist_package_assessments(
+                result.candidates,
+            )
             selected = sum(candidate.status.value == "SELECTED" for candidate in result.candidates)
             suppressed = sum(candidate.status.value != "SELECTED" for candidate in result.candidates)
             return StrategyMatrixResult(
@@ -268,6 +314,28 @@ class OptionStrategyPipeline:
                 selected,
                 suppressed,
                 len(result.scenarios),
+                stock_behavior_shadow_status=(
+                    "FAILED" if shadow_error else
+                    shadow_result.status if shadow_result is not None else "DISABLED"
+                ),
+                stock_behavior_assessment_count=(
+                    shadow_result.attempted if shadow_result is not None else 0
+                ),
+                stock_behavior_assessment_inserted=(
+                    shadow_result.inserted if shadow_result is not None else 0
+                ),
+                stock_behavior_assessment_error=shadow_error,
+                package_assessment_status=(
+                    "FAILED" if package_error else
+                    package_result.status if package_result is not None else "DISABLED"
+                ),
+                package_assessment_count=(
+                    package_result.attempted if package_result is not None else 0
+                ),
+                package_assessment_inserted=(
+                    package_result.inserted if package_result is not None else 0
+                ),
+                package_assessment_error=package_error,
             )
         except Exception as exc:
             self.work_repository.retry(
@@ -286,6 +354,35 @@ class OptionStrategyPipeline:
                 0,
                 str(exc),
             )
+
+    def _persist_stock_behavior_shadow(
+        self, context, candidates,
+    ) -> tuple[StockBehaviorShadowResult | None, str | None]:
+        if self.stock_behavior_shadow_service is None:
+            return None, None
+        try:
+            return (
+                self._measure_evidence("STOCK_BEHAVIOR", lambda: self.stock_behavior_shadow_service.assess_and_persist(context, candidates)),
+                None,
+            )
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+
+    def _persist_package_assessments(
+        self, candidates,
+    ) -> tuple[PackageAssessmentRunResult | None, str | None]:
+        service = getattr(self, "package_assessment_service", None)
+        if service is None:
+            return None, None
+        try:
+            return self._measure_evidence("PACKAGE", lambda: service.assess_and_persist(candidates)), None
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+
+    def _measure_evidence(self, stage, callback):
+        if not hasattr(self, "evidence_runtime"):
+            self.evidence_runtime = EvidenceRuntimeMonitor()
+        return self.evidence_runtime.run(stage, callback)
 
 def _read_context(now: datetime):
     from options.domain import DecisionContext

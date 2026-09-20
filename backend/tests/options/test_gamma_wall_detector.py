@@ -1,3 +1,4 @@
+import hashlib
 import sys
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -249,14 +250,22 @@ def test_wall_gamma_policy_enables_the_gates():
 
 
 def test_disabled_gates_leave_the_strategy_identity_unchanged():
-    _, sha = _policy("strategy_v1.json")
-    assert _engine("gamma_policy_v1.json").policy_sha256 == sha
+    policy, sha = _policy("strategy_v1.json")
+    engine = _engine("gamma_policy_v1.json")
+    assert engine.policy_sha256 == sha
+    assert engine.strategy_version == policy.strategy_version
+    for candidate in _squeeze(_scan("gamma_policy_v1.json", ())):
+        assert "gamma_policy_sha256" not in candidate.primary_evidence
+        assert "gamma_evidence_version" not in candidate.primary_evidence
 
 
 def test_enabled_gates_change_the_strategy_identity():
-    _, sha = _policy("strategy_v1.json")
+    policy, sha = _policy("strategy_v1.json")
+    _, gamma_sha = _gamma_policy("gamma_policy_v2_walls.json")
     engine = _engine("gamma_policy_v2_walls.json")
     assert engine.policy_sha256 != sha
+    assert engine.policy_sha256 != hashlib.sha256(f"{sha}:{gamma_sha}".encode("utf-8")).hexdigest()
+    assert engine.strategy_version == f"{policy.strategy_version}_gamma_evidence_v1"
     assert len(engine.policy_sha256) == 64
 
 
@@ -265,6 +274,14 @@ def test_enabled_gates_require_the_gamma_policy_hash():
     gamma_policy, _ = _gamma_policy("gamma_policy_v2_walls.json")
     with pytest.raises(ValueError, match="gamma policy hash"):
         OptionStrategyEngine(policy, sha, gamma_policy)
+
+
+@pytest.mark.parametrize("gamma_hash", ["x" * 64, "A" * 64, "a" * 63, "", None])
+def test_wall_evidence_requires_a_valid_policy_hash(gamma_hash):
+    policy, sha = _policy("strategy_v1.json")
+    gamma_policy, _ = _gamma_policy("gamma_policy_v2_walls.json")
+    with pytest.raises(ValueError, match="gamma policy hash"):
+        OptionStrategyEngine(policy, sha, gamma_policy, gamma_hash)
 
 
 def test_gamma_policies_have_distinct_identities():
@@ -317,13 +334,66 @@ def test_v2_selects_at_a_proximate_wall_with_a_volume_surge():
 
 def test_v2_records_wall_evidence_on_the_candidate():
     candidates = _squeeze(_scan("gamma_policy_v2_walls.json", _scoped()))
-    evidence = [c for c in candidates if c.status.value == "SELECTED"][0].primary_evidence
+    candidate = next(candidate for candidate in candidates if candidate.status.value == "SELECTED")
+    evidence = candidate.primary_evidence
+    _, gamma_hash = _gamma_policy("gamma_policy_v2_walls.json")
+    assert evidence["gamma_policy_sha256"] == gamma_hash
+    assert evidence["gamma_evidence_version"] == "gamma_wall_evidence_v1"
+    assert evidence["gamma_matrix_id"] == str(candidate.matrix_id)
+    assert candidate.strategy_version.endswith("_gamma_evidence_v1")
     assert evidence["gamma_wall_strike"] == "100"
     assert evidence["gamma_regime"] == "NEGATIVE_GAMMA"
     assert evidence["gamma_scope"] == "ZERO_DTE"
     assert evidence["dealer_convention"] == "DEALER_SHORT_CALLS_LONG_PUTS"
     assert evidence["gamma_wall_share"] > 0.05
     assert evidence["volume_surge_ratio"] >= 2.0
+
+
+def test_generated_wall_candidate_qualifies_only_with_its_retained_profile():
+    from options.alert_qualification import retained_gamma_evidence
+    from options.strategies.gates import GateVerdict
+
+    profile = _profile()
+    candidates = _squeeze(_scan("gamma_policy_v2_walls.json", _scoped(profile)))
+    candidate = next(candidate for candidate in candidates if candidate.status.value == "SELECTED")
+    _, gamma_hash = _gamma_policy("gamma_policy_v2_walls.json")
+    profile_id = str(uuid4())
+    detail = {
+        "candidate": {
+            "matrix_id": candidate.matrix_id,
+            "underlying": "SPY",
+            "strategy_name": candidate.strategy_name,
+            "market_data_time": candidate.market_data_time,
+            "observed_time": candidate.observed_time,
+            "primary_evidence": dict(candidate.primary_evidence),
+        },
+        "legs": [{"strike": leg.strike, "expiration_date": leg.expiration_date} for leg in candidate.legs],
+        "gamma_evidence": [{
+            "gamma_profile_id": profile_id,
+            "matrix_id": candidate.matrix_id,
+            "underlying": "SPY",
+            "scope": "ZERO_DTE",
+            "gamma_policy_sha256": gamma_hash,
+            "first_observed_at": OBSERVED_TIME,
+            "market_data_time": MARKET_TIME,
+            "shares_per_contract": profile.shares_per_contract,
+            "contributing_contract_count": profile.contributing_contract_count,
+            "eligible_contract_count": profile.eligible_contract_count,
+            "coverage_fraction": profile.coverage_fraction,
+            "quality_reasons": profile.quality_reasons,
+            "dealer_convention": profile.convention.value,
+            "regime_at_spot": profile.flip.regime_at_spot.value,
+        }],
+    }
+
+    evidence = retained_gamma_evidence(detail)
+
+    assert evidence.verdict is GateVerdict.PASS
+    assert evidence.source_ids == (profile_id, gamma_hash)
+    assert "MODELED_DEALER_CONVENTION_NOT_OBSERVED_POSITIONING" in evidence.reasons
+    assert candidate.execution_eligibility is None
+    detail["gamma_evidence"][0]["matrix_id"] = uuid4()
+    assert retained_gamma_evidence(detail).verdict is GateVerdict.UNAVAILABLE
 
 
 def test_wall_detection_is_convention_independent():

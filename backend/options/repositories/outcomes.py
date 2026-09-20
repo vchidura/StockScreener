@@ -5,8 +5,9 @@ from decimal import Decimal
 from typing import Any, Sequence
 from uuid import UUID
 
-from psycopg2.extras import execute_values
+from psycopg2.extras import Json, execute_values
 
+from options.calendar import OptionExchangeCalendar
 from options.domain import MarkSource
 from options.outcomes import OptionDecayOutcome, OptionOutcomeLeg
 from options.strategies.domain import OptionSide
@@ -20,6 +21,49 @@ OPTION_OUTCOME_RETENTION_DAYS = 60
 class OptionOutcomeRepository(PostgresRepository):
     def __init__(self, connection_factory: ConnectionFactory | None = None) -> None:
         super().__init__(connection_factory)
+
+    def retained_plan_marks(self, candidate_ids, *, available_by, valuation_policy_sha256):
+        ids = sorted({UUID(str(value)) for value in candidate_ids}, key=str)
+        if not 1 <= len(ids) <= 200 or available_by.tzinfo is None:
+            raise ValueError("history marks require 1-200 candidates and an aware cutoff")
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '5s'")
+            cursor.execute("SELECT to_regclass('public.option_signal_current_marks') IS NOT NULL AS ready")
+            if not cursor.fetchone()["ready"]:
+                return {"ready": False, "rows": {}}
+            cursor.execute("""
+                SELECT mark.*, candidate.candidate_identity, candidate.matrix_id,
+                       COALESCE(evidence.legs, '[]'::jsonb) AS legs
+                FROM option_signal_current_marks AS mark
+                JOIN option_strategy_candidates AS candidate USING(candidate_id)
+                LEFT JOIN LATERAL (
+                    SELECT jsonb_agg(jsonb_build_object(
+                        'contract_id', snapshot.contract_id, 'contract_ticker', snapshot.contract_ticker,
+                        'side', leg.side, 'ratio', leg.ratio, 'multiplier', leg.multiplier,
+                        'strike', snapshot.strike, 'expiration_date', snapshot.expiration_date,
+                        'contract_type', snapshot.contract_type, 'entry_mark', leg.model_mark,
+                        'entry_valuation_policy_sha256', leg.valuation_policy_sha256,
+                        'snapshot_multiplier', snapshot.shares_per_contract,
+                        'entry_mark_source', leg.mark_source, 'exit_mark', snapshot.model_mark,
+                        'exit_mark_source', snapshot.mark_source, 'valuation_policy_sha256', snapshot.valuation_policy_sha256,
+                        'snapshot_id', snapshot.snapshot_id, 'batch_id', snapshot.batch_id,
+                        'source_market_time', snapshot.mark_market_data_time,
+                        'source_observed_time', snapshot.first_observed_at,
+                        'revised_observed_at', snapshot.revised_observed_at
+                    ) ORDER BY leg.leg_index) AS legs
+                    FROM option_candidate_legs AS leg
+                    JOIN option_chain_snapshots AS snapshot
+                      ON snapshot.contract_id=leg.contract_id AND snapshot.snapshot_id=ANY(mark.source_snapshot_ids)
+                     AND snapshot.batch_id=mark.source_batch_id
+                     AND snapshot.first_observed_at>=candidate.observed_time AND snapshot.first_observed_at<=mark.observed_time
+                    WHERE leg.candidate_id=mark.candidate_id
+                ) AS evidence ON TRUE
+                WHERE mark.candidate_id=ANY(%s::uuid[]) AND mark.valuation_policy_sha256=%s
+                  AND mark.observed_time<=%s AND mark.updated_at<=%s
+                ORDER BY mark.candidate_id
+            """, (ids, valuation_policy_sha256, available_by, available_by))
+            return {"ready": True, "rows": {str(row["candidate_id"]): dict(row) for row in cursor.fetchall()}}
 
     def persist_decay_outcomes(
         self,
@@ -184,20 +228,56 @@ class OptionOutcomeRepository(PostgresRepository):
         available_by,
         retention_days: int = OPTION_OUTCOME_RETENTION_DAYS,
         limit: int = 1000,
+        include_incomplete_packages: bool = False,
+        availability_policy_sha256: str | None = None,
+        calendar: OptionExchangeCalendar | None = None,
     ) -> tuple[dict[str, Any], ...]:
         if retention_days <= 0 or limit <= 0:
             raise ValueError("retention_days and limit must be positive")
+        session_clocks = []
+        if include_incomplete_packages:
+            if availability_policy_sha256 is None:
+                raise ValueError("terminal outcome scheduling requires an exact availability policy")
+            exchange = calendar or OptionExchangeCalendar()
+            for session in exchange.trailing_sessions_before(
+                available_by.date() + timedelta(days=1), retention_days + 1,
+            ):
+                if session >= (available_by - timedelta(days=retention_days)).date():
+                    session_clocks.append({
+                        "session_date": session.isoformat(),
+                        "session_close": exchange.session_close(session).isoformat(),
+                        "next_open": exchange.next_session_open(session).isoformat(),
+                    })
         with self._cursor() as cursor:
             cursor.execute(
                 """
-                SELECT candidate.candidate_id, signal.event_id,
+                WITH session_clocks AS (
+                    SELECT * FROM jsonb_to_recordset(%s::jsonb) AS clocks(
+                        session_date date, session_close timestamptz, next_open timestamptz
+                    )
+                )
+                SELECT candidate.candidate_id, candidate.candidate_identity,
+                       signal.event_id,
                        candidate.market_data_time, candidate.capital_at_risk,
+                       ARRAY(
+                           SELECT required_leg.contract_id
+                           FROM option_candidate_legs AS required_leg
+                           WHERE required_leg.candidate_id = candidate.candidate_id
+                           ORDER BY required_leg.leg_index
+                       ) AS required_contract_ids,
                        COALESCE(
-                           ARRAY_AGG(outcome.measurement_type) FILTER (
+                           ARRAY_AGG(DISTINCT outcome.measurement_type) FILTER (
                                WHERE outcome.outcome_id IS NOT NULL
                            ), ARRAY[]::TEXT[]
-                       ) AS completed_measurements
+                       ) AS completed_measurements,
+                       COALESCE(
+                           ARRAY_AGG(DISTINCT unavailable.measurement_type) FILTER (
+                               WHERE unavailable.evidence_id IS NOT NULL
+                           ), ARRAY[]::TEXT[]
+                       ) AS unavailable_measurements
                 FROM option_strategy_candidates AS candidate
+                                LEFT JOIN session_clocks AS session
+                                    ON session.session_date = (candidate.market_data_time AT TIME ZONE 'UTC')::date
                                 LEFT JOIN option_signal_occurrences AS signal_occurrence
                                     ON signal_occurrence.source_candidate_id = candidate.candidate_id
                                 LEFT JOIN option_signal_events AS signal
@@ -205,6 +285,10 @@ class OptionOutcomeRepository(PostgresRepository):
                 LEFT JOIN option_signal_decay_outcomes AS outcome
                   ON outcome.candidate_id = candidate.candidate_id
                  AND outcome.valuation_policy_sha256 = %s
+                                LEFT JOIN option_outcome_unavailable_evidence AS unavailable
+                                    ON unavailable.candidate_id = candidate.candidate_id
+                                 AND unavailable.valuation_policy_sha256 = %s
+                                 AND (%s::text IS NULL OR unavailable.availability_policy_sha256 = %s)
                 WHERE candidate.status = 'SELECTED'
                   AND candidate.candidate_kind IN ('SINGLE_CONTRACT', 'MULTI_LEG')
                   AND candidate.capital_at_risk > 0
@@ -216,34 +300,74 @@ class OptionOutcomeRepository(PostgresRepository):
                                             WHERE entry_leg.candidate_id = candidate.candidate_id
                                                 AND entry_leg.valuation_policy_sha256 IS DISTINCT FROM %s
                                     )
-                                    AND EXISTS (
+                                    AND (NOT %s OR EXISTS (
+                                            SELECT 1 FROM (VALUES
+                                                    ('15MIN', candidate.market_data_time + INTERVAL '15 minutes'),
+                                                    ('30MIN', candidate.market_data_time + INTERVAL '30 minutes'),
+                                                    ('60MIN', candidate.market_data_time + INTERVAL '60 minutes'),
+                                                    ('CLOSE', CASE WHEN session.session_close > candidate.market_data_time
+                                                                                 THEN session.session_close END),
+                                                    ('NEXT_OPEN', session.next_open)
+                                            ) AS due(measurement_type, checkpoint_at)
+                                            WHERE due.checkpoint_at <= %s
+                                                AND NOT EXISTS (
+                                                        SELECT 1 FROM option_signal_decay_outcomes AS completed
+                                                        WHERE completed.candidate_id = candidate.candidate_id
+                                                            AND completed.measurement_type = due.measurement_type
+                                                            AND completed.valuation_policy_sha256 = %s
+                                                )
+                                                AND NOT EXISTS (
+                                                        SELECT 1 FROM option_outcome_unavailable_evidence AS terminal
+                                                        WHERE terminal.candidate_id = candidate.candidate_id
+                                                            AND terminal.measurement_type = due.measurement_type
+                                                            AND terminal.valuation_policy_sha256 = %s
+                                                            AND terminal.availability_policy_sha256 = %s
+                                                )
+                                    ))
+                                    AND (
+                                        %s
+                                        OR EXISTS (
                                             SELECT 1
                                             FROM option_chain_snapshots AS snapshot
                                             JOIN option_candidate_legs AS observed_leg
-                                                ON observed_leg.contract_id = snapshot.contract_id
+                                              ON observed_leg.contract_id = snapshot.contract_id
                                             WHERE observed_leg.candidate_id = candidate.candidate_id
-                                                AND snapshot.model_mark IS NOT NULL
-                                                AND snapshot.valuation_policy_sha256 = %s
-                                                AND snapshot.first_observed_at <= %s
-                                                AND snapshot.mark_market_data_time >=
-                                                        candidate.market_data_time + INTERVAL '15 minutes'
+                                                                                            AND snapshot.underlying = candidate.underlying
+                                                                                            AND snapshot.market_data_time >= candidate.market_data_time
+                                              AND snapshot.model_mark IS NOT NULL
+                                              AND snapshot.valuation_policy_sha256 = %s
+                                              AND snapshot.first_observed_at <= %s
+                                              AND snapshot.mark_market_data_time >=
+                                                  candidate.market_data_time + INTERVAL '15 minutes'
                                             GROUP BY snapshot.batch_id
                                             HAVING COUNT(DISTINCT snapshot.contract_id) = (
-                                                    SELECT COUNT(*)
-                                                    FROM option_candidate_legs AS required_leg
-                                                    WHERE required_leg.candidate_id = candidate.candidate_id
+                                                SELECT COUNT(*)
+                                                FROM option_candidate_legs AS required_leg
+                                                WHERE required_leg.candidate_id = candidate.candidate_id
                                             )
+                                        )
                                     )
                 GROUP BY candidate.candidate_id, signal.event_id
-                                HAVING COUNT(DISTINCT outcome.measurement_type) < 5
-                                    ORDER BY COUNT(DISTINCT outcome.measurement_type),
-                                             candidate.market_data_time DESC, candidate.candidate_id
+                                 HAVING %s OR COUNT(DISTINCT outcome.measurement_type)
+                                         + COUNT(DISTINCT unavailable.measurement_type) < 5
+                 ORDER BY CASE WHEN %s THEN candidate.market_data_time END ASC,
+                        CASE WHEN NOT %s THEN COUNT(DISTINCT outcome.measurement_type)
+                            + COUNT(DISTINCT unavailable.measurement_type) END,
+                        CASE WHEN NOT %s THEN candidate.market_data_time END DESC,
+                        candidate.candidate_id
                 LIMIT %s
                 """,
                 (
-                    valuation_policy_sha256, available_by, available_by,
-                    retention_days, valuation_policy_sha256,
-                    valuation_policy_sha256, available_by, limit,
+                    Json(session_clocks),
+                    valuation_policy_sha256, valuation_policy_sha256,
+                    availability_policy_sha256, availability_policy_sha256,
+                    available_by, available_by, retention_days,
+                    valuation_policy_sha256, include_incomplete_packages, available_by,
+                    valuation_policy_sha256, valuation_policy_sha256, availability_policy_sha256,
+                    include_incomplete_packages,
+                    valuation_policy_sha256, available_by,
+                    include_incomplete_packages, include_incomplete_packages,
+                    include_incomplete_packages, include_incomplete_packages, limit,
                 ),
             )
             return tuple(dict(row) for row in cursor.fetchall())

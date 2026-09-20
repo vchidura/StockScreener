@@ -14,6 +14,8 @@ from options.config import (
     load_option_runtime_configuration,
     load_valuation_policy,
 )
+from equity.behavior import DEFINITION_SHA256, OPTIONS_SWING_PROFILE
+from options.stock_behavior_gates import STOCK_BEHAVIOR_GATE_POLICY
 
 
 def _environment(**overrides: str) -> dict[str, str]:
@@ -26,6 +28,11 @@ def test_runtime_configuration_is_frozen_read_only_and_secret_safe():
     runtime = load_option_runtime_configuration(_environment(), BACKEND_DIR)
 
     assert runtime.settings.start_read_only is True
+    assert runtime.settings.stock_behavior_shadow_enabled is False
+    assert runtime.settings.package_assessments_enabled is False
+    assert runtime.settings.baseline_alerts_enabled is False
+    assert runtime.settings.baseline_alerts_effective_from is None
+    assert runtime.settings.outcome_unavailable_evidence_enabled is False
     assert runtime.settings.underlyers == (
         "AAPL",
         "AMD",
@@ -71,6 +78,84 @@ def test_runtime_configuration_is_frozen_read_only_and_secret_safe():
         runtime.settings.start_read_only = False
     with pytest.raises(ValidationError):
         runtime.policy.contract_filter.maximum_dte = 30
+
+
+def test_baseline_alerts_require_aware_effective_date_without_changing_source_identity():
+    disabled = load_option_runtime_configuration(_environment(), BACKEND_DIR)
+    with pytest.raises(ValueError, match="EFFECTIVE_FROM"):
+        load_option_runtime_configuration(_environment(OPTION_BASELINE_ALERTS_ENABLED="true"), BACKEND_DIR)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        load_option_runtime_configuration(_environment(OPTION_BASELINE_ALERTS_ENABLED="true",
+            OPTION_BASELINE_ALERTS_EFFECTIVE_FROM="2026-09-21T13:30:00"), BACKEND_DIR)
+    enabled = load_option_runtime_configuration(_environment(OPTION_BASELINE_ALERTS_ENABLED="true",
+        OPTION_BASELINE_ALERTS_EFFECTIVE_FROM="2026-09-21T13:30:00Z"), BACKEND_DIR)
+    assert enabled.settings.baseline_alerts_enabled
+    assert enabled.configuration_sha256 == disabled.configuration_sha256
+    assert enabled.strategy_policy_sha256 == disabled.strategy_policy_sha256
+
+
+def test_stock_behavior_shadow_is_explicit_and_not_part_of_market_configuration_identity(
+    tmp_path: Path,
+):
+    disabled = load_option_runtime_configuration(_environment(), BACKEND_DIR)
+    with pytest.raises(ValueError, match="LAUNCH_FILE"):
+        load_option_runtime_configuration(
+            _environment(OPTION_STOCK_BEHAVIOR_SHADOW_ENABLED="true"), BACKEND_DIR,
+        )
+    launch_path = tmp_path / "launch.json"
+    launch_path.write_text(json.dumps({
+        "schema_version": "option_stock_behavior_shadow_launch_v1",
+        "launch_id": "options-stock-behavior-test-v1",
+        "starts_at": "2026-09-21T13:30:00Z",
+        "ends_at": "2026-09-21T20:30:00Z",
+        "underlyers": list(disabled.settings.underlyers),
+        "maximum_assessments": 1000,
+        "maximum_payload_bytes": 50000000,
+        "maximum_candidates_per_matrix": 100,
+        "minimum_assessments_before_rate_stops": 25,
+        "maximum_unavailable_fraction": 0.5,
+        "maximum_p95_decision_lag_seconds": 120,
+        "artifact_destination": "backups/options-stock-behavior/test/status.json",
+        "detector_policy_sha256": STOCK_BEHAVIOR_GATE_POLICY.sha256,
+        "behavior_definition_sha256": DEFINITION_SHA256,
+        "behavior_policy_sha256": OPTIONS_SWING_PROFILE.sha256,
+        "assessment_only": True,
+        "execution_permission": False,
+    }), encoding="utf-8")
+    enabled = load_option_runtime_configuration(
+        _environment(
+            OPTION_STOCK_BEHAVIOR_SHADOW_ENABLED="true",
+            OPTION_STOCK_BEHAVIOR_SHADOW_LAUNCH_FILE=str(launch_path),
+        ),
+        BACKEND_DIR,
+    )
+
+    assert enabled.settings.stock_behavior_shadow_enabled is True
+    assert enabled.stock_behavior_shadow_launch is not None
+    assert enabled.stock_behavior_shadow_launch.launch_id == "options-stock-behavior-test-v1"
+    assert len(enabled.stock_behavior_shadow_launch_sha256 or "") == 64
+    assert enabled.configuration_sha256 == disabled.configuration_sha256
+
+
+def test_package_assessment_switch_does_not_change_market_configuration_identity():
+    disabled = load_option_runtime_configuration(_environment(), BACKEND_DIR)
+    enabled = load_option_runtime_configuration(
+        _environment(OPTION_PACKAGE_ASSESSMENTS_ENABLED="true"), BACKEND_DIR,
+    )
+
+    assert enabled.settings.package_assessments_enabled is True
+    assert enabled.configuration_sha256 == disabled.configuration_sha256
+
+
+def test_outcome_unavailable_switch_does_not_change_market_configuration_identity():
+    disabled = load_option_runtime_configuration(_environment(), BACKEND_DIR)
+    enabled = load_option_runtime_configuration(
+        _environment(OPTION_OUTCOME_UNAVAILABLE_EVIDENCE_ENABLED="true"),
+        BACKEND_DIR,
+    )
+
+    assert enabled.settings.outcome_unavailable_evidence_enabled is True
+    assert enabled.configuration_sha256 == disabled.configuration_sha256
 
 
 def test_policy_fingerprint_uses_canonical_validated_content(tmp_path: Path):

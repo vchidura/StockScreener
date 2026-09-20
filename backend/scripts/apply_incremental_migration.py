@@ -29,6 +29,11 @@ def _parse_args() -> argparse.Namespace:
         "--verify-table",
         help="Table that the restricted runtime role must be able to access after migration.",
     )
+    parser.add_argument(
+        "--skip-runtime-role-configuration",
+        action="store_true",
+        help="Apply and register the migration without altering the existing runtime role or grants.",
+    )
     return parser.parse_args()
 
 
@@ -66,7 +71,8 @@ def main() -> int:
                 "ON CONFLICT (version) DO NOTHING",
                 (version,),
             )
-    configure_runtime_role(settings)
+    if not args.skip_runtime_role_configuration:
+        configure_runtime_role(settings)
     with closing(psycopg2.connect(
         dbname=settings["DB_NAME"], user=settings["DB_USER"],
         password=settings["DB_PASSWORD"], host=settings["DB_HOST"],
@@ -88,7 +94,8 @@ def main() -> int:
                 table_available = bool(cursor.fetchone()[0])
     print(
         f"MIGRATION_APPLIED version={version} registered={registered} "
-        f"runtime_table_available={table_available}"
+        f"runtime_table_available={table_available} "
+        f"runtime_role_configured={not args.skip_runtime_role_configuration}"
     )
     return 0
 

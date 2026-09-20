@@ -98,3 +98,60 @@ STRATEGY_REGISTRY = (
 )
 
 REGISTRY_BY_NAME = {item.strategy_name: item for item in STRATEGY_REGISTRY}
+
+DISCOVERY_CATALOG_VERSION = "option_discovery_v1"
+DISCOVERY_CATEGORY_LABELS = {
+    "INCOME": "Income Generation",
+    "DEFINED_RISK_INCOME": "Defined-Risk Income",
+    "MOMENTUM": "Momentum / Activity",
+    "NEUTRAL_VOL": "Neutral / Volatility",
+}
+
+STRUCTURE_DISCOVERY_CATEGORIES = {
+    StructureType.CASH_SECURED_PUT: ("INCOME",),
+    StructureType.PUT_CREDIT_VERTICAL: ("DEFINED_RISK_INCOME",),
+    StructureType.CALL_CREDIT_VERTICAL: ("DEFINED_RISK_INCOME",),
+    StructureType.IRON_CONDOR: ("DEFINED_RISK_INCOME", "NEUTRAL_VOL"),
+    StructureType.CALL_BUTTERFLY: ("NEUTRAL_VOL",),
+    StructureType.PUT_BUTTERFLY: ("NEUTRAL_VOL",),
+    StructureType.LONG_CALL: ("MOMENTUM",),
+    StructureType.LONG_PUT: ("MOMENTUM",),
+    StructureType.CALL_DEBIT_VERTICAL: ("MOMENTUM",),
+    StructureType.PUT_DEBIT_VERTICAL: ("MOMENTUM",),
+    StructureType.SWEEP_LIKE_CLUSTER: ("MOMENTUM", "NEUTRAL_VOL"),
+    StructureType.VOLUME_OI_ANOMALY: ("MOMENTUM", "NEUTRAL_VOL"),
+    StructureType.VOLATILITY_DISTORTION: ("NEUTRAL_VOL",),
+}
+
+
+def discovery_categories(structure_type: StructureType) -> tuple[str, ...]:
+    return STRUCTURE_DISCOVERY_CATEGORIES[structure_type]
+
+
+def build_discovery_catalog() -> dict[str, object]:
+    return {
+        "version": DISCOVERY_CATALOG_VERSION,
+        "categories": [
+            {"id": category_id, "label": label}
+            for category_id, label in DISCOVERY_CATEGORY_LABELS.items()
+        ],
+        "models": [
+            {
+                "id": registration.strategy_name,
+                "label": registration.display_name,
+                "output_kind": (
+                    "OBSERVATION"
+                    if registration.allowed_risk_classes == (StructureRiskClass.RESEARCH_CONTEXT,)
+                    else "STRUCTURE"
+                ),
+                "structures": [
+                    {
+                        "id": structure.value,
+                        "category_ids": list(discovery_categories(structure)),
+                    }
+                    for structure in registration.allowed_structure_types
+                ],
+            }
+            for registration in STRATEGY_REGISTRY
+        ],
+    }

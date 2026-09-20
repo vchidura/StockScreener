@@ -5,6 +5,7 @@ import pytest
 from equity.polygon import sha256_json
 
 from scripts import run_corporate_action_worker
+from scripts import backfill_corporate_actions
 
 
 OBSERVED_AT = datetime(2026, 9, 11, 18, 0, tzinfo=timezone.utc)
@@ -150,3 +151,58 @@ def test_native_worker_launcher_includes_corporate_action_refresh():
     ).read_text(encoding="utf-8")
 
     assert 'ScriptName "run_corporate_action_worker.py"' in source
+
+
+def test_targeted_backfill_persists_response_bound_split_observation_atomically(monkeypatch):
+    identities = {ticker: uuid4() for ticker in ("AAPL", "IWM")}
+    universe = type("Universe", (), {
+        "get_latest_as_of": lambda self, context: {"universe_run_id": "run"},
+        "member_tickers": lambda self, run_id: frozenset(identities),
+    })()
+    references = [type("Reference", (), {"ticker": ticker, "security_id": identity})()
+                  for ticker, identity in identities.items()]
+    monkeypatch.setattr(backfill_corporate_actions, "EquityUniverseRepository", lambda: universe)
+    monkeypatch.setattr(backfill_corporate_actions.EquityReferenceRepository, "list_securities_as_of",
+                        lambda self, tickers, context: tuple(references))
+    client = type("Client", (), {
+        "fetch_splits": lambda self, start, end: ({
+            "id": "split", "ticker": "AAPL", "execution_date": "2026-08-10",
+            "split_from": 1, "split_to": 2,
+        },),
+        "fetch_dividends": lambda self, start, end: pytest.fail("dividends not requested"),
+    })()
+    monkeypatch.setattr(backfill_corporate_actions, "PolygonEquityClient", lambda: client)
+    repository = type("Repository", (), {})()
+    repository.calls = []
+    repository.persist_observation = lambda coverage, actions: (
+        repository.calls.append((tuple(coverage), tuple(actions))) or (len(actions), len(coverage))
+    )
+    monkeypatch.setattr(backfill_corporate_actions, "EquityCorporateActionRepository", lambda: repository)
+    monkeypatch.setenv("DB_NAME", "stocks")
+    arguments = type("Arguments", (), {
+        "start": "2026-08-04", "end": "2026-08-14", "dividends": False,
+        "ticker": ["AAPL", "IWM"], "apply": True,
+        "confirm_database_name": "stocks", "output": None,
+    })()
+    monkeypatch.setattr(backfill_corporate_actions, "parser",
+                        lambda: type("Parser", (), {"parse_args": lambda self: arguments})())
+
+    assert backfill_corporate_actions.main() == 0
+    coverage, actions = repository.calls[0]
+    assert len(coverage) == 2 and {row.action_type for row in coverage} == {"SPLIT"}
+    assert all(row.availability_mode.value == "LIVE_OBSERVED" for row in coverage)
+    assert all(row.response_action_count is not None and row.response_sha256 for row in coverage)
+    assert len(actions) == 1 and actions[0].ticker == "AAPL"
+
+
+def test_backfill_apply_requires_database_and_universe_confirmation(monkeypatch):
+    monkeypatch.setenv("DB_NAME", "stocks")
+    arguments = type("Arguments", (), {
+        "start": "2026-08-04", "end": "2026-08-14", "dividends": False,
+        "ticker": ["OTHER"], "apply": True,
+        "confirm_database_name": "wrong", "output": None,
+    })()
+    monkeypatch.setattr(backfill_corporate_actions, "parser",
+                        lambda: type("Parser", (), {"parse_args": lambda self: arguments})())
+    with pytest.raises(SystemExit, match="database-name"):
+        backfill_corporate_actions.main()

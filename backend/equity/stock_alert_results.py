@@ -17,12 +17,13 @@ from research.stock_idea_engine import digest
 from research.stock_idea_replay import utc
 
 
-def capture_result_source(directory, stream, now):
+def capture_result_source(directory, stream, now=None):
     directory = Path(directory)
     view_path = directory / "alerts-view.json"
     if view_path.stat().st_size > 20_000_000:
         raise ValueError("source alert view exceeds read bound")
     raw = view_path.read_bytes()
+    now = now or datetime.now(timezone.utc)
     snapshot = json.loads(raw)
     if utc(snapshot["as_of"]) > now:
         raise ValueError("source snapshot is in the future")
@@ -43,9 +44,28 @@ def capture_result_source(directory, stream, now):
     by_run = {publication["window_key"]: publication for publication in publications}
     for row in snapshot["alerts"]:
         publication = by_run[row["run_id"]]
-        position = state["positions"][row["alert_id"]]
+        if row["alert_id"] not in publication["selected"]:
+            raise ValueError("view plan does not match retained ledger")
+        if row["lane"] == "WATCH":
+            candidate = publication.get("candidates", {}).get(row["alert_id"])
+            dispositions = [item for item in publication["dispositions"] if item["episode_id"] == row["alert_id"]]
+            if (not candidate or len(dispositions) != 1 or dispositions[0]["selection"] != "SELECTED"
+                    or row["model"] != "discovery" or row["interval"] != "1d" or row["status"] != "WATCH"
+                    or row["hold"] != "Watch only" or row["policy_version"] != policy["policy_version"]
+                    or any(row[field] != candidate[field] for field in ("security_id", "ticker", "model", "interval", "direction"))
+                    or any(row[field] != dispositions[0][field] for field in ("security_id", "model", "interval", "direction"))
+                    or any(row.get(field) is not None for field in ("trigger_price", "stop", "target", "risk_pct", "reward_risk",
+                        "entry_price", "entry_at", "entry_risk", "exit_due_at", "exit_price", "exit_at", "paper_return", "mark_price", "mark_at"))):
+                raise ValueError("view watch does not match retained ledger")
+            if (utc(row["triggered_at"]) != utc(publication.get("market_time", publication["window_key"]))
+                    or utc(row["published_at"]) != utc(publication["actual_publication_at"])):
+                raise ValueError("view watch clocks changed")
+            continue
+        position = state.get("positions", {}).get(row["alert_id"])
+        if row["lane"] != "TRADE" or row["model"] == "discovery" or position is None:
+            raise ValueError("view trade has no retained position")
         candidate = position["candidate"]
-        if row["alert_id"] not in publication["selected"] or any(row[field] != candidate[field] for field in ("security_id", "ticker", "model", "interval", "direction", "stop", "target", "policy_version")):
+        if any(row[field] != candidate[field] for field in ("security_id", "ticker", "model", "interval", "direction", "stop", "target", "policy_version")):
             raise ValueError("view plan does not match retained ledger")
         if (row["trigger_price"] != candidate["price"] or utc(row["triggered_at"]) != utc(candidate["trigger_at"])
                 or utc(row["published_at"]) != utc(publication["actual_publication_at"])):
@@ -61,7 +81,7 @@ def capture_result_source(directory, stream, now):
             bundles[run["run_id"]] = bundle
     return dict(instance=instance | dict(policy=policy, enrollment=state["members"]), snapshot=snapshot,
         publications={key: value for key, value in by_run.items() if key in {run["run_id"] for run in snapshot["publications"]}},
-        contexts=bundles, source_sha256=hashlib.sha256(raw).hexdigest())
+        contexts=bundles, source_sha256=hashlib.sha256(raw).hexdigest(), captured_at=now.isoformat())
 
 
 def retain_record(cursor, instance_id, kind, record_id, payload):
@@ -162,6 +182,237 @@ def load_shared_results(now=None):
                 error=record["error"], projector_stale=age > 180, worker=snapshot.get("worker"),
                 publication_window_start=snapshot.get("publication_window_start"), publication_deadline=snapshot.get("publication_deadline")))
     return combine_snapshots(snapshots, streams)
+
+
+def read_published_stock_setup(*, policy, record_id, payload_sha256, episode_id,
+                              security_id, ticker, market_cutoff, observed_cutoff,
+                              cursor_factory=get_db_cursor, clock=None):
+    from equity.behavior_setup import PublishedSetupSourcePolicy, bind_published_stock_setup
+
+    policy = PublishedSetupSourcePolicy.model_validate(policy)
+    if market_cutoff.tzinfo is None or observed_cutoff.tzinfo is None or market_cutoff > observed_cutoff:
+        raise ValueError("setup reader requires causal aware cutoffs")
+    with cursor_factory() as cursor:
+        cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        cursor.execute("SET LOCAL statement_timeout='5s'")
+        cursor.execute("""SELECT to_regclass('public.stock_alert_result_records') IS NOT NULL
+            AND to_regclass('public.stock_alert_result_instances') IS NOT NULL AS ready""")
+        if not cursor.fetchone()["ready"]:
+            return None
+        cursor.execute("""
+            SELECT CASE WHEN octet_length(instance.payload::text) <= 4194304
+                        THEN instance.payload END AS instance,
+                   CASE WHEN octet_length(record.payload::text) <= 4194304
+                        THEN record.payload END AS publication,
+                   record.payload_sha256, record.imported_at
+            FROM stock_alert_result_records AS record
+            JOIN stock_alert_result_instances AS instance USING(instance_id)
+            WHERE record.instance_id=%s AND record.kind='publication_evidence'
+              AND record.record_id=%s AND record.payload_sha256=%s
+              AND record.imported_at<=%s AND instance.created_at<=%s
+            LIMIT 1
+        """, (policy.instance_id, record_id, payload_sha256, observed_cutoff, observed_cutoff))
+        row = cursor.fetchone()
+    received_at = clock() if clock else datetime.now(timezone.utc)
+    if received_at < observed_cutoff:
+        raise ValueError("setup observer receipt precedes query cutoff")
+    if row is None:
+        return None
+    if row["instance"] is None or row["publication"] is None:
+        raise ValueError("retained setup payload exceeds read bound")
+    if utc(row["publication"].get("market_time", record_id)) > market_cutoff:
+        raise ValueError("setup publication exceeds market cutoff")
+    if utc(row["publication"]["actual_publication_at"]) > observed_cutoff:
+        raise ValueError("setup publication exceeds observation cutoff")
+    return bind_published_stock_setup(instance=row["instance"], publication=row["publication"],
+        record_id=record_id, payload_sha256=row["payload_sha256"], imported_at=row["imported_at"],
+        received_at=received_at, episode_id=episode_id, security_id=security_id, ticker=ticker, policy=policy)
+
+
+def read_setup_publication_inventory(*, limit=12, cursor_factory=get_db_cursor, clock=None):
+    if not 1 <= limit <= 48:
+        raise ValueError("setup inventory requires 1..48 publications")
+    cutoff = clock() if clock else datetime.now(timezone.utc)
+    with cursor_factory() as cursor:
+        cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        cursor.execute("SET LOCAL statement_timeout='5s'")
+        cursor.execute("""SELECT to_regclass('public.stock_alert_result_records') IS NOT NULL
+            AND to_regclass('public.stock_alert_result_instances') IS NOT NULL
+            AND to_regclass('public.stock_alert_result_streams') IS NOT NULL AS ready""")
+        if not cursor.fetchone()["ready"]:
+            return (), cutoff
+        cursor.execute("""
+            SELECT record.record_id, record.payload_sha256, record.imported_at,
+                   CASE WHEN octet_length(record.payload::text) <= 4194304
+                        THEN record.payload END AS publication,
+                   instance.payload AS instance
+            FROM stock_alert_result_streams AS stream
+            JOIN stock_alert_result_instances AS instance USING(instance_id)
+            JOIN LATERAL (
+                SELECT record_id, payload_sha256, imported_at, payload
+                FROM stock_alert_result_records
+                WHERE instance_id=stream.instance_id AND kind='publication_evidence'
+                  AND imported_at<=%s
+                ORDER BY record_id DESC LIMIT %s
+            ) AS record ON TRUE
+            WHERE stream.stream='intraday' AND instance.created_at<=%s
+              AND octet_length(instance.payload::text) <= 4194304
+            ORDER BY record.record_id DESC
+        """, (cutoff, limit, cutoff))
+        rows = tuple(dict(row) for row in cursor.fetchall())
+    received_at = clock() if clock else datetime.now(timezone.utc)
+    if received_at < cutoff or len(rows) > limit:
+        raise ValueError("setup inventory read bound/receipt mismatch")
+    return rows, received_at
+
+
+def read_original_setup_publications(path, record_ids):
+    record_ids = tuple(dict.fromkeys(record_ids))
+    if not 1 <= len(record_ids) <= 48:
+        raise ValueError("original setup comparison requires 1..48 exact keys")
+    path = Path(path).resolve()
+    if not path.is_file():
+        raise ValueError("original setup ledger does not exist")
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)) as connection:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        manifest = connection.execute("""SELECT policy_hash,
+            CASE WHEN length(payload)<=4194304 THEN payload END
+            FROM forward_manifest WHERE singleton=1""").fetchone()
+        if manifest is None or manifest[1] is None or digest(json.loads(manifest[1])) != manifest[0]:
+            raise ValueError("original setup manifest checksum/bound mismatch")
+        publications = {}
+        for record_id in record_ids:
+            row = connection.execute("""SELECT CASE WHEN length(payload)<=4194304 THEN payload END
+                FROM forward_publications WHERE window_key=?""", (record_id,)).fetchone()
+            if row is None:
+                continue
+            publication = _decode_original_setup_payload(row[0])
+            if publication.get("window_key") != record_id:
+                raise ValueError("original setup publication key mismatch")
+            publications[record_id] = publication
+    return manifest[0], publications
+
+
+def _decode_original_setup_payload(blob):
+    if blob is None or len(blob) > 4194304:
+        raise ValueError("original setup compressed payload exceeds bound")
+    decoder = zlib.decompressobj()
+    raw = decoder.decompress(blob, 16777217)
+    if len(raw) > 16777216 or not decoder.eof or decoder.unused_data:
+        raise ValueError("original setup decompressed payload exceeds bound or is invalid")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("original setup payload must be an object")
+    return payload
+
+
+def read_direct_stock_setup(path, *, policy, record_id, payload_sha256, episode_id,
+                            security_id, ticker, market_cutoff, clock=None):
+    from equity.behavior_setup import bind_direct_stock_setup, resolve_direct_setup_policy
+
+    policy = resolve_direct_setup_policy(policy)
+    started_at = clock() if clock else datetime.now(timezone.utc)
+    if market_cutoff.tzinfo is None or started_at.tzinfo is None or market_cutoff > started_at:
+        raise ValueError("direct setup requires a causal market cutoff")
+    path = Path(path).resolve()
+    if not path.is_file():
+        return None
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)) as connection:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        manifest = connection.execute("""SELECT policy_hash,
+            CASE WHEN length(payload)<=4194304 THEN payload END
+            FROM forward_manifest WHERE singleton=1""").fetchone()
+        if manifest is None or manifest[1] is None or manifest[0] != policy.instance_policy_sha256:
+            raise ValueError("direct setup manifest identity/bound mismatch")
+        config = json.loads(manifest[1])
+        if digest(config) != manifest[0]:
+            raise ValueError("direct setup manifest checksum mismatch")
+        row = connection.execute("""SELECT CASE WHEN length(payload)<=4194304 THEN payload END
+            FROM forward_publications WHERE window_key=?""", (record_id,)).fetchone()
+        if row is None:
+            return None
+        publication = _decode_original_setup_payload(row[0])
+        checkpoint = connection.execute("""SELECT CASE WHEN length(payload)<=4194304 THEN payload END
+            FROM forward_checkpoint WHERE singleton=1""").fetchone()
+        if checkpoint is None:
+            raise ValueError("direct setup enrollment checkpoint unavailable")
+        state = _decode_original_setup_payload(checkpoint[0])
+        instance = strategy_instance(config, state, "intraday") | {"policy": config, "enrollment": state["members"]}
+    received_at = clock() if clock else datetime.now(timezone.utc)
+    if received_at < started_at:
+        raise ValueError("direct setup receipt moved backwards")
+    if utc(publication.get("market_time", record_id)) > market_cutoff:
+        raise ValueError("direct setup publication exceeds market cutoff")
+    if utc(publication["actual_publication_at"]) > started_at:
+        raise ValueError("direct setup publication was not available at read cutoff")
+    return bind_direct_stock_setup(instance=instance, publication=publication, record_id=record_id,
+        payload_sha256=payload_sha256, received_at=received_at, episode_id=episode_id,
+        security_id=security_id, ticker=ticker, policy=policy)
+
+
+def read_direct_stock_setups(path, *, policies, underlyers, market_cutoff, as_of, clock=None):
+    from uuid import UUID
+    from equity.behavior_setup import bind_direct_stock_setup, resolve_direct_setup_policy
+
+    policies = tuple(resolve_direct_setup_policy(policy) for policy in policies)
+    if (not policies or len(policies) > 2 or len({policy.instance_id for policy in policies}) != 1
+            or not 1 <= len(underlyers) <= 13 or market_cutoff.utcoffset() is None
+            or as_of.utcoffset() is None or market_cutoff > as_of):
+        raise ValueError("direct setup batch requires one pinned source and causal bounded scope")
+    path = Path(path).resolve()
+    if not path.is_file():
+        raise ValueError("pinned direct setup ledger is missing")
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)) as connection:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        manifest = connection.execute("SELECT policy_hash,CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_manifest WHERE singleton=1").fetchone()
+        if manifest is None or manifest[1] is None or manifest[0] != policies[0].instance_policy_sha256:
+            raise ValueError("pinned setup manifest identity or bound mismatch")
+        config = json.loads(manifest[1])
+        if digest(config) != manifest[0]:
+            raise ValueError("pinned setup manifest checksum mismatch")
+        checkpoint = connection.execute("SELECT CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_checkpoint WHERE singleton=1").fetchone()
+        if checkpoint is None:
+            raise ValueError("pinned setup checkpoint unavailable")
+        state = _decode_original_setup_payload(checkpoint[0])
+        instance = strategy_instance(config, state, "intraday") | {"policy": config, "enrollment": state["members"]}
+        if any(instance["instance_id"] != policy.instance_id or instance["policy_hash"] != policy.instance_policy_sha256 for policy in policies):
+            raise ValueError("pinned setup instance changed")
+        rows = connection.execute("SELECT window_key,CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_publications ORDER BY window_key DESC LIMIT 12").fetchall()
+        publications, size = [], 0
+        for record_id, blob in rows:
+            publication = _decode_original_setup_payload(blob)
+            size += len(json.dumps(publication, allow_nan=False).encode("utf-8"))
+            if size > 67108864:
+                raise ValueError("direct setup batch exceeds payload budget")
+            publications.append((record_id, publication))
+    received_at = clock() if clock else datetime.now(timezone.utc)
+    if received_at < as_of:
+        raise ValueError("direct setup batch receipt moved backwards")
+    results, seen = [], set()
+    for record_id, publication in publications:
+        if utc(publication.get("market_time", record_id)) > market_cutoff or utc(publication["actual_publication_at"]) > as_of:
+            continue
+        for episode_id, candidate in publication.get("candidates", {}).items():
+            if (candidate["ticker"] not in underlyers or candidate["interval"] != "1h"
+                    or utc(candidate["expires_at"]) <= received_at or episode_id in seen):
+                continue
+            policy = next((policy for policy in policies if policy.detector_version == candidate["policy_version"]), None)
+            if policy is None:
+                continue
+            try:
+                evidence = bind_direct_stock_setup(instance=instance, publication=publication, record_id=record_id,
+                    payload_sha256=digest(publication), received_at=received_at, episode_id=episode_id,
+                    security_id=UUID(candidate["security_id"]), ticker=candidate["ticker"], policy=policy)
+            except ValueError:
+                continue
+            results.append(evidence)
+            seen.add(episode_id)
+            if len(results) > 5000:
+                raise ValueError("direct setup batch exceeds episode bound")
+    return tuple(results)
 
 
 def attach_shared_context(page):

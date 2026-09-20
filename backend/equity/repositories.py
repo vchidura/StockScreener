@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Callable, ContextManager, Iterator, Mapping, Sequence
 from uuid import UUID
 
@@ -31,6 +32,43 @@ from .qualification import QualificationRevision
 
 register_uuid()
 ConnectionFactory = Callable[[], ContextManager[Any]]
+
+LEGACY_CONTEXT_COLUMNS = (
+    "equity_context_snapshot_id", "security_id", "ticker", "strategy_horizon", "market_time",
+    "observed_at", "valid_until", "status", "universe_run_id", "security_revision_id",
+    "fundamental_snapshot_id", "regime_state", "ema_direction", "qualified_direction",
+    "direction_qualification_id", "direction_evidence_id", "direction_horizon", "direction_valid_until",
+    "trigger_state", "trigger_valid_until", "range_forecast_id", "range_lower", "range_upper",
+    "range_valid_until", "market_cap", "shares_outstanding", "free_float", "dividend_yield",
+    "enterprise_value", "ebitda", "operating_income", "free_cash_flow", "risk_levels",
+    "conflict_state", "stale_components", "reason_codes", "summary", "context_policy_version",
+    "context_policy_sha256", "created_at",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class BehaviorFeatureSourceRead:
+    evidence: EquityEvidence
+    evidence_created_at: datetime
+    selected_revision_ids: tuple[UUID, ...]
+    bars: tuple[EquityBarRevision, ...]
+    bar_created_ats: tuple[datetime, ...]
+    missing_revision_ids: tuple[UUID, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BehaviorGroupedDailyRead:
+    ticker: str
+    bars: tuple[EquityBarRevision, ...]
+    bar_created_ats: tuple[datetime, ...]
+
+def legacy_context_predicate(cursor: Any) -> str:
+    cursor.execute(
+        "SELECT EXISTS(SELECT 1 FROM pg_attribute "
+        "WHERE attrelid = to_regclass('equity_context_snapshots') "
+        "AND attname = 'context_kind' AND NOT attisdropped) AS ready"
+    )
+    return "context_kind = 'LEGACY'" if cursor.fetchone()["ready"] else "TRUE"
 
 
 def default_connection_factory() -> ContextManager[Any]:
@@ -521,6 +559,79 @@ class EquityCorporateActionRepository(_Repository):
             )
             return dict(coverage), tuple(dict(row) for row in cursor.fetchall())
 
+    def read_behavior_split_coverage(
+        self,
+        tickers: Sequence[str],
+        context: DecisionWatermark,
+        *,
+        window_start,
+        window_end,
+        maximum_coverage_rows: int = 1000,
+        maximum_action_rows: int = 5000,
+    ) -> tuple[tuple[dict[str, Any], ...], dict[UUID, tuple[dict[str, Any], ...]]]:
+        normalized = tuple(dict.fromkeys(ticker.strip().upper() for ticker in tickers))
+        if not normalized or len(normalized) > 100 or any(not ticker for ticker in normalized):
+            raise ValueError("behavior action read requires 1-100 distinct tickers")
+        if window_end < window_start:
+            raise ValueError("behavior action coverage window is invalid")
+        if not 1 <= maximum_coverage_rows <= 10000 or not 1 <= maximum_action_rows <= 50000:
+            raise ValueError("behavior action coverage bounds are invalid")
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '10s'")
+            cursor.execute(
+                """
+                SELECT * FROM equity_corporate_action_coverage
+                WHERE source = 'POLYGON_CORPORATE_ACTIONS_V1'
+                  AND action_type = 'SPLIT'
+                  AND ticker = ANY(%s::TEXT[])
+                  AND window_start <= %s
+                  AND window_end >= %s
+                  AND first_observed_at <= %s
+                  AND created_at <= %s
+                ORDER BY ticker, first_observed_at DESC, created_at DESC, coverage_id
+                LIMIT %s
+                """,
+                (
+                    list(normalized), window_end, window_start,
+                    context.observed_time, context.observed_time,
+                    maximum_coverage_rows + 1,
+                ),
+            )
+            coverage = tuple(dict(row) for row in cursor.fetchall())
+            if len(coverage) > maximum_coverage_rows:
+                raise ValueError("behavior split coverage row bound exceeded")
+            actions_by_coverage = {UUID(str(row["coverage_id"])): [] for row in coverage}
+            if coverage:
+                cursor.execute(
+                    """
+                    SELECT member.coverage_id, action.*
+                    FROM equity_corporate_action_coverage_members AS member
+                    JOIN equity_corporate_actions AS action USING (corporate_action_id)
+                    WHERE member.coverage_id = ANY(%s::UUID[])
+                                            AND action.first_observed_at <= %s
+                                            AND action.created_at <= %s
+                                            AND (action.revised_observed_at IS NULL OR action.revised_observed_at <= %s)
+                                            AND COALESCE(action.replay_available_at, action.first_observed_at) <= %s
+                    ORDER BY member.coverage_id, action.effective_date,
+                             action.source_key, action.corporate_action_id
+                    LIMIT %s
+                    """,
+                    (
+                        [str(row["coverage_id"]) for row in coverage],
+                        context.observed_time, context.observed_time,
+                        context.observed_time, context.observed_time,
+                        maximum_action_rows + 1,
+                    ),
+                )
+                action_rows = tuple(dict(row) for row in cursor.fetchall())
+                if len(action_rows) > maximum_action_rows:
+                    raise ValueError("behavior split action row bound exceeded")
+                for action in action_rows:
+                    coverage_id = UUID(str(action.pop("coverage_id")))
+                    actions_by_coverage[coverage_id].append(action)
+        return coverage, {key: tuple(value) for key, value in actions_by_coverage.items()}
+
 
 class EquityBarRepository(_Repository):
     def persist(self, bars: Sequence[EquityBarRevision]) -> int:
@@ -767,6 +878,82 @@ class EquityBarRepository(_Repository):
         for row in rows:
             grouped[row["ticker"]].append(_bar_from_row(row))
         return {ticker: tuple(values) for ticker, values in grouped.items()}
+
+    def read_behavior_grouped_daily(
+        self,
+        tickers: Sequence[str],
+        context: DecisionWatermark,
+        *,
+        adjusted: bool,
+        limit_per_ticker: int = 273,
+    ) -> tuple[BehaviorGroupedDailyRead, ...]:
+        normalized = tuple(dict.fromkeys(ticker.strip().upper() for ticker in tickers))
+        if not normalized or len(normalized) > 100 or any(not ticker for ticker in normalized):
+            raise ValueError("adjusted behavior read requires 1-100 distinct tickers")
+        if not 1 <= limit_per_ticker <= 1024:
+            raise ValueError("adjusted behavior read limit must be in [1, 1024]")
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '10s'")
+            cursor.execute(
+                """
+                WITH visible AS (
+                    SELECT DISTINCT ON (ticker, bar_start) *
+                    FROM equity_bar_revisions
+                    WHERE ticker = ANY(%s::TEXT[])
+                      AND interval = '1d'
+                      AND session_scope = 'RTH'
+                      AND adjusted = %s
+                      AND is_final = TRUE
+                      AND availability_mode = 'HISTORICAL_RECONSTRUCTED'
+                      AND quality_codes @> ARRAY['GROUPED_DAILY_EXACT_TICKER_V2']::TEXT[]
+                      AND bar_end <= %s
+                      AND system_observed_at <= %s
+                      AND replay_available_at <= %s
+                      AND created_at <= %s
+                      AND (provider_published_at IS NULL OR provider_published_at <= %s)
+                    ORDER BY ticker, bar_start, replay_available_at DESC,
+                             system_observed_at DESC, created_at DESC, bar_revision_id
+                ), ranked AS (
+                    SELECT visible.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ticker ORDER BY bar_start DESC
+                           ) AS recency_rank
+                    FROM visible
+                )
+                SELECT * FROM ranked WHERE recency_rank <= %s
+                ORDER BY ticker, bar_start
+                """,
+                (
+                    list(normalized), adjusted, context.market_time,
+                    context.observed_time, context.observed_time,
+                    context.observed_time, context.observed_time,
+                    limit_per_ticker,
+                ),
+            )
+            rows = tuple(cursor.fetchall())
+        grouped = {ticker: [] for ticker in normalized}
+        for row in rows:
+            grouped[row["ticker"]].append(row)
+        return tuple(
+            BehaviorGroupedDailyRead(
+                ticker=ticker,
+                bars=tuple(_bar_from_row(row) for row in selected),
+                bar_created_ats=tuple(row["created_at"] for row in selected),
+            )
+            for ticker, selected in grouped.items() if selected
+        )
+
+    def read_behavior_adjusted_daily(
+        self,
+        tickers: Sequence[str],
+        context: DecisionWatermark,
+        *,
+        limit_per_ticker: int = 273,
+    ) -> tuple[BehaviorGroupedDailyRead, ...]:
+        return self.read_behavior_grouped_daily(
+            tickers, context, adjusted=True, limit_per_ticker=limit_per_ticker,
+        )
 
     def daily_session_bars(
         self,
@@ -1374,6 +1561,97 @@ class EquityEvidenceRepository(_Repository):
                 ),
             )
             return tuple(_evidence_from_row(row) for row in cursor.fetchall())
+    def read_behavior_feature_sources(
+        self,
+        tickers: Sequence[str],
+        context: DecisionWatermark,
+        *,
+        intervals: Sequence[str] = ("1d", "1h", "30m"),
+        maximum_source_bars: int = 1024,
+        source_bars_by_interval: Mapping[str, int] | None = None,
+    ) -> tuple[BehaviorFeatureSourceRead, ...]:
+        normalized_tickers = tuple(dict.fromkeys(ticker.strip().upper() for ticker in tickers))
+        normalized_intervals = tuple(dict.fromkeys(intervals))
+        if not normalized_tickers or len(normalized_tickers) > 100 or any(not ticker for ticker in normalized_tickers):
+            raise ValueError("behavior source read requires 1-100 distinct tickers")
+        if not normalized_intervals or not set(normalized_intervals) <= {"1d", "1h", "30m"}:
+            raise ValueError("behavior source read requires supported distinct intervals")
+        if not 1 <= maximum_source_bars <= 4096:
+            raise ValueError("maximum_source_bars must be in [1, 4096]")
+        limits = dict(source_bars_by_interval or {})
+        if set(limits) - set(normalized_intervals) or any(
+            type(value) is not int or not 1 <= value <= maximum_source_bars
+            for value in limits.values()
+        ):
+            raise ValueError("per-interval source bar limits are invalid")
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '10s'")
+            cursor.execute(
+                """
+                WITH ranked AS (
+                    SELECT evidence.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ticker, interval
+                               ORDER BY market_time DESC, observed_at DESC,
+                                        created_at DESC, evidence_id
+                           ) AS recency_rank
+                    FROM equity_evidence AS evidence
+                    WHERE ticker = ANY(%s::TEXT[])
+                      AND interval = ANY(%s::TEXT[])
+                      AND evidence_type = 'FEATURE_SNAPSHOT'
+                      AND source_name = 'EQUITY_FEATURES'
+                      AND market_time <= %s
+                      AND observed_at <= %s
+                      AND created_at <= %s
+                )
+                SELECT * FROM ranked WHERE recency_rank = 1
+                ORDER BY ticker, interval
+                """,
+                (
+                    list(normalized_tickers), list(normalized_intervals),
+                    context.market_time, context.observed_time, context.observed_time,
+                ),
+            )
+            evidence_rows = tuple(cursor.fetchall())
+            source_ids = []
+            for row in evidence_rows:
+                source_ids.extend(_behavior_source_revision_window(
+                    row, limits.get(row["interval"], maximum_source_bars),
+                ))
+            unique_source_ids = tuple(dict.fromkeys(source_ids))
+            bar_rows = ()
+            if unique_source_ids:
+                cursor.execute(
+                    """
+                    SELECT * FROM equity_bar_revisions
+                    WHERE bar_revision_id = ANY(%s::UUID[])
+                      AND system_observed_at <= %s
+                                            AND COALESCE(replay_available_at, system_observed_at) <= %s
+                      AND created_at <= %s
+                    ORDER BY bar_revision_id
+                    """,
+                    (
+                        list(unique_source_ids), context.observed_time,
+                        context.observed_time, context.observed_time,
+                    ),
+                )
+                bar_rows = tuple(cursor.fetchall())
+        bars_by_id = {row["bar_revision_id"]: row for row in bar_rows}
+        result = []
+        for row in evidence_rows:
+            revision_ids = _behavior_source_revision_window(
+                row, limits.get(row["interval"], maximum_source_bars),
+            )
+            selected = tuple(bars_by_id[revision_id] for revision_id in revision_ids if revision_id in bars_by_id)
+            result.append(BehaviorFeatureSourceRead(
+                evidence=_evidence_from_row(row), evidence_created_at=row["created_at"],
+                selected_revision_ids=revision_ids,
+                bars=tuple(_bar_from_row(bar) for bar in selected),
+                bar_created_ats=tuple(bar["created_at"] for bar in selected),
+                missing_revision_ids=tuple(revision_id for revision_id in revision_ids if revision_id not in bars_by_id),
+            ))
+        return tuple(result)
 
     def persist_context(
         self,
@@ -1420,6 +1698,193 @@ class EquityEvidenceRepository(_Repository):
                     ],
                 )
 
+    def persist_behavior(
+        self,
+        build_snapshot: Callable[[Mapping[UUID, datetime]], Any],
+        *,
+        derived_evidence: Sequence[EquityEvidence] = (),
+    ):
+        from .behavior import BEHAVIOR_SOURCE_EVIDENCE_CONTRACTS, StockBehaviorSnapshot
+
+        if not callable(build_snapshot):
+            raise TypeError("persist_behavior requires a snapshot factory")
+        derived_by_id = {row.evidence_id: row for row in derived_evidence}
+        if len(derived_by_id) != len(derived_evidence):
+            raise ValueError("derived behavior evidence IDs must be distinct")
+        if any(
+            (row.source_name, row.source_version, row.payload_schema_version)
+            not in BEHAVIOR_SOURCE_EVIDENCE_CONTRACTS
+            for row in derived_evidence
+        ):
+            raise ValueError("behavior sources require dedicated immutable evidence envelopes")
+        with self._cursor() as cursor:
+            cursor.execute("SET LOCAL lock_timeout = '2s'")
+            cursor.execute("SET LOCAL statement_timeout = '10s'")
+            cursor.execute(
+                "SELECT EXISTS(SELECT 1 FROM pg_attribute "
+                "WHERE attrelid = to_regclass('equity_context_snapshots') "
+                "AND attname = 'behavior_payload_text' AND NOT attisdropped) AS ready"
+            )
+            if not cursor.fetchone()["ready"]:
+                raise RuntimeError("stock behavior persistence requires migration 044")
+
+            if derived_evidence:
+                execute_values(
+                    cursor,
+                    """
+                    INSERT INTO equity_evidence (
+                        evidence_id, evidence_key, lifecycle_key, evidence_type,
+                        evidence_role, security_id, ticker, interval, direction,
+                        lifecycle_status, strength, market_time, observed_at, valid_until,
+                        source_name, source_version, payload_schema_version,
+                        analysis_run_id, latest_bar_revision_id, security_revision_id,
+                        fundamental_report_ids, source_revision_ids, quality_state,
+                        quality_codes, qualification_revision_id, payload, payload_sha256
+                    ) VALUES %s
+                    ON CONFLICT (evidence_key) DO NOTHING
+                    """,
+                    [_evidence_values(row) for row in derived_evidence],
+                )
+                cursor.execute(
+                    """
+                          SELECT evidence_id, evidence_key, lifecycle_key, evidence_type,
+                              evidence_role, security_id, ticker, interval, direction,
+                              lifecycle_status, strength, market_time, observed_at, valid_until,
+                              source_name, source_version, payload_schema_version,
+                              analysis_run_id, latest_bar_revision_id, security_revision_id,
+                              fundamental_report_ids, source_revision_ids, quality_state,
+                              quality_codes, qualification_revision_id, payload,
+                              payload_sha256, created_at
+                    FROM equity_evidence WHERE evidence_id = ANY(%s::UUID[])
+                    """,
+                    (list(derived_by_id),),
+                )
+                stored_derived = {row["evidence_id"]: row for row in cursor.fetchall()}
+                if set(stored_derived) != set(derived_by_id) or any(
+                    not _stored_evidence_matches(stored_derived[evidence_id], evidence)
+                    for evidence_id, evidence in derived_by_id.items()
+                ):
+                    raise ValueError("stored derived evidence differs from the requested contract")
+            else:
+                stored_derived = {}
+
+            snapshot = build_snapshot({
+                evidence_id: row["created_at"] for evidence_id, row in stored_derived.items()
+            })
+            if not isinstance(snapshot, StockBehaviorSnapshot):
+                raise TypeError("snapshot factory must return StockBehaviorSnapshot")
+            source_by_id = {}
+            for component in snapshot.components:
+                for source in component.sources:
+                    existing = source_by_id.setdefault(source.evidence_id, source)
+                    if existing != source:
+                        raise ValueError("one evidence ID cannot describe multiple source contracts")
+            if set(derived_by_id) != set(source_by_id):
+                raise ValueError("every behavior source requires a derived evidence envelope")
+            source_ids = tuple(sorted(source_by_id, key=str))
+            cursor.execute(
+                """
+                  SELECT evidence_id, evidence_key, lifecycle_key, evidence_type,
+                      evidence_role, security_id, ticker, interval, direction,
+                      lifecycle_status, strength, market_time, observed_at, valid_until,
+                      source_name, source_version, payload_schema_version,
+                      analysis_run_id, latest_bar_revision_id, security_revision_id,
+                      fundamental_report_ids, source_revision_ids, quality_state,
+                      quality_codes, qualification_revision_id, payload,
+                      payload_sha256, created_at
+                FROM equity_evidence WHERE evidence_id = ANY(%s::UUID[])
+                """,
+                (list(source_ids),),
+            )
+            source_rows = {row["evidence_id"]: row for row in cursor.fetchall()}
+            if set(source_rows) != set(source_ids):
+                raise ValueError("behavior source evidence is missing or conflicted")
+            for evidence_id, source in source_by_id.items():
+                row = source_rows[evidence_id]
+                if (
+                    row["security_id"] != source.security_id
+                    or row["interval"] != source.interval
+                    or row["market_time"] != source.market_time
+                    or row["observed_at"] != source.observed_at
+                    or row["valid_until"] != source.valid_until
+                    or row["payload_sha256"] != source.payload_sha256
+                    or row["created_at"] != source.recorded_at
+                    or row["created_at"] > source.received_at
+                    or (
+                        source.security_id == snapshot.security_id
+                        and (
+                            row["ticker"] != snapshot.ticker
+                            or row["security_revision_id"] != snapshot.security_revision_id
+                        )
+                    )
+                ):
+                    raise ValueError("stored evidence does not match the behavior source contract")
+
+            cursor.execute(
+                "SELECT behavior_payload_text FROM equity_context_snapshots "
+                "WHERE equity_context_snapshot_id = %s",
+                (snapshot.snapshot_id,),
+            )
+            existing_row = cursor.fetchone()
+            if existing_row is not None:
+                existing = StockBehaviorSnapshot.model_validate_json(existing_row["behavior_payload_text"])
+                if existing.identity_sha256 != snapshot.identity_sha256:
+                    raise ValueError("stored behavior identity conflicts with requested snapshot")
+                self._verify_behavior_links(cursor, snapshot.snapshot_id, source_ids)
+                return existing, False
+
+            cursor.execute(
+                """
+                INSERT INTO equity_context_snapshots (
+                    equity_context_snapshot_id, security_id, ticker, strategy_horizon,
+                    market_time, observed_at, valid_until, status, security_revision_id,
+                    risk_levels, conflict_state, stale_components, reason_codes, summary,
+                    context_policy_version, context_policy_sha256, context_kind,
+                    behavior_schema_version, behavior_definition_sha256,
+                    behavior_computed_at, behavior_payload_text, behavior_payload_sha256
+                ) VALUES (
+                    %s,%s,%s,%s,%s,%s,%s,'DEGRADED',%s,
+                    %s,%s,%s,%s,%s,%s,%s,'STOCK_BEHAVIOR',%s,%s,%s,%s,%s
+                ) ON CONFLICT DO NOTHING
+                RETURNING equity_context_snapshot_id
+                """,
+                (
+                    snapshot.snapshot_id, snapshot.security_id, snapshot.ticker,
+                    snapshot.profile, snapshot.market_time, snapshot.available_at,
+                    snapshot.valid_until, snapshot.security_revision_id,
+                    Json({}), Json({}), Json([]), [],
+                    Json({"identity_sha256": snapshot.identity_sha256}),
+                    snapshot.profile, snapshot.policy_sha256, snapshot.schema_version,
+                    snapshot.definition_sha256, snapshot.computed_at,
+                    snapshot.canonical_json(), snapshot.sha256,
+                ),
+            )
+            if cursor.fetchone() is None:
+                raise ValueError("behavior snapshot conflicts with an existing context identity")
+            execute_values(
+                cursor,
+                """
+                INSERT INTO equity_context_evidence (
+                    equity_context_snapshot_id, evidence_id, evidence_role, ordinal
+                ) VALUES %s
+                """,
+                [
+                    (snapshot.snapshot_id, evidence_id, source_rows[evidence_id]["evidence_role"], ordinal)
+                    for ordinal, evidence_id in enumerate(source_ids)
+                ],
+            )
+            return snapshot, True
+
+    @staticmethod
+    def _verify_behavior_links(cursor, snapshot_id: UUID, source_ids: Sequence[UUID]) -> None:
+        cursor.execute(
+            "SELECT evidence_id FROM equity_context_evidence "
+            "WHERE equity_context_snapshot_id = %s ORDER BY evidence_id",
+            (snapshot_id,),
+        )
+        if tuple(row["evidence_id"] for row in cursor.fetchall()) != tuple(source_ids):
+            raise ValueError("stored behavior evidence links are incomplete or conflicted")
+
     def get_context_as_of(
         self,
         ticker: str,
@@ -1429,11 +1894,13 @@ class EquityEvidenceRepository(_Repository):
         policy_sha256: str | None = None,
     ) -> EquityContextSnapshot | None:
         with self._cursor() as cursor:
+            predicate = legacy_context_predicate(cursor)
             cursor.execute(
-                """
-                SELECT *
+                f"""
+                SELECT {', '.join(LEGACY_CONTEXT_COLUMNS)}
                 FROM equity_context_snapshots
                 WHERE ticker = %s
+                  AND {predicate}
                   AND strategy_horizon = %s
                   AND market_time <= %s
                   AND observed_at <= %s
@@ -1450,6 +1917,68 @@ class EquityEvidenceRepository(_Repository):
             )
             row = cursor.fetchone()
         return _context_from_row(row) if row else None
+
+    def get_behavior_as_of(
+        self, security_id: UUID, context: DecisionWatermark, *, profile: str,
+        definition_sha256: str, policy_sha256: str,
+    ):
+        from .behavior import load_stock_behavior_snapshot, resolve_behavior_profile
+
+        if not isinstance(security_id, UUID):
+            raise ValueError("an exact supported security/profile/definition is required")
+        resolve_behavior_profile(profile, definition_sha256, policy_sha256)
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '5s'")
+            cursor.execute("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('equity_context_snapshots') AND attname = 'behavior_payload_text' AND NOT attisdropped) AS ready")
+            if not cursor.fetchone()["ready"]:
+                return None
+            cursor.execute(
+                """
+                SELECT equity_context_snapshot_id, security_id, ticker, security_revision_id,
+                                             strategy_horizon, context_policy_sha256, market_time, observed_at, valid_until, created_at,
+                                             behavior_schema_version, behavior_definition_sha256, behavior_computed_at,
+                                             behavior_payload_text, behavior_payload_sha256
+                FROM equity_context_snapshots
+                WHERE context_kind = 'STOCK_BEHAVIOR' AND security_id = %s
+                                    AND strategy_horizon = %s AND behavior_definition_sha256 = %s AND context_policy_sha256 = %s
+                  AND behavior_schema_version = 'stock_behavior_v1'
+                                    AND market_time <= %s AND observed_at <= %s AND created_at <= %s
+                                    AND valid_until > %s
+                                    AND behavior_payload_text::jsonb->>'availability_mode' = 'PROSPECTIVE_RECEIPT'
+                                ORDER BY market_time DESC, observed_at DESC, created_at DESC, equity_context_snapshot_id
+                LIMIT 1
+                """,
+                (security_id, profile, definition_sha256, policy_sha256, context.market_time,
+                 context.observed_time, context.observed_time, context.observed_time),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        if len(row["behavior_payload_text"].encode("utf-8")) > 262144:
+            raise ValueError("behavior payload exceeds contract size")
+        snapshot = load_stock_behavior_snapshot(row["behavior_payload_text"])
+        from .behavior_sources import snapshot_uses_current_source_policies
+
+        if not snapshot_uses_current_source_policies(snapshot):
+            return None
+        expected = {
+            "equity_context_snapshot_id": snapshot.snapshot_id, "security_id": snapshot.security_id,
+            "ticker": snapshot.ticker, "security_revision_id": snapshot.security_revision_id,
+            "strategy_horizon": snapshot.profile, "context_policy_sha256": snapshot.policy_sha256,
+            "market_time": snapshot.market_time, "behavior_schema_version": snapshot.schema_version,
+            "behavior_definition_sha256": snapshot.definition_sha256,
+            "behavior_computed_at": snapshot.computed_at, "observed_at": snapshot.available_at,
+            "valid_until": snapshot.valid_until, "behavior_payload_sha256": snapshot.sha256,
+        }
+        if any(row[key] != value for key, value in expected.items()) or row["behavior_payload_text"] != snapshot.canonical_json():
+            raise ValueError("stored behavior columns/hash disagree with validated payload")
+        if (snapshot.security_id != security_id or snapshot.profile != profile or snapshot.policy_sha256 != policy_sha256
+                or snapshot.definition_sha256 != definition_sha256 or snapshot.market_time > context.market_time
+                or max(snapshot.available_at, row["created_at"]) > context.observed_time
+                or snapshot.valid_until <= context.observed_time or snapshot.availability_mode != "PROSPECTIVE_RECEIPT"):
+            raise ValueError("behavior context does not satisfy the exact as-of request")
+        return snapshot
 
     def robust_qualification_ids_as_of(
         self,
@@ -2592,6 +3121,63 @@ def _evidence_from_row(row: dict[str, Any]) -> EquityEvidence:
         payload_json=json.dumps(row.get("payload") or {}, sort_keys=True),
         payload_sha256=row["payload_sha256"],
     )
+
+
+def _evidence_values(row: EquityEvidence) -> tuple[Any, ...]:
+    import json
+
+    return (
+        row.evidence_id, row.evidence_key, row.lifecycle_key,
+        row.evidence_type.value, row.evidence_role.value,
+        row.security_id, row.ticker, row.interval, row.direction,
+        row.lifecycle_status.value, row.strength, row.market_time,
+        row.observed_at, row.valid_until, row.source_name,
+        row.source_version, row.payload_schema_version,
+        row.analysis_run_id, row.latest_bar_revision_id,
+        row.security_revision_id, list(row.fundamental_report_ids),
+        list(row.source_revision_ids), row.quality_state.value,
+        list(row.quality_codes), row.qualification_revision_id,
+        Json(json.loads(row.payload_json)), row.payload_sha256,
+    )
+
+
+def _stored_evidence_matches(row: Mapping[str, Any], evidence: EquityEvidence) -> bool:
+    import json
+
+    return (
+        row["evidence_id"] == evidence.evidence_id
+        and row["evidence_key"] == evidence.evidence_key
+        and row["lifecycle_key"] == evidence.lifecycle_key
+        and row["evidence_type"] == evidence.evidence_type.value
+        and row["evidence_role"] == evidence.evidence_role.value
+        and row["security_id"] == evidence.security_id
+        and row["ticker"] == evidence.ticker
+        and row["interval"] == evidence.interval
+        and row["direction"] == (evidence.direction.value if evidence.direction else None)
+        and row["lifecycle_status"] == evidence.lifecycle_status.value
+        and row["strength"] == evidence.strength
+        and row["market_time"] == evidence.market_time
+        and row["observed_at"] == evidence.observed_at
+        and row["valid_until"] == evidence.valid_until
+        and row["source_name"] == evidence.source_name
+        and row["source_version"] == evidence.source_version
+        and row["payload_schema_version"] == evidence.payload_schema_version
+        and row["analysis_run_id"] == evidence.analysis_run_id
+        and row["latest_bar_revision_id"] == evidence.latest_bar_revision_id
+        and row["security_revision_id"] == evidence.security_revision_id
+        and tuple(row["fundamental_report_ids"] or ()) == evidence.fundamental_report_ids
+        and tuple(row["source_revision_ids"] or ()) == evidence.source_revision_ids
+        and row["quality_state"] == evidence.quality_state.value
+        and tuple(row["quality_codes"] or ()) == evidence.quality_codes
+        and row["qualification_revision_id"] == evidence.qualification_revision_id
+        and row["payload"] == json.loads(evidence.payload_json)
+        and row["payload_sha256"] == evidence.payload_sha256
+    )
+
+
+def _behavior_source_revision_window(row: Mapping[str, Any], maximum_source_bars: int) -> tuple[UUID, ...]:
+    revisions = tuple(row.get("source_revision_ids") or ())
+    return revisions[-maximum_source_bars:]
 
 
 def _context_values(row: EquityContextSnapshot) -> tuple[Any, ...]:

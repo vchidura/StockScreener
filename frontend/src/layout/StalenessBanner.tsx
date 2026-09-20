@@ -53,6 +53,9 @@ export function StalenessBanner() {
 
   if (!status || status.status === 'READY') return null
 
+  const updating = status.status === 'EXPIRED' && status.pipeline_active
+  const active = status.active_intervals?.join(', ') || 'equity'
+  const stale = status.stale_intervals.join(', ')
   const severe = status.status === 'EXPIRED' || status.staleness_sessions >= 1
   return (
     <div
@@ -61,15 +64,19 @@ export function StalenessBanner() {
       aria-live="polite"
     >
       <span className="tm-staleness__badge">
-        {status.status === 'EXPIRED' ? 'Data unavailable' : 'Stale data'}
+        {updating ? 'Updating data' : status.status === 'EXPIRED' ? 'Data unavailable' : 'Stale data'}
       </span>
       <span className="tm-staleness__text">
-        {status.status === 'EXPIRED'
+        {updating
+          ? `Equity ${active} analysis is processing. Unavailable ${stale || 'older'} projections will remain blocked until the close pipeline catches up.`
+          : status.status === 'EXPIRED'
           ? `Published analysis is more than ${status.max_serveable_stale_sessions} trading sessions old and is no longer served. Start the equity worker to resume updates.`
           : describe(status)}
       </span>
       <span className="tm-staleness__hint">
-        {status.status === 'EXPIRED'
+        {updating
+          ? 'The equity worker is active; no restart is needed.'
+          : status.status === 'EXPIRED'
           ? 'Expired setup timeframes are unavailable.'
           : `Retained setups: up to ${status.max_serveable_stale_sessions} sessions old.`}
       </span>

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -20,6 +21,10 @@ from options.domain import (
     VarianceEstimator,
     VarianceSource,
     VolatilityAssumption,
+)
+from options.stock_behavior_shadow_launch import (
+    OptionStockBehaviorShadowLaunch,
+    load_option_stock_behavior_shadow_launch,
 )
 
 
@@ -51,6 +56,12 @@ class OptionSettings(_FrozenModel):
     event_calendar_provider: str | None = None
     event_calendar_max_age_seconds: int = Field(default=43200, ge=3600)
     equity_context_enabled: bool = False
+    stock_behavior_shadow_enabled: bool = False
+    stock_behavior_shadow_launch_file: Path | None = None
+    package_assessments_enabled: bool = False
+    baseline_alerts_enabled: bool = False
+    baseline_alerts_effective_from: datetime | None = None
+    outcome_unavailable_evidence_enabled: bool = False
     execution_engine: ExecutionEngine = ExecutionEngine.PAPER_PROXY
     universe_mode: UniverseMode = UniverseMode.FIXED
     fixed_stock_underlyers: tuple[str, ...] = (
@@ -133,6 +144,10 @@ class OptionSettings(_FrozenModel):
 
     @model_validator(mode="after")
     def _validate_universe(self) -> "OptionSettings":
+        if self.baseline_alerts_enabled and self.baseline_alerts_effective_from is None:
+            raise ValueError("OPTION_BASELINE_ALERTS_ENABLED requires OPTION_BASELINE_ALERTS_EFFECTIVE_FROM")
+        if self.baseline_alerts_effective_from is not None and self.baseline_alerts_effective_from.utcoffset() is None:
+            raise ValueError("OPTION_BASELINE_ALERTS_EFFECTIVE_FROM must be timezone-aware")
         overlap = set(self.fixed_stock_underlyers) & set(self.fixed_etf_underlyers)
         if overlap:
             raise ValueError(f"stock and ETF universes overlap: {sorted(overlap)}")
@@ -221,9 +236,17 @@ class ValuationPolicy(_FrozenModel):
     display_only_mark_sources: tuple[MarkSource, ...]
     commission_per_contract_per_side: Decimal = Field(ge=0)
     slippage_model: str = Field(min_length=1)
+    underlying_price_basis: str | None = None
 
     @model_validator(mode="after")
     def _validate_sources(self) -> "ValuationPolicy":
+        if self.underlying_price_basis is not None and (
+            self.underlying_price_basis != "RAW_FINALIZED_MINUTE_CLOSE_V1"
+            or self.policy_version != "option_valuation_raw_spot_v2"
+        ):
+            raise ValueError("raw spot basis requires its distinct valuation version")
+        if self.policy_version == "option_valuation_raw_spot_v2" and self.underlying_price_basis is None:
+            raise ValueError("raw valuation requires an explicit underlying price basis")
         entry_sources = set(self.allowed_entry_mark_sources)
         exit_sources = set(self.allowed_exit_mark_sources)
         display_sources = set(self.display_only_mark_sources)
@@ -237,7 +260,10 @@ class ValuationPolicy(_FrozenModel):
 
     @property
     def policy_sha256(self) -> str:
-        return _sha256(self.model_dump(mode="json"))
+        payload = self.model_dump(mode="json")
+        if self.underlying_price_basis is None:
+            payload.pop("underlying_price_basis", None)
+        return _sha256(payload)
 
 
 class SettlementValuationPolicy(_FrozenModel):
@@ -444,6 +470,13 @@ class ScenarioPolicy(_FrozenModel):
         return self
 
 
+class ForwardAdmissionPolicy(_FrozenModel):
+    version: str = Field(default="forward_original_mark_admission_v1", pattern="^forward_original_mark_admission_v1$")
+    maximum_source_age_seconds: int = Field(default=1800, ge=1800, le=1800)
+    session_cap: str = Field(default="SOURCE_SESSION_CLOSE", pattern="^SOURCE_SESSION_CLOSE$")
+    scope: str = Field(default="DIRECTIONAL_DEBIT_PACKAGES", pattern="^DIRECTIONAL_DEBIT_PACKAGES$")
+
+
 class StrategyPolicy(_FrozenModel):
     strategy_version: str = Field(min_length=1)
     gamma_squeeze: GammaSqueezePolicy
@@ -454,6 +487,13 @@ class StrategyPolicy(_FrozenModel):
     flow: FlowStrategyPolicy
     smile: SmileStrategyPolicy
     scenarios: ScenarioPolicy
+    forward_admission: ForwardAdmissionPolicy | None = None
+
+    @model_validator(mode="after")
+    def validate_forward_admission(self):
+        if (self.forward_admission is not None) != (self.strategy_version == "phase2_v5_technical_forward"):
+            raise ValueError("forward admission requires its distinct strategy version")
+        return self
 
 
 class GammaExposurePolicy(_FrozenModel):
@@ -612,6 +652,8 @@ class OptionRuntimeConfiguration:
     gamma_policy: GammaExposurePolicy
     gamma_policy_sha256: str
     configuration_sha256: str
+    stock_behavior_shadow_launch: OptionStockBehaviorShadowLaunch | None = None
+    stock_behavior_shadow_launch_sha256: str | None = None
 
     def metadata(self) -> dict[str, object]:
         return {
@@ -681,6 +723,8 @@ def load_strategy_policy(path: Path) -> StrategyPolicyArtifact:
         raise ValueError(f"unable to load option strategy policy from {path}") from exc
     policy = StrategyPolicy.model_validate(payload)
     canonical_payload = policy.model_dump(mode="json")
+    if policy.forward_admission is None:
+        canonical_payload.pop("forward_admission", None)
     return StrategyPolicyArtifact(policy=policy, sha256=_sha256(canonical_payload), path=path)
 
 
@@ -726,6 +770,20 @@ def load_option_runtime_configuration(
             "OPTION_EVENT_CALENDAR_MAX_AGE_SECONDS", "43200"
         ),
         "equity_context_enabled": environ.get("OPTION_EQUITY_CONTEXT_ENABLED", "false"),
+        "stock_behavior_shadow_enabled": environ.get(
+            "OPTION_STOCK_BEHAVIOR_SHADOW_ENABLED", "false"
+        ),
+        "stock_behavior_shadow_launch_file": environ.get(
+            "OPTION_STOCK_BEHAVIOR_SHADOW_LAUNCH_FILE"
+        ),
+        "package_assessments_enabled": environ.get(
+            "OPTION_PACKAGE_ASSESSMENTS_ENABLED", "false"
+        ),
+        "baseline_alerts_enabled": environ.get("OPTION_BASELINE_ALERTS_ENABLED", "false"),
+        "baseline_alerts_effective_from": environ.get("OPTION_BASELINE_ALERTS_EFFECTIVE_FROM") or None,
+        "outcome_unavailable_evidence_enabled": environ.get(
+            "OPTION_OUTCOME_UNAVAILABLE_EVIDENCE_ENABLED", "false"
+        ),
         "execution_engine": environ.get(
             "OPTION_EXECUTION_ENGINE", ExecutionEngine.PAPER_PROXY.value
         ),
@@ -804,6 +862,9 @@ def load_option_runtime_configuration(
     archive_root = settings.raw_archive_root
     if not archive_root.is_absolute():
         archive_root = (backend_dir / archive_root).resolve()
+    launch_path = settings.stock_behavior_shadow_launch_file
+    if launch_path is not None and not launch_path.is_absolute():
+        launch_path = (backend_dir / launch_path).resolve()
     settings = settings.model_copy(
         update={
             "policy_file": policy_path,
@@ -812,8 +873,23 @@ def load_option_runtime_configuration(
             "strategy_policy_file": strategy_policy_path,
             "gamma_policy_file": gamma_policy_path,
             "raw_archive_root": archive_root,
+            "stock_behavior_shadow_launch_file": launch_path,
         }
     )
+
+    launch = (
+        load_option_stock_behavior_shadow_launch(launch_path)
+        if launch_path is not None else None
+    )
+    if settings.stock_behavior_shadow_enabled and launch is None:
+        raise ValueError(
+            "OPTION_STOCK_BEHAVIOR_SHADOW_ENABLED requires "
+            "OPTION_STOCK_BEHAVIOR_SHADOW_LAUNCH_FILE"
+        )
+    if launch is not None and launch.underlyers != settings.underlyers:
+        raise ValueError(
+            "stock behavior shadow launch underlyers must match the configured universe"
+        )
 
     artifact = load_developer_policy(policy_path)
     valuation_policy = load_valuation_policy(valuation_policy_path)
@@ -822,6 +898,8 @@ def load_option_runtime_configuration(
     )
     strategy_artifact = load_strategy_policy(strategy_policy_path)
     gamma_artifact = load_gamma_policy(gamma_policy_path)
+    if strategy_artifact.policy.forward_admission is not None and valuation_policy.underlying_price_basis != "RAW_FINALIZED_MINUTE_CLOSE_V1":
+        raise ValueError("forward technical admission requires the raw finalized spot valuation policy")
     configuration_payload = {
         **settings.fingerprint_payload(),
         "policy_version": artifact.policy.policy_version,
@@ -851,4 +929,6 @@ def load_option_runtime_configuration(
         gamma_policy=gamma_artifact.policy,
         gamma_policy_sha256=gamma_artifact.sha256,
         configuration_sha256=_sha256(configuration_payload),
+        stock_behavior_shadow_launch=launch,
+        stock_behavior_shadow_launch_sha256=launch.sha256 if launch else None,
     )

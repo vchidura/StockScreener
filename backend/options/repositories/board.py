@@ -5,13 +5,17 @@ import json
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from psycopg2.extras import Json, execute_values
 
 from options.strategies.gates import GATE_LEDGER_VERSION
+from options.analytics.alert_selection import (
+    BASELINE_SELECTOR_POLICY, BASELINE_SELECTOR_SHA256, BASELINE_SELECTOR_VERSION,
+    select_baseline_alerts,
+)
 from .base import ConnectionFactory, PostgresRepository
 
 
@@ -80,6 +84,150 @@ def rank_board_members(
 class OptionBoardPublicationRepository(PostgresRepository):
     def __init__(self, connection_factory: ConnectionFactory | None = None) -> None:
         super().__init__(connection_factory)
+
+    def publish_baseline_cycle(self, *, configuration, scheduled_cycle, published_at, effective_from, calendar):
+        scheduled_cycle = _utc(scheduled_cycle, "scheduled_cycle")
+        published_at = _utc(published_at, "published_at")
+        effective_from = _utc(effective_from, "effective_from")
+        if not effective_from <= scheduled_cycle <= published_at:
+            raise ValueError("baseline selection requires a prospective nonfuture cycle")
+        expected = configuration.settings.underlyers
+        policy = configuration.strategy_policy_sha256
+        config = configuration.configuration_sha256
+        publication_id = uuid5(NAMESPACE_URL,
+            f"option-board:{scheduled_cycle.isoformat()}:{policy}:{config}:{BASELINE_SELECTOR_SHA256}")
+        with self._cursor() as cursor:
+            cursor.execute("SET LOCAL statement_timeout = '5s'")
+            cursor.execute("SET LOCAL lock_timeout = '2s'")
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"option-alert-baseline:{policy}:{BASELINE_SELECTOR_SHA256}",))
+            cursor.execute("""SELECT publication_id, covered_underlying_count, selection_evidence
+                FROM option_board_publications WHERE publication_id=%s""", (publication_id,))
+            existing = cursor.fetchone()
+            if existing:
+                evidence = dict(existing["selection_evidence"])
+                return BoardPublicationResult("ALREADY_PUBLISHED", publication_id, len(expected),
+                    existing["covered_underlying_count"], evidence["new_alerts"], evidence)
+            cursor.execute("""SELECT MAX(scheduled_cycle) AS latest_cycle FROM option_board_publications
+                WHERE selector_sha256=%s AND strategy_policy_sha256=%s""",
+                (BASELINE_SELECTOR_SHA256, policy))
+            latest = cursor.fetchone()["latest_cycle"]
+            if latest is not None and latest >= scheduled_cycle:
+                return BoardPublicationResult("OUT_OF_ORDER", None, len(expected), 0, 0, {})
+            cursor.execute("""
+                SELECT DISTINCT ON (analysis.underlying) analysis.matrix_id, analysis.underlying,
+                       analysis.market_time, analysis.observed_time
+                FROM option_ingestion_runs AS ingestion
+                JOIN option_analysis_runs AS analysis USING(batch_id)
+                JOIN option_work_items AS work
+                  ON work.subject_id=analysis.matrix_id::text AND work.stage='STRATEGY'
+                 AND work.business_key='strategy:' || analysis.matrix_id::text || ':' || %s
+                WHERE ingestion.scheduled_cycle=%s AND ingestion.configuration_sha256=%s
+                  AND ingestion.policy_sha256=%s AND analysis.policy_sha256=%s
+                  AND analysis.underlying=ANY(%s)
+                  AND ingestion.status='COMPLETE' AND analysis.status='COMPLETE' AND work.status='COMPLETED'
+                  AND ingestion.completed_at<=%s AND analysis.completed_at<=%s AND work.completed_at<=%s
+                  AND analysis.observed_time<=%s AND analysis.created_at<=%s AND analysis.market_time<=%s
+                ORDER BY analysis.underlying, analysis.completed_at DESC, analysis.matrix_id
+            """, (configuration.strategy_policy.strategy_version, scheduled_cycle, config,
+                configuration.policy_sha256, configuration.policy_sha256, list(expected),
+                published_at, published_at, published_at, published_at, published_at, published_at))
+            matrices = [dict(row) for row in cursor.fetchall()]
+            covered = {row["underlying"] for row in matrices}
+            if covered != set(expected):
+                return BoardPublicationResult("INCOMPLETE_UNIVERSE", None, len(expected), len(covered), 0,
+                    {"missing_underlyers": sorted(set(expected) - covered)})
+            matrix_ids = [row["matrix_id"] for row in matrices]
+            cursor.execute("""
+                SELECT candidate.candidate_id, candidate.matrix_id, candidate.underlying,
+                       candidate.strategy_name, candidate.strategy_version, candidate.policy_sha256,
+                       candidate.structure_type, candidate.candidate_kind, candidate.candidate_rank,
+                       candidate.status, candidate.market_data_time, candidate.observed_time,
+                       candidate.valid_until, candidate.net_premium,
+                       (SELECT COUNT(*)=6 FROM option_candidate_execution_gates AS gate
+                                                WHERE gate.candidate_id=candidate.candidate_id AND gate.ledger_version=%s
+                                                    AND gate.evaluated_at<=%s) AS gate_ledger_complete,
+                                             (SELECT COUNT(*)=3 AND bool_and(gate.verdict='PASS')
+                                                FROM option_candidate_execution_gates AS gate
+                                                WHERE gate.candidate_id=candidate.candidate_id AND gate.ledger_version=%s
+                                                    AND gate.gate_name IN ('CANDIDATE_KIND','STRATEGY_CONTEXT','EQUITY_DIRECTION')
+                                                    AND gate.evaluated_at<=%s) AS baseline_gates_pass,
+                       COALESCE(legs.payload, '[]'::jsonb) AS legs, legs.first_expiration
+                FROM option_strategy_candidates AS candidate
+                LEFT JOIN LATERAL (
+                    SELECT MIN(leg.expiration_date) AS first_expiration,
+                           jsonb_agg(jsonb_build_object('contract_id',leg.contract_id,'side',leg.side,
+                               'ratio',leg.ratio,'multiplier',leg.multiplier,'model_mark',leg.model_mark,
+                               'source_market_time',leg.source_market_time) ORDER BY leg.leg_index) AS payload
+                    FROM option_candidate_legs AS leg WHERE leg.candidate_id=candidate.candidate_id
+                ) AS legs ON TRUE
+                WHERE candidate.matrix_id=ANY(%s::uuid[]) AND candidate.policy_sha256=%s
+                  AND candidate.strategy_version=%s AND candidate.status='SELECTED'
+                  AND candidate.created_at<=%s AND candidate.observed_time<=%s
+                ORDER BY candidate.candidate_id LIMIT 5001
+            """, (GATE_LEDGER_VERSION, published_at, GATE_LEDGER_VERSION, published_at,
+                matrix_ids, policy, configuration.strategy_policy.strategy_version,
+                published_at, published_at))
+            rows = [dict(row) for row in cursor.fetchall()]
+            if len(rows) > 5000:
+                raise ValueError("baseline candidate bound exceeded")
+            cutoffs = {expiration: calendar.expiration_cutoff(expiration)
+                for expiration in {row["first_expiration"] for row in rows if row["first_expiration"] is not None}}
+            for row in rows:
+                row["expires_at"] = cutoffs.get(row["first_expiration"])
+            cursor.execute("""
+                SELECT DISTINCT ON (member.selection_evidence->>'alert_identity')
+                       member.candidate_id, member.selection_evidence->>'alert_identity' AS alert_identity,
+                       member.selection_evidence->>'expires_at' AS expires_at
+                FROM option_board_publications AS publication
+                JOIN option_board_members AS member USING(publication_id)
+                WHERE publication.selector_sha256=%s AND publication.strategy_policy_sha256=%s
+                  AND publication.scheduled_cycle>=%s
+                  AND publication.scheduled_cycle<%s AND publication.published_at<=%s
+                ORDER BY member.selection_evidence->>'alert_identity', publication.scheduled_cycle
+                LIMIT 100001
+            """, (BASELINE_SELECTOR_SHA256, policy, published_at - timedelta(days=61),
+                scheduled_cycle, published_at))
+            prior = [dict(row) for row in cursor.fetchall()]
+            if len(prior) > 100000:
+                raise ValueError("baseline prior-alert bound exceeded")
+            input_cutoff = published_at
+            cursor.execute("SELECT clock_timestamp() AS decision_at")
+            published_at = _utc(cursor.fetchone()["decision_at"], "decision_at")
+            if published_at < input_cutoff:
+                raise ValueError("baseline database clock precedes input cutoff")
+            selection = select_baseline_alerts(rows, {row["alert_identity"]: row for row in prior}, decision_at=published_at)
+            evidence = {**selection["evidence"], "selector_policy": BASELINE_SELECTOR_POLICY,
+                "effective_from": effective_from.isoformat(), "input_cutoff": input_cutoff.isoformat(),
+                "observations": selection["observations"]}
+            cursor.execute("""
+                INSERT INTO option_board_publications (publication_id, scheduled_cycle, as_of_session, status,
+                    selector_version, selector_sha256, strategy_policy_sha256, configuration_sha256,
+                    expected_underlying_count, covered_underlying_count, source_matrix_ids,
+                    market_data_time, observed_time, selection_evidence, published_at)
+                VALUES (%s,%s,%s,'COMPLETE',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (publication_id, scheduled_cycle, calendar.session_for_slot(scheduled_cycle),
+                BASELINE_SELECTOR_VERSION, BASELINE_SELECTOR_SHA256, policy, config, len(expected), len(matrices),
+                matrix_ids, max(row["market_time"] for row in matrices), max(row["observed_time"] for row in matrices),
+                Json(evidence), published_at))
+            if selection["members"]:
+                execute_values(cursor, """INSERT INTO option_board_members (publication_id, candidate_id,
+                    underlying, strategy_name, candidate_kind, board_position, raw_candidate_rank,
+                    source_matrix_id, selection_evidence) VALUES %s""", [
+                    (publication_id, row["candidate_id"], row["underlying"], row["strategy_name"],
+                     row["candidate_kind"], row["board_position"], row["candidate_rank"], row["matrix_id"],
+                     Json({"alert_identity": row["alert_identity"], "direction": row["direction"],
+                           "expires_at": row["expires_at"].isoformat(), "selector_sha256": BASELINE_SELECTOR_SHA256}))
+                    for row in selection["members"]])
+            accepted_ids = {str(row["candidate_id"]) for row in selection["members"]} | {
+                row["candidate_id"] for row in selection["observations"]}
+            if accepted_ids:
+                deadline = min(row["valid_until"] for row in rows if str(row["candidate_id"]) in accepted_ids)
+                cursor.execute("SELECT clock_timestamp() < %s AS timely", (deadline,))
+                if not cursor.fetchone()["timely"]:
+                    raise ValueError("baseline entry deadline elapsed during persistence")
+            return BoardPublicationResult("PUBLISHED", publication_id, len(expected), len(matrices),
+                len(selection["members"]), evidence)
 
     def publish_complete_cycle(
         self,
@@ -435,6 +583,75 @@ class OptionBoardPublicationRepository(PostgresRepository):
                 len(members),
                 selection_evidence,
             )
+
+    def baseline_runs(self, *, configuration, as_of):
+        as_of = _utc(as_of, "as_of")
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '5s'")
+            cursor.execute("""SELECT publication_id, scheduled_cycle, as_of_session, published_at,
+                    expected_underlying_count, covered_underlying_count, source_matrix_ids,
+                    selection_evidence->'new_alerts' AS new_alerts,
+                    selection_evidence->'repeat_hits' AS repeat_hits,
+                    selection_evidence->'rejections' AS rejections,
+                    selection_evidence->'by_model' AS by_model
+                FROM option_board_publications
+                WHERE status='COMPLETE' AND selector_sha256=%s AND strategy_policy_sha256=%s
+                  AND configuration_sha256=%s AND scheduled_cycle>=%s AND scheduled_cycle<=%s
+                  AND published_at<=%s AND created_at<=%s
+                ORDER BY scheduled_cycle LIMIT 5001""",
+                (BASELINE_SELECTOR_SHA256, configuration.strategy_policy_sha256,
+                 configuration.configuration_sha256, as_of - timedelta(days=60), as_of, as_of, as_of))
+            rows = [dict(row) for row in cursor.fetchall()]
+            if len(rows) > 5000:
+                raise ValueError("baseline run read bound exceeded")
+            return rows
+
+    def baseline_members(self, publication_ids, *, configuration, as_of):
+        as_of = _utc(as_of, "as_of")
+        if len(publication_ids) > 200:
+            raise ValueError("baseline membership is bounded to 200 runs")
+        if not publication_ids:
+            return {}
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '5s'")
+            cursor.execute("""
+                WITH selected AS MATERIALIZED (
+                    SELECT member.candidate_id, member.selection_evidence,
+                           publication.publication_id, publication.scheduled_cycle, publication.published_at
+                    FROM option_board_publications AS publication
+                    JOIN option_board_members AS member USING(publication_id)
+                    WHERE publication.publication_id=ANY(%s::uuid[]) AND publication.selector_sha256=%s
+                      AND publication.strategy_policy_sha256=%s AND publication.configuration_sha256=%s
+                      AND publication.published_at<=%s AND publication.created_at<=%s AND member.created_at<=%s
+                ), repeats AS (
+                    SELECT observation->>'first_candidate_id' AS first_candidate_id,
+                           COUNT(DISTINCT publication.publication_id) AS hits,
+                           MAX(publication.published_at) AS last_seen
+                    FROM option_board_publications AS publication
+                    CROSS JOIN LATERAL jsonb_array_elements(
+                        COALESCE(publication.selection_evidence->'observations','[]'::jsonb)) AS observation
+                    JOIN selected ON selected.candidate_id::text=observation->>'first_candidate_id'
+                      AND selected.selection_evidence->>'alert_identity'=observation->>'alert_identity'
+                    WHERE publication.selector_sha256=%s AND publication.strategy_policy_sha256=%s
+                                            AND publication.published_at<=%s
+                      AND publication.created_at<=%s AND publication.scheduled_cycle>selected.scheduled_cycle
+                      AND publication.published_at<(selected.selection_evidence->>'expires_at')::timestamptz
+                      AND publication.scheduled_cycle>=(SELECT MIN(scheduled_cycle) FROM selected)
+                    GROUP BY observation->>'first_candidate_id'
+                )
+                SELECT selected.*, 1+COALESCE(repeats.hits,0) AS hit_count,
+                       COALESCE(repeats.last_seen,selected.published_at) AS last_seen
+                FROM selected LEFT JOIN repeats ON repeats.first_candidate_id=selected.candidate_id::text
+                ORDER BY selected.candidate_id LIMIT 10001
+            """, (list(publication_ids), BASELINE_SELECTOR_SHA256, configuration.strategy_policy_sha256,
+                configuration.configuration_sha256, as_of, as_of, as_of, BASELINE_SELECTOR_SHA256,
+                configuration.strategy_policy_sha256, as_of, as_of))
+            rows = [dict(row) for row in cursor.fetchall()]
+            if len(rows) > 10000:
+                raise ValueError("baseline member read bound exceeded")
+            return {str(row["candidate_id"]): row for row in rows}
 
     def latest_complete(
         self,

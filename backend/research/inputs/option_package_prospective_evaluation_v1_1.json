@@ -1,0 +1,63 @@
+{
+  "artifact_destination": "backups/options-package-evaluation/option-package-prospective-v1.json",
+  "calibration_enabled": false,
+  "detector_policy_sha256": "f3fddf6aadb5dc9688fbf3dcf4250113a64fb48b0a3b2d35b55400232fe7a8dd",
+  "directional_strategies": [
+    "DIRECTIONAL_LONG_PREMIUM",
+    "DIRECTIONAL_DEBIT_SPREAD"
+  ],
+  "embargo_sessions": 1,
+  "execution_permission": false,
+  "frozen_at": "2026-09-18T20:04:27.969107Z",
+  "implementation_sha256": "66516207373d7fff64d1e7e6764f939d48fa4e6a174ecb54c1a2d2e3825f0ca8",
+  "maximum_package_rows": 50000,
+  "minimum_independent_clusters": 20,
+  "minimum_outcome_coverage": 0.8,
+  "outcome_availability_policy_sha256": "e4b67daf5e1ee55e39b053b620a9f8b976356727899d4ee6e5954708e0603a13",
+  "outcome_basis": "INDICATIVE_OPTION_MARKS_NET_COMMISSION",
+  "package_assessment_policy_sha256": "c405b8488fe96b49d40689c799139bf5a9037d194740df26afe6248576eb740d",
+  "primary_measurement": "NEXT_OPEN",
+  "probability_status": "UNAVAILABLE",
+  "research_only": true,
+  "schema_version": "option_package_evaluation_manifest_v1",
+  "sensitivity_measurements": [
+    "60MIN",
+    "CLOSE"
+  ],
+  "stock_behavior_launch_sha256": "99c10a4fc93a94c630fdead85f7e52cf10cbe9f5047636097da6d230c6122930",
+  "strategy_policy_sha256": "c4a46268cbef4cb44994fe5524dc2499ef90d36853cd3d50b07a3126a31e6bc6",
+  "study_id": "option-package-prospective-v1-r1",
+  "test": {
+    "end_session": "2026-10-30",
+    "start_session": "2026-10-20"
+  },
+  "train": {
+    "end_session": "2026-10-02",
+    "start_session": "2026-09-18"
+  },
+  "underlyers": [
+    "AAPL",
+    "AMD",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "MSFT",
+    "NVDA",
+    "PLTR",
+    "SOFI",
+    "TSLA",
+    "SPY",
+    "QQQ",
+    "IWM"
+  ],
+  "validation": {
+    "end_session": "2026-10-16",
+    "start_session": "2026-10-06"
+  },
+  "valuation_policy_sha256": "86a5db37ebebe377cdec62647a0fc3205859a1fa4e8d40a43d834f5f5828c7cd",
+  "variants": [
+    "EXISTING_CANDIDATE_BASELINE",
+    "MINIMAL_STOCK_GATES",
+    "ALIGNED_RELATIVE_STRENGTH_SIGN"
+  ]
+}

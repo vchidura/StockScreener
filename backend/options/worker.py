@@ -53,15 +53,21 @@ class OptionMaterializationWorker:
         underlyers: tuple[str, ...] | None = None,
         outcome_service=None,
         partition_maintainer: Callable[[datetime], object] | None = None,
+        validation_callback: Callable[[datetime], object] | None = None,
         clock: Callable[[], datetime] | None = None,
         sleep: Callable[[float], None] | None = None,
+        effective_from: datetime | None = None,
     ) -> None:
+        if effective_from is not None and effective_from.utcoffset() is None:
+            raise ValueError("forward worker start must be timezone-aware")
+        self.effective_from = effective_from
         self.pipeline = pipeline
         self.calendar = calendar or OptionExchangeCalendar()
         self.settings = settings or OptionWorkerSettings.from_environment()
         self.underlyers = underlyers
         self.outcome_service = outcome_service
         self.partition_maintainer = partition_maintainer
+        self.validation_callback = validation_callback
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.sleep = sleep or time.sleep
         self._completed_slots: set[datetime] = set()
@@ -91,27 +97,23 @@ class OptionMaterializationWorker:
                 seconds=self.settings.publication_grace_seconds
             ),
         )
-        if latest_slot is None:
+        if latest_slot is None or self.effective_from is not None and latest_slot < self.effective_from:
             return None
+        if self._retry_slot is not None and self._retry_slot != latest_slot:
+            LOGGER.warning(
+                "option retry superseded slot=%s current_slot=%s; historical evidence retained",
+                self._retry_slot.isoformat(),
+                latest_slot.isoformat(),
+            )
+            self._retry_slot = None
+            self._retry_not_before = None
         if (
             self._retry_slot is not None
             and self._retry_not_before is not None
             and now < self._retry_not_before
         ):
             return None
-        retry_slots = []
-        if self._retry_slot is not None:
-            retry_slots.append(self._retry_slot)
-        durable_retry = self.pipeline.latest_due_retry_cycle()
-        if durable_retry is not None:
-            retry_slots.append(durable_retry.astimezone(timezone.utc))
-        latest_session = self.calendar.session_for_slot(latest_slot)
-        current_session_retries = [
-            candidate
-            for candidate in retry_slots
-            if self.calendar.session_for_slot(candidate) == latest_session
-        ]
-        slot = max(current_session_retries) if current_session_retries else latest_slot
+        slot = latest_slot
         if slot in self._completed_slots:
             return None
         LOGGER.info("materializing option slot=%s", slot.isoformat())
@@ -121,19 +123,22 @@ class OptionMaterializationWorker:
             cycle_time=slot,
             progress_callback=progress_callback,
         )
-        if self.outcome_service is not None:
-            outcome_result = self.outcome_service.mature(available_by=now)
-            LOGGER.info(
-                "option outcomes candidates=%s due=%s available=%s persisted=%s pending=%s",
-                outcome_result.candidates,
-                outcome_result.due_measurements,
-                outcome_result.available_measurements,
-                outcome_result.persisted,
-                outcome_result.pending,
-            )
         counts: dict[str, int] = {}
+        shadow_counts: dict[str, int] = {}
+        package_counts: dict[str, int] = {}
         for item in result.results:
             counts[item.status] = counts.get(item.status, 0) + 1
+            for reason in getattr(item, "reasons", ()):
+                if reason.startswith("STOCK_BEHAVIOR_SHADOW_"):
+                    shadow_status = reason.removeprefix("STOCK_BEHAVIOR_SHADOW_")
+                    shadow_counts[shadow_status] = shadow_counts.get(shadow_status, 0) + 1
+                if reason.startswith("OPTION_PACKAGE_ASSESSMENT_"):
+                    package_status = reason.removeprefix(
+                        "OPTION_PACKAGE_ASSESSMENT_"
+                    )
+                    package_counts[package_status] = (
+                        package_counts.get(package_status, 0) + 1
+                    )
         if any(getattr(item, "retryable", False) for item in result.results):
             self._retry_slot = slot
             self._retry_not_before = now + FAILURE_RETRY_DELAY
@@ -148,10 +153,37 @@ class OptionMaterializationWorker:
                 self._retry_slot = None
                 self._retry_not_before = None
         LOGGER.info(
-            "option slot complete slot=%s statuses=%s",
+            "option slot complete slot=%s statuses=%s stock_behavior_shadow=%s "
+            "package_assessments=%s",
             slot.isoformat(),
             ",".join(f"{key}:{value}" for key, value in sorted(counts.items())),
+            ",".join(
+                f"{key}:{value}" for key, value in sorted(shadow_counts.items())
+            ) or "DISABLED_OR_NOT_APPLICABLE",
+            ",".join(
+                f"{key}:{value}" for key, value in sorted(package_counts.items())
+            ) or "DISABLED",
         )
+        if getattr(result, "detector_evaluation", None) is not None:
+            LOGGER.info("option detector evaluation slot=%s result=%s", slot.isoformat(), result.detector_evaluation)
+        if self.outcome_service is not None:
+            outcome_result = self.outcome_service.mature(available_by=self.clock().astimezone(timezone.utc))
+            LOGGER.info(
+                "option outcomes candidates=%s due=%s available=%s persisted=%s pending=%s",
+                outcome_result.candidates,
+                outcome_result.due_measurements,
+                outcome_result.available_measurements,
+                outcome_result.persisted,
+                outcome_result.pending,
+            )
+        if self.validation_callback is not None:
+            try:
+                validation = self.validation_callback(self.clock().astimezone(timezone.utc))
+                LOGGER.info("option continuous validation=%s", validation)
+            except Exception:
+                LOGGER.exception(
+                    "option continuous validation failed; materialization remains complete"
+                )
         return result
 
     def run_forever(self, leadership: OptionSchedulerLeadership) -> None:

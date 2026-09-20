@@ -147,11 +147,21 @@ export interface MaterializationStatus {
   last_market_time: string | null
   oldest_stale_market_time: string | null
   stale_intervals: string[]
+  pipeline_active?: boolean
+  active_intervals?: string[]
 }
 
 export const fetchMaterializationStatus = async (): Promise<MaterializationStatus> => {
   const response = await api.get('/equity/materialization-status')
-  return response.data
+  const status = response.data as MaterializationStatus
+  if (status.pipeline_active !== undefined) return status
+  const health = await api.get('/equity/health')
+  const activeIntervals = Array.from(new Set<string>(
+    (health.data.recent_runs || [])
+      .filter((run: { status?: string }) => run.status === 'PENDING' || run.status === 'RUNNING')
+      .map((run: { interval: string }) => run.interval),
+  )).sort()
+  return { ...status, pipeline_active: activeIntervals.length > 0, active_intervals: activeIntervals }
 }
 
 export interface GapResult {
@@ -2211,7 +2221,7 @@ export interface OptionCandidateLeg {
   local_iv: number | null
   local_delta: number | null
   local_gamma: number | null
-  // Only the opportunities endpoint projects these.
+  // Available when the reader projects original leg market evidence.
   local_theta_per_day?: number | null
   local_vega_per_vol_point?: number | null
   local_rho_per_rate_point?: number | null
@@ -2228,6 +2238,7 @@ export interface OptionCandidateLeg {
 }
 
 export interface OptionCandidateRow {
+  calendar_dte?: number
   candidate_id: string
   matrix_id: string
   strategy_name: string
@@ -2286,6 +2297,203 @@ export interface OptionCandidatesData {
   execution_mode: 'READ_ONLY_RESEARCH'
 }
 
+export interface OptionBehaviorFunnel {
+  candidates: number
+  selected: number
+  applicable: number
+  dispositions: Record<string, number>
+  eligible: number
+  timely: number
+  shortlist: number
+  entry_open_now: number
+  reasons: Record<string, number>
+}
+
+export interface OptionBehaviorState {
+  disposition: string
+  reasons: string[]
+  eligible: boolean
+  shortlist: boolean
+  selection_reason: string | null
+  timely_at_recording: boolean
+  entry_open_now: boolean
+  decision_at: string | null
+  recorded_at: string | null
+  metrics: Record<string, number>
+}
+
+export interface OptionDetectionRun {
+  run_id: string
+  scheduled_cycle: string
+  session_date: string
+  completed_at: string
+  covered_underlyings: number
+  expected_underlyings: number
+  new_alerts?: number
+  repeat_hits?: number
+  rejections?: Record<string, number>
+  by_model?: Record<string, Record<string, number>>
+}
+
+export type OptionDetectorSort = 'run' | 'underlyer' | 'detector' | 'category' | 'strategy' | 'rank' | 'entry_limit'
+
+export interface OptionDetectorDatasets {
+  storage_ready: boolean
+  datasets: string[]
+  current_dataset_id: string | null
+  default_dataset_id: string | null
+}
+
+export const getOptionDetectorDatasets = async (): Promise<OptionsEnvelope<OptionDetectorDatasets>> => (await api.get('/options/alerts/datasets')).data
+
+export interface OptionAlertOriginalPackage {
+  status: 'AVAILABLE' | 'UNAVAILABLE'
+  basis?: 'ORIGINAL_CANDIDATE_SNAPSHOTS'
+  structure_type?: string
+  expiration_date?: string | null
+  calendar_dte?: number | null
+  net_premium?: string | null
+  capital_at_risk?: string | null
+  maximum_loss?: string | null
+  maximum_profit?: string | null
+  breakevens?: string[]
+  market_data_time?: string
+  observed_time?: string
+  legs: OptionCandidateLeg[]
+}
+
+export interface OptionDetectorEvaluationReview {
+  storage_ready: boolean
+  dataset_id: string | null
+  datasets: string[]
+  sessions: string[]
+  session_date: string | null
+  as_of: string
+  maximum_new_alerts: number
+  outcome_status: string
+  total: number
+  models: Array<{
+    detector_id: 'O1' | 'O2' | 'S1' | 'S2'; evaluated: number; detected: number; selected: number;
+    not_selected: number; repeats: number; observations: number;
+    measured: number | null; positive_rate: number | null; mean_net_return: number | null; outcome_status: string;
+  }>
+  rows: Array<{
+    evaluation_id: string; candidate_id: string | null; run_id: string; scheduled_cycle: string;
+    detector_id: 'O1' | 'O2' | 'S1' | 'S2'; origin: 'OPTIONS_FIRST' | 'STOCK_FIRST'; underlyer: string;
+    direction: -1 | 1 | null; category: string; strategy_name: string | null; candidate_rank: number | null;
+    selection_status: 'SELECTED' | 'NOT_SELECTED' | 'REPEAT' | 'OBSERVATION'; selection_reason: string;
+    plan_sha256: string | null; selected_at: string; entry_deadline: string | null; exit_deadline: string | null;
+    entry_limit: string | null; outcome_status: string; net_return: number | null;
+    event_horizon_status: string; shared_model_exposure: boolean;
+    observation?: { finding_disposition: string; stock_context_status: string; reasons: string[];
+      findings: Array<{ contract_id: number; snapshot_id: string; strike: string; local_iv: number;
+        fitted_iv: number; residual: number; robust_z: number }> };
+  }>
+  cells: Array<{
+    detector_id: 'O1' | 'O2' | 'S1' | 'S2'; selection_status: string; selection_reason: string;
+    occurrences: number; distinct_packages: number; repeated_package_occurrences: number;
+    measured: number | null; positive_rate: number | null; mean_net_return: number | null; outcome_status: string;
+  }>
+}
+
+export const getOptionDetectorEvaluations = async (params: {
+  session_date?: string; dataset_id?: string; detector?: 'O1' | 'O2' | 'S1' | 'S2';
+  underlyer?: string; sort_by?: OptionDetectorSort; sort_order?: 'asc' | 'desc';
+  selection_status?: 'SELECTED' | 'NOT_SELECTED' | 'REPEAT' | 'OBSERVATION'; limit?: number; offset?: number;
+}): Promise<OptionsEnvelope<OptionDetectorEvaluationReview>> => (await api.get('/options/alerts/evaluations', { params })).data
+
+export interface OptionDetectorAlertReview {
+  version: 'option_detector_alert_review_v1'
+  dataset_id: string
+  scope: 'LATEST' | 'HISTORY'
+  status: 'COMPLETE' | 'NO_COMPLETE_RUN'
+  as_of: string
+  latest_run_id: string | null
+  session_date: string | null
+  sessions: string[]
+  total: number
+  new_alerts: number
+  repeat_hits: number
+  maximum_new_alerts: number
+  outcome_status: 'NOT_BOUND_TO_PROSPECTIVE_OUTCOMES'
+  execution_permission: false
+  rows: Array<{
+    evaluation_id: string; candidate_id: string; run_id: string; scheduled_cycle: string;
+    detector_id: 'O1' | 'S1' | 'S2'; origin: 'OPTIONS_FIRST' | 'STOCK_FIRST'; underlyer: string;
+    direction: -1 | 1; category: string; strategy_name: string | null; candidate_rank: number; first_selected_at: string;
+    hit_count: number; repeat_count: number; last_seen_at: string; plan_sha256: string;
+    entry_limit: string; entry_deadline: string; exit_deadline: string;
+    management_policy: Record<string, unknown>; event_horizon_status: string; original_package?: OptionAlertOriginalPackage;
+    outcome_status: 'NOT_BOUND_TO_PROSPECTIVE_OUTCOMES'; net_return: null; fill: null;
+  }>
+}
+
+export const getOptionDetectorAlerts = async (params: {
+  dataset_id: string; scope?: 'LATEST' | 'HISTORY'; session_date?: string;
+  underlyer?: string; sort_by?: OptionDetectorSort; sort_order?: 'asc' | 'desc';
+  detector?: 'O1' | 'S1' | 'S2'; limit?: number; offset?: number;
+}): Promise<OptionsEnvelope<OptionDetectorAlertReview>> => (await api.get('/options/alerts/detector-runs', { params })).data
+
+export interface OptionBehaviorReview {
+  version: string
+  session_date: string
+  session_close: string | null
+  session_state: 'CLOSED' | 'IN_PROGRESS' | 'NON_TRADING_DAY'
+  scope: 'LATEST' | 'CURRENT' | 'HISTORY'
+  latest_completed_session: string
+  sessions?: string[]
+  run?: OptionDetectionRun | null
+  active_run?: OptionDetectionRun | null
+  withheld_run?: OptionDetectionRun | null
+  runs?: OptionDetectionRun[]
+  newer_partial_run?: { scheduled_cycle: string; covered_underlyings: number; expected_underlyings: number; missing_underlyings: string[] } | null
+  history_basis: 'RETAINED_CANDIDATE_DETECTIONS_NOT_PUBLICATIONS' | 'PERSISTED_BASELINE_ALERT_MEMBERS'
+  selector_version?: string
+  selector_sha256?: string
+  models?: Record<string, string>
+  run_funnel?: { new_alerts: number; repeat_hits: number }
+  as_of: string
+  policy_version: string
+  policy_sha256: string
+  selection_basis: string
+  elapsed_seconds: number
+  schema: Record<string, boolean>
+  funnel: OptionBehaviorFunnel
+  rows?: Array<Pick<OptionCandidateRow, 'candidate_id' | 'underlying' | 'display_name' | 'candidate_rank' | 'structure_type'
+    | 'expiration_date' | 'calendar_dte' | 'net_premium' | 'capital_at_risk' | 'market_data_time' | 'valid_until'
+    | 'management_policy' | 'management_policy_version' | 'maximum_loss' | 'maximum_profit' | 'reason_codes'> & {
+    behavior: OptionBehaviorState
+    scheduled_cycle?: string
+    hit_count?: number
+    category_ids?: string[]
+    alert?: { publication_id: string; published_at: string; last_seen: string }
+    current_mark?: OptionAlertHistoryRow['current_mark']
+    legs: Array<Pick<OptionCandidateLeg, 'leg_index' | 'contract_ticker' | 'side' | 'ratio' | 'multiplier' | 'strike'
+      | 'contract_type' | 'model_mark' | 'source_market_time' | 'spot' | 'local_iv' | 'local_delta' | 'local_gamma'
+      | 'local_theta_per_day' | 'local_vega_per_vol_point' | 'local_rho_per_rate_point' | 'day_volume' | 'open_interest'
+      | 'mark_source' | 'quote_bid' | 'quote_ask'>>
+  }>
+  total?: number
+  cohort_count?: number
+  cohort_rule?: string
+  cohort_rows?: Array<{ candidate_id: string; underlying: string; strategy_name: string; structure_type: string;
+    candidate_rank: number; market_data_time: string; behavior: OptionBehaviorState;
+    outcomes: Record<string, {state: string; net_return: number | null; net_pnl: string | null; estimated_cost: string | null}> }>
+  by_strategy?: Record<string, OptionBehaviorFunnel>
+  factors?: Record<string, {count: number; minimum: number; mean: number; maximum: number}>
+  cells?: Array<{ arm: string; strategy: string; structure: string; horizon: string; cohorts: number; measured: number;
+    states: Record<string, number>; outcome_coverage: number | null; mean_net_return: number | null;
+    positive_mark_fraction: number | null; minimum_net_return: number | null; maximum_net_return: number | null; verdict: string }>
+  execution_permission: false
+  probability: null
+}
+
+export const getOptionBehaviorReview = async (params: {
+  behavior_view: 'SHORTLIST' | 'ELIGIBLE' | 'ALL' | 'DAILY'; session_date?: string; underlyer?: string;
+  review_scope?: 'LATEST' | 'CURRENT' | 'HISTORY';
+  strategy?: string; minimum_dte?: number; maximum_dte?: number; limit?: number; offset?: number;
+}): Promise<OptionsEnvelope<OptionBehaviorReview>> => (await api.get('/options/candidates', { params })).data
+
 export interface OptionOpportunityUnderlyer {
   underlying: string
   matrix_id: string
@@ -2337,6 +2545,106 @@ export interface OptionOpportunitiesData {
 export type OptionScreenerScope = 'ALL' | 'STRUCTURED' | 'RESEARCH' | 'BOARD'
 export type OptionScreenerSort = 'PREMIUM_ACTIVITY' | 'VOLUME' | 'OPEN_INTEREST' | 'VOLUME_OI' | 'OI_CHANGE' | 'IV'
 
+export interface OptionDiscoveryCatalog {
+  version: string
+  contract_filters?: Record<string, { label: string; unit: string; minimum?: number; maximum?: number; integer?: boolean }>
+  categories: { id: OptionCandidatePersona; label: string }[]
+  models: {
+    id: string
+    label: string
+    output_kind: 'STRUCTURE' | 'OBSERVATION'
+    structures: { id: string; category_ids: OptionCandidatePersona[] }[]
+  }[]
+}
+
+export interface EligibleChainRow {
+  snapshot_id: string
+  contract_id: number
+  contract_ticker: string
+  underlying: string
+  contract_type: 'CALL' | 'PUT'
+  expiration_date: string
+  strike: string
+  calendar_dte: number
+  spot: string
+  model_mark: string
+  absolute_delta: number
+  local_delta: number
+  local_iv: number
+  local_gamma: number
+  local_theta_per_day: number
+  local_vega_per_vol_point: number
+  local_rho_per_rate_point?: number | null
+  bid?: string | null
+  ask?: string | null
+  mark_market_data_time?: string | null
+  day_volume: number | null
+  open_interest: number | null
+  volume_open_interest_ratio: number | null
+  otm_fraction: string
+  market_data_time: string
+  first_observed_at: string
+  mark_source: string
+  quality_flags: string[]
+  asset_type?: string | null
+  provider?: string | null
+  batch_id?: string | null
+  matrix_id?: string | null
+  expiration_cutoff?: string | null
+  time_to_expiration_years?: number | null
+  shares_per_contract?: number | null
+  exercise_style?: string | null
+  spot_market_data_time?: string | null
+  display_mark?: string | null
+  midpoint?: string | null
+  intrinsic_value?: string | null
+  extrinsic_value?: string | null
+  single_contract_breakeven?: string | null
+  provider_iv?: number | null
+  provider_gamma?: number | null
+  risk_free_rate?: number | null
+  dividend_yield?: number | null
+  iv_converged?: boolean | null
+  iv_solver?: string | null
+  iv_iteration_count?: number | null
+  iv_price_error?: number | null
+  iv_failure_reason?: string | null
+  model_version?: string | null
+  revised_observed_at?: string | null
+  data_delay_seconds?: number | null
+  revision?: number | null
+  policy_version?: string | null
+  policy_sha256?: string | null
+  valuation_policy_version?: string | null
+  valuation_policy_sha256?: string | null
+  raw_payload_sha256?: string | null
+  normalized_payload_sha256?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface EligibleChainRequest {
+  session_date?: string
+  underlyer?: string
+  contract_type?: 'CALL' | 'PUT'
+  filters: { field: string; minimum?: number; maximum?: number }[]
+  sort: string
+  descending: boolean
+  limit: number
+  offset: number
+}
+
+export interface EligibleChainData {
+  rows: EligibleChainRow[]
+  total: number
+  coverage: { underlying: string; batch_id: string; matrix_id: string; market_time: string; observed_time: string; received: number; retained: number; eligible: number }[]
+  missing_underlyers?: string[]
+  requested_underlyers?: string[]
+  coverage_status?: 'MISSING' | 'PARTIAL' | 'COVERED'
+  selection_basis?: 'LATEST_COMPLETE_MATRIX_PER_UNDERLYING'
+  serving_mode?: 'CURRENT_POLICY'
+}
+
 export interface OptionScreenerRow {
   snapshot_id: string
   contract_id: number
@@ -2358,6 +2666,9 @@ export interface OptionScreenerRow {
   market_data_time: string
   first_observed_at: string
   strategy_names: string[]
+  structure_types: string[]
+  category_ids: OptionCandidatePersona[]
+  result_kind: 'STRUCTURE_LEG' | 'OBSERVATION' | 'MIXED'
   candidate_count: number
   structured_candidate_count: number
   research_candidate_count: number
@@ -2386,6 +2697,7 @@ export interface OptionScreenerData {
   limit: number
   offset: number
   scope: OptionScreenerScope
+  category: OptionCandidatePersona | null
   session_date: string | null
   sort: OptionScreenerSort
   directional_flow_available: false
@@ -2419,6 +2731,114 @@ export interface OptionExecutionGate {
   reason_codes: string[]
   evidence: Record<string, unknown>
   evaluated_at: string
+}
+
+export interface OptionStockBehaviorGateEvidence {
+  gate_id: string
+  requirement: 'REQUIRED' | 'ADVISORY'
+  verdict: 'PASS' | 'FAIL' | 'UNAVAILABLE' | 'NOT_APPLICABLE'
+  factor: string | null
+  component_key: string | null
+  metric_id: string | null
+  formula_id: string | null
+  comparator: string
+  actual_float: number | null
+  actual_text: string | null
+  threshold_float: number | null
+  source_evidence_ids: string[]
+  source_payload_sha256s: string[]
+  source_market_times: string[]
+  reason_codes: string[]
+}
+
+export interface OptionStockBehaviorAssessmentEvidence {
+  schema_version: 'option_stock_behavior_assessment_v1'
+  detector_policy_version?: string
+  detector_policy_sha256?: string
+  stock_profile?: string | null
+  launch_id?: string | null
+  launch_manifest_sha256?: string | null
+  disposition: 'ELIGIBLE_RESEARCH' | 'BLOCKED' | 'UNAVAILABLE' | 'NOT_APPLICABLE'
+  directional_thesis: string | null
+  stock_market_cutoff: string | null
+  decision_at: string
+  target_horizon: string
+  behavior_data_status: string | null
+  behavior_alignment_state: string | null
+  gates: OptionStockBehaviorGateEvidence[]
+  assessment_only: true
+  execution_permission: false
+}
+
+export interface OptionPackageTermsEvidence {
+  schema_version: 'option_package_terms_v1'
+  structure: string
+  entry_basis: 'CANDIDATE_MODEL_MARKS'
+  market_time: string
+  observed_at: string
+  valid_until: string | null
+  net_premium: string
+  collateral_required: string | null
+  capital_at_risk: string | null
+  maximum_loss_status: 'BOUNDED' | 'UNBOUNDED' | 'UNAVAILABLE'
+  maximum_loss: string | null
+  maximum_profit_status: 'BOUNDED' | 'UNBOUNDED' | 'UNAVAILABLE'
+  maximum_profit: string | null
+  breakevens: string[]
+  research_only: true
+  execution_permission: false
+}
+
+export interface OptionPackageAssessmentEvidence {
+  schema_version: 'option_package_assessment_v1'
+  assessment_policy_version: string
+  assessment_policy_sha256: string
+  valuation_policy_sha256: string
+  assessed_at: string
+  status: 'READY' | 'UNAVAILABLE'
+  package: OptionPackageTermsEvidence | null
+  package_terms_sha256: string | null
+  reason_codes: string[]
+  research_only: true
+  execution_permission: false
+}
+
+export interface OptionCandidateResearchEvidence {
+  version: 'option_candidate_research_evidence_v1'
+  detector: {
+    id: string
+    version: string
+    display_name: string
+    output_kind: 'OBSERVATION' | 'STRUCTURED_PACKAGE'
+  }
+  category_ids: OptionCandidatePersona[]
+  structure: string
+  stock_behavior: {
+    availability: 'AVAILABLE' | 'UNAVAILABLE'
+    reason: string | null
+    payload_sha256?: string
+    recorded_at?: string
+    assessment: OptionStockBehaviorAssessmentEvidence | null
+  }
+  package_assessment: {
+    availability: 'AVAILABLE' | 'UNAVAILABLE'
+    reason: string | null
+    payload_sha256?: string
+    recorded_at?: string
+    assessment: OptionPackageAssessmentEvidence | null
+  }
+  probability: {
+    status: 'UNAVAILABLE'
+    value: null
+    reason: string
+    target: null
+    outcome_basis: null
+    report_sha256: null
+  }
+  source_basis: 'PERSISTED_EVIDENCE_ONLY'
+  calculation_performed: false
+  publication_permission: false
+  execution_permission: false
 }
 
 export interface OptionCandidateDetailData {
@@ -2467,6 +2887,7 @@ export interface OptionCandidateDetailData {
     first_observed_at: string
     payload_sha256: string
   }>
+  research_evidence?: OptionCandidateResearchEvidence
   quote_liquidity: 'NOT_AVAILABLE'
   execution_mode: 'READ_ONLY_RESEARCH'
 }
@@ -2773,6 +3194,13 @@ export const getOptionGamma = async (params?: {
 }
 
 export const getOptionCandidates = async (params?: {
+  category?: OptionCandidatePersona
+  session_date?: string
+  structured_only?: boolean
+  minimum_dte?: number
+  maximum_dte?: number
+  maximum_capital?: number
+  sort?: 'DEFAULT' | 'CAPITAL_ASC' | 'DTE_ASC'
   underlyer?: string
   persona?: OptionCandidatePersona
   status?: OptionCandidateStatus
@@ -2794,12 +3222,23 @@ export const getOptionOpportunities = async (params?: {
   return response.data
 }
 
+export const getOptionDiscoveryCatalog = async (): Promise<OptionDiscoveryCatalog> => {
+  const response = await api.get('/options/discovery-catalog')
+  return response.data
+}
+
+export const queryEligibleChain = async (request: EligibleChainRequest): Promise<OptionsEnvelope<EligibleChainData>> => {
+  const response = await api.post('/options/eligible-chain/query', request)
+  return response.data
+}
+
 export const getOptionScreener = async (params?: {
   session_date?: string
   scope?: OptionScreenerScope
   underlyer?: string
   contract_type?: 'CALL' | 'PUT'
   strategy?: string
+  category?: OptionCandidatePersona
   minimum_dte?: number
   maximum_dte?: number
   minimum_volume?: number
@@ -2817,6 +3256,128 @@ export const getOptionCandidate = async (
   candidateId: string,
 ): Promise<OptionsEnvelope<OptionCandidateDetailData>> => {
   const response = await api.get(`/options/candidates/${candidateId}`)
+  return response.data
+}
+
+export interface OptionAlertAssessment {
+  capability: 'OBSERVATION' | 'INDICATIVE' | 'QUOTE_PAPER' | 'EXECUTION'
+  status: 'SATISFIED' | 'BLOCKED' | 'UNAVAILABLE' | 'NOT_APPLICABLE'
+  blocking_inputs: string[]
+}
+
+export interface OptionAlertManagement {
+  policy_version: string
+  strategy_name: 'DIRECTIONAL_LONG_PREMIUM' | 'DIRECTIONAL_DEBIT_SPREAD'
+  stop_loss_fraction: string
+  take_profit_fraction: string
+  maximum_hold_seconds: number
+  minimum_exit_dte: number
+}
+
+export interface OptionAlertPreviewRequest {
+  entry_deadline?: string
+  exit_deadline?: string
+  entry_limit?: string
+  management_policy?: OptionAlertManagement
+}
+
+export interface OptionAlertPreviewData {
+  version: string
+  status: 'NOT_APPLICABLE' | 'BLOCKED' | 'INDICATIVE_PLAN_VALID'
+  candidate_id: string
+  assessed_at: string
+  original_valid_until: string | null
+  source_market_time: string
+  source_observed_at: string
+  original_package: { legs: OptionCandidateLeg[]; economics: Record<string, unknown> }
+  original_management_policy: Record<string, unknown> | null
+  original_management_policy_version: string | null
+  proposed_management_policy: Record<string, unknown> | null
+  qualification: { assessments: OptionAlertAssessment[]; execution_permission: false }
+  blockers: Array<{ code: string; field?: string; inputs?: string[]; message?: string }>
+  plan_preview: { plan_id: string; plan_sha256: string; source_evidence_omitted: true; plan: Record<string, unknown> } | null
+  persisted: false
+  publication_permission: false
+  execution_permission: false
+  paper_position_created: false
+}
+
+export interface OptionAlertHistoryRow {
+  event_id: string
+  sequence: number
+  plan_id: string
+  plan_sha256: string
+  event_type: 'PUBLISHED' | 'OBSERVED' | 'INVALIDATED' | 'EXPIRED'
+  recorded_at: string
+  request: { reason: string | null; source_ids: string[]; source_available_at: string | null }
+  candidate_id: string
+  underlying: string
+  strategy: string
+  structure: string
+  legs: Array<{
+    index: number; contract_id: number; contract_ticker: string; side: 'BUY' | 'SELL'; ratio: number
+    multiplier: number; expiration_date: string; strike: string; contract_type: 'CALL' | 'PUT'
+    entry_model_mark: string; source_market_time: string
+  }>
+  entry_limit: string
+  entry_limit_kind: 'MINIMUM_CREDIT' | 'MAXIMUM_DEBIT'
+  entry_deadline: string
+  exit_deadline: string
+  entry_window_elapsed: boolean
+  original_economics: Record<string, unknown>
+  management_policy: Record<string, unknown>
+  management_policy_version?: string | null
+  management_source?: string
+  management_limits?: Record<string, unknown> | null
+  decision_at?: string | null
+  published_at?: string | null
+  hit_count?: number | null
+  hit_count_basis?: string
+  current_mark?: {
+    status: 'FRESH' | 'STALE' | 'UNAVAILABLE'
+    reason: string | null
+    market_time: string | null
+    observed_time: string | null
+    oldest_leg_market_time?: string
+    age_seconds: number | null
+    maximum_age_seconds?: number
+    signed_package_mark: string | null
+    package_price: string | null
+    gross_pnl: string | null
+    price_return: string | null
+    estimated_cost: string | null
+    net_pnl: string | null
+    net_return: string | null
+    basis: string
+    price_return_basis: string
+    net_return_basis: string
+    valuation_policy_sha256?: string
+    source_snapshot_ids?: string[]
+    after_exit_deadline?: boolean | null
+    slippage: 'UNAVAILABLE'
+    execution_permission: false
+  }
+  source_market_time: string
+  execution_permission: false
+}
+
+export interface OptionAlertHistoryData {
+  version: string
+  rows: OptionAlertHistoryRow[]
+  limit: number
+  offset: number
+  checked_at?: string
+  source: 'FORWARD_INDICATIVE'
+  execution_permission: false
+}
+
+export const previewOptionAlert = async (candidateId: string, request: OptionAlertPreviewRequest = {}): Promise<OptionsEnvelope<OptionAlertPreviewData>> => {
+  const response = await api.post(`/options/alerts/preview/${candidateId}`, request)
+  return response.data
+}
+
+export const getOptionAlertHistory = async (params: { limit: number; offset: number }): Promise<OptionsEnvelope<OptionAlertHistoryData>> => {
+  const response = await api.get('/options/alerts/history', { params })
   return response.data
 }
 

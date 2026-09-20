@@ -81,6 +81,26 @@ def parser() -> argparse.ArgumentParser:
         help="Keep ETFs and ETVs; excluded by default because their benchmarks "
              "are self-referential",
     )
+    result.add_argument(
+        "--include-non-common-ticker", action="append", default=[],
+        help="Keep one explicitly selected ETF without admitting every non-common ticker; repeatable.",
+    )
+    result.add_argument(
+        "--ticker", action="append", default=[],
+        help="Restrict ingestion to selected universe tickers; repeatable and fail-closed.",
+    )
+    result.add_argument(
+        "--skip-benchmarks", action="store_true",
+        help="Do not add research benchmark ETFs; allowed only with explicit --ticker values.",
+    )
+    result.add_argument(
+        "--security-type", action="append", choices=("CS", "ETF", "ETV"),
+        help="Restrict dated reference types; repeatable. Defaults preserve existing behavior.",
+    )
+    result.add_argument(
+        "--fetch-missing-reference-cache", action="store_true",
+        help="Fetch only missing ticker-scoped dated references; cannot be combined with --apply.",
+    )
     result.add_argument("--limit-sessions", type=int)
     result.add_argument(
         "--from-reconstructed-universes", action="store_true",
@@ -129,17 +149,30 @@ class DatedIdentityMap:
 
 
 def dated_security_ids(cache_dir, session_date, tickers, *, observed_at,
-                       security_types=("CS", "ETF"), include_non_common=False):
-    def missing_cache():
-        raise ValueError(f"DATED_REFERENCE_CACHE_MISSING: tickers-{security_type}_{session_date}")
+                       security_types=("CS", "ETF"), include_non_common=False,
+                       allowed_non_common_tickers=(), reference_fetcher=None,
+                       cache_scope_tickers=()):
 
     cache = ResponseCache(cache_dir)
     selected = set(tickers)
+    scoped_tickers = tuple(sorted({ticker.upper() for ticker in cache_scope_tickers}))
+    allowed_non_common = {ticker.upper() for ticker in allowed_non_common_tickers}
+    if not allowed_non_common <= selected:
+        raise ValueError("explicit non-common tickers must be in the selected universe")
     identities = {}
     identity_tickers = {}
     source_hashes = {}
     for security_type in security_types:
-        references = cache.get_or_fetch(f"tickers-{security_type}", session_date.isoformat(), missing_cache)
+        cache_kind = f"tickers-{security_type}"
+        if scoped_tickers:
+            cache_kind += "-subset-" + sha256_json(scoped_tickers)[:16]
+
+        def missing_cache(current_type=security_type):
+            if reference_fetcher is None:
+                raise ValueError(f"DATED_REFERENCE_CACHE_MISSING: {cache_kind}_{session_date}")
+            return reference_fetcher(current_type, session_date, scoped_tickers or tuple(sorted(selected)))
+
+        references = cache.get_or_fetch(cache_kind, session_date.isoformat(), missing_cache)
         source_hashes[security_type] = sha256_json(references)
         for payload in references:
             if not isinstance(payload, dict) or payload.get("type") != security_type:
@@ -163,7 +196,8 @@ def dated_security_ids(cache_dir, session_date, tickers, *, observed_at,
             identities[ticker] = identity
             identity_tickers[revision.security_id] = ticker
     excluded = frozenset(ticker for ticker, identity in identities.items()
-                         if not include_non_common and identity[3] != "CS" and ticker not in BENCHMARK_TICKERS)
+                         if not include_non_common and identity[3] != "CS"
+                         and ticker not in BENCHMARK_TICKERS and ticker not in allowed_non_common)
     return DatedIdentityMap(
         security_ids={ticker: identity[0] for ticker, identity in identities.items() if ticker not in excluded},
         excluded_tickers=excluded,
@@ -190,20 +224,25 @@ def existing_identity_conflicts(cursor, session_date, security_ids):
     return [dict(row) for row in cursor.fetchall()]
 
 
-def identity_preflight(sessions, tickers, *, cache_dir, observed_at, include_non_common=False):
+def identity_preflight(sessions, tickers, *, cache_dir, observed_at, include_non_common=False,
+                       allowed_non_common_tickers=(), required_benchmark_tickers=BENCHMARK_TICKERS,
+                       security_types=None, reference_fetcher=None, cache_scope_tickers=()):
     plans = {}
     issues = []
-    security_types = ("CS", "ETF", "ETV") if include_non_common else ("CS", "ETF")
+    security_types = tuple(security_types or (("CS", "ETF", "ETV") if include_non_common else ("CS", "ETF")))
     for session in sessions:
         try:
             identity = dated_security_ids(
                 cache_dir, session, tickers, observed_at=observed_at,
                 security_types=security_types, include_non_common=include_non_common,
+                allowed_non_common_tickers=allowed_non_common_tickers,
+                reference_fetcher=reference_fetcher,
+                cache_scope_tickers=cache_scope_tickers,
             )
         except (ValueError, OSError) as error:
             issues.append({"session": session.isoformat(), "reason": "DATED_REFERENCE_UNRESOLVED", "detail": str(error)})
             continue
-        missing_benchmarks = sorted(BENCHMARK_TICKERS - set(identity.security_ids))
+        missing_benchmarks = sorted(set(required_benchmark_tickers) - set(identity.security_ids))
         if missing_benchmarks:
             issues.append({"session": session.isoformat(), "reason": "DATED_BENCHMARK_REFERENCE_MISSING",
                            "tickers": missing_benchmarks})
@@ -288,6 +327,17 @@ def main() -> int:
         if universe is None:
             raise SystemExit("no live universe run is available")
         tickers = universe_repository.member_tickers(universe["universe_run_id"])
+    requested_tickers = tuple(dict.fromkeys(
+        ticker.strip().upper() for ticker in arguments.ticker if ticker.strip()
+    ))
+    if arguments.skip_benchmarks and not requested_tickers:
+        raise SystemExit("--skip-benchmarks requires at least one explicit --ticker")
+    if requested_tickers:
+        if not set(requested_tickers) <= set(tickers):
+            raise SystemExit("explicit tickers must already belong to the selected universe")
+        tickers = requested_tickers
+    if arguments.fetch_missing_reference_cache and arguments.apply:
+        raise SystemExit("reference-cache fetch and adjusted-price apply must be separate stages")
     calendar = exchange_calendars.get_calendar(arguments.calendar)
     sessions = [
         pd.Timestamp(value).date()
@@ -300,10 +350,37 @@ def main() -> int:
     if any(calendar.session_close(pd.Timestamp(session)).to_pydatetime() > observed_at for session in sessions):
         raise SystemExit("requested range includes an unfinished exchange session")
 
-    selected_tickers = tuple(sorted(set(tickers) | set(BENCHMARK_TICKERS)))
+    selected_tickers = tuple(sorted(
+        set(tickers) if arguments.skip_benchmarks else set(tickers) | set(BENCHMARK_TICKERS)
+    ))
+    allowed_non_common_tickers = tuple(dict.fromkeys(
+        ticker.strip().upper() for ticker in arguments.include_non_common_ticker if ticker.strip()
+    ))
+    if any(not ticker.replace(".", "").replace("-", "").isalnum() for ticker in allowed_non_common_tickers):
+        raise SystemExit("explicit non-common tickers must be valid symbols")
+    if not set(allowed_non_common_tickers) <= set(selected_tickers):
+        raise SystemExit("explicit non-common tickers must already belong to the selected universe")
+    security_types = tuple(dict.fromkeys(arguments.security_type or (
+        ("CS", "ETF", "ETV") if arguments.include_non_common else ("CS", "ETF")
+    )))
+    reference_client = PolygonEquityClient() if arguments.fetch_missing_reference_cache else None
+
+    def fetch_references(security_type, session_date, scoped_tickers):
+        rows = []
+        for ticker in scoped_tickers:
+            payload = reference_client.fetch_ticker_overview(ticker, as_of_date=session_date)
+            if payload is not None and payload.get("type") == security_type:
+                rows.append(payload)
+        return rows
+
     identity_plans, identity_report = identity_preflight(
         sessions, selected_tickers, cache_dir=arguments.reference_cache_dir,
         observed_at=observed_at, include_non_common=arguments.include_non_common,
+        allowed_non_common_tickers=allowed_non_common_tickers,
+        required_benchmark_tickers=() if arguments.skip_benchmarks else BENCHMARK_TICKERS,
+        security_types=security_types,
+        reference_fetcher=fetch_references if reference_client is not None else None,
+        cache_scope_tickers=requested_tickers if arguments.skip_benchmarks else (),
     )
 
     report = {
@@ -316,7 +393,12 @@ def main() -> int:
             else "LATEST_LIVE_UNIVERSE"
         ),
         "securities_requested": len(selected_tickers),
+        "explicit_tickers": list(requested_tickers),
+        "benchmarks_included": not arguments.skip_benchmarks,
+        "reference_cache_fetch_enabled": arguments.fetch_missing_reference_cache,
+        "reference_security_types": list(security_types),
         "common_stock_only": not arguments.include_non_common,
+        "explicit_non_common_tickers": list(allowed_non_common_tickers),
         "mode": "APPLY" if arguments.apply else "DRY_RUN",
         "identity_preflight": identity_report,
         "research_readiness": "NOT_CERTIFIED",
@@ -326,7 +408,11 @@ def main() -> int:
         write_report(report, arguments.output)
         return 2
     if not arguments.apply:
-        report["note"] = "nothing fetched or written; identity checks pass, actual provider prices still require validation"
+        report["note"] = (
+            "dated references cached; no adjusted prices fetched or database rows written"
+            if arguments.fetch_missing_reference_cache
+            else "nothing fetched or written; identity checks pass, actual provider prices still require validation"
+        )
         write_report(report, arguments.output)
         return 0
 

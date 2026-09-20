@@ -51,6 +51,10 @@ def test_leadership_holds_dedicated_connection_and_uses_database_heartbeat_time(
 
     statements = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
     assert "pg_try_advisory_lock" in statements
+    assert "WHERE status = 'LEADER'" in statements
+    assert statements.index("WHERE status = 'LEADER'") < statements.index(
+        "INSERT INTO option_scheduler_instances"
+    )
     assert "INSERT INTO option_scheduler_instances" in statements
     assert "last_heartbeat_at = NOW()" in statements
     assert "pg_advisory_unlock" in statements

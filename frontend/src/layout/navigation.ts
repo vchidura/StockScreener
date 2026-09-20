@@ -118,6 +118,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { to: '/options/activity', label: 'Option Activity', icon: Activity },
       { to: '/options/flow', label: 'Options Flow', icon: Route },
       { to: '/options/screener', label: 'Options Screener', icon: ScanSearch },
+      { to: '/options/alerts', label: 'Options Alerts', icon: Bell },
     ],
   },
 ]

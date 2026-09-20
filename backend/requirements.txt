@@ -13,3 +13,4 @@ pyarrow==25.0.1
 exchange-calendars==4.13.2
 lightgbm==4.3.0
 scikit-learn==1.4.0
+psutil==7.2.2

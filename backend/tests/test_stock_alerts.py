@@ -159,6 +159,70 @@ def test_result_source_capture_preserves_source_files_and_rejects_altered_plan(t
     view.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="retained ledger"):
         capture_result_source(tmp_path, "intraday", datetime(2026, 9, 17, tzinfo=timezone.utc))
+    row["stop"] = plan.stop
+    view.write_text(json.dumps(data))
+    store.save(dict(enrolled_at=data["enrolled_at"], members=["A"], positions={}))
+    with pytest.raises(ValueError, match="no retained position"):
+        capture_result_source(tmp_path, "intraday", datetime(2026, 9, 17, tzinfo=timezone.utc))
+
+
+def test_result_source_capture_accepts_positionless_watch_and_rejects_tampering(tmp_path, monkeypatch):
+    import json
+    from datetime import timedelta
+    from pathlib import Path
+    from types import SimpleNamespace
+    import equity.stock_alert_results as repository
+    from research.stock_idea_forward import ForwardStore, forward_config, forward_decision, shadow_snapshot, publish_view
+    from research.stock_idea_replay import utc
+    from test_stock_idea_engine import candidate
+    from equity.stock_alert_results import capture_result_source
+    policy = forward_config(quality_version=2)
+    boundary = utc("2026-09-17T20:00:00Z")
+    now = utc("2026-09-17T20:17:00Z")
+    plan = candidate(model="discovery", interval="1d", trigger_at=boundary, available_at=now,
+        expires_at=utc("2026-09-18T13:30:00Z"))
+    state = dict(enrolled_at="2026-09-17T13:00:00Z", members=[dict(security_id=plan.security_id, ticker=plan.ticker)],
+        next_boundary="2026-09-18T14:00:00Z", bars={})
+    packet = dict(security_id=plan.security_id, interval="1d", market_time=boundary, available_at=now,
+        ready=True, candidates=[plan], updates=[], revision_ids=["watch"])
+    store = ForwardStore(tmp_path / "forward.sqlite", policy)
+    state, publication, outbox = forward_decision(state, [packet], boundary=boundary, actual_time=now,
+        members=state["members"], policy_hash=store.policy_hash, config=policy)
+    assert publication["selected"] == [plan.episode_id] and not state["positions"]
+    store.save(state, publication, outbox)
+    data = shadow_snapshot(state, [publication], policy, now)
+    view = tmp_path / "alerts-view.json"
+    publish_view(view, data)
+    before = (store.path.read_bytes(), view.read_bytes())
+    capture = capture_result_source(tmp_path, "intraday", now)
+    assert capture["snapshot"]["alerts"][0]["lane"] == "WATCH"
+    assert (store.path.read_bytes(), view.read_bytes()) == before
+    with pytest.raises(ValueError, match="in the future"):
+        capture_result_source(tmp_path, "intraday", now - timedelta(seconds=1))
+    reads = []
+    read_bytes = Path.read_bytes
+    def tracked_read(path):
+        raw = read_bytes(path)
+        if path == view:
+            reads.append("captured")
+        return raw
+    def capture_clock(zone):
+        assert reads == ["captured"]
+        return now + timedelta(seconds=1)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_bytes", tracked_read)
+        patch.setattr(repository, "datetime", SimpleNamespace(now=capture_clock))
+        refreshed = capture_result_source(tmp_path, "intraday")
+    assert refreshed["captured_at"] == (now + timedelta(seconds=1)).isoformat()
+    for changes in (dict(ticker="OTHER"), dict(direction=-plan.direction), dict(model="resumption"), dict(lane="TRADE"),
+            dict(trigger_price=100.), dict(stop=90.), dict(paper_return=.2), dict(entry_at=now.isoformat()),
+            dict(policy_version="OTHER"), dict(triggered_at="2026-09-17T19:30:00Z"), dict(published_at="2026-09-17T20:18:00Z")):
+        altered = deepcopy(data)
+        altered["alerts"][0].update(changes)
+        publish_view(view, altered)
+        with pytest.raises(ValueError):
+            capture_result_source(tmp_path, "intraday", now)
+    assert store.path.read_bytes() == before[0]
 
 
 def annotation_fixture():

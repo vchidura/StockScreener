@@ -4,13 +4,15 @@ import { Link } from 'react-router-dom'
 import { useSearchParams } from 'react-router-dom'
 import { AlertTriangle, Database, Filter, Info, RotateCcw, ScanSearch, SlidersHorizontal } from 'lucide-react'
 import { usePublishPageContext } from '../layout/pageContext'
-import { useSessionDate } from '../layout/sessionDate'
 import {
+  getOptionDiscoveryCatalog,
   getOptionScreener,
   type OptionScreenerScope,
   type OptionScreenerSort,
 } from '../services/api'
 import './OptionsScreenerPage.css'
+import { OptionsScreenLibrary, OptionsPackageResults, OptionsChainResults } from './OptionsScreenLibrary.tsx'
+import { contractColumns, screenQuery, switchOptionsView, type OptionsView } from './optionsScreenLibrary'
 
 const PRESETS = [
   { key: 'all', label: 'All detected', scope: 'ALL' as const },
@@ -48,8 +50,24 @@ export default function OptionsScreenerPage() {
     ['underlyer', 'min_volume', 'min_oi', 'min_ratio', 'sort'].some(name => params.has(name))
     || (!params.has('preset') && ['type', 'min_dte', 'max_dte'].some(name => params.has(name)))
   ))
-  const { pinned: sessionDate } = useSessionDate()
+  const sessionDate = params.get('session_date') || ''
   const preset = PRESETS.find(item => item.key === params.get('preset')) || PRESETS[0]
+  const catalogQuery = useQuery({ queryKey: ['options', 'discovery-catalog'], queryFn: getOptionDiscoveryCatalog, staleTime: 60_000, retry: false })
+  const catalog = catalogQuery.data
+  const packageView = params.get('view') === 'packages'
+  const chainView = params.get('view') === 'chain'
+  const detectedView = !packageView && !chainView
+  let filterError = ''
+  try { if (catalog) screenQuery(params, catalog) } catch (failure) { filterError = failure instanceof Error ? failure.message : 'Invalid filters' }
+  const categoryParam = params.get('category') || ''
+  const modelParam = params.get('model') || ''
+  const category = catalog?.categories.find(item => item.id === categoryParam)
+  const model = catalog?.models.find(item => item.id === modelParam)
+  const invalidCatalogFilter = !!catalog && (!!categoryParam && !category || !!modelParam && !model)
+  const waitingForCatalog = !!(categoryParam || modelParam) && !catalog
+  const scope = (['ALL', 'STRUCTURED', 'RESEARCH', 'BOARD'].includes(params.get('scope') || '') ? params.get('scope') : preset.scope) as OptionScreenerScope
+  const matchingModels = catalog?.models.filter(item => (!category || item.structures.some(structure => structure.category_ids.includes(category.id)))
+    && (!packageView || item.output_kind === 'STRUCTURE') && (scope !== 'STRUCTURED' || item.output_kind === 'STRUCTURE') && (scope !== 'RESEARCH' || item.output_kind === 'OBSERVATION')) || []
   const underlyer = params.get('underlyer') || 'ALL'
   const contractType = params.get('type') || 'ALL'
   const minimumDte = numberParam(params, 'min_dte', 0)
@@ -60,11 +78,12 @@ export default function OptionsScreenerPage() {
   const sort = (params.get('sort') || 'PREMIUM_ACTIVITY') as OptionScreenerSort
   const offset = numberParam(params, 'offset', 0)
   const query = useQuery({
-    queryKey: ['options', 'screener', sessionDate, preset.key, underlyer, contractType, minimumDte, maximumDte, minimumVolume, minimumOi, minimumRatio, sort, offset],
+    queryKey: ['options', 'screener', sessionDate, preset.key, category?.id, model?.id, scope, underlyer, contractType, minimumDte, maximumDte, minimumVolume, minimumOi, minimumRatio, sort, offset],
     queryFn: () => getOptionScreener({
       session_date: sessionDate || undefined,
-      scope: preset.scope as OptionScreenerScope,
-      strategy: preset.strategy,
+      scope,
+      strategy: model?.id || preset.strategy,
+      category: category?.id,
       underlyer: underlyer === 'ALL' ? undefined : underlyer,
       contract_type: contractType === 'ALL' ? undefined : contractType as 'CALL' | 'PUT',
       minimum_dte: minimumDte,
@@ -76,6 +95,7 @@ export default function OptionsScreenerPage() {
       limit: 100,
       offset,
     }),
+    enabled: detectedView && !filterError && !invalidCatalogFilter && !waitingForCatalog,
     refetchInterval: 60_000,
   })
   const data = query.data?.data
@@ -83,13 +103,14 @@ export default function OptionsScreenerPage() {
   const calls = rows.filter(row => row.contract_type === 'CALL').length
   const puts = rows.length - calls
   const update = (values: Record<string, string | null>) => {
-    const next = new URLSearchParams(params)
+    const next = new URLSearchParams(window.location.search)
     Object.entries(values).forEach(([key, value]) => value ? next.set(key, value) : next.delete(key))
     if (!('offset' in values)) next.delete('offset')
     setParams(next)
   }
   const applyPreset = (item: typeof PRESETS[number]) => {
     const next = new URLSearchParams()
+    if (categoryParam) next.set('category', categoryParam)
     if (item.key !== 'all') next.set('preset', item.key)
     if (item.type) next.set('type', item.type)
     if (item.minimumDte) next.set('min_dte', String(item.minimumDte))
@@ -99,22 +120,42 @@ export default function OptionsScreenerPage() {
   usePublishPageContext({
     eyebrow: 'Contract discovery',
     title: 'Options Screener',
-    detail: 'Filter contracts referenced by persisted strategy detections without inferring executable or buyer/seller flow.',
-    session: '1d',
+    detail: undefined,
+    status: [{ label: 'Session', value: sessionDate || 'Latest stored', title: 'Options source session; individual matrix times remain shown with the results.' }],
   })
 
   return <div className="option-screener">
+    {catalog && <OptionsScreenLibrary catalog={catalog} params={params} setParams={setParams} />}
+    {detectedView && params.has('columns') && <style>{contractColumns.map((column, index) => !column.locked && !params.get('columns')!.split(',').includes(column.key) ? `.option-screener .screener-table tr > :nth-child(${index + 1}) { display: none; }` : '').join('\n')}</style>}
+    <section className="screener-discovery-controls" aria-label="Options discovery filters">
+      <label>View<select aria-label="Screen view" value={packageView ? 'packages' : chainView ? 'chain' : 'contracts'} onChange={event => setParams(switchOptionsView(params, event.target.value as OptionsView))}><option value="chain" disabled={!catalog?.contract_filters}>Eligible chain</option><option value="contracts">Detected contracts</option><option value="packages">Strategy packages</option></select></label>
+      <label>Options session<input type="date" aria-label="Options session" value={sessionDate} onChange={event => update({ session_date: event.target.value || null })} /></label>
+      {sessionDate && <button type="button" className="sw-icon" title="Return to latest stored options" aria-label="Return to latest stored options" onClick={() => update({ session_date: null })}><RotateCcw size={16} /></button>}
+      {!chainView && <label>Category<select aria-label="Category" value={categoryParam} disabled={!catalog} onChange={event => update({ category: event.target.value || null, model: null, preset: null })}>
+        <option value="">All categories</option>{invalidCatalogFilter && categoryParam && !category && <option value={categoryParam}>Unknown category</option>}
+        {catalog?.categories.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}
+      </select></label>}
+      {detectedView && <label>Evidence<select aria-label="Evidence type" value={scope} onChange={event => update({ scope: event.target.value === 'ALL' ? null : event.target.value, model: null, preset: null })}>
+        <option value="ALL">All detections</option><option value="STRUCTURED">Structure legs</option><option value="RESEARCH">Observations only</option><option value="BOARD">Published Board</option>
+      </select></label>}
+      {!chainView && <label>Model<select aria-label="Model" value={modelParam || preset.strategy || ''} disabled={!catalog} onChange={event => update({ model: event.target.value || null, preset: null })}>
+        <option value="">All matching models</option>
+        {(modelParam || preset.strategy) && !matchingModels.some(item => item.id === (modelParam || preset.strategy)) && <option value={modelParam || preset.strategy}>{model?.label || readable(modelParam || preset.strategy || '')} (outside filters)</option>}
+        {matchingModels.map(item => <option key={item.id} value={item.id}>{item.label}{item.output_kind === 'OBSERVATION' ? ' (observation)' : ''}</option>)}
+      </select></label>}
+      {!chainView && <span title="Model catalog, not execution eligibility or predictive confidence">{catalog ? `${catalog.models.length} registered models` : catalogQuery.isError ? 'Model catalog unavailable' : 'Loading model catalog'}</span>}
+    </section>
     <section className="screener-terminal-bar">
-      <nav className="screener-presets" aria-label="Options screener presets">
+      {detectedView && <nav className="screener-presets" aria-label="Options screener presets">
         {PRESETS.map(item => <button type="button" key={item.key} className={preset.key === item.key ? 'active' : ''} onClick={() => applyPreset(item)}>{item.label}</button>)}
-      </nav>
+      </nav>}
       <div className="screener-actions">
         <span title="Delayed research marks; no quote aggressor side"><Info size={13} />Delayed · no NBBO direction</span>
-        <button type="button" className={filtersOpen ? 'active' : ''} aria-expanded={filtersOpen} onClick={() => setFiltersOpen(value => !value)}><SlidersHorizontal size={14} />Filters</button>
-        <button type="button" title="Reset scanner" aria-label="Reset scanner" onClick={() => { setParams(new URLSearchParams()); setFiltersOpen(false) }}><RotateCcw size={14} /></button>
+        {detectedView && <button type="button" className={filtersOpen ? 'active' : ''} aria-expanded={filtersOpen} onClick={() => setFiltersOpen(value => !value)}><SlidersHorizontal size={14} />Filters</button>}
+        <button type="button" title="Reset scanner" aria-label="Reset scanner" onClick={() => { setParams(new URLSearchParams(chainView ? { view: 'chain' } : packageView ? { view: 'packages' } : {})); setFiltersOpen(false) }}><RotateCcw size={14} /></button>
       </div>
     </section>
-    {filtersOpen && <section className="screener-filters" aria-label="Contract filters">
+    {filtersOpen && detectedView && <section className="screener-filters" aria-label="Contract filters">
       <div className="screener-filter-heading"><Filter size={15} /><strong>Advanced filters</strong></div>
       <label>Underlying<select value={underlyer} onChange={event => update({ underlyer: event.target.value === 'ALL' ? null : event.target.value })}><option value="ALL">All tracked</option>{(data?.underlyers || []).map(value => <option key={value}>{value}</option>)}</select></label>
       <label>Type<select value={contractType} onChange={event => update({ type: event.target.value === 'ALL' ? null : event.target.value, preset: null })}><option value="ALL">Calls + puts</option><option value="CALL">Calls</option><option value="PUT">Puts</option></select></label>
@@ -124,9 +165,23 @@ export default function OptionsScreenerPage() {
       <label>Min Vol / OI<input type="number" min="0" step="0.5" value={minimumRatio} onChange={event => update({ min_ratio: event.target.value === '0' ? null : event.target.value })} /></label>
       <label>Sort<select value={sort} onChange={event => update({ sort: event.target.value === 'PREMIUM_ACTIVITY' ? null : event.target.value })}><option value="PREMIUM_ACTIVITY">Premium activity</option><option value="VOLUME">Volume</option><option value="OPEN_INTEREST">Open interest</option><option value="VOLUME_OI">Volume / OI</option><option value="OI_CHANGE">Absolute OI change</option><option value="IV">Implied volatility</option></select></label>
     </section>}
-    {query.isLoading && <div className="screener-state"><Database size={18} /><span>Loading detected contracts…</span></div>}
-    {query.isError && <div className="screener-state is-warning"><AlertTriangle size={18} /><span>Options Screener data is unavailable.</span></div>}
-    {!query.isLoading && !query.isError && <>
+    {chainView && <OptionsChainResults catalog={catalog} params={params} setParams={setParams} sessionDate={sessionDate || undefined} />}
+    {packageView && <>
+      <section className="screener-discovery-controls" aria-label="Package filters">
+        <label>Underlying<input aria-label="Package underlying" maxLength={15} placeholder="All tracked" value={params.get('underlyer') || ''} onChange={event => update({ underlyer: event.target.value.toUpperCase() || null })} /></label>
+        <label>Minimum DTE<input aria-label="Package minimum DTE" type="number" min="0" max="365" value={params.get('min_dte') || '0'} onChange={event => update({ min_dte: event.target.value || null })} /></label>
+        <label>Maximum DTE<input aria-label="Package maximum DTE" type="number" min="0" max="365" value={params.get('max_dte') || '60'} onChange={event => update({ max_dte: event.target.value || null })} /></label>
+        <label>Maximum capital ($)<input aria-label="Maximum package capital" type="number" min="0" placeholder="Any" value={params.get('max_capital') || ''} onChange={event => update({ max_capital: event.target.value || null })} /></label>
+        <label>Sort<select aria-label="Package sort" value={params.get('sort') || 'DEFAULT'} onChange={event => update({ sort: event.target.value })}><option value="DEFAULT">Model / ticker / rank</option><option value="CAPITAL_ASC">Capital: lowest first</option><option value="DTE_ASC">DTE: shortest first</option></select></label>
+      </section>
+      <OptionsPackageResults catalog={catalog} params={params} setParams={setParams} sessionDate={sessionDate || undefined} />
+    </>}
+    {invalidCatalogFilter && <div className="screener-state is-warning" role="alert"><AlertTriangle size={18} /><span>Unknown category or model. Reset the filters to continue.</span></div>}
+    {waitingForCatalog && <div className="screener-state" role="status"><Database size={18} /><span>{catalogQuery.isError ? 'Category and model filtering unavailable.' : 'Loading model catalog...'}</span></div>}
+    {detectedView && query.isLoading && <div className="screener-state"><Database size={18} /><span>Loading detected contracts…</span></div>}
+    {detectedView && query.isError && <div className="screener-state is-warning"><AlertTriangle size={18} /><span>Options Screener data is unavailable.</span></div>}
+    {detectedView && !filterError && !query.isLoading && !query.isError && !invalidCatalogFilter && !waitingForCatalog && <>
+      {data?.serving_mode === 'HISTORICAL_PREVIOUS_POLICY' && rows.length > 0 && <div className="screener-state is-warning" role="status"><AlertTriangle size={18} /><span>Historical previous-policy evidence</span></div>}
       <section className="screener-summary"><span><strong>{data?.total || 0}</strong> matched</span><span className="is-call"><strong>{calls}</strong> calls shown</span><span className="is-put"><strong>{puts}</strong> puts shown</span><span><strong>{rows.filter(row => row.board_position != null).length}</strong> published Board rows shown</span></section>
       <section className="screener-table-panel">
         <header><div><ScanSearch size={17} /><div><h2>{preset.label}</h2><p>{preset.key === 'board' ? 'Exact contracts referenced by the latest immutable Board publication.' : 'Latest detected contract per underlying and source matrix in the selected session.'}</p></div></div><span>{rows.length} shown</span></header>

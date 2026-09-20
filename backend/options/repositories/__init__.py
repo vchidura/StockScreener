@@ -22,6 +22,8 @@ from .market_events import (
 from .model_inputs import OptionModelInputRepository
 from .new_series import OptionNewSeriesRepository
 from .outcomes import OptionOutcomeRepository
+from .outcome_availability import OptionOutcomeAvailabilityRepository
+from .package_assessments import OptionPackageAssessmentRepository
 from .retention import OptionRetentionRepository
 from .snapshots import OptionSnapshotRepository
 from .trades import OptionTradeRepository
@@ -50,6 +52,8 @@ __all__ = [
 	"OptionModelInputRepository",
 	"OptionNewSeriesRepository",
 	"OptionOutcomeRepository",
+	"OptionOutcomeAvailabilityRepository",
+	"OptionPackageAssessmentRepository",
 	"OptionRetentionRepository",
 	"OptionSnapshotRepository",
 	"OptionTradeRepository",

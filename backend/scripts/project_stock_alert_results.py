@@ -28,6 +28,7 @@ def main():
     from equity.stock_alert_results import capture_result_source, persist_capture, record_stream_error, load_shared_results
     from research.stock_alert_results import namespace_snapshot
     from research.stock_idea_engine import digest
+    from research.stock_idea_replay import utc
     if args.check_storage:
         import psycopg2
         with get_db_connection() as connection:
@@ -68,15 +69,16 @@ def main():
                 now, reports, captures = datetime.now(timezone.utc), [], []
                 for stream, directory in directories.items():
                     try:
-                        captured = capture_result_source(directory, stream, now)
-                        reports.append(persist_capture(captured, now))
+                        captured = capture_result_source(directory, stream)
+                        reports.append(persist_capture(captured, utc(captured["captured_at"])))
                         captures.append(captured)
                     except Exception as error:
-                        record_stream_error(stream, now, type(error).__name__)
+                        record_stream_error(stream, datetime.now(timezone.utc), type(error).__name__)
                         reports.append(dict(stream=stream, status="IMPORT_FAILED", error=type(error).__name__, detail=str(error) if isinstance(error, ValueError) else None))
                 if args.verify:
                     if len(captures) != len(directories):
                         raise ValueError("not all result streams imported")
+                    now = datetime.now(timezone.utc)
                     before = load_shared_results(now)
                     for capture in captures:
                         persist_capture(capture, now)

@@ -728,9 +728,11 @@ def test_evidence_read_never_uses_current_projection_for_asof_context():
     assert parameters[1:3] == (context.market_time, context.observed_time)
 
 
-def test_context_read_enforces_market_observation_and_validity_bounds():
+@pytest.mark.parametrize("migrated", [False, True])
+def test_context_read_enforces_market_observation_and_validity_bounds(migrated):
     repository, _, cursor = _repository(EquityEvidenceRepository)
     context = _watermark()
+    cursor.fetchone.side_effect = [{"ready": migrated}, None]
 
     assert repository.get_context_as_of(
         "AAPL", "INTRADAY_30M", context, policy_sha256=HASH
@@ -743,6 +745,135 @@ def test_context_read_enforces_market_observation_and_validity_bounds():
     assert parameters[2:5] == (
         context.market_time, context.observed_time, context.market_time
     )
+    assert ("context_kind = 'LEGACY'" in sql) is migrated
+    assert "to_jsonb" not in sql
+    assert "SELECT *" not in sql
+
+def test_behavior_feature_source_read_is_bounded_and_uses_both_asof_clocks():
+    repository, _, cursor = _repository(EquityEvidenceRepository)
+    context = _watermark()
+    cursor.fetchall.return_value = []
+
+    assert repository.read_behavior_feature_sources(["aapl", "AAPL"], context) == ()
+
+    sql, parameters = cursor.execute.call_args_list[2].args
+    assert "PARTITION BY ticker, interval" in sql
+    assert "evidence_type = 'FEATURE_SNAPSHOT'" in sql and "source_name = 'EQUITY_FEATURES'" in sql
+    assert "market_time <= %s" in sql and "observed_at <= %s" in sql and "created_at <= %s" in sql
+    assert parameters == (["AAPL"], ["1d", "1h", "30m"], context.market_time, context.observed_time, context.observed_time)
+    assert cursor.execute.call_count == 3
+
+@pytest.mark.parametrize("tickers,intervals,bound", [([], ("1d",), 10), (["AAPL"], ("5m",), 10), (["AAPL"], ("1d",), 0)])
+def test_behavior_feature_source_read_rejects_unbounded_or_unsupported_scope(tickers, intervals, bound):
+    repository, _, _ = _repository(EquityEvidenceRepository)
+    with pytest.raises(ValueError):
+        repository.read_behavior_feature_sources(tickers, _watermark(), intervals=intervals, maximum_source_bars=bound)
+
+
+def test_behavior_feature_source_window_selects_bounded_latest_revisions():
+    from equity.repositories import _behavior_source_revision_window
+
+    revisions = tuple(uuid4() for _ in range(300))
+    assert _behavior_source_revision_window({"source_revision_ids": revisions}, 273) == revisions[-273:]
+
+
+def test_behavior_feature_source_read_accepts_exact_per_interval_limits():
+    repository, _, cursor = _repository(EquityEvidenceRepository)
+    cursor.fetchall.return_value = []
+    result = repository.read_behavior_feature_sources(
+        ["AAPL"], _watermark(), maximum_source_bars=273,
+        source_bars_by_interval={"1d": 273, "1h": 200, "30m": 200},
+    )
+    assert result == ()
+
+    with pytest.raises(ValueError, match="per-interval"):
+        repository.read_behavior_feature_sources(
+            ["AAPL"], _watermark(), maximum_source_bars=273,
+            source_bars_by_interval={"5m": 200},
+        )
+
+
+def test_behavior_adjusted_daily_read_is_exact_bounded_and_recording_safe():
+    repository, _, cursor = _repository(EquityBarRepository)
+    context = _watermark()
+    cursor.fetchall.return_value = []
+
+    assert repository.read_behavior_adjusted_daily(["aapl", "AAPL"], context) == ()
+
+    sql, parameters = cursor.execute.call_args_list[2].args
+    assert "adjusted = %s" in sql and "availability_mode = 'HISTORICAL_RECONSTRUCTED'" in sql
+    assert "GROUPED_DAILY_EXACT_TICKER_V2" in sql
+    assert "system_observed_at <= %s" in sql and "replay_available_at <= %s" in sql
+    assert "created_at <= %s" in sql and "provider_published_at IS NULL" in sql
+    assert parameters == (
+        ["AAPL"], True, context.market_time, context.observed_time, context.observed_time,
+        context.observed_time, context.observed_time, 273,
+    )
+
+    cursor.reset_mock()
+    cursor.fetchall.return_value = []
+    assert repository.read_behavior_grouped_daily(
+        ["AAPL"], context, adjusted=False, limit_per_ticker=200,
+    ) == ()
+    assert cursor.execute.call_args_list[2].args[1][1] is False
+
+
+@pytest.mark.parametrize("tickers,limit", [([], 273), (["AAPL"], 0), (["AAPL"], 1025)])
+def test_behavior_adjusted_daily_read_rejects_invalid_scope(tickers, limit):
+    repository, _, _ = _repository(EquityBarRepository)
+    with pytest.raises(ValueError):
+        repository.read_behavior_adjusted_daily(tickers, _watermark(), limit_per_ticker=limit)
+
+
+def test_behavior_split_coverage_read_is_bounded_and_observation_safe():
+    repository, _, cursor = _repository(EquityCorporateActionRepository)
+    context = _watermark()
+    cursor.fetchall.return_value = []
+    start = context.market_time.date() - timedelta(days=365)
+    end = context.market_time.date()
+
+    assert repository.read_behavior_split_coverage(
+        ["aapl", "AAPL"], context, window_start=start, window_end=end,
+    ) == ((), {})
+
+    sql, parameters = cursor.execute.call_args_list[2].args
+    assert "action_type = 'SPLIT'" in sql and "response_action_count" not in sql
+    assert "first_observed_at <= %s" in sql and "created_at <= %s" in sql
+    assert parameters == (["AAPL"], end, start, context.observed_time, context.observed_time, 1001)
+    assert cursor.execute.call_count == 3
+
+
+@pytest.mark.parametrize("tickers,start_offset,end_offset,coverage_bound,action_bound", [
+    ([], 0, 1, 10, 10), (["AAPL"], 1, 0, 10, 10),
+    (["AAPL"], 0, 1, 0, 10), (["AAPL"], 0, 1, 10, 0),
+])
+def test_behavior_split_coverage_read_rejects_invalid_scope(tickers, start_offset, end_offset, coverage_bound, action_bound):
+    repository, _, _ = _repository(EquityCorporateActionRepository)
+    today = _watermark().market_time.date()
+    with pytest.raises(ValueError):
+        repository.read_behavior_split_coverage(
+            tickers, _watermark(), window_start=today + timedelta(days=start_offset),
+            window_end=today + timedelta(days=end_offset),
+            maximum_coverage_rows=coverage_bound, maximum_action_rows=action_bound,
+        )
+
+
+def test_legacy_context_mapper_ignores_new_columns_and_writer_keeps_old_insert():
+    from equity.repositories import _context_from_row, LEGACY_CONTEXT_COLUMNS
+
+    original = _context()
+    row = dict(original.__dict__) if hasattr(original, "__dict__") else {field: getattr(original, field) for field in original.__dataclass_fields__}
+    row["status"] = original.status.value
+    for key in ("risk_levels", "conflict_state", "stale_components", "summary"):
+        import json
+        row[key] = json.loads(row.pop(key + "_json"))
+    assert _context_from_row({**row, "context_kind": "LEGACY", "behavior_payload": None}) == original
+    assert len(LEGACY_CONTEXT_COLUMNS) == 40
+    repository, _, cursor = _repository(EquityEvidenceRepository)
+    repository.persist_context(original, ())
+    sql, values = cursor.execute.call_args.args
+    assert "behavior_" not in sql and "context_kind" not in sql
+    assert len(values) == 39
 
 
 def test_robust_qualification_lookup_is_effective_at_observation_time():

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import json
 
 from options.config import ValuationPolicy
 from options.domain import ContractType, DataQualityFlag, MarkSource
@@ -12,6 +13,8 @@ from options.domain import ContractType, DataQualityFlag, MarkSource
 class UnderlyingMinuteBar:
     close: Decimal
     market_data_time: datetime
+    bar_start: datetime | None = None
+    raw_payload_text: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.close) is not Decimal or not self.close.is_finite() or self.close <= 0:
@@ -21,6 +24,18 @@ class UnderlyingMinuteBar:
             "market_data_time",
             _as_utc(self.market_data_time, "market_data_time"),
         )
+        if (self.bar_start is None) != (self.raw_payload_text is None):
+            raise ValueError("raw minute bar requires both timestamp and complete provider payload")
+        if self.raw_payload_text is not None:
+            start = _as_utc(self.bar_start, "bar_start")
+            payload = json.loads(self.raw_payload_text)
+            prices = {key: Decimal(str(payload[key])) for key in ("o", "h", "l", "c", "v")}
+            if (self.market_data_time != start + timedelta(minutes=1)
+                    or any(not price.is_finite() for price in prices.values())
+                    or prices["v"] < 0 or prices["l"] <= 0
+                    or not prices["l"] <= min(prices["o"], prices["c"]) <= max(prices["o"], prices["c"]) <= prices["h"]
+                    or prices["c"] != self.close):
+                raise ValueError("invalid raw minute OHLCV or close timestamp")
 
 
 @dataclass(frozen=True, slots=True)

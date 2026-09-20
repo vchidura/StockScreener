@@ -14,8 +14,10 @@ from scripts.run_equity_worker import (
     ingest_due_interval,
     latest_completed_slot,
     latest_due_slot,
+    load_retained_reference,
     mature_prospective_scanner_outcomes,
     parser,
+    refresh_behavior_adjusted_daily,
     repair_recent_sessions,
     repair_session_bounds,
 )
@@ -116,6 +118,8 @@ def test_latest_due_slot_rejects_negative_provider_delay():
 def test_worker_once_flag_is_opt_in():
     assert parser().parse_args([]).once is False
     assert parser().parse_args(["--once"]).once is True
+    assert parser().parse_args([]).behavior_shadow is False
+    assert parser().parse_args(["--behavior-shadow"]).behavior_shadow is True
     assert parser().parse_args(["--repair-sessions", "3"]).repair_sessions == 3
     assert HEARTBEAT_SECONDS > 0
 
@@ -250,6 +254,51 @@ def test_worker_skips_scanner_outcomes_for_non_scanner_interval():
     ) == ()
 
 
+def test_behavior_adjusted_refresh_uses_latest_completed_daily_session():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    service = MagicMock()
+    service.behavior_shadow_enabled = True
+    reference = SimpleNamespace(revisions=("AAPL",))
+    observed_at = datetime(2026, 9, 18, 14, 0, tzinfo=UTC)
+
+    refresh_behavior_adjusted_daily(
+        service, reference, observed_at=observed_at,
+    )
+
+    call = service.refresh_behavior_adjusted_daily.call_args
+    assert call.args == (("AAPL",),)
+    assert call.kwargs["session_date"] == datetime(2026, 9, 17).date()
+    assert call.kwargs["observed_at"] >= observed_at
+
+    service.reset_mock()
+    results = refresh_behavior_adjusted_daily(
+        service, reference, observed_at=observed_at, session_count=10,
+    )
+    assert len(results) == service.refresh_behavior_adjusted_daily.call_count == 10
+    dates = [call.kwargs["session_date"] for call in service.refresh_behavior_adjusted_daily.call_args_list]
+    assert dates[0] == datetime(2026, 9, 3).date()
+    assert dates[-1] == datetime(2026, 9, 17).date()
+
+
+def test_behavior_bootstrap_reference_read_never_calls_provider(monkeypatch):
+    import scripts.run_equity_worker as worker
+
+    class ReferenceRepository:
+        def list_securities_as_of(self, tickers, watermark):
+            return ()
+
+    class UniverseRepository:
+        def get_latest_as_of(self, watermark):
+            return None
+
+    monkeypatch.setattr(worker, "EquityReferenceRepository", ReferenceRepository)
+    monkeypatch.setattr(worker, "EquityUniverseRepository", UniverseRepository)
+
+    assert load_retained_reference(("AAPL",), datetime(2026, 9, 18, tzinfo=UTC)) is None
+
+
 class _StopWorkerLoop(Exception):
     pass
 
@@ -278,7 +327,7 @@ def _stub_worker_dependencies(monkeypatch, intervals):
     monkeypatch.setattr(worker, "PolygonEquityClient", lambda: object())
     monkeypatch.setattr(
         worker, "EquityMaterializationService",
-        lambda client, native_fetch_workers=None: object(),
+        lambda client, **kwargs: object(),
     )
     monkeypatch.setattr(
         worker, "load_or_refresh_reference",
@@ -324,6 +373,33 @@ def test_daily_context_precedes_analysis_publication(monkeypatch, context_status
     )
     assert finished is (context_status == "PUBLISHED")
     assert service.materialize_interval.call_count == (1 if finished else 0)
+
+
+def test_behavior_adjusted_refresh_failure_never_blocks_legacy_analysis(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import scripts.run_equity_worker as worker
+
+    service = MagicMock()
+    service.behavior_shadow_enabled = True
+    service.publish_canonical_interval.return_value = SimpleNamespace(
+        status="COMPLETE", selected=1, missing=0,
+    )
+    service.refresh_behavior_adjusted_daily.side_effect = RuntimeError("adjusted unavailable")
+    service.materialize_interval.return_value = SimpleNamespace(status="COMPLETE")
+    monkeypatch.setattr(worker, "ingest_due_interval", lambda *args, **kwargs: SimpleNamespace(
+        bar_count=1, inserted_count=1, missing_tickers=(),
+    ))
+    monkeypatch.setattr(worker, "mature_prospective_scanner_outcomes", lambda *args, **kwargs: ())
+    slot = datetime(2026, 9, 18, 14, 0, tzinfo=UTC)
+
+    finished = worker.materialize_due_interval(
+        service, SimpleNamespace(revisions=(object(),), universe_run_id="universe"),
+        interval="30m", slot=slot, observed_at=slot, once=True,
+    )
+
+    assert finished is True
+    service.materialize_interval.assert_called_once()
 
 
 def test_worker_recovers_missing_daily_context_even_when_analysis_is_current(monkeypatch):

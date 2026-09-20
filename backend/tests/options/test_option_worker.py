@@ -1,4 +1,5 @@
 import sys
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,6 +55,38 @@ def test_option_worker_processes_each_delayed_slot_once():
     ]
 
 
+def test_option_worker_logs_stock_behavior_shadow_stop(caplog):
+    class ShadowPipeline(FakePipeline):
+        def run_once(self, underlyers=None, *, as_of, cycle_time, progress_callback=None):
+            return SimpleNamespace(results=(SimpleNamespace(
+                status="COMPLETE",
+                reasons=("STOCK_BEHAVIOR_SHADOW_UNAVAILABLE_RATE_STOP",),
+            ),))
+
+    worker = OptionMaterializationWorker(ShadowPipeline(), calendar=FakeCalendar())
+
+    with caplog.at_level(logging.INFO, logger="option-worker"):
+        worker.poll_once()
+
+    assert "stock_behavior_shadow=UNAVAILABLE_RATE_STOP:1" in caplog.text
+
+
+def test_option_worker_logs_package_assessment_state(caplog):
+    class PackagePipeline(FakePipeline):
+        def run_once(self, underlyers=None, *, as_of, cycle_time, progress_callback=None):
+            return SimpleNamespace(results=(SimpleNamespace(
+                status="COMPLETE",
+                reasons=("OPTION_PACKAGE_ASSESSMENT_COMPLETE",),
+            ),))
+
+    worker = OptionMaterializationWorker(PackagePipeline(), calendar=FakeCalendar())
+
+    with caplog.at_level(logging.INFO, logger="option-worker"):
+        worker.poll_once()
+
+    assert "package_assessments=COMPLETE:1" in caplog.text
+
+
 def test_option_worker_maintains_partitions_once_per_utc_month():
     maintained = []
     current = [datetime(2026, 8, 31, 14, 16, tzinfo=UTC)]
@@ -94,6 +127,60 @@ def test_option_worker_matures_outcomes_after_materialization():
 
     assert worker.poll_once() is not None
     assert calls == [now]
+
+
+def test_option_worker_runs_continuous_validation_after_materialization():
+    calls = []
+    now = datetime(2026, 8, 31, 14, 16, tzinfo=UTC)
+    worker = OptionMaterializationWorker(
+        FakePipeline(), calendar=FakeCalendar(), clock=lambda: now,
+        validation_callback=lambda available_at: calls.append(available_at) or {
+            "state": "RUNNING"
+        },
+    )
+
+    assert worker.poll_once() is not None
+    assert calls == [now]
+
+
+def test_outcomes_and_validation_use_post_work_clocks():
+    start = datetime(2026, 8, 31, 14, 16, tzinfo=UTC)
+    now = [start]
+    assessed = []
+    validated = []
+
+    class SlowPipeline(FakePipeline):
+        def run_once(self, *args, **kwargs):
+            now[0] += timedelta(minutes=2)
+            return super().run_once(*args, **kwargs)
+
+    class SlowOutcomes:
+        def mature(self, *, available_by):
+            assessed.append(available_by)
+            now[0] += timedelta(minutes=1)
+            return SimpleNamespace(candidates=0, due_measurements=0, available_measurements=0, persisted=0, pending=0)
+
+    worker = OptionMaterializationWorker(
+        SlowPipeline(), calendar=FakeCalendar(), clock=lambda: now[0],
+        outcome_service=SlowOutcomes(), validation_callback=validated.append,
+    )
+    worker.poll_once()
+    assert assessed == [start + timedelta(minutes=2)]
+    assert validated == [start + timedelta(minutes=3)]
+
+
+def test_option_worker_contains_continuous_validation_failure(caplog):
+    worker = OptionMaterializationWorker(
+        FakePipeline(), calendar=FakeCalendar(),
+        validation_callback=lambda _available_at: (_ for _ in ()).throw(
+            RuntimeError("validation failed")
+        ),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="option-worker"):
+        assert worker.poll_once() is not None
+
+    assert "materialization remains complete" in caplog.text
 
 
 def test_option_worker_passes_configured_slot_policy_to_calendar():
@@ -202,7 +289,7 @@ def test_option_worker_passes_controlled_underlying_subset():
     assert observed == [("SPY",)]
 
 
-def test_option_worker_prioritizes_durable_same_session_retry():
+def test_option_worker_does_not_replay_superseded_durable_retry():
     class LatestCalendar(FakeCalendar):
         def latest_delayed_slot(self, now, **kwargs):
             return datetime(2026, 8, 31, 14, 15, tzinfo=UTC)
@@ -215,9 +302,83 @@ def test_option_worker_prioritizes_durable_same_session_retry():
     )
 
     assert worker.poll_once() is not None
-    pipeline.due_retry_slot = None
-    assert worker.poll_once() is not None
+    assert worker.poll_once() is None
+    assert pipeline.due_retry_slot == datetime(2026, 8, 31, 14, 0, tzinfo=UTC)
     assert [cycle_time for _, cycle_time in pipeline.calls] == [
-        datetime(2026, 8, 31, 14, 0, tzinfo=UTC),
         datetime(2026, 8, 31, 14, 15, tzinfo=UTC),
     ]
+
+
+def test_option_worker_advances_after_persistent_failure_without_replaying_gaps():
+    from options.calendar import OptionExchangeCalendar
+
+    class PersistentFailurePipeline(FakePipeline):
+        def run_once(self, underlyers=None, *, as_of, cycle_time, progress_callback=None):
+            self.calls.append((as_of, cycle_time))
+            return SimpleNamespace(results=(SimpleNamespace(status="FAILED", retryable=True),))
+
+    current = [datetime(2026, 9, 17, 14, 16, tzinfo=UTC)]
+    pipeline = PersistentFailurePipeline()
+    worker = OptionMaterializationWorker(pipeline, calendar=OptionExchangeCalendar(), clock=lambda: current[0])
+    for hour in (14, 15, 16, 19, 20):
+        current[0] = datetime(2026, 9, 17, hour, 16, tzinfo=UTC)
+        assert worker.poll_once() is not None
+    assert pipeline.due_retry_slot is None
+    assert [slot for _, slot in pipeline.calls] == [
+        datetime(2026, 9, 17, hour, 0, tzinfo=UTC) for hour in (14, 15, 16, 19, 20)
+    ]
+    assert worker.calendar.latest_delayed_slot(current[0]) == datetime(2026, 9, 17, 20, 0, tzinfo=UTC)
+
+
+def test_option_worker_new_slot_bypasses_old_retry_cooldown():
+    from options.calendar import OptionExchangeCalendar
+
+    class FailurePipeline(FakePipeline):
+        def run_once(self, underlyers=None, *, as_of, cycle_time, progress_callback=None):
+            self.calls.append((as_of, cycle_time))
+            return SimpleNamespace(results=(SimpleNamespace(status="FAILED", retryable=True),))
+
+    current = [datetime(2026, 9, 17, 14, 29, 31, tzinfo=UTC)]
+    pipeline = FailurePipeline()
+    worker = OptionMaterializationWorker(pipeline, calendar=OptionExchangeCalendar(), clock=lambda: current[0])
+    worker.poll_once()
+    current[0] = datetime(2026, 9, 17, 14, 30, 30, tzinfo=UTC)
+    worker.poll_once()
+    assert [slot for _, slot in pipeline.calls] == [
+        datetime(2026, 9, 17, 14, 0, tzinfo=UTC),
+        datetime(2026, 9, 17, 14, 15, tzinfo=UTC),
+    ]
+
+
+def test_option_worker_outcome_failure_does_not_repeat_completed_ingestion():
+    import pytest
+
+    class FailingOutcomes:
+        def mature(self, *, available_by):
+            raise RuntimeError("outcome failure")
+
+    pipeline = FakePipeline()
+    worker = OptionMaterializationWorker(pipeline, calendar=FakeCalendar(), outcome_service=FailingOutcomes())
+    with pytest.raises(RuntimeError, match="outcome failure"):
+        worker.poll_once()
+    assert worker.poll_once() is None
+    assert len(pipeline.calls) == 1
+
+
+def test_option_worker_logs_redact_messages_arguments_and_tracebacks():
+    import logging
+    from scripts.run_option_worker import RedactingFormatter
+
+    formatter = RedactingFormatter("%(message)s", ("configured-secret",))
+    try:
+        raise ValueError("configured-secret apiKey=other-secret")
+    except ValueError:
+        record = logging.LogRecord(
+            "option-worker", logging.ERROR, __file__, 1,
+            "worker failed %s", ("configured-secret",), sys.exc_info(),
+        )
+    text = formatter.format(record)
+    assert "configured-secret" not in text
+    assert "other-secret" not in text
+    assert "Traceback" in text
+    assert "[REDACTED]" in text

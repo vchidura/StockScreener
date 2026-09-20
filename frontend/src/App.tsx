@@ -17,9 +17,10 @@ const PatternWatch = lazy(() => import('./pages/PatternWatch'))
 const TickerWorkspace = lazy(() => import('./pages/ticker/TickerWorkspace'))
 const OptionsActivityPage = lazy(() => import('./pages/OptionsActivityPage'))
 const OptionsFlowPage = lazy(() => import('./pages/OptionsFlowPage'))
-const OptionsScreenerPage = lazy(() => import('./pages/OptionsScreenerPage'))
+const OptionsScreenerPage = lazy(() => import('./pages/OptionsScreeningWorkspace'))
 const StockScreenerPage = lazy(() => import('./pages/StockScreeningPage'))
 const StockAlertsPage = lazy(() => import('./pages/StockAlertsPage'))
+const OptionsAlertsPage = lazy(() => import('./pages/OptionsAlertsPage'))
 const OptionsResearchWorkspace = lazy(() => import('./pages/OptionsResearchWorkspace'))
 const Account = lazy(() => import('./pages/auth/Account'))
 const SignIn = lazy(() => import('./pages/auth/SignIn'))
@@ -53,6 +54,7 @@ function PortalRoutes() {
         <Route path="/options/activity" element={<OptionsActivityPage />} />
         <Route path="/options/flow" element={<OptionsFlowPage />} />
         <Route path="/options/screener" element={<OptionsScreenerPage />} />
+        <Route path="/options/alerts" element={<OptionsAlertsPage />} />
         <Route path="/stocks/screener" element={<StockScreenerPage />} />
         <Route path="/stocks/alerts" element={<StockAlertsPage />} />
         <Route path="/options/*" element={<OptionsResearchWorkspace />} />

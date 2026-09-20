@@ -19,6 +19,7 @@ from research.gics_sectors import (
 )
 
 from .context import build_equity_context
+from .behavior_producer import BehaviorProductionResult, produce_stock_behavior_snapshots
 from .derivation import DERIVATION_SOURCES, derive_canonical_bars
 from .domain import (
     BarAvailabilityMode,
@@ -46,6 +47,7 @@ from .materialization import (
 from .polygon import (
     PolygonEquityClient,
     canonical_json,
+    normalize_grouped_daily_bars,
     normalize_fundamental_reports,
     normalize_native_bars,
     normalize_security_reference,
@@ -56,6 +58,7 @@ from .qualification import qualify_outcomes
 from .repositories import (
     EquityAnalysisRepository,
     EquityBarRepository,
+    EquityCorporateActionRepository,
     EquityEvidenceRepository,
     EquityIngestionRepository,
     EquityOutcomeRepository,
@@ -115,6 +118,17 @@ class FundamentalRefreshResult:
     reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class AdjustedDailyRefreshResult:
+    session_date: date
+    status: str
+    requested: int
+    available: int
+    inserted: int
+    missing_tickers: tuple[str, ...]
+    ingestion_segment_id: UUID | None = None
+
+
 class IngestionCoverageError(RuntimeError):
     pass
 
@@ -141,6 +155,7 @@ class AnalysisRunResult:
     evidence_count: int
     inserted_evidence_count: int
     context_count: int
+    behavior_shadow: BehaviorProductionResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +196,9 @@ class EquityMaterializationService:
         analysis_repository: EquityAnalysisRepository | None = None,
         evidence_repository: EquityEvidenceRepository | None = None,
         outcome_repository: EquityOutcomeRepository | None = None,
+        corporate_action_repository: EquityCorporateActionRepository | None = None,
+        behavior_shadow_enabled: bool = False,
+        behavior_shadow_tickers: Sequence[str] = (),
         native_fetch_workers: int = 1,
         outcome_path_cache_size: int = 0,
         outcome_path_prefetch_limit: int | None = None,
@@ -192,6 +210,13 @@ class EquityMaterializationService:
         if outcome_path_prefetch_limit is not None \
                 and outcome_path_prefetch_limit <= 0:
             raise ValueError("outcome_path_prefetch_limit must be positive")
+        normalized_behavior_tickers = tuple(dict.fromkeys(
+            ticker.strip().upper() for ticker in behavior_shadow_tickers
+        ))
+        if any(not ticker for ticker in normalized_behavior_tickers) or len(normalized_behavior_tickers) > 100:
+            raise ValueError("behavior shadow requires 1-100 valid distinct tickers")
+        if behavior_shadow_enabled and not normalized_behavior_tickers:
+            raise ValueError("enabled behavior shadow requires an explicit ticker scope")
         self.client = client
         self.native_fetch_workers = native_fetch_workers
         self.outcome_path_cache_size = outcome_path_cache_size
@@ -204,6 +229,69 @@ class EquityMaterializationService:
         self.analysis_repository = analysis_repository or EquityAnalysisRepository()
         self.evidence_repository = evidence_repository or EquityEvidenceRepository()
         self.outcome_repository = outcome_repository or EquityOutcomeRepository()
+        self.corporate_action_repository = (
+            corporate_action_repository or EquityCorporateActionRepository()
+        )
+        self.behavior_shadow_enabled = behavior_shadow_enabled
+        self.behavior_shadow_tickers = normalized_behavior_tickers
+
+    def _produce_behavior_shadow(
+        self,
+        securities: Sequence[SecurityReferenceRevision],
+        *,
+        interval: str,
+        watermark: DecisionWatermark,
+        run_purpose: str,
+        run_status: str,
+    ) -> BehaviorProductionResult | None:
+        if (
+            not self.behavior_shadow_enabled
+            or run_purpose != "ORIGINAL"
+            or interval not in {"30m", "1h", "1d"}
+            or run_status not in {"COMPLETE", "DEGRADED"}
+        ):
+            return None
+        scoped = tuple(
+            security for security in securities
+            if security.ticker in self.behavior_shadow_tickers
+        )
+        scoped_tickers = {security.ticker for security in scoped}
+        missing = tuple(
+            ticker for ticker in self.behavior_shadow_tickers
+            if ticker not in scoped_tickers
+        )
+        observed_at = datetime.now(timezone.utc)
+        if not scoped:
+            return BehaviorProductionResult(
+                market_time=watermark.market_time, received_at=observed_at,
+                attempted=len(self.behavior_shadow_tickers), inserted=0, existing=0,
+                skipped=tuple(
+                    (ticker, ("SECURITY_REFERENCE_MISSING",)) for ticker in missing
+                ),
+                failed=(),
+            )
+        try:
+            result = produce_stock_behavior_snapshots(
+                scoped,
+                watermark=DecisionWatermark(watermark.market_time, observed_at),
+                evidence_repository=self.evidence_repository,
+                bar_repository=self.bar_repository,
+                corporate_action_repository=self.corporate_action_repository,
+            )
+            return replace(
+                result,
+                attempted=len(self.behavior_shadow_tickers),
+                skipped=(
+                    *result.skipped,
+                    *((ticker, ("SECURITY_REFERENCE_MISSING",)) for ticker in missing),
+                ),
+            )
+        except Exception as exc:
+            return BehaviorProductionResult(
+                market_time=watermark.market_time, received_at=observed_at,
+                attempted=len(scoped), inserted=0, existing=0, skipped=(),
+                failed=(("*", type(exc).__name__),),
+            )
 
     def refresh_reference(
         self,
@@ -484,6 +572,120 @@ class EquityMaterializationService:
             persist_seconds=persist_seconds,
             elapsed_seconds=elapsed_seconds,
         )
+
+    def refresh_behavior_adjusted_daily(
+        self,
+        securities: Sequence[SecurityReferenceRevision],
+        *,
+        session_date: date,
+        observed_at: datetime,
+    ) -> AdjustedDailyRefreshResult:
+        observed_utc = _utc(observed_at)
+        selected = tuple(
+            security for security in securities
+            if security.ticker in self.behavior_shadow_tickers
+        )
+        if not self.behavior_shadow_enabled or not selected:
+            raise ValueError("adjusted behavior refresh requires an enabled non-empty scope")
+        current_ids = {security.ticker: security.security_id for security in selected}
+        identity_bars = self.bar_repository.daily_session_bars(
+            tuple(current_ids), session_date, observed_by=observed_utc,
+            adjusted=False,
+        )
+        missing_identity = tuple(
+            ticker for ticker in current_ids if ticker not in identity_bars
+        )
+        if missing_identity:
+            return AdjustedDailyRefreshResult(
+                session_date=session_date, status="IDENTITY_UNAVAILABLE",
+                requested=len(selected), available=0, inserted=0,
+                missing_tickers=missing_identity,
+            )
+        expected_ids = {
+            ticker: identity_bars[ticker].security_id for ticker in current_ids
+        }
+        mismatched_current = tuple(
+            ticker for ticker in current_ids
+            if current_ids[ticker] != expected_ids[ticker]
+        )
+        if mismatched_current:
+            raise ValueError(
+                "current and session security identities differ: "
+                + ",".join(mismatched_current)
+            )
+        existing = self.bar_repository.daily_session_bars(
+            tuple(expected_ids), session_date, observed_by=observed_utc,
+            adjusted=True,
+        )
+        mismatched = tuple(
+            ticker for ticker, bar in existing.items()
+            if bar.security_id != expected_ids[ticker]
+        )
+        if mismatched:
+            raise ValueError("adjusted daily identity repair required: " + ",".join(mismatched))
+        missing_before = tuple(ticker for ticker in expected_ids if ticker not in existing)
+        if not missing_before:
+            return AdjustedDailyRefreshResult(
+                session_date=session_date, status="ALREADY_PRESENT",
+                requested=len(selected), available=len(existing), inserted=0,
+                missing_tickers=(),
+            )
+        segment_id = uuid5(
+            NAMESPACE_URL,
+            "equity-behavior-adjusted-daily:" + sha256_json({
+                "session_date": session_date.isoformat(),
+                "observed_at": observed_utc.isoformat(),
+                "security_ids": {
+                    ticker: str(expected_ids[ticker]) for ticker in sorted(expected_ids)
+                },
+            }),
+        )
+        self.ingestion_repository.start_segment(
+            ingestion_segment_id=segment_id, provider="polygon",
+            provider_mode="REST", dataset="EQUITY_BEHAVIOR_ADJUSTED_DAILY",
+            interval="1d",
+            requested_from=datetime.combine(session_date, time.min, tzinfo=timezone.utc),
+            requested_to=datetime.combine(session_date, time.max, tzinfo=timezone.utc),
+            observed_at=observed_utc,
+        )
+        try:
+            rows = self.client.fetch_grouped_daily(session_date, adjusted=True)
+            bars = normalize_grouped_daily_bars(
+                rows, session_date=session_date, security_ids=expected_ids,
+                observed_at=observed_utc, ingestion_segment_id=segment_id,
+                availability_mode=BarAvailabilityMode.HISTORICAL_RECONSTRUCTED,
+                adjusted=True,
+            )
+            if any(bar.bar_end > observed_utc for bar in bars):
+                raise ValueError("adjusted daily refresh requires a completed session")
+            selected_bars = tuple(bar for bar in bars if bar.ticker in missing_before)
+            inserted = self.bar_repository.persist(selected_bars)
+            available = set(existing) | {bar.ticker for bar in selected_bars}
+            missing_after = tuple(ticker for ticker in expected_ids if ticker not in available)
+            status = "COMPLETE" if not missing_after else "DEGRADED"
+            self.ingestion_repository.complete_segment(
+                segment_id, status=status,
+                market_watermark=max((bar.bar_end for bar in selected_bars), default=None),
+                record_count=len(selected_bars),
+                checksum_sha256=sha256_json(sorted(
+                    (bar.ticker, str(bar.bar_revision_id), bar.payload_sha256)
+                    for bar in selected_bars
+                )),
+                gap_details={"missing_tickers": list(missing_after)},
+                completed_at=datetime.now(timezone.utc),
+            )
+            return AdjustedDailyRefreshResult(
+                session_date=session_date, status=status, requested=len(selected),
+                available=len(available), inserted=inserted,
+                missing_tickers=missing_after, ingestion_segment_id=segment_id,
+            )
+        except Exception as exc:
+            self.ingestion_repository.complete_segment(
+                segment_id, status="FAILED", market_watermark=None,
+                record_count=0, gap_details={"failure_type": type(exc).__name__},
+                completed_at=datetime.now(timezone.utc),
+            )
+            raise
 
     def reconcile_stream_interval(
         self,
@@ -1093,6 +1295,10 @@ class EquityMaterializationService:
             )
             restarted = bool(restart and restart(run_id))
             if not restarted:
+                behavior_shadow = self._produce_behavior_shadow(
+                    securities, interval=interval, watermark=watermark,
+                    run_purpose=run_purpose, run_status=run_record["status"],
+                )
                 return AnalysisRunResult(
                     analysis_run_id=run_record["analysis_run_id"],
                     interval=interval,
@@ -1103,6 +1309,7 @@ class EquityMaterializationService:
                     evidence_count=0,
                     inserted_evidence_count=0,
                     context_count=0,
+                    behavior_shadow=behavior_shadow,
                 )
         run_watermark = DecisionWatermark(
             watermark.market_time,
@@ -1250,6 +1457,10 @@ class EquityMaterializationService:
             output_sha256=output_sha256,
             projections=pending_projections if run_purpose == "ORIGINAL" else (),
         )
+        behavior_shadow = self._produce_behavior_shadow(
+            securities, interval=interval, watermark=watermark,
+            run_purpose=run_purpose, run_status=run["status"],
+        )
         return AnalysisRunResult(
             analysis_run_id=run_id,
             interval=interval,
@@ -1260,6 +1471,7 @@ class EquityMaterializationService:
             evidence_count=evidence_count,
             inserted_evidence_count=inserted_evidence_count,
             context_count=context_count,
+            behavior_shadow=behavior_shadow,
         )
 
     def evaluate_directional_outcomes(

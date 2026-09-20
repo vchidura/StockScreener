@@ -22,7 +22,7 @@ from options.domain import (
     OptionContractCatalogEntry,
     OptionTradeCursor,
 )
-from options.errors import OptionProviderError, ProviderErrorCategory
+from options.errors import InvalidBatchTransition, OptionProviderError, ProviderErrorCategory
 from options.data.polygon_developer import PolygonDeveloperEngine
 from options.data.polygon_http import PolygonHttpResponse
 from options.data.polygon_http import PolygonRateLimitGate
@@ -215,6 +215,27 @@ def test_transport_exhaustion_fails_batch_without_fabricating_raw_page():
     assert repository.failed[0][1] is BatchStatus.FAILED
 
 
+@pytest.mark.parametrize("status", [BatchStatus.FAILED, BatchStatus.QUARANTINED])
+def test_terminal_chain_batch_is_preserved_without_another_provider_request(monkeypatch, status):
+    engine, repository, transport, _ = _engine([requests.Timeout("contains-secret")])
+    with pytest.raises(OptionProviderError):
+        engine.get_option_chain("SPY", NOW, date(2026, 9, 30), Decimal("500"), Decimal("700"))
+    retained = replace(repository.batch, status=status, completed_at=NOW, failure_reason="original failure")
+    monkeypatch.setattr(repository, "begin_batch", lambda *args: retained.batch_id)
+    monkeypatch.setattr(repository, "load_batch", lambda batch_id: retained)
+    previous_requests = list(transport.requests)
+    previous_failures = list(repository.failed)
+
+    with pytest.raises(InvalidBatchTransition, match="preserve terminal evidence"):
+        engine.get_option_chain("SPY", NOW, date(2026, 9, 30), Decimal("500"), Decimal("700"))
+
+    assert transport.requests == previous_requests
+    assert repository.failed == previous_failures
+    assert repository.completed == []
+    assert repository.pages == []
+    assert retained.failure_reason == "original failure"
+
+
 def test_spot_uses_latest_source_bar_at_or_before_requested_time():
     bar_time = int(NOW.timestamp() * 1000)
     engine, _, _, _ = _engine(
@@ -249,6 +270,23 @@ def test_underlying_minute_bars_are_bounded_sorted_and_deduplicated():
 
     assert [bar.market_data_time for bar in bars] == [earlier, NOW]
     assert bars[-1].close == Decimal("102")
+
+
+def test_forward_raw_minutes_preserve_ohlcv_and_use_closed_bar_timestamp():
+    import json
+    from datetime import timedelta
+    from options.config import load_valuation_policy
+
+    start = NOW - timedelta(minutes=2)
+    payload = dict(t=int(start.timestamp() * 1000), o=100, h=103, l=99, c=102, v=1500)
+    engine, _, _, _ = _engine([_response({"results": [payload]})])
+    bars = engine.get_underlying_minute_bars("SPY", start, NOW, raw_finalized=True)
+    assert len(bars) == 1 and bars[0].market_data_time == start + timedelta(minutes=1)
+    assert json.loads(bars[0].raw_payload_text) == payload
+    legacy = load_valuation_policy(BACKEND_DIR / "options/policies/valuation_v1.json")
+    raw = load_valuation_policy(BACKEND_DIR / "options/policies/valuation_raw_spot_v2.json")
+    assert legacy.policy_sha256 == "86a5db37ebebe377cdec62647a0fc3205859a1fa4e8d40a43d834f5f5828c7cd"
+    assert raw.policy_sha256 != legacy.policy_sha256
 
 
 def test_reference_preserves_adjustment_metadata_for_catalog_rejection():

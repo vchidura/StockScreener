@@ -29,6 +29,7 @@ from equity.domain import (
     QualityState,
     SecurityReferenceRevision,
 )
+from equity.behavior_producer import BehaviorProductionResult
 from equity.materialization import MaterializationResult
 from equity.outcomes import default_directional_policy
 from equity.orchestration import (
@@ -71,6 +72,9 @@ def security(ticker):
 
 
 class FakeClient:
+    def __init__(self):
+        self.grouped_calls = []
+
     def fetch_float(self, tickers):
         return tuple(
             {"ticker": ticker, "free_float": 900_000, "free_float_percent": 90.0}
@@ -84,6 +88,12 @@ class FakeClient:
         return ({
             "t": int(datetime(2026, 8, 28, 13, 30, tzinfo=UTC).timestamp() * 1000),
             "o": 100, "h": 102, "l": 99, "c": 101, "v": 1000,
+        },)
+
+    def fetch_grouped_daily(self, session_date, *, adjusted):
+        self.grouped_calls.append((session_date, adjusted))
+        return ({
+            "T": "AAPL", "o": 100, "h": 102, "l": 99, "c": 101, "v": 1000,
         },)
 
 
@@ -154,6 +164,7 @@ class FakeBarRepository:
         self.publication = None
         self.bulk_bars = {}
         self.bulk_read_calls = []
+        self.daily_identity_bars = {}
 
     def persist(self, rows):
         batch = tuple(rows)
@@ -175,6 +186,18 @@ class FakeBarRepository:
             )
             for index in range(50)
         )
+
+    def daily_session_bars(self, tickers, session_date, *, observed_by, adjusted=False):
+        if not adjusted:
+            return {
+                ticker: bar for ticker, bar in self.daily_identity_bars.items()
+                if ticker in tickers
+            }
+        return {
+            bar.ticker: bar for bar in self.persisted
+            if bar.session_date == session_date and bar.adjusted == adjusted
+            and bar.ticker in tickers
+        }
 
     def list_final_after(
         self, ticker, interval, *, after, available_by, limit,
@@ -370,6 +393,51 @@ def test_native_ingestion_terminal_fails_segment_on_provider_error():
     assert completion["status"] == "FAILED"
     assert completion["record_count"] == 0
     assert completion["gap_details"] == {"failure_type": "RuntimeError"}
+
+
+def test_behavior_adjusted_daily_refresh_is_bounded_and_idempotent():
+    client = FakeClient()
+    item = security("AAPL")
+    pipeline, dependencies = service(
+        client=client, behavior_shadow_enabled=True,
+        behavior_shadow_tickers=("AAPL",),
+    )
+    dependencies["bar_repository"].daily_identity_bars["AAPL"] = SimpleNamespace(
+        security_id=item.security_id,
+    )
+    observed_at = datetime(2026, 8, 28, 21, 0, tzinfo=UTC)
+
+    first = pipeline.refresh_behavior_adjusted_daily(
+        (item,), session_date=date(2026, 8, 28), observed_at=observed_at,
+    )
+    repeated = pipeline.refresh_behavior_adjusted_daily(
+        (item,), session_date=date(2026, 8, 28), observed_at=observed_at,
+    )
+
+    assert first.status == "COMPLETE" and first.inserted == 1
+    assert repeated.status == "ALREADY_PRESENT" and repeated.inserted == 0
+    assert client.grouped_calls == [(date(2026, 8, 28), True)]
+    bar = dependencies["bar_repository"].persisted[0]
+    assert bar.adjusted is True
+    assert bar.quality_codes == ("GROUPED_DAILY_EXACT_TICKER_V2",)
+    assert dependencies["ingestion_repository"].completed[1]["status"] == "COMPLETE"
+
+
+def test_behavior_adjusted_daily_refresh_never_fetches_without_session_identity():
+    client = FakeClient()
+    pipeline, _ = service(
+        client=client, behavior_shadow_enabled=True,
+        behavior_shadow_tickers=("AAPL",),
+    )
+
+    result = pipeline.refresh_behavior_adjusted_daily(
+        (security("AAPL"),), session_date=date(2026, 8, 28),
+        observed_at=datetime(2026, 8, 28, 21, tzinfo=UTC),
+    )
+
+    assert result.status == "IDENTITY_UNAVAILABLE"
+    assert result.missing_tickers == ("AAPL",)
+    assert client.grouped_calls == []
 
 
 def test_parallel_native_ingestion_uses_forked_clients_and_degrades_at_95_percent():
@@ -725,6 +793,69 @@ def test_shadow_analysis_persists_results_without_current_projections():
     assert materialize.call_args.kwargs["fundamental_metrics"]["market_cap"] == Decimal(
         "10000000000"
     )
+
+
+def test_behavior_shadow_runs_after_legacy_publish_and_cannot_fail_analysis():
+    item = security("AAPL")
+    pipeline, dependencies = service(
+        behavior_shadow_enabled=True, behavior_shadow_tickers=("AAPL",),
+    )
+    shadow_result = BehaviorProductionResult(
+        market_time=NOW, received_at=NOW, attempted=1,
+        inserted=1, existing=0, skipped=(), failed=(),
+    )
+
+    def produce(*args, **kwargs):
+        assert dependencies["analysis_repository"].output_sha256
+        return shadow_result
+
+    with (
+        patch("equity.orchestration.materialize_equity_evidence") as materialize,
+        patch("equity.orchestration.produce_stock_behavior_snapshots", side_effect=produce),
+    ):
+        materialize.return_value = MaterializationResult((), "NEUTRAL", "NEUTRAL", ())
+        result = pipeline.materialize_interval(
+            (item,), universe_run_id=uuid4(), interval="30m",
+            watermark=DecisionWatermark(NOW, NOW + timedelta(seconds=1)),
+        )
+
+    assert result.status == "COMPLETE" and result.behavior_shadow == shadow_result
+
+    with (
+        patch("equity.orchestration.materialize_equity_evidence") as materialize,
+        patch("equity.orchestration.produce_stock_behavior_snapshots", side_effect=RuntimeError("shadow failed")),
+    ):
+        materialize.return_value = MaterializationResult((), "NEUTRAL", "NEUTRAL", ())
+        result = pipeline.materialize_interval(
+            (item,), universe_run_id=uuid4(), interval="1h",
+            watermark=DecisionWatermark(NOW, NOW + timedelta(seconds=2)),
+        )
+
+    assert result.status == "COMPLETE"
+    assert result.behavior_shadow.failed == (("*", "RuntimeError"),)
+
+
+def test_behavior_shadow_reports_configured_underlyer_missing_from_equity_universe():
+    pipeline, _ = service(
+        behavior_shadow_enabled=True,
+        behavior_shadow_tickers=("AAPL", "MSFT"),
+    )
+    produced = BehaviorProductionResult(
+        market_time=NOW, received_at=NOW, attempted=1, inserted=0, existing=1,
+        skipped=(), failed=(),
+    )
+    with patch(
+        "equity.orchestration.produce_stock_behavior_snapshots",
+        return_value=produced,
+    ):
+        result = pipeline._produce_behavior_shadow(
+            (security("AAPL"),), interval="30m",
+            watermark=DecisionWatermark(NOW, NOW),
+            run_purpose="ORIGINAL", run_status="COMPLETE",
+        )
+
+    assert result.attempted == 2
+    assert result.skipped == (("MSFT", ("SECURITY_REFERENCE_MISSING",)),)
 
 
 def test_analysis_marks_member_insufficient_when_latest_bar_misses_watermark():

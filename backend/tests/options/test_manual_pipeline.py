@@ -235,6 +235,11 @@ class FakeDailyFactRepository:
 class FakeBoardRepository:
     def __init__(self):
         self.calls = []
+        self.baseline_calls = []
+
+    def publish_baseline_cycle(self, **kwargs):
+        self.baseline_calls.append(kwargs)
+        return SimpleNamespace(status="PUBLISHED", member_count=0)
 
     def publish_complete_cycle(self, **kwargs):
         self.calls.append(kwargs)
@@ -257,6 +262,25 @@ class FakeAnalysisRepository:
 
     def finish(self, run):
         self.finished = run
+
+
+def test_forward_raw_spot_uses_canonical_native_bar_store():
+    import json
+    from unittest.mock import MagicMock
+    from options.analytics.marks import UnderlyingMinuteBar
+
+    clock = datetime(2026, 9, 18, 15, 0, tzinfo=timezone.utc)
+    raw = dict(t=int((clock - timedelta(minutes=1)).timestamp() * 1000), o=100, h=102, l=99, c=101, v=1000)
+    bar = UnderlyingMinuteBar(Decimal("101"), clock, clock - timedelta(minutes=1), json.dumps(raw))
+    pipeline = ManualOptionPipeline.__new__(ManualOptionPipeline)
+    pipeline.raw_spot_repository = MagicMock()
+    pipeline.raw_spot_reference_repository = SimpleNamespace(get_security_as_of=lambda *_: SimpleNamespace(
+        security_id=uuid4(), active=True, effective_from=clock - timedelta(days=1)))
+    assert pipeline._retain_raw_spot_bars("SPY", (bar,), clock + timedelta(minutes=15)) == (bar,)
+    stored = pipeline.raw_spot_repository.persist.call_args.args[0][0]
+    assert stored.bar_end == clock and stored.close_price == Decimal("101")
+    assert not stored.adjusted and stored.is_final and stored.interval == "1m"
+    assert stored.source_kind.value == "NATIVE_REST" and stored.session_scope.value == "RTH"
 
 
 def test_manual_pipeline_runs_complete_fixture_cycle():
@@ -449,6 +473,78 @@ def test_board_publication_runs_only_for_complete_configured_universe():
     )
     assert board.calls[0]["scheduled_cycle"] == MARKET_TIME
     assert complete.board_publication.status == "PUBLISHED"
+    assert complete.baseline_alert_selection is None
+    assert board.baseline_calls == []
+    assert complete.detector_evaluation is None
+
+    from options.analytics.alert_selection import build_detector_run
+    from unittest.mock import MagicMock
+
+    def collect_detector_run(**kwargs):
+        return build_detector_run(configuration=kwargs["configuration"], dataset_id=kwargs["dataset_id"],
+            scheduled_cycle=kwargs["scheduled_cycle"], selected_at=kwargs["started_at"],
+            matrices=[dict(underlying=symbol, matrix_id=matrix_id, market_time=MARKET_TIME,
+                observed_time=OBSERVED_AT) for symbol, matrix_id in kwargs["completed_matrices"].items()],
+            records=(), rejections={}), ()
+
+    hook = MagicMock(side_effect=collect_detector_run)
+    repository = MagicMock()
+    repository.completed_run.return_value = None
+    repository.persist_completed_run.return_value = dict(status="RECORDED", new_alerts=0)
+    pipeline.detector_cycle_hook = hook
+    pipeline.detector_dataset_id = "forward-hook-fixture"
+    pipeline.detector_effective_from = MARKET_TIME + timedelta(minutes=15)
+    pipeline.detector_evaluation_repository = repository
+    assert pipeline.run_once(as_of=OBSERVED_AT, cycle_time=MARKET_TIME).detector_evaluation is None
+    hook.assert_not_called()
+    pipeline.detector_effective_from = MARKET_TIME
+    assert pipeline.run_once((configuration.settings.underlyers[0],), as_of=OBSERVED_AT,
+        cycle_time=MARKET_TIME).detector_evaluation is None
+    hook.assert_not_called()
+    complete = pipeline.run_once(as_of=OBSERVED_AT, cycle_time=MARKET_TIME)
+    assert complete.detector_evaluation == dict(status="RECORDED", new_alerts=0)
+    repository.persist_completed_run.assert_called_once()
+    hook.side_effect = RuntimeError("fixture source failure")
+    complete = pipeline.run_once(as_of=OBSERVED_AT, cycle_time=MARKET_TIME)
+    assert complete.detector_evaluation["status"] == "FAILED"
+    assert complete.board_publication.status == "PUBLISHED"
+    assert all(result.status == "COMPLETE" for result in complete.results)
+    repository.persist_completed_run.assert_called_once()
+    stored_run, stored_records = repository.persist_completed_run.call_args.args
+    repository.completed_run.return_value = (stored_run, stored_records)
+    original_underlying_run = pipeline._run_underlying
+    pipeline._run_underlying = lambda underlyer, asset_type, session, cycle: UnderlyingCycleResult(
+        underlyer, asset_type, uuid4(), dict(stored_run.source_matrices)[underlyer], "ALREADY_COMPLETED", 1, 1, 1.0, ())
+    pipeline.clock = lambda: OBSERVED_AT + timedelta(minutes=1)
+    hook.reset_mock()
+    complete = pipeline.run_once(as_of=OBSERVED_AT + timedelta(minutes=1), cycle_time=MARKET_TIME)
+    assert complete.detector_evaluation["status"] == "RECORDED"
+    hook.assert_not_called()
+    assert repository.persist_completed_run.call_args.args == (stored_run, stored_records)
+    pipeline._run_underlying = original_underlying_run
+    pipeline.clock = lambda: OBSERVED_AT
+    pipeline.detector_cycle_hook = None
+
+    from dataclasses import replace
+
+    pipeline.configuration = replace(configuration, settings=configuration.settings.model_copy(update={
+        "baseline_alerts_enabled": True, "baseline_alerts_effective_from": MARKET_TIME,
+    }))
+    partial = pipeline.run_once((configuration.settings.underlyers[0],), as_of=OBSERVED_AT, cycle_time=MARKET_TIME)
+    assert partial.baseline_alert_selection is None and board.baseline_calls == []
+    complete = pipeline.run_once(as_of=OBSERVED_AT, cycle_time=MARKET_TIME)
+    assert complete.baseline_alert_selection.member_count == 0
+    assert len(board.baseline_calls) == 1
+    assert board.baseline_calls[0]["published_at"] == OBSERVED_AT
+
+    def failed_selection(**kwargs):
+        raise RuntimeError("fixture failure")
+
+    board.publish_baseline_cycle = failed_selection
+    complete = pipeline.run_once(as_of=OBSERVED_AT, cycle_time=MARKET_TIME)
+    assert complete.baseline_alert_selection.status == "FAILED"
+    assert complete.board_publication.status == "PUBLISHED"
+    assert all(result.status == "COMPLETE" for result in complete.results)
 
 
 def test_manual_pipeline_extends_chain_to_retained_candidate_legs():
@@ -535,6 +631,38 @@ def test_empty_normalized_matrix_is_terminal_quality_failure():
         "normalization produced no retained contracts",
     )
     assert work.terminal_error == "normalization produced no retained contracts"
+
+
+def test_terminal_ingestion_batch_is_not_an_operational_retry():
+    from options.errors import InvalidBatchTransition
+
+    class FailedEngine(FakeEngine):
+        def get_option_chain(self, *args):
+            raise InvalidBatchTransition("terminal retained batch")
+
+    configuration = load_option_runtime_configuration(
+        {"POLYGON_API_KEY": "test-secret"}, BACKEND_DIR,
+    )
+    pipeline = ManualOptionPipeline(
+        configuration,
+        FailedEngine(),
+        calendar=FakeCalendar(),
+        catalog_repository=FakeCatalogRepository(),
+        universe_repository=FakeUniverseRepository(),
+        ingestion_repository=FakeIngestionRepository(),
+        snapshot_repository=FakeSnapshotRepository(),
+        gamma_repository=FakeGammaRepository(),
+        daily_fact_repository=FakeDailyFactRepository(),
+        analysis_repository=FakeAnalysisRepository(),
+        work_repository=FakeWorkRepository(),
+        clock=lambda: OBSERVED_AT,
+    )
+
+    result = pipeline.run_once(("SPY",), as_of=OBSERVED_AT)
+
+    assert result.results[0].status == "FAILED"
+    assert result.results[0].retryable is False
+    assert result.results[0].reasons == ("InvalidBatchTransition", "terminal retained batch")
 
 
 def test_explicit_terminal_slot_restart_returns_already_completed():

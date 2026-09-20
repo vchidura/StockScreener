@@ -99,6 +99,9 @@ def test_compose_forwards_complete_option_and_worker_contract():
         "OPTION_POLL_SECONDS: ${OPTION_POLL_SECONDS:-900}"
     ) == 2
     assert "EQUITY_MATERIALIZATION_INTERVALS:" in source
+    assert "command: python scripts/run_equity_worker.py --behavior-shadow" in source
+    assert source.count("\n      OPTION_FIXED_STOCK_UNDERLYERS:") == 3
+    assert source.count("\n      OPTION_FIXED_ETF_UNDERLYERS:") == 3
     assert source.count("APP_ENV: ${APP_ENV:-production}") == 9
     assert "equity-migrate:" in source
     assert "option-worker:" in source

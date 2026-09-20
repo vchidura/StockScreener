@@ -6006,5 +6006,1081 @@ CREATE TRIGGER trg_guard_equity_response_bound_action
     BEFORE UPDATE OR DELETE ON public.equity_corporate_actions
     FOR EACH ROW EXECUTE FUNCTION public.guard_equity_response_bound_action();
 
+CREATE TABLE IF NOT EXISTS public.option_alert_plans (
+    plan_id uuid PRIMARY KEY,
+    candidate_id uuid NOT NULL REFERENCES public.option_strategy_candidates(candidate_id),
+    exposure_key text NOT NULL CHECK (exposure_key ~ '^[0-9a-f]{64}$'),
+    plan_sha256 text NOT NULL UNIQUE CHECK (plan_sha256 ~ '^[0-9a-f]{64}$'),
+    payload_text text NOT NULL,
+    decision_at timestamptz NOT NULL,
+    entry_deadline timestamptz NOT NULL,
+    exit_deadline timestamptz NOT NULL,
+    stored_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CHECK (isfinite(decision_at) AND isfinite(entry_deadline) AND isfinite(exit_deadline)),
+    CHECK (decision_at < entry_deadline AND entry_deadline < exit_deadline),
+    CHECK (plan_sha256 = encode(sha256(convert_to(payload_text, 'UTF8')), 'hex')),
+    CHECK ((jsonb_typeof(payload_text::jsonb) = 'object'
+        AND payload_text::jsonb->>'version' = 'option_alert_plan_v1'
+        AND payload_text::jsonb->>'state' = 'UNPUBLISHED_INDICATIVE_PLAN'
+        AND (payload_text::jsonb->>'candidate_id')::uuid = candidate_id
+        AND (payload_text::jsonb->>'decision_at')::timestamptz = decision_at
+        AND (payload_text::jsonb->>'entry_deadline')::timestamptz = entry_deadline
+        AND (payload_text::jsonb->>'exit_deadline')::timestamptz = exit_deadline
+        AND payload_text::jsonb->'execution_permission' = 'false'::jsonb
+        AND payload_text::jsonb->'paper_position_created' = 'false'::jsonb
+        AND payload_text::jsonb->'published_at' = 'null'::jsonb
+        AND payload_text::jsonb->'fill' = 'null'::jsonb) IS TRUE)
+);
+CREATE INDEX IF NOT EXISTS option_alert_plans_exposure_idx ON public.option_alert_plans(exposure_key);
+
+CREATE SEQUENCE IF NOT EXISTS public.option_alert_publication_sequence;
+CREATE TABLE IF NOT EXISTS public.option_alert_publication_events (
+    event_id uuid PRIMARY KEY,
+    sequence bigint NOT NULL UNIQUE,
+    plan_id uuid NOT NULL REFERENCES public.option_alert_plans(plan_id),
+    event_type text NOT NULL CHECK (event_type IN ('PUBLISHED', 'OBSERVED', 'INVALIDATED', 'EXPIRED')),
+    request_key text NOT NULL CHECK (length(btrim(request_key)) BETWEEN 1 AND 200),
+    request_text text NOT NULL,
+    recorded_at timestamptz NOT NULL,
+    UNIQUE (plan_id, request_key),
+    CHECK ((jsonb_typeof(request_text::jsonb) = 'object'
+        AND request_text::jsonb->>'version' = 'option_alert_publication_v1'
+        AND (request_text::jsonb->>'plan_id')::uuid = plan_id
+        AND request_text::jsonb->>'event' = event_type
+        AND request_text::jsonb->'execution_permission' = 'false'::jsonb) IS TRUE)
+);
+ALTER SEQUENCE public.option_alert_publication_sequence OWNED BY public.option_alert_publication_events.sequence;
+CREATE INDEX IF NOT EXISTS option_alert_events_plan_idx ON public.option_alert_publication_events(plan_id, sequence DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS option_alert_one_publication_idx ON public.option_alert_publication_events(plan_id) WHERE event_type = 'PUBLISHED';
+CREATE UNIQUE INDEX IF NOT EXISTS option_alert_one_terminal_idx ON public.option_alert_publication_events(plan_id) WHERE event_type IN ('INVALIDATED', 'EXPIRED');
+
+CREATE OR REPLACE FUNCTION public.guard_option_alert_publication() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    parent public.option_alert_plans%ROWTYPE;
+    previous_type text;
+    source_time timestamptz;
+BEGIN
+    SELECT * INTO parent FROM public.option_alert_plans WHERE plan_id = NEW.plan_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'option alert plan missing'; END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended('option-alert:' || parent.exposure_key, 0));
+    SELECT * INTO parent FROM public.option_alert_plans WHERE plan_id = NEW.plan_id FOR UPDATE;
+    NEW.recorded_at := clock_timestamp();
+    NEW.sequence := nextval('public.option_alert_publication_sequence');
+    SELECT event_type INTO previous_type FROM public.option_alert_publication_events
+        WHERE plan_id = NEW.plan_id ORDER BY sequence DESC LIMIT 1;
+    IF NEW.recorded_at < parent.decision_at THEN RAISE EXCEPTION 'option alert event precedes decision'; END IF;
+    IF previous_type IN ('INVALIDATED', 'EXPIRED') THEN RAISE EXCEPTION 'terminal option alert cannot reopen'; END IF;
+    IF NEW.event_type = 'PUBLISHED' THEN
+        IF previous_type IS NOT NULL OR NEW.recorded_at >= parent.entry_deadline THEN
+            RAISE EXCEPTION 'option alert publication requires a new unexpired plan';
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM public.option_alert_plans AS other
+            JOIN LATERAL (
+                SELECT event_type FROM public.option_alert_publication_events
+                WHERE plan_id = other.plan_id ORDER BY sequence DESC LIMIT 1
+            ) AS latest ON TRUE
+            WHERE other.exposure_key = parent.exposure_key AND latest.event_type IN ('PUBLISHED', 'OBSERVED')
+        ) THEN RAISE EXCEPTION 'active option exposure already published'; END IF;
+    ELSE
+        IF previous_type IS NULL THEN RAISE EXCEPTION 'option alert must be published before lifecycle events'; END IF;
+        IF NEW.event_type = 'EXPIRED' THEN
+            IF NEW.recorded_at < parent.entry_deadline THEN RAISE EXCEPTION 'option alert cannot expire early'; END IF;
+        ELSIF NEW.recorded_at >= parent.entry_deadline THEN
+            RAISE EXCEPTION 'expired entry window only accepts expiration';
+        END IF;
+    END IF;
+    IF NEW.event_type IN ('OBSERVED', 'INVALIDATED') THEN
+        IF NOT (jsonb_typeof(NEW.request_text::jsonb->'source_ids') = 'array'
+                AND jsonb_array_length(NEW.request_text::jsonb->'source_ids') > 0) IS TRUE THEN
+            RAISE EXCEPTION 'option alert event requires source IDs';
+        END IF;
+        source_time := (NEW.request_text::jsonb->>'source_available_at')::timestamptz;
+        IF source_time IS NULL OR source_time < parent.decision_at OR source_time > NEW.recorded_at THEN
+            RAISE EXCEPTION 'option alert event source is not causal';
+        END IF;
+    END IF;
+    IF NEW.event_type = 'INVALIDATED' AND COALESCE(length(btrim(NEW.request_text::jsonb->>'reason')), 0) = 0 THEN
+        RAISE EXCEPTION 'option alert invalidation requires a reason';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS option_alert_publication_guard ON public.option_alert_publication_events;
+CREATE TRIGGER option_alert_publication_guard BEFORE INSERT ON public.option_alert_publication_events
+    FOR EACH ROW EXECUTE FUNCTION public.guard_option_alert_publication();
+
+CREATE OR REPLACE FUNCTION public.reject_option_alert_mutation() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'option alert plans and publication evidence are immutable';
+END;
+$$;
+DROP TRIGGER IF EXISTS option_alert_plans_immutable ON public.option_alert_plans;
+CREATE TRIGGER option_alert_plans_immutable BEFORE UPDATE OR DELETE ON public.option_alert_plans
+    FOR EACH ROW EXECUTE FUNCTION public.reject_option_alert_mutation();
+DROP TRIGGER IF EXISTS option_alert_events_immutable ON public.option_alert_publication_events;
+CREATE TRIGGER option_alert_events_immutable BEFORE UPDATE OR DELETE ON public.option_alert_publication_events
+    FOR EACH ROW EXECUTE FUNCTION public.reject_option_alert_mutation();
+DROP TRIGGER IF EXISTS option_alert_plans_no_truncate ON public.option_alert_plans;
+CREATE TRIGGER option_alert_plans_no_truncate BEFORE TRUNCATE ON public.option_alert_plans
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_option_alert_mutation();
+DROP TRIGGER IF EXISTS option_alert_events_no_truncate ON public.option_alert_publication_events;
+CREATE TRIGGER option_alert_events_no_truncate BEFORE TRUNCATE ON public.option_alert_publication_events
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_option_alert_mutation();
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+ALTER TABLE public.equity_context_snapshots
+    ADD COLUMN IF NOT EXISTS context_kind text NOT NULL DEFAULT 'LEGACY',
+    ADD COLUMN IF NOT EXISTS behavior_schema_version text,
+    ADD COLUMN IF NOT EXISTS behavior_definition_sha256 text,
+    ADD COLUMN IF NOT EXISTS behavior_computed_at timestamptz,
+    ADD COLUMN IF NOT EXISTS behavior_payload_text text,
+    ADD COLUMN IF NOT EXISTS behavior_payload_sha256 text;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'public.equity_context_snapshots'::regclass
+                   AND conname = 'ck_equity_context_behavior_contract') THEN
+        ALTER TABLE public.equity_context_snapshots ADD CONSTRAINT ck_equity_context_behavior_contract CHECK ((
+            (context_kind = 'LEGACY'
+             AND behavior_schema_version IS NULL AND behavior_definition_sha256 IS NULL
+             AND behavior_computed_at IS NULL
+             AND behavior_payload_text IS NULL AND behavior_payload_sha256 IS NULL)
+            OR
+            (context_kind = 'STOCK_BEHAVIOR'
+             AND behavior_schema_version = 'stock_behavior_v1'
+             AND strategy_horizon = 'OPTIONS_SWING_V1'
+             AND behavior_definition_sha256 ~ '^[0-9a-f]{64}$'
+             AND behavior_payload_sha256 ~ '^[0-9a-f]{64}$'
+             AND status = 'DEGRADED' AND qualified_direction IS NULL
+             AND direction_qualification_id IS NULL AND direction_evidence_id IS NULL
+             AND isfinite(market_time) AND isfinite(behavior_computed_at)
+             AND isfinite(observed_at) AND isfinite(valid_until)
+             AND market_time <= behavior_computed_at AND behavior_computed_at <= observed_at
+             AND observed_at < valid_until
+             AND octet_length(behavior_payload_text) BETWEEN 2 AND 262144
+             AND behavior_payload_sha256 = encode(sha256(convert_to(behavior_payload_text, 'UTF8')), 'hex')
+               AND jsonb_typeof(behavior_payload_text::jsonb) = 'object'
+               AND behavior_payload_text::jsonb->>'schema_version' = behavior_schema_version
+               AND behavior_payload_text::jsonb->>'definition_sha256' = behavior_definition_sha256
+               AND behavior_payload_text::jsonb->>'profile' = strategy_horizon
+               AND behavior_payload_text::jsonb->>'policy_sha256' = context_policy_sha256
+               AND (behavior_payload_text::jsonb->>'security_id')::uuid = security_id
+               AND (behavior_payload_text::jsonb->>'security_revision_id')::uuid = security_revision_id
+               AND behavior_payload_text::jsonb->>'ticker' = ticker
+               AND (behavior_payload_text::jsonb->>'market_time')::timestamptz = market_time
+               AND (behavior_payload_text::jsonb->>'computed_at')::timestamptz = behavior_computed_at
+               AND (behavior_payload_text::jsonb->>'available_at')::timestamptz = observed_at
+               AND (behavior_payload_text::jsonb->>'valid_until')::timestamptz = valid_until
+               AND behavior_payload_text::jsonb->>'availability_mode' IN ('PROSPECTIVE_RECEIPT', 'RECONSTRUCTED')
+               AND behavior_payload_text::jsonb->'execution_permission' = 'false'::jsonb
+               AND jsonb_typeof(behavior_payload_text::jsonb->'components') = 'array'
+               AND jsonb_array_length(behavior_payload_text::jsonb->'components') BETWEEN 1 AND 18
+               AND jsonb_typeof(behavior_payload_text::jsonb->'required_components') = 'array'
+               AND jsonb_array_length(behavior_payload_text::jsonb->'required_components') BETWEEN 1 AND 18)
+           ) IS TRUE) NOT VALID;
+    END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.guard_equity_behavior_context() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.context_kind = 'STOCK_BEHAVIOR' THEN
+            NEW.created_at := clock_timestamp();
+            IF NEW.observed_at > NEW.created_at THEN
+                RAISE EXCEPTION 'behavior context cannot be received in the future';
+            END IF;
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF OLD.context_kind = 'STOCK_BEHAVIOR' THEN
+        RAISE EXCEPTION 'stock behavior evidence is immutable';
+    END IF;
+    IF TG_OP = 'UPDATE' AND NEW.context_kind IS DISTINCT FROM OLD.context_kind THEN
+        RAISE EXCEPTION 'legacy context cannot be reinterpreted as stock behavior';
+    END IF;
+    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_guard_equity_behavior_context ON public.equity_context_snapshots;
+CREATE TRIGGER trg_guard_equity_behavior_context BEFORE INSERT OR UPDATE OR DELETE
+    ON public.equity_context_snapshots FOR EACH ROW EXECUTE FUNCTION public.guard_equity_behavior_context();
+
+CREATE OR REPLACE FUNCTION public.guard_equity_behavior_evidence_link() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE parent_kind text; parent_created_here boolean; source_contract_ok boolean;
+BEGIN
+    SELECT context_kind, xmin::text = pg_current_xact_id()::text
+    INTO parent_kind, parent_created_here
+    FROM public.equity_context_snapshots
+    WHERE equity_context_snapshot_id = COALESCE(NEW.equity_context_snapshot_id, OLD.equity_context_snapshot_id);
+    IF parent_kind = 'STOCK_BEHAVIOR' THEN
+        IF TG_OP = 'INSERT' AND parent_created_here THEN
+            SELECT EXISTS (
+                SELECT 1 FROM public.equity_evidence
+                WHERE evidence_id = NEW.evidence_id AND (
+                    (source_name = 'STOCK_BEHAVIOR_ADJUSTED_DAILY'
+                     AND source_version = 'provider_adjusted_daily_history_v1'
+                     AND payload_schema_version = 'stock_behavior_adjusted_daily_source_v1')
+                    OR
+                    (source_name = 'STOCK_BEHAVIOR_RAW_SOURCE'
+                     AND source_version = 'behavior_feature_source_v1'
+                     AND payload_schema_version = 'stock_behavior_raw_source_v1')
+                )
+            ) INTO source_contract_ok;
+            IF source_contract_ok THEN RETURN NEW; END IF;
+            RAISE EXCEPTION 'stock behavior links require dedicated immutable source evidence';
+        END IF;
+        RAISE EXCEPTION 'stock behavior evidence links are immutable';
+    END IF;
+    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_guard_equity_behavior_evidence_link ON public.equity_context_evidence;
+CREATE TRIGGER trg_guard_equity_behavior_evidence_link BEFORE INSERT OR UPDATE OR DELETE
+    ON public.equity_context_evidence FOR EACH ROW EXECUTE FUNCTION public.guard_equity_behavior_evidence_link();
+
+CREATE OR REPLACE FUNCTION public.guard_equity_behavior_source_evidence() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM public.equity_context_evidence AS link
+        JOIN public.equity_context_snapshots AS context USING (equity_context_snapshot_id)
+        WHERE link.evidence_id = OLD.evidence_id AND context.context_kind = 'STOCK_BEHAVIOR'
+    ) THEN
+        RAISE EXCEPTION 'stock behavior source evidence is immutable';
+    END IF;
+    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_guard_equity_behavior_source_evidence ON public.equity_evidence;
+CREATE TRIGGER trg_guard_equity_behavior_source_evidence BEFORE UPDATE OR DELETE
+    ON public.equity_evidence FOR EACH ROW EXECUTE FUNCTION public.guard_equity_behavior_source_evidence();
+
+CREATE OR REPLACE FUNCTION public.guard_equity_behavior_evidence_truncate() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM public.equity_context_snapshots WHERE context_kind = 'STOCK_BEHAVIOR') THEN
+        RAISE EXCEPTION 'stock behavior evidence prevents evidence truncation';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_guard_equity_behavior_link_truncate ON public.equity_context_evidence;
+CREATE TRIGGER trg_guard_equity_behavior_link_truncate BEFORE TRUNCATE ON public.equity_context_evidence
+    FOR EACH STATEMENT EXECUTE FUNCTION public.guard_equity_behavior_evidence_truncate();
+DROP TRIGGER IF EXISTS trg_guard_equity_behavior_source_truncate ON public.equity_evidence;
+CREATE TRIGGER trg_guard_equity_behavior_source_truncate BEFORE TRUNCATE ON public.equity_evidence
+    FOR EACH STATEMENT EXECUTE FUNCTION public.guard_equity_behavior_evidence_truncate();
+
+CREATE OR REPLACE FUNCTION public.guard_equity_behavior_truncate() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM public.equity_context_snapshots WHERE context_kind = 'STOCK_BEHAVIOR') THEN
+        RAISE EXCEPTION 'stock behavior evidence prevents context truncation';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_guard_equity_behavior_truncate ON public.equity_context_snapshots;
+CREATE TRIGGER trg_guard_equity_behavior_truncate BEFORE TRUNCATE ON public.equity_context_snapshots
+    FOR EACH STATEMENT EXECUTE FUNCTION public.guard_equity_behavior_truncate();
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+CREATE OR REPLACE FUNCTION public.guard_equity_behavior_evidence_link() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE parent_kind text; parent_created_here boolean; source_contract_ok boolean;
+BEGIN
+    SELECT context_kind, xmin::text = pg_current_xact_id()::text
+    INTO parent_kind, parent_created_here
+    FROM public.equity_context_snapshots
+    WHERE equity_context_snapshot_id = COALESCE(NEW.equity_context_snapshot_id, OLD.equity_context_snapshot_id);
+    IF parent_kind = 'STOCK_BEHAVIOR' THEN
+        IF TG_OP = 'INSERT' AND parent_created_here THEN
+            SELECT EXISTS (
+                SELECT 1 FROM public.equity_evidence
+                WHERE evidence_id = NEW.evidence_id AND (
+                    (source_name = 'STOCK_BEHAVIOR_ADJUSTED_DAILY'
+                     AND source_version = 'provider_adjusted_daily_history_v1'
+                     AND payload_schema_version = 'stock_behavior_adjusted_1d_v1')
+                    OR
+                    (source_name = 'STOCK_BEHAVIOR_RAW_SOURCE'
+                     AND source_version = 'behavior_feature_source_v1'
+                     AND payload_schema_version = 'stock_behavior_raw_source_v1')
+                )
+            ) INTO source_contract_ok;
+            IF source_contract_ok THEN RETURN NEW; END IF;
+            RAISE EXCEPTION 'stock behavior links require dedicated immutable source evidence';
+        END IF;
+        RAISE EXCEPTION 'stock behavior evidence links are immutable';
+    END IF;
+    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END;
+$$;
+
+ALTER TABLE public.equity_context_snapshots VALIDATE CONSTRAINT ck_equity_context_behavior_contract;
+CREATE INDEX idx_equity_behavior_asof ON public.equity_context_snapshots
+    (security_id, strategy_horizon, behavior_definition_sha256, context_policy_sha256,
+     market_time DESC, observed_at DESC)
+    WHERE context_kind = 'STOCK_BEHAVIOR';
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+CREATE TABLE IF NOT EXISTS public.option_stock_behavior_assessments (
+    assessment_id uuid PRIMARY KEY,
+    candidate_id uuid NOT NULL REFERENCES public.option_strategy_candidates(candidate_id),
+    candidate_identity character(64) NOT NULL CHECK (candidate_identity ~ '^[0-9a-f]{64}$'),
+    matrix_id uuid NOT NULL REFERENCES public.option_analysis_runs(matrix_id),
+    stock_snapshot_id uuid REFERENCES public.equity_context_snapshots(equity_context_snapshot_id),
+    underlying varchar(16) NOT NULL,
+    option_strategy_version varchar(64) NOT NULL,
+    option_strategy_policy_sha256 character(64) NOT NULL CHECK (option_strategy_policy_sha256 ~ '^[0-9a-f]{64}$'),
+    option_configuration_sha256 character(64) NOT NULL CHECK (option_configuration_sha256 ~ '^[0-9a-f]{64}$'),
+    option_market_policy_sha256 character(64) NOT NULL CHECK (option_market_policy_sha256 ~ '^[0-9a-f]{64}$'),
+    option_analysis_policy_sha256 character(64) NOT NULL CHECK (option_analysis_policy_sha256 ~ '^[0-9a-f]{64}$'),
+    option_market_time timestamptz NOT NULL,
+    option_observed_at timestamptz NOT NULL,
+    stock_market_cutoff timestamptz NOT NULL,
+    detector_policy_version varchar(64) NOT NULL,
+    detector_policy_sha256 character(64) NOT NULL CHECK (detector_policy_sha256 ~ '^[0-9a-f]{64}$'),
+    decision_at timestamptz NOT NULL,
+    disposition varchar(24) NOT NULL CHECK (
+        disposition IN ('ELIGIBLE_RESEARCH', 'BLOCKED', 'UNAVAILABLE', 'NOT_APPLICABLE')
+    ),
+    payload_text text NOT NULL,
+    payload_sha256 character(64) NOT NULL CHECK (payload_sha256 ~ '^[0-9a-f]{64}$'),
+    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CHECK (isfinite(option_market_time) AND isfinite(option_observed_at)
+        AND isfinite(stock_market_cutoff) AND isfinite(decision_at) AND isfinite(recorded_at)),
+    CHECK (option_market_time <= option_observed_at AND option_observed_at <= decision_at),
+    CHECK (stock_market_cutoff <= decision_at),
+    CHECK (octet_length(payload_text) BETWEEN 2 AND 262144),
+    CHECK (payload_sha256 = encode(sha256(convert_to(payload_text, 'UTF8')), 'hex')),
+    CHECK ((
+        jsonb_typeof(payload_text::jsonb) = 'object'
+        AND payload_text::jsonb->>'schema_version' = 'option_stock_behavior_assessment_v1'
+        AND (payload_text::jsonb->>'candidate_id')::uuid = candidate_id
+        AND payload_text::jsonb->>'candidate_identity_sha256' = candidate_identity
+        AND (payload_text::jsonb->>'matrix_id')::uuid = matrix_id
+        AND payload_text::jsonb->>'underlyer' = underlying
+        AND payload_text::jsonb->>'option_strategy_version' = option_strategy_version
+        AND payload_text::jsonb->>'option_strategy_policy_sha256' = option_strategy_policy_sha256
+        AND payload_text::jsonb->>'option_configuration_sha256' = option_configuration_sha256
+        AND payload_text::jsonb->>'option_market_policy_sha256' = option_market_policy_sha256
+        AND payload_text::jsonb->>'option_analysis_policy_sha256' = option_analysis_policy_sha256
+        AND (payload_text::jsonb->>'option_market_time')::timestamptz = option_market_time
+        AND (payload_text::jsonb->>'option_observed_at')::timestamptz = option_observed_at
+        AND (payload_text::jsonb->>'stock_market_cutoff')::timestamptz = stock_market_cutoff
+        AND payload_text::jsonb->>'detector_policy_version' = detector_policy_version
+        AND payload_text::jsonb->>'detector_policy_sha256' = detector_policy_sha256
+        AND (payload_text::jsonb->>'decision_at')::timestamptz = decision_at
+        AND payload_text::jsonb->>'disposition' = disposition
+        AND payload_text::jsonb->'assessment_only' = 'true'::jsonb
+        AND payload_text::jsonb->'execution_permission' = 'false'::jsonb
+        AND CASE
+            WHEN stock_snapshot_id IS NULL
+            THEN payload_text::jsonb->'stock_snapshot_id' = 'null'::jsonb
+            ELSE (payload_text::jsonb->>'stock_snapshot_id')::uuid = stock_snapshot_id
+        END
+    ) IS TRUE)
+);
+
+CREATE INDEX IF NOT EXISTS idx_option_stock_behavior_candidate
+    ON public.option_stock_behavior_assessments(candidate_id, decision_at DESC, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_option_stock_behavior_snapshot
+    ON public.option_stock_behavior_assessments(stock_snapshot_id)
+    WHERE stock_snapshot_id IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION public.guard_option_stock_behavior_assessment() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    candidate public.option_strategy_candidates%ROWTYPE;
+    stock_context public.equity_context_snapshots%ROWTYPE;
+    source_underlying text;
+    source_market_time timestamptz;
+    source_observed_time timestamptz;
+    source_scheduled_cycle timestamptz;
+    source_configuration_sha256 text;
+    source_market_policy_sha256 text;
+    source_analysis_policy_sha256 text;
+BEGIN
+    SELECT * INTO candidate
+    FROM public.option_strategy_candidates
+    WHERE candidate_id = NEW.candidate_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'stock behavior assessment candidate is missing'; END IF;
+    IF candidate.candidate_identity <> NEW.candidate_identity
+       OR candidate.matrix_id <> NEW.matrix_id
+       OR candidate.underlying <> NEW.underlying
+         OR candidate.strategy_version <> NEW.option_strategy_version
+         OR candidate.policy_sha256 <> NEW.option_strategy_policy_sha256
+         OR candidate.market_data_time <> NEW.option_market_time
+         OR candidate.observed_time <> NEW.option_observed_at
+         OR candidate.observed_time <> NEW.decision_at THEN
+        RAISE EXCEPTION 'stock behavior assessment candidate identity or clocks disagree';
+    END IF;
+    SELECT analysis.underlying, analysis.market_time, analysis.observed_time,
+           ingestion.scheduled_cycle, ingestion.configuration_sha256,
+           ingestion.policy_sha256, analysis.policy_sha256
+    INTO source_underlying, source_market_time, source_observed_time,
+         source_scheduled_cycle, source_configuration_sha256,
+         source_market_policy_sha256, source_analysis_policy_sha256
+    FROM public.option_analysis_runs AS analysis
+    JOIN public.option_ingestion_runs AS ingestion USING (batch_id)
+    WHERE analysis.matrix_id = NEW.matrix_id;
+    IF NOT FOUND
+       OR source_underlying <> NEW.underlying
+       OR source_market_time <> NEW.option_market_time
+       OR source_observed_time <> NEW.option_observed_at
+       OR source_scheduled_cycle <> NEW.stock_market_cutoff
+       OR source_configuration_sha256 <> NEW.option_configuration_sha256
+       OR source_market_policy_sha256 <> NEW.option_market_policy_sha256
+       OR source_analysis_policy_sha256 <> NEW.option_analysis_policy_sha256 THEN
+        RAISE EXCEPTION 'stock behavior assessment matrix lineage disagrees';
+    END IF;
+    IF NEW.stock_snapshot_id IS NOT NULL THEN
+        SELECT * INTO stock_context
+        FROM public.equity_context_snapshots
+        WHERE equity_context_snapshot_id = NEW.stock_snapshot_id;
+        IF NOT FOUND OR stock_context.context_kind <> 'STOCK_BEHAVIOR'
+           OR stock_context.ticker <> NEW.underlying
+           OR stock_context.market_time > NEW.decision_at
+           OR stock_context.observed_at > NEW.decision_at
+           OR stock_context.valid_until <= NEW.decision_at THEN
+            RAISE EXCEPTION 'stock behavior assessment source context is invalid';
+        END IF;
+    END IF;
+    NEW.recorded_at := clock_timestamp();
+    IF NEW.recorded_at < NEW.decision_at THEN
+        RAISE EXCEPTION 'stock behavior assessment cannot be recorded before its decision';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_guard_option_stock_behavior_assessment
+    ON public.option_stock_behavior_assessments;
+CREATE TRIGGER trg_guard_option_stock_behavior_assessment
+    BEFORE INSERT ON public.option_stock_behavior_assessments
+    FOR EACH ROW EXECUTE FUNCTION public.guard_option_stock_behavior_assessment();
+
+CREATE OR REPLACE FUNCTION public.reject_option_stock_behavior_assessment_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'option stock behavior assessments are immutable';
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_option_stock_behavior_assessment_immutable
+    ON public.option_stock_behavior_assessments;
+CREATE TRIGGER trg_option_stock_behavior_assessment_immutable
+    BEFORE UPDATE OR DELETE ON public.option_stock_behavior_assessments
+    FOR EACH ROW EXECUTE FUNCTION public.reject_option_stock_behavior_assessment_mutation();
+DROP TRIGGER IF EXISTS trg_option_stock_behavior_assessment_no_truncate
+    ON public.option_stock_behavior_assessments;
+CREATE TRIGGER trg_option_stock_behavior_assessment_no_truncate
+    BEFORE TRUNCATE ON public.option_stock_behavior_assessments
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_option_stock_behavior_assessment_mutation();
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM public.option_stock_behavior_assessments) THEN
+        RAISE EXCEPTION 'launch identity migration requires an empty assessment ledger';
+    END IF;
+END;
+$$;
+
+ALTER TABLE public.option_stock_behavior_assessments
+    ADD COLUMN IF NOT EXISTS launch_id varchar(64),
+    ADD COLUMN IF NOT EXISTS launch_manifest_sha256 character(64);
+
+ALTER TABLE public.option_stock_behavior_assessments
+    ALTER COLUMN launch_id SET NOT NULL,
+    ALTER COLUMN launch_manifest_sha256 SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.option_stock_behavior_assessments'::regclass
+          AND conname = 'ck_option_stock_behavior_launch_contract'
+    ) THEN
+        ALTER TABLE public.option_stock_behavior_assessments
+            ADD CONSTRAINT ck_option_stock_behavior_launch_contract CHECK ((
+                launch_id ~ '^[a-z0-9][a-z0-9-]{7,63}$'
+                AND launch_manifest_sha256 ~ '^[0-9a-f]{64}$'
+                AND payload_text::jsonb->>'launch_id' = launch_id
+                AND payload_text::jsonb->>'launch_manifest_sha256' = launch_manifest_sha256
+            ) IS TRUE);
+    END IF;
+END;
+$$;
+
+CREATE INDEX IF NOT EXISTS idx_option_stock_behavior_launch
+    ON public.option_stock_behavior_assessments
+    (launch_manifest_sha256, decision_at, recorded_at);
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+CREATE TABLE IF NOT EXISTS public.option_package_assessments (
+    assessment_id uuid PRIMARY KEY,
+    candidate_id uuid NOT NULL REFERENCES public.option_strategy_candidates(candidate_id),
+    candidate_identity character(64) NOT NULL CHECK (candidate_identity ~ '^[0-9a-f]{64}$'),
+    matrix_id uuid NOT NULL REFERENCES public.option_analysis_runs(matrix_id),
+    valuation_policy_sha256 character(64) NOT NULL CHECK (valuation_policy_sha256 ~ '^[0-9a-f]{64}$'),
+    assessment_status varchar(16) NOT NULL CHECK (assessment_status IN ('READY', 'UNAVAILABLE')),
+    package_terms_sha256 character(64) CHECK (package_terms_sha256 ~ '^[0-9a-f]{64}$'),
+    package_payload_text text CHECK (
+        package_payload_text IS NULL
+        OR octet_length(package_payload_text) BETWEEN 2 AND 262144
+    ),
+    assessed_at timestamptz NOT NULL CHECK (isfinite(assessed_at)),
+    payload_text text NOT NULL CHECK (octet_length(payload_text) BETWEEN 2 AND 262144),
+    payload_sha256 character(64) NOT NULL CHECK (payload_sha256 ~ '^[0-9a-f]{64}$'),
+    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp() CHECK (isfinite(recorded_at)),
+    CHECK ((assessment_status = 'READY') = (
+        package_terms_sha256 IS NOT NULL AND package_payload_text IS NOT NULL
+    )),
+    CHECK (
+        package_terms_sha256 IS NULL
+        OR package_terms_sha256 = encode(
+            sha256(convert_to(package_payload_text, 'UTF8')), 'hex'
+        )
+    ),
+    CHECK (payload_sha256 = encode(sha256(convert_to(payload_text, 'UTF8')), 'hex')),
+    CHECK ((
+        jsonb_typeof(payload_text::jsonb) = 'object'
+        AND payload_text::jsonb->>'schema_version' = 'option_package_assessment_v1'
+        AND (payload_text::jsonb->>'candidate_id')::uuid = candidate_id
+        AND payload_text::jsonb->>'candidate_identity_sha256' = candidate_identity
+        AND (payload_text::jsonb->>'option_matrix_id')::uuid = matrix_id
+        AND payload_text::jsonb->>'valuation_policy_sha256' = valuation_policy_sha256
+        AND payload_text::jsonb->>'status' = assessment_status
+        AND (payload_text::jsonb->>'assessed_at')::timestamptz = assessed_at
+        AND payload_text::jsonb->'research_only' = 'true'::jsonb
+        AND payload_text::jsonb->'execution_permission' = 'false'::jsonb
+        AND CASE
+            WHEN package_terms_sha256 IS NULL THEN
+                payload_text::jsonb->'package' = 'null'::jsonb
+                AND payload_text::jsonb->'package_terms_sha256' = 'null'::jsonb
+            ELSE
+                payload_text::jsonb->>'package_terms_sha256' = package_terms_sha256
+                AND payload_text::jsonb->'package' = package_payload_text::jsonb
+        END
+    ) IS TRUE)
+);
+
+CREATE INDEX IF NOT EXISTS idx_option_package_assessment_candidate
+    ON public.option_package_assessments(candidate_id, assessed_at DESC, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_option_package_assessment_status
+    ON public.option_package_assessments(
+        valuation_policy_sha256, assessment_status, assessed_at DESC
+    );
+
+CREATE OR REPLACE FUNCTION public.guard_option_package_assessment() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE candidate public.option_strategy_candidates%ROWTYPE;
+BEGIN
+    SELECT * INTO candidate FROM public.option_strategy_candidates
+    WHERE candidate_id = NEW.candidate_id;
+    IF NOT FOUND
+       OR candidate.candidate_identity <> NEW.candidate_identity
+       OR candidate.matrix_id <> NEW.matrix_id
+       OR candidate.observed_time <> NEW.assessed_at THEN
+        RAISE EXCEPTION 'option package assessment candidate identity or clock disagrees';
+    END IF;
+    NEW.recorded_at := clock_timestamp();
+    IF NEW.recorded_at < NEW.assessed_at THEN
+        RAISE EXCEPTION 'option package assessment cannot be recorded before assessment';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_guard_option_package_assessment
+    ON public.option_package_assessments;
+CREATE TRIGGER trg_guard_option_package_assessment
+    BEFORE INSERT ON public.option_package_assessments
+    FOR EACH ROW EXECUTE FUNCTION public.guard_option_package_assessment();
+
+CREATE OR REPLACE FUNCTION public.reject_option_package_assessment_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'option package assessments are immutable';
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_option_package_assessment_immutable
+    ON public.option_package_assessments;
+CREATE TRIGGER trg_option_package_assessment_immutable
+    BEFORE UPDATE OR DELETE ON public.option_package_assessments
+    FOR EACH ROW EXECUTE FUNCTION public.reject_option_package_assessment_mutation();
+DROP TRIGGER IF EXISTS trg_option_package_assessment_no_truncate
+    ON public.option_package_assessments;
+CREATE TRIGGER trg_option_package_assessment_no_truncate
+    BEFORE TRUNCATE ON public.option_package_assessments
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_option_package_assessment_mutation();
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+CREATE TABLE IF NOT EXISTS public.option_outcome_unavailable_evidence (
+    evidence_id uuid PRIMARY KEY,
+    candidate_id uuid NOT NULL REFERENCES public.option_strategy_candidates(candidate_id),
+    candidate_identity character(64) NOT NULL CHECK (candidate_identity ~ '^[0-9a-f]{64}$'),
+    valuation_policy_sha256 character(64) NOT NULL CHECK (valuation_policy_sha256 ~ '^[0-9a-f]{64}$'),
+    measurement_type varchar(16) NOT NULL CHECK (
+        measurement_type IN ('15MIN', '30MIN', '60MIN', 'CLOSE', 'NEXT_OPEN')
+    ),
+    checkpoint_at timestamptz NOT NULL CHECK (isfinite(checkpoint_at)),
+    availability_deadline timestamptz NOT NULL CHECK (
+        isfinite(availability_deadline) AND availability_deadline >= checkpoint_at
+    ),
+    required_contract_ids bigint[] NOT NULL CHECK (cardinality(required_contract_ids) BETWEEN 1 AND 4),
+    observed_contract_ids bigint[] NOT NULL DEFAULT ARRAY[]::bigint[],
+    missing_contract_ids bigint[] NOT NULL CHECK (cardinality(missing_contract_ids) >= 1),
+    availability_policy_version varchar(64) NOT NULL,
+    availability_policy_sha256 character(64) NOT NULL CHECK (availability_policy_sha256 ~ '^[0-9a-f]{64}$'),
+    payload_text text NOT NULL CHECK (octet_length(payload_text) BETWEEN 2 AND 262144),
+    payload_sha256 character(64) NOT NULL CHECK (payload_sha256 ~ '^[0-9a-f]{64}$'),
+    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp() CHECK (isfinite(recorded_at)),
+    CHECK (payload_sha256 = encode(sha256(convert_to(payload_text, 'UTF8')), 'hex')),
+    CHECK ((
+        jsonb_typeof(payload_text::jsonb) = 'object'
+        AND payload_text::jsonb->>'schema_version' = 'option_outcome_measurement_assessment_v1'
+        AND (payload_text::jsonb->>'candidate_id')::uuid = candidate_id
+        AND payload_text::jsonb->>'candidate_identity_sha256' = candidate_identity
+        AND payload_text::jsonb->>'valuation_policy_sha256' = valuation_policy_sha256
+        AND payload_text::jsonb->>'measurement_type' = measurement_type
+        AND (payload_text::jsonb->>'checkpoint_at')::timestamptz = checkpoint_at
+        AND (payload_text::jsonb->>'evaluated_at')::timestamptz = availability_deadline
+        AND (payload_text::jsonb->>'availability_deadline')::timestamptz = availability_deadline
+        AND payload_text::jsonb->>'status' = 'UNAVAILABLE'
+        AND payload_text::jsonb->>'availability_policy_version' = availability_policy_version
+        AND payload_text::jsonb->>'availability_policy_sha256' = availability_policy_sha256
+        AND payload_text::jsonb->'research_only' = 'true'::jsonb
+        AND payload_text::jsonb->'execution_permission' = 'false'::jsonb
+    ) IS TRUE)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_option_outcome_unavailable_contract
+    ON public.option_outcome_unavailable_evidence(
+        candidate_id, measurement_type, valuation_policy_sha256,
+        availability_policy_sha256
+    );
+
+CREATE OR REPLACE FUNCTION public.guard_option_outcome_unavailable_evidence()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE candidate_identity_value text;
+BEGIN
+    SELECT candidate_identity INTO candidate_identity_value
+    FROM public.option_strategy_candidates WHERE candidate_id=NEW.candidate_id;
+    IF NOT FOUND OR candidate_identity_value <> NEW.candidate_identity THEN
+        RAISE EXCEPTION 'outcome unavailable evidence candidate identity disagrees';
+    END IF;
+    NEW.recorded_at := clock_timestamp();
+    IF NEW.recorded_at < NEW.availability_deadline THEN
+        RAISE EXCEPTION 'outcome unavailable evidence cannot precede its deadline';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_guard_option_outcome_unavailable_evidence
+    ON public.option_outcome_unavailable_evidence;
+CREATE TRIGGER trg_guard_option_outcome_unavailable_evidence
+    BEFORE INSERT ON public.option_outcome_unavailable_evidence
+    FOR EACH ROW EXECUTE FUNCTION public.guard_option_outcome_unavailable_evidence();
+
+CREATE OR REPLACE FUNCTION public.reject_option_outcome_unavailable_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'option outcome unavailable evidence is immutable';
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_option_outcome_unavailable_immutable
+    ON public.option_outcome_unavailable_evidence;
+CREATE TRIGGER trg_option_outcome_unavailable_immutable
+    BEFORE UPDATE OR DELETE ON public.option_outcome_unavailable_evidence
+    FOR EACH ROW EXECUTE FUNCTION public.reject_option_outcome_unavailable_mutation();
+DROP TRIGGER IF EXISTS trg_option_outcome_unavailable_no_truncate
+    ON public.option_outcome_unavailable_evidence;
+CREATE TRIGGER trg_option_outcome_unavailable_no_truncate
+    BEFORE TRUNCATE ON public.option_outcome_unavailable_evidence
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_option_outcome_unavailable_mutation();
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM public.option_package_assessments) THEN
+        RAISE EXCEPTION 'package assessment policy migration requires an empty ledger';
+    END IF;
+END;
+$$;
+
+ALTER TABLE public.option_package_assessments
+    ADD COLUMN IF NOT EXISTS assessment_policy_version varchar(64),
+    ADD COLUMN IF NOT EXISTS assessment_policy_sha256 character(64);
+
+ALTER TABLE public.option_package_assessments
+    ALTER COLUMN assessment_policy_version SET NOT NULL,
+    ALTER COLUMN assessment_policy_sha256 SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid='public.option_package_assessments'::regclass
+          AND conname='ck_option_package_assessment_policy'
+    ) THEN
+        ALTER TABLE public.option_package_assessments
+            ADD CONSTRAINT ck_option_package_assessment_policy CHECK ((
+                assessment_policy_version <> ''
+                AND assessment_policy_sha256 ~ '^[0-9a-f]{64}$'
+                AND payload_text::jsonb->>'assessment_policy_version'
+                    = assessment_policy_version
+                AND payload_text::jsonb->>'assessment_policy_sha256'
+                    = assessment_policy_sha256
+            ) IS TRUE);
+    END IF;
+END;
+$$;
+
+CREATE INDEX IF NOT EXISTS idx_option_package_assessment_policy
+    ON public.option_package_assessments(
+        assessment_policy_sha256, assessed_at, recorded_at
+    );
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM public.option_outcome_unavailable_evidence) THEN
+        RAISE EXCEPTION 'unavailable leg contract migration requires an empty ledger';
+    END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid='public.option_outcome_unavailable_evidence'::regclass
+          AND conname='ck_option_outcome_unavailable_payload_arrays'
+    ) THEN
+        ALTER TABLE public.option_outcome_unavailable_evidence
+            ADD CONSTRAINT ck_option_outcome_unavailable_payload_arrays CHECK ((
+                payload_text::jsonb->'required_contract_ids'
+                    = to_jsonb(required_contract_ids)
+                AND payload_text::jsonb->'observed_contract_ids'
+                    = to_jsonb(observed_contract_ids)
+                AND payload_text::jsonb->'missing_contract_ids'
+                    = to_jsonb(missing_contract_ids)
+                AND payload_text::jsonb->'source_batch_id' = 'null'::jsonb
+                AND payload_text::jsonb->'reason_codes'
+                    = '["COHERENT_PACKAGE_MARKS_UNAVAILABLE"]'::jsonb
+            ) IS TRUE);
+    END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.guard_option_outcome_unavailable_evidence()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    candidate_identity_value text;
+    candidate_contract_ids bigint[];
+    valuation_policy_matches boolean;
+    expected_missing_ids bigint[];
+BEGIN
+    SELECT candidate_identity INTO candidate_identity_value
+    FROM public.option_strategy_candidates WHERE candidate_id=NEW.candidate_id;
+    IF NOT FOUND OR candidate_identity_value <> NEW.candidate_identity THEN
+        RAISE EXCEPTION 'outcome unavailable evidence candidate identity disagrees';
+    END IF;
+    SELECT array_agg(contract_id ORDER BY leg_index),
+           bool_and(valuation_policy_sha256=NEW.valuation_policy_sha256)
+    INTO candidate_contract_ids, valuation_policy_matches
+    FROM public.option_candidate_legs WHERE candidate_id=NEW.candidate_id;
+    IF candidate_contract_ids IS NULL
+       OR candidate_contract_ids <> NEW.required_contract_ids
+       OR valuation_policy_matches IS NOT TRUE THEN
+        RAISE EXCEPTION 'outcome unavailable evidence package legs or policy disagree';
+    END IF;
+    IF NOT NEW.observed_contract_ids <@ NEW.required_contract_ids THEN
+        RAISE EXCEPTION 'outcome unavailable observed contracts are not package legs';
+    END IF;
+    SELECT COALESCE(array_agg(contract_id ORDER BY ordinal), ARRAY[]::bigint[])
+    INTO expected_missing_ids
+    FROM unnest(NEW.required_contract_ids) WITH ORDINALITY AS item(contract_id, ordinal)
+    WHERE NOT contract_id=ANY(NEW.observed_contract_ids);
+    IF expected_missing_ids <> NEW.missing_contract_ids THEN
+        RAISE EXCEPTION 'outcome unavailable missing contracts are not exact';
+    END IF;
+    NEW.recorded_at := clock_timestamp();
+    IF NEW.recorded_at < NEW.availability_deadline THEN
+        RAISE EXCEPTION 'outcome unavailable evidence cannot precede its deadline';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+CREATE OR REPLACE FUNCTION public.option_package_assessment_matches_candidate(
+    assessment_candidate_id uuid,
+    assessment_candidate_identity text,
+    assessment_matrix_id uuid,
+    assessment_valuation_policy_sha256 text,
+    assessment_status text,
+    assessment_package jsonb,
+    assessment_assessed_at timestamptz
+) RETURNS boolean
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    candidate public.option_strategy_candidates%ROWTYPE;
+    package_breakevens numeric[];
+BEGIN
+    SELECT * INTO candidate FROM public.option_strategy_candidates
+    WHERE candidate_id=assessment_candidate_id;
+    IF NOT FOUND
+       OR candidate.candidate_identity <> assessment_candidate_identity
+       OR candidate.matrix_id <> assessment_matrix_id
+       OR candidate.observed_time <> assessment_assessed_at THEN
+        RETURN false;
+    END IF;
+    IF assessment_status='UNAVAILABLE' THEN
+        RETURN assessment_package IS NULL;
+    END IF;
+    IF assessment_status <> 'READY' OR assessment_package IS NULL
+       OR candidate.status <> 'SELECTED'
+       OR candidate.candidate_kind NOT IN ('SINGLE_CONTRACT', 'MULTI_LEG') THEN
+        RETURN false;
+    END IF;
+    SELECT COALESCE(array_agg(value::numeric ORDER BY ordinal), ARRAY[]::numeric[])
+    INTO package_breakevens
+    FROM jsonb_array_elements_text(assessment_package->'breakevens')
+         WITH ORDINALITY AS item(value, ordinal);
+    IF (assessment_package->>'candidate_id')::uuid <> candidate.candidate_id
+       OR assessment_package->>'candidate_identity_sha256' <> candidate.candidate_identity
+       OR (assessment_package->>'option_matrix_id')::uuid <> candidate.matrix_id
+       OR assessment_package->>'underlyer' <> candidate.underlying
+       OR assessment_package->>'strategy_name' <> candidate.strategy_name
+       OR assessment_package->>'strategy_version' <> candidate.strategy_version
+       OR assessment_package->>'strategy_policy_sha256' <> candidate.policy_sha256
+       OR assessment_package->>'structure' <> candidate.structure_type
+       OR (assessment_package->>'market_time')::timestamptz <> candidate.market_data_time
+       OR (assessment_package->>'observed_at')::timestamptz <> candidate.observed_time
+           OR (CASE WHEN candidate.valid_until IS NULL
+               THEN assessment_package->'valid_until' <> 'null'::jsonb
+               ELSE (assessment_package->>'valid_until')::timestamptz <> candidate.valid_until END)
+       OR (assessment_package->>'net_premium')::numeric IS DISTINCT FROM candidate.net_premium
+       OR (assessment_package->>'collateral_required')::numeric IS DISTINCT FROM candidate.collateral_required
+       OR (assessment_package->>'capital_at_risk')::numeric IS DISTINCT FROM candidate.capital_at_risk
+       OR (assessment_package->>'maximum_profit')::numeric IS DISTINCT FROM candidate.maximum_profit
+       OR (assessment_package->>'maximum_loss')::numeric IS DISTINCT FROM candidate.maximum_loss
+       OR package_breakevens IS DISTINCT FROM candidate.breakevens THEN
+        RETURN false;
+    END IF;
+    IF jsonb_array_length(assessment_package->'ordered_legs') <> (
+        SELECT count(*) FROM public.option_candidate_legs
+        WHERE candidate_id=candidate.candidate_id
+    ) OR EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(assessment_package->'ordered_legs')
+             WITH ORDINALITY AS item(package_leg, ordinal)
+        LEFT JOIN public.option_candidate_legs AS leg
+          ON leg.candidate_id=candidate.candidate_id
+         AND leg.leg_index=item.ordinal-1
+        WHERE leg.candidate_id IS NULL
+           OR (item.package_leg->>'leg_index')::integer <> leg.leg_index
+           OR (item.package_leg->>'snapshot_id')::uuid <> leg.snapshot_id
+           OR (item.package_leg->>'contract_id')::bigint <> leg.contract_id
+           OR item.package_leg->>'contract_ticker' <> leg.contract_ticker
+           OR item.package_leg->>'side' <> leg.side
+           OR (item.package_leg->>'ratio')::integer <> leg.ratio
+           OR (item.package_leg->>'multiplier')::integer <> leg.multiplier
+           OR (item.package_leg->>'expiration_date')::date <> leg.expiration_date
+           OR (item.package_leg->>'strike')::numeric <> leg.strike
+           OR item.package_leg->>'contract_type' <> leg.contract_type
+           OR (item.package_leg->>'spot')::numeric <> leg.spot
+           OR (item.package_leg->>'entry_mark')::numeric IS DISTINCT FROM leg.model_mark
+           OR (item.package_leg->>'time_to_expiration_years')::double precision <> leg.time_to_expiration_years
+           OR (item.package_leg->>'risk_free_rate')::double precision <> leg.risk_free_rate
+           OR (item.package_leg->>'dividend_yield')::double precision <> leg.dividend_yield
+           OR (item.package_leg->>'entry_iv')::double precision IS DISTINCT FROM leg.local_iv
+           OR (item.package_leg->>'source_market_time')::timestamptz <> leg.source_market_time
+           OR item.package_leg->>'mark_source' <> leg.mark_source
+           OR item.package_leg->>'model_version' <> leg.model_version
+           OR item.package_leg->>'valuation_policy_version' IS DISTINCT FROM leg.valuation_policy_version
+           OR item.package_leg->>'valuation_policy_sha256' IS DISTINCT FROM leg.valuation_policy_sha256
+           OR item.package_leg->>'valuation_policy_sha256' <> assessment_valuation_policy_sha256
+    ) THEN
+        RETURN false;
+    END IF;
+    RETURN true;
+EXCEPTION WHEN OTHERS THEN
+    RETURN false;
+END;
+$$;
+
+LOCK TABLE public.option_package_assessments IN SHARE ROW EXCLUSIVE MODE;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM public.option_package_assessments
+        WHERE NOT public.option_package_assessment_matches_candidate(
+            candidate_id, candidate_identity, matrix_id,
+            valuation_policy_sha256, assessment_status,
+            package_payload_text::jsonb, assessed_at
+        )
+    ) THEN
+        RAISE EXCEPTION 'existing option package assessment disagrees with candidate';
+    END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.guard_option_package_assessment() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT public.option_package_assessment_matches_candidate(
+        NEW.candidate_id, NEW.candidate_identity, NEW.matrix_id,
+        NEW.valuation_policy_sha256, NEW.assessment_status,
+        NEW.package_payload_text::jsonb, NEW.assessed_at
+    ) THEN
+        RAISE EXCEPTION 'option package assessment candidate or package disagrees';
+    END IF;
+    NEW.recorded_at := clock_timestamp();
+    IF NEW.recorded_at < NEW.assessed_at THEN
+        RAISE EXCEPTION 'option package assessment cannot be recorded before assessment';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+CREATE TABLE IF NOT EXISTS public.option_detector_evaluations (
+    evaluation_id uuid PRIMARY KEY,
+    dataset_id varchar(80) NOT NULL,
+    run_id uuid NOT NULL,
+    scheduled_cycle timestamptz NOT NULL,
+    session_date date NOT NULL,
+    selector_sha256 char(64) NOT NULL CHECK (selector_sha256 ~ '^[0-9a-f]{64}$'),
+    detector_id varchar(16) NOT NULL CHECK (detector_id IN ('O1','O2','S1','S2')),
+    candidate_id uuid REFERENCES public.option_strategy_candidates(candidate_id),
+    matrix_id uuid NOT NULL REFERENCES public.option_analysis_runs(matrix_id),
+    recurrence_sha256 char(64) NOT NULL CHECK (recurrence_sha256 ~ '^[0-9a-f]{64}$'),
+    selection_status varchar(24) NOT NULL CHECK (selection_status IN ('SELECTED','NOT_SELECTED','REPEAT','OBSERVATION')),
+    selection_reason varchar(64) NOT NULL,
+    selected_at timestamptz NOT NULL,
+    payload_text text NOT NULL CHECK (octet_length(payload_text) <= 65536),
+    payload_sha256 char(64) NOT NULL CHECK (payload_sha256 ~ '^[0-9a-f]{64}$'),
+    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (dataset_id,run_id,detector_id,recurrence_sha256),
+    CHECK ((detector_id='O2' AND selection_status='OBSERVATION' AND candidate_id IS NULL)
+        OR (detector_id<>'O2' AND selection_status<>'OBSERVATION' AND candidate_id IS NOT NULL)),
+    CHECK (scheduled_cycle <= selected_at AND selected_at <= recorded_at),
+    CHECK (session_date = (scheduled_cycle AT TIME ZONE 'America/New_York')::date),
+    CHECK (payload_sha256 = encode(sha256(convert_to(payload_text,'UTF8')),'hex')),
+    CHECK ((payload_text::jsonb->>'dataset_id') = dataset_id),
+    CHECK ((payload_text::jsonb->>'run_id')::uuid = run_id),
+    CHECK ((payload_text::jsonb->>'selector_sha256') = selector_sha256),
+    CHECK ((payload_text::jsonb->>'selection_status') = selection_status),
+    CHECK ((payload_text::jsonb->>'selection_reason') = selection_reason),
+    CHECK ((payload_text::jsonb->>'evidence_mode') = 'PROSPECTIVE_RECEIPT'),
+    CHECK ((payload_text::jsonb->'package'->>'candidate_id')::uuid = candidate_id),
+    CHECK ((payload_text::jsonb->'package'->>'matrix_id')::uuid = matrix_id),
+    CHECK ((payload_text::jsonb->'package'->>'detector_id') = detector_id),
+    CHECK ((payload_text::jsonb->'package'->>'recurrence_sha256') = recurrence_sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_option_detector_evaluations_session
+    ON public.option_detector_evaluations (dataset_id,session_date,scheduled_cycle);
+CREATE INDEX IF NOT EXISTS idx_option_detector_evaluations_run
+    ON public.option_detector_evaluations (run_id);
+CREATE OR REPLACE FUNCTION public.guard_option_detector_evaluation() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    payload jsonb := NEW.payload_text::jsonb;
+    package jsonb := payload->'package';
+    candidate public.option_strategy_candidates%ROWTYPE;
+BEGIN
+    IF NEW.detector_id='O2' THEN
+        IF NOT COALESCE(payload->>'schema_version'='option_surface_evaluation_evidence_v1'
+           AND payload->>'dataset_id'=NEW.dataset_id AND (payload->>'run_id')::uuid=NEW.run_id
+           AND payload->>'selector_sha256'=NEW.selector_sha256
+           AND payload->>'selection_status'='OBSERVATION' AND NEW.selection_status='OBSERVATION'
+           AND payload->>'selection_reason'='OBSERVATION_ONLY' AND NEW.selection_reason='OBSERVATION_ONLY'
+           AND payload->>'evidence_mode'='PROSPECTIVE_RECEIPT'
+           AND (payload->>'selected_at')::timestamptz=NEW.selected_at
+           AND payload->>'recurrence_sha256'=NEW.recurrence_sha256
+           AND (payload->'observation'->>'scheduled_cycle')::timestamptz=NEW.scheduled_cycle
+           AND (payload->'observation'->>'matrix_id')::uuid=NEW.matrix_id
+           AND payload->'observation'->>'detector_id'='O2'
+           AND payload->'observation'->>'output_kind'='OBSERVATION'
+           AND payload->'observation'->>'package_status'='NOT_APPLICABLE'
+           AND (payload->'observation'->>'decision_at')::timestamptz<=NEW.selected_at
+           AND NEW.candidate_id IS NULL, false) THEN
+            RAISE EXCEPTION 'surface evaluation must preserve observation-only identity and clocks';
+        END IF;
+        NEW.recorded_at := clock_timestamp();
+        RETURN NEW;
+    END IF;
+    IF NOT COALESCE(payload->>'schema_version'='option_detector_selection_evidence_v1'
+       AND payload->>'dataset_id'=NEW.dataset_id AND (payload->>'run_id')::uuid=NEW.run_id
+       AND payload->>'selector_sha256'=NEW.selector_sha256
+       AND payload->>'selection_status'=NEW.selection_status
+       AND payload->>'selection_reason'=NEW.selection_reason
+       AND payload->>'evidence_mode'='PROSPECTIVE_RECEIPT'
+       AND (payload->>'selected_at')::timestamptz=NEW.selected_at
+       AND (package->>'scheduled_cycle')::timestamptz=NEW.scheduled_cycle
+       AND (package->>'candidate_id')::uuid=NEW.candidate_id
+       AND (package->>'matrix_id')::uuid=NEW.matrix_id
+       AND package->>'detector_id'=NEW.detector_id
+       AND package->>'recurrence_sha256'=NEW.recurrence_sha256
+       AND package->>'evidence_mode'='PROSPECTIVE_RECEIPT'
+       AND package->>'status'='QUALIFIED_INDICATIVE'
+       AND (package->>'decision_at')::timestamptz<=NEW.selected_at
+       AND NEW.selected_at<(package->>'entry_deadline')::timestamptz
+       AND package->>'plan_sha256'=encode(sha256(convert_to(payload->>'plan_payload_text','UTF8')),'hex'), false) THEN
+        RAISE EXCEPTION 'detector evaluation payload does not match its identity or original clocks';
+    END IF;
+    SELECT * INTO candidate FROM public.option_strategy_candidates WHERE candidate_id=NEW.candidate_id;
+    IF NOT FOUND OR candidate.matrix_id<>NEW.matrix_id
+       OR candidate.candidate_identity IS DISTINCT FROM package->>'candidate_identity_sha256'
+       OR candidate.observed_time>NEW.selected_at OR candidate.valid_until IS NULL
+       OR (package->>'entry_deadline')::timestamptz>candidate.valid_until THEN
+        RAISE EXCEPTION 'detector evaluation candidate reference mismatch';
+    END IF;
+    NEW.recorded_at := clock_timestamp();
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS option_detector_evaluation_guard ON public.option_detector_evaluations;
+CREATE TRIGGER option_detector_evaluation_guard BEFORE INSERT ON public.option_detector_evaluations
+    FOR EACH ROW EXECUTE FUNCTION public.guard_option_detector_evaluation();
+DROP TRIGGER IF EXISTS option_detector_evaluations_immutable ON public.option_detector_evaluations;
+CREATE TRIGGER option_detector_evaluations_immutable BEFORE UPDATE OR DELETE ON public.option_detector_evaluations
+    FOR EACH ROW EXECUTE FUNCTION public.reject_option_alert_mutation();
+DROP TRIGGER IF EXISTS option_detector_evaluations_no_truncate ON public.option_detector_evaluations;
+CREATE TRIGGER option_detector_evaluations_no_truncate BEFORE TRUNCATE ON public.option_detector_evaluations
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_option_alert_mutation();
+
 COMMIT;
 

@@ -15,6 +15,7 @@ from equity.api import (
     current_chart_bar_projection,
     current_equity_materialization,
     current_trade_setup_projection,
+    equity_materialization_status,
     expected_materialized_market_time,
     minimum_fresh_materialized_market_time,
     router,
@@ -34,6 +35,50 @@ def test_materialized_equity_router_exposes_read_only_reporting_surfaces():
         "/api/equity/qualifications",
     }
     assert all("GET" in route.methods for route in router.routes)
+
+
+def test_materialization_status_distinguishes_active_close_pipeline():
+    cursor = MagicMock()
+    cursor.fetchall.side_effect = [
+        [{
+            "interval_key": "1wk",
+            "market_time": datetime(2026, 9, 11, 20, tzinfo=timezone.utc),
+            "published_at": datetime(2026, 9, 11, 21, tzinfo=timezone.utc),
+        }],
+        [{
+            "interval": "1d", "status": "RUNNING",
+            "market_time": datetime(2026, 9, 18, 20, tzinfo=timezone.utc),
+            "expected_members": 386, "completed_members": 51,
+            "no_match_members": 0, "insufficient_members": 0,
+            "failed_members": 0,
+            "created_at": datetime(2026, 9, 18, 20, 42, tzinfo=timezone.utc),
+        }],
+    ]
+
+    @contextmanager
+    def get_cursor():
+        yield cursor
+
+    with (
+        patch("database.get_db_cursor", get_cursor),
+        patch(
+            "equity.api.expected_materialized_market_time",
+            return_value=datetime(2026, 9, 18, 20, tzinfo=timezone.utc),
+        ),
+        patch(
+            "equity.api.minimum_fresh_materialized_market_time",
+            return_value=datetime(2026, 9, 18, 20, tzinfo=timezone.utc),
+        ),
+    ):
+        result = equity_materialization_status()
+
+    assert result["status"] == "EXPIRED"
+    assert result["stale_intervals"] == ["1wk"]
+    assert result["pipeline_active"] is True
+    assert result["active_intervals"] == ["1d"]
+    assert result["active_runs"][0]["completed_members"] == 51
+    assert "PENDING', 'RUNNING" in cursor.execute.call_args_list[1].args[0]
+    assert "LIMIT 20" in cursor.execute.call_args_list[1].args[0]
 
 
 def test_current_projection_api_has_stable_pagination_metadata():

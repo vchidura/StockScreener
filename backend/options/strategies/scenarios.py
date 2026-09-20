@@ -85,6 +85,26 @@ def build_scenario_grid(
                             "spot_shock_fraction": spot_shock,
                             "iv_shock_fraction": iv_shock,
                             "time_fraction_remaining": time_fraction,
+                            "entry_net_premium": str(candidate.net_premium),
+                            "valuation_inputs": [
+                                {
+                                    "leg_index": leg.leg_index,
+                                    "contract_id": leg.contract_id,
+                                    "time_to_expiration_years": (
+                                        leg.time_to_expiration_years
+                                    ),
+                                    "risk_free_rate": leg.risk_free_rate,
+                                    "dividend_yield": leg.dividend_yield,
+                                    "entry_iv": leg.local_iv,
+                                    "valuation_policy_version": (
+                                        leg.valuation_policy_version
+                                    ),
+                                    "valuation_policy_sha256": (
+                                        leg.valuation_policy_sha256
+                                    ),
+                                }
+                                for leg in candidate.legs
+                            ],
                             "quote_liquidity": "NOT_AVAILABLE",
                         },
                         quality_flags=tuple(sorted(scenario_flags)),

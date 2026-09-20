@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from options.calendar import OptionExchangeCalendar
 from options.config import ValuationPolicy
+from options.outcome_contracts import (
+    OptionOutcomeAvailabilityPolicy,
+    assess_option_outcome_measurement,
+)
 from options.outcomes import (
     CURRENT_MARK_MEASUREMENT,
     configured_valuation_policy,
@@ -12,6 +16,7 @@ from options.outcomes import (
     measurement_checkpoints,
 )
 from options.repositories.outcomes import OptionOutcomeRepository
+from options.repositories.outcome_availability import OptionOutcomeAvailabilityRepository
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +28,8 @@ class OptionOutcomeRunResult:
     pending: int
     current_candidates: int = 0
     current_persisted: int = 0
+    unavailable_measurements: int = 0
+    unavailable_persisted: int = 0
 
 
 class OptionOutcomeService:
@@ -32,10 +39,20 @@ class OptionOutcomeService:
         *,
         calendar: OptionExchangeCalendar | None = None,
         policy: ValuationPolicy | None = None,
+        availability_repository: OptionOutcomeAvailabilityRepository | None = None,
+        availability_policy: OptionOutcomeAvailabilityPolicy | None = None,
+        availability_evidence_enabled: bool = False,
     ) -> None:
         self.repository = repository or OptionOutcomeRepository()
         self.calendar = calendar or OptionExchangeCalendar()
         self.policy = policy or configured_valuation_policy()
+        self.availability_repository = (
+            availability_repository or OptionOutcomeAvailabilityRepository()
+        )
+        self.availability_policy = (
+            availability_policy or OptionOutcomeAvailabilityPolicy()
+        )
+        self.availability_evidence_enabled = availability_evidence_enabled
 
     def mature(
         self,
@@ -44,15 +61,30 @@ class OptionOutcomeService:
         limit: int = 1000,
     ) -> OptionOutcomeRunResult:
         available_utc = _utc(available_by)
+        candidate_limit = (
+            min(limit, self.availability_policy.maximum_candidates_per_run)
+            if self.availability_evidence_enabled else limit
+        )
+        pending_arguments = {}
+        if self.availability_evidence_enabled:
+            pending_arguments.update(
+                availability_policy_sha256=self.availability_policy.sha256,
+                calendar=self.calendar,
+            )
         candidates = self.repository.list_pending_candidates(
             valuation_policy_sha256=self.policy.policy_sha256,
             available_by=available_utc,
-            limit=limit,
+            limit=candidate_limit,
+            include_incomplete_packages=self.availability_evidence_enabled,
+            **pending_arguments,
         )
         outcomes = []
+        unavailable_assessments = []
         due = pending = 0
         for candidate in candidates:
-            completed = set(candidate["completed_measurements"] or ())
+            completed = set(candidate["completed_measurements"] or ()) | set(
+                candidate.get("unavailable_measurements") or ()
+            )
             checkpoints = measurement_checkpoints(
                 candidate["market_data_time"], calendar=self.calendar
             )
@@ -60,14 +92,47 @@ class OptionOutcomeService:
                 if measurement_type in completed or checkpoint > available_utc:
                     continue
                 due += 1
+                checkpoint_arguments = {
+                    "checkpoint_time": checkpoint,
+                    "available_by": available_utc,
+                    "valuation_policy_sha256": self.policy.policy_sha256,
+                }
+                if self.availability_evidence_enabled:
+                    checkpoint_arguments.update(
+                        available_by=min(
+                            available_utc, self.availability_policy.deadline(checkpoint),
+                        ),
+                        maximum_mark_lag=timedelta(
+                            seconds=self.availability_policy.maximum_mark_lag_seconds,
+                        ),
+                    )
                 legs = self.repository.checkpoint_legs(
                     candidate["candidate_id"],
-                    checkpoint_time=checkpoint,
-                    available_by=available_utc,
-                    valuation_policy_sha256=self.policy.policy_sha256,
+                    **checkpoint_arguments,
                 )
-                if not legs:
+                if not legs and not self.availability_evidence_enabled:
                     pending += 1
+                    continue
+                required_contract_ids = tuple(candidate["required_contract_ids"])
+                observed_contract_ids = tuple(leg.contract_id for leg in legs)
+                source_batch_id = legs[0].source_batch_id if legs else None
+                availability = assess_option_outcome_measurement(
+                    candidate_id=candidate["candidate_id"],
+                    candidate_identity_sha256=candidate["candidate_identity"],
+                    valuation_policy_sha256=self.policy.policy_sha256,
+                    measurement_type=measurement_type,
+                    checkpoint_at=checkpoint,
+                    evaluated_at=available_utc,
+                    required_contract_ids=required_contract_ids,
+                    observed_contract_ids=observed_contract_ids,
+                    source_batch_id=source_batch_id,
+                    policy=self.availability_policy,
+                )
+                if availability.status == "PENDING":
+                    pending += 1
+                    continue
+                if availability.status == "UNAVAILABLE":
+                    unavailable_assessments.append(availability)
                     continue
                 outcomes.append(evaluate_delayed_proxy_outcome(
                     candidate_id=candidate["candidate_id"],
@@ -80,6 +145,12 @@ class OptionOutcomeService:
                     policy=self.policy,
                 ))
         persisted = self.repository.persist_decay_outcomes(outcomes)
+        unavailable_persisted = (
+            self.availability_repository.persist_unavailable(
+                unavailable_assessments
+            ).inserted
+            if unavailable_assessments and self.availability_evidence_enabled else 0
+        )
         current_outcomes = []
         current_persisted = 0
         if self.repository.current_marks_available():
@@ -114,6 +185,8 @@ class OptionOutcomeService:
             pending=pending,
             current_candidates=len(current_outcomes),
             current_persisted=current_persisted,
+            unavailable_measurements=len(unavailable_assessments),
+            unavailable_persisted=unavailable_persisted,
         )
 
 

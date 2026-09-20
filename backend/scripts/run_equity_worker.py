@@ -51,6 +51,9 @@ STALE_RUN_MINUTES = int(os.getenv("EQUITY_STALE_RUN_MINUTES", "60"))
 INTERVAL_RETRY_SECONDS = int(os.getenv("EQUITY_INTERVAL_RETRY_SECONDS", "300"))
 NATIVE_FETCH_WORKERS = int(os.getenv("EQUITY_NATIVE_FETCH_WORKERS", "8"))
 PROVIDER_DELAY_MINUTES = int(os.getenv("EQUITY_PROVIDER_DELAY_MINUTES", "15"))
+BEHAVIOR_ADJUSTED_CATCHUP_SESSIONS = int(os.getenv(
+    "EQUITY_BEHAVIOR_ADJUSTED_CATCHUP_SESSIONS", "10"
+))
 WORKER_LOCK_NAME = os.getenv(
     "EQUITY_WORKER_LOCK_NAME", "stock-screener:equity-materialization-worker"
 )
@@ -178,12 +181,9 @@ def repair_recent_sessions(
     return tuple(results)
 
 
-def load_or_refresh_reference(
-    service: EquityMaterializationService,
-    tickers: tuple[str, ...],
-    now: datetime,
-    session_date,
-) -> ReferenceRefreshResult:
+def load_retained_reference(
+    tickers: tuple[str, ...], now: datetime,
+) -> ReferenceRefreshResult | None:
     watermark = DecisionWatermark(now, now)
     references = EquityReferenceRepository().list_securities_as_of(tickers, watermark)
     universe_repository = EquityUniverseRepository()
@@ -203,6 +203,18 @@ def load_or_refresh_reference(
             revisions=references,
             missing_tickers=(),
         )
+    return None
+
+
+def load_or_refresh_reference(
+    service: EquityMaterializationService,
+    tickers: tuple[str, ...],
+    now: datetime,
+    session_date,
+) -> ReferenceRefreshResult:
+    retained = load_retained_reference(tickers, now)
+    if retained is not None:
+        return retained
     return service.refresh_reference(
         tickers,
         observed_at=now,
@@ -234,6 +246,41 @@ def mature_prospective_scanner_outcomes(
                 prospective_only=True,
             ))
     return tuple(results)
+
+
+def refresh_behavior_adjusted_daily(
+    service: EquityMaterializationService,
+    reference: ReferenceRefreshResult,
+    *,
+    observed_at: datetime,
+    session_count: int = 1,
+):
+    if not getattr(service, "behavior_shadow_enabled", False):
+        return None
+    if not 1 <= session_count <= 30:
+        raise ValueError("behavior adjusted catch-up sessions must be in [1, 30]")
+    daily_market_time = latest_due_slot(
+        observed_at, "1d",
+        provider_delay=timedelta(minutes=PROVIDER_DELAY_MINUTES),
+    )
+    if daily_market_time is None:
+        raise ValueError("no completed daily session is available")
+    calendar = exchange_calendars.get_calendar("XNYS")
+    session = calendar.date_to_session(
+        pd.Timestamp(daily_market_time.date()), direction="previous",
+    )
+    sessions = [session]
+    for _ in range(session_count - 1):
+        session = calendar.previous_session(session)
+        sessions.append(session)
+    receipt = max(datetime.now(timezone.utc), observed_at)
+    return tuple(
+        service.refresh_behavior_adjusted_daily(
+            reference.revisions, session_date=session.date(),
+            observed_at=receipt,
+        )
+        for session in reversed(sessions)
+    )
 
 
 def ingest_due_interval(
@@ -342,6 +389,16 @@ def materialize_due_interval(
         publication.selected,
         publication.missing,
     )
+    if getattr(service, "behavior_shadow_enabled", False):
+        try:
+            adjusted = refresh_behavior_adjusted_daily(
+                service, reference, observed_at=observed_at,
+            )
+            LOGGER.info("behavior adjusted daily refresh %s", adjusted)
+        except Exception:
+            LOGGER.exception(
+                "behavior adjusted daily refresh failed non-fatally",
+            )
     if interval == "1d" and publication.status == "COMPLETE":
         context = refresh_current_daily_signals(now=datetime.now(timezone.utc))
         LOGGER.info("daily signal context %s", context)
@@ -393,7 +450,19 @@ def materialize_due_interval(
     return True
 
 
-def run_worker(*, once: bool = False, repair_sessions: int = 0) -> None:
+def behavior_shadow_tickers() -> tuple[str, ...]:
+    from options.config import load_option_runtime_configuration
+
+    tickers = load_option_runtime_configuration().settings.underlyers
+    if len(tickers) != 13 or len(set(tickers)) != 13:
+        raise ValueError("behavior shadow requires the approved 13 distinct option underlyers")
+    return tickers
+
+
+def run_worker(
+    *, once: bool = False, repair_sessions: int = 0,
+    behavior_shadow: bool = False,
+) -> None:
     invalid = set(INTERVALS) - SUPPORTED_INTERVALS
     if invalid:
         raise ValueError(f"unsupported EQUITY_MATERIALIZATION_INTERVALS: {sorted(invalid)}")
@@ -403,6 +472,8 @@ def run_worker(*, once: bool = False, repair_sessions: int = 0) -> None:
         raise ValueError("EQUITY_WORKER_HEARTBEAT_SECONDS must be positive")
     if PROVIDER_DELAY_MINUTES < 0:
         raise ValueError("EQUITY_PROVIDER_DELAY_MINUTES must not be negative")
+    if not 1 <= BEHAVIOR_ADJUSTED_CATCHUP_SESSIONS <= 30:
+        raise ValueError("EQUITY_BEHAVIOR_ADJUSTED_CATCHUP_SESSIONS must be in [1, 30]")
     if repair_sessions < 0:
         raise ValueError("repair_sessions must not be negative")
     tickers = tuple(get_selected_tickers(active_only=True))
@@ -423,11 +494,32 @@ def run_worker(*, once: bool = False, repair_sessions: int = 0) -> None:
             len(recovered_runs), len(recovered_segments),
         )
     provider_delay = timedelta(minutes=PROVIDER_DELAY_MINUTES)
+    behavior_tickers = behavior_shadow_tickers() if behavior_shadow else ()
     service = EquityMaterializationService(
-        PolygonEquityClient(), native_fetch_workers=NATIVE_FETCH_WORKERS
+        PolygonEquityClient(), native_fetch_workers=NATIVE_FETCH_WORKERS,
+        behavior_shadow_enabled=behavior_shadow,
+        behavior_shadow_tickers=behavior_tickers,
     )
     reference = None
     reference_checked_at = None
+    if behavior_shadow:
+        bootstrap_at = datetime.now(timezone.utc)
+        bootstrap_slot = latest_due_slot(
+            bootstrap_at, "1d", provider_delay=provider_delay,
+        )
+        if bootstrap_slot is not None:
+            try:
+                reference = load_retained_reference(tickers, bootstrap_at)
+                if reference is None:
+                    raise RuntimeError("fresh retained Equity references are unavailable")
+                reference_checked_at = bootstrap_at
+                adjusted = refresh_behavior_adjusted_daily(
+                    service, reference, observed_at=bootstrap_at,
+                    session_count=BEHAVIOR_ADJUSTED_CATCHUP_SESSIONS,
+                )
+                LOGGER.info("behavior startup adjusted daily refresh %s", adjusted)
+            except Exception:
+                LOGGER.exception("behavior startup adjusted daily refresh failed non-fatally")
     if repair_sessions:
         repair_now = datetime.now(timezone.utc)
         repair_slot = latest_due_slot(
@@ -453,10 +545,13 @@ def run_worker(*, once: bool = False, repair_sessions: int = 0) -> None:
     completed = analysis_repository.latest_published_market_times(INTERVALS)
     last_heartbeat_at = datetime.now(timezone.utc)
     LOGGER.info(
-        "worker started intervals=%s provider_delay_minutes=%s resumed_intervals=%s",
+        "worker started intervals=%s provider_delay_minutes=%s resumed_intervals=%s "
+        "behavior_shadow=%s behavior_tickers=%s",
         ",".join(INTERVALS),
         PROVIDER_DELAY_MINUTES,
         ",".join(sorted(completed)),
+        behavior_shadow,
+        ",".join(behavior_tickers),
     )
     while True:
         now = datetime.now(timezone.utc)
@@ -575,6 +670,11 @@ def parser() -> argparse.ArgumentParser:
         metavar="N",
         help="Idempotently refetch and rederive the latest N XNYS sessions first.",
     )
+    result.add_argument(
+        "--behavior-shadow",
+        action="store_true",
+        help="Persist fail-closed stock behavior for the configured 13 option underlyers.",
+    )
     return result
 
 
@@ -588,7 +688,10 @@ def main() -> int:
         if not is_leader:
             LOGGER.error("another equity materialization worker holds leadership")
             return 2
-        run_worker(once=args.once, repair_sessions=args.repair_sessions)
+        run_worker(
+            once=args.once, repair_sessions=args.repair_sessions,
+            behavior_shadow=args.behavior_shadow,
+        )
     return 0
 
 

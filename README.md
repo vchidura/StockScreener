@@ -63,6 +63,7 @@ omitted. Keep these option gates explicit and unchanged:
 ```env
 OPTION_START_READ_ONLY=true
 OPTION_EQUITY_CONTEXT_ENABLED=false
+OPTION_STOCK_BEHAVIOR_SHADOW_ENABLED=false
 OPTION_RAW_ARCHIVE_ENABLED=false
 ```
 
@@ -137,6 +138,19 @@ promise that every cycle produces a new publication.
 | [run_option_model_input_worker.py](backend/scripts/run_option_model_input_worker.py) | Options | `OptionInputs` | Official Treasury curve observations; refreshes every 6 hours, retries failures after 5 minutes; does not itself change option valuation policy |
 | [run_option_worker.py](backend/scripts/run_option_worker.py) | Options | `Options` | Delayed option ingestion, analysis, strategy/recommendation publication and paper-outcome processing; due XNYS-open-anchored 15-minute slots |
 
+The options worker always targets the latest observable delayed slot. A newer slot
+supersedes an older retry and its cooldown; missed slots and terminal failed batches
+are retained, not replayed with later snapshots. Same-slot operational failures may
+retry after five minutes, but a failed/quarantined batch is never reopened. Outcome
+processing cannot erase the completed ingestion checkpoint.
+
+Options worker diagnostics are written to
+[worker.log](backend/backups/options-worker/worker.log), with three rotating backups
+of up to 2 MB each. Log timestamps use the host timezone; slot identities include UTC.
+Configured secrets and common credential parameters are redacted, including tracebacks.
+`run_option_worker.py --log-file <path>` overrides the path. Logging and scheduler
+progress do not certify data freshness, full-session coverage or execution readiness.
+
 All workers require the configured application database and installed schema.
 Equity ingestion/corporate actions/options need their Polygon/Massive entitlements;
 earnings coverage needs `FINNHUB_API_KEY` (without it, earnings are unavailable,
@@ -154,6 +168,51 @@ Do not run native and Compose copies against the same database. An Options-only
 launch does not supply equity ingestion: retain/start the equity side separately
 when fresh underlying prices are needed, without enabling the separate
 `OPTION_EQUITY_CONTEXT_ENABLED` gate.
+
+The native Equity launcher enables the equity-owned `--behavior-shadow` producer for
+the fixed 13 configured option underlyers. At startup it checks the latest 10 exchange
+sessions and fetches split-adjusted grouped-daily data only for missing sessions with
+exact canonical identities; normal cycles check only the latest completed session. It then
+assembles and persists behavior after the legacy analysis run is terminal. Missing, stale or invalid behavior
+inputs skip independently and never fail legacy materialization. This does not enable an
+option detector gate, alert publication or execution permission. Check the real producer
+path without writes:
+
+Persisted option stock-behavior assessments are separately gated by
+`OPTION_STOCK_BEHAVIOR_SHADOW_ENABLED=false`. Enabling it requires migration 046 and
+launch-identity migration 047 plus a reviewed bounded or continuous-development manifest supplied through
+`OPTION_STOCK_BEHAVIOR_SHADOW_LAUNCH_FILE`. It records assessment-only evidence after original
+candidate persistence; it does not change admission, alerts, reservations, paper positions,
+or execution permission, and failures do not retry original strategy work. Continuous mode
+enforces row, payload, unavailable-rate and latency checks over a rolling usage window and
+refreshes its approved status artifact after each completed Options cycle.
+
+WP6 package-term assessments are separately gated by
+`OPTION_PACKAGE_ASSESSMENTS_ENABLED=false` and require migrations 048 and 050. They reconcile
+ordered candidate legs and signed reward/risk economics against the existing payoff engine,
+record READY or explicit UNAVAILABLE research evidence, and never alter outcome maturation,
+qualification, publication, probability or execution permission.
+
+Terminal missing-package outcome evidence is independently gated by
+`OPTION_OUTCOME_UNAVAILABLE_EVIDENCE_ENABLED=false` and requires migration 049. It leaves
+missing coherent marks transiently pending until the versioned delayed-data deadline, then
+records immutable UNAVAILABLE evidence without changing existing available outcomes.
+
+```powershell
+.\backend\.venv\Scripts\python.exe -u `
+  .\backend\scripts\report_stock_behavior_production_readiness.py
+```
+
+`BLOCKED` with only `FEATURE_EVIDENCE_EXPIRED_AT_RECEIPT` before the session is expected;
+recheck after fresh 30-minute and hourly analyses. `READY` means all 13 snapshots can be
+assembled, not that any option strategy or publisher is approved.
+
+Options Alerts dry-run v2 attaches an assessment-only stock behavior profile for
+directional long-premium and debit-spread candidates. It records exact snapshot/policy/
+candidate identities and structural directional/liquidity gates, but does not change
+candidate selection, blockers, publication, paper positions or execution permission.
+Other strategy families are explicitly not applicable. No empirical ADX, extension or
+RVOL threshold is activated by this assessment.
 
 #### Start And Preview
 
@@ -336,6 +395,13 @@ show independent source and import timestamps, errors and projector staleness.
 - Publications/plans/context are immutable; row/mark updates are append-only revisions.
   Known entry/exit clocks and settled outcomes cannot be rewritten. Imports retain
   source payloads and hashes; corrupt/missing streams do not erase other results.
+- Discovery WATCH records have no paper position. The importer validates their
+  selected publication disposition, candidate identity, watch-only fields and clocks;
+  TRADE records still require their exact retained position and plan. A valid closing
+  WATCH must not prevent later trade publications from reaching the shared reader.
+- Each stream's capture timestamp is taken after reading its atomic source file;
+  a snapshot published during the other stream's import is not falsely future-dated.
+  Genuinely future-dated snapshots are still rejected.
 
 Deploy schema042 with the existing `apply_incremental_migration.py` administrator
 runner. `project_stock_alert_results.py --verify` imports and reconciles both streams,

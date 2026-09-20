@@ -193,7 +193,7 @@ function Invoke-OneShotWorker {
 if (-not $Plan) { $env:PYTHONIOENCODING = "utf-8" }
 $modeArgs = if ($Once) { @("--once") } else { @() }
 $stockAlertArgs = @("--quality-version", "2") + $modeArgs
-$equityArgs = @($modeArgs)
+$equityArgs = @("--behavior-shadow") + @($modeArgs)
 if ($RepairSessions -gt 0) {
     $equityArgs += @("--repair-sessions", $RepairSessions.ToString())
 }
@@ -354,7 +354,10 @@ Write-Output "Research observer is opt-in (-IncludePaperStudy); Advanced streami
 Write-Output "Verify with:"
 if ($Worker) {
     switch ($Worker) {
-        "Equity" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_equity_materialization.py --coverage-report" }
+        "Equity" {
+            Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\report_equity_analysis_status.py"
+            Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\report_stock_behavior_production_readiness.py"
+        }
         "StockAlerts" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_stock_idea_worker.py --status" }
         "SwingAlerts" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_stock_idea_worker.py --swing --status" }
         "AlertResults" { Write-Output "  Inspect stock-alert-results-projector and GET /api/stocks/alert-view?combined=true for independent stream freshness." }
@@ -368,6 +371,7 @@ if ($Worker) {
 elseif ($Only -in @("All", "Equity")) {
     Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_equity_materialization.py --coverage-report"
     Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\report_equity_analysis_status.py"
+    Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\report_stock_behavior_production_readiness.py"
     Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_screening_worker.py --status"
     if ($IncludePaperStudy) { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_equity_paper_tracker.py --status" }
     if ($PublishScreening) { Write-Output "  GET /api/stocks/screening/catalog: inspect latest session/generation and field coverage" }

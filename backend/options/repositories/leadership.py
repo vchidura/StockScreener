@@ -60,6 +60,14 @@ class OptionSchedulerLeadership:
                     return False
                 cursor.execute(
                     """
+                    UPDATE option_scheduler_instances
+                    SET status = 'STOPPED', stopped_at = COALESCE(stopped_at, NOW()),
+                        updated_at = NOW()
+                    WHERE status = 'LEADER'
+                    """
+                )
+                cursor.execute(
+                    """
                     INSERT INTO option_scheduler_instances (
                         instance_id, configuration_sha256, policy_sha256,
                         process_id, host_name, status, acquired_at,

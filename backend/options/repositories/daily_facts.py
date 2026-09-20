@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -314,6 +314,85 @@ READ_QUERIES: Mapping[str, str] = {
 
 
 class OptionDailyFactRepository(PostgresRepository):
+    def participation_inventory(self, *, configuration, as_of):
+        from options.calendar import OptionExchangeCalendar
+
+        if as_of.utcoffset() is None or not 1 <= len(configuration.settings.underlyers) <= 13:
+            raise ValueError("participation inventory requires an aware cutoff and bounded configured universe")
+        calendar = OptionExchangeCalendar()
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '5s'")
+            cursor.execute("""
+                SELECT DISTINCT ON (analysis.underlying) analysis.matrix_id, analysis.batch_id,
+                       analysis.underlying, analysis.market_time, analysis.observed_time,
+                       analysis.completed_at, ingestion.scheduled_cycle
+                FROM option_analysis_runs AS analysis
+                JOIN option_ingestion_runs AS ingestion USING(batch_id)
+                WHERE analysis.underlying=ANY(%s) AND ingestion.configuration_sha256=%s
+                  AND analysis.policy_sha256=%s AND ingestion.policy_sha256=%s
+                  AND analysis.status='COMPLETE' AND ingestion.status='COMPLETE'
+                  AND analysis.market_time>=%s AND analysis.market_time<=%s
+                  AND analysis.observed_time<=%s AND analysis.completed_at<=%s AND analysis.created_at<=%s
+                  AND ingestion.completed_at<=%s
+                ORDER BY analysis.underlying, analysis.market_time DESC, analysis.observed_time DESC, analysis.matrix_id
+                LIMIT 14
+            """, (list(configuration.settings.underlyers), configuration.configuration_sha256,
+                configuration.policy_sha256, configuration.policy_sha256, as_of - timedelta(days=7),
+                as_of, as_of, as_of, as_of, as_of))
+            matrices = [dict(row) for row in cursor.fetchall()]
+            if len(matrices) > 13:
+                raise ValueError("participation matrix bound exceeded")
+            if not matrices:
+                return []
+            sessions = [calendar.session_for_slot(row["scheduled_cycle"]) for row in matrices]
+            settlements = [calendar.previous_session(session) for session in sessions]
+            closes = [calendar.session_close(session) for session in sessions]
+            cursor.execute("""
+                WITH matrices AS (
+                    SELECT * FROM UNNEST(%s::uuid[],%s::uuid[],%s::date[],%s::date[],%s::timestamptz[])
+                        AS source(matrix_id,batch_id,volume_session,settlement_session,session_close)
+                ), facts AS (
+                    SELECT matrices.matrix_id, snapshot.snapshot_id, snapshot.day_volume, snapshot.open_interest,
+                           snapshot.market_data_time, snapshot.expiration_cutoff,
+                           snapshot.first_observed_at, snapshot.created_at, snapshot.revised_observed_at,
+                           matrices.session_close,
+                           (daily.open_interest IS NOT NULL AND daily.open_interest=snapshot.open_interest
+                            AND daily.open_interest_source='PROVIDER_CHAIN_SNAPSHOT'
+                            AND daily.open_interest_observed_session=matrices.volume_session
+                            AND daily.open_interest_observed_at<=snapshot.first_observed_at
+                            AND (daily.open_interest_revised_observed_at IS NULL
+                                 OR daily.open_interest_revised_observed_at>snapshot.first_observed_at)) AS dated_oi_matches
+                    FROM matrices
+                    JOIN option_chain_snapshots AS snapshot USING(batch_id)
+                    LEFT JOIN option_daily_contract_facts AS daily
+                      ON daily.contract_id=snapshot.contract_id AND daily.settlement_session=matrices.settlement_session
+                     AND daily.underlying=snapshot.underlying
+                    WHERE snapshot.policy_sha256=%s AND snapshot.market_data_time<=%s
+                      AND snapshot.first_observed_at<=%s AND snapshot.created_at<=%s
+                      AND (snapshot.revised_observed_at IS NULL OR snapshot.revised_observed_at<=%s)
+                      AND (snapshot.market_data_time AT TIME ZONE 'America/New_York')::date=matrices.volume_session
+                )
+                SELECT matrix_id, COUNT(*) AS snapshots,
+                       COUNT(*) FILTER (WHERE open_interest>0) AS positive_oi,
+                       COUNT(*) FILTER (WHERE open_interest IS NULL OR open_interest=0) AS missing_or_zero_oi,
+                       COUNT(*) FILTER (WHERE open_interest>0 AND day_volume>=3::numeric*open_interest) AS ratio_findings,
+                       COUNT(*) FILTER (WHERE open_interest>0 AND day_volume>=3::numeric*open_interest
+                           AND dated_oi_matches) AS dated_ratio_findings,
+                       COUNT(*) FILTER (WHERE open_interest>0 AND day_volume>=3::numeric*open_interest
+                           AND dated_oi_matches AND market_data_time+interval '30 minutes'>%s
+                           AND expiration_cutoff>%s AND session_close>%s
+                           AND revised_observed_at IS NULL) AS fresh_at_cutoff,
+                       MIN(first_observed_at-market_data_time) AS minimum_receipt_lag,
+                       MAX(created_at-market_data_time) AS maximum_recording_lag
+                FROM facts GROUP BY matrix_id ORDER BY matrix_id
+            """, ([row["matrix_id"] for row in matrices], [row["batch_id"] for row in matrices],
+                sessions, settlements, closes, configuration.policy_sha256, as_of, as_of, as_of, as_of, as_of, as_of, as_of))
+            counts = {row["matrix_id"]: dict(row) for row in cursor.fetchall()}
+            return [{**matrix, "volume_session": session, "oi_settlement_session": settlement,
+                "counts": counts.get(matrix["matrix_id"], {})}
+                for matrix, session, settlement in zip(matrices, sessions, settlements)]
+
     """Retained provider facts at one row per contract per settlement session."""
 
     def persist_open_interest(self, records: Sequence[DailyOpenInterestRecord]) -> int:

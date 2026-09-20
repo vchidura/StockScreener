@@ -52,6 +52,7 @@ def test_plan_lists_exact_worker_sets_without_process_or_database_work(only, nam
     assert all(name in line for name, line in zip(names, lines))
     if only != "Options":
         assert "--continuous" in lines[3]
+        assert "--behavior-shadow" in lines[0]
     assert all("run_equity_stream_worker.py" not in line and "replay" not in line for line in lines)
     assert "Plan only: no workers started" in result.stdout
 
@@ -89,6 +90,7 @@ def test_single_worker_plan_starts_only_selected_entry_point(name, script, once)
     assert ("--continuous" in lines[0]) == (not once and name in ("Portal", "MarketContext", "AlertResults"))
     assert "--retry-window" not in lines[0] and "--enable-source-readiness" not in lines[0]
     assert ("--quality-version 2" in lines[0]) == (name in ("StockAlerts", "SwingAlerts"))
+    assert ("--behavior-shadow" in lines[0]) == (name == "Equity")
     assert ("--swing" in lines[0]) == (name == "SwingAlerts")
     assert ("--activate-swing-shadow" in lines[0]) == (name == "SwingAlerts")
     assert "Dependencies are not started automatically" in result.stdout

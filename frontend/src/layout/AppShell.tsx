@@ -96,7 +96,7 @@ function storedCollapsed(): boolean {
   }
 }
 
-function AlertSessionStepper({ dates, selected, source }: NonNullable<PageContextValue['alertSessions']>) {
+function AlertSessionStepper({ dates, selected, source, emptyLabel = 'No publications', resetKeys = [] }: NonNullable<PageContextValue['alertSessions']>) {
   const [params, setParams] = useSearchParams()
   const index = dates.indexOf(selected)
   const choose = (session: string) => {
@@ -105,12 +105,13 @@ function AlertSessionStepper({ dates, selected, source }: NonNullable<PageContex
     else next.set('session_date', session)
     next.delete('run')
     next.delete('offset')
+    for (const key of resetKeys) next.delete(key)
     setParams(next)
   }
   return <div className="tm-session sa-session" role="group" aria-label="Alert trading session">
     <button type="button" title="Previous alert session" aria-label="Previous alert session" disabled={index <= 0} onClick={() => choose(dates[index - 1])}><ChevronLeft size={15} /></button>
     <select aria-label="Alert session date" value={selected || ''} disabled={!dates.length} onChange={event => choose(event.target.value)}>
-      {!dates.length && <option value="">No publications</option>}
+      {!dates.length && <option value="">{emptyLabel}</option>}
       {[...dates].reverse().map(date => <option key={date} value={date}>{sessionLabel(date)}</option>)}
     </select>
     <button type="button" title="Next alert session" aria-label="Next alert session" disabled={index < 0 || index === dates.length - 1} onClick={() => choose(dates[index + 1])}><ChevronRight size={15} /></button>

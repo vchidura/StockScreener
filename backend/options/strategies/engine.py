@@ -10,6 +10,7 @@ from decimal import Decimal
 from statistics import median
 from typing import Iterable
 from uuid import NAMESPACE_URL, UUID, uuid5
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -73,7 +74,13 @@ class OptionStrategyEngine:
         risk_engine_available: bool = False,
     ) -> None:
         self.policy = policy
+        self.admission_calendar = None
+        if policy.forward_admission is not None:
+            from options.calendar import OptionExchangeCalendar
+
+            self.admission_calendar = OptionExchangeCalendar()
         self.gamma_policy = gamma_policy
+        self.gamma_policy_sha256 = None
         self.read_only = read_only
         self.quotes_available = quotes_available
         self.risk_engine_available = risk_engine_available
@@ -81,12 +88,18 @@ class OptionStrategyEngine:
         # The gamma policy only enters strategy identity when it actually gates
         # selection, so leaving the walls disabled preserves the published hash.
         if gamma_policy is not None and gamma_policy.require_gamma_wall:
-            if not gamma_policy_sha256:
+            if (
+                not isinstance(gamma_policy_sha256, str)
+                or len(gamma_policy_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in gamma_policy_sha256)
+            ):
                 raise ValueError(
-                    "enabling gamma wall gates requires the gamma policy hash"
+                    "enabling gamma wall gates requires the gamma policy hash as lowercase SHA256"
                 )
+            self.gamma_policy_sha256 = gamma_policy_sha256
+            self.strategy_version = f"{policy.strategy_version}_gamma_evidence_v1"
             self.policy_sha256 = hashlib.sha256(
-                f"{policy_sha256}:{gamma_policy_sha256}".encode("utf-8")
+                f"{policy_sha256}:{gamma_policy_sha256}:{self.strategy_version}".encode("utf-8")
             ).hexdigest()
         else:
             self.policy_sha256 = policy_sha256
@@ -379,6 +392,9 @@ class OptionStrategyEngine:
                             "moneyness_fraction": abs(float(row.strike / row.spot) - 1),
                             **(
                                 {
+                                    "gamma_evidence_version": "gamma_wall_evidence_v1",
+                                    "gamma_policy_sha256": self.gamma_policy_sha256,
+                                    "gamma_matrix_id": str(matrix_id),
                                     "gamma_wall_strike": str(wall.strike),
                                     "gamma_wall_share": wall.gamma_share,
                                     "gamma_wall_distance_fraction": wall.distance_to_spot_fraction,
@@ -1162,8 +1178,16 @@ class OptionStrategyEngine:
             iv_context_id=None,
             market_data_time=context.market_data_time,
             observed_time=context.observed_time,
-            valid_until=context.market_data_time + timedelta(seconds=900),
+            valid_until=self._candidate_deadline(context, registration.strategy_name, legs),
         )
+
+    def _candidate_deadline(self, context, strategy_name, legs):
+        admission = self.policy.forward_admission
+        if admission is None or strategy_name not in {"DIRECTIONAL_LONG_PREMIUM", "DIRECTIONAL_DEBIT_SPREAD"}:
+            return context.market_data_time + timedelta(seconds=900)
+        source_time = min(context.market_data_time, *(leg.source_market_time for leg in legs))
+        session = source_time.astimezone(ZoneInfo("America/New_York")).date()
+        return min(source_time + timedelta(seconds=admission.maximum_source_age_seconds), self.admission_calendar.session_close(session))
 
     def _research_candidate(self, matrix_id: UUID, registration: StrategyRegistration, structure_type: StructureType, rank: int, row: OptionContractSnapshot, context: StrategyContextSnapshot, metric_name: str, metric_value: float, evidence: dict[str, object]) -> OptionCandidate:
         candidate_id, identity = candidate_identity(matrix_id, registration.strategy_name, self.strategy_version, structure_type, (row.contract_id,), metric_name)

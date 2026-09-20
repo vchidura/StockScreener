@@ -22,12 +22,12 @@ from options.domain import (
     OptionTradeEvent,
     TradeClassificationStatus,
 )
-from options.strategies.domain import CandidateStatus, StrategyContextSnapshot, StrategyContextStatus
+from options.strategies.domain import CandidateStatus, StrategyContextSnapshot, StrategyContextStatus, StructureType
 from options.strategies.engine import (
     OptionStrategyEngine,
     _quadratic_coefficient_payload,
 )
-from options.strategies.registry import STRATEGY_REGISTRY
+from options.strategies.registry import STRATEGY_REGISTRY, build_discovery_catalog, discovery_categories
 
 
 UTC = timezone.utc
@@ -35,6 +35,66 @@ MARKET_TIME = datetime(2026, 8, 28, 20, 0, tzinfo=UTC)
 OBSERVED_TIME = MARKET_TIME + timedelta(minutes=15)
 EXPIRATION = date(2026, 9, 18)
 HASH = "a" * 64
+
+
+def test_forward_admission_is_versioned_and_never_resets_source_age():
+    from types import SimpleNamespace
+    from options.config import load_strategy_policy, StrategyPolicy
+
+    legacy = load_strategy_policy(BACKEND_DIR / "options/policies/strategy_v1.json")
+    forward = load_strategy_policy(BACKEND_DIR / "options/policies/strategy_technical_forward_v1.json")
+    assert legacy.sha256 == "c4a46268cbef4cb44994fe5524dc2499ef90d36853cd3d50b07a3126a31e6bc6"
+    assert forward.sha256 != legacy.sha256
+    old = OptionStrategyEngine(legacy.policy, legacy.sha256)
+    new = OptionStrategyEngine(forward.policy, forward.sha256)
+    clock = datetime(2026, 9, 18, 15, 0, tzinfo=UTC)
+    context = SimpleNamespace(market_data_time=clock, observed_time=clock + timedelta(minutes=20))
+    legs = (SimpleNamespace(source_market_time=clock - timedelta(minutes=2)),)
+    assert old._candidate_deadline(context, "DIRECTIONAL_LONG_PREMIUM", legs) == clock + timedelta(minutes=15)
+    assert new._candidate_deadline(context, "DIRECTIONAL_LONG_PREMIUM", legs) == clock + timedelta(minutes=28)
+    context.observed_time += timedelta(minutes=30)
+    assert new._candidate_deadline(context, "DIRECTIONAL_LONG_PREMIUM", legs) == clock + timedelta(minutes=28)
+    assert new._candidate_deadline(context, "INCOME_WHEEL", legs) == clock + timedelta(minutes=15)
+    context.market_data_time = datetime(2026, 9, 18, 19, 50, tzinfo=UTC)
+    assert new._candidate_deadline(context, "DIRECTIONAL_LONG_PREMIUM", (SimpleNamespace(source_market_time=context.market_data_time),)) == datetime(2026, 9, 18, 20, 0, tzinfo=UTC)
+    with pytest.raises(ValueError, match="distinct strategy"):
+        StrategyPolicy.model_validate({**forward.policy.model_dump(), "strategy_version": "phase2_v4"})
+
+
+def test_discovery_catalog_covers_registered_models_without_execution_claims():
+    catalog = build_discovery_catalog()
+    assert catalog["version"] == "option_discovery_v1"
+    assert [model["id"] for model in catalog["models"]] == [
+        registration.strategy_name for registration in STRATEGY_REGISTRY
+    ]
+    categories = {category["id"] for category in catalog["categories"]}
+    observations = {
+        model["id"] for model in catalog["models"]
+        if model["output_kind"] == "OBSERVATION"
+    }
+    assert observations == {
+        "SWEEP_LIKE_CLUSTER", "VOLUME_OI_ANOMALY", "VOLATILITY_SMILE_DISTORTION",
+    }
+    for model in catalog["models"]:
+        assert "execution_eligibility" not in model
+        assert "success_probability" not in model
+        for structure in model["structures"]:
+            assert structure["category_ids"]
+            assert set(structure["category_ids"]) <= categories
+
+
+@pytest.mark.parametrize(("structure", "categories"), [
+    (StructureType.CASH_SECURED_PUT, ("INCOME",)),
+    (StructureType.PUT_CREDIT_VERTICAL, ("DEFINED_RISK_INCOME",)),
+    (StructureType.CALL_CREDIT_VERTICAL, ("DEFINED_RISK_INCOME",)),
+    (StructureType.IRON_CONDOR, ("DEFINED_RISK_INCOME", "NEUTRAL_VOL")),
+    (StructureType.CALL_BUTTERFLY, ("NEUTRAL_VOL",)),
+    (StructureType.PUT_BUTTERFLY, ("NEUTRAL_VOL",)),
+    (StructureType.CALL_DEBIT_VERTICAL, ("MOMENTUM",)),
+    (StructureType.PUT_DEBIT_VERTICAL, ("MOMENTUM",)),
+])
+def test_discovery_categories_follow_structure_not_broad_persona(structure, categories):
+    assert discovery_categories(structure) == categories
 
 
 def snapshot(

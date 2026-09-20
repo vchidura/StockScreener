@@ -13,6 +13,18 @@ def baseline_sql() -> str:
     return BASELINE.read_text(encoding="utf-8")
 
 
+def test_detector_evaluations_migration_is_additive_and_matches_baseline():
+    sql = (MIGRATIONS_DIR / "053_option_detector_evaluations.sql").read_text(encoding="utf-8")
+    assert sql.strip() in baseline_sql()
+    assert "UNIQUE (dataset_id,run_id,detector_id,recurrence_sha256)" in sql
+    assert "BEFORE UPDATE OR DELETE" in sql and "BEFORE TRUNCATE" in sql
+    assert "payload_sha256 = encode(sha256" in sql
+    assert "detector_id IN ('O1','O2','S1','S2')" in sql
+    assert "detector_id='O2' AND selection_status='OBSERVATION' AND candidate_id IS NULL" in sql
+    assert "surface evaluation must preserve observation-only identity" in sql
+    assert "ALTER TABLE" not in sql and "DROP TABLE" not in sql
+
+
 def normalized_sql() -> str:
     return " ".join(baseline_sql().split())
 
@@ -57,6 +69,174 @@ def test_action_coverage_response_migration_matches_baseline():
     assert "action.security_id = coverage.security_id" in sql
     assert "linked_count <> coverage.response_action_count" in sql
     assert "response-bound action coverage is immutable" in sql
+
+
+def test_option_alert_publication_migration_matches_baseline_and_guards_evidence():
+    sql = (MIGRATIONS_DIR / "043_option_alert_publications.sql").read_text(encoding="utf-8")
+    assert sql.strip() in baseline_sql()
+    for name in ("option_alert_plans", "option_alert_publication_events", "option_alert_publication_sequence"):
+        assert f"public.{name}" in sql
+    assert "UNIQUE (plan_id, request_key)" in sql
+    assert "NEW.recorded_at := clock_timestamp()" in sql
+    assert "NEW.sequence := nextval" in sql
+    assert sql.index("pg_advisory_xact_lock") < sql.index("NEW.sequence := nextval")
+    assert "FOR UPDATE" in sql
+    assert "sha256(convert_to(payload_text, 'UTF8'))" in sql
+    assert "terminal option alert cannot reopen" in sql
+    assert "expired entry window only accepts expiration" in sql
+    assert "active option exposure already published" in sql
+    assert "BEFORE UPDATE OR DELETE" in sql and "BEFORE TRUNCATE" in sql
+    assert "execution_permission' = 'false'::jsonb" in sql
+
+
+def test_stock_behavior_migration_is_additive_isolated_and_in_baseline():
+    sql = (MIGRATIONS_DIR / "044_equity_stock_behavior_contract.sql").read_text(encoding="utf-8")
+    assert sql.strip() in baseline_sql()
+    assert "context_kind text NOT NULL DEFAULT 'LEGACY'" in sql
+    assert sql.count("ADD COLUMN IF NOT EXISTS") == 6
+    assert "ADD COLUMN IF NOT EXISTS behavior_payload_text text" in sql
+    for removed in ("behavior_profile", "behavior_data_status", "behavior_alignment_state",
+                    "behavior_available_at", "behavior_valid_until", "behavior_payload jsonb"):
+        assert removed not in sql
+    assert "payload_text::jsonb->>'profile' = strategy_horizon" in sql
+    assert "payload_text::jsonb->>'available_at')::timestamptz = observed_at" in sql
+    assert "payload_text::jsonb->>'valid_until')::timestamptz = valid_until" in sql
+    assert "GENERATED ALWAYS" not in sql
+    assert "observed_at < valid_until" in sql
+    assert "NOT VALID" in sql and "CREATE INDEX" not in sql
+    assert "SET LOCAL lock_timeout = '2s'" in sql
+    assert "VALIDATE CONSTRAINT ck_equity_context_behavior_contract" in baseline_sql()
+    assert "CREATE INDEX idx_equity_behavior_asof" in baseline_sql()
+    assert "IS TRUE" in sql
+    assert "qualified_direction IS NULL" in sql
+    assert "stock behavior evidence is immutable" in sql
+    assert "stock behavior evidence links are immutable" in sql
+    assert "stock behavior source evidence is immutable" in sql
+    assert "stock behavior evidence prevents evidence truncation" in sql
+    assert "xmin::text = pg_current_xact_id()::text" in sql
+    assert "legacy context cannot be reinterpreted" in sql
+    assert "stock behavior evidence prevents context truncation" in sql
+    assert "BEFORE TRUNCATE" in sql
+    assert "NEW.created_at := clock_timestamp()" in sql
+    assert "CREATE TABLE" not in sql
+    assert not re.search(r"\b(?:UPDATE|DELETE FROM|DROP COLUMN|RENAME COLUMN|TRUNCATE)\s+public\.", sql)
+
+
+def test_stock_behavior_schema_identifier_correction_matches_baseline():
+    sql = (MIGRATIONS_DIR / "045_stock_behavior_adjusted_schema_identifier.sql").read_text(encoding="utf-8")
+    assert sql.strip() in baseline_sql()
+    assert "stock_behavior_adjusted_1d_v1" in sql
+    assert "CREATE OR REPLACE FUNCTION public.guard_equity_behavior_evidence_link" in sql
+    assert "ALTER TABLE" not in sql and "CREATE INDEX" not in sql
+
+
+def test_option_stock_behavior_assessment_migration_matches_baseline():
+    sql = (MIGRATIONS_DIR / "046_option_stock_behavior_assessments.sql").read_text(encoding="utf-8")
+    assert sql.strip() in baseline_sql()
+    assert "CREATE TABLE IF NOT EXISTS public.option_stock_behavior_assessments" in sql
+    assert "candidate_id uuid NOT NULL REFERENCES public.option_strategy_candidates" in sql
+    assert "stock_snapshot_id uuid REFERENCES public.equity_context_snapshots" in sql
+    assert "option_configuration_sha256 character(64) NOT NULL" in sql
+    assert "option_market_policy_sha256 character(64) NOT NULL" in sql
+    assert "option_analysis_policy_sha256 character(64) NOT NULL" in sql
+    assert "candidate.policy_sha256 <> NEW.option_strategy_policy_sha256" in sql
+    assert "candidate.market_data_time <> NEW.option_market_time" in sql
+    assert "JOIN public.option_ingestion_runs AS ingestion USING (batch_id)" in sql
+    assert "source_configuration_sha256 <> NEW.option_configuration_sha256" in sql
+    assert "source_scheduled_cycle <> NEW.stock_market_cutoff" in sql
+    assert "assessment_only' = 'true'::jsonb" in sql
+    assert "execution_permission' = 'false'::jsonb" in sql
+    assert "NEW.recorded_at := clock_timestamp()" in sql
+    assert "candidate.candidate_identity <> NEW.candidate_identity" in sql
+    assert "stock_context.context_kind <> 'STOCK_BEHAVIOR'" in sql
+    assert "BEFORE UPDATE OR DELETE" in sql and "BEFORE TRUNCATE" in sql
+
+
+def test_option_stock_behavior_launch_identity_migration_matches_baseline():
+    sql = (MIGRATIONS_DIR / "047_option_stock_behavior_launch_identity.sql").read_text(
+        encoding="utf-8"
+    )
+    assert sql.strip() in baseline_sql()
+    assert "launch identity migration requires an empty assessment ledger" in sql
+    assert "ADD COLUMN IF NOT EXISTS launch_id varchar(64)" in sql
+    assert "ADD COLUMN IF NOT EXISTS launch_manifest_sha256 character(64)" in sql
+    assert "payload_text::jsonb->>'launch_id' = launch_id" in sql
+    assert "payload_text::jsonb->>'launch_manifest_sha256' = launch_manifest_sha256" in sql
+    assert "idx_option_stock_behavior_launch" in sql
+
+
+def test_option_package_assessment_migration_matches_baseline():
+    sql = (MIGRATIONS_DIR / "048_option_package_assessments.sql").read_text(
+        encoding="utf-8"
+    )
+    assert sql.strip() in baseline_sql()
+    assert "CREATE TABLE IF NOT EXISTS public.option_package_assessments" in sql
+    assert "candidate_id uuid NOT NULL REFERENCES public.option_strategy_candidates" in sql
+    assert "matrix_id uuid NOT NULL REFERENCES public.option_analysis_runs" in sql
+    assert "assessment_status IN ('READY', 'UNAVAILABLE')" in sql
+    assert "package_payload_text text" in sql
+    assert "sha256(convert_to(package_payload_text, 'UTF8'))" in sql
+    assert "payload_text::jsonb->'package' = package_payload_text::jsonb" in sql
+    assert "payload_text::jsonb->'research_only' = 'true'::jsonb" in sql
+    assert "payload_text::jsonb->'execution_permission' = 'false'::jsonb" in sql
+    assert "candidate.candidate_identity <> NEW.candidate_identity" in sql
+    assert "NEW.recorded_at := clock_timestamp()" in sql
+    assert "BEFORE UPDATE OR DELETE" in sql and "BEFORE TRUNCATE" in sql
+
+
+def test_option_outcome_unavailable_migration_matches_baseline():
+    sql = (MIGRATIONS_DIR / "049_option_outcome_unavailable_evidence.sql").read_text(
+        encoding="utf-8"
+    )
+    assert sql.strip() in baseline_sql()
+    assert "CREATE TABLE IF NOT EXISTS public.option_outcome_unavailable_evidence" in sql
+    assert "candidate_id uuid NOT NULL REFERENCES public.option_strategy_candidates" in sql
+    assert "missing_contract_ids bigint[] NOT NULL" in sql
+    assert "payload_text::jsonb->>'status' = 'UNAVAILABLE'" in sql
+    assert "payload_text::jsonb->'research_only' = 'true'::jsonb" in sql
+    assert "payload_text::jsonb->'execution_permission' = 'false'::jsonb" in sql
+    assert "NEW.recorded_at < NEW.availability_deadline" in sql
+    assert "BEFORE UPDATE OR DELETE" in sql and "BEFORE TRUNCATE" in sql
+
+
+def test_option_package_assessment_policy_migration_matches_baseline():
+    sql = (MIGRATIONS_DIR / "050_option_package_assessment_policy.sql").read_text(
+        encoding="utf-8"
+    )
+    assert sql.strip() in baseline_sql()
+    assert "package assessment policy migration requires an empty ledger" in sql
+    assert "ADD COLUMN IF NOT EXISTS assessment_policy_version" in sql
+    assert "ADD COLUMN IF NOT EXISTS assessment_policy_sha256" in sql
+    assert "payload_text::jsonb->>'assessment_policy_version'" in sql
+    assert "payload_text::jsonb->>'assessment_policy_sha256'" in sql
+    assert "idx_option_package_assessment_policy" in sql
+
+
+def test_option_outcome_unavailable_leg_contract_matches_baseline():
+    sql = (MIGRATIONS_DIR / "051_option_outcome_unavailable_leg_contract.sql").read_text(
+        encoding="utf-8"
+    )
+    assert sql.strip() in baseline_sql()
+    assert "unavailable leg contract migration requires an empty ledger" in sql
+    assert "payload_text::jsonb->'required_contract_ids'" in sql
+    assert "array_agg(contract_id ORDER BY leg_index)" in sql
+    assert "valuation_policy_sha256=NEW.valuation_policy_sha256" in sql
+    assert "observed_contract_ids <@ NEW.required_contract_ids" in sql
+    assert "expected_missing_ids <> NEW.missing_contract_ids" in sql
+
+
+def test_option_package_candidate_contract_matches_baseline():
+    sql = (MIGRATIONS_DIR / "052_option_package_candidate_contract.sql").read_text(
+        encoding="utf-8"
+    )
+    assert sql.strip() in baseline_sql()
+    assert "option_package_assessment_matches_candidate" in sql
+    assert "LOCK TABLE public.option_package_assessments" in sql
+    assert "existing option package assessment disagrees with candidate" in sql
+    assert "package_breakevens IS DISTINCT FROM candidate.breakevens" in sql
+    assert "LEFT JOIN public.option_candidate_legs" in sql
+    assert "WHERE candidate_id=candidate.candidate_id" in sql
+    assert "valuation_policy_sha256' <> assessment_valuation_policy_sha256" in sql
 
 
 def test_baseline_creates_final_canonical_inventory() -> None:

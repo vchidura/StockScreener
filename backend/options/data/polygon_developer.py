@@ -31,7 +31,7 @@ from options.domain import (
     SpotPrice,
     WorkStage,
 )
-from options.errors import OptionProviderError, ProviderErrorCategory
+from options.errors import InvalidBatchTransition, OptionProviderError, ProviderErrorCategory
 from options.repositories.ingestion import OptionIngestionRepository
 from options.repositories.trades import OptionTradeRepository
 from options.analytics.marks import UnderlyingMinuteBar
@@ -182,6 +182,7 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
         underlyer: str,
         start_time: datetime,
         end_time: datetime,
+        *, raw_finalized: bool = False,
     ) -> tuple[UnderlyingMinuteBar, ...]:
         start_time = _as_utc(start_time, "start_time")
         end_time = _as_utc(end_time, "end_time")
@@ -193,7 +194,7 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
         )
         payload, _ = self._request_json(
             f"{self.base_url}{path}",
-            {"adjusted": "true", "sort": "asc", "limit": "50000"},
+            {"adjusted": "false" if raw_finalized else "true", "sort": "asc", "limit": "50000"},
         )
         self._validate_provider_status(payload, {"OK", "DELAYED"}, "underlying aggregates")
         results = payload.get("results")
@@ -206,13 +207,16 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
         for row in results:
             if not isinstance(row, dict) or not isinstance(row.get("t"), int):
                 continue
-            market_time = _from_milliseconds(row["t"])
+            bar_start = _from_milliseconds(row["t"])
+            market_time = bar_start + timedelta(minutes=1) if raw_finalized else bar_start
             if not start_time <= market_time <= end_time:
                 continue
             try:
                 bar = UnderlyingMinuteBar(
                     close=Decimal(str(row["c"])),
                     market_data_time=market_time,
+                    bar_start=bar_start if raw_finalized else None,
+                    raw_payload_text=json.dumps(row, sort_keys=True, separators=(",", ":"), allow_nan=False) if raw_finalized else None,
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -493,6 +497,13 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
             existing_batch = self.ingestion_repository.load_batch(batch_id)
             if existing_batch is not None and existing_batch.complete:
                 return existing_batch
+            if existing_batch is not None and existing_batch.status in (
+                BatchStatus.FAILED, BatchStatus.QUARANTINED,
+            ):
+                raise InvalidBatchTransition(
+                    f"ingestion batch {batch_id} is {existing_batch.status.value}; "
+                    "preserve terminal evidence and wait for a new scheduled slot"
+                )
         path = f"/v3/snapshot/options/{quote(underlyer, safe='')}"
         url = f"{self.base_url}{path}"
         params = filters

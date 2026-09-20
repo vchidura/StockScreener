@@ -14,6 +14,7 @@ from options.analytics.analysis_engine import OptionAnalysisEngine
 from options.analytics.marks import UnderlyingMinuteBar
 from options.calendar import OptionExchangeCalendar
 from options.config import OptionRuntimeConfiguration
+from options.errors import InvalidBatchTransition
 from options.model_inputs import (
     DividendCashFlow,
     TREASURY_CURVE_SOURCE,
@@ -101,6 +102,8 @@ class ManualCycleResult:
     completed_at: datetime
     results: tuple[UnderlyingCycleResult, ...]
     board_publication: BoardPublicationResult | None = None
+    baseline_alert_selection: BoardPublicationResult | None = None
+    detector_evaluation: dict | None = None
 
 
 class TerminalOptionQualityError(RuntimeError):
@@ -131,8 +134,26 @@ class ManualOptionPipeline:
         board_repository: OptionBoardPublicationRepository | None = None,
         model_input_repository: OptionModelInputRepository | None = None,
         corporate_action_repository: EquityCorporateActionRepository | None = None,
+        detector_cycle_hook: Callable | None = None,
+        detector_dataset_id: str | None = None,
+        detector_effective_from: datetime | None = None,
+        detector_evaluation_repository=None,
+        raw_spot_repository=None,
+        raw_spot_reference_repository=None,
         clock=None,
     ) -> None:
+        if detector_cycle_hook is not None:
+            if not detector_dataset_id or detector_effective_from is None:
+                raise ValueError("detector hook requires an explicit dataset and effective start")
+            detector_effective_from = _as_utc(detector_effective_from, "detector_effective_from")
+        elif detector_dataset_id is not None or detector_effective_from is not None:
+            raise ValueError("detector scope requires an explicit source hook")
+        self.detector_cycle_hook = detector_cycle_hook
+        self.detector_dataset_id = detector_dataset_id
+        self.detector_effective_from = detector_effective_from
+        self.detector_evaluation_repository = detector_evaluation_repository
+        self.raw_spot_repository = raw_spot_repository
+        self.raw_spot_reference_repository = raw_spot_reference_repository
         self.configuration = configuration
         self.engine = engine
         self.calendar = calendar or OptionExchangeCalendar()
@@ -245,11 +266,25 @@ class ManualOptionPipeline:
             completed_at,
         )
         board_publication = None
+        baseline_alert_selection = None
+        detector_evaluation = None
         if (
             self.strategy_pipeline is not None
             and len(requested) == len(self.configuration.settings.underlyers)
             and set(requested) == set(self.configuration.settings.underlyers)
         ):
+            effective_from = self.configuration.settings.baseline_alerts_effective_from
+            if self.configuration.settings.baseline_alerts_enabled and effective_from is not None and cycle_time >= effective_from:
+                try:
+                    baseline_alert_selection = self.board_repository.publish_baseline_cycle(
+                        configuration=self.configuration, scheduled_cycle=cycle_time,
+                        published_at=_as_utc(self.clock(), "clock"), effective_from=effective_from,
+                        calendar=self.calendar,
+                    )
+                except Exception:
+                    LOGGER.exception("Baseline alert selection failed after strategy acknowledgement")
+                    baseline_alert_selection = BoardPublicationResult(
+                        "FAILED", None, len(requested), 0, 0, {"reason": "BASELINE_SELECTION_FAILED"})
             board_publication = self.board_repository.publish_complete_cycle(
                 scheduled_cycle=cycle_time,
                 as_of_session=as_of_session,
@@ -260,6 +295,35 @@ class ManualOptionPipeline:
                 configuration_sha256=self.configuration.configuration_sha256,
                 published_at=completed_at,
             )
+            if (self.detector_cycle_hook is not None and cycle_time >= self.detector_effective_from
+                    and all(result.status in {"COMPLETE", "ALREADY_COMPLETED"} and result.matrix_id is not None for result in results)):
+                try:
+                    from options.analytics.alert_selection import load_detector_run
+                    from options.repositories.alert_evaluations import OptionAlertEvaluationRepository
+
+                    hook_started_at = _as_utc(self.clock(), "clock")
+                    matrices = {result.underlyer: result.matrix_id for result in results}
+                    repository = self.detector_evaluation_repository or OptionAlertEvaluationRepository()
+                    retained = repository.completed_run(dataset_id=self.detector_dataset_id,
+                        scheduled_cycle=cycle_time, as_of=hook_started_at)
+                    run, records = retained if retained is not None else self.detector_cycle_hook(
+                        configuration=self.configuration, dataset_id=self.detector_dataset_id,
+                        scheduled_cycle=cycle_time, completed_matrices=matrices, started_at=hook_started_at)
+                    run = load_detector_run(run.canonical_json())
+                    if (run.dataset_id != self.detector_dataset_id or run.scheduled_cycle != cycle_time
+                            or run.configuration_sha256 != self.configuration.configuration_sha256
+                            or run.strategy_policy_sha256 != self.configuration.strategy_policy_sha256
+                            or run.market_policy_sha256 != self.configuration.policy_sha256
+                            or run.strategy_version != self.configuration.strategy_policy.strategy_version
+                            or run.expected_underlyers != tuple(sorted(requested))
+                            or dict(run.source_matrices) != matrices
+                            or run.selected_at > _as_utc(self.clock(), "clock")
+                            or retained is None and run.selected_at < hook_started_at):
+                        raise ValueError("detector hook evidence differs from the completed cycle scope")
+                    detector_evaluation = repository.persist_completed_run(run, records)
+                except Exception:
+                    LOGGER.exception("Detector evaluation failed after strategy acknowledgement")
+                    detector_evaluation = dict(status="FAILED", reason="DETECTOR_EVALUATION_FAILED")
         return ManualCycleResult(
             universe_run_id=universe_run_id,
             as_of_session=as_of_session,
@@ -267,7 +331,30 @@ class ManualOptionPipeline:
             completed_at=completed_at,
             results=results,
             board_publication=board_publication,
+            baseline_alert_selection=baseline_alert_selection,
+            detector_evaluation=detector_evaluation,
         )
+
+    def _retain_raw_spot_bars(self, underlyer, bars, observed_at):
+        from equity.domain import BarAvailabilityMode
+        from equity.polygon import normalize_native_bars
+        from equity.repositories import EquityBarRepository, EquityReferenceRepository
+
+        references = self.raw_spot_reference_repository or EquityReferenceRepository()
+        security = references.get_security_as_of(underlyer, DecisionWatermark(min(bar.market_data_time for bar in bars), observed_at))
+        if security is None or not security.active:
+            raise TerminalOptionQualityError("raw option spot requires dated stock security identity")
+        if any(bar.raw_payload_text is None for bar in bars):
+            raise TerminalOptionQualityError("raw option spot requires complete provider OHLCV")
+        retained = normalize_native_bars(security.security_id, underlyer, "1m",
+            [json.loads(bar.raw_payload_text) for bar in bars], observed_at=observed_at,
+            adjusted=False, availability_mode=BarAvailabilityMode.LIVE_OBSERVED)
+        by_close = {(bar.bar_end, bar.close_price): bar for bar in retained}
+        selected = tuple(bar for bar in bars if (bar.market_data_time, bar.close) in by_close)
+        if not selected or any(security.effective_from > bar.bar_start for bar in retained):
+            raise TerminalOptionQualityError("raw option spot requires finalized native regular-session bars")
+        (self.raw_spot_repository or EquityBarRepository()).persist(retained)
+        return selected
 
     def _persist_fixed_universe(
         self,
@@ -448,15 +535,19 @@ class ManualOptionPipeline:
             )
             bars: tuple[UnderlyingMinuteBar, ...] = ()
             if mark_window is not None:
+                raw_spot = self.configuration.valuation_policy.underlying_price_basis == "RAW_FINALIZED_MINUTE_CLOSE_V1"
                 bars = self.engine.get_underlying_minute_bars(
                     underlyer,
                     mark_window[0] - timedelta(minutes=1),
                     mark_window[1],
+                    **({"raw_finalized": True} if raw_spot else {}),
                 )
             observed_time = max(
                 bar_window_observed_at,
                 _as_utc(self.clock(), "clock"),
             )
+            if self.configuration.valuation_policy.underlying_price_basis == "RAW_FINALIZED_MINUTE_CLOSE_V1" and bars:
+                bars = self._retain_raw_spot_bars(underlyer, bars, observed_time)
             context = DecisionContext(cycle_time, observed_time)
             rate_curve = ()
             if self.configuration.settings.risk_free_rate_source == TREASURY_CURVE_SOURCE:
@@ -648,6 +739,7 @@ class ManualOptionPipeline:
                     completed_at,
                 )
             )
+            strategy_reasons: tuple[str, ...] = ()
             if self.strategy_pipeline is not None:
                 strategy_result = self.strategy_pipeline.process(
                     analysis,
@@ -657,6 +749,21 @@ class ManualOptionPipeline:
                 if strategy_result.status == "RETRY":
                     raise RuntimeError(
                         f"strategy pipeline failed: {strategy_result.error}"
+                    )
+                shadow_status = getattr(
+                    strategy_result, "stock_behavior_shadow_status", "DISABLED"
+                )
+                if shadow_status != "DISABLED":
+                    strategy_reasons = (
+                        "STOCK_BEHAVIOR_SHADOW_"
+                        + shadow_status,
+                    )
+                package_status = getattr(
+                    strategy_result, "package_assessment_status", "DISABLED"
+                )
+                if package_status != "DISABLED":
+                    strategy_reasons += (
+                        "OPTION_PACKAGE_ASSESSMENT_" + package_status,
                     )
             if not self.work_repository.complete(work_item.work_id, lease_owner):
                 raise RuntimeError("normalization work lease expired before acknowledgement")
@@ -672,6 +779,7 @@ class ManualOptionPipeline:
                 reasons=(
                     analysis.chain_health.reasons
                     + trade_ingestion.reasons
+                    + strategy_reasons
                     + (
                         ()
                         if open_interest_captured
@@ -680,7 +788,7 @@ class ManualOptionPipeline:
                 ),
             )
         except Exception as exc:
-            retryable = not isinstance(exc, TerminalOptionQualityError)
+            retryable = not isinstance(exc, (TerminalOptionQualityError, InvalidBatchTransition))
             if work_item is not None:
                 if retryable:
                     self.work_repository.retry(
