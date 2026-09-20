@@ -734,3 +734,20 @@ test('prices volumes ranks volatility and categorical observations remain neutra
     for (const value of [.12, -.12, 0, 'UP', 'DOWN', 'RESUMING_UP', 'RESUMING_DOWN']) assert.equal(model.screeningValueClass(field, value), '')
   }
 })
+
+test('screener detail facts prioritize performance context without exposing source identifiers', () => {
+  const row = { values: { price: 100, change: .02, volume: 1_000_000, instrument_type: 'CS',
+    discovery_state: 'TRENDING', discovery_trend: 'UP', vs_ema20: .03, vs_ema50: .08,
+    vs_sma200: .15, vs_prior_high20: -.01, momentum_12_1: .2, momentum_6_1: .12,
+    momentum_3_1: .04, momentum_percentile: .9, dollar_volume_20: 50_000_000,
+    relative_volume_20: 1.4, realized_volatility_21: .25 }, missing: {} }
+  const groups = model.screeningDetailFacts(row, { fields: builtInCatalog.fields })
+  assert.deepEqual(groups.map(group => group.title), ['Snapshot', 'Trend and location', 'Momentum', 'Liquidity and risk'])
+  assert.deepEqual(groups[1].facts.map(fact => fact.field), ['discovery_state', 'discovery_trend', 'vs_ema20', 'vs_prior_high20'])
+  assert.equal(groups[0].facts.find(fact => fact.field === 'price').value, '100')
+  assert.equal(groups[1].facts.find(fact => fact.field === 'vs_ema20').tone, 'sw-value-positive')
+  assert.equal(groups[3].facts.find(fact => fact.field === 'relative_volume_20').label, 'Daily relative volume (20-session)')
+  assert.equal(JSON.stringify(groups).includes('source_bar_id'), false)
+  const missing = model.screeningDetailFacts({ values: { ...row.values, vs_ema20: null }, missing: { vs_ema20: 'HISTORY_GAP' } }, { fields: builtInCatalog.fields })
+  assert.equal(missing[1].facts.find(fact => fact.field === 'vs_ema20').missing, 'HISTORY_GAP')
+})

@@ -13,6 +13,10 @@ import exchange_calendars
 
 SCHEMA = "stock_alert_view_v1"
 SOURCES = ("SHADOW", "REPLAY", "LEGACY")
+STATIC_TRADE_WARNINGS = frozenset({
+    "Paper only", "Forward paper only", "Stop gaps can exceed planned risk",
+    "Action coverage not certified", "Short borrow unverified", "Countertrend context",
+})
 
 
 def session_dates(latest):
@@ -44,6 +48,106 @@ def history_publications(snapshot, session):
     withheld = set(latest_by_strategy.values())
     return sorted((item for item in publications if item["session"] == session
         and item["run_id"] not in withheld), key=publication_order)
+
+
+def directional_risk_warnings(row):
+    if row.get("lane") != "TRADE" or row.get("direction") not in (-1, 1):
+        return []
+    indicators = row.get("indicators") if isinstance(row.get("indicators"), dict) else {}
+    values = {key: indicators.get(key) if isinstance(indicators.get(key), (int, float))
+              and not isinstance(indicators.get(key), bool) and math.isfinite(indicators[key]) else None
+              for key in ("ema20_distance", "ema50_distance", "ema50_slope", "momentum", "rs_percentile",
+                          "rsi", "relative_volume")}
+    direction, evidence = row["direction"], []
+    opposing_side = "bullish" if direction == -1 else "bearish"
+    side = "SHORT" if direction == -1 else "LONG"
+    comparisons = (
+        ("ema20_distance", "price {:+.2%} vs EMA20"),
+        ("ema50_distance", "price {:+.2%} vs EMA50"),
+        ("ema50_slope", "EMA50 {:+.2%} over 10 bars"),
+        ("momentum", "12-minus-1 momentum {:+.2%}"),
+    )
+    for key, detail in comparisons:
+        value = values[key]
+        if value is not None and direction * value < 0:
+            evidence.append(detail.format(value))
+    relative_strength = values["rs_percentile"]
+    if relative_strength is not None and ((direction == -1 and relative_strength >= .7)
+            or (direction == 1 and relative_strength <= .3)):
+        evidence.append(f"RS63 percentile {relative_strength * 100:.1f}")
+    details = []
+    if evidence:
+        details.append(f"countertrend {side} against {opposing_side} trigger evidence (" + "; ".join(evidence) + ")")
+    model = row.get("model")
+    missing = [label for key, label in (("ema20_distance", "EMA20 distance"),
+               ("ema50_distance", "EMA50 distance"), ("ema50_slope", "EMA50 slope"),
+               ("rsi", "RSI14"), ("relative_volume", "relative volume")) if values[key] is None]
+    if missing and model in ("resumption", "acceptance", "failure"):
+        details.append("trigger metrics unavailable: " + ", ".join(missing))
+    warnings = ["Directional context: " + "; ".join(details)] if details else []
+    trigger_risk = []
+    if values["rsi"] is not None and ((direction == 1 and values["rsi"] >= 70)
+            or (direction == -1 and values["rsi"] <= 30)):
+        trigger_risk.append(f"RSI14 {values['rsi']:.1f} ({'overbought LONG' if direction == 1 else 'oversold SHORT'})")
+    if values["relative_volume"] is not None and values["relative_volume"] < 1:
+        trigger_risk.append(f"relative volume {values['relative_volume']:.2f}x versus prior 20-bar mean")
+    if trigger_risk:
+        warnings.append("Trigger risk: " + "; ".join(trigger_risk))
+    return warnings
+
+
+def evidence_risk_warnings(row):
+    warnings = []
+    for warning in row.get("warnings") or []:
+        if warning in STATIC_TRADE_WARNINGS or warning.startswith((
+                "Short opposes ", "Long opposes ", "Extension-reversal model ", "Breakout-acceptance model ",
+                "Trigger-time trend risk is incomplete;", "Directional context:")):
+            continue
+        if warning == "Latest stored price may be stale; inspect its timestamp":
+            stamp = row.get("latest_price_at")
+            if stamp:
+                warnings.append(f"Latest price stale at source read: completed bar ended {stamp}; age exceeded 50 minutes")
+            continue
+        if warning == "Current stored price is stale; inspect its timestamp":
+            stamp = row.get("latest_price_at")
+            interval = f" {row['latest_price_interval']}" if row.get("latest_price_interval") else ""
+            warnings.append(f"Current price stale: latest completed{interval} bar ended {stamp}"
+                            if stamp else "Current price stale: completed-bar timestamp unavailable")
+            continue
+        warnings.append(warning)
+    return list(dict.fromkeys(warnings))
+
+
+def collapse_alert_rows(rows):
+    groups = defaultdict(list)
+    for row in rows:
+        style = row.get("trade_style") or ("SWING" if row["interval"] == "1d" else "INTRADAY")
+        opportunity = row.get("daily_setup_id") if style == "SWING" and row.get("daily_setup_id") else row.get("triggered_at") or row["alert_id"]
+        groups[(row.get("strategy_instance_id"), row["security_id"], row["direction"], style, opportunity)].append(row)
+    status_priority = {"OPEN": 5, "PENDING": 4, "UNRESOLVED": 3, "CLOSED": 2, "CLOSED_PAPER": 2, "NO_FILL": 1}
+    interval_priority = {"30m": 0, "1h": 1, "1d": 2}
+    collapsed = []
+    for group in groups.values():
+        primary = max(group, key=lambda row: (status_priority.get(row["status"], 0),
+            timestamp_value(row.get("triggered_at")) or float("-inf"), row["alert_id"]))
+        merged = dict(primary)
+        variants = sorted(group, key=lambda row: (timestamp_value(row.get("triggered_at")) or float("-inf"),
+            interval_priority.get(row["interval"], 99), row["model"], row["alert_id"]))
+        merged.update(plan_count=len(variants),
+            display_models=sorted({row["model"] for row in variants}),
+            display_intervals=sorted({row["interval"] for row in variants}, key=lambda value: interval_priority.get(value, 99)),
+            plan_variants=[{key: row.get(key) for key in ("alert_id", "model", "interval", "triggered_at", "trigger_price",
+                "stop", "target", "status", "entry_price", "exit_price", "paper_return", "reason")} for row in variants],
+            warnings=list(dict.fromkeys(warning for row in variants for warning in row.get("warnings", []))),
+            hits=max((row.get("hits") for row in variants if row.get("hits") is not None), default=None),
+            hit_models=sorted({model for row in variants for model in row.get("hit_models", [])}),
+            hit_intervals=sorted({interval for row in variants for interval in row.get("hit_intervals", [])}))
+        first_seen = [row.get("first_seen") for row in variants if timestamp_value(row.get("first_seen")) is not None]
+        last_seen = [row.get("last_seen") for row in variants if timestamp_value(row.get("last_seen")) is not None]
+        merged["first_seen"] = min(first_seen, key=timestamp_value) if first_seen else None
+        merged["last_seen"] = max(last_seen, key=timestamp_value) if last_seen else None
+        collapsed.append(merged)
+    return collapsed
 
 
 def alert_page(snapshot, *, session=None, view="latest", run=None, search="", direction=None,
@@ -86,10 +190,10 @@ def alert_page(snapshot, *, session=None, view="latest", run=None, search="", di
             window["models"].update(hit["models"])
             window["intervals"].update(hit["intervals"])
     rows = []
-    active_sides = defaultdict(set)
+    active_sides = defaultdict(lambda: defaultdict(int))
     for item in snapshot.get("alerts", []):
         if item["status"] in ("PENDING", "OPEN", "UNRESOLVED"):
-            active_sides[item["security_id"]].add(item["direction"])
+            active_sides[item["security_id"]][item["direction"]] += 1
     for original in snapshot.get("alerts", []):
         if view == "open":
             if original["status"] not in ("PENDING", "OPEN", "UNRESOLVED"):
@@ -104,8 +208,14 @@ def alert_page(snapshot, *, session=None, view="latest", run=None, search="", di
                 or trade_type and style != trade_type):
             continue
         row = dict(original)
+        row["warnings"] = [*directional_risk_warnings(row), *evidence_risk_warnings(row)]
         if snapshot.get("combined"):
-            row["opposing_exposure"] = -row["direction"] in active_sides[row["security_id"]]
+            opposing = active_sides[row["security_id"]][-row["direction"]]
+            row["opposing_exposure"] = opposing > 0
+            if row["opposing_exposure"]:
+                opposing_side = "LONG" if row["direction"] == -1 else "SHORT"
+                row["warnings"] = list(dict.fromkeys([*row["warnings"],
+                    f"Opposing active exposure: {opposing} {opposing_side} {'plan' if opposing == 1 else 'plans'} retained"]))
         row.update(price_return_fields(row))
         windows = hit_windows[(row.get("strategy_instance_id"), row["security_id"], row["direction"])]
         row_run = next((item for item in latest_runs if item["run_id"] == row["run_id"]), None)
@@ -117,6 +227,7 @@ def alert_page(snapshot, *, session=None, view="latest", run=None, search="", di
             hit_models=sorted({model for item in details for model in item["models"]}),
             hit_intervals=sorted({interval for item in details for interval in item["intervals"]}))
         rows.append(row)
+    rows = collapse_alert_rows(rows)
     sort = sort or ("triggered_at" if view == "history" else "published_at")
     allowed_sort = {"published_at", "triggered_at", "ticker", "direction", "model", "interval", "trigger_price", "entry_price",
                     "stop", "target", "risk_pct", "reward_risk", "hits", "latest_price", "paper_return", "price_return",
@@ -306,8 +417,9 @@ def enrich_replay(snapshot, bundle, config):
                 latest[bar["security_id"]] = bar
     calendar = exchange_calendars.get_calendar("XNYS")
     for alert in snapshot["alerts"]:
-        frame = indices.get((alert["security_id"], alert["interval"]))
-        stamp = pd.Timestamp(alert["triggered_at"])
+        indicator_interval = alert.get("indicator_interval") or alert["interval"]
+        stamp = pd.Timestamp(alert.get("indicator_at") or alert["triggered_at"])
+        frame = indices.get((alert["security_id"], indicator_interval))
         if frame is not None and stamp in frame.index:
             row = frame.loc[stamp]
             if not alert["ticker"]:
@@ -324,6 +436,13 @@ def enrich_replay(snapshot, bundle, config):
         trigger_date = stamp.date().isoformat()
         daily_date = trigger_date if alert["interval"] == "1d" else str(calendar.previous_session(trigger_date).date())
         alert["daily_context_at"] = calendar.session_close(daily_date).isoformat()
+        daily_frame = indices.get((alert["security_id"], "1d"))
+        daily_stamp = pd.Timestamp(alert["daily_context_at"])
+        if daily_frame is not None and daily_stamp in daily_frame.index:
+            daily_row = daily_frame.loc[daily_stamp]
+            if daily_row.ready and daily_row.visible_at <= pd.Timestamp(alert["published_at"]):
+                value = daily_row.relative_volume
+                alert["indicators"]["daily_rvol20"] = float(value) if math.isfinite(value) else None
         bar = latest.get(alert["security_id"])
         if bar:
             if not alert["ticker"]:

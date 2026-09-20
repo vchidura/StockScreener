@@ -833,7 +833,7 @@ def update_positions(state, config, now):
 
 
 def shadow_snapshot(state, publications, config, now):
-    from research.stock_alerts import replay_snapshot, session_dates
+    from research.stock_alerts import enrich_replay, replay_snapshot, session_dates
     projected = []
     for publication in publications:
         item = dict(publication, outcomes={key: state.get("positions", {})[key] for key in publication["selected"] if key in state.get("positions", {})})
@@ -894,6 +894,12 @@ def shadow_snapshot(state, publications, config, now):
         if publication.get("retry_of"):
             record.update(trigger_at=publication["market_time"], retry_of=publication["retry_of"])
             snapshot["warnings"].append("A source-ready retry preserves the earlier incomplete run")
+    alert_members = {row["security_id"] for row in snapshot["alerts"]}
+    if alert_members:
+        bars = [bar for key, retained in state.get("bars", {}).items() if key.rsplit("|", 1)[0] in alert_members
+                for bar in retained.values()]
+        actions = [action for action in state.get("actions", []) if action["security_id"] in alert_members]
+        snapshot = enrich_replay(snapshot, dict(bars=bars, actions=actions), config)
     return snapshot
 
 

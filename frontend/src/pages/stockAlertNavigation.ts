@@ -1,6 +1,6 @@
 import type { AlertSource } from '../services/stockDiscovery'
 
-export type AlertView = 'latest' | 'history' | 'open'
+export type AlertView = 'latest' | 'history' | 'open' | 'eod'
 
 export function alertSort(params: URLSearchParams, view: AlertView) {
   return {
@@ -30,11 +30,11 @@ export function alertTradeFilters(params: URLSearchParams, source: AlertSource) 
 }
 
 export function resolveAlertRoute(params: URLSearchParams): { source: AlertSource; view: AlertView } {
-  const view = params.get('view') === 'history' ? 'history' : params.get('view') === 'open' ? 'open' : 'latest'
+  const view = params.get('view') === 'history' ? 'history' : params.get('view') === 'open' ? 'open' : params.get('view') === 'eod' ? 'eod' : 'latest'
   const requested = params.get('source')
   const source = requested === 'REPLAY' || requested === 'LEGACY' || requested === 'SHADOW'
     ? requested : view === 'history' ? 'REPLAY' : 'SHADOW'
-  return { source: view === 'open' ? 'SHADOW' : source, view }
+  return { source: view === 'open' || view === 'eod' ? 'SHADOW' : source, view }
 }
 
 export function alertSourceParams(source: AlertSource, view: AlertView): URLSearchParams {
@@ -48,11 +48,12 @@ export function alertTabParams(params: URLSearchParams, view: AlertView, forward
   if (forwardEnrolled && !params.has('source')) next.set('source', 'SHADOW')
   if (view !== 'latest') next.set('view', view)
   else next.delete('view')
-  if (view === 'open') {
+  if (view === 'open' || view === 'eod') {
     next.set('source', 'SHADOW')
-    next.delete('session_date')
     next.delete('status')
+    if (view === 'open') next.delete('session_date')
   }
+  if (view !== 'eod') next.delete('review_selection')
   next.delete('run')
   next.delete('offset')
   if (resolveAlertRoute(params).view !== view) {

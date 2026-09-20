@@ -15,6 +15,12 @@ TARGETS = {(row.strategy_name, row.structure_type) for row in STOCK_BEHAVIOR_GAT
 MEASUREMENTS = ("60MIN", "CLOSE", "NEXT_OPEN")
 REQUIRED_GATES = {"PROFILE_DATA_READY", "DIRECTIONAL_THESIS_STRUCTURE", "UNDERLYING_LIQUIDITY_EVIDENCE",
     *(f"TREND_SLOPE_{interval}" for interval in STOCK_BEHAVIOR_GATE_POLICY.required_trend_intervals)}
+PARTICIPATION_BUCKETS = (
+    ("QUIET_LT_0_75X", None, .75),
+    ("NORMAL_0_75_TO_1_25X", .75, 1.25),
+    ("ELEVATED_1_25_TO_2X", 1.25, 2.),
+    ("SURGE_GE_2X", 2., None),
+)
 
 
 def _complete_package(row, applicable, as_of):
@@ -135,6 +141,16 @@ def daily_scorecard(rows, outcomes, unavailable, as_of, *, persisted_alerts=Fals
             continue
         key = (row["underlying"], row["strategy_name"], row["structure_type"])
         cohorts.setdefault(key, row)
+    def outcome_state(row, horizon):
+        key = (str(row["candidate_id"]), horizon)
+        checkpoint = measurement_checkpoints(row["market_data_time"]).get(horizon)
+        outcome = outcome_by_key.get(key)
+        state = ("NOT_APPLICABLE" if checkpoint is None else "NOT_DUE" if checkpoint > as_of
+            else "MEASURED" if outcome and outcome.get("net_return") is not None
+            else "UNAVAILABLE" if key in missing_by_key
+            else "PENDING" if as_of < availability_policy.deadline(checkpoint) else "MISSING_AFTER_DEADLINE")
+        return state, outcome
+
     cells = []
     cohort_rows = {}
     availability_policy = OptionOutcomeAvailabilityPolicy()
@@ -146,15 +162,8 @@ def daily_scorecard(rows, outcomes, unavailable, as_of, *, persisted_alerts=Fals
                 continue
             if arm == "BEHAVIOR_V1_TIMELY" and not (row["behavior"]["eligible"] and row["behavior"]["timely_at_recording"]):
                 continue
-            checkpoints = measurement_checkpoints(row["market_data_time"])
             for horizon in MEASUREMENTS:
-                key = (str(row["candidate_id"]), horizon)
-                checkpoint = checkpoints.get(horizon)
-                outcome = outcome_by_key.get(key)
-                state = ("NOT_APPLICABLE" if checkpoint is None else "NOT_DUE" if checkpoint > as_of
-                    else "MEASURED" if outcome and outcome.get("net_return") is not None
-                    else "UNAVAILABLE" if key in missing_by_key
-                    else "PENDING" if as_of < availability_policy.deadline(checkpoint) else "MISSING_AFTER_DEADLINE")
+                state, outcome = outcome_state(row, horizon)
                 if arm in ("ASSESSMENT_COVERED_CANDIDATE_BASELINE", "PERSISTED_BASELINE_ALERTS"):
                     detail = cohort_rows.setdefault(str(row["candidate_id"]), {
                         field: row[field] for field in ("candidate_id", "candidate_identity", "underlying", "strategy_name",
@@ -176,6 +185,26 @@ def daily_scorecard(rows, outcomes, unavailable, as_of, *, persisted_alerts=Fals
                 minimum_net_return=min(measured) if measured else None, maximum_net_return=max(measured) if measured else None,
                 distinct_underlyings=len({row["underlying"] for row, _, _ in values}),
                 verdict="DESCRIPTIVE_ONLY" if measured else "INCONCLUSIVE", probability=None))
+    participation_groups = defaultdict(list)
+    participation_missing = 0
+    for row in cohorts.values():
+        value = row["behavior"]["metrics"].get("PARTICIPATION_EVIDENCE")
+        if value is None or not isfinite(value):
+            participation_missing += 1
+            continue
+        bucket = next(name for name, lower, upper in PARTICIPATION_BUCKETS
+            if (lower is None or value >= lower) and (upper is None or value < upper))
+        for horizon in MEASUREMENTS:
+            state, outcome = outcome_state(row, horizon)
+            participation_groups[(bucket, row["strategy_name"], row["structure_type"], horizon)].append((state, outcome))
+    participation_cells = []
+    for (bucket, strategy, structure, horizon), values in sorted(participation_groups.items()):
+        measured = [float(outcome["net_return"]) for state, outcome in values if state == "MEASURED"]
+        participation_cells.append(dict(bucket=bucket, strategy=strategy, structure=structure, horizon=horizon,
+            cohorts=len(values), states=dict(Counter(state for state, _ in values)), measured=len(measured),
+            outcome_coverage=len(measured) / len(values), mean_net_return=fmean(measured) if measured else None,
+            positive_mark_fraction=sum(value > 0 for value in measured) / len(measured) if measured else None,
+            verdict="DESCRIPTIVE_ONLY" if measured else "INCONCLUSIVE"))
     factors = defaultdict(list)
     for row in rows:
         for metric, value in row["behavior"]["metrics"].items():
@@ -184,6 +213,13 @@ def daily_scorecard(rows, outcomes, unavailable, as_of, *, persisted_alerts=Fals
         cohort_rule="PERSISTED_FIRST_ALERT_ONLY_REPEATS_EXCLUDED" if persisted_alerts else "FIRST_ASSESSMENT_COVERED_SELECTED_PER_SESSION_UNDERLYING_STRATEGY_STRUCTURE_BEFORE_OUTCOMES",
         factor_basis="CANDIDATE_OCCURRENCES_NOT_INDEPENDENT_SAMPLES",
         factors={key: dict(count=len(values), minimum=min(values), mean=fmean(values), maximum=max(values)) for key, values in sorted(factors.items())},
+        participation_analysis=dict(schema_version="option_daily_rvol_challenger_v1",
+            metric_id="daily_rvol20", gate_id="PARTICIPATION_EVIDENCE",
+            basis="LATEST_COMPLETED_DAILY_VOLUME_OVER_PRIOR_20_SESSION_MEAN",
+            timing="PRIOR_COMPLETED_SESSION_FOR_INTRADAY_CANDIDATES", selection_effect=False,
+            missing_cohorts=participation_missing,
+            buckets=[dict(name=name, minimum=lower, maximum_exclusive=upper) for name, lower, upper in PARTICIPATION_BUCKETS],
+            cells=participation_cells),
         by_strategy={name: selection_funnel([row for row in rows if row["strategy_name"] == name]) for name in sorted({row["strategy_name"] for row in rows})},
         outcome_basis="INDICATIVE_OPTION_MARKS_NET_COMMISSION_NO_SLIPPAGE", probability=None,
         calibration_status="NOT_ATTEMPTED", threshold_changes=False, execution_permission=False)

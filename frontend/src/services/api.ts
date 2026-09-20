@@ -2481,6 +2481,19 @@ export interface OptionBehaviorReview {
     outcomes: Record<string, {state: string; net_return: number | null; net_pnl: string | null; estimated_cost: string | null}> }>
   by_strategy?: Record<string, OptionBehaviorFunnel>
   factors?: Record<string, {count: number; minimum: number; mean: number; maximum: number}>
+  participation_analysis?: {
+    schema_version: 'option_daily_rvol_challenger_v1'
+    metric_id: 'daily_rvol20'
+    gate_id: 'PARTICIPATION_EVIDENCE'
+    basis: string
+    timing: string
+    selection_effect: false
+    missing_cohorts: number
+    buckets: Array<{ name: string; minimum: number | null; maximum_exclusive: number | null }>
+    cells: Array<{ bucket: string; strategy: string; structure: string; horizon: string; cohorts: number;
+      states: Record<string, number>; measured: number; outcome_coverage: number; mean_net_return: number | null;
+      positive_mark_fraction: number | null; verdict: string }>
+  }
   cells?: Array<{ arm: string; strategy: string; structure: string; horizon: string; cohorts: number; measured: number;
     states: Record<string, number>; outcome_coverage: number | null; mean_net_return: number | null;
     positive_mark_fraction: number | null; minimum_net_return: number | null; maximum_net_return: number | null; verdict: string }>

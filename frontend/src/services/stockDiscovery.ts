@@ -135,6 +135,23 @@ export interface AlertPlanRow {
   last_seen: string | null
   hit_models: string[]
   hit_intervals: string[]
+  plan_count?: number
+  display_models?: string[]
+  display_intervals?: string[]
+  plan_variants?: Array<{
+    alert_id: string
+    model: string
+    interval: string
+    triggered_at: string
+    trigger_price: number | null
+    stop: number | null
+    target: number | null
+    status: string
+    entry_price: number | null
+    exit_price: number | null
+    paper_return: number | null
+    reason: string | null
+  }>
   indicators: Record<string, number | string | null>
   indicator_at: string
   indicator_interval: string
@@ -181,3 +198,116 @@ export interface AlertViewResponse {
 
 export const getAlertView = async (params: Record<string, string | number | boolean | undefined>) =>
   (await api.get<AlertViewResponse>('/stocks/alert-view', { params })).data
+
+export type StockEodSelection = 'SELECTED' | 'NOT_SELECTED' | 'REPEAT'
+
+export interface StockEodReviewRow {
+  candidate_id: string
+  episode_id: string
+  ticker: string
+  security_id: string
+  direction: -1 | 1
+  trade_type: 'INTRADAY' | 'SWING'
+  strategy_label: string
+  model: 'resumption' | 'acceptance' | 'failure'
+  interval: '30m' | '1h' | '1d'
+  selection_status: StockEodSelection
+  selection_reason: string
+  reason_counts: Record<string, number>
+  occurrences: number
+  repeat_occurrences: number
+  first_seen: string
+  last_seen: string
+  model_rank: number | null
+  pool_size: number | null
+  priority_rank: number | null
+  priority_pool_size: number | null
+  ranking_basis: string
+  trigger_at: string
+  trigger_price: number
+  stop: number
+  target: number
+  risk_pct: number | null
+  reward_risk: number | null
+  rs_percentile: number
+  extension_atr: number
+  momentum: number
+  liquidity: number
+  policy_version: string
+  outcome_status: string | null
+  paper_return: number | null
+}
+
+export interface StockEodReview {
+  schema: 'stock_alert_eod_review_v1'
+  storage_ready: boolean
+  as_of: string
+  session_date: string | null
+  sessions: string[]
+  completed_runs: number
+  missed_runs: number
+  detected_occurrences: number
+  unique_candidates: number
+  outcome_status: 'DESCRIPTIVE_CURRENT_PAPER_OUTCOMES_NOT_CALIBRATED'
+  execution_permission: false
+  review_signals: Array<
+    | { code: 'COVERAGE_LIMITED'; severity: 'CAUTION'; completed: number; missed: number; total_runs: number; completion_rate: number }
+    | { code: 'ALLOCATION_PRESSURE'; severity: 'CAUTION'; candidates: number; top_three_priority: number }
+    | { code: 'RANK_ORDER_INVERSION'; severity: 'REVIEW'; model: 'resumption' | 'acceptance' | 'failure'; rank1_measured: number; rank1_mean_return: number; rank2_3_measured: number; rank2_3_mean_return: number }
+    | { code: 'LOW_FILL_CONVERSION'; severity: 'REVIEW'; model: 'resumption' | 'acceptance' | 'failure'; fill_rate: number; entered: number; no_fill: number; resolved: number }
+    | { code: 'ALLOCATION_CONCENTRATION'; severity: 'REVIEW'; dimension: 'direction' | 'interval'; value: string | number; share: number; selected: number }
+  >
+  diagnostics: {
+    coverage: { completed: number; missed: number; completion_rate: number | null }
+    conversion: StockEodOutcomeSummary
+    rank_buckets: Array<StockEodOutcomeSummary & { model: 'resumption' | 'acceptance' | 'failure'; bucket: 'RANK_1' | 'RANK_2_3' | 'RANK_4_PLUS' }>
+    bottlenecks: Array<{ reason: string; category: 'ALLOCATION' | 'PLAN_GEOMETRY' | 'TIMING_OR_DATA'; candidates: number; ranked: number; top_three_priority: number; median_priority: number | null }>
+    direction_mix: Array<StockEodOutcomeSummary & { value: -1 | 1; share: number | null }>
+    interval_mix: Array<StockEodOutcomeSummary & { value: '30m' | '1h' | '1d'; share: number | null }>
+    model_mix: Array<StockEodOutcomeSummary & { value: 'resumption' | 'acceptance' | 'failure'; share: number | null }>
+    limitations: string[]
+  }
+  models: Array<{
+    model: 'resumption' | 'acceptance' | 'failure'
+    detected_occurrences: number
+    unique_candidates: number
+    selected: number
+    not_selected: number
+    repeats: number
+    entered: number
+    closed: number
+    open: number
+    no_fill: number
+    pending: number
+    unavailable: number
+    fill_rate: number | null
+    measured: number
+    positive_rate: number | null
+    mean_return: number | null
+    median_return: number | null
+    top_reasons: Array<{ reason: string; count: number }>
+    ranking_basis: string
+  }>
+  total: number
+  offset: number
+  limit: number
+  rows: StockEodReviewRow[]
+}
+
+export interface StockEodOutcomeSummary {
+  selected: number
+  entered: number
+  closed: number
+  open: number
+  no_fill: number
+  pending: number
+  unavailable: number
+  fill_rate: number | null
+  measured: number
+  positive_rate: number | null
+  mean_return: number | null
+  median_return: number | null
+}
+
+export const getStockEodReview = async (params: Record<string, string | number | undefined>) =>
+  (await api.get<StockEodReview>('/stocks/alert-eod-review', { params })).data

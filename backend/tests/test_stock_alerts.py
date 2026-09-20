@@ -2,7 +2,7 @@ from copy import deepcopy
 
 import pytest
 
-from research.stock_alerts import alert_page, price_return_fields, risk_fields, session_dates
+from research.stock_alerts import alert_page, directional_risk_warnings, price_return_fields, risk_fields, session_dates
 
 
 def snapshot():
@@ -77,6 +77,75 @@ def test_combined_missing_stream_retains_other_results_and_never_nets_opposed_pl
         row.update(status="OPEN", direction=direction)
     page = alert_page(combined, view="open")
     assert page["total"] == 2 and all(row["opposing_exposure"] for row in page["rows"])
+    assert {warning for row in page["rows"] for warning in row["warnings"] if warning.startswith("Opposing active exposure:")} == {
+        "Opposing active exposure: 1 LONG plan retained", "Opposing active exposure: 1 SHORT plan retained"}
+
+
+@pytest.mark.parametrize("direction,indicators,expected", [
+    (-1, dict(ema20_distance=.12, ema50_distance=.2, ema50_slope=.08, momentum=2.35, rs_percentile=.94,
+              rsi=62., relative_volume=1.2),
+     "Directional context: countertrend SHORT against bullish trigger evidence"),
+    (1, dict(ema20_distance=-.12, ema50_distance=-.2, ema50_slope=-.08, momentum=-.35, rs_percentile=.06,
+             rsi=38., relative_volume=1.2),
+     "Directional context: countertrend LONG against bearish trigger evidence"),
+])
+def test_directional_risk_warnings_are_symmetric(direction, indicators, expected):
+    row = dict(lane="TRADE", direction=direction, model="failure", indicators=indicators)
+    warnings = directional_risk_warnings(row)
+    assert warnings[0].startswith(expected)
+    assert len(warnings) == 1 and "12-minus-1 momentum" in warnings[0] and "RS63 percentile" in warnings[0]
+    assert "trigger metrics unavailable" not in warnings[0]
+
+
+def test_directional_risk_warnings_cover_missing_context_without_false_conflict():
+    aligned = dict(lane="TRADE", direction=1, model="resumption", indicators=dict(
+        ema20_distance=.02, ema50_distance=.04, ema50_slope=.01, momentum=.2, rs_percentile=.8,
+        rsi=55., relative_volume=1.1))
+    assert directional_risk_warnings(aligned) == []
+    incomplete = aligned | dict(model="acceptance", indicators=dict(momentum=.2, rs_percentile=.8))
+    warnings = directional_risk_warnings(incomplete)
+    assert warnings == ["Directional context: trigger metrics unavailable: EMA20 distance, EMA50 distance, EMA50 slope, RSI14, relative volume"]
+
+
+def test_directional_risk_warnings_use_rsi_and_relative_volume_only_at_risk_thresholds():
+    row = dict(lane="TRADE", direction=1, model="resumption", indicators=dict(
+        ema20_distance=.02, ema50_distance=.04, ema50_slope=.01, momentum=.2, rs_percentile=.8,
+        rsi=72.34, relative_volume=.62))
+    assert directional_risk_warnings(row) == [
+        "Trigger risk: RSI14 72.3 (overbought LONG); relative volume 0.62x versus prior 20-bar mean"]
+    row["direction"] = -1
+    row["indicators"].update(ema20_distance=-.02, ema50_distance=-.04, ema50_slope=-.01,
+        momentum=-.2, rs_percentile=.2, rsi=28.76, relative_volume=1.)
+    assert directional_risk_warnings(row) == ["Trigger risk: RSI14 28.8 (oversold SHORT)"]
+
+
+def test_alert_page_adds_directional_warnings_without_mutating_retained_alert():
+    data = snapshot()
+    alert = data["alerts"][0]
+    alert.update(direction=-1, model="failure", warnings=["Paper only", "Stop gaps can exceed planned risk",
+        "Action coverage not certified", "Short borrow unverified", "Forward paper only"],
+        indicators=dict(momentum=2.35, rs_percentile=.94))
+    original = deepcopy(alert)
+    row = alert_page(data, session="2026-09-02", run="one")["rows"][0]
+    context = [warning for warning in row["warnings"] if warning.startswith("Directional context:")]
+    assert row["warnings"] == context and len(context) == 1 and "12-minus-1 momentum +235.00%" in context[0]
+    assert "RS63 percentile 94.0" in context[0] and "trigger metrics unavailable" in context[0]
+    assert alert == original
+
+
+@pytest.mark.parametrize("warning,expected", [
+    ("Latest stored price may be stale; inspect its timestamp",
+     "Latest price stale at source read: completed bar ended 2026-09-02T20:00:00Z; age exceeded 50 minutes"),
+    ("Current stored price is stale; inspect its timestamp",
+     "Current price stale: latest completed 5m bar ended 2026-09-02T20:00:00Z"),
+])
+def test_alert_page_replaces_stale_boilerplate_with_exact_bar_evidence(warning, expected):
+    data = snapshot()
+    data["alerts"][0].update(warnings=[warning], latest_price_at="2026-09-02T20:00:00Z",
+        latest_price_interval="5m", indicators=dict(ema20_distance=.01, ema50_distance=.02,
+            ema50_slope=.01, momentum=.2, rs_percentile=.8, rsi=55., relative_volume=1.1))
+    row = alert_page(data, session="2026-09-02", run="one")["rows"][0]
+    assert row["warnings"] == [expected]
 
 
 def test_combined_context_uses_original_instance_ids_without_changing_rows(monkeypatch):
@@ -486,6 +555,45 @@ def test_history_keeps_frozen_plan_and_distinct_valid_window_hits():
     assert data == original
 
 
+def test_history_collapses_same_side_interval_variants_without_merging_opposite_direction():
+    data = snapshot()
+    first = data["alerts"][0]
+    first.update(triggered_at="2026-09-02T14:00:00Z", status="CLOSED", interval="30m", stop=99.,
+        target=105., paper_return=.02, warnings=["first"], indicators=dict(ema20_distance=.01,
+            ema50_distance=.02, ema50_slope=.01, momentum=.2, rs_percentile=.8, rsi=55., relative_volume=1.1))
+    data["alerts"].append(dict(first, alert_id="hourly", run_id="empty", interval="1h", status="NO_FILL",
+        stop=98.5, target=106., paper_return=0., warnings=["second"]))
+    data["alerts"].append(dict(first, alert_id="short", run_id="empty", direction=-1, model="failure",
+        interval="1h", status="CLOSED", stop=102., target=95.))
+    original = deepcopy(data)
+    page = alert_page(data, session="2026-09-02", view="history")
+    assert page["total"] == 2
+    long = next(row for row in page["rows"] if row["direction"] == 1)
+    assert long["alert_id"] == "plan" and long["status"] == "CLOSED" and long["plan_count"] == 2
+    assert long["display_models"] == ["resumption"] and long["display_intervals"] == ["30m", "1h"]
+    assert [variant["status"] for variant in long["plan_variants"]] == ["CLOSED", "NO_FILL"]
+    assert long["warnings"] == ["first", "second"] and long["hits"] == 2
+    short = next(row for row in page["rows"] if row["direction"] == -1)
+    assert short["plan_count"] == 1 and short["alert_id"] == "short"
+    assert data == original
+
+
+def test_history_collapses_swing_confirmations_by_daily_setup_only():
+    data = snapshot()
+    first = data["alerts"][0]
+    first.update(trade_style="SWING", daily_setup_id="daily-one", triggered_at="2026-09-02T14:00:00Z",
+        interval="30m", status="OPEN")
+    data["alerts"].append(dict(first, alert_id="hourly-confirmation", run_id="empty", interval="1h",
+        triggered_at="2026-09-02T14:30:00Z"))
+    data["alerts"].append(dict(first, alert_id="later-setup", run_id="empty", daily_setup_id="daily-two",
+        triggered_at="2026-09-02T15:00:00Z"))
+    page = alert_page(data, session="2026-09-02", view="history")
+    assert page["total"] == 2
+    grouped = next(row for row in page["rows"] if row["daily_setup_id"] == "daily-one")
+    assert grouped["plan_count"] == 2 and grouped["display_intervals"] == ["30m", "1h"]
+    assert next(row for row in page["rows"] if row["daily_setup_id"] == "daily-two")["plan_count"] == 1
+
+
 def test_history_withholds_latest_run_before_filters_then_releases_it_after_next_run():
     data = dict(snapshot(), source="SHADOW")
     data["publications"] = data["publications"][:1]
@@ -779,6 +887,53 @@ def test_enrichment_is_prefix_causal_and_does_not_reprice_closed_plans():
     assert enriched["alerts"][0]["latest_price"] == 200.
     assert enriched["alerts"][0]["paper_return"] == .02
     assert enriched["alerts"][0]["stop"] == 99. and enriched["alerts"][0]["target"] == 105.
+
+
+def test_enrichment_uses_frozen_daily_setup_metrics_for_intraday_confirmed_swing():
+    from research.stock_alerts import enrich_replay
+    from test_stock_idea_replay import full_fixture
+    fixture, config = full_fixture()
+    daily_bars = [bar for bar in fixture["bars"] if bar["ticker"] == "A" and bar["interval"] == "1d"]
+    for index, bar in enumerate(daily_bars):
+        bar["close"] += .03 if index % 2 else -.03
+        bar["high"] = max(bar["high"], bar["close"] + .01)
+        bar["low"] = min(bar["low"], bar["close"] - .01)
+    data = snapshot()
+    daily = next(bar for bar in daily_bars if bar["session"] == "2026-08-03")
+    data["alerts"][0].update(interval="30m", triggered_at="2026-08-03T14:00:00+00:00",
+        published_at="2026-08-03T20:17:00+00:00", indicator_interval="1d", indicator_at=daily["bar_end"], indicators={})
+    alert = enrich_replay(data, fixture, config)["alerts"][0]
+    assert alert["indicator_status"] == "RECONSTRUCTED_PINNED_TRIGGER_SNAPSHOT"
+    assert all(alert["indicators"].get(key) is not None for key in (
+        "rsi", "relative_volume", "daily_rvol20", "volatility", "ema20_distance", "ema50_distance", "ema50_slope"))
+    assert alert["indicators"]["daily_rvol20"] == alert["indicators"]["relative_volume"]
+
+
+def test_shadow_snapshot_enriches_trigger_metrics_without_changing_plan():
+    from research.stock_idea_forward import shadow_snapshot
+    from research.stock_idea_engine import candidate_record
+    from research.stock_idea_replay import available_at
+    from test_stock_idea_engine import candidate, NOW
+    from test_stock_idea_replay import full_fixture
+    fixture, config = full_fixture()
+    trade = candidate()
+    eligible = [bar for bar in fixture["bars"] if available_at(bar, config) <= NOW]
+    state = dict(enrolled_at="2026-06-01T13:00:00Z", next_boundary="2026-08-03T14:30:00Z",
+        members=[dict(security_id="A", ticker="A")], actions=[], positions={trade.episode_id: dict(
+            candidate=candidate_record(trade), state="PENDING")}, bars={})
+    for bar in eligible:
+        state["bars"].setdefault(f"{bar['security_id']}|{bar['interval']}", {})[bar["bar_start"]] = bar
+    publication = dict(arm="PRIORITY", window_key=trade.trigger_at.isoformat(), deadline=NOW.isoformat(),
+        session=str(trade.trigger_at.date()), coverage="PUBLISHED", expected_members=["A"], missing_members=[],
+        selected=[trade.episode_id], dispositions=[dict(episode_id=trade.episode_id, security_id="A",
+            direction=1, model="resumption", interval="30m", reason=None)])
+    alert = shadow_snapshot(state, [publication], config, NOW)["alerts"][0]
+    assert {key: alert[key] for key in ("trigger_price", "stop", "target")} == {
+        "trigger_price": trade.price, "stop": trade.stop, "target": trade.target}
+    assert alert["indicator_status"] == "RECONSTRUCTED_PINNED_TRIGGER_SNAPSHOT"
+    assert all(alert["indicators"].get(key) is not None for key in (
+        "relative_volume", "daily_rvol20", "volatility", "ema20_distance", "ema50_distance", "ema50_slope"))
+    assert alert["daily_context_at"] < alert["triggered_at"]
 
 
 def test_filtering_and_indicator_sort_never_change_the_original_run():

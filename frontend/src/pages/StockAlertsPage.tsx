@@ -1,12 +1,13 @@
-import { Fragment, useDeferredValue, useState, type ReactNode } from 'react'
+import { useDeferredValue, useEffect, useEffectEvent, useRef, useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
-import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Bell, ChevronDown, ChevronRight, Clock, Download, History, RefreshCw, ShieldAlert } from 'lucide-react'
+import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Bell, Clock, Download, Eye, History, RefreshCw, ShieldAlert, X } from 'lucide-react'
 import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
 import { usePublishPageContext } from '../layout/pageContext'
-import { getAlertView, type AlertContextFactor, type AlertPlanRow } from '../services/stockDiscovery'
+import { getAlertView, type AlertPlanRow } from '../services/stockDiscovery'
 import { alertSort, alertSourceParams, alertTabParams, alertTradeFilters, legacyAlertStatuses, resolveAlertRoute, tradeAlertModels, tradeAlertStatuses, type AlertView } from './stockAlertNavigation'
-import { alertColumnLayout, alertPlanTiming, alertRiskAssessment, unavailableAlertProbability } from './stockAlertPresentation'
+import { alertColumnLayout, alertPlanTiming, alertPublicationFacts, alertRiskAssessment, earliestAlertWindow, unavailableAlertProbability } from './stockAlertPresentation'
+import StockEodReviewPanel from './StockEodReviewPanel'
 import './StockDiscoveryPage.css'
 import './StockAlertsPage.css'
 
@@ -69,84 +70,82 @@ function exportAlerts(rows: AlertPlanRow[], visible: AlertColumn[], value: (row:
   URL.revokeObjectURL(url)
 }
 
-function contextValue(key: string, factor: AlertContextFactor): ReactNode {
-  const value = factor.value
-  if (!value) return 'Unavailable'
-  if (key === 'market') return value.direction ? readable(value.direction) : 'Unavailable'
-  if (key === 'spy' || key === 'qqq') return <>{value.direction ? readable(value.direction) : 'Unavailable'} / 1 session {percent(value.return1)} / 5 sessions {percent(value.return5)} / 20 sessions {percent(value.return20)}</>
-  if (key === 'sector_rotation' || key === 'stock_relative_rotation') return <>
-    {value.state ? readable(value.state) : 'Unavailable'} / 5-session relative {number((value.relative5 ?? NaN) * 100)} pp
-    <p>20-session relative {number((value.relative20 ?? NaN) * 100)} pp / relative change {number((value.relative_change5 ?? NaN) * 100)} pp</p>
-    {factor.persistence && <p>{readable(factor.persistence.status)} ({factor.persistence.observations}) / reconstructed trail</p>}
-  </>
-  if (key === 'stock_divergence') return value.labels?.map(readable).join('; ') || 'Unavailable'
-  if (key === 'tracked_breadth') return <>{value.advancing} advancing / {value.declining} declining
-    <p>Above SMA50 {number((value.above_sma50_fraction ?? NaN) * 100)}% / SMA200 {number((value.above_sma200_fraction ?? NaN) * 100)}%</p>
-    <p>Coverage {factor.timely_observations ?? 'Unknown'} / {factor.expected_observations ?? 'Unknown'}</p></>
-  if (key === 'spy_realized_volatility') return <>{number((value.annualized_volatility20 ?? NaN) * 100)}% annualized / 20 daily returns</>
-  if (key === 'vix' || key === 'credit') return <>{number(value.level)} {key === 'credit' ? 'bps' : 'points'} / percentile {number((value.percentile ?? NaN) * 100)}%</>
-  if (key === 'conditions_score') return <>{number(value.score, 1)} / 100 / development only</>
-  if (key === 'market_volume' || key === 'sector_volume') return <>{number(value.relative_volume)}x / same elapsed session time</>
-  if (key === 'event_shadow') return <>{value.disposition ? readable(value.disposition) : 'Unknown'} / live gate disabled
-    {!!value.blocking_factors?.length && <p>Holding-window events: {value.blocking_factors.join(', ')}</p>}
-    {!!value.unknown_factors?.length && <p>Uncertain: {value.unknown_factors.join(', ')}</p>}</>
-  if (key === 'stock_daily') return <>{value.direction ? readable(value.direction) : 'Unavailable'} / 20-session return {percent(value.return20)}</>
-  if (key === 'sector') return <>{value.direction ? readable(value.direction) : 'Unavailable'} / stock vs sector {number((value.stock_minus_sector20 ?? NaN) * 100)} pp / sector vs SPY {number((value.sector_minus_spy20 ?? NaN) * 100)} pp (20 sessions)</>
-  if (key === 'financials') return value.reports?.map(report => <div className="sa-financial-report" key={report.report_id}>
-    <strong>{readable(report.timeframe)} / {report.period_end}</strong>
-    <p>Filed {report.filing_date} / {report.age_days} days since period end{report.stale ? ' / Stale' : ''}</p>
-    <p>{readable(report.units)}</p>
-    <p>Cash {number(report.metrics.cash_and_equivalents)} / current debt {number(report.metrics.current_debt)} / long-term debt {number(report.metrics.long_term_debt)}</p>
-    <p>Operating cash flow {number(report.metrics.operating_cash_flow)} / capex {number(report.metrics.capital_expenditures)} / reported free cash flow {number(report.metrics.free_cash_flow)}</p>
-    <p>{report.source}{report.accession_number ? ` / ${report.accession_number}` : ''}</p>
-  </div>) || 'Unavailable'
-  if (value.events?.length) return <>{value.events.map((event, index) => <p key={`${event.type}-${event.scheduled_time}-${index}`}>
-    {readable(event.type)} / {time(event.scheduled_time)} ET / {readable(event.confidence)}
-    {event.relative_timing && <small>{readable(event.relative_timing)}</small>}
-  </p>)}{value.timing_uncertain && <span>Event timing uncertain</span>}</>
-  return value.coverage_complete ? 'No known event in the holding horizon' : 'Event coverage unknown'
+function AlertDetailField({ label, value }: { label: string; value: ReactNode }) {
+  return <div className="sa-detail-field"><span>{label}</span><strong>{value}</strong></div>
 }
 
-function SavedAlertContext({ row }: { row: AlertPlanRow }) {
-  const context = row.context
-  const labels: [string, string][] = [['market', 'Market'], ['stock_daily', 'Ticker daily'], ['sector', 'Sector'],
-    ['earnings', 'Earnings'], ['fomc', 'FOMC'], ['financials', 'Financials / debt / cash flow'],
-    ['sector_rotation', 'Sector rotation vs SPY'], ['stock_relative_rotation', 'Ticker rotation vs sector'],
-    ['stock_divergence', 'Five-session divergence'], ['tracked_breadth', 'Tracked-stock breadth'],
-    ['spy', 'SPY'], ['qqq', 'QQQ'], ['spy_realized_volatility', 'SPY realized volatility'],
-    ['vix', 'VIX'], ['credit', 'High-yield OAS'], ['conditions_score', 'Development conditions score'],
-    ['market_volume', 'SPY comparable volume'], ['sector_volume', 'Sector comparable volume'], ['event_shadow', 'Event shadow study']]
-  return <section className="sa-context" aria-label={`Saved context for ${row.ticker}`}>
-    <h3>Publication context</h3>
-    {context?.status !== 'AVAILABLE' ? <p className="sa-context-meta">{context?.reason ? readable(context.reason) : 'No saved publication context'}</p> : <>
-      <p className="sa-context-meta">Retained as-of evidence / cutoff {time(context.input_cutoff)} ET / assembled {time(context.assembled_at)} ET</p>
-      <dl className="sa-context-grid">{labels.filter(([key], index) => index < 6 || key in context.factors).map(([key, label]) => {
-        const factor = context.factors[key]
-        return <div key={key}><dt>{label}</dt><dd>
-          <span className="sa-context-status">{factor ? readable(factor.status) : 'Not covered'}</span>
-          {factor && <div>{contextValue(key, factor)}</div>}
-          {factor && <details className="sa-context-evidence"><summary>Source evidence ({factor.source_revision_ids.length})</summary>
-            <p>Market/event time {time(factor.market_time)} ET</p>
-            <p>Observed {time(factor.observed_at)} ET / available {time(factor.available_at)} ET</p>
-            {factor.source_snapshot_sha256 && <><p>Archived Market Conditions / session {factor.source_snapshot_session}</p><code>{factor.source_snapshot_sha256}</code><p>Source lineage</p><code>{factor.source_lineage_ref}</code></>}
-            {factor.reason_codes.length > 0 && <p>{factor.reason_codes.map(readable).join('; ')}</p>}
-            <code>{factor.source_revision_ids.join(', ') || 'No eligible source revisions'}</code>
-          </details>}
-        </dd></div>
-      })}</dl>
-      <details className="sa-context-evidence"><summary>Publication provenance</summary>
-        <p>{context.capture_mode ? readable(context.capture_mode) : 'Unavailable'}</p>
-        <p>Published {time(context.publication_at)} ET</p>
-        <p>Context hash <code>{context.bundle_sha256}</code></p>
-        <p>Original publication hash <code>{context.source_publication_sha256}</code></p>
-      </details>
-    </>}
-  </section>
+function AlertDetailDrawer({ row, returnFocus, onClose }: {
+  row: AlertPlanRow
+  returnFocus: HTMLButtonElement | null
+  onClose: () => void
+}) {
+  const assessment = alertRiskAssessment(row)
+  const timing = alertPlanTiming(row)
+  const direction = row.direction === 1 ? 'Long' : row.direction === -1 ? 'Short' : 'Context'
+  const displayedModels = (row.display_models || [row.model]).map(model => models[model] || readable(model))
+  const displayedIntervals = row.display_intervals || [row.interval]
+  const publicationFacts = alertPublicationFacts(row)
+  const closeOnEscape = useEffectEvent(onClose)
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeOnEscape()
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      returnFocus?.focus()
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [returnFocus])
+  return <div className="sa-drawer-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
+    <aside className="sa-alert-drawer" role="dialog" aria-modal="true" aria-labelledby="sa-alert-drawer-title">
+      <header><div><span>{timing.style} alert review</span><h2 id="sa-alert-drawer-title"><Link to={`/ticker/${encodeURIComponent(row.ticker)}`}>{row.ticker}</Link> <small className={tone(row.direction)}>{direction}</small></h2><p>{displayedModels.join(' + ')} / {displayedIntervals.join(' + ')} / {readable(row.status)}</p></div>
+        <button type="button" className="sa-drawer-close" title="Close alert details" aria-label="Close alert details" autoFocus onClick={onClose}><X size={18} /></button></header>
+      <div className="sa-alert-drawer__body">
+        <section><h3>Trade plan</h3><div className="sa-detail-grid">
+          <AlertDetailField label="Trigger" value={price(row.trigger_price)} />
+          <AlertDetailField label="Original stop" value={price(row.stop)} />
+          <AlertDetailField label="Target" value={price(row.target)} />
+          <AlertDetailField label="Risk to stop" value={percent(row.risk_pct)} />
+          <AlertDetailField label="Reward / risk" value={`${number(row.reward_risk)}x`} />
+          <AlertDetailField label="Maximum hold" value={timing.hold} />
+        </div>{(row.plan_count || 1) > 1 && <p className="sa-detail-empty">Primary plan shown above; {row.plan_count} same-side plans are consolidated in this row.</p>}</section>
+        {(row.plan_variants?.length || 0) > 1 && <section><h3>Plan variants</h3><div className="sa-variant-list">{row.plan_variants!.map(variant => <div key={variant.alert_id}>
+          <span><strong>{models[variant.model] || readable(variant.model)} / {variant.interval}</strong><small>{readable(variant.status)}</small></span>
+          <span>{price(variant.trigger_price)} trigger / {price(variant.stop)} stop / {price(variant.target)} target</span>
+          <span>{variant.status === 'NO_FILL' ? 'No paper entry' : variant.paper_return == null ? 'Outcome pending' : `${percent(variant.paper_return)} paper P/L`}</span>
+        </div>)}</div></section>}
+        <section><h3>Trigger evidence</h3><div className="sa-detail-grid sa-detail-grid--metrics">
+          <AlertDetailField label="Price vs EMA50" value={percent(row.indicators.ema50_distance)} />
+          <AlertDetailField label="EMA50 slope / 10 bars" value={percent(row.indicators.ema50_slope)} />
+          <AlertDetailField label="RSI14" value={number(row.indicators.rsi, 1)} />
+          <AlertDetailField label="12-1 momentum" value={percent(row.indicators.momentum)} />
+          <AlertDetailField label="RS63 percentile" value={typeof row.indicators.rs_percentile === 'number' ? `${number(row.indicators.rs_percentile * 100, 1)}%` : 'N/A'} />
+          <AlertDetailField label={`${row.indicator_interval || row.interval} relative volume`} value={typeof row.indicators.relative_volume === 'number' ? `${number(row.indicators.relative_volume)}x` : 'N/A'} />
+          <AlertDetailField label="Daily relative volume (20-session)" value={<>{typeof row.indicators.daily_rvol20 === 'number' ? `${number(row.indicators.daily_rvol20)}x` : 'N/A'}<small>{row.daily_context_at ? `${time(row.daily_context_at)} ET completed bar` : 'Completed daily context unavailable'}</small></>} />
+        </div></section>
+        <section className={assessment.cautions.length ? 'sa-detail-risk is-caution' : 'sa-detail-risk'}><h3>Risk and data</h3><p>{assessment.reason}</p>{assessment.cautions.length ? <ul>{assessment.cautions.map(caution => <li key={caution}>{caution}</li>)}</ul> : <p>No evidence-specific warning at the retained trigger snapshot.</p>}</section>
+        <section><h3>Ticker and alert context</h3>{publicationFacts.length ? <><div className="sa-detail-grid sa-detail-grid--context">{publicationFacts.map(fact => <AlertDetailField key={fact.label} label={fact.label} value={fact.value} />)}</div>{row.context?.status !== 'AVAILABLE' && <p className="sa-detail-empty">Publication factors were not retained; showing available alert history.</p>}</> : <p className="sa-detail-empty">Ticker and alert context were not retained for this publication.</p>}</section>
+        <section><h3>Paper status</h3><div className="sa-detail-grid">
+          <AlertDetailField label="Status" value={readable(row.status)} />
+          <AlertDetailField label="Paper entry" value={<>{price(row.entry_price)}<small>{time(row.entry_at)} ET</small></>} />
+          <AlertDetailField label="Latest stored price" value={<>{price(row.latest_price)}<small>{time(row.latest_price_at)} ET</small></>} />
+          <AlertDetailField label="Paper P/L" value={percent(row.paper_return)} />
+          <AlertDetailField label="Latest eligible exit" value={`${time(row.exit_due_at)} ET`} />
+          {row.exit_price != null && <AlertDetailField label="Fixed exit" value={<>{price(row.exit_price)}<small>{time(row.exit_at)} ET</small></>} />}
+        </div></section>
+      </div>
+    </aside>
+  </div>
 }
 
 export default function StockAlertsPage() {
   const [params, setParams] = useSearchParams()
-  const [expanded, setExpanded] = useState<string | null>(null)
+  const [selectedAlertId, setSelectedAlertId] = useState<string | null>(null)
+  const [eodSessions, setEodSessions] = useState({ dates: [] as string[], selected: '' })
+  const detailTrigger = useRef<HTMLButtonElement | null>(null)
   const search = useDeferredValue(params.get('search') || '')
   const { source: requestedSource, view } = resolveAlertRoute(params)
   const offset = Math.max(0, Number(params.get('offset')) || 0)
@@ -161,28 +160,33 @@ export default function StockAlertsPage() {
     trade_type: tradeType, combined: params.has('combined') ? params.get('combined') === 'true' : undefined,
     run: view === 'latest' ? params.get('run') || undefined : undefined, search,
     interval: params.get('interval') || undefined, ...filters, sort, descending, offset, limit: 100 }
-  const query = useQuery({ queryKey: ['stock-alert-view', args], queryFn: () => getAlertView(args), refetchInterval: requestedSource === 'REPLAY' ? false : 30_000 })
-  const data = query.data
+  const query = useQuery({ queryKey: ['stock-alert-view', args], queryFn: () => getAlertView(args), enabled: view !== 'eod', refetchInterval: requestedSource === 'REPLAY' ? false : 30_000 })
+  const data = view === 'eod' ? undefined : query.data
   const source = data?.source || requestedSource
   const sourceLabel = source === 'REPLAY' ? 'Backtested history' : source === 'LEGACY' ? 'Legacy daily history' : data?.combined ? 'Intraday + swing shadow' : data?.source_id === 'stock_ideas_forward_swing_v1' ? 'Swing shadow' : 'Forward shadow'
   const rows = data?.rows || []
+  const selectedAlert = rows.find(row => row.alert_id === selectedAlertId) || null
   const displayedRuns = view === 'history' ? data?.runs || [] : view === 'open' ? [] : data?.latest_runs || (data?.run ? [data.run] : [])
   const incompleteCoverage = displayedRuns.some(run => (run.missing ?? 0) > 0 || run.status === 'MISSED_PUBLICATION')
   const dataWarnings = data?.warnings.filter(warning => /stale|missing|unavailable/i.test(warning)) || []
+  const nextWindow = earliestAlertWindow(data?.strategy_streams)
+  const retainedDataStale = data?.strategy_streams?.some(stream => stream.projector_stale || stream.status === 'STALE' || !!stream.error)
   const update = (values: Record<string, string | null>) => {
     const next = new URLSearchParams(params)
     Object.entries(values).forEach(([key, value]) => value ? next.set(key, value) : next.delete(key))
     if (!('offset' in values)) next.delete('offset')
     setParams(next)
-    setExpanded(null)
+    setSelectedAlertId(null)
   }
   const changeView = (next: AlertView) => {
     setParams(alertTabParams(params, next, data?.source === 'SHADOW' && !!data.sessions.length))
-    setExpanded(null)
+    setSelectedAlertId(null)
   }
   usePublishPageContext({ eyebrow: 'Stocks', title: 'Stock Alerts',
-    status: [{ label: 'Data', value: sourceLabel, title: source === 'REPLAY' ? `Simulated alerts, not delivered live. Prices and outcomes frozen at ${time(data?.as_of)} ET.` : data?.source_label }],
-    alertSessions: { dates: data?.sessions || [], selected: data?.session || '', source: requestedSource } })
+    status: [{ label: 'Data', value: view === 'eod' ? 'Retained selection evidence' : sourceLabel, title: source === 'REPLAY' ? `Simulated alerts, not delivered live. Prices and outcomes frozen at ${time(data?.as_of)} ET.` : data?.source_label }],
+    alertSessions: view === 'eod'
+      ? { dates: eodSessions.dates, selected: eodSessions.selected, source: 'STOCK_EOD_REVIEW', emptyLabel: 'No evaluated sessions', resetKeys: ['offset'] }
+      : { dates: data?.sessions || [], selected: data?.session || '', source: requestedSource } })
   const choosePreset = (preset: string) => {
     const wanted = new Set(presets[preset])
     for (const column of effectiveColumns) {
@@ -207,7 +211,11 @@ export default function StockAlertsPage() {
     const item = value(row, column.key)
     if (column.key === 'ticker') return <><Link to={`/ticker/${encodeURIComponent(row.ticker)}`}>{row.ticker || 'N/A'}</Link><small>{row.lane === 'WATCH' ? 'Watch only' : row.indicators.sector || row.company_name}</small></>
     if (column.key === 'direction') return <span className={tone(row.direction)}>{row.direction === 1 ? <ArrowUp size={13} /> : row.direction === -1 ? <ArrowDown size={13} /> : null}{row.direction === 1 ? 'Long' : row.direction === -1 ? 'Short' : 'Context'}</span>
-    if (column.key === 'model') return <>{models[row.model] || readable(row.model)}<small>{alertPlanTiming(row).interval}</small></>
+    if (column.key === 'model') {
+      const displayedModels = (row.display_models || [row.model]).map(model => models[model] || readable(model))
+      const displayedIntervals = row.display_intervals || [row.interval]
+      return <>{displayedModels.join(' + ')}<small>{(row.plan_count || 1) > 1 ? `${displayedIntervals.join(' + ')} / ${row.plan_count} plans` : alertPlanTiming(row).interval}</small></>
+    }
     if (column.key === 'trade_style') return <>{alertPlanTiming(row).style}<small>{row.strategy_label}{row.opposing_exposure ? ' / Opposing exposure' : ''}</small></>
     if (column.key === 'published_at') return <span title={`Trigger ${time(row.triggered_at)} ET`}>{time(row.published_at)}</span>
     if (column.key === 'triggered_at') return <span title={row.triggered_at}>{time(row.triggered_at)}</span>
@@ -219,7 +227,10 @@ export default function StockAlertsPage() {
     if (column.key === 'entry_price') return <>{price(row.entry_price)}<small>{time(row.entry_at)}</small></>
     if (column.key === 'exit_price') return <>{price(row.exit_price)}<small>{time(row.exit_at)}</small></>
     if (column.key === 'paper_return') return <span className={tone(row.paper_return)}>{percent(row.paper_return)}<small>{row.status.includes('CLOSED') ? 'Fixed exit' : row.status.includes('OPEN') ? 'Unrealized' : row.status === 'NO_FILL' ? 'No exposure' : row.status === 'PENDING' ? 'Awaiting entry data' : ''}</small></span>
-    if (column.key === 'status') return <span title={row.reason ? readable(row.reason) : undefined}>{readable(row.status)}{row.warnings.length > 0 && <ShieldAlert size={13} className="sa-risk-icon" aria-label="Risk details available" />}</span>
+    if (column.key === 'status') {
+      const cautions = alertRiskAssessment(row).cautions
+      return <span title={row.reason ? readable(row.reason) : undefined}>{readable(row.status)}{cautions.length > 0 && <ShieldAlert size={13} className="sa-risk-icon" aria-label="Risk details available" />}</span>
+    }
     if (column.key === 'success_probability') return <span title={unavailableAlertProbability.reason}>{unavailableAlertProbability.label}</span>
     if (column.key === 'risk_assessment') {
       const assessment = alertRiskAssessment(row)
@@ -241,34 +252,32 @@ export default function StockAlertsPage() {
       <div className="sd-presets" role="tablist" aria-label="Alert views" onKeyDown={event => {
         if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
         event.preventDefault()
-        const views: AlertView[] = source === 'SHADOW' ? ['latest', 'history', 'open'] : ['latest', 'history']
+        const views: AlertView[] = source === 'SHADOW' ? ['latest', 'history', 'eod', 'open'] : ['latest', 'history']
         const next = views[event.key === 'Home' ? 0 : event.key === 'End' ? views.length - 1 : (views.indexOf(view) + (event.key === 'ArrowRight' ? 1 : views.length - 1)) % views.length]
         changeView(next)
         event.currentTarget.querySelector<HTMLButtonElement>(`#sa-${next}`)?.focus()
       }}>
         <button role="tab" id="sa-latest" tabIndex={view === 'latest' ? 0 : -1} aria-controls="sa-results" aria-selected={view === 'latest'} className={view === 'latest' ? 'active' : ''} onClick={() => changeView('latest')}>Latest Run</button>
         <button role="tab" id="sa-history" tabIndex={view === 'history' ? 0 : -1} aria-controls="sa-results" aria-selected={view === 'history'} className={view === 'history' ? 'active' : ''} onClick={() => changeView('history')}>Day History</button>
+        {source === 'SHADOW' && <button role="tab" id="sa-eod" tabIndex={view === 'eod' ? 0 : -1} aria-controls="sa-results" aria-selected={view === 'eod'} className={view === 'eod' ? 'active' : ''} onClick={() => changeView('eod')}>EOD Review</button>}
         {source === 'SHADOW' && <button role="tab" id="sa-open" tabIndex={view === 'open' ? 0 : -1} aria-controls="sa-results" aria-selected={view === 'open'} className={view === 'open' ? 'active' : ''} onClick={() => changeView('open')}>Open Positions</button>}
       </div>
-      <div className="sd-tools">
+      {view !== 'eod' && <div className="sd-tools">
         <label className="sa-preset"><span className="sa-sr-only">Column preset</span><select aria-label="Column preset" value={selectedPreset} onChange={event => choosePreset(event.target.value)}><option value="" disabled>Custom columns</option><option value="plan">Trade plan</option><option value="trend">Trend</option><option value="momentum">Momentum</option><option value="liquidity">Liquidity</option></select></label>
         <ColumnPicker columns={selectable} hidden={hidden} onToggle={preferences.toggle} onShowAll={preferences.showAll} onReset={preferences.reset} />
         <button type="button" title="Export displayed alerts" aria-label="Export displayed alerts" disabled={!rows.length} onClick={() => exportAlerts(rows, visible, value)}><Download size={16} /></button>
         <button type="button" title="Refresh retained alerts" aria-label="Refresh retained alerts" disabled={query.isFetching} onClick={() => void query.refetch()}><RefreshCw size={16} /></button>
-      </div>
+      </div>}
     </section>
-    {data?.combined && <section className="sa-streams" aria-label="Strategy publication status">{data.strategy_streams?.map(stream => {
-      const latest = data.latest_runs?.find(run => run.strategy_instance_id === stream.instance_id)
-      return <div key={stream.stream}><strong>{stream.label}</strong><span className={stream.error || stream.projector_stale ? 'sd-negative' : ''}>{readable(stream.status)}{stream.error ? ` / ${readable(stream.error)}` : ''}</span>
-        <span>Source {time(stream.as_of)} ET / Imported {time(stream.imported_at)} ET</span>
-        <span>{latest ? `${readable(latest.status)} / ${latest.selected} selected / ${time(latest.published_at)} ET` : 'No publication for selected session'}</span>
-        {stream.publication_deadline && <span>Next window {time(stream.publication_window_start)} to {time(stream.publication_deadline)} ET</span>}
-      </div>
-    })}</section>}
+    {view === 'eod' ? <StockEodReviewPanel params={params} update={update} offset={offset} onSessionContext={setEodSessions} /> : <>
     <div className="sa-trade-types" role="group" aria-label="Trade type">
       {([['', 'All'], ['INTRADAY', 'Intraday'], ['SWING', 'Swing']] as const).map(([key, label]) =>
         <button key={label} type="button" aria-pressed={(tradeType || '') === key} onClick={() => update({ trade_type: key || null, run: null })}>{label}</button>)}
       {view === 'open' && <span>All retained open, pending and unresolved positions</span>}
+      {data?.combined && (retainedDataStale || nextWindow) && <span className="sa-schedule" role="status">
+        {retainedDataStale && <span className="sa-schedule__stale"><AlertTriangle size={13} />Retained data stale</span>}
+        {nextWindow && <span><Clock size={13} />Next alert window {time(nextWindow.publication_window_start)}-{time(nextWindow.publication_deadline)} ET</span>}
+      </span>}
     </div>
     <section className="sd-filters sa-filters" aria-label="Alert filters">
       <label>Stock<input value={params.get('search') || ''} placeholder="Ticker or company" onChange={event => update({ search: event.target.value })} /></label>
@@ -313,29 +322,13 @@ export default function StockAlertsPage() {
       {data?.publication_mode === 'SOURCE_READINESS' && <div className="sa-data-warning" role="status"><Clock size={14} /><span>Next publication after inputs complete: {time(data.publication_window_start)} to {time(data.publication_deadline)} ET</span></div>}
       {query.isLoading ? <div className="sd-empty" role="status">Loading retained alerts...</div> : query.isError ? null : !rows.length ? <div className="sd-empty"><Bell size={24} /><strong>{data?.status === 'WAITING_FOR_PUBLICATION' ? 'Waiting for the next forward publication' : data?.status === 'AWAITING_PUBLICATION' ? source === 'SHADOW' ? 'No shadow publications yet' : 'Awaiting retained publications' : !data?.runs.length ? view === 'history' && data?.withheld_run ? 'No earlier runs for this session' : 'No publication recorded for this session' : view === 'latest' && data?.run?.selected === 0 ? 'No new alerts in this publication' : view === 'history' && data?.runs.every(run => run.selected === 0) ? data?.withheld_run ? 'No alerts in earlier runs' : 'No alerts published for this session' : 'No matching alerts'}</strong>{data?.next_publication_at && <span>Next publication {time(data.next_publication_at)} ET</span>}{source === 'SHADOW' && data?.status === 'AWAITING_PUBLICATION' && <button type="button" className="sa-history-action" onClick={() => setParams(alertSourceParams('REPLAY', 'history'))}><History size={16} />View backtested history</button>}</div> :
         <div className="sd-table-scroll sa-scroll"><table><thead><tr><th aria-label="Plan details" />{visible.map(column => <th key={column.key} aria-sort={sort === column.key ? descending ? 'descending' : 'ascending' : undefined}><button type="button" title={column.tip || column.label} onClick={() => sortColumn(column.key)}>{column.key === 'latest_price' && source === 'REPLAY' ? 'Price at cutoff' : column.label}{sort === column.key && (descending ? <ArrowDown size={11} /> : <ArrowUp size={11} />)}</button></th>)}</tr></thead><tbody>
-          {rows.map(row => <Fragment key={row.alert_id}><tr><td><button className="sd-expand" aria-label={`Plan details for ${row.ticker} ${row.interval}`} aria-expanded={expanded === row.alert_id} onClick={() => setExpanded(expanded === row.alert_id ? null : row.alert_id)}>{expanded === row.alert_id ? <ChevronDown size={15} /> : <ChevronRight size={15} />}</button></td>
+          {rows.map(row => <tr key={row.alert_id}><td><button className="sd-expand sa-detail-launch" title="View alert details" aria-label={`View alert details for ${row.ticker}`} aria-haspopup="dialog" onClick={event => { detailTrigger.current = event.currentTarget; setSelectedAlertId(row.alert_id) }}><Eye size={15} /></button></td>
             {visible.map(column => <td key={column.key} className={column.key === 'ticker' ? 'sd-symbol' : ''} title={column.indicator ? `${column.tip || column.label}. ${column.key === 'momentum' || column.key === 'liquidity' || column.key === 'rs_percentile' ? time(row.daily_context_at) : `${row.indicator_interval} ${time(row.indicator_at)}`} ET; ${readable(row.indicator_status)}` : column.tip}>{cell(row, column)}</td>)}
-          </tr>{expanded === row.alert_id && <tr className="sd-detail"><td colSpan={visible.length + 1}><dl>
-            <div><dt>Trigger / published (ET)</dt><dd>{time(row.triggered_at)} / {time(row.published_at)}</dd></div>
-            {row.trade_style === 'SWING' && <><div><dt>Daily setup (ET)</dt><dd>{time(row.daily_setup_at)}</dd></div>
-              <div><dt>Entry confirmation</dt><dd>{row.confirmation_interval || row.interval} / {time(row.triggered_at)} ET</dd></div>
-              <div><dt>Holding policy</dt><dd>{alertPlanTiming(row).hold}; entry session counts as one</dd></div>
-              <div><dt>Daily setup ID</dt><dd>{row.daily_setup_id || 'Unavailable'}</dd></div></>}
-            <div><dt>Original bracket</dt><dd>{price(row.stop)} stop / {price(row.target)} target</dd></div>
-            {row.strategy_instance_id && <><div><dt>Strategy instance</dt><dd>{row.strategy_instance_id}</dd></div>
-              <div><dt>Original alert / run</dt><dd>{row.original_alert_id} / {row.original_run_id}</dd></div>
-              <div><dt>Exposure</dt><dd>{row.opposing_exposure ? 'Opposite-direction open or pending plan also retained; positions not netted' : 'Independent strategy plan'}</dd></div></>}
-            <div><dt>Entry risk / reward-risk</dt><dd>{percent(row.entry_risk?.risk_pct)} / {number(row.entry_risk?.reward_risk)}x</dd></div>
-            <div><dt>Latest eligible exit (ET)</dt><dd>{time(row.exit_due_at)}</dd></div>
-            <div><dt>First / last seen (ET)</dt><dd>{time(row.first_seen)} / {time(row.last_seen)}</dd></div>
-            <div><dt>Hit attribution</dt><dd>{row.hit_models.map(model => models[model] || model).join(', ') || 'Unavailable'} / {row.hit_intervals.join(', ')}</dd></div>
-            <div><dt>Risk / data warnings</dt><dd>{row.warnings.join('; ')}{row.reason ? `; ${readable(row.reason)}` : ''}</dd></div>
-            <div><dt>Indicator snapshot</dt><dd>{row.indicator_interval} / {time(row.indicator_at)} ET / {readable(row.indicator_status)}</dd></div>
-            {view === 'history' && <><div><dt>Paper mark (ET)</dt><dd>{price(row.mark_price)} / {time(row.mark_at)}</dd></div><div><dt>Fixed exit (ET)</dt><dd>{price(row.exit_price)} / {time(row.exit_at)}</dd></div></>}
-            <div><dt>Policy</dt><dd>{row.policy_version}</dd></div><div><dt>Recurrence coverage</dt><dd>{data?.hit_coverage || 'Unavailable in this source'}</dd></div>
-          </dl><SavedAlertContext row={row} /></td></tr>}</Fragment>)}
+          </tr>)}
         </tbody></table></div>}
       <footer className="sd-pager"><span>{data?.total ? `${offset + 1}-${offset + rows.length} of ${data.total}` : '0 results'}</span><div><button title="Previous page" aria-label="Previous page" disabled={!offset} onClick={() => update({ offset: String(Math.max(0, offset - 100)) })}><ArrowLeft size={16} /></button><button title="Next page" aria-label="Next page" disabled={offset + rows.length >= (data?.total || 0)} onClick={() => update({ offset: String(offset + 100) })}><ArrowRight size={16} /></button></div></footer>
     </section>
+    {selectedAlert && <AlertDetailDrawer row={selectedAlert} returnFocus={detailTrigger.current} onClose={() => setSelectedAlertId(null)} />}
+    </>}
   </div>
 }

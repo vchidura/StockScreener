@@ -1,11 +1,11 @@
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useEffectEvent, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Check, ChevronDown, ChevronRight, CircleHelp, Download, RefreshCw, RotateCcw, Save, SlidersHorizontal, X } from 'lucide-react'
+import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Check, CircleHelp, Download, Eye as ChevronDown, Eye as ChevronRight, RefreshCw, RotateCcw, Save, SlidersHorizontal, X } from 'lucide-react'
 import { usePublishPageContext } from '../layout/pageContext'
 import { ColumnPicker, type ColumnSpec } from '../layout/PageChrome'
 import { getGapDetails, getHourlyDetails, getScreeningCatalog, queryScreening } from '../services/screening'
-import { appliedScreeningColumns, comparisonDate, compileDraft, DEFAULT_COLUMNS, downloadText, emptyDraft, emptyPredicate, filterLabel, formatValue, hasDraftFilter, hourlyContextTiming, hourlyObservedBehavior, hourlyTimestamp, newComparisonReason, newOnlyRequest, removeDraftFilter, resultCsv, ruleIdentity, screeningColumns, screeningColumnGroup, screeningColumnPresets, screeningDisplayColumns, screeningFieldHelp, screeningTimeframeLabel, screeningValueClass, selectedScreeningColumnPreset, type Draft, type FieldHelpScope, type FieldSpec, type GapDetails, type HourlyDetails, type ScreeningRequest, type ScreeningRow } from './screeningModel'
+import { appliedScreeningColumns, comparisonDate, compileDraft, DEFAULT_COLUMNS, downloadText, emptyDraft, emptyPredicate, filterLabel, formatValue, hasDraftFilter, hourlyContextTiming, hourlyObservedBehavior, hourlyTimestamp, newComparisonReason, newOnlyRequest, removeDraftFilter, resultCsv, ruleIdentity, screeningColumns, screeningColumnGroup, screeningColumnPresets, screeningDetailFacts, screeningDisplayColumns, screeningFieldHelp, screeningTimeframeLabel, screeningValueClass, selectedScreeningColumnPreset, type Draft, type FieldHelpScope, type FieldSpec, type GapDetails, type HourlyDetails, type ScreeningCatalog, type ScreeningRequest, type ScreeningResult, type ScreeningRow } from './screeningModel'
 import { useScreenLibrary } from './useScreenLibrary'
 import { dailyCoverageNotice } from './screeningModel'
 import ScreenLibrary, { Modal } from './ScreenLibrary'
@@ -210,8 +210,55 @@ export default function StockScreeningPage() {
         </>}
       </main>
     </div>
+    {expandedRow && catalog && result && <ScreeningDetailDrawer row={expandedRow} catalog={catalog} generation={result.generation} comparison={comparison} hourlyStale={!!result.hourly_stale} gap={gapQuery.data} gapLoading={gapQuery.isFetching && !gapQuery.data} gapError={gapQuery.isError} retryGap={() => void gapQuery.refetch()} onClose={() => setExpanded(null)} />}
   </div>
 }
+
+function ScreeningDetailDrawer({ row, catalog, generation, comparison, hourlyStale, gap, gapLoading, gapError, retryGap, onClose }: {
+  row: ScreeningRow
+  catalog: ScreeningCatalog
+  generation: ScreeningResult['generation']
+  comparison?: ScreeningResult['comparison']
+  hourlyStale: boolean
+  gap?: GapDetails
+  gapLoading: boolean
+  gapError: boolean
+  retryGap: () => void
+  onClose: () => void
+}) {
+  const closeOnEscape = useEffectEvent(onClose)
+  const groups = screeningDetailFacts(row, catalog)
+  const patterns = Object.entries(row.patterns).filter(([, observation]) => observation.present)
+  const gapEpisode = gap?.matching_episodes.find(episode => episode.episode_id === row.gap_summary?.representative?.episode_id)
+    || gap?.matching_episodes[0]
+  useEffect(() => {
+    const overflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const keydown = (event: KeyboardEvent) => { if (event.key === 'Escape') closeOnEscape() }
+    document.addEventListener('keydown', keydown)
+    return () => {
+      document.body.style.overflow = overflow
+      document.querySelector<HTMLButtonElement>(`button[aria-label="Explain ${row.ticker}"]`)?.focus()
+      document.removeEventListener('keydown', keydown)
+    }
+  }, [row.ticker])
+  const explanationText = (explanation: ScreeningRow['explanations'][number]) => explanation.conditions
+    ? explanation.conditions.map(condition => `${catalog.hourly?.fields[condition.field]?.label || condition.field}: ${formatValue(condition.value, catalog.hourly?.fields[condition.field])} (${readableState(condition.state)})`).join('; ')
+    : explanation.field === 'gap' ? readableState(explanation.reason || explanation.state)
+      : explanation.observations ? explanation.observations.map(observation => `${catalog.patterns[observation.field]?.label || observation.field}: ${readableState(observation.state)}`).join('; ')
+        : `${formatValue(explanation.value, catalog.fields[explanation.field])} (${readableState(explanation.reason || explanation.state)})`
+  return <div className="sw-detail-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}><aside className="sw-detail-drawer" role="dialog" aria-modal="true" aria-labelledby="sw-detail-title">
+    <header><div><span>Daily screening snapshot</span><h2 id="sw-detail-title"><Link to={`/ticker/${encodeURIComponent(row.ticker)}`}>{row.ticker}</Link></h2><p>{row.company_name || 'Company name unavailable'} / {row.session}</p></div><button type="button" className="sw-detail-close" aria-label="Close stock details" title="Close stock details" autoFocus onClick={onClose}><X size={18} /></button></header>
+    <div className="sw-detail-body">
+      {groups.map(group => <section key={group.title}><h3>{group.title}</h3><div className="sw-detail-grid">{group.facts.map(fact => <div key={fact.field}><span>{fact.label}</span><strong className={fact.tone}>{fact.value}</strong>{fact.missing && <small>{readableState(fact.missing)}</small>}</div>)}</div></section>)}
+      {row.hourly && <section><h3>Hourly behavior</h3><p className="sw-detail-note">{generation.hourly_source ? hourlyContextTiming(generation.market_time, generation.hourly_source) : 'Hourly timing unavailable'}{hourlyStale ? ' / Stale' : ''}</p><div className="sw-detail-grid">{Object.entries(catalog.hourly?.fields || {}).map(([field, spec]) => <div key={field}><span>{spec.label}</span><strong className={field === 'close' ? '' : screeningValueClass('change', row.hourly!.values[field])}>{field === 'close' && row.hourly!.values[field] != null ? `$${formatValue(row.hourly!.values[field])}` : formatValue(row.hourly!.values[field], spec)}</strong>{row.hourly!.missing[field] && <small>{readableState(row.hourly!.missing[field])}</small>}</div>)}</div></section>}
+      <section><h3>Setups and observations</h3><div className="sw-detail-grid"><div><span>Candle observations</span><strong>{patterns.length ? patterns.map(([id]) => catalog.patterns[id]?.label || id).join(', ') : 'None'}</strong></div><div><span>Daily gap</span><strong>{row.gap_summary?.representative ? `${formatValue(row.gap_summary.representative.values.direction)} / ${formatValue(row.gap_summary.representative.values.state)}` : row.gap_summary?.status === 'READY' ? 'No matching gap' : 'Unavailable'}</strong>{row.gap_summary?.representative && <small>{row.gap_summary.representative.values.formation_age} sessions old / {formatValue(row.gap_summary.representative.values.fill_fraction, { unit: 'fraction' })} filled</small>}</div>{gapEpisode && <><div><span>Gap zone</span><strong>${formatValue(gapEpisode.zone_lower)} to ${formatValue(gapEpisode.zone_upper)}</strong></div><div><span>Price vs gap</span><strong>{formatValue(gapEpisode.values.price_location)} / {formatValue(gapEpisode.values.distance_fraction, { unit: 'fraction' })} from edge</strong></div></>}</div>{gapLoading && <p className="sw-detail-note" role="status">Loading retained gap details...</p>}{gapError && <p className="sw-detail-note" role="alert">Gap details unavailable. <button type="button" onClick={retryGap}>Retry</button></p>}</section>
+      <section><h3>Why this stock matched</h3>{row.explanations.length ? <ul className="sw-detail-reasons">{row.explanations.map(explanation => <li key={explanation.field}><strong>{explanation.field === 'gap' ? 'Daily gap' : explanation.field === 'hourly' ? 'Hourly context' : catalog.fields[explanation.field]?.label || 'Candle observations'}</strong><span>{explanationText(explanation)}</span></li>)}</ul> : <p className="sw-detail-note">Eligible instrument with a valid completed daily bar; no additional predicates were applied.</p>}<div className="sw-detail-grid"><div><span>Screen membership</span><strong>{row.new_status === 'NEW' ? 'New match' : row.new_status === 'NOT_NEW' ? 'Continuing match' : 'Comparison unavailable'}</strong><small>{newComparisonReason(row.new_reason)}</small></div><div><span>Comparison</span><strong>{comparison?.status === 'READY' ? `${comparison.current_session} vs ${comparison.previous_session}` : 'Unavailable'}</strong></div></div></section>
+    </div>
+  </aside></div>
+}
+
+const readableState = (value: string) => value.toLowerCase().replace(/_/g, ' ')
 
 function FieldHelpButton({ field, scope = 'daily', spec }: { field: string; scope?: FieldHelpScope; spec?: FieldSpec }) {
   const [open, setOpen] = useState(false)

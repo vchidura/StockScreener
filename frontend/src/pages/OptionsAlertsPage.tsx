@@ -22,6 +22,10 @@ const pageSize = 50
 const capabilityLabels: Record<string, string> = { OBSERVATION: 'Observation evidence', INDICATIVE: 'Indicative package', QUOTE_PAPER: 'Quote-qualified paper', EXECUTION: 'Execution' }
 const candidateStates: OptionCandidateStatus[] = ['SELECTED', 'SUPPRESSED', 'REJECTED']
 const categories: OptionCandidatePersona[] = ['INCOME', 'DEFINED_RISK_INCOME', 'MOMENTUM', 'NEUTRAL_VOL']
+const participationBucketLabels: Record<string, string> = {
+  QUIET_LT_0_75X: 'Quiet (<0.75x)', NORMAL_0_75_TO_1_25X: 'Normal (0.75-1.25x)',
+  ELEVATED_1_25_TO_2X: 'Elevated (1.25-2x)', SURGE_GE_2X: 'Surge (>=2x)',
+}
 
 function ColumnHeaders({ columns }: { columns: OptionAlertColumn[] }) {
   return <>{columns.map(column => <th key={column.key} scope="col" title={column.tip}>{column.label}</th>)}</>
@@ -639,6 +643,17 @@ function BehaviorReviewPanel({ view, params, update, offset, columns, onSessionC
           }} />
         </tr>)}</tbody></table>{!data.cells?.length && <div className="sd-empty">No assessment-covered cohorts for this session.</div>}</div></div>
         <p className="oa-permission">{baseline ? 'First recorded alerts only / Repeat hits are not new samples' : 'Same covered candidate pool / First assessed model-ranked cohort'} / Commission included, slippage unavailable / Descriptive, not calibrated</p>
+        {data.participation_analysis && <details className="oa-provenance"><summary>Daily relative-volume challenger</summary>
+          <p className="oa-muted">Prior completed daily session versus its preceding 20-session mean / Descriptive outcome split only / Does not change detection or selection</p>
+          <div className="oa-leg-scroll" tabIndex={0} role="region" aria-label="Daily relative volume outcome analysis"><table className="oa-legs"><thead><tr>
+            <th>RVOL bucket</th><th>Model / structure</th><th>Horizon</th><th>Cohorts</th><th>Coverage</th><th>Mean return</th><th>Positive</th><th>States</th>
+          </tr></thead><tbody>{data.participation_analysis.cells.map(cell => <tr key={`${cell.bucket}-${cell.strategy}-${cell.structure}-${cell.horizon}`}>
+            <td>{participationBucketLabels[cell.bucket] || label(cell.bucket)}</td><td>{modelNames[cell.strategy] || label(cell.strategy)}<small>{label(cell.structure)}</small></td>
+            <td>{label(cell.horizon)}</td><td>{cell.cohorts}</td><td>{cell.measured}<small>{percent(cell.outcome_coverage)}</small></td>
+            <td>{percent(cell.mean_net_return)}</td><td>{percent(cell.positive_mark_fraction)}</td><td>{Object.entries(cell.states).map(([state, count]) => <small key={state}>{label(state)}: {count}</small>)}</td>
+          </tr>)}</tbody></table>{!data.participation_analysis.cells.length && <div className="sd-empty">No daily relative-volume cohorts are available.</div>}</div>
+          {data.participation_analysis.missing_cohorts > 0 && <p className="oa-muted">{data.participation_analysis.missing_cohorts} cohorts lack causal daily relative-volume evidence.</p>}
+        </details>}
         <details className="oa-provenance"><summary>Exact assessment cohorts ({data.cohort_count || 0})</summary>
           <div className="oa-leg-scroll" tabIndex={0} role="region" aria-label="Exact daily assessment cohorts"><table className="oa-legs"><thead><tr>
             <th>Underlying / model</th><th>Structure / rank</th><th>Source (ET)</th><th>Stock behavior</th><th>60 min</th><th>Close</th><th>Next open</th><th>Details</th>

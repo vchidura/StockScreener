@@ -270,6 +270,31 @@ def test_eod_selects_cohort_before_outcomes_and_never_zero_fills_missing():
     assert report["probability"] is None and report["threshold_changes"] is False
 
 
+def test_eod_daily_rvol_challenger_is_descriptive_and_does_not_change_cohorts():
+    quiet = candidate(underlying="AAPL")
+    elevated = candidate(underlying="MSFT")
+    rows = [quiet, elevated]
+    for row, value in zip(rows, (.6, 1.6)):
+        row["behavior"] = dict(applicable=True, complete_package=True, disposition="ELIGIBLE_RESEARCH",
+            eligible=True, timely_at_recording=True, shortlist=False, entry_open_now=False, reasons=[],
+            metrics={"PARTICIPATION_EVIDENCE": value})
+    outcomes = [
+        dict(candidate_id=quiet["candidate_id"], measurement_type="60MIN", net_return=.1),
+        dict(candidate_id=elevated["candidate_id"], measurement_type="60MIN", net_return=-.2),
+    ]
+
+    report = daily_scorecard(rows, outcomes, [], NOW + timedelta(hours=5))
+    cells = {(cell["bucket"], cell["horizon"]): cell for cell in report["participation_analysis"]["cells"]}
+
+    assert report["cohort_count"] == 2
+    assert report["participation_analysis"]["schema_version"] == "option_daily_rvol_challenger_v1"
+    assert report["participation_analysis"]["selection_effect"] is False
+    assert report["participation_analysis"]["missing_cohorts"] == 0
+    assert cells[("QUIET_LT_0_75X", "60MIN")]["mean_net_return"] == .1
+    assert cells[("ELEVATED_1_25_TO_2X", "60MIN")]["mean_net_return"] == -.2
+    assert report["threshold_changes"] is False
+
+
 def test_review_filtering_precedes_pagination_and_keeps_funnel():
     from types import SimpleNamespace
     from options.analytics.behavior_review import build_behavior_review

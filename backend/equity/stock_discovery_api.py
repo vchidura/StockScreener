@@ -120,3 +120,22 @@ def alert_view(source: Literal["SHADOW", "REPLAY", "LEGACY"] = "SHADOW", session
         return attach_alert_context(page)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get("/alert-eod-review")
+def alert_eod_review(session_date: date | None = None, search: str = Query("", max_length=80),
+                     model: Literal["resumption", "acceptance", "failure"] | None = None,
+                     selection_status: Literal["SELECTED", "NOT_SELECTED", "REPEAT"] | None = None,
+                     direction: Annotated[int | None, Query(ge=-1, le=1)] = None,
+                     trade_type: Literal["INTRADAY", "SWING"] | None = None,
+                     offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=200)):
+    from psycopg2 import Error as DatabaseError
+    from equity.stock_alert_results import load_stock_eod_review
+    try:
+        return load_stock_eod_review(as_of=datetime.now(timezone.utc), session_date=session_date,
+            search=search, model=model, selection_status=selection_status, direction=direction,
+            trade_type=trade_type, offset=offset, limit=limit)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except (OSError, DatabaseError) as error:
+        raise HTTPException(status_code=503, detail="Retained stock evaluation evidence is unavailable") from error

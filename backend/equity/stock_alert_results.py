@@ -184,6 +184,76 @@ def load_shared_results(now=None):
     return combine_snapshots(snapshots, streams)
 
 
+def load_stock_eod_review(*, as_of=None, session_date=None, search="", model=None,
+                          selection_status=None, direction=None, trade_type=None,
+                          offset=0, limit=100, cursor_factory=get_db_cursor):
+    from research.stock_alert_review import build_stock_eod_review
+
+    as_of = as_of or datetime.now(timezone.utc)
+    if as_of.utcoffset() is None:
+        raise ValueError("stock EOD review requires an aware cutoff")
+    with cursor_factory() as cursor:
+        cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        cursor.execute("SET LOCAL statement_timeout='10s'")
+        cursor.execute("""SELECT to_regclass('public.stock_alert_result_records') IS NOT NULL
+            AND to_regclass('public.stock_alert_result_instances') IS NOT NULL
+            AND to_regclass('public.stock_alert_result_streams') IS NOT NULL
+            AND to_regclass('public.stock_alert_result_revisions') IS NOT NULL AS ready""")
+        if not cursor.fetchone()["ready"]:
+            return build_stock_eod_review([], {}, as_of=as_of, session_date=None, sessions=[], storage_ready=False,
+                search=search, model=model, selection_status=selection_status, direction=direction,
+                trade_type=trade_type, offset=offset, limit=limit)
+        cursor.execute("""SELECT DISTINCT record.payload->>'session' AS session
+            FROM stock_alert_result_streams AS stream
+            JOIN stock_alert_result_records AS record ON record.instance_id=stream.instance_id
+            WHERE record.kind='publication_evidence' AND record.imported_at<=%s
+              AND record.payload ? 'session'
+            ORDER BY session DESC LIMIT 21""", (as_of,))
+        sessions = sorted(row["session"] for row in cursor.fetchall())
+        selected = str(session_date) if session_date else (sessions[-1] if sessions else None)
+        if selected and selected not in sessions:
+            raise ValueError("session outside the retained stock evaluation window")
+        publication_rows = []
+        if selected:
+            cursor.execute("""SELECT stream.stream,stream.instance_id,instance.payload AS instance,
+                    record.record_id,record.payload_sha256,record.payload
+                FROM stock_alert_result_streams AS stream
+                JOIN stock_alert_result_instances AS instance USING(instance_id)
+                JOIN stock_alert_result_records AS record ON record.instance_id=stream.instance_id
+                WHERE record.kind='publication_evidence' AND record.imported_at<=%s
+                  AND record.payload->>'session'=%s
+                  AND octet_length(record.payload::text)<=4194304
+                  AND octet_length(instance.payload::text)<=4194304
+                ORDER BY stream.stream,record.record_id LIMIT 1001""", (as_of, selected))
+            publication_rows = [dict(row) for row in cursor.fetchall()]
+        if len(publication_rows) > 1000:
+            raise ValueError("stock EOD review exceeds publication bound")
+        publications = []
+        for row in publication_rows:
+            if (not isinstance(row["payload_sha256"], str) or len(row["payload_sha256"]) != 64
+                    or any(character not in "0123456789abcdef" for character in row["payload_sha256"])):
+                raise ValueError("stock EOD publication checksum is invalid")
+            publications.append(dict(instance_id=row["instance_id"], stream=row["stream"],
+                label=row["instance"].get("label", row["stream"].title()), record_id=row["record_id"], payload=row["payload"]))
+        candidate_ids = sorted({episode_id for record in publications for episode_id in record["payload"].get("candidates", {})})
+        outcomes = {}
+        if candidate_ids:
+            instance_ids = sorted({record["instance_id"] for record in publications})
+            cursor.execute("""SELECT DISTINCT ON(instance_id,alert_id) instance_id,alert_id,payload,payload_sha256
+                FROM stock_alert_result_revisions
+                WHERE instance_id=ANY(%s) AND alert_id=ANY(%s) AND imported_at<=%s
+                  AND octet_length(payload::text)<=4194304
+                ORDER BY instance_id,alert_id,source_as_of DESC,imported_at DESC LIMIT 10001""",
+                (instance_ids, candidate_ids, as_of))
+            outcome_rows = [dict(row) for row in cursor.fetchall()]
+            if len(outcome_rows) > 10000 or any(digest(row["payload"]) != row["payload_sha256"] for row in outcome_rows):
+                raise ValueError("stock EOD outcome read bound or checksum mismatch")
+            outcomes = {(row["instance_id"], row["alert_id"]): row["payload"] for row in outcome_rows}
+    return build_stock_eod_review(publications, outcomes, as_of=as_of, session_date=selected,
+        sessions=sessions, storage_ready=True, search=search, model=model, selection_status=selection_status,
+        direction=direction, trade_type=trade_type, offset=offset, limit=limit)
+
+
 def read_published_stock_setup(*, policy, record_id, payload_sha256, episode_id,
                               security_id, ticker, market_cutoff, observed_cutoff,
                               cursor_factory=get_db_cursor, clock=None):

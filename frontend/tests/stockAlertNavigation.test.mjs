@@ -8,7 +8,43 @@ const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.Modu
 const { resolveAlertRoute, alertSourceParams, alertTabParams, alertTradeFilters, alertSort } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`)
 const presentationSource = readFileSync(new URL('../src/pages/stockAlertPresentation.ts', import.meta.url), 'utf8')
 const presentation = ts.transpileModule(presentationSource, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } })
-const { alertColumnLayout, alertPlanTiming, alertRiskAssessment, unavailableAlertProbability } = await import(`data:text/javascript;base64,${Buffer.from(presentation.outputText).toString('base64')}`)
+const { alertColumnLayout, alertPlanTiming, alertPublicationFacts, alertRiskAssessment, earliestAlertWindow, unavailableAlertProbability } = await import(`data:text/javascript;base64,${Buffer.from(presentation.outputText).toString('base64')}`)
+
+test('combined alert status keeps only the earliest actionable publication window', () => {
+  const streams = [
+    { publication_window_start: '2026-09-21T15:15:00Z', publication_deadline: '2026-09-21T15:29:00Z' },
+    { publication_window_start: '2026-09-21T14:15:00Z', publication_deadline: '2026-09-21T14:29:00Z' },
+    { publication_window_start: '2026-09-21T13:15:00Z' },
+  ]
+  assert.deepEqual(earliestAlertWindow(streams), streams[1])
+  assert.equal(earliestAlertWindow(undefined), null)
+})
+
+test('alert publication context is limited to six ticker and alert facts without provenance', () => {
+  const factor = value => ({ status: 'READY', reason_codes: [], source_revision_ids: ['hidden'], value })
+  const row = { hits: 2, first_seen: '2026-09-17T15:00:00Z', last_seen: '2026-09-18T15:00:00Z',
+    hit_models: ['failure'], hit_intervals: ['1d'], context: { status: 'AVAILABLE', reason: null, factors: {
+    stock_daily: factor({ direction: 'UP', return20: .1234 }),
+    stock_relative_rotation: factor({ state: 'LEADING', relative5: .012, relative20: .034, relative_change5: .006 }),
+    sector: factor({ direction: 'DOWN', stock_minus_sector20: .0456, sector_minus_spy20: -.021 }),
+    stock_divergence: factor({ labels: ['STOCK_SPECIFIC_STRENGTH'] }),
+    earnings: factor({ events: [{ type: 'EARNINGS', scheduled_time: '2026-09-22T20:00:00Z', confidence: 'HIGH', relative_timing: 'DURING_HOLD' }] }),
+    fomc: factor({ events: [{ type: 'FOMC', scheduled_time: '2026-09-23T18:00:00Z', confidence: 'HIGH' }] }),
+  } } }
+  const facts = alertPublicationFacts(row)
+  assert.deepEqual(facts.map(item => item.label), ['Ticker trend', 'Relative rotation', 'Sector influence', 'Divergence', 'Holding-window event', 'Alert persistence'])
+  assert.equal(facts[0].value, 'up / 20-session return +12.34%')
+  assert.match(facts[1].value, /^leading .* 5-session \+1.2 pp .* change \+0.6 pp$/)
+  assert.match(facts[2].value, /stock vs sector \+4.6 pp \/ sector vs SPY -2.1 pp/)
+  assert.equal(facts[3].value, 'stock specific strength')
+  assert.match(facts[4].value, /^earnings .* during hold$/)
+  assert.match(facts[5].value, /^2 retained windows \/ failure, 1d/)
+  assert.equal(JSON.stringify(facts).includes('hidden'), false)
+  assert.deepEqual(alertPublicationFacts({ hits: null, first_seen: null, last_seen: null, hit_models: [], hit_intervals: [], context: { status: 'UNAVAILABLE', reason: 'MISSING', factors: {} } }), [])
+  row.context.factors.earnings = factor({ coverage_complete: true, events: [] })
+  row.context.factors.fomc = factor({ coverage_complete: true, events: [] })
+  assert.equal(alertPublicationFacts(row).find(item => item.label === 'Holding-window event').value, 'No known earnings or FOMC event during hold')
+})
 
 test('swing entry timeframe cannot be mistaken for an intraday holding cap', () => {
   const row = { interval: '30m', confirmation_interval: '30m', lane: 'TRADE', trade_style: 'SWING', holding_sessions: 21, hold: '21 sessions' }
@@ -137,9 +173,19 @@ test('risk assessment quantifies both directions without inventing low risk or a
   const result = alertRiskAssessment(row)
   assert.equal(result.stopDistance, .02)
   assert.equal(result.label, 'Unrated')
-  assert.deepEqual(result.cautions, ['Stop gaps can exceed planned risk'])
+  assert.deepEqual(result.cautions, [])
   assert.equal(alertRiskAssessment({ ...row, direction: -1, stop: 102, target: 96 }).stopDistance, .02)
   assert.equal(alertRiskAssessment({ ...row, status: 'UNRESOLVED', reason: 'IDENTITY_UNAVAILABLE' }).label, 'Data issue')
+  const context = 'Directional context: countertrend SHORT against bullish trigger evidence (12-minus-1 momentum +235.00%; RS63 percentile 94.0); trigger metrics unavailable: EMA50 slope'
+  const consolidated = alertRiskAssessment({ ...row, warnings: ['Stop gaps can exceed planned risk', 'Action coverage not certified',
+    'Latest stored price may be stale; inspect its timestamp', 'Short borrow unverified', context] })
+  assert.equal(consolidated.label, 'Countertrend')
+  assert.deepEqual(consolidated.cautions, [context])
+  assert.equal(consolidated.reason, 'Original bracket: 2.00% to stop and 4.00% to target from trigger; not a maximum-loss estimate.')
+  assert.deepEqual(alertRiskAssessment({ ...row, warnings: ['Current price stale: latest completed 5m bar ended 2026-09-18T20:00:00Z'] }).cautions,
+    ['Current price stale: latest completed 5m bar ended 2026-09-18T20:00:00Z'])
+  assert.equal(alertRiskAssessment({ ...row, warnings: ['Directional context: trigger metrics unavailable: EMA50 slope'] }).label, 'Data limited')
+  assert.equal(alertRiskAssessment({ ...row, status: 'UNRESOLVED', warnings: [context] }).label, 'Data issue')
   assert.equal(alertRiskAssessment({ ...row, target: 1000 }).label, 'Unrated')
   assert.equal(unavailableAlertProbability.label, 'Unavailable')
   assert.match(unavailableAlertProbability.reason, /not probabilities/)
@@ -158,4 +204,15 @@ test('open positions use forward results without a historical date or stale run 
   for (const key of ['session_date', 'run', 'offset', 'status']) assert.equal(open.has(key), false)
   assert.deepEqual(resolveAlertRoute(new URLSearchParams('source=REPLAY&view=open')), { source: 'SHADOW', view: 'open' })
   assert.equal(alertTabParams(open, 'latest', true).get('source'), 'SHADOW')
+})
+
+test('EOD review is always retained shadow evidence and keeps its selected session', () => {
+  const current = new URLSearchParams('source=REPLAY&view=history&session_date=2026-09-18&status=CLOSED&review_selection=NOT_SELECTED')
+  const review = alertTabParams(current, 'eod')
+  assert.deepEqual(resolveAlertRoute(review), { source: 'SHADOW', view: 'eod' })
+  assert.equal(review.get('session_date'), null)
+  assert.equal(review.has('status'), false)
+  review.set('session_date', '2026-09-18')
+  assert.equal(alertTabParams(review, 'eod').get('session_date'), '2026-09-18')
+  assert.equal(alertTabParams(review, 'latest', true).has('review_selection'), false)
 })

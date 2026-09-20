@@ -50,6 +50,23 @@ export interface ScreeningResult {
   comparison?: { status: string; current_session: string; previous_session: string | null; previous_generation: string | null; new_count: number | null; unavailable_count: number }
 }
 
+export const screeningDetailGroups = [
+  { title: 'Snapshot', fields: ['price', 'change', 'volume', 'instrument_type'] },
+  { title: 'Trend and location', fields: ['discovery_state', 'discovery_trend', 'vs_ema20', 'vs_ema50', 'vs_sma200', 'vs_prior_high20'] },
+  { title: 'Momentum', fields: ['momentum_12_1', 'momentum_6_1', 'momentum_3_1', 'momentum_percentile'] },
+  { title: 'Liquidity and risk', fields: ['dollar_volume_20', 'relative_volume_20', 'realized_volatility_21'] },
+] as const
+
+export function screeningDetailFacts(row: Pick<ScreeningRow, 'values' | 'missing'>, catalog: Pick<ScreeningCatalog, 'fields'>) {
+  return screeningDetailGroups.map(group => ({ title: group.title, facts: group.fields.map(field => {
+    const spec = catalog.fields[field]
+    const value = row.values[field]
+    const label = field === 'relative_volume_20' ? 'Daily relative volume (20-session)' : spec?.label || field.replace(/_/g, ' ')
+    return { field, label, value: formatValue(value, spec),
+      missing: value == null ? row.missing[field] || 'UNAVAILABLE' : null, tone: screeningValueClass(field, value) }
+  }).filter(fact => fact.field in catalog.fields) }))
+}
+
 export function dailyCoverageNotice(generation?: Pick<ScreeningResult['generation'], 'session' | 'expected_members' | 'source_publication_status' | 'source_selected_members' | 'source_unavailable_members'>): string | null {
   if (generation?.source_publication_status !== 'DEGRADED') return null
   const selected = generation.source_selected_members
