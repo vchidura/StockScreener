@@ -1,6 +1,16 @@
 param()
 
 $ErrorActionPreference = "Stop"
+$groupPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'run_worker_group.py'))
+$managed = @(Get-CimInstance Win32_Process | Where-Object {
+    $_.Name -eq 'python.exe' -and $_.CommandLine -and
+    $_.CommandLine.IndexOf($groupPath, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+    $_.CommandLine -match '--group(?:=|\s+)["'']?options(?:["'']?\s|$)' -and
+    $_.CommandLine -notmatch '--(status|plan|check|stop)(\s|$)'
+})
+if ($managed.Count) {
+    throw 'Options is managed; use run_worker_group.py --group options --stop. No child was stopped.'
+}
 $scriptPath = [System.IO.Path]::GetFullPath(
     (Join-Path $PSScriptRoot "run_option_worker.py")
 )

@@ -11,6 +11,7 @@ from pydantic import AwareDatetime, Field, model_validator
 from equity.behavior import Contract, DEFINITION_V1_SHA256, Name, OPTIONS_SWING_PROFILE, Sha256, StockBehaviorSnapshot
 from options.analytics.smile import SmileInput, fit_smile_groups, qualifying_distortions
 from options.calendar import OptionExchangeCalendar
+from options.config import ValuationPolicy
 from options.domain import ContractType
 
 
@@ -59,7 +60,8 @@ class SurfaceSource(Contract):
     @model_validator(mode="after")
     def validate_source(self):
         if (not self.market_time <= self.observed_at <= self.recorded_at <= self.received_at
-            or not self.market_time <= self.scheduled_cycle <= self.received_at):
+            or self.scheduled_cycle > self.received_at
+            or self.schema_version == "option_local_surface_source_v1" and self.market_time > self.scheduled_cycle):
             raise ValueError("surface source requires causal actual receipts")
         if self.expiration_cutoff <= self.market_time:
             raise ValueError("surface expired at source")
@@ -72,34 +74,79 @@ class SurfaceSource(Contract):
         return self
 
 
-def bind_surface_source(*, snapshots, lineage, security, recorded_at, received_at):
+class CausalSurfacePoint(SurfacePoint):
+    market_time: AwareDatetime
+    observed_at: AwareDatetime
+
+
+class CausalSurfaceSource(SurfaceSource):
+    schema_version: Literal["option_local_surface_source_v2"] = "option_local_surface_source_v2"
+    spot_market_time: AwareDatetime
+    valuation_policy: ValuationPolicy
+    model_version: Name
+    points: tuple[CausalSurfacePoint, ...] = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_point_clocks(self):
+        if (self.valuation_policy_sha256 != self.valuation_policy.policy_sha256
+                or self.market_time != max(point.market_time for point in self.points)
+                or self.observed_at != max(point.observed_at for point in self.points)
+                or any(not point.market_time <= point.observed_at <= self.recorded_at
+                    or not 0 <= (point.market_time - self.spot_market_time).total_seconds()
+                        <= self.valuation_policy.maximum_option_spot_skew_seconds for point in self.points)):
+            raise ValueError("surface point clocks must retain their causal valuation basis")
+        return self
+
+
+def surface_snapshot_eligible(snapshot, *, valuation_policy=None):
+    if (snapshot.quality_flags or not snapshot.iv_converged or snapshot.local_iv is None
+            or snapshot.revised_observed_at is not None
+            or snapshot.mark_market_data_time != snapshot.market_data_time):
+        return False
+    if valuation_policy is None:
+        return snapshot.spot_market_data_time == snapshot.market_data_time
+    return (snapshot.valuation_policy_sha256 == valuation_policy.policy_sha256
+        and snapshot.valuation_policy_version == valuation_policy.policy_version
+        and snapshot.mark_source in valuation_policy.allowed_entry_mark_sources
+        and 0 <= (snapshot.mark_market_data_time - snapshot.spot_market_data_time).total_seconds()
+            <= valuation_policy.maximum_option_spot_skew_seconds)
+
+
+def bind_surface_source(*, snapshots, lineage, security, recorded_at, received_at, valuation_policy=None):
     if not 1 <= len(snapshots) <= 256:
         raise ValueError("surface source exceeds contract bound")
     first = snapshots[0]
     if (not security.active or security.ticker != first.underlyer
-            or security.effective_from > first.market_data_time or security.observed_at > received_at):
+            or security.effective_from > min(row.spot_market_data_time for row in snapshots) or security.observed_at > received_at):
         raise ValueError("surface dated security identity unavailable")
     if lineage.underlying != first.underlyer or first.market_data_time > lineage.market_time:
         raise ValueError("surface matrix scope mismatch")
     coherent = ("batch_id", "underlyer", "contract_type", "expiration_date", "expiration_cutoff",
-        "spot", "spot_market_data_time", "market_data_time", "valuation_policy_sha256", "model_version")
+        "spot", "spot_market_data_time", "valuation_policy_sha256", "model_version")
+    if valuation_policy is None:
+        coherent += ("market_data_time",)
     for snapshot in snapshots:
         if (any(getattr(snapshot, field) != getattr(first, field) for field in coherent)
-                or not snapshot.iv_converged or snapshot.quality_flags or snapshot.revised_observed_at is not None
+                or not surface_snapshot_eligible(snapshot, valuation_policy=valuation_policy)
                 or snapshot.first_observed_at > lineage.observed_time
-                or snapshot.mark_market_data_time != first.market_data_time
-                or snapshot.spot_market_data_time != first.market_data_time):
+                or snapshot.market_data_time > lineage.market_time):
             raise ValueError("surface points require one coherent unrevised valuation batch")
-    return SurfaceSource(security_id=security.security_id, underlyer=first.underlyer,
+    source_type = CausalSurfaceSource if valuation_policy is not None else SurfaceSource
+    point_type = CausalSurfacePoint if valuation_policy is not None else SurfacePoint
+    return source_type(security_id=security.security_id, underlyer=first.underlyer,
         matrix_id=lineage.matrix_id, scheduled_cycle=lineage.scheduled_cycle, batch_id=first.batch_id,
         configuration_sha256=lineage.configuration_sha256, market_policy_sha256=lineage.market_policy_sha256,
         valuation_policy_sha256=first.valuation_policy_sha256, contract_type=first.contract_type.value,
         expiration_date=first.expiration_date, expiration_cutoff=first.expiration_cutoff, spot=first.spot,
-        market_time=first.market_data_time, observed_at=max(row.first_observed_at for row in snapshots),
+        market_time=max(row.market_data_time for row in snapshots), observed_at=max(row.first_observed_at for row in snapshots),
         recorded_at=recorded_at, received_at=received_at,
-        points=tuple(SurfacePoint(contract_id=row.contract_id, contract_ticker=row.contract_ticker,
+        **(dict(spot_market_time=first.spot_market_data_time, valuation_policy=valuation_policy,
+            model_version=first.model_version) if valuation_policy is not None else {}),
+        points=tuple(point_type(contract_id=row.contract_id, contract_ticker=row.contract_ticker,
             snapshot_id=row.snapshot_id, snapshot_sha256=row.normalized_payload_sha256,
-            strike=row.strike, local_iv=row.local_iv) for row in sorted(snapshots, key=lambda row: (row.strike, row.contract_id))))
+            strike=row.strike, local_iv=row.local_iv,
+            **(dict(market_time=row.market_data_time, observed_at=row.first_observed_at) if valuation_policy is not None else {}))
+            for row in sorted(snapshots, key=lambda row: (row.strike, row.contract_id))))
 
 
 class SurfaceFinding(Contract):
@@ -171,11 +218,14 @@ def assess_surface_first(source, stock, *, market_cutoff, decision_at, context_u
 
     if market_cutoff.utcoffset() is None or decision_at.utcoffset() is None or market_cutoff > decision_at:
         raise ValueError("surface cutoffs must be aware and causal")
-    source = SurfaceSource.model_validate_json(source.canonical_json())
+    source_type = CausalSurfaceSource if source.schema_version == "option_local_surface_source_v2" else SurfaceSource
+    source = source_type.model_validate_json(source.canonical_json())
     calendar = calendar or OptionExchangeCalendar()
     session = calendar.session_for_slot(source.market_time)
+    oldest_market_time = min(point.market_time for point in source.points) if isinstance(source, CausalSurfaceSource) else source.market_time
+    maximum_age = min(SURFACE_POLICY.maximum_source_age_seconds, source.valuation_policy.maximum_source_age_seconds) if isinstance(source, CausalSurfaceSource) else SURFACE_POLICY.maximum_source_age_seconds
     valid_until = min(calendar.session_close(session), source.expiration_cutoff,
-        source.market_time + timedelta(seconds=SURFACE_POLICY.maximum_source_age_seconds))
+        oldest_market_time + timedelta(seconds=maximum_age))
     reasons, findings, fits = [], [], ()
     unavailable = source.received_at > decision_at or source.market_time > market_cutoff or decision_at >= valid_until
     if source.scheduled_cycle > market_cutoff:

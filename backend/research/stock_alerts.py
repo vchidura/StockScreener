@@ -44,6 +44,8 @@ def history_publications(snapshot, session):
     latest_by_strategy = {}
     if snapshot["source"] != "REPLAY":
         for publication in sorted(publications, key=publication_order):
+            if snapshot.get("current_session") and publication["session"] != snapshot["current_session"]:
+                continue
             latest_by_strategy[publication.get("strategy_instance_id")] = publication["run_id"]
     withheld = set(latest_by_strategy.values())
     return sorted((item for item in publications if item["session"] == session

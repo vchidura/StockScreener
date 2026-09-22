@@ -240,7 +240,8 @@ def bind_option_leg_basis(*, candidate, security, snapshots, references, raw_bar
     basis_rows = []
     for leg, snapshot, reference, bar, created_at in zip(candidate.legs, snapshots, references, raw_bars, raw_bar_created_ats):
         validation = validate_standard_contract(reference)
-        if validation.eligibility_status != CatalogEligibility.VALIDATED_ACTIVE or json.loads(reference.adjustment_metadata_json):
+        if (validation.eligibility_status != CatalogEligibility.VALIDATED_ACTIVE
+                or set(json.loads(reference.adjustment_metadata_json)) - {"cfi", "correction"}):
             raise ValueError("setup requires unadjusted standard option deliverables")
         if snapshot.contract_type != validation.contract_type or snapshot.exercise_style != validation.exercise_style:
             raise ValueError("setup option type/style differs from contract reference")

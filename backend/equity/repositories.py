@@ -1379,6 +1379,8 @@ class EquityIngestionRepository(_Repository):
         *,
         stale_after: timedelta,
         reason: str = "INGESTION_SEGMENT_STALE",
+        intervals: Sequence[str] | None = None,
+        dataset: str | None = None,
     ) -> tuple[dict[str, Any], ...]:
         if stale_after < timedelta(0):
             raise ValueError("stale_after must not be negative")
@@ -1390,6 +1392,8 @@ class EquityIngestionRepository(_Repository):
                     FROM equity_ingestion_segments
                     WHERE status = 'WRITING'
                       AND created_at < NOW() - %s
+                                            AND (%s::TEXT[] IS NULL OR interval = ANY(%s))
+                                            AND (%s::TEXT IS NULL OR dataset = %s)
                     FOR UPDATE SKIP LOCKED
                 )
                 UPDATE equity_ingestion_segments AS segment
@@ -1402,7 +1406,8 @@ class EquityIngestionRepository(_Repository):
                 WHERE segment.ingestion_segment_id = stale_segments.ingestion_segment_id
                 RETURNING segment.ingestion_segment_id, segment.dataset, segment.interval
                 """,
-                (stale_after, reason),
+                (stale_after, list(intervals) if intervals is not None else None,
+                    list(intervals) if intervals is not None else None, dataset, dataset, reason),
             )
             return tuple(dict(row) for row in cursor.fetchall())
 
@@ -2358,6 +2363,8 @@ class EquityAnalysisRepository(_Repository):
         *,
         stale_after: timedelta,
         reason: str = "ANALYSIS_RUN_LEASE_EXPIRED",
+        intervals: Sequence[str] | None = None,
+        run_purpose: str | None = None,
     ) -> tuple[dict[str, Any], ...]:
         if stale_after < timedelta(0):
             raise ValueError("stale_after must not be negative")
@@ -2368,9 +2375,12 @@ class EquityAnalysisRepository(_Repository):
                 FROM equity_analysis_runs
                 WHERE status = 'RUNNING'
                   AND created_at < NOW() - %s
+                                    AND (%s::TEXT[] IS NULL OR interval = ANY(%s))
+                                    AND (%s::TEXT IS NULL OR run_purpose = %s)
                 FOR UPDATE SKIP LOCKED
                 """,
-                (stale_after,),
+                (stale_after, list(intervals) if intervals is not None else None,
+                    list(intervals) if intervals is not None else None, run_purpose, run_purpose),
             )
             stale_run_ids = tuple(row["analysis_run_id"] for row in cursor.fetchall())
             if not stale_run_ids:

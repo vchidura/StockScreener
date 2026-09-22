@@ -26,6 +26,49 @@ def load_alert_view(source, *, combined=None):
     return load_snapshot(path, source)
 
 
+def forward_session_snapshot(snapshot, *, as_of=None):
+    if snapshot.get("source") != "SHADOW":
+        return snapshot
+    now = as_of or datetime.now(timezone.utc)
+    dates = session_dates(now.astimezone(ZoneInfo("America/New_York")).date().isoformat())
+    return dict(snapshot, sessions=dates, current_session=dates[-1])
+
+
+def current_alert_schedules(snapshot, *, as_of=None):
+    if snapshot.get("source") != "SHADOW":
+        return []
+    now = as_of or datetime.now(timezone.utc)
+    session = now.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+    backend = Path(__file__).resolve().parents[1]
+    sources = [("swing" if snapshot.get("source_id") == "stock_ideas_forward_swing_v1" else "intraday", snapshot)]
+    if snapshot.get("combined"):
+        sources = [("intraday", Path(os.getenv("STOCK_ALERT_SHADOW_VIEW") or backend / "backups/equity-shadow/stock-ideas-forward-v2/alerts-view.json")),
+            ("swing", backend / "backups/equity-shadow/stock-ideas-swing-v1/alerts-view.json")]
+    result = []
+    for stream, source in sources:
+        row = dict(stream=stream, label="Swing" if stream == "swing" else "Intraday", status="UNAVAILABLE")
+        try:
+            if isinstance(source, Path):
+                if source.stat().st_size > 20_000_000:
+                    raise ValueError("worker schedule snapshot exceeds bound")
+                source = load_snapshot(source, "SHADOW")
+            source_time = datetime.fromisoformat(source["as_of"])
+            start = datetime.fromisoformat(source["publication_window_start"])
+            end = datetime.fromisoformat(source["publication_deadline"])
+            if any(value.utcoffset() is None for value in (source_time, start, end)) or source_time > now or end < start:
+                raise ValueError("worker schedule clocks invalid")
+            runs = [run for run in source.get("publications", []) if run["session"] == session]
+            latest = max(runs, key=lambda run: run["trigger_at"], default=None)
+            row.update(status="OVERDUE" if end < now else "RETAINED", source_as_of=source_time.isoformat(),
+                publication_window_start=start.isoformat(), publication_deadline=end.isoformat(),
+                skipped_windows=sum(run["status"] == "MISSED_PUBLICATION" for run in runs),
+                latest_run={key: latest[key] for key in ("trigger_at", "published_at", "status", "selected")} if latest else None)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        result.append(row)
+    return result
+
+
 def attach_alert_context(page):
     if page.get("combined"):
         from equity.stock_alert_results import attach_shared_context

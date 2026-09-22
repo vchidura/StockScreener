@@ -3,7 +3,9 @@
 .sa-trade-types button[aria-pressed=true] { color: var(--tm-accent); background: var(--tm-accent-soft); border-color: var(--tm-accent); }
 .sa-trade-types span { margin-left: 8px; font-size: 11px; color: var(--tm-muted); }
 .sa-trade-types .sa-schedule { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px 16px; margin-left: auto; }
-.sa-trade-types .sa-schedule > span { display: inline-flex; align-items: center; gap: 5px; margin-left: 0; }
+.sa-trade-types .sa-schedule > :is(span, strong) { display: inline-flex; align-items: center; gap: 5px; margin-left: 0; flex-wrap: wrap; }
+.sa-trade-types .sa-schedule strong { font-weight: 700; }
+.sa-trade-types .sa-schedule__warning { color: var(--tm-warn); }
 .sa-trade-types .sa-schedule__stale { color: var(--tm-negative); }
 @media (max-width: 650px) { .stock-alerts .sd-presets { flex-wrap: wrap; } .sa-trade-types .sa-schedule { width: 100%; justify-content: flex-start; margin: 6px 0 0; } }
 .stock-alerts { letter-spacing: 0; }
@@ -33,6 +35,8 @@
 .stock-alerts .sa-scroll table { min-width: 1050px; width: max-content; max-width: none; }
 .stock-alerts th, .stock-alerts td { min-width: 78px; }
 .stock-alerts th:first-child, .stock-alerts td:first-child { min-width: 42px; width: 42px; }
+.stock-alerts .sa-scroll :is(th, td):first-child { min-width: 154px; width: 154px; }
+.stock-alerts .sa-scroll .sa-plan-details { min-width: 42px; width: 42px; }
 .stock-alerts th:nth-child(2), .stock-alerts td:nth-child(2) { min-width: 80px; }
 .stock-alerts th button { display: inline-flex; align-items: center; gap: 4px; }
 .sa-detail-launch { color: var(--tm-accent); }

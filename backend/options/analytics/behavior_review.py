@@ -268,6 +268,14 @@ def _partition_runs(runs, *, session_date, pending=None):
         withheld_run=active if active and active["session_date"] == selected_date else None)
 
 
+def _detector_run_summary(run):
+    return dict(run_id=str(run.run_id), scheduled_cycle=run.scheduled_cycle.isoformat(),
+        selected_at=run.selected_at.isoformat(), published_at=run.selected_at.isoformat(),
+        market_time=run.market_time.isoformat(), observed_time=run.observed_time.isoformat(),
+        expected_underlyings=len(run.expected_underlyers), covered_underlyings=len(run.source_matrices),
+        selection_counts=dict(run.selection_counts), rejections=dict(run.rejections))
+
+
 def _detector_strategy(record):
     import json
     from options.analytics.alert_selection import SurfaceEvaluationEvidence
@@ -277,16 +285,38 @@ def _detector_strategy(record):
     return json.loads(record.plan_payload_text).get("management_policy", {}).get("strategy_name")
 
 
+def _detector_triggered_at(record):
+    import json
+    from options.analytics.alert_selection import SurfaceEvaluationEvidence
+
+    if isinstance(record, SurfaceEvaluationEvidence):
+        return None
+    plan = json.loads(record.plan_payload_text)
+    if record.detector_id == "O1":
+        value = plan.get("source_market_time")
+    else:
+        evidence = plan.get("management_policy", {}).get("technical_exit", {}).get("evidence", {})
+        value = evidence.get("market_time") if evidence.get("source_kind") == "STOCK_SETUP" else None
+    if not isinstance(value, str):
+        return None
+    try:
+        triggered_at = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return triggered_at if triggered_at.utcoffset() is not None and triggered_at <= record.package.decision_at else None
+
+
 def _sort_detector_records(records, sort_by, sort_order):
     import json
     from decimal import Decimal
     from options.analytics.alert_selection import SurfaceEvaluationEvidence
 
-    if sort_by not in {"run", "underlyer", "detector", "category", "strategy", "rank", "entry_limit"} or sort_order not in {"asc", "desc"}:
+    if sort_by not in {"triggered_at", "run", "underlyer", "detector", "category", "strategy", "rank", "entry_limit"} or sort_order not in {"asc", "desc"}:
         raise ValueError("invalid detector sort")
     def value(record):
         observation = isinstance(record, SurfaceEvaluationEvidence)
         source = record.observation if observation else record.package
+        if sort_by == "triggered_at": return _detector_triggered_at(record)
         if sort_by == "run": return record.scheduled_cycle
         if sort_by == "underlyer": return source.underlyer
         if sort_by == "detector": return record.detector_id
@@ -383,9 +413,7 @@ def build_detector_evaluation_review(*, as_of, session_date=None, dataset_id=Non
         storage_ready=inputs["ready"], datasets=inputs["datasets"], dataset_id=inputs["dataset_id"],
         sessions=[day.isoformat() for day in inputs["sessions"]],
         session_date=inputs["session_date"].isoformat() if inputs["session_date"] else None,
-        completed_runs=[dict(run_id=str(run.run_id), scheduled_cycle=run.scheduled_cycle.isoformat(),
-            selected_at=run.selected_at.isoformat(), selection_counts=dict(run.selection_counts))
-            for run in inputs.get("runs", ())],
+        completed_runs=[_detector_run_summary(run) for run in inputs.get("runs", ())],
         rows=rows, total=len(filtered), cells=cells, models=models, limit=limit, offset=offset,
         maximum_new_alerts=20, cohort_basis="FROZEN_SELECTION_BEFORE_OUTCOMES",
         outcome_status="NOT_BOUND_TO_PROSPECTIVE_OUTCOMES", execution_permission=False)
@@ -397,9 +425,10 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
     import json
     from zoneinfo import ZoneInfo
     from options.repositories.alert_evaluations import OptionAlertEvaluationRepository
+    from options.analytics.alert_selection import SurfaceEvaluationEvidence
 
     if (not dataset_id or len(dataset_id) > 80 or as_of.utcoffset() is None
-            or scope not in ("LATEST", "HISTORY") or detector not in (None, "O1", "S1", "S2")
+            or scope not in ("LATEST", "HISTORY") or detector not in (None, "O1", "O2", "S1", "S2")
             or not 1 <= limit <= 200 or offset < 0):
         raise ValueError("invalid detector alert scope")
     reader = repository or OptionAlertEvaluationRepository()
@@ -413,7 +442,7 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
     selected_date = session_date or latest_date
     if latest is None:
         return dict(version="option_detector_alert_review_v1", dataset_id=dataset_id, scope=scope,
-            status="NO_COMPLETE_RUN", as_of=as_of.isoformat(), latest_run_id=None,
+            status="NO_COMPLETE_RUN", as_of=as_of.isoformat(), latest_run_id=None, run=None, runs=[], latest_run=None,
             session_date=selected_date.isoformat() if selected_date else None,
             sessions=sessions, rows=[], total=0, new_alerts=0, repeat_hits=0, maximum_new_alerts=20,
             outcome_status="NOT_BOUND_TO_PROSPECTIVE_OUTCOMES", execution_permission=False)
@@ -427,19 +456,38 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
         active_runs = tuple(run for run in inputs.get("runs", ()) if run.run_id != latest.run_id)
         active_ids = {run.run_id for run in active_runs}
         records = tuple(row for row in inputs["records"] if row.run_id in active_ids)
-    selected = _sort_detector_records((row for row in records if row.selection_status == "SELECTED"
+    selected = _sort_detector_records((row for row in records if (row.selection_status == "SELECTED"
+        or isinstance(row, SurfaceEvaluationEvidence) and row.observation.finding_disposition == "DETECTED")
         and (detector is None or row.detector_id == detector)
-        and (not underlyer or row.package.underlyer == underlyer.strip().upper())), sort_by, sort_order)
+        and (not underlyer or (row.observation.underlyer if isinstance(row, SurfaceEvaluationEvidence)
+            else row.package.underlyer) == underlyer.strip().upper())), sort_by, sort_order)
     page = selected[offset:offset + limit]
-    hits = reader.repeat_counts(dataset_id=dataset_id, records=page, as_of=as_of)
-    originals = source_repository.original_packages(page, as_of=as_of) if source_repository is not None else {}
+    packages = [row for row in page if not isinstance(row, SurfaceEvaluationEvidence)]
+    hits = reader.repeat_counts(dataset_id=dataset_id, records=packages, as_of=as_of)
+    originals = source_repository.original_packages(packages, as_of=as_of) if source_repository is not None else {}
     rows = []
     for record in page:
+        if isinstance(record, SurfaceEvaluationEvidence):
+            observation = record.observation
+            rows.append(dict(evaluation_id=str(record.evaluation_id), candidate_id=None,
+                run_id=str(record.run_id), scheduled_cycle=record.scheduled_cycle.isoformat(), triggered_at=None,
+                detector_id="O2", origin="OPTIONS_FIRST", underlyer=observation.underlyer, direction=None,
+                category="NEUTRAL_VOL", strategy_name=None, candidate_rank=None,
+                first_selected_at=record.selected_at.isoformat(), last_seen_at=record.selected_at.isoformat(),
+                hit_count=None, repeat_count=None, plan_sha256=None, entry_limit=None,
+                entry_deadline=None, exit_deadline=None, management_policy=None,
+                event_horizon_status=observation.event_context_status,
+                original_package=dict(status="NOT_APPLICABLE_OBSERVATION", legs=[]),
+                outcome_status="NOT_APPLICABLE_OBSERVATION", net_return=None, fill=None,
+                observation=observation.model_dump(mode="json")))
+            continue
         package = record.package
         plan = json.loads(record.plan_payload_text)
         repeat = hits[record.evaluation_id]
+        triggered_at = _detector_triggered_at(record)
         rows.append(dict(evaluation_id=str(record.evaluation_id), candidate_id=str(record.candidate_id),
             run_id=str(record.run_id), scheduled_cycle=record.scheduled_cycle.isoformat(),
+            triggered_at=triggered_at.isoformat() if triggered_at else None,
             detector_id=record.detector_id, origin="OPTIONS_FIRST" if record.detector_id == "O1" else "STOCK_FIRST",
             underlyer=package.underlyer, direction=package.direction, category=package.primary_category,
             strategy_name=_detector_strategy(record),
@@ -453,8 +501,11 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
             outcome_status="NOT_BOUND_TO_PROSPECTIVE_OUTCOMES", net_return=None, fill=None))
     return dict(version="option_detector_alert_review_v1", dataset_id=dataset_id, scope=scope,
         status="COMPLETE", as_of=as_of.isoformat(), latest_run_id=str(latest.run_id),
+        run=_detector_run_summary(latest) if scope == "LATEST" else None,
+        latest_run=_detector_run_summary(latest), runs=[_detector_run_summary(run) for run in active_runs],
         session_date=selected_date.isoformat(), sessions=sessions,
         rows=rows, total=len(selected), limit=limit, offset=offset,
+        detected_observations=sum(isinstance(row, SurfaceEvaluationEvidence) for row in selected),
         new_alerts=sum(dict(run.selection_counts)["SELECTED"] for run in active_runs),
         repeat_hits=sum(dict(run.selection_counts)["REPEAT"] for run in active_runs), maximum_new_alerts=20,
         outcome_status="NOT_BOUND_TO_PROSPECTIVE_OUTCOMES", execution_permission=False)

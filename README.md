@@ -121,28 +121,110 @@ the exchange schedule.
 
 #### Resident Worker Checklist
 
-The native launcher's default `-Only All` starts eight worker windows. Use
-`-Only Equity` for the five equity-side workers or `-Only Options` for the three
-options/calendar workers. Use `-Worker` for a single worker from the table below.
+The native launcher's continuous `-Only All` plan now starts five managed groups.
+The user-approved native cutover completed September21 at19:03UTC. Existing standalone
+services are never automatically replaced: any subsequent cutover still requires review.
+`-Plan` is read-only and never starts services.
+
+| Group | `-Worker` Value | Independent Work |
+|---|---|---|
+| Equity | `Equity` | Existing seven isolated ingestion, derivation, analysis and maintenance stages |
+| Stock Alerts | `StockAlerts` | Existing intraday, swing and results-projector children |
+| UI Projections | `UIProjections` | Portal and Screening as separate continuous children |
+| Reference Refresh | `ReferenceRefresh` | Corporate actions, market events and Treasury inputs as independently scheduled one-shot jobs |
+| Options | `Options` | Existing Options worker under lifecycle supervision; its internal processing is unchanged |
+
+`-Only Equity` selects four groups, with **only corporate actions** in Reference Refresh.
+`-Only Options` selects two groups, with **only market events and Treasury inputs** in
+Reference Refresh. Start `All` when both sets are needed: a running subset cannot be
+silently expanded by a second launch. `-Once` retains the original eight-component
+sequential maintenance pass. Named standalone components remain available for reviewed
+maintenance when their owning group is stopped. Their output contracts remain separate:
 Provider refresh cadences below are defaults, not a
 promise that every cycle produces a new publication.
 
 | Worker | Launch Set | `-Worker` Value | Purpose And Cadence |
 |---|---|---|---|
-| [run_equity_worker.py](backend/scripts/run_equity_worker.py) | Equity | `Equity` | REST bar ingestion, canonical publication, v16 analysis and daily signal context; checks due watermarks every 15 seconds with the configured provider delay |
+| [run_equity_worker.py](backend/scripts/run_equity_worker.py) | Equity | `Equity` | Supervises isolated native ingestion, derivation, four analysis lanes and bounded outcome/context maintenance; independent 15-second checks with the configured provider delay |
 | [run_corporate_action_worker.py](backend/scripts/run_corporate_action_worker.py) | Equity | `CorporateActions` | Upcoming/recent split and dividend observations; refreshes every 6 hours, retries failures after 5 minutes |
-| [run_stock_idea_worker.py](backend/scripts/run_stock_idea_worker.py) | Equity | `StockAlerts` | Multi-model forward shadow alerts after completed source ingestion; bounded XNYS 30m publication windows, shared 30m/1h/daily decisions, actual input times and isolated paper plans |
+| [run_stock_alert_service.py](backend/scripts/run_stock_alert_service.py) | Equity | `StockAlerts` | Supervises already-enrolled intraday and swing alert workers plus results projection; separate checkpoints, policies and process-local caches; does not start equity ingestion |
 | [refresh_equity_portal_snapshots.py](backend/scripts/refresh_equity_portal_snapshots.py) | Equity | `Portal` | Refreshes the 20 portal/scanner snapshots when missing or stale; checks every 60 seconds with `--continuous`; does not publish the separate Stock Screener snapshot |
 | [run_screening_worker.py](backend/scripts/run_screening_worker.py) | Equity | `Screening` | Checks retained daily/hourly publications every 60 seconds; prepares a daily anchor when a new complete daily cohort arrives and appends hourly-context revisions without provider calls |
 | [run_market_event_worker.py](backend/scripts/run_market_event_worker.py) | Options | `MarketEvents` | Shared Finnhub earnings and official FOMC calendar coverage; refreshes every 6 hours |
 | [run_option_model_input_worker.py](backend/scripts/run_option_model_input_worker.py) | Options | `OptionInputs` | Official Treasury curve observations; refreshes every 6 hours, retries failures after 5 minutes; does not itself change option valuation policy |
-| [run_option_worker.py](backend/scripts/run_option_worker.py) | Options | `Options` | Delayed option ingestion, analysis, strategy/recommendation publication and paper-outcome processing; due XNYS-open-anchored 15-minute slots |
+| [run_option_worker.py](backend/scripts/run_option_worker.py) | Options | `Options` | Supervised in continuous mode; direct in one-shot mode. Existing delayed ingestion, analysis, recommendation and paper-outcome processing; XNYS-open-anchored 15-minute slots |
+
+Group lifecycle is implemented in [run_worker_group.py](backend/scripts/run_worker_group.py),
+reusing the existing supervisor and Windows job cleanup. It refuses active standalone
+components rather than stopping them. Continuous child crashes use bounded backoff;
+reference jobs retain separate six-hour refresh and five-minute retry timers, including
+`MARKET_EVENT_RETRY_SECONDS`. Successful process exit is not proof of complete provider
+coverage. Saved schedules avoid another refresh immediately after an orderly restart.
+An interrupted job is retried, never marked successful; underlying immutable writers remain
+responsible for idempotence. First activation has no retained schedule and runs each job once.
+
+Read-only inspection and an explicit stop command:
+
+```powershell
+.\backend\.venv\Scripts\python.exe -B backend/scripts/run_worker_group.py --group projections --plan
+.\backend\.venv\Scripts\python.exe -B backend/scripts/run_worker_group.py --group projections --check
+.\backend\.venv\Scripts\python.exe -B backend/scripts/run_worker_group.py --group projections --status
+.\backend\.venv\Scripts\python.exe -B backend/scripts/run_worker_group.py --group projections --stop
+```
+
+Group values are `projections`, `references`, and `options`. Status and redacted rotating
+logs are in `backend/backups/worker-groups/<group>`. The stop request is bound to the exact
+service instance; it never kills unrelated workers. The legacy standalone Options stop
+script refuses a group-owned child. VS Code provides **Preview consolidated worker lineup**,
+**Inspect managed worker group**, **Check managed worker group conflicts**, and
+**Stop managed worker group** tasks. The new groups currently target native Windows only;
+Compose deployment is unchanged and does not yet reproduce this complete lineup.
+
+Continuous Equity remains one managed service/window. Native ingestion and canonical
+publication never wait for analysis, outcome maturation or adjusted-daily context.
+The 30-minute, hourly, short-interval and daily/weekly/monthly analysis lanes use separate
+processes and service instances. Downstream work reads committed canonical publications;
+missing or failed latest sources remain unavailable. Each idle lane selects the latest
+eligible interval target with a fresh clock, without queuing an unbounded historical backlog.
+Native fetch concurrency remains eight by default. One-shot/explicit repair commands
+retain their bounded sequential behavior. No Advanced stream is enabled by this change.
+
+Inspect process/stage state with `run_equity_worker.py --status`, and actual ingestion,
+canonical and analysis latency with `report_equity_analysis_status.py --latency` (both
+under `backend/scripts`, using the backend virtual environment). The corresponding VS Code
+tasks are **Show equity worker stages** and **Report equity pipeline latency**. Logs and
+bounded atomic status files are in `backend/backups/equity-worker`.
+Provider delay, waiting for finalized bar boundaries, polling and processing latency are
+distinct. A zero-delay entitlement does not imply zero network or computation time.
+The latency report shows excess completion time beyond the configured provider delay;
+zero pending bar boundaries alone is not proof of low latency.
 
 The options worker always targets the latest observable delayed slot. A newer slot
 supersedes an older retry and its cooldown; missed slots and terminal failed batches
 are retained, not replayed with later snapshots. Same-slot operational failures may
 retry after five minutes, but a failed/quarantined batch is never reopened. Outcome
 processing cannot erase the completed ingestion checkpoint.
+
+For an enrolled technical-options launch using `option_detector_forward_launch_v2`,
+Stock Alerts and Options may start in parallel. Startup validates reviewed code,
+policies, schema and permissions, not the arrival of today's stock-alert publication.
+O1 reuses the latest cutoff-eligible stock behavior context only while its original
+trend/liquidity and technical evidence remain valid. It does not require a selected
+stock alert and never treats expired prior-session context as fresh confirmation.
+S1/S2 require the expected completed, same-session 30-minute stock publication window
+at each underlying's delayed option market cutoff, plus an exact unexpired hourly
+episode. Provider delay is not subtracted twice. Missing, late, missed, corrupt or
+wrong-runtime stock sources disable those models for that run, not O1/O2. An empty
+newest publication never falls back to an older nonempty one. Original entry terms,
+expiry, identity and event gates remain mandatory; later inputs enter later cycles.
+
+Code changes still require a reviewed new launch manifest. After source-code review,
+`prepare_option_stock_behavior_shadow_launch.py --technical-forward` accepts
+`--approve-stock-runtime-transition` to pin current stock code before its first new
+publication, without changing the enrolled policy or relabeling old evidence. This
+is an explicit preparation action, not a daily-startup flag or automatic trust update.
+An optional aware `--effective-from` inside `--session-date` gives an intraday rollout
+a prospective cutoff. No new enrollment, replay or freshness extension is implied.
 
 Options worker diagnostics are written to
 [worker.log](backend/backups/options-worker/worker.log), with three rotating backups
@@ -268,6 +350,61 @@ different terminal per resident worker). Append `-Once` for a single cycle;
 the launcher supplies the appropriate entry-point flags automatically, except
 MarketContext, which is continuous-only through this launcher.
 
+#### Unified Stock Alerts Service
+
+Normal `-Worker StockAlerts`, `-Only Equity` and `-Only All` now start
+[run_stock_alert_service.py](backend/scripts/run_stock_alert_service.py). It runs
+the existing intraday worker, swing worker and results projector concurrently in
+separate Python processes. Their strategies, SQLite ledgers, enrollments, quotas,
+positions, expiry rules and caches remain independent; no strategy worker code or
+Options source pins change. Both stock studies must already be enrolled under the
+current policies and default directories. Missing/incompatible enrollment stops
+startup before takeover; this service never enrolls or migrates a study.
+
+```powershell
+.\backend\.venv\Scripts\python.exe backend/scripts/run_stock_alert_service.py --plan
+.\backend\.venv\Scripts\python.exe backend/scripts/run_stock_alert_service.py --check
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Worker StockAlerts
+.\backend\.venv\Scripts\python.exe backend/scripts/run_stock_alert_service.py --status
+.\backend\.venv\Scripts\python.exe backend/scripts/run_stock_alert_service.py --stop
+```
+
+One supervisor advisory lock prevents duplicate service ownership. Existing child
+writer/projector locks remain active. Unexpected child exits restart only that child
+after bounded backoff (5, 10, 20, 40 seconds; five consecutive failures halt retries).
+Five minutes of stable runtime resets the failure streak. Changed enrollments or
+policies block automatic restart. Application-reported source unavailability is not
+a process crash and does not trigger a forced restart or loosen signal rules.
+Windows job objects terminate owned descendants if the supervisor exits, including
+unexpected termination. `--stop` targets the retained service instance, not arbitrary
+PIDs; it tries graceful child shutdown before bounded job cleanup.
+
+Unified lifecycle status and redacted rotating logs are under
+`backend/backups/stock-alert-service/status.json` and `service.log` (2 MB plus three
+backups). `--status` includes source publication and projector timestamps separately
+from process health. Running children do not imply fresh sources or qualified alerts.
+The projector still polls every 60 seconds, independent of strategy computation;
+it adds read-model latency, not a signal-calculation dependency.
+
+For an explicitly approved one-time transition from separately running components:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\backend\scripts\start_workers.ps1 -Worker StockAlerts -ReplaceAlertWorkers
+```
+
+This validates policy/enrollment first and stops only exact same-workspace resident
+intraday, swing and projector process trees. It rejects duplicates, maintenance jobs
+and custom stores. Stop may interrupt uncommitted work; committed evidence survives,
+and missed windows are not replayed. Do not add this switch to routine startup.
+The normal launcher refuses implicit takeover and skips independent child launches
+when the service owns them. Use the existing service check/status/stop VS Code tasks.
+
+`-Once` deliberately retains the original bounded **intraday-only** pass, not a
+service launch or swing enrollment. It refuses to run while the supervisor is active.
+The native supervisor currently requires Windows; Compose behavior is unchanged.
+
 The provider-free alert-context annotator is an additional **opt-in** worker,
 excluded from the default All/Equity sets:
 
@@ -324,7 +461,7 @@ preview or `-NoNewWindow` to run in the calling terminal. `-Once` is rejected;
 use the bounded capture CLI with an explicit new output for one-shot work.
 The **Start standalone market context worker** VS Code task calls this same entry.
 
-The daily-owned swing alert policy is a separate, inactive-by-default experiment:
+The daily-owned swing alert policy is a separate experiment with explicit enrollment:
 
 ```powershell
 .\backend\.venv\Scripts\python.exe backend/scripts/run_stock_idea_worker.py --swing --plan
@@ -340,7 +477,8 @@ slot fail closed. Stops/targets remain active overnight, including gap losses.
 
 `--swing` ignores `STOCK_ALERT_SHADOW_VIEW` and uses the separate
 `backend/backups/equity-shadow/stock-ideas-swing-v1` store/view. It cannot reuse the
-v1/v2 default stores and is not started by the default worker groups. Actual writer
+v1/v2 default stores. The unified service resumes an already-enrolled swing study;
+it never creates that enrollment. Direct writer
 execution additionally requires `--activate-swing-shadow`; no activation or reader
 cutover is performed by preview. Starting this experiment enrolls a new dated cohort,
 not a retroactive clone of old alerts or their recovery overlays. Existing plans and
@@ -348,7 +486,7 @@ closed/no-fill outcomes retain their original policies. The shared results reade
 below presents both streams without merging their checkpoints. Prospective collection
 and disjoint outcome evaluation are still required; this is not a qualified strategy.
 
-After explicit activation approval, start only the swing worker in its own window:
+For separately approved enrollment or standalone maintenance, with the service stopped:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
@@ -357,8 +495,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 ```
 
 `-Worker SwingAlerts` explicitly supplies `--swing --activate-swing-shadow` and
-opens `stock-swing-shadow-worker`; it is excluded from the default All/Equity groups.
-Duplicate checks distinguish swing and intraday modes, so the two can run independently.
+opens a standalone `stock-swing-shadow-worker`. Normal All/Equity now runs swing
+inside the StockAlerts service; do not start a standalone duplicate. Duplicate checks
+distinguish standalone modes and reject competing launches while the service is running.
 `-Plan` remains side-effect free. A separately approved exact-identity quarantine
 can use the normal quarantine flags together with the swing activation flags;
 it preserves the enrollment and existing records, taking effect only at a future
@@ -378,16 +517,19 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
   .\backend\scripts\start_workers.ps1 -Worker AlertResults
 ```
 
-This opens `stock-alert-results-projector` separately; it is opt-in, not part of
-All/Equity, and does not start or restart strategy workers. Durable status is at
+This is a standalone maintenance alternative with the service stopped. Normal
+All/Equity now includes projection inside StockAlerts, so no separate daily command
+is needed. The projector does not start or restart strategy workers. Durable status is at
 `backend/backups/stock-alert-results/projector-status.json`; API stream statuses
 show independent source and import timestamps, errors and projector staleness.
 
 - Trade type: All / Intraday / Swing. Plan IDs, original policies and outcomes
   stay distinct even for the same stock, direction or publication timestamp.
-- Latest Run selects the latest publication per strategy, including empty/missed
-  publications; it never falls back to an older nonempty run. Day History excludes
-  each strategy's latest publication and combines the remaining selected-session rows.
+- Latest Run defaults to the current XNYS session, including when the retained projection
+  is stale. It selects the latest publication per strategy, including empty/missed
+  publications, without falling back to an older day or nonempty run. Day History
+  excludes only each strategy's latest current-session publication; all prior-session
+  publications, including the last swing run, remain available on their original dates.
 - Open Positions includes pending/open/unresolved plans outside the21-session date
   navigator. Sorting/pagination are global; recurrence remains strategy-specific.
 - Opposing exposure is an annotation, not netting or a new selection gate. Returns
@@ -527,10 +669,12 @@ the Stock Screener session/publication details or the read-only
 `GET /api/stocks/screening/catalog`; a successful worker launch is not proof of
 fresh screening data.
 
-**Stock Alerts:** [run_stock_idea_worker.py](backend/scripts/run_stock_idea_worker.py)
-replaces the legacy daily discovery worker in Equity/All launches. It enrolls the
-latest complete tracked daily cohort once, warms up from already-stored canonical
-bars, and publishes only post-enrollment resumption/acceptance/failure plans.
+**Stock Alerts:** [run_stock_alert_service.py](backend/scripts/run_stock_alert_service.py)
+is the Equity/All entry point. Its intraday and swing children reuse
+[run_stock_idea_worker.py](backend/scripts/run_stock_idea_worker.py), warm up from
+already-stored canonical bars and publish only post-enrollment plans. The supervisor
+requires the existing enrollments; initial direct-worker enrollment is a separate
+approved action, never a side effect of routine service startup.
 The initial cohort is 386 tracked instruments, including ETFs, not the full market.
 The active `stock_ideas_source_ready_v2` timing policy waits for a COMPLETE native
 30m publication covering the enrolled security IDs, with both publication/creation
@@ -546,13 +690,12 @@ The original retained state and view remain under
 `backend/backups/equity-shadow/stock-ideas-forward-v1/`. The corrected quality-v2
 worker now defaults to a SEPARATE `stock-ideas-forward-v2/` directory, gates on
 current eligible native prices and remaining entry slots, and strengthens intraday
-breakout confirmation. It is implemented but not enrolled or activated. No old
-checkpoint, published plan or paper result is migrated. A mismatched existing
-store/view is rejected, not overwritten. The reader continues serving the old
-view unless `STOCK_ALERT_SHADOW_VIEW` is explicitly changed during an approved
-cutover. Keep that variable pointed at the NEW view for both worker and reader;
-pointing v2 at the v1 view is rejected. The application is currently paused.
-Offline inspection:
+breakout confirmation. The enrolled v2 study is now resumed by the service, separately
+from the enrolled swing study. No old checkpoint, published plan or paper result is
+migrated. A mismatched existing store/view is rejected, not overwritten. The service
+requires the default v2 view; an explicitly configured `STOCK_ALERT_SHADOW_VIEW` must
+resolve there. The combined reader consumes projector results; old v1 evidence is
+retained but not treated as current. Offline inspection:
 
 ```powershell
 .\backend\.venv\Scripts\python.exe .\backend\scripts\run_stock_idea_worker.py --plan

@@ -63,6 +63,36 @@ class OptionStockBehaviorAssessmentRepository(PostgresRepository):
     def __init__(self, connection_factory: ConnectionFactory | None = None) -> None:
         super().__init__(connection_factory)
 
+    def intraday_confirmation_source(self, *, security_id, market_cutoff, as_of):
+        from equity.behavior import DEFINITION_V1_SHA256, OPTIONS_SWING_PROFILE, load_stock_behavior_snapshot
+
+        if market_cutoff.utcoffset() is None or as_of.utcoffset() is None or market_cutoff > as_of:
+            raise ValueError("intraday confirmation requires causal cutoffs")
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '5s'")
+            cursor.execute("""SELECT equity_context_snapshot_id,security_id,market_time,observed_at,created_at,
+                    behavior_payload_text,behavior_payload_sha256
+                FROM equity_context_snapshots WHERE context_kind='STOCK_BEHAVIOR' AND security_id=%s
+                  AND strategy_horizon=%s AND context_policy_sha256=%s AND behavior_definition_sha256=%s
+                  AND behavior_schema_version='stock_behavior_v1'
+                  AND market_time<=%s AND observed_at<=%s AND created_at<=%s
+                ORDER BY market_time DESC,observed_at DESC,created_at DESC,equity_context_snapshot_id LIMIT 1""",
+                (security_id, OPTIONS_SWING_PROFILE.name, OPTIONS_SWING_PROFILE.sha256, DEFINITION_V1_SHA256,
+                 market_cutoff, as_of, as_of))
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        if len(row["behavior_payload_text"].encode("ascii")) > 262144:
+            raise ValueError("intraday source payload exceeds bound")
+        snapshot = load_stock_behavior_snapshot(row["behavior_payload_text"])
+        if (snapshot.sha256 != row["behavior_payload_sha256"] or snapshot.canonical_json() != row["behavior_payload_text"]
+                or snapshot.snapshot_id != row["equity_context_snapshot_id"] or snapshot.security_id != security_id
+                or snapshot.market_time != row["market_time"] or snapshot.available_at != row["observed_at"]
+                or snapshot.availability_mode != "PROSPECTIVE_RECEIPT"):
+            raise ValueError("intraday carrier identity, hash or receipt mismatch")
+        return snapshot
+
     def detector_cycle_sources(self, *, configuration, scheduled_cycle, completed_matrices, as_of):
         if (as_of.utcoffset() is None or scheduled_cycle.utcoffset() is None or scheduled_cycle > as_of
                 or not 1 <= len(completed_matrices) <= 13
@@ -143,13 +173,25 @@ class OptionStockBehaviorAssessmentRepository(PostgresRepository):
             legs = tuple(dict(row) for row in cursor.fetchall())
             if len(legs) > 10000:
                 raise ValueError("detector leg source bound exceeded")
-            contracts = sorted({row["contract_id"] for row in legs})
-            cursor.execute("""SELECT catalog.contract_id,catalog.contract_ticker,catalog.underlying,catalog.asset_type,version.*
-                FROM option_contract_catalog AS catalog JOIN option_contract_catalog_versions AS version USING(contract_id)
-                WHERE catalog.contract_id=ANY(%s::bigint[]) AND catalog.catalog_admitted_at<=%s
-                  AND version.first_observed_at<=%s AND COALESCE(version.revised_observed_at,version.first_observed_at)<=%s
-                  AND version.eligibility_status='VALIDATED_ACTIVE' ORDER BY catalog.contract_id,version.valid_from DESC LIMIT 20001""",
-                (contracts, as_of, as_of, as_of))
+            cursor.execute(
+                "SELECT candidate.candidate_id,catalog.contract_id,catalog.contract_ticker,"
+                "catalog.underlying,catalog.asset_type,version.* "
+                "FROM option_candidate_legs AS leg JOIN option_strategy_candidates AS candidate USING(candidate_id) "
+                "JOIN option_contract_catalog AS catalog ON catalog.contract_id=leg.contract_id "
+                "AND catalog.first_observed_at<=candidate.observed_time "
+                "AND catalog.catalog_admitted_at<=candidate.observed_time "
+                "AND (catalog.expired_at IS NULL OR catalog.expired_at>candidate.market_data_time) "
+                "JOIN LATERAL (SELECT version.* FROM option_contract_catalog_versions AS version "
+                "WHERE version.contract_id=leg.contract_id AND version.valid_from<=candidate.market_data_time "
+                "AND (version.valid_to IS NULL OR version.valid_to>candidate.market_data_time) "
+                "AND version.first_observed_at<=candidate.observed_time "
+                "AND COALESCE(version.revised_observed_at,version.first_observed_at)<=candidate.observed_time "
+                "ORDER BY version.valid_from DESC,"
+                "COALESCE(version.revised_observed_at,version.first_observed_at) DESC,"
+                "version.catalog_version_id DESC LIMIT 1) AS version ON TRUE "
+                "WHERE leg.candidate_id=ANY(%s::uuid[]) AND candidate.observed_time<=%s "
+                "AND version.eligibility_status='VALIDATED_ACTIVE' "
+                "ORDER BY candidate.candidate_id,catalog.contract_id LIMIT 20001", (ids, as_of))
             references = tuple(dict(row) for row in cursor.fetchall())
             if len(references) > 20000:
                 raise ValueError("detector reference source bound exceeded")
@@ -167,11 +209,16 @@ class OptionStockBehaviorAssessmentRepository(PostgresRepository):
                 raise ValueError("detector spot source bound exceeded")
         return dict(candidates=candidates, legs=legs, references=references, raw_bars=bars)
 
-    def detector_technical_sources(self, *, underlyers, market_cutoff, as_of):
+    def detector_technical_sources(self, *, underlyers, market_cutoff, as_of, technical_underlyers=None):
         from equity.materialization import SETUP_VERSION
+        from psycopg2.errors import QueryCanceled
 
         if not 1 <= len(underlyers) <= 13 or market_cutoff.utcoffset() is None or as_of.utcoffset() is None or market_cutoff > as_of:
             raise ValueError("technical sources require bounded causal scope")
+        technical_underlyers = tuple(underlyers if technical_underlyers is None else technical_underlyers)
+        if len(technical_underlyers) != len(set(technical_underlyers)) or not set(technical_underlyers) <= set(underlyers):
+            raise ValueError("technical scope must be a distinct subset of the configured universe")
+        source_error = None
         with self._cursor() as cursor:
             cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             cursor.execute("SET LOCAL statement_timeout = '5s'")
@@ -187,16 +234,19 @@ class OptionStockBehaviorAssessmentRepository(PostgresRepository):
                   AND feature.interval=setup.interval AND feature.market_time=setup.market_time
                   AND feature.observed_at<=%s AND feature.created_at<=%s
                 ORDER BY setup.ticker,setup.interval,setup.market_time DESC,setup.observed_at DESC LIMIT 27""",
-                (list(underlyers), SETUP_VERSION, market_cutoff, as_of, as_of, as_of, as_of, as_of))
+                (list(technical_underlyers), SETUP_VERSION, market_cutoff, as_of, as_of, as_of, as_of, as_of))
             sources = tuple(dict(row) for row in cursor.fetchall())
             ids = sorted({identity for row in sources for identity in row["feature_bar_ids"]}, key=str)
             if len(sources) > 26 or len(ids) > 12000:
                 raise ValueError("technical source bar budget exceeded")
-            cursor.execute("""SELECT * FROM equity_bar_revisions WHERE bar_revision_id=ANY(%s::uuid[])
-                AND NOT adjusted AND is_final AND session_scope='RTH' AND availability_mode='LIVE_OBSERVED'
-                AND quality_codes=ARRAY[]::text[] AND system_observed_at<=%s AND created_at<=%s
-                ORDER BY bar_start""", (ids, as_of, as_of))
-            bars = tuple(dict(row) for row in cursor.fetchall())
+            cursor.execute("SAVEPOINT detector_optional_structure")
+            try:
+                bars = self._technical_bars(cursor, ids, as_of) if ids else ()
+            except QueryCanceled:
+                cursor.execute("ROLLBACK TO SAVEPOINT detector_optional_structure")
+                bars, sources, source_error = (), (), "O1_TECHNICAL_SOURCE_TIMEOUT"
+            cursor.execute("RELEASE SAVEPOINT detector_optional_structure")
+            cursor.execute("SET LOCAL statement_timeout = '5s'")
             cursor.execute("""SELECT DISTINCT ON(source,source_key) * FROM option_market_events
                 WHERE (affected_underlying=ANY(%s) OR affected_underlying IS NULL)
                   AND first_observed_at<=%s AND COALESCE(revised_observed_at,first_observed_at)<=%s
@@ -216,7 +266,42 @@ class OptionStockBehaviorAssessmentRepository(PostgresRepository):
             coverage = tuple(dict(row) for row in cursor.fetchall())
             if len(coverage) > 1000:
                 raise ValueError("technical event coverage budget exceeded")
-        return dict(sources=sources, bars=bars, events=events, coverage=coverage)
+        result = dict(sources=sources, bars=bars, events=events, coverage=coverage)
+        if source_error:
+            result["source_error"] = source_error
+        return result
+
+    @staticmethod
+    def _technical_bars(cursor, ids, as_of, *, clock=None):
+        from time import monotonic
+        from psycopg2.errors import QueryCanceled
+
+        clock = clock or monotonic
+        deadline = clock() + 5
+        for attempt in range(2):
+            remaining_ms = min(5000, int((deadline - clock()) * 1000))
+            if remaining_ms <= 0:
+                raise QueryCanceled("technical bar lookup exceeded its five-second budget")
+            cursor.execute("SAVEPOINT detector_technical_bar_read")
+            try:
+                cursor.execute("SET LOCAL statement_timeout = %s", (min(2000, remaining_ms) if attempt == 0 else remaining_ms,))
+                cursor.execute(
+                    "SELECT * FROM equity_bar_revisions WHERE bar_revision_id=ANY(%s::uuid[]) "
+                    "AND NOT adjusted AND is_final AND session_scope='RTH' AND availability_mode='LIVE_OBSERVED' "
+                    "AND quality_codes=ARRAY[]::text[] AND system_observed_at<=%s AND created_at<=%s ORDER BY bar_start",
+                    (ids, as_of, as_of))
+                bars = tuple(dict(row) for row in cursor.fetchall())
+            except QueryCanceled:
+                cursor.execute("ROLLBACK TO SAVEPOINT detector_technical_bar_read")
+                cursor.execute("RELEASE SAVEPOINT detector_technical_bar_read")
+                if attempt == 1:
+                    raise
+            else:
+                cursor.execute("RELEASE SAVEPOINT detector_technical_bar_read")
+                if clock() > deadline:
+                    raise QueryCanceled("technical bar lookup exceeded its five-second budget")
+                cursor.execute("SET LOCAL statement_timeout = '5s'")
+                return bars
 
     def technical_replay_preflight(self, *, configuration, session_date, as_of):
         from equity.behavior import DEFINITION_V1_SHA256, OPTIONS_SWING_PROFILE

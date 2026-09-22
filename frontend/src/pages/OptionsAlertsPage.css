@@ -1,4 +1,13 @@
 .option-alerts { letter-spacing: 0; }
+.oa-alert-window { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; padding: 10px 0; font-size: 11px; color: var(--tm-ink); }
+.oa-alert-window strong { font-weight: 700; overflow-wrap: anywhere; }
+.oa-alert-window svg { flex: 0 0 14px; }
+.oa-alert-window--warning { color: var(--tm-warn); }
+.oa-attempt-status { flex-basis: 100%; overflow-wrap: anywhere; }
+.oa-run-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; font-size: 11px; }
+.oa-run-warning { color: var(--tm-warn); font-weight: 600; }
+.option-alerts [aria-label="Detector run publication history"] table { font-size: 11px; border-collapse: collapse; }
+.option-alerts [aria-label="Detector run publication history"] :is(th, td) { padding: 7px 9px; vertical-align: top; white-space: nowrap; text-align: left; }
 .option-alerts .oa-sort { display: inline-flex; align-items: center; gap: 6px; border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; padding: 4px 0; text-align: left; }
 .option-alerts .oa-sort svg { flex: 0 0 13px; }
 .option-alerts .oa-sort:focus-visible { outline: 2px solid var(--tm-accent); outline-offset: 3px; }
@@ -50,6 +59,7 @@
 .oa-row-link:hover { text-decoration: underline; }
 .option-alerts .sd-table-panel td:first-child { position: sticky; left: 0; z-index: 1; background: var(--tm-surface); }
 .option-alerts .sd-table-panel th:first-child { left: 0; z-index: 2; }
+.option-alerts [aria-label="Detector alerts table"] :is(th, td):first-child { min-width: 166px; }
 .option-alerts .sd-table-scroll { max-height: 60vh; }
 .option-alerts .sd-table-scroll:focus-visible, .oa-leg-scroll:focus-visible { outline: 2px solid var(--tm-accent); outline-offset: -2px; }
 .sw-modal:has(.oa-detail) { width: min(1040px, calc(100vw - 24px)); overflow: auto; }

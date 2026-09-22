@@ -102,10 +102,11 @@ def alert_view(source: Literal["SHADOW", "REPLAY", "LEGACY"] = "SHADOW", session
                offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=200),
                trade_type: Literal["INTRADAY", "SWING"] | None = None, combined: bool | None = None):
     from psycopg2 import Error as DatabaseError
-    from equity.stock_alert_views import attach_alert_context, current_history_prices, history_snapshot_for_date, load_alert_view
+    from equity.stock_alert_views import attach_alert_context, current_history_prices, history_snapshot_for_date, load_alert_view, current_alert_schedules, forward_session_snapshot
     from research.stock_alerts import alert_page
     try:
         snapshot = load_alert_view(source) if combined is None else load_alert_view(source, combined=combined)
+        snapshot = forward_session_snapshot(snapshot)
         if view == "history":
             snapshot = history_snapshot_for_date(snapshot, str(session_date) if session_date else None)
             snapshot = current_history_prices(snapshot, str(session_date) if session_date else None)
@@ -117,6 +118,7 @@ def alert_view(source: Literal["SHADOW", "REPLAY", "LEGACY"] = "SHADOW", session
         page = alert_page(snapshot, session=str(session_date) if session_date else None, view=view, run=run,
             search=search, direction=direction, model=model, interval=interval, status=status, lane=lane,
             sort=sort, descending=descending, offset=offset, limit=limit, trade_type=trade_type)
+        page["schedule_streams"] = current_alert_schedules(snapshot)
         return attach_alert_context(page)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error

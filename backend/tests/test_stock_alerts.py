@@ -55,6 +55,40 @@ def test_combined_latest_is_per_strategy_and_does_not_fall_back_to_nonempty():
     assert history["total"] == 1 and history["rows"][0]["original_source_id"] == "intraday"
 
 
+def test_forward_session_moves_old_swing_latest_to_history_without_fallback():
+    from datetime import datetime, timezone
+    from equity.stock_alert_views import forward_session_snapshot
+
+    combined, _ = combined_fixture()
+    original = deepcopy(combined)
+    current = forward_session_snapshot(combined, as_of=datetime(2026, 9, 21, 15, tzinfo=timezone.utc))
+    for trade_type in (None, "SWING", "INTRADAY"):
+        latest = alert_page(current, trade_type=trade_type)
+        assert latest["session"] == "2026-09-21" and latest["rows"] == [] and latest["latest_runs"] == []
+    history = alert_page(current, session="2026-09-02", view="history", trade_type="SWING")
+    assert history["total"] == 1 and history["withheld_run"] is None
+    assert alert_page(current, view="open", trade_type="SWING")["total"] == 1
+    swing = next(row for row in current["publications"] if row["strategy_label"] == "Swing")
+    current = dict(current, publications=[*current["publications"], dict(swing, run_id="new-empty-swing",
+        session="2026-09-21", published_at="2026-09-21T14:25:00Z", selected=0, status="PUBLISHED")])
+    assert alert_page(current, trade_type="SWING")["total"] == 0
+    assert alert_page(current, session="2026-09-02", view="history", trade_type="SWING")["total"] == 1
+    prior_plan = next(row for row in current["alerts"] if row.get("trade_style") == "SWING")
+    earlier = dict(swing, run_id="today-earlier-swing", session="2026-09-21", published_at="2026-09-21T14:20:00Z", selected=1)
+    current = dict(current, publications=[*current["publications"], earlier], alerts=[*current["alerts"],
+        dict(prior_plan, alert_id="today-plan", run_id=earlier["run_id"], published_at=earlier["published_at"])])
+    assert alert_page(current, trade_type="SWING")["total"] == 0
+    assert [row["alert_id"] for row in alert_page(current, view="history", trade_type="SWING")["rows"]] == ["today-plan"]
+    newest = dict(earlier, run_id="today-newest-swing", published_at="2026-09-21T14:50:00Z")
+    current = dict(current, publications=[*current["publications"], newest], alerts=[*current["alerts"],
+        dict(prior_plan, alert_id="newest-plan", run_id=newest["run_id"], published_at=newest["published_at"])])
+    assert [row["alert_id"] for row in alert_page(current, trade_type="SWING")["rows"]] == ["newest-plan"]
+    assert [row["alert_id"] for row in alert_page(current, view="history", trade_type="SWING")["rows"]] == ["today-plan"]
+    assert combined == original
+    replay = snapshot()
+    assert forward_session_snapshot(replay) is replay
+
+
 def test_combined_recurrence_and_filters_are_instance_scoped_and_pagination_is_global():
     combined, _ = combined_fixture()
     for row in combined["alerts"]:
@@ -820,6 +854,33 @@ def test_replay_builder_retains_watch_and_frozen_trade_return():
     assert len(result["alerts"]) == 2
     assert result["alerts"][0]["paper_return"] == .02
     assert result["alerts"][1]["lane"] == "WATCH" and result["alerts"][1]["paper_return"] is None
+
+
+def test_current_worker_schedule_does_not_relabel_stale_results_or_skips(monkeypatch, tmp_path):
+    from copy import deepcopy
+    from datetime import datetime, timezone
+    import equity.stock_alert_views as views
+
+    now = datetime(2026, 9, 21, 15, 20, tzinfo=timezone.utc)
+    current = dict(source="SHADOW", as_of=now.isoformat(), publication_window_start="2026-09-21T15:15:00+00:00",
+        publication_deadline="2026-09-21T15:29:55+00:00", publications=[dict(session="2026-09-21",
+        trigger_at="2026-09-21T14:00:00+00:00", published_at="2026-09-21T14:25:00+00:00", status="PUBLISHED", selected=0)])
+    stale = dict(source="SHADOW", combined=True, as_of="2026-09-19T17:00:00+00:00", alerts=[{"preserved": True}])
+    before = deepcopy(stale)
+    path = tmp_path / "current.json"
+    path.write_text("{}")
+    monkeypatch.setattr(views, "__file__", str(tmp_path / "equity" / "stock_alert_views.py"))
+    monkeypatch.setenv("STOCK_ALERT_SHADOW_VIEW", str(path))
+    monkeypatch.setattr(views, "load_snapshot", lambda *_: deepcopy(current))
+    result = views.current_alert_schedules(stale, as_of=now)
+    assert result[0]["publication_window_start"] == current["publication_window_start"]
+    assert result[0]["skipped_windows"] == 0 and result[0]["latest_run"]["selected"] == 0
+    assert stale == before
+    current["publications"][0]["status"] = "MISSED_PUBLICATION"
+    assert views.current_alert_schedules(stale, as_of=now)[0]["skipped_windows"] == 1
+    current["publication_deadline"] = "2026-09-21T15:19:00+00:00"
+    assert views.current_alert_schedules(stale, as_of=now)[0]["status"] == "OVERDUE"
+    assert views.current_alert_schedules(dict(source="REPLAY"), as_of=now) == []
 
 
 def test_alert_view_route_defaults_to_shadow_and_never_calls_capture(monkeypatch):

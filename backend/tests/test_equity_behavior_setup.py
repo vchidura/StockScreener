@@ -75,7 +75,7 @@ def publication_inputs(model="acceptance"):
         policy_version="relative_trend_resumption_intraday_v1" if model == "resumption" else "range_breakout_acceptance_intraday_v2",
         revision_ids=(str(uuid4()),))
     config = {"policy_version": "stock_ideas_forward_quality_v2"}
-    state = {"enrolled_at": (NOW - timedelta(days=1)).isoformat(), "members": [{"security_id": stock.security_id}]}
+    state = {"enrolled_at": (NOW - timedelta(days=1)).isoformat(), "members": [{"security_id": stock.security_id, "ticker": stock.ticker}]}
     instance = strategy_instance(config, state, "intraday") | {"policy": config, "enrollment": state["members"]}
     runtime = {name: "c" * 64 for name in ("research/stock_idea_models.py", "research/stock_idea_engine.py",
         "equity/stock_idea_forward_source.py", "research/stock_idea_forward.py", "research/stock_idea_replay.py",
@@ -400,6 +400,68 @@ def test_direct_batch_reader_preserves_committed_source_and_expiry(tmp_path, mod
     assert len(results) == 1 and results[0].candidate.model == model
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
     assert read_direct_stock_setups(path, **{**arguments, "clock": lambda: stock.expires_at}) == ()
+
+
+@pytest.mark.parametrize("model", ["acceptance", "resumption"])
+def test_aligned_stock_setup_windows_never_fall_back_or_rewrite(tmp_path, model):
+    import hashlib
+    import json
+    import sqlite3
+    import zlib
+    from equity.stock_alert_results import read_direct_stock_setup_windows
+
+    path, stock, publication, policy = direct_ledger_fixture(tmp_path, model)
+    arguments = dict(policies=(policy,), windows={stock.ticker: (stock.trigger_at, stock.trigger_at)},
+        as_of=NOW, clock=lambda: NOW)
+    evidence, reasons = read_direct_stock_setup_windows(path, **arguments)
+    assert evidence == () and reasons["S1_STOCK_WINDOW_NOT_AVAILABLE"] == 1
+    with sqlite3.connect(path) as writer:
+        writer.execute("INSERT INTO forward_publications VALUES(?,?)", (publication["window_key"], zlib.compress(json.dumps(publication).encode())))
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    evidence, reasons = read_direct_stock_setup_windows(path, **arguments)
+    assert len(evidence) == 1 and evidence[0].candidate.model == model
+    assert not reasons.get(("S2" if model == "resumption" else "S1") + "_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW")
+    for boundary in (None, stock.trigger_at + timedelta(minutes=30)):
+        cutoff = max(NOW, boundary or NOW)
+        evidence, reasons = read_direct_stock_setup_windows(path, **dict(arguments,
+            windows={stock.ticker: (cutoff, boundary)}, as_of=cutoff, clock=lambda: cutoff))
+        assert not evidence and reasons
+    evidence, reasons = read_direct_stock_setup_windows(path, **dict(arguments, as_of=stock.trigger_at))
+    assert not evidence and reasons["S1_STOCK_WINDOW_NOT_AVAILABLE"] == 1
+    evidence, reasons = read_direct_stock_setup_windows(path, **dict(arguments, clock=lambda: stock.expires_at))
+    assert not evidence and reasons["S1_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"] == 1
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    retry = dict(publication, window_key=publication["window_key"] + ":source-ready-retry",
+        market_time=publication["window_key"], actual_publication_at=(NOW - timedelta(seconds=1)).isoformat(), candidates={})
+    with sqlite3.connect(path) as writer:
+        writer.execute("INSERT INTO forward_publications VALUES(?,?)", (retry["window_key"], zlib.compress(json.dumps(retry).encode())))
+    evidence, reasons = read_direct_stock_setup_windows(path, **arguments)
+    assert not evidence and reasons["S1_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"] == 1
+
+
+@pytest.mark.parametrize("mutation,reason", [("runtime", "STOCK_WINDOW_POLICY_OR_RUNTIME_MISMATCH"),
+    ("missed", "STOCK_WINDOW_NOT_PUBLISHED"), ("missing", "STOCK_MEMBER_UNAVAILABLE"),
+    ("corrupt", "STOCK_SOURCE_UNAVAILABLE"), ("compression", "STOCK_SOURCE_UNAVAILABLE")])
+def test_aligned_stock_window_reports_source_failures_without_old_fallback(tmp_path, mutation, reason):
+    import json
+    import sqlite3
+    import zlib
+    from equity.stock_alert_results import read_direct_stock_setup_windows
+
+    path, stock, publication, policy = direct_ledger_fixture(tmp_path)
+    if mutation == "runtime":
+        publication["runtime_sources"]["research/stock_idea_models.py"] = "d" * 64
+    elif mutation == "missed":
+        publication["coverage"] = "MISSED"
+    elif mutation == "missing":
+        publication["missing_members"] = [stock.security_id]
+    payload = b"invalid compressed source" if mutation == "compression" else zlib.compress(b'[]' if mutation == "corrupt" else json.dumps(publication).encode())
+    with sqlite3.connect(path) as connection:
+        connection.execute("INSERT INTO forward_publications VALUES(?,?)", (publication["window_key"],
+            payload))
+    evidence, reasons = read_direct_stock_setup_windows(path, policies=(policy,),
+        windows={stock.ticker: (stock.trigger_at, stock.trigger_at)}, as_of=NOW, clock=lambda: NOW)
+    assert not evidence and reasons["S1_" + reason] == 1
 
 
 @pytest.mark.parametrize("mutation", ["hash", "clock", "expiry", "cutoff", "schema"])

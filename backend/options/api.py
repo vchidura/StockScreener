@@ -1631,6 +1631,29 @@ def option_detector_datasets() -> OptionsEnvelope:
     return _envelope(available=True, as_of=now, data=data)
 
 
+@router.get("/alerts/schedule", response_model=OptionsEnvelope)
+def option_detector_schedule() -> OptionsEnvelope:
+    from zoneinfo import ZoneInfo
+    from options.repositories.alert_review_sources import OptionAlertReviewSourceRepository, configured_detector_launch, detector_alert_schedule, detector_attempt_status
+
+    now = datetime.now(timezone.utc)
+    try:
+        launch = configured_detector_launch()
+        if launch is None:
+            return _envelope(available=False, reason="DETECTOR_LAUNCH_NOT_CONFIGURED", data={})
+        completed = OptionAlertReviewSourceRepository().window_completions(dataset_id=launch.dataset_id,
+            session_date=now.astimezone(ZoneInfo("America/New_York")).date(), as_of=now)
+        data = detector_alert_schedule(as_of=now, effective_from=launch.effective_from,
+            settings=OptionWorkerSettings.from_environment(), completed=completed)
+        data["dataset_id"] = launch.dataset_id
+        data["evaluation_attempts"] = detector_attempt_status(launch=launch, as_of=now, completed=completed)
+        if any(row["status"] in ("FAILED", "INCOMPLETE", "UNVERIFIED") for row in data["evaluation_attempts"]["attempts"]):
+            data["warning"] = True
+    except (OSError, ValueError, DatabaseError):
+        return _envelope(available=False, reason="DETECTOR_SCHEDULE_UNAVAILABLE", data={})
+    return _envelope(available=True, as_of=now, data=data)
+
+
 @router.get("/alerts/evaluations", response_model=OptionsEnvelope)
 def option_alert_evaluations(
     session_date: date | None = None,
@@ -1638,7 +1661,7 @@ def option_alert_evaluations(
     detector: Literal["O1", "O2", "S1", "S2"] | None = None,
     selection_status: Literal["SELECTED", "NOT_SELECTED", "REPEAT", "OBSERVATION"] | None = None,
     underlyer: str | None = None,
-    sort_by: Literal["run", "underlyer", "detector", "category", "strategy", "rank", "entry_limit"] = "run",
+    sort_by: Literal["triggered_at", "run", "underlyer", "detector", "category", "strategy", "rank", "entry_limit"] = "run",
     sort_order: Literal["asc", "desc"] = "asc",
     limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
 ) -> OptionsEnvelope:
@@ -1661,9 +1684,9 @@ def option_alert_evaluations(
 def option_detector_alerts(
     dataset_id: str = Query(min_length=1, max_length=80),
     scope: Literal["LATEST", "HISTORY"] = "LATEST", session_date: date | None = None,
-    detector: Literal["O1", "S1", "S2"] | None = None,
+    detector: Literal["O1", "O2", "S1", "S2"] | None = None,
     underlyer: str | None = None,
-    sort_by: Literal["run", "underlyer", "detector", "category", "strategy", "rank", "entry_limit"] = "run",
+    sort_by: Literal["triggered_at", "run", "underlyer", "detector", "category", "strategy", "rank", "entry_limit"] = "run",
     sort_order: Literal["asc", "desc"] = "asc",
     limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
 ) -> OptionsEnvelope:

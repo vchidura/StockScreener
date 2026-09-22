@@ -423,6 +423,29 @@ def read_direct_stock_setup(path, *, policy, record_id, payload_sha256, episode_
 
 
 def read_direct_stock_setups(path, *, policies, underlyers, market_cutoff, as_of, clock=None):
+    return _read_direct_stock_setup_batch(path, policies=policies, underlyers=underlyers,
+        market_cutoff=market_cutoff, as_of=as_of, clock=clock)[0]
+
+
+def read_direct_stock_setup_windows(path, *, policies, windows, as_of, clock=None):
+    from collections import Counter
+
+    if not 1 <= len(windows) <= 13:
+        raise ValueError("aligned stock setup read requires 1..13 underlyings")
+    for cutoff, boundary in windows.values():
+        if (cutoff.utcoffset() is None or cutoff > as_of
+                or boundary is not None and (boundary.utcoffset() is None or boundary > cutoff)):
+            raise ValueError("aligned stock setup window must be causal")
+    try:
+        return _read_direct_stock_setup_batch(path, policies=policies, underlyers=tuple(windows),
+            market_cutoff=max(cutoff for cutoff, _ in windows.values()), as_of=as_of,
+            clock=clock, windows=windows)
+    except (OSError, sqlite3.Error, zlib.error, ValueError, KeyError, TypeError):
+        return (), Counter({"S1_STOCK_SOURCE_UNAVAILABLE": len(windows), "S2_STOCK_SOURCE_UNAVAILABLE": len(windows)})
+
+
+def _read_direct_stock_setup_batch(path, *, policies, underlyers, market_cutoff, as_of, clock=None, windows=None):
+    from collections import Counter
     from uuid import UUID
     from equity.behavior_setup import bind_direct_stock_setup, resolve_direct_setup_policy
 
@@ -461,12 +484,44 @@ def read_direct_stock_setups(path, *, policies, underlyers, market_cutoff, as_of
     received_at = clock() if clock else datetime.now(timezone.utc)
     if received_at < as_of:
         raise ValueError("direct setup batch receipt moved backwards")
+    rejections = Counter()
+    if windows is not None:
+        selected = []
+        securities = {member["ticker"]: member["security_id"] for member in instance["enrollment"] if "ticker" in member}
+        for ticker, (cutoff, boundary) in windows.items():
+            eligible = [(record_id, publication) for record_id, publication in publications
+                if boundary is not None and utc(publication.get("market_time", record_id)) == boundary
+                and utc(publication["actual_publication_at"]) <= as_of]
+            latest = max(eligible, key=lambda item: utc(item[1]["actual_publication_at"]), default=None)
+            reason = None
+            if boundary is None:
+                reason = "STOCK_WINDOW_NOT_YET_CLOSED"
+            elif latest is None:
+                reason = "STOCK_WINDOW_NOT_AVAILABLE"
+            elif latest[1].get("coverage") != "PUBLISHED":
+                reason = "STOCK_WINDOW_NOT_PUBLISHED"
+            elif any(latest[1].get("runtime_sources") != dict(policy.runtime_sources)
+                    or latest[1].get("policy_hash") != policy.publication_policy_sha256 for policy in policies):
+                reason = "STOCK_WINDOW_POLICY_OR_RUNTIME_MISMATCH"
+            elif (securities.get(ticker) not in latest[1].get("expected_members", ())
+                    or securities.get(ticker) in latest[1].get("missing_members", ())):
+                reason = "STOCK_MEMBER_UNAVAILABLE"
+            if reason:
+                for model in ("S1", "S2"):
+                    rejections[f"{model}_{reason}"] += 1
+                continue
+            selected.append((*latest, ticker))
+        publications = selected
+    else:
+        publications = [(record_id, publication, None) for record_id, publication in publications]
     results, seen = [], set()
-    for record_id, publication in publications:
+    for record_id, publication, ticker in publications:
         if utc(publication.get("market_time", record_id)) > market_cutoff or utc(publication["actual_publication_at"]) > as_of:
             continue
+        matched_models = set()
         for episode_id, candidate in publication.get("candidates", {}).items():
             if (candidate["ticker"] not in underlyers or candidate["interval"] != "1h"
+                    or ticker is not None and candidate["ticker"] != ticker
                     or utc(candidate["expires_at"]) <= received_at or episode_id in seen):
                 continue
             policy = next((policy for policy in policies if policy.detector_version == candidate["policy_version"]), None)
@@ -480,9 +535,13 @@ def read_direct_stock_setups(path, *, policies, underlyers, market_cutoff, as_of
                 continue
             results.append(evidence)
             seen.add(episode_id)
+            matched_models.add("S2" if evidence.expected_model == "resumption" else "S1")
             if len(results) > 5000:
                 raise ValueError("direct setup batch exceeds episode bound")
-    return tuple(results)
+        if ticker is not None:
+            for model in {"S1", "S2"} - matched_models:
+                rejections[f"{model}_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"] += 1
+    return tuple(results), rejections
 
 
 def attach_shared_context(page):

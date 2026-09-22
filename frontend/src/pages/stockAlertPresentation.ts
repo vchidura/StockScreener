@@ -1,7 +1,7 @@
 import type { ColumnSpec } from '../layout/PageChrome'
 import type { AlertPlanRow } from '../services/stockDiscovery'
 
-const requiredLatestColumns = new Set(['stop', 'target', 'reward_risk', 'success_probability', 'risk_assessment'])
+const requiredLatestColumns = new Set(['triggered_at', 'stop', 'target', 'reward_risk', 'success_probability', 'risk_assessment'])
 const requiredHistoryColumns = new Set(['triggered_at', 'latest_price', 'price_return'])
 
 export const unavailableAlertProbability = {
@@ -9,9 +9,13 @@ export const unavailableAlertProbability = {
   reason: 'No validated, calibrated success estimate for this model, direction, interval and execution policy. Reward/risk and hits are not probabilities.',
 }
 
-export function earliestAlertWindow(streams: Array<{ publication_window_start?: string; publication_deadline?: string }> | undefined) {
-  return (streams || []).filter(stream => stream.publication_window_start && stream.publication_deadline)
-    .sort((left, right) => Date.parse(left.publication_window_start!) - Date.parse(right.publication_window_start!))[0] || null
+export function earliestAlertWindow(streams: Array<{ publication_window_start?: string; publication_deadline?: string }> | undefined, now = Date.now()) {
+  const windows = (streams || []).filter(stream => Number.isFinite(Date.parse(stream.publication_window_start || ''))
+    && Number.isFinite(Date.parse(stream.publication_deadline || ''))
+    && Date.parse(stream.publication_window_start!) <= Date.parse(stream.publication_deadline!))
+  const upcoming = windows.filter(stream => Date.parse(stream.publication_deadline!) >= now)
+  return upcoming.sort((left, right) => Date.parse(left.publication_window_start!) - Date.parse(right.publication_window_start!))[0]
+    || windows.sort((left, right) => Date.parse(right.publication_deadline!) - Date.parse(left.publication_deadline!))[0] || null
 }
 
 const factNumber = (value: number, digits = 2) => Number.isFinite(value)

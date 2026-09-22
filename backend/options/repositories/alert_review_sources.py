@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 from uuid import UUID
-from datetime import timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from options.alert_qualification import retained_candidate
 from .base import PostgresRepository
 
 
-def configured_detector_dataset(*, backend_dir=None, environ=None):
+def configured_detector_launch(*, backend_dir=None, environ=None):
     import os
     from pathlib import Path
-    from options.detector_launch import DetectorForwardLaunch
+    from options.detector_launch import decode_detector_forward_launch
 
     environment = os.environ if environ is None else environ
     source = environment.get("OPTION_TECHNICAL_FORWARD_LAUNCH_FILE")
@@ -24,13 +24,106 @@ def configured_detector_dataset(*, backend_dir=None, environ=None):
     path = (root / source).resolve()
     if not path.is_relative_to(root) or path.stat().st_size > 262144:
         raise ValueError("configured detector result manifest path or size invalid")
-    launch = DetectorForwardLaunch.model_validate_json(path.read_text(encoding="utf-8"))
+    launch = decode_detector_forward_launch(path.read_text(encoding="utf-8"))
     if launch.sha256 != checksum:
         raise ValueError("configured detector result manifest checksum mismatch")
-    return launch.dataset_id
+    return launch
+
+
+def configured_detector_dataset(*, backend_dir=None, environ=None):
+    launch = configured_detector_launch(backend_dir=backend_dir, environ=environ)
+    return launch.dataset_id if launch else None
+
+
+def detector_attempt_status(*, launch, as_of, completed=(), backend_dir=None):
+    import json
+    from pathlib import Path
+
+    root = backend_dir or Path(__file__).resolve().parents[2]
+    path = root / "backups/options-worker/detector-status.json"
+    unavailable = dict(available=False, attempts=[])
+    try:
+        if path.stat().st_size > 131072:
+            return unavailable
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (payload["version"] != "option_detector_operational_status_v1" or payload["dataset_id"] != launch.dataset_id
+                or payload["configuration_sha256"] != launch.configuration_sha256
+                or not isinstance(payload["attempts"], list) or len(payload["attempts"]) > 96):
+            return unavailable
+        attempts = []
+        seen = set()
+        for row in payload["attempts"]:
+            cycle, started = (datetime.fromisoformat(row[key]) for key in ("scheduled_cycle", "started_at"))
+            finished = datetime.fromisoformat(row["finished_at"]) if row.get("finished_at") else None
+            if (cycle.utcoffset() is None or started.utcoffset() is None or finished and finished.utcoffset() is None
+                    or not launch.effective_from <= cycle <= started <= as_of
+                    or finished and not started <= finished <= as_of or cycle in seen
+                    or row["status"] not in ("RUNNING", "FAILED", "RECORDED", "INCOMPLETE")
+                    or row["status"] != "RUNNING" and finished is None):
+                return unavailable
+            seen.add(cycle)
+            if cycle.date() != as_of.astimezone(ZoneInfo("America/New_York")).date() or cycle in completed:
+                continue
+            status = row["status"]
+            if status == "RECORDED" or status == "RUNNING" and as_of - started > timedelta(minutes=30):
+                status = "UNVERIFIED"
+            reason = row.get("reason")
+            if reason not in (None, "DETECTOR_SOURCE_TIMEOUT", "DETECTOR_EVALUATION_FAILED", "PIPELINE_EXECUTION_FAILED", "DETECTOR_NOT_EVALUATED"):
+                reason = "DETECTOR_EVALUATION_FAILED"
+            attempts.append(dict(scheduled_cycle=cycle.isoformat(), started_at=started.isoformat(),
+                finished_at=finished.isoformat() if finished else None, status=status, reason=reason))
+        return dict(available=True, attempts=sorted(attempts, key=lambda row: row["scheduled_cycle"]))
+    except (OSError, ValueError, TypeError, KeyError):
+        return unavailable
+
+
+def detector_alert_schedule(*, as_of, effective_from, settings, completed=(), calendar=None):
+    import exchange_calendars
+    import pandas as pd
+
+    if as_of.utcoffset() is None or effective_from.utcoffset() is None or settings.slot_seconds < 60:
+        raise ValueError("alert schedule requires aware clocks and bounded cadence")
+    calendar = calendar or exchange_calendars.get_calendar("XNYS")
+    session = calendar.date_to_session(pd.Timestamp(max(as_of.astimezone(ZoneInfo("America/New_York")).date(),
+        effective_from.astimezone(ZoneInfo("America/New_York")).date())), direction="next")
+    interval = timedelta(seconds=settings.slot_seconds)
+    delay = timedelta(seconds=settings.provider_delay_seconds + settings.publication_grace_seconds)
+    completed = set(completed)
+    missing = []
+    for _ in range(2):
+        opened = calendar.session_open(session).to_pydatetime()
+        closed = calendar.session_close(session).to_pydatetime()
+        cycle = opened + interval
+        while cycle <= closed:
+            start, end = cycle + delay, cycle + delay + interval
+            if cycle >= effective_from:
+                if end <= as_of and cycle not in completed:
+                    missing.append(cycle)
+                elif end > as_of and cycle not in completed:
+                    return dict(dataset_timing="EXPECTED_CHECK_WINDOW_NOT_COMPLETION_DEADLINE", as_of=as_of.isoformat(),
+                        scheduled_cycle=cycle.isoformat(), window_start=start.isoformat(), window_end=end.isoformat(),
+                        status="DUE" if start <= as_of else "UPCOMING", warning=bool(missing),
+                        unpublished_windows=len(missing), last_unpublished_cycle=missing[-1].isoformat() if missing else None)
+            cycle += interval
+        session = calendar.next_session(session)
+    raise ValueError("next alert schedule unavailable")
 
 
 class OptionAlertReviewSourceRepository(PostgresRepository):
+    def window_completions(self, *, dataset_id, session_date, as_of):
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '5s'")
+            cursor.execute("SELECT scheduled_cycle FROM option_board_publications "
+                "WHERE selector_version IN ('option_detector_run_v1','option_detector_run_v2') AND status='COMPLETE' "
+                "AND selection_evidence->>'dataset_id'=%s AND as_of_session=%s "
+                "AND published_at<=%s AND created_at<=%s ORDER BY scheduled_cycle LIMIT 1001",
+                (dataset_id, session_date, as_of, as_of))
+            records = [row["scheduled_cycle"] for row in cursor.fetchall()]
+        if len(records) > 1000:
+            raise ValueError("alert schedule completion bound exceeded")
+        return records
+
     def dataset_index(self, *, as_of):
         if as_of.utcoffset() is None:
             raise ValueError("dataset index requires an aware cutoff")

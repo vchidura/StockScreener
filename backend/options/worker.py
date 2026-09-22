@@ -57,10 +57,12 @@ class OptionMaterializationWorker:
         clock: Callable[[], datetime] | None = None,
         sleep: Callable[[float], None] | None = None,
         effective_from: datetime | None = None,
+        detector_status_callback: Callable[[dict], object] | None = None,
     ) -> None:
         if effective_from is not None and effective_from.utcoffset() is None:
             raise ValueError("forward worker start must be timezone-aware")
         self.effective_from = effective_from
+        self.detector_status_callback = detector_status_callback
         self.pipeline = pipeline
         self.calendar = calendar or OptionExchangeCalendar()
         self.settings = settings or OptionWorkerSettings.from_environment()
@@ -117,12 +119,25 @@ class OptionMaterializationWorker:
         if slot in self._completed_slots:
             return None
         LOGGER.info("materializing option slot=%s", slot.isoformat())
-        result = self.pipeline.run_once(
-            self.underlyers,
-            as_of=now,
-            cycle_time=slot,
-            progress_callback=progress_callback,
-        )
+        attempt = dict(scheduled_cycle=slot.isoformat(), started_at=now.isoformat(), status="RUNNING")
+        self._detector_status(attempt)
+        try:
+            result = self.pipeline.run_once(
+                self.underlyers,
+                as_of=now,
+                cycle_time=slot,
+                progress_callback=progress_callback,
+            )
+        except Exception:
+            self._detector_status(dict(attempt, status="FAILED", reason="PIPELINE_EXECUTION_FAILED",
+                finished_at=self.clock().astimezone(timezone.utc).isoformat()))
+            raise
+        detector = getattr(result, "detector_evaluation", None)
+        status = "RECORDED" if detector and detector.get("status") in ("RECORDED", "ALREADY_RECORDED") else "FAILED" if detector and detector.get("status") == "FAILED" else "INCOMPLETE"
+        self._detector_status(dict(attempt, status=status,
+            reason=detector.get("reason") if detector else "DETECTOR_NOT_EVALUATED",
+            finished_at=self.clock().astimezone(timezone.utc).isoformat(),
+            run_id=str(detector["run_id"]) if detector and detector.get("run_id") else None))
         counts: dict[str, int] = {}
         shadow_counts: dict[str, int] = {}
         package_counts: dict[str, int] = {}
@@ -185,6 +200,13 @@ class OptionMaterializationWorker:
                     "option continuous validation failed; materialization remains complete"
                 )
         return result
+
+    def _detector_status(self, payload):
+        if self.detector_status_callback is not None:
+            try:
+                self.detector_status_callback(payload)
+            except Exception:
+                LOGGER.exception("detector operational status unavailable; retained results unchanged")
 
     def run_forever(self, leadership: OptionSchedulerLeadership) -> None:
         while True:

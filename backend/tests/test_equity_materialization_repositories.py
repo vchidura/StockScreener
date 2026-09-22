@@ -1070,7 +1070,7 @@ def test_stale_analysis_recovery_terminal_fails_unresolved_work():
     assert "lease_expires_at = NULL" in member_sql
     assert "run.analysis_run_id = ANY(%s)" in run_sql
     assert "status = 'FAILED'" in run_sql
-    assert select_parameters == (timedelta(minutes=30),)
+    assert select_parameters == (timedelta(minutes=30), None, None, None, None)
     assert member_parameters == (
         "ANALYSIS_RUN_LEASE_EXPIRED", [run_id],
     )
@@ -1148,7 +1148,7 @@ def test_stale_ingestion_recovery_terminal_fails_writing_segments():
     assert "FOR UPDATE SKIP LOCKED" in sql
     assert "status = 'FAILED'" in sql
     assert "jsonb_build_object" in sql
-    assert parameters == (timedelta(minutes=30), "INGESTION_SEGMENT_STALE")
+    assert parameters == (timedelta(minutes=30), None, None, None, None, "INGESTION_SEGMENT_STALE")
     assert result[0]["ingestion_segment_id"] == segment_id
 
 
@@ -1157,6 +1157,17 @@ def test_stale_ingestion_recovery_rejects_negative_age():
 
     with pytest.raises(ValueError, match="stale_after must not be negative"):
         repository.fail_stale_segments(stale_after=timedelta(seconds=-1))
+
+
+def test_stage_recovery_is_scoped_to_owned_intervals_and_dataset():
+    analysis, _, cursor = _repository(EquityAnalysisRepository)
+    cursor.fetchall.return_value = []
+    analysis.fail_stale_runs(stale_after=timedelta(0), intervals=("30m", "1h"), run_purpose="ORIGINAL")
+    assert cursor.execute.call_args.args[1] == (timedelta(0), ["30m", "1h"], ["30m", "1h"], "ORIGINAL", "ORIGINAL")
+    ingestion, _, cursor = _repository(EquityIngestionRepository)
+    cursor.fetchall.return_value = []
+    ingestion.fail_stale_segments(stale_after=timedelta(0), intervals=("30m",), dataset="EQUITY_BARS")
+    assert cursor.execute.call_args.args[1] == (timedelta(0), ["30m"], ["30m"], "EQUITY_BARS", "EQUITY_BARS", "INGESTION_SEGMENT_STALE")
 
 
 def test_existing_analysis_run_is_returned_without_member_mutation():

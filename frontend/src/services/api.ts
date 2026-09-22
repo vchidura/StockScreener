@@ -2335,7 +2335,7 @@ export interface OptionDetectionRun {
   by_model?: Record<string, Record<string, number>>
 }
 
-export type OptionDetectorSort = 'run' | 'underlyer' | 'detector' | 'category' | 'strategy' | 'rank' | 'entry_limit'
+export type OptionDetectorSort = 'triggered_at' | 'run' | 'underlyer' | 'detector' | 'category' | 'strategy' | 'rank' | 'entry_limit'
 
 export interface OptionDetectorDatasets {
   storage_ready: boolean
@@ -2345,6 +2345,26 @@ export interface OptionDetectorDatasets {
 }
 
 export const getOptionDetectorDatasets = async (): Promise<OptionsEnvelope<OptionDetectorDatasets>> => (await api.get('/options/alerts/datasets')).data
+
+export interface OptionAlertSchedule {
+  dataset_id: string
+  as_of: string
+  scheduled_cycle: string
+  window_start: string
+  window_end: string
+  status: 'UPCOMING' | 'DUE'
+  warning: boolean
+  unpublished_windows: number
+  last_unpublished_cycle: string | null
+  evaluation_attempts?: {
+    available: boolean
+    attempts: Array<{ scheduled_cycle: string; started_at: string; finished_at: string | null;
+      status: 'RUNNING' | 'FAILED' | 'INCOMPLETE' | 'UNVERIFIED'; reason: string | null }>
+  }
+  dataset_timing: 'EXPECTED_CHECK_WINDOW_NOT_COMPLETION_DEADLINE'
+}
+
+export const getOptionAlertSchedule = async (): Promise<OptionsEnvelope<OptionAlertSchedule>> => (await api.get('/options/alerts/schedule')).data
 
 export interface OptionAlertOriginalPackage {
   status: 'AVAILABLE' | 'UNAVAILABLE'
@@ -2362,6 +2382,19 @@ export interface OptionAlertOriginalPackage {
   legs: OptionCandidateLeg[]
 }
 
+export interface OptionDetectorRunSummary {
+  run_id: string
+  scheduled_cycle: string
+  selected_at: string
+  published_at: string
+  market_time: string
+  observed_time: string
+  expected_underlyings: number
+  covered_underlyings: number
+  selection_counts: Record<string, number>
+  rejections: Record<string, number>
+}
+
 export interface OptionDetectorEvaluationReview {
   storage_ready: boolean
   dataset_id: string | null
@@ -2370,6 +2403,7 @@ export interface OptionDetectorEvaluationReview {
   session_date: string | null
   as_of: string
   maximum_new_alerts: number
+  completed_runs: OptionDetectorRunSummary[]
   outcome_status: string
   total: number
   models: Array<{
@@ -2409,29 +2443,38 @@ export interface OptionDetectorAlertReview {
   status: 'COMPLETE' | 'NO_COMPLETE_RUN'
   as_of: string
   latest_run_id: string | null
+  run: OptionDetectorRunSummary | null
+  latest_run: OptionDetectorRunSummary | null
+  runs: OptionDetectorRunSummary[]
   session_date: string | null
   sessions: string[]
   total: number
   new_alerts: number
+  detected_observations?: number
   repeat_hits: number
   maximum_new_alerts: number
   outcome_status: 'NOT_BOUND_TO_PROSPECTIVE_OUTCOMES'
   execution_permission: false
   rows: Array<{
-    evaluation_id: string; candidate_id: string; run_id: string; scheduled_cycle: string;
-    detector_id: 'O1' | 'S1' | 'S2'; origin: 'OPTIONS_FIRST' | 'STOCK_FIRST'; underlyer: string;
-    direction: -1 | 1; category: string; strategy_name: string | null; candidate_rank: number; first_selected_at: string;
-    hit_count: number; repeat_count: number; last_seen_at: string; plan_sha256: string;
-    entry_limit: string; entry_deadline: string; exit_deadline: string;
-    management_policy: Record<string, unknown>; event_horizon_status: string; original_package?: OptionAlertOriginalPackage;
-    outcome_status: 'NOT_BOUND_TO_PROSPECTIVE_OUTCOMES'; net_return: null; fill: null;
+    evaluation_id: string; candidate_id: string | null; run_id: string; scheduled_cycle: string;
+    triggered_at: string | null;
+    detector_id: 'O1' | 'O2' | 'S1' | 'S2'; origin: 'OPTIONS_FIRST' | 'STOCK_FIRST'; underlyer: string;
+    direction: -1 | 1 | null; category: string; strategy_name: string | null; candidate_rank: number | null; first_selected_at: string;
+    hit_count: number | null; repeat_count: number | null; last_seen_at: string; plan_sha256: string | null;
+    entry_limit: string | null; entry_deadline: string | null; exit_deadline: string | null;
+    management_policy: Record<string, unknown> | null; event_horizon_status: string; original_package?: OptionAlertOriginalPackage;
+    outcome_status: 'NOT_BOUND_TO_PROSPECTIVE_OUTCOMES' | 'NOT_APPLICABLE_OBSERVATION'; net_return: null; fill: null;
+    observation?: NonNullable<OptionDetectorEvaluationReview['rows'][number]['observation']> & {
+      expiration_date: string; contract_type: string; market_cutoff: string; decision_at: string;
+      valid_until: string; input_count: number; policy_sha256: string; source_sha256: string;
+    };
   }>
 }
 
 export const getOptionDetectorAlerts = async (params: {
   dataset_id: string; scope?: 'LATEST' | 'HISTORY'; session_date?: string;
   underlyer?: string; sort_by?: OptionDetectorSort; sort_order?: 'asc' | 'desc';
-  detector?: 'O1' | 'S1' | 'S2'; limit?: number; offset?: number;
+  detector?: 'O1' | 'O2' | 'S1' | 'S2'; limit?: number; offset?: number;
 }): Promise<OptionsEnvelope<OptionDetectorAlertReview>> => (await api.get('/options/alerts/detector-runs', { params })).data
 
 export interface OptionBehaviorReview {

@@ -321,9 +321,11 @@ class ManualOptionPipeline:
                             or retained is None and run.selected_at < hook_started_at):
                         raise ValueError("detector hook evidence differs from the completed cycle scope")
                     detector_evaluation = repository.persist_completed_run(run, records)
-                except Exception:
+                except Exception as error:
+                    from psycopg2.errors import QueryCanceled
                     LOGGER.exception("Detector evaluation failed after strategy acknowledgement")
-                    detector_evaluation = dict(status="FAILED", reason="DETECTOR_EVALUATION_FAILED")
+                    detector_evaluation = dict(status="FAILED", reason="DETECTOR_SOURCE_TIMEOUT"
+                        if isinstance(error, QueryCanceled) else "DETECTOR_EVALUATION_FAILED")
         return ManualCycleResult(
             universe_run_id=universe_run_id,
             as_of_session=as_of_session,

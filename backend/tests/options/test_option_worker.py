@@ -55,6 +55,55 @@ def test_option_worker_processes_each_delayed_slot_once():
     ]
 
 
+def test_detector_attempt_reports_running_failed_and_recorded_without_fake_completion():
+    states = []
+    now = datetime(2026, 8, 31, 14, 16, tzinfo=UTC)
+    class DetectorPipeline(FakePipeline):
+        def run_once(self, *args, **kwargs):
+            return SimpleNamespace(results=(SimpleNamespace(status="COMPLETE"),),
+                detector_evaluation={"status": "FAILED", "reason": "DETECTOR_SOURCE_TIMEOUT"})
+    worker = OptionMaterializationWorker(DetectorPipeline(), calendar=FakeCalendar(), clock=lambda: now,
+        detector_status_callback=states.append)
+    worker.poll_once()
+    assert [row["status"] for row in states] == ["RUNNING", "FAILED"]
+    assert states[-1]["reason"] == "DETECTOR_SOURCE_TIMEOUT" and states[-1]["run_id"] is None
+    assert states[-1]["finished_at"] == now.isoformat()
+    states.clear()
+    worker.pipeline.run_once = lambda *args, **kwargs: SimpleNamespace(results=(),
+        detector_evaluation={"status": "RECORDED", "run_id": "retained-run", "new_alerts": 0})
+    worker._completed_slots.clear()
+    worker.poll_once()
+    assert [row["status"] for row in states] == ["RUNNING", "RECORDED"]
+    assert states[-1]["run_id"] == "retained-run"
+
+
+def test_detector_status_write_failure_does_not_change_pipeline_result(caplog):
+    worker = OptionMaterializationWorker(FakePipeline(), calendar=FakeCalendar(),
+        detector_status_callback=lambda payload: (_ for _ in ()).throw(OSError("unavailable")))
+    assert worker.poll_once() is not None
+    assert "retained results unchanged" in caplog.text
+
+
+def test_detector_attempt_status_writer_is_scoped_and_bounded(tmp_path, monkeypatch):
+    import json
+    from scripts import run_option_worker as script
+
+    monkeypatch.setattr(script, "BACKEND_DIR", tmp_path)
+    config = SimpleNamespace(configuration_sha256="a" * 64)
+    record = script._detector_status_callback(config, "dataset-one")
+    now = datetime(2026, 8, 31, 14, 0, tzinfo=UTC)
+    for number in range(100):
+        stamp = (now + timedelta(minutes=number)).isoformat()
+        record(dict(scheduled_cycle=stamp, started_at=stamp, status="FAILED", finished_at=stamp,
+            reason="DETECTOR_SOURCE_TIMEOUT"))
+    path = tmp_path / "backups/options-worker/detector-status.json"
+    assert len(json.loads(path.read_text())["attempts"]) == 96
+    record = script._detector_status_callback(config, "dataset-two")
+    record(dict(scheduled_cycle=now.isoformat(), started_at=now.isoformat(), status="RUNNING"))
+    result = json.loads(path.read_text())
+    assert result["dataset_id"] == "dataset-two" and len(result["attempts"]) == 1
+
+
 def test_option_worker_logs_stock_behavior_shadow_stop(caplog):
     class ShadowPipeline(FakePipeline):
         def run_once(self, underlyers=None, *, as_of, cycle_time, progress_callback=None):

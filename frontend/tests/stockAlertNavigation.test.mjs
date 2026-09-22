@@ -16,8 +16,31 @@ test('combined alert status keeps only the earliest actionable publication windo
     { publication_window_start: '2026-09-21T14:15:00Z', publication_deadline: '2026-09-21T14:29:00Z' },
     { publication_window_start: '2026-09-21T13:15:00Z' },
   ]
-  assert.deepEqual(earliestAlertWindow(streams), streams[1])
+  assert.deepEqual(earliestAlertWindow(streams, Date.parse('2026-09-21T14:00:00Z')), streams[1])
+  assert.deepEqual(earliestAlertWindow(streams, Date.parse('2026-09-21T14:30:00Z')), streams[0])
+  assert.deepEqual(earliestAlertWindow(streams, Date.parse('2026-09-21T16:00:00Z')), streams[0])
+  assert.equal(earliestAlertWindow([{ publication_window_start: 'invalid', publication_deadline: 'invalid' }]), null)
+  assert.equal(earliestAlertWindow([{ publication_window_start: '2026-09-21T15:00:00Z', publication_deadline: '2026-09-21T14:00:00Z' }]), null)
   assert.equal(earliestAlertWindow(undefined), null)
+})
+
+test('alert window distinguishes current worker schedules from stale results and actual skipped runs', () => {
+  const page = readFileSync(new URL('../src/pages/StockAlertsPage.tsx', import.meta.url), 'utf8')
+  const css = readFileSync(new URL('../src/pages/StockAlertsPage.css', import.meta.url), 'utf8')
+  assert.match(page, /data\?\.schedule_streams\?\.filter/)
+  assert.match(page, /stream\.skipped_windows/)
+  assert.match(page, /Alert window overdue/)
+  assert.match(page, /Completion unverified/)
+  assert.match(page, /Latest \{latestWorkerPublication\.label\.toLowerCase\(\)\} run/)
+  assert.match(page, /<strong className=\{windowOverdue \|\| skippedWindow/)
+  assert.match(css, /sa-schedule__warning \{ color: var\(--tm-warn\)/)
+})
+
+test('Latest Run separates no publication from no alerts in a trade-type run', () => {
+  const page = readFileSync(new URL('../src/pages/StockAlertsPage.tsx', import.meta.url), 'utf8')
+  assert.match(page, /No current-session alerts/)
+  assert.match(page, /No publication recorded for this session\./)
+  assert.ok(page.includes('`No ${tradeType.toLowerCase()} alerts in this run`'))
 })
 
 test('alert publication context is limited to six ticker and alert facts without provenance', () => {
@@ -158,13 +181,14 @@ test('Day History keeps customizable plan columns instead of inheriting Latest R
 
 
 test('Day History always pairs the current price and price return without exposing them in Latest Run', () => {
-  const columns = [{ key: 'ticker', locked: true }, { key: 'triggered_at', history: true }, { key: 'latest_price', history: true },
+  const columns = [{ key: 'triggered_at' }, { key: 'ticker', locked: true }, { key: 'latest_price', history: true },
     { key: 'price_return', history: true }, { key: 'paper_return', history: true }]
   const hidden = new Set(['triggered_at', 'latest_price', 'price_return', 'paper_return'])
   const history = alertColumnLayout(columns, hidden, 'history')
-  assert.deepEqual(history.visible.map(column => column.key), ['ticker', 'triggered_at', 'latest_price', 'price_return'])
+  assert.deepEqual(history.visible.map(column => column.key), ['triggered_at', 'ticker', 'latest_price', 'price_return'])
   assert.ok(history.visible.every(column => column.locked))
-  assert.deepEqual(alertColumnLayout(columns, new Set(), 'latest').visible.map(column => column.key), ['ticker'])
+  assert.deepEqual(alertColumnLayout(columns, hidden, 'latest').visible.map(column => column.key), ['triggered_at', 'ticker'])
+  assert.ok(alertColumnLayout(columns, hidden, 'latest').visible[0].locked)
   assert.equal(hidden.size, 4)
 })
 

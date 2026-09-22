@@ -6,7 +6,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import date, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import exchange_calendars
@@ -29,8 +29,11 @@ def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--launch-id", required=True)
     parser.add_argument("--session-date", type=date.fromisoformat, required=True)
+    parser.add_argument("--effective-from", type=datetime.fromisoformat, help="Optional aware in-session cutoff for a prospective technical launch; existing completed slots remain untouched.")
     parser.add_argument("--continuous-development", action="store_true")
     parser.add_argument("--technical-forward", action="store_true", help="Prepare the separate pinned technical detector launch; never activates it.")
+    parser.add_argument("--intraday-confirmation", action="store_true", help="Pin reviewed O1 v2 completed-30m confirmation for development observation alerts.")
+    parser.add_argument("--approve-stock-runtime-transition", action="store_true", help="Explicitly pin reviewed current stock code before its first new publication; old publications remain ineligible under the new pins.")
     parser.add_argument("--check-only", action="store_true", help="Validate a technical launch without writing its manifest.")
     parser.add_argument("--stock-ledger", default="backups/equity-shadow/stock-ideas-forward-v2/forward.sqlite")
     parser.add_argument("--usage-window-seconds", type=int, default=86400)
@@ -47,6 +50,8 @@ def _arguments() -> argparse.Namespace:
 
 def main() -> int:
     args = _arguments()
+    if (args.approve_stock_runtime_transition or args.effective_from is not None or args.intraday_confirmation) and not args.technical_forward:
+        raise ValueError("stock runtime transition requires a technical forward launch")
     output = args.output.resolve()
     research_root = (BACKEND_DIR / "research").resolve()
     if output.parent != research_root or output.suffix != ".json":
@@ -56,6 +61,11 @@ def main() -> int:
     calendar = exchange_calendars.get_calendar("XNYS")
     session = calendar.date_to_session(pd.Timestamp(args.session_date), direction="none")
     starts_at = calendar.session_open(session).to_pydatetime().astimezone(timezone.utc)
+    if args.effective_from is not None:
+        if (args.effective_from.utcoffset() is None or not starts_at <= args.effective_from
+                <= calendar.session_close(session).to_pydatetime()):
+            raise ValueError("technical effective cutoff must be aware and inside the requested exchange session")
+        starts_at = args.effective_from.astimezone(timezone.utc)
     session_end = (
         calendar.session_close(session).to_pydatetime().astimezone(timezone.utc)
         + timedelta(minutes=1)
@@ -64,13 +74,13 @@ def main() -> int:
     if args.technical_forward:
         from options.detector_launch import prepare_detector_forward_launch
         from options.repositories.stock_behavior_assessments import OptionStockBehaviorAssessmentRepository
-        from datetime import datetime
-
         environment = dict(os.environ, OPTION_STRATEGY_POLICY_FILE="options/policies/strategy_technical_forward_v1.json",
             OPTION_VALUATION_POLICY_FILE="options/policies/valuation_raw_spot_v2.json")
         configuration = load_option_runtime_configuration(environment, BACKEND_DIR)
         launch = prepare_detector_forward_launch(backend_dir=BACKEND_DIR, configuration=configuration,
-            dataset_id=args.launch_id, effective_from=starts_at, stock_ledger=args.stock_ledger)
+            dataset_id=args.launch_id, effective_from=starts_at, stock_ledger=args.stock_ledger,
+            approve_stock_runtime_transition=args.approve_stock_runtime_transition,
+            intraday_confirmation=args.intraday_confirmation)
         cutoff = datetime.now(timezone.utc)
         source_repository = OptionStockBehaviorAssessmentRepository()
         source_repository.detector_package_sources(configuration=configuration, candidate_ids=(), as_of=cutoff)

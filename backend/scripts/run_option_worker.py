@@ -125,6 +125,28 @@ def _continuous_validation_callback(configuration, evidence_runtime=None):
     return validate
 
 
+def _detector_status_callback(configuration, dataset_id):
+    path = BACKEND_DIR / "backups/options-worker/detector-status.json"
+    attempts = []
+    if path.is_file() and path.stat().st_size <= 131072:
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+            if (previous.get("dataset_id") == dataset_id
+                    and previous.get("configuration_sha256") == configuration.configuration_sha256):
+                attempts = previous.get("attempts", [])[-95:]
+        except (OSError, ValueError, TypeError):
+            attempts = []
+
+    def record(attempt):
+        nonlocal attempts
+        attempts = [row for row in attempts if row["scheduled_cycle"] != attempt["scheduled_cycle"]]
+        attempts = sorted([*attempts, attempt], key=lambda row: row["scheduled_cycle"])[-96:]
+        _write_validation_artifact(path, dict(version="option_detector_operational_status_v1", dataset_id=dataset_id,
+            configuration_sha256=configuration.configuration_sha256, attempts=attempts,
+            checked_at=attempt.get("finished_at", attempt["started_at"])))
+    return record
+
+
 def _write_validation_artifact(path: Path, report: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -241,6 +263,8 @@ def main() -> int:
             partition_maintainer=ensure_option_partitions,
             validation_callback=_continuous_validation_callback(configuration, strategy_pipeline.evidence_runtime),
             effective_from=detector_arguments.get("detector_effective_from"),
+            detector_status_callback=_detector_status_callback(configuration, detector_arguments["detector_dataset_id"])
+                if detector_arguments else None,
         )
         if detector_arguments:
             logging.getLogger("option-worker").info("TECHNICAL_FORWARD_ARMED dataset=%s effective_from=%s maximum_new_alerts=20 execution=False",

@@ -4,7 +4,7 @@ import type { ColumnSpec } from '../layout/PageChrome'
 export type OptionAlertView = 'behavior' | 'day_history' | 'candidates' | 'daily' | 'history'
 export type OptionAlertColumn = ColumnSpec & { tip?: string }
 
-export const detectorSortKeys = ['run', 'underlyer', 'detector', 'category', 'strategy', 'rank', 'entry_limit'] as const
+export const detectorSortKeys = ['triggered_at', 'run', 'underlyer', 'detector', 'category', 'strategy', 'rank', 'entry_limit'] as const
 
 export function optionDetectorSort(params: URLSearchParams) {
   const raw = params.get('detector_sort')
@@ -69,6 +69,7 @@ export const optionMarketColumns: OptionAlertColumn[] = [
 ]
 
 export const detectorAlertColumns: OptionAlertColumn[] = [
+  { key: 'triggered_at', label: 'Triggered (ET)', group: 'Alert', locked: true, tip: 'Retained option source time for O1 or original stock trigger-bar time for S1/S2, not selection or run time.' },
   { key: 'underlyer', label: 'Underlying', group: 'Alert', locked: true },
   { key: 'contracts', label: 'Contracts / structure', group: 'Package' },
   { key: 'expiry', label: 'Expiry / DTE at source', group: 'Package' },
@@ -94,10 +95,10 @@ export const detectorAlertColumns: OptionAlertColumn[] = [
   { key: 'details', label: 'Details', group: 'Alert', hiddenByDefault: true },
 ]
 
-const detectorIdentity = ['underlyer', 'detector', 'details']
+const detectorIdentity = ['triggered_at', 'underlyer', 'detector', 'details']
 export const detectorColumnPresets: Record<string, string[]> = {
   'Package / market data': detectorAlertColumns.filter(column => !column.hiddenByDefault).map(column => column.key),
-  'Greeks / volatility': ['underlyer', 'contracts', 'expiry', 'stock', 'option_price', 'iv', 'delta', 'gamma', 'theta', 'vega', 'rho'],
+  'Greeks / volatility': ['triggered_at', 'underlyer', 'contracts', 'expiry', 'stock', 'option_price', 'iv', 'delta', 'gamma', 'theta', 'vega', 'rho'],
   'Price / activity': [...detectorIdentity, 'category', 'strategy', 'contracts', 'expiry', 'stock', 'option_price', 'volume', 'open_interest', 'volume_oi', 'iv'],
   'Trade plan': [...detectorIdentity, 'strategy', 'contracts', 'entry_limit', 'technical_stop', 'technical_target', ...optionPlanColumns.map(column => column.key), 'exit_due'],
   Performance: [...detectorIdentity, 'category', 'strategy', 'run', 'hit_count', 'entry_limit', 'net_return', 'outcome_status'],

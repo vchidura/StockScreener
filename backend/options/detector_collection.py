@@ -13,7 +13,7 @@ from options.analytics.alert_selection import (
     select_dual_origin_packages,
 )
 from options.dual_origin import bind_activity_source, detect_option_participation, qualify_dual_origin_package
-from options.surface_detection import assess_surface_first, bind_surface_source
+from options.surface_detection import assess_surface_first, bind_surface_source, surface_snapshot_eligible
 
 
 @dataclass(frozen=True)
@@ -90,10 +90,7 @@ class RetainedDetectorSourceReader:
             else:
                 activity.append(dict(source=source, finding=finding, snapshot=snapshot, lineage=lineage,
                     security=security, stock=stocks[snapshot.underlyer]))
-            if (snapshot.quality_flags or not snapshot.iv_converged or snapshot.local_iv is None
-                    or snapshot.revised_observed_at is not None
-                    or snapshot.mark_market_data_time != snapshot.market_data_time
-                    or snapshot.spot_market_data_time != snapshot.market_data_time):
+            if not surface_snapshot_eligible(snapshot, valuation_policy=configuration.valuation_policy):
                 excluded["SURFACE_POINT_INELIGIBLE"] += 1
             else:
                 groups[(snapshot.batch_id, snapshot.expiration_date, snapshot.contract_type)].append((snapshot, row["created_at"], lineage))
@@ -102,16 +99,18 @@ class RetainedDetectorSourceReader:
             cohorts = defaultdict(list)
             for value in values:
                 snapshot = value[0]
-                cohorts[(snapshot.spot, snapshot.spot_market_data_time, snapshot.market_data_time,
+                cohorts[(snapshot.spot, snapshot.spot_market_data_time,
                     snapshot.valuation_policy_sha256, snapshot.model_version)].append(value)
-            ordered = sorted(cohorts.items(), key=lambda item: (-len(item[1]), -item[0][2].timestamp(), str(item[0])))
+            ordered = sorted(cohorts.items(), key=lambda item: (-len(item[1]),
+                -max(value[0].market_data_time for value in item[1]).timestamp(), str(item[0])))
             values = ordered[0][1]
             excluded["SURFACE_OTHER_COHERENT_COHORT"] += sum(len(group) for _, group in ordered[1:])
             snapshots = tuple(value[0] for value in values)
             try:
                 source = bind_surface_source(snapshots=snapshots, lineage=values[0][2],
                     security=securities[snapshots[0].underlyer],
-                    recorded_at=max(value[1] for value in values), received_at=received_at)
+                    recorded_at=max(value[1] for value in values), received_at=received_at,
+                    valuation_policy=configuration.valuation_policy)
             except ValueError:
                 excluded["SURFACE_SOURCE_INVALID"] += 1
                 continue
@@ -123,18 +122,24 @@ class RetainedDetectorSourceReader:
 
 
 def retained_contract_reference(row):
-    from options.domain import AssetType, OptionContractReference
+    from options.domain import AssetType, CatalogEligibility, OptionContractReference, validate_standard_contract
 
-    if row["eligibility_status"] != "VALIDATED_ACTIVE" or row["additional_underlyings"] or row["adjustment_metadata"]:
+    if (row["eligibility_status"] != "VALIDATED_ACTIVE" or row["additional_underlyings"]
+            or not isinstance(row["adjustment_metadata"], dict)
+            or set(row["adjustment_metadata"]) - {"cfi", "correction"}):
         raise ValueError("technical packages require explicitly validated standard references")
-    return OptionContractReference(contract_ticker=row["contract_ticker"], underlyer=row["underlying"],
+    reference = OptionContractReference(contract_ticker=row["contract_ticker"], underlyer=row["underlying"],
         asset_type=AssetType(row["asset_type"]), provider=row["provider"], provider_version=row["provider_version"],
         provider_contract_type=row["provider_contract_type"], expiration_date=row["expiration_date"], strike=row["strike"],
         provider_exercise_style=row["provider_exercise_style"], shares_per_contract=row["shares_per_contract"],
         primary_exchange=row["primary_exchange"], correction=row["correction"], additional_underlyings_json="[]",
-        adjustment_metadata_json="{}", changes_deliverables=False, valid_from=row["valid_from"], valid_to=row["valid_to"],
+        adjustment_metadata_json=json.dumps(row["adjustment_metadata"], sort_keys=True, separators=(",", ":")),
+        changes_deliverables=bool(row.get("changes_deliverables", False)), valid_from=row["valid_from"], valid_to=row["valid_to"],
         first_observed_at=row["first_observed_at"], revised_observed_at=row["revised_observed_at"],
         refreshed_at=row["refreshed_at"], payload_sha256=row["payload_sha256"])
+    if validate_standard_contract(reference).eligibility_status != CatalogEligibility.VALIDATED_ACTIVE:
+        raise ValueError("technical packages require explicitly validated standard references")
+    return reference
 
 
 def bind_structural_technical_source(row, bars, *, security, direction, spot, received_at):
@@ -176,11 +181,14 @@ def bind_structural_technical_source(row, bars, *, security, direction, spot, re
 
 
 class ProductionDetectorSourceReader:
-    def __init__(self, retained_reader, repository, corporate_action_repository, *, setup_reader, clock=None):
+    def __init__(self, retained_reader, repository, corporate_action_repository, *, setup_reader, clock=None,
+                 aligned_setup_windows=False, intraday_confirmation=False):
         self.retained_reader = retained_reader
         self.repository = repository
         self.corporate_action_repository = corporate_action_repository
         self.setup_reader = setup_reader
+        self.aligned_setup_windows = aligned_setup_windows
+        self.intraday_confirmation = intraday_confirmation
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def __call__(self, *, configuration, dataset_id, scheduled_cycle, completed_matrices, started_at):
@@ -196,9 +204,48 @@ class ProductionDetectorSourceReader:
         cutoff = self.clock()
         package_sources = self.repository.detector_package_sources(configuration=configuration,
             candidate_ids=tuple(row["candidate_id"] for row in retained["candidates"]), as_of=cutoff)
+        activity = {row["snapshot"].snapshot_id: row for row in retained["activity"]}
+        assessor = assess_options_first
+        intraday_stocks = {}
+        if self.intraday_confirmation:
+            from options.dual_origin import assess_options_intraday
+            from options.intraday_participation import bind_intraday_components
+            from options.detector_launch import aligned_stock_windows
+
+            assessor = assess_options_intraday
+            for leg in package_sources["legs"]:
+                matched = activity.get(leg["snapshot_id"])
+                if leg["side"] != "BUY" or matched is None or matched["finding"].disposition != "DETECTED":
+                    continue
+                source = matched["source"]
+                window = aligned_stock_windows({source.underlyer: source.market_time})[source.underlyer][1]
+                key = (source.security_id, window)
+                if key not in intraday_stocks:
+                    carrier = self.repository.intraday_confirmation_source(security_id=source.security_id,
+                        market_cutoff=window or source.market_time, as_of=cutoff)
+                    intraday_stocks[key] = bind_intraday_components(carrier, received_at=self.clock()) if carrier else None
+                matched["intraday_stock"] = intraday_stocks[key]
+            cutoff = self.clock()
+        technical_underlyers = set()
+        for leg in package_sources["legs"]:
+            matched = activity.get(leg["snapshot_id"])
+            if leg["side"] != "BUY" or matched is None or matched["finding"].disposition != "DETECTED":
+                continue
+            decision = assessor(matched["source"], matched.get("intraday_stock") if self.intraday_confirmation else matched["stock"],
+                direction=1 if matched["snapshot"].contract_type.value == "CALL" else -1,
+                market_cutoff=max(scheduled_cycle, matched["lineage"].market_time), decision_at=cutoff)
+            if decision.disposition == "CONFIRMED":
+                technical_underlyers.add(matched["snapshot"].underlyer)
         technical_sources = self.repository.detector_technical_sources(underlyers=configuration.settings.underlyers,
-            market_cutoff=max(scheduled_cycle, *(row["market_time"] for row in retained["matrices"])), as_of=cutoff)
-        setups = self.setup_reader(market_cutoff=max(scheduled_cycle, *(row["market_time"] for row in retained["matrices"])), as_of=cutoff)
+            market_cutoff=max(scheduled_cycle, *(row["market_time"] for row in retained["matrices"])), as_of=cutoff,
+            technical_underlyers=tuple(sorted(technical_underlyers)))
+        setup_arguments = dict(market_cutoff=max(scheduled_cycle, *(row["market_time"] for row in retained["matrices"])), as_of=cutoff)
+        setup_rejections = {}
+        if self.aligned_setup_windows:
+            setup_arguments["market_cutoffs"] = {row["underlying"]: max(scheduled_cycle, row["market_time"]) for row in retained["matrices"]}
+            setups, setup_rejections = self.setup_reader(**setup_arguments)
+        else:
+            setups = self.setup_reader(**setup_arguments)
         source_bars = {row["bar_revision_id"]: row for row in technical_sources["bars"]}
         coverage_cache = {}
         for technical_source in technical_sources["sources"]:
@@ -213,7 +260,6 @@ class ProductionDetectorSourceReader:
         received_at = self.clock()
         if received_at < cutoff:
             raise ValueError("package source receipt moved backwards")
-        activity = {row["snapshot"].snapshot_id: row for row in retained["activity"]}
         legs, references = defaultdict(list), defaultdict(list)
         for row in package_sources["legs"]:
             legs[row["candidate_id"]].append(row)
@@ -221,6 +267,9 @@ class ProductionDetectorSourceReader:
             references[row["contract_id"]].append(row)
         raw_bars = package_sources["raw_bars"]
         rejected = Counter(retained["rejections"])
+        rejected.update(setup_rejections)
+        if technical_sources.get("source_error"):
+            rejected[technical_sources["source_error"]] += 1
         packages = []
         calendar = OptionExchangeCalendar()
         for row in package_sources["candidates"]:
@@ -234,7 +283,8 @@ class ProductionDetectorSourceReader:
             try:
                 snapshots = tuple(activity[leg.snapshot_id]["snapshot"] for leg in candidate.legs)
                 refs = tuple(retained_contract_reference(next(ref for ref in references[leg.contract_id]
-                    if ref["valid_from"] <= candidate.market_data_time
+                    if ref.get("candidate_id", candidate.candidate_id) == candidate.candidate_id
+                    and ref["valid_from"] <= candidate.market_data_time
                     and (ref["valid_to"] is None or ref["valid_to"] > candidate.market_data_time)
                     and max(ref["first_observed_at"], ref["revised_observed_at"] or ref["first_observed_at"]) <= candidate.observed_time)) for leg in candidate.legs)
                 bars = tuple(next(bar for bar in raw_bars if bar["security_id"] == matched["security"].security_id
@@ -242,7 +292,8 @@ class ProductionDetectorSourceReader:
             except (KeyError, StopIteration, ValueError):
                 rejected["EXACT_PACKAGE_REFERENCE_OR_RAW_SPOT_UNAVAILABLE"] += 1
                 continue
-            common = dict(source=matched["source"], candidate=candidate, stock=matched["stock"], security=matched["security"],
+            stock = matched.get("intraday_stock") if self.intraday_confirmation else matched["stock"]
+            common = dict(source=matched["source"], candidate=candidate, stock=stock, security=matched["security"],
                 lineage=matched["lineage"], snapshots=snapshots, references=refs,
                 raw_bars=tuple(_bar_from_row(bar) for bar in bars), raw_bar_created_ats=tuple(bar["created_at"] for bar in bars),
                 source_received_at=received_at, planned_entry_at=received_at + timedelta(seconds=1),
@@ -251,7 +302,7 @@ class ProductionDetectorSourceReader:
                 event_detail=dict(holding_event_evidence=technical_sources["events"],
                     event_coverage_evidence=technical_sources["coverage"], holding_event_coverage=technical_sources["coverage"]))
             decisions = []
-            stock_decision = assess_options_first(matched["source"], matched["stock"], direction=direction,
+            stock_decision = assessor(matched["source"], stock, direction=direction,
                 market_cutoff=max(scheduled_cycle, matched["lineage"].market_time), decision_at=received_at)
             if stock_decision.disposition == "CONFIRMED":
                 candidates = sorted((source for source in technical_sources["sources"] if source["ticker"] == candidate.underlyer
@@ -272,6 +323,8 @@ class ProductionDetectorSourceReader:
                     rejected["O1_TECHNICAL_SOURCE_UNAVAILABLE"] += 1
             else:
                 rejected["O1_STOCK_CONFIRMATION_UNAVAILABLE"] += 1
+                if self.intraday_confirmation:
+                    rejected.update("O1_" + reason for reason in stock_decision.reasons)
             for setup in setups:
                 if setup.candidate.ticker != candidate.underlyer or setup.candidate.direction != direction:
                     continue

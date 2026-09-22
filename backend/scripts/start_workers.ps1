@@ -6,14 +6,16 @@
     Launches the canonical continuous workers:
       - equity materialization   (ingest, publish, analyze every due interval)
             - corporate actions        (refresh upcoming splits and dividends)
-            - stock idea shadow        (multi-model forward alerts and stored-price paper marks)
+            - stock alert service      (supervised intraday, swing and results projection)
       - equity portal snapshots  (publishes the 20 generation-aware snapshots)
             - screening publications   (completed daily anchor plus advancing hourly context)
             - market events            (refresh earnings and FOMC coverage)
             - option model inputs      (refresh official Treasury curves)
       - delayed option pipeline  (ingest, analyze, strategies, recommendations)
 
-        -Only Equity selects the first five; -Only Options selects the last three.
+        Continuous All starts five managed groups. Equity selects equity, stock
+        alerts, UI projections and corporate-action refresh; Options selects the
+        Options group and calendar/model-input refresh. One-shot lineup is unchanged.
         -Worker selects one resident worker without starting its dependencies.
         -Worker MarketContext starts the reviewed Market Conditions refresher in
         its own window; context workers are excluded from default worker sets.
@@ -28,7 +30,8 @@
         refresh. Those switches cannot be combined with -Worker.
         The Advanced stream and replay jobs are never started. The stock-idea
         worker publishes unqualified forward shadow observations, never orders.
-        StockAlerts explicitly uses quality version 2 and its separate default store.
+        StockAlerts supervises the two already-enrolled strategies and results sync.
+        One-shot recovery retains the existing intraday-only stock alert pass.
         The legacy daily discovery worker is no longer started. Replay remains frozen.
 
 .EXAMPLE
@@ -41,7 +44,7 @@ param(
     [ValidateSet("All", "Equity", "Options")]
     [string]$Only = "All",
 
-    [ValidateSet("Equity", "CorporateActions", "StockAlerts", "SwingAlerts", "AlertResults", "AlertContext", "MarketContext", "Portal", "Screening", "MarketEvents", "OptionInputs", "Options")]
+    [ValidateSet("Equity", "CorporateActions", "StockAlerts", "SwingAlerts", "AlertResults", "AlertContext", "MarketContext", "Portal", "Screening", "MarketEvents", "OptionInputs", "Options", "UIProjections", "ReferenceRefresh")]
     [string]$Worker,
 
     [switch]$Once,
@@ -49,6 +52,8 @@ param(
     [switch]$Plan,
 
     [switch]$ShadowEvents,
+
+    [switch]$ReplaceAlertWorkers,
 
     [switch]$IncludePaperStudy,
 
@@ -78,7 +83,15 @@ $workerScripts = @{
     MarketEvents = "run_market_event_worker.py"
     OptionInputs = "run_option_model_input_worker.py"
     Options = "run_option_worker.py"
+    UIProjections = "run_worker_group.py"
+    ReferenceRefresh = "run_worker_group.py"
 }
+$workerGroups = @{ UIProjections = 'projections'; ReferenceRefresh = 'references'; Options = 'options' }
+if (-not $Once) {
+    $workerScripts.StockAlerts = "run_stock_alert_service.py"
+    $workerScripts.Options = "run_worker_group.py"
+}
+$groupedDefault = -not $Once -and -not $Worker
 
 if (-not $Plan -and -not (Test-Path $python -PathType Leaf)) {
     throw "Virtualenv interpreter not found: $python"
@@ -89,8 +102,14 @@ if ($Worker -and $PSBoundParameters.ContainsKey("Only")) {
 if ($ShadowEvents -and $Worker -ne "AlertContext") {
     throw "-ShadowEvents requires -Worker AlertContext and never enables a live gate"
 }
+if ($ReplaceAlertWorkers -and ($Worker -ne 'StockAlerts' -or $Once)) {
+    throw '-ReplaceAlertWorkers requires a continuous -Worker StockAlerts launch'
+}
 if ($Once -and $Worker -eq "MarketContext") {
     throw "-Worker MarketContext is continuous only; use the bounded context capture CLI with a new --output for one-shot work"
+}
+if ($Once -and $Worker -in @('UIProjections', 'ReferenceRefresh')) {
+    throw 'Managed groups are continuous only; use a named component with -Once for bounded maintenance'
 }
 if ($Worker -and ($IncludePaperStudy -or $PublishScreening)) {
     throw "-Worker cannot be combined with -IncludePaperStudy or -PublishScreening"
@@ -114,11 +133,62 @@ if ($IncludePaperStudy -and -not $Plan) {
     }
 }
 
-$running = if ($Plan) { @() } else { Get-CimInstance Win32_Process -Filter "Name like '%python%'" -ErrorAction SilentlyContinue }
+$running = if ($Plan) { @() } else { Get-CimInstance Win32_Process -Filter "Name like '%python%'" -ErrorAction Stop }
+
+function Get-GroupOption {
+    param([string]$CommandLine, [string]$Name, [string]$Default = '')
+    if ($CommandLine -match ("--" + $Name + "(?:=|\s+)" + '["'']?([a-z]+)')) { return $matches[1] }
+    return $Default
+}
 
 function Test-AlreadyRunning {
     param([string]$ScriptName, [string[]]$Arguments = @())
+    $groups = @($running | Where-Object { $_.CommandLine -like '*run_worker_group.py*' -and $_.CommandLine -notmatch '--(status|plan|check|stop)(\s|$)' })
+    $owners = @{
+        'refresh_equity_portal_snapshots.py' = 'projections'; 'run_screening_worker.py' = 'projections'
+        'run_corporate_action_worker.py' = 'references'; 'run_market_event_worker.py' = 'references'
+        'run_option_model_input_worker.py' = 'references'; 'run_option_worker.py' = 'options'
+    }
+    if ($ScriptName -eq 'run_worker_group.py') {
+        $requested = $Arguments[[Array]::IndexOf($Arguments, '--group') + 1]
+        $scope = 'all'
+        if ($Arguments -contains '--scope') { $scope = $Arguments[[Array]::IndexOf($Arguments, '--scope') + 1] }
+        $existing = @($groups | Where-Object { (Get-GroupOption $_.CommandLine 'group') -eq $requested })
+        if ($existing) {
+            if ($requested -eq 'references' -and @($existing | Where-Object {
+                (Get-GroupOption $_.CommandLine 'scope' 'all') -notin @('all', $scope)
+            }).Count) { throw 'Reference group scope differs; explicit reviewed group restart required' }
+            Write-Warning ("Worker group {0} already running; skipping." -f $requested)
+            return $true
+        }
+        $components = @($owners.Keys | Where-Object { $owners[$_] -eq $requested })
+        if ($requested -eq 'references' -and $scope -ne 'all') {
+            $components = if ($scope -eq 'equity') { @('run_corporate_action_worker.py') } else { @('run_market_event_worker.py', 'run_option_model_input_worker.py') }
+        }
+        foreach ($component in $components) {
+            if (@($running | Where-Object { $_.CommandLine -like "*$component*" -and $_.CommandLine -notmatch '--(status|plan|check|check-technical-launch)(\s|$)' }).Count) {
+                throw ("Standalone {0} is running; reviewed group cutover required" -f $component)
+            }
+        }
+        return $false
+    }
+    if ($owners.ContainsKey($ScriptName) -and @($groups | Where-Object { (Get-GroupOption $_.CommandLine 'group') -eq $owners[$ScriptName] }).Count) {
+        Write-Warning ("Worker group already running; skipping independent {0}." -f $ScriptName)
+        return $true
+    }
+    $service = $running | Where-Object { $_.CommandLine -like '*run_stock_alert_service.py*' -and $_.CommandLine -notmatch '--(status|plan|check|stop)(\s|$)' }
+    if ($service -and $ScriptName -in @('run_stock_alert_service.py', 'run_stock_idea_worker.py', 'project_stock_alert_results.py')) {
+        Write-Warning ("Stock alert service already running (PID {0}); skipping independent component launch." -f ($service.ProcessId -join ', '))
+        return $true
+    }
+    if ($ScriptName -eq 'run_stock_alert_service.py') {
+        $standalone = $running | Where-Object { $_.CommandLine -match 'run_stock_idea_worker\.py|project_stock_alert_results\.py' -and $_.CommandLine -notmatch '--(status|plan|check-readiness|check-storage)(\s|$)' }
+        if ($standalone -and -not $ReplaceAlertWorkers) { throw 'Standalone alert components are running; use a reviewed service takeover instead of starting duplicate workers.' }
+    }
     $match = $running | Where-Object { $_.CommandLine -and $_.CommandLine -like "*$ScriptName*" }
+    if ($ScriptName -eq 'run_stock_alert_service.py') {
+        $match = $match | Where-Object { $_.CommandLine -notmatch '--(status|plan|check|stop)(\s|$)' }
+    }
     if ($ScriptName -eq "run_stock_idea_worker.py") {
         $swing = $Arguments -contains "--swing"
         $match = $match | Where-Object { ($_.CommandLine -match '(^|\s)"?--swing"?(?=\s|$)') -eq $swing }
@@ -139,6 +209,9 @@ function Start-Worker {
     )
 
     if ($Worker -and $ScriptName -ne $workerScripts[$Worker]) { return }
+    if ($Worker -and $ScriptName -eq 'run_worker_group.py') {
+        if ($Arguments[[Array]::IndexOf($Arguments, '--group') + 1] -ne $workerGroups[$Worker]) { return }
+    }
     $scriptPath = Join-Path $scripts $ScriptName
     if (-not (Test-Path $scriptPath -PathType Leaf)) {
         throw "Worker script not found: $scriptPath"
@@ -198,6 +271,22 @@ if ($RepairSessions -gt 0) {
     $equityArgs += @("--repair-sessions", $RepairSessions.ToString())
 }
 
+$referenceScope = if ($groupedDefault -and $Only -ne 'All') { $Only.ToLowerInvariant() } else { 'all' }
+if (-not $Plan -and -not $Once) {
+    $requestedGroups = @()
+    if ($groupedDefault) {
+        if ($Only -ne 'Options') { $requestedGroups += 'projections' }
+        $requestedGroups += 'references'
+        if ($Only -ne 'Equity') { $requestedGroups += 'options' }
+    }
+    elseif ($workerGroups.ContainsKey($Worker)) { $requestedGroups += $workerGroups[$Worker] }
+    foreach ($group in $requestedGroups) {
+        $groupArgs = @('--group', $group)
+        if ($group -eq 'references') { $groupArgs += @('--scope', $referenceScope) }
+        Test-AlreadyRunning -ScriptName 'run_worker_group.py' -Arguments $groupArgs | Out-Null
+    }
+}
+
 if ($Worker -eq "MarketContext") {
     $marketContextArgs = @(
         "--rotation-only",
@@ -253,7 +342,7 @@ if ($Worker -ne "SwingAlerts" -and $Only -in @("All", "Equity")) {
         Invoke-OneShotWorker -Title "corporate-action-worker" `
             -ScriptName "run_corporate_action_worker.py" -Arguments $modeArgs
     }
-    else {
+    elseif (-not $groupedDefault) {
         Start-Worker -Title "corporate-action-worker" `
             -ScriptName "run_corporate_action_worker.py"
     }
@@ -263,8 +352,10 @@ if ($Worker -ne "SwingAlerts" -and $Only -in @("All", "Equity")) {
             -ScriptName "run_stock_idea_worker.py" -Arguments $stockAlertArgs
     }
     else {
-        Start-Worker -Title "stock-idea-shadow-worker" `
-            -ScriptName "run_stock_idea_worker.py" -Arguments $stockAlertArgs
+        $serviceArgs = @()
+        if ($ReplaceAlertWorkers) { $serviceArgs += '--replace-standalone' }
+        Start-Worker -Title "stock-alert-service" `
+            -ScriptName "run_stock_alert_service.py" -Arguments $serviceArgs
     }
 
     # The snapshot publisher has no --once; it is either a single pass or continuous.
@@ -272,6 +363,9 @@ if ($Worker -ne "SwingAlerts" -and $Only -in @("All", "Equity")) {
     if ($Once) {
         Invoke-OneShotWorker -Title "equity-portal-snapshots" `
             -ScriptName "refresh_equity_portal_snapshots.py"
+    }
+    elseif ($groupedDefault -or $Worker -eq 'UIProjections') {
+        Start-Worker -Title "ui-projections" -ScriptName "run_worker_group.py" -Arguments @('--group', 'projections')
     }
     else {
         Start-Worker -Title "equity-portal-snapshots" `
@@ -298,7 +392,7 @@ if ($Worker -ne "SwingAlerts" -and $Only -in @("All", "Equity")) {
                 -ScriptName "run_screening_worker.py" -Arguments @("--once")
         }
     }
-    else {
+    elseif (-not $groupedDefault) {
         Start-Worker -Title "screening-worker" -ScriptName "run_screening_worker.py"
     }
 
@@ -314,12 +408,16 @@ if ($Worker -ne "SwingAlerts" -and $Only -in @("All", "Equity")) {
     }
 }
 
+if ($groupedDefault -or $Worker -eq 'ReferenceRefresh') {
+    Start-Worker -Title "reference-refresh" -ScriptName "run_worker_group.py" -Arguments @('--group', 'references', '--scope', $referenceScope)
+}
+
 if ($Only -in @("All", "Options")) {
     if ($Once) {
         Invoke-OneShotWorker -Title "market-event-worker" `
             -ScriptName "run_market_event_worker.py" -Arguments $modeArgs
     }
-    else {
+    elseif (-not $groupedDefault) {
         Start-Worker -Title "market-event-worker" `
             -ScriptName "run_market_event_worker.py"
     }
@@ -328,7 +426,7 @@ if ($Only -in @("All", "Options")) {
         Invoke-OneShotWorker -Title "option-model-input-worker" `
             -ScriptName "run_option_model_input_worker.py" -Arguments $modeArgs
     }
-    else {
+    elseif (-not $groupedDefault) {
         Start-Worker -Title "option-model-input-worker" `
             -ScriptName "run_option_model_input_worker.py"
     }
@@ -338,7 +436,7 @@ if ($Only -in @("All", "Options")) {
             -ScriptName "run_option_worker.py" -Arguments $modeArgs
     }
     else {
-        Start-Worker -Title "option-worker" -ScriptName "run_option_worker.py"
+        Start-Worker -Title "options-service" -ScriptName "run_worker_group.py" -Arguments @('--group', 'options')
     }
 }
 
@@ -349,7 +447,7 @@ if ($oneShotFailures.Count -gt 0) {
 Write-Output ""
 if ($Plan) { Write-Output "Plan only: no workers started; current process/DB/provider health was not checked." }
 if ($Worker) { Write-Output "Selected worker: $Worker. Dependencies are not started automatically." }
-Write-Output "Screening refreshes completed hourly context with its daily anchor; Stock Alerts uses the separate forward shadow worker."
+Write-Output "Screening refreshes completed hourly context; Stock Alerts supervises enrolled intraday, swing and results sync. One-shot recovery remains intraday-only."
 Write-Output "Research observer is opt-in (-IncludePaperStudy); Advanced streaming, replay and backtest jobs stay excluded."
 Write-Output "Verify with:"
 if ($Worker) {
@@ -358,13 +456,15 @@ if ($Worker) {
             Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\report_equity_analysis_status.py"
             Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\report_stock_behavior_production_readiness.py"
         }
-        "StockAlerts" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_stock_idea_worker.py --status" }
+        "StockAlerts" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_stock_alert_service.py --status" }
         "SwingAlerts" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_stock_idea_worker.py --swing --status" }
         "AlertResults" { Write-Output "  Inspect stock-alert-results-projector and GET /api/stocks/alert-view?combined=true for independent stream freshness." }
         "AlertContext" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_stock_alert_context_worker.py --status" }
         "MarketContext" { Write-Output "  Inspect market-context-worker for WAITING_FOR_NEXT_SOURCE_WINDOW or a verified capture; GET /api/stocks/market-conditions for source dates and coverage." }
         "Screening" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_screening_worker.py --status" }
         "Options" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_option_pipeline.py --status" }
+        "UIProjections" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_worker_group.py --group projections --status" }
+        "ReferenceRefresh" { Write-Output "  backend\.venv\Scripts\python.exe backend\scripts\run_worker_group.py --group references --status" }
         default { Write-Output "  Inspect the selected worker's console for a successful refresh or an error." }
     }
 }

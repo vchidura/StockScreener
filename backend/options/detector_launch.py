@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
 import sqlite3
-from typing import Literal
+from typing import ClassVar, Literal
 
 from pydantic import AwareDatetime, Field, model_validator
 
@@ -26,9 +26,12 @@ RUNTIME_FILES = (
     "equity/polygon.py", "equity/materialization.py", "equity/setup_composition.py",
     "scripts/run_option_worker.py",
 )
+INTRADAY_RUNTIME_FILES = (*RUNTIME_FILES, "options/intraday_participation.py", "equity/behavior.py",
+    "equity/behavior_sources.py", "options/stock_behavior_gates.py")
 
 
 class DetectorForwardLaunch(Contract):
+    runtime_files: ClassVar[tuple[str, ...]] = RUNTIME_FILES
     schema_version: Literal["option_detector_forward_launch_v1"] = "option_detector_forward_launch_v1"
     dataset_id: Name
     effective_from: AwareDatetime
@@ -52,10 +55,49 @@ class DetectorForwardLaunch(Contract):
                 or self.technical_policy_sha256 != TECHNICAL_EXIT_POLICY.sha256
                 or self.qualification_policy_sha256 != TECHNICAL_QUALIFICATION_POLICY.sha256
                 or self.acceptance_source.instance_id != self.resumption_source.instance_id
-                or {name for name, _ in self.runtime_sources} != set(RUNTIME_FILES)
-                or len(self.runtime_sources) != len(RUNTIME_FILES)):
+                or {name for name, _ in self.runtime_sources} != set(self.runtime_files)
+                or len(self.runtime_sources) != len(self.runtime_files)):
             raise ValueError("detector launch policies, universe or runtime pins mismatch")
         return self
+
+
+class SourceReadyDetectorForwardLaunch(DetectorForwardLaunch):
+    schema_version: Literal["option_detector_forward_launch_v2"] = "option_detector_forward_launch_v2"
+    stock_readiness_policy: Literal["PER_MODEL_COMPLETED_WINDOW_V1"] = "PER_MODEL_COMPLETED_WINDOW_V1"
+
+
+class IntradayDetectorForwardLaunch(SourceReadyDetectorForwardLaunch):
+    runtime_files: ClassVar[tuple[str, ...]] = INTRADAY_RUNTIME_FILES
+    schema_version: Literal["option_detector_forward_launch_v3"] = "option_detector_forward_launch_v3"
+    o1_confirmation_policy_sha256: Sha256
+    alert_mode: Literal["DEVELOPMENT_OBSERVATIONS"] = "DEVELOPMENT_OBSERVATIONS"
+
+    @model_validator(mode="after")
+    def validate_intraday(self):
+        from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY
+
+        if self.o1_confirmation_policy_sha256 != INTRADAY_ALIGNMENT_POLICY.sha256:
+            raise ValueError("intraday launch requires the reviewed O1 policy")
+        return self
+
+
+def decode_detector_forward_launch(payload):
+    data = json.loads(payload)
+    contracts = {"option_detector_forward_launch_v1": DetectorForwardLaunch,
+        "option_detector_forward_launch_v2": SourceReadyDetectorForwardLaunch,
+        "option_detector_forward_launch_v3": IntradayDetectorForwardLaunch}
+    contract = contracts.get(data.get("schema_version"))
+    if contract is None:
+        raise ValueError("unsupported detector forward launch schema")
+    return contract.model_validate(data)
+
+
+def aligned_stock_windows(market_cutoffs, *, calendar=None):
+    from options.calendar import OptionExchangeCalendar
+
+    calendar = calendar or OptionExchangeCalendar()
+    return {ticker: (cutoff, calendar.latest_delayed_slot(cutoff, interval=timedelta(minutes=30),
+        provider_delay=timedelta(0), publication_grace=timedelta(0))) for ticker, cutoff in market_cutoffs.items()}
 
 
 def _scoped_path(backend_dir, relative):
@@ -69,7 +111,8 @@ def _source_hashes(backend_dir, names):
     return tuple(sorted((name, hashlib.sha256(_scoped_path(backend_dir, name).read_bytes()).hexdigest()) for name in names))
 
 
-def prepare_detector_forward_launch(*, backend_dir, configuration, dataset_id, effective_from, stock_ledger):
+def prepare_detector_forward_launch(*, backend_dir, configuration, dataset_id, effective_from, stock_ledger,
+                                   approve_stock_runtime_transition=False, intraday_confirmation=False):
     from equity.stock_alert_results import _decode_original_setup_payload
     from research.stock_alert_results import strategy_instance
     from research.stock_idea_engine import digest
@@ -92,21 +135,33 @@ def prepare_detector_forward_launch(*, backend_dir, configuration, dataset_id, e
         raise ValueError("forward launch stock source identity mismatch")
     instance = strategy_instance(config, state, "intraday")
     runtime = tuple(sorted(publication["runtime_sources"].items()))
-    if runtime != _source_hashes(backend_dir, [name for name, _ in runtime]):
-        raise ValueError("stock worker publication runtime differs from current source files; revalidation required")
+    current_runtime = _source_hashes(backend_dir, [name for name, _ in runtime])
+    if runtime != current_runtime:
+        if not approve_stock_runtime_transition:
+            raise ValueError("stock worker publication runtime differs from current source files; revalidation required")
+        from research.stock_idea_forward import forward_config, runtime_sources
+
+        if (set(publication["runtime_sources"]) != set(runtime_sources())
+                or digest(forward_config(quality_version=2)) != manifest[0]):
+            raise ValueError("reviewed stock runtime transition cannot change source scope or enrolled policy")
+        runtime = current_runtime
     common = dict(instance_id=instance["instance_id"], instance_policy_sha256=manifest[0],
         publication_policy_sha256=publication["policy_hash"], runtime_sources=runtime)
-    launch = DetectorForwardLaunch(dataset_id=dataset_id, effective_from=effective_from,
+    from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY
+
+    launch_type = IntradayDetectorForwardLaunch if intraday_confirmation else SourceReadyDetectorForwardLaunch
+    launch = launch_type(dataset_id=dataset_id, effective_from=effective_from,
         underlyers=configuration.settings.underlyers, configuration_sha256=configuration.configuration_sha256,
         strategy_policy_sha256=configuration.strategy_policy_sha256, valuation_policy_sha256=configuration.valuation_policy_sha256,
         stock_ledger=stock_ledger, acceptance_source=DirectSetupSourcePolicy(**common),
-        resumption_source=DirectResumptionSourcePolicy(**common), runtime_sources=_source_hashes(backend_dir, RUNTIME_FILES))
+        resumption_source=DirectResumptionSourcePolicy(**common), runtime_sources=_source_hashes(backend_dir, launch_type.runtime_files),
+        **(dict(o1_confirmation_policy_sha256=INTRADAY_ALIGNMENT_POLICY.sha256) if intraday_confirmation else {}))
     validate_detector_forward_launch(launch, configuration=configuration, backend_dir=backend_dir)
     return launch
 
 
 def validate_detector_forward_launch(launch, *, configuration, backend_dir):
-    launch = DetectorForwardLaunch.model_validate_json(launch.canonical_json())
+    launch = decode_detector_forward_launch(launch.canonical_json())
     if (configuration.strategy_policy.forward_admission is None
             or configuration.valuation_policy.underlying_price_basis != "RAW_FINALIZED_MINUTE_CLOSE_V1"
             or configuration.valuation_policy.maximum_source_age_seconds != 1800
@@ -115,12 +170,13 @@ def validate_detector_forward_launch(launch, *, configuration, backend_dir):
             or launch.strategy_policy_sha256 != configuration.strategy_policy_sha256
             or launch.valuation_policy_sha256 != configuration.valuation_policy_sha256
             or launch.underlyers != configuration.settings.underlyers
-            or launch.runtime_sources != _source_hashes(backend_dir, RUNTIME_FILES)):
+            or launch.runtime_sources != _source_hashes(backend_dir, launch.runtime_files)):
         raise ValueError("detector launch does not match reviewed configuration, policy or source code")
     for policy in (launch.acceptance_source, launch.resumption_source):
         if policy.runtime_sources != _source_hashes(backend_dir, [name for name, _ in policy.runtime_sources]):
             raise ValueError("pinned stock runtime source changed")
-    if not _scoped_path(backend_dir, launch.stock_ledger).is_file():
+    ledger = _scoped_path(backend_dir, launch.stock_ledger)
+    if not isinstance(launch, SourceReadyDetectorForwardLaunch) and not ledger.is_file():
         raise ValueError("pinned stock ledger is unavailable")
     return launch
 
@@ -129,7 +185,7 @@ def load_detector_forward_launch(path, *, expected_sha256, configuration, backen
     path = _scoped_path(backend_dir, path)
     if path.stat().st_size > 262144:
         raise ValueError("detector launch manifest exceeds size bound")
-    launch = DetectorForwardLaunch.model_validate_json(path.read_text(encoding="utf-8"))
+    launch = decode_detector_forward_launch(path.read_text(encoding="utf-8"))
     if launch.sha256 != expected_sha256:
         raise ValueError("detector launch manifest checksum mismatch")
     return validate_detector_forward_launch(launch, configuration=configuration, backend_dir=backend_dir)
@@ -137,17 +193,23 @@ def load_detector_forward_launch(path, *, expected_sha256, configuration, backen
 
 def build_detector_collector(launch, *, configuration, backend_dir):
     from equity.repositories import EquityCorporateActionRepository, EquityEvidenceRepository, EquityReferenceRepository
-    from equity.stock_alert_results import read_direct_stock_setups
+    from equity.stock_alert_results import read_direct_stock_setups, read_direct_stock_setup_windows
     from options.detector_collection import DetectorCycleCollector, ProductionDetectorSourceReader, RetainedDetectorSourceReader
     from options.repositories.alert_evaluations import OptionAlertEvaluationRepository
     from options.repositories.stock_behavior_assessments import OptionStockBehaviorAssessmentRepository
 
     launch = validate_detector_forward_launch(launch, configuration=configuration, backend_dir=backend_dir)
     repository = OptionStockBehaviorAssessmentRepository()
-    def setups(*, market_cutoff, as_of):
+    aligned = isinstance(launch, SourceReadyDetectorForwardLaunch)
+    def setups(*, market_cutoff, as_of, market_cutoffs=None):
+        if aligned:
+            return read_direct_stock_setup_windows(_scoped_path(backend_dir, launch.stock_ledger),
+                policies=(launch.acceptance_source, launch.resumption_source),
+                windows=aligned_stock_windows(market_cutoffs), as_of=as_of)
         return read_direct_stock_setups(_scoped_path(backend_dir, launch.stock_ledger),
             policies=(launch.acceptance_source, launch.resumption_source), underlyers=launch.underlyers,
             market_cutoff=market_cutoff, as_of=as_of)
     sources = ProductionDetectorSourceReader(RetainedDetectorSourceReader(repository, EquityReferenceRepository(), EquityEvidenceRepository()),
-        repository, EquityCorporateActionRepository(), setup_reader=setups)
+        repository, EquityCorporateActionRepository(), setup_reader=setups, aligned_setup_windows=aligned,
+        intraday_confirmation=isinstance(launch, IntradayDetectorForwardLaunch))
     return DetectorCycleCollector(sources, OptionAlertEvaluationRepository())

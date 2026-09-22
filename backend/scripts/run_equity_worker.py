@@ -318,7 +318,7 @@ def ingest_due_interval(
         return None
 
 
-def materialize_due_interval(
+def publish_due_interval(
     service: EquityMaterializationService,
     reference: ReferenceRefreshResult,
     *,
@@ -326,8 +326,8 @@ def materialize_due_interval(
     slot: datetime,
     observed_at: datetime,
     once: bool,
-) -> bool:
-    """Materialize one due interval. False means the slot should be retried later."""
+):
+    """Ingest and publish canonical bars without downstream analysis or outcomes."""
     LOGGER.info("materializing interval=%s slot=%s", interval, slot.isoformat())
     ingestion = ingest_due_interval(
         service,
@@ -338,7 +338,7 @@ def materialize_due_interval(
         once=once,
     )
     if ingestion is None:
-        return False
+        return None
     LOGGER.info(
         "ingestion complete interval=%s slot=%s bars=%s inserted=%s missing=%s",
         interval,
@@ -380,7 +380,7 @@ def materialize_due_interval(
             publication.missing,
             publication.failed,
         )
-        return True
+        return publication
     LOGGER.info(
         "publication complete interval=%s slot=%s status=%s selected=%s missing=%s",
         interval,
@@ -389,6 +389,25 @@ def materialize_due_interval(
         publication.selected,
         publication.missing,
     )
+    return publication
+
+
+def materialize_due_interval(
+    service: EquityMaterializationService,
+    reference: ReferenceRefreshResult,
+    *,
+    interval: str,
+    slot: datetime,
+    observed_at: datetime,
+    once: bool,
+) -> bool:
+    """Materialize one due interval. False means the slot should be retried later."""
+    publication = publish_due_interval(service, reference, interval=interval,
+        slot=slot, observed_at=observed_at, once=once)
+    if publication is None:
+        return False
+    if publication.status == "FAILED":
+        return True
     if getattr(service, "behavior_shadow_enabled", False):
         try:
             adjusted = refresh_behavior_adjusted_daily(
@@ -435,8 +454,7 @@ def materialize_due_interval(
         watermark=DecisionWatermark(slot, observed_at),
     )
     LOGGER.info(
-        "ingestion=%s publication=%s analysis=%s",
-        ingestion,
+        "publication=%s analysis=%s",
         publication,
         analysis,
     )
@@ -658,6 +676,8 @@ def run_worker(
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--stage", choices=("native", "derived", "30m-analysis", "hourly-analysis", "short-analysis", "daily-analysis", "maintenance"), help=argparse.SUPPRESS)
+    result.add_argument("--status", action="store_true", help="Read bounded continuous stage status without running work.")
     result.add_argument(
         "--once",
         action="store_true",
@@ -680,18 +700,31 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
+    from scripts.equity_worker_stages import check_stage_parent, run_stage, run_supervisor, status
+    if args.status:
+        print(json.dumps(status(), indent=2))
+        return 0
+    if args.stage and (args.once or args.repair_sessions):
+        raise ValueError("isolated stages cannot run repair or one-shot jobs")
+    if args.stage:
+        check_stage_parent()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-7s | %(message)s",
     )
-    with try_advisory_leadership(WORKER_LOCK_NAME) as is_leader:
+    lock = WORKER_LOCK_NAME if args.stage is None else f"{WORKER_LOCK_NAME}:{args.stage}"
+    with try_advisory_leadership(lock) as is_leader:
         if not is_leader:
             LOGGER.error("another equity materialization worker holds leadership")
             return 2
-        run_worker(
-            once=args.once, repair_sessions=args.repair_sessions,
-            behavior_shadow=args.behavior_shadow,
-        )
+        if args.stage:
+            run_stage(args.stage, behavior_shadow=args.behavior_shadow)
+        elif args.once:
+            run_worker(once=True, repair_sessions=args.repair_sessions, behavior_shadow=args.behavior_shadow)
+        else:
+            if args.repair_sessions:
+                run_worker(once=True, repair_sessions=args.repair_sessions, behavior_shadow=args.behavior_shadow)
+            run_supervisor(behavior_shadow=args.behavior_shadow)
     return 0
 
 

@@ -219,6 +219,7 @@ def bind_activity_source(*, snapshot, open_interest_record, lineage, security,
 
 
 class SignalDecision(Contract):
+    intraday_confirmation: ClassVar[bool] = False
     schema_version: Literal["dual_origin_signal_decision_v1"] = "dual_origin_signal_decision_v1"
     detector_id: Literal["O1", "S1"]
     origin: Literal["OPTIONS_FIRST", "STOCK_FIRST"]
@@ -267,14 +268,14 @@ class SignalDecision(Contract):
             raise ValueError("confirmation requires both timely source identities")
         if self.disposition != "CONFIRMED" and not self.reasons:
             raise ValueError("nonconfirmation requires reasons")
-        if self.detector_id == "O1" and (
+        if self.detector_id == "O1" and not self.intraday_confirmation and (
             self.origin_detector_version != ACTIVITY_POLICY.version or self.origin_policy_sha256 != ACTIVITY_POLICY.sha256
             or self.confirmation_policy_version != STOCK_ALIGNMENT_POLICY.version
             or self.confirmation_policy_sha256 != STOCK_ALIGNMENT_POLICY.sha256
             or self.confirmation_basis != STOCK_ALIGNMENT_POLICY.confirmation_basis
         ):
             raise ValueError("unsupported O1 decision policy")
-        if self.detector_id == "O1" and self.disposition == "CONFIRMED" and (
+        if self.detector_id == "O1" and not self.intraday_confirmation and self.disposition == "CONFIRMED" and (
             len(self.gates) != 4 or any(gate.verdict != "PASS" for gate in self.gates)
             or {gate.gate_id for gate in self.gates} != {"TREND_SLOPE_1d", "TREND_SLOPE_1h", "TREND_SLOPE_30m", "UNDERLYING_LIQUIDITY_EVIDENCE"}
         ):
@@ -298,8 +299,49 @@ class ResumptionSignalDecision(SignalDecision):
     detector_id: Literal["S2"] = "S2"
 
 
+class IntradaySignalDecision(SignalDecision):
+    intraday_confirmation: ClassVar[bool] = True
+    schema_version: Literal["dual_origin_signal_decision_v3"] = "dual_origin_signal_decision_v3"
+    detector_id: Literal["O1"] = "O1"
+
+    @model_validator(mode="after")
+    def validate_intraday_policy(self):
+        from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY, INTRADAY_PROFILE
+
+        policy = INTRADAY_ALIGNMENT_POLICY
+        if (self.origin_detector_version != ACTIVITY_POLICY.version or self.origin_policy_sha256 != ACTIVITY_POLICY.sha256
+                or self.confirmation_policy_version != policy.version or self.confirmation_policy_sha256 != policy.sha256
+                or self.confirmation_basis != policy.confirmation_basis
+                or self.stock_source_policy_sha256 not in (None, INTRADAY_PROFILE.sha256)):
+            raise ValueError("unsupported O1 intraday decision policy")
+        if self.disposition == "CONFIRMED" and (len(self.gates) != 2
+                or {gate.gate_id for gate in self.gates} != {"TREND_SLOPE_30m", "UNDERLYING_LIQUIDITY_EVIDENCE"}
+                or any(gate.verdict != "PASS" for gate in self.gates)):
+            raise ValueError("O1 intraday confirmation requires exact stock gates")
+        return self
+
+
+def assess_options_intraday(source, stock, *, direction, market_cutoff, decision_at):
+    from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY, INTRADAY_PROFILE, assess_intraday_participation
+
+    observation = assess_intraday_participation(source, stock, direction=direction,
+        market_cutoff=market_cutoff, decision_at=decision_at)
+    finding = detect_option_participation(source, market_cutoff=market_cutoff, decision_at=decision_at)
+    policy = INTRADAY_ALIGNMENT_POLICY
+    return IntradaySignalDecision(detector_id="O1", origin="OPTIONS_FIRST", origin_id=str(observation.activity.episode_id),
+        origin_detector_version=ACTIVITY_POLICY.version, origin_policy_sha256=ACTIVITY_POLICY.sha256,
+        confirmation_policy_version=policy.version, confirmation_policy_sha256=policy.sha256,
+        confirmation_basis=policy.confirmation_basis, security_id=source.security_id, underlyer=source.underlyer,
+        direction=direction, market_cutoff=market_cutoff, decision_at=decision_at,
+        valid_until=observation.valid_until, stock_source_sha256=observation.stock_source_sha256,
+        stock_source_policy_sha256=INTRADAY_PROFILE.sha256 if stock else None,
+        **_activity_fields(source, finding), disposition=observation.disposition,
+        reasons=observation.reasons, gates=observation.gates)
+
+
 def load_signal_decision(value):
-    contracts = {"dual_origin_signal_decision_v1": SignalDecision, "dual_origin_signal_decision_v2": ResumptionSignalDecision}
+    contracts = {"dual_origin_signal_decision_v1": SignalDecision, "dual_origin_signal_decision_v2": ResumptionSignalDecision,
+        "dual_origin_signal_decision_v3": IntradaySignalDecision}
     contract = contracts.get(value.schema_version)
     if contract is None:
         raise ValueError("unsupported signal decision schema")
@@ -686,7 +728,8 @@ def qualify_dual_origin_package(
 
     decision = load_signal_decision(decision)
     if decision.detector_id == "O1":
-        recomputed = assess_options_first(source, stock, direction=decision.direction,
+        assessor = assess_options_intraday if isinstance(decision, IntradaySignalDecision) else assess_options_first
+        recomputed = assessor(source, stock, direction=decision.direction,
             market_cutoff=decision.market_cutoff, decision_at=decision.decision_at)
     else:
         if setup is None or trusted_source_policy is None or stock_first_policy is None:
@@ -832,6 +875,9 @@ def qualify_dual_origin_package(
         entry_limit_units="USD_PER_PACKAGE", management_policy_version=management_version,
         management_policy_sha256=management_sha256, management_policy=management,
         indicative_qualification=indicative, event_horizon=event_horizon,
+        **(dict(confirmation_policy_version=decision.confirmation_policy_version,
+            confirmation_policy_sha256=decision.confirmation_policy_sha256,
+            stock_confirmation=stock.model_dump(mode="json")) if isinstance(decision, IntradaySignalDecision) else {}),
         remaining_capabilities=["QUOTE_PAPER", "EXECUTION"], publication_permission=False,
         execution_permission=False, fill=None)))
     qualified_type = QualifiedTechnicalPackage if technical else QualifiedResumptionPackage if decision.detector_id == "S2" else QualifiedDualOriginPackage

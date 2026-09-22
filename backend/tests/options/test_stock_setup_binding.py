@@ -169,7 +169,32 @@ def test_setup_binding_freezes_exact_package_and_same_session_horizon(structure)
     assert SetupPackageBinding.model_validate_json(result.canonical_json()) == result
 
 
-@pytest.mark.parametrize("mutation", ["manifest", "candidate", "matrix", "identity", "deliverable", "spot", "snapshot",
+@pytest.mark.parametrize("metadata", [{"cfi": "OCASPS"}, {"cfi": "OCASPS", "correction": 1}])
+def test_setup_binding_preserves_standard_reference_metadata(metadata):
+    import json
+    from dataclasses import asdict, replace
+    from options.detector_collection import retained_contract_reference
+    from options.stock_setup_binding import bind_setup_option_package
+
+    inputs = binding_inputs()
+    original = replace(inputs["references"][0], adjustment_metadata_json=json.dumps(metadata),
+        correction=str(metadata["correction"]) if "correction" in metadata else None)
+    row = asdict(original)
+    row.update(underlying=row.pop("underlyer"), eligibility_status="VALIDATED_ACTIVE",
+        additional_underlyings=[], adjustment_metadata=metadata)
+    reference = retained_contract_reference(row)
+    assert json.loads(reference.adjustment_metadata_json) == metadata
+    assert reference.payload_sha256 == original.payload_sha256
+    inputs["references"] = (reference,)
+    assert bind_setup_option_package(**inputs).entry_geometry_status == "PASS"
+    for changes in ({"shares_per_contract": 10}, {"provider_exercise_style": "EUROPEAN"},
+            {"additional_underlyings": [{"ticker": "OTHER"}]}, {"changes_deliverables": True},
+            {"eligibility_status": "REJECTED_UNSUPPORTED"}, {"adjustment_metadata": {"cash_deliverable": 10}}):
+        with pytest.raises(ValueError):
+            retained_contract_reference({**row, **changes})
+
+
+@pytest.mark.parametrize("mutation", ["manifest", "candidate", "matrix", "identity", "deliverable", "unknown_adjustment", "additional_deliverable", "spot", "snapshot",
     "late_reference", "adjusted", "late_bar", "entry_expiry", "overnight", "exit_expiry", "faked_original", "tamper", "stale_mark"])
 def test_setup_binding_rejects_incoherent_package_or_horizon(mutation):
     from dataclasses import replace
@@ -183,6 +208,8 @@ def test_setup_binding_rejects_incoherent_package_or_horizon(mutation):
     if mutation == "matrix": inputs["lineage"] = replace(inputs["lineage"], matrix_id=uuid4())
     if mutation == "identity": inputs["security"] = replace(inputs["security"], security_id=uuid4())
     if mutation == "deliverable": inputs["references"] = (replace(inputs["references"][0], changes_deliverables=True),)
+    if mutation == "unknown_adjustment": inputs["references"] = (replace(inputs["references"][0], adjustment_metadata_json='{"cash_deliverable":10}'),)
+    if mutation == "additional_deliverable": inputs["references"] = (replace(inputs["references"][0], additional_underlyings_json='[{"ticker":"OTHER"}]'),)
     if mutation == "spot": inputs["raw_bars"] = (replace(inputs["raw_bars"][0], close_price=Decimal("99")),)
     if mutation == "snapshot": inputs["snapshots"] = (replace(inputs["snapshots"][0], model_mark=Decimal("6")),)
     if mutation == "late_reference": inputs["references"] = (replace(inputs["references"][0], revised_observed_at=NOW + timedelta(seconds=1)),)

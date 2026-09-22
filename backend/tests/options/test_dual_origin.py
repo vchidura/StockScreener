@@ -137,6 +137,79 @@ def test_o2_known_event_is_context_not_trade_confirmation():
     assert result.package_status == "NOT_APPLICABLE" and result.probability is None
 
 
+def test_o2_causal_source_retains_distinct_trade_clocks_and_oldest_expiry():
+    from dataclasses import replace
+    from options.outcomes import configured_valuation_policy
+    from options.surface_detection import CausalSurfaceSource, assess_surface_first, bind_surface_source
+
+    source, stock, inputs = surface_inputs()
+    original = inputs["snapshots"][0]
+    snapshots = tuple(replace(original, contract_id=point.contract_id, contract_ticker=point.contract_ticker,
+        snapshot_id=point.snapshot_id, strike=point.strike, local_iv=point.local_iv,
+        market_data_time=original.market_data_time + timedelta(seconds=index + 1),
+        mark_market_data_time=original.market_data_time + timedelta(seconds=index + 1))
+        for index, point in enumerate(source.points))
+    lineage = replace(inputs["lineage"], market_time=max(row.market_data_time for row in snapshots))
+    policy = configured_valuation_policy()
+    bound = bind_surface_source(snapshots=snapshots, lineage=lineage, security=inputs["security"],
+        recorded_at=inputs["decision_at"], received_at=inputs["decision_at"], valuation_policy=policy)
+    assert bound.market_time > bound.scheduled_cycle
+    assert bound.spot_market_time == original.spot_market_data_time
+    assert tuple(point.market_time for point in bound.points) == tuple(row.market_data_time for row in snapshots)
+    assert CausalSurfaceSource.model_validate_json(bound.canonical_json()) == bound
+    result = assess_surface_first(bound, stock, market_cutoff=inputs["decision_at"], decision_at=inputs["decision_at"])
+    assert result.finding_disposition == "DETECTED"
+    assert result.valid_until == snapshots[0].market_data_time + timedelta(seconds=min(1800, policy.maximum_source_age_seconds))
+    expired = assess_surface_first(bound, stock, market_cutoff=result.valid_until, decision_at=result.valid_until)
+    assert expired.finding_disposition == "UNAVAILABLE" and not expired.findings
+    for changes in ({"spot_market_time": bound.market_time + timedelta(seconds=1)},
+            {"spot_market_time": bound.spot_market_time - timedelta(seconds=policy.maximum_option_spot_skew_seconds)},
+            {"valuation_policy_sha256": "0" * 64}, {"market_time": bound.market_time - timedelta(seconds=1)}):
+        with pytest.raises(ValueError):
+            CausalSurfaceSource.model_validate({**bound.model_dump(), **changes})
+
+
+@pytest.mark.parametrize("boundary", ["same", "limit", "future", "over_limit"])
+def test_o2_snapshot_clock_policy_boundary(boundary):
+    from dataclasses import replace
+    from options.outcomes import configured_valuation_policy
+    from options.surface_detection import surface_snapshot_eligible
+
+    _, _, inputs = surface_inputs()
+    original = inputs["snapshots"][0]
+    policy = configured_valuation_policy()
+    skew = {"same": 0, "limit": policy.maximum_option_spot_skew_seconds,
+        "future": -1, "over_limit": policy.maximum_option_spot_skew_seconds + 1}[boundary]
+    snapshot = replace(original, spot_market_data_time=original.market_data_time - timedelta(seconds=skew))
+    assert surface_snapshot_eligible(snapshot, valuation_policy=policy) is (boundary in ("same", "limit"))
+
+
+@pytest.mark.parametrize("mutation", ["future_spot", "skew", "policy", "quality", "revision", "mark_source", "late", "spot", "batch", "expiry"])
+def test_o2_causal_binder_keeps_source_quality_and_identity_guards(mutation):
+    from dataclasses import replace
+    from options.domain import DataQualityFlag, MarkSource
+    from options.outcomes import configured_valuation_policy
+    from options.surface_detection import bind_surface_source
+
+    _, _, inputs = surface_inputs()
+    policy = configured_valuation_policy()
+    first = inputs["snapshots"][0]
+    second = replace(first, contract_id=999, snapshot_id=uuid4(), strike=first.strike + 1)
+    if mutation == "future_spot": second = replace(second, spot_market_data_time=first.market_data_time + timedelta(seconds=1))
+    if mutation == "skew": second = replace(second, spot_market_data_time=first.market_data_time - timedelta(seconds=policy.maximum_option_spot_skew_seconds + 1))
+    if mutation == "policy": second = replace(second, valuation_policy_sha256="0" * 64)
+    if mutation == "quality": second = replace(second, quality_flags=(DataQualityFlag.FALLBACK_MARK,))
+    if mutation == "revision": second = replace(second, revised_observed_at=inputs["decision_at"])
+    if mutation == "mark_source": second = replace(second, mark_source=MarkSource.DISPLAY_DAY_CLOSE)
+    if mutation == "late": second = replace(second, first_observed_at=inputs["decision_at"] + timedelta(seconds=1))
+    if mutation == "spot": second = replace(second, spot=first.spot + 1)
+    if mutation == "batch": second = replace(second, batch_id=uuid4())
+    if mutation == "expiry": second = replace(second, expiration_date=first.expiration_date + timedelta(days=1))
+    with pytest.raises(ValueError):
+        bind_surface_source(snapshots=(first, second), lineage=inputs["lineage"], security=inputs["security"],
+            recorded_at=inputs["decision_at"], received_at=inputs["decision_at"], valuation_policy=policy)
+
+
 @pytest.mark.parametrize(("changes", "reason"), [
     ({"open_interest": 0}, "POSITIVE_OPEN_INTEREST_REQUIRED"),
     ({"open_interest": None}, "POSITIVE_OPEN_INTEREST_REQUIRED"),
@@ -197,7 +270,7 @@ def confirmation_inputs():
 @pytest.mark.parametrize(("mutation", "expected"), [
     (None, "CONFIRMED"), ("missing", "UNAVAILABLE"), ("identity", "UNAVAILABLE"),
     ("opposite", "CONTRADICTED"), ("put", "UNMATCHED"), ("zero_oi", "UNAVAILABLE"),
-    ("below", "NOT_DETECTED"), ("future_cutoff", "UNAVAILABLE"),
+    ("below", "NOT_DETECTED"), ("future_cutoff", "UNAVAILABLE"), ("expired_stock", "UNAVAILABLE"),
 ])
 def test_o1_confirms_stock_alignment_without_package_or_publication(mutation, expected):
     from options.dual_origin import assess_options_first
@@ -211,8 +284,10 @@ def test_o1_confirms_stock_alignment_without_package_or_publication(mutation, ex
     if mutation == "below": source = source.model_copy(update={"day_volume": 20})
     cutoff = inputs["decision_at"] if mutation != "future_cutoff" else source.market_time - timedelta(seconds=1)
     result = assess_options_first(source, stock, direction=-1 if mutation == "opposite" else 1,
-        market_cutoff=cutoff, decision_at=inputs["decision_at"])
+        market_cutoff=cutoff, decision_at=stock.valid_until if mutation == "expired_stock" else inputs["decision_at"])
     assert result.disposition == expected, result.reasons
+    if mutation == "expired_stock":
+        assert "STOCK_NOT_READY_AT_DECISION" in result.reasons
     assert result.origin_id == str(result.activity.episode_id)
     assert result.package_status == "NOT_ASSESSED" and not result.execution_permission
     assert type(result).model_validate_json(result.canonical_json()) == result
@@ -239,6 +314,331 @@ def test_s1_retains_exact_stock_episode_and_non_directional_activity_confirmatio
     assert result.origin_detector_version == "range_breakout_acceptance_intraday_v2"
     assert result.confirmation_basis == "MATCHED_CONTRACT_PARTICIPATION_NOT_AGGRESSOR_DIRECTION"
     assert not result.publication_permission and result.package_status == "NOT_ASSESSED"
+
+
+def intraday_confirmation_inputs():
+    from equity.behavior import BehaviorComponent
+    from options.intraday_participation import IntradayStockEvidence
+
+    inputs, source = confirmation_inputs()
+    market = datetime(2026, 9, 18, 14, 45, tzinfo=timezone.utc)
+    decision = market + timedelta(minutes=16)
+    source = source.model_copy(update=dict(market_time=market, volume_session=market.date(),
+        oi_settlement_session=date(2026, 9, 17), oi_observed_at=market + timedelta(minutes=15),
+        observed_at=market + timedelta(minutes=15), recorded_at=decision, received_at=decision,
+        expiration_cutoff=datetime(2026, 10, 16, 20, tzinfo=timezone.utc)))
+    components = []
+    for component in inputs["stock"].components:
+        if component.key not in {"TREND.30m", "PARTICIPATION.1d"}:
+            continue
+        payload = component.model_dump()
+        payload["state"] = None
+        payload["metrics"] = [metric.model_dump() for metric in component.metrics
+                              if metric.definition.metric_id in {"ema50_slope10_atr", "median_dollar_volume20"}]
+        for origin in payload["sources"]:
+            origin.update(market_time=market - timedelta(minutes=15), observed_at=market,
+                recorded_at=market, received_at=market, valid_until=market + timedelta(minutes=30),
+                published_at=None)
+        components.append(BehaviorComponent.model_validate(payload))
+    stock = IntradayStockEvidence(security_id=source.security_id, underlyer=source.underlyer,
+        available_at=market, components=tuple(components))
+    return source, stock, decision
+
+
+@pytest.mark.parametrize(("mutation", "expected"), [
+    (None, "CONFIRMED"), ("missing_trend", "UNAVAILABLE"), ("missing_liquidity", "UNAVAILABLE"),
+    ("future_bar", "UNAVAILABLE"), ("late_receipt", "UNAVAILABLE"), ("expired", "UNAVAILABLE"),
+    ("opposite", "CONTRADICTED"), ("put", "UNMATCHED"), ("zero_oi", "UNAVAILABLE"),
+    ("identity", "UNAVAILABLE"), ("prior_session", "UNAVAILABLE"),
+])
+def test_o1_v2_uses_completed_1030_bar_for_1045_option_without_other_trends(mutation, expected):
+    from options.intraday_participation import IntradayStockEvidence, assess_intraday_participation
+
+    source, stock, decision = intraday_confirmation_inputs()
+    payload = stock.model_dump()
+    if mutation == "missing_trend": payload["components"] = payload["components"][1:]
+    if mutation == "missing_liquidity": payload["components"] = payload["components"][:1]
+    if mutation in {"future_bar", "expired", "prior_session"}:
+        origin = payload["components"][0]["sources"][0]
+        if mutation == "future_bar":
+            origin.update(market_time=source.market_time + timedelta(minutes=15), observed_at=decision,
+                recorded_at=decision, received_at=decision)
+            payload["available_at"] = decision
+        if mutation == "expired": origin["valid_until"] = decision
+        if mutation == "prior_session": origin["market_time"] -= timedelta(days=1)
+    if mutation == "late_receipt": payload["available_at"] = decision + timedelta(seconds=1)
+    if mutation == "identity": payload["underlyer"] = "MSFT"
+    if mutation == "put": source = source.model_copy(update={"contract_type": "PUT"})
+    if mutation == "zero_oi": source = source.model_copy(update={"open_interest": 0})
+    stock = IntradayStockEvidence.model_validate(payload)
+    result = assess_intraday_participation(source, stock, direction=-1 if mutation == "opposite" else 1,
+        market_cutoff=decision, decision_at=decision)
+    assert result.disposition == expected, result.reasons
+    assert result.market_cutoff == source.market_time
+    assert result.policy.version == "option_participation_stock_alignment_v2"
+    assert result.package_status == "NOT_ASSESSED" and not result.execution_permission
+    assert type(result).model_validate_json(result.canonical_json()) == result
+    if mutation is None:
+        assert {gate.gate_id for gate in result.gates} == {"TREND_SLOPE_30m", "UNDERLYING_LIQUIDITY_EVIDENCE"}
+        assert result.gates[0].source_market_times == (source.market_time - timedelta(minutes=15),)
+
+
+def test_o1_v2_rejects_forming_bars_reconstructed_receipts_and_forged_confirmation():
+    from options.intraday_participation import IntradayStockEvidence, assess_intraday_participation
+
+    source, stock, decision = intraday_confirmation_inputs()
+    for mutation in ("forming", "reconstructed", "no_lineage", "hidden_timeframe"):
+        payload = stock.model_dump()
+        origin = payload["components"][0]["sources"][0]
+        if mutation == "forming": origin["completed_bars_only"] = False
+        if mutation == "reconstructed":
+            origin.update(availability_mode="RECONSTRUCTED", history_mode="RECONSTRUCTED_HISTORY",
+                history_available_at=origin["received_at"])
+        if mutation == "no_lineage": payload["components"][0]["sources"] = ()
+        if mutation == "hidden_timeframe": payload["components"][0]["interval"] = "1h"
+        with pytest.raises(ValueError):
+            IntradayStockEvidence.model_validate(payload)
+    result = assess_intraday_participation(source, stock, direction=1, market_cutoff=decision, decision_at=decision)
+    with pytest.raises(ValueError, match="exact timely stock gates"):
+        type(result).model_validate({**result.model_dump(), "gates": ()})
+
+
+def test_o1_v2_component_adapter_does_not_require_other_trends_or_extend_source_expiry():
+    from equity.behavior import BehaviorComponent, StockBehaviorSnapshot
+    from equity.behavior_sources import ADJUSTED_DAILY_HISTORY_POLICY, BEHAVIOR_SOURCE_SELECTION_POLICY
+    from options.intraday_participation import bind_intraday_components, assess_intraday_participation
+
+    inputs, source = confirmation_inputs()
+    payload = inputs["stock"].model_dump()
+    for component in payload["components"]:
+        if component["factor"] == "TREND" and component["interval"] != "30m":
+            component.update(status="UNAVAILABLE", state=None, reason_codes=("TEST_OTHER_TREND_MISSING",), metrics=())
+        for origin in component["sources"]:
+            origin["policy_sha256"] = (BEHAVIOR_SOURCE_SELECTION_POLICY if component["interval"] == "30m" else ADJUSTED_DAILY_HISTORY_POLICY).sha256
+            if component["interval"] == "1d":
+                origin.update(price_basis="PROVIDER_SPLIT_ADJUSTED", source_manifest_sha256="a" * 64)
+    stock = StockBehaviorSnapshot.model_validate(payload)
+    assert stock.assess_at(inputs["decision_at"]).data_status != "READY"
+    projected = bind_intraday_components(stock, received_at=inputs["decision_at"])
+    assert {row.key for row in projected.components} == {"TREND.30m", "PARTICIPATION.1d"}
+    assert projected.carrier_snapshot_sha256 == stock.sha256
+    assert all(len(row.metrics) == 1 for row in projected.components)
+    source = source.model_copy(update={"market_time": inputs["decision_at"]})
+    source = source.model_copy(update={"observed_at": inputs["decision_at"], "recorded_at": inputs["decision_at"]})
+    result = assess_intraday_participation(source, projected, direction=1,
+        market_cutoff=inputs["decision_at"], decision_at=inputs["decision_at"])
+    assert result.disposition == "CONFIRMED", result.reasons
+    deadline = min(origin.valid_until for row in projected.components for origin in row.sources)
+    expired = assess_intraday_participation(source, projected, direction=1,
+        market_cutoff=inputs["decision_at"], decision_at=deadline)
+    assert expired.disposition == "UNAVAILABLE"
+
+
+def test_intraday_launch_requires_its_policy_and_expanded_runtime_pins():
+    from pathlib import Path
+    from options.detector_launch import decode_detector_forward_launch, IntradayDetectorForwardLaunch, INTRADAY_RUNTIME_FILES, _source_hashes
+    from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY
+
+    backend = Path(__file__).resolve().parents[2]
+    from test_equity_behavior_setup import direct_policy, publication_inputs
+    from equity.behavior_setup import DirectResumptionSourcePolicy
+
+    _, _, _, original_policy = publication_inputs()
+    acceptance = direct_policy(original_policy)
+    resumption = DirectResumptionSourcePolicy(instance_id=acceptance.instance_id,
+        instance_policy_sha256=acceptance.instance_policy_sha256, publication_policy_sha256=acceptance.publication_policy_sha256,
+        runtime_sources=acceptance.runtime_sources)
+    launch = IntradayDetectorForwardLaunch(dataset_id="intraday-launch-fixture", effective_from=NOW,
+        underlyers=("AAPL",), configuration_sha256="a" * 64, strategy_policy_sha256="b" * 64,
+        valuation_policy_sha256="c" * 64, stock_ledger="backups/fixture.sqlite", acceptance_source=acceptance,
+        resumption_source=resumption, runtime_sources=_source_hashes(backend, INTRADAY_RUNTIME_FILES),
+        o1_confirmation_policy_sha256=INTRADAY_ALIGNMENT_POLICY.sha256)
+    assert decode_detector_forward_launch(launch.canonical_json()) == launch
+    assert launch.alert_mode == "DEVELOPMENT_OBSERVATIONS"
+    for changes in ({"o1_confirmation_policy_sha256": "0" * 64}, {"runtime_sources": launch.runtime_sources[:-1]}):
+        with pytest.raises(ValueError):
+            IntradayDetectorForwardLaunch.model_validate({**launch.model_dump(), **changes})
+
+
+def test_o1_v2_preserves_package_qualification_and_freezes_confirmation_provenance():
+    import json
+    from options.dual_origin import assess_options_intraday, qualify_dual_origin_package
+    from options.intraday_participation import IntradayStockEvidence
+
+    inputs = technical_qualification_inputs()
+    original, _ = qualify_dual_origin_package(**inputs)
+    stock = inputs["stock"]
+    evidence = IntradayStockEvidence(security_id=stock.security_id, underlyer=stock.ticker,
+        available_at=stock.available_at, components=tuple(row for row in stock.components
+            if row.key in {"TREND.30m", "PARTICIPATION.1d"}))
+    inputs["stock"] = evidence
+    inputs["decision"] = assess_options_intraday(inputs["source"], evidence, direction=1,
+        market_cutoff=inputs["decision"].market_cutoff, decision_at=inputs["decision"].decision_at)
+    package, plan = qualify_dual_origin_package(**inputs)
+    assert package.recurrence_sha256 != original.recurrence_sha256
+    assert package.exposure_sha256 == original.exposure_sha256
+    payload = json.loads(plan.payload_json)
+    assert payload["confirmation_policy_version"] == "option_participation_stock_alignment_v2"
+    assert payload["stock_confirmation"] == evidence.model_dump(mode="json")
+    assert payload["management_policy"]["technical_exit"]
+
+
+def test_o1_intraday_signal_version_retains_v1_and_exact_gate_policy():
+    from options.dual_origin import assess_options_intraday, load_signal_decision, SignalDecision
+
+    source, stock, decision = intraday_confirmation_inputs()
+    result = assess_options_intraday(source, stock, direction=1, market_cutoff=decision, decision_at=decision)
+    assert result.disposition == "CONFIRMED" and result.schema_version == "dual_origin_signal_decision_v3"
+    assert load_signal_decision(result) == result
+    with pytest.raises(ValueError):
+        SignalDecision.model_validate(result.model_dump())
+    for changes in ({"gates": ()}, {"confirmation_policy_sha256": "0" * 64}):
+        with pytest.raises(ValueError):
+            type(result).model_validate({**result.model_dump(), **changes})
+
+
+def test_o2_retained_sample_uses_first_run_and_does_not_select_on_followup():
+    from types import SimpleNamespace
+    from options.analytics.alert_selection import build_surface_evidence
+    from options.surface_detection import assess_surface_first
+    from scripts.report_stock_behavior_coverage import surface_observation_sample
+
+    source, stock, inputs = surface_inputs()
+    observation = assess_surface_first(source, stock, market_cutoff=inputs["decision_at"], decision_at=inputs["decision_at"])
+    records = build_surface_evidence((observation,), dataset_id="o2-sample-fixture", selected_at=inputs["decision_at"])
+    record = records[0]
+    first = SimpleNamespace(dataset_id=record.dataset_id, run_id=record.run_id,
+        scheduled_cycle=record.scheduled_cycle, selected_at=record.selected_at)
+    subsequent = observation.model_copy(update=dict(scheduled_cycle=observation.scheduled_cycle + timedelta(minutes=15),
+        decision_at=observation.decision_at + timedelta(minutes=15), market_cutoff=observation.market_cutoff + timedelta(minutes=15),
+        valid_until=observation.valid_until + timedelta(minutes=15), findings=(), finding_disposition="NOT_DETECTED"))
+    later_records = build_surface_evidence((subsequent,), dataset_id=record.dataset_id, selected_at=subsequent.decision_at)
+    later = SimpleNamespace(dataset_id=record.dataset_id, run_id=later_records[0].run_id,
+        scheduled_cycle=subsequent.scheduled_cycle, selected_at=subsequent.decision_at)
+    baseline = surface_observation_sample(((first, records),))
+    report = surface_observation_sample(((later, later_records), (first, records)))
+    assert len(report["selected"]) == 1
+    selected = report["selected"][0]
+    assert selected["snapshot_id"] == baseline["selected"][0]["snapshot_id"]
+    assert selected["followup_observations"][0]["status"] == "NOT_REDETECTED_IN_RETAINED_COHORT"
+    assert selected["followup_observations"][0]["residual_iv_points"] is None
+    assert selected["outcome_status"] == "NOT_BOUND_TO_PROSPECTIVE_OUTCOMES"
+    assert not report["publication_permission"] and not report["execution_permission"]
+    assert surface_observation_sample(())["selected"] == []
+    with pytest.raises(ValueError):
+        surface_observation_sample(((first, records),), limit=6)
+
+
+def test_o2_sample_followup_rejects_changed_membership_clocks_and_measurements():
+    import json
+    from copy import deepcopy
+    from types import SimpleNamespace
+    from options.analytics.alert_selection import build_surface_evidence
+    from options.surface_detection import assess_surface_first
+    from scripts.report_stock_behavior_coverage import surface_observation_sample, validate_surface_sample_seed
+
+    source, stock, inputs = surface_inputs()
+    observation = assess_surface_first(source, stock, market_cutoff=inputs["decision_at"], decision_at=inputs["decision_at"])
+    records = build_surface_evidence((observation,), dataset_id="o2-followup-fixture", selected_at=inputs["decision_at"])
+    run = SimpleNamespace(dataset_id=records[0].dataset_id, run_id=records[0].run_id,
+        scheduled_cycle=records[0].scheduled_cycle, selected_at=records[0].selected_at)
+    sample = surface_observation_sample(((run, records),))
+    sample.update(dataset_id=run.dataset_id, evidence_basis="ORIGINAL_HASH_VERIFIED_COMPLETED_RUNS")
+    sample = json.loads(json.dumps(sample, default=str))
+    assert len(validate_surface_sample_seed(sample, run, records)) == 1
+    for field in ("contract_id", "published_at", "robust_z", "evaluation_sha256"):
+        changed = deepcopy(sample)
+        changed["selected"][0][field] = "changed"
+        with pytest.raises(ValueError, match="changed"):
+            validate_surface_sample_seed(changed, run, records)
+
+
+def test_o2_checkpoint_reader_keeps_causal_bounds_and_does_not_fallback_for_missing_contract():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from scripts.report_stock_behavior_coverage import read_surface_checkpoint_rows
+
+    cursor = MagicMock()
+    matrix = dict(matrix_id=uuid4(), batch_id=uuid4(), market_time=MARKET, observed_time=NOW)
+    cursor.fetchone.return_value = matrix
+    cursor.fetchall.return_value = ()
+    run = SimpleNamespace(configuration_sha256="a" * 64, market_policy_sha256="b" * 64, scheduled_cycle=MARKET)
+    result = read_surface_checkpoint_rows(cursor, run=run, underlying="SPY", expiration=date(2026, 9, 25),
+        contract_type="PUT", checkpoint_at=NOW)
+    assert result == (matrix, ())
+    assert cursor.execute.call_count == 2
+    query, parameters = cursor.execute.call_args.args
+    assert "created_at<=%s" in query and "LIMIT 5001" in query
+    assert parameters[-2:] == (NOW, NOW)
+
+
+def surface_checkpoint_inputs():
+    from dataclasses import replace
+    from math import log
+    from options.outcomes import configured_valuation_policy
+
+    inputs, _ = package_handoff_inputs()
+    original = inputs["snapshots"][0]
+    baseline, followup = [], []
+    batch = uuid4()
+    for index in range(13):
+        strike = 92 + 2 * index
+        moneyness = log(strike / float(original.spot))
+        smooth = .28 + .35 * moneyness ** 2 - .15 * moneyness
+        perturbation = ((index % 3) - 1) * .001
+        row = replace(original, contract_id=100 + index, snapshot_id=uuid4(),
+            contract_ticker=f"O:FIXTURE{index}", strike=Decimal(strike), local_iv=smooth + perturbation)
+        baseline.append(replace(row, local_iv=row.local_iv + (.02 if strike in (100, 102) else 0)))
+        followup.append(replace(row, snapshot_id=uuid4(), batch_id=batch,
+            market_data_time=row.market_data_time + timedelta(minutes=15),
+            mark_market_data_time=row.mark_market_data_time + timedelta(minutes=15),
+            spot_market_data_time=row.spot_market_data_time + timedelta(minutes=15),
+            first_observed_at=row.first_observed_at + timedelta(minutes=15)))
+    return dict(baseline_peers=tuple(baseline), snapshots=tuple(followup), contract_id=104,
+        checkpoint_at=original.market_data_time + timedelta(minutes=16), valuation_policy=configured_valuation_policy())
+
+
+def test_o2_fixed_checkpoint_measures_below_threshold_without_treating_it_as_missing():
+    from options.analytics.surface_followup import measure_surface_checkpoint
+
+    result = measure_surface_checkpoint(**surface_checkpoint_inputs())
+    assert result["status"] == "MEASURED_FIXED_PEERS"
+    assert result["baseline_fit"]["meets_original_distortion_rule"]
+    assert not result["fixed_peer_fit"]["meets_original_distortion_rule"]
+    assert result["absolute_residual_change_iv_points"] < 0
+    assert result["fixed_peer_fit"]["residual_iv_points"] is not None
+
+
+@pytest.mark.parametrize(("mutation", "reason"), [
+    ("absent", "CONTRACT_ABSENT_FROM_LATEST_MATRIX"), ("duplicate", "AMBIGUOUS_CONTRACT_SNAPSHOTS"),
+    ("future", "SOURCE_NOT_AVAILABLE_AT_CHECKPOINT"), ("stale", "COHORT_EXPIRED_AT_CHECKPOINT"),
+    ("unchanged", "NO_NEW_OPTION_MARK"), ("policy", "VALUATION_BASIS_CHANGED"),
+    ("revision", "TARGET_SOURCE_INELIGIBLE"), ("identity", "CONTRACT_IDENTITY_CHANGED"),
+    ("missing_peer", "ORIGINAL_PEER_COHORT_INCOMPLETE"),
+])
+def test_o2_fixed_checkpoint_retains_missingness_and_exact_source_constraints(mutation, reason):
+    from dataclasses import replace
+    from options.analytics.surface_followup import measure_surface_checkpoint
+
+    inputs = surface_checkpoint_inputs()
+    rows = list(inputs["snapshots"])
+    if mutation == "absent": rows = [row for row in rows if row.contract_id != inputs["contract_id"]]
+    if mutation == "duplicate": rows.append(rows[4])
+    if mutation == "future": rows[4] = replace(rows[4], first_observed_at=inputs["checkpoint_at"] + timedelta(seconds=1))
+    if mutation == "stale": inputs["checkpoint_at"] += timedelta(minutes=30)
+    if mutation == "unchanged": rows = list(inputs["baseline_peers"])
+    if mutation == "policy": rows[4] = replace(rows[4], valuation_policy_sha256="0" * 64)
+    if mutation == "revision": rows[4] = replace(rows[4], revised_observed_at=inputs["checkpoint_at"])
+    if mutation == "identity": rows[4] = replace(rows[4], shares_per_contract=10)
+    if mutation == "missing_peer": rows = rows[1:]
+    result = measure_surface_checkpoint(**{**inputs, "snapshots": tuple(rows)})
+    assert result["reason"] == reason
+    assert result["absolute_residual_change_iv_points"] is None
+    assert result["fixed_peer_fit"] is None
+    if mutation != "missing_peer":
+        assert result["available_original_peer_count"] is None
+    if mutation == "revision":
+        assert result["target_revised_observed_at"] == inputs["checkpoint_at"]
 
 
 def test_s1_rejects_untrusted_policy_and_o1_rejects_forged_pass():
@@ -667,7 +1067,8 @@ def test_zero_run_repository_writes_header_and_never_invents_members(monkeypatch
 
 
 @pytest.mark.parametrize("model", ["S1", "S2"])
-def test_production_assembler_qualifies_exact_inputs_and_blocks_known_events(model):
+@pytest.mark.parametrize("stock_window", ["legacy", "ready", "missing"])
+def test_production_assembler_qualifies_exact_inputs_and_blocks_known_events(model, stock_window, tmp_path):
     from dataclasses import asdict
     from types import SimpleNamespace
     from options.detector_collection import DetectorCycleCollector, ProductionDetectorSourceReader
@@ -686,7 +1087,7 @@ def test_production_assembler_qualifies_exact_inputs_and_blocks_known_events(mod
     for leg, original in zip(candidate.legs, inputs["references"]):
         reference = asdict(original)
         reference.update(contract_id=leg.contract_id, underlying=reference.pop("underlyer"),
-            eligibility_status="VALIDATED_ACTIVE", additional_underlyings=[], adjustment_metadata={})
+            eligibility_status="VALIDATED_ACTIVE", additional_underlyings=[], adjustment_metadata={"cfi": "OCASPS"})
         references.append(reference)
     bars = tuple(dict(asdict(bar), created_at=created) for bar, created in zip(inputs["raw_bars"], inputs["raw_bar_created_ats"]))
     retained = dict(matrices=(dict(underlying=candidate.underlyer, matrix_id=candidate.matrix_id,
@@ -704,9 +1105,20 @@ def test_production_assembler_qualifies_exact_inputs_and_blocks_known_events(mod
     technical = dict(sources=(structure,), bars=bars, events=(), coverage=())
     repository = SimpleNamespace(detector_package_sources=lambda **_: dict(candidates=(row,), legs=legs, references=references, raw_bars=bars),
         detector_technical_sources=lambda **_: technical)
+    def setups(**arguments):
+        if stock_window == "legacy":
+            return (inputs["setup"],)
+        assert arguments["market_cutoffs"] == {candidate.underlyer: max(lineage.scheduled_cycle, lineage.market_time)}
+        if stock_window == "missing":
+            from equity.stock_alert_results import read_direct_stock_setup_windows
+            from options.detector_launch import aligned_stock_windows
+
+            return read_direct_stock_setup_windows(tmp_path / "absent.sqlite", policies=(inputs["setup"].source_policy,),
+                windows=aligned_stock_windows(arguments["market_cutoffs"]), as_of=arguments["as_of"], clock=lambda: clock)
+        return (inputs["setup"],), {}
     reader = ProductionDetectorSourceReader(SimpleNamespace(read=lambda **_: retained), repository,
         SimpleNamespace(latest_covered_actions=lambda *_, **__: ({"coverage": True}, ())),
-        setup_reader=lambda **_: (inputs["setup"],), clock=lambda: clock)
+        setup_reader=setups, clock=lambda: clock, aligned_setup_windows=stock_window != "legacy")
     configuration = detector_run_inputs()["configuration"]
     configuration.valuation_policy = inputs["valuation_policy"]
     configuration.valuation_policy_sha256 = inputs["valuation_policy"].policy_sha256
@@ -714,15 +1126,38 @@ def test_production_assembler_qualifies_exact_inputs_and_blocks_known_events(mod
     collector = DetectorCycleCollector(reader, SimpleNamespace(prior_selected=lambda **_: {}), clock=lambda: clock)
     arguments = dict(configuration=configuration, dataset_id="production-assembler-fixture",
         scheduled_cycle=lineage.scheduled_cycle, completed_matrices={candidate.underlyer: candidate.matrix_id}, started_at=clock)
+    from scripts.report_stock_behavior_coverage import package_binding_diagnostic
+    diagnostic = package_binding_diagnostic(retained, repository.detector_package_sources())
+    assert diagnostic["package_reasons"] == {"EXACT_PACKAGE_SOURCES_AVAILABLE": 1}
+    unavailable = package_binding_diagnostic(retained, {**repository.detector_package_sources(), "references": (), "raw_bars": ()})
+    assert unavailable["package_reasons"] == {"CAUSAL_REFERENCE_UNAVAILABLE": 1, "EXACT_RAW_SPOT_UNAVAILABLE": 1}
     run, records = collector(**arguments)
-    assert {record.detector_id for record in records} == {"O1", model}, dict(run.rejections)
+    expected = {"O1"} if stock_window == "missing" else {"O1", model}
+    assert {record.detector_id for record in records} == expected, dict(run.rejections)
+    if stock_window == "missing":
+        assert dict(run.rejections)["S1_STOCK_SOURCE_UNAVAILABLE"] == 1
+        assert dict(run.rejections)["S2_STOCK_SOURCE_UNAVAILABLE"] == 1
+        assert not (tmp_path / "absent.sqlite").exists()
+        retained["surface_inputs"] = ("unchanged-O2-source",)
+        assert reader(**arguments).surface_inputs == retained["surface_inputs"]
+        retained["surface_inputs"] = ()
     assert run.schema_version == "option_detector_run_v2"
     technical["events"] = (dict(source="fixture", source_key="event", event_type="EARNINGS",
         affected_underlying=candidate.underlyer, first_observed_at=clock, scheduled_time=clock + timedelta(minutes=30),
         market_event_id=uuid4(), status="SCHEDULED", confidence="CONFIRMED"),)
     technical["coverage"] = ()
     blocked, rows = collector(**arguments)
-    assert rows == () and dict(blocked.rejections)["KNOWN_EVENT_IN_HOLDING_WINDOW"] == 2
+    assert rows == () and dict(blocked.rejections)["KNOWN_EVENT_IN_HOLDING_WINDOW"] == len(expected)
+    technical.update(events=(), sources=(), bars=(), source_error="O1_TECHNICAL_SOURCE_TIMEOUT")
+    partial, rows = collector(**arguments)
+    assert {record.detector_id for record in rows} == (set() if stock_window == "missing" else {model})
+    assert dict(partial.rejections)["O1_TECHNICAL_SOURCE_TIMEOUT"] == 1
+    retained["activity"][0]["stock"] = None
+    def unconfirmed_sources(**arguments):
+        assert arguments["technical_underlyers"] == ()
+        return dict(events=(), coverage=(), sources=(), bars=())
+    repository.detector_technical_sources = unconfirmed_sources
+    collector(**arguments)
 
 
 def test_production_structural_source_rejects_atr_only_or_adjusted_levels():
@@ -768,6 +1203,34 @@ def test_retained_candidate_decoder_preserves_original_terms():
         retained_candidate(row, legs)
 
 
+def test_detector_attempt_reader_requires_explicit_scoped_status(tmp_path):
+    import json
+    from types import SimpleNamespace
+    from options.repositories.alert_review_sources import detector_attempt_status
+
+    launch = SimpleNamespace(dataset_id="fixture", configuration_sha256="a" * 64, effective_from=NOW - timedelta(hours=1))
+    path = tmp_path / "backups/options-worker/detector-status.json"
+    assert detector_attempt_status(launch=launch, as_of=NOW, backend_dir=tmp_path) == dict(available=False, attempts=[])
+    path.parent.mkdir(parents=True)
+    cycle = NOW - timedelta(minutes=15)
+    row = dict(scheduled_cycle=cycle.isoformat(), started_at=cycle.isoformat(), finished_at=NOW.isoformat(),
+        status="FAILED", reason="DETECTOR_SOURCE_TIMEOUT")
+    payload = dict(version="option_detector_operational_status_v1", dataset_id="fixture",
+        configuration_sha256="a" * 64, attempts=[row])
+    path.write_text(json.dumps(payload))
+    result = detector_attempt_status(launch=launch, as_of=NOW, backend_dir=tmp_path)
+    assert result["available"] and result["attempts"][0]["status"] == "FAILED"
+    assert not detector_attempt_status(launch=launch, as_of=NOW, completed=[cycle], backend_dir=tmp_path)["attempts"]
+    for changes in ({"dataset_id": "old"}, {"configuration_sha256": "b" * 64}, {"attempts": [row, row]},
+            {"attempts": [{**row, "finished_at": (NOW + timedelta(seconds=1)).isoformat()}]}, {"attempts": [row] * 97}):
+        path.write_text(json.dumps({**payload, **changes}))
+        assert not detector_attempt_status(launch=launch, as_of=NOW, backend_dir=tmp_path)["available"]
+    row.update(status="RUNNING", finished_at=None, started_at=(NOW - timedelta(minutes=40)).isoformat(),
+        scheduled_cycle=(NOW - timedelta(minutes=45)).isoformat())
+    path.write_text(json.dumps(payload))
+    assert detector_attempt_status(launch=launch, as_of=NOW, backend_dir=tmp_path)["attempts"][0]["status"] == "UNVERIFIED"
+
+
 def test_detector_package_source_queries_are_bounded_read_only(monkeypatch):
     from contextlib import contextmanager
     from unittest.mock import MagicMock
@@ -782,10 +1245,89 @@ def test_detector_package_source_queries_are_bounded_read_only(monkeypatch):
     monkeypatch.setattr(repository, "_cursor", read)
     assert repository.detector_package_sources(configuration=detector_run_inputs()["configuration"],
         candidate_ids=(), as_of=NOW) == dict(candidates=(), legs=(), references=(), raw_bars=())
+    reference_query = next(call for call in cursor.execute.call_args_list if "option_contract_catalog_versions" in call.args[0])
+    assert "version.valid_from<=candidate.market_data_time" in reference_query.args[0]
+    assert "version.valid_to>candidate.market_data_time" in reference_query.args[0]
+    assert "version.first_observed_at)<=candidate.observed_time" in reference_query.args[0]
+    assert "JOIN LATERAL" in reference_query.args[0]
+    assert "version.catalog_version_id DESC LIMIT 1" in reference_query.args[0]
+    assert reference_query.args[1][0] == []
     for call in cursor.execute.call_args_list:
         assert call.args[0].strip().startswith(("SET", "SELECT"))
         if len(call.args) > 1:
             assert call.args[0].count("%s") == len(call.args[1])
+
+
+def test_optional_technical_timeout_preserves_event_read_and_unrelated_models(monkeypatch):
+    from contextlib import contextmanager
+    from unittest.mock import MagicMock
+    from psycopg2.errors import QueryCanceled
+    from options.repositories.stock_behavior_assessments import OptionStockBehaviorAssessmentRepository
+
+    cursor = MagicMock()
+    source = dict(feature_bar_ids=(uuid4(),))
+    event = dict(status="SCHEDULED", affected_underlying="AAPL")
+    cursor.fetchall.side_effect = [[source], [event], [{"coverage": True}]]
+    @contextmanager
+    def read():
+        yield cursor
+    repository = OptionStockBehaviorAssessmentRepository()
+    monkeypatch.setattr(repository, "_cursor", read)
+    monkeypatch.setattr(repository, "_technical_bars", MagicMock(side_effect=QueryCanceled("timeout")))
+    result = repository.detector_technical_sources(underlyers=("AAPL", "SPY"), technical_underlyers=("AAPL",), market_cutoff=NOW, as_of=NOW)
+    assert result["sources"] == result["bars"] == ()
+    assert result["events"] == (event,) and result["coverage"] == ({"coverage": True},)
+    assert result["source_error"] == "O1_TECHNICAL_SOURCE_TIMEOUT"
+    select_calls = [call for call in cursor.execute.call_args_list if call.args[0].startswith("SELECT")]
+    assert select_calls[0].args[1][0] == ["AAPL"]
+    assert select_calls[1].args[1][0] == ["AAPL", "SPY"]
+    assert any(call.args[0] == "ROLLBACK TO SAVEPOINT detector_optional_structure" for call in cursor.execute.call_args_list)
+    repository._technical_bars.reset_mock()
+    cursor.fetchall.side_effect = [[], [event], []]
+    result = repository.detector_technical_sources(underlyers=("AAPL",), technical_underlyers=(), market_cutoff=NOW, as_of=NOW)
+    repository._technical_bars.assert_not_called()
+    assert result["events"] == (event,)
+
+
+def test_technical_bar_lookup_retries_same_snapshot_under_one_budget():
+    from unittest.mock import MagicMock
+    from options.repositories.stock_behavior_assessments import OptionStockBehaviorAssessmentRepository
+    from psycopg2.errors import QueryCanceled
+
+    cursor = MagicMock()
+    ids = [uuid4() for _ in range(1001)]
+    cursor.fetchall.return_value = [{"bar_start": NOW, "bar_revision_id": ids[0]}]
+    attempts = []
+    def execute(query, parameters=None):
+        if query.startswith("SELECT"):
+            attempts.append(parameters)
+            if len(attempts) == 1:
+                raise QueryCanceled("transient query timeout")
+    cursor.execute.side_effect = execute
+    clock = iter([0., 0.1, 2.1, 2.2])
+    rows = OptionStockBehaviorAssessmentRepository._technical_bars(cursor, ids, NOW, clock=lambda: next(clock))
+    queries = [call for call in cursor.execute.call_args_list if call.args[0].startswith("SELECT")]
+    assert len(queries) == 2 and all(call.args[1][0] == ids for call in queries)
+    assert all(call.args[1][1:] == (NOW, NOW) for call in queries)
+    assert all("NOT adjusted AND is_final" in call.args[0] and "quality_codes=ARRAY[]::text[]" in call.args[0] for call in queries)
+    assert rows[0]["bar_revision_id"] == ids[0]
+    timeouts = [call.args[1][0] for call in cursor.execute.call_args_list if len(call.args) > 1 and call.args[0].startswith("SET")]
+    assert timeouts == [2000, 2900]
+    assert any(call.args[0] == "ROLLBACK TO SAVEPOINT detector_technical_bar_read" for call in cursor.execute.call_args_list)
+    cursor.reset_mock()
+    attempts.clear()
+    clock = iter([0., 0., 5.1])
+    with pytest.raises(QueryCanceled, match="five-second budget"):
+        OptionStockBehaviorAssessmentRepository._technical_bars(cursor, ids, NOW, clock=lambda: next(clock))
+    assert sum(call.args[0].startswith("SELECT") for call in cursor.execute.call_args_list) == 1
+    cursor.reset_mock()
+    def fail(query, parameters=None):
+        if query.startswith("SELECT"):
+            raise ValueError("not a timeout")
+    cursor.execute.side_effect = fail
+    with pytest.raises(ValueError, match="not a timeout"):
+        OptionStockBehaviorAssessmentRepository._technical_bars(cursor, ids, NOW, clock=lambda: 0)
+    assert sum(call.args[0].startswith("SELECT") for call in cursor.execute.call_args_list) == 1
 
 
 def test_detector_cycle_sources_read_only_exact_scope_and_bounds(monkeypatch):
@@ -842,6 +1384,8 @@ def test_retained_detector_sources_bind_actual_receipts_and_dated_oi(monkeypatch
         SimpleNamespace(get_behavior_as_of=lambda *_, **__: stock), clock=lambda: clock)
     arguments = dict(configuration=detector_run_inputs()["configuration"], scheduled_cycle=lineage.scheduled_cycle,
         completed_matrices={"AAPL": lineage.matrix_id}, as_of=clock)
+    from options.outcomes import configured_valuation_policy
+    arguments["configuration"].valuation_policy = configured_valuation_policy()
     result = reader.read(**arguments)
     assert result["received_at"] == clock and len(result["activity"]) == 1
     assert result["activity"][0]["source"].oi_observed_at == fact["open_interest_observed_at"]
@@ -863,19 +1407,26 @@ def test_retained_surface_source_excludes_bad_point_without_poisoning_valid_grou
     source, stock, inputs = surface_inputs()
     original = inputs["snapshots"][0]
     points = [replace(original, contract_id=point.contract_id, contract_ticker=point.contract_ticker,
-        snapshot_id=point.snapshot_id, strike=point.strike, local_iv=point.local_iv) for point in source.points]
+        snapshot_id=point.snapshot_id, strike=point.strike, local_iv=point.local_iv,
+        market_data_time=original.market_data_time + timedelta(seconds=index + 1),
+        mark_market_data_time=original.market_data_time + timedelta(seconds=index + 1)) for index, point in enumerate(source.points)]
     points.append(replace(original, contract_id=9999, snapshot_id=uuid4(), quality_flags=(DataQualityFlag.FALLBACK_MARK,)))
     clock, lineage = inputs["decision_at"], inputs["lineage"]
+    lineage = replace(lineage, market_time=max(point.market_data_time for point in points))
     retained = dict(matrices=({**asdict(lineage), "batch_id": original.batch_id, "created_at": clock},),
         snapshots=tuple(dict(snapshot=point, created_at=clock) for point in points), open_interest=(), candidates=())
     monkeypatch.setattr("options.repositories.snapshots._snapshot", lambda row: row["snapshot"])
     reader = RetainedDetectorSourceReader(SimpleNamespace(detector_cycle_sources=lambda **_: retained),
         SimpleNamespace(get_security_as_of=lambda *_: inputs["security"]),
         SimpleNamespace(get_behavior_as_of=lambda *_, **__: stock), clock=lambda: clock)
-    result = reader.read(configuration=detector_run_inputs()["configuration"], scheduled_cycle=lineage.scheduled_cycle,
+    from options.outcomes import configured_valuation_policy
+    configuration = detector_run_inputs()["configuration"]
+    configuration.valuation_policy = configured_valuation_policy()
+    result = reader.read(configuration=configuration, scheduled_cycle=lineage.scheduled_cycle,
         completed_matrices={"AAPL": lineage.matrix_id}, as_of=clock)
     assert len(result["surface_inputs"]) == 1
     assert len(result["surface_inputs"][0]["source"].points) == len(source.points)
+    assert result["surface_inputs"][0]["source"].schema_version == "option_local_surface_source_v2"
     assert result["rejections"]["SURFACE_POINT_INELIGIBLE"] == 1
 
 
@@ -931,6 +1482,74 @@ def test_forward_detector_launch_rejects_unreviewed_policy_and_runtime(tmp_path)
     changed = launch.model_copy(update={"valuation_policy_sha256": "0" * 64})
     with pytest.raises(ValueError, match="reviewed configuration"):
         validate_detector_forward_launch(changed, configuration=configuration, backend_dir=backend)
+
+
+def test_launch_preparation_requires_explicit_stock_transition_and_preserves_source(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import sqlite3
+    import zlib
+    from pathlib import Path
+    from options.config import load_option_runtime_configuration
+    from options.detector_launch import RUNTIME_FILES, prepare_detector_forward_launch, decode_detector_forward_launch, validate_detector_forward_launch
+    from research.stock_idea_forward import forward_config, runtime_sources
+    from research.stock_idea_engine import digest
+    from test_equity_behavior_setup import direct_ledger_fixture
+
+    path, _, publication, _ = direct_ledger_fixture(tmp_path)
+    config = forward_config(quality_version=2)
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE forward_manifest SET policy_hash=?,payload=?", (digest(config), json.dumps(config)))
+        publication["runtime_sources"] = {name: "0" * 64 for name in runtime_sources()}
+        publication["policy_hash"] = digest(config)
+        connection.execute("INSERT INTO forward_publications VALUES(?,?)", (publication["window_key"], zlib.compress(json.dumps(publication).encode())))
+    for name in set(RUNTIME_FILES) | set(runtime_sources()):
+        source = tmp_path / name
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("reviewed fixture", encoding="utf-8")
+    configuration = load_option_runtime_configuration(dict(POLYGON_API_KEY="fixture",
+        OPTION_STRATEGY_POLICY_FILE="options/policies/strategy_technical_forward_v1.json",
+        OPTION_VALUATION_POLICY_FILE="options/policies/valuation_raw_spot_v2.json"), Path(__file__).resolve().parents[2])
+    arguments = dict(backend_dir=tmp_path, configuration=configuration, dataset_id="parallel-start-fixture",
+        effective_from=NOW, stock_ledger=path.name)
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="revalidation required"):
+        prepare_detector_forward_launch(**arguments)
+    launch = prepare_detector_forward_launch(**arguments, approve_stock_runtime_transition=True)
+    assert launch.schema_version == "option_detector_forward_launch_v2"
+    assert decode_detector_forward_launch(launch.canonical_json()) == launch
+    assert dict(launch.acceptance_source.runtime_sources) != publication["runtime_sources"]
+    assert launch.acceptance_source.runtime_sources == launch.resumption_source.runtime_sources
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    original_payload = json.loads(launch.canonical_json())
+    original_payload.pop("stock_readiness_policy")
+    original_payload["schema_version"] = "option_detector_forward_launch_v1"
+    original = decode_detector_forward_launch(json.dumps(original_payload))
+    assert decode_detector_forward_launch(original.canonical_json()).sha256 == original.sha256
+    missing_source = launch.model_copy(update={"stock_ledger": "absent.sqlite"})
+    assert validate_detector_forward_launch(missing_source, configuration=configuration, backend_dir=tmp_path) == missing_source
+    assert not (tmp_path / "absent.sqlite").exists()
+    with pytest.raises(ValueError, match="ledger is unavailable"):
+        validate_detector_forward_launch(original.model_copy(update={"stock_ledger": "absent.sqlite"}), configuration=configuration, backend_dir=tmp_path)
+    monkeypatch.setattr("research.stock_idea_forward.forward_config", lambda **_: dict(config, policy_version="changed"))
+    with pytest.raises(ValueError, match="enrolled policy"):
+        prepare_detector_forward_launch(**arguments, approve_stock_runtime_transition=True)
+
+
+@pytest.mark.parametrize("cutoff,expected", [
+    ("2026-09-21T13:59:59+00:00", None),
+    ("2026-09-21T14:00:00+00:00", "2026-09-21T14:00:00+00:00"),
+    ("2026-09-21T14:29:59+00:00", "2026-09-21T14:00:00+00:00"),
+    ("2026-09-21T14:30:00+00:00", "2026-09-21T14:30:00+00:00"),
+    ("2026-11-27T18:20:00+00:00", "2026-11-27T18:00:00+00:00"),
+    ("2026-09-20T15:00:00+00:00", None),
+])
+def test_stock_windows_follow_market_clock_without_double_provider_delay(cutoff, expected):
+    from options.detector_launch import aligned_stock_windows
+
+    cutoff = datetime.fromisoformat(cutoff)
+    result = aligned_stock_windows({"AAPL": cutoff})["AAPL"]
+    assert result == (cutoff, datetime.fromisoformat(expected) if expected else None)
 
 
 def test_forward_worker_refuses_older_slots_without_provider_work():
@@ -1088,7 +1707,39 @@ def test_eod_selection_comparison_preserves_exclusions_and_missing_outcomes():
     assert all(model["measured"] is None for model in result["models"])
 
 
+def test_detector_alert_reader_exposes_only_detected_o2_without_package_queries():
+    from types import SimpleNamespace
+    from options.analytics.alert_selection import build_surface_evidence
+    from options.analytics.behavior_review import build_detector_alert_review
+    from options.surface_detection import assess_surface_first
+
+    source, stock, inputs = surface_inputs()
+    observation = assess_surface_first(source, stock, market_cutoff=inputs["decision_at"], decision_at=inputs["decision_at"])
+    record = build_surface_evidence((observation,), dataset_id="observation-ui", selected_at=inputs["decision_at"])[0]
+    run = SimpleNamespace(run_id=record.run_id, scheduled_cycle=record.scheduled_cycle,
+        selected_at=record.selected_at, market_time=source.market_time, observed_time=source.observed_at,
+        expected_underlyers=(source.underlyer,), source_matrices=((source.underlyer, source.matrix_id),),
+        selection_counts=(("SELECTED", 0), ("REPEAT", 0), ("NOT_SELECTED", 0), ("OBSERVATION", 1)), rejections=())
+    calls = []
+    repo = SimpleNamespace(completed_runs=lambda **_: (run,), completed_run=lambda **_: (run, (record,)),
+        repeat_counts=lambda **kwargs: calls.append(kwargs["records"]) or {})
+    review = build_detector_alert_review(dataset_id=record.dataset_id, as_of=record.selected_at,
+        detector="O2", repository=repo)
+    assert review["total"] == review["detected_observations"] == 1
+    assert calls == [[]]
+    row = review["rows"][0]
+    assert row["candidate_id"] is row["entry_limit"] is row["net_return"] is row["fill"] is None
+    assert row["observation"]["findings"] and row["outcome_status"] == "NOT_APPLICABLE_OBSERVATION"
+    assert build_detector_alert_review(dataset_id=record.dataset_id, as_of=record.selected_at,
+        detector="O1", repository=repo)["total"] == 0
+    empty = record.model_copy(update={"observation": observation.model_copy(update={"findings": (), "finding_disposition": "NOT_DETECTED"})})
+    repo.completed_run = lambda **_: (run, (empty,))
+    assert build_detector_alert_review(dataset_id=record.dataset_id, as_of=record.selected_at,
+        repository=repo)["total"] == 0
+
+
 def test_detector_alert_reader_zero_latest_keeps_original_history_and_hits():
+    import json
     from types import SimpleNamespace
     from options.analytics.alert_selection import DetectorRunEvidence, build_detector_run
     from options.analytics.behavior_review import build_detector_alert_review
@@ -1098,6 +1749,7 @@ def test_detector_alert_reader_zero_latest_keeps_original_history_and_hits():
     latest = DetectorRunEvidence.model_validate({**first.model_dump(),
         "scheduled_cycle": first.scheduled_cycle + timedelta(minutes=15),
         "selected_at": first.selected_at + timedelta(minutes=15), "record_sha256s": (),
+        "rejections": (("O1_STOCK_CONFIRMATION_UNAVAILABLE", 5), ("SURFACE_POINT_INELIGIBLE", 20)),
         "selection_counts": tuple((status, 0) for status, _ in first.selection_counts)})
     repo = SimpleNamespace(completed_runs=lambda **_: (first, latest),
         completed_run=lambda **_: (latest, ()),
@@ -1105,14 +1757,46 @@ def test_detector_alert_reader_zero_latest_keeps_original_history_and_hits():
         repeat_counts=lambda **_: {records[0].evaluation_id: dict(repeats=3, last_seen_at=latest.selected_at)})
     current = build_detector_alert_review(dataset_id=first.dataset_id, as_of=latest.selected_at, repository=repo)
     assert current["status"] == "COMPLETE" and current["rows"] == [] and current["new_alerts"] == 0
+    assert current["run"]["published_at"] == latest.selected_at.isoformat()
+    assert current["run"]["scheduled_cycle"] == latest.scheduled_cycle.isoformat()
+    assert current["run"]["published_at"] != current["run"]["scheduled_cycle"]
+    assert current["run"]["rejections"] == dict(latest.rejections)
+    assert current["run"]["covered_underlyings"] == current["run"]["expected_underlyings"]
     history = build_detector_alert_review(dataset_id=first.dataset_id, as_of=latest.selected_at, repository=repo, scope="HISTORY")
+    assert history["run"] is None
+    assert [run["run_id"] for run in history["runs"]] == [str(first.run_id)]
+    assert history["latest_run"]["published_at"] == latest.selected_at.isoformat()
     assert history["rows"][0]["hit_count"] == 4
     assert history["rows"][0]["plan_sha256"] == records[0].package.plan_sha256
     assert history["rows"][0]["first_selected_at"] == first.selected_at.isoformat()
+    assert datetime.fromisoformat(history["rows"][0]["triggered_at"]) == datetime.fromisoformat(json.loads(records[0].plan_payload_text)["source_market_time"])
     assert history["rows"][0]["net_return"] is None and history["rows"][0]["fill"] is None
     repo.completed_runs = lambda **_: ()
     empty = build_detector_alert_review(dataset_id="different-dataset", as_of=latest.selected_at, repository=repo)
     assert empty["status"] == "NO_COMPLETE_RUN" and empty["rows"] == []
+    assert empty["run"] is None and empty["latest_run"] is None and empty["runs"] == []
+
+
+@pytest.mark.parametrize("model", ["O1", "S1", "S2"])
+def test_detector_trigger_time_uses_original_origin_evidence_and_missing_sorts_last(model):
+    import json
+    from types import SimpleNamespace
+    from options.analytics.behavior_review import _detector_triggered_at, _sort_detector_records
+
+    option_time, stock_time = NOW - timedelta(minutes=5), NOW - timedelta(minutes=20)
+    plan = dict(source_market_time=option_time.isoformat(), management_policy=dict(technical_exit=dict(
+        evidence=dict(source_kind="STOCK_SETUP", market_time=stock_time.isoformat()))))
+    record = SimpleNamespace(detector_id=model, plan_payload_text=json.dumps(plan), package=SimpleNamespace(decision_at=NOW),
+        evaluation_id=uuid4(), scheduled_cycle=NOW - timedelta(minutes=15), selected_at=NOW)
+    assert _detector_triggered_at(record) == (option_time if model == "O1" else stock_time)
+    missing = SimpleNamespace(**{**vars(record), "evaluation_id": uuid4(), "plan_payload_text": "{}"})
+    for order in ("asc", "desc"):
+        assert _sort_detector_records([missing, record], "triggered_at", order) == [record, missing]
+    for value in (None, "invalid", NOW.replace(tzinfo=None).isoformat(), (NOW + timedelta(seconds=1)).isoformat()):
+        plan["source_market_time"] = value
+        plan["management_policy"]["technical_exit"]["evidence"]["market_time"] = value
+        record.plan_payload_text = json.dumps(plan)
+        assert _detector_triggered_at(record) is None
 
 
 def test_detector_readers_sort_package_strategy_before_pagination():
@@ -1218,6 +1902,26 @@ def test_alert_original_package_reader_binds_retained_snapshot_and_preserves_mis
         repository.original_packages(records, as_of=package.decision_at)
     cursor.fetchall.side_effect = [[], []]
     assert repository.original_packages(records, as_of=package.decision_at) == {}
+
+
+@pytest.mark.parametrize("now,effective,completed,start,missing", [
+    ("2026-09-21T13:00:00+00:00", "2026-09-21T13:30:00+00:00", [], "2026-09-21T14:00:30+00:00", 0),
+    ("2026-09-21T14:05:00+00:00", "2026-09-21T13:30:00+00:00", [], "2026-09-21T14:00:30+00:00", 0),
+    ("2026-09-21T14:16:00+00:00", "2026-09-21T13:30:00+00:00", [], "2026-09-21T14:15:30+00:00", 1),
+    ("2026-09-21T14:16:00+00:00", "2026-09-21T13:30:00+00:00", ["2026-09-21T13:45:00+00:00", "2026-09-21T14:00:00+00:00"], "2026-09-21T14:30:30+00:00", 0),
+    ("2026-09-21T14:50:00+00:00", "2026-09-21T15:00:00+00:00", [], "2026-09-21T15:15:30+00:00", 0),
+    ("2026-09-20T15:00:00+00:00", "2026-09-18T13:30:00+00:00", [], "2026-09-21T14:00:30+00:00", 0),
+    ("2026-11-27T18:31:00+00:00", "2026-11-27T18:00:00+00:00", [], "2026-11-30T15:00:30+00:00", 1),
+])
+def test_detector_schedule_distinguishes_windows_from_completed_runs(now, effective, completed, start, missing):
+    from options.repositories.alert_review_sources import detector_alert_schedule
+    from options.worker import OptionWorkerSettings
+
+    result = detector_alert_schedule(as_of=datetime.fromisoformat(now), effective_from=datetime.fromisoformat(effective),
+        settings=OptionWorkerSettings(), completed=[datetime.fromisoformat(value) for value in completed])
+    assert datetime.fromisoformat(result["window_start"]) == datetime.fromisoformat(start)
+    assert result["unpublished_windows"] == missing and result["warning"] == bool(missing)
+    assert result["dataset_timing"] == "EXPECTED_CHECK_WINDOW_NOT_COMPLETION_DEADLINE"
 
 
 def test_current_detector_dataset_is_default_even_before_any_run(monkeypatch):

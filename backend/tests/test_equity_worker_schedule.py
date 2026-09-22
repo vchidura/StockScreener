@@ -206,6 +206,197 @@ def test_worker_once_surfaces_native_coverage_failure():
         )
 
 
+def test_canonical_publication_does_not_run_downstream_work():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from scripts.run_equity_worker import publish_due_interval
+
+    service = MagicMock()
+    service.ingest_native_interval.return_value = SimpleNamespace(
+        bar_count=1, inserted_count=1, missing_tickers=())
+    publication = SimpleNamespace(status="COMPLETE", selected=1, missing=0)
+    service.publish_canonical_interval.return_value = publication
+    reference = SimpleNamespace(revisions=("AAPL",))
+    slot = datetime(2026, 9, 21, 14, 0, tzinfo=UTC)
+    assert publish_due_interval(service, reference, interval="30m", slot=slot,
+        observed_at=slot + timedelta(minutes=15), once=False) is publication
+    service.materialize_interval.assert_not_called()
+    service.evaluate_directional_outcomes.assert_not_called()
+    service.refresh_behavior_adjusted_daily.assert_not_called()
+
+
+def test_stage_schedules_do_not_queue_or_share_completion():
+    from scripts.equity_worker_stages import StageSchedule
+
+    now = datetime(2026, 9, 21, 16, 0, tzinfo=UTC)
+    native = StageSchedule(("5m", "30m"))
+    analysis = StageSchedule(("5m", "30m"))
+    assert analysis.next({"5m": now}, now) == ("5m", now)
+    native.finish("5m", now, success=True, now=now)
+    later = now + timedelta(minutes=5)
+    assert native.next({"5m": later}, later) == ("5m", later)
+    assert analysis.completed == {}
+    native.finish("5m", later, success=False, now=later)
+    assert native.next({"5m": later, "30m": now}, later) == ("30m", now)
+    assert native.next({"5m": later + timedelta(minutes=5)}, later) == ("5m", later + timedelta(minutes=5))
+
+
+def test_analysis_stage_never_ingests_or_matures_outcomes():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from scripts.equity_worker_stages import analyze_published_interval, stage_commands
+
+    service = MagicMock()
+    service.materialize_interval.return_value.status = "COMPLETE"
+    now = datetime(2026, 9, 21, 16, 0, tzinfo=UTC)
+    assert analyze_published_interval(service, SimpleNamespace(revisions=("AAPL",), universe_run_id="universe"),
+        interval="30m", slot=now, observed_at=now)
+    service.ingest_native_interval.assert_not_called()
+    service.evaluate_directional_outcomes.assert_not_called()
+    assert set(stage_commands()) == {"native", "derived", "30m-analysis", "hourly-analysis", "short-analysis", "daily-analysis", "maintenance"}
+
+
+def test_stage_publication_read_is_bounded_readonly_and_preserves_failed_latest(monkeypatch):
+    from contextlib import contextmanager
+    from unittest.mock import MagicMock
+    from scripts import equity_worker_stages as stages
+
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [{"interval": "30m", "market_time": datetime(2026, 9, 21, 16, 0, tzinfo=UTC),
+        "observed_at": datetime(2026, 9, 21, 16, 15, tzinfo=UTC), "status": "FAILED"}]
+    @contextmanager
+    def connection():
+        yield cursor
+    monkeypatch.setattr(stages, "get_db_cursor", connection)
+    assert stages.publication_watermarks(("30m",))["30m"]["status"] == "FAILED"
+    queries = [call.args[0] for call in cursor.execute.call_args_list]
+    assert queries[:2] == ["SET TRANSACTION READ ONLY", "SET LOCAL statement_timeout = '5s'"]
+    assert "DISTINCT ON (interval)" in queries[-1]
+    assert "status IN" not in queries[-1]
+
+
+def test_stage_targets_require_canonical_dependencies_and_provider_delay(monkeypatch):
+    from scripts import equity_worker_stages as stages
+
+    now = datetime(2026, 9, 21, 14, 45, tzinfo=UTC)
+    monkeypatch.setattr(stages.worker, "PROVIDER_DELAY_MINUTES", 15)
+    assert stages.stage_targets("native", now, {})["30m"] == now - timedelta(minutes=15)
+    assert stages.stage_targets("derived", now, {}) == {}
+    source = {"30m": {"market_time": now - timedelta(minutes=15), "status": "COMPLETE"}}
+    assert stages.stage_targets("derived", now, source)["1h"] == now - timedelta(minutes=15)
+    assert stages.stage_targets("30m-analysis", now, source)["30m"] == source["30m"]["market_time"]
+    source["30m"]["status"] = "FAILED"
+    assert "30m" not in stages.stage_targets("30m-analysis", now, source)
+    assert "1h" not in stages.stage_targets("derived", now, source)
+    monkeypatch.setattr(stages.worker, "PROVIDER_DELAY_MINUTES", 0)
+    assert stages.stage_targets("native", now, {})["15m"] == now
+
+
+def _stub_stage_loop(monkeypatch, *, iterations=3):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from scripts import equity_worker_stages as stages
+
+    clock = [datetime(2026, 9, 21, 16, 15, tzinfo=UTC)]
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+    service = MagicMock()
+    service.analysis_repository.latest_published_market_times.return_value = {}
+    service.evaluate_directional_outcomes.return_value = SimpleNamespace(due=1, persisted=1, pending=0)
+    reference = SimpleNamespace(revisions=("AAPL",), universe_run_id="universe")
+    monkeypatch.setattr(stages, "datetime", Clock)
+    monkeypatch.setattr(stages, "check_stage_parent", lambda: None)
+    monkeypatch.setattr(stages, "EquityMaterializationService", lambda *args, **kwargs: service)
+    monkeypatch.setattr(stages, "PolygonEquityClient", lambda: object())
+    monkeypatch.setattr(stages.worker, "INTERVALS", ("5m", "30m", "1h", "1d"))
+    monkeypatch.setattr(stages.worker, "PROVIDER_DELAY_MINUTES", 15)
+    monkeypatch.setattr(stages.worker, "get_selected_tickers", lambda **kwargs: ("AAPL",))
+    monkeypatch.setattr(stages.worker, "load_or_refresh_reference", lambda *args: reference)
+    monkeypatch.setattr(stages.worker, "load_retained_reference", lambda *args: reference)
+    monkeypatch.setattr(stages.worker, "behavior_shadow_tickers", lambda: ("AAPL",))
+    monkeypatch.setattr(stages, "publication_watermarks", lambda intervals: {interval: dict(
+        market_time=datetime(2026, 9, 21, 16, 0, tzinfo=UTC), status="COMPLETE") for interval in intervals})
+    states = []
+    monkeypatch.setattr(stages, "write_stage_status", lambda stage, state: states.append(dict(state)))
+    sleeps = []
+    def advance(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= iterations:
+            raise _StopWorkerLoop()
+        clock[0] += timedelta(seconds=15)
+    monkeypatch.setattr(stages.time, "sleep", advance)
+    return stages, service, states
+
+
+def test_native_stage_continues_with_downstream_unavailable_and_current_job_clock(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    stages, service, states = _stub_stage_loop(monkeypatch)
+    monkeypatch.setattr(stages, "publication_watermarks", lambda intervals: {})
+    publish = MagicMock(return_value=SimpleNamespace(status="COMPLETE"))
+    monkeypatch.setattr(stages.worker, "publish_due_interval", publish)
+    with pytest.raises(_StopWorkerLoop):
+        stages.run_stage("native")
+    assert [call.kwargs["interval"] for call in publish.call_args_list] == ["30m", "5m"]
+    assert publish.call_args_list[1].kwargs["observed_at"] > publish.call_args_list[0].kwargs["observed_at"]
+    service.materialize_interval.assert_not_called()
+    service.evaluate_directional_outcomes.assert_not_called()
+    service.ingestion_repository.fail_stale_segments.assert_called_once_with(
+        stale_after=timedelta(0), intervals=("30m", "5m"), dataset="EQUITY_BARS")
+    assert any(state["state"] == "BUSY" for state in states)
+
+
+@pytest.mark.parametrize("failure", ["exception", "unavailable"])
+def test_maintenance_failure_backs_off_without_starving_outcomes(monkeypatch, failure):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    stages, service, states = _stub_stage_loop(monkeypatch)
+    refresh = MagicMock(side_effect=RuntimeError("unavailable")) if failure == "exception" else MagicMock(
+        return_value=(SimpleNamespace(status="IDENTITY_UNAVAILABLE"),))
+    context = MagicMock(return_value={"status": "ALREADY_PRESENT"})
+    monkeypatch.setattr(stages.worker, "refresh_behavior_adjusted_daily", refresh)
+    monkeypatch.setattr(stages.worker, "refresh_current_daily_signals", context)
+    with pytest.raises(_StopWorkerLoop):
+        stages.run_stage("maintenance", behavior_shadow=True)
+    refresh.assert_called_once()
+    context.assert_called_once()
+    service.evaluate_directional_outcomes.assert_called_once()
+    assert service.evaluate_directional_outcomes.call_args.kwargs["limit"] == 100
+    assert service.evaluate_directional_outcomes.call_args.kwargs["prospective_only"] is True
+    service.materialize_interval.assert_not_called()
+
+
+def test_stage_requires_supervisor_identity(monkeypatch):
+    from scripts.equity_worker_stages import check_stage_parent
+
+    monkeypatch.delenv("EQUITY_STAGE_PARENT_PID", raising=False)
+    monkeypatch.delenv("EQUITY_STAGE_PARENT_CREATED", raising=False)
+    with pytest.raises(RuntimeError, match="managed supervisor"):
+        check_stage_parent()
+
+
+def test_stage_status_resolves_venv_child_identity_and_rejects_unrelated_pid(monkeypatch, tmp_path):
+    import json
+    from types import SimpleNamespace
+    from scripts import equity_worker_stages as stages
+
+    now = datetime.now(UTC).isoformat()
+    (tmp_path / "service.json").write_text(json.dumps(dict(pid=1, process_created_at=1,
+        checked_at=now, state="RUNNING", components={"native": dict(pid=2, state="RUNNING", started_at=now)})))
+    (tmp_path / "native.json").write_text(json.dumps(dict(pid=3, stage="native", state="BUSY", checked_at=now)))
+    monkeypatch.setattr(stages, "ROOT", tmp_path)
+    process = SimpleNamespace(pid=3, create_time=lambda: 1, parents=lambda: [SimpleNamespace(pid=2)],
+        cmdline=lambda: ["python", "run_equity_worker.py", "--stage", "native"])
+    monkeypatch.setattr("psutil.Process", lambda identity: process)
+    assert stages.status()["stages"]["native"]["state"] == "BUSY"
+    process.parents = lambda: [SimpleNamespace(pid=4)]
+    assert stages.status()["stages"]["native"]["state"] == "UNVERIFIED"
+
+
 def test_early_close_never_creates_slot_after_session_close():
     assert latest_completed_slot(
         datetime(2026, 11, 27, 20, 0, tzinfo=UTC), "30m"
