@@ -35,11 +35,14 @@
 .stock-alerts .sa-scroll table { min-width: 1050px; width: max-content; max-width: none; }
 .stock-alerts th, .stock-alerts td { min-width: 78px; }
 .stock-alerts th:first-child, .stock-alerts td:first-child { min-width: 42px; width: 42px; }
-.stock-alerts .sa-scroll :is(th, td):first-child { min-width: 154px; width: 154px; }
+.stock-alerts .sa-scroll :is(th, td):first-child { position: sticky; left: 0; z-index: 1; min-width: 42px; width: 42px; text-align: center; background: var(--tm-surface); border-right: 1px solid var(--tm-line); }
+.stock-alerts .sa-scroll th:first-child { z-index: 2; background: var(--tm-surface-sunken); }
+.stock-alerts .sa-scroll :is(th, td):nth-child(2) { min-width: 154px; width: 154px; }
 .stock-alerts .sa-scroll .sa-plan-details { min-width: 42px; width: 42px; }
 .stock-alerts th:nth-child(2), .stock-alerts td:nth-child(2) { min-width: 80px; }
 .stock-alerts th button { display: inline-flex; align-items: center; gap: 4px; }
 .sa-detail-launch { color: var(--tm-accent); }
+.sa-trigger-price { color: var(--tm-accent); font-weight: 700; }
 .sa-risk-icon { margin-left: 5px; color: var(--tm-warn); }
 .sa-risk-assessment { display: inline-block; width: 156px; white-space: normal; overflow-wrap: anywhere; line-height: 1.4; }
 .sa-drawer-backdrop { position: fixed; inset: 0; z-index: 500; display: flex; justify-content: flex-end; background: rgb(0 0 0 / 48%); }

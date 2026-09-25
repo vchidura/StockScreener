@@ -1699,7 +1699,7 @@ def option_detector_alerts(
         data = build_detector_alert_review(dataset_id=dataset_id, as_of=now, scope=scope,
             session_date=session_date, detector=detector, limit=limit, offset=offset,
             underlyer=underlyer, sort_by=sort_by, sort_order=sort_order,
-            source_repository=OptionAlertReviewSourceRepository(), valuation_policy=configuration.valuation_policy)
+            source_repository=OptionAlertReviewSourceRepository())
     except (ValueError, DatabaseError):
         return _envelope(available=False, reason="DETECTOR_ALERTS_UNAVAILABLE", data={})
     return _envelope(available=True, as_of=now, data=data)

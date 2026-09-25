@@ -240,3 +240,25 @@ test('EOD review is always retained shadow evidence and keeps its selected sessi
   assert.equal(alertTabParams(review, 'eod').get('session_date'), '2026-09-18')
   assert.equal(alertTabParams(review, 'latest', true).has('review_selection'), false)
 })
+
+test('stock alert tables lead with View and Day History uses semantic price colors', () => {
+  const page = readFileSync(new URL('../src/pages/StockAlertsPage.tsx', import.meta.url), 'utf8')
+  const table = page.slice(page.indexOf('<div className="sd-table-scroll sa-scroll">'), page.indexOf('<footer className="sd-pager">'))
+  assert.match(table, /<tr><th className="sa-plan-details" scope="col">View<\/th>\{visible\.map/)
+  assert.match(table, /<tr key=\{row\.alert_id\}>\s*<td className="sa-plan-details">/)
+  assert.match(page, /className=\{view === 'history' \? tone\(row\.price_return\) : ''\}/)
+  assert.match(page, /className=\{view === 'history' \? 'sa-trigger-price' : undefined\}/)
+  assert.match(page, /className=\{view === 'history' \? 'sd-negative' : undefined\}/)
+  assert.match(page, /className=\{view === 'history' \? 'sd-positive' : undefined\}/)
+  const css = readFileSync(new URL('../src/pages/StockAlertsPage.css', import.meta.url), 'utf8')
+  assert.match(css, /\.sa-scroll :is\(th, td\):first-child \{ position: sticky; left: 0;/)
+  assert.match(css, /\.sa-trigger-price \{ color: var\(--tm-accent\); font-weight: 700; \}/)
+})
+
+test('stock alert columns place Hits before probability and Model after risk assessment', () => {
+  const page = readFileSync(new URL('../src/pages/StockAlertsPage.tsx', import.meta.url), 'utf8')
+  const keys = ['hits', 'success_probability', 'risk_assessment', 'model', 'hold']
+  const positions = keys.map(key => page.indexOf(`{ key: '${key}'`))
+  assert.ok(positions.every(position => position >= 0))
+  assert.deepEqual([...positions].sort((left, right) => left - right), positions)
+})
