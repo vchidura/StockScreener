@@ -817,24 +817,11 @@ class EquityMaterializationService:
         selected = {}
         failures = {}
         manifest = []
+        bars_at_watermark = self.bar_repository.list_final_at_watermark_for_tickers(
+            tuple(security.ticker for security in securities), interval, watermark,
+            session_scope=BarSessionScope.RTH, adjusted=False)
         for security in securities:
-            try:
-                bars = self.bar_repository.list_final_as_of(
-                    security.ticker,
-                    interval,
-                    watermark,
-                    limit=1,
-                    session_scope=BarSessionScope.RTH,
-                    adjusted=False,
-                )
-            except Exception as exc:
-                failures[security.ticker] = type(exc).__name__
-                manifest.append({
-                    "failure": type(exc).__name__,
-                    "ticker": security.ticker,
-                })
-                continue
-            bar = bars[-1] if bars and bars[-1].bar_end == watermark.market_time else None
+            bar = bars_at_watermark.get(security.ticker)
             if bar is not None:
                 selected[security.ticker] = bar
             manifest.append({

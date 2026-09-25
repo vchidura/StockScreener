@@ -44,9 +44,8 @@ def test_all_phase_builds_ordered_portal_bootstrap_without_research(monkeypatch)
     assert sum(phase == "native-bars" for phase in phases) == 4
     assert sum(phase == "derive" for phase in phases) == 4
     assert sum(phase == "reference" for phase in phases) == 2
-    assert phases.index("publish") < phases.index("current-signals")
-    assert phases.index("current-signals") < phases.index("snapshots")
-    assert sum(phase == "current-signals" for phase in phases) == 2
+    assert phases.index("publish") < phases.index("snapshots")
+    assert "current-signals" not in phases
 
 
 def test_all_phase_includes_optional_research_before_validation(monkeypatch):

@@ -430,6 +430,13 @@ def test_aligned_stock_setup_windows_never_fall_back_or_rewrite(tmp_path, model)
     assert not evidence and reasons["S1_STOCK_WINDOW_NOT_AVAILABLE"] == 1
     evidence, reasons = read_direct_stock_setup_windows(path, **dict(arguments, clock=lambda: stock.expires_at))
     assert not evidence and reasons["S1_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"] == 1
+    from equity.stock_alert_results import read_direct_stock_setup_shadow_windows
+    shadows, shadow_reasons = read_direct_stock_setup_shadow_windows(path,
+        **dict(arguments, clock=lambda: stock.expires_at))
+    assert len(shadows) == 1
+    assert shadows[0].episode_id == stock.episode_id
+    assert shadows[0].source_status == "EXPIRED_BEFORE_SOURCE_READ"
+    assert shadow_reasons["S1_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"] == 1
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
     retry = dict(publication, window_key=publication["window_key"] + ":source-ready-retry",
         market_time=publication["window_key"], actual_publication_at=(NOW - timedelta(seconds=1)).isoformat(), candidates={})

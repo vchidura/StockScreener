@@ -7,6 +7,17 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
+
+@pytest.mark.parametrize("module_name", ["generate_cross_sectional_signal", "generate_market_discovery", "refresh_daily_signal_context"])
+def test_legacy_writer_cli_requires_explicit_write_permission(monkeypatch, module_name):
+    import importlib
+    import sys
+    module = importlib.import_module("scripts." + module_name)
+    monkeypatch.setattr(sys, "argv", [module_name])
+    with pytest.raises(SystemExit) as error:
+        module.main()
+    assert error.value.code == 2
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts import refresh_daily_signal_context as context
 

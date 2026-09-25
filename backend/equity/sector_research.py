@@ -92,103 +92,8 @@ def sector_intelligence(leader_limit: int = 5) -> dict:
         sector_universe = {
             row["sector"]: row["count"] for row in cursor.fetchall()
         }
-        cursor.execute(
-            """
-            SELECT trade_date FROM market_discovery_states
-            ORDER BY trade_date DESC LIMIT 1
-            """
-        )
-        discovery_row = cursor.fetchone()
         discovery_mix: dict[str, dict[str, int]] = {}
-        if discovery_row:
-            cursor.execute(
-                """
-                SELECT selected.sector, discovery.state,
-                       COUNT(*)::INTEGER AS count
-                FROM market_discovery_states AS discovery
-                JOIN selected_tickers AS selected
-                  ON selected.ticker = discovery.ticker
-                 AND selected.is_active = TRUE
-                WHERE discovery.trade_date = %s
-                  AND selected.sector IS NOT NULL
-                  AND BTRIM(selected.sector) <> ''
-                  AND selected.sector <> 'ETF'
-                GROUP BY selected.sector, discovery.state
-                """,
-                (discovery_row["trade_date"],),
-            )
-            for row in cursor.fetchall():
-                discovery_mix.setdefault(row["sector"], {})[
-                    row["state"]
-                ] = row["count"]
-        cursor.execute("SELECT MAX(trade_date) AS d FROM cross_sectional_signals")
-        cross_sectional_row = cursor.fetchone()
         skew_by_sector: dict[str, dict] = {}
-        names_by_sector: dict[str, list[dict]] = {}
-        if cross_sectional_row and cross_sectional_row["d"]:
-            cursor.execute(
-                """
-                SELECT selected.sector,
-                       COUNT(*) FILTER (WHERE signal.side = 'LONG')::INTEGER
-                         AS long_skew,
-                       COUNT(*) FILTER (WHERE signal.side = 'SHORT')::INTEGER
-                         AS short_skew,
-                       AVG(signal.percentile)::DOUBLE PRECISION
-                         AS average_percentile,
-                       COUNT(*)::INTEGER AS covered
-                FROM cross_sectional_signals AS signal
-                JOIN selected_tickers AS selected
-                  ON selected.ticker = signal.ticker
-                 AND selected.is_active = TRUE
-                WHERE signal.trade_date = %s
-                  AND selected.sector IS NOT NULL
-                  AND BTRIM(selected.sector) <> ''
-                  AND selected.sector <> 'ETF'
-                GROUP BY selected.sector
-                """,
-                (cross_sectional_row["d"],),
-            )
-            for row in cursor.fetchall():
-                skew_by_sector[row["sector"]] = {
-                    "long_skew": row["long_skew"],
-                    "short_skew": row["short_skew"],
-                    "average_percentile": row["average_percentile"],
-                    "covered": row["covered"],
-                }
-            cursor.execute(
-                """
-                SELECT selected.sector, signal.ticker, signal.side,
-                       signal.percentile
-                FROM cross_sectional_signals AS signal
-                JOIN selected_tickers AS selected
-                  ON selected.ticker = signal.ticker
-                 AND selected.is_active = TRUE
-                WHERE signal.trade_date = %s
-                  AND signal.side IN ('LONG', 'SHORT')
-                  AND selected.sector IS NOT NULL
-                  AND BTRIM(selected.sector) <> ''
-                  AND selected.sector <> 'ETF'
-                ORDER BY selected.sector,
-                  CASE WHEN signal.side = 'LONG'
-                       THEN signal.percentile ELSE -signal.percentile END DESC
-                """,
-                (cross_sectional_row["d"],),
-            )
-            for row in cursor.fetchall():
-                names_by_sector.setdefault(row["sector"], []).append(dict(row))
-
-    for sector, skew in skew_by_sector.items():
-        names = names_by_sector.get(sector, [])
-        skew["net_tilt"] = (
-            (skew["long_skew"] - skew["short_skew"]) / skew["covered"]
-            if skew["covered"] else None
-        )
-        skew["long_names"] = [
-            row["ticker"] for row in names if row["side"] == "LONG"
-        ][:leader_limit]
-        skew["short_names"] = [
-            row["ticker"] for row in names if row["side"] == "SHORT"
-        ][:leader_limit]
 
     aggregates: dict[int, dict[str, dict]] = {}
     leaders: dict[str, dict[str, list[dict]]] = {}
@@ -263,13 +168,9 @@ def sector_intelligence(leader_limit: int = 5) -> dict:
         "trade_date": (
             one_session[0]["trade_date"].isoformat() if one_session else None
         ),
-        "discovery_trade_date": (
-            discovery_row["trade_date"].isoformat() if discovery_row else None
-        ),
-        "cross_sectional_trade_date": (
-            cross_sectional_row["d"].isoformat()
-            if cross_sectional_row and cross_sectional_row["d"] else None
-        ),
+        "discovery_trade_date": None,
+        "cross_sectional_trade_date": None,
+        "legacy_context_status": "RETIRED_USE_EQUITY_CONTEXT",
         "sessions": list(SECTOR_ROTATION_SESSIONS),
         "leader_sessions": list(LEADER_LAGGARD_SESSIONS),
         "results": results,

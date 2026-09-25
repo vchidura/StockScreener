@@ -355,7 +355,10 @@ def comparison_status(current, previous):
             return "REVISION_POLICY_UNAVAILABLE"
     except (KeyError, ValueError, TypeError):
         return "REVISION_POLICY_UNAVAILABLE"
-    for name in ("technicals.py", "stock_discovery.py"):
+    contract = current.get("daily_state_contract")
+    if contract != previous.get("daily_state_contract") or contract not in (None, "daily_state_extracted_v1"):
+        return "INCOMPATIBLE_PUBLICATIONS"
+    for name in ("technicals.py", "daily_state.py" if contract else "stock_discovery.py"):
         if not current.get("code_hashes", {}).get(name) or current["code_hashes"][name] != previous.get("code_hashes", {}).get(name):
             return "INCOMPATIBLE_PUBLICATIONS"
     return "READY"

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from uuid import uuid4
 import pytest
@@ -49,6 +49,7 @@ def test_active_security_ids_cover_portal_and_ranked_universes(monkeypatch):
 
 def test_refresh_persists_normalized_live_actions(monkeypatch):
     security_id = uuid4()
+    requests = []
     monkeypatch.setattr(
         run_corporate_action_worker,
         "active_security_ids",
@@ -57,6 +58,7 @@ def test_refresh_persists_normalized_live_actions(monkeypatch):
 
     class Client:
         def fetch_splits(self, start, end):
+            requests.append(("SPLIT", start, end))
             return ({
                 "id": "split-1", "ticker": "AAPL",
                 "execution_date": "2026-10-01", "split_from": 1,
@@ -64,6 +66,7 @@ def test_refresh_persists_normalized_live_actions(monkeypatch):
             },)
 
         def fetch_dividends(self, start, end):
+            requests.append(("DIVIDEND", start, end))
             return ({
                 "id": "dividend-1", "ticker": "AAPL",
                 "ex_dividend_date": "2026-09-20", "cash_amount": 0.25,
@@ -97,6 +100,14 @@ def test_refresh_persists_normalized_live_actions(monkeypatch):
     assert result.normalized_actions == 2
     assert result.inserted_actions == 2
     assert result.inserted_coverage == 2
+    assert {(kind, start) for kind, start, _ in requests} == {
+        ("SPLIT", OBSERVED_AT.date() - timedelta(days=180)),
+        ("DIVIDEND", OBSERVED_AT.date() - timedelta(days=30)),
+    }
+    assert {(row.action_type, row.window_start) for row in repository.coverage} == {
+        ("SPLIT", OBSERVED_AT.date() - timedelta(days=180)),
+        ("DIVIDEND", OBSERVED_AT.date() - timedelta(days=30)),
+    }
     assert {action.action_type for action in repository.actions} == {
         "SPLIT", "DIVIDEND",
     }

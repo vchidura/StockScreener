@@ -457,6 +457,28 @@ def test_bulk_bar_read_can_return_full_visible_history():
     assert result == {"AAPL": (), "MSFT": ()}
 
 
+def test_exact_watermark_bar_read_preserves_visibility_and_revision_precedence():
+    repository, _, cursor = _repository(EquityBarRepository)
+    context = _watermark()
+
+    assert repository.list_final_at_watermark_for_tickers(
+        ("aapl", "MSFT", "AAPL"), "30m", context
+    ) == {}
+
+    sql, parameters = cursor.execute.call_args.args
+    assert "DISTINCT ON (ticker, interval, bar_start)" in sql
+    assert "bar_end = %s" in sql
+    assert "COALESCE(replay_available_at, system_observed_at) <= %s" in sql
+    assert "is_final = TRUE" in sql
+    assert "source_kind = 'RECONCILED' THEN 0" in sql
+    assert "availability_mode = 'LIVE_OBSERVED' THEN 0 ELSE 1" in sql
+    assert "GROUPED_DAILY_AGGREGATE" in sql
+    assert parameters == (
+        ["AAPL", "MSFT"], "30m", BarSessionScope.RTH.value, False,
+        context.market_time, context.observed_time,
+    )
+
+
 def test_daily_session_read_uses_canonical_source_precedence():
     repository, _, cursor = _repository(EquityBarRepository)
     session_date = _watermark().market_time.date()

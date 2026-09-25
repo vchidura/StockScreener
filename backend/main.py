@@ -140,8 +140,12 @@ app.add_middleware(
 app.include_router(equity_materialization_router)
 from equity.stock_discovery_api import router as stock_discovery_router
 app.include_router(stock_discovery_router)
+from equity.stock_alert_api import router as stock_alert_router
+app.include_router(stock_alert_router)
 from equity.screening_api import router as screening_router
 app.include_router(screening_router)
+from equity.stock_context import router as stock_context_router
+app.include_router(stock_context_router)
 
 app.include_router(options_router)
 

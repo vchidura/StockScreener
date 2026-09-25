@@ -163,7 +163,7 @@ test('screener filters start closed and open only through explicit controls', ()
 
 test('chain defaults match alert prices without changing explicit saved columns', () => {
   const defaults = model.visibleOptionsColumns('chain').map(column => column.key)
-  assert.deepEqual(defaults, ['underlying', 'contract', 'calendar_dte', 'spot', 'otm_fraction', 'model_mark', 'day_volume', 'open_interest', 'local_iv', 'market_data_time'])
+  assert.deepEqual(defaults, ['market_data_time', 'underlying', 'contract', 'calendar_dte', 'spot', 'otm_fraction', 'model_mark', 'day_volume', 'open_interest', 'local_iv'])
   assert.deepEqual(model.optionColumnPresets('chain')['Price / activity'], defaults)
   const selected = 'underlying,contract,absolute_delta,local_gamma'
   assert.deepEqual(model.visibleOptionsColumns('chain', selected).map(column => column.key), selected.split(','))
@@ -237,6 +237,10 @@ test('screener View opens a fixed snapshot without new queries or saved screen f
   assert.doesNotMatch(detail, /useQuery|fetch\(|getOptionCandidate/)
   assert.match(detail, /<Modal title="Option contract details"/)
   assert.match(detail, /optionContractDetailSections\(row\)/)
+  assert.match(detail, /className=\{detailTone\(field.key, field.value\)\}/)
+  assert.match(detail, /key === 'contract_type'/)
+  assert.match(detail, /\['model_mark', 'display_mark'\]/)
+  assert.match(detail, /'local_delta', 'local_theta_per_day', 'local_vega_per_vol_point', 'local_rho_per_rate_point'/)
   assert.match(detail, /JSON.stringify\(row, null, 2\)/)
   assert.match(detail, /Not a fill or an alert package/)
   const style = readFileSync(new URL('../src/pages/OptionsScreenerPage.css', import.meta.url), 'utf8')

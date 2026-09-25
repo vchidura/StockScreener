@@ -209,6 +209,18 @@ class FakeBarRepository:
         self.bulk_read_calls.append(kwargs)
         return {ticker: tuple(self.bulk_bars.get(ticker, ())) for ticker in tickers}
 
+    def list_final_at_watermark_for_tickers(self, tickers, interval, watermark, **kwargs):
+        self.bulk_read_calls.append(kwargs)
+        if self.latest_bar_end != watermark.market_time:
+            return {}
+        return {
+            ticker: SimpleNamespace(
+                bar_revision_id=uuid4(), ticker=ticker, interval=interval,
+                bar_end=self.latest_bar_end,
+            )
+            for ticker in tickers
+        }
+
     def list_pending_reconciliation(self, interval, *, available_by, limit):
         return self.pending_reconciliation
 
@@ -533,7 +545,6 @@ def test_stream_reconciliation_terminal_fails_segment_on_provider_error():
 def test_canonical_publication_selects_only_bars_at_market_watermark():
     pipeline, dependencies = service()
     securities = (security("AAPL"), security("MSFT"))
-    dependencies["bar_repository"].latest_bar_end = NOW
 
     result = pipeline.publish_canonical_interval(
         securities, interval="30m", watermark=DecisionWatermark(NOW, NOW)
@@ -545,6 +556,42 @@ def test_canonical_publication_selects_only_bars_at_market_watermark():
     assert set(publication["selected"]) == {"AAPL", "MSFT"}
     assert publication["selection_policy_version"] == "equity_bar_selection_v1"
     assert publication["session_scope"] is BarSessionScope.RTH
+    assert dependencies["bar_repository"].bulk_read_calls == [{
+        "session_scope": BarSessionScope.RTH,
+        "adjusted": False,
+    }]
+
+
+def test_canonical_publication_marks_absent_watermark_bars_missing():
+    pipeline, dependencies = service()
+    dependencies["bar_repository"].latest_bar_end = NOW - timedelta(minutes=30)
+
+    result = pipeline.publish_canonical_interval(
+        (security("AAPL"), security("MSFT")),
+        interval="30m",
+        watermark=DecisionWatermark(NOW, NOW),
+    )
+
+    assert result.status == "FAILED"
+    assert result.selected == 0
+    assert result.missing == 2
+    assert result.failed == 0
+
+
+def test_canonical_publication_does_not_publish_when_bulk_read_fails():
+    pipeline, dependencies = service()
+    dependencies["bar_repository"].list_final_at_watermark_for_tickers = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable"))
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        pipeline.publish_canonical_interval(
+            (security("AAPL"),),
+            interval="30m",
+            watermark=DecisionWatermark(NOW, NOW),
+        )
+
+    assert dependencies["bar_repository"].publication is None
 
 
 def test_daily_derivation_persists_complete_multiticker_cohort():

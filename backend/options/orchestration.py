@@ -192,6 +192,36 @@ class ManualOptionPipeline:
             equity_evidence_repository or EquityEvidenceRepository()
         )
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self._reference_cache = {}
+
+    def _list_option_references(
+        self,
+        underlyer: str,
+        as_of_session: date,
+        expiration_through: date,
+        asset_type: AssetType,
+        strike_min: Decimal,
+        strike_max: Decimal,
+    ):
+        now = _as_utc(self.clock(), "clock")
+        cache_seconds = self.configuration.settings.reference_cache_seconds
+        cached = self._reference_cache.get(underlyer)
+        if (cache_seconds > 0 and cached is not None
+                and cached["as_of_session"] == as_of_session
+                and cached["asset_type"] is asset_type
+                and cached["expiration_through"] >= expiration_through
+                and cached["strike_min"] <= strike_min
+                and cached["strike_max"] >= strike_max
+                and 0 <= (now - cached["observed_at"]).total_seconds() <= cache_seconds):
+            return cached["references"]
+        references = self.engine.list_option_references(
+            underlyer, as_of_session, expiration_through, asset_type,
+            strike_min, strike_max)
+        self._reference_cache[underlyer] = dict(
+            as_of_session=as_of_session, asset_type=asset_type,
+            expiration_through=expiration_through, strike_min=strike_min,
+            strike_max=strike_max, observed_at=now, references=references)
+        return references
 
     def latest_due_retry_cycle(self) -> datetime | None:
         return self.work_repository.latest_due_cycle(
@@ -308,7 +338,8 @@ class ManualOptionPipeline:
                         scheduled_cycle=cycle_time, as_of=hook_started_at)
                     run, records = retained if retained is not None else self.detector_cycle_hook(
                         configuration=self.configuration, dataset_id=self.detector_dataset_id,
-                        scheduled_cycle=cycle_time, completed_matrices=matrices, started_at=hook_started_at)
+                        scheduled_cycle=cycle_time, completed_matrices=matrices, started_at=hook_started_at,
+                        progress_callback=progress_callback)
                     run = load_detector_run(run.canonical_json())
                     if (run.dataset_id != self.detector_dataset_id or run.scheduled_cycle != cycle_time
                             or run.configuration_sha256 != self.configuration.configuration_sha256
@@ -439,7 +470,7 @@ class ManualOptionPipeline:
                         expiration_through,
                         followup["expiration_through"],
                     )
-            references = self.engine.list_option_references(
+            references = self._list_option_references(
                 underlyer,
                 as_of_session,
                 expiration_through,

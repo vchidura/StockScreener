@@ -1025,7 +1025,8 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (np.integer,)):
         return int(value)
     if isinstance(value, (np.floating,)):
-        return float(value) if np.isfinite(value) else None
+        normalized = float(value)
+        return 0.0 if normalized == 0.0 else normalized if np.isfinite(value) else None
     if isinstance(value, (np.bool_,)):
         return bool(value)
     if isinstance(value, Decimal):
@@ -1038,8 +1039,10 @@ def _json_safe(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, datetime):
         return value.isoformat()
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return 0.0 if value == 0.0 else value
     return value
 
 

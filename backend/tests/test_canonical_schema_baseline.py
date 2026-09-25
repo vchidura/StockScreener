@@ -25,6 +25,29 @@ def test_detector_evaluations_migration_is_additive_and_matches_baseline():
     assert "ALTER TABLE" not in sql and "DROP TABLE" not in sql
 
 
+def test_o1_indicator_observation_migration_is_additive_and_matches_baseline():
+    sql = (MIGRATIONS_DIR / "054_option_o1_indicator_observations.sql").read_text(encoding="utf-8")
+    assert sql.strip() in baseline_sql()
+    assert "option_o1_indicator_observations" in sql
+    assert "option_participation_indicator_review_v1" in sql
+    assert "INDICATOR_SHADOW_ONLY" in sql
+    assert "changes_admission'='false'::jsonb" in sql
+    assert "BEFORE UPDATE OR DELETE" in sql and "BEFORE TRUNCATE" in sql
+    assert "ALTER TABLE" not in sql and "DROP TABLE" not in sql
+
+
+def test_stock_setup_indicator_observation_migration_is_additive_and_matches_baseline():
+    sql = (MIGRATIONS_DIR / "055_option_stock_setup_indicator_observations.sql").read_text(encoding="utf-8")
+    assert sql.strip() in baseline_sql()
+    assert "option_stock_setup_indicator_observations" in sql
+    assert "stock_first_mixed_indicator_review_v1" in sql
+    assert "MIXED_INDICATOR_SHADOW_ONLY" in sql
+    assert "detector_id IN ('S1','S2')" in sql
+    assert "changes_admission'='false'::jsonb" in sql
+    assert "BEFORE UPDATE OR DELETE" in sql and "BEFORE TRUNCATE" in sql
+    assert "ALTER TABLE" not in sql and "DROP TABLE" not in sql
+
+
 def normalized_sql() -> str:
     return " ".join(baseline_sql().split())
 

@@ -103,10 +103,6 @@ def stage_targets(stage, now, publications):
 
 
 def analyze_published_interval(service, reference, *, interval, slot, observed_at):
-    if interval == "1d":
-        context = worker.refresh_current_daily_signals(now=observed_at)
-        if context["status"] not in ("PUBLISHED", "ALREADY_PRESENT"):
-            return False
     result = service.materialize_interval(reference.revisions, universe_run_id=reference.universe_run_id,
         interval=interval, watermark=DecisionWatermark(slot, observed_at))
     return result.status in ("COMPLETE", "DEGRADED")
@@ -147,7 +143,7 @@ def run_stage(stage, *, behavior_shadow=False):
             if row["status"] in ("COMPLETE", "DEGRADED")}
     schedule = StageSchedule(intervals, completed)
     maintenance = maintenance_jobs(intervals) if stage == "maintenance" else ()
-    maintenance_index, adjusted_session, context_session = 0, None, None
+    maintenance_index, adjusted_session = 0, None
     maintenance_retries = {}
     delay = timedelta(minutes=worker.PROVIDER_DELAY_MINUTES)
     while True:
@@ -166,8 +162,6 @@ def run_stage(stage, *, behavior_shadow=False):
                 daily = worker.latest_due_slot(now, "1d", provider_delay=delay)
                 if behavior_shadow and adjusted_session != daily and now >= maintenance_retries.get("adjusted-daily", now):
                     job = ("adjusted-daily", daily)
-                elif "1d" in intervals and context_session != daily and now >= maintenance_retries.get("daily-context", now):
-                    job = ("daily-context", daily)
                 elif maintenance:
                     interval, policy, horizon = maintenance[maintenance_index]
                     maintenance_index = (maintenance_index + 1) % len(maintenance)
@@ -183,12 +177,6 @@ def run_stage(stage, *, behavior_shadow=False):
                         prospective_only=True, limit=100)
                     LOGGER.info("outcome batch horizon=%s due=%s persisted=%s pending=%s", horizon,
                         result.due, result.persisted, result.pending)
-                elif interval == "daily-context":
-                    result = worker.refresh_current_daily_signals(now=now)
-                    if result["status"] in ("PUBLISHED", "ALREADY_PRESENT"):
-                        context_session = daily
-                    else:
-                        maintenance_retries[interval] = now + timedelta(seconds=worker.INTERVAL_RETRY_SECONDS)
                 else:
                     if reference is None or now - reference_checked >= timedelta(days=1):
                         tickers = tuple(worker.get_selected_tickers(active_only=True))

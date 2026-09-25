@@ -5,6 +5,29 @@ from types import SimpleNamespace
 from scripts import run_option_worker
 
 
+def test_reviewed_option_pins_override_stale_inherited_values(tmp_path):
+    path = tmp_path / ".env"
+    path.write_text(
+        "OPTION_STRATEGY_POLICY_FILE=options/policies/v2.json\n"
+        "OPTION_TECHNICAL_FORWARD_LAUNCH_FILE=research/v22.json\n"
+        "OPTION_TECHNICAL_FORWARD_LAUNCH_SHA256=" + "a" * 64 + "\n",
+        encoding="utf-8",
+    )
+    environment = {
+        "OPTION_STRATEGY_POLICY_FILE": "options/policies/v1.json",
+        "UNRELATED": "preserved",
+    }
+
+    run_option_worker._load_reviewed_option_pins(path, environment)
+
+    assert environment == {
+        "OPTION_STRATEGY_POLICY_FILE": "options/policies/v2.json",
+        "OPTION_TECHNICAL_FORWARD_LAUNCH_FILE": "research/v22.json",
+        "OPTION_TECHNICAL_FORWARD_LAUNCH_SHA256": "a" * 64,
+        "UNRELATED": "preserved",
+    }
+
+
 def configuration(*, package=False, unavailable=False, launch=None):
     return SimpleNamespace(
         stock_behavior_shadow_launch=launch,

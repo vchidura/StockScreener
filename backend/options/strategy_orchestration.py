@@ -10,7 +10,7 @@ from options.analytics.analysis_engine import OptionAnalysisSnapshot
 from options.analytics.chain_analysis import ChainHealth
 from options.analytics.gamma_exposure import ScopedGammaProfile
 from options.config import OptionRuntimeConfiguration
-from options.domain import AssetType, OptionAnalysisRun, OptionContractSnapshot, WorkStage
+from options.domain import AssetType, ContractType, OptionAnalysisRun, OptionContractSnapshot, WorkStage
 from options.evidence_runtime import EvidenceRuntimeMonitor
 from options.repositories.strategies import OptionStrategyRepository
 from options.repositories.analysis import OptionAnalysisRepository
@@ -274,10 +274,13 @@ class OptionStrategyPipeline:
                     self.configuration.settings.equity_context_enabled
                 ),
             )
-            trades = self.trade_repository.list_for_underlyer(
-                underlyer,
+            sweep_contract_ids = tuple(snapshot.contract_id for snapshot in snapshots
+                if snapshot.contract_type is ContractType.CALL and snapshot.strike > snapshot.spot)
+            trades = self.trade_repository.list_for_contracts(
+                sweep_contract_ids,
                 decision_context.market_time - timedelta(hours=8),
                 decision_context,
+                minimum_notional=self.configuration.strategy_policy.flow.minimum_print_notional,
             )
             result = self.engine.scan(
                 matrix_id,

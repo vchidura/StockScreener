@@ -28,6 +28,52 @@ design when the local documentation archive is present. The local production
 runbook is [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md); the startup commands below
 remain in the tracked README.
 
+## Shared Equity Context
+
+The simplification code is implemented and tested. API/frontend-only local deployment
+and retained-data page validation completed September22. Equity and Options managed
+groups are now running with shared corporate-action, earnings/FOMC and Treasury
+refresh. Options v8 is armed prospectively for September23 with O1 v3's latest
+available completed30m confirmation; its first delayed09:45slot check is10:00:30ET.
+The Options group and API-only reader restart passed validation. Retained v7
+publications remain immutable v2 evidence; fresh-session v8 publication/soak
+acceptance remains pending.
+`/api/stocks/context` reads the existing immutable daily Screening
+rank cohort and independently published `1d`, `1h` and `30m` setup evidence. It does
+not fetch providers, recalculate indicators, run a detector or require Options.
+Each component retains its own source time, readiness and identity. Sector filters
+do not recalculate universe percentiles; raw daily momentum is descriptive, not a
+qualified long/short signal. Missing/stale context does not hide a technical plan.
+
+Dashboard Market Discovery and its legacy validated-signal presentation are replaced
+by daily momentum ranks. Sector Intelligence retains price returns, breadth, rotation
+and leaders/laggards, with optional shared context. Ticker plan geometry is unchanged;
+missing daily context is explicitly reported rather than strengthening its verdict.
+Stock Alerts' current URLs, historical readers, selection policies and paper records
+are preserved. Current alert routes are owned by `equity.stock_alert_api`.
+
+Default equity stages, one-shot processing, portal publication and fresh bootstrap
+no longer produce `discovery-1.0-shadow`/`xsmom-1.0` legacy results. Historical APIs
+and exact research scorers remain. Legacy writer CLIs require `--allow-legacy-write`
+unless `--dry-run` is selected; this is not a recommended ordinary startup step.
+
+`/api/stocks/context/bridge/{ticker}` offers an optional, separately versioned
+read-only rank attachment to a compatible retained behavior snapshot. It references
+the existing full-equity rank cohort, never ranks only the option watchlist, and does
+not rewrite the original behavior payload or affect option admission/execution.
+This implementation requires no new persistence table or schema migration. Automatic
+use in option decisions remains unactivated; any such use needs its own policy scope.
+Current Options detectors consume immutable stock behavior and direct setup evidence,
+not the retired discovery/rank tables. Their source identity, freshness, package and
+execution guards remain unchanged by the equity simplification.
+
+PostgreSQL remains the bar/evidence store. Provider delay, completed-bar finality and
+processing latency remain separate. Advanced streaming and new 5m/15m alert policies
+are not enabled by these changes. No storage or performance improvement is claimed
+without before/after measurement. The local
+[simplification plan](docs/EQUITY_RUNTIME_SIMPLIFICATION_PLAN.md) records acceptance
+checks, preservation evidence and deployment holds.
+
 ## Local Documentation And Research Inputs
 
 The root `docs/` directory is local-only and ignored by Git, including existing
@@ -1145,6 +1191,11 @@ verification. The verifier must report both `CANONICAL_RESTORE_VALIDATED` and
 ## Documentation
 
 - [Deployment](docs/DEPLOYMENT.md)
+- [O1 options-first ingestion-to-alert flow](docs/OPTIONS_O1_INGESTION_TO_ALERT_DISPLAY.md)
+- [Defined-risk credit spread alert design](docs/OPTIONS_CREDIT_SPREAD_INGESTION_TO_ALERT_DESIGN.md)
+- [CR3 iron condor alert design](docs/OPTIONS_CR3_IRON_CONDOR_ALERT_DESIGN.md)
+- [BF1 butterfly alert design](docs/OPTIONS_BF1_BUTTERFLY_ALERT_DESIGN.md)
+- [Income Wheel lifecycle alert design](docs/OPTIONS_INCOME_WHEEL_ALERT_DESIGN.md)
 - [Fresh database setup](docs/FRESH_DATABASE_SETUP.md)
 - [Feature catalog](docs/FEATURES.md)
 - [Strategies](docs/STRATEGIES.md)

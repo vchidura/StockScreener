@@ -283,6 +283,36 @@ def test_forward_raw_spot_uses_canonical_native_bar_store():
     assert stored.source_kind.value == "NATIVE_REST" and stored.session_scope.value == "RTH"
 
 
+def test_reference_cache_reuses_only_fresh_same_session_coverage_superset():
+    configuration = load_option_runtime_configuration(
+        {"POLYGON_API_KEY": "test-secret", "OPTION_REFERENCE_CACHE_SECONDS": "900"}, BACKEND_DIR
+    )
+    now = [OBSERVED_AT]
+    calls = []
+    references = (object(),)
+    pipeline = ManualOptionPipeline.__new__(ManualOptionPipeline)
+    pipeline.configuration = configuration
+    pipeline.clock = lambda: now[0]
+    pipeline._reference_cache = {}
+    pipeline.engine = SimpleNamespace(list_option_references=lambda *args:
+        calls.append(args) or references)
+    expiration = OBSERVED_AT.date() + timedelta(days=30)
+
+    first = pipeline._list_option_references("SPY", OBSERVED_AT.date(), expiration,
+        AssetType.ETF, Decimal("90"), Decimal("110"))
+    narrower = pipeline._list_option_references("SPY", OBSERVED_AT.date(), expiration,
+        AssetType.ETF, Decimal("95"), Decimal("105"))
+    wider = pipeline._list_option_references("SPY", OBSERVED_AT.date(), expiration,
+        AssetType.ETF, Decimal("80"), Decimal("120"))
+    now[0] += timedelta(seconds=901)
+    expired = pipeline._list_option_references("SPY", OBSERVED_AT.date(), expiration,
+        AssetType.ETF, Decimal("90"), Decimal("110"))
+
+    assert first is narrower is wider is expired is references
+    assert len(calls) == 3
+    assert calls[1][-2:] == (Decimal("80"), Decimal("120"))
+
+
 def test_manual_pipeline_runs_complete_fixture_cycle():
     configuration = load_option_runtime_configuration(
         {"POLYGON_API_KEY": "test-secret"}, BACKEND_DIR

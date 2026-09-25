@@ -8,11 +8,11 @@ import {
   getOptionAlertHistory, getOptionBehaviorReview, getOptionCandidate, getOptionCandidates, getOptionDiscoveryCatalog, getOptionDetectorEvaluations, getOptionDetectorAlerts, getOptionDetectorDatasets, getOptionAlertSchedule, previewOptionAlert,
   type OptionAlertHistoryRow, type OptionAlertPreviewRequest, type OptionCandidateDetailData, type OptionCandidateLeg,
   type OptionCandidateResearchEvidence, type OptionStockBehaviorGateEvidence,
-  type OptionDetectorEvaluationReview, type OptionDetectorAlertReview, type OptionDetectorSort, type OptionDetectorDatasets, type OptionDetectorRunSummary,
+  type OptionDetectorEvaluationReview, type OptionDetectorAlertReview, type OptionDetectorSort, type OptionDetectorDatasets, type OptionDetectorRunSummary, type OptionLocalSurfaceObservation,
   type OptionCandidatePersona, type OptionCandidateStatus,
 } from '../services/api'
 import { Modal } from './ScreenLibrary'
-import { optionDetectorSort, optionDetectorSortChange, optionPackageStrategyName, detectorAlertColumns, detectorColumnPresets, detectorViewPreset, readDetectorPresets, writeDetectorPresets, type DetectorViewPreset } from './optionsAlertPresentation'
+import { optionDetectorSort, optionDetectorSortChange, optionPackageStrategyName, detectorAlertColumns, detectorObservationFieldStates, detectorColumnPresets, detectorViewPreset, readDetectorPresets, writeDetectorPresets, type DetectorViewPreset } from './optionsAlertPresentation'
 import { emptyOptionAlertForm, optionAlertColumns, optionAlertTabParams, optionReviewScope, optionReviewSelection, optionAlertVisibleColumns, optionBehaviorMetrics, optionCandidateBoardFacts, optionLegMarketValues, optionMarketColumns, optionPackagePremium, optionPackagePrice, optionPlanTerms, optionRemainingHold, optionAlertLabel as label, optionAlertMoney as money, optionAlertPercent, optionAlertPreviewRequest, optionAlertTime as time, optionEntryWindow, optionGateTimeframe, optionGateValue, type OptionAlertColumn, type OptionAlertForm, type OptionAlertView } from './optionsAlertPresentation'
 import './StockDiscoveryPage.css'
 import './StockScreeningPage.css'
@@ -26,6 +26,8 @@ const participationBucketLabels: Record<string, string> = {
   QUIET_LT_0_75X: 'Quiet (<0.75x)', NORMAL_0_75_TO_1_25X: 'Normal (0.75-1.25x)',
   ELEVATED_1_25_TO_2X: 'Elevated (1.25-2x)', SURGE_GE_2X: 'Surge (>=2x)',
 }
+const detectorHistoryOnlyColumns = new Set(['current_price', 'price_pnl', 'gross_pnl', 'net_pnl', 'estimated_cost', 'net_return', 'current_mark_time', 'current_mark_status'])
+const markTone = (value: unknown) => { const numeric = Number(value); return !Number.isFinite(numeric) || numeric === 0 ? '' : numeric > 0 ? 'sd-positive' : 'sd-negative' }
 
 function ColumnHeaders({ columns }: { columns: OptionAlertColumn[] }) {
   return <>{columns.map(column => <th key={column.key} scope="col" title={column.tip}>{column.label}</th>)}</>
@@ -69,6 +71,15 @@ function planCells(netPremium: unknown, legs: Parameters<typeof optionPackagePri
   }
 }
 
+function detectorThresholdCells(netPremium: unknown, legs: Parameters<typeof optionPackagePrice>[1], management: Record<string, unknown> | undefined,
+  options: Parameters<typeof optionPlanTerms>[3]): Record<'technical_stop' | 'technical_target', ReactNode> {
+  const plan = optionPlanTerms(netPremium, legs, management, options)
+  const threshold = (value: number | null, tone: string) => <span className={tone} title={`${label(plan.basis)} / ${label(plan.closeKind)} / Per share / Not a guaranteed fill`}>
+    {value == null ? 'Unavailable' : money(value)}<small>Option package / share</small>
+  </span>
+  return { technical_stop: threshold(plan.stopPrice, 'sd-negative'), technical_target: threshold(plan.targetPrice, 'sd-positive') }
+}
+
 function currentMarkCells(row: Pick<OptionAlertHistoryRow, 'current_mark' | 'original_economics' | 'hit_count'> & { exit_deadline?: string }): Record<string, ReactNode> {
   const mark = row.current_mark
   const valid = mark && mark.status !== 'UNAVAILABLE'
@@ -85,6 +96,26 @@ function currentMarkCells(row: Pick<OptionAlertHistoryRow, 'current_mark' | 'ori
     mark_status: <><Status value={mark?.status || 'UNAVAILABLE'} />{mark?.reason && <small>{label(mark.reason)}</small>}{mark?.after_exit_deadline && <small>After planned exit deadline</small>}</>,
     hit_count: row.hit_count == null ? 'Unavailable' : <span title="Distinct recorded source windows for this exact frozen plan; not independent samples">{row.hit_count}</span>,
     remaining_hold: optionRemainingHold(row.exit_deadline),
+  }
+}
+
+function detectorCurrentMarkCells(mark: OptionAlertHistoryRow['current_mark'] | null, originalNetPremium: unknown): Record<string, ReactNode> {
+  const valid = mark && mark.status !== 'UNAVAILABLE'
+  const packageValue = valid && mark.signed_package_mark != null ? -Number(mark.signed_package_mark) : null
+  const shareValue = valid && mark.package_price != null ? -Number(mark.package_price) : null
+  const credit = Number(originalNetPremium) > 0
+  const amount = (value: number | null) => value == null || !Number.isFinite(value) ? 'Unavailable' : money(credit ? -value : value)
+  return {
+    current_price: <span className={markTone(valid ? mark.price_return : null)}>{amount(shareValue)}<small>{amount(packageValue)} / package</small><small>{credit ? 'Buy-to-close cost' : 'Sell-to-close value'}</small></span>,
+    price_pnl: <span className={markTone(valid ? mark.price_return : null)} title="Gross marked P/L / absolute original net premium; no fills or stop/target exit simulation">
+      {optionAlertPercent(valid ? mark.price_return : null)}<small>{valid ? 'From trigger, gross' : label(mark?.reason || 'CURRENT_MARK_UNAVAILABLE')}</small>
+    </span>,
+    gross_pnl: <span className={markTone(valid ? mark.gross_pnl : null)}>{money(valid ? mark.gross_pnl : null)}</span>,
+    net_pnl: <span className={markTone(valid ? mark.net_pnl : null)}>{money(valid ? mark.net_pnl : null)}</span>,
+    estimated_cost: money(valid ? mark.estimated_cost : null),
+    net_return: <span className={markTone(valid ? mark.net_return : null)}>{optionAlertPercent(valid ? mark.net_return : null)}</span>,
+    current_mark_time: <>{time(mark?.market_time)}<small>{mark?.age_seconds == null ? 'Age unavailable' : `${(mark.age_seconds / 3600).toFixed(1)} hours old`}</small></>,
+    current_mark_status: <><Status value={mark?.status || 'UNAVAILABLE'} />{mark?.reason && <small>{label(mark.reason)}</small>}{mark?.after_exit_deadline && <small>After planned exit deadline</small>}</>,
   }
 }
 
@@ -354,15 +385,112 @@ function DetectorResultVersion({ data, params, update }: {
   </details>
 }
 
+type DetectorAlertRow = OptionDetectorAlertReview['rows'][number]
+
+function AlertSidecarFacts({ title, values }: { title: string; values: Array<[string, ReactNode]> }) {
+  return <section aria-label={title}><h3>{title}</h3><dl className="oa-alert-sidecar-facts">{values.map(([name, value]) =>
+    <div key={name}><dt>{name}</dt><dd>{value ?? 'Unavailable'}</dd></div>)}</dl></section>
+}
+
+function DetectorAlertSidecar({ row, close, openCandidate }: { row: DetectorAlertRow; close: () => void; openCandidate: () => void }) {
+  const original = row.original_package
+  const legs = original.status === 'AVAILABLE' ? original.legs : []
+  const visibleManagement = Object.fromEntries(Object.entries(row.management_policy || {}).filter(([key]) => key !== 'technical_exit'))
+  const marks = detectorCurrentMarkCells(row.current_mark, original.net_premium)
+  const thresholds = detectorThresholdCells(original.net_premium, legs, row.management_policy, {
+    version: String(row.management_policy?.policy_version || ''), source: 'EXPLICIT_ALERT_POLICY',
+    entryLimit: row.entry_limit, entryKind: 'MAXIMUM_DEBIT', exitDeadline: row.exit_deadline,
+  })
+  const legValues = (fields: Array<[string, (leg: OptionCandidateLeg) => ReactNode]>) => legs.flatMap(leg => fields.map(([name, value]) =>
+    [`Leg ${leg.leg_index + 1} ${name}`, value(leg)] as [string, ReactNode]))
+  const ratio = (leg: OptionCandidateLeg) => Number(leg.open_interest) > 0 && Number.isFinite(Number(leg.day_volume))
+    ? `${(Number(leg.day_volume) / Number(leg.open_interest)).toFixed(2)}x` : 'Unavailable'
+  const otm = (leg: OptionCandidateLeg) => {
+    const spot = Number(leg.spot), strike = Number(leg.strike)
+    return spot > 0 && Number.isFinite(strike) ? optionAlertPercent(leg.contract_type === 'CALL' ? (strike - spot) / spot : (spot - strike) / spot) : 'Unavailable'
+  }
+  return <Modal title={`${row.underlyer} ${row.detector_id} ${row.observation ? 'IV observation' : 'alert details'}`} close={close}>
+    <div className="oa-detail oa-alert-sidecar">
+      <div className="oa-detail-heading"><div><h3>{row.underlyer} <span>{row.observation ? 'IV observation' : label(original.structure_type || row.strategy_name || 'alert')}</span></h3>
+        <p>{detectorNames[row.detector_id]} / {label(row.origin)}</p></div><Status value={row.observation ? 'OBSERVATION' : 'SELECTED'} /></div>
+      <p className="oa-alert-sidecar-notice">Retained alert evidence / Delayed marks / Not a fill or execution permission</p>
+      <AlertSidecarFacts title="Alert selection" values={[
+        ['Triggered (ET)', time(row.triggered_at)], ['First selected (ET)', time(row.first_selected_at)],
+        ['Run (ET)', time(row.scheduled_cycle)], ['Direction', row.direction === 1 ? <span className="sd-positive">Bullish</span> : <span className="sd-negative">Bearish</span>],
+        ['Category', label(row.category)], ['Package strategy', optionPackageStrategyName(row.strategy_name)],
+        ['Occurrences', `${row.hit_count} (${row.repeat_count} repeats)`], ['Last observed (ET)', time(row.last_seen_at)],
+      ]} />
+      {row.observation ? <>
+        <AlertSidecarFacts title="Observation evidence" values={[
+          ['Source cutoff (ET)', time(row.observation.market_cutoff)], ['Analyzed (ET)', time(row.observation.decision_at)],
+          ['Valid until (ET)', time(row.observation.valid_until)], ['Stock context', label(row.observation.stock_context_status)],
+          ['Event context', label(row.event_horizon_status || 'UNAVAILABLE')], ['Disposition', label(row.observation.finding_disposition)],
+        ]} />
+        {row.observation.findings.map(finding => <AlertSidecarFacts key={finding.snapshot_id} title={`${money(finding.strike)} ${row.observation?.contract_type} finding`} values={[
+          ['Local IV', optionAlertPercent(finding.local_iv)], ['Fitted IV', optionAlertPercent(finding.fitted_iv)],
+          ['IV gap (points)', (finding.residual * 100).toFixed(3)], ['Robust z-score', finding.robust_z.toFixed(3)],
+          ['Contract ID', finding.contract_id], ['Snapshot ID', <code>{finding.snapshot_id}</code>],
+        ]} />)}
+      </> : <>
+        <AlertSidecarFacts title="Package prices and performance" values={[
+          ['Trigger price / share', <span className="oa-trigger-price"><PackagePrice netPremium={original.net_premium} legs={legs} /></span>],
+          ['Current price', marks.current_price], ['Price P/L', marks.price_pnl], ['Current mark status', marks.current_mark_status],
+          ['Option stop / share', thresholds.technical_stop], ['Option target / share', thresholds.technical_target],
+          ['Capital at risk', money(original.capital_at_risk)], ['Maximum expiration loss', money(original.maximum_loss)],
+          ['Maximum expiration profit', money(original.maximum_profit)], ['Breakevens', original.breakevens?.length ? original.breakevens.map(money).join(', ') : 'Unavailable'],
+        ]} />
+        <AlertSidecarFacts title="Contract terms" values={legValues([
+          ['Contract', leg => <><strong className={leg.contract_type === 'CALL' ? 'sd-positive' : 'sd-negative'}>{leg.contract_type}</strong><small>{leg.contract_ticker}</small></>],
+          ['Side / ratio', leg => `${leg.side} / ${leg.ratio}`], ['Expiration', leg => leg.expiration_date],
+          ['DTE at source', () => original.calendar_dte ?? 'Unavailable'], ['Strike / share', leg => money(leg.strike)],
+          ['Contract multiplier', leg => leg.multiplier], ['Signed OTM distance', otm],
+        ])} />
+        <AlertSidecarFacts title="Prices and economics" values={legValues([
+          ['Underlying spot', leg => money(leg.spot)], ['Original model mark / share', leg => <span className="oa-trigger-price">{money(leg.model_mark)}</span>],
+          ['Retained bid / share', leg => money(leg.quote_bid)], ['Retained ask / share', leg => money(leg.quote_ask)],
+          ['Mark basis', leg => label(leg.mark_source)],
+        ])} />
+        <AlertSidecarFacts title="Greeks and volatility" values={legValues([
+          ['Local IV', leg => optionAlertPercent(leg.local_iv)], ['Delta', leg => <span className={markTone(leg.local_delta)}>{leg.local_delta ?? 'Unavailable'}</span>],
+          ['Gamma', leg => leg.local_gamma ?? 'Unavailable'], ['Theta / share / day', leg => <span className={markTone(leg.local_theta_per_day)}>{leg.local_theta_per_day ?? 'Unavailable'}</span>],
+          ['Vega / share / vol point', leg => leg.local_vega_per_vol_point ?? 'Unavailable'], ['Rho / share / rate point', leg => <span className={markTone(leg.local_rho_per_rate_point)}>{leg.local_rho_per_rate_point ?? 'Unavailable'}</span>],
+        ])} />
+        <AlertSidecarFacts title="Activity" values={legValues([
+          ['Day volume', leg => leg.day_volume?.toLocaleString() ?? 'Unavailable'], ['Open interest', leg => leg.open_interest?.toLocaleString() ?? 'Unavailable'],
+          ['Volume / OI ratio', ratio],
+        ])} />
+        <AlertSidecarFacts title="Model quality and assumptions" values={legValues([
+          ['Model version', leg => leg.model_version || 'Unavailable'], ['Quality flags', leg => leg.quality_flags?.length ? leg.quality_flags.map(label).join(' / ') : 'None recorded'],
+          ['Time to expiration (years)', leg => leg.time_to_expiration_years ?? 'Unavailable'], ['Risk-free rate', leg => optionAlertPercent(leg.risk_free_rate)],
+          ['Dividend yield', leg => optionAlertPercent(leg.dividend_yield)], ['Valuation policy version', leg => leg.valuation_policy_version || 'Unavailable'],
+        ])} />
+        <AlertSidecarFacts title="Source times" values={legValues([
+          ['Snapshot market time (ET)', leg => time(leg.source_market_time)], ['Mark basis', leg => label(leg.mark_source)],
+          ['Valuation policy SHA256', leg => leg.valuation_policy_sha256 ? <code>{leg.valuation_policy_sha256}</code> : 'Unavailable'],
+        ])} />
+        <section aria-label="Original alert management"><h3>Original alert management</h3><Rules values={visibleManagement} /></section>
+      </>}
+      <details className="oa-provenance"><summary>Alert and snapshot provenance</summary><Rules values={{ candidate_id: row.candidate_id,
+        matrix_id: row.matrix_id, evaluation_id: row.evaluation_id, plan_sha256: row.plan_sha256, event_horizon: row.event_horizon_status,
+        original_basis: original.basis, original_observed_at: original.observed_time }} /></details>
+      {!row.observation && legs.map(leg => <details className="oa-provenance" key={leg.leg_index}><summary>Leg {leg.leg_index + 1} provenance</summary><Rules values={{
+        snapshot_id: leg.snapshot_id, batch_id: leg.batch_id, normalized_payload_sha256: leg.normalized_payload_sha256,
+        valuation_policy_version: leg.valuation_policy_version, valuation_policy_sha256: leg.valuation_policy_sha256 }} /></details>)}
+      {!row.observation && <button type="button" className="oa-command" onClick={openCandidate}><Eye size={15} />Original candidate evidence</button>}
+    </div>
+  </Modal>
+}
+
 function DetectorAlertsPanel({ view, params, update, offset, onSessionContext }: {
   view: 'behavior' | 'day_history'; params: URLSearchParams;
   update: (values: Record<string, string | null>) => void; offset: number;
   onSessionContext: (value: NonNullable<PageContextValue['alertSessions']>) => void;
 }) {
   const queryClient = useQueryClient()
-  const preferences = useColumnPreferences('option-detector-alerts-v4', detectorAlertColumns)
+  const preferences = useColumnPreferences('option-detector-alerts-v8', detectorAlertColumns)
   const hidden = new Set([...preferences.hidden].filter(key => !detectorAlertColumns.some(column => column.key === key && column.locked)))
-  const columns = detectorAlertColumns.filter(column => !hidden.has(column.key))
+  const columns = detectorAlertColumns.filter(column => !hidden.has(column.key)
+    && (view === 'day_history' || !detectorHistoryOnlyColumns.has(column.key)))
   const [planDetail, setPlanDetail] = useState<OptionDetectorAlertReview['rows'][number] | null>(null)
   const [presets, setPresets] = useState<DetectorViewPreset[]>([])
   const [presetError, setPresetError] = useState('')
@@ -473,46 +601,52 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext }:
           ? <DetectorSortHeader key={column.key} title={column.label} field={column.key as OptionDetectorSort} params={params} update={update} />
           : <th key={column.key} scope="col">{column.label}</th>)}</tr></thead>
           <tbody>{data?.rows.map(row => {
-            const technical = row.management_policy?.technical_exit as Record<string, unknown> | undefined
             const observation = row.observation
             const original = row.original_package
             const legs = original?.status === 'AVAILABLE' ? original.legs : []
+            const thresholds = detectorThresholdCells(original?.net_premium, legs, row.management_policy ?? undefined, {
+              version: String(row.management_policy?.policy_version || ''), source: 'EXPLICIT_ALERT_POLICY',
+              entryLimit: row.entry_limit, entryKind: 'MAXIMUM_DEBIT', exitDeadline: row.exit_deadline ?? undefined,
+            })
             return <tr key={row.evaluation_id}><ColumnCells columns={columns} values={{
               triggered_at: <span title={row.detector_id === 'O1' ? 'Original option source time' : 'Original stock trigger-bar time'}>{time(row.triggered_at)}</span>,
-              underlyer: <><button type="button" className="oa-row-link" onClick={() => setPlanDetail(row)}>{row.underlyer}</button><small>{observation ? 'Volatility observation' : row.direction === 1 ? 'Bullish' : 'Bearish'}</small></>,
+              underlyer: <><button type="button" className="oa-row-link" onClick={() => setPlanDetail(row)}>{row.underlyer}</button><small className={observation ? '' : markTone(row.direction)}>{observation ? 'O2 / IV observation' : `${row.detector_id} / ${row.direction === 1 ? 'Bullish' : 'Bearish'}`}</small></>,
               detector: <>{detectorNames[row.detector_id]}<small>{label(row.origin)}</small></>,
               category: label(row.category), strategy: row.strategy_name ? optionPackageStrategyName(row.strategy_name) : 'Unavailable',
               contracts: legs.length ? <>{label(original?.structure_type || '')}{legs.map(leg => <small key={leg.leg_index}>{leg.side} {leg.ratio} {leg.contract_ticker}</small>)}</> : 'Unavailable',
               expiry: original?.expiration_date ? <>{original.expiration_date}<small>{original.calendar_dte ?? 'Unavailable'} DTE at source</small></> : 'Unavailable',
-              ...marketCells(legs), option_price: <PackagePrice netPremium={original?.net_premium} legs={legs} />,
-              ...planCells(original?.net_premium, legs, row.management_policy ?? undefined, { version: String(row.management_policy?.policy_version || ''),
-                source: 'EXPLICIT_ALERT_POLICY', entryLimit: row.entry_limit, entryKind: 'MAXIMUM_DEBIT', exitDeadline: row.exit_deadline ?? undefined }, original?.maximum_loss),
+              ...marketCells(legs), option_price: <span className="oa-trigger-price"><PackagePrice netPremium={original?.net_premium} legs={legs} /></span>,
+              ...detectorCurrentMarkCells(row.current_mark, original?.net_premium),
+              ...thresholds,
               capital: money(original?.capital_at_risk), maximum_loss: money(original?.maximum_loss), maximum_profit: money(original?.maximum_profit),
               breakevens: original?.breakevens?.length ? original.breakevens.map(money).join(', ') : 'Unavailable',
               outcome_status: 'Not connected',
               run: time(row.scheduled_cycle), entry_limit: <>{money(row.entry_limit)}<small>Debit / Not a fill</small></>,
               hit_count: <span title={`Last observed ${time(row.last_seen_at)} ET`}>{row.hit_count}<small>{row.repeat_count} repeats</small></span>,
-              technical_stop: money(technical?.underlying_stop), technical_target: money(technical?.underlying_target),
               entry_window: <><Status value={optionEntryWindow(row.entry_deadline)} /><small>{time(row.entry_deadline)} ET</small></>,
-              exit_due: time(row.exit_deadline), net_return: optionAlertPercent(row.net_return),
+              fitted_iv: 'Not applicable', residual: 'Not applicable', robust_z: 'Not applicable',
+              source_cutoff: 'Not applicable', analyzed_at: 'Not applicable',
               details: <button type="button" className="oa-icon" title="View frozen alert plan" aria-label={`View ${row.underlyer} ${row.detector_id} alert plan`} onClick={() => setPlanDetail(row)}><Eye size={15} /></button>,
               ...(observation ? {
+                ...Object.fromEntries(Object.entries(detectorObservationFieldStates(row)).map(([key, value]) => [key,
+                  <span title={value === 'Not retained' ? 'This market field is not included in the retained O2 observation; no current or unrelated snapshot is substituted.' : value === 'Not applicable' ? 'O2 records an IV observation, not a directional trigger, trade package or fill.' : undefined}>{value}</span>])),
                 contracts: observation.findings.map(finding => <div key={finding.snapshot_id}>{money(finding.strike)} {observation.contract_type}<small>{finding.residual > 0 ? 'Rich IV' : 'Cheap IV'} / z {finding.robust_z.toFixed(2)}</small></div>),
                 expiry: observation.expiration_date,
                 iv: observation.findings.map(finding => <div key={finding.snapshot_id}>{optionAlertPercent(finding.local_iv)}<small>Fitted {optionAlertPercent(finding.fitted_iv)} / gap {(finding.residual * 100).toFixed(2)} pts</small></div>),
-                strategy: 'Local IV surface observation', outcome_status: 'Observation only',
-                option_price: 'Not a package', entry_limit: 'Not applicable', entry_window: 'Not applicable',
-                exit_due: 'Not applicable', hit_count: 'Not counted as package hits',
-                plan_stop: 'Not applicable', plan_target: 'Not applicable', risk_to_stop: 'Not applicable',
-                reward_risk: 'Not applicable', maximum_hold: 'Not applicable',
-                risk_assessment: <span>Observation only<small>{label(row.event_horizon_status)} event context</small></span>,
+                fitted_iv: observation.findings.map(finding => <div key={finding.snapshot_id}>{optionAlertPercent(finding.fitted_iv)}</div>),
+                residual: observation.findings.map(finding => <div key={finding.snapshot_id}>{(finding.residual * 100).toFixed(2)}</div>),
+                robust_z: observation.findings.map(finding => <div key={finding.snapshot_id}>{finding.robust_z.toFixed(2)}</div>),
+                source_cutoff: time(observation.market_cutoff), analyzed_at: time(observation.decision_at),
+                risk_assessment: <span>Observation only<small>{label(row.event_horizon_status || 'UNAVAILABLE')} event context</small></span>,
+                details: <button type="button" className="oa-icon" title="View retained IV observation evidence" aria-label={`View ${row.underlyer} O2 observation evidence`} onClick={() => setPlanDetail(row)}><Eye size={15} /></button>,
               } : {}),
             }} /></tr>
           })}</tbody>
         </table>{!data?.rows.length && <div className="sd-empty">{!dataset ? index?.datasets.length ? 'Select a detector dataset.' : 'No detector runs have been recorded.'
           : data?.status === 'NO_COMPLETE_RUN' ? 'No completed detector run for this dataset and session.'
           : view === 'behavior' ? 'No qualified new alerts in this completed run and filter scope.' : 'No earlier admitted alerts for this session and filter scope.'}</div>}
-      </div><div className="sd-pager"><span>{data?.total ?? 0} alert records</span><div>
+      </div>
+      <div className="sd-pager"><span>{data?.total ?? 0} alert / observation records</span><div>
         <button aria-label="Previous detector alerts page" disabled={!offset || review.isFetching} onClick={() => update({ offset: String(Math.max(0, offset - pageSize)) })}><ArrowLeft size={15} /></button>
         <button aria-label="Next detector alerts page" disabled={offset + pageSize >= (data?.total ?? 0) || review.isFetching} onClick={() => update({ offset: String(offset + pageSize) })}><ArrowRight size={15} /></button>
       </div></div></div>
@@ -521,27 +655,9 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext }:
       <label>Preset name<input aria-label="Alert preset name" value={presetName} maxLength={60} onChange={event => setPresetName(event.target.value)} required /></label>
       {presetError && <Notice>{presetError}</Notice>}<div className="oa-form-actions"><button className="oa-command" type="submit"><Save size={15} />Save preset</button></div>
     </form></Modal>}
-    {planDetail && <Modal title={`${planDetail.underlyer} ${planDetail.detector_id} frozen alert`} close={() => setPlanDetail(null)}><div className="oa-detail">
-      {planDetail.observation ? <>
-        <Rules values={{ source_cutoff: time(planDetail.observation.market_cutoff), decision_at: time(planDetail.observation.decision_at),
-          published_at: time(planDetail.first_selected_at), original_valid_until: time(planDetail.observation.valid_until),
-          stock_context: planDetail.observation.stock_context_status, event_context: planDetail.event_horizon_status,
-          strike_count: planDetail.observation.input_count, policy_sha256: planDetail.observation.policy_sha256,
-          source_sha256: planDetail.observation.source_sha256 }} />
-        {planDetail.observation.findings.map(finding => <Rules key={finding.snapshot_id} values={{
-          contract: `${planDetail.observation?.expiration_date} ${money(finding.strike)} ${planDetail.observation?.contract_type}`,
-          local_iv: optionAlertPercent(finding.local_iv), fitted_iv: optionAlertPercent(finding.fitted_iv),
-          residual_iv_points: (finding.residual * 100).toFixed(3), robust_z: finding.robust_z.toFixed(3), snapshot_id: finding.snapshot_id }} />)}
-        <p className="oa-permission">Development observation / No package, fill or execution permission</p>
-      </> : <>
-      <Rules values={{ category: label(planDetail.category), package_strategy: optionPackageStrategyName(planDetail.strategy_name),
-        first_selected: time(planDetail.first_selected_at), entry_limit: money(planDetail.entry_limit), entry_deadline: time(planDetail.entry_deadline),
-        exit_due: time(planDetail.exit_deadline), hits: planDetail.hit_count, plan_sha256: planDetail.plan_sha256 }} />
-      <h3>Original management</h3><Rules values={planDetail.management_policy} />
-      <p className="oa-permission">Indicative plan / Outcomes unavailable / No fill or execution permission</p>
-      <button type="button" className="oa-command" onClick={() => { update({ candidate: planDetail.candidate_id, offset: String(offset) }); setPlanDetail(null) }}><Eye size={15} />Original candidate evidence</button>
-      </>}
-    </div></Modal>}
+    {planDetail && <DetectorAlertSidecar row={planDetail} close={() => setPlanDetail(null)} openCandidate={() => {
+      update({ candidate: planDetail.candidate_id, offset: String(offset) }); setPlanDetail(null)
+    }} />}
   </section>
 }
 
@@ -562,6 +678,7 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
   const review = useQuery({ queryKey: ['option-detector-evaluations', request], queryFn: () => getOptionDetectorEvaluations(request), retry: false,
     enabled: Boolean(index), refetchInterval: 30_000 })
   const data = review.data?.available ? review.data.data : undefined
+  const surfaceObservation = observationDetail ? detectorSurfaceObservation(observationDetail) : null
   useEffect(() => { setObservationDetail(null) }, [params])
   useEffect(() => {
     if (data) onSessionContext({ dates: data.sessions, selected: data.session_date || '', source: 'OPTIONS_DETECTOR_EVALUATIONS',
@@ -604,15 +721,15 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
           <DetectorSortHeader title="Model" field="detector" params={params} update={update} />
           <DetectorSortHeader title="Category" field="category" params={params} update={update} />
           <DetectorSortHeader title="Package strategy" field="strategy" params={params} update={update} /><th>Details</th></tr></thead>
-        <tbody>{data.rows.map(row => <tr key={row.evaluation_id}>
+        <tbody>{data.rows.map(row => { const surface = detectorSurfaceObservation(row); return <tr key={row.evaluation_id}>
           <td>{row.underlyer}<small>{row.direction === 1 ? 'Bullish' : row.direction === -1 ? 'Bearish' : 'Nondirectional'}</small></td>
-          <td>{time(row.scheduled_cycle)}</td><td>{selectionNames[row.selection_status]}<small>{label(row.selection_reason)}</small>{row.observation && <><small>{label(row.observation.finding_disposition)}</small><small>{row.observation.findings.length} residual findings</small></>}</td>
+          <td>{time(row.scheduled_cycle)}</td><td>{selectionNames[row.selection_status]}<small>{label(row.selection_reason)}</small>{surface && <><small>{label(surface.finding_disposition)}</small><small>{surface.findings.length} residual findings</small></>}</td>
           <td>{row.candidate_rank ?? 'Not applicable'}</td><td>{row.observation ? 'Not applicable' : <>{money(row.entry_limit)}<small>Not a fill</small></>}</td><td>{row.observation ? 'Not applicable' : optionAlertPercent(row.net_return)}</td>
           <td>{detectorNames[row.detector_id]}<small>{label(row.origin)}</small>{row.shared_model_exposure && <small>Shared exposure</small>}</td>
           <td>{label(row.category)}</td><td>{row.observation ? 'Not applicable' : row.strategy_name ? optionPackageStrategyName(row.strategy_name) : 'Unavailable'}</td>
-          <td><button className="oa-icon" aria-label={`View ${row.underlyer} ${row.detector_id} evaluation package`} title={row.observation ? 'View surface observation evidence' : 'View original candidate evidence'}
-            onClick={() => row.observation ? setObservationDetail(row) : update({ candidate: row.candidate_id, offset: String(offset) })}><Eye size={15} /></button></td>
-        </tr>)}</tbody>
+          <td><button className="oa-icon" aria-label={`View ${row.underlyer} ${row.detector_id} evaluation package`} title={surface ? 'View surface observation evidence' : row.observation ? 'Observation detail unavailable in this table' : 'View original candidate evidence'}
+            disabled={Boolean(row.observation && !surface)} onClick={() => surface ? setObservationDetail(row) : !row.observation && update({ candidate: row.candidate_id, offset: String(offset) })}><Eye size={15} /></button></td>
+        </tr> })}</tbody>
       </table>{!data.rows.length && <div className="sd-empty">No detector evaluation records for this dataset and session.</div>}</div>
         <div className="sd-pager"><span>{data.total} evaluation records</span><div>
           <button aria-label="Previous evaluation page" disabled={offset === 0 || review.isFetching} onClick={() => update({ offset: String(Math.max(0, offset - pageSize)) })}><ArrowLeft size={15} /></button>
@@ -621,16 +738,16 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
       </div>
     </>}
     <details className="oa-provenance"><summary>Legacy diagnostics</summary><button type="button" className="oa-command" onClick={() => update({ eod: 'legacy', offset: null })}>Legacy stock gates</button></details>
-    {observationDetail?.observation && <Modal title={`${observationDetail.underlyer} surface observation`} close={() => setObservationDetail(null)}>
+    {surfaceObservation && observationDetail && <Modal title={`${observationDetail.underlyer} surface observation`} close={() => setObservationDetail(null)}>
       <div className="oa-detail"><dl className="oa-facts">
-        <div><dt>Finding</dt><dd>{label(observationDetail.observation.finding_disposition)}</dd></div>
-        <div><dt>Stock context</dt><dd>{label(observationDetail.observation.stock_context_status)}</dd></div>
-        <div><dt>Event context</dt><dd>{label(observationDetail.event_horizon_status)}</dd></div>
+        <div><dt>Finding</dt><dd>{label(surfaceObservation.finding_disposition)}</dd></div>
+        <div><dt>Stock context</dt><dd>{label(surfaceObservation.stock_context_status)}</dd></div>
+        <div><dt>Event context</dt><dd>{label(observationDetail.event_horizon_status || 'UNAVAILABLE')}</dd></div>
         <div><dt>Output</dt><dd>Observation only</dd></div>
-      </dl><ul>{observationDetail.observation.reasons.map(reason => <li key={reason}>{label(reason)}</li>)}</ul>
+      </dl><ul>{surfaceObservation.reasons.map(reason => <li key={reason}>{label(reason)}</li>)}</ul>
         <div className="oa-leg-scroll" tabIndex={0} role="region" aria-label="Surface residual evidence"><table className="oa-legs">
           <thead><tr><th>Contract ID</th><th>Strike</th><th>Observed IV</th><th>Fitted IV</th><th>Residual</th><th>Robust z</th></tr></thead>
-          <tbody>{observationDetail.observation.findings.map(finding => <tr key={finding.snapshot_id}><td>{finding.contract_id}</td><td>{money(finding.strike)}</td>
+          <tbody>{surfaceObservation.findings.map(finding => <tr key={finding.snapshot_id}><td>{finding.contract_id}</td><td>{money(finding.strike)}</td>
             <td>{optionAlertPercent(finding.local_iv)}</td><td>{optionAlertPercent(finding.fitted_iv)}</td><td>{optionAlertPercent(finding.residual)}</td><td>{finding.robust_z.toFixed(3)}</td></tr>)}</tbody>
         </table></div>
       </div>
@@ -858,7 +975,7 @@ export default function OptionsAlertsPage() {
     </div><div className="sd-tools">{(historyView || activeView === 'daily' && params.get('eod') === 'legacy') && <ColumnPicker key={activeView} columns={optionAlertColumns[activeView]} hidden={hidden} onToggle={preferences.toggle} onShowAll={preferences.showAll} onReset={preferences.reset} />}<Link to="/options" className="oa-research"><FlaskConical size={14} />Research</Link>{!reviewView && <button type="button" title="Refresh options alerts" aria-label="Refresh options alerts" disabled={query.isFetching} onClick={() => { void query.refetch() }}><RefreshCw size={15} /></button>}</div></div>
     {reviewView && <OptionsAlertWindow dataset={params.get('evaluation_dataset')} />}
     {reviewView ? activeView === 'daily' ? <BehaviorReviewPanel key={activeView} view="daily" params={params} update={update} offset={offset} columns={columns} onSessionContext={setSessionContext} />
-      : <DetectorAlertsPanel key={`detector-v4-${activeView}`} view={activeView as 'behavior' | 'day_history'} params={params} update={update} offset={offset} onSessionContext={setSessionContext} /> : <>
+      : <DetectorAlertsPanel key={`detector-v5-${activeView}`} view={activeView as 'behavior' | 'day_history'} params={params} update={update} offset={offset} onSessionContext={setSessionContext} /> : <>
     {!historyView && <div className="sd-filters oa-filters">
       <label>Underlying<input type="search" placeholder="All underlyings" maxLength={12} value={params.get('underlyer') || ''} onChange={event => update({ underlyer: event.target.value.toUpperCase() })} /></label>
       <label>Category<select aria-label="Category" value={category || ''} onChange={event => update({ category: event.target.value, strategy: null })}><option value="">All categories</option>{catalog.data?.categories.map(item => <option value={item.id} key={item.id}>{item.label}</option>)}</select></label>
@@ -917,4 +1034,8 @@ export default function OptionsAlertsPage() {
     {selectedId && <CandidateDetail key={selectedId} candidateId={selectedId} close={closeDetail} />}
     {!selectedId && selectedEvent && <PublicationDetail row={selectedEvent} close={closeDetail} openCandidate={() => update({ candidate: selectedEvent.candidate_id, event: null, offset: String(offset) })} />}
   </div>
+}
+
+function detectorSurfaceObservation(row: OptionDetectorEvaluationReview['rows'][number]): OptionLocalSurfaceObservation | null {
+  return row.observation && 'findings' in row.observation ? row.observation : null
 }

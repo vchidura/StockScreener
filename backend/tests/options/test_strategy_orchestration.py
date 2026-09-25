@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -253,7 +254,8 @@ def test_auxiliary_assessment_failures_do_not_retry_original_strategy_work():
             event_calendar_provider=None, event_calendar_max_age_seconds=43200,
             equity_context_enabled=False, start_read_only=True,
         ),
-        strategy_policy=SimpleNamespace(strategy_version="strategy_v1"),
+        strategy_policy=SimpleNamespace(strategy_version="strategy_v1",
+            flow=SimpleNamespace(minimum_print_notional=Decimal("50000"))),
         strategy_policy_sha256="a" * 64,
     )
     pipeline.engine = SimpleNamespace(
@@ -265,7 +267,9 @@ def test_auxiliary_assessment_failures_do_not_retry_original_strategy_work():
     pipeline.work_repository = work_repository
     context = SimpleNamespace()
     pipeline.context_repository = SimpleNamespace(build=lambda *_args, **_kwargs: context)
-    pipeline.trade_repository = SimpleNamespace(list_for_underlyer=lambda *_args: ())
+    trade_reads = []
+    pipeline.trade_repository = SimpleNamespace(list_for_contracts=lambda *args, **kwargs:
+        trade_reads.append((args, kwargs)) or ())
     pipeline.strategy_repository = SimpleNamespace(
         persist=lambda persisted_context, result: persisted.append(
             (persisted_context, result)
@@ -292,3 +296,5 @@ def test_auxiliary_assessment_failures_do_not_retry_original_strategy_work():
     assert result.package_assessment_error == "RuntimeError: package failed"
     assert len(persisted) == 1
     assert len(completed) == 1
+    assert trade_reads == [(((), decision_context.market_time - timedelta(hours=8), decision_context),
+        {"minimum_notional": Decimal("50000")})]

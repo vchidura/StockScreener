@@ -54,6 +54,27 @@ class StrategyScanResult:
     candidate_gate_ledgers: tuple[tuple[UUID, ExecutionGateLedger], ...] = ()
 
 
+def _qualifying_participation_ratio(row, policy) -> float | None:
+    if policy is None or row.day_volume is None or row.open_interest is None or row.open_interest <= 0:
+        return None
+    ratio = row.day_volume / row.open_interest
+    return ratio if ratio >= policy.minimum_volume_oi_ratio else None
+
+
+def _participation_anchor_evidence(evidence, policy, ratio):
+    if ratio is None:
+        return evidence
+    return {
+        **evidence,
+        "participation_anchor": {
+            "version": policy.version,
+            "source_basis": policy.source_basis,
+            "volume_oi_ratio": ratio,
+            "revalidation": "O1_DATED_OPEN_INTEREST_REQUIRED",
+        },
+    }
+
+
 def _quadratic_coefficient_payload(coefficients: np.ndarray) -> dict[str, float]:
     if coefficients.shape != (3,):
         raise ValueError("quadratic fit must contain exactly three coefficients")
@@ -555,11 +576,10 @@ class OptionStrategyEngine:
         )
         outputs: list[OptionCandidate] = []
         emitted: dict[tuple[str, ContractType], int] = defaultdict(int)
-        for lane, contract_type, ratio, row, evidence in scored:
-            key = (lane, contract_type)
-            if emitted[key] >= policy.maximum_candidates_per_lane_side:
-                continue
-            emitted[key] += 1
+        anchor_policy = self.policy.participation_anchor
+
+        def append_candidate(item, participation_ratio=None):
+            lane, contract_type, ratio, row, evidence = item
             structure = (
                 StructureType.LONG_CALL
                 if contract_type is ContractType.CALL
@@ -567,6 +587,15 @@ class OptionStrategyEngine:
             )
             leg = _leg(row, 0, OptionSide.BUY)
             payoff = evaluate_terminal_payoff((leg,))
+            rank_components = {
+                "breakeven_expected_move_ratio": ratio,
+                "absolute_delta": abs(float(row.local_delta)),
+                "open_interest": row.open_interest,
+                "day_volume": row.day_volume,
+                "contract_id": row.contract_id,
+            }
+            if participation_ratio is not None:
+                rank_components["participation_volume_oi_ratio"] = participation_ratio
             outputs.append(
                 self._candidate(
                     matrix_id,
@@ -579,14 +608,10 @@ class OptionStrategyEngine:
                     context,
                     primary_metric_name="breakeven_expected_move_ratio",
                     primary_metric_value=ratio,
-                    rank_components={
-                        "breakeven_expected_move_ratio": ratio,
-                        "absolute_delta": abs(float(row.local_delta)),
-                        "open_interest": row.open_interest,
-                        "day_volume": row.day_volume,
-                        "contract_id": row.contract_id,
-                    },
-                    primary_evidence=evidence,
+                    rank_components=rank_components,
+                    primary_evidence=_participation_anchor_evidence(
+                        evidence, anchor_policy, participation_ratio
+                    ),
                     capital_at_risk=payoff.maximum_loss,
                     reason_codes=self._capability_reasons(context),
                     management_policy={
@@ -597,6 +622,29 @@ class OptionStrategyEngine:
                     },
                 )
             )
+
+        for lane, contract_type, ratio, row, evidence in scored:
+            key = (lane, contract_type)
+            if emitted[key] >= policy.maximum_candidates_per_lane_side:
+                continue
+            emitted[key] += 1
+            append_candidate(
+                (lane, contract_type, ratio, row, evidence),
+                _qualifying_participation_ratio(row, anchor_policy),
+            )
+        if anchor_policy is not None:
+            selected_contracts = {candidate.legs[0].contract_id for candidate in outputs}
+            anchors = [item for item in scored
+                if item[3].contract_id not in selected_contracts
+                and _qualifying_participation_ratio(item[3], anchor_policy) is not None]
+            anchors.sort(key=lambda item: (
+                -_qualifying_participation_ratio(item[3], anchor_policy),
+                item[0], item[1].value, item[2], item[3].contract_id,
+            ))
+            for item in anchors[:anchor_policy.maximum_candidates_per_underlyer_strategy]:
+                append_candidate(
+                    item, _qualifying_participation_ratio(item[3], anchor_policy)
+                )
         return tuple(outputs)
 
     def _debit_spread(
@@ -761,16 +809,26 @@ class OptionStrategyEngine:
         )
         outputs: list[OptionCandidate] = []
         emitted: dict[tuple[str, ContractType], int] = defaultdict(int)
-        for lane, contract_type, breakeven_ratio, return_on_risk, legs, payoff, evidence in scored:
-            key = (lane, contract_type)
-            if emitted[key] >= policy.maximum_candidates_per_lane_side:
-                continue
-            emitted[key] += 1
+        anchor_policy = self.policy.participation_anchor
+
+        def append_candidate(item, participation_ratio=None):
+            lane, contract_type, breakeven_ratio, return_on_risk, legs, payoff, evidence = item
             structure = (
                 StructureType.CALL_DEBIT_VERTICAL
                 if contract_type is ContractType.CALL
                 else StructureType.PUT_DEBIT_VERTICAL
             )
+            rank_components = {
+                "return_on_risk": return_on_risk,
+                "breakeven_expected_move_ratio": breakeven_ratio,
+                "target_expected_move_ratio": evidence[
+                    "target_expected_move_ratio"
+                ],
+                "width_fraction": evidence["width_fraction"],
+                "ordered_contract_ids": [leg.contract_id for leg in legs],
+            }
+            if participation_ratio is not None:
+                rank_components["participation_volume_oi_ratio"] = participation_ratio
             outputs.append(
                 self._candidate(
                     matrix_id,
@@ -783,16 +841,10 @@ class OptionStrategyEngine:
                     context,
                     primary_metric_name="return_on_risk",
                     primary_metric_value=return_on_risk,
-                    rank_components={
-                        "return_on_risk": return_on_risk,
-                        "breakeven_expected_move_ratio": breakeven_ratio,
-                        "target_expected_move_ratio": evidence[
-                            "target_expected_move_ratio"
-                        ],
-                        "width_fraction": evidence["width_fraction"],
-                        "ordered_contract_ids": [leg.contract_id for leg in legs],
-                    },
-                    primary_evidence=evidence,
+                    rank_components=rank_components,
+                    primary_evidence=_participation_anchor_evidence(
+                        evidence, anchor_policy, participation_ratio
+                    ),
                     capital_at_risk=payoff.maximum_loss,
                     return_on_risk=return_on_risk,
                     reason_codes=self._capability_reasons(context),
@@ -805,6 +857,41 @@ class OptionStrategyEngine:
                     },
                 )
             )
+
+        for lane, contract_type, breakeven_ratio, return_on_risk, legs, payoff, evidence in scored:
+            key = (lane, contract_type)
+            if emitted[key] >= policy.maximum_candidates_per_lane_side:
+                continue
+            emitted[key] += 1
+            append_candidate(
+                (lane, contract_type, breakeven_ratio, return_on_risk, legs, payoff, evidence),
+                _qualifying_participation_ratio(
+                    next(row for row in snapshots if row.contract_id == legs[0].contract_id),
+                    anchor_policy,
+                ),
+            )
+        if anchor_policy is not None:
+            snapshots_by_contract = {row.contract_id: row for row in snapshots}
+            selected_long_contracts = {candidate.legs[0].contract_id for candidate in outputs}
+            anchors = []
+            anchored_long_contracts = set()
+            for item in scored:
+                long_contract_id = item[4][0].contract_id
+                participation_ratio = _qualifying_participation_ratio(
+                    snapshots_by_contract[long_contract_id], anchor_policy
+                )
+                if (long_contract_id in selected_long_contracts
+                        or long_contract_id in anchored_long_contracts
+                        or participation_ratio is None):
+                    continue
+                anchored_long_contracts.add(long_contract_id)
+                anchors.append((item, participation_ratio))
+            anchors.sort(key=lambda value: (
+                -value[1], value[0][0], value[0][1].value,
+                -value[0][3], value[0][2], value[0][4][0].contract_id,
+            ))
+            for item, participation_ratio in anchors[:anchor_policy.maximum_candidates_per_underlyer_strategy]:
+                append_candidate(item, participation_ratio)
         return tuple(outputs)
 
     def _spread_and_range(

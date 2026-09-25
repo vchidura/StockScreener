@@ -1,7 +1,7 @@
 import inspect
 import sys
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -186,3 +186,26 @@ def test_market_fact_reads_require_decision_context():
     now = datetime(2026, 8, 28, 20, 15, tzinfo=UTC)
     context = DecisionContext(market_time=now, observed_time=now)
     assert context.observed_time == now
+
+
+def test_bounded_trade_read_uses_contract_time_and_notional_policy():
+    cursor = MagicMock()
+    cursor.closed = False
+    cursor.fetchall.return_value = []
+    factory, _ = _connection_factory(cursor)
+    repository = OptionTradeRepository(factory)
+    now = datetime(2026, 8, 28, 20, 15, tzinfo=UTC)
+    context = DecisionContext(market_time=now, observed_time=now + timedelta(minutes=1))
+
+    assert repository.list_for_contracts(
+        (3, 1, 3), now - timedelta(hours=8), context,
+        minimum_notional=Decimal("50000"),
+    ) == ()
+
+    sql, parameters = cursor.execute.call_args.args
+    assert "contract_id = ANY(%s::bigint[])" in sql
+    assert "classification_status = 'INCLUDED'" in sql
+    assert "notional >= %s" in sql
+    assert "underlying = %s" not in sql
+    assert parameters == ([1, 3], now - timedelta(hours=8), now,
+        context.observed_time, Decimal("50000"))

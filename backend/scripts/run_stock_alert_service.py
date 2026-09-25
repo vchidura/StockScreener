@@ -285,7 +285,14 @@ def write_status(path, payload):
             json.dump(payload, output, allow_nan=False, sort_keys=True)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, path)
+        for attempt in range(3):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05)
     finally:
         if temporary and Path(temporary).exists():
             Path(temporary).unlink()

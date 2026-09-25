@@ -5,17 +5,11 @@ import {
   scanAll,
   getTickersOverview, getLatestPriceDate,
   getDailyRecommendationsWithFallback,
-  getCrossSectionalSignals,
-  getSignalSectors,
-  getDiscoveryStates,
   TickerOverviewRow,
   MarketRegime,
   DailyRecommendationsResponse,
-  CrossSectionalListResponse,
-  SectorCoverage,
-  DiscoveryResponse,
-  DiscoveryState,
 } from '../services/api'
+import { MomentumRanks } from './EquityContextPanels'
 import { usePublishPageContext } from '../layout/pageContext'
 import { CommandBar, CommandSpacer } from '../layout/PageChrome'
 
@@ -62,25 +56,6 @@ function Dashboard() {
   const { data: dailyRecs = { trade_date: '', bull_recommendations: [], bear_recommendations: [], total_bull: 0, total_bear: 0, used_date: '' }, isFetching: recsLoading } = useQuery<DailyRecommendationsResponse & { used_date: string }>({
     queryKey: ['daily-recommendations'],
     queryFn: () => getDailyRecommendationsWithFallback(),
-  })
-  const [signalSector, setSignalSector] = useState<string>('')
-  const { data: sectorList = { sectors: [] } } = useQuery<{ sectors: SectorCoverage[] }>({
-    queryKey: ['xs-signal', 'sectors'],
-    queryFn: () => getSignalSectors(),
-  })
-  const { data: xsLong = null, isFetching: xsLongLoading } = useQuery<CrossSectionalListResponse>({
-    queryKey: ['xs-signal', 'LONG', signalSector],
-    queryFn: () => getCrossSectionalSignals('LONG', 10, signalSector || undefined),
-  })
-  const { data: xsShort = null } = useQuery<CrossSectionalListResponse>({
-    queryKey: ['xs-signal', 'SHORT', signalSector],
-    queryFn: () => getCrossSectionalSignals('SHORT', 10, signalSector || undefined),
-  })
-  const xsShortRows = xsShort?.results ?? []
-  const [discoveryState, setDiscoveryState] = useState<DiscoveryState>('REVERSAL_CONFIRMED')
-  const { data: discovery = null, isFetching: discoveryLoading } = useQuery<DiscoveryResponse>({
-    queryKey: ['market-discovery', discoveryState, signalSector],
-    queryFn: () => getDiscoveryStates(discoveryState, 100, signalSector || undefined),
   })
   type StratEntry = { strategy: string; direction: 'buy' | 'sell' | 'hold'; weight: number }
   type FibWatchEntry = { ticker: string; signal: string; nearest_level: string; distance_pct: number; trend: string }
@@ -628,196 +603,7 @@ function Dashboard() {
 
       </div>
 
-      {/* ─── VALIDATED CROSS-SECTIONAL SIGNAL ─── */}
-      <div style={{ marginBottom: '1.25rem' }}>
-        <h3 style={SECTION_TITLE}>
-          ✅ Validated Signal
-          <span style={SUBTITLE}>
-            {xsLong?.results?.[0]
-              ? `${xsLong.results[0].model_version} · ${xsLong.trade_date} · ${xsLong.results[0].horizon_days}-day hold · ${xsLong.results[0].universe_size} names`
-              : 'Runs after each close'}
-          </span>
-        </h3>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', margin: '-4px 0 10px' }}>
-          <label htmlFor="xs-sector" style={{ fontSize: '0.75rem', color: 'var(--tm-muted)', fontWeight: 600 }}>
-            Rank within
-          </label>
-          <select
-            id="xs-sector"
-            value={signalSector}
-            onChange={e => setSignalSector(e.target.value)}
-            style={{
-              fontSize: '0.78rem', padding: '4px 8px', borderRadius: '6px',
-              border: '1px solid var(--tm-line-strong)', color: 'var(--tm-ink)', background: 'var(--tm-surface-raised)',
-            }}
-          >
-            <option value="">Whole universe</option>
-            {sectorList.sectors.map(s => (
-              <option key={s.sector} value={s.sector}>{s.sector} ({s.tickers})</option>
-            ))}
-          </select>
-          {signalSector && (
-            <span style={{ fontSize: '0.72rem', color: 'var(--tm-warn)' }}>
-              Sector ranking diversifies (max sector share 35% → 21%) but historically
-              returned ~19% vs ~25% a year.
-            </span>
-          )}
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '14px' }}>
-          {([
-            { label: signalSector ? `Top of ${signalSector} — LONG` : 'Top decile — LONG', rows: xsLong?.results ?? [], color: 'var(--tm-pos)' },
-            { label: signalSector ? `Bottom of ${signalSector}` : 'Bottom decile — SHORT', rows: xsShortRows, color: 'var(--tm-neg)' },
-          ]).map(panel => (            <div key={panel.label} style={CARD}>
-              <h4 style={{ margin: '0 0 10px', fontSize: '0.9rem', color: panel.color, fontWeight: 700 }}>
-                {panel.label}
-              </h4>
-              {xsLongLoading ? (
-                <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>Loading signal...</div>
-              ) : panel.rows.length === 0 ? (
-                <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>
-                  No signal yet — generated post-close.
-                </div>
-              ) : (
-                <table style={{ width: '100%', fontSize: '0.84rem', borderCollapse: 'collapse' }}>
-                  <thead>
-                    <tr style={{ borderBottom: `2px solid ${panel.color}` }}>
-                      <th style={{ padding: '8px 6px', textAlign: 'left', fontWeight: 700, color: 'var(--tm-muted)', fontSize: '0.75rem' }}>Ticker</th>
-                      <th style={{ padding: '8px 6px', textAlign: 'right', fontWeight: 700, color: 'var(--tm-muted)', fontSize: '0.75rem' }}>Rank</th>
-                      <th style={{ padding: '8px 6px', textAlign: 'right', fontWeight: 700, color: 'var(--tm-muted)', fontSize: '0.75rem' }}>Score</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {panel.rows.map(r => {
-                      const rank = signalSector
-                        ? r.sector_rank
-                        : r.percentile !== null
-                          ? Math.round((1 - r.percentile) * (r.universe_size - 1)) + 1
-                          : null
-                      const total = signalSector ? r.sector_size : r.universe_size
-                      return (
-                        <tr key={r.ticker} style={{ borderBottom: '1px solid var(--tm-line)' }}>
-                          <td
-                            onClick={() => navigate(`/ticker/${r.ticker}`)}
-                            style={{ padding: '8px 6px', fontWeight: 700, cursor: 'pointer', color: 'var(--tm-accent)' }}
-                          >
-                            {r.ticker}
-                          </td>
-                          <td style={{ padding: '8px 6px', textAlign: 'right', color: 'var(--tm-muted)' }}>
-                            {rank !== null ? `${rank} / ${total}` : '—'}
-                          </td>
-                          <td style={{ padding: '8px 6px', textAlign: 'right', fontWeight: 600, color: panel.color }}>
-                            {r.neutral_score !== null ? r.neutral_score.toFixed(2) : '—'}
-                          </td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              )}
-            </div>
-          ))}
-        </div>
-        <div style={{ marginTop: '8px', fontSize: '0.72rem', color: 'var(--tm-muted)' }}>
-          Cross-sectional momentum, neutralised against beta / size / volatility / sector.
-          Out-of-sample net Sharpe 1.32 vs 1.02 for equal-weight long-only. Monitored, not
-          settled — IC t-stat 1.70 over 26 independent periods. The long leg carries the edge
-          (+2.00% per 21d, t=2.85); the short leg is not statistically distinguishable from the
-          universe (t=−0.22), so treat it as a hedge rather than a conviction short. See{' '}
-          <code>docs/SIGNAL_RESEARCH.md</code>.
-        </div>
-      </div>
-
-      {/* ─── MARKET DISCOVERY STATES ─── */}
-      <div style={{ marginBottom: '1.25rem' }}>
-        <h3 style={SECTION_TITLE}>
-          Market Discovery
-          <span style={SUBTITLE}>
-            {discovery?.trade_date
-              ? `${discovery.trade_date} · ${discovery.results[0]?.model_version ?? 'shadow model'}`
-              : 'Runs after each complete close'}
-          </span>
-        </h3>
-        <div style={{ display: 'flex', gap: '8px', alignItems: 'center', margin: '-4px 0 10px', flexWrap: 'wrap' }}>
-          <label htmlFor="discovery-state" style={{ fontSize: '0.75rem', color: 'var(--tm-muted)', fontWeight: 600 }}>
-            Discovery lane
-          </label>
-          <select
-            id="discovery-state"
-            value={discoveryState}
-            onChange={event => setDiscoveryState(event.target.value as DiscoveryState)}
-            style={{
-              fontSize: '0.78rem', padding: '4px 8px', borderRadius: '6px',
-              border: '1px solid var(--tm-line-strong)', color: 'var(--tm-ink)', background: 'var(--tm-surface-raised)',
-            }}
-          >
-            <option value="CONTINUATION">Continuation ({discovery?.summary.CONTINUATION ?? 0})</option>
-            <option value="REVERSAL_CONFIRMED">Confirmed reversal ({discovery?.summary.REVERSAL_CONFIRMED ?? 0})</option>
-            <option value="EMERGING_REVERSAL">Emerging reversal ({discovery?.summary.EMERGING_REVERSAL ?? 0})</option>
-            <option value="REVERSAL_WATCH">Reversal watch ({discovery?.summary.REVERSAL_WATCH ?? 0})</option>
-            <option value="CONFLICT">Conflict ({discovery?.summary.CONFLICT ?? 0})</option>
-            <option value="LAGGARD">Laggard ({discovery?.summary.LAGGARD ?? 0})</option>
-          </select>
-          <span style={{ fontSize: '0.72rem', color: discoveryState === 'CONTINUATION' ? 'var(--tm-pos)' : 'var(--tm-warn)' }}>
-            {discoveryState === 'CONTINUATION'
-              ? '21-day continuation candidate; monitored alpha, not settled.'
-              : 'Discovery only — track outcomes before treating as a recommendation.'}
-          </span>
-        </div>
-        <div style={CARD}>
-          {discoveryLoading ? (
-            <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>Loading discovery states...</div>
-          ) : !discovery?.results.length ? (
-            <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>No names currently match this lane.</div>
-          ) : (
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', fontSize: '0.82rem', borderCollapse: 'collapse' }}>
-                <thead>
-                  <tr style={{ borderBottom: '2px solid var(--tm-line-strong)' }}>
-                    {['Ticker', 'Sector', '21d move', 'Recent rank', 'Activity', 'Echo rank', 'Current position', 'Status'].map((label, index) => (
-                      <th key={label} style={{
-                        padding: '8px 6px', textAlign: index < 2 ? 'left' : 'right',
-                        color: 'var(--tm-muted)', fontSize: '0.73rem', fontWeight: 700,
-                      }}>{label}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {discovery.results.map(row => (
-                    <tr key={row.ticker} style={{ borderBottom: '1px solid var(--tm-line)' }}>
-                      <td
-                        onClick={() => navigate(`/ticker/${row.ticker}`)}
-                        style={{ padding: '8px 6px', fontWeight: 700, cursor: 'pointer', color: 'var(--tm-accent)' }}
-                      >{row.ticker}</td>
-                      <td style={{ padding: '8px 6px', color: 'var(--tm-muted)' }}>{row.sector ?? '—'}</td>
-                      <td style={{ padding: '8px 6px', textAlign: 'right', fontWeight: 600 }}>
-                        {row.recent_21d_return !== null ? `${(row.recent_21d_return * 100).toFixed(1)}%` : '—'}
-                      </td>
-                      <td style={{ padding: '8px 6px', textAlign: 'right' }}>
-                        {row.recent_21d_percentile !== null ? `${Math.round(row.recent_21d_percentile * 100)}%` : '—'}
-                      </td>
-                      <td style={{ padding: '8px 6px', textAlign: 'right' }}>
-                        {row.activity_percentile !== null ? `${Math.round(row.activity_percentile * 100)}%` : '—'}
-                      </td>
-                      <td style={{ padding: '8px 6px', textAlign: 'right' }}>
-                        {row.echo_percentile !== null ? `${Math.round(row.echo_percentile * 100)}%` : 'N/A'}
-                      </td>
-                      <td style={{ padding: '8px 6px', textAlign: 'right', minWidth: 150 }} title={row.position_guidance ?? undefined}>
-                        <div style={{ fontWeight: 700 }}>{row.trend_state?.replace(/_/g, ' ') ?? '—'}</div>
-                        <div style={{ color: row.extension_risk === 'EXHAUSTION_WATCH' ? 'var(--tm-neg)' : row.extension_risk === 'EXTENDED' ? 'var(--tm-warn)' : 'var(--tm-muted)', fontSize: '0.7rem' }}>
-                          {row.extension_risk?.replace(/_/g, ' ') ?? 'No overlay'}
-                        </div>
-                      </td>
-                      <td style={{ padding: '8px 6px', textAlign: 'right', color: row.validation_status === 'CANDIDATE_ALPHA' ? 'var(--tm-pos)' : 'var(--tm-warn)', fontWeight: 700 }}>
-                        {row.validation_status === 'CANDIDATE_ALPHA' ? 'Candidate alpha' : 'Discovery only'}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      </div>
+      <MomentumRanks />
 
       {/* ─── DAILY RECOMMENDATIONS ─── */}
       <div style={{ marginBottom: '1.25rem' }}>

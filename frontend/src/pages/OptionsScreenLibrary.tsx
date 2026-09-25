@@ -229,6 +229,13 @@ export function OptionsScreenLibrary({ catalog, params, setParams, filterControl
 }
 
 function OptionContractDetail({ row, close }: { row: EligibleChainRow; close: () => void }) {
+  const detailTone = (key: string, value: unknown) => {
+    if (key === 'contract_type') return value === 'CALL' ? 'os-positive' : value === 'PUT' ? 'os-negative' : ''
+    if (['model_mark', 'display_mark'].includes(key)) return 'os-option-price'
+    if (!['local_delta', 'local_theta_per_day', 'local_vega_per_vol_point', 'local_rho_per_rate_point'].includes(key)) return ''
+    const numeric = Number(value)
+    return !Number.isFinite(numeric) || numeric === 0 ? '' : numeric > 0 ? 'os-positive' : 'os-negative'
+  }
   function fieldValue(field: ReturnType<typeof optionContractDetailSections>[number]['fields'][number]): string {
     const value = field.value
     if (value == null || typeof value === 'string' && !value.trim()) return 'Unavailable'
@@ -242,11 +249,11 @@ function OptionContractDetail({ row, close }: { row: EligibleChainRow; close: ()
     return String(value)
   }
   return <Modal title="Option contract details" close={close}><div className="os-contract-detail">
-    <div className="os-contract-heading"><h3>{row.underlying} / {row.contract_type} {optionAlertMoney(row.strike)}</h3><p>{row.contract_ticker}</p></div>
+    <div className="os-contract-heading"><h3>{row.underlying} / <span className={row.contract_type === 'CALL' ? 'os-positive' : 'os-negative'}>{row.contract_type}</span> {optionAlertMoney(row.strike)}</h3><p>{row.contract_ticker}</p></div>
     <p className="os-contract-notice">Retained contract snapshot / Delayed marks / Not a fill or an alert package</p>
     {optionContractDetailSections(row).map(section => <section key={section.title} aria-label={section.title}>
       <h3>{section.title}</h3><dl className="os-contract-facts">{section.fields.map(field => <div key={field.key}>
-        <dt>{field.label}</dt><dd title={typeof field.value === 'string' ? field.value : undefined}>{fieldValue(field)}</dd>
+        <dt>{field.label}</dt><dd className={detailTone(field.key, field.value)} title={typeof field.value === 'string' ? field.value : undefined}>{fieldValue(field)}</dd>
       </div>)}</dl>
     </section>)}
     <p className="os-contract-notice">No strategy selection, stop/target plan, calibrated probability or execution permission is attached to this screening row.</p>
@@ -276,9 +283,10 @@ export function OptionsChainResults({ catalog, params, setParams, sessionDate, r
   const data = query.data?.data
   const rows = invalid ? [] : data?.rows || []
   const columns = visibleOptionsColumns('chain', params.get('columns'))
+  const tone = (value: unknown) => { const numeric = Number(value); return !Number.isFinite(numeric) || numeric === 0 ? '' : numeric > 0 ? 'os-positive' : 'os-negative' }
   function update(key: string, value: string) { const next = new URLSearchParams(window.location.search); if (value === '') next.delete(key); else next.set(key, value); if (key !== 'offset') next.delete('offset'); setParams(next) }
   function cell(row: EligibleChainRow, key: string): ReactNode {
-    if (key === 'contract') return <><strong>{row.strike} {row.contract_type}</strong><small>{row.expiration_date}</small><small title={row.contract_ticker}>{row.contract_ticker}</small></>
+    if (key === 'contract') return <><strong className={row.contract_type === 'CALL' ? 'os-positive' : 'os-negative'}>{row.strike} {row.contract_type}</strong><small>{row.expiration_date}</small><small title={row.contract_ticker}>{row.contract_ticker}</small></>
     if (key === 'market_data_time') return <span title={`Observed ${timestamp(row.first_observed_at)} ET / ${readable(row.mark_source)}`}>{timestamp(row.market_data_time)}</span>
     if (key === 'underlying') return <Link to={`/ticker/${encodeURIComponent(row.underlying)}`} title={`Open ${row.underlying} ticker page`}>{row.underlying}</Link>
     if (key === 'mark_market_data_time' || key === 'first_observed_at') return optionAlertTime(row[key])
@@ -287,10 +295,13 @@ export function OptionsChainResults({ catalog, params, setParams, sessionDate, r
     if (key === 'bid_ask') return row.bid == null || row.ask == null ? 'Unavailable' : `${optionAlertMoney(row.bid)} / ${optionAlertMoney(row.ask)}`
     const value = row[key as keyof EligibleChainRow]
     if (value == null || value === '' || !Number.isFinite(Number(value))) return 'Unavailable'
-    if (key === 'spot' || key === 'model_mark') return optionAlertMoney(value)
+    if (key === 'spot') return optionAlertMoney(value)
+    if (key === 'model_mark') return <span className="os-option-price">{optionAlertMoney(value)}</span>
     if (key === 'local_iv' || key === 'otm_fraction') return optionAlertPercent(value)
     const formatted = Number(value).toLocaleString('en-US', { maximumFractionDigits: ['day_volume', 'open_interest', 'calendar_dte'].includes(key) ? 0 : key === 'volume_open_interest_ratio' ? 2 : 4 })
-    return key === 'volume_open_interest_ratio' ? `${formatted}x` : formatted
+    const displayed = key === 'volume_open_interest_ratio' ? `${formatted}x` : formatted
+    return ['local_delta', 'local_theta_per_day', 'local_vega_per_vol_point', 'local_rho_per_rate_point'].includes(key)
+      ? <span className={tone(value)}>{displayed}</span> : displayed
   }
   return <>
     {!resultsOnly && <><section className="screener-discovery-controls" aria-label="Eligible chain controls">
@@ -317,8 +328,8 @@ export function OptionsChainResults({ catalog, params, setParams, sessionDate, r
         <div className="os-coverage-grid">{data.coverage.map(row => <div key={row.underlying}><strong>{row.underlying}</strong><span>{timestamp(row.market_time)} ET</span><span>{row.eligible} eligible / {row.retained} retained / {row.received} received</span></div>)}</div>
       </details>}
       {!invalid && query.data && !query.data.available && <p role="status">{readable(query.data.reason || 'NO_ELIGIBLE_CHAIN')}</p>}
-      <div className="screener-table-wrap" tabIndex={0} role="region" aria-label="Eligible option contracts"><table className="os-package-table"><thead><tr>{columns.map(column => <th key={column.key} scope="col" title={column.tip}>{column.label}</th>)}<th className="os-contract-view" scope="col">View</th></tr></thead><tbody>
-        {rows.map(row => <tr key={row.snapshot_id}>{columns.map(column => <td key={column.key}>{cell(row, column.key)}</td>)}<td className="os-contract-view"><button type="button" className="sw-icon" title="View retained contract details" aria-label={`View ${row.contract_ticker} details`} onClick={event => { contractTrigger.current = event.currentTarget; setSelectedContract(structuredClone(row)) }}><Eye size={16} /></button></td></tr>)}
+      <div className="screener-table-wrap" tabIndex={0} role="region" aria-label="Eligible option contracts"><table className="os-package-table"><thead><tr><th className="os-contract-view" scope="col">View</th>{columns.map(column => <th key={column.key} scope="col" title={column.tip}>{column.label}</th>)}</tr></thead><tbody>
+        {rows.map(row => <tr key={row.snapshot_id}><td className="os-contract-view"><button type="button" className="sw-icon" title="View retained contract details" aria-label={`View ${row.contract_ticker} details`} onClick={event => { contractTrigger.current = event.currentTarget; setSelectedContract(structuredClone(row)) }}><Eye size={16} /></button></td>{columns.map(column => <td key={column.key}>{cell(row, column.key)}</td>)}</tr>)}
         {!query.isLoading && rows.length === 0 && <tr><td colSpan={columns.length + 1}>{invalid || (query.isError ? 'Data unavailable' : 'No eligible contracts on this page.')}</td></tr>}
       </tbody></table></div>
       <footer><span>Retained policy-filtered chain / delayed model marks</span><div><button type="button" disabled={offset === 0} onClick={() => update('offset', String(Math.max(0, offset - 100)))}>Previous</button><button type="button" disabled={offset + 100 >= (data?.total || 0)} onClick={() => update('offset', String(offset + 100))}>Next</button></div></footer>

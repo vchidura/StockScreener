@@ -126,7 +126,10 @@ def refresh_current_daily_signals(*, now=None, dry_run=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--allow-legacy-write", action="store_true", help="Explicitly permit retired legacy-table publication")
     arguments = parser.parse_args()
+    if not arguments.dry_run and not arguments.allow_legacy_write:
+        parser.error("Legacy production writer retired; use --dry-run or explicitly approve --allow-legacy-write")
     report = refresh_current_daily_signals(dry_run=arguments.dry_run)
     print(json.dumps(report, indent=2))
     return 0 if report["status"] in ("PUBLISHED", "ALREADY_PRESENT", "DRY_RUN") else 1

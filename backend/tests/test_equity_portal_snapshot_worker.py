@@ -20,19 +20,31 @@ def test_worker_loads_backend_environment_before_database_import():
 
 
 
-def test_snapshot_refresh_waits_for_matching_daily_context(monkeypatch):
+def test_snapshot_refresh_does_not_produce_legacy_context(monkeypatch):
+    from scripts import refresh_daily_signal_context as legacy
     connection = MagicMock()
     manager = MagicMock()
     manager.__enter__.return_value = connection
     monkeypatch.setattr(worker, "get_db_connection", lambda: manager)
-    monkeypatch.setattr(worker, "refresh_current_daily_signals", lambda: {"status": "WAITING_FOR_COMPLETE_DAILY_PUBLICATION"})
-    manifest = MagicMock()
+    refresh = MagicMock(side_effect=RuntimeError("legacy unavailable"))
+    monkeypatch.setattr(legacy, "refresh_current_daily_signals", refresh)
+    manifest = MagicMock(return_value={"source_generation": 1})
     monkeypatch.setattr(worker, "source_manifest", manifest)
-
-    with pytest.raises(worker.SourceGenerationChanged, match="daily signal context"):
-        worker.refresh_once()
-
-    manifest.assert_not_called()
+    monkeypatch.setattr(worker, "get_selected_tickers", lambda _: ["AAPL"])
+    monkeypatch.setattr(worker, "get_tickers_overview", lambda _: [])
+    monkeypatch.setattr(worker, "bulk_load_dataframes", lambda *args: {})
+    monkeypatch.setattr(worker, "analyze_market_regime", lambda *args: {})
+    monkeypatch.setattr(worker, "latest_sector_performance", lambda *args: [])
+    monkeypatch.setattr(worker, "sector_intelligence", lambda *args: {})
+    monkeypatch.setattr(worker, "compute_default_scanner_snapshots", lambda *args: {})
+    monkeypatch.setattr(worker, "_compute_streak_snapshots", lambda: {})
+    publish = MagicMock(return_value=["snapshot"])
+    monkeypatch.setattr(worker, "publish", publish)
+    monkeypatch.setattr(worker, "current", lambda _: dict(is_fresh=True, read_latency_ms=1))
+    assert worker.refresh_once()["published"] == ["snapshot"]
+    publish.assert_called_once()
+    refresh.assert_not_called()
+    assert manifest.call_count == 2
     assert "pg_advisory_unlock" in connection.cursor.return_value.execute.call_args.args[0]
 
 

@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+from unittest.mock import Mock
 
 import pytest
 
@@ -115,7 +116,8 @@ def test_worker_group_commands_preserve_worker_behavior_and_scope():
     assert all(command[-1] == "--once" for command in group_commands("references").values())
     assert set(group_commands("projections")) == {"portal", "screening"}
     assert group_commands("projections")["portal"][-1] == "--continuous"
-    assert Path(group_commands("options")["options"][-1]).name == "run_option_worker.py"
+    assert {name: Path(command[-1]).name for name, command in group_commands("options").items()} == {
+        "options": "run_option_worker.py", "outcomes": "run_option_outcome_worker.py"}
     assert reference_schedules(("market-events",), {}) == {"market-events": (21600, 300)}
     with pytest.raises(ValueError):
         reference_schedules(("market-events",), {"MARKET_EVENT_POLL_SECONDS": "0"})
@@ -193,7 +195,7 @@ def test_reference_interrupted_stop_restores_retry_not_an_immediate_fetch():
     replacement.close()
 
 
-@pytest.mark.parametrize("selection,children", [("projections", 2), ("references", 3), ("options", 1)])
+@pytest.mark.parametrize("selection,children", [("projections", 2), ("references", 3), ("options", 2)])
 def test_worker_group_lifecycle_uses_only_fake_children_and_bound_stop(monkeypatch, tmp_path, selection, children):
     from contextlib import contextmanager
     from types import SimpleNamespace
@@ -257,6 +259,20 @@ def test_worker_group_status_is_readonly_and_rejects_reused_pid(monkeypatch, tmp
     monkeypatch.setattr(group.psutil, "Process", lambda identity: SimpleNamespace(create_time=lambda: 2))
     value = group.group_status("references", root=tmp_path)
     assert value["state"] == "STALE" and value["components"]["events"]["state"] == "UNVERIFIED"
+
+
+def test_worker_status_write_retries_transient_windows_access_denied(monkeypatch, tmp_path):
+    from scripts import run_stock_alert_service as service
+
+    destination = tmp_path / "status.json"
+    replace = Mock(side_effect=[PermissionError("busy"), None])
+    delays = []
+    monkeypatch.setattr(service.os, "replace", replace)
+    monkeypatch.setattr(service.time, "sleep", delays.append)
+
+    service.write_status(destination, {"state": "RUNNING"})
+
+    assert replace.call_count == 2 and delays == [0.05]
 
 
 @pytest.mark.parametrize("final_state", ["STOPPED", "STALE", "STOP_FAILED"])

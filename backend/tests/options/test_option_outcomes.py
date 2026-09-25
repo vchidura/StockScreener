@@ -525,6 +525,43 @@ def test_checkpoint_legs_require_one_complete_causal_snapshot_batch():
     assert "JOIN eligible_batches AS batch USING (batch_id)" in compact
 
 
+def test_bulk_checkpoint_and_current_mark_reads_rank_each_candidate_independently():
+    cursor = MagicMock()
+    cursor.closed = False
+    cursor.fetchall.return_value = []
+    connection = MagicMock(closed=False)
+    connection.cursor.return_value = cursor
+
+    @contextmanager
+    def factory():
+        yield connection
+
+    repository = OptionOutcomeRepository(factory)
+    candidate_id = uuid4()
+    checkpoint = datetime(2026, 8, 31, 19, 30, tzinfo=UTC)
+    available_by = checkpoint + timedelta(minutes=15)
+
+    checkpoint_result = repository.checkpoint_legs_bulk(
+        ((candidate_id, checkpoint, available_by),),
+        valuation_policy_sha256="a" * 64,
+    )
+    checkpoint_sql = " ".join(cursor.execute.call_args.args[0].split())
+    assert checkpoint_result == {(candidate_id, checkpoint): ()}
+    assert "jsonb_to_recordset" in checkpoint_sql
+    assert "PARTITION BY candidate_id, checkpoint_time, available_by" in checkpoint_sql
+    assert "batch.batch_rank=1" in checkpoint_sql
+
+    current_result = repository.current_mark_legs_bulk(
+        (candidate_id,), available_by=available_by,
+        valuation_policy_sha256="a" * 64,
+    )
+    current_sql = " ".join(cursor.execute.call_args.args[0].split())
+    assert current_result == {candidate_id: ()}
+    assert "PARTITION BY candidate_id" in current_sql
+    assert "ORDER BY market_time DESC, observed_time DESC" in current_sql
+    assert "batch.batch_rank=1" in current_sql
+
+
 def test_measurement_checkpoints_use_exchange_close_and_next_open():
     result = measurement_checkpoints(
         datetime(2026, 8, 31, 19, 0, tzinfo=UTC)
@@ -836,3 +873,106 @@ def test_option_outcome_service_persists_latest_coherent_current_mark():
     assert result.current_persisted == 1
     assert repository.outcomes[0].measurement_type == "CURRENT"
     assert repository.outcomes[0].net_pnl == Decimal("98.70")
+
+
+def test_option_outcome_service_uses_one_bulk_read_per_leg_phase():
+    candidate_id = uuid4()
+    batch_id = uuid4()
+    market_time = datetime(2026, 8, 31, 19, 0, tzinfo=UTC)
+    policy = delayed_proxy_commission_policy()
+    calls = []
+
+    def leg(checkpoint):
+        return OptionOutcomeLeg(contract_id=42, side=OptionSide.BUY, ratio=1, multiplier=100,
+            entry_mark=Decimal("5"), exit_mark=Decimal("6"), source_snapshot_id=uuid4(),
+            source_batch_id=batch_id, source_market_time=checkpoint,
+            source_observed_time=checkpoint, entry_mark_source=MarkSource.DEVELOPER_ALIGNED_AGG_CLOSE,
+            exit_mark_source=MarkSource.DEVELOPER_ALIGNED_AGG_CLOSE,
+            entry_valuation_policy_sha256=policy.policy_sha256,
+            exit_valuation_policy_sha256=policy.policy_sha256)
+
+    class Repository:
+        def list_pending_candidates(self, **kwargs):
+            return ({"candidate_id": candidate_id, "candidate_identity": "a" * 64,
+                "event_id": None, "market_data_time": market_time,
+                "capital_at_risk": Decimal("500"), "required_contract_ids": (42,),
+                "completed_measurements": ("15MIN",), "unavailable_measurements": ()},)
+
+        def checkpoint_legs_bulk(self, requests, **kwargs):
+            calls.append(("checkpoints", tuple(requests), kwargs))
+            return {(candidate, checkpoint): (leg(checkpoint),)
+                for candidate, checkpoint, _ in requests}
+
+        def checkpoint_legs(self, *args, **kwargs):
+            raise AssertionError("single checkpoint read must not run")
+
+        def persist_decay_outcomes(self, outcomes):
+            return len(outcomes)
+
+        def current_marks_available(self):
+            return True
+
+        def delete_non_causal_current_marks(self):
+            return 0
+
+        def list_current_candidates(self, **kwargs):
+            return ({"candidate_id": candidate_id, "event_id": None,
+                "market_data_time": market_time, "capital_at_risk": Decimal("500")},)
+
+        def current_mark_legs_bulk(self, candidate_ids, **kwargs):
+            calls.append(("current", tuple(candidate_ids), kwargs))
+            return {candidate_id: (leg(kwargs["available_by"]),)}
+
+        def current_mark_legs(self, *args, **kwargs):
+            raise AssertionError("single current-mark read must not run")
+
+        def persist_current_marks(self, outcomes):
+            return len(outcomes)
+
+    result = OptionOutcomeService(Repository(), policy=policy).mature(
+        available_by=datetime(2026, 8, 31, 20, 15, tzinfo=UTC))
+
+    assert result.due_measurements == result.available_measurements == result.persisted == 3
+    assert result.current_candidates == result.current_persisted == 1
+    assert [call[0] for call in calls] == ["checkpoints", "current"]
+
+
+def test_option_outcome_service_batches_both_full_current_mark_queues():
+    policy = delayed_proxy_commission_policy()
+    candidates = tuple({"candidate_id": uuid4(), "event_id": None,
+        "market_data_time": datetime(2026, 8, 31, 19, 0, tzinfo=UTC),
+        "capital_at_risk": Decimal("500")} for _ in range(2000))
+    batches = []
+
+    class Repository:
+        def list_pending_candidates(self, **kwargs):
+            return ()
+
+        def checkpoint_legs_bulk(self, requests, **kwargs):
+            return {}
+
+        def persist_decay_outcomes(self, outcomes):
+            return 0
+
+        def current_marks_available(self):
+            return True
+
+        def delete_non_causal_current_marks(self):
+            return 0
+
+        def list_current_candidates(self, **kwargs):
+            return candidates
+
+        def current_mark_legs_bulk(self, candidate_ids, **kwargs):
+            batches.append(tuple(candidate_ids))
+            return {}
+
+        def persist_current_marks(self, outcomes):
+            return 0
+
+    result = OptionOutcomeService(Repository(), policy=policy).mature(
+        available_by=datetime(2026, 8, 31, 20, 15, tzinfo=UTC), limit=1000)
+
+    assert [len(batch) for batch in batches] == [1000, 1000]
+    assert len({identity for batch in batches for identity in batch}) == 2000
+    assert result.current_candidates == result.current_persisted == 0

@@ -10,7 +10,7 @@ import pandas as pd
 
 from database import get_db_cursor
 from equity.technicals import detect_setup_candlesticks
-from equity.stock_discovery import stock_features
+from equity.daily_state import stock_features
 from equity.screening_gaps import project_gaps
 from equity.screening_hourly import attach_hourly
 from research.screening import FIELDS, PATTERNS, VERSION, UNIVERSE, FIELD_SET_VERSION, STATE_FIELDS, GAP_VERSION, GAP_WINDOW, GAP_CATALOG, digest
@@ -213,7 +213,8 @@ def build_latest(session_date: date | None = None, *, allow_degraded: bool = Fal
                 source_publication_status=publication["status"], source_selected_members=publication["selected_members"],
                 source_unavailable_members=[dict(ticker=member["ticker"], security_id=str(member["security_id"]), status=member["status"])
                                 for member in members if member["status"] != "SELECTED"],
-                code_hashes={name: digest(Path(__file__).with_name(name).read_text(encoding="utf-8")) for name in ("screening_projection.py", "technicals.py", "stock_discovery.py")},
+                daily_state_contract="daily_state_extracted_v1",
+                code_hashes={name: digest(Path(__file__).with_name(name).read_text(encoding="utf-8")) for name in ("screening_projection.py", "technicals.py", "daily_state.py")},
                 gap_code_hashes={"projector": digest(Path(__file__).with_name("screening_gaps.py").read_text(encoding="utf-8")),
                          "detectors": digest(Path(__file__).parents[1].joinpath("screeners.py").read_text(encoding="utf-8"))},
                 contract_hash=digest(dict(fields=FIELDS, patterns=PATTERNS)))

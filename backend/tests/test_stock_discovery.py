@@ -34,6 +34,9 @@ def test_stock_features_require_contiguous_same_security_history():
     session = frame.session_date.iloc[-1]
     result = stock_features(frame, session, "one")
     assert result["eligible"] and abs(result["momentum"] - (332 / 101 - 1)) < 1e-12
+    assert (result["price"], result["trend"], result["state"], result["break_side"]) == (353., "UP", "TRENDING", 0)
+    assert result["dollar_volume"] == 343_500_000. and result["relative_volume"] == 1.
+    assert abs(result["change"] - (353 / 352 - 1)) < 1e-12
     assert stock_features(frame.iloc[:-1], session, "one")["exclusion"] == "MISSING_LATEST_SESSION"
     frame.loc[100, "security_id"] = "other"
     assert stock_features(frame, session, "one")["exclusion"] == "IDENTITY_CHANGED"

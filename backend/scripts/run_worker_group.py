@@ -37,7 +37,8 @@ def group_commands(group, *, scope="all", backend=BACKEND, executable=sys.execut
         return dict(portal=(*prefix, str(scripts / "refresh_equity_portal_snapshots.py"), "--continuous"),
             screening=(*prefix, str(scripts / "run_screening_worker.py")))
     if group == "options":
-        return dict(options=(*prefix, str(scripts / "run_option_worker.py")))
+        return dict(options=(*prefix, str(scripts / "run_option_worker.py")),
+            outcomes=(*prefix, str(scripts / "run_option_outcome_worker.py")))
     if group != "references" or scope not in ("all", "equity", "options"):
         raise ValueError("unsupported worker group or reference scope")
     commands = {}

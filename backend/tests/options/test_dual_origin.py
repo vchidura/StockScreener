@@ -316,6 +316,87 @@ def test_s1_retains_exact_stock_episode_and_non_directional_activity_confirmatio
     assert not result.publication_permission and result.package_status == "NOT_ASSESSED"
 
 
+@pytest.mark.parametrize("model", ["S1", "S2"])
+def test_stock_first_indicator_observation_retains_mixed_shadow_metrics(model):
+    from datetime import timedelta
+    from research.stock_idea_engine import candidate_record
+    from options.stock_setup_binding import (
+        STOCK_SETUP_INDICATOR_METRICS, StockSetupIndicatorObservation,
+        build_stock_setup_indicator_observation, build_stock_setup_shadow_source,
+    )
+
+    inputs = qualification_inputs(model=model)
+    setup = inputs["setup"]
+    decision_at = inputs["decision"].decision_at
+    source = build_stock_setup_shadow_source(candidate_payload=candidate_record(setup.candidate),
+        episode_id=setup.candidate.episode_id, policy=setup.source_policy,
+        publication_payload_sha256=setup.source.payload_sha256,
+        publication_market_time=setup.source.market_time, published_at=setup.source.observed_at,
+        received_at=decision_at, setup_selection="SELECTED", setup_reason=None)
+    observation = build_stock_setup_indicator_observation(source, (inputs["source"],),
+        scheduled_cycle=inputs["lineage"].scheduled_cycle, matrix_id=inputs["candidate"].matrix_id,
+        decision_at=decision_at)
+
+    assert observation.detector_id == model and observation.baseline_disposition == "CONFIRMED"
+    assert tuple(row.metric_id for row in observation.measurements) == STOCK_SETUP_INDICATOR_METRICS
+    assert next(row for row in observation.measurements if row.metric_id == "option_matched_contract_count").value == 1
+    model_metric = "stock_breakout_clearance_atr" if model == "S1" else "stock_resumption_target_distance_atr"
+    other_metric = "stock_resumption_target_distance_atr" if model == "S1" else "stock_breakout_clearance_atr"
+    assert next(row for row in observation.measurements if row.metric_id == model_metric).status == "READY"
+    assert next(row for row in observation.measurements if row.metric_id == other_metric).status == "UNAVAILABLE"
+    assert {row.challenger_id for row in observation.challengers} >= {
+        "BASELINE_CURRENT", "OPTION_VOLUME_OI_5_0", "OPTION_BREADTH_2",
+        "S1_MIXED_QUALITY" if model == "S1" else "S2_MIXED_QUALITY",
+    }
+    assert not observation.policy.changes_admission and not observation.execution_permission
+    assert StockSetupIndicatorObservation.model_validate_json(observation.canonical_json()) == observation
+
+    expired_at = setup.candidate.expires_at + timedelta(seconds=1)
+    expired_source = build_stock_setup_shadow_source(candidate_payload=candidate_record(setup.candidate),
+        episode_id=setup.candidate.episode_id, policy=setup.source_policy,
+        publication_payload_sha256=setup.source.payload_sha256,
+        publication_market_time=setup.source.market_time, published_at=setup.source.observed_at,
+        received_at=expired_at, setup_selection="SELECTED", setup_reason=None)
+    expired = build_stock_setup_indicator_observation(expired_source, (inputs["source"],),
+        scheduled_cycle=inputs["lineage"].scheduled_cycle, matrix_id=inputs["candidate"].matrix_id,
+        decision_at=expired_at)
+    assert expired.baseline_disposition == "UNAVAILABLE"
+    assert expired.baseline_reasons == ("STOCK_EPISODE_EXPIRED_BEFORE_OPTION_DECISION",)
+    blocked_source = source.model_copy(update={"setup_selection": "SUPPRESSED", "setup_reason": "INSUFFICIENT_TARGET_ROOM"})
+    blocked = build_stock_setup_indicator_observation(blocked_source, (inputs["source"],),
+        scheduled_cycle=inputs["lineage"].scheduled_cycle, matrix_id=inputs["candidate"].matrix_id,
+        decision_at=decision_at)
+    assert blocked.baseline_disposition == "UNAVAILABLE"
+    assert blocked.baseline_reasons == ("STOCK_EPISODE_STRUCTURALLY_BLOCKED",)
+    from options.analytics.alert_selection import build_stock_setup_indicator_evidence
+    from scripts.report_stock_behavior_coverage import summarize_stock_setup_indicator_observations
+
+    records = (*build_stock_setup_indicator_evidence((observation,),
+        dataset_id=f"{model.lower()}-mixed-shadow-active", selected_at=decision_at),
+        *build_stock_setup_indicator_evidence((expired,),
+        dataset_id=f"{model.lower()}-mixed-shadow-expired", selected_at=expired_at))
+    report = summarize_stock_setup_indicator_observations(records,
+        start_date=observation.scheduled_cycle.date(), end_date=observation.scheduled_cycle.date(),
+        as_of=expired_at)
+    assert report["status"] == "SHADOW_EVIDENCE_ONLY" and report["observations"] == 2
+    assert report["models"][model]["baseline_dispositions"] == {"CONFIRMED": 1, "UNAVAILABLE": 1}
+    assert report["models"][model]["expired_before_option_decision"] == 1
+    assert report["inference"]["timing_loss_is_separate_cohort"]
+    from types import SimpleNamespace
+    from options.analytics.behavior_review import build_detector_alert_review, build_detector_evaluation_review
+
+    active_record = records[0]
+    review = build_detector_evaluation_review(as_of=active_record.selected_at,
+        dataset_id=active_record.dataset_id, detector=model, repository=SimpleNamespace(
+            review_inputs=lambda **_: dict(ready=True, datasets=(active_record.dataset_id,),
+                dataset_id=active_record.dataset_id, sessions=(observation.scheduled_cycle.date(),),
+                session_date=observation.scheduled_cycle.date(), records=(active_record,), runs=())))
+    assert review["total"] == 1 and review["rows"][0]["candidate_id"] is None
+    assert review["rows"][0]["origin"] == "STOCK_FIRST"
+    assert review["rows"][0]["selection_reason"] == "MIXED_INDICATOR_SHADOW_ONLY"
+    assert review["models"][[row["detector_id"] for row in review["models"]].index(model)]["observations"] == 1
+
+
 def intraday_confirmation_inputs():
     from equity.behavior import BehaviorComponent
     from options.intraday_participation import IntradayStockEvidence
@@ -349,23 +430,47 @@ def intraday_confirmation_inputs():
     (None, "CONFIRMED"), ("missing_trend", "UNAVAILABLE"), ("missing_liquidity", "UNAVAILABLE"),
     ("future_bar", "UNAVAILABLE"), ("late_receipt", "UNAVAILABLE"), ("expired", "UNAVAILABLE"),
     ("opposite", "CONTRADICTED"), ("put", "UNMATCHED"), ("zero_oi", "UNAVAILABLE"),
-    ("identity", "UNAVAILABLE"), ("prior_session", "UNAVAILABLE"),
+    ("identity", "UNAVAILABLE"), ("prior_session", "CONFIRMED"),
+    ("prior_session_after_window", "CONFIRMED"), ("older_session", "UNAVAILABLE"),
 ])
-def test_o1_v2_uses_completed_1030_bar_for_1045_option_without_other_trends(mutation, expected):
+def test_o1_v3_uses_latest_completed_bar_without_other_trends(mutation, expected):
+    from options.calendar import OptionExchangeCalendar
     from options.intraday_participation import IntradayStockEvidence, assess_intraday_participation
 
     source, stock, decision = intraday_confirmation_inputs()
     payload = stock.model_dump()
     if mutation == "missing_trend": payload["components"] = payload["components"][1:]
     if mutation == "missing_liquidity": payload["components"] = payload["components"][:1]
-    if mutation in {"future_bar", "expired", "prior_session"}:
+    if mutation == "expired":
+        payload["components"][1]["sources"][0]["valid_until"] = decision
+    if mutation in {"future_bar", "prior_session", "prior_session_after_window", "older_session"}:
         origin = payload["components"][0]["sources"][0]
         if mutation == "future_bar":
             origin.update(market_time=source.market_time + timedelta(minutes=15), observed_at=decision,
                 recorded_at=decision, received_at=decision)
             payload["available_at"] = decision
-        if mutation == "expired": origin["valid_until"] = decision
-        if mutation == "prior_session": origin["market_time"] -= timedelta(days=1)
+        if mutation in {"prior_session", "prior_session_after_window", "older_session"}:
+            if mutation != "prior_session_after_window":
+                option_market = datetime(2026, 9, 18, 13, 45, tzinfo=timezone.utc)
+                decision = option_market + timedelta(minutes=16)
+                source = source.model_copy(update=dict(market_time=option_market,
+                    oi_observed_at=option_market + timedelta(minutes=15),
+                    observed_at=option_market + timedelta(minutes=15),
+                    recorded_at=decision, received_at=decision))
+            prior_session = OptionExchangeCalendar().previous_session(source.volume_session)
+            prior_close = OptionExchangeCalendar().session_close(prior_session)
+            if mutation == "older_session":
+                prior_close = OptionExchangeCalendar().session_close(
+                    OptionExchangeCalendar().previous_session(prior_session))
+            origin.update(market_time=prior_close, observed_at=prior_close,
+                recorded_at=prior_close, received_at=prior_close,
+                valid_until=prior_close + timedelta(minutes=30))
+            liquidity = payload["components"][1]["sources"][0]
+            daily_close = OptionExchangeCalendar().session_close(prior_session)
+            liquidity.update(market_time=daily_close, observed_at=daily_close,
+                recorded_at=daily_close, received_at=daily_close,
+                valid_until=decision + timedelta(hours=1))
+            payload["available_at"] = decision
     if mutation == "late_receipt": payload["available_at"] = decision + timedelta(seconds=1)
     if mutation == "identity": payload["underlyer"] = "MSFT"
     if mutation == "put": source = source.model_copy(update={"contract_type": "PUT"})
@@ -375,7 +480,7 @@ def test_o1_v2_uses_completed_1030_bar_for_1045_option_without_other_trends(muta
         market_cutoff=decision, decision_at=decision)
     assert result.disposition == expected, result.reasons
     assert result.market_cutoff == source.market_time
-    assert result.policy.version == "option_participation_stock_alignment_v2"
+    assert result.policy.version == "option_participation_stock_alignment_v3"
     assert result.package_status == "NOT_ASSESSED" and not result.execution_permission
     assert type(result).model_validate_json(result.canonical_json()) == result
     if mutation is None:
@@ -403,40 +508,145 @@ def test_o1_v2_rejects_forming_bars_reconstructed_receipts_and_forged_confirmati
         type(result).model_validate({**result.model_dump(), "gates": ()})
 
 
-def test_o1_v2_component_adapter_does_not_require_other_trends_or_extend_source_expiry():
+def test_o1_v3_component_adapter_does_not_require_other_trends_or_extend_daily_expiry():
     from equity.behavior import BehaviorComponent, StockBehaviorSnapshot
     from equity.behavior_sources import ADJUSTED_DAILY_HISTORY_POLICY, BEHAVIOR_SOURCE_SELECTION_POLICY
+    from options.detector_launch import aligned_stock_windows
     from options.intraday_participation import bind_intraday_components, assess_intraday_participation
 
     inputs, source = confirmation_inputs()
     payload = inputs["stock"].model_dump()
+    completed_window = aligned_stock_windows({source.underlyer: inputs["decision_at"]})[source.underlyer][1]
+    assert completed_window is not None
     for component in payload["components"]:
         if component["factor"] == "TREND" and component["interval"] != "30m":
             component.update(status="UNAVAILABLE", state=None, reason_codes=("TEST_OTHER_TREND_MISSING",), metrics=())
         for origin in component["sources"]:
             origin["policy_sha256"] = (BEHAVIOR_SOURCE_SELECTION_POLICY if component["interval"] == "30m" else ADJUSTED_DAILY_HISTORY_POLICY).sha256
+            if component["interval"] == "30m":
+                origin.update(market_time=completed_window, observed_at=completed_window,
+                    recorded_at=completed_window, received_at=completed_window)
             if component["interval"] == "1d":
                 origin.update(price_basis="PROVIDER_SPLIT_ADJUSTED", source_manifest_sha256="a" * 64)
     stock = StockBehaviorSnapshot.model_validate(payload)
     assert stock.assess_at(inputs["decision_at"]).data_status != "READY"
     projected = bind_intraday_components(stock, received_at=inputs["decision_at"])
-    assert {row.key for row in projected.components} == {"TREND.30m", "PARTICIPATION.1d"}
+    assert {"TREND.30m", "PARTICIPATION.1d"} <= {row.key for row in projected.components}
     assert projected.carrier_snapshot_sha256 == stock.sha256
-    assert all(len(row.metrics) == 1 for row in projected.components)
+    assert {metric.definition.metric_id for row in projected.components for metric in row.metrics} >= {
+        "ema50_slope10_atr", "adx14", "median_dollar_volume20"}
     source = source.model_copy(update={"market_time": inputs["decision_at"]})
     source = source.model_copy(update={"observed_at": inputs["decision_at"], "recorded_at": inputs["decision_at"]})
     result = assess_intraday_participation(source, projected, direction=1,
         market_cutoff=inputs["decision_at"], decision_at=inputs["decision_at"])
     assert result.disposition == "CONFIRMED", result.reasons
-    deadline = min(origin.valid_until for row in projected.components for origin in row.sources)
+    deadline = min(origin.valid_until for row in projected.components if row.interval == "1d" for origin in row.sources)
     expired = assess_intraday_participation(source, projected, direction=1,
         market_cutoff=inputs["decision_at"], decision_at=deadline)
     assert expired.disposition == "UNAVAILABLE"
 
 
+def test_o1_indicator_observation_retains_shadow_metrics_without_changing_baseline():
+    from types import SimpleNamespace
+    from equity.behavior import StockBehaviorSnapshot
+    from equity.behavior_sources import ADJUSTED_DAILY_HISTORY_POLICY, BEHAVIOR_SOURCE_SELECTION_POLICY
+    from options.detector_launch import aligned_stock_windows
+    from options.dual_origin import assess_options_intraday
+    from options.intraday_participation import (
+        O1_INDICATOR_METRICS, O1IndicatorObservation, bind_intraday_components,
+        build_o1_indicator_observation,
+    )
+
+    inputs, source = confirmation_inputs()
+    payload = inputs["stock"].model_dump()
+    completed_window = aligned_stock_windows({source.underlyer: inputs["decision_at"]})[source.underlyer][1]
+    assert completed_window is not None
+    for component in payload["components"]:
+        for origin in component["sources"]:
+            origin["policy_sha256"] = (BEHAVIOR_SOURCE_SELECTION_POLICY
+                if component["interval"] == "30m" else ADJUSTED_DAILY_HISTORY_POLICY).sha256
+            if component["interval"] == "30m":
+                origin.update(market_time=completed_window, observed_at=completed_window,
+                    recorded_at=completed_window, received_at=completed_window)
+            if component["interval"] == "1d":
+                origin.update(price_basis="PROVIDER_SPLIT_ADJUSTED", source_manifest_sha256="a" * 64)
+    stock = StockBehaviorSnapshot.model_validate(payload)
+    projected = bind_intraday_components(stock, received_at=inputs["decision_at"])
+    source = source.model_copy(update={"market_time": inputs["decision_at"],
+        "observed_at": inputs["decision_at"], "recorded_at": inputs["decision_at"]})
+    decision = assess_options_intraday(source, projected, direction=1,
+        market_cutoff=inputs["decision_at"], decision_at=inputs["decision_at"])
+    observation = build_o1_indicator_observation(source, decision, projected,
+        scheduled_cycle=inputs["decision_at"])
+
+    assert observation.baseline_disposition == decision.disposition == "CONFIRMED"
+    assert tuple((row.component_key, row.metric_id) for row in observation.measurements) == O1_INDICATOR_METRICS
+    assert {row.challenger_id for row in observation.challengers} >= {
+        "BASELINE_V3", "RETURN5_ALIGNMENT", "ADX14_20", "SLOPE_ABS_0_02",
+        "EXTENSION_ABS_MAX_2_0", "DAILY_RVOL20_1_25", "SAME_ELAPSED_30M_RVOL_1_25"}
+    same_elapsed = next(row for row in observation.challengers if row.challenger_id == "SAME_ELAPSED_30M_RVOL_1_25")
+    assert same_elapsed.verdict == "UNAVAILABLE" and same_elapsed.reason_codes == ("UNAVAILABLE_NOT_IMPLEMENTED",)
+    assert O1IndicatorObservation.model_validate_json(observation.canonical_json()) == observation
+    assert not observation.policy.changes_admission and not observation.publication_permission
+
+    from options.detector_collection import DetectorCycleCollector, DetectorCycleInputs
+    from options.analytics.behavior_review import build_detector_alert_review, build_detector_evaluation_review
+
+    configuration = detector_run_inputs()["configuration"]
+    configuration.settings.underlyers = (source.underlyer,)
+    matrices = {source.underlyer: source.matrix_id}
+    cycle_inputs = DetectorCycleInputs(matrices=(dict(underlying=source.underlyer,
+        matrix_id=source.matrix_id, market_time=source.market_time,
+        observed_time=decision.decision_at),), o1_observations=(observation,))
+    collector = DetectorCycleCollector(lambda **_: cycle_inputs,
+        SimpleNamespace(prior_selected=lambda **_: {}), clock=lambda: decision.decision_at)
+    run, records = collector(configuration=configuration, dataset_id="o1-indicator-fixture",
+        scheduled_cycle=observation.scheduled_cycle, completed_matrices=matrices,
+        started_at=decision.decision_at)
+    assert len(records) == 1 and records[0].selection_status == "OBSERVATION"
+    assert dict(run.selection_counts) == {"NOT_SELECTED": 0, "OBSERVATION": 1, "REPEAT": 0, "SELECTED": 0}
+    review = build_detector_evaluation_review(as_of=decision.decision_at,
+        dataset_id="o1-indicator-fixture", detector="O1", repository=SimpleNamespace(
+            review_inputs=lambda **_: dict(ready=True, datasets=("o1-indicator-fixture",),
+                dataset_id="o1-indicator-fixture", sessions=(observation.scheduled_cycle.date(),),
+                session_date=observation.scheduled_cycle.date(), records=records, runs=(run,))))
+    assert review["total"] == 1 and review["rows"][0]["candidate_id"] is None
+    assert review["rows"][0]["selection_reason"] == "INDICATOR_SHADOW_ONLY"
+    assert review["models"][0]["observations"] == 1 and review["models"][0]["selected"] == 0
+    alert_repository = SimpleNamespace(completed_runs=lambda **_: (run,), completed_run=lambda **_: (run, records),
+        repeat_counts=lambda **kwargs: {} if kwargs["records"] == [] else pytest.fail("observation entered package repeat lookup"))
+    latest_review = build_detector_alert_review(dataset_id="o1-indicator-fixture",
+        as_of=decision.decision_at, detector="O1", repository=alert_repository)
+    assert latest_review["total"] == 0 and latest_review["detected_observations"] == 1
+    assert latest_review["rows"] == []
+    newer = run.model_copy(update={"scheduled_cycle": run.scheduled_cycle + timedelta(minutes=15),
+        "selected_at": run.selected_at + timedelta(minutes=15), "record_sha256s": (),
+        "selection_counts": tuple((status, 0) for status, _ in run.selection_counts)})
+    alert_repository.completed_runs = lambda **_: (run, newer)
+    alert_repository.completed_run = lambda **_: (newer, ())
+    alert_repository.review_inputs = lambda **_: dict(runs=(run, newer), records=records)
+    assert build_detector_alert_review(dataset_id="o1-indicator-fixture",
+        as_of=newer.selected_at, detector="O1", repository=alert_repository)["total"] == 0
+    history_review = build_detector_alert_review(dataset_id="o1-indicator-fixture",
+        as_of=newer.selected_at, detector="O1", repository=alert_repository, scope="HISTORY")
+    assert history_review["total"] == 0 and history_review["detected_observations"] == 1
+    assert history_review["rows"] == []
+    from scripts.report_stock_behavior_coverage import summarize_o1_indicator_observations
+    report = summarize_o1_indicator_observations(records,
+        start_date=observation.scheduled_cycle.date(), end_date=observation.scheduled_cycle.date(),
+        as_of=decision.decision_at)
+    assert report["status"] == "SHADOW_EVIDENCE_ONLY" and report["observations"] == 1
+    assert report["baseline_dispositions"] == {"CONFIRMED": 1}
+    assert report["distinct_dataset_episodes"] == 1 and report["duplicate_dataset_episode_rows"] == 0
+    assert report["metric_availability"]["ema50_slope10_atr"]["ready"] == 1
+    assert report["challenger_verdicts"]["SAME_ELAPSED_30M_RVOL_1_25"]["unavailable"] == 1
+    assert report["inference"] == dict(independent_samples=False, correlated_observations=True,
+        outcome_comparison_ready=False, admission_changed=False, execution_changed=False)
+
+
 def test_intraday_launch_requires_its_policy_and_expanded_runtime_pins():
     from pathlib import Path
-    from options.detector_launch import decode_detector_forward_launch, IntradayDetectorForwardLaunch, INTRADAY_RUNTIME_FILES, _source_hashes
+    from options.detector_launch import decode_detector_forward_launch, LatestCompletedDetectorForwardLaunch, INTRADAY_RUNTIME_FILES, _source_hashes
     from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY
 
     backend = Path(__file__).resolve().parents[2]
@@ -448,7 +658,7 @@ def test_intraday_launch_requires_its_policy_and_expanded_runtime_pins():
     resumption = DirectResumptionSourcePolicy(instance_id=acceptance.instance_id,
         instance_policy_sha256=acceptance.instance_policy_sha256, publication_policy_sha256=acceptance.publication_policy_sha256,
         runtime_sources=acceptance.runtime_sources)
-    launch = IntradayDetectorForwardLaunch(dataset_id="intraday-launch-fixture", effective_from=NOW,
+    launch = LatestCompletedDetectorForwardLaunch(dataset_id="intraday-launch-fixture", effective_from=NOW,
         underlyers=("AAPL",), configuration_sha256="a" * 64, strategy_policy_sha256="b" * 64,
         valuation_policy_sha256="c" * 64, stock_ledger="backups/fixture.sqlite", acceptance_source=acceptance,
         resumption_source=resumption, runtime_sources=_source_hashes(backend, INTRADAY_RUNTIME_FILES),
@@ -457,20 +667,59 @@ def test_intraday_launch_requires_its_policy_and_expanded_runtime_pins():
     assert launch.alert_mode == "DEVELOPMENT_OBSERVATIONS"
     for changes in ({"o1_confirmation_policy_sha256": "0" * 64}, {"runtime_sources": launch.runtime_sources[:-1]}):
         with pytest.raises(ValueError):
-            IntradayDetectorForwardLaunch.model_validate({**launch.model_dump(), **changes})
+            LatestCompletedDetectorForwardLaunch.model_validate({**launch.model_dump(), **changes})
 
 
-def test_o1_v2_preserves_package_qualification_and_freezes_confirmation_provenance():
+def test_stock_setup_ready_launch_pins_exact_window_wait_policy():
+    from pathlib import Path
+    from options.detector_launch import (
+        INTRADAY_RUNTIME_FILES, STOCK_SETUP_PUBLICATION_WAIT_POLICY,
+        StockSetupReadyDetectorForwardLaunch, decode_detector_forward_launch, _source_hashes,
+    )
+    from test_equity_behavior_setup import direct_policy, publication_inputs
+    from equity.behavior_setup import DirectResumptionSourcePolicy
+    from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY
+
+    backend = Path(__file__).resolve().parents[2]
+    _, _, _, original_policy = publication_inputs()
+    acceptance = direct_policy(original_policy)
+    resumption = DirectResumptionSourcePolicy(instance_id=acceptance.instance_id,
+        instance_policy_sha256=acceptance.instance_policy_sha256,
+        publication_policy_sha256=acceptance.publication_policy_sha256,
+        runtime_sources=acceptance.runtime_sources)
+    launch = StockSetupReadyDetectorForwardLaunch(dataset_id="setup-wait-launch-fixture", effective_from=NOW,
+        underlyers=("AAPL",), configuration_sha256="a" * 64, strategy_policy_sha256="b" * 64,
+        valuation_policy_sha256="c" * 64, stock_ledger="backups/fixture.sqlite", acceptance_source=acceptance,
+        resumption_source=resumption, runtime_sources=_source_hashes(backend, INTRADAY_RUNTIME_FILES),
+        o1_confirmation_policy_sha256=INTRADAY_ALIGNMENT_POLICY.sha256)
+    assert decode_detector_forward_launch(launch.canonical_json()) == launch
+    assert launch.stock_readiness_policy == "PER_MODEL_EXACT_WINDOW_WAIT_V2"
+    assert launch.stock_setup_wait_policy_sha256 == STOCK_SETUP_PUBLICATION_WAIT_POLICY.sha256
+    with pytest.raises(ValueError):
+        StockSetupReadyDetectorForwardLaunch.model_validate({**launch.model_dump(),
+            "stock_setup_wait_policy_sha256": "0" * 64})
+
+
+def test_o1_v3_preserves_package_qualification_and_freezes_confirmation_provenance():
     import json
+    from options.detector_launch import aligned_stock_windows
     from options.dual_origin import assess_options_intraday, qualify_dual_origin_package
     from options.intraday_participation import IntradayStockEvidence
 
     inputs = technical_qualification_inputs()
     original, _ = qualify_dual_origin_package(**inputs)
     stock = inputs["stock"]
+    payload = stock.model_dump()
+    payload["components"] = [row for row in payload["components"]
+        if f'{row["factor"]}.{row["interval"]}' in {"TREND.30m", "PARTICIPATION.1d"}]
+    window = aligned_stock_windows({stock.ticker: inputs["source"].market_time})[stock.ticker][1]
+    assert window is not None
+    trend = next(row for row in payload["components"] if row["interval"] == "30m")
+    for origin in trend["sources"]:
+        origin.update(market_time=window, observed_at=window, recorded_at=window,
+            received_at=window, valid_until=inputs["decision"].decision_at + timedelta(hours=1))
     evidence = IntradayStockEvidence(security_id=stock.security_id, underlyer=stock.ticker,
-        available_at=stock.available_at, components=tuple(row for row in stock.components
-            if row.key in {"TREND.30m", "PARTICIPATION.1d"}))
+        available_at=stock.available_at, components=tuple(payload["components"]))
     inputs["stock"] = evidence
     inputs["decision"] = assess_options_intraday(inputs["source"], evidence, direction=1,
         market_cutoff=inputs["decision"].market_cutoff, decision_at=inputs["decision"].decision_at)
@@ -478,17 +727,17 @@ def test_o1_v2_preserves_package_qualification_and_freezes_confirmation_provenan
     assert package.recurrence_sha256 != original.recurrence_sha256
     assert package.exposure_sha256 == original.exposure_sha256
     payload = json.loads(plan.payload_json)
-    assert payload["confirmation_policy_version"] == "option_participation_stock_alignment_v2"
+    assert payload["confirmation_policy_version"] == "option_participation_stock_alignment_v3"
     assert payload["stock_confirmation"] == evidence.model_dump(mode="json")
     assert payload["management_policy"]["technical_exit"]
 
 
-def test_o1_intraday_signal_version_retains_v1_and_exact_gate_policy():
+def test_o1_latest_completed_signal_version_retains_v1_and_exact_gate_policy():
     from options.dual_origin import assess_options_intraday, load_signal_decision, SignalDecision
 
     source, stock, decision = intraday_confirmation_inputs()
     result = assess_options_intraday(source, stock, direction=1, market_cutoff=decision, decision_at=decision)
-    assert result.disposition == "CONFIRMED" and result.schema_version == "dual_origin_signal_decision_v3"
+    assert result.disposition == "CONFIRMED" and result.schema_version == "dual_origin_signal_decision_v4"
     assert load_signal_decision(result) == result
     with pytest.raises(ValueError):
         SignalDecision.model_validate(result.model_dump())
@@ -954,6 +1203,33 @@ def test_evaluation_evidence_preserves_plan_and_original_selection():
             DetectorSelectionEvidence.model_validate({**record.model_dump(), **changes})
 
 
+def test_evaluation_evidence_accepts_valid_plan_above_legacy_32k_bound():
+    import hashlib
+    import json
+    from options.analytics.alert_selection import DetectorSelectionEvidence
+    from options.strategies.domain import canonical_json
+
+    record = evaluation_records()[0]
+    plan = json.loads(record.plan_payload_text)
+    plan["retained_source_probe"] = ""
+    base = canonical_json(plan)
+    plan["retained_source_probe"] = "x" * (33000 - len(base))
+    plan_payload_text = canonical_json(plan)
+    package = type(record.package).model_validate({
+        **record.package.model_dump(),
+        "plan_sha256": hashlib.sha256(plan_payload_text.encode("ascii")).hexdigest(),
+    })
+
+    expanded = DetectorSelectionEvidence.model_validate({
+        **record.model_dump(),
+        "package": package,
+        "plan_payload_text": plan_payload_text,
+    })
+
+    assert 32768 < len(plan_payload_text.encode("ascii")) < 65536
+    assert len(expanded.canonical_json().encode("ascii")) <= 65536
+
+
 def detector_run_inputs(records=()):
     from types import SimpleNamespace
 
@@ -1126,6 +1402,30 @@ def test_production_assembler_qualifies_exact_inputs_and_blocks_known_events(mod
     collector = DetectorCycleCollector(reader, SimpleNamespace(prior_selected=lambda **_: {}), clock=lambda: clock)
     arguments = dict(configuration=configuration, dataset_id="production-assembler-fixture",
         scheduled_cycle=lineage.scheduled_cycle, completed_matrices={candidate.underlyer: candidate.matrix_id}, started_at=clock)
+    if stock_window == "ready":
+        from research.stock_idea_engine import candidate_record
+        from options.stock_setup_binding import build_stock_setup_shadow_source
+
+        setup = inputs["setup"]
+        shadow_source = build_stock_setup_shadow_source(candidate_payload=candidate_record(setup.candidate),
+            episode_id=setup.candidate.episode_id, policy=setup.source_policy,
+            publication_payload_sha256=setup.source.payload_sha256,
+            publication_market_time=setup.source.market_time, published_at=setup.source.observed_at,
+            received_at=clock, setup_selection="SELECTED", setup_reason=None)
+        shadow_calls = []
+        def shadow_setups(**arguments):
+            shadow_calls.append(arguments)
+            return (shadow_source,), {}
+        shadow_reader = ProductionDetectorSourceReader(SimpleNamespace(read=lambda **_: retained), repository,
+            SimpleNamespace(latest_covered_actions=lambda *_, **__: ({"coverage": True}, ())),
+            setup_reader=setups, setup_shadow_reader=shadow_setups,
+            clock=lambda: clock, aligned_setup_windows=True, setup_wait_enabled=True)
+        shadow_inputs = shadow_reader(**arguments)
+        assert len(shadow_inputs.stock_setup_observations) == 1
+        assert shadow_inputs.stock_setup_observations[0].detector_id == model
+        assert len(shadow_inputs.package_inputs) == 2
+        assert shadow_calls[0]["as_of"] == clock
+        assert "wait_deadline" not in shadow_calls[0] and "progress_callback" not in shadow_calls[0]
     from scripts.report_stock_behavior_coverage import package_binding_diagnostic
     diagnostic = package_binding_diagnostic(retained, repository.detector_package_sources())
     assert diagnostic["package_reasons"] == {"EXACT_PACKAGE_SOURCES_AVAILABLE": 1}
@@ -1491,7 +1791,7 @@ def test_launch_preparation_requires_explicit_stock_transition_and_preserves_sou
     import zlib
     from pathlib import Path
     from options.config import load_option_runtime_configuration
-    from options.detector_launch import RUNTIME_FILES, prepare_detector_forward_launch, decode_detector_forward_launch, validate_detector_forward_launch
+    from options.detector_launch import INTRADAY_RUNTIME_FILES, OPTIMIZED_INTRADAY_RUNTIME_FILES, RUNTIME_FILES, prepare_detector_forward_launch, decode_detector_forward_launch, validate_detector_forward_launch
     from research.stock_idea_forward import forward_config, runtime_sources
     from research.stock_idea_engine import digest
     from test_equity_behavior_setup import direct_ledger_fixture
@@ -1503,7 +1803,7 @@ def test_launch_preparation_requires_explicit_stock_transition_and_preserves_sou
         publication["runtime_sources"] = {name: "0" * 64 for name in runtime_sources()}
         publication["policy_hash"] = digest(config)
         connection.execute("INSERT INTO forward_publications VALUES(?,?)", (publication["window_key"], zlib.compress(json.dumps(publication).encode())))
-    for name in set(RUNTIME_FILES) | set(runtime_sources()):
+    for name in set(OPTIMIZED_INTRADAY_RUNTIME_FILES) | set(runtime_sources()):
         source = tmp_path / name
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_text("reviewed fixture", encoding="utf-8")
@@ -1520,6 +1820,11 @@ def test_launch_preparation_requires_explicit_stock_transition_and_preserves_sou
     assert decode_detector_forward_launch(launch.canonical_json()) == launch
     assert dict(launch.acceptance_source.runtime_sources) != publication["runtime_sources"]
     assert launch.acceptance_source.runtime_sources == launch.resumption_source.runtime_sources
+    wait_launch = prepare_detector_forward_launch(**arguments, approve_stock_runtime_transition=True,
+        intraday_confirmation=True, stock_setup_wait=True)
+    assert wait_launch.schema_version == "option_detector_forward_launch_v6"
+    assert wait_launch.stock_readiness_policy == "PER_MODEL_EXACT_WINDOW_WAIT_V2"
+    assert decode_detector_forward_launch(wait_launch.canonical_json()) == wait_launch
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
     original_payload = json.loads(launch.canonical_json())
     original_payload.pop("stock_readiness_policy")
@@ -1552,6 +1857,47 @@ def test_stock_windows_follow_market_clock_without_double_provider_delay(cutoff,
     assert result == (cutoff, datetime.fromisoformat(expected) if expected else None)
 
 
+def test_exact_stock_publication_wait_is_bounded_and_heartbeat_safe():
+    from collections import Counter
+    from options.detector_launch import read_stock_setup_windows_when_ready
+
+    boundary = datetime(2026, 9, 23, 14, 30, tzinfo=timezone.utc)
+    current = [boundary + timedelta(minutes=23)]
+    reads, heartbeats = [], []
+    def reader(_path, **arguments):
+        reads.append(arguments["as_of"])
+        if len(reads) < 3:
+            return (), Counter({"S1_STOCK_WINDOW_NOT_AVAILABLE": 1, "S2_STOCK_WINDOW_NOT_AVAILABLE": 1})
+        return ("setup",), Counter()
+    def wait(seconds):
+        current[0] += timedelta(seconds=seconds)
+
+    evidence, reasons = read_stock_setup_windows_when_ready(reader, path="unused",
+        policies=("policy",), windows={"AAPL": (current[0], boundary)}, as_of=current[0],
+        wait_deadline=boundary + timedelta(minutes=29), progress_callback=lambda: heartbeats.append(current[0]),
+        clock=lambda: current[0], wait=wait)
+    assert evidence == ("setup",) and reasons == Counter()
+    assert len(reads) == 3 and len(heartbeats) == 2
+    assert reads == sorted(reads) and reads[-1] <= boundary + timedelta(minutes=29)
+
+    current[0] = boundary + timedelta(minutes=29, seconds=54)
+    reads.clear()
+    evidence, reasons = read_stock_setup_windows_when_ready(lambda *args, **kwargs: (
+        (), Counter({"S1_STOCK_WINDOW_NOT_AVAILABLE": 1})), path="unused", policies=("policy",),
+        windows={"AAPL": (current[0], boundary)}, as_of=current[0], wait_deadline=boundary + timedelta(hours=1),
+        clock=lambda: current[0], wait=wait)
+    assert evidence == () and reasons["S1_STOCK_WINDOW_NOT_AVAILABLE"] == 1
+    assert current[0] == boundary + timedelta(minutes=29, seconds=55)
+
+    reads.clear()
+    heartbeats.clear()
+    read_stock_setup_windows_when_ready(reader, path="unused", policies=("policy",),
+        windows={"AAPL": (current[0], None)}, as_of=current[0],
+        wait_deadline=current[0] + timedelta(minutes=10), progress_callback=lambda: heartbeats.append(current[0]),
+        clock=lambda: current[0], wait=wait)
+    assert len(reads) == 1 and not heartbeats
+
+
 def test_forward_worker_refuses_older_slots_without_provider_work():
     from types import SimpleNamespace
     from unittest.mock import MagicMock
@@ -1575,6 +1921,29 @@ def test_forward_launch_worker_default_is_disabled_and_requires_checksum(monkeyp
         _detector_pipeline_arguments(None)
 
 
+def test_forward_launch_storage_requires_shadow_observation_guards():
+    from scripts.run_option_worker import _detector_storage_ready
+
+    ready = dict(registered=True, runtime_select=True, runtime_insert=True,
+        o1_table_present=True, o1_registered=True, o1_runtime_select=True, o1_runtime_insert=True,
+        stock_setup_table_present=True, stock_setup_registered=True,
+        stock_setup_runtime_select=True, stock_setup_runtime_insert=True,
+        unvalidated_constraints=0,
+        triggers=[{"enabled": "O"}] * 3, o1_triggers=[{"enabled": "O"}] * 3,
+        stock_setup_triggers=[{"enabled": "O"}] * 3,
+        indexes=[{"valid": True, "ready": True}] * 4)
+    assert _detector_storage_ready(ready)
+    for field in ("o1_table_present", "o1_registered", "o1_runtime_select", "o1_runtime_insert"):
+        assert not _detector_storage_ready({**ready, field: False})
+    for field in ("stock_setup_table_present", "stock_setup_registered",
+                  "stock_setup_runtime_select", "stock_setup_runtime_insert"):
+        assert not _detector_storage_ready({**ready, field: False})
+    assert not _detector_storage_ready({**ready, "o1_triggers": ready["o1_triggers"][:2]})
+    assert not _detector_storage_ready({**ready, "o1_triggers": [{"enabled": "D"}] * 3})
+    assert not _detector_storage_ready({**ready, "stock_setup_triggers": ready["stock_setup_triggers"][:2]})
+    assert not _detector_storage_ready({**ready, "stock_setup_triggers": [{"enabled": "D"}] * 3})
+
+
 def test_detector_source_report_forbids_output_and_mixed_modes(monkeypatch):
     from scripts.report_stock_behavior_coverage import parse_args
 
@@ -1582,8 +1951,37 @@ def test_detector_source_report_forbids_output_and_mixed_modes(monkeypatch):
         monkeypatch.setattr("sys.argv", ["report", "--detector-sources", *arguments])
         with pytest.raises(SystemExit):
             parse_args()
+    monkeypatch.setattr("sys.argv", ["report", "--detector-sources", "--compact", "--output", "validation.json"])
+    compact = parse_args()
+    assert compact.detector_sources and compact.compact and compact.output.name == "validation.json"
     monkeypatch.setattr("sys.argv", ["report", "--detector-sources"])
     assert parse_args().detector_sources
+
+
+def test_o1_indicator_period_report_requires_an_isolated_bounded_mode(monkeypatch):
+    from scripts.report_stock_behavior_coverage import parse_args
+
+    monkeypatch.setattr("sys.argv", ["report", "--o1-indicator-review", "2026-09-22", "2026-09-29",
+        "--detector-dataset-id", "options-shadow-v10"])
+    arguments = parse_args()
+    assert arguments.o1_indicator_review == [date(2026, 9, 22), date(2026, 9, 29)]
+    assert arguments.detector_dataset_id == "options-shadow-v10"
+    monkeypatch.setattr("sys.argv", ["report", "--detector-dataset-id", "options-shadow-v10"])
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_stock_setup_indicator_period_report_accepts_exact_dataset_scope(monkeypatch):
+    from scripts.report_stock_behavior_coverage import parse_args
+
+    monkeypatch.setattr("sys.argv", ["report", "--stock-setup-indicator-review", "2026-09-22", "2026-09-29",
+        "--detector-dataset-id", "options-mixed-v11"])
+    arguments = parse_args()
+    assert arguments.stock_setup_indicator_review == [date(2026, 9, 22), date(2026, 9, 29)]
+    assert arguments.detector_dataset_id == "options-mixed-v11"
+    monkeypatch.setattr("sys.argv", ["report", "--o1-indicator-review", "2026-09-22", "2026-09-29", "--detector-schema"])
+    with pytest.raises(SystemExit):
+        parse_args()
 
 
 def test_complete_run_repository_refuses_partial_source_and_changed_retry(monkeypatch):
@@ -1707,7 +2105,7 @@ def test_eod_selection_comparison_preserves_exclusions_and_missing_outcomes():
     assert all(model["measured"] is None for model in result["models"])
 
 
-def test_detector_alert_reader_exposes_only_detected_o2_without_package_queries():
+def test_detector_alert_reader_counts_detected_o2_without_exposing_alert_rows():
     from types import SimpleNamespace
     from options.analytics.alert_selection import build_surface_evidence
     from options.analytics.behavior_review import build_detector_alert_review
@@ -1725,11 +2123,9 @@ def test_detector_alert_reader_exposes_only_detected_o2_without_package_queries(
         repeat_counts=lambda **kwargs: calls.append(kwargs["records"]) or {})
     review = build_detector_alert_review(dataset_id=record.dataset_id, as_of=record.selected_at,
         detector="O2", repository=repo)
-    assert review["total"] == review["detected_observations"] == 1
+    assert review["total"] == 0 and review["detected_observations"] == 1
+    assert review["rows"] == []
     assert calls == [[]]
-    row = review["rows"][0]
-    assert row["candidate_id"] is row["entry_limit"] is row["net_return"] is row["fill"] is None
-    assert row["observation"]["findings"] and row["outcome_status"] == "NOT_APPLICABLE_OBSERVATION"
     assert build_detector_alert_review(dataset_id=record.dataset_id, as_of=record.selected_at,
         detector="O1", repository=repo)["total"] == 0
     empty = record.model_copy(update={"observation": observation.model_copy(update={"findings": (), "finding_disposition": "NOT_DETECTED"})})
@@ -1738,7 +2134,23 @@ def test_detector_alert_reader_exposes_only_detected_o2_without_package_queries(
         repository=repo)["total"] == 0
 
 
-def test_detector_alert_reader_zero_latest_keeps_original_history_and_hits():
+def test_detector_alert_reader_rejects_latest_run_above_alert_cap():
+    from types import SimpleNamespace
+    from options.analytics.alert_selection import build_detector_run
+    from options.analytics.behavior_review import build_detector_alert_review
+
+    record = evaluation_records()[0]
+    records = (record,) * 21
+    run = build_detector_run(**detector_run_inputs((record,)))
+    repository = SimpleNamespace(completed_runs=lambda **_: (run,),
+        completed_run=lambda **_: (run, records))
+
+    with pytest.raises(ValueError, match="exceeds maximum new alerts"):
+        build_detector_alert_review(dataset_id=record.dataset_id,
+            as_of=record.selected_at, repository=repository)
+
+
+def test_detector_alert_reader_zero_latest_keeps_original_history_and_hits(monkeypatch):
     import json
     from types import SimpleNamespace
     from options.analytics.alert_selection import DetectorRunEvidence, build_detector_run
@@ -1755,20 +2167,41 @@ def test_detector_alert_reader_zero_latest_keeps_original_history_and_hits():
         completed_run=lambda **_: (latest, ()),
         review_inputs=lambda **_: dict(runs=(first, latest), records=records),
         repeat_counts=lambda **_: {records[0].evaluation_id: dict(repeats=3, last_seen_at=latest.selected_at)})
-    current = build_detector_alert_review(dataset_id=first.dataset_id, as_of=latest.selected_at, repository=repo)
+    original = dict(status="AVAILABLE", market_data_time=records[0].package.decision_at,
+        net_premium=Decimal("-100"), capital_at_risk=Decimal("100"), legs=[])
+    source_repository = SimpleNamespace(original_packages=lambda page, **_: {
+        str(records[0].candidate_id): original} if page else {})
+    mark_calls = []
+    mark_repository = SimpleNamespace(retained_plan_marks=lambda ids, **kwargs: (
+        mark_calls.append((ids, kwargs)) or {"ready": True, "rows": {
+            str(records[0].candidate_id): {"candidate_id": records[0].candidate_id}}}))
+    expected_mark = dict(status="FRESH", reason=None, package_price=Decimal("2.5"),
+        price_return=Decimal("0.25"), market_time=latest.selected_at)
+    monkeypatch.setattr("options.outcomes.review_retained_candidate_mark",
+        lambda candidate, retained, **_: expected_mark)
+    valuation = SimpleNamespace(policy_sha256="e" * 64)
+    current = build_detector_alert_review(dataset_id=first.dataset_id, as_of=latest.selected_at,
+        repository=repo, source_repository=source_repository, valuation_policy=valuation,
+        mark_repository=mark_repository)
     assert current["status"] == "COMPLETE" and current["rows"] == [] and current["new_alerts"] == 0
+    assert mark_calls == []
     assert current["run"]["published_at"] == latest.selected_at.isoformat()
     assert current["run"]["scheduled_cycle"] == latest.scheduled_cycle.isoformat()
     assert current["run"]["published_at"] != current["run"]["scheduled_cycle"]
     assert current["run"]["rejections"] == dict(latest.rejections)
     assert current["run"]["covered_underlyings"] == current["run"]["expected_underlyings"]
-    history = build_detector_alert_review(dataset_id=first.dataset_id, as_of=latest.selected_at, repository=repo, scope="HISTORY")
+    history = build_detector_alert_review(dataset_id=first.dataset_id, as_of=latest.selected_at,
+        repository=repo, scope="HISTORY", source_repository=source_repository,
+        valuation_policy=valuation, mark_repository=mark_repository)
     assert history["run"] is None
     assert [run["run_id"] for run in history["runs"]] == [str(first.run_id)]
     assert history["latest_run"]["published_at"] == latest.selected_at.isoformat()
     assert history["rows"][0]["hit_count"] == 4
     assert history["rows"][0]["plan_sha256"] == records[0].package.plan_sha256
     assert history["rows"][0]["first_selected_at"] == first.selected_at.isoformat()
+    assert history["rows"][0]["current_mark"] == expected_mark
+    assert mark_calls == [([records[0].candidate_id], dict(available_by=latest.selected_at,
+        valuation_policy_sha256="e" * 64))]
     assert datetime.fromisoformat(history["rows"][0]["triggered_at"]) == datetime.fromisoformat(json.loads(records[0].plan_payload_text)["source_market_time"])
     assert history["rows"][0]["net_return"] is None and history["rows"][0]["fill"] is None
     repo.completed_runs = lambda **_: ()
@@ -1880,6 +2313,7 @@ def test_alert_original_package_reader_binds_retained_snapshot_and_preserves_mis
     for leg, snapshot in zip(candidate.pop("legs"), inputs["snapshots"]):
         legs.append(dict(leg, candidate_id=package.candidate_id, matched_snapshot_id=snapshot.snapshot_id,
             snapshot_contract_id=snapshot.contract_id, snapshot_underlying=snapshot.underlyer,
+            batch_id=snapshot.batch_id, normalized_payload_sha256="a" * 64,
             snapshot_mark=snapshot.model_mark, snapshot_spot=snapshot.spot, snapshot_iv=snapshot.local_iv,
             snapshot_valuation_sha256=snapshot.valuation_policy_sha256, first_observed_at=snapshot.first_observed_at,
             revised_observed_at=None, day_volume=0, open_interest=None, quote_bid=None, quote_ask=None))
@@ -1892,6 +2326,9 @@ def test_alert_original_package_reader_binds_retained_snapshot_and_preserves_mis
     cursor.fetchall.side_effect = [[candidate], legs]
     result = repository.original_packages(records, as_of=package.decision_at)[str(package.candidate_id)]
     assert result["legs"][0]["day_volume"] == 0 and result["legs"][0]["open_interest"] is None
+    assert result["legs"][0]["valuation_policy_sha256"] == inputs["candidate"].legs[0].valuation_policy_sha256
+    assert result["legs"][0]["model_version"] == inputs["candidate"].legs[0].model_version
+    assert result["legs"][0]["quality_flags"] == inputs["candidate"].legs[0].quality_flags
     assert result["net_premium"] == inputs["candidate"].net_premium
     for call in cursor.execute.call_args_list:
         assert call.args[0].strip().startswith(("SET", "SELECT"))
@@ -1952,6 +2389,40 @@ def test_detector_dataset_manifest_is_read_only_and_hash_checked():
     root = Path(__file__).resolve().parents[2]
     with pytest.raises(ValueError, match="path or size"):
         configured_detector_dataset(backend_dir=root, environ={"OPTION_TECHNICAL_FORWARD_LAUNCH_FILE": "../README.md", "OPTION_TECHNICAL_FORWARD_LAUNCH_SHA256": "a" * 64})
+
+
+def test_detector_dataset_default_prefers_reviewed_dotenv_pins(tmp_path, monkeypatch):
+    from options.detector_launch import _source_hashes, StockSetupReadyDetectorForwardLaunch, INTRADAY_RUNTIME_FILES
+    from options.repositories.alert_review_sources import configured_detector_dataset
+    from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY
+    from test_equity_behavior_setup import direct_policy, publication_inputs
+    from equity.behavior_setup import DirectResumptionSourcePolicy
+
+    for name in INTRADAY_RUNTIME_FILES:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture", encoding="utf-8")
+    _, _, _, original_policy = publication_inputs()
+    acceptance = direct_policy(original_policy)
+    resumption = DirectResumptionSourcePolicy(instance_id=acceptance.instance_id,
+        instance_policy_sha256=acceptance.instance_policy_sha256,
+        publication_policy_sha256=acceptance.publication_policy_sha256,
+        runtime_sources=acceptance.runtime_sources)
+    launch = StockSetupReadyDetectorForwardLaunch(dataset_id="dotenv-current", effective_from=NOW,
+        underlyers=("AAPL",), configuration_sha256="a" * 64, strategy_policy_sha256="b" * 64,
+        valuation_policy_sha256="c" * 64, stock_ledger="backups/fixture.sqlite",
+        acceptance_source=acceptance, resumption_source=resumption,
+        runtime_sources=_source_hashes(tmp_path, INTRADAY_RUNTIME_FILES),
+        o1_confirmation_policy_sha256=INTRADAY_ALIGNMENT_POLICY.sha256)
+    manifest = tmp_path / "launch.json"
+    manifest.write_text(launch.canonical_json(), encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        f"OPTION_TECHNICAL_FORWARD_LAUNCH_FILE=launch.json\nOPTION_TECHNICAL_FORWARD_LAUNCH_SHA256={launch.sha256}\n",
+        encoding="utf-8")
+    monkeypatch.setenv("OPTION_TECHNICAL_FORWARD_LAUNCH_FILE", "stale.json")
+    monkeypatch.setenv("OPTION_TECHNICAL_FORWARD_LAUNCH_SHA256", "0" * 64)
+
+    assert configured_detector_dataset(backend_dir=tmp_path) == "dotenv-current"
 
 
 def test_detector_alert_api_requires_dataset_and_only_dispatches_reader(monkeypatch):

@@ -42,6 +42,51 @@ def test_behavior_roundtrip_is_immutable_versioned_and_not_permission():
         snapshot.ticker = "AAPL"
 
 
+def rank_context(snapshot):
+    return dict(schema="stock_equity_context_v1", as_of=NOW.isoformat(),
+        cohort=dict(snapshot_id=str(uuid4()), generation="a" * 64, payload_sha256="b" * 64,
+                    source_publication_id=str(uuid4()), universe="CONFIGURED_TRACKED_EQUITIES",
+                    expected_members=386, eligible_ranked=362, ranking="RAW_12_MINUS_1_MOMENTUM_PERCENTILE",
+                    market_time=(NOW - timedelta(days=1)).isoformat(), source_cutoff=(NOW - timedelta(hours=2)).isoformat(),
+                    available_at=(NOW - timedelta(hours=1)).isoformat(), status="READY"),
+        rows=[dict(security_id=str(snapshot.security_id), ticker=snapshot.ticker,
+                   daily=dict(status="READY", percentile=.9, momentum=.25))])
+
+
+def test_optional_rank_attachment_preserves_original_behavior_bytes_and_assessment():
+    from equity.behavior_context import attach_daily_rank, StockBehaviorEquityContext
+    from equity.domain import DecisionWatermark
+    snapshot = StockBehaviorSnapshot.model_validate(snapshot_payload())
+    original = snapshot.canonical_json()
+    assessment = snapshot.assess_at(NOW)
+    attachment = attach_daily_rank(snapshot, rank_context(snapshot), DecisionWatermark(NOW, NOW))
+    assert attachment.rank_status == "READY" and attachment.rank.percentile == .9
+    assert attachment.rank.eligible_ranked == 362 and attachment.rank.expected_members == 386
+    assert attachment.execution_permission is False and attachment.classification == "DESCRIPTIVE_ONLY"
+    assert StockBehaviorEquityContext.model_validate_json(attachment.canonical_json()) == attachment
+    assert snapshot.canonical_json() == original and snapshot.assess_at(NOW) == assessment
+
+
+@pytest.mark.parametrize("problem", ["absent", "stale", "future", "identity", "definition"])
+def test_optional_rank_attachment_missingness_and_causality(problem):
+    from equity.behavior_context import attach_daily_rank
+    from equity.domain import DecisionWatermark
+    snapshot = StockBehaviorSnapshot.model_validate(snapshot_payload())
+    context = rank_context(snapshot)
+    if problem == "absent": context["rows"] = []
+    if problem == "stale": context["cohort"]["status"] = "STALE"
+    if problem == "future": context["cohort"]["available_at"] = (NOW + timedelta(seconds=1)).isoformat()
+    if problem == "identity": context["rows"][0]["ticker"] = "OTHER"
+    if problem == "definition": context["cohort"]["ranking"] = "NEW_MODEL"
+    if problem in ("future", "identity", "definition"):
+        with pytest.raises(ValueError):
+            attach_daily_rank(snapshot, context, DecisionWatermark(NOW, NOW))
+    else:
+        attachment = attach_daily_rank(snapshot, context, DecisionWatermark(NOW, NOW))
+        assert attachment.rank is None and attachment.rank_status != "READY"
+        assert attachment.original_data_status == "READY"
+
+
 def test_version_dispatch_preserves_v1_when_default_catalog_changes(monkeypatch):
     from equity import behavior
 

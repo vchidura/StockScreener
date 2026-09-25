@@ -61,6 +61,26 @@ def test_forward_admission_is_versioned_and_never_resets_source_age():
         StrategyPolicy.model_validate({**forward.policy.model_dump(), "strategy_version": "phase2_v4"})
 
 
+def test_o1_participation_anchor_policy_has_a_distinct_version():
+    from options.config import load_strategy_policy, StrategyPolicy
+
+    anchored = load_strategy_policy(
+        BACKEND_DIR / "options/policies/strategy_technical_forward_v2.json"
+    )
+
+    assert anchored.policy.strategy_version == "phase2_v6_o1_activity_anchor"
+    assert anchored.policy.forward_admission is not None
+    assert anchored.policy.participation_anchor.minimum_volume_oi_ratio == 3.0
+    assert anchored.policy.participation_anchor.source_basis == (
+        "CHAIN_VOLUME_OI_REVALIDATED_BY_DATED_OI"
+    )
+    with pytest.raises(ValueError, match="participation anchoring"):
+        StrategyPolicy.model_validate({
+            **anchored.policy.model_dump(),
+            "strategy_version": "phase2_v5_technical_forward",
+        })
+
+
 def test_discovery_catalog_covers_registered_models_without_execution_claims():
     catalog = build_discovery_catalog()
     assert catalog["version"] == "option_discovery_v1"

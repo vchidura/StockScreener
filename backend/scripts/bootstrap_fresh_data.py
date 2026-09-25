@@ -24,7 +24,6 @@ PHASES = (
     "coverage",
     "derive",
     "publish",
-    "current-signals",
     "analyze",
     "snapshots",
     "research-inputs",
@@ -151,21 +150,6 @@ def build_commands(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
             for interval in ("1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"):
                 command.extend(("--interval", interval))
             commands.append((phase, command))
-        elif phase == "current-signals":
-            commands.extend((
-                (phase, [
-                    python,
-                    str(scripts / "generate_cross_sectional_signal.py"),
-                    "--date",
-                    args.end,
-                ]),
-                (phase, [
-                    python,
-                    str(scripts / "generate_market_discovery.py"),
-                    "--date",
-                    args.end,
-                ]),
-            ))
         elif phase == "analyze":
             command = [python, materialize, "--analyze"]
             for interval in ("5m", "15m", "30m", "1h", "1d", "1wk", "1mo"):

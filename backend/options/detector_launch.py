@@ -4,8 +4,10 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import logging
 from pathlib import Path
 import sqlite3
+import time
 from typing import ClassVar, Literal
 
 from pydantic import AwareDatetime, Field, model_validator
@@ -16,6 +18,7 @@ from options.alert_plans import TECHNICAL_EXIT_POLICY
 from options.dual_origin import TECHNICAL_QUALIFICATION_POLICY
 
 
+LOGGER = logging.getLogger(__name__)
 RUNTIME_FILES = (
     "options/alert_plans.py", "options/alert_qualification.py", "options/analytics/alert_selection.py",
     "options/analytics/marks.py", "options/config.py", "options/data/polygon_developer.py",
@@ -28,6 +31,11 @@ RUNTIME_FILES = (
 )
 INTRADAY_RUNTIME_FILES = (*RUNTIME_FILES, "options/intraday_participation.py", "equity/behavior.py",
     "equity/behavior_sources.py", "options/stock_behavior_gates.py")
+OPTIMIZED_RUNTIME_FILES = (*RUNTIME_FILES, "options/outcome_service.py", "options/repositories/outcomes.py",
+    "options/repositories/trades.py", "options/strategy_orchestration.py",
+    "scripts/run_option_outcome_worker.py", "scripts/run_worker_group.py")
+OPTIMIZED_INTRADAY_RUNTIME_FILES = (*OPTIMIZED_RUNTIME_FILES, "options/intraday_participation.py",
+    "equity/behavior.py", "equity/behavior_sources.py", "options/stock_behavior_gates.py")
 
 
 class DetectorForwardLaunch(Contract):
@@ -74,18 +82,100 @@ class IntradayDetectorForwardLaunch(SourceReadyDetectorForwardLaunch):
 
     @model_validator(mode="after")
     def validate_intraday(self):
+        from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY_V2
+
+        if self.o1_confirmation_policy_sha256 != INTRADAY_ALIGNMENT_POLICY_V2.sha256:
+            raise ValueError("intraday launch requires the reviewed O1 policy")
+        return self
+
+
+class LatestCompletedDetectorForwardLaunch(SourceReadyDetectorForwardLaunch):
+    runtime_files: ClassVar[tuple[str, ...]] = INTRADAY_RUNTIME_FILES
+    schema_version: Literal["option_detector_forward_launch_v4"] = "option_detector_forward_launch_v4"
+    o1_confirmation_policy_sha256: Sha256
+    alert_mode: Literal["DEVELOPMENT_OBSERVATIONS"] = "DEVELOPMENT_OBSERVATIONS"
+
+    @model_validator(mode="after")
+    def validate_latest_completed(self):
         from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY
 
         if self.o1_confirmation_policy_sha256 != INTRADAY_ALIGNMENT_POLICY.sha256:
-            raise ValueError("intraday launch requires the reviewed O1 policy")
+            raise ValueError("latest-completed launch requires the reviewed O1 policy")
         return self
+
+
+class StockSetupPublicationWaitPolicy(Contract):
+    version: Literal["stock_setup_exact_publication_wait_v1"] = "stock_setup_exact_publication_wait_v1"
+    maximum_wait_seconds: Literal[600] = 600
+    poll_seconds: Literal[2] = 2
+    wait_reasons: tuple[Literal["STOCK_WINDOW_NOT_AVAILABLE", "STOCK_WINDOW_NOT_PUBLISHED"], ...] = (
+        "STOCK_WINDOW_NOT_AVAILABLE", "STOCK_WINDOW_NOT_PUBLISHED")
+    deadline_basis: Literal["MIN_SOURCE_DEADLINE_OPTION_ACTIVITY_VALIDITY_HARD_CAP"] = "MIN_SOURCE_DEADLINE_OPTION_ACTIVITY_VALIDITY_HARD_CAP"
+    prior_window_fallback: Literal[False] = False
+    changes_episode_expiry: Literal[False] = False
+    execution_permission: Literal[False] = False
+
+
+STOCK_SETUP_PUBLICATION_WAIT_POLICY = StockSetupPublicationWaitPolicy()
+
+
+class StockSetupReadyDetectorForwardLaunch(LatestCompletedDetectorForwardLaunch):
+    schema_version: Literal["option_detector_forward_launch_v5"] = "option_detector_forward_launch_v5"
+    stock_readiness_policy: Literal["PER_MODEL_EXACT_WINDOW_WAIT_V2"] = "PER_MODEL_EXACT_WINDOW_WAIT_V2"
+    stock_setup_wait_policy_sha256: Literal[STOCK_SETUP_PUBLICATION_WAIT_POLICY.sha256] = STOCK_SETUP_PUBLICATION_WAIT_POLICY.sha256
+
+
+class OptimizedStockSetupReadyDetectorForwardLaunch(StockSetupReadyDetectorForwardLaunch):
+    runtime_files: ClassVar[tuple[str, ...]] = OPTIMIZED_INTRADAY_RUNTIME_FILES
+    schema_version: Literal["option_detector_forward_launch_v6"] = "option_detector_forward_launch_v6"
+
+
+def read_stock_setup_windows_when_ready(reader, *, path, policies, windows, as_of, wait_deadline,
+                                        progress_callback=None, clock=None, wait=None):
+    from research.stock_idea_forward import readiness_deadline
+
+    if (as_of.utcoffset() is None or wait_deadline.utcoffset() is None or wait_deadline < as_of
+            or not windows or any(boundary is None for _, boundary in windows.values())):
+        return reader(path, policies=policies, windows=windows, as_of=as_of)
+    clock = clock or (lambda: datetime.now(timezone.utc))
+    wait = wait or time.sleep
+    source_deadline = max(readiness_deadline(boundary) for _, boundary in windows.values())
+    deadline = min(source_deadline, wait_deadline,
+        as_of + timedelta(seconds=STOCK_SETUP_PUBLICATION_WAIT_POLICY.maximum_wait_seconds))
+    current = as_of
+    waiting = False
+    while True:
+        evidence, rejections = reader(path, policies=policies, windows=windows,
+            as_of=current, clock=lambda: current)
+        pending = any(any(key.endswith(reason) for reason in STOCK_SETUP_PUBLICATION_WAIT_POLICY.wait_reasons)
+            and count > 0 for key, count in rejections.items())
+        if not pending or current >= deadline:
+            if waiting:
+                LOGGER.info("stock setup exact publication wait %s at=%s deadline=%s reasons=%s",
+                    "ready" if not pending else "deadline_reached", current.isoformat(), deadline.isoformat(),
+                    dict(sorted(rejections.items())))
+            return evidence, rejections
+        if not waiting:
+            LOGGER.info("stock setup exact publication wait pending at=%s deadline=%s reasons=%s",
+                current.isoformat(), deadline.isoformat(), dict(sorted(rejections.items())))
+            waiting = True
+        if progress_callback is not None:
+            progress_callback()
+        wait(min(STOCK_SETUP_PUBLICATION_WAIT_POLICY.poll_seconds, (deadline - current).total_seconds()))
+        advanced = clock().astimezone(timezone.utc)
+        if advanced <= current:
+            raise ValueError("stock setup publication wait clock did not advance")
+        current = min(advanced, deadline)
 
 
 def decode_detector_forward_launch(payload):
     data = json.loads(payload)
     contracts = {"option_detector_forward_launch_v1": DetectorForwardLaunch,
         "option_detector_forward_launch_v2": SourceReadyDetectorForwardLaunch,
-        "option_detector_forward_launch_v3": IntradayDetectorForwardLaunch}
+        "option_detector_forward_launch_v3": IntradayDetectorForwardLaunch,
+        "option_detector_forward_launch_v4": LatestCompletedDetectorForwardLaunch,
+        "option_detector_forward_launch_v5": StockSetupReadyDetectorForwardLaunch,
+        "option_detector_forward_launch_v6": OptimizedStockSetupReadyDetectorForwardLaunch}
     contract = contracts.get(data.get("schema_version"))
     if contract is None:
         raise ValueError("unsupported detector forward launch schema")
@@ -112,7 +202,8 @@ def _source_hashes(backend_dir, names):
 
 
 def prepare_detector_forward_launch(*, backend_dir, configuration, dataset_id, effective_from, stock_ledger,
-                                   approve_stock_runtime_transition=False, intraday_confirmation=False):
+                                   approve_stock_runtime_transition=False, intraday_confirmation=False,
+                                   stock_setup_wait=False):
     from equity.stock_alert_results import _decode_original_setup_payload
     from research.stock_alert_results import strategy_instance
     from research.stock_idea_engine import digest
@@ -149,7 +240,10 @@ def prepare_detector_forward_launch(*, backend_dir, configuration, dataset_id, e
         publication_policy_sha256=publication["policy_hash"], runtime_sources=runtime)
     from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY
 
-    launch_type = IntradayDetectorForwardLaunch if intraday_confirmation else SourceReadyDetectorForwardLaunch
+    launch_type = (OptimizedStockSetupReadyDetectorForwardLaunch if stock_setup_wait else
+        LatestCompletedDetectorForwardLaunch if intraday_confirmation else SourceReadyDetectorForwardLaunch)
+    if stock_setup_wait and not intraday_confirmation:
+        raise ValueError("stock setup publication wait requires intraday confirmation")
     launch = launch_type(dataset_id=dataset_id, effective_from=effective_from,
         underlyers=configuration.settings.underlyers, configuration_sha256=configuration.configuration_sha256,
         strategy_policy_sha256=configuration.strategy_policy_sha256, valuation_policy_sha256=configuration.valuation_policy_sha256,
@@ -193,7 +287,9 @@ def load_detector_forward_launch(path, *, expected_sha256, configuration, backen
 
 def build_detector_collector(launch, *, configuration, backend_dir):
     from equity.repositories import EquityCorporateActionRepository, EquityEvidenceRepository, EquityReferenceRepository
-    from equity.stock_alert_results import read_direct_stock_setups, read_direct_stock_setup_windows
+    from equity.stock_alert_results import (
+        read_direct_stock_setups, read_direct_stock_setup_shadow_windows, read_direct_stock_setup_windows,
+    )
     from options.detector_collection import DetectorCycleCollector, ProductionDetectorSourceReader, RetainedDetectorSourceReader
     from options.repositories.alert_evaluations import OptionAlertEvaluationRepository
     from options.repositories.stock_behavior_assessments import OptionStockBehaviorAssessmentRepository
@@ -201,15 +297,30 @@ def build_detector_collector(launch, *, configuration, backend_dir):
     launch = validate_detector_forward_launch(launch, configuration=configuration, backend_dir=backend_dir)
     repository = OptionStockBehaviorAssessmentRepository()
     aligned = isinstance(launch, SourceReadyDetectorForwardLaunch)
-    def setups(*, market_cutoff, as_of, market_cutoffs=None):
+    wait_for_setups = isinstance(launch, StockSetupReadyDetectorForwardLaunch)
+    def setups(*, market_cutoff, as_of, market_cutoffs=None, wait_deadline=None, progress_callback=None):
         if aligned:
-            return read_direct_stock_setup_windows(_scoped_path(backend_dir, launch.stock_ledger),
-                policies=(launch.acceptance_source, launch.resumption_source),
-                windows=aligned_stock_windows(market_cutoffs), as_of=as_of)
+            path = _scoped_path(backend_dir, launch.stock_ledger)
+            policies = (launch.acceptance_source, launch.resumption_source)
+            windows = aligned_stock_windows(market_cutoffs)
+            if wait_for_setups:
+                if wait_deadline is None:
+                    raise ValueError("stock setup publication wait requires an option activity deadline")
+                return read_stock_setup_windows_when_ready(read_direct_stock_setup_windows,
+                    path=path, policies=policies, windows=windows, as_of=as_of,
+                    wait_deadline=wait_deadline, progress_callback=progress_callback)
+            return read_direct_stock_setup_windows(path, policies=policies, windows=windows, as_of=as_of)
         return read_direct_stock_setups(_scoped_path(backend_dir, launch.stock_ledger),
             policies=(launch.acceptance_source, launch.resumption_source), underlyers=launch.underlyers,
             market_cutoff=market_cutoff, as_of=as_of)
+    def setup_shadows(*, market_cutoff, as_of, market_cutoffs=None, **_):
+        if not aligned:
+            return (), {}
+        return read_direct_stock_setup_shadow_windows(_scoped_path(backend_dir, launch.stock_ledger),
+            policies=(launch.acceptance_source, launch.resumption_source),
+            windows=aligned_stock_windows(market_cutoffs), as_of=as_of)
     sources = ProductionDetectorSourceReader(RetainedDetectorSourceReader(repository, EquityReferenceRepository(), EquityEvidenceRepository()),
-        repository, EquityCorporateActionRepository(), setup_reader=setups, aligned_setup_windows=aligned,
-        intraday_confirmation=isinstance(launch, IntradayDetectorForwardLaunch))
+        repository, EquityCorporateActionRepository(), setup_reader=setups, setup_shadow_reader=setup_shadows,
+        aligned_setup_windows=aligned, setup_wait_enabled=wait_for_setups,
+        intraday_confirmation=isinstance(launch, (IntradayDetectorForwardLaunch, LatestCompletedDetectorForwardLaunch)))
     return DetectorCycleCollector(sources, OptionAlertEvaluationRepository())

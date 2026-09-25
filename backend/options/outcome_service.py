@@ -81,6 +81,7 @@ class OptionOutcomeService:
         outcomes = []
         unavailable_assessments = []
         due = pending = 0
+        due_requests = []
         for candidate in candidates:
             completed = set(candidate["completed_measurements"] or ()) | set(
                 candidate.get("unavailable_measurements") or ()
@@ -92,24 +93,29 @@ class OptionOutcomeService:
                 if measurement_type in completed or checkpoint > available_utc:
                     continue
                 due += 1
-                checkpoint_arguments = {
-                    "checkpoint_time": checkpoint,
-                    "available_by": available_utc,
-                    "valuation_policy_sha256": self.policy.policy_sha256,
-                }
+                read_available_by = available_utc
                 if self.availability_evidence_enabled:
-                    checkpoint_arguments.update(
-                        available_by=min(
-                            available_utc, self.availability_policy.deadline(checkpoint),
-                        ),
-                        maximum_mark_lag=timedelta(
-                            seconds=self.availability_policy.maximum_mark_lag_seconds,
-                        ),
-                    )
-                legs = self.repository.checkpoint_legs(
-                    candidate["candidate_id"],
-                    **checkpoint_arguments,
-                )
+                    read_available_by = min(
+                        available_utc, self.availability_policy.deadline(checkpoint))
+                due_requests.append((candidate, measurement_type, checkpoint, read_available_by))
+        maximum_mark_lag = timedelta(
+            seconds=self.availability_policy.maximum_mark_lag_seconds)
+        bulk_checkpoint_legs = None
+        if hasattr(self.repository, "checkpoint_legs_bulk"):
+            bulk_checkpoint_legs = self.repository.checkpoint_legs_bulk(
+                [(candidate["candidate_id"], checkpoint, read_available_by)
+                 for candidate, _, checkpoint, read_available_by in due_requests],
+                valuation_policy_sha256=self.policy.policy_sha256,
+                maximum_mark_lag=maximum_mark_lag,
+            )
+        for candidate, measurement_type, checkpoint, read_available_by in due_requests:
+                legs = (bulk_checkpoint_legs.get((candidate["candidate_id"], checkpoint), ())
+                    if bulk_checkpoint_legs is not None else self.repository.checkpoint_legs(
+                        candidate["candidate_id"], checkpoint_time=checkpoint,
+                        available_by=read_available_by,
+                        valuation_policy_sha256=self.policy.policy_sha256,
+                        **({"maximum_mark_lag": maximum_mark_lag}
+                           if self.availability_evidence_enabled else {})))
                 if not legs and not self.availability_evidence_enabled:
                     pending += 1
                     continue
@@ -155,16 +161,26 @@ class OptionOutcomeService:
         current_persisted = 0
         if self.repository.current_marks_available():
             self.repository.delete_non_causal_current_marks()
-            for candidate in self.repository.list_current_candidates(
+            current_candidates = self.repository.list_current_candidates(
                 valuation_policy_sha256=self.policy.policy_sha256,
                 available_by=available_utc,
                 limit=limit,
-            ):
-                legs = self.repository.current_mark_legs(
-                    candidate["candidate_id"],
-                    available_by=available_utc,
-                    valuation_policy_sha256=self.policy.policy_sha256,
-                )
+            )
+            bulk_current_legs = None
+            if hasattr(self.repository, "current_mark_legs_bulk"):
+                bulk_current_legs = {}
+                candidate_ids = [candidate["candidate_id"] for candidate in current_candidates]
+                for offset in range(0, len(candidate_ids), 1000):
+                    bulk_current_legs.update(self.repository.current_mark_legs_bulk(
+                        candidate_ids[offset:offset + 1000],
+                        available_by=available_utc,
+                        valuation_policy_sha256=self.policy.policy_sha256,
+                    ))
+            for candidate in current_candidates:
+                legs = (bulk_current_legs.get(candidate["candidate_id"], ())
+                    if bulk_current_legs is not None else self.repository.current_mark_legs(
+                        candidate["candidate_id"], available_by=available_utc,
+                        valuation_policy_sha256=self.policy.policy_sha256))
                 if not legs:
                     continue
                 current_outcomes.append(evaluate_delayed_proxy_outcome(

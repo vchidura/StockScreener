@@ -41,6 +41,7 @@ from equity.repositories import (  # noqa: E402
 LOGGER = logging.getLogger("corporate-action-worker")
 POLL_SECONDS = int(os.getenv("EQUITY_CORPORATE_ACTION_POLL_SECONDS", "21600"))
 LOOKBACK_DAYS = int(os.getenv("EQUITY_CORPORATE_ACTION_LOOKBACK_DAYS", "30"))
+SPLIT_LOOKBACK_DAYS = int(os.getenv("EQUITY_CORPORATE_ACTION_SPLIT_LOOKBACK_DAYS", "180"))
 HORIZON_DAYS = int(os.getenv("EQUITY_CORPORATE_ACTION_HORIZON_DAYS", "365"))
 RETRY_SECONDS = int(os.getenv("EQUITY_CORPORATE_ACTION_RETRY_SECONDS", "300"))
 WORKER_LOCK_NAME = os.getenv(
@@ -82,12 +83,17 @@ def build_coverage(
     observed_at: datetime,
     availability_mode: BarAvailabilityMode = BarAvailabilityMode.LIVE_OBSERVED,
     responses=None,
+    action_types=("SPLIT", "DIVIDEND"),
 ) -> tuple[EquityCorporateActionCoverage, ...]:
-    if responses is not None and set(responses) != {"SPLIT", "DIVIDEND"}:
-        raise ValueError("coverage requires both completed split and dividend responses")
+    action_types = tuple(action_types)
+    if not action_types or len(set(action_types)) != len(action_types) \
+            or set(action_types) - {"SPLIT", "DIVIDEND"}:
+        raise ValueError("coverage requires distinct supported action types")
+    if responses is not None and set(responses) != set(action_types):
+        raise ValueError("coverage requires every requested completed response")
     rows = []
     for ticker in sorted(tickers):
-        for action_type in ("SPLIT", "DIVIDEND"):
+        for action_type in action_types:
             payload = {
                 "action_type": action_type,
                 "ticker": ticker,
@@ -140,14 +146,15 @@ def refresh_corporate_actions(
 ) -> CorporateActionRefreshResult:
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ValueError("observed_at must be timezone-aware")
-    start = observed_at.date() - timedelta(days=LOOKBACK_DAYS)
+    split_start = observed_at.date() - timedelta(days=SPLIT_LOOKBACK_DAYS)
+    dividend_start = observed_at.date() - timedelta(days=LOOKBACK_DAYS)
     end = observed_at.date() + timedelta(days=HORIZON_DAYS)
     security_ids = active_security_ids(observed_at)
     if not security_ids:
         raise RuntimeError("active equity universe contains no security references")
     client = client or PolygonEquityClient()
-    split_rows = client.fetch_splits(start, end)
-    dividend_rows = client.fetch_dividends(start, end)
+    split_rows = client.fetch_splits(split_start, end)
+    dividend_rows = client.fetch_dividends(dividend_start, end)
     actions = (
         *normalize_corporate_actions(
             split_rows,
@@ -165,12 +172,13 @@ def refresh_corporate_actions(
         ),
     )
     repository = repository or EquityCorporateActionRepository()
-    coverage = build_coverage(
-        security_ids,
-        start=start,
-        end=end,
-        observed_at=observed_at,
-        responses={"SPLIT": split_rows, "DIVIDEND": dividend_rows},
+    coverage = (
+        *build_coverage(security_ids, start=split_start, end=end,
+            observed_at=observed_at, responses={"SPLIT": split_rows},
+            action_types=("SPLIT",)),
+        *build_coverage(security_ids, start=dividend_start, end=end,
+            observed_at=observed_at, responses={"DIVIDEND": dividend_rows},
+            action_types=("DIVIDEND",)),
     )
     inserted, inserted_coverage = repository.persist_observation(coverage, actions)
     return CorporateActionRefreshResult(
@@ -186,7 +194,7 @@ def refresh_corporate_actions(
 def run_worker(*, once: bool = False) -> None:
     if POLL_SECONDS <= 0 or RETRY_SECONDS <= 0:
         raise ValueError("corporate-action poll and retry durations must be positive")
-    if LOOKBACK_DAYS < 0 or HORIZON_DAYS <= 0:
+    if LOOKBACK_DAYS < 0 or SPLIT_LOOKBACK_DAYS < 0 or HORIZON_DAYS <= 0:
         raise ValueError("corporate-action date windows are invalid")
     while True:
         try:

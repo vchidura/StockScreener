@@ -1,4 +1,5 @@
-import { TickerDiscoveryState, TradeSetup } from '../../services/api'
+import type { TradeSetup } from '../../services/api'
+import type { StockContextRow } from '../../services/stockContext'
 import { MIN_EXECUTABLE_RR, MIN_STOP_ATR, MUTED, NEG, POS, WARN, money, sideOfBias } from './tickerShared'
 
 export interface TradePlan {
@@ -94,8 +95,7 @@ export function evaluatePlan(
   plan: TradePlan,
   setup: TradeSetup,
   livePrice: number | null,
-  discovery: TickerDiscoveryState | null,
-  discoveryStale: boolean,
+  context: StockContextRow | null,
 ): PlanVerdict {
   const drift = livePrice === null
     ? null
@@ -146,42 +146,19 @@ export function evaluatePlan(
   ]
 
   const cautions: PlanCaution[] = []
-  if (discoveryStale) {
+  const daily = context?.frames['1d']
+  const contextReady = daily?.status === 'READY' && !!daily.trend
+  if (!contextReady) {
     cautions.push({
-      detail: 'Daily market state is out of date, so it was left out of this read.',
-      source: 'discovery overlay',
+      detail: 'Published daily context is unavailable or stale; the technical plan is retained for review.',
+      source: 'equity context',
     })
-  } else if (discovery) {
-    const source = `daily discovery overlay · ${discovery.validation_status === 'CANDIDATE_ALPHA' ? 'candidate alpha' : 'unvalidated'}`
-    const reversalAgainst = plan.side === 'LONG'
-      ? discovery.reversal_trigger?.startsWith('BEARISH')
-      : discovery.reversal_trigger?.startsWith('BULLISH')
-    const withTrend = (plan.side === 'LONG' && discovery.trend_state === 'UPTREND')
-      || (plan.side === 'SHORT' && discovery.trend_state === 'DOWNTREND')
-    const againstTrend = (plan.side === 'LONG' && discovery.trend_state === 'DOWNTREND')
-      || (plan.side === 'SHORT' && discovery.trend_state === 'UPTREND')
-    const extended = !!discovery.extension_risk && discovery.extension_risk !== 'NORMAL'
-
-    if (reversalAgainst) {
-      cautions.push({
-        detail: discovery.position_guidance
-          ?? `Daily reversal trigger ${(discovery.reversal_trigger ?? '').replace(/_/g, ' ').toLowerCase()} runs against this ${plan.side}.`,
-        source,
-      })
-    } else if (withTrend && extended) {
-      cautions.push({
-        detail: discovery.position_guidance
-          ?? `Daily trend is ${discovery.extension_risk?.replace(/_/g, ' ').toLowerCase()} — entering here is chasing.`,
-        source,
-      })
-    }
-    // A bias that opposes the daily trend is the falling-knife case, previously unflagged.
-    if (againstTrend) {
-      cautions.push({
-        detail: `Daily trend is ${(discovery.trend_state ?? '').toLowerCase()}, so this ${plan.side} is counter-trend.`,
-        source,
-      })
-    }
+  } else if ((plan.side === 'LONG' && daily.trend?.includes('Bearish'))
+      || (plan.side === 'SHORT' && daily.trend?.includes('Bullish'))) {
+    cautions.push({
+      detail: `Daily EMA context is ${daily.trend}; this ${plan.side} plan is countertrend.`,
+      source: `published daily setup ${daily.market_time ?? ''}`,
+    })
   }
 
   const scored = checks.filter(check => check.pass !== null)
@@ -189,6 +166,7 @@ export function evaluatePlan(
   const blocked = failures.some(check => check.blocking)
 
   const label = blocked ? 'Not tradeable'
+    : !contextReady ? 'Context unavailable'
     : failures.length === 0 && cautions.length === 0 ? 'Take'
     : failures.length + cautions.length <= 1 ? 'Take with care'
     : 'Wait'

@@ -26,6 +26,7 @@ from equity.domain import (
 )
 from equity.materialization import (
     PortalStrategyResults,
+    _json_safe,
     _portal_strategy_results,
     derive_session_hourly_frame,
     materialize_equity_evidence,
@@ -35,6 +36,14 @@ from equity.setup_composition import compose_fibonacci_context
 
 UTC = timezone.utc
 HASH = "a" * 64
+
+
+def test_json_safe_normalizes_signed_zero_before_canonical_hashing():
+    payload = _json_safe({"python": -0.0, "numpy": np.float64(-0.0)})
+
+    assert json.dumps(payload, sort_keys=True, separators=(",", ":")) == (
+        '{"numpy":0.0,"python":0.0}'
+    )
 
 
 def security():

@@ -11,16 +11,24 @@ from .base import PostgresRepository
 def configured_detector_launch(*, backend_dir=None, environ=None):
     import os
     from pathlib import Path
+    from dotenv import dotenv_values
     from options.detector_launch import decode_detector_forward_launch
 
-    environment = os.environ if environ is None else environ
+    root = (backend_dir or Path(__file__).resolve().parents[2]).resolve()
+    if environ is None:
+        pinned = dotenv_values(root / ".env")
+        environment = dict(os.environ,
+            **{key: value for key, value in pinned.items()
+               if key in {"OPTION_TECHNICAL_FORWARD_LAUNCH_FILE",
+                          "OPTION_TECHNICAL_FORWARD_LAUNCH_SHA256"} and value is not None})
+    else:
+        environment = environ
     source = environment.get("OPTION_TECHNICAL_FORWARD_LAUNCH_FILE")
     checksum = environment.get("OPTION_TECHNICAL_FORWARD_LAUNCH_SHA256")
     if not source and not checksum:
         return None
     if not source or not checksum:
         raise ValueError("configured detector result version is incomplete")
-    root = (backend_dir or Path(__file__).resolve().parents[2]).resolve()
     path = (root / source).resolve()
     if not path.is_relative_to(root) or path.stat().st_size > 262144:
         raise ValueError("configured detector result manifest path or size invalid")
@@ -200,7 +208,9 @@ class OptionAlertReviewSourceRepository(PostgresRepository):
             fields = ("leg_index", "snapshot_id", "contract_id", "contract_ticker", "side", "ratio", "multiplier",
                 "expiration_date", "strike", "contract_type", "spot", "model_mark", "local_iv", "local_delta",
                 "local_gamma", "local_theta_per_day", "local_vega_per_vol_point", "local_rho_per_rate_point",
-                "source_market_time", "mark_source", "day_volume", "open_interest", "quote_bid", "quote_ask")
+                "time_to_expiration_years", "risk_free_rate", "dividend_yield", "source_market_time", "mark_source",
+                "model_version", "quality_flags", "valuation_policy_version", "valuation_policy_sha256", "batch_id",
+                "normalized_payload_sha256", "day_volume", "open_interest", "quote_bid", "quote_ask")
             result[str(candidate.candidate_id)] = dict(status="AVAILABLE", basis="ORIGINAL_CANDIDATE_SNAPSHOTS",
                 structure_type=candidate.structure_type.value, expiration_date=candidate.expiration_date,
                 calendar_dte=(candidate.expiration_date - candidate.market_data_time.date()).days,

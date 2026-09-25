@@ -444,7 +444,26 @@ def read_direct_stock_setup_windows(path, *, policies, windows, as_of, clock=Non
         return (), Counter({"S1_STOCK_SOURCE_UNAVAILABLE": len(windows), "S2_STOCK_SOURCE_UNAVAILABLE": len(windows)})
 
 
-def _read_direct_stock_setup_batch(path, *, policies, underlyers, market_cutoff, as_of, clock=None, windows=None):
+def read_direct_stock_setup_shadow_windows(path, *, policies, windows, as_of, clock=None):
+    from collections import Counter
+
+    if not 1 <= len(windows) <= 13:
+        raise ValueError("aligned stock setup shadow read requires 1..13 underlyings")
+    for cutoff, boundary in windows.values():
+        if (cutoff.utcoffset() is None or cutoff > as_of
+                or boundary is not None and (boundary.utcoffset() is None or boundary > cutoff)):
+            raise ValueError("aligned stock setup shadow window must be causal")
+    try:
+        _, rejections, shadows = _read_direct_stock_setup_batch(path, policies=policies, underlyers=tuple(windows),
+            market_cutoff=max(cutoff for cutoff, _ in windows.values()), as_of=as_of,
+            clock=clock, windows=windows, include_shadow=True)
+        return shadows, rejections
+    except (OSError, sqlite3.Error, zlib.error, ValueError, KeyError, TypeError):
+        return (), Counter({"S1_SHADOW_SOURCE_UNAVAILABLE": len(windows), "S2_SHADOW_SOURCE_UNAVAILABLE": len(windows)})
+
+
+def _read_direct_stock_setup_batch(path, *, policies, underlyers, market_cutoff, as_of, clock=None, windows=None,
+                                   include_shadow=False):
     from collections import Counter
     from uuid import UUID
     from equity.behavior_setup import bind_direct_stock_setup, resolve_direct_setup_policy
@@ -514,7 +533,7 @@ def _read_direct_stock_setup_batch(path, *, policies, underlyers, market_cutoff,
         publications = selected
     else:
         publications = [(record_id, publication, None) for record_id, publication in publications]
-    results, seen = [], set()
+    results, seen, shadows, shadow_seen = [], set(), [], set()
     for record_id, publication, ticker in publications:
         if utc(publication.get("market_time", record_id)) > market_cutoff or utc(publication["actual_publication_at"]) > as_of:
             continue
@@ -522,10 +541,30 @@ def _read_direct_stock_setup_batch(path, *, policies, underlyers, market_cutoff,
         for episode_id, candidate in publication.get("candidates", {}).items():
             if (candidate["ticker"] not in underlyers or candidate["interval"] != "1h"
                     or ticker is not None and candidate["ticker"] != ticker
-                    or utc(candidate["expires_at"]) <= received_at or episode_id in seen):
+                    or episode_id in seen):
                 continue
             policy = next((policy for policy in policies if policy.detector_version == candidate["policy_version"]), None)
             if policy is None:
+                continue
+            if include_shadow and episode_id not in shadow_seen:
+                from options.stock_setup_binding import build_stock_setup_shadow_source
+
+                try:
+                    dispositions = [row for row in publication.get("dispositions", ()) if row.get("episode_id") == episode_id]
+                    if len(dispositions) != 1:
+                        raise ValueError("stock setup shadow source requires one retained disposition")
+                    disposition = dispositions[0]
+                    shadows.append(build_stock_setup_shadow_source(candidate_payload=candidate, episode_id=episode_id,
+                        policy=policy, publication_payload_sha256=digest(publication),
+                        publication_market_time=utc(publication.get("market_time", record_id)),
+                        published_at=utc(publication["actual_publication_at"]), received_at=received_at,
+                        setup_selection=disposition["selection"], setup_reason=disposition.get("reason")))
+                    shadow_seen.add(episode_id)
+                    if len(shadows) > 5000:
+                        raise ValueError("direct setup shadow batch exceeds episode bound")
+                except ValueError:
+                    pass
+            if utc(candidate["expires_at"]) <= received_at:
                 continue
             try:
                 evidence = bind_direct_stock_setup(instance=instance, publication=publication, record_id=record_id,
@@ -541,6 +580,8 @@ def _read_direct_stock_setup_batch(path, *, policies, underlyers, market_cutoff,
         if ticker is not None:
             for model in {"S1", "S2"} - matched_models:
                 rejections[f"{model}_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"] += 1
+    if include_shadow:
+        return tuple(results), rejections, tuple(shadows)
     return tuple(results), rejections
 
 

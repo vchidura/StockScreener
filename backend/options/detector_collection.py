@@ -9,7 +9,8 @@ import json
 from typing import Callable, Mapping
 
 from options.analytics.alert_selection import (
-    build_detector_run, build_selection_evidence, build_surface_evidence,
+    build_detector_run, build_o1_indicator_evidence, build_selection_evidence,
+    build_stock_setup_indicator_evidence, build_surface_evidence,
     select_dual_origin_packages,
 )
 from options.dual_origin import bind_activity_source, detect_option_participation, qualify_dual_origin_package
@@ -20,6 +21,8 @@ from options.surface_detection import assess_surface_first, bind_surface_source,
 class DetectorCycleInputs:
     matrices: tuple[Mapping, ...]
     package_inputs: tuple[Mapping, ...] = ()
+    o1_observations: tuple[object, ...] = ()
+    stock_setup_observations: tuple[object, ...] = ()
     surface_inputs: tuple[Mapping, ...] = ()
     rejections: tuple[tuple[str, int], ...] = ()
     reject_invalid_packages: bool = False
@@ -182,16 +185,20 @@ def bind_structural_technical_source(row, bars, *, security, direction, spot, re
 
 class ProductionDetectorSourceReader:
     def __init__(self, retained_reader, repository, corporate_action_repository, *, setup_reader, clock=None,
-                 aligned_setup_windows=False, intraday_confirmation=False):
+                 setup_shadow_reader=None, aligned_setup_windows=False, intraday_confirmation=False,
+                 setup_wait_enabled=False):
         self.retained_reader = retained_reader
         self.repository = repository
         self.corporate_action_repository = corporate_action_repository
         self.setup_reader = setup_reader
+        self.setup_shadow_reader = setup_shadow_reader
         self.aligned_setup_windows = aligned_setup_windows
         self.intraday_confirmation = intraday_confirmation
+        self.setup_wait_enabled = setup_wait_enabled
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
-    def __call__(self, *, configuration, dataset_id, scheduled_cycle, completed_matrices, started_at):
+    def __call__(self, *, configuration, dataset_id, scheduled_cycle, completed_matrices, started_at,
+                 progress_callback=None):
         from options.alert_qualification import retained_candidate
         from options.alert_plans import TechnicalExitEvidence, TechnicalLevel
         from options.dual_origin import assess_options_first, assess_stock_first, StockFirstPolicy, StockResumptionPolicy
@@ -207,15 +214,15 @@ class ProductionDetectorSourceReader:
         activity = {row["snapshot"].snapshot_id: row for row in retained["activity"]}
         assessor = assess_options_first
         intraday_stocks = {}
+        o1_observations = []
         if self.intraday_confirmation:
             from options.dual_origin import assess_options_intraday
-            from options.intraday_participation import bind_intraday_components
+            from options.intraday_participation import bind_intraday_components, build_o1_indicator_observation
             from options.detector_launch import aligned_stock_windows
 
             assessor = assess_options_intraday
-            for leg in package_sources["legs"]:
-                matched = activity.get(leg["snapshot_id"])
-                if leg["side"] != "BUY" or matched is None or matched["finding"].disposition != "DETECTED":
+            for matched in retained["activity"]:
+                if matched["finding"].disposition != "DETECTED":
                     continue
                 source = matched["source"]
                 window = aligned_stock_windows({source.underlyer: source.market_time})[source.underlyer][1]
@@ -226,6 +233,15 @@ class ProductionDetectorSourceReader:
                     intraday_stocks[key] = bind_intraday_components(carrier, received_at=self.clock()) if carrier else None
                 matched["intraday_stock"] = intraday_stocks[key]
             cutoff = self.clock()
+            for matched in retained["activity"]:
+                if matched["finding"].disposition != "DETECTED":
+                    continue
+                direction = 1 if matched["snapshot"].contract_type.value == "CALL" else -1
+                decision = assessor(matched["source"], matched.get("intraday_stock"), direction=direction,
+                    market_cutoff=max(scheduled_cycle, matched["lineage"].market_time), decision_at=cutoff)
+                if decision.activity is not None and decision.activity.disposition == "DETECTED":
+                    o1_observations.append(build_o1_indicator_observation(matched["source"], decision,
+                        matched.get("intraday_stock"), scheduled_cycle=scheduled_cycle))
         technical_underlyers = set()
         for leg in package_sources["legs"]:
             matched = activity.get(leg["snapshot_id"])
@@ -243,9 +259,21 @@ class ProductionDetectorSourceReader:
         setup_rejections = {}
         if self.aligned_setup_windows:
             setup_arguments["market_cutoffs"] = {row["underlying"]: max(scheduled_cycle, row["market_time"]) for row in retained["matrices"]}
+            if self.setup_wait_enabled:
+                setup_arguments["wait_deadline"] = max((row["finding"].valid_until for row in retained["activity"]
+                    if row["finding"].disposition == "DETECTED"), default=cutoff)
+                setup_arguments["progress_callback"] = progress_callback
             setups, setup_rejections = self.setup_reader(**setup_arguments)
         else:
             setups = self.setup_reader(**setup_arguments)
+        shadow_arguments = {key: value for key, value in setup_arguments.items()
+            if key not in {"wait_deadline", "progress_callback"}}
+        if self.setup_wait_enabled:
+            shadow_arguments["as_of"] = self.clock()
+            if shadow_arguments["as_of"] < cutoff:
+                raise ValueError("stock setup shadow receipt moved backwards after wait")
+        setup_shadows, shadow_rejections = (self.setup_shadow_reader(**shadow_arguments)
+            if self.setup_shadow_reader is not None else ((), {}))
         source_bars = {row["bar_revision_id"]: row for row in technical_sources["bars"]}
         coverage_cache = {}
         for technical_source in technical_sources["sources"]:
@@ -268,9 +296,24 @@ class ProductionDetectorSourceReader:
         raw_bars = package_sources["raw_bars"]
         rejected = Counter(retained["rejections"])
         rejected.update(setup_rejections)
+        rejected.update({key: value for key, value in shadow_rejections.items() if "SHADOW_SOURCE_UNAVAILABLE" in key})
         if technical_sources.get("source_error"):
             rejected[technical_sources["source_error"]] += 1
         packages = []
+        stock_setup_observations = []
+        if setup_shadows:
+            from options.stock_setup_binding import build_stock_setup_indicator_observation
+
+            detected_activity = tuple(row["source"] for row in retained["activity"]
+                if row["finding"].disposition == "DETECTED")
+            matrices_by_underlyer = {row["underlying"]: row["matrix_id"] for row in retained["matrices"]}
+            for setup_shadow in setup_shadows:
+                try:
+                    stock_setup_observations.append(build_stock_setup_indicator_observation(setup_shadow,
+                        detected_activity, scheduled_cycle=scheduled_cycle,
+                        matrix_id=matrices_by_underlyer[setup_shadow.candidate.ticker], decision_at=received_at))
+                except (KeyError, ValueError):
+                    rejected[setup_shadow.detector_id + "_SHADOW_OBSERVATION_INVALID"] += 1
         calendar = OptionExchangeCalendar()
         for row in package_sources["candidates"]:
             candidate = retained_candidate(row, legs[row["candidate_id"]])
@@ -359,6 +402,8 @@ class ProductionDetectorSourceReader:
                 packages.append(dict(common, **extra, decision=decision, entry_deadline=deadline, exit_deadline=exit_at,
                     technical_evidence=technical, technical_source_policy_sha256=technical.source_policy_sha256))
         return DetectorCycleInputs(matrices=retained["matrices"], package_inputs=tuple(packages),
+            o1_observations=tuple(o1_observations),
+            stock_setup_observations=tuple(stock_setup_observations),
             surface_inputs=retained["surface_inputs"], rejections=tuple(sorted(rejected.items())), reject_invalid_packages=True)
 
 
@@ -368,16 +413,19 @@ class DetectorCycleCollector:
         self.evaluation_repository = evaluation_repository
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
-    def __call__(self, *, configuration, dataset_id, scheduled_cycle, completed_matrices, started_at):
+    def __call__(self, *, configuration, dataset_id, scheduled_cycle, completed_matrices, started_at,
+                 progress_callback=None):
         if (started_at.utcoffset() is None or scheduled_cycle.utcoffset() is None
                 or scheduled_cycle > started_at
                 or set(completed_matrices) != set(configuration.settings.underlyers)):
             raise ValueError("detector collection requires a complete causal configured cycle")
         inputs = self.source_reader(configuration=configuration, dataset_id=dataset_id,
-            scheduled_cycle=scheduled_cycle, completed_matrices=completed_matrices, started_at=started_at)
+            scheduled_cycle=scheduled_cycle, completed_matrices=completed_matrices, started_at=started_at,
+            progress_callback=progress_callback)
         if not isinstance(inputs, DetectorCycleInputs):
             raise ValueError("detector source reader must return bounded cycle inputs")
-        if (len(inputs.package_inputs) + len(inputs.surface_inputs) > 5000
+        if (len(inputs.package_inputs) + len(inputs.o1_observations) + len(inputs.stock_setup_observations)
+            + len(inputs.surface_inputs) > 5000
                 or len(inputs.matrices) != len(completed_matrices)
                 or {row["underlying"]: row["matrix_id"] for row in inputs.matrices} != completed_matrices):
             raise ValueError("detector collection input bound or source matrix scope mismatch")
@@ -409,10 +457,27 @@ class DetectorCycleCollector:
             raise ValueError("detector selection clock precedes collection")
         prior = self.evaluation_repository.prior_selected(dataset_id=dataset_id,
             scheduled_cycle=scheduled_cycle, as_of=selected_at)
+        prior_o1 = (self.evaluation_repository.prior_o1_observed(dataset_id=dataset_id,
+            scheduled_cycle=scheduled_cycle, as_of=selected_at)
+            if hasattr(self.evaluation_repository, "prior_o1_observed") else set())
+        new_o1 = tuple(row for row in inputs.o1_observations if row.recurrence_sha256 not in prior_o1)
+        repeat_o1 = len(inputs.o1_observations) - len(new_o1)
+        if repeat_o1:
+            rejected["O1_REPEAT_OBSERVATION"] += repeat_o1
+        prior_setups = (self.evaluation_repository.prior_stock_setup_observed(dataset_id=dataset_id,
+            scheduled_cycle=scheduled_cycle, as_of=selected_at)
+            if hasattr(self.evaluation_repository, "prior_stock_setup_observed") else set())
+        new_setups = tuple(row for row in inputs.stock_setup_observations
+            if row.recurrence_sha256 not in prior_setups)
+        repeat_setups = len(inputs.stock_setup_observations) - len(new_setups)
+        if repeat_setups:
+            rejected["STOCK_SETUP_REPEAT_OBSERVATION"] += repeat_setups
         selection = select_dual_origin_packages(packages, prior, decision_at=selected_at,
             scheduled_cycle=scheduled_cycle, expected_underlyers=configuration.settings.underlyers,
             completed_matrices=completed_matrices)
         records = (*build_selection_evidence(selection, plans, dataset_id=dataset_id, selected_at=selected_at),
+            *build_o1_indicator_evidence(new_o1, dataset_id=dataset_id, selected_at=selected_at),
+            *build_stock_setup_indicator_evidence(new_setups, dataset_id=dataset_id, selected_at=selected_at),
             *build_surface_evidence(observations, dataset_id=dataset_id, selected_at=selected_at))
         rejected.update(selection["evidence"]["rejections"])
         run = build_detector_run(configuration=configuration, dataset_id=dataset_id,

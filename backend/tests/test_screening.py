@@ -856,6 +856,25 @@ def test_published_discovery_state_matches_original_and_stays_field_scoped(state
         assert evaluate(unavailable, rule)[0] == "UNKNOWN"
 
 
+def test_extracted_state_provenance_does_not_trust_compatibility_shim():
+    from copy import deepcopy
+    from research.screening import comparison_status
+    previous = dict(version=VERSION, universe="fixed", interval="1d", field_set_version="fields",
+                    contract_hash="contract", capture_mode="RECONSTRUCTED_FROM_RETAINED_PUBLICATION",
+                    session="2026-09-10", source_cutoff="2026-09-10T21:00:00+00:00",
+                    daily_state_contract="daily_state_extracted_v1",
+                    code_hashes={"technicals.py": "candles", "daily_state.py": "implementation"})
+    current = deepcopy(previous)
+    current.update(session="2026-09-11", previous_expected_session="2026-09-10",
+                   source_cutoff="2026-09-11T21:00:00+00:00")
+    assert comparison_status(current, previous) == "READY"
+    current["code_hashes"]["daily_state.py"] = "changed"
+    assert comparison_status(current, previous) == "INCOMPATIBLE_PUBLICATIONS"
+    current["code_hashes"]["daily_state.py"] = "implementation"
+    previous.pop("daily_state_contract")
+    assert comparison_status(current, previous) == "INCOMPATIBLE_PUBLICATIONS"
+
+
 def test_new_state_fields_cannot_be_requested_from_old_publication():
     generation = dict(version=VERSION, generation="old", rows=[row(price=10.)])
     assert query_generation(generation, Query())["matched_count"] == 1

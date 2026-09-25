@@ -22,6 +22,7 @@ MARKET_TIME = datetime(2026, 9, 4, 17, 0, tzinfo=UTC)
 OBSERVED_TIME = datetime(2026, 9, 4, 17, 15, tzinfo=UTC)
 BATCH = uuid4()
 POLICY_PATH = BACKEND_DIR / "options" / "policies" / "strategy_v1.json"
+ANCHOR_POLICY_PATH = BACKEND_DIR / "options" / "policies" / "strategy_technical_forward_v2.json"
 SPOT = Decimal("100")
 
 
@@ -101,8 +102,9 @@ def _health(count):
     )
 
 
-def _scan(snapshots, direction=None):
-    policy, sha = _policy()
+def _scan(snapshots, direction=None, *, anchored=False):
+    artifact = load_strategy_policy(ANCHOR_POLICY_PATH if anchored else POLICY_PATH)
+    policy, sha = artifact.policy, artifact.sha256
     engine = OptionStrategyEngine(policy, sha)
     matrix_id = uuid4()
     result = engine.scan(
@@ -115,8 +117,11 @@ def _scan(snapshots, direction=None):
     )
 
 
-def _selected(snapshots, direction=None):
-    return [c for c in _scan(snapshots, direction) if c.status.value == "SELECTED"]
+def _selected(snapshots, direction=None, *, anchored=False):
+    return [
+        candidate for candidate in _scan(snapshots, direction, anchored=anchored)
+        if candidate.status.value == "SELECTED"
+    ]
 
 
 # Spot 100, 30 DTE at 30% IV implies a ~8.6% one-sigma move. The 100/103 call spread
@@ -245,6 +250,28 @@ def test_each_lane_and_side_is_capped_independently():
     )
     selected = _selected(crowded)
     assert len(selected) == 1
+
+
+def test_participation_anchor_builds_best_spread_around_detected_long_leg():
+    baseline = _call_spread()
+    detected_long = _snapshot(
+        5, ContractType.CALL, 101, dte=30, delta=0.55, mark=2.8,
+        open_interest=5000, day_volume=15000,
+    )
+    detected_short = _snapshot(
+        6, ContractType.CALL, 103, dte=30, delta=0.35, mark=1.8,
+    )
+    snapshots = (*baseline, detected_long, detected_short)
+
+    original = _selected(snapshots)
+    anchored = _selected(snapshots, anchored=True)
+
+    assert len(original) == 1
+    assert anchored[0].legs == original[0].legs
+    assert [candidate.legs[0].contract_id for candidate in anchored] == [1, 5]
+    assert anchored[1].legs[1].contract_id == 6
+    assert anchored[1].primary_evidence["participation_anchor"]["volume_oi_ratio"] == 3.0
+    assert anchored[1].return_on_risk >= 1.0
 
 
 def test_profit_target_must_sit_inside_the_implied_move():

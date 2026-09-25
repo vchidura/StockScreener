@@ -22,6 +22,7 @@ MARKET_TIME = datetime(2026, 9, 4, 17, 0, tzinfo=UTC)
 OBSERVED_TIME = datetime(2026, 9, 4, 17, 15, tzinfo=UTC)
 BATCH = uuid4()
 POLICY_PATH = BACKEND_DIR / "options" / "policies" / "strategy_v1.json"
+ANCHOR_POLICY_PATH = BACKEND_DIR / "options" / "policies" / "strategy_technical_forward_v2.json"
 SPOT = Decimal("100")
 
 
@@ -98,8 +99,9 @@ def _health(count):
     )
 
 
-def _scan(snapshots):
-    policy, sha = _policy()
+def _scan(snapshots, *, anchored=False):
+    artifact = load_strategy_policy(ANCHOR_POLICY_PATH if anchored else POLICY_PATH)
+    policy, sha = artifact.policy, artifact.sha256
     engine = OptionStrategyEngine(policy, sha)
     matrix_id = uuid4()
     result = engine.scan(
@@ -111,8 +113,11 @@ def _scan(snapshots):
     )
 
 
-def _selected(snapshots):
-    return [c for c in _scan(snapshots) if c.status.value == "SELECTED"]
+def _selected(snapshots, *, anchored=False):
+    return [
+        candidate for candidate in _scan(snapshots, anchored=anchored)
+        if candidate.status.value == "SELECTED"
+    ]
 
 
 # A 30-day 0.45-delta call at 2.00 breaks even 2% away against a ~8.6% implied move.
@@ -173,6 +178,30 @@ def test_each_lane_and_side_is_capped_independently():
         (c.primary_evidence["dte_lane"], c.structure_type.value) for c in selected
     }
     assert len(selected) == len(keys)
+
+
+def test_participation_anchor_appends_detected_contract_after_original_lane_winner():
+    winner = _snapshot(
+        1, ContractType.CALL, 100, dte=30, delta=0.45, mark=1.0,
+        open_interest=5000, day_volume=2000,
+    )
+    detected = _snapshot(
+        2, ContractType.CALL, 100, dte=30, delta=0.45, mark=2.0,
+        open_interest=5000, day_volume=15000,
+    )
+
+    assert [candidate.legs[0].contract_id for candidate in _selected((detected, winner))] == [1]
+    anchored = _selected((detected, winner), anchored=True)
+
+    assert [candidate.legs[0].contract_id for candidate in anchored] == [1, 2]
+    assert [candidate.rank for candidate in anchored] == [1, 2]
+    assert "participation_anchor" not in anchored[0].primary_evidence
+    assert anchored[1].primary_evidence["participation_anchor"] == {
+        "version": "o1_participation_candidate_anchor_v1",
+        "source_basis": "CHAIN_VOLUME_OI_REVALIDATED_BY_DATED_OI",
+        "volume_oi_ratio": 3.0,
+        "revalidation": "O1_DATED_OPEN_INTEREST_REQUIRED",
+    }
 
 
 def test_liquidity_floors_exclude_thin_contracts():

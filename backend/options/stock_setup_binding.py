@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -22,7 +23,7 @@ from options.calendar import OptionExchangeCalendar
 from options.domain import CatalogEligibility, validate_standard_contract
 from options.outcome_contracts import PACKAGE_ASSESSMENT_POLICY, OptionPackageAssessment, assess_option_package
 from options.stock_setup_gates import DirectHourlyAcceptancePolicy, SetupGateAssessment, evaluate_hourly_acceptance
-from research.stock_idea_engine import entry_gate
+from research.stock_idea_engine import candidate_record, entry_gate, read_candidate
 
 
 SETUP_RESEARCH_UNDERLYERS = frozenset({
@@ -34,6 +35,246 @@ SETUP_BINDING_CODE_PATHS = (
     "options/stock_setup_binding.py", "options/stock_setup_gates.py", "options/strategies/payoff.py",
     "research/stock_idea_engine.py",
 )
+
+STOCK_SETUP_INDICATOR_METRICS = (
+    "stock_rs_strength", "stock_extension_atr", "stock_room_risk", "stock_liquidity",
+    "stock_directional_momentum", "stock_breakout_clearance_atr", "stock_resumption_target_distance_atr",
+    "option_matched_contract_count", "option_max_volume_oi_ratio", "option_total_day_volume", "option_min_dte",
+)
+
+
+class StockSetupIndicatorReviewPolicy(Contract):
+    version: Literal["stock_first_mixed_indicator_review_v1"] = "stock_first_mixed_indicator_review_v1"
+    rs_strength_thresholds: tuple[float, ...] = (0.75, 0.85)
+    room_risk_thresholds: tuple[float, ...] = (1.5, 2.0)
+    liquidity_thresholds: tuple[float, ...] = (20_000_000.0, 50_000_000.0)
+    option_volume_oi_thresholds: tuple[float, ...] = (5.0, 10.0)
+    option_breadth_thresholds: tuple[int, ...] = (2, 3)
+    s1_breakout_clearance_range_atr: tuple[float, float] = (0.25, 0.75)
+    s2_extension_caps_atr: tuple[float, ...] = (1.0, 1.5)
+    episode_admission: Literal["FIRST_OBSERVATION_PER_DATASET_EPISODE"] = "FIRST_OBSERVATION_PER_DATASET_EPISODE"
+    changes_admission: Literal[False] = False
+    publication_permission: Literal[False] = False
+    execution_permission: Literal[False] = False
+
+
+STOCK_SETUP_INDICATOR_REVIEW_POLICY = StockSetupIndicatorReviewPolicy()
+
+
+class StockSetupShadowSource(Contract):
+    schema_version: Literal["stock_setup_shadow_source_v1"] = "stock_setup_shadow_source_v1"
+    detector_id: Literal["S1", "S2"]
+    source_policy_sha256: Sha256
+    publication_payload_sha256: Sha256
+    candidate_payload_text: str
+    candidate_payload_sha256: Sha256
+    episode_id: Sha256
+    publication_market_time: AwareDatetime
+    published_at: AwareDatetime
+    received_at: AwareDatetime
+    source_status: Literal["ACTIVE_AT_SOURCE_READ", "EXPIRED_BEFORE_SOURCE_READ"]
+    setup_selection: Literal["SELECTED", "ELIGIBLE", "SUPPRESSED"]
+    setup_reason: Name | None = None
+
+    @property
+    def candidate(self):
+        return read_candidate(json.loads(self.candidate_payload_text))
+
+    @model_validator(mode="after")
+    def validate_source(self):
+        candidate = self.candidate
+        expected_detector = "S2" if candidate.model == "resumption" else "S1" if candidate.model == "acceptance" else None
+        expected_status = "ACTIVE_AT_SOURCE_READ" if candidate.expires_at > self.received_at else "EXPIRED_BEFORE_SOURCE_READ"
+        canonical = json.dumps(candidate_record(candidate), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        if (expected_detector != self.detector_id or candidate.episode_id != self.episode_id
+                or canonical != self.candidate_payload_text
+                or hashlib.sha256(canonical.encode("ascii")).hexdigest() != self.candidate_payload_sha256
+                or not candidate.trigger_at <= candidate.available_at <= self.published_at <= self.received_at
+                or self.publication_market_time > self.published_at or self.source_status != expected_status
+                or (self.setup_selection in ("SELECTED", "ELIGIBLE")) != (self.setup_reason is None)):
+            raise ValueError("stock setup shadow source identity or clocks mismatch")
+        return self
+
+
+def build_stock_setup_shadow_source(*, candidate_payload, episode_id, policy, publication_payload_sha256,
+                                    publication_market_time, published_at, received_at,
+                                    setup_selection, setup_reason):
+    candidate_payload = {key: value for key, value in candidate_payload.items() if key != "episode_id"}
+    candidate = read_candidate(candidate_payload)
+    canonical = json.dumps(candidate_record(candidate), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    detector_id = "S2" if candidate.model == "resumption" else "S1" if candidate.model == "acceptance" else None
+    if detector_id is None or candidate.policy_version != policy.detector_version:
+        raise ValueError("stock setup shadow source requires S1 or S2 policy identity")
+    return StockSetupShadowSource(detector_id=detector_id, source_policy_sha256=policy.sha256,
+        publication_payload_sha256=publication_payload_sha256, candidate_payload_text=canonical,
+        candidate_payload_sha256=hashlib.sha256(canonical.encode("ascii")).hexdigest(), episode_id=episode_id,
+        publication_market_time=publication_market_time, published_at=published_at, received_at=received_at,
+        setup_selection=setup_selection, setup_reason=setup_reason,
+        source_status="ACTIVE_AT_SOURCE_READ" if candidate.expires_at > received_at else "EXPIRED_BEFORE_SOURCE_READ")
+
+
+class StockSetupIndicatorMeasurement(Contract):
+    metric_id: Name
+    unit: Name
+    status: Literal["READY", "UNAVAILABLE"]
+    value: float | None = None
+    reason_codes: tuple[Name, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_measurement(self):
+        if self.metric_id not in STOCK_SETUP_INDICATOR_METRICS:
+            raise ValueError("unsupported stock setup indicator metric")
+        if self.status == "READY" and (self.value is None or not math.isfinite(self.value) or self.reason_codes):
+            raise ValueError("ready stock setup metric requires one finite value")
+        if self.status == "UNAVAILABLE" and (self.value is not None or not self.reason_codes):
+            raise ValueError("unavailable stock setup metric requires reasons")
+        return self
+
+
+class StockSetupChallengerAssessment(Contract):
+    challenger_id: Name
+    verdict: Literal["PASS", "FAIL", "UNAVAILABLE"]
+    metric_ids: tuple[Name, ...]
+    reason_codes: tuple[Name, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_assessment(self):
+        if (self.verdict == "PASS") == bool(self.reason_codes):
+            raise ValueError("stock setup challenger verdict and reasons disagree")
+        return self
+
+
+class StockSetupIndicatorObservation(Contract):
+    schema_version: Literal["option_stock_setup_indicator_observation_v1"] = "option_stock_setup_indicator_observation_v1"
+    detector_id: Literal["S1", "S2"]
+    output_kind: Literal["OBSERVATION"] = "OBSERVATION"
+    policy: StockSetupIndicatorReviewPolicy = STOCK_SETUP_INDICATOR_REVIEW_POLICY
+    scheduled_cycle: AwareDatetime
+    matrix_id: UUID
+    setup_source: StockSetupShadowSource
+    underlyer: Name
+    direction: Literal[-1, 1]
+    decision_at: AwareDatetime
+    valid_until: AwareDatetime
+    baseline_disposition: Literal["CONFIRMED", "UNMATCHED", "UNAVAILABLE"]
+    baseline_reasons: tuple[Name, ...]
+    activity_source_sha256s: tuple[Sha256, ...]
+    measurements: tuple[StockSetupIndicatorMeasurement, ...]
+    challengers: tuple[StockSetupChallengerAssessment, ...]
+    package_status: Literal["NOT_ASSESSED"] = "NOT_ASSESSED"
+    outcome_status: Literal["NOT_YET_MEASURED"] = "NOT_YET_MEASURED"
+    publication_permission: Literal[False] = False
+    execution_permission: Literal[False] = False
+
+    @property
+    def recurrence_sha256(self):
+        return hashlib.sha256(f"{self.policy.sha256}:{self.detector_id}:{self.setup_source.episode_id}".encode("ascii")).hexdigest()
+
+    @model_validator(mode="after")
+    def validate_observation(self):
+        candidate = self.setup_source.candidate
+        if (self.detector_id != self.setup_source.detector_id or self.underlyer != candidate.ticker
+                or self.direction != candidate.direction or self.valid_until != candidate.expires_at
+                or self.scheduled_cycle > self.decision_at or self.setup_source.received_at > self.decision_at
+                or tuple(row.metric_id for row in self.measurements) != STOCK_SETUP_INDICATOR_METRICS
+                or len({row.challenger_id for row in self.challengers}) != len(self.challengers)
+                or tuple(sorted(set(self.activity_source_sha256s))) != self.activity_source_sha256s
+                or (self.baseline_disposition == "CONFIRMED") != (not self.baseline_reasons)):
+            raise ValueError("stock setup indicator observation identity, metrics or clocks mismatch")
+        return self
+
+
+def _stock_setup_challenger(challenger_id, metric_ids, values, predicate):
+    missing = tuple(metric_id for metric_id in metric_ids if values.get(metric_id) is None)
+    if missing:
+        return StockSetupChallengerAssessment(challenger_id=challenger_id, verdict="UNAVAILABLE",
+            metric_ids=metric_ids, reason_codes=tuple(f"{metric_id.upper()}_UNAVAILABLE" for metric_id in missing))
+    passed = predicate(*(values[metric_id] for metric_id in metric_ids))
+    return StockSetupChallengerAssessment(challenger_id=challenger_id, verdict="PASS" if passed else "FAIL",
+        metric_ids=metric_ids, reason_codes=() if passed else ("CHALLENGER_THRESHOLD_NOT_MET",))
+
+
+def build_stock_setup_indicator_observation(setup_source, activity_sources, *, scheduled_cycle, matrix_id, decision_at):
+    setup_source = StockSetupShadowSource.model_validate_json(setup_source.canonical_json())
+    candidate = setup_source.candidate
+    expected_contract = "CALL" if candidate.direction == 1 else "PUT"
+    matched = tuple(sorted((source for source in activity_sources
+        if source.security_id == UUID(candidate.security_id) and source.underlyer == candidate.ticker
+        and source.contract_type == expected_contract and source.received_at <= decision_at
+        and source.open_interest and source.open_interest > 0 and source.day_volume is not None
+        and source.day_volume / source.open_interest >= 3), key=lambda row: row.contract_id))
+    rs_strength = candidate.rs_rank if candidate.direction == 1 else 1 - candidate.rs_rank
+    values = dict(stock_rs_strength=rs_strength, stock_extension_atr=candidate.extension,
+        stock_room_risk=candidate.room_risk, stock_liquidity=candidate.liquidity,
+        stock_directional_momentum=candidate.direction * candidate.momentum,
+        stock_breakout_clearance_atr=(candidate.direction * (candidate.price - candidate.reference) / candidate.activation_atr
+            if candidate.model == "acceptance" else None),
+        stock_resumption_target_distance_atr=(candidate.direction * (candidate.reference - candidate.price) / candidate.activation_atr
+            if candidate.model == "resumption" else None),
+        option_matched_contract_count=float(len(matched)) if matched else None,
+        option_max_volume_oi_ratio=max((source.day_volume / source.open_interest for source in matched), default=None),
+        option_total_day_volume=float(sum(source.day_volume for source in matched)) if matched else None,
+        option_min_dte=float(min((source.expiration_date - source.volume_session).days for source in matched)) if matched else None)
+    units = dict(stock_rs_strength="fraction", stock_extension_atr="atr_multiple", stock_room_risk="ratio",
+        stock_liquidity="usd", stock_directional_momentum="fraction", stock_breakout_clearance_atr="atr_multiple",
+        stock_resumption_target_distance_atr="atr_multiple", option_matched_contract_count="count",
+        option_max_volume_oi_ratio="ratio", option_total_day_volume="contracts", option_min_dte="days")
+    measurements = tuple(StockSetupIndicatorMeasurement(metric_id=metric_id, unit=units[metric_id],
+        status="READY" if values[metric_id] is not None else "UNAVAILABLE", value=values[metric_id],
+        reason_codes=() if values[metric_id] is not None else (("NOT_APPLICABLE_TO_MODEL",)
+            if metric_id.startswith("stock_") else ("MATCHED_OPTION_PARTICIPATION_UNAVAILABLE",)))
+        for metric_id in STOCK_SETUP_INDICATOR_METRICS)
+    allowed_suppression = {"MODEL_QUOTA", "MODEL_STOCK_DUPLICATE", "ACTIVE_POSITION_CAP"}
+    setup_eligible = (setup_source.setup_selection in ("SELECTED", "ELIGIBLE") and setup_source.setup_reason is None
+        or setup_source.setup_selection == "SUPPRESSED" and setup_source.setup_reason in allowed_suppression)
+    if not setup_eligible:
+        baseline_disposition, reasons = "UNAVAILABLE", ("STOCK_EPISODE_STRUCTURALLY_BLOCKED",)
+    elif decision_at >= candidate.expires_at:
+        baseline_disposition, reasons = "UNAVAILABLE", ("STOCK_EPISODE_EXPIRED_BEFORE_OPTION_DECISION",)
+    elif not matched:
+        baseline_disposition, reasons = "UNMATCHED", ("MATCHED_OPTION_PARTICIPATION_UNAVAILABLE",)
+    else:
+        baseline_disposition, reasons = "CONFIRMED", ()
+    policy = STOCK_SETUP_INDICATOR_REVIEW_POLICY
+    challengers = [StockSetupChallengerAssessment(challenger_id="BASELINE_CURRENT",
+        verdict="PASS" if baseline_disposition == "CONFIRMED" else "UNAVAILABLE" if baseline_disposition == "UNAVAILABLE" else "FAIL",
+        metric_ids=("option_matched_contract_count",), reason_codes=() if baseline_disposition == "CONFIRMED" else reasons)]
+    for threshold in policy.rs_strength_thresholds:
+        challengers.append(_stock_setup_challenger(f"RS_STRENGTH_{str(threshold).replace('.', '_')}",
+            ("stock_rs_strength",), values, lambda value, limit=threshold: value >= limit))
+    for threshold in policy.room_risk_thresholds:
+        challengers.append(_stock_setup_challenger(f"ROOM_RISK_{str(threshold).replace('.', '_')}",
+            ("stock_room_risk",), values, lambda value, limit=threshold: value >= limit))
+    for threshold in policy.liquidity_thresholds:
+        challengers.append(_stock_setup_challenger(f"LIQUIDITY_{int(threshold)}",
+            ("stock_liquidity",), values, lambda value, limit=threshold: value >= limit))
+    for threshold in policy.option_volume_oi_thresholds:
+        challengers.append(_stock_setup_challenger(f"OPTION_VOLUME_OI_{str(threshold).replace('.', '_')}",
+            ("option_max_volume_oi_ratio",), values, lambda value, limit=threshold: value >= limit))
+    for threshold in policy.option_breadth_thresholds:
+        challengers.append(_stock_setup_challenger(f"OPTION_BREADTH_{threshold}",
+            ("option_matched_contract_count",), values, lambda value, limit=threshold: value >= limit))
+    challengers.append(_stock_setup_challenger("DIRECTIONAL_MOMENTUM_POSITIVE",
+        ("stock_directional_momentum",), values, lambda value: value > 0))
+    if candidate.model == "acceptance":
+        low, high = policy.s1_breakout_clearance_range_atr
+        challengers.append(_stock_setup_challenger("S1_BREAKOUT_CLEARANCE_0_25_TO_0_75",
+            ("stock_breakout_clearance_atr",), values, lambda value: low <= value <= high))
+        challengers.append(_stock_setup_challenger("S1_MIXED_QUALITY",
+            ("stock_rs_strength", "stock_room_risk", "stock_breakout_clearance_atr", "option_max_volume_oi_ratio"),
+            values, lambda rs, room, clearance, ratio: rs >= .75 and room >= 1.5 and low <= clearance <= high and ratio >= 5))
+    else:
+        for threshold in policy.s2_extension_caps_atr:
+            challengers.append(_stock_setup_challenger(f"S2_EXTENSION_MAX_{str(threshold).replace('.', '_')}",
+                ("stock_extension_atr",), values, lambda value, limit=threshold: value <= limit))
+        challengers.append(_stock_setup_challenger("S2_MIXED_QUALITY",
+            ("stock_rs_strength", "stock_room_risk", "stock_extension_atr", "stock_directional_momentum", "option_max_volume_oi_ratio"),
+            values, lambda rs, room, extension, momentum, ratio: rs >= .8 and room >= 1.5 and extension <= 1.5 and momentum > 0 and ratio >= 5))
+    return StockSetupIndicatorObservation(detector_id=setup_source.detector_id, scheduled_cycle=scheduled_cycle,
+        matrix_id=matrix_id, setup_source=setup_source, underlyer=candidate.ticker, direction=candidate.direction,
+        decision_at=decision_at, valid_until=candidate.expires_at, baseline_disposition=baseline_disposition,
+        baseline_reasons=reasons, activity_source_sha256s=tuple(sorted({source.sha256 for source in matched})),
+        measurements=measurements, challengers=tuple(challengers))
 
 
 def _relative_path(value: str, prefix: str, suffix: str) -> str:

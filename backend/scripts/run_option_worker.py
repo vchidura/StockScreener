@@ -18,18 +18,55 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 load_dotenv(BACKEND_DIR / ".env")
+
+REVIEWED_OPTION_PINS = (
+    "OPTION_STRATEGY_POLICY_FILE",
+    "OPTION_TECHNICAL_FORWARD_LAUNCH_FILE",
+    "OPTION_TECHNICAL_FORWARD_LAUNCH_SHA256",
+)
+
+
+def _load_reviewed_option_pins(path, environment=None):
+    environment = os.environ if environment is None else environment
+    pinned = dotenv_values(path)
+    for key in REVIEWED_OPTION_PINS:
+        value = pinned.get(key)
+        if value is not None:
+            environment[key] = value
+    return environment
+
+
+_load_reviewed_option_pins(BACKEND_DIR / ".env")
 
 from options import build_option_startup_state, load_option_runtime_configuration
 from options.startup import ensure_option_partitions
 from options.data import build_data_engine
 from options.orchestration import ManualOptionPipeline
-from options.outcome_service import OptionOutcomeService
-from options.repositories import OptionOutcomeRepository, OptionSchedulerLeadership
+from options.repositories import OptionSchedulerLeadership
 from options.strategy_orchestration import OptionStrategyPipeline
 from options.worker import OptionMaterializationWorker
+
+
+def _detector_storage_ready(schema):
+    return bool(
+        schema.get("registered") and schema.get("runtime_select") and schema.get("runtime_insert")
+        and schema.get("o1_table_present") and schema.get("o1_registered")
+        and schema.get("o1_runtime_select") and schema.get("o1_runtime_insert")
+        and schema.get("stock_setup_table_present") and schema.get("stock_setup_registered")
+        and schema.get("stock_setup_runtime_select") and schema.get("stock_setup_runtime_insert")
+        and schema.get("unvalidated_constraints") == 0
+        and len(schema.get("triggers", ())) == 3
+        and all(row["enabled"] == "O" for row in schema["triggers"])
+        and len(schema.get("o1_triggers", ())) == 3
+        and all(row["enabled"] == "O" for row in schema["o1_triggers"])
+        and len(schema.get("stock_setup_triggers", ())) == 3
+        and all(row["enabled"] == "O" for row in schema["stock_setup_triggers"])
+        and len(schema.get("indexes", ())) == 4
+        and all(row["valid"] and row["ready"] for row in schema["indexes"])
+    )
 
 
 def _detector_pipeline_arguments(configuration):
@@ -46,10 +83,7 @@ def _detector_pipeline_arguments(configuration):
 
     launch = load_detector_forward_launch(path, expected_sha256=expected, configuration=configuration, backend_dir=BACKEND_DIR)
     schema = OptionAlertEvaluationRepository().schema_readiness()
-    if (not schema.get("registered") or not schema.get("runtime_select") or not schema.get("runtime_insert")
-            or schema.get("unvalidated_constraints") != 0
-            or len(schema.get("triggers", ())) != 3 or any(row["enabled"] != "O" for row in schema["triggers"])
-            or len(schema.get("indexes", ())) != 4 or any(not row["valid"] or not row["ready"] for row in schema["indexes"])):
+    if not _detector_storage_ready(schema):
         raise ValueError("technical forward storage guards or permissions are not ready")
     sources = OptionStockBehaviorAssessmentRepository()
     cutoff = datetime.now(timezone.utc)
@@ -235,12 +269,10 @@ def main() -> int:
         return 2
     try:
         strategy_pipeline = OptionStrategyPipeline(configuration)
-        outcome_repository = OptionOutcomeRepository()
         pipeline = ManualOptionPipeline(
             configuration,
             build_data_engine(configuration),
             strategy_pipeline=strategy_pipeline,
-            outcome_repository=outcome_repository,
             **detector_arguments,
         )
         underlyers = None
@@ -253,13 +285,6 @@ def main() -> int:
         worker = OptionMaterializationWorker(
             pipeline,
             underlyers=underlyers,
-            outcome_service=OptionOutcomeService(
-                outcome_repository,
-                policy=configuration.valuation_policy,
-                availability_evidence_enabled=(
-                    configuration.settings.outcome_unavailable_evidence_enabled
-                ),
-            ),
             partition_maintainer=ensure_option_partitions,
             validation_callback=_continuous_validation_callback(configuration, strategy_pipeline.evidence_runtime),
             effective_from=detector_arguments.get("detector_effective_from"),

@@ -32,9 +32,14 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--effective-from", type=datetime.fromisoformat, help="Optional aware in-session cutoff for a prospective technical launch; existing completed slots remain untouched.")
     parser.add_argument("--continuous-development", action="store_true")
     parser.add_argument("--technical-forward", action="store_true", help="Prepare the separate pinned technical detector launch; never activates it.")
-    parser.add_argument("--intraday-confirmation", action="store_true", help="Pin reviewed O1 v2 completed-30m confirmation for development observation alerts.")
+    parser.add_argument("--intraday-confirmation", action="store_true", help="Pin reviewed O1 v3 latest-available completed-30m confirmation for development observation alerts.")
+    parser.add_argument("--stock-setup-wait", action="store_true", help="Wait boundedly for the exact S1/S2 stock publication while causal option activity remains valid.")
     parser.add_argument("--approve-stock-runtime-transition", action="store_true", help="Explicitly pin reviewed current stock code before its first new publication; old publications remain ineligible under the new pins.")
     parser.add_argument("--check-only", action="store_true", help="Validate a technical launch without writing its manifest.")
+    parser.add_argument("--strategy-policy-file", choices=(
+        "options/policies/strategy_technical_forward_v1.json",
+        "options/policies/strategy_technical_forward_v2.json",
+    ), default="options/policies/strategy_technical_forward_v1.json")
     parser.add_argument("--stock-ledger", default="backups/equity-shadow/stock-ideas-forward-v2/forward.sqlite")
     parser.add_argument("--usage-window-seconds", type=int, default=86400)
     parser.add_argument("--output", type=Path, required=True)
@@ -50,8 +55,11 @@ def _arguments() -> argparse.Namespace:
 
 def main() -> int:
     args = _arguments()
-    if (args.approve_stock_runtime_transition or args.effective_from is not None or args.intraday_confirmation) and not args.technical_forward:
+    if (args.approve_stock_runtime_transition or args.effective_from is not None or args.intraday_confirmation
+            or args.stock_setup_wait) and not args.technical_forward:
         raise ValueError("stock runtime transition requires a technical forward launch")
+    if args.stock_setup_wait and not args.intraday_confirmation:
+        raise ValueError("stock setup wait requires intraday confirmation")
     output = args.output.resolve()
     research_root = (BACKEND_DIR / "research").resolve()
     if output.parent != research_root or output.suffix != ".json":
@@ -74,13 +82,13 @@ def main() -> int:
     if args.technical_forward:
         from options.detector_launch import prepare_detector_forward_launch
         from options.repositories.stock_behavior_assessments import OptionStockBehaviorAssessmentRepository
-        environment = dict(os.environ, OPTION_STRATEGY_POLICY_FILE="options/policies/strategy_technical_forward_v1.json",
+        environment = dict(os.environ, OPTION_STRATEGY_POLICY_FILE=args.strategy_policy_file,
             OPTION_VALUATION_POLICY_FILE="options/policies/valuation_raw_spot_v2.json")
         configuration = load_option_runtime_configuration(environment, BACKEND_DIR)
         launch = prepare_detector_forward_launch(backend_dir=BACKEND_DIR, configuration=configuration,
             dataset_id=args.launch_id, effective_from=starts_at, stock_ledger=args.stock_ledger,
             approve_stock_runtime_transition=args.approve_stock_runtime_transition,
-            intraday_confirmation=args.intraday_confirmation)
+            intraday_confirmation=args.intraday_confirmation, stock_setup_wait=args.stock_setup_wait)
         cutoff = datetime.now(timezone.utc)
         source_repository = OptionStockBehaviorAssessmentRepository()
         source_repository.detector_package_sources(configuration=configuration, candidate_ids=(), as_of=cutoff)

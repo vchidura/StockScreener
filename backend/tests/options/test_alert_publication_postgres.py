@@ -71,6 +71,14 @@ def isolated_schema():
                 evaluations = evaluations.replace("public.", f'"{schema}".')
                 cursor.execute(evaluations)
                 cursor.execute(evaluations)
+                indicators = (BACKEND_DIR / "migrations" / "054_option_o1_indicator_observations.sql").read_text(encoding="utf-8")
+                indicators = indicators.replace("public.", f'"{schema}".')
+                cursor.execute(indicators)
+                cursor.execute(indicators)
+                setup_indicators = (BACKEND_DIR / "migrations" / "055_option_stock_setup_indicator_observations.sql").read_text(encoding="utf-8")
+                setup_indicators = setup_indicators.replace("public.", f'"{schema}".')
+                cursor.execute(setup_indicators)
+                cursor.execute(setup_indicators)
                 for statement in (
                     "GRANT USAGE ON SCHEMA {} TO {}",
                     "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {} TO {}",
@@ -136,6 +144,58 @@ def make_evaluation_records(schema, model="O1", *, technical=False):
                     (candidate.candidate_id, candidate.matrix_id, candidate.identity_sha256, candidate.observed_time, candidate.valid_until))
         current.commit()
     return records
+
+
+def make_o1_indicator_records():
+    from equity.behavior import METRICS_V1
+    from options.analytics.alert_selection import build_o1_indicator_evidence
+    from options.intraday_participation import (
+        O1_INDICATOR_METRICS, O1ChallengerAssessment,
+        O1IndicatorMeasurement, O1IndicatorObservation,
+    )
+
+    matrix_id = uuid4()
+    definitions = {row.metric_id: row for row in METRICS_V1}
+    measurements = tuple(O1IndicatorMeasurement(component_key=component, metric_id=metric,
+        unit=definitions[metric].unit, status="UNAVAILABLE", reason_codes=("FIXTURE_UNAVAILABLE",))
+        for component, metric in O1_INDICATOR_METRICS)
+    observation = O1IndicatorObservation(scheduled_cycle=datetime(2026, 9, 22, 16, 30, tzinfo=timezone.utc),
+        matrix_id=matrix_id, security_id=uuid4(), underlyer="AAPL", contract_id=123,
+        snapshot_id=uuid4(), episode_id=uuid4(), direction=1,
+        decision_at=datetime(2026, 9, 22, 16, 40, tzinfo=timezone.utc),
+        valid_until=datetime(2026, 9, 22, 17, 0, tzinfo=timezone.utc),
+        activity_source_sha256="a" * 64, stock_source_sha256=None,
+        baseline_disposition="UNAVAILABLE", baseline_reasons=("FIXTURE_UNAVAILABLE",),
+        volume_oi_ratio=3.0, measurements=measurements,
+        challengers=(O1ChallengerAssessment(challenger_id="BASELINE_V3", verdict="UNAVAILABLE",
+            metric_ids=("ema50_slope10_atr", "median_dollar_volume20"),
+            reason_codes=("FIXTURE_UNAVAILABLE",)),))
+    records = build_o1_indicator_evidence((observation,), dataset_id="isolated-o1-shadow-" + uuid4().hex,
+        selected_at=observation.decision_at)
+    return records
+
+
+def make_stock_setup_indicator_records(model):
+    from research.stock_idea_engine import candidate_record
+    from options.analytics.alert_selection import build_stock_setup_indicator_evidence
+    from options.stock_setup_binding import (
+        build_stock_setup_indicator_observation, build_stock_setup_shadow_source,
+    )
+    from test_dual_origin import qualification_inputs
+
+    inputs = qualification_inputs(model=model)
+    setup = inputs["setup"]
+    decision_at = inputs["decision"].decision_at
+    source = build_stock_setup_shadow_source(candidate_payload=candidate_record(setup.candidate),
+        episode_id=setup.candidate.episode_id, policy=setup.source_policy,
+        publication_payload_sha256=setup.source.payload_sha256,
+        publication_market_time=setup.source.market_time, published_at=setup.source.observed_at,
+        received_at=decision_at, setup_selection="SELECTED", setup_reason=None)
+    observation = build_stock_setup_indicator_observation(source, (inputs["source"],),
+        scheduled_cycle=inputs["lineage"].scheduled_cycle, matrix_id=inputs["candidate"].matrix_id,
+        decision_at=decision_at)
+    return build_stock_setup_indicator_evidence((observation,),
+        dataset_id=f"isolated-{model.lower()}-shadow-{uuid4().hex}", selected_at=decision_at)
 
 
 def seed_completed_run(schema, run):
@@ -232,6 +292,55 @@ def test_detector_evaluation_technical_plans_roundtrip_without_schema_changes(is
     assert result["records"] == list(records)
     assert records[0].package.schema_version == "dual_origin_qualified_package_v3"
     assert json.loads(records[0].plan_payload_text)["version"] == "dual_origin_indicative_plan_v2"
+
+
+def test_o1_indicator_observation_postgres_roundtrip_and_immutability(isolated_schema):
+    records = make_o1_indicator_records()
+    record = records[0]
+    with closing(connection(schema=isolated_schema)) as current:
+        with current.cursor() as cursor:
+            cursor.execute("INSERT INTO option_analysis_runs (matrix_id) VALUES (%s)", (record.matrix_id,))
+        current.commit()
+    repo = evaluation_repository(isolated_schema)
+    assert repo.persist_run(records) == 1
+    assert repo.persist_run(records) == 0
+    result = repo.review_inputs(as_of=datetime.now(timezone.utc), dataset_id=record.dataset_id)
+    assert result["records"] == list(records)
+    session_date = record.scheduled_cycle.date()
+    assert repo.o1_indicator_observations(start_date=session_date, end_date=session_date,
+        as_of=datetime.now(timezone.utc), dataset_id=record.dataset_id) == records
+    with pytest.raises(ValueError, match="bounded period"):
+        repo.o1_indicator_observations(start_date=session_date - timedelta(days=32), end_date=session_date,
+            as_of=datetime.now(timezone.utc), dataset_id=record.dataset_id)
+    with closing(connection(schema=isolated_schema)) as current:
+        for query in ("UPDATE option_o1_indicator_observations SET selected_at=selected_at WHERE evaluation_id=%s",
+                      "DELETE FROM option_o1_indicator_observations WHERE evaluation_id=%s"):
+            with pytest.raises(psycopg2.Error, match="immutable"):
+                with current.cursor() as cursor:
+                    cursor.execute(query, (record.evaluation_id,))
+            current.rollback()
+
+
+@pytest.mark.parametrize("model", ["S1", "S2"])
+def test_stock_setup_indicator_observation_postgres_roundtrip_and_immutability(isolated_schema, model):
+    records = make_stock_setup_indicator_records(model)
+    record = records[0]
+    with closing(connection(schema=isolated_schema)) as current:
+        with current.cursor() as cursor:
+            cursor.execute("INSERT INTO option_analysis_runs (matrix_id) VALUES (%s)", (record.matrix_id,))
+        current.commit()
+    repo = evaluation_repository(isolated_schema)
+    assert repo.persist_run(records) == 1
+    assert repo.persist_run(records) == 0
+    result = repo.review_inputs(as_of=datetime.now(timezone.utc), dataset_id=record.dataset_id)
+    assert result["records"] == list(records)
+    with closing(connection(schema=isolated_schema)) as current:
+        for query in ("UPDATE option_stock_setup_indicator_observations SET selected_at=selected_at WHERE evaluation_id=%s",
+                      "DELETE FROM option_stock_setup_indicator_observations WHERE evaluation_id=%s"):
+            with pytest.raises(psycopg2.Error, match="immutable"):
+                with current.cursor() as cursor:
+                    cursor.execute(query, (record.evaluation_id,))
+            current.rollback()
 
 
 def test_detector_evaluation_complete_observation_concurrency_and_scope(isolated_schema):

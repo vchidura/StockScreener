@@ -116,8 +116,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate cross-sectional momentum signal")
     parser.add_argument("--date", default=None, help="As-of date (YYYY-MM-DD); default latest")
     parser.add_argument("--dry-run", action="store_true", help="Print without writing")
+    parser.add_argument("--allow-legacy-write", action="store_true", help="Explicitly permit retired legacy-table publication")
     parser.add_argument("--top", type=int, default=10, help="Rows to print per side")
     args = parser.parse_args()
+    if not args.dry_run and not args.allow_legacy_write:
+        parser.error("Legacy production writer retired; use --dry-run or explicitly approve --allow-legacy-write")
 
     cross = compute_signal(args.date)
     if cross.empty:

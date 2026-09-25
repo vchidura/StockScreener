@@ -306,6 +306,28 @@ class IntradaySignalDecision(SignalDecision):
 
     @model_validator(mode="after")
     def validate_intraday_policy(self):
+        from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY_V2, INTRADAY_PROFILE_V2
+
+        policy = INTRADAY_ALIGNMENT_POLICY_V2
+        if (self.origin_detector_version != ACTIVITY_POLICY.version or self.origin_policy_sha256 != ACTIVITY_POLICY.sha256
+                or self.confirmation_policy_version != policy.version or self.confirmation_policy_sha256 != policy.sha256
+                or self.confirmation_basis != policy.confirmation_basis
+            or self.stock_source_policy_sha256 not in (None, INTRADAY_PROFILE_V2.sha256)):
+            raise ValueError("unsupported O1 intraday decision policy")
+        if self.disposition == "CONFIRMED" and (len(self.gates) != 2
+                or {gate.gate_id for gate in self.gates} != {"TREND_SLOPE_30m", "UNDERLYING_LIQUIDITY_EVIDENCE"}
+                or any(gate.verdict != "PASS" for gate in self.gates)):
+            raise ValueError("O1 intraday confirmation requires exact stock gates")
+        return self
+
+
+class LatestCompletedSignalDecision(SignalDecision):
+    intraday_confirmation: ClassVar[bool] = True
+    schema_version: Literal["dual_origin_signal_decision_v4"] = "dual_origin_signal_decision_v4"
+    detector_id: Literal["O1"] = "O1"
+
+    @model_validator(mode="after")
+    def validate_latest_completed_policy(self):
         from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY, INTRADAY_PROFILE
 
         policy = INTRADAY_ALIGNMENT_POLICY
@@ -313,11 +335,11 @@ class IntradaySignalDecision(SignalDecision):
                 or self.confirmation_policy_version != policy.version or self.confirmation_policy_sha256 != policy.sha256
                 or self.confirmation_basis != policy.confirmation_basis
                 or self.stock_source_policy_sha256 not in (None, INTRADAY_PROFILE.sha256)):
-            raise ValueError("unsupported O1 intraday decision policy")
+            raise ValueError("unsupported O1 latest-completed decision policy")
         if self.disposition == "CONFIRMED" and (len(self.gates) != 2
                 or {gate.gate_id for gate in self.gates} != {"TREND_SLOPE_30m", "UNDERLYING_LIQUIDITY_EVIDENCE"}
                 or any(gate.verdict != "PASS" for gate in self.gates)):
-            raise ValueError("O1 intraday confirmation requires exact stock gates")
+            raise ValueError("O1 latest-completed confirmation requires exact stock gates")
         return self
 
 
@@ -328,7 +350,7 @@ def assess_options_intraday(source, stock, *, direction, market_cutoff, decision
         market_cutoff=market_cutoff, decision_at=decision_at)
     finding = detect_option_participation(source, market_cutoff=market_cutoff, decision_at=decision_at)
     policy = INTRADAY_ALIGNMENT_POLICY
-    return IntradaySignalDecision(detector_id="O1", origin="OPTIONS_FIRST", origin_id=str(observation.activity.episode_id),
+    return LatestCompletedSignalDecision(detector_id="O1", origin="OPTIONS_FIRST", origin_id=str(observation.activity.episode_id),
         origin_detector_version=ACTIVITY_POLICY.version, origin_policy_sha256=ACTIVITY_POLICY.sha256,
         confirmation_policy_version=policy.version, confirmation_policy_sha256=policy.sha256,
         confirmation_basis=policy.confirmation_basis, security_id=source.security_id, underlyer=source.underlyer,
@@ -341,7 +363,8 @@ def assess_options_intraday(source, stock, *, direction, market_cutoff, decision
 
 def load_signal_decision(value):
     contracts = {"dual_origin_signal_decision_v1": SignalDecision, "dual_origin_signal_decision_v2": ResumptionSignalDecision,
-        "dual_origin_signal_decision_v3": IntradaySignalDecision}
+        "dual_origin_signal_decision_v3": IntradaySignalDecision,
+        "dual_origin_signal_decision_v4": LatestCompletedSignalDecision}
     contract = contracts.get(value.schema_version)
     if contract is None:
         raise ValueError("unsupported signal decision schema")
@@ -728,7 +751,9 @@ def qualify_dual_origin_package(
 
     decision = load_signal_decision(decision)
     if decision.detector_id == "O1":
-        assessor = assess_options_intraday if isinstance(decision, IntradaySignalDecision) else assess_options_first
+        if isinstance(decision, IntradaySignalDecision):
+            raise ValueError("archived O1 v2 decisions cannot be requalified under the v3 runtime")
+        assessor = assess_options_intraday if isinstance(decision, LatestCompletedSignalDecision) else assess_options_first
         recomputed = assessor(source, stock, direction=decision.direction,
             market_cutoff=decision.market_cutoff, decision_at=decision.decision_at)
     else:
@@ -877,7 +902,7 @@ def qualify_dual_origin_package(
         indicative_qualification=indicative, event_horizon=event_horizon,
         **(dict(confirmation_policy_version=decision.confirmation_policy_version,
             confirmation_policy_sha256=decision.confirmation_policy_sha256,
-            stock_confirmation=stock.model_dump(mode="json")) if isinstance(decision, IntradaySignalDecision) else {}),
+            stock_confirmation=stock.model_dump(mode="json")) if isinstance(decision, LatestCompletedSignalDecision) else {}),
         remaining_capabilities=["QUOTE_PAPER", "EXECUTION"], publication_permission=False,
         execution_permission=False, fill=None)))
     qualified_type = QualifiedTechnicalPackage if technical else QualifiedResumptionPackage if decision.detector_id == "S2" else QualifiedDualOriginPackage

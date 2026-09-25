@@ -5,28 +5,15 @@ import {
   getSectorIntelligence,
   getMarketRegime,
   getTickersOverview,
-  DiscoveryState,
 } from '../services/api'
 import { usePublishPageContext } from '../layout/pageContext'
+import { SectorEquityContext } from './EquityContextPanels'
 
 const colors = {
   ink: 'var(--tm-ink)', muted: 'var(--tm-muted)', line: 'var(--tm-line)', panel: 'var(--tm-surface)',
   canvas: 'var(--tm-canvas)', green: 'var(--tm-pos)', greenSoft: 'var(--tm-pos-soft)',
   red: 'var(--tm-neg)', redSoft: 'var(--tm-neg-soft)', amber: 'var(--tm-warn)', amberSoft: 'var(--tm-warn-soft)',
   blue: 'var(--tm-accent)', blueSoft: 'var(--tm-accent-soft)',
-}
-
-const discoveryOrder: DiscoveryState[] = [
-  'REVERSAL_CONFIRMED', 'EMERGING_REVERSAL', 'REVERSAL_WATCH', 'CONTINUATION', 'CONFLICT', 'LAGGARD', 'NEUTRAL',
-]
-const discoveryStyle: Record<DiscoveryState, { label: string; color: string }> = {
-  REVERSAL_CONFIRMED: { label: 'Reversal confirmed', color: colors.green },
-  EMERGING_REVERSAL: { label: 'Emerging reversal', color: 'var(--tm-pos)' },
-  REVERSAL_WATCH: { label: 'Reversal watch', color: colors.amber },
-  CONTINUATION: { label: 'Continuation', color: colors.blue },
-  CONFLICT: { label: 'Conflict', color: 'var(--tm-alt)' },
-  LAGGARD: { label: 'Laggard', color: colors.red },
-  NEUTRAL: { label: 'Neutral', color: colors.muted },
 }
 
 const rotationWindows = ['1', '5', '10', '21', '63']
@@ -94,7 +81,7 @@ export default function SectorIntelligence() {
   usePublishPageContext({
     eyebrow: 'Market · sector intelligence',
     title: 'Sector Intelligence',
-    detail: 'Regime context, rank movement across horizons, discovery-state mix, and cross-sectional momentum extremes.',
+    detail: 'Sector returns, rotation, breadth and published equity context.',
     status: [
       {
         label: 'Market',
@@ -272,82 +259,12 @@ export default function SectorIntelligence() {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: 8, marginBottom: 12 }}>
             <h2 style={{ fontSize: 16, margin: 0, letterSpacing: 0 }}>{detail.sector} detail</h2>
             <div style={{ color: colors.muted, fontSize: 11 }}>
-              Discovery states as of {intelligence.data?.discovery_trade_date ?? '—'} · cross-sectional as of {intelligence.data?.cross_sectional_trade_date ?? '—'}
+              Price results as of {intelligence.data?.trade_date ?? '—'}
             </div>
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 20 }}>
-            <div>
-              <div style={{ color: colors.muted, fontSize: 11, textTransform: 'uppercase', fontWeight: 700, marginBottom: 6 }}>Discovery-state mix</div>
-              {discoveryOrder.filter(state => (detail.discovery_mix[state] ?? 0) > 0).length === 0 && (
-                <div style={{ color: colors.muted, fontSize: 12 }}>No discovery states recorded for this sector.</div>
-              )}
-              {(() => {
-                const total = Object.values(detail.discovery_mix).reduce((sum, v) => sum + (v ?? 0), 0)
-                return discoveryOrder.map(state => {
-                  const count = detail.discovery_mix[state] ?? 0
-                  if (!count) return null
-                  const style = discoveryStyle[state]
-                  return (
-                    <div key={state} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 5 }}>
-                      <div style={{ width: 130, fontSize: 11, color: colors.muted }}>{style.label}</div>
-                      <div style={{ flex: 1, background: colors.canvas, borderRadius: 3, height: 10, overflow: 'hidden' }}>
-                        <div style={{ width: `${(count / (total || 1)) * 100}%`, background: style.color, height: '100%' }} />
-                      </div>
-                      <div style={{ width: 26, textAlign: 'right', fontSize: 11, fontWeight: 700 }}>{count}</div>
-                    </div>
-                  )
-                })
-              })()}
-              {detail.discovery_universe > 0 && (
-                <div style={{ color: colors.muted, fontSize: 10, marginTop: 6 }}>
-                  {Object.values(detail.discovery_mix).reduce((sum, v) => sum + (v ?? 0), 0)} of {detail.discovery_universe} sector stocks classified on this date
-                </div>
-              )}
-            </div>
-
-            <div>
-              <div style={{ color: colors.muted, fontSize: 11, textTransform: 'uppercase', fontWeight: 700, marginBottom: 6 }}>Cross-sectional skew</div>
-              {detail.cross_sectional_skew ? (
-                <>
-                  <div style={{ fontSize: 12, marginBottom: 4 }}>
-                    <span style={{ color: colors.green, fontWeight: 700 }}>{detail.cross_sectional_skew.long_skew}</span> actionable LONG (decile 10)
-                  </div>
-                  <div style={{ fontSize: 12, marginBottom: 4 }}>
-                    <span style={{ color: colors.red, fontWeight: 700 }}>{detail.cross_sectional_skew.short_skew}</span> actionable SHORT (decile 1)
-                  </div>
-                  {detail.cross_sectional_skew.net_tilt != null && (
-                    <div style={{ fontSize: 12, marginBottom: 4 }}>
-                      Net tilt <strong style={{ color: detail.cross_sectional_skew.net_tilt > 0 ? colors.green : detail.cross_sectional_skew.net_tilt < 0 ? colors.red : colors.muted }}>
-                        {detail.cross_sectional_skew.net_tilt > 0 ? '+' : ''}{pct(detail.cross_sectional_skew.net_tilt, 1)}
-                      </strong> of sector names
-                    </div>
-                  )}
-                  {detail.cross_sectional_skew.average_percentile != null && (
-                    <div style={{ fontSize: 12, marginBottom: 8 }}>
-                      Average percentile <strong>{pct(detail.cross_sectional_skew.average_percentile, 0)}</strong> of the universe
-                    </div>
-                  )}
-                  {detail.cross_sectional_skew.long_names.length > 0 && (
-                    <div style={{ marginBottom: 6 }}>
-                      <span style={{ color: colors.muted, fontSize: 10 }}>LONG: </span>
-                      {detail.cross_sectional_skew.long_names.map(ticker => (
-                        <button key={ticker} type="button" onClick={() => navigate(`/ticker/${ticker}`)} style={{ border: 0, background: colors.greenSoft, color: colors.green, borderRadius: 4, padding: '2px 6px', fontSize: 11, fontWeight: 700, cursor: 'pointer', marginRight: 4, marginBottom: 4 }}>{ticker}</button>
-                      ))}
-                    </div>
-                  )}
-                  {detail.cross_sectional_skew.short_names.length > 0 && (
-                    <div style={{ marginBottom: 6 }}>
-                      <span style={{ color: colors.muted, fontSize: 10 }}>SHORT: </span>
-                      {detail.cross_sectional_skew.short_names.map(ticker => (
-                        <button key={ticker} type="button" onClick={() => navigate(`/ticker/${ticker}`)} style={{ border: 0, background: colors.redSoft, color: colors.red, borderRadius: 4, padding: '2px 6px', fontSize: 11, fontWeight: 700, cursor: 'pointer', marginRight: 4, marginBottom: 4 }}>{ticker}</button>
-                      ))}
-                    </div>
-                  )}
-                  <div style={{ color: colors.muted, fontSize: 11 }}>{detail.cross_sectional_skew.covered} names ranked in the cross-section</div>
-                </>
-              ) : null}
-            </div>
+            <SectorEquityContext sector={detail.sector} />
 
             <div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
@@ -386,15 +303,6 @@ export default function SectorIntelligence() {
             </div>
           </div>
 
-          <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${colors.line}`, fontSize: 11, color: colors.muted }}>
-            <strong style={{ color: colors.ink }}>Cross-sectional skew</strong> — a stock-picking signal, not a sector-strength signal.
-            The underlying model (xsmom-1.0) ranks names <em>after</em> removing each sector's average score, so it finds standouts
-            within a sector regardless of whether that sector is hot or cold overall. Read it alongside Rotation above:
-            a sector with strong price rotation but few/no actionable LONGs here means the move is broad and already priced
-            in, with no individual names still standing out; a sector with weak rotation but several actionable LONGs
-            means the model sees idiosyncratic strength in specific names even though the sector as a whole is lagging —
-            worth a closer look at those tickers rather than the sector itself.
-          </div>
         </section>
       )}
     </div>

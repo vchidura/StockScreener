@@ -10,6 +10,8 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from pydantic import AwareDatetime, Field, model_validator
 
 from equity.behavior import Contract, Name, Sha256
+from options.intraday_participation import O1IndicatorObservation
+from options.stock_setup_binding import StockSetupIndicatorObservation
 from options.dual_origin import QualifiedDualOriginPackage, QualifiedResumptionPackage, QualifiedTechnicalPackage, load_qualified_package
 from options.surface_detection import SurfaceDecision
 
@@ -327,7 +329,7 @@ class DetectorSelectionEvidence(Contract):
     selection_status: Literal["SELECTED", "NOT_SELECTED", "REPEAT"]
     selection_reason: Literal["WITHIN_RUN_BUDGET", "RUN_CAP", "LOWER_RANK_SAME_DETECTOR_UNDERLYING_DIRECTION", "PRIOR_ALERT"]
     first_candidate_id: UUID | None = None
-    plan_payload_text: str = Field(max_length=32768)
+    plan_payload_text: str = Field(max_length=65536)
     evidence_mode: Literal["PROSPECTIVE_RECEIPT"] = "PROSPECTIVE_RECEIPT"
     publication_permission: Literal[False] = False
 
@@ -493,11 +495,126 @@ def build_surface_evidence(observations, *, dataset_id, selected_at):
     return records
 
 
+class O1IndicatorEvaluationEvidence(Contract):
+    schema_version: Literal["option_o1_indicator_evaluation_evidence_v1"] = "option_o1_indicator_evaluation_evidence_v1"
+    dataset_id: Name
+    run_id: UUID
+    selector_sha256: Sha256 = DUAL_ORIGIN_SELECTOR_SHA256
+    selected_at: AwareDatetime
+    observation: O1IndicatorObservation
+    recurrence_sha256: Sha256
+    selection_status: Literal["OBSERVATION"] = "OBSERVATION"
+    selection_reason: Literal["INDICATOR_SHADOW_ONLY"] = "INDICATOR_SHADOW_ONLY"
+    evidence_mode: Literal["PROSPECTIVE_RECEIPT"] = "PROSPECTIVE_RECEIPT"
+    publication_permission: Literal[False] = False
+
+    @property
+    def scheduled_cycle(self):
+        return self.observation.scheduled_cycle
+
+    @property
+    def detector_id(self):
+        return "O1"
+
+    @property
+    def candidate_id(self):
+        return None
+
+    @property
+    def matrix_id(self):
+        return self.observation.matrix_id
+
+    @property
+    def evaluation_id(self):
+        return uuid5(NAMESPACE_URL, f"option-detector-evaluation:{self.run_id}:O1:{self.recurrence_sha256}")
+
+    @model_validator(mode="after")
+    def validate_evidence(self):
+        expected = uuid5(NAMESPACE_URL, f"option-detector-evaluation-run:{self.dataset_id}:{self.scheduled_cycle.isoformat()}")
+        if (self.run_id != expected or self.selector_sha256 != DUAL_ORIGIN_SELECTOR_SHA256
+                or self.recurrence_sha256 != self.observation.recurrence_sha256
+                or self.observation.decision_at > self.selected_at
+                or len(self.canonical_json().encode("ascii")) > 65536):
+            raise ValueError("O1 indicator evaluation identity, clock or payload bound mismatch")
+        return self
+
+
+def build_o1_indicator_evidence(observations, *, dataset_id, selected_at):
+    if len(observations) > 5000:
+        raise ValueError("O1 indicator evaluation exceeds input bound")
+    records = tuple(O1IndicatorEvaluationEvidence(dataset_id=dataset_id, selected_at=selected_at,
+        run_id=uuid5(NAMESPACE_URL, f"option-detector-evaluation-run:{dataset_id}:{row.scheduled_cycle.isoformat()}"),
+        recurrence_sha256=row.recurrence_sha256,
+        observation=O1IndicatorObservation.model_validate_json(row.canonical_json())) for row in observations)
+    if len({row.evaluation_id for row in records}) != len(records):
+        raise ValueError("O1 contract episode must be evaluated once per run")
+    return records
+
+
+class StockSetupIndicatorEvaluationEvidence(Contract):
+    schema_version: Literal["option_stock_setup_indicator_evaluation_evidence_v1"] = "option_stock_setup_indicator_evaluation_evidence_v1"
+    dataset_id: Name
+    run_id: UUID
+    selector_sha256: Sha256 = DUAL_ORIGIN_SELECTOR_SHA256
+    selected_at: AwareDatetime
+    observation: StockSetupIndicatorObservation
+    recurrence_sha256: Sha256
+    selection_status: Literal["OBSERVATION"] = "OBSERVATION"
+    selection_reason: Literal["MIXED_INDICATOR_SHADOW_ONLY"] = "MIXED_INDICATOR_SHADOW_ONLY"
+    evidence_mode: Literal["PROSPECTIVE_RECEIPT"] = "PROSPECTIVE_RECEIPT"
+    publication_permission: Literal[False] = False
+
+    @property
+    def scheduled_cycle(self):
+        return self.observation.scheduled_cycle
+
+    @property
+    def detector_id(self):
+        return self.observation.detector_id
+
+    @property
+    def candidate_id(self):
+        return None
+
+    @property
+    def matrix_id(self):
+        return self.observation.matrix_id
+
+    @property
+    def evaluation_id(self):
+        return uuid5(NAMESPACE_URL,
+            f"option-detector-evaluation:{self.run_id}:{self.detector_id}:{self.recurrence_sha256}")
+
+    @model_validator(mode="after")
+    def validate_evidence(self):
+        expected = uuid5(NAMESPACE_URL, f"option-detector-evaluation-run:{self.dataset_id}:{self.scheduled_cycle.isoformat()}")
+        if (self.run_id != expected or self.selector_sha256 != DUAL_ORIGIN_SELECTOR_SHA256
+                or self.recurrence_sha256 != self.observation.recurrence_sha256
+                or self.observation.decision_at > self.selected_at
+                or len(self.canonical_json().encode("ascii")) > 131072):
+            raise ValueError("stock setup indicator evaluation identity, clock or payload bound mismatch")
+        return self
+
+
+def build_stock_setup_indicator_evidence(observations, *, dataset_id, selected_at):
+    if len(observations) > 5000:
+        raise ValueError("stock setup indicator evaluation exceeds input bound")
+    records = tuple(StockSetupIndicatorEvaluationEvidence(dataset_id=dataset_id, selected_at=selected_at,
+        run_id=uuid5(NAMESPACE_URL, f"option-detector-evaluation-run:{dataset_id}:{row.scheduled_cycle.isoformat()}"),
+        recurrence_sha256=row.recurrence_sha256,
+        observation=StockSetupIndicatorObservation.model_validate_json(row.canonical_json())) for row in observations)
+    if len({row.evaluation_id for row in records}) != len(records):
+        raise ValueError("stock setup episode must be evaluated once per run")
+    return records
+
+
 def load_evaluation_evidence(payload_text):
     import json
 
     payload = json.loads(payload_text)
     contracts = {"option_detector_selection_evidence_v1": DetectorSelectionEvidence,
+        "option_o1_indicator_evaluation_evidence_v1": O1IndicatorEvaluationEvidence,
+        "option_stock_setup_indicator_evaluation_evidence_v1": StockSetupIndicatorEvaluationEvidence,
         "option_surface_evaluation_evidence_v1": SurfaceEvaluationEvidence}
     contract = contracts.get(payload.get("schema_version"))
     if contract is None:
@@ -596,7 +713,9 @@ def build_detector_run(*, configuration, dataset_id, scheduled_cycle, selected_a
         rejections=tuple(sorted(rejections.items())))
     source_map = dict(run.source_matrices)
     for record in records:
-        symbol = record.observation.underlyer if isinstance(record, SurfaceEvaluationEvidence) else record.package.underlyer
+        symbol = record.observation.underlyer if isinstance(record, (
+            O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
+        )) else record.package.underlyer
         if (record.dataset_id != run.dataset_id or record.run_id != run.run_id
                 or record.selected_at != run.selected_at or record.selector_sha256 != run.selector_sha256
                 or source_map.get(symbol) != record.matrix_id):

@@ -78,6 +78,8 @@ def readiness_cycle(store, state, config, view_path, *, clock, read_inputs, read
     from equity.stock_idea_forward_source import forward_input_readiness
     read_readiness = read_readiness or forward_input_readiness
     now = clock()
+    cycle_started = time.monotonic()
+    timings = {}
     retry = state.get("retry_boundary")
     boundary = utc(retry or state["next_boundary"])
     deadline = readiness_deadline(boundary)
@@ -87,30 +89,41 @@ def readiness_cycle(store, state, config, view_path, *, clock, read_inputs, read
     state["last_readiness_check"] = now.isoformat()
     selection_members, cohort = alert_selection_cohort(state, boundary)
     readiness = read_readiness(selection_members, boundary, now, include_daily=include_daily) if now <= deadline else None
+    timings["readiness"] = round(time.monotonic() - cycle_started, 3)
     if not readiness and now <= deadline:
         return state, dict(status="WAITING_FOR_SOURCE_PUBLICATION", boundary=boundary.isoformat(), deadline=deadline.isoformat())
     if readiness:
         cutoff = clock()
+        started = time.monotonic()
         batch = read_inputs(state["members"], cutoff, include_daily=include_daily,
             after=min(utc(state["last_source_read"]), boundary))
+        timings["read_inputs"] = round(time.monotonic() - started, 3)
+        started = time.monotonic()
         state, packets = advance_detectors(state, batch, config, cutoff, frame_cache=FRAME_CACHE)
+        timings["advance_detectors"] = round(time.monotonic() - started, 3)
         prepared = {f"{packet['security_id']}:{packet['interval']}:{packet['market_time']}": packet
             for packet in state.get("prepared_packets", [])}
         prepared.update({f"{packet['security_id']}:{packet['interval']}:{packet['market_time']}": packet_record(packet) for packet in packets})
         state["prepared_packets"] = list(prepared.values())
+        started = time.monotonic()
         state = update_positions(state, config, cutoff)
+        timings["update_positions"] = round(time.monotonic() - started, 3)
         if include_daily:
             state["last_daily_read"] = cutoff.isoformat()
         readiness["input_cutoff"] = cutoff.isoformat()
         if cohort:
             readiness["alert_cohort_generation"] = cohort["generation_id"]
+        started = time.monotonic()
         store.save(state)
+        timings["checkpoint"] = round(time.monotonic() - started, 3)
     else:
         readiness = dict(input_cutoff=deadline.isoformat(), publications=[], reason="SOURCE_NOT_READY_BEFORE_DEADLINE")
     packets = [restore_packet(packet) for packet in state.get("prepared_packets", [])]
     before_publication = state
+    started = time.monotonic()
     state, publication, outbox = forward_decision(state, packets, boundary=boundary, actual_time=clock(),
         members=state["members"], policy_hash=store.policy_hash, config=config, readiness=readiness)
+    timings["decision"] = round(time.monotonic() - started, 3)
     def finish(current, record):
         if retry:
             record.update(window_key=boundary.isoformat() + ":source-ready-retry", retry_of=boundary.isoformat(), market_time=boundary.isoformat())
@@ -120,17 +133,25 @@ def readiness_cycle(store, state, config, view_path, *, clock, read_inputs, read
         current["prepared_packets"] = [packet for packet in current.get("prepared_packets", []) if utc(packet["market_time"]) > boundary]
     finish(state, publication)
     try:
+        started = time.monotonic()
         store.save(state, publication, outbox, clock=clock)
+        timings["publication_persist"] = round(time.monotonic() - started, 3)
     except ForwardPublicationLate:
         state, publication, outbox = forward_decision(before_publication, packets, boundary=boundary, actual_time=clock(),
             members=before_publication["members"], policy_hash=store.policy_hash, config=config, readiness=readiness)
         finish(state, publication)
+        started = time.monotonic()
         store.save(state, publication, outbox)
+        timings["publication_persist"] = round(time.monotonic() - started, 3)
+    started = time.monotonic()
     publish_view(view_path, shadow_snapshot(state, store.publications(), config, clock()))
+    timings["publish_view"] = round(time.monotonic() - started, 3)
+    timings["total"] = round(time.monotonic() - cycle_started, 3)
     return state, dict(status=publication["coverage"], boundary=boundary.isoformat(), retry_of=retry,
         published_at=publication["actual_publication_at"], candidates=len(publication["dispositions"]),
         selected=len(publication["selected"]), missing_members=len(publication["missing_members"]), dispatch_policy=READINESS_POLICY["version"],
-        selection_members=len(selection_members), cohort_generation=cohort["generation_id"] if cohort else None)
+        selection_members=len(selection_members), cohort_generation=cohort["generation_id"] if cohort else None,
+        timings_seconds=timings)
 
 
 def cycle(store, state, config, view_path, *, clock=lambda: datetime.now(timezone.utc), read_inputs=None):

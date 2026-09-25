@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Collection
 
 from psycopg2.extras import execute_values
@@ -213,6 +214,43 @@ class OptionTradeRepository(PostgresRepository):
                     context.market_time,
                     context.observed_time,
                 ),
+            )
+            rows = cursor.fetchall()
+        return tuple(_trade_event(row) for row in rows)
+
+    def list_for_contracts(
+        self,
+        contract_ids,
+        start_time: datetime,
+        context: DecisionContext,
+        *,
+        minimum_notional: Decimal,
+    ) -> tuple[OptionTradeEvent, ...]:
+        ids = tuple(sorted({int(value) for value in contract_ids}))
+        if not ids:
+            return ()
+        if len(ids) > 5000 or minimum_notional <= 0:
+            raise ValueError("bounded trade read requires 1-5000 contracts and positive notional")
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    trade_event_id, provider, contract_id, contract_ticker, underlying,
+                    sip_timestamp, sequence_number, participant_timestamp,
+                    first_observed_at, revised_observed_at, exchange, conditions,
+                    correction, provider_trade_id, price, size, shares_per_contract,
+                    notional, payload_sha256, raw_batch_id, classification_status,
+                    classification_reasons, semantics_version
+                FROM option_trade_events
+                WHERE contract_id = ANY(%s::bigint[])
+                  AND sip_timestamp BETWEEN %s AND %s
+                  AND COALESCE(revised_observed_at, first_observed_at) <= %s
+                  AND classification_status = 'INCLUDED'
+                  AND notional >= %s
+                ORDER BY sip_timestamp, sequence_number,
+                         participant_timestamp NULLS FIRST, trade_event_id
+                """,
+                (list(ids), start_time, context.market_time, context.observed_time, minimum_notional),
             )
             rows = cursor.fetchall()
         return tuple(_trade_event(row) for row in rows)

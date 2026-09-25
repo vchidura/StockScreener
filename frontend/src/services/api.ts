@@ -2208,6 +2208,8 @@ export type OptionCandidateStatus = 'SELECTED' | 'SUPPRESSED' | 'REJECTED'
 export type OptionCandidatePersona = 'INCOME' | 'DEFINED_RISK_INCOME' | 'MOMENTUM' | 'NEUTRAL_VOL'
 
 export interface OptionCandidateLeg {
+  snapshot_id?: string
+  batch_id?: string | null
   leg_index: number
   contract_id: number
   contract_ticker: string
@@ -2230,6 +2232,13 @@ export interface OptionCandidateLeg {
   open_interest?: number | null
   source_market_time: string
   mark_source: string
+  time_to_expiration_years?: number | null
+  risk_free_rate?: number | null
+  dividend_yield?: number | null
+  model_version?: string | null
+  valuation_policy_version?: string | null
+  valuation_policy_sha256?: string | null
+  normalized_payload_sha256?: string | null
   quality_flags: string[]
   quote_bid: string | null
   quote_ask: string | null
@@ -2395,6 +2404,61 @@ export interface OptionDetectorRunSummary {
   rejections: Record<string, number>
 }
 
+export interface OptionLocalSurfaceObservation {
+  schema_version?: 'option_local_surface_decision_v1'
+  contract_type: 'CALL' | 'PUT'
+  expiration_date: string
+  market_cutoff: string
+  decision_at: string
+  valid_until: string
+  input_count: number
+  policy_sha256: string
+  source_sha256: string
+  finding_disposition: string
+  stock_context_status: string
+  reasons: string[]
+  findings: Array<{ contract_id: number; snapshot_id: string; strike: string; local_iv: number;
+    fitted_iv: number; residual: number; robust_z: number }>
+}
+
+export interface OptionO1IndicatorObservation {
+  schema_version: 'option_o1_indicator_observation_v1'
+  baseline_disposition: string
+  baseline_reasons: string[]
+  volume_oi_ratio: number
+  contract_id: number
+  snapshot_id: string
+  decision_at: string
+  valid_until: string
+  outcome_status: 'NOT_YET_MEASURED'
+  package_status: 'NOT_ASSESSED'
+  measurements: Array<{ component_key: string; metric_id: string; unit: string;
+    status: 'READY' | 'UNAVAILABLE'; value: number | null; reason_codes: string[] }>
+  challengers: Array<{ challenger_id: string; verdict: 'PASS' | 'FAIL' | 'UNAVAILABLE';
+    metric_ids: string[]; reason_codes: string[] }>
+}
+
+export interface OptionStockSetupIndicatorObservation {
+  schema_version: 'option_stock_setup_indicator_observation_v1'
+  detector_id: 'S1' | 'S2'
+  baseline_disposition: string
+  baseline_reasons: string[]
+  decision_at: string
+  valid_until: string
+  setup_source: {
+    source_status: 'ACTIVE_AT_SOURCE_READ' | 'EXPIRED_BEFORE_SOURCE_READ'
+    publication_market_time: string
+    published_at: string
+    candidate_payload_sha256: string
+  }
+  outcome_status: 'NOT_YET_MEASURED'
+  package_status: 'NOT_ASSESSED'
+  measurements: Array<{ metric_id: string; unit: string;
+    status: 'READY' | 'UNAVAILABLE'; value: number | null; reason_codes: string[] }>
+  challengers: Array<{ challenger_id: string; verdict: 'PASS' | 'FAIL' | 'UNAVAILABLE';
+    metric_ids: string[]; reason_codes: string[] }>
+}
+
 export interface OptionDetectorEvaluationReview {
   storage_ready: boolean
   dataset_id: string | null
@@ -2418,10 +2482,8 @@ export interface OptionDetectorEvaluationReview {
     selection_status: 'SELECTED' | 'NOT_SELECTED' | 'REPEAT' | 'OBSERVATION'; selection_reason: string;
     plan_sha256: string | null; selected_at: string; entry_deadline: string | null; exit_deadline: string | null;
     entry_limit: string | null; outcome_status: string; net_return: number | null;
-    event_horizon_status: string; shared_model_exposure: boolean;
-    observation?: { finding_disposition: string; stock_context_status: string; reasons: string[];
-      findings: Array<{ contract_id: number; snapshot_id: string; strike: string; local_iv: number;
-        fitted_iv: number; residual: number; robust_z: number }> };
+    event_horizon_status: string | null; shared_model_exposure: boolean;
+    observation?: OptionLocalSurfaceObservation | OptionO1IndicatorObservation | OptionStockSetupIndicatorObservation;
   }>
   cells: Array<{
     detector_id: 'O1' | 'O2' | 'S1' | 'S2'; selection_status: string; selection_reason: string;
@@ -2437,7 +2499,7 @@ export const getOptionDetectorEvaluations = async (params: {
 }): Promise<OptionsEnvelope<OptionDetectorEvaluationReview>> => (await api.get('/options/alerts/evaluations', { params })).data
 
 export interface OptionDetectorAlertReview {
-  version: 'option_detector_alert_review_v1'
+  version: 'option_detector_alert_review_v2'
   dataset_id: string
   scope: 'LATEST' | 'HISTORY'
   status: 'COMPLETE' | 'NO_COMPLETE_RUN'
@@ -2456,18 +2518,16 @@ export interface OptionDetectorAlertReview {
   outcome_status: 'NOT_BOUND_TO_PROSPECTIVE_OUTCOMES'
   execution_permission: false
   rows: Array<{
-    evaluation_id: string; candidate_id: string | null; run_id: string; scheduled_cycle: string;
+    evaluation_id: string; candidate_id: string; matrix_id: string; run_id: string; scheduled_cycle: string;
     triggered_at: string | null;
     detector_id: 'O1' | 'O2' | 'S1' | 'S2'; origin: 'OPTIONS_FIRST' | 'STOCK_FIRST'; underlyer: string;
-    direction: -1 | 1 | null; category: string; strategy_name: string | null; candidate_rank: number | null; first_selected_at: string;
-    hit_count: number | null; repeat_count: number | null; last_seen_at: string; plan_sha256: string | null;
-    entry_limit: string | null; entry_deadline: string | null; exit_deadline: string | null;
-    management_policy: Record<string, unknown> | null; event_horizon_status: string; original_package?: OptionAlertOriginalPackage;
-    outcome_status: 'NOT_BOUND_TO_PROSPECTIVE_OUTCOMES' | 'NOT_APPLICABLE_OBSERVATION'; net_return: null; fill: null;
-    observation?: NonNullable<OptionDetectorEvaluationReview['rows'][number]['observation']> & {
-      expiration_date: string; contract_type: string; market_cutoff: string; decision_at: string;
-      valid_until: string; input_count: number; policy_sha256: string; source_sha256: string;
-    };
+    direction: -1 | 1; category: string; strategy_name: string | null; candidate_rank: number; first_selected_at: string;
+    hit_count: number; repeat_count: number; last_seen_at: string; plan_sha256: string;
+    entry_limit: string; entry_deadline: string; exit_deadline: string;
+    management_policy: Record<string, unknown>; event_horizon_status: string | null; original_package: OptionAlertOriginalPackage;
+    current_mark: OptionAlertHistoryRow['current_mark'] | null;
+    observation?: OptionLocalSurfaceObservation;
+    outcome_status: 'NOT_BOUND_TO_PROSPECTIVE_OUTCOMES'; net_return: null; fill: null;
   }>
 }
 

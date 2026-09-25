@@ -8,7 +8,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
@@ -99,6 +99,7 @@ class OptionSettings(_FrozenModel):
     # Beyond this the run is behind its slot far enough that marks begin falling outside
     # the source-age window, so the matrix is degraded rather than trusted.
     maximum_execution_lag_seconds: int = Field(default=1800, gt=0)
+    reference_cache_seconds: int = Field(default=900, ge=0, le=900)
     # Trade ingestion is opt-in because enabling it multiplies provider requests per
     # cycle. These knobs are intentionally absent from fingerprint_payload: they bound
     # operational cost, and the watchlist rule must be versioned separately before any
@@ -186,6 +187,7 @@ class OptionSettings(_FrozenModel):
             "raw_archive_root": str(self.raw_archive_root),
             "start_read_only": self.start_read_only,
             "maximum_execution_lag_seconds": self.maximum_execution_lag_seconds,
+            "reference_cache_seconds": self.reference_cache_seconds,
         }
 
 
@@ -477,6 +479,13 @@ class ForwardAdmissionPolicy(_FrozenModel):
     scope: str = Field(default="DIRECTIONAL_DEBIT_PACKAGES", pattern="^DIRECTIONAL_DEBIT_PACKAGES$")
 
 
+class ParticipationAnchorPolicy(_FrozenModel):
+    version: Literal["o1_participation_candidate_anchor_v1"] = "o1_participation_candidate_anchor_v1"
+    minimum_volume_oi_ratio: Literal[3.0] = 3.0
+    maximum_candidates_per_underlyer_strategy: int = Field(default=100, gt=0, le=100)
+    source_basis: Literal["CHAIN_VOLUME_OI_REVALIDATED_BY_DATED_OI"] = "CHAIN_VOLUME_OI_REVALIDATED_BY_DATED_OI"
+
+
 class StrategyPolicy(_FrozenModel):
     strategy_version: str = Field(min_length=1)
     gamma_squeeze: GammaSqueezePolicy
@@ -488,11 +497,15 @@ class StrategyPolicy(_FrozenModel):
     smile: SmileStrategyPolicy
     scenarios: ScenarioPolicy
     forward_admission: ForwardAdmissionPolicy | None = None
+    participation_anchor: ParticipationAnchorPolicy | None = None
 
     @model_validator(mode="after")
     def validate_forward_admission(self):
-        if (self.forward_admission is not None) != (self.strategy_version == "phase2_v5_technical_forward"):
+        forward_versions = {"phase2_v5_technical_forward", "phase2_v6_o1_activity_anchor"}
+        if (self.forward_admission is not None) != (self.strategy_version in forward_versions):
             raise ValueError("forward admission requires its distinct strategy version")
+        if (self.participation_anchor is not None) != (self.strategy_version == "phase2_v6_o1_activity_anchor"):
+            raise ValueError("participation anchoring requires its distinct strategy version")
         return self
 
 
@@ -725,6 +738,8 @@ def load_strategy_policy(path: Path) -> StrategyPolicyArtifact:
     canonical_payload = policy.model_dump(mode="json")
     if policy.forward_admission is None:
         canonical_payload.pop("forward_admission", None)
+    if policy.participation_anchor is None:
+        canonical_payload.pop("participation_anchor", None)
     return StrategyPolicyArtifact(policy=policy, sha256=_sha256(canonical_payload), path=path)
 
 
@@ -840,6 +855,7 @@ def load_option_runtime_configuration(
         "trade_ingestion_budget_seconds": environ.get(
             "OPTION_TRADE_INGESTION_BUDGET_SECONDS", "120"
         ),
+        "reference_cache_seconds": environ.get("OPTION_REFERENCE_CACHE_SECONDS", "900"),
     }
     settings = OptionSettings.model_validate(values)
     policy_path = settings.policy_file

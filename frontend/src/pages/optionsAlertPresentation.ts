@@ -1,8 +1,29 @@
-import type { OptionAlertPreviewRequest, OptionCandidateDetailData, OptionCandidateLeg, OptionStockBehaviorGateEvidence } from '../services/api'
+import type { OptionAlertPreviewRequest, OptionCandidateDetailData, OptionCandidateLeg, OptionStockBehaviorGateEvidence, OptionDetectorAlertReview } from '../services/api'
 import type { ColumnSpec } from '../layout/PageChrome'
 
 export type OptionAlertView = 'behavior' | 'day_history' | 'candidates' | 'daily' | 'history'
 export type OptionAlertColumn = ColumnSpec & { tip?: string }
+
+const detectorObservationColumns: OptionAlertColumn[] = [
+  { key: 'fitted_iv', label: 'Fitted IV', group: 'Observation evidence', hiddenByDefault: true },
+  { key: 'residual', label: 'IV gap (points)', group: 'Observation evidence', hiddenByDefault: true },
+  { key: 'robust_z', label: 'Robust z-score', group: 'Observation evidence', hiddenByDefault: true },
+  { key: 'source_cutoff', label: 'Source cutoff (ET)', group: 'Observation evidence', hiddenByDefault: true, tip: 'Retained surface evaluation cutoff, not a stock trigger or an individual option quote timestamp.' },
+  { key: 'analyzed_at', label: 'Analyzed (ET)', group: 'Observation evidence', hiddenByDefault: true },
+]
+
+export function detectorObservationFieldStates(row: OptionDetectorAlertReview['rows'][number]): Record<string, string> {
+  if (!row.observation) return {}
+  return {
+    ...Object.fromEntries(optionMarketColumns.map(column => [column.key, 'Not retained'])),
+    ...Object.fromEntries(['triggered_at', 'hit_count', 'technical_stop', 'technical_target',
+      'current_price', 'price_pnl', 'current_mark_time', 'current_mark_status', 'gross_pnl',
+      'net_pnl', 'estimated_cost', 'capital', 'maximum_loss', 'maximum_profit', 'breakevens',
+      'net_return'].map(key => [key, 'Not applicable'])),
+    strategy: 'Local IV surface observation', outcome_status: 'Observation only',
+    option_price: 'Not applicable', leg_prices: 'Not applicable',
+  }
+}
 
 export const detectorSortKeys = ['triggered_at', 'run', 'underlyer', 'detector', 'category', 'strategy', 'rank', 'entry_limit'] as const
 
@@ -68,40 +89,54 @@ export const optionMarketColumns: OptionAlertColumn[] = [
   { key: 'mark_source', label: 'Option price basis', group: 'Original market data', hiddenByDefault: true },
 ]
 
+const detectorHiddenMarketColumns = new Set(['theta', 'vega', 'rho', 'bid_ask', 'mark_time', 'mark_source'])
+
+const detectorMarketColumns: OptionAlertColumn[] = optionMarketColumns.flatMap(column => {
+  if (column.key === 'option_price') return []
+  const source = { ...column, hiddenByDefault: detectorHiddenMarketColumns.has(column.key),
+    label: column.label, tip: column.tip }
+  return column.key === 'leg_prices' ? [source,
+    { key: 'option_price', label: 'Trigger price', group: 'Original market data', tip: 'Original net package price per share from the trigger snapshots. Not a fill or current mark.' },
+    { key: 'current_price', label: 'Current price', group: 'Marked performance', tip: 'Latest retained coherent package mark per share. Delayed and not an executable quote or fill.' },
+    { key: 'price_pnl', label: 'Price P/L %', group: 'Marked performance', tip: 'Gross package P/L divided by absolute original net premium. Credit gains reflect lower close cost. Ignores fills and stop/target exits.' },
+    { key: 'technical_stop', label: 'Stop price', group: 'Risk / target', tip: 'Frozen option package close threshold per share, normalized by the common contract multiplier. Not total contract cost or a guaranteed fill.' },
+    { key: 'technical_target', label: 'Target price', group: 'Risk / target', tip: 'Frozen option package target threshold per share, normalized by the common contract multiplier. Not total contract proceeds or a guaranteed fill.' },
+  ] : [source]
+})
+
 export const detectorAlertColumns: OptionAlertColumn[] = [
+  { key: 'details', label: 'View', group: 'Alert', locked: true },
   { key: 'triggered_at', label: 'Triggered (ET)', group: 'Alert', locked: true, tip: 'Retained option source time for O1 or original stock trigger-bar time for S1/S2, not selection or run time.' },
   { key: 'underlyer', label: 'Underlying', group: 'Alert', locked: true },
   { key: 'contracts', label: 'Contracts / structure', group: 'Package' },
   { key: 'expiry', label: 'Expiry / DTE at source', group: 'Package' },
-  ...optionMarketColumns.map(column => ({ ...column, hiddenByDefault: false })),
+  ...detectorMarketColumns,
   { key: 'run', label: 'Run (ET)', group: 'Alert', hiddenByDefault: true },
-  { key: 'entry_limit', label: 'Entry limit / package', group: 'Trade plan', hiddenByDefault: true },
   { key: 'hit_count', label: 'Hits', group: 'Alert', hiddenByDefault: true },
-  { key: 'technical_stop', label: 'Stock stop', group: 'Trade plan', hiddenByDefault: true },
-  { key: 'technical_target', label: 'Stock target', group: 'Trade plan', hiddenByDefault: true },
-  ...optionPlanColumns.map(column => ({ ...column, hiddenByDefault: true,
-    label: column.key === 'plan_stop' ? 'Hard option stop' : column.key === 'plan_target' ? 'Hard option profit limit' : column.label })),
-  { key: 'entry_window', label: 'Entry window', group: 'Trade plan', hiddenByDefault: true },
-  { key: 'exit_due', label: 'Exit due (ET)', group: 'Trade plan', hiddenByDefault: true },
   { key: 'capital', label: 'Original capital at risk', group: 'Economics', hiddenByDefault: true },
   { key: 'maximum_loss', label: 'Maximum expiration loss', group: 'Economics', hiddenByDefault: true },
   { key: 'maximum_profit', label: 'Maximum expiration profit', group: 'Economics', hiddenByDefault: true },
   { key: 'breakevens', label: 'Expiration breakevens', group: 'Economics', hiddenByDefault: true },
   { key: 'net_return', label: 'Net marked return', group: 'Performance', hiddenByDefault: true },
+  { key: 'gross_pnl', label: 'Gross package P/L', group: 'Marked performance', hiddenByDefault: true },
+  { key: 'net_pnl', label: 'Net package P/L', group: 'Marked performance', hiddenByDefault: true },
+  { key: 'estimated_cost', label: 'Commission estimate', group: 'Marked performance', hiddenByDefault: true },
+  { key: 'current_mark_time', label: 'Current price time (ET)', group: 'Marked performance', hiddenByDefault: true },
+  { key: 'current_mark_status', label: 'Current mark status', group: 'Marked performance', hiddenByDefault: true },
   { key: 'outcome_status', label: 'Outcome status', group: 'Performance', hiddenByDefault: true },
+  ...detectorObservationColumns,
   { key: 'detector', label: 'Model', group: 'Classification', hiddenByDefault: true },
   { key: 'category', label: 'Category', group: 'Classification', hiddenByDefault: true },
   { key: 'strategy', label: 'Package strategy', group: 'Classification', hiddenByDefault: true },
-  { key: 'details', label: 'Details', group: 'Alert', hiddenByDefault: true },
 ]
 
-const detectorIdentity = ['triggered_at', 'underlyer', 'detector', 'details']
+const detectorIdentity = ['details', 'triggered_at', 'underlyer', 'detector']
 export const detectorColumnPresets: Record<string, string[]> = {
   'Package / market data': detectorAlertColumns.filter(column => !column.hiddenByDefault).map(column => column.key),
   'Greeks / volatility': ['triggered_at', 'underlyer', 'contracts', 'expiry', 'stock', 'option_price', 'iv', 'delta', 'gamma', 'theta', 'vega', 'rho'],
-  'Price / activity': [...detectorIdentity, 'category', 'strategy', 'contracts', 'expiry', 'stock', 'option_price', 'volume', 'open_interest', 'volume_oi', 'iv'],
-  'Trade plan': [...detectorIdentity, 'strategy', 'contracts', 'entry_limit', 'technical_stop', 'technical_target', ...optionPlanColumns.map(column => column.key), 'exit_due'],
-  Performance: [...detectorIdentity, 'category', 'strategy', 'run', 'hit_count', 'entry_limit', 'net_return', 'outcome_status'],
+  'Price / activity': [...detectorIdentity, 'category', 'strategy', 'contracts', 'expiry', 'stock', 'option_price', 'current_price', 'price_pnl', 'technical_stop', 'technical_target', 'volume', 'open_interest', 'volume_oi', 'iv'],
+  Performance: [...detectorIdentity, 'category', 'strategy', 'run', 'hit_count', 'option_price', 'current_price', 'price_pnl', 'gross_pnl', 'net_pnl', 'net_return', 'current_mark_time', 'current_mark_status', 'outcome_status'],
+  'IV observation evidence': [...detectorIdentity, 'contracts', 'expiry', 'iv', ...detectorObservationColumns.map(column => column.key)],
   All: detectorAlertColumns.map(column => column.key),
 }
 
@@ -119,7 +154,7 @@ export function detectorViewPreset(name: string, params: URLSearchParams, column
     if (value) query[key] = value
   }
   if (query.underlyer && !/^[A-Z][A-Z0-9.]{0,14}$/.test(query.underlyer)) throw new Error('Invalid underlying')
-  if (query.evaluation_detector && !['O1', 'S1', 'S2'].includes(query.evaluation_detector)) throw new Error('Invalid package model')
+  if (query.evaluation_detector && !['O1', 'O2', 'S1', 'S2'].includes(query.evaluation_detector)) throw new Error('Invalid detector model')
   if (query.detector_sort && !detectorSortKeys.some(key => key === query.detector_sort)) throw new Error('Invalid sort')
   if (query.detector_order && !['asc', 'desc'].includes(query.detector_order)) throw new Error('Invalid sort direction')
   return { name: trimmed, query, columns: [...new Set([...detectorAlertColumns.filter(column => column.locked).map(column => column.key), ...columns])] }

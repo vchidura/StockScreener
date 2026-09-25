@@ -41,7 +41,6 @@ from equity.repositories import (
     EquityReferenceRepository,
     EquityUniverseRepository,
 )
-from scripts.refresh_daily_signal_context import refresh_current_daily_signals
 
 
 LOGGER = logging.getLogger("equity-worker")
@@ -418,11 +417,6 @@ def materialize_due_interval(
             LOGGER.exception(
                 "behavior adjusted daily refresh failed non-fatally",
             )
-    if interval == "1d" and publication.status == "COMPLETE":
-        context = refresh_current_daily_signals(now=datetime.now(timezone.utc))
-        LOGGER.info("daily signal context %s", context)
-        if context["status"] not in ("PUBLISHED", "ALREADY_PRESENT"):
-            return False
     LOGGER.info(
         "maturing outcomes interval=%s slot=%s",
         interval,
@@ -557,8 +551,6 @@ def run_worker(
             provider_delay=provider_delay,
         )
     retry_after: dict[str, datetime] = {}
-    context_completed = None
-    context_retry_at = None
     once_failures: list[str] = []
     completed = analysis_repository.latest_published_market_times(INTERVALS)
     last_heartbeat_at = datetime.now(timezone.utc)
@@ -633,25 +625,6 @@ def run_worker(
                 retry_after[interval] = now + timedelta(
                     seconds=INTERVAL_RETRY_SECONDS
                 )
-        if "1d" in INTERVALS:
-            context_slot = latest_due_slot(now, "1d", provider_delay=provider_delay)
-            if context_slot != context_completed and (
-                context_retry_at is None or now >= context_retry_at
-            ):
-                try:
-                    context = refresh_current_daily_signals(now=datetime.now(timezone.utc))
-                    LOGGER.info("daily signal context %s", context)
-                    if context["status"] in ("PUBLISHED", "ALREADY_PRESENT"):
-                        context_completed = context_slot
-                    else:
-                        context_retry_at = now + timedelta(seconds=INTERVAL_RETRY_SECONDS)
-                        if once:
-                            once_failures.append(f"daily-context:{context['status']}")
-                except Exception as exc:
-                    LOGGER.exception("daily signal context failed; existing dates retained")
-                    context_retry_at = now + timedelta(seconds=INTERVAL_RETRY_SECONDS)
-                    if once:
-                        once_failures.append(f"daily-context:{type(exc).__name__}")
         if once:
             if once_failures:
                 raise RuntimeError(

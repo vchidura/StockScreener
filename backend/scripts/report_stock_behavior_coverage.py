@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime, timezone
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -27,6 +28,380 @@ from equity.behavior_sources import (
 from equity.domain import DecisionWatermark
 from equity.repositories import EquityBarRepository, EquityCorporateActionRepository, EquityEvidenceRepository
 from options.config import load_option_runtime_configuration
+
+
+def summarize_stock_setup_source(path, *, as_of, maximum_publications=12):
+    from collections import Counter
+    from contextlib import closing
+    import sqlite3
+    import zlib
+
+    from equity.stock_alert_results import _decode_original_setup_payload, utc
+
+    path = path.resolve()
+    if not path.is_file() or not 1 <= maximum_publications <= 48 or as_of.utcoffset() is None:
+        raise ValueError("stock setup source review requires a bounded existing ledger and aware cutoff")
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)) as connection:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        rows = connection.execute("""SELECT window_key,CASE WHEN length(payload)<=4194304 THEN payload END
+            FROM forward_publications ORDER BY window_key DESC LIMIT ?""", (maximum_publications,)).fetchall()
+    if any(payload is None for _, payload in rows):
+        raise ValueError("stock setup source review exceeds publication or payload bound")
+    publications = []
+    totals = Counter()
+    statuses = Counter()
+    for window_key, payload in rows:
+        try:
+            publication = _decode_original_setup_payload(payload)
+        except (json.JSONDecodeError, zlib.error, ValueError, TypeError) as error:
+            raise ValueError("stock setup source review found an invalid publication") from error
+        candidates = Counter(row.get("model", "UNKNOWN") for row in publication.get("candidates", {}).values())
+        missing_members = set(publication.get("missing_members", ()))
+        for row in publication.get("candidates", {}).values():
+            model = row.get("model", "UNKNOWN")
+            remaining_seconds = (utc(row["expires_at"]) - utc(publication["actual_publication_at"])).total_seconds()
+            statuses[(model, "ACTIVE_AT_PUBLICATION" if remaining_seconds > 0 else "EXPIRED_AT_PUBLICATION")] += 1
+            for seconds in (300, 900, 1200, 1800):
+                if remaining_seconds >= seconds:
+                    statuses[(model, f"REMAINING_GE_{seconds}_SECONDS")] += 1
+            statuses[(model, "MISSING_MEMBER" if row.get("security_id") in missing_members else "AVAILABLE_MEMBER")] += 1
+        active = Counter(row.get("model", "UNKNOWN") for row in publication.get("candidates", {}).values()
+            if utc(row["expires_at"]) > as_of)
+        active_at_publication = Counter(row.get("model", "UNKNOWN") for row in publication.get("candidates", {}).values()
+            if utc(row["expires_at"]) > utc(publication["actual_publication_at"]))
+        by_ticker_model = Counter((row.get("ticker", "UNKNOWN"), row.get("model", "UNKNOWN"))
+            for row in publication.get("candidates", {}).values())
+        expirations = sorted(utc(row["expires_at"]) for row in publication.get("candidates", {}).values())
+        dispositions = Counter((row.get("model", "UNKNOWN"), row.get("selection", "UNKNOWN"), row.get("reason"))
+            for row in publication.get("dispositions", ()))
+        totals.update(candidates)
+        publications.append(dict(window_key=window_key, market_time=publication.get("market_time", window_key),
+            actual_publication_at=publication.get("actual_publication_at"), coverage=publication.get("coverage"),
+            retry_of=publication.get("retry_of"), expected_members=len(publication.get("expected_members", ())),
+            missing_members=sorted(publication.get("missing_members", ())), candidates=dict(candidates),
+            candidate_ticker_models={f"{ticker}:{model}": count for (ticker, model), count in sorted(by_ticker_model.items())},
+            earliest_expiry=expirations[0] if expirations else None, latest_expiry=expirations[-1] if expirations else None,
+            active_at_publication=dict(active_at_publication), active_at_review=dict(active),
+            selected=len(publication.get("selected", ())),
+            dispositions={f"{model}:{selection}:{reason or 'NONE'}": count
+                for (model, selection, reason), count in sorted(dispositions.items(), key=lambda item: str(item[0]))}))
+    return dict(version="stock_setup_source_review_v1", as_of=as_of, ledger=str(path),
+        publications=publications, candidate_totals=dict(totals),
+        candidate_status_totals={f"{model}:{status}": count for (model, status), count in sorted(statuses.items())},
+        source_writes=0,
+        publication_permission=False, execution_permission=False)
+
+
+def summarize_o1_indicator_observations(records, *, start_date, end_date, as_of):
+    from collections import Counter, defaultdict
+
+    def rate(numerator, denominator):
+        return round(numerator / denominator, 6) if denominator else None
+
+    baselines = Counter()
+    underlyers = Counter()
+    directions = Counter()
+    sessions = Counter()
+    policies = Counter()
+    outcomes = Counter()
+    metric_statuses = defaultdict(Counter)
+    metric_reasons = defaultdict(Counter)
+    challenger_verdicts = defaultdict(Counter)
+    challenger_reasons = defaultdict(Counter)
+    episode_keys = set()
+    for record in records:
+        observation = record.observation
+        baselines[observation.baseline_disposition] += 1
+        underlyers[observation.underlyer] += 1
+        directions["BULLISH" if observation.direction == 1 else "BEARISH"] += 1
+        sessions[observation.scheduled_cycle.date().isoformat()] += 1
+        policies[observation.policy.sha256] += 1
+        outcomes[observation.outcome_status] += 1
+        episode_keys.add((record.dataset_id, record.recurrence_sha256))
+        for measurement in observation.measurements:
+            metric_statuses[measurement.metric_id][measurement.status] += 1
+            metric_reasons[measurement.metric_id].update(measurement.reason_codes)
+        for challenger in observation.challengers:
+            challenger_verdicts[challenger.challenger_id][challenger.verdict] += 1
+            challenger_reasons[challenger.challenger_id].update(challenger.reason_codes)
+    total = len(records)
+    metrics = {}
+    for metric_id in sorted(metric_statuses):
+        counts = metric_statuses[metric_id]
+        metrics[metric_id] = dict(ready=counts["READY"], unavailable=counts["UNAVAILABLE"],
+            ready_rate=rate(counts["READY"], sum(counts.values())), unavailable_reasons=dict(metric_reasons[metric_id]))
+    challengers = {}
+    for challenger_id in sorted(challenger_verdicts):
+        counts = challenger_verdicts[challenger_id]
+        available = counts["PASS"] + counts["FAIL"]
+        challengers[challenger_id] = dict(passed=counts["PASS"], failed=counts["FAIL"],
+            unavailable=counts["UNAVAILABLE"], pass_rate_when_available=rate(counts["PASS"], available),
+            reason_counts=dict(challenger_reasons[challenger_id]))
+    top_underlyer = underlyers.most_common(1)[0] if underlyers else None
+    top_session = sessions.most_common(1)[0] if sessions else None
+    return dict(version="option_o1_indicator_period_review_v1",
+        status="NO_OBSERVATIONS" if not records else "SHADOW_EVIDENCE_ONLY",
+        start_date=start_date, end_date=end_date, as_of=as_of,
+        observations=total, distinct_dataset_episodes=len(episode_keys),
+        duplicate_dataset_episode_rows=total - len(episode_keys), datasets=sorted({row.dataset_id for row in records}),
+        baseline_dispositions=dict(baselines), metric_availability=metrics, challenger_verdicts=challengers,
+        concentration=dict(underlyers=dict(underlyers), directions=dict(directions), sessions=dict(sessions),
+            largest_underlyer_share=rate(top_underlyer[1], total) if top_underlyer else None,
+            largest_session_share=rate(top_session[1], total) if top_session else None),
+        policy_sha256s=dict(policies), outcome_statuses=dict(outcomes),
+        inference=dict(independent_samples=False, correlated_observations=True,
+            outcome_comparison_ready=False, admission_changed=False, execution_changed=False),
+        limitations=["CONTRACT_EPISODES_WITHIN_A_SESSION_AND_UNDERLYER_ARE_CORRELATED",
+            "CHALLENGER_VERDICTS_ARE_DESCRIPTIVE_NOT_PERFORMANCE_ESTIMATES",
+            "OUTCOMES_ARE_NOT_YET_MEASURED", "NO_ADMISSION_PACKAGE_OR_EXECUTION_EFFECT"],
+        source_writes=0, publication_permission=False, execution_permission=False)
+
+
+def summarize_stock_setup_indicator_observations(records, *, start_date, end_date, as_of):
+    from collections import Counter, defaultdict
+
+    def rate(numerator, denominator):
+        return round(numerator / denominator, 6) if denominator else None
+
+    by_model = {}
+    for model in ("S1", "S2"):
+        scoped = [row for row in records if row.detector_id == model]
+        baselines = Counter(row.observation.baseline_disposition for row in scoped)
+        baseline_reasons = Counter(reason for row in scoped for reason in row.observation.baseline_reasons)
+        source_statuses = Counter(row.observation.setup_source.source_status for row in scoped)
+        setup_dispositions = Counter(
+            f"{row.observation.setup_source.setup_selection}:{row.observation.setup_source.setup_reason or 'NONE'}"
+            for row in scoped)
+        underlyers = Counter(row.observation.underlyer for row in scoped)
+        directions = Counter("BULLISH" if row.observation.direction == 1 else "BEARISH" for row in scoped)
+        metrics = defaultdict(Counter)
+        metric_reasons = defaultdict(Counter)
+        challengers = defaultdict(Counter)
+        challenger_reasons = defaultdict(Counter)
+        for record in scoped:
+            for measurement in record.observation.measurements:
+                metrics[measurement.metric_id][measurement.status] += 1
+                metric_reasons[measurement.metric_id].update(measurement.reason_codes)
+            for challenger in record.observation.challengers:
+                challengers[challenger.challenger_id][challenger.verdict] += 1
+                challenger_reasons[challenger.challenger_id].update(challenger.reason_codes)
+        metric_summary = {metric_id: dict(ready=counts["READY"], unavailable=counts["UNAVAILABLE"],
+            ready_rate=rate(counts["READY"], sum(counts.values())), unavailable_reasons=dict(metric_reasons[metric_id]))
+            for metric_id, counts in sorted(metrics.items())}
+        challenger_summary = {}
+        for challenger_id, counts in sorted(challengers.items()):
+            available = counts["PASS"] + counts["FAIL"]
+            challenger_summary[challenger_id] = dict(passed=counts["PASS"], failed=counts["FAIL"],
+                unavailable=counts["UNAVAILABLE"], pass_rate_when_available=rate(counts["PASS"], available),
+                reason_counts=dict(challenger_reasons[challenger_id]))
+        by_model[model] = dict(observations=len(scoped), baseline_dispositions=dict(baselines),
+            baseline_reasons=dict(baseline_reasons), source_statuses=dict(source_statuses),
+            setup_dispositions=dict(setup_dispositions),
+            expired_before_option_decision=baseline_reasons["STOCK_EPISODE_EXPIRED_BEFORE_OPTION_DECISION"],
+            structurally_blocked=baseline_reasons["STOCK_EPISODE_STRUCTURALLY_BLOCKED"],
+            confirmed_with_option_activity=baselines["CONFIRMED"], unmatched_option_activity=baselines["UNMATCHED"],
+            metric_availability=metric_summary, challenger_verdicts=challenger_summary,
+            concentration=dict(underlyers=dict(underlyers), directions=dict(directions)))
+    episode_keys = {(row.dataset_id, row.detector_id, row.recurrence_sha256) for row in records}
+    return dict(version="option_stock_setup_indicator_period_review_v1",
+        status="NO_OBSERVATIONS" if not records else "SHADOW_EVIDENCE_ONLY",
+        start_date=start_date, end_date=end_date, as_of=as_of, observations=len(records),
+        distinct_dataset_model_episodes=len(episode_keys), duplicate_dataset_model_episode_rows=len(records) - len(episode_keys),
+        datasets=sorted({row.dataset_id for row in records}), models=by_model,
+        inference=dict(independent_samples=False, correlated_observations=True,
+            timing_loss_is_separate_cohort=True, outcome_comparison_ready=False,
+            admission_changed=False, execution_changed=False),
+        limitations=["STOCK_EPISODES_WITHIN_A_SESSION_AND_UNDERLYER_ARE_CORRELATED",
+            "EXPIRED_EPISODES_MEASURE_PIPELINE_TIMING_NOT_OPTION_SIGNAL_FAILURE",
+            "CHALLENGER_VERDICTS_ARE_DESCRIPTIVE_NOT_PERFORMANCE_ESTIMATES",
+            "OUTCOMES_ARE_NOT_YET_MEASURED", "NO_ADMISSION_PACKAGE_OR_EXECUTION_EFFECT"],
+        source_writes=0, publication_permission=False, execution_permission=False)
+
+
+def o1_confirmation_diagnostic(sources, repository, *, decision_at):
+    from collections import Counter
+    from zoneinfo import ZoneInfo
+
+    from options.detector_launch import aligned_stock_windows
+    from options.dual_origin import assess_options_intraday
+    from options.intraday_participation import bind_intraday_components
+
+    if decision_at.utcoffset() is None or len(sources["activity"]) > 20000:
+        raise ValueError("O1 confirmation diagnostic requires bounded causal inputs")
+    cache = {}
+    dispositions, reasons, source_sessions = Counter(), Counter(), Counter()
+    examples = []
+    detected = [row for row in sources["activity"] if row["finding"].disposition == "DETECTED"]
+    for row in detected:
+        source = row["source"]
+        window = aligned_stock_windows({source.underlyer: source.market_time})[source.underlyer][1]
+        key = (source.security_id, window)
+        if key not in cache:
+            carrier = repository.intraday_confirmation_source(
+                security_id=source.security_id,
+                market_cutoff=window or source.market_time,
+                as_of=decision_at,
+            )
+            cache[key] = bind_intraday_components(carrier, received_at=decision_at) if carrier else None
+        stock = cache[key]
+        decision = assess_options_intraday(
+            source,
+            stock,
+            direction=1 if source.contract_type == "CALL" else -1,
+            market_cutoff=max(row["lineage"].scheduled_cycle, row["lineage"].market_time),
+            decision_at=decision_at,
+        )
+        dispositions[decision.disposition] += 1
+        reasons.update(decision.reasons)
+        trend = next((component for component in stock.components if component.key == "TREND.30m"), None) if stock else None
+        trend_dates = {
+            origin.market_time.astimezone(ZoneInfo("America/New_York")).date()
+            for origin in trend.sources
+        } if trend else set()
+        if not trend_dates:
+            basis = "NO_30M_SOURCE"
+        elif trend_dates == {source.volume_session}:
+            basis = "SAME_SESSION_30M"
+        elif max(trend_dates) < source.volume_session:
+            basis = "PRIOR_SESSION_30M"
+        else:
+            basis = "MIXED_OR_FUTURE_30M"
+        source_sessions[basis] += 1
+        if len(examples) < 8:
+            examples.append(dict(
+                underlyer=source.underlyer,
+                contract_id=source.contract_id,
+                option_market_time=source.market_time,
+                completed_window=window,
+                disposition=decision.disposition,
+                reasons=decision.reasons,
+                source_session_basis=basis,
+                trend_market_times=sorted(
+                    origin.market_time for origin in trend.sources
+                ) if trend else [],
+            ))
+    return dict(
+        detected_activity=len(detected),
+        confirmation_dispositions=dict(sorted(dispositions.items())),
+        confirmation_reasons=dict(sorted(reasons.items())),
+        source_session_basis=dict(sorted(source_sessions.items())),
+        examples=examples,
+        publication_permission=False,
+        execution_permission=False,
+    )
+
+
+def o1_package_dry_run(runtime, launch, recorded, retained, package_sources):
+    from collections import Counter
+    from types import SimpleNamespace
+
+    from equity.repositories import EquityCorporateActionRepository
+    from equity.stock_alert_results import read_direct_stock_setup_shadow_windows, read_direct_stock_setup_windows
+    from options.detector_collection import DetectorCycleCollector, DetectorCycleInputs, ProductionDetectorSourceReader
+    from options.detector_launch import aligned_stock_windows, LatestCompletedDetectorForwardLaunch
+    from options.repositories.stock_behavior_assessments import OptionStockBehaviorAssessmentRepository
+
+    if not isinstance(launch, LatestCompletedDetectorForwardLaunch):
+        raise ValueError("manual O1 v3 validation requires the latest-completed launch contract")
+    cutoff = recorded.selected_at
+    source_repository = OptionStockBehaviorAssessmentRepository()
+    repository = SimpleNamespace(
+        detector_package_sources=lambda **_: package_sources,
+        intraday_confirmation_source=source_repository.intraday_confirmation_source,
+        detector_technical_sources=source_repository.detector_technical_sources,
+    )
+
+    def setups(*, market_cutoff, as_of, market_cutoffs=None):
+        return read_direct_stock_setup_windows(
+            (BACKEND_DIR / launch.stock_ledger).resolve(),
+            policies=(launch.acceptance_source, launch.resumption_source),
+            windows=aligned_stock_windows(market_cutoffs),
+            as_of=as_of,
+            clock=lambda: cutoff,
+        )
+
+    def setup_shadows(*, market_cutoff, as_of, market_cutoffs=None):
+        return read_direct_stock_setup_shadow_windows(
+            (BACKEND_DIR / launch.stock_ledger).resolve(),
+            policies=(launch.acceptance_source, launch.resumption_source),
+            windows=aligned_stock_windows(market_cutoffs),
+            as_of=as_of,
+            clock=lambda: cutoff,
+        )
+
+    clock = lambda: cutoff
+    production_sources = ProductionDetectorSourceReader(
+        SimpleNamespace(read=lambda **_: retained),
+        repository,
+        EquityCorporateActionRepository(),
+        setup_reader=setups,
+        setup_shadow_reader=setup_shadows,
+        aligned_setup_windows=True,
+        intraday_confirmation=True,
+        clock=clock,
+    )
+
+    setup_observations = []
+    def sources(**arguments):
+        inputs = production_sources(**arguments)
+        setup_observations.extend(inputs.stock_setup_observations)
+        return DetectorCycleInputs(
+            matrices=inputs.matrices,
+            package_inputs=tuple(row for row in inputs.package_inputs
+                if row["decision"].detector_id == "O1"),
+            rejections=inputs.rejections,
+            reject_invalid_packages=inputs.reject_invalid_packages,
+        )
+
+    collector = DetectorCycleCollector(
+        sources,
+        SimpleNamespace(prior_selected=lambda **_: {}),
+        clock=clock,
+    )
+    run, records = collector(
+        configuration=runtime,
+        dataset_id=f"{launch.dataset_id}-manual-validation",
+        scheduled_cycle=recorded.scheduled_cycle,
+        completed_matrices=dict(recorded.source_matrices),
+        started_at=cutoff,
+    )
+    rows = []
+    for record in records:
+        if record.detector_id != "O1":
+            continue
+        package = record.package
+        rows.append(dict(
+            candidate_id=str(package.candidate_id),
+            underlyer=package.underlyer,
+            direction=package.direction,
+            candidate_rank=package.candidate_rank,
+            selection_status=record.selection_status,
+            selection_reason=record.selection_reason,
+            decision_at=package.decision_at,
+            entry_deadline=package.entry_deadline,
+            exit_deadline=package.exit_deadline,
+            event_horizon_status=package.event_horizon_status,
+        ))
+    return dict(
+        status="MANUAL_READ_ONLY_NOT_PERSISTED",
+        dataset_id=run.dataset_id,
+        scheduled_cycle=run.scheduled_cycle,
+        selected_at=run.selected_at,
+        o1_records=rows,
+        o1_record_count=len(rows),
+        selection_counts=dict(run.selection_counts),
+        rejections=dict(run.rejections),
+        stock_setup_shadow=dict(total=len(setup_observations),
+            by_model=dict(Counter(row.detector_id for row in setup_observations)),
+            baseline_dispositions={f"{model}:{disposition}": count for (model, disposition), count in
+                Counter((row.detector_id, row.baseline_disposition) for row in setup_observations).items()},
+            baseline_reasons=dict(Counter(reason for row in setup_observations for reason in row.baseline_reasons)),
+            underlyers=sorted({row.underlyer for row in setup_observations})),
+        source_matrices_match=dict(run.source_matrices) == dict(recorded.source_matrices),
+        publication_permission=False,
+        execution_permission=False,
+    )
 
 
 def package_binding_diagnostic(sources, packages, *, valuation_policy=None):
@@ -460,10 +835,22 @@ def parse_args():
     parser.add_argument("--dual-origin-readiness", action="store_true", help="Inspect current O1 activity and S1 setup inventory without writes or detector activation.")
     parser.add_argument("--detector-sources", action="store_true", help="Read and bind the latest complete retained detector cycle; diagnostic only, no writes.")
     parser.add_argument("--detector-run-id", type=UUID, help="With --detector-sources, inspect one recorded run at its original selection cutoff; never replay or rewrite it.")
+    parser.add_argument("--compact", action="store_true", help="With --detector-sources, emit only the O1 confirmation, package dry-run and recorded rejection summary.")
     parser.add_argument("--technical-replay-preflight", type=date.fromisoformat, metavar="YYYY-MM-DD", help="Read-only strict-as-of technical replay gate for one session; optional new audit file only.")
-    parser.add_argument("--detector-schema", action="store_true", help="Read-only migration-053 preflight/postflight; no output file or source scan.")
+    parser.add_argument("--detector-schema", action="store_true", help="Read-only migration-053/054/055 preflight/postflight; no output file or source scan.")
+    parser.add_argument("--o1-indicator-review", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
+        help="Summarize retained prospective O1 shadow indicators for an inclusive period of at most 32 dates.")
+    parser.add_argument("--detector-dataset-id", help="Limit an indicator review to one exact detector dataset.")
+    parser.add_argument("--stock-setup-source-review", action="store_true",
+        help="Summarize the pinned S1/S2 stock setup ledger without changing or replaying it.")
+    parser.add_argument("--stock-setup-indicator-review", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
+        help="Summarize retained prospective S1/S2 mixed indicators for an inclusive period of at most 32 dates.")
     parser.add_argument("--technical-source-diagnostic", action="store_true", help="Read-only source query timings and bar lookup plan under the unchanged five-second limit.")
     parser.add_argument("--review-detector-launch", type=Path, help="Read-only comparison of a prepared replacement manifest and current process identities.")
+    parser.add_argument("--detector-strategy-policy-file", choices=(
+        "options/policies/strategy_technical_forward_v1.json",
+        "options/policies/strategy_technical_forward_v2.json",
+    ), help="With --review-detector-launch, validate against this immutable replacement strategy policy.")
     parser.add_argument("--publication-limit", type=int, default=12, choices=range(1, 49), metavar="1..48")
     parser.add_argument("--original-setup-ledger", type=Path, help="Compare exact retained publication keys against this SQLite ledger in query-only mode.")
     args = parser.parse_args()
@@ -478,14 +865,18 @@ def parse_args():
     if args.review_detector_launch and (args.output or args.technical_source_diagnostic or args.detector_sources or args.detector_run_id
             or args.detector_schema or args.technical_replay_preflight or args.dual_origin_readiness or args.setup_publications or args.original_setup_ledger):
         parser.error("--review-detector-launch cannot be combined with other modes")
+    if args.detector_strategy_policy_file and not args.review_detector_launch:
+        parser.error("--detector-strategy-policy-file requires --review-detector-launch")
     if args.technical_source_diagnostic and (args.output or args.detector_sources or args.detector_run_id or args.detector_schema
             or args.technical_replay_preflight or args.dual_origin_readiness or args.setup_publications or args.original_setup_ledger):
         parser.error("--technical-source-diagnostic cannot be combined with other modes or output writes")
     if args.detector_run_id and not args.detector_sources:
         parser.error("--detector-run-id requires --detector-sources")
+    if args.compact and not args.detector_sources:
+        parser.error("--compact requires --detector-sources")
     if args.technical_replay_preflight and (args.detector_sources or args.detector_schema or args.dual_origin_readiness or args.setup_publications or args.original_setup_ledger):
         parser.error("--technical-replay-preflight cannot be combined with other reports")
-    if args.detector_sources and (args.output or args.detector_schema or args.dual_origin_readiness or args.setup_publications or args.original_setup_ledger):
+    if args.detector_sources and ((args.output and not args.compact) or args.detector_schema or args.dual_origin_readiness or args.setup_publications or args.original_setup_ledger):
         parser.error("--detector-sources cannot be combined with other reports or output writes")
     if args.detector_schema and (args.output or args.dual_origin_readiness or args.setup_publications or args.original_setup_ledger):
         parser.error("--detector-schema cannot be combined with source reports or output writes")
@@ -493,11 +884,68 @@ def parse_args():
         parser.error("--dual-origin-readiness is read-only and cannot be combined with output or setup options")
     if args.original_setup_ledger and not args.setup_publications:
         parser.error("--original-setup-ledger requires --setup-publications")
+    if args.o1_indicator_review and any((args.surface_observations, args.surface_followup, args.review_detector_launch,
+            args.technical_source_diagnostic, args.detector_sources, args.detector_run_id, args.detector_schema,
+            args.technical_replay_preflight, args.dual_origin_readiness, args.setup_publications,
+            args.original_setup_ledger, args.compact)):
+        parser.error("--o1-indicator-review cannot be combined with another report mode")
+    if args.stock_setup_source_review and any((args.surface_observations, args.surface_followup, args.review_detector_launch,
+            args.technical_source_diagnostic, args.detector_sources, args.detector_run_id, args.detector_schema,
+            args.technical_replay_preflight, args.dual_origin_readiness, args.setup_publications,
+            args.original_setup_ledger, args.compact, args.o1_indicator_review, args.detector_dataset_id, args.output)):
+        parser.error("--stock-setup-source-review is read-only and cannot be combined with another report mode or output")
+    if args.stock_setup_indicator_review and any((args.surface_observations, args.surface_followup, args.review_detector_launch,
+            args.technical_source_diagnostic, args.detector_sources, args.detector_run_id, args.detector_schema,
+            args.technical_replay_preflight, args.dual_origin_readiness, args.setup_publications,
+            args.original_setup_ledger, args.compact, args.o1_indicator_review, args.stock_setup_source_review)):
+        parser.error("--stock-setup-indicator-review cannot be combined with another report mode")
+    if args.detector_dataset_id and not (args.o1_indicator_review or args.stock_setup_indicator_review):
+        parser.error("--detector-dataset-id requires an indicator review")
     return args
 
 
 def main() -> int:
     args = parse_args()
+    if args.stock_setup_indicator_review:
+        from options.repositories.alert_evaluations import OptionAlertEvaluationRepository
+
+        start_date, end_date = args.stock_setup_indicator_review
+        cutoff = datetime.now(timezone.utc)
+        records = OptionAlertEvaluationRepository().stock_setup_indicator_observations(
+            start_date=start_date, end_date=end_date, as_of=cutoff, dataset_id=args.detector_dataset_id)
+        report = summarize_stock_setup_indicator_observations(records,
+            start_date=start_date, end_date=end_date, as_of=cutoff)
+        rendered = json.dumps(report, indent=2, sort_keys=True, default=str, allow_nan=False)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            with args.output.open("x", encoding="utf-8") as destination:
+                destination.write(rendered + "\n")
+        print(rendered)
+        return 0
+    if args.stock_setup_source_review:
+        from options.repositories.alert_review_sources import configured_detector_launch
+
+        launch = configured_detector_launch()
+        report = summarize_stock_setup_source((BACKEND_DIR / launch.stock_ledger),
+            as_of=datetime.now(timezone.utc))
+        print(json.dumps(report, indent=2, sort_keys=True, default=str, allow_nan=False))
+        return 0
+    if args.o1_indicator_review:
+        from options.repositories.alert_evaluations import OptionAlertEvaluationRepository
+
+        start_date, end_date = args.o1_indicator_review
+        cutoff = datetime.now(timezone.utc)
+        records = OptionAlertEvaluationRepository().o1_indicator_observations(
+            start_date=start_date, end_date=end_date, as_of=cutoff, dataset_id=args.detector_dataset_id)
+        report = summarize_o1_indicator_observations(records,
+            start_date=start_date, end_date=end_date, as_of=cutoff)
+        rendered = json.dumps(report, indent=2, sort_keys=True, default=str, allow_nan=False)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            with args.output.open("x", encoding="utf-8") as destination:
+                destination.write(rendered + "\n")
+        print(rendered)
+        return 0
     if args.surface_followup:
         report = retained_surface_checkpoint_followup(args.surface_followup)
         rendered = json.dumps(report, indent=2, sort_keys=True, default=str, allow_nan=False)
@@ -531,9 +979,14 @@ def main() -> int:
 
         report = OptionAlertEvaluationRepository().schema_readiness()
         report["migration_sha256"] = hashlib.sha256((BACKEND_DIR / "migrations/053_option_detector_evaluations.sql").read_bytes()).hexdigest()
+        report["o1_migration_sha256"] = hashlib.sha256((BACKEND_DIR / "migrations/054_option_o1_indicator_observations.sql").read_bytes()).hexdigest()
+        report["stock_setup_migration_sha256"] = hashlib.sha256((BACKEND_DIR / "migrations/055_option_stock_setup_indicator_observations.sql").read_bytes()).hexdigest()
         print(json.dumps(report, sort_keys=True, indent=2, default=str))
         return 0
-    runtime = load_option_runtime_configuration()
+    runtime = load_option_runtime_configuration(
+        dict(os.environ, OPTION_STRATEGY_POLICY_FILE=args.detector_strategy_policy_file),
+        BACKEND_DIR,
+    ) if args.detector_strategy_policy_file else load_option_runtime_configuration()
     if args.review_detector_launch:
         print(json.dumps(review_detector_launch(args.review_detector_launch, runtime), indent=2, default=str))
         return 0
@@ -589,10 +1042,12 @@ def main() -> int:
         recorded = None
         if args.detector_run_id:
             from options.repositories.alert_evaluations import OptionAlertEvaluationRepository
-            from options.repositories.alert_review_sources import configured_detector_dataset
+            from options.repositories.alert_review_sources import OptionAlertReviewSourceRepository, configured_detector_launch
 
-            recorded = next((run for run in OptionAlertEvaluationRepository().completed_runs(
-                dataset_id=configured_detector_dataset(), as_of=cutoff) if run.run_id == args.detector_run_id), None)
+            evaluation_repository = OptionAlertEvaluationRepository()
+            datasets = OptionAlertReviewSourceRepository().dataset_index(as_of=cutoff)["datasets"]
+            recorded = next((run for dataset in datasets for run in evaluation_repository.completed_runs(
+                dataset_id=dataset, as_of=cutoff) if run.run_id == args.detector_run_id), None)
             if recorded is None or recorded.configuration_sha256 != runtime.configuration_sha256:
                 raise ValueError("recorded detector run unavailable in the current configuration/dataset")
             cutoff = recorded.selected_at
@@ -614,14 +1069,30 @@ def main() -> int:
                 matrices=len(sources["matrices"]), retained_candidates=len(sources["candidates"]),
                 package_source_counts={key: len(values) for key, values in packages.items()},
                 binding_diagnostic=package_binding_diagnostic(sources, packages, valuation_policy=runtime.valuation_policy),
+                o1_confirmation=o1_confirmation_diagnostic(sources, repository, decision_at=cutoff),
+                o1_package_dry_run=o1_package_dry_run(
+                    runtime, configured_detector_launch(), recorded, sources, packages,
+                ) if recorded else None,
                 recorded_rejections=dict(recorded.rejections) if recorded else None,
                 inspection_basis="CURRENT_RETAINED_ROWS_AT_ORIGINAL_CUTOFF_NOT_A_REPLAY" if recorded else "CURRENT_RETAINED_ROWS",
                 activity_dispositions=dict(Counter(row["finding"].disposition for row in sources["activity"])),
                 activity_reasons=dict(Counter(reason for row in sources["activity"] for reason in row["finding"].reasons)),
                 surface_dispositions=dict(Counter(row.finding_disposition for row in observations)),
                 source_exclusions=sources["rejections"],
-                pending=["PLAN_QUALIFICATION_NOT_RUN_BY_DIAGNOSTIC", "NO_SELECTION_OR_PUBLICATION_BY_DIAGNOSTIC"])
-        print(json.dumps(report, indent=2, sort_keys=True, default=str))
+                pending=["NO_PERSISTENCE_OR_PUBLICATION_BY_DIAGNOSTIC"] if recorded else
+                    ["PLAN_QUALIFICATION_NOT_RUN_BY_DIAGNOSTIC", "NO_SELECTION_OR_PUBLICATION_BY_DIAGNOSTIC"])
+        if args.compact:
+            report = {key: report.get(key) for key in (
+                "status", "as_of", "scheduled_cycle", "o1_confirmation",
+                "o1_package_dry_run", "recorded_rejections",
+                "publication_permission", "execution_permission",
+            )}
+        rendered = json.dumps(report, indent=2, sort_keys=True, default=str)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            with args.output.open("x", encoding="utf-8") as destination:
+                destination.write(rendered + "\n")
+        print(rendered)
         return 0
     if args.dual_origin_readiness:
         from equity.stock_alert_results import read_setup_publication_inventory

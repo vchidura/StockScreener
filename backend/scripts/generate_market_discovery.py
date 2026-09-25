@@ -130,7 +130,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate shadow market-discovery states")
     parser.add_argument("--date", default=None)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--allow-legacy-write", action="store_true", help="Explicitly permit retired legacy-table publication")
     args = parser.parse_args()
+    if not args.dry_run and not args.allow_legacy_write:
+        parser.error("Legacy production writer retired; use --dry-run or explicitly approve --allow-legacy-write")
     states = compute(args.date)
     if states.empty:
         logger.error("No discovery states produced")

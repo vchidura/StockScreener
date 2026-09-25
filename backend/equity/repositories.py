@@ -879,6 +879,54 @@ class EquityBarRepository(_Repository):
             grouped[row["ticker"]].append(_bar_from_row(row))
         return {ticker: tuple(values) for ticker, values in grouped.items()}
 
+    def list_final_at_watermark_for_tickers(
+        self,
+        tickers: Sequence[str],
+        interval: str,
+        context: DecisionWatermark,
+        *,
+        session_scope: BarSessionScope = BarSessionScope.RTH,
+        adjusted: bool = False,
+    ) -> dict[str, EquityBarRevision]:
+        normalized = tuple(dict.fromkeys(ticker.upper() for ticker in tickers))
+        if not normalized:
+            return {}
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT DISTINCT ON (ticker, interval, bar_start) *
+                FROM equity_bar_revisions
+                WHERE ticker = ANY(%s)
+                  AND interval = %s
+                  AND session_scope = %s
+                  AND adjusted = %s
+                  AND is_final = TRUE
+                  AND NOT (
+                      availability_mode = 'HISTORICAL_RECONSTRUCTED'
+                      AND quality_codes @> ARRAY['GROUPED_DAILY_AGGREGATE']::TEXT[]
+                  )
+                  AND bar_end = %s
+                  AND COALESCE(replay_available_at, system_observed_at) <= %s
+                ORDER BY ticker, interval, bar_start,
+                         CASE
+                             WHEN source_kind = 'RECONCILED' THEN 0
+                             WHEN interval IN ('5m', '15m', '30m') AND source_kind = 'NATIVE_REST' THEN 1
+                             WHEN interval IN ('5m', '15m', '30m') AND source_kind = 'REALTIME_STREAM' THEN 2
+                             WHEN interval IN ('1h', '1d', '1wk', '1mo') AND source_kind = 'DERIVED' THEN 1
+                             WHEN source_kind = 'NATIVE_REST' THEN 2
+                             WHEN source_kind = 'DERIVED' THEN 3
+                             ELSE 4
+                         END,
+                         CASE WHEN availability_mode = 'LIVE_OBSERVED' THEN 0 ELSE 1 END,
+                         COALESCE(replay_available_at, system_observed_at) DESC,
+                         created_at DESC
+                """,
+                (list(normalized), interval, session_scope.value, adjusted,
+                 context.market_time, context.observed_time),
+            )
+            rows = cursor.fetchall()
+        return {row["ticker"]: _bar_from_row(row) for row in rows}
+
     def read_behavior_grouped_daily(
         self,
         tickers: Sequence[str],

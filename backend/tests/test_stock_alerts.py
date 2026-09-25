@@ -885,7 +885,7 @@ def test_current_worker_schedule_does_not_relabel_stale_results_or_skips(monkeyp
 
 def test_alert_view_route_defaults_to_shadow_and_never_calls_capture(monkeypatch):
     from fastapi import FastAPI, HTTPException
-    from equity.stock_discovery_api import router, alert_view
+    from equity.stock_alert_api import router, alert_view
     import equity.stock_alert_views as views
     from research.stock_alerts import empty_snapshot
     monkeypatch.setattr(views, "load_alert_view", lambda source: snapshot() if source == "REPLAY" else empty_snapshot(source))
@@ -907,7 +907,7 @@ def test_alert_direction_query_parses_http_values_and_rejects_invalid_sides(monk
     import json
     from urllib.parse import urlencode
     from fastapi import FastAPI
-    from equity.stock_discovery_api import router
+    from equity.stock_alert_api import router
     import equity.stock_alert_views as views
 
     monkeypatch.setattr(views, "load_alert_view", lambda source: snapshot())

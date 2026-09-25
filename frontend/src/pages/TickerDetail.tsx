@@ -25,9 +25,9 @@ import {
   ChartDataPoint,
   FormingChartPattern,
   MultiTradeSetupResponse,
-  getTickerDiscoveryState,
-  TickerDiscoveryResponse,
 } from '../services/api'
+import { getStockContext } from '../services/stockContext'
+import { TickerEquityContext } from './EquityContextPanels'
 import { formingPatternRead } from '../utils/formingPatterns'
 
 import {
@@ -38,7 +38,6 @@ import {
   INTERVAL_NOUN,
   LABEL,
   LINE,
-  MAX_DISCOVERY_AGE_DAYS,
   MARKET_TIME_ZONE,
   MUTED,
   NEG,
@@ -273,18 +272,15 @@ function TickerDetail({ view }: { view: TickerView }) {
   const confluenceZones = multiSetup?.confluence_zones ?? []
   const analysisLabel = INTERVAL_NOUN[setupInterval] ?? PATTERN_INTERVAL_LABEL[setupInterval] ?? setupInterval
 
-  const { data: discoveryResp = null } = useQuery<TickerDiscoveryResponse | null>({
-    queryKey: ['market-discovery', symbol],
-    queryFn: () => getTickerDiscoveryState(symbol!),
+  const { data: equityContext = null, isError: equityContextError } = useQuery({
+    queryKey: ['stock-context', symbol],
+    queryFn: () => getStockContext(symbol!),
     enabled: !!symbol,
+    refetchInterval: 60_000,
   })
-  const discoveryState = discoveryResp?.state ?? null
+  const stockContext = !equityContextError && equityContext?.rows.length === 1 ? equityContext.rows[0] : null
 
   const techSide = tradeSetup ? sideOfBias(tradeSetup.direction.bias) : null
-  const discoveryAgeDays = discoveryState?.trade_date
-    ? Math.floor((Date.now() - Date.parse(`${discoveryState.trade_date}T00:00:00Z`)) / 86_400_000)
-    : null
-  const discoveryStale = discoveryAgeDays !== null && discoveryAgeDays > MAX_DISCOVERY_AGE_DAYS
   const plan = tradeSetup ? buildTradePlan(tradeSetup) : null
 
   useEffect(() => {
@@ -811,7 +807,7 @@ function TickerDetail({ view }: { view: TickerView }) {
   const priceChangePercent = latestQuote?.change_percent ?? chartPriceChangePercent
 
   const verdict = plan && tradeSetup
-    ? evaluatePlan(plan, tradeSetup, displayPrice, discoveryState, discoveryStale)
+    ? evaluatePlan(plan, tradeSetup, displayPrice, stockContext)
     : null
   const selectedStructuralPatterns = (tradeSetup?.structural_patterns ?? []).slice(0, 2)
     .map(pattern => ({ ...pattern, timeframe: setupInterval, selected: true }))
@@ -1502,6 +1498,7 @@ function TickerDetail({ view }: { view: TickerView }) {
                   </div>
 
                   <div style={{ padding: '0.9rem 0.85rem 0.5rem' }}>
+                    <TickerEquityContext context={equityContextError ? null : equityContext} />
                     <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', marginBottom: '0.5rem' }}>
                       {isLong
                         ? endCap(plan.stop, 'Stop', NEG, plan.stopLabel, 'left')

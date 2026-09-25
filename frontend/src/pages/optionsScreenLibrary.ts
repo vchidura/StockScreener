@@ -24,6 +24,7 @@ export const packageColumns: OptionsColumn[] = [
   { key: 'market_data_time', label: 'Source (ET)' }, { key: 'eligibility', label: 'Eligibility' },
 ]
 export const chainColumns: OptionsColumn[] = [
+  { key: 'market_data_time', label: 'Source (ET)', group: 'Evidence' },
   { key: 'underlying', label: 'Ticker', group: 'Contract', locked: true },
   { key: 'contract', label: 'Contract', group: 'Contract', locked: true },
   { key: 'calendar_dte', label: 'DTE', group: 'Contract', tip: 'Calendar days to expiry at the retained source time.' },
@@ -33,7 +34,6 @@ export const chainColumns: OptionsColumn[] = [
   { key: 'day_volume', label: 'Volume', group: 'Price & activity', tip: 'Contract day volume in the retained snapshot.' },
   { key: 'open_interest', label: 'OI', group: 'Price & activity', tip: 'Snapshot open interest, not intraday position changes.' },
   { key: 'local_iv', label: 'IV', group: 'Greeks & volatility', tip: 'Retained local model implied volatility, displayed as a percentage.' },
-  { key: 'market_data_time', label: 'Source (ET)', group: 'Evidence' },
   { key: 'local_delta', label: 'Delta', group: 'Greeks & volatility', hiddenByDefault: true, tip: 'Signed local model delta, not a calibrated probability.' },
   { key: 'absolute_delta', label: 'Absolute delta', group: 'Greeks & volatility', hiddenByDefault: true },
   { key: 'local_gamma', label: 'Gamma', group: 'Greeks & volatility', hiddenByDefault: true },

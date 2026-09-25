@@ -544,6 +544,96 @@ class OptionOutcomeRepository(PostgresRepository):
             for row in rows
         )
 
+    def checkpoint_legs_bulk(
+        self,
+        requests,
+        *,
+        valuation_policy_sha256: str,
+        maximum_mark_lag: timedelta = timedelta(minutes=15),
+    ) -> dict[tuple[UUID, Any], tuple[OptionOutcomeLeg, ...]]:
+        normalized = tuple(sorted({(UUID(str(candidate_id)), checkpoint_time, available_by)
+            for candidate_id, checkpoint_time, available_by in requests},
+            key=lambda row: (str(row[0]), row[1], row[2])))
+        if not normalized:
+            return {}
+        if len(normalized) > 1000 or maximum_mark_lag <= timedelta(0):
+            raise ValueError("bulk checkpoint read requires 1-1000 requests and positive mark lag")
+        if any(checkpoint.tzinfo is None or available.tzinfo is None for _, checkpoint, available in normalized):
+            raise ValueError("bulk checkpoint clocks must be timezone-aware")
+        payload = [dict(candidate_id=str(candidate_id), checkpoint_time=checkpoint.isoformat(),
+            available_by=available.isoformat()) for candidate_id, checkpoint, available in normalized]
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                WITH requests AS (
+                    SELECT * FROM jsonb_to_recordset(%s::jsonb) AS request(
+                        candidate_id uuid, checkpoint_time timestamptz, available_by timestamptz
+                    )
+                ), candidate_legs AS (
+                    SELECT request.candidate_id, request.checkpoint_time, request.available_by,
+                           leg.contract_id, leg.side, leg.ratio, leg.multiplier,
+                           leg.model_mark AS entry_mark, leg.mark_source AS entry_mark_source,
+                           leg.valuation_policy_sha256 AS entry_valuation_policy_sha256
+                    FROM requests AS request
+                    JOIN option_candidate_legs AS leg USING(candidate_id)
+                    WHERE leg.valuation_policy_sha256 = %s
+                ), complete_batches AS (
+                    SELECT leg.candidate_id, leg.checkpoint_time, leg.available_by,
+                           snapshot.batch_id,
+                           MAX(snapshot.mark_market_data_time) AS market_time,
+                           MAX(snapshot.first_observed_at) AS observed_time
+                    FROM candidate_legs AS leg
+                    JOIN option_chain_snapshots AS snapshot USING(contract_id)
+                    WHERE snapshot.model_mark IS NOT NULL
+                      AND snapshot.valuation_policy_sha256 = %s
+                      AND snapshot.mark_market_data_time >= leg.checkpoint_time
+                      AND snapshot.mark_market_data_time <= leg.checkpoint_time + %s
+                      AND snapshot.first_observed_at <= leg.available_by
+                    GROUP BY leg.candidate_id, leg.checkpoint_time, leg.available_by, snapshot.batch_id
+                    HAVING COUNT(DISTINCT snapshot.contract_id) = (
+                        SELECT COUNT(*) FROM candidate_legs AS required
+                        WHERE required.candidate_id=leg.candidate_id
+                          AND required.checkpoint_time=leg.checkpoint_time
+                          AND required.available_by=leg.available_by
+                    )
+                ), ranked_batches AS (
+                    SELECT complete.*,
+                           ROW_NUMBER() OVER (PARTITION BY candidate_id, checkpoint_time, available_by
+                               ORDER BY market_time, observed_time, batch_id) AS batch_rank
+                    FROM complete_batches AS complete
+                ), selected AS (
+                    SELECT DISTINCT ON (leg.candidate_id, leg.checkpoint_time, leg.contract_id)
+                           leg.candidate_id, leg.checkpoint_time, leg.contract_id,
+                           leg.side, leg.ratio, leg.multiplier, leg.entry_mark,
+                           snapshot.model_mark AS exit_mark, leg.entry_mark_source,
+                           snapshot.mark_source AS exit_mark_source,
+                           leg.entry_valuation_policy_sha256,
+                           snapshot.valuation_policy_sha256 AS exit_valuation_policy_sha256,
+                           snapshot.snapshot_id, snapshot.batch_id,
+                           snapshot.mark_market_data_time, snapshot.first_observed_at,
+                           snapshot.revision
+                    FROM candidate_legs AS leg
+                    JOIN ranked_batches AS batch
+                      ON batch.candidate_id=leg.candidate_id
+                     AND batch.checkpoint_time=leg.checkpoint_time
+                     AND batch.available_by=leg.available_by
+                     AND batch.batch_rank=1
+                    JOIN option_chain_snapshots AS snapshot
+                      ON snapshot.contract_id=leg.contract_id AND snapshot.batch_id=batch.batch_id
+                    WHERE snapshot.first_observed_at <= leg.available_by
+                    ORDER BY leg.candidate_id, leg.checkpoint_time, leg.contract_id,
+                             snapshot.first_observed_at DESC, snapshot.revision DESC, snapshot.snapshot_id
+                )
+                SELECT * FROM selected ORDER BY candidate_id, checkpoint_time, contract_id
+                """,
+                (Json(payload), valuation_policy_sha256, valuation_policy_sha256, maximum_mark_lag),
+            )
+            rows = cursor.fetchall()
+        grouped = {(candidate_id, checkpoint): [] for candidate_id, checkpoint, _ in normalized}
+        for row in rows:
+            grouped[(row["candidate_id"], row["checkpoint_time"])].append(_outcome_leg(row))
+        return {key: tuple(values) for key, values in grouped.items()}
+
     def current_mark_legs(
         self,
         candidate_id: UUID,
@@ -622,3 +712,96 @@ class OptionOutcomeRepository(PostgresRepository):
             )
             for row in rows
         )
+
+    def current_mark_legs_bulk(
+        self,
+        candidate_ids,
+        *,
+        available_by,
+        valuation_policy_sha256: str,
+    ) -> dict[UUID, tuple[OptionOutcomeLeg, ...]]:
+        ids = tuple(sorted({UUID(str(value)) for value in candidate_ids}, key=str))
+        if not ids:
+            return {}
+        if len(ids) > 1000 or available_by.tzinfo is None:
+            raise ValueError("bulk current marks require 1-1000 candidates and an aware cutoff")
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                WITH requests AS (
+                    SELECT UNNEST(%s::uuid[]) AS candidate_id
+                ), candidate_legs AS (
+                    SELECT leg.candidate_id, leg.contract_id, leg.side, leg.ratio,
+                           leg.multiplier, leg.model_mark AS entry_mark,
+                           leg.mark_source AS entry_mark_source,
+                           leg.valuation_policy_sha256 AS entry_valuation_policy_sha256,
+                           candidate.market_data_time AS entry_market_time
+                    FROM requests AS request
+                    JOIN option_candidate_legs AS leg USING(candidate_id)
+                    JOIN option_strategy_candidates AS candidate USING(candidate_id)
+                    WHERE leg.valuation_policy_sha256 = %s
+                ), complete_batches AS (
+                    SELECT leg.candidate_id, snapshot.batch_id,
+                           MAX(snapshot.mark_market_data_time) AS market_time,
+                           MAX(snapshot.first_observed_at) AS observed_time
+                    FROM candidate_legs AS leg
+                    JOIN option_chain_snapshots AS snapshot USING(contract_id)
+                    WHERE snapshot.model_mark IS NOT NULL
+                      AND snapshot.valuation_policy_sha256 = %s
+                      AND snapshot.first_observed_at <= %s
+                      AND snapshot.mark_market_data_time > leg.entry_market_time
+                    GROUP BY leg.candidate_id, snapshot.batch_id
+                    HAVING COUNT(DISTINCT snapshot.contract_id) = (
+                        SELECT COUNT(*) FROM candidate_legs AS required
+                        WHERE required.candidate_id=leg.candidate_id
+                    )
+                ), ranked_batches AS (
+                    SELECT complete.*,
+                           ROW_NUMBER() OVER (PARTITION BY candidate_id
+                               ORDER BY market_time DESC, observed_time DESC, batch_id DESC) AS batch_rank
+                    FROM complete_batches AS complete
+                ), selected AS (
+                    SELECT DISTINCT ON (leg.candidate_id, leg.contract_id)
+                           leg.candidate_id, leg.contract_id, leg.side, leg.ratio,
+                           leg.multiplier, leg.entry_mark, snapshot.model_mark AS exit_mark,
+                           leg.entry_mark_source, snapshot.mark_source AS exit_mark_source,
+                           leg.entry_valuation_policy_sha256,
+                           snapshot.valuation_policy_sha256 AS exit_valuation_policy_sha256,
+                           snapshot.snapshot_id, snapshot.batch_id,
+                           snapshot.mark_market_data_time, snapshot.first_observed_at,
+                           snapshot.revision
+                    FROM candidate_legs AS leg
+                    JOIN ranked_batches AS batch
+                      ON batch.candidate_id=leg.candidate_id AND batch.batch_rank=1
+                    JOIN option_chain_snapshots AS snapshot
+                      ON snapshot.contract_id=leg.contract_id AND snapshot.batch_id=batch.batch_id
+                    WHERE snapshot.first_observed_at <= %s
+                    ORDER BY leg.candidate_id, leg.contract_id,
+                             snapshot.first_observed_at DESC, snapshot.revision DESC, snapshot.snapshot_id
+                )
+                SELECT * FROM selected ORDER BY candidate_id, contract_id
+                """,
+                (list(ids), valuation_policy_sha256, valuation_policy_sha256,
+                 available_by, available_by),
+            )
+            rows = cursor.fetchall()
+        grouped = {candidate_id: [] for candidate_id in ids}
+        for row in rows:
+            grouped[row["candidate_id"]].append(_outcome_leg(row))
+        return {key: tuple(values) for key, values in grouped.items()}
+
+
+def _outcome_leg(row) -> OptionOutcomeLeg:
+    return OptionOutcomeLeg(
+        contract_id=int(row["contract_id"]),
+        side=OptionSide(row["side"]), ratio=int(row["ratio"]),
+        multiplier=int(row["multiplier"]),
+        entry_mark=Decimal(row["entry_mark"]), exit_mark=Decimal(row["exit_mark"]),
+        source_snapshot_id=row["snapshot_id"], source_batch_id=row["batch_id"],
+        source_market_time=row["mark_market_data_time"],
+        source_observed_time=row["first_observed_at"],
+        entry_mark_source=MarkSource(row["entry_mark_source"]),
+        exit_mark_source=MarkSource(row["exit_mark_source"]),
+        entry_valuation_policy_sha256=row["entry_valuation_policy_sha256"],
+        exit_valuation_policy_sha256=row["exit_valuation_policy_sha256"],
+    )
