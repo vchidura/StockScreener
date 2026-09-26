@@ -1617,7 +1617,8 @@ def option_gamma(
 
 @router.get("/alerts/datasets", response_model=OptionsEnvelope)
 def option_detector_datasets() -> OptionsEnvelope:
-    from options.repositories.alert_review_sources import OptionAlertReviewSourceRepository, configured_detector_dataset
+    from zoneinfo import ZoneInfo
+    from options.repositories.alert_review_sources import OptionAlertReviewSourceRepository, configured_detector_dataset, configured_detector_launch
 
     now = datetime.now(timezone.utc)
     try:
@@ -1626,6 +1627,14 @@ def option_detector_datasets() -> OptionsEnvelope:
         data["current_dataset_id"] = current
         data["datasets"] = sorted(set(data["datasets"]) | ({current} if current else set()))
         data["default_dataset_id"] = current or (data["datasets"][0] if len(data["datasets"]) == 1 else None)
+        launch = configured_detector_launch()
+        current_session = launch.effective_from.astimezone(ZoneInfo("America/New_York")).date().isoformat() if launch else None
+        if current and current_session:
+            data["dataset_sessions"].setdefault(current, [])
+            data["dataset_sessions"][current] = sorted(set(data["dataset_sessions"][current]) | {current_session})
+            data["sessions"] = sorted(set(data["sessions"]) | {current_session})
+            data["session_datasets"][current_session] = current
+        data["current_session_date"] = current_session
     except (OSError, ValueError, DatabaseError):
         return _envelope(available=False, reason="DETECTOR_DATASET_INDEX_UNAVAILABLE", data={})
     return _envelope(available=True, as_of=now, data=data)
@@ -1658,7 +1667,7 @@ def option_detector_schedule() -> OptionsEnvelope:
 def option_alert_evaluations(
     session_date: date | None = None,
     dataset_id: str | None = Query(default=None, min_length=1, max_length=80),
-    detector: Literal["O1", "O2", "S1", "S2"] | None = None,
+    detector: Literal["O1", "O2", "O3", "S1", "S2"] | None = None,
     selection_status: Literal["SELECTED", "NOT_SELECTED", "REPEAT", "OBSERVATION"] | None = None,
     underlyer: str | None = None,
     sort_by: Literal["triggered_at", "run", "underlyer", "detector", "category", "strategy", "rank", "entry_limit"] = "run",
@@ -1684,7 +1693,8 @@ def option_alert_evaluations(
 def option_detector_alerts(
     dataset_id: str = Query(min_length=1, max_length=80),
     scope: Literal["LATEST", "HISTORY"] = "LATEST", session_date: date | None = None,
-    detector: Literal["O1", "O2", "S1", "S2"] | None = None,
+    session_rollup: bool = False,
+    detector: Literal["O1", "O2", "O3", "S1", "S2"] | None = None,
     underlyer: str | None = None,
     sort_by: Literal["triggered_at", "run", "underlyer", "detector", "category", "strategy", "rank", "entry_limit"] = "run",
     sort_order: Literal["asc", "desc"] = "asc",
@@ -1696,10 +1706,21 @@ def option_detector_alerts(
     now = datetime.now(timezone.utc)
     try:
         configuration = _configuration()
+        source_repository = OptionAlertReviewSourceRepository()
+        history_dataset_ids = ()
+        if session_rollup:
+            if scope != "HISTORY" or session_date is None:
+                raise ValueError("detector session rollup requires one history session")
+            index = source_repository.dataset_index(as_of=now)
+            history_dataset_ids = tuple(sorted(dataset for dataset, sessions in index["dataset_sessions"].items()
+                if session_date.isoformat() in sessions))
+            if dataset_id not in history_dataset_ids:
+                history_dataset_ids = (*history_dataset_ids, dataset_id)
         data = build_detector_alert_review(dataset_id=dataset_id, as_of=now, scope=scope,
             session_date=session_date, detector=detector, limit=limit, offset=offset,
             underlyer=underlyer, sort_by=sort_by, sort_order=sort_order,
-            source_repository=OptionAlertReviewSourceRepository())
+            source_repository=source_repository, history_dataset_ids=history_dataset_ids,
+            valuation_policy=configuration.valuation_policy)
     except (ValueError, DatabaseError):
         return _envelope(available=False, reason="DETECTOR_ALERTS_UNAVAILABLE", data={})
     return _envelope(available=True, as_of=now, data=data)

@@ -162,7 +162,9 @@ class OptionStockBehaviorAssessmentRepository(PostgresRepository):
             cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             cursor.execute("SET LOCAL statement_timeout = '5s'")
             cursor.execute("""SELECT * FROM option_strategy_candidates WHERE candidate_id=ANY(%s::uuid[])
-                AND strategy_name IN ('DIRECTIONAL_LONG_PREMIUM','DIRECTIONAL_DEBIT_SPREAD')
+                AND (strategy_name IN ('DIRECTIONAL_LONG_PREMIUM','DIRECTIONAL_DEBIT_SPREAD')
+                     OR (strategy_name='SPREAD_RANGE_LOCATOR'
+                         AND structure_type IN ('PUT_CREDIT_VERTICAL','CALL_CREDIT_VERTICAL')))
                 AND policy_sha256=%s AND strategy_version=%s AND status='SELECTED'
                 AND observed_time<=%s AND created_at<=%s AND valid_until>%s
                 ORDER BY candidate_id""", (list(candidate_ids), configuration.strategy_policy_sha256,

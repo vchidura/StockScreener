@@ -196,8 +196,8 @@ export default function StockAlertsPage() {
   usePublishPageContext({ eyebrow: 'Stocks', title: 'Stock Alerts',
     status: [{ label: 'Data', value: view === 'eod' ? 'Retained selection evidence' : sourceLabel, title: source === 'REPLAY' ? `Simulated alerts, not delivered live. Prices and outcomes frozen at ${time(data?.as_of)} ET.` : data?.source_label }],
     alertSessions: view === 'eod'
-      ? { dates: eodSessions.dates, selected: eodSessions.selected, source: 'STOCK_EOD_REVIEW', emptyLabel: 'No evaluated sessions', resetKeys: ['offset'] }
-      : { dates: data?.sessions || [], selected: data?.session || '', source: requestedSource } })
+      ? { dates: eodSessions.dates, selected: eodSessions.selected, source: 'STOCK_EOD_REVIEW', emptyLabel: 'No evaluated sessions', resetKeys: ['offset'], historicalView: 'history', historicalSource: 'SHADOW' }
+      : { dates: data?.sessions || [], selected: params.get('session_date') || data?.session || '', source: requestedSource, historicalView: 'history', historicalSource: requestedSource } })
   const choosePreset = (preset: string) => {
     const wanted = new Set(presets[preset])
     for (const column of effectiveColumns) {

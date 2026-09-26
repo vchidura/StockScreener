@@ -837,7 +837,7 @@ def parse_args():
     parser.add_argument("--detector-run-id", type=UUID, help="With --detector-sources, inspect one recorded run at its original selection cutoff; never replay or rewrite it.")
     parser.add_argument("--compact", action="store_true", help="With --detector-sources, emit only the O1 confirmation, package dry-run and recorded rejection summary.")
     parser.add_argument("--technical-replay-preflight", type=date.fromisoformat, metavar="YYYY-MM-DD", help="Read-only strict-as-of technical replay gate for one session; optional new audit file only.")
-    parser.add_argument("--detector-schema", action="store_true", help="Read-only migration-053/054/055 preflight/postflight; no output file or source scan.")
+    parser.add_argument("--detector-schema", action="store_true", help="Read-only migration-053 through 057 preflight/postflight; no output file or source scan.")
     parser.add_argument("--o1-indicator-review", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
         help="Summarize retained prospective O1 shadow indicators for an inclusive period of at most 32 dates.")
     parser.add_argument("--detector-dataset-id", help="Limit an indicator review to one exact detector dataset.")
@@ -850,6 +850,8 @@ def parse_args():
     parser.add_argument("--detector-strategy-policy-file", choices=(
         "options/policies/strategy_technical_forward_v1.json",
         "options/policies/strategy_technical_forward_v2.json",
+        "options/policies/strategy_o3_credit_v1.json",
+        "options/policies/strategy_o3_credit_v2.json",
     ), help="With --review-detector-launch, validate against this immutable replacement strategy policy.")
     parser.add_argument("--publication-limit", type=int, default=12, choices=range(1, 49), metavar="1..48")
     parser.add_argument("--original-setup-ledger", type=Path, help="Compare exact retained publication keys against this SQLite ledger in query-only mode.")
@@ -981,6 +983,8 @@ def main() -> int:
         report["migration_sha256"] = hashlib.sha256((BACKEND_DIR / "migrations/053_option_detector_evaluations.sql").read_bytes()).hexdigest()
         report["o1_migration_sha256"] = hashlib.sha256((BACKEND_DIR / "migrations/054_option_o1_indicator_observations.sql").read_bytes()).hexdigest()
         report["stock_setup_migration_sha256"] = hashlib.sha256((BACKEND_DIR / "migrations/055_option_stock_setup_indicator_observations.sql").read_bytes()).hexdigest()
+        report["o3_migration_sha256"] = hashlib.sha256((BACKEND_DIR / "migrations/056_option_o3_credit_observations.sql").read_bytes()).hexdigest()
+        report["o3_admission_migration_sha256"] = hashlib.sha256((BACKEND_DIR / "migrations/057_option_o3_indicative_admission.sql").read_bytes()).hexdigest()
         print(json.dumps(report, sort_keys=True, indent=2, default=str))
         return 0
     runtime = load_option_runtime_configuration(

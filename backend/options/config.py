@@ -486,6 +486,28 @@ class ParticipationAnchorPolicy(_FrozenModel):
     source_basis: Literal["CHAIN_VOLUME_OI_REVALIDATED_BY_DATED_OI"] = "CHAIN_VOLUME_OI_REVALIDATED_BY_DATED_OI"
 
 
+class CreditPolicy(_FrozenModel):
+    version: Literal["o3_options_first_credit_v1", "o3_options_first_credit_v2"] = "o3_options_first_credit_v1"
+    minimum_entry_dte: Literal[7] = 7
+    maximum_entry_dte: Literal[30] = 30
+    minimum_leg_open_interest: Literal[500] = 500
+    minimum_leg_day_volume: Literal[50] = 50
+    minimum_exit_dte: Literal[3] = 3
+    stop_loss_multiple: Literal[2.0] = 2.0
+    take_profit_fraction: Literal[0.5] = 0.5
+    output: Literal["QUALIFIED_INDICATIVE_RESEARCH"] = "QUALIFIED_INDICATIVE_RESEARCH"
+    maximum_source_age_seconds: Literal[1800] | None = None
+    source_session_cap: Literal["SOURCE_SESSION_CLOSE"] | None = None
+    pricing_basis: Literal["ORIGINAL_COHERENT_MODEL_MARKS"] | None = None
+
+    @model_validator(mode="after")
+    def validate_source_age(self):
+        timing = (self.maximum_source_age_seconds, self.source_session_cap, self.pricing_basis)
+        if (self.version == "o3_options_first_credit_v2") != all(value is not None for value in timing):
+            raise ValueError("O3 v2 credit requires its source-age and pricing basis")
+        return self
+
+
 class StrategyPolicy(_FrozenModel):
     strategy_version: str = Field(min_length=1)
     gamma_squeeze: GammaSqueezePolicy
@@ -498,14 +520,20 @@ class StrategyPolicy(_FrozenModel):
     scenarios: ScenarioPolicy
     forward_admission: ForwardAdmissionPolicy | None = None
     participation_anchor: ParticipationAnchorPolicy | None = None
+    credit: CreditPolicy | None = None
 
     @model_validator(mode="after")
     def validate_forward_admission(self):
-        forward_versions = {"phase2_v5_technical_forward", "phase2_v6_o1_activity_anchor"}
+        forward_versions = {"phase2_v5_technical_forward", "phase2_v6_o1_activity_anchor", "phase2_v7_o3_credit", "phase2_v8_o3_credit_timing"}
         if (self.forward_admission is not None) != (self.strategy_version in forward_versions):
             raise ValueError("forward admission requires its distinct strategy version")
-        if (self.participation_anchor is not None) != (self.strategy_version == "phase2_v6_o1_activity_anchor"):
+        if (self.participation_anchor is not None) != (self.strategy_version in {"phase2_v6_o1_activity_anchor", "phase2_v7_o3_credit", "phase2_v8_o3_credit_timing"}):
             raise ValueError("participation anchoring requires its distinct strategy version")
+        credit_versions = {"phase2_v7_o3_credit": "o3_options_first_credit_v1", "phase2_v8_o3_credit_timing": "o3_options_first_credit_v2"}
+        if (self.credit is not None) != (self.strategy_version in credit_versions):
+            raise ValueError("O3 credit requires its distinct strategy version")
+        if self.credit is not None and self.credit.version != credit_versions[self.strategy_version]:
+            raise ValueError("O3 credit policy version does not match its strategy version")
         return self
 
 
@@ -740,6 +768,11 @@ def load_strategy_policy(path: Path) -> StrategyPolicyArtifact:
         canonical_payload.pop("forward_admission", None)
     if policy.participation_anchor is None:
         canonical_payload.pop("participation_anchor", None)
+    if policy.credit is None:
+        canonical_payload.pop("credit", None)
+    elif policy.credit.version == "o3_options_first_credit_v1":
+        for key in ("maximum_source_age_seconds", "source_session_cap", "pricing_basis"):
+            canonical_payload["credit"].pop(key, None)
     return StrategyPolicyArtifact(policy=policy, sha256=_sha256(canonical_payload), path=path)
 
 

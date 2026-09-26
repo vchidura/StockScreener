@@ -58,7 +58,8 @@ def isolated_schema():
                     status text,policy_sha256 char(64),completed_at timestamptz,created_at timestamptz)""").format(sql.Identifier(schema)))
                 cursor.execute(sql.SQL("""CREATE TABLE {}.option_strategy_candidates (
                     candidate_id uuid PRIMARY KEY, matrix_id uuid, candidate_identity char(64),
-                    observed_time timestamptz, valid_until timestamptz,policy_sha256 char(64),status text)""").format(sql.Identifier(schema)))
+                    observed_time timestamptz, valid_until timestamptz,policy_sha256 char(64),status text,
+                    strategy_name text,structure_type text)""").format(sql.Identifier(schema)))
                 cursor.execute(sql.SQL("""CREATE TABLE {}.option_ingestion_runs (batch_id uuid PRIMARY KEY,
                     scheduled_cycle timestamptz,configuration_sha256 char(64),policy_sha256 char(64),status text,completed_at timestamptz)""").format(sql.Identifier(schema)))
                 cursor.execute(sql.SQL("""CREATE TABLE {}.option_work_items (subject_id text,stage text,
@@ -79,6 +80,14 @@ def isolated_schema():
                 setup_indicators = setup_indicators.replace("public.", f'"{schema}".')
                 cursor.execute(setup_indicators)
                 cursor.execute(setup_indicators)
+                credit_observations = (BACKEND_DIR / "migrations" / "056_option_o3_credit_observations.sql").read_text(encoding="utf-8")
+                credit_observations = credit_observations.replace("public.", f'"{schema}".')
+                cursor.execute(credit_observations)
+                cursor.execute(credit_observations)
+                credit_admission = (BACKEND_DIR / "migrations" / "057_option_o3_indicative_admission.sql").read_text(encoding="utf-8")
+                credit_admission = credit_admission.replace("public.", f'"{schema}".')
+                cursor.execute(credit_admission)
+                cursor.execute(credit_admission)
                 for statement in (
                     "GRANT USAGE ON SCHEMA {} TO {}",
                     "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {} TO {}",
@@ -172,6 +181,29 @@ def make_o1_indicator_records():
             reason_codes=("FIXTURE_UNAVAILABLE",)),))
     records = build_o1_indicator_evidence((observation,), dataset_id="isolated-o1-shadow-" + uuid4().hex,
         selected_at=observation.decision_at)
+    return records
+
+
+def make_o3_credit_records(schema):
+    from options.analytics.alert_selection import build_o3_credit_evidence
+    from options.credit_detection import assess_o3_credit
+    from test_credit_detection import NOW, credit_fixture
+
+    candidate, decision, snapshots, invalidation = credit_fixture(1)
+    observation = assess_o3_credit(candidate, decision,
+        activity_contract_id=candidate.legs[0].contract_id, snapshots=snapshots,
+        structural_invalidation=invalidation, scheduled_cycle=NOW)
+    records = build_o3_credit_evidence((observation,), dataset_id="isolated-o3-shadow-" + uuid4().hex,
+        selected_at=decision.decision_at)
+    with closing(connection(schema=schema)) as current:
+        with current.cursor() as cursor:
+            cursor.execute("INSERT INTO option_analysis_runs (matrix_id) VALUES (%s)", (candidate.matrix_id,))
+            cursor.execute("""INSERT INTO option_strategy_candidates
+                (candidate_id,matrix_id,candidate_identity,observed_time,valid_until,strategy_name,structure_type)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)""", (candidate.candidate_id, candidate.matrix_id,
+                candidate.identity_sha256, candidate.observed_time, candidate.valid_until,
+                candidate.strategy_name, candidate.structure_type.value))
+        current.commit()
     return records
 
 
@@ -614,3 +646,20 @@ def test_postgres_rejects_expired_publish_and_payload_hash(isolated_schema):
         with current.cursor() as cursor, pytest.raises(psycopg2.Error, match="check constraint"):
             cursor.execute("INSERT INTO option_alert_plans(plan_id,candidate_id,exposure_key,plan_sha256,payload_text,decision_at,entry_deadline,exit_deadline) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (*values[:3], "0" * 64, *values[4:]))
         current.rollback()
+
+
+def test_o3_credit_observation_postgres_roundtrip_and_immutability(isolated_schema):
+    records = make_o3_credit_records(isolated_schema)
+    record = records[0]
+    repo = evaluation_repository(isolated_schema)
+    assert repo.persist_run(records) == 1
+    assert repo.persist_run(records) == 0
+    result = repo.review_inputs(as_of=datetime.now(timezone.utc), dataset_id=record.dataset_id)
+    assert result["ready"] and result["records"] == list(records)
+    with closing(connection(schema=isolated_schema)) as current:
+        for query in ("UPDATE option_o3_credit_observations SET selected_at=selected_at WHERE evaluation_id=%s",
+                      "DELETE FROM option_o3_credit_observations WHERE evaluation_id=%s"):
+            with pytest.raises(psycopg2.Error, match="immutable"):
+                with current.cursor() as cursor:
+                    cursor.execute(query, (record.evaluation_id,))
+            current.rollback()

@@ -2349,6 +2349,10 @@ export type OptionDetectorSort = 'triggered_at' | 'run' | 'underlyer' | 'detecto
 export interface OptionDetectorDatasets {
   storage_ready: boolean
   datasets: string[]
+  dataset_sessions: Record<string, string[]>
+  sessions: string[]
+  session_datasets: Record<string, string>
+  current_session_date: string | null
   current_dataset_id: string | null
   default_dataset_id: string | null
 }
@@ -2459,6 +2463,34 @@ export interface OptionStockSetupIndicatorObservation {
     metric_ids: string[]; reason_codes: string[] }>
 }
 
+export interface OptionO3CreditObservation {
+  schema_version: 'option_o3_credit_observation_v1'
+  detector_id: 'O3'
+  underlyer: string
+  direction: -1 | 1
+  candidate_rank: number
+  structure_type: 'PUT_CREDIT_VERTICAL' | 'CALL_CREDIT_VERTICAL'
+  decision_at: string
+  valid_until: string
+  disposition: 'QUALIFIED_INDICATIVE'
+  net_credit: string
+  maximum_profit: string
+  maximum_loss: string
+  breakeven: string
+  return_on_risk: string
+  structural_invalidation: string
+  pricing_basis: 'ORIGINAL_COHERENT_MODEL_MARKS'
+  legs: Array<{ leg_index: number; snapshot_id: string; contract_id: number; contract_ticker: string;
+    side: 'BUY' | 'SELL'; ratio: number; multiplier: 100; expiration_date: string; strike: string;
+    spot: string; model_mark: string; local_iv: number; local_delta: number; local_gamma: number;
+    local_theta_per_day: number; local_vega_per_vol_point: number; local_rho_per_rate_point: number;
+    day_volume: number | null; open_interest: number | null; bid: string | null; ask: string | null;
+    source_market_time: string; mark_source: string; valuation_policy_version: string;
+    valuation_policy_sha256: string }>
+}
+
+export type OptionDetectorId = 'O1' | 'O2' | 'O3' | 'S1' | 'S2'
+
 export interface OptionDetectorEvaluationReview {
   storage_ready: boolean
   dataset_id: string | null
@@ -2471,29 +2503,29 @@ export interface OptionDetectorEvaluationReview {
   outcome_status: string
   total: number
   models: Array<{
-    detector_id: 'O1' | 'O2' | 'S1' | 'S2'; evaluated: number; detected: number; selected: number;
+    detector_id: OptionDetectorId; evaluated: number; detected: number; selected: number;
     not_selected: number; repeats: number; observations: number;
     measured: number | null; positive_rate: number | null; mean_net_return: number | null; outcome_status: string;
   }>
   rows: Array<{
     evaluation_id: string; candidate_id: string | null; run_id: string; scheduled_cycle: string;
-    detector_id: 'O1' | 'O2' | 'S1' | 'S2'; origin: 'OPTIONS_FIRST' | 'STOCK_FIRST'; underlyer: string;
+    detector_id: OptionDetectorId; origin: 'OPTIONS_FIRST' | 'STOCK_FIRST'; underlyer: string;
     direction: -1 | 1 | null; category: string; strategy_name: string | null; candidate_rank: number | null;
     selection_status: 'SELECTED' | 'NOT_SELECTED' | 'REPEAT' | 'OBSERVATION'; selection_reason: string;
     plan_sha256: string | null; selected_at: string; entry_deadline: string | null; exit_deadline: string | null;
     entry_limit: string | null; outcome_status: string; net_return: number | null;
     event_horizon_status: string | null; shared_model_exposure: boolean;
-    observation?: OptionLocalSurfaceObservation | OptionO1IndicatorObservation | OptionStockSetupIndicatorObservation;
+    observation?: OptionLocalSurfaceObservation | OptionO1IndicatorObservation | OptionO3CreditObservation | OptionStockSetupIndicatorObservation;
   }>
   cells: Array<{
-    detector_id: 'O1' | 'O2' | 'S1' | 'S2'; selection_status: string; selection_reason: string;
+    detector_id: OptionDetectorId; selection_status: string; selection_reason: string;
     occurrences: number; distinct_packages: number; repeated_package_occurrences: number;
     measured: number | null; positive_rate: number | null; mean_net_return: number | null; outcome_status: string;
   }>
 }
 
 export const getOptionDetectorEvaluations = async (params: {
-  session_date?: string; dataset_id?: string; detector?: 'O1' | 'O2' | 'S1' | 'S2';
+  session_date?: string; dataset_id?: string; detector?: OptionDetectorId;
   underlyer?: string; sort_by?: OptionDetectorSort; sort_order?: 'asc' | 'desc';
   selection_status?: 'SELECTED' | 'NOT_SELECTED' | 'REPEAT' | 'OBSERVATION'; limit?: number; offset?: number;
 }): Promise<OptionsEnvelope<OptionDetectorEvaluationReview>> => (await api.get('/options/alerts/evaluations', { params })).data
@@ -2520,21 +2552,22 @@ export interface OptionDetectorAlertReview {
   rows: Array<{
     evaluation_id: string; candidate_id: string; matrix_id: string; run_id: string; scheduled_cycle: string;
     triggered_at: string | null;
-    detector_id: 'O1' | 'O2' | 'S1' | 'S2'; origin: 'OPTIONS_FIRST' | 'STOCK_FIRST'; underlyer: string;
-    direction: -1 | 1; category: string; strategy_name: string | null; candidate_rank: number; first_selected_at: string;
-    hit_count: number; repeat_count: number; last_seen_at: string; plan_sha256: string;
-    entry_limit: string; entry_deadline: string; exit_deadline: string;
+    detector_id: OptionDetectorId; origin: 'OPTIONS_FIRST' | 'STOCK_FIRST'; underlyer: string;
+    direction: -1 | 1; category: string; strategy_name: string | null; candidate_rank: number | null; first_selected_at: string;
+    hit_count: number; repeat_count: number; last_seen_at: string; plan_sha256: string | null;
+    entry_limit: string | null; entry_deadline: string | null; exit_deadline: string | null;
     management_policy: Record<string, unknown>; event_horizon_status: string | null; original_package: OptionAlertOriginalPackage;
     current_mark: OptionAlertHistoryRow['current_mark'] | null;
-    observation?: OptionLocalSurfaceObservation;
+    observation?: OptionLocalSurfaceObservation | OptionO3CreditObservation;
     outcome_status: 'NOT_BOUND_TO_PROSPECTIVE_OUTCOMES'; net_return: null; fill: null;
   }>
 }
 
 export const getOptionDetectorAlerts = async (params: {
   dataset_id: string; scope?: 'LATEST' | 'HISTORY'; session_date?: string;
+  session_rollup?: boolean;
   underlyer?: string; sort_by?: OptionDetectorSort; sort_order?: 'asc' | 'desc';
-  detector?: 'O1' | 'O2' | 'S1' | 'S2'; limit?: number; offset?: number;
+  detector?: OptionDetectorId; limit?: number; offset?: number;
 }): Promise<OptionsEnvelope<OptionDetectorAlertReview>> => (await api.get('/options/alerts/detector-runs', { params })).data
 
 export interface OptionBehaviorReview {

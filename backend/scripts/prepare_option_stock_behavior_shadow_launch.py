@@ -39,8 +39,12 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--strategy-policy-file", choices=(
         "options/policies/strategy_technical_forward_v1.json",
         "options/policies/strategy_technical_forward_v2.json",
+        "options/policies/strategy_o3_credit_v1.json",
+        "options/policies/strategy_o3_credit_v2.json",
     ), default="options/policies/strategy_technical_forward_v1.json")
     parser.add_argument("--stock-ledger", default="backups/equity-shadow/stock-ideas-forward-v2/forward.sqlite")
+    parser.add_argument("--reuse-stock-source-launch", type=Path,
+        help="Reuse exact reviewed stock source pins from an existing detector launch for an option-only runtime transition.")
     parser.add_argument("--usage-window-seconds", type=int, default=86400)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--maximum-assessments", type=int, default=1000)
@@ -58,6 +62,8 @@ def main() -> int:
     if (args.approve_stock_runtime_transition or args.effective_from is not None or args.intraday_confirmation
             or args.stock_setup_wait) and not args.technical_forward:
         raise ValueError("stock runtime transition requires a technical forward launch")
+    if args.reuse_stock_source_launch is not None and not args.technical_forward:
+        raise ValueError("stock source launch reuse requires a technical forward launch")
     if args.stock_setup_wait and not args.intraday_confirmation:
         raise ValueError("stock setup wait requires intraday confirmation")
     output = args.output.resolve()
@@ -85,10 +91,19 @@ def main() -> int:
         environment = dict(os.environ, OPTION_STRATEGY_POLICY_FILE=args.strategy_policy_file,
             OPTION_VALUATION_POLICY_FILE="options/policies/valuation_raw_spot_v2.json")
         configuration = load_option_runtime_configuration(environment, BACKEND_DIR)
+        stock_source_launch = None
+        if args.reuse_stock_source_launch is not None:
+            from options.detector_launch import decode_detector_forward_launch
+
+            source_path = args.reuse_stock_source_launch.resolve()
+            if source_path.parent != (BACKEND_DIR / "research").resolve() or not source_path.is_file():
+                raise ValueError("reused stock source launch must be an existing research manifest")
+            stock_source_launch = decode_detector_forward_launch(source_path.read_text(encoding="utf-8"))
         launch = prepare_detector_forward_launch(backend_dir=BACKEND_DIR, configuration=configuration,
             dataset_id=args.launch_id, effective_from=starts_at, stock_ledger=args.stock_ledger,
             approve_stock_runtime_transition=args.approve_stock_runtime_transition,
-            intraday_confirmation=args.intraday_confirmation, stock_setup_wait=args.stock_setup_wait)
+            intraday_confirmation=args.intraday_confirmation, stock_setup_wait=args.stock_setup_wait,
+            stock_source_launch=stock_source_launch)
         cutoff = datetime.now(timezone.utc)
         source_repository = OptionStockBehaviorAssessmentRepository()
         source_repository.detector_package_sources(configuration=configuration, candidate_ids=(), as_of=cutoff)

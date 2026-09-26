@@ -48,6 +48,32 @@ def test_stock_setup_indicator_observation_migration_is_additive_and_matches_bas
     assert "ALTER TABLE" not in sql and "DROP TABLE" not in sql
 
 
+def test_o3_credit_observation_migration_is_additive_shadow_only_and_matches_baseline():
+    sql = (MIGRATIONS_DIR / "056_option_o3_credit_observations.sql").read_text(encoding="utf-8")
+    assert sql.strip() in baseline_sql()
+    assert "option_o3_credit_observations" in sql
+    assert "CREDIT_SHADOW_ONLY" in sql
+    assert "INDICATIVE_MODEL_MARK_ONLY" in sql
+    assert "candidate.strategy_name='SPREAD_RANGE_LOCATOR'" in sql
+    assert "candidate.structure_type IN ('PUT_CREDIT_VERTICAL','CALL_CREDIT_VERTICAL')" in sql
+    assert "publication_permission'='false'::jsonb" in sql
+    assert "execution_permission'='false'::jsonb" in sql
+    assert "BEFORE UPDATE OR DELETE" in sql and "BEFORE TRUNCATE" in sql
+    assert "ALTER TABLE" not in sql and "DROP TABLE" not in sql
+
+
+def test_o3_indicative_admission_migration_promotes_empty_prospective_relation():
+    sql = (MIGRATIONS_DIR / "057_option_o3_indicative_admission.sql").read_text(encoding="utf-8")
+    assert sql.strip() in baseline_sql()
+    assert "requires an empty prospective relation" in sql
+    assert "selection_status') = 'SELECTED'" in sql
+    assert "O3_INDICATIVE_ADMISSION" in sql
+    assert "QUALIFIED_INDICATIVE" in sql
+    assert "publication_permission'='false'::jsonb" in sql
+    assert "execution_permission'='false'::jsonb" in sql
+    assert "DROP TABLE" not in sql
+
+
 def normalized_sql() -> str:
     return " ".join(baseline_sql().split())
 

@@ -1545,6 +1545,10 @@ def test_detector_package_source_queries_are_bounded_read_only(monkeypatch):
     monkeypatch.setattr(repository, "_cursor", read)
     assert repository.detector_package_sources(configuration=detector_run_inputs()["configuration"],
         candidate_ids=(), as_of=NOW) == dict(candidates=(), legs=(), references=(), raw_bars=())
+    candidate_query = next(call for call in cursor.execute.call_args_list
+        if call.args[0].strip().startswith("SELECT * FROM option_strategy_candidates"))
+    assert "strategy_name='SPREAD_RANGE_LOCATOR'" in candidate_query.args[0]
+    assert "structure_type IN ('PUT_CREDIT_VERTICAL','CALL_CREDIT_VERTICAL')" in candidate_query.args[0]
     reference_query = next(call for call in cursor.execute.call_args_list if "option_contract_catalog_versions" in call.args[0])
     assert "version.valid_from<=candidate.market_data_time" in reference_query.args[0]
     assert "version.valid_to>candidate.market_data_time" in reference_query.args[0]
@@ -1839,6 +1843,17 @@ def test_launch_preparation_requires_explicit_stock_transition_and_preserves_sou
     monkeypatch.setattr("research.stock_idea_forward.forward_config", lambda **_: dict(config, policy_version="changed"))
     with pytest.raises(ValueError, match="enrolled policy"):
         prepare_detector_forward_launch(**arguments, approve_stock_runtime_transition=True)
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE forward_checkpoint SET payload=? WHERE singleton=1", (b"x" * 4194305,))
+    with pytest.raises(ValueError, match="compressed payload exceeds bound"):
+        prepare_detector_forward_launch(**arguments)
+    reused = prepare_detector_forward_launch(**arguments, intraday_confirmation=True,
+        stock_setup_wait=True, stock_source_launch=wait_launch)
+    assert reused.acceptance_source == wait_launch.acceptance_source
+    assert reused.resumption_source == wait_launch.resumption_source
+    with pytest.raises(ValueError, match="reused detector stock source pins"):
+        prepare_detector_forward_launch(**arguments, approve_stock_runtime_transition=True,
+            stock_source_launch=wait_launch)
 
 
 @pytest.mark.parametrize("cutoff,expected", [
@@ -1926,20 +1941,25 @@ def test_forward_launch_storage_requires_shadow_observation_guards():
 
     ready = dict(registered=True, runtime_select=True, runtime_insert=True,
         o1_table_present=True, o1_registered=True, o1_runtime_select=True, o1_runtime_insert=True,
+        o3_table_present=True, o3_registered=True, o3_admission_registered=True, o3_runtime_select=True, o3_runtime_insert=True,
         stock_setup_table_present=True, stock_setup_registered=True,
         stock_setup_runtime_select=True, stock_setup_runtime_insert=True,
         unvalidated_constraints=0,
-        triggers=[{"enabled": "O"}] * 3, o1_triggers=[{"enabled": "O"}] * 3,
+        triggers=[{"enabled": "O"}] * 3, o1_triggers=[{"enabled": "O"}] * 3, o3_triggers=[{"enabled": "O"}] * 3,
         stock_setup_triggers=[{"enabled": "O"}] * 3,
         indexes=[{"valid": True, "ready": True}] * 4)
     assert _detector_storage_ready(ready)
     for field in ("o1_table_present", "o1_registered", "o1_runtime_select", "o1_runtime_insert"):
+        assert not _detector_storage_ready({**ready, field: False})
+    for field in ("o3_table_present", "o3_registered", "o3_admission_registered", "o3_runtime_select", "o3_runtime_insert"):
         assert not _detector_storage_ready({**ready, field: False})
     for field in ("stock_setup_table_present", "stock_setup_registered",
                   "stock_setup_runtime_select", "stock_setup_runtime_insert"):
         assert not _detector_storage_ready({**ready, field: False})
     assert not _detector_storage_ready({**ready, "o1_triggers": ready["o1_triggers"][:2]})
     assert not _detector_storage_ready({**ready, "o1_triggers": [{"enabled": "D"}] * 3})
+    assert not _detector_storage_ready({**ready, "o3_triggers": ready["o3_triggers"][:2]})
+    assert not _detector_storage_ready({**ready, "o3_triggers": [{"enabled": "D"}] * 3})
     assert not _detector_storage_ready({**ready, "stock_setup_triggers": ready["stock_setup_triggers"][:2]})
     assert not _detector_storage_ready({**ready, "stock_setup_triggers": [{"enabled": "D"}] * 3})
 
@@ -2100,7 +2120,7 @@ def test_eod_selection_comparison_preserves_exclusions_and_missing_outcomes():
     assert all(cell["measured"] is None and cell["positive_rate"] is None for cell in result["cells"])
     assert result["rows"][0]["net_return"] is None
     assert result["maximum_new_alerts"] == 20
-    assert [model["detector_id"] for model in result["models"]] == ["O1", "O2", "S1", "S2"]
+    assert [model["detector_id"] for model in result["models"]] == ["O1", "O2", "O3", "S1", "S2"]
     assert result["models"][0]["selected"] == 1 and result["models"][0]["not_selected"] == 1
     assert all(model["measured"] is None for model in result["models"])
 
@@ -2125,7 +2145,7 @@ def test_detector_alert_reader_counts_detected_o2_without_exposing_alert_rows():
         detector="O2", repository=repo)
     assert review["total"] == 0 and review["detected_observations"] == 1
     assert review["rows"] == []
-    assert calls == [[]]
+    assert calls == []
     assert build_detector_alert_review(dataset_id=record.dataset_id, as_of=record.selected_at,
         detector="O1", repository=repo)["total"] == 0
     empty = record.model_copy(update={"observation": observation.model_copy(update={"findings": (), "finding_disposition": "NOT_DETECTED"})})
@@ -2362,15 +2382,22 @@ def test_detector_schedule_distinguishes_windows_from_completed_runs(now, effect
 
 
 def test_current_detector_dataset_is_default_even_before_any_run(monkeypatch):
+    from types import SimpleNamespace
     from options import api
     from options.repositories import alert_review_sources
     from options.analytics import behavior_review
 
     monkeypatch.setattr(alert_review_sources, "configured_detector_dataset", lambda: "current-four-model-v1")
-    monkeypatch.setattr(alert_review_sources.OptionAlertReviewSourceRepository, "dataset_index", lambda *_, **__: dict(storage_ready=True, datasets=["old-v1"]))
+    monkeypatch.setattr(alert_review_sources, "configured_detector_launch", lambda: SimpleNamespace(
+        effective_from=datetime(2026, 9, 25, 13, 30, tzinfo=timezone.utc)))
+    monkeypatch.setattr(alert_review_sources.OptionAlertReviewSourceRepository, "dataset_index", lambda *_, **__: dict(
+        storage_ready=True, datasets=["old-v1"], dataset_sessions={"old-v1": ["2026-09-24"]},
+        sessions=["2026-09-24"], session_datasets={"2026-09-24": "old-v1"}))
     response = api.option_detector_datasets()
     assert response.data["default_dataset_id"] == "current-four-model-v1"
     assert response.data["datasets"] == ["current-four-model-v1", "old-v1"]
+    assert response.data["sessions"] == ["2026-09-24", "2026-09-25"]
+    assert response.data["session_datasets"] == {"2026-09-24": "old-v1", "2026-09-25": "current-four-model-v1"}
     calls = []
     monkeypatch.setattr(behavior_review, "build_detector_evaluation_review", lambda **kwargs: calls.append(kwargs) or {})
     api.option_alert_evaluations(dataset_id=None, limit=50, offset=0)
@@ -2433,6 +2460,22 @@ def test_detector_alert_api_requires_dataset_and_only_dispatches_reader(monkeypa
     monkeypatch.setattr(behavior_review, "build_detector_alert_review", lambda **kwargs: calls.append(kwargs) or dict(rows=[]))
     assert api.option_detector_alerts(dataset_id="fixture", limit=50, offset=0).available
     assert calls[0]["dataset_id"] == "fixture" and calls[0]["scope"] == "LATEST"
+    assert calls[0]["valuation_policy"] is not None
+
+
+def test_detector_alert_api_rolls_same_session_datasets_for_history(monkeypatch):
+    from options import api
+    from options.analytics import behavior_review
+    from options.repositories import alert_review_sources
+
+    calls = []
+    monkeypatch.setattr(behavior_review, "build_detector_alert_review", lambda **kwargs: calls.append(kwargs) or dict(rows=[]))
+    monkeypatch.setattr(alert_review_sources.OptionAlertReviewSourceRepository, "dataset_index", lambda *_, **__: dict(
+        dataset_sessions={"prior-v26": ["2026-09-25"], "other-day": ["2026-09-24"]}))
+    response = api.option_detector_alerts(dataset_id="current-v27", scope="HISTORY",
+        session_date=date(2026, 9, 25), session_rollup=True, limit=50, offset=0)
+    assert response.available
+    assert calls[0]["history_dataset_ids"] == ("prior-v26", "current-v27")
 
 
 def test_eod_evaluation_api_is_read_only_dispatch(monkeypatch):

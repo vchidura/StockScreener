@@ -9,7 +9,7 @@ import json
 from typing import Callable, Mapping
 
 from options.analytics.alert_selection import (
-    build_detector_run, build_o1_indicator_evidence, build_selection_evidence,
+    build_detector_run, build_o1_indicator_evidence, build_o3_credit_evidence, build_selection_evidence,
     build_stock_setup_indicator_evidence, build_surface_evidence,
     select_dual_origin_packages,
 )
@@ -22,6 +22,7 @@ class DetectorCycleInputs:
     matrices: tuple[Mapping, ...]
     package_inputs: tuple[Mapping, ...] = ()
     o1_observations: tuple[object, ...] = ()
+    o3_observations: tuple[object, ...] = ()
     stock_setup_observations: tuple[object, ...] = ()
     surface_inputs: tuple[Mapping, ...] = ()
     rejections: tuple[tuple[str, int], ...] = ()
@@ -201,6 +202,7 @@ class ProductionDetectorSourceReader:
                  progress_callback=None):
         from options.alert_qualification import retained_candidate
         from options.alert_plans import TechnicalExitEvidence, TechnicalLevel
+        from options.credit_detection import assess_o3_credit
         from options.dual_origin import assess_options_first, assess_stock_first, StockFirstPolicy, StockResumptionPolicy
         from options.outcome_contracts import assess_option_package
         from options.calendar import OptionExchangeCalendar
@@ -243,6 +245,10 @@ class ProductionDetectorSourceReader:
                     o1_observations.append(build_o1_indicator_observation(matched["source"], decision,
                         matched.get("intraday_stock"), scheduled_cycle=scheduled_cycle))
         technical_underlyers = set()
+        credit_policy = getattr(configuration.strategy_policy, "credit", None)
+        if credit_policy is not None:
+            technical_underlyers.update(row["snapshot"].underlyer for row in retained["activity"]
+                if row["finding"].disposition == "DETECTED")
         for leg in package_sources["legs"]:
             matched = activity.get(leg["snapshot_id"])
             if leg["side"] != "BUY" or matched is None or matched["finding"].disposition != "DETECTED":
@@ -300,6 +306,7 @@ class ProductionDetectorSourceReader:
         if technical_sources.get("source_error"):
             rejected[technical_sources["source_error"]] += 1
         packages = []
+        o3_observations = []
         stock_setup_observations = []
         if setup_shadows:
             from options.stock_setup_binding import build_stock_setup_indicator_observation
@@ -317,6 +324,47 @@ class ProductionDetectorSourceReader:
         calendar = OptionExchangeCalendar()
         for row in package_sources["candidates"]:
             candidate = retained_candidate(row, legs[row["candidate_id"]])
+            if (credit_policy is not None
+                    and candidate.structure_type.value in ("PUT_CREDIT_VERTICAL", "CALL_CREDIT_VERTICAL")):
+                package_activity = tuple(activity.get(leg.snapshot_id) for leg in candidate.legs)
+                if any(item is None or item["source"].oi_settlement_session is None for item in package_activity):
+                    rejected["O3_DATED_OI_LINEAGE_UNAVAILABLE"] += 1
+                    continue
+                triggers = [item for item in package_activity if item["finding"].disposition == "DETECTED"]
+                if not triggers:
+                    rejected["O3_ACTIVITY_TRIGGER_UNAVAILABLE"] += 1
+                    continue
+                trigger = max(triggers, key=lambda item: (item["finding"].volume_oi_ratio, -item["snapshot"].contract_id))
+                direction = 1 if candidate.structure_type.value == "PUT_CREDIT_VERTICAL" else -1
+                stock = trigger.get("intraday_stock") if self.intraday_confirmation else trigger["stock"]
+                decision = assessor(trigger["source"], stock, direction=direction,
+                    market_cutoff=max(scheduled_cycle, trigger["lineage"].market_time), decision_at=received_at)
+                if decision.disposition != "CONFIRMED":
+                    rejected["O3_STOCK_CONFIRMATION_UNAVAILABLE"] += 1
+                    continue
+                sources = sorted((source for source in technical_sources["sources"]
+                    if source["ticker"] == candidate.underlyer and source["direction"] == direction
+                    and source["market_time"] <= decision.market_cutoff), key=lambda source: source["market_time"], reverse=True)
+                if not sources:
+                    rejected["O3_STRUCTURAL_INVALIDATION_UNAVAILABLE"] += 1
+                    continue
+                try:
+                    technical = bind_structural_technical_source(sources[0], source_bars,
+                        security=trigger["security"], direction=direction, spot=candidate.legs[0].spot,
+                        received_at=received_at)
+                    first_day = min(source_bars[identity]["session_date"] for identity in sources[0]["feature_bar_ids"])
+                    key = (candidate.underlyer, first_day, sources[0]["market_time"].date())
+                    coverage, actions = coverage_cache[key]
+                    if coverage is None or actions or coverage.get("created_at", cutoff) > cutoff:
+                        raise ValueError("raw technical history split coverage unavailable or crossed")
+                    snapshots = tuple(item["snapshot"] for item in package_activity)
+                    invalidation = next(level.price for level in technical.levels if level.role == "INVALIDATION")
+                    o3_observations.append(assess_o3_credit(candidate, decision,
+                        activity_contract_id=trigger["snapshot"].contract_id, snapshots=snapshots,
+                        structural_invalidation=invalidation, scheduled_cycle=scheduled_cycle))
+                except (KeyError, StopIteration, ValueError):
+                    rejected["O3_CREDIT_QUALIFICATION_UNAVAILABLE"] += 1
+                continue
             long_leg = next((leg for leg in candidate.legs if leg.side.value == "BUY"), None)
             matched = activity.get(long_leg.snapshot_id) if long_leg else None
             if matched is None or matched["finding"].disposition != "DETECTED":
@@ -403,6 +451,7 @@ class ProductionDetectorSourceReader:
                     technical_evidence=technical, technical_source_policy_sha256=technical.source_policy_sha256))
         return DetectorCycleInputs(matrices=retained["matrices"], package_inputs=tuple(packages),
             o1_observations=tuple(o1_observations),
+            o3_observations=tuple(o3_observations),
             stock_setup_observations=tuple(stock_setup_observations),
             surface_inputs=retained["surface_inputs"], rejections=tuple(sorted(rejected.items())), reject_invalid_packages=True)
 
@@ -424,7 +473,7 @@ class DetectorCycleCollector:
             progress_callback=progress_callback)
         if not isinstance(inputs, DetectorCycleInputs):
             raise ValueError("detector source reader must return bounded cycle inputs")
-        if (len(inputs.package_inputs) + len(inputs.o1_observations) + len(inputs.stock_setup_observations)
+        if (len(inputs.package_inputs) + len(inputs.o1_observations) + len(inputs.o3_observations) + len(inputs.stock_setup_observations)
             + len(inputs.surface_inputs) > 5000
                 or len(inputs.matrices) != len(completed_matrices)
                 or {row["underlying"]: row["matrix_id"] for row in inputs.matrices} != completed_matrices):
@@ -464,6 +513,25 @@ class DetectorCycleCollector:
         repeat_o1 = len(inputs.o1_observations) - len(new_o1)
         if repeat_o1:
             rejected["O1_REPEAT_OBSERVATION"] += repeat_o1
+        prior_o3 = (self.evaluation_repository.prior_o3_observed(dataset_id=dataset_id,
+            scheduled_cycle=scheduled_cycle, as_of=selected_at)
+            if hasattr(self.evaluation_repository, "prior_o3_observed") else set())
+        eligible_o3 = tuple(row for row in inputs.o3_observations if row.recurrence_sha256 not in prior_o3)
+        repeat_o3 = len(inputs.o3_observations) - len(eligible_o3)
+        if repeat_o3:
+            rejected["O3_REPEAT"] += repeat_o3
+        lanes = set()
+        new_o3 = []
+        for row in sorted(eligible_o3, key=lambda item: (item.candidate_rank, item.underlyer, item.direction, str(item.candidate_id))):
+            lane = (row.underlyer, row.direction)
+            if lane in lanes:
+                rejected["LOWER_RANK_O3_UNDERLYING_DIRECTION"] += 1
+                continue
+            lanes.add(lane)
+            new_o3.append(row)
+        if len(new_o3) > 10:
+            rejected["O3_RUN_CAP"] += len(new_o3) - 10
+            new_o3 = new_o3[:10]
         prior_setups = (self.evaluation_repository.prior_stock_setup_observed(dataset_id=dataset_id,
             scheduled_cycle=scheduled_cycle, as_of=selected_at)
             if hasattr(self.evaluation_repository, "prior_stock_setup_observed") else set())
@@ -474,9 +542,10 @@ class DetectorCycleCollector:
             rejected["STOCK_SETUP_REPEAT_OBSERVATION"] += repeat_setups
         selection = select_dual_origin_packages(packages, prior, decision_at=selected_at,
             scheduled_cycle=scheduled_cycle, expected_underlyers=configuration.settings.underlyers,
-            completed_matrices=completed_matrices)
+            completed_matrices=completed_matrices, maximum_new_alerts=20 - len(new_o3))
         records = (*build_selection_evidence(selection, plans, dataset_id=dataset_id, selected_at=selected_at),
             *build_o1_indicator_evidence(new_o1, dataset_id=dataset_id, selected_at=selected_at),
+            *build_o3_credit_evidence(tuple(new_o3), dataset_id=dataset_id, selected_at=selected_at),
             *build_stock_setup_indicator_evidence(new_setups, dataset_id=dataset_id, selected_at=selected_at),
             *build_surface_evidence(observations, dataset_id=dataset_id, selected_at=selected_at))
         rejected.update(selection["evidence"]["rejections"])

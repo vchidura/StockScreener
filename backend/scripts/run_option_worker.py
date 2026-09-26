@@ -55,6 +55,8 @@ def _detector_storage_ready(schema):
         schema.get("registered") and schema.get("runtime_select") and schema.get("runtime_insert")
         and schema.get("o1_table_present") and schema.get("o1_registered")
         and schema.get("o1_runtime_select") and schema.get("o1_runtime_insert")
+        and schema.get("o3_table_present") and schema.get("o3_registered") and schema.get("o3_admission_registered")
+        and schema.get("o3_runtime_select") and schema.get("o3_runtime_insert")
         and schema.get("stock_setup_table_present") and schema.get("stock_setup_registered")
         and schema.get("stock_setup_runtime_select") and schema.get("stock_setup_runtime_insert")
         and schema.get("unvalidated_constraints") == 0
@@ -62,6 +64,8 @@ def _detector_storage_ready(schema):
         and all(row["enabled"] == "O" for row in schema["triggers"])
         and len(schema.get("o1_triggers", ())) == 3
         and all(row["enabled"] == "O" for row in schema["o1_triggers"])
+        and len(schema.get("o3_triggers", ())) == 3
+        and all(row["enabled"] == "O" for row in schema["o3_triggers"])
         and len(schema.get("stock_setup_triggers", ())) == 3
         and all(row["enabled"] == "O" for row in schema["stock_setup_triggers"])
         and len(schema.get("indexes", ())) == 4

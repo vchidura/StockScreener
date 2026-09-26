@@ -81,6 +81,48 @@ def test_o1_participation_anchor_policy_has_a_distinct_version():
         })
 
 
+def test_o3_credit_policy_is_distinct_and_preserves_o1_anchor():
+    from options.config import load_strategy_policy, StrategyPolicy
+
+    v1 = load_strategy_policy(BACKEND_DIR / "options/policies/strategy_o3_credit_v1.json")
+    policy = load_strategy_policy(BACKEND_DIR / "options/policies/strategy_o3_credit_v2.json")
+    assert v1.sha256 == "0850c29d76ebd29055cb9b6532f0462b06bb1c4f188c11fd0c1ace390f3b83e9"
+    assert v1.policy.strategy_version == "phase2_v7_o3_credit"
+    assert v1.policy.credit.maximum_source_age_seconds is None
+    assert policy.policy.strategy_version == "phase2_v8_o3_credit_timing"
+    assert policy.policy.participation_anchor.minimum_volume_oi_ratio == 3.0
+    assert policy.policy.credit.minimum_entry_dte == 7
+    assert policy.policy.credit.maximum_entry_dte == 30
+    assert policy.policy.credit.maximum_source_age_seconds == 1800
+    assert policy.policy.credit.source_session_cap == "SOURCE_SESSION_CLOSE"
+    assert policy.policy.credit.pricing_basis == "ORIGINAL_COHERENT_MODEL_MARKS"
+    assert policy.policy.credit.output == "QUALIFIED_INDICATIVE_RESEARCH"
+    with pytest.raises(ValueError, match="O3 credit"):
+        StrategyPolicy.model_validate({**policy.policy.model_dump(), "strategy_version": "phase2_v6_o1_activity_anchor"})
+
+
+def test_o3_credit_deadline_uses_source_time_and_session_close():
+    from types import SimpleNamespace
+    from options.config import load_strategy_policy
+
+    v1 = load_strategy_policy(BACKEND_DIR / "options/policies/strategy_o3_credit_v1.json")
+    v2 = load_strategy_policy(BACKEND_DIR / "options/policies/strategy_o3_credit_v2.json")
+    old = OptionStrategyEngine(v1.policy, v1.sha256)
+    new = OptionStrategyEngine(v2.policy, v2.sha256)
+    source_time = datetime(2026, 9, 25, 18, 30, tzinfo=UTC)
+    context = SimpleNamespace(market_data_time=source_time, observed_time=source_time + timedelta(minutes=15, seconds=22))
+    legs = (SimpleNamespace(source_market_time=source_time),)
+    assert old._candidate_deadline(context, "SPREAD_RANGE_LOCATOR", legs, StructureType.PUT_CREDIT_VERTICAL) == source_time + timedelta(minutes=15)
+    assert new._candidate_deadline(context, "SPREAD_RANGE_LOCATOR", legs, StructureType.PUT_CREDIT_VERTICAL) == source_time + timedelta(minutes=30)
+    context.observed_time += timedelta(minutes=10)
+    assert new._candidate_deadline(context, "SPREAD_RANGE_LOCATOR", legs, StructureType.CALL_CREDIT_VERTICAL) == source_time + timedelta(minutes=30)
+    assert new._candidate_deadline(context, "SPREAD_RANGE_LOCATOR", legs, StructureType.IRON_CONDOR) == source_time + timedelta(minutes=15)
+    closing_time = datetime(2026, 9, 25, 19, 50, tzinfo=UTC)
+    context.market_data_time = closing_time
+    legs = (SimpleNamespace(source_market_time=closing_time),)
+    assert new._candidate_deadline(context, "SPREAD_RANGE_LOCATOR", legs, StructureType.CALL_CREDIT_VERTICAL) == datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
+
+
 def test_discovery_catalog_covers_registered_models_without_execution_claims():
     catalog = build_discovery_catalog()
     assert catalog["version"] == "option_discovery_v1"

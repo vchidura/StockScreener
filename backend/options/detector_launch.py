@@ -22,7 +22,7 @@ LOGGER = logging.getLogger(__name__)
 RUNTIME_FILES = (
     "options/alert_plans.py", "options/alert_qualification.py", "options/analytics/alert_selection.py",
     "options/analytics/marks.py", "options/config.py", "options/data/polygon_developer.py",
-    "options/detector_collection.py", "options/detector_launch.py", "options/dual_origin.py",
+    "options/credit_detection.py", "options/detector_collection.py", "options/detector_launch.py", "options/dual_origin.py",
     "options/orchestration.py", "options/repositories/alert_evaluations.py",
     "options/repositories/stock_behavior_assessments.py", "options/stock_setup_binding.py",
     "options/strategies/engine.py", "options/surface_detection.py", "options/worker.py", "equity/stock_alert_results.py",
@@ -203,7 +203,7 @@ def _source_hashes(backend_dir, names):
 
 def prepare_detector_forward_launch(*, backend_dir, configuration, dataset_id, effective_from, stock_ledger,
                                    approve_stock_runtime_transition=False, intraday_confirmation=False,
-                                   stock_setup_wait=False):
+                                   stock_setup_wait=False, stock_source_launch=None):
     from equity.stock_alert_results import _decode_original_setup_payload
     from research.stock_alert_results import strategy_instance
     from research.stock_idea_engine import digest
@@ -215,29 +215,50 @@ def prepare_detector_forward_launch(*, backend_dir, configuration, dataset_id, e
         connection.execute("PRAGMA query_only=ON")
         connection.execute("BEGIN")
         manifest = connection.execute("SELECT policy_hash,CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_manifest WHERE singleton=1").fetchone()
-        checkpoint = connection.execute("SELECT CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_checkpoint WHERE singleton=1").fetchone()
-        latest = connection.execute("SELECT CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_publications ORDER BY window_key DESC LIMIT 1").fetchone()
-        if not manifest or not manifest[1] or not checkpoint or not latest:
+        if not manifest or not manifest[1]:
             raise ValueError("forward launch source manifest, checkpoint or publication is missing")
         config = json.loads(manifest[1])
-        state = _decode_original_setup_payload(checkpoint[0])
-        publication = _decode_original_setup_payload(latest[0])
     if digest(config) != manifest[0] or config["policy_version"] != "stock_ideas_forward_quality_v2":
         raise ValueError("forward launch stock source identity mismatch")
-    instance = strategy_instance(config, state, "intraday")
-    runtime = tuple(sorted(publication["runtime_sources"].items()))
-    current_runtime = _source_hashes(backend_dir, [name for name, _ in runtime])
-    if runtime != current_runtime:
-        if not approve_stock_runtime_transition:
-            raise ValueError("stock worker publication runtime differs from current source files; revalidation required")
-        from research.stock_idea_forward import forward_config, runtime_sources
+    if stock_source_launch is not None:
+        source = decode_detector_forward_launch(stock_source_launch.canonical_json())
+        if (approve_stock_runtime_transition or source.stock_ledger != stock_ledger
+                or source.underlyers != configuration.settings.underlyers
+                or source.acceptance_source.instance_policy_sha256 != manifest[0]
+                or source.resumption_source.instance_policy_sha256 != manifest[0]
+                or source.acceptance_source.runtime_sources != _source_hashes(backend_dir,
+                    [name for name, _ in source.acceptance_source.runtime_sources])
+                or source.resumption_source.runtime_sources != _source_hashes(backend_dir,
+                    [name for name, _ in source.resumption_source.runtime_sources])):
+            raise ValueError("reused detector stock source pins do not match the enrolled source")
+        acceptance_source = source.acceptance_source
+        resumption_source = source.resumption_source
+    else:
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)) as connection:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            checkpoint = connection.execute("SELECT CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_checkpoint WHERE singleton=1").fetchone()
+            latest = connection.execute("SELECT CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_publications ORDER BY window_key DESC LIMIT 1").fetchone()
+            if not checkpoint or not latest:
+                raise ValueError("forward launch source manifest, checkpoint or publication is missing")
+            state = _decode_original_setup_payload(checkpoint[0])
+            publication = _decode_original_setup_payload(latest[0])
+        instance = strategy_instance(config, state, "intraday")
+        runtime = tuple(sorted(publication["runtime_sources"].items()))
+        current_runtime = _source_hashes(backend_dir, [name for name, _ in runtime])
+        if runtime != current_runtime:
+            if not approve_stock_runtime_transition:
+                raise ValueError("stock worker publication runtime differs from current source files; revalidation required")
+            from research.stock_idea_forward import forward_config, runtime_sources
 
-        if (set(publication["runtime_sources"]) != set(runtime_sources())
-                or digest(forward_config(quality_version=2)) != manifest[0]):
-            raise ValueError("reviewed stock runtime transition cannot change source scope or enrolled policy")
-        runtime = current_runtime
-    common = dict(instance_id=instance["instance_id"], instance_policy_sha256=manifest[0],
-        publication_policy_sha256=publication["policy_hash"], runtime_sources=runtime)
+            if (set(publication["runtime_sources"]) != set(runtime_sources())
+                    or digest(forward_config(quality_version=2)) != manifest[0]):
+                raise ValueError("reviewed stock runtime transition cannot change source scope or enrolled policy")
+            runtime = current_runtime
+        common = dict(instance_id=instance["instance_id"], instance_policy_sha256=manifest[0],
+            publication_policy_sha256=publication["policy_hash"], runtime_sources=runtime)
+        acceptance_source = DirectSetupSourcePolicy(**common)
+        resumption_source = DirectResumptionSourcePolicy(**common)
     from options.intraday_participation import INTRADAY_ALIGNMENT_POLICY
 
     launch_type = (OptimizedStockSetupReadyDetectorForwardLaunch if stock_setup_wait else
@@ -247,8 +268,8 @@ def prepare_detector_forward_launch(*, backend_dir, configuration, dataset_id, e
     launch = launch_type(dataset_id=dataset_id, effective_from=effective_from,
         underlyers=configuration.settings.underlyers, configuration_sha256=configuration.configuration_sha256,
         strategy_policy_sha256=configuration.strategy_policy_sha256, valuation_policy_sha256=configuration.valuation_policy_sha256,
-        stock_ledger=stock_ledger, acceptance_source=DirectSetupSourcePolicy(**common),
-        resumption_source=DirectResumptionSourcePolicy(**common), runtime_sources=_source_hashes(backend_dir, launch_type.runtime_files),
+        stock_ledger=stock_ledger, acceptance_source=acceptance_source,
+        resumption_source=resumption_source, runtime_sources=_source_hashes(backend_dir, launch_type.runtime_files),
         **(dict(o1_confirmation_policy_sha256=INTRADAY_ALIGNMENT_POLICY.sha256) if intraday_confirmation else {}))
     validate_detector_forward_launch(launch, configuration=configuration, backend_dir=backend_dir)
     return launch

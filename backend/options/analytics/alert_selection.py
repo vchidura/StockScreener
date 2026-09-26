@@ -11,6 +11,7 @@ from pydantic import AwareDatetime, Field, model_validator
 
 from equity.behavior import Contract, Name, Sha256
 from options.intraday_participation import O1IndicatorObservation
+from options.credit_detection import O3CreditObservation
 from options.stock_setup_binding import StockSetupIndicatorObservation
 from options.dual_origin import QualifiedDualOriginPackage, QualifiedResumptionPackage, QualifiedTechnicalPackage, load_qualified_package
 from options.surface_detection import SurfaceDecision
@@ -224,7 +225,8 @@ DUAL_ORIGIN_SELECTOR_POLICY = {
 DUAL_ORIGIN_SELECTOR_SHA256 = hashlib.sha256(canonical_json(DUAL_ORIGIN_SELECTOR_POLICY).encode("ascii")).hexdigest()
 
 
-def select_dual_origin_packages(packages, prior_alerts, *, decision_at, scheduled_cycle, expected_underlyers, completed_matrices):
+def select_dual_origin_packages(packages, prior_alerts, *, decision_at, scheduled_cycle, expected_underlyers, completed_matrices,
+                                maximum_new_alerts=DUAL_ORIGIN_SELECTOR_POLICY["maximum_new_alerts"]):
     from options.dual_origin import QualifiedDualOriginPackage
 
     decision_at = _time(decision_at)
@@ -232,6 +234,7 @@ def select_dual_origin_packages(packages, prior_alerts, *, decision_at, schedule
     expected, completed = tuple(expected_underlyers), tuple(completed_matrices)
     if (not 1 <= len(expected) <= 13 or len(expected) != len(set(expected))
             or len(set(completed_matrices.values())) != len(completed_matrices) or scheduled_cycle > decision_at
+            or type(maximum_new_alerts) is not int or not 0 <= maximum_new_alerts <= DUAL_ORIGIN_SELECTOR_POLICY["maximum_new_alerts"]
             or len(packages) > DUAL_ORIGIN_SELECTOR_POLICY["maximum_inputs"]
             or len(prior_alerts) > DUAL_ORIGIN_SELECTOR_POLICY["maximum_prior_alerts"]):
         raise ValueError("dual-origin selection requires distinct universe and bounded inputs")
@@ -295,9 +298,9 @@ def select_dual_origin_packages(packages, prior_alerts, *, decision_at, schedule
         lanes.add(lane)
         queues[model].append(row)
     members = []
-    while any(queues.values()) and len(members) < DUAL_ORIGIN_SELECTOR_POLICY["maximum_new_alerts"]:
+    while any(queues.values()) and len(members) < maximum_new_alerts:
         for model in sorted(queues):
-            if queues[model] and len(members) < DUAL_ORIGIN_SELECTOR_POLICY["maximum_new_alerts"]:
+            if queues[model] and len(members) < maximum_new_alerts:
                 member = queues[model].popleft()
                 members.append(member)
                 evaluation_rows.append(dict(package=member, selection_status="SELECTED",
@@ -551,6 +554,62 @@ def build_o1_indicator_evidence(observations, *, dataset_id, selected_at):
     return records
 
 
+class O3CreditEvaluationEvidence(Contract):
+    schema_version: Literal["option_o3_credit_evaluation_evidence_v1"] = "option_o3_credit_evaluation_evidence_v1"
+    dataset_id: Name
+    run_id: UUID
+    selector_sha256: Sha256 = DUAL_ORIGIN_SELECTOR_SHA256
+    selected_at: AwareDatetime
+    observation: O3CreditObservation
+    recurrence_sha256: Sha256
+    selection_status: Literal["SELECTED"] = "SELECTED"
+    selection_reason: Literal["O3_INDICATIVE_ADMISSION"] = "O3_INDICATIVE_ADMISSION"
+    evidence_mode: Literal["PROSPECTIVE_RECEIPT"] = "PROSPECTIVE_RECEIPT"
+    publication_permission: Literal[False] = False
+
+    @property
+    def scheduled_cycle(self):
+        return self.observation.scheduled_cycle
+
+    @property
+    def detector_id(self):
+        return "O3"
+
+    @property
+    def candidate_id(self):
+        return self.observation.candidate_id
+
+    @property
+    def matrix_id(self):
+        return self.observation.matrix_id
+
+    @property
+    def evaluation_id(self):
+        return uuid5(NAMESPACE_URL, f"option-detector-evaluation:{self.run_id}:O3:{self.recurrence_sha256}")
+
+    @model_validator(mode="after")
+    def validate_evidence(self):
+        expected = uuid5(NAMESPACE_URL, f"option-detector-evaluation-run:{self.dataset_id}:{self.scheduled_cycle.isoformat()}")
+        if (self.run_id != expected or self.selector_sha256 != DUAL_ORIGIN_SELECTOR_SHA256
+                or self.recurrence_sha256 != self.observation.recurrence_sha256
+                or self.observation.decision_at > self.selected_at
+                or len(self.canonical_json().encode("ascii")) > 65536):
+            raise ValueError("O3 credit evaluation identity, clock or payload bound mismatch")
+        return self
+
+
+def build_o3_credit_evidence(observations, *, dataset_id, selected_at):
+    if len(observations) > 5000:
+        raise ValueError("O3 credit evaluation exceeds input bound")
+    records = tuple(O3CreditEvaluationEvidence(dataset_id=dataset_id, selected_at=selected_at,
+        run_id=uuid5(NAMESPACE_URL, f"option-detector-evaluation-run:{dataset_id}:{row.scheduled_cycle.isoformat()}"),
+        recurrence_sha256=row.recurrence_sha256,
+        observation=O3CreditObservation.model_validate_json(row.canonical_json())) for row in observations)
+    if len({row.evaluation_id for row in records}) != len(records):
+        raise ValueError("O3 credit candidate must be evaluated once per run")
+    return records
+
+
 class StockSetupIndicatorEvaluationEvidence(Contract):
     schema_version: Literal["option_stock_setup_indicator_evaluation_evidence_v1"] = "option_stock_setup_indicator_evaluation_evidence_v1"
     dataset_id: Name
@@ -614,6 +673,7 @@ def load_evaluation_evidence(payload_text):
     payload = json.loads(payload_text)
     contracts = {"option_detector_selection_evidence_v1": DetectorSelectionEvidence,
         "option_o1_indicator_evaluation_evidence_v1": O1IndicatorEvaluationEvidence,
+        "option_o3_credit_evaluation_evidence_v1": O3CreditEvaluationEvidence,
         "option_stock_setup_indicator_evaluation_evidence_v1": StockSetupIndicatorEvaluationEvidence,
         "option_surface_evaluation_evidence_v1": SurfaceEvaluationEvidence}
     contract = contracts.get(payload.get("schema_version"))
@@ -714,7 +774,7 @@ def build_detector_run(*, configuration, dataset_id, scheduled_cycle, selected_a
     source_map = dict(run.source_matrices)
     for record in records:
         symbol = record.observation.underlyer if isinstance(record, (
-            O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
+            O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
         )) else record.package.underlyer
         if (record.dataset_id != run.dataset_id or record.run_id != run.run_id
                 or record.selected_at != run.selected_at or record.selector_sha256 != run.selector_sha256

@@ -154,7 +154,7 @@ export function detectorViewPreset(name: string, params: URLSearchParams, column
     if (value) query[key] = value
   }
   if (query.underlyer && !/^[A-Z][A-Z0-9.]{0,14}$/.test(query.underlyer)) throw new Error('Invalid underlying')
-  if (query.evaluation_detector && !['O1', 'O2', 'S1', 'S2'].includes(query.evaluation_detector)) throw new Error('Invalid detector model')
+  if (query.evaluation_detector && !['O1', 'O2', 'O3', 'S1', 'S2'].includes(query.evaluation_detector)) throw new Error('Invalid detector model')
   if (query.detector_sort && !detectorSortKeys.some(key => key === query.detector_sort)) throw new Error('Invalid sort')
   if (query.detector_order && !['asc', 'desc'].includes(query.detector_order)) throw new Error('Invalid sort direction')
   return { name: trimmed, query, columns: [...new Set([...detectorAlertColumns.filter(column => column.locked).map(column => column.key), ...columns])] }
@@ -544,4 +544,12 @@ export function optionLegMarketValues(leg: Partial<OptionCandidateLeg>): Record<
     volume_oi: volume != null && volume >= 0 && interest != null && interest > 0 ? `${numeric(volume / interest, 2)}x` : 'Unavailable',
     mark_time: optionAlertTime(leg.source_market_time), mark_source: leg.mark_source ? optionAlertLabel(leg.mark_source) : 'Unavailable',
   }
+}
+
+export function optionContractExpired(expirationDate: string | null | undefined, asOf: string | null | undefined): boolean {
+  if (!expirationDate || !asOf || !/^\d{4}-\d{2}-\d{2}$/.test(expirationDate)) return false
+  const currentSession = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date(asOf))
+  return expirationDate < currentSession
 }

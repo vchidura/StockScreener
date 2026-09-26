@@ -1265,10 +1265,17 @@ class OptionStrategyEngine:
             iv_context_id=None,
             market_data_time=context.market_data_time,
             observed_time=context.observed_time,
-            valid_until=self._candidate_deadline(context, registration.strategy_name, legs),
+            valid_until=self._candidate_deadline(context, registration.strategy_name, legs, structure_type),
         )
 
-    def _candidate_deadline(self, context, strategy_name, legs):
+    def _candidate_deadline(self, context, strategy_name, legs, structure_type=None):
+        credit = self.policy.credit
+        if (strategy_name == "SPREAD_RANGE_LOCATOR"
+                and structure_type in {StructureType.PUT_CREDIT_VERTICAL, StructureType.CALL_CREDIT_VERTICAL}
+                and credit is not None and credit.maximum_source_age_seconds is not None):
+            source_time = min(context.market_data_time, *(leg.source_market_time for leg in legs))
+            session = source_time.astimezone(ZoneInfo("America/New_York")).date()
+            return min(source_time + timedelta(seconds=credit.maximum_source_age_seconds), self.admission_calendar.session_close(session))
         admission = self.policy.forward_admission
         if admission is None or strategy_name not in {"DIRECTIONAL_LONG_PREMIUM", "DIRECTIONAL_DEBIT_SPREAD"}:
             return context.market_data_time + timedelta(seconds=900)

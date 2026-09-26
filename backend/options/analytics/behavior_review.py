@@ -279,9 +279,11 @@ def _detector_run_summary(run):
 def _detector_strategy(record):
     import json
     from options.analytics.alert_selection import (
-        O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
+        O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
     )
 
+    if isinstance(record, O3CreditEvaluationEvidence):
+        return "SPREAD_RANGE_LOCATOR"
     if isinstance(record, (O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence)):
         return None
     return json.loads(record.plan_payload_text).get("management_policy", {}).get("strategy_name")
@@ -290,12 +292,12 @@ def _detector_strategy(record):
 def _detector_triggered_at(record):
     import json
     from options.analytics.alert_selection import (
-        O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
+        O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
     )
 
     if isinstance(record, StockSetupIndicatorEvaluationEvidence):
         return record.observation.setup_source.candidate.trigger_at
-    if isinstance(record, (O1IndicatorEvaluationEvidence, SurfaceEvaluationEvidence)):
+    if isinstance(record, (O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, SurfaceEvaluationEvidence)):
         return None
     plan = json.loads(record.plan_payload_text)
     if record.detector_id == "O1":
@@ -316,19 +318,19 @@ def _sort_detector_records(records, sort_by, sort_order):
     import json
     from decimal import Decimal
     from options.analytics.alert_selection import (
-        O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
+        O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
     )
 
     if sort_by not in {"triggered_at", "run", "underlyer", "detector", "category", "strategy", "rank", "entry_limit"} or sort_order not in {"asc", "desc"}:
         raise ValueError("invalid detector sort")
     def value(record):
-        observation = isinstance(record, (O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence))
+        observation = isinstance(record, (O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence))
         source = record.observation if observation else record.package
         if sort_by == "triggered_at": return _detector_triggered_at(record)
         if sort_by == "run": return record.scheduled_cycle
         if sort_by == "underlyer": return source.underlyer
         if sort_by == "detector": return record.detector_id
-        if sort_by == "category": return ("NEUTRAL_VOL" if record.detector_id == "O2" else "MOMENTUM") if observation else source.primary_category
+        if sort_by == "category": return ("NEUTRAL_VOL" if record.detector_id == "O2" else "DEFINED_RISK_INCOME" if record.detector_id == "O3" else "MOMENTUM") if observation else source.primary_category
         if sort_by == "strategy": return _detector_strategy(record)
         if sort_by == "rank": return None if observation else source.candidate_rank
         return None if observation else Decimal(json.loads(record.plan_payload_text)["entry_limit"])
@@ -346,10 +348,10 @@ def build_detector_evaluation_review(*, as_of, session_date=None, dataset_id=Non
     from options.repositories.alert_evaluations import OptionAlertEvaluationRepository
 
     from options.analytics.alert_selection import (
-        O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
+        O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
     )
 
-    if not 1 <= limit <= 200 or offset < 0 or detector not in (None, "O1", "O2", "S1", "S2") or selection_status not in (None, "SELECTED", "NOT_SELECTED", "REPEAT", "OBSERVATION"):
+    if not 1 <= limit <= 200 or offset < 0 or detector not in (None, "O1", "O2", "O3", "S1", "S2") or selection_status not in (None, "SELECTED", "NOT_SELECTED", "REPEAT", "OBSERVATION"):
         raise ValueError("invalid detector evaluation review filters")
     inputs = (repository or OptionAlertEvaluationRepository()).review_inputs(
         as_of=as_of, session_date=session_date, dataset_id=dataset_id)
@@ -362,7 +364,7 @@ def build_detector_evaluation_review(*, as_of, session_date=None, dataset_id=Non
         if detector is not None and record.detector_id != detector:
             continue
         observation_record = isinstance(record, (
-            O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
+            O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
         ))
         symbol = record.observation.underlyer if observation_record else record.package.underlyer
         if underlyer and symbol != underlyer.strip().upper():
@@ -385,6 +387,18 @@ def build_detector_evaluation_review(*, as_of, session_date=None, dataset_id=Non
                 selection_reason="INDICATOR_SHADOW_ONLY", plan_sha256=None,
                 selected_at=record.selected_at.isoformat(), entry_deadline=None, exit_deadline=None,
                 entry_limit=None, outcome_status="NOT_YET_MEASURED_SHADOW", net_return=None,
+                shared_model_exposure=False, event_horizon_status=None,
+                observation=observation.model_dump(mode="json")))
+            continue
+        if isinstance(record, O3CreditEvaluationEvidence):
+            observation = record.observation
+            rows.append(dict(evaluation_id=str(record.evaluation_id), candidate_id=str(record.candidate_id), run_id=str(record.run_id),
+                scheduled_cycle=record.scheduled_cycle.isoformat(), detector_id="O3", origin="OPTIONS_FIRST",
+                underlyer=observation.underlyer, direction=observation.direction, category="DEFINED_RISK_INCOME",
+                strategy_name="SPREAD_RANGE_LOCATOR", candidate_rank=observation.candidate_rank, selection_status="SELECTED",
+                selection_reason="O3_INDICATIVE_ADMISSION", plan_sha256=None,
+                selected_at=record.selected_at.isoformat(), entry_deadline=None, exit_deadline=None,
+                entry_limit=None, outcome_status="NOT_BOUND_TO_PROSPECTIVE_OUTCOMES", net_return=None,
                 shared_model_exposure=False, event_horizon_status=None,
                 observation=observation.model_dump(mode="json")))
             continue
@@ -439,7 +453,7 @@ def build_detector_evaluation_review(*, as_of, session_date=None, dataset_id=Non
                     O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence)) for row in values)
                 else "NOT_BOUND_TO_PROSPECTIVE_OUTCOMES"))
     models = []
-    for model in ("O1", "O2", "S1", "S2"):
+    for model in ("O1", "O2", "O3", "S1", "S2"):
         model_records = [record for record in scoped if record.detector_id == model]
         models.append(dict(detector_id=model, evaluated=len(model_records),
             detected=sum(record.observation.finding_disposition == "DETECTED" if isinstance(record, SurfaceEvaluationEvidence)
@@ -466,30 +480,40 @@ def build_detector_evaluation_review(*, as_of, session_date=None, dataset_id=Non
 def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_date=None,
                                detector=None, limit=50, offset=0, repository=None,
                                underlyer=None, sort_by="run", sort_order="asc", source_repository=None,
-                               mark_repository=None, valuation_policy=None):
+                               mark_repository=None, valuation_policy=None, history_dataset_ids=()):
     import json
     from psycopg2 import Error as DatabaseError
     from zoneinfo import ZoneInfo
     from options.repositories.alert_evaluations import OptionAlertEvaluationRepository
     from options.analytics.alert_selection import (
-        O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
+        O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
     )
 
+    history_dataset_ids = tuple(dict.fromkeys(history_dataset_ids or ()))
     if (not dataset_id or len(dataset_id) > 80 or as_of.utcoffset() is None
-            or scope not in ("LATEST", "HISTORY") or detector not in (None, "O1", "O2", "S1", "S2")
-            or not 1 <= limit <= 200 or offset < 0):
+            or scope not in ("LATEST", "HISTORY") or detector not in (None, "O1", "O2", "O3", "S1", "S2")
+            or not 1 <= limit <= 200 or offset < 0 or len(history_dataset_ids) > 20
+            or any(not value or len(value) > 80 for value in history_dataset_ids)):
         raise ValueError("invalid detector alert scope")
     reader = repository or OptionAlertEvaluationRepository()
     _sort_detector_records((), sort_by, sort_order)
-    runs = reader.completed_runs(dataset_id=dataset_id, as_of=as_of)
+    dataset_ids = history_dataset_ids if scope == "HISTORY" and history_dataset_ids else (dataset_id,)
+    runs_by_cycle = {}
+    for source_dataset_id in dataset_ids:
+        for run in reader.completed_runs(dataset_id=source_dataset_id, as_of=as_of):
+            existing = runs_by_cycle.get(run.scheduled_cycle)
+            if existing is None or (run.selected_at, run.dataset_id) > (existing.selected_at, existing.dataset_id):
+                runs_by_cycle[run.scheduled_cycle] = run
+    runs = tuple(sorted(runs_by_cycle.values(), key=lambda run: run.scheduled_cycle))
     sessions = sorted({run.scheduled_cycle.astimezone(ZoneInfo("America/New_York")).date().isoformat() for run in runs})
-    candidates = tuple(run for run in runs if scope != "LATEST" or session_date is None
+    candidates = tuple(run for run in runs if session_date is None
         or run.scheduled_cycle.astimezone(ZoneInfo("America/New_York")).date() == session_date)
     latest = max(candidates, key=lambda run: run.scheduled_cycle) if candidates else None
     latest_date = latest.scheduled_cycle.astimezone(ZoneInfo("America/New_York")).date() if latest else None
     selected_date = session_date or latest_date
     if latest is None:
         return dict(version="option_detector_alert_review_v2", dataset_id=dataset_id, scope=scope,
+            dataset_ids=list(dataset_ids),
             status="NO_COMPLETE_RUN", as_of=as_of.isoformat(), latest_run_id=None, run=None, runs=[], latest_run=None,
             session_date=selected_date.isoformat() if selected_date else None,
             sessions=sessions, rows=[], total=0, new_alerts=0, repeat_hits=0, maximum_new_alerts=20,
@@ -500,13 +524,16 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
             raise ValueError("latest completed detector run cannot be reconciled")
         active_runs, records = (latest,), completed[1]
     else:
-        inputs = reader.review_inputs(dataset_id=dataset_id, session_date=selected_date, as_of=as_of)
-        active_runs = tuple(run for run in inputs.get("runs", ()) if run.run_id != latest.run_id)
+        active_runs = tuple(run for run in candidates if run.run_id != latest.run_id)
         active_ids = {run.run_id for run in active_runs}
-        records = tuple(row for row in inputs["records"] if row.run_id in active_ids)
-    observation_types = (O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence)
+        records = []
+        for source_dataset_id in dataset_ids:
+            inputs = reader.review_inputs(dataset_id=source_dataset_id, session_date=selected_date, as_of=as_of)
+            records.extend(row for row in inputs["records"] if row.run_id in active_ids)
+        records = tuple(records)
+    observation_types = (O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence)
     visible = tuple(row for row in records if (row.selection_status == "SELECTED"
-        or isinstance(row, (O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence))
+        or isinstance(row, (O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, StockSetupIndicatorEvaluationEvidence))
         or isinstance(row, SurfaceEvaluationEvidence) and row.observation.finding_disposition == "DETECTED")
         and (detector is None or row.detector_id == detector)
         and (not underlyer or (row.observation.underlyer if isinstance(row, observation_types)
@@ -516,9 +543,17 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
         (row for row in visible if not isinstance(row, observation_types)), sort_by, sort_order)
     if scope == "LATEST" and len(selected) > 20:
         raise ValueError("latest detector run exceeds maximum new alerts")
-    page = selected[offset:offset + limit]
-    hits = reader.repeat_counts(dataset_id=dataset_id, records=page, as_of=as_of)
-    originals = source_repository.original_packages(page, as_of=as_of) if source_repository is not None else {}
+    displayed = _sort_detector_records((*selected, *(row for row in observations if isinstance(row, O3CreditEvaluationEvidence))), sort_by, sort_order)
+    page = displayed[offset:offset + limit]
+    package_page = tuple(row for row in page if not isinstance(row, O3CreditEvaluationEvidence))
+    hits = {}
+    if package_page:
+        records_by_dataset = defaultdict(list)
+        for record in package_page:
+            records_by_dataset[record.dataset_id].append(record)
+        for source_dataset_id, source_records in records_by_dataset.items():
+            hits.update(reader.repeat_counts(dataset_id=source_dataset_id, records=tuple(source_records), as_of=as_of))
+    originals = source_repository.original_packages(package_page, as_of=as_of) if source_repository is not None and package_page else {}
     marks, mark_reason = {}, None
     if scope == "HISTORY" and page and valuation_policy is not None:
         from options.repositories.outcomes import OptionOutcomeRepository
@@ -534,6 +569,60 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
             mark_reason = "CURRENT_MARK_READ_UNAVAILABLE"
     rows = []
     for record in page:
+        if isinstance(record, O3CreditEvaluationEvidence):
+            from options.credit_detection import O3_CREDIT_POLICY
+
+            observation = record.observation
+            contract_type = "PUT" if observation.structure_type == "PUT_CREDIT_VERTICAL" else "CALL"
+            expiration = observation.legs[0].expiration_date
+            original = dict(status="AVAILABLE", basis="ORIGINAL_CANDIDATE_SNAPSHOTS",
+                structure_type=observation.structure_type, expiration_date=expiration.isoformat(),
+                calendar_dte=(expiration - observation.decision_at.date()).days,
+                market_data_time=max(leg.source_market_time for leg in observation.legs).isoformat(),
+                observed_time=observation.decision_at.isoformat(), net_premium=str(observation.net_credit),
+                capital_at_risk=str(observation.maximum_loss), maximum_loss=str(observation.maximum_loss),
+                maximum_profit=str(observation.maximum_profit), breakevens=[str(observation.breakeven)],
+                legs=[dict(leg_index=leg.leg_index, snapshot_id=str(leg.snapshot_id), contract_id=leg.contract_id,
+                    contract_ticker=leg.contract_ticker, side=leg.side, ratio=leg.ratio, multiplier=leg.multiplier,
+                    expiration_date=leg.expiration_date.isoformat(), strike=str(leg.strike), contract_type=contract_type,
+                    model_mark=str(leg.model_mark), local_iv=leg.local_iv, local_delta=leg.local_delta,
+                    local_gamma=leg.local_gamma, local_theta_per_day=leg.local_theta_per_day,
+                    local_vega_per_vol_point=leg.local_vega_per_vol_point,
+                    local_rho_per_rate_point=leg.local_rho_per_rate_point, spot=str(leg.spot),
+                    day_volume=leg.day_volume, open_interest=leg.open_interest,
+                    source_market_time=leg.source_market_time.isoformat(), mark_source=leg.mark_source,
+                    valuation_policy_version=leg.valuation_policy_version,
+                    valuation_policy_sha256=leg.valuation_policy_sha256,
+                    quality_flags=[], quote_bid=str(leg.bid) if leg.bid is not None else None,
+                    quote_ask=str(leg.ask) if leg.ask is not None else None,
+                    quote_midpoint=None, quote_spread_midpoint=None) for leg in observation.legs])
+            current_mark = None
+            if scope == "HISTORY" and valuation_policy is not None:
+                from options.outcomes import review_retained_candidate_mark
+
+                current_mark = review_retained_candidate_mark(dict(candidate_id=record.candidate_id,
+                    candidate_identity=observation.candidate_identity_sha256, matrix_id=record.matrix_id,
+                    market_data_time=original["market_data_time"], net_premium=original["net_premium"],
+                    capital_at_risk=original["capital_at_risk"], legs=original["legs"]),
+                    marks.get(str(record.candidate_id)), checked_at=as_of, policy=valuation_policy)
+                if mark_reason:
+                    current_mark["reason"] = mark_reason
+            rows.append(dict(evaluation_id=str(record.evaluation_id), candidate_id=str(record.candidate_id),
+                matrix_id=str(record.matrix_id), run_id=str(record.run_id), scheduled_cycle=record.scheduled_cycle.isoformat(),
+                triggered_at=observation.decision_at.isoformat(), detector_id="O3", origin="OPTIONS_FIRST",
+                underlyer=observation.underlyer, direction=observation.direction, category="DEFINED_RISK_INCOME",
+                strategy_name="SPREAD_RANGE_LOCATOR", candidate_rank=observation.candidate_rank,
+                first_selected_at=record.selected_at.isoformat(), hit_count=1, repeat_count=0,
+                last_seen_at=record.selected_at.isoformat(), plan_sha256=None,
+                entry_limit=str(observation.net_credit), entry_deadline=observation.valid_until.isoformat(),
+                exit_deadline=None, management_policy=dict(policy_version=O3_CREDIT_POLICY["version"],
+                    strategy_name="SPREAD_RANGE_LOCATOR", basis="ENTRY_CREDIT",
+                    stop_loss_multiple=O3_CREDIT_POLICY["stop_loss_multiple"],
+                    take_profit_fraction=O3_CREDIT_POLICY["take_profit_fraction"],
+                    exit_dte=O3_CREDIT_POLICY["minimum_exit_dte"]), event_horizon_status=None,
+                original_package=original, current_mark=current_mark, observation=observation.model_dump(mode="json"),
+                outcome_status="NOT_BOUND_TO_PROSPECTIVE_OUTCOMES", net_return=None, fill=None))
+            continue
         package = record.package
         plan = json.loads(record.plan_payload_text)
         repeat = hits[record.evaluation_id]
@@ -569,11 +658,12 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
             original_package=original, current_mark=current_mark,
             outcome_status="NOT_BOUND_TO_PROSPECTIVE_OUTCOMES", net_return=None, fill=None))
     return dict(version="option_detector_alert_review_v2", dataset_id=dataset_id, scope=scope,
+        dataset_ids=list(dataset_ids),
         status="COMPLETE", as_of=as_of.isoformat(), latest_run_id=str(latest.run_id),
         run=_detector_run_summary(latest) if scope == "LATEST" else None,
         latest_run=_detector_run_summary(latest), runs=[_detector_run_summary(run) for run in active_runs],
         session_date=selected_date.isoformat(), sessions=sessions,
-        rows=rows, total=len(selected), limit=limit, offset=offset,
+        rows=rows, total=len(displayed), limit=limit, offset=offset,
         detected_observations=len(observations),
         new_alerts=sum(dict(run.selection_counts)["SELECTED"] for run in active_runs),
         repeat_hits=sum(dict(run.selection_counts)["REPEAT"] for run in active_runs), maximum_new_alerts=20,

@@ -96,13 +96,22 @@ function storedCollapsed(): boolean {
   }
 }
 
-function AlertSessionStepper({ dates, selected, source, emptyLabel = 'No publications', resetKeys = [] }: NonNullable<PageContextValue['alertSessions']>) {
+function AlertSessionStepper({ dates, selected, source, emptyLabel = 'No publications', resetKeys = [], datasetByDate = {}, historicalView, historicalSource }: NonNullable<PageContextValue['alertSessions']>) {
   const [params, setParams] = useSearchParams()
   const index = dates.indexOf(selected)
   const choose = (session: string) => {
     const next = new URLSearchParams(params)
-    if (session === dates[dates.length - 1]) next.delete('session_date')
+    const latest = session === dates[dates.length - 1]
+    if (latest) next.delete('session_date')
     else next.set('session_date', session)
+    if (historicalView) {
+      if (latest) next.delete('view')
+      else next.set('view', historicalView)
+    }
+    if (!latest && historicalSource) next.set('source', historicalSource)
+    const dataset = datasetByDate[session]
+    if (latest || !dataset) next.delete('evaluation_dataset')
+    else next.set('evaluation_dataset', dataset)
     next.delete('run')
     next.delete('offset')
     for (const key of resetKeys) next.delete(key)

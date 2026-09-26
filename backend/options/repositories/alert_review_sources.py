@@ -141,19 +141,26 @@ class OptionAlertReviewSourceRepository(PostgresRepository):
             cursor.execute("SET LOCAL statement_timeout = '5s'")
             cursor.execute("SELECT to_regclass('option_detector_evaluations') IS NOT NULL AS ready")
             if not cursor.fetchone()["ready"]:
-                return dict(storage_ready=False, datasets=[])
+                return dict(storage_ready=False, datasets=[], dataset_sessions={}, sessions=[], session_datasets={})
             cursor.execute(
-                "SELECT DISTINCT dataset_id FROM ("
-                "SELECT dataset_id FROM option_detector_evaluations WHERE session_date>=%s AND selected_at<=%s AND recorded_at<=%s "
-                "UNION SELECT selection_evidence->>'dataset_id' AS dataset_id FROM option_board_publications "
+                "SELECT selection_evidence->>'dataset_id' AS dataset_id,as_of_session AS session_date,"
+                "MAX(scheduled_cycle) AS latest_cycle FROM option_board_publications "
                 "WHERE selector_version IN ('option_detector_run_v1','option_detector_run_v2') AND status='COMPLETE' "
-                "AND as_of_session>=%s AND published_at<=%s AND created_at<=%s"
-                ") AS versions ORDER BY dataset_id LIMIT 1001", (start, as_of, as_of, start, as_of, as_of),
+                "AND as_of_session>=%s AND published_at<=%s AND created_at<=%s "
+                "GROUP BY selection_evidence->>'dataset_id',as_of_session "
+                "ORDER BY as_of_session,dataset_id LIMIT 1001", (start, as_of, as_of),
             )
-            datasets = [row["dataset_id"] for row in cursor.fetchall()]
-        if len(datasets) > 1000:
+            rows = [dict(row) for row in cursor.fetchall()]
+        if len(rows) > 1000:
             raise ValueError("dataset index exceeds bound")
-        return dict(storage_ready=True, datasets=datasets)
+        datasets = sorted({row["dataset_id"] for row in rows})
+        dataset_sessions = {dataset: sorted(row["session_date"].isoformat() for row in rows if row["dataset_id"] == dataset)
+            for dataset in datasets}
+        session_datasets = {}
+        for row in sorted(rows, key=lambda item: (item["session_date"], item["latest_cycle"], item["dataset_id"])):
+            session_datasets[row["session_date"].isoformat()] = row["dataset_id"]
+        return dict(storage_ready=True, datasets=datasets, dataset_sessions=dataset_sessions,
+            sessions=sorted(session_datasets), session_datasets=session_datasets)
 
     def original_packages(self, records, *, as_of):
         records = tuple(records)

@@ -43,6 +43,16 @@ test('Latest Run separates no publication from no alerts in a trade-type run', (
   assert.ok(page.includes('`No ${tradeType.toLowerCase()} alerts in this run`'))
 })
 
+test('header date navigation opens forward Day History and retains the requested session', () => {
+  const page = readFileSync(new URL('../src/pages/StockAlertsPage.tsx', import.meta.url), 'utf8')
+  const shell = readFileSync(new URL('../src/layout/AppShell.tsx', import.meta.url), 'utf8')
+  assert.match(page, /historicalView: 'history', historicalSource: requestedSource/)
+  assert.match(page, /selected: params\.get\('session_date'\) \|\| data\?\.session/)
+  assert.match(shell, /next\.set\('view', historicalView\)/)
+  assert.match(shell, /next\.set\('source', historicalSource\)/)
+  assert.match(shell, /if \(latest\) next\.delete\('view'\)/)
+})
+
 test('alert publication context is limited to six ticker and alert facts without provenance', () => {
   const factor = value => ({ status: 'READY', reason_codes: [], source_revision_ids: ['hidden'], value })
   const row = { hits: 2, first_seen: '2026-09-17T15:00:00Z', last_seen: '2026-09-18T15:00:00Z',
