@@ -136,16 +136,18 @@ test('explicit management uses entered percentages and elapsed hours once', () =
   for (const changes of [{ stopPercent: '100' }, { holdHours: 'Infinity' }, { exitDte: '0' }, { policyVersion: '' }]) assert.throws(() => model.optionAlertPreviewRequest({ ...form, ...changes }, 'DIRECTIONAL_LONG_PREMIUM'))
 })
 
-test('Alerts route is explicit and Research stays available with no publisher UI', () => {
+test('Alerts route is explicit and legacy research URLs redirect to the screener', () => {
   const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8')
   const navigation = readFileSync(new URL('../src/layout/navigation.ts', import.meta.url), 'utf8')
   const page = readFileSync(new URL('../src/pages/OptionsAlertsPage.tsx', import.meta.url), 'utf8')
   assert.match(app, /path="\/options\/alerts" element=\{<OptionsAlertsPage/)
-  assert.match(app, /path="\/options\/\*" element=\{<OptionsResearchWorkspace/)
+  assert.match(app, /path="\/options\/\*" element=\{<Navigate to="\/options\/screener" replace/)
   assert.match(navigation, /to: '\/options\/alerts', label: 'Options Alerts'/)
-  assert.match(page, /structured_only: packagesOnly/)
-  assert.match(page, /getOptionAlertHistory/)
+  assert.doesNotMatch(navigation, /Options Research/)
+  assert.match(page, /getOptionDetectorAlerts/)
+  assert.match(page, /getOptionDetectorEvaluations/)
   assert.match(page, /previewOptionAlert/)
+  assert.doesNotMatch(page, /getOptionAlertHistory|getOptionBehaviorReview|getOptionCandidates/)
   assert.doesNotMatch(page, /publishOption|createPosition|executeTrade|activatePublisher/)
 })
 
@@ -193,55 +195,6 @@ test('global staleness banner distinguishes an active close pipeline', () => {
   assert.match(banner, /will remain blocked until the close pipeline catches up/)
   assert.match(api, /if \(status\.pipeline_active !== undefined\) return status/)
   assert.match(api, /run\.status === 'PENDING' \|\| run\.status === 'RUNNING'/)
-})
-
-test('behavior and EOD views reuse persisted readers without hiding the candidate inventory', () => {
-  const page = readFileSync(new URL('../src/pages/OptionsAlertsPage.tsx', import.meta.url), 'utf8')
-  assert.match(page, /getOptionBehaviorReview/)
-  assert.match(page, /Directional stock gates passed/)
-  assert.match(page, /Timely directional shortlist/)
-  assert.match(page, /Model-selected complete packages/)
-  assert.match(page, /EOD Review/)
-  assert.match(source, /Outcome states/)
-  assert.match(page, /!historyView && !reviewView && validDte/)
-  assert.match(page, /No timely shortlist is available/)
-  assert.match(page, /Partial-session assessment/)
-  assert.match(page, /Exact assessment cohorts/)
-  assert.match(page, /Correlated observations, not independent samples/)
-  assert.match(page, /URLSearchParams\(\{ view: 'candidates' \}\)/)
-})
-
-test('column layouts preserve defaults, expose retained fields and protect identity', () => {
-  const expected = { behavior: 22, day_history: 21, candidates: 21, history: 22, daily: 7 }
-  for (const [view, count] of Object.entries(expected)) {
-    const columns = model.optionAlertColumns[view]
-    assert.equal(new Set(columns.map(column => column.key)).size, columns.length)
-    const defaults = new Set(columns.filter(column => column.hiddenByDefault).map(column => column.key))
-    assert.equal(model.optionAlertVisibleColumns(view, defaults).length, count)
-    assert.equal(model.optionAlertVisibleColumns(view, new Set()).length, columns.length)
-    assert.deepEqual(model.optionAlertVisibleColumns(view, new Set(columns.map(column => column.key))), columns.filter(column => column.locked))
-  }
-  assert.equal(model.optionBehaviorMetrics.length, 12)
-  assert.ok(model.optionAlertColumns.candidates.some(column => column.key === 'maximum_loss' && column.hiddenByDefault))
-  assert.ok(model.optionAlertColumns.history.some(column => column.key === 'exit_deadline' && column.hiddenByDefault))
-  assert.ok(model.optionAlertColumns.daily.some(column => column.key === 'minimum' && column.hiddenByDefault))
-})
-
-test('options tables reuse the shared picker with isolated saved preferences', () => {
-  const page = readFileSync(new URL('../src/pages/OptionsAlertsPage.tsx', import.meta.url), 'utf8')
-  for (const view of ['behavior', 'candidates', 'daily', 'history']) {
-    const version = view === 'daily' ? 1 : 2
-    assert.ok(page.includes(`useColumnPreferences('option-alerts-${view}-v${version}', optionAlertColumns.${view})`))
-  }
-  assert.match(page, /<ColumnPicker key=\{activeView\}/)
-  assert.match(page, /onShowAll=\{preferences.showAll\} onReset=\{preferences.reset\}/)
-  assert.equal((page.match(/<ColumnHeaders columns=\{columns\}/g) || []).length, 4)
-  assert.equal((page.match(/<ColumnCells columns=\{columns\}/g) || []).length, 5)
-  assert.doesNotMatch(page, /<ColumnCells columns=\{detectorObservationColumns\}/)
-  assert.match(page, /optionAlertVisibleColumns\(activeView, preferences.hidden\)/)
-  assert.equal((page.match(/\.\.\.marketCells\(row.legs\)/g) || []).length, 2)
-  assert.match(page, /title=\{column.tip\}/)
-  assert.match(page, /money\(leg.entry_model_mark\)/)
 })
 
 test('board detail facts preserve original decisions and distinguish absent evidence', () => {
@@ -299,10 +252,6 @@ test('original contract prices retain units, moneyness and missing market data',
   assert.equal(model.optionPackagePremium('-235'), '$235.00 debit')
   assert.equal(model.optionPackagePremium('150'), '$150.00 credit')
   assert.equal(model.optionPackagePremium(null), 'Unavailable')
-  for (const view of ['behavior', 'candidates']) {
-    const defaults = model.optionAlertColumns[view].filter(column => !column.hiddenByDefault).map(column => column.key)
-    for (const key of ['contracts', 'stock', 'option_price', 'otm', 'volume', 'open_interest', 'iv']) assert.ok(defaults.includes(key))
-  }
 })
 
 test('package price uses signed ratio-weighted leg premiums and the actual multiplier', () => {
@@ -334,31 +283,6 @@ test('package prices fail closed on missing marks, invalid terms and mismatched 
   assert.equal(model.optionPackagePrice(473, legs).reason, 'PACKAGE_PREMIUM_LEG_MISMATCH')
   assert.equal(model.optionPackagePrice(-470, legs).price, null)
   assert.equal(model.optionPackagePrice(-473, [legs[0]]).price, null)
-})
-
-test('published history uses frozen entry leg prices with the same package basis', () => {
-  const legs = [{ side: 'BUY', entry_model_mark: '7', ratio: 1, multiplier: 100 },
-    { side: 'SELL', entry_model_mark: '2.27', ratio: 1, multiplier: 100 }]
-  const original = structuredClone(legs)
-  assert.equal(model.optionPackagePrice('-473', legs).price, -4.73)
-  assert.equal(model.optionPackagePrice('-450', legs).reason, 'PACKAGE_PREMIUM_LEG_MISMATCH')
-  assert.equal(model.optionPackagePrice('-473', [{ ...legs[0], entry_model_mark: null }, legs[1]]).price, null)
-  assert.deepEqual(legs, original)
-})
-
-test('Alerts and Published History share package-price display without repricing history', () => {
-  const page = readFileSync(new URL('../src/pages/OptionsAlertsPage.tsx', import.meta.url), 'utf8')
-  assert.equal((page.match(/option_price: <PackagePrice netPremium=\{row.net_premium\} legs=\{row.legs\}/g) || []).length, 2)
-  assert.match(page, /entry_marks: <PackagePrice netPremium=\{row.original_economics.net_premium\} legs=\{row.legs\}/)
-  assert.match(page, /entry_leg_marks: row.legs.length/)
-  assert.doesNotMatch(page, /<PackagePrice netPremium=\{row.entry_limit\}/)
-  assert.match(page, /column.key === 'leg_prices' \? 'option_price'/)
-  assert.equal(model.optionAlertColumns.history.find(column => column.key === 'entry_marks').label, 'Original package price / share')
-  assert.ok(model.optionAlertColumns.history.find(column => column.key === 'entry_leg_marks').hiddenByDefault)
-  for (const view of ['behavior', 'candidates']) {
-    assert.equal(model.optionAlertColumns[view].find(column => column.key === 'option_price').label, 'Option price')
-    assert.ok(model.optionAlertColumns[view].find(column => column.key === 'leg_prices').hiddenByDefault)
-  }
 })
 
 test('plan columns distinguish debit stops from credit close costs and never invent management', () => {
@@ -395,71 +319,26 @@ test('explicit plan limits retain their entry basis and missing or invalid thres
   assert.equal(explicit.basis, 'PLANNED_ENTRY_LIMIT_NOT_FILL')
   for (const invalid of [0, -1, 1, Infinity, NaN, null]) assert.equal(model.optionPlanTerms(-200, legs, { ...policy, stop_loss_fraction: invalid }, { version: 'v1' }).stop, null)
   assert.equal(model.optionPlanTerms(-200, [], policy, { version: 'v1' }).stop, null)
-  const clock = Date.parse('2026-09-18T20:00:00Z')
-  assert.equal(model.optionRemainingHold('2026-09-18T21:00:00Z', clock), '1 hours')
-  assert.equal(model.optionRemainingHold('2026-09-18T20:00:00Z', clock), 'Deadline elapsed')
-  assert.equal(model.optionRemainingHold(null, clock), 'Unavailable')
 })
 
-test('history presents marked return bases and recorded plans without publishing or fabricating hits', () => {
-  const page = readFileSync(new URL('../src/pages/OptionsAlertsPage.tsx', import.meta.url), 'utf8')
-  assert.match(page, /\.\.\.currentMarkCells\(row\)/)
-  assert.equal((page.match(/\.\.\.planCells\(/g) || []).length, 3)
-  assert.ok((page.match(/detectorThresholdCells\(/g) || []).length >= 3)
-  assert.match(page, /mark.status !== 'UNAVAILABLE'/)
-  assert.match(page, /row.hit_count == null \? 'Unavailable'/)
-  assert.match(page, /Original candidate-mark basis/)
-  assert.match(page, /After planned exit deadline/)
-  assert.match(page, /repeated plan events are not independent samples/)
-  assert.match(page, /Retained marked performance/)
-  assert.match(page, /row.original_economics.net_premium/)
-  assert.doesNotMatch(page, /publishOption|createPosition|executeTrade|activatePublisher/)
-})
-
-test('Latest Run and Day History share selection and retain the chosen session', () => {
-  const original = new URLSearchParams('view=day_history&session_date=2026-09-18&underlyer=AAPL&behavior=ALL&offset=50&candidate=one&event=two')
+test('current detector tabs retain the chosen session and clear transient detail', () => {
+  const original = new URLSearchParams('view=day_history&session_date=2026-09-18&underlyer=AAPL&offset=50&candidate=one&event=two')
   const current = model.optionAlertTabParams(original, 'behavior')
   assert.equal(current.get('session_date'), '2026-09-18')
   assert.equal(current.get('underlyer'), 'AAPL')
-  assert.equal(current.get('behavior'), 'ALL')
   for (const key of ['offset', 'candidate', 'event']) assert.equal(current.get(key), null)
-  assert.equal(model.optionAlertTabParams(original, 'day_history').get('session_date'), '2026-09-18')
-  assert.equal(model.optionReviewScope('behavior'), 'CURRENT')
-  assert.equal(model.optionReviewScope('day_history'), 'HISTORY')
-  assert.equal(model.optionReviewScope('daily'), 'HISTORY')
-  assert.equal(model.optionReviewScope('history'), 'LATEST')
   assert.equal(original.get('offset'), '50')
-  assert.ok(model.optionAlertColumns.day_history.some(column => column.key === 'price_pnl'))
-  assert.ok(!model.optionAlertColumns.day_history.some(column => column.key === 'event'))
-  assert.ok(model.optionAlertColumns.day_history.some(column => column.key === 'hit_count'))
   const page = readFileSync(new URL('../src/pages/OptionsAlertsPage.tsx', import.meta.url), 'utf8')
-  assert.match(page, /review_scope: optionReviewScope\(view\)/)
-  assert.match(page, /session_date: params.get\('session_date'\) \|\| undefined/)
-  assert.match(page, /Open Day History/)
-  assert.match(page, /Legacy Publication Audit/)
-  assert.match(page, /Retained detections, not publication events/)
-  assert.match(page, /option-alerts-day-history-v1/)
-  assert.match(page, /refetchInterval: daily \? false : 30_000/)
-  assert.match(page, /currentMarkCells\(\{ current_mark: row.current_mark/)
-  for (const view of ['behavior', 'day_history']) {
-    assert.equal(model.optionReviewSelection(model.optionAlertTabParams(new URLSearchParams(), view)), 'ALL')
-    assert.equal(model.optionReviewSelection(model.optionAlertTabParams(new URLSearchParams('behavior=ELIGIBLE'), view)), 'ELIGIBLE')
-    assert.equal(model.optionReviewSelection(model.optionAlertTabParams(new URLSearchParams('behavior=SHORTLIST'), view)), 'SHORTLIST')
-  }
-  assert.match(page, /optionReviewSelection\(params\)/)
-  assert.match(page, /alertSessions: reviewView \? \{ \.\.\.sessionContext, selected: params.get\('session_date'\)/)
-  assert.match(page, /Last completed run retained/)
-  assert.match(page, /latest_run_excluded/)
-  const shell = readFileSync(new URL('../src/layout/AppShell.tsx', import.meta.url), 'utf8')
-  assert.match(shell, /emptyLabel = 'No publications', resetKeys = \[\]/)
-  assert.match(shell, /for \(const key of resetKeys\) next.delete\(key\)/)
+  assert.match(page, /const views: OptionAlertView\[\] = \['behavior', 'day_history', 'daily'\]/)
+  assert.match(page, /historicalView: 'day_history'/)
+  assert.doesNotMatch(page, /Legacy Publication Audit|Legacy stock gates|getOptionBehaviorReview|getOptionAlertHistory/)
 })
 
-test('Alerts no longer exposes the broad candidate inventory as a navigable tab', () => {
+test('Alerts exposes only current detector views', () => {
   const page = readFileSync(new URL('../src/pages/OptionsAlertsPage.tsx', import.meta.url), 'utf8')
-  assert.match(page, /\['history', 'daily', 'day_history'\]\.includes\(params.get\('view'\)/)
-  assert.match(page, /const views: OptionAlertView\[\] = \['behavior', 'day_history', 'daily', 'history'\]/)
-  assert.doesNotMatch(page, />Candidates<\/button>/)
+  assert.match(page, /params\.get\('view'\) === 'daily'/)
+  assert.match(page, /params\.get\('view'\) === 'day_history'/)
+  assert.doesNotMatch(page, />Candidates<\/button>|Legacy Publication Audit|getOptionCandidates|getOptionDiscoveryCatalog/)
 })
 
 test('Latest and History use dataset membership with sortable category and strategy columns', () => {
@@ -485,7 +364,7 @@ test('detector workspace restores source columns and uses current models without
   const page = readFileSync(new URL('../src/pages/OptionsAlertsPage.tsx', import.meta.url), 'utf8')
   const shell = readFileSync(new URL('../src/layout/AppShell.tsx', import.meta.url), 'utf8')
   const panel = page.slice(page.indexOf('function DetectorAlertsPanel'), page.indexOf('function DetectorEvaluationPanel'))
-  const daily = page.slice(page.indexOf('function DetectorEvaluationPanel'), page.indexOf('function BehaviorReviewPanel'))
+  const daily = page.slice(page.indexOf('function DetectorEvaluationPanel'), page.indexOf('export default function OptionsAlertsPage'))
   assert.match(panel, /queryFn: getOptionDetectorDatasets/)
   assert.match(panel, /index\?\.session_datasets\[requestedSession\]/)
   assert.match(panel, /datasetByDate: index\?\.session_datasets/)
@@ -524,7 +403,6 @@ test('detector workspace restores source columns and uses current models without
   assert.match(page, /Selected indicative research alert \/ Original retained model marks/)
   assert.match(daily, /All retained results/)
   assert.doesNotMatch(daily, /aria-label="EOD review scope"/)
-  assert.match(daily, /Legacy diagnostics/)
   assert.match(daily, /Prospective outcomes are not connected/)
 })
 
@@ -555,19 +433,6 @@ test('zero-alert runs show publication clocks and retained exclusions independen
   assert.match(page, /No qualified new alerts in this completed run/)
 })
 
-test('baseline alert views separate models, categories and recorded repeat hits', () => {
-  const page = readFileSync(new URL('../src/pages/OptionsAlertsPage.tsx', import.meta.url), 'utf8')
-  for (const view of ['behavior', 'day_history']) {
-    assert.ok(model.optionAlertColumns[view].some(column => column.key === 'hit_count'))
-    assert.ok(model.optionAlertColumns[view].some(column => column.key === 'category'))
-  }
-  assert.match(page, /data\?\.history_basis === 'PERSISTED_BASELINE_ALERT_MEMBERS'/)
-  assert.match(page, /Object.entries\(modelNames\)/)
-  assert.match(page, /row.hit_count == null \? 'Unavailable'/)
-  assert.match(page, /First recorded alerts only \/ Repeat hits are not new samples/)
-  assert.doesNotMatch(page, /\.slice\(0, 50\)|setHitCount|publishBaseline/)
-})
-
 test('EOD compares all qualified selection records without inventing outcomes', () => {
   const page = readFileSync(new URL('../src/pages/OptionsAlertsPage.tsx', import.meta.url), 'utf8')
   const api = readFileSync(new URL('../src/services/api.ts', import.meta.url), 'utf8')
@@ -577,7 +442,6 @@ test('EOD compares all qualified selection records without inventing outcomes', 
   assert.match(page, /Detector evaluation storage is not deployed/)
   assert.match(page, /cell.measured \?\? 'Unavailable'/)
   assert.match(page, /queryKey: \['option-detector-evaluations', request\]/)
-  assert.match(page, /Legacy stock gates/)
   assert.match(api, /api.get\('\/options\/alerts\/evaluations', \{ params \}\)/)
   assert.doesNotMatch(page, /evaluateOnGet|recordOverflow|createEvaluation/)
 })

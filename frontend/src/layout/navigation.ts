@@ -114,7 +114,6 @@ export const NAV_GROUPS: NavGroup[] = [
     label: 'Options',
     icon: FlaskConical,
     items: [
-      { to: '/options', label: 'Options Research', icon: FlaskConical, end: true },
       { to: '/options/activity', label: 'Option Activity', icon: Activity },
       { to: '/options/flow', label: 'Options Flow', icon: Route },
       { to: '/options/screener', label: 'Options Screener', icon: ScanSearch },

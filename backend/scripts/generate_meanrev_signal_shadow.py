@@ -39,7 +39,6 @@ from research.meanrev import (  # noqa: E402
     N_DECILES,
     score_meanrev_cross_sections,
 )
-from generate_cross_sectional_signal import ensure_table  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("meanrev-shadow-signal")
@@ -143,7 +142,6 @@ def main() -> int:
         print("\n[dry-run] nothing written")
         return 0
 
-    ensure_table()
     written = persist(cross)
     logger.info("Persisted %s rows to cross_sectional_signals (shadow, unvalidated)", written)
     return 0

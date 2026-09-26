@@ -42,10 +42,6 @@ from options.domain import (
     reference_drift_failed,
 )
 from options.repositories.analysis import OptionAnalysisRepository
-from options.repositories.board import (
-    BoardPublicationResult,
-    OptionBoardPublicationRepository,
-)
 from options.repositories.catalog import OptionContractCatalogRepository
 from options.repositories.daily_facts import (
     DailyOpenInterestRecord,
@@ -101,8 +97,6 @@ class ManualCycleResult:
     started_at: datetime
     completed_at: datetime
     results: tuple[UnderlyingCycleResult, ...]
-    board_publication: BoardPublicationResult | None = None
-    baseline_alert_selection: BoardPublicationResult | None = None
     detector_evaluation: dict | None = None
 
 
@@ -131,7 +125,6 @@ class ManualOptionPipeline:
         strategy_pipeline: OptionStrategyPipeline | None = None,
         equity_evidence_repository: EquityEvidenceRepository | None = None,
         outcome_repository: OptionOutcomeRepository | None = None,
-        board_repository: OptionBoardPublicationRepository | None = None,
         model_input_repository: OptionModelInputRepository | None = None,
         corporate_action_repository: EquityCorporateActionRepository | None = None,
         detector_cycle_hook: Callable | None = None,
@@ -175,7 +168,6 @@ class ManualOptionPipeline:
         )
         self.strategy_pipeline = strategy_pipeline
         self.outcome_repository = outcome_repository
-        self.board_repository = board_repository or OptionBoardPublicationRepository()
         self.model_input_repository = model_input_repository
         if (
             self.model_input_repository is None
@@ -295,36 +287,12 @@ class ManualOptionPipeline:
             completed_count / len(results) if results else 0.0,
             completed_at,
         )
-        board_publication = None
-        baseline_alert_selection = None
         detector_evaluation = None
         if (
             self.strategy_pipeline is not None
             and len(requested) == len(self.configuration.settings.underlyers)
             and set(requested) == set(self.configuration.settings.underlyers)
         ):
-            effective_from = self.configuration.settings.baseline_alerts_effective_from
-            if self.configuration.settings.baseline_alerts_enabled and effective_from is not None and cycle_time >= effective_from:
-                try:
-                    baseline_alert_selection = self.board_repository.publish_baseline_cycle(
-                        configuration=self.configuration, scheduled_cycle=cycle_time,
-                        published_at=_as_utc(self.clock(), "clock"), effective_from=effective_from,
-                        calendar=self.calendar,
-                    )
-                except Exception:
-                    LOGGER.exception("Baseline alert selection failed after strategy acknowledgement")
-                    baseline_alert_selection = BoardPublicationResult(
-                        "FAILED", None, len(requested), 0, 0, {"reason": "BASELINE_SELECTION_FAILED"})
-            board_publication = self.board_repository.publish_complete_cycle(
-                scheduled_cycle=cycle_time,
-                as_of_session=as_of_session,
-                expected_underlyers=self.configuration.settings.underlyers,
-                strategy_policy_sha256=(
-                    self.configuration.strategy_policy_sha256
-                ),
-                configuration_sha256=self.configuration.configuration_sha256,
-                published_at=completed_at,
-            )
             if (self.detector_cycle_hook is not None and cycle_time >= self.detector_effective_from
                     and all(result.status in {"COMPLETE", "ALREADY_COMPLETED"} and result.matrix_id is not None for result in results)):
                 try:
@@ -363,8 +331,6 @@ class ManualOptionPipeline:
             started_at=started_at,
             completed_at=completed_at,
             results=results,
-            board_publication=board_publication,
-            baseline_alert_selection=baseline_alert_selection,
             detector_evaluation=detector_evaluation,
         )
 

@@ -329,9 +329,10 @@ class ScannerRetirementTests(unittest.TestCase):
         paths = {route.path for route in main.app.routes}
         for path in ("/api/scanner-events/qualification", "/api/scanner-events/latest-by-ticker",
                      "/api/scanner-events/summary", "/api/scanner-events/backlog",
-                     "/api/scanner-events", "/api/stock/{ticker}/scanner-events"):
+                     "/api/scanner-events", "/api/stock/{ticker}/scanner-events",
+                     "/api/scanner-events/sector-performance"):
             self.assertNotIn(path, paths)
-        for path in ("/api/scanner-events/sector-performance", "/api/scan/streak",
+        for path in ("/api/sector-intelligence", "/api/scan/streak",
                      "/api/stocks/alert-view", "/api/stocks/screening/query"):
             self.assertIn(path, paths)
 

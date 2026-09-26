@@ -181,7 +181,6 @@ class OptionUniverseRepository(PostgresRepository):
                                         status = 'RUNNING'
                                         OR (
                                                 status = 'DEGRADED'
-                                                AND %s = 'COMPLETE'
                                                 AND completeness_fraction < %s
                                         )
                                     )
@@ -191,7 +190,6 @@ class OptionUniverseRepository(PostgresRepository):
                                         completeness_fraction,
                                         completed_at,
                                         run_id,
-                                        status.value,
                                         completeness_fraction,
                                 ),
             )
@@ -207,8 +205,14 @@ class OptionUniverseRepository(PostgresRepository):
                 existing = cursor.fetchone()
                 if (
                     existing
-                    and existing["status"] == status.value
-                    and existing["completeness_fraction"] == completeness_fraction
+                    and (
+                        existing["status"] == UniverseRunStatus.COMPLETE.value
+                        or (
+                            existing["status"] == UniverseRunStatus.DEGRADED.value
+                            and status is UniverseRunStatus.DEGRADED
+                            and existing["completeness_fraction"] >= completeness_fraction
+                        )
+                    )
                 ):
                     return
                 raise InvalidBatchTransition("universe run is missing or not RUNNING")

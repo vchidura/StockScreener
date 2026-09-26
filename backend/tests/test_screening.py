@@ -823,7 +823,7 @@ def test_published_discovery_state_matches_original_and_stays_field_scoped(state
     from datetime import date, timedelta
     import pandas as pd
     from equity.screening_projection import project_security
-    from equity.stock_discovery import stock_features
+    from equity.daily_state import stock_features
     start = date(2025, 1, 1)
     bullish = state in ("PULLBACK", "RESUMING_UP")
     closes = [100 + index * (.2 if bullish else -.2) for index in range(253)]

@@ -224,7 +224,7 @@ test('contract detail preserves exact retained fields, zeros and missingness', (
 
 test('screener View opens a fixed snapshot without new queries or saved screen fields', () => {
   const page = readFileSync(new URL('../src/pages/OptionsScreenLibrary.tsx', import.meta.url), 'utf8')
-  const chain = page.slice(page.indexOf('export function OptionsChainResults'), page.indexOf('export function OptionsPackageResults'))
+  const chain = page.slice(page.indexOf('export function OptionsChainResults'))
   const detail = page.slice(page.indexOf('function OptionContractDetail'), page.indexOf('export function OptionsChainResults'))
   assert.match(chain, /setSelectedContract\(structuredClone\(row\)\)/)
   assert.match(chain, /contractTrigger.current = event.currentTarget/)
@@ -251,7 +251,7 @@ test('screener View opens a fixed snapshot without new queries or saved screen f
 
 test('screener ticker links and table colors match the shared table conventions', () => {
   const page = readFileSync(new URL('../src/pages/OptionsScreenLibrary.tsx', import.meta.url), 'utf8')
-  const chain = page.slice(page.indexOf('export function OptionsChainResults'), page.indexOf('export function OptionsPackageResults'))
+  const chain = page.slice(page.indexOf('export function OptionsChainResults'))
   assert.ok(chain.includes('<Link to={`/ticker/${encodeURIComponent(row.underlying)}`}'))
   assert.match(chain, /title=\{`Open \$\{row.underlying\} ticker page`\}/)
   assert.match(chain, /aria-label=\{`View \$\{row.contract_ticker\} details`\}/)

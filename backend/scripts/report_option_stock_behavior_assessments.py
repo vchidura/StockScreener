@@ -7,7 +7,7 @@ import json
 import os
 import sys
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -49,9 +49,6 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--launch-file", type=Path)
     parser.add_argument("--write-launch-artifact", action="store_true")
-    parser.add_argument("--session-date", type=date.fromisoformat, help="Read-only daily behavior/outcome scorecard for one session.")
-    parser.add_argument("--as-of", type=datetime.fromisoformat, help="Aware observation cutoff; defaults to actual receipt time.")
-    parser.add_argument("--review-view", choices=("SHORTLIST", "ELIGIBLE", "ALL", "DAILY"), default="DAILY")
     return parser.parse_args()
 
 
@@ -431,27 +428,6 @@ def build_report(
 
 def main() -> int:
     args = _arguments()
-    if args.session_date:
-        from options.analytics.behavior_review import build_behavior_review
-        from options.config import load_option_runtime_configuration
-
-        if args.write_launch_artifact or args.launch_file:
-            raise ValueError("daily review cannot overwrite or reinterpret a launch status artifact")
-        now = datetime.now(timezone.utc)
-        cutoff = args.as_of or now
-        if cutoff.tzinfo is None or cutoff > now:
-            raise ValueError("daily review cutoff must be aware and not in the future")
-        report = build_behavior_review(load_option_runtime_configuration(), session_date=args.session_date,
-            as_of=cutoff, view=args.review_view)
-        rendered = json.dumps(report, sort_keys=True, indent=2, default=str, allow_nan=False)
-        if args.output:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            with args.output.open("x", encoding="utf-8") as output:
-                output.write(rendered + "\n")
-        print(rendered)
-        return 0 if not args.require_storage_ready or all(report["schema"].values()) else 2
-    if args.as_of:
-        raise ValueError("--as-of requires --session-date")
     launch = (
         load_option_stock_behavior_shadow_launch(args.launch_file.resolve())
         if args.launch_file else None

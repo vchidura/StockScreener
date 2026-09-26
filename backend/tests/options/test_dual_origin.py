@@ -2383,27 +2383,50 @@ def test_detector_schedule_distinguishes_windows_from_completed_runs(now, effect
 
 def test_current_detector_dataset_is_default_even_before_any_run(monkeypatch):
     from types import SimpleNamespace
+    from zoneinfo import ZoneInfo
     from options import api
     from options.repositories import alert_review_sources
     from options.analytics import behavior_review
 
-    monkeypatch.setattr(alert_review_sources, "configured_detector_dataset", lambda: "current-four-model-v1")
+    effective_from = datetime.now(timezone.utc) - timedelta(minutes=1)
+    effective_session = effective_from.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+    monkeypatch.setattr(alert_review_sources, "configured_detector_dataset", lambda **_: "current-four-model-v1")
     monkeypatch.setattr(alert_review_sources, "configured_detector_launch", lambda: SimpleNamespace(
-        effective_from=datetime(2026, 9, 25, 13, 30, tzinfo=timezone.utc)))
+        dataset_id="current-four-model-v1", effective_from=effective_from))
     monkeypatch.setattr(alert_review_sources.OptionAlertReviewSourceRepository, "dataset_index", lambda *_, **__: dict(
         storage_ready=True, datasets=["old-v1"], dataset_sessions={"old-v1": ["2026-09-24"]},
         sessions=["2026-09-24"], session_datasets={"2026-09-24": "old-v1"}))
     response = api.option_detector_datasets()
     assert response.data["default_dataset_id"] == "current-four-model-v1"
     assert response.data["datasets"] == ["current-four-model-v1", "old-v1"]
-    assert response.data["sessions"] == ["2026-09-24", "2026-09-25"]
-    assert response.data["session_datasets"] == {"2026-09-24": "old-v1", "2026-09-25": "current-four-model-v1"}
+    assert response.data["sessions"] == sorted({"2026-09-24", effective_session})
+    assert response.data["session_datasets"] == {"2026-09-24": "old-v1", effective_session: "current-four-model-v1"}
+    assert response.data["configured_dataset_id"] == "current-four-model-v1"
     calls = []
     monkeypatch.setattr(behavior_review, "build_detector_evaluation_review", lambda **kwargs: calls.append(kwargs) or {})
     api.option_alert_evaluations(dataset_id=None, limit=50, offset=0)
     assert calls[-1]["dataset_id"] == "current-four-model-v1"
     api.option_alert_evaluations(dataset_id="old-v1", limit=50, offset=0)
     assert calls[-1]["dataset_id"] == "old-v1"
+
+
+def test_future_detector_launch_does_not_displace_latest_retained_dataset(monkeypatch):
+    from types import SimpleNamespace
+    from options import api
+    from options.repositories import alert_review_sources
+
+    monkeypatch.setattr(alert_review_sources, "configured_detector_launch", lambda: SimpleNamespace(
+        dataset_id="future-v28", effective_from=datetime.now(timezone.utc) + timedelta(days=3)))
+    monkeypatch.setattr(alert_review_sources.OptionAlertReviewSourceRepository, "dataset_index", lambda *_, **__: dict(
+        storage_ready=True, datasets=["current-v27"], dataset_sessions={"current-v27": ["2026-09-25"]},
+        sessions=["2026-09-25"], session_datasets={"2026-09-25": "current-v27"}))
+
+    data = api.option_detector_datasets().data
+    assert data["current_dataset_id"] == "current-v27"
+    assert data["default_dataset_id"] == "current-v27"
+    assert data["current_session_date"] == "2026-09-25"
+    assert data["session_datasets"] == {"2026-09-25": "current-v27"}
+    assert data["configured_dataset_id"] == "future-v28"
 
 
 def test_detector_dataset_manifest_is_read_only_and_hash_checked():

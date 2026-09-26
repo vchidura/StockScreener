@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections import Counter, defaultdict, deque
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import ClassVar, Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -16,43 +16,7 @@ from options.stock_setup_binding import StockSetupIndicatorObservation
 from options.dual_origin import QualifiedDualOriginPackage, QualifiedResumptionPackage, QualifiedTechnicalPackage, load_qualified_package
 from options.surface_detection import SurfaceDecision
 
-from options.strategies.domain import StructureType, canonical_json, signal_identity_sha256
-from options.strategies.registry import REGISTRY_BY_NAME
-
-
-BASELINE_MODELS = {
-    "INCOME_WHEEL": "Cash-secured put baseline",
-    "SPREAD_RANGE_LOCATOR": "OI structure baseline",
-    "DIRECTIONAL_LONG_PREMIUM": "Implied-move long premium baseline",
-    "DIRECTIONAL_DEBIT_SPREAD": "Implied-move debit spread baseline",
-}
-STRUCTURE_LANES = {
-    "CASH_SECURED_PUT": (1, "BULLISH"),
-    "LONG_CALL": (1, "BULLISH"), "LONG_PUT": (1, "BEARISH"),
-    "CALL_DEBIT_VERTICAL": (2, "BULLISH"), "PUT_DEBIT_VERTICAL": (2, "BEARISH"),
-    "PUT_CREDIT_VERTICAL": (2, "BULLISH"), "CALL_CREDIT_VERTICAL": (2, "BEARISH"),
-    "IRON_CONDOR": (4, "RANGE"),
-    "CALL_BUTTERFLY": (3, "RANGE"), "PUT_BUTTERFLY": (3, "RANGE"),
-}
-BASELINE_SELECTOR_VERSION = "option_alert_baseline_selector_v1"
-BASELINE_SELECTOR_POLICY = {
-    "version": BASELINE_SELECTOR_VERSION,
-    "models": BASELINE_MODELS,
-    "structure_lanes": STRUCTURE_LANES,
-    "maximum_new_alerts": 50,
-    "maximum_expiry_days": 60,
-    "lane": ["strategy_name", "underlying", "direction"],
-    "allocation": "MODEL_ROUND_ROBIN_RANK_UNDERLYING_CANDIDATE_ID",
-    "repeat": "MODEL_VERSION_POLICY_EXACT_SORTED_LEGS_UNTIL_FIRST_LEG_EXPIRY",
-    "repeat_observation": "ONCE_PER_COMPLETE_RUN_ALL_QUALIFYING_PREVIOUS_ALERTS",
-    "admission": "SELECTED_COMPLETE_CAUSAL_PACKAGE_KIND_CONTEXT_DIRECTION_PASS_BEFORE_ORIGINAL_DEADLINE",
-    "required_gate_ledger": "gate_ledger_v2",
-    "non_executable_gates": ["QUOTE_LIQUIDITY", "RISK_ENGINE", "READ_ONLY_MODE"],
-    "execution_allowed": False,
-}
-BASELINE_SELECTOR_SHA256 = hashlib.sha256(
-    canonical_json(BASELINE_SELECTOR_POLICY).encode("ascii")
-).hexdigest()
+from options.strategies.domain import canonical_json
 
 
 def _time(value):
@@ -60,138 +24,6 @@ def _time(value):
     if result.tzinfo is None or result.utcoffset() is None:
         raise ValueError("alert clocks must be timezone-aware")
     return result
-
-
-def baseline_package_identity(row):
-    legs = tuple(sorted(
-        (int(leg["contract_id"]), leg["side"], int(leg["ratio"]), int(leg["multiplier"]))
-        for leg in row["legs"]
-    ))
-    return signal_identity_sha256(
-        row["underlying"], row["strategy_name"], row["strategy_version"],
-        row["policy_sha256"], StructureType(row["structure_type"]), legs,
-    )
-
-
-def _rejection(row, decision_at):
-    if row.get("strategy_name") not in BASELINE_MODELS:
-        return "MODEL_NOT_ENABLED"
-    if row.get("status") != "SELECTED":
-        return "NOT_SELECTED"
-    if not row.get("gate_ledger_complete"):
-        return "GATE_LEDGER_INCOMPLETE"
-    if not row.get("baseline_gates_pass"):
-        return "BASELINE_GATES_NOT_PASSED"
-    try:
-        if StructureType(row["structure_type"]) not in REGISTRY_BY_NAME[row["strategy_name"]].allowed_structure_types:
-            return "MODEL_STRUCTURE_MISMATCH"
-        if not _time(row["market_data_time"]) <= _time(row["observed_time"]) <= decision_at:
-            return "NONCAUSAL_CANDIDATE"
-        if decision_at >= _time(row["valid_until"]):
-            return "ENTRY_DEADLINE_ELAPSED"
-        expires_at = _time(row["expires_at"])
-        if not decision_at < expires_at or (expires_at - decision_at).total_seconds() > 60 * 86400:
-            return "EXPIRY_OUTSIDE_POLICY"
-        expected_count, _ = STRUCTURE_LANES[row["structure_type"]]
-        legs = row["legs"]
-        if len(legs) != expected_count or len({leg["contract_id"] for leg in legs}) != len(legs):
-            return "PACKAGE_INCOMPLETE"
-        premium = Decimal(0)
-        for leg in legs:
-            if leg["side"] not in ("BUY", "SELL"):
-                return "PACKAGE_INVALID"
-            for field in ("contract_id", "ratio", "multiplier"):
-                value = Decimal(str(leg[field]))
-                if not value.is_finite() or value <= 0 or value != value.to_integral_value():
-                    return "PACKAGE_INVALID"
-            mark = Decimal(str(leg["model_mark"]))
-            if not mark.is_finite() or mark <= 0:
-                return "PACKAGE_INVALID"
-            if _time(leg["source_market_time"]) > _time(row["observed_time"]):
-                return "NONCAUSAL_LEG"
-            premium += (1 if leg["side"] == "SELL" else -1) * mark * int(leg["ratio"]) * int(leg["multiplier"])
-        retained_premium = Decimal(str(row["net_premium"]))
-        if not retained_premium.is_finite() or abs(premium - retained_premium) > Decimal("0.00000002"):
-            return "PACKAGE_PREMIUM_MISMATCH"
-        rank = Decimal(str(row["candidate_rank"]))
-        if not rank.is_finite() or rank < 1 or rank != rank.to_integral_value():
-            return "RANK_INVALID"
-        baseline_package_identity(row)
-    except (KeyError, ValueError, TypeError, InvalidOperation, OverflowError):
-        return "PACKAGE_INVALID"
-    return None
-
-
-def select_baseline_alerts(rows, prior_alerts, *, decision_at):
-    decision_at = _time(decision_at)
-    rejected = Counter()
-    by_model = defaultdict(Counter)
-    qualified = []
-    for original in rows:
-        model = original.get("strategy_name", "UNKNOWN")
-        by_model[model]["input"] += 1
-        reason = _rejection(original, decision_at)
-        if reason:
-            rejected[reason] += 1
-            by_model[model]["quality_rejected"] += 1
-            continue
-        row = dict(original)
-        row["alert_identity"] = baseline_package_identity(row)
-        row["direction"] = STRUCTURE_LANES[row["structure_type"]][1]
-        qualified.append(row)
-    qualified.sort(key=lambda row: (int(row["candidate_rank"]), row["underlying"], str(row["candidate_id"])))
-    seen, lanes, observations = set(), set(), []
-    queues = defaultdict(deque)
-    for row in qualified:
-        identity = row["alert_identity"]
-        if identity in seen:
-            rejected["DUPLICATE_PACKAGE_IN_RUN"] += 1
-            by_model[row["strategy_name"]]["duplicate_packages"] += 1
-            continue
-        seen.add(identity)
-        prior = prior_alerts.get(identity)
-        if prior is not None:
-            if decision_at < _time(prior["expires_at"]):
-                observations.append({
-                    "alert_identity": identity,
-                    "first_candidate_id": str(prior["candidate_id"]),
-                    "candidate_id": str(row["candidate_id"]),
-                })
-                by_model[row["strategy_name"]]["repeats"] += 1
-            else:
-                rejected["PRIOR_ALERT_EXPIRED"] += 1
-            continue
-        lane = (row["strategy_name"], row["underlying"], row["direction"])
-        if lane in lanes:
-            rejected["LOWER_RANK_SAME_LANE"] += 1
-            by_model[row["strategy_name"]]["lane_excluded"] += 1
-            continue
-        lanes.add(lane)
-        queues[row["strategy_name"]].append(row)
-    members = []
-    while any(queues.values()) and len(members) < BASELINE_SELECTOR_POLICY["maximum_new_alerts"]:
-        for model in sorted(queues):
-            if queues[model] and len(members) < BASELINE_SELECTOR_POLICY["maximum_new_alerts"]:
-                members.append(queues[model].popleft())
-                by_model[model]["new_alerts"] += 1
-    rejected["RUN_CAP"] += sum(len(queue) for queue in queues.values())
-    for model, queue in queues.items():
-        by_model[model]["cap_excluded"] = len(queue)
-    positions = Counter()
-    for row in members:
-        lane = (row["underlying"], row["strategy_name"], row["candidate_kind"])
-        positions[lane] += 1
-        row["board_position"] = positions[lane]
-    return {
-        "members": members,
-        "observations": observations,
-        "evidence": {
-            "input_candidates": len(rows), "new_alerts": len(members),
-            "repeat_hits": len(observations), "rejections": dict(sorted(rejected.items())),
-            "by_model": {model: dict(counts) for model, counts in sorted(by_model.items())},
-            "execution_allowed": False,
-        },
-    }
 
 
 DUAL_ORIGIN_SELECTOR_POLICY_V1 = {

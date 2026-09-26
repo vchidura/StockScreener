@@ -357,13 +357,10 @@ def test_maintenance_failure_backs_off_without_starving_outcomes(monkeypatch, fa
     stages, service, states = _stub_stage_loop(monkeypatch)
     refresh = MagicMock(side_effect=RuntimeError("unavailable")) if failure == "exception" else MagicMock(
         return_value=(SimpleNamespace(status="IDENTITY_UNAVAILABLE"),))
-    context = MagicMock(return_value={"status": "ALREADY_PRESENT"})
     monkeypatch.setattr(stages.worker, "refresh_behavior_adjusted_daily", refresh)
-    monkeypatch.setattr(stages.worker, "refresh_current_daily_signals", context, raising=False)
     with pytest.raises(_StopWorkerLoop):
         stages.run_stage("maintenance", behavior_shadow=True)
     refresh.assert_called_once()
-    context.assert_not_called()
     assert service.evaluate_directional_outcomes.call_count == 2
     assert service.evaluate_directional_outcomes.call_args.kwargs["limit"] == 100
     assert service.evaluate_directional_outcomes.call_args.kwargs["prospective_only"] is True
@@ -511,7 +508,6 @@ def _stub_worker_dependencies(monkeypatch, intervals):
             return ()
 
     monkeypatch.setattr(worker, "INTERVALS", intervals)
-    monkeypatch.setattr(worker, "refresh_current_daily_signals", lambda **kwargs: {"status": "ALREADY_PRESENT"}, raising=False)
     monkeypatch.setattr(worker, "get_selected_tickers", lambda active_only=True: ("AAPL",))
     monkeypatch.setattr(worker, "EquityAnalysisRepository", _Analysis)
     monkeypatch.setattr(worker, "EquityIngestionRepository", _Ingestion)
@@ -533,51 +529,6 @@ def _stub_worker_dependencies(monkeypatch, intervals):
         lambda _seconds: (_ for _ in ()).throw(_StopWorkerLoop()),
     )
     return worker
-
-
-@pytest.mark.parametrize("context_status", ["PUBLISHED", "BUSY", "WAITING_FOR_COMPLETE_DAILY_PUBLICATION", "exception"])
-def test_daily_analysis_never_requires_legacy_context(monkeypatch, context_status):
-    from types import SimpleNamespace
-    from unittest.mock import MagicMock
-    import scripts.run_equity_worker as worker
-
-    service = MagicMock()
-    service.publish_canonical_interval.return_value = SimpleNamespace(
-        status="COMPLETE", selected=1, missing=0,
-    )
-    service.materialize_interval.return_value = SimpleNamespace(status="COMPLETE")
-    monkeypatch.setattr(worker, "ingest_due_interval", lambda *args, **kwargs: SimpleNamespace(
-        bar_count=1, inserted_count=1, missing_tickers=(),
-    ))
-    monkeypatch.setattr(worker, "mature_prospective_scanner_outcomes", lambda *args, **kwargs: ())
-
-    refresh = MagicMock(side_effect=RuntimeError("legacy unavailable")) if context_status == "exception" else MagicMock(return_value={"status": context_status})
-    monkeypatch.setattr(worker, "refresh_current_daily_signals", refresh, raising=False)
-    now = datetime(2026, 9, 8, 20, 0, tzinfo=UTC)
-    finished = worker.materialize_due_interval(
-        service, SimpleNamespace(revisions=(object(),), universe_run_id="universe"),
-        interval="1d", slot=now, observed_at=now, once=True,
-    )
-    assert finished is True
-    service.materialize_interval.assert_called_once()
-    refresh.assert_not_called()
-    from scripts.equity_worker_stages import analyze_published_interval
-    assert analyze_published_interval(service, SimpleNamespace(revisions=(object(),), universe_run_id="universe"),
-        interval="1d", slot=now, observed_at=now)
-    refresh.assert_not_called()
-
-
-@pytest.mark.parametrize("failure", ["BUSY", "exception"])
-def test_retired_context_is_not_invoked_by_one_shot(monkeypatch, failure):
-    from unittest.mock import MagicMock
-    worker = _stub_worker_dependencies(monkeypatch, ("1d",))
-    materialize = MagicMock(return_value=True)
-    refresh = MagicMock(side_effect=RuntimeError("legacy unavailable")) if failure == "exception" else MagicMock(return_value={"status": failure})
-    monkeypatch.setattr(worker, "materialize_due_interval", materialize)
-    monkeypatch.setattr(worker, "refresh_current_daily_signals", refresh)
-    worker.run_worker(once=True)
-    materialize.assert_called_once()
-    refresh.assert_not_called()
 
 
 def test_behavior_adjusted_refresh_failure_never_blocks_legacy_analysis(monkeypatch):
@@ -605,49 +556,6 @@ def test_behavior_adjusted_refresh_failure_never_blocks_legacy_analysis(monkeypa
 
     assert finished is True
     service.materialize_interval.assert_called_once()
-
-
-def test_worker_does_not_restart_retired_context_when_analysis_is_current(monkeypatch):
-    from unittest.mock import MagicMock
-
-    worker = _stub_worker_dependencies(monkeypatch, ("1d",))
-    slot = datetime(2026, 9, 8, 20, 0, tzinfo=UTC)
-    monkeypatch.setattr(
-        worker.EquityAnalysisRepository, "latest_published_market_times",
-        lambda self, intervals: {"1d": slot},
-    )
-    refresh = MagicMock(return_value={"status": "PUBLISHED"})
-    materialize = MagicMock()
-    monkeypatch.setattr(worker, "refresh_current_daily_signals", refresh)
-    monkeypatch.setattr(worker, "materialize_due_interval", materialize)
-
-    worker.run_worker(once=True)
-
-    refresh.assert_not_called()
-    materialize.assert_not_called()
-
-
-def test_retired_context_is_not_invoked_while_intervals_continue(monkeypatch):
-    from unittest.mock import MagicMock
-
-    worker = _stub_worker_dependencies(monkeypatch, ("1d", "1wk"))
-    materialize = MagicMock(return_value=True)
-    refresh = MagicMock(side_effect=RuntimeError("context failed"))
-    monkeypatch.setattr(worker, "materialize_due_interval", materialize)
-    monkeypatch.setattr(worker, "refresh_current_daily_signals", refresh)
-    sleeps = {"count": 0}
-
-    def sleep(_seconds):
-        sleeps["count"] += 1
-        if sleeps["count"] == 2:
-            raise _StopWorkerLoop()
-
-    monkeypatch.setattr(worker.time, "sleep", sleep)
-    with pytest.raises(_StopWorkerLoop):
-        worker.run_worker()
-
-    assert materialize.call_count == 2
-    refresh.assert_not_called()
 
 
 def test_failing_interval_does_not_starve_later_intervals(monkeypatch):

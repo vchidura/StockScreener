@@ -1,7 +1,7 @@
 import type { OptionAlertPreviewRequest, OptionCandidateDetailData, OptionCandidateLeg, OptionStockBehaviorGateEvidence, OptionDetectorAlertReview } from '../services/api'
 import type { ColumnSpec } from '../layout/PageChrome'
 
-export type OptionAlertView = 'behavior' | 'day_history' | 'candidates' | 'daily' | 'history'
+export type OptionAlertView = 'behavior' | 'day_history' | 'daily'
 export type OptionAlertColumn = ColumnSpec & { tip?: string }
 
 const detectorObservationColumns: OptionAlertColumn[] = [
@@ -50,15 +50,6 @@ export function optionAlertTabParams(params: URLSearchParams, view: OptionAlertV
   next.set('view', view)
   for (const key of ['offset', 'candidate', 'event']) next.delete(key)
   return next
-}
-
-export function optionReviewSelection(params: URLSearchParams): 'ALL' | 'ELIGIBLE' | 'SHORTLIST' {
-  const selected = params.get('behavior')
-  return selected === 'ELIGIBLE' || selected === 'SHORTLIST' ? selected : 'ALL'
-}
-
-export function optionReviewScope(view: OptionAlertView): 'CURRENT' | 'HISTORY' | 'LATEST' {
-  return view === 'behavior' ? 'CURRENT' : view === 'day_history' || view === 'daily' ? 'HISTORY' : 'LATEST'
 }
 
 export const optionPlanColumns: OptionAlertColumn[] = [
@@ -181,130 +172,6 @@ export function writeDetectorPresets(storage: Pick<Storage, 'setItem'>, presets:
   const raw = JSON.stringify({ version: 1, presets })
   readDetectorPresets({ getItem: () => raw })
   storage.setItem(DETECTOR_PRESETS_KEY, raw)
-}
-
-export const optionBehaviorMetrics = [
-  { key: 'TREND_SLOPE_1d', label: 'Daily slope', metric: 'ema50_slope10_atr' },
-  { key: 'TREND_SLOPE_1h', label: 'Hourly slope', metric: 'ema50_slope10_atr' },
-  { key: 'TREND_SLOPE_30m', label: '30 minute slope', metric: 'ema50_slope10_atr' },
-  { key: 'TREND_STRENGTH_EVIDENCE_1d', label: 'Daily ADX', metric: 'adx14' },
-  { key: 'TREND_STRENGTH_EVIDENCE_1h', label: 'Hourly ADX', metric: 'adx14' },
-  { key: 'TREND_STRENGTH_EVIDENCE_30m', label: '30 minute ADX', metric: 'adx14' },
-  { key: 'EXTENSION_EVIDENCE_1d', label: 'Daily extension', metric: 'extension_ema21_atr' },
-  { key: 'EXTENSION_EVIDENCE_1h', label: 'Hourly extension', metric: 'extension_ema21_atr' },
-  { key: 'EXTENSION_EVIDENCE_30m', label: '30 minute extension', metric: 'extension_ema21_atr' },
-  { key: 'PARTICIPATION_EVIDENCE', label: 'Daily relative volume', metric: 'daily_rvol20' },
-  { key: 'RELATIVE_STRENGTH_EVIDENCE', label: 'Relative strength', metric: 'excess_return20' },
-  { key: 'UNDERLYING_LIQUIDITY_EVIDENCE', label: 'Underlying liquidity', metric: 'median_dollar_volume20' },
-]
-
-const dayHistoryColumns: OptionAlertColumn[] = [
-  { key: 'underlying', label: 'Underlying / model', group: 'Detection', locked: true },
-  { key: 'category', label: 'Category', group: 'Detection' },
-  { key: 'hit_count', label: 'Hits', group: 'Detection', tip: 'One hit per qualifying completed run for this exact model/version and package until expiry. Repeats are not independent outcome samples.' },
-  { key: 'source', label: 'Detected source (ET)', group: 'Detection', tip: 'Original source time, not publication time. Each row is a retained candidate occurrence.' },
-  { key: 'contracts', label: 'Contracts / structure', group: 'Package' },
-  { key: 'expiry', label: 'Expiry / DTE at source', group: 'Package' },
-  ...optionMarketColumns.filter(column => column.key !== 'mark_time').map(column => ({ ...column, hiddenByDefault: column.key !== 'option_price' })),
-  { key: 'current_price', label: 'Latest option price', group: 'Marked performance', tip: 'Latest retained exact-package mark, not a live quote or fill.' },
-  { key: 'price_pnl', label: 'Price P/L %', group: 'Marked performance', tip: 'Gross marked P/L / absolute original premium; missing marks stay unavailable.' },
-  { key: 'net_return', label: 'Net marked return', group: 'Marked performance', tip: 'After declared commission / original capital at risk; slippage unavailable.' },
-  { key: 'mark_time', label: 'Latest mark (ET)', group: 'Marked performance' },
-  { key: 'mark_status', label: 'Mark status', group: 'Marked performance' },
-  ...optionPlanColumns,
-  { key: 'behavior', label: 'Stock behavior', group: 'Assessment' },
-  { key: 'receipt', label: 'Receipt timing', group: 'Assessment', hiddenByDefault: true },
-  { key: 'entry', label: 'Entry window now', group: 'Assessment' },
-  { key: 'details', label: 'Details', group: 'Detection', locked: true },
-  { key: 'gross_pnl', label: 'Gross marked P/L', group: 'Marked performance', hiddenByDefault: true },
-  { key: 'net_pnl', label: 'Net marked P/L', group: 'Marked performance', hiddenByDefault: true },
-  { key: 'estimated_cost', label: 'Commission estimate', group: 'Marked performance', hiddenByDefault: true },
-]
-
-export const optionAlertColumns: Record<OptionAlertView, OptionAlertColumn[]> = {
-  day_history: dayHistoryColumns,
-  behavior: [
-    { key: 'underlying', label: 'Underlying / model', group: 'Package', locked: true },
-    { key: 'category', label: 'Category', group: 'Detection' },
-    { key: 'hit_count', label: 'Hits', group: 'Detection', tip: 'Initial detection plus distinct qualifying worker runs for the exact package. Refreshes and retries do not add hits.' },
-    { key: 'contracts', label: 'Contracts / structure', group: 'Package' },
-    { key: 'expiry', label: 'Expiry / DTE', group: 'Package' },
-    ...optionMarketColumns,
-    { key: 'premium', label: 'Package debit / credit', group: 'Package', tip: 'Original net premium per package, not traded-volume premium. Model capital at risk is shown below it.' },
-    ...optionPlanColumns,
-    { key: 'behavior', label: 'Stock behavior', group: 'Assessment' },
-    { key: 'receipt', label: 'Receipt timing', group: 'Assessment' },
-    { key: 'entry', label: 'Entry window now', group: 'Assessment' },
-    { key: 'details', label: 'Details', group: 'Package', locked: true },
-    { key: 'decision', label: 'Assessment decision (ET)', group: 'Assessment', hiddenByDefault: true },
-    { key: 'selection', label: 'Representative selection', group: 'Assessment', hiddenByDefault: true },
-    ...optionBehaviorMetrics.map(metric => ({ key: metric.key, label: metric.label, group: 'Recorded stock factors', hiddenByDefault: true })),
-  ],
-  candidates: [
-    { key: 'underlying', label: 'Underlying / model', group: 'Package', locked: true },
-    { key: 'contracts', label: 'Contracts / structure', group: 'Package' },
-    { key: 'expiry', label: 'Expiration / DTE', group: 'Package' },
-    ...optionMarketColumns,
-    { key: 'premium', label: 'Package debit / credit', group: 'Economics', tip: 'Original net premium per package; not cumulative traded premium.' },
-    ...optionPlanColumns,
-    { key: 'capital', label: 'Capital at risk', group: 'Economics' },
-    { key: 'source', label: 'Source (ET)', group: 'Evidence' },
-    { key: 'entry', label: 'Entry window', group: 'Evidence' },
-    { key: 'status', label: 'Candidate state', group: 'Evidence' },
-    { key: 'details', label: 'Details', group: 'Package', locked: true },
-    { key: 'structure', label: 'Structure', group: 'Package', hiddenByDefault: true },
-    { key: 'maximum_loss', label: 'Model maximum loss', group: 'Economics', hiddenByDefault: true },
-    { key: 'maximum_profit', label: 'Model maximum profit', group: 'Economics', hiddenByDefault: true },
-    { key: 'collateral', label: 'Collateral required', group: 'Economics', hiddenByDefault: true },
-    { key: 'breakevens', label: 'Model breakevens', group: 'Economics', hiddenByDefault: true },
-    { key: 'observed', label: 'Observed (ET)', group: 'Evidence', hiddenByDefault: true },
-    { key: 'reasons', label: 'Reason codes', group: 'Evidence', hiddenByDefault: true },
-    { key: 'policy', label: 'Strategy policy SHA256', group: 'Evidence', hiddenByDefault: true },
-  ],
-  history: [
-    { key: 'event', label: 'Event', group: 'Publication', locked: true },
-    { key: 'underlying', label: 'Underlying / strategy', group: 'Package', locked: true },
-    { key: 'structure', label: 'Package', group: 'Package' },
-    { key: 'contracts', label: 'Contracts', group: 'Package' },
-    { key: 'entry_marks', label: 'Original package price / share', group: 'Package', tip: 'Frozen net package premium reconciled to the original leg marks. Separate from the planned entry limit; not a current price or fill.' },
-    { key: 'current_price', label: 'Latest option price', group: 'Marked performance', tip: 'Last retained coherent package mark, not a live quote. See mark time and freshness.' },
-    { key: 'price_pnl', label: 'Price P/L %', group: 'Marked performance', tip: 'Gross package P/L divided by absolute original net premium. Credit gains reflect lower close cost. Ignores fills and stop/target exits.' },
-    { key: 'net_return', label: 'Net marked return', group: 'Marked performance', tip: 'P/L after declared commission divided by original capital at risk. Slippage unavailable; not an executed return.' },
-    { key: 'mark_time', label: 'Latest mark (ET)', group: 'Marked performance' },
-    { key: 'mark_status', label: 'Mark status', group: 'Marked performance' },
-    ...optionPlanColumns,
-    { key: 'remaining_hold', label: 'Time to exit deadline', group: 'Trade plan', tip: 'Time remaining to the frozen exit deadline; does not assert an open position.' },
-    { key: 'hit_count', label: 'Hits', group: 'Publication', tip: 'Distinct recorded source windows for this exact plan, including its initial decision. Refreshes and terminal events do not add hits; not confidence.' },
-    { key: 'recorded', label: 'Recorded (ET)', group: 'Publication' },
-    { key: 'entry_limit', label: 'Entry limit / package', group: 'Plan' },
-    { key: 'entry_deadline', label: 'Original deadline (ET)', group: 'Plan' },
-    { key: 'details', label: 'Details', group: 'Publication', locked: true },
-    { key: 'entry_leg_marks', label: 'Original leg prices / share', group: 'Package', hiddenByDefault: true },
-    { key: 'gross_pnl', label: 'Gross marked P/L', group: 'Marked performance', hiddenByDefault: true },
-    { key: 'net_pnl', label: 'Net marked P/L', group: 'Marked performance', hiddenByDefault: true },
-    { key: 'estimated_cost', label: 'Commission estimate', group: 'Marked performance', hiddenByDefault: true },
-    { key: 'source', label: 'Source (ET)', group: 'Publication', hiddenByDefault: true },
-    { key: 'exit_deadline', label: 'Exit deadline (ET)', group: 'Plan', hiddenByDefault: true },
-    { key: 'capital', label: 'Original capital at risk', group: 'Plan', hiddenByDefault: true },
-    { key: 'maximum_loss', label: 'Original maximum loss', group: 'Plan', hiddenByDefault: true },
-    { key: 'maximum_profit', label: 'Original maximum profit', group: 'Plan', hiddenByDefault: true },
-    { key: 'plan', label: 'Plan SHA256', group: 'Publication', hiddenByDefault: true },
-  ],
-  daily: [
-    { key: 'comparison', label: 'Comparison / model', group: 'Cohort', locked: true },
-    { key: 'structure', label: 'Structure / horizon', group: 'Cohort', locked: true },
-    { key: 'cohorts', label: 'Cohorts', group: 'Cohort' },
-    { key: 'coverage', label: 'Measured / coverage', group: 'Outcomes' },
-    { key: 'mean', label: 'Mean net marked return', group: 'Outcomes' },
-    { key: 'positive', label: 'Positive marked returns', group: 'Outcomes' },
-    { key: 'states', label: 'Outcome states', group: 'Outcomes' },
-    { key: 'minimum', label: 'Minimum net marked return', group: 'Outcomes', hiddenByDefault: true },
-    { key: 'maximum', label: 'Maximum net marked return', group: 'Outcomes', hiddenByDefault: true },
-  ],
-}
-
-export function optionAlertVisibleColumns(view: OptionAlertView, hidden: Set<string>): OptionAlertColumn[] {
-  return optionAlertColumns[view].filter(column => column.locked || !hidden.has(column.key))
 }
 
 export const optionAlertLabel = (value: string) => value.toLowerCase().replace(/_/g, ' ').replace(/^./, letter => letter.toUpperCase())

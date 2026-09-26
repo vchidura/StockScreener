@@ -4,10 +4,8 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   scanAll,
   getTickersOverview, getLatestPriceDate,
-  getDailyRecommendationsWithFallback,
   TickerOverviewRow,
   MarketRegime,
-  DailyRecommendationsResponse,
 } from '../services/api'
 import { MomentumRanks } from './EquityContextPanels'
 import { usePublishPageContext } from '../layout/pageContext'
@@ -52,10 +50,6 @@ function Dashboard() {
   const { data: overview = [], isFetching: overviewLoading } = useQuery<TickerOverviewRow[]>({
     queryKey: ['tickers', 'overview'],
     queryFn: () => getTickersOverview(),
-  })
-  const { data: dailyRecs = { trade_date: '', bull_recommendations: [], bear_recommendations: [], total_bull: 0, total_bear: 0, used_date: '' }, isFetching: recsLoading } = useQuery<DailyRecommendationsResponse & { used_date: string }>({
-    queryKey: ['daily-recommendations'],
-    queryFn: () => getDailyRecommendationsWithFallback(),
   })
   type StratEntry = { strategy: string; direction: 'buy' | 'sell' | 'hold'; weight: number }
   type FibWatchEntry = { ticker: string; signal: string; nearest_level: string; distance_pct: number; trend: string }
@@ -604,117 +598,6 @@ function Dashboard() {
       </div>
 
       <MomentumRanks />
-
-      {/* ─── DAILY RECOMMENDATIONS ─── */}
-      <div style={{ marginBottom: '1.25rem' }}>
-        <h3 style={SECTION_TITLE}>
-          💡 Daily Recommendations
-          <span style={{ ...SUBTITLE, color: 'var(--tm-warn)', fontWeight: 600 }}>
-            UNVALIDATED — legacy engine, 44.6% accuracy vs 55.0% for always-long
-          </span>
-        </h3>
-        <div style={{ fontSize: '0.72rem', color: 'var(--tm-faint)', margin: '-6px 0 10px' }}>
-          {dailyRecs.used_date ? `Data for ${dailyRecs.used_date}. ` : ''}
-          Retained as the historical baseline; not a trading recommendation.
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '14px' }}>
-          {/* Bull Recommendations Table */}
-          <div style={CARD}>
-            <h4 style={{ margin: '0 0 10px', fontSize: '0.9rem', color: 'var(--tm-pos)', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px' }}>
-              📈 Top Bull Signals ({dailyRecs.total_bull})
-            </h4>
-            {recsLoading ? (
-              <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>Loading recommendations...</div>
-            ) : dailyRecs.bull_recommendations.length === 0 ? (
-              <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>No bull recommendations available</div>
-            ) : (
-              <div style={{ maxHeight: '300px', overflowY: 'auto' }}>
-                <table style={{ width: '100%', fontSize: '0.84rem', borderCollapse: 'collapse' }}>
-                  <thead style={{ position: 'sticky', top: 0, background: 'var(--tm-surface)', zIndex: 1 }}>
-                    <tr style={{ borderBottom: '1px solid var(--tm-line)' }}>
-                      <th style={{ padding: '8px 6px', textAlign: 'left', fontWeight: 700, color: 'var(--tm-muted)', fontSize: '0.75rem', borderBottom: '2px solid var(--tm-pos)' }}>Ticker</th>
-                      <th style={{ padding: '8px 6px', textAlign: 'right', fontWeight: 700, color: 'var(--tm-muted)', fontSize: '0.75rem', borderBottom: '2px solid var(--tm-pos)' }}>Rank</th>
-                      <th style={{ padding: '8px 6px', textAlign: 'right', fontWeight: 700, color: 'var(--tm-muted)', fontSize: '0.75rem', borderBottom: '2px solid var(--tm-pos)' }}>Confidence</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {dailyRecs.bull_recommendations.map((rec) => (
-                      <tr key={rec.rec_id} style={{ borderBottom: '1px solid var(--tm-line)', backgroundColor: rec.confidence >= 70 ? 'var(--tm-pos-soft)' : 'transparent' }}>
-                        <td style={{ padding: '8px 6px', fontWeight: 700, cursor: 'pointer', color: 'var(--tm-accent)' }}>
-                          {rec.ticker}
-                        </td>
-                        <td style={{ padding: '8px 6px', textAlign: 'right', color: 'var(--tm-muted)', fontSize: '0.82rem' }}>
-                          #{rec.rank}
-                        </td>
-                        <td style={{ padding: '8px 6px', textAlign: 'right' }}>
-                          <span style={{
-                            fontSize: '0.85rem',
-                            fontWeight: 700,
-                            padding: '3px 8px',
-                            background: 'var(--tm-pos)',
-                            color: 'var(--tm-on-accent)',
-                            borderRadius: '4px'
-                          }}>
-                            {rec.confidence.toFixed(0)}%
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
-
-          {/* Bear Recommendations Table */}
-          <div style={CARD}>
-            <h4 style={{ margin: '0 0 10px', fontSize: '0.9rem', color: 'var(--tm-neg)', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px' }}>
-              📉 Top Bear Signals ({dailyRecs.total_bear})
-            </h4>
-            {recsLoading ? (
-              <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>Loading recommendations...</div>
-            ) : dailyRecs.bear_recommendations.length === 0 ? (
-              <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>No bear recommendations available</div>
-            ) : (
-              <div style={{ maxHeight: '300px', overflowY: 'auto' }}>
-                <table style={{ width: '100%', fontSize: '0.84rem', borderCollapse: 'collapse' }}>
-                  <thead style={{ position: 'sticky', top: 0, background: 'var(--tm-surface)', zIndex: 1 }}>
-                    <tr style={{ borderBottom: '1px solid var(--tm-line)' }}>
-                      <th style={{ padding: '8px 6px', textAlign: 'left', fontWeight: 700, color: 'var(--tm-muted)', fontSize: '0.75rem', borderBottom: '2px solid var(--tm-neg)' }}>Ticker</th>
-                      <th style={{ padding: '8px 6px', textAlign: 'right', fontWeight: 700, color: 'var(--tm-muted)', fontSize: '0.75rem', borderBottom: '2px solid var(--tm-neg)' }}>Rank</th>
-                      <th style={{ padding: '8px 6px', textAlign: 'right', fontWeight: 700, color: 'var(--tm-muted)', fontSize: '0.75rem', borderBottom: '2px solid var(--tm-neg)' }}>Confidence</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {dailyRecs.bear_recommendations.map((rec) => (
-                      <tr key={rec.rec_id} style={{ borderBottom: '1px solid var(--tm-line)', backgroundColor: rec.confidence >= 70 ? 'var(--tm-neg-soft)' : 'transparent' }}>
-                        <td style={{ padding: '8px 6px', fontWeight: 700, cursor: 'pointer', color: 'var(--tm-accent)' }}>
-                          {rec.ticker}
-                        </td>
-                        <td style={{ padding: '8px 6px', textAlign: 'right', color: 'var(--tm-muted)', fontSize: '0.82rem' }}>
-                          #{rec.rank}
-                        </td>
-                        <td style={{ padding: '8px 6px', textAlign: 'right' }}>
-                          <span style={{
-                            fontSize: '0.85rem',
-                            fontWeight: 700,
-                            padding: '3px 8px',
-                            background: 'var(--tm-neg)',
-                            color: 'var(--tm-on-accent)',
-                            borderRadius: '4px'
-                          }}>
-                            {rec.confidence.toFixed(0)}%
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
 
       {/* ─── ROW 3: Scanner Agreement + Fib Sentiment ─── */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '14px', marginBottom: '1.25rem' }}>

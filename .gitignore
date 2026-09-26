@@ -100,3 +100,4 @@ backend/research/scanner_confidence_study.json
 # Reviewed local launches pin a machine's source ledger and runtime checkout.
 backend/research/options_technical_forward_*.json
 backend/research/options_observations_*.json
+!backend/research/options_observations_20260928_v28.json

@@ -9,9 +9,13 @@ Keep this always-loaded file short. Detailed guidance is loaded only when needed
 - Before running commands, read [Windows execution](instructions/windows-execution.instructions.md)
   once for the current task. It also applies to read-only audits and commands
   that do not touch a matching file.
-- For multi-step work or a resumed task, follow [context retention](../docs/AGENT_CONTEXT.md)
-  and load only that task's checkpoint. Do not load every checkpoint or the entire
-  repository memory/history. Do not reread unchanged guidance on every tool call.
+- For multi-step Stock Alerts work, load only
+  [stock-alerts](../docs/agent-context/stock-alerts.md). For Options Alerts work,
+  load only [options-alerts](../docs/agent-context/options-alerts.md). Follow
+  [context retention](../docs/AGENT_CONTEXT.md) for compact handoffs. Do not load
+  retired checkpoints, the entire repository memory or prior conversation history.
+- Start a new chat when changing model, workstream or design/implementation/runtime
+  phase. Carry forward one checkpoint, exact file anchors and one focused check.
 - Runtime/startup authority: [README](../README.md) and
   [deployment](../docs/DEPLOYMENT.md). Treat audit reports as dated evidence, not
   current process state or standing permission to act.

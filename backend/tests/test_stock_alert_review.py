@@ -101,7 +101,7 @@ def test_stock_eod_review_excludes_missed_runs_from_selection_statistics():
 
 def test_stock_eod_review_route_is_read_only_and_forwards_filters(monkeypatch):
     from datetime import date
-    from equity.stock_discovery_api import alert_eod_review
+    from equity.stock_alert_api import alert_eod_review
     import equity.stock_alert_results as repository
 
     calls = []

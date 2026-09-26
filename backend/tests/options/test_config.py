@@ -30,8 +30,6 @@ def test_runtime_configuration_is_frozen_read_only_and_secret_safe():
     assert runtime.settings.start_read_only is True
     assert runtime.settings.stock_behavior_shadow_enabled is False
     assert runtime.settings.package_assessments_enabled is False
-    assert runtime.settings.baseline_alerts_enabled is False
-    assert runtime.settings.baseline_alerts_effective_from is None
     assert runtime.settings.outcome_unavailable_evidence_enabled is False
     assert runtime.settings.underlyers == (
         "AAPL",
@@ -80,18 +78,6 @@ def test_runtime_configuration_is_frozen_read_only_and_secret_safe():
         runtime.policy.contract_filter.maximum_dte = 30
 
 
-def test_baseline_alerts_require_aware_effective_date_without_changing_source_identity():
-    disabled = load_option_runtime_configuration(_environment(), BACKEND_DIR)
-    with pytest.raises(ValueError, match="EFFECTIVE_FROM"):
-        load_option_runtime_configuration(_environment(OPTION_BASELINE_ALERTS_ENABLED="true"), BACKEND_DIR)
-    with pytest.raises(ValueError, match="timezone-aware"):
-        load_option_runtime_configuration(_environment(OPTION_BASELINE_ALERTS_ENABLED="true",
-            OPTION_BASELINE_ALERTS_EFFECTIVE_FROM="2026-09-21T13:30:00"), BACKEND_DIR)
-    enabled = load_option_runtime_configuration(_environment(OPTION_BASELINE_ALERTS_ENABLED="true",
-        OPTION_BASELINE_ALERTS_EFFECTIVE_FROM="2026-09-21T13:30:00Z"), BACKEND_DIR)
-    assert enabled.settings.baseline_alerts_enabled
-    assert enabled.configuration_sha256 == disabled.configuration_sha256
-    assert enabled.strategy_policy_sha256 == disabled.strategy_policy_sha256
 
 
 def test_stock_behavior_shadow_is_explicit_and_not_part_of_market_configuration_identity(

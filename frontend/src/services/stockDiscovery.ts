@@ -1,6 +1,6 @@
 import api from './api'
 
-export type AlertSource = 'SHADOW' | 'REPLAY' | 'LEGACY'
+export type AlertSource = 'SHADOW' | 'REPLAY'
 
 export interface AlertPublication {
   run_id: string

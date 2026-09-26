@@ -3,7 +3,7 @@ import { Link, type SetURLSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { Copy, Download, Eye, FolderOpen, Pencil, Plus, Save, Search, Trash2, Upload, RotateCcw, Check, ChevronDown, X } from 'lucide-react'
 import { ColumnPicker } from '../layout/PageChrome'
-import { getOptionCandidate, getOptionCandidates, queryEligibleChain, type EligibleChainRow, type EligibleChainRequest, type OptionCandidateRow, type OptionDiscoveryCatalog } from '../services/api'
+import { queryEligibleChain, type EligibleChainRow, type EligibleChainRequest, type OptionDiscoveryCatalog } from '../services/api'
 import { Modal } from './ScreenLibrary'
 import { chainFilterRanges, columnsForView, independentScreenQuery, makeOptionsScreen, optionColumnPresets, optionContractDetailSections, optionRuleLabels, optionTemplates, OPTIONS_LIBRARY_KEY, readOptionsLibrary, screenQuery, visibleOptionsColumns, writeOptionsLibrary, type OptionsLibrary, type OptionsScreen, type OptionsView } from './optionsScreenLibrary'
 import { optionAlertMoney, optionAlertPercent, optionAlertTime } from './optionsAlertPresentation'
@@ -11,7 +11,6 @@ import './StockScreeningPage.css'
 
 type ControlsProps = { catalog?: OptionDiscoveryCatalog; params: URLSearchParams; setParams: SetURLSearchParams }
 const readable = (value: string) => value.replace(/_/g, ' ')
-const money = (value: string | number | null | undefined) => value == null ? 'Unavailable' : Number(value).toLocaleString('en-US', { style: 'currency', currency: 'USD' })
 const timestamp = (value: string) => new Date(value).toLocaleString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
 function download(content: string, name: string, type: string) {
   const url = URL.createObjectURL(new Blob([content], { type }))
@@ -336,53 +335,4 @@ export function OptionsChainResults({ catalog, params, setParams, sessionDate, r
     </section>
     {selectedContract && <OptionContractDetail row={selectedContract} close={() => setSelectedContract(null)} />}
   </>
-}
-
-export function OptionsPackageResults({ catalog, params, setParams, sessionDate }: ControlsProps & { sessionDate?: string }) {
-  const [selected, setSelected] = useState<string | null>(null)
-  let invalid = ''
-  try { if (catalog) screenQuery(params, catalog) } catch (failure) { invalid = failure instanceof Error ? failure.message : 'Invalid filters' }
-  const category = catalog?.categories.find(item => item.id === params.get('category'))?.id
-  const args = { session_date: sessionDate, structured_only: true, status: 'SELECTED' as const, category,
-    strategy: params.get('model') || undefined, underlyer: params.get('underlyer') || undefined,
-    minimum_dte: Number(params.get('min_dte') || 0), maximum_dte: Number(params.get('max_dte') || 60),
-    maximum_capital: params.has('max_capital') ? Number(params.get('max_capital')) : undefined,
-    sort: (params.get('sort') || 'DEFAULT') as 'DEFAULT' | 'CAPITAL_ASC' | 'DTE_ASC', limit: 100, offset: Number(params.get('offset') || 0) }
-  const query = useQuery({ queryKey: ['options', 'package-screen', args], queryFn: () => getOptionCandidates(args), enabled: !!catalog && !invalid, refetchInterval: 60_000 })
-  const detail = useQuery({ queryKey: ['options', 'candidate', selected], queryFn: () => getOptionCandidate(selected!), enabled: !!selected })
-  const rows = query.data?.data.rows || []
-  const columns = columnsForView('packages').filter(column => column.locked || !params.has('columns') || params.get('columns')!.split(',').includes(column.key))
-  const value = (row: OptionCandidateRow, key: string): ReactNode => {
-    if (key === 'legs') return row.legs.map(leg => <div key={leg.leg_index}>{leg.side} {leg.ratio} {leg.contract_ticker}<small>Multiplier {leg.multiplier} / mark {money(leg.model_mark)}</small></div>)
-    if (key === 'structure_type') return <><strong>{readable(row.structure_type)}</strong><small>{row.expiration_date}</small></>
-    if (key === 'eligibility') return <span title={row.reason_codes.map(readable).join('; ')}>{row.execution_eligibility || 'Not eligible'}</span>
-    if (key === 'net_premium') return row.net_premium == null ? 'Unavailable' : `${money(Math.abs(Number(row.net_premium)))} ${Number(row.net_premium) >= 0 ? 'credit' : 'debit'}`
-    if (['capital_at_risk', 'collateral_required', 'maximum_profit', 'maximum_loss'].includes(key)) return money(row[key as keyof OptionCandidateRow] as string | null)
-    if (key === 'breakevens') return row.breakevens.map(amount => money(amount)).join(', ') || 'Unavailable'
-    if (key === 'market_data_time') return timestamp(row.market_data_time)
-    if (key === 'structure_risk_class') return readable(row.structure_risk_class)
-    return String(row[key as keyof OptionCandidateRow] ?? 'Unavailable')
-  }
-  const page = (offset: number) => { const next = new URLSearchParams(params); next.set('offset', String(offset)); setParams(next) }
-  return <section className="screener-table-panel os-package-panel">
-    <header><div><h2>Complete strategy packages</h2><span>{query.data?.data.total ?? 0} matched / {rows.length} shown</span></div><button type="button" title="Export displayed packages" aria-label="Export displayed packages" disabled={!rows.length} onClick={() => download(JSON.stringify({ source: 'DELAYED_RESEARCH', as_of: query.data?.as_of, filters: args, rows }, null, 2), 'option-packages.json', 'application/json')}><Download size={16} /></button></header>
-    {query.isLoading && <p role="status">Loading packages...</p>}{query.isError && <p role="alert">Package data unavailable.</p>}
-    {query.data?.data.serving_mode === 'HISTORICAL_PREVIOUS_POLICY' && rows.length > 0 && <p role="status">Historical previous-policy evidence</p>}
-    <div className="screener-table-wrap"><table className="os-package-table"><thead><tr>{columns.map(column => <th key={column.key}>{column.label}</th>)}<th>Evidence</th></tr></thead><tbody>
-      {!invalid && rows.map(row => <tr key={row.candidate_id}>{columns.map(column => <td key={column.key}>{value(row, column.key)}</td>)}<td><button type="button" title={`Inspect ${row.underlying} package`} aria-label={`Inspect package ${row.candidate_id}`} onClick={() => setSelected(row.candidate_id)}><Eye size={16} /></button></td></tr>)}
-      {!query.isLoading && !rows.length && <tr><td colSpan={columns.length + 1}>{invalid || 'No complete packages match this screen.'}</td></tr>}
-    </tbody></table></div>
-    <footer><span>Delayed model marks / not executable quotes</span><div><button type="button" disabled={args.offset === 0} onClick={() => page(Math.max(0, args.offset - 100))}>Previous</button><button type="button" disabled={args.offset + rows.length >= (query.data?.data.total || 0)} onClick={() => page(args.offset + 100)}>Next</button></div></footer>
-    {selected && <Modal title="Package evidence" close={() => setSelected(null)} wide><div className="os-library-content os-package-detail">
-      {detail.isLoading && <p>Loading evidence...</p>}{detail.isError && <p role="alert">Evidence unavailable.</p>}
-      {detail.data?.data && <><h3>{detail.data.data.candidate.underlying} / {readable(detail.data.data.candidate.structure_type)}</h3>
-        <p>Source {timestamp(detail.data.data.candidate.market_data_time)} ET / observed {timestamp(detail.data.data.candidate.observed_time)} ET</p>
-        {detail.data.data.legs.map(leg => <p key={leg.leg_index}>{leg.side} {leg.ratio} {leg.contract_ticker} / multiplier {leg.multiplier} / mark {money(leg.model_mark)}</p>)}
-        <h3>Execution gates</h3>{detail.data.data.execution_gates.map(gate => <p key={gate.gate_name}><strong>{readable(gate.gate_name)}: {gate.verdict}</strong> {gate.reason_codes.map(readable).join('; ')}</p>)}
-        <h3>Context</h3><p>Trend: {detail.data.data.candidate.trend_state || 'Unavailable'} / earnings: {detail.data.data.candidate.earnings_blackout_state || 'Unavailable'} / FOMC: {detail.data.data.candidate.fed_blackout_state || 'Unavailable'}</p>
-        <h3>Spot / IV / time scenarios</h3><div className="screener-table-wrap"><table className="os-package-table"><thead><tr><th>Spot shock</th><th>IV shock</th><th>Time remaining</th><th>Modeled P/L</th></tr></thead><tbody>{detail.data.data.scenarios.map(scenario => <tr key={scenario.scenario_result_id}><td>{(scenario.spot_shock_fraction * 100).toFixed(1)}%</td><td>{(scenario.iv_shock_fraction * 100).toFixed(1)}%</td><td>{(scenario.time_fraction_remaining * 100).toFixed(1)}%</td><td>{money(scenario.profit_loss)}</td></tr>)}</tbody></table></div>
-        <h3>Management policy</h3>{Object.entries(detail.data.data.candidate.management_policy).map(([key, item]) => <p key={key}>{readable(key)}: {typeof item === 'object' ? JSON.stringify(item) : String(item)}</p>)}
-        <p>Candidate {selected}</p><p>Policy {detail.data.data.candidate.policy_sha256}</p></>}
-    </div></Modal>}
-  </section>
 }

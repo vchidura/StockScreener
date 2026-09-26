@@ -115,6 +115,35 @@ def test_complete_run_allows_only_monotonic_terminal_upgrade():
     assert "status = 'DEGRADED'" in sql
     assert "completeness_fraction < %s" in sql
     assert parameters == (
-        "COMPLETE", 1.0, completed_at, run_id, "COMPLETE", 1.0,
+        "COMPLETE", 1.0, completed_at, run_id, 1.0,
     )
     connection.commit.assert_called_once_with()
+
+
+def test_degraded_retry_can_improve_and_never_regresses_terminal_coverage():
+    repository, _, cursor = _repository()
+    run_id = uuid4()
+    completed_at = datetime(2026, 9, 25, 20, 30, tzinfo=UTC)
+
+    cursor.rowcount = 0
+    cursor.fetchone.return_value = {
+        "status": UniverseRunStatus.DEGRADED.value,
+        "completeness_fraction": 12 / 13,
+    }
+    repository.complete_run(
+        run_id,
+        UniverseRunStatus.DEGRADED,
+        1 / 13,
+        completed_at,
+    )
+
+    update, parameters = cursor.execute.call_args_list[0].args
+    assert "status = 'DEGRADED'" in update
+    assert "completeness_fraction < %s" in update
+    assert parameters == (
+        UniverseRunStatus.DEGRADED.value,
+        1 / 13,
+        completed_at,
+        run_id,
+        1 / 13,
+    )

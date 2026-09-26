@@ -1,0 +1,233 @@
+{
+  "acceptance_source": {
+    "availability_contract": "DIRECT_COMMITTED_LEDGER_RECEIPT",
+    "detector_version": "range_breakout_acceptance_intraday_v2",
+    "instance_id": "bf2210d08af0ddf5c24cc996b69e32ef03cef810afcc949b1f2ac12c2fe2c17c",
+    "instance_policy_sha256": "665c2f74a00ff5c9e7a6c014bb6fc4d7b5146a73d7a86666044692d2066188b8",
+    "price_basis": "RAW_ACTION_GATED",
+    "publication_policy_sha256": "b22823a1d56971598eead81e55edfa787b212910e09d17f8d65587b1dca91870",
+    "runtime_sources": [
+      [
+        "equity/stock_idea_forward_source.py",
+        "a87f73255ad54feb396a871df82f5fbef71d6a208407665ef67126a5b8297ae4"
+      ],
+      [
+        "research/stock_idea_engine.py",
+        "ac7003f891b64d4d1766fbbfa900cbfa40f469b246f39d2f1a974ba0fe82b89c"
+      ],
+      [
+        "research/stock_idea_forward.py",
+        "adc6bc538fffdfb69b92c128ab9e0f0735725ee2a33f9f7a2b46a5adf93fea83"
+      ],
+      [
+        "research/stock_idea_models.py",
+        "cd096cacf1dfd9da4eff95161f1681450f23f6e555507cead9b8d093640c0072"
+      ],
+      [
+        "research/stock_idea_replay.py",
+        "71061319757d0629e4811b760d122819bd474230ed42bafafd9bd001ed2622d9"
+      ],
+      [
+        "scripts/run_stock_idea_worker.py",
+        "7013438dff86e8cae27cf6852d8d1d0d9d7d037244da2c2f2b45615b50ccf413"
+      ]
+    ],
+    "version": "stock_setup_direct_source_v1"
+  },
+  "alert_mode": "DEVELOPMENT_OBSERVATIONS",
+  "configuration_sha256": "457a37c190cea07201c9ee16397fe90370072beea13d0b599a4f60a6443b692a",
+  "dataset_id": "options-observations-20260928-v28",
+  "effective_from": "2026-09-28T13:30:00Z",
+  "evidence_mode": "PROSPECTIVE_RECEIPT",
+  "execution_permission": false,
+  "maximum_new_alerts": 20,
+  "o1_confirmation_policy_sha256": "9035d4ebfaae5a644e95a19aa3e51f9ea8e7614b9140ad6f3c839fe47c72dd33",
+  "qualification_policy_sha256": "203eff2d823a4894c095d39f2313c8a8bf486698fee4be8e704b41e6ca7c33ed",
+  "resumption_source": {
+    "availability_contract": "DIRECT_COMMITTED_LEDGER_RECEIPT",
+    "detector_version": "relative_trend_resumption_intraday_v1",
+    "instance_id": "bf2210d08af0ddf5c24cc996b69e32ef03cef810afcc949b1f2ac12c2fe2c17c",
+    "instance_policy_sha256": "665c2f74a00ff5c9e7a6c014bb6fc4d7b5146a73d7a86666044692d2066188b8",
+    "price_basis": "RAW_ACTION_GATED",
+    "publication_policy_sha256": "b22823a1d56971598eead81e55edfa787b212910e09d17f8d65587b1dca91870",
+    "runtime_sources": [
+      [
+        "equity/stock_idea_forward_source.py",
+        "a87f73255ad54feb396a871df82f5fbef71d6a208407665ef67126a5b8297ae4"
+      ],
+      [
+        "research/stock_idea_engine.py",
+        "ac7003f891b64d4d1766fbbfa900cbfa40f469b246f39d2f1a974ba0fe82b89c"
+      ],
+      [
+        "research/stock_idea_forward.py",
+        "adc6bc538fffdfb69b92c128ab9e0f0735725ee2a33f9f7a2b46a5adf93fea83"
+      ],
+      [
+        "research/stock_idea_models.py",
+        "cd096cacf1dfd9da4eff95161f1681450f23f6e555507cead9b8d093640c0072"
+      ],
+      [
+        "research/stock_idea_replay.py",
+        "71061319757d0629e4811b760d122819bd474230ed42bafafd9bd001ed2622d9"
+      ],
+      [
+        "scripts/run_stock_idea_worker.py",
+        "7013438dff86e8cae27cf6852d8d1d0d9d7d037244da2c2f2b45615b50ccf413"
+      ]
+    ],
+    "version": "stock_resumption_direct_source_v1"
+  },
+  "runtime_sources": [
+    [
+      "equity/behavior.py",
+      "d0e9668585725741dea995606790fe3c1e55880d05831272f226f2cdb8bc96c9"
+    ],
+    [
+      "equity/behavior_sources.py",
+      "7de2f777c8c3635756a51c65ad764b742eb1d1f197188ccafbe1bd83c4f9f3b3"
+    ],
+    [
+      "equity/materialization.py",
+      "daa80daf443e7ecaa12f84640749dd7218f2747ac22657571751d645649229e9"
+    ],
+    [
+      "equity/polygon.py",
+      "f37fee5ee3da698782441800b9b2b5b2a5dfe7b17c65c8f157f93f2a655a1999"
+    ],
+    [
+      "equity/setup_composition.py",
+      "a70688754426601957b482fb1ef87f264d1783c54c603c3d5250bd2d4f7cdb44"
+    ],
+    [
+      "equity/stock_alert_results.py",
+      "daa97f0066cbdbd4dee88940f5e4c2070e1d1083f6f12514dcb49742cd6fe4a4"
+    ],
+    [
+      "options/alert_plans.py",
+      "3ad8a702d2aeeaa48520a65032c2adec2b7ef553853d632be14b7ab34b029a2e"
+    ],
+    [
+      "options/alert_qualification.py",
+      "f8b23d18fe21d21b768e3ea7f07a8feb7cb1d60d24571fa8ea78b67749e6b6b8"
+    ],
+    [
+      "options/analytics/alert_selection.py",
+      "3678f6fab6b13eb742972565ecc899af094f708b3f71d6b9bc5b2855449eedb8"
+    ],
+    [
+      "options/analytics/marks.py",
+      "e68432db35449509bb44fa63f00429c1bdda1a110f32c523e996eab1153af99d"
+    ],
+    [
+      "options/config.py",
+      "6b5c1e0dec03ee98ac9157cdbec4bec210139637d202e03b16aac3d05c9a97bf"
+    ],
+    [
+      "options/credit_detection.py",
+      "9cc224884da55775419e3907ab624431b3f8ee7e531f94c601f9077ae39972b2"
+    ],
+    [
+      "options/data/polygon_developer.py",
+      "53b190cf651d2aee651b90a31d771ef6b7fe00b6f410a88e349617746fb38e40"
+    ],
+    [
+      "options/detector_collection.py",
+      "a25d5527437311365b6946e8fb5802a0c4a6e7383b5ed35e6c5b313a074cb0b9"
+    ],
+    [
+      "options/detector_launch.py",
+      "2b6efe85305189b20736eebb66bd865c65f2ca04c6167378a7de3f8ba876afe6"
+    ],
+    [
+      "options/dual_origin.py",
+      "337d824aae30db92a04ccb25cc3101852d8807ce0c4fb3d05f107ad8552e2471"
+    ],
+    [
+      "options/intraday_participation.py",
+      "7cadf8261d901b6ebb9aefe59b4cabda8994c0dc656de9cd807545cf6cc644c4"
+    ],
+    [
+      "options/orchestration.py",
+      "1d9f25b20ecc4c30702d8150440355894e714103cda2372b17e89b6dff807ee8"
+    ],
+    [
+      "options/outcome_service.py",
+      "2b6d3134338a4bdcda897d0d6ce535d15807328f36e3daad8782ed8612a247cb"
+    ],
+    [
+      "options/repositories/alert_evaluations.py",
+      "d17b2bb1b2db49232511083a5db7dad8374df95245614475f42c63c48a38c8a7"
+    ],
+    [
+      "options/repositories/outcomes.py",
+      "e5ee5242fc65199c3b93613f546dfc3b03a138b64e5e0ee20bc18855ea0e1ce0"
+    ],
+    [
+      "options/repositories/stock_behavior_assessments.py",
+      "4f2cc8eb143b88d11c766f7160a951d55f5413a0a77f8bc9914f6d82300dcf58"
+    ],
+    [
+      "options/repositories/trades.py",
+      "a87437a1106c0aa4d1f06555a3f648c86247bf59674f4f4d9ead5e88f525d9df"
+    ],
+    [
+      "options/stock_behavior_gates.py",
+      "99882b812e1a21fd9f6e500989abb0005cdde533bc5c983a28d994e56d3f6c70"
+    ],
+    [
+      "options/stock_setup_binding.py",
+      "4e27a2417107c11428c47c8a81393a650bf278af977d7c301e209845df90e5d9"
+    ],
+    [
+      "options/strategies/engine.py",
+      "e7b30d623223ab32d5adac92053baba99fee899da89a5a7ad5a0efabf6bf9164"
+    ],
+    [
+      "options/strategy_orchestration.py",
+      "75f56a378ca62c9273ef7674104841c47ffa7e4387890a85eb314513db29cf33"
+    ],
+    [
+      "options/surface_detection.py",
+      "b110139b6628aea1f8603e87f39a1ee3d5ff3d3344ed41b7709a16f095f32d69"
+    ],
+    [
+      "options/worker.py",
+      "a630e92ef61974a56294404791e1f2c28cba1e0e8731db810345cbf033c6a0fc"
+    ],
+    [
+      "scripts/run_option_outcome_worker.py",
+      "0921fd11aed1e2d04a4b7641d3fc5a7b49888ab503f9a65150347027d12be81c"
+    ],
+    [
+      "scripts/run_option_worker.py",
+      "69d8ca0eafe23523b71fdc1297739ff2206bba72452f2e9dc03c5bec6a5dd901"
+    ],
+    [
+      "scripts/run_worker_group.py",
+      "db37fec2a38a3f6c62ca359f181c42d165044e12d238693eaa1a39bcc42b7ac6"
+    ]
+  ],
+  "schema_version": "option_detector_forward_launch_v6",
+  "stock_ledger": "backups/equity-shadow/stock-ideas-forward-v2/forward.sqlite",
+  "stock_readiness_policy": "PER_MODEL_EXACT_WINDOW_WAIT_V2",
+  "stock_setup_wait_policy_sha256": "2af31e81ae33ba6884f98b82a9d70ee700e968552634122c1f4feb0c807ac8da",
+  "strategy_policy_sha256": "9db0f4a34935dad87fd308b6efc3f24f732eb2913fc48fdf5b4a3fea5d8669fc",
+  "technical_policy_sha256": "f585c58d12acf379234c9d25c91ec0d390a986ab09e9ff2a2f85b3302c0704a7",
+  "underlyers": [
+    "AAPL",
+    "AMD",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "MSFT",
+    "NVDA",
+    "PLTR",
+    "SOFI",
+    "TSLA",
+    "SPY",
+    "QQQ",
+    "IWM"
+  ],
+  "valuation_policy_sha256": "2570137d7f64b9f51edce12dca7d74a4f9fdf16ff4817230b1c412d8eb55e289"
+}

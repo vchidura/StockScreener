@@ -81,7 +81,15 @@ generated source copy is tracked.
 | `GET /api/chart-patterns/scan` | Materialized Pattern Watch scan |
 | `GET /api/scan/*` | Worker-published scanner pages |
 | `GET /api/sector-intelligence` | Worker-published sector view |
-| `GET /api/options/health` | Read-only option research readiness |
+| `POST /api/options/eligible-chain/query` | Stored-contract options screening |
+| `GET /api/options/alerts/detector-runs` | Options alert run evidence |
+| `GET /api/options/flow` | Delayed option activity and flow |
 
 Legacy `stock_prices_*` and scanner-event tables are not part of the canonical
 baseline and must not be recreated.
+
+The inactive `daily_recommendations`, `opening_pattern_scores`,
+`pattern_analog_matches`, and `pattern_calibration_priors` relations are retained
+as historical data only. Their portal, API, generator, tracker, analog, and
+calibration code was removed on 2026-09-25. Consider a drop migration only after a
+future observation confirms no external readers or audit dependency.

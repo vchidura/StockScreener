@@ -21,7 +21,6 @@ const OptionsScreenerPage = lazy(() => import('./pages/OptionsScreeningWorkspace
 const StockScreenerPage = lazy(() => import('./pages/StockScreeningPage'))
 const StockAlertsPage = lazy(() => import('./pages/StockAlertsPage'))
 const OptionsAlertsPage = lazy(() => import('./pages/OptionsAlertsPage'))
-const OptionsResearchWorkspace = lazy(() => import('./pages/OptionsResearchWorkspace'))
 const Account = lazy(() => import('./pages/auth/Account'))
 const SignIn = lazy(() => import('./pages/auth/SignIn'))
 const SignUp = lazy(() => import('./pages/auth/SignUp'))
@@ -57,7 +56,7 @@ function PortalRoutes() {
         <Route path="/options/alerts" element={<OptionsAlertsPage />} />
         <Route path="/stocks/screener" element={<StockScreenerPage />} />
         <Route path="/stocks/alerts" element={<StockAlertsPage />} />
-        <Route path="/options/*" element={<OptionsResearchWorkspace />} />
+        <Route path="/options/*" element={<Navigate to="/options/screener" replace />} />
         <Route path="/account" element={<Account />} />
         <Route path="/scanner-results" element={<Navigate to="/stocks/persistence" replace />} />
         <Route path="/scanner-evaluation" element={<Navigate to="/stocks/persistence" replace />} />

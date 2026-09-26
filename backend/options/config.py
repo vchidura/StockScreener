@@ -59,8 +59,6 @@ class OptionSettings(_FrozenModel):
     stock_behavior_shadow_enabled: bool = False
     stock_behavior_shadow_launch_file: Path | None = None
     package_assessments_enabled: bool = False
-    baseline_alerts_enabled: bool = False
-    baseline_alerts_effective_from: datetime | None = None
     outcome_unavailable_evidence_enabled: bool = False
     execution_engine: ExecutionEngine = ExecutionEngine.PAPER_PROXY
     universe_mode: UniverseMode = UniverseMode.FIXED
@@ -145,10 +143,6 @@ class OptionSettings(_FrozenModel):
 
     @model_validator(mode="after")
     def _validate_universe(self) -> "OptionSettings":
-        if self.baseline_alerts_enabled and self.baseline_alerts_effective_from is None:
-            raise ValueError("OPTION_BASELINE_ALERTS_ENABLED requires OPTION_BASELINE_ALERTS_EFFECTIVE_FROM")
-        if self.baseline_alerts_effective_from is not None and self.baseline_alerts_effective_from.utcoffset() is None:
-            raise ValueError("OPTION_BASELINE_ALERTS_EFFECTIVE_FROM must be timezone-aware")
         overlap = set(self.fixed_stock_underlyers) & set(self.fixed_etf_underlyers)
         if overlap:
             raise ValueError(f"stock and ETF universes overlap: {sorted(overlap)}")
@@ -827,8 +821,6 @@ def load_option_runtime_configuration(
         "package_assessments_enabled": environ.get(
             "OPTION_PACKAGE_ASSESSMENTS_ENABLED", "false"
         ),
-        "baseline_alerts_enabled": environ.get("OPTION_BASELINE_ALERTS_ENABLED", "false"),
-        "baseline_alerts_effective_from": environ.get("OPTION_BASELINE_ALERTS_EFFECTIVE_FROM") or None,
         "outcome_unavailable_evidence_enabled": environ.get(
             "OPTION_OUTCOME_UNAVAILABLE_EVIDENCE_ENABLED", "false"
         ),

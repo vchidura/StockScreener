@@ -772,7 +772,7 @@ flags; the exclusion persists in the checkpoint. Do not delete a member or subst
 its new security ID by ticker. `--check-readiness` inspects the pending cohort and a
 retained-source probe without writes, but does not guarantee future alerts. Current
 OKE activation and verification are recorded in
-[the downstream publication checkpoint](docs/agent-context/downstream-publications.md).
+[the Stock Alerts checkpoint](docs/agent-context/stock-alerts.md).
 Incremental alert reads revisit seven calendar days of retained native history
 (up to 800 bars per ticker), keeping actual observed/created cutoffs. Missing bars
 inserted behind a detector cursor reset only that security's intraday setup state;
@@ -933,16 +933,8 @@ remains disabled.
 local IV/Greeks, chain and expiration analysis, six strategy modules, payoff and
 scenario analysis, and atomic candidate/recommendation persistence. It runs on
 XNYS-open-anchored 15-minute slots after the configured Developer delay. The
-worker remains read-only for execution; only backend-published rows appear in the
-Opportunity Board and Decisions views.
-
-The default `/options` route opens the all-universe Opportunity Board. It presents
-the leading persisted structure from each strategy and underlying separately from
-research-only detector highlights. Ranking remains the backend strategy rank; the
-portal does not fabricate a score across strategies. Raw contract research remains
-available at `/options/research`. Decisions combines Candidate Audit and Signal Ledger;
-the full matrix Explorer remains available contextually from Research rather than as a
-primary tab.
+worker remains read-only for execution; backend-published rows feed Options Screener
+and Options Alerts. The default `/options` route redirects to `/options/screener`.
 
 Stocks and options have separate primary navigation sections. **Stocks / Tickers** links
 Overview to `/ticker/SPY` by default and keeps that item active for any `/ticker/{symbol}`
@@ -950,8 +942,8 @@ workspace; global ticker search continues to open the searched symbol on the sam
 tab. Stock Research lives beside Overview at `/stock-research`. There is no separate global
 Research section.
 
-The **Options** section exposes Options Research, Option Activity, and Options Flow as
-equal-level pages. `/options/activity` compares cumulative call
+The **Options** section exposes Option Activity, Options Flow, Options Screener, and
+Options Alerts as equal-level pages. `/options/activity` compares cumulative call
 and put volume, open interest, estimated premium activity, and matched settlement-to-
 settlement OI change across the 13 configured underlyings. The shared header session
 selector reads each underlying's last complete 15-minute matrix within that exchange

@@ -11,28 +11,23 @@ export function alertSort(params: URLSearchParams, view: AlertView) {
 
 export const tradeAlertModels = ['resumption', 'acceptance', 'failure']
 export const tradeAlertStatuses = ['PENDING', 'OPEN', 'CLOSED', 'NO_FILL', 'UNRESOLVED']
-export const legacyAlertStatuses = ['OPEN_PAPER', 'CLOSED_PAPER', 'WAITING_FOR_ENTRY', 'WAITING_FOR_EVALUATION',
-  'ENTRY_UNAVAILABLE', 'EXIT_UNAVAILABLE', 'PATH_UNAVAILABLE', 'NON_TRADING_PATH',
-  'CORPORATE_ACTION_UNRESOLVED', 'IDENTITY_UNAVAILABLE']
 
-export function alertTradeFilters(params: URLSearchParams, source: AlertSource) {
+export function alertTradeFilters(params: URLSearchParams) {
   const direction = params.get('direction')
   const model = params.get('model')
   const status = params.get('status')
-  const models = source === 'LEGACY' ? ['legacy_daily'] : tradeAlertModels
-  const statuses = source === 'LEGACY' ? [...tradeAlertStatuses, ...legacyAlertStatuses] : tradeAlertStatuses
   return {
     lane: 'TRADE' as const,
     direction: direction === '1' || direction === '-1' ? direction : undefined,
-    model: model && models.includes(model) ? model : undefined,
-    status: status && statuses.includes(status) ? status : undefined,
+    model: model && tradeAlertModels.includes(model) ? model : undefined,
+    status: status && tradeAlertStatuses.includes(status) ? status : undefined,
   }
 }
 
 export function resolveAlertRoute(params: URLSearchParams): { source: AlertSource; view: AlertView } {
   const view = params.get('view') === 'history' ? 'history' : params.get('view') === 'open' ? 'open' : params.get('view') === 'eod' ? 'eod' : 'latest'
   const requested = params.get('source')
-  const source = requested === 'REPLAY' || requested === 'LEGACY' || requested === 'SHADOW'
+  const source = requested === 'REPLAY' || requested === 'SHADOW'
     ? requested : view === 'history' ? 'REPLAY' : 'SHADOW'
   return { source: view === 'open' || view === 'eod' ? 'SHADOW' : source, view }
 }

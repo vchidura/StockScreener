@@ -5,7 +5,7 @@ import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Bell, Clock, 
 import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
 import { usePublishPageContext } from '../layout/pageContext'
 import { getAlertView, type AlertPlanRow } from '../services/stockDiscovery'
-import { alertSort, alertSourceParams, alertTabParams, alertTradeFilters, legacyAlertStatuses, resolveAlertRoute, tradeAlertModels, tradeAlertStatuses, type AlertView } from './stockAlertNavigation'
+import { alertSort, alertSourceParams, alertTabParams, alertTradeFilters, resolveAlertRoute, tradeAlertModels, tradeAlertStatuses, type AlertView } from './stockAlertNavigation'
 import { alertColumnLayout, alertPlanTiming, alertPublicationFacts, alertRiskAssessment, earliestAlertWindow, unavailableAlertProbability } from './stockAlertPresentation'
 import StockEodReviewPanel from './StockEodReviewPanel'
 import './StockDiscoveryPage.css'
@@ -17,7 +17,7 @@ const price = (value: unknown) => typeof value === 'number' && Number.isFinite(v
 const time = (value: string | null | undefined) => value ? new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(new Date(value)) : 'N/A'
 const readable = (value: string) => value.toLowerCase().replace(/_/g, ' ')
 const tone = (value: unknown) => typeof value !== 'number' || value === 0 ? '' : value > 0 ? 'sd-positive' : 'sd-negative'
-const models: Record<string, string> = { resumption: 'Trend resumption', acceptance: 'Breakout acceptance', failure: 'Extension reversal', discovery: 'Momentum watch', legacy_daily: 'Legacy daily' }
+const models: Record<string, string> = { resumption: 'Trend resumption', acceptance: 'Breakout acceptance', failure: 'Extension reversal', discovery: 'Momentum watch' }
 type AlertColumn = ColumnSpec & { history?: boolean; tip?: string; indicator?: boolean }
 const columns: AlertColumn[] = [
   { key: 'triggered_at', label: 'Triggered (ET)', group: 'Alert details', tip: 'Original trigger-bar timestamp, separate from when the alert was published' },
@@ -156,7 +156,7 @@ export default function StockAlertsPage() {
   const { columns: effectiveColumns, selectable, hidden, visible } = alertColumnLayout(columns, preferences.hidden, view)
   const selectedPreset = Object.entries(presets).find(([, keys]) =>
     effectiveColumns.every(column => !hidden.has(column.key) === (keys.includes(column.key) || !!column.locked)))?.[0] || ''
-  const filters = alertTradeFilters(params, requestedSource)
+  const filters = alertTradeFilters(params)
   const tradeType = params.get('trade_type') === 'SWING' ? 'SWING' : params.get('trade_type') === 'INTRADAY' ? 'INTRADAY' : undefined
   const args = { source: requestedSource, view, session_date: view === 'open' ? undefined : params.get('session_date') || undefined,
     trade_type: tradeType, combined: params.has('combined') ? params.get('combined') === 'true' : undefined,
@@ -165,7 +165,7 @@ export default function StockAlertsPage() {
   const query = useQuery({ queryKey: ['stock-alert-view', args], queryFn: () => getAlertView(args), enabled: view !== 'eod', refetchInterval: requestedSource === 'REPLAY' ? false : 30_000 })
   const data = view === 'eod' ? undefined : query.data
   const source = data?.source || requestedSource
-  const sourceLabel = source === 'REPLAY' ? 'Backtested history' : source === 'LEGACY' ? 'Legacy daily history' : data?.combined ? 'Intraday + swing shadow' : data?.source_id === 'stock_ideas_forward_swing_v1' ? 'Swing shadow' : 'Forward shadow'
+  const sourceLabel = source === 'REPLAY' ? 'Backtested history' : data?.combined ? 'Intraday + swing shadow' : data?.source_id === 'stock_ideas_forward_swing_v1' ? 'Swing shadow' : 'Forward shadow'
   const rows = data?.rows || []
   const selectedAlert = rows.find(row => row.alert_id === selectedAlertId) || null
   const displayedRuns = view === 'history' ? data?.runs || [] : view === 'open' ? [] : data?.latest_runs || (data?.run ? [data.run] : [])
@@ -299,9 +299,9 @@ export default function StockAlertsPage() {
     <section className="sd-filters sa-filters" aria-label="Alert filters">
       <label>Stock<input value={params.get('search') || ''} placeholder="Ticker or company" onChange={event => update({ search: event.target.value })} /></label>
       <label>Direction<select value={filters.direction || ''} onChange={event => update({ direction: event.target.value })}><option value="">All</option><option value="1">Long</option><option value="-1">Short</option></select></label>
-      <label>Model<select value={filters.model || ''} onChange={event => update({ model: event.target.value })}><option value="">All models</option>{(source === 'LEGACY' ? ['legacy_daily'] : tradeAlertModels).map(key => <option key={key} value={key}>{models[key]}</option>)}</select></label>
+      <label>Model<select value={filters.model || ''} onChange={event => update({ model: event.target.value })}><option value="">All models</option>{tradeAlertModels.map(key => <option key={key} value={key}>{models[key]}</option>)}</select></label>
       <label>Trigger interval<select value={params.get('interval') || ''} onChange={event => update({ interval: event.target.value })}><option value="">All</option>{['30m', '1h', '1d'].map(interval => <option key={interval}>{interval}</option>)}</select></label>
-      <label>Status<select value={filters.status || ''} onChange={event => update({ status: event.target.value })}><option value="">All</option>{[...tradeAlertStatuses, ...(source === 'LEGACY' ? legacyAlertStatuses : [])].map(state => <option key={state} value={state}>{readable(state)}</option>)}</select></label>
+      <label>Status<select value={filters.status || ''} onChange={event => update({ status: event.target.value })}><option value="">All</option>{tradeAlertStatuses.map(state => <option key={state} value={state}>{readable(state)}</option>)}</select></label>
     </section>
     <div className="sa-results-heading">
       <span role="status" aria-label="Matching alerts"><strong>{query.isLoading ? 'Loading' : data?.total ?? 'N/A'}</strong> {data?.total === 1 ? 'alert' : 'alerts'}</span>
@@ -327,7 +327,6 @@ export default function StockAlertsPage() {
           {view === 'latest' && !!data?.runs.length && <label className="sa-run-selector">Publication (ET)<select aria-label="Publication run" value={params.get('run') || ''} onChange={event => update({ run: event.target.value })}><option value="">{data.combined ? 'Latest per strategy' : 'Latest publication'}</option>{[...data.runs].reverse().map(run => <option key={run.run_id} value={run.run_id}>{run.strategy_label ? `${run.strategy_label} / ` : ''}{time(run.published_at)} / {run.selected} selected</option>)}</select></label>}
           {!!data?.warnings.length && <ul className="sa-run-notes">{data.warnings.map(warning => <li key={warning}>{warning}</li>)}</ul>}
           <nav className="sa-record-links" aria-label="Historical records">
-            {source !== 'LEGACY' && <Link to={`?${alertSourceParams('LEGACY', 'history')}`}>Legacy daily history</Link>}
             {requestedSource !== 'REPLAY' && <Link to={`?${alertSourceParams('REPLAY', 'history')}`}>Backtested history</Link>}
           </nav>
         </div>

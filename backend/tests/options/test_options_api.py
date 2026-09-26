@@ -1,7 +1,6 @@
 import json
 import os
 import sys
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,32 +16,23 @@ if str(BACKEND_DIR) not in sys.path:
 
 from main import app
 from options.api import (
+    _configuration,
     _candidate_research_evidence,
     _event_asset_type,
     _event_window_state,
-    _performance_checkpoints,
     option_candidate_detail,
     option_alert_qualification,
     option_alert_qualification_policy,
-    option_alert_publications,
     option_alert_publication_preview,
     OptionAlertPreviewRequest,
     option_alert_publications_dry_run,
     _assess_stock_behavior_for_dry_run,
     OptionAlertDryRunRequest,
     option_candidates,
-    option_data_quality,
     option_discovery_catalog,
     option_eligible_chain,
     option_event_calendar_reference,
     option_flow,
-    option_gamma,
-    option_health,
-    option_opportunities,
-    option_performance,
-    option_screener,
-    option_signals,
-    option_universe,
 )
 from options.calendar import OptionExchangeCalendar
 from options.discovery import EligibleChainQuery, contract_filter_sql
@@ -114,44 +104,6 @@ def test_session_validation_uses_causal_versioned_contracts_and_independent_verd
     assert "version.strike" in snapshot_sql
 
 
-def test_alert_publications_missing_schema_does_not_initialize_or_publish():
-    cursor = MagicMock()
-    cursor.fetchone.return_value = {"ready": False}
-    with patch("options.api.get_db_cursor") as connection, patch("options.api.OptionAlertPublicationRepository") as repository, patch("options.api._configuration", return_value=SimpleNamespace(policy_sha256="a" * 64)):
-        connection.return_value.__enter__.return_value = cursor
-        result = option_alert_publications(limit=10, offset=0).model_dump(mode="json")
-    assert result["available"] is False
-    assert result["reason"] == "OPTION_ALERT_PUBLICATION_MIGRATION_REQUIRED"
-    assert result["data"]["rows"] == []
-    repository.assert_not_called()
-    assert cursor.execute.call_args.args[0].strip().startswith("SELECT")
-
-
-def test_alert_publications_reader_preserves_event_and_separates_elapsed_deadline():
-    import json
-    now = datetime.now(UTC)
-    cursor = MagicMock()
-    cursor.fetchone.return_value = {"ready": True}
-    plan = {"candidate_id": str(uuid4()), "underlying": "SPY", "strategy": "INCOME_WHEEL", "structure": "CASH_SECURED_PUT", "legs": [],
-            "entry_limit": "200", "entry_limit_kind": "MINIMUM_CREDIT", "entry_deadline": (now - timedelta(minutes=1)).isoformat(),
-            "exit_deadline": (now + timedelta(days=1)).isoformat(), "original_economics": {}, "management_policy": {}, "source_market_time": now.isoformat()}
-    record = {"event_id": uuid4(), "sequence": 4, "plan_id": uuid4(), "plan_sha256": "b" * 64, "event_type": "PUBLISHED", "recorded_at": now - timedelta(minutes=2),
-              "payload_text": json.dumps(plan), "request_text": '{"event":"PUBLISHED"}'}
-    with patch("options.api.get_db_cursor") as connection, patch("options.api.OptionAlertPublicationRepository") as repository, patch("options.api.OptionOutcomeRepository") as outcomes, patch("options.api._configuration", return_value=SimpleNamespace(policy_sha256="a" * 64)):
-        connection.return_value.__enter__.return_value = cursor
-        repository.return_value.history.return_value = (record,)
-        outcomes.return_value.retained_plan_marks.return_value = {"ready": False, "rows": {}}
-        result = option_alert_publications(limit=10, offset=20).model_dump(mode="json")
-    repository.return_value.history.assert_called_once_with(limit=10, offset=20)
-    row = result["data"]["rows"][0]
-    assert row["event_type"] == "PUBLISHED"
-    assert row["entry_window_elapsed"] is True
-    assert row["execution_permission"] is False
-    assert "source_evidence" not in row
-    assert record["event_type"] == "PUBLISHED"
-
-
-@pytest.mark.skipif(os.getenv("OPTION_ALERT_READONLY_TESTS") != "1", reason="explicit read-only PostgreSQL check required")
 def test_alert_publications_exposure_reader_live_read_only():
     from dotenv import load_dotenv
     from options.repositories.alert_publications import OptionAlertPublicationRepository
@@ -583,34 +535,6 @@ def test_eligible_chain_zero_and_signed_bounds_are_preserved():
     assert parameters == ("PUT", -0.2, 0, 0)
 
 
-def test_options_health_exposes_delayed_read_only_contract():
-    payload = option_health().model_dump(mode="json")
-    assert payload["data_tier"] == "15-MINUTE DELAYED RESEARCH DATA"
-    assert payload["data"]["read_only"] is True
-    assert payload["data"]["schema_ready"] is True
-    assert payload["data"]["valuation_policy_version"] == "option_valuation_v1"
-    assert len(payload["data"]["valuation_policy_sha256"]) == 64
-    settlement = payload["data"]["settlement_valuation_policy"]
-    assert settlement["version"] == "option_settlement_valuation_v1"
-    assert settlement["adjusted"] is False
-    assert settlement["iv_context_ready"] is False
-    assert payload["data"]["event_calendar"]["coverage_required"] is True
-    assert payload["data"]["event_calendar"]["maximum_age_seconds"] == 43200
-    assert payload["data"]["event_calendar"]["status"] in {
-        "UNCONFIGURED", "CONFIGURED_COVERAGE_REQUIRED",
-    }
-    workbench = payload["data"]["candidate_workbench"]
-    # An empty cohort is a legitimate state after a purge, so assert the shape of the
-    # contract rather than the presence of rows.
-    assert isinstance(workbench["available"], bool)
-    assert workbench["candidate_count"] >= 0
-    assert workbench["available"] is (workbench["candidate_count"] > 0)
-    publication = payload["data"]["board_publication"]
-    assert publication["expected_underlyings"] == 13
-    assert len(publication["selector_sha256"]) == 64
-    assert publication["publishable"] is (
-        publication["covered_underlyings"] == publication["expected_underlyings"]
-    )
 
 
 def test_ticker_event_calendar_fails_closed_when_source_is_unconfigured(monkeypatch):
@@ -662,58 +586,12 @@ def test_event_asset_type_uses_equity_reference_outside_option_universe(monkeypa
     assert _event_asset_type("ARKK", datetime.now(timezone.utc), ()) == "ETF"
 
 
-def test_options_gamma_returns_profiles_for_the_active_policy():
-    payload = option_gamma(
-        underlyer=None, scope="TOTAL", include_curve=False
-    ).model_dump(mode="json")
-    data = payload["data"]
-    assert data["scope"] == "TOTAL"
-    assert data["gamma_policy_version"]
-    assert len(data["gamma_policy_sha256"]) == 64
-    assert "does not identify who is long or short" in data["dealer_convention_note"]
-    for profile in data["profiles"]:
-        assert profile["regime_at_spot"] in {
-            "POSITIVE_GAMMA", "NEGATIVE_GAMMA", "UNDETERMINED"
-        }
-        assert profile["dealer_convention"] in {
-            "DEALER_LONG_CALLS_SHORT_PUTS", "DEALER_SHORT_CALLS_LONG_PUTS"
-        }
-        assert 0 <= profile["coverage_fraction"] <= 1
-        assert profile["call_gamma_notional_per_percent"] >= 0
-        assert profile["put_gamma_notional_per_percent"] >= 0
-        # The board query must not carry the curve payload.
-        assert profile["strike_profile"] is None
 
 
-def test_options_gamma_curve_is_opt_in_and_ordered():
-    payload = option_gamma(
-        underlyer="SPY", scope="TOTAL", include_curve=True
-    ).model_dump(mode="json")
-    profiles = payload["data"]["profiles"]
-    if not profiles:
-        return
-    profile = profiles[0]
-    curve = profile["strike_profile"]
-    assert curve is not None
-    assert len(curve) == profile["strike_count"]
-    strikes = [float(row["strike"]) for row in curve]
-    assert strikes == sorted(strikes)
 
 
-def test_options_gamma_scope_filter_is_applied():
-    payload = option_gamma(
-        underlyer=None, scope="ZERO_DTE", include_curve=False
-    ).model_dump(mode="json")
-    assert payload["data"]["scope"] == "ZERO_DTE"
-    assert all(
-        profile["scope"] == "ZERO_DTE" for profile in payload["data"]["profiles"]
-    )
 
 
-def test_options_universe_returns_configured_or_persisted_members():
-    payload = option_universe().model_dump(mode="json")
-    assert len(payload["data"]) == 13
-    assert {row["ticker"] for row in payload["data"]} >= {"AAPL", "SPY", "IWM"}
 
 
 def test_options_flow_exposes_activity_without_inferred_direction():
@@ -1109,19 +987,6 @@ def test_research_findings_expose_distinct_source_contracts():
     assert len({row["source_contract_id"] for row in findings}) == len(findings)
 
 
-def test_recommendation_api_exposes_persisted_signal_contract():
-    payload = option_signals(limit=5, offset=0).model_dump(mode="json")
-
-    assert payload["reason"] in {None, "NO_SIGNAL_EVENTS"}
-    assert payload["data"]["limit"] == 5
-    assert payload["data"]["offset"] == 0
-    assert payload["data"]["execution_mode"] == "READ_ONLY_RESEARCH"
-    assert set(payload["data"]["status_counts"]) == {
-        "pending", "ready", "blocked", "expired",
-    }
-    for row in payload["data"]["rows"]:
-        assert isinstance(row["legs"], list)
-        assert row["expected_leg_count"] == len(row["legs"])
 
 
 def test_discovery_catalog_is_static_and_does_not_claim_market_readiness():
@@ -1135,344 +1000,28 @@ def test_discovery_catalog_is_static_and_does_not_claim_market_readiness():
     assert "execution_eligibility" not in payload
 
 
-@pytest.mark.parametrize("scope", ["ALL", "STRUCTURED", "RESEARCH", "BOARD"])
-@pytest.mark.parametrize("category", [None, "INCOME", "DEFINED_RISK_INCOME", "MOMENTUM", "NEUTRAL_VOL"])
-def test_screener_category_filters_candidates_before_grouping(scope, category):
-    configuration = SimpleNamespace(
-        policy_sha256="a" * 64,
-        configuration_sha256="b" * 64,
-        strategy_policy_sha256="c" * 64,
-        settings=SimpleNamespace(underlyers=("SPY",)),
-    )
-    cursor = MagicMock()
-    cursor.fetchall.return_value = []
-    with patch("options.api._configuration", return_value=configuration), patch(
-        "options.api.get_db_cursor"
-    ) as connection, patch("options.api._strategy_schema_available", return_value=True), patch(
-        "options.api._board_schema_available", return_value=True
-    ):
-        connection.return_value.__enter__.return_value = cursor
-        payload = option_screener(
-            scope=scope, category=category, minimum_dte=0, maximum_dte=60,
-            minimum_volume=0, minimum_open_interest=0, minimum_volume_oi_ratio=0,
-            limit=5, offset=10,
-        ).model_dump(mode="json")
-    query, parameters = cursor.execute.call_args.args
-    assert query.count("%s") == len(parameters)
-    assert parameters[18:20] == (configuration.configuration_sha256, scope)
-    assert query.index("category_candidates AS MATERIALIZED") < query.index("detected AS MATERIALIZED")
-    assert query.count("FROM category_candidates AS candidate") == 2
-    assert "structure_type = ANY(%s::text[])" in query
-    structures, duplicate_structures = parameters[24:26]
-    assert structures == duplicate_structures
-    expected = {
-        None: None,
-        "INCOME": {"CASH_SECURED_PUT"},
-        "DEFINED_RISK_INCOME": {"PUT_CREDIT_VERTICAL", "CALL_CREDIT_VERTICAL", "IRON_CONDOR"},
-        "MOMENTUM": {"LONG_CALL", "LONG_PUT", "CALL_DEBIT_VERTICAL", "PUT_DEBIT_VERTICAL", "SWEEP_LIKE_CLUSTER", "VOLUME_OI_ANOMALY"},
-        "NEUTRAL_VOL": {"IRON_CONDOR", "CALL_BUTTERFLY", "PUT_BUTTERFLY", "SWEEP_LIKE_CLUSTER", "VOLUME_OI_ANOMALY", "VOLATILITY_DISTORTION"},
-    }[category]
-    assert (set(structures) if structures is not None else None) == expected
-    assert parameters[-2:] == (5, 10)
-    assert payload["data"]["category"] == category
-    assert payload["data"]["rows"] == []
-
-
-@pytest.mark.parametrize(("structured", "observations", "result_kind"), [
-    (1, 0, "STRUCTURE_LEG"), (0, 1, "OBSERVATION"), (1, 1, "MIXED"),
-])
-def test_screener_category_result_kind_preserves_contract_row_semantics(structured, observations, result_kind):
-    cursor = MagicMock()
-    cursor.fetchall.return_value = [{
-        "filtered_total": 1, "current_policy": True,
-        "structure_types": ["IRON_CONDOR"] if structured else ["VOLUME_OI_ANOMALY"],
-        "structured_candidate_count": structured, "research_candidate_count": observations,
-        "market_data_time": datetime(2026, 9, 16, 19, tzinfo=UTC),
-        "first_observed_at": datetime(2026, 9, 16, 19, 15, tzinfo=UTC),
-    }]
-    configuration = SimpleNamespace(
-        policy_sha256="a" * 64, configuration_sha256="b" * 64,
-        strategy_policy_sha256="c" * 64, settings=SimpleNamespace(underlyers=("SPY",)),
-    )
-    with patch("options.api._configuration", return_value=configuration), patch(
-        "options.api.get_db_cursor"
-    ) as connection, patch("options.api._strategy_schema_available", return_value=True), patch(
-        "options.api._board_schema_available", return_value=True
-    ):
-        connection.return_value.__enter__.return_value = cursor
-        payload = option_screener(
-            minimum_dte=0, maximum_dte=60, minimum_volume=0,
-            minimum_open_interest=0, minimum_volume_oi_ratio=0, limit=5, offset=0,
-        ).model_dump(mode="json")
-    row = payload["data"]["rows"][0]
-    assert row["result_kind"] == result_kind
-    assert "NEUTRAL_VOL" in row["category_ids"]
-    assert "execution_eligibility" not in row
-    assert "success_probability" not in row
-
-
-def test_options_screener_exposes_detected_contract_metrics():
-    payload = option_screener(
-        session_date=None,
-        scope="ALL",
-        underlyer=None,
-        contract_type=None,
-        strategy=None,
-        minimum_dte=0,
-        maximum_dte=60,
-        minimum_volume=0,
-        minimum_open_interest=0,
-        minimum_volume_oi_ratio=0,
-        sort="PREMIUM_ACTIVITY",
-        limit=5,
-        offset=0,
-    ).model_dump(mode="json")
-
-    assert payload["reason"] in {None, "NO_DETECTED_CONTRACTS"}
-    assert payload["data"]["scope"] == "ALL"
-    assert payload["data"]["sort"] == "PREMIUM_ACTIVITY"
-    assert payload["data"]["directional_flow_available"] is False
-    assert payload["data"]["quote_liquidity"] == "NOT_AVAILABLE"
-    assert payload["data"]["serving_mode"] in {
-        "CURRENT_POLICY", "HISTORICAL_PREVIOUS_POLICY",
-    }
-    assert "not transacted premium" in payload["data"]["definitions"]["premium_activity"]
-    contract_ids = [row["contract_id"] for row in payload["data"]["rows"]]
-    assert len(contract_ids) == len(set(contract_ids))
-    for row in payload["data"]["rows"]:
-        assert row["contract_type"] in {"CALL", "PUT"}
-        assert row["calendar_dte"] >= 0
-        assert row["strategy_names"]
-
-
-def test_performance_api_exposes_checkpoint_and_management_contract():
-    payload = option_performance(
-        cohort="RANK_LEADERS", days=14, limit=5, offset=0
-    ).model_dump(mode="json")
-
-    assert payload["reason"] in {None, "NO_SIGNAL_PERFORMANCE"}
-    assert payload["data"]["days"] == 14
-    assert payload["data"]["cohort"] == "RANK_LEADERS"
-    assert payload["data"]["requested_cohort"] == "RANK_LEADERS"
-    assert payload["data"]["limit"] == 5
-    assert payload["data"]["valuation_mode"] == "RESEARCH_DELAYED_PROXY"
-    assert payload["data"]["materialization_owner"] == "OPTION_WORKER"
-    assert payload["data"]["entry_basis"] == "FIRST_RAW_RANK_LEADER_OCCURRENCE"
-    assert payload["data"]["board_membership_exact"] is False
-    assert "does not reconstruct historical Opportunity Board membership" in (
-        payload["data"]["cohort_definition"]
-    )
-    assert payload["data"]["navigation_revalues"] is False
-    assert isinstance(payload["data"]["current_mark_included"], bool)
-    assert isinstance(payload["data"]["measurement_summary"], list)
-    for row in payload["data"]["rows"]:
-        assert row["structure_type"]
-        assert row["capital_at_risk"] is not None
-        assert all(
-            checkpoint["status"] in {"AVAILABLE", "PENDING", "NOT_DUE"}
-            for checkpoint in row["checkpoints"]
-        )
-        assert {
-            checkpoint["measurement_type"] for checkpoint in row["checkpoints"]
-        } <= {"15MIN", "30MIN", "60MIN", "CLOSE", "NEXT_OPEN"}
-        if row["current_mark"]:
-            assert isinstance(row["current_mark"]["legs"], list)
-        assert row["candidate_rank"] == 1
-
-
-def test_performance_api_can_include_all_structured_signals():
-    board = option_performance(
-        cohort="RANK_LEADERS", days=14, limit=200, offset=0
-    ).model_dump(mode="json")
-    all_signals = option_performance(
-        cohort="ALL_SIGNALS", days=14, limit=200, offset=0
-    ).model_dump(mode="json")
-
-    assert board["data"]["total"] <= all_signals["data"]["total"]
-    assert all_signals["data"]["cohort"] == "ALL_SIGNALS"
-    assert all_signals["data"]["entry_basis"] == "ORIGINAL_SIGNAL_PACKAGE"
-
-
-def test_performance_api_can_filter_historical_board_by_strategy():
-    payload = option_performance(
-        strategy="income_wheel", cohort="RANK_LEADERS",
-        days=14, limit=200, offset=0,
-    ).model_dump(mode="json")
-
-    assert all(
-        row["strategy_name"] == "INCOME_WHEEL"
-        for row in payload["data"]["rows"]
-    )
-
-
-def test_legacy_opportunity_board_cohort_is_an_alias_for_rank_leaders():
-    payload = option_performance(
-        cohort="OPPORTUNITY_BOARD", days=14, limit=1, offset=0
-    ).model_dump(mode="json")
-
-    assert payload["data"]["cohort"] == "RANK_LEADERS"
-    assert payload["data"]["requested_cohort"] == "OPPORTUNITY_BOARD"
-    assert payload["data"]["board_membership_exact"] is False
-
-
-def test_exact_board_performance_is_prospective_publication_membership():
-    payload = option_performance(
-        cohort="BOARD_PUBLICATIONS", days=14, limit=1, offset=0
-    ).model_dump(mode="json")
-
-    assert payload["data"]["cohort"] == "BOARD_PUBLICATIONS"
-    assert payload["data"]["requested_cohort"] == "BOARD_PUBLICATIONS"
-    assert payload["data"]["entry_basis"] == "FIRST_PUBLISHED_BOARD_MEMBERSHIP"
-    assert payload["data"]["board_membership_exact"] is True
-    assert "Coverage begins with the first prospective publication" in (
-        payload["data"]["cohort_definition"]
-    )
-
-
-def test_performance_checkpoints_distinguish_available_pending_and_not_due():
-    market_time = datetime(2026, 9, 2, 14, 0, tzinfo=UTC)
-    outcome = {"measurement_type": "15MIN", "net_pnl": "10.00"}
-    row = {"market_data_time": market_time, "outcomes": [outcome]}
-
-    checkpoints = _performance_checkpoints(
-        row,
-        generated_at=market_time + timedelta(minutes=31),
-        exchange=OptionExchangeCalendar(),
-    )
-
-    statuses = {
-        checkpoint["measurement_type"]: checkpoint["status"]
-        for checkpoint in checkpoints
-    }
-    assert statuses["15MIN"] == "AVAILABLE"
-    assert statuses["30MIN"] == "PENDING"
-    assert statuses["60MIN"] == "NOT_DUE"
-    assert checkpoints[0]["outcome"] == outcome
-    assert "outcomes" not in row
-
-
-def test_opportunity_board_separates_structures_from_research_detectors():
-    payload = option_opportunities(per_strategy=1).model_dump(mode="json")
-
-    assert payload["reason"] in {None, "NO_COMPLETE_BOARD_PUBLICATION"}
-    assert payload["data"]["selection_basis"] == "IMMUTABLE_BOARD_PUBLICATION"
-    assert payload["data"]["execution_mode"] == "READ_ONLY_RESEARCH"
-    if payload["available"]:
-        assert payload["data"]["serving_mode"] in {
-            "CURRENT_POLICY", "HISTORICAL_PREVIOUS_POLICY",
-        }
-    assert payload["data"]["configured_underlyer_count"] == 13
-    assert payload["data"]["covered_underlyer_count"] == len(
-        payload["data"]["underlyers"]
-    )
-    assert all(
-        row["candidate_kind"] != "RESEARCH_ONLY"
-        for row in payload["data"]["structured"]
-    )
-    assert all(
-        row["candidate_kind"] == "RESEARCH_ONLY"
-        for row in payload["data"]["research_highlights"]
-    )
-    for row in (
-        payload["data"]["structured"]
-        + payload["data"]["research_highlights"]
-    ):
-        assert row["strategy_position"] == 1
-        assert row["window_state"] in {"ACTIVE", "ELAPSED", "UNBOUNDED"}
-        assert isinstance(row["legs"], list)
-
-
-def test_opportunity_board_reads_immutable_publication_members():
-    cursor = MagicMock()
-    publication_id = uuid4()
-    matrix_id = uuid4()
-    cursor.fetchone.side_effect = [
-        {"ready": True},
-        {"ready": True},
-        {
-            "publication_id": publication_id,
-            "source_matrix_ids": [matrix_id],
-            "market_data_time": datetime(2026, 9, 4, 15, 0, tzinfo=UTC),
-            "observed_time": datetime(2026, 9, 4, 15, 15, tzinfo=UTC),
-            "covered_underlying_count": 1,
-            "scheduled_cycle": datetime(2026, 9, 4, 15, 0, tzinfo=UTC),
-            "published_at": datetime(2026, 9, 4, 15, 16, tzinfo=UTC),
-            "selector_version": "option_board_selector_v1",
-            "selector_sha256": "b" * 64,
-            "selection_evidence": {"persisted_members": 0},
-        },
-    ]
-    cursor.fetchall.side_effect = [[{
-        "underlying": "SPY",
-        "matrix_id": matrix_id,
-        "analysis_status": "COMPLETE",
-        "market_data_time": datetime(2026, 9, 4, 15, 0, tzinfo=UTC),
-        "observed_time": datetime(2026, 9, 4, 15, 15, tzinfo=UTC),
-        "matrix_age_seconds": 0,
-        "structured_count": 0,
-        "research_count": 0,
-        "suppressed_count": 0,
-        "recommendation_count": 0,
-        "blocked_count": 0,
-    }], []]
-
-    @contextmanager
-    def get_cursor():
-        yield cursor
-
-    with patch("options.api.get_db_cursor", get_cursor):
-        result = option_opportunities(per_strategy=1)
-
-    assert result.data["structured"] == []
-    assert result.data["publication_id"] == publication_id
-    assert result.data["selection_basis"] == "IMMUTABLE_BOARD_PUBLICATION"
-    opportunity_sql = cursor.execute.call_args_list[-1].args[0]
-    assert "FROM option_board_members AS member" in opportunity_sql
-    assert "member.publication_id = %s" in opportunity_sql
-    assert "member.board_position <= %s" in opportunity_sql
-    assert "first_selected_contracts" not in opportunity_sql
-
-
-def test_data_quality_explains_retention_and_unknown_references():
-    payload = option_data_quality(limit=5).model_dump(mode="json")
-
-    assert payload["data"]["definitions"]["unknown_references"].startswith(
-        "Provider option tickers absent"
-    )
-    assert len(payload["data"]["retention_criteria"]) == 6
-    assert len(payload["data"]["model_eligibility_criteria"]) == 3
-    assert payload["data"]["unknown_reference_gate"] == {
-        "maximum_count": 20,
-        "maximum_fraction": 0.01,
-        "rule": "Reference drift fails above the lower of the count and fraction thresholds.",
-    }
-    for run in payload["data"]["runs"]:
-        assert run["excluded_row_count"] == max(
-            run["received_row_count"] - run["retained_row_count"],
-            0,
-        )
-        assert 0 <= run["catalog_coverage_fraction"] <= 1
-        assert 0 <= run["retention_fraction"] <= 1
-        assert all(
-            {"code", "label", "count"} <= set(reason)
-            for reason in run["exclusion_breakdown"]
-        )
-
-
 def test_options_routes_are_registered_on_main_app():
     paths = {route.path for route in app.routes}
+    assert {
+        "/api/options/eligible-chain/query",
+        "/api/options/flow",
+        "/api/options/discovery-catalog",
+        "/api/options/candidates",
+        "/api/options/candidates/{candidate_id}",
+        "/api/options/alerts/datasets",
+        "/api/options/alerts/detector-runs",
+        "/api/options/calendar/{underlyer}",
+    } <= paths
     assert {
         "/api/options/health",
         "/api/options/universe",
         "/api/options/chain/{underlyer}",
         "/api/options/analysis/{underlyer}",
-        "/api/options/flow",
         "/api/options/data-quality",
+        "/api/options/gamma",
         "/api/options/opportunities",
         "/api/options/screener",
-        "/api/options/candidates",
-        "/api/options/candidates/{candidate_id}",
         "/api/options/scenarios/{candidate_id}",
         "/api/options/signals",
         "/api/options/performance",
-    } <= paths
+    }.isdisjoint(paths)

@@ -11,11 +11,13 @@ from pathlib import Path
 
 import exchange_calendars
 import pandas as pd
+from dotenv import load_dotenv
 
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
+load_dotenv(BACKEND_DIR / ".env")
 
 from equity.behavior import DEFINITION_SHA256, OPTIONS_SWING_PROFILE  # noqa: E402
 from options.config import load_option_runtime_configuration  # noqa: E402

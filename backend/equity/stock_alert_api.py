@@ -24,7 +24,7 @@ def market_conditions():
 
 
 @router.get("/alert-view")
-def alert_view(source: Literal["SHADOW", "REPLAY", "LEGACY"] = "SHADOW", session_date: date | None = None,
+def alert_view(source: Literal["SHADOW", "REPLAY"] = "SHADOW", session_date: date | None = None,
                view: Literal["latest", "history", "open"] = "latest", run: str | None = Query(None, max_length=150),
                search: str = Query("", max_length=80), direction: Annotated[int | None, Query(ge=-1, le=1)] = None,
                model: str | None = None, interval: str | None = None, status: str | None = None,

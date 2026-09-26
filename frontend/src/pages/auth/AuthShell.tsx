@@ -105,10 +105,10 @@ export default function AuthShell({
             </small>
           </span>
         </NavLink>
-        <h2>Equity and options research, evidence first.</h2>
+        <h2>Equity and options screening, evidence first.</h2>
         <ul>
           <li>Scanner qualification with explicit robustness gates rather than back-fitted scores.</li>
-          <li>Delayed options research that states its entitlement limits on every surface.</li>
+          <li>Delayed options screening and alerts that state their entitlement limits on every surface.</li>
           <li>Read-only throughout. No recommendations, no order routing.</li>
         </ul>
         <NavLink to="/" className="auth-page__back">

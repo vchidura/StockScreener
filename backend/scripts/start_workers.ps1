@@ -32,7 +32,7 @@
         worker publishes unqualified forward shadow observations, never orders.
         StockAlerts supervises the two already-enrolled strategies and results sync.
         One-shot recovery retains the existing intraday-only stock alert pass.
-        The legacy daily discovery worker is no longer started. Replay remains frozen.
+        The legacy daily discovery writer has been removed. Replay remains frozen.
 
 .EXAMPLE
         .\start_workers.ps1 -Worker Screening -NoNewWindow

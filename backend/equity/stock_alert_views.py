@@ -13,8 +13,6 @@ from research.stock_alerts import SCHEMA, empty_snapshot, history_publications, 
 
 
 def load_alert_view(source, *, combined=None):
-    if source == "LEGACY":
-        return legacy_view()
     if source == "SHADOW":
         marker = Path(__file__).resolve().parents[1] / "backups/stock-alert-results/reader.json"
         if combined is True or (combined is None and marker.is_file()):
@@ -181,79 +179,3 @@ def current_history_prices(snapshot, session=None, *, now=None, view="history"):
     if failed:
         warnings.append("Current price refresh unavailable; retained paper outcomes are unchanged")
     return dict(snapshot, alerts=records, warnings=warnings, price_as_of=now.isoformat())
-
-
-def legacy_view():
-    from equity.stock_discovery import VERSION, SNAPSHOT_SOURCE, ALERT_SOURCE, MARK_SOURCE
-    from equity.api import expected_materialized_market_time
-    now = datetime.now(timezone.utc)
-    expected_mark = expected_materialized_market_time(now, "30m")
-    with get_db_cursor() as cursor:
-        cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        cursor.execute("SET LOCAL statement_timeout='15s'")
-        cursor.execute("""SELECT market_time,MAX(observed_at) AS published_at,COUNT(*) AS expected
-            FROM equity_evidence WHERE source_name=%s AND source_version=%s AND observed_at<=%s
-              AND market_time>=%s GROUP BY market_time ORDER BY market_time""",
-                       (SNAPSHOT_SOURCE, VERSION, now, now - timedelta(days=70)))
-        runs = [dict(row) for row in cursor.fetchall()]
-        if not runs:
-            return empty_snapshot("LEGACY")
-        dates = session_dates(str(runs[-1]["market_time"].date()))
-        cursor.execute("""SELECT alert.evidence_id,alert.security_id,alert.ticker,alert.direction,alert.market_time,
-                alert.observed_at,alert.payload,mark.payload AS paper,mark.observed_at AS evaluated_at
-            FROM equity_evidence alert
-            LEFT JOIN LATERAL(SELECT payload,observed_at FROM equity_evidence mark
-                WHERE mark.source_name=%s AND mark.source_version=%s AND mark.payload->>'alert_id'=alert.evidence_id::text
-                  AND mark.observed_at<=%s AND mark.created_at<=%s
-                ORDER BY mark.observed_at DESC,mark.created_at DESC,mark.evidence_id LIMIT 1) mark ON TRUE
-            WHERE alert.source_name=%s AND alert.source_version=%s AND alert.market_time>=%s::date
-              AND alert.observed_at<=%s AND alert.created_at<=%s
-            ORDER BY alert.observed_at,alert.evidence_id LIMIT 10001""",
-            (MARK_SOURCE, VERSION, now, now, ALERT_SOURCE, VERSION, dates[0], now, now))
-        records = [dict(row) for row in cursor.fetchall()]
-        if len(records) > 10000:
-            raise ValueError("legacy alert view exceeds its bounded read limit")
-        identities = sorted({str(row["security_id"]) for row in records})
-        quotes = {}
-        if identities:
-            cursor.execute("""SELECT DISTINCT ON(security_id) security_id::text,close_price::float8 AS price,bar_end
-                FROM equity_bar_revisions WHERE security_id=ANY(%s::uuid[]) AND session_scope='RTH'
-                  AND interval='30m' AND NOT adjusted AND is_final AND bar_end<=%s
-                  AND bar_start>=%s AND system_observed_at<=%s AND created_at<=%s
-                ORDER BY security_id,bar_end DESC,system_observed_at DESC,created_at DESC,bar_revision_id""",
-                (identities, now, now - timedelta(days=7), now, now))
-            quotes = {str(row["security_id"]): dict(row) for row in cursor.fetchall()}
-    publications = [dict(run_id=row["market_time"].isoformat(), session=str(row["market_time"].date()),
-        trigger_at=row["market_time"].isoformat(), published_at=row["published_at"].isoformat(), status="LEGACY_CAPTURE",
-        expected=row["expected"], missing=None, selected=sum(record["market_time"] == row["market_time"] for record in records), conflicts=None)
-        for row in runs if str(row["market_time"].date()) in dates]
-    alerts = []
-    for record in records:
-        data, paper = record["payload"], record["paper"] or {}
-        status = paper.get("status", "WAITING_FOR_EVALUATION")
-        quote = quotes.get(str(record["security_id"]), {})
-        closed = status == "CLOSED_PAPER"
-        warnings = ["Legacy daily policy", "Structural stop/target not retained", "Recurrence observations unavailable"]
-        if not quote or quote["bar_end"] < expected_mark:
-            warnings.append("Latest stock price is stale or unavailable")
-        mark_time = datetime.fromisoformat(paper["mark_time"]) if paper.get("mark_time") else None
-        if status == "OPEN_PAPER" and (mark_time is None or mark_time < expected_mark):
-            warnings.append("Paper mark is stale; P/L uses the last retained mark")
-        alerts.append(dict(alert_id=str(record["evidence_id"]), run_id=record["market_time"].isoformat(),
-            security_id=str(record["security_id"]), ticker=record["ticker"], company_name=None, direction=record["direction"],
-            model="legacy_daily", interval="1d", lane="WATCH" if record["direction"] == 0 else "TRADE",
-            triggered_at=record["market_time"].isoformat(), published_at=record["observed_at"].isoformat(),
-            trigger_price=data.get("signal_price"), entry_price=paper.get("entry_price"), entry_at=paper.get("entry_time"),
-            stop=None, target=None, risk_pct=None, reward_risk=None, entry_risk=None, hold="21 sessions",
-            exit_due_at=None, status=status, reason=None, exit_price=paper.get("mark_price") if closed else None,
-            exit_at=paper.get("mark_time") if closed else None, paper_return=paper.get("return_fraction"),
-            latest_price=quote.get("price"), latest_price_at=quote["bar_end"].isoformat() if quote else None,
-            mark_price=paper.get("mark_price"), mark_at=paper.get("mark_time"),
-            indicators=dict(momentum=data.get("momentum"), sector=data.get("sector")),
-            indicator_at=record["market_time"].isoformat(), indicator_interval="1d", daily_context_at=record["market_time"].isoformat(),
-            indicator_status="LEGACY_RETAINED_FIELDS", warnings=warnings,
-            policy_version=VERSION))
-    return dict(schema=SCHEMA, source="LEGACY", source_id=VERSION, source_label="Legacy daily / paper tracking",
-        status="READY", as_of=now.isoformat(), sessions=dates, publications=publications, alerts=alerts,
-        observations=[], hit_coverage=None, outcome_policy="Legacy next-session / 10 bps round trip",
-        indicators_available=["momentum", "sector"], warnings=["Legacy daily policy, separate from multi-model research", "Price and paper-mark timestamps are independent"])

@@ -101,7 +101,7 @@ test('sidebar Latest Run stays shadow while Day History defaults to backtested d
   assert.deepEqual(resolveAlertRoute(new URLSearchParams('view=history')), { source: 'REPLAY', view: 'history' })
 })
 
-for (const source of ['SHADOW', 'REPLAY', 'LEGACY']) {
+for (const source of ['SHADOW', 'REPLAY']) {
   test(`explicit ${source} selection is never silently replaced`, () => {
     const params = new URLSearchParams({ source, view: 'history', session_date: '2026-08-18' })
     assert.equal(resolveAlertRoute(params).source, source)
@@ -114,7 +114,7 @@ for (const source of ['SHADOW', 'REPLAY', 'LEGACY']) {
 test('changing sources preserves Day History without carrying an incompatible date or filters', () => {
   const params = alertSourceParams('REPLAY', 'history')
   assert.equal(params.toString(), 'source=REPLAY&view=history')
-  assert.equal(alertSourceParams('LEGACY', 'latest').toString(), 'source=LEGACY')
+  assert.deepEqual(resolveAlertRoute(new URLSearchParams('source=LEGACY&view=history')), { source: 'REPLAY', view: 'history' })
 })
 
 test('switching a default-source tab clears source-specific dates and run pagination', () => {
@@ -129,21 +129,18 @@ test('switching a default-source tab clears source-specific dates and run pagina
 
 test('old watch links cannot silently hide trade alerts after lane control is removed', () => {
   const params = new URLSearchParams('lane=WATCH&model=discovery&status=WATCH&direction=0')
-  assert.deepEqual(alertTradeFilters(params, 'REPLAY'), {
+  assert.deepEqual(alertTradeFilters(params), {
     lane: 'TRADE', direction: undefined, model: undefined, status: undefined,
   })
   assert.equal(params.get('lane'), 'WATCH')
 })
 
 test('visible trade filters are preserved without mixing legacy or watch models', () => {
-  assert.deepEqual(alertTradeFilters(new URLSearchParams('model=failure&status=CLOSED&direction=-1'), 'REPLAY'), {
+  assert.deepEqual(alertTradeFilters(new URLSearchParams('model=failure&status=CLOSED&direction=-1')), {
     lane: 'TRADE', direction: '-1', model: 'failure', status: 'CLOSED',
   })
-  assert.deepEqual(alertTradeFilters(new URLSearchParams('model=legacy_daily&status=OPEN_PAPER&direction=1'), 'LEGACY'), {
-    lane: 'TRADE', direction: '1', model: 'legacy_daily', status: 'OPEN_PAPER',
-  })
-  assert.equal(alertTradeFilters(new URLSearchParams('model=legacy_daily&status=OPEN_PAPER'), 'REPLAY').model, undefined)
-  assert.equal(alertTradeFilters(new URLSearchParams('status=OPEN_PAPER'), 'REPLAY').status, undefined)
+  assert.equal(alertTradeFilters(new URLSearchParams('model=legacy_daily&status=OPEN_PAPER')).model, undefined)
+  assert.equal(alertTradeFilters(new URLSearchParams('status=OPEN_PAPER')).status, undefined)
 })
 
 test('an enrolled forward view keeps Day History in the genuine shadow source', () => {

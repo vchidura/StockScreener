@@ -453,8 +453,6 @@ def test_runtime_and_research_sources_do_not_mutate_schema() -> None:
         "database.py",
         "research/evaluate.py",
         "scripts/discover_universe_polygon.py",
-        "scripts/generate_cross_sectional_signal.py",
-        "scripts/generate_market_discovery.py",
         "scripts/prepare_historical_signal_research.py",
         "scripts/run_historical_signal_outcomes.py",
     ):
