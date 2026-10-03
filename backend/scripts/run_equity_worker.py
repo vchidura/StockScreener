@@ -180,8 +180,14 @@ def repair_recent_sessions(
     return tuple(results)
 
 
+RETAINED_REFERENCE_MAX_AGE = timedelta(days=7)
+# Stages cache the reference for one day, so the owner refreshes a day before readers reject it.
+REFERENCE_REFRESH_AGE = RETAINED_REFERENCE_MAX_AGE - timedelta(days=1)
+
+
 def load_retained_reference(
     tickers: tuple[str, ...], now: datetime,
+    max_age: timedelta = RETAINED_REFERENCE_MAX_AGE,
 ) -> ReferenceRefreshResult | None:
     watermark = DecisionWatermark(now, now)
     references = EquityReferenceRepository().list_securities_as_of(tickers, watermark)
@@ -193,7 +199,7 @@ def load_retained_reference(
     )
     reference_is_fresh = (
         len(references) == len(tickers)
-        and all(now - row.observed_at <= timedelta(days=7) for row in references)
+        and all(now - row.observed_at <= max_age for row in references)
         and set(tickers).issubset(universe_tickers)
     )
     if reference_is_fresh and universe is not None:
@@ -211,7 +217,7 @@ def load_or_refresh_reference(
     now: datetime,
     session_date,
 ) -> ReferenceRefreshResult:
-    retained = load_retained_reference(tickers, now)
+    retained = load_retained_reference(tickers, now, max_age=REFERENCE_REFRESH_AGE)
     if retained is not None:
         return retained
     return service.refresh_reference(

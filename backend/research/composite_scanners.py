@@ -142,7 +142,7 @@ def _dynamic_swing_pairs(
 ) -> pd.DataFrame:
     """Latest ATR-filtered alternating pivot pair known at each bar."""
     size = len(frame)
-    result = pd.DataFrame(index=frame.index, data={
+    columns = {
         "p1_index": np.full(size, -1, dtype=int),
         "p1_price": np.full(size, np.nan),
         "p1_type": np.full(size, "", dtype=object),
@@ -150,7 +150,7 @@ def _dynamic_swing_pairs(
         "p2_price": np.full(size, np.nan),
         "p2_type": np.full(size, "", dtype=object),
         "swing_atr": np.full(size, np.nan),
-    })
+    }
     high = frame["high"].to_numpy(dtype=float)
     low = frame["low"].to_numpy(dtype=float)
     atr = frame["atr_ref"].to_numpy(dtype=float)
@@ -197,26 +197,26 @@ def _dynamic_swing_pairs(
                 first["atr"], second["atr"]
             )
             for prefix, pivot in (("p1", first), ("p2", second)):
-                result.at[frame.index[confirmation], f"{prefix}_index"] = pivot["index"]
-                result.at[frame.index[confirmation], f"{prefix}_price"] = pivot["price"]
-                result.at[frame.index[confirmation], f"{prefix}_type"] = pivot["type"]
-            result.at[frame.index[confirmation], "swing_atr"] = swing_atr
-    return result
+                columns[f"{prefix}_index"][confirmation] = pivot["index"]
+                columns[f"{prefix}_price"][confirmation] = pivot["price"]
+                columns[f"{prefix}_type"][confirmation] = pivot["type"]
+            columns["swing_atr"][confirmation] = swing_atr
+    return pd.DataFrame(columns, index=frame.index)
 
 
 def _level_context(frame: pd.DataFrame) -> pd.DataFrame:
     """Attach the nearest active gap/FVG/Fibonacci retest level at every bar."""
-    result = pd.DataFrame(index=frame.index)
     size = len(frame)
+    columns = {}
     for side in ("bull", "bear"):
-        result[f"{side}_level"] = np.nan
-        result[f"{side}_stop"] = np.nan
-        result[f"{side}_level_source"] = ""
-        result[f"{side}_level_anchor"] = ""
-        result[f"{side}_swing_atr"] = np.nan
-        result[f"{side}_level_age_bars"] = np.nan
-        result[f"{side}_prior_level_tests"] = np.nan
-        result[f"{side}_level_cluster_count"] = 0
+        columns[f"{side}_level"] = np.full(size, np.nan)
+        columns[f"{side}_stop"] = np.full(size, np.nan)
+        columns[f"{side}_level_source"] = np.full(size, "", dtype=object)
+        columns[f"{side}_level_anchor"] = np.full(size, "", dtype=object)
+        columns[f"{side}_swing_atr"] = np.full(size, np.nan)
+        columns[f"{side}_level_age_bars"] = np.full(size, np.nan)
+        columns[f"{side}_prior_level_tests"] = np.full(size, np.nan)
+        columns[f"{side}_level_cluster_count"] = np.zeros(size, dtype=np.int64)
 
     open_ = frame["open"].to_numpy(dtype=float)
     high = frame["high"].to_numpy(dtype=float)
@@ -226,6 +226,12 @@ def _level_context(frame: pd.DataFrame) -> pd.DataFrame:
     dates = pd.to_datetime(frame["date"]).to_numpy()
     zones: list[dict] = []
     swing_pairs = _dynamic_swing_pairs(frame)
+    pair_first_index = swing_pairs["p1_index"].to_numpy()
+    pair_second_index = swing_pairs["p2_index"].to_numpy()
+    pair_first_price = swing_pairs["p1_price"].to_numpy()
+    pair_second_price = swing_pairs["p2_price"].to_numpy()
+    pair_second_type = swing_pairs["p2_type"].to_numpy()
+    pair_swing_atr = swing_pairs["swing_atr"].to_numpy()
 
     for position in range(size):
         current_atr = atr[position]
@@ -258,16 +264,15 @@ def _level_context(frame: pd.DataFrame) -> pd.DataFrame:
                 })
         zones = active_zones
 
-        pair = swing_pairs.iloc[position]
-        first_position = int(pair["p1_index"])
-        second_position = int(pair["p2_index"])
-        first_price = _finite(pair["p1_price"])
-        second_price = _finite(pair["p2_price"])
+        first_position = int(pair_first_index[position])
+        second_position = int(pair_second_index[position])
+        first_price = _finite(pair_first_price[position])
+        second_price = _finite(pair_second_price[position])
         if (first_price is not None and second_price is not None
                 and first_position >= 0 and second_position >= 0):
             swing_high = max(first_price, second_price)
             swing_low = min(first_price, second_price)
-            direction = 1 if pair["p2_type"] == "high" else -1
+            direction = 1 if pair_second_type[position] == "high" else -1
             for ratio in FIB_RETRACEMENT_RATIOS:
                 level = (
                     swing_high - ratio * (swing_high - swing_low)
@@ -286,7 +291,7 @@ def _level_context(frame: pd.DataFrame) -> pd.DataFrame:
                         "low": level - 0.25 * current_atr,
                         "high": level + 0.25 * current_atr,
                         "distance": abs(close[position] - level),
-                        "swing_atr": _finite(pair["swing_atr"]),
+                        "swing_atr": _finite(pair_swing_atr[position]),
                     })
 
         for direction, side in ((1, "bull"), (-1, "bear")):
@@ -310,21 +315,18 @@ def _level_context(frame: pd.DataFrame) -> pd.DataFrame:
                         for existing in clustered_levels
                     ):
                         clustered_levels.append(item_reference)
-                result.at[frame.index[position], f"{side}_level"] = candidate["reference"]
-                result.at[frame.index[position], f"{side}_stop"] = (
+                columns[f"{side}_level"][position] = candidate["reference"]
+                columns[f"{side}_stop"][position] = (
                     candidate["low"] - 0.25 * current_atr
                     if direction == 1 else candidate["high"] + 0.25 * current_atr
                 )
-                result.at[frame.index[position], f"{side}_level_source"] = candidate["source"]
-                result.at[frame.index[position], f"{side}_level_anchor"] = candidate["anchor"]
-                result.at[frame.index[position], f"{side}_swing_atr"] = candidate.get("swing_atr")
-                result.at[frame.index[position], f"{side}_level_age_bars"] = (
-                    position - origin_position
-                )
-                result.at[frame.index[position], f"{side}_prior_level_tests"] = prior_tests
-                result.at[frame.index[position], f"{side}_level_cluster_count"] = len(
-                    clustered_levels
-                )
+                columns[f"{side}_level_source"][position] = candidate["source"]
+                columns[f"{side}_level_anchor"][position] = candidate["anchor"]
+                swing_atr = candidate.get("swing_atr")
+                columns[f"{side}_swing_atr"][position] = np.nan if swing_atr is None else swing_atr
+                columns[f"{side}_level_age_bars"][position] = position - origin_position
+                columns[f"{side}_prior_level_tests"][position] = prior_tests
+                columns[f"{side}_level_cluster_count"][position] = len(clustered_levels)
 
         if position >= 1:
             prior_high = high[position - 1]
@@ -362,7 +364,7 @@ def _level_context(frame: pd.DataFrame) -> pd.DataFrame:
                         "high": low[position - 2], "position": position,
                         "anchor": pd.Timestamp(dates[position]).isoformat(),
                     })
-    return result
+    return pd.DataFrame(columns, index=frame.index)
 
 
 def _event(scanner_name: str, frame: pd.DataFrame, row: pd.Series, direction: int,

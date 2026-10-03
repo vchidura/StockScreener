@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
@@ -93,6 +93,7 @@ class MaterializationResult:
     ema_direction: str | None
     setup_direction: str
     quality_codes: tuple[str, ...]
+    directional_levels: Mapping[int, Mapping[str, Any]] | None = None
 
 
 def bars_to_frame(bars: Sequence[EquityBarRevision]) -> pd.DataFrame:
@@ -186,7 +187,10 @@ def materialize_equity_evidence(
     robust_qualifications: Mapping[
         tuple[str, str, str | None, int | None], UUID
     ] | None = None,
+    level_directions: Sequence[int] = (),
 ) -> MaterializationResult:
+    if any(requested not in (-1, 1) for requested in level_directions):
+        raise ValueError("requested level directions must be -1 or 1")
     if not bars:
         return MaterializationResult((), None, "UNAVAILABLE", ("NO_FINAL_BARS",))
     observed_utc = _utc(observed_at)
@@ -637,6 +641,28 @@ def materialize_equity_evidence(
         fibonacci=portal_strategies.fibonacci,
         directional_brackets=True,
     )
+    directional_levels = {}
+    if level_directions:
+        level_atr = setup_technicals.payload()["atr"]
+        level_fibonacci = compose_fibonacci_context(portal_strategies.fibonacci)
+    for requested in level_directions:
+        forced = compose_trade_levels(
+            interval=interval,
+            technicals=setup_technicals,
+            direction=replace(direction_composition,
+                direction="Bullish" if requested == 1 else "Bearish"),
+            primary_retests=primary_retests,
+            momentum_pullback=portal_strategies.momentum_pullback,
+            bearish_bounce=portal_strategies.bearish_bounce,
+            fibonacci=portal_strategies.fibonacci,
+            directional_brackets=True,
+        )
+        directional_levels[requested] = {
+            "targets": list(forced.targets[:5]),
+            "stops": list(forced.stops[:5]),
+            "atr": level_atr,
+            "fibonacci": level_fibonacci,
+        }
     timing = compose_setup_timing(
         technicals=setup_technicals,
         moving_average=portal_strategies.moving_average,
@@ -776,6 +802,7 @@ def materialize_equity_evidence(
         ema_direction=ema_direction,
         setup_direction=setup_direction,
         quality_codes=feature_quality,
+        directional_levels=directional_levels or None,
     )
 
 

@@ -480,6 +480,7 @@ def test_detector_evaluation_runs_only_for_complete_configured_universe():
             matrices=[dict(underlying=symbol, matrix_id=matrix_id, market_time=MARKET_TIME,
                 observed_time=OBSERVED_AT) for symbol, matrix_id in kwargs["completed_matrices"].items()],
             records=(), rejections={},
+            unavailable_underlyers=kwargs.get("unavailable_underlyers"),
         ), ()
 
     hook = MagicMock(side_effect=collect_detector_run)
@@ -518,6 +519,29 @@ def test_detector_evaluation_runs_only_for_complete_configured_universe():
     assert repeated.detector_evaluation["status"] == "RECORDED"
     hook.assert_not_called()
     assert repository.persist_completed_run.call_args.args == (stored_run, stored_records)
+
+    hook.partial_coverage = True
+    repository.completed_run.return_value = None
+    blocked = configuration.settings.underlyers[0]
+    pipeline._run_underlying = lambda underlyer, asset_type, session, cycle: UnderlyingCycleResult(
+        underlyer, asset_type, uuid4(), None if underlyer == blocked else uuid4(),
+        "FAILED" if underlyer == blocked else "COMPLETE", 1, 1, 1.0,
+        ("DATA_QUALITY_GATE_FAILED",) if underlyer == blocked else (),
+    )
+    result = pipeline.run_once(as_of=OBSERVED_AT, cycle_time=MARKET_TIME)
+    assert result.detector_evaluation["status"] == "RECORDED"
+    partial_run, _ = repository.persist_completed_run.call_args.args
+    assert partial_run.schema_version == "option_detector_run_v3"
+    assert partial_run.expected_underlyers == tuple(sorted(configuration.settings.underlyers))
+    assert blocked not in dict(partial_run.source_matrices)
+    assert partial_run.unavailable_underlyers == ((blocked, ("DATA_QUALITY_GATE_FAILED",)),)
+
+    hook.reset_mock()
+    pipeline._run_underlying = lambda underlyer, asset_type, session, cycle: UnderlyingCycleResult(
+        underlyer, asset_type, uuid4(), None, "FAILED", 0, 0, None, ("DATA_QUALITY_GATE_FAILED",),
+    )
+    assert pipeline.run_once(as_of=OBSERVED_AT, cycle_time=MARKET_TIME).detector_evaluation is None
+    hook.assert_not_called()
 
 
 
@@ -558,7 +582,7 @@ def test_manual_pipeline_extends_chain_to_retained_candidate_legs():
 
     expected = (
         MARKET_TIME.date()
-        + timedelta(days=configuration.policy.contract_filter.maximum_dte),
+        + timedelta(days=configuration.settings.acquisition_maximum_dte),
         Decimal("75"),
         Decimal("130"),
     )

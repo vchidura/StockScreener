@@ -289,6 +289,45 @@ def review_retained_candidate_mark(candidate: dict, retained: dict | None, *, ch
     return review_retained_plan_mark(basis, retained, checked_at=checked_at, policy=policy)
 
 
+def detector_management_crossing(management: dict, *, entry_net_premium: Decimal,
+                                 current_net_premium: Decimal, multiplier: int) -> tuple[str, Decimal] | None:
+    if multiplier <= 0 or not entry_net_premium.is_finite() or not current_net_premium.is_finite() or entry_net_premium == 0:
+        return None
+    try:
+        entry = abs(entry_net_premium) / Decimal(multiplier)
+        if entry_net_premium < 0:
+            if current_net_premium > 0:
+                return None
+            stop_fraction = Decimal(str(management["stop_loss_fraction"]))
+            target_fraction = Decimal(str(management["take_profit_fraction"]))
+            if not Decimal(0) < stop_fraction < Decimal(1) or target_fraction <= 0:
+                return None
+            close_value = -current_net_premium / Decimal(multiplier)
+            stop = entry * (Decimal(1) - stop_fraction)
+            target = entry * (Decimal(1) + target_fraction)
+            if close_value >= target:
+                return "TARGET_MET", target
+            if close_value <= stop:
+                return "STOP_LOSS_HIT", stop
+        else:
+            if current_net_premium < 0:
+                return None
+            stop_multiple = Decimal(str(management["stop_loss_multiple"]))
+            target_fraction = Decimal(str(management["take_profit_fraction"]))
+            if stop_multiple <= 1 or not Decimal(0) < target_fraction <= Decimal(1):
+                return None
+            close_cost = current_net_premium / Decimal(multiplier)
+            stop = entry * stop_multiple
+            target = entry * (Decimal(1) - target_fraction)
+            if close_cost <= target:
+                return "TARGET_MET", target
+            if close_cost >= stop:
+                return "STOP_LOSS_HIT", stop
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
 def _package_premium(
     legs: tuple[OptionOutcomeLeg, ...],
     *,

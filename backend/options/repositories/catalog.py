@@ -147,9 +147,10 @@ def _upsert_reference(cursor: Any, reference: OptionContractReference):
             cursor.execute(
                 """
                 UPDATE option_contract_catalog
-                SET catalog_admitted_at = COALESCE(catalog_admitted_at, %s),
+                SET catalog_admitted_at = %s,
                     updated_at = NOW()
                 WHERE contract_id = %s
+                  AND catalog_admitted_at IS NULL
                 """,
                 (admitted_at, contract_id),
             )

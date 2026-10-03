@@ -51,11 +51,11 @@ class TechnicalExitEvidence(Contract):
     security_id: UUID
     underlyer: Name
     direction: Literal[-1, 1]
-    source_kind: Literal["STOCK_SETUP", "STRUCTURE_SNAPSHOT"]
+    source_kind: Literal["STOCK_SETUP", "STRUCTURE_SNAPSHOT", "CANONICAL_STOCK_SIGNAL"]
     source_policy_sha256: Sha256
     source_payload_sha256: Sha256
     source_revision_ids: tuple[UUID, ...] = Field(min_length=1, max_length=1000)
-    interval: Literal["30m", "1h"]
+    interval: Literal["5m", "15m", "30m", "1h"]
     market_time: AwareDatetime
     available_at: AwareDatetime
     received_at: AwareDatetime
@@ -93,7 +93,7 @@ def technical_exit_terms(*, evidence, trusted_source_policy_sha256, security_id,
         raise ValueError("technical management requires positive exact entry prices")
     invalidation = next(level for level in evidence.levels if level.role == "INVALIDATION")
     buffer = evidence.atr * Decimal(TECHNICAL_EXIT_POLICY.structure_buffer_atr)
-    stop = invalidation.price if evidence.source_kind == "STOCK_SETUP" else invalidation.price - direction * buffer
+    stop = invalidation.price if evidence.source_kind in ("STOCK_SETUP", "CANONICAL_STOCK_SIGNAL") else invalidation.price - direction * buffer
     candidates = [level for level in evidence.levels if level.role == "OPPOSING_STRUCTURE"
         and direction * (level.price - stock_entry) > 0]
     if not candidates or direction * (stock_entry - invalidation.price) <= 0 or stop <= 0:

@@ -160,6 +160,21 @@ def test_catalog_upsert_writes_stable_identity_and_append_only_version():
     connection.commit.assert_called_once_with()
 
 
+def test_catalog_reobservation_does_not_update_an_already_admitted_contract():
+    repository, _, cursor = _repository_with_row(None)
+    cursor.fetchone.side_effect = [
+        None,
+        {"contract_id": 7, "underlying": "SPY", "asset_type": "ETF"},
+    ]
+
+    assert repository.upsert_reference(_reference()) == 7
+
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    update = next(statement for statement in statements if "UPDATE option_contract_catalog" in statement)
+    assert "catalog_admitted_at IS NULL" in update
+    assert "INSERT INTO option_contract_catalog_versions" in statements[-1]
+
+
 def test_bulk_catalog_lookup_uses_one_bitemporal_query():
     repository, _, cursor = _repository_with_row(None)
     cursor.fetchall.return_value = []

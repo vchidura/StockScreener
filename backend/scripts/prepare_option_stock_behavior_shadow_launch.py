@@ -36,6 +36,10 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--technical-forward", action="store_true", help="Prepare the separate pinned technical detector launch; never activates it.")
     parser.add_argument("--intraday-confirmation", action="store_true", help="Pin reviewed O1 v3 latest-available completed-30m confirmation for development observation alerts.")
     parser.add_argument("--stock-setup-wait", action="store_true", help="Wait boundedly for the exact S1/S2 stock publication while causal option activity remains valid.")
+    parser.add_argument("--canonical-stock-first", action="store_true", help="Use canonical completed stock bars for S1/S2 without a Stock Alerts ledger.")
+    parser.add_argument("--canonical-trend", action="store_true", help="Pin O1 v4: exact current canonical 30m trend, opening window unavailable, v2 observation-only challengers.")
+    parser.add_argument("--direct-structure", action="store_true", help="Pin V36: structural stop/target levels recomputed from exact canonical bars, O1 review v3 observations.")
+    parser.add_argument("--partial-coverage", action="store_true", help="Prepare launch v10: evaluate healthy current matrices and retain unavailable ticker coverage; never activates it.")
     parser.add_argument("--approve-stock-runtime-transition", action="store_true", help="Explicitly pin reviewed current stock code before its first new publication; old publications remain ineligible under the new pins.")
     parser.add_argument("--check-only", action="store_true", help="Validate a technical launch without writing its manifest.")
     parser.add_argument("--strategy-policy-file", choices=(
@@ -62,7 +66,7 @@ def _arguments() -> argparse.Namespace:
 def main() -> int:
     args = _arguments()
     if (args.approve_stock_runtime_transition or args.effective_from is not None or args.intraday_confirmation
-            or args.stock_setup_wait) and not args.technical_forward:
+            or args.stock_setup_wait or args.partial_coverage) and not args.technical_forward:
         raise ValueError("stock runtime transition requires a technical forward launch")
     if args.reuse_stock_source_launch is not None and not args.technical_forward:
         raise ValueError("stock source launch reuse requires a technical forward launch")
@@ -105,15 +109,58 @@ def main() -> int:
             dataset_id=args.launch_id, effective_from=starts_at, stock_ledger=args.stock_ledger,
             approve_stock_runtime_transition=args.approve_stock_runtime_transition,
             intraday_confirmation=args.intraday_confirmation, stock_setup_wait=args.stock_setup_wait,
-            stock_source_launch=stock_source_launch)
+            stock_source_launch=stock_source_launch, canonical_stock_first=args.canonical_stock_first,
+            canonical_trend=args.canonical_trend, direct_structure=args.direct_structure,
+            partial_coverage=args.partial_coverage)
         cutoff = datetime.now(timezone.utc)
         source_repository = OptionStockBehaviorAssessmentRepository()
         source_repository.detector_package_sources(configuration=configuration, candidate_ids=(), as_of=cutoff)
         technical_sources = source_repository.detector_technical_sources(underlyers=launch.underlyers, market_cutoff=cutoff, as_of=cutoff)
+        stock_bar_sources = ()
+        stock_bar_signal_counts = {}
+        stock_bar_unavailable = []
+        stock_bar_interval_counts = {}
+        stock_bar_daily_characteristics = {}
+        if args.canonical_stock_first:
+            from collections import Counter
+            from equity.repositories import _bar_from_row
+            from options.calendar import OptionExchangeCalendar
+            from options.stock_bar_detection import detect_canonical_stock_signals
+
+            stock_bar_sources = source_repository.detector_stock_bar_sources(
+                underlyers=launch.underlyers,
+                market_cutoffs={underlyer: cutoff for underlyer in launch.underlyers}, as_of=cutoff)
+            signals = []
+            for underlyer in launch.underlyers:
+                rows = tuple(row for row in stock_bar_sources if row["ticker"] == underlyer)
+                stock_bar_interval_counts[underlyer] = dict(sorted(Counter(row["interval"] for row in rows).items()))
+                if not rows:
+                    stock_bar_unavailable.append(underlyer)
+                    continue
+                try:
+                    signals.extend(detect_canonical_stock_signals(security_id=rows[0]["security_id"],
+                        underlyer=underlyer, bars=tuple((_bar_from_row(row), row["created_at"]) for row in rows),
+                        market_cutoff=cutoff, decision_at=cutoff,
+                        session_close=OptionExchangeCalendar().session_close(cutoff.date())))
+                except ValueError:
+                    stock_bar_unavailable.append(underlyer)
+            stock_bar_signal_counts = dict(sorted(Counter(signal.detector_id for signal in signals).items()))
+            stock_bar_daily_characteristics = {"|".join((str(key[0]),
+                str(key[1]), str(key[2]), ",".join(key[3]))): count
+                for (key, count) in Counter((record["availability_mode"], record["source_kind"],
+                    record["session_scope"], tuple(record["quality_codes"] or ()))
+                    for record in stock_bar_sources if record["interval"] == "1d").items()}
+        trend_bar_counts = {}
+        if args.canonical_trend:
+            trend_bars = source_repository.detector_trend_bar_sources(underlyers=launch.underlyers,
+                market_cutoffs={underlyer: cutoff for underlyer in launch.underlyers}, as_of=cutoff)
+            trend_bar_counts = {underlyer: {interval: len(rows) for interval, rows in value.items()}
+                for underlyer, value in trend_bars.items()}
         if not args.check_only:
             with output.open("x", encoding="utf-8") as destination:
                 destination.write(json.dumps(launch.model_dump(mode="json"), indent=2, sort_keys=True) + "\n")
-        print(f"TECHNICAL_LAUNCH_PREPARED dataset={launch.dataset_id} sha256={launch.sha256} effective_from={launch.effective_from.isoformat()} underlyers={len(launch.underlyers)} current_technical_sources={len(technical_sources['sources'])} activated=False")
+        print(f"CANONICAL_TREND_SOURCE_BARS={json.dumps(trend_bar_counts, sort_keys=True)}")
+        print(f"TECHNICAL_LAUNCH_PREPARED dataset={launch.dataset_id} sha256={launch.sha256} effective_from={launch.effective_from.isoformat()} underlyers={len(launch.underlyers)} current_technical_sources={len(technical_sources['sources'])} canonical_stock_bar_rows={len(stock_bar_sources)} canonical_stock_signals={json.dumps(stock_bar_signal_counts, sort_keys=True)} canonical_stock_unavailable={json.dumps(stock_bar_unavailable)} canonical_stock_intervals={json.dumps(stock_bar_interval_counts, sort_keys=True)} canonical_daily_characteristics={json.dumps(stock_bar_daily_characteristics, sort_keys=True)} activated=False")
         return 0
     if args.check_only:
         raise ValueError("--check-only requires --technical-forward")

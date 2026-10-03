@@ -30,6 +30,7 @@ class OptionOutcomeRunResult:
     current_persisted: int = 0
     unavailable_measurements: int = 0
     unavailable_persisted: int = 0
+    management_statuses_persisted: int = 0
 
 
 class OptionOutcomeService:
@@ -159,6 +160,7 @@ class OptionOutcomeService:
         )
         current_outcomes = []
         current_persisted = 0
+        management_statuses_persisted = 0
         if self.repository.current_marks_available():
             self.repository.delete_non_causal_current_marks()
             current_candidates = self.repository.list_current_candidates(
@@ -193,6 +195,11 @@ class OptionOutcomeService:
                     policy=self.policy,
                 ))
             current_persisted = self.repository.persist_current_marks(current_outcomes)
+            management_statuses_persisted = self.repository.persist_detector_management_crossings(
+                current_outcomes, available_by=available_utc,
+                valuation_policy_sha256=self.policy.policy_sha256,
+                maximum_source_age_seconds=self.policy.maximum_source_age_seconds,
+            )
         return OptionOutcomeRunResult(
             candidates=len(candidates),
             due_measurements=due,
@@ -203,6 +210,7 @@ class OptionOutcomeService:
             current_persisted=current_persisted,
             unavailable_measurements=len(unavailable_assessments),
             unavailable_persisted=unavailable_persisted,
+            management_statuses_persisted=management_statuses_persisted,
         )
 
 

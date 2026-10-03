@@ -42,21 +42,27 @@ export type ColumnSpec = {
 
 const storageName = (key: string) => `alphascreener.columns.${key}`
 
-function initialHidden(storageKey: string, columns: ColumnSpec[]): Set<string> {
+type ColumnPreferenceMigration = { from: string; forceHidden: string[] }
+
+function initialHidden(storageKey: string, columns: ColumnSpec[], migration?: ColumnPreferenceMigration): Set<string> {
   const fallback = new Set(columns.filter(column => column.hiddenByDefault).map(column => column.key))
   try {
-    const raw = localStorage.getItem(storageName(storageKey))
+    const current = localStorage.getItem(storageName(storageKey))
+    const legacy = current ? null : migration && localStorage.getItem(storageName(migration.from))
+    const raw = current || legacy
     if (!raw) return fallback
     const stored = JSON.parse(raw) as string[]
     const known = new Set(columns.map(column => column.key))
-    return new Set(stored.filter(key => known.has(key)))
+    const hidden = new Set(stored.filter(key => known.has(key)))
+    if (!current) migration?.forceHidden.forEach(key => { if (known.has(key)) hidden.add(key) })
+    return hidden
   } catch {
     return fallback
   }
 }
 
-export function useColumnPreferences(storageKey: string, columns: ColumnSpec[]) {
-  const [hidden, setHidden] = useState<Set<string>>(() => initialHidden(storageKey, columns))
+export function useColumnPreferences(storageKey: string, columns: ColumnSpec[], migration?: ColumnPreferenceMigration) {
+  const [hidden, setHidden] = useState<Set<string>>(() => initialHidden(storageKey, columns, migration))
 
   useEffect(() => {
     try {

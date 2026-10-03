@@ -904,6 +904,8 @@ class OptionStrategyEngine:
         by_key = {(row.expiration_date, row.contract_type, row.strike): row for row in snapshots}
         structures: list[tuple[float, tuple[CandidateLeg, ...], StructureType, dict[str, object]]] = []
         policy = self.policy.spreads
+        credit_policy = self.policy.credit
+        anchor_policy = self.policy.participation_anchor if credit_policy is not None else None
         for expiration in expirations:
             walls = json.loads(expiration.wall_clusters_json)
             verticals: dict[ContractType, list[tuple[float, tuple[CandidateLeg, ...], StructureType, dict[str, object]]]] = defaultdict(list)
@@ -915,34 +917,48 @@ class OptionStrategyEngine:
                 short = by_key.get((expiration.expiration_date, contract_type, short_strike))
                 if short is None:
                     continue
-                farther = sorted(
-                    (
-                        row
-                        for row in snapshots
+                short_contracts = {short.contract_id: short}
+                if anchor_policy is not None:
+                    short_contracts.update({
+                        row.contract_id: row for row in snapshots
                         if row.expiration_date == expiration.expiration_date
                         and row.contract_type is contract_type
-                        and (
-                            row.strike < short.strike
-                            if contract_type is ContractType.PUT
-                            else row.strike > short.strike
-                        )
-                    ),
-                    key=lambda row: abs(row.strike - short.strike),
-                )[: policy.maximum_wings_per_short_strike]
-                for wing in farther:
-                    legs = (_leg(short, 0, OptionSide.SELL), _leg(wing, 1, OptionSide.BUY))
-                    payoff = evaluate_terminal_payoff(legs)
-                    if not payoff.bounded_maximum_loss or payoff.maximum_loss is None or payoff.maximum_loss <= 0 or payoff.net_premium <= 0:
-                        continue
-                    structure = StructureType.PUT_CREDIT_VERTICAL if contract_type is ContractType.PUT else StructureType.CALL_CREDIT_VERTICAL
-                    evidence = {
-                        "wall_center": str(center),
-                        "wall_strength": wall["maximum_robust_z"],
-                        "wall_open_interest": wall["total_open_interest"],
-                    }
-                    item = (float(wall["maximum_robust_z"]), legs, structure, evidence)
-                    verticals[contract_type].append(item)
-                    structures.append(item)
+                        and row.strike in member_strikes
+                        and _qualifying_participation_ratio(row, anchor_policy) is not None
+                    })
+                for short in short_contracts.values():
+                    farther = sorted(
+                        (
+                            row
+                            for row in snapshots
+                            if row.expiration_date == expiration.expiration_date
+                            and row.contract_type is contract_type
+                            and (
+                                row.strike < short.strike
+                                if contract_type is ContractType.PUT
+                                else row.strike > short.strike
+                            )
+                        ),
+                        key=lambda row: abs(row.strike - short.strike),
+                    )[: policy.maximum_wings_per_short_strike]
+                    for wing in farther:
+                        legs = (_leg(short, 0, OptionSide.SELL), _leg(wing, 1, OptionSide.BUY))
+                        payoff = evaluate_terminal_payoff(legs)
+                        if not payoff.bounded_maximum_loss or payoff.maximum_loss is None or payoff.maximum_loss <= 0 or payoff.net_premium <= 0:
+                            continue
+                        structure = StructureType.PUT_CREDIT_VERTICAL if contract_type is ContractType.PUT else StructureType.CALL_CREDIT_VERTICAL
+                        ratios = tuple(ratio for ratio in (
+                            _qualifying_participation_ratio(short, anchor_policy),
+                            _qualifying_participation_ratio(wing, anchor_policy),
+                        ) if ratio is not None)
+                        evidence = _participation_anchor_evidence({
+                            "wall_center": str(center),
+                            "wall_strength": wall["maximum_robust_z"],
+                            "wall_open_interest": wall["total_open_interest"],
+                        }, anchor_policy, max(ratios) if ratios else None)
+                        item = (float(wall["maximum_robust_z"]), legs, structure, evidence)
+                        verticals[contract_type].append(item)
+                        structures.append(item)
             puts = sorted(verticals[ContractType.PUT], key=_structure_sort)
             calls = sorted(verticals[ContractType.CALL], key=_structure_sort)
             if puts and calls:
@@ -1005,7 +1021,10 @@ class OptionStrategyEngine:
                         ("NO_STRUCTURE_FOR_QUALIFIED_DIRECTION",),
                     ),
                 )
-        structures.sort(key=_structure_sort)
+        structures.sort(key=lambda item: (
+            _o3_structure_priority(item, snapshots, context, credit_policy),
+            *_structure_sort(item),
+        ))
         counts: dict[tuple[StructureType, object], int] = defaultdict(int)
         candidates: list[OptionCandidate] = []
         for strength, legs, structure, evidence in structures:
@@ -1378,6 +1397,20 @@ def _strike_volume_surge(
 def _structure_sort(item: tuple[float, tuple[CandidateLeg, ...], StructureType, dict[str, object]]) -> tuple[object, ...]:
     strength, legs, structure, _ = item
     return (-strength, structure.value, tuple(leg.contract_id for leg in legs))
+
+
+def _o3_structure_priority(item, snapshots, context, credit_policy) -> int:
+    _, legs, structure, evidence = item
+    if (credit_policy is None or "participation_anchor" not in evidence
+            or structure not in {StructureType.PUT_CREDIT_VERTICAL, StructureType.CALL_CREDIT_VERTICAL}):
+        return 2
+    rows = _snapshot_for_leg(legs, snapshots)
+    dte = (legs[0].expiration_date - context.market_data_time.date()).days
+    if (credit_policy.minimum_entry_dte <= dte <= credit_policy.maximum_entry_dte
+            and all((row.open_interest or 0) >= credit_policy.minimum_leg_open_interest
+                and (row.day_volume or 0) >= credit_policy.minimum_leg_day_volume for row in rows)):
+        return 0
+    return 1
 
 
 def _snapshot_for_leg(legs: tuple[CandidateLeg, ...], snapshots: Iterable[OptionContractSnapshot]) -> tuple[OptionContractSnapshot, ...]:

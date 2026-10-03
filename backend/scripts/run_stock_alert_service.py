@@ -66,14 +66,21 @@ def check_enrollments(backend=BACKEND, *, policies=None):
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as connection:
             connection.execute("PRAGMA query_only=ON")
             connection.execute("BEGIN")
-            row = connection.execute("SELECT policy_hash,CASE WHEN length(payload)<=262144 THEN payload END FROM forward_manifest WHERE singleton=1").fetchone()
-            checkpoint = connection.execute("SELECT CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_checkpoint WHERE singleton=1").fetchone()
-            if not row or not row[1] or not checkpoint or not checkpoint[0] or json.loads(row[1]).get("policy_version") != version:
-                raise ValueError(f"{name} enrollment or policy is unavailable")
-            if digest(json.loads(row[1])) != row[0] or digest(policies[name]) != row[0]:
+            row = connection.execute("SELECT policy_hash,length(payload),CASE WHEN length(payload)<=262144 THEN payload END FROM forward_manifest WHERE singleton=1").fetchone()
+            checkpoint = connection.execute("SELECT length(payload),CASE WHEN length(payload)<=16777216 THEN payload END FROM forward_checkpoint WHERE singleton=1").fetchone()
+            if not row or not row[2]:
+                raise ValueError(f"{name} enrollment manifest is missing" if not row
+                    else f"{name} enrollment manifest exceeds bound ({row[1]} bytes)")
+            if not checkpoint or not checkpoint[1]:
+                raise ValueError(f"{name} enrollment checkpoint is missing" if not checkpoint
+                    else f"{name} enrollment checkpoint exceeds bound ({checkpoint[0]} bytes)")
+            policy = json.loads(row[2])
+            if policy.get("policy_version") != version:
+                raise ValueError(f"{name} enrollment policy version is unavailable")
+            if digest(policy) != row[0] or digest(policies[name]) != row[0]:
                 raise ValueError(f"{name} stored policy does not match current worker policy")
             decoder = zlib.decompressobj()
-            payload = decoder.decompress(checkpoint[0], 16777217)
+            payload = decoder.decompress(checkpoint[1], 16777217)
             if len(payload) > 16777216 or not decoder.eof or decoder.unused_data:
                 raise ValueError(f"{name} enrollment checkpoint exceeds bound or is invalid")
             state = json.loads(payload)
@@ -537,5 +544,6 @@ if __name__ == "__main__":
         if logger.handlers:
             logger.exception("Service stopped: %s", type(error).__name__)
         else:
-            print(json.dumps(dict(state="START_FAILED", reason=type(error).__name__)), file=sys.stderr)
+            print(json.dumps(dict(state="START_FAILED", reason=type(error).__name__,
+                detail=str(error) if isinstance(error, ValueError) else None)), file=sys.stderr)
         raise SystemExit(1)

@@ -642,6 +642,14 @@ def test_service_supervisor_requires_existing_separate_enrollments_without_write
         hashes[path] = hashlib.sha256(path.read_bytes()).hexdigest()
     assert set(check_enrollments(tmp_path, policies=policies)) == {"intraday", "swing"}
     assert hashes == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in hashes}
+    intraday = tmp_path / "backups/equity-shadow/stock-ideas-forward-v2/forward.sqlite"
+    large_state = dict(enrolled_at="2026-09-17T13:00:00Z",
+        members=[dict(security_id="fixture", ticker="TEST")], padding="x" * 5_000_000)
+    large_checkpoint = zlib.compress(json.dumps(large_state).encode(), level=0)
+    assert 4_194_304 < len(large_checkpoint) < 16_777_216
+    with sqlite3.connect(intraday) as connection:
+        connection.execute("UPDATE forward_checkpoint SET payload=? WHERE singleton=1", (large_checkpoint,))
+    assert set(check_enrollments(tmp_path, policies=policies)) == {"intraday", "swing"}
     with pytest.raises(ValueError, match="stored policy"):
         check_enrollments(tmp_path, policies=dict(policies, swing=dict(policy_version="changed")))
     monkeypatch.setenv("STOCK_ALERT_SHADOW_VIEW", str(tmp_path / "other.json"))

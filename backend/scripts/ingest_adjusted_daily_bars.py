@@ -13,6 +13,7 @@ import argparse
 from collections import Counter
 from dataclasses import dataclass
 import json
+import os
 import sys
 import time
 from datetime import date, datetime, timezone
@@ -114,6 +115,10 @@ def parser() -> argparse.ArgumentParser:
              "--from-reconstructed-universes",
     )
     result.add_argument("--apply", action="store_true")
+    result.add_argument(
+        "--confirm-database-name",
+        help="Required with --apply and must exactly match DB_NAME.",
+    )
     result.add_argument(
         "--reference-cache-dir", type=Path,
         default=BACKEND_DIR / ".cache" / "historical-signal-research",
@@ -310,6 +315,9 @@ def main() -> int:
     end = date.fromisoformat(arguments.end)
     if end < start or (arguments.limit_sessions is not None and arguments.limit_sessions <= 0):
         raise SystemExit("end must not precede start and limit-sessions must be positive")
+    database_name = os.getenv("DB_NAME", "").strip()
+    if arguments.apply and arguments.confirm_database_name != database_name:
+        raise SystemExit("--apply requires --confirm-database-name matching DB_NAME")
     observed_at = datetime.now(timezone.utc)
     watermark = DecisionWatermark(observed_at, observed_at)
 

@@ -58,6 +58,9 @@ backend/option-raw/
 # Local documentation and research artifacts. Required program inputs live in backend/research/inputs/.
 /docs/
 
+# Local working specs. Routed agent context lives in .github/copilot-instructions.md.
+/.github/specs/
+
 # Local backups, forward state and study artifacts are retained outside Git.
 backend/backups/
 

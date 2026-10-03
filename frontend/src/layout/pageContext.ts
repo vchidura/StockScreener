@@ -16,7 +16,7 @@ export type PageContextValue = {
   /** Interval to step sessions by; the date itself lives in `useSessionDate`. */
   session?: string
   alertSessions?: { dates: string[]; selected: string; source: string; emptyLabel?: string; resetKeys?: string[];
-    datasetByDate?: Record<string, string>; historicalView?: string; historicalSource?: string }
+    datasetByDate?: Record<string, string>; sessionRollup?: boolean; historicalView?: string; historicalSource?: string }
 }
 
 export const PageContextSetter = createContext<(value: PageContextValue | null) => void>(() => {})

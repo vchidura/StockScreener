@@ -11,6 +11,7 @@ import pytest
 
 from options.outcomes import (
     OptionOutcomeLeg,
+    detector_management_crossing,
     delayed_proxy_commission_policy,
     evaluate_delayed_proxy_outcome,
     measurement_checkpoints,
@@ -87,6 +88,27 @@ def test_long_option_proxy_return_uses_capital_at_risk():
     assert result.gross_pnl == Decimal("100")
     assert result.net_pnl == Decimal("98.70")
     assert result.net_return == Decimal("0.1974")
+
+
+def test_detector_management_crossing_uses_frozen_debit_and_credit_limits():
+    debit = dict(stop_loss_fraction="0.35", take_profit_fraction="0.5")
+    assert detector_management_crossing(debit, entry_net_premium=Decimal("-100"),
+        current_net_premium=Decimal("-150"), multiplier=100) == ("TARGET_MET", Decimal("1.5"))
+    assert detector_management_crossing(debit, entry_net_premium=Decimal("-100"),
+        current_net_premium=Decimal("-65"), multiplier=100) == ("STOP_LOSS_HIT", Decimal("0.65"))
+    assert detector_management_crossing(debit, entry_net_premium=Decimal("-100"),
+        current_net_premium=Decimal("10"), multiplier=100) is None
+    credit = dict(stop_loss_multiple="2", take_profit_fraction="0.5")
+    assert detector_management_crossing(credit, entry_net_premium=Decimal("200"),
+        current_net_premium=Decimal("100"), multiplier=100) == ("TARGET_MET", Decimal("1.0"))
+    assert detector_management_crossing(credit, entry_net_premium=Decimal("200"),
+        current_net_premium=Decimal("400"), multiplier=100) == ("STOP_LOSS_HIT", Decimal("4"))
+    assert detector_management_crossing(dict(stop_loss_multiple="2", take_profit_fraction="1"),
+        entry_net_premium=Decimal("200"), current_net_premium=Decimal("0"), multiplier=100) == ("TARGET_MET", Decimal("0"))
+    assert detector_management_crossing(credit, entry_net_premium=Decimal("200"),
+        current_net_premium=Decimal("-10"), multiplier=100) is None
+    assert detector_management_crossing({}, entry_net_premium=Decimal("-100"),
+        current_net_premium=Decimal("-150"), multiplier=100) is None
 
 
 def test_long_option_price_movement_is_contract_multiplier_times_mark_change():
@@ -451,12 +473,17 @@ def test_current_mark_candidates_prioritize_unmarked_packages():
     assert "snapshot.mark_market_data_time > candidate.market_data_time" in compact
     assert "HAVING COUNT(DISTINCT snapshot.contract_id)" in compact
     assert "PARTITION BY current_mark.candidate_id IS NULL" in compact
+    assert "detector_alert_candidates AS MATERIALIZED" in compact
+    assert "FROM option_detector_evaluations" in compact
+    assert "FROM option_o3_credit_observations" in compact
+    assert "detector_alert.candidate_id IS NOT NULL DESC" in compact
     assert "THEN candidate.market_data_time END DESC" in compact
     assert "current_mark.market_time NULLS FIRST" in compact
     assert "WHERE queue_rank <= %s" in compact
     assert "entry_leg.valuation_policy_sha256 IS DISTINCT FROM %s" in compact
     assert "snapshot.valuation_policy_sha256 = %s" in compact
     assert parameters == (
+        available_by, available_by, available_by, available_by,
         "a" * 64, available_by, available_by, 60,
         "a" * 64, available_by, "a" * 64, available_by, 1000,
     )
@@ -864,6 +891,9 @@ def test_option_outcome_service_persists_latest_coherent_current_mark():
             self.outcomes = tuple(outcomes)
             return len(self.outcomes)
 
+        def persist_detector_management_crossings(self, outcomes, **kwargs):
+            return 0
+
     repository = Repository()
     result = OptionOutcomeService(repository).mature(
         available_by=datetime(2026, 8, 31, 20, 15, tzinfo=UTC)
@@ -929,6 +959,9 @@ def test_option_outcome_service_uses_one_bulk_read_per_leg_phase():
         def persist_current_marks(self, outcomes):
             return len(outcomes)
 
+        def persist_detector_management_crossings(self, outcomes, **kwargs):
+            return 0
+
     result = OptionOutcomeService(Repository(), policy=policy).mature(
         available_by=datetime(2026, 8, 31, 20, 15, tzinfo=UTC))
 
@@ -968,6 +1001,9 @@ def test_option_outcome_service_batches_both_full_current_mark_queues():
             return {}
 
         def persist_current_marks(self, outcomes):
+            return 0
+
+        def persist_detector_management_crossings(self, outcomes, **kwargs):
             return 0
 
     result = OptionOutcomeService(Repository(), policy=policy).mature(

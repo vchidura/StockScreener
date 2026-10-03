@@ -183,6 +183,24 @@ def scanner_frame(latest_time):
     }])
 
 
+def test_requested_level_directions_do_not_change_default_output_and_match_own_setup():
+    source_bars = bars()
+    latest = source_bars[-1]
+    common = dict(analysis_run_id=uuid4(), security=SECURITY, interval="30m", bars=source_bars,
+        observed_at=latest.bar_end + timedelta(seconds=2))
+    default = materialize_equity_evidence(**common)
+    requested = materialize_equity_evidence(**common, level_directions=(1, -1))
+    assert default.directional_levels is None
+    assert [row.payload_json for row in default.evidence] == [row.payload_json for row in requested.evidence]
+    setup = json.loads(next(row for row in requested.evidence if row.evidence_type is EvidenceType.TRADE_SETUP).payload_json)
+    own = 1 if requested.setup_direction == "BULLISH" else -1
+    assert requested.directional_levels[own]["stops"] == setup["stops"]
+    assert requested.directional_levels[own]["targets"] == setup["targets"]
+    close = setup["last_close"]
+    assert all(level["price"] > close for level in requested.directional_levels[-1]["stops"])
+    assert all(level["price"] < close for level in requested.directional_levels[-1]["targets"])
+
+
 def test_materializer_emits_common_evidence_families_and_conflict():
     source_bars = bars()
     latest = source_bars[-1]

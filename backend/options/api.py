@@ -759,7 +759,7 @@ def option_detector_datasets() -> OptionsEnvelope:
             data["dataset_sessions"][current] = sorted(set(data["dataset_sessions"][current]) | {configured_session})
             data["sessions"] = sorted(set(data["sessions"]) | {configured_session})
             data["session_datasets"][configured_session] = current
-        data["current_session_date"] = configured_session if launch_effective else retained_session
+        data["current_session_date"] = data["sessions"][-1] if data["sessions"] else None
         data["configured_dataset_id"] = configured
         data["configured_effective_from"] = launch.effective_from if launch else None
     except (OSError, ValueError, DatabaseError):
@@ -828,12 +828,16 @@ def option_detector_alerts(
     limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
 ) -> OptionsEnvelope:
     from options.analytics.behavior_review import build_detector_alert_review
-    from options.repositories.alert_review_sources import OptionAlertReviewSourceRepository
+    from options.repositories.alert_review_sources import (
+        OptionAlertReviewSourceRepository, configured_detector_launch, detector_attempt_status,
+    )
 
     now = datetime.now(timezone.utc)
     try:
         configuration = _configuration()
         source_repository = OptionAlertReviewSourceRepository()
+        launch = configured_detector_launch()
+        attempts = detector_attempt_status(launch=launch, as_of=now)["attempts"] if launch is not None and launch.dataset_id == dataset_id else ()
         history_dataset_ids = ()
         if session_rollup:
             if scope != "HISTORY" or session_date is None:
@@ -847,8 +851,8 @@ def option_detector_alerts(
             session_date=session_date, detector=detector, limit=limit, offset=offset,
             underlyer=underlyer, sort_by=sort_by, sort_order=sort_order,
             source_repository=source_repository, history_dataset_ids=history_dataset_ids,
-            valuation_policy=configuration.valuation_policy)
-    except (ValueError, DatabaseError):
+            valuation_policy=configuration.valuation_policy, attempts=attempts)
+    except (OSError, ValueError, DatabaseError):
         return _envelope(available=False, reason="DETECTOR_ALERTS_UNAVAILABLE", data={})
     return _envelope(available=True, as_of=now, data=data)
 
@@ -1951,4 +1955,51 @@ def option_event_calendar_reference(
             default=None,
         ),
         data=data,
+    )
+
+
+@router.get("/quotes/current", response_model=OptionsEnvelope)
+def option_current_quotes(
+    contract_id: list[int] = Query(min_length=1, max_length=8),
+) -> OptionsEnvelope:
+    contract_ids = tuple(dict.fromkeys(contract_id))
+    if any(value <= 0 for value in contract_ids):
+        return _envelope(available=False, reason="INVALID_CONTRACT_ID", data={"quotes": []})
+    with get_db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT to_regclass('public.option_quote_current') IS NOT NULL AS ready
+            """
+        )
+        if not cursor.fetchone()["ready"]:
+            return _envelope(available=False, reason="ADVANCED_QUOTE_SCHEMA_UNAVAILABLE", data={"quotes": []})
+        cursor.execute(
+            """
+            SELECT quote.contract_id, quote.contract_ticker, quote.quote_time,
+                   quote.received_at, quote.bid, quote.ask, quote.bid_size,
+                   quote.ask_size, quote.updated_at
+            FROM option_quote_current AS quote
+            WHERE quote.provider = 'polygon_advanced'
+              AND quote.contract_id = ANY(%s::bigint[])
+              AND quote.quote_time <= NOW()
+              AND quote.received_at <= NOW()
+            ORDER BY quote.contract_id
+            """,
+            (list(contract_ids),),
+        )
+        quotes = [dict(row) for row in cursor.fetchall()]
+    found = {row["contract_id"] for row in quotes}
+    return _envelope(
+        available=bool(quotes),
+        reason=None if quotes else "ADVANCED_QUOTES_UNAVAILABLE",
+        as_of=max((row["quote_time"] for row in quotes), default=None),
+        observed_at=max((row["received_at"] for row in quotes), default=None),
+        data={
+            "quotes": quotes,
+            "requested_contract_ids": list(contract_ids),
+            "missing_contract_ids": [value for value in contract_ids if value not in found],
+            "source": "PERSISTED_ADVANCED_QUOTE_CURRENT",
+            "provider_fetch_performed": False,
+            "execution_permission": False,
+        },
     )

@@ -60,10 +60,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-id", required=True)
     parser.add_argument("--session-date", type=date.fromisoformat, required=True)
+    parser.add_argument("--session-rollup", action="store_true",
+        help="Include every retained dataset that has detector runs for the selected session.")
     args = parser.parse_args()
     as_of = datetime.now(timezone.utc)
     repository = OptionAlertEvaluationRepository()
     source_repository = OptionAlertReviewSourceRepository()
+    history_dataset_ids = ()
+    if args.session_rollup:
+        index = source_repository.dataset_index(as_of=as_of)
+        history_dataset_ids = tuple(sorted(dataset for dataset, sessions in index["dataset_sessions"].items()
+            if args.session_date.isoformat() in sessions))
+        if args.dataset_id not in history_dataset_ids:
+            history_dataset_ids = (*history_dataset_ids, args.dataset_id)
     reports = {
         scope.lower(): compact(build_detector_alert_review(
             dataset_id=args.dataset_id,
@@ -73,6 +82,7 @@ def main() -> int:
             limit=200,
             repository=repository,
             source_repository=source_repository,
+            history_dataset_ids=history_dataset_ids if scope == "HISTORY" else (),
         ))
         for scope in ("LATEST", "HISTORY")
     }

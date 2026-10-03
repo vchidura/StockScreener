@@ -1,6 +1,6 @@
 """Read-only v1 behavior selection and descriptive outcome review."""
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import date, datetime
 from math import isfinite
 from statistics import fmean
 
@@ -28,6 +28,8 @@ def _detector_run_summary(run):
         selected_at=run.selected_at.isoformat(), published_at=run.selected_at.isoformat(),
         market_time=run.market_time.isoformat(), observed_time=run.observed_time.isoformat(),
         expected_underlyings=len(run.expected_underlyers), covered_underlyings=len(run.source_matrices),
+        coverage_status=run.coverage_status,
+        unavailable_underlyers=dict(run.unavailable_underlyers) if run.partial_coverage else {},
         selection_counts=dict(run.selection_counts), rejections=dict(run.rejections))
 
 
@@ -59,7 +61,8 @@ def _detector_triggered_at(record):
         value = plan.get("source_market_time")
     else:
         evidence = plan.get("management_policy", {}).get("technical_exit", {}).get("evidence", {})
-        value = evidence.get("market_time") if evidence.get("source_kind") == "STOCK_SETUP" else None
+        value = evidence.get("market_time") if evidence.get("source_kind") in (
+            "STOCK_SETUP", "CANONICAL_STOCK_SIGNAL") else None
     if not isinstance(value, str):
         return None
     try:
@@ -235,7 +238,7 @@ def build_detector_evaluation_review(*, as_of, session_date=None, dataset_id=Non
 def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_date=None,
                                detector=None, limit=50, offset=0, repository=None,
                                underlyer=None, sort_by="run", sort_order="asc", source_repository=None,
-                               mark_repository=None, valuation_policy=None, history_dataset_ids=()):
+                               mark_repository=None, valuation_policy=None, history_dataset_ids=(), attempts=()):
     import json
     from psycopg2 import Error as DatabaseError
     from zoneinfo import ZoneInfo
@@ -251,6 +254,7 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
             or any(not value or len(value) > 80 for value in history_dataset_ids)):
         raise ValueError("invalid detector alert scope")
     reader = repository or OptionAlertEvaluationRepository()
+    display_records_supported = hasattr(source_repository, "alert_display_records")
     _sort_detector_records((), sort_by, sort_order)
     dataset_ids = history_dataset_ids if scope == "HISTORY" and history_dataset_ids else (dataset_id,)
     runs_by_cycle = {}
@@ -266,26 +270,63 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
     latest = max(candidates, key=lambda run: run.scheduled_cycle) if candidates else None
     latest_date = latest.scheduled_cycle.astimezone(ZoneInfo("America/New_York")).date() if latest else None
     selected_date = session_date or latest_date
-    if latest is None:
+    valid_attempts = []
+    for attempt in attempts:
+        cycle = datetime.fromisoformat(attempt["scheduled_cycle"])
+        started = datetime.fromisoformat(attempt["started_at"])
+        if (cycle.utcoffset() is None or started.utcoffset() is None or not cycle <= started <= as_of
+                or attempt["status"] not in ("RUNNING", "FAILED", "INCOMPLETE", "UNVERIFIED")):
+            raise ValueError("detector attempt identity or clocks mismatch")
+        if session_date is None or cycle.astimezone(ZoneInfo("America/New_York")).date() == session_date:
+            valid_attempts.append((cycle, attempt))
+    latest_attempt = max(valid_attempts, key=lambda item: item[0]) if valid_attempts else None
+    newer_attempt = latest_attempt is not None and (latest is None or latest_attempt[0] > latest.scheduled_cycle)
+    if newer_attempt:
+        selected_date = latest_attempt[0].astimezone(ZoneInfo("America/New_York")).date()
+    if latest is None or scope == "LATEST" and newer_attempt:
         return dict(version="option_detector_alert_review_v2", dataset_id=dataset_id, scope=scope,
             dataset_ids=list(dataset_ids),
-            status="NO_COMPLETE_RUN", as_of=as_of.isoformat(), latest_run_id=None, run=None, runs=[], latest_run=None,
+            status=latest_attempt[1]["status"] if newer_attempt else "NO_COMPLETE_RUN",
+            latest_attempt=latest_attempt[1] if newer_attempt else None,
+            as_of=as_of.isoformat(), latest_run_id=str(latest.run_id) if latest else None, run=None, runs=[],
+            latest_run=_detector_run_summary(latest) if latest else None,
             session_date=selected_date.isoformat() if selected_date else None,
             sessions=sessions, rows=[], total=0, new_alerts=0, repeat_hits=0, maximum_new_alerts=20,
             outcome_status="NOT_BOUND_TO_PROSPECTIVE_OUTCOMES", execution_permission=False)
+    display_observation_count = None
     if scope == "LATEST":
-        completed = reader.completed_run(dataset_id=dataset_id, scheduled_cycle=latest.scheduled_cycle, as_of=as_of)
-        if completed is None or completed[0] != latest:
-            raise ValueError("latest completed detector run cannot be reconciled")
-        active_runs, records = (latest,), completed[1]
+        if display_records_supported:
+            inputs = source_repository.alert_display_records(dataset_id=dataset_id, session_date=selected_date,
+                runs=(latest,), as_of=as_of, detector=detector, underlyer=underlyer)
+            active_runs, records = (latest,), inputs["records"]
+            display_observation_count = inputs["detected_observations"]
+        else:
+            completed = reader.completed_run(dataset_id=dataset_id, scheduled_cycle=latest.scheduled_cycle, as_of=as_of)
+            if completed is None or completed[0] != latest:
+                raise ValueError("latest completed detector run cannot be reconciled")
+            active_runs, records = (latest,), completed[1]
     else:
-        active_runs = tuple(run for run in candidates if run.run_id != latest.run_id)
+        active_runs = tuple(run for run in candidates if newer_attempt or run.run_id != latest.run_id)
         active_ids = {run.run_id for run in active_runs}
         records = []
+        history_observation_count = 0
+        optimized_history = True
         for source_dataset_id in dataset_ids:
-            inputs = reader.review_inputs(dataset_id=source_dataset_id, session_date=selected_date, as_of=as_of)
-            records.extend(row for row in inputs["records"] if row.run_id in active_ids)
+            source_runs = tuple(run for run in active_runs if run.dataset_id == source_dataset_id)
+            if not source_runs:
+                continue
+            if display_records_supported:
+                inputs = source_repository.alert_display_records(dataset_id=source_dataset_id, session_date=selected_date,
+                    runs=source_runs, as_of=as_of, detector=detector, underlyer=underlyer)
+                records.extend(inputs["records"])
+                history_observation_count += inputs["detected_observations"]
+            else:
+                optimized_history = False
+                inputs = reader.review_inputs(dataset_id=source_dataset_id, session_date=selected_date, as_of=as_of)
+                records.extend(row for row in inputs["records"] if row.run_id in active_ids)
         records = tuple(records)
+        if optimized_history:
+            display_observation_count = history_observation_count
     observation_types = (O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence)
     visible = tuple(row for row in records if (row.selection_status == "SELECTED"
         or isinstance(row, (O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, StockSetupIndicatorEvaluationEvidence))
@@ -309,8 +350,8 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
         for source_dataset_id, source_records in records_by_dataset.items():
             hits.update(reader.repeat_counts(dataset_id=source_dataset_id, records=tuple(source_records), as_of=as_of))
     originals = source_repository.original_packages(package_page, as_of=as_of) if source_repository is not None and package_page else {}
-    marks, mark_reason = {}, None
-    if scope == "HISTORY" and page and valuation_policy is not None:
+    marks, mark_reason, management_status_ready = {}, None, False
+    if page and valuation_policy is not None:
         from options.repositories.outcomes import OptionOutcomeRepository
 
         try:
@@ -318,11 +359,13 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
                 [record.candidate_id for record in page], available_by=as_of,
                 valuation_policy_sha256=valuation_policy.policy_sha256)
             marks = mark_inputs["rows"]
+            management_status_ready = bool(mark_inputs.get("management_status_ready"))
             if not mark_inputs["ready"]:
                 mark_reason = "CURRENT_MARK_STORAGE_UNAVAILABLE"
         except (ValueError, DatabaseError):
             mark_reason = "CURRENT_MARK_READ_UNAVAILABLE"
     rows = []
+    current_session_date = as_of.astimezone(ZoneInfo("America/New_York")).date()
     for record in page:
         if isinstance(record, O3CreditEvaluationEvidence):
             from options.credit_detection import O3_CREDIT_POLICY
@@ -352,7 +395,7 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
                     quote_ask=str(leg.ask) if leg.ask is not None else None,
                     quote_midpoint=None, quote_spread_midpoint=None) for leg in observation.legs])
             current_mark = None
-            if scope == "HISTORY" and valuation_policy is not None:
+            if valuation_policy is not None:
                 from options.outcomes import review_retained_candidate_mark
 
                 current_mark = review_retained_candidate_mark(dict(candidate_id=record.candidate_id,
@@ -376,15 +419,20 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
                     take_profit_fraction=O3_CREDIT_POLICY["take_profit_fraction"],
                     exit_dte=O3_CREDIT_POLICY["minimum_exit_dte"]), event_horizon_status=None,
                 original_package=original, current_mark=current_mark, observation=observation.model_dump(mode="json"),
+                management_status="NOT_APPLICABLE",
                 outcome_status="NOT_BOUND_TO_PROSPECTIVE_OUTCOMES", net_return=None, fill=None))
             continue
         package = record.package
         plan = json.loads(record.plan_payload_text)
         repeat = hits[record.evaluation_id]
+        stock_confirmation = plan.get("stock_confirmation") or {}
+        confirmation_timeframes = sorted(set((repeat.get("confirmation_timeframes") or ()))
+            | ({stock_confirmation["interval"]} if stock_confirmation.get("schema_version") == "option_canonical_stock_signal_v1" else set()),
+            key=lambda value: {"5m": 0, "15m": 1, "30m": 2, "1h": 3}.get(value, 99))
         triggered_at = _detector_triggered_at(record)
         original = originals.get(str(record.candidate_id), dict(status="UNAVAILABLE", legs=[]))
         current_mark = None
-        if scope == "HISTORY" and valuation_policy is not None and original.get("status") == "AVAILABLE":
+        if valuation_policy is not None and original.get("status") == "AVAILABLE":
             from options.outcomes import review_retained_candidate_mark
 
             current_mark = review_retained_candidate_mark(dict(
@@ -398,6 +446,18 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
             ), marks.get(str(record.candidate_id)), checked_at=as_of, policy=valuation_policy)
             if mark_reason:
                 current_mark["reason"] = mark_reason
+        management_status = marks.get(str(record.candidate_id), {}).get("management_status")
+        if management_status is None:
+            expiration_date = original.get("expiration_date")
+            if isinstance(expiration_date, str):
+                try:
+                    expiration_date = date.fromisoformat(expiration_date)
+                except ValueError:
+                    expiration_date = None
+            elif isinstance(expiration_date, datetime):
+                expiration_date = expiration_date.date()
+            management_status = ("EXPIRED" if isinstance(expiration_date, date) and expiration_date < current_session_date
+                else "MONITORING" if management_status_ready else "UNAVAILABLE")
         rows.append(dict(evaluation_id=str(record.evaluation_id), candidate_id=str(record.candidate_id), matrix_id=str(package.matrix_id),
             run_id=str(record.run_id), scheduled_cycle=record.scheduled_cycle.isoformat(),
             triggered_at=triggered_at.isoformat() if triggered_at else None,
@@ -406,20 +466,24 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
             strategy_name=_detector_strategy(record),
             candidate_rank=package.candidate_rank, first_selected_at=record.selected_at.isoformat(),
             hit_count=1 + repeat["repeats"], repeat_count=repeat["repeats"],
+            confirmation_timeframes=confirmation_timeframes,
             last_seen_at=(repeat["last_seen_at"] or record.selected_at).isoformat(),
             plan_sha256=package.plan_sha256, entry_limit=plan["entry_limit"],
             entry_deadline=package.entry_deadline.isoformat(), exit_deadline=package.exit_deadline.isoformat(),
             management_policy=plan["management_policy"], event_horizon_status=package.event_horizon_status,
+            management_status=management_status,
             original_package=original, current_mark=current_mark,
             outcome_status="NOT_BOUND_TO_PROSPECTIVE_OUTCOMES", net_return=None, fill=None))
     return dict(version="option_detector_alert_review_v2", dataset_id=dataset_id, scope=scope,
         dataset_ids=list(dataset_ids),
-        status="COMPLETE", as_of=as_of.isoformat(), latest_run_id=str(latest.run_id),
+        status="PARTIAL" if scope == "LATEST" and latest.coverage_status == "PARTIAL" else "COMPLETE",
+        latest_attempt=latest_attempt[1] if newer_attempt else None,
+        as_of=as_of.isoformat(), latest_run_id=str(latest.run_id),
         run=_detector_run_summary(latest) if scope == "LATEST" else None,
         latest_run=_detector_run_summary(latest), runs=[_detector_run_summary(run) for run in active_runs],
         session_date=selected_date.isoformat(), sessions=sessions,
         rows=rows, total=len(displayed), limit=limit, offset=offset,
-        detected_observations=len(observations),
+        detected_observations=(display_observation_count if display_observation_count is not None else len(observations)),
         new_alerts=sum(dict(run.selection_counts)["SELECTED"] for run in active_runs),
         repeat_hits=sum(dict(run.selection_counts)["REPEAT"] for run in active_runs), maximum_new_alerts=20,
         outcome_status="NOT_BOUND_TO_PROSPECTIVE_OUTCOMES", execution_permission=False)

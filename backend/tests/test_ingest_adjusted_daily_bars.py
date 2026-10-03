@@ -101,10 +101,12 @@ def test_ticker_only_reference_is_not_identity_evidence(tmp_path, cik):
 
 
 def prepare_import(monkeypatch, tmp_path, *, apply=False, reconstructed=True):
+    monkeypatch.setenv("DB_NAME", "adjusted_import_test")
     arguments = SimpleNamespace(
         start="2024-03-01", end="2024-03-04", calendar="XNYS", limit_sessions=None,
         from_reconstructed_universes=reconstructed, policy_version="test",
         include_non_common=False, include_non_common_ticker=[], apply=apply,
+        confirm_database_name="adjusted_import_test",
         ticker=[], skip_benchmarks=False,
         security_type=None, fetch_missing_reference_cache=False,
         output=tmp_path / "report.json", reference_cache_dir=tmp_path,

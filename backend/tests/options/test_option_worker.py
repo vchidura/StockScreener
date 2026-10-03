@@ -84,6 +84,40 @@ def test_detector_status_write_failure_does_not_change_pipeline_result(caplog):
     assert "retained results unchanged" in caplog.text
 
 
+def test_recorded_partial_cycle_is_not_retried_or_replaced():
+    class PartialPipeline(FakePipeline):
+        def run_once(self, *args, **kwargs):
+            self.calls.append(kwargs["cycle_time"])
+            return SimpleNamespace(
+                results=(SimpleNamespace(underlyer="AAPL", status="FAILED", retryable=True),),
+                detector_evaluation={"status": "RECORDED", "run_id": "partial-run", "new_alerts": 0,
+                    "unavailable_underlyers": (("AAPL", ("CURRENT_MATRIX_UNAVAILABLE",)),)})
+
+    pipeline = PartialPipeline()
+    worker = OptionMaterializationWorker(pipeline, calendar=FakeCalendar(),
+        clock=lambda: datetime(2026, 8, 31, 14, 16, tzinfo=UTC))
+    assert worker.poll_once() is not None
+    assert worker.poll_once() is None
+    assert len(pipeline.calls) == 1
+
+
+def test_recorded_partial_cycle_still_retries_underlyers_outside_the_recorded_gap():
+    class PartialPipeline(FakePipeline):
+        def run_once(self, *args, **kwargs):
+            self.calls.append(kwargs["cycle_time"])
+            return SimpleNamespace(
+                results=(SimpleNamespace(underlyer="AAPL", status="FAILED", retryable=True),
+                    SimpleNamespace(underlyer="MSFT", status="FAILED", retryable=True)),
+                detector_evaluation={"status": "RECORDED", "run_id": "partial-run", "new_alerts": 0,
+                    "unavailable_underlyers": (("AAPL", ("CURRENT_MATRIX_UNAVAILABLE",)),)})
+
+    pipeline = PartialPipeline()
+    worker = OptionMaterializationWorker(pipeline, calendar=FakeCalendar(),
+        clock=lambda: datetime(2026, 8, 31, 14, 16, tzinfo=UTC))
+    assert worker.poll_once() is not None
+    assert worker._retry_slot is not None
+
+
 def test_detector_attempt_status_writer_is_scoped_and_bounded(tmp_path, monkeypatch):
     import json
     from scripts import run_option_worker as script

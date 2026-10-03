@@ -80,7 +80,7 @@ def _detector_pipeline_arguments(configuration):
         return {}
     if not path or not expected:
         raise ValueError("technical forward launch requires both manifest path and reviewed checksum")
-    from options.detector_launch import load_detector_forward_launch, build_detector_collector
+    from options.detector_launch import load_detector_forward_launch, build_detector_collector, PartialCoverageDetectorForwardLaunch
     from options.repositories.alert_evaluations import OptionAlertEvaluationRepository
     from options.repositories.stock_behavior_assessments import OptionStockBehaviorAssessmentRepository
     from datetime import datetime, timezone
@@ -89,6 +89,8 @@ def _detector_pipeline_arguments(configuration):
     schema = OptionAlertEvaluationRepository().schema_readiness()
     if not _detector_storage_ready(schema):
         raise ValueError("technical forward storage guards or permissions are not ready")
+    if isinstance(launch, PartialCoverageDetectorForwardLaunch) and not schema.get("partial_coverage_registered"):
+        raise ValueError("partial detector coverage requires migration 062")
     sources = OptionStockBehaviorAssessmentRepository()
     cutoff = datetime.now(timezone.utc)
     sources.detector_package_sources(configuration=configuration, candidate_ids=(), as_of=cutoff)

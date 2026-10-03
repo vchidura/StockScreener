@@ -98,12 +98,12 @@ def prepare_pair(anchor, now):
         hourly_coverage=payload['hourly_coverage'])
 
 
-def run_once(*, publish_result=True):
+def run_once(*, publish_result=True, rebuild_current=False):
     now = datetime.now(timezone.utc)
     source_id, anchor = load_daily_anchor(now)
     if source_id is None:
         return dict(status='WAITING_FOR_DAILY_PUBLICATION')
-    if anchor is None or anchor['source_publication_id'] != source_id:
+    if rebuild_current or anchor is None or anchor['source_publication_id'] != source_id:
         anchor = build_latest()
         if publish_result:
             publish({SNAPSHOT_TYPE: anchor}, manifest(anchor))
@@ -138,10 +138,17 @@ def main():
     modes.add_argument('--once', action='store_true')
     modes.add_argument('--status', action='store_true')
     modes.add_argument('--measure', action='store_true')
+    parser.add_argument(
+        '--rebuild-current',
+        action='store_true',
+        help='Publish a new immutable screening revision from the current retained history; requires --once.',
+    )
     parser.add_argument('--poll-seconds', type=int, default=int(os.getenv('SCREENING_WORKER_POLL_SECONDS', '60')))
     args = parser.parse_args()
     if args.poll_seconds < 15:
         parser.error('poll-seconds must be at least 15')
+    if args.rebuild_current and not args.once:
+        parser.error('--rebuild-current requires --once')
     if args.status or args.measure:
         print(json.dumps(status() if args.status else run_once(publish_result=False), indent=2), flush=True)
         return
@@ -153,7 +160,7 @@ def main():
         try:
             while True:
                 try:
-                    result = run_once()
+                    result = run_once(rebuild_current=args.rebuild_current)
                     print(json.dumps(dict(checked_at=datetime.now(timezone.utc).isoformat(), **result)), flush=True)
                 except Exception:
                     if args.once:

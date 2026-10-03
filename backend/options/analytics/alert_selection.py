@@ -4,16 +4,16 @@ import hashlib
 from collections import Counter, defaultdict, deque
 from datetime import datetime
 from decimal import Decimal
-from typing import ClassVar, Literal
+from typing import Annotated, ClassVar, Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import AwareDatetime, Field, model_validator
 
 from equity.behavior import Contract, Name, Sha256
-from options.intraday_participation import O1IndicatorObservation
+from options.intraday_participation import O1IndicatorObservation, O1IndicatorObservationV2, O1IndicatorObservationV3
 from options.credit_detection import O3CreditObservation
 from options.stock_setup_binding import StockSetupIndicatorObservation
-from options.dual_origin import QualifiedDualOriginPackage, QualifiedResumptionPackage, QualifiedTechnicalPackage, load_qualified_package
+from options.dual_origin import QualifiedCanonicalStockPackage, QualifiedDualOriginPackage, QualifiedResumptionPackage, QualifiedTechnicalPackage, load_qualified_package
 from options.surface_detection import SurfaceDecision
 
 from options.strategies.domain import canonical_json
@@ -107,8 +107,13 @@ def select_dual_origin_packages(packages, prior_alerts, *, decision_at, schedule
             if not isinstance(prior, QualifiedDualOriginPackage):
                 raise ValueError("prior alert identity must resolve an original qualified package")
             prior = load_qualified_package(prior)
+            canonical_repeat = (isinstance(prior, QualifiedCanonicalStockPackage)
+                and isinstance(row, QualifiedCanonicalStockPackage)
+                and prior.recurrence_contract_id == row.recurrence_contract_id
+                and prior.direction == row.direction)
             if (prior.recurrence_sha256 != identity or prior.detector_id != row.detector_id
-                    or prior.exposure_sha256 != row.exposure_sha256 or prior.expires_at != row.expires_at
+                    or not (prior.exposure_sha256 == row.exposure_sha256 or canonical_repeat)
+                    or prior.expires_at != row.expires_at
                     or prior.decision_at >= row.decision_at):
                 raise ValueError("prior alert identity, expiry or chronology mismatch")
             if decision_at < prior.expires_at:
@@ -160,7 +165,7 @@ class DetectorSelectionEvidence(Contract):
     run_id: UUID
     selector_sha256: Sha256 = DUAL_ORIGIN_SELECTOR_SHA256
     selected_at: AwareDatetime
-    package: QualifiedDualOriginPackage | QualifiedResumptionPackage | QualifiedTechnicalPackage
+    package: QualifiedDualOriginPackage | QualifiedResumptionPackage | QualifiedTechnicalPackage | QualifiedCanonicalStockPackage
     selection_status: Literal["SELECTED", "NOT_SELECTED", "REPEAT"]
     selection_reason: Literal["WITHIN_RUN_BUDGET", "RUN_CAP", "LOWER_RANK_SAME_DETECTOR_UNDERLYING_DIRECTION", "PRIOR_ALERT"]
     first_candidate_id: UUID | None = None
@@ -336,7 +341,8 @@ class O1IndicatorEvaluationEvidence(Contract):
     run_id: UUID
     selector_sha256: Sha256 = DUAL_ORIGIN_SELECTOR_SHA256
     selected_at: AwareDatetime
-    observation: O1IndicatorObservation
+    observation: Annotated[O1IndicatorObservation | O1IndicatorObservationV2 | O1IndicatorObservationV3,
+        Field(discriminator="schema_version")]
     recurrence_sha256: Sha256
     selection_status: Literal["OBSERVATION"] = "OBSERVATION"
     selection_reason: Literal["INDICATOR_SHADOW_ONLY"] = "INDICATOR_SHADOW_ONLY"
@@ -380,7 +386,7 @@ def build_o1_indicator_evidence(observations, *, dataset_id, selected_at):
     records = tuple(O1IndicatorEvaluationEvidence(dataset_id=dataset_id, selected_at=selected_at,
         run_id=uuid5(NAMESPACE_URL, f"option-detector-evaluation-run:{dataset_id}:{row.scheduled_cycle.isoformat()}"),
         recurrence_sha256=row.recurrence_sha256,
-        observation=O1IndicatorObservation.model_validate_json(row.canonical_json())) for row in observations)
+        observation=type(row).model_validate_json(row.canonical_json())) for row in observations)
     if len({row.evaluation_id for row in records}) != len(records):
         raise ValueError("O1 contract episode must be evaluated once per run")
     return records
@@ -516,6 +522,7 @@ def load_evaluation_evidence(payload_text):
 
 class DetectorRunEvidence(Contract):
     actual_matrix_watermarks: ClassVar[bool] = False
+    partial_coverage: ClassVar[bool] = False
     schema_version: Literal["option_detector_run_v1"] = "option_detector_run_v1"
     dataset_id: Name
     scheduled_cycle: AwareDatetime
@@ -540,8 +547,12 @@ class DetectorRunEvidence(Contract):
         return uuid5(NAMESPACE_URL, f"option-detector-evaluation-run:{self.dataset_id}:{self.scheduled_cycle.isoformat()}")
 
     @property
+    def coverage_status(self):
+        return "COMPLETE"
+
+    @property
     def scope_sha256(self):
-        return hashlib.sha256(canonical_json(dict(version="option_detector_run_scope_v2" if self.actual_matrix_watermarks else "option_detector_run_scope_v1",
+        return hashlib.sha256(canonical_json(dict(version="option_detector_run_scope_v3" if self.partial_coverage else "option_detector_run_scope_v2" if self.actual_matrix_watermarks else "option_detector_run_scope_v1",
             dataset_id=self.dataset_id, selector_sha256=self.selector_sha256,
             configuration_sha256=self.configuration_sha256, strategy_policy_sha256=self.strategy_policy_sha256,
             market_policy_sha256=self.market_policy_sha256, strategy_version=self.strategy_version,
@@ -553,7 +564,9 @@ class DetectorRunEvidence(Contract):
             raise ValueError("unsupported detector run selector")
         if tuple(sorted(set(self.expected_underlyers))) != self.expected_underlyers:
             raise ValueError("detector run universe must be distinct and sorted")
-        if (tuple(name for name, _ in self.source_matrices) != self.expected_underlyers
+        names = tuple(name for name, _ in self.source_matrices)
+        if ((not self.partial_coverage and names != self.expected_underlyers)
+            or self.partial_coverage and (names != tuple(sorted(set(names))) or set(names) - set(self.expected_underlyers))
                 or len({matrix for _, matrix in self.source_matrices}) != len(self.source_matrices)):
             raise ValueError("detector run requires exact complete source matrices")
         if (self.scheduled_cycle > self.selected_at or not self.market_time <= self.observed_time <= self.selected_at
@@ -579,21 +592,44 @@ class ForwardDetectorRunEvidence(DetectorRunEvidence):
     watermark_basis: Literal["ACTUAL_RETAINED_MATRIX_WATERMARKS"] = "ACTUAL_RETAINED_MATRIX_WATERMARKS"
 
 
+class PartialDetectorRunEvidence(ForwardDetectorRunEvidence):
+    partial_coverage: ClassVar[bool] = True
+    schema_version: Literal["option_detector_run_v3"] = "option_detector_run_v3"
+    unavailable_underlyers: tuple[tuple[Name, tuple[Name, ...]], ...] = Field(default=(), max_length=13)
+
+    @property
+    def coverage_status(self):
+        return "PARTIAL" if self.unavailable_underlyers else "COMPLETE"
+
+    @model_validator(mode="after")
+    def validate_coverage(self):
+        missing = tuple(sorted(set(self.expected_underlyers) - {name for name, _ in self.source_matrices}))
+        if (tuple(name for name, _ in self.unavailable_underlyers) != missing
+                or any(not reasons or len(set(reasons)) != len(reasons)
+                    for _, reasons in self.unavailable_underlyers)):
+            raise ValueError("partial detector run requires exact unavailable ticker reasons")
+        return self
+
+
 def load_detector_run(payload_text):
     import json
 
     contract = {"option_detector_run_v1": DetectorRunEvidence,
-        "option_detector_run_v2": ForwardDetectorRunEvidence}.get(json.loads(payload_text).get("schema_version"))
+        "option_detector_run_v2": ForwardDetectorRunEvidence,
+        "option_detector_run_v3": PartialDetectorRunEvidence}.get(json.loads(payload_text).get("schema_version"))
     if contract is None:
         raise ValueError("unsupported detector run schema")
     return contract.model_validate_json(payload_text)
 
 
-def build_detector_run(*, configuration, dataset_id, scheduled_cycle, selected_at, matrices, records, rejections):
+def build_detector_run(*, configuration, dataset_id, scheduled_cycle, selected_at, matrices, records, rejections,
+                       unavailable_underlyers=None):
     from collections import Counter
 
     counts = Counter(record.selection_status for record in records)
-    contract = ForwardDetectorRunEvidence if getattr(configuration.strategy_policy, "forward_admission", None) is not None else DetectorRunEvidence
+    contract = (PartialDetectorRunEvidence if unavailable_underlyers is not None else
+        ForwardDetectorRunEvidence if getattr(configuration.strategy_policy, "forward_admission", None) is not None else DetectorRunEvidence)
+    coverage = dict(unavailable_underlyers=tuple(unavailable_underlyers)) if unavailable_underlyers is not None else {}
     run = contract(dataset_id=dataset_id, scheduled_cycle=scheduled_cycle, selected_at=selected_at,
         configuration_sha256=configuration.configuration_sha256, strategy_policy_sha256=configuration.strategy_policy_sha256,
         market_policy_sha256=configuration.policy_sha256, strategy_version=configuration.strategy_policy.strategy_version,
@@ -602,7 +638,7 @@ def build_detector_run(*, configuration, dataset_id, scheduled_cycle, selected_a
         market_time=max(row["market_time"] for row in matrices), observed_time=max(row["observed_time"] for row in matrices),
         record_sha256s=tuple(sorted(((row.evaluation_id, row.sha256) for row in records), key=lambda item: str(item[0]))),
         selection_counts=tuple(sorted((status, counts[status]) for status in ("SELECTED", "NOT_SELECTED", "REPEAT", "OBSERVATION"))),
-        rejections=tuple(sorted(rejections.items())))
+        rejections=tuple(sorted(rejections.items())), **coverage)
     source_map = dict(run.source_matrices)
     for record in records:
         symbol = record.observation.underlyer if isinstance(record, (

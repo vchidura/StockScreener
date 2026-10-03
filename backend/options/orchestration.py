@@ -4,6 +4,7 @@ import json
 import logging
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -258,16 +259,9 @@ class ManualOptionPipeline:
             requested,
             started_at,
         )
-        results = []
-        for underlyer in requested:
-            if progress_callback is not None:
-                progress_callback()
-            results.append(self._run_underlying(
-                underlyer,
-                universe_members[underlyer],
-                as_of_session,
-                cycle_time,
-            ))
+        results = self._run_underlyings(
+            requested, universe_members, as_of_session, cycle_time, progress_callback,
+        )
         if progress_callback is not None:
             progress_callback()
         results = tuple(results)
@@ -288,26 +282,35 @@ class ManualOptionPipeline:
             completed_at,
         )
         detector_evaluation = None
+        eligible_results = tuple(result for result in results
+            if result.status in {"COMPLETE", "ALREADY_COMPLETED"} and result.matrix_id is not None)
+        partial_coverage = getattr(self.detector_cycle_hook, "partial_coverage", False) is True
         if (
             self.strategy_pipeline is not None
             and len(requested) == len(self.configuration.settings.underlyers)
             and set(requested) == set(self.configuration.settings.underlyers)
         ):
             if (self.detector_cycle_hook is not None and cycle_time >= self.detector_effective_from
-                    and all(result.status in {"COMPLETE", "ALREADY_COMPLETED"} and result.matrix_id is not None for result in results)):
+                    and eligible_results and (partial_coverage or len(eligible_results) == len(results))):
                 try:
                     from options.analytics.alert_selection import load_detector_run
                     from options.repositories.alert_evaluations import OptionAlertEvaluationRepository
 
                     hook_started_at = _as_utc(self.clock(), "clock")
-                    matrices = {result.underlyer: result.matrix_id for result in results}
+                    matrices = {result.underlyer: result.matrix_id for result in eligible_results}
+                    unavailable = tuple(sorted((result.underlyer, tuple(sorted(set(
+                        reason for reason in result.reasons if reason.isascii()
+                        and reason.replace("_", "").isalnum() and reason.upper() == reason)))
+                        or ("CURRENT_MATRIX_UNAVAILABLE",)) for result in results
+                        if result not in eligible_results))
+                    coverage = dict(unavailable_underlyers=unavailable) if partial_coverage else {}
                     repository = self.detector_evaluation_repository or OptionAlertEvaluationRepository()
                     retained = repository.completed_run(dataset_id=self.detector_dataset_id,
                         scheduled_cycle=cycle_time, as_of=hook_started_at)
                     run, records = retained if retained is not None else self.detector_cycle_hook(
                         configuration=self.configuration, dataset_id=self.detector_dataset_id,
                         scheduled_cycle=cycle_time, completed_matrices=matrices, started_at=hook_started_at,
-                        progress_callback=progress_callback)
+                        progress_callback=progress_callback, **coverage)
                     run = load_detector_run(run.canonical_json())
                     if (run.dataset_id != self.detector_dataset_id or run.scheduled_cycle != cycle_time
                             or run.configuration_sha256 != self.configuration.configuration_sha256
@@ -316,10 +319,14 @@ class ManualOptionPipeline:
                             or run.strategy_version != self.configuration.strategy_policy.strategy_version
                             or run.expected_underlyers != tuple(sorted(requested))
                             or dict(run.source_matrices) != matrices
+                            or partial_coverage and (not run.partial_coverage
+                                or run.unavailable_underlyers != unavailable)
                             or run.selected_at > _as_utc(self.clock(), "clock")
                             or retained is None and run.selected_at < hook_started_at):
                         raise ValueError("detector hook evidence differs from the completed cycle scope")
                     detector_evaluation = repository.persist_completed_run(run, records)
+                    if partial_coverage:
+                        detector_evaluation["unavailable_underlyers"] = unavailable
                 except Exception as error:
                     from psycopg2.errors import QueryCanceled
                     LOGGER.exception("Detector evaluation failed after strategy acknowledgement")
@@ -406,6 +413,40 @@ class ManualOptionPipeline:
         self.universe_repository.activate_members(members)
         return asset_types
 
+    def _run_underlyings(
+        self,
+        requested: tuple[str, ...],
+        universe_members,
+        as_of_session: date,
+        cycle_time: datetime,
+        progress_callback,
+    ) -> list:
+        workers = max(1, min(self.configuration.settings.underlying_concurrency, len(requested)))
+        if workers == 1:
+            results = []
+            for underlyer in requested:
+                if progress_callback is not None:
+                    progress_callback()
+                results.append(self._run_underlying(
+                    underlyer, universe_members[underlyer], as_of_session, cycle_time,
+                ))
+            return results
+        # Results stay in requested order so matrix identity and universe status are unchanged.
+        ordered: list = [None] * len(requested)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="option-underlying") as executor:
+            submitted = {
+                executor.submit(
+                    self._run_underlying,
+                    underlyer, universe_members[underlyer], as_of_session, cycle_time,
+                ): index
+                for index, underlyer in enumerate(requested)
+            }
+            for future in as_completed(submitted):
+                ordered[submitted[future]] = future.result()
+                if progress_callback is not None:
+                    progress_callback()
+        return ordered
+
     def _run_underlying(
         self,
         underlyer: str,
@@ -417,9 +458,10 @@ class ManualOptionPipeline:
         work_item = None
         lease_owner = f"manual:{socket.gethostname()}"
         try:
-            expiration_through = as_of_session + timedelta(
-                days=self.configuration.policy.contract_filter.maximum_dte
-            )
+            expiration_through = as_of_session + timedelta(days=max(
+                self.configuration.policy.contract_filter.maximum_dte,
+                self.configuration.settings.acquisition_maximum_dte,
+            ))
             spot = self.engine.get_spot_price(underlyer, cycle_time)
             corridor = self.configuration.policy.contract_filter.strike_corridor_fraction
             strike_min = spot.price * (Decimal("1") - corridor)

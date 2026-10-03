@@ -133,6 +133,16 @@ def main() -> int:
         "actions_matched_to_universe": len(actions),
         "splits_matched_to_universe": len(split_actions),
         "distinct_split_tickers": len({a.ticker for a in split_actions}),
+        "matched_split_actions": [
+            {
+                "ticker": action.ticker,
+                "effective_date": action.effective_date.isoformat(),
+                "split_from": str(action.split_from),
+                "split_to": str(action.split_to),
+                "source_key": action.source_key,
+            }
+            for action in split_actions
+        ],
         "mode": "APPLY" if arguments.apply else "DRY_RUN",
     }
     if arguments.apply:

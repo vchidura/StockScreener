@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Sequence
@@ -9,7 +11,7 @@ from psycopg2.extras import Json, execute_values
 
 from options.calendar import OptionExchangeCalendar
 from options.domain import MarkSource
-from options.outcomes import OptionDecayOutcome, OptionOutcomeLeg
+from options.outcomes import OptionDecayOutcome, OptionOutcomeLeg, detector_management_crossing
 from options.strategies.domain import OptionSide
 
 from .base import ConnectionFactory, PostgresRepository
@@ -31,7 +33,16 @@ class OptionOutcomeRepository(PostgresRepository):
             cursor.execute("SET LOCAL statement_timeout = '5s'")
             cursor.execute("SELECT to_regclass('public.option_signal_current_marks') IS NOT NULL AS ready")
             if not cursor.fetchone()["ready"]:
-                return {"ready": False, "rows": {}}
+                return {"ready": False, "management_status_ready": False, "rows": {}}
+            cursor.execute("""SELECT COUNT(*) = 9 AS ready FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='option_signal_current_marks'
+                  AND column_name = ANY(%s)""", ([
+                    "management_status", "management_status_evaluation_id", "management_status_plan_sha256",
+                    "management_status_threshold_price", "management_status_mark_price",
+                    "management_status_market_time", "management_status_observed_time",
+                    "management_status_source_snapshot_ids", "management_status_recorded_at",
+                ],))
+            management_status_ready = bool(cursor.fetchone()["ready"])
             cursor.execute("""
                 SELECT mark.*, candidate.candidate_identity, candidate.matrix_id,
                        COALESCE(evidence.legs, '[]'::jsonb) AS legs
@@ -63,7 +74,8 @@ class OptionOutcomeRepository(PostgresRepository):
                   AND mark.observed_time<=%s AND mark.updated_at<=%s
                 ORDER BY mark.candidate_id
             """, (ids, valuation_policy_sha256, available_by, available_by))
-            return {"ready": True, "rows": {str(row["candidate_id"]): dict(row) for row in cursor.fetchall()}}
+            return {"ready": True, "management_status_ready": management_status_ready,
+                "rows": {str(row["candidate_id"]): dict(row) for row in cursor.fetchall()}}
 
     def persist_decay_outcomes(
         self,
@@ -161,6 +173,103 @@ class OptionOutcomeRepository(PostgresRepository):
                 ],
             )
             return cursor.rowcount
+
+    def persist_detector_management_crossings(
+        self, outcomes: Sequence[OptionDecayOutcome], *, available_by,
+        valuation_policy_sha256: str, maximum_source_age_seconds: int,
+    ) -> int:
+        if not outcomes:
+            return 0
+        if (available_by.tzinfo is None or maximum_source_age_seconds <= 0
+                or any(row.valuation_policy_sha256 != valuation_policy_sha256 for row in outcomes)):
+            raise ValueError("management status requires bounded current marks and one valuation policy")
+        outcome_by_candidate = {row.candidate_id: row for row in outcomes}
+        if len(outcome_by_candidate) != len(outcomes):
+            raise ValueError("management status requires unique candidate marks")
+        candidate_ids = tuple(outcome_by_candidate)
+        with self._cursor() as cursor:
+            cursor.execute("""SELECT COUNT(*) = 9 AS ready FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='option_signal_current_marks'
+                  AND column_name = ANY(%s)""", ([
+                    "management_status", "management_status_evaluation_id", "management_status_plan_sha256",
+                    "management_status_threshold_price", "management_status_mark_price",
+                    "management_status_market_time", "management_status_observed_time",
+                    "management_status_source_snapshot_ids", "management_status_recorded_at",
+                ],))
+            if not cursor.fetchone()["ready"]:
+                return 0
+            cursor.execute("SET LOCAL statement_timeout = '5s'")
+            cursor.execute("""
+                SELECT evaluation.evaluation_id, evaluation.candidate_id, evaluation.payload_text,
+                       candidate.net_premium, MIN(leg.multiplier) AS multiplier,
+                       COUNT(DISTINCT leg.multiplier) AS multiplier_count,
+                       current_mark.market_time, current_mark.observed_time,
+                       current_mark.mark, current_mark.source_snapshot_ids,
+                       MIN(snapshot.mark_market_data_time) AS oldest_market_time
+                FROM option_detector_evaluations AS evaluation
+                JOIN option_strategy_candidates AS candidate USING (candidate_id)
+                JOIN option_candidate_legs AS leg USING (candidate_id)
+                JOIN option_signal_current_marks AS current_mark
+                  ON current_mark.candidate_id=evaluation.candidate_id
+                 AND current_mark.valuation_policy_sha256=%s
+                JOIN option_chain_snapshots AS snapshot
+                  ON snapshot.snapshot_id=ANY(current_mark.source_snapshot_ids)
+                 AND snapshot.batch_id=current_mark.source_batch_id
+                WHERE evaluation.candidate_id=ANY(%s::uuid[])
+                  AND evaluation.selection_status='SELECTED'
+                  AND current_mark.management_status IS NULL
+                  AND current_mark.market_time<=%s AND current_mark.observed_time<=%s
+                GROUP BY evaluation.evaluation_id, evaluation.candidate_id, evaluation.payload_text,
+                         candidate.net_premium, current_mark.market_time, current_mark.observed_time,
+                         current_mark.mark, current_mark.source_snapshot_ids
+                ORDER BY evaluation.selected_at, evaluation.evaluation_id
+            """, (valuation_policy_sha256, list(candidate_ids), available_by, available_by))
+            rows = cursor.fetchall()
+            persisted = 0
+            for row in rows:
+                outcome = outcome_by_candidate[row["candidate_id"]]
+                if (int(row["multiplier_count"]) != 1
+                        or outcome.market_time != row["market_time"]
+                        or outcome.observed_time != row["observed_time"]
+                        or outcome.exit_net_premium != row["mark"]
+                        or tuple(row["source_snapshot_ids"]) != outcome.source_snapshot_ids
+                        or (available_by - row["oldest_market_time"]).total_seconds() > maximum_source_age_seconds):
+                    continue
+                evidence = json.loads(row["payload_text"])
+                plan_text = evidence.get("plan_payload_text")
+                package = evidence.get("package") or {}
+                if (not isinstance(plan_text, str)
+                        or hashlib.sha256(plan_text.encode("ascii")).hexdigest() != package.get("plan_sha256")
+                        or package.get("candidate_id") != str(row["candidate_id"])):
+                    continue
+                plan = json.loads(plan_text)
+                entry_premium = Decimal(row["net_premium"])
+                if outcome.entry_net_premium != entry_premium:
+                    continue
+                crossing = detector_management_crossing(
+                    plan.get("management_policy") or {}, entry_net_premium=entry_premium,
+                    current_net_premium=outcome.exit_net_premium, multiplier=int(row["multiplier"]),
+                )
+                if crossing is None:
+                    continue
+                status, threshold = crossing
+                mark_price = (outcome.exit_net_premium if entry_premium > 0 else -outcome.exit_net_premium) / Decimal(int(row["multiplier"]))
+                cursor.execute("""
+                    UPDATE option_signal_current_marks
+                    SET management_status=%s, management_status_evaluation_id=%s,
+                        management_status_plan_sha256=%s, management_status_threshold_price=%s,
+                        management_status_mark_price=%s, management_status_market_time=%s,
+                        management_status_observed_time=%s, management_status_source_snapshot_ids=%s,
+                        management_status_recorded_at=%s
+                    WHERE candidate_id=%s AND valuation_policy_sha256=%s
+                      AND management_status IS NULL AND market_time=%s AND mark=%s
+                      AND source_snapshot_ids=%s
+                """, (status, row["evaluation_id"], package["plan_sha256"], threshold, mark_price,
+                    row["market_time"], row["observed_time"], list(row["source_snapshot_ids"]),
+                    available_by, row["candidate_id"], valuation_policy_sha256,
+                    row["market_time"], row["mark"], list(row["source_snapshot_ids"])))
+                persisted += cursor.rowcount
+            return persisted
 
     def current_marks_available(self) -> bool:
         with self._cursor() as cursor:
@@ -385,14 +494,25 @@ class OptionOutcomeRepository(PostgresRepository):
         with self._cursor() as cursor:
             cursor.execute(
                 """
-                                WITH candidate_queue AS (
+                        WITH detector_alert_candidates AS MATERIALIZED (
+                            SELECT candidate_id
+                            FROM option_detector_evaluations
+                            WHERE selection_status='SELECTED'
+                              AND selected_at<=%s AND recorded_at<=%s
+                            UNION
+                            SELECT candidate_id
+                            FROM option_o3_credit_observations
+                            WHERE selected_at<=%s AND recorded_at<=%s
+                        ), candidate_queue AS (
                                         SELECT candidate.candidate_id, signal.event_id,
                                                      candidate.market_data_time,
                                                      candidate.capital_at_risk,
                                                      current_mark.candidate_id IS NULL AS mark_missing,
+                                     detector_alert.candidate_id IS NOT NULL AS detector_alert,
                                                      ROW_NUMBER() OVER (
                                                              PARTITION BY current_mark.candidate_id IS NULL
                                                              ORDER BY
+                                             detector_alert.candidate_id IS NOT NULL DESC,
                                                                      CASE WHEN current_mark.candidate_id IS NULL
                                                                              THEN candidate.market_data_time END DESC,
                                                                      current_mark.market_time NULLS FIRST,
@@ -407,6 +527,8 @@ class OptionOutcomeRepository(PostgresRepository):
                                         LEFT JOIN option_signal_current_marks AS current_mark
                                             ON current_mark.candidate_id = candidate.candidate_id
                                          AND current_mark.valuation_policy_sha256 = %s
+                                        LEFT JOIN detector_alert_candidates AS detector_alert
+                                            ON detector_alert.candidate_id = candidate.candidate_id
                                         WHERE candidate.status = 'SELECTED'
                                             AND candidate.candidate_kind IN ('SINGLE_CONTRACT', 'MULTI_LEG')
                                             AND candidate.capital_at_risk > 0
@@ -451,6 +573,7 @@ class OptionOutcomeRepository(PostgresRepository):
                                 ORDER BY mark_missing DESC, queue_rank
                 """,
                 (
+                    available_by, available_by, available_by, available_by,
                     valuation_policy_sha256, available_by, available_by,
                     retention_days, valuation_policy_sha256, available_by,
                     valuation_policy_sha256, available_by, limit,

@@ -66,6 +66,7 @@ def test_runtime_configuration_is_frozen_read_only_and_secret_safe():
     )
     assert runtime.settlement_valuation_policy.option_aggregates_adjusted is False
     assert runtime.policy.contract_filter.maximum_dte == 60
+    assert runtime.settings.acquisition_maximum_dte == 60
     assert runtime.settlement_valuation_policy_sha256 == (
         runtime.settlement_valuation_policy.policy_sha256
     )

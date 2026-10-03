@@ -32,6 +32,11 @@ export function resolveAlertRoute(params: URLSearchParams): { source: AlertSourc
   return { source: view === 'open' || view === 'eod' ? 'SHADOW' : source, view }
 }
 
+export function alertCombinedResults(params: URLSearchParams, source: AlertSource, view: AlertView) {
+  if (params.has('combined')) return params.get('combined') === 'true'
+  return source === 'SHADOW' && view === 'history' ? true : undefined
+}
+
 export function alertSourceParams(source: AlertSource, view: AlertView): URLSearchParams {
   const next = new URLSearchParams({ source })
   if (view !== 'latest') next.set('view', view)

@@ -99,11 +99,13 @@ export const detectorAlertColumns: OptionAlertColumn[] = [
   { key: 'details', label: 'View', group: 'Alert', locked: true },
   { key: 'triggered_at', label: 'Triggered (ET)', group: 'Alert', locked: true, tip: 'Retained option source time for O1 or original stock trigger-bar time for S1/S2, not selection or run time.' },
   { key: 'underlyer', label: 'Underlying', group: 'Alert', locked: true },
-  { key: 'contracts', label: 'Contracts / structure', group: 'Package' },
+  { key: 'contract_summary', label: 'Contract summary', group: 'Package' },
+  { key: 'contracts', label: 'Contracts / structure', group: 'Package', hiddenByDefault: true },
   { key: 'expiry', label: 'Expiry / DTE at source', group: 'Package' },
   ...detectorMarketColumns,
   { key: 'run', label: 'Run (ET)', group: 'Alert', hiddenByDefault: true },
-  { key: 'hit_count', label: 'Hits', group: 'Alert', hiddenByDefault: true },
+  { key: 'hit_count', label: 'Hits', group: 'Alert' },
+  { key: 'management_status', label: 'Management status', group: 'Management', tip: 'First fresh retained mark crossing of the frozen target/stop rule. Not a fill or realized outcome.' },
   { key: 'capital', label: 'Original capital at risk', group: 'Economics', hiddenByDefault: true },
   { key: 'maximum_loss', label: 'Maximum expiration loss', group: 'Economics', hiddenByDefault: true },
   { key: 'maximum_profit', label: 'Maximum expiration profit', group: 'Economics', hiddenByDefault: true },
@@ -121,12 +123,19 @@ export const detectorAlertColumns: OptionAlertColumn[] = [
   { key: 'strategy', label: 'Package strategy', group: 'Classification', hiddenByDefault: true },
 ]
 
-const detectorIdentity = ['details', 'triggered_at', 'underlyer', 'detector']
+export function detectorAlertColumnsForView(view: 'behavior' | 'day_history'): OptionAlertColumn[] {
+  return detectorAlertColumns.map(column =>
+    column.key === 'current_price' || column.key === 'price_pnl'
+      ? { ...column, hiddenByDefault: view === 'behavior' }
+      : column)
+}
+
+const detectorIdentity = ['details', 'triggered_at', 'underlyer', 'contract_summary', 'detector']
 export const detectorColumnPresets: Record<string, string[]> = {
   'Package / market data': detectorAlertColumns.filter(column => !column.hiddenByDefault).map(column => column.key),
-  'Greeks / volatility': ['triggered_at', 'underlyer', 'contracts', 'expiry', 'stock', 'option_price', 'iv', 'delta', 'gamma', 'theta', 'vega', 'rho'],
+  'Greeks / volatility': ['triggered_at', 'underlyer', 'contract_summary', 'contracts', 'expiry', 'stock', 'option_price', 'iv', 'delta', 'gamma', 'theta', 'vega', 'rho'],
   'Price / activity': [...detectorIdentity, 'category', 'strategy', 'contracts', 'expiry', 'stock', 'option_price', 'current_price', 'price_pnl', 'technical_stop', 'technical_target', 'volume', 'open_interest', 'volume_oi', 'iv'],
-  Performance: [...detectorIdentity, 'category', 'strategy', 'run', 'hit_count', 'option_price', 'current_price', 'price_pnl', 'gross_pnl', 'net_pnl', 'net_return', 'current_mark_time', 'current_mark_status', 'outcome_status'],
+  Performance: [...detectorIdentity, 'category', 'strategy', 'run', 'hit_count', 'management_status', 'option_price', 'current_price', 'price_pnl', 'gross_pnl', 'net_pnl', 'net_return', 'current_mark_time', 'current_mark_status', 'outcome_status'],
   'IV observation evidence': [...detectorIdentity, 'contracts', 'expiry', 'iv', ...detectorObservationColumns.map(column => column.key)],
   All: detectorAlertColumns.map(column => column.key),
 }
@@ -304,6 +313,14 @@ function marketNumber(value: unknown): number | null {
 export function optionPackagePremium(value: unknown): string {
   const numeric = marketNumber(value)
   return numeric == null ? 'Unavailable' : `${optionAlertMoney(Math.abs(numeric))} ${numeric < 0 ? 'debit' : numeric > 0 ? 'credit' : 'net'}`
+}
+
+export function optionContractSummary(underlyer: string, legs: readonly (Pick<OptionCandidateLeg, 'strike' | 'contract_type'> & Partial<Pick<OptionCandidateLeg, 'side' | 'ratio'>> )[]): string {
+  if (!legs.length) return 'Unavailable'
+  const strike = (value: unknown) => marketNumber(value)?.toLocaleString('en-US', { maximumFractionDigits: 3 }) ?? 'Unavailable'
+  return legs.length === 1
+    ? `${underlyer} ${strike(legs[0].strike)} ${legs[0].contract_type}`
+    : `${underlyer} / ${legs.map(leg => `${leg.side ? `${leg.side} ` : ''}${leg.ratio ? `${leg.ratio}x ` : ''}${strike(leg.strike)} ${leg.contract_type}`).join(' / ')}`
 }
 
 type PackagePriceLeg = {

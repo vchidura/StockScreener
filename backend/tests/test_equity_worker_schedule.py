@@ -487,6 +487,34 @@ def test_behavior_bootstrap_reference_read_never_calls_provider(monkeypatch):
     assert load_retained_reference(("AAPL",), datetime(2026, 9, 18, tzinfo=UTC)) is None
 
 
+def test_reference_owner_refreshes_before_stage_readers_reject_it(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import scripts.run_equity_worker as worker
+
+    now = datetime(2026, 9, 30, 14, 0, tzinfo=UTC)
+    row = SimpleNamespace(ticker="AAPL", observed_at=now - timedelta(days=6, hours=12))
+
+    class ReferenceRepository:
+        def list_securities_as_of(self, tickers, watermark):
+            return (row,)
+
+    class UniverseRepository:
+        def get_latest_as_of(self, watermark):
+            return {"universe_run_id": "universe"}
+
+        def member_tickers(self, universe_run_id):
+            return frozenset({"AAPL"})
+
+    monkeypatch.setattr(worker, "EquityReferenceRepository", ReferenceRepository)
+    monkeypatch.setattr(worker, "EquityUniverseRepository", UniverseRepository)
+    service = MagicMock()
+
+    assert load_retained_reference(("AAPL",), now).revisions == (row,)
+    assert worker.load_or_refresh_reference(service, ("AAPL",), now, now.date()) is service.refresh_reference.return_value
+    service.refresh_reference.assert_called_once()
+
+
 class _StopWorkerLoop(Exception):
     pass
 

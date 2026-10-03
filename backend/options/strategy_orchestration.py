@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import socket
 import json
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ from options.stock_behavior_shadow import (
 )
 from options.strategies.context import OptionStrategyContextRepository
 from options.strategies.engine import OptionStrategyEngine
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +372,10 @@ class OptionStrategyPipeline:
                 None,
             )
         except Exception as exc:
+            LOGGER.warning(
+                "stock behavior shadow assessment failed error=%s: %s",
+                type(exc).__name__, exc,
+            )
             return None, f"{type(exc).__name__}: {exc}"
 
     def _persist_package_assessments(
@@ -380,6 +387,10 @@ class OptionStrategyPipeline:
         try:
             return self._measure_evidence("PACKAGE", lambda: service.assess_and_persist(candidates)), None
         except Exception as exc:
+            LOGGER.warning(
+                "option package assessment failed error=%s: %s",
+                type(exc).__name__, exc,
+            )
             return None, f"{type(exc).__name__}: {exc}"
 
     def _measure_evidence(self, stage, callback):

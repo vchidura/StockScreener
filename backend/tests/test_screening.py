@@ -583,6 +583,23 @@ def test_screening_worker_waits_and_does_not_rebuild_unchanged_daily_anchor(monk
     assert calls == ['build', 'publish']
 
 
+def test_screening_worker_can_publish_new_immutable_revision_from_current_history(monkeypatch):
+    from scripts import run_screening_worker as worker
+    calls = []
+    previous = dict(source_publication_id='daily', generation='old')
+    rebuilt = dict(source_publication_id='daily', generation='history-complete')
+    monkeypatch.setattr(worker, 'load_daily_anchor', lambda now: ('daily', previous))
+    monkeypatch.setattr(worker, 'build_latest', lambda: calls.append('build') or rebuilt)
+    monkeypatch.setattr(worker, 'publish', lambda *args: calls.append(args[0]['SCREENING_DAILY_V1']['generation']) or ['new-snapshot'])
+    monkeypatch.setattr(worker, 'prepare_pair', lambda anchor, now: (None, dict(status='ALREADY_PUBLISHED')))
+
+    result = worker.run_once(rebuild_current=True)
+
+    assert result['status'] == 'ALREADY_PUBLISHED'
+    assert calls == ['build', 'history-complete']
+    assert previous['generation'] == 'old'
+
+
 def test_screening_pair_is_idempotent_uses_retained_sources_and_preserves_anchor(monkeypatch):
     from copy import deepcopy
     from contextlib import contextmanager

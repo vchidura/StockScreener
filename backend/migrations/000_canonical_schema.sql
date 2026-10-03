@@ -6130,6 +6130,40 @@ DROP TRIGGER IF EXISTS option_alert_events_no_truncate ON public.option_alert_pu
 CREATE TRIGGER option_alert_events_no_truncate BEFORE TRUNCATE ON public.option_alert_publication_events
     FOR EACH STATEMENT EXECUTE FUNCTION public.reject_option_alert_mutation();
 
+CREATE TABLE IF NOT EXISTS public.option_signal_current_marks (
+    candidate_id uuid NOT NULL REFERENCES public.option_strategy_candidates(candidate_id),
+    event_id uuid REFERENCES public.option_signal_events(event_id),
+    market_time timestamp with time zone NOT NULL,
+    observed_time timestamp with time zone NOT NULL,
+    mark numeric(20,8) NOT NULL,
+    net_return numeric(20,8) NOT NULL,
+    availability_flag character varying(32) NOT NULL,
+    quality_flags text[] NOT NULL DEFAULT ARRAY[]::text[],
+    entry_net_premium numeric(20,8) NOT NULL,
+    exit_net_premium numeric(20,8) NOT NULL,
+    gross_pnl numeric(20,8) NOT NULL,
+    estimated_cost numeric(20,8) NOT NULL,
+    net_pnl numeric(20,8) NOT NULL,
+    capital_at_risk numeric(20,8) NOT NULL CHECK (capital_at_risk > 0),
+    valuation_policy_version character varying(64) NOT NULL,
+    valuation_policy_sha256 character(64) NOT NULL,
+    source_snapshot_ids uuid[] NOT NULL DEFAULT ARRAY[]::uuid[],
+    source_batch_id uuid NOT NULL REFERENCES public.option_ingestion_runs(batch_id),
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    PRIMARY KEY (candidate_id, valuation_policy_sha256),
+    CHECK (observed_time >= market_time),
+    CHECK (availability_flag = 'RESEARCH_DELAYED_PROXY'),
+    CHECK (valuation_policy_sha256 ~ '^[0-9a-f]{64}$'),
+    CHECK (cardinality(source_snapshot_ids) > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_option_current_marks_policy_market
+    ON public.option_signal_current_marks (valuation_policy_sha256, market_time DESC);
+
+INSERT INTO public.schema_migrations(version)
+VALUES ('020_option_current_marks') ON CONFLICT DO NOTHING;
+
 SET LOCAL lock_timeout = '2s';
 SET LOCAL statement_timeout = '30s';
 
@@ -7408,5 +7442,308 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+ALTER TABLE public.option_signal_current_marks
+    ADD COLUMN management_status varchar(24),
+    ADD COLUMN management_status_evaluation_id uuid REFERENCES public.option_detector_evaluations(evaluation_id),
+    ADD COLUMN management_status_plan_sha256 char(64),
+    ADD COLUMN management_status_threshold_price numeric(20,8),
+    ADD COLUMN management_status_mark_price numeric(20,8),
+    ADD COLUMN management_status_market_time timestamptz,
+    ADD COLUMN management_status_observed_time timestamptz,
+    ADD COLUMN management_status_source_snapshot_ids uuid[],
+    ADD COLUMN management_status_recorded_at timestamptz,
+    ADD CONSTRAINT option_current_mark_management_status_contract CHECK (
+        (management_status IS NULL AND management_status_evaluation_id IS NULL
+            AND management_status_plan_sha256 IS NULL AND management_status_threshold_price IS NULL
+            AND management_status_mark_price IS NULL AND management_status_market_time IS NULL
+            AND management_status_observed_time IS NULL AND management_status_source_snapshot_ids IS NULL
+            AND management_status_recorded_at IS NULL)
+        OR (management_status IS NOT NULL AND management_status IN ('TARGET_MET','STOP_LOSS_HIT')
+            AND management_status_evaluation_id IS NOT NULL
+            AND management_status_plan_sha256 ~ '^[0-9a-f]{64}$'
+            AND management_status_threshold_price >= 0 AND management_status_mark_price >= 0
+            AND management_status_market_time IS NOT NULL
+            AND management_status_observed_time >= management_status_market_time
+            AND management_status_source_snapshot_ids IS NOT NULL
+            AND cardinality(management_status_source_snapshot_ids) > 0
+            AND management_status_recorded_at >= management_status_observed_time)
+    );
+
+CREATE OR REPLACE FUNCTION public.guard_option_detector_management_status() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.management_status IS NOT NULL AND ROW(
+        NEW.management_status, NEW.management_status_evaluation_id, NEW.management_status_plan_sha256,
+        NEW.management_status_threshold_price, NEW.management_status_mark_price,
+        NEW.management_status_market_time, NEW.management_status_observed_time,
+        NEW.management_status_source_snapshot_ids, NEW.management_status_recorded_at
+    ) IS DISTINCT FROM ROW(
+        OLD.management_status, OLD.management_status_evaluation_id, OLD.management_status_plan_sha256,
+        OLD.management_status_threshold_price, OLD.management_status_mark_price,
+        OLD.management_status_market_time, OLD.management_status_observed_time,
+        OLD.management_status_source_snapshot_ids, OLD.management_status_recorded_at
+    ) THEN
+        RAISE EXCEPTION 'detector management terminal status is immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS option_detector_management_status_immutable ON public.option_signal_current_marks;
+CREATE TRIGGER option_detector_management_status_immutable BEFORE UPDATE ON public.option_signal_current_marks
+    FOR EACH ROW EXECUTE FUNCTION public.guard_option_detector_management_status();
+
+INSERT INTO public.schema_migrations(version) VALUES ('058_option_detector_management_status') ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.option_quote_stream_sessions (
+    stream_session_id uuid PRIMARY KEY,
+    provider varchar(64) NOT NULL,
+    capability_profile_sha256 char(64) NOT NULL,
+    configured_underlyers text[] NOT NULL,
+    started_at timestamptz NOT NULL,
+    ended_at timestamptz,
+    status varchar(24) NOT NULL,
+    disconnect_reason text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (provider = 'polygon_advanced'),
+    CHECK (capability_profile_sha256 ~ '^[0-9a-f]{64}$'),
+    CHECK (cardinality(configured_underlyers) BETWEEN 1 AND 100),
+    CHECK (status IN ('CONNECTING', 'CONNECTED', 'DISCONNECTED', 'FAILED')),
+    CHECK (ended_at IS NULL OR ended_at >= started_at)
+);
+
+CREATE TABLE IF NOT EXISTS public.option_quote_current (
+    provider varchar(64) NOT NULL,
+    contract_id bigint NOT NULL REFERENCES public.option_contract_catalog(contract_id),
+    stream_session_id uuid REFERENCES public.option_quote_stream_sessions(stream_session_id),
+    contract_ticker varchar(64) NOT NULL,
+    quote_time timestamptz NOT NULL,
+    received_at timestamptz NOT NULL,
+    bid numeric(20,8) NOT NULL,
+    ask numeric(20,8) NOT NULL,
+    bid_size bigint,
+    ask_size bigint,
+    conditions text[] NOT NULL DEFAULT ARRAY[]::text[],
+    payload_sha256 char(64) NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (provider, contract_id),
+    CHECK (provider = 'polygon_advanced'),
+    CHECK (quote_time <= received_at),
+    CHECK (bid >= 0 AND ask >= bid),
+    CHECK (bid_size IS NULL OR bid_size >= 0),
+    CHECK (ask_size IS NULL OR ask_size >= 0),
+    CHECK (payload_sha256 ~ '^[0-9a-f]{64}$')
+);
+CREATE INDEX IF NOT EXISTS idx_option_quote_current_contract_time ON public.option_quote_current (contract_id, quote_time DESC);
+
+CREATE TABLE IF NOT EXISTS public.option_quote_samples (
+    quote_sample_id uuid NOT NULL,
+    sampled_at timestamptz NOT NULL,
+    provider varchar(64) NOT NULL,
+    contract_id bigint NOT NULL REFERENCES public.option_contract_catalog(contract_id),
+    stream_session_id uuid REFERENCES public.option_quote_stream_sessions(stream_session_id),
+    quote_time timestamptz NOT NULL,
+    received_at timestamptz NOT NULL,
+    bid numeric(20,8) NOT NULL,
+    ask numeric(20,8) NOT NULL,
+    bid_size bigint,
+    ask_size bigint,
+    sample_reason varchar(24) NOT NULL,
+    payload_sha256 char(64) NOT NULL,
+    PRIMARY KEY (quote_sample_id, sampled_at),
+    UNIQUE (provider, contract_id, quote_time, payload_sha256, sampled_at),
+    CHECK (provider = 'polygon_advanced'),
+    CHECK (quote_time <= received_at AND received_at <= sampled_at),
+    CHECK (bid >= 0 AND ask >= bid),
+    CHECK (bid_size IS NULL OR bid_size >= 0),
+    CHECK (ask_size IS NULL OR ask_size >= 0),
+    CHECK (sample_reason IN ('CHANGE', 'HEARTBEAT', 'DECISION', 'EXIT_MONITOR')),
+    CHECK (payload_sha256 ~ '^[0-9a-f]{64}$')
+) PARTITION BY RANGE (sampled_at);
+CREATE INDEX IF NOT EXISTS idx_option_quote_samples_contract_time ON ONLY public.option_quote_samples (contract_id, quote_time DESC);
+
+CREATE TABLE IF NOT EXISTS public.option_price_monitor_events (
+    monitor_event_id uuid PRIMARY KEY,
+    candidate_id uuid REFERENCES public.option_strategy_candidates(candidate_id),
+    plan_id uuid REFERENCES public.option_alert_plans(plan_id),
+    contract_id bigint REFERENCES public.option_contract_catalog(contract_id),
+    monitor_key char(64) NOT NULL,
+    event_type varchar(24) NOT NULL,
+    event_time timestamptz NOT NULL,
+    quote_time timestamptz,
+    threshold_price numeric(20,8),
+    observed_price numeric(20,8),
+    payload jsonb NOT NULL,
+    payload_sha256 char(64) NOT NULL,
+    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (monitor_key, event_type, event_time, payload_sha256),
+    CHECK (event_type IN ('ARMED', 'QUOTE', 'TARGET_MET', 'STOP_LOSS_HIT', 'EXPIRED', 'UNAVAILABLE')),
+    CHECK (quote_time IS NULL OR quote_time <= event_time),
+    CHECK (threshold_price IS NULL OR threshold_price >= 0),
+    CHECK (observed_price IS NULL OR observed_price >= 0),
+    CHECK (jsonb_typeof(payload) = 'object'),
+    CHECK (payload_sha256 ~ '^[0-9a-f]{64}$')
+);
+CREATE INDEX IF NOT EXISTS idx_option_price_monitor_events_plan_time ON public.option_price_monitor_events (plan_id, event_time DESC) WHERE plan_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_option_price_monitor_events_candidate_time ON public.option_price_monitor_events (candidate_id, event_time DESC) WHERE candidate_id IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION public.ensure_option_market_data_partitions(p_month_start date) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog', 'public'
+    AS $$
+DECLARE
+    current_month DATE;
+    month_start_utc TIMESTAMPTZ;
+    next_month_utc TIMESTAMPTZ;
+    month_suffix TEXT;
+    snapshot_partition TEXT;
+    trade_partition TEXT;
+    quote_partition TEXT;
+BEGIN
+    IF p_month_start <> date_trunc('month', p_month_start)::DATE THEN RAISE EXCEPTION 'p_month_start must be the first day of a month'; END IF;
+    current_month := date_trunc('month', CURRENT_DATE)::DATE;
+    IF p_month_start NOT IN (current_month, (current_month + INTERVAL '1 month')::DATE) THEN RAISE EXCEPTION 'partition maintenance is limited to current and next month'; END IF;
+    month_start_utc := p_month_start::TIMESTAMP AT TIME ZONE 'UTC';
+    next_month_utc := (p_month_start + INTERVAL '1 month')::TIMESTAMP AT TIME ZONE 'UTC';
+    month_suffix := to_char(p_month_start, 'YYYYMM');
+    snapshot_partition := 'option_chain_snapshots_y' || month_suffix;
+    trade_partition := 'option_trade_events_y' || month_suffix;
+    quote_partition := 'option_quote_samples_y' || month_suffix;
+    PERFORM pg_advisory_xact_lock(hashtextextended('option-market-data-partition:' || month_suffix, 0));
+    EXECUTE format('CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.option_chain_snapshots FOR VALUES FROM (%L) TO (%L)', snapshot_partition, month_start_utc, next_month_utc);
+    EXECUTE format('CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.option_trade_events FOR VALUES FROM (%L) TO (%L)', trade_partition, month_start_utc, next_month_utc);
+    EXECUTE format('CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.option_quote_samples FOR VALUES FROM (%L) TO (%L)', quote_partition, month_start_utc, next_month_utc);
+END;
+$$;
+REVOKE ALL ON FUNCTION public.ensure_option_market_data_partitions(date) FROM PUBLIC;
+SELECT public.ensure_option_market_data_partitions(date_trunc('month', CURRENT_DATE)::date);
+SELECT public.ensure_option_market_data_partitions((date_trunc('month', CURRENT_DATE) + INTERVAL '1 month')::date);
+INSERT INTO public.schema_migrations(version) VALUES ('059_option_advanced_quote_monitoring') ON CONFLICT DO NOTHING;
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+CREATE OR REPLACE FUNCTION public.guard_option_o1_indicator_observation() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    payload jsonb := NEW.payload_text::jsonb;
+    observation jsonb := payload->'observation';
+BEGIN
+    IF NOT COALESCE(
+       payload->>'schema_version'='option_o1_indicator_evaluation_evidence_v1'
+       AND payload->>'dataset_id'=NEW.dataset_id
+       AND (payload->>'run_id')::uuid=NEW.run_id
+       AND payload->>'selector_sha256'=NEW.selector_sha256
+       AND payload->>'selection_status'='OBSERVATION'
+       AND payload->>'selection_reason'='INDICATOR_SHADOW_ONLY'
+       AND payload->>'evidence_mode'='PROSPECTIVE_RECEIPT'
+       AND (payload->>'selected_at')::timestamptz=NEW.selected_at
+       AND payload->>'recurrence_sha256'=NEW.recurrence_sha256
+       AND ((observation->>'schema_version'='option_o1_indicator_observation_v1'
+             AND observation->'policy'->>'version'='option_participation_indicator_review_v1')
+         OR (observation->>'schema_version'='option_o1_indicator_observation_v2'
+             AND observation->'policy'->>'version'='option_participation_indicator_review_v2'))
+       AND observation->>'detector_id'='O1'
+       AND observation->>'output_kind'='OBSERVATION'
+       AND observation->>'package_status'='NOT_ASSESSED'
+       AND observation->>'outcome_status'='NOT_YET_MEASURED'
+       AND (observation->>'scheduled_cycle')::timestamptz=NEW.scheduled_cycle
+       AND (observation->>'matrix_id')::uuid=NEW.matrix_id
+       AND (observation->>'decision_at')::timestamptz<=NEW.selected_at
+       AND observation->'policy'->'changes_admission'='false'::jsonb
+       AND observation->'execution_permission'='false'::jsonb
+       AND EXISTS(SELECT 1 FROM public.option_analysis_runs WHERE matrix_id=NEW.matrix_id), false) THEN
+        RAISE EXCEPTION 'O1 indicator observation must preserve shadow identity, policy and clocks';
+    END IF;
+    NEW.recorded_at := clock_timestamp();
+    RETURN NEW;
+END;
+$$;
+INSERT INTO public.schema_migrations(version) VALUES ('060_option_o1_indicator_review_v2') ON CONFLICT DO NOTHING;
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+CREATE OR REPLACE FUNCTION public.guard_option_o1_indicator_observation() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    payload jsonb := NEW.payload_text::jsonb;
+    observation jsonb := payload->'observation';
+BEGIN
+    IF NOT COALESCE(
+       payload->>'schema_version'='option_o1_indicator_evaluation_evidence_v1'
+       AND payload->>'dataset_id'=NEW.dataset_id
+       AND (payload->>'run_id')::uuid=NEW.run_id
+       AND payload->>'selector_sha256'=NEW.selector_sha256
+       AND payload->>'selection_status'='OBSERVATION'
+       AND payload->>'selection_reason'='INDICATOR_SHADOW_ONLY'
+       AND payload->>'evidence_mode'='PROSPECTIVE_RECEIPT'
+       AND (payload->>'selected_at')::timestamptz=NEW.selected_at
+       AND payload->>'recurrence_sha256'=NEW.recurrence_sha256
+       AND ((observation->>'schema_version'='option_o1_indicator_observation_v1'
+             AND observation->'policy'->>'version'='option_participation_indicator_review_v1')
+         OR (observation->>'schema_version'='option_o1_indicator_observation_v2'
+             AND observation->'policy'->>'version'='option_participation_indicator_review_v2')
+         OR (observation->>'schema_version'='option_o1_indicator_observation_v3'
+             AND observation->'policy'->>'version'='option_participation_indicator_review_v3'))
+       AND observation->>'detector_id'='O1'
+       AND observation->>'output_kind'='OBSERVATION'
+       AND observation->>'package_status'='NOT_ASSESSED'
+       AND observation->>'outcome_status'='NOT_YET_MEASURED'
+       AND (observation->>'scheduled_cycle')::timestamptz=NEW.scheduled_cycle
+       AND (observation->>'matrix_id')::uuid=NEW.matrix_id
+       AND (observation->>'decision_at')::timestamptz<=NEW.selected_at
+       AND observation->'policy'->'changes_admission'='false'::jsonb
+    AND observation->'policy'->'execution_permission'='false'::jsonb
+    AND observation->'publication_permission'='false'::jsonb
+       AND observation->'execution_permission'='false'::jsonb
+       AND EXISTS(SELECT 1 FROM public.option_analysis_runs WHERE matrix_id=NEW.matrix_id), false) THEN
+        RAISE EXCEPTION 'O1 indicator observation must preserve shadow identity, policy and clocks';
+    END IF;
+    NEW.recorded_at := clock_timestamp();
+    RETURN NEW;
+END;
+$$;
+INSERT INTO public.schema_migrations(version) VALUES ('061_option_o1_indicator_review_v3') ON CONFLICT DO NOTHING;
+
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '30s';
+
+DO $$
+DECLARE coverage_constraint record;
+BEGIN
+    FOR coverage_constraint IN
+        SELECT conname FROM pg_constraint
+        WHERE conrelid='public.option_board_publications'::regclass
+          AND contype='c'
+          AND pg_get_expr(conbin, conrelid)='(covered_underlying_count = expected_underlying_count)'
+    LOOP
+        EXECUTE format('ALTER TABLE public.option_board_publications DROP CONSTRAINT %I', coverage_constraint.conname);
+    END LOOP;
+END;
+$$;
+
+ALTER TABLE public.option_board_publications
+    ADD CONSTRAINT option_board_publications_versioned_coverage CHECK (
+        covered_underlying_count > 0
+        AND covered_underlying_count <= expected_underlying_count
+        AND (
+            (selector_version <> 'option_detector_run_v3'
+             AND covered_underlying_count = expected_underlying_count)
+            OR (
+                selector_version = 'option_detector_run_v3'
+                AND selection_evidence->>'kind' = 'DUAL_ORIGIN_COMPLETE_RUN'
+                AND (selection_evidence->>'payload_text')::jsonb->>'schema_version' = 'option_detector_run_v3'
+                AND jsonb_array_length((selection_evidence->>'payload_text')::jsonb->'expected_underlyers') = expected_underlying_count
+                AND jsonb_array_length((selection_evidence->>'payload_text')::jsonb->'source_matrices') = covered_underlying_count
+                AND jsonb_array_length((selection_evidence->>'payload_text')::jsonb->'unavailable_underlyers') = expected_underlying_count - covered_underlying_count
+            ) IS TRUE
+        )
+    );
+
+INSERT INTO public.schema_migrations(version) VALUES ('062_option_detector_partial_coverage') ON CONFLICT DO NOTHING;
 
 COMMIT;

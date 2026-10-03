@@ -93,10 +93,11 @@ class OptionStockBehaviorAssessmentRepository(PostgresRepository):
             raise ValueError("intraday carrier identity, hash or receipt mismatch")
         return snapshot
 
-    def detector_cycle_sources(self, *, configuration, scheduled_cycle, completed_matrices, as_of):
+    def detector_cycle_sources(self, *, configuration, scheduled_cycle, completed_matrices, as_of, partial_coverage=False):
         if (as_of.utcoffset() is None or scheduled_cycle.utcoffset() is None or scheduled_cycle > as_of
                 or not 1 <= len(completed_matrices) <= 13
-                or set(completed_matrices) != set(configuration.settings.underlyers)
+                or set(completed_matrices) - set(configuration.settings.underlyers)
+                or not partial_coverage and set(completed_matrices) != set(configuration.settings.underlyers)
                 or len(set(completed_matrices.values())) != len(completed_matrices)):
             raise ValueError("detector sources require an exact complete causal cycle")
         matrix_ids = list(completed_matrices.values())
@@ -211,6 +212,79 @@ class OptionStockBehaviorAssessmentRepository(PostgresRepository):
                 raise ValueError("detector spot source bound exceeded")
         return dict(candidates=candidates, legs=legs, references=references, raw_bars=bars)
 
+    def detector_stock_bar_sources(self, *, underlyers, market_cutoffs, as_of):
+        if (as_of.utcoffset() is None or not 1 <= len(underlyers) <= 13
+                or set(underlyers) != set(market_cutoffs)
+                or any(cutoff.utcoffset() is None or cutoff > as_of for cutoff in market_cutoffs.values())):
+            raise ValueError("canonical stock bar sources require a bounded causal universe")
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '10s'")
+            cursor.execute("""WITH requested AS (
+                    SELECT * FROM unnest(%s::text[],%s::timestamptz[]) AS value(ticker,market_cutoff)
+                ), intraday AS (
+                    SELECT DISTINCT ON(bar.ticker,bar.interval,bar.bar_start) bar.*
+                    FROM requested JOIN equity_bar_revisions AS bar ON bar.ticker=requested.ticker
+                    WHERE bar.interval=ANY(ARRAY['5m','15m','30m','1h'])
+                      AND bar.is_final AND NOT bar.adjusted AND bar.session_scope='RTH'
+                      AND bar.bar_end<=requested.market_cutoff AND bar.system_observed_at<=%s AND bar.created_at<=%s
+                      AND bar.session_date=(requested.market_cutoff AT TIME ZONE 'America/New_York')::date
+                    ORDER BY bar.ticker,bar.interval,bar.bar_start,bar.system_observed_at DESC,
+                      bar.created_at DESC,bar.bar_revision_id DESC
+                ), daily AS (
+                    SELECT DISTINCT ON(bar.ticker,bar.interval,bar.bar_start) bar.*
+                    FROM requested JOIN equity_bar_revisions AS bar ON bar.ticker=requested.ticker
+                    WHERE bar.interval='1d' AND bar.is_final AND NOT bar.adjusted AND bar.session_scope='RTH'
+                      AND bar.bar_end<=requested.market_cutoff AND bar.system_observed_at<=%s AND bar.created_at<=%s
+                      AND bar.bar_start>=requested.market_cutoff-INTERVAL '40 days'
+                    ORDER BY bar.ticker,bar.interval,bar.bar_start,bar.system_observed_at DESC,
+                      bar.created_at DESC,bar.bar_revision_id DESC
+                ), eligible AS (SELECT * FROM intraday UNION ALL SELECT * FROM daily)
+                SELECT * FROM eligible ORDER BY ticker,interval,bar_end LIMIT 5001""",
+                (list(underlyers), [market_cutoffs[ticker] for ticker in underlyers], as_of, as_of, as_of, as_of))
+            rows = tuple(dict(row) for row in cursor.fetchall())
+        if len(rows) > 5000:
+            raise ValueError("canonical stock bar source bound exceeded")
+        return rows
+
+    def detector_trend_bar_sources(self, *, underlyers, market_cutoffs, as_of):
+        """Latest 202 canonical 30m and 22 daily final RTH bars per underlyer at its own cutoff."""
+        if (as_of.utcoffset() is None or not 1 <= len(underlyers) <= 13
+                or set(underlyers) != set(market_cutoffs)
+                or any(cutoff.utcoffset() is None or cutoff > as_of for cutoff in market_cutoffs.values())):
+            raise ValueError("canonical trend bar sources require a bounded causal universe")
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '5s'")
+            cursor.execute("""WITH requested AS (
+                    SELECT * FROM unnest(%s::text[],%s::timestamptz[]) AS value(ticker,market_cutoff)
+                ), eligible AS (
+                    SELECT DISTINCT ON(bar.ticker,bar.interval,bar.bar_start) bar.bar_revision_id,bar.security_id,
+                        bar.ticker,bar.interval,bar.bar_start,bar.bar_end,bar.session_date,bar.high_price,bar.low_price,
+                        bar.close_price,bar.volume,bar.created_at,bar.system_observed_at
+                    FROM requested JOIN equity_bar_revisions AS bar ON bar.ticker=requested.ticker
+                    WHERE bar.interval IN ('30m','1d') AND bar.is_final AND NOT bar.adjusted AND bar.session_scope='RTH'
+                      AND bar.availability_mode='LIVE_OBSERVED'
+                      AND (bar.quality_codes=ARRAY[]::text[] OR (bar.interval='1d'
+                           AND bar.quality_codes=ARRAY['DERIVED_FROM_CANONICAL_30M']::text[]))
+                      AND bar.bar_end<=requested.market_cutoff AND bar.system_observed_at<=%s AND bar.created_at<=%s
+                      AND bar.bar_start>=requested.market_cutoff-INTERVAL '60 days'
+                    ORDER BY bar.ticker,bar.interval,bar.bar_start,bar.system_observed_at DESC,
+                      bar.created_at DESC,bar.bar_revision_id DESC
+                ), numbered AS (
+                    SELECT eligible.*,ROW_NUMBER() OVER(PARTITION BY ticker,interval ORDER BY bar_end DESC) AS recency
+                    FROM eligible
+                ) SELECT * FROM numbered WHERE (interval='30m' AND recency<=202) OR (interval='1d' AND recency<=22)
+                ORDER BY ticker,interval,bar_end LIMIT 3001""",
+                (list(underlyers), [market_cutoffs[ticker] for ticker in underlyers], as_of, as_of))
+            rows = tuple(dict(row) for row in cursor.fetchall())
+        if len(rows) > 3000:
+            raise ValueError("canonical trend bar source bound exceeded")
+        grouped = {ticker: {"30m": [], "1d": []} for ticker in underlyers}
+        for row in rows:
+            grouped[row["ticker"]][row["interval"]].append(row)
+        return grouped
+
     def detector_technical_sources(self, *, underlyers, market_cutoff, as_of, technical_underlyers=None):
         from equity.materialization import SETUP_VERSION
         from psycopg2.errors import QueryCanceled
@@ -290,7 +364,9 @@ class OptionStockBehaviorAssessmentRepository(PostgresRepository):
                 cursor.execute(
                     "SELECT * FROM equity_bar_revisions WHERE bar_revision_id=ANY(%s::uuid[]) "
                     "AND NOT adjusted AND is_final AND session_scope='RTH' AND availability_mode='LIVE_OBSERVED' "
-                    "AND quality_codes=ARRAY[]::text[] AND system_observed_at<=%s AND created_at<=%s ORDER BY bar_start",
+                    "AND (quality_codes=ARRAY[]::text[] OR (interval='1h' "
+                    "AND quality_codes=ARRAY['DERIVED_FROM_CANONICAL_30M']::text[])) "
+                    "AND system_observed_at<=%s AND created_at<=%s ORDER BY bar_start",
                     (ids, as_of, as_of))
                 bars = tuple(dict(row) for row in cursor.fetchall())
             except QueryCanceled:

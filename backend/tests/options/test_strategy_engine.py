@@ -2,6 +2,7 @@ import sys
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ from options.domain import (
     ExerciseStyle,
     MarkSource,
     OptionContractSnapshot,
+    OptionExpirationAnalytics,
     OptionTradeEvent,
     TradeClassificationStatus,
 )
@@ -121,6 +123,81 @@ def test_o3_credit_deadline_uses_source_time_and_session_close():
     context.market_data_time = closing_time
     legs = (SimpleNamespace(source_market_time=closing_time),)
     assert new._candidate_deadline(context, "SPREAD_RANGE_LOCATOR", legs, StructureType.CALL_CREDIT_VERTICAL) == datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(("contract_type", "wing_strike", "center_strike", "low_strikes", "activity_strike", "structure"), [
+    (ContractType.PUT, "90", "95", ("96", "97", "98"), "99", StructureType.PUT_CREDIT_VERTICAL),
+    (ContractType.CALL, "110", "105", ("104", "103", "102"), "101", StructureType.CALL_CREDIT_VERTICAL),
+])
+def test_o3_credit_generation_retains_exact_activity_contract_from_wall_region(
+    contract_type, wing_strike, center_strike, low_strikes, activity_strike, structure,
+):
+    from options.config import load_strategy_policy
+
+    policy = load_strategy_policy(BACKEND_DIR / "options/policies/strategy_o3_credit_v2.json")
+    engine = OptionStrategyEngine(policy.policy, policy.sha256)
+    matrix_id = uuid4()
+    source_time = MARKET_TIME - timedelta(minutes=30)
+    rows = (
+        replace(snapshot(1, wing_strike, "1", 0.30, contract_type), open_interest=1000,
+            spot_market_data_time=source_time, mark_market_data_time=source_time,
+            market_data_time=source_time, first_observed_at=source_time + timedelta(minutes=15)),
+        replace(snapshot(2, center_strike, "2", 0.30, contract_type), open_interest=1000,
+            spot_market_data_time=source_time, mark_market_data_time=source_time,
+            market_data_time=source_time, first_observed_at=source_time + timedelta(minutes=15)),
+        replace(snapshot(3, low_strikes[0], "2.5", 0.30, contract_type), day_volume=300, open_interest=100,
+            spot_market_data_time=source_time, mark_market_data_time=source_time,
+            market_data_time=source_time, first_observed_at=source_time + timedelta(minutes=15)),
+        replace(snapshot(4, low_strikes[1], "3", 0.30, contract_type), day_volume=300, open_interest=100,
+            spot_market_data_time=source_time, mark_market_data_time=source_time,
+            market_data_time=source_time, first_observed_at=source_time + timedelta(minutes=15)),
+        replace(snapshot(5, low_strikes[2], "3.5", 0.30, contract_type), day_volume=300, open_interest=100,
+            spot_market_data_time=source_time, mark_market_data_time=source_time,
+            market_data_time=source_time, first_observed_at=source_time + timedelta(minutes=15)),
+        replace(snapshot(30, activity_strike, "4", 0.30, contract_type), day_volume=1500, open_interest=500,
+            spot_market_data_time=source_time, mark_market_data_time=source_time,
+            market_data_time=source_time, first_observed_at=source_time + timedelta(minutes=15)),
+    )
+    expiration = OptionExpirationAnalytics(
+        matrix_id=matrix_id,
+        expiration_date=EXPIRATION,
+        fractional_maturity_years=21 / 365,
+        forward_price=None,
+        atm_iv=None,
+        call_25_delta_iv=None,
+        put_25_delta_iv=None,
+        call_skew_25_delta=None,
+        put_skew_25_delta=None,
+        risk_reversal_25_delta=None,
+        interpolation_diagnostics_json="{}",
+        put_volume=2450,
+        call_volume=0,
+        put_open_interest=2300,
+        call_open_interest=0,
+        breadth=3,
+        concentration_metrics_json="{}",
+        wall_clusters_json=json.dumps([{
+            "contract_type": contract_type.value,
+            "member_strikes": [center_strike, *low_strikes, activity_strike],
+            "center_strike": center_strike,
+            "maximum_robust_z": 4.0,
+            "total_open_interest": 1500,
+        }]),
+        term_change=None,
+        term_slope=None,
+        quality_reasons=(),
+    )
+
+    candidates = engine._spread_and_range(
+        matrix_id, rows, (expiration,), replace(strategy_context(matrix_id),
+            market_data_time=source_time, observed_time=source_time + timedelta(minutes=15))
+    )
+    credit = [
+        candidate for candidate in candidates
+        if candidate.structure_type is structure
+    ]
+
+    assert any(30 in {leg.contract_id for leg in candidate.legs} for candidate in credit)
 
 
 def test_discovery_catalog_covers_registered_models_without_execution_claims():

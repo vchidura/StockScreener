@@ -36,6 +36,10 @@ OPTIMIZED_RUNTIME_FILES = (*RUNTIME_FILES, "options/outcome_service.py", "option
     "scripts/run_option_outcome_worker.py", "scripts/run_worker_group.py")
 OPTIMIZED_INTRADAY_RUNTIME_FILES = (*OPTIMIZED_RUNTIME_FILES, "options/intraday_participation.py",
     "equity/behavior.py", "equity/behavior_sources.py", "options/stock_behavior_gates.py")
+CANONICAL_STOCK_RUNTIME_FILES = (*OPTIMIZED_INTRADAY_RUNTIME_FILES, "options/stock_bar_detection.py")
+CANONICAL_TREND_RUNTIME_FILES = (*CANONICAL_STOCK_RUNTIME_FILES, "equity/behavior_calculators.py", "equity/technicals.py")
+DIRECT_STRUCTURE_RUNTIME_FILES = (*CANONICAL_TREND_RUNTIME_FILES, "equity/repositories.py", "equity/orchestration.py",
+    "research/composite_scanners.py", "screeners.py")
 
 
 class DetectorForwardLaunch(Contract):
@@ -130,6 +134,88 @@ class OptimizedStockSetupReadyDetectorForwardLaunch(StockSetupReadyDetectorForwa
     schema_version: Literal["option_detector_forward_launch_v6"] = "option_detector_forward_launch_v6"
 
 
+class CanonicalStockFirstDetectorForwardLaunch(Contract):
+    runtime_files: ClassVar[tuple[str, ...]] = CANONICAL_STOCK_RUNTIME_FILES
+    expected_o1_policy: ClassVar[str] = "option_participation_stock_alignment_v3"
+    schema_version: Literal["option_detector_forward_launch_v7"] = "option_detector_forward_launch_v7"
+    dataset_id: Name
+    effective_from: AwareDatetime
+    underlyers: tuple[Name, ...] = Field(min_length=1, max_length=13)
+    configuration_sha256: Sha256
+    strategy_policy_sha256: Sha256
+    valuation_policy_sha256: Sha256
+    technical_policy_sha256: Sha256 = TECHNICAL_EXIT_POLICY.sha256
+    qualification_policy_sha256: Sha256 = TECHNICAL_QUALIFICATION_POLICY.sha256
+    o1_confirmation_policy_sha256: Sha256
+    stock_bar_policy_sha256: Sha256
+    runtime_sources: tuple[tuple[str, Sha256], ...]
+    maximum_new_alerts: Literal[20] = 20
+    stock_readiness_policy: Literal["CANONICAL_COMPLETED_BAR_FALLBACK_V1"] = "CANONICAL_COMPLETED_BAR_FALLBACK_V1"
+    alert_mode: Literal["DEVELOPMENT_OBSERVATIONS"] = "DEVELOPMENT_OBSERVATIONS"
+    evidence_mode: Literal["PROSPECTIVE_RECEIPT"] = "PROSPECTIVE_RECEIPT"
+    execution_permission: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_canonical_stock_launch(self):
+        from options.intraday_participation import CANONICAL_TREND_ALIGNMENT_POLICY, INTRADAY_ALIGNMENT_POLICY
+        from options.stock_bar_detection import STOCK_BAR_SIGNAL_POLICY_SHA256
+
+        o1_policy = {INTRADAY_ALIGNMENT_POLICY.version: INTRADAY_ALIGNMENT_POLICY,
+            CANONICAL_TREND_ALIGNMENT_POLICY.version: CANONICAL_TREND_ALIGNMENT_POLICY}[self.expected_o1_policy]
+        if (len(set(self.underlyers)) != len(self.underlyers)
+                or self.technical_policy_sha256 != TECHNICAL_EXIT_POLICY.sha256
+                or self.qualification_policy_sha256 != TECHNICAL_QUALIFICATION_POLICY.sha256
+                or self.o1_confirmation_policy_sha256 != o1_policy.sha256
+                or self.stock_bar_policy_sha256 != STOCK_BAR_SIGNAL_POLICY_SHA256
+                or {name for name, _ in self.runtime_sources} != set(self.runtime_files)
+                or len(self.runtime_sources) != len(self.runtime_files)):
+            raise ValueError("canonical stock detector launch policies, universe or runtime pins mismatch")
+        return self
+
+
+class CanonicalTrendDetectorForwardLaunch(CanonicalStockFirstDetectorForwardLaunch):
+    runtime_files: ClassVar[tuple[str, ...]] = CANONICAL_TREND_RUNTIME_FILES
+    expected_o1_policy: ClassVar[str] = "option_participation_stock_alignment_v4"
+    expected_review_version: ClassVar[int] = 2
+    schema_version: Literal["option_detector_forward_launch_v8"] = "option_detector_forward_launch_v8"
+    o1_trend_source_policy_sha256: Sha256
+    o1_indicator_review_policy_sha256: Sha256
+    structural_technical_selection: Literal["FIRST_BINDABLE_LATEST_30M_THEN_1H_DERIVED_ACCEPTED"] = "FIRST_BINDABLE_LATEST_30M_THEN_1H_DERIVED_ACCEPTED"
+
+    @model_validator(mode="after")
+    def validate_canonical_trend_launch(self):
+        from options.intraday_participation import (
+            CANONICAL_TREND_SOURCE_POLICY, O1_INDICATOR_REVIEW_POLICY_V2, O1_INDICATOR_REVIEW_POLICY_V3,
+        )
+
+        review = {2: O1_INDICATOR_REVIEW_POLICY_V2, 3: O1_INDICATOR_REVIEW_POLICY_V3}[self.expected_review_version]
+        if (self.o1_trend_source_policy_sha256 != CANONICAL_TREND_SOURCE_POLICY.sha256
+                or self.o1_indicator_review_policy_sha256 != review.sha256):
+            raise ValueError("canonical trend launch requires the reviewed O1 trend and review policies")
+        return self
+
+
+class DirectStructureDetectorForwardLaunch(CanonicalTrendDetectorForwardLaunch):
+    runtime_files: ClassVar[tuple[str, ...]] = DIRECT_STRUCTURE_RUNTIME_FILES
+    expected_review_version: ClassVar[int] = 3
+    schema_version: Literal["option_detector_forward_launch_v9"] = "option_detector_forward_launch_v9"
+    structural_level_policy_sha256: Sha256
+    structural_technical_selection: Literal["EXACT_CURRENT_WINDOW_30M_THEN_1H_EITHER_DIRECTION"] = "EXACT_CURRENT_WINDOW_30M_THEN_1H_EITHER_DIRECTION"
+
+    @model_validator(mode="after")
+    def validate_direct_structure_launch(self):
+        from options.detector_collection import direct_structural_policy_sha256
+
+        if self.structural_level_policy_sha256 != direct_structural_policy_sha256():
+            raise ValueError("direct structure launch requires the reviewed structural level policy")
+        return self
+
+
+class PartialCoverageDetectorForwardLaunch(DirectStructureDetectorForwardLaunch):
+    schema_version: Literal["option_detector_forward_launch_v10"] = "option_detector_forward_launch_v10"
+    coverage_policy: Literal["PER_UNDERLYER_COMPLETE_CURRENT_MATRIX_V1"] = "PER_UNDERLYER_COMPLETE_CURRENT_MATRIX_V1"
+
+
 def read_stock_setup_windows_when_ready(reader, *, path, policies, windows, as_of, wait_deadline,
                                         progress_callback=None, clock=None, wait=None):
     from research.stock_idea_forward import readiness_deadline
@@ -175,7 +261,11 @@ def decode_detector_forward_launch(payload):
         "option_detector_forward_launch_v3": IntradayDetectorForwardLaunch,
         "option_detector_forward_launch_v4": LatestCompletedDetectorForwardLaunch,
         "option_detector_forward_launch_v5": StockSetupReadyDetectorForwardLaunch,
-        "option_detector_forward_launch_v6": OptimizedStockSetupReadyDetectorForwardLaunch}
+        "option_detector_forward_launch_v6": OptimizedStockSetupReadyDetectorForwardLaunch,
+        "option_detector_forward_launch_v7": CanonicalStockFirstDetectorForwardLaunch,
+        "option_detector_forward_launch_v8": CanonicalTrendDetectorForwardLaunch,
+        "option_detector_forward_launch_v9": DirectStructureDetectorForwardLaunch,
+        "option_detector_forward_launch_v10": PartialCoverageDetectorForwardLaunch}
     contract = contracts.get(data.get("schema_version"))
     if contract is None:
         raise ValueError("unsupported detector forward launch schema")
@@ -203,29 +293,63 @@ def _source_hashes(backend_dir, names):
 
 def prepare_detector_forward_launch(*, backend_dir, configuration, dataset_id, effective_from, stock_ledger,
                                    approve_stock_runtime_transition=False, intraday_confirmation=False,
-                                   stock_setup_wait=False, stock_source_launch=None):
+                                   stock_setup_wait=False, stock_source_launch=None,
+                                   canonical_stock_first=False, canonical_trend=False, direct_structure=False,
+                                   partial_coverage=False):
     from equity.stock_alert_results import _decode_original_setup_payload
     from research.stock_alert_results import strategy_instance
     from research.stock_idea_engine import digest
 
-    path = _scoped_path(backend_dir, stock_ledger)
-    if not path.is_file():
-        raise ValueError("forward launch requires the existing stock source ledger")
-    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)) as connection:
-        connection.execute("PRAGMA query_only=ON")
-        connection.execute("BEGIN")
-        manifest = connection.execute("SELECT policy_hash,CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_manifest WHERE singleton=1").fetchone()
-        if not manifest or not manifest[1]:
-            raise ValueError("forward launch source manifest, checkpoint or publication is missing")
-        config = json.loads(manifest[1])
-    if digest(config) != manifest[0] or config["policy_version"] != "stock_ideas_forward_quality_v2":
-        raise ValueError("forward launch stock source identity mismatch")
+    if canonical_trend and not canonical_stock_first:
+        raise ValueError("canonical trend confirmation extends the canonical stock-first launch")
+    if direct_structure and not canonical_trend:
+        raise ValueError("direct structural levels extend the canonical trend launch")
+    if partial_coverage and not direct_structure:
+        raise ValueError("partial coverage requires the direct structural launch")
+    if canonical_stock_first:
+        from options.intraday_participation import (
+            CANONICAL_TREND_ALIGNMENT_POLICY, CANONICAL_TREND_SOURCE_POLICY, INTRADAY_ALIGNMENT_POLICY,
+            O1_INDICATOR_REVIEW_POLICY_V2,
+        )
+        from options.stock_bar_detection import STOCK_BAR_SIGNAL_POLICY_SHA256
+
+        if not intraday_confirmation or stock_setup_wait or approve_stock_runtime_transition:
+            raise ValueError("canonical stock-first launch requires intraday confirmation without setup transition flags")
+        common = dict(dataset_id=dataset_id,
+            effective_from=effective_from, underlyers=configuration.settings.underlyers,
+            configuration_sha256=configuration.configuration_sha256,
+            strategy_policy_sha256=configuration.strategy_policy_sha256,
+            valuation_policy_sha256=configuration.valuation_policy_sha256,
+            stock_bar_policy_sha256=STOCK_BAR_SIGNAL_POLICY_SHA256)
+        if direct_structure:
+            from options.detector_collection import direct_structural_policy_sha256
+            from options.intraday_participation import O1_INDICATOR_REVIEW_POLICY_V3
+
+            launch_type = PartialCoverageDetectorForwardLaunch if partial_coverage else DirectStructureDetectorForwardLaunch
+            launch = launch_type(**common,
+                o1_confirmation_policy_sha256=CANONICAL_TREND_ALIGNMENT_POLICY.sha256,
+                o1_trend_source_policy_sha256=CANONICAL_TREND_SOURCE_POLICY.sha256,
+                o1_indicator_review_policy_sha256=O1_INDICATOR_REVIEW_POLICY_V3.sha256,
+                structural_level_policy_sha256=direct_structural_policy_sha256(),
+                runtime_sources=_source_hashes(backend_dir, DIRECT_STRUCTURE_RUNTIME_FILES))
+        elif canonical_trend:
+            launch = CanonicalTrendDetectorForwardLaunch(**common,
+                o1_confirmation_policy_sha256=CANONICAL_TREND_ALIGNMENT_POLICY.sha256,
+                o1_trend_source_policy_sha256=CANONICAL_TREND_SOURCE_POLICY.sha256,
+                o1_indicator_review_policy_sha256=O1_INDICATOR_REVIEW_POLICY_V2.sha256,
+                runtime_sources=_source_hashes(backend_dir, CANONICAL_TREND_RUNTIME_FILES))
+        else:
+            launch = CanonicalStockFirstDetectorForwardLaunch(**common,
+                o1_confirmation_policy_sha256=INTRADAY_ALIGNMENT_POLICY.sha256,
+                runtime_sources=_source_hashes(backend_dir, CANONICAL_STOCK_RUNTIME_FILES))
+        validate_detector_forward_launch(launch, configuration=configuration, backend_dir=backend_dir)
+        return launch
+
     if stock_source_launch is not None:
         source = decode_detector_forward_launch(stock_source_launch.canonical_json())
         if (approve_stock_runtime_transition or source.stock_ledger != stock_ledger
                 or source.underlyers != configuration.settings.underlyers
-                or source.acceptance_source.instance_policy_sha256 != manifest[0]
-                or source.resumption_source.instance_policy_sha256 != manifest[0]
+                or source.acceptance_source.instance_policy_sha256 != source.resumption_source.instance_policy_sha256
                 or source.acceptance_source.runtime_sources != _source_hashes(backend_dir,
                     [name for name, _ in source.acceptance_source.runtime_sources])
                 or source.resumption_source.runtime_sources != _source_hashes(backend_dir,
@@ -234,15 +358,24 @@ def prepare_detector_forward_launch(*, backend_dir, configuration, dataset_id, e
         acceptance_source = source.acceptance_source
         resumption_source = source.resumption_source
     else:
+        path = _scoped_path(backend_dir, stock_ledger)
+        if not path.is_file():
+            raise ValueError("forward launch requires the existing stock source ledger")
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)) as connection:
             connection.execute("PRAGMA query_only=ON")
             connection.execute("BEGIN")
+            manifest = connection.execute("SELECT policy_hash,CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_manifest WHERE singleton=1").fetchone()
+            if not manifest or not manifest[1]:
+                raise ValueError("forward launch source manifest, checkpoint or publication is missing")
+            config = json.loads(manifest[1])
             checkpoint = connection.execute("SELECT CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_checkpoint WHERE singleton=1").fetchone()
             latest = connection.execute("SELECT CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_publications ORDER BY window_key DESC LIMIT 1").fetchone()
             if not checkpoint or not latest:
                 raise ValueError("forward launch source manifest, checkpoint or publication is missing")
             state = _decode_original_setup_payload(checkpoint[0])
             publication = _decode_original_setup_payload(latest[0])
+        if digest(config) != manifest[0] or config["policy_version"] != "stock_ideas_forward_quality_v2":
+            raise ValueError("forward launch stock source identity mismatch")
         instance = strategy_instance(config, state, "intraday")
         runtime = tuple(sorted(publication["runtime_sources"].items()))
         current_runtime = _source_hashes(backend_dir, [name for name, _ in runtime])
@@ -287,12 +420,13 @@ def validate_detector_forward_launch(launch, *, configuration, backend_dir):
             or launch.underlyers != configuration.settings.underlyers
             or launch.runtime_sources != _source_hashes(backend_dir, launch.runtime_files)):
         raise ValueError("detector launch does not match reviewed configuration, policy or source code")
-    for policy in (launch.acceptance_source, launch.resumption_source):
-        if policy.runtime_sources != _source_hashes(backend_dir, [name for name, _ in policy.runtime_sources]):
-            raise ValueError("pinned stock runtime source changed")
-    ledger = _scoped_path(backend_dir, launch.stock_ledger)
-    if not isinstance(launch, SourceReadyDetectorForwardLaunch) and not ledger.is_file():
-        raise ValueError("pinned stock ledger is unavailable")
+    if not isinstance(launch, CanonicalStockFirstDetectorForwardLaunch):
+        for policy in (launch.acceptance_source, launch.resumption_source):
+            if policy.runtime_sources != _source_hashes(backend_dir, [name for name, _ in policy.runtime_sources]):
+                raise ValueError("pinned stock runtime source changed")
+        ledger = _scoped_path(backend_dir, launch.stock_ledger)
+        if not isinstance(launch, SourceReadyDetectorForwardLaunch) and not ledger.is_file():
+            raise ValueError("pinned stock ledger is unavailable")
     return launch
 
 
@@ -317,9 +451,12 @@ def build_detector_collector(launch, *, configuration, backend_dir):
 
     launch = validate_detector_forward_launch(launch, configuration=configuration, backend_dir=backend_dir)
     repository = OptionStockBehaviorAssessmentRepository()
-    aligned = isinstance(launch, SourceReadyDetectorForwardLaunch)
+    canonical_stock_first = isinstance(launch, CanonicalStockFirstDetectorForwardLaunch)
+    aligned = isinstance(launch, SourceReadyDetectorForwardLaunch) or canonical_stock_first
     wait_for_setups = isinstance(launch, StockSetupReadyDetectorForwardLaunch)
     def setups(*, market_cutoff, as_of, market_cutoffs=None, wait_deadline=None, progress_callback=None):
+        if canonical_stock_first:
+            return ()
         if aligned:
             path = _scoped_path(backend_dir, launch.stock_ledger)
             policies = (launch.acceptance_source, launch.resumption_source)
@@ -335,13 +472,23 @@ def build_detector_collector(launch, *, configuration, backend_dir):
             policies=(launch.acceptance_source, launch.resumption_source), underlyers=launch.underlyers,
             market_cutoff=market_cutoff, as_of=as_of)
     def setup_shadows(*, market_cutoff, as_of, market_cutoffs=None, **_):
-        if not aligned:
+        if canonical_stock_first or not aligned:
             return (), {}
         return read_direct_stock_setup_shadow_windows(_scoped_path(backend_dir, launch.stock_ledger),
             policies=(launch.acceptance_source, launch.resumption_source),
             windows=aligned_stock_windows(market_cutoffs), as_of=as_of)
-    sources = ProductionDetectorSourceReader(RetainedDetectorSourceReader(repository, EquityReferenceRepository(), EquityEvidenceRepository()),
+    evaluations = OptionAlertEvaluationRepository()
+    canonical_trend = isinstance(launch, CanonicalTrendDetectorForwardLaunch)
+    direct_structure = isinstance(launch, DirectStructureDetectorForwardLaunch)
+    from equity.repositories import EquityBarRepository
+    partial_coverage = isinstance(launch, PartialCoverageDetectorForwardLaunch)
+    sources = ProductionDetectorSourceReader(RetainedDetectorSourceReader(repository, EquityReferenceRepository(), EquityEvidenceRepository(),
+        partial_coverage=partial_coverage),
         repository, EquityCorporateActionRepository(), setup_reader=setups, setup_shadow_reader=setup_shadows,
         aligned_setup_windows=aligned, setup_wait_enabled=wait_for_setups,
-        intraday_confirmation=isinstance(launch, (IntradayDetectorForwardLaunch, LatestCompletedDetectorForwardLaunch)))
-    return DetectorCycleCollector(sources, OptionAlertEvaluationRepository())
+        intraday_confirmation=isinstance(launch, (IntradayDetectorForwardLaunch, LatestCompletedDetectorForwardLaunch,
+            CanonicalStockFirstDetectorForwardLaunch)), canonical_stock_first=canonical_stock_first,
+        canonical_trend=canonical_trend,
+        activity_history_reader=evaluations.prior_o1_directional_activity if canonical_trend else None,
+        direct_structure=direct_structure, bar_repository=EquityBarRepository() if direct_structure else None)
+    return DetectorCycleCollector(sources, evaluations, partial_coverage=partial_coverage)

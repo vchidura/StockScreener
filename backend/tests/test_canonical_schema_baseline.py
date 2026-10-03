@@ -74,6 +74,56 @@ def test_o3_indicative_admission_migration_promotes_empty_prospective_relation()
     assert "DROP TABLE" not in sql
 
 
+def test_detector_management_status_migration_is_immutable_and_matches_baseline():
+    sql = (MIGRATIONS_DIR / "058_option_detector_management_status.sql").read_text(encoding="utf-8")
+    assert sql.strip() in baseline_sql()
+    assert "management_status IN ('TARGET_MET','STOP_LOSS_HIT')" in sql
+    assert "detector management terminal status is immutable" in sql
+    assert "BEFORE UPDATE" in sql
+
+
+def test_advanced_quote_monitoring_migration_matches_baseline_and_is_sampled():
+    sql = (MIGRATIONS_DIR / "059_option_advanced_quote_monitoring.sql").read_text(
+        encoding="utf-8"
+    )
+    baseline = baseline_sql()
+    assert "option_quote_current" in sql
+    assert "option_quote_samples" in sql and "PARTITION BY RANGE (sampled_at)" in sql
+    assert "sample_reason IN ('CHANGE', 'HEARTBEAT', 'DECISION', 'EXIT_MONITOR')" in sql
+    assert "option_price_monitor_events" in sql
+    assert "option_quote_samples_y" in sql
+    assert "CREATE TABLE IF NOT EXISTS public.option_execution_" not in sql
+    for contract in (
+        "option_quote_stream_sessions",
+        "option_quote_current",
+        "option_quote_samples",
+        "option_price_monitor_events",
+        "option_quote_samples_y",
+        "059_option_advanced_quote_monitoring",
+    ):
+        assert contract in baseline
+
+
+def test_current_marks_table_precedes_management_status_alter_in_baseline():
+    baseline = baseline_sql()
+    table_creation = baseline.index(
+        "CREATE TABLE IF NOT EXISTS public.option_signal_current_marks"
+    )
+    management_alter = baseline.index(
+        "ALTER TABLE public.option_signal_current_marks"
+    )
+    assert table_creation < management_alter
+    assert "REFERENCES public.option_strategy_candidates(candidate_id)" in baseline[
+        table_creation:management_alter
+    ]
+    assert "REFERENCES public.option_ingestion_runs(batch_id)" in baseline[
+        table_creation:management_alter
+    ]
+    assert "VALUES ('020_option_current_marks')" in baseline[
+        table_creation:management_alter
+    ]
+
+
 def normalized_sql() -> str:
     return " ".join(baseline_sql().split())
 
@@ -354,7 +404,7 @@ def test_baseline_is_atomic_versioned_and_bootstrapped() -> None:
     assert "CREATE SCHEMA public" not in sql
     assert "VALUES ('000_canonical_schema')" in sql
     assert "INSERT INTO public.equity_portal_source_state" in sql
-    assert sql.count("SELECT public.ensure_option_market_data_partitions(") == 2
+    assert sql.count("SELECT public.ensure_option_market_data_partitions(") == 4
     assert not re.search(
         r"option_(?:chain_snapshots|trade_events)_y20\d{4}", sql
     )

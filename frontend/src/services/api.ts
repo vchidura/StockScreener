@@ -1736,6 +1736,8 @@ export interface OptionDetectorRunSummary {
   observed_time: string
   expected_underlyings: number
   covered_underlyings: number
+  coverage_status?: 'COMPLETE' | 'PARTIAL'
+  unavailable_underlyers?: Record<string, string[]>
   selection_counts: Record<string, number>
   rejections: Record<string, number>
 }
@@ -1758,7 +1760,7 @@ export interface OptionLocalSurfaceObservation {
 }
 
 export interface OptionO1IndicatorObservation {
-  schema_version: 'option_o1_indicator_observation_v1'
+  schema_version: 'option_o1_indicator_observation_v1' | 'option_o1_indicator_observation_v2' | 'option_o1_indicator_observation_v3'
   baseline_disposition: string
   baseline_reasons: string[]
   volume_oi_ratio: number
@@ -1891,7 +1893,9 @@ export interface OptionDetectorAlertReview {
   version: 'option_detector_alert_review_v2'
   dataset_id: string
   scope: 'LATEST' | 'HISTORY'
-  status: 'COMPLETE' | 'NO_COMPLETE_RUN'
+  status: 'COMPLETE' | 'PARTIAL' | 'NO_COMPLETE_RUN' | 'RUNNING' | 'FAILED' | 'INCOMPLETE' | 'UNVERIFIED'
+  latest_attempt?: { scheduled_cycle: string; started_at: string; finished_at: string | null;
+    status: 'RUNNING' | 'FAILED' | 'INCOMPLETE' | 'UNVERIFIED'; reason: string | null } | null
   as_of: string
   latest_run_id: string | null
   run: OptionDetectorRunSummary | null
@@ -1911,7 +1915,8 @@ export interface OptionDetectorAlertReview {
     triggered_at: string | null;
     detector_id: OptionDetectorId; origin: 'OPTIONS_FIRST' | 'STOCK_FIRST'; underlyer: string;
     direction: -1 | 1; category: string; strategy_name: string | null; candidate_rank: number | null; first_selected_at: string;
-    hit_count: number; repeat_count: number; last_seen_at: string; plan_sha256: string | null;
+    hit_count: number; repeat_count: number; confirmation_timeframes?: string[]; last_seen_at: string; plan_sha256: string | null;
+    management_status: 'MONITORING' | 'TARGET_MET' | 'STOP_LOSS_HIT' | 'EXPIRED' | 'NOT_APPLICABLE' | 'UNAVAILABLE';
     entry_limit: string | null; entry_deadline: string | null; exit_deadline: string | null;
     management_policy: Record<string, unknown>; event_horizon_status: string | null; original_package: OptionAlertOriginalPackage;
     current_mark: OptionCurrentMark | null;
@@ -2214,6 +2219,27 @@ export interface OptionCandidateDetailData {
   execution_mode: 'READ_ONLY_RESEARCH'
 }
 
+export interface OptionCurrentAdvancedQuote {
+  contract_id: number
+  contract_ticker: string
+  quote_time: string
+  received_at: string
+  bid: string
+  ask: string
+  bid_size: number | null
+  ask_size: number | null
+  updated_at: string
+}
+
+export interface OptionCurrentAdvancedQuotesData {
+  quotes: OptionCurrentAdvancedQuote[]
+  requested_contract_ids: number[]
+  missing_contract_ids: number[]
+  source: 'PERSISTED_ADVANCED_QUOTE_CURRENT'
+  provider_fetch_performed: false
+  execution_permission: false
+}
+
 export const getOptionEventCalendar = async (
   underlyer: string,
   daysForward = 30,
@@ -2267,6 +2293,13 @@ export const getOptionCandidate = async (
   candidateId: string,
 ): Promise<OptionsEnvelope<OptionCandidateDetailData>> => {
   const response = await api.get(`/options/candidates/${candidateId}`)
+  return response.data
+}
+
+export const getOptionCurrentAdvancedQuotes = async (
+  contractIds: number[],
+): Promise<OptionsEnvelope<OptionCurrentAdvancedQuotesData>> => {
+  const response = await api.get('/options/quotes/current', { params: { contract_id: contractIds } })
   return response.data
 }
 

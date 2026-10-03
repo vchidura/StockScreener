@@ -106,6 +106,8 @@ class OptionSettings(_FrozenModel):
     trade_watchlist_per_underlyer: int = Field(default=15, gt=0, le=200)
     trade_lookback_seconds: int = Field(default=3600, gt=0)
     trade_ingestion_budget_seconds: int = Field(default=120, gt=0)
+    acquisition_maximum_dte: int = Field(default=60, ge=1, le=365)
+    underlying_concurrency: int = Field(default=4, ge=1, le=8)
 
     @field_validator("fixed_stock_underlyers", "fixed_etf_underlyers", mode="before")
     @classmethod
@@ -182,6 +184,8 @@ class OptionSettings(_FrozenModel):
             "start_read_only": self.start_read_only,
             "maximum_execution_lag_seconds": self.maximum_execution_lag_seconds,
             "reference_cache_seconds": self.reference_cache_seconds,
+            "acquisition_maximum_dte": self.acquisition_maximum_dte,
+            "underlying_concurrency": self.underlying_concurrency,
         }
 
 
@@ -879,6 +883,12 @@ def load_option_runtime_configuration(
         "trade_lookback_seconds": environ.get("OPTION_TRADE_LOOKBACK_SECONDS", "3600"),
         "trade_ingestion_budget_seconds": environ.get(
             "OPTION_TRADE_INGESTION_BUDGET_SECONDS", "120"
+        ),
+        "acquisition_maximum_dte": environ.get(
+            "OPTION_ACQUISITION_MAXIMUM_DTE", "60"
+        ),
+        "underlying_concurrency": environ.get(
+            "OPTION_UNDERLYING_CONCURRENCY", "4"
         ),
         "reference_cache_seconds": environ.get("OPTION_REFERENCE_CACHE_SECONDS", "900"),
     }

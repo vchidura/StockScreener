@@ -154,7 +154,15 @@ class OptionMaterializationWorker:
                     package_counts[package_status] = (
                         package_counts.get(package_status, 0) + 1
                     )
-        if any(getattr(item, "retryable", False) for item in result.results):
+        # A recorded partial run already retains the unavailable underlyers as evidence, so only
+        # those underlyers forgo the slot retry.
+        partially_recorded = frozenset(
+            name for name, _ in (detector or {}).get("unavailable_underlyers", ())
+        ) if status == "RECORDED" else frozenset()
+        retryable = tuple(item for item in result.results if getattr(item, "retryable", False))
+        if partially_recorded:
+            retryable = tuple(item for item in retryable if item.underlyer not in partially_recorded)
+        if retryable:
             self._retry_slot = slot
             self._retry_not_before = now + FAILURE_RETRY_DELAY
             LOGGER.warning(

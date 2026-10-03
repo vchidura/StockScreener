@@ -5,7 +5,7 @@ import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Bell, Clock, 
 import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
 import { usePublishPageContext } from '../layout/pageContext'
 import { getAlertView, type AlertPlanRow } from '../services/stockDiscovery'
-import { alertSort, alertSourceParams, alertTabParams, alertTradeFilters, resolveAlertRoute, tradeAlertModels, tradeAlertStatuses, type AlertView } from './stockAlertNavigation'
+import { alertCombinedResults, alertSort, alertSourceParams, alertTabParams, alertTradeFilters, resolveAlertRoute, tradeAlertModels, tradeAlertStatuses, type AlertView } from './stockAlertNavigation'
 import { alertColumnLayout, alertPlanTiming, alertPublicationFacts, alertRiskAssessment, earliestAlertWindow, unavailableAlertProbability } from './stockAlertPresentation'
 import StockEodReviewPanel from './StockEodReviewPanel'
 import './StockDiscoveryPage.css'
@@ -159,7 +159,7 @@ export default function StockAlertsPage() {
   const filters = alertTradeFilters(params)
   const tradeType = params.get('trade_type') === 'SWING' ? 'SWING' : params.get('trade_type') === 'INTRADAY' ? 'INTRADAY' : undefined
   const args = { source: requestedSource, view, session_date: view === 'open' ? undefined : params.get('session_date') || undefined,
-    trade_type: tradeType, combined: params.has('combined') ? params.get('combined') === 'true' : undefined,
+    trade_type: tradeType, combined: alertCombinedResults(params, requestedSource, view),
     run: view === 'latest' ? params.get('run') || undefined : undefined, search,
     interval: params.get('interval') || undefined, ...filters, sort, descending, offset, limit: 100 }
   const query = useQuery({ queryKey: ['stock-alert-view', args], queryFn: () => getAlertView(args), enabled: view !== 'eod', refetchInterval: requestedSource === 'REPLAY' ? false : 30_000 })
@@ -171,6 +171,7 @@ export default function StockAlertsPage() {
   const displayedRuns = view === 'history' ? data?.runs || [] : view === 'open' ? [] : data?.latest_runs || (data?.run ? [data.run] : [])
   const incompleteCoverage = displayedRuns.some(run => (run.missing ?? 0) > 0 || run.status === 'MISSED_PUBLICATION')
   const dataWarnings = data?.warnings.filter(warning => /stale|missing|unavailable/i.test(warning)) || []
+  const showIncompleteCoverage = incompleteCoverage && view !== 'history'
   const currentSchedules = data?.schedule_streams?.filter(stream => !tradeType || stream.stream === (tradeType === 'SWING' ? 'swing' : 'intraday'))
   const nextWindow = earliestAlertWindow(currentSchedules ?? (data?.combined ? data.strategy_streams?.filter(stream => !tradeType
     || stream.stream === (tradeType === 'SWING' ? 'swing' : 'intraday')) : data?.publication_window_start && data.publication_deadline
@@ -283,9 +284,16 @@ export default function StockAlertsPage() {
       </div>}
     </section>
     {view === 'eod' ? <StockEodReviewPanel params={params} update={update} offset={offset} onSessionContext={setEodSessions} /> : <>
-    <div className="sa-trade-types" role="group" aria-label="Trade type">
-      {([['', 'All'], ['INTRADAY', 'Intraday'], ['SWING', 'Swing']] as const).map(([key, label]) =>
-        <button key={label} type="button" aria-pressed={(tradeType || '') === key} onClick={() => update({ trade_type: key || null, run: null })}>{label}</button>)}
+    <section className="sd-filters sa-filters" aria-label="Alert filters">
+      <label>Stock<input value={params.get('search') || ''} placeholder="Ticker or company" onChange={event => update({ search: event.target.value })} /></label>
+      <label>Direction<select value={filters.direction || ''} onChange={event => update({ direction: event.target.value })}><option value="">All</option><option value="1">Long</option><option value="-1">Short</option></select></label>
+      <label>Trade type<select aria-label="Trade type" value={tradeType || ''} onChange={event => update({ trade_type: event.target.value || null, run: null })}><option value="">All</option><option value="INTRADAY">Intraday</option><option value="SWING">Swing</option></select></label>
+      <label>Model<select value={filters.model || ''} onChange={event => update({ model: event.target.value })}><option value="">All models</option>{tradeAlertModels.map(key => <option key={key} value={key}>{models[key]}</option>)}</select></label>
+      <label>Trigger interval<select value={params.get('interval') || ''} onChange={event => update({ interval: event.target.value })}><option value="">All</option>{['30m', '1h', '1d'].map(interval => <option key={interval}>{interval}</option>)}</select></label>
+      <label>Status<select value={filters.status || ''} onChange={event => update({ status: event.target.value })}><option value="">All</option>{tradeAlertStatuses.map(state => <option key={state} value={state}>{readable(state)}</option>)}</select></label>
+    </section>
+    <div className="sa-results-heading">
+      <span role="status" aria-label="Matching alerts"><strong>{query.isLoading ? 'Loading' : data?.total ?? 'N/A'}</strong> {data?.total === 1 ? 'alert' : 'alerts'}</span>
       {view === 'open' && <span>All retained open, pending and unresolved positions</span>}
       {source === 'SHADOW' && (retainedDataStale || nextWindow || skippedWindow || scheduleWarnings.length > 0) && <span className="sa-schedule" role="status">
         {retainedDataStale && <span className="sa-schedule__stale"><AlertTriangle size={13} />Retained data stale</span>}
@@ -295,16 +303,6 @@ export default function StockAlertsPage() {
         {windowOverdue && !skippedWindow && <strong className="sa-schedule__warning">Completion unverified</strong>}
         {scheduleWarnings.map(stream => <strong key={stream.stream} className="sa-schedule__warning">{stream.label}: {stream.status === 'OVERDUE' ? 'window overdue' : 'window unavailable'}</strong>)}
       </span>}
-    </div>
-    <section className="sd-filters sa-filters" aria-label="Alert filters">
-      <label>Stock<input value={params.get('search') || ''} placeholder="Ticker or company" onChange={event => update({ search: event.target.value })} /></label>
-      <label>Direction<select value={filters.direction || ''} onChange={event => update({ direction: event.target.value })}><option value="">All</option><option value="1">Long</option><option value="-1">Short</option></select></label>
-      <label>Model<select value={filters.model || ''} onChange={event => update({ model: event.target.value })}><option value="">All models</option>{tradeAlertModels.map(key => <option key={key} value={key}>{models[key]}</option>)}</select></label>
-      <label>Trigger interval<select value={params.get('interval') || ''} onChange={event => update({ interval: event.target.value })}><option value="">All</option>{['30m', '1h', '1d'].map(interval => <option key={interval}>{interval}</option>)}</select></label>
-      <label>Status<select value={filters.status || ''} onChange={event => update({ status: event.target.value })}><option value="">All</option>{tradeAlertStatuses.map(state => <option key={state} value={state}>{readable(state)}</option>)}</select></label>
-    </section>
-    <div className="sa-results-heading">
-      <span role="status" aria-label="Matching alerts"><strong>{query.isLoading ? 'Loading' : data?.total ?? 'N/A'}</strong> {data?.total === 1 ? 'alert' : 'alerts'}</span>
       <details key={`${source}:${view}:${data?.session || ''}`} className="sa-run-details">
         <summary>Run details</summary>
         <div className="sa-run-content">
@@ -332,7 +330,7 @@ export default function StockAlertsPage() {
         </div>
       </details>
     </div>
-    {(incompleteCoverage || dataWarnings.length > 0) && <div className="sa-data-warning" role="note"><AlertTriangle size={14} /><span>{incompleteCoverage ? 'Some alert inputs were unavailable at publication time. ' : ''}{dataWarnings.join(' / ')}</span></div>}
+    {(showIncompleteCoverage || dataWarnings.length > 0) && <div className="sa-data-warning" role="note"><AlertTriangle size={14} /><span>{showIncompleteCoverage ? 'Some alert inputs were unavailable at publication time. ' : ''}{dataWarnings.join(' / ')}</span></div>}
     {query.isError && <div className="sd-notice" role="alert"><AlertTriangle size={16} />Alert view unavailable<button onClick={() => void query.refetch()}>Retry</button>{params.get('session_date') && <button onClick={() => update({ session_date: null, run: null })}>Latest session</button>}</div>}
     <section id="sa-results" role="tabpanel" aria-labelledby={`sa-${view}`} className="sd-table-panel">
       {query.isLoading ? <div className="sd-empty" role="status">Loading retained alerts...</div> : query.isError ? null : !rows.length ? <div className="sd-empty"><Bell size={24} /><strong>{data?.status === 'WAITING_FOR_PUBLICATION' ? 'Waiting for the next forward publication' : data?.status === 'AWAITING_PUBLICATION' ? source === 'SHADOW' ? 'No shadow publications yet' : 'Awaiting retained publications' : !data?.runs.length ? view === 'latest' ? 'No current-session alerts' : view === 'history' && data?.withheld_run ? 'No earlier runs for this session' : 'No publication recorded for this session' : view === 'latest' && data?.run?.selected === 0 ? 'No new alerts in this publication' : view === 'history' && data?.runs.every(run => run.selected === 0) ? data?.withheld_run ? 'No alerts in earlier runs' : 'No alerts published for this session' : view === 'latest' && tradeType ? `No ${tradeType.toLowerCase()} alerts in this run` : 'No matching alerts'}</strong>{view === 'latest' && !data?.runs.length && <span>No publication recorded for this session.</span>}{data?.next_publication_at && <span>Next publication {time(data.next_publication_at)} ET</span>}{source === 'SHADOW' && data?.status === 'AWAITING_PUBLICATION' && <button type="button" className="sa-history-action" onClick={() => setParams(alertSourceParams('REPLAY', 'history'))}><History size={16} />View backtested history</button>}</div> :

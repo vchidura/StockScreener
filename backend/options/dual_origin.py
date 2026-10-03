@@ -280,7 +280,7 @@ class SignalDecision(Contract):
             or {gate.gate_id for gate in self.gates} != {"TREND_SLOPE_1d", "TREND_SLOPE_1h", "TREND_SLOPE_30m", "UNDERLYING_LIQUIDITY_EVIDENCE"}
         ):
             raise ValueError("O1 confirmation requires exact stock gates")
-        if self.detector_id in ("S1", "S2"):
+        if self.detector_id in ("S1", "S2") and self.schema_version != "dual_origin_signal_decision_v5":
             if self.stock_source_policy_sha256 is None:
                 raise ValueError("S1 requires exact stock source policy")
             policy_type = StockFirstPolicy if self.detector_id == "S1" else StockResumptionPolicy
@@ -297,6 +297,23 @@ class SignalDecision(Contract):
 class ResumptionSignalDecision(SignalDecision):
     schema_version: Literal["dual_origin_signal_decision_v2"] = "dual_origin_signal_decision_v2"
     detector_id: Literal["S2"] = "S2"
+
+
+class CanonicalStockSignalDecision(SignalDecision):
+    schema_version: Literal["dual_origin_signal_decision_v5"] = "dual_origin_signal_decision_v5"
+    detector_id: Literal["S1", "S2"]
+
+    @model_validator(mode="after")
+    def validate_canonical_stock_policy(self):
+        from options.stock_bar_detection import STOCK_BAR_SIGNAL_POLICY, STOCK_BAR_SIGNAL_POLICY_SHA256
+
+        if (self.origin_detector_version != STOCK_BAR_SIGNAL_POLICY["version"]
+                or self.origin_policy_sha256 != STOCK_BAR_SIGNAL_POLICY_SHA256
+                or self.stock_source_policy_sha256 != STOCK_BAR_SIGNAL_POLICY_SHA256
+                or self.confirmation_policy_version != "canonical_stock_option_participation_v1"
+                or self.confirmation_basis != "EXACT_BOUGHT_CONTRACT_MATCHING_STOCK_DIRECTION"):
+            raise ValueError("unsupported canonical stock-first policy")
+        return self
 
 
 class IntradaySignalDecision(SignalDecision):
@@ -361,10 +378,72 @@ def assess_options_intraday(source, stock, *, direction, market_cutoff, decision
         reasons=observation.reasons, gates=observation.gates)
 
 
+def assess_options_credit_intraday(source, stock, *, direction, market_cutoff, decision_at):
+    decision = assess_options_intraday(source, stock, direction=direction,
+        market_cutoff=market_cutoff, decision_at=decision_at)
+    if (decision.disposition != "UNMATCHED"
+            or decision.reasons != ("ACTIVITY_CONTRACT_NOT_MATCHED_TO_THESIS",)):
+        return decision
+    return LatestCompletedSignalDecision.model_validate({**decision.model_dump(),
+        "disposition": "CONFIRMED", "reasons": ()})
+
+
+class CanonicalTrendSignalDecision(SignalDecision):
+    intraday_confirmation: ClassVar[bool] = True
+    schema_version: Literal["dual_origin_signal_decision_v6"] = "dual_origin_signal_decision_v6"
+    detector_id: Literal["O1"] = "O1"
+
+    @model_validator(mode="after")
+    def validate_canonical_trend_policy(self):
+        from options.intraday_participation import CANONICAL_TREND_ALIGNMENT_POLICY, CANONICAL_TREND_SOURCE_POLICY
+
+        policy = CANONICAL_TREND_ALIGNMENT_POLICY
+        if (self.origin_detector_version != ACTIVITY_POLICY.version or self.origin_policy_sha256 != ACTIVITY_POLICY.sha256
+                or self.confirmation_policy_version != policy.version or self.confirmation_policy_sha256 != policy.sha256
+                or self.confirmation_basis != policy.confirmation_basis
+                or self.stock_source_policy_sha256 not in (None, CANONICAL_TREND_SOURCE_POLICY.sha256)):
+            raise ValueError("unsupported O1 canonical-trend decision policy")
+        if self.disposition == "CONFIRMED" and (len(self.gates) != 2
+                or {gate.gate_id for gate in self.gates} != {"TREND_SLOPE_30m", "UNDERLYING_LIQUIDITY_EVIDENCE"}
+                or any(gate.verdict != "PASS" for gate in self.gates)):
+            raise ValueError("O1 canonical-trend confirmation requires exact stock gates")
+        return self
+
+
+def assess_options_canonical_trend(source, stock, *, direction, market_cutoff, decision_at):
+    from options.intraday_participation import (
+        CANONICAL_TREND_ALIGNMENT_POLICY, CANONICAL_TREND_SOURCE_POLICY, assess_canonical_trend,
+    )
+
+    finding, disposition, reasons, gates, valid_until = assess_canonical_trend(source, stock,
+        direction=direction, market_cutoff=market_cutoff, decision_at=decision_at)
+    policy = CANONICAL_TREND_ALIGNMENT_POLICY
+    return CanonicalTrendSignalDecision(detector_id="O1", origin="OPTIONS_FIRST", origin_id=str(finding.episode_id),
+        origin_detector_version=ACTIVITY_POLICY.version, origin_policy_sha256=ACTIVITY_POLICY.sha256,
+        confirmation_policy_version=policy.version, confirmation_policy_sha256=policy.sha256,
+        confirmation_basis=policy.confirmation_basis, security_id=source.security_id, underlyer=source.underlyer,
+        direction=direction, market_cutoff=market_cutoff, decision_at=decision_at, valid_until=valid_until,
+        stock_source_sha256=stock.sha256 if stock is not None else None,
+        stock_source_policy_sha256=CANONICAL_TREND_SOURCE_POLICY.sha256 if stock is not None else None,
+        **_activity_fields(source, finding), disposition=disposition, reasons=reasons, gates=gates)
+
+
+def assess_options_credit_canonical_trend(source, stock, *, direction, market_cutoff, decision_at):
+    decision = assess_options_canonical_trend(source, stock, direction=direction,
+        market_cutoff=market_cutoff, decision_at=decision_at)
+    if (decision.disposition != "UNMATCHED"
+            or decision.reasons != ("ACTIVITY_CONTRACT_NOT_MATCHED_TO_THESIS",)):
+        return decision
+    return CanonicalTrendSignalDecision.model_validate({**decision.model_dump(),
+        "disposition": "CONFIRMED", "reasons": ()})
+
+
 def load_signal_decision(value):
     contracts = {"dual_origin_signal_decision_v1": SignalDecision, "dual_origin_signal_decision_v2": ResumptionSignalDecision,
         "dual_origin_signal_decision_v3": IntradaySignalDecision,
-        "dual_origin_signal_decision_v4": LatestCompletedSignalDecision}
+        "dual_origin_signal_decision_v4": LatestCompletedSignalDecision,
+        "dual_origin_signal_decision_v5": CanonicalStockSignalDecision,
+        "dual_origin_signal_decision_v6": CanonicalTrendSignalDecision}
     contract = contracts.get(value.schema_version)
     if contract is None:
         raise ValueError("unsupported signal decision schema")
@@ -479,6 +558,53 @@ def assess_stock_first(
         decision_at=decision_at, valid_until=min(setup.source.valid_until, finding.valid_until) if finding else setup.source.valid_until,
         stock_source_sha256=setup.sha256, stock_source_policy_sha256=trusted_source_policy.sha256,
         **_activity_fields(source, finding), disposition=disposition, reasons=tuple(sorted(set(reasons))))
+
+
+def assess_canonical_stock_first(signal, source, *, market_cutoff, decision_at, calendar=None):
+    import hashlib
+    from options.stock_bar_detection import CanonicalStockSignal, STOCK_BAR_SIGNAL_POLICY_SHA256
+
+    signal = CanonicalStockSignal.model_validate_json(signal.canonical_json())
+    finding = detect_option_participation(source, market_cutoff=market_cutoff,
+        decision_at=decision_at, calendar=calendar) if source else None
+    reasons = []
+    disposition = "CONFIRMED"
+    if (market_cutoff.utcoffset() is None or decision_at.utcoffset() is None
+            or market_cutoff > decision_at or signal.received_at > decision_at
+            or signal.market_time > market_cutoff or decision_at >= signal.valid_until):
+        reasons.append("STOCK_TRIGGER_NOT_AVAILABLE_AT_DECISION")
+        disposition = "UNAVAILABLE"
+    if source is None:
+        reasons.append("OPTION_PARTICIPATION_UNAVAILABLE")
+        disposition = "UNAVAILABLE"
+    elif source.security_id != signal.security_id or source.underlyer != signal.underlyer:
+        reasons.append("CROSS_MARKET_SECURITY_MISMATCH")
+        disposition = "UNAVAILABLE"
+    elif finding.disposition != "DETECTED":
+        reasons.extend(finding.reasons)
+        if disposition != "UNAVAILABLE":
+            disposition = "UNAVAILABLE" if finding.disposition == "UNAVAILABLE" else "UNMATCHED"
+    elif source.contract_type != ("CALL" if signal.direction == 1 else "PUT"):
+        reasons.append("ACTIVITY_CONTRACT_NOT_MATCHED_TO_THESIS")
+        if disposition != "UNAVAILABLE":
+            disposition = "UNMATCHED"
+    policy_hash = hashlib.sha256(canonical_json({
+        "version": "canonical_stock_option_participation_v1",
+        "activity_ratio": 3,
+        "contract_binding": "EXACT_BOUGHT_LEG",
+    }).encode("ascii")).hexdigest()
+    return CanonicalStockSignalDecision(detector_id=signal.detector_id, origin="STOCK_FIRST",
+        origin_id=str(signal.signal_id), origin_detector_version=signal.policy_version,
+        origin_policy_sha256=STOCK_BAR_SIGNAL_POLICY_SHA256,
+        confirmation_policy_version="canonical_stock_option_participation_v1",
+        confirmation_policy_sha256=policy_hash,
+        confirmation_basis="EXACT_BOUGHT_CONTRACT_MATCHING_STOCK_DIRECTION",
+        security_id=signal.security_id, underlyer=signal.underlyer, direction=signal.direction,
+        market_cutoff=market_cutoff, decision_at=decision_at,
+        valid_until=min(signal.valid_until, finding.valid_until) if finding else signal.valid_until,
+        stock_source_sha256=signal.sha256, stock_source_policy_sha256=STOCK_BAR_SIGNAL_POLICY_SHA256,
+        **_activity_fields(source, finding), disposition=disposition,
+        reasons=tuple(sorted(set(reasons))))
 
 
 class CandidateHandoffPolicy(Contract):
@@ -722,9 +848,18 @@ class QualifiedTechnicalPackage(QualifiedDualOriginPackage):
     detector_id: Literal["O1", "S1", "S2"]
 
 
+class QualifiedCanonicalStockPackage(QualifiedTechnicalPackage):
+    schema_version: Literal["dual_origin_qualified_package_v4"] = "dual_origin_qualified_package_v4"
+    detector_id: Literal["S1", "S2"]
+    recurrence_contract_id: int = Field(strict=True, gt=0)
+    confirmation_timeframe: Literal["5m", "15m", "30m", "1h"]
+
+
 def load_qualified_package(value):
     contracts = {"dual_origin_qualified_package_v1": QualifiedDualOriginPackage,
-        "dual_origin_qualified_package_v2": QualifiedResumptionPackage, "dual_origin_qualified_package_v3": QualifiedTechnicalPackage}
+        "dual_origin_qualified_package_v2": QualifiedResumptionPackage,
+        "dual_origin_qualified_package_v3": QualifiedTechnicalPackage,
+        "dual_origin_qualified_package_v4": QualifiedCanonicalStockPackage}
     contract = contracts.get(value.schema_version)
     if contract is None:
         raise ValueError("unsupported qualified package schema")
@@ -736,6 +871,7 @@ def qualify_dual_origin_package(
     snapshots, references, raw_bars, raw_bar_created_ats, source_received_at,
     planned_entry_at, entry_deadline, exit_deadline, entry_limit, valuation_policy,
     management_policy=None, setup=None, trusted_source_policy=None, stock_first_policy=None,
+    canonical_stock_signal=None,
     event_detail=None, technical_evidence=None, technical_source_policy_sha256=None,
 ):
     import hashlib
@@ -753,8 +889,14 @@ def qualify_dual_origin_package(
     if decision.detector_id == "O1":
         if isinstance(decision, IntradaySignalDecision):
             raise ValueError("archived O1 v2 decisions cannot be requalified under the v3 runtime")
-        assessor = assess_options_intraday if isinstance(decision, LatestCompletedSignalDecision) else assess_options_first
+        assessor = (assess_options_canonical_trend if isinstance(decision, CanonicalTrendSignalDecision)
+            else assess_options_intraday if isinstance(decision, LatestCompletedSignalDecision) else assess_options_first)
         recomputed = assessor(source, stock, direction=decision.direction,
+            market_cutoff=decision.market_cutoff, decision_at=decision.decision_at)
+    elif isinstance(decision, CanonicalStockSignalDecision):
+        if canonical_stock_signal is None:
+            raise ValueError("canonical S1/S2 qualification requires exact stock signal")
+        recomputed = assess_canonical_stock_first(canonical_stock_signal, source,
             market_cutoff=decision.market_cutoff, decision_at=decision.decision_at)
     else:
         if setup is None or trusted_source_policy is None or stock_first_policy is None:
@@ -771,9 +913,13 @@ def qualify_dual_origin_package(
             <= entry_deadline < min(candidate.valid_until, decision.valid_until)
             or not planned_entry_at < exit_deadline):
         raise ValueError("qualification source/entry/exit clocks exceed original validity")
-    stock_available_at = stock.available_at if decision.detector_id == "O1" else setup.source.received_at
+    stock_available_at = (stock.available_at if decision.detector_id == "O1" else
+        canonical_stock_signal.received_at if isinstance(decision, CanonicalStockSignalDecision)
+        else setup.source.received_at)
     earliest_market_time = min(source.market_time, candidate.market_data_time,
-        stock.market_time if decision.detector_id == "O1" else setup.source.market_time)
+        stock.market_time if decision.detector_id == "O1" else
+        canonical_stock_signal.market_time if isinstance(decision, CanonicalStockSignalDecision)
+        else setup.source.market_time)
     if stock_available_at > source_received_at:
         raise ValueError("qualification predates the stock evidence receipt")
     if (not security.active or security.security_id != decision.security_id or security.ticker != candidate.underlyer
@@ -805,11 +951,20 @@ def qualify_dual_origin_package(
     if exit_deadline >= expires_at:
         raise ValueError("qualification exit must precede every leg expiration")
     if decision.detector_id in ("S1", "S2"):
-        if (source_session != setup.source.market_time.astimezone(ZoneInfo("America/New_York")).date()
+        if isinstance(decision, CanonicalStockSignalDecision):
+            signal = canonical_stock_signal
+            if (source_session != signal.session_date
                 or not calendar.next_session_open(calendar.previous_session(source_session)) <= planned_entry_at
                 < exit_deadline <= calendar.session_close(source_session)
-                or any(not setup.source.market_time <= row.spot_at <= candidate.market_data_time for row in basis)
-                or entry_gate(setup.candidate, float(basis[0].spot)) is not None):
+                or any(not signal.market_time <= row.spot_at <= candidate.market_data_time for row in basis)
+                or decision.direction * (basis[0].spot - signal.stop) <= 0
+                or decision.direction * (signal.target - basis[0].spot) <= 0):
+                raise ValueError("canonical stock-first qualification requires intact prior-close geometry")
+        elif (source_session != setup.source.market_time.astimezone(ZoneInfo("America/New_York")).date()
+            or not calendar.next_session_open(calendar.previous_session(source_session)) <= planned_entry_at
+            < exit_deadline <= calendar.session_close(source_session)
+            or any(not setup.source.market_time <= row.spot_at <= candidate.market_data_time for row in basis)
+            or entry_gate(setup.candidate, float(basis[0].spot)) is not None):
             raise ValueError("stock-first qualification requires original same-session trigger geometry and exit")
     candidate_record = asdict(candidate)
     candidate_record["underlying"] = candidate_record.pop("underlyer")
@@ -842,7 +997,17 @@ def qualify_dual_origin_package(
         if technical_evidence.market_time > decision.market_cutoff:
             raise ValueError("technical levels exceed the original decision market cutoff")
         if decision.detector_id in ("S1", "S2"):
-            if (technical_evidence.source_kind != "STOCK_SETUP" or technical_evidence.source_payload_sha256 != setup.sha256
+            if isinstance(decision, CanonicalStockSignalDecision):
+                signal = canonical_stock_signal
+                if (technical_evidence.source_kind != "CANONICAL_STOCK_SIGNAL"
+                        or technical_evidence.source_payload_sha256 != signal.sha256
+                        or technical_evidence.source_policy_sha256 != signal.policy_sha256
+                        or technical_evidence.interval != signal.interval
+                        or set(technical_evidence.source_revision_ids) != {bar.bar_revision_id for bar in signal.bars}
+                        or next(level.price for level in technical_evidence.levels if level.role == "INVALIDATION") != signal.stop
+                        or not any(level.role == "OPPOSING_STRUCTURE" and level.price == signal.target for level in technical_evidence.levels)):
+                    raise ValueError("technical policy must preserve canonical stock signal geometry and source")
+            elif (technical_evidence.source_kind != "STOCK_SETUP" or technical_evidence.source_payload_sha256 != setup.sha256
                     or technical_evidence.source_policy_sha256 != trusted_source_policy.sha256
                     or technical_evidence.interval != setup.candidate.interval
                     or set(map(str, technical_evidence.source_revision_ids)) != set(setup.candidate.revision_ids)
@@ -881,13 +1046,19 @@ def qualify_dual_origin_package(
         raise ValueError("management target exceeds bounded package payoff")
     source_basis_sha256 = hashlib.sha256(_canonical(dict(security=asdict(security),
         lineage=asdict(lineage), activity=source.sha256, legs=[row.model_dump(mode="json") for row in basis],
+        stock_signal=canonical_stock_signal.sha256 if canonical_stock_signal is not None else None,
         source_received_at=source_received_at)).encode("ascii")).hexdigest()
     management_sha256 = hashlib.sha256(_canonical(dict(version=management_version, terms=management)).encode("ascii")).hexdigest()
     recurrence_management = hashlib.sha256(_canonical(dict(version=management_version,
         technical_policy_sha256=technical["policy_sha256"], source_policy_sha256=technical_evidence.source_policy_sha256,
         strategy_name=candidate.strategy_name)).encode("ascii")).hexdigest() if technical else management_sha256
-    recurrence = hashlib.sha256(":".join((handoff.recurrence_sha256, recurrence_management,
-        qualification_policy.sha256)).encode("ascii")).hexdigest()
+    recurrence = (hashlib.sha256(_canonical(dict(version="canonical_stock_contract_recurrence_v1",
+        detector_id=decision.detector_id, contract_id=source.contract_id,
+        direction=decision.direction, expiration_date=source.expiration_date.isoformat(),
+        qualification_policy_sha256=qualification_policy.sha256)).encode("ascii")).hexdigest()
+        if isinstance(decision, CanonicalStockSignalDecision) else
+        hashlib.sha256(":".join((handoff.recurrence_sha256, recurrence_management,
+            qualification_policy.sha256)).encode("ascii")).hexdigest())
     plan = FrozenOptionAlertPlan(_canonical(dict(version="dual_origin_indicative_plan_v2" if technical else "dual_origin_indicative_plan_v1",
         candidate_id=str(candidate.candidate_id), candidate_identity_sha256=candidate.identity_sha256,
         matrix_id=str(candidate.matrix_id), detector_id=decision.detector_id, origin_id=decision.origin_id,
@@ -902,10 +1073,18 @@ def qualify_dual_origin_package(
         indicative_qualification=indicative, event_horizon=event_horizon,
         **(dict(confirmation_policy_version=decision.confirmation_policy_version,
             confirmation_policy_sha256=decision.confirmation_policy_sha256,
-            stock_confirmation=stock.model_dump(mode="json")) if isinstance(decision, LatestCompletedSignalDecision) else {}),
+            stock_confirmation=(canonical_stock_signal.model_dump(mode="json")
+                if isinstance(decision, CanonicalStockSignalDecision) else stock.model_dump(mode="json")))
+            if isinstance(decision, (LatestCompletedSignalDecision, CanonicalStockSignalDecision,
+                CanonicalTrendSignalDecision)) else {}),
         remaining_capabilities=["QUOTE_PAPER", "EXECUTION"], publication_permission=False,
         execution_permission=False, fill=None)))
-    qualified_type = QualifiedTechnicalPackage if technical else QualifiedResumptionPackage if decision.detector_id == "S2" else QualifiedDualOriginPackage
+    qualified_type = (QualifiedCanonicalStockPackage if isinstance(decision, CanonicalStockSignalDecision)
+        else QualifiedTechnicalPackage if technical else QualifiedResumptionPackage
+        if decision.detector_id == "S2" else QualifiedDualOriginPackage)
+    canonical_fields = (dict(recurrence_contract_id=source.contract_id,
+        confirmation_timeframe=canonical_stock_signal.interval)
+        if isinstance(decision, CanonicalStockSignalDecision) else {})
     qualified = qualified_type(handoff_sha256=handoff.sha256, decision_sha256=decision.sha256,
         candidate_id=candidate.candidate_id, candidate_identity_sha256=candidate.identity_sha256,
         matrix_id=candidate.matrix_id, scheduled_cycle=lineage.scheduled_cycle,
@@ -913,5 +1092,5 @@ def qualify_dual_origin_package(
         direction=decision.direction, candidate_rank=candidate.rank, exposure_sha256=handoff.exposure_sha256,
         recurrence_sha256=recurrence, plan_sha256=plan.sha256, source_basis_sha256=source_basis_sha256,
         decision_at=decision.decision_at, entry_deadline=entry_deadline, exit_deadline=exit_deadline,
-        expires_at=expires_at, event_horizon_status=event_horizon["status"])
+        expires_at=expires_at, event_horizon_status=event_horizon["status"], **canonical_fields)
     return qualified, plan

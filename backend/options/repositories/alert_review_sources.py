@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from options.alert_qualification import retained_candidate
+from options.analytics.alert_selection import load_evaluation_evidence
 from .base import PostgresRepository
 
 
@@ -123,7 +124,7 @@ class OptionAlertReviewSourceRepository(PostgresRepository):
             cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             cursor.execute("SET LOCAL statement_timeout = '5s'")
             cursor.execute("SELECT scheduled_cycle FROM option_board_publications "
-                "WHERE selector_version IN ('option_detector_run_v1','option_detector_run_v2') AND status='COMPLETE' "
+                "WHERE selector_version IN ('option_detector_run_v1','option_detector_run_v2','option_detector_run_v3') AND status='COMPLETE' "
                 "AND selection_evidence->>'dataset_id'=%s AND as_of_session=%s "
                 "AND published_at<=%s AND created_at<=%s ORDER BY scheduled_cycle LIMIT 1001",
                 (dataset_id, session_date, as_of, as_of))
@@ -145,7 +146,7 @@ class OptionAlertReviewSourceRepository(PostgresRepository):
             cursor.execute(
                 "SELECT selection_evidence->>'dataset_id' AS dataset_id,as_of_session AS session_date,"
                 "MAX(scheduled_cycle) AS latest_cycle FROM option_board_publications "
-                "WHERE selector_version IN ('option_detector_run_v1','option_detector_run_v2') AND status='COMPLETE' "
+                "WHERE selector_version IN ('option_detector_run_v1','option_detector_run_v2','option_detector_run_v3') AND status='COMPLETE' "
                 "AND as_of_session>=%s AND published_at<=%s AND created_at<=%s "
                 "GROUP BY selection_evidence->>'dataset_id',as_of_session "
                 "ORDER BY as_of_session,dataset_id LIMIT 1001", (start, as_of, as_of),
@@ -161,6 +162,80 @@ class OptionAlertReviewSourceRepository(PostgresRepository):
             session_datasets[row["session_date"].isoformat()] = row["dataset_id"]
         return dict(storage_ready=True, datasets=datasets, dataset_sessions=dataset_sessions,
             sessions=sorted(session_datasets), session_datasets=session_datasets)
+
+    def alert_display_records(self, *, dataset_id, session_date, runs, as_of, detector=None, underlyer=None):
+        runs = tuple(runs)
+        if (not dataset_id or len(dataset_id) > 80 or as_of.utcoffset() is None or not runs
+                or detector not in (None, "O1", "O2", "O3", "S1", "S2")
+                or any(run.dataset_id != dataset_id or run.selected_at > as_of for run in runs)):
+            raise ValueError("alert display lookup requires exact completed runs")
+        run_ids = [run.run_id for run in runs]
+        normalized_underlyer = underlyer.strip().upper() if underlyer else None
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '5s'")
+            identity_params = (dataset_id, session_date, run_ids, as_of, as_of) * 4
+            cursor.execute("""SELECT evaluation_id,payload_sha256,run_id FROM option_detector_evaluations
+                WHERE dataset_id=%s AND session_date=%s AND run_id=ANY(%s::uuid[]) AND selected_at<=%s AND recorded_at<=%s
+                UNION ALL
+                SELECT evaluation_id,payload_sha256,run_id FROM option_o1_indicator_observations
+                WHERE dataset_id=%s AND session_date=%s AND run_id=ANY(%s::uuid[]) AND selected_at<=%s AND recorded_at<=%s
+                UNION ALL
+                SELECT evaluation_id,payload_sha256,run_id FROM option_o3_credit_observations
+                WHERE dataset_id=%s AND session_date=%s AND run_id=ANY(%s::uuid[]) AND selected_at<=%s AND recorded_at<=%s
+                UNION ALL
+                SELECT evaluation_id,payload_sha256,run_id FROM option_stock_setup_indicator_observations
+                WHERE dataset_id=%s AND session_date=%s AND run_id=ANY(%s::uuid[]) AND selected_at<=%s AND recorded_at<=%s""",
+                identity_params)
+            identities_by_run = {}
+            for row in cursor.fetchall():
+                identities_by_run.setdefault(row["run_id"], []).append((row["evaluation_id"], row["payload_sha256"]))
+            if any(tuple(sorted(identities_by_run.get(run.run_id, ()), key=lambda item: str(item[0]))) != run.record_sha256s
+                    for run in runs):
+                raise ValueError("alert display records do not reconcile with completed runs")
+            visible_params = (dataset_id, session_date, run_ids, as_of, as_of) * 2
+            cursor.execute("""SELECT evaluation_id,payload_text,payload_sha256 FROM option_detector_evaluations
+                WHERE dataset_id=%s AND session_date=%s AND run_id=ANY(%s::uuid[])
+                  AND selection_status='SELECTED' AND selected_at<=%s AND recorded_at<=%s
+                UNION ALL
+                SELECT evaluation_id,payload_text,payload_sha256 FROM option_o3_credit_observations
+                WHERE dataset_id=%s AND session_date=%s AND run_id=ANY(%s::uuid[]) AND selected_at<=%s AND recorded_at<=%s
+                ORDER BY evaluation_id LIMIT 5001""", visible_params)
+            payload_rows = cursor.fetchall()
+            cursor.execute("""WITH observations AS (
+                SELECT 'O1'::text AS detector_id,payload_text::jsonb->'observation'->>'underlyer' AS underlyer
+                FROM option_o1_indicator_observations
+                WHERE dataset_id=%s AND session_date=%s AND run_id=ANY(%s::uuid[]) AND selected_at<=%s AND recorded_at<=%s
+                UNION ALL
+                SELECT 'O3'::text,payload_text::jsonb->'observation'->>'underlyer'
+                FROM option_o3_credit_observations
+                WHERE dataset_id=%s AND session_date=%s AND run_id=ANY(%s::uuid[]) AND selected_at<=%s AND recorded_at<=%s
+                UNION ALL
+                SELECT detector_id,payload_text::jsonb->'observation'->>'underlyer'
+                FROM option_stock_setup_indicator_observations
+                WHERE dataset_id=%s AND session_date=%s AND run_id=ANY(%s::uuid[]) AND selected_at<=%s AND recorded_at<=%s
+                UNION ALL
+                SELECT 'O2'::text,payload_text::jsonb->'observation'->>'underlyer'
+                FROM option_detector_evaluations
+                WHERE dataset_id=%s AND session_date=%s AND run_id=ANY(%s::uuid[]) AND selected_at<=%s AND recorded_at<=%s
+                  AND detector_id='O2' AND selection_status='OBSERVATION'
+                  AND payload_text::jsonb->'observation'->>'finding_disposition'='DETECTED'
+            ) SELECT COUNT(*) AS count FROM observations
+              WHERE (%s::text IS NULL OR detector_id=%s) AND (%s::text IS NULL OR underlyer=%s)""",
+                (*identity_params, detector, detector, normalized_underlyer, normalized_underlyer))
+            detected_observations = int(cursor.fetchone()["count"])
+        if len(payload_rows) > 5000:
+            raise ValueError("alert display payload exceeds bound")
+        records = []
+        run_id_set = set(run_ids)
+        for row in payload_rows:
+            record = load_evaluation_evidence(row["payload_text"])
+            if (record.evaluation_id != row["evaluation_id"] or record.sha256 != row["payload_sha256"]
+                    or record.canonical_json() != row["payload_text"] or record.dataset_id != dataset_id
+                    or record.run_id not in run_id_set or record.selected_at > as_of):
+                raise ValueError("alert display evidence identity mismatch")
+            records.append(record)
+        return dict(records=tuple(records), detected_observations=detected_observations)
 
     def original_packages(self, records, *, as_of):
         records = tuple(records)

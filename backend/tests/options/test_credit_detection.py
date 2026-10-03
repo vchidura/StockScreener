@@ -143,10 +143,12 @@ def test_o3_selected_result_moves_from_latest_run_to_day_history():
     later = build_o3_credit_evidence((later_observation,), dataset_id=dataset,
         selected_at=later_observation.decision_at)[0]
     def run(record):
-        return SimpleNamespace(run_id=record.run_id, scheduled_cycle=record.scheduled_cycle,
+        return SimpleNamespace(dataset_id=record.dataset_id, run_id=record.run_id,
+            scheduled_cycle=record.scheduled_cycle,
             selected_at=record.selected_at, market_time=record.scheduled_cycle,
             observed_time=record.selected_at, expected_underlyers=("AAPL",),
             source_matrices=(("AAPL", record.matrix_id),),
+            coverage_status="COMPLETE", partial_coverage=False,
             selection_counts=(("SELECTED", 1), ("REPEAT", 0), ("NOT_SELECTED", 0), ("OBSERVATION", 0)),
             rejections=())
     runs = (run(first), run(later))
@@ -198,6 +200,7 @@ def test_o3_day_history_retains_prior_dataset_after_prospective_cutover():
             scheduled_cycle=record.scheduled_cycle, selected_at=record.selected_at,
             market_time=record.scheduled_cycle, observed_time=record.selected_at,
             expected_underlyers=("AAPL",), source_matrices=(("AAPL", record.matrix_id),),
+            coverage_status="COMPLETE", partial_coverage=False,
             selection_counts=(("SELECTED", 1), ("REPEAT", 0), ("NOT_SELECTED", 0), ("OBSERVATION", 0)),
             rejections=())
     prior_runs = (run(first), run(later))

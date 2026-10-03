@@ -5,7 +5,7 @@ import ts from 'typescript'
 
 const source = readFileSync(new URL('../src/pages/stockAlertNavigation.ts', import.meta.url), 'utf8')
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } })
-const { resolveAlertRoute, alertSourceParams, alertTabParams, alertTradeFilters, alertSort } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`)
+const { resolveAlertRoute, alertCombinedResults, alertSourceParams, alertTabParams, alertTradeFilters, alertSort } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`)
 const presentationSource = readFileSync(new URL('../src/pages/stockAlertPresentation.ts', import.meta.url), 'utf8')
 const presentation = ts.transpileModule(presentationSource, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } })
 const { alertColumnLayout, alertPlanTiming, alertPublicationFacts, alertRiskAssessment, earliestAlertWindow, unavailableAlertProbability } = await import(`data:text/javascript;base64,${Buffer.from(presentation.outputText).toString('base64')}`)
@@ -153,6 +153,13 @@ test('an enrolled forward view keeps Day History in the genuine shadow source', 
   assert.equal(replay.get('session_date'), '2026-08-18')
 })
 
+test('SHADOW Day History reads retained combined results unless explicitly overridden', () => {
+  assert.equal(alertCombinedResults(new URLSearchParams(), 'SHADOW', 'history'), true)
+  assert.equal(alertCombinedResults(new URLSearchParams(), 'SHADOW', 'latest'), undefined)
+  assert.equal(alertCombinedResults(new URLSearchParams(), 'REPLAY', 'history'), undefined)
+  assert.equal(alertCombinedResults(new URLSearchParams('combined=false'), 'SHADOW', 'history'), false)
+})
+
 test('Day History defaults to newest trigger and tab switches clear incompatible sorting', () => {
   const params = new URLSearchParams('source=SHADOW&sort=ticker&ascending=1&search=ABC')
   assert.deepEqual(alertSort(new URLSearchParams(), 'history'), { sort: 'triggered_at', descending: true })
@@ -260,6 +267,20 @@ test('stock alert tables lead with View and Day History uses semantic price colo
   const css = readFileSync(new URL('../src/pages/StockAlertsPage.css', import.meta.url), 'utf8')
   assert.match(css, /\.sa-scroll :is\(th, td\):first-child \{ position: sticky; left: 0;/)
   assert.match(css, /\.sa-trigger-price \{ color: var\(--tm-accent\); font-weight: 700; \}/)
+})
+
+test('stock alert trade type is a filter and history keeps the table scrollbar in view', () => {
+  const page = readFileSync(new URL('../src/pages/StockAlertsPage.tsx', import.meta.url), 'utf8')
+  const filters = page.slice(page.indexOf('<section className="sd-filters sa-filters"'), page.indexOf('<div className="sa-results-heading">'))
+  const order = ['Stock<input', 'Direction<select', 'Trade type<select', 'Model<select'].map(value => filters.indexOf(value))
+  assert.ok(order.every(position => position >= 0))
+  assert.deepEqual([...order].sort((left, right) => left - right), order)
+  assert.match(filters, /aria-label="Trade type"/)
+  assert.doesNotMatch(page, /className="sa-trade-types"|aria-pressed=\{\(tradeType/)
+  assert.match(page, /const showIncompleteCoverage = incompleteCoverage && view !== 'history'/)
+  assert.match(page, /showIncompleteCoverage \? 'Some alert inputs were unavailable at publication time\. '/)
+  const css = readFileSync(new URL('../src/pages/StockAlertsPage.css', import.meta.url), 'utf8')
+  assert.match(css, /\.stock-alerts \.sa-scroll \{ max-height: clamp\(220px, calc\(100dvh - 340px\), 65vh\); \}/)
 })
 
 test('stock alert columns place Hits before probability and Model after risk assessment', () => {

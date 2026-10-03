@@ -1,25 +1,24 @@
 import { useDeferredValue, useEffect, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link, useSearchParams } from 'react-router-dom'
-import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ArrowUpDown, BarChart3, CheckCircle2, Clock, Eye, History, ListFilter, RefreshCw, RotateCcw, Save, ScanSearch, ShieldAlert, Trash2 } from 'lucide-react'
+import { useSearchParams } from 'react-router-dom'
+import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ArrowUpDown, BarChart3, CheckCircle2, Clock, Eye, History, ListFilter, RefreshCw, RotateCcw, Save, ShieldAlert, Trash2 } from 'lucide-react'
 import { usePublishPageContext, type PageContextValue } from '../layout/pageContext'
 import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
 import {
-  getOptionCandidate, getOptionDetectorEvaluations, getOptionDetectorAlerts, getOptionDetectorDatasets, getOptionAlertSchedule, previewOptionAlert,
+  getOptionCandidate, getOptionCurrentAdvancedQuotes, getOptionDetectorEvaluations, getOptionDetectorAlerts, getOptionDetectorDatasets, getOptionAlertSchedule, previewOptionAlert,
   type OptionCurrentMark, type OptionAlertPreviewRequest, type OptionCandidateDetailData, type OptionCandidateLeg,
   type OptionCandidateResearchEvidence, type OptionStockBehaviorGateEvidence,
   type OptionDetectorEvaluationReview, type OptionDetectorAlertReview, type OptionDetectorSort, type OptionDetectorDatasets, type OptionDetectorRunSummary, type OptionLocalSurfaceObservation, type OptionO3CreditObservation,
 } from '../services/api'
 import { Modal } from './ScreenLibrary'
-import { optionContractExpired, optionDetectorSort, optionDetectorSortChange, optionPackageStrategyName, detectorAlertColumns, detectorObservationFieldStates, detectorColumnPresets, detectorViewPreset, readDetectorPresets, writeDetectorPresets, type DetectorViewPreset } from './optionsAlertPresentation'
-import { emptyOptionAlertForm, optionAlertTabParams, optionCandidateBoardFacts, optionLegMarketValues, optionMarketColumns, optionPackagePremium, optionPackagePrice, optionPlanTerms, optionAlertLabel as label, optionAlertMoney as money, optionAlertPercent, optionAlertPreviewRequest, optionAlertTime as time, optionEntryWindow, optionGateTimeframe, optionGateValue, type OptionAlertForm, type OptionAlertView } from './optionsAlertPresentation'
+import { optionContractExpired, optionDetectorSort, optionDetectorSortChange, optionPackageStrategyName, detectorAlertColumns, detectorAlertColumnsForView, detectorObservationFieldStates, detectorColumnPresets, detectorViewPreset, readDetectorPresets, writeDetectorPresets, type DetectorViewPreset } from './optionsAlertPresentation'
+import { emptyOptionAlertForm, optionAlertTabParams, optionCandidateBoardFacts, optionContractSummary, optionLegMarketValues, optionMarketColumns, optionPackagePremium, optionPackagePrice, optionPlanTerms, optionAlertLabel as label, optionAlertMoney as money, optionAlertPercent, optionAlertPreviewRequest, optionAlertTime as time, optionEntryWindow, optionGateTimeframe, optionGateValue, type OptionAlertForm, type OptionAlertView } from './optionsAlertPresentation'
 import './StockDiscoveryPage.css'
 import './StockScreeningPage.css'
 import './OptionsAlertsPage.css'
 
 const pageSize = 50
 const capabilityLabels: Record<string, string> = { OBSERVATION: 'Observation evidence', INDICATIVE: 'Indicative package', QUOTE_PAPER: 'Quote-qualified paper', EXECUTION: 'Execution' }
-const detectorHistoryOnlyColumns = new Set(['current_price', 'price_pnl', 'gross_pnl', 'net_pnl', 'estimated_cost', 'net_return', 'current_mark_time', 'current_mark_status'])
 const markTone = (value: unknown) => { const numeric = Number(value); return !Number.isFinite(numeric) || numeric === 0 ? '' : numeric > 0 ? 'sd-positive' : 'sd-negative' }
 
 function ColumnCells({ columns, values }: { columns: ColumnSpec[]; values: Record<string, ReactNode> }) {
@@ -55,12 +54,11 @@ function detectorCurrentMarkCells(mark: OptionCurrentMark | null, originalNetPre
   expirationDate?: string | null, asOf?: string | null): Record<string, ReactNode> {
   const valid = mark && mark.status !== 'UNAVAILABLE'
   const expired = optionContractExpired(expirationDate, asOf)
-  const packageValue = valid && mark.signed_package_mark != null ? -Number(mark.signed_package_mark) : null
   const shareValue = valid && mark.package_price != null ? -Number(mark.package_price) : null
   const credit = Number(originalNetPremium) > 0
   const amount = (value: number | null) => value == null || !Number.isFinite(value) ? 'Unavailable' : money(credit ? -value : value)
   return {
-    current_price: <span className={markTone(valid ? mark.price_return : null)}>{amount(shareValue)}<small>{amount(packageValue)} / package</small><small>{expired ? 'Last retained mark / Expired contract' : credit ? 'Buy-to-close cost' : 'Sell-to-close value'}</small></span>,
+    current_price: <span className={markTone(valid ? mark.price_return : null)}>{amount(shareValue)}<small>{mark?.market_time ? `As of ${time(mark.market_time)} ET` : 'Timestamp unavailable'}</small></span>,
     price_pnl: <span className={markTone(valid ? mark.price_return : null)} title="Gross marked P/L / absolute original net premium; no fills or stop/target exit simulation">
       {optionAlertPercent(valid ? mark.price_return : null)}<small>{valid ? expired ? 'At last retained mark / Gross' : 'From trigger, gross' : label(mark?.reason || 'CURRENT_MARK_UNAVAILABLE')}</small>
     </span>,
@@ -78,6 +76,15 @@ function Status({ value }: { value: string }) {
   const inactive = ['ELAPSED', 'EXPIRED', 'NOT_APPLICABLE', 'SUPPRESSED'].includes(value)
   const Icon = good ? CheckCircle2 : inactive ? Clock : ShieldAlert
   return <span className={`oa-status ${good ? 'oa-status--good' : inactive ? 'oa-status--muted' : 'oa-status--warn'}`}><Icon size={12} aria-hidden="true" />{label(value)}</span>
+}
+
+function ManagementStatus({ value }: { value: OptionDetectorAlertReview['rows'][number]['management_status'] }) {
+  if (value === 'TARGET_MET') return <div><span className="oa-status oa-status--good"><CheckCircle2 size={12} aria-hidden="true" />Target MET</span><small>First fresh retained mark crossing / Not a fill</small></div>
+  if (value === 'STOP_LOSS_HIT') return <div><span className="oa-status oa-status--warn"><ShieldAlert size={12} aria-hidden="true" />Stop loss Hit</span><small>First fresh retained mark crossing / Not a fill</small></div>
+  if (value === 'EXPIRED') return <div><Status value="EXPIRED" /><small>Last retained mark / Not settlement value</small></div>
+  if (value === 'NOT_APPLICABLE') return <div><Status value="NOT_APPLICABLE" /><small>Indicative / no management rule</small></div>
+  if (value === 'UNAVAILABLE') return <div><Status value="UNAVAILABLE" /><small>Terminal status storage unavailable</small></div>
+  return <div><Status value="OPEN" /><small>No terminal crossing recorded</small></div>
 }
 
 function Notice({ children, retry }: { children: ReactNode; retry?: () => void }) {
@@ -185,6 +192,8 @@ function CandidateDetail({ candidateId, close }: { candidateId: string; close: (
   const preview = useQuery({ queryKey: ['option-alert-preview', candidateId, submission.request, submission.revision], queryFn: () => previewOptionAlert(candidateId, submission.request), staleTime: 0, refetchOnMount: 'always', retry: false, refetchOnWindowFocus: false })
   const data = detail.data?.available ? detail.data.data : undefined
   const candidate = data?.candidate
+  const contractIds = data?.legs.map(leg => leg.contract_id) || []
+  const currentQuotes = useQuery({ queryKey: ['option-current-advanced-quotes', contractIds], queryFn: () => getOptionCurrentAdvancedQuotes(contractIds), enabled: contractIds.length > 0, staleTime: 0, retry: false, refetchOnWindowFocus: false })
   const assessment = preview.data?.available ? preview.data.data : undefined
   const dirty = JSON.stringify(form) !== submission.form
   const edit = (field: keyof OptionAlertForm, value: string) => { setForm(previous => ({ ...previous, [field]: value })); setFormError('') }
@@ -206,6 +215,7 @@ function CandidateDetail({ candidateId, close }: { candidateId: string; close: (
       <div className="oa-detail-heading"><div><h3>{candidate.underlying} <span>{label(candidate.structure_type)}</span></h3><p>{candidate.display_name || label(candidate.strategy_name)} <span className="oa-muted">/ {candidate.strategy_version}</span></p></div><Status value={candidate.status} /></div>
       <dl className="oa-facts"><div><dt>Source market time (ET)</dt><dd>{time(candidate.market_data_time)}</dd></div><div><dt>Originally observed (ET)</dt><dd>{time(candidate.observed_time)}</dd></div><div><dt>Original entry deadline (ET)</dt><dd>{time(candidate.valid_until)}</dd></div><div><dt>Entry window</dt><dd><Status value={optionEntryWindow(candidate.valid_until)} /></dd></div></dl>
       <section aria-label="Detector category and structure"><h3>Discovery identity</h3><dl className="oa-facts"><div><dt>Detector</dt><dd>{data?.research_evidence?.detector.display_name || candidate.display_name}<small>{data?.research_evidence?.detector.id || candidate.strategy_name}</small></dd></div><div><dt>Category</dt><dd>{(data?.research_evidence?.category_ids || candidate.persona_tags).map(label).join(', ') || 'Unavailable'}</dd></div><div><dt>Structure</dt><dd>{label(data?.research_evidence?.structure || candidate.structure_type)}</dd></div><div><dt>Output</dt><dd>{label(data?.research_evidence?.detector.output_kind || (candidate.candidate_kind === 'RESEARCH_ONLY' ? 'OBSERVATION' : 'STRUCTURED_PACKAGE'))}</dd></div></dl></section>
+      {candidate.candidate_kind !== 'RESEARCH_ONLY' && <section aria-label="Current Advanced quotes"><div className="oa-section-heading"><h3>Current Advanced quotes</h3><button type="button" className="oa-icon" title="Refresh stored Advanced quotes" aria-label="Refresh stored Advanced quotes" disabled={currentQuotes.isFetching} onClick={() => { void currentQuotes.refetch() }}><RefreshCw size={15} /></button></div>{currentQuotes.isFetching && <p className="oa-muted" role="status">Reading stored quotes...</p>}{currentQuotes.data?.available ? <dl className="oa-facts">{currentQuotes.data.data.quotes.map(quote => <div key={quote.contract_id}><dt>{quote.contract_ticker}</dt><dd>{money(quote.bid)} / {money(quote.ask)}<small>{time(quote.quote_time)} ET</small></dd></div>)}</dl> : <Notice>{label(currentQuotes.data?.reason || 'ADVANCED_QUOTES_UNAVAILABLE')}</Notice>}<p className="oa-permission"><ShieldAlert size={14} aria-hidden="true" />Stored stream state only / No provider fetch / No execution permission</p></section>}
       {candidate.candidate_kind === 'RESEARCH_ONLY' ? <section aria-label="Observation evidence"><h3>Observation output</h3><p className="oa-muted">{candidate.source_contract_ticker || 'Source contract unavailable'} / No structured package</p><Rules values={candidate.primary_evidence} /></section> : <section aria-label="Package economics"><h3>Indicative structured package</h3><dl className="oa-facts"><div><dt>Original package price / share</dt><dd><PackagePrice netPremium={candidate.net_premium} legs={data?.legs || []} /></dd></div></dl><Legs rows={data?.legs || []} /><Economics values={candidate as unknown as Record<string, unknown>} /></section>}
       <StockBehaviorEvidence evidence={data?.research_evidence} />
       {candidate.candidate_kind !== 'RESEARCH_ONLY' && <><PackageEvidence evidence={data?.research_evidence} /><ScenarioEvidence rows={data?.scenarios || []} /></>}
@@ -263,38 +273,9 @@ function DetectorSortHeader({ title, field, params, update }: {
   </th>
 }
 
-function OptionsAlertWindow({ dataset }: { dataset: string | null }) {
-  const query = useQuery({ queryKey: ['option-alert-schedule'], queryFn: getOptionAlertSchedule, retry: false, refetchInterval: 30_000 })
-  const schedule = query.data?.available ? query.data.data : undefined
-  if (schedule && dataset && schedule.dataset_id !== dataset) return null
-  const overdue = !!schedule && Date.parse(schedule.window_end) < Date.now()
-  const warning = query.isError || query.data && !query.data.available || schedule?.warning || overdue
-  const attempts = schedule?.evaluation_attempts?.available ? schedule.evaluation_attempts.attempts : []
-  const latestAttempt = attempts[attempts.length - 1]
-  const latestFailure = [...attempts].reverse().find(attempt => attempt.status === 'FAILED')
-  return <div className={`oa-alert-window${warning ? ' oa-alert-window--warning' : ''}`} role="status" aria-label="Options alert window">
-    {warning ? <AlertTriangle size={14} /> : <Clock size={14} />}
-    {schedule ? <>
-      <strong title="Expected delayed worker check window; completion depends on retained inputs and processing.">{overdue ? 'Alert window overdue' : 'Next alert window'} {time(schedule.window_start)}-{time(schedule.window_end)} ET</strong>
-      {schedule.unpublished_windows > 0 && <strong>{schedule.unpublished_windows} elapsed {schedule.unpublished_windows === 1 ? 'window' : 'windows'} without recorded completion; latest {time(schedule.last_unpublished_cycle)} ET</strong>}
-      {latestFailure && <strong className="oa-attempt-status" role="alert" aria-label="Detector evaluation failure">
-        Evaluation failed: {time(latestFailure.scheduled_cycle)} ET run / {latestFailure.reason === 'DETECTOR_SOURCE_TIMEOUT' ? 'Source query timed out' : label(latestFailure.reason || 'DETECTOR_EVALUATION_FAILED')}
-        {' / '}Failed at {time(latestFailure.finished_at)} ET. No completed alert result for this run.
-      </strong>}
-      {latestAttempt && latestAttempt !== latestFailure && <span className="oa-attempt-status" aria-label="Detector attempt status">
-        {latestAttempt.status === 'RUNNING' ? 'Run in progress' : 'Evaluation completion unverified'}: {time(latestAttempt.scheduled_cycle)} ET
-      </span>}
-      {schedule.evaluation_attempts && !schedule.evaluation_attempts.available && schedule.unpublished_windows > 0 && <span>Evaluation diagnostics unavailable</span>}
-      {!warning && schedule.status === 'DUE' && <span>Awaiting run completion</span>}
-    </> : <strong>{query.isPending ? 'Loading alert window...' : 'Alert window unavailable'}</strong>}
-  </div>
-}
-
-
-function DetectorRunDetails({ runs }: { runs: OptionDetectorRunSummary[] }) {
+function DetectorRunTable({ runs }: { runs: OptionDetectorRunSummary[] }) {
   if (!runs.length) return null
-  return <details className="oa-provenance"><summary>Completed runs and exclusions ({runs.length})</summary>
-    <div className="sd-table-scroll" tabIndex={0} role="region" aria-label="Detector run publication history"><table>
+  return <div className="sd-table-scroll" tabIndex={0} role="region" aria-label="Detector run publication history"><table>
       <thead><tr><th>Scheduled run (ET)</th><th>Published (ET)</th><th>Source watermark (ET)</th><th>Coverage</th><th>New alerts</th><th title="Counts use different units: packages, stock windows or surface points. They are not an additive funnel.">Recorded exclusions</th></tr></thead>
       <tbody>{[...runs].reverse().map(run => <tr key={run.run_id}>
         <td>{time(run.scheduled_cycle)}</td><td>{time(run.published_at)}</td><td>{time(run.market_time)}</td>
@@ -302,9 +283,22 @@ function DetectorRunDetails({ runs }: { runs: OptionDetectorRunSummary[] }) {
         <td>{Object.entries(run.rejections).filter(([, count]) => count > 0).map(([reason, count]) => <div key={reason} title={reason}>{label(reason)}: {count}</div>)}</td>
       </tr>)}</tbody>
     </table></div>
-  </details>
 }
 
+function DetectorRunDetails({ runs }: { runs: OptionDetectorRunSummary[] }) {
+  if (!runs.length) return null
+  return <details className="oa-provenance"><summary>Completed runs and exclusions ({runs.length})</summary><DetectorRunTable runs={runs} /></details>
+}
+
+function DetectorVersionControl({ data, params, update }: {
+  data?: OptionDetectorDatasets; params: URLSearchParams; update: (values: Record<string, string | null>) => void;
+}) {
+  const explicit = params.get('evaluation_dataset')
+  return <><label>Results version<select aria-label="Results version" value={explicit || ''} onChange={event => update({ evaluation_dataset: event.target.value, session_date: null, offset: null })}>
+    <option value="">Current five-model results</option>
+    {data?.datasets.map(value => <option key={value} value={value}>{value === data.current_dataset_id ? `Current: ${value}` : value}</option>)}
+  </select></label><code>{explicit || data?.default_dataset_id || 'No configured results version'}</code></>
+}
 
 function DetectorResultVersion({ data, params, update }: {
   data?: OptionDetectorDatasets; params: URLSearchParams; update: (values: Record<string, string | null>) => void;
@@ -312,10 +306,20 @@ function DetectorResultVersion({ data, params, update }: {
   const explicit = params.get('evaluation_dataset')
   const current = !explicit || explicit === data?.current_dataset_id
   return <details className="oa-result-version"><summary>{current ? 'Current models' : 'Archived results'} / Results version</summary>
-    <label>Results version<select aria-label="Results version" value={explicit || ''} onChange={event => update({ evaluation_dataset: event.target.value, session_date: null, offset: null })}>
-      <option value="">Current five-model results</option>
-      {data?.datasets.map(value => <option key={value} value={value}>{value === data.current_dataset_id ? `Current: ${value}` : value}</option>)}
-    </select></label><code>{explicit || data?.default_dataset_id || 'No configured results version'}</code>
+    <DetectorVersionControl data={data} params={params} update={update} />
+  </details>
+}
+
+function DetectorResultsDisclosure({ datasets, review, params, update }: {
+  datasets?: OptionDetectorDatasets; review?: OptionDetectorAlertReview; params: URLSearchParams;
+  update: (values: Record<string, string | null>) => void;
+}) {
+  const explicit = params.get('evaluation_dataset')
+  const current = !explicit || explicit === datasets?.current_dataset_id
+  return <details className="oa-result-version oa-results-disclosure"><summary>{current ? 'Current models' : 'Archived results'} / Results version / Runs and exclusions ({review?.runs.length || 0})</summary>
+    <div className="oa-results-disclosure__content"><DetectorVersionControl data={datasets} params={params} update={update} />
+      {review?.run && <dl className="oa-results-facts"><div><dt>Scheduled run (ET)</dt><dd>{time(review.run.scheduled_cycle)}</dd></div><div><dt>Published (ET)</dt><dd>{time(review.run.published_at)}</dd></div><div><dt>Coverage</dt><dd>{review.run.covered_underlyings}/{review.run.expected_underlyings}</dd></div><div><dt>Read as of (ET)</dt><dd>{time(review.as_of)}</dd></div></dl>}
+      <DetectorRunTable runs={review?.runs || []} /></div>
   </details>
 }
 
@@ -431,16 +435,19 @@ function DetectorAlertSidecar({ row, asOf, close, openCandidate }: { row: Detect
   </Modal>
 }
 
-function DetectorAlertsPanel({ view, params, update, offset, onSessionContext }: {
+function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, tabs }: {
   view: 'behavior' | 'day_history'; params: URLSearchParams;
   update: (values: Record<string, string | null>) => void; offset: number;
   onSessionContext: (value: NonNullable<PageContextValue['alertSessions']>) => void;
+  tabs: ReactNode;
 }) {
   const queryClient = useQueryClient()
-  const preferences = useColumnPreferences('option-detector-alerts-v8', detectorAlertColumns)
+  const preferenceColumns = detectorAlertColumnsForView(view)
+  const preferenceKey = view === 'behavior' ? 'option-detector-alerts-latest-v1' : 'option-detector-alerts-history-v1'
+  const preferences = useColumnPreferences(preferenceKey, preferenceColumns,
+    { from: 'option-detector-alerts-v9', forceHidden: ['contracts', ...(view === 'behavior' ? ['current_price', 'price_pnl'] : [])] })
   const hidden = new Set([...preferences.hidden].filter(key => !detectorAlertColumns.some(column => column.key === key && column.locked)))
-  const columns = detectorAlertColumns.filter(column => !hidden.has(column.key)
-    && (view === 'day_history' || !detectorHistoryOnlyColumns.has(column.key)))
+  const columns = detectorAlertColumns.filter(column => !hidden.has(column.key))
   const [planDetail, setPlanDetail] = useState<OptionDetectorAlertReview['rows'][number] | null>(null)
   const [presets, setPresets] = useState<DetectorViewPreset[]>([])
   const [presetError, setPresetError] = useState('')
@@ -469,13 +476,19 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext }:
   const review = useQuery({ queryKey: ['option-detector-alerts', request], queryFn: () => getOptionDetectorAlerts(request),
     enabled: Boolean(dataset), retry: false, refetchInterval: 30_000 })
   const data = review.data?.available ? review.data.data : undefined
+  const incompleteAttempt = Boolean(data && ['RUNNING', 'FAILED', 'INCOMPLETE', 'UNVERIFIED'].includes(data.status))
+  const scheduleQuery = useQuery({ queryKey: ['option-alert-schedule'], queryFn: getOptionAlertSchedule, retry: false, refetchInterval: 30_000 })
+  const schedule = scheduleQuery.data?.available ? scheduleQuery.data.data : undefined
+  const scheduleSession = schedule ? new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(schedule.scheduled_cycle)) : ''
+  const showNextWindow = Boolean(view === 'behavior' && schedule && scheduleSession !== data?.session_date)
   const failed = inventory.isError || inventory.data && !inventory.data.available || index?.storage_ready === false
     || review.isError || review.data && !review.data.available
   useEffect(() => { setPlanDetail(null) }, [params])
   useEffect(() => {
     onSessionContext({ dates: index?.sessions || data?.sessions || [],
       selected: requestedSession || index?.current_session_date || data?.session_date || '', source: 'OPTIONS_DETECTOR_ALERTS',
-      emptyLabel: 'No completed detector runs', resetKeys: ['candidate', 'event'], datasetByDate: index?.session_datasets })
+      emptyLabel: 'No completed detector runs', resetKeys: ['candidate', 'event'], datasetByDate: index?.session_datasets,
+      sessionRollup: true })
   }, [data, index, onSessionContext, requestedSession])
   const refresh = () => {
     void inventory.refetch()
@@ -512,6 +525,18 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext }:
   }
   const sortable = new Set(['triggered_at', 'underlyer', 'detector', 'category', 'strategy', 'run', 'entry_limit'])
   return <section className="oa-evaluation" aria-label={view === 'behavior' ? 'Latest detector alerts' : 'Detector alert day history'}>
+    <div className="sd-toolbar oa-alert-toolbar">{tabs}<div className="sd-tools">
+      <label className="oa-toolbar-preset"><span>Column preset</span><select aria-label="Alert column preset" value={columnPreset} onChange={event => { setSelectedPreset(''); const keys = detectorColumnPresets[event.target.value]; if (keys) applyColumns(keys) }}>
+        <option value="">Custom columns</option>{Object.keys(detectorColumnPresets).map(name => <option key={name} value={name}>{name}</option>)}</select></label>
+      <ColumnPicker columns={preferenceColumns} hidden={hidden}
+        onToggle={key => { setSelectedPreset(''); preferences.toggle(key) }} onShowAll={() => { setSelectedPreset(''); preferences.showAll() }} onReset={() => { setSelectedPreset(''); preferences.reset() }} />
+      <button type="button" className="oa-icon" title="Save filter and column preset" aria-label="Save alert preset" disabled={!presetWritable}
+        onClick={() => { setPresetName(selectedPreset.startsWith('saved:') ? selectedPreset.slice(6) : ''); setSavingPreset(true) }}><Save size={15} /></button>
+      <button type="button" className="oa-icon" title="Delete selected preset" aria-label="Delete alert preset"
+        disabled={!presetWritable || !selectedPreset.startsWith('saved:')} onClick={deletePreset}><Trash2 size={15} /></button>
+      <button type="button" className="oa-icon" title="Refresh alerts and retained current marks" aria-label="Refresh alerts and current marks"
+        disabled={inventory.isFetching || review.isFetching} onClick={refresh}><RefreshCw size={15} /></button>
+    </div></div>
     <div className="sd-filters oa-filters oa-detector-filters">
       {presets.length > 0 && <label>Saved views<select aria-label="Saved alert view" value={selectedPreset} onChange={event => applyPreset(event.target.value)}>
         <option value="">Select saved view</option>
@@ -522,35 +547,22 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext }:
       <label>Model<select aria-label="Detector alert model" value={detector || ''} onChange={event => { setSelectedPreset(''); update({ evaluation_detector: event.target.value }) }}>
         <option value="">All models</option>{(['O1', 'O2', 'O3', 'S1', 'S2'] as const).map(id => <option key={id} value={id}>{detectorNames[id]}</option>)}
       </select></label>
-      <label>Column preset<select aria-label="Alert column preset" value={columnPreset} onChange={event => { setSelectedPreset(''); const keys = detectorColumnPresets[event.target.value]; if (keys) applyColumns(keys) }}>
-        <option value="">Custom columns</option>{Object.keys(detectorColumnPresets).map(name => <option key={name} value={name}>{name}</option>)}
-      </select></label>
-      <div className="oa-detector-tools"><ColumnPicker columns={detectorAlertColumns} hidden={hidden}
-        onToggle={key => { setSelectedPreset(''); preferences.toggle(key) }} onShowAll={() => { setSelectedPreset(''); preferences.showAll() }} onReset={() => { setSelectedPreset(''); preferences.reset() }} />
-        <span className="oa-tool-label">Columns</span>
-        <button type="button" className="oa-icon" title="Save filter and column preset" aria-label="Save alert preset" disabled={!presetWritable}
-          onClick={() => { setPresetName(selectedPreset.startsWith('saved:') ? selectedPreset.slice(6) : ''); setSavingPreset(true) }}><Save size={15} /></button>
-        <button type="button" className="oa-icon" title="Delete selected preset" aria-label="Delete alert preset" disabled={!presetWritable || !selectedPreset.startsWith('saved:')} onClick={deletePreset}><Trash2 size={15} /></button>
-        <button type="button" className="oa-icon" title="Refresh detector alerts" aria-label="Refresh detector alerts"
-          disabled={inventory.isFetching || review.isFetching} onClick={refresh}><RefreshCw size={15} /></button>
-      </div>
+      {data?.latest_attempt && view === 'behavior' ? <div className="oa-filter-status oa-filter-status--warning" role="status"><span>Latest attempted run</span><strong>{time(data.latest_attempt.scheduled_cycle)} ET / {label(data.status)}</strong></div>
+        : showNextWindow ? <div className={`oa-filter-status${schedule?.warning ? ' oa-filter-status--warning' : ''}`} role="status"><span>Next alert window</span><strong>{time(schedule?.window_start)}-{time(schedule?.window_end)} ET</strong></div>
+        : data?.run && <div className="oa-filter-status" role="status"><strong>Scheduled run {time(data.run.scheduled_cycle)} ET</strong><strong>Published {time(data.run.published_at)} ET</strong></div>}
     </div>
-    <DetectorResultVersion data={index} params={params} update={update} />
+    <DetectorResultsDisclosure datasets={index} review={data} params={params} update={update} />
     {presetError && <Notice>{presetError}</Notice>}
     {failed && <Notice retry={refresh}>Detector alerts are unavailable.</Notice>}
+    {incompleteAttempt && <Notice>{data?.status === 'RUNNING' ? 'Detection is in progress.' : 'Detection did not complete.'}{data?.latest_run && ` Last completed run: ${time(data.latest_run.scheduled_cycle)} ET.`}</Notice>}
+    {data?.status === 'PARTIAL' && data.run && <Notice>
+      {data.run.covered_underlyings}/{data.run.expected_underlyings} tickers evaluated. Unavailable: {Object.keys(data.run.unavailable_underlyers || {}).join(', ')}.
+    </Notice>}
     {inventory.isPending || dataset && review.isPending ? <div className="sd-empty" role="status">Loading detector alerts...</div> : !failed && <>
       <div className="sd-metrics"><span>{data?.session_date || 'No completed detector run'}</span>
-        <span><strong>{data?.new_alerts ?? 0}</strong> new alerts</span><span><strong>{data?.repeat_hits ?? 0}</strong> repeat hits</span>
-        <span><strong>{data?.detected_observations ?? 0}</strong> IV observation groups</span>
+        {!incompleteAttempt && <><span><strong>{data?.new_alerts ?? 0}</strong> new alerts</span><span><strong>{data?.repeat_hits ?? 0}</strong> repeat hits</span>
+        <span><strong>{data?.detected_observations ?? 0}</strong> IV observation groups</span></>}
         <span>Maximum 20 new alerts / run</span></div>
-      {data?.run && <div className="oa-run-status" role="status" aria-label="Latest detector publication">
-        <strong>Scheduled run {time(data.run.scheduled_cycle)} ET</strong><strong>Published {time(data.run.published_at)} ET</strong>
-        <span>{data.run.covered_underlyings}/{data.run.expected_underlyings} underlyings</span>
-        {Object.values(data.run.rejections).some(count => count > 0) && <span className="oa-run-warning">Source / qualification exclusions recorded</span>}
-      </div>}
-      {view === 'day_history' && data?.latest_run && <div className="oa-run-status">Latest run excluded: {time(data.latest_run.scheduled_cycle)} ET / published {time(data.latest_run.published_at)} ET</div>}
-      {data && <span className="oa-muted">Read as of {time(data.as_of)} ET</span>}
-      <DetectorRunDetails runs={data?.runs || []} />
       <div className="sd-table-panel"><div className="sd-table-scroll" tabIndex={0} role="region" aria-label="Detector alerts table">
         <table><thead><tr>{columns.map(column => sortable.has(column.key)
           ? <DetectorSortHeader key={column.key} title={column.label} field={column.key as OptionDetectorSort} params={params} update={update} />
@@ -569,6 +581,7 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext }:
               underlyer: <><button type="button" className="oa-row-link" onClick={() => setPlanDetail(row)}>{row.underlyer}</button><small className={surface ? '' : markTone(row.direction)}>{credit ? `O3 / ${row.direction === 1 ? 'Bullish put credit' : 'Bearish call credit'}` : surface ? 'O2 / IV observation' : `${row.detector_id} / ${row.direction === 1 ? 'Bullish' : 'Bearish'}`}</small></>,
               detector: <>{detectorNames[row.detector_id]}<small>{label(row.origin)}</small></>,
               category: label(row.category), strategy: row.strategy_name ? optionPackageStrategyName(row.strategy_name) : 'Unavailable',
+              contract_summary: legs.length ? <>{label(original?.structure_type || '')}<small>{optionContractSummary(row.underlyer, legs)}</small></> : 'Unavailable',
               contracts: legs.length ? <>{label(original?.structure_type || '')}{legs.map(leg => <small key={leg.leg_index}>{leg.side} {leg.ratio} {leg.contract_ticker}</small>)}</> : 'Unavailable',
               expiry: original?.expiration_date ? <>{original.expiration_date}<small>{original.calendar_dte ?? 'Unavailable'} DTE at source</small></> : 'Unavailable',
               ...marketCells(legs), option_price: <span className="oa-trigger-price"><PackagePrice netPremium={original?.net_premium} legs={legs} /></span>,
@@ -578,7 +591,8 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext }:
               breakevens: original?.breakevens?.length ? original.breakevens.map(money).join(', ') : 'Unavailable',
               outcome_status: 'Not connected',
               run: time(row.scheduled_cycle), entry_limit: <>{money(row.entry_limit)}<small>Debit / Not a fill</small></>,
-              hit_count: <span title={`Last observed ${time(row.last_seen_at)} ET`}>{row.hit_count}<small>{row.repeat_count} repeats</small></span>,
+              hit_count: <span title={`Last observed ${time(row.last_seen_at)} ET`}>{row.hit_count}<small>{row.repeat_count} repeats{row.confirmation_timeframes?.length ? ` / ${row.confirmation_timeframes.join(', ')}` : ''}</small></span>,
+              management_status: <ManagementStatus value={row.management_status} />,
               entry_window: <><Status value={optionEntryWindow(row.entry_deadline)} /><small>{time(row.entry_deadline)} ET</small></>,
               fitted_iv: 'Not applicable', residual: 'Not applicable', robust_z: 'Not applicable',
               source_cutoff: 'Not applicable', analyzed_at: 'Not applicable',
@@ -587,6 +601,7 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext }:
                 ...Object.fromEntries(Object.entries(detectorObservationFieldStates(row)).map(([key, value]) => [key,
                   <span title={value === 'Not retained' ? 'This market field is not included in the retained O2 observation; no current or unrelated snapshot is substituted.' : value === 'Not applicable' ? 'O2 records an IV observation, not a directional trigger, trade package or fill.' : undefined}>{value}</span>])),
                 contracts: surface.findings.map(finding => <div key={finding.snapshot_id}>{money(finding.strike)} {surface.contract_type}<small>{finding.residual > 0 ? 'Rich IV' : 'Cheap IV'} / z {finding.robust_z.toFixed(2)}</small></div>),
+                contract_summary: surface.findings.map(finding => <div key={finding.snapshot_id}>{optionContractSummary(row.underlyer, [{ strike: finding.strike, contract_type: surface.contract_type }])}</div>),
                 expiry: surface.expiration_date,
                 iv: surface.findings.map(finding => <div key={finding.snapshot_id}>{optionAlertPercent(finding.local_iv)}<small>Fitted {optionAlertPercent(finding.fitted_iv)} / gap {(finding.residual * 100).toFixed(2)} pts</small></div>),
                 fitted_iv: surface.findings.map(finding => <div key={finding.snapshot_id}>{optionAlertPercent(finding.fitted_iv)}</div>),
@@ -606,6 +621,8 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext }:
           })}</tbody>
         </table>{!data?.rows.length && <div className="sd-empty">{!dataset ? index?.datasets.length ? 'Select a detector dataset.' : 'No detector runs have been recorded.'
           : data?.status === 'NO_COMPLETE_RUN' ? 'No completed detector run for this dataset and session.'
+          : incompleteAttempt ? data?.status === 'RUNNING' ? 'Awaiting detector results.' : 'Alert results are unavailable for this attempt.'
+          : data?.status === 'PARTIAL' ? 'No qualified new alerts among the evaluated tickers in this filter scope.'
           : view === 'behavior' ? 'No qualified new alerts in this completed run and filter scope.' : 'No earlier admitted alerts for this session and filter scope.'}</div>}
       </div>
       <div className="sd-pager"><span>{data?.total ?? 0} alert / observation records</span><div>
@@ -700,8 +717,7 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
         <div className="sd-pager"><span>{data.total} evaluation records</span><div>
           <button aria-label="Previous evaluation page" disabled={offset === 0 || review.isFetching} onClick={() => update({ offset: String(Math.max(0, offset - pageSize)) })}><ArrowLeft size={15} /></button>
           <button aria-label="Next evaluation page" disabled={offset + pageSize >= data.total || review.isFetching} onClick={() => update({ offset: String(offset + pageSize) })}><ArrowRight size={15} /></button>
-        </div></div>
-      </div>
+        </div></div></div>
     </>}
     {surfaceObservation && observationDetail && <Modal title={`${observationDetail.underlyer} surface observation`} close={() => setObservationDetail(null)}>
       <div className="oa-detail"><dl className="oa-facts">
@@ -762,16 +778,16 @@ export default function OptionsAlertsPage() {
   }
   usePublishPageContext({ eyebrow: 'Options', title: 'Options Alerts', status: [{ label: 'Mode', value: 'Read-only / Indicative' }, { label: 'Data', value: '15-minute delayed' }],
     alertSessions: { ...sessionContext, selected: params.get('session_date') || sessionContext.dates[sessionContext.dates.length - 1] || '', historicalView: 'day_history' } })
-  return <div className="stock-discovery option-alerts">
-    <div className="sd-toolbar"><div className="sd-presets" role="tablist" aria-label="Options alert views">
+  const tabs = <div className="sd-presets" role="tablist" aria-label="Options alert views">
       <button type="button" role="tab" aria-selected={activeView === 'behavior'} tabIndex={activeView === 'behavior' ? 0 : -1} onKeyDown={tabKey} className={activeView === 'behavior' ? 'active' : ''} onClick={() => switchTab('behavior')}><ListFilter size={14} />Latest Run</button>
       <button type="button" role="tab" aria-selected={activeView === 'day_history'} tabIndex={activeView === 'day_history' ? 0 : -1} onKeyDown={tabKey} className={activeView === 'day_history' ? 'active' : ''} onClick={() => switchTab('day_history')}><History size={14} />Day History</button>
       <button type="button" role="tab" aria-selected={activeView === 'daily'} tabIndex={activeView === 'daily' ? 0 : -1} onKeyDown={tabKey} className={activeView === 'daily' ? 'active' : ''} onClick={() => switchTab('daily')}><BarChart3 size={14} />EOD Review</button>
-    </div><div className="sd-tools"><Link to="/options/screener" className="oa-research"><ScanSearch size={14} />Screener</Link></div></div>
-    <OptionsAlertWindow dataset={params.get('evaluation_dataset')} />
+    </div>
+  return <div className="stock-discovery option-alerts">
+    {activeView === 'daily' && <div className="sd-toolbar">{tabs}</div>}
     {activeView === 'daily'
       ? <DetectorEvaluationPanel params={params} update={update} offset={offset} onSessionContext={setSessionContext} />
-      : <DetectorAlertsPanel key={`detector-v5-${activeView}`} view={activeView} params={params} update={update} offset={offset} onSessionContext={setSessionContext} />}
+      : <DetectorAlertsPanel key={`detector-v5-${activeView}`} view={activeView} params={params} update={update} offset={offset} onSessionContext={setSessionContext} tabs={tabs} />}
     {selectedId && <CandidateDetail key={selectedId} candidateId={selectedId} close={closeDetail} />}
   </div>
 }

@@ -31,7 +31,8 @@ class OptionAlertEvaluationRepository(PostgresRepository):
                 EXISTS(SELECT 1 FROM public.schema_migrations WHERE version='054_option_o1_indicator_observations') AS o1_registered,
                 EXISTS(SELECT 1 FROM public.schema_migrations WHERE version='056_option_o3_credit_observations') AS o3_registered,
                 EXISTS(SELECT 1 FROM public.schema_migrations WHERE version='057_option_o3_indicative_admission') AS o3_admission_registered,
-                EXISTS(SELECT 1 FROM public.schema_migrations WHERE version='055_option_stock_setup_indicator_observations') AS stock_setup_registered""")
+                EXISTS(SELECT 1 FROM public.schema_migrations WHERE version='055_option_stock_setup_indicator_observations') AS stock_setup_registered,
+                EXISTS(SELECT 1 FROM public.schema_migrations WHERE version='062_option_detector_partial_coverage') AS partial_coverage_registered""")
             report = dict(cursor.fetchone())
             cursor.execute("""SELECT COUNT(*) AS waiting_locks FROM pg_locks
                 WHERE NOT granted AND relation IN (
@@ -175,7 +176,7 @@ class OptionAlertEvaluationRepository(PostgresRepository):
             or run.configuration_sha256 != row["configuration_sha256"]
             or run.strategy_policy_sha256 != row["strategy_policy_sha256"]
             or list(matrix for _, matrix in run.source_matrices) != row["source_matrix_ids"]
-            or len(run.expected_underlyers) != row["covered_underlying_count"]):
+            or len(run.source_matrices) != row["covered_underlying_count"]):
             raise ValueError("stored detector run identity/hash mismatch")
         return run
 
@@ -187,7 +188,7 @@ class OptionAlertEvaluationRepository(PostgresRepository):
             cursor.execute("SET LOCAL statement_timeout = '5s'")
             cursor.execute("""SELECT publication_id,selector_sha256,selection_evidence,scheduled_cycle,published_at,
                     configuration_sha256,strategy_policy_sha256,source_matrix_ids,covered_underlying_count
-                FROM option_board_publications WHERE status='COMPLETE' AND selector_version IN ('option_detector_run_v1','option_detector_run_v2')
+                FROM option_board_publications WHERE status='COMPLETE' AND selector_version IN ('option_detector_run_v1','option_detector_run_v2','option_detector_run_v3')
                   AND selection_evidence->>'dataset_id'=%s AND scheduled_cycle>=%s AND scheduled_cycle<=%s
                   AND published_at<=%s AND created_at<=%s
                 ORDER BY scheduled_cycle LIMIT 5001""", (dataset_id, as_of - timedelta(days=60), as_of, as_of, as_of))
@@ -204,7 +205,7 @@ class OptionAlertEvaluationRepository(PostgresRepository):
             cursor.execute("SET LOCAL statement_timeout = '5s'")
             cursor.execute("""SELECT publication_id,selector_sha256,selection_evidence,scheduled_cycle,published_at,
                     configuration_sha256,strategy_policy_sha256,source_matrix_ids,covered_underlying_count
-                FROM option_board_publications WHERE status='COMPLETE' AND selector_version IN ('option_detector_run_v1','option_detector_run_v2')
+                FROM option_board_publications WHERE status='COMPLETE' AND selector_version IN ('option_detector_run_v1','option_detector_run_v2','option_detector_run_v3')
                   AND selection_evidence->>'dataset_id'=%s AND scheduled_cycle=%s
                   AND published_at<=%s AND created_at<=%s LIMIT 2""", (dataset_id, scheduled_cycle, as_of, as_of))
             headers = cursor.fetchall()
@@ -250,7 +251,7 @@ class OptionAlertEvaluationRepository(PostgresRepository):
             FROM option_detector_evaluations AS evaluation
             JOIN option_board_publications AS publication ON publication.publication_id=evaluation.run_id
             WHERE evaluation.dataset_id=%s AND evaluation.selection_status='SELECTED'
-              AND publication.status='COMPLETE' AND publication.selector_version IN ('option_detector_run_v1','option_detector_run_v2')
+              AND publication.status='COMPLETE' AND publication.selector_version IN ('option_detector_run_v1','option_detector_run_v2','option_detector_run_v3')
               AND publication.selection_evidence->>'dataset_id'=%s
               AND evaluation.scheduled_cycle>=%s AND evaluation.scheduled_cycle<%s
               AND evaluation.selected_at<=%s AND evaluation.recorded_at<=%s AND publication.created_at<=%s
@@ -294,6 +295,26 @@ class OptionAlertEvaluationRepository(PostgresRepository):
             if len(rows) > 10000:
                 raise ValueError("prior O1 observations exceed bound")
             return {row["recurrence_sha256"] for row in rows}
+
+    def prior_o1_directional_activity(self, *, dataset_id, scheduled_cycle, as_of, window_seconds=2700):
+        if (as_of.utcoffset() is None or scheduled_cycle.utcoffset() is None or scheduled_cycle > as_of
+                or not 0 < window_seconds <= 7200):
+            raise ValueError("prior O1 activity lookup requires causal bounded cutoffs")
+        with self._cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = '5s'")
+            cursor.execute("""SELECT DISTINCT payload_text::jsonb->'observation'->>'underlyer' AS underlyer,
+                    (payload_text::jsonb->'observation'->>'direction')::int AS direction
+                FROM option_o1_indicator_observations
+                WHERE dataset_id=%s AND scheduled_cycle>=%s AND scheduled_cycle<%s
+                  AND session_date=(%s AT TIME ZONE 'America/New_York')::date
+                  AND selected_at<=%s AND recorded_at<=%s LIMIT 1001""",
+                (dataset_id, scheduled_cycle - timedelta(seconds=window_seconds), scheduled_cycle,
+                 scheduled_cycle, as_of, as_of))
+            rows = cursor.fetchall()
+            if len(rows) > 1000:
+                raise ValueError("prior O1 activity exceeds bound")
+            return {(row["underlyer"], row["direction"]) for row in rows}
 
     def prior_o3_observed(self, *, dataset_id, scheduled_cycle, as_of):
         if as_of.utcoffset() is None or scheduled_cycle.utcoffset() is None or scheduled_cycle > as_of:
@@ -405,7 +426,10 @@ class OptionAlertEvaluationRepository(PostgresRepository):
             cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             cursor.execute("SET LOCAL statement_timeout = '5s'")
             cursor.execute("""SELECT original.evaluation_id,COUNT(DISTINCT hit.run_id) AS repeats,
-                    MAX(hit.selected_at) AS last_seen_at
+                                        MAX(hit.selected_at) AS last_seen_at,
+                                        ARRAY_REMOVE(ARRAY_AGG(DISTINCT
+                                            ((hit.payload_text::jsonb->>'plan_payload_text')::jsonb->'stock_confirmation'->>'interval')),NULL)
+                                            AS confirmation_timeframes
                 FROM option_detector_evaluations AS original
                 JOIN option_board_publications AS origin_run ON origin_run.publication_id=original.run_id
                 LEFT JOIN (
@@ -413,7 +437,7 @@ class OptionAlertEvaluationRepository(PostgresRepository):
                     JOIN option_board_publications AS publication ON publication.publication_id=evaluation.run_id
                     WHERE evaluation.dataset_id=%s AND evaluation.selection_status='REPEAT'
                       AND evaluation.selected_at<=%s AND evaluation.recorded_at<=%s
-                      AND publication.selector_version IN ('option_detector_run_v1','option_detector_run_v2') AND publication.status='COMPLETE'
+                      AND publication.selector_version IN ('option_detector_run_v1','option_detector_run_v2','option_detector_run_v3') AND publication.status='COMPLETE'
                       AND publication.selection_evidence->>'dataset_id'=%s
                       AND publication.published_at<=%s AND publication.created_at<=%s
                 ) AS hit ON hit.dataset_id=original.dataset_id AND hit.detector_id=original.detector_id
@@ -423,13 +447,14 @@ class OptionAlertEvaluationRepository(PostgresRepository):
                   AND hit.payload_text::jsonb->>'first_candidate_id'=original.candidate_id::text
                 WHERE original.dataset_id=%s AND original.evaluation_id=ANY(%s::uuid[])
                   AND original.selection_status='SELECTED' AND original.selected_at<=%s AND original.recorded_at<=%s
-                  AND origin_run.selector_version IN ('option_detector_run_v1','option_detector_run_v2') AND origin_run.status='COMPLETE'
+                  AND origin_run.selector_version IN ('option_detector_run_v1','option_detector_run_v2','option_detector_run_v3') AND origin_run.status='COMPLETE'
                   AND origin_run.selection_evidence->>'dataset_id'=%s
                   AND origin_run.published_at<=%s AND origin_run.created_at<=%s
                 GROUP BY original.evaluation_id""",
                 (dataset_id, as_of, as_of, dataset_id, as_of, as_of, dataset_id,
                  [row.evaluation_id for row in records], as_of, as_of, dataset_id, as_of, as_of))
-            results = {row["evaluation_id"]: dict(repeats=int(row["repeats"]), last_seen_at=row["last_seen_at"])
+            results = {row["evaluation_id"]: dict(repeats=int(row["repeats"]), last_seen_at=row["last_seen_at"],
+                confirmation_timeframes=tuple(row["confirmation_timeframes"] or ()))
                 for row in cursor.fetchall()}
             if set(results) != {row.evaluation_id for row in records}:
                 raise ValueError("repeat lookup cannot resolve every original completed alert")
@@ -465,7 +490,7 @@ class OptionAlertEvaluationRepository(PostgresRepository):
                 self._persist_records(cursor, records, payloads, allow_insert=False)
                 return dict(status="ALREADY_RECORDED", run_id=str(run.run_id), new_alerts=dict(run.selection_counts)["SELECTED"])
             cursor.execute("""SELECT scheduled_cycle,selector_sha256,created_at FROM option_board_publications
-                WHERE selector_version IN ('option_detector_run_v1','option_detector_run_v2') AND selection_evidence->>'dataset_id'=%s
+                WHERE selector_version IN ('option_detector_run_v1','option_detector_run_v2','option_detector_run_v3') AND selection_evidence->>'dataset_id'=%s
                 ORDER BY scheduled_cycle DESC LIMIT 1""", (run.dataset_id,))
             latest = cursor.fetchone()
             if latest and (latest["scheduled_cycle"] >= run.scheduled_cycle or latest["selector_sha256"] != run.scope_sha256):
@@ -555,7 +580,7 @@ class OptionAlertEvaluationRepository(PostgresRepository):
                 WHERE session_date>=%s AND session_date<=%s AND selected_at<=%s AND recorded_at<=%s
                 UNION
                 SELECT selection_evidence->>'dataset_id',as_of_session FROM option_board_publications
-                WHERE selector_version IN ('option_detector_run_v1','option_detector_run_v2') AND status='COMPLETE'
+                WHERE selector_version IN ('option_detector_run_v1','option_detector_run_v2','option_detector_run_v3') AND status='COMPLETE'
                   AND as_of_session>=%s AND as_of_session<=%s AND published_at<=%s AND created_at<=%s
                 ) AS sessions ORDER BY dataset_id,session_date LIMIT 1001""",
                 (today - timedelta(days=60), today, as_of, as_of,
@@ -600,7 +625,7 @@ class OptionAlertEvaluationRepository(PostgresRepository):
                 records.append(record)
             cursor.execute("""SELECT publication_id,selector_sha256,selection_evidence,scheduled_cycle,published_at,
                     configuration_sha256,strategy_policy_sha256,source_matrix_ids,covered_underlying_count
-                FROM option_board_publications WHERE selector_version IN ('option_detector_run_v1','option_detector_run_v2') AND status='COMPLETE'
+                FROM option_board_publications WHERE selector_version IN ('option_detector_run_v1','option_detector_run_v2','option_detector_run_v3') AND status='COMPLETE'
                   AND selection_evidence->>'dataset_id'=%s AND as_of_session=%s
                   AND published_at<=%s AND created_at<=%s ORDER BY scheduled_cycle LIMIT 5001""",
                 (chosen, selected_date, as_of, as_of))

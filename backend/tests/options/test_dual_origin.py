@@ -316,6 +316,49 @@ def test_s1_retains_exact_stock_episode_and_non_directional_activity_confirmatio
     assert not result.publication_permission and result.package_status == "NOT_ASSESSED"
 
 
+def test_canonical_stock_first_decision_requires_exact_matching_option_activity():
+    from decimal import Decimal
+    from uuid import NAMESPACE_URL, uuid5
+    from options.dual_origin import assess_canonical_stock_first, load_signal_decision
+    from options.stock_bar_detection import CanonicalStockBarPoint, CanonicalStockSignal, STOCK_BAR_SIGNAL_POLICY_SHA256
+
+    _, source = confirmation_inputs()
+    decision_at = source.market_time + timedelta(minutes=16)
+    points = tuple(CanonicalStockBarPoint(bar_revision_id=uuid4(), interval="5m",
+        session_date=source.volume_session, bar_start=source.market_time - timedelta(minutes=10 - index * 5),
+        bar_end=source.market_time - timedelta(minutes=5 - index * 5),
+        open=Decimal(value), high=Decimal(value) + 1, low=Decimal(value) - 1,
+        close=Decimal(value), system_observed_at=source.market_time,
+        created_at=source.market_time, payload_sha256="a" * 64)
+        for index, value in enumerate(("100", "101.1")))
+    signal_id = uuid5(NAMESPACE_URL, ":".join(("canonical-stock-signal",
+        STOCK_BAR_SIGNAL_POLICY_SHA256, "S1", str(source.security_id),
+        source.volume_session.isoformat(), "1", str(points[-1].bar_revision_id))))
+    daily = tuple(CanonicalStockBarPoint(bar_revision_id=uuid4(), interval="1d",
+        session_date=source.volume_session - timedelta(days=15 - index),
+        bar_start=source.market_time - timedelta(days=15 - index, hours=6, minutes=30),
+        bar_end=source.market_time - timedelta(days=15 - index),
+        open=Decimal("100"), high=Decimal("101"), low=Decimal("99"), close=Decimal("100"),
+        system_observed_at=source.market_time - timedelta(days=15 - index),
+        created_at=source.market_time - timedelta(days=15 - index), payload_sha256="a" * 64)
+        for index in range(15))
+    signal = CanonicalStockSignal(signal_id=signal_id, detector_id="S1",
+        security_id=source.security_id, underlyer=source.underlyer, direction=1,
+        interval="5m", session_date=source.volume_session, prior_close=Decimal("100"),
+        prior_atr14=Decimal("2"), threshold=Decimal("1"), trigger_price=Decimal("101.1"),
+        stop=Decimal("100"), target=Decimal("102.2"), daily_bars=daily, bars=points,
+        market_time=points[-1].bar_end, available_at=source.market_time,
+        received_at=decision_at, valid_until=decision_at + timedelta(minutes=10))
+    result = assess_canonical_stock_first(signal, source, market_cutoff=source.market_time,
+        decision_at=decision_at)
+    assert result.disposition == "CONFIRMED" and result.activity_contract_id == source.contract_id
+    assert result.stock_source_sha256 == signal.sha256
+    assert load_signal_decision(result) == result
+    put = source.model_copy(update={"contract_type": "PUT"})
+    assert assess_canonical_stock_first(signal, put, market_cutoff=source.market_time,
+        decision_at=decision_at).disposition == "UNMATCHED"
+
+
 @pytest.mark.parametrize("model", ["S1", "S2"])
 def test_stock_first_indicator_observation_retains_mixed_shadow_metrics(model):
     from datetime import timedelta
@@ -486,6 +529,24 @@ def test_o1_v3_uses_latest_completed_bar_without_other_trends(mutation, expected
     if mutation is None:
         assert {gate.gate_id for gate in result.gates} == {"TREND_SLOPE_30m", "UNDERLYING_LIQUIDITY_EVIDENCE"}
         assert result.gates[0].source_market_times == (source.market_time - timedelta(minutes=15),)
+
+
+def test_o3_credit_confirmation_treats_activity_contract_type_as_directionless():
+    from options.dual_origin import assess_options_credit_intraday, assess_options_intraday
+
+    source, stock, decision_at = intraday_confirmation_inputs()
+    put_activity = source.model_copy(update={"contract_type": "PUT"})
+    o1 = assess_options_intraday(put_activity, stock, direction=1,
+        market_cutoff=decision_at, decision_at=decision_at)
+    o3 = assess_options_credit_intraday(put_activity, stock, direction=1,
+        market_cutoff=decision_at, decision_at=decision_at)
+
+    assert o1.disposition == "UNMATCHED"
+    assert o1.reasons == ("ACTIVITY_CONTRACT_NOT_MATCHED_TO_THESIS",)
+    assert o3.disposition == "CONFIRMED" and o3.reasons == ()
+    assert {gate.gate_id for gate in o3.gates} == {"TREND_SLOPE_30m", "UNDERLYING_LIQUIDITY_EVIDENCE"}
+    assert assess_options_credit_intraday(put_activity, None, direction=1,
+        market_cutoff=decision_at, decision_at=decision_at).disposition == "UNAVAILABLE"
 
 
 def test_o1_v2_rejects_forming_bars_reconstructed_receipts_and_forged_confirmation():
@@ -1100,7 +1161,7 @@ def qualified_package(index=1, *, model="O1", underlyer="AAPL", direction=1, ran
 
 
 def test_dual_origin_global_cap_and_deterministic_fair_allocation():
-    from options.analytics.alert_selection import select_dual_origin_packages
+    from options.analytics.alert_selection import build_selection_evidence, load_evaluation_evidence, select_dual_origin_packages
 
     names = tuple(f"T{index}" for index in range(13))
     packages = [qualified_package(1 + stock * 4 + model_index * 2 + side_index,
@@ -1121,7 +1182,7 @@ def test_dual_origin_global_cap_and_deterministic_fair_allocation():
 
 
 def test_all_three_package_models_share_one_twenty_alert_budget():
-    from options.analytics.alert_selection import select_dual_origin_packages
+    from options.analytics.alert_selection import build_selection_evidence, load_evaluation_evidence, select_dual_origin_packages
 
     packages = [qualified_package(1000 + model_index * 100 + index, model=model, underlyer=f"T{index}")
         for model_index, model in enumerate(("O1", "S1", "S2")) for index in range(13)]
@@ -1795,7 +1856,7 @@ def test_launch_preparation_requires_explicit_stock_transition_and_preserves_sou
     import zlib
     from pathlib import Path
     from options.config import load_option_runtime_configuration
-    from options.detector_launch import INTRADAY_RUNTIME_FILES, OPTIMIZED_INTRADAY_RUNTIME_FILES, RUNTIME_FILES, prepare_detector_forward_launch, decode_detector_forward_launch, validate_detector_forward_launch
+    from options.detector_launch import CANONICAL_STOCK_RUNTIME_FILES, INTRADAY_RUNTIME_FILES, OPTIMIZED_INTRADAY_RUNTIME_FILES, RUNTIME_FILES, build_detector_collector, prepare_detector_forward_launch, decode_detector_forward_launch, validate_detector_forward_launch
     from research.stock_idea_forward import forward_config, runtime_sources
     from research.stock_idea_engine import digest
     from test_equity_behavior_setup import direct_ledger_fixture
@@ -1807,7 +1868,7 @@ def test_launch_preparation_requires_explicit_stock_transition_and_preserves_sou
         publication["runtime_sources"] = {name: "0" * 64 for name in runtime_sources()}
         publication["policy_hash"] = digest(config)
         connection.execute("INSERT INTO forward_publications VALUES(?,?)", (publication["window_key"], zlib.compress(json.dumps(publication).encode())))
-    for name in set(OPTIMIZED_INTRADAY_RUNTIME_FILES) | set(runtime_sources()):
+    for name in set(CANONICAL_STOCK_RUNTIME_FILES) | set(runtime_sources()):
         source = tmp_path / name
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_text("reviewed fixture", encoding="utf-8")
@@ -1851,6 +1912,24 @@ def test_launch_preparation_requires_explicit_stock_transition_and_preserves_sou
         stock_setup_wait=True, stock_source_launch=wait_launch)
     assert reused.acceptance_source == wait_launch.acceptance_source
     assert reused.resumption_source == wait_launch.resumption_source
+    missing_arguments = {**arguments, "stock_ledger": "absent.sqlite"}
+    missing_source = wait_launch.model_copy(update={"stock_ledger": "absent.sqlite"})
+    reused_without_ledger = prepare_detector_forward_launch(**missing_arguments, intraday_confirmation=True,
+        stock_setup_wait=True, stock_source_launch=missing_source)
+    assert reused_without_ledger.acceptance_source == wait_launch.acceptance_source
+    assert reused_without_ledger.resumption_source == wait_launch.resumption_source
+    canonical = prepare_detector_forward_launch(**missing_arguments, intraday_confirmation=True,
+        canonical_stock_first=True)
+    assert canonical.schema_version == "option_detector_forward_launch_v7"
+    assert canonical.stock_readiness_policy == "CANONICAL_COMPLETED_BAR_FALLBACK_V1"
+    assert "stock_ledger" not in canonical.model_fields
+    assert dict(canonical.runtime_sources)["options/stock_bar_detection.py"]
+    assert decode_detector_forward_launch(canonical.canonical_json()) == canonical
+    assert validate_detector_forward_launch(canonical,
+        configuration=configuration, backend_dir=tmp_path) == canonical
+    collector = build_detector_collector(canonical, configuration=configuration, backend_dir=tmp_path)
+    assert collector.source_reader.canonical_stock_first
+    assert not collector.source_reader.setup_wait_enabled
     with pytest.raises(ValueError, match="reused detector stock source pins"):
         prepare_detector_forward_launch(**arguments, approve_stock_runtime_transition=True,
             stock_source_launch=wait_launch)
@@ -2137,6 +2216,7 @@ def test_detector_alert_reader_counts_detected_o2_without_exposing_alert_rows():
     run = SimpleNamespace(run_id=record.run_id, scheduled_cycle=record.scheduled_cycle,
         selected_at=record.selected_at, market_time=source.market_time, observed_time=source.observed_at,
         expected_underlyers=(source.underlyer,), source_matrices=((source.underlyer, source.matrix_id),),
+        coverage_status="COMPLETE", partial_coverage=False,
         selection_counts=(("SELECTED", 0), ("REPEAT", 0), ("NOT_SELECTED", 0), ("OBSERVATION", 1)), rejections=())
     calls = []
     repo = SimpleNamespace(completed_runs=lambda **_: (run,), completed_run=lambda **_: (run, (record,)),
@@ -2170,6 +2250,43 @@ def test_detector_alert_reader_rejects_latest_run_above_alert_cap():
             as_of=record.selected_at, repository=repository)
 
 
+def test_latest_detector_alert_refresh_includes_retained_marks(monkeypatch):
+    from types import SimpleNamespace
+    from options.analytics.alert_selection import build_detector_run
+    from options.analytics.behavior_review import build_detector_alert_review
+
+    record = evaluation_records()[0]
+    run = build_detector_run(**detector_run_inputs((record,)))
+    repo = SimpleNamespace(completed_runs=lambda **_: (run,),
+        completed_run=lambda **_: (run, (record,)),
+        repeat_counts=lambda **_: {record.evaluation_id: dict(repeats=0, last_seen_at=None)})
+    original = dict(status="AVAILABLE", market_data_time=record.package.decision_at,
+        net_premium=Decimal("-100"), capital_at_risk=Decimal("100"), legs=[])
+    source = SimpleNamespace(original_packages=lambda page, **_: {
+        str(record.candidate_id): original} if page else {})
+    mark = dict(status="FRESH", reason=None, package_price=Decimal("1.5"),
+        price_return=Decimal("0.5"), market_time=record.selected_at)
+    mark_repository = SimpleNamespace(retained_plan_marks=lambda ids, **_: {
+        "ready": True, "management_status_ready": True,
+        "rows": {str(record.candidate_id): {"candidate_id": record.candidate_id}}})
+    monkeypatch.setattr("options.outcomes.review_retained_candidate_mark",
+        lambda *_args, **_kwargs: mark)
+
+    result = build_detector_alert_review(dataset_id=record.dataset_id, as_of=record.selected_at,
+        repository=repo, source_repository=source, valuation_policy=SimpleNamespace(policy_sha256="e" * 64),
+        mark_repository=mark_repository)
+
+    assert result["scope"] == "LATEST"
+    assert result["rows"][0]["current_mark"] == mark
+    assert result["rows"][0]["management_status"] == "MONITORING"
+
+    original["expiration_date"] = date(2026, 9, 1)
+    expired = build_detector_alert_review(dataset_id=record.dataset_id, as_of=datetime(2026, 9, 29, tzinfo=timezone.utc),
+        repository=repo, source_repository=source, valuation_policy=SimpleNamespace(policy_sha256="e" * 64),
+        mark_repository=mark_repository)
+    assert expired["rows"][0]["management_status"] == "EXPIRED"
+
+
 def test_detector_alert_reader_zero_latest_keeps_original_history_and_hits(monkeypatch):
     import json
     from types import SimpleNamespace
@@ -2194,7 +2311,8 @@ def test_detector_alert_reader_zero_latest_keeps_original_history_and_hits(monke
     mark_calls = []
     mark_repository = SimpleNamespace(retained_plan_marks=lambda ids, **kwargs: (
         mark_calls.append((ids, kwargs)) or {"ready": True, "rows": {
-            str(records[0].candidate_id): {"candidate_id": records[0].candidate_id}}}))
+            str(records[0].candidate_id): {"candidate_id": records[0].candidate_id,
+                "management_status": "TARGET_MET"}}}))
     expected_mark = dict(status="FRESH", reason=None, package_price=Decimal("2.5"),
         price_return=Decimal("0.25"), market_time=latest.selected_at)
     monkeypatch.setattr("options.outcomes.review_retained_candidate_mark",
@@ -2220,6 +2338,7 @@ def test_detector_alert_reader_zero_latest_keeps_original_history_and_hits(monke
     assert history["rows"][0]["plan_sha256"] == records[0].package.plan_sha256
     assert history["rows"][0]["first_selected_at"] == first.selected_at.isoformat()
     assert history["rows"][0]["current_mark"] == expected_mark
+    assert history["rows"][0]["management_status"] == "TARGET_MET"
     assert mark_calls == [([records[0].candidate_id], dict(available_by=latest.selected_at,
         valuation_policy_sha256="e" * 64))]
     assert datetime.fromisoformat(history["rows"][0]["triggered_at"]) == datetime.fromisoformat(json.loads(records[0].plan_payload_text)["source_market_time"])
@@ -2228,6 +2347,67 @@ def test_detector_alert_reader_zero_latest_keeps_original_history_and_hits(monke
     empty = build_detector_alert_review(dataset_id="different-dataset", as_of=latest.selected_at, repository=repo)
     assert empty["status"] == "NO_COMPLETE_RUN" and empty["rows"] == []
     assert empty["run"] is None and empty["latest_run"] is None and empty["runs"] == []
+
+
+def test_latest_incomplete_attempt_does_not_carry_completed_alerts():
+    from types import SimpleNamespace
+    from options.analytics.alert_selection import build_detector_run
+    from options.analytics.behavior_review import build_detector_alert_review
+
+    records = evaluation_records()
+    completed = build_detector_run(**detector_run_inputs(records))
+    attempted_cycle = completed.scheduled_cycle + timedelta(minutes=15)
+    as_of = completed.selected_at + timedelta(minutes=30)
+    attempt = dict(scheduled_cycle=attempted_cycle.isoformat(), started_at=as_of.isoformat(),
+        finished_at=as_of.isoformat(), status="INCOMPLETE", reason="DETECTOR_NOT_EVALUATED")
+    repository = SimpleNamespace(completed_runs=lambda **_: (completed,),
+        review_inputs=lambda **_: dict(records=records),
+        repeat_counts=lambda **_: {records[0].evaluation_id: dict(repeats=0, last_seen_at=None)})
+    latest = build_detector_alert_review(dataset_id=completed.dataset_id, as_of=as_of,
+        repository=repository, attempts=(attempt,))
+    assert latest["status"] == "INCOMPLETE" and latest["rows"] == []
+    assert latest["run"] is None and latest["latest_attempt"] == attempt
+    assert latest["latest_run"]["run_id"] == str(completed.run_id)
+    history = build_detector_alert_review(dataset_id=completed.dataset_id, as_of=as_of,
+        repository=repository, attempts=(attempt,), scope="HISTORY")
+    assert [run["run_id"] for run in history["runs"]] == [str(completed.run_id)]
+    assert history["total"] == len(records)
+
+
+def test_detector_alert_history_uses_display_focused_repository_reader():
+    from types import SimpleNamespace
+    from options.analytics.alert_selection import DetectorRunEvidence, build_detector_run
+    from options.analytics.behavior_review import build_detector_alert_review
+
+    records = evaluation_records()
+    first = build_detector_run(**detector_run_inputs(records))
+    latest = DetectorRunEvidence.model_validate({**first.model_dump(),
+        "scheduled_cycle": first.scheduled_cycle + timedelta(minutes=15),
+        "selected_at": first.selected_at + timedelta(minutes=15), "record_sha256s": (),
+        "selection_counts": tuple((status, 0) for status, _ in first.selection_counts)})
+    calls = []
+    def display_records(**kwargs):
+        calls.append(kwargs)
+        history = kwargs["runs"] == (first,)
+        return {"records": records if history else (), "detected_observations": 37 if history else 5}
+    repository = SimpleNamespace(
+        completed_runs=lambda **_: (first, latest),
+        completed_run=lambda **_: (_ for _ in ()).throw(AssertionError("full run reader should not run")),
+        repeat_counts=lambda **_: {records[0].evaluation_id: dict(repeats=0, last_seen_at=None)},
+        review_inputs=lambda **_: (_ for _ in ()).throw(AssertionError("full history reader should not run")),
+    )
+    source_repository = SimpleNamespace(alert_display_records=display_records,
+        original_packages=lambda *_, **__: {})
+    result = build_detector_alert_review(dataset_id=first.dataset_id, scope="HISTORY",
+        as_of=latest.selected_at, repository=repository,
+        source_repository=source_repository)
+
+    assert result["total"] == 1 and result["detected_observations"] == 37
+    assert calls[0]["runs"] == (first,) and calls[0]["session_date"] == first.scheduled_cycle.date()
+    current = build_detector_alert_review(dataset_id=first.dataset_id,
+        as_of=latest.selected_at, repository=repository, source_repository=source_repository)
+    assert current["total"] == 0 and current["detected_observations"] == 5
+    assert calls[1]["runs"] == (latest,)
 
 
 @pytest.mark.parametrize("model", ["O1", "S1", "S2"])
@@ -2242,6 +2422,11 @@ def test_detector_trigger_time_uses_original_origin_evidence_and_missing_sorts_l
     record = SimpleNamespace(detector_id=model, plan_payload_text=json.dumps(plan), package=SimpleNamespace(decision_at=NOW),
         evaluation_id=uuid4(), scheduled_cycle=NOW - timedelta(minutes=15), selected_at=NOW)
     assert _detector_triggered_at(record) == (option_time if model == "O1" else stock_time)
+    canonical_plan = dict(management_policy=dict(technical_exit=dict(evidence=dict(
+        source_kind="CANONICAL_STOCK_SIGNAL", market_time=stock_time.isoformat()))))
+    canonical_record = SimpleNamespace(detector_id="S1", plan_payload_text=json.dumps(canonical_plan),
+        package=SimpleNamespace(decision_at=NOW))
+    assert _detector_triggered_at(canonical_record) == stock_time
     missing = SimpleNamespace(**{**vars(record), "evaluation_id": uuid4(), "plan_payload_text": "{}"})
     for order in ("asc", "desc"):
         assert _sort_detector_records([missing, record], "triggered_at", order) == [record, missing]
@@ -2429,6 +2614,22 @@ def test_future_detector_launch_does_not_displace_latest_retained_dataset(monkey
     assert data["configured_dataset_id"] == "future-v28"
 
 
+def test_multi_session_launch_reports_latest_retained_session_as_current(monkeypatch):
+    from types import SimpleNamespace
+    from options import api
+    from options.repositories import alert_review_sources
+
+    monkeypatch.setattr(alert_review_sources, "configured_detector_launch", lambda: SimpleNamespace(
+        dataset_id="v34", effective_from=datetime(2026, 9, 29, 15, 45, tzinfo=timezone.utc)))
+    monkeypatch.setattr(alert_review_sources.OptionAlertReviewSourceRepository, "dataset_index", lambda *_, **__: dict(
+        storage_ready=True, datasets=["v33", "v34"], dataset_sessions={"v33": ["2026-09-29"], "v34": ["2026-09-29", "2026-09-30"]},
+        sessions=["2026-09-29", "2026-09-30"], session_datasets={"2026-09-29": "v34", "2026-09-30": "v34"}))
+
+    data = api.option_detector_datasets().data
+    assert data["current_session_date"] == "2026-09-30"
+    assert data["sessions"] == ["2026-09-29", "2026-09-30"]
+
+
 def test_detector_dataset_manifest_is_read_only_and_hash_checked():
     from pathlib import Path
     from options.repositories.alert_review_sources import configured_detector_dataset
@@ -2603,6 +2804,88 @@ def test_qualification_reuses_raw_basis_and_explicit_plan_before_selection(model
     result = select_dual_origin_packages([qualified], {}, decision_at=qualified.decision_at,
         scheduled_cycle=qualified.scheduled_cycle, expected_underlyers=("AAPL",), completed_matrices={"AAPL": qualified.matrix_id})
     assert result["members"] == [qualified]
+
+
+def test_canonical_stock_first_qualification_preserves_bar_geometry_and_contract_recurrence():
+    import hashlib
+    from decimal import Decimal
+    from uuid import NAMESPACE_URL, uuid5
+    from options.alert_plans import TechnicalExitEvidence, TechnicalLevel
+    from options.analytics.alert_selection import build_selection_evidence, load_evaluation_evidence, select_dual_origin_packages
+    from options.dual_origin import QualifiedCanonicalStockPackage, assess_canonical_stock_first, qualify_dual_origin_package
+    from options.stock_bar_detection import CanonicalStockBarPoint, CanonicalStockSignal, STOCK_BAR_SIGNAL_POLICY_SHA256
+    from options.strategies.domain import canonical_json
+
+    inputs = qualification_inputs("LONG_CALL", "S1")
+    candidate, source = inputs["candidate"], inputs["source"]
+    decision_at = inputs["decision"].decision_at
+    spot = inputs["snapshots"][0].spot
+    prior_close, atr = spot - Decimal("2"), Decimal("2")
+    points = tuple(CanonicalStockBarPoint(bar_revision_id=uuid4(), interval="5m",
+        session_date=candidate.market_data_time.date(),
+        bar_start=candidate.market_data_time - timedelta(minutes=10 - index * 5),
+        bar_end=candidate.market_data_time - timedelta(minutes=5 - index * 5),
+        open=value, high=value + 1, low=value - 1, close=value,
+        system_observed_at=candidate.observed_time, created_at=candidate.observed_time,
+        payload_sha256="a" * 64) for index, value in enumerate((prior_close, spot)))
+    signal_id = uuid5(NAMESPACE_URL, ":".join(("canonical-stock-signal",
+        STOCK_BAR_SIGNAL_POLICY_SHA256, "S1", str(source.security_id),
+        candidate.market_data_time.date().isoformat(), "1", str(points[-1].bar_revision_id))))
+    daily = tuple(CanonicalStockBarPoint(bar_revision_id=uuid4(), interval="1d",
+        session_date=candidate.market_data_time.date() - timedelta(days=15 - index),
+        bar_start=candidate.market_data_time - timedelta(days=15 - index, hours=6, minutes=30),
+        bar_end=candidate.market_data_time - timedelta(days=15 - index),
+        open=prior_close, high=prior_close + 1, low=prior_close - 1, close=prior_close,
+        system_observed_at=candidate.market_data_time - timedelta(days=15 - index),
+        created_at=candidate.market_data_time - timedelta(days=15 - index), payload_sha256="a" * 64)
+        for index in range(15))
+    signal = CanonicalStockSignal(signal_id=signal_id, detector_id="S1",
+        security_id=source.security_id, underlyer=candidate.underlyer, direction=1,
+        interval="5m", session_date=candidate.market_data_time.date(), prior_close=prior_close,
+        prior_atr14=atr, threshold=Decimal("1"), trigger_price=spot, stop=prior_close,
+        target=spot + Decimal("2"), daily_bars=daily, bars=points, market_time=points[-1].bar_end,
+        available_at=candidate.observed_time, received_at=decision_at,
+        valid_until=inputs["decision"].valid_until)
+    decision = assess_canonical_stock_first(signal, source,
+        market_cutoff=inputs["decision"].market_cutoff, decision_at=decision_at)
+    technical = TechnicalExitEvidence(security_id=source.security_id,
+        underlyer=candidate.underlyer, direction=1, source_kind="CANONICAL_STOCK_SIGNAL",
+        source_policy_sha256=STOCK_BAR_SIGNAL_POLICY_SHA256, source_payload_sha256=signal.sha256,
+        source_revision_ids=tuple(point.bar_revision_id for point in points), interval="5m",
+        market_time=signal.market_time, available_at=signal.available_at,
+        received_at=signal.received_at, valid_until=signal.valid_until, atr=atr,
+        levels=(TechnicalLevel(level_id="prior-close", role="INVALIDATION", price=prior_close),
+            TechnicalLevel(level_id="symmetric-target", role="OPPOSING_STRUCTURE", price=signal.target)))
+    inputs.update(decision=decision, setup=None, trusted_source_policy=None,
+        stock_first_policy=None, canonical_stock_signal=signal, technical_evidence=technical,
+        technical_source_policy_sha256=STOCK_BAR_SIGNAL_POLICY_SHA256, management_policy=None)
+
+    qualified, plan = qualify_dual_origin_package(**inputs)
+
+    expected = hashlib.sha256(canonical_json(dict(version="canonical_stock_contract_recurrence_v1",
+        detector_id="S1", contract_id=source.contract_id, direction=1,
+        expiration_date=source.expiration_date.isoformat(),
+        qualification_policy_sha256=qualified.qualification_policy_sha256)).encode("ascii")).hexdigest()
+    assert qualified.recurrence_sha256 == expected
+    assert isinstance(qualified, QualifiedCanonicalStockPackage)
+    assert qualified.recurrence_contract_id == source.contract_id
+    assert qualified.confirmation_timeframe == "5m"
+    assert '"source_kind":"CANONICAL_STOCK_SIGNAL"' in plan.payload_json
+    assert '"interval":"5m"' in plan.payload_json
+    selected = select_dual_origin_packages((qualified,), {}, decision_at=qualified.decision_at,
+        scheduled_cycle=qualified.scheduled_cycle, expected_underlyers=(qualified.underlyer,),
+        completed_matrices={qualified.underlyer: qualified.matrix_id})
+    record = build_selection_evidence(selected, {plan.sha256: plan},
+        dataset_id="canonical-stock-selection", selected_at=qualified.decision_at)[0]
+    assert isinstance(load_evaluation_evidence(record.canonical_json()).package,
+        QualifiedCanonicalStockPackage)
+    later = qualified.model_copy(update={"decision_at": qualified.decision_at + timedelta(seconds=1),
+        "exposure_sha256": "f" * 64, "confirmation_timeframe": "30m"})
+    selection = select_dual_origin_packages((later,), {qualified.recurrence_sha256: qualified},
+        decision_at=later.decision_at, scheduled_cycle=later.scheduled_cycle,
+        expected_underlyers=(later.underlyer,), completed_matrices={later.underlyer: later.matrix_id})
+    assert selection["members"] == [] and len(selection["observations"]) == 1
+    assert selection["evidence"]["by_model"]["S1"]["repeat_hits"] == 1
 
 
 @pytest.mark.parametrize("mutation", ["raw_price", "adjusted", "late_receipt", "management", "entry_deadline", "exit_expiry", "valuation", "activity", "thesis_source"])

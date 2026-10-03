@@ -33,10 +33,10 @@ WITH visible AS (
       AND session_scope = 'RTH'
       AND adjusted = %(adjusted)s
       AND is_final = TRUE
-      AND NOT (
+      AND (%(include_historical_grouped)s OR NOT (
           availability_mode = 'HISTORICAL_RECONSTRUCTED'
           AND quality_codes @> ARRAY['GROUPED_DAILY_AGGREGATE']::TEXT[]
-      )
+      ))
     ORDER BY ticker, bar_start, created_at DESC
 ),
 moves AS (
@@ -59,7 +59,8 @@ LEFT JOIN equity_corporate_actions AS action
     ON action.ticker = moves.ticker
    AND action.action_type = 'SPLIT'
    AND action.effective_date = moves.bar_start::date
-WHERE moves.pct_change <= %(down)s OR moves.pct_change >= %(up)s
+WHERE (moves.pct_change <= %(down)s OR moves.pct_change >= %(up)s)
+  AND (%(ticker)s IS NULL OR moves.ticker = %(ticker)s)
 ORDER BY moves.ticker, moves.bar_start
 """
 
@@ -68,10 +69,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--interval", default="1d")
     parser.add_argument("--adjusted", action="store_true")
+    parser.add_argument(
+        "--include-historical-grouped",
+        action="store_true",
+        help="Include grouped-daily historical reconstructed bars; required to inspect adjusted backfills.",
+    )
     parser.add_argument("--down", type=float, default=-0.38)
     parser.add_argument("--up", type=float, default=0.60)
     parser.add_argument("--limit", type=int, default=40)
+    parser.add_argument("--ticker", help="Restrict the audit to one ticker.")
     args = parser.parse_args()
+    ticker = args.ticker.upper() if args.ticker else None
 
     with get_db_cursor() as cursor:
         cursor.execute(
@@ -79,8 +87,10 @@ def main() -> int:
             {
                 "interval": args.interval,
                 "adjusted": args.adjusted,
+                "include_historical_grouped": args.include_historical_grouped,
                 "down": args.down,
                 "up": args.up,
+                "ticker": ticker,
             },
         )
         rows = cursor.fetchall()
