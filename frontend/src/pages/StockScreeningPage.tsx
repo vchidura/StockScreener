@@ -9,6 +9,7 @@ import { appliedScreeningColumns, comparisonDate, compileDraft, DEFAULT_COLUMNS,
 import { useScreenLibrary } from './useScreenLibrary'
 import { dailyCoverageNotice } from './screeningModel'
 import ScreenLibrary, { Modal } from './ScreenLibrary'
+import PatternWatchLink from './PatternWatchLink'
 import './StockScreeningPage.css'
 
 export default function StockScreeningPage() {
@@ -248,7 +249,7 @@ function ScreeningDetailDrawer({ row, catalog, generation, comparison, hourlySta
       : explanation.observations ? explanation.observations.map(observation => `${catalog.patterns[observation.field]?.label || observation.field}: ${readableState(observation.state)}`).join('; ')
         : `${formatValue(explanation.value, catalog.fields[explanation.field])} (${readableState(explanation.reason || explanation.state)})`
   return <div className="sw-detail-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}><aside className="sw-detail-drawer" role="dialog" aria-modal="true" aria-labelledby="sw-detail-title">
-    <header><div><span>Daily screening snapshot</span><h2 id="sw-detail-title"><Link to={`/ticker/${encodeURIComponent(row.ticker)}`}>{row.ticker}</Link></h2><p>{row.company_name || 'Company name unavailable'} / {row.session}</p></div><button type="button" className="sw-detail-close" aria-label="Close stock details" title="Close stock details" autoFocus onClick={onClose}><X size={18} /></button></header>
+    <header><div><span>Daily screening snapshot</span><h2 id="sw-detail-title"><Link to={`/ticker/${encodeURIComponent(row.ticker)}`}>{row.ticker}</Link> <PatternWatchLink ticker={row.ticker} className="sw-detail-pattern-link" /></h2><p>{row.company_name || 'Company name unavailable'} / {row.session}</p></div><button type="button" className="sw-detail-close" aria-label="Close stock details" title="Close stock details" autoFocus onClick={onClose}><X size={18} /></button></header>
     <div className="sw-detail-body">
       {groups.map(group => <section key={group.title}><h3>{group.title}</h3><div className="sw-detail-grid">{group.facts.map(fact => <div key={fact.field}><span>{fact.label}</span><strong className={fact.tone}>{fact.value}</strong>{fact.missing && <small>{readableState(fact.missing)}</small>}</div>)}</div></section>)}
       {row.hourly && <section><h3>Hourly behavior</h3><p className="sw-detail-note">{generation.hourly_source ? hourlyContextTiming(generation.market_time, generation.hourly_source) : 'Hourly timing unavailable'}{hourlyStale ? ' / Stale' : ''}</p><div className="sw-detail-grid">{Object.entries(catalog.hourly?.fields || {}).map(([field, spec]) => <div key={field}><span>{spec.label}</span><strong className={field === 'close' ? '' : screeningValueClass('change', row.hourly!.values[field])}>{field === 'close' && row.hourly!.values[field] != null ? `$${formatValue(row.hourly!.values[field])}` : formatValue(row.hourly!.values[field], spec)}</strong>{row.hourly!.missing[field] && <small>{readableState(row.hourly!.missing[field])}</small>}</div>)}</div></section>}

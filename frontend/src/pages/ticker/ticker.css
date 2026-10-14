@@ -1,6 +1,45 @@
+.tk-analysis-provenance {
+  width: 100%;
+  min-width: 0;
+  font-size: 0.75rem;
+  color: var(--tm-muted);
+}
+.tk-analysis-provenance dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr));
+  gap: 0.35rem 1rem;
+  margin: 0.35rem 0;
+}
+.tk-analysis-provenance dl > div {
+  display: grid;
+  grid-template-columns: 4.5rem minmax(0, 1fr);
+  gap: 0.35rem;
+  min-width: 0;
+}
+.tk-analysis-provenance dd { margin: 0; overflow-wrap: anywhere; }
+.tk-analysis-provenance summary { cursor: pointer; width: fit-content; }
+.tk-analysis-provenance summary:focus-visible { outline: 2px solid var(--tm-ink); outline-offset: 3px; }
+
 .ticker-workspace {
   padding: 12px 14px 24px;
 }
+
+.ticker-workspace__state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 320px;
+  padding: 24px;
+  color: var(--tm-muted);
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+.ticker-workspace__state strong { color: var(--tm-ink); }
+.ticker-workspace__state p { margin: 0; max-width: 36rem; }
+.ticker-workspace__state progress { width: min(100%, 16rem); accent-color: var(--tm-accent); }
+.ticker-workspace__state button { display: inline-flex; align-items: center; gap: 6px; }
 
 .ticker-tabs {
   display: flex;
@@ -249,6 +288,16 @@
   background: var(--tm-surface);
   border: 1px solid var(--tm-line);
   border-radius: 8px;
+}
+
+.ticker-entity > .tk-analysis-provenance {
+  box-sizing: border-box;
+  padding: 10px 13px;
+  border-top: 1px solid var(--tm-line);
+}
+.ticker-entity > .tk-analysis-provenance summary {
+  color: var(--tm-ink);
+  font-weight: 600;
 }
 
 .ticker-entity__head {

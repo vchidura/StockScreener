@@ -91,6 +91,12 @@ function Notice({ children, retry }: { children: ReactNode; retry?: () => void }
   return <div className="sd-notice" role="alert"><AlertTriangle size={16} aria-hidden="true" /><span>{children}</span>{retry && <button type="button" onClick={retry}>Retry</button>}</div>
 }
 
+function optionAlertsUnavailableReason(reason: string | null | undefined) {
+  if (reason === 'EQUITY_ONLY_COHORT') return 'The selected realtime cohort contains no option underlyings or detector datasets.'
+  if (reason === 'ACTIVE_COHORT_UNAVAILABLE') return 'The selected realtime cohort is unavailable.'
+  return label(reason || 'OPTIONS_ALERTS_UNAVAILABLE')
+}
+
 function Rules({ values }: { values: Record<string, unknown> | null | undefined }) {
   if (!values || !Object.keys(values).length) return <p className="oa-muted">No retained management rules</p>
   return <dl className="oa-facts">{Object.entries(values).map(([key, value]) => <div key={key}><dt>{label(key)}</dt><dd>{value == null ? 'Unavailable' : typeof value === 'object' ? JSON.stringify(value) : String(value)}</dd></div>)}</dl>
@@ -184,6 +190,34 @@ function RecordedDecisionEvidence({ data }: { data: OptionCandidateDetailData })
   </>
 }
 
+function RetainedAdvisoryContext({ data }: { data: OptionCandidateDetailData }) {
+  const context = data.advisory_context
+  if (!context) return null
+  const trades = context.trades
+  return <section aria-label="Retained advisory context">
+    <div className="oa-section-heading"><h3>Retained context</h3><Status value="ADVISORY" /></div>
+    <dl className="oa-facts">
+      <div><dt>Pricing assumption</dt><dd>{data.valuation_assumption === 'EXPLICIT_ZERO_YIELD_RESEARCH' ? 'Zero-yield research' : label(data.valuation_assumption || 'UNAVAILABLE')}</dd></div>
+      <div><dt>Trade coverage</dt><dd><Status value={trades.status} /><small>{label(trades.reason || trades.scope || 'TARGET_LOCAL_TRADE_WINDOW_NOT_RETAINED')}</small></dd></div>
+      <div><dt>Eligible retained volume</dt><dd>{trades.volume == null ? 'Unavailable' : trades.volume.toLocaleString()}</dd></div>
+      <div><dt>Eligible retained premium</dt><dd>{money(trades.transacted_premium)}</dd></div>
+      <div><dt>Trade window (ET)</dt><dd>{time(trades.window_start)} / {time(trades.window_end)}</dd></div>
+      <div><dt>Aggressor side</dt><dd>Unavailable</dd></div>
+    </dl>
+    {trades.classification_counts && <Rules values={trades.classification_counts} />}
+    {context.gamma.profiles.length ? <div className="oa-leg-scroll" tabIndex={0} role="region" aria-label="Retained gamma context"><table className="oa-legs"><thead><tr>
+      <th>Scope</th><th>Signed GEX / 1%</th><th>Unsigned GEX / 1%</th><th>Gamma flip</th><th>Coverage / quality</th><th>Dealer assumption</th>
+    </tr></thead><tbody>{context.gamma.profiles.map(({ scope, profile }) => <tr key={scope}>
+      <td>{label(scope)}<small>{label(profile.flip.regime_at_spot)}</small></td>
+      <td>{money(profile.net_gamma_notional_per_percent)}</td><td>{money(profile.absolute_gamma_notional_per_percent)}</td>
+      <td>{money(profile.flip.flip_spot)}<small>{profile.flip.reasons.map(label).join(' / ')}</small></td>
+      <td>{optionAlertPercent(profile.coverage_fraction)} / {profile.contributing_contract_count}<small>{profile.quality_reasons.map(label).join(' / ')}</small></td>
+      <td>{label(profile.convention)}</td>
+    </tr>)}</tbody></table></div> : <Notice>Gamma profiles unavailable</Notice>}
+    <p className="oa-muted">Retained chain scope / Dealer hypothesis / No directional trade-flow claim</p>
+  </section>
+}
+
 function CandidateDetail({ candidateId, close }: { candidateId: string; close: () => void }) {
   const detail = useQuery({ queryKey: ['option-alert-candidate', candidateId], queryFn: () => getOptionCandidate(candidateId), staleTime: 0, refetchOnMount: 'always', retry: false, refetchOnWindowFocus: false })
   const [form, setForm] = useState<OptionAlertForm>({ ...emptyOptionAlertForm })
@@ -210,7 +244,7 @@ function CandidateDetail({ candidateId, close }: { candidateId: string; close: (
   return <Modal title="Option candidate details" close={close} wide><div className="oa-detail">
     {detail.isPending && <div className="oa-loading" role="status">Loading candidate...</div>}
     {detail.isError && <Notice retry={() => { void detail.refetch() }}>Candidate request failed.</Notice>}
-    {detail.data && !detail.data.available && <Notice>{label(detail.data.reason || 'CANDIDATE_UNAVAILABLE')}</Notice>}
+    {detail.data && !detail.data.available && <Notice>{optionAlertsUnavailableReason(detail.data.reason)}</Notice>}
     {candidate && <>
       <div className="oa-detail-heading"><div><h3>{candidate.underlying} <span>{label(candidate.structure_type)}</span></h3><p>{candidate.display_name || label(candidate.strategy_name)} <span className="oa-muted">/ {candidate.strategy_version}</span></p></div><Status value={candidate.status} /></div>
       <dl className="oa-facts"><div><dt>Source market time (ET)</dt><dd>{time(candidate.market_data_time)}</dd></div><div><dt>Originally observed (ET)</dt><dd>{time(candidate.observed_time)}</dd></div><div><dt>Original entry deadline (ET)</dt><dd>{time(candidate.valid_until)}</dd></div><div><dt>Entry window</dt><dd><Status value={optionEntryWindow(candidate.valid_until)} /></dd></div></dl>
@@ -218,13 +252,14 @@ function CandidateDetail({ candidateId, close }: { candidateId: string; close: (
       {candidate.candidate_kind !== 'RESEARCH_ONLY' && <section aria-label="Current Advanced quotes"><div className="oa-section-heading"><h3>Current Advanced quotes</h3><button type="button" className="oa-icon" title="Refresh stored Advanced quotes" aria-label="Refresh stored Advanced quotes" disabled={currentQuotes.isFetching} onClick={() => { void currentQuotes.refetch() }}><RefreshCw size={15} /></button></div>{currentQuotes.isFetching && <p className="oa-muted" role="status">Reading stored quotes...</p>}{currentQuotes.data?.available ? <dl className="oa-facts">{currentQuotes.data.data.quotes.map(quote => <div key={quote.contract_id}><dt>{quote.contract_ticker}</dt><dd>{money(quote.bid)} / {money(quote.ask)}<small>{time(quote.quote_time)} ET</small></dd></div>)}</dl> : <Notice>{label(currentQuotes.data?.reason || 'ADVANCED_QUOTES_UNAVAILABLE')}</Notice>}<p className="oa-permission"><ShieldAlert size={14} aria-hidden="true" />Stored stream state only / No provider fetch / No execution permission</p></section>}
       {candidate.candidate_kind === 'RESEARCH_ONLY' ? <section aria-label="Observation evidence"><h3>Observation output</h3><p className="oa-muted">{candidate.source_contract_ticker || 'Source contract unavailable'} / No structured package</p><Rules values={candidate.primary_evidence} /></section> : <section aria-label="Package economics"><h3>Indicative structured package</h3><dl className="oa-facts"><div><dt>Original package price / share</dt><dd><PackagePrice netPremium={candidate.net_premium} legs={data?.legs || []} /></dd></div></dl><Legs rows={data?.legs || []} /><Economics values={candidate as unknown as Record<string, unknown>} /></section>}
       <StockBehaviorEvidence evidence={data?.research_evidence} />
+      {data && <RetainedAdvisoryContext data={data} />}
       {candidate.candidate_kind !== 'RESEARCH_ONLY' && <><PackageEvidence evidence={data?.research_evidence} /><ScenarioEvidence rows={data?.scenarios || []} /></>}
       {data && <RecordedDecisionEvidence data={data} />}
       <section aria-label="Calibrated probability"><div className="oa-section-heading"><h3>Probability</h3><Status value={data?.research_evidence?.probability.status || 'UNAVAILABLE'} /></div><Notice>{label(data?.research_evidence?.probability.reason || 'NO_QUALIFIED_CALIBRATION_REPORT')}</Notice><p className="oa-permission"><ShieldAlert size={14} aria-hidden="true" />Probability unavailable / No calibration claim / No execution permission</p></section>
       <section aria-label="Candidate qualification"><div className="oa-section-heading"><h3>Qualification</h3><span className="oa-muted">{assessment ? `${time(assessment.assessed_at)} ET` : ''}</span></div>
         {preview.isFetching && <p className="oa-muted" role="status">Assessing retained evidence...</p>}
         {preview.isError && <Notice retry={() => { void preview.refetch() }}>Qualification request failed. No preview result is available.</Notice>}
-        {preview.data && !preview.data.available && <Notice>{label(preview.data.reason || 'ASSESSMENT_UNAVAILABLE')}</Notice>}
+        {preview.data && !preview.data.available && <Notice>{optionAlertsUnavailableReason(preview.data.reason)}</Notice>}
         {assessment && <><div className="oa-assessments">{assessment.qualification.assessments.map(item => <div key={item.capability}><strong>{capabilityLabels[item.capability]}</strong><Status value={item.status} /><p>{item.blocking_inputs.length ? item.blocking_inputs.map(label).join(' / ') : 'No blocking inputs for this capability'}</p></div>)}</div>
           <div className="oa-section-heading"><h3>Plan blockers</h3><Status value={preview.isFetching ? 'ASSESSING' : dirty ? 'UNASSESSED_CHANGES' : assessment.status} /></div>
           {assessment.blockers.length ? <ul className="oa-blockers">{assessment.blockers.map((item, index) => <li key={`${item.code}-${index}`}><AlertTriangle size={13} aria-hidden="true" /><span>{label(item.code)}{item.field ? `: ${label(item.field)}` : ''}{item.inputs?.length ? `: ${item.inputs.map(label).join(', ')}` : ''}{item.message ? `: ${item.message}` : ''}</span></li>)}</ul> : <p className="oa-muted">No planning blockers at assessment time</p>}
@@ -553,7 +588,7 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, t
     </div>
     <DetectorResultsDisclosure datasets={index} review={data} params={params} update={update} />
     {presetError && <Notice>{presetError}</Notice>}
-    {failed && <Notice retry={refresh}>Detector alerts are unavailable.</Notice>}
+    {failed && <Notice retry={refresh}>{optionAlertsUnavailableReason(inventory.data?.reason || review.data?.reason)}</Notice>}
     {incompleteAttempt && <Notice>{data?.status === 'RUNNING' ? 'Detection is in progress.' : 'Detection did not complete.'}{data?.latest_run && ` Last completed run: ${time(data.latest_run.scheduled_cycle)} ET.`}</Notice>}
     {data?.status === 'PARTIAL' && data.run && <Notice>
       {data.run.covered_underlyings}/{data.run.expected_underlyings} tickers evaluated. Unavailable: {Object.keys(data.run.unavailable_underlyers || {}).join(', ')}.
@@ -680,9 +715,9 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
       </select></label>
       <button type="button" className="oa-icon" title="Refresh detector evaluation" aria-label="Refresh detector evaluation" disabled={review.isFetching} onClick={() => { void review.refetch() }}><RefreshCw size={15} /></button>
     </div>
-    {(inventory.isError || inventory.data && !inventory.data.available) && <Notice>Current result version is unavailable.</Notice>}
+    {(inventory.isError || inventory.data && !inventory.data.available) && <Notice>{optionAlertsUnavailableReason(inventory.data?.reason)}</Notice>}
     {(inventory.isPending || index && review.isPending) && <div className="sd-empty" role="status">Loading detector evaluation...</div>}
-    {(review.isError || review.data && !review.data.available) && <Notice retry={() => { void review.refetch() }}>Detector evaluation is unavailable.</Notice>}
+    {(review.isError || review.data && !review.data.available) && <Notice retry={() => { void review.refetch() }}>{optionAlertsUnavailableReason(review.data?.reason)}</Notice>}
     {data && !data.storage_ready && <Notice>Detector evaluation storage is not deployed. No selected or overflow results have been recorded.</Notice>}
     {data?.storage_ready && <>
       <div className="sd-metrics"><span>{data.session_date || 'No evaluated session'}</span><span><strong>{data.total}</strong> evaluation records in scope</span><span>Alert limit: {data.maximum_new_alerts} new / run</span></div>

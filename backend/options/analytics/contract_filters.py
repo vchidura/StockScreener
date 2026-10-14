@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from options.domain import ContractType, DataQualityFlag, ExerciseStyle
@@ -58,7 +59,10 @@ def filter_contract(
     strike_corridor_fraction: Decimal = Decimal("0.15"),
     minimum_day_volume: int = 20,
     minimum_open_interest: int = 100,
+    liquidity_rule: Literal["OR", "AND"] = "OR",
 ) -> ContractFilterResult:
+    if liquidity_rule not in {"OR", "AND"}:
+        raise ValueError("liquidity rule must be OR or AND")
     market_time = _as_utc(market_time, "market_time")
     expiration_cutoff = _as_utc(expiration_cutoff, "expiration_cutoff")
     calendar_dte = (expiration_date - market_time.astimezone(ET).date()).days
@@ -105,7 +109,12 @@ def filter_contract(
     open_interest_passes = (
         open_interest is not None and open_interest >= minimum_open_interest
     )
-    if not volume_passes and not open_interest_passes:
+    liquidity_passes = (
+        volume_passes and open_interest_passes
+        if liquidity_rule == "AND"
+        else volume_passes or open_interest_passes
+    )
+    if not liquidity_passes:
         reasons.append(FilterReason.LIQUIDITY_FLOOR)
 
     return ContractFilterResult(

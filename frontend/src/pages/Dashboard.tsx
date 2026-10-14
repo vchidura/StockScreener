@@ -3,13 +3,16 @@ import { useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   scanAll,
-  getTickersOverview, getLatestPriceDate,
+  getTickersOverview, getLatestPricePublication,
+  resolveDashboardPublication, requireMatchingPublication,
   TickerOverviewRow,
   MarketRegime,
+  DashboardPublication,
 } from '../services/api'
 import { MomentumRanks } from './EquityContextPanels'
 import { usePublishPageContext } from '../layout/pageContext'
 import { CommandBar, CommandSpacer } from '../layout/PageChrome'
+import { publicationPath, usePublicationQuery } from './publicationNavigation'
 
 // Muted strategy palette
 const STRAT = [
@@ -28,6 +31,7 @@ const MIN_CHG_OPTIONS = [{ label: 'Any', value: 0 }, { label: '1%+', value: 1 },
 const CARD: React.CSSProperties = {
   background: 'var(--tm-surface)', border: '1px solid var(--tm-line)', borderRadius: '10px', padding: '16px',
   boxShadow: '0 1px 3px rgba(0,0,0,0.04)', display: 'flex', flexDirection: 'column',
+  minWidth: 0,
 }
 const SECTION_TITLE: React.CSSProperties = {
   margin: '0 0 12px', fontSize: '0.92rem', fontWeight: 700, color: 'var(--tm-ink)',
@@ -40,16 +44,22 @@ const selectStyle: React.CSSProperties = {
 }
 
 function Dashboard() {
+  const realtimeOnly = import.meta.env.VITE_REALTIME_ONLY === 'true'
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const [loading, setLoading] = useState(false)
-  const { data: latestDate = '' } = useQuery({
+  const [canonicalLoading, setLoading] = useState(false)
+  const [scanError, setScanError] = useState('')
+  const canonicalLatestQuery = useQuery({
     queryKey: ['latest-price-date'],
-    queryFn: () => getLatestPriceDate(),
+    queryFn: () => getLatestPricePublication(),
+    retry: realtimeOnly ? false : undefined,
+    enabled: !realtimeOnly,
   })
-  const { data: overview = [], isFetching: overviewLoading } = useQuery<TickerOverviewRow[]>({
+  const canonicalOverviewQuery = useQuery<TickerOverviewRow[]>({
     queryKey: ['tickers', 'overview'],
     queryFn: () => getTickersOverview(),
+    enabled: !realtimeOnly,
+    retry: realtimeOnly ? false : undefined,
   })
   type StratEntry = { strategy: string; direction: 'buy' | 'sell' | 'hold'; weight: number }
   type FibWatchEntry = { ticker: string; signal: string; nearest_level: string; distance_pct: number; trend: string }
@@ -59,14 +69,19 @@ function Dashboard() {
     fibWatchlist: FibWatchEntry[]
     marketRegime: MarketRegime | null
     scanTime: string
+    publication?: DashboardPublication
   }
 
-  const fetchDashboardScan = useCallback(async (refresh = false): Promise<DashboardScanData> => {
-    if (refresh) {
+  const fetchDashboardScan = useCallback(async (refresh = false, snapshotId?: string): Promise<DashboardScanData> => {
+    if (realtimeOnly && !snapshotId) throw new Error('Stored Dashboard publication unavailable')
+    if (refresh && !realtimeOnly) {
       queryClient.invalidateQueries({ queryKey: ['latest-price-date'] })
       queryClient.invalidateQueries({ queryKey: ['tickers', 'overview'] })
     }
-    const combined = await scanAll(undefined, undefined, refresh)
+    const combined = await scanAll(undefined, undefined, refresh, snapshotId)
+    if (realtimeOnly && combined.publication?.snapshot_id !== snapshotId) {
+      throw new Error('Stored Dashboard scan does not match the requested publication')
+    }
     const gapData = combined.gaps
     const maData = combined.ma_crossover
     const momentumData = combined.momentum_pullback
@@ -152,17 +167,37 @@ function Dashboard() {
       fibSentiment: sent,
       fibWatchlist: watchlist,
       marketRegime: combined.market_regime ?? null,
-      scanTime: new Date().toLocaleTimeString(),
+      scanTime: realtimeOnly ? combined.scan_datetime : new Date().toLocaleTimeString(),
+      publication: combined.publication,
     }
-  }, [queryClient])
+  }, [queryClient, realtimeOnly])
 
+  const realtimeQuery = usePublicationQuery('dashboard-publication', async pin => {
+    const publication = await resolveDashboardPublication(pin)
+    const [overview, scan] = await Promise.all([
+      getTickersOverview(undefined, false, publication.snapshot_id),
+      fetchDashboardScan(false, publication.snapshot_id),
+    ])
+    requireMatchingPublication(scan.publication, publication)
+    return { overview, scan, publication: scan.publication }
+  })
+  const publication = realtimeQuery.data?.publication
+  const latest = realtimeOnly ? (publication ? { latest_date: publication.session, publication } : undefined) : canonicalLatestQuery.data
+  const latestDate = latest?.latest_date ?? ''
+  const latestError = realtimeOnly ? (realtimeQuery.error ? new Error(realtimeQuery.error) : null) : canonicalLatestQuery.error
+  const overview = realtimeOnly ? realtimeQuery.data?.overview ?? [] : canonicalOverviewQuery.data ?? []
+  const overviewLoading = realtimeOnly ? realtimeQuery.loading && !realtimeQuery.data : canonicalOverviewQuery.isFetching
+  const loading = realtimeOnly ? realtimeQuery.loading : canonicalLoading
+  const overviewError = realtimeOnly ? latestError : canonicalOverviewQuery.error
+  const overviewUnavailable = realtimeOnly ? !publication : !!overviewError
   const scanQueryKey = ['dashboard-scan']
-  const { data: scanData } = useQuery<DashboardScanData>({
+  const canonicalScanQuery = useQuery<DashboardScanData>({
     queryKey: scanQueryKey,
     queryFn: () => fetchDashboardScan(),
     enabled: false,
     staleTime: 30 * 60 * 1000,
   })
+  const scanData = realtimeOnly ? realtimeQuery.data?.scan : canonicalScanQuery.data
   const scanComplete = !!scanData
   const tickerStrategies = scanData?.tickerStrategies ?? {}
   const fibSentiment = scanData?.fibSentiment ?? {}
@@ -170,20 +205,29 @@ function Dashboard() {
   const marketRegime = scanData?.marketRegime ?? null
 
   const runScan = useCallback(async (refresh = false) => {
+    if (realtimeOnly) {
+      await realtimeQuery.refresh()
+      return
+    }
     setLoading(true)
+    setScanError('')
     try {
-      if (refresh) {
+      if (refresh && !realtimeOnly) {
         queryClient.setQueryData(scanQueryKey, undefined)
       }
       await queryClient.fetchQuery({
         queryKey: scanQueryKey,
         queryFn: () => fetchDashboardScan(refresh),
+        staleTime: refresh ? 0 : 30 * 60 * 1000,
+        retry: realtimeOnly ? false : undefined,
       })
     } catch (err) {
       console.error('Dashboard scan failed:', err)
+      setScanError(err instanceof Error ? err.message : 'Dashboard scan failed')
+    } finally {
+      setLoading(false)
     }
-    setLoading(false)
-  }, [queryClient, fetchDashboardScan])
+  }, [queryClient, fetchDashboardScan, realtimeOnly, realtimeQuery.refresh])
 
   // Market breadth — computed from overview data (% of tickers above 200 SMA)
   const breadth = useMemo(() => {
@@ -359,7 +403,7 @@ function Dashboard() {
   })
 
   const renderMoversTable = (rows: TickerOverviewRow[]) => (
-    <div style={{ maxHeight: MOVERS_HEIGHT, overflowY: 'auto' }}>
+    <div style={{ maxHeight: MOVERS_HEIGHT, overflowY: 'auto', overflowX: 'auto' }}>
       <table style={{ width: '100%', fontSize: '0.84rem', borderCollapse: 'collapse' }}>
         <thead style={{ position: 'sticky', top: 0, background: 'var(--tm-surface)', zIndex: 1 }}>
           <tr style={{ borderBottom: '1px solid var(--tm-line)' }}>
@@ -397,9 +441,21 @@ function Dashboard() {
         </span>
         <CommandSpacer />
         <button type="button" className="tm-commandbar__action" onClick={() => runScan(true)} disabled={loading}>
-          {loading ? 'Scanning…' : scanComplete ? 'Rescan all strategies' : 'Run full scan'}
+          {loading ? (realtimeOnly ? 'Loading…' : 'Scanning…') : realtimeOnly ? 'Read stored scans' : scanComplete ? 'Rescan all strategies' : 'Run full scan'}
         </button>
       </CommandBar>
+      {realtimeOnly && publication && <div role="status" style={{ ...CARD, marginBottom: '1.25rem', fontSize: '0.78rem', overflowWrap: 'anywhere' }}>
+        <strong>{publication.scope_note}</strong>
+        <span>{publication.status} · Market time {publication.market_time} · Published {publication.generated_at}</span>
+        <span>Read at {publication.read_at} · Split-adjusted history; raw current quotes and 20-session liquidity. GET requests never compute or fetch.</span>
+        <span>Scanner context preserves adjusted OHLCV, including volume-sensitive heuristics. Raw-volume parity is UNVERIFIED; scanner volume is not Overview raw liquidity.</span>
+        <span>Sector references and 200-week history unavailable. Individual scanner navigation is not integrated.</span>
+        {publication.missing_producers.market_regime && <span>Market regime unavailable: SPY/QQQ cohort inputs are missing.</span>}
+      </div>}
+      {(latestError || overviewError || scanError || (realtimeOnly && latest && !publication)) && <div role="alert" style={{ ...CARD, marginBottom: '1.25rem', color: 'var(--tm-neg)' }}>
+        Dashboard publication unavailable: {scanError || latestError?.message || overviewError?.message || 'Missing realtime publication metadata'}.
+        Previously displayed values, if any, are retained; this is not a no-match result.
+      </div>}
 
       {/* ─── TOP MOVERS ─── */}
       <div style={{ marginBottom: '1.25rem' }}>
@@ -424,16 +480,18 @@ function Dashboard() {
             {filteredOverview.length} of {overview.length} tickers
           </span>
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '14px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 300px), 1fr))', gap: '14px' }}>
           <div style={CARD}>
             <h3 style={{ margin: '0 0 8px', fontSize: '0.92rem', color: 'var(--tm-pos)', fontWeight: 700 }}>🟢 Top Gainers</h3>
             {overviewLoading ? <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>Loading...</div>
+              : overviewUnavailable ? emptySlate('Movers publication unavailable')
               : topGainers.length === 0 ? <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>No data</div>
               : renderMoversTable(topGainers)}
           </div>
           <div style={CARD}>
             <h3 style={{ margin: '0 0 8px', fontSize: '0.92rem', color: 'var(--tm-neg)', fontWeight: 700 }}>🔴 Top Losers</h3>
             {overviewLoading ? <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>Loading...</div>
+              : overviewUnavailable ? emptySlate('Movers publication unavailable')
               : topLosers.length === 0 ? <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>No data</div>
               : renderMoversTable(topLosers)}
           </div>
@@ -444,7 +502,7 @@ function Dashboard() {
       {loading && (
         <div style={{ textAlign: 'center', padding: '1.5rem', background: 'var(--tm-surface-sunken)', borderRadius: '10px', border: '1px solid var(--tm-line)', marginBottom: '1.25rem' }}>
           <div className="spinner" style={{ margin: '0 auto 10px', width: '28px', height: '28px' }}></div>
-          <div style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--tm-ink)' }}>Scanning 400 tickers across 5 strategies...</div>
+          <div style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--tm-ink)' }}>{realtimeOnly ? `Reading stored scans for ${overview.length} cohort tickers...` : 'Scanning 400 tickers across 5 strategies...'}</div>
         </div>
       )}
 
@@ -529,7 +587,7 @@ function Dashboard() {
             {breadth && (
               <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid var(--tm-line)' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '14px', flexWrap: 'wrap' }}>
-                  <span style={{ fontSize: '0.7rem', fontWeight: 700, color: 'var(--tm-ink)' }}>📊 Market Breadth</span>
+                  <span style={{ fontSize: '0.7rem', fontWeight: 700, color: 'var(--tm-ink)' }}>📊 {realtimeOnly ? 'Selected Cohort Breadth' : 'Market Breadth'}</span>
                   {([
                     ['> 200 SMA', breadth.pct_200, breadth.above_200],
                     ['> 50 SMA', breadth.pct_50, breadth.above_50],
@@ -551,12 +609,13 @@ function Dashboard() {
       })()}
 
       {/* ─── ROW 2: Unusual Volume + Scanner Context ─── */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '14px', marginBottom: '1.25rem' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 300px), 1fr))', gap: '14px', marginBottom: '1.25rem' }}>
 
         {/* Unusual Volume */}
         <div style={CARD}>
           <h3 style={SECTION_TITLE}>🔥 Unusual Volume <span style={SUBTITLE}>RelVol ≥ 2x</span></h3>
           {overviewLoading ? <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>Loading...</div>
+            : overviewUnavailable ? emptySlate('Volume publication unavailable')
             : highVolMovers.length === 0 ? <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem', padding: '20px 0', textAlign: 'center' }}>No unusual volume detected</div>
             : (
               <div style={{ maxHeight: 340, overflowY: 'auto', flex: 1 }}>
@@ -597,15 +656,15 @@ function Dashboard() {
 
       </div>
 
-      <MomentumRanks />
+      <MomentumRanks snapshotId={publication?.snapshot_id} />
 
       {/* ─── ROW 3: Scanner Agreement + Fib Sentiment ─── */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '14px', marginBottom: '1.25rem' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 300px), 1fr))', gap: '14px', marginBottom: '1.25rem' }}>
 
         {/* Scanner agreement */}
         <div style={CARD}>
           <h3 style={SECTION_TITLE}>Scanner Agreement <span style={SUBTITLE}>2+ descriptive scanners pointing in the same direction</span></h3>
-          {!scanComplete ? emptySlate('Run Full Scan to detect confluence') : confluenceTickers.length === 0 ? (
+          {!scanComplete ? emptySlate(realtimeOnly ? 'Read stored scans to see agreement' : 'Run Full Scan to detect confluence') : confluenceTickers.length === 0 ? (
             <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem', padding: '16px 0', textAlign: 'center' }}>No multi-strategy confluence detected</div>
           ) : (
             <>
@@ -707,7 +766,7 @@ function Dashboard() {
         {/* Fib Sentiment */}
         <div style={CARD}>
           <h3 style={SECTION_TITLE}>🔢 Fib Sentiment</h3>
-          {!scanComplete ? emptySlate('Run Full Scan to see sentiment') : (
+          {!scanComplete ? emptySlate(realtimeOnly ? 'Read stored scans to see sentiment' : 'Run Full Scan to see sentiment') : (
             <>
               {/* Stacked bar */}
               {(() => {
@@ -783,7 +842,7 @@ function Dashboard() {
       {/* ─── QUICK NAV ─── */}
       <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
         {STRAT.map(s => (
-          <button key={s.key} onClick={() => navigate(s.path)}
+          <button key={s.key} onClick={() => navigate(publicationPath(s.path, publication?.snapshot_id))}
             style={{
               display: 'flex', alignItems: 'center', gap: '6px', padding: '7px 14px',
               background: 'var(--tm-surface)', border: `1px solid ${s.color}`, borderRadius: '7px',
@@ -794,7 +853,7 @@ function Dashboard() {
             {s.icon} {s.key} →
           </button>
         ))}
-        <button onClick={() => navigate('/overview')}
+        <button onClick={() => navigate(publicationPath('/overview', publication?.snapshot_id))}
           style={{
             display: 'flex', alignItems: 'center', gap: '6px', padding: '7px 14px',
             background: 'var(--tm-surface)', border: '1px solid var(--tm-line)', borderRadius: '7px',

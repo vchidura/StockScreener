@@ -23,7 +23,7 @@ type SessionDateStore = {
 
 const SessionDateContext = createContext<SessionDateStore | null>(null)
 
-export function SessionDateProvider({ children }: { children: ReactNode }) {
+export function SessionDateProvider({ children, enabled = true }: { children: ReactNode; enabled?: boolean }) {
   const [pinned, setPinned] = useState('')
   const [interval, setInterval] = useState('1d')
 
@@ -31,6 +31,7 @@ export function SessionDateProvider({ children }: { children: ReactNode }) {
     queryKey: ['market', 'trading-sessions', interval],
     queryFn: () => getTradingSessions(interval),
     staleTime: 60 * 1000,
+    enabled,
   })
 
   const sessions = useMemo(() => data?.sessions ?? [], [data])

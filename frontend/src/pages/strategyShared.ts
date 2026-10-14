@@ -65,3 +65,18 @@ export function intervalSemantics(interval: ScanInterval): IntervalSemantics {
 export function isPublishedSnapshot(interval: ScanInterval, scanDate: string): boolean {
   return interval === '1d' && !scanDate
 }
+import type { KeyboardEvent } from 'react'
+
+export function sortHeaderProps(activate: () => void, selected: boolean, direction: 'asc' | 'desc') {
+  return {
+    tabIndex: 0,
+    'aria-sort': selected ? (direction === 'asc' ? 'ascending' as const : 'descending' as const) : 'none' as const,
+    onClick: activate,
+    onKeyDown: (event: KeyboardEvent<HTMLTableCellElement>) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault()
+        activate()
+      }
+    },
+  }
+}

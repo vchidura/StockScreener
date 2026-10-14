@@ -24,6 +24,14 @@ class OptionExchangeCalendar:
             raise ValueError("market_time must belong to an exchange session")
         return session.date()
 
+    def session_open(self, session_date: date) -> datetime:
+        session = self._calendar.date_to_session(
+            pd.Timestamp(session_date), direction="none"
+        )
+        return self._calendar.session_open(session).to_pydatetime().astimezone(
+            timezone.utc
+        )
+
     def session_close(self, session_date: date) -> datetime:
         session = self._calendar.date_to_session(
             pd.Timestamp(session_date), direction="none"
@@ -31,6 +39,34 @@ class OptionExchangeCalendar:
         return self._calendar.session_close(session).to_pydatetime().astimezone(
             timezone.utc
         )
+
+    def latest_completed_minute_start(self, as_of: datetime) -> datetime:
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            raise ValueError("as_of must be timezone-aware")
+        observed = as_of.astimezone(timezone.utc)
+        session = self._calendar.date_to_session(
+            pd.Timestamp(observed.date()), direction="previous"
+        )
+        session_open = self._calendar.session_open(session).to_pydatetime().astimezone(
+            timezone.utc
+        )
+        session_close = self._calendar.session_close(session).to_pydatetime().astimezone(
+            timezone.utc
+        )
+        if session.date() != observed.date():
+            return session_close - timedelta(minutes=1)
+        if session.date() == observed.date() and observed > session_open:
+            completed_end = min(
+                observed.replace(second=0, microsecond=0),
+                session_close,
+            )
+            if completed_end > session_open:
+                return completed_end - timedelta(minutes=1)
+        previous = self._calendar.previous_session(session)
+        previous_close = self._calendar.session_close(previous).to_pydatetime().astimezone(
+            timezone.utc
+        )
+        return previous_close - timedelta(minutes=1)
 
     def next_session_open(self, session_date: date) -> datetime:
         session = self._calendar.date_to_session(

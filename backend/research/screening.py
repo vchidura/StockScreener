@@ -19,6 +19,17 @@ GAP_VERSION = "screening_daily_gap_context_v1"
 GAP_MAX_AGE = 20
 GAP_WINDOW = GAP_MAX_AGE + 2
 HOURLY_VERSION = "screening_hourly_context_v1"
+DEFERRED = {
+    "sector": "Dated source coverage not yet verified",
+    "industry": "Dated source coverage not yet verified",
+    "market_cap": "Dated source coverage not yet verified",
+    "rsi": "Indicator contract not yet inventoried",
+    "adx": "Indicator contract not yet inventoried",
+    "rs63": "Same-universe benchmark source not yet verified",
+    "atr": "Indicator contract not yet inventoried",
+    "active_setups": "Retained lifecycle and invalidation coverage not yet verified",
+    "persistence": "Requires five expected compatible daily screening publications",
+}
 
 
 def field(label, group, unit, warmup, *, kind="number", options=None, source="canonical_daily_bars"):
@@ -245,6 +256,15 @@ class Query(StrictModel):
         return self
 
 
+class SnapshotRowRequest(StrictModel):
+    generation: str = Field(min_length=64, max_length=64)
+    security_id: str = Field(min_length=1, max_length=64)
+
+
+class GapDetailRequest(SnapshotRowRequest):
+    gap: GapPredicate | None = None
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
@@ -348,6 +368,8 @@ def comparison_status(current, previous):
             return "INCOMPATIBLE_PUBLICATIONS"
     if current["capture_mode"] != "RECONSTRUCTED_FROM_RETAINED_PUBLICATION":
         return "REVISION_POLICY_UNAVAILABLE"
+    if current.get("screening_basis") != previous.get("screening_basis"):
+        return "INCOMPATIBLE_PUBLICATIONS"
     try:
         current_cutoff = datetime.fromisoformat(current["source_cutoff"])
         prior_cutoff = datetime.fromisoformat(previous["source_cutoff"])
@@ -364,6 +386,25 @@ def comparison_status(current, previous):
     return "READY"
 
 
+def _head_membership(state, row, prior, current, previous):
+    """`new_membership` over lineage heads (stored generations keep heads, not bar lists). Two consecutive
+    generations are one session apart, so the adjusted history of the later one without its latest bar is
+    the earlier one without its oldest, bar for bar (revision id and payload hash). That is stricter than the
+    warmup-window comparison of the listed form: a revision anywhere in the overlap, or any change to the set
+    of known actions (not only a new one), reads as changed history."""
+    if previous.get("historical_price_basis") != current["historical_price_basis"]:
+        return "UNAVAILABLE", "SOURCE_HISTORY_CHANGED"
+    if current.get("current_quote_bar_id") != row["source_bar_id"] or previous.get("current_quote_bar_id") != prior["source_bar_id"]:
+        return "UNAVAILABLE", "SOURCE_LINEAGE_UNAVAILABLE"
+    if (
+        current["previous_quote_bar_id"] != previous["current_quote_bar_id"]
+        or current["adjusted_without_latest_sha256"] != previous["adjusted_without_oldest_sha256"]
+        or current["actions"] != previous["actions"]
+    ):
+        return "UNAVAILABLE", "SOURCE_HISTORY_CHANGED"
+    return ("NEW", "PRIOR_NONMATCH") if state == "NO_MATCH" else ("NOT_NEW", "PRIOR_MATCH")
+
+
 def new_membership(row, prior, predicate, current_lineage, prior_lineage):
     if prior is None:
         return "UNAVAILABLE", "NO_PRIOR_MEMBERSHIP"
@@ -376,8 +417,21 @@ def new_membership(row, prior, predicate, current_lineage, prior_lineage):
         return "UNAVAILABLE", "PRIOR_FIELDS_UNAVAILABLE"
     if not current_lineage or not prior_lineage or not row.get("source_bar_id") or not prior.get("source_bar_id"):
         return "UNAVAILABLE", "SOURCE_LINEAGE_UNAVAILABLE"
+    if "bar_lineage" in current_lineage and "bar_lineage" in prior_lineage:
+        return _head_membership(state, row, prior, current_lineage, prior_lineage)
     warmup = max([GAP_WINDOW if predicate.gap is not None else 2] + [FIELDS[condition.field]["warmup_sessions"] for condition in predicate.filters])
     current_bars, prior_bars = current_lineage.get("bars", []), prior_lineage.get("bars", [])
+    if current_lineage.get("historical_price_basis") == "PROVIDER_SPLIT_ADJUSTED":
+        if prior_lineage.get("historical_price_basis") != current_lineage["historical_price_basis"]:
+            return "UNAVAILABLE", "SOURCE_HISTORY_CHANGED"
+        current_raw, prior_raw = current_lineage.get("raw_daily", []), prior_lineage.get("raw_daily", [])
+        if not current_raw or not prior_raw or current_raw[-1] != row["source_bar_id"] or prior_raw[-1] != prior["source_bar_id"]:
+            return "UNAVAILABLE", "SOURCE_LINEAGE_UNAVAILABLE"
+        if current_raw[-2] != prior_raw[-1]:
+            return "UNAVAILABLE", "SOURCE_HISTORY_CHANGED"
+        if current_bars[-warmup:-1] != prior_bars[-(warmup - 1):] or set(current_lineage.get("actions", [])) - set(prior_lineage.get("actions", [])):
+            return "UNAVAILABLE", "SOURCE_HISTORY_CHANGED"
+        return ("NEW", "PRIOR_NONMATCH") if state == "NO_MATCH" else ("NOT_NEW", "PRIOR_MATCH")
     if not current_bars or not prior_bars or current_bars[-1] != row["source_bar_id"] or prior_bars[-1] != prior["source_bar_id"]:
         return "UNAVAILABLE", "SOURCE_LINEAGE_UNAVAILABLE"
     if current_bars[-warmup:-1] != prior_bars[-(warmup - 1):] or set(current_lineage.get("actions", [])) - set(prior_lineage.get("actions", [])):

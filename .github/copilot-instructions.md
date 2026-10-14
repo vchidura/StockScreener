@@ -11,7 +11,11 @@ Keep this always-loaded file short. Detailed guidance is loaded only when needed
   that do not touch a matching file.
 - For multi-step Stock Alerts work, load only
   [stock-alerts](../docs/agent-context/stock-alerts.md). For Options Alerts work,
-  load only [options-alerts](../docs/agent-context/options-alerts.md). Follow
+  load only [options-alerts](../docs/agent-context/options-alerts.md). For realtime
+  scaling or V2 schema work, load only
+  [advanced-realtime](../docs/agent-context/advanced-realtime.md) and, when a schema
+  or retention decision is needed, the
+  [V2 design](../docs/REALTIME_SCHEMA_V2_DESIGN.md). Follow
   [context retention](../docs/AGENT_CONTEXT.md) for compact handoffs. Do not load
   retired checkpoints, the entire repository memory or prior conversation history.
 - Start a new chat when changing model, workstream or design/implementation/runtime

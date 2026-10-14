@@ -294,13 +294,19 @@ def test_worker_group_stop_requires_confirmed_owned_shutdown(monkeypatch, tmp_pa
     assert json.loads((tmp_path / "projections/stop.json").read_text())["instance_id"] == "current"
 
 
-def test_managed_worker_tasks_resolve_group_picker_and_use_process_execution():
+def test_vscode_tasks_use_process_execution_and_resolve_declared_inputs():
     tasks = json.loads((ROOT / ".vscode/tasks.json").read_text(encoding="utf-8"))
-    picker = next(row for row in tasks["inputs"] if row["id"] == "managedWorkerGroup")
-    assert picker["type"] == "pickString" and set(picker["options"]) == {"projections", "references", "options"}
-    selected = [row for row in tasks["tasks"] if "${input:managedWorkerGroup}" in row.get("args", [])]
-    assert len(selected) == 3 and all(row["type"] == "process" for row in selected)
-    assert {row["args"][-1] for row in selected} == {"--status", "--check", "--stop"}
+    labels = [row["label"] for row in tasks["tasks"]]
+    assert labels and len(labels) == len(set(labels))
+    assert all(row["type"] == "process" and isinstance(row["args"], list)
+               and row["options"]["cwd"] == "${workspaceFolder}" for row in tasks["tasks"])
+    declared_inputs = {row["id"] for row in tasks.get("inputs", [])}
+    referenced_inputs = {
+        argument[len("${input:"):-1]
+        for row in tasks["tasks"] for argument in row["args"]
+        if argument.startswith("${input:") and argument.endswith("}")
+    }
+    assert declared_inputs == referenced_inputs
 
 
 def test_one_shot_plan_orders_screening_after_equity_and_uses_explicit_flags():

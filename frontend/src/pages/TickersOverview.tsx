@@ -1,12 +1,15 @@
 import { useState, useMemo, useCallback } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Settings } from 'lucide-react'
 import { usePublishPageContext } from '../layout/pageContext'
 import { useSessionDate } from '../layout/sessionDate'
+import '../layout/pageChrome.css'
+import { usePublicationQuery } from './publicationNavigation'
 import { NO_TREND_ADX, momentumTitle, trendLabel, trendTitle } from './setupPresentation'
 import {
   getTickersOverview, TickerOverviewRow,
+  getAllTickersPublication,
   getSetupSummary, SetupSummaryResponse, SetupSummaryRow, SetupSummaryInterval,
 } from '../services/api'
 
@@ -39,6 +42,7 @@ const DEFAULT_HIDDEN_COLUMNS = [
 ]
 
 function TickersOverview() {
+  const realtimeOnly = import.meta.env.VITE_REALTIME_ONLY === 'true'
   const queryClient = useQueryClient()
   const [sortField, setSortField] = useState<SortField>('ticker')
   const [sortDir, setSortDir] = useState<SortDir>('asc')
@@ -49,29 +53,43 @@ function TickersOverview() {
   const [presetFilter, setPresetFilter] = useState('')
   const [presetPct, setPresetPct] = useState(5)
   const { pinned: scanDate } = useSessionDate()
-  const [hiddenCols, setHiddenCols] = useState<Set<string>>(new Set(DEFAULT_HIDDEN_COLUMNS))
+  const [hiddenCols, setHiddenCols] = useState<Set<string>>(() => new Set(DEFAULT_HIDDEN_COLUMNS))
   const [showColPicker, setShowColPicker] = useState(false)
-  const navigate = useNavigate()
 
-  const { data = [], isFetching: loading, error: queryError } = useQuery<TickerOverviewRow[]>({
+  const realtimeQuery = usePublicationQuery('all-tickers', getAllTickersPublication)
+  const overviewQuery = useQuery<TickerOverviewRow[]>({
     queryKey: ['tickers', 'overview', scanDate],
     queryFn: () => getTickersOverview(scanDate || undefined),
+    enabled: !realtimeOnly,
   })
-  const error = queryError ? (queryError as Error).message : null
+  const data = (realtimeOnly ? realtimeQuery.data?.overview : overviewQuery.data) ?? []
+  const weekly200Available = data.some(row => row.wsma_200 != null)
+  const loading = realtimeOnly ? realtimeQuery.loading : overviewQuery.isFetching
+  const error = realtimeOnly ? realtimeQuery.error : overviewQuery.error?.message
+  const evidenceRefs = realtimeQuery.data?.setup_evidence_refs
 
   const handleRefresh = useCallback(async () => {
+    if (realtimeOnly) {
+      await realtimeQuery.refresh()
+      return
+    }
     const key = ['tickers', 'overview', scanDate]
     queryClient.setQueryData(key, undefined)
     queryClient.invalidateQueries({ queryKey: ['setup-summary'] })
     await queryClient.fetchQuery({ queryKey: key, queryFn: () => getTickersOverview(scanDate || undefined, true) })
-  }, [scanDate, queryClient])
+  }, [scanDate, queryClient, realtimeOnly, realtimeQuery.refresh])
 
   // Published setup state for the whole universe; a read, not a scan.
-  const { data: setupData, isFetching: setupLoading, isError: setupError } = useQuery<SetupSummaryResponse>({
+  const setupQuery = useQuery<SetupSummaryResponse>({
     queryKey: ['setup-summary', SETUP_INTERVAL],
     queryFn: () => getSetupSummary(SETUP_INTERVAL),
     staleTime: 5 * 60 * 1000,
+    enabled: !realtimeOnly,
   })
+  const setupData = realtimeOnly ? realtimeQuery.data?.setup : setupQuery.data
+  const setupLoading = realtimeOnly ? realtimeQuery.loading : setupQuery.isFetching
+  const setupError = realtimeOnly ? !!realtimeQuery.error : setupQuery.isError
+  const confirmationUnavailable = realtimeOnly && !!setupData && setupData.results.every(row => row.multi_tf_agree == null)
 
   const setupMap = useMemo(() => {
     const map: Record<string, SetupSummaryRow> = {}
@@ -323,9 +341,11 @@ function TickersOverview() {
   const visibleColumns = columns.filter(c => !hiddenCols.has(c.key))
 
   usePublishPageContext({
-    eyebrow: 'Market · full universe',
+    eyebrow: realtimeOnly ? 'Market · selected realtime cohort' : 'Market · full universe',
     title: 'All Tickers',
-    detail: 'Price, momentum, key moving averages, and published trade-setup state for every tracked ticker.',
+    detail: realtimeOnly
+      ? 'Price, momentum, key moving averages, and published daily setups for the exact retained cohort.'
+      : 'Price, momentum, key moving averages, and published trade-setup state for every tracked ticker.',
     session: SETUP_INTERVAL,
   })
 
@@ -442,9 +462,12 @@ function TickersOverview() {
         style: pctColor(row.dist_200) || {},
       }
       case 'wsma_50': return { content: fmt(row.wsma_50), style: maColor(row.close, row.wsma_50) || {} }
-      case 'wsma_200': return { content: fmt(row.wsma_200), style: { fontWeight: 'bold', ...(maColor(row.close, row.wsma_200) || {}) } }
+      case 'wsma_200': return {
+        content: row.wsma_200 != null ? fmt(row.wsma_200) : <span title="200 complete weekly bars are required; no published 200-week average is available.">N/A</span>,
+        style: { fontWeight: 'bold', ...(maColor(row.close, row.wsma_200) || {}) },
+      }
       case 'dist_200w': return {
-        content: row.dist_200w != null ? (row.dist_200w > 0 ? '+' : '') + row.dist_200w.toFixed(1) + '%' : '—',
+        content: row.dist_200w != null ? (row.dist_200w > 0 ? '+' : '') + row.dist_200w.toFixed(1) + '%' : <span title="No published distance from the 200-week average is available.">N/A</span>,
         style: pctColor(row.dist_200w) || {},
       }
       default: return { content: '—' }
@@ -458,6 +481,7 @@ function TickersOverview() {
         <input
           type="text"
           placeholder="Filter by ticker..."
+          aria-label="Filter by ticker"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
           style={{
@@ -472,6 +496,8 @@ function TickersOverview() {
           value={sectorFilter}
           onChange={(event) => setSectorFilter(event.target.value)}
           aria-label="Filter by sector"
+          disabled={realtimeOnly && sectors.length === 0}
+          title={realtimeOnly && sectors.length === 0 ? 'Dated sector reference producer unavailable' : undefined}
           style={{
             padding: '8px 12px',
             borderRadius: '4px',
@@ -489,6 +515,7 @@ function TickersOverview() {
         </select>
         <select
           value={presetFilter}
+          aria-label="Filter by preset"
           onChange={(e) => {
             const key = e.target.value
             setPresetFilter(key)
@@ -512,7 +539,7 @@ function TickersOverview() {
                 {groups.map(g => (
                   <optgroup key={g} label={g}>
                     {presetFilters.filter(f => f.group === g).map(f => (
-                      <option key={f.key} value={f.key}>{f.label}</option>
+                      <option key={f.key} value={f.key} disabled={f.key === 'setup_multi_tf' && confirmationUnavailable}>{f.label}</option>
                     ))}
                   </optgroup>
                 ))}
@@ -548,6 +575,7 @@ function TickersOverview() {
         )}
         <select
           value={maFilterIdx}
+          aria-label="Filter by moving average"
           onChange={(e) => {
             const idx = Number(e.target.value)
             setMaFilterIdx(idx)
@@ -563,7 +591,7 @@ function TickersOverview() {
           }}
         >
           {maFilterOptions.map((opt, idx) => (
-            <option key={idx} value={idx}>{opt.label}</option>
+            <option key={idx} value={idx} disabled={realtimeOnly && opt.key === 'wsma_200' && !weekly200Available}>{opt.label}</option>
           ))}
         </select>
         {maFilterOptions[maFilterIdx]?.type === 'proximity' && (
@@ -651,9 +679,9 @@ function TickersOverview() {
       </div>
 
       {loading && <p>Loading overview for all selected tickers...</p>}
-      {error && <p style={{ color: 'red' }}>Error: {error}</p>}
+      {error && <p role="alert" style={{ color: 'var(--tm-neg)' }}>Error: {error}{realtimeOnly && data.length > 0 ? '. Retaining the previous publication.' : ''}</p>}
 
-      {!loading && !error && data.length > 0 && (
+      {data.length > 0 && (realtimeOnly || (!loading && !error)) && (
         <div className="tm-fit">
           <table
             style={{
@@ -714,10 +742,7 @@ function TickersOverview() {
                   key={row.ticker}
                   style={{
                     background: i % 2 === 0 ? 'var(--tm-surface)' : 'var(--tm-surface-raised)',
-                    cursor: 'pointer',
                   }}
-                  onClick={() => navigate(`/ticker/${row.ticker}`)}
-                  title={`Click to view ${row.ticker} chart`}
                 >
                   {visibleColumns.map((col, ci) => {
                     const { content, style: cellStyle } = renderCell(col.key, row)
@@ -730,7 +755,12 @@ function TickersOverview() {
                         ...cellStyle,
                         ...(isGroupEnd ? { borderRight: '2px solid var(--tm-line)' } : {}),
                       }}>
-                        {content}
+                        {col.key === 'ticker' ? <Link
+                          className="ticker-publication-link"
+                          to={`/ticker/${row.ticker}`}
+                          aria-label={`Open ${row.ticker} ticker workspace`}
+                          title={evidenceRefs?.[row.ticker] ? `Daily evidence ${evidenceRefs[row.ticker].evidence_id}` : undefined}
+                        >{content}</Link> : content}
                       </td>
                     )
                   })}

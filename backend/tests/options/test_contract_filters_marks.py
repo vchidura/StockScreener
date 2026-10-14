@@ -94,6 +94,23 @@ def test_liquidity_floor_is_literal_or_rule(volume, open_interest, eligible):
         assert DataQualityFlag.MISSING_OPEN_INTEREST in result.quality_flags
 
 
+@pytest.mark.parametrize(
+    ("volume", "open_interest", "eligible"),
+    [(250, 500, True), (251, 501, True), (249, 500, False), (250, 499, False),
+     (None, 500, False), (250, None, False), (None, None, False)],
+)
+def test_strict_liquidity_requires_both_reviewed_floors(volume, open_interest, eligible):
+    result = _filter(7, day_volume=volume, open_interest=open_interest,
+        minimum_day_volume=250, minimum_open_interest=500, liquidity_rule="AND")
+    assert result.eligible is eligible
+    assert (FilterReason.LIQUIDITY_FLOOR in result.reasons) is not eligible
+
+
+def test_unknown_liquidity_rule_fails_closed():
+    with pytest.raises(ValueError, match="liquidity rule must be OR or AND"):
+        _filter(7, liquidity_rule="XOR")
+
+
 def test_expiration_cutoff_rejects_zero_dte_at_cutoff():
     result = _filter(0, market_time=CUTOFF)
     assert result.eligible is False

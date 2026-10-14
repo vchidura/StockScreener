@@ -1,5 +1,10 @@
-import { useState, useMemo, useCallback } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { sortHeaderProps } from './strategyShared'
+import './strategyPages.css'
+import { Fragment, useState, useMemo, useCallback } from 'react'
+import { getDailyScannerPublication } from '../services/api'
+import { usePublicationQuery, useStrategyInterval } from './publicationNavigation'
+import { StrategyPublicationError, strategyEmptyMessage } from './StrategyPublication'
+import { StrategyTickerButton } from './StrategyTickerButton'
 import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-query'
 import { scanFibonacci, FibonacciScanResponse, FibTarget, FibExtension } from '../services/api'
 import { usePublishPageContext } from '../layout/pageContext'
@@ -10,11 +15,11 @@ const STRATEGY_TOOLTIP =
   'Fibonacci Retracement uses the golden ratio (and related ratios) to identify likely support/resistance levels after a significant price swing.\n\n' +
   '1. SWING DETECTION: Zigzag pivot algorithm finds meaningful highs and lows (min 5% swing).\n' +
   '2. LEVEL COMPUTATION: 23.6%, 38.2%, 50%, 61.8%, 78.6% retracement levels between swing points.\n' +
-  '3. SIGNAL: Price proximity to nearest Fibonacci level determines actionability.'
+  '3. SIGNAL: Price proximity to the nearest Fibonacci level is descriptive, not a recommendation.'
 
 const LEVEL_TOOLTIPS: Record<string, string> = {
   '23.6%': 'Shallow retracement — strong trend barely pauses. Fast-moving momentum stocks retrace here.',
-  '38.2%': 'Prime entry zone. Most institutional buying/selling happens at this level.',
+  '38.2%': 'A retracement ratio used as a research reference; not a verified institutional entry zone.',
   '50.0%': 'Half retracement. Not a true Fibonacci number but universally watched by traders.',
   '61.8%': 'The Golden Ratio — last strong support/resistance before the trend is questioned.',
   '78.6%': 'Deep retracement — if this level breaks, the original trend is likely over.',
@@ -71,7 +76,7 @@ type SortKey = 'ticker' | 'last_close' | 'distance_pct' | 'retracement_pct' | 's
 type SortDir = 'asc' | 'desc'
 
 function FibonacciScreener() {
-  const navigate = useNavigate()
+  const realtimeOnly = import.meta.env.VITE_REALTIME_ONLY === 'true'
   const queryClient = useQueryClient()
   const [filter, setFilter] = useState('')
   const [signalFilter, setSignalFilter] = useState('')
@@ -84,19 +89,28 @@ function FibonacciScreener() {
   const [sortDir, setSortDir] = useState<SortDir>('asc')
   const { pinned: scanDate } = useSessionDate()
   const [minSwing, setMinSwing] = useState(5)
-  const [interval, setInterval] = useState<'5m' | '15m' | '30m' | '1h' | '1d'>('1d')
+  const [canonicalInterval, setCanonicalInterval] = useState<'5m' | '15m' | '30m' | '1h' | '1d'>('1d')
+  const storedInterval = useStrategyInterval()
+  const interval = realtimeOnly ? storedInterval.interval : canonicalInterval
+  const setInterval = (value: typeof canonicalInterval) => realtimeOnly ? storedInterval.setInterval(value === '1h' ? '1h' : '1d') : setCanonicalInterval(value)
 
-  const { data, isFetching: loading } = useQuery<FibonacciScanResponse>({
+  const realtimeQuery = usePublicationQuery('daily-fibonacci', pin => getDailyScannerPublication('fibonacci', pin, interval === '1h' ? '1h' : '1d'))
+  const canonicalQuery = useQuery<FibonacciScanResponse>({
     queryKey: ['scan', 'fibonacci', interval, scanDate, minSwing],
     queryFn: () => scanFibonacci(undefined, scanDate || undefined, minSwing, interval),
     placeholderData: keepPreviousData,
+    enabled: !realtimeOnly,
   })
+  const data = realtimeOnly ? realtimeQuery.data?.data : canonicalQuery.data
+  const loading = realtimeOnly ? realtimeQuery.loading : canonicalQuery.isFetching
+  const error = realtimeOnly ? realtimeQuery.error : canonicalQuery.error?.message
 
   const handleRefresh = useCallback(async () => {
+    if (realtimeOnly) return realtimeQuery.refresh()
     const key = ['scan', 'fibonacci', interval, scanDate, minSwing]
     queryClient.setQueryData(key, undefined)
     await queryClient.fetchQuery({ queryKey: key, queryFn: () => scanFibonacci(undefined, scanDate || undefined, minSwing, interval, true) })
-  }, [interval, scanDate, minSwing, queryClient])
+  }, [interval, scanDate, minSwing, queryClient, realtimeOnly, realtimeQuery.refresh])
 
   const filtered = useMemo(() => {
     if (!data?.results) return []
@@ -184,13 +198,14 @@ function FibonacciScreener() {
   )
 
   return (
-    <div>
+    <div className="strategy-workspace">
       <CommandBar>
         <CommandGroup label="Min swing">
           {SWING_PRESETS.map(p => (
             <button
               key={p.value}
               type="button"
+              disabled={realtimeOnly && p.value !== 5}
               title={p.tip}
               className={minSwing === p.value ? 'is-active' : undefined}
               onClick={() => setMinSwing(p.value)}
@@ -205,13 +220,16 @@ function FibonacciScreener() {
             min={3}
             max={15}
             step={1}
-            value={minSwing}
+            value={realtimeOnly && interval === '1h' ? '' : minSwing}
+            placeholder={realtimeOnly && interval === '1h' ? 'ATR' : undefined}
+            disabled={realtimeOnly}
+            aria-label="Minimum swing percent"
             onChange={(e) => setMinSwing(Number(e.target.value))}
             style={{ width: 58, textAlign: 'center' }}
           />
         </CommandField>
         <CommandGroup label="Interval">
-          {(['5m', '15m', '30m', '1h', '1d'] as const).map((iv) => (
+          {(['5m', '15m', '30m', '1h', '1d'] as const).filter(iv => !realtimeOnly || iv === '1d' || iv === '1h').map((iv) => (
             <button
               key={iv}
               type="button"
@@ -224,11 +242,12 @@ function FibonacciScreener() {
           ))}
         </CommandGroup>
         <CommandSpacer />
-        <span className="tm-commandbar__note">{filtered.length} matches</span>
+        <span className="tm-commandbar__note">{realtimeOnly && !data ? 'Publication unavailable' : `${filtered.length} matches`}</span>
         <button type="button" className="tm-commandbar__action" onClick={handleRefresh} disabled={loading}>
-          {loading ? 'Scanning…' : 'Refresh'}
+          {loading ? (realtimeOnly ? 'Reading…' : 'Scanning…') : 'Refresh'}
         </button>
       </CommandBar>
+      <StrategyPublicationError error={error} publication={realtimeOnly ? realtimeQuery.data?.publication : undefined} />
 
       {/* Methodology card */}
       <div className="card" style={{ marginBottom: '1.5rem', background: 'var(--bg-secondary)', border: '1px solid var(--border)' }}>
@@ -256,7 +275,7 @@ function FibonacciScreener() {
           <div>
             <h4 style={{ color: 'var(--primary)', marginBottom: '0.5rem' }}>3. Proximity Signal</h4>
             <p style={{ fontSize: '0.85rem', margin: '0.25rem 0' }}>
-              "Near Fib" when price is within <strong>1.5%</strong> of a level — the actionable zone.
+              "Near Fib" when price is within <strong>1.5%</strong> of a level — a descriptive proximity zone.
             </p>
           </div>
           <div>
@@ -277,25 +296,25 @@ function FibonacciScreener() {
         </div>
       </div>
 
-      {loading && (
+      {loading && !data && (
         <div className="loading">
           <div className="spinner"></div>
-          <span>Scanning Fibonacci levels across all tickers...</span>
+          <span>{realtimeOnly ? `Reading stored ${interval} Fibonacci publication...` : 'Scanning Fibonacci levels across all tickers...'}</span>
         </div>
       )}
 
-      {!loading && data && (
+      {(realtimeOnly || !loading) && data && (
         <>
           {/* Filters */}
           <div className="filter-bar">
-            <input
+            <input aria-label="Search ticker..."
               type="text"
               placeholder="Search ticker..."
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
               style={{ minWidth: '160px' }}
             />
-            <select
+            <select aria-label="All Signals"
               value={signalFilter}
               onChange={(e) => setSignalFilter(e.target.value)}
               style={{ minWidth: '140px' }}
@@ -303,7 +322,7 @@ function FibonacciScreener() {
               <option value="">All Signals</option>
               {allSignals.map(s => <option key={s} value={s}>{s}</option>)}
             </select>
-            <select
+            <select aria-label="All Trends"
               value={trendFilter}
               onChange={(e) => setTrendFilter(e.target.value)}
               style={{ minWidth: '160px' }}
@@ -312,7 +331,7 @@ function FibonacciScreener() {
               <option value="uptrend_retracement">↑ Uptrend Pullback</option>
               <option value="downtrend_retracement">↓ Downtrend Bounce</option>
             </select>
-            <select
+            <select aria-label="All Zones"
               value={zoneFilter}
               onChange={(e) => setZoneFilter(e.target.value)}
               style={{ minWidth: '140px' }}
@@ -321,20 +340,20 @@ function FibonacciScreener() {
               {allZones.map(z => <option key={z} value={z}>{z}</option>)}
             </select>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
-              <label style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Dist ≤</label>
-              <input
+              <label style={{ whiteSpace: 'nowrap' }}>Dist ≤</label>
+              <input aria-label="%"
                 type="number"
                 min={0}
                 step={0.5}
                 placeholder="%"
                 value={maxDistance}
                 onChange={(e) => setMaxDistance(e.target.value)}
-                style={{ width: '52px', padding: '0.3rem 0.4rem', borderRadius: '6px', border: '1px solid var(--border)', fontSize: '0.82rem', textAlign: 'center' }}
+                style={{ width: '52px', textAlign: 'center' }}
               />
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
-              <label style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Retrace</label>
-              <input
+              <label style={{ whiteSpace: 'nowrap' }}>Retrace</label>
+              <input aria-label="Min"
                 type="number"
                 min={0}
                 max={100}
@@ -342,10 +361,10 @@ function FibonacciScreener() {
                 placeholder="Min"
                 value={minRetrace}
                 onChange={(e) => setMinRetrace(e.target.value)}
-                style={{ width: '48px', padding: '0.3rem 0.4rem', borderRadius: '6px', border: '1px solid var(--border)', fontSize: '0.82rem', textAlign: 'center' }}
+                style={{ width: '48px', textAlign: 'center' }}
               />
-              <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>–</span>
-              <input
+              <span>–</span>
+              <input aria-label="Max"
                 type="number"
                 min={0}
                 max={100}
@@ -353,12 +372,12 @@ function FibonacciScreener() {
                 placeholder="Max"
                 value={maxRetrace}
                 onChange={(e) => setMaxRetrace(e.target.value)}
-                style={{ width: '48px', padding: '0.3rem 0.4rem', borderRadius: '6px', border: '1px solid var(--border)', fontSize: '0.82rem', textAlign: 'center' }}
+                style={{ width: '48px', textAlign: 'center' }}
               />
-              <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>%</span>
+              <span>%</span>
             </div>
-            <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
-              {data.total_scanned} scanned &middot; {filtered.length} results
+            <span>
+              {data.total_scanned} {realtimeOnly ? 'cohort members' : 'scanned'} &middot; {filtered.length} results
             </span>
           </div>
 
@@ -368,12 +387,12 @@ function FibonacciScreener() {
               <thead>
                 <tr>
                   <th style={{ width: '28px' }}></th>
-                  <th onClick={() => handleSort('ticker')} style={thStyle('ticker')}>
+                  <th {...sortHeaderProps(() => handleSort('ticker'), sortKey === 'ticker', sortDir)} style={thStyle('ticker')}>
                     Ticker{sortArrow('ticker')}
                   </th>
                   <th style={{ textAlign: 'center' }}>Signal</th>
                   <th style={{ textAlign: 'center' }}>Trend</th>
-                  <th onClick={() => handleSort('last_close')} style={thStyle('last_close', 'right')}>
+                  <th {...sortHeaderProps(() => handleSort('last_close'), sortKey === 'last_close', sortDir)} style={thStyle('last_close', 'right')}>
                     Close{sortArrow('last_close')}
                   </th>
                   <th style={{ textAlign: 'center' }}>
@@ -384,13 +403,13 @@ function FibonacciScreener() {
                     Nearest Level
                     <InfoIcon tooltip="The closest Fibonacci level to the current price." />
                   </th>
-                  <th onClick={() => handleSort('distance_pct')} style={thStyle('distance_pct', 'right')}>
+                  <th {...sortHeaderProps(() => handleSort('distance_pct'), sortKey === 'distance_pct', sortDir)} style={thStyle('distance_pct', 'right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>Distance %{sortArrow('distance_pct')}<InfoIcon tooltip="How far the current price is from the nearest Fibonacci level. Closer to 0% = more actionable." /></span>
                   </th>
-                  <th onClick={() => handleSort('retracement_pct')} style={thStyle('retracement_pct', 'right')}>
+                  <th {...sortHeaderProps(() => handleSort('retracement_pct'), sortKey === 'retracement_pct', sortDir)} style={thStyle('retracement_pct', 'right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>Retrace %{sortArrow('retracement_pct')}<InfoIcon tooltip="How much of the swing has been retraced. 0% = at the extreme, 100% = fully retraced." /></span>
                   </th>
-                  <th onClick={() => handleSort('swing_size_pct')} style={thStyle('swing_size_pct', 'right')}>
+                  <th {...sortHeaderProps(() => handleSort('swing_size_pct'), sortKey === 'swing_size_pct', sortDir)} style={thStyle('swing_size_pct', 'right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>Swing %{sortArrow('swing_size_pct')}<InfoIcon tooltip="Total swing size as a percentage. Larger swings produce more reliable Fibonacci levels." /></span>
                   </th>
                 </tr>
@@ -399,24 +418,25 @@ function FibonacciScreener() {
                 {filtered.length === 0 ? (
                   <tr>
                     <td colSpan={10} style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-secondary)' }}>
-                      No Fibonacci signals found
+                      {realtimeOnly ? strategyEmptyMessage(data.analysis, 'No Fibonacci signals found') : 'No Fibonacci signals found'}
                     </td>
                   </tr>
                 ) : (
-                  filtered.map((r, idx) => {
+                  filtered.map(r => {
                     const sc = SIGNAL_COLORS[r.signal] || { bg: '#f5f5f5', text: '#333' }
                     const tc = TREND_COLORS[r.trend_direction] || { bg: '#f5f5f5', text: '#333' }
                     const expanded = expandedRows.has(r.ticker)
                     return (
-                      <>
-                      <tr key={idx} onClick={() => toggleExpand(r.ticker)} style={{ cursor: 'pointer' }}>
+                      <Fragment key={r.ticker}>
+                      <tr onClick={() => toggleExpand(r.ticker)} style={{ cursor: 'pointer' }}>
                         <td style={{ textAlign: 'center', fontSize: '0.75rem', width: '28px', color: 'var(--text-secondary)' }}>
-                          {expanded ? '▼' : '▶'}
+                          <button type="button" aria-label={`Toggle ${r.ticker} details`} aria-expanded={expanded}
+                            onClick={event => { event.stopPropagation(); toggleExpand(r.ticker) }}>
+                            {expanded ? '▼' : '▶'}
+                          </button>
                         </td>
                         <td>
-                          <span className="ticker" onClick={(e) => { e.stopPropagation(); navigate(`/ticker/${r.ticker}`) }}>
-                            {r.ticker}
-                          </span>
+                          <StrategyTickerButton ticker={r.ticker} publication={realtimeQuery.data?.publication} />
                         </td>
                         <td style={{ textAlign: 'center' }}>
                           <span style={{
@@ -466,7 +486,7 @@ function FibonacciScreener() {
                         </td>
                       </tr>
                       {expanded && (
-                        <tr key={`${idx}-detail`} style={{ background: 'var(--bg-secondary)' }}>
+                        <tr key={`${r.ticker}-detail`} style={{ background: 'var(--bg-secondary)' }}>
                           <td colSpan={10} style={{ padding: '0.75rem 1rem' }}>
                             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '1rem' }}>
 
@@ -590,7 +610,7 @@ function FibonacciScreener() {
                           </td>
                         </tr>
                       )}
-                      </>
+                      </Fragment>
                     )
                   })
                 )}

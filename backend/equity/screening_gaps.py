@@ -3,7 +3,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pandas as pd
 
-from screeners import identify_gap_up, identify_gap_down, _gap_lifecycle
+from equity.gap_detection import identify_gap_up, identify_gap_down, _gap_lifecycle
 from research.screening import GAP_VERSION, GAP_WINDOW
 
 

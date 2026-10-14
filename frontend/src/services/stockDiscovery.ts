@@ -1,4 +1,4 @@
-import api from './api'
+import api, { tickerParams } from './api'
 
 export type AlertSource = 'SHADOW' | 'REPLAY'
 
@@ -200,7 +200,7 @@ export interface AlertViewResponse {
 }
 
 export const getAlertView = async (params: Record<string, string | number | boolean | undefined>) =>
-  (await api.get<AlertViewResponse>('/stocks/alert-view', { params })).data
+  (await api.get<AlertViewResponse>('/stocks/alert-view', { params: tickerParams(params) })).data
 
 export type StockEodSelection = 'SELECTED' | 'NOT_SELECTED' | 'REPEAT'
 
@@ -313,4 +313,4 @@ export interface StockEodOutcomeSummary {
 }
 
 export const getStockEodReview = async (params: Record<string, string | number | undefined>) =>
-  (await api.get<StockEodReview>('/stocks/alert-eod-review', { params })).data
+  (await api.get<StockEodReview>('/stocks/alert-eod-review', { params: tickerParams(params) })).data

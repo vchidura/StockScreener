@@ -28,7 +28,7 @@ from research.gics_sectors import (  # noqa: E402
 
 load_dotenv(BACKEND_DIR / ".env")
 API_KEY = os.getenv("POLYGON_API_KEY")
-BASE_URL = "https://api.polygon.io"
+BASE_URL = "https://api.massive.com"
 MAX_WORKERS = 20
 SESSION = build_session(pool_maxsize=MAX_WORKERS + 4)
 

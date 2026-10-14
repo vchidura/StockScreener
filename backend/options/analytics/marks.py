@@ -62,6 +62,26 @@ class ContractEconomics:
     quality_flags: tuple[DataQualityFlag, ...]
 
 
+def fresh_mark_window(
+    mark_times,
+    observed_at: datetime,
+    maximum_source_age_seconds: int,
+) -> tuple[datetime, datetime] | None:
+    """Bounds of the causally usable option mark times, or None when none are usable.
+
+    A mark is usable when it is not in the future and not older than the policy source
+    age. Stale and future marks stay auditable in the raw rows but cannot widen the
+    underlying-bar acquisition window.
+    """
+    observed_at = _as_utc(observed_at, "observed_at")
+    earliest = observed_at - timedelta(seconds=maximum_source_age_seconds)
+    usable = [
+        mark for mark in mark_times
+        if mark is not None and earliest <= mark <= observed_at
+    ]
+    return (min(usable), max(usable)) if usable else None
+
+
 def select_developer_marks(
     *,
     policy: ValuationPolicy,

@@ -29,7 +29,7 @@ export function chartTimeToDate(time: Time): Date {
 }
 
 export function isIntradayInterval(interval: string): boolean {
-  return interval !== '1d' && interval !== '1wk'
+  return !['1d', '1wk', '1mo'].includes(interval)
 }
 
 export function formatChartTime(time: Time, interval: string): string {
@@ -122,6 +122,7 @@ export function getVisibleChartData(data: ChartDataPoint[], period: string, inte
     '6mo': 180,
     '1y': 365,
     '2y': 730,
+    '5y': 1825,
   }
   const days = calendarDays[period]
   if (!days) return data
@@ -285,13 +286,13 @@ export function gradeTone(grade: string | null | undefined): string {
 
 export const SETUP_INTERVALS = ['1mo', '1wk', '1d', '1h'] as const
 export type SetupTimeframe = '30m' | '1h' | '1d' | '1wk' | '1mo'
-export const CHART_INTERVALS = ['1m', '5m', '15m', '30m', '1h', '1d', '1wk'] as const
+export const CHART_INTERVALS = ['1m', '5m', '15m', '30m', '1h', '1d', '1wk', '1mo'] as const
 export const INTERVAL_NOUN: Record<string, string> = { '1mo': 'monthly', '1wk': 'weekly', '1d': 'daily', '1h': 'hourly' }
 export const PATTERN_INTERVAL_LABEL: Record<string, string> = {
   '1m': '1 minute', '5m': '5 minute', '15m': '15 minute',
-  '30m': '30 minute', '1h': 'Hourly', '1d': 'Daily', '1wk': 'Weekly',
+  '30m': '30 minute', '1h': 'Hourly', '1d': 'Daily', '1wk': 'Weekly', '1mo': 'Monthly',
 }
-export const PATTERN_INTERVAL_ORDER = ['1wk', '1d', '1h', '30m', '15m', '5m'] as const
+export const PATTERN_INTERVAL_ORDER = ['1mo', '1wk', '1d', '1h', '30m', '15m', '5m'] as const
 
 export const patternChoiceValue = (interval: string, type: string) => `frame|${interval}|${type}`
 
@@ -356,6 +357,8 @@ export const defaultPeriodForInterval = (interval: string) => {
   if (interval === '1h') return '3mo'
   if (interval === '1m') return '1d'
   if (interval === '1wk') return '2y'
+  if (interval === '1mo') return '5y'
+  if (interval === '1d') return '2y'
   return '1y'
 }
 

@@ -19,6 +19,7 @@ from options.analytics.marks import (
 from options.config import DeveloperPolicy, ValuationPolicy
 from options.model_inputs import (
     DividendCashFlow,
+    ExpirationValuationCandidate,
     equivalent_continuous_dividend_yield,
 )
 from options.domain import (
@@ -59,6 +60,7 @@ class DeveloperNormalizationInput:
     dividend_coverage_available: bool = False
     input_quality_flags: tuple[DataQualityFlag, ...] = ()
     normalized_observed_at: datetime | None = None
+    valuation_candidate: ExpirationValuationCandidate | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +125,14 @@ def parse_polygon_snapshot(
         raw_payload_sha256=_sha256(raw_payload_json),
         mark_time_from_release_stamp=mark_time_from_release_stamp,
     )
+
+
+TIMESTAMP_MATURITY_DIVIDEND_MODEL_VERSIONS = frozenset({"black_scholes_european_v2"})
+"""Model versions whose equivalent dividend yield is derived over the solver's own timestamp maturity.
+
+`black_scholes_european_v1` (the default) keeps the date-based maturity so stored v1 evidence and its
+hashes stay reproducible. A V2 cohort opts in by constructing the normalizer with the v2 model version,
+which is recorded on every snapshot."""
 
 
 class DeveloperOptionNormalizer:
@@ -197,6 +207,19 @@ class DeveloperOptionNormalizer:
                 )
                 _increment(rejected, reason.value)
                 continue
+            candidate = item.valuation_candidate
+            if candidate is not None and (candidate.valuation_date != raw.option_mark_time.date()
+                    or candidate.selected_at > normalized_observed_at):
+                _increment(rejected, "VALUATION_CANDIDATE_CLOCK_MISMATCH")
+                continue
+            if candidate is not None and (
+                candidate.expiration_date != catalog.expiration_date
+                or candidate.risk_free_rate != item.risk_free_rate
+                or candidate.dividend_yield != item.dividend_yield
+                or candidate.dividend_cash_flows != item.dividend_cash_flows
+                or not item.dividend_coverage_available
+            ):
+                raise ValueError("Developer expiration valuation candidate drifted")
             filtered = filter_contract(
                 contract_type=catalog.contract_type,
                 exercise_style=catalog.exercise_style,
@@ -216,6 +239,7 @@ class DeveloperOptionNormalizer:
                 ),
                 minimum_day_volume=self.policy.contract_filter.minimum_day_volume,
                 minimum_open_interest=self.policy.contract_filter.minimum_open_interest,
+                liquidity_rule=self.policy.contract_filter.liquidity_rule,
             )
             if not filtered.eligible:
                 for reason in filtered.reasons:
@@ -232,6 +256,9 @@ class DeveloperOptionNormalizer:
                     expiration_date=catalog.expiration_date,
                     risk_free_rate=item.risk_free_rate,
                     cash_flows=item.dividend_cash_flows,
+                    maturity_years=(
+                        maturity if self.model_version in TIMESTAMP_MATURITY_DIVIDEND_MODEL_VERSIONS else None
+                    ),
                 )
                 if item.dividend_coverage_available
                 else item.dividend_yield
@@ -387,6 +414,25 @@ class DeveloperOptionNormalizer:
                 "model_version": self.model_version,
                 "raw_payload_sha256": raw.raw_payload_sha256,
             }
+            if item.valuation_candidate is not None:
+                candidate = item.valuation_candidate
+                normalized_payload["valuation_candidate"] = {
+                    "valuation_date": candidate.valuation_date.isoformat(),
+                    "expiration_date": candidate.expiration_date.isoformat(),
+                    "spot": str(candidate.spot),
+                    "rate_date": candidate.rate_date.isoformat(),
+                    "rate_observation_ids": [str(identity) for identity in candidate.rate_observation_ids],
+                    "rate_payload_sha256": list(candidate.rate_payload_sha256),
+                    "dividend_cash_flows": [
+                        {"ex_date": flow.ex_date.isoformat(), "cash_amount": str(flow.cash_amount)}
+                        for flow in candidate.dividend_cash_flows
+                    ],
+                    "dividend_coverage_start": candidate.dividend_coverage_start.isoformat(),
+                    "dividend_coverage_end": candidate.dividend_coverage_end.isoformat(),
+                    "dividend_source_key": candidate.dividend_source_key,
+                    "dividend_payload_sha256": candidate.dividend_payload_sha256,
+                    "selected_at": candidate.selected_at.isoformat(),
+                }
             normalized_payload_sha256 = _sha256(_canonical_json(normalized_payload))
             snapshots.append(
                 OptionContractSnapshot(

@@ -16,6 +16,7 @@ import pandas as pd
 import requests
 
 from http_client import get_session
+from provider_endpoints import REST_BASE_URL, REST_HOSTS
 from research.gics_sectors import MANUAL_SECTORS, sector_for_sic
 
 from .domain import (
@@ -28,12 +29,13 @@ from .domain import (
 )
 
 
-POLYGON_BASE_URL = "https://api.polygon.io"
+POLYGON_BASE_URL = REST_BASE_URL
 REQUEST_TIMEOUT_SECONDS = 30
-_ALLOWED_API_HOSTS = {"api.polygon.io", "api.massive.com"}
+_ALLOWED_API_HOSTS = REST_HOSTS
 _INTRADAY_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30}
 _NATIVE_AGGREGATES = {
     **{interval: (minutes, "minute") for interval, minutes in _INTRADAY_MINUTES.items()},
+    "1wk": (1, "week"),
     "1mo": (1, "month"),
 }
 
@@ -571,16 +573,22 @@ def normalize_native_bars(
     results: list[EquityBarRevision] = []
     for row in rows:
         provider_start = pd.Timestamp(row["t"], unit="ms", tz="UTC")
-        if interval == "1mo":
+        if interval in {"1wk", "1mo"}:
             provider_date = provider_start.tz_convert("America/New_York").date()
-            month_start = date(provider_date.year, provider_date.month, 1)
-            next_month = (
-                date(provider_date.year + 1, 1, 1)
-                if provider_date.month == 12
-                else date(provider_date.year, provider_date.month + 1, 1)
-            )
+            if interval == "1wk":
+                iso = provider_date.isocalendar()
+                period_start = date.fromisocalendar(iso.year, iso.week, 1)
+                period_end = date.fromisocalendar(iso.year, iso.week, 5)
+            else:
+                period_start = date(provider_date.year, provider_date.month, 1)
+                next_month = (
+                    date(provider_date.year + 1, 1, 1)
+                    if provider_date.month == 12
+                    else date(provider_date.year, provider_date.month + 1, 1)
+                )
+                period_end = next_month - timedelta(days=1)
             sessions = calendar.sessions_in_range(
-                pd.Timestamp(month_start), pd.Timestamp(next_month - timedelta(days=1))
+                pd.Timestamp(period_start), pd.Timestamp(period_end)
             )
             if not len(sessions):
                 continue
@@ -605,7 +613,7 @@ def normalize_native_bars(
             continue
         if not calendar.is_session(session_date):
             continue
-        if interval != "1mo":
+        if interval not in {"1wk", "1mo"}:
             session_open = calendar.session_open(session_date).to_pydatetime().astimezone(timezone.utc)
             session_close = calendar.session_close(session_date).to_pydatetime().astimezone(timezone.utc)
             if start < session_open or end > session_close:

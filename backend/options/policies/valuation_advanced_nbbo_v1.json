@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "policy_version": "option_valuation_advanced_nbbo_v1",
+  "primary_model_mark_source": "ADVANCED_NBBO_MIDPOINT",
+  "maximum_source_age_seconds": 1,
+  "maximum_option_spot_skew_seconds": 1,
+  "intrinsic_price_tolerance": "0.01",
+  "allowed_entry_mark_sources": [
+    "ADVANCED_NBBO_MIDPOINT"
+  ],
+  "allowed_exit_mark_sources": [
+    "ADVANCED_NBBO_MIDPOINT"
+  ],
+  "display_only_mark_sources": [],
+  "commission_per_contract_per_side": "0.65",
+  "slippage_model": "UNAVAILABLE"
+}

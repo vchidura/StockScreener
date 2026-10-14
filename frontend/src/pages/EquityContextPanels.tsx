@@ -3,25 +3,31 @@ import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { getStockContext, type StockContextResponse } from '../services/stockContext'
 
-function useEquityContext() {
-  return useQuery({ queryKey: ['stock-context'], queryFn: () => getStockContext(), staleTime: 30_000, refetchInterval: 60_000 })
+function useEquityContext(snapshotId?: string) {
+  return useQuery({
+    queryKey: snapshotId ? ['stock-context', snapshotId] : ['stock-context'],
+    queryFn: () => getStockContext(undefined, snapshotId),
+    enabled: import.meta.env.VITE_REALTIME_ONLY !== 'true' || !!snapshotId,
+    retry: import.meta.env.VITE_REALTIME_ONLY === 'true' ? false : undefined,
+    staleTime: 30_000, refetchInterval: 60_000,
+  })
 }
 
 const percent = (value: number | null | undefined) => value == null ? 'Unavailable' : `${(value * 100).toFixed(1)}%`
 const human = (value: string) => value.replace(/_/g, ' ').toLowerCase()
 
-export function MomentumRanks() {
-  const query = useEquityContext()
+export function MomentumRanks({ snapshotId }: { snapshotId?: string }) {
+  const query = useEquityContext(snapshotId)
   const [sector, setSector] = useState('')
   const cohort = query.isError ? null : query.data?.cohort
-  const rows = (query.data?.rows ?? []).filter(row => row.daily.percentile != null && (!sector || row.sector === sector))
+  const rows = (query.isError ? [] : query.data?.rows ?? []).filter(row => row.daily.percentile != null && (!sector || row.sector === sector))
   const sectors = [...new Set((query.data?.rows ?? []).map(row => row.sector).filter((value): value is string => !!value))].sort()
   return <section aria-label="Daily momentum ranks" style={{ marginBottom: 20 }}>
     <div style={{ display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: 12, marginBottom: 12 }}>
       <h3 style={{ margin: 0, fontSize: 16 }}>Daily momentum ranks</h3>
       <span style={{ color: 'var(--tm-muted)', fontSize: 12 }}>{cohort ? `${cohort.session} / ${cohort.eligible_ranked} ranked of ${cohort.expected_members} / ${cohort.status.toLowerCase()}` : 'Context unavailable'}</span>
-      <label style={{ marginLeft: 'auto', fontSize: 12 }}>Sector <select value={sector} onChange={event => setSector(event.target.value)}>
-        <option value="">All sectors</option>{sectors.map(value => <option key={value}>{value}</option>)}
+      <label style={{ marginLeft: 'auto', fontSize: 12 }}>Sector <select disabled={!!cohort?.scope_note && !sectors.length} value={sector} onChange={event => setSector(event.target.value)}>
+        <option value="">{cohort?.scope_note && !sectors.length ? 'Sector references unavailable' : 'All sectors'}</option>{sectors.map(value => <option key={value}>{value}</option>)}
       </select></label>
     </div>
     {query.isLoading ? <p>Loading published ranks...</p> : query.isError || !cohort ? <p>Published ranks unavailable.</p> :
@@ -31,7 +37,7 @@ export function MomentumRanks() {
             .sort((left, right) => (group.leading ? -1 : 1) * (left.daily.percentile! - right.daily.percentile!) || left.ticker.localeCompare(right.ticker)).slice(0, 10)
           return <div key={group.label}>
             <h4 style={{ fontSize: 14, margin: '0 0 8px' }}>{group.label}</h4>
-            <table className="data-table" style={{ width: '100%' }}><thead><tr><th>Stock</th><th>Universe percentile</th><th>12-1 return</th></tr></thead>
+            <table className="data-table" style={{ width: '100%' }}><thead><tr><th>Stock</th><th>{cohort.scope_note ? 'Cohort percentile' : 'Universe percentile'}</th><th>12-1 return</th></tr></thead>
               <tbody>{selected.map(row => <tr key={row.security_id}><td><Link to={`/ticker/${row.ticker}`}>{row.ticker}</Link></td>
                 <td>{percent(row.daily.percentile)}</td><td>{percent(row.daily.momentum)}</td></tr>)}</tbody></table>
             {!selected.length && <p>No covered names in this group.</p>}

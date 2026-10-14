@@ -42,7 +42,7 @@ from http_client import build_session
 SESSION = build_session(pool_maxsize=32)  # sized for the 20-worker thread pool below
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
-BASE_URL = "https://api.polygon.io"
+BASE_URL = "https://api.massive.com"
 REQUEST_TIMEOUT = 30
 
 # Major ETFs added unconditionally, on top of --target-size stock picks

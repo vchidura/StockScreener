@@ -7,6 +7,7 @@ import { queryEligibleChain, type EligibleChainRow, type EligibleChainRequest, t
 import { Modal } from './ScreenLibrary'
 import { chainFilterRanges, columnsForView, independentScreenQuery, makeOptionsScreen, optionColumnPresets, optionContractDetailSections, optionRuleLabels, optionTemplates, OPTIONS_LIBRARY_KEY, readOptionsLibrary, screenQuery, visibleOptionsColumns, writeOptionsLibrary, type OptionsLibrary, type OptionsScreen, type OptionsView } from './optionsScreenLibrary'
 import { optionAlertMoney, optionAlertPercent, optionAlertTime } from './optionsAlertPresentation'
+import { publicationPath } from './publicationNavigation'
 import './StockScreeningPage.css'
 
 type ControlsProps = { catalog?: OptionDiscoveryCatalog; params: URLSearchParams; setParams: SetURLSearchParams }
@@ -19,6 +20,13 @@ function download(content: string, name: string, type: string) {
   anchor.download = name
   anchor.click()
   URL.revokeObjectURL(url)
+}
+
+function eligibleChainUnavailableReason(reason: string | null | undefined) {
+  if (reason === 'EQUITY_ONLY_COHORT') return 'The selected realtime cohort contains no option underlyings.'
+  if (reason === 'NO_ACTIVE_POLICY_ELIGIBLE_CHAIN') return 'No complete active-policy option matrix was retained for this cohort.'
+  if (reason === 'ACTIVE_COHORT_UNAVAILABLE') return 'The selected realtime cohort is unavailable.'
+  return readable(reason || 'NO_ELIGIBLE_CHAIN')
 }
 
 type LibraryProps = ControlsProps & {
@@ -114,8 +122,11 @@ export function OptionsScreenLibrary({ catalog, params, setParams, filterControl
     if (!catalog) return
     try { independentScreenQuery(new URLSearchParams(next), catalog) } catch (failure) { setError(failure instanceof Error ? failure.message : 'Unsupported screen'); return }
     const nextParams = new URLSearchParams(next)
-    const selectedSession = new URLSearchParams(window.location.search).get('session_date')
-    if (selectedSession) nextParams.set('session_date', selectedSession)
+    const currentParams = new URLSearchParams(window.location.search)
+    for (const key of ['session_date', 'cohort_id', 'snapshot_id']) {
+      const value = currentParams.get(key)
+      if (value) nextParams.set(key, value)
+    }
     setBaseline(JSON.stringify(screenQuery(nextParams, catalog)))
     const key = next.screen ? `saved:${next.screen}` : next.builtin && next.builtin !== 'all' ? `builtin:${next.builtin}` : null
     if (closeAfterLoad.current && writable) {
@@ -142,8 +153,11 @@ export function OptionsScreenLibrary({ catalog, params, setParams, filterControl
       if (afterSave) { load(afterSave); setAfterSave(null) }
       else if (naming.action === 'SAVE' || naming.action === 'UPDATE') {
         const next = new URLSearchParams({ ...saved.query, screen: saved.id })
-        const selectedSession = new URLSearchParams(window.location.search).get('session_date')
-        if (selectedSession) next.set('session_date', selectedSession)
+        const currentParams = new URLSearchParams(window.location.search)
+        for (const key of ['session_date', 'cohort_id', 'snapshot_id']) {
+          const value = currentParams.get(key)
+          if (value) next.set(key, value)
+        }
         setParams(next)
       }
       setNaming(null)
@@ -177,7 +191,7 @@ export function OptionsScreenLibrary({ catalog, params, setParams, filterControl
     try {
       const validated = independentScreenQuery(new URLSearchParams(draftQuery), catalog)
       const next = new URLSearchParams(validated)
-      for (const key of ['screen', 'builtin', 'session_date']) if (params.has(key)) next.set(key, params.get(key)!)
+      for (const key of ['screen', 'builtin', 'session_date', 'cohort_id', 'snapshot_id']) if (params.has(key)) next.set(key, params.get(key)!)
       if (applyMode !== 'APPLY_ONLY') {
         const saved = makeOptionsScreen(applyMode === 'UPDATE' ? active!.name : applyName, validated, catalog, applyMode === 'UPDATE' ? active : undefined)
         if (!commit(latest => ({ ...latest, screens: [...latest.screens.filter(item => item.id !== saved.id), saved], tabs: [...new Set([...(latest.tabs || []), `saved:${saved.id}`])] }))) return
@@ -287,7 +301,7 @@ export function OptionsChainResults({ catalog, params, setParams, sessionDate, r
   function cell(row: EligibleChainRow, key: string): ReactNode {
     if (key === 'contract') return <><strong className={row.contract_type === 'CALL' ? 'os-positive' : 'os-negative'}>{row.strike} {row.contract_type}</strong><small>{row.expiration_date}</small><small title={row.contract_ticker}>{row.contract_ticker}</small></>
     if (key === 'market_data_time') return <span title={`Observed ${timestamp(row.first_observed_at)} ET / ${readable(row.mark_source)}`}>{timestamp(row.market_data_time)}</span>
-    if (key === 'underlying') return <Link to={`/ticker/${encodeURIComponent(row.underlying)}`} title={`Open ${row.underlying} ticker page`}>{row.underlying}</Link>
+    if (key === 'underlying') return <Link to={publicationPath(`/ticker/${encodeURIComponent(row.underlying)}`, params.get('snapshot_id') ?? undefined, params.get('cohort_id') ?? undefined)} title={`Open ${row.underlying} ticker page`}>{row.underlying}</Link>
     if (key === 'mark_market_data_time' || key === 'first_observed_at') return optionAlertTime(row[key])
     if (key === 'mark_source') return row.mark_source ? readable(row.mark_source) : 'Unavailable'
     if (key === 'quality_flags') return row.quality_flags?.length ? row.quality_flags.map(readable).join(' / ') : 'None recorded'
@@ -326,10 +340,10 @@ export function OptionsChainResults({ catalog, params, setParams, sessionDate, r
         {!!data.missing_underlyers?.length && <p>Missing active-policy matrix: {data.missing_underlyers.join(', ')}</p>}
         <div className="os-coverage-grid">{data.coverage.map(row => <div key={row.underlying}><strong>{row.underlying}</strong><span>{timestamp(row.market_time)} ET</span><span>{row.eligible} eligible / {row.retained} retained / {row.received} received</span></div>)}</div>
       </details>}
-      {!invalid && query.data && !query.data.available && <p role="status">{readable(query.data.reason || 'NO_ELIGIBLE_CHAIN')}</p>}
+      {!invalid && query.data && !query.data.available && <p role="status">{eligibleChainUnavailableReason(query.data.reason)}</p>}
       <div className="screener-table-wrap" tabIndex={0} role="region" aria-label="Eligible option contracts"><table className="os-package-table"><thead><tr><th className="os-contract-view" scope="col">View</th>{columns.map(column => <th key={column.key} scope="col" title={column.tip}>{column.label}</th>)}</tr></thead><tbody>
         {rows.map(row => <tr key={row.snapshot_id}><td className="os-contract-view"><button type="button" className="sw-icon" title="View retained contract details" aria-label={`View ${row.contract_ticker} details`} onClick={event => { contractTrigger.current = event.currentTarget; setSelectedContract(structuredClone(row)) }}><Eye size={16} /></button></td>{columns.map(column => <td key={column.key}>{cell(row, column.key)}</td>)}</tr>)}
-        {!query.isLoading && rows.length === 0 && <tr><td colSpan={columns.length + 1}>{invalid || (query.isError ? 'Data unavailable' : 'No eligible contracts on this page.')}</td></tr>}
+        {!query.isLoading && rows.length === 0 && <tr><td colSpan={columns.length + 1}>{invalid || (query.isError || query.data?.available === false ? 'Data unavailable' : 'No eligible contracts on this page.')}</td></tr>}
       </tbody></table></div>
       <footer><span>Retained policy-filtered chain / delayed model marks</span><div><button type="button" disabled={offset === 0} onClick={() => update('offset', String(Math.max(0, offset - 100)))}>Previous</button><button type="button" disabled={offset + 100 >= (data?.total || 0)} onClick={() => update('offset', String(offset + 100))}>Next</button></div></footer>
     </section>

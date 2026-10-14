@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Command, Search, X } from 'lucide-react'
 import { getTickers } from '../services/api'
+import { publicationPath } from '../pages/publicationNavigation'
 import { NAV_ITEMS, readLastStockSymbol } from './navigation'
 
 type SearchResult = {
@@ -23,18 +24,20 @@ function rankTickers(tickers: string[], query: string): string[] {
   return [...exact, ...startsWith, ...contains]
 }
 
-export default function GlobalSearch() {
+export default function GlobalSearch({ loadTickers = true }: { loadTickers?: boolean }) {
   const [query, setQuery] = useState('')
   const [tickers, setTickers] = useState<string[]>([])
   const [open, setOpen] = useState(false)
   const [highlight, setHighlight] = useState(0)
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const wrapperRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
+    if (!loadTickers) return
     getTickers().then(setTickers).catch(() => {})
-  }, [])
+  }, [loadTickers])
 
   useEffect(() => {
     const focusOnCommandK = (event: KeyboardEvent) => {
@@ -84,7 +87,11 @@ export default function GlobalSearch() {
   }, [results])
 
   const go = (result: SearchResult) => {
-    navigate(result.to)
+    navigate(publicationPath(
+      result.to,
+      searchParams.get('snapshot_id') ?? undefined,
+      searchParams.get('cohort_id') ?? undefined,
+    ))
     setQuery('')
     setOpen(false)
     inputRef.current?.blur()

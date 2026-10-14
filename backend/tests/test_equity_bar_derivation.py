@@ -12,7 +12,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from equity.derivation import derive_canonical_bars
+from equity.derivation import derive_canonical_bars, derive_five_minute_bars
 from equity.domain import (
     BarAvailabilityMode,
     BarSourceKind,
@@ -66,6 +66,75 @@ def intraday_30m(item, session_date=date(2026, 8, 28)):
         start = end
         index += 1
     return tuple(results)
+
+
+def intraday_5m(item, session_date=date(2026, 8, 28)):
+    calendar = exchange_calendars.get_calendar("XNYS")
+    session = pd.Timestamp(session_date)
+    session_open = calendar.session_open(session).to_pydatetime().astimezone(UTC)
+    session_close = calendar.session_close(session).to_pydatetime().astimezone(UTC)
+    results = []
+    start = session_open
+    index = 0
+    while start < session_close:
+        end = min(start + timedelta(minutes=5), session_close)
+        results.append(bar(item, "5m", start, end, session_date, index))
+        start = end
+        index += 1
+    return tuple(results)
+
+
+def test_fifteen_minute_derivation_requires_complete_five_minute_windows():
+    item = security()
+    source = intraday_5m(item)
+    segment_id = uuid4()
+
+    result = derive_five_minute_bars(
+        item,
+        source,
+        target_interval="15m",
+        observed_at=source[-1].bar_end,
+        ingestion_segment_id=segment_id,
+    )
+    incomplete = derive_five_minute_bars(
+        item,
+        (*source[:1], *source[2:]),
+        target_interval="15m",
+        observed_at=source[-1].bar_end,
+        ingestion_segment_id=segment_id,
+    )
+
+    assert len(result) == 26
+    assert all(len(row.source_bar_revision_ids) == 3 for row in result)
+    assert result[0].open_price == source[0].open_price
+    assert result[0].close_price == source[2].close_price
+    assert result[0].volume == Decimal("3000")
+    assert len(incomplete) == 25
+
+
+def test_five_minute_source_derives_all_realtime_intraday_intervals():
+    item = security()
+    source = intraday_5m(item)
+    segment_id = uuid4()
+
+    results = {
+        interval: derive_five_minute_bars(
+            item,
+            source,
+            target_interval=interval,
+            observed_at=source[-1].bar_end,
+            ingestion_segment_id=segment_id,
+        )
+        for interval in ("15m", "30m", "1h", "1d")
+    }
+
+    assert {interval: len(rows) for interval, rows in results.items()} == {
+        "15m": 26,
+        "30m": 13,
+        "1h": 7,
+        "1d": 1,
+    }
+    assert len(results["1d"][0].source_bar_revision_ids) == 78
 
 
 def daily(item, start=date(2026, 8, 1), end=date(2026, 8, 31)):

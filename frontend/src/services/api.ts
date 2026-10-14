@@ -9,6 +9,67 @@ const api = axios.create({
   timeout: 120000,
 })
 
+const storedReadError = (error: unknown): Error => {
+  if (axios.isAxiosError?.(error) && typeof error.response?.data?.detail === 'string') {
+    return new Error(error.response.data.detail)
+  }
+  return error instanceof Error ? error : new Error('Stored realtime publication is unavailable')
+}
+
+type ApiQueryValue = string | number | boolean | readonly (string | number | boolean)[] | undefined
+
+export const tickerParams = (params?: Record<string, ApiQueryValue>, snapshotId?: string) => {
+  if (import.meta.env.VITE_REALTIME_ONLY !== 'true') return params
+  const cohort_id = import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
+  if (!cohort_id) throw new Error('Realtime ticker requires VITE_REALTIME_COHORT_ID')
+  return { ...params, cohort_id, ...(snapshotId !== undefined ? { snapshot_id: snapshotId } : {}) }
+}
+
+export const retainedTickerParams = (params?: Record<string, ApiQueryValue>, snapshotId?: string) =>
+  tickerParams(import.meta.env.VITE_REALTIME_ONLY === 'true' ? { ...params, read_mode: 'retained' } : params, snapshotId)
+
+export interface TechnicalEvidenceRef {
+  cohort_id: string
+  evidence_id: string
+  evidence_type: 'TRADE_SETUP'
+  market_time: string
+  payload_sha256: string
+  observed_at: string
+  published_at: string
+}
+
+export interface TickerWorkspacePublication {
+  cohort_id: string
+  snapshot_id: string
+  payload_sha256: string
+  ticker: string
+  market_time: string
+  generated_at: string
+  read_at: string
+  status: string
+  read_mode?: 'RETAINED'
+  reference_status?: 'CURRENT' | 'UNAVAILABLE'
+  action_status?: 'CURRENT' | 'CHANGED'
+  current_data_available?: boolean
+  section_warnings?: Partial<Record<'reference' | 'actions' | 'market', string>>
+  evidence_refs: Partial<Record<'30m' | '1h' | '1d' | '1wk' | '1mo', TechnicalEvidenceRef>>
+}
+
+export const getTickerWorkspacePublication = async (ticker: string, snapshotId?: string) => {
+  try {
+    const response = await api.get(`/stock/${ticker}/workspace-publication`, { params: retainedTickerParams(undefined, snapshotId) })
+    const publication = response.data as TickerWorkspacePublication
+    if (!publication.snapshot_id || publication.ticker !== ticker.trim().toUpperCase()
+      || publication.cohort_id !== import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
+      || (snapshotId !== undefined && publication.snapshot_id !== snapshotId)) {
+      throw new Error('Ticker publication does not match the requested release')
+    }
+    return { publication }
+  } catch (error) {
+    throw storedReadError(error)
+  }
+}
+
 export interface RotationFact<Value> {
   status: string
   value: Value | null
@@ -139,6 +200,28 @@ export const getMarketConditions = async (): Promise<MarketConditionsResponse> =
   return response.data
 }
 
+export interface MarketNotificationWindow {
+  calendar: 'XNYS'
+  checked_at: string
+  session: string
+  is_trading_session: boolean
+  notifications_enabled: boolean
+  session_open: string | null
+  session_close: string | null
+}
+
+export const fetchMarketNotificationWindow = async (): Promise<MarketNotificationWindow> => {
+  const response = await api.get('/equity/notification-window')
+  const result = response.data as MarketNotificationWindow
+  if (result.calendar !== 'XNYS' || typeof result.notifications_enabled !== 'boolean'
+    || typeof result.is_trading_session !== 'boolean' || !Number.isFinite(Date.parse(result.checked_at))
+    || result.is_trading_session && (!result.session_open || !result.session_close
+      || !Number.isFinite(Date.parse(result.session_open)) || !Number.isFinite(Date.parse(result.session_close)))) {
+    throw new Error('Exchange notification window is unavailable')
+  }
+  return result
+}
+
 export interface MaterializationStatus {
   status: 'READY' | 'STALE' | 'EXPIRED' | 'UNAVAILABLE'
   checked_at: string
@@ -149,10 +232,52 @@ export interface MaterializationStatus {
   stale_intervals: string[]
   pipeline_active?: boolean
   active_intervals?: string[]
+  source?: string
+  ticker_count?: number
+  serving_latest_available?: boolean
 }
 
-export const fetchMaterializationStatus = async (): Promise<MaterializationStatus> => {
-  const response = await api.get('/equity/materialization-status')
+export const fetchMaterializationStatus = async (snapshotId?: string, ticker?: string, dailyStrategies = false, interval: StrategyInterval = '1d'): Promise<MaterializationStatus> => {
+  if (import.meta.env.VITE_REALTIME_ONLY === 'true' && dailyStrategies) {
+    const publication = await resolveDailyStrategyPublication(snapshotId, interval)
+    if (publication.staleness_sessions === undefined || publication.max_serveable_stale_sessions === undefined) {
+      throw new Error('Independent strategy freshness metadata is unavailable')
+    }
+    return { status: publication.status, checked_at: publication.read_at, source: publication.release_type,
+      max_serveable_stale_sessions: publication.max_serveable_stale_sessions,
+      staleness_sessions: publication.staleness_sessions, last_market_time: publication.market_time,
+      oldest_stale_market_time: publication.status === 'READY' ? null : publication.market_time,
+      stale_intervals: publication.status === 'READY' ? [] : [interval], pipeline_active: false, active_intervals: [] }
+  }
+  if (import.meta.env.VITE_REALTIME_ONLY === 'true' && ticker) {
+    const { publication } = await getTickerWorkspacePublication(ticker, snapshotId)
+    const setup = await getMultiTradeSetup(ticker, false, publication.snapshot_id)
+    if (setup.ticker !== publication.ticker || setup.as_of !== publication.generated_at) {
+      throw new Error('Ticker freshness response does not match the selected publication')
+    }
+    const metrics = Object.entries(setup.setup_read_metrics ?? {})
+    if (metrics.length === 0) throw new Error('Ticker publication freshness metadata is unavailable')
+    const severity = { READY: 0, STALE: 1, EXPIRED: 2, UNAVAILABLE: 3 }
+    const status = metrics.reduce<MaterializationStatus['status']>((worst, [, metric]) => {
+      const state = metric.status === 'MISSING' ? 'UNAVAILABLE' : metric.status
+      if (!(state in severity)) throw new Error('Ticker publication freshness state is invalid')
+      return severity[state] > severity[worst] ? state : worst
+    }, 'READY')
+    const stale = metrics.filter(([, metric]) => metric.status !== 'READY')
+    const unavailableIntervals = Object.keys(setup.errors ?? {})
+    const oldest = stale.map(([, metric]) => metric.market_time).filter((value): value is string => !!value)
+      .sort((left, right) => Date.parse(left) - Date.parse(right))[0]
+    return {
+      status: unavailableIntervals.length ? 'UNAVAILABLE' : status,
+      checked_at: publication.read_at, source: 'TICKER_WORKSPACE_V1', ticker_count: 1,
+      max_serveable_stale_sessions: Math.max(...metrics.map(([, metric]) => metric.max_serveable_stale_sessions ?? 0)),
+      staleness_sessions: Math.max(...metrics.map(([, metric]) => metric.staleness_sessions ?? 0)),
+      last_market_time: publication.market_time, oldest_stale_market_time: oldest ?? null,
+      stale_intervals: Array.from(new Set([...stale.map(([interval]) => interval), ...unavailableIntervals])),
+    }
+  }
+  const params = import.meta.env.VITE_REALTIME_ONLY === 'true' && snapshotId ? { snapshot_id: snapshotId } : undefined
+  const response = await api.get('/equity/materialization-status', { params: tickerParams(params) })
   const status = response.data as MaterializationStatus
   if (status.pipeline_active !== undefined) return status
   const health = await api.get('/equity/health')
@@ -220,7 +345,9 @@ export interface FVGResult {
   total_fvgs: number
 }
 
-export interface FVGScanResponse {
+export interface FVGScanResponse extends DailyScannerCoverage {
+  publication?: DashboardPublication
+  scanner_basis?: ScannerBasis
   scan_datetime: string
   interval: string
   lookback: number
@@ -381,7 +508,9 @@ export interface StreakResponse {
   results: StreakResult[]
 }
 
-export interface GapScanResponse {
+export interface GapScanResponse extends DailyScannerCoverage {
+  publication?: DashboardPublication
+  scanner_basis?: ScannerBasis
   scan_datetime: string
   total_scanned: number
   total_signals: number
@@ -389,7 +518,9 @@ export interface GapScanResponse {
   results: GapResult[]
 }
 
-export interface MAScanResponse {
+export interface MAScanResponse extends DailyScannerCoverage {
+  publication?: DashboardPublication
+  scanner_basis?: ScannerBasis
   scan_datetime: string
   total_scanned: number
   total_signals: number
@@ -399,7 +530,9 @@ export interface MAScanResponse {
   results: MAResult[]
 }
 
-export interface MomentumPullbackScanResponse {
+export interface MomentumPullbackScanResponse extends DailyScannerCoverage {
+  publication?: DashboardPublication
+  scanner_basis?: ScannerBasis
   scan_datetime: string
   total_scanned: number
   total_signals: number
@@ -430,7 +563,9 @@ export interface BearishBounceResult {
   date: string
 }
 
-export interface BearishBounceScanResponse {
+export interface BearishBounceScanResponse extends DailyScannerCoverage {
+  publication?: DashboardPublication
+  scanner_basis?: ScannerBasis
   scan_datetime: string
   total_scanned: number
   total_signals: number
@@ -489,7 +624,9 @@ export interface FibonacciResult {
   date: string
 }
 
-export interface FibonacciScanResponse {
+export interface FibonacciScanResponse extends DailyScannerCoverage {
+  publication?: DashboardPublication
+  scanner_basis?: ScannerBasis
   scan_datetime: string
   total_scanned: number
   total_signals: number
@@ -537,7 +674,8 @@ export interface MarketRegime {
 export interface CombinedScanResponse {
   scan_datetime: string
   total_scanned: number
-  market_regime?: MarketRegime
+  market_regime?: MarketRegime | null
+  publication?: DashboardPublication
   gaps: { total_signals: number; results: GapResult[] }
   ma_crossover: { total_signals: number; results: MAResult[] }
   momentum_pullback: { total_signals: number; results: MomentumPullbackResult[] }
@@ -668,6 +806,16 @@ export interface PatternWatchResponse {
   results: PatternWatchRow[]
   cross_frame: CrossFramePatternSummary | null
   computed_at: string
+  publication?: {
+    cohort_id: string
+    snapshot_id: string
+    source_generation: number
+    market_time: string
+    generated_at: string
+    read_at: string
+    status: string
+    workspaces: Array<{ ticker: string; snapshot_id: string; payload_sha256: string }>
+  }
 }
 
 export interface LatestQuote {
@@ -753,12 +901,14 @@ export const scanGaps = async (
   scanDate?: string,
   interval = '1d',
   refresh = false,
+  snapshotId?: string,
 ): Promise<GapScanResponse> => {
   const params: Record<string, string | boolean> = { interval }
   if (tickers) params.tickers = tickers
   if (scanDate) params.scan_date = scanDate
   if (refresh) params.refresh = true
-  const response = await api.get('/scan/gaps', { params })
+  if (snapshotId && import.meta.env.VITE_REALTIME_ONLY === 'true') params.snapshot_id = snapshotId
+  const response = await api.get('/scan/gaps', { params: tickerParams(params) })
   return response.data
 }
 
@@ -769,12 +919,14 @@ export const scanFVG = async (
   interval = '1d',
   lookback = 50,
   refresh = false,
+  snapshotId?: string,
 ): Promise<FVGScanResponse> => {
   const params: Record<string, string | number | boolean> = { interval, lookback }
   if (tickers) params.tickers = tickers
   if (scanDate) params.scan_date = scanDate
   if (refresh) params.refresh = true
-  const response = await api.get('/scan/fvg', { params })
+  if (snapshotId && import.meta.env.VITE_REALTIME_ONLY === 'true') params.snapshot_id = snapshotId
+  const response = await api.get('/scan/fvg', { params: tickerParams(params) })
   return response.data
 }
 
@@ -786,12 +938,14 @@ export const scanMACrossover = async (
   scanDate?: string,
   interval = '1d',
   refresh = false,
+  snapshotId?: string,
 ): Promise<MAScanResponse> => {
   const params: Record<string, string | number | boolean> = { short_period: shortPeriod, long_period: longPeriod, interval }
   if (tickers) params.tickers = tickers
   if (scanDate) params.scan_date = scanDate
   if (refresh) params.refresh = true
-  const response = await api.get('/scan/ma-crossover', { params })
+  if (snapshotId && import.meta.env.VITE_REALTIME_ONLY === 'true') params.snapshot_id = snapshotId
+  const response = await api.get('/scan/ma-crossover', { params: tickerParams(params) })
   return response.data
 }
 
@@ -801,12 +955,14 @@ export const scanMomentumPullback = async (
   scanDate?: string,
   interval = '1d',
   refresh = false,
+  snapshotId?: string,
 ): Promise<MomentumPullbackScanResponse> => {
   const params: Record<string, string | boolean> = { interval }
   if (tickers) params.tickers = tickers
   if (scanDate) params.scan_date = scanDate
   if (refresh) params.refresh = true
-  const response = await api.get('/scan/momentum-pullback', { params })
+  if (snapshotId && import.meta.env.VITE_REALTIME_ONLY === 'true') params.snapshot_id = snapshotId
+  const response = await api.get('/scan/momentum-pullback', { params: tickerParams(params) })
   return response.data
 }
 
@@ -816,12 +972,14 @@ export const scanBearishBounce = async (
   scanDate?: string,
   interval = '1d',
   refresh = false,
+  snapshotId?: string,
 ): Promise<BearishBounceScanResponse> => {
   const params: Record<string, string | boolean> = { interval }
   if (tickers) params.tickers = tickers
   if (scanDate) params.scan_date = scanDate
   if (refresh) params.refresh = true
-  const response = await api.get('/scan/bearish-bounce', { params })
+  if (snapshotId && import.meta.env.VITE_REALTIME_ONLY === 'true') params.snapshot_id = snapshotId
+  const response = await api.get('/scan/bearish-bounce', { params: tickerParams(params) })
   return response.data
 }
 
@@ -832,12 +990,14 @@ export const scanFibonacci = async (
   minSwingPct = 5.0,
   interval = '1d',
   refresh = false,
+  snapshotId?: string,
 ): Promise<FibonacciScanResponse> => {
   const params: Record<string, string | number | boolean> = { min_swing_pct: minSwingPct, interval }
   if (tickers) params.tickers = tickers
   if (scanDate) params.scan_date = scanDate
   if (refresh) params.refresh = true
-  const response = await api.get('/scan/fibonacci', { params })
+  if (snapshotId && import.meta.env.VITE_REALTIME_ONLY === 'true') params.snapshot_id = snapshotId
+  const response = await api.get('/scan/fibonacci', { params: tickerParams(params) })
   return response.data
 }
 
@@ -845,11 +1005,13 @@ export const scanAll = async (
   scanDate?: string,
   minSwingPct = 5.0,
   refresh = false,
+  snapshotId?: string,
 ): Promise<CombinedScanResponse> => {
   const params: Record<string, string | number | boolean> = { min_swing_pct: minSwingPct }
   if (scanDate) params.scan_date = scanDate
   if (refresh) params.refresh = true
-  const response = await api.get('/scan/all', { params })
+  if (snapshotId) params.snapshot_id = snapshotId
+  const response = await api.get('/scan/all', { params: tickerParams(params) })
   return response.data
 }
 
@@ -934,10 +1096,13 @@ export interface SetupSummaryResponse {
   market_time: string | null
   count: number
   results: SetupSummaryRow[]
+  publication?: DashboardPublication
 }
 
-export const getSetupSummary = async (interval: SetupSummaryInterval = '1d'): Promise<SetupSummaryResponse> => {
-  const response = await api.get('/tickers/setup-summary', { params: { interval } })
+export const getSetupSummary = async (interval: SetupSummaryInterval = '1d', snapshotId?: string): Promise<SetupSummaryResponse> => {
+  const params: Record<string, string> = { interval }
+  if (snapshotId && import.meta.env.VITE_REALTIME_ONLY === 'true') params.snapshot_id = snapshotId
+  const response = await api.get('/tickers/setup-summary', { params: tickerParams(params) })
   return response.data
 }
 
@@ -945,16 +1110,451 @@ export const getSetupSummary = async (interval: SetupSummaryInterval = '1d'): Pr
 export const getTickers = async (refresh = false): Promise<string[]> => {
   const params: Record<string, boolean> = {}
   if (refresh) params.refresh = true
-  const response = await api.get('/tickers', { params })
+  const response = await api.get('/tickers', { params: tickerParams(params) })
   return response.data
 }
 
-// Get Latest Price Date
-export const getLatestPriceDate = async (refresh = false): Promise<string> => {
-  const params: Record<string, boolean> = {}
+export interface DashboardPublication {
+  cohort_id?: string
+  strategy_ticker_available?: boolean
+  read_mode?: 'RETAINED'
+  reference_status?: 'CURRENT' | 'UNAVAILABLE'
+  action_status?: 'CURRENT' | 'CHANGED'
+  current_data_available?: boolean
+  execution_permission?: false
+  provider_fetch_performed?: false
+  release_type?: 'DAILY_STRATEGIES_V1' | 'DAILY_STRATEGY_HISTORY_V1' | 'DAILY_STRATEGY_ROLLING_V1'
+    | 'HOURLY_STRATEGIES_V1' | 'HOURLY_STRATEGY_HISTORY_V1' | 'HOURLY_STRATEGY_ROLLING_V1'
+  interval?: StrategyInterval
+  payload_sha256?: string
+  staleness_sessions?: number
+  max_serveable_stale_sessions?: number
+  snapshot_id: string
+  status: 'READY' | 'STALE' | 'EXPIRED'
+  session: string
+  market_time: string
+  generated_at: string
+  read_at: string
+  expected_market_time: string
+  scope_note: string
+  price_basis: string
+  missing_producers: Record<string, string>
+}
+
+export interface ScannerBasis {
+  price: string
+  volume: string
+  raw_volume_parity: 'UNVERIFIED'
+  weekly: string
+  usage: string
+}
+
+export type ScannerAnalysisStatus = 'COMPLETE' | 'COMPLETE_EMPTY' | 'PARTIAL' | 'INSUFFICIENT_HISTORY' | 'UNAVAILABLE' | 'FAILED'
+export interface ScannerCorporateAction {
+  action_id: string
+  action_type: string
+  effective_date: string
+  payload_sha256: string
+  cash_amount: string | null
+  currency: string | null
+  distribution_type: string | null
+  handling: 'CORPORATE_ACTION_REVIEW' | 'RECURRING_CASH_DIVIDEND_PRICE_SERIES_UNCHANGED'
+}
+export interface ScannerMemberAnalysis {
+  ticker: string
+  status: ScannerAnalysisStatus
+  available_bars: number
+  required_bars: number
+  total_signals: number
+  reason: string | null
+  corporate_actions?: ScannerCorporateAction[]
+}
+export interface ScannerAnalysis {
+  status: ScannerAnalysisStatus
+  total_evaluated: number
+  total_unavailable: number
+  members: ScannerMemberAnalysis[]
+}
+export interface DailyScannerCoverage {
+  interval?: string
+  analysis?: ScannerAnalysis
+}
+
+const checkedDailyStrategyPublication = (publication: DashboardPublication | undefined, snapshotId?: string, interval: StrategyInterval = '1d') => {
+  const versions = interval === '1d' ? ['DAILY_STRATEGIES_V1', 'DAILY_STRATEGY_HISTORY_V1', 'DAILY_STRATEGY_ROLLING_V1']
+    : ['HOURLY_STRATEGIES_V1', 'HOURLY_STRATEGY_HISTORY_V1', 'HOURLY_STRATEGY_ROLLING_V1']
+  if (!publication || !versions.includes(publication.release_type ?? '') || (publication.interval ?? '1d') !== interval
+    || publication.cohort_id !== import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
+    || !publication.snapshot_id || (snapshotId !== undefined && publication.snapshot_id !== snapshotId)) {
+    throw new Error('Stored independent strategy publication does not match the requested identity')
+  }
+  return publication
+}
+
+const resolveDailyStrategyPublication = async (snapshotId?: string, interval: StrategyInterval = '1d') => {
+  const response = await api.get('/strategies/daily', { params: tickerParams({ read_mode: 'retained', ...(interval === '1h' ? { interval } : {}) }, snapshotId) }).catch(error => {
+    throw storedReadError(error)
+  })
+  return checkedDailyStrategyPublication(response.data.publication, snapshotId, interval)
+}
+
+export interface LatestPricePublication {
+  latest_date: string
+  publication?: DashboardPublication
+}
+
+export const getLatestPricePublication = async (refresh = false, snapshotId?: string): Promise<LatestPricePublication> => {
+  const params: Record<string, boolean | string> = {}
   if (refresh) params.refresh = true
-  const response = await api.get('/latest-price-date', { params })
-  return response.data.latest_date
+  if (snapshotId && import.meta.env.VITE_REALTIME_ONLY === 'true') params.snapshot_id = snapshotId
+  try {
+    const response = await api.get('/latest-price-date', { params: tickerParams(params) })
+    return response.data
+  } catch (error) {
+    throw storedReadError(error)
+  }
+}
+
+export const getLatestPriceDate = async (refresh = false): Promise<string> => {
+  return (await getLatestPricePublication(refresh)).latest_date
+}
+
+export const resolveDashboardPublication = async (snapshotId?: string) => {
+  const latest = await getLatestPricePublication(false, snapshotId)
+  const publication = latest.publication
+  if (!publication || (snapshotId && publication.snapshot_id !== snapshotId)) {
+    throw new Error('Stored realtime publication metadata does not match the requested identity')
+  }
+  return publication
+}
+
+export function requireMatchingPublication(actual: DashboardPublication | undefined, expected: DashboardPublication): asserts actual is DashboardPublication {
+  const fields: Array<keyof DashboardPublication> = ['cohort_id', 'snapshot_id', 'session', 'market_time', 'generated_at', 'status', 'expected_market_time', 'strategy_ticker_available', 'release_type', 'payload_sha256', 'interval']
+  if (!actual || fields.some(
+    key => actual[key] !== expected[key],
+  )) throw new Error('Stored response does not match the requested publication')
+}
+
+export interface AllTickersPublication {
+  overview: TickerOverviewRow[]
+  setup: SetupSummaryResponse
+  publication: DashboardPublication
+  workspaces?: Array<{ ticker: string; snapshot_id: string; payload_sha256: string }>
+  setup_evidence_refs?: Record<string, TechnicalEvidenceRef>
+}
+
+export const getAllTickersPublication = async (snapshotId?: string): Promise<AllTickersPublication> => {
+  try {
+    const publication = await resolveDashboardPublication(snapshotId)
+    const [overview, setup] = await Promise.all([
+      getTickersOverview(undefined, false, publication.snapshot_id),
+      getSetupSummary('1d', publication.snapshot_id),
+    ])
+    requireMatchingPublication(setup.publication, publication)
+    return { overview, setup, publication: setup.publication }
+  } catch (error) {
+    if (import.meta.env.VITE_REALTIME_ONLY !== 'true') throw error
+    const response = await api.get('/tickers/workspace-publication', { params: retainedTickerParams(undefined, snapshotId) })
+    const result = response.data as AllTickersPublication
+    if (snapshotId !== undefined && result.publication.snapshot_id !== snapshotId) {
+      throw new Error('Ticker summary does not match the requested release')
+    }
+    return result
+  }
+}
+
+export interface DailyScannerPages {
+  gaps: { data: GapScanResponse; fvgData: FVGScanResponse; publication: DashboardPublication }
+  'ma-crossover': { data: MAScanResponse; publication: DashboardPublication }
+  'momentum-pullback': { data: MomentumPullbackScanResponse; publication: DashboardPublication }
+  'bearish-bounce': { data: BearishBounceScanResponse; publication: DashboardPublication }
+  fibonacci: { data: FibonacciScanResponse; publication: DashboardPublication }
+}
+
+export async function getDailyScannerPublication<K extends keyof DailyScannerPages>(kind: K, snapshotId?: string, interval: StrategyInterval = '1d'): Promise<DailyScannerPages[K]> {
+  if (import.meta.env.VITE_REALTIME_ONLY === 'true') {
+    try {
+      const response = await api.get('/strategies/daily', { params: tickerParams({ strategy: kind, read_mode: 'retained', ...(interval === '1h' ? { interval } : {}) }, snapshotId) })
+      const result = response.data as DailyScannerPages[K]
+      const publication = checkedDailyStrategyPublication(result.publication, snapshotId, interval)
+      const scanners = [result.data, ...('fvgData' in result ? [result.fvgData] : [])]
+      for (const scanner of scanners) {
+        requireMatchingPublication(scanner.publication, publication)
+        if (scanner.interval !== interval || !scanner.scanner_basis || scanner.scanner_basis.raw_volume_parity !== 'UNVERIFIED'
+          || JSON.stringify(scanner.scanner_basis) !== JSON.stringify(result.data.scanner_basis)) {
+          throw new Error('Stored scanner research basis is unavailable or does not match')
+        }
+        const coverage = scanner.analysis
+        if (!coverage || coverage.total_evaluated + coverage.total_unavailable !== scanner.total_scanned
+          || coverage.members.length !== scanner.total_scanned
+          || new Set(coverage.members.map(member => member.ticker)).size !== scanner.total_scanned) {
+          throw new Error('Stored strategy analysis coverage is unavailable or does not match')
+        }
+      }
+      if (kind === 'gaps' && !('fvgData' in result)) throw new Error('Stored FVG contract is unavailable')
+      return result
+    } catch (error) {
+      throw storedReadError(error)
+    }
+  }
+  const publication = await resolveDashboardPublication(snapshotId)
+  const pin = publication.snapshot_id
+  const checked = <T extends { publication?: DashboardPublication; scanner_basis?: ScannerBasis }>(data: T) => {
+    requireMatchingPublication(data.publication, publication)
+    if (!data.scanner_basis || data.scanner_basis.raw_volume_parity !== 'UNVERIFIED') {
+      throw new Error('Stored scanner research basis is unavailable')
+    }
+    return { data, publication: data.publication }
+  }
+  const reads: { [P in keyof DailyScannerPages]: () => Promise<DailyScannerPages[P]> } = {
+    gaps: async () => {
+      const [data, fvgData] = await Promise.all([
+        scanGaps(undefined, undefined, '1d', false, pin),
+        scanFVG(undefined, undefined, '1d', 50, false, pin),
+      ])
+      const fvg = checked(fvgData)
+      const result = checked(data)
+      if (JSON.stringify(data.scanner_basis) !== JSON.stringify(fvgData.scanner_basis)) {
+        throw new Error('Opening gaps and FVG research basis does not match')
+      }
+      return { ...result, fvgData, publication: fvg.publication.read_at > result.publication.read_at ? fvg.publication : result.publication }
+    },
+    'ma-crossover': async () => checked(await scanMACrossover(undefined, 9, 21, undefined, '1d', false, pin)),
+    'momentum-pullback': async () => checked(await scanMomentumPullback(undefined, undefined, '1d', false, pin)),
+    'bearish-bounce': async () => checked(await scanBearishBounce(undefined, undefined, '1d', false, pin)),
+    fibonacci: async () => checked(await scanFibonacci(undefined, undefined, 5, '1d', false, pin)),
+  }
+  return reads[kind]()
+}
+
+export type StrategyInterval = '1d' | '1h'
+export type DailyScannerContract = 'SCAN_GAPS_1D' | 'SCAN_FVG_1D_50' | 'SCAN_MA_1D_9_21'
+  | 'SCAN_MOMENTUM_1D' | 'SCAN_BEARISH_1D' | 'SCAN_FIBONACCI_1D_5'
+  | 'SCAN_GAPS_1H' | 'SCAN_FVG_1H_50' | 'SCAN_MA_1H_9_21' | 'SCAN_MOMENTUM_1H' | 'SCAN_BEARISH_1H' | 'SCAN_FIBONACCI_1H_ATR'
+export const HOURLY_STRATEGY_CONTRACTS: Record<string, DailyScannerContract> = {
+  SCAN_GAPS_1D: 'SCAN_GAPS_1H', SCAN_FVG_1D_50: 'SCAN_FVG_1H_50', SCAN_MA_1D_9_21: 'SCAN_MA_1H_9_21',
+  SCAN_MOMENTUM_1D: 'SCAN_MOMENTUM_1H', SCAN_BEARISH_1D: 'SCAN_BEARISH_1H', SCAN_FIBONACCI_1D_5: 'SCAN_FIBONACCI_1H_ATR',
+}
+export function dailyStrategyContract(contract: DailyScannerContract) {
+  return Object.keys(HOURLY_STRATEGY_CONTRACTS).find(key => HOURLY_STRATEGY_CONTRACTS[key] === contract) ?? contract
+}
+export type DailyEvaluationResult = GapResult | FVGResult | MAResult | MomentumPullbackResult | BearishBounceResult | FibonacciResult
+export interface DailyEvaluationScanner {
+  interval: string
+  scan_datetime: string
+  total_scanned: number
+  total_signals: number
+  results: DailyEvaluationResult[]
+  lookback?: number
+  short_period?: number
+  long_period?: number
+  min_swing_pct?: number | null
+  swing_policy?: string
+}
+export interface DailyStrategyEvaluations {
+  publication: DashboardPublication
+  scanner_basis: ScannerBasis
+  members: string[]
+  observed_sessions: string[]
+  recurrence_available: false
+  scanners: Record<DailyScannerContract, DailyEvaluationScanner>
+  analysis: Record<DailyScannerContract, ScannerAnalysis>
+  evidence_refs: Record<string, Record<string, { cohort_id: string; evidence_id: string; evidence_type: 'SCANNER_RESULT'; market_time: string; payload_sha256: string }>>
+}
+
+export async function getDailyStrategyEvaluations(snapshotId?: string, interval: StrategyInterval = '1d'): Promise<DailyStrategyEvaluations> {
+  if (import.meta.env.VITE_REALTIME_ONLY !== 'true') throw new Error('Stored daily evaluations require realtime-only mode')
+  try {
+    const response = await api.get('/strategies/daily', { params: tickerParams({ view: 'evaluations', read_mode: 'retained', ...(interval === '1h' ? { interval } : {}) }, snapshotId) })
+    const result = response.data as DailyStrategyEvaluations
+    const publication = checkedDailyStrategyPublication(result.publication, snapshotId, interval)
+    const dailyContracts: DailyScannerContract[] = ['SCAN_GAPS_1D', 'SCAN_FVG_1D_50', 'SCAN_MA_1D_9_21',
+      'SCAN_MOMENTUM_1D', 'SCAN_BEARISH_1D', 'SCAN_FIBONACCI_1D_5']
+    const contracts = interval === '1d' ? dailyContracts : dailyContracts.map(key => HOURLY_STRATEGY_CONTRACTS[key])
+    if (!result.members?.length || new Set(result.members).size !== result.members.length
+      || result.observed_sessions?.length !== 1 || result.observed_sessions[0] !== publication.session
+      || result.recurrence_available !== false || !result.evidence_refs
+      || !result.scanner_basis || result.scanner_basis.raw_volume_parity !== 'UNVERIFIED'
+      || contracts.some(key => !result.scanners?.[key] || !result.analysis?.[key])) {
+      throw new Error('Stored evaluation membership, coverage or research basis is unavailable')
+    }
+    for (const key of contracts) {
+      const scanner = result.scanners[key], coverage = result.analysis[key]
+      if (scanner.interval !== interval || scanner.scan_datetime !== publication.generated_at
+        || scanner.total_scanned !== result.members.length || scanner.total_signals !== scanner.results?.length
+        || scanner.results.some(row => !result.members.includes(row.ticker))
+        || coverage.members?.length !== result.members.length
+        || coverage.members.some((member, index) => member.ticker !== result.members[index])
+        || coverage.total_evaluated !== coverage.members.filter(member => ['COMPLETE', 'COMPLETE_EMPTY'].includes(member.status)).length
+        || coverage.total_unavailable + coverage.total_evaluated !== result.members.length) {
+        throw new Error('Stored evaluation rows or coverage do not match the exact release')
+      }
+      for (const member of coverage.members) {
+        const rows = scanner.results.filter(row => row.ticker === member.ticker)
+        const ref = result.evidence_refs[member.ticker]?.[key]
+        const evaluated = member.status === 'COMPLETE' || member.status === 'COMPLETE_EMPTY'
+        const requiredBars = ({ SCAN_GAPS_1D: 20, SCAN_FVG_1D_50: 50, SCAN_MA_1D_9_21: 26,
+          SCAN_MOMENTUM_1D: interval === '1d' ? 210 : 200, SCAN_BEARISH_1D: interval === '1d' ? 210 : 200, SCAN_FIBONACCI_1D_5: 50 } as Record<string, number>)[dailyStrategyContract(key)]
+        const invalidRows = member.total_signals !== rows.length || !evaluated && rows.length > 0
+          || member.status === 'COMPLETE_EMPTY' && rows.length > 0
+          || member.status === 'COMPLETE' && rows.length === 0
+          || !['COMPLETE', 'COMPLETE_EMPTY', 'INSUFFICIENT_HISTORY', 'UNAVAILABLE', 'FAILED'].includes(member.status)
+          || !Number.isInteger(member.available_bars) || member.available_bars < 0 || member.required_bars !== requiredBars
+          || evaluated && member.available_bars < requiredBars
+        const invalidEvidence = member.status === 'UNAVAILABLE' || member.status === 'FAILED' ? !!ref
+          : !ref || ref.cohort_id !== publication.cohort_id || ref.market_time !== publication.market_time
+            || ref.evidence_type !== 'SCANNER_RESULT' || !ref.evidence_id || !ref.payload_sha256
+        if (invalidRows || invalidEvidence) {
+          throw new Error('Stored member evaluation or evidence reference does not match the release')
+        }
+      }
+    }
+    if (result.scanners[contracts[1]].lookback !== 50
+      || result.scanners[contracts[2]].short_period !== 9 || result.scanners[contracts[2]].long_period !== 21
+      || (interval === '1d' ? result.scanners[contracts[5]].min_swing_pct !== 5
+        : result.scanners[contracts[5]].min_swing_pct !== null || result.scanners[contracts[5]].swing_policy !== 'INTERVAL_AWARE_ATR_STRUCTURAL_CONFIRMED_LEG')) throw new Error('Stored evaluation defaults do not match')
+    return result
+  } catch (error) {
+    throw storedReadError(error)
+  }
+}
+
+export interface DailyStrategyTickerPublication {
+  evaluation_session?: string
+  evaluation_market_time?: string
+  interpretation?: string
+  publication: DashboardPublication
+  scanner_basis: ScannerBasis
+  ticker: string
+  cohort_count: number
+  overview: TickerOverviewRow | null
+  setup: SetupSummaryRow | null
+  analysis: Record<'gaps' | 'fvg' | 'ma' | 'momentum' | 'bearish' | 'fibonacci', ScannerMemberAnalysis>
+  evidence_refs: Record<string, { cohort_id: string; evidence_id: string; evidence_type: 'SCANNER_RESULT'; market_time: string; payload_sha256: string }>
+  scans: {
+    gaps: GapResult[]
+    fvg: FVGResult[]
+    ma: MAResult[]
+    momentum: MomentumPullbackResult[]
+    bearish: BearishBounceResult[]
+    fibonacci: FibonacciResult[]
+  }
+}
+
+export interface PersistenceSession {
+  session: string
+  state: 'MATCH' | 'NO_MATCH' | 'UNAVAILABLE' | 'INSUFFICIENT_HISTORY' | 'FAILED'
+  reason: string | null
+  transition: string
+  consecutive_run: number
+  event_ids: string[]
+  direction: string[]
+  direction_changed: boolean
+  native_rows: DailyEvaluationResult[]
+  evidence_ref?: DailyStrategyEvaluations['evidence_refs'][string][string] | null
+  input_sha256?: string | null
+  market_time: string | null
+  observed_at: string | null
+  available_bars: number
+  required_bars: number | null
+  distance: number | null
+  magnitude: number | null
+  maturity: number | null
+  volume: number | null
+}
+export interface PersistenceStrategyRow {
+  ticker: string
+  contract: DailyScannerContract
+  sessions: PersistenceSession[]
+  matched: number
+  evaluated: number
+  coverage: string
+  consecutive_run: number
+  transition: string
+}
+export interface StrategyPersistencePublication extends Omit<DailyStrategyEvaluations, 'recurrence_available'> {
+  evaluation_sessions: string[]
+  interpretation: string
+  reconstruction_at: string | null
+  session_provenance?: Record<string, 'STORED_EVALUATION' | 'RECONSTRUCTED_RESEARCH_NOT_ORIGINAL_ON_TIME_DECISIONS'>
+  persistence: { sessions: string[]; window_unit: 'XNYS_TRADING_SESSIONS'; rows: PersistenceStrategyRow[] } | null
+}
+
+export async function getStrategyPersistence(snapshotId?: string, interval: StrategyInterval = '1d'): Promise<StrategyPersistencePublication> {
+  const response = await api.get('/strategies/daily', { params: tickerParams({ view: 'persistence', read_mode: 'retained', ...(interval === '1h' ? { interval } : {}) }, snapshotId) })
+  const result = response.data as StrategyPersistencePublication
+  const publication = checkedDailyStrategyPublication(result.publication, snapshotId, interval)
+  if (result.evaluation_sessions?.length !== 5 || new Set(result.evaluation_sessions).size !== 5
+    || result.evaluation_sessions[result.evaluation_sessions.length - 1] !== publication.session || !result.members?.length
+    || new Set(result.members).size !== result.members.length || !result.observed_sessions?.length
+    || result.observed_sessions.some(session => !result.evaluation_sessions.includes(session))
+    || result.scanner_basis?.raw_volume_parity !== 'UNVERIFIED') throw new Error('Stored Persistence coverage does not match')
+  if (result.persistence) {
+    const history = result.persistence
+    const rolling = publication.release_type?.includes('_ROLLING_') === true
+    if ((rolling ? result.interpretation !== 'STORED_SESSION_OUTCOMES_WITH_EXPLICIT_PROVENANCE'
+        || !result.session_provenance || Object.keys(result.session_provenance).sort().join() !== [...result.observed_sessions].sort().join()
+        || Object.values(result.session_provenance).some(value => !['STORED_EVALUATION', 'RECONSTRUCTED_RESEARCH_NOT_ORIGINAL_ON_TIME_DECISIONS'].includes(value))
+      : result.interpretation !== 'RECONSTRUCTED_RESEARCH_NOT_ORIGINAL_ON_TIME_DECISIONS' || result.reconstruction_at !== publication.generated_at)
+      || history.window_unit !== 'XNYS_TRADING_SESSIONS'
+      || history.sessions.join() !== result.evaluation_sessions.join() || history.rows.length !== result.members.length * 6
+      || new Set(history.rows.map(row => `${row.ticker}:${row.contract}`)).size !== history.rows.length
+      || history.rows.some(row => !result.members.includes(row.ticker) || row.sessions.length !== 5
+        || row.sessions.some((cell, index) => cell.session !== history.sessions[index]
+          || !['MATCH', 'NO_MATCH', 'UNAVAILABLE', 'INSUFFICIENT_HISTORY', 'FAILED'].includes(cell.state)
+          || ['MATCH', 'NO_MATCH'].includes(cell.state) && (!cell.evidence_ref
+            || cell.evidence_ref.cohort_id !== publication.cohort_id || cell.evidence_ref.market_time !== cell.market_time
+            || (rolling ? !cell.observed_at || !Number.isFinite(Date.parse(cell.observed_at))
+              || Date.parse(cell.observed_at) > Date.parse(publication.generated_at)
+              || !result.session_provenance?.[cell.session] : cell.observed_at !== result.reconstruction_at) || !cell.input_sha256))
+        || row.matched !== row.sessions.filter(cell => cell.state === 'MATCH').length
+        || row.evaluated !== row.sessions.filter(cell => ['MATCH', 'NO_MATCH'].includes(cell.state)).length
+        || row.coverage !== `${row.evaluated}/5`)) throw new Error('Stored Persistence sessions or evidence do not match')
+  } else if (result.observed_sessions.length !== 1 || result.interpretation !== 'RETAINED_LATEST_EVALUATION_ONLY') {
+    throw new Error('Stored Persistence cannot substitute missing history')
+  }
+  return result
+}
+
+export async function getDailyStrategyTickerPublication(symbol: string, snapshotId?: string, interval: StrategyInterval = '1d', evaluationSession?: string): Promise<DailyStrategyTickerPublication> {
+  if (import.meta.env.VITE_REALTIME_ONLY !== 'true') throw new Error('Daily strategy research requires realtime-only mode')
+  const ticker = symbol.toUpperCase()
+  if (!/^[A-Z][A-Z0-9.-]{0,31}$/.test(ticker)) throw new Error('Invalid daily research ticker')
+  const publication = await resolveDailyStrategyPublication(snapshotId, interval)
+  if (publication.cohort_id !== import.meta.env.VITE_REALTIME_COHORT_ID?.trim()) {
+    throw new Error('Daily research publication does not match the requested cohort')
+  }
+  if (publication.strategy_ticker_available !== true) {
+    throw new Error('Selected publication does not retain complete daily ticker research contracts')
+  }
+  const response = await api.get('/strategies/daily', { params: tickerParams({ ticker, read_mode: 'retained', ...(interval === '1h' ? { interval } : {}),
+    ...(evaluationSession ? { evaluation_session: evaluationSession } : {}) }, publication.snapshot_id) })
+  const result = response.data as DailyStrategyTickerPublication
+  requireMatchingPublication(result.publication, publication)
+  if (result.evaluation_session !== evaluationSession || evaluationSession && (!result.evaluation_market_time?.startsWith(evaluationSession)
+    || !['STORED_EVALUATION', 'RECONSTRUCTED_RESEARCH_NOT_ORIGINAL_ON_TIME_DECISIONS'].includes(result.interpretation ?? ''))) throw new Error('Stored evaluation session does not match')
+  if (!result.scanner_basis || result.scanner_basis.raw_volume_parity !== 'UNVERIFIED') {
+    throw new Error('Stored scanner research basis is unavailable')
+  }
+  const names = ['gaps', 'fvg', 'ma', 'momentum', 'bearish', 'fibonacci'] as const
+  const contracts = { gaps: 'SCAN_GAPS_1D', fvg: 'SCAN_FVG_1D_50', ma: 'SCAN_MA_1D_9_21',
+    momentum: 'SCAN_MOMENTUM_1D', bearish: 'SCAN_BEARISH_1D', fibonacci: 'SCAN_FIBONACCI_1D_5' }
+  if (result.ticker !== ticker || !result.cohort_count || result.overview && result.overview.ticker !== ticker
+    || result.setup && result.setup.ticker !== ticker || names.some(name => !result.analysis?.[name]
+      || result.analysis[name].ticker !== ticker || !result.scans?.[name]
+      || result.scans[name].some(row => row.ticker !== ticker)
+      || result.analysis[name].total_signals !== result.scans[name].length) || !result.evidence_refs) {
+    throw new Error('Daily research membership does not match the publication')
+  }
+  for (const name of names) {
+    const ref = result.evidence_refs[interval === '1d' ? contracts[name] : HOURLY_STRATEGY_CONTRACTS[contracts[name]]]
+    if (result.analysis[name].status === 'UNAVAILABLE' ? !!ref || result.scans[name].length > 0 : !ref || ref.cohort_id !== publication.cohort_id
+      || ref.market_time !== (result.evaluation_market_time ?? publication.market_time) || ref.evidence_type !== 'SCANNER_RESULT'
+      || !ref.evidence_id || !ref.payload_sha256) {
+      throw new Error('Daily research evidence references do not match the publication')
+    }
+  }
+  return result
 }
 
 // Selectable scan sessions, oldest first (weekends, holidays and un-ingested days absent)
@@ -966,7 +1566,7 @@ export interface TradingSessionsResponse {
 }
 
 export const getTradingSessions = async (interval = '1d', limit = 260): Promise<TradingSessionsResponse> => {
-  const response = await api.get('/trading-sessions', { params: { interval, limit } })
+  const response = await api.get('/trading-sessions', { params: tickerParams({ interval, limit }) })
   return response.data
 }
 
@@ -976,10 +1576,11 @@ export const getChartData = async (
   period = '1y',
   interval = '1d',
   refresh = false,
+  snapshotId?: string,
 ): Promise<ChartDataPoint[]> => {
   const params: Record<string, string | boolean> = { period, interval }
   if (refresh) params.refresh = true
-  const response = await api.get(`/stock/${ticker}/chart`, { params })
+  const response = await api.get(`/stock/${ticker}/chart`, { params: retainedTickerParams(params, snapshotId) })
   return response.data
 }
 
@@ -987,10 +1588,11 @@ export const getChartPatterns = async (
   ticker: string,
   interval = '1d',
   refresh = false,
+  snapshotId?: string,
 ): Promise<ChartPatternsResponse> => {
   const params: Record<string, string | boolean> = { interval }
   if (refresh) params.refresh = true
-  const response = await api.get(`/stock/${ticker}/chart-patterns`, { params })
+  const response = await api.get(`/stock/${ticker}/chart-patterns`, { params: retainedTickerParams(params, snapshotId) })
   return response.data
 }
 
@@ -998,45 +1600,49 @@ export const getPriceChannel = async (
   ticker: string,
   interval = '1d',
   refresh = false,
+  snapshotId?: string,
 ): Promise<PriceChannelResponse> => {
   const params: Record<string, string | boolean> = { interval }
   if (refresh) params.refresh = true
-  const response = await api.get(`/stock/${ticker}/price-channel`, { params })
+  const response = await api.get(`/stock/${ticker}/price-channel`, { params: retainedTickerParams(params, snapshotId) })
   return response.data
 }
 
 export const scanChartPatterns = async (
   interval = '1d',
   refresh = false,
+  snapshotId?: string,
 ): Promise<PatternWatchResponse> => {
   const params: Record<string, string | boolean> = { interval }
   if (refresh) params.refresh = true
-  const response = await api.get('/chart-patterns/scan', { params })
+  const response = await api.get('/chart-patterns/scan', { params: retainedTickerParams(params, snapshotId) })
   return response.data
 }
 
 export const scanTickerChartPatterns = async (
   ticker: string,
   refresh = false,
+  snapshotId?: string,
 ): Promise<PatternWatchResponse> => {
   const response = await api.get(`/chart-patterns/ticker/${ticker}`, {
-    params: refresh ? { refresh: true } : undefined,
+    params: retainedTickerParams(refresh ? { refresh: true } : undefined, snapshotId),
   })
   return response.data
 }
 
-export const getLatestQuote = async (ticker: string, refresh = false): Promise<LatestQuote> => {
+export const getLatestQuote = async (ticker: string, refresh = false, snapshotId?: string): Promise<LatestQuote> => {
   const params: Record<string, boolean> = {}
   if (refresh) params.refresh = true
-  const response = await api.get(`/stock/${ticker}/quote`, { params })
+  const response = await api.get(`/stock/${ticker}/quote`, { params: retainedTickerParams(params, snapshotId) })
   return response.data
 }
 
 export const getEquitySecurityProfile = async (
   ticker: string,
+  snapshotId?: string,
 ): Promise<EquitySecurityProfileResponse> => {
   const response = await api.get(`/equity/security/${ticker}`, {
-    params: { report_limit: 12 },
+    params: retainedTickerParams({ report_limit: 12 }, snapshotId),
   })
   return response.data
 }
@@ -1341,18 +1947,19 @@ export interface MultiTradeSetupResponse {
   as_of: string
 }
 
-export const getMultiTradeSetup = async (ticker: string, refresh = false): Promise<MultiTradeSetupResponse> => {
+export const getMultiTradeSetup = async (ticker: string, refresh = false, snapshotId?: string): Promise<MultiTradeSetupResponse> => {
   const params = refresh ? { refresh: true } : undefined
-  const response = await api.get(`/stock/${ticker}/trade-setup/multi`, { params })
+  const response = await api.get(`/stock/${ticker}/trade-setup/multi`, { params: retainedTickerParams(params, snapshotId) })
   return response.data
 }
 
 // Get Tickers Overview (OHLC + daily MAs + weekly MAs)
-export const getTickersOverview = async (scanDate?: string, refresh = false): Promise<TickerOverviewRow[]> => {
+export const getTickersOverview = async (scanDate?: string, refresh = false, snapshotId?: string): Promise<TickerOverviewRow[]> => {
   const params: Record<string, string | boolean> = {}
   if (scanDate) params.scan_date = scanDate
   if (refresh) params.refresh = true
-  const response = await api.get('/tickers/overview', { params })
+  if (snapshotId) params.snapshot_id = snapshotId
+  const response = await api.get('/tickers/overview', { params: tickerParams(params) })
   return response.data
 }
 
@@ -1689,7 +2296,7 @@ export interface OptionDetectorDatasets {
   configured_effective_from: string | null
 }
 
-export const getOptionDetectorDatasets = async (): Promise<OptionsEnvelope<OptionDetectorDatasets>> => (await api.get('/options/alerts/datasets')).data
+export const getOptionDetectorDatasets = async (): Promise<OptionsEnvelope<OptionDetectorDatasets>> => (await api.get('/options/alerts/datasets', { params: tickerParams() })).data
 
 export interface OptionAlertSchedule {
   dataset_id: string
@@ -1709,7 +2316,7 @@ export interface OptionAlertSchedule {
   dataset_timing: 'EXPECTED_CHECK_WINDOW_NOT_COMPLETION_DEADLINE'
 }
 
-export const getOptionAlertSchedule = async (): Promise<OptionsEnvelope<OptionAlertSchedule>> => (await api.get('/options/alerts/schedule')).data
+export const getOptionAlertSchedule = async (): Promise<OptionsEnvelope<OptionAlertSchedule>> => (await api.get('/options/alerts/schedule', { params: tickerParams() })).data
 
 export interface OptionAlertOriginalPackage {
   status: 'AVAILABLE' | 'UNAVAILABLE'
@@ -1862,7 +2469,7 @@ export const getOptionDetectorEvaluations = async (params: {
   session_date?: string; dataset_id?: string; detector?: OptionDetectorId;
   underlyer?: string; sort_by?: OptionDetectorSort; sort_order?: 'asc' | 'desc';
   selection_status?: 'SELECTED' | 'NOT_SELECTED' | 'REPEAT' | 'OBSERVATION'; limit?: number; offset?: number;
-}): Promise<OptionsEnvelope<OptionDetectorEvaluationReview>> => (await api.get('/options/alerts/evaluations', { params })).data
+}): Promise<OptionsEnvelope<OptionDetectorEvaluationReview>> => (await api.get('/options/alerts/evaluations', { params: tickerParams(params) })).data
 
 export interface OptionCurrentMark {
   status: 'FRESH' | 'STALE' | 'UNAVAILABLE'
@@ -1930,7 +2537,7 @@ export const getOptionDetectorAlerts = async (params: {
   session_rollup?: boolean;
   underlyer?: string; sort_by?: OptionDetectorSort; sort_order?: 'asc' | 'desc';
   detector?: OptionDetectorId; limit?: number; offset?: number;
-}): Promise<OptionsEnvelope<OptionDetectorAlertReview>> => (await api.get('/options/alerts/detector-runs', { params })).data
+}): Promise<OptionsEnvelope<OptionDetectorAlertReview>> => (await api.get('/options/alerts/detector-runs', { params: tickerParams(params) })).data
 
 export interface OptionDiscoveryCatalog {
   version: string
@@ -2169,6 +2776,17 @@ export interface OptionCandidateResearchEvidence {
 }
 
 export interface OptionCandidateDetailData {
+  valuation_assumption?: 'EXPLICIT_ZERO_YIELD_RESEARCH' | 'POLICY_BOUND_SOURCE_INPUTS'
+  advisory_context?: {
+    gamma: { role: 'ADVISORY'; policy_sha256: string; coverage: string; profiles: Array<{
+      scope: string; profile: { net_gamma_notional_per_percent: number; absolute_gamma_notional_per_percent: number;
+        coverage_fraction: number; contributing_contract_count: number; convention: string; quality_reasons: string[];
+        flip: { flip_spot: string | null; regime_at_spot: string; reasons: string[] } }
+    }> }
+    trades: { role: 'ADVISORY'; status: string; reason: string | null; volume: number | null; transacted_premium: string | null;
+      window_start?: string; window_end?: string; unique_event_count?: number; classification_counts?: Record<string, number>;
+      scope?: string; aggressor_side: null; chain_volume_used_as_tape: false }
+  }
   candidate: Omit<OptionCandidateRow, 'legs'> & {
     context_status: string | null
     trend_state: string | null
@@ -2243,9 +2861,10 @@ export interface OptionCurrentAdvancedQuotesData {
 export const getOptionEventCalendar = async (
   underlyer: string,
   daysForward = 30,
+  snapshotId?: string,
 ): Promise<OptionsEnvelope<OptionTickerCalendarData>> => {
   const response = await api.get(`/options/calendar/${underlyer}`, {
-    params: { days_forward: daysForward },
+    params: retainedTickerParams({ days_forward: daysForward }, snapshotId),
   })
   return response.data
 }
@@ -2254,7 +2873,7 @@ export const getOptionFlow = async (
   underlyer?: string,
   sessionDate?: string,
 ): Promise<OptionsEnvelope<OptionFlowData>> => {
-  const response = await api.get('/options/flow', { params: { underlyer, session_date: sessionDate } })
+  const response = await api.get('/options/flow', { params: tickerParams({ underlyer, session_date: sessionDate }) })
   return response.data
 }
 
@@ -2280,26 +2899,26 @@ export const getOptionCandidates = async (params?: {
 }
 
 export const getOptionDiscoveryCatalog = async (): Promise<OptionDiscoveryCatalog> => {
-  const response = await api.get('/options/discovery-catalog')
+  const response = await api.get('/options/discovery-catalog', { params: tickerParams() })
   return response.data
 }
 
 export const queryEligibleChain = async (request: EligibleChainRequest): Promise<OptionsEnvelope<EligibleChainData>> => {
-  const response = await api.post('/options/eligible-chain/query', request)
+  const response = await api.post('/options/eligible-chain/query', request, { params: tickerParams() })
   return response.data
 }
 
 export const getOptionCandidate = async (
   candidateId: string,
 ): Promise<OptionsEnvelope<OptionCandidateDetailData>> => {
-  const response = await api.get(`/options/candidates/${candidateId}`)
+  const response = await api.get(`/options/candidates/${candidateId}`, { params: tickerParams() })
   return response.data
 }
 
 export const getOptionCurrentAdvancedQuotes = async (
   contractIds: number[],
 ): Promise<OptionsEnvelope<OptionCurrentAdvancedQuotesData>> => {
-  const response = await api.get('/options/quotes/current', { params: { contract_id: contractIds } })
+  const response = await api.get('/options/quotes/current', { params: tickerParams({ contract_id: contractIds }) })
   return response.data
 }
 
@@ -2347,7 +2966,7 @@ export interface OptionAlertPreviewData {
 }
 
 export const previewOptionAlert = async (candidateId: string, request: OptionAlertPreviewRequest = {}): Promise<OptionsEnvelope<OptionAlertPreviewData>> => {
-  const response = await api.post(`/options/alerts/preview/${candidateId}`, request)
+  const response = await api.post(`/options/alerts/preview/${candidateId}`, request, { params: tickerParams() })
   return response.data
 }
 

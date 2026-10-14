@@ -50,7 +50,7 @@ from options.repositories.catalog import (  # noqa: E402
     OptionContractCatalogRepository,
 )
 
-BASE_URL = "https://api.polygon.io"
+BASE_URL = "https://api.massive.com"
 ALLOWED_HOSTS = frozenset({"api.polygon.io", "api.massive.com"})
 DEFAULT_OUTPUT = BACKEND_DIR.parent / "docs" / "option_historical_catalog_admission.json"
 IV_CONTEXT_HORIZON_DAYS = (7, 21, 45)

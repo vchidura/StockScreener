@@ -8,6 +8,7 @@ pydantic==2.5.3
 numpy==1.26.4
 scipy==1.17.1
 requests==2.31.0
+websockets==17.0.1
 polygon-api-client==1.16.3
 pyarrow==25.0.1
 exchange-calendars==4.13.2

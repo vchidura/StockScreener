@@ -62,15 +62,16 @@ def test_direct_structural_levels_require_trend_window_revision():
             expected_latest_revision_id=uuid4())
 
 
-def leg(side, contract_type, expiration, contract_id, *, spot=100, delta=0.5, theta=-0.05, vega=0.1):
+def leg(side, contract_type, expiration, contract_id, *, spot=100, delta=0.5, theta=-0.05, vega=0.1, strike=100):
     return SimpleNamespace(side=SimpleNamespace(value=side), contract_type=SimpleNamespace(value=contract_type),
-        expiration_date=expiration, contract_id=contract_id, spot=Decimal(spot), local_iv=0.3, local_delta=delta,
+        expiration_date=expiration, contract_id=contract_id, spot=Decimal(spot), strike=Decimal(strike),
+        time_to_expiration_years=0.05, risk_free_rate=0.04, dividend_yield=0.01, local_iv=0.3, local_delta=delta,
         local_theta_per_day=theta, local_vega_per_vol_point=vega, ratio=1, multiplier=100)
 
 
-def candidate(strategy, rank, dte, contract_id, contract_type="CALL"):
+def candidate(strategy, rank, dte, contract_id, contract_type="CALL", strike=100):
     session = date(2026, 9, 18)
-    legs = (leg("BUY", contract_type, session + timedelta(days=dte), contract_id),)
+    legs = (leg("BUY", contract_type, session + timedelta(days=dte), contract_id, strike=strike),)
     if strategy == "DIRECTIONAL_DEBIT_SPREAD":
         legs += (leg("SELL", contract_type, session + timedelta(days=dte), contract_id + 1000),)
     return SimpleNamespace(underlyer="AAPL", strategy_name=strategy, structure_type=SimpleNamespace(value="LONG_CALL"),
@@ -103,6 +104,89 @@ def test_matched_expressions_keep_missing_greeks_observation_only():
         activity_contract_ids=set(), rv20=0.25)
     assert row.long_delta is None
     assert row.theta_per_maximum_loss is None and row.vega_per_maximum_loss is None
+
+
+def test_matched_expressions_do_not_compare_a_biased_itm_put_iv_with_realized_volatility():
+    from options.intraday_participation import matched_expressions
+
+    session = date(2026, 9, 18)
+    pool = [candidate("DIRECTIONAL_LONG_PREMIUM", 1, 30, 1, contract_type="PUT", strike=108),
+        candidate("DIRECTIONAL_DEBIT_SPREAD", 1, 30, 2, contract_type="PUT", strike=100)]
+    rows = {row.strategy_name: row for row in matched_expressions(pool, underlyer="AAPL", direction=-1,
+        session_date=session, activity_contract_ids=set(), rv20=0.25)}
+    in_the_money, at_the_money = rows["DIRECTIONAL_LONG_PREMIUM"], rows["DIRECTIONAL_DEBIT_SPREAD"]
+    assert in_the_money.iv_over_rv20 is None and in_the_money.long_iv == pytest.approx(0.3)
+    assert in_the_money.expected_move is not None
+    assert at_the_money.iv_over_rv20 == pytest.approx(1.2)
+
+
+def test_o1_v3_records_why_an_activity_iv_was_withheld_and_the_challenger_is_unavailable():
+    from options.dual_origin import assess_options_canonical_trend
+    from options.intraday_participation import build_o1_indicator_observation_v3
+
+    source = activity_source()
+    stock = evidence(source)
+    decision = assess_options_canonical_trend(source, stock, direction=1, market_cutoff=MARKET, decision_at=NOW)
+    extras = dict(minutes_since_open=30, gap_open_return=0.01, opening_range_break_held=1.0,
+        spy_session_return=0.004, qqq_session_return=0.005, activity_dte=28, activity_iv=None, rv20_cc_annual=0.2)
+
+    def observe(**kwargs):
+        return build_o1_indicator_observation_v3(source, decision, stock, scheduled_cycle=MARKET,
+            regime={"SPY": 0.1, "QQQ": 0.2}, prior_same_direction=False, extras=extras, expressions=(), **kwargs)
+
+    def activity_iv(observation):
+        return next(row for row in observation.measurements if row.metric_id == "activity_iv")
+
+    withheld = observe(unavailable_reasons={"activity_iv": ("IV_NOT_COMPARABLE_ITM_PUT_AMERICAN_BIAS",)})
+    assert activity_iv(withheld).status == "UNAVAILABLE" and activity_iv(withheld).value is None
+    assert activity_iv(withheld).reason_codes == ("IV_NOT_COMPARABLE_ITM_PUT_AMERICAN_BIAS",)
+    challenger = next(row for row in withheld.challengers if row.challenger_id == "ACTIVITY_IV_BELOW_RV20")
+    assert challenger.verdict == "UNAVAILABLE" and challenger.reason_codes == ("REQUIRED_INDICATOR_UNAVAILABLE",)
+    assert activity_iv(observe()).reason_codes == ("METRIC_UNAVAILABLE",)
+
+
+def _v36_inputs(snapshot):
+    from options.dual_origin import assess_options_canonical_trend
+
+    source = activity_source()
+    stock = evidence(source)
+    decision = assess_options_canonical_trend(source, stock, direction=1, market_cutoff=MARKET, decision_at=NOW)
+    closes = [100 + (index % 3) for index in range(25)]
+    daily = [dict(ticker="AAPL", interval="1d", session_date=source.volume_session - timedelta(days=25 - index),
+        close_price=close) for index, close in enumerate(closes)]
+    matched = dict(source=source, snapshot=snapshot, intraday_stock=stock)
+    return [(matched, decision, 1, False)], daily
+
+
+def _snapshot(contract_type, strike):
+    return SimpleNamespace(contract_type=contract_type, spot=Decimal("100"), strike=Decimal(strike),
+        time_to_expiration_years=0.1, risk_free_rate=0.04, dividend_yield=0.01, local_iv=0.30,
+        local_vega_per_vol_point=0.1, iv_converged=True, iv_failure_reason=None)
+
+
+@pytest.mark.parametrize(("contract_type", "strike", "comparable"), [("PUT", "108", False), ("PUT", "100", True),
+    ("CALL", "92", True)])
+def test_collector_gates_the_activity_iv_used_against_realized_volatility(contract_type, strike, comparable):
+    from collections import Counter
+    from options.detector_collection import ProductionDetectorSourceReader
+    from options.domain import ContractType
+
+    pending, daily = _v36_inputs(_snapshot(ContractType(contract_type), strike))
+    rejected = Counter()
+    observations = ProductionDetectorSourceReader._v36_observations(None, pending,
+        package_sources=dict(candidates=[]), legs={}, stock_rows=daily, scheduled_cycle=MARKET,
+        regime={"SPY": 0.1, "QQQ": 0.2}, rejected=rejected)
+
+    assert not rejected and len(observations) == 1
+    measurement = next(row for row in observations[0].measurements if row.metric_id == "activity_iv")
+    challenger = next(row for row in observations[0].challengers if row.challenger_id == "ACTIVITY_IV_BELOW_RV20")
+    if comparable:
+        assert measurement.status == "READY" and measurement.value == pytest.approx(0.30)
+        assert challenger.verdict in ("PASS", "FAIL")
+    else:
+        assert measurement.status == "UNAVAILABLE"
+        assert measurement.reason_codes == ("IV_NOT_COMPARABLE_ITM_PUT_AMERICAN_BIAS",)
+        assert challenger.verdict == "UNAVAILABLE"
 
 
 def test_opening_lane_measures_gap_and_held_range_break():

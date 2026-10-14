@@ -356,12 +356,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 It checks command selection and script paths, not provider credentials, enrollment
 or runtime health. ExecutionPolicy Bypass applies only to that PowerShell process.
 
-Terminal 1 starts the API and explicitly loads the backend environment file:
+Terminal 1 starts the realtime API from the repository root using the active
+backend environment file. `main:app` is the canonical entry point and must not be
+used with the realtime-only configuration:
 
 ```powershell
-.\backend\.venv\Scripts\python.exe -m uvicorn main:app `
-  --app-dir backend --env-file .\backend\.env `
-  --reload --host 127.0.0.1 --port 8001
+.\backend\.venv\Scripts\python.exe -m uvicorn scripts.run_realtime_portal_api:create_app --factory `
+  --app-dir backend --reload --host 127.0.0.1 --port 8001
 ```
 
 Terminal 2 launches the complete resident set in separate worker windows:
@@ -647,7 +648,441 @@ npm.cmd run dev
 ```
 
 Open `http://127.0.0.1:5174`. The Vite development server proxies `/api` to
-`http://127.0.0.1:8001`.
+`http://127.0.0.1:8001` by default; an explicit `VITE_API_PROXY_TARGET` overrides it.
+
+#### Advanced Realtime Portal
+
+The Advanced Realtime validation portal uses the standalone realtime API as its
+only backend on port `8001`; the canonical API does not run beside it. The API
+is launched from the repository root using the active `backend/.env`. The retired
+`backend/.env_old_donot_use` is never loaded. `REALTIME_API_DSN` must identify
+`stocks_realtime_v1` as `stocks_realtime_api`. The process verifies both the
+database name and `advanced_realtime_v1` lineage before serving requests.
+
+After explicit API startup/unlock approval, run from the repository root:
+
+```powershell
+.\backend\.venv\Scripts\python.exe -m uvicorn scripts.run_realtime_portal_api:create_app --factory `
+  --app-dir backend --reload --host 127.0.0.1 --port 8001
+```
+
+Reader startup and forward acquisition use explicit, separate entry points and
+PostgreSQL role permissions; there is no extra API/runtime enable switch. Starting
+the reader never starts provider workers. Database principal unlocks, enrollment,
+acquisition, publication and automatic scheduling remain separate approved actions.
+Canonical API/workers still need their own valid canonical configuration; a
+realtime-only environment is not sufficient for canonical `main:app`.
+
+The existing **Start Realtime API reader** task runs this command with its working
+directory at the repository root. The factory loads `backend/.env` by default.
+Reload workers create separate verified reader pools
+and close them on shutdown; the factory imports no canonical database composition.
+Active and retired local environment files are ignored by Git. No credentials
+need to be copied to the repository root.
+
+The selected API file needs `REALTIME_API_DSN`. The Uvicorn command above explicitly
+binds loopback port `8001`; it does not use `REALTIME_API_HOST` or `REALTIME_API_PORT`.
+The standalone script remains an alternative, defaults to `backend/.env` and
+loopback port `8001`, and honors these variables or its CLI overrides. Canonical `DB_NAME`,
+`DB_USER` and `DB_PASSWORD` are never substitutes for the realtime API DSN.
+
+All realtime API, worker, provisioning and admin scripts load `backend/.env` by
+default. `--env-file` remains an explicit override where supported. The retired
+`.env.realtime.local` name is used only as an optional one-time generated-secret
+output and is never a runtime input default. The v1 redacted environment audit
+(`audit_realtime_environment.py`) was retired on 2026-10-13: it asserted the
+`stocks_realtime_v1` DSN and role names and never certified LOGIN state, entitlement or
+freshness.
+
+- Portal reader: `REALTIME_API_DSN`; approved host/port is `127.0.0.1:8001`.
+- Provider-backed realtime jobs: add `POLYGON_API_KEY` and `FINNHUB_API_KEY`.
+- Provisioning/security/admin audits: add `DB_HOST`, `DB_PORT`,
+  `POSTGRES_ADMIN_USER` and `POSTGRES_ADMIN_PASSWORD`.
+- Runtime/migration jobs use `REALTIME_RUNTIME_DSN` and `REALTIME_MIGRATOR_DSN`
+  from the shared file. Realtime database selection still comes only from these
+  exact DSNs; canonical DB variables are never substitutes.
+
+##### Manual Nine-Name Forward Execution
+
+> **Retired 2026-10-13.** These v1 scripts queried relations dropped from the V2 baseline and were
+> removed: `run_realtime_developer_acquisition.py`, `run_realtime_developer_bootstrap.py`,
+> `run_realtime_developer_cycle.py`, `run_realtime_developer_forward.py`,
+> `run_realtime_developer_forward_service.py`, `run_realtime_ticker_history.py`,
+> `run_realtime_daily_strategies.py`, `run_realtime_equity_validation.py`,
+> `prepare_realtime_market_open.py`, `report_realtime_target_status.py`,
+> `audit_realtime_environment.py`, `audit_realtime_equity_validation.py`,
+> `validate_realtime_database.py`, `validate_realtime_preflight.py`,
+> `validate_realtime_references.py`, `validate_realtime_security.py`,
+> `repair_realtime_derived_bar_clocks.py`, `report_realtime_forward_enrollment_attempt.py` and
+> `benchmark_realtime_technical_evidence.py`. The V2 stage runners and
+> `run_realtime_v2_orchestrator.py` replace the acquisition, strategy and validation drivers;
+> `validate_realtime_v2_schema.py` replaces the schema validators. Steps below that depended on a
+> retired script are marked retired; the commands of the remaining v1 scripts are unchanged.
+> `backend/scripts/check_scripts_against_v2_registry.py` (offline) lists scripts that still name
+> relations outside the V2 registry or import modules that no longer work.
+
+This is a manual, plan-first flow. It never starts a scheduler or resident worker.
+Run it only under an approved scope. Omit `--execute` to inspect plans first. Every
+enrollment/report path used for execution must be new; never overwrite a failed or
+completed report, and inspect target state before retrying an interrupted write.
+
+The single pre-open preparation command (`prepare_realtime_market_open.py`) is retired;
+confirm the target with `provision_realtime_database.py --status` (step 1) and the V2
+plan with `run_realtime_v2_orchestrator.py plan`. Enrollment is provider-backed and is
+rejected before the XNYS open, so the post-open stages below remain manual.
+
+```mermaid
+flowchart LR
+    A[Audit backend/.env and target] --> B[Lock principals]
+    B --> C[Unlock runtime]
+    C --> D[References]
+    D --> E[Nine-name enrollment]
+    E --> F[Historical and OI bootstrap]
+    F --> G[Current cutoff inputs]
+    G --> H[Native readiness acceptance]
+    H --> I[One delayed option cycle]
+    I --> J[Lock runtime]
+    J --> K[Unlock API]
+    K --> L[Start API and frontend]
+    L --> M[Manual page validation]
+```
+
+Set reviewed values before running commands. Timestamps must be timezone-aware.
+`$Cutoff` is a completed 15-minute market cutoff, `$AvailableAfter` is exactly the
+Developer delay later, and `$CycleDeadline` is no more than 90 seconds after
+`$AvailableAfter`. Prepare the three cutoff commands before release; do not type
+or revise policy values inside that 90-second window.
+
+```powershell
+$Database = "stocks_realtime_v1"
+$Session = "<YYYY-MM-DD XNYS session>"
+$PriorSession = "<previous completed XNYS session>"
+$EnrollmentDeadline = "<aware same-session deadline>"
+$BootstrapDeadline = "<aware bootstrap deadline>"
+$Enrollment = "backend/.realtime-canary/<new-enrollment>.json"
+$EnrollmentReport = "backend/.realtime-canary/<new-enrollment-report>.json"
+$BootstrapReport = "backend/.realtime-canary/<new-bootstrap-report>.json"
+
+$Cutoff = "<aware completed 15-minute cutoff>"
+$AvailableAfter = "<cutoff plus 15 minutes>"
+$CycleDeadline = "<available-after plus at most 90 seconds>"
+$ServingExpires = "<approved serving expiry>"
+$PlannedEntryAt = "<after cycle deadline>"
+$EntryDeadline = "<after planned entry>"
+$ExitDeadline = "<after entry deadline>"
+$OwnerId = "<reviewed UUID>"
+```
+
+1. **Preflight and principal transition.** Keep the API/frontend stopped while
+   runtime owns LOGIN. These commands make no provider calls.
+
+```powershell
+.\backend\.venv\Scripts\python.exe -B backend/scripts/provision_realtime_database.py `
+  --database $Database --confirm-database-name $Database --role-prefix stocks_realtime --status
+
+.\backend\.venv\Scripts\python.exe -B backend/scripts/provision_realtime_database.py `
+  --database $Database --confirm-database-name $Database --role-prefix stocks_realtime --lock-principals
+.\backend\.venv\Scripts\python.exe -B backend/scripts/provision_realtime_database.py `
+  --database $Database --confirm-database-name $Database --role-prefix stocks_realtime --unlock-runtime
+```
+
+2. **Refresh exact references only when the approved seed is absent or stale.**
+   This stage is bounded to the nine-name equity/options manifest. It does not
+   enroll the cohort or publish portal data.
+
+```powershell
+.\backend\.venv\Scripts\python.exe -B backend/scripts/run_realtime_reference_bootstrap.py `
+  --database $Database --confirm-database-name $Database --role-prefix stocks_realtime `
+  --manifest backend/realtime/manifests/developer_forward_nine_v1.json `
+  --report-path "backend/.realtime-canary/<new-reference-report>.json" --execute
+```
+
+3. **Create the immutable nine-name option enrollment.** Run after the XNYS open
+   and before `$EnrollmentDeadline`. The policy retains every admitted contract
+   through 60 DTE while selecting 108 primary 7/21/45-DTE slots.
+
+```powershell
+.\backend\.venv\Scripts\python.exe -B backend/scripts/run_realtime_option_pre_session.py `
+  --database $Database --confirm-database-name $Database --forward-nine `
+  --session-date $Session --deadline $EnrollmentDeadline `
+  --maximum-requests 360 --maximum-response-bytes 33554432 `
+  --developer-policy options/policies/developer_forward_liquidity_v2.json `
+  --valuation-policy options/policies/valuation_raw_spot_v2.json `
+  --strategy-policy options/policies/strategy_technical_forward_v2.json `
+  --target-dtes 7 21 45 --maximum-target-dte-deviation 4 `
+  --enrollment-output $Enrollment --report-path $EnrollmentReport `
+  --server-max-connections 20 --reserved-connections 5 --execute
+```
+
+4. **Warm the new cohort once (retired).** `run_realtime_developer_bootstrap.py`, which wrote the
+   historical equity facts, exact reference facts and admitted prior-settlement OI, was retired
+   on 2026-10-13 with the v1 Developer acquisition cycle; the V2 EQUITY_INGEST/REFERENCE runners
+   replace it and are not yet bound to a provider source.
+
+5. **Run one prospective cutoff (retired).** `run_realtime_developer_forward.py` (the `current`,
+   `accept` and `cycle` stages) was retired on 2026-10-13; V2 publication runs through the
+   `run_realtime_v2_orchestrator.py` stage runners.
+
+6. **Always restore principal state.** Run these even after a failed data stage.
+   Final expected state is API LOGIN/NOINHERIT and runtime/migrator NOLOGIN.
+
+```powershell
+.\backend\.venv\Scripts\python.exe -B backend/scripts/provision_realtime_database.py `
+  --database $Database --confirm-database-name $Database --role-prefix stocks_realtime --lock-runtime
+.\backend\.venv\Scripts\python.exe -B backend/scripts/provision_realtime_database.py `
+  --database $Database --confirm-database-name $Database --role-prefix stocks_realtime --unlock-api
+.\backend\.venv\Scripts\python.exe -B backend/scripts/provision_realtime_database.py `
+  --database $Database --confirm-database-name $Database --role-prefix stocks_realtime --status
+```
+
+7. **Start readers manually after role restoration.** These commands do not start
+   data acquisition or scheduling.
+
+```powershell
+.\backend\.venv\Scripts\python.exe -m uvicorn scripts.run_realtime_portal_api:create_app --factory `
+  --app-dir backend --reload --host 127.0.0.1 --port 8001
+
+# Separate terminal
+npm.cmd --prefix frontend run dev
+```
+
+8. **Validate stored reads.** Check `/api/realtime/health`, all nine ticker pages,
+   Stock Screener, Stock Alerts and supported Options pages twice (initial load and
+   refresh). Compare market/receipt/publication clocks, cohort/manifest/policy hashes,
+   row counts and release IDs. HTTP 200 or a rendered shell alone is not DATA_READY.
+   A legitimate empty result requires complete input coverage; otherwise it must be
+   unavailable. Dashboard/daily strategies currently remain blocked when known
+   dividends fall inside a split-only adjusted-history window.
+
+**Equity recovery is a separate branch**, not a prerequisite to repeat daily. Audit
+first with `audit_realtime_ticker_history.py` (now a read-only V2 audit; `--allow-disposable`
+only for `test_realtime_v2_` databases). `run_realtime_ticker_history.py` was retired on
+2026-10-13, so recovering a proven missing session is a V2 EQUITY_INGEST concern (runner
+not yet bound). Publish provider-free surfaces with `project_realtime_screening.py --surface
+screening|ticker|dashboard|alerts`. Never replay acquisition merely to republish a
+failed stored view.
+
+##### Dedicated Advanced Realtime Service (Developer REST Lane)
+
+> **Retired 2026-10-13.** `backend/scripts/run_realtime_developer_forward_service.py` (the v1
+> continuous Developer REST owner: six-hour reference refresh, then `current` and `cycle`
+> windows) queried relations dropped from the V2 baseline and was removed together with the
+> `run_realtime_developer_forward.py` and `run_realtime_developer_bootstrap.py` stages it
+> drove. Its replacement is the V2 stage orchestrator (`run_realtime_v2_orchestrator.py`,
+> `plan`/`once`/`continuous`; `continuous` needs `--execute` and an authorized scope). The
+> PowerShell/cmd launchers `start_realtime_advanced_service.ps1|cmd` still point at the
+> retired script and must not be used.
+
+The `1h` strategy controls and stored history readers are enabled on all five
+strategy pages, Strategy Overview and Persistence. Previous-day detection results
+appear only after evidence-backed hourly releases exist. Persistence is a five
+exchange-session window of exact hourly evaluation cutoffs, not five hourly bars
+or an hour-by-hour archive. Initial historical reconstruction requires separate
+bounded authorization and retains reconstructed-research provenance.
+
+##### Scalable Staged Option Enrollment
+
+The scalable enrollment foundation is deployed: migration 019 and reviewed grants
+are applied. Execution still requires a separately approved session/run, budgets,
+provider scope and principal handoff. The retained 2026-10-09 canonical-fallback
+selection is BLOCKED and must not be relabeled or replayed.
+
+This path replaces all-or-nothing provider acquisition with three phases:
+
+1. **PREPARE** freezes one profile/scope/policy/budget identity and creates one
+   leased work row per underlying without provider calls.
+2. **ACQUIRE** claims one underlying with `SKIP LOCKED`, persists its complete
+   discovery/catalog/package receipt atomically, and can resume only missing or
+   failed tickers. All workers share one database-backed request/byte/pacing ledger,
+   so parallel processes cannot multiply the account's 2 requests/second ceiling.
+3. **FINALIZE** loads only persisted immutable receipts, verifies exact universe and
+   aggregate budgets, then creates the unchanged manifest/cohort selection and one
+   immutable package-set finalization in the same CONTROL transaction.
+
+PLAN is provider/database inert. A nine-name example:
+
+```powershell
+.\backend\.venv\Scripts\python.exe -B `
+  backend/scripts/run_realtime_option_staged_enrollment.py `
+  --session-date $Session --deadline $EnrollmentDeadline `
+  --maximum-requests 1000 --maximum-response-bytes 67108864
+```
+
+After migration approval, PREPARE uses new evidence paths:
+
+```powershell
+$StagedRun = "backend/.realtime-canary/<new-staged-run>.json"
+
+.\backend\.venv\Scripts\python.exe -B `
+  backend/scripts/run_realtime_option_staged_enrollment.py --prepare --execute `
+  --session-date $Session --deadline $EnrollmentDeadline `
+  --maximum-requests 1000 --maximum-response-bytes 67108864 `
+  --staged-run-output $StagedRun `
+  --report-path "backend/.realtime-canary/<new-prepare-report>.json"
+```
+
+Each ACQUIRE invocation claims one pending ticker. Multiple bounded processes may
+use the same staged run because request pacing and aggregate bytes are serialized in
+PostgreSQL. `--package-workers` pins reviewed concurrency into the capacity hash;
+the CLI itself acquires exactly one package per invocation and never spawns hidden
+workers. Do not override per-package caps without measured evidence:
+
+```powershell
+.\backend\.venv\Scripts\python.exe -B `
+  backend/scripts/run_realtime_option_staged_enrollment.py --acquire --execute `
+  --session-date $Session --deadline $EnrollmentDeadline `
+  --maximum-requests 1000 --maximum-response-bytes 67108864 `
+  --package-workers 4 `
+  --package-maximum-requests 120 --package-maximum-response-bytes 67108864 `
+  --staged-run-file $StagedRun `
+  --report-path "backend/.realtime-canary/<new-package-report>.json"
+```
+
+Repeat ACQUIRE with a new report path until no pending package remains, then FINALIZE:
+
+```powershell
+.\backend\.venv\Scripts\python.exe -B `
+  backend/scripts/run_realtime_option_staged_enrollment.py --finalize --execute `
+  --session-date $Session --deadline $EnrollmentDeadline `
+  --maximum-requests 1000 --maximum-response-bytes 67108864 `
+  --staged-run-file $StagedRun `
+  --enrollment-output "backend/.realtime-canary/<new-enrollment>.json" `
+  --report-path "backend/.realtime-canary/<new-finalize-report>.json"
+```
+
+The schema/work-claim contract supports up to 1,000 staged underlyings. All worker
+processes reserve physical requests and response bytes through one run-scoped
+PostgreSQL ledger before/after provider I/O, including failed attempts and shared
+Retry-After pacing. The current
+subscription manifest still caps selected option quotes at 1,000; with 12 selected
+slots per underlying, the current policy supports at most 66 fully selected names.
+A 50-underlying/600-slot process plan is guarded by tests and forms deterministic
+native detector shards of 13/13/13/11 names. Larger selected universes require a
+separately versioned quote-cap; native detector runs remain capped at 13 and are
+sharded rather than silently widened. UI pagination/capacity still requires review
+before target activation.
+
+Realtime-only mode maps stored projections into `/stocks/screener`,
+`/stocks/alerts`, `/options/alerts` and `/ticker/:symbol`; validation status
+remains at `/realtime-canary`. The fixed cohort is supplied by
+`VITE_REALTIME_COHORT_ID`. Navigation exposes only those mapped surfaces and
+unsupported legacy URLs redirect to Stock Screener without canonical requests.
+Options Alerts explicitly reports not applicable for the equity cohort. The
+legacy Docker Compose stack still launches canonical `main:app` and is not an
+Advanced Realtime launcher. Container deployment requires a container-reachable
+realtime DSN and a separately reviewed network bind.
+
+Realtime screening uses a versioned dual-basis contract: the last 253 of the
+retained 283 provider split-adjusted daily sessions own historical momentum,
+moving-average and volatility inputs; the latest raw daily bar owns exact nominal
+price display and audit scale. Raw intraday remains authoritative for option and
+execution alignment. Future full chart acquisition uses native raw 5m bars and
+derives 15m, 30m, 1h and raw RTH 1d; adjusted daily derives 1wk and 1mo. The
+derivation code is offline-qualified but not activated in the current cohort.
+
+The Stock Screener now uses the original `StockScreeningPage`, browser-local
+library and four `/api/stocks/screening/*` contracts in realtime-only mode.
+Ticker Workspace uses the original `TickerWorkspace`/`TickerDetail` layout, views,
+chart controls and compatible `/api/stock/*`, profile and stock-context contracts.
+Stock Alerts uses the original page and its two compatible retained-read contracts;
+Options Alerts remains a validation adapter. Supported offline contracts are not
+durable/live parity.
+The standalone reader serves complete compatible generations from
+`rt.screening_generations`/`rt.screening_rows`; it never computes, calls a provider
+or queries canonical storage on a request.
+
+The provider-free producer is `backend/scripts/project_realtime_screening.py`.
+Without `--execute` it only validates arguments and prints `NOT_EXECUTED`; it
+does not load credentials or connect. Execution requires separate target-write
+authorization, the COMPUTE role, migration `014` and dated reference revisions
+with actual provider `security_type`/`company_name` fields. Older immutable
+revisions are not backfilled and `STOCK` is never silently inferred as `CS`.
+Exact cohort membership, 283 retained adjusted sessions (253 computed), the
+nominal current/raw liquidity window, raw derived hourly source chains and
+split-coverage evidence are required. Missing hourly slots retain field-specific
+unavailability; missing required daily/reference/action evidence rejects publication.
+
+Argument-validation example only (illustrative identifiers; no database/provider I/O):
+
+```powershell
+.\backend\.venv\Scripts\python.exe -B backend\scripts\project_realtime_screening.py `
+  --cohort-id "00000000-0000-0000-0000-000000000001" --session "2026-10-02" `
+  --cutoff "2026-10-06T07:35:00+00:00" --source-generation 1
+```
+
+Only an explicitly authorized invocation with reviewed identities adds
+`--execute --confirm-database-name stocks_realtime_v1`. This is not a startup task, reference
+bootstrap, history import or activation. The full-generation current pointer
+cannot regress to a simplified validation envelope.
+
+Ticker production uses the same provider-free CLI with `--surface ticker`.
+It reads only exact-cohort retained `rt.bar_revisions` and dated `ref` evidence,
+runs the shared DB-free equity materializer and stores immutable
+`TICKER_WORKSPACE_V1` snapshots in `rt.portal_snapshots`. It does not acquire,
+import or derive missing stored intervals. Native 5m must cover the retained
+90-session raw window; stored 15m/30m/1h/raw RTH 1d aggregates reconcile to those
+source IDs. Adjusted 1wk/1mo aggregates reconcile to retained adjusted daily facts.
+Intraday setups use the original 500-bar analysis bound and finalized pattern
+research uses 300 bars; chart history and complete source lineage remain retained.
+Daily setup indicators use adjusted history, while quotes and daily charts use
+explicitly raw nominal facts. No raw daily history is extended to 253 sessions.
+
+The reader validates snapshot checksums, cohort/manifest/reference identity,
+provider-qualified market clocks and the existing bounded-staleness policy.
+New reference or corporate-action evidence requires republishing; refresh only
+rereads stored outputs. Missing intervals fail closed. Native 1m history,
+extended company fields, fundamental reports and a qualified ticker event-calendar
+projection have no producer in this slice. Their values are not estimated, and
+calendar absence is never treated as clear. The retained monthly history is
+shorter than the existing 50-bar setup minimum, so monthly setups are unavailable.
+Neither offline API/browser proof nor argument validation establishes durable
+`DATA_READY` or live deployment. Applying `014`, supplying qualified retained
+history/references, executing the producer and restarting the standalone reader
+each require separate explicit authorization.
+
+Stock Alerts production uses `--surface alerts` on the same nonexecuting-by-default
+CLI. It reads only exact-cohort realtime bars/references/actions, executes the
+original DB-free alert detectors with actual availability clocks, and stores
+immutable `STOCK_ALERTS_V1` projections in `rt.portal_snapshots`. Daily features are
+split-adjusted; daily execution scale requires a same-session raw fact. Execution
+uses completed raw 30m bars with validated causal sources. Missing raw daily
+history is never extended or inferred.
+
+The original `/api/stocks/alert-view` and `/api/stocks/alert-eod-review` handlers
+reuse the shared navigation/filter/sort/pagination/recurrence and review functions.
+They read stored outputs only, preserve independent strategy instances and paper
+plans/outcomes, and never load a canonical ledger or materialize during a request.
+Explicit realtime-owned retained streams can be projected offline; the durable
+forward enrollment/publication checkpoint loader is not implemented. The CLI
+therefore publishes explicit unavailable forward evidence, not simulated live
+alerts, and refuses to replace an existing projection containing forward streams.
+There is no retained realtime replay cohort or publication rotation/event-context
+producer: REPLAY returns unavailable and context absence never certifies an empty
+calendar. This slice does not authorize enrollment, publication, activation or orders.
+
+`stocks_realtime_v1` is the disposable integration target. Its current rows are
+test evidence and may be dropped only through the reviewed reset/bootstrap
+workflow. Production will use a separately named database and a frozen 400-equity/
+50-option-underlying manifest. Inspect the current generic plan without env,
+database or provider access:
+
+```powershell
+.\backend\.venv\Scripts\python.exe -B `
+  backend/scripts/run_realtime_bootstrap.py `
+  --manifest backend/realtime/manifests/integration_equity_nine_v1.json `
+  --database stocks_realtime_v1 `
+  --confirm-database-name stocks_realtime_v1 `
+  --session-date 2026-10-02
+```
+
+The CLI supports PLAN, INITIALIZE_CHECKPOINT, STATUS and `--execute-next-stage`.
+Single-stage execution is currently implemented only for PROVISION, MIGRATIONS and
+SECURITY; failed stages resume from the same checkpoint with bounded redacted
+evidence. It refuses REFERENCES and later stages until their adapters exist. Reset
+is plan-only through `plan_realtime_integration_reset.py`; destructive reset remains
+unavailable until every stage can rebuild and verify the database. Integration
+retains all bars; retention/archive optimization follows correctness and measured
+400/50 storage qualification.
 
 #### Screening, Alerts And Optional Research
 

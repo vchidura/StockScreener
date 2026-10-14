@@ -12,7 +12,7 @@ from typing import Callable, Mapping
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from options.analytics.analysis_engine import OptionAnalysisEngine
-from options.analytics.marks import UnderlyingMinuteBar
+from options.analytics.marks import UnderlyingMinuteBar, fresh_mark_window
 from options.calendar import OptionExchangeCalendar
 from options.config import OptionRuntimeConfiguration
 from options.errors import InvalidBatchTransition
@@ -26,6 +26,9 @@ from options.data.normalizer import (
     DeveloperOptionNormalizer,
     RawDeveloperOptionObservation,
     parse_polygon_snapshot,
+)
+from options.data.polygon_chain_discovery import (
+    build_polygon_option_chain_discovery_plan,
 )
 from options.data.polygon_developer import PolygonDeveloperEngine
 from options.domain import (
@@ -103,6 +106,24 @@ class ManualCycleResult:
 
 class TerminalOptionQualityError(RuntimeError):
     pass
+
+
+def select_option_trade_watchlist(snapshots, catalog, *, limit):
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("trade watchlist limit must be positive")
+    eligible = [snapshot for snapshot in snapshots if snapshot.contract_type is ContractType.CALL
+        and snapshot.strike > snapshot.spot and snapshot.day_volume and snapshot.contract_ticker in catalog]
+    eligible.sort(key=lambda snapshot: (-(snapshot.day_volume or 0), -(snapshot.open_interest or 0),
+        snapshot.expiration_date, snapshot.contract_id))
+    seen, selected = set(), []
+    for snapshot in eligible:
+        if snapshot.contract_id in seen:
+            continue
+        seen.add(snapshot.contract_id)
+        selected.append(catalog[snapshot.contract_ticker])
+        if len(selected) >= limit:
+            break
+    return tuple(selected)
 
 
 class ManualOptionPipeline:
@@ -458,14 +479,23 @@ class ManualOptionPipeline:
         work_item = None
         lease_owner = f"manual:{socket.gethostname()}"
         try:
-            expiration_through = as_of_session + timedelta(days=max(
-                self.configuration.policy.contract_filter.maximum_dte,
-                self.configuration.settings.acquisition_maximum_dte,
-            ))
             spot = self.engine.get_spot_price(underlyer, cycle_time)
-            corridor = self.configuration.policy.contract_filter.strike_corridor_fraction
-            strike_min = spot.price * (Decimal("1") - corridor)
-            strike_max = spot.price * (Decimal("1") + corridor)
+            discovery_plan = build_polygon_option_chain_discovery_plan(
+                underlyer,
+                cycle_time,
+                spot.price,
+                maximum_dte=self.configuration.policy.contract_filter.maximum_dte,
+                acquisition_maximum_dte=(
+                    self.configuration.settings.acquisition_maximum_dte
+                ),
+                strike_corridor_fraction=(
+                    self.configuration.policy.contract_filter.strike_corridor_fraction
+                ),
+                expiration_anchor=as_of_session,
+            )
+            expiration_through = discovery_plan.expiration_through
+            strike_min = discovery_plan.strike_min
+            strike_max = discovery_plan.strike_max
             if self.outcome_repository is not None:
                 followup = self.outcome_repository.retained_leg_bounds(
                     underlyer,
@@ -868,33 +898,8 @@ class ManualOptionPipeline:
         calls with observed activity - and capped so provider cost stays proportional
         to the universe rather than the chain.
         """
-        eligible = [
-            snapshot
-            for snapshot in snapshots
-            if snapshot.contract_type is ContractType.CALL
-            and snapshot.strike > snapshot.spot
-            and snapshot.day_volume
-            and snapshot.contract_ticker in catalog
-        ]
-        eligible.sort(
-            key=lambda snapshot: (
-                -(snapshot.day_volume or 0),
-                -(snapshot.open_interest or 0),
-                snapshot.expiration_date,
-                snapshot.contract_id,
-            )
-        )
-        limit = self.configuration.settings.trade_watchlist_per_underlyer
-        seen: set[int] = set()
-        selected: list[OptionContractCatalogEntry] = []
-        for snapshot in eligible:
-            if snapshot.contract_id in seen:
-                continue
-            seen.add(snapshot.contract_id)
-            selected.append(catalog[snapshot.contract_ticker])
-            if len(selected) >= limit:
-                break
-        return tuple(selected)
+        return select_option_trade_watchlist(snapshots, catalog,
+            limit=self.configuration.settings.trade_watchlist_per_underlyer)
 
     def _capture_open_interest(
         self,
@@ -1126,15 +1131,9 @@ def _fresh_mark_window(
     observed_at: datetime,
     maximum_source_age_seconds: int,
 ) -> tuple[datetime, datetime] | None:
-    observed_at = _as_utc(observed_at, "observed_at")
-    earliest = observed_at - timedelta(seconds=maximum_source_age_seconds)
-    marks = [
-        row.option_mark_time
-        for row in rows
-        if row.option_mark_time is not None
-        and earliest <= row.option_mark_time <= observed_at
-    ]
-    return (min(marks), max(marks)) if marks else None
+    return fresh_mark_window(
+        (row.option_mark_time for row in rows), observed_at, maximum_source_age_seconds
+    )
 
 
 def _resolve_dividend_yield(

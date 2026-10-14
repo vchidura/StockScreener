@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Settings2 } from 'lucide-react'
 import './pageChrome.css'
 
@@ -108,6 +108,20 @@ export function ColumnPicker({
 }) {
   const [open, setOpen] = useState(false)
   const container = useRef<HTMLDivElement>(null)
+  const menu = useRef<HTMLDivElement>(null)
+  const positionMenu = useCallback(() => {
+    if (!container.current || !menu.current) return
+    const viewportWidth = document.documentElement.clientWidth
+    menu.current.style.setProperty('--tm-column-menu-max-width', `${Math.max(0, viewportWidth - 16)}px`)
+    const width = menu.current.getBoundingClientRect().width
+    const right = container.current.getBoundingClientRect().right
+    const left = Math.max(8, Math.min(right - width, viewportWidth - width - 8))
+    menu.current.style.right = `${right - width - left}px`
+  }, [])
+
+  useLayoutEffect(() => {
+    if (open) positionMenu()
+  })
 
   useEffect(() => {
     if (!open) return
@@ -117,11 +131,15 @@ export function ColumnPicker({
     const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') setOpen(false) }
     document.addEventListener('mousedown', close)
     document.addEventListener('keydown', escape)
+    window.addEventListener('resize', positionMenu)
+    window.addEventListener('scroll', positionMenu, true)
     return () => {
       document.removeEventListener('mousedown', close)
       document.removeEventListener('keydown', escape)
+      window.removeEventListener('resize', positionMenu)
+      window.removeEventListener('scroll', positionMenu, true)
     }
-  }, [open])
+  }, [open, positionMenu])
 
   const hiddenCount = columns.filter(column => hidden.has(column.key)).length
   const title = `Choose columns${hiddenCount ? ` (${hiddenCount} hidden)` : ''}`
@@ -147,7 +165,7 @@ export function ColumnPicker({
         {hiddenCount > 0 && <i>{hiddenCount}</i>}
       </button>
       {open && (
-        <div className={`tm-columns__menu${groups.length ? ' tm-columns__menu--grouped' : ''}`}>
+        <div ref={menu} className={`tm-columns__menu${groups.length ? ' tm-columns__menu--grouped' : ''}`}>
           <div className="tm-columns__actions">
             <button type="button" onClick={onShowAll}>Show all</button>
             <button type="button" onClick={onReset}>Reset to fit</button>

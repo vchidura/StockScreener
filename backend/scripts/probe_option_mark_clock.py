@@ -29,7 +29,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 load_dotenv(BACKEND_DIR / ".env")
 
-BASE_URL = "https://api.polygon.io"
+BASE_URL = "https://api.massive.com"
 UTC = timezone.utc
 
 

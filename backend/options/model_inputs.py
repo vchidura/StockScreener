@@ -61,6 +61,84 @@ class DividendCashFlow:
             raise ValueError("dividend cash amount must be positive")
 
 
+@dataclass(frozen=True, slots=True)
+class ExpirationValuationCandidate:
+    valuation_date: date
+    expiration_date: date
+    spot: Decimal
+    risk_free_rate: float
+    dividend_yield: float
+    rate_date: date
+    rate_observation_ids: tuple[UUID, ...]
+    rate_payload_sha256: tuple[str, ...]
+    dividend_cash_flows: tuple[DividendCashFlow, ...]
+    dividend_coverage_start: date
+    dividend_coverage_end: date
+    dividend_source_key: str
+    dividend_payload_sha256: str
+    selected_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class DefaultedExpirationValuationInput:
+    risk_free_rate: float
+    dividend_yield: float
+
+    def __post_init__(self) -> None:
+        if (not math.isfinite(self.risk_free_rate)
+                or not math.isfinite(self.dividend_yield)
+                or not 0 <= self.dividend_yield <= 1):
+            raise ValueError("defaulted expiration valuation inputs must be finite")
+
+
+def prepare_expiration_valuation_candidate(
+    *, curve: tuple[RiskFreeRateObservation, ...], expected_rate_date: date,
+    valuation_date: date, expiration_date: date, spot: Decimal, selected_at: datetime,
+    maximum_age_seconds: int, cash_flows: tuple[DividendCashFlow, ...],
+    dividend_coverage_start: date, dividend_coverage_end: date,
+    dividend_coverage_complete: bool, dividend_received_at: datetime,
+    dividend_source_key: str, dividend_payload_sha256: str,
+) -> ExpirationValuationCandidate:
+    selected = _utc(selected_at)
+    dividend_received = _utc(dividend_received_at)
+    if (type(maximum_age_seconds) is not int or maximum_age_seconds <= 0
+            or valuation_date > expiration_date or expected_rate_date > valuation_date
+            or valuation_date > selected.date()
+            or not spot.is_finite() or spot <= 0):
+        raise ValueError("valuation candidate requires finite spot, valid dates and explicit freshness")
+    if (dividend_coverage_complete is not True
+            or not dividend_coverage_start <= valuation_date <= expiration_date <= dividend_coverage_end):
+        raise ValueError("dividend/distribution coverage is unavailable for the full expiry window")
+    if (not dividend_source_key.strip() or len(dividend_payload_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in dividend_payload_sha256)):
+        raise ValueError("dividend/distribution provenance is missing")
+    if not 0 <= (selected - dividend_received).total_seconds() <= maximum_age_seconds:
+        raise ValueError("dividend/distribution observation is stale or future")
+    rates = tuple(row for row in curve if row.rate_date == expected_rate_date)
+    if not rates or len({row.tenor_days for row in rates}) != len(rates):
+        raise ValueError("required Treasury curve is missing or ambiguous")
+    for row in rates:
+        if (row.source != TREASURY_CURVE_SOURCE or row.availability_mode != "LIVE_OBSERVED"
+            or row.source_key != f"{expected_rate_date.isoformat()}:{row.tenor_days}d"
+                or row.replay_available_at is not None or row.tenor_days <= 0
+                or not math.isfinite(row.annual_rate) or row.source_observed_at is None
+                or not _utc(row.source_observed_at) <= _utc(row.first_observed_at) <= selected
+                or not 0 <= (selected - _utc(row.first_observed_at)).total_seconds() <= maximum_age_seconds
+                or len(row.payload_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in row.payload_sha256)):
+            raise ValueError("Treasury source/availability/freshness provenance is invalid")
+    if any(not flow.cash_amount.is_finite() or flow.cash_amount <= 0 for flow in cash_flows):
+        raise ValueError("dividend/distribution amount must be finite and positive")
+    rate = interpolate_rate(rates, max((expiration_date - valuation_date).days, 1))
+    yield_value = equivalent_continuous_dividend_yield(spot=spot, valuation_date=valuation_date,
+        expiration_date=expiration_date, risk_free_rate=rate, cash_flows=cash_flows)
+    return ExpirationValuationCandidate(valuation_date, expiration_date, spot, rate, yield_value,
+        expected_rate_date, tuple(row.rate_observation_id for row in rates),
+        tuple(row.payload_sha256 for row in rates), cash_flows,
+        dividend_coverage_start, dividend_coverage_end, dividend_source_key,
+        dividend_payload_sha256, selected)
+
+
 def parse_treasury_curve(
     xml: str,
     *,
@@ -165,13 +243,23 @@ def equivalent_continuous_dividend_yield(
     expiration_date: date,
     risk_free_rate: float,
     cash_flows: tuple[DividendCashFlow, ...],
+    maturity_years: float | None = None,
 ) -> float:
+    """Continuous yield q with S*(1-exp(-q*T)) equal to the present value of the cash dividends.
+
+    By default T is the date-based maturity (legacy, `black_scholes_european_v1`). Pass the solver's own
+    timestamp-based `maturity_years` so q is applied over exactly the T it was derived for; with the
+    date-based T the dividend effect is mis-scaled by up to a day over T (about 2 volatility points at
+    one day to expiry for an index ETF, 0.06 at ten days).
+    """
     if spot <= 0:
         raise ValueError("spot must be positive")
     maturity_days = (expiration_date - valuation_date).days
     if maturity_days <= 0:
         return 0.0
-    maturity_years = maturity_days / 365.0
+    if maturity_years is not None and maturity_years <= 0:
+        return 0.0
+    maturity_years = maturity_days / 365.0 if maturity_years is None else maturity_years
     present_value = 0.0
     for flow in cash_flows:
         days = (flow.ex_date - valuation_date).days

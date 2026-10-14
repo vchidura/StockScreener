@@ -190,7 +190,7 @@ export function chainFilterRanges(query: Record<string, string>, catalog: Option
 
 export function switchOptionsView(params: URLSearchParams, view: OptionsView) {
   const next = new URLSearchParams({ view })
-  for (const key of ['underlyer', 'session_date']) if (params.has(key)) next.set(key, params.get(key)!)
+  for (const key of ['underlyer', 'session_date', 'cohort_id', 'snapshot_id']) if (params.has(key)) next.set(key, params.get(key)!)
   if (params.get('view') !== 'chain' && view !== 'chain') {
     for (const key of ['category', 'min_dte', 'max_dte']) if (params.has(key)) next.set(key, params.get(key)!)
   }
@@ -198,7 +198,7 @@ export function switchOptionsView(params: URLSearchParams, view: OptionsView) {
 }
 
 export function screenQuery(params: URLSearchParams, catalog: OptionDiscoveryCatalog) {
-  return validateScreenQuery(Object.fromEntries([...params].filter(([key]) => !['screen', 'builtin', 'offset', 'session_date'].includes(key))), catalog)
+  return validateScreenQuery(Object.fromEntries([...params].filter(([key]) => !['screen', 'builtin', 'offset', 'session_date', 'cohort_id', 'snapshot_id'].includes(key))), catalog)
 }
 
 export function readOptionsLibrary(storage: Pick<Storage, 'getItem'>, catalog: OptionDiscoveryCatalog): OptionsLibrary {
@@ -257,7 +257,7 @@ export const optionFilterGroups: Record<string, string[]> = {
 }
 
 export function independentScreenQuery(params: URLSearchParams, catalog: OptionDiscoveryCatalog) {
-  const raw = Object.fromEntries([...params].filter(([key]) => !['screen', 'builtin', 'offset', 'session_date'].includes(key)))
+  const raw = Object.fromEntries([...params].filter(([key]) => !['screen', 'builtin', 'offset', 'session_date', 'cohort_id', 'snapshot_id'].includes(key)))
   if (raw.view && raw.view !== 'chain' || ['model', 'category', 'scope', 'preset'].some(key => key in raw)) throw new Error('This legacy screen uses alert-model output. Its saved definition is preserved; choose a contract screen from the library.')
   return validateScreenQuery({ ...raw, view: 'chain' }, catalog)
 }

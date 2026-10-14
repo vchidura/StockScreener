@@ -1,5 +1,10 @@
+import { sortHeaderProps } from './strategyShared'
+import './strategyPages.css'
 import { useState, useEffect, useMemo, useCallback } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { getDailyScannerPublication } from '../services/api'
+import { usePublicationQuery, useStrategyInterval } from './publicationNavigation'
+import { StrategyPublicationError, strategyEmptyMessage } from './StrategyPublication'
+import { StrategyTickerButton } from './StrategyTickerButton'
 import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-query'
 import { scanMACrossover, MAScanResponse, MAResult } from '../services/api'
 import { usePublishPageContext } from '../layout/pageContext'
@@ -107,7 +112,7 @@ type SortKey = 'ticker' | 'last_close' | 'short_ma' | 'long_ma' | 'ma_spread_pct
 type SortDir = 'asc' | 'desc'
 
 function MAScreener() {
-  const navigate = useNavigate()
+  const realtimeOnly = import.meta.env.VITE_REALTIME_ONLY === 'true'
   const queryClient = useQueryClient()
   const [filter, setFilter] = useState('')
   const [markerFilter, setMarkerFilter] = useState('')
@@ -119,19 +124,28 @@ function MAScreener() {
   const [sortKey, setSortKey] = useState<SortKey | null>(null)
   const [sortDir, setSortDir] = useState<SortDir>('asc')
   const { pinned: scanDate } = useSessionDate()
-  const [interval, setInterval] = useState<'5m' | '15m' | '30m' | '1h' | '1d'>('1d')
+  const [canonicalInterval, setCanonicalInterval] = useState<'5m' | '15m' | '30m' | '1h' | '1d'>('1d')
+  const storedInterval = useStrategyInterval()
+  const interval = realtimeOnly ? storedInterval.interval : canonicalInterval
+  const setInterval = (value: typeof canonicalInterval) => realtimeOnly ? storedInterval.setInterval(value === '1h' ? '1h' : '1d') : setCanonicalInterval(value)
 
-  const { data, isFetching: loading } = useQuery<MAScanResponse>({
+  const realtimeQuery = usePublicationQuery('daily-ma-crossover', pin => getDailyScannerPublication('ma-crossover', pin, interval === '1h' ? '1h' : '1d'))
+  const canonicalQuery = useQuery<MAScanResponse>({
     queryKey: ['scan', 'ma-crossover', interval, scanDate, shortPeriod, longPeriod],
     queryFn: () => scanMACrossover(undefined, shortPeriod, longPeriod, scanDate || undefined, interval),
     placeholderData: keepPreviousData,
+    enabled: !realtimeOnly,
   })
+  const data = realtimeOnly ? realtimeQuery.data?.data : canonicalQuery.data
+  const loading = realtimeOnly ? realtimeQuery.loading : canonicalQuery.isFetching
+  const error = realtimeOnly ? realtimeQuery.error : canonicalQuery.error?.message
 
   const handleRefresh = useCallback(async () => {
+    if (realtimeOnly) return realtimeQuery.refresh()
     const key = ['scan', 'ma-crossover', interval, scanDate, shortPeriod, longPeriod]
     queryClient.setQueryData(key, undefined)
     await queryClient.fetchQuery({ queryKey: key, queryFn: () => scanMACrossover(undefined, shortPeriod, longPeriod, scanDate || undefined, interval, true) })
-  }, [interval, scanDate, shortPeriod, longPeriod, queryClient])
+  }, [interval, scanDate, shortPeriod, longPeriod, queryClient, realtimeOnly, realtimeQuery.refresh])
 
   const getTabItems = (tab: typeof TABS[number]): MAResult[] => {
     if (!data?.results_by_signal) return []
@@ -269,12 +283,13 @@ function MAScreener() {
   }, [filter])
 
   return (
-    <div>
+    <div className="strategy-workspace">
       <CommandBar>
         <CommandField label="Short MA">
-          <input
+          <input aria-label="short Period"
             type="number"
             value={shortPeriod}
+            disabled={realtimeOnly}
             onChange={(e) => setShortPeriod(Number(e.target.value))}
             min={2}
             max={50}
@@ -283,9 +298,10 @@ function MAScreener() {
           />
         </CommandField>
         <CommandField label="Long MA">
-          <input
+          <input aria-label="long Period"
             type="number"
             value={longPeriod}
+            disabled={realtimeOnly}
             onChange={(e) => setLongPeriod(Number(e.target.value))}
             min={5}
             max={200}
@@ -294,7 +310,7 @@ function MAScreener() {
           />
         </CommandField>
         <CommandGroup label="Interval">
-          {(['5m', '15m', '30m', '1h', '1d'] as const).map((iv) => (
+          {(['5m', '15m', '30m', '1h', '1d'] as const).filter(iv => !realtimeOnly || iv === '1d' || iv === '1h').map((iv) => (
             <button
               key={iv}
               type="button"
@@ -307,7 +323,7 @@ function MAScreener() {
           ))}
         </CommandGroup>
         <CommandSpacer />
-        <span className="tm-commandbar__note">{tabItems.length} matches</span>
+        <span className="tm-commandbar__note">{realtimeOnly && !data ? 'Publication unavailable' : `${tabItems.length} matches`}</span>
         <ColumnPicker
           columns={MA_COLUMNS}
           hidden={columns.hidden}
@@ -316,51 +332,30 @@ function MAScreener() {
           onReset={columns.reset}
         />
         <button type="button" className="tm-commandbar__action" onClick={handleRefresh} disabled={loading}>
-          {loading ? 'Scanning…' : 'Refresh'}
+          {loading ? (realtimeOnly ? 'Reading…' : 'Scanning…') : 'Refresh'}
         </button>
       </CommandBar>
+      <StrategyPublicationError error={error} publication={realtimeOnly ? realtimeQuery.data?.publication : undefined} />
 
-      {loading && (
+      {loading && !data && (
         <div className="loading">
           <div className="spinner"></div>
-          <span>Scanning {shortPeriod}/{longPeriod} MA crossovers ({interval}) across all tickers...</span>
+          <span>{realtimeOnly ? `Reading stored ${interval} MA publication...` : <>Scanning {shortPeriod}/{longPeriod} MA crossovers ({interval}) across all tickers...</>}</span>
         </div>
       )}
 
-      {!loading && data && (
+      {(realtimeOnly || !loading) && data && (
         <>
           {/* Tabs */}
-          <div style={{
-            display: 'flex',
-            gap: '0',
-            flexWrap: 'wrap',
-            borderBottom: '2px solid var(--border)',
-            marginBottom: '1rem',
-          }}>
+          <div className="strategy-tabs" aria-label="MA signal categories">
             {isCrossTab && (
               <button
-                style={{
-                  padding: '0.75rem 1.25rem',
-                  border: 'none',
-                  borderBottom: '3px solid var(--primary-color)',
-                  background: 'none',
-                  cursor: 'default',
-                  fontWeight: 700,
-                  color: 'var(--primary-color)',
-                  fontSize: '0.95rem',
-                  marginBottom: '-2px',
-                }}
+                type="button"
+                className="is-active"
+                aria-pressed="true"
               >
                 All Tabs
-                <span style={{
-                  marginLeft: '0.5rem',
-                  background: 'var(--primary-color)',
-                  color: 'var(--tm-on-accent)',
-                  borderRadius: '10px',
-                  padding: '2px 8px',
-                  fontSize: '0.8rem',
-                  fontWeight: 600,
-                }}>
+                <span className="strategy-tab-count">
                   {tabItems.length}
                 </span>
               </button>
@@ -372,6 +367,9 @@ function MAScreener() {
               return (
                 <button
                   key={tab.key}
+                  type="button"
+                  className={isActive ? 'is-active' : isCrossTab && filteredCount === 0 ? 'is-muted' : undefined}
+                  aria-pressed={isActive}
                   onClick={() => {
                     if (isCrossTab) {
                       // Clear filters and switch to this tab
@@ -379,31 +377,10 @@ function MAScreener() {
                     }
                     setActiveTab(tab.key)
                   }}
-                  style={{
-                    padding: '0.75rem 1.25rem',
-                    border: 'none',
-                    borderBottom: isActive ? `3px solid ${tab.color}` : '3px solid transparent',
-                    background: 'none',
-                    cursor: 'pointer',
-                    fontWeight: isActive ? 700 : 400,
-                    color: isActive ? tab.color : 'var(--text-secondary)',
-                    fontSize: isCrossTab ? '0.85rem' : '0.95rem',
-                    transition: 'all 0.2s',
-                    marginBottom: '-2px',
-                    opacity: isCrossTab && filteredCount === 0 ? 0.4 : 1,
-                  }}
                   title={isCrossTab ? `${filteredCount} matching in ${tab.label} (click to view this tab only)` : undefined}
                 >
                   {tab.label}
-                  <span style={{
-                    marginLeft: '0.5rem',
-                    background: isActive || (isCrossTab && filteredCount > 0) ? (tab.color ?? 'var(--tm-accent)') : 'var(--tm-line)',
-                    color: isActive || (isCrossTab && filteredCount > 0) ? 'var(--tm-on-accent)' : 'var(--text-secondary)',
-                    borderRadius: '10px',
-                    padding: '2px 8px',
-                    fontSize: '0.8rem',
-                    fontWeight: 600,
-                  }}>
+                  <span className="strategy-tab-count">
                     {filteredCount}
                   </span>
                 </button>
@@ -413,14 +390,14 @@ function MAScreener() {
 
           {/* Filters */}
           <div className="filter-bar" style={{ flexWrap: 'wrap' }}>
-            <input
+            <input aria-label="Search ticker..."
               type="text"
               placeholder="Search ticker..."
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
               style={{ minWidth: '140px' }}
             />
-            <select
+            <select aria-label="All Markers"
               value={markerFilter}
               onChange={(e) => setMarkerFilter(e.target.value)}
               style={{ minWidth: '130px' }}
@@ -428,7 +405,7 @@ function MAScreener() {
               <option value="">All Markers</option>
               {allMarkers.map(m => <option key={m} value={m}>{m}</option>)}
             </select>
-            <select
+            <select aria-label="All Weekly"
               value={weeklyFilter}
               onChange={(e) => setWeeklyFilter(e.target.value)}
               style={{ minWidth: '130px' }}
@@ -439,7 +416,7 @@ function MAScreener() {
               <option value="W-Bullish Cross">W-Bullish Cross</option>
               <option value="W-Bearish Cross">W-Bearish Cross</option>
             </select>
-            <select
+            <select aria-label="All Presets"
               value={presetFilter}
               onChange={(e) => setPresetFilter(e.target.value)}
               style={{ minWidth: '150px' }}
@@ -452,8 +429,8 @@ function MAScreener() {
               <option value="wide_spread">📈 Wide Spread (≥2%)</option>
               <option value="narrow_spread">📉 Narrow Spread ({`<`}1%)</option>
             </select>
-            <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
-              {data.total_scanned} scanned &middot; {tabItems.length} shown{isCrossTab ? ' (all tabs)' : ''}
+            <span>
+              {data.total_scanned} {realtimeOnly ? 'cohort members' : 'scanned'} &middot; {tabItems.length} shown{isCrossTab ? ' (all tabs)' : ''}
             </span>
             {isCrossTab && (
               <button
@@ -472,37 +449,37 @@ function MAScreener() {
             <table className="data-table">
               <thead>
                 <tr>
-                  {show('ticker') && <th onClick={() => handleSort('ticker')} style={thStyle('ticker')}>
+                  {show('ticker') && <th {...sortHeaderProps(() => handleSort('ticker'), sortKey === 'ticker', sortDir)} style={thStyle('ticker')}>
                     Ticker{sortArrow('ticker')}
                   </th>}
                   {show('signal') && <th>Signal</th>}
                   {show('markers') && <th className="tm-nowrap">Markers<InfoIcon tooltip={MARKERS_LEGEND} /></th>}
-                  {show('last_close') && <th onClick={() => handleSort('last_close')} style={thStyle('last_close', 'right')}>
+                  {show('last_close') && <th {...sortHeaderProps(() => handleSort('last_close'), sortKey === 'last_close', sortDir)} style={thStyle('last_close', 'right')}>
                     Last Close{sortArrow('last_close')}
                   </th>}
-                  {show('short_ma') && <th onClick={() => handleSort('short_ma')} style={thStyle('short_ma', 'right')}>
+                  {show('short_ma') && <th {...sortHeaderProps(() => handleSort('short_ma'), sortKey === 'short_ma', sortDir)} style={thStyle('short_ma', 'right')}>
                     Short MA ({shortPeriod}){sortArrow('short_ma')}
                   </th>}
-                  {show('long_ma') && <th onClick={() => handleSort('long_ma')} style={thStyle('long_ma', 'right')}>
+                  {show('long_ma') && <th {...sortHeaderProps(() => handleSort('long_ma'), sortKey === 'long_ma', sortDir)} style={thStyle('long_ma', 'right')}>
                     Long MA ({longPeriod}){sortArrow('long_ma')}
                   </th>}
-                  {show('ma_spread_pct') && <th onClick={() => handleSort('ma_spread_pct')} style={thStyle('ma_spread_pct', 'right')}>
+                  {show('ma_spread_pct') && <th {...sortHeaderProps(() => handleSort('ma_spread_pct'), sortKey === 'ma_spread_pct', sortDir)} style={thStyle('ma_spread_pct', 'right')}>
                     <span className="tm-nowrap">Spread %{sortArrow('ma_spread_pct')}<InfoIcon tooltip="Percentage gap between the short and long MAs. Wider spread = stronger trend momentum. Narrowing spread warns the crossover may reverse." /></span>
                   </th>}
-                  {show('days_since_cross') && <th onClick={() => handleSort('days_since_cross')} style={thStyle('days_since_cross', 'center')}>
+                  {show('days_since_cross') && <th {...sortHeaderProps(() => handleSort('days_since_cross'), sortKey === 'days_since_cross', sortDir)} style={thStyle('days_since_cross', 'center')}>
                     Days{sortArrow('days_since_cross')}
                   </th>}
                   {show('crossover_date') && <th>Cross Date</th>}
-                  {show('price_change_since_cross_pct') && <th onClick={() => handleSort('price_change_since_cross_pct')} style={thStyle('price_change_since_cross_pct', 'right')}>
+                  {show('price_change_since_cross_pct') && <th {...sortHeaderProps(() => handleSort('price_change_since_cross_pct'), sortKey === 'price_change_since_cross_pct', sortDir)} style={thStyle('price_change_since_cross_pct', 'right')}>
                     Since Cross %{sortArrow('price_change_since_cross_pct')}
                   </th>}
-                  {show('weekly_short_ma') && <th onClick={() => handleSort('weekly_short_ma')} style={{ ...thStyle('weekly_short_ma', 'right'), borderLeft: '2px solid var(--border)' }}>
+                  {show('weekly_short_ma') && <th {...sortHeaderProps(() => handleSort('weekly_short_ma'), sortKey === 'weekly_short_ma', sortDir)} style={{ ...thStyle('weekly_short_ma', 'right'), borderLeft: '2px solid var(--border)' }}>
                     W-Short ({shortPeriod}){sortArrow('weekly_short_ma')}
                   </th>}
-                  {show('weekly_long_ma') && <th onClick={() => handleSort('weekly_long_ma')} style={thStyle('weekly_long_ma', 'right')}>
+                  {show('weekly_long_ma') && <th {...sortHeaderProps(() => handleSort('weekly_long_ma'), sortKey === 'weekly_long_ma', sortDir)} style={thStyle('weekly_long_ma', 'right')}>
                     W-Long ({longPeriod}){sortArrow('weekly_long_ma')}
                   </th>}
-                  {show('weekly_spread_pct') && <th onClick={() => handleSort('weekly_spread_pct')} style={thStyle('weekly_spread_pct', 'right')}>
+                  {show('weekly_spread_pct') && <th {...sortHeaderProps(() => handleSort('weekly_spread_pct'), sortKey === 'weekly_spread_pct', sortDir)} style={thStyle('weekly_spread_pct', 'right')}>
                     <span className="tm-nowrap">W-Spread %{sortArrow('weekly_spread_pct')}<InfoIcon tooltip="Weekly MA spread: percentage gap between the weekly short and long SMAs. Computed from true weekly closes (last trading day of each week). Confirms whether the daily signal aligns with the broader weekly trend." /></span>
                   </th>}
                   {show('weekly_signal') && <th className="tm-nowrap">W-Signal<InfoIcon tooltip="Weekly crossover signal using true weekly closes.\nW-Bullish Cross: Weekly short SMA just crossed above weekly long SMA.\nW-Bearish Cross: Weekly short SMA just crossed below weekly long SMA.\nW-Above: Weekly short SMA is above weekly long SMA (weekly uptrend).\nW-Below: Weekly short SMA is below weekly long SMA (weekly downtrend)." /></th>}
@@ -512,7 +489,9 @@ function MAScreener() {
                 {tabItems.length === 0 ? (
                   <tr>
                     <td colSpan={columns.visibleColumns.length} style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-secondary)' }}>
-                      {isCrossTab
+                      {realtimeOnly ? strategyEmptyMessage(data.analysis, isCrossTab
+                        ? 'No results match the current filters across any tab'
+                        : `No ${activeTabDef.label.toLowerCase()} signals found`) : isCrossTab
                         ? 'No results match the current filters across any tab'
                         : `No ${activeTabDef.label.toLowerCase()} signals found`}
                     </td>
@@ -521,9 +500,7 @@ function MAScreener() {
                   tabItems.map((r, idx) => (
                     <tr key={idx}>
                       {show('ticker') && <td>
-                        <span className="ticker" onClick={() => navigate(`/ticker/${r.ticker}`)}>
-                          {r.ticker}
-                        </span>
+                        <StrategyTickerButton ticker={r.ticker} publication={realtimeQuery.data?.publication} />
                       </td>}
                       {show('signal') && <td>
                         {(() => {

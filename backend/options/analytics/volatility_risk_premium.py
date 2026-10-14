@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 
+from options.analytics.iv_comparability import (
+    IvComparabilityPolicy,
+    IvComparabilitySummary,
+    classify_iv_comparability,
+    summarize_iv_comparability,
+)
 from options.domain import ContractType
 
 
@@ -19,6 +25,11 @@ class ContractIvObservation:
     strike: Decimal
     spot: Decimal
     implied_volatility: float
+    # Needed only by the IV comparability policy; missing rate and yield mean zero carry
+    # (the strictest in-the-money rule), missing vega is derived from the volatility.
+    risk_free_rate: float | None = None
+    dividend_yield: float | None = None
+    vega_per_vol_point: float | None = None
 
     def __post_init__(self) -> None:
         if self.maturity_years <= 0 or not math.isfinite(self.maturity_years):
@@ -38,6 +49,24 @@ class ExpirationIvPoint:
     call_count: int
     put_count: int
     maximum_absolute_log_moneyness: float
+    # Contracts nearer to the money than a selected one that the comparability policy skipped.
+    excluded_contract_count: int = 0
+    excluded_reason_counts: tuple[tuple[str, int], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AtmIvAssessment:
+    """ATM point plus the evidence behind it; `point` is None only with explicit reasons."""
+
+    point: ExpirationIvPoint | None
+    comparability: IvComparabilitySummary | None
+    unavailable_reasons: tuple[str, ...] = ()
+
+    @property
+    def status(self) -> str:
+        if self.point is None:
+            return "UNAVAILABLE"
+        return self.comparability.status if self.comparability is not None else "COMPARABLE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,10 +120,32 @@ def summarize_expiration_atm_iv(
     *,
     maximum_absolute_log_moneyness: float = 0.03,
     contracts_per_side: int = 2,
+    comparability_policy: IvComparabilityPolicy | None = None,
 ) -> ExpirationIvPoint | None:
-    """Build one robust ATM point from the nearest calls and puts at an expiration."""
+    """Build one robust ATM point from the nearest calls and puts at an expiration.
+
+    Without a comparability policy every contract is eligible (the legacy rule that persisted
+    IV contexts were built with). With one, contracts whose IV is not comparable are skipped and
+    the next nearest comparable contract on that side is used instead.
+    """
+    return assess_expiration_atm_iv(
+        observations,
+        maximum_absolute_log_moneyness=maximum_absolute_log_moneyness,
+        contracts_per_side=contracts_per_side,
+        comparability_policy=comparability_policy,
+    ).point
+
+
+def assess_expiration_atm_iv(
+    observations: tuple[ContractIvObservation, ...],
+    *,
+    maximum_absolute_log_moneyness: float = 0.03,
+    contracts_per_side: int = 2,
+    comparability_policy: IvComparabilityPolicy | None = None,
+) -> AtmIvAssessment:
+    """`summarize_expiration_atm_iv` with the reasons for an unavailable point and the exclusions."""
     if not observations:
-        return None
+        return AtmIvAssessment(None, None, ("NO_OBSERVATIONS",))
     if maximum_absolute_log_moneyness <= 0:
         raise ValueError("maximum_absolute_log_moneyness must be positive")
     if contracts_per_side < 1:
@@ -106,6 +157,9 @@ def summarize_expiration_atm_iv(
 
     selected: list[tuple[float, ContractIvObservation]] = []
     side_counts: dict[ContractType, int] = {}
+    verdicts = []
+    skipped = []
+    unavailable: list[str] = []
     for contract_type in (ContractType.CALL, ContractType.PUT):
         ranked = sorted(
             (
@@ -116,18 +170,42 @@ def summarize_expiration_atm_iv(
             key=lambda item: (item[0], item[1].strike),
         )
         eligible = [item for item in ranked if item[0] <= maximum_absolute_log_moneyness]
-        chosen = eligible[:contracts_per_side]
+        if comparability_policy is None:
+            chosen = eligible[:contracts_per_side]
+        else:
+            chosen = []
+            for item in eligible:
+                if len(chosen) == contracts_per_side:
+                    break
+                verdict = _classify_observation(item[1], comparability_policy)
+                verdicts.append(verdict)
+                if verdict.comparable:
+                    chosen.append(item)
+                else:
+                    skipped.append(verdict)
         if not chosen:
-            return None
+            side = contract_type.value
+            unavailable.append(
+                f"NO_COMPARABLE_{side}_IN_BAND" if eligible else f"NO_{side}_IN_BAND"
+            )
+            continue
         selected.extend(chosen)
         side_counts[contract_type] = len(chosen)
+    summary = (
+        summarize_iv_comparability(verdicts, comparability_policy)
+        if comparability_policy is not None
+        else None
+    )
+    if unavailable:
+        return AtmIvAssessment(None, summary, tuple(unavailable))
 
     maturities = [row.maturity_years for _, row in selected]
     maturity = statistics.median(maturities)
     if max(maturities) - min(maturities) > 1e-9:
         raise ValueError("one expiration produced inconsistent maturities")
 
-    return ExpirationIvPoint(
+    excluded_reasons = summarize_iv_comparability(skipped, comparability_policy).reason_counts if skipped else ()
+    point = ExpirationIvPoint(
         expiration_date=next(iter(expirations)),
         maturity_years=maturity,
         atm_implied_volatility=statistics.median(
@@ -137,6 +215,23 @@ def summarize_expiration_atm_iv(
         call_count=side_counts[ContractType.CALL],
         put_count=side_counts[ContractType.PUT],
         maximum_absolute_log_moneyness=max(distance for distance, _ in selected),
+        excluded_contract_count=len(skipped),
+        excluded_reason_counts=excluded_reasons,
+    )
+    return AtmIvAssessment(point, summary)
+
+
+def _classify_observation(row: ContractIvObservation, policy: IvComparabilityPolicy):
+    return classify_iv_comparability(
+        contract_type=row.contract_type,
+        spot=row.spot,
+        strike=row.strike,
+        time_to_expiration_years=row.maturity_years,
+        risk_free_rate=row.risk_free_rate if row.risk_free_rate is not None else 0.0,
+        dividend_yield=row.dividend_yield if row.dividend_yield is not None else 0.0,
+        local_iv=row.implied_volatility,
+        local_vega_per_vol_point=row.vega_per_vol_point,
+        policy=policy,
     )
 
 

@@ -4,16 +4,18 @@ import hashlib
 import json
 import threading
 from collections.abc import Callable, Collection, Mapping
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from queue import Queue
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, quote, urlsplit
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from zoneinfo import ZoneInfo
 
 import requests
 
+from provider_endpoints import REST_BASE_URL
 from options.config import OptionRuntimeConfiguration
 from options.domain import (
     AssetType,
@@ -32,12 +34,15 @@ from options.domain import (
     WorkStage,
 )
 from options.errors import InvalidBatchTransition, OptionProviderError, ProviderErrorCategory
-from options.repositories.ingestion import OptionIngestionRepository
-from options.repositories.trades import OptionTradeRepository
 from options.analytics.marks import UnderlyingMinuteBar
 
 from .base import BaseDataEngine
 from .base import validate_developer_capabilities
+from .polygon_chain_discovery import (
+    PolygonOptionChainDiscoveryAdapter,
+    PolygonOptionChainDiscoveryLimits,
+    PolygonOptionChainDiscoveryPlan,
+)
 from .trade_classification import classify_option_trade
 from .polygon_http import (
     PolygonHttpResponse,
@@ -48,7 +53,50 @@ from .polygon_http import (
 from .trades_base import OptionsTradeSource
 
 
+if TYPE_CHECKING:
+    from options.repositories.ingestion import OptionIngestionRepository
+    from options.repositories.trades import OptionTradeRepository
+
+
 ET = ZoneInfo("America/New_York")
+
+MAXIMUM_MINUTE_BAR_PAGES = 8
+RAW_FINALIZED_PRICE_BASIS = "RAW_FINALIZED_MINUTE_CLOSE_V1"
+ADJUSTED_START_PRICE_BASIS = "ADJUSTED_BAR_START_V1"
+
+
+@dataclass(frozen=True, slots=True)
+class MinuteBarCoverage:
+    """What a minute-bar read actually covered, for retained diagnostics (RT-05)."""
+
+    requested_from: datetime
+    requested_to: datetime
+    returned_from: datetime | None
+    returned_to: datetime | None
+    bar_count: int
+    pages_fetched: int
+    pagination_complete: bool
+    price_basis: str
+
+
+def validate_polygon_next_page(next_url, expected_path, expected_filters, *, base_url):
+    parsed, base = urlsplit(next_url), urlsplit(base_url)
+    if (parsed.scheme != "https" or parsed.hostname is None or parsed.hostname.lower() != base.hostname.lower()
+            or parsed.username is not None or parsed.password is not None):
+        raise OptionProviderError(ProviderErrorCategory.PAGINATION, "Polygon URL failed HTTPS host validation")
+    if parsed.path != expected_path:
+        raise OptionProviderError(ProviderErrorCategory.PAGINATION, "Polygon pagination changed the endpoint path")
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if set(query) - (set(expected_filters) | {"cursor", "apiKey"}) or any(len(values) != 1 for values in query.values()):
+        raise OptionProviderError(ProviderErrorCategory.PAGINATION, "Polygon pagination contained unexpected or repeated parameters")
+    cursors = query.get("cursor")
+    if not cursors or len(cursors) != 1 or not cursors[0]:
+        raise OptionProviderError(ProviderErrorCategory.PAGINATION, "Polygon pagination omitted a unique cursor")
+    for key, expected in expected_filters.items():
+        if key in query and query[key] != [expected]:
+            raise OptionProviderError(ProviderErrorCategory.PAGINATION, "Polygon pagination changed request filters")
+    params = {key: values[0] for key, values in query.items() if key != "apiKey" and len(values) == 1}
+    return f"{base_url}{parsed.path}", params, cursors[0]
 
 
 class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
@@ -68,7 +116,7 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
         *,
         transport: PolygonHttpTransport | None = None,
         rate_limit_gate: PolygonRateLimitGate | None = None,
-        base_url: str = "https://api.polygon.io",
+        base_url: str = REST_BASE_URL,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.configuration = configuration
@@ -184,25 +232,68 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
         end_time: datetime,
         *, raw_finalized: bool = False,
     ) -> tuple[UnderlyingMinuteBar, ...]:
+        return self.get_underlying_minute_bars_with_coverage(
+            underlyer, start_time, end_time, raw_finalized=raw_finalized
+        )[0]
+
+    def get_underlying_minute_bars_with_coverage(
+        self,
+        underlyer: str,
+        start_time: datetime,
+        end_time: datetime,
+        *,
+        raw_finalized: bool = False,
+        maximum_pages: int = MAXIMUM_MINUTE_BAR_PAGES,
+    ) -> tuple[tuple[UnderlyingMinuteBar, ...], MinuteBarCoverage]:
+        """Read minute bars, following validated continuation pages.
+
+        Coverage is complete only when the provider returned no further page. A response
+        that still has a continuation after the page bound, or a repeated cursor, raises
+        instead of returning a partial prefix as a usable alignment source.
+        """
         start_time = _as_utc(start_time, "start_time")
         end_time = _as_utc(end_time, "end_time")
         if end_time < start_time:
             raise ValueError("end_time cannot precede start_time")
+        if type(maximum_pages) is not int or maximum_pages < 1:
+            raise ValueError("maximum_pages must be a positive integer")
         path = (
             f"/v2/aggs/ticker/{quote(underlyer, safe='')}/range/1/minute/"
             f"{start_time.date().isoformat()}/{end_time.date().isoformat()}"
         )
-        payload, _ = self._request_json(
-            f"{self.base_url}{path}",
-            {"adjusted": "false" if raw_finalized else "true", "sort": "asc", "limit": "50000"},
-        )
-        self._validate_provider_status(payload, {"OK", "DELAYED"}, "underlying aggregates")
-        results = payload.get("results")
-        if not isinstance(results, list):
-            raise OptionProviderError(
-                ProviderErrorCategory.SCHEMA,
-                "Polygon aggregate response is missing a results array",
+        filters = {"adjusted": "false" if raw_finalized else "true", "sort": "asc", "limit": "50000"}
+        url, params = f"{self.base_url}{path}", dict(filters)
+        results: list[Any] = []
+        cursors: set[str] = set()
+        pages = 0
+        while True:
+            payload, _ = self._request_json(url, params)
+            pages += 1
+            self._validate_provider_status(payload, {"OK", "DELAYED"}, "underlying aggregates")
+            page_results = payload.get("results")
+            if not isinstance(page_results, list):
+                raise OptionProviderError(
+                    ProviderErrorCategory.SCHEMA,
+                    "Polygon aggregate response is missing a results array",
+                )
+            results.extend(page_results)
+            next_url = payload.get("next_url")
+            if not next_url:
+                break
+            if pages >= maximum_pages:
+                raise OptionProviderError(
+                    ProviderErrorCategory.PAGINATION,
+                    "Polygon underlying aggregates were incomplete at the page bound",
+                )
+            url, params, cursor = validate_polygon_next_page(
+                next_url, path, filters, base_url=self.base_url
             )
+            if cursor in cursors:
+                raise OptionProviderError(
+                    ProviderErrorCategory.PAGINATION,
+                    "Polygon underlying aggregate pagination repeated a cursor",
+                )
+            cursors.add(cursor)
         bars: dict[datetime, UnderlyingMinuteBar] = {}
         for row in results:
             if not isinstance(row, dict) or not isinstance(row.get("t"), int):
@@ -221,7 +312,18 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
             except (KeyError, TypeError, ValueError):
                 continue
             bars[market_time] = bar
-        return tuple(bars[key] for key in sorted(bars))
+        ordered = tuple(bars[key] for key in sorted(bars))
+        coverage = MinuteBarCoverage(
+            requested_from=start_time,
+            requested_to=end_time,
+            returned_from=ordered[0].market_data_time if ordered else None,
+            returned_to=ordered[-1].market_data_time if ordered else None,
+            bar_count=len(ordered),
+            pages_fetched=pages,
+            pagination_complete=True,
+            price_basis=RAW_FINALIZED_PRICE_BASIS if raw_finalized else ADJUSTED_START_PRICE_BASIS,
+        )
+        return ordered, coverage
 
     def get_option_daily_aggregates(
         self,
@@ -461,27 +563,20 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
         strike_min: Decimal,
         strike_max: Decimal,
     ) -> RawOptionBatch:
-        as_of = _as_utc(as_of, "as_of")
-        if strike_min <= 0 or strike_max < strike_min:
-            raise ValueError("option chain strike bounds are invalid")
-        market_date = as_of.astimezone(ET).date()
-        filters = {
-            "expiration_date.gte": market_date.isoformat(),
-            "expiration_date.lte": expiration_through.isoformat(),
-            "strike_price.gte": str(strike_min),
-            "strike_price.lte": str(strike_max),
-            "limit": "250",
-            "sort": "ticker",
-            "order": "asc",
-        }
-        request_filter_sha256 = _sha256_json(filters)
+        plan = PolygonOptionChainDiscoveryPlan.build(
+            underlyer,
+            as_of,
+            expiration_through,
+            strike_min,
+            strike_max,
+        )
         started_at = _as_utc(self.clock(), "clock")
         initial_batch = RawOptionBatch(
             batch_id=uuid4(),
             provider="polygon",
-            underlyer=underlyer,
-            scheduled_cycle=as_of,
-            request_filter_sha256=request_filter_sha256,
+            underlyer=plan.underlyer,
+            scheduled_cycle=plan.scheduled_cycle,
+            request_filter_sha256=plan.request_filter_sha256,
             policy_sha256=self.configuration.policy_sha256,
             status=BatchStatus.FETCHING,
             pages=(),
@@ -504,117 +599,34 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
                     f"ingestion batch {batch_id} is {existing_batch.status.value}; "
                     "preserve terminal evidence and wait for a new scheduled slot"
                 )
-        path = f"/v3/snapshot/options/{quote(underlyer, safe='')}"
-        url = f"{self.base_url}{path}"
-        params = filters
-        request_cursor_sha256 = None
-        pages: list[RawBatchPage] = []
-        seen_requests: set[str] = set()
-        try:
-            while True:
-                request_identity = _sha256_json(
-                    {"url": url, "params": sorted(params.items())}
-                )
-                if request_identity in seen_requests:
-                    raise OptionProviderError(
-                        ProviderErrorCategory.PAGINATION,
-                        "Polygon option-chain pagination repeated a request",
-                    )
-                seen_requests.add(request_identity)
-                response = self._request_response(url, params)
-                try:
-                    payload = self._decode_json(response)
-                except OptionProviderError:
-                    pages.append(
-                        self._persist_invalid_page(
-                            batch_id,
-                            len(pages) + 1,
-                            response,
-                            request_filter_sha256,
-                            request_cursor_sha256,
-                            url,
-                            params,
-                        )
-                    )
-                    raise
-                results = payload.get("results")
-                if not isinstance(results, list) or not all(
-                    isinstance(row, dict) for row in results
-                ):
-                    pages.append(
-                        self._persist_invalid_page(
-                            batch_id,
-                            len(pages) + 1,
-                            response,
-                            request_filter_sha256,
-                            request_cursor_sha256,
-                            url,
-                            params,
-                        )
-                    )
-                    raise OptionProviderError(
-                        ProviderErrorCategory.SCHEMA,
-                        "Polygon option-chain response has an invalid results array",
-                    )
-                page_number = len(pages) + 1
-                next_url = payload.get("next_url")
-                terminal = not next_url
-                next_cursor_sha256 = None
-                next_request = None
-                validation_status = PageValidationStatus.VALID
-                try:
-                    if next_url:
-                        next_request = self._validate_next_page(
-                            str(next_url), path, filters
-                        )
-                        next_cursor_sha256 = _sha256_text(next_request[2])
-                except OptionProviderError:
-                    validation_status = PageValidationStatus.INVALID
-                page = RawBatchPage(
-                    batch_id=batch_id,
-                    page_number=page_number,
-                    row_count=len(results),
-                    response_bytes=response.body,
-                    payload_sha256=_sha256_bytes(response.body),
-                    received_at=_as_utc(self.clock(), "clock"),
-                    terminal=terminal,
-                    validation_status=validation_status,
-                    request_filter_sha256=request_filter_sha256,
-                    request_cursor_sha256=request_cursor_sha256,
-                    request_id=(
-                        str(payload["request_id"])
-                        if payload.get("request_id") is not None
-                        else None
-                    ),
-                    next_cursor_sha256=next_cursor_sha256,
-                    request_metadata=tuple(
-                        sorted(
-                            [("path", urlsplit(url).path)]
-                            + [(key, value) for key, value in params.items() if key != "apiKey"]
-                        )
-                    ),
-                )
-                self.ingestion_repository.persist_page(page)
-                pages.append(page)
-                if validation_status is PageValidationStatus.INVALID:
-                    raise OptionProviderError(
-                        ProviderErrorCategory.PAGINATION,
-                        "Polygon option-chain next page failed validation",
-                    )
-                self._check_fetch_caps(pages)
-                if terminal:
-                    break
-                url, params, cursor = next_request
-                request_cursor_sha256 = _sha256_text(cursor)
-
-            self.ingestion_repository.complete_batch(
+        capacity = self.configuration.policy.capacity
+        adapter = PolygonOptionChainDiscoveryAdapter(
+            self._request_response,
+            base_url=self.base_url,
+            limits=PolygonOptionChainDiscoveryLimits(
+                maximum_pages=capacity.maximum_pages_per_batch,
+                maximum_rows=capacity.maximum_contracts_per_batch,
+                maximum_page_bytes=capacity.maximum_page_bytes,
+                maximum_batch_bytes=capacity.maximum_batch_bytes,
+            ),
+            clock=self.clock,
+            page_sink=self.ingestion_repository.persist_page,
+            completion_sink=lambda: self.ingestion_repository.complete_batch(
                 batch_id,
                 uuid4(),
                 f"normalize:{batch_id}",
-                self.configuration.policy.capacity.maximum_work_attempts,
-                self.configuration.policy.capacity.maximum_pages_per_batch,
-                self.configuration.policy.capacity.maximum_contracts_per_batch,
-                self.configuration.policy.capacity.maximum_batch_bytes,
+                capacity.maximum_work_attempts,
+                capacity.maximum_pages_per_batch,
+                capacity.maximum_contracts_per_batch,
+                capacity.maximum_batch_bytes,
+            ),
+        )
+        try:
+            result = adapter.discover(
+                plan,
+                batch_id=batch_id,
+                policy_sha256=self.configuration.policy_sha256,
+                started_at=started_at,
             )
         except OptionProviderError as exc:
             failure_status = (
@@ -632,19 +644,7 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
                 batch_id, failure_status, exc.category.value, str(exc)
             )
             raise
-
-        return RawOptionBatch(
-            batch_id=batch_id,
-            provider="polygon",
-            underlyer=underlyer,
-            scheduled_cycle=as_of,
-            request_filter_sha256=request_filter_sha256,
-            policy_sha256=self.configuration.policy_sha256,
-            status=BatchStatus.COMPLETE,
-            pages=tuple(pages),
-            started_at=started_at,
-            completed_at=_as_utc(self.clock(), "clock"),
-        )
+        return result.batch
 
     def stream_market_data(
         self,
@@ -997,37 +997,7 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
         expected_path: str,
         expected_filters: Mapping[str, str],
     ) -> tuple[str, dict[str, str], str]:
-        parsed = self._validate_url(next_url)
-        if parsed.path != expected_path:
-            raise OptionProviderError(
-                ProviderErrorCategory.PAGINATION,
-                "Polygon pagination changed the endpoint path",
-            )
-        query = parse_qs(parsed.query, keep_blank_values=True)
-        allowed_keys = set(expected_filters) | {"cursor", "apiKey"}
-        if set(query) - allowed_keys or any(len(values) != 1 for values in query.values()):
-            raise OptionProviderError(
-                ProviderErrorCategory.PAGINATION,
-                "Polygon pagination contained unexpected or repeated parameters",
-            )
-        cursor_values = query.get("cursor")
-        if not cursor_values or len(cursor_values) != 1 or not cursor_values[0]:
-            raise OptionProviderError(
-                ProviderErrorCategory.PAGINATION,
-                "Polygon pagination omitted a unique cursor",
-            )
-        for key, expected in expected_filters.items():
-            if key in query and query[key] != [expected]:
-                raise OptionProviderError(
-                    ProviderErrorCategory.PAGINATION,
-                    "Polygon pagination changed request filters",
-                )
-        params = {
-            key: values[0]
-            for key, values in query.items()
-            if key != "apiKey" and len(values) == 1
-        }
-        return f"{self.base_url}{parsed.path}", params, cursor_values[0]
+        return validate_polygon_next_page(next_url, expected_path, expected_filters, base_url=self.base_url)
 
     def _validate_url(self, url: str):
         parsed = urlsplit(url)
@@ -1130,6 +1100,7 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
         batch_id,
         row: dict[str, Any],
         observed_at: datetime,
+        *, provider: str = "polygon",
     ) -> OptionTradeEvent:
         try:
             sip_timestamp = _from_nanoseconds(int(row["sip_timestamp"]))
@@ -1152,7 +1123,7 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
         payload_sha256 = _sha256_json(row)
         event_identity = _canonical_json_text(
             {
-                "provider": "polygon",
+                "provider": provider,
                 "contract_ticker": contract.contract_ticker,
                 "sip_timestamp": row["sip_timestamp"],
                 "sequence_number": sequence_number,
@@ -1163,7 +1134,7 @@ class PolygonDeveloperEngine(BaseDataEngine, OptionsTradeSource):
         classification = classify_option_trade(conditions, correction)
         return OptionTradeEvent(
             trade_event_id=uuid5(NAMESPACE_URL, event_identity),
-            provider="polygon",
+            provider=provider,
             contract_id=contract.contract_id,
             contract_ticker=contract.contract_ticker,
             underlyer=contract.underlyer,

@@ -10,6 +10,7 @@ from options.model_inputs import (
     equivalent_continuous_dividend_yield,
     interpolate_rate,
     parse_treasury_curve,
+    prepare_expiration_valuation_candidate,
 )
 from options.orchestration import ManualOptionPipeline
 
@@ -33,6 +34,76 @@ XML = """<?xml version="1.0" encoding="utf-8"?>
   </m:properties></content></entry>
 </feed>
 """
+
+
+def _candidate_inputs(**updates):
+    values = dict(curve=parse_treasury_curve(XML, received_at=OBSERVED_AT),
+        expected_rate_date=date(2026, 9, 10), valuation_date=date(2026, 9, 11),
+        expiration_date=date(2026, 10, 26), spot=Decimal("100"), selected_at=OBSERVED_AT,
+        maximum_age_seconds=90, cash_flows=(DividendCashFlow(date(2026, 10, 1), Decimal("0.25")),),
+        dividend_coverage_start=date(2026, 9, 11), dividend_coverage_end=date(2026, 11, 10),
+        dividend_coverage_complete=True, dividend_received_at=OBSERVED_AT,
+        dividend_source_key="fixture:declared-cash-flows:covered-window", dividend_payload_sha256="a" * 64)
+    values.update(updates)
+    return values
+
+
+def test_provider_valuation_candidate_uses_native_maturity_matched_math_and_provenance():
+    result = prepare_expiration_valuation_candidate(**_candidate_inputs())
+    assert result.risk_free_rate == pytest.approx(0.04)
+    assert result.dividend_yield > 0 and len(result.rate_observation_ids) == 2
+    assert result.dividend_cash_flows == _candidate_inputs()["cash_flows"]
+    assert (result.dividend_coverage_start, result.dividend_coverage_end) == (date(2026, 9, 11), date(2026, 11, 10))
+    assert result.dividend_payload_sha256 == "a" * 64 and result.selected_at == OBSERVED_AT
+    longer = prepare_expiration_valuation_candidate(**_candidate_inputs(expiration_date=date(2026, 11, 10)))
+    assert longer.risk_free_rate == pytest.approx(0.041)
+    assert longer.dividend_yield != pytest.approx(result.dividend_yield)
+
+
+@pytest.mark.parametrize("updates", [
+    {"dividend_coverage_complete": False}, {"dividend_coverage_end": date(2026, 10, 1)},
+    {"dividend_source_key": ""}, {"dividend_payload_sha256": "bad"},
+    {"maximum_age_seconds": 0}, {"spot": Decimal("Infinity")},
+    {"expected_rate_date": date(2026, 9, 9)}, {"expected_rate_date": date(2026, 9, 12)},
+    {"valuation_date": date(2026, 9, 12)},
+])
+def test_provider_valuation_candidate_rejects_missing_or_ineligible_inputs(updates):
+    with pytest.raises(ValueError):
+        prepare_expiration_valuation_candidate(**_candidate_inputs(**updates))
+
+
+def test_provider_valuation_candidate_zero_requires_complete_coverage_and_rejects_future_or_stale_receipts():
+    from dataclasses import replace
+    from datetime import timedelta
+
+    assert prepare_expiration_valuation_candidate(**_candidate_inputs(cash_flows=())).dividend_yield == 0
+    with pytest.raises(ValueError, match="coverage is unavailable"):
+        prepare_expiration_valuation_candidate(**_candidate_inputs(cash_flows=(), dividend_coverage_complete=False))
+    with pytest.raises(ValueError, match="stale or future"):
+        prepare_expiration_valuation_candidate(**_candidate_inputs(dividend_received_at=OBSERVED_AT + timedelta(seconds=1)))
+    with pytest.raises(ValueError, match="freshness provenance"):
+        prepare_expiration_valuation_candidate(**_candidate_inputs(selected_at=OBSERVED_AT + timedelta(seconds=91),
+            dividend_received_at=OBSERVED_AT + timedelta(seconds=91)))
+    inputs = _candidate_inputs()
+    inputs["curve"] = tuple(replace(row, source_key="") for row in inputs["curve"])
+    with pytest.raises(ValueError, match="provenance is invalid"):
+        prepare_expiration_valuation_candidate(**inputs)
+
+
+def test_provider_valuation_candidate_accepts_same_session_expiry_with_shortest_rate_and_full_coverage():
+    result = prepare_expiration_valuation_candidate(**_candidate_inputs(
+        expiration_date=date(2026, 9, 11),
+        cash_flows=(DividendCashFlow(date(2026, 9, 11), Decimal("0.25")),),
+        dividend_coverage_end=date(2026, 9, 11)))
+
+    assert result.expiration_date == result.valuation_date
+    assert result.risk_free_rate == pytest.approx(0.039)
+    # The ex-date is already reflected in same-session spot, so it is not a future cash flow.
+    assert result.dividend_yield == 0
+    with pytest.raises(ValueError, match="coverage is unavailable"):
+        prepare_expiration_valuation_candidate(**_candidate_inputs(
+            expiration_date=date(2026, 9, 11), cash_flows=(),
+            dividend_coverage_end=date(2026, 9, 11), dividend_coverage_complete=False))
 
 
 def test_treasury_curve_parser_preserves_live_and_reconstructed_provenance():

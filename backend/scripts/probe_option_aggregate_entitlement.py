@@ -39,7 +39,7 @@ load_dotenv(BACKEND_DIR / ".env")
 from database import get_db_cursor  # noqa: E402
 from options.config import load_option_runtime_configuration  # noqa: E402
 
-BASE_URL = "https://api.polygon.io"
+BASE_URL = "https://api.massive.com"
 DEFAULT_OUTPUT = BACKEND_DIR.parent / "docs" / "option_aggregate_entitlement_probe.json"
 
 SQL_CLOSE_NEAR = """

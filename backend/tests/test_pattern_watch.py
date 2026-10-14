@@ -53,11 +53,11 @@ def pattern(name: str, grade: str, touches: int, readiness: str = "FORMING", edg
 
 
 class PatternWatchEndpointTests(unittest.IsolatedAsyncioTestCase):
-    async def test_universe_scan_contract_excludes_removed_one_minute_interval(self):
+    async def test_universe_scan_contract_reserves_five_minute_for_ticker_research(self):
         operation = main.app.openapi()["paths"]["/api/chart-patterns/scan"]["get"]
         interval = next(parameter for parameter in operation["parameters"] if parameter["name"] == "interval")
 
-        self.assertEqual(interval["schema"]["pattern"], "^(5m|15m|30m|1h|1d|1wk)$")
+        self.assertEqual(interval["schema"]["pattern"], "^(15m|30m|1h|1d|1wk|1mo)$")
 
     async def test_ticker_patterns_report_the_close_used_by_the_detector(self):
         source = frame(100.0)
@@ -254,7 +254,7 @@ class PatternWatchEndpointTests(unittest.IsolatedAsyncioTestCase):
                 "channel": {"type": "RISING_CHANNEL"} if interval == "30m" else None,
                 "computed_at": "2026-08-28T12:00:00+00:00",
             }
-            for interval in ("5m", "15m", "30m", "1h", "1d", "1wk")
+            for interval in ("5m", "15m", "30m", "1h", "1d", "1wk", "1mo")
         ]
         channel_detector = AsyncMock(side_effect=channel_responses)
         with (
@@ -268,15 +268,15 @@ class PatternWatchEndpointTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await main.scan_ticker_chart_patterns("aaa", refresh=True)
 
-        self.assertEqual(detector.await_count, 6)
+        self.assertEqual(detector.await_count, 7)
         self.assertEqual(
             detector.await_args_list,
-            [call("AAA", interval, False) for interval in ("5m", "15m", "30m", "1h", "1d", "1wk")],
+            [call("AAA", interval, False) for interval in ("5m", "15m", "30m", "1h", "1d", "1wk", "1mo")],
         )
-        self.assertEqual(channel_detector.await_count, 6)
+        self.assertEqual(channel_detector.await_count, 7)
         self.assertEqual(
             channel_detector.await_args_list,
-            [call("AAA", interval, False) for interval in ("5m", "15m", "30m", "1h", "1d", "1wk")],
+            [call("AAA", interval, False) for interval in ("5m", "15m", "30m", "1h", "1d", "1wk", "1mo")],
         )
         clear_bulk_cache.assert_called_once_with()
         invalidate_prefix.assert_any_call(f"{main.CHART_PATTERN_TICKER_CACHE}_AAA")

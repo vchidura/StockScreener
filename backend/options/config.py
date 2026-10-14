@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_serializer, model_validator
 
 from options.domain import (
     DealerConvention,
@@ -195,11 +195,19 @@ class ContractFilterPolicy(_FrozenModel):
     strike_corridor_fraction: Decimal = Field(gt=0, lt=1)
     minimum_day_volume: int = Field(ge=0)
     minimum_open_interest: int = Field(ge=0)
+    liquidity_rule: Literal["OR", "AND"] = "OR"
     maximum_unknown_references: int = Field(gt=0)
     maximum_unknown_reference_fraction: Decimal = Field(gt=0, le=1)
     reference_admission_budget_seconds: int = Field(gt=0)
     required_exercise_style: str
     required_shares_per_contract: int = Field(gt=0)
+
+    @model_serializer(mode="wrap")
+    def _serialize_liquidity_rule(self, handler):
+        payload = handler(self)
+        if self.liquidity_rule == "OR":
+            payload.pop("liquidity_rule", None)
+        return payload
 
     @model_validator(mode="after")
     def _validate_dte_range(self) -> "ContractFilterPolicy":
@@ -240,12 +248,13 @@ class ValuationPolicy(_FrozenModel):
 
     @model_validator(mode="after")
     def _validate_sources(self) -> "ValuationPolicy":
+        raw_versions = {"option_valuation_raw_spot_v2", "option_valuation_zero_yield_research_v1"}
         if self.underlying_price_basis is not None and (
             self.underlying_price_basis != "RAW_FINALIZED_MINUTE_CLOSE_V1"
-            or self.policy_version != "option_valuation_raw_spot_v2"
+            or self.policy_version not in raw_versions
         ):
             raise ValueError("raw spot basis requires its distinct valuation version")
-        if self.policy_version == "option_valuation_raw_spot_v2" and self.underlying_price_basis is None:
+        if self.policy_version in raw_versions and self.underlying_price_basis is None:
             raise ValueError("raw valuation requires an explicit underlying price basis")
         entry_sources = set(self.allowed_entry_mark_sources)
         exit_sources = set(self.allowed_exit_mark_sources)

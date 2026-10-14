@@ -8,6 +8,7 @@ import { getAlertView, type AlertPlanRow } from '../services/stockDiscovery'
 import { alertCombinedResults, alertSort, alertSourceParams, alertTabParams, alertTradeFilters, resolveAlertRoute, tradeAlertModels, tradeAlertStatuses, type AlertView } from './stockAlertNavigation'
 import { alertColumnLayout, alertPlanTiming, alertPublicationFacts, alertRiskAssessment, earliestAlertWindow, unavailableAlertProbability } from './stockAlertPresentation'
 import StockEodReviewPanel from './StockEodReviewPanel'
+import PatternWatchLink from './PatternWatchLink'
 import './StockDiscoveryPage.css'
 import './StockAlertsPage.css'
 
@@ -103,7 +104,7 @@ function AlertDetailDrawer({ row, returnFocus, onClose }: {
   }, [returnFocus])
   return <div className="sa-drawer-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
     <aside className="sa-alert-drawer" role="dialog" aria-modal="true" aria-labelledby="sa-alert-drawer-title">
-      <header><div><span>{timing.style} alert review</span><h2 id="sa-alert-drawer-title"><Link to={`/ticker/${encodeURIComponent(row.ticker)}`}>{row.ticker}</Link> <small className={tone(row.direction)}>{direction}</small></h2><p>{displayedModels.join(' + ')} / {displayedIntervals.join(' + ')} / {readable(row.status)}</p></div>
+      <header><div><span>{timing.style} alert review</span><h2 id="sa-alert-drawer-title"><Link to={`/ticker/${encodeURIComponent(row.ticker)}`}>{row.ticker}</Link> <PatternWatchLink ticker={row.ticker} className="sa-pattern-watch-link" /> <small className={tone(row.direction)}>{direction}</small></h2><p>{displayedModels.join(' + ')} / {displayedIntervals.join(' + ')} / {readable(row.status)}</p></div>
         <button type="button" className="sa-drawer-close" title="Close alert details" aria-label="Close alert details" autoFocus onClick={onClose}><X size={18} /></button></header>
       <div className="sa-alert-drawer__body">
         <section><h3>Trade plan</h3><div className="sa-detail-grid">

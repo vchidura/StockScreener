@@ -1,11 +1,13 @@
+import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link, Navigate, useLocation, useParams } from 'react-router-dom'
 import TickerDetail, { type TickerView } from '../TickerDetail'
 import EntityRail from './EntityRail'
 import FinancialsView from './FinancialsView'
 import { usePublishPageContext } from '../../layout/pageContext'
-import { getEquitySecurityProfile, getLatestQuote, getOptionEventCalendar } from '../../services/api'
-import { formatQuoteTime } from './tickerShared'
+import { getEquitySecurityProfile, getLatestQuote, getOptionEventCalendar, getTickerWorkspacePublication, type TradeSetup } from '../../services/api'
+import { usePublicationQuery } from '../publicationNavigation'
+import { formatQuoteTime, type SetupTimeframe } from './tickerShared'
 import './ticker.css'
 
 const VIEWS: Array<{ value: TickerView; label: string }> = [
@@ -20,27 +22,38 @@ export default function TickerWorkspace() {
   const { symbol = '', view } = useParams<{ symbol: string; view?: string }>()
   const location = useLocation()
   const active = (VIEWS.find(item => item.value === view)?.value ?? 'overview') as TickerView
+  const [analysisInterval, setAnalysisInterval] = useState<SetupTimeframe>('1d')
+  const [analysisSetup, setAnalysisSetup] = useState<TradeSetup | null>(null)
+  const realtimeOnly = import.meta.env.VITE_REALTIME_ONLY === 'true'
+  const release = usePublicationQuery(`ticker-workspace:${symbol}`, pin => getTickerWorkspacePublication(symbol, pin))
+  const publication = release.data?.publication
+  const snapshotId = publication?.snapshot_id
+  const readsEnabled = !realtimeOnly || !!publication
+  const publicationLoading = realtimeOnly && !publication && !release.error
+  const queryScope = realtimeOnly ? [publication?.cohort_id, snapshotId] : []
+  const technicalWarning = release.error ?? ([publication?.section_warnings?.actions,
+    publication?.section_warnings?.market].filter(Boolean).join(' ') || null)
 
   const { data: profile = null, isFetching: profileLoading } = useQuery({
-    queryKey: ['equity-security-profile', symbol],
-    queryFn: () => getEquitySecurityProfile(symbol),
-    enabled: !!symbol,
+    queryKey: ['equity-security-profile', symbol, ...queryScope],
+    queryFn: () => getEquitySecurityProfile(symbol, snapshotId),
+    enabled: !!symbol && readsEnabled,
     staleTime: 24 * 60 * 60 * 1000,
   })
   const { data: quote = null } = useQuery({
-    queryKey: ['latest-quote', symbol],
-    queryFn: () => getLatestQuote(symbol),
-    enabled: !!symbol,
-    refetchInterval: 60_000,
+    queryKey: ['latest-quote', symbol, ...queryScope],
+    queryFn: () => getLatestQuote(symbol, false, snapshotId),
+    enabled: !!symbol && readsEnabled,
+    refetchInterval: realtimeOnly ? false : 60_000,
   })
   const {
     data: calendar = null,
     isFetching: calendarLoading,
     isError: calendarError,
   } = useQuery({
-    queryKey: ['option-event-calendar', symbol, 30],
-    queryFn: () => getOptionEventCalendar(symbol, 30),
-    enabled: !!symbol && active === 'overview',
+    queryKey: ['option-event-calendar', symbol, 30, ...queryScope],
+    queryFn: () => getOptionEventCalendar(symbol, 30, snapshotId),
+    enabled: !!symbol && active === 'overview' && readsEnabled,
     staleTime: 15 * 60 * 1000,
   })
 
@@ -66,7 +79,9 @@ export default function TickerWorkspace() {
     ],
   })
 
-  if (view === 'scanner') return <Navigate to={`/ticker/${symbol}${location.search}`} replace />
+  if (view === 'scanner') {
+    return <Navigate to={`/ticker/${symbol}${location.search}`} replace />
+  }
 
   return (
     <div className="ticker-workspace">
@@ -85,16 +100,29 @@ export default function TickerWorkspace() {
 
       <div className={active === 'overview' ? 'ticker-body ticker-body--with-rail' : 'ticker-body'}>
         <div className="ticker-main">
-          <TickerDetail view={active} />
-          {active === 'financials' && <FinancialsView profile={profile} loading={profileLoading} />}
+          <TickerDetail view={active} publication={publication} readsEnabled={readsEnabled}
+            publicationLoading={publicationLoading}
+            availabilityError={realtimeOnly ? technicalWarning : null}
+            onRefreshPublication={realtimeOnly ? async () => {
+              if (release.error) await release.retry()
+              else await release.refresh()
+            } : undefined}
+            onAnalysisIntervalChange={setAnalysisInterval}
+            onAnalysisSetupChange={setAnalysisSetup} />
+          {active === 'financials' && <FinancialsView profile={profile} loading={publicationLoading || profileLoading}
+            availabilityError={realtimeOnly ? release.error : null} />}
         </div>
         {active === 'overview' && (
           <EntityRail
             profile={profile}
-            loading={profileLoading}
+            loading={publicationLoading || profileLoading}
             calendar={calendar}
-            calendarLoading={calendarLoading}
+            calendarLoading={publicationLoading || calendarLoading}
             calendarError={calendarError}
+            availabilityError={realtimeOnly ? release.error : null}
+            publication={publication}
+            analysisInterval={analysisInterval}
+            setup={analysisSetup}
           />
         )}
       </div>

@@ -3,7 +3,10 @@ import type {
   OptionEventWindowState,
   OptionsEnvelope,
   OptionTickerCalendarData,
+  TickerWorkspacePublication,
+  TradeSetup,
 } from '../../services/api'
+import { INTERVAL_NOUN, MARKET_TIME_ZONE, money, relativeAge, type SetupTimeframe } from './tickerShared'
 
 export const compactMoney = (value: number | string | null | undefined) => {
   if (value === null || value === undefined) return '—'
@@ -54,7 +57,7 @@ const eventLabel = (eventType: string) => (
 const stateLabel: Record<OptionEventWindowState, string> = {
   BLOCKED: 'Blocked',
   CLEAR: 'Clear now',
-  UNAVAILABLE: 'Unavailable',
+  UNAVAILABLE: 'N/A',
   NOT_APPLICABLE: 'Not applicable',
 }
 
@@ -64,7 +67,7 @@ const nextEventLabel = (
 ) => {
   if (event) return eventDateTime(event)
   if (state === 'NOT_APPLICABLE') return 'Not applicable'
-  if (state === 'UNAVAILABLE') return 'Unavailable'
+  if (state === 'UNAVAILABLE') return 'N/A'
   return 'None in 30d'
 }
 
@@ -74,16 +77,26 @@ export default function EntityRail({
   calendar,
   calendarLoading,
   calendarError,
+  availabilityError,
+  publication,
+  analysisInterval = '1d',
+  setup,
 }: {
   profile: EquitySecurityProfileResponse | null
   loading: boolean
   calendar: OptionsEnvelope<OptionTickerCalendarData> | null
   calendarLoading: boolean
   calendarError: boolean
+  availabilityError?: string | null
+  publication?: TickerWorkspacePublication
+  analysisInterval?: SetupTimeframe
+  setup?: TradeSetup | null
 }) {
   const security = profile?.security ?? null
+  const evidenceRef = publication?.evidence_refs[analysisInterval]
   const calendarData = calendar?.data ?? null
-  const upcomingEvents = (calendarData?.events ?? []).filter(event => (
+  const calendarAvailable = calendar?.available === true && calendarData !== null
+  const upcomingEvents = (calendarAvailable ? calendarData.events : []).filter(event => (
     event.status !== 'CANCELED'
     && new Date(event.scheduled_time).getTime() >= Date.now()
   ))
@@ -91,15 +104,11 @@ export default function EntityRail({
   const nextFed = upcomingEvents.find(event => event.event_type === 'FED_RATE_DECISION')
   const calendarMessage = calendarLoading
     ? 'Loading calendar coverage…'
-    : calendarError
-      ? 'Calendar service could not be read.'
-      : calendar?.reason === 'EVENT_CALENDAR_UNCONFIGURED'
-        ? 'Calendar source is not configured.'
-        : calendar?.reason === 'EVENT_CALENDAR_COVERAGE_INCOMPLETE'
-          ? 'Coverage is incomplete; absence is not treated as clear.'
-          : calendarData?.events.length === 0
-            ? 'No dated events in the next 30 days.'
-            : null
+    : calendarError || !calendarAvailable
+      ? availabilityError ?? 'N/A'
+      : calendarData.events.length === 0
+        ? 'No dated events in the next 30 days.'
+        : null
 
   const rows: Array<[string, string]> = [
     ['Issue type', security?.security_type?.replace(/_/g, ' ') ?? '—'],
@@ -119,10 +128,11 @@ export default function EntityRail({
         <strong>{security?.company_name ?? profile?.ticker ?? 'Security'}</strong>
         <span>Reference data</span>
       </div>
+      {availabilityError && security && <p role="alert" className="ticker-entity__empty">{availabilityError}</p>}
       {loading && !security ? (
         <p className="ticker-entity__empty">Loading reference data…</p>
       ) : !security ? (
-        <p className="ticker-entity__empty">No published security reference record for this ticker.</p>
+        <p role={availabilityError ? 'alert' : undefined} className="ticker-entity__empty">{availabilityError ?? 'No published security reference record for this ticker.'}</p>
       ) : (
         <dl className="ticker-entity__rows">
           {rows.map(([label, value]) => (
@@ -137,7 +147,7 @@ export default function EntityRail({
         <strong>Event calendar</strong>
         <span>30-day horizon</span>
       </div>
-      {calendarData && (
+      {calendarAvailable && (
         <dl className="ticker-entity__rows ticker-entity__rows--calendar">
           <div>
             <dt title="Blackout checks the previous 24 hours and next 72 hours">Earnings blackout</dt>
@@ -167,12 +177,12 @@ export default function EntityRail({
           </div>
           <div>
             <dt>Source</dt>
-            <dd>{calendarData.configured_source ?? 'Not configured'}</dd>
+            <dd>{calendarData.configured_source ?? 'N/A'}</dd>
           </div>
           <div>
             <dt>Coverage</dt>
             <dd title={`${calendarData.coverage.length} active coverage record${calendarData.coverage.length === 1 ? '' : 's'}`}>
-              {calendar?.available ? 'Complete' : 'Incomplete'}
+              Complete
             </dd>
           </div>
         </dl>
@@ -189,10 +199,35 @@ export default function EntityRail({
           ))}
         </div>
       ) : null}
-      {calendarMessage && <p className="ticker-calendar__message">{calendarMessage}</p>}
+      {(availabilityError || calendarMessage) && <p role={availabilityError ? 'alert' : undefined} className="ticker-calendar__message">{availabilityError ?? calendarMessage}</p>}
       <div className="ticker-entity__note">
         News, insider transactions and institutional holdings are not integrated.
       </div>
+      {(setup || evidenceRef) && <details className="tk-analysis-provenance" aria-label="Run details">
+        <summary>Run details</summary>
+        <dl>
+          <div><dt>Timeframe</dt><dd>{INTERVAL_NOUN[analysisInterval] ?? analysisInterval}</dd></div>
+          {setup && <>
+            <div><dt>Date</dt><dd><time dateTime={setup.date}>{setup.date}</time></dd></div>
+            <div><dt>Close</dt><dd>{money(setup.last_close)}</dd></div>
+            <div><dt>Confirmed against</dt><dd>{setup.ema_alignment.confirm_interval
+              ? INTERVAL_NOUN[setup.ema_alignment.confirm_interval] ?? setup.ema_alignment.confirm_interval
+              : 'No higher-timeframe confirmation'}</dd></div>
+            {setup.computed_at && <div><dt>Computed</dt><dd><time dateTime={setup.computed_at}>
+              {relativeAge(setup.computed_at) || setup.computed_at}
+            </time></dd></div>}
+          </>}
+          {evidenceRef && ([['Market', evidenceRef.market_time], ['Observed', evidenceRef.observed_at], ['Published', evidenceRef.published_at]] as const).map(([label, timestamp]) => (
+            <div key={label}><dt>{label}</dt><dd><time dateTime={timestamp}>{new Intl.DateTimeFormat(undefined, {
+              timeZone: MARKET_TIME_ZONE, month: 'short', day: 'numeric', year: 'numeric',
+              hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+            }).format(new Date(timestamp))}</time></dd></div>
+          ))}
+        </dl>
+        {evidenceRef && <dl><div><dt>Evidence</dt><dd><code>{evidenceRef.evidence_id}</code></dd></div>
+          <div><dt>SHA-256</dt><dd><code>{evidenceRef.payload_sha256}</code></dd></div>
+          <div><dt>Release</dt><dd><code>{publication.snapshot_id}</code></dd></div></dl>}
+      </details>}
     </aside>
   )
 }

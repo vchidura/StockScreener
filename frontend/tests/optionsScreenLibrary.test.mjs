@@ -252,7 +252,9 @@ test('screener View opens a fixed snapshot without new queries or saved screen f
 test('screener ticker links and table colors match the shared table conventions', () => {
   const page = readFileSync(new URL('../src/pages/OptionsScreenLibrary.tsx', import.meta.url), 'utf8')
   const chain = page.slice(page.indexOf('export function OptionsChainResults'))
-  assert.ok(chain.includes('<Link to={`/ticker/${encodeURIComponent(row.underlying)}`}'))
+  assert.match(chain, /<Link to=\{publicationPath\(`\/ticker\/\$\{encodeURIComponent\(row\.underlying\)\}`/)
+  assert.match(chain, /params\.get\('snapshot_id'\)/)
+  assert.match(chain, /params\.get\('cohort_id'\)/)
   assert.match(chain, /title=\{`Open \$\{row.underlying\} ticker page`\}/)
   assert.match(chain, /aria-label=\{`View \$\{row.contract_ticker\} details`\}/)
   const style = readFileSync(new URL('../src/pages/OptionsScreenerPage.css', import.meta.url), 'utf8')
@@ -260,4 +262,16 @@ test('screener ticker links and table colors match the shared table conventions'
   assert.match(style, /\.options-screening-workspace \.os-package-table td \{ color: var\(--tm-ink\); \}/)
   assert.match(style, /\.options-screening-workspace \.os-package-table a \{ color: var\(--tm-accent\); font-weight: 700;/)
   assert.match(style, /\.os-package-table td small.*color: var\(--tm-muted\)/)
+})
+
+test('publication identity remains in navigation but outside saved screen definitions', () => {
+  const params = new URLSearchParams({
+    view: 'chain', underlyer: 'AAPL', cohort_id: 'cohort', snapshot_id: 'snapshot',
+  })
+  assert.deepEqual(model.independentScreenQuery(params, catalog), { underlyer: 'AAPL', view: 'chain' })
+  assert.deepEqual(model.screenQuery(params, catalog), { underlyer: 'AAPL', view: 'chain' })
+  const switched = model.switchOptionsView(params, 'chain')
+  assert.equal(switched.get('cohort_id'), 'cohort')
+  assert.equal(switched.get('snapshot_id'), 'snapshot')
+  assert.throws(() => model.validateScreenQuery({ view: 'chain', cohort_id: 'cohort' }, catalog), /Unsupported screen field/)
 })

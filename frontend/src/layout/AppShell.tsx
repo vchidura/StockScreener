@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { NavLink, useLocation, useSearchParams } from 'react-router-dom'
-import { ChevronDown, ChevronLeft, ChevronRight, LogIn, Menu, Moon, PanelLeftClose, PanelLeftOpen, RotateCcw, Sun } from 'lucide-react'
+import { ChevronDown, ChevronLeft, ChevronRight, Database, LogIn, Menu, Moon, PanelLeftClose, PanelLeftOpen, RotateCcw, Sun } from 'lucide-react'
 import GlobalSearch from './GlobalSearch'
 import { StalenessBanner } from './StalenessBanner'
 import { PageContextSetter, type PageContextValue } from './pageContext'
@@ -20,6 +20,7 @@ import {
 } from './navigation'
 import { useTheme } from '../theme/useTheme'
 import './AppShell.css'
+import { navigationPublicationPath } from '../pages/publicationNavigation'
 
 const RAIL_STORAGE_KEY = 'alphascreener.rail.collapsed'
 const GROUP_STORAGE_KEY = 'alphascreener.rail.expanded-groups.v1'
@@ -141,8 +142,12 @@ function MarketDataStamp() {
   )
 }
 
-export default function AppShell({ children }: { children: ReactNode }) {
+export default function AppShell({ children, realtimeOnly = false, realtimeHome = '/realtime-canary', realtimeCanary = '/realtime-canary' }: { children: ReactNode; realtimeOnly?: boolean; realtimeHome?: string; realtimeCanary?: string }) {
   const location = useLocation()
+  const publicationPin = new URLSearchParams(location.search).get('snapshot_id') ?? undefined
+  const publicationCohort = new URLSearchParams(location.search).get('cohort_id') ?? undefined
+  const publicationInterval = new URLSearchParams(location.search).get('interval') === '1h' ? '1h' : '1d'
+  const pinnedPath = (path: string) => navigationPublicationPath(path, location.pathname, publicationPin, publicationCohort, publicationInterval)
   const { theme, toggleTheme } = useTheme()
   const [collapsed, setCollapsed] = useState(storedCollapsed)
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -200,7 +205,12 @@ export default function AppShell({ children }: { children: ReactNode }) {
 
   const publishPageContext = useCallback((value: PageContextValue | null) => setPageContext(value), [])
 
-  const breadcrumb = breadcrumbFor(location.pathname)
+  const breadcrumb = location.pathname === '/realtime-canary'
+    ? ['Realtime', 'Validation status']
+    : breadcrumbFor(location.pathname)
+  const validationDestination = publicationPin || publicationCohort
+    ? pinnedPath('/realtime-canary')
+    : realtimeCanary
   const activeGroupId = groupForPath(location.pathname)
   const flyoutGroup = NAV_GROUPS.find(group => group.id === flyoutGroupId) ?? null
   const compactRail = collapsed && !drawerOpen
@@ -228,9 +238,10 @@ export default function AppShell({ children }: { children: ReactNode }) {
   const renderItem = (item: NavItem, flyout = false) => {
     const Icon = item.icon
     const active = itemMatchesPath(item, location.pathname)
-    const destination = item.activeFor === 'ticker'
+    const baseDestination = item.activeFor === 'ticker'
       ? `/ticker/${lastStockSymbol}`
       : item.to
+    const destination = realtimeOnly ? pinnedPath(baseDestination) : baseDestination
     return (
       <NavLink
         key={item.to}
@@ -251,7 +262,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
     <div className={`tm-shell${collapsed ? ' tm-shell--collapsed' : ''}`}>
       <aside className={`tm-rail${drawerOpen ? ' is-open' : ''}`} aria-label="Primary navigation">
         <div className="tm-rail__brand">
-          <NavLink to="/" className="tm-brand" title={`${BRAND_NAME} ${BRAND_SUFFIX}`}>
+          <NavLink to={realtimeOnly ? pinnedPath(realtimeHome) : '/'} className="tm-brand" title={`${BRAND_NAME} ${BRAND_SUFFIX}`}>
             <span className="tm-brand__mark">{BRAND_MARK}</span>
             <span className="tm-brand__text">
               <strong>{BRAND_NAME}</strong>
@@ -273,6 +284,13 @@ export default function AppShell({ children }: { children: ReactNode }) {
         </div>
 
         <nav className="tm-rail__nav">
+          {realtimeOnly && <div className="tm-rail__group tm-rail__group--static">
+            <span className="tm-rail__group-label">Realtime</span>
+            <NavLink to={validationDestination} className="tm-rail__item" title="Equity validation status">
+              <Database size={15} aria-hidden="true" />
+              <span>Validation status</span>
+            </NavLink>
+          </div>}
           {NAV_GROUPS.map(group => {
             const GroupIcon = group.icon
             if (group.collapsible === false) {
@@ -367,10 +385,10 @@ export default function AppShell({ children }: { children: ReactNode }) {
             >
               {theme === 'dark' ? <Sun size={15} aria-hidden="true" /> : <Moon size={15} aria-hidden="true" />}
             </button>
-            <NavLink to="/signin" className="tm-signin">
+            {!realtimeOnly && <NavLink to="/signin" className="tm-signin">
               <LogIn size={14} aria-hidden="true" />
               <span>Sign in</span>
-            </NavLink>
+            </NavLink>}
           </div>
         </header>
 

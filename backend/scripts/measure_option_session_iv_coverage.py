@@ -38,7 +38,7 @@ from database import get_db_cursor  # noqa: E402
 from options.calendar import OptionExchangeCalendar  # noqa: E402
 from options.config import load_option_runtime_configuration  # noqa: E402
 
-BASE_URL = "https://api.polygon.io"
+BASE_URL = "https://api.massive.com"
 DEFAULT_OUTPUT = BACKEND_DIR.parent / "docs" / "option_session_iv_coverage.json"
 
 # Three bracketing strikes is the practical minimum for interpolating an ATM value

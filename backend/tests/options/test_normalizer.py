@@ -4,6 +4,8 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
@@ -72,14 +74,36 @@ def _payload(**overrides):
     return payload
 
 
-def _normalizer():
+def _normalizer(policy_file=None):
+    environ = {"POLYGON_API_KEY": "test-secret"}
+    if policy_file is not None:
+        environ["OPTION_POLICY_FILE"] = policy_file
     configuration = load_option_runtime_configuration(
-        {"POLYGON_API_KEY": "test-secret"}, BACKEND_DIR
+        environ, BACKEND_DIR
     )
     return DeveloperOptionNormalizer(
         configuration.policy,
         configuration.valuation_policy,
     )
+
+
+@pytest.mark.parametrize(
+    ("volume", "open_interest", "eligible"),
+    [(250, 500, True), (251, 501, True), (249, 500, False), (250, 499, False),
+     (None, 500, False), (250, None, False), (None, None, False)],
+)
+def test_strict_liquidity_policy_is_applied_during_normalization(volume, open_interest, eligible):
+    normalizer = _normalizer("options/policies/developer_forward_liquidity_v2.json")
+    assert normalizer.policy.contract_filter.liquidity_rule == "AND"
+    raw = parse_polygon_snapshot(_payload(day={**_payload()["day"], "volume": volume},
+        open_interest=open_interest), OBSERVED_AT)
+    item = DeveloperNormalizationInput(raw, _catalog(),
+        (UnderlyingMinuteBar(Decimal("100"), MARKET_TIME),),
+        datetime(2026, 9, 4, 20, 0, tzinfo=UTC), 0.04, 0.0)
+    result = normalizer.normalize(uuid4(), (item,))
+    assert result.retained_count == len(result.matrix_snapshots) == int(eligible)
+    if not eligible:
+        assert result.rejected_counts == (("LIQUIDITY_FLOOR", 1),)
 
 
 def test_developer_fixture_maps_every_snapshot_field_without_fabricating_quotes():
@@ -112,6 +136,28 @@ def test_developer_fixture_maps_every_snapshot_field_without_fabricating_quotes(
     assert snapshot.risk_free_rate == 0.04
     assert snapshot.raw_payload_sha256 == raw.raw_payload_sha256
     assert len(snapshot.normalized_payload_sha256) == 64
+
+
+def test_provider_valuation_candidate_clock_mismatch_rejects_only_the_stale_contract():
+    from dataclasses import replace
+    from options.model_inputs import ExpirationValuationCandidate
+
+    raw = parse_polygon_snapshot(_payload(), OBSERVED_AT)
+    candidate = ExpirationValuationCandidate(raw.option_mark_time.date() + timedelta(days=1),
+        _catalog().expiration_date, Decimal("100"), 0.04, 0.0,
+        raw.option_mark_time.date(), (uuid4(),), ("a" * 64,), (),
+        raw.option_mark_time.date(), _catalog().expiration_date,
+        "fixture:covered-dividends", "b" * 64, OBSERVED_AT)
+    item = DeveloperNormalizationInput(raw=raw, catalog=_catalog(),
+        underlying_bars=(UnderlyingMinuteBar(Decimal("100"), MARKET_TIME),),
+        expiration_cutoff=datetime(2026, 9, 4, 20, 0, tzinfo=UTC),
+        risk_free_rate=0.04, dividend_yield=0.0, dividend_coverage_available=True,
+        normalized_observed_at=OBSERVED_AT, valuation_candidate=candidate)
+
+    result = _normalizer().normalize(uuid4(), (item,))
+
+    assert result.received_count == 1 and result.retained_count == 0
+    assert dict(result.rejected_counts) == {"VALUATION_CANDIDATE_CLOCK_MISMATCH": 1}
 
 
 def test_missing_optional_provider_greeks_remain_null_diagnostics():

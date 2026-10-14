@@ -1,0 +1,21 @@
+.strategy-publication {
+  padding: .65rem .8rem;
+  margin-bottom: 1rem;
+  border: 1px solid var(--tm-line);
+  border-radius: 6px;
+  background: var(--tm-surface);
+  font-size: .8rem;
+  overflow-wrap: anywhere;
+}
+.strategy-publication p { margin: .35rem 0; }
+.strategy-publication [role="alert"] { color: var(--tm-neg); font-weight: 600; }
+.data-table th[tabindex]:focus-visible,
+.data-table button:focus-visible { outline: 2px solid var(--tm-accent); outline-offset: -2px; }
+.data-table button.ticker {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  font: inherit;
+  text-align: inherit;
+}
+.data-table button.ticker:disabled { color: inherit; cursor: not-allowed; }

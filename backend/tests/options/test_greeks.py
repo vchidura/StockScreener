@@ -15,6 +15,7 @@ from options.analytics import (
     passes_convergence_gate,
     solve_local_greeks,
 )
+from options.analytics.greeks import price_and_greeks
 from options.domain import ContractType
 
 
@@ -69,6 +70,44 @@ def test_brent_fallback_recovers_when_newton_budget_is_exhausted():
     assert result.converged is True
     assert result.local_iv == pytest.approx(0.4, abs=1e-8)
     assert result.solver.value == "BRENT"
+
+
+def _short_dated(contract_type, strike, volatility, days=1.0, rounded=True):
+    maturity = days / 365.0
+    price = price_and_greeks(contract_type, spot=100.0, strike=float(strike), maturity=maturity, rate=0.045,
+                             dividend=0.0, volatility=volatility)[0]
+    mark = round(price * 200) / 200 if rounded else price
+    return OptionValuationInput(
+        contract_type=contract_type, spot=Decimal("100"), strike=Decimal(str(strike)), model_mark=Decimal(repr(mark)),
+        time_to_expiration_years=maturity, risk_free_rate=0.045, dividend_yield=0.0)
+
+
+def test_a_mark_that_does_not_depend_on_volatility_is_not_identifiable():
+    # One day to expiry, 10% in the money: the price is intrinsic value whatever the volatility is, so any
+    # volatility "fits". The solver used to report a volatility near its starting guess (33.7%) as converged.
+    marks = [_short_dated(ContractType.PUT, 110, vol, rounded=False) for vol in (0.10, 0.15)]
+    for result in solve_local_greeks(tuple(marks)):
+        assert result.converged is False
+        assert result.local_iv is None and result.local_delta is None
+        assert result.failure_reason is IvFailureReason.IV_NOT_IDENTIFIABLE
+    # The previous behaviour (no uncertainty bound) is still reachable explicitly.
+    assert solve_local_greeks((marks[0],), maximum_iv_uncertainty=1e9)[0].converged is True
+    # The gate discriminates: at 50% volatility the same option has enough time value to pin the IV.
+    sensitive = solve_local_greeks((_short_dated(ContractType.PUT, 110, 0.5, rounded=False),))[0]
+    assert sensitive.converged is True and sensitive.local_iv == pytest.approx(0.5, abs=1e-3)
+
+
+def test_an_identifiable_short_dated_option_still_recovers_its_volatility():
+    for contract_type, strike in ((ContractType.CALL, 100), (ContractType.PUT, 100), (ContractType.CALL, 103),
+                                  (ContractType.PUT, 97)):
+        result = solve_local_greeks((_short_dated(contract_type, strike, 0.25, rounded=False),))[0]
+        assert result.converged is True
+        assert result.local_iv == pytest.approx(0.25, abs=1e-5)
+
+
+def test_identifiability_bound_must_be_positive():
+    with pytest.raises(ValueError):
+        solve_local_greeks((_input(ContractType.CALL, "10.45"),), maximum_iv_uncertainty=0.0)
 
 
 def test_per_underlying_convergence_gate_is_literal_ninety_five_percent():

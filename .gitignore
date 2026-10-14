@@ -56,7 +56,10 @@ backend/scripts/_*.py
 backend/option-raw/
 
 # Local documentation and research artifacts. Required program inputs live in backend/research/inputs/.
-/docs/
+/docs/*
+!/docs/ADVANCED_REALTIME_PREFLIGHT_DESIGN.md
+!/docs/ADVANCED_REALTIME_IMPLEMENTATION_PLAN.md
+!/docs/ADVANCED_REALTIME_IMPLEMENTATION_TRACKER.md
 
 # Local working specs. Routed agent context lives in .github/copilot-instructions.md.
 /.github/specs/
@@ -74,17 +77,22 @@ frontend/dist/
 
 # --- Local environment files (do not commit secrets) ---
 .env
+.env.realtime
+.env_old_donot_use
 .env.local
 .env.development.local
 .env.test.local
 .env.production.local
 backend/.env
 backend/.env.production
+backend/.env.realtime.local
+backend/.realtime-canary/
 frontend/.env.local
 
 # Keep safe/shared templates tracked
 !.env.example
 !backend/.env.example
+!backend/.env.realtime.example
 !frontend/.env.production
 
 # --- Temporary / cache ---

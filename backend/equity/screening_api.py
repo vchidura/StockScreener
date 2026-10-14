@@ -9,23 +9,11 @@ from fastapi import APIRouter, HTTPException
 
 from database import get_db_cursor
 from equity.calendar import latest_expected_market_time
-from research.screening import FIELDS, PATTERNS, VERSION, STATE_FIELDS, SHORT_MOMENTUM_FIELDS, GAP_VERSION, GAP_CATALOG, supported_hourly_contract, GapPredicate, StrictModel, Query, evaluate_gaps, query_generation
-from pydantic import Field
+from research.screening import DEFERRED, FIELDS, PATTERNS, VERSION, STATE_FIELDS, SHORT_MOMENTUM_FIELDS, GAP_VERSION, GAP_CATALOG, supported_hourly_contract, GapPredicate, Query, SnapshotRowRequest, GapDetailRequest, evaluate_gaps, query_generation
 
 
 router = APIRouter(prefix="/api/stocks/screening", tags=["stock-screening"])
 SNAPSHOT_TYPE = "SCREENING_DAILY_V1"
-DEFERRED = {
-    "sector": "Dated source coverage not yet verified",
-    "industry": "Dated source coverage not yet verified",
-    "market_cap": "Dated source coverage not yet verified",
-    "rsi": "Indicator contract not yet inventoried",
-    "adx": "Indicator contract not yet inventoried",
-    "rs63": "Same-universe benchmark source not yet verified",
-    "atr": "Indicator contract not yet inventoried",
-    "active_setups": "Retained lifecycle and invalidation coverage not yet verified",
-    "persistence": "Requires five expected compatible daily screening publications",
-}
 
 
 def publication_index():
@@ -118,15 +106,6 @@ def previous_generation(generation, publications):
                 ORDER BY generated_at DESC,snapshot_id LIMIT 1""", (SNAPSHOT_TYPE, expected_session))
             selected = cursor.fetchone()
     return load_generation(str(selected["snapshot_id"])) if selected else None
-
-
-class SnapshotRowRequest(StrictModel):
-    generation: str = Field(min_length=64, max_length=64)
-    security_id: str = Field(min_length=1, max_length=64)
-
-
-class GapDetailRequest(SnapshotRowRequest):
-    gap: GapPredicate | None = None
 
 
 def snapshot_row(request: SnapshotRowRequest):

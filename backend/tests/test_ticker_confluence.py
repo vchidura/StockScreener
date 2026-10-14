@@ -6,7 +6,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from main import _build_ticker_confluence_zones
+from equity.ticker_contracts import build_ticker_confluence_zones as _build_ticker_confluence_zones
 
 
 def setup(interval: str, close: float, ema21: float, fib: float, pattern=None, zones=None):

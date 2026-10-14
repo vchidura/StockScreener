@@ -1,0 +1,130 @@
+"""STOCK_ALERTS and STRATEGY_PUBLISH runners: publication stages dispatched from the EQUITY_CYCLE receipt.
+
+STOCK_ALERTS computes the alert snapshot read-only under the compute role and publishes it under the
+publication role (the V2 registry lets only `publication` insert portal snapshots). STRATEGY_PUBLISH
+runs the ported strategy producer once per interval; the producer already writes its evidence under
+compute and its snapshots and releases under publication. No provider is called by either.
+
+Cancellation follows the equity runners: every write goes through the stage's fenced transaction
+(StageCancelled / WriteFenceRejected), and `context.is_cancelled()` is polled between phases.
+"""
+from __future__ import annotations
+
+import logging
+from collections.abc import Mapping
+
+from .database_access import RealtimeDatabaseRole
+from .database_access_v2 import WriteFenceRejected
+from .runner_environment import RunnerEnvironment
+from .stage_database_v2 import V2StageDatabase
+from .stage_orchestrator import StageCancelled, StageContext, StageOutcome, StageRunner
+from .stage_runners_equity import (
+    EQUITY_CYCLE_RECEIPT_MISSING,
+    REFERENCE_GENERATION_UNAVAILABLE,
+    STAGE_CANCELLED,
+    _is_session_close,
+    _window_receipt,
+    reference_generation,
+)
+from .stock_alert_repository import (
+    RetainedForwardState,
+    compute_realtime_stock_alerts,
+    publish_realtime_stock_alerts,
+)
+from .strategy_repository import materialize_due_realtime_strategies
+
+logger = logging.getLogger(__name__)
+
+STOCK_ALERTS_RETAINED_FORWARD_STATE = "STOCK_ALERTS_RETAINED_FORWARD_STATE"
+STRATEGY_INTERVALS = ("1d", "1h")
+# Analysis coverage statuses of a strategy snapshot that mean its members were evaluated (an evaluation without
+# any setup is COMPLETE_EMPTY); everything else (PARTIAL, INSUFFICIENT_HISTORY, UNAVAILABLE) degrades the stage.
+EVALUATED_ANALYSIS_STATUSES = frozenset({"COMPLETE", "COMPLETE_EMPTY"})
+
+
+def _missing_producers(snapshot) -> tuple[str, ...]:
+    payload = getattr(snapshot, "payload", None)
+    missing = payload.get("missing_producers") if isinstance(payload, Mapping) else None
+    if not isinstance(missing, Mapping):
+        return ()
+    return tuple(f"MISSING_PRODUCER:{name}" for name in sorted(missing))
+
+
+def stock_alerts_runner(environment: RunnerEnvironment) -> StageRunner:
+    def run(context: StageContext) -> StageOutcome:
+        plan, window = context.plan, context.window
+        compute = V2StageDatabase(context, RealtimeDatabaseRole.COMPUTE)
+        publication = V2StageDatabase(context, RealtimeDatabaseRole.PUBLICATION)
+        try:
+            receipt = _window_receipt(compute, window)
+            if receipt is None:
+                return StageOutcome.failed(EQUITY_CYCLE_RECEIPT_MISSING)
+            generation = reference_generation(compute, window.cutoff)
+            if generation < 1:
+                return StageOutcome.blocked(REFERENCE_GENERATION_UNAVAILABLE)
+            if context.is_cancelled():
+                return StageOutcome.failed(STAGE_CANCELLED)
+            try:
+                snapshot = compute_realtime_stock_alerts(
+                    compute, cohort_id=plan.cohort_id, session=plan.session_date, cutoff=window.cutoff,
+                    known_by=window.deadline, source_generation=generation,
+                )
+            except RetainedForwardState:
+                return StageOutcome.blocked(STOCK_ALERTS_RETAINED_FORWARD_STATE)
+            if context.is_cancelled():
+                return StageOutcome.failed(STAGE_CANCELLED)
+            publish_realtime_stock_alerts(
+                publication, snapshot, receipt=receipt, session_close=_is_session_close(context),
+            )
+        except (StageCancelled, WriteFenceRejected):
+            return StageOutcome.failed(STAGE_CANCELLED)
+        return StageOutcome.complete(degraded=_missing_producers(snapshot))
+
+    return run
+
+
+def strategy_publish_runner(environment: RunnerEnvironment) -> StageRunner:
+    def run(context: StageContext) -> StageOutcome:
+        plan, window = context.plan, context.window
+        compute = V2StageDatabase(context, RealtimeDatabaseRole.COMPUTE)
+        publication = V2StageDatabase(context, RealtimeDatabaseRole.PUBLICATION)
+        statuses: list[str] = []
+        failures: list[str] = []
+        unevaluated: list[str] = []
+        try:
+            receipt = _window_receipt(publication, window)
+            if receipt is None:
+                return StageOutcome.failed(EQUITY_CYCLE_RECEIPT_MISSING)
+            for interval in STRATEGY_INTERVALS:
+                if context.is_cancelled():
+                    return StageOutcome.failed(STAGE_CANCELLED)
+                try:
+                    # Strategies read `available_by` as the time the data is known (they subtract the provider
+                    # delay themselves), so they run at the window deadline: every bar fetched and recorded
+                    # within the completion budget, including the bars up to the window cutoff, is available.
+                    outcomes = materialize_due_realtime_strategies(
+                        compute, publication, cohort_id=plan.cohort_id, available_by=window.deadline,
+                        intervals=(interval,), receipt=receipt,
+                    )
+                except (StageCancelled, WriteFenceRejected):
+                    raise
+                except Exception as error:  # noqa: BLE001 - one interval must not stop the other
+                    logger.warning("strategy interval %s failed: %s", interval, type(error).__name__,
+                                   exc_info=True)
+                    failures.append(f"STRATEGY_{interval.upper()}_FAILED:{type(error).__name__}")
+                    continue
+                statuses.extend(f"{item['interval']}={item['status']}" for item in outcomes)
+                unevaluated.extend(
+                    f"STRATEGY_{interval.upper()}_{status}" for item in outcomes
+                    for status in item.get("analysis", ()) if status not in EVALUATED_ANALYSIS_STATUSES)
+        except (StageCancelled, WriteFenceRejected):
+            return StageOutcome.failed(STAGE_CANCELLED)
+        if len(failures) == len(STRATEGY_INTERVALS):
+            return StageOutcome.failed(*failures)
+        # ALREADY_STORED (a retained cutoff) is a success. A failed interval degrades the stage, and so does a
+        # snapshot whose members could not be (fully) evaluated: it is valid and published, but not what the
+        # stage exists to produce, and the stage must not look healthy.
+        return StageOutcome.complete(degraded=(*failures, *dict.fromkeys(unevaluated)),
+                                     evidence_ref=";".join(statuses) or None)
+
+    return run

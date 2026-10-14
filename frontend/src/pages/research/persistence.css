@@ -1,3 +1,16 @@
+.pv-dots .pv-cell-match { background: var(--tm-accent); }
+.pv-dots .pv-cell-no_match { background: transparent; border: 1px solid var(--tm-muted); }
+.pv-dots .pv-cell-unavailable, .pv-dots .pv-cell-insufficient_history { background: transparent; border: 1px dashed var(--tm-muted); }
+.pv-dots .pv-cell-failed { background: var(--danger); }
+.pv-detail pre { max-width: 460px; max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.pv-original .pv-status-actions { display: flex; align-items: center; gap: 12px; }
+.pv-original .pv-panel__head { padding-left: 12px; }
+.pv-original .pv-section { border-bottom: 1px solid var(--tm-line); }
+.pv-original .pv-table { min-width: 1180px; }
+.pv-original .pv-axis { max-width: 280px; }
+.pv-original .pv-axis small { overflow-wrap: anywhere; }
+.pv-original .pv-cell-match { background: var(--tm-pos); }
+.pv-original .pv-dots i { box-sizing: border-box; flex: 0 0 7px; }
 .pv {
   display: grid;
   gap: 16px;
@@ -10,7 +23,21 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
 }
+
+.pv-section { min-width: 0; }
+.pv-section h2 { margin: 0 0 8px; font-size: 14px; }
+.pv-section h2 small { font-weight: 400; color: var(--tm-muted); }
+.pv-expand { width: 24px; height: 24px; display: inline-grid; place-items: center; padding: 0; border: 0; background: transparent; color: var(--tm-ink); cursor: pointer; }
+.pv-symbol { white-space: nowrap; }
+.pv-reason { display: block; color: var(--tm-muted); }
+.pv-realtime button:focus-visible { outline: 2px solid var(--tm-accent); outline-offset: 2px; }
+.pv-realtime a:focus-visible { outline: 2px solid var(--tm-accent); outline-offset: 2px; }
+.pv-realtime .pv-ticker { text-decoration: none; }
+.pv-realtime .pv-ticker:hover { text-decoration: underline; }
+.pv-realtime .pv-table { min-width: 720px; }
+.pv-realtime .pv-table td { font-variant-numeric: tabular-nums; }
 
 .pv-refresh {
   display: grid;

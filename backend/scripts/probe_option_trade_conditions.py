@@ -22,7 +22,7 @@ def main() -> int:
     configuration = load_option_runtime_configuration()
     api_key = configuration.settings.polygon_api_key.get_secret_value()
     response = requests.get(
-        "https://api.polygon.io/v3/reference/conditions",
+        "https://api.massive.com/v3/reference/conditions",
         params={
             "asset_class": "options",
             "data_type": "trade",

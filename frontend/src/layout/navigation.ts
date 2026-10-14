@@ -102,6 +102,7 @@ export const NAV_GROUPS: NavGroup[] = [
     label: 'Strategies',
     icon: Sigma,
     items: [
+      { to: '/strategies/overview', label: 'Overview', icon: Table2 },
       { to: '/gaps', label: 'Gap & Imbalance', icon: ArrowLeftRight },
       { to: '/ma-crossover', label: 'MA Crossover', icon: TrendingUp },
       { to: '/momentum-pullback', label: 'Momentum Pullback', icon: Activity },
@@ -137,6 +138,8 @@ export function activeTickerSymbol(pathname: string): string | null {
 export function breadcrumbFor(pathname: string): string[] {
   const symbol = activeTickerSymbol(pathname)
   if (symbol) return ['Stocks', symbol]
+  const research = /^\/strategy-research\/([^/]+)/.exec(pathname)
+  if (research) return ['Strategies', 'Overview', decodeURIComponent(research[1]).toUpperCase()]
   if (pathname.startsWith('/account')) return ['Account']
   for (const group of NAV_GROUPS) {
     const item = group.items

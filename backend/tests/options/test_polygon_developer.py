@@ -114,7 +114,7 @@ def _engine(responses, rate_limit_gate=None):
 
 def test_chain_consumes_all_pages_and_strips_key_from_next_request_metadata():
     next_url = (
-        "https://api.polygon.io/v3/snapshot/options/SPY?cursor=next-1"
+        "https://api.massive.com/v3/snapshot/options/SPY?cursor=next-1"
         "&apiKey=never-persist-this"
     )
     engine, repository, transport, _ = _engine(
@@ -183,7 +183,7 @@ def test_full_250_row_terminal_page_is_complete_without_next_url():
 
 
 def test_repeated_pagination_cursor_quarantines_complete_chain_attempt():
-    next_url = "https://api.polygon.io/v3/snapshot/options/SPY?cursor=repeated"
+    next_url = "https://api.massive.com/v3/snapshot/options/SPY?cursor=repeated"
     engine, repository, _, _ = _engine(
         [
             _response({"results": [{"ticker": "O:1"}], "next_url": next_url}),
@@ -289,6 +289,119 @@ def test_forward_raw_minutes_preserve_ohlcv_and_use_closed_bar_timestamp():
     assert raw.policy_sha256 != legacy.policy_sha256
 
 
+def _minute_row(start, close=100):
+    return dict(t=int(start.timestamp() * 1000), o=close, h=close, l=close, c=close, v=10)
+
+
+_MINUTE_PATH = "/v2/aggs/ticker/SPY/range/1/minute/2026-08-29/2026-08-29"
+
+
+def _minute_next(cursor, host="api.massive.com", path=_MINUTE_PATH, adjusted="false"):
+    return (
+        f"https://{host}{path}?cursor={cursor}&adjusted={adjusted}&sort=asc&limit=50000"
+        "&apiKey=never-persist-this"
+    )
+
+
+def test_minute_reader_follows_continuation_and_finds_the_needed_bar_on_page_two():
+    from datetime import timedelta
+
+    first, second = NOW - timedelta(minutes=3), NOW - timedelta(minutes=2)
+    engine, _, transport, _ = _engine([
+        _response({"results": [_minute_row(first)], "next_url": _minute_next("page-2")}),
+        _response({"results": [_minute_row(second)]}),
+    ])
+
+    bars, coverage = engine.get_underlying_minute_bars_with_coverage(
+        "SPY", first, NOW, raw_finalized=True
+    )
+
+    assert [bar.bar_start for bar in bars] == [first, second]
+    assert coverage.pages_fetched == 2 and coverage.pagination_complete is True
+    assert coverage.bar_count == 2
+    assert coverage.price_basis == "RAW_FINALIZED_MINUTE_CLOSE_V1"
+    assert coverage.returned_from == first + timedelta(minutes=1)
+    assert coverage.returned_to == second + timedelta(minutes=1)
+    assert len(transport.requests) == 2
+    assert transport.requests[0][1]["adjusted"] == "false"
+    assert transport.requests[1][1]["cursor"] == "page-2"
+    assert "apiKey" not in transport.requests[1][1]
+
+
+def test_minute_reader_legacy_basis_is_adjusted_with_bar_start_time():
+    engine, _, transport, _ = _engine([_response({"results": [_minute_row(NOW, 101)]})])
+
+    bars, coverage = engine.get_underlying_minute_bars_with_coverage("SPY", NOW, NOW)
+
+    assert coverage.price_basis == "ADJUSTED_BAR_START_V1"
+    assert transport.requests[0][1]["adjusted"] == "true"
+    assert bars[0].market_data_time == NOW
+
+
+def test_minute_reader_never_returns_a_partial_prefix_as_complete():
+    from datetime import timedelta
+
+    start = NOW - timedelta(minutes=3)
+    engine, _, _, _ = _engine([
+        _response({"results": [_minute_row(start)], "next_url": _minute_next("page-2")}),
+    ])
+    with pytest.raises(OptionProviderError) as bounded:
+        engine.get_underlying_minute_bars_with_coverage(
+            "SPY", start, NOW, raw_finalized=True, maximum_pages=1
+        )
+    assert bounded.value.category is ProviderErrorCategory.PAGINATION
+    assert "incomplete" in str(bounded.value)
+
+
+@pytest.mark.parametrize("next_url", [
+    _minute_next("a", host="example.com"),
+    _minute_next("a", path="/v2/aggs/ticker/QQQ/range/1/minute/2026-08-29/2026-08-29"),
+])
+def test_minute_reader_rejects_hostile_continuation(next_url):
+    from datetime import timedelta
+
+    start = NOW - timedelta(minutes=3)
+    engine, _, _, _ = _engine([
+        _response({"results": [_minute_row(start)], "next_url": next_url}),
+    ])
+    with pytest.raises(OptionProviderError) as hostile:
+        engine.get_underlying_minute_bars_with_coverage("SPY", start, NOW, raw_finalized=True)
+    assert hostile.value.category is ProviderErrorCategory.PAGINATION
+
+
+def test_minute_reader_rejects_a_repeated_cursor():
+    from datetime import timedelta
+
+    start = NOW - timedelta(minutes=3)
+    engine, _, _, _ = _engine([
+        _response({"results": [_minute_row(start)], "next_url": _minute_next("loop")}),
+        _response({"results": [_minute_row(start + timedelta(minutes=1))],
+                   "next_url": _minute_next("loop")}),
+    ])
+    with pytest.raises(OptionProviderError, match="repeated a cursor"):
+        engine.get_underlying_minute_bars_with_coverage("SPY", start, NOW, raw_finalized=True)
+
+
+def test_minute_reader_handles_empty_and_out_of_order_duplicate_pages():
+    from datetime import timedelta
+
+    engine, _, _, _ = _engine([_response({"results": []})])
+    bars, coverage = engine.get_underlying_minute_bars_with_coverage("SPY", NOW, NOW)
+    assert bars == () and coverage.bar_count == 0
+    assert coverage.returned_from is None and coverage.pagination_complete is True
+
+    early, late = NOW - timedelta(minutes=3), NOW - timedelta(minutes=2)
+    engine, _, _, _ = _engine([
+        _response({"results": [_minute_row(late, 102)],
+                   "next_url": _minute_next("p2", adjusted="true")}),
+        _response({"results": [_minute_row(early, 100), _minute_row(late, 103)]}),
+    ])
+    bars, coverage = engine.get_underlying_minute_bars_with_coverage("SPY", early, NOW)
+    assert [bar.market_data_time for bar in bars] == [early, late]
+    assert bars[-1].close == Decimal("103")
+    assert coverage.pages_fetched == 2
+
+
 def test_reference_preserves_adjustment_metadata_for_catalog_rejection():
     engine, _, _, _ = _engine(
         [
@@ -321,7 +434,7 @@ def test_reference_preserves_adjustment_metadata_for_catalog_rejection():
 
 def test_reference_refresh_consumes_pages_with_inclusive_bounds():
     next_url = (
-        "https://api.polygon.io/v3/reference/options/contracts?cursor=reference-next"
+        "https://api.massive.com/v3/reference/options/contracts?cursor=reference-next"
     )
     result = {
         "ticker": "O:SPY260904C00650000",

@@ -1,0 +1,205 @@
+{
+  "provenance": "SYNTHETIC_SCHEMA_FIXTURE_NOT_LIVE_CAPTURED",
+  "provenance_note": "Authored by hand to follow the documented GET /v3/reference/conditions schema (asset_class=options, data_type=trade). It was never fetched from the provider: ids 9001-9013 are outside the provider's id range and every name starts with SYNTHETIC. Replace it with a reviewed live capture before any live use.",
+  "fetched_at": "2026-10-12T00:00:00Z",
+  "request": {"asset_class": "options", "data_type": "trade"},
+  "status": "OK",
+  "count": 13,
+  "results": [
+    {
+      "id": 9001,
+      "abbreviation": "SYN_REGULAR",
+      "name": "SYNTHETIC regular sale",
+      "description": "Synthetic example of an ordinary volume-updating print.",
+      "type": "sale_condition",
+      "asset_class": "options",
+      "data_types": ["trade"],
+      "legacy": false,
+      "sip_mapping": {"OPRA": "SYN1"},
+      "update_rules": {
+        "consolidated": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true},
+        "market_center": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}
+      }
+    },
+    {
+      "id": 9002,
+      "abbreviation": "SYN_OPENING",
+      "name": "SYNTHETIC opening trade",
+      "description": "Synthetic example of an opening-rotation print that updates volume.",
+      "type": "sale_condition",
+      "asset_class": "options",
+      "data_types": ["trade"],
+      "legacy": false,
+      "sip_mapping": {"OPRA": "SYN2"},
+      "update_rules": {
+        "consolidated": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true},
+        "market_center": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}
+      }
+    },
+    {
+      "id": 9003,
+      "abbreviation": "SYN_ISO",
+      "name": "SYNTHETIC intermarket sweep",
+      "description": "Synthetic example of an intermarket sweep order print.",
+      "type": "sale_condition",
+      "asset_class": "options",
+      "data_types": ["trade"],
+      "legacy": false,
+      "sip_mapping": {"OPRA": "SYN3"},
+      "update_rules": {
+        "consolidated": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true},
+        "market_center": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}
+      }
+    },
+    {
+      "id": 9004,
+      "abbreviation": "SYN_FLOOR",
+      "name": "SYNTHETIC floor trade",
+      "description": "Synthetic example of a floor-negotiated single-leg print.",
+      "type": "sale_condition",
+      "asset_class": "options",
+      "data_types": ["trade"],
+      "legacy": false,
+      "sip_mapping": {"OPRA": "SYN4"},
+      "update_rules": {
+        "consolidated": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true},
+        "market_center": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}
+      }
+    },
+    {
+      "id": 9005,
+      "abbreviation": "SYN_CROSS",
+      "name": "SYNTHETIC single-leg cross",
+      "description": "Synthetic example of a single-leg cross print.",
+      "type": "sale_condition",
+      "asset_class": "options",
+      "data_types": ["trade"],
+      "legacy": false,
+      "sip_mapping": {"OPRA": "SYN5"},
+      "update_rules": {
+        "consolidated": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true},
+        "market_center": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}
+      }
+    },
+    {
+      "id": 9006,
+      "abbreviation": "SYN_MULTILEG",
+      "name": "SYNTHETIC multi-leg electronic trade",
+      "description": "Synthetic example of a multi-leg print that reports a net price.",
+      "type": "sale_condition",
+      "asset_class": "options",
+      "data_types": ["trade"],
+      "legacy": false,
+      "sip_mapping": {"OPRA": "SYN6"},
+      "update_rules": {
+        "consolidated": {"updates_high_low": false, "updates_open_close": false, "updates_volume": true},
+        "market_center": {"updates_high_low": false, "updates_open_close": false, "updates_volume": true}
+      }
+    },
+    {
+      "id": 9007,
+      "abbreviation": "SYN_MULTILEG_CROSS",
+      "name": "SYNTHETIC multi-leg cross",
+      "description": "Synthetic example of a multi-leg cross print.",
+      "type": "sale_condition",
+      "asset_class": "options",
+      "data_types": ["trade"],
+      "legacy": false,
+      "sip_mapping": {"OPRA": "SYN7"},
+      "update_rules": {
+        "consolidated": {"updates_high_low": false, "updates_open_close": false, "updates_volume": true},
+        "market_center": {"updates_high_low": false, "updates_open_close": false, "updates_volume": true}
+      }
+    },
+    {
+      "id": 9008,
+      "abbreviation": "SYN_LATE",
+      "name": "SYNTHETIC late report",
+      "description": "Synthetic example of a late print that still updates volume.",
+      "type": "sale_condition",
+      "asset_class": "options",
+      "data_types": ["trade"],
+      "legacy": false,
+      "sip_mapping": {"OPRA": "SYN8"},
+      "update_rules": {
+        "consolidated": {"updates_high_low": false, "updates_open_close": false, "updates_volume": true},
+        "market_center": {"updates_high_low": false, "updates_open_close": false, "updates_volume": true}
+      }
+    },
+    {
+      "id": 9009,
+      "abbreviation": "SYN_LATE_NOVOL",
+      "name": "SYNTHETIC late and out of sequence",
+      "description": "Synthetic example of a late print that does not update volume.",
+      "type": "sale_condition",
+      "asset_class": "options",
+      "data_types": ["trade"],
+      "legacy": false,
+      "sip_mapping": {"OPRA": "SYN9"},
+      "update_rules": {
+        "consolidated": {"updates_high_low": false, "updates_open_close": false, "updates_volume": false},
+        "market_center": {"updates_high_low": false, "updates_open_close": false, "updates_volume": false}
+      }
+    },
+    {
+      "id": 9010,
+      "abbreviation": "SYN_NONVOLUME",
+      "name": "SYNTHETIC non-volume informational print",
+      "description": "Synthetic example of a print that never counts toward volume.",
+      "type": "sale_condition",
+      "asset_class": "options",
+      "data_types": ["trade"],
+      "legacy": false,
+      "sip_mapping": {"OPRA": "SYNA"},
+      "update_rules": {
+        "consolidated": {"updates_high_low": false, "updates_open_close": false, "updates_volume": false},
+        "market_center": {"updates_high_low": false, "updates_open_close": false, "updates_volume": false}
+      }
+    },
+    {
+      "id": 9011,
+      "abbreviation": "SYN_CANCEL",
+      "name": "SYNTHETIC cancel of a prior print",
+      "description": "Synthetic example of a cancel message echoing a prior print.",
+      "type": "sale_condition",
+      "asset_class": "options",
+      "data_types": ["trade"],
+      "legacy": false,
+      "sip_mapping": {"OPRA": "SYNB"},
+      "update_rules": {
+        "consolidated": {"updates_high_low": false, "updates_open_close": false, "updates_volume": false},
+        "market_center": {"updates_high_low": false, "updates_open_close": false, "updates_volume": false}
+      }
+    },
+    {
+      "id": 9012,
+      "abbreviation": "SYN_CANCEL_LAST",
+      "name": "SYNTHETIC cancel of the last print",
+      "description": "Synthetic example of a cancel message for the most recent print.",
+      "type": "sale_condition",
+      "asset_class": "options",
+      "data_types": ["trade"],
+      "legacy": false,
+      "sip_mapping": {"OPRA": "SYNC"},
+      "update_rules": {
+        "consolidated": {"updates_high_low": false, "updates_open_close": false, "updates_volume": false},
+        "market_center": {"updates_high_low": false, "updates_open_close": false, "updates_volume": false}
+      }
+    },
+    {
+      "id": 9013,
+      "abbreviation": "SYN_UNREVIEWED",
+      "name": "SYNTHETIC code present in the payload but never reviewed",
+      "description": "Present so that a provider code without a reviewed interpretation fails closed.",
+      "type": "sale_condition",
+      "asset_class": "options",
+      "data_types": ["trade"],
+      "legacy": false,
+      "sip_mapping": {"OPRA": "SYND"},
+      "update_rules": {
+        "consolidated": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true},
+        "market_center": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}
+      }
+    }
+  ]
+}

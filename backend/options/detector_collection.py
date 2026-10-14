@@ -12,7 +12,7 @@ from uuid import NAMESPACE_URL, uuid5
 from options.analytics.alert_selection import (
     build_detector_run, build_o1_indicator_evidence, build_o3_credit_evidence, build_selection_evidence,
     build_stock_setup_indicator_evidence, build_surface_evidence,
-    select_dual_origin_packages,
+    select_dual_origin_packages, select_o3_credit_observations,
 )
 from options.dual_origin import bind_activity_source, detect_option_participation, qualify_dual_origin_package
 from options.surface_detection import assess_surface_first, bind_surface_source, surface_snapshot_eligible
@@ -357,6 +357,7 @@ class ProductionDetectorSourceReader:
 
     def _v36_observations(self, pending, *, package_sources, legs, stock_rows, scheduled_cycle, regime, rejected):
         from options.alert_qualification import retained_candidate
+        from options.analytics.iv_comparability import comparison_iv
         from options.calendar import OptionExchangeCalendar
         from options.intraday_participation import (
             build_o1_indicator_observation_v3, matched_expressions, opening_measurements, realized_volatility20,
@@ -401,15 +402,17 @@ class ProductionDetectorSourceReader:
                 extras = opening_measurements(rows_by_ticker[source.underlyer], session_date=session,
                     session_open=session_open, decision_at=decision.decision_at, direction=direction,
                     prior_close=float(daily[-1]["close_price"]) if daily else None)
+                activity_iv, activity_iv_reasons = comparison_iv(matched["snapshot"])
                 extras.update(spy_session_return=session_return("SPY", session, decision.decision_at),
                     qqq_session_return=session_return("QQQ", session, decision.decision_at),
                     activity_dte=(source.expiration_date - session).days,
-                    activity_iv=matched["snapshot"].local_iv, rv20_cc_annual=rv20)
+                    activity_iv=activity_iv, rv20_cc_annual=rv20)
                 expressions = matched_expressions(candidates, underlyer=source.underlyer, direction=direction,
                     session_date=session, activity_contract_ids=detected[(source.underlyer, direction)], rv20=rv20)
                 observations.append(build_o1_indicator_observation_v3(source, decision, matched.get("intraday_stock"),
                     scheduled_cycle=scheduled_cycle, regime=regime, prior_same_direction=prior,
-                    extras=extras, expressions=expressions))
+                    extras=extras, expressions=expressions,
+                    unavailable_reasons={"activity_iv": activity_iv_reasons}))
             except (KeyError, TypeError, ValueError, ArithmeticError):
                 rejected["O1_V3_OBSERVATION_UNAVAILABLE"] += 1
         return observations
@@ -864,22 +867,8 @@ class DetectorCycleCollector:
         prior_o3 = (self.evaluation_repository.prior_o3_observed(dataset_id=dataset_id,
             scheduled_cycle=scheduled_cycle, as_of=selected_at)
             if hasattr(self.evaluation_repository, "prior_o3_observed") else set())
-        eligible_o3 = tuple(row for row in inputs.o3_observations if row.recurrence_sha256 not in prior_o3)
-        repeat_o3 = len(inputs.o3_observations) - len(eligible_o3)
-        if repeat_o3:
-            rejected["O3_REPEAT"] += repeat_o3
-        lanes = set()
-        new_o3 = []
-        for row in sorted(eligible_o3, key=lambda item: (item.candidate_rank, item.underlyer, item.direction, str(item.candidate_id))):
-            lane = (row.underlyer, row.direction)
-            if lane in lanes:
-                rejected["LOWER_RANK_O3_UNDERLYING_DIRECTION"] += 1
-                continue
-            lanes.add(lane)
-            new_o3.append(row)
-        if len(new_o3) > 10:
-            rejected["O3_RUN_CAP"] += len(new_o3) - 10
-            new_o3 = new_o3[:10]
+        new_o3, o3_rejections = select_o3_credit_observations(inputs.o3_observations, prior_o3)
+        rejected.update(o3_rejections)
         prior_setups = (self.evaluation_repository.prior_stock_setup_observed(dataset_id=dataset_id,
             scheduled_cycle=scheduled_cycle, as_of=selected_at)
             if hasattr(self.evaluation_repository, "prior_stock_setup_observed") else set())

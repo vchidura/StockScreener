@@ -436,6 +436,24 @@ class O3CreditEvaluationEvidence(Contract):
         return self
 
 
+def select_o3_credit_observations(observations, prior_recurrences):
+    eligible = tuple(row for row in observations if row.recurrence_sha256 not in prior_recurrences)
+    rejected = Counter()
+    if len(observations) != len(eligible):
+        rejected["O3_REPEAT"] = len(observations) - len(eligible)
+    lanes, selected = set(), []
+    for row in sorted(eligible, key=lambda item: (item.candidate_rank, item.underlyer, item.direction, str(item.candidate_id))):
+        lane = (row.underlyer, row.direction)
+        if lane in lanes:
+            rejected["LOWER_RANK_O3_UNDERLYING_DIRECTION"] += 1
+            continue
+        lanes.add(lane)
+        selected.append(row)
+    if len(selected) > 10:
+        rejected["O3_RUN_CAP"] = len(selected) - 10
+    return tuple(selected[:10]), dict(rejected)
+
+
 def build_o3_credit_evidence(observations, *, dataset_id, selected_at):
     if len(observations) > 5000:
         raise ValueError("O3 credit evaluation exceeds input bound")

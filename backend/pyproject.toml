@@ -28,6 +28,7 @@ dependencies = [
     "yfinance>=0.2.36",
     "finnhub-python>=2.4.19",
     "websocket-client>=1.7.0",
+    "websockets==17.0.1",
     "python-dotenv>=1.0.0",
     "pydantic>=2.5.3",
     "numpy>=1.26.3",
@@ -42,7 +43,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
-    "httpx>=0.25.0",
+    "httpx>=0.25.0,<0.28",
 ]
 
 [project.scripts]
@@ -61,3 +62,4 @@ exclude = ["tests*", "scripts*", "src*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.env.example"]
+"realtime" = ["sql/*.sql"]

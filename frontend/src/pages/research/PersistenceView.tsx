@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react'
 import { scanStreak, getTickersOverview, type StreakResult, type TickerOverviewRow } from '../../services/api'
 import './persistence.css'
+import RealtimeSessionPersistenceView from './RealtimeSessionPersistenceView'
 
 const STRATEGIES = [
   { value: 'gaps', label: 'Gap & Imbalance', direction: 'Both' },
@@ -144,6 +145,10 @@ type Row = {
 }
 
 export default function PersistenceView() {
+  return import.meta.env.VITE_REALTIME_ONLY === 'true' ? <RealtimeSessionPersistenceView /> : <CanonicalPersistenceView />
+}
+
+function CanonicalPersistenceView() {
   const navigate = useNavigate()
   const [strategyFilter, setStrategyFilter] = useState<string>('all')
   const [groupBy, setGroupBy] = useState<'none' | 'strategy' | AxisKey>('none')

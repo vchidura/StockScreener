@@ -46,7 +46,7 @@ from options.calendar import OptionExchangeCalendar  # noqa: E402
 from options.config import load_option_runtime_configuration  # noqa: E402
 from options.domain import ContractType  # noqa: E402
 
-BASE_URL = "https://api.polygon.io"
+BASE_URL = "https://api.massive.com"
 DEFAULT_OUTPUT = BACKEND_DIR.parent / "docs" / "option_historical_iv_probe.json"
 
 SQL_SESSION_CLOSES = """

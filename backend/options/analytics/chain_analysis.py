@@ -10,7 +10,18 @@ from statistics import median
 from uuid import UUID
 
 from options.domain import ContractType, OptionContractSnapshot, OptionExpirationAnalytics
+from options.analytics.iv_comparability import (
+    DEFAULT_IV_COMPARABILITY_POLICY,
+    IvComparability,
+    IvComparabilityPolicy,
+    classify_iv_comparability,
+    summarize_iv_comparability,
+)
 from options.analytics.oi_walls import OiWallInput, detect_oi_wall_clusters
+
+# Four rows (both bracketing strikes, both types) are required; an in-the-money put at the
+# upper strike is normally excluded, so three comparable rows are enough for the median.
+_MINIMUM_COMPARABLE_ATM_ROWS = 3
 
 
 class ContractMoneyness(str, Enum):
@@ -188,13 +199,36 @@ def analyze_expirations(
     minimum_oi_wall_robust_z: float = 2.5,
     maximum_oi_wall_clusters: int = 5,
     allow_zero_mad_wall_fallback: bool = False,
+    iv_comparability_policy: IvComparabilityPolicy | None = DEFAULT_IV_COMPARABILITY_POLICY,
 ) -> tuple[OptionExpirationAnalytics, ...]:
+    """Per-expiration analytics.
+
+    ATM IV and the 25-delta IVs compare IV across contracts, so only contracts that pass
+    `iv_comparability_policy` enter them (None restores the legacy all-contract behavior).
+    The counts and reasons of excluded contracts are recorded in the diagnostics JSON.
+    """
     grouped: dict[object, list[ExpirationContractInput]] = {}
     for contract in contracts:
         grouped.setdefault(contract.expiration_date, []).append(contract)
     results: list[OptionExpirationAnalytics] = []
     for expiration_date in sorted(grouped):
         rows = grouped[expiration_date]
+        classified: dict[int, IvComparability] = {}
+
+        def comparable(row: ExpirationContractInput) -> bool:
+            if iv_comparability_policy is None:
+                return True
+            if row.contract_id not in classified:
+                classified[row.contract_id] = _classify(row, iv_comparability_policy)
+            return classified[row.contract_id].comparable
+
+        def summary(subset: list[ExpirationContractInput]) -> dict[str, object]:
+            for row in subset:
+                comparable(row)
+            return summarize_iv_comparability(
+                (classified[row.contract_id] for row in subset), iv_comparability_policy
+            ).to_dict()
+
         maturity = median(row.time_to_expiration_years for row in rows)
         forwards = [
             float(row.spot)
@@ -206,6 +240,7 @@ def analyze_expirations(
         upper_strikes = sorted({float(row.strike) for row in rows if float(row.strike) > forward})
         reasons = ["DEVELOPER_QUOTES_NOT_AVAILABLE"]
         atm_iv = None
+        atm_diagnostics = None
         if lower_strikes and upper_strikes:
             lower_strike = lower_strikes[-1]
             upper_strike = upper_strikes[0]
@@ -215,17 +250,25 @@ def analyze_expirations(
                 if float(row.strike) in (lower_strike, upper_strike)
             ]
             if len(atm_rows) >= 4:
-                atm_iv = median(row.local_iv for row in atm_rows)
+                usable = [row for row in atm_rows if comparable(row)]
+                if iv_comparability_policy is not None:
+                    atm_diagnostics = summary(atm_rows)
+                if len(usable) >= _MINIMUM_COMPARABLE_ATM_ROWS:
+                    atm_iv = median(row.local_iv for row in usable)
+                else:
+                    reasons.append("ATM_IV_NOT_COMPARABLE")
         if atm_iv is None:
             reasons.append("ATM_IV_INSUFFICIENT")
+        calls = [row for row in rows if row.contract_type is ContractType.CALL]
+        puts = [row for row in rows if row.contract_type is ContractType.PUT]
         call_25 = _interpolate_delta(
-            rows,
+            [row for row in calls if comparable(row)],
             ContractType.CALL,
             0.25,
             maximum_delta_interpolation_gap,
         )
         put_25 = _interpolate_delta(
-            rows,
+            [row for row in puts if comparable(row)],
             ContractType.PUT,
             -0.25,
             maximum_delta_interpolation_gap,
@@ -237,8 +280,6 @@ def analyze_expirations(
         call_skew = call_25 - atm_iv if call_25 is not None and atm_iv is not None else None
         put_skew = put_25 - atm_iv if put_25 is not None and atm_iv is not None else None
         risk_reversal = call_25 - put_25 if call_25 is not None and put_25 is not None else None
-        calls = [row for row in rows if row.contract_type is ContractType.CALL]
-        puts = [row for row in rows if row.contract_type is ContractType.PUT]
         call_volume = sum(row.day_volume or 0 for row in calls)
         put_volume = sum(row.day_volume or 0 for row in puts)
         call_oi = sum(row.open_interest or 0 for row in calls)
@@ -250,6 +291,13 @@ def analyze_expirations(
             "call_25_delta_available": call_25 is not None,
             "put_25_delta_available": put_25 is not None,
         }
+        if iv_comparability_policy is not None:
+            diagnostics["iv_comparability"] = {
+                "policy_version": iv_comparability_policy.version,
+                "atm_iv": atm_diagnostics,
+                "call_25_delta": summary(calls),
+                "put_25_delta": summary(puts),
+            }
         concentration = {
             "maximum_contract_oi_fraction": max_oi / total_oi if total_oi else None,
             "put_call_volume_ratio": put_volume / call_volume if call_volume else None,
@@ -323,6 +371,19 @@ def analyze_expirations(
             term_slope=change / maturity_gap,
         )
     return tuple(results)
+
+
+def _classify(row: ExpirationContractInput, policy: IvComparabilityPolicy) -> IvComparability:
+    return classify_iv_comparability(
+        contract_type=row.contract_type,
+        spot=row.spot,
+        strike=row.strike,
+        time_to_expiration_years=row.time_to_expiration_years,
+        risk_free_rate=row.risk_free_rate,
+        dividend_yield=row.dividend_yield,
+        local_iv=row.local_iv,
+        policy=policy,
+    )
 
 
 def _interpolate_delta(

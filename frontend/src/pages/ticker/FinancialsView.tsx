@@ -17,9 +17,10 @@ const margin = (numerator: number | string | null, denominator: number | string 
   return `${((top / bottom) * 100).toFixed(1)}%`
 }
 
-export default function FinancialsView({ profile, loading }: {
+export default function FinancialsView({ profile, loading, availabilityError }: {
   profile: EquitySecurityProfileResponse | null
   loading: boolean
+  availabilityError?: string | null
 }) {
   const reports = profile?.fundamental_reports ?? []
 
@@ -33,10 +34,11 @@ export default function FinancialsView({ profile, loading }: {
         {reports.length > 0 && <span className="ticker-panel__count">{reports.length} periods</span>}
       </header>
 
+      {availabilityError && reports.length > 0 && <p role="alert" className="ticker-panel__empty">{availabilityError}</p>}
       {loading && reports.length === 0 ? (
         <p className="ticker-panel__empty">Loading fundamental reports…</p>
       ) : reports.length === 0 ? (
-        <p className="ticker-panel__empty">No fundamental reports are stored for this ticker.</p>
+        <p role={availabilityError ? 'alert' : undefined} className="ticker-panel__empty">{availabilityError ?? 'No fundamental reports are stored for this ticker.'}</p>
       ) : (
         <div className="ticker-table-wrap">
           <table className="ticker-table">

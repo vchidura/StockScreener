@@ -23,6 +23,7 @@ class IvFailureReason(str, Enum):
     ABOVE_NO_ARBITRAGE_BOUND = "ABOVE_NO_ARBITRAGE_BOUND"
     IV_OUT_OF_BOUNDS = "IV_OUT_OF_BOUNDS"
     IV_CONVERGENCE_FAILED = "IV_CONVERGENCE_FAILED"
+    IV_NOT_IDENTIFIABLE = "IV_NOT_IDENTIFIABLE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,10 +77,20 @@ def solve_local_greeks(
     price_error_tolerance: float = 1e-6,
     minimum_vega: float = 1e-8,
     use_brent_fallback: bool = True,
+    maximum_iv_uncertainty: float = 0.01,
 ) -> tuple[LocalGreeksResult, ...]:
+    """Solve local IV and Greeks from option marks (Black-Scholes, European, continuous dividend yield).
+
+    An IV is reported only if it is identifiable. A volatility that reproduces the mark within the
+    price tolerance is not enough: where the price is almost flat in volatility (deep in the money,
+    almost no time left, far out of the money) a wide range of volatilities fit the mark. The IV must
+    change the price by more than the tolerance when moved by +/- `maximum_iv_uncertainty` (volatility
+    units, default 0.01 = one volatility point), and vega must be at least `minimum_vega`. Otherwise
+    the row fails with IV_NOT_IDENTIFIABLE instead of echoing an arbitrary volatility.
+    """
     if not inputs:
         return ()
-    if minimum_iv <= 0 or maximum_iv <= minimum_iv:
+    if minimum_iv <= 0 or maximum_iv <= minimum_iv or maximum_iv_uncertainty <= 0:
         raise ValueError("IV bounds are invalid")
     count = len(inputs)
     spot = np.asarray([float(item.spot) for item in inputs], dtype=np.float64)
@@ -204,6 +215,35 @@ def solve_local_greeks(
             converged[index] = True
             solvers[index] = IvSolver.BRENT
             iteration_counts[index] += brent_iterations
+
+    solved = np.flatnonzero(converged)
+    if solved.size:
+        sigma = volatility[solved]
+        lower = np.maximum(sigma - maximum_iv_uncertainty, minimum_iv)
+        upper = np.minimum(sigma + maximum_iv_uncertainty, maximum_iv)
+
+        def priced(values):
+            return _price_and_vega(
+                safe_spot[solved], safe_strike[solved], safe_maturity[solved], rate[solved], dividend[solved],
+                values, is_call[solved],
+            )
+
+        _, vega_at_solution = priced(sigma)
+        lower_gap = np.where(
+            sigma - lower >= 0.5 * maximum_iv_uncertainty,
+            np.abs(priced(lower)[0] - mark[solved]), np.inf)
+        upper_gap = np.where(
+            upper - sigma >= 0.5 * maximum_iv_uncertainty,
+            np.abs(priced(upper)[0] - mark[solved]), np.inf)
+        flat = (
+            ~(np.abs(vega_at_solution) >= minimum_vega)
+            | (lower_gap <= price_error_tolerance)
+            | (upper_gap <= price_error_tolerance)
+        )
+        for index in solved[flat]:
+            converged[index] = False
+            solvers[index] = None
+            failures[index] = IvFailureReason.IV_NOT_IDENTIFIABLE
 
     results: list[LocalGreeksResult] = []
     for index in range(count):

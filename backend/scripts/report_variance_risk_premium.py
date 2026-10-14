@@ -29,6 +29,7 @@ load_dotenv(BACKEND_DIR / ".env")
 
 from database import get_db_cursor  # noqa: E402
 from options.analytics.greeks import OptionValuationInput, solve_local_greeks  # noqa: E402
+from options.analytics.iv_comparability import DEFAULT_IV_COMPARABILITY_POLICY  # noqa: E402
 from options.analytics.realized_volatility import (  # noqa: E402
     DailyBar,
     build_bar_series,
@@ -37,9 +38,9 @@ from options.analytics.realized_volatility import (  # noqa: E402
 )
 from options.analytics.volatility_risk_premium import (  # noqa: E402
     ContractIvObservation,
+    assess_expiration_atm_iv,
     calculate_variance_risk_premium,
     interpolate_total_variance,
-    summarize_expiration_atm_iv,
 )
 from options.calendar import OptionExchangeCalendar  # noqa: E402
 from options.config import (  # noqa: E402
@@ -132,6 +133,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--horizons", default="7,21,45")
     parser.add_argument("--maximum-log-moneyness", type=float, default=0.03)
     parser.add_argument("--contracts-per-side", type=int, default=2)
+    parser.add_argument(
+        "--legacy-atm-selection",
+        action="store_true",
+        help=(
+            "Reproduce earlier studies: use the nearest contracts even when their IV carries "
+            "the European-model American-exercise bias or too little vega (see iv_comparability)."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     return parser.parse_args()
 
@@ -270,6 +279,9 @@ def _option_iv_points(
                 strike=strike,
                 spot=spot,
                 implied_volatility=result.local_iv,
+                risk_free_rate=risk_free_rate,
+                dividend_yield=dividend_yields[session],
+                vega_per_vol_point=result.local_vega_per_vol_point,
             )
         )
         converged += 1
@@ -289,10 +301,14 @@ def _matched_iv(
     horizons: tuple[int, ...],
     maximum_log_moneyness: float,
     contracts_per_side: int,
-) -> tuple[dict[int, dict[date, Any]], dict[str, int]]:
+    comparability_policy=None,
+) -> tuple[dict[int, dict[date, Any]], dict[str, Any]]:
     matched: dict[int, dict[date, Any]] = {horizon: {} for horizon in horizons}
     expiration_points = 0
     rejected_expirations = 0
+    excluded_contracts = 0
+    exclusion_reasons: dict[str, int] = defaultdict(int)
+    unavailable_reasons: dict[str, int] = defaultdict(int)
     sessions_with_lower = {horizon: 0 for horizon in horizons}
     sessions_with_upper = {horizon: 0 for horizon in horizons}
     maximum_maturity = 0.0
@@ -302,17 +318,24 @@ def _matched_iv(
             by_expiration[contract.expiration_date].append(contract)
         points = []
         for rows in by_expiration.values():
-            point = summarize_expiration_atm_iv(
+            assessment = assess_expiration_atm_iv(
                 tuple(rows),
                 maximum_absolute_log_moneyness=maximum_log_moneyness,
                 contracts_per_side=contracts_per_side,
+                comparability_policy=comparability_policy,
             )
+            point = assessment.point
             if point is None:
                 rejected_expirations += 1
+                for reason in assessment.unavailable_reasons:
+                    unavailable_reasons[reason] += 1
             else:
                 points.append(point)
                 expiration_points += 1
                 maximum_maturity = max(maximum_maturity, point.maturity_years)
+                excluded_contracts += point.excluded_contract_count
+                for reason, count in point.excluded_reason_counts:
+                    exclusion_reasons[reason] += count
         for horizon in horizons:
             target = horizon / 252
             sessions_with_lower[horizon] += any(
@@ -328,6 +351,9 @@ def _matched_iv(
         "sessions_with_contract_iv": len(by_session),
         "expiration_points": expiration_points,
         "rejected_expirations": rejected_expirations,
+        "rejected_expiration_reasons": dict(sorted(unavailable_reasons.items())),
+        "skipped_non_comparable_contracts": excluded_contracts,
+        "skipped_contract_reasons": dict(sorted(exclusion_reasons.items())),
         "maximum_expiration_maturity_years": maximum_maturity,
         "sessions_with_lower_expiration": sessions_with_lower,
         "sessions_with_upper_expiration": sessions_with_upper,
@@ -447,11 +473,13 @@ def main() -> int:
         dividends,
         float(configuration.settings.risk_free_rate),
     )
+    comparability_policy = None if args.legacy_atm_selection else DEFAULT_IV_COMPARABILITY_POLICY
     matched, match_counts = _matched_iv(
         contract_iv,
         horizons,
         args.maximum_log_moneyness,
         args.contracts_per_side,
+        comparability_policy,
     )
 
     variance = _intraday_variance(ticker, policy.intraday_interval, adjusted.sessions)
@@ -461,7 +489,19 @@ def main() -> int:
         "status": "PRELIMINARY_RESEARCH_ONLY",
         "forecast_policy_version": policy.forecast_policy_version,
         "forecast_policy_sha256": forecast_artifact.sha256,
-        "iv_method": "LOCAL_BLACK_SCHOLES_ATM_CALL_PUT_MEDIAN_TOTAL_VARIANCE_INTERPOLATION",
+        "iv_method": (
+            "LOCAL_BLACK_SCHOLES_ATM_CALL_PUT_MEDIAN_TOTAL_VARIANCE_INTERPOLATION"
+            if comparability_policy is None
+            else "LOCAL_BLACK_SCHOLES_COMPARABLE_ATM_CALL_PUT_MEDIAN_TOTAL_VARIANCE_INTERPOLATION"
+        ),
+        "iv_comparability_policy": (
+            None if comparability_policy is None else {
+                "version": comparability_policy.version,
+                "itm_tolerance": comparability_policy.itm_tolerance,
+                "carry_floor": comparability_policy.carry_floor,
+                "minimum_vega_per_vol_point": comparability_policy.minimum_vega_per_vol_point,
+            }
+        ),
         "maximum_absolute_log_moneyness": args.maximum_log_moneyness,
         "contracts_per_side": args.contracts_per_side,
         "mark_source": "PROVIDER_DAILY_AGGREGATE_ADJUSTED",

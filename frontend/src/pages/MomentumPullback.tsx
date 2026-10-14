@@ -1,5 +1,10 @@
+import { sortHeaderProps } from './strategyShared'
+import './strategyPages.css'
 import { useState, useMemo, useCallback } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { getDailyScannerPublication } from '../services/api'
+import { usePublicationQuery, useStrategyInterval } from './publicationNavigation'
+import { StrategyPublicationError, strategyEmptyMessage } from './StrategyPublication'
+import { StrategyTickerButton } from './StrategyTickerButton'
 import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-query'
 import { scanMomentumPullback, MomentumPullbackScanResponse } from '../services/api'
 import { ScanInterval, SCAN_INTERVALS, intervalSemantics, isPublishedSnapshot } from './strategyShared'
@@ -8,18 +13,18 @@ import { useSessionDate } from '../layout/sessionDate'
 import { CommandBar, CommandGroup, CommandSpacer } from '../layout/PageChrome'
 
 const STRATEGY_TOOLTIP =
-  'Finds stocks in strong uptrends with optimal pullback entries. Trade WITH the trend, enter ON the pullback.\n\n' +
-  '1. TREND ANCHOR: Daily EMA 8>21>34>55>89 stack, weekly EMA 8>21>34, price above 200 SMA.\n' +
-  '2. PULLBACK ZONE: Slow Stochastic %K < 40 (oversold in uptrend), ADX 20-60 (healthy trend), price within 1 ATR of EMA 21 (rubber band).\n' +
-  '3. ENTRY SCORE: Composite A+ to C grade based on stochastic depth, EMA 21 proximity, stack alignment, relative volume, and ADX strength.'
+  'Describes pullbacks within an uptrend using research heuristics, not trading recommendations.\n\n' +
+  '1. TREND ANCHOR: At least 2 daily stacked EMA pairs, plus weekly EMA stack or price above 200 SMA.\n' +
+  '2. PULLBACK ZONE: Slow Stochastic %K < 40, ADX 15-55, price within 2 ATR of EMA 21, RSI 30-60.\n' +
+  '3. HEURISTIC SCORE: Composite A+ to C grade based on stochastic depth, EMA 21 proximity, stack alignment, relative volume, and ADX strength.'
 
 const PILLAR_TOOLTIPS = {
-  dailyStack: 'Daily EMA 8 > 21 > 34 > 55 > 89 — all five exponential moving averages aligned bullishly. Stack count shows how many consecutive pairs are in order (max 4).',
+  dailyStack: 'Daily EMA order 8 > 21 > 34 > 55 > 89. At least 2 of the 4 consecutive pairs must be aligned, plus weekly stack OR the 200-day SMA gate.',
   weeklyStack: 'Weekly EMA 8 > 21 > 34 — confirms the uptrend on the higher timeframe. Resampled from daily data.',
   sma200: 'Price must be above the 200-day SMA, confirming a long-term uptrend. Institutional investors use this as a baseline health indicator.',
   stochastic: 'Slow Stochastic %K (14,3,3). Values below 40 indicate the stock has pulled back within an uptrend — an "oversold in context" reading, not a weakening trend.',
-  adx: 'Average Directional Index (14). Values 20-60 indicate a healthy trending market. Below 20 = no trend; above 60 = overextended.',
-  rubberBand: 'Price must be within 1 ATR (14) of EMA 21. Like a rubber band stretched from the mean — it snaps back. This ensures price is near support.',
+  adx: 'Average Directional Index (14). The detector admits values 15-55.',
+  rubberBand: 'Price must be within 2 ATR (14) of EMA 21. This is a proximity rule, not a prediction.',
   relVolume: 'Current volume vs 20-day average. Higher relative volume at pullback support strengthens the entry signal.',
   grade: 'Entry Quality Score — A+ (≥90), A (≥80), B+ (≥70), B (≥60), C (<60). Weighted by: Stoch depth (30%), EMA21 proximity (25%), stack alignment (20%), rel. volume (15%), ADX (10%).',
 }
@@ -60,25 +65,34 @@ type SortKey = 'ticker' | 'last_close' | 'score' | 'stoch_k' | 'adx' | 'dist_to_
 type SortDir = 'asc' | 'desc'
 
 function MomentumPullback() {
-  const navigate = useNavigate()
+  const realtimeOnly = import.meta.env.VITE_REALTIME_ONLY === 'true'
   const queryClient = useQueryClient()
   const [filter, setFilter] = useState('')
   const [gradeFilter, setGradeFilter] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('score')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
   const { pinned: scanDate } = useSessionDate()
-  const [interval, setInterval] = useState<ScanInterval>('1d')
-  const { data, isFetching: loading } = useQuery<MomentumPullbackScanResponse>({
+  const [canonicalInterval, setCanonicalInterval] = useState<ScanInterval>('1d')
+  const storedInterval = useStrategyInterval()
+  const interval = realtimeOnly ? storedInterval.interval : canonicalInterval
+  const setInterval = (value: ScanInterval) => realtimeOnly ? storedInterval.setInterval(value === '1h' ? '1h' : '1d') : setCanonicalInterval(value)
+  const realtimeQuery = usePublicationQuery('daily-momentum-pullback', pin => getDailyScannerPublication('momentum-pullback', pin, interval === '1h' ? '1h' : '1d'))
+  const canonicalQuery = useQuery<MomentumPullbackScanResponse>({
     queryKey: ['scan', 'momentum-pullback', interval, scanDate],
     queryFn: () => scanMomentumPullback(undefined, scanDate || undefined, interval),
     placeholderData: keepPreviousData,
+    enabled: !realtimeOnly,
   })
+  const data = realtimeOnly ? realtimeQuery.data?.data : canonicalQuery.data
+  const loading = realtimeOnly ? realtimeQuery.loading : canonicalQuery.isFetching
+  const error = realtimeOnly ? realtimeQuery.error : canonicalQuery.error?.message
 
   const handleRefresh = useCallback(async () => {
+    if (realtimeOnly) return realtimeQuery.refresh()
     const key = ['scan', 'momentum-pullback', interval, scanDate]
     queryClient.setQueryData(key, undefined)
     await queryClient.fetchQuery({ queryKey: key, queryFn: () => scanMomentumPullback(undefined, scanDate || undefined, interval, true) })
-  }, [interval, scanDate, queryClient])
+  }, [interval, scanDate, queryClient, realtimeOnly, realtimeQuery.refresh])
 
   const filtered = useMemo(() => {
     if (!data?.results) return []
@@ -140,10 +154,10 @@ function MomentumPullback() {
     )
 
   return (
-    <div>
+    <div className="strategy-workspace">
       <CommandBar>
         <CommandGroup label="Interval">
-          {SCAN_INTERVALS.map((iv) => (
+          {SCAN_INTERVALS.filter(iv => !realtimeOnly || iv === '1d' || iv === '1h').map((iv) => (
             <button
               key={iv}
               type="button"
@@ -156,11 +170,12 @@ function MomentumPullback() {
           ))}
         </CommandGroup>
         <CommandSpacer />
-        <span className="tm-commandbar__note">{filtered.length} of {data?.results.length ?? 0} matches</span>
+        <span className="tm-commandbar__note">{realtimeOnly && !data ? 'Publication unavailable' : `${filtered.length} of ${data?.results.length ?? 0} matches`}</span>
         <button type="button" className="tm-commandbar__action" onClick={handleRefresh} disabled={loading}>
-          {loading ? 'Scanning…' : 'Refresh'}
+          {loading ? (realtimeOnly ? 'Reading…' : 'Scanning…') : 'Refresh'}
         </button>
       </CommandBar>
+      <StrategyPublicationError error={error} publication={realtimeOnly ? realtimeQuery.data?.publication : undefined} />
 
       {/* Provenance + interval semantics */}
       <div
@@ -176,7 +191,7 @@ function MomentumPullback() {
           {published ? 'Published daily snapshot' : 'Live scan'}
         </strong>
         <span style={{ color: 'var(--text-secondary)' }}>
-          {published
+          {realtimeOnly ? 'Stored defaults for the selected realtime cohort.' : published
             ? 'Precomputed nightly across the full universe on daily candles.'
             : `Computed on request over the full universe using ${semantics.candle.toLowerCase()}.`}
         </span>
@@ -196,19 +211,19 @@ function MomentumPullback() {
           <span style={{ fontSize: '1.5rem' }}>📊</span>
           <div>
             <div style={{ fontWeight: 700, fontSize: '1.1rem' }}>Elite Momentum Pullback Methodology</div>
-            <div style={{ fontSize: '0.8rem', color: 'var(--success)', fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>High-Probability Trend Trading</div>
+            <div style={{ fontSize: '0.8rem', color: 'var(--success)', fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>Research Heuristics - Not Probabilities</div>
           </div>
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '1.25rem' }}>
           <div>
             <h4 style={{ color: 'var(--success)', marginBottom: '0.5rem' }}>1. The Trend Anchor</h4>
             <p style={{ fontSize: '0.85rem', margin: '0.25rem 0' }}>
-              {checkMark(true)} <strong>Daily Stack:</strong> EMA 8 {'>'} 21 {'>'} 34 {'>'} 55 {'>'} 89
+              {checkMark(true)} <strong>Daily Stack:</strong> At least 2 of 4 EMA pairs, 8 {'>'} 21 {'>'} 34 {'>'} 55 {'>'} 89
               <InfoIcon tooltip={PILLAR_TOOLTIPS.dailyStack} />
             </p>
             <p style={{ fontSize: '0.85rem', margin: '0.25rem 0', opacity: semantics.higherTfLabel ? 1 : 0.55 }}>
               {gateMark(true, !!semantics.higherTfLabel, 'Not evaluated at this interval')}{' '}
-              <strong>Higher timeframe:</strong>{' '}
+              <strong>Higher timeframe (or baseline):</strong>{' '}
               {semantics.higherTfLabel ?? 'not evaluated at this interval'}
               <InfoIcon tooltip={PILLAR_TOOLTIPS.weeklyStack} />
             </p>
@@ -226,11 +241,11 @@ function MomentumPullback() {
               <InfoIcon tooltip={PILLAR_TOOLTIPS.stochastic} />
             </p>
             <p style={{ fontSize: '0.85rem', margin: '0.25rem 0' }}>
-              {checkMark(true)} <strong>ADX Strength:</strong> 20 – 60
+              {checkMark(true)} <strong>ADX Strength:</strong> 15 – 55
               <InfoIcon tooltip={PILLAR_TOOLTIPS.adx} />
             </p>
             <p style={{ fontSize: '0.85rem', margin: '0.25rem 0' }}>
-              <span style={{ color: 'var(--tm-warn)', fontWeight: 700 }}>!</span> <strong>Rubber Band:</strong> Within 1 ATR of EMA 21
+              <span style={{ color: 'var(--tm-warn)', fontWeight: 700 }}>!</span> <strong>Rubber Band:</strong> Within 2 ATR of EMA 21; RSI 30–60
               <InfoIcon tooltip={PILLAR_TOOLTIPS.rubberBand} />
             </p>
           </div>
@@ -244,25 +259,25 @@ function MomentumPullback() {
         </div>
       </div>
 
-      {loading && (
+      {loading && !data && (
         <div className="loading">
           <div className="spinner"></div>
-          <span>Scanning momentum pullback setups across all tickers...</span>
+          <span>{realtimeOnly ? `Reading stored ${interval} momentum publication...` : 'Scanning momentum pullback setups across all tickers...'}</span>
         </div>
       )}
 
-      {!loading && data && (
+      {(realtimeOnly || !loading) && data && (
         <>
           {/* Filters */}
           <div className="filter-bar">
-            <input
+            <input aria-label="Search ticker..."
               type="text"
               placeholder="Search ticker..."
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
               style={{ minWidth: '160px' }}
             />
-            <select
+            <select aria-label="All Grades"
               value={gradeFilter}
               onChange={(e) => setGradeFilter(e.target.value)}
               style={{ minWidth: '120px' }}
@@ -270,8 +285,8 @@ function MomentumPullback() {
               <option value="">All Grades</option>
               {allGrades.map(g => <option key={g} value={g}>{g}</option>)}
             </select>
-            <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
-              {data.total_scanned} scanned &middot; {filtered.length} qualifying setups
+            <span>
+              {data.total_scanned} {realtimeOnly ? 'cohort members' : 'scanned'} &middot; {filtered.length} qualifying setups
             </span>
           </div>
 
@@ -280,22 +295,22 @@ function MomentumPullback() {
             <table className="data-table">
               <thead>
                 <tr>
-                  <th onClick={() => handleSort('ticker')} style={thStyle('ticker')}>
+                  <th {...sortHeaderProps(() => handleSort('ticker'), sortKey === 'ticker', sortDir)} style={thStyle('ticker')}>
                     Ticker{sortArrow('ticker')}
                   </th>
-                  <th onClick={() => handleSort('score')} style={thStyle('score', 'center')}>
+                  <th {...sortHeaderProps(() => handleSort('score'), sortKey === 'score', sortDir)} style={thStyle('score', 'center')}>
                     <span style={{ whiteSpace: 'nowrap' }}>Grade{sortArrow('score')}<InfoIcon tooltip={PILLAR_TOOLTIPS.grade} /></span>
                   </th>
-                  <th onClick={() => handleSort('last_close')} style={thStyle('last_close', 'right')}>
+                  <th {...sortHeaderProps(() => handleSort('last_close'), sortKey === 'last_close', sortDir)} style={thStyle('last_close', 'right')}>
                     Close{sortArrow('last_close')}
                   </th>
-                  <th onClick={() => handleSort('volume')} style={thStyle('volume', 'right')}>
+                  <th {...sortHeaderProps(() => handleSort('volume'), sortKey === 'volume', sortDir)} style={thStyle('volume', 'right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>Volume{sortArrow('volume')}<InfoIcon tooltip="Latest daily trading volume and relative volume (vs 20-day avg). Higher relative volume at pullback support strengthens the signal." /></span>
                   </th>
-                  <th onClick={() => handleSort('rsi')} style={thStyle('rsi', 'right')}>
+                  <th {...sortHeaderProps(() => handleSort('rsi'), sortKey === 'rsi', sortDir)} style={thStyle('rsi', 'right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>RSI{sortArrow('rsi')}<InfoIcon tooltip="Relative Strength Index (14-period). Below 30 = oversold, above 70 = overbought. In a momentum pullback context, RSI 30-50 confirms the pullback without breaking the trend." /></span>
                   </th>
-                  <th onClick={() => handleSort('sma200')} style={thStyle('sma200', 'center')}>
+                  <th {...sortHeaderProps(() => handleSort('sma200'), sortKey === 'sma200', sortDir)} style={thStyle('sma200', 'center')}>
                     <span style={{ whiteSpace: 'nowrap', opacity: semantics.baselineLabel ? 1 : 0.55 }}>
                       {semantics.baselineLabel ? `>${semantics.baselineLabel}` : '>SMA n/a'}
                       {sortArrow('sma200')}
@@ -304,13 +319,13 @@ function MomentumPullback() {
                         : 'Not evaluated at this interval — the intraday scan skips the 200-period baseline entirely and tightens the EMA stack requirement instead.'} />
                     </span>
                   </th>
-                  <th onClick={() => handleSort('stoch_k')} style={thStyle('stoch_k', 'right')}>
+                  <th {...sortHeaderProps(() => handleSort('stoch_k'), sortKey === 'stoch_k', sortDir)} style={thStyle('stoch_k', 'right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>Stoch %K{sortArrow('stoch_k')}<InfoIcon tooltip={PILLAR_TOOLTIPS.stochastic} /></span>
                   </th>
-                  <th onClick={() => handleSort('adx')} style={thStyle('adx', 'right')}>
+                  <th {...sortHeaderProps(() => handleSort('adx'), sortKey === 'adx', sortDir)} style={thStyle('adx', 'right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>ADX{sortArrow('adx')}<InfoIcon tooltip={PILLAR_TOOLTIPS.adx} /></span>
                   </th>
-                  <th onClick={() => handleSort('dist_to_ema21_pct')} style={thStyle('dist_to_ema21_pct', 'right')}>
+                  <th {...sortHeaderProps(() => handleSort('dist_to_ema21_pct'), sortKey === 'dist_to_ema21_pct', sortDir)} style={thStyle('dist_to_ema21_pct', 'right')}>
                     <span style={{ whiteSpace: 'nowrap' }}>Dist EMA21{sortArrow('dist_to_ema21_pct')}<InfoIcon tooltip={PILLAR_TOOLTIPS.rubberBand} /></span>
                   </th>
                 </tr>
@@ -319,7 +334,7 @@ function MomentumPullback() {
                 {filtered.length === 0 ? (
                   <tr>
                     <td colSpan={9} style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-secondary)' }}>
-                      No qualifying momentum pullback setups found
+                      {realtimeOnly ? strategyEmptyMessage(data.analysis, 'No qualifying momentum pullback setups found') : 'No qualifying momentum pullback setups found'}
                     </td>
                   </tr>
                 ) : (
@@ -328,9 +343,7 @@ function MomentumPullback() {
                     return (
                       <tr key={idx}>
                         <td>
-                          <span className="ticker" onClick={() => navigate(`/ticker/${r.ticker}`)}>
-                            {r.ticker}
-                          </span>
+                          <StrategyTickerButton ticker={r.ticker} publication={realtimeQuery.data?.publication} />
                         </td>
                         <td style={{ textAlign: 'center' }}>
                           <span style={{

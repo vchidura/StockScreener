@@ -1,11 +1,12 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink, RefreshCw, Search, X } from 'lucide-react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { CrossFramePatternSummary, FormingChartPattern, PriceChannel, getTickers, scanChartPatterns, scanTickerChartPatterns } from '../services/api'
 import { formingPatternRead } from '../utils/formingPatterns'
 import { usePublishPageContext } from '../layout/pageContext'
 import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
+import { patternTickerPath } from './patternWatchNavigation'
 
 /** Secondary geometry detail starts hidden so the 15-column table fits a laptop screen. */
 const PATTERN_COLUMNS: ColumnSpec[] = [
@@ -37,9 +38,12 @@ const colors = {
 
 const intervalLabels: Record<string, string> = {
   all: 'All intervals',
-  '5m': '5 minutes', '15m': '15 minutes',
+  '5m': '5 minutes · ticker only', '15m': '15 minutes',
   '30m': '30 minutes', '1h': 'Hourly', '1d': 'Daily', '1wk': 'Weekly',
+  '1mo': 'Monthly',
 }
+
+const tickerOnlyIntervals = new Set(['all', '5m'])
 
 const patternLabels: Record<FormingChartPattern['type'], string> = {
   ASCENDING_TRIANGLE: 'Ascending triangle',
@@ -117,13 +121,21 @@ const crossFrameRead = (summary: CrossFramePatternSummary | null | undefined) =>
 
 export default function PatternWatch() {
   const navigate = useNavigate()
+  const [urlParams] = useSearchParams()
   const queryClient = useQueryClient()
-  const [interval, setInterval] = useState('1d')
+  const linkedTicker = /^[A-Z][A-Z0-9.\-]{0,9}$/.test((urlParams.get('ticker') || '').toUpperCase())
+    ? (urlParams.get('ticker') || '').toUpperCase()
+    : ''
+  const requestedInterval = urlParams.get('interval') || '1d'
+  const [interval, setInterval] = useState(
+    requestedInterval in intervalLabels && (requestedInterval !== 'all' || linkedTicker)
+      ? requestedInterval : '1d',
+  )
   const [patternType, setPatternType] = useState('all')
   const [readinessFilter, setReadinessFilter] = useState('all')
   const [channelFilter, setChannelFilter] = useState('all')
   const [sector, setSector] = useState('all')
-  const [search, setSearch] = useState('')
+  const [search, setSearch] = useState(linkedTicker)
   const normalizedSearch = search.trim().toUpperCase()
 
   const tickerUniverse = useQuery({
@@ -132,23 +144,26 @@ export default function PatternWatch() {
     staleTime: 86_400_000,
   })
   const exactTicker = tickerUniverse.data?.includes(normalizedSearch) ? normalizedSearch : ''
-  const allTicker = interval === 'all' ? exactTicker : ''
-  const awaitingAllTicker = interval === 'all' && !allTicker
+  const tickerOnly = tickerOnlyIntervals.has(interval)
+  const selectedTicker = tickerOnly ? exactTicker : ''
+  const awaitingTicker = tickerOnly && !selectedTicker
 
-  const queryKey = ['chart-patterns', 'scan', interval, allTicker]
+  const queryKey = ['chart-patterns', 'scan', interval, selectedTicker]
   const patterns = useQuery({
     queryKey,
-    queryFn: () => interval === 'all'
-      ? scanTickerChartPatterns(allTicker)
+    queryFn: () => tickerOnly
+      ? scanTickerChartPatterns(selectedTicker)
       : scanChartPatterns(interval),
-    enabled: !awaitingAllTicker,
-    staleTime: interval === '1d' || interval === '1wk' ? 300_000 : 60_000,
+    enabled: !awaitingTicker,
+    staleTime: interval === '1d' || interval === '1wk' || interval === '1mo' ? 300_000 : 60_000,
   })
 
   const sectors = useMemo(() => (
-    [...new Set((patterns.data?.results ?? []).map(row => row.sector).filter((value): value is string => !!value))]
+    [...new Set((patterns.data?.results ?? [])
+      .filter(row => interval !== '5m' || row.interval === '5m')
+      .map(row => row.sector).filter((value): value is string => !!value))]
       .sort((a, b) => a.localeCompare(b))
-  ), [patterns.data])
+  ), [interval, patterns.data])
   const rows = (patterns.data?.results ?? []).filter(row => {
     const term = search.trim().toUpperCase()
     const channel = row.channel ?? null
@@ -160,7 +175,8 @@ export default function PatternWatch() {
       || (channelFilter === 'opposing' && context?.relation === 'OPPOSING')
       || (channelFilter === 'near_support' && channel?.position === 'NEAR_SUPPORT')
       || (channelFilter === 'near_resistance' && channel?.position === 'NEAR_RESISTANCE')
-    return (!term || row.ticker.includes(term) || row.pattern.name.toUpperCase().includes(term))
+    return (interval !== '5m' || row.interval === '5m')
+      && (!term || row.ticker.includes(term) || row.pattern.name.toUpperCase().includes(term))
       && (patternType === 'all' || row.pattern.type === patternType)
       && (readinessFilter === 'all' || row.pattern.readiness === readinessFilter)
       && matchesChannel
@@ -180,19 +196,25 @@ export default function PatternWatch() {
   })
 
   const refresh = async () => {
-    if (awaitingAllTicker) return
+    if (awaitingTicker) return
     queryClient.removeQueries({ queryKey, exact: true })
     await queryClient.fetchQuery({
       queryKey,
-      queryFn: () => interval === 'all'
-        ? scanTickerChartPatterns(allTicker, true)
+      queryFn: () => tickerOnly
+        ? scanTickerChartPatterns(selectedTicker, true)
         : scanChartPatterns(interval, true),
     })
   }
   const patternUrl = (ticker: string, pattern: FormingChartPattern, rowInterval: string, channel: PriceChannel | null) => {
-    const params = new URLSearchParams({ interval: rowInterval, patterns: 'on', pattern: pattern.type })
-    if (channel) params.set('channel', 'on')
-    return `/ticker/${ticker}?${params.toString()}`
+    const publication = patterns.data?.publication
+    const workspace = publication?.workspaces.find(item => item.ticker === ticker)
+    if (publication && !workspace) throw new Error('Pattern Watch member workspace is missing from the publication')
+    const query = new URLSearchParams(urlParams)
+    if (publication) query.set('cohort_id', publication.cohort_id)
+    return patternTickerPath({
+      ticker, interval: rowInterval, patternType: pattern.type, hasChannel: channel !== null,
+      snapshotId: workspace?.snapshot_id,
+    }, query.toString())
   }
   const openPattern = (ticker: string, pattern: FormingChartPattern, rowInterval: string, channel: PriceChannel | null) => (
     navigate(patternUrl(ticker, pattern, rowInterval, channel))
@@ -225,8 +247,8 @@ export default function PatternWatch() {
           </div>
           <select aria-label="Pattern interval" value={interval} onChange={event => { setInterval(event.target.value); setPatternType('all'); setReadinessFilter('all'); setChannelFilter('all'); setSector('all') }} style={control}>
             {Object.entries(intervalLabels).map(([value, label]) => (
-              <option key={value} value={value} disabled={value === 'all' && !exactTicker}>
-                {label}{value === 'all' && !exactTicker ? ' · enter ticker first' : ''}
+              <option key={value} value={value} disabled={tickerOnlyIntervals.has(value) && !exactTicker}>
+                {label}{tickerOnlyIntervals.has(value) && !exactTicker ? ' · enter ticker first' : ''}
               </option>
             ))}
           </select>
@@ -256,14 +278,14 @@ export default function PatternWatch() {
             {sectors.map(value => <option key={value} value={value}>{value}</option>)}
             <option value="unclassified">Unclassified / ETF</option>
           </select>
-          <button type="button" onClick={refresh} disabled={patterns.isFetching || awaitingAllTicker} title="Refresh forming patterns" style={{ ...control, display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer', color: colors.blue }}>
+          <button type="button" onClick={refresh} disabled={patterns.isFetching || awaitingTicker} title="Refresh forming patterns" style={{ ...control, display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer', color: colors.blue }}>
             <RefreshCw size={14} aria-hidden="true" />
             {patterns.isFetching ? 'Measuring…' : 'Refresh'}
           </button>
           <span style={{ marginLeft: 'auto', color: colors.muted, fontSize: 11.5, whiteSpace: 'nowrap' }}>
             {patterns.data
               ? `${rows.length} candidates · ${visibleTickers} tickers shown · ${patterns.data.matched_tickers}/${patterns.data.scanned} matched`
-              : awaitingAllTicker ? 'Enter an exact active ticker' : 'Loading universe…'}
+              : awaitingTicker ? 'Enter an exact active ticker' : 'Loading universe…'}
           </span>
           <ColumnPicker
             columns={PATTERN_COLUMNS}
@@ -292,10 +314,10 @@ export default function PatternWatch() {
               </tr>
             </thead>
             <tbody>
-              {awaitingAllTicker && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>Enter an exact active ticker to compare its forming patterns across all intervals.</td></tr>}
-              {!awaitingAllTicker && patterns.isLoading && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>Measuring the active universe…</td></tr>}
+              {awaitingTicker && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>Enter an exact active ticker for five-minute or cross-frame pattern research.</td></tr>}
+              {!awaitingTicker && patterns.isLoading && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>Measuring the active universe…</td></tr>}
               {patterns.isError && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.red }}>Pattern Watch could not be loaded.</td></tr>}
-              {!awaitingAllTicker && !patterns.isLoading && !patterns.isError && rows.length === 0 && (
+              {!awaitingTicker && !patterns.isLoading && !patterns.isError && rows.length === 0 && (
                 <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>No forming candidates match this interval and filter set.</td></tr>
               )}
               {rows.map(row => {

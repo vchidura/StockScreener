@@ -1,4 +1,4 @@
-import api from './api'
+import api, { tickerParams, retainedTickerParams } from './api'
 
 export interface StockContextCohort {
   snapshot_id: string
@@ -12,6 +12,7 @@ export interface StockContextCohort {
   available_at: string
   ranking: string
   status: 'READY' | 'STALE'
+  scope_note?: string
 }
 
 export interface StockContextFrame {
@@ -50,7 +51,8 @@ export interface StockContextResponse {
   execution_permission: false
 }
 
-export async function getStockContext(ticker?: string): Promise<StockContextResponse> {
-  const response = await api.get('/stocks/context', { params: ticker ? { ticker } : undefined })
+export async function getStockContext(ticker?: string, snapshotId?: string): Promise<StockContextResponse> {
+  const params = ticker ? { ticker } : snapshotId ? { snapshot_id: snapshotId } : undefined
+  const response = await api.get('/stocks/context', { params: (ticker ? retainedTickerParams : tickerParams)(params, ticker ? snapshotId : undefined) })
   return response.data
 }

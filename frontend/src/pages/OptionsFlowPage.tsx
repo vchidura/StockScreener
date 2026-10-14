@@ -49,6 +49,13 @@ const formatDateTime = (value: string | null | undefined) => value
     }).format(new Date(value))
   : 'Unavailable'
 
+export function optionFlowUnavailableReason(reason: string | null | undefined) {
+  if (reason === 'EQUITY_ONLY_COHORT') return 'The selected realtime cohort contains no option underlyings.'
+  if (reason === 'NO_COMPLETE_MATRIX') return 'No complete analyzed option matrices were retained for this cohort.'
+  if (reason === 'ACTIVE_COHORT_UNAVAILABLE') return 'The selected realtime cohort is unavailable.'
+  return reason || 'The options service could not be read.'
+}
+
 function metricValues(row: OptionFlowExpiration | OptionFlowStrike, metric: ProfileMetric) {
   return metric === 'volume'
     ? [row.call_volume, row.put_volume]
@@ -198,7 +205,7 @@ export default function OptionsFlowPage() {
   })
 
   if (flow.isLoading) return <div className="flow-state"><Database size={20} /><div><strong>Loading options activity</strong><span>Reading the latest complete option matrices.</span></div></div>
-  if (flow.isError || !data || flow.data?.available === false) return <div className="flow-state flow-state--warning"><AlertTriangle size={20} /><div><strong>Options activity unavailable</strong><span>{flow.data?.reason || 'The options service could not be read.'}</span></div></div>
+  if (flow.isError || !data || flow.data?.available === false) return <div className="flow-state flow-state--warning"><AlertTriangle size={20} /><div><strong>Options activity unavailable</strong><span>{optionFlowUnavailableReason(flow.data?.reason)}</span></div></div>
 
   const oiChange = selected?.open_interest_change
   const strikeRows = strikeExpiration === 'ALL'
@@ -208,7 +215,11 @@ export default function OptionsFlowPage() {
   return (
     <div className="options-flow-page">
       <section className="flow-command" aria-label="Options flow filters">
-        <label>Underlying<select value={data.selected} onChange={event => setSearchParams({ underlyer: event.target.value })}>{data.underlyers.map(row => <option key={row.underlying} value={row.underlying}>{row.underlying} · {row.asset_type}</option>)}</select></label>
+        <label>Underlying<select value={data.selected} onChange={event => setSearchParams(current => {
+          const next = new URLSearchParams(current)
+          next.set('underlyer', event.target.value)
+          return next
+        })}>{data.underlyers.map(row => <option key={row.underlying} value={row.underlying}>{row.underlying} · {row.asset_type}</option>)}</select></label>
         <div className="flow-command__measure"><span>Chart measure</span><ProfileToggle value={profileMetric} onChange={setProfileMetric} /></div>
         <div className="flow-command__context"><Radio size={15} /><span><strong>{data.session_date ? formatDate(data.session_date) : 'Latest session'}</strong>Selected ticker · latest complete matrix in this exchange session</span></div>
       </section>

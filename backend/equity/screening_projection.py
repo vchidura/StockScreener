@@ -8,7 +8,6 @@ import exchange_calendars
 import numpy as np
 import pandas as pd
 
-from database import get_db_cursor
 from equity.technicals import detect_setup_candlesticks
 from equity.daily_state import stock_features
 from equity.screening_gaps import project_gaps
@@ -19,7 +18,7 @@ from research.screening import FIELDS, PATTERNS, VERSION, UNIVERSE, FIELD_SET_VE
 SNAPSHOT_TYPE = "SCREENING_DAILY_V1"
 
 
-def project_security(member, bars, actions, session, ordinals):
+def project_security(member, bars, actions, session, ordinals, *, split_adjusted=False):
     identity = str(member["security_id"])
     frame = pd.DataFrame(bars)
     if not frame.empty:
@@ -46,7 +45,8 @@ def project_security(member, bars, actions, session, ordinals):
             return None, "INVALID_BAR"
         if (prices.high < prices[["open", "close", "low"]].max(axis=1)).any() or (prices.low > prices[["open", "close", "high"]].min(axis=1)).any():
             return None, "INVALID_BAR_GEOMETRY"
-        if size > 1 and any(selected.session_date.iloc[0] < action["effective_date"] <= session and action["action_type"] in ("SPLIT", "MERGER", "SPINOFF", "SYMBOL_CHANGE") for action in actions):
+        gated_actions = ("MERGER", "SPINOFF", "SYMBOL_CHANGE") if split_adjusted else ("SPLIT", "MERGER", "SPINOFF", "SYMBOL_CHANGE")
+        if size > 1 and any(selected.session_date.iloc[0] < action["effective_date"] <= session and action["action_type"] in gated_actions for action in actions):
             return None, "CORPORATE_ACTION_REVIEW"
         return prices, None
 
@@ -94,7 +94,8 @@ def project_security(member, bars, actions, session, ordinals):
     if prices is not None:
         source = frame.copy()
         source["ordinal"] = source.session_date.map(ordinals)
-        source["raw_close"], source["raw_volume"] = source.close, source.volume
+        if "raw_close" not in source:
+            source["raw_close"], source["raw_volume"] = source.close, source.volume
         discovery = stock_features(source, session, identity)
         issue = discovery["exclusion"] or None
     for name, source_name in (("discovery_state", "state"), ("discovery_trend", "trend")):
@@ -149,6 +150,7 @@ def validate_publication_members(publication, members):
 
 
 def build_latest(session_date: date | None = None, *, allow_degraded: bool = False):
+    from database import get_db_cursor
     calendar = exchange_calendars.get_calendar("XNYS")
     if session_date is not None and not calendar.is_session(str(session_date)):
         raise ValueError("Requested date is not an exchange session")

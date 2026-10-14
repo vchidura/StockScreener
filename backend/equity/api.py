@@ -10,6 +10,7 @@ from fastapi import APIRouter, Query
 
 from .calendar import (
     latest_expected_market_time,
+    market_notification_window,
     max_serveable_stale_sessions,
     staleness_state,
 )
@@ -415,6 +416,11 @@ def equity_materialization_health() -> dict[str, Any]:
             result["recent_runs"] = [dict(row) for row in cursor.fetchall()]
     result["checked_at"] = datetime.now(timezone.utc)
     return result
+
+
+@router.get("/notification-window")
+def equity_notification_window() -> dict[str, Any]:
+    return market_notification_window(datetime.now(timezone.utc))
 
 
 @router.get("/materialization-status")

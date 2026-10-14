@@ -10,6 +10,7 @@ from equity.behavior import (
     BehaviorComponent, BehaviorComponentAssessment, BehaviorMetric, BehaviorProfile, Contract,
     DEFINITION_V1_SHA256, METRICS_V1, Name, Sha256,
 )
+from options.analytics.iv_comparability import comparison_iv
 from options.dual_origin import ACTIVITY_POLICY, ActivityFinding, ActivitySource, detect_option_participation
 from options.stock_behavior_gates import StockBehaviorGate, _metric_gate
 
@@ -1074,6 +1075,7 @@ def matched_expressions(candidates, *, underlyer, direction, session_date, activ
         dte = min((leg.expiration_date - session_date).days for leg in candidate.legs)
         spot = float(long_leg.spot)
         iv = float(long_leg.local_iv) if long_leg.local_iv else None
+        comparable_iv, _ = comparison_iv(long_leg)
         expected = spot * iv * math.sqrt(max(dte, 1) / 365) if iv else None
         breakeven = float(candidate.breakevens[0]) if candidate.breakevens else None
         maximum_loss = float(candidate.maximum_loss) if candidate.maximum_loss is not None else None
@@ -1093,7 +1095,7 @@ def matched_expressions(candidates, *, underlyer, direction, session_date, activ
             breakeven_to_expected_move=abs(breakeven - spot) / expected if expected and breakeven is not None else None,
             theta_per_maximum_loss=theta / maximum_loss if theta is not None and maximum_loss else None,
             vega_per_maximum_loss=vega / maximum_loss if vega is not None and maximum_loss else None,
-            iv_over_rv20=iv / rv20 if iv and rv20 else None))
+            iv_over_rv20=comparable_iv / rv20 if comparable_iv and rv20 else None))
     return tuple(results)
 
 
@@ -1118,16 +1120,21 @@ def opening_measurements(rows, *, session_date, session_open, decision_at, direc
 
 
 def build_o1_indicator_observation_v3(source, decision, stock, *, scheduled_cycle, regime, prior_same_direction,
-                                      extras, expressions):
-    """V36: V2 indicators plus opening lane, DTE/volatility context and shadow matched expressions."""
+                                      extras, expressions, unavailable_reasons=None):
+    """V36: V2 indicators plus opening lane, DTE/volatility context and shadow matched expressions.
+
+    `unavailable_reasons` maps a metric id to the reason codes recorded when its extra is missing,
+    for example why an activity IV was withheld from the comparison with realized volatility.
+    """
     base = build_o1_indicator_observation_v2(source, decision, stock, scheduled_cycle=scheduled_cycle,
         regime=regime, prior_same_direction=prior_same_direction)
     direction = base.direction
+    reasons = unavailable_reasons or {}
     measurements = tuple(O1IndicatorMeasurementV3.model_validate(row.model_dump()) for row in base.measurements)
     measurements += tuple(O1IndicatorMeasurementV3(component_key=key, metric_id=metric, unit=unit,
         status="READY", value=float(extras[metric])) if extras.get(metric) is not None else
         O1IndicatorMeasurementV3(component_key=key, metric_id=metric, unit=unit, status="UNAVAILABLE",
-            reason_codes=("METRIC_UNAVAILABLE",)) for key, metric, unit in O1_REVIEW_V3_EXTRA_METRICS)
+            reason_codes=tuple(reasons.get(metric) or ("METRIC_UNAVAILABLE",))) for key, metric, unit in O1_REVIEW_V3_EXTRA_METRICS)
     ready = {row.metric_id: row.value for row in measurements if row.status == "READY"}
 
     def challenger(challenger_id, metric_ids, predicate):

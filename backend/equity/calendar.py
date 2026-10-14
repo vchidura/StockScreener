@@ -9,7 +9,25 @@ import exchange_calendars
 import pandas as pd
 
 
-INTERVAL_MINUTES = {"5m": 5, "15m": 15, "30m": 30, "1h": 60}
+INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
+
+
+def market_notification_window(now: datetime, *, calendar_name: str = "XNYS") -> dict[str, Any]:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    now_utc = now.astimezone(timezone.utc)
+    calendar = exchange_calendars.get_calendar(calendar_name)
+    session = pd.Timestamp(now_utc.astimezone(calendar.tz).date())
+    is_session = calendar.is_session(session)
+    session_open = calendar.session_open(session).to_pydatetime() if is_session else None
+    session_close = calendar.session_close(session).to_pydatetime() if is_session else None
+    return dict(
+        calendar=calendar_name, checked_at=now_utc.isoformat(), session=str(session.date()),
+        is_trading_session=is_session,
+        notifications_enabled=bool(is_session and session_open <= now_utc < session_close),
+        session_open=session_open.isoformat() if session_open else None,
+        session_close=session_close.isoformat() if session_close else None,
+    )
 
 
 def max_serveable_stale_sessions() -> int:

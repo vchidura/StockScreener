@@ -1,0 +1,21 @@
+{
+  "semantics_version": "massive_options_conditions_v2",
+  "provenance": "SYNTHETIC_SCHEMA_FIXTURE_NOT_LIVE_CAPTURED",
+  "reviewed_payload_sha256": "44a141a8f6f0aa6d2729f4beca7c90a5317819bf8fe4d2a35c351be7b37912d1",
+  "reviewed_at": "2026-10-12T00:00:00Z",
+  "review_note": "Reviews only the synthetic schema fixture beside it. It says nothing about live provider ids; a live capture needs its own payload hash and its own reviewed table.",
+  "codes": [
+    {"condition_id": 9001, "treatment": "INCLUDED", "review_note": "ordinary volume-updating print"},
+    {"condition_id": 9002, "treatment": "INCLUDED", "review_note": "opening print that updates volume"},
+    {"condition_id": 9003, "treatment": "INCLUDED", "is_sweep": true, "review_note": "intermarket sweep flag"},
+    {"condition_id": 9004, "treatment": "INCLUDED", "is_floor": true, "review_note": "floor-negotiated print"},
+    {"condition_id": 9005, "treatment": "INCLUDED", "is_cross": true, "review_note": "single-leg cross"},
+    {"condition_id": 9006, "treatment": "INCLUDED", "is_multi_leg": true, "review_note": "net price, excluded from side classification"},
+    {"condition_id": 9007, "treatment": "INCLUDED", "is_multi_leg": true, "is_cross": true, "review_note": "multi-leg cross"},
+    {"condition_id": 9008, "treatment": "INCLUDED", "is_late": true, "review_note": "late print that still updates volume"},
+    {"condition_id": 9009, "treatment": "EXCLUDED", "is_late": true, "review_note": "late and does not update volume"},
+    {"condition_id": 9010, "treatment": "EXCLUDED", "review_note": "informational, never volume"},
+    {"condition_id": 9011, "treatment": "CANCELED", "review_note": "cancel echoing a prior print"},
+    {"condition_id": 9012, "treatment": "CANCELED", "review_note": "cancel of the last print"}
+  ]
+}
