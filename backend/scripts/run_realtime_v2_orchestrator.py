@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """V2 stage orchestrator entry point (security deferred: connects as the database owner).
 
-  plan        read-only: show the plan scope, principals, wired/unwired stages (and which wired stages
+  plan        read-only: show the plan scope, pools, wired/unwired stages (and which wired stages
               fail closed for lack of a provider source) and readiness
   once        claim and run every window that is due, then exit
   continuous  poll windows and tick resident stages until interrupted
@@ -48,7 +48,7 @@ from realtime.migrations import (  # noqa: E402
 )
 from realtime.orchestration_repository import PostgresOrchestrationRepository  # noqa: E402
 from realtime.runner_environment import RunnerEnvironment  # noqa: E402
-from realtime.stage_graph import RESIDENT_SCHEDULES, STAGES_V1  # noqa: E402
+from realtime.stage_graph import RESIDENT_SCHEDULES, STAGE_CATALOGS  # noqa: E402
 from realtime.stage_orchestrator import StageOrchestrator  # noqa: E402
 from realtime.stage_runners_v2 import (  # noqa: E402
     build_runners,
@@ -69,7 +69,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--allow-disposable", action="store_true")
     parser.add_argument("--security-mode", choices=SECURITY_MODES_V2, default=SECURITY_MODE_DEFERRED)
     parser.add_argument("--plan-id", type=UUID, required=True)
-    parser.add_argument("--completion-budget-seconds", type=int, default=60)
+    parser.add_argument("--completion-budget-seconds", type=int, default=300)
     parser.add_argument("--serving-lag-seconds", type=int, default=30)
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--other-connections", type=int, default=8,
@@ -106,9 +106,10 @@ def main(argv=None) -> int:
     # deployment is checked against the server's connection capacity before any stage can start.
     probe = _pool(args, 2)
     try:
-        plan_id_enabled = PostgresOrchestrationRepository(
-            V2ConnectionProvider({OWNER_POOL: probe}, config)).load_plan(args.plan_id).enabled_stages
-        pool_max = orchestrator_pool_size(plan_id_enabled)
+        probe_repository = PostgresOrchestrationRepository(V2ConnectionProvider({OWNER_POOL: probe}, config))
+        probe_plan = probe_repository.load_plan(args.plan_id)
+        probe_catalog = probe_repository.load_catalog(probe_plan.stage_catalog_version)
+        pool_max = orchestrator_pool_size(probe_plan.enabled_stages, probe_catalog)
         budget = verify_server_connection_budget(
             probe, {"orchestrator": pool_max, "other_consumers": args.other_connections},
             reserved_connections=args.reserved_connections)
@@ -119,18 +120,21 @@ def main(argv=None) -> int:
         provider = V2ConnectionProvider({OWNER_POOL: pool}, config)
         database = provider.verify()
         # No provider source is configured here, so REFERENCE and EQUITY_INGEST stay fail-closed.
-        environment = RunnerEnvironment(provider)
+        environment = RunnerEnvironment(provider, freeze_heap=True)
         repository = PostgresOrchestrationRepository(provider)
         plan = repository.load_plan(args.plan_id)
         catalog = repository.load_catalog(plan.stage_catalog_version)
+        source_catalog = STAGE_CATALOGS.get(plan.stage_catalog_version)
+        if source_catalog is None:
+            raise ValueError(f"unsupported source stage catalog: {plan.stage_catalog_version}")
         enabled = plan.enabled_stages
-        resident = sorted(name for name in enabled if STAGES_V1[name].schedule_kind in RESIDENT_SCHEDULES)
+        resident = sorted(name for name in enabled if source_catalog[name].schedule_kind in RESIDENT_SCHEDULES)
         report = {
             "database": database, "security_mode": args.security_mode, "plan_id": str(plan.plan_id),
-            "session_date": plan.session_date.isoformat(), "catalog_matches_source": dict(catalog) == STAGES_V1,
+            "session_date": plan.session_date.isoformat(), "catalog_matches_source": dict(catalog) == source_catalog,
             "enabled": sorted(enabled), "resident": resident, "pool_max": pool_max, "connection_ceiling": budget,
-            "principal_pools": sorted(pools_required(enabled, config)),
-            "wired": sorted(enabled & wired_stages()), "unwired": sorted(unwired_stages(enabled)),
+            "pools": sorted(pools_required(enabled, config)),
+            "wired": sorted(wired_stages(enabled)), "unwired": sorted(unwired_stages(enabled)),
             "fail_closed_without_source": fail_closed_stages(enabled, environment),
             "readiness": dict(repository.readiness(plan.cohort_id)),
         }
@@ -138,7 +142,8 @@ def main(argv=None) -> int:
             print(json.dumps(report, indent=2, default=str))
             return 0 if report["catalog_matches_source"] and not report["unwired"] else 2
         orchestrator = StageOrchestrator(
-            repository, build_runners(enabled, provider, environment=environment), database=provider)
+            repository, build_runners(enabled, provider, environment=environment), database=provider,
+            stages=source_catalog, catalog_version=plan.stage_catalog_version)
         orchestrator.start(plan.plan_id)
         specs = window_specs_for_session(
             plan.cohort_id, plan.session_date, DEVELOPER_TIER,

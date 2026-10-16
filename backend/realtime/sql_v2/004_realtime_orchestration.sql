@@ -8,18 +8,19 @@ CREATE TABLE rt.stage_catalog (
     version varchar(32) NOT NULL,
     domain varchar(12) NOT NULL,
     prerequisites text[] NOT NULL DEFAULT ARRAY[]::text[],
-    capability_role varchar(32) NOT NULL,
-    principal_profile varchar(32) NOT NULL,
+    execution_lane varchar(12) NOT NULL,
     schedule_kind varchar(16) NOT NULL,
     gates_strategy boolean NOT NULL DEFAULT false,
+    deadline_offset_seconds integer,
     PRIMARY KEY (stage_id, version),
     CHECK (stage_id = upper(stage_id) AND btrim(stage_id) <> ''),
     CHECK (btrim(version) <> ''),
     CHECK (domain IN ('shared', 'equity', 'options')),
+    CHECK (execution_lane IN ('data', 'alert', 'portal', 'options')),
+    CHECK ((domain = 'options') = (execution_lane = 'options')),
     CHECK (NOT (stage_id = ANY (prerequisites))),
-    CHECK (principal_profile IN ('runtime_data', 'runtime_options')),
-    CHECK ((domain = 'options') = (principal_profile = 'runtime_options')),
     CHECK (schedule_kind IN ('INTERVAL', 'WINDOW', 'SESSION', 'COALESCED', 'CONTINUOUS')),
+    CHECK (deadline_offset_seconds IS NULL OR deadline_offset_seconds BETWEEN 1 AND 3600),
     CHECK (NOT gates_strategy OR domain = 'options')
 );
 
@@ -52,18 +53,30 @@ CREATE TRIGGER trg_rt_stage_catalog_validate
     FOR EACH ROW EXECUTE FUNCTION rt.validate_stage_catalog();
 
 INSERT INTO rt.stage_catalog
-    (stage_id, version, domain, prerequisites, capability_role, principal_profile, schedule_kind, gates_strategy)
+    (stage_id, version, domain, prerequisites, execution_lane, schedule_kind, gates_strategy,
+     deadline_offset_seconds)
 VALUES
-    ('REFERENCE', 'stages_v1', 'shared', ARRAY[]::text[], 'references', 'runtime_data', 'INTERVAL', false),
-    ('EQUITY_INGEST', 'stages_v1', 'equity', ARRAY['REFERENCE'], 'ingress', 'runtime_data', 'WINDOW', false),
-    ('EQUITY_EVIDENCE', 'stages_v1', 'equity', ARRAY['EQUITY_INGEST'], 'compute', 'runtime_data', 'WINDOW', false),
-    ('PORTAL_PUBLISH', 'stages_v1', 'equity', ARRAY['EQUITY_EVIDENCE'], 'publication', 'runtime_data', 'COALESCED', false),
-    ('STRATEGY_PUBLISH', 'stages_v1', 'equity', ARRAY['EQUITY_EVIDENCE'], 'publication', 'runtime_data', 'COALESCED', false),
-    ('STOCK_ALERTS', 'stages_v1', 'equity', ARRAY['EQUITY_EVIDENCE'], 'compute', 'runtime_data', 'WINDOW', false),
-    ('OPTIONS_ACQUIRE', 'stages_v1', 'options', ARRAY['REFERENCE'], 'options_ingress', 'runtime_options', 'WINDOW', false),
-    ('OPTIONS_ADMISSION', 'stages_v1', 'options', ARRAY['OPTIONS_ACQUIRE'], 'options_compute', 'runtime_options', 'SESSION', false),
-    ('OPTIONS_CYCLE', 'stages_v1', 'options', ARRAY['OPTIONS_ADMISSION'], 'options_compute', 'runtime_options', 'WINDOW', true),
-    ('OPTIONS_FLOW', 'stages_v1', 'options', ARRAY['REFERENCE'], 'options_compute', 'runtime_options', 'CONTINUOUS', false);
+    ('REFERENCE', 'stages_v1', 'shared', ARRAY[]::text[], 'data', 'INTERVAL', false, NULL),
+    ('EQUITY_INGEST', 'stages_v1', 'equity', ARRAY['REFERENCE'], 'data', 'WINDOW', false, NULL),
+    ('EQUITY_EVIDENCE', 'stages_v1', 'equity', ARRAY['EQUITY_INGEST'], 'data', 'WINDOW', false, NULL),
+    ('PORTAL_PUBLISH', 'stages_v1', 'equity', ARRAY['EQUITY_EVIDENCE'], 'data', 'COALESCED', false, NULL),
+    ('STRATEGY_PUBLISH', 'stages_v1', 'equity', ARRAY['EQUITY_EVIDENCE'], 'data', 'COALESCED', false, NULL),
+    ('STOCK_ALERTS', 'stages_v1', 'equity', ARRAY['EQUITY_EVIDENCE'], 'data', 'WINDOW', false, NULL),
+    ('OPTIONS_ACQUIRE', 'stages_v1', 'options', ARRAY['REFERENCE'], 'options', 'WINDOW', false, NULL),
+    ('OPTIONS_ADMISSION', 'stages_v1', 'options', ARRAY['OPTIONS_ACQUIRE'], 'options', 'SESSION', false, NULL),
+    ('OPTIONS_CYCLE', 'stages_v1', 'options', ARRAY['OPTIONS_ADMISSION'], 'options', 'WINDOW', true, NULL),
+    ('OPTIONS_FLOW', 'stages_v1', 'options', ARRAY['REFERENCE'], 'options', 'CONTINUOUS', false, NULL),
+    ('REFERENCE', 'stages_v2', 'shared', ARRAY[]::text[], 'data', 'INTERVAL', false, NULL),
+    ('EQUITY_INGEST', 'stages_v2', 'equity', ARRAY['REFERENCE'], 'data', 'WINDOW', false, 120),
+    ('EQUITY_MATERIALIZE', 'stages_v2', 'equity', ARRAY['EQUITY_INGEST'], 'data', 'WINDOW', false, 120),
+    ('STOCK_ALERTS', 'stages_v2', 'equity', ARRAY['EQUITY_MATERIALIZE'], 'alert', 'WINDOW', false, 120),
+    ('EQUITY_PROJECTION', 'stages_v2', 'equity', ARRAY['EQUITY_MATERIALIZE'], 'portal', 'COALESCED', false, 300),
+    ('PORTAL_PUBLISH', 'stages_v2', 'equity', ARRAY['EQUITY_PROJECTION'], 'portal', 'COALESCED', false, 300),
+    ('STRATEGY_PUBLISH', 'stages_v2', 'equity', ARRAY['EQUITY_MATERIALIZE'], 'portal', 'COALESCED', false, 300),
+    ('OPTIONS_ACQUIRE', 'stages_v2', 'options', ARRAY['REFERENCE'], 'options', 'WINDOW', false, NULL),
+    ('OPTIONS_ADMISSION', 'stages_v2', 'options', ARRAY['OPTIONS_ACQUIRE'], 'options', 'SESSION', false, NULL),
+    ('OPTIONS_CYCLE', 'stages_v2', 'options', ARRAY['OPTIONS_ADMISSION'], 'options', 'WINDOW', true, NULL),
+    ('OPTIONS_FLOW', 'stages_v2', 'options', ARRAY['REFERENCE'], 'options', 'CONTINUOUS', false, NULL);
 
 CREATE TRIGGER trg_rt_stage_catalog_immutable
     BEFORE UPDATE OR DELETE ON rt.stage_catalog
@@ -159,7 +172,7 @@ CREATE TABLE rt.cycle_receipts (
     build_id varchar(96) NOT NULL,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (window_id, receipt_kind),
-    CHECK (receipt_kind IN ('EQUITY_CYCLE', 'OPTIONS_CYCLE')),
+    CHECK (receipt_kind IN ('EQUITY_CYCLE', 'OPTIONS_CYCLE', 'INPUT_READY', 'PORTAL_READY')),
     CHECK (reference_generation > 0),
     CHECK (universe_sha256 ~ '^[0-9a-f]{64}$'),
     CHECK (input_sha256 ~ '^[0-9a-f]{64}$'),
@@ -237,8 +250,8 @@ CREATE TRIGGER trg_rt_stage_runs_validate
 -- (FOR SHARE) is held through COMMIT, so the coordinator's timeout (an UPDATE of the same row)
 -- either lands before the check and the write is rejected, or waits for the commit that was
 -- legitimately made while RUNNING. The lock is taken only at the end, so a hung runner that never
--- reaches its commit cannot delay the coordinator. SECURITY DEFINER: stage roles hold no privilege
--- on rt.stage_runs.
+-- reaches its commit cannot delay the coordinator. SECURITY DEFINER: the check reads rt.stage_runs as
+-- the function owner, whatever the caller's own grants.
 CREATE FUNCTION rt.fence_stage_run(p_stage_run_id uuid) RETURNS void
     LANGUAGE plpgsql
     SECURITY DEFINER

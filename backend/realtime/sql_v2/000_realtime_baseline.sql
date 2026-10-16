@@ -31,7 +31,7 @@ END;
 $$;
 
 -- Catalog tables are append-only except that whole-lifecycle pruning deletes rows
--- (only the partition_admin capability is granted DELETE on them).
+-- (only the admin role, which owns every relation, deletes from them).
 CREATE FUNCTION rt.reject_catalog_update() RETURNS trigger
     LANGUAGE plpgsql
     SET search_path TO 'pg_catalog', 'rt', 'ref'

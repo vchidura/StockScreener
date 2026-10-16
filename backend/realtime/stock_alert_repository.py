@@ -17,7 +17,7 @@ from .portal_projection_repository import (
     RELEASE_CLASS_SESSION_CLOSE, RETENTION_HOT_AND_KEPT, persist_portal_snapshot_cursor,
     portal_session_date, publish_portal_release_cursor,
 )
-from .screening_repository import load_realtime_screening_input
+from .screening_repository import load_realtime_stock_alert_input
 from .stock_alert_projection import STOCK_ALERTS_VERSION, produce_realtime_stock_alerts
 from .worker_database import RealtimeProcessDatabase
 
@@ -56,7 +56,7 @@ def compute_realtime_stock_alerts(compute_database: RealtimeProcessDatabase, **s
         if previous is not None and previous["retained_body"] and previous["retained_forward"] is not False:
             raise RetainedForwardState(
                 "Forward checkpoint loader is unavailable; refusing to replace retained publications")
-        inputs = load_realtime_screening_input(cursor, **scope, include_portal_history=True)
+        inputs = load_realtime_stock_alert_input(cursor, **scope)
         return produce_realtime_stock_alerts(inputs)
 
 

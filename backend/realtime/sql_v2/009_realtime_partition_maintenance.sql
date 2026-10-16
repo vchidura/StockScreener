@@ -57,7 +57,7 @@ VALUES
     ('rt.option_flow_clusters', 'WEEKLY', 'session_date', 'date', 'ARCHIVE_FIRST', 'SESSIONS', 26, 14, 28, true, ARRAY['OPTION_FLOW_CLUSTERS'], NULL);
 
 -- Creates the missing partitions of one policy relation. Runs as the owner so the
--- runtime and archivist principals never need CREATE on the schema.
+-- runtime role never needs CREATE on the schema.
 CREATE FUNCTION rt.ensure_partitions(p_relation text, p_today date) RETURNS integer
     LANGUAGE plpgsql
     SECURITY DEFINER

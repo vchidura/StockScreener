@@ -5,15 +5,15 @@ test_realtime_v2_bind_a; it is created from the sql_v2 baseline and always dropp
 fakes (no provider is called); credentials stay inside tests/realtime/v2_database.py.
 
 Exercised for real: REFERENCE (seed manifests, current pointer, readiness), EQUITY_INGEST (provider
-ledger, acquisition batches/facts, watermarks, all fenced under the ingress role), EQUITY_EVIDENCE's
-bar phase (acquisition batches -> materialization jobs -> rt.bar_catalog / bar_revisions / bar_current under
-the compute role: idempotent replay, cancellation between jobs, retry, contract-invalid) and its receipt
-generation, STOCK_ALERTS (the retained-state guard SQL, the snapshot and both releases under the
-publication role) and STRATEGY_PUBLISH's receipt dispatch. NOT exercised here: the strategy producer's
+ledger, acquisition batches/facts, watermarks, all fenced to the stage run), EQUITY_EVIDENCE's
+bar phase (acquisition batches -> materialization jobs -> rt.bar_catalog / bar_revisions / bar_current:
+idempotent replay, cancellation between jobs, retry, contract-invalid) and its receipt
+generation, STOCK_ALERTS (the retained-state guard SQL, the snapshot and both releases) and
+STRATEGY_PUBLISH's receipt dispatch. NOT exercised here: the strategy producer's
 own SQL and EQUITY_EVIDENCE's projection (both replaced by fakes: compute_realtime_ticker_cycle is stubbed
 AFTER the real bar phase because the projection needs deep history), the session-close kept release, and
-the hardened role grants (the runtime connects as the owner in deferred security mode; the transaction
-roles each stage asked for are recorded and checked instead).
+the hardened role grants (the runtime connects as the owner in deferred security mode; the fenced and
+unfenced write transactions each stage opened are recorded and checked instead).
 """
 from __future__ import annotations
 
@@ -116,9 +116,14 @@ class World:
     def states(self, window_id):
         return {stage: record.state for stage, record in self.repository.stage_states(window_id).items()}
 
-    def roles(self, *, write=None, fenced=None):
-        return {role for role, _, read_only, has_fence in self.transactions
-                if (write is None or write == (not read_only)) and (fenced is None or fenced == has_fence)}
+    def writes(self, *, fenced=None):
+        """Write transactions opened since the last clear; a window stage's are fenced, a resident stage's
+        and the orchestrator's own bookkeeping are not."""
+        return [item for item in self.transactions
+                if not item[0] and (fenced is None or fenced == item[1])]
+
+    def reads(self):
+        return [item for item in self.transactions if item[0]]
 
 
 def _world(pool) -> World:
@@ -152,10 +157,9 @@ def _world(pool) -> World:
                   security_ids, instrument_ids)
     original = provider.transaction
 
-    def recording(capability_role, principal_profile, **options):
-        world.transactions.append((capability_role, principal_profile, bool(options.get("read_only")),
-                                   options.get("fence") is not None))
-        return original(capability_role, principal_profile, **options)
+    def recording(*args, **options):
+        world.transactions.append((bool(options.get("read_only")), options.get("fence") is not None))
+        return original(*args, **options)
 
     provider.transaction = recording
     return world
@@ -247,8 +251,8 @@ def test_a_ready_refresh_raises_the_ready_count_and_the_pointer_together_and_an_
     cutoff = world.now - timedelta(seconds=90)
     assert _query(pool, "SELECT count(*) FROM rt.seed_manifests WHERE status = 'READY' AND created_at <= %s",
                   (cutoff,))[0][0] == ready_before + 2  # the generation reference_generation derives
-    assert world.provider.role_violations == []
-    assert world.roles(write=True) >= {"references"} and "ingress" not in world.roles()
+    assert world.writes(fenced=False)  # REFERENCE is resident: its writes are unfenced
+    assert not world.writes(fenced=True)
 
 
 def test_the_unconfigured_reference_and_ingest_stages_are_blocked_through_the_orchestrator_without_writes(pool):
@@ -272,7 +276,7 @@ def test_the_unconfigured_reference_and_ingest_stages_are_blocked_through_the_or
             (str(window.window_id),))]
     assert _query(pool, "SELECT count(*) FROM rt.acquisition_batches WHERE cohort_id = %s",
                   (str(world.cohort),))[0][0] == 0
-    assert "ingress" not in world.roles(write=True)
+    assert not world.writes(fenced=True)  # the blocked window stage opened no fenced write transaction
 
 
 def _alerts_snapshot(streams):
@@ -310,7 +314,8 @@ def test_the_ingest_evidence_alerts_and_strategy_stages_run_in_dependency_order_
             cohort_id=world.cohort, provider_tier=ProviderTier.MASSIVE_DEVELOPER, source_manifest_sha256="a" * 64,
             source_generation=scope["source_generation"], session=scope["session"], cutoff=scope["cutoff"],
             members=(), bars=(), actions=(), coverage=())))
-    monkeypatch.setattr(alert_repository, "load_realtime_screening_input", lambda cursor, **scope: SimpleNamespace(**scope))
+    monkeypatch.setattr(alert_repository, "load_realtime_stock_alert_input",
+                        lambda cursor, **scope: SimpleNamespace(**scope))
     monkeypatch.setattr(alert_repository, "produce_realtime_stock_alerts", _alerts_snapshot(streams))
     monkeypatch.setattr(alert_runners, "materialize_due_realtime_strategies",
                         lambda compute, publication, **options: strategy_calls.append(
@@ -367,16 +372,13 @@ def test_the_ingest_evidence_alerts_and_strategy_stages_run_in_dependency_order_
         ("COMPUTE", "PUBLICATION", ("1d",), first.deadline), ("COMPUTE", "PUBLICATION", ("1h",), first.deadline)]
     assert all(str(o["receipt"].receipt_id) == str(receipts[0][0]) for _, _, o in strategy_calls)
 
-    # Capability roles: ingress writes (fenced), compute writes only the bars/jobs of the bar phase (fenced),
-    # publication writes (fenced).
-    assert world.roles(write=True, fenced=True) == {"ingress", "compute", "publication"}
-    assert "compute" in world.roles(write=False)
+    # Every window stage's writes (ingest, the bar phase, publication) are fenced to its stage run.
+    assert world.writes(fenced=True) and world.reads()
     # The bar phase materialized the two ingested 1m bars in the same window, before the (stubbed) projection.
     assert _query(pool, "SELECT count(*) FROM rt.bar_catalog WHERE cohort_id = %s", (cohort,))[0][0] == 2
     assert _query(pool, "SELECT count(*) FROM rt.bar_current WHERE cohort_id = %s", (cohort,))[0][0] == 2
     assert _query(pool, "SELECT status, count(*) FROM rt.materialization_jobs WHERE cohort_id = %s GROUP BY status",
                   (cohort,)) == [("COMPLETE", 2)]
-    assert world.provider.role_violations == []
 
     # A second window replaces the retained alert snapshot (no forward state) through the real guard SQL.
     later = {stage: runner for stage, runner in runners.items() if stage != "EQUITY_INGEST"}
@@ -402,7 +404,6 @@ def test_the_ingest_evidence_alerts_and_strategy_stages_run_in_dependency_order_
     assert [tuple(row[0]) for row in blocked] == [("STOCK_ALERTS_RETAINED_FORWARD_STATE",)]
     assert _query(pool, "SELECT count(*) FROM rt.snapshot_catalog WHERE cohort_id = %s", (cohort,))[0][0] == 3
     assert world.repository.readiness(world.cohort)["STOCK_ALERTS"] == "BLOCKED"
-    assert world.provider.role_violations == []
 
 
 def test_a_missing_equity_cycle_receipt_fails_alerts_and_strategy_on_the_real_schema(pool, monkeypatch):
@@ -417,7 +418,7 @@ def test_a_missing_equity_cycle_receipt_fails_alerts_and_strategy_on_the_real_sc
     }
     monkeypatch.setattr(alert_runners, "materialize_due_realtime_strategies",
                         lambda *a, **k: pytest.fail("no receipt, nothing to publish"))
-    monkeypatch.setattr(alert_repository, "load_realtime_screening_input",
+    monkeypatch.setattr(alert_repository, "load_realtime_stock_alert_input",
                         lambda *a, **k: pytest.fail("no receipt, nothing to compute"))
     world.clock.value = world.now
     window = world.window(-90)
@@ -544,7 +545,7 @@ def test_the_evidence_bar_phase_materializes_ingested_bars_once_and_a_replay_add
     watermarks = _watermarks(pool, world.cohort)
     assert len(watermarks) == 4  # two tickers x (1m, 5m)
 
-    # Window 2: the real evidence runner drains the batches under the compute role before the projection.
+    # Window 2: the real evidence runner drains the batches before the projection.
     world.transactions.clear()
     second = world.window(-60)
     world.orchestrator({"EQUITY_EVIDENCE": evidence}).run_window(second.window_id)
@@ -556,7 +557,7 @@ def test_the_evidence_bar_phase_materializes_ingested_bars_once_and_a_replay_add
         (ticker, world.instrument_ids[ticker]) for ticker in SMALL_UNIVERSE.equity_tickers}
     assert _jobs(pool, world.cohort) == [("COMPLETE", 1, None), ("COMPLETE", 1, None)]
     assert _watermarks(pool, world.cohort) == watermarks  # the bar phase never touches acquisition watermarks
-    assert world.roles(write=True, fenced=True) == {"compute"} and world.provider.role_violations == []
+    assert world.writes(fenced=True)  # the bar phase's job and bar writes are fenced to the stage run
 
     # Window 3: the same ingest result is replayed and the bar phase runs again: nothing is added anywhere.
     third = world.window(-30)
@@ -608,7 +609,6 @@ def test_a_stage_cancelled_between_bar_jobs_leaves_the_rest_unclaimed_for_the_ne
     assert _stage(pool, third, "EQUITY_EVIDENCE") == ("COMPLETE", ()) and _receipt_count(pool, third) == 1
     assert _sorted_rows(_bar_rows(pool, world.cohort)) == _expected_bars(cache[0])
     assert _jobs(pool, world.cohort) == [("COMPLETE", 1, None), ("COMPLETE", 1, None)]
-    assert world.provider.role_violations == []
 
 
 def test_a_transient_bar_job_failure_degrades_the_stage_and_a_later_window_retries_it(pool, monkeypatch):

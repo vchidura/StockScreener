@@ -4,10 +4,11 @@ Every repository, worker and producer ported from v1 takes a `RealtimeProcessDat
 `process_plan.role` and `transaction(read_only, dict_cursor, isolation_level)`. This adapter satisfies
 that interface on top of `StageContext.transaction`, so those functions run unchanged on the V2
 schema and inherit its guarantees: a cancelled stage cannot open a write transaction, and a window
-stage's writes commit only while its stage run is RUNNING (the stage write fence). A stage that needs
-two roles (for example compute and publication) builds one adapter per role over the same context. The
-options roles (OPTIONS_INGRESS, OPTIONS_COMPUTE) lower-case to the `options_ingress` / `options_compute`
-capability roles of the `runtime_options` principal profile.
+stage's writes commit only while its stage run is RUNNING (the stage write fence).
+
+`process_plan.role` is only the logical wiring label the ported code asserts (a compute half must not
+be handed the publication database). V2 has no per-label database role: every transaction runs as
+the single `app` role.
 """
 from __future__ import annotations
 
@@ -40,7 +41,31 @@ class V2StageDatabase(RealtimeProcessDatabase):
                     isolation_level: str | None = None):
         with self._context.transaction(
             read_only=bool(read_only), dict_cursor=dict_cursor, isolation_level=isolation_level,
-            role=self._process_plan.role.value.lower(),
+        ) as unit_of_work:
+            yield unit_of_work.cursor
+
+
+class V2WorkerDatabase(RealtimeProcessDatabase):
+    """An external leased-job worker over the V2 app pool.
+
+    Stage fencing belongs to the coordinator. Worker writes are instead fenced by the materialization
+    job lease in the same transaction that persists output and completes the job.
+    """
+
+    def __init__(self, provider, role: RealtimeDatabaseRole = RealtimeDatabaseRole.COMPUTE) -> None:
+        if not isinstance(role, RealtimeDatabaseRole):
+            raise TypeError("a worker database requires a RealtimeDatabaseRole")
+        self._provider = provider
+        self._process_plan = StageProcessPlan(role)
+        self._connection_provider = None
+
+    @contextmanager
+    def transaction(self, *, read_only: bool | None = None, dict_cursor: bool = False,
+                    isolation_level: str | None = None):
+        with self._provider.transaction(
+            read_only=bool(read_only),
+            dict_cursor=dict_cursor,
+            isolation_level=isolation_level,
         ) as unit_of_work:
             yield unit_of_work.cursor
 

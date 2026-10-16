@@ -285,6 +285,7 @@ def create_realtime_portal_app(
     repositories: RealtimePortalRepositories,
     *,
     clock: Callable[[], datetime] = _now,
+    database_target: str = EXPECTED_DATABASE_NAME,
 ) -> FastAPI:
     if not isinstance(repositories, RealtimePortalRepositories):
         raise TypeError("realtime portal repositories are invalid")
@@ -292,7 +293,7 @@ def create_realtime_portal_app(
         title="StockScreener Realtime Canary API",
         version="1.0.0-canary",
     )
-    app.state.database_target = EXPECTED_DATABASE_NAME
+    app.state.database_target = database_target
     app.state.canonical_fallback = False
 
     def cutoff() -> datetime:
@@ -311,7 +312,7 @@ def create_realtime_portal_app(
     def health():
         return {
             "status": "READY",
-            "database_target": EXPECTED_DATABASE_NAME,
+            "database_target": app.state.database_target,
             "canonical_fallback": False,
             "provider_fetch_performed": False,
         }
@@ -450,6 +451,30 @@ def create_realtime_portal_app(
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
         except Exception as error:
+            raise unavailable(error) from error
+
+    @app.get("/api/trading-sessions")
+    def trading_sessions(
+        interval: Literal["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"] = "1d",
+        limit: int = Query(260, ge=1, le=2_000),
+        cohort_id: UUID | None = None,
+    ):
+        if repositories.ticker_workspace is None:
+            raise HTTPException(503, "Realtime Ticker Workspace repository is unavailable")
+        try:
+            return repositories.ticker_workspace.trading_sessions(
+                interval=interval,
+                limit=limit,
+                available_by=cutoff(),
+                cohort_id=cohort_id,
+            )
+        except TickerPublicationUnavailable as error:
+            raise HTTPException(503, str(error)) from error
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        except Exception as error:
+            logging.getLogger(__name__).exception(
+                "Realtime ticker trading sessions read failed")
             raise unavailable(error) from error
 
     @app.get("/api/tickers/workspace-publication")

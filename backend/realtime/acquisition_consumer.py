@@ -64,7 +64,7 @@ def build_developer_acquisition_job(
         "batch_payload_sha256": batch.batch_payload_sha256,
         "cohort_id": batch.cohort_id,
         "provider_tier": batch.provider_tier,
-        "fact_schema_version": batch.fact_kind.schema_version,
+        "fact_schema_version": batch.fact_schema_version,
     })
     return MaterializationJob(
         job_id=uuid5(

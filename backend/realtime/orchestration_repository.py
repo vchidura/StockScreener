@@ -2,7 +2,7 @@
 
 The repository port (OrchestrationRepository) is what the orchestrator depends on; the Postgres
 implementation writes rt.window_runs, rt.stage_runs, rt.cycle_receipts, rt.stage_readiness_current
-and rt.release_current as the control capability. Every write after a claim is fenced by the
+and rt.release_current as the runtime role. Every write after a claim is fenced by the
 window owner epoch, so a stale owner cannot change a window another owner has taken over.
 """
 from __future__ import annotations
@@ -18,8 +18,80 @@ from .stage_graph import StageDefinition
 
 TERMINAL_WINDOW_STATES = frozenset({"COMPLETE", "FAILED", "MISSED", "RETAINED_GAP"})
 OWNER_LOST = "OWNER_LOST"
-CONTROL_ROLE = "control"
-CONTROL_PRINCIPAL = "runtime_data"
+EQUITY_WINDOW_BUILD_ID = "v2-10-developer-window-v1"
+
+
+def equity_window_recovery_cursor(cursor, cohort_id: UUID, cutoff: datetime) -> dict:
+    """Reuse only receipts sealed for the same window, cohort, universe and build."""
+    cursor.execute(
+        "SELECT window_run.window_key, window_run.state, window_run.provider_tier, window_run.updated_at, "
+        "receipt.receipt_id, receipt.cohort_id, receipt.cutoff, receipt.universe_sha256, "
+        "receipt.input_sha256, receipt.build_id, receipt.reference_generation, "
+        "manifest.universe_sha256, plan.stage_catalog_version, plan.cohort_id, "
+        "window_run.deadline "
+        "FROM rt.window_runs AS window_run "
+        "JOIN rt.cohorts AS cohort ON cohort.cohort_id=window_run.cohort_id "
+        "JOIN rt.subscription_manifests AS manifest USING (manifest_id) "
+        "JOIN rt.service_plans AS plan ON plan.plan_id=window_run.plan_id "
+        "LEFT JOIN rt.cycle_receipts AS receipt "
+        "ON receipt.window_id=window_run.window_id AND receipt.receipt_kind='INPUT_READY' "
+        "WHERE window_run.cohort_id=%s AND window_run.cutoff=%s "
+        "ORDER BY window_run.updated_at DESC, window_run.window_key",
+        (str(cohort_id), cutoff),
+    )
+    rows = tuple(cursor.fetchall())
+    complete = False
+    receipt_specs = set()
+    input_known_bys = set()
+    for row in rows:
+        if row[4] is None:
+            continue
+        if (
+            row[2] != "MASSIVE_DEVELOPER"
+            or str(row[5]) != str(cohort_id)
+            or row[6] != cutoff
+            or row[7] != row[11]
+            or row[9] != EQUITY_WINDOW_BUILD_ID
+            or row[10] < 1
+            or row[12] != "stages_v2"
+            or str(row[13]) != str(cohort_id)
+            or len(row[8]) != 64
+            or any(character not in "0123456789abcdef" for character in row[8])
+        ):
+            raise ValueError("durable INPUT_READY receipt does not match the recovery scope")
+        receipt_specs.add(CycleReceiptSpec(
+            "INPUT_READY",
+            row[6],
+            int(row[10]),
+            row[7],
+            row[8],
+            row[9],
+        ))
+        if "-receipt-retry" not in row[0]:
+            input_known_bys.add(row[14])
+        complete = complete or row[1] == "COMPLETE"
+    if len(receipt_specs) > 1 or len(input_known_bys) > 1:
+        raise ValueError("durable INPUT_READY receipts disagree on the sealed recovery input")
+    has_receipt = bool(receipt_specs)
+    if has_receipt and not input_known_bys:
+        raise ValueError("durable INPUT_READY receipt lacks its original visibility clock")
+    prefix = "-receipt-retry" if has_receipt else "-acquisition-retry"
+    keys = {row[0] for row in rows}
+    attempt = 1
+    while cutoff.isoformat() + prefix + str(attempt) in keys:
+        attempt += 1
+    failed_at = max(
+        (row[3] for row in rows if row[1] in {"FAILED", "MISSED", "RETAINED_GAP"}),
+        default=None,
+    )
+    return {
+        "complete": complete,
+        "has_input_receipt": has_receipt,
+        "input_receipt": next(iter(receipt_specs), None),
+        "input_known_by": next(iter(input_known_bys), None),
+        "retry_suffix": prefix + str(attempt) if rows else "",
+        "retry_not_before": failed_at + timedelta(minutes=5) if failed_at else None,
+    }
 
 
 class LeaseLost(RuntimeError):
@@ -158,12 +230,11 @@ def _run(row) -> StageRunRecord:
 
 
 class PostgresOrchestrationRepository:
-    def __init__(self, provider: V2ConnectionProvider, *, principal_profile: str = CONTROL_PRINCIPAL) -> None:
+    def __init__(self, provider: V2ConnectionProvider) -> None:
         self._provider = provider
-        self._principal = principal_profile
 
     def _transaction(self, *, read_only: bool = False):
-        return self._provider.transaction(CONTROL_ROLE, self._principal, read_only=read_only)
+        return self._provider.transaction(read_only=read_only)
 
     @staticmethod
     def _fence(cursor, claim: WindowClaim) -> None:
@@ -196,11 +267,16 @@ class PostgresOrchestrationRepository:
     def load_catalog(self, version: str) -> Mapping[str, StageDefinition]:
         with self._transaction(read_only=True) as unit:
             unit.cursor.execute(
-                "SELECT stage_id, domain, prerequisites, principal_profile, capability_role, schedule_kind, "
-                "gates_strategy FROM rt.stage_catalog WHERE version = %s ORDER BY stage_id", (version,))
+                "SELECT stage_id, domain, prerequisites, execution_lane, schedule_kind, gates_strategy, "
+                "deadline_offset_seconds "
+                "FROM rt.stage_catalog WHERE version = %s ORDER BY stage_id", (version,))
             rows = unit.cursor.fetchall()
-        return {row[0]: StageDefinition(row[0], row[1], tuple(row[2]), row[3], row[4], row[5], bool(row[6]))
-                for row in rows}
+        return {
+            row[0]: StageDefinition(
+                row[0], row[1], tuple(row[2]), row[3], row[4], bool(row[5]), row[6],
+            )
+            for row in rows
+        }
 
     def load_plan(self, plan_id: UUID) -> ServicePlan:
         with self._transaction(read_only=True) as unit:

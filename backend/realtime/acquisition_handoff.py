@@ -32,6 +32,7 @@ from .preflight import ProviderTier
 MAX_DEVELOPER_ACQUISITION_FACTS = 1_000
 ACQUISITION_FACT_PAGE_SIZE = 100
 DEVELOPER_EQUITY_BAR_SCHEMA = "developer_equity_bar_v1"
+DEVELOPER_EQUITY_BAR_BULK_SCHEMA = "developer_equity_bar_bulk_v1"
 DEVELOPER_OPTION_SNAPSHOT_SCHEMA = "developer_option_snapshot_v1"
 
 
@@ -176,8 +177,26 @@ def _bar_payload(revision: EquityBarRevision) -> dict[str, object]:
     }
 
 
-def _bar_from_payload(payload: Mapping[str, object]) -> EquityBarRevision:
-    _require_contract_fields(payload, _BAR_FIELDS, DEVELOPER_EQUITY_BAR_SCHEMA)
+def _bar_from_payload(
+    payload: Mapping[str, object],
+    *,
+    schema_version: str = DEVELOPER_EQUITY_BAR_SCHEMA,
+) -> EquityBarRevision:
+    if schema_version == DEVELOPER_EQUITY_BAR_BULK_SCHEMA:
+        _require_contract_fields(
+            payload,
+            (*_BAR_FIELDS, "acquisition_provider_batch_id"),
+            schema_version,
+        )
+        payload = {
+            key: value
+            for key, value in payload.items()
+            if key != "acquisition_provider_batch_id"
+        }
+    elif schema_version == DEVELOPER_EQUITY_BAR_SCHEMA:
+        _require_contract_fields(payload, _BAR_FIELDS, schema_version)
+    else:
+        raise ValueError("Developer equity acquisition fact schema is unsupported")
     session_date = payload["session_date"]
     if not isinstance(session_date, str):
         raise ValueError("bar session_date must be an ISO date")
@@ -466,6 +485,7 @@ def _option_from_payload(payload: Mapping[str, object]) -> OptionContractSnapsho
 class DeveloperEquityBarAcquisitionFact:
     instrument_id: int
     revision: EquityBarRevision
+    acquisition_provider_batch_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if type(self.instrument_id) is not int or self.instrument_id <= 0:
@@ -485,9 +505,16 @@ class DeveloperEquityBarAcquisitionFact:
             raise ValueError(
                 "Developer acquisition requires a final native or lineage-bound derived bar"
             )
+        if (
+            self.acquisition_provider_batch_id is not None
+            and not isinstance(self.acquisition_provider_batch_id, UUID)
+        ):
+            raise TypeError("Developer bulk acquisition provider batch ID is invalid")
 
     @property
     def provider_batch_id(self) -> UUID:
+        if self.acquisition_provider_batch_id is not None:
+            return self.acquisition_provider_batch_id
         assert self.revision.ingestion_segment_id is not None
         return self.revision.ingestion_segment_id
 
@@ -512,7 +539,12 @@ class DeveloperEquityBarAcquisitionFact:
         return self.revision.payload_sha256
 
     def structured_fact(self) -> dict[str, object]:
-        return _bar_payload(self.revision)
+        payload = _bar_payload(self.revision)
+        if self.acquisition_provider_batch_id is not None:
+            payload["acquisition_provider_batch_id"] = str(
+                self.acquisition_provider_batch_id
+            )
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -557,11 +589,31 @@ DeveloperAcquisitionFact = (
 )
 
 
+def _fact_schema_version(
+    facts: Sequence[DeveloperAcquisitionFact],
+) -> str:
+    bulk_flags = tuple(
+        isinstance(fact, DeveloperEquityBarAcquisitionFact)
+        and fact.acquisition_provider_batch_id is not None
+        for fact in facts
+    )
+    if all(isinstance(fact, DeveloperEquityBarAcquisitionFact) for fact in facts):
+        if any(bulk_flags) and not all(bulk_flags):
+            raise ValueError("Developer acquisition cannot mix bulk and ordinary equity facts")
+        return (
+            DEVELOPER_EQUITY_BAR_BULK_SCHEMA
+            if all(bulk_flags)
+            else DEVELOPER_EQUITY_BAR_SCHEMA
+        )
+    return DEVELOPER_OPTION_SNAPSHOT_SCHEMA
+
+
 def _batch_contract(
     *,
     cohort_id: UUID,
     provider_tier: ProviderTier,
     fact_kind: DeveloperAcquisitionFactKind,
+    fact_schema_version: str,
     provider: str,
     provider_batch_id: UUID,
     started_at: datetime,
@@ -572,7 +624,7 @@ def _batch_contract(
         "cohort_id": str(cohort_id),
         "provider_tier": provider_tier.value,
         "fact_kind": fact_kind.value,
-        "fact_schema_version": fact_kind.schema_version,
+        "fact_schema_version": fact_schema_version,
         "provider": provider,
         "provider_batch_id": str(provider_batch_id),
         "started_at": started_at.isoformat(),
@@ -599,6 +651,7 @@ class DeveloperAcquisitionBatch:
     cohort_id: UUID
     provider_tier: ProviderTier
     fact_kind: DeveloperAcquisitionFactKind
+    fact_schema_version: str
     provider: str
     provider_batch_id: UUID
     started_at: datetime
@@ -626,6 +679,9 @@ class DeveloperAcquisitionBatch:
         )
         if any(not isinstance(fact, expected_type) for fact in self.facts):
             raise ValueError("Developer acquisition fact kind is inconsistent")
+        expected_schema = _fact_schema_version(self.facts)
+        if self.fact_schema_version != expected_schema:
+            raise ValueError("Developer acquisition fact schema is inconsistent")
         if any(fact.provider_batch_id != self.provider_batch_id for fact in self.facts):
             raise ValueError("Developer acquisition facts cross provider batches")
         if self.fact_kind is DeveloperAcquisitionFactKind.OPTION_SNAPSHOT and any(
@@ -645,6 +701,7 @@ class DeveloperAcquisitionBatch:
             cohort_id=self.cohort_id,
             provider_tier=self.provider_tier,
             fact_kind=self.fact_kind,
+            fact_schema_version=self.fact_schema_version,
             provider=provider,
             provider_batch_id=self.provider_batch_id,
             started_at=started,
@@ -687,10 +744,12 @@ def build_developer_acquisition_batch(
     normalized_provider = provider.strip()
     started = _utc(started_at, "started_at")
     completed = _utc(completed_at, "completed_at")
+    fact_schema_version = _fact_schema_version(rows)
     contract = _batch_contract(
         cohort_id=cohort_id,
         provider_tier=ProviderTier.MASSIVE_DEVELOPER,
         fact_kind=fact_kind,
+        fact_schema_version=fact_schema_version,
         provider=normalized_provider,
         provider_batch_id=provider_batch_id,
         started_at=started,
@@ -708,6 +767,7 @@ def build_developer_acquisition_batch(
         cohort_id=cohort_id,
         provider_tier=ProviderTier.MASSIVE_DEVELOPER,
         fact_kind=fact_kind,
+        fact_schema_version=fact_schema_version,
         provider=normalized_provider,
         provider_batch_id=provider_batch_id,
         started_at=started,
@@ -760,7 +820,7 @@ def persist_developer_acquisition_batch_cursor(
             str(batch.cohort_id),
             batch.provider_tier.value,
             batch.fact_kind.value,
-            batch.fact_kind.schema_version,
+            batch.fact_schema_version,
             batch.provider,
             str(batch.provider_batch_id),
             str(batch.request_id) if batch.request_id is not None else None,
@@ -792,7 +852,7 @@ def persist_developer_acquisition_batch_cursor(
         str(batch.cohort_id),
         batch.provider_tier.value,
         batch.fact_kind.value,
-        batch.fact_kind.schema_version,
+        batch.fact_schema_version,
         batch.provider,
         str(batch.provider_batch_id),
         batch.started_at,
@@ -838,6 +898,7 @@ def persist_developer_acquisition_batch(
 def _decode_fact(
     *,
     fact_kind: DeveloperAcquisitionFactKind,
+    fact_schema_version: str,
     provider: str,
     provider_batch_id: UUID,
     row: tuple[object, ...],
@@ -855,9 +916,18 @@ def _decode_fact(
     if not isinstance(structured_fact, Mapping):
         raise ValueError("Developer acquisition structured fact must be an object")
     if fact_kind is DeveloperAcquisitionFactKind.EQUITY_BAR:
+        acquisition_provider_batch_id = (
+            UUID(str(structured_fact["acquisition_provider_batch_id"]))
+            if fact_schema_version == DEVELOPER_EQUITY_BAR_BULK_SCHEMA
+            else None
+        )
         fact: DeveloperAcquisitionFact = DeveloperEquityBarAcquisitionFact(
             int(instrument_id),
-            _bar_from_payload(structured_fact),
+            _bar_from_payload(
+                structured_fact,
+                schema_version=fact_schema_version,
+            ),
+            acquisition_provider_batch_id,
         )
     else:
         fact = DeveloperOptionSnapshotAcquisitionFact(
@@ -906,7 +976,12 @@ def _restore_developer_acquisition_batch(
         request_id,
     ) = batch_row
     fact_kind = DeveloperAcquisitionFactKind(str(fact_kind_value))
-    if str(fact_schema_version) != fact_kind.schema_version:
+    supported_schemas = (
+        {DEVELOPER_EQUITY_BAR_SCHEMA, DEVELOPER_EQUITY_BAR_BULK_SCHEMA}
+        if fact_kind is DeveloperAcquisitionFactKind.EQUITY_BAR
+        else {DEVELOPER_OPTION_SNAPSHOT_SCHEMA}
+    )
+    if str(fact_schema_version) not in supported_schemas:
         raise ValueError("Developer acquisition fact schema is unsupported")
     if int(fact_count) != len(fact_rows) or tuple(
         int(row[0]) for row in fact_rows
@@ -916,6 +991,7 @@ def _restore_developer_acquisition_batch(
     facts = tuple(
         _decode_fact(
             fact_kind=fact_kind,
+            fact_schema_version=str(fact_schema_version),
             provider=str(provider),
             provider_batch_id=source_batch_id,
             row=row,
@@ -927,6 +1003,7 @@ def _restore_developer_acquisition_batch(
         cohort_id=UUID(str(cohort_id)),
         provider_tier=ProviderTier(str(provider_tier)),
         fact_kind=fact_kind,
+        fact_schema_version=str(fact_schema_version),
         provider=str(provider),
         provider_batch_id=source_batch_id,
         started_at=started_at,

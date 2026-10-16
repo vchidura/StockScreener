@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -24,7 +24,12 @@ if TYPE_CHECKING:
     from .option_flow.labels import PriorOpenInterest
     from .reference_service import ReferenceSeedService
     from .stage_orchestrator import StageContext
-    from .stage_runners_options import OptionsFlowSettings, OptionsFlowState
+    from .stage_runners_options import (
+        OptionsAcquireResult,
+        OptionsAdmissionResult,
+        OptionsFlowSettings,
+        OptionsFlowState,
+    )
 
 
 def _new_options_flow_state() -> OptionsFlowState:
@@ -36,9 +41,10 @@ def _new_options_flow_state() -> OptionsFlowState:
 class CycleHandoff:
     """Bounded in-process hand-off of a computed ticker cycle from EQUITY_EVIDENCE to PORTAL_PUBLISH.
 
-    Both stages run in the same process and principal lane, so the compute result need not be
+    Both stages normally run in the same process and principal lane, so the compute result need not be
     recomputed. It is an optimization, never a source of truth: when nothing is found (restart between
-    the stages) the publishing stage fails closed and the next window recomputes. At most `capacity`
+    the stages, or an eviction) PORTAL_PUBLISH rebuilds the cycle from durable rows and checks it against
+    the EQUITY_CYCLE receipt. At most `capacity`
     cycles are retained, so memory does not grow when publication falls behind."""
 
     def __init__(self, capacity: int = 2) -> None:
@@ -90,6 +96,7 @@ class RunnerEnvironment:
     equity_source: DeveloperAcquisitionSource | None = None
     universe: UniverseManifest | None = None
     reference_scope: str = "MARKET_REFERENCES"
+    input_known_by: datetime | None = None
     options_flow_source: OptionFlowSource | None = None
     options_flow_semantics: ConditionSemantics | None = None
     options_flow_policy: FlowStrategyPolicy | None = None
@@ -97,3 +104,18 @@ class RunnerEnvironment:
     options_flow_oi_loader: Callable[[StageContext, date], Mapping[str, PriorOpenInterest]] | None = None
     options_flow_clock: Callable[[], float] = time.monotonic
     options_flow_state: OptionsFlowState = field(default_factory=_new_options_flow_state)
+    options_acquire_action: Callable[[StageContext], OptionsAcquireResult] | None = None
+    options_admission_action: Callable[[StageContext], OptionsAdmissionResult] | None = None
+    # A long-running service sets `freeze_heap`: after the first successful ticker cycle the primed state is
+    # moved out of the cyclic collector's view (gc.freeze), so later gen-2 collections skip the retained bars.
+    freeze_heap: bool = False
+    heap_frozen: bool = False
+
+    def known_by(self, window) -> datetime:
+        value = self.input_known_by or window.deadline
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("runner input visibility clock must be timezone-aware")
+        known_by = value.astimezone(timezone.utc)
+        if known_by < window.cutoff:
+            raise ValueError("runner input visibility clock cannot precede the cutoff")
+        return known_by

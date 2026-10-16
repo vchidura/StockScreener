@@ -16,6 +16,24 @@ MAX_BAR_PERSIST_BATCH = 1_000
 BAR_BATCH_PAGE_SIZE = 100
 
 
+def _current_source_precedence(alias: str) -> str:
+    return (
+        "CASE "
+        f"WHEN {alias}.adjustment_basis='ADJUSTED' AND {alias}.interval='1d' "
+        f"AND {alias}.source_kind='NATIVE_REST' THEN 5 "
+        f"WHEN {alias}.adjustment_basis='ADJUSTED' AND {alias}.interval IN ('1wk','1mo') "
+        f"AND {alias}.source_kind='DERIVED' THEN 5 "
+        f"WHEN {alias}.adjustment_basis='RAW_UNADJUSTED' AND {alias}.interval IN ('1m','5m') "
+        f"AND {alias}.source_kind='NATIVE_REST' THEN 5 "
+        f"WHEN {alias}.adjustment_basis='RAW_UNADJUSTED' "
+        f"AND {alias}.interval IN ('15m','30m','1h','1d') "
+        f"AND {alias}.source_kind='DERIVED' THEN 5 "
+        f"WHEN {alias}.source_kind='RECONCILED' THEN 4 "
+        f"WHEN {alias}.source_kind='NATIVE_REST' THEN 3 "
+        f"WHEN {alias}.source_kind='DERIVED' THEN 2 ELSE 1 END"
+    )
+
+
 def persist_realtime_equity_bars_cursor(
     cursor,
     facts: Sequence[RealtimeEquityBarFact],
@@ -173,11 +191,9 @@ def persist_realtime_equity_bars_cursor(
         "observed_at=EXCLUDED.observed_at, updated_at=clock_timestamp() "
         "WHERE rt.bar_current.provider_tier=EXCLUDED.provider_tier "
         "AND rt.bar_current.bar_end=EXCLUDED.bar_end AND ("
-        "CASE EXCLUDED.source_kind WHEN 'RECONCILED' THEN 4 "
-        "WHEN 'NATIVE_REST' THEN 3 WHEN 'DERIVED' THEN 2 ELSE 1 END > "
-        "CASE rt.bar_current.source_kind WHEN 'RECONCILED' THEN 4 "
-        "WHEN 'NATIVE_REST' THEN 3 WHEN 'DERIVED' THEN 2 ELSE 1 END "
-        "OR (rt.bar_current.source_kind=EXCLUDED.source_kind "
+        + _current_source_precedence("EXCLUDED") + " > "
+        + _current_source_precedence("rt.bar_current")
+        + " OR (rt.bar_current.source_kind=EXCLUDED.source_kind "
         "AND rt.bar_current.observed_at < EXCLUDED.observed_at))",
         [
             (

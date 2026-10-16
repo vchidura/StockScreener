@@ -19,12 +19,16 @@ from realtime.migrations import (
     validate_target_database_v2,
 )
 from realtime.relation_registry import (
-    CAPABILITY_ROLES,
+    ADMIN_ROLE,
+    API_ROLE,
+    APP_ROLE,
     PARTITION_POLICY_SEEDS,
     PARTITIONED_RELATIONS,
-    PRINCIPAL_PROFILES,
     RELATIONS,
+    ROLES,
+    RUNTIME_ROLES,
     SECURITY_PHASES,
+    Relation,
     grants,
     security_policy,
 )
@@ -32,6 +36,10 @@ from realtime.security_v2 import build_role_names_v2, record_security_audit_v2
 
 SQL_DIR = Path(V2_MIGRATIONS_DIR)
 _CREATE_TABLE = re.compile(r"^CREATE TABLE ((?:ref|rt)\.[a-z_0-9]+)", re.MULTILINE)
+_TRIGGER = re.compile(
+    r"CREATE TRIGGER\s+\w+\s+BEFORE\s+([A-Z ]+?)\s+ON\s+((?:ref|rt)\.\w+)\s+"
+    r"FOR EACH (ROW|STATEMENT)\s+EXECUTE FUNCTION\s+(rt\.\w+)\(\)", re.DOTALL)
+_UPDATE_BLOCKING_FUNCTIONS = ("rt.reject_immutable_change", "rt.reject_catalog_update")
 
 
 def _sql(name: str) -> str:
@@ -104,24 +112,75 @@ def test_stage_catalog_seeds_keep_options_out_of_equity_prerequisites():
         return 1 + max((depth(item, (*seen, name)) for item in stages[name][1]), default=0)
 
     assert max(depth(name) for name in stages) == 4
-    gates = re.findall(r"\('([A-Z_]+)', 'stages_v1'.*?, (true|false)\)", text)
+    gates = re.findall(r"\('([A-Z_]+)', 'stages_v1'.*?, (true|false), (?:NULL|\d+)\)", text)
     assert {name for name, flag in gates if flag == "true"} == {"OPTIONS_CYCLE"}
 
 
-def test_registry_invariants_and_separation_of_duties():
-    assert "owner" not in CAPABILITY_ROLES
+def test_stages_v2_catalog_has_explicit_independent_equity_lanes():
+    text = _sql("004_realtime_orchestration.sql")
+    rows = re.findall(
+        r"\('([A-Z_]+)', 'stages_v2', '(shared|equity|options)', ARRAY\[([^\]]*)\](?:::text\[\])?, "
+        r"'([a-z]+)', '([A-Z]+)', (true|false), (NULL|\d+)\)",
+        text,
+    )
+    stages = {
+        name: (domain, tuple(re.findall(r"'([A-Z_]+)'", prerequisites)), lane)
+        for name, domain, prerequisites, lane, _schedule, _gate, _deadline in rows
+    }
+    assert stages["EQUITY_MATERIALIZE"] == ("equity", ("EQUITY_INGEST",), "data")
+    assert stages["STOCK_ALERTS"] == ("equity", ("EQUITY_MATERIALIZE",), "alert")
+    assert stages["EQUITY_PROJECTION"] == ("equity", ("EQUITY_MATERIALIZE",), "portal")
+    assert stages["PORTAL_PUBLISH"] == ("equity", ("EQUITY_PROJECTION",), "portal")
+
+
+def _update_blocked_tables() -> set[str]:
+    return {table for events, table, scope, function in _TRIGGER.findall(_all_sql())
+            if scope == "ROW" and "UPDATE" in events.split() and function in _UPDATE_BLOCKING_FUNCTIONS}
+
+
+def test_registry_invariants_and_role_separation():
+    assert ROLES == (ADMIN_ROLE, APP_ROLE, API_ROLE) == ("admin", "app", "api")
+    assert RUNTIME_ROLES == (APP_ROLE, API_ROLE)
     for name, spec in RELATIONS.items():
         privileges = grants()[name]
-        if spec.domain == "equity":
-            assert not any(role.startswith("options_") for role in (*spec.insert, *spec.update, *spec.delete)), name
-        if spec.domain == "options":
-            assert not any(role in {"compute", "ingress"} for role in (*spec.insert, *spec.update)), name
-        assert "reader" not in {role for privilege, roles in privileges.items() if privilege != "SELECT"
+        granted = {role for roles in privileges.values() for role in roles}
+        assert granted <= set(RUNTIME_ROLES), name  # admin owns every relation and is never granted
+        assert API_ROLE not in {role for privilege, roles in privileges.items() if privilege != "SELECT"
                                 for role in roles}, name
-    for principal, memberships in PRINCIPAL_PROFILES.items():
-        assert set(memberships) <= {"owner", *CAPABILITY_ROLES}
-    assert not set(PRINCIPAL_PROFILES["runtime_options"]) & {"ingress", "compute", "references", "publication"}
-    assert not set(PRINCIPAL_PROFILES["runtime_data"]) & {"options_ingress", "options_compute"}
+        if spec.retention == "OWNER_ONLY":
+            assert not privileges, name
+            continue
+        assert APP_ROLE in privileges["SELECT"], name
+        assert (API_ROLE in privileges["SELECT"]) == spec.api, name
+        assert ("INSERT" in privileges and "UPDATE" in privileges) == (spec.writes != "NONE"), name
+        assert ("DELETE" in privileges) == spec.delete, name
+    # app deletes only from the runtime tables that retention prunes row by row; catalogs and
+    # partitions are pruned by admin, which owns them.
+    assert {name for name, spec in RELATIONS.items() if spec.delete} == {
+        "rt.worker_leases", "rt.provider_request_ledger", "rt.materialization_jobs", "rt.job_barriers",
+        "rt.job_barrier_members", "rt.option_volume_checkpoints"}
+
+
+def test_relation_rejects_grants_that_break_the_role_model():
+    with pytest.raises(ValueError):
+        Relation("shared", "BOUNDED", writes="APPEND", delete=True)
+    with pytest.raises(ValueError):
+        Relation("shared", "OWNER_ONLY", writes="MUTABLE")
+    with pytest.raises(ValueError):
+        Relation("shared", "OWNER_ONLY", api=True)
+    with pytest.raises(ValueError):
+        Relation("shared", "BOUNDED", writes="OVERWRITE")
+
+
+def test_append_only_relations_are_kept_append_only_by_a_trigger_not_by_withholding_update():
+    blocked = _update_blocked_tables()
+    append_only = {name for name, spec in RELATIONS.items() if spec.writes == "APPEND"}
+    mutable = {name for name, spec in RELATIONS.items() if spec.writes == "MUTABLE"}
+    assert append_only and mutable
+    assert not append_only - blocked, sorted(append_only - blocked)
+    assert not mutable & blocked, sorted(mutable & blocked)
+    for name in append_only:
+        assert "UPDATE" in grants()[name]  # app holds UPDATE; the trigger is the only guard
 
 
 def test_immutable_bodies_have_triggers_and_local_mock_is_owner_only():
@@ -146,9 +205,14 @@ def test_target_validation_accepts_only_the_v2_name_or_disposable_v2_names():
 
 def test_role_names_use_prefix_and_stay_within_postgres_limits():
     roles = build_role_names_v2("stocks_realtime_v2")
-    assert roles.name("runtime_options") == "stocks_realtime_v2_runtime_options"
+    assert roles.name("app") == "stocks_realtime_v2_app"
+    assert roles.all_names == ("stocks_realtime_v2_admin", "stocks_realtime_v2_app", "stocks_realtime_v2_api")
+    assert roles.runtime_names == ("stocks_realtime_v2_app", "stocks_realtime_v2_api")
     assert all(len(name) <= 63 for name in roles.all_names)
     assert len(set(roles.all_names)) == len(roles.all_names)
+    for removed in ("owner", "runtime_options", "compute", "reader"):
+        with pytest.raises(ValueError):
+            roles.name(removed)
     with pytest.raises(ValueError):
         build_role_names_v2("Bad Prefix")
 
@@ -217,8 +281,8 @@ class _Connection:
 
 def test_audit_is_recorded_only_when_every_check_passed():
     connection = _Connection()
-    with pytest.raises(RuntimeError, match="capability_privileges_match_registry"):
-        record_security_audit_v2(connection, [("capability_privileges_match_registry", "FAIL missing"),
+    with pytest.raises(RuntimeError, match="runtime_privileges_match_registry"):
+        record_security_audit_v2(connection, [("runtime_privileges_match_registry", "FAIL missing"),
                                               ("no_public_table_privileges", "PASS")])
     assert connection.log == []
     record_security_audit_v2(connection, [("no_public_table_privileges", "PASS")])

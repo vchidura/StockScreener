@@ -3,14 +3,14 @@
 
 Run this only after the pipeline is validated with the runtime connected as the owner (security
 deferred). PLAN (default) is read-only and reports the ledger phase and which roles exist.
---execute ensures the NOLOGIN capability and principal roles (re-runnable; existing roles must
+--execute ensures the NOLOGIN admin, app and api roles (re-runnable; existing roles must
 match the policy), applies the registry grants, audits exact privileges and records AUDITED only
 on a clean audit. A failed audit leaves the ledger at APPLIED, which a hardened runtime refuses.
 
 Targets: test_realtime_v2_* with --allow-disposable, or stocks_realtime_v2 with
 --authorization-reference naming the explicit approval. stocks_realtime_v1 is never accepted.
-LOGIN principals and their credentials are NOT created here: that credential model is a separate,
-explicit decision. This script makes no provider request and prints no credential.
+LOGIN on the app and api roles and their credentials are NOT created here: that credential model is a
+separate, explicit decision. This script makes no provider request and prints no credential.
 """
 from __future__ import annotations
 

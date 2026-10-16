@@ -5,13 +5,17 @@ import re
 from pathlib import Path
 
 from realtime.migrations import V2_MIGRATIONS_DIR
-from realtime.relation_registry import CAPABILITY_ROLES, PRINCIPAL_PROFILES
 from realtime.stage_graph import (
+    ALERT_LANE,
+    DATA_LANE,
     NON_COMPLETING_STATES,
+    OPTIONS_LANE,
+    PORTAL_LANE,
     STAGES_V1,
+    STAGES_V2,
     Action,
     decide_window,
-    principal_profiles_required,
+    lanes_required,
     startable_stages,
 )
 
@@ -24,22 +28,82 @@ STATES = ("PENDING", "RUNNING", "COMPLETE", "FAILED", "BLOCKED_PREREQ", "BLOCKED
 def test_stage_graph_equals_sql_seed():
     text = (Path(V2_MIGRATIONS_DIR) / "004_realtime_orchestration.sql").read_text(encoding="utf-8")
     rows = re.findall(
-        r"\('([A-Z_]+)', 'stages_v1', '(shared|equity|options)', ARRAY\[([^\]]*)\](?:::text\[\])?, '([a-z_]+)', "
-        r"'(runtime_data|runtime_options)', '([A-Z]+)', (true|false)\)", text)
-    parsed = {name: (domain, tuple(re.findall(r"'([A-Z_]+)'", prerequisites)), profile, capability, schedule,
-                     gate == "true")
-              for name, domain, prerequisites, capability, profile, schedule, gate in rows}
-    assert parsed == {name: (stage.domain, stage.prerequisites, stage.principal_profile, stage.capability_role,
-                             stage.schedule_kind, stage.gates_strategy)
+        r"\('([A-Z_]+)', 'stages_v1', '(shared|equity|options)', ARRAY\[([^\]]*)\](?:::text\[\])?, "
+        r"'([a-z]+)', '([A-Z]+)', (true|false), (NULL|\d+)\)", text)
+    parsed = {
+        name: (
+            domain,
+            tuple(re.findall(r"'([A-Z_]+)'", prerequisites)),
+            lane,
+            schedule,
+            gate == "true",
+            None if deadline == "NULL" else int(deadline),
+        )
+        for name, domain, prerequisites, lane, schedule, gate, deadline in rows
+    }
+    assert parsed == {
+        name: (
+            stage.domain,
+            stage.prerequisites,
+            stage.lane,
+            stage.schedule_kind,
+            stage.gates_strategy,
+            stage.deadline_offset_seconds,
+        )
                       for name, stage in STAGES_V1.items()}
     assert set(parsed) == set(STAGES_V1)
 
 
-def test_each_stage_capability_role_belongs_to_its_principal_profile():
+def test_v2_catalog_splits_shared_materialization_from_alert_and_portal_lanes():
+    text = (Path(V2_MIGRATIONS_DIR) / "004_realtime_orchestration.sql").read_text(encoding="utf-8")
+    rows = re.findall(
+        r"\('([A-Z_]+)', 'stages_v2', '(shared|equity|options)', ARRAY\[([^\]]*)\](?:::text\[\])?, "
+        r"'([a-z]+)', '([A-Z]+)', (true|false), (NULL|\d+)\)", text)
+    parsed = {
+        name: (
+            domain,
+            tuple(re.findall(r"'([A-Z_]+)'", prerequisites)),
+            lane,
+            schedule,
+            gate == "true",
+            None if deadline == "NULL" else int(deadline),
+        )
+        for name, domain, prerequisites, lane, schedule, gate, deadline in rows
+    }
+    assert parsed == {
+        name: (
+            stage.domain,
+            stage.prerequisites,
+            stage.lane,
+            stage.schedule_kind,
+            stage.gates_strategy,
+            stage.deadline_offset_seconds,
+        )
+        for name, stage in STAGES_V2.items()
+    }
+    assert STAGES_V2["EQUITY_MATERIALIZE"].lane == DATA_LANE
+    assert STAGES_V2["STOCK_ALERTS"].lane == ALERT_LANE
+    assert {
+        STAGES_V2[name].lane for name in ("EQUITY_PROJECTION", "PORTAL_PUBLISH", "STRATEGY_PUBLISH")
+    } == {PORTAL_LANE}
+    assert STAGES_V2["STOCK_ALERTS"].prerequisites == ("EQUITY_MATERIALIZE",)
+    assert STAGES_V2["EQUITY_PROJECTION"].prerequisites == ("EQUITY_MATERIALIZE",)
+    assert STAGES_V2["PORTAL_PUBLISH"].prerequisites == ("EQUITY_PROJECTION",)
+    assert STAGES_V2["EQUITY_MATERIALIZE"].deadline_offset_seconds == 120
+    assert STAGES_V2["STOCK_ALERTS"].deadline_offset_seconds == 120
+    assert STAGES_V2["EQUITY_PROJECTION"].deadline_offset_seconds == 300
+    assert STAGES_V2["PORTAL_PUBLISH"].deadline_offset_seconds == 300
+    assert lanes_required(STAGES_V2, STAGES_V2) == frozenset(
+        {DATA_LANE, ALERT_LANE, PORTAL_LANE, OPTIONS_LANE}
+    )
+
+
+def test_options_stages_run_in_their_own_lane_and_nothing_else_does():
     for name, stage in STAGES_V1.items():
-        assert stage.capability_role in PRINCIPAL_PROFILES[stage.principal_profile], name
-        assert (stage.capability_role in CAPABILITY_ROLES)
-        assert (stage.domain == "options") == stage.capability_role.startswith("options_")
+        assert stage.lane == (OPTIONS_LANE if stage.domain == "options" else DATA_LANE), name
+    assert {stage.lane for stage in STAGES_V1.values()} == {DATA_LANE, OPTIONS_LANE}
+    assert not hasattr(STAGES_V1["REFERENCE"], "capability_role")
+    assert not hasattr(STAGES_V1["REFERENCE"], "principal_profile")
 
 
 def test_blocked_options_admission_does_not_stop_equity_reference_or_portal():
@@ -105,10 +169,10 @@ def test_a_blocked_shared_reference_holds_only_its_actual_dependents_in_startup_
     assert "EQUITY_INGEST" not in startable_stages(frozenset({"EQUITY_INGEST"}), readiness)
 
 
-def test_service_starts_with_blocked_options_and_needs_only_enabled_principals():
+def test_service_starts_with_blocked_options_and_needs_only_enabled_lanes():
     readiness = {"OPTIONS_ADMISSION": "BLOCKED", "OPTIONS_CYCLE": "BLOCKED", "REFERENCE": "READY"}
     started = startable_stages(ALL, readiness)
     assert INDEPENDENT <= started
     assert "OPTIONS_CYCLE" not in started and "OPTIONS_ADMISSION" not in started
-    assert principal_profiles_required(INDEPENDENT) == frozenset({"runtime_data"})
-    assert principal_profiles_required(ALL) == frozenset({"runtime_data", "runtime_options"})
+    assert lanes_required(INDEPENDENT) == frozenset({DATA_LANE})
+    assert lanes_required(ALL) == frozenset({DATA_LANE, OPTIONS_LANE})

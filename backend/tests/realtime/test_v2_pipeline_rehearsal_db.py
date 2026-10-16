@@ -50,18 +50,19 @@ PART A (deferred security: one owner pool, the runtime connects as the database 
     cutoffs follow the close; the strategies find the retained snapshots of W1's market time (ALREADY_STORED,
     validated, nothing new published) in every one of them.
 
-PART B (hardened security, principals simulated with SET ROLE from the admin connection)
-    harden_database_v2 creates the NOLOGIN roles and grants and the exact-privilege audit must end AUDITED.
-    The runtime then uses one pool per principal profile (runtime_data, api; no owner pool) whose connections
-    are the admin connection with `SET ROLE <principal>` applied at checkout (and RESET ROLE on release), so
-    V2ConnectionProvider's per-transaction `SET LOCAL ROLE <capability>` runs inside the principal as in
+PART B (hardened security, roles simulated with SET ROLE from the admin connection)
+    harden_database_v2 creates the NOLOGIN admin, app and api roles and grants and the exact-privilege audit
+    must end AUDITED. The runtime then uses one pool per role (app, api; no owner pool) whose connections
+    are the admin connection with `SET ROLE <role>` applied at checkout (and RESET ROLE on release), so
+    V2ConnectionProvider's per-transaction `SET LOCAL ROLE <role>` runs inside it as in
     production. A new REFERENCE seed (generation 2), a new ingest of restated bars and one full window (W4,
-    +4 min) then run under the principals, including the reader's default `current` mode through the `api`
-    principal, the screening repository and the kept tier (strategies, session-close releases); out-of-role
-    writes are rejected by PostgreSQL (compute -> portal snapshot, publication -> bar, ingress -> bar_current
-    update, reader -> anything). W4's strategies only READ (ALREADY_STORED, same market time as W1), so the
-    session-close writes (kept-only, hot-and-kept, SESSION_CLOSE release) are probed under the hardened
-    `publication` role with probe snapshots and rolled back; W1 took them for real under the owner pool.
+    +4 min) then run as `app`, including the reader's default `current` mode through the `api`
+    role, the screening repository and the kept tier (strategies, session-close releases); forbidden
+    writes are rejected by PostgreSQL (an UPDATE of an append-only table by its trigger, a DELETE, a read of
+    an owner-only table and DDL by missing privileges, and any write as api). W4's strategies only READ
+    (ALREADY_STORED, same market time as W1), so the session-close writes (kept-only, hot-and-kept,
+    SESSION_CLOSE release) are probed as the hardened `app` role with probe snapshots and rolled back; W1 took
+    them for real under the owner pool.
 
 TEST-SIDE SIMULATIONS (all that remain; each one is marked where it happens)
     * Time. The orchestrator Clock is a settable value: a window runs at its release time + 1 s (real now), and
@@ -75,40 +76,66 @@ TEST-SIDE SIMULATIONS (all that remain; each one is marked where it happens)
     * History bootstrap. No stage bootstraps a history (finding F4), so the 13 bootstrap windows run the real
       EQUITY_INGEST plus the bar drain of EQUITY_EVIDENCE only (its projection needs the whole history).
     * Windows after the final one (W2..W4) have cutoffs after the close: they stand for restatement re-runs.
-    * The principals: PostgreSQL lets a superuser session user SET ROLE to any role, so the principal ->
-      capability MEMBERSHIP is enforced by the provider (PermissionError) and verified with pg_has_role; the
-      capability roles' table grants are enforced by the server (b4 shows the rejections).
+    * The roles: PostgreSQL lets a superuser session user SET ROLE to any role, so the simulation proves the
+      grants (the server enforces them for the role in force) but not a LOGIN credential; admin, app and api
+      share no membership, which is verified with pg_has_role.
     * `created_at` of a bar is the database insert time and cannot be set: a deadline is "passed" for it only by
       real time passing, which is why W1 and W2 have short budgets.
     * STOCK_ALERTS has no context / forward / replay producer: every window reports exactly those three
       MISSING_PRODUCER codes (asserted), the only degraded codes of the whole run.
 
-NOT EXERCISED: provider calls (none exist here), the options stages, a LOGIN principal, the connection-pool
-    budget of the real deployment, a strategy FIRST publication under the hardened principals (probed in b5
+NOT EXERCISED: provider calls (none exist here), the options stages, a LOGIN role, the connection-pool
+    budget of the real deployment, a strategy FIRST publication as the hardened app role (probed in b5
     instead), a second session (the retained-history input of the rolling strategies is empty) and the dashboard
     publication (no stage publishes it).
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import threading
 import time
-from collections import Counter, namedtuple
+from collections import Counter, deque, namedtuple
 from contextlib import closing, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 import psycopg2.errors
 from psycopg2 import sql
+from fastapi.testclient import TestClient
 
 import exchange_calendars
 import realtime.ticker_repository as ticker_repository
 from equity.calendar import latest_expected_market_time
-from realtime.contracts import UniverseManifest, canonical_json
-from realtime.database_access import RealtimeDatabaseRole
+from equity.domain import BarSourceKind
+from realtime.advanced_equity_journal_bridge import (
+    AdvancedEquityJournalBridgeConfig,
+    process_advanced_equity_journal_once,
+)
+from realtime.advanced_gateway import AdvancedGateway, GatewayConfiguration
+from realtime.bridge import drain_raw_buffer_once
+from realtime.buffer import BufferLimits, RawMessageBuffer
+from realtime.contracts import (
+    AssetClass,
+    MarketChannel,
+    MarketFeed,
+    SubscriptionManifest,
+    SubscriptionMember,
+    UniverseManifest,
+    canonical_json,
+    canonical_sha256,
+)
+from realtime.database_access import (
+    RealtimeDatabasePrincipal,
+    RealtimeDatabaseRole,
+    RealtimePoolBudget,
+    RealtimeProcessDatabasePlan,
+    RoleScopedConnectionProvider,
+)
 from realtime.database_access_v2 import (
     OWNER_POOL,
     V2AccessConfig,
@@ -116,14 +143,32 @@ from realtime.database_access_v2 import (
     verify_pool_target_v2,
 )
 from realtime.equity_bar_drain import drain_equity_bar_jobs, lease_owner_for
+from realtime.equity_bar_adapter import (
+    RealtimeEquityBarFact,
+    adapt_derived_equity_bar,
+)
+from realtime.equity_bar_repository import persist_realtime_equity_bars_cursor
+from realtime.equity_interval_finalizer import (
+    EQUITY_INTERVAL_FINALIZE_JOB,
+    EquityWorkerConfig,
+    enqueue_five_minute_finalizer_jobs_cursor,
+    run_five_minute_finalizer_once,
+)
+from realtime.journal import RawJournalReader, RawJournalWriter
 from realtime.lineage_head import (
     BOUNDED_MANIFEST_BYTES,
     BOUNDED_WORKSPACE_PAYLOAD_BYTES,
     inputs_sha256,
     reference_set,
 )
+from realtime.normalizer import (
+    NORMALIZER_VERSION,
+    InstrumentAdmission,
+    normalize_raw_message,
+)
 from realtime.orchestration_repository import PostgresOrchestrationRepository, WindowSpec
 from realtime.portal_compatibility_repository import RealtimeScreeningRepository, load_session_close_releases
+from realtime.portal_api import build_realtime_portal_repositories, create_realtime_portal_app
 from realtime.portal_projection import build_portal_snapshot
 from realtime.portal_projection_repository import (
     RELEASE_CLASS_SESSION_CLOSE,
@@ -134,8 +179,8 @@ from realtime.portal_projection_repository import (
     publish_portal_release_cursor,
 )
 from realtime.preflight import ProviderTier
-from realtime.relation_registry import CAPABILITY_ROLES, PRINCIPAL_PROFILES
-from realtime.runner_environment import RunnerEnvironment
+from realtime.relation_registry import ROLES
+from realtime.runner_environment import CycleHandoff, RunnerEnvironment
 from realtime.screening_delta_loader import ScreeningInputLoader
 from realtime.screening_projection import RealtimeScreeningInput
 from realtime.screening_repository import load_realtime_screening_input
@@ -145,9 +190,16 @@ from realtime.security_v2 import (
     drop_disposable_roles_v2,
     harden_database_v2,
 )
-from realtime.stage_database_v2 import StageProcessPlan, V2StageDatabase
+from realtime.stage_database_v2 import StageProcessPlan, V2StageDatabase, V2WorkerDatabase
+from realtime.stage_graph import STAGES_V2
 from realtime.stage_orchestrator import StageOrchestrator, StageOutcome
 from realtime.stage_runners_alerts import EVALUATED_ANALYSIS_STATUSES
+from realtime.stage_runners_equity import (
+    FINALIZER_POLICY_SHA256,
+    INPUT_READY,
+    PORTAL_READY,
+    input_ready_identity,
+)
 from realtime.stage_runners_v2 import build_runners
 from realtime.stock_alert_projection import STOCK_ALERTS_VERSION
 from realtime.stock_alert_repository import RealtimeStockAlertViewRepository, StockAlertQueryRejected
@@ -162,7 +214,9 @@ from realtime.ticker_projection import (
     project_realtime_ticker_workspace,
 )
 from realtime.ticker_references import compose_evidence
-from realtime.ticker_repository import RealtimeTickerWorkspaceRepository, compute_realtime_ticker_cycle
+from realtime.ticker_repository import (
+    RealtimeTickerWorkspaceRepository, compute_realtime_ticker_cycle, publish_realtime_ticker_cycle,
+)
 from realtime.v2_service import V2Service
 from realtime.worker_database import RealtimeProcessDatabase
 from tests.realtime import rehearsal_support as support
@@ -173,13 +227,14 @@ pytestmark = requires_v2_database
 
 UTC = timezone.utc
 DATABASE = "test_realtime_v2_e2e_a"
-ROLE_PREFIX = f"test_rt_e2e_{uuid4().hex[:6]}"
+ROLE_PREFIX = "test_rt_e2e_a"
+PRESERVE_DATABASE = os.getenv("STOCKS_V2_PRESERVE_DATABASE") == "1"
 TICKERS = support.FIRST_TICKERS
 UNIVERSE = UniverseManifest("rehearsal-v1", TICKERS, ())
 ENABLED = frozenset({"REFERENCE", "EQUITY_INGEST", "EQUITY_EVIDENCE", "PORTAL_PUBLISH", "STRATEGY_PUBLISH",
                      "STOCK_ALERTS"})
 WINDOW_STAGES = ("EQUITY_INGEST", "EQUITY_EVIDENCE", "PORTAL_PUBLISH", "STOCK_ALERTS", "STRATEGY_PUBLISH")
-Used = namedtuple("Used", "stage window role profile read_only fenced")
+Used = namedtuple("Used", "stage window read_only fenced")
 
 
 class SimulatedCrash(BaseException):
@@ -243,13 +298,14 @@ def roles():
     try:
         yield names
     finally:
-        remaining = _drop_roles(names)  # the database fixture is torn down first, so nothing depends on them
-        assert remaining == [], f"disposable roles were left behind: {remaining}"
+        if not PRESERVE_DATABASE:
+            remaining = _drop_roles(names)  # the database fixture is torn down first, so nothing depends on them
+            assert remaining == [], f"disposable roles were left behind: {remaining}"
 
 
 @pytest.fixture(scope="module")
 def pool(roles, anchor):
-    with disposable_v2_database(DATABASE) as connection_pool:
+    with disposable_v2_database(DATABASE, preserve=PRESERVE_DATABASE) as connection_pool:
         yield connection_pool
 
 
@@ -269,17 +325,17 @@ class Runtime:
         self.transactions: list[Used] = []
         self.timings: dict[tuple, float] = {}
         self.crash_after: set[tuple] = set()
+        self.crash_before: set[tuple] = set()
         self.watermarks_before_drain: dict[str, list] = {}
         self.loads: dict[tuple, object] = {}
         original = provider.transaction
 
         @contextmanager
-        def recording(capability_role, principal_profile, **options):
+        def recording(*args, **options):
             where = getattr(ACTIVE, "stage", None) or (None, None)
-            with original(capability_role, principal_profile, **options) as unit:
-                # recorded once the access layer accepted the (role, profile) pair
-                self.transactions.append(Used(where[1], where[0], capability_role, principal_profile,
-                                              bool(options.get("read_only")), options.get("fence") is not None))
+            with original(*args, **options) as unit:
+                self.transactions.append(Used(where[1], where[0], bool(options.get("read_only")),
+                                              options.get("fence") is not None))
                 yield unit
 
         provider.transaction = recording
@@ -287,6 +343,8 @@ class Runtime:
         self.runners = {stage: self._instrument(stage, runner) for stage, runner in base.items()}
         self.runners["EQUITY_EVIDENCE"] = self._instrument("EQUITY_EVIDENCE", self._crashable(
             "EQUITY_EVIDENCE", self._watching(base["EQUITY_EVIDENCE"])))
+        self.runners["PORTAL_PUBLISH"] = self._instrument("PORTAL_PUBLISH", self._crashable(
+            "PORTAL_PUBLISH", self._dying_first("PORTAL_PUBLISH", base["PORTAL_PUBLISH"])))
         # The history-bootstrap windows run the bar drain of EQUITY_EVIDENCE only: its projection needs the whole
         # history, which the bootstrap is still collecting (finding F4: no stage bootstraps a history).
         self.bootstrap_evidence = self._instrument("EQUITY_EVIDENCE", self._bootstrap_drain())
@@ -312,6 +370,21 @@ class Runtime:
             return outcome
 
         return run
+
+    def _dying_first(self, stage, runner):
+        def run(context):
+            if (context.window.window_key, stage, context.attempt) in self.crash_before:
+                raise SimulatedCrash(f"{stage} died before its work")  # the stage's input stage committed
+            return runner(context)
+
+        return run
+
+    def restart(self) -> None:
+        """What a new process starts with: no hand-off, no projection state, no delta loader. The database (and
+        so every receipt, evidence row and release) is all that survives."""
+        self.environment.handoff = CycleHandoff()
+        self.environment.ticker_state = TickerProjectionState()
+        self.environment.screening_loader = ScreeningInputLoader()
 
     def _watching(self, runner):
         def run(context):
@@ -358,11 +431,12 @@ class Runtime:
                                     "EQUITY_EVIDENCE": self.bootstrap_evidence}).run_window(record.window_id)
         return record, report
 
-    def run_window(self, spec, *, stub=()):
-        """The real window through V2Service.poll_windows with the real runner table (`stub` stages are no-ops)."""
+    def run_window(self, spec, *, stub=(), **options):
+        """The real window through V2Service.poll_windows with the real runner table (`stub` stages are no-ops;
+        `options` go to the StageOrchestrator, e.g. max_attempts)."""
         self.clock.value = spec.release_at + timedelta(seconds=1)
         table = {stage: runner for stage, runner in self.runners.items() if stage not in stub}
-        service = V2Service(self.orchestrator(table), self.repository, self.rehearsal.plan_id, (spec,),
+        service = V2Service(self.orchestrator(table, **options), self.repository, self.rehearsal.plan_id, (spec,),
                             clock=self.clock)
         started = time.perf_counter()
         report = service.poll_windows()
@@ -372,14 +446,11 @@ class Runtime:
         return {stage: round(seconds, 2) for (key, stage, attempt), seconds in sorted(self.timings.items())
                 if key == window_key}
 
-    def roles_by_stage(self, window_key=None, *, write=None):
-        result = {}
-        for used in self.transactions:
-            if used.stage is None or (window_key is not None and used.window != window_key):
-                continue
-            if write is None or write == (not used.read_only):
-                result.setdefault(used.stage, set()).add(used.role)
-        return result
+    def stages_used(self, window_key=None, *, write=None):
+        """The stages that opened a transaction (of the given kind) through the access layer."""
+        return {used.stage for used in self.transactions
+                if used.stage is not None and (window_key is None or used.window == window_key)
+                and (write is None or write == (not used.read_only))}
 
 
 PROVIDER_DELAY = timedelta(minutes=15)
@@ -729,7 +800,7 @@ def workspace_payloads(rehearsal):
 def reader_for(runtime):
     @contextmanager
     def cursor_factory():
-        with runtime.provider.transaction("reader", "api", read_only=True, dict_cursor=True,
+        with runtime.provider.transaction("api", read_only=True, dict_cursor=True,
                                           isolation_level="REPEATABLE READ") as unit:
             yield unit.cursor
 
@@ -809,7 +880,7 @@ def test_a3_bars_jobs_and_watermarks_of_the_ingest_and_evidence_stages(rehearsal
 def oracle_inputs(runtime, rehearsal, spec, generation):
     """The screening input a FRESH full load builds for the window `spec` right now: market cutoff = the window's
     cutoff, recording clocks bounded by the window's deadline (the oracle the loader and the runner must match)."""
-    with runtime.provider.transaction("compute", "runtime_data", read_only=True, dict_cursor=True) as unit:
+    with runtime.provider.transaction(read_only=True, dict_cursor=True) as unit:
         return load_realtime_screening_input(
             unit.cursor, cohort_id=rehearsal.cohort, session=rehearsal.session, cutoff=spec.cutoff,
             known_by=spec.deadline, source_generation=generation, include_portal_history=True)
@@ -842,7 +913,7 @@ def test_a3b_bars_fetched_after_the_cutoff_are_visible_to_their_own_window_and_a
     # ... and the input the receipt names is exactly what a fresh full load under the same two clocks builds.
     assert inputs_sha256(oracle_inputs(runtime, rehearsal, spec, 1)) == receipt_input_sha(rehearsal, spec)
     # With the single old clock (known_by = cutoff) none of them would be visible: the window would be empty.
-    with runtime.provider.transaction("compute", "runtime_data", read_only=True, dict_cursor=True) as unit:
+    with runtime.provider.transaction(read_only=True, dict_cursor=True) as unit:
         old_rule = load_realtime_screening_input(
             unit.cursor, cohort_id=rehearsal.cohort, session=rehearsal.session, cutoff=spec.cutoff,
             source_generation=1, include_portal_history=True)
@@ -891,7 +962,7 @@ def test_a4b_the_final_window_keeps_its_session_close_and_the_retention_readers_
     """W1's cutoff is the session close: the stages keep the session summary, patterns and alerts (hot AND kept)
     and the strategies (kept only) and publish SESSION_CLOSE releases of them; the readers of the kept tier
     (retained mode, the 21-session navigation window of the alerts, the frozen session-close releases) serve them
-    through the `api` principal's reader role. The 26-session physical retention is the registry's
+    through the `api` role. The 26-session physical retention is the registry's
     (rt.portal_snapshot_kept, SESSION_WINDOW 26); the 21-session picker is enforced by the readers."""
     runtime, cohort = rehearsal.deferred, str(rehearsal.cohort)
     kept = rehearsal.q("SELECT snapshot_id, snapshot_type, session_date FROM rt.portal_snapshot_kept "
@@ -969,7 +1040,7 @@ def expected(rehearsal, w1):
 
 def screening_checks(rehearsal, runtime, cursor_factory, window_cutoff, digest, *, generations):
     """The screening generation EQUITY_EVIDENCE persisted for the window with `window_cutoff`, the current
-    pointer on it, and the screening repository (stored-only reader) reading it through `runtime`'s principals:
+    pointer on it, and the screening repository (stored-only reader) reading it through `runtime`'s roles:
     the first load recomputes every member's bar heads over rt.bar_current and verifies them."""
     cohort = str(rehearsal.cohort)
     (row,) = rehearsal.q(
@@ -1221,15 +1292,14 @@ def test_a7b_a_bar_recorded_after_a_deadline_is_invisible_to_that_window_and_vis
 class ProviderDatabase(RealtimeProcessDatabase):
     """A process database over the access provider for work outside any window (no stage run, no fence)."""
 
-    def __init__(self, provider, role: RealtimeDatabaseRole, profile: str = "runtime_data") -> None:
+    def __init__(self, provider, role: RealtimeDatabaseRole) -> None:
         self._process_plan = StageProcessPlan(role)
         self._connection_provider = None
-        self._provider, self._profile = provider, profile
+        self._provider = provider
 
     @contextmanager
     def transaction(self, *, read_only=None, dict_cursor=False, isolation_level=None):
-        with self._provider.transaction(self._process_plan.role.value.lower(), self._profile,
-                                        read_only=bool(read_only), dict_cursor=dict_cursor,
+        with self._provider.transaction(read_only=bool(read_only), dict_cursor=dict_cursor,
                                         isolation_level=isolation_level) as unit:
             yield unit.cursor
 
@@ -1281,26 +1351,17 @@ def test_a7c_a_late_arrival_forces_a_full_reload_that_publishes_the_identity_of_
 
 # --- Part A: the role audit and the timings --------------------------------------------------------------------------
 
-def test_a8_every_stage_used_exactly_the_capabilities_of_the_registry_and_no_role_violation_was_recorded(rehearsal, w3b):
+def test_a8_every_stage_ran_through_the_one_provider_and_window_writes_were_fenced(rehearsal, w3b):
     runtime = rehearsal.deferred
-    assert runtime.provider.role_violations == []
-    assert {used.profile for used in runtime.transactions if used.stage is not None} == {"runtime_data"}
-    # STRATEGY_PUBLISH writes its evidence under compute and its snapshots and releases under publication, but
-    # only in the window that PUBLISHES a strategy (W1: the market time is the session close for every later
-    # window of the run too); the later windows find the retained snapshot (ALREADY_STORED) and only read.
-    assert runtime.roles_by_stage(write=True) == {
-        "REFERENCE": {"references"}, "EQUITY_INGEST": {"ingress"}, "EQUITY_EVIDENCE": {"compute"},
-        "PORTAL_PUBLISH": {"publication"}, "STOCK_ALERTS": {"publication"},
-        "STRATEGY_PUBLISH": {"compute", "publication"}}
-    assert runtime.roles_by_stage("w1", write=True)["STRATEGY_PUBLISH"] == {"compute", "publication"}
-    assert all("STRATEGY_PUBLISH" not in runtime.roles_by_stage(window, write=True)
-               for window in ("w2", "w3", "w3b"))
-    assert all(runtime.roles_by_stage(window)["STRATEGY_PUBLISH"] == {"compute", "publication"}
-               for window in ("w2", "w3", "w3b"))
-    assert runtime.roles_by_stage() == {
-        "REFERENCE": {"references"}, "EQUITY_INGEST": {"ingress"}, "EQUITY_EVIDENCE": {"compute"},
-        "PORTAL_PUBLISH": {"publication"}, "STOCK_ALERTS": {"compute", "publication"},
-        "STRATEGY_PUBLISH": {"compute", "publication"}}
+    stages = {"REFERENCE", "EQUITY_INGEST", "EQUITY_EVIDENCE", "PORTAL_PUBLISH", "STOCK_ALERTS", "STRATEGY_PUBLISH"}
+    assert runtime.stages_used(write=True) == stages
+    # STRATEGY_PUBLISH writes only in the window that PUBLISHES a strategy (W1: the market time is the session
+    # close for every later window of the run too); the later windows find the retained snapshot
+    # (ALREADY_STORED) and only read.
+    assert "STRATEGY_PUBLISH" in runtime.stages_used("w1", write=True)
+    assert all("STRATEGY_PUBLISH" not in runtime.stages_used(window, write=True) for window in ("w2", "w3", "w3b"))
+    assert all("STRATEGY_PUBLISH" in runtime.stages_used(window) for window in ("w2", "w3", "w3b"))
+    assert runtime.stages_used() == stages
     # Window-stage writes commit only under the stage-run fence; the resident REFERENCE stage has no stage run.
     assert all(used.fenced for used in runtime.transactions if used.stage in WINDOW_STAGES and not used.read_only)
     assert not any(used.fenced for used in runtime.transactions if used.stage == "REFERENCE")
@@ -1326,22 +1387,21 @@ def test_a9_the_timings_per_stage_are_reported(rehearsal, w3b):
 
 # --- PART B ------------------------------------------------------------------------------------------------------------
 
-class PrincipalPool:
-    """Pool shim for a NOLOGIN principal: a checkout is a connection of the admin pool with `SET ROLE <principal>`
+class RolePool:
+    """Pool shim for a NOLOGIN role: a checkout is a connection of the admin pool with `SET ROLE <role>`
     applied for the session (committed, so a rollback inside a unit of work does not undo it); a check-in
-    resets the role. V2ConnectionProvider then runs its per-transaction `SET LOCAL ROLE <capability>` inside
-    the principal. LIMIT OF THE SIMULATION: PostgreSQL lets a superuser session user `SET ROLE` to any role,
-    so the principal -> capability MEMBERSHIP is enforced by the provider (PermissionError), not by the
-    server; the capability role's own table grants ARE enforced by the server."""
+    resets the role. V2ConnectionProvider then runs its per-transaction `SET LOCAL ROLE <role>` inside it.
+    LIMIT OF THE SIMULATION: PostgreSQL lets a superuser session user `SET ROLE` to any role, so this proves
+    the role's grants, which the server enforces for the role in force, and not a LOGIN credential."""
 
-    def __init__(self, pool, principal: str) -> None:
-        self._pool, self.principal = pool, principal
+    def __init__(self, pool, role: str) -> None:
+        self._pool, self.role = pool, role
 
     def getconn(self):
         connection = self._pool.getconn()
         try:
             with connection.cursor() as cursor:
-                cursor.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(self.principal)))
+                cursor.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(self.role)))
             connection.commit()
         except BaseException:
             self._pool.putconn(connection, close=True)
@@ -1386,7 +1446,7 @@ def hardening(rehearsal, roles, w3b):
 
 @pytest.fixture(scope="module")
 def hardened(rehearsal, roles, hardening):
-    pools = {profile: PrincipalPool(rehearsal.pool, roles.name(profile)) for profile in ("runtime_data", "api")}
+    pools = {role: RolePool(rehearsal.pool, roles.name(role)) for role in ("app", "api")}
     provider = V2ConnectionProvider(pools, hardened_config())
     return Runtime("hardened", provider, rehearsal), pools
 
@@ -1402,36 +1462,30 @@ def test_b1_hardening_creates_only_nologin_roles_and_the_exact_privilege_audit_p
     print("\nHARDENING seconds", round(hardening.seconds, 1), "audit checks", len(hardening.audit))
 
 
-def test_b2_the_runtime_gate_reads_under_a_capability_role_so_the_noinherit_data_principal_passes(
+def test_b2_the_runtime_gate_reads_as_the_role_it_logs_in_as_and_the_roles_share_no_membership(
         rehearsal, roles, hardened):
     runtime, pools = hardened
     config = runtime.provider.config
-    # The api principal inherits `reader`, which may read both identity relations: the gate passes.
-    assert verify_pool_target_v2(pools["api"], config) == DATABASE
-    # runtime_data is NOINHERIT and holds no grant itself: without a capability role the gate cannot read
-    # rt.database_identity (the rehearsal's finding F1, fixed by `principal_profile`: the gate now assumes
-    # `control`, or `reader` for the api principal, which the registry lets read both relations).
-    with pytest.raises(psycopg2.errors.InsufficientPrivilege, match="permission denied for schema rt"):
-        verify_pool_target_v2(pools["runtime_data"], config)
-    assert verify_pool_target_v2(pools["runtime_data"], config, "runtime_data") == DATABASE
-    assert verify_pool_target_v2(pools["api"], config, "api") == DATABASE
+    # Both runtime roles may read the identity relations: the gate passes for each of them, with or without
+    # naming the role the pool logs in as.
+    for role in ("app", "api"):
+        assert verify_pool_target_v2(pools[role], config) == DATABASE
+        assert verify_pool_target_v2(pools[role], config, role) == DATABASE
     assert runtime.provider.verify() == DATABASE
     with pytest.raises(ValueError, match="must not hold an owner pool"):
         V2ConnectionProvider({OWNER_POOL: rehearsal.pool}, config)
-    with pytest.raises(PermissionError, match="api is not a member of compute"):
-        with runtime.provider.transaction("compute", "api"):
+    with pytest.raises(ValueError, match="read-only"):
+        with runtime.provider.transaction("api"):
             pass
-    members = {(profile, capability): rehearsal.scalar("SELECT pg_has_role(%s, %s, 'MEMBER')",
-                                                       (roles.name(profile), roles.name(capability)))
-               for profile, capabilities in PRINCIPAL_PROFILES.items() for capability in CAPABILITY_ROLES}
-    assert {key for key, value in members.items() if value} == {
-        (profile, capability) for profile, capabilities in PRINCIPAL_PROFILES.items() for capability in capabilities
-        if capability in CAPABILITY_ROLES}
+    members = {(member, role): rehearsal.scalar("SELECT pg_has_role(%s, %s, 'MEMBER')",
+                                                (roles.name(member), roles.name(role)))
+               for member in ROLES for role in ROLES if member != role}
+    assert len(members) == 6 and not any(members.values())
 
 
 @pytest.fixture(scope="module")
 def w4(rehearsal, hardened, w3b):
-    """A full window under the principals: a new reference seed (generation 2, created between W3b's and W4's
+    """A full window as the app role: a new reference seed (generation 2, created between W3b's and W4's
     cutoffs), a new ingest of restated bars fetched now, five stages."""
     runtime, _ = hardened
     tick = runtime.tick_reference(rehearsal.cutoff(3.5))
@@ -1444,7 +1498,7 @@ def w4(rehearsal, hardened, w3b):
         strategy=strategy_status(rehearsal)))
 
 
-def test_b3_a_full_window_completes_under_the_principals_with_the_capabilities_of_the_registry(
+def test_b3_a_full_window_completes_as_the_app_role_with_the_grants_of_the_registry(
         rehearsal, roles, hardened, w2, w3, w3b, w4):
     runtime, _ = hardened
     print("\nW4 stage seconds", runtime.stage_times("w4"), "total", round(w4.seconds, 1))
@@ -1452,9 +1506,9 @@ def test_b3_a_full_window_completes_under_the_principals_with_the_capabilities_o
     assert w4.extra["tick"] == "COMPLETE" and w4.report.window_errors == {}
     (report,) = w4.report.windows
     states = {stage: (state, codes) for stage, _, state, codes in rehearsal.stage_rows("w4")}
-    # As in W1, the whole window COMPLETEs under the principals, with the same degraded codes. The strategies'
+    # As in W1, the whole window COMPLETEs as app, with the same degraded codes. The strategies'
     # market time is the same session close as W1's, so the stage finds the retained snapshots (ALREADY_STORED),
-    # validates them under the hardened compute role and publishes nothing new.
+    # validates them as app and publishes nothing new.
     assert report.window_state == "COMPLETE", states
     assert {stage: state for stage, (state, _) in states.items()} == {stage: "COMPLETE" for stage in WINDOW_STAGES}
     assert {stage: codes for stage, (state, codes) in states.items() if codes} == {
@@ -1470,19 +1524,13 @@ def test_b3_a_full_window_completes_under_the_principals_with_the_capabilities_o
     assert (release_class, cutoff) == ("INTRADAY", w4.spec.cutoff)
     # The pointed-at release still names the strategies of W1 (carried forward by the lanes that published).
     assert len(entries) == len(TICKERS) + 5 and {ROLLING_VERSION, HOURLY_ROLLING_VERSION} <= {key[0] for key in entries}
-    # The access layer recorded nothing (a hardened provider raises instead of recording) and the capabilities
-    # each stage used are those of Part A, all of them members of the profile as PostgreSQL knows it. W4's
-    # strategy stage only reads, so the strategy write capabilities are those of W1 (deferred) plus the probe b5.
-    assert runtime.provider.role_violations == []
-    assert runtime.roles_by_stage(write=True) == {
-        stage: roles_used for stage, roles_used in rehearsal.deferred.roles_by_stage(write=True).items()
-        if stage != "STRATEGY_PUBLISH"}
-    assert runtime.roles_by_stage() == rehearsal.deferred.roles_by_stage()
-    for used in {(u.role, u.profile) for u in runtime.transactions}:
-        assert rehearsal.scalar("SELECT pg_has_role(%s, %s, 'MEMBER')",
-                                (roles.name(used[1]), roles.name(used[0]))), used
+    # The stages that wrote are those of Part A (a hardened provider raises instead of letting a wrong role
+    # through, and PostgreSQL enforced every grant for `app`). W4's strategy stage only reads, so its writes
+    # are those of W1 (deferred) plus the probe b5.
+    assert runtime.stages_used(write=True) == rehearsal.deferred.stages_used(write=True) - {"STRATEGY_PUBLISH"}
+    assert runtime.stages_used() == rehearsal.deferred.stages_used()
     assert all(used.fenced for used in runtime.transactions if used.stage in WINDOW_STAGES and not used.read_only)
-    # Reads through the api principal (reader role), in the default `current` mode: the workspace the window
+    # Reads through the api role, in the default `current` mode: the workspace the window
     # published, composed from the tables the reader role may read, equals the bar facts (every restatement
     # generation applied, oldest first: a later observation of the same bar wins); the screening generation the
     # compute stage persisted reads back through the stored-only screening reader (first load verifies bar heads).
@@ -1501,7 +1549,7 @@ def test_b3_a_full_window_completes_under_the_principals_with_the_capabilities_o
         assert reader.read(ticker, "quote", available_by=datetime.now(UTC), cohort_id=rehearsal.cohort) == payload["quote"]
     assert len(digests) == 1
     screening_checks(rehearsal, runtime, cursor_factory, w4.spec.cutoff, digests.pop(), generations=5)
-    # The kept tier through the api principal's reader role: the strategies W1 published are still named by the
+    # The kept tier through the api role: the strategies W1 published are still named by the
     # pointed-at release and read READY in `current` mode; the session-close releases of the session are readable.
     strategies = RealtimeDailyStrategyRepository(cursor_factory, transaction_configured=True)
     for interval in ("1d", "1h"):
@@ -1512,45 +1560,53 @@ def test_b3_a_full_window_completes_under_the_principals_with_the_capabilities_o
         assert load_session_close_releases(cursor, rehearsal.cohort, rehearsal.session)
 
 
-def test_b4_out_of_role_writes_are_rejected_by_postgresql_and_leave_no_row(rehearsal, hardened, w4):
+def test_b4_forbidden_writes_are_rejected_by_postgresql_and_leave_no_row(rehearsal, roles, hardened, w4):
     runtime, _ = hardened
     cohort = str(rehearsal.cohort)
     before = rehearsal.counts()
-    snapshot = (
+    snapshot_insert = (
         "INSERT INTO rt.snapshot_catalog (snapshot_id, cohort_id, provider_tier, snapshot_class, snapshot_type, "
         "snapshot_key, session_date, source_generation, manifest_sha256, payload_sha256, generated_at) "
         "VALUES (%s, %s, 'MASSIVE_DEVELOPER', 'EPHEMERAL_PORTAL', 'OUT_OF_ROLE', 'X', %s, 1, %s, %s, %s)",
         (str(uuid4()), cohort, rehearsal.session, "a" * 64, "b" * 64, rehearsal.closed))
-    bar = (
-        "INSERT INTO rt.bar_catalog (bar_revision_id, cohort_id, provider_tier, instrument_id, interval, "
-        "bar_start, bar_end, observed_at, session_date) VALUES (%s, %s, 'MASSIVE_DEVELOPER', %s, '1m', %s, %s, %s, %s)",
-        (str(uuid4()), cohort, next(iter(rehearsal.instrument_ids.values())), rehearsal.closed - timedelta(minutes=1),
-         rehearsal.closed, rehearsal.closed + timedelta(minutes=1), rehearsal.session))
+    # app holds INSERT and UPDATE on every writable table, so an append-only table is guarded by its trigger;
+    # DELETE, owner-only tables and DDL are guarded by missing privileges.
     attempts = [
-        ("compute", "runtime_data", snapshot, "permission denied for table snapshot_catalog"),
-        ("publication", "runtime_data", bar, "permission denied for table bar_catalog"),
-        ("ingress", "runtime_data", ("UPDATE rt.bar_current SET observed_at = observed_at WHERE cohort_id = %s",
-                                     (cohort,)), "permission denied for table bar_current"),
-        ("reader", "api", snapshot, "permission denied for table snapshot_catalog"),
+        (psycopg2.errors.RaiseException, "immutable",
+         ("UPDATE rt.snapshot_catalog SET snapshot_key = snapshot_key WHERE cohort_id = %s", (cohort,))),
+        (psycopg2.errors.InsufficientPrivilege, "permission denied for table snapshot_catalog",
+         ("DELETE FROM rt.snapshot_catalog WHERE cohort_id = %s", (cohort,))),
+        (psycopg2.errors.InsufficientPrivilege, "permission denied for table schema_migrations",
+         ("SELECT count(*) FROM rt.schema_migrations", ())),
+        (psycopg2.errors.InsufficientPrivilege, "permission denied for schema rt",
+         ("CREATE TABLE rt.out_of_role_probe (x integer)", ())),
     ]
-    for capability, profile, (statement, parameters), message in attempts:
-        with pytest.raises(psycopg2.errors.InsufficientPrivilege, match=message):
-            with runtime.provider.transaction(capability, profile) as unit:
+    for error, message, (statement, parameters) in attempts:
+        with pytest.raises(error, match=message):
+            with runtime.provider.transaction() as unit:
                 unit.cursor.execute(statement, parameters)
+    # api is read-only: the provider refuses a read-write unit of work, and a write inside a read-only one fails.
+    with pytest.raises(ValueError, match="read-only"):
+        with runtime.provider.transaction("api"):
+            pass
+    with pytest.raises(psycopg2.errors.ReadOnlySqlTransaction):
+        with runtime.provider.transaction("api", read_only=True) as unit:
+            unit.cursor.execute(*snapshot_insert)
+    assert not rehearsal.scalar("SELECT has_table_privilege(%s, 'rt.snapshot_catalog', 'INSERT')",
+                                (roles.name("api"),))
     assert rehearsal.counts() == before
-    assert runtime.provider.role_violations == []
 
 
 class ProbeRollback(Exception):
     pass
 
 
-def test_b5_the_kept_and_session_close_writes_of_w1_are_granted_to_the_hardened_publication_role(
+def test_b5_the_kept_and_session_close_writes_of_w1_are_granted_to_the_hardened_app_role(
         rehearsal, hardened, w4):
     """W1 (deferred) took the first publication writes of the session close for real: the kept snapshot of the
-    strategies, the hot-and-kept pair of the ticker/alerts stages and the session-close releases. W4, under the
-    principals, is not a session-close window and its strategies are ALREADY_STORED, so the same three writes
-    (kept-only, hot-and-kept, session-close release) are exercised under the hardened `publication` principal
+    strategies, the hot-and-kept pair of the ticker/alerts stages and the session-close releases. W4, as
+    the hardened app role, is not a session-close window and its strategies are ALREADY_STORED, so the same three
+    writes (kept-only, hot-and-kept, session-close release) are exercised as `app`
     here with probe snapshots and rolled back: the grants cover them."""
     runtime, _ = hardened
     cohort = rehearsal.cohort
@@ -1581,7 +1637,7 @@ def test_b5_the_kept_and_session_close_writes_of_w1_are_granted_to_the_hardened_
     before = rehearsal.counts()
     written = {}
     with pytest.raises(ProbeRollback):
-        with runtime.provider.transaction("publication", "runtime_data") as unit:
+        with runtime.provider.transaction() as unit:
             kept = persist_portal_snapshot_cursor(unit.cursor, snapshot, retention=RETENTION_HOT_AND_KEPT)
             only = persist_portal_snapshot_cursor(unit.cursor, kept_only, retention=RETENTION_KEPT)
             intraday = publish_portal_release_cursor(unit.cursor, receipt, (snapshot,))
@@ -1601,3 +1657,1348 @@ def test_b5_the_kept_and_session_close_writes_of_w1_are_granted_to_the_hardened_
     assert rehearsal.counts() == before
     assert rehearsal.scalar("SELECT count(*) FROM rt.portal_snapshot_kept WHERE snapshot_key IN "
                             "('REHEARSAL_PROBE', 'REHEARSAL_PROBE_KEPT')") == 0
+
+
+# --- PART C: a process restart between EQUITY_EVIDENCE and PORTAL_PUBLISH (hardened app role) ------------------------
+
+class RollbackPublication(ProviderDatabase):
+    """Publishes as the hardened app role, reads the release rows it just wrote and rolls everything
+    back: what an uninterrupted PORTAL_PUBLISH would publish for a receipt, without publishing it."""
+
+    def __init__(self, provider, receipt_id) -> None:
+        super().__init__(provider, RealtimeDatabaseRole.PUBLICATION)
+        self.receipt_id, self.written = receipt_id, None
+
+    @contextmanager
+    def transaction(self, *, read_only=None, dict_cursor=False, isolation_level=None):
+        with self._provider.transaction(read_only=False, dict_cursor=dict_cursor,
+                                        isolation_level=isolation_level) as unit:
+            yield unit.cursor
+            unit.cursor.execute("SELECT release_id::text, release_class, manifest_sha256 FROM rt.portal_releases "
+                                "WHERE receipt_id = %s", (str(self.receipt_id),))
+            self.written = unit.cursor.fetchall()
+            raise ProbeRollback
+
+
+def published_identities(snapshots):
+    return {(snapshot.snapshot_type, snapshot.snapshot_key):
+            (str(snapshot.snapshot_id), snapshot.source_manifest_sha256, snapshot.payload_sha256)
+            for snapshot in snapshots}
+
+
+@pytest.fixture(scope="module")
+def w5(rehearsal, hardened, w4):
+    """W5, run through the real orchestrator as the hardened app role, with the process dying between
+    EQUITY_EVIDENCE and PORTAL_PUBLISH: attempt 1 dies before its work, the restarted process (empty hand-off,
+    projection state and loader) publishes in attempt 2 from a cycle rebuilt out of durable rows but dies before
+    reporting, and a second restart publishes again in attempt 3."""
+    runtime, _ = hardened
+    cohort = rehearsal.cohort
+    revised = support.revise_last_bars(rehearsal.history, count=2, observed_at=datetime.now(UTC), label="w5")
+    rehearsal.source.queue("revisions-w5", revised)
+    spec = rehearsal.spec("w5", rehearsal.cutoff(5))
+    stubs = ("STOCK_ALERTS", "STRATEGY_PUBLISH")
+    options = dict(stub=stubs, max_attempts=3)
+    before = rehearsal.counts()
+    runtime.crash_before.add(("w5", "PORTAL_PUBLISH", 1))
+    with swallow_simulated_crash():
+        runtime.run_window(spec, **options)
+    died = dict(counts=rehearsal.counts(), rows=rehearsal.stage_rows("w5"), state=rehearsal.window_state("w5"))
+    # What an uninterrupted PORTAL_PUBLISH would publish: the hand-off cycle of the evidence stage, published for
+    # the durable receipt inside a transaction that is rolled back.
+    cycle = runtime.environment.handoff.peek(cohort, spec.cutoff)
+    assert cycle is not None
+    receipt_row = rehearsal.q(
+        "SELECT receipt.receipt_id, receipt.universe_sha256 FROM rt.cycle_receipts AS receipt "
+        "JOIN rt.window_runs AS window_run USING (window_id) WHERE window_run.cohort_id = %s "
+        "AND window_run.window_key = 'w5'", (str(cohort),))[0]
+    receipt = PortalReleaseReceipt(receipt_row[0], cohort, ProviderTier.MASSIVE_DEVELOPER, spec.cutoff, receipt_row[1])
+    twin = RollbackPublication(runtime.provider, receipt.receipt_id)
+    with pytest.raises(ProbeRollback):
+        publish_realtime_ticker_cycle(twin, cycle, receipt=receipt, session_close=False)
+    uninterrupted = dict(
+        snapshots=published_identities((*cycle.projection.snapshots, cycle.summary, cycle.pattern_publication)),
+        releases=twin.written, counts=rehearsal.counts(), input_sha256=inputs_sha256(cycle.inputs))
+    runtime.restart()
+    runtime.crash_after.add(("w5", "PORTAL_PUBLISH", 2))
+    with swallow_simulated_crash():
+        runtime.run_window(spec, **options)
+    first_recovery = dict(
+        counts=rehearsal.counts(), rows=rehearsal.stage_rows("w5"), release=current_release(rehearsal)[0],
+        loader=runtime.environment.screening_loader.last_report, state=len(runtime.environment.ticker_state),
+        handoff=len(runtime.environment.handoff))
+    runtime.restart()
+    report, seconds = runtime.run_window(spec, **options)
+    return Outcome(spec, report, seconds, extra=dict(
+        before=before, died=died, uninterrupted=uninterrupted, first_recovery=first_recovery,
+        counts=rehearsal.counts(), release=current_release(rehearsal)[0], receipt=receipt, revised=revised))
+
+
+def test_c1_a_restart_between_the_evidence_and_publication_stages_recovers_the_identical_release(
+        rehearsal, hardened, w5):
+    runtime, _ = hardened
+    print("\nW5 rows", rehearsal.stage_rows("w5"), "seconds", round(w5.seconds, 1))
+    before, died, expected = w5.extra["before"], w5.extra["died"], w5.extra["uninterrupted"]
+    cohort = str(rehearsal.cohort)
+    # The process died after EQUITY_EVIDENCE had committed and before PORTAL_PUBLISH did anything: the receipt,
+    # the evidence and the screening generation are durable, nothing is published.
+    assert {stage: (attempt, state) for stage, attempt, state, _ in died["rows"]} == {
+        "EQUITY_INGEST": (1, "COMPLETE"), "EQUITY_EVIDENCE": (1, "COMPLETE"), "PORTAL_PUBLISH": (1, "RUNNING")}
+    assert died["counts"]["rt.cycle_receipts"] == before["rt.cycle_receipts"] + 1
+    assert died["counts"]["rt.screening_generations"] == before["rt.screening_generations"] + 1
+    for table in ("rt.snapshot_catalog", "rt.portal_releases"):
+        assert died["counts"][table] == before[table], table
+    # The twin published the uninterrupted cycle for the same receipt and rolled back: one intraday release.
+    assert len(expected["releases"]) == 1 and expected["releases"][0][1] == "INTRADAY"
+    assert expected["counts"] == died["counts"]
+    assert expected["input_sha256"] == receipt_input_sha(rehearsal, w5.spec)
+    # Attempt 2 ran in a process with nothing in memory: it rebuilt the cycle from durable rows (the loader and
+    # the projection state were never touched), published, and died before reporting.
+    recovery = w5.extra["first_recovery"]
+    assert recovery["loader"] is None and recovery["state"] == 0 and recovery["handoff"] == 0
+    assert {(stage, attempt): state for stage, attempt, state, _ in recovery["rows"]}[("PORTAL_PUBLISH", 1)] == "FAILED"
+    after = recovery["counts"]
+    assert after["rt.snapshot_catalog"] == before["rt.snapshot_catalog"] + len(TICKERS) + 2
+    assert after["rt.portal_releases"] == before["rt.portal_releases"] + 1
+    for table in ("rt.bar_catalog", "rt.bar_revisions", "rt.bar_current", "rt.evidence_catalog", "rt.equity_evidence",
+                  "rt.cycle_receipts", "rt.screening_generations", "rt.materialization_jobs"):
+        assert after[table] == died["counts"][table], table  # the recovery is read-only apart from the release
+    # Identical identities: every snapshot (id, manifest and payload digests) and the release itself are the ones
+    # the uninterrupted run would have published.
+    stored = {(row[0], row[1]): (row[2], row[3], row[4]) for row in rehearsal.q(
+        "SELECT snapshot_type, snapshot_key, snapshot_id::text, manifest_sha256, payload_sha256 "
+        "FROM rt.snapshot_catalog WHERE cohort_id = %s AND generated_at = %s", (cohort, w5.spec.cutoff))}
+    assert stored == expected["snapshots"] and len(stored) == len(TICKERS) + 2
+    assert rehearsal.q("SELECT release_id::text, release_class, manifest_sha256 FROM rt.portal_releases "
+                       "WHERE receipt_id = %s", (str(w5.extra["receipt"].receipt_id),)) == expected["releases"]
+    assert w5.extra["release"] == w5.extra["first_recovery"]["release"] == expected["releases"][0][0]
+    # The retry after a second restart (attempt 3) rebuilt and published the same cycle again: no row of any kind.
+    (report,) = w5.report.windows
+    assert w5.report.window_errors == {} and report.window_state == "COMPLETE", rehearsal.stage_rows("w5")
+    rows = {(stage, attempt): (state, codes) for stage, attempt, state, codes in rehearsal.stage_rows("w5")}
+    assert rows[("PORTAL_PUBLISH", 1)] == ("FAILED", ("OWNER_LOST",))
+    assert rows[("PORTAL_PUBLISH", 2)] == ("FAILED", ("OWNER_LOST",))
+    assert rows[("PORTAL_PUBLISH", 3)] == ("COMPLETE", ())
+    assert w5.extra["counts"] == recovery["counts"]
+    assert rehearsal.scalar("SELECT count(*) FROM rt.portal_releases WHERE receipt_id = %s",
+                            (str(w5.extra["receipt"].receipt_id),)) == 1
+    # Publication needed nothing beyond the grants of app: the rebuild is a read-only transaction.
+    assert "PORTAL_PUBLISH" in runtime.stages_used("w5")
+
+
+def test_c2_a_cycle_that_is_not_the_one_the_receipt_names_is_refused_and_writes_nothing(rehearsal, hardened, w5):
+    runtime, _ = hardened
+    before = rehearsal.counts()
+    assert rehearsal.scalar("SELECT reference_generation FROM rt.cycle_receipts WHERE receipt_id = %s",
+                            (str(w5.extra["receipt"].receipt_id),)) == 2
+    publication = ProviderDatabase(runtime.provider, RealtimeDatabaseRole.PUBLICATION)
+    scope = dict(cohort_id=rehearsal.cohort, session=rehearsal.session, cutoff=w5.spec.cutoff,
+                 known_by=w5.spec.deadline, source_generation=2, universe_sha256=w5.extra["receipt"].universe_sha256)
+    rebuilt = ticker_repository.rehydrate_realtime_ticker_cycle(
+        publication, input_sha256=receipt_input_sha(rehearsal, w5.spec), **scope)
+    assert published_identities((*rebuilt.projection.snapshots, rebuilt.summary, rebuilt.pattern_publication)) == (
+        w5.extra["uninterrupted"]["snapshots"])
+    with pytest.raises(ticker_repository.CycleRehydrationMismatch):
+        ticker_repository.rehydrate_realtime_ticker_cycle(publication, input_sha256="0" * 64, **scope)
+    assert rehearsal.counts() == before
+
+
+def test_d1_stages_v2_runs_the_two_ticker_input_alert_projection_and_shared_release_end_to_end(
+    rehearsal, hardened, w5, monkeypatch,
+):
+    import realtime.stage_runners_equity as equity_runners
+
+    monkeypatch.setattr(
+        equity_runners,
+        "finalize_five_minute_inputs",
+        lambda *args, **kwargs: ("COMPLETE", ()),
+    )
+    runtime, _ = hardened
+    enabled = frozenset({
+        "EQUITY_INGEST",
+        "EQUITY_MATERIALIZE",
+        "STOCK_ALERTS",
+        "EQUITY_PROJECTION",
+        "PORTAL_PUBLISH",
+    })
+    spec = rehearsal.spec("v2-small", rehearsal.cutoff(6))
+    plan_id = uuid4()
+    rehearsal.admin(
+        "INSERT INTO rt.service_plans (plan_id, cohort_id, session_date, stage_catalog_version, "
+        "enabled_stages, config_sha256, deadline, scope_reference) "
+        "VALUES (%s,%s,%s,'stages_v2',%s,%s,%s,'two-ticker stages_v2 rehearsal')",
+        (
+            str(plan_id),
+            str(rehearsal.cohort),
+            rehearsal.session,
+            sorted(enabled),
+            uuid4().hex + uuid4().hex,
+            spec.deadline + timedelta(hours=1),
+        ),
+    )
+    environment = RunnerEnvironment(runtime.provider, build_id="rehearsal-stages-v2")
+    runners = dict(build_runners(enabled, runtime.provider, environment=environment))
+    runners["EQUITY_INGEST"] = lambda context: StageOutcome.complete()
+    repository = PostgresOrchestrationRepository(runtime.provider)
+    window = repository.ensure_window(plan_id, spec)
+    clock = Clock(spec.release_at + timedelta(seconds=1))
+    report = StageOrchestrator(
+        repository,
+        runners,
+        database=runtime.provider,
+        stages=STAGES_V2,
+        catalog_version="stages_v2",
+        clock=clock,
+        max_lane_seconds=1_500.0,
+        lane_grace_seconds=1_200.0,
+    ).run_window(window.window_id)
+
+    rows = {
+        stage: state
+        for stage, _attempt, state, _reasons in rehearsal.stage_rows("v2-small")
+    }
+    assert report.window_state == "COMPLETE"
+    assert rows == {stage: "COMPLETE" for stage in enabled}
+    receipts = rehearsal.q(
+        "SELECT receipt_kind, receipt_id::text FROM rt.cycle_receipts WHERE window_id=%s ORDER BY receipt_kind",
+        (str(window.window_id),),
+    )
+    assert {row[0] for row in receipts} == {INPUT_READY, PORTAL_READY}
+    input_receipt = next(row[1] for row in receipts if row[0] == INPUT_READY)
+    release = current_release(rehearsal)
+    assert release[2:4] == (input_receipt, spec.cutoff)
+    assert (STOCK_ALERTS_VERSION, "PLATFORM") in release[4]
+    assert {(TICKER_WORKSPACE_VERSION, ticker) for ticker in TICKERS} <= set(release[4])
+
+
+class AdvancedFakeConnection:
+    def __init__(self, incoming):
+        self.incoming = deque(incoming)
+        self.sent = []
+        self.closed = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return False
+
+    async def send(self, payload):
+        self.sent.append(json.loads(payload))
+
+    async def recv(self, *, decode=None):
+        assert decode is False
+        return self.incoming.popleft()
+
+    async def close(self, *, code, reason):
+        self.closed = (code, reason)
+
+
+def _advanced_status(status):
+    return json.dumps(
+        [{"ev": "status", "status": status, "message": status}],
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+def _seed_advanced_rehearsal(rehearsal, *, cutoff, enabled):
+    profile_id, manifest_id, cohort_id, plan_id = uuid4(), uuid4(), uuid4(), uuid4()
+    session_id, owner_id = uuid4(), uuid4()
+    digest = lambda: uuid4().hex + uuid4().hex  # noqa: E731
+    born = rehearsal.opened - timedelta(hours=1)
+    universe_sha256, allocation_policy_sha256 = rehearsal.q(
+        "SELECT manifest.universe_sha256, manifest.allocation_policy_sha256 "
+        "FROM rt.cohorts AS cohort JOIN rt.subscription_manifests AS manifest USING (manifest_id) "
+        "WHERE cohort.cohort_id=%s",
+        (str(rehearsal.cohort),),
+    )[0]
+    with rehearsal.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO rt.capability_profiles ("
+            "profile_id, config_sha256, schema_sha256, account_alias, capabilities_sha256, "
+            "universe_sha256, checked_at, expires_at, status, profile_sha256, provider_tier, "
+            "security_policy_sha256, preflight_mode, provider_requests, action_authorized, created_at"
+            ") VALUES (%s,%s,%s,'advanced-e2e',%s,%s,%s,%s,'PASS',%s,'MASSIVE_ADVANCED',"
+            "%s,'PASSIVE',false,false,%s)",
+            (
+                str(profile_id),
+                digest(),
+                digest(),
+                digest(),
+                universe_sha256,
+                born,
+                born + timedelta(days=30),
+                digest(),
+                digest(),
+                born,
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO rt.subscription_manifests ("
+            "manifest_id, manifest_sha256, universe_sha256, session_date, effective_at, "
+            "profile_id, manifest_kind, stock_count, option_underlying_count, member_count, "
+            "allocation_policy_sha256, created_at"
+            ") VALUES (%s,%s,%s,%s,%s,%s,'EQUITY_VALIDATION',%s,0,%s,%s,%s)",
+            (
+                str(manifest_id),
+                digest(),
+                universe_sha256,
+                rehearsal.session,
+                born,
+                str(profile_id),
+                len(TICKERS),
+                len(TICKERS),
+                allocation_policy_sha256,
+                born,
+            ),
+        )
+        for priority, ticker in enumerate(TICKERS, start=1):
+            cursor.execute(
+                "INSERT INTO rt.subscription_members ("
+                "manifest_id, instrument_id, channel, priority, purpose, option_underlying"
+                ") VALUES (%s,%s,'AM',%s,'PRIMARY',false)",
+                (str(manifest_id), rehearsal.instrument_ids[ticker], priority),
+            )
+        cursor.execute(
+            "INSERT INTO rt.cohorts ("
+            "cohort_id, cohort_sha256, manifest_id, configuration_sha256, model_bundle_sha256, "
+            "valuation_sha256, effective_at, mode, created_at"
+            ") VALUES (%s,%s,%s,%s,%s,%s,%s,'SHADOW',%s)",
+            (
+                str(cohort_id),
+                digest(),
+                str(manifest_id),
+                digest(),
+                digest(),
+                digest(),
+                born,
+                born,
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO rt.stream_sessions ("
+            "session_id, provider, feed, manifest_id, owner_id, owner_epoch, "
+            "started_at, subscribed_at, status"
+            ") VALUES (%s,'synthetic-advanced','STOCKS',%s,%s,7,%s,%s,'LIVE')",
+            (
+                str(session_id),
+                str(manifest_id),
+                str(owner_id),
+                cutoff - timedelta(minutes=10),
+                cutoff - timedelta(minutes=9),
+            ),
+        )
+        calendar = exchange_calendars.get_calendar("XNYS")
+        previous_session = calendar.previous_session(str(rehearsal.session)).date()
+        coverage_start = calendar.session_offset(
+            str(previous_session),
+            -282,
+        ).date()
+        for ticker in TICKERS:
+            cursor.execute(
+                "INSERT INTO ref.corporate_action_coverage ("
+                "coverage_id, security_id, action_type, window_start, window_end, "
+                "source, source_key, response_action_count, response_sha256, "
+                "observed_at, received_at, payload_sha256"
+                ") VALUES (%s,%s,'SPLIT',%s,%s,'synthetic','advanced-e2e',0,%s,%s,%s,%s)",
+                (
+                    str(
+                        uuid5(
+                            NAMESPACE_URL,
+                            f"advanced-e2e-coverage:{cohort_id}:{ticker}",
+                        )
+                    ),
+                    str(rehearsal.security_ids[ticker]),
+                    coverage_start,
+                    rehearsal.session,
+                    digest(),
+                    cutoff - timedelta(hours=1),
+                    cutoff - timedelta(hours=1),
+                    digest(),
+                ),
+            )
+        cursor.execute(
+            "INSERT INTO rt.service_plans ("
+            "plan_id, cohort_id, session_date, stage_catalog_version, enabled_stages, "
+            "config_sha256, deadline, scope_reference"
+            ") VALUES (%s,%s,%s,'stages_v2',%s,%s,%s,'synthetic Advanced e2e')",
+            (
+                str(plan_id),
+                str(cohort_id),
+                rehearsal.session,
+                sorted(enabled),
+                digest(),
+                datetime.now(UTC) + timedelta(hours=1),
+            ),
+        )
+    return SimpleNamespace(
+        cohort_id=cohort_id,
+        plan_id=plan_id,
+        manifest_id=manifest_id,
+        session_id=session_id,
+    )
+
+
+def _advanced_history_facts(
+    rehearsal,
+    *,
+    cohort_id,
+    cutoff,
+    stream_session_id,
+    journal_generation,
+):
+    current_facts = tuple(
+        fact for ticker in TICKERS for fact in rehearsal.history[ticker]
+    )
+    previous_session = exchange_calendars.get_calendar("XNYS").previous_session(
+        str(rehearsal.session)
+    ).date()
+    previous_history = support.build_history(
+        previous_session,
+        TICKERS,
+        cohort_id=rehearsal.cohort,
+        instrument_ids=rehearsal.instrument_ids,
+        fetched_at=rehearsal.started,
+    )
+    current_keys = {
+        (
+            fact.revision.ticker,
+            fact.revision.interval,
+            fact.revision.adjusted,
+            fact.revision.bar_start,
+        )
+        for fact in current_facts
+    }
+    previous_by_id = {
+        fact.revision.bar_revision_id: fact
+        for ticker in TICKERS
+        for fact in previous_history[ticker]
+    }
+    extra_ids = {
+        revision_id
+        for revision_id, fact in previous_by_id.items()
+        if (
+            fact.revision.ticker,
+            fact.revision.interval,
+            fact.revision.adjusted,
+            fact.revision.bar_start,
+        )
+        not in current_keys
+    }
+    pending = list(extra_ids)
+    while pending:
+        fact = previous_by_id[pending.pop()]
+        for source_id in fact.revision.source_bar_revision_ids:
+            if source_id in previous_by_id and source_id not in extra_ids:
+                extra_ids.add(source_id)
+                pending.append(source_id)
+    all_facts = (
+        *current_facts,
+        *(previous_by_id[revision_id] for revision_id in sorted(extra_ids, key=str)),
+    )
+    all_ids = {fact.revision.bar_revision_id for fact in all_facts}
+    window_start = cutoff - timedelta(minutes=5)
+    selected = {
+        fact.revision.bar_revision_id: fact
+        for fact in all_facts
+        if fact.revision.bar_end <= cutoff
+        and not (
+            fact.revision.interval == "1m"
+            and fact.revision.bar_start >= window_start
+        )
+        and not (
+            fact.revision.interval == "5m"
+            and fact.revision.bar_start == window_start
+        )
+    }
+    changed = True
+    while changed:
+        changed = False
+        for revision_id, fact in tuple(selected.items()):
+            if (
+                fact.revision.source_kind is BarSourceKind.DERIVED
+                and any(
+                    source in all_ids and source not in selected
+                    for source in fact.revision.source_bar_revision_ids
+                )
+            ):
+                del selected[revision_id]
+                changed = True
+    mapped_ids = {
+        revision_id: uuid5(
+            NAMESPACE_URL,
+            f"advanced-e2e-history:{cohort_id}:{revision_id}",
+        )
+        for revision_id in selected
+    }
+    native_facts = []
+    derived_winners = []
+    for source_offset, (old_id, fact) in enumerate(
+        sorted(
+            selected.items(),
+            key=lambda item: (
+                item[1].revision.bar_end,
+                item[1].revision.ticker,
+                item[1].revision.interval,
+                str(item[0]),
+            ),
+        ),
+        start=1,
+    ):
+        revision = fact.revision
+        source_kind = revision.source_kind
+        lineage_ids = tuple(
+            mapped_ids.get(source, source)
+            for source in revision.source_bar_revision_ids
+        )
+        if source_kind is not BarSourceKind.DERIVED:
+            historical_revision = replace(
+                revision,
+                bar_revision_id=mapped_ids[old_id],
+                source_kind=BarSourceKind.REALTIME_STREAM,
+                ingestion_segment_id=None,
+                source_bar_revision_ids=(),
+                supersedes_bar_revision_id=None,
+                payload_sha256=canonical_sha256(
+                    {
+                        "contract": "advanced-e2e-history-v1",
+                        "cohort_id": cohort_id,
+                        "source_revision_id": old_id,
+                        "source_payload_sha256": revision.payload_sha256,
+                    }
+                ),
+            )
+            native_facts.append(
+                RealtimeEquityBarFact(
+                    cohort_id=cohort_id,
+                    provider_tier=ProviderTier.MASSIVE_ADVANCED,
+                    instrument_id=fact.instrument_id,
+                    revision=historical_revision,
+                    journal_generation=journal_generation,
+                    stream_session_id=stream_session_id,
+                    source_offset=source_offset,
+                )
+            )
+            continue
+        rewritten = replace(
+            revision,
+            bar_revision_id=mapped_ids[old_id],
+            ingestion_segment_id=uuid5(
+                NAMESPACE_URL,
+                f"advanced-e2e-history-segment:{cohort_id}:{revision.ticker}",
+            ),
+            source_bar_revision_ids=lineage_ids,
+            supersedes_bar_revision_id=None,
+            payload_sha256=canonical_sha256(
+                {
+                    "contract": "advanced-e2e-history-v1",
+                    "cohort_id": cohort_id,
+                    "source_revision_id": old_id,
+                    "source_payload_sha256": revision.payload_sha256,
+                }
+            ),
+        )
+        derived_winners.append(
+            adapt_derived_equity_bar(
+                rewritten,
+                cohort_id=cohort_id,
+                provider_tier=ProviderTier.MASSIVE_ADVANCED,
+                instrument_id=fact.instrument_id,
+            )
+        )
+    return tuple((*native_facts, *derived_winners))
+
+
+def _persist_advanced_history(rehearsal, facts):
+    with rehearsal.cursor() as cursor:
+        for offset in range(0, len(facts), 1_000):
+            persist_realtime_equity_bars_cursor(
+                cursor,
+                facts[offset : offset + 1_000],
+            )
+
+
+def _advanced_payloads(cutoff):
+    payloads = []
+    sequence = 1
+    for minute in range(5):
+        start = cutoff - timedelta(minutes=5 - minute)
+        end = start + timedelta(minutes=1)
+        for ticker_index, ticker in enumerate(TICKERS):
+            base = 180 + ticker_index * 20 + minute
+            payloads.append(
+                (
+                    '[{"ev":"AM","sym":"'
+                    + ticker
+                    + '","o":'
+                    + str(base)
+                    + ',"h":'
+                    + str(base + 2)
+                    + ',"l":'
+                    + str(base - 1)
+                    + ',"c":'
+                    + str(base + 1)
+                    + ',"v":1000,"vw":'
+                    + str(base + 0.5)
+                    + ',"s":'
+                    + str(int(start.timestamp() * 1000))
+                    + ',"e":'
+                    + str(int(end.timestamp() * 1000))
+                    + ',"q":'
+                    + str(sequence)
+                    + "}]"
+                ).encode("ascii")
+            )
+            sequence += 1
+    payloads.append(
+        (
+            '[{"ev":"Q","sym":"'
+            + TICKERS[0]
+            + '","bp":200,"ap":201,"bs":10,"as":11,"t":'
+            + str(int(cutoff.timestamp() * 1000))
+            + ',"q":'
+            + str(sequence)
+            + "}]"
+        ).encode("ascii")
+    )
+    return tuple(payloads)
+
+
+def _run_advanced_fake_gateway(*, payloads, session_id, received_at):
+    manifest = SubscriptionManifest(
+        version="advanced-e2e-v1",
+        session_date=received_at.date(),
+        universe=UNIVERSE,
+        capability_profile_sha256="a" * 64,
+        allocation_policy_sha256="b" * 64,
+        members=tuple(
+            SubscriptionMember(AssetClass.EQUITY, ticker, ticker, channel)
+            for ticker in TICKERS
+            for channel in (
+                MarketChannel.TRADE,
+                MarketChannel.QUOTE,
+                MarketChannel.MINUTE_AGGREGATE,
+            )
+        ),
+    )
+    incoming = (
+        _advanced_status("auth_success"),
+        _advanced_status("success"),
+        *payloads,
+    )
+    connection = AdvancedFakeConnection(incoming)
+    buffer = RawMessageBuffer(
+        BufferLimits(
+            maximum_events=len(payloads),
+            maximum_bytes=sum(len(payload) for payload in payloads),
+            maximum_age_ns=1_000_000,
+        ),
+        monotonic_ns=lambda: 100,
+    )
+    gateway = AdvancedGateway(
+        GatewayConfiguration.stocks(),
+        manifest,
+        buffer,
+        api_key="synthetic-never-print",
+        connection_factory=lambda _: connection,
+        utc_clock=lambda: received_at,
+        monotonic_ns=lambda: 100,
+        session_id_factory=lambda: session_id,
+    )
+    result = asyncio.run(
+        gateway.run_session(maximum_market_messages=len(payloads))
+    )
+    assert result.provider_requests is False
+    assert result.accepted_messages == len(payloads)
+    assert buffer.snapshot().admitted_events == len(payloads)
+    return buffer
+
+
+def _drain_advanced_buffer(buffer, writer):
+    commits = []
+    while True:
+        commit = drain_raw_buffer_once(
+            buffer,
+            writer,
+            maximum_events=4,
+            maximum_bytes=4_096,
+        )
+        if commit is None:
+            return tuple(commits)
+        commits.append(commit)
+
+
+def _restart_advanced_projection(environment):
+    environment.handoff = CycleHandoff()
+    environment.ticker_state = TickerProjectionState()
+    environment.screening_loader = ScreeningInputLoader()
+
+
+def _advanced_api_app(*, api_pool, api_role, clock):
+    plan = RealtimeProcessDatabasePlan(
+        "advanced-e2e-api",
+        RealtimeDatabaseRole.READER,
+        RealtimePoolBudget(1, 2),
+    )
+    provider = RoleScopedConnectionProvider(
+        {RealtimeDatabasePrincipal.API: api_pool},
+        {RealtimeDatabaseRole.READER: api_role},
+        statement_timeout_ms=30_000,
+    )
+    database = RealtimeProcessDatabase(plan, provider)
+    repositories = build_realtime_portal_repositories(database)
+    return create_realtime_portal_app(repositories, clock=lambda: clock)
+
+
+def _read_advanced_api_publication(app, cohort_id):
+    cohort = str(cohort_id)
+    calls = (
+        ("screening_catalog", "GET", "/api/stocks/screening/catalog", {"cohort_id": cohort}, None),
+        ("screening_query", "POST", "/api/stocks/screening/query", {"cohort_id": cohort}, {}),
+        ("stock_alerts", "GET", "/api/stocks/alert-view", {"cohort_id": cohort}, None),
+        ("workspace", "GET", "/api/tickers/workspace-publication", {"cohort_id": cohort}, None),
+        *tuple(
+            (
+                f"ticker:{ticker}",
+                "GET",
+                f"/api/stock/{ticker}/workspace-publication",
+                {"cohort_id": cohort},
+                None,
+            )
+            for ticker in TICKERS
+        ),
+        *tuple(
+            (
+                f"chart:{ticker}",
+                "GET",
+                f"/api/stock/{ticker}/chart",
+                {"cohort_id": cohort, "interval": "5m", "period": "5y"},
+                None,
+            )
+            for ticker in TICKERS
+        ),
+        ("dashboard", "GET", "/api/tickers/overview", {"cohort_id": cohort}, None),
+    )
+    publication = {}
+    with TestClient(app) as client:
+        for name, method, path, params, body in calls:
+            response = client.request(method, path, params=params, json=body)
+            publication[name] = (
+                response.status_code,
+                response.content,
+                response.json(),
+            )
+    return publication
+
+
+def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_shared_release(
+    rehearsal, roles, hardened, w5, tmp_path,
+):
+    runtime, pools = hardened
+    provider = runtime.provider
+    enabled = frozenset(
+        {
+            "EQUITY_INGEST",
+            "EQUITY_MATERIALIZE",
+            "STOCK_ALERTS",
+            "EQUITY_PROJECTION",
+            "PORTAL_PUBLISH",
+        }
+    )
+    cutoff = rehearsal.closed - timedelta(minutes=15)
+    seeded = _seed_advanced_rehearsal(
+        rehearsal,
+        cutoff=cutoff,
+        enabled=enabled,
+    )
+    history = _advanced_history_facts(
+        rehearsal,
+        cohort_id=seeded.cohort_id,
+        cutoff=cutoff,
+        stream_session_id=seeded.session_id,
+        journal_generation=uuid4(),
+    )
+    _persist_advanced_history(rehearsal, history)
+
+    release_at = datetime.now(UTC) - timedelta(seconds=2)
+    checked_at = release_at + timedelta(seconds=1)
+    spec = WindowSpec(
+        seeded.cohort_id,
+        ProviderTier.MASSIVE_ADVANCED.value,
+        f"advanced-e2e-{seeded.cohort_id}",
+        release_at,
+        cutoff,
+        release_at + timedelta(minutes=5),
+    )
+    repository = PostgresOrchestrationRepository(provider)
+    window = repository.ensure_window(seeded.plan_id, spec)
+    repository.upsert_readiness(
+        seeded.cohort_id,
+        "REFERENCE",
+        "stages_v2",
+        "READY",
+        (),
+        "synthetic-existing-seed",
+        checked_at,
+    )
+
+    payloads = _advanced_payloads(cutoff)
+    received_at = cutoff + timedelta(seconds=1)
+    journal_generation = uuid4()
+    journal_path = tmp_path / "advanced-e2e.sqlite"
+    buffer = _run_advanced_fake_gateway(
+        payloads=payloads,
+        session_id=seeded.session_id,
+        received_at=received_at,
+    )
+    writer = RawJournalWriter(
+        journal_path,
+        generation=journal_generation,
+        clock=lambda: cutoff + timedelta(seconds=2),
+    )
+    first_commit = drain_raw_buffer_once(
+        buffer,
+        writer,
+        maximum_events=4,
+        maximum_bytes=4_096,
+    )
+    writer.close()
+    with RawJournalWriter(
+        journal_path,
+        generation=journal_generation,
+        clock=lambda: cutoff + timedelta(seconds=2),
+    ) as writer:
+        committed = (first_commit, *_drain_advanced_buffer(buffer, writer))
+    duplicate_buffer = _run_advanced_fake_gateway(
+        payloads=payloads,
+        session_id=seeded.session_id,
+        received_at=received_at,
+    )
+    with RawJournalWriter(
+        journal_path,
+        generation=journal_generation,
+        clock=lambda: cutoff + timedelta(seconds=2),
+    ) as writer:
+        duplicates = _drain_advanced_buffer(duplicate_buffer, writer)
+        reader = RawJournalReader(journal_path)
+        admissions = {
+            ticker: InstrumentAdmission(
+                rehearsal.instrument_ids[ticker],
+                ticker,
+                ticker,
+                AssetClass.EQUITY,
+                shard_id,
+            )
+            for shard_id, ticker in enumerate(TICKERS)
+        }
+        for raw in reader.read_after(0):
+            writer.commit_normalized(normalize_raw_message(raw, admissions))
+    reader = RawJournalReader(journal_path)
+    assert sum(row.inserted_count for row in committed) == len(payloads)
+    assert sum(row.duplicate_count for row in duplicates) == len(payloads)
+    assert len(reader.read_after(0)) == len(payloads)
+    assert len(reader.read_normalized_after(0)) == len(payloads)
+
+    bridge_config = AdvancedEquityJournalBridgeConfig(
+        cohort_id=seeded.cohort_id,
+        journal_generation=journal_generation,
+        stream_session_id=seeded.session_id,
+        owner_epoch=7,
+        normalizer_version=NORMALIZER_VERSION,
+        shard_ids=tuple(range(len(TICKERS))),
+        batch_limit=len(payloads) - 1,
+    )
+    bridge_database = V2WorkerDatabase(
+        provider,
+        RealtimeDatabaseRole.COMPUTE,
+    )
+    bridged = process_advanced_equity_journal_once(
+        bridge_database,
+        reader,
+        bridge_config,
+        checked_at=checked_at,
+    )
+    assert (
+        bridged.persisted_bars,
+        bridged.committed_offset,
+        bridged.shards_advanced,
+    ) == (len(TICKERS) * 5, len(payloads) - 1, len(TICKERS))
+
+    gap_id = uuid4()
+    rehearsal.admin(
+        "INSERT INTO rt.stream_gaps ("
+        "gap_id, session_id, instrument_id, channel, gap_start, gap_end, "
+        "journal_generation, shard_id, last_durable_offset, reason, recovery_status"
+        ") VALUES (%s,%s,%s,'AM',%s,NULL,%s,0,%s,'SYNTHETIC_OFFSET_GAP','UNRESOLVED')",
+        (
+            str(gap_id),
+            str(seeded.session_id),
+            rehearsal.instrument_ids[TICKERS[0]],
+            cutoff - timedelta(minutes=1),
+            str(journal_generation),
+            len(payloads) - 1,
+        ),
+    )
+    restarted_bridge = V2WorkerDatabase(
+        provider,
+        RealtimeDatabaseRole.COMPUTE,
+    )
+    with pytest.raises(
+        ValueError,
+        match="unresolved Advanced equity AM gap",
+    ):
+        process_advanced_equity_journal_once(
+            restarted_bridge,
+            RawJournalReader(journal_path),
+            bridge_config,
+            checked_at=checked_at,
+        )
+    reference_generation = rehearsal.scalar(
+        "SELECT count(*) FROM rt.seed_manifests "
+        "WHERE status='READY' AND created_at<=%s",
+        (cutoff,),
+    )
+    with pytest.raises(ValueError, match="unresolved stream gaps"):
+        input_ready_identity(
+            restarted_bridge,
+            cohort_id=seeded.cohort_id,
+            cutoff=cutoff,
+            known_by=spec.deadline,
+            reference_generation=reference_generation,
+        )
+    assert rehearsal.q(
+        "SELECT shard_id, committed_offset FROM rt.consumer_checkpoints "
+        "WHERE cohort_id=%s ORDER BY shard_id",
+        (str(seeded.cohort_id),),
+    ) == [(0, len(payloads) - 1), (1, len(payloads) - 1)]
+    rehearsal.admin(
+        "UPDATE rt.stream_gaps SET recovery_status='REPAIRED', gap_end=%s, "
+        "repair_reference=%s WHERE gap_id=%s",
+        (cutoff, str(uuid4()), str(gap_id)),
+    )
+    resumed = process_advanced_equity_journal_once(
+        restarted_bridge,
+        RawJournalReader(journal_path),
+        bridge_config,
+        checked_at=checked_at,
+    )
+    replayed = process_advanced_equity_journal_once(
+        V2WorkerDatabase(provider, RealtimeDatabaseRole.COMPUTE),
+        RawJournalReader(journal_path),
+        bridge_config,
+        checked_at=checked_at,
+    )
+    assert (resumed.persisted_bars, resumed.committed_offset) == (
+        0,
+        len(payloads),
+    )
+    assert (replayed.persisted_bars, replayed.scanned_records) == (0, 0)
+
+    build_id = "advanced-e2e-rehearsal"
+    barrier_id = uuid5(
+        NAMESPACE_URL,
+        f"stockscreener:equity-5m-finalizer:{window.window_id}",
+    )
+    with restarted_bridge.transaction() as cursor:
+        enqueue_five_minute_finalizer_jobs_cursor(
+            cursor,
+            cohort_id=seeded.cohort_id,
+            window_id=window.window_id,
+            instrument_ids=tuple(
+                rehearsal.instrument_ids[ticker] for ticker in TICKERS
+            ),
+            checked_at=checked_at,
+            policy_sha256=FINALIZER_POLICY_SHA256,
+            build_id=build_id,
+            barrier_id=barrier_id,
+        )
+    worker_config = EquityWorkerConfig(
+        cohort_id=seeded.cohort_id,
+        job_kind=EQUITY_INTERVAL_FINALIZE_JOB,
+        lease_owner=uuid4(),
+        claim_limit=1,
+    )
+    first_worker = run_five_minute_finalizer_once(
+        restarted_bridge,
+        worker_config,
+        checked_at=checked_at,
+    )
+    second_worker = run_five_minute_finalizer_once(
+        V2WorkerDatabase(provider, RealtimeDatabaseRole.COMPUTE),
+        replace(worker_config, lease_owner=uuid4()),
+        checked_at=checked_at,
+    )
+    idle_worker = run_five_minute_finalizer_once(
+        V2WorkerDatabase(provider, RealtimeDatabaseRole.COMPUTE),
+        replace(worker_config, lease_owner=uuid4()),
+        checked_at=checked_at,
+    )
+    assert (first_worker.claimed, first_worker.completed) == (1, 1)
+    assert (second_worker.claimed, second_worker.completed) == (1, 1)
+    assert idle_worker.claimed == 0
+    universe_sha256, exact_input_sha256 = input_ready_identity(
+        restarted_bridge,
+        cohort_id=seeded.cohort_id,
+        cutoff=cutoff,
+        known_by=spec.deadline,
+        reference_generation=reference_generation,
+    )
+    assert len(universe_sha256) == len(exact_input_sha256) == 64
+    with restarted_bridge.transaction(read_only=True, dict_cursor=True) as cursor:
+        projection_inputs = ScreeningInputLoader().load(
+            cursor,
+            cohort_id=seeded.cohort_id,
+            session=rehearsal.session,
+            cutoff=cutoff,
+            source_generation=reference_generation,
+            known_by=spec.deadline,
+        )
+    calendar = exchange_calendars.get_calendar("XNYS")
+    previous_session = calendar.previous_session(str(rehearsal.session))
+    expected_raw_daily_sessions = [
+        stamp.date()
+        for stamp in calendar.sessions_in_range(
+            calendar.session_offset(previous_session, -19),
+            previous_session,
+        )
+    ]
+    expected_adjusted_sessions = [
+        stamp.date()
+        for stamp in calendar.sessions_in_range(
+            calendar.session_offset(previous_session, -282),
+            previous_session,
+        )
+    ]
+    for ticker in TICKERS:
+        adjusted_sessions = sorted(
+            row["session_date"]
+            for row in projection_inputs.bars
+            if row["ticker"] == ticker
+            and row["interval"] == "1d"
+            and row["adjustment_basis"] == "ADJUSTED"
+        )
+        assert adjusted_sessions == expected_adjusted_sessions, (
+            ticker,
+            len(adjusted_sessions),
+            adjusted_sessions[:2],
+            adjusted_sessions[-2:],
+            expected_adjusted_sessions[:2],
+            expected_adjusted_sessions[-2:],
+        )
+        raw_daily_sessions = sorted(
+            row["session_date"]
+            for row in projection_inputs.bars
+            if row["ticker"] == ticker
+            and row["interval"] == "1d"
+            and row["adjustment_basis"] == "RAW_UNADJUSTED"
+        )
+        assert raw_daily_sessions[-20:] == expected_raw_daily_sessions, (
+            ticker,
+            len(raw_daily_sessions),
+            raw_daily_sessions[-20:],
+            expected_raw_daily_sessions,
+        )
+
+    environment = RunnerEnvironment(provider, build_id=build_id)
+    runners = dict(
+        build_runners(enabled, provider, environment=environment)
+    )
+    runners["EQUITY_INGEST"] = lambda context: StageOutcome.complete()
+    publish = runners["PORTAL_PUBLISH"]
+
+    def crash_at_publication_boundaries(context):
+        if context.attempt == 1:
+            raise SimulatedCrash("portal publication died before work")
+        outcome = publish(context)
+        if context.attempt == 2:
+            raise SimulatedCrash("portal publication died after commit")
+        return outcome
+
+    runners["PORTAL_PUBLISH"] = crash_at_publication_boundaries
+
+    def orchestrator():
+        return StageOrchestrator(
+            repository,
+            runners,
+            database=provider,
+            stages=STAGES_V2,
+            catalog_version="stages_v2",
+            clock=Clock(checked_at),
+            max_attempts=3,
+            max_lane_seconds=1_500.0,
+            lane_grace_seconds=1_200.0,
+        )
+
+    assert rehearsal.scalar(
+        "SELECT state FROM rt.window_runs WHERE window_id=%s",
+        (str(window.window_id),),
+    ) == "PENDING"
+    with swallow_simulated_crash():
+        orchestrator().run_window(window.window_id)
+    receipts_after_projection = rehearsal.q(
+        "SELECT receipt_kind, count(*) FROM rt.cycle_receipts "
+        "WHERE window_id=%s GROUP BY receipt_kind ORDER BY receipt_kind",
+        (str(window.window_id),),
+    )
+    stage_rows_after_projection = rehearsal.q(
+        "SELECT stage_id, attempt, state, reason_codes "
+        "FROM rt.stage_runs WHERE window_id=%s ORDER BY stage_id, attempt",
+        (str(window.window_id),),
+    )
+    assert receipts_after_projection == [
+        (INPUT_READY, 1),
+        (PORTAL_READY, 1),
+    ], stage_rows_after_projection
+    _restart_advanced_projection(environment)
+    with swallow_simulated_crash():
+        orchestrator().run_window(window.window_id)
+    stored_after_commit = {
+        "bars": rehearsal.q(
+            "SELECT instrument_id, interval, bar_start, count(*) "
+            "FROM rt.bar_revisions WHERE cohort_id=%s "
+            "AND interval IN ('1m','5m') AND bar_start>=%s AND bar_end<=%s "
+            "GROUP BY instrument_id, interval, bar_start ORDER BY 1,2,3",
+            (
+                str(seeded.cohort_id),
+                cutoff - timedelta(minutes=5),
+                cutoff,
+            ),
+        ),
+        "jobs": rehearsal.q(
+            "SELECT job_kind, status, count(*) FROM rt.materialization_jobs "
+            "WHERE cohort_id=%s GROUP BY job_kind, status ORDER BY 1,2",
+            (str(seeded.cohort_id),),
+        ),
+        "snapshots": rehearsal.q(
+            "SELECT snapshot_type, snapshot_key, snapshot_id::text "
+            "FROM rt.snapshot_catalog WHERE cohort_id=%s AND generated_at=%s "
+            "ORDER BY snapshot_type, snapshot_key",
+            (str(seeded.cohort_id), cutoff),
+        ),
+        "releases": rehearsal.q(
+            "SELECT release_id::text, receipt_id::text, manifest_sha256 "
+            "FROM rt.portal_releases WHERE cohort_id=%s ORDER BY release_id",
+            (str(seeded.cohort_id),),
+        ),
+        "screening": rehearsal.q(
+            "SELECT generation_id::text, source_manifest_sha256, status "
+            "FROM rt.screening_generations WHERE cohort_id=%s AND generated_at=%s",
+            (str(seeded.cohort_id), cutoff),
+        ),
+    }
+    _restart_advanced_projection(environment)
+    report = orchestrator().run_window(window.window_id)
+    stored_after_retry = {
+        "bars": rehearsal.q(
+            "SELECT instrument_id, interval, bar_start, count(*) "
+            "FROM rt.bar_revisions WHERE cohort_id=%s "
+            "AND interval IN ('1m','5m') AND bar_start>=%s AND bar_end<=%s "
+            "GROUP BY instrument_id, interval, bar_start ORDER BY 1,2,3",
+            (
+                str(seeded.cohort_id),
+                cutoff - timedelta(minutes=5),
+                cutoff,
+            ),
+        ),
+        "jobs": rehearsal.q(
+            "SELECT job_kind, status, count(*) FROM rt.materialization_jobs "
+            "WHERE cohort_id=%s GROUP BY job_kind, status ORDER BY 1,2",
+            (str(seeded.cohort_id),),
+        ),
+        "snapshots": rehearsal.q(
+            "SELECT snapshot_type, snapshot_key, snapshot_id::text "
+            "FROM rt.snapshot_catalog WHERE cohort_id=%s AND generated_at=%s "
+            "ORDER BY snapshot_type, snapshot_key",
+            (str(seeded.cohort_id), cutoff),
+        ),
+        "releases": rehearsal.q(
+            "SELECT release_id::text, receipt_id::text, manifest_sha256 "
+            "FROM rt.portal_releases WHERE cohort_id=%s ORDER BY release_id",
+            (str(seeded.cohort_id),),
+        ),
+        "screening": rehearsal.q(
+            "SELECT generation_id::text, source_manifest_sha256, status "
+            "FROM rt.screening_generations WHERE cohort_id=%s AND generated_at=%s",
+            (str(seeded.cohort_id), cutoff),
+        ),
+    }
+    assert report.window_state == "COMPLETE"
+    assert stored_after_retry == stored_after_commit
+    assert all(row[3] == 1 for row in stored_after_retry["bars"])
+    assert len(stored_after_retry["bars"]) == len(TICKERS) * 6
+    assert stored_after_retry["jobs"] == [
+        (EQUITY_INTERVAL_FINALIZE_JOB, "COMPLETE", len(TICKERS))
+    ]
+    assert len(stored_after_retry["screening"]) == 1
+    snapshot_identities = {
+        (row[0], row[1]) for row in stored_after_retry["snapshots"]
+    }
+    assert len(snapshot_identities) == len(stored_after_retry["snapshots"]) == (
+        len(TICKERS) + 3
+    )
+    assert (STOCK_ALERTS_VERSION, "PLATFORM") in snapshot_identities
+    assert {
+        (TICKER_WORKSPACE_VERSION, ticker) for ticker in TICKERS
+    } <= snapshot_identities
+    input_receipt = rehearsal.scalar(
+        "SELECT receipt_id::text FROM rt.cycle_receipts "
+        "WHERE window_id=%s AND receipt_kind=%s",
+        (str(window.window_id), INPUT_READY),
+    )
+    assert {row[1] for row in stored_after_retry["releases"]} == {
+        input_receipt
+    }
+    current = rehearsal.q(
+        "SELECT release.release_id::text, release.receipt_id::text, release.cutoff, "
+        "release.provider_tier, release.manifest "
+        "FROM rt.portal_release_current AS pointer "
+        "JOIN rt.portal_releases AS release "
+        "ON release.release_id=pointer.release_id AND release.cutoff=pointer.cutoff "
+        "WHERE pointer.cohort_id=%s AND pointer.provider_tier='MASSIVE_ADVANCED'",
+        (str(seeded.cohort_id),),
+    )
+    assert len(current) == 1
+    release_id, release_receipt, release_cutoff, release_tier, release_manifest = current[0]
+    assert (release_receipt, release_cutoff, release_tier) == (
+        input_receipt,
+        cutoff,
+        ProviderTier.MASSIVE_ADVANCED.value,
+    )
+    release_identities = {
+        (entry["snapshot_type"], entry["snapshot_key"])
+        for entry in release_manifest["snapshots"]
+    }
+    assert snapshot_identities == release_identities
+
+    screening_rows = rehearsal.q(
+        "SELECT generation_id::text, provider_tier, source_manifest_sha256, manifest "
+        "FROM rt.screening_generations WHERE cohort_id=%s AND generated_at=%s",
+        (str(seeded.cohort_id), cutoff),
+    )
+    assert len(screening_rows) == 1
+    screening_id, screening_tier, screening_sha256, screening_manifest = screening_rows[0]
+    assert screening_tier == ProviderTier.MASSIVE_ADVANCED.value
+    assert screening_sha256 == canonical_sha256(screening_manifest)
+    assert screening_manifest["source_cutoff"] == cutoff.isoformat()
+
+    snapshot_rows = rehearsal.q(
+        "SELECT catalog.snapshot_type, catalog.snapshot_key, catalog.snapshot_id::text, "
+        "catalog.provider_tier, catalog.source_generation, "
+        "snapshot.payload->>'provider_fetch_performed' "
+        "FROM rt.snapshot_catalog AS catalog "
+        "JOIN rt.portal_snapshot_hot AS snapshot "
+        "ON snapshot.snapshot_id=catalog.snapshot_id "
+        "AND snapshot.generated_at=catalog.generated_at "
+        "WHERE catalog.cohort_id=%s AND catalog.generated_at=%s "
+        "ORDER BY catalog.snapshot_type, catalog.snapshot_key",
+        (str(seeded.cohort_id), cutoff),
+    )
+    expected_snapshots = {
+        (snapshot_type, snapshot_key): snapshot_id
+        for snapshot_type, snapshot_key, snapshot_id, _tier, _generation, _provider_fetch in snapshot_rows
+    }
+    assert len(expected_snapshots) == 5
+    assert {
+        tier for _type, _key, _id, tier, _generation, _provider_fetch in snapshot_rows
+    } == {ProviderTier.MASSIVE_ADVANCED.value}
+    assert {
+        generation for _type, _key, _id, _tier, generation, _provider_fetch in snapshot_rows
+    } == {screening_manifest["source_generation"]}
+    assert all(
+        provider_fetch == "false"
+        for _type, _key, _id, _tier, _generation, provider_fetch in snapshot_rows
+    )
+
+    storage_counts_before_api = rehearsal.q(
+        "SELECT "
+        "(SELECT count(*) FROM rt.cycle_receipts WHERE window_id=%s), "
+        "(SELECT count(*) FROM rt.snapshot_catalog WHERE cohort_id=%s), "
+        "(SELECT count(*) FROM rt.portal_releases WHERE cohort_id=%s), "
+        "(SELECT count(*) FROM rt.screening_generations WHERE cohort_id=%s), "
+        "(SELECT count(*) FROM rt.materialization_jobs WHERE cohort_id=%s), "
+        "(SELECT count(*) FROM rt.bar_revisions WHERE cohort_id=%s)",
+        (
+            str(window.window_id),
+            *(str(seeded.cohort_id) for _ in range(5)),
+        ),
+    )[0]
+    api_read_at = datetime.now(UTC)
+    first_app = _advanced_api_app(
+        api_pool=pools["api"],
+        api_role=roles.name("api"),
+        clock=api_read_at,
+    )
+    first_api = _read_advanced_api_publication(first_app, seeded.cohort_id)
+    assert {
+        name: response[0] for name, response in first_api.items()
+    } == {
+        "screening_catalog": 200,
+        "screening_query": 200,
+        "stock_alerts": 200,
+        "workspace": 200,
+        **{f"ticker:{ticker}": 200 for ticker in TICKERS},
+        **{f"chart:{ticker}": 200 for ticker in TICKERS},
+        "dashboard": 503,
+    }
+
+    catalog = first_api["screening_catalog"][2]
+    query = first_api["screening_query"][2]
+    alerts = first_api["stock_alerts"][2]
+    workspace = first_api["workspace"][2]
+    assert catalog["status"] == "READY"
+    assert [row["generation"] for row in catalog["publications"]] == [
+        screening_manifest["generation"]
+    ]
+    assert query["universe_count"] == query["matched_count"] == len(TICKERS)
+    assert query["generation"]["generation"] == screening_manifest["generation"]
+    assert query["generation"]["provider_tier"] == screening_tier
+    assert query["generation"]["source_cutoff"] == release_cutoff.isoformat()
+    assert query["generation"]["source_generation"] == screening_manifest["source_generation"]
+    assert alerts["provider_fetch_performed"] is False
+    assert set(alerts["missing_producers"]) == {"context", "forward", "replay"}
+    assert first_api["dashboard"][2] == {
+        "detail": "Dashboard has no retained publication for this cohort"
+    }
+
+    exposed_snapshot_ids = {
+        workspace["publication"]["snapshot_id"],
+        *(row["snapshot_id"] for row in workspace["workspaces"]),
+        *(first_api[f"ticker:{ticker}"][2]["snapshot_id"] for ticker in TICKERS),
+    }
+    expected_exposed_snapshot_ids = {
+        expected_snapshots[(TICKER_WORKSPACE_SUMMARY_VERSION, "PLATFORM")],
+        *(expected_snapshots[(TICKER_WORKSPACE_VERSION, ticker)] for ticker in TICKERS),
+    }
+    assert exposed_snapshot_ids == expected_exposed_snapshot_ids
+    release_snapshot_ids = {
+        entry["snapshot_id"] for entry in release_manifest["snapshots"]
+    }
+    assert exposed_snapshot_ids <= release_snapshot_ids
+    assert len(release_snapshot_ids) == 5
+    for ticker in TICKERS:
+        chart = first_api[f"chart:{ticker}"][2]
+        assert len(chart) > 1
+        assert chart[-1]["time"] == int((cutoff - timedelta(minutes=5)).timestamp())
+
+    second_app = _advanced_api_app(
+        api_pool=pools["api"],
+        api_role=roles.name("api"),
+        clock=api_read_at,
+    )
+    second_api = _read_advanced_api_publication(second_app, seeded.cohort_id)
+    assert second_api == first_api
+    assert rehearsal.q(
+        "SELECT "
+        "(SELECT count(*) FROM rt.cycle_receipts WHERE window_id=%s), "
+        "(SELECT count(*) FROM rt.snapshot_catalog WHERE cohort_id=%s), "
+        "(SELECT count(*) FROM rt.portal_releases WHERE cohort_id=%s), "
+        "(SELECT count(*) FROM rt.screening_generations WHERE cohort_id=%s), "
+        "(SELECT count(*) FROM rt.materialization_jobs WHERE cohort_id=%s), "
+        "(SELECT count(*) FROM rt.bar_revisions WHERE cohort_id=%s)",
+        (
+            str(window.window_id),
+            *(str(seeded.cohort_id) for _ in range(5)),
+        ),
+    )[0] == storage_counts_before_api
+    assert str(UUID(release_id)) == release_id
+    assert str(UUID(screening_id)) == screening_id

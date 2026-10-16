@@ -96,6 +96,22 @@ def catalog_facts(cursor, relations: Sequence[str]) -> dict[str, dict[str, objec
             "WHERE k.conrelid = %s::regclass AND k.contype = 'f'", (relation,))
         parents = {row[0] for row in cursor.fetchall()}
         cursor.execute(
+            "SELECT array_agg(child.attname ORDER BY keys.ordinality),"
+            "array_agg(parent.attname ORDER BY keys.ordinality) "
+            "FROM pg_constraint k "
+            "CROSS JOIN LATERAL unnest(k.conkey, k.confkey) WITH ORDINALITY "
+            "AS keys(child_num, parent_num, ordinality) "
+            "JOIN pg_attribute child ON child.attrelid=k.conrelid AND child.attnum=keys.child_num "
+            "JOIN pg_attribute parent ON parent.attrelid=k.confrelid AND parent.attnum=keys.parent_num "
+            "WHERE k.conrelid=%s::regclass AND k.confrelid=k.conrelid AND k.contype='f' "
+            "GROUP BY k.oid ORDER BY k.oid",
+            (relation,),
+        )
+        self_foreign_keys = [
+            dict(columns=list(columns), referenced_columns=list(referenced_columns))
+            for columns, referenced_columns in cursor.fetchall()
+        ]
+        cursor.execute(
             "SELECT a.attname, pg_get_serial_sequence(%s, a.attname) FROM pg_attribute a "
             "WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped "
             "AND pg_get_serial_sequence(%s, a.attname) IS NOT NULL", (relation, relation, relation))
@@ -104,8 +120,16 @@ def catalog_facts(cursor, relations: Sequence[str]) -> dict[str, dict[str, objec
             "SELECT t.tgname, pg_get_triggerdef(t.oid) FROM pg_trigger t "
             "WHERE t.tgrelid = %s::regclass AND NOT t.tgisinternal ORDER BY t.tgname", (relation,))
         triggers = [dict(name=name, definition=definition) for name, definition in cursor.fetchall()]
-        facts[relation] = dict(columns=columns, primary_key=primary_key, parents=parents, sequences=sequences,
-                               triggers=triggers, schema=schema, table=table)
+        facts[relation] = dict(
+            columns=columns,
+            primary_key=primary_key,
+            parents=parents,
+            self_foreign_keys=self_foreign_keys,
+            sequences=sequences,
+            triggers=triggers,
+            schema=schema,
+            table=table,
+        )
     return facts
 
 
@@ -118,11 +142,19 @@ def build_reference_copy_plan(cursor) -> dict[str, object]:
         fact = facts[name]
         columns = [column["name"] for column in fact["columns"] if not column["generated"]]
         relations.append(dict(
-            relation=name, columns=columns, primary_key=fact["primary_key"],
+            relation=name,
+            columns=columns,
+            column_types={
+                column["name"]: column["type"]
+                for column in fact["columns"]
+                if not column["generated"]
+            },
+            primary_key=fact["primary_key"],
             parents=sorted(parent for parent in fact["parents"] if parent in scope and parent != name),
             # A table that references itself cannot be copied in primary-key order alone: the executor
             # must insert parents first or defer the foreign key for the load.
             self_referencing=name in fact["parents"],
+            self_foreign_keys=fact["self_foreign_keys"],
             generated_columns_skipped=[column["name"] for column in fact["columns"] if column["generated"]],
             insert_triggers=[trigger["name"] for trigger in fact["triggers"]
                              if " INSERT" in trigger["definition"].upper()],
@@ -134,7 +166,8 @@ def build_reference_copy_plan(cursor) -> dict[str, object]:
                 setval=(f"SELECT setval('{sequence['sequence']}', "
                         f"(SELECT COALESCE(max(\"{sequence['column']}\"), 1) FROM {_quote(name)}), true)")))
     return dict(
-        version=PLAN_VERSION, mode="PLAN", executor="NOT_BUILT", source=SOURCE_DATABASE, target=TARGET_DATABASE,
+        version=PLAN_VERSION, mode="PLAN", executor="reference_copy_executor_v1",
+        source=SOURCE_DATABASE, target=TARGET_DATABASE,
         source_access="READ ONLY transaction, SELECT only; v1 is never modified",
         timestamps="copied verbatim: every column is listed, no target DEFAULT is used",
         relations=relations, sequences=sequences,

@@ -186,9 +186,13 @@ def test_the_009_policy_rows_are_all_accepted_or_not_ordinary_retention():
 
 
 def test_every_catalog_rule_names_a_prunable_registry_catalog():
+    from realtime.relation_registry import grants
+
     for catalog in CATALOG_RULES:
         spec = RELATIONS[catalog]
-        assert not spec.partitioned and spec.delete == ("partition_admin",) and spec.prune_read
+        # Catalogs are append-only for app; admin (the owner) prunes them with DELETE.
+        assert not spec.partitioned and spec.writes == "APPEND" and not spec.delete, catalog
+        assert "DELETE" not in grants()[catalog], catalog
 
 
 def test_the_snapshot_catalog_rule_prunes_exactly_the_class_that_has_hot_bodies():

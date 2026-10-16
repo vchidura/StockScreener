@@ -5,11 +5,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import exchange_calendars
 
 from equity.portal_scanners import compute_default_scanner_snapshots
 from screeners import _compute_index_technicals
 
 from .contracts import canonical_sha256
+from .equity_portal_history import build_realtime_equity_portal_history_plan
 from .lineage_head import (
     inputs_bar_lineage_sha256, inputs_sha256, reference_set, require_bounded_manifest, rows_identity,
 )
@@ -98,9 +100,30 @@ def _overview(ticker, frame, raw):
 
 
 def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
-    screening = produce_realtime_screening(replace(
-        inputs, bars=tuple(row for row in inputs.bars if row["interval"] not in {"1wk", "1mo"}),
-    ))
+    calendar = exchange_calendars.get_calendar("XNYS")
+    history_session = (
+        calendar.previous_session(str(inputs.session)).date()
+        if inputs.cutoff < calendar.session_close(str(inputs.session)).to_pydatetime()
+        else inputs.session
+    )
+    history_plan = build_realtime_equity_portal_history_plan(
+        history_session,
+        equity_ticker_count=len(inputs.members),
+    )
+    adjusted_sessions = set(history_plan.adjusted_sessions)
+    inputs = replace(
+        inputs,
+        bars=tuple(
+            row for row in inputs.bars
+            if row["interval"] not in {"1wk", "1mo"}
+            and not (
+                row["interval"] == "1d"
+                and row["adjustment_basis"] == "ADJUSTED"
+                and row["session_date"] not in adjusted_sessions
+            )
+        ),
+    )
+    screening = produce_realtime_screening(inputs)
     delay = timedelta(minutes=15 if inputs.provider_tier is ProviderTier.MASSIVE_DEVELOPER else 0)
     indexed = {str(row["bar_revision_id"]): row for row in inputs.bars}
 
@@ -124,7 +147,8 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
             raise ValueError("Dashboard source availability is beyond cutoff")
     start = min(row["session_date"] for row in inputs.bars if row["interval"] == "1d"
                 and row["adjustment_basis"] == "ADJUSTED")
-    if any(start < action["effective_date"] <= inputs.session and action["action_type"] != "SPLIT"
+    if any(start < action["effective_date"] <= inputs.session
+           and action["action_type"] not in {"SPLIT", "DIVIDEND"}
            for action in inputs.actions):
         raise ValueError("Dashboard non-split corporate action requires reviewed history")
     frames, raw = dashboard_frames(inputs)
@@ -199,7 +223,7 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
         setup_summary=dict(
             interval="1d", source="MATERIALIZED_CURRENT_PROJECTION",
             analysis_run_id=manifest["setup_analysis_run_id"], computed_at=inputs.cutoff.isoformat(),
-            is_fresh=True, staleness_sessions=0, market_time=manifest["market_time"],
+            is_fresh=True, staleness_sessions=0, market_time=setup_evidence[0]["market_time"],
             count=len(setup_rows), results=setup_rows,
         ),
         context=dict(

@@ -179,6 +179,18 @@ def test_nine_ticker_real_detectors_do_not_turn_bootstrap_into_forward_publicati
     assert payload["provider_fetch_performed"] is payload["execution_permission"] is False
 
 
+def test_detector_only_bar_input_produces_the_same_alert_snapshot_as_portal_history():
+    inputs = timely_fixture()
+    detector_bars = tuple(
+        row for row in inputs.bars
+        if row["interval"] in {"30m", "1d"}
+    )
+
+    assert produce_realtime_stock_alerts(replace(inputs, bars=detector_bars)) == (
+        produce_realtime_stock_alerts(inputs)
+    )
+
+
 def test_original_alert_and_eod_routes_read_retained_outputs_only():
     app, store = alert_app()
     with TestClient(app) as client:
@@ -371,7 +383,7 @@ def test_default_materializer_never_replaces_forward_or_unknown_state(monkeypatc
                                    {"retained_body": True, "retained_forward": retained_forward}]
     def forbidden(*args, **kwargs):
         raise AssertionError("Retained/unknown forward state must not reach production or writes")
-    monkeypatch.setattr(repository, "load_realtime_screening_input", forbidden)
+    monkeypatch.setattr(repository, "load_realtime_stock_alert_input", forbidden)
     monkeypatch.setattr(repository, "persist_portal_snapshot_cursor", forbidden)
     with pytest.raises(ValueError, match="refusing to replace retained publications"):
         repository.compute_realtime_stock_alerts(database, cohort_id=COHORT_ID)
@@ -398,7 +410,7 @@ def test_materializer_replaces_only_unretained_or_forward_free_state(monkeypatch
         "expired_body": [pointer, release, {"retained_body": False, "retained_forward": None}],
         "empty_forward": [pointer, release, {"retained_body": True, "retained_forward": False}],
     }[previous]
-    monkeypatch.setattr(repository, "load_realtime_screening_input",
+    monkeypatch.setattr(repository, "load_realtime_stock_alert_input",
                         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("reached production")))
     with pytest.raises(RuntimeError, match="reached production"):
         repository.compute_realtime_stock_alerts(database, cohort_id=COHORT_ID)
@@ -430,7 +442,7 @@ def test_alert_compute_and_publication_each_require_their_own_role_and_the_split
         repository.materialize_realtime_stock_alerts(compute, compute, cohort_id=COHORT_ID)
     persisted = []
     monkeypatch.setattr(repository, "load_current_release", lambda cursor, cohort_id: None)
-    monkeypatch.setattr(repository, "load_realtime_screening_input", lambda cursor, **scope: scope)
+    monkeypatch.setattr(repository, "load_realtime_stock_alert_input", lambda cursor, **scope: scope)
     monkeypatch.setattr(repository, "produce_realtime_stock_alerts", lambda inputs: snapshot)
     monkeypatch.setattr(repository, "persist_portal_snapshot_cursor",
                         lambda cursor, row, **options: persisted.append((cursor, options)) or row)

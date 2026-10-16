@@ -144,8 +144,10 @@ def test_pools_required_follows_enabled_stages_and_security_mode():
     equity = {name for name, stage in STAGES_V1.items() if stage.domain != "options"}
     assert pools_required(equity, V2AccessConfig()) == frozenset({OWNER_POOL})
     hardened = V2AccessConfig(security_mode="hardened", role_prefix="stocks_realtime_v2")
-    assert pools_required(equity, hardened) == frozenset({"runtime_data"})
-    assert pools_required(STAGES_V1, hardened) == frozenset({"runtime_data", "runtime_options"})
+    # One app pool serves every stage, Options included; the api pool belongs to the HTTP process.
+    assert pools_required(equity, hardened) == frozenset({"app"})
+    assert pools_required(STAGES_V1, hardened) == frozenset({"app"})
+    assert pools_required(set(), hardened) == frozenset() == pools_required(set(), V2AccessConfig())
 
 
 def test_connection_budget_enforces_the_headroom_over_the_whole_deployment():
@@ -180,44 +182,54 @@ def test_provider_pool_shape_is_validated_per_mode():
     with pytest.raises(ValueError):
         V2ConnectionProvider({}, config)
     with pytest.raises(ValueError, match="single owner pool"):
-        V2ConnectionProvider({"runtime_data": object()}, config)
+        V2ConnectionProvider({"app": object()}, config)
     with pytest.raises(ValueError, match="must not hold an owner pool"):
         V2ConnectionProvider({OWNER_POOL: object()}, hardened)
     with pytest.raises(ValueError, match="unknown"):
         V2ConnectionProvider({"nobody": object()}, config)
+    with pytest.raises(ValueError, match="unknown"):
+        V2ConnectionProvider({"runtime_data": object()}, hardened)
+    assert V2ConnectionProvider({"app": object(), "api": object()}, hardened)
 
 
-def test_deferred_transaction_uses_the_owner_pool_without_switching_roles_and_records_role_mismatches():
+def test_deferred_transaction_uses_the_owner_pool_without_switching_roles():
     pool = _Pool([])
     provider = V2ConnectionProvider({OWNER_POOL: pool}, V2AccessConfig())
-    with provider.transaction("compute", "runtime_data") as unit:
+    with provider.transaction() as unit:
         unit.cursor.execute("SELECT 1")
     statements = [text for text, _ in pool.connection.statements]
     assert not any("SET LOCAL ROLE" in text for text in statements)
-    assert pool.connection.committed == 1 and provider.role_violations == []
-    with provider.transaction("compute", "runtime_options"):
-        pass
-    assert [(v.capability_role, v.principal_profile) for v in provider.role_violations] == [
-        ("compute", "runtime_options")]
-    with pytest.raises(ValueError):
-        with provider.transaction("nonsense", "runtime_data"):
+    assert pool.connection.committed == 1 and unit.role == "app"
+    with provider.transaction("api", read_only=True) as unit:
+        assert unit.role == "api"
+    with pytest.raises(ValueError, match="unknown database role"):
+        with provider.transaction("compute"):
+            pass
+    with pytest.raises(ValueError, match="read-only"):
+        with provider.transaction("api"):
             pass
 
 
-def test_hardened_transaction_sets_the_capability_role_and_refuses_a_mismatch():
-    pool = _Pool([])
+def test_hardened_transaction_sets_the_app_or_api_role_on_its_own_pool():
+    app_pool, api_pool = _Pool([]), _Pool([])
     config = V2AccessConfig(security_mode="hardened", role_prefix="stocks_realtime_v2")
-    provider = V2ConnectionProvider({"runtime_options": pool}, config)
-    with provider.transaction("options_compute", "runtime_options", read_only=True):
+    provider = V2ConnectionProvider({"app": app_pool, "api": api_pool}, config)
+    with provider.transaction(read_only=True):
         pass
-    statements = [text for text, _ in pool.connection.statements]
-    assert any("SET LOCAL ROLE" in text and "stocks_realtime_v2_options_compute" in text for text in statements)
+    statements = [text for text, _ in app_pool.connection.statements]
+    assert any("SET LOCAL ROLE" in text and "stocks_realtime_v2_app" in text for text in statements)
     assert any("READ ONLY" in text for text in statements)
-    with pytest.raises(PermissionError):
-        with provider.transaction("compute", "runtime_options"):
+    with provider.transaction("api", read_only=True):
+        pass
+    assert any("SET LOCAL ROLE" in text and "stocks_realtime_v2_api" in text
+               for text, _ in api_pool.connection.statements)
+    assert not any("stocks_realtime_v2_api" in text for text, _ in app_pool.connection.statements)
+    with pytest.raises(ValueError, match="read-only"):
+        with provider.transaction("api"):
             pass
+    only_app = V2ConnectionProvider({"app": _Pool([])}, config)
     with pytest.raises(RuntimeError, match="no v2 pool"):
-        with provider.transaction("compute", "runtime_data"):
+        with only_app.transaction("api", read_only=True):
             pass
 
 
@@ -244,23 +256,26 @@ def test_pool_verification_gates_on_database_identity_and_security_phase():
     assert verify_pool_target_v2(pool_for("test_realtime_v2_x", good, "AUDITED"), hardened)
 
 
-def test_a_hardened_pool_verifies_under_a_capability_role_its_principal_holds():
+def test_a_hardened_pool_verifies_under_the_role_it_logs_in_as():
     good = [("advanced_realtime_v2", "test_realtime_v2_x")]
     hardened = V2AccessConfig(security_mode="hardened", role_prefix="stocks_realtime_v2", allow_disposable=True)
 
-    def verified_statements(principal):
+    def verified_statements(role):
         pool = _Pool([("current_database", [("test_realtime_v2_x",)]), ("rt.database_identity", good),
                       ("security_phase_events", [("AUDITED",)])])
-        verify_pool_target_v2(pool, hardened, principal)
+        verify_pool_target_v2(pool, hardened, role)
         return [text for text, _ in pool.connection.statements if "SET LOCAL ROLE" in str(text)]
 
-    # NOINHERIT runtime principals read the identity relations as `control`; the api principal as `reader`.
-    assert any("stocks_realtime_v2_control" in str(text) for text in verified_statements("runtime_data"))
-    assert any("stocks_realtime_v2_control" in str(text) for text in verified_statements("runtime_options"))
-    assert any("stocks_realtime_v2_reader" in str(text) for text in verified_statements("api"))
-    # Without a principal (or in deferred mode) no role is assumed.
+    assert any("stocks_realtime_v2_app" in str(text) for text in verified_statements("app"))
+    assert any("stocks_realtime_v2_api" in str(text) for text in verified_statements("api"))
+    # Without a role (or in deferred mode) no role is assumed.
     assert verified_statements(None) == []
-    assert verified_statements("migrator") == []
+    deferred = V2AccessConfig(allow_disposable=True)
+    pool = _Pool([("current_database", [("test_realtime_v2_x",)]), ("rt.database_identity", good),
+                  ("security_phase_events", [("DEFERRED",)])])
+    verify_pool_target_v2(pool, deferred, "app")
+    assert not any("SET LOCAL ROLE" in str(text) for text, _ in pool.connection.statements)
+
 
 @pytest.fixture(scope="module")
 def database():
@@ -277,10 +292,10 @@ def test_partition_maintenance_creates_ahead_and_alarms_when_creation_is_missed(
 
     provider = V2ConnectionProvider({OWNER_POOL: database}, V2AccessConfig(allow_disposable=True))
     today = date_type.today()
-    with provider.transaction("maintenance", "runtime_data") as unit:
+    with provider.transaction() as unit:
         created, alarms = ensure_partitions_and_check(unit.cursor, today)
     assert created >= 0 and alarms == []
-    with provider.transaction("maintenance", "runtime_data", read_only=True) as unit:
+    with provider.transaction(read_only=True) as unit:
         missed = partition_alarms(unit.cursor, today + timedelta(days=30))
     from realtime.relation_registry import PARTITIONED_RELATIONS
 
@@ -291,26 +306,26 @@ def test_diagnostics_round_trip_on_the_real_table_and_database_rules_hold(databa
     pool = database
     provider = V2ConnectionProvider({OWNER_POOL: pool}, V2AccessConfig(allow_disposable=True))
     assert provider.verify().startswith("test_realtime_v2_")
-    with provider.transaction("control", "runtime_data") as unit:
+    with provider.transaction() as unit:
         cohort = insert_cohort(unit.cursor, NOW)
     created_at = datetime.now(timezone.utc)
-    with provider.transaction("options_compute", "runtime_options") as unit:
+    with provider.transaction() as unit:
         assert persist_normalization_diagnostics(unit.cursor, cohort, [_diagnostic()], created_at=created_at) == 1
-    with provider.transaction("options_compute", "runtime_options") as unit:
+    with provider.transaction() as unit:
         assert persist_normalization_diagnostics(unit.cursor, cohort, [_diagnostic()], created_at=created_at) == 0
-    with provider.transaction("options_compute", "runtime_options", read_only=True) as unit:
+    with provider.transaction(read_only=True) as unit:
         rows = load_normalization_diagnostics(unit.cursor, cohort, "spy")
     assert len(rows) == 1
     assert rows[0]["rejection_counts"] == {"OPTION_SPOT_SKEW": 4132} and rows[0]["pages_fetched"] == 3
     assert rows[0]["bar_acquisition"] == "FETCHED" and rows[0]["usable_mark_count"] == 4132
     # The database rejects a zero-candidate row without reasons even if the Python guard is bypassed.
     with pytest.raises(psycopg2.errors.CheckViolation):
-        with provider.transaction("options_compute", "runtime_options") as unit:
+        with provider.transaction() as unit:
             unit.cursor.execute(
                 "INSERT INTO rt.normalization_diagnostics (diagnostic_id, cohort_id, underlyer, bar_count, "
                 "pages_fetched, pagination_complete, bar_acquisition, price_basis, raw_rows, usable_mark_count, "
                 "candidates) VALUES (%s,%s,'SPY',1,1,true,'FETCHED','NOT_APPLICABLE',1,1,0)",
                 (str(uuid4()), str(cohort)))
     with pytest.raises(psycopg2.errors.RaiseException):
-        with provider.transaction("options_compute", "runtime_options") as unit:
+        with provider.transaction() as unit:
             unit.cursor.execute("UPDATE rt.normalization_diagnostics SET raw_rows = raw_rows + 1")

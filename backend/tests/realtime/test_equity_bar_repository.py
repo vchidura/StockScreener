@@ -85,7 +85,16 @@ def test_bar_revision_and_current_pointer_commit_atomically_in_batches():
     assert all("ON CONFLICT DO NOTHING" in statement for statement in cursor.value_statements)
     assert "INSERT INTO rt.bar_current" in cursor.recorded_current_statement
     assert "rt.bar_current.provider_tier=EXCLUDED.provider_tier" in cursor.recorded_current_statement
-    assert "WHEN 'RECONCILED' THEN 4" in cursor.recorded_current_statement
+    assert (
+        "EXCLUDED.adjustment_basis='RAW_UNADJUSTED' "
+        "AND EXCLUDED.interval IN ('15m','30m','1h','1d') "
+        "AND EXCLUDED.source_kind='DERIVED' THEN 5"
+    ) in cursor.recorded_current_statement
+    assert (
+        "EXCLUDED.adjustment_basis='ADJUSTED' "
+        "AND EXCLUDED.interval IN ('1wk','1mo') "
+        "AND EXCLUDED.source_kind='DERIVED' THEN 5"
+    ) in cursor.recorded_current_statement
     assert cursor.recorded_catalog_rows[0][7] == fact.revision.system_observed_at
     assert cursor.recorded_revision_rows[0][2] == "MASSIVE_DEVELOPER"
     # observed_at is the partition key and must equal the catalog's observed_at.

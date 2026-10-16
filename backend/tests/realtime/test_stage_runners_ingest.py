@@ -206,7 +206,7 @@ def test_reference_blocks_without_a_universe_before_any_provider_call():
     assert database.calls == []
 
 
-def test_a_ready_seed_is_persisted_under_the_references_role_with_the_next_ready_count(monkeypatch):
+def test_a_ready_seed_is_persisted_as_the_app_role_with_the_next_ready_count(monkeypatch):
     persisted = []
     monkeypatch.setattr(runners, "persist_reference_result_cursor",
                         lambda cursor, result, **options: persisted.append((result, options)))
@@ -224,7 +224,7 @@ def test_a_ready_seed_is_persisted_under_the_references_role_with_the_next_ready
     assert result.manifest.status is SeedStatus.READY
     assert outcome.state == "COMPLETE" and outcome.reason_codes == () and outcome.evidence_ref == str(
         result.manifest.seed_id)
-    assert [role for role, _ in database.calls] == ["references"]
+    assert [role for role, _ in database.calls] == ["app"]
     assert "rt.seed_manifests" in database.cursor.statements[0][0]
     assert "status = 'READY'" in database.cursor.statements[1][0]
 
@@ -419,14 +419,13 @@ def test_the_ingest_runners_construct_no_provider_client_and_import_no_provider_
         assert forbidden not in source, forbidden
 
 
-def test_the_ingest_stages_are_registered_with_their_capability_roles():
+def test_the_ingest_stages_are_registered_in_the_data_lane():
     from realtime.stage_graph import STAGES_V1
     from realtime.stage_runners_v2 import RUNNER_FACTORIES
 
     assert RUNNER_FACTORIES["REFERENCE"] is runners.reference_runner
     assert RUNNER_FACTORIES["EQUITY_INGEST"] is runners.equity_ingest_runner
-    assert STAGES_V1["REFERENCE"].capability_role == "references"
-    assert STAGES_V1["EQUITY_INGEST"].capability_role == "ingress"
+    assert STAGES_V1["REFERENCE"].lane == STAGES_V1["EQUITY_INGEST"].lane == "data"
 
 
 def test_fail_closed_stages_name_the_enabled_source_gated_stages_an_environment_cannot_serve():

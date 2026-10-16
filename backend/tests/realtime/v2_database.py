@@ -2,7 +2,7 @@
 
 Set STOCKS_V2_DB_TESTS=1 and run pytest WITHOUT the offline I/O guard plugin. The database is
 created from template0, the sql_v2 baseline is applied as its owner (security deferred), and the
-database is always dropped.
+database is dropped unless an explicit caller preserves it for a post-test validation.
 """
 from __future__ import annotations
 
@@ -81,10 +81,12 @@ def drop_database_if_exists(name: str) -> None:
 
 
 @contextmanager
-def disposable_v2_database(name: str):
-    """Yield a connection pool for a freshly provisioned disposable database; drop it afterwards."""
+def disposable_v2_database(name: str, *, preserve: bool = False):
+    """Yield a freshly provisioned database pool; normally drop the database afterwards."""
     if not name.startswith("test_realtime_v2_"):
         raise ValueError("disposable database names must start with test_realtime_v2_")
+    if type(preserve) is not bool:
+        raise TypeError("preserve must be a boolean")
     settings = _settings()
     created = False
     pool = None
@@ -113,7 +115,7 @@ def disposable_v2_database(name: str):
     finally:
         if pool is not None:
             pool.closeall()
-        if created:
+        if created and not preserve:
             with closing(_connect(settings, "postgres")) as connection:
                 connection.autocommit = True
                 with connection.cursor() as cursor:

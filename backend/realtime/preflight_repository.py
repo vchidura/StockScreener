@@ -7,6 +7,65 @@ from psycopg2.extras import Json
 from .preflight import PreflightProfile, TierTransition
 
 
+def persist_preflight_profile_evidence_cursor(cursor, profile: PreflightProfile) -> None:
+    cursor.execute(
+        "INSERT INTO rt.capability_profiles ("
+        "profile_id, profile_sha256, config_sha256, schema_sha256, "
+        "account_alias, capabilities_sha256, universe_sha256, "
+        "security_policy_sha256, provider_tier, preflight_mode, "
+        "provider_requests, action_authorized, checked_at, expires_at, status"
+        ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'PASSIVE', "
+        "false, false, %s, %s, %s) ON CONFLICT (profile_id) DO NOTHING",
+        (
+            str(profile.profile_id),
+            profile.profile_sha256,
+            profile.configuration_sha256,
+            profile.schema_sha256,
+            profile.account_alias,
+            profile.capabilities_sha256,
+            profile.universe_sha256,
+            profile.security_policy_sha256,
+            profile.provider_tier.value,
+            profile.checked_at,
+            profile.expires_at,
+            profile.verdict.value,
+        ),
+    )
+    cursor.execute(
+        "SELECT profile_sha256 FROM rt.capability_profiles WHERE profile_id = %s",
+        (str(profile.profile_id),),
+    )
+    row = cursor.fetchone()
+    if row is None or row[0] != profile.profile_sha256:
+        raise ValueError("persisted preflight profile identity conflict")
+    for check in profile.checks:
+        evidence = {
+            "evidence_reference": check.evidence_reference,
+            "passive": True,
+            "profile_sha256": profile.profile_sha256,
+            "provider_requests": False,
+            "action_authorized": False,
+        }
+        cursor.execute(
+            "INSERT INTO rt.capability_checks ("
+            "profile_id, check_name, scope_key, verdict, required, "
+            "reason_codes, observed_at, expires_at, evidence"
+            ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (profile_id, check_name, scope_key) DO NOTHING",
+            (
+                str(profile.profile_id),
+                check.check_name,
+                check.scope_key,
+                check.verdict.value,
+                check.required,
+                list(check.reason_codes),
+                check.observed_at,
+                check.expires_at,
+                Json(evidence),
+            ),
+        )
+
+
 def persist_preflight_profile(
     connection,
     profile: PreflightProfile,
@@ -22,63 +81,7 @@ def persist_preflight_profile(
     reasons = list(profile.readiness.reason_codes)
     try:
         with connection.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO rt.capability_profiles ("
-                "profile_id, profile_sha256, config_sha256, schema_sha256, "
-                "account_alias, capabilities_sha256, universe_sha256, "
-                "security_policy_sha256, provider_tier, preflight_mode, "
-                "provider_requests, action_authorized, checked_at, expires_at, status"
-                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'PASSIVE', "
-                "false, false, %s, %s, %s) ON CONFLICT (profile_id) DO NOTHING",
-                (
-                    str(profile.profile_id),
-                    profile.profile_sha256,
-                    profile.configuration_sha256,
-                    profile.schema_sha256,
-                    profile.account_alias,
-                    profile.capabilities_sha256,
-                    profile.universe_sha256,
-                    profile.security_policy_sha256,
-                    profile.provider_tier.value,
-                    profile.checked_at,
-                    profile.expires_at,
-                    profile.verdict.value,
-                ),
-            )
-            cursor.execute(
-                "SELECT profile_sha256 FROM rt.capability_profiles "
-                "WHERE profile_id = %s",
-                (str(profile.profile_id),),
-            )
-            row = cursor.fetchone()
-            if row is None or row[0] != profile.profile_sha256:
-                raise ValueError("persisted preflight profile identity conflict")
-            for check in profile.checks:
-                evidence = {
-                    "evidence_reference": check.evidence_reference,
-                    "passive": True,
-                    "profile_sha256": profile.profile_sha256,
-                    "provider_requests": False,
-                    "action_authorized": False,
-                }
-                cursor.execute(
-                    "INSERT INTO rt.capability_checks ("
-                    "profile_id, check_name, scope_key, verdict, required, "
-                    "reason_codes, observed_at, expires_at, evidence"
-                    ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                    "ON CONFLICT (profile_id, check_name, scope_key) DO NOTHING",
-                    (
-                        str(profile.profile_id),
-                        check.check_name,
-                        check.scope_key,
-                        check.verdict.value,
-                        check.required,
-                        list(check.reason_codes),
-                        check.observed_at,
-                        check.expires_at,
-                        Json(evidence),
-                    ),
-                )
+            persist_preflight_profile_evidence_cursor(cursor, profile)
             cursor.execute(
                 "SELECT status, reasons, epoch, profile_id "
                 "FROM rt.readiness_current "

@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 import inspect
 import json
 from uuid import NAMESPACE_URL, uuid5
+from zoneinfo import ZoneInfo
 
 import pytest
 from options.data.polygon_http import PolygonHttpResponse
@@ -128,15 +129,16 @@ def test_forward_context_acquisition_keeps_true_observation_clock_and_complete_p
 
 
 def test_v3_portal_history_collects_adjusted_daily_range_once_per_ticker():
-    import exchange_calendars
-
     identities = _identities()
     identity = identities[0]
     plan = build_realtime_equity_portal_history_plan(date(2026, 10, 8))
-    calendar = exchange_calendars.get_calendar("XNYS")
     rows = [
         dict(
-            t=int(calendar.session_open(str(session)).timestamp() * 1000),
+            t=int(datetime.combine(
+                session,
+                datetime.min.time(),
+                tzinfo=ZoneInfo("America/New_York"),
+            ).timestamp() * 1000),
             o=100, h=101, l=99, c=100, v=1000, vw=100, n=10,
         )
         for session in plan.adjusted_sessions
@@ -159,21 +161,37 @@ def test_v3_portal_history_collects_adjusted_daily_range_once_per_ticker():
     assert tuple(fact.revision.session_date for fact in facts) == plan.adjusted_sessions
     assert all(fact.revision.adjusted for fact in facts)
 
+    drifted = [dict(row) for row in rows]
+    drifted[0]["t"] -= 24 * 60 * 60 * 1000
+    bad_source = PolygonEquityValidationHistorySource(
+        QueueTransport((
+            PolygonHttpResponse(200, json.dumps({"results": drifted}).encode()),
+        )),
+        identities,
+        cohort_id=uuid5(NAMESPACE_URL, "v3-adjusted-daily-clock-drift"),
+    )
+    with pytest.raises(ValueError, match="session clock drift"):
+        bad_source._collect_adjusted_daily_identity(
+            identity,
+            plan=plan,
+            observed_at=datetime(2026, 10, 10, tzinfo=timezone.utc),
+        )
+
 
 def test_v3_portal_history_collects_native_adjusted_weekly_range():
-    import exchange_calendars
-
     identities = _identities()
     identity = identities[0]
     plan = build_realtime_equity_portal_history_plan(date(2026, 10, 8))
-    calendar = exchange_calendars.get_calendar("XNYS")
     rows = []
     for session in plan.weekly_sessions:
         iso = session.isocalendar()
-        week_start = date.fromisocalendar(iso.year, iso.week, 1)
-        sessions = calendar.sessions_in_range(str(week_start), str(session))
+        provider_start = datetime.combine(
+            date.fromisocalendar(iso.year, iso.week, 7),
+            datetime.min.time(),
+            tzinfo=ZoneInfo("America/New_York"),
+        )
         rows.append(dict(
-            t=int(calendar.session_open(sessions[0]).timestamp() * 1000),
+            t=int(provider_start.timestamp() * 1000),
             o=100, h=101, l=99, c=100, v=5000, vw=100, n=50,
         ))
     transport = QueueTransport((
@@ -190,8 +208,10 @@ def test_v3_portal_history_collects_native_adjusted_weekly_range():
     assert len(transport.calls) == 1
     assert "/range/1/week/" in transport.calls[0][0]
     first_iso = plan.weekly_start.isocalendar()
-    request_start = date.fromisocalendar(first_iso.year, first_iso.week, 1)
-    assert f"/{request_start.isoformat()}/{plan.weekly_end.isoformat()}" in transport.calls[0][0]
+    last_iso = plan.weekly_end.isocalendar()
+    request_start = date.fromisocalendar(first_iso.year, first_iso.week, 7)
+    request_end = date.fromisocalendar(last_iso.year, last_iso.week, 7)
+    assert f"/{request_start.isoformat()}/{request_end.isoformat()}" in transport.calls[0][0]
     assert len(facts) == 261
     assert tuple(fact.revision.session_date for fact in facts) == plan.weekly_sessions
     assert all(fact.revision.adjusted for fact in facts)

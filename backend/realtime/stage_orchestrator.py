@@ -1,7 +1,7 @@
 """Resident stage orchestrator for V2 (RT-01): independent stages driven by the stage catalog.
 
 Decisions come from stage_graph.decide_window; state lives behind OrchestrationRepository. Stages
-are grouped into lanes by principal profile and the lanes run concurrently, so a failing, blocked
+are grouped into lanes by domain (Options stages in their own lane) and the lanes run concurrently, so a failing, blocked
 or slow Options stage never delays or blocks an equity, reference or portal stage. A stage failure
 is recorded against that stage only; its declared dependents are recorded BLOCKED_PREREQ and
 every other stage proceeds. Exception messages are never persisted (only the exception type).
@@ -25,7 +25,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from .database_access_v2 import StageRunFence, V2ConnectionProvider
@@ -46,7 +46,7 @@ from .stage_graph import (
     Action,
     StageDefinition,
     decide_window,
-    principal_profiles_required,
+    lanes_required,
     startable_stages,
 )
 
@@ -114,27 +114,23 @@ class StageContext:
         return self.cancelled is not None and self.cancelled.is_set()
 
     def transaction(self, *, read_only: bool = False, dict_cursor: bool = False,
-                    isolation_level: str | None = None, role: str | None = None):
-        """A unit of work as this stage's capability role and principal profile.
+                    isolation_level: str | None = None):
+        """A unit of work as the runtime (`app`) role.
 
         This is the only supported way for a runner to write. A cancelled stage cannot open a write
         transaction, and for a window stage every write transaction commits only while its stage
         run is still RUNNING (checked in the same transaction, see StageRunFence), so a runner that
         ignores cancellation cannot land data after STAGE_TIMEOUT. Resident stages have no stage
-        run and are not fenced here. `role` selects another capability role of the same principal
-        (a stage that persists evidence and publishes snapshots uses compute and publication); the
-        access layer still refuses a role the principal is not a member of."""
+        run and are not fenced here."""
         if self.database is None:
             raise RuntimeError("this orchestrator has no database provider")
-        capability_role = role or self.stage.capability_role
         if read_only:
-            return self.database.transaction(capability_role, self.stage.principal_profile, read_only=True,
-                                             dict_cursor=dict_cursor, isolation_level=isolation_level)
+            return self.database.transaction(read_only=True, dict_cursor=dict_cursor,
+                                             isolation_level=isolation_level)
         if self.is_cancelled():
             raise StageCancelled(f"{self.stage.stage_id} was abandoned; it may not write")
         return self.database.transaction(
-            capability_role, self.stage.principal_profile, dict_cursor=dict_cursor,
-            isolation_level=isolation_level,
+            dict_cursor=dict_cursor, isolation_level=isolation_level,
             fence=StageRunFence(self.stage_run_id) if self.fenced else None)
 
 
@@ -149,7 +145,7 @@ class StartReport:
     resident_stages: frozenset[str]
     startable: frozenset[str]
     held: frozenset[str]
-    principal_profiles: frozenset[str]
+    lanes: frozenset[str]
 
 
 @dataclass(slots=True)
@@ -173,6 +169,7 @@ class StageOrchestrator:
         *,
         database: V2ConnectionProvider | None = None,
         stages: Mapping[str, StageDefinition] = STAGES_V1,
+        catalog_version: str = STAGE_CATALOG_VERSION,
         clock: Callable[[], datetime] = utc_now,
         owner_id: UUID | None = None,
         lease_seconds: int = 300,
@@ -189,10 +186,13 @@ class StageOrchestrator:
         unknown = set(runners) - set(stages)
         if unknown:
             raise ValueError(f"runners for unknown stages: {sorted(unknown)}")
+        if not catalog_version.strip():
+            raise ValueError("stage catalog version cannot be blank")
         self._repository = repository
         self._runners = dict(runners)
         self._database = database
         self._stages = dict(stages)
+        self._catalog_version = catalog_version
         self._clock = clock
         self._owner_id = owner_id or uuid4()
         self._lease_seconds = lease_seconds
@@ -210,7 +210,7 @@ class StageOrchestrator:
     def start(self, plan_id: UUID) -> StartReport:
         plan = self._repository.load_plan(plan_id)
         catalog = self._repository.load_catalog(plan.stage_catalog_version)
-        if plan.stage_catalog_version != STAGE_CATALOG_VERSION or dict(catalog) != self._stages:
+        if plan.stage_catalog_version != self._catalog_version or dict(catalog) != self._stages:
             raise CatalogMismatch("database stage catalog differs from the source catalog")
         missing = sorted(plan.enabled_stages - set(self._runners))
         if missing:
@@ -222,7 +222,7 @@ class StageOrchestrator:
                              if self._stages[name].schedule_kind in RESIDENT_SCHEDULES)
         return StartReport(
             plan.plan_id, plan.enabled_stages, plan.enabled_stages - resident, resident, startable,
-            plan.enabled_stages - startable, principal_profiles_required(plan.enabled_stages, self._stages))
+            plan.enabled_stages - startable, lanes_required(plan.enabled_stages, self._stages))
 
     def tick_resident(self, plan_id: UUID, stage_id: str, window: WindowRecord | None = None) -> StageOutcome:
         """Run one tick of a resident (INTERVAL or CONTINUOUS) stage. It reports through
@@ -249,12 +249,12 @@ class StageOrchestrator:
         report = WindowReport(window_id, "CLAIMED")
         window_stages = frozenset(name for name in plan.enabled_stages
                                   if self._stages[name].schedule_kind not in RESIDENT_SCHEDULES)
-        cancelled = threading.Event()
         try:
             self._repository.recover_orphans(claim, now)
             lanes: dict[str, set[str]] = defaultdict(set)
             for name in window_stages:
-                lanes[self._stages[name].principal_profile].add(name)
+                lanes[self._stages[name].lane].add(name)
+            cancelled = {lane: threading.Event() for lane in lanes}
             abandoned: set[str] = set()
             while True:
                 progressed = self._run_round(claim, plan, window_stages, lanes, report, cancelled, abandoned)
@@ -264,7 +264,8 @@ class StageOrchestrator:
         except LeaseLost:
             report.status = "LEASE_LOST"
         finally:
-            cancelled.set()  # any abandoned lane thread stops at its next checkpoint
+            for event in locals().get("cancelled", {}).values():
+                event.set()
         return report
 
     def _plan(self, plan_id: UUID) -> ServicePlan:
@@ -277,63 +278,82 @@ class StageOrchestrator:
         return WindowRecord(uuid4(), plan.plan_id, plan.cohort_id, "RESIDENT", "RESIDENT", now, now, plan.deadline,
                             "RUNNING")
 
-    def _lane_budget(self, claim: WindowClaim) -> float:
-        remaining = (claim.window.deadline - self._clock()).total_seconds()
+    def _lane_budget(self, claim: WindowClaim, lane: str) -> float:
+        offsets = {
+            self._stages[stage_id].deadline_offset_seconds
+            for stage_id in self._stages
+            if self._stages[stage_id].lane == lane
+            and self._stages[stage_id].deadline_offset_seconds is not None
+        }
+        lane_deadline = claim.window.deadline
+        if offsets:
+            lane_deadline = min(
+                lane_deadline,
+                claim.window.release_at + timedelta(seconds=min(offsets)),
+            )
+        remaining = (lane_deadline - self._clock()).total_seconds()
         return max(0.0, min(self._max_lane_seconds, max(0.0, remaining) + self._lane_grace_seconds))
 
     def _run_round(self, claim: WindowClaim, plan: ServicePlan, window_stages: frozenset[str],
-                   lanes: Mapping[str, set[str]], report: WindowReport, cancelled: threading.Event,
+                   lanes: Mapping[str, set[str]], report: WindowReport,
+                   cancelled: Mapping[str, threading.Event],
                    abandoned: set[str]) -> bool:
         progressed: dict[str, bool] = {}
         failures: dict[str, BaseException] = {}
 
-        def lane_worker(profile: str) -> None:
+        def lane_worker(lane: str) -> None:
             try:
-                progressed[profile] = self._advance_lane(claim, plan, window_stages, lanes[profile], report,
-                                                         cancelled)
+                progressed[lane] = self._advance_lane(
+                    claim, plan, window_stages, lanes[lane], report, cancelled[lane],
+                )
             except LeaseLost as error:
-                failures[profile] = error
+                failures[lane] = error
             except Exception as error:  # noqa: BLE001 - a lane failure must not stop the other lanes
-                logger.exception("orchestrator lane %s failed", profile)
-                report.lane_errors[profile] = type(error).__name__
-                progressed[profile] = False
+                logger.exception("orchestrator lane %s failed", lane)
+                report.lane_errors[lane] = type(error).__name__
+                progressed[lane] = False
 
-        active = [profile for profile in sorted(lanes) if profile not in abandoned]
-        threads = {profile: threading.Thread(target=lane_worker, args=(profile,), daemon=True,
-                                             name=f"stage-lane-{profile}") for profile in active}
-        end = time.monotonic() + self._lane_budget(claim)
+        active = [lane for lane in sorted(lanes) if lane not in abandoned]
+        threads = {lane: threading.Thread(target=lane_worker, args=(lane,), daemon=True,
+                                          name=f"stage-lane-{lane}") for lane in active}
+        ends = {lane: time.monotonic() + self._lane_budget(claim, lane) for lane in active}
         last_beat = time.monotonic()
-        groups = [active] if self._parallel else [[profile] for profile in active]
+        groups = [active] if self._parallel else [[lane] for lane in active]
         for group in groups:
-            for profile in group:
-                threads[profile].start()
-            while any(threads[profile].is_alive() for profile in group):
-                if time.monotonic() >= end:
+            for lane in group:
+                threads[lane].start()
+            while True:
+                alive = [lane for lane in group if lane not in abandoned and threads[lane].is_alive()]
+                if not alive:
                     break
-                threads[next(p for p in group if threads[p].is_alive())].join(timeout=0.05)
+                now_mono = time.monotonic()
+                overrun = [lane for lane in alive if now_mono >= ends[lane]]
+                if overrun:
+                    for lane in overrun:
+                        cancelled[lane].set()
+                    self._time_out_lanes(claim, plan, overrun, lanes, report)
+                    abandoned.update(overrun)
+                    continue
+                lane = min(alive, key=lambda item: ends[item])
+                threads[lane].join(timeout=min(0.05, max(0.0, ends[lane] - now_mono)))
                 if time.monotonic() - last_beat >= self._heartbeat_seconds:
                     self._repository.renew_lease(claim, self._clock(), self._lease_seconds)
                     last_beat = time.monotonic()
-            overrun = [profile for profile in group if threads[profile].is_alive()]
-            if overrun:
-                cancelled.set()
-                self._time_out_lanes(claim, plan, overrun, lanes, report)
-                abandoned.update(overrun)
-        for profile, error in list(failures.items()):
-            if profile not in abandoned:  # an abandoned lane's late LeaseLost is expected and ignored
+        for lane, error in list(failures.items()):
+            if lane not in abandoned:  # an abandoned lane's late LeaseLost is expected and ignored
                 raise error
-        return any(progressed.get(profile, False) for profile in active) or bool(abandoned & set(active))
+        return any(progressed.get(lane, False) for lane in active) or bool(abandoned & set(active))
 
     def _time_out_lanes(self, claim: WindowClaim, plan: ServicePlan, overrun: list[str],
                         lanes: Mapping[str, set[str]], report: WindowReport) -> None:
         now = self._clock()
-        stage_ids = sorted(name for profile in overrun for name in lanes[profile])
+        stage_ids = sorted(name for lane in overrun for name in lanes[lane])
         for run in self._repository.timeout_running_stages(claim, stage_ids, now):
             self._repository.upsert_readiness(plan.cohort_id, run.stage_id, plan.stage_catalog_version, "BLOCKED",
                                               ("STAGE_TIMEOUT",), None, now)
             report.executed.append((run.stage_id, "FAILED"))
-        for profile in overrun:
-            report.lane_errors[profile] = "STAGE_TIMEOUT"
+        for lane in overrun:
+            report.lane_errors[lane] = "STAGE_TIMEOUT"
 
     def _decision_states(self, claim: WindowClaim) -> tuple[Mapping[str, StageRunRecord], dict[str, str]]:
         records = self._repository.stage_states(claim.window.window_id)

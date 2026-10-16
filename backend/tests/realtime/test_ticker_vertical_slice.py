@@ -24,7 +24,8 @@ from realtime.preflight import ProviderTier
 from realtime.screening_projection import RealtimeScreeningInput
 from realtime.screening_repository import load_realtime_screening_input
 from realtime.ticker_projection import (
-    TICKER_WORKSPACE_VERSION, _chart_point, _fact, produce_realtime_ticker_workspace,
+    TICKER_WORKSPACE_VERSION, _chart_point, _fact, _intraday_expected_count,
+    produce_realtime_ticker_workspace,
     project_realtime_ticker_workspace,
     produce_realtime_ticker_workspace_summary,
 )
@@ -167,6 +168,29 @@ def test_recovery_calendar_enumerates_every_completed_decision_interval():
     early = completed_ticker_decision_windows(date(2026, 11, 27))
     assert sum(interval == "30m" for interval, _ in early) == 7
     assert sum(interval == "1h" for interval, _ in early) == 4
+
+
+def test_partial_session_intraday_counts_replace_the_oldest_retained_session():
+    calendar = exchange_calendars.get_calendar("XNYS")
+    session = date(2026, 10, 15)
+    cutoff = datetime(2026, 10, 15, 19, 15, tzinfo=timezone.utc)
+    plan = build_realtime_equity_portal_history_plan(session)
+
+    assert (plan.raw_sessions[0], plan.raw_sessions[-1], len(plan.raw_sessions)) == (
+        date(2026, 6, 9), session, 90,
+    )
+    assert (plan.one_minute_sessions[0], plan.one_minute_sessions[-1],
+            len(plan.one_minute_sessions)) == (date(2026, 10, 9), session, 5)
+    assert {
+        interval: _intraday_expected_count(calendar, plan, session, cutoff, interval)
+        for interval in ("1m", "5m", "15m", "30m", "1h")
+    } == {
+        "1m": 1905,
+        "5m": 7011,
+        "15m": 2337,
+        "30m": 1168,
+        "1h": 628,
+    }
 
 
 def test_recovery_history_separates_market_cutoff_and_late_known_by(monkeypatch):
@@ -1415,12 +1439,13 @@ def test_portal_loader_reads_exact_retained_intervals_and_causal_clocks():
     )
     assert loaded == inputs
     bar_sql = cursor.execute.call_args_list[2].args[0]
-    assert "interval IN ('1m','5m','15m','30m','1h','1d')" in bar_sql
-    assert "interval='1d'" in bar_sql
+    assert "interval IN ('1m','5m','15m','30m','1h')" in bar_sql
+    assert "adjustment_basis='RAW_UNADJUSTED' AND interval='1d'" in bar_sql
     assert "interval='1wk' AND session_date BETWEEN %s AND %s" in bar_sql
     assert "interval='1mo' AND session_date BETWEEN %s AND %s" in bar_sql
     assert "interval IN ('15m','30m','1h','1d') AND source_kind='DERIVED' THEN 5" in bar_sql
-    assert "interval IN ('1d','1wk','1mo') AND source_kind='NATIVE_REST' THEN 5" in bar_sql
+    assert "interval='1d' AND source_kind='NATIVE_REST' THEN 5" in bar_sql
+    assert "interval IN ('1wk','1mo') AND source_kind='DERIVED' THEN 5" in bar_sql
     assert "provider_published_at<=%s" in bar_sql and "created_at<=%s" in bar_sql
     action_sql = cursor.execute.call_args_list[-2].args[0]
     assert "newer.source_key=action.source_key" in action_sql

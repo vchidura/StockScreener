@@ -45,6 +45,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from realtime.contracts import canonical_json, canonical_sha256  # noqa: E402
+from realtime.screening_repository import share_bar_values  # noqa: E402
 import realtime.ticker_projection as ticker_projection  # noqa: E402
 from tests.realtime.test_ticker_vertical_slice import ticker_fixture  # noqa: E402
 
@@ -171,9 +172,10 @@ def _payload_breakdown(inputs, projection):
     }
 
 
-def _time_cases(inputs, cold_runs, cycles, gc_clock=None, on_primed=None):
+def _time_cases(inputs, cold_runs, cycles, gc_clock=None, on_primed=None, freeze=False):
     """Time the three gate cases on `inputs`: cold (fresh state each run), warm (same bars, cutoff advanced) and
-    one interval revised. Returns the raw lists plus the last projections."""
+    one interval revised. Returns the raw lists plus the last projections. `freeze` moves everything alive after
+    priming out of the cyclic collector's view (gc.freeze), as the runner does after its first cycle."""
     cases = dict(cold=[], cold_cpu=[], cold_gc=[], warm=[], warm_cpu=[], changed=[], changed_cpu=[])
     projection = None
     for _ in range(max(1, cold_runs)):
@@ -185,6 +187,9 @@ def _time_cases(inputs, cold_runs, cycles, gc_clock=None, on_primed=None):
     _run(inputs, state)
     if on_primed:
         on_primed()
+    if freeze:
+        gc.collect()
+        gc.freeze()
     warm_stats, warm_projection, later = {}, None, inputs
     for _ in range(max(1, cycles)):
         later = replace(later, cutoff=later.cutoff + timedelta(minutes=5))
@@ -340,6 +345,8 @@ def _clone_ticker(generation, instrument_id, symbol, rows, member, actions, cove
         if row["ingestion_segment_id"] is not None:
             clone["ingestion_segment_id"] = ident("segment", row["ingestion_segment_id"])
         bars.append(clone)
+    # The loader shares the repeated immutable values of the rows it reads (share_bar_values); so do the clones.
+    bars = share_bar_values(bars)
     cloned_actions = [dict(
         action, action_id=ident("action", action["action_id"]), security_id=security_id, ticker=symbol,
         payload_sha256=hashlib.sha256(f"{generation}:{action['payload_sha256']}".encode()).hexdigest(),
@@ -410,7 +417,8 @@ def _scale_point(count, args):
     cloned_bars = len(inputs.bars) - len(base.bars)
     primed = {}
     cases = _time_cases(
-        inputs, args.cold_runs, args.cycles, gc_clock, on_primed=lambda: primed.update(rss=_memory()[0]))
+        inputs, args.cold_runs, args.cycles, gc_clock, on_primed=lambda: primed.update(rss=_memory()[0]),
+        freeze=args.gc_freeze)
     load.append(dict(_contention(), moment="after"))
     rss, peak = _memory()
     tickers, bars = len(inputs.members), len(inputs.bars)
@@ -463,11 +471,41 @@ def _projected_peak_gib(measured, bars):
     return mean_y + slope * (bars - mean_x)
 
 
+def _available_gib():
+    """Physical memory available to a new process (Windows GlobalMemoryStatusEx); None where it cannot be read."""
+    import ctypes
+
+    class Status(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [
+            (name, ctypes.c_ulonglong) for name in (
+                "total_phys", "avail_phys", "total_page", "avail_page", "total_virtual", "avail_virtual",
+                "avail_extended")]
+
+    try:
+        status = Status()
+        status.length = ctypes.sizeof(status)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return status.avail_phys / GIB
+    except (AttributeError, OSError):
+        return None
+
+
 def _scale_curve(args):
     points = sorted({int(value) for value in args.scale_curve.split(",")})
     results, measured, bars_per_ticker = [], [], None
     for count in points:
         projection = _projected_peak_gib(measured, count * bars_per_ticker) if bars_per_ticker else None
+        available = _available_gib()
+        if projection is not None and available is not None and projection + args.headroom_gib > available:
+            results.append({
+                "tickers": count, "status": "NOT_RUN", "reason": "AVAILABLE_MEMORY", "bars": count * bars_per_ticker,
+                "projected_peak_gib": round(projection, 1), "available_gib": round(available, 1),
+                "headroom_gib": args.headroom_gib,
+            })
+            print(f"[{count}] NOT_RUN: projected peak {projection:.1f} GiB + {args.headroom_gib} GiB headroom "
+                  f"exceeds the {available:.1f} GiB available", flush=True)
+            continue
         if projection is not None and projection > args.projection_limit_gib:
             slope = (measured[-1][1] - measured[0][1]) / max(1, measured[-1][0] - measured[0][0]) * (1 << 20) if len(measured) > 1 else None
             results.append({
@@ -483,7 +521,8 @@ def _scale_curve(args):
         cold_runs = args.cold_runs if args.cold_runs else (3 if count <= 9 else 2 if count <= 50 else 1)
         cycles = args.cycles if args.cycles else (5 if count <= 9 else 3 if count <= 50 else 2)
         command = [sys.executable, "-B", "-W", "ignore", str(Path(__file__).resolve()), "--scale", str(count),
-                   "--cold-runs", str(cold_runs), "--cycles", str(cycles), "--rss-limit-gib", str(args.rss_limit_gib)]
+                   "--cold-runs", str(cold_runs), "--cycles", str(cycles), "--rss-limit-gib", str(args.rss_limit_gib),
+                   *(["--gc-freeze"] if args.gc_freeze else [])]
         print(f"[{count}] running ({cold_runs} cold, {cycles} cycles); load before: {quiet}", flush=True)
         completed = subprocess.run(command, capture_output=True, text=True)
         line = next((row for row in completed.stdout.splitlines() if row.startswith(POINT_MARKER)), None)
@@ -514,6 +553,8 @@ def _scale_curve(args):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cold-runs", type=int, default=None)
+    parser.add_argument("--gc-freeze", action="store_true",
+                        help="gc.freeze() after priming the state (warm and one-interval cycles then skip the old heap)")
     parser.add_argument("--cycles", type=int, default=None, help="warm and one-interval cycles to time")
     parser.add_argument("--tickers", type=int, default=0, help="use only the first N of the nine members (E2 shape)")
     parser.add_argument("--cprofile", choices=("cold", "warm"), help="print the heaviest functions of one run")
@@ -530,6 +571,9 @@ def main() -> int:
                         help="E2: run ascending points, each in a fresh subprocess, skipping (NOT_RUN) any point whose "
                              "linearly extrapolated peak RSS exceeds --projection-limit-gib")
     parser.add_argument("--projection-limit-gib", type=float, default=PROJECTION_LIMIT_GIB)
+    parser.add_argument("--headroom-gib", type=float, default=4.0,
+                        help="a curve point is NOT_RUN unless its projected peak plus this much fits the physical "
+                             "memory available now (the machine is shared)")
     parser.add_argument("--rss-limit-gib", type=float, default=PROJECTION_LIMIT_GIB + 2,
                         help="a point aborts itself when its working set passes this (watchdog)")
     parser.add_argument("--quiet-cpu-percent", type=float, default=25.0)
@@ -559,7 +603,7 @@ def main() -> int:
     load_before = _contention()
     gc_clock = _GcClock()
     gc.callbacks.append(gc_clock)
-    cases = _time_cases(inputs, args.cold_runs, args.cycles, gc_clock)
+    cases = _time_cases(inputs, args.cold_runs, args.cycles, gc_clock, freeze=args.gc_freeze)
     cold, cold_cpu, warm, warm_cpu = cases["cold"], cases["cold_cpu"], cases["warm"], cases["warm_cpu"]
     changed, changed_cpu = cases["changed"], cases["changed_cpu"]
     projection, warm_projection, later, state = (

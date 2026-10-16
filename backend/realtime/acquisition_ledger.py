@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -92,6 +92,12 @@ class ProviderRequestReservation:
     cohort_id: UUID | None = None
     window_id: UUID | None = None
     stage_run_id: UUID | None = None
+    budget_scope_sha256: str | None = None
+    budget_session_date: date | None = None
+    authorization_reference: str | None = None
+    reserved_response_bytes: int | None = None
+    account_request_ceiling: int | None = None
+    account_decoded_byte_ceiling: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.lane, ProviderRequestLane):
@@ -102,6 +108,50 @@ class ProviderRequestReservation:
         object.__setattr__(self, "endpoint_class", _text(self.endpoint_class, "endpoint_class", 48))
         object.__setattr__(self, "request_sha256", _sha256(self.request_sha256, "request_sha256"))
         object.__setattr__(self, "reserved_at", _utc(self.reserved_at, "reserved_at"))
+        budget_values = (
+            self.budget_scope_sha256,
+            self.budget_session_date,
+            self.authorization_reference,
+            self.reserved_response_bytes,
+            self.account_request_ceiling,
+            self.account_decoded_byte_ceiling,
+        )
+        if any(value is not None for value in budget_values):
+            if any(value is None for value in budget_values):
+                raise ValueError("coordinated request budget fields must be all present")
+            object.__setattr__(
+                self,
+                "budget_scope_sha256",
+                _sha256(str(self.budget_scope_sha256), "budget_scope_sha256"),
+            )
+            if not isinstance(self.budget_session_date, date):
+                raise TypeError("budget_session_date must be a date")
+            object.__setattr__(
+                self,
+                "authorization_reference",
+                _text(
+                    str(self.authorization_reference),
+                    "authorization_reference",
+                    160,
+                ),
+            )
+            for value, name in (
+                (self.reserved_response_bytes, "reserved_response_bytes"),
+                (self.account_request_ceiling, "account_request_ceiling"),
+                (
+                    self.account_decoded_byte_ceiling,
+                    "account_decoded_byte_ceiling",
+                ),
+            ):
+                if type(value) is not int or value <= 0:
+                    raise ValueError(f"{name} must be a positive integer")
+            if (
+                self.reserved_response_bytes
+                > self.account_decoded_byte_ceiling
+            ):
+                raise ValueError(
+                    "reserved_response_bytes exceeds the account byte ceiling"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +233,12 @@ def _reservation_identity(value: ProviderRequestReservation) -> tuple[object, ..
         value.endpoint_class,
         value.request_sha256,
         value.attempt,
+        value.budget_scope_sha256,
+        value.budget_session_date,
+        value.authorization_reference,
+        value.reserved_response_bytes,
+        value.account_request_ceiling,
+        value.account_decoded_byte_ceiling,
     )
 
 
@@ -191,21 +247,46 @@ def _normalized(row) -> tuple[object, ...]:
 
 
 def reserve_provider_request_cursor(cursor, reservation: ProviderRequestReservation) -> UUID:
-    cursor.execute(
-        "INSERT INTO rt.provider_request_ledger (request_id, account_alias, lane, "
-        "cohort_id, window_id, stage_run_id, endpoint_class, request_sha256, attempt, "
-        "state, reserved_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'RESERVED', %s) "
-        "ON CONFLICT (request_id) DO NOTHING",
-        (*_reservation_identity(reservation), reservation.reserved_at),
-    )
-    cursor.execute(
-        "SELECT request_id, account_alias, lane, cohort_id, window_id, stage_run_id, "
-        "endpoint_class, request_sha256, attempt FROM rt.provider_request_ledger "
-        "WHERE request_id=%s",
-        (str(reservation.request_id),),
-    )
+    identity = _reservation_identity(reservation)
+    coordinated = reservation.budget_scope_sha256 is not None
+    if coordinated:
+        cursor.execute(
+            "INSERT INTO rt.provider_request_ledger (request_id, account_alias, lane, "
+            "cohort_id, window_id, stage_run_id, endpoint_class, request_sha256, attempt, "
+            "budget_scope_sha256, budget_session_date, authorization_reference, "
+            "reserved_response_bytes, account_request_ceiling, account_decoded_byte_ceiling, "
+            "state, reserved_at) VALUES ("
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+            "'RESERVED', %s) "
+            "ON CONFLICT (request_id) DO NOTHING",
+            (*identity, reservation.reserved_at),
+        )
+        cursor.execute(
+            "SELECT request_id, account_alias, lane, cohort_id, window_id, stage_run_id, "
+            "endpoint_class, request_sha256, attempt, budget_scope_sha256, "
+            "budget_session_date, authorization_reference, reserved_response_bytes, "
+            "account_request_ceiling, account_decoded_byte_ceiling "
+            "FROM rt.provider_request_ledger WHERE request_id=%s",
+            (str(reservation.request_id),),
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO rt.provider_request_ledger (request_id, account_alias, lane, "
+            "cohort_id, window_id, stage_run_id, endpoint_class, request_sha256, attempt, "
+            "state, reserved_at) VALUES ("
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s, 'RESERVED', %s) "
+            "ON CONFLICT (request_id) DO NOTHING",
+            (*identity[:9], reservation.reserved_at),
+        )
+        cursor.execute(
+            "SELECT request_id, account_alias, lane, cohort_id, window_id, stage_run_id, "
+            "endpoint_class, request_sha256, attempt "
+            "FROM rt.provider_request_ledger WHERE request_id=%s",
+            (str(reservation.request_id),),
+        )
     stored = cursor.fetchone()
-    if stored is None or _normalized(stored) != _reservation_identity(reservation):
+    expected = identity if coordinated else identity[:9]
+    if stored is None or _normalized(stored) != expected:
         raise ValueError("provider request ledger identity conflict")
     return reservation.request_id
 
@@ -269,6 +350,63 @@ def record_provider_request_cursor(
     return reservation.request_id
 
 
+def load_recorded_provider_request_cursor(
+    cursor,
+    request_id: UUID,
+) -> RecordedProviderRequest | None:
+    cursor.execute(
+        "SELECT request_id,account_alias,lane,endpoint_class,request_sha256,"
+        "reserved_at,attempt,cohort_id,window_id,stage_run_id,"
+        "budget_scope_sha256,budget_session_date,authorization_reference,"
+        "reserved_response_bytes,account_request_ceiling,"
+        "account_decoded_byte_ceiling,state,completed_at,started_at,outcome,"
+        "http_status,response_bytes,row_count,pages_fetched,requested_from,"
+        "requested_to,price_basis,completeness,failure_code,payload_id "
+        "FROM rt.provider_request_ledger WHERE request_id=%s",
+        (str(request_id),),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    reservation = ProviderRequestReservation(
+        request_id=UUID(str(row[0])),
+        account_alias=row[1],
+        lane=ProviderRequestLane(row[2]),
+        endpoint_class=row[3],
+        request_sha256=row[4],
+        reserved_at=row[5],
+        attempt=int(row[6]),
+        cohort_id=UUID(str(row[7])) if row[7] is not None else None,
+        window_id=UUID(str(row[8])) if row[8] is not None else None,
+        stage_run_id=UUID(str(row[9])) if row[9] is not None else None,
+        budget_scope_sha256=row[10],
+        budget_session_date=row[11],
+        authorization_reference=row[12],
+        reserved_response_bytes=row[13],
+        account_request_ceiling=row[14],
+        account_decoded_byte_ceiling=row[15],
+    )
+    if row[16] == ProviderRequestState.RESERVED.value:
+        return None
+    completion = ProviderRequestCompletion(
+        state=ProviderRequestState(row[16]),
+        completed_at=row[17],
+        started_at=row[18],
+        outcome=ProviderRequestOutcome(row[19]) if row[19] is not None else None,
+        http_status=row[20],
+        response_bytes=row[21],
+        row_count=row[22],
+        pages_fetched=row[23],
+        requested_from=row[24],
+        requested_to=row[25],
+        price_basis=PriceBasis(row[26]),
+        completeness=RequestCompleteness(row[27]),
+        failure_code=row[28],
+        payload_id=UUID(str(row[29])) if row[29] is not None else None,
+    )
+    return RecordedProviderRequest(reservation, completion)
+
+
 def mark_stale_provider_requests_ambiguous_cursor(cursor, *, reserved_before: datetime) -> int:
     cursor.execute(
         "UPDATE rt.provider_request_ledger SET state='AMBIGUOUS' "
@@ -301,11 +439,12 @@ class AcquisitionWatermark:
     instrument_id: int
     interval: str
     source_kind: str
-    last_complete_bar_end: datetime
+    last_complete_bar_end: datetime | None
     overlap_policy: str
     terminal_state: WatermarkTerminalState = WatermarkTerminalState.COMPLETE
     reason_codes: tuple[str, ...] = ()
     request_id: UUID | None = None
+    last_examined_bar_end: datetime | None = None
 
     def __post_init__(self) -> None:
         if type(self.instrument_id) is not int or self.instrument_id <= 0:
@@ -323,35 +462,68 @@ class AcquisitionWatermark:
         object.__setattr__(
             self, "overlap_policy", _text(self.overlap_policy, "overlap_policy", 64)
         )
-        object.__setattr__(
-            self,
+        completed = _optional_utc(
+            self.last_complete_bar_end,
             "last_complete_bar_end",
-            _utc(self.last_complete_bar_end, "last_complete_bar_end"),
         )
+        examined = _optional_utc(
+            self.last_examined_bar_end,
+            "last_examined_bar_end",
+        )
+        if examined is None:
+            if completed is None:
+                raise ValueError(
+                    "watermark requires a last examined or complete boundary"
+                )
+            examined = completed
+        if completed is not None and completed > examined:
+            raise ValueError(
+                "last complete boundary cannot exceed last examined boundary"
+            )
+        if (
+            self.terminal_state is WatermarkTerminalState.COMPLETE
+            and completed != examined
+        ):
+            raise ValueError(
+                "a COMPLETE watermark requires the examined boundary to be complete"
+            )
+        object.__setattr__(self, "last_complete_bar_end", completed)
+        object.__setattr__(self, "last_examined_bar_end", examined)
 
 
 def advance_acquisition_watermark_cursor(cursor, watermark: AcquisitionWatermark) -> bool:
-    """Advance monotonically; a GAP at the same bar end may be upgraded to COMPLETE."""
+    """Advance examined progress without treating a GAP as complete progress."""
     cursor.execute(
         "INSERT INTO rt.acquisition_watermarks (cohort_id, instrument_id, interval, "
-        "source_kind, last_complete_bar_end, overlap_policy, terminal_state, "
-        "reason_codes, request_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "source_kind, last_complete_bar_end, last_examined_bar_end, overlap_policy, "
+        "terminal_state, reason_codes, request_id) VALUES ("
+        "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (cohort_id, instrument_id, interval, source_kind) DO UPDATE SET "
-        "last_complete_bar_end=EXCLUDED.last_complete_bar_end, "
+        "last_complete_bar_end=CASE "
+        "WHEN EXCLUDED.last_complete_bar_end IS NULL "
+        "THEN rt.acquisition_watermarks.last_complete_bar_end "
+        "WHEN rt.acquisition_watermarks.last_complete_bar_end IS NULL "
+        "THEN EXCLUDED.last_complete_bar_end "
+        "ELSE GREATEST(rt.acquisition_watermarks.last_complete_bar_end, "
+        "EXCLUDED.last_complete_bar_end) END, "
+        "last_examined_bar_end=EXCLUDED.last_examined_bar_end, "
         "overlap_policy=EXCLUDED.overlap_policy, terminal_state=EXCLUDED.terminal_state, "
         "reason_codes=EXCLUDED.reason_codes, request_id=EXCLUDED.request_id, "
         "updated_at=clock_timestamp() "
-        "WHERE rt.acquisition_watermarks.last_complete_bar_end < EXCLUDED.last_complete_bar_end "
-        "OR (rt.acquisition_watermarks.last_complete_bar_end = EXCLUDED.last_complete_bar_end "
+        "WHERE rt.acquisition_watermarks.last_examined_bar_end "
+        "< EXCLUDED.last_examined_bar_end "
+        "OR (rt.acquisition_watermarks.last_examined_bar_end "
+        "= EXCLUDED.last_examined_bar_end "
         "AND rt.acquisition_watermarks.terminal_state = 'GAP' "
         "AND EXCLUDED.terminal_state = 'COMPLETE') "
-        "RETURNING last_complete_bar_end",
+        "RETURNING last_examined_bar_end",
         (
             str(watermark.cohort_id),
             watermark.instrument_id,
             watermark.interval,
             watermark.source_kind,
             watermark.last_complete_bar_end,
+            watermark.last_examined_bar_end,
             watermark.overlap_policy,
             watermark.terminal_state.value,
             list(watermark.reason_codes),
@@ -370,8 +542,9 @@ def load_acquisition_watermark_cursor(
     source_kind: str,
 ) -> AcquisitionWatermark | None:
     cursor.execute(
-        "SELECT last_complete_bar_end, overlap_policy, terminal_state, reason_codes, "
-        "request_id FROM rt.acquisition_watermarks WHERE cohort_id=%s AND "
+        "SELECT last_complete_bar_end, last_examined_bar_end, overlap_policy, "
+        "terminal_state, reason_codes, request_id "
+        "FROM rt.acquisition_watermarks WHERE cohort_id=%s AND "
         "instrument_id=%s AND interval=%s AND source_kind=%s",
         (str(cohort_id), instrument_id, interval, source_kind),
     )
@@ -384,10 +557,11 @@ def load_acquisition_watermark_cursor(
         interval=interval,
         source_kind=source_kind,
         last_complete_bar_end=row[0],
-        overlap_policy=row[1],
-        terminal_state=WatermarkTerminalState(row[2]),
-        reason_codes=tuple(row[3] or ()),
-        request_id=UUID(str(row[4])) if row[4] is not None else None,
+        last_examined_bar_end=row[1],
+        overlap_policy=row[2],
+        terminal_state=WatermarkTerminalState(row[3]),
+        reason_codes=tuple(row[4] or ()),
+        request_id=UUID(str(row[5])) if row[5] is not None else None,
     )
 
 

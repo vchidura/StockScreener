@@ -505,11 +505,13 @@ class PolygonEquityValidationHistorySource:
             raise ValueError(
                 f"realtime portal adjusted daily history is incomplete for {identity.ticker}"
             )
-        calendar = exchange_calendars.get_calendar("XNYS")
         revisions = []
         for session, row in zip(plan.adjusted_sessions, rows):
-            expected_open = calendar.session_open(str(session)).to_pydatetime().astimezone(timezone.utc)
-            if int(row["t"]) != int(expected_open.timestamp() * 1000):
+            provider_time = datetime.fromtimestamp(
+                int(row["t"]) / 1000,
+                tz=timezone.utc,
+            )
+            if provider_time.astimezone(ZoneInfo("America/New_York")).date() != session:
                 raise ValueError(
                     f"realtime portal adjusted daily session clock drift for {identity.ticker}"
                 )
@@ -718,10 +720,12 @@ class PolygonEquityValidationHistorySource:
         observed_at: datetime,
     ) -> tuple:
         first_iso = plan.weekly_start.isocalendar()
-        request_start = date.fromisocalendar(first_iso.year, first_iso.week, 1)
+        last_iso = plan.weekly_end.isocalendar()
+        request_start = date.fromisocalendar(first_iso.year, first_iso.week, 7)
+        request_end = date.fromisocalendar(last_iso.year, last_iso.week, 7)
         rows = self._get(
             f"/v2/aggs/ticker/{quote(identity.ticker, safe='')}/range/1/week/"
-            f"{request_start.isoformat()}/{plan.weekly_end.isoformat()}",
+            f"{request_start.isoformat()}/{request_end.isoformat()}",
             {"adjusted": "true", "sort": "asc", "limit": "50000"},
             interval_minutes=1,
             timespan="week",
@@ -729,7 +733,7 @@ class PolygonEquityValidationHistorySource:
         segment_id = uuid5(
             NAMESPACE_URL,
             f"realtime-portal-native-1wk:{identity.ticker}:{request_start}:"
-            f"{plan.weekly_end}:{canonical_sha256(rows)}",
+            f"{request_end}:{canonical_sha256(rows)}",
         )
         revisions = normalize_native_bars(
             identity.security.security_id, identity.ticker, "1wk", rows,

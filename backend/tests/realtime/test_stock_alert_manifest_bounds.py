@@ -1,6 +1,9 @@
 from dataclasses import replace
+from datetime import date, datetime, timezone
 from functools import partial
 import json
+from unittest.mock import MagicMock
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 import pytest
@@ -11,6 +14,7 @@ from realtime.lineage_head import (
     BOUNDED_MANIFEST_BYTES, inputs_bar_lineage_sha256, inputs_sha256, reference_set,
     require_bounded_manifest,
 )
+from realtime.screening_repository import BarRequest, BarScope, select_alert_bars
 from research.stock_idea_forward import forward_config
 from research.stock_idea_replay import derive_hours
 from tests.realtime.test_equity_validation_history import COHORT_ID
@@ -26,6 +30,7 @@ MANIFEST_KEYS = {
 REMOVED_KEYS = {"references", "source_revision_ids", "source_payload_sha256", "domain_hourly_lineage"}
 
 CASES = {"plain": (alert_snapshot, alert_fixture), "retained": (retained_snapshot, timely_fixture)}
+UTC = timezone.utc
 
 
 def manifest_size(snapshot):
@@ -52,8 +57,9 @@ def test_manifest_is_bounded_with_digests_only(case):
 def test_manifest_digests_bind_inputs_and_derived_hourly_lineage(case):
     snapshot, fixture = (build() for build in CASES[case])
     manifest = snapshot.source_manifest
-    assert manifest["input_sha256"] == inputs_sha256(fixture)
-    assert manifest["bar_lineage_sha256"] == inputs_bar_lineage_sha256(fixture)
+    alert_inputs = projection.alert_source_inputs(fixture)
+    assert manifest["input_sha256"] == inputs_sha256(alert_inputs)
+    assert manifest["bar_lineage_sha256"] == inputs_bar_lineage_sha256(alert_inputs)
     bars, _ = projection.alert_domain_inputs(fixture)
     hourly = {row["revision_id"]: row["source_revision_ids"]
               for row in derive_hours(bars, forward_config(quality_version=2))}
@@ -65,10 +71,29 @@ def test_manifest_digests_bind_inputs_and_derived_hourly_lineage(case):
 def test_bar_payload_change_moves_the_input_and_bar_lineage_digests():
     inputs = alert_fixture()
     bars = list(inputs.bars)
-    bars[0] = dict(bars[0], payload_sha256="f" * 64)
+    index = next(index for index, row in enumerate(bars) if row["interval"] == "30m")
+    bars[index] = dict(bars[index], payload_sha256="f" * 64)
     changed = replace(inputs, bars=tuple(bars))
-    assert inputs_sha256(changed) != inputs_sha256(inputs)
-    assert inputs_bar_lineage_sha256(changed) != inputs_bar_lineage_sha256(inputs)
+    base_alert = projection.alert_source_inputs(inputs)
+    changed_alert = projection.alert_source_inputs(changed)
+    assert inputs_sha256(changed_alert) != inputs_sha256(base_alert)
+    assert inputs_bar_lineage_sha256(changed_alert) != inputs_bar_lineage_sha256(base_alert)
+
+
+def test_alert_loader_queries_only_daily_and_thirty_minute_winners():
+    cursor = MagicMock()
+    cursor.fetchall.return_value = ()
+    scope = BarScope(uuid4(), "MASSIVE_DEVELOPER", ("AAPL",), False, ())
+    cutoff = datetime(2026, 10, 2, 20, 0, tzinfo=UTC)
+    request = BarRequest(scope, cutoff, cutoff, (), ())
+
+    assert select_alert_bars(cursor, request, date(2026, 10, 2)) == ()
+
+    statement = cursor.execute.call_args.args[0]
+    assert "interval='30m'" in statement
+    assert "interval='1d'" in statement
+    assert "interval IN ('1m','5m'" not in statement
+    assert "interval='1h'" not in statement
 
 
 @pytest.mark.parametrize("case", CASES)

@@ -194,7 +194,12 @@ def build_process_plan(
     target_dtes: tuple[int, ...] = (7, 21, 45, 60),
     reviewed_forward: bool = False,
 ) -> OptionPreSessionProcessPlan:
-    if (database != "stocks_realtime_v1" or not isinstance(universe, UniverseManifest)
+    valid_target = database == "stocks_realtime_v1" or (
+        database == "stocks_realtime_v2"
+        and reviewed_forward
+        and universe == DEVELOPER_FORWARD_UNIVERSE
+    )
+    if (not valid_target or not isinstance(universe, UniverseManifest)
             or universe not in (CANARY_UNIVERSE, DEVELOPER_FORWARD_UNIVERSE) and not reviewed_forward):
         raise ValueError("pre-session plan requires the exact target and a reviewed universe")
     if (type(maximum_target_dte_deviation) is not int or not 0 <= maximum_target_dte_deviation <= 4

@@ -20,9 +20,19 @@ def test_the_v2_schedule_equals_the_v1_schedule(session):
             old.cutoff, old.available_after, old.deadline, old.serving_expires_at)
 
 
-@pytest.mark.parametrize("budget", [0, 91, -1, 60.0, True])
+@pytest.mark.parametrize("budget", [0, 301, -1, 60.0, True])
 def test_budgets_must_be_reviewed_bounded_integers(budget):
     with pytest.raises(ValueError):
         developer_session_windows(date(2026, 10, 12), completion_budget_seconds=budget, serving_lag_seconds=30)
     with pytest.raises(ValueError):
         developer_session_windows(date(2026, 10, 12), completion_budget_seconds=30, serving_lag_seconds=budget)
+
+
+def test_v2_window_allows_the_approved_five_minute_portal_budget():
+    windows = developer_session_windows(
+        date(2026, 10, 12),
+        completion_budget_seconds=300,
+        serving_lag_seconds=30,
+    )
+    assert windows
+    assert all((window.deadline - window.available_after).total_seconds() == 300 for window in windows)

@@ -38,6 +38,34 @@ FIVE_MINUTE_DERIVATION_POLICIES = {
     "1h": "xnys_realtime_5m_to_1h_v1",
     "1d": "xnys_realtime_5m_to_1d_v1",
 }
+ONE_MINUTE_DERIVATION_POLICIES = {
+    "5m": "xnys_realtime_1m_to_5m_v1",
+}
+
+
+def derive_minute_bars(
+    security: SecurityReferenceRevision,
+    source_bars: Sequence[EquityBarRevision],
+    *,
+    target_interval: str,
+    observed_at: datetime,
+    ingestion_segment_id: UUID,
+    calendar_name: str = "XNYS",
+) -> tuple[EquityBarRevision, ...]:
+    if target_interval not in ONE_MINUTE_DERIVATION_POLICIES:
+        raise ValueError(f"unsupported 1m derived interval: {target_interval}")
+    observed_utc = _utc(observed_at)
+    ordered = tuple(sorted(source_bars, key=lambda row: row.bar_start))
+    _validate_sources(security, ordered, "1m")
+    return _derive_from_intraday(
+        security,
+        ordered,
+        target_interval=target_interval,
+        observed_at=observed_utc,
+        ingestion_segment_id=ingestion_segment_id,
+        calendar=exchange_calendars.get_calendar(calendar_name),
+        derivation_policy=ONE_MINUTE_DERIVATION_POLICIES[target_interval],
+    )
 
 
 def derive_five_minute_bars(
@@ -111,7 +139,7 @@ def _derive_from_intraday(
     calendar,
     derivation_policy: str | None = None,
 ) -> tuple[EquityBarRevision, ...]:
-    source_minutes = {"5m": 5, "30m": 30}.get(bars[0].interval)
+    source_minutes = {"1m": 1, "5m": 5, "30m": 30}.get(bars[0].interval)
     if source_minutes is None:
         raise ValueError("unsupported intraday derivation source interval")
     grouped: dict[date, list[EquityBarRevision]] = defaultdict(list)
@@ -140,7 +168,7 @@ def _derive_from_intraday(
             continue
 
         window_start = session_open
-        target_minutes = {"15m": 15, "30m": 30, "1h": 60}.get(target_interval)
+        target_minutes = {"5m": 5, "15m": 15, "30m": 30, "1h": 60}.get(target_interval)
         if target_minutes is None:
             raise ValueError("unsupported intraday derivation target interval")
         while window_start < session_close:

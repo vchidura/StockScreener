@@ -3,6 +3,9 @@
 This module is the final hardening phase. The structural baseline (sql_v2) creates no role or
 grant and records the phase DEFERRED; apply_database_security_v2 records APPLIED and
 record_security_audit_v2 records AUDITED only after a clean exact-privilege audit.
+
+Three roles: admin (owner of every object, DDL, migrations, partition detach/drop), app (the
+runtime) and api (read-only). They share no membership, so no role can assume another.
 """
 from __future__ import annotations
 
@@ -13,33 +16,26 @@ from dataclasses import dataclass
 from psycopg2 import sql
 
 from .relation_registry import (
-    CAPABILITY_ROLES,
-    PRINCIPAL_PROFILES,
-    RELATIONS,
+    ADMIN_ROLE,
+    API_ROLE,
+    APP_ROLE,
+    ROLES,
+    RUNTIME_ROLES,
     SECURITY_POLICY_VERSION,
     grants,
     security_policy,
 )
-from .stage_graph import RESIDENT_SCHEDULES, STAGES_V1
 
 _ROLE_PREFIX = re.compile(r"^[a-z][a-z0-9_]{2,30}$")
-CAPABILITY_SUFFIXES = ("owner", *CAPABILITY_ROLES)
-PRINCIPAL_SUFFIXES = tuple(PRINCIPAL_PROFILES)
-# Principals that must not inherit privileges: they SET ROLE to one capability at a time.
-NOINHERIT_PRINCIPALS = ("runtime_data", "runtime_options", "archivist")
 SEQUENCE_GRANTS = {
-    "control": ("rt.readiness_transitions_transition_id_seq",),
-    "references": ("rt.instruments_instrument_id_seq",),
+    APP_ROLE: ("rt.readiness_transitions_transition_id_seq", "rt.instruments_instrument_id_seq"),
 }
-# Roles whose stages run once per window (and so have a stage run to fence their writes against).
-FENCED_STAGE_ROLES = tuple(sorted({
-    stage.capability_role for stage in STAGES_V1.values() if stage.schedule_kind not in RESIDENT_SCHEDULES
-}))
+# The partition and fence functions are SECURITY DEFINER (they run as admin); EXECUTE is the only gate.
 EXECUTE_GRANTS = {
-    "rt.ensure_partitions(text, date)": ("partition_admin", "maintenance"),
-    "rt.ensure_partitions_all(date)": ("partition_admin", "maintenance"),
-    "rt.partition_health(date)": ("partition_admin", "maintenance"),
-    "rt.fence_stage_run(uuid)": FENCED_STAGE_ROLES,
+    "rt.ensure_partitions(text, date)": (APP_ROLE,),
+    "rt.ensure_partitions_all(date)": (APP_ROLE,),
+    "rt.partition_health(date)": (APP_ROLE,),
+    "rt.fence_stage_run(uuid)": (APP_ROLE,),
 }
 PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")
 
@@ -49,19 +45,17 @@ class RoleNamesV2:
     prefix: str
 
     def name(self, suffix: str) -> str:
+        if suffix not in ROLES:
+            raise ValueError(f"unknown role {suffix}")
         return f"{self.prefix}_{suffix}"
 
     @property
-    def capability_names(self) -> tuple[str, ...]:
-        return tuple(self.name(suffix) for suffix in CAPABILITY_SUFFIXES)
-
-    @property
-    def principal_names(self) -> tuple[str, ...]:
-        return tuple(self.name(suffix) for suffix in PRINCIPAL_SUFFIXES)
+    def runtime_names(self) -> tuple[str, ...]:
+        return tuple(self.name(suffix) for suffix in RUNTIME_ROLES)
 
     @property
     def all_names(self) -> tuple[str, ...]:
-        return self.capability_names + self.principal_names
+        return tuple(self.name(suffix) for suffix in ROLES)
 
 
 def build_role_names_v2(prefix: str) -> RoleNamesV2:
@@ -95,13 +89,8 @@ def create_disposable_roles_v2(connection, roles: RoleNamesV2) -> None:
         existing = [row[0] for row in cursor.fetchall()]
         if existing:
             raise RuntimeError("disposable role already exists; refusing ownership: " + ", ".join(existing))
-        for suffix in (*CAPABILITY_SUFFIXES, *PRINCIPAL_SUFFIXES):
-            noinherit = sql.SQL(" NOINHERIT") if suffix in NOINHERIT_PRINCIPALS else sql.SQL("")
-            cursor.execute(sql.SQL("CREATE ROLE {} NOLOGIN{}").format(sql.Identifier(roles.name(suffix)), noinherit))
-        for principal, memberships in PRINCIPAL_PROFILES.items():
-            for capability in memberships:
-                cursor.execute(sql.SQL("GRANT {} TO {}").format(
-                    sql.Identifier(roles.name(capability)), sql.Identifier(roles.name(principal))))
+        for suffix in ROLES:
+            cursor.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(roles.name(suffix))))
 
 
 def drop_disposable_roles_v2(connection, roles: RoleNamesV2) -> None:
@@ -113,7 +102,7 @@ def drop_disposable_roles_v2(connection, roles: RoleNamesV2) -> None:
 
 
 def apply_database_security_v2(connection, roles: RoleNamesV2) -> None:
-    owner = roles.name("owner")
+    owner = roles.name(ADMIN_ROLE)
     with connection.cursor() as cursor:
         cursor.execute("SELECT policy FROM rt.database_security_policies WHERE policy_version = %s",
                        (SECURITY_POLICY_VERSION,))
@@ -145,10 +134,18 @@ def apply_database_security_v2(connection, roles: RoleNamesV2) -> None:
         cursor.execute("REVOKE ALL ON ALL TABLES IN SCHEMA ref, rt FROM PUBLIC")
         cursor.execute("REVOKE ALL ON ALL SEQUENCES IN SCHEMA ref, rt FROM PUBLIC")
         cursor.execute("REVOKE ALL ON ALL FUNCTIONS IN SCHEMA ref, rt FROM PUBLIC")
+        # Declarative: a rerun after a registry change must not keep a privilege the registry dropped.
+        cursor.execute(sql.SQL("REVOKE ALL ON DATABASE {} FROM {}").format(
+            sql.Identifier(database_name), _identifier_list(roles.runtime_names)))
         cursor.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
-            sql.Identifier(database_name), _identifier_list(roles.principal_names)))
-        runtime_capabilities = [roles.name(suffix) for suffix in CAPABILITY_ROLES]
-        cursor.execute(sql.SQL("GRANT USAGE ON SCHEMA ref, rt TO {}").format(_identifier_list(runtime_capabilities)))
+            sql.Identifier(database_name), _identifier_list(roles.runtime_names)))
+        # The option-flow writer stages its COPY batches in a TEMP table; PUBLIC's TEMP right was revoked above.
+        cursor.execute(sql.SQL("GRANT TEMPORARY ON DATABASE {} TO {}").format(
+            sql.Identifier(database_name), sql.Identifier(roles.name(APP_ROLE))))
+        for kind in ("TABLES", "SEQUENCES", "FUNCTIONS"):
+            cursor.execute(sql.SQL("REVOKE ALL ON ALL {} IN SCHEMA ref, rt FROM {}").format(
+                sql.SQL(kind), _identifier_list(roles.runtime_names)))
+        cursor.execute(sql.SQL("GRANT USAGE ON SCHEMA ref, rt TO {}").format(_identifier_list(roles.runtime_names)))
         by_privilege: dict[tuple[str, str], list[str]] = {}
         for relation, privileges in grants().items():
             for privilege, role_suffixes in privileges.items():
@@ -194,31 +191,26 @@ def _record_phase(cursor, phase: str, detail: dict[str, object]) -> None:
 
 
 def ensure_roles_v2(connection, roles: RoleNamesV2) -> list[str]:
-    """Create any missing capability or principal role and verify the existing ones; re-runnable.
+    """Create any missing role (admin, app, api) and verify the existing ones; re-runnable.
 
-    All roles are NOLOGIN. LOGIN principals and their credentials are provisioned separately, after
-    the credential model is decided (never from this module). An existing role whose attributes differ
-    from the policy is an error, never silently altered. Returns the names created in this call.
+    All roles are NOLOGIN, inherit by default and are members of nothing. LOGIN and credentials are
+    provisioned separately, after the credential model is decided (never from this module). An
+    existing role whose attributes differ from the policy is an error, never silently altered.
+    Returns the names created in this call.
     """
     created: list[str] = []
     with connection.cursor() as cursor:
         cursor.execute("SELECT rolname, rolcanlogin, rolinherit FROM pg_roles WHERE rolname = ANY(%s)",
                        (list(roles.all_names),))
         existing = {name: (can_login, inherit) for name, can_login, inherit in cursor.fetchall()}
-        for suffix in (*CAPABILITY_SUFFIXES, *PRINCIPAL_SUFFIXES):
+        for name, attributes in existing.items():
+            if attributes != (False, True):
+                raise RuntimeError(f"existing role {name} does not match the security policy attributes")
+        for suffix in ROLES:
             name = roles.name(suffix)
-            wanted_inherit = suffix not in NOINHERIT_PRINCIPALS
-            if name in existing:
-                if existing[name] != (False, wanted_inherit):
-                    raise RuntimeError(f"existing role {name} does not match the security policy attributes")
-                continue
-            noinherit = sql.SQL("") if wanted_inherit else sql.SQL(" NOINHERIT")
-            cursor.execute(sql.SQL("CREATE ROLE {} NOLOGIN{}").format(sql.Identifier(name), noinherit))
-            created.append(name)
-        for principal, memberships in PRINCIPAL_PROFILES.items():
-            for capability in memberships:
-                cursor.execute(sql.SQL("GRANT {} TO {}").format(
-                    sql.Identifier(roles.name(capability)), sql.Identifier(roles.name(principal))))
+            if name not in existing:
+                cursor.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(name)))
+                created.append(name)
     return created
 
 
@@ -251,12 +243,8 @@ def audit_database_security_v2(connection, roles: RoleNamesV2) -> list[tuple[str
     results: list[tuple[str, str]] = []
     expected = grants()
     with connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE n.nspname IN ('ref','rt') AND c.relkind IN ('r','p') AND NOT c.relispartition")
-        relations = sorted(row[0] for row in cursor.fetchall())
         mismatches: list[str] = []
-        for suffix in CAPABILITY_ROLES:
+        for suffix in RUNTIME_ROLES:
             role = roles.name(suffix)
             for privilege in PRIVILEGES:
                 cursor.execute(
@@ -268,7 +256,7 @@ def audit_database_security_v2(connection, roles: RoleNamesV2) -> list[tuple[str
                     wanted = suffix in expected.get(relation, {}).get(privilege, ())
                     if bool(has_privilege) != wanted:
                         mismatches.append(f"{suffix}:{privilege}:{relation}:{'missing' if wanted else 'extra'}")
-        results.append(("capability_privileges_match_registry",
+        results.append(("runtime_privileges_match_registry",
                         "PASS" if not mismatches else f"FAIL {mismatches[:8]} (+{max(0, len(mismatches) - 8)})"))
         cursor.execute(
             "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace, "
@@ -277,44 +265,46 @@ def audit_database_security_v2(connection, roles: RoleNamesV2) -> list[tuple[str
         cursor.execute(
             "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE n.nspname IN ('ref','rt') AND c.relkind IN ('r','p','S') "
-            "AND pg_get_userbyid(c.relowner) <> %s", (roles.name("owner"),))
-        results.append(("all_relations_owned_by_owner", "PASS" if cursor.fetchone()[0] == 0 else "FAIL"))
+            "AND pg_get_userbyid(c.relowner) <> %s", (roles.name(ADMIN_ROLE),))
+        results.append(("all_relations_owned_by_admin", "PASS" if cursor.fetchone()[0] == 0 else "FAIL"))
 
-        def has_role(principal: str, capability: str) -> bool:
-            cursor.execute("SELECT pg_has_role(%s, %s, 'MEMBER')", (roles.name(principal), roles.name(capability)))
+        def has_role(member: str, role: str) -> bool:
+            cursor.execute("SELECT pg_has_role(%s, %s, 'MEMBER')", (roles.name(member), roles.name(role)))
             return bool(cursor.fetchone()[0])
 
-        results.append(("runtime_options_cannot_use_data_roles", "PASS" if not any(
-            has_role("runtime_options", role) for role in ("ingress", "compute", "references", "publication",
-                                                           "maintenance", "partition_admin", "owner")) else "FAIL"))
-        results.append(("runtime_data_cannot_use_options_roles", "PASS" if not any(
-            has_role("runtime_data", role) for role in ("options_ingress", "options_compute", "partition_admin",
-                                                        "owner")) else "FAIL"))
-        results.append(("archivist_can_ddl_only_via_owner", "PASS" if has_role("archivist", "owner")
-                        and has_role("archivist", "partition_admin") and not has_role("archivist", "compute")
-                        else "FAIL"))
+        results.append(("roles_share_no_membership", "PASS" if not any(
+            has_role(member, role) for member in ROLES for role in ROLES if member != role) else "FAIL"))
+        cursor.execute(
+            "SELECT count(*) FROM pg_roles WHERE rolname = ANY(%s) "
+            "AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolbypassrls OR rolreplication)",
+            (list(roles.all_names),))
+        results.append(("roles_hold_no_administrative_attributes", "PASS" if cursor.fetchone()[0] == 0 else "FAIL"))
+        cursor.execute(
+            "SELECT bool_or(has_schema_privilege(r.name, s.name, 'CREATE')) "
+            "FROM unnest(%s::text[]) AS r(name), unnest(ARRAY['public', 'ref', 'rt']) AS s(name)",
+            (list(roles.runtime_names),))
+        results.append(("runtime_roles_cannot_create_in_schemas", "PASS" if not cursor.fetchone()[0] else "FAIL"))
+        cursor.execute(
+            "SELECT has_database_privilege(%s, current_database(), 'TEMPORARY'), "
+            "has_database_privilege(%s, current_database(), 'TEMPORARY')",
+            (roles.name(APP_ROLE), roles.name(API_ROLE)))
+        app_temp, api_temp = cursor.fetchone()
+        results.append(("only_app_may_create_temporary_tables", "PASS" if app_temp and not api_temp else "FAIL"))
         results.append(("api_is_read_only", "PASS" if not any(
-            privilege != "SELECT" and "reader" in roles_map.get(privilege, ())
+            privilege != "SELECT" and API_ROLE in roles_map.get(privilege, ())
             for roles_map in expected.values() for privilege in roles_map) else "FAIL"))
-        for relation, spec in RELATIONS.items():
-            if spec.domain == "equity" and any(role.startswith("options_") for role in (*spec.insert, *spec.update)):
-                results.append((f"equity_table_not_writable_by_options:{relation}", "FAIL"))
-            if spec.domain == "options" and any(role in ("compute", "ingress") for role in (*spec.insert, *spec.update)):
-                results.append((f"options_table_not_writable_by_data:{relation}", "FAIL"))
         cursor.execute(
             "SELECT has_function_privilege(%s, 'rt.ensure_partitions(text, date)', 'EXECUTE'), "
             "has_function_privilege(%s, 'rt.ensure_partitions(text, date)', 'EXECUTE')",
-            (roles.name("partition_admin"), roles.name("reader")))
+            (roles.name(APP_ROLE), roles.name(API_ROLE)))
         granted, denied = cursor.fetchone()
         results.append(("partition_function_execute_is_restricted", "PASS" if granted and not denied else "FAIL"))
         cursor.execute(
-            "SELECT bool_and(has_function_privilege(role.name, 'rt.fence_stage_run(uuid)', 'EXECUTE')) "
-            "FROM unnest(%s::text[]) AS role(name)", ([roles.name(suffix) for suffix in FENCED_STAGE_ROLES],))
-        fenced = cursor.fetchone()[0]
-        cursor.execute("SELECT has_function_privilege(%s, 'rt.fence_stage_run(uuid)', 'EXECUTE')",
-                       (roles.name("reader"),))
-        reader_can = cursor.fetchone()[0]
-        results.append(("stage_fence_execute_is_restricted", "PASS" if fenced and not reader_can else "FAIL"))
+            "SELECT has_function_privilege(%s, 'rt.fence_stage_run(uuid)', 'EXECUTE'), "
+            "has_function_privilege(%s, 'rt.fence_stage_run(uuid)', 'EXECUTE')",
+            (roles.name(APP_ROLE), roles.name(API_ROLE)))
+        fenced, api_can = cursor.fetchone()
+        results.append(("stage_fence_execute_is_restricted", "PASS" if fenced and not api_can else "FAIL"))
         cursor.execute("SELECT phase FROM rt.security_phase_events ORDER BY event_id DESC LIMIT 1")
         phase = cursor.fetchone()
         results.append(("security_phase_ledger_records_hardening",

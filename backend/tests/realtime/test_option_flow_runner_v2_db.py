@@ -5,11 +5,12 @@ test_realtime_v2_oflow_a (created from the sql_v2 baseline, always dropped). The
 mock; no gateway, socket or provider exists anywhere in this file. Exercised on the real schema: the writer's
 COPY and divergence check, the checkpoint rows with their regression guard, gap rows under the ingress
 role, the prior-open-interest query, restart equivalence, fail-closed divergence next to a completing
-equity window, and the roles every transaction asked for.
+equity window, and that every stage transaction runs as the single app role.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import sys
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -122,16 +123,23 @@ _bases = []
 def next_base() -> int:
     """A distinct 15-minute-aligned scenario start per world: rt.option_flow_events is unique by
     (contract, sequence, time, revision) whatever the cohort, so two worlds may never share prints."""
-    now_ms = int(datetime.now(UTC).timestamp() * 1000)
-    base = now_ms - now_ms % ALIGNMENT_MS + (len(_bases) + 1) * ALIGNMENT_MS
+    anchor = datetime.now(UTC).replace(hour=14, minute=0, second=0, microsecond=0)
+    anchor_ms = int(anchor.timestamp() * 1000)
+    base = anchor_ms + (len(_bases) + 1) * ALIGNMENT_MS
     _bases.append(base)
     return base
 
 
-def relative(rows, base_ms):
+def relative(rows, base_ms, session_date=None):
     """Rows with every timestamp expressed relative to the scenario start, for cross-world comparison."""
     origin = datetime.fromtimestamp(base_ms / 1000, UTC)
-    return [tuple(value - origin if isinstance(value, datetime) else value for value in row) for row in rows]
+    date_origin = session_date or origin.date()
+    return [tuple(
+        value - origin if isinstance(value, datetime)
+        else value - date_origin if isinstance(value, date)
+        else value
+        for value in row
+    ) for row in rows]
 
 
 class World:
@@ -144,9 +152,12 @@ class World:
         self.transactions = []
         original = self.provider.transaction
 
-        def recording(capability_role, principal_profile, **options):
-            self.transactions.append((capability_role, principal_profile, bool(options.get("read_only"))))
-            return original(capability_role, principal_profile, **options)
+        def recording(*args, **options):
+            # A stage's own transactions come through StageContext.transaction; the orchestrator's
+            # bookkeeping comes through its repository. One role runs both, so the caller tells them apart.
+            from_stage = sys._getframe(1).f_globals["__name__"] == "realtime.stage_orchestrator"
+            self.transactions.append((from_stage, bool(options.get("read_only"))))
+            return original(*args, **options)
 
         self.provider.transaction = recording
         self.base_ms = base_ms or next_base()
@@ -195,13 +206,10 @@ class World:
                                  "WHERE cohort_id = %s AND stage_id = 'OPTIONS_FLOW'", (str(self.cohort),))
         return (rows[0][0], tuple(rows[0][1]), rows[0][2]) if rows else None
 
-    def roles(self, *, write=None):
-        """Capability roles the stage asked for (the orchestrator's own control transactions are not the stage's)."""
-        return {role for role, profile, read_only in self.transactions
-                if profile == "runtime_options" and (write is None or write == (not read_only))}
-
-    def stage_transactions(self):
-        return [item for item in self.transactions if item[1] == "runtime_options"]
+    def stage_transactions(self, *, write=None):
+        """The transactions the OPTIONS_FLOW stage itself opened (not the orchestrator's own bookkeeping)."""
+        return [item for item in self.transactions
+                if item[0] and (write is None or write == (not item[1]))]
 
     def run_to_end(self, *, finish=True):
         state = self.environment.options_flow_state
@@ -218,7 +226,10 @@ class World:
     def rows(self, *, normalized=False):
         rows = {name: _query(self.pool, sql, (str(self.cohort),))
                 for name, sql in (("events", EVENTS_SQL), ("clusters", CLUSTERS_SQL), ("volume", VOLUME_SQL))}
-        return {name: relative(value, self.base_ms) for name, value in rows.items()} if normalized else rows
+        return {
+            name: relative(value, self.base_ms, self.session_date)
+            for name, value in rows.items()
+        } if normalized else rows
 
     def checkpoint_rows(self, consumer_name="option_flow_stream_v1"):
         return _query(self.pool, CHECKPOINT_SQL, (str(self.cohort), consumer_name))
@@ -311,7 +322,6 @@ def test_a_crash_and_restart_persists_the_same_rows_as_an_uninterrupted_session(
     resumed_gaps = relative(gap_rows(pool, feed), other_ms)
     # the same gaps, not duplicated by the replay (the session and journal identities differ by feed)
     assert [row[1:4] + row[5:] for row in resumed_gaps] == [row[1:4] + row[5:] for row in expected_gaps]
-    assert resumed_world.provider.role_violations == []
 
 
 def asdict_stats(consumer):
@@ -360,8 +370,6 @@ def test_gaps_are_durable_before_their_rows_and_a_missing_stream_session_fails_c
     del world
     again.run_to_end()
     assert gap_rows(pool, feed) == rows
-    assert again.provider.role_violations == []
-    assert again.roles(write=True) <= {"options_compute", "options_ingress"}
 
 
 def test_gaps_name_each_contract_that_is_an_instrument_and_one_row_for_the_rest(pool):
@@ -453,7 +461,6 @@ def test_a_divergent_replay_blocks_options_flow_only_and_an_equity_window_still_
     assert blocked_world.session().start.mode in ("RESTORED", "WARMING")
     assert blocked_world.rows() == stored and resumed.fed_offset == feed.last_offset()
     assert blocked_world.readiness()[0] in ("READY", "DEGRADED")
-    assert blocked_world.provider.role_violations == []
 
 
 # --- checkpoints on the real schema ---------------------------------------------------------------------------------
@@ -496,7 +503,6 @@ def test_a_checkpoint_ahead_of_the_journal_is_rejected_and_then_deliberately_rep
     feed.add_trade(CALL, 700, world.base_ms + 20_000, 5.0, 100, conditions=(9001,))
     second.tick()
     assert {row[1] for row in second.checkpoint_rows()} == {feed.last_offset()}  # replaced once, on purpose
-    assert second.provider.role_violations == []
 
 
 def test_the_regression_guard_refuses_a_stale_writer_and_its_flush_rolls_back(pool):
@@ -585,7 +591,7 @@ def test_prior_open_interest_is_read_from_the_reference_baselines_and_a_missing_
     events = {row[0]: row for row in world.rows()["events"]}
     assert events[CALL][PRIOR_OI] == 300 and events[CALL][EXCEEDS] is True
     assert events[PUT][PRIOR_OI] is None and events[PUT][EXCEEDS] is False
-    assert world.roles(write=False) == {"options_compute"}
+    assert world.stage_transactions(write=False)  # the prior-open-interest read is a stage read-only transaction
 
 
 # --- configuration, service and roles ----------------------------------------------------------------------------------
@@ -601,7 +607,7 @@ def test_an_unconfigured_runner_blocks_through_the_database_orchestrator_without
         assert world.stage_transactions() == [] and world.rows() == before
 
 
-def test_the_v2_service_ticks_options_flow_and_every_transaction_uses_the_runtime_options_roles(pool):
+def test_the_v2_service_ticks_options_flow_and_every_stage_transaction_runs_as_the_app_role(pool):
     base_ms = next_base()
     feed = db_feed(base_ms, disconnect=False)
     world = World(pool, feed, base_ms=base_ms)
@@ -610,9 +616,5 @@ def test_the_v2_service_ticks_options_flow_and_every_transaction_uses_the_runtim
     assert service.tick_resident_once("OPTIONS_FLOW") == "COMPLETE"
     assert service.resident_errors == {}
     assert world.readiness()[0] == "READY"
-    assert world.stage_transactions() and {role for role, profile, _ in world.transactions
-                                          if profile != "runtime_options"} <= {"control"}  # the orchestrator's own
-    assert world.roles(write=True) == {"options_compute"}  # a clean stream needs no ingress write
-    assert world.roles(write=False) == {"options_compute"}
-    assert world.provider.role_violations == []
+    assert world.stage_transactions(write=True) and world.stage_transactions(write=False)
     assert len(world.rows()["events"]) > 0

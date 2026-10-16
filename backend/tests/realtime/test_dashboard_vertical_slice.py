@@ -118,6 +118,21 @@ def test_exact_nine_real_domain_outputs_and_immutable_writer():
     assert len(store.snapshots) == 1
 
 
+def test_dashboard_accepts_covered_cash_dividends_but_rejects_other_actions():
+    inputs = dashboard_fixture()
+    base = dict(inputs.actions[0])
+    dividend = {
+        **base,
+        "action_type": "DIVIDEND",
+        "effective_date": inputs.session,
+    }
+    produce_realtime_dashboard(replace(inputs, actions=(*inputs.actions, dividend)))
+
+    other = {**dividend, "action_type": "OTHER"}
+    with pytest.raises(ValueError, match="non-split corporate action"):
+        produce_realtime_dashboard(replace(inputs, actions=(*inputs.actions, other)))
+
+
 def test_original_dashboard_requests_read_one_pinned_publication_without_compute(monkeypatch):
     app, store = dashboard_app()
     import realtime.dashboard_projection as producer

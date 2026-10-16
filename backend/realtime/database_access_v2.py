@@ -1,10 +1,8 @@
 """V2 database access with a deferred security phase.
 
-While security is deferred the runtime connects as the database owner and no role is switched;
-transactions still declare the capability role and principal profile they would use, and a
-mismatch is recorded so the hardening phase cannot reveal a wrong-role write for the first time.
-Once hardened, each transaction runs `SET LOCAL ROLE <prefix>_<capability>` on the pool of the
-stage's principal. The security phase ledger (rt.security_phase_events) gates both modes: a
+While security is deferred the runtime connects as the database owner and no role is switched.
+Once hardened, each transaction runs `SET LOCAL ROLE <prefix>_app` (or `_api` for read-only API
+access) on that role's pool. The security phase ledger (rt.security_phase_events) gates both modes: a
 deferred runtime refuses a database already hardened and a hardened runtime refuses a database
 whose privileges were not audited.
 """
@@ -25,9 +23,9 @@ from .migrations import (
     SECURITY_MODE_HARDENED,
     SECURITY_MODES_V2,
 )
-from .relation_registry import CAPABILITY_ROLES, PRINCIPAL_PROFILES
+from .relation_registry import API_ROLE, APP_ROLE, RUNTIME_ROLES
 from .security_v2 import build_role_names_v2
-from .stage_graph import STAGES_V1, StageDefinition, principal_profiles_required
+from .stage_graph import STAGES_V1, StageDefinition, lanes_required
 
 EXPECTED_V2_LINEAGE_NAME = "advanced_realtime_v2"
 DISPOSABLE_V2_PREFIX = "test_realtime_v2_"
@@ -50,21 +48,13 @@ class V2AccessConfig:
             raise ValueError("statement timeout must be a positive integer")
         if self.security_mode == SECURITY_MODE_HARDENED:
             if not self.role_prefix:
-                raise ValueError("hardened access requires the capability role prefix")
+                raise ValueError("hardened access requires the role prefix")
             build_role_names_v2(self.role_prefix)
-
-
-@dataclass(frozen=True, slots=True)
-class RoleViolation:
-    capability_role: str
-    principal_profile: str
-    reason: str
 
 
 @dataclass(slots=True)
 class V2UnitOfWork:
-    capability_role: str
-    principal_profile: str
+    role: str
     connection: Any
     cursor: Any
     read_only: bool
@@ -101,26 +91,24 @@ class StageRunFence:
             raise
 
 
-def pools_required(enabled_stages: Iterable[str], config: V2AccessConfig,
-                   stages: Mapping[str, StageDefinition] = STAGES_V1) -> frozenset[str]:
+def pools_required(enabled_stages: Iterable[str], config: V2AccessConfig) -> frozenset[str]:
     """Pool keys a plan needs. Deferred access uses one owner pool for every stage; hardened
-    access needs only the principals of the enabled stages (an equity-only plan never opens the
-    options principal)."""
+    access uses the single `app` pool (the `api` pool belongs to the HTTP process, not a plan)."""
     enabled = frozenset(enabled_stages)
-    if config.security_mode == SECURITY_MODE_DEFERRED:
-        return frozenset({OWNER_POOL}) if enabled else frozenset()
-    return principal_profiles_required(enabled, stages)
+    if not enabled:
+        return frozenset()
+    return frozenset({OWNER_POOL}) if config.security_mode == SECURITY_MODE_DEFERRED else frozenset({APP_ROLE})
 
 
 CONNECTION_HEADROOM = 0.70
 
 
 def orchestrator_pool_size(enabled_stages: Iterable[str], stages: Mapping[str, StageDefinition] = STAGES_V1) -> int:
-    """Connections one orchestrator process can hold: a lane per principal profile, a resident loop
+    """Connections one orchestrator process can hold: a lane per execution lane, a resident loop
     per INTERVAL/CONTINUOUS stage, plus the coordinator and its lease heartbeat."""
     enabled = frozenset(enabled_stages)
     resident = sum(1 for name in enabled if stages[name].schedule_kind in ("INTERVAL", "CONTINUOUS"))
-    return len(principal_profiles_required(enabled, stages)) + resident + 2
+    return len(lanes_required(enabled, stages)) + resident + 2
 
 
 def plan_connection_budget(planned: Mapping[str, int], *, server_max_connections: int,
@@ -159,25 +147,22 @@ def verify_server_connection_budget(pool: Any, planned: Mapping[str, int], *, re
                                   headroom=headroom)
 
 
-def _verification_role(config: V2AccessConfig, principal_profile: str | None) -> str | None:
-    """The capability role a hardened pool assumes to read the identity and phase tables. A NOINHERIT
-    principal cannot read them itself, so it checks as `control` (runtime principals) or `reader` (api)."""
-    if config.security_mode != SECURITY_MODE_HARDENED or principal_profile is None or not config.role_prefix:
+def _verification_role(config: V2AccessConfig, role: str | None) -> str | None:
+    """The database role a hardened pool assumes to read the identity and phase tables: the role of
+    the pool itself (`app` or `api`). A deferred pool is the owner and assumes nothing."""
+    if config.security_mode != SECURITY_MODE_HARDENED or role is None or not config.role_prefix:
         return None
-    memberships = PRINCIPAL_PROFILES.get(principal_profile, ())
-    role = next((name for name in ("control", "reader") if name in memberships), None)
-    return build_role_names_v2(config.role_prefix).name(role) if role else None
+    return build_role_names_v2(config.role_prefix).name(role)
 
 
-def verify_pool_target_v2(pool: Any, config: V2AccessConfig, principal_profile: str | None = None) -> str:
+def verify_pool_target_v2(pool: Any, config: V2AccessConfig, role: str | None = None) -> str:
     """Check the database name, lineage identity and security phase; return the database name.
-    `principal_profile` names the principal a hardened pool logs in as, so the check runs under a
-    capability role that is allowed to read the identity and phase tables."""
+    `role` names the role a hardened pool logs in as (`app` or `api`), so the check runs under it."""
     connection = pool.getconn()
     try:
         with connection.cursor() as cursor:
             cursor.execute("SET TRANSACTION READ ONLY")
-            verification_role = _verification_role(config, principal_profile)
+            verification_role = _verification_role(config, role)
             if verification_role is not None:
                 cursor.execute(sql.SQL("SET LOCAL ROLE {}").format(sql.Identifier(verification_role)))
             cursor.execute("SELECT current_database()")
@@ -210,7 +195,7 @@ class V2ConnectionProvider:
     def __init__(self, pools: Mapping[str, Any], config: V2AccessConfig) -> None:
         if not pools:
             raise ValueError("v2 connection provider requires at least one pool")
-        valid = {OWNER_POOL, *PRINCIPAL_PROFILES}
+        valid = {OWNER_POOL, *RUNTIME_ROLES}
         unknown = set(pools) - valid
         if unknown:
             raise ValueError(f"unknown v2 pool keys: {sorted(unknown)}")
@@ -221,7 +206,6 @@ class V2ConnectionProvider:
         self._pools = dict(pools)
         self._config = config
         self._roles = build_role_names_v2(config.role_prefix) if config.role_prefix else None
-        self.role_violations: list[RoleViolation] = []
 
     @property
     def config(self) -> V2AccessConfig:
@@ -234,30 +218,22 @@ class V2ConnectionProvider:
             raise RuntimeError("v2 pools target different databases")
         return databases.pop()
 
-    def _check_role(self, capability_role: str, principal_profile: str) -> None:
-        if capability_role not in CAPABILITY_ROLES:
-            raise ValueError(f"unknown capability role {capability_role}")
-        if principal_profile not in PRINCIPAL_PROFILES:
-            raise ValueError(f"unknown principal profile {principal_profile}")
-        if capability_role in PRINCIPAL_PROFILES[principal_profile]:
-            return
-        reason = f"{principal_profile} is not a member of {capability_role}"
-        if self._config.security_mode == SECURITY_MODE_HARDENED:
-            raise PermissionError(reason)
-        self.role_violations.append(RoleViolation(capability_role, principal_profile, reason))
-
     @contextmanager
-    def transaction(self, capability_role: str, principal_profile: str, *,
-                    read_only: bool = False, isolation_level: str | None = None,
-                    fence: CommitFence | None = None, dict_cursor: bool = False):
-        self._check_role(capability_role, principal_profile)
+    def transaction(self, role: str = APP_ROLE, *, read_only: bool = False,
+                    isolation_level: str | None = None, fence: CommitFence | None = None,
+                    dict_cursor: bool = False):
+        """One unit of work as `app` (the runtime, default) or `api` (read-only)."""
+        if role not in RUNTIME_ROLES:
+            raise ValueError(f"unknown database role {role}")
+        if role == API_ROLE and not read_only:
+            raise ValueError("the api role is read-only")
         if fence is not None and read_only:
             raise ValueError("a read-only transaction has no writes to fence")
         isolation = isolation_level.strip().upper() if isolation_level else None
         if isolation not in _ISOLATION_LEVELS:
             raise ValueError("unsupported realtime transaction isolation level")
         deferred = self._config.security_mode == SECURITY_MODE_DEFERRED
-        pool_key = OWNER_POOL if deferred else principal_profile
+        pool_key = OWNER_POOL if deferred else role
         pool = self._pools.get(pool_key)
         if pool is None:
             raise RuntimeError(f"no v2 pool is configured for {pool_key}")
@@ -269,11 +245,10 @@ class V2ConnectionProvider:
                 cursor.execute(f"SET TRANSACTION ISOLATION LEVEL {isolation}, {mode}" if isolation
                                else f"SET TRANSACTION {mode}")
                 if not deferred:
-                    cursor.execute(sql.SQL("SET LOCAL ROLE {}").format(
-                        sql.Identifier(self._roles.name(capability_role))))
+                    cursor.execute(sql.SQL("SET LOCAL ROLE {}").format(sql.Identifier(self._roles.name(role))))
                 cursor.execute("SELECT set_config('statement_timeout', %s, true)",
                                (f"{self._config.statement_timeout_ms}ms",))
-                yield V2UnitOfWork(capability_role, principal_profile, connection, cursor, read_only)
+                yield V2UnitOfWork(role, connection, cursor, read_only)
                 if fence is not None:
                     fence.verify(cursor)
             connection.commit()

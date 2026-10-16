@@ -2,9 +2,12 @@
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import timedelta
+import math
 from pathlib import Path
 from typing import Mapping
 from uuid import UUID
+
+import exchange_calendars
 
 from research.stock_alert_results import combine_snapshots, namespace_snapshot, strategy_instance
 from research.stock_alerts import empty_snapshot, enrich_replay, replay_snapshot, session_dates
@@ -20,7 +23,7 @@ from .contracts import canonical_sha256
 from .equity_portal_history import build_realtime_equity_portal_history_plan
 from .lineage_head import inputs_bar_lineage_sha256, inputs_sha256, reference_set, require_bounded_manifest
 from .portal_projection import build_portal_snapshot
-from .screening_projection import RealtimeScreeningInput, produce_realtime_screening
+from .screening_projection import RealtimeScreeningInput
 
 
 STOCK_ALERTS_VERSION = "STOCK_ALERTS_V1"
@@ -41,12 +44,126 @@ class RetainedAlertStream:
     publications: tuple[Mapping, ...]
 
 
-def alert_domain_inputs(inputs: RealtimeScreeningInput):
-    policy = forward_config(quality_version=2)
-    # The shared gate validates all causal sources, references, action coverage and scale.
-    produce_realtime_screening(replace(
-        inputs, bars=tuple(row for row in inputs.bars if row["interval"] not in {"1wk", "1mo"}),
+def alert_source_inputs(inputs: RealtimeScreeningInput) -> RealtimeScreeningInput:
+    return replace(inputs, bars=tuple(
+        row for row in inputs.bars
+        if (
+            row["interval"] == "30m" and row["adjustment_basis"] == "RAW_UNADJUSTED"
+            or row["interval"] == "1d" and row["adjustment_basis"] in {"ADJUSTED", "RAW_UNADJUSTED"}
+        )
     ))
+
+
+def _validate_alert_sources(inputs: RealtimeScreeningInput, plan, bars_by_ticker) -> None:
+    members = inputs.members
+    if (
+        not 0 < len(members) <= 1000
+        or len({str(member["security_id"]) for member in members}) != len(members)
+        or len({member["ticker"] for member in members}) != len(members)
+    ):
+        raise ValueError("Full unique alert manifest membership is required")
+    if set(bars_by_ticker) - {member["ticker"] for member in members}:
+        raise ValueError("Alert bars extend beyond the exact manifest")
+    coverage_by_security, actions_by_security = {}, {}
+    for row in inputs.coverage:
+        coverage_by_security.setdefault(str(row["security_id"]), []).append(row)
+    for row in inputs.actions:
+        actions_by_security.setdefault(str(row["security_id"]), []).append(row)
+    adjusted_sessions = tuple(plan.adjusted_sessions)
+    raw_sessions = tuple(plan.raw_sessions)
+    recorded_by = inputs.recorded_by
+    for member in members:
+        identity, ticker = str(member["security_id"]), member["ticker"]
+        if not member.get("security_revision_id") or member.get("security_type") not in {"CS", "ETF", "ETV"}:
+            raise ValueError(f"Alert reference identity/type unavailable: {ticker}")
+        if member["observed_at"] > inputs.cutoff:
+            raise ValueError(f"Alert reference is not available: {ticker}")
+        own = bars_by_ticker.get(ticker, ())
+        for row in own:
+            if (
+                str(row["cohort_id"]) != str(inputs.cohort_id)
+                or row["provider_tier"] != inputs.provider_tier.value
+                or str(row["security_id"]) != identity
+                or row["instrument_id"] != member["instrument_id"]
+                or row["ticker"] != ticker
+                or row["session_scope"] != "RTH"
+                or not row["is_final"]
+                or row["bar_end"] > inputs.cutoff
+                or row["observed_at"] > recorded_by
+                or row["created_at"] > recorded_by
+                or row.get("replay_available_at") is not None and row["replay_available_at"] > recorded_by
+                or row.get("provider_published_at") is not None and row["provider_published_at"] > recorded_by
+            ):
+                raise ValueError(f"Alert source identity/availability drift: {ticker}")
+            prices = tuple(float(row[name]) for name in ("open", "high", "low", "close", "volume"))
+            if (
+                not all(math.isfinite(value) for value in prices)
+                or min(prices[:4]) <= 0
+                or prices[4] < 0
+                or prices[1] < max(prices[0], prices[2], prices[3])
+                or prices[2] > min(prices[0], prices[1], prices[3])
+            ):
+                raise ValueError(f"Invalid alert bar: {ticker}")
+            if row["source_kind"] in {"DERIVED", "RECONCILED"} and not row["source_revision_ids"]:
+                raise ValueError("Alert derived source lineage is missing")
+        adjusted = sorted(
+            (row for row in own if row["interval"] == "1d" and row["adjustment_basis"] == "ADJUSTED"),
+            key=lambda row: row["session_date"],
+        )
+        raw = sorted(
+            (row for row in own if row["interval"] == "1d" and row["adjustment_basis"] == "RAW_UNADJUSTED"),
+            key=lambda row: row["session_date"],
+        )
+        if tuple(row["session_date"] for row in adjusted) != adjusted_sessions:
+            raise ValueError(f"Alert adjusted history is incomplete: {ticker}")
+        if tuple(row["session_date"] for row in raw) != raw_sessions:
+            raise ValueError(f"Alert raw daily history is incomplete: {ticker}")
+        actions = actions_by_security.get(identity, ())
+        if any(row["ticker"] != ticker or row["received_at"] > inputs.cutoff for row in actions):
+            raise ValueError(f"Alert action evidence drift: {ticker}")
+        if any(
+            row["action_type"] == "SPLIT"
+            and (
+                not math.isfinite(float(row["split_from"]))
+                or not math.isfinite(float(row["split_to"]))
+                or float(row["split_from"]) <= 0
+                or float(row["split_to"]) <= 0
+            )
+            for row in actions
+        ):
+            raise ValueError(f"Invalid alert split evidence: {ticker}")
+        coverage = [
+            row for row in coverage_by_security.get(identity, ())
+            if (
+                row["action_type"] == "SPLIT"
+                and row["window_start"] <= adjusted_sessions[0]
+                and row["window_end"] >= inputs.session
+                and row["received_at"] <= inputs.cutoff
+            )
+        ]
+        coverage = [
+            row for row in coverage
+            if (
+                row["response_action_count"] == sum(
+                    action["action_type"] == "SPLIT"
+                    and row["window_start"] <= action["effective_date"] <= row["window_end"]
+                    for action in actions
+                )
+                and all(
+                    action["received_at"] <= row["received_at"]
+                    for action in actions
+                    if action["action_type"] == "SPLIT"
+                    and row["window_start"] <= action["effective_date"] <= row["window_end"]
+                )
+            )
+        ]
+        if not coverage:
+            raise ValueError(f"Alert split/action coverage drift: {ticker}")
+
+
+def alert_domain_inputs(inputs: RealtimeScreeningInput):
+    inputs = alert_source_inputs(inputs)
+    policy = forward_config(quality_version=2)
     # created_at and the availability clocks (observed_at, replay/published and bar_end plus the provider
     # delay) are recording clocks: they are checked against `recorded_by` (known_by, else the cutoff);
     # bar_end itself stays a market time, checked against the cutoff.
@@ -55,27 +172,43 @@ def alert_domain_inputs(inputs: RealtimeScreeningInput):
         created = row["created_at"]
         if created.tzinfo is None or created.utcoffset() is None or created > recorded_by:
             raise ValueError("Alert source creation clock is beyond cutoff")
-    source_index = {str(row["bar_revision_id"]): row for row in inputs.bars}
     def source_clock(row):
         return max(row["bar_end"] + timedelta(minutes=15), row["created_at"], row["observed_at"],
                    *(row[key] for key in ("replay_available_at", "provider_published_at") if row.get(key) is not None))
     for row in inputs.bars:
         effective_available_at = source_clock(row)
-        if row["source_kind"] == "DERIVED":
-            effective_available_at = max(effective_available_at,
-                *(source_clock(source_index[str(source)]) for source in row["source_revision_ids"]))
         if effective_available_at > recorded_by or row["bar_end"] > inputs.cutoff:
             raise ValueError("Alert source availability is beyond cutoff")
-    plan = build_realtime_equity_portal_history_plan(inputs.session, equity_ticker_count=len(inputs.members))
+    intraday_plan = build_realtime_equity_portal_history_plan(
+        inputs.session,
+        equity_ticker_count=len(inputs.members),
+    )
+    calendar = exchange_calendars.get_calendar("XNYS")
+    session_close = calendar.session_close(str(inputs.session)).to_pydatetime()
+    daily_plan = intraday_plan
+    if inputs.cutoff < session_close:
+        daily_plan = build_realtime_equity_portal_history_plan(
+            calendar.previous_session(str(inputs.session)).date(),
+            equity_ticker_count=len(inputs.members),
+        )
+    bars_by_ticker = {}
+    for row in inputs.bars:
+        bars_by_ticker.setdefault(row["ticker"], []).append(row)
+    _validate_alert_sources(inputs, daily_plan, bars_by_ticker)
     bars = []
     for member in inputs.members:
         identity, ticker = str(member["security_id"]), member["ticker"]
-        own = [row for row in inputs.bars if row["ticker"] == ticker]
+        own = bars_by_ticker.get(ticker, ())
         raw = {row["session_date"]: row for row in own
                if row["interval"] == "1d" and row["adjustment_basis"] == "RAW_UNADJUSTED"}
         native = sorted((row for row in own if row["interval"] == "30m"
                          and row["adjustment_basis"] == "RAW_UNADJUSTED"), key=lambda row: row["bar_start"])
-        expected = [window for session in plan.raw_sessions for window in session_windows(str(session))]
+        expected = [
+            window
+            for session in intraday_plan.raw_sessions
+            for window in session_windows(str(session))
+            if window[1] <= inputs.cutoff
+        ]
         if [(row["bar_start"], row["bar_end"]) for row in native] != expected:
             raise ValueError(f"Alert completed 30m history is incomplete: {ticker}")
         daily = sorted((row for row in own if row["interval"] == "1d"
@@ -254,6 +387,7 @@ def _retained_snapshot(inputs, retained, bars, actions):
 
 
 def produce_realtime_stock_alerts(inputs: RealtimeScreeningInput, *, streams=()):
+    inputs = alert_source_inputs(inputs)
     bars, actions = alert_domain_inputs(inputs)
     policy = forward_config(quality_version=2)
     packets = evaluate_alert_inputs(inputs, bars, actions, policy)
@@ -275,10 +409,12 @@ def produce_realtime_stock_alerts(inputs: RealtimeScreeningInput, *, streams=())
                       sessions=session_dates(str(inputs.session)), current_session=str(inputs.session),
                       warnings=[MISSING_PRODUCERS["forward"], MISSING_PRODUCERS["context"]])
     observations = []
+    packets_by_member_interval = {}
+    for row in packets:
+        packets_by_member_interval.setdefault((row["security_id"], row["interval"]), []).append(row)
     for member in inputs.members:
         for interval in ("30m", "1h", "1d"):
-            own = [row for row in packets if row["security_id"] == str(member["security_id"])
-                   and row["interval"] == interval]
+            own = packets_by_member_interval.get((str(member["security_id"]), interval), ())
             latest = max(own, key=lambda row: row["market_time"], default=None)
             ready = latest is not None and latest["ready"] and latest["available_at"] <= inputs.cutoff
             observations.append(dict(

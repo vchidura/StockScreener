@@ -121,16 +121,12 @@ class FakeOptionsDatabase:
     diverge_events: bool = False
     fail_gap_insert: Exception | None = None
     fail_checkpoint_insert: Exception | None = None
-    role_violations: list = field(default_factory=list)
     commits: int = 0
     rollbacks: int = 0
 
-    def transaction(self, capability_role, principal_profile, *, read_only=False, dict_cursor=False,
-                    isolation_level=None, fence=None):
-        assert principal_profile == "runtime_options", principal_profile
-        if capability_role not in ("options_compute", "options_ingress"):
-            self.role_violations.append(capability_role)
-        return self._transaction(capability_role, read_only)
+    def transaction(self, role="app", *, read_only=False, dict_cursor=False, isolation_level=None, fence=None):
+        assert role == "app", role  # V2 has one runtime role; the stage's work area selects nothing
+        return self._transaction(role, read_only)
 
     @contextmanager
     def _transaction(self, role, read_only):
@@ -145,7 +141,7 @@ class FakeOptionsDatabase:
         for effect in effects:
             effect()
         self.commits += 1
-        self.commit_log.append((role, read_only))
+        self.commit_log.append((role, read_only, frozenset(cursor.tables)))
 
     def roles(self, *, write=None):
         return {role for role, read_only in self.transactions if write is None or write == (not read_only)}
@@ -169,6 +165,7 @@ class _FakeCursor:
         self._rows: list = []
         self._divergent: dict[str, list] = {}
         self._pending: dict[str, dict] = {}
+        self.tables: set[str] = set()  # the tables this transaction wrote, to tell a gap write from a flush
         self.rowcount = 0
 
     def close(self) -> None:
@@ -201,6 +198,8 @@ class _FakeCursor:
     def execute(self, statement, parameters=None):
         text = " ".join(statement.split())
         db = self._db
+        if text.startswith(("INSERT INTO ", "UPDATE ")):
+            self.tables.add(text.split()[2] if text.startswith("INSERT") else text.split()[1])
         if text.startswith("CREATE TEMP TABLE"):
             return
         if text.startswith("INSERT INTO rt.option_flow_events"):

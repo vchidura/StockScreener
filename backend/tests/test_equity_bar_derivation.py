@@ -12,7 +12,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from equity.derivation import derive_canonical_bars, derive_five_minute_bars
+from equity.derivation import derive_canonical_bars, derive_five_minute_bars, derive_minute_bars
 from equity.domain import (
     BarAvailabilityMode,
     BarSourceKind,
@@ -82,6 +82,50 @@ def intraday_5m(item, session_date=date(2026, 8, 28)):
         start = end
         index += 1
     return tuple(results)
+
+
+def intraday_1m(item, session_date=date(2026, 8, 28)):
+    calendar = exchange_calendars.get_calendar("XNYS")
+    session = pd.Timestamp(session_date)
+    session_open = calendar.session_open(session).to_pydatetime().astimezone(UTC)
+    session_close = calendar.session_close(session).to_pydatetime().astimezone(UTC)
+    results = []
+    start = session_open
+    index = 0
+    while start < session_close:
+        end = min(start + timedelta(minutes=1), session_close)
+        results.append(bar(item, "1m", start, end, session_date, index))
+        start = end
+        index += 1
+    return tuple(results)
+
+
+def test_five_minute_finalization_requires_complete_one_minute_windows():
+    item = security()
+    source = intraday_1m(item)
+    segment_id = uuid4()
+
+    result = derive_minute_bars(
+        item,
+        source,
+        target_interval="5m",
+        observed_at=source[-1].bar_end,
+        ingestion_segment_id=segment_id,
+    )
+    incomplete = derive_minute_bars(
+        item,
+        (*source[:1], *source[2:]),
+        target_interval="5m",
+        observed_at=source[-1].bar_end,
+        ingestion_segment_id=segment_id,
+    )
+
+    assert len(result) == 78
+    assert all(len(row.source_bar_revision_ids) == 5 for row in result)
+    assert result[0].open_price == source[0].open_price
+    assert result[0].close_price == source[4].close_price
+    assert result[0].volume == Decimal("5000")
+    assert len(incomplete) == 77
 
 
 def test_fifteen_minute_derivation_requires_complete_five_minute_windows():

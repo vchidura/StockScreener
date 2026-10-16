@@ -82,12 +82,14 @@ def test_the_plan_orders_every_relation_after_its_parents_and_carries_all_column
     result, _ = plan
     json.dumps(result)
     names = [row["relation"] for row in result["relations"]]
-    assert set(names) == DESIGN_REFERENCE_TABLES | {"rt.instruments"} and result["executor"] == "NOT_BUILT"
+    assert set(names) == DESIGN_REFERENCE_TABLES | {"rt.instruments"}
+    assert result["executor"] == "reference_copy_executor_v1"
     assert names.index("ref.securities") < names.index("ref.security_revisions")
     for row in result["relations"]:
         assert row["columns"] and row["primary_key"] and set(row["primary_key"]) <= set(row["columns"])
         assert all(names.index(parent) < names.index(row["relation"]) for parent in row["parents"])
         assert isinstance(row["self_referencing"], bool)
+        assert isinstance(row["self_foreign_keys"], list)
     timestamp_columns = [column for row in result["relations"] for column in row["columns"]
                          if column.endswith("_at")]
     assert timestamp_columns, "reference rows keep their original timestamps"

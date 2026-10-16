@@ -19,7 +19,10 @@ from .runner_environment import RunnerEnvironment
 from .stage_database_v2 import V2StageDatabase
 from .stage_orchestrator import StageCancelled, StageContext, StageOutcome, StageRunner
 from .stage_runners_equity import (
+    EQUITY_CYCLE,
     EQUITY_CYCLE_RECEIPT_MISSING,
+    INPUT_READY,
+    INPUT_READY_RECEIPT_MISSING,
     REFERENCE_GENERATION_UNAVAILABLE,
     STAGE_CANCELLED,
     _is_session_close,
@@ -42,6 +45,14 @@ STRATEGY_INTERVALS = ("1d", "1h")
 EVALUATED_ANALYSIS_STATUSES = frozenset({"COMPLETE", "COMPLETE_EMPTY"})
 
 
+def _input_receipt(database, plan, window):
+    is_v2 = getattr(plan, "stage_catalog_version", "stages_v1") == "stages_v2"
+    return (
+        _window_receipt(database, window, receipt_kind=INPUT_READY if is_v2 else EQUITY_CYCLE),
+        INPUT_READY_RECEIPT_MISSING if is_v2 else EQUITY_CYCLE_RECEIPT_MISSING,
+    )
+
+
 def _missing_producers(snapshot) -> tuple[str, ...]:
     payload = getattr(snapshot, "payload", None)
     missing = payload.get("missing_producers") if isinstance(payload, Mapping) else None
@@ -56,9 +67,9 @@ def stock_alerts_runner(environment: RunnerEnvironment) -> StageRunner:
         compute = V2StageDatabase(context, RealtimeDatabaseRole.COMPUTE)
         publication = V2StageDatabase(context, RealtimeDatabaseRole.PUBLICATION)
         try:
-            receipt = _window_receipt(compute, window)
+            receipt, missing_reason = _input_receipt(compute, plan, window)
             if receipt is None:
-                return StageOutcome.failed(EQUITY_CYCLE_RECEIPT_MISSING)
+                return StageOutcome.failed(missing_reason)
             generation = reference_generation(compute, window.cutoff)
             if generation < 1:
                 return StageOutcome.blocked(REFERENCE_GENERATION_UNAVAILABLE)
@@ -67,7 +78,7 @@ def stock_alerts_runner(environment: RunnerEnvironment) -> StageRunner:
             try:
                 snapshot = compute_realtime_stock_alerts(
                     compute, cohort_id=plan.cohort_id, session=plan.session_date, cutoff=window.cutoff,
-                    known_by=window.deadline, source_generation=generation,
+                    known_by=environment.known_by(window), source_generation=generation,
                 )
             except RetainedForwardState:
                 return StageOutcome.blocked(STOCK_ALERTS_RETAINED_FORWARD_STATE)
@@ -92,18 +103,17 @@ def strategy_publish_runner(environment: RunnerEnvironment) -> StageRunner:
         failures: list[str] = []
         unevaluated: list[str] = []
         try:
-            receipt = _window_receipt(publication, window)
+            receipt, missing_reason = _input_receipt(publication, plan, window)
             if receipt is None:
-                return StageOutcome.failed(EQUITY_CYCLE_RECEIPT_MISSING)
+                return StageOutcome.failed(missing_reason)
             for interval in STRATEGY_INTERVALS:
                 if context.is_cancelled():
                     return StageOutcome.failed(STAGE_CANCELLED)
                 try:
-                    # Strategies read `available_by` as the time the data is known (they subtract the provider
-                    # delay themselves), so they run at the window deadline: every bar fetched and recorded
-                    # within the completion budget, including the bars up to the window cutoff, is available.
+                    # Strategies subtract the provider delay from this sealed input visibility clock.
                     outcomes = materialize_due_realtime_strategies(
-                        compute, publication, cohort_id=plan.cohort_id, available_by=window.deadline,
+                        compute, publication, cohort_id=plan.cohort_id,
+                        available_by=environment.known_by(window),
                         intervals=(interval,), receipt=receipt,
                     )
                 except (StageCancelled, WriteFenceRejected):

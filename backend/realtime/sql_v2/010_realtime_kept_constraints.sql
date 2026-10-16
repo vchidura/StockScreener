@@ -230,6 +230,12 @@ CREATE UNIQUE INDEX uq_rt_instrument_contract ON rt.instruments USING btree (con
 
 CREATE UNIQUE INDEX uq_rt_instrument_security ON rt.instruments USING btree (security_id) WHERE (security_id IS NOT NULL);
 
+-- An instrument identity is never changed or removed; app holds UPDATE on every writable table, so the
+-- trigger is what keeps this table append-only (writers insert with ON CONFLICT DO NOTHING).
+CREATE TRIGGER trg_rt_instruments_immutable BEFORE DELETE OR UPDATE ON rt.instruments FOR EACH ROW EXECUTE FUNCTION rt.reject_immutable_change();
+
+CREATE TRIGGER trg_rt_instruments_no_truncate BEFORE TRUNCATE ON rt.instruments FOR EACH STATEMENT EXECUTE FUNCTION rt.reject_immutable_change();
+
 ALTER TABLE ONLY rt.instruments
     ADD CONSTRAINT instruments_contract_id_fkey FOREIGN KEY (contract_id) REFERENCES ref.option_contracts(contract_id);
 

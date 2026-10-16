@@ -324,6 +324,7 @@ def test_batch_rejects_cross_batch_and_cross_tier_relabelling():
             cohort_id=batch.cohort_id,
             provider_tier=ProviderTier.MASSIVE_ADVANCED,
             fact_kind=batch.fact_kind,
+            fact_schema_version=batch.fact_schema_version,
             provider=batch.provider,
             provider_batch_id=batch.provider_batch_id,
             started_at=batch.started_at,
@@ -331,6 +332,31 @@ def test_batch_rejects_cross_batch_and_cross_tier_relabelling():
             facts=batch.facts,
             batch_payload_sha256=batch.batch_payload_sha256,
         )
+
+
+def test_bulk_bar_batch_uses_a_chunk_envelope_without_changing_bar_lineage():
+    revision = _developer_revision()
+    original_segment = revision.ingestion_segment_id
+    chunk_id = uuid4()
+    fact = DeveloperEquityBarAcquisitionFact(
+        1,
+        revision,
+        acquisition_provider_batch_id=chunk_id,
+    )
+
+    batch = build_developer_acquisition_batch(
+        cohort_id=COHORT,
+        provider="MASSIVE_RETAINED_V1",
+        provider_batch_id=chunk_id,
+        started_at=NOW,
+        completed_at=NOW,
+        facts=(fact,),
+    )
+
+    assert batch.fact_schema_version == "developer_equity_bar_bulk_v1"
+    assert batch.provider_batch_id == chunk_id
+    assert fact.structured_fact()["acquisition_provider_batch_id"] == str(chunk_id)
+    assert fact.revision.ingestion_segment_id == original_segment
 
 
 def test_developer_bar_fact_accepts_stable_derived_lineage_only():

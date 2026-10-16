@@ -39,7 +39,7 @@ def test_alerts_runner_blocks_without_a_ready_reference_generation(monkeypatch):
     outcome = runners.stock_alerts_runner(RunnerEnvironment(None))(context)
     assert outcome.state == "BLOCKED_POLICY" and outcome.reason_codes == (runners.REFERENCE_GENERATION_UNAVAILABLE,)
     assert "rt.seed_manifests" in database.cursor.statements[1][0]
-    assert [role for role, _ in database.calls] == ["compute", "compute"]
+    assert [role for role, _ in database.calls] == ["app", "app"]
 
 
 def test_alerts_runner_computes_read_only_then_publishes_under_the_publication_role(monkeypatch):
@@ -229,11 +229,10 @@ def test_a_rejected_strategy_write_is_a_cancelled_failure_and_skips_the_other_in
     assert outcome.state == "FAILED" and outcome.reason_codes == (runners.STAGE_CANCELLED,)
 
 
-def test_the_alert_stages_are_registered_with_their_capability_roles():
+def test_the_alert_stages_are_registered_in_the_data_lane():
     from realtime.stage_graph import STAGES_V1
     from realtime.stage_runners_v2 import RUNNER_FACTORIES
 
     assert RUNNER_FACTORIES["STOCK_ALERTS"] is runners.stock_alerts_runner
     assert RUNNER_FACTORIES["STRATEGY_PUBLISH"] is runners.strategy_publish_runner
-    assert STAGES_V1["STOCK_ALERTS"].capability_role == "compute"
-    assert STAGES_V1["STRATEGY_PUBLISH"].capability_role == "publication"
+    assert STAGES_V1["STOCK_ALERTS"].lane == STAGES_V1["STRATEGY_PUBLISH"].lane == "data"

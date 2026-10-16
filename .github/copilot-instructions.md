@@ -20,25 +20,25 @@ Keep this always-loaded file short. Detailed guidance is loaded only when needed
   retired checkpoints, the entire repository memory or prior conversation history.
 - Start a new chat when changing model, workstream or design/implementation/runtime
   phase. Carry forward one checkpoint, exact file anchors and one focused check.
+- Large files are references, not context: never view a file over about 20 KB whole
+  (README, `REALTIME_SCHEMA_V2_DESIGN.md`, dated reports, long tests). `grep` headings or
+  symbols, then `view` a `view_range`. `docs/` holds about 500 MB of JSON/CSV artifacts:
+  grep it only with `glob: "*.md"`.
+- A resume or handoff prompt names one checkpoint, exact anchors and one check (about 40
+  lines at most). It must not tell the next session to read several large documents.
 - Runtime/startup authority: [README](../README.md) and
-  [deployment](../docs/DEPLOYMENT.md). Treat audit reports as dated evidence, not
-  current process state or standing permission to act.
+  [deployment](../docs/DEPLOYMENT.md) (read the needed section only). Treat audit
+  reports as dated evidence, not current process state or standing permission to act.
 
 ## Execution Defaults
 
-- Prefer an existing VS Code task. Inspect its current command, arguments, type,
-  working directory, and side effects before running it.
-- For Python/Node programs, prefer `type: process` with an executable and separate
-  argument array. Shell tasks are for actual shell syntax. Reuse the task label;
-  do not create another task to try another quoting variation.
-- Never embed substantial Python/SQL/JavaScript in PowerShell `-c`, `-Command`,
-  heredocs, or here-string pipelines. Put reusable logic in an appropriate script
-  using editor patch tools; invoke the script directly.
-- A quoting/indentation error or a shell that cannot resolve basic commands is an
-  execution-wrapper failure. Switch method after the first such failure. Do not
-  spend repeated attempts changing quotes or start another copy of the job.
-- Blank output is UNKNOWN, not success or proof that nothing ran. Recover the
-  task output and exact job state before retrying. Report evidence and blockers.
+- Follow the Windows runbook (read once before commands): existing VS Code task first,
+  `type: process` with separate arguments, reusable logic in a script file and never
+  substantial Python/SQL/JavaScript in PowerShell `-c`, heredocs or here-strings. Change
+  method after the first quoting or wrapper failure; do not retry quoting variations or
+  start a second copy of a job.
+- Blank output is UNKNOWN, not success or proof that nothing ran. Recover the task output
+  and exact job state before retrying. Report evidence and blockers.
 
 ## Scope And Evidence
 
@@ -48,7 +48,9 @@ Keep this always-loaded file short. Detailed guidance is loaded only when needed
   publishing, migrating, or repairing data requires explicit scope authorization.
   Never relax freshness, deadlines, identity checks, or execution gates to get a pass.
 - Preserve concurrent/user changes, immutable bars/evidence, frozen manifests,
-  original timestamps, and existing live services outside the approved scope.
+  original timestamps, and existing live services outside the approved scope. `docs/`
+  is gitignored, so `git status` hides doc edits: re-read a doc just before editing it
+  and re-grep after, since another session may be writing the same file.
 - After an edit, run the cheapest relevant behavioral check before widening scope.
   Distinguish command completion, test success, report verdict, freshness, and full
   historical coverage. `READY` or exit code zero alone does not prove data integrity.

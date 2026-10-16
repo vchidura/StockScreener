@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
@@ -21,7 +21,7 @@ from realtime.orchestration_repository import (
     ServicePlan,
     WindowSpec,
 )
-from realtime.stage_graph import STAGES_V1, RESIDENT_SCHEDULES
+from realtime.stage_graph import STAGE_CATALOGS, STAGES_V1, STAGES_V2, RESIDENT_SCHEDULES
 from realtime.stage_orchestrator import (
     CatalogMismatch,
     MissingRunner,
@@ -70,6 +70,8 @@ class Harness:
         defaults.update(runners)
         kwargs.setdefault("clock", self.clock)
         kwargs.setdefault("database", self.database)
+        kwargs.setdefault("stages", STAGE_CATALOGS[self.plan.stage_catalog_version])
+        kwargs.setdefault("catalog_version", self.plan.stage_catalog_version)
         return StageOrchestrator(self.repository, defaults, **kwargs)
 
     def mark_reference_ready(self):
@@ -79,10 +81,10 @@ class Harness:
         return {stage: record.state for stage, record in self.repository.stage_states(window_id).items()}
 
 
-def _memory_harness(enabled=ALL) -> Harness:
-    plan = ServicePlan(uuid4(), uuid4(), date(2026, 10, 12), "stages_v1", frozenset(enabled), "a" * 64,
+def _memory_harness(enabled=ALL, *, catalog=STAGES_V1, version="stages_v1") -> Harness:
+    plan = ServicePlan(uuid4(), uuid4(), date(2026, 10, 12), version, frozenset(enabled), "a" * 64,
                        NOW + timedelta(hours=8))
-    repository = InMemoryOrchestrationRepository(plan)
+    repository = InMemoryOrchestrationRepository(plan, catalog)
     return Harness(
         repository, plan, Clock(),
         query_release=lambda: next(iter(repository.release.values()), None),
@@ -217,6 +219,66 @@ def test_a_slow_options_lane_does_not_delay_the_equity_lane(harness):
         window.window_id)
     assert harness.states(window.window_id)["OPTIONS_ACQUIRE"] == "COMPLETE"
     assert report.window_state == "COMPLETE"
+
+
+def test_a_slow_v2_portal_lane_does_not_delay_the_alert_lane():
+    enabled = frozenset({"STOCK_ALERTS", "EQUITY_PROJECTION"})
+    harness = _memory_harness(enabled, catalog=STAGES_V2, version="stages_v2")
+    harness.repository.upsert_readiness(
+        harness.plan.cohort_id, "EQUITY_MATERIALIZE", "stages_v2", "READY", (), None, NOW,
+    )
+    window = harness.window()
+    alerted = threading.Event()
+
+    def slow_projection(context):
+        return StageOutcome.complete() if alerted.wait(timeout=20) else StageOutcome.failed("ALERT_WAS_BLOCKED")
+
+    def publish_alert(context):
+        alerted.set()
+        return StageOutcome.complete()
+
+    report = harness.orchestrator({
+        "EQUITY_PROJECTION": slow_projection,
+        "STOCK_ALERTS": publish_alert,
+    }).run_window(window.window_id)
+    states = harness.states(window.window_id)
+    assert states["STOCK_ALERTS"] == states["EQUITY_PROJECTION"] == "COMPLETE"
+    assert report.window_state == "COMPLETE"
+
+
+def test_a_v2_alert_deadline_timeout_does_not_cancel_the_longer_portal_lane():
+    catalog = dict(STAGES_V2)
+    catalog["STOCK_ALERTS"] = replace(catalog["STOCK_ALERTS"], deadline_offset_seconds=1)
+    catalog["EQUITY_PROJECTION"] = replace(catalog["EQUITY_PROJECTION"], deadline_offset_seconds=3)
+    enabled = frozenset({"STOCK_ALERTS", "EQUITY_PROJECTION"})
+    harness = _memory_harness(enabled, catalog=catalog, version="stages_v2")
+    harness.repository.upsert_readiness(
+        harness.plan.cohort_id, "EQUITY_MATERIALIZE", "stages_v2", "READY", (), None, NOW,
+    )
+    window = harness.window(cutoff_offset=-90)
+    portal_finished = threading.Event()
+
+    def hung_alert(context):
+        while not context.is_cancelled():
+            time.sleep(0.01)
+        return StageOutcome.complete()
+
+    def slow_portal(context):
+        time.sleep(1.5)
+        portal_finished.set()
+        return StageOutcome.complete()
+
+    report = harness.orchestrator(
+        {"STOCK_ALERTS": hung_alert, "EQUITY_PROJECTION": slow_portal},
+        max_lane_seconds=5,
+        lane_grace_seconds=0,
+        heartbeat_seconds=0.1,
+    ).run_window(window.window_id)
+    states = harness.states(window.window_id)
+    assert portal_finished.is_set()
+    assert states["STOCK_ALERTS"] == "FAILED"
+    assert states["EQUITY_PROJECTION"] == "COMPLETE"
+    assert report.lane_errors == {"alert": "STAGE_TIMEOUT"}
 
 
 def test_an_equity_failure_blocks_only_its_declared_dependents(harness):
@@ -374,12 +436,12 @@ def test_resident_stage_failure_is_isolated_and_reported_through_readiness(harne
 def test_start_reports_scope_and_never_requires_options_for_an_equity_only_plan(memory):
     equity_only = _memory_harness(enabled=frozenset({"REFERENCE", *EQUITY}))
     report = equity_only.orchestrator({}).start(equity_only.plan.plan_id)
-    assert report.principal_profiles == frozenset({"runtime_data"})
+    assert report.lanes == frozenset({"data"})
     assert report.resident_stages == frozenset({"REFERENCE"})
     memory.repository.upsert_readiness(memory.plan.cohort_id, "OPTIONS_ADMISSION", "stages_v1", "BLOCKED",
                                        ("REQUIRED_STRATEGY_COVERAGE_UNAVAILABLE",), None, NOW)
     full = memory.orchestrator({}).start(memory.plan.plan_id)
-    assert full.principal_profiles == frozenset({"runtime_data", "runtime_options"})
+    assert full.lanes == frozenset({"data", "options"})
     assert EQUITY <= full.startable and "OPTIONS_FLOW" in full.startable
     assert {"OPTIONS_ADMISSION", "OPTIONS_CYCLE"} <= full.held
 
@@ -387,9 +449,9 @@ def test_start_reports_scope_and_never_requires_options_for_an_equity_only_plan(
 def test_start_fails_closed_on_catalog_drift_or_a_missing_runner(memory):
     drifted = dict(STAGES_V1)
     stage = drifted["OPTIONS_CYCLE"]
-    drifted["OPTIONS_CYCLE"] = type(stage)(stage.stage_id, stage.domain, ("EQUITY_EVIDENCE",),
-                                           stage.principal_profile, stage.capability_role, stage.schedule_kind,
-                                           stage.gates_strategy)
+    drifted["OPTIONS_CYCLE"] = type(stage)(
+        stage.stage_id, stage.domain, ("EQUITY_EVIDENCE",), stage.lane, stage.schedule_kind, stage.gates_strategy,
+    )
     memory.repository.catalog = drifted
     with pytest.raises(CatalogMismatch):
         memory.orchestrator({}).start(memory.plan.plan_id)
@@ -419,14 +481,14 @@ def test_a_hung_options_stage_times_out_without_starving_equity_or_later_windows
     states = harness.states(first.window_id)
     assert {states[name] for name in EQUITY - {"REFERENCE"}} == {"COMPLETE"}
     assert states["OPTIONS_ACQUIRE"] == "FAILED" and "OPTIONS_ADMISSION" not in states
-    assert report.lane_errors == {"runtime_options": "STAGE_TIMEOUT"}
+    assert report.lane_errors == {"options": "STAGE_TIMEOUT"}
     assert report.status == "PENDING_STAGES"
     assert ("OPTIONS_ACQUIRE", 1, "FAILED", ("STAGE_TIMEOUT",)) in harness.query_runs(first.window_id)
     assert harness.repository.readiness(harness.plan.cohort_id)["OPTIONS_ACQUIRE"] == "BLOCKED"
     # The abandoned runner finishes late: nothing it writes is accepted (no receipt, state unchanged).
     assert exited.wait(timeout=10)
     for thread in threading.enumerate():
-        if thread.name == "stage-lane-runtime_options":
+        if thread.name == "stage-lane-options":
             thread.join(timeout=10)
     assert harness.query_receipts(first.window_id) == 0
     assert harness.states(first.window_id)["OPTIONS_ACQUIRE"] == "FAILED"
@@ -484,7 +546,7 @@ def test_a_stage_that_ignores_cancellation_cannot_commit_ordinary_data_after_its
         release.set()
         assert exited.wait(timeout=10)
         for thread in threading.enumerate():
-            if thread.name == "stage-lane-runtime_options":
+            if thread.name == "stage-lane-options":
                 thread.join(timeout=10)
         assert outcomes == {"commit": "WriteFenceRejected", "reopen": "StageCancelled"}
         connection = database.getconn()
@@ -627,7 +689,7 @@ def test_a_repository_failure_in_one_lane_does_not_stop_the_other_lane(memory):
     class FlakyOptions(InMemoryOrchestrationRepository):
         def start_stage(self, claim, stage, version, attempt, now):
             if stage.domain == "options":
-                raise ConnectionError("options principal is locked")
+                raise ConnectionError("options store is unavailable")
             return super().start_stage(claim, stage, version, attempt, now)
 
     flaky = FlakyOptions(memory.plan)
@@ -640,5 +702,5 @@ def test_a_repository_failure_in_one_lane_does_not_stop_the_other_lane(memory):
     ).run_window(window.window_id)
     states = {stage: record.state for stage, record in flaky.stage_states(window.window_id).items()}
     assert {states[name] for name in EQUITY - {"REFERENCE"}} == {"COMPLETE"}
-    assert report.lane_errors == {"runtime_options": "ConnectionError"}
+    assert report.lane_errors == {"options": "ConnectionError"}
     assert report.status == "PENDING_STAGES"

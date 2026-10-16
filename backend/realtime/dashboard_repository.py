@@ -2,6 +2,8 @@
 from copy import deepcopy
 from datetime import datetime, timedelta
 
+import exchange_calendars
+
 from equity.calendar import latest_expected_market_time, staleness_state
 from equity.ticker_contracts import setup_summary_row
 
@@ -32,27 +34,49 @@ class DashboardQueryRejected(ValueError):
 def materialize_realtime_dashboard(database: RealtimeProcessDatabase,
                                    publication_database: RealtimeProcessDatabase, *,
                                    receipt=None, session_close=False, **scope):
-    if not isinstance(database, RealtimeProcessDatabase) or database.process_plan.role is not RealtimeDatabaseRole.COMPUTE:
-        raise ValueError("Realtime Dashboard production requires the target-local COMPUTE role")
-    if (not isinstance(publication_database, RealtimeProcessDatabase)
-            or publication_database.process_plan.role is not RealtimeDatabaseRole.PUBLICATION):
-        raise ValueError("Realtime Dashboard persistence requires the target-local PUBLICATION role")
-    with database.transaction(dict_cursor=True, read_only=True, isolation_level="REPEATABLE READ") as cursor:
-        inputs = load_realtime_screening_input(cursor, **scope)
-        snapshot = produce_realtime_dashboard(inputs)
+    snapshot = compute_realtime_dashboard(database, **scope)
     with publication_database.transaction() as cursor:
-        if session_close:
-            kept = persist_portal_snapshot_cursor(cursor, snapshot, retention=RETENTION_HOT_AND_KEPT)
-        else:
-            persist_portal_snapshot_cursor(cursor, snapshot)
+        published, kept = persist_realtime_dashboard_cursor(
+            cursor,
+            snapshot,
+            session_close=session_close,
+        )
         if receipt is not None:
-            publish_portal_release_cursor(cursor, receipt, (snapshot,))
+            publish_portal_release_cursor(cursor, receipt, published)
             if session_close:
                 publish_portal_release_cursor(
-                    cursor, receipt, (kept,), release_class=RELEASE_CLASS_SESSION_CLOSE,
+                    cursor,
+                    receipt,
+                    kept,
+                    release_class=RELEASE_CLASS_SESSION_CLOSE,
                     session_date=portal_session_date(snapshot),
                 )
     return snapshot
+
+
+def compute_realtime_dashboard(database: RealtimeProcessDatabase, **scope):
+    if not isinstance(database, RealtimeProcessDatabase) or database.process_plan.role is not RealtimeDatabaseRole.COMPUTE:
+        raise ValueError("Realtime Dashboard production requires the target-local COMPUTE role")
+    with database.transaction(dict_cursor=True, read_only=True, isolation_level="REPEATABLE READ") as cursor:
+        inputs = load_realtime_screening_input(
+            cursor,
+            include_portal_history=True,
+            include_strategy_action_details=True,
+            **scope,
+        )
+        return produce_realtime_dashboard(inputs)
+
+
+def persist_realtime_dashboard_cursor(cursor, snapshot, *, session_close=False):
+    if session_close:
+        kept = persist_portal_snapshot_cursor(
+            cursor,
+            snapshot,
+            retention=RETENTION_HOT_AND_KEPT,
+        )
+        return (snapshot,), (kept,)
+    persist_portal_snapshot_cursor(cursor, snapshot)
+    return (snapshot,), ()
 
 
 class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
@@ -181,25 +205,34 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                 evidence = payload.get("setup_evidence")
                 if summary is None or evidence is None:
                     raise DashboardPublicationUnavailable("Daily setup summary has no retained publication")
-                if (
+                header_drift = (
                     summary["interval"] != "1d" or summary["source"] != "MATERIALIZED_CURRENT_PROJECTION"
                     or summary["computed_at"] != payload["generated_at"]
-                    or summary["market_time"] != payload["market_time"]
                     or summary["analysis_run_id"] != manifest["setup_analysis_run_id"]
                     or summary["count"] != len(tickers)
                     or [row["ticker"] for row in summary["results"]] != tickers
                     or [row["ticker"] for row in evidence] != tickers
-                    or any(
-                        canonical_sha256(row["payload"]) != row["payload_sha256"]
-                        or row["market_time"] != payload["market_time"]
-                        or row["observed_at"] != payload["generated_at"]
-                        or row["analysis_run_id"] != summary["analysis_run_id"]
-                        or row["security_revision_id"] != str(reference["security_revision_id"])
-                        or setup_summary_row(row) != flattened
-                        for row, reference, flattened in zip(evidence, references, summary["results"])
-                    )
-                ):
-                    raise ValueError("All Tickers stored setup evidence/summary drift")
+                )
+                if header_drift:
+                    raise ValueError("All Tickers stored setup evidence/summary header drift")
+                for row, reference, flattened in zip(evidence, references, summary["results"]):
+                    drift = [
+                        name for name, mismatched in (
+                            ("payload_sha256", canonical_sha256(row["payload"]) != row["payload_sha256"]),
+                            ("market_time", row["market_time"] != summary["market_time"]),
+                            ("observed_at", row["observed_at"] != payload["generated_at"]),
+                            ("analysis_run_id", row["analysis_run_id"] != summary["analysis_run_id"]),
+                            ("security_revision_id", row["security_revision_id"]
+                             != str(reference["security_revision_id"])),
+                            ("flattened", setup_summary_row(row) != flattened),
+                        )
+                        if mismatched
+                    ]
+                    if drift:
+                        raise ValueError(
+                            "All Tickers stored setup evidence/summary row drift: "
+                            f"{row['ticker']} fields={','.join(drift)}"
+                        )
             deadline_expired = stored["valid_until"] is not None and cutoff >= stored["valid_until"]
             # A frozen session-close release stands on its own embedded hashes; only a live
             # (hot) publication must still match current reference and action data.
@@ -228,8 +261,19 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                 if cursor.fetchone()["action_drift"]:
                     raise DashboardPublicationUnavailable("Dashboard action evidence changed; republish required")
         delay = 15 if stored["provider_tier"] == "MASSIVE_DEVELOPER" else 0
-        expected = latest_expected_market_time(cutoff - timedelta(minutes=delay), "1d")
         actual = _utc(datetime.fromisoformat(payload["market_time"]), "Dashboard market time")
+        session_close = exchange_calendars.get_calendar("XNYS").session_close(
+            str(payload["session"])
+        ).to_pydatetime()
+        availability_interval = (
+            "1d"
+            if actual == session_close
+            else "5m"
+        )
+        expected = latest_expected_market_time(
+            cutoff - timedelta(minutes=delay),
+            availability_interval,
+        )
         if actual > expected:
             raise DashboardPublicationUnavailable("Dashboard is ahead of the provider-qualified watermark")
         state = staleness_state(actual, expected, is_fresh=actual == expected)

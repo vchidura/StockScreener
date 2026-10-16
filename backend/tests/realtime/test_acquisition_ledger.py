@@ -78,7 +78,8 @@ def test_ledger_rows_use_the_v2_completeness_and_price_basis_columns():
 def test_reservation_conflicts_are_rejected_and_finish_is_idempotent_only_when_identical():
     cursor = MagicMock()
     cursor.fetchone.return_value = (
-        str(REQUEST), "developer", "OPTIONS_CHAIN", str(COHORT), None, None, "aggs_minute", "a" * 64, 1,
+        str(REQUEST), "developer", "OPTIONS_CHAIN", str(COHORT), None, None,
+        "aggs_minute", "a" * 64, 1, None, None, None, None, None, None,
     )
     with pytest.raises(ValueError, match="ledger identity conflict"):
         reserve_provider_request_cursor(cursor, _reservation())
@@ -96,6 +97,20 @@ def test_reservation_conflicts_are_rejected_and_finish_is_idempotent_only_when_i
     cursor.fetchone.return_value = None
     with pytest.raises(ValueError, match="not reserved"):
         finish_provider_request_cursor(cursor, REQUEST, completion)
+
+
+def test_coordinated_reservation_fields_are_all_or_none():
+    with pytest.raises(ValueError, match="all present"):
+        _reservation(budget_scope_sha256="b" * 64)
+    coordinated = _reservation(
+        budget_scope_sha256="b" * 64,
+        budget_session_date=NOW.date(),
+        authorization_reference="approved",
+        reserved_response_bytes=2_001,
+        account_request_ceiling=10,
+        account_decoded_byte_ceiling=20_000,
+    )
+    assert coordinated.reserved_response_bytes == 2_001
 
 
 @pytest.mark.parametrize(
@@ -163,7 +178,8 @@ def test_watermark_only_moves_forward_and_a_gap_needs_a_reason():
     assert advance_acquisition_watermark_cursor(cursor, _watermark()) is True
 
     statement, parameters = cursor.execute.call_args.args
-    assert "rt.acquisition_watermarks.last_complete_bar_end < EXCLUDED.last_complete_bar_end" in statement
+    assert "rt.acquisition_watermarks.last_examined_bar_end" in statement
+    assert "EXCLUDED.last_complete_bar_end IS NULL" in statement
     assert "terminal_state = 'GAP'" in statement
     assert parameters[:4] == (str(COHORT), 7, "1m", "NATIVE_REST")
     cursor.fetchone.return_value = None
@@ -172,13 +188,33 @@ def test_watermark_only_moves_forward_and_a_gap_needs_a_reason():
         _watermark(terminal_state=WatermarkTerminalState.GAP)
     gap = _watermark(terminal_state=WatermarkTerminalState.NO_TRADE, reason_codes=("NO_TRADES_IN_MINUTE",))
     assert gap.reason_codes == ("NO_TRADES_IN_MINUTE",)
+    unresolved = _watermark(
+        last_complete_bar_end=None,
+        last_examined_bar_end=NOW,
+        terminal_state=WatermarkTerminalState.GAP,
+        reason_codes=("MISSING_MINUTE",),
+    )
+    assert unresolved.last_complete_bar_end is None
+    assert unresolved.last_examined_bar_end == NOW
+    with pytest.raises(ValueError, match="examined boundary to be complete"):
+        _watermark(
+            last_complete_bar_end=NOW - timedelta(minutes=1),
+            last_examined_bar_end=NOW,
+        )
     with pytest.raises(ValueError, match="interval is unsupported"):
         _watermark(interval="2m")
 
 
 def test_watermark_round_trips_from_its_row():
     cursor = MagicMock()
-    cursor.fetchone.return_value = (NOW, "developer_rest_overlap_v1", "COMPLETE", [], str(REQUEST))
+    cursor.fetchone.return_value = (
+        NOW,
+        NOW,
+        "developer_rest_overlap_v1",
+        "COMPLETE",
+        [],
+        str(REQUEST),
+    )
     loaded = load_acquisition_watermark_cursor(
         cursor, cohort_id=COHORT, instrument_id=7, interval="1m", source_kind="NATIVE_REST",
     )

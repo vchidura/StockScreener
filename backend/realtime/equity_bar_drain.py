@@ -114,6 +114,7 @@ def drain_equity_bar_jobs(
     lease_seconds: int = LEASE_SECONDS,
     maximum_attempts: int = MAXIMUM_ATTEMPTS,
     retry_delay_seconds: int = RETRY_DELAY_SECONDS,
+    acquisition_batch_ids: tuple[UUID, ...] | None = None,
 ) -> EquityBarDrainResult:
     """Materialize pending equity acquisition batches of one cohort into rt.bar_*, under the compute role.
 
@@ -125,6 +126,21 @@ def drain_equity_bar_jobs(
         raise ValueError("equity bar materialization requires the compute database role")
     if max_jobs < 1 or not 1 <= discovery_limit <= 100 or not 1 <= claim_limit <= 100:
         raise ValueError("equity bar materialization bounds are invalid")
+    if acquisition_batch_ids is not None and (
+        type(acquisition_batch_ids) is not tuple
+        or not acquisition_batch_ids or len(acquisition_batch_ids) > 100
+        or len(set(acquisition_batch_ids)) != len(acquisition_batch_ids)
+        or any(not isinstance(value, UUID) for value in acquisition_batch_ids)
+    ):
+        raise ValueError("equity bar materialization batch scope is invalid")
+    claim_scope = (
+        {"source_revision_ids": acquisition_batch_ids}
+        if acquisition_batch_ids is not None else {}
+    )
+    discovery_scope = (
+        {"acquisition_batch_ids": acquisition_batch_ids}
+        if acquisition_batch_ids is not None else {}
+    )
     discovered = claimed_total = completed = retried = failed = blocked = bars = 0
     # Every pass claims a job or discovers new ones, and discovery finds nothing twice, so this only
     # guards against a defect in a stubbed dependency.
@@ -136,12 +152,13 @@ def drain_equity_bar_jobs(
             claimed = claim_materialization_jobs_cursor(
                 cursor, job_kind=DEVELOPER_EQUITY_ACQUISITION_JOB, lease_owner=lease_owner,
                 lease_seconds=lease_seconds, maximum_attempts=maximum_attempts,
-                limit=min(claim_limit, max_jobs - claimed_total), cohort_id=cohort_id)
+                limit=min(claim_limit, max_jobs - claimed_total), cohort_id=cohort_id,
+                **claim_scope)
         if not claimed:
             _checkpoint(should_stop)
             queued = enqueue_pending_developer_acquisition_jobs(
                 database, cohort_id=cohort_id, fact_kind=DeveloperAcquisitionFactKind.EQUITY_BAR,
-                limit=min(discovery_limit, max_jobs - claimed_total))
+                limit=min(discovery_limit, max_jobs - claimed_total), **discovery_scope)
             discovered += len(queued)
             if not queued:
                 break

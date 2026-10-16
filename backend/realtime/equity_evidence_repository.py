@@ -619,6 +619,7 @@ _EVIDENCE_COLUMNS = (
     "qualification_revision_id, payload, payload_sha256, "
     "materialization_input_sha256, source_window_id, source_window_role"
 )
+_VERIFY_EVIDENCE_CHUNK = 2_000
 
 
 def _stored_source_window(row) -> tuple:
@@ -972,6 +973,48 @@ def _latest_feature_current_values(prepared_rows):
         if previous is None or prepared.generation > previous.generation:
             latest[key] = prepared
     return tuple(_feature_current_values(prepared) for prepared in latest.values())
+
+
+def verify_realtime_equity_materializations_persisted_cursor(
+    cursor, writes: Sequence[RealtimeEquityMaterializationWrite],
+) -> int:
+    """Read-only: raise ValueError unless every evidence row the writes imply is already persisted with the
+    identity (key, payload digest, source window and role) the writes compute. Returns the evidence rows
+    checked. It is the check a recovery makes before it publishes snapshots that name this evidence without
+    having computed (and so persisted) it in the same process."""
+    requested = tuple(writes)
+    prepared = tuple(
+        _prepare_realtime_equity_materialization(
+            row.result, row.definition, generation=row.generation,
+            update_evidence_current=row.update_evidence_current,
+        )
+        for row in requested
+    )
+    if not prepared:
+        return 0
+    cohort_ids = {row.result.cohort_id for row in prepared}
+    if len(cohort_ids) != 1:
+        raise ValueError("realtime equity materialization verification cannot mix cohorts")
+    cohort_id = str(next(iter(cohort_ids)))
+    expected = {}
+    for row in prepared:
+        expected.update(row.expected_evidence)
+    evidence_ids = sorted(expected)
+    persisted = {}
+    for offset in range(0, len(evidence_ids), _VERIFY_EVIDENCE_CHUNK):
+        cursor.execute(
+            "SELECT evidence_id, evidence_key, payload_sha256, source_window_id, source_window_role "
+            "FROM rt.equity_evidence WHERE cohort_id=%s AND evidence_id=ANY(%s::uuid[])",
+            (cohort_id, evidence_ids[offset:offset + _VERIFY_EVIDENCE_CHUNK]),
+        )
+        for stored in cursor.fetchall():
+            if isinstance(stored, Mapping):
+                stored = (stored["evidence_id"], stored["evidence_key"], stored["payload_sha256"],
+                          stored["source_window_id"], stored["source_window_role"])
+            persisted[str(stored[0])] = (stored[1], stored[2], str(stored[3]), stored[4])
+    if persisted != expected:
+        raise ValueError("realtime equity evidence is not persisted as the materializations require")
+    return len(expected)
 
 
 def persist_realtime_equity_materialization_batch_cursor(

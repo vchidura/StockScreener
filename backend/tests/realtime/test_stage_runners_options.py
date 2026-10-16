@@ -38,11 +38,18 @@ from realtime.orchestration_repository import ServicePlan
 from realtime.runner_environment import RunnerEnvironment
 from realtime.stage_orchestrator import StageContext, StageOutcome
 from realtime.stage_runners_options import (
+    OPTIONS_ACQUIRE_INCOMPLETE,
+    OPTIONS_ACQUIRE_NOT_CONFIGURED,
+    OPTIONS_ADMISSION_NOT_CONFIGURED,
     OPTIONS_FLOW_CONDITIONS_UNPINNED,
     OPTIONS_FLOW_POLICY_NOT_CONFIGURED,
     OPTIONS_FLOW_SOURCE_NOT_CONFIGURED,
     REPLAY_DIVERGENCE,
+    OptionsAcquireResult,
+    OptionsAdmissionResult,
     OptionsFlowSettings,
+    options_acquire_runner,
+    options_admission_runner,
     options_flow_block_reason,
     options_flow_runner,
 )
@@ -121,13 +128,57 @@ def test_the_runner_is_registered_and_reported_as_fail_closed_until_configured()
     from realtime.stage_runners_v2 import RUNNER_FACTORIES, build_runners, fail_closed_stages, unwired_stages
 
     assert RUNNER_FACTORIES["OPTIONS_FLOW"] is options_flow_runner
-    assert unwired_stages() == {"OPTIONS_ACQUIRE", "OPTIONS_ADMISSION", "OPTIONS_CYCLE"}
+    assert RUNNER_FACTORIES["OPTIONS_ACQUIRE"] is options_acquire_runner
+    assert RUNNER_FACTORIES["OPTIONS_ADMISSION"] is options_admission_runner
+    assert unwired_stages() == {"OPTIONS_CYCLE"}
     assert set(build_runners({"OPTIONS_FLOW"}, None)) == {"OPTIONS_FLOW"}
-    assert fail_closed_stages({"OPTIONS_FLOW"}, RunnerEnvironment(None)) == {
-        "OPTIONS_FLOW": OPTIONS_FLOW_SOURCE_NOT_CONFIGURED}
+    assert fail_closed_stages(
+        {"OPTIONS_ACQUIRE", "OPTIONS_ADMISSION", "OPTIONS_FLOW"}, RunnerEnvironment(None)
+    ) == {
+        "OPTIONS_ACQUIRE": OPTIONS_ACQUIRE_NOT_CONFIGURED,
+        "OPTIONS_ADMISSION": OPTIONS_ADMISSION_NOT_CONFIGURED,
+        "OPTIONS_FLOW": OPTIONS_FLOW_SOURCE_NOT_CONFIGURED,
+    }
     configured = RunnerEnvironment(None, options_flow_source=SpySource(MockOptionFeed()),
                                    options_flow_semantics=pinned_semantics(), options_flow_policy=policy())
     assert fail_closed_stages({"OPTIONS_FLOW"}, configured) == {}
+
+
+def test_acquire_and_admission_actions_are_typed_complete_and_fail_closed():
+    world = harness(None)
+    window = world.orchestrator._placeholder_window(world.plan, NOW)
+    acquire_context = StageContext(
+        world.plan, window, world.orchestrator._stages["OPTIONS_ACQUIRE"],
+        uuid4(), 1, NOW, None,
+    )
+    admission_context = StageContext(
+        world.plan, window, world.orchestrator._stages["OPTIONS_ADMISSION"],
+        uuid4(), 1, NOW, None,
+    )
+    run_id, selection_id, cohort_id = uuid4(), uuid4(), uuid4()
+    environment = RunnerEnvironment(
+        None,
+        options_acquire_action=lambda _: OptionsAcquireResult(
+            run_id, ("SPY", "QQQ"), ("SPY",), 2, 100
+        ),
+        options_admission_action=lambda _: OptionsAdmissionResult(
+            selection_id, "BLOCKED", ("REQUIRED_STRATEGY_COVERAGE_UNAVAILABLE",)
+        ),
+    )
+    acquire = options_acquire_runner(environment)(acquire_context)
+    assert (acquire.state, acquire.reason_codes) == ("FAILED", (OPTIONS_ACQUIRE_INCOMPLETE,))
+    admission = options_admission_runner(environment)(admission_context)
+    assert admission.state == "BLOCKED_POLICY"
+    assert admission.reason_codes == ("REQUIRED_STRATEGY_COVERAGE_UNAVAILABLE",)
+
+    environment.options_acquire_action = lambda _: OptionsAcquireResult(
+        run_id, ("SPY", "QQQ"), ("QQQ", "SPY"), 4, 200
+    )
+    environment.options_admission_action = lambda _: OptionsAdmissionResult(
+        selection_id, "READY", (), cohort_id, 1, 12
+    )
+    assert options_acquire_runner(environment)(acquire_context).state == "COMPLETE"
+    assert options_admission_runner(environment)(admission_context).state == "COMPLETE"
 
 
 def test_the_runner_module_builds_no_gateway_websocket_or_http_client():
@@ -149,8 +200,7 @@ def test_a_tick_without_a_checkpoint_starts_warming_and_reports_why():
     outcome = world.tick()
     assert outcome.state == "COMPLETE" and outcome.reason_codes == ("OPTIONS_FLOW_WARMING:NO_CHECKPOINT",)
     assert world.readiness()[0] == "DEGRADED"
-    assert world.database.roles(write=True) == {"options_compute"}
-    assert world.database.role_violations == []
+    assert world.database.roles(write=True) == {"app"}
 
 
 def test_a_current_stage_is_ready_and_its_evidence_names_the_offsets():
@@ -255,10 +305,11 @@ def test_a_gateway_reconnect_a_lost_frame_and_an_offset_hole_are_persisted_as_ga
     # One row per gap and engine shard (the engine reports every shard), all unresolved, channel unspecified.
     assert len(world.database.gaps) == 4 * 2 and {entry[3] for entry in world.database.gaps.values()} == {None}
     log = world.database.commit_log
-    first_gap = log.index(("options_ingress", False))
-    assert first_gap < log.index(("options_compute", False), 1)  # the gap transaction commits before any flush...
-    flushes_before = [item for item in log[:first_gap] if item == ("options_compute", False)]
-    assert flushes_before == []
+    gap_commits = [index for index, (_, _, tables) in enumerate(log) if "rt.stream_gaps" in tables]
+    flush_tables = {"rt.option_flow_events", "rt.option_flow_clusters", "rt.option_volume_checkpoints"}
+    flush_commits = [index for index, (_, _, tables) in enumerate(log) if tables & flush_tables]
+    assert gap_commits and flush_commits
+    assert gap_commits[0] < flush_commits[0]  # the gap transaction commits before any flush
     # The affected accumulators are INCOMPLETE in the persisted volume checkpoints.
     assert {row["baseline_kind"] for row in world.database.volume_rows()} == {"INCOMPLETE"}
 
@@ -529,25 +580,21 @@ def test_a_source_that_goes_backwards_or_changes_generation_fails_the_tick_with_
     assert "secret" not in repr(outcome) and "secret" not in repr(broken.readiness())
 
 
-def test_every_relation_the_runner_writes_is_writable_by_the_capability_role_it_uses():
+def test_every_relation_the_runner_writes_is_writable_by_the_app_role():
     import re
     from pathlib import Path
 
     from realtime.option_flow import checkpoint_state
-    from realtime.relation_registry import DEFAULT_READ_ROLES, PRINCIPAL_PROFILES, RELATIONS
+    from realtime.relation_registry import RELATIONS, grants
 
-    assert {"options_compute", "options_ingress"} <= set(PRINCIPAL_PROFILES["runtime_options"])
-    # the writer's flush transaction (options_compute): rows, volume state and the checkpoint commit together
+    # the writer's flush transaction: rows, volume state and the checkpoint commit together as app
     for table in ("rt.option_flow_events", "rt.option_flow_clusters", "rt.option_volume_checkpoints",
-                  "rt.consumer_checkpoints"):
-        assert "options_compute" in RELATIONS[table].insert, table
-    assert "options_compute" in RELATIONS["rt.option_volume_checkpoints"].update
-    assert "options_compute" in RELATIONS["rt.consumer_checkpoints"].update  # the checkpoint upsert and the advance
-    # gap rows are an ingress relation: options_compute may not write them, options_ingress may
-    assert "options_ingress" in RELATIONS["rt.stream_gaps"].insert
-    assert "options_compute" not in RELATIONS["rt.stream_gaps"].insert
-    for table in ("ref.oi_baselines", "ref.option_contracts"):
-        assert "options_compute" in DEFAULT_READ_ROLES and RELATIONS[table].insert == ("references",)
+                  "rt.consumer_checkpoints", "rt.stream_gaps"):
+        assert "app" in grants()[table]["INSERT"], table
+    for table in ("rt.option_volume_checkpoints", "rt.consumer_checkpoints", "rt.stream_gaps"):
+        assert "app" in grants()[table]["UPDATE"] and RELATIONS[table].writes == "MUTABLE", table  # upserts
+    for table in ("ref.oi_baselines", "ref.option_contracts"):  # read to load the prior open interest
+        assert "app" in grants()[table]["SELECT"], table
     # and the only tables the runner modules write themselves are exactly those two
     written = set()
     for module in (runners, checkpoint_state):

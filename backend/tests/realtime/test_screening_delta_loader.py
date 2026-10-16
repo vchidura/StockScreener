@@ -76,7 +76,9 @@ def in_window(row: dict, history: tuple, portal: bool) -> bool:
             (basis == ADJ and interval == "1d" and history[0] <= day <= history[1])
             or (basis == ADJ and interval == "1wk" and history[2] <= day <= history[3])
             or (basis == ADJ and interval == "1mo" and history[4] <= day <= history[5])
-            or (basis == RAW and interval in ("1m", "5m", "15m", "30m", "1h", "1d") and history[6] <= day <= history[7])
+            or (basis == RAW and interval == "1d" and history[6] <= day <= history[7])
+            or (basis == RAW and interval in ("1m", "5m", "15m", "30m", "1h")
+                and history[8] <= day <= history[9])
         )
     return (
         (interval == "1d" and basis == ADJ and history[0] <= day <= history[1])
@@ -221,7 +223,7 @@ class FakeCursor:
     def _candidates(self, params, portal):
         cohort, tier, tickers, *rest = params
         history = tuple(rest[5:])
-        assert len(history) == (8 if portal else 6)
+        assert len(history) == (10 if portal else 6)
         cutoff, known_by = self._clocks(rest[:5])
         return [row for row in self.db.rows if row["_committed"]
                 and str(row["cohort_id"]) == cohort and row["provider_tier"] == tier
@@ -236,7 +238,7 @@ class FakeCursor:
     def _winners(self, sql, params):
         portal = "interval='1wk'" in sql
         with_state = " AS visible_total" in sql
-        size = 3 + 5 + (8 if portal else 6)
+        size = 3 + 5 + (10 if portal else 6)
         assert len(params) == size * (2 if with_state else 1)
         if with_state:
             assert params[:size] == params[size:]
@@ -260,7 +262,7 @@ class FakeCursor:
 
     def _delta(self, sql, params):
         portal = "interval='1wk'" in sql
-        size = 3 + 5 + (8 if portal else 6)
+        size = 3 + 5 + (10 if portal else 6)
         assert len(params) == 2 * size + 5
         assert params[:size] == params[size:2 * size]
         previous_cutoff, previous_known_by = self._clocks(params[2 * size:])
@@ -595,7 +597,7 @@ def test_new_session_rolls_the_window_with_a_full_reload():
     database.add(start=next_open)
     rolled, _ = agree(database, loader, next_open + 20 * MINUTE, session=NEXT_SESSION)
     assert loader.last_report.mode == "full" and loader.last_report.reason == "WINDOW_CHANGED"
-    assert edge_bar["bar_revision_id"] not in ids_of(rolled)
+    assert edge_bar["bar_revision_id"] in ids_of(rolled)
     database.add(start=next_open + 20 * MINUTE)
     agree(database, loader, next_open + 40 * MINUTE, session=NEXT_SESSION)
     assert loader.last_report.mode == "delta" and loader.last_report.bar_rows_read == 1

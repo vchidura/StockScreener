@@ -4,13 +4,14 @@ from datetime import datetime
 from typing import Sequence
 from uuid import UUID
 
-from equity.derivation import derive_canonical_bars, derive_five_minute_bars
+from equity.derivation import derive_canonical_bars, derive_five_minute_bars, derive_minute_bars
 from equity.domain import SecurityReferenceRevision
 
 from .equity_bar_adapter import RealtimeEquityBarFact, adapt_derived_equity_bar
 
 
 REALTIME_DERIVATION_SOURCES = {
+    "5m": ("1m", False),
     "15m": ("5m", False),
     "30m": ("5m", False),
     "1h": ("5m", False),
@@ -53,22 +54,19 @@ def derive_realtime_interval_facts(
         raise ValueError("realtime derivation source identity changed")
     cohort_id, provider_tier, instrument_id = next(iter(identities))
     revisions = tuple(fact.revision for fact in candidates)
-    derived = (
-        derive_five_minute_bars(
-            security,
-            revisions,
-            target_interval=target_interval,
-            observed_at=observed_at,
-            ingestion_segment_id=ingestion_segment_id,
-        )
+    derive = (
+        derive_minute_bars
+        if source_interval == "1m"
+        else derive_five_minute_bars
         if source_interval == "5m"
-        else derive_canonical_bars(
+        else derive_canonical_bars
+    )
+    derived = derive(
             security,
             revisions,
             target_interval=target_interval,
             observed_at=observed_at,
             ingestion_segment_id=ingestion_segment_id,
-        )
     )
     return tuple(
         adapt_derived_equity_bar(

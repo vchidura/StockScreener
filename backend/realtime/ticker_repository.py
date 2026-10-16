@@ -22,8 +22,9 @@ from .equity_evidence_repository import (
     load_release_evidence_bodies_cursor,
     persist_realtime_equity_materialization_batch_cursor,
     resolve_release_evidence_refs_cursor,
+    verify_realtime_equity_materializations_persisted_cursor,
 )
-from .lineage_head import mapping_identity, reference_set, require_member_set, workspace_set
+from .lineage_head import inputs_sha256, mapping_identity, reference_set, require_member_set, workspace_set
 from .portal_compatibility_repository import (
     SNAPSHOT_IDENTITY_RELATION, SNAPSHOT_RELATION, BoundedCache, _RealtimeCompatibilityRepository,
     _active_cohort, _utc, _TICKER_PATTERN,
@@ -250,19 +251,14 @@ class TickerCycle:
     pattern_publication: object
 
 
-def compute_realtime_ticker_cycle(
-    compute_database: RealtimeProcessDatabase, *, state: TickerProjectionState | None = None,
-    loader=None, **scope,
-) -> TickerCycle:
-    """EQUITY_EVIDENCE half: load inputs, project (incrementally with `state`) and persist the
-    evidence. Nothing is published. `loader` is the runner's long-lived `ScreeningInputLoader`
-    (delta loads); without it every retained bar is re-read. `scope` carries cohort_id, session, cutoff (the
-    market boundary), source_generation and optionally `known_by` (when a bar must have been recorded, not
-    before the cutoff; default the cutoff), all forwarded unchanged to the loader."""
-    if not isinstance(compute_database, RealtimeProcessDatabase) or compute_database.process_plan.role is not RealtimeDatabaseRole.COMPUTE:
-        raise ValueError("Realtime ticker production requires the target-local COMPUTE role")
+class CycleRehydrationMismatch(ValueError):
+    """The cycle rebuilt from durable data is not the one the EQUITY_CYCLE receipt names."""
+
+
+def _project_ticker_cycle(database: RealtimeProcessDatabase, *, state, loader, scope):
+    """Read-only half shared by compute and rehydration: load the inputs and project the cycle."""
     load_inputs = loader.load if loader is not None else load_realtime_screening_input
-    with compute_database.transaction(
+    with database.transaction(
         read_only=True, dict_cursor=True, isolation_level="REPEATABLE READ",
     ) as cursor:
         inputs = load_inputs(cursor, **scope, include_portal_history=True)
@@ -280,10 +276,15 @@ def compute_realtime_ticker_cycle(
         snapshots = projection.snapshots
         summary = produce_realtime_ticker_workspace_summary(inputs, snapshots, projection.summary_charts)
         pattern_publication = produce_realtime_pattern_watch_publication(inputs, snapshots)
-    _verify_ticker_evidence_parity(projection)
-    history_policy_sha256 = snapshots[0].source_manifest["history_policy_sha256"]
+    return inputs, projection, summary, pattern_publication
+
+
+def _materialization_write_groups(projection, inputs):
+    """The evidence writes of a cycle: the workspace materializations (they move the evidence-current pointer),
+    then the Pattern Watch ones (they do not)."""
+    history_policy_sha256 = projection.snapshots[0].source_manifest["history_policy_sha256"]
     for results, pattern_watch in ((projection.materializations, False), (projection.pattern_materializations, True)):
-        writes = tuple(
+        yield tuple(
             RealtimeEquityMaterializationWrite(
                 result=result,
                 definition=_ticker_feature_definition(result, history_policy_sha256, pattern_watch=pattern_watch),
@@ -292,6 +293,25 @@ def compute_realtime_ticker_cycle(
             )
             for result in results
         )
+
+
+def compute_realtime_ticker_cycle(
+    compute_database: RealtimeProcessDatabase, *, state: TickerProjectionState | None = None,
+    loader=None, **scope,
+) -> TickerCycle:
+    """EQUITY_EVIDENCE half: load inputs, project (incrementally with `state`) and persist the
+    evidence. Nothing is published. `loader` is the runner's long-lived `ScreeningInputLoader`
+    (delta loads); without it every retained bar is re-read. `scope` carries cohort_id, session, cutoff (the
+    market boundary), source_generation and optionally `known_by` (when a bar must have been recorded, not
+    before the cutoff; default the cutoff), all forwarded unchanged to the loader."""
+    if not isinstance(compute_database, RealtimeProcessDatabase) or compute_database.process_plan.role is not RealtimeDatabaseRole.COMPUTE:
+        raise ValueError("Realtime ticker production requires the target-local COMPUTE role")
+    inputs, projection, summary, pattern_publication = _project_ticker_cycle(
+        compute_database, state=state, loader=loader, scope=scope,
+    )
+    snapshots = projection.snapshots
+    _verify_ticker_evidence_parity(projection)
+    for writes in _materialization_write_groups(projection, inputs):
         for offset in range(0, len(writes), TICKER_EVIDENCE_CHUNK_SIZE):
             with compute_database.transaction() as cursor:
                 persist_realtime_equity_materialization_batch_cursor(
@@ -323,36 +343,87 @@ def _require_workspace_generation(inputs, snapshots, generation):
         raise ValueError("Ticker screening generation does not match the cycle's workspaces")
 
 
+def rehydrate_realtime_ticker_cycle(
+    publication_database: RealtimeProcessDatabase, *, input_sha256: str, universe_sha256: str, **scope,
+) -> TickerCycle:
+    """PORTAL_PUBLISH recovery when the in-process hand-off is gone (a restart between the two stages).
+
+    Rebuilds the cycle EQUITY_EVIDENCE computed from durable rows only, read-only under the PUBLICATION
+    role: a stateless full load (the same `scope`, in particular `known_by` = the window deadline, so a bar
+    recorded after the window is invisible) and a cold projection. It is deterministic, and the durable
+    state proves it: the rebuilt input and universe identities must equal the ones the EQUITY_CYCLE receipt
+    names, and every evidence row the rebuilt materializations name must be persisted with the identity they
+    imply (a different build or policy would name evidence that was never written). Otherwise
+    CycleRehydrationMismatch: fail closed, nothing is published from a cycle the evidence stage did not
+    compute. Nothing is written. The cost is a cold projection (about 1.3 s per ticker on the quiet
+    reference machine); the long-lived loader and projection state are deliberately not touched, since the
+    window may be older than what they hold."""
+    if not isinstance(publication_database, RealtimeProcessDatabase) or publication_database.process_plan.role is not RealtimeDatabaseRole.PUBLICATION:
+        raise ValueError("Realtime ticker rehydration requires the target-local PUBLICATION role")
+    inputs, projection, summary, pattern_publication = _project_ticker_cycle(
+        publication_database, state=None, loader=None, scope=scope,
+    )
+    if inputs_sha256(inputs) != input_sha256 or reference_set(inputs.members)["sha256"] != universe_sha256:
+        raise CycleRehydrationMismatch("the rebuilt cycle is not the one the EQUITY_CYCLE receipt names")
+    try:
+        with publication_database.transaction(read_only=True, dict_cursor=True) as cursor:
+            for writes in _materialization_write_groups(projection, inputs):
+                verify_realtime_equity_materializations_persisted_cursor(cursor, writes)
+    except ValueError as error:
+        raise CycleRehydrationMismatch(str(error)) from error
+    generation = projection.screening_generation
+    if generation is not None:
+        _require_workspace_generation(inputs, projection.snapshots, generation)
+        projection = replace(projection, screening_generation=None)
+    return TickerCycle(inputs, projection, summary, pattern_publication)
+
+
 def publish_realtime_ticker_cycle(
     publication_database: RealtimeProcessDatabase, cycle: TickerCycle, *, receipt=None, session_close=False,
 ):
     """PORTAL_PUBLISH half: persist the cycle's snapshots and publish the release for `receipt`."""
     if not isinstance(publication_database, RealtimeProcessDatabase) or publication_database.process_plan.role is not RealtimeDatabaseRole.PUBLICATION:
         raise ValueError("Realtime ticker persistence requires the target-local PUBLICATION role")
-    snapshots, summary = cycle.projection.snapshots, cycle.summary
-    pattern_publication = cycle.pattern_publication
     with publication_database.transaction() as cursor:
-        for snapshot in snapshots:
-            persist_portal_snapshot_cursor(cursor, snapshot)
-        if session_close:
-            kept = (
-                persist_portal_snapshot_cursor(
-                    cursor, summary, retention=RETENTION_HOT_AND_KEPT,
-                    kept_snapshot=_session_close_summary(summary, snapshots),
-                ),
-                persist_portal_snapshot_cursor(cursor, pattern_publication, retention=RETENTION_HOT_AND_KEPT),
-            )
-        else:
-            persist_portal_snapshot_cursor(cursor, summary)
-            persist_portal_snapshot_cursor(cursor, pattern_publication)
+        published, kept = persist_realtime_ticker_cycle_cursor(
+            cursor,
+            cycle,
+            session_close=session_close,
+        )
         if receipt is not None:
-            publish_portal_release_cursor(cursor, receipt, (*snapshots, summary, pattern_publication))
+            publish_portal_release_cursor(cursor, receipt, published)
             if session_close:
                 publish_portal_release_cursor(
                     cursor, receipt, kept, release_class=RELEASE_CLASS_SESSION_CLOSE,
-                    session_date=portal_session_date(summary),
+                    session_date=portal_session_date(cycle.summary),
                 )
-    return snapshots
+    return cycle.projection.snapshots
+
+
+def persist_realtime_ticker_cycle_cursor(cursor, cycle: TickerCycle, *, session_close=False):
+    snapshots, summary = cycle.projection.snapshots, cycle.summary
+    pattern_publication = cycle.pattern_publication
+    for snapshot in snapshots:
+        persist_portal_snapshot_cursor(cursor, snapshot)
+    if session_close:
+        kept = (
+            persist_portal_snapshot_cursor(
+                cursor,
+                summary,
+                retention=RETENTION_HOT_AND_KEPT,
+                kept_snapshot=_session_close_summary(summary, snapshots),
+            ),
+            persist_portal_snapshot_cursor(
+                cursor,
+                pattern_publication,
+                retention=RETENTION_HOT_AND_KEPT,
+            ),
+        )
+    else:
+        persist_portal_snapshot_cursor(cursor, summary)
+        persist_portal_snapshot_cursor(cursor, pattern_publication)
+        kept = ()
+    return (*snapshots, summary, pattern_publication), kept
 
 
 def materialize_realtime_ticker_workspace(
@@ -432,7 +503,10 @@ def _availability(market_time, cutoff, interval):
     expected = latest_expected_market_time(cutoff - timedelta(minutes=15), interval)
     actual = _stamp(market_time)
     if actual > expected:
-        raise TickerPublicationUnavailable("Ticker source is ahead of the provider-qualified watermark")
+        raise TickerPublicationUnavailable(
+            "Ticker source is ahead of the provider-qualified watermark: "
+            f"interval={interval} actual={actual.isoformat()} expected={expected.isoformat()}"
+        )
     state = staleness_state(actual, expected, is_fresh=actual == expected)
     return dict(state, expected_market_time=expected.isoformat())
 
@@ -534,6 +608,36 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
         if len(tickers) != len(set(tickers)) or any(not _TICKER_PATTERN.fullmatch(ticker) for ticker in tickers):
             raise ValueError("Ticker catalog stored identity drift")
         return tickers
+
+    def trading_sessions(self, *, interval, limit, available_by, cohort_id=None):
+        cutoff = _utc(available_by, "available_by")
+        if cohort_id is None:
+            raise ValueError("Realtime trading sessions require an explicit cohort")
+        if interval not in {"1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"}:
+            raise ValueError("Realtime trading session interval is unsupported")
+        if type(limit) is not int or not 1 <= limit <= 2_000:
+            raise ValueError("Realtime trading session limit must be in [1, 2000]")
+        with self._cursor() as cursor:
+            self._begin(cursor)
+            cursor.execute(
+                "SELECT DISTINCT session_date FROM rt.bar_catalog "
+                "WHERE cohort_id=%s AND interval=%s AND observed_at<=%s "
+                "ORDER BY session_date DESC LIMIT %s",
+                (str(cohort_id), interval, cutoff, limit),
+            )
+            sessions = tuple(row["session_date"] for row in cursor.fetchall())
+        if not sessions:
+            raise TickerPublicationUnavailable(
+                "Ticker Workspace has no retained trading sessions for this interval"
+            )
+        ordered = tuple(reversed(sessions))
+        return {
+            "interval": interval,
+            "sessions": [session.isoformat() for session in ordered],
+            "data_as_of": ordered[-1].isoformat(),
+            "data_interval": interval,
+            "provider_fetch_performed": False,
+        }
 
     def materialization_status(self, *, available_by, cohort_id=None):
         cutoff = _utc(available_by, "available_by")
@@ -744,7 +848,17 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                     frames=("1d",),
                 )["1d"] for item in members}
         read_state = row.get("_retained_read_state")
-        state = _read_availability(payload["market_time"], cutoff, "1d", read_state)
+        availability_interval = (
+            "1d"
+            if row.get("snapshot_class") == "SESSION_CLOSE"
+            else "5m"
+        )
+        state = _read_availability(
+            payload["market_time"],
+            cutoff,
+            availability_interval,
+            read_state,
+        )
         publication = dict(
             cohort_id=str(cohort_id),
             snapshot_id=str(row["snapshot_id"]), payload_sha256=row["payload_sha256"],
@@ -1011,11 +1125,18 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
         read_state = payload.get("_retained_read_state")
         if contract == "publication":
             context = payload["context"]["cohort"]
-            state = _read_availability(payload["quote"]["as_of"], cutoff, "1d", read_state)
+            quote = payload["quote"]
+            quote_interval = "5m" if quote["source"] == "5m" else "1d"
+            state = _read_availability(
+                quote["as_of"],
+                cutoff,
+                quote_interval,
+                read_state,
+            )
             serving = deepcopy(read_state) if read_state is not None else {}
             if serving:
                 serving["current_data_available"] = serving["current_data_available"] and state["status"] == "READY"
-                if _availability(payload["quote"]["as_of"], cutoff, "1d")["status"] != "READY":
+                if _availability(quote["as_of"], cutoff, quote_interval)["status"] != "READY":
                     serving["section_warnings"]["market"] = "Market data is not current; displaying the retained publication."
             publication = dict(
                 cohort_id=str(cohort_id or context.get("cohort_id")), snapshot_id=context["snapshot_id"],

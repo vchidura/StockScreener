@@ -12,6 +12,7 @@ from realtime.materialization_jobs import (
     build_closure_materialization_job,
     claim_materialization_jobs,
     complete_materialization_job,
+    complete_materialization_job_with_barriers_cursor,
     complete_materialization_job_cursor,
     enqueue_materialization_job,
     evaluate_job_barrier_cursor,
@@ -244,6 +245,78 @@ def test_output_and_job_completion_commit_atomically_under_lease_fence():
     )
     assert output_calls == [cursor]
     assert connection.commit.call_count == 1
+
+
+def test_output_job_and_all_open_barrier_members_complete_atomically():
+    job = _job()
+    claimed = ClaimedMaterializationJob(job, OWNER, 2, NOW + timedelta(minutes=1), 1)
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (OWNER, 2, True)
+    cursor.fetchall.return_value = (
+        (str(UUID(int=1)), "AAPL", "f" * 64),
+        (str(UUID(int=2)), "AAPL", "f" * 64),
+    )
+    cursor.rowcount = 1
+    persisted = []
+
+    complete_materialization_job_with_barriers_cursor(
+        cursor,
+        claimed,
+        outcome_input_sha256="f" * 64,
+        persist_output=lambda active: persisted.append(active),
+    )
+
+    assert persisted == [cursor]
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert any("UPDATE rt.materialization_jobs" in statement for statement in statements)
+    assert any("FROM rt.job_barrier_members" in statement for statement in statements)
+    barrier_updates = [
+        call for call in cursor.execute.call_args_list
+        if "UPDATE rt.job_barrier_members SET outcome=" in call.args[0]
+    ]
+    assert len(barrier_updates) == 2
+
+
+def test_gap_or_late_job_completion_marks_open_barriers_missing_atomically():
+    job = _job()
+    claimed = ClaimedMaterializationJob(job, OWNER, 2, NOW + timedelta(minutes=1), 1)
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (OWNER, 2, True)
+    cursor.fetchall.return_value = ((str(UUID(int=1)), "AAPL", "f" * 64),)
+    cursor.rowcount = 1
+    persisted = []
+
+    complete_materialization_job_with_barriers_cursor(
+        cursor,
+        claimed,
+        outcome_input_sha256="f" * 64,
+        persist_output=lambda active: persisted.append(active),
+        barrier_outcome=BarrierOutcome.MISSING,
+    )
+
+    assert persisted == [cursor]
+    barrier_update = next(
+        call for call in cursor.execute.call_args_list
+        if "UPDATE rt.job_barrier_members SET outcome=" in call.args[0]
+    )
+    assert barrier_update.args[1][:2] == ("MISSING", None)
+
+
+def test_barrier_completion_rejects_an_input_identity_mismatch():
+    job = _job()
+    claimed = ClaimedMaterializationJob(job, OWNER, 2, NOW + timedelta(minutes=1), 1)
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (OWNER, 2, True)
+    cursor.fetchall.return_value = ((str(UUID(int=1)), "AAPL", "e" * 64),)
+    cursor.rowcount = 1
+
+    with pytest.raises(ValueError, match="input identity"):
+        complete_materialization_job_with_barriers_cursor(
+            cursor,
+            claimed,
+            outcome_input_sha256="f" * 64,
+            persist_output=lambda active: None,
+        )
 
 
 def test_cursor_level_completion_composes_output_without_owning_transaction():

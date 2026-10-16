@@ -1,6 +1,6 @@
 """Partition lifecycle for the maintenance loop: create ahead, then raise an alarm if any policy
 relation has fewer than 7 pre-created days (a missed creation is never silent; there is no default
-partition). Runs as the maintenance or partition_admin capability (EXECUTE is granted to both).
+partition). Runs as the app role (EXECUTE on the SECURITY DEFINER partition functions is granted to it).
 """
 from __future__ import annotations
 

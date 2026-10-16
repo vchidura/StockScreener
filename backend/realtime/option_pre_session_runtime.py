@@ -235,7 +235,7 @@ def build_option_pre_session_runtime(
     effective_at: datetime,
     environ: Mapping[str, str],
     backend_dir: Path,
-    pool_factory: Callable,
+    pool_factory: Callable | None = None,
     transport_factory: Callable = RequestsPolygonHttpTransport,
     profile_refresher: Callable = refresh_blocked_developer_profile,
     clock: Callable | None = None,
@@ -244,14 +244,23 @@ def build_option_pre_session_runtime(
     request_scheduler=None,
     source_deadline: datetime | None = None,
     prepared_target_plan: OptionPreSessionTargetPlan | None = None,
+    references_database: RealtimeProcessDatabase | None = None,
+    control_database: RealtimeProcessDatabase | None = None,
 ) -> OptionPreSessionRuntime:
     universe = process_plan.universe
     if universe.sha256 != process_plan.universe_sha256 or universe.option_underlyings != process_plan.option_underlyings:
         raise ValueError("pre-session process universe identity drifted")
+    external_databases = references_database is not None or control_database is not None
+    if (references_database is None) != (control_database is None):
+        raise ValueError("pre-session external databases must be supplied together")
     dsn = str(environ.get("REALTIME_RUNTIME_DSN") or "").strip()
     api_key = str(environ.get("POLYGON_API_KEY") or "").strip()
-    if not dsn or not api_key:
-        raise RuntimeError("pre-session runtime requires REALTIME_RUNTIME_DSN and POLYGON_API_KEY")
+    if not external_databases and (not dsn or not api_key):
+        raise RuntimeError(
+            "pre-session runtime requires REALTIME_RUNTIME_DSN and POLYGON_API_KEY"
+        )
+    if external_databases and not api_key:
+        raise RuntimeError("pre-session runtime requires POLYGON_API_KEY and a database binding")
     runtime = load_option_runtime_configuration(dict(environ), backend_dir)
     if set(runtime.settings.underlyers) != set(universe.equity_tickers):
         raise ValueError("pre-session runtime configuration changed the reviewed universe")
@@ -282,6 +291,8 @@ def build_option_pre_session_runtime(
         )
     roles = build_role_names("stocks_realtime")
     if prepared_target_plan is None:
+        if external_databases:
+            raise ValueError("external pre-session databases require a prepared target plan")
         profile = profile_refresher(dsn, roles.control, scheduled_cycle, universe)
         if (profile.provider_tier is not ProviderTier.MASSIVE_DEVELOPER
                 or profile.universe_sha256 != universe.sha256
@@ -299,30 +310,39 @@ def build_option_pre_session_runtime(
     pools = []
     http_session = None
     try:
-        references_pool = pool_factory(1, 1, dsn=dsn)
-        pools.append(references_pool)
-        control_pool = pool_factory(1, 1, dsn=dsn)
-        pools.append(control_pool)
-        if control_pool is references_pool:
-            raise ValueError("pre-session stage pools must be distinct")
-        references_database = RealtimeProcessDatabase.wire(
-            RealtimeProcessDatabasePlan(
-                "worker:option_pre_session:references",
-                RealtimeDatabaseRole.REFERENCES,
-                RealtimePoolBudget(1, 1),
-            ),
-            principal_pool=references_pool,
-            role_name=roles.references,
-        )
-        control_database = RealtimeProcessDatabase.wire(
-            RealtimeProcessDatabasePlan(
-                "worker:option_pre_session:control",
-                RealtimeDatabaseRole.CONTROL,
-                RealtimePoolBudget(1, 1),
-            ),
-            principal_pool=control_pool,
-            role_name=roles.control,
-        )
+        if external_databases:
+            if (not isinstance(references_database, RealtimeProcessDatabase)
+                    or references_database.process_plan.role is not RealtimeDatabaseRole.REFERENCES
+                    or not isinstance(control_database, RealtimeProcessDatabase)
+                    or control_database.process_plan.role is not RealtimeDatabaseRole.CONTROL):
+                raise ValueError("pre-session external database roles are invalid")
+        else:
+            if pool_factory is None:
+                raise ValueError("pre-session runtime requires a pool factory")
+            references_pool = pool_factory(1, 1, dsn=dsn)
+            pools.append(references_pool)
+            control_pool = pool_factory(1, 1, dsn=dsn)
+            pools.append(control_pool)
+            if control_pool is references_pool:
+                raise ValueError("pre-session stage pools must be distinct")
+            references_database = RealtimeProcessDatabase.wire(
+                RealtimeProcessDatabasePlan(
+                    "worker:option_pre_session:references",
+                    RealtimeDatabaseRole.REFERENCES,
+                    RealtimePoolBudget(1, 1),
+                ),
+                principal_pool=references_pool,
+                role_name=roles.references,
+            )
+            control_database = RealtimeProcessDatabase.wire(
+                RealtimeProcessDatabasePlan(
+                    "worker:option_pre_session:control",
+                    RealtimeDatabaseRole.CONTROL,
+                    RealtimePoolBudget(1, 1),
+                ),
+                principal_pool=control_pool,
+                role_name=roles.control,
+            )
         scope = (prepared_target_plan.scope if prepared_target_plan is not None
             else _load_scope(references_database, scheduled_cycle, universe))
         transport_options = dict(timeout_seconds=runtime.policy.provider_requests.request_timeout_seconds)

@@ -23,6 +23,7 @@ from realtime.screening_repository import (
     _bar_candidate_params,
     _bar_candidate_sql,
     load_realtime_screening_input,
+    load_realtime_stock_alert_input,
     screening_history_window,
     select_new_bars,
 )
@@ -105,6 +106,20 @@ def seeded_world(pool, tickers=("AAPL", "MSFT")):
             bars += [Bar(ticker, "1d", PREVIOUS_OPEN, basis, session=date(2026, 10, 1)) for basis in (ADJ, RAW)]
         insert_bars(cursor, world, bars)
     return world
+
+
+def test_stock_alert_loader_reads_daily_and_thirty_minute_bars_only(pool):
+    world = seeded_world(pool, ("AAPL",))
+    add(pool, world, Bar("AAPL", "30m", PREVIOUS_OPEN, session=date(2026, 10, 1)))
+    with pool.transaction() as cursor:
+        inputs = load_realtime_stock_alert_input(
+            cursor,
+            cohort_id=world.cohort_id,
+            session=SESSION,
+            cutoff=at(20),
+            source_generation=1,
+        )
+    assert {row["interval"] for row in inputs.bars} == {"1d", "30m"}
 
 
 def add(pool, world, *bars):
@@ -533,4 +548,3 @@ def test_known_by_must_be_aware_and_not_before_the_cutoff_on_the_real_loaders(po
                 loader.load(cursor, **scope(world, at(20), known_by=bad))
             with pytest.raises(ValueError, match=message):
                 load_realtime_screening_input(cursor, **scope(world, at(20), known_by=bad))
-

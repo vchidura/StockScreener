@@ -65,11 +65,11 @@ def test_hardening_is_rerunnable_fail_closed_and_verified_by_the_runtime_gate(ca
             assert verify_pool_target_v2(pool, hardened) == name
         finally:
             pool.closeall()
-        # An existing role that violates the policy (a LOGIN capability role) is refused, never altered.
+        # An existing role that violates the policy (a LOGIN app role) is refused, never altered.
         with closing(_connect(_settings(), "postgres")) as connection:
             connection.autocommit = True
             with connection.cursor() as cursor:
-                cursor.execute(f'ALTER ROLE "{roles.name("compute")}" LOGIN')
+                cursor.execute(f'ALTER ROLE "{roles.name("app")}" LOGIN')
         with pytest.raises(RuntimeError, match="does not match the security policy"):
             harden.main([*argv, "--execute"])
     finally:

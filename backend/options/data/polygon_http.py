@@ -25,6 +25,12 @@ class PolygonHttpTransport(Protocol):
         ...
 
 
+class PolygonResponseTooLarge(ValueError):
+    def __init__(self, observed_bytes: int):
+        super().__init__("provider response exceeds its bounded read limit")
+        self.observed_bytes = observed_bytes
+
+
 class RequestsPolygonHttpTransport:
     def __init__(
         self,
@@ -32,10 +38,16 @@ class RequestsPolygonHttpTransport:
         *,
         timeout_seconds: float = 30.0,
         session_factory: Callable = get_session,
+        maximum_response_bytes: int | None = None,
     ) -> None:
         self._api_key = api_key
         self._timeout_seconds = timeout_seconds
         self._session_factory = session_factory
+        if maximum_response_bytes is not None and (
+            type(maximum_response_bytes) is not int or maximum_response_bytes < 1
+        ):
+            raise ValueError("provider response limit must be positive")
+        self._maximum_response_bytes = maximum_response_bytes
 
     def get(self, url: str, params: Mapping[str, str]) -> PolygonHttpResponse:
         response = self._session_factory().get(
@@ -44,12 +56,22 @@ class RequestsPolygonHttpTransport:
             headers={"Authorization": f"Bearer {self._api_key}"},
             timeout=self._timeout_seconds,
             allow_redirects=False,
+            **({"stream": True} if self._maximum_response_bytes is not None else {}),
         )
-        return PolygonHttpResponse(
-            status_code=response.status_code,
-            body=response.content,
-            headers=tuple((str(key), str(value)) for key, value in response.headers.items()),
-        )
+        try:
+            body = (
+                response.content if self._maximum_response_bytes is None
+                else response.raw.read(self._maximum_response_bytes + 1, decode_content=True)
+            )
+            if self._maximum_response_bytes is not None and len(body) > self._maximum_response_bytes:
+                raise PolygonResponseTooLarge(len(body))
+            return PolygonHttpResponse(
+                status_code=response.status_code, body=body,
+                headers=tuple((str(key), str(value)) for key, value in response.headers.items()),
+            )
+        finally:
+            if self._maximum_response_bytes is not None:
+                response.close()
 
 
 class PolygonRateLimitGate:

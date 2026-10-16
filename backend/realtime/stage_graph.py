@@ -12,8 +12,16 @@ from enum import Enum
 from typing import Mapping
 
 STAGE_CATALOG_VERSION = "stages_v1"
+STAGE_CATALOG_VERSION_V2 = "stages_v2"
 TERMINAL_STATES = frozenset({"COMPLETE", "FAILED", "BLOCKED_PREREQ", "BLOCKED_POLICY", "MISSED"})
 NON_COMPLETING_STATES = frozenset({"FAILED", "BLOCKED_PREREQ", "BLOCKED_POLICY", "MISSED"})
+
+
+DATA_LANE = "data"
+ALERT_LANE = "alert"
+PORTAL_LANE = "portal"
+OPTIONS_LANE = "options"
+EXECUTION_LANES = frozenset({DATA_LANE, ALERT_LANE, PORTAL_LANE, OPTIONS_LANE})
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,10 +29,14 @@ class StageDefinition:
     stage_id: str
     domain: str
     prerequisites: tuple[str, ...]
-    principal_profile: str
-    capability_role: str
+    execution_lane: str
     schedule_kind: str
     gates_strategy: bool = False
+    deadline_offset_seconds: int | None = None
+
+    @property
+    def lane(self) -> str:
+        return self.execution_lane
 
 
 # INTERVAL and CONTINUOUS stages are resident loops that report through readiness; the rest run
@@ -33,21 +45,44 @@ RESIDENT_SCHEDULES = frozenset({"INTERVAL", "CONTINUOUS"})
 
 STAGES_V1: dict[str, StageDefinition] = {
     stage.stage_id: stage for stage in (
-        StageDefinition("REFERENCE", "shared", (), "runtime_data", "references", "INTERVAL"),
-        StageDefinition("EQUITY_INGEST", "equity", ("REFERENCE",), "runtime_data", "ingress", "WINDOW"),
-        StageDefinition("EQUITY_EVIDENCE", "equity", ("EQUITY_INGEST",), "runtime_data", "compute", "WINDOW"),
-        StageDefinition("PORTAL_PUBLISH", "equity", ("EQUITY_EVIDENCE",), "runtime_data", "publication", "COALESCED"),
-        StageDefinition("STRATEGY_PUBLISH", "equity", ("EQUITY_EVIDENCE",), "runtime_data", "publication",
-                        "COALESCED"),
-        StageDefinition("STOCK_ALERTS", "equity", ("EQUITY_EVIDENCE",), "runtime_data", "compute", "WINDOW"),
-        StageDefinition("OPTIONS_ACQUIRE", "options", ("REFERENCE",), "runtime_options", "options_ingress", "WINDOW"),
-        StageDefinition("OPTIONS_ADMISSION", "options", ("OPTIONS_ACQUIRE",), "runtime_options", "options_compute",
-                        "SESSION"),
-        StageDefinition("OPTIONS_CYCLE", "options", ("OPTIONS_ADMISSION",), "runtime_options", "options_compute",
-                        "WINDOW", True),
-        StageDefinition("OPTIONS_FLOW", "options", ("REFERENCE",), "runtime_options", "options_compute",
-                        "CONTINUOUS"),
+        StageDefinition("REFERENCE", "shared", (), DATA_LANE, "INTERVAL"),
+        StageDefinition("EQUITY_INGEST", "equity", ("REFERENCE",), DATA_LANE, "WINDOW"),
+        StageDefinition("EQUITY_EVIDENCE", "equity", ("EQUITY_INGEST",), DATA_LANE, "WINDOW"),
+        StageDefinition("PORTAL_PUBLISH", "equity", ("EQUITY_EVIDENCE",), DATA_LANE, "COALESCED"),
+        StageDefinition("STRATEGY_PUBLISH", "equity", ("EQUITY_EVIDENCE",), DATA_LANE, "COALESCED"),
+        StageDefinition("STOCK_ALERTS", "equity", ("EQUITY_EVIDENCE",), DATA_LANE, "WINDOW"),
+        StageDefinition("OPTIONS_ACQUIRE", "options", ("REFERENCE",), OPTIONS_LANE, "WINDOW"),
+        StageDefinition("OPTIONS_ADMISSION", "options", ("OPTIONS_ACQUIRE",), OPTIONS_LANE, "SESSION"),
+        StageDefinition("OPTIONS_CYCLE", "options", ("OPTIONS_ADMISSION",), OPTIONS_LANE, "WINDOW", True),
+        StageDefinition("OPTIONS_FLOW", "options", ("REFERENCE",), OPTIONS_LANE, "CONTINUOUS"),
     )
+}
+
+STAGES_V2: dict[str, StageDefinition] = {
+    stage.stage_id: stage for stage in (
+        StageDefinition("REFERENCE", "shared", (), DATA_LANE, "INTERVAL"),
+        StageDefinition("EQUITY_INGEST", "equity", ("REFERENCE",), DATA_LANE, "WINDOW",
+                        deadline_offset_seconds=120),
+        StageDefinition("EQUITY_MATERIALIZE", "equity", ("EQUITY_INGEST",), DATA_LANE, "WINDOW",
+                        deadline_offset_seconds=120),
+        StageDefinition("STOCK_ALERTS", "equity", ("EQUITY_MATERIALIZE",), ALERT_LANE, "WINDOW",
+                        deadline_offset_seconds=120),
+        StageDefinition("EQUITY_PROJECTION", "equity", ("EQUITY_MATERIALIZE",), PORTAL_LANE, "COALESCED",
+                        deadline_offset_seconds=300),
+        StageDefinition("PORTAL_PUBLISH", "equity", ("EQUITY_PROJECTION",), PORTAL_LANE, "COALESCED",
+                        deadline_offset_seconds=300),
+        StageDefinition("STRATEGY_PUBLISH", "equity", ("EQUITY_MATERIALIZE",), PORTAL_LANE, "COALESCED",
+                        deadline_offset_seconds=300),
+        StageDefinition("OPTIONS_ACQUIRE", "options", ("REFERENCE",), OPTIONS_LANE, "WINDOW"),
+        StageDefinition("OPTIONS_ADMISSION", "options", ("OPTIONS_ACQUIRE",), OPTIONS_LANE, "SESSION"),
+        StageDefinition("OPTIONS_CYCLE", "options", ("OPTIONS_ADMISSION",), OPTIONS_LANE, "WINDOW", True),
+        StageDefinition("OPTIONS_FLOW", "options", ("REFERENCE",), OPTIONS_LANE, "CONTINUOUS"),
+    )
+}
+
+STAGE_CATALOGS = {
+    STAGE_CATALOG_VERSION: STAGES_V1,
+    STAGE_CATALOG_VERSION_V2: STAGES_V2,
 }
 
 
@@ -126,7 +161,7 @@ def startable_stages(
     return frozenset(startable)
 
 
-def principal_profiles_required(enabled: frozenset[str] | set[str],
-                                stages: Mapping[str, StageDefinition] = STAGES_V1) -> frozenset[str]:
-    """Principals a plan needs; an equity-only plan never needs the options principal."""
-    return frozenset(stages[stage_id].principal_profile for stage_id in enabled)
+def lanes_required(enabled: frozenset[str] | set[str],
+                   stages: Mapping[str, StageDefinition] = STAGES_V1) -> frozenset[str]:
+    """Lanes a plan runs; an equity-only plan never opens the options lane."""
+    return frozenset(stages[stage_id].lane for stage_id in enabled)

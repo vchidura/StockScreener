@@ -6,11 +6,11 @@ or HTTP client: with no source it is BLOCKED_POLICY (OPTIONS_FLOW_SOURCE_NOT_CON
 nothing, and with only the synthetic conditions fixture it is BLOCKED_POLICY
 (OPTIONS_FLOW_CONDITIONS_UNPINNED) before any read.
 
-Database access (stage transactions of the `runtime_options` principal; resident stages have no stage
+Database access (stage transactions as the `app` role; resident stages have no stage
 run, so there is no write fence): reads and writes of the engine output and of the engine checkpoint go
-through `options_compute` (one transaction per writer flush: events, clusters, volume checkpoints and the
-checkpoint commit together); stream gaps go through `options_ingress` because rt.stream_gaps is an
-ingress relation. Gaps are written before the flush that makes the state they affect durable.
+through one transaction per writer flush (events, clusters, volume checkpoints and the checkpoint commit
+together); stream gaps are written in their own transaction. Gaps are written before the flush that makes
+the state they affect durable.
 
 Start: the latest checkpoint is restored when every check passes (policy, version, configuration, shard
 map, hash, state digest, offset not ahead of the source); otherwise the engine starts WARMING from the
@@ -93,10 +93,12 @@ OPTIONS_FLOW_CHECKPOINT_REGRESSION = "OPTIONS_FLOW_CHECKPOINT_REGRESSION"
 OPTIONS_FLOW_SOURCE_FAILED = "OPTIONS_FLOW_SOURCE_FAILED"
 OPTIONS_FLOW_OPEN_INTEREST_FAILED = "OPTIONS_FLOW_OPEN_INTEREST_FAILED"
 OPTIONS_FLOW_TICK_BUSY = "OPTIONS_FLOW_TICK_BUSY"
+OPTIONS_ACQUIRE_NOT_CONFIGURED = "OPTIONS_ACQUIRE_NOT_CONFIGURED"
+OPTIONS_ACQUIRE_INCOMPLETE = "OPTIONS_ACQUIRE_INCOMPLETE"
+OPTIONS_ADMISSION_NOT_CONFIGURED = "OPTIONS_ADMISSION_NOT_CONFIGURED"
+OPTIONS_ADMISSION_INCOMPLETE = "OPTIONS_ADMISSION_INCOMPLETE"
 WARMING_NO_CHECKPOINT = "NO_CHECKPOINT"
 WARMING_NEW_SESSION = "NEW_SESSION"
-READ_ROLE = "options_compute"
-GAP_ROLE = "options_ingress"
 _NAMESPACE = UUID("4a8e2b1c-7d03-4f95-a6e8-2c91d0b5f378")
 
 
@@ -107,6 +109,75 @@ class OpenInterestLoadError(RuntimeError):
 class GapPersistenceError(RuntimeError):
     """A gap could not be written to rt.stream_gaps (for example its stream session is not registered).
     The batch stays undelivered and is retried on the next tick; no row of it is flushed meanwhile."""
+
+
+@dataclass(frozen=True, slots=True)
+class OptionsAcquireResult:
+    run_id: UUID
+    expected_underlyings: tuple[str, ...]
+    completed_underlyings: tuple[str, ...]
+    provider_requests: int
+    response_bytes: int
+
+    def __post_init__(self) -> None:
+        expected = tuple(sorted(self.expected_underlyings))
+        completed = tuple(sorted(self.completed_underlyings))
+        if (not expected or len(expected) != len(set(expected))
+                or any(not symbol or symbol != symbol.upper() for symbol in expected)
+                or len(completed) != len(set(completed))
+                or any(symbol not in expected for symbol in completed)
+                or type(self.provider_requests) is not int or self.provider_requests < 0
+                or type(self.response_bytes) is not int or self.response_bytes < 0):
+            raise ValueError("Options acquire result is invalid")
+        object.__setattr__(self, "expected_underlyings", expected)
+        object.__setattr__(self, "completed_underlyings", completed)
+
+    @property
+    def complete(self) -> bool:
+        return self.completed_underlyings == self.expected_underlyings
+
+    @property
+    def evidence_ref(self) -> str:
+        return (
+            f"options-acquire:{self.run_id}:"
+            f"{len(self.completed_underlyings)}/{len(self.expected_underlyings)}:"
+            f"requests={self.provider_requests}:bytes={self.response_bytes}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OptionsAdmissionResult:
+    selection_id: UUID
+    status: str
+    reason_codes: tuple[str, ...]
+    cohort_id: UUID | None = None
+    slot_set_version: int | None = None
+    slot_contract_count: int = 0
+
+    def __post_init__(self) -> None:
+        status = self.status.strip().upper()
+        reasons = tuple(dict.fromkeys(self.reason_codes))
+        ready = status == "READY"
+        if (status not in {"READY", "BLOCKED"}
+                or ready != (not reasons)
+                or ready != (self.cohort_id is not None)
+                or ready != (self.slot_set_version is not None)
+                or (self.slot_set_version is not None and self.slot_set_version <= 0)
+                or type(self.slot_contract_count) is not int
+                or self.slot_contract_count < 0
+                or ready != (self.slot_contract_count > 0)):
+            raise ValueError("Options admission result is invalid")
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "reason_codes", reasons)
+
+    @property
+    def evidence_ref(self) -> str:
+        cohort = str(self.cohort_id) if self.cohort_id is not None else "none"
+        version = self.slot_set_version if self.slot_set_version is not None else 0
+        return (
+            f"options-admission:{self.selection_id}:{self.status}:"
+            f"cohort={cohort}:slot={version}:{self.slot_contract_count}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +199,48 @@ class OptionsFlowSettings:
     checkpoint_interval_ms: int = 5_000
     backlog_degraded_records: int = 10_000
     open_interest_max_rows: int = 500_000
+
+
+def options_acquire_block_reason(environment: RunnerEnvironment) -> str | None:
+    return None if callable(environment.options_acquire_action) else OPTIONS_ACQUIRE_NOT_CONFIGURED
+
+
+def options_admission_block_reason(environment: RunnerEnvironment) -> str | None:
+    return None if callable(environment.options_admission_action) else OPTIONS_ADMISSION_NOT_CONFIGURED
+
+
+def options_acquire_runner(environment: RunnerEnvironment) -> StageRunner:
+    def run(context: StageContext) -> StageOutcome:
+        blocked = options_acquire_block_reason(environment)
+        if blocked is not None:
+            return StageOutcome.blocked(blocked)
+        if context.is_cancelled():
+            return StageOutcome.failed(STAGE_CANCELLED)
+        result = environment.options_acquire_action(context)
+        if not isinstance(result, OptionsAcquireResult):
+            return StageOutcome.failed(OPTIONS_ACQUIRE_INCOMPLETE)
+        if not result.complete:
+            return StageOutcome.failed(OPTIONS_ACQUIRE_INCOMPLETE)
+        return StageOutcome.complete(evidence_ref=result.evidence_ref)
+
+    return run
+
+
+def options_admission_runner(environment: RunnerEnvironment) -> StageRunner:
+    def run(context: StageContext) -> StageOutcome:
+        blocked = options_admission_block_reason(environment)
+        if blocked is not None:
+            return StageOutcome.blocked(blocked)
+        if context.is_cancelled():
+            return StageOutcome.failed(STAGE_CANCELLED)
+        result = environment.options_admission_action(context)
+        if not isinstance(result, OptionsAdmissionResult):
+            return StageOutcome.failed(OPTIONS_ADMISSION_INCOMPLETE)
+        if result.status == "BLOCKED":
+            return StageOutcome("BLOCKED_POLICY", result.reason_codes, None, result.evidence_ref)
+        return StageOutcome.complete(evidence_ref=result.evidence_ref)
+
+    return run
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,8 +295,7 @@ class StageTransactionConnection:
         def __getattr__(self, name: str) -> Any:
             return getattr(self._cursor, name)
 
-    def __init__(self, role: str) -> None:
-        self._role = role
+    def __init__(self) -> None:
         self.context: StageContext | None = None
         self._manager: Any = None
         self._cursor: StageTransactionConnection._Cursor | None = None
@@ -195,7 +307,7 @@ class StageTransactionConnection:
         if self._manager is None:
             if self.context is None:
                 raise RuntimeError("the stage transaction connection is not bound to a stage context")
-            manager = self.context.transaction(role=self._role)
+            manager = self.context.transaction()
             unit = manager.__enter__()
             self._manager, self._cursor = manager, self._Cursor(unit.cursor)
         return self._cursor
@@ -327,7 +439,7 @@ OpenInterestLoader = Callable[[StageContext, date], Mapping[str, PriorOpenIntere
 
 def reference_open_interest_loader(max_rows: int) -> OpenInterestLoader:
     def load(context: StageContext, session_date: date) -> Mapping[str, PriorOpenInterest]:
-        with context.transaction(read_only=True, role=READ_ROLE) as unit:
+        with context.transaction(read_only=True) as unit:
             return load_prior_open_interest_cursor(unit.cursor, session_date, context.started_at, max_rows=max_rows)
 
     return load
@@ -375,7 +487,7 @@ def _start_session(environment: RunnerEnvironment, settings: OptionsFlowSettings
     store = CheckpointStore(consumer_name=settings.consumer_name, cohort_id=context.plan.cohort_id,
                             generation=generation, owner_epoch=settings.owner_epoch,
                             max_state_bytes=settings.max_checkpoint_bytes)
-    with context.transaction(read_only=True, role=READ_ROLE) as unit:
+    with context.transaction(read_only=True) as unit:
         rows = store.load(unit.cursor)
     tail_reader = getattr(source, "last_offset", None)
     tail = None if tail_reader is None else int(tail_reader())
@@ -401,7 +513,7 @@ def _start_session(environment: RunnerEnvironment, settings: OptionsFlowSettings
     loader = environment.options_flow_oi_loader or reference_open_interest_loader(settings.open_interest_max_rows)
     engine.set_prior_open_interest(loader(context, context.plan.session_date))
     prune_sessions(engine, context.plan.session_date - timedelta(days=1))
-    connection = StageTransactionConnection(READ_ROLE)
+    connection = StageTransactionConnection()
     connection.bind(context)
 
     def writer_factory(hook):
@@ -411,7 +523,7 @@ def _start_session(environment: RunnerEnvironment, settings: OptionsFlowSettings
 
     def gap_sink(entries: Sequence[GapEntry]) -> None:
         try:
-            with connection.context.transaction(role=GAP_ROLE) as unit:
+            with connection.context.transaction() as unit:
                 persist_gap_entries(unit.cursor, entries)
         except PsycopgError as error:
             raise GapPersistenceError(type(error).__name__) from None

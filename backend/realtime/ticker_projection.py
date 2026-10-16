@@ -124,6 +124,7 @@ class TickerProjectionState:
         immutable, so (tier, revision id, payload hash) fully identifies the fact."""
         current, previous, tier = self._current, self._previous, inputs.provider_tier.value
         built = reused = 0
+        prices = {}  # one ticker's facts share their Decimal prices
         facts = []
         for row in rows:
             slot = ("fact", tier, row["bar_revision_id"], row["payload_sha256"])
@@ -131,7 +132,7 @@ class TickerProjectionState:
             if fact is None:
                 fact = previous.get(slot)
                 if fact is None:
-                    fact = _fact(row, inputs)
+                    fact = _fact(row, inputs, prices)
                     built += 1
                 else:
                     reused += 1
@@ -174,7 +175,21 @@ def _uuid(value):
     return value if type(value) is UUID else UUID(str(value))
 
 
-def _fact(row, inputs):
+def _price(value, prices):
+    """Decimal(str(value)), sharing one Decimal per distinct non-zero float within `prices` (one ticker's facts):
+    prices repeat across a ticker's bars, so most of a fact's Decimals become references. Zero keeps its sign
+    (-0.0 == 0.0 as a key) and any other type is converted directly."""
+    if type(value) is float and value:
+        decimal = prices.get(value)
+        if decimal is None:
+            decimal = prices[value] = Decimal(str(value))
+        return decimal
+    return Decimal(str(value))
+
+
+def _fact(row, inputs, prices=None):
+    prices = {} if prices is None else prices
+    vwap = row.get("vwap")
     return RealtimeEquityBarFact(
         cohort_id=_uuid(row["cohort_id"]), provider_tier=inputs.provider_tier,
         instrument_id=row["instrument_id"],
@@ -185,10 +200,10 @@ def _fact(row, inputs):
             security_id=_uuid(row["security_id"]), ticker=row["ticker"],
             interval=row["interval"], session_date=row["session_date"],
             bar_start=row["bar_start"], bar_end=row["bar_end"],
-            open_price=Decimal(str(row["open"])), high_price=Decimal(str(row["high"])),
-            low_price=Decimal(str(row["low"])), close_price=Decimal(str(row["close"])),
+            open_price=_price(row["open"], prices), high_price=_price(row["high"], prices),
+            low_price=_price(row["low"], prices), close_price=_price(row["close"], prices),
             volume=Decimal(str(row["volume"])),
-            vwap=Decimal(str(row["vwap"])) if row.get("vwap") is not None else None,
+            vwap=_price(vwap, prices) if vwap is not None else None,
             transaction_count=row.get("transaction_count"), source_kind=BarSourceKind(row["source_kind"]),
             availability_mode=BarAvailabilityMode(row["availability_mode"]),
             is_final=row["is_final"], system_observed_at=row["observed_at"],
@@ -239,6 +254,34 @@ def _manifest_value(value):
     if isinstance(value, (tuple, list)):
         return [_manifest_value(item) for item in value]
     return value
+
+
+class _RowsBySecurity:
+    """One cycle's rows grouped by security id, so a ticker reads its own rows instead of rescanning the whole
+    cohort's (an O(N^2) cost over N tickers: every list holds about 90 rows per ticker). `of(security_id)` returns
+    exactly what the filter it replaces returned, in the same order: with `shared_none` the rows without a
+    security (cohort-wide events) are included, interleaved with the ticker's own at their original positions."""
+
+    def __init__(self, rows, *, shared_none=False):
+        self._own: dict[str, list] = {}
+        self._shared: list = []
+        for position, row in enumerate(rows):
+            security_id = row.get("security_id") if shared_none else row["security_id"]
+            if security_id is None:
+                if shared_none:
+                    self._shared.append((position, row))
+            else:
+                self._own.setdefault(str(security_id), []).append((position, row))
+
+    def of(self, security_id: str) -> list:
+        own = self._own.get(security_id, ())
+        if not self._shared:
+            return [row for _, row in own]
+        return [row for _, row in sorted((*self._shared, *own), key=_position)]
+
+
+def _position(entry):
+    return entry[0]
 
 
 def _calendar_projection(security, inputs, market_events, market_event_coverage):
@@ -423,6 +466,28 @@ def _fact_chain(group):
     return revision_chain_sha256((fact.revision.bar_revision_id, fact.revision.payload_sha256) for fact in group)
 
 
+_INTRADAY_WIDTH_MINUTES = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+}
+
+
+def _intraday_expected_count(calendar, plan, session, cutoff, interval):
+    expected = plan.expected_count(interval, "RAW_UNADJUSTED")
+    session_open = calendar.session_open(str(session)).to_pydatetime()
+    session_close = calendar.session_close(str(session)).to_pydatetime()
+    if cutoff >= session_close:
+        return expected
+    width = _INTRADAY_WIDTH_MINUTES[interval]
+    duration = int((session_close - session_open).total_seconds() // 60)
+    elapsed = max(0, int((cutoff - session_open).total_seconds() // 60))
+    full_session_count = (duration + width - 1) // width
+    return expected - full_session_count + elapsed // width
+
+
 def _session_slices(group):
     slices = {}
     for fact in group:
@@ -483,10 +548,18 @@ class _DerivationVerifier:
                 by_start = {fact.revision.bar_start: fact for fact in expected}
                 if len({fact.revision.bar_start for fact in rows}) != len(rows):
                     raise ValueError("Ticker interval source windows are duplicated")
-                if any(fact.revision.source_kind is not BarSourceKind.DERIVED
-                       or fact.revision.bar_start not in by_start
-                       or not _same_aggregate(fact, by_start[fact.revision.bar_start]) for fact in rows):
-                    raise ValueError(f"Ticker derived interval lineage/aggregate drift: {interval}")
+                for fact in rows:
+                    expected_fact = by_start.get(fact.revision.bar_start)
+                    if (
+                        fact.revision.source_kind is not BarSourceKind.DERIVED
+                        or expected_fact is None
+                        or not _same_aggregate(fact, expected_fact)
+                    ):
+                        raise ValueError(
+                            f"Ticker derived interval lineage/aggregate drift: {interval} "
+                            f"session={session} bar_start={fact.revision.bar_start.isoformat()} "
+                            f"source_kind={fact.revision.source_kind.value}"
+                        )
             return len(expected)
 
         return sum(self._state.remember(kind, keys[s], lambda s=s: build(s)) for s in sessions)
@@ -512,6 +585,36 @@ class _DerivationVerifier:
             return len(expected)
 
         key = (self._security.security_revision_id, interval, _fact_chain(sources), _fact_chain(stored))
+        return self._state.remember("lineage", key, build)
+
+    def verify_mixed_whole(self, interval, sources, stored, native_source_kinds):
+        def build():
+            expected = self._derive(interval, sources)
+            by_start = {fact.revision.bar_start: fact for fact in expected}
+            if len({fact.revision.bar_start for fact in stored}) != len(stored):
+                raise ValueError("Ticker interval source windows are duplicated")
+            for fact in stored:
+                if fact.revision.source_kind in native_source_kinds:
+                    continue
+                if (
+                    fact.revision.source_kind is not BarSourceKind.DERIVED
+                    or fact.revision.bar_start not in by_start
+                    or not _same_aggregate(
+                        fact,
+                        by_start[fact.revision.bar_start],
+                    )
+                ):
+                    raise ValueError(
+                        f"Ticker mixed interval lineage/aggregate drift: {interval}"
+                    )
+            return len(expected)
+
+        key = (
+            self._security.security_revision_id,
+            f"{interval}:mixed",
+            _fact_chain(sources),
+            _fact_chain(stored),
+        )
         return self._state.remember("lineage", key, build)
 
 
@@ -576,7 +679,28 @@ def project_realtime_ticker_workspace(
 def _project_realtime_ticker_workspace(
     inputs, *, market_events, market_event_coverage, fundamental_reports, fundamental_coverage, state,
 ):
-    plan = build_realtime_equity_portal_history_plan(inputs.session, equity_ticker_count=len(inputs.members))
+    calendar = exchange_calendars.get_calendar("XNYS")
+    partial_session = (
+        inputs.cutoff
+        < calendar.session_close(str(inputs.session)).to_pydatetime()
+    )
+    history_session = (
+        calendar.previous_session(str(inputs.session)).date()
+        if partial_session
+        else inputs.session
+    )
+    plan = build_realtime_equity_portal_history_plan(
+        history_session,
+        equity_ticker_count=len(inputs.members),
+    )
+    intraday_plan = (
+        build_realtime_equity_portal_history_plan(
+            inputs.session,
+            equity_ticker_count=len(inputs.members),
+        )
+        if partial_session
+        else plan
+    )
     allowed = {(interval, basis) for interval, basis, _ in plan.expected_counts_per_ticker}
     if any((row["interval"], row["adjustment_basis"]) not in allowed for row in inputs.bars):
         raise ValueError("Ticker retained interval/basis contract drift")
@@ -588,7 +712,8 @@ def _project_realtime_ticker_workspace(
         if row["interval"] == "1d" and row["adjustment_basis"] == "ADJUSTED"
         and row["session_date"] in screening_sessions
         or row["interval"] == "1d" and row["session_date"] >= plan.raw_sessions[-20]
-        or row["interval"] == "1h" and row["session_date"] >= plan.raw_sessions[-20]
+        or row["interval"] == "1h"
+        and row["session_date"] >= intraday_plan.raw_sessions[-20]
     }
     pending = list(selected)
     while pending:
@@ -606,6 +731,14 @@ def _project_realtime_ticker_workspace(
     ))
     code_sha256 = _ticker_code_sha256()
     adjusted_session_set = frozenset(plan.adjusted_sessions)
+    raw_session_sets = {
+        "1m": frozenset(intraday_plan.one_minute_sessions),
+        "5m": frozenset(intraday_plan.raw_sessions),
+        "15m": frozenset(intraday_plan.raw_sessions),
+        "30m": frozenset(intraday_plan.raw_sessions),
+        "1h": frozenset(intraday_plan.raw_sessions),
+        "1d": frozenset(plan.raw_sessions),
+    }
     rows_by_ticker = {}
     for row in inputs.bars:
         rows_by_ticker.setdefault(row["ticker"], []).append(row)
@@ -613,10 +746,21 @@ def _project_realtime_ticker_workspace(
     materializations = []
     pattern_materializations = []
     summary_charts = {}
+    # Grouped once per cycle: each ticker reads only its own rows (see _RowsBySecurity).
+    actions_by_security = _RowsBySecurity(inputs.actions)
+    coverage_by_security = _RowsBySecurity(inputs.coverage)
+    events_by_security = _RowsBySecurity(market_events, shared_none=True)
+    event_coverage_by_security = _RowsBySecurity(market_event_coverage, shared_none=True)
+    reports_by_security = _RowsBySecurity(fundamental_reports)
+    fundamental_coverage_by_security = _RowsBySecurity(fundamental_coverage)
     provider_tier, cutoff = inputs.provider_tier.value, inputs.cutoff
+    native_source_kinds = {BarSourceKind.NATIVE_REST}
+    if provider_tier == "MASSIVE_ADVANCED":
+        native_source_kinds.add(BarSourceKind.REALTIME_STREAM)
     recorded_by = inputs.recorded_by  # known_by, else the cutoff: the bound of every recording clock below
     for member in sorted(inputs.members, key=lambda row: row["ticker"]):
         security = _security(member)
+        own_security_id = str(security.security_id)
         own = rows_by_ticker.get(security.ticker, [])
         security_text, cohort_text = str(security.security_id), str(inputs.cohort_id)
         for row in own:
@@ -644,8 +788,15 @@ def _project_realtime_ticker_workspace(
         groups = {
             (interval, basis): tuple(sorted(
                 (fact for fact in buckets.get((interval, basis == "ADJUSTED"), ())
-                 if (interval, basis) != ("1d", "ADJUSTED")
-                 or fact.revision.session_date in adjusted_session_set),
+                 if (
+                     (interval, basis) != ("1d", "ADJUSTED")
+                     or fact.revision.session_date in adjusted_session_set
+                 )
+                 and (
+                     basis != "RAW_UNADJUSTED"
+                     or interval not in raw_session_sets
+                     or fact.revision.session_date in raw_session_sets[interval]
+                 )),
                 key=lambda fact: fact.revision.bar_start,
             ))
             for interval, basis, _ in plan.expected_counts_per_ticker
@@ -656,31 +807,52 @@ def _project_realtime_ticker_workspace(
             ) for key, group in groups.items() if group
         }
         missing = dict(MISSING_PRODUCERS)
-        profile_reports = _fundamental_projection(security, inputs, fundamental_reports)
-        fundamentals_covered = _has_fundamental_coverage(security, inputs, fundamental_coverage)
+        own_reports = reports_by_security.of(own_security_id)
+        own_fundamental_coverage = fundamental_coverage_by_security.of(own_security_id)
+        own_events = events_by_security.of(own_security_id)
+        own_event_coverage = event_coverage_by_security.of(own_security_id)
+        profile_reports = _fundamental_projection(security, inputs, own_reports)
+        fundamentals_covered = _has_fundamental_coverage(security, inputs, own_fundamental_coverage)
         if profile_reports and not fundamentals_covered:
             raise ValueError("Ticker fundamental reports require retained coverage")
         if fundamentals_covered:
             missing.pop("fundamentals")
         available = {}
         five = groups[("5m", "RAW_UNADJUSTED")]
+        five_sessions = intraday_plan.raw_sessions
+        five_expected = _intraday_expected_count(
+            calendar, intraday_plan, inputs.session, inputs.cutoff, "5m",
+        )
         if five:
-            if len(five) != plan.expected_count("5m", "RAW_UNADJUSTED"):
+            if len(five) != five_expected:
                 missing["raw_history"] = "NATIVE_5M_HISTORY_INCOMPLETE"
-            elif tuple(sorted({fact.revision.session_date for fact in five})) != plan.raw_sessions:
+            elif tuple(sorted({fact.revision.session_date for fact in five})) != five_sessions:
                 raise ValueError("Ticker native 5m sessions drift")
-            elif any(fact.revision.source_kind not in {BarSourceKind.NATIVE_REST, BarSourceKind.REALTIME_STREAM}
-                     for fact in five):
-                raise ValueError("Ticker 5m history must be native")
+            elif any(
+                fact.revision.source_kind not in native_source_kinds
+                and not (
+                    provider_tier == "MASSIVE_ADVANCED"
+                    and partial_session
+                    and fact.revision.session_date == inputs.session
+                    and fact.revision.source_kind is BarSourceKind.DERIVED
+                    and len(fact.revision.source_bar_revision_ids) == 5
+                )
+                for fact in five
+            ):
+                raise ValueError("Ticker 5m history source drift")
             else:
                 available["5m"] = five
         else:
             missing["raw_history"] = "NATIVE_5M_HISTORY_NOT_RETAINED"
         one = groups[("1m", "RAW_UNADJUSTED")]
+        one_sessions = intraday_plan.one_minute_sessions
+        one_expected = _intraday_expected_count(
+            calendar, intraday_plan, inputs.session, inputs.cutoff, "1m",
+        )
         if (
-            len(one) == plan.expected_count("1m", "RAW_UNADJUSTED")
-            and tuple(sorted({fact.revision.session_date for fact in one})) == plan.one_minute_sessions
-            and all(fact.revision.source_kind is BarSourceKind.NATIVE_REST for fact in one)
+            len(one) == one_expected
+            and tuple(sorted({fact.revision.session_date for fact in one})) == one_sessions
+            and all(fact.revision.source_kind in native_source_kinds for fact in one)
         ):
             available["1m"] = one
             missing.pop("1m")
@@ -690,44 +862,92 @@ def _project_realtime_ticker_workspace(
         if (
             len(monthly) == plan.expected_count("1mo", "ADJUSTED")
             and tuple(fact.revision.session_date for fact in monthly) == plan.monthly_sessions
-            and all(fact.revision.source_kind is BarSourceKind.NATIVE_REST for fact in monthly)
+            and all(fact.revision.source_kind in native_source_kinds for fact in monthly)
         ):
             available["1mo"] = monthly
         else:
             missing["chart:1mo"] = "NATIVE_ADJUSTED_MONTHLY_HISTORY_INCOMPLETE"
-        own_actions = [row for row in inputs.actions if str(row["security_id"]) == str(security.security_id)]
+        own_actions = actions_by_security.of(own_security_id)
         if any(row["action_type"] == "SPLIT" and plan.raw_start <= row["effective_date"] <= plan.raw_end
                for row in own_actions):
             raise ValueError("Ticker raw split window requires review")
         adjusted = groups[("1d", "ADJUSTED")]
         segment = uuid5(NAMESPACE_URL, f"ticker-lineage-check:{inputs.cohort_id}:{security.ticker}")
         verifier = _DerivationVerifier(state, security, inputs, segment)
-        if "5m" in available and verifier.windows("1d", "5m", available["5m"]) != len(plan.raw_sessions):
+        complete_raw_sessions = len(intraday_plan.raw_sessions) - int(partial_session)
+        if (
+            "5m" in available
+            and verifier.windows("1d", "5m", available["5m"]) != complete_raw_sessions
+        ):
             raise ValueError("Ticker native 5m session windows are incomplete")
         adjusted_sources = tuple(sorted(buckets.get(("1d", True), ()), key=lambda fact: fact.revision.bar_start))
         for interval, basis, expected_count in plan.expected_counts_per_ticker:
             if (interval, basis) == ("1d", "ADJUSTED") or interval in {"1m", "5m", "1mo"}:
                 continue
             stored = groups[(interval, basis)]
-            sources = adjusted_sources if basis == "ADJUSTED" else available.get("5m", ())
+            sources = (
+                adjusted_sources
+                if basis == "ADJUSTED"
+                else tuple(sorted(
+                    (
+                        fact
+                        for fact in buckets.get(("5m", False), ())
+                        if fact.revision.session_date in raw_session_sets["1d"]
+                    ),
+                    key=lambda fact: fact.revision.bar_start,
+                ))
+                if interval == "1d"
+                else available.get("5m", ())
+            )
+            source_label = "5m:daily" if interval == "1d" and basis == "RAW_UNADJUSTED" else "5m"
             if not stored or not sources:
                 missing[f"chart:{interval}"] = "RETAINED_INTERVAL_UNAVAILABLE"
                 continue
-            if interval == "1wk" and all(
-                fact.revision.source_kind is BarSourceKind.NATIVE_REST for fact in stored
+            if interval == "1wk" and any(
+                fact.revision.source_kind in native_source_kinds for fact in stored
             ):
                 if (
                     len(stored) != expected_count
                     or tuple(fact.revision.session_date for fact in stored) != plan.weekly_sessions
                 ):
                     raise ValueError("Ticker native adjusted weekly history drift")
+                verifier.verify_mixed_whole(
+                    interval,
+                    sources,
+                    stored,
+                    native_source_kinds,
+                )
                 available[interval] = stored
                 continue
-            expected_windows = (
-                verifier.verify_whole(interval, sources, stored) if basis == "ADJUSTED"
-                else verifier.verify_sessions(interval, "5m", sources, f"{interval}:{basis}", stored)
+            stored_expected_count = (
+                _intraday_expected_count(
+                    calendar, intraday_plan, inputs.session, inputs.cutoff, interval,
+                )
+                if basis == "RAW_UNADJUSTED" and interval in _INTRADAY_WIDTH_MINUTES
+                else expected_count
             )
-            if len(stored) != expected_count:
+            expected_windows = (
+                verifier.verify_mixed_whole(
+                    interval,
+                    sources,
+                    stored,
+                    native_source_kinds,
+                )
+                if any(
+                    fact.revision.source_kind in native_source_kinds
+                    for fact in stored
+                )
+                else verifier.verify_whole(interval, sources, stored)
+                if basis == "ADJUSTED"
+                else verifier.verify_sessions(
+                    interval,
+                    source_label,
+                    sources,
+                    f"{interval}:{basis}",
+                    stored,
+                )
+            )
+            if len(stored) != stored_expected_count:
                 if interval == "1wk" and len(stored) == expected_windows:
                     available[interval] = stored
                     missing["weekly_200"] = "NATIVE_ADJUSTED_WEEKLY_HISTORY_UNAVAILABLE"
@@ -860,7 +1080,7 @@ def _project_realtime_ticker_workspace(
                     "weighted_shares", "cik", "composite_figi", "share_class_figi",
                 )
             }, fundamental_reports=profile_reports, missing_producers=missing),
-            calendar=_calendar_projection(security, inputs, market_events, market_event_coverage),
+            calendar=_calendar_projection(security, inputs, own_events, own_event_coverage),
             chart_refs=chart_refs,
             chart_market_times={interval: bars[-1].revision.bar_end.isoformat() for interval, bars in available.items()},
             quote=dict(ticker=security.ticker, price=price, previous_close=previous_close, change=change,
@@ -890,25 +1110,14 @@ def _project_realtime_ticker_workspace(
             ),
             evidence_index=evidence_index,
         )
-        own_security_id = str(security.security_id)
         input_identity = dict(
             reference=_manifest_value(dict(member)),
             actions=rows_identity(own_actions),
-            coverage=rows_identity([row for row in inputs.coverage if str(row["security_id"]) == own_security_id]),
-            market_events=rows_identity([
-                row for row in market_events
-                if row.get("security_id") is None or str(row["security_id"]) == own_security_id
-            ]),
-            market_event_coverage=rows_identity([
-                row for row in market_event_coverage
-                if row.get("security_id") is None or str(row["security_id"]) == own_security_id
-            ]),
-            fundamental_reports=rows_identity([
-                row for row in fundamental_reports if str(row["security_id"]) == own_security_id
-            ]),
-            fundamental_coverage=rows_identity([
-                row for row in fundamental_coverage if str(row["security_id"]) == own_security_id
-            ]),
+            coverage=rows_identity(coverage_by_security.of(own_security_id)),
+            market_events=rows_identity(own_events),
+            market_event_coverage=rows_identity(own_event_coverage),
+            fundamental_reports=rows_identity(own_reports),
+            fundamental_coverage=rows_identity(own_fundamental_coverage),
             bar_lineage=assemble_lineage_head({
                 f"{interval}:{basis}": group_head(
                     count=len(group), first_revision_id=group[0].revision.bar_revision_id,

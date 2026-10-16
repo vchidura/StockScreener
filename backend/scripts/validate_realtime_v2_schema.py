@@ -7,9 +7,10 @@ zero-candidate diagnostics, AM-only manifests, slot caps, partition behavior). T
 is always dropped. It never touches stocks_realtime_v1 or stocks_realtime_v2 and makes no
 provider request.
 
-Two phases. STRUCTURE needs no capability roles (the runtime connects as the owner) and is
-what --security-mode deferred runs. SECURITY is the final hardening phase (create roles, apply
-grants, exact-privilege audit, ledger AUDITED) and also runs with --security-mode hardened.
+Two phases. STRUCTURE needs no roles (the runtime connects as the owner) and is
+what --security-mode deferred runs. SECURITY is the final hardening phase (create the admin, app
+and api roles, apply grants, exact-privilege audit, ledger AUDITED) and also runs with
+--security-mode hardened.
 """
 from __future__ import annotations
 
@@ -45,6 +46,7 @@ from realtime.relation_registry import (  # noqa: E402
     PARTITION_POLICY_SEEDS,
     PARTITIONED_RELATIONS,
     RELATIONS,
+    SECURITY_POLICY_VERSION,
     security_policy,
 )
 from realtime.security_v2 import (  # noqa: E402
@@ -68,9 +70,16 @@ def parse_args() -> argparse.Namespace:
                         help="deferred runs the structure phase only (no roles); hardened adds the final "
                              "security phase")
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument(
+        "--validate-existing",
+        action="store_true",
+        help="validate an already-provisioned disposable database without owning or dropping it",
+    )
     args = parser.parse_args()
     validate_target_database_v2(args.database, args.confirm_database_name, allow_disposable=True,
                                 security_mode=args.security_mode)
+    if args.validate_existing and not args.execute:
+        parser.error("--validate-existing requires --execute")
     return args
 
 
@@ -152,7 +161,8 @@ def catalog_checks(cursor) -> list[tuple[str, str]]:
         "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
         "WHERE n.nspname = 'rt' AND c.relispartition AND c.relname LIKE '%default%'")
     results.append(("no_default_partitions", "PASS" if cursor.fetchone()[0] == 0 else "FAIL"))
-    cursor.execute("SELECT policy FROM rt.database_security_policies WHERE policy_version = 'realtime_security_v2'")
+    cursor.execute("SELECT policy FROM rt.database_security_policies WHERE policy_version = %s",
+                   (SECURITY_POLICY_VERSION,))
     row = cursor.fetchone()
     results.append(("security_policy_matches_source", "PASS" if row and row[0] == security_policy()
                     else "FAIL policy row differs from relation_registry.security_policy()"))
@@ -189,14 +199,14 @@ def catalog_checks(cursor) -> list[tuple[str, str]]:
 
 
 def deferred_phase_checks(cursor, role_prefix: str) -> list[tuple[str, str]]:
-    """Structure-phase checks for the deferred security state. They need no capability role.
+    """Structure-phase checks for the deferred security state. They need no database role.
 
     Insertions here are rolled back by the caller, so the ledger is DEFERRED again afterwards.
     """
     results: list[tuple[str, str]] = []
     cursor.execute("SELECT count(*) FROM pg_roles WHERE starts_with(rolname, %s)", (role_prefix + "_",))
-    results.append(("structure_phase_runs_without_capability_roles",
-                    "PASS" if cursor.fetchone()[0] == 0 else "FAIL capability roles exist before the security phase"))
+    results.append(("structure_phase_runs_without_roles",
+                    "PASS" if cursor.fetchone()[0] == 0 else "FAIL roles exist before the security phase"))
     cursor.execute(
         "SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace, "
         "LATERAL aclexplode(c.relacl) a WHERE n.nspname IN ('ref','rt') AND a.grantee <> c.relowner) + "
@@ -218,7 +228,7 @@ def deferred_phase_checks(cursor, role_prefix: str) -> list[tuple[str, str]]:
     results.append(_expect(
         cursor, "ledger_rejects_a_policy_hash_that_does_not_match", errors.ForeignKeyViolation,
         "INSERT INTO rt.security_phase_events (policy_version, policy_sha256, phase) "
-        "VALUES ('realtime_security_v2', %s, 'APPLIED')", (HASH,)))
+        "VALUES (%s, %s, 'APPLIED')", (SECURITY_POLICY_VERSION, HASH)))
     results.append(_accept(cursor, "ledger_accepts_applied_after_deferred", insert, ("APPLIED",)))
     results.append(_expect(cursor, "ledger_cannot_return_to_deferred", errors.RaiseException,
                            insert, ("DEFERRED",)))
@@ -275,9 +285,8 @@ def behavior_checks(cursor) -> list[tuple[str, str]]:
     # Stage independence (RT-01).
     results.append(_expect(
         cursor, "options_stage_cannot_be_prerequisite_of_equity_stage", errors.RaiseException,
-        "INSERT INTO rt.stage_catalog (stage_id, version, domain, prerequisites, capability_role, "
-        "principal_profile, schedule_kind) VALUES ('BAD_EQUITY', 'stages_v1', 'equity', ARRAY['OPTIONS_CYCLE'], "
-        "'compute', 'runtime_data', 'WINDOW')"))
+        "INSERT INTO rt.stage_catalog (stage_id, version, domain, prerequisites, schedule_kind) "
+        "VALUES ('BAD_EQUITY', 'stages_v1', 'equity', ARRAY['OPTIONS_CYCLE'], 'WINDOW')"))
     results.append(_expect(
         cursor, "stage_catalog_is_immutable", errors.RaiseException,
         "UPDATE rt.stage_catalog SET schedule_kind = 'WINDOW' WHERE stage_id = 'REFERENCE'"))
@@ -513,6 +522,58 @@ def detach_check(settings: dict[str, str], database: str) -> list[tuple[str, str
     return [("detach_concurrently_then_drop", "PASS")]
 
 
+def validation_summary(results: dict[str, list[tuple[str, str]]]) -> tuple[dict[str, object], bool]:
+    summary = {
+        phase: {
+            "checks": len(items),
+            "failures": [item for item in items if not item[1].startswith("PASS")],
+        }
+        for phase, items in results.items()
+    }
+    return summary, any(entry["failures"] for entry in summary.values())
+
+
+def validate_existing_database(
+    settings: dict[str, str],
+    database: str,
+    security_mode: str,
+) -> int:
+    phases = v2_provisioning_phases(security_mode)
+    roles = build_role_names_v2("test_rt_" + database[len("test_realtime_v2_"):])
+    with closing(_connect(settings, "postgres")) as connection:
+        connection.autocommit = True
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname=%s)", (database,))
+            if not cursor.fetchone()[0]:
+                raise RuntimeError("disposable database does not exist")
+    results: dict[str, list[tuple[str, str]]] = {phase: [] for phase in phases}
+    with closing(_connect(settings, database)) as connection:
+        with connection.cursor() as cursor:
+            results[PHASE_STRUCTURE].extend(catalog_checks(cursor))
+            results[PHASE_STRUCTURE].extend(behavior_checks(cursor))
+        connection.rollback()
+    results[PHASE_STRUCTURE].extend(detach_check(settings, database))
+    if PHASE_SECURITY in phases:
+        with closing(_connect(settings, database)) as connection:
+            audit = audit_database_security_v2(connection, roles)
+            results[PHASE_SECURITY].extend(audit)
+            phase = current_security_phase_v2(connection)
+            results[PHASE_SECURITY].append((
+                "security_phase_ledger_ends_audited",
+                "PASS" if phase == "AUDITED" else f"FAIL phase={phase}",
+            ))
+            connection.rollback()
+    summary, failed = validation_summary(results)
+    print(json.dumps({
+        "status": "FAILED" if failed else "VERIFIED",
+        "mode": "VALIDATE_EXISTING",
+        "security_mode": security_mode,
+        "migrations": len(load_realtime_migrations(V2_MIGRATIONS_DIR)),
+        "phases": summary,
+    }, indent=2))
+    return 1 if failed else 0
+
+
 def main() -> int:
     args = parse_args()
     migrations = load_realtime_migrations(V2_MIGRATIONS_DIR)
@@ -524,6 +585,8 @@ def main() -> int:
         print("No database changes made. Add --execute.")
         return 0
     settings = _settings()
+    if args.validate_existing:
+        return validate_existing_database(settings, args.database, args.security_mode)
     created = False
     roles = build_role_names_v2("test_rt_" + args.database[len("test_realtime_v2_"):])
     roles_created = False
@@ -567,10 +630,7 @@ def main() -> int:
                 results[PHASE_SECURITY].append(("security_phase_ledger_ends_audited",
                                                 "PASS" if phase == "AUDITED" else f"FAIL phase={phase}"))
                 connection.rollback()
-        summary = {phase: {"checks": len(items),
-                           "failures": [item for item in items if not item[1].startswith("PASS")]}
-                   for phase, items in results.items()}
-        failed = any(entry["failures"] for entry in summary.values())
+        summary, failed = validation_summary(results)
         print(json.dumps({"status": "FAILED" if failed else "VERIFIED", "security_mode": args.security_mode,
                           "migrations": len(migrations), "phases": summary}, indent=2))
         return 1 if failed else 0

@@ -247,20 +247,24 @@ def run_passive_preflight(
     evidence: PassivePreflightEvidence,
     *,
     checked_at: datetime,
+    expected_database_name: str = EXPECTED_DATABASE_NAME,
+    expected_schema_versions: tuple[str, ...] = EXPECTED_SCHEMA_VERSIONS,
 ) -> PreflightProfile:
+    if not expected_database_name.strip() or not expected_schema_versions:
+        raise ValueError("passive preflight target identity is incomplete")
     now = _utc(checked_at, "checked_at")
     expires_at = now + timedelta(seconds=configuration.profile_ttl_seconds)
     checks = [
         _condition_check(
             "database_target",
-            evidence.schema.database_name == EXPECTED_DATABASE_NAME,
+            evidence.schema.database_name == expected_database_name,
             now,
             expires_at,
             "WRONG_DATABASE_TARGET",
         ),
         _condition_check(
             "schema_versions",
-            evidence.schema.applied_versions == EXPECTED_SCHEMA_VERSIONS,
+            evidence.schema.applied_versions == expected_schema_versions,
             now,
             expires_at,
             "SCHEMA_VERSION_MISMATCH",

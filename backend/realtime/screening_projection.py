@@ -186,13 +186,29 @@ def produce_realtime_screening(inputs: RealtimeScreeningInput) -> RealtimeScreen
         raise ValueError("Screening bars extend beyond the exact manifest")
     calendar = exchange_calendars.get_calendar("XNYS")
     session = inputs.session
-    sessions = [stamp.date() for stamp in calendar.sessions_in_range(calendar.session_offset(str(session), -282), str(session))]
+    session_close = calendar.session_close(str(session)).to_pydatetime()
+    partial_session = inputs.cutoff < session_close
+    daily_session = (
+        calendar.previous_session(str(session)).date()
+        if partial_session else session
+    )
+    sessions = [
+        stamp.date()
+        for stamp in calendar.sessions_in_range(
+            calendar.session_offset(str(daily_session), -282),
+            str(daily_session),
+        )
+    ]
     ordinals = {stamp: index for index, stamp in enumerate(sessions)}
-    market_time = calendar.session_close(str(session)).to_pydatetime()
-    if market_time > inputs.cutoff:
-        raise ValueError("Screening session is not completed at cutoff")
+    market_time = inputs.cutoff if partial_session else session_close
     slots = hourly_slots(calendar, market_time)
     rows, lineage, hourly_lineage = [], {}, {}
+    # Grouped once (an O(members x rows) rescan per member otherwise), original order kept.
+    coverage_by_security, actions_by_security = {}, {}
+    for item in inputs.coverage:
+        coverage_by_security.setdefault(str(item["security_id"]), []).append(item)
+    for item in inputs.actions:
+        actions_by_security.setdefault(str(item["security_id"]), []).append(item)
     for member in sorted(members, key=lambda m: m["ticker"]):
         ticker, identity = member["ticker"], str(member["security_id"])
         if not member.get("security_revision_id") or member.get("security_type") not in {"CS", "ETF", "ETV"}:
@@ -204,14 +220,34 @@ def produce_realtime_screening(inputs: RealtimeScreeningInput) -> RealtimeScreen
         adjusted = sorted((b for b in own if b["interval"] == "1d" and b["adjustment_basis"] == "ADJUSTED"), key=lambda b: b["session_date"])
         raw = sorted((b for b in own if b["interval"] == "1d" and b["adjustment_basis"] == "RAW_UNADJUSTED"), key=lambda b: b["session_date"])
         if [b["session_date"] for b in adjusted] != sessions:
-            raise ValueError(f"Screening adjusted history requires exact 283 retained sessions: {ticker}")
+            observed = [b["session_date"] for b in adjusted]
+            mismatch = next(
+                (
+                    (index, expected, actual)
+                    for index, (expected, actual) in enumerate(
+                        zip(sessions, observed)
+                    )
+                    if expected != actual
+                ),
+                None,
+            )
+            raise ValueError(
+                "Screening adjusted history requires exact 283 retained sessions: "
+                f"{ticker}; observed={len(observed)} "
+                f"{observed[:1]}..{observed[-1:]}; mismatch={mismatch}"
+            )
         if [b["session_date"] for b in raw[-20:]] != sessions[-20:]:
-            raise ValueError(f"Screening nominal current/liquidity history unavailable: {ticker}")
-        own_coverage = [c for c in inputs.coverage if str(c["security_id"]) == identity and c["action_type"] == "SPLIT"
+            observed = [b["session_date"] for b in raw]
+            raise ValueError(
+                "Screening nominal current/liquidity history unavailable: "
+                f"{ticker}; observed={len(observed)} "
+                f"{observed[-20:-19]}..{observed[-1:]}"
+            )
+        own_coverage = [c for c in coverage_by_security.get(identity, ()) if c["action_type"] == "SPLIT"
                         and c["window_start"] <= sessions[0] and c["window_end"] >= session and c["received_at"] <= inputs.cutoff]
         if not own_coverage:
             raise ValueError(f"Screening split/action evidence unavailable: {ticker}")
-        actions = [dict(a) for a in inputs.actions if str(a["security_id"]) == identity]
+        actions = [dict(a) for a in actions_by_security.get(identity, ())]
         if any(a["received_at"] > inputs.cutoff or a["ticker"] != ticker for a in actions):
             raise ValueError(f"Screening action evidence drift: {ticker}")
         if any(a["action_type"] == "SPLIT" and (
@@ -244,7 +280,7 @@ def produce_realtime_screening(inputs: RealtimeScreeningInput) -> RealtimeScreen
             bar["raw_close"] = float(nominal_bar["close"]) if nominal_bar else np.nan
             bar["raw_volume"] = float(nominal_bar["volume"]) if nominal_bar else np.nan
         selected = dict(member, selected_bar_revision_id=historical[-1]["bar_revision_id"], status="SELECTED")
-        row = project_security(selected, historical, actions, session, ordinals, split_adjusted=True)
+        row = project_security(selected, historical, actions, daily_session, ordinals, split_adjusted=True)
         row["source_bar_id"] = str(raw[-1]["bar_revision_id"])
         row["values"].update(price=float(raw[-1]["close"]), volume=float(raw[-1]["volume"]))
         row["quality"] = ["SPLIT_COVERAGE_VERIFIED_OTHER_KNOWN_ACTIONS_ONLY"]
@@ -262,12 +298,16 @@ def produce_realtime_screening(inputs: RealtimeScreeningInput) -> RealtimeScreen
     equity_dir = Path(__file__).resolve().parents[1] / "equity"
     manifest = dict(
         session=str(session), market_time=market_time.isoformat(), observed_at=inputs.cutoff.isoformat(),
+        projection_mode="INTRADAY_ASOF_V1" if partial_session else "SESSION_CLOSE_V1",
+        session_status="PARTIAL" if partial_session else "COMPLETE",
+        daily_as_of_session=str(daily_session),
         source_cutoff=inputs.cutoff.isoformat(), source_publication_id=inputs.source_manifest_sha256,
         source_manifest_sha256=inputs.source_manifest_sha256, cohort_id=str(inputs.cohort_id),
         provider_tier=inputs.provider_tier.value, source_generation=inputs.source_generation,
         previous_expected_session=str(calendar.previous_session(str(session)).date()),
         expected_members=len(members), source_selected_members=len(members),
-        source_publication_status="COMPLETE", source_unavailable_members=[],
+        source_publication_status="PARTIAL" if partial_session else "COMPLETE",
+        source_unavailable_members=[],
         daily_state_contract="daily_state_extracted_v1", screening_basis=SCREENING_BASIS,
         field_contract=REALTIME_FIELDS,
         code_hashes={name: digest((equity_dir / name).read_text(encoding="utf-8")) for name in ("screening_projection.py", "technicals.py", "daily_state.py")},

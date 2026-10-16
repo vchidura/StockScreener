@@ -19,6 +19,35 @@ from .worker_database import RealtimeProcessDatabase
 MAX_SOURCE_LINEAGE_ROUNDS = 8
 BAR_VISIBILITY_CLOCKS = 5
 
+# Columns whose values repeat across thousands of bars (one cohort, tier, ticker, interval, segment, ...).
+# psycopg2 builds a new object per value per row; keeping one shared instance per distinct value cuts the
+# retained row dict by about a third. Every value is immutable (UUID, str, int, date), so sharing is invisible
+# to equality, hashing and the projection output.
+_SHARED_BAR_COLUMNS = (
+    "cohort_id", "provider_tier", "security_id", "instrument_id", "ticker", "interval", "session_date",
+    "session_scope", "adjustment_basis", "source_kind", "availability_mode", "ingestion_segment_id",
+    "journal_generation", "stream_session_id",
+)
+# A pool is bounded by the domain of its column (a few hundred tickers, intervals and sessions), except
+# ingestion_segment_id, which grows with every acquisition batch: past this many entries a pool starts over
+# (rows already retained keep their objects; only the sharing between old and new rows is lost).
+_SHARED_POOL_LIMIT = 100_000
+_shared_bar_pools = {column: {} for column in _SHARED_BAR_COLUMNS}
+
+
+def share_bar_values(rows: list[dict]) -> list[dict]:
+    """Replace the repeated immutable values of freshly fetched bar rows by one shared instance per value."""
+    for pool in _shared_bar_pools.values():
+        if len(pool) > _SHARED_POOL_LIMIT:
+            pool.clear()
+    pools = tuple(_shared_bar_pools.items())
+    for row in rows:
+        for column, pool in pools:
+            value = row.get(column)
+            if value is not None:
+                row[column] = pool.setdefault(value, value)
+    return rows
+
 # A bar is visible under (cutoff, known_by) when the system had recorded it by `known_by` (observed_at,
 # created_at, replay_available_at, provider_published_at) and it ended by `cutoff` (the market boundary).
 # Every clock is an immutable column of an immutable row (rt.bar_revisions rejects UPDATE and DELETE), so
@@ -90,25 +119,55 @@ class BarRequest:
 
 
 @lru_cache(maxsize=16)
-def screening_history_window(session: date, *, include_portal_history: bool) -> tuple[date, tuple]:
+def screening_history_window(
+    session: date,
+    *,
+    include_portal_history: bool,
+    cutoff: datetime | None = None,
+) -> tuple[date, tuple]:
     """The first daily session and the history-window parameters shared by every bar query. A pure function
     of the session (the portal plan costs about 130 ms), so it is computed once per session."""
     calendar = exchange_calendars.get_calendar("XNYS")
     if not calendar.is_session(str(session)):
         raise ValueError("Screening requires an exchange session")
-    start = calendar.session_offset(str(session), -282).date()
-    nominal_start = calendar.session_offset(str(session), -19).date()
-    raw_start = calendar.session_offset(str(session), -89).date()
+    history_session = session
+    if cutoff is not None:
+        if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+            raise ValueError("Screening cutoff must be timezone-aware")
+        if cutoff < calendar.session_close(str(session)).to_pydatetime():
+            history_session = calendar.previous_session(str(session)).date()
+    start = calendar.session_offset(str(history_session), -282).date()
+    nominal_start = calendar.session_offset(str(history_session), -19).date()
+    daily_raw_start = calendar.session_offset(str(history_session), -89).date()
+    intraday_raw_start = calendar.session_offset(str(session), -89).date()
     portal_plan = (
-        build_realtime_equity_portal_history_plan(session)
+        build_realtime_equity_portal_history_plan(history_session)
         if include_portal_history else None
     )
     from equity.screening_hourly import hourly_slots
     slots = hourly_slots(calendar, calendar.session_close(str(session)).to_pydatetime())
     history_params = (
-        (start, session, portal_plan.weekly_start, portal_plan.weekly_end,
-         portal_plan.monthly_start, session, raw_start, session) if include_portal_history else
-        (start, session, nominal_start, session, slots[0][0], slots[-1][1])
+        (
+            start,
+            history_session,
+            portal_plan.weekly_start,
+            portal_plan.weekly_end,
+            portal_plan.monthly_start,
+            history_session,
+            daily_raw_start,
+            history_session,
+            intraday_raw_start,
+            session,
+        )
+        if include_portal_history
+        else (
+            start,
+            history_session,
+            nominal_start,
+            history_session,
+            slots[0][0],
+            slots[-1][1],
+        )
     )
     return start, history_params
 
@@ -119,8 +178,10 @@ def bar_history_predicate(include_portal_history: bool) -> str:
         "AND session_date BETWEEN %s AND %s) OR (adjustment_basis='ADJUSTED' "
         "AND interval='1wk' AND session_date BETWEEN %s AND %s) OR (adjustment_basis='ADJUSTED' "
         "AND interval='1mo' AND session_date BETWEEN %s AND %s) "
+        "OR (adjustment_basis='RAW_UNADJUSTED' AND interval='1d' "
+        "AND session_date BETWEEN %s AND %s) "
         "OR (adjustment_basis='RAW_UNADJUSTED' "
-        "AND interval IN ('1m','5m','15m','30m','1h','1d') AND session_date BETWEEN %s AND %s)) "
+        "AND interval IN ('1m','5m','15m','30m','1h') AND session_date BETWEEN %s AND %s)) "
         if include_portal_history else
         "AND ((interval='1d' AND adjustment_basis='ADJUSTED' AND session_date BETWEEN %s AND %s) "
         "OR (interval='1d' AND adjustment_basis='RAW_UNADJUSTED' AND session_date BETWEEN %s AND %s) "
@@ -133,7 +194,8 @@ def source_precedence_case(include_portal_history: bool) -> str:
     bar_revision_id."""
     return (
         "CASE "
-        "WHEN adjustment_basis='ADJUSTED' AND interval IN ('1d','1wk','1mo') AND source_kind='NATIVE_REST' THEN 5 "
+        "WHEN adjustment_basis='ADJUSTED' AND interval='1d' AND source_kind='NATIVE_REST' THEN 5 "
+        "WHEN adjustment_basis='ADJUSTED' AND interval IN ('1wk','1mo') AND source_kind='DERIVED' THEN 5 "
         "WHEN adjustment_basis='RAW_UNADJUSTED' AND interval IN ('1m','5m') AND source_kind='NATIVE_REST' THEN 5 "
         "WHEN adjustment_basis='RAW_UNADJUSTED' AND interval IN ('15m','30m','1h','1d') AND source_kind='DERIVED' THEN 5 "
         "WHEN source_kind='RECONCILED' THEN 4 WHEN source_kind='NATIVE_REST' THEN 3 "
@@ -190,7 +252,7 @@ def select_winning_bars(cursor, scope: BarScope, clocks: BarClocks, *, with_stat
         + source_precedence_case(include) + " DESC, observed_at DESC, created_at DESC, bar_revision_id",
         params,
     )
-    rows = [dict(row) for row in cursor.fetchall()]
+    rows = share_bar_values([dict(row) for row in cursor.fetchall()])
     if not with_state:
         return rows
     ranked, total = [], 0
@@ -212,7 +274,7 @@ def select_new_bars(cursor, scope: BarScope, previous: BarClocks, current: BarCl
         "FROM rt.bar_revisions WHERE " + candidate + _BAR_NOT_VISIBLE_AT + ") AS new_bars ON true",
         (*params, *params, *previous.params()),
     )
-    rows = [dict(row) for row in cursor.fetchall()]
+    rows = share_bar_values([dict(row) for row in cursor.fetchall()])
     total = rows[0]["visible_total"]
     ranked = []
     for row in rows:
@@ -234,7 +296,7 @@ def select_source_bars(cursor, scope: BarScope, revision_ids, clocks: BarClocks)
         "ORDER BY bar_revision_id",
         (revision_ids, str(scope.cohort_id), scope.provider_tier, *clocks.params()),
     )
-    return [dict(row) for row in cursor.fetchall()]
+    return share_bar_values([dict(row) for row in cursor.fetchall()])
 
 
 def referenced_source_ids(rows: Iterable[dict]) -> set[str]:
@@ -290,6 +352,75 @@ def load_realtime_screening_input(cursor, *, cohort_id: UUID, session: date,
     )
 
 
+def select_alert_bars(cursor, request: BarRequest, session: date) -> tuple[dict, ...]:
+    calendar = exchange_calendars.get_calendar("XNYS")
+    scope, clocks = request.scope, request.clocks
+    daily_session = (
+        calendar.previous_session(str(session)).date()
+        if request.cutoff < calendar.session_close(str(session)).to_pydatetime()
+        else session
+    )
+    adjusted_start = calendar.session_offset(str(daily_session), -282).date()
+    daily_raw_start = calendar.session_offset(str(daily_session), -89).date()
+    intraday_raw_start = calendar.session_offset(str(session), -89).date()
+    history = (
+        adjusted_start,
+        daily_session,
+        daily_raw_start,
+        daily_session,
+        intraday_raw_start,
+        session,
+    )
+    predicate = (
+        "cohort_id=%s AND provider_tier=%s AND ticker=ANY(%s) "
+        "AND session_scope='RTH' AND is_final AND " + _BAR_VISIBLE_AT
+        + "AND ((interval='1d' AND adjustment_basis='ADJUSTED' AND session_date BETWEEN %s AND %s) "
+        "OR (interval='1d' AND adjustment_basis='RAW_UNADJUSTED' AND session_date BETWEEN %s AND %s) "
+        "OR (interval='30m' AND adjustment_basis='RAW_UNADJUSTED' AND session_date BETWEEN %s AND %s)) "
+    )
+    parameters = (
+        str(scope.cohort_id),
+        scope.provider_tier,
+        list(scope.tickers),
+        *clocks.params(),
+        *history,
+    )
+    precedence = source_precedence_case(False)
+    cursor.execute(
+        "SELECT DISTINCT ON (ticker, interval, adjustment_basis, bar_start) "
+        + bar_columns(True)
+        + " FROM rt.bar_revisions WHERE "
+        + predicate
+        + "ORDER BY ticker, interval, adjustment_basis, bar_start, "
+        + precedence
+        + " DESC, observed_at DESC, created_at DESC, bar_revision_id",
+        parameters,
+    )
+    return tuple(share_bar_values([dict(row) for row in cursor.fetchall()]))
+
+
+def load_realtime_stock_alert_input(
+    cursor,
+    *,
+    cohort_id: UUID,
+    session: date,
+    cutoff: datetime,
+    source_generation: int,
+    known_by: datetime | None = None,
+) -> RealtimeScreeningInput:
+    return load_screening_input(
+        cursor,
+        cohort_id=cohort_id,
+        session=session,
+        cutoff=cutoff,
+        source_generation=source_generation,
+        include_portal_history=False,
+        include_strategy_action_details=False,
+        known_by=known_by,
+        bar_loader=lambda active_cursor, request: select_alert_bars(active_cursor, request, session),
+    )
+
+
 def load_screening_input(cursor, *, cohort_id: UUID, session: date,
                          cutoff: datetime, source_generation: int,
                          include_portal_history: bool,
@@ -298,7 +429,11 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
                          bar_loader: Callable[[object, BarRequest], tuple]) -> RealtimeScreeningInput:
     """The screening input with the bar set supplied by `bar_loader` (the full read or a retained one).
     Manifest, members, actions and coverage are read on every call, with the cutoff."""
-    start, history_params = screening_history_window(session, include_portal_history=include_portal_history)
+    start, history_params = screening_history_window(
+        session,
+        include_portal_history=include_portal_history,
+        cutoff=cutoff,
+    )
     requested_known_by = known_by
     if known_by is None:
         known_by = cutoff

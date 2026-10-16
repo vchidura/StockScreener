@@ -112,13 +112,13 @@ def test_compute_refuses_a_generation_that_is_not_the_one_the_workspaces_name(mo
     assert store.generations == {} and store.current is None
 
 
-def test_the_compute_role_holds_every_privilege_the_persist_statements_use(monkeypatch):
+def test_the_app_role_holds_every_privilege_the_persist_statements_use(monkeypatch):
     from realtime.relation_registry import grants
 
     table_grants = grants()
     for relation in ("rt.screening_generations", "rt.screening_rows", "rt.screening_current"):
-        assert {"SELECT", "INSERT"} <= {name for name, roles in table_grants[relation].items() if "compute" in roles}
-    assert "compute" in table_grants["rt.screening_current"]["UPDATE"]
+        assert {"SELECT", "INSERT"} <= {name for name, roles in table_grants[relation].items() if "app" in roles}
+    assert "app" in table_grants["rt.screening_current"]["UPDATE"]
     store = ScreeningStore()
     run_compute(monkeypatch, ticker_projection(), store)()
     assert store.statements and all(

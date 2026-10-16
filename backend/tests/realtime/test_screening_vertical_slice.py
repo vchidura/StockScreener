@@ -105,6 +105,29 @@ def screening_fixture(session=date(2026, 10, 2), *, current=True):
     )
 
 
+def test_intraday_asof_projection_uses_prior_daily_session_and_completed_intraday_bars():
+    inputs = screening_fixture()
+    calendar = exchange_calendars.get_calendar("XNYS")
+    cutoff = calendar.session_open(str(inputs.session)).to_pydatetime() + timedelta(hours=2)
+    asof = replace(
+        inputs,
+        cutoff=cutoff,
+        bars=tuple(row for row in inputs.bars if row["bar_end"] <= cutoff),
+        known_by=cutoff + timedelta(minutes=15),
+    )
+
+    generation = produce_realtime_screening(asof)
+
+    assert generation.generated_at == cutoff
+    assert generation.manifest["projection_mode"] == "INTRADAY_ASOF_V1"
+    assert generation.manifest["session_status"] == "PARTIAL"
+    assert generation.manifest["daily_as_of_session"] == str(
+        calendar.previous_session(str(inputs.session)).date()
+    )
+    assert generation.status == "COMPLETE"
+    assert len(generation.rows) == len(inputs.members)
+
+
 class ScreeningStore:
     """SQL-boundary fixture: real projection, writer and readers, no PostgreSQL/provider."""
     def __init__(self):

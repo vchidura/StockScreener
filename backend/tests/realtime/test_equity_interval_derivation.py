@@ -6,7 +6,7 @@ from realtime.equity_bar_adapter import RealtimeEquityBarFact
 from realtime.equity_interval_derivation import derive_realtime_interval_facts
 from realtime.preflight import ProviderTier
 from equity.domain import BarSourceKind
-from tests.test_equity_bar_derivation import daily, intraday_5m, security
+from tests.test_equity_bar_derivation import daily, intraday_1m, intraday_5m, security
 
 
 UTC = timezone.utc
@@ -94,6 +94,23 @@ def test_realtime_derives_weekly_and_monthly_on_adjusted_daily_basis():
     assert all(row.revision.adjusted is True for row in (*weekly, *monthly))
     assert all(row.revision.source_bar_revision_ids for row in (*weekly, *monthly))
     assert monthly[0].revision.session_date == date(2026, 8, 31)
+
+
+def test_realtime_derives_five_minutes_only_from_raw_one_minute_bars():
+    item = security()
+    source = _facts(intraday_1m(item))
+
+    result = derive_realtime_interval_facts(
+        item,
+        source,
+        target_interval="5m",
+        observed_at=source[-1].revision.bar_end,
+        ingestion_segment_id=uuid4(),
+    )
+
+    assert len(result) == 78
+    assert all(fact.revision.interval == "5m" for fact in result)
+    assert all(len(fact.revision.source_bar_revision_ids) == 5 for fact in result)
 
 
 def test_realtime_derivation_fails_closed_for_missing_basis_or_mixed_identity():

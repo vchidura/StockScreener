@@ -18,6 +18,7 @@ from realtime.equity_evidence_repository import (
     resolve_evidence_ref_as_of_cursor,
     resolve_release_evidence_refs_cursor,
     load_release_evidence_bodies_cursor,
+    verify_realtime_equity_materializations_persisted_cursor,
 )
 from realtime.equity_materialization_adapter import materialize_realtime_equity_evidence
 from tests.realtime.test_equity_materialization_adapter import _facts, _security
@@ -452,6 +453,78 @@ def test_feature_definition_must_match_materialized_feature_version():
         persist_realtime_equity_materialization(
             MagicMock(), _result(), _definition("equity_features_v2"), generation=1,
         )
+
+
+class _VerifyCursor:
+    """Answers the verifier's SELECTs from a list of stored evidence rows."""
+
+    def __init__(self, rows):
+        self.rows, self.statements, self._page = list(rows), [], []
+
+    def execute(self, statement, parameters):
+        self.statements.append(statement)
+        _, ids = parameters
+        wanted = set(ids)
+        self._page = [row for row in self.rows
+                      if str(row["evidence_id"] if isinstance(row, dict) else row[0]) in wanted]
+
+    def fetchall(self):
+        return self._page
+
+
+def _stored_evidence(prepared):
+    return [(evidence_id, *identity) for evidence_id, identity in prepared.expected_evidence.items()]
+
+
+def test_verification_accepts_exactly_the_persisted_identities_and_reads_only():
+    result, definition = _setup_result(), _definition()
+    write = RealtimeEquityMaterializationWrite(result, definition, 7)
+    prepared = _prepare_realtime_equity_materialization(result, definition, generation=7)
+    cursor = _VerifyCursor(_stored_evidence(prepared))
+    assert verify_realtime_equity_materializations_persisted_cursor(cursor, (write,)) == len(
+        prepared.expected_evidence)
+    assert cursor.statements and all(statement.startswith("SELECT") for statement in cursor.statements)
+    dict_rows = [dict(zip(("evidence_id", "evidence_key", "payload_sha256", "source_window_id",
+                           "source_window_role"), row)) for row in _stored_evidence(prepared)]
+    assert verify_realtime_equity_materializations_persisted_cursor(_VerifyCursor(dict_rows), (write,)) == len(
+        prepared.expected_evidence)
+    assert verify_realtime_equity_materializations_persisted_cursor(_VerifyCursor([]), ()) == 0
+
+
+@pytest.mark.parametrize("defect", ("missing", "payload", "key", "window", "role"))
+def test_verification_fails_closed_on_any_missing_or_different_evidence_row(defect):
+    result, definition = _setup_result(), _definition()
+    write = RealtimeEquityMaterializationWrite(result, definition, 7)
+    stored = _stored_evidence(_prepare_realtime_equity_materialization(result, definition, generation=7))
+    row = list(stored[0])
+    if defect == "missing":
+        stored.pop(0)
+    elif defect == "payload":
+        row[2] = "0" * 64
+        stored[0] = tuple(row)
+    elif defect == "key":
+        row[1] = row[1] + "-other"
+        stored[0] = tuple(row)
+    elif defect == "window":
+        row[3] = str(uuid4())
+        stored[0] = tuple(row)
+    elif defect == "role":
+        row[4] = "PRIMARY" if row[4] != "PRIMARY" else None
+        stored[0] = tuple(row)
+    with pytest.raises(ValueError, match="not persisted as the materializations require"):
+        verify_realtime_equity_materializations_persisted_cursor(_VerifyCursor(stored), (write,))
+
+
+def test_verification_reads_in_bounded_chunks(monkeypatch):
+    import realtime.equity_evidence_repository as repository
+
+    result, definition = _setup_result(), _definition()
+    prepared = _prepare_realtime_equity_materialization(result, definition, generation=7)
+    cursor = _VerifyCursor(_stored_evidence(prepared))
+    monkeypatch.setattr(repository, "_VERIFY_EVIDENCE_CHUNK", 2)
+    verify_realtime_equity_materializations_persisted_cursor(
+        cursor, (RealtimeEquityMaterializationWrite(result, definition, 7),))
+    assert len(cursor.statements) == -(-len(prepared.expected_evidence) // 2) > 1
 
 
 def test_equity_evidence_cursor_api_leaves_transaction_to_worker():

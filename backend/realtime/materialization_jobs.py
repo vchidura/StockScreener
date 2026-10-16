@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -162,6 +162,48 @@ def build_closure_materialization_job(
     )
 
 
+def build_source_closure_materialization_job(
+    *,
+    job_kind: str,
+    cohort_id: UUID,
+    instrument_id: int,
+    interval: str,
+    source_revision_id: UUID,
+    bundle_sha256: str,
+    policy_sha256: str,
+    build_id: str,
+    available_at: datetime,
+) -> MaterializationJob:
+    closure = materialization_closure_sha256(
+        job_kind=job_kind,
+        cohort_id=cohort_id,
+        instrument_id=instrument_id,
+        interval=interval,
+        primary_window_id=None,
+        confirmation_window_ids=(),
+        source_revision_id=source_revision_id,
+        bundle_sha256=bundle_sha256,
+        policy_sha256=policy_sha256,
+        build_id=build_id.strip(),
+    )
+    kind = job_kind.strip().upper()
+    return MaterializationJob(
+        job_id=uuid5(NAMESPACE_URL, f"materialization-job:{kind}:{closure}"),
+        closure_sha256=closure,
+        job_kind=kind,
+        instrument_id=instrument_id,
+        cohort_id=cohort_id,
+        source_revision_id=source_revision_id,
+        bundle_sha256=bundle_sha256,
+        available_at=available_at,
+        interval=interval,
+        primary_window_id=None,
+        confirmation_window_ids=(),
+        policy_sha256=policy_sha256,
+        build_id=build_id,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ClaimedMaterializationJob:
     job: MaterializationJob
@@ -194,6 +236,21 @@ def _job_values(job: MaterializationJob) -> tuple[object, ...]:
 
 
 def _identity(row) -> tuple[object, ...]:
+    if isinstance(row, Mapping):
+        row = tuple(row[name] for name in (
+            "job_id",
+            "closure_sha256",
+            "job_kind",
+            "cohort_id",
+            "instrument_id",
+            "interval",
+            "source_revision_id",
+            "primary_window_id",
+            "confirmation_window_ids",
+            "bundle_sha256",
+            "policy_sha256",
+            "build_id",
+        ))
     return tuple(
         str(value) if isinstance(value, UUID)
         else [str(item) if isinstance(item, UUID) else item for item in value]
@@ -418,6 +475,42 @@ def complete_materialization_job(
     except Exception:
         connection.rollback()
         raise
+
+
+def complete_materialization_job_with_barriers_cursor(
+    cursor,
+    claimed: ClaimedMaterializationJob,
+    *,
+    outcome_input_sha256: str,
+    persist_output: Callable[[object], None],
+    barrier_outcome: BarrierOutcome | None = None,
+) -> None:
+    digest = _sha256(outcome_input_sha256, "outcome_input_sha256")
+    outcome = BarrierOutcome.COMPLETE if barrier_outcome is None else barrier_outcome
+    if not isinstance(outcome, BarrierOutcome):
+        raise TypeError("job barrier outcome is invalid")
+    complete_materialization_job_cursor(cursor, claimed, persist_output=persist_output)
+    cursor.execute(
+        "SELECT member.barrier_id, member.member_key, member.expected_input_sha256 "
+        "FROM rt.job_barrier_members AS member "
+        "JOIN rt.job_barriers AS barrier ON barrier.barrier_id=member.barrier_id "
+        "WHERE member.job_id=%s AND barrier.state='OPEN' "
+        "ORDER BY member.barrier_id, member.member_key FOR UPDATE OF member",
+        (str(claimed.job.job_id),),
+    )
+    memberships = tuple(cursor.fetchall())
+    for barrier_id, member_key, expected_input_sha256 in memberships:
+        if expected_input_sha256 != digest:
+            raise ValueError("job barrier input identity does not match worker output")
+        record_job_barrier_outcome_cursor(
+            cursor,
+            barrier_id=UUID(str(barrier_id)),
+            member_key=str(member_key),
+            outcome=outcome,
+            outcome_input_sha256=(
+                digest if outcome is BarrierOutcome.COMPLETE else None
+            ),
+        )
 
 
 def fail_materialization_job_cursor(

@@ -11,7 +11,7 @@ are never touched (the archive worker owns ARCHIVE_FIRST).
 
 For now only test_realtime_v2_* databases are accepted; stocks_realtime_v2 is refused. This script
 makes no provider request and never prints credentials. While security is deferred it connects as the
-database owner; the hardened phase runs it as the archivist principal.
+database owner; the hardened phase runs it as the admin role (it owns the partitions and the catalogs).
 """
 from __future__ import annotations
 

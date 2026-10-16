@@ -13,6 +13,7 @@ from equity.domain import (
 )
 from realtime.contracts import AssetClass, MarketChannel
 from realtime.equity_bar_adapter import (
+    AdvancedMinuteFinality,
     adapt_advanced_minute_aggregate,
     adapt_developer_equity_bar,
     adapt_derived_equity_bar,
@@ -102,6 +103,20 @@ def _advanced_record():
     )
 
 
+def _advanced_finality(**changes):
+    values = dict(
+        journal_generation=GENERATION,
+        stream_session_id=SESSION,
+        owner_epoch=3,
+        normalized_through_offset=10,
+        event_time_watermark=NOW,
+        proved_at=NOW + timedelta(milliseconds=2),
+        gap_free=True,
+    )
+    values.update(changes)
+    return AdvancedMinuteFinality(**values)
+
+
 def test_developer_rest_bar_retains_delayed_source_identity():
     fact = adapt_developer_equity_bar(
         _developer_revision(),
@@ -120,13 +135,14 @@ def test_advanced_am_bar_retains_exact_journal_and_finality_lineage():
         _advanced_record(),
         cohort_id=COHORT,
         security_id=SECURITY,
+        finality=_advanced_finality(),
     )
 
     assert fact.provider_tier is ProviderTier.MASSIVE_ADVANCED
     assert fact.revision.source_kind is BarSourceKind.REALTIME_STREAM
     assert fact.revision.open_price == Decimal("100")
     assert fact.revision.close_price == Decimal("101")
-    assert fact.revision.system_observed_at == NOW + timedelta(milliseconds=1)
+    assert fact.revision.system_observed_at == NOW + timedelta(milliseconds=2)
     assert fact.journal_generation == GENERATION
     assert fact.stream_session_id == SESSION
     assert fact.source_offset == 10
@@ -138,12 +154,33 @@ def test_bar_sources_cannot_be_relabelled_across_tiers():
             _advanced_record(),
             cohort_id=COHORT,
             security_id=SECURITY,
+            finality=_advanced_finality(),
         )
         type(fact)(
             cohort_id=fact.cohort_id,
             provider_tier=ProviderTier.MASSIVE_DEVELOPER,
             instrument_id=fact.instrument_id,
             revision=fact.revision,
+        )
+
+
+@pytest.mark.parametrize(
+    "finality",
+    [
+        _advanced_finality(event_time_watermark=NOW - timedelta(microseconds=1)),
+        _advanced_finality(normalized_through_offset=9),
+        _advanced_finality(gap_free=False),
+        _advanced_finality(journal_generation=UUID(int=1)),
+        _advanced_finality(stream_session_id=UUID(int=2)),
+    ],
+)
+def test_advanced_am_stays_provisional_until_watermark_offset_session_and_gap_prove_finality(finality):
+    with pytest.raises(ValueError, match="finality"):
+        adapt_advanced_minute_aggregate(
+            _advanced_record(),
+            cohort_id=COHORT,
+            security_id=SECURITY,
+            finality=finality,
         )
 
 

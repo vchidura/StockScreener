@@ -104,7 +104,10 @@ def restricted(inputs, tickers):
 @pytest.mark.parametrize("clock", CLOCKS)
 def test_the_alert_domain_checks_the_recording_clocks_against_recorded_by(clock):
     inputs = restricted(timely_fixture(), ("AAPL", "MSFT"))
-    index = next(i for i, row in enumerate(inputs.bars) if row["interval"] == "1m")
+    index = next(
+        i for i, row in enumerate(inputs.bars)
+        if row["interval"] == "1d" and row["adjustment_basis"] == "ADJUSTED"
+    )
     late = with_clock(inputs, index, **{clock: LATE})
     with pytest.raises(ValueError, match="beyond cutoff|availability drift"):
         alert_domain_inputs(late)

@@ -539,7 +539,7 @@ def _require_whole_utc_days(partition: PartitionInfo) -> None:
 class PostgresPartitionRetentionRepository:
     """`connect` returns a new psycopg2 connection each call (the caller owns credentials).
 
-    Needs the owner (DETACH, DROP) and DELETE on the catalogs: the archivist principal in the hardened
+    Needs the owner (DETACH, DROP) and DELETE on the catalogs: the admin role in the hardened
     phase, the database owner while security is deferred. Partition listing and the detach-then-drop
     DDL are the session archive repository's.
     """

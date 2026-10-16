@@ -19,6 +19,28 @@ from .preflight import ProviderTier
 
 
 @dataclass(frozen=True, slots=True)
+class AdvancedMinuteFinality:
+    journal_generation: UUID
+    stream_session_id: UUID
+    owner_epoch: int
+    normalized_through_offset: int
+    event_time_watermark: datetime
+    proved_at: datetime
+    gap_free: bool
+
+    def __post_init__(self) -> None:
+        if self.owner_epoch <= 0 or self.normalized_through_offset <= 0:
+            raise ValueError("Advanced minute finality owner epoch and offset must be positive")
+        for name in ("event_time_watermark", "proved_at"):
+            value = getattr(self, name)
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError(f"Advanced minute finality {name} must be timezone-aware")
+            object.__setattr__(self, name, value.astimezone(timezone.utc))
+        if type(self.gap_free) is not bool:
+            raise TypeError("Advanced minute finality gap_free must be boolean")
+
+
+@dataclass(frozen=True, slots=True)
 class RealtimeEquityBarFact:
     cohort_id: UUID
     provider_tier: ProviderTier
@@ -83,7 +105,10 @@ def adapt_advanced_minute_aggregate(
     *,
     cohort_id: UUID,
     security_id: UUID,
+    finality: AdvancedMinuteFinality,
 ) -> RealtimeEquityBarFact:
+    if not isinstance(finality, AdvancedMinuteFinality):
+        raise TypeError("Advanced bar adapter requires an AdvancedMinuteFinality proof")
     if (
         record.asset_class is not AssetClass.EQUITY
         or record.event_kind is not MarketChannel.MINUTE_AGGREGATE
@@ -111,6 +136,15 @@ def adapt_advanced_minute_aggregate(
     bar_end = datetime.fromtimestamp(end_timestamp / 1000, tz=timezone.utc)
     if bar_end != record.event_at or record.received_at < bar_end:
         raise ValueError("Advanced AM clocks violate finality")
+    if (
+        finality.journal_generation != record.journal_generation
+        or finality.stream_session_id != record.stream_session_id
+        or finality.normalized_through_offset < record.event_offset
+        or finality.event_time_watermark < bar_end
+        or not finality.gap_free
+        or finality.proved_at < record.committed_at
+    ):
+        raise ValueError("Advanced AM finality proof does not cover the normalized event")
     if record.size is None:
         raise ValueError("Advanced AM volume is unavailable")
     revision_id = uuid5(
@@ -137,7 +171,7 @@ def adapt_advanced_minute_aggregate(
         source_kind=BarSourceKind.REALTIME_STREAM,
         availability_mode=BarAvailabilityMode.LIVE_OBSERVED,
         is_final=True,
-        system_observed_at=record.received_at,
+        system_observed_at=max(record.received_at, finality.proved_at),
         replay_available_at=None,
         adjusted=False,
         payload_sha256=record.payload_sha256,
