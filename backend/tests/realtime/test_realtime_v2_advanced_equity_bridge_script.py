@@ -70,6 +70,18 @@ def test_cli_requires_safe_target_mode_and_bounded_batch():
     with pytest.raises(SystemExit):
         script.parse_args([*BASE, "--once", "--security-mode", "hardened"])
 
+    hardened = script.parse_args([
+        *BASE,
+        "--once",
+        "--security-mode",
+        "hardened",
+        "--journal-root",
+        ".",
+    ])
+    assert hardened.security_mode == "hardened"
+    assert hardened.journal.is_absolute()
+    assert hardened.journal_root.is_absolute()
+
 
 def test_once_wires_raw_reader_and_v2_worker_database(monkeypatch, capsys):
     pool = MagicMock()

@@ -99,9 +99,61 @@ RELATIONS: dict[str, Relation] = {
     "rt.slot_set_members": _r("options", "BOUNDED", append=True),
     "rt.slot_set_current": _r("options", "BOUNDED", mutable=True),
     "rt.cohorts": _r("control", "BOUNDED", append=True, api=True),
+    "rt.cohort_history_bindings": _r(
+        "control", "BOUNDED", append=True, api=True
+    ),
     "rt.worker_leases": _r("control", "BOUNDED", mutable=True, delete=True),
     "rt.readiness_current": _r("control", "BOUNDED", mutable=True, api=True),
     "rt.readiness_transitions": _r("control", "BOUNDED", append=True, api=True),
+    "rt.advanced_stream_authorizations": _r("control", "BOUNDED"),
+    "rt.advanced_stream_authorization_status": _r(
+        "control", "BOUNDED", api=True
+    ),
+    "rt.advanced_ingress_runtime_profiles": _r(
+        "control", "BOUNDED", api=True
+    ),
+    "rt.advanced_ingress_cohort_bindings": _r(
+        "control", "BOUNDED", api=True
+    ),
+    "rt.advanced_ingress_plans": _r(
+        "control", "BOUNDED", mutable=True, api=True
+    ),
+    "rt.advanced_ingress_plan_usage": _r(
+        "control", "BOUNDED", mutable=True, api=True
+    ),
+    "rt.advanced_journal_registry": _r(
+        "control", "BOUNDED", mutable=True, api=True
+    ),
+    "rt.advanced_journal_capacity_events": _r(
+        "control", "KEPT_3M", append=True, api=True
+    ),
+    "rt.advanced_gap_repairs": _r(
+        "control", "KEPT_3M", mutable=True, api=True
+    ),
+    "rt.advanced_repair_payloads": _r(
+        "control", "HOT_TTL", append=True
+    ),
+    "rt.advanced_gap_dependencies": _r(
+        "control", "BOUNDED", mutable=True, api=True
+    ),
+    "rt.advanced_gap_alerts": _r(
+        "control", "KEPT_3M", mutable=True, api=True
+    ),
+    "rt.advanced_backfill_runs": _r(
+        "control", "KEPT_3M", mutable=True, api=True
+    ),
+    "rt.advanced_backfill_work": _r(
+        "control", "KEPT_3M", mutable=True, api=True
+    ),
+    "rt.advanced_backfill_releases": _r(
+        "control", "KEPT_3M", append=True, api=True
+    ),
+    "rt.advanced_scheduler_sessions": _r(
+        "control", "KEPT_3M", mutable=True, api=True
+    ),
+    "rt.advanced_window_retries": _r(
+        "control", "KEPT_3M", mutable=True, api=True
+    ),
     "rt.stream_sessions": _r("shared", "BOUNDED", mutable=True),
     "rt.stream_gaps": _r("shared", "BOUNDED", mutable=True),
     "rt.provider_tier_transitions": _r("control", "BOUNDED", append=True, api=True),

@@ -41,6 +41,7 @@ FIVE_MINUTE_DERIVATION_POLICIES = {
 ONE_MINUTE_DERIVATION_POLICIES = {
     "5m": "xnys_realtime_1m_to_5m_v1",
 }
+ADVANCED_SPARSE_MINUTE_POLICY = "xnys_advanced_sparse_am_1m_to_5m_v1"
 
 
 def derive_minute_bars(
@@ -65,6 +66,132 @@ def derive_minute_bars(
         ingestion_segment_id=ingestion_segment_id,
         calendar=exchange_calendars.get_calendar(calendar_name),
         derivation_policy=ONE_MINUTE_DERIVATION_POLICIES[target_interval],
+    )
+
+
+def derive_advanced_sparse_minute_window(
+    security: SecurityReferenceRevision,
+    source_bars: Sequence[EquityBarRevision],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    observed_at: datetime,
+    ingestion_segment_id: UUID,
+) -> EquityBarRevision:
+    start = _utc(window_start)
+    end = _utc(window_end)
+    observed = _utc(observed_at)
+    if end - start != timedelta(minutes=5):
+        raise ValueError(
+            "Advanced sparse derivation requires one five-minute window"
+        )
+    ordered = tuple(sorted(source_bars, key=lambda row: row.bar_start))
+    if not ordered:
+        raise ValueError(
+            "Advanced sparse derivation requires at least one traded minute"
+        )
+    _validate_sources(security, ordered, "1m")
+    if (
+        len({row.bar_start for row in ordered}) != len(ordered)
+        or any(
+            row.bar_end - row.bar_start != timedelta(minutes=1)
+            or row.bar_start < start
+            or row.bar_end > end
+            for row in ordered
+        )
+    ):
+        raise ValueError(
+            "Advanced sparse derivation source windows are invalid"
+        )
+    source_ids = tuple(row.bar_revision_id for row in ordered)
+    volume = sum((row.volume for row in ordered), Decimal("0"))
+    vwap_volume = sum(
+        (
+            row.volume
+            for row in ordered
+            if row.vwap is not None
+        ),
+        Decimal("0"),
+    )
+    weighted_vwap = sum(
+        (
+            row.vwap * row.volume
+            for row in ordered
+            if row.vwap is not None
+        ),
+        Decimal("0"),
+    )
+    vwap = weighted_vwap / vwap_volume if vwap_volume > 0 else None
+    transaction_counts = [
+        row.transaction_count
+        for row in ordered
+        if row.transaction_count is not None
+    ]
+    missing_starts = tuple(
+        value
+        for value in (
+            start + timedelta(minutes=index)
+            for index in range(5)
+        )
+        if value not in {row.bar_start for row in ordered}
+    )
+    payload = {
+        "adjusted": False,
+        "interval": "5m",
+        "policy": ADVANCED_SPARSE_MINUTE_POLICY,
+        "session_scope": BarSessionScope.RTH.value,
+        "source_bar_revision_ids": [
+            str(value) for value in source_ids
+        ],
+        "missing_no_trade_starts": [
+            value.isoformat() for value in missing_starts
+        ],
+        "ticker": security.ticker,
+        "window_start": start.isoformat(),
+        "window_end": end.isoformat(),
+    }
+    digest = sha256_json(payload)
+    return EquityBarRevision(
+        bar_revision_id=uuid5(
+            NAMESPACE_URL,
+            f"equity-bar:{security.ticker}:5m:{start.isoformat()}:"
+            f"DERIVED:{ADVANCED_SPARSE_MINUTE_POLICY}:{digest}",
+        ),
+        security_id=security.security_id,
+        ticker=security.ticker,
+        interval="5m",
+        session_date=ordered[-1].session_date,
+        bar_start=start,
+        bar_end=end,
+        open_price=ordered[0].open_price,
+        high_price=max(row.high_price for row in ordered),
+        low_price=min(row.low_price for row in ordered),
+        close_price=ordered[-1].close_price,
+        volume=volume,
+        vwap=vwap,
+        transaction_count=(
+            sum(transaction_counts)
+            if transaction_counts
+            else None
+        ),
+        source_kind=BarSourceKind.DERIVED,
+        availability_mode=BarAvailabilityMode.LIVE_OBSERVED,
+        is_final=True,
+        system_observed_at=max(observed, end),
+        replay_available_at=None,
+        adjusted=False,
+        payload_sha256=digest,
+        quality_codes=(
+            "DERIVED_FROM_ADVANCED_AM_1M",
+            *(
+                ("ADVANCED_NO_TRADE_MINUTES",)
+                if missing_starts
+                else ()
+            ),
+        ),
+        ingestion_segment_id=ingestion_segment_id,
+        source_bar_revision_ids=source_ids,
+        session_scope=BarSessionScope.RTH,
     )
 
 

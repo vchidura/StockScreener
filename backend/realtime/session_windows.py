@@ -12,10 +12,19 @@ from datetime import date, datetime, timedelta
 
 MAX_BUDGET_SECONDS = 300
 WINDOW_MINUTES = 15
+ADVANCED_WINDOW_MINUTES = 5
 
 
 @dataclass(frozen=True, slots=True)
 class DeveloperSessionWindow:
+    cutoff: datetime
+    available_after: datetime
+    deadline: datetime
+    serving_expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AdvancedSessionWindow:
     cutoff: datetime
     available_after: datetime
     deadline: datetime
@@ -39,5 +48,46 @@ def developer_session_windows(session_date: date, *, completion_budget_seconds: 
         windows.append(DeveloperSessionWindow(
             cutoff, release, release + timedelta(seconds=completion_budget_seconds),
             release + step + timedelta(seconds=serving_lag_seconds)))
+        cutoff += step
+    return tuple(windows)
+
+
+def advanced_session_windows(
+    session_date: date,
+    *,
+    finality_delay_seconds: int,
+    completion_budget_seconds: int,
+    serving_lag_seconds: int,
+    calendar=None,
+) -> tuple[AdvancedSessionWindow, ...]:
+    from options.calendar import OptionExchangeCalendar
+
+    if (
+        type(finality_delay_seconds) is not int
+        or not 1 <= finality_delay_seconds <= 60
+        or type(completion_budget_seconds) is not int
+        or not 1 <= completion_budget_seconds <= MAX_BUDGET_SECONDS
+        or type(serving_lag_seconds) is not int
+        or not 1 <= serving_lag_seconds <= MAX_BUDGET_SECONDS
+    ):
+        raise ValueError(
+            "Advanced schedule requires reviewed bounded finality/completion/serving budgets"
+        )
+    calendar = calendar or OptionExchangeCalendar()
+    opened = calendar.session_open(session_date)
+    closed = calendar.session_close(session_date)
+    step = timedelta(minutes=ADVANCED_WINDOW_MINUTES)
+    cutoff = opened + step
+    windows = []
+    while cutoff <= closed:
+        release = cutoff + timedelta(seconds=finality_delay_seconds)
+        windows.append(
+            AdvancedSessionWindow(
+                cutoff,
+                release,
+                release + timedelta(seconds=completion_budget_seconds),
+                release + step + timedelta(seconds=serving_lag_seconds),
+            )
+        )
         cutoff += step
     return tuple(windows)

@@ -2,13 +2,20 @@
 from dataclasses import replace
 from datetime import timedelta
 from functools import lru_cache
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
 from realtime.contracts import canonical_json, canonical_sha256
 from realtime.lineage_head import BOUNDED_MANIFEST_BYTES, bar_lineage_head
-from realtime.ticker_projection import TickerProjectionState, project_realtime_ticker_workspace
+from realtime.ticker_projection import (
+    _DerivationVerifier,
+    TickerProjectionState,
+    _fact,
+    _security,
+    project_realtime_ticker_workspace,
+)
+from realtime.preflight import ProviderTier
 from tests.realtime.test_ticker_vertical_slice import ticker_fixture
 
 TICKERS = ("AAPL", "MSFT")
@@ -71,6 +78,84 @@ def test_the_manifest_is_a_bounded_lineage_head_not_embedded_bars(primed):
         for name in ("actions", "coverage", "market_events", "market_event_coverage",
                      "fundamental_reports", "fundamental_coverage"):
             assert set(manifest[name]) == {"count", "sha256"}
+
+
+def test_advanced_rest_fact_preserves_explicit_repair_lineage():
+    row = dict(
+        next(
+            row
+            for row in two_names().bars
+            if row["source_kind"] == "NATIVE_REST"
+        ),
+        provider_tier="MASSIVE_ADVANCED",
+        quality_codes=("EXPLICIT_ADVANCED_REST_REPAIR_V1",),
+    )
+
+    fact = _fact(row, two_names())
+
+    assert fact.revision.quality_codes == (
+        "EXPLICIT_ADVANCED_REST_REPAIR_V1",
+    )
+
+
+def test_derivation_verifier_separates_bound_history_from_advanced_bars():
+    inputs = two_names()
+    rows = [
+        row
+        for row in inputs.bars
+        if row["ticker"] == "AAPL"
+        and row["interval"] == "5m"
+        and row["adjustment_basis"] == "RAW_UNADJUSTED"
+    ]
+    sessions = sorted({row["session_date"] for row in rows})[-2:]
+    source_by_session = {}
+    for session in sessions:
+        source_by_session[session] = tuple(
+            _fact(
+                (
+                    dict(
+                        row,
+                        cohort_id=UUID(int=9),
+                        provider_tier=ProviderTier.MASSIVE_ADVANCED.value,
+                        quality_codes=(
+                            "EXPLICIT_ADVANCED_REST_REPAIR_V1",
+                        ),
+                    )
+                    if session == sessions[-1]
+                    else row
+                ),
+                inputs,
+            )
+            for row in rows
+            if row["session_date"] == session
+        )
+    member = next(
+        row for row in inputs.members if row["ticker"] == "AAPL"
+    )
+    verifier = _DerivationVerifier(
+        TickerProjectionState(),
+        _security(member),
+        inputs,
+        UUID(int=10),
+    )
+
+    verifier._prefetch("1d", source_by_session, sessions)
+
+    assert all(verifier._derived[("1d", session)] for session in sessions)
+    assert verifier.verify_mixed_whole(
+        "1d",
+        tuple(
+            fact
+            for session in sessions
+            for fact in source_by_session[session]
+        ),
+        (),
+        {
+            fact.revision.source_kind
+            for facts in source_by_session.values()
+            for fact in facts
+        },
+    ) == 2
 
 
 def test_a_long_lived_state_never_changes_the_result(primed):

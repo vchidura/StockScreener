@@ -1,6 +1,7 @@
 """Closure-keyed raw higher-interval derivation from current final 5m inputs."""
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -10,7 +11,7 @@ from .acquisition_ledger import (
     advance_acquisition_watermark_cursor,
 )
 from .contracts import canonical_sha256
-from .equity_bar_adapter import adapt_developer_equity_bar
+from .equity_bar_adapter import RealtimeEquityBarFact
 from .equity_bar_repository import persist_realtime_equity_bars_cursor
 from .equity_interval_derivation import derive_realtime_interval_facts
 from .equity_interval_finalizer import (
@@ -28,6 +29,7 @@ from .materialization_jobs import (
     build_source_closure_materialization_job,
     enqueue_materialization_job_cursor,
 )
+from .preflight import ProviderTier
 from .worker_database import RealtimeProcessDatabase
 
 
@@ -41,6 +43,9 @@ DERIVATION_POLICY_SHA256 = canonical_sha256({
     "session_scope": "RTH",
 })
 DERIVATION_BUILD_ID = "v2-incremental-derivation-v1"
+ADVANCED_DERIVATION_BUILD_ID = (
+    "v2-advanced-interval-derivation-v2"
+)
 DERIVATION_OVERLAP_POLICY = "v2_derived_exact_source_closure_v1"
 
 
@@ -87,14 +92,35 @@ def _load_current_five_minute_facts(
             checked_at,
         ),
     )
-    revisions = tuple(_bar_revision(row) for row in cursor.fetchall())
     return tuple(
-        adapt_developer_equity_bar(
-            revision,
-            cohort_id=cohort_id,
-            instrument_id=instrument_id,
+        RealtimeEquityBarFact(
+            cohort_id=UUID(str(row["cohort_id"])),
+            provider_tier=ProviderTier(row["provider_tier"]),
+            instrument_id=int(row["instrument_id"]),
+            revision=_bar_revision(row),
         )
-        for revision in revisions
+        for row in cursor.fetchall()
+    )
+
+
+def _output_fact(
+    fact: RealtimeEquityBarFact,
+    *,
+    build_id: str,
+) -> RealtimeEquityBarFact:
+    if fact.provider_tier is not ProviderTier.MASSIVE_ADVANCED:
+        return fact
+    return replace(
+        fact,
+        revision=replace(
+            fact.revision,
+            bar_revision_id=uuid5(
+                NAMESPACE_URL,
+                "stockscreener:advanced-interval-derivation:"
+                f"{build_id}:{fact.cohort_id}:"
+                f"{fact.revision.bar_revision_id}",
+            ),
+        ),
     )
 
 
@@ -129,6 +155,12 @@ def enqueue_interval_derivation_jobs_cursor(
         )
         if not sources:
             continue
+        effective_build_id = (
+            ADVANCED_DERIVATION_BUILD_ID
+            if sources[0].provider_tier
+            is ProviderTier.MASSIVE_ADVANCED
+            else build_id
+        )
         security = _load_finalizer_security_cursor(
             cursor,
             instrument_id=instrument_id,
@@ -164,7 +196,7 @@ def enqueue_interval_derivation_jobs_cursor(
                     source_revision_id=source_ids[0],
                     bundle_sha256=bundle,
                     policy_sha256=policy_sha256,
-                    build_id=build_id,
+                    build_id=effective_build_id,
                     available_at=checked,
                 )
                 enqueue_materialization_job_cursor(cursor, job)
@@ -183,7 +215,10 @@ def prepare_interval_derivation_output(
         or job.source_revision_id is None
         or job.bundle_sha256 is None
         or job.policy_sha256 != DERIVATION_POLICY_SHA256
-        or job.build_id != DERIVATION_BUILD_ID
+        or job.build_id not in {
+            DERIVATION_BUILD_ID,
+            ADVANCED_DERIVATION_BUILD_ID,
+        }
     ):
         raise ValueError("claimed derivation job contract is invalid")
     with database.transaction(read_only=True, dict_cursor=True) as cursor:
@@ -207,6 +242,16 @@ def prepare_interval_derivation_output(
             session_date=source["session_date"],
             checked_at=job.available_at,
         )
+        expected_build_id = (
+            ADVANCED_DERIVATION_BUILD_ID
+            if sources[0].provider_tier
+            is ProviderTier.MASSIVE_ADVANCED
+            else DERIVATION_BUILD_ID
+        )
+        if job.build_id != expected_build_id:
+            raise ValueError(
+                "derivation job provider/build identity changed"
+            )
         security = _load_finalizer_security_cursor(
             cursor,
             instrument_id=job.instrument_id,
@@ -230,6 +275,10 @@ def prepare_interval_derivation_output(
     )
     if derived is None:
         raise ValueError("derivation job source window is no longer complete")
+    derived = _output_fact(
+        derived,
+        build_id=job.build_id,
+    )
     bundle = canonical_sha256({
         "target_interval": job.interval,
         "bar_start": derived.revision.bar_start,

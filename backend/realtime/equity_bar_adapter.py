@@ -69,12 +69,25 @@ class RealtimeEquityBarFact:
             if self.revision.ingestion_segment_id is None:
                 raise ValueError("derived bar requires a materialization segment")
         elif self.provider_tier is ProviderTier.MASSIVE_ADVANCED:
-            if self.revision.source_kind is not BarSourceKind.REALTIME_STREAM:
-                raise ValueError("Advanced bar must use realtime stream source kind")
-            if any(value is None for value in journal_values):
-                raise ValueError("Advanced bar requires complete journal lineage")
-            if self.revision.ingestion_segment_id is not None:
-                raise ValueError("Advanced stream bar cannot use a REST ingestion segment")
+            if self.revision.source_kind is BarSourceKind.REALTIME_STREAM:
+                if any(value is None for value in journal_values):
+                    raise ValueError("Advanced bar requires complete journal lineage")
+                if self.revision.ingestion_segment_id is not None:
+                    raise ValueError("Advanced stream bar cannot use a REST ingestion segment")
+            elif self.revision.source_kind is BarSourceKind.NATIVE_REST:
+                if (
+                    any(value is not None for value in journal_values)
+                    or self.revision.ingestion_segment_id is None
+                    or "EXPLICIT_ADVANCED_REST_REPAIR_V1"
+                    not in self.revision.quality_codes
+                ):
+                    raise ValueError(
+                        "Advanced REST bar requires explicit repair lineage"
+                    )
+            else:
+                raise ValueError(
+                    "Advanced bar must use stream or explicit REST repair"
+                )
         else:
             if self.revision.source_kind is not BarSourceKind.NATIVE_REST:
                 raise ValueError("Developer bar must use native REST source kind")
@@ -150,8 +163,7 @@ def adapt_advanced_minute_aggregate(
     revision_id = uuid5(
         NAMESPACE_URL,
         f"realtime-equity-bar:{cohort_id}:{record.instrument_id}:1m:"
-        f"{bar_start.isoformat()}:{record.journal_generation}:{record.event_offset}:"
-        f"{record.payload_sha256}",
+        f"{bar_start.isoformat()}:{record.payload_sha256}",
     )
     revision = EquityBarRevision(
         bar_revision_id=revision_id,

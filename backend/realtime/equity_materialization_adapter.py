@@ -44,21 +44,54 @@ def materialize_realtime_equity_evidence(
         tuple[str, str, str | None, int | None], UUID
     ] | None = None,
     level_directions: Sequence[int] = (),
+    target_cohort_id: UUID | None = None,
+    target_provider_tier: ProviderTier | None = None,
+    target_instrument_id: int | None = None,
 ) -> RealtimeEquityMaterializationResult:
     rows = tuple(bars)
     confirmations = tuple(confirmation_bars)
     if not rows:
         raise ValueError("realtime equity materialization requires bars")
-    identities = {
-        (row.cohort_id, row.provider_tier, row.instrument_id)
+    source_instruments = {
+        row.instrument_id
         for row in (*rows, *confirmations)
     }
-    if len(identities) != 1:
-        raise ValueError("realtime equity materialization cannot mix cohort/tier/instrument")
-    cohort_id, provider_tier, instrument_id = next(iter(identities))
-    revisions = tuple(sorted((row.revision for row in rows), key=lambda row: row.bar_start))
+    target_values = (
+        target_cohort_id,
+        target_provider_tier,
+        target_instrument_id,
+    )
+    if any(value is not None for value in target_values):
+        if (
+            any(value is None for value in target_values)
+            or len(source_instruments) != 1
+            or next(iter(source_instruments)) != target_instrument_id
+        ):
+            raise ValueError(
+                "realtime equity materialization target is incomplete"
+            )
+        cohort_id = target_cohort_id
+        provider_tier = target_provider_tier
+        instrument_id = target_instrument_id
+    else:
+        identities = {
+            (row.cohort_id, row.provider_tier, row.instrument_id)
+            for row in (*rows, *confirmations)
+        }
+        if len(identities) != 1:
+            raise ValueError(
+                "realtime equity materialization cannot mix cohort/tier/instrument"
+            )
+        cohort_id, provider_tier, instrument_id = next(iter(identities))
+    ordered_facts = tuple(
+        sorted(rows, key=lambda row: row.revision.bar_start)
+    )
+    ordered_confirmations = tuple(
+        sorted(confirmations, key=lambda row: row.revision.bar_start)
+    )
+    revisions = tuple(row.revision for row in ordered_facts)
     confirmation_revisions = tuple(
-        sorted((row.revision for row in confirmations), key=lambda row: row.bar_start)
+        row.revision for row in ordered_confirmations
     )
     interval = revisions[0].interval
     if any(
@@ -79,11 +112,22 @@ def materialize_realtime_equity_evidence(
         "security_revision_id": security.security_revision_id,
         "interval": interval,
         "bar_revisions": tuple(
-            (row.bar_revision_id, row.payload_sha256) for row in revisions
+            (
+                fact.cohort_id,
+                fact.provider_tier.value,
+                fact.revision.bar_revision_id,
+                fact.revision.payload_sha256,
+            )
+            for fact in ordered_facts
         ),
         "confirmation_revisions": tuple(
-            (row.bar_revision_id, row.payload_sha256)
-            for row in confirmation_revisions
+            (
+                fact.cohort_id,
+                fact.provider_tier.value,
+                fact.revision.bar_revision_id,
+                fact.revision.payload_sha256,
+            )
+            for fact in ordered_confirmations
         ),
         "observed_at": observed,
     }

@@ -106,10 +106,10 @@ def minute_bars(item, *, observed_offset_seconds=0):
     return tuple(rows)
 
 
-def window():
+def window(provider_tier=ProviderTier.MASSIVE_DEVELOPER):
     return finalizer.FiveMinuteFinalizerWindow(
         cohort_id=COHORT,
-        provider_tier=ProviderTier.MASSIVE_DEVELOPER,
+        provider_tier=provider_tier,
         window_id=WINDOW,
         window_start=START,
         window_end=END,
@@ -190,6 +190,35 @@ def test_finalizer_input_classifies_complete_gap_and_late_without_inventing_bars
         )
 
 
+def test_advanced_finalizer_distinguishes_sparse_no_trade_from_gap():
+    item = security()
+    advanced = window(ProviderTier.MASSIVE_ADVANCED)
+    sparse = finalizer.build_five_minute_finalizer_input(
+        advanced,
+        instrument_id=7,
+        security=item,
+        source_bars=minute_bars(item)[::2],
+        checked_at=END + timedelta(seconds=5),
+        policy_sha256=POLICY,
+        build_id="build-1",
+        gap_free_coverage=True,
+    )
+    no_trade = finalizer.build_five_minute_finalizer_input(
+        advanced,
+        instrument_id=7,
+        security=item,
+        source_bars=(),
+        checked_at=END + timedelta(seconds=5),
+        policy_sha256=POLICY,
+        build_id="build-1",
+        gap_free_coverage=True,
+    )
+
+    assert sparse.outcome is finalizer.FiveMinuteFinalizerOutcome.COMPLETE
+    assert no_trade.outcome is finalizer.FiveMinuteFinalizerOutcome.NO_TRADE
+    assert sparse.gap_free_coverage and no_trade.gap_free_coverage
+
+
 def test_enqueuer_uses_one_logical_job_per_instrument_window_and_exact_barrier(monkeypatch):
     first = input_for(7)
     second = input_for(8)
@@ -244,6 +273,13 @@ def test_enqueuer_uses_one_logical_job_per_instrument_window_and_exact_barrier(m
         (finalizer.FiveMinuteFinalizerOutcome.COMPLETE, 1, BarrierOutcome.COMPLETE, "COMPLETE", ()),
         (finalizer.FiveMinuteFinalizerOutcome.LATE, 1, BarrierOutcome.COMPLETE, "COMPLETE", ("FINALIZER_LATE",)),
         (finalizer.FiveMinuteFinalizerOutcome.GAP, 0, BarrierOutcome.MISSING, "GAP", ("FINALIZER_GAP",)),
+        (
+            finalizer.FiveMinuteFinalizerOutcome.NO_TRADE,
+            0,
+            BarrierOutcome.COMPLETE,
+            "COMPLETE",
+            ("FINALIZER_NO_TRADE",),
+        ),
     ],
 )
 def test_prepare_persists_bar_and_watermark_as_one_worker_output(
@@ -254,10 +290,20 @@ def test_prepare_persists_bar_and_watermark_as_one_worker_output(
         prepared_input = replace(prepared_input, outcome=outcome)
     elif outcome is finalizer.FiveMinuteFinalizerOutcome.GAP:
         prepared_input = replace(prepared_input, outcome=outcome, source_bars=prepared_input.source_bars[:-1])
+    elif outcome is finalizer.FiveMinuteFinalizerOutcome.NO_TRADE:
+        prepared_input = replace(
+            prepared_input,
+            window=window(ProviderTier.MASSIVE_ADVANCED),
+            outcome=outcome,
+            source_bars=(),
+            gap_free_coverage=True,
+        )
     job = claimed(prepared_input)
     database = Database()
     monkeypatch.setattr(
-        finalizer, "_load_finalizer_window_cursor", MagicMock(return_value=window())
+        finalizer,
+        "_load_finalizer_window_cursor",
+        MagicMock(return_value=prepared_input.window),
     )
     monkeypatch.setattr(
         finalizer,
@@ -285,6 +331,56 @@ def test_prepare_persists_bar_and_watermark_as_one_worker_output(
         if outcome is finalizer.FiveMinuteFinalizerOutcome.GAP
         else END
     )
+
+
+def test_advanced_sparse_finalizer_derives_full_window_without_invented_minutes(
+    monkeypatch,
+):
+    item = security()
+    prepared_input = finalizer.build_five_minute_finalizer_input(
+        window(ProviderTier.MASSIVE_ADVANCED),
+        instrument_id=7,
+        security=item,
+        source_bars=minute_bars(item)[::2],
+        checked_at=END + timedelta(seconds=5),
+        policy_sha256=POLICY,
+        build_id="build-1",
+        gap_free_coverage=True,
+    )
+    job = claimed(prepared_input)
+    database = Database()
+    database.cursor.fetchone.return_value = None
+    monkeypatch.setattr(
+        finalizer,
+        "_load_finalizer_window_cursor",
+        MagicMock(return_value=prepared_input.window),
+    )
+    monkeypatch.setattr(
+        finalizer,
+        "_load_finalizer_member_input_cursor",
+        MagicMock(return_value=prepared_input),
+    )
+    persist = MagicMock()
+    monkeypatch.setattr(
+        finalizer,
+        "persist_realtime_equity_bars_cursor",
+        persist,
+    )
+    monkeypatch.setattr(
+        finalizer,
+        "advance_acquisition_watermark_cursor",
+        MagicMock(return_value=True),
+    )
+
+    output = finalizer.prepare_five_minute_finalizer_output(database, job)
+    output.persist_output(database.cursor)
+
+    fact = persist.call_args.args[1][0]
+    assert fact.revision.bar_start == START
+    assert fact.revision.bar_end == END
+    assert fact.revision.volume == Decimal("3000")
+    assert len(fact.revision.source_bar_revision_ids) == 3
+    assert "ADVANCED_NO_TRADE_MINUTES" in fact.revision.quality_codes
 
 
 def test_finalizer_runner_reuses_bounded_generic_worker_claims(monkeypatch):

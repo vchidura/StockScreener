@@ -184,7 +184,11 @@ def _input_identity_database(*, second_watermark=True, batch_sha="9" * 64):
     return _Database([scope, members, seeds, tuple(watermarks)])
 
 
-def _advanced_input_identity_database(*, gaps=()):
+def _advanced_input_identity_database(
+    *,
+    gaps=(),
+    no_trade_instrument=None,
+):
     scope = (
         "1" * 64, "2" * 64, "3" * 64, "4" * 64,
         UUID(int=1), "5" * 64, "6" * 64, "7" * 64, 2,
@@ -197,18 +201,42 @@ def _advanced_input_identity_database(*, gaps=()):
     )
     seeds = ((UUID(int=7), "f" * 64, "6" * 64, {"reference": 1}),)
     sessions = (
-        (UUID(int=20), "massive", "STOCKS", UUID(int=1), UUID(int=21), 4, NOW, "LIVE"),
+        (
+            UUID(int=20), "massive", "STOCKS", UUID(int=1),
+            UUID(int=21), 4, NOW, "LIVE", UUID(int=22), NOW,
+        ),
     )
     checkpoints = (
-        ("equity-finalizer", UUID(int=22), 0, "0" * 64, 4, 100, UUID(int=23), "1" * 64),
+        (
+            "equity-finalizer", UUID(int=22), 0, "0" * 64, 4,
+            100, UUID(int=23), "1" * 64, str(UUID(int=20)), NOW,
+        ),
     )
-    heads = (
+    heads = tuple(row for row in (
         (11, "1m", UUID(int=24), "2" * 64, NOW, UUID(int=22), UUID(int=20), 90, []),
         (12, "1m", UUID(int=25), "3" * 64, NOW, UUID(int=22), UUID(int=20), 91, []),
         (11, "5m", UUID(int=26), "4" * 64, NOW, None, None, None, [UUID(int=24)]),
         (12, "5m", UUID(int=27), "5" * 64, NOW, None, None, None, [UUID(int=25)]),
-    )
-    return _Database([scope, members, seeds, sessions, checkpoints, tuple(gaps), heads])
+    ) if row[0] != no_trade_instrument)
+    finalizer_progress = (
+        (
+            no_trade_instrument,
+            NOW,
+            NOW,
+            "COMPLETE",
+            ["FINALIZER_NO_TRADE"],
+        ),
+    ) if no_trade_instrument is not None else ()
+    return _Database([
+        scope,
+        members,
+        seeds,
+        sessions,
+        checkpoints,
+        tuple(gaps),
+        heads,
+        finalizer_progress,
+    ])
 
 
 def test_input_ready_binds_full_scope_exact_members_sources_and_reference_generations():
@@ -277,6 +305,23 @@ def test_advanced_input_ready_binds_stream_checkpoint_gap_and_finalizer_heads():
         reference_generation=1,
     )
     assert universe == "6" * 64 and len(digest) == 64
+
+    no_trade_raw = _advanced_input_identity_database(
+        no_trade_instrument=12,
+    )
+    no_trade_database = V2StageDatabase(
+        _context("EQUITY_MATERIALIZE", database=no_trade_raw),
+        RealtimeDatabaseRole.COMPUTE,
+    )
+    no_trade_universe, no_trade_digest = runners.input_ready_identity(
+        no_trade_database,
+        cohort_id=cohort_id,
+        cutoff=NOW,
+        known_by=NOW + timedelta(minutes=1),
+        reference_generation=1,
+    )
+    assert no_trade_universe == universe
+    assert no_trade_digest != digest
 
     gap = (UUID(int=30), UUID(int=20), 11, "AM", NOW, None, UUID(int=22), 0, 89, "OVERLOAD", "UNRESOLVED")
     raw_gap = _advanced_input_identity_database(gaps=(gap,))
@@ -698,8 +743,9 @@ def test_the_runner_factories_are_registered_for_the_six_non_options_stages_and_
     from realtime.stage_runners_v2 import RUNNER_FACTORIES, unwired_stages
     assert set(RUNNER_FACTORIES) == {
         "REFERENCE", "EQUITY_INGEST", "EQUITY_EVIDENCE", "PORTAL_PUBLISH", "STRATEGY_PUBLISH", "STOCK_ALERTS",
-        "OPTIONS_FLOW", "EQUITY_MATERIALIZE", "EQUITY_PROJECTION"}
-    assert unwired_stages() == frozenset(name for name in STAGES_V1 if name.startswith("OPTIONS_")) - {"OPTIONS_FLOW"}
+        "OPTIONS_ACQUIRE", "OPTIONS_ADMISSION", "OPTIONS_FLOW",
+        "EQUITY_INPUT_GATE", "EQUITY_MATERIALIZE", "EQUITY_PROJECTION"}
+    assert unwired_stages() == {"OPTIONS_CYCLE"}
     assert unwired_stages(frozenset(
         name for name in STAGES_V2 if not name.startswith("OPTIONS_")
     )) == frozenset()

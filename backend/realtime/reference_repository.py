@@ -274,10 +274,17 @@ def persist_reference_result_cursor(
     )
 
 
+REVIEWED_REFERENCE_SCOPES = frozenset({
+    "MARKET_REFERENCES",
+    "EQUITY_VALIDATION_REFERENCES",
+    "ADVANCED_SPY_REFERENCES",
+})
+
+
 def _check_reference_seed(generation: int, scope: str, facts: tuple[ReferenceFact, ...]) -> None:
     if generation <= 0:
         raise ValueError("seed generation must be positive")
-    if scope not in {"MARKET_REFERENCES", "EQUITY_VALIDATION_REFERENCES"}:
+    if scope not in REVIEWED_REFERENCE_SCOPES:
         raise ValueError("reference seed scope is not reviewed")
     validate_reference_facts(facts)
 

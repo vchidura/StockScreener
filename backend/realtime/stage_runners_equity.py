@@ -35,7 +35,15 @@ from .equity_interval_finalizer import (
     enqueue_five_minute_finalizer_jobs_cursor,
     run_five_minute_finalizer_once,
 )
-from .equity_worker_service import EQUITY_INTERVAL_FINALIZE_JOB, EquityWorkerConfig
+from .equity_interval_derivation_worker import (
+    enqueue_interval_derivation_jobs_cursor,
+    run_interval_derivation_worker_once,
+)
+from .equity_worker_service import (
+    EQUITY_INTERVAL_DERIVE_JOB,
+    EQUITY_INTERVAL_FINALIZE_JOB,
+    EquityWorkerConfig,
+)
 from .lineage_head import inputs_sha256, reference_set
 from .materialization_jobs import evaluate_job_barrier_cursor
 from .orchestration_repository import CycleReceiptSpec
@@ -68,6 +76,7 @@ CYCLE_REHYDRATION_MISMATCH = "CYCLE_REHYDRATION_MISMATCH"
 STAGE_CANCELLED = "STAGE_CANCELLED"
 FINALIZER_INPUT_PENDING = "FINALIZER_INPUT_PENDING"
 FINALIZER_BARRIER_FAILED = "FINALIZER_BARRIER_FAILED"
+DERIVATION_FAILED = "DERIVATION_FAILED"
 def reference_generation(database: V2StageDatabase, cutoff) -> int:
     """Owner decision (2026-10-12): the generation every snapshot and receipt carries is the number
     of READY reference seed manifests created at or before the window cutoff. Monotonic, derived from
@@ -124,7 +133,9 @@ def input_ready_identity(database: V2StageDatabase, *, cohort_id, cutoff, known_
         seeds = tuple(cursor.fetchall())
         if scope[14] == "MASSIVE_ADVANCED":
             cursor.execute(
-                "SELECT session_id, provider, feed, manifest_id, owner_id, owner_epoch, started_at, status "
+                "SELECT session_id, provider, feed, manifest_id, owner_id,"
+                "owner_epoch,started_at,status,journal_generation,"
+                "event_time_watermark "
                 "FROM rt.stream_sessions WHERE manifest_id=%s AND started_at<=%s "
                 "ORDER BY started_at, session_id",
                 (str(scope[4]), known_by),
@@ -132,7 +143,11 @@ def input_ready_identity(database: V2StageDatabase, *, cohort_id, cutoff, known_
             stream_sessions = tuple(cursor.fetchall())
             cursor.execute(
                 "SELECT consumer_name, journal_generation, shard_id, shard_map_sha256, owner_epoch, "
-                "committed_offset, checkpoint_id, state_hash FROM rt.consumer_checkpoints "
+                "committed_offset,checkpoint_id,state_hash,"
+                "convert_from(state_payload,'UTF8')::jsonb->>'stream_session_id',"
+                "(convert_from(state_payload,'UTF8')::jsonb"
+                "->>'event_time_watermark')::timestamptz "
+                "FROM rt.consumer_checkpoints "
                 "WHERE cohort_id=%s AND committed_at<=%s "
                 "ORDER BY consumer_name, journal_generation, shard_id",
                 (str(cohort_id), known_by),
@@ -155,17 +170,30 @@ def input_ready_identity(database: V2StageDatabase, *, cohort_id, cutoff, known_
                 "JOIN rt.bar_revisions AS revision ON revision.bar_revision_id=current.bar_revision_id "
                 "AND revision.observed_at=current.observed_at "
                 "WHERE current.cohort_id=%s AND current.provider_tier='MASSIVE_ADVANCED' "
-                "AND current.interval IN ('1m','5m') AND revision.bar_end<=%s "
+                "AND current.interval IN ('1m','5m','15m','30m','1h','1d') "
+                "AND revision.bar_end<=%s "
                 "AND revision.created_at<=%s ORDER BY current.instrument_id, current.interval, "
                 "revision.bar_end DESC, revision.observed_at DESC",
                 (str(cohort_id), cutoff, known_by),
             )
             bar_heads = tuple(cursor.fetchall())
+            cursor.execute(
+                "SELECT instrument_id,last_complete_bar_end,"
+                "last_examined_bar_end,terminal_state,reason_codes "
+                "FROM rt.acquisition_watermarks "
+                "WHERE cohort_id=%s AND interval='5m' "
+                "AND source_kind='DERIVED' "
+                "AND last_examined_bar_end>=%s "
+                "ORDER BY instrument_id",
+                (str(cohort_id), cutoff),
+            )
+            finalizer_progress = tuple(cursor.fetchall())
             sources = {
                 "stream_sessions": stream_sessions,
                 "checkpoints": checkpoints,
                 "gaps": gaps,
                 "bar_heads": bar_heads,
+                "finalizer_progress": finalizer_progress,
             }
         else:
             cursor.execute(
@@ -193,20 +221,63 @@ def input_ready_identity(database: V2StageDatabase, *, cohort_id, cutoff, known_
         checkpoints = sources["checkpoints"]
         gaps = sources["gaps"]
         heads = sources["bar_heads"]
+        finalizer_progress = sources["finalizer_progress"]
         if not sessions or not checkpoints:
             raise ValueError("INPUT_READY requires Advanced stream sessions and checkpoints")
         if gaps:
             raise ValueError("INPUT_READY has unresolved stream gaps")
-        session_ids = {row[0] for row in sessions}
-        checkpoint_generations = {row[1] for row in checkpoints}
-        if any(
-            row[5] is not None and row[5] not in checkpoint_generations
-            or row[6] is not None and row[6] not in session_ids
+        session_by_id = {
+            str(row[0]): row
+            for row in sessions
+            if row[8] is not None
+            and row[9] is not None
+            and row[9] >= cutoff
+        }
+        checkpoint_coverage = {}
+        for row in checkpoints:
+            own_session = session_by_id.get(str(row[8]))
+            if (
+                own_session is None
+                or str(row[1]) != str(own_session[8])
+                or int(row[4]) != int(own_session[5])
+                or row[9] is None
+                or row[9] < cutoff
+            ):
+                continue
+            key = (str(row[1]), str(row[8]))
+            checkpoint_coverage[key] = max(
+                int(row[5]),
+                checkpoint_coverage.get(key, 0),
+            )
+        if not checkpoint_coverage or any(
+            row[1] == "1m"
+            and (
+                row[5] is None
+                or row[6] is None
+                or row[7] is None
+                or int(row[7])
+                > checkpoint_coverage.get(
+                    (str(row[5]), str(row[6])),
+                    -1,
+                )
+            )
             for row in heads
         ):
             raise ValueError("INPUT_READY Advanced bar heads drift from stream checkpoints")
+        no_trade_instruments = {
+            row[0]
+            for row in finalizer_progress
+            if row[1] is not None
+            and row[1] >= cutoff
+            and row[2] >= cutoff
+            and row[3] == "COMPLETE"
+            and "FINALIZER_NO_TRADE" in tuple(row[4] or ())
+        }
         for interval in ("1m", "5m"):
-            if {row[0] for row in heads if row[1] == interval} != member_instruments:
+            covered = {
+                row[0] for row in heads if row[1] == interval
+            } | no_trade_instruments
+            if covered != member_instruments:
                 raise ValueError(f"INPUT_READY requires exact Advanced {interval} finalizer heads")
     else:
         if {row[0] for row in sources} != member_instruments:
@@ -307,6 +378,65 @@ def finalize_five_minute_inputs(
     return "FAILED", (FINALIZER_BARRIER_FAILED, *dict.fromkeys(reasons))
 
 
+def finalize_higher_interval_inputs(
+    database: V2StageDatabase,
+    context: StageContext,
+) -> tuple[str, tuple[str, ...]]:
+    plan, window = context.plan, context.window
+    with database.transaction(dict_cursor=True) as cursor:
+        cursor.execute(
+            "SELECT instrument.instrument_id "
+            "FROM rt.cohorts AS cohort "
+            "JOIN rt.subscription_members AS member USING(manifest_id) "
+            "JOIN rt.instruments AS instrument USING(instrument_id) "
+            "WHERE cohort.cohort_id=%s "
+            "AND instrument.asset_class='EQUITY' "
+            "AND member.channel='AM' ORDER BY instrument.instrument_id",
+            (str(plan.cohort_id),),
+        )
+        instrument_ids = tuple(
+            int(row["instrument_id"])
+            for row in cursor.fetchall()
+        )
+        enqueue_interval_derivation_jobs_cursor(
+            cursor,
+            cohort_id=plan.cohort_id,
+            instrument_ids=instrument_ids,
+            session_date=plan.session_date,
+            checked_at=max(context.started_at, window.cutoff),
+        )
+    config = EquityWorkerConfig(
+        cohort_id=plan.cohort_id,
+        job_kind=EQUITY_INTERVAL_DERIVE_JOB,
+        lease_owner=uuid5(
+            NAMESPACE_URL,
+            f"stockscreener:advanced-derive:{context.stage_run_id}",
+        ),
+        claim_limit=100,
+    )
+    reasons = []
+    failed = False
+    for _ in range(100):
+        status = run_interval_derivation_worker_once(
+            database,
+            config,
+            checked_at=max(context.started_at, window.cutoff),
+        )
+        reasons.extend(status.reason_codes)
+        if status.failed or status.blocked:
+            failed = True
+        if status.claimed == 0:
+            break
+    else:
+        return "FAILED", (DERIVATION_FAILED, "DERIVATION_DRAIN_LIMIT")
+    if failed:
+        return "FAILED", (
+            DERIVATION_FAILED,
+            *dict.fromkeys(reasons),
+        )
+    return "COMPLETE", tuple(dict.fromkeys(reasons))
+
+
 def equity_materialize_runner(environment: RunnerEnvironment) -> StageRunner:
     def run(context: StageContext) -> StageOutcome:
         plan, window = context.plan, context.window
@@ -332,6 +462,20 @@ def equity_materialize_runner(environment: RunnerEnvironment) -> StageRunner:
                 return StageOutcome.blocked(*finalizer_reasons)
             if finalizer_state == "FAILED":
                 return StageOutcome.failed(*finalizer_reasons)
+            derivation_reasons = ()
+            if (
+                getattr(
+                    context.window,
+                    "provider_tier",
+                    ProviderTier.MASSIVE_DEVELOPER.value,
+                )
+                == ProviderTier.MASSIVE_ADVANCED.value
+            ):
+                derivation_state, derivation_reasons = (
+                    finalize_higher_interval_inputs(compute, context)
+                )
+                if derivation_state == "FAILED":
+                    return StageOutcome.failed(*derivation_reasons)
             universe_sha256, input_sha256 = input_ready_identity(
                 compute,
                 cohort_id=plan.cohort_id,
@@ -341,7 +485,11 @@ def equity_materialize_runner(environment: RunnerEnvironment) -> StageRunner:
             )
         except (StageCancelled, WriteFenceRejected):
             return StageOutcome.failed(STAGE_CANCELLED)
-        return StageOutcome.complete(degraded=(*bars.degraded_reasons(), *finalizer_reasons), receipt=CycleReceiptSpec(
+        return StageOutcome.complete(degraded=(
+            *bars.degraded_reasons(),
+            *finalizer_reasons,
+            *derivation_reasons,
+        ), receipt=CycleReceiptSpec(
             INPUT_READY,
             window.cutoff,
             generation,
@@ -516,17 +664,23 @@ def portal_publish_runner(environment: RunnerEnvironment) -> StageRunner:
         plan, window = context.plan, context.window
         publication = V2StageDatabase(context, RealtimeDatabaseRole.PUBLICATION)
         try:
-            is_v2 = getattr(plan, "stage_catalog_version", "stages_v1") == "stages_v2"
+            is_split_graph = getattr(
+                plan,
+                "stage_catalog_version",
+                "stages_v1",
+            ) in {"stages_v2", "stages_v3"}
             projection_receipt = _window_cycle_receipt(
                 publication,
                 window,
-                receipt_kind=PORTAL_READY if is_v2 else EQUITY_CYCLE,
+                receipt_kind=(
+                    PORTAL_READY if is_split_graph else EQUITY_CYCLE
+                ),
             )
             if projection_receipt is None:
                 return StageOutcome.failed(EQUITY_CYCLE_RECEIPT_MISSING)
             release_receipt = (
                 _window_cycle_receipt(publication, window, receipt_kind=INPUT_READY)
-                if is_v2 else projection_receipt
+                if is_split_graph else projection_receipt
             )
             if release_receipt is None:
                 return StageOutcome.failed(INPUT_READY_RECEIPT_MISSING)
@@ -561,7 +715,7 @@ def portal_publish_runner(environment: RunnerEnvironment) -> StageRunner:
                     known_by=environment.known_by(window),
                     source_generation=projection_receipt.reference_generation,
                 )
-                if is_v2 else None
+                if is_split_graph else None
             )
             publish_realtime_portal_cycle_atomic(
                 publication,

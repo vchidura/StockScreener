@@ -38,6 +38,7 @@ from realtime.advanced_equity_journal_bridge import (  # noqa: E402
 )
 from realtime.database_access import RealtimeDatabaseRole  # noqa: E402
 from realtime.database_access_v2 import (  # noqa: E402
+    APP_ROLE,
     OWNER_POOL,
     V2AccessConfig,
     V2ConnectionProvider,
@@ -69,6 +70,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=SECURITY_MODE_DEFERRED,
     )
     parser.add_argument("--journal", type=Path, required=True)
+    parser.add_argument("--journal-root", type=Path)
     parser.add_argument("--cohort-id", type=UUID, required=True)
     parser.add_argument("--journal-generation", type=UUID, required=True)
     parser.add_argument("--stream-session-id", type=UUID, required=True)
@@ -91,10 +93,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         allow_disposable=args.allow_disposable,
         security_mode=args.security_mode,
     )
-    if args.security_mode == SECURITY_MODE_HARDENED:
-        parser.error(
-            "hardened runtime credentials are provisioned in the final hardening phase"
-        )
+    args.journal = args.journal.resolve()
+    if args.journal_root is not None:
+        args.journal_root = args.journal_root.resolve()
+        try:
+            args.journal.relative_to(args.journal_root)
+        except ValueError:
+            parser.error("--journal must be inside --journal-root")
+    if (
+        args.security_mode == SECURITY_MODE_HARDENED
+        and args.journal_root is None
+    ):
+        parser.error("hardened mode requires --journal-root")
     if not args.execute:
         parser.error("the Advanced equity bridge mutates PostgreSQL and requires --execute")
     if not 1 <= args.batch_limit <= MAX_ADVANCED_EQUITY_BATCH:
@@ -110,6 +120,19 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def _pool(args: argparse.Namespace) -> ThreadedConnectionPool:
     load_dotenv(BACKEND_DIR / ".env", override=True)
+    if args.security_mode == SECURITY_MODE_HARDENED:
+        dsn = os.getenv("REALTIME_V2_APP_DSN", "").strip()
+        if not dsn:
+            raise RuntimeError(
+                "hardened Advanced bridge requires REALTIME_V2_APP_DSN"
+            )
+        return ThreadedConnectionPool(
+            1,
+            1,
+            dsn=dsn,
+            application_name="run_realtime_v2_advanced_equity_bridge",
+            options="-c timezone=UTC",
+        )
     names = ("DB_HOST", "DB_PORT", "POSTGRES_ADMIN_USER", "POSTGRES_ADMIN_PASSWORD")
     settings = {name: os.getenv(name, "").strip() for name in names}
     missing = [name for name, value in settings.items() if not value]
@@ -169,7 +192,13 @@ def main(argv=None) -> int:
     pool = _pool(args)
     try:
         provider = V2ConnectionProvider(
-            {OWNER_POOL: pool},
+            {
+                (
+                    APP_ROLE
+                    if args.security_mode == SECURITY_MODE_HARDENED
+                    else OWNER_POOL
+                ): pool
+            },
             V2AccessConfig(
                 security_mode=args.security_mode,
                 allow_disposable=args.allow_disposable,

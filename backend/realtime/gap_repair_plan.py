@@ -133,8 +133,11 @@ def plan_gap_repair_cursor(
             )
             ranges = _coalesce(missing, width=width)
             total_missing += len(missing)
-            for instrument_id, ticker, _bar_start in missing:
-                request_scopes.add((session_date, interval, instrument_id, ticker))
+            if interval == "1m":
+                for instrument_id, ticker, _bar_start in missing:
+                    request_scopes.add(
+                        (session_date, instrument_id, ticker)
+                    )
             plans.append({
                 "session_date": session_date,
                 "interval": interval,
@@ -145,9 +148,9 @@ def plan_gap_repair_cursor(
                 "missing_ranges": ranges[:detail_limit],
                 "missing_ranges_truncated": len(ranges) > detail_limit,
                 "executor": (
-                    "HISTORICAL_1M_EXECUTOR_NOT_IMPLEMENTED"
+                    "ADVANCED_HISTORICAL_1M"
                     if interval == "1m"
-                    else "RECENT_NATIVE_SESSION_REPAIR"
+                    else "LOCAL_DERIVATION_FROM_RAW_1M"
                 ),
             })
     return {

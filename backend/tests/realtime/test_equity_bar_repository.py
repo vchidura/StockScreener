@@ -86,6 +86,18 @@ def test_bar_revision_and_current_pointer_commit_atomically_in_batches():
     assert "INSERT INTO rt.bar_current" in cursor.recorded_current_statement
     assert "rt.bar_current.provider_tier=EXCLUDED.provider_tier" in cursor.recorded_current_statement
     assert (
+        "JOIN rt.capability_profiles AS profile USING(profile_id)"
+        in cursor.recorded_current_statement
+    )
+    assert (
+        "JOIN rt.subscription_manifests AS manifest USING(manifest_id)"
+        in cursor.recorded_current_statement
+    )
+    assert (
+        "profile.provider_tier FROM rt.cohorts AS cohort"
+        in cursor.recorded_current_statement
+    )
+    assert (
         "EXCLUDED.adjustment_basis='RAW_UNADJUSTED' "
         "AND EXCLUDED.interval IN ('15m','30m','1h','1d') "
         "AND EXCLUDED.source_kind='DERIVED' THEN 5"

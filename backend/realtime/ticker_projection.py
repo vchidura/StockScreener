@@ -36,6 +36,7 @@ from .lineage_head import (
     assemble_lineage_head, group_head, reference_set, require_bounded_manifest, require_bounded_payload,
     revision_chain_sha256, rows_identity, workspace_set,
 )
+from .preflight import ProviderTier
 from .portal_projection import build_portal_snapshot
 from .screening_projection import RealtimeScreeningInput, produce_realtime_screening
 from .ticker_references import chart_basis, chart_group_key, evidence_ref
@@ -191,7 +192,8 @@ def _fact(row, inputs, prices=None):
     prices = {} if prices is None else prices
     vwap = row.get("vwap")
     return RealtimeEquityBarFact(
-        cohort_id=_uuid(row["cohort_id"]), provider_tier=inputs.provider_tier,
+        cohort_id=_uuid(row["cohort_id"]),
+        provider_tier=ProviderTier(row["provider_tier"]),
         instrument_id=row["instrument_id"],
         journal_generation=row.get("journal_generation"), stream_session_id=row.get("stream_session_id"),
         source_offset=row.get("source_offset"),
@@ -213,6 +215,7 @@ def _fact(row, inputs, prices=None):
             ingestion_segment_id=row["ingestion_segment_id"],
             source_bar_revision_ids=tuple([_uuid(value) for value in row["source_revision_ids"]]),
             session_scope=BarSessionScope(row["session_scope"]),
+            quality_codes=tuple(row.get("quality_codes") or ()),
         ),
     )
 
@@ -426,6 +429,9 @@ def materialize_ticker_interval(
         return materialize_realtime_equity_evidence(
             analysis_run_id=uuid5(NAMESPACE_URL, f"ticker-workspace:{identity}"),
             security=security, bars=bars, confirmation_bars=confirmations, observed_at=observed_at,
+            target_cohort_id=inputs.cohort_id,
+            target_provider_tier=inputs.provider_tier,
+            target_instrument_id=bars[0].instrument_id,
         )
 
     # The identity names the exact bars and security revision; the chains add each bar's payload
@@ -517,6 +523,23 @@ class _DerivationVerifier:
             observed_at=self._inputs.cutoff, ingestion_segment_id=self._segment,
         )
 
+    def _derive_identity_groups(self, interval, sources):
+        by_identity = {}
+        for fact in sources:
+            by_identity.setdefault(
+                (
+                    fact.cohort_id,
+                    fact.provider_tier,
+                    fact.instrument_id,
+                ),
+                [],
+            ).append(fact)
+        return tuple(
+            derived
+            for rows in by_identity.values()
+            for derived in self._derive(interval, tuple(rows))
+        )
+
     def _sliced(self, label, group):
         if label not in self._slices:
             by_session = _session_slices(group)
@@ -527,11 +550,31 @@ class _DerivationVerifier:
         todo = [session for session in sessions if (interval, session) not in self._derived]
         if not todo:
             return
-        derived = self._derive(interval, tuple(fact for s in todo for fact in source_by_session.get(s, ())))
         for session in todo:
             self._derived[(interval, session)] = []
-        for fact in derived:
-            self._derived.setdefault((interval, fact.revision.session_date), []).append(fact)
+        by_identity = {}
+        for session in todo:
+            rows = tuple(source_by_session.get(session, ()))
+            identities = {
+                (
+                    fact.cohort_id,
+                    fact.provider_tier,
+                    fact.instrument_id,
+                )
+                for fact in rows
+            }
+            if len(identities) > 1:
+                raise ValueError(
+                    "Ticker derivation session mixes cohort, tier or instrument"
+                )
+            if rows:
+                by_identity.setdefault(identities.pop(), []).extend(rows)
+        for rows in by_identity.values():
+            for fact in self._derive(interval, tuple(rows)):
+                self._derived.setdefault(
+                    (interval, fact.revision.session_date),
+                    [],
+                ).append(fact)
 
     def _sessions_total(self, kind, interval, source_label, sources, stored_label=None, stored=None):
         source_by, source_chain = self._sliced(source_label, sources)
@@ -574,7 +617,7 @@ class _DerivationVerifier:
 
     def verify_whole(self, interval, sources, stored):
         def build():
-            expected = self._derive(interval, sources)
+            expected = self._derive_identity_groups(interval, sources)
             by_start = {fact.revision.bar_start: fact for fact in expected}
             if len({fact.revision.bar_start for fact in stored}) != len(stored):
                 raise ValueError("Ticker interval source windows are duplicated")
@@ -589,7 +632,7 @@ class _DerivationVerifier:
 
     def verify_mixed_whole(self, interval, sources, stored, native_source_kinds):
         def build():
-            expected = self._derive(interval, sources)
+            expected = self._derive_identity_groups(interval, sources)
             by_start = {fact.revision.bar_start: fact for fact in expected}
             if len({fact.revision.bar_start for fact in stored}) != len(stored):
                 raise ValueError("Ticker interval source windows are duplicated")
@@ -765,12 +808,34 @@ def _project_realtime_ticker_workspace(
         security_text, cohort_text = str(security.security_id), str(inputs.cohort_id)
         for row in own:
             row_security, row_cohort = row["security_id"], row["cohort_id"]
+            target_identity = (
+                (
+                    row_cohort == inputs.cohort_id
+                    if type(row_cohort) is UUID
+                    else str(row_cohort) == cohort_text
+                )
+                and row["provider_tier"] == provider_tier
+            )
+            history_identity = (
+                inputs.history_source_cohort_id is not None
+                and inputs.history_source_provider_tier is not None
+                and inputs.history_before is not None
+                and inputs.history_binding_sha256 is not None
+                and (
+                    row_cohort == inputs.history_source_cohort_id
+                    if type(row_cohort) is UUID
+                    else str(row_cohort)
+                    == str(inputs.history_source_cohort_id)
+                )
+                and row["provider_tier"]
+                == inputs.history_source_provider_tier.value
+                and row["bar_end"] < inputs.history_before
+            )
             replay, published, created = (
                 row.get("replay_available_at"), row.get("provider_published_at"), row.get("created_at"))
             if (
                 (row_security != security.security_id if type(row_security) is UUID else str(row_security) != security_text)
-                or (row_cohort != inputs.cohort_id if type(row_cohort) is UUID else str(row_cohort) != cohort_text)
-                or row["provider_tier"] != provider_tier
+                or not (target_identity or history_identity)
                 or row["instrument_id"] != member["instrument_id"]
                 or not row["is_final"] or row["session_scope"] != "RTH"
                 or row["bar_end"] > cutoff or row["observed_at"] > recorded_by
@@ -859,14 +924,6 @@ def _project_realtime_ticker_workspace(
         else:
             missing["chart:1m"] = "NATIVE_1M_HISTORY_INCOMPLETE"
         monthly = groups[("1mo", "ADJUSTED")]
-        if (
-            len(monthly) == plan.expected_count("1mo", "ADJUSTED")
-            and tuple(fact.revision.session_date for fact in monthly) == plan.monthly_sessions
-            and all(fact.revision.source_kind in native_source_kinds for fact in monthly)
-        ):
-            available["1mo"] = monthly
-        else:
-            missing["chart:1mo"] = "NATIVE_ADJUSTED_MONTHLY_HISTORY_INCOMPLETE"
         own_actions = actions_by_security.of(own_security_id)
         if any(row["action_type"] == "SPLIT" and plan.raw_start <= row["effective_date"] <= plan.raw_end
                for row in own_actions):
@@ -881,6 +938,30 @@ def _project_realtime_ticker_workspace(
         ):
             raise ValueError("Ticker native 5m session windows are incomplete")
         adjusted_sources = tuple(sorted(buckets.get(("1d", True), ()), key=lambda fact: fact.revision.bar_start))
+        if (
+            len(monthly) == plan.expected_count("1mo", "ADJUSTED")
+            and tuple(
+                fact.revision.session_date for fact in monthly
+            ) == plan.monthly_sessions
+            and all(
+                fact.revision.source_kind in (
+                    *native_source_kinds,
+                    BarSourceKind.DERIVED,
+                )
+                for fact in monthly
+            )
+        ):
+            verifier.verify_mixed_whole(
+                "1mo",
+                adjusted_sources,
+                monthly,
+                native_source_kinds,
+            )
+            available["1mo"] = monthly
+        else:
+            missing["chart:1mo"] = (
+                "NATIVE_ADJUSTED_MONTHLY_HISTORY_INCOMPLETE"
+            )
         for interval, basis, expected_count in plan.expected_counts_per_ticker:
             if (interval, basis) == ("1d", "ADJUSTED") or interval in {"1m", "5m", "1mo"}:
                 continue
@@ -1141,6 +1222,17 @@ def _project_realtime_ticker_workspace(
             analysis_windows=dict(intraday_setup_bars=500, finalized_pattern_bars=300),
             code_sha256=code_sha256, **input_identity,
         )
+        if inputs.history_binding_sha256 is not None:
+            source_manifest.update(
+                history_binding_sha256=inputs.history_binding_sha256,
+                history_source_cohort_id=str(
+                    inputs.history_source_cohort_id
+                ),
+                history_source_provider_tier=(
+                    inputs.history_source_provider_tier.value
+                ),
+                history_before=inputs.history_before.isoformat(),
+            )
         require_bounded_manifest(source_manifest, name=f"Ticker workspace {security.ticker}")
         require_bounded_payload(payload, name=f"Ticker workspace {security.ticker}")
         snapshots.append(build_portal_snapshot(

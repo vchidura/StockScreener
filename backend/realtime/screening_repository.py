@@ -9,6 +9,7 @@ from uuid import UUID
 
 import exchange_calendars
 
+from .contracts import canonical_sha256
 from .database_access import RealtimeDatabaseRole
 from .equity_portal_history import build_realtime_equity_portal_history_plan
 from .portal_projection_repository import persist_screening_generation_cursor
@@ -92,11 +93,17 @@ class BarScope:
     tickers: tuple[str, ...]
     include_portal_history: bool
     history_params: tuple
+    history_source_cohort_id: UUID | None = None
+    history_source_provider_tier: str | None = None
+    history_before: datetime | None = None
+    history_binding_sha256: str | None = None
 
 
 BAR_IDENTITY_FIELDS = (
     "cohort", "tier", "tickers", "portal_history", "window", "strategy_details", "session",
     "source_generation", "manifest_id", "manifest_sha256", "members",
+    "history_source_cohort", "history_source_tier", "history_before",
+    "history_binding_sha256",
 )
 
 
@@ -210,6 +217,7 @@ def bar_columns(include_portal_history: bool) -> str:
     extra = (
         "availability_mode, vwap, transaction_count, ingestion_segment_id, "
         "journal_generation, stream_session_id, source_offset, provider_published_at, "
+        "quality_codes, "
         if include_portal_history else ""
     )
     return (
@@ -221,16 +229,47 @@ def bar_columns(include_portal_history: bool) -> str:
     )
 
 
-def _bar_candidate_sql(include_portal_history: bool) -> str:
+def _bar_scope_sql(scope: BarScope) -> tuple[str, tuple]:
+    target = "(cohort_id=%s AND provider_tier=%s)"
+    params: tuple = (str(scope.cohort_id), scope.provider_tier)
+    if scope.history_source_cohort_id is None:
+        return target, params
+    if (
+        scope.history_source_provider_tier is None
+        or scope.history_before is None
+        or scope.history_binding_sha256 is None
+    ):
+        raise ValueError("screening history binding is incomplete")
     return (
-        "cohort_id=%s AND provider_tier=%s AND ticker=ANY(%s) AND session_scope='RTH' AND is_final AND "
-        + _BAR_VISIBLE_AT + bar_history_predicate(include_portal_history)
+        "(" + target
+        + " OR (cohort_id=%s AND provider_tier=%s AND bar_end<%s))",
+        (
+            *params,
+            str(scope.history_source_cohort_id),
+            scope.history_source_provider_tier,
+            scope.history_before,
+        ),
+    )
+
+
+def _bar_candidate_sql(scope: BarScope) -> str:
+    binding, _params = _bar_scope_sql(scope)
+    return (
+        binding
+        + " AND ticker=ANY(%s) AND session_scope='RTH' AND is_final AND "
+        + _BAR_VISIBLE_AT
+        + bar_history_predicate(scope.include_portal_history)
     )
 
 
 def _bar_candidate_params(scope: BarScope, clocks: BarClocks) -> tuple:
-    return (str(scope.cohort_id), scope.provider_tier, list(scope.tickers),
-            *clocks.params(), *scope.history_params)
+    _binding, binding_params = _bar_scope_sql(scope)
+    return (
+        *binding_params,
+        list(scope.tickers),
+        *clocks.params(),
+        *scope.history_params,
+    )
 
 
 def select_winning_bars(cursor, scope: BarScope, clocks: BarClocks, *, with_state: bool = False):
@@ -239,7 +278,7 @@ def select_winning_bars(cursor, scope: BarScope, clocks: BarClocks, *, with_stat
     candidate revisions visible under `clocks` (the integrity count of the delta loader), read in the same
     statement and so from the same snapshot."""
     include = scope.include_portal_history
-    candidate, params = _bar_candidate_sql(include), _bar_candidate_params(scope, clocks)
+    candidate, params = _bar_candidate_sql(scope), _bar_candidate_params(scope, clocks)
     state = ""
     if with_state:
         state = (", " + source_precedence_case(include) + " AS src_rank, "
@@ -266,7 +305,7 @@ def select_new_bars(cursor, scope: BarScope, previous: BarClocks, current: BarCl
     """The candidate revisions visible under `current` and not visible under `previous`, each with its source
     rank, plus the number of candidates visible under `current` (one statement, one snapshot)."""
     include = scope.include_portal_history
-    candidate, params = _bar_candidate_sql(include), _bar_candidate_params(scope, current)
+    candidate, params = _bar_candidate_sql(scope), _bar_candidate_params(scope, current)
     cursor.execute(
         "SELECT counted.visible_total, new_bars.* FROM "
         "(SELECT count(*) AS visible_total FROM rt.bar_revisions WHERE " + candidate + ") AS counted "
@@ -287,14 +326,16 @@ def select_new_bars(cursor, scope: BarScope, previous: BarClocks, current: BarCl
 
 def select_source_bars(cursor, scope: BarScope, revision_ids, clocks: BarClocks):
     """Derived-bar source revisions by id, visible under `clocks` (any scope, interval or window), ordered by id."""
+    binding, binding_params = _bar_scope_sql(scope)
     cursor.execute(
         "SELECT " + bar_columns(scope.include_portal_history) + " "
-        "FROM rt.bar_revisions WHERE bar_revision_id=ANY(%s::uuid[]) AND cohort_id=%s "
-        "AND provider_tier=%s AND observed_at<=%s AND created_at<=%s "
+        "FROM rt.bar_revisions WHERE bar_revision_id=ANY(%s::uuid[]) AND "
+        + binding
+        + " AND observed_at<=%s AND created_at<=%s "
         "AND (replay_available_at IS NULL OR replay_available_at<=%s) "
         "AND (provider_published_at IS NULL OR provider_published_at<=%s) AND is_final AND bar_end<=%s "
         "ORDER BY bar_revision_id",
-        (revision_ids, str(scope.cohort_id), scope.provider_tier, *clocks.params()),
+        (revision_ids, *binding_params, *clocks.params()),
     )
     return share_bar_values([dict(row) for row in cursor.fetchall()])
 
@@ -445,9 +486,14 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
         raise ValueError("Screening known_by must not precede the cutoff")
     cursor.execute(
         "SELECT manifest.manifest_id, manifest.manifest_sha256, manifest.stock_count, "
-        "profile.provider_tier FROM rt.cohorts AS cohort "
+        "profile.provider_tier,binding.source_cohort_id,"
+        "binding.source_provider_tier,binding.history_before,"
+        "binding.binding_sha256 "
+        "FROM rt.cohorts AS cohort "
         "JOIN rt.subscription_manifests AS manifest USING (manifest_id) "
         "JOIN rt.capability_profiles AS profile USING (profile_id) "
+        "LEFT JOIN rt.cohort_history_bindings AS binding "
+        "ON binding.target_cohort_id=cohort.cohort_id "
         "WHERE cohort.cohort_id=%s AND cohort.created_at<=%s AND cohort.effective_at<=%s "
         "AND manifest.created_at<=%s AND profile.created_at<=%s",
         (str(cohort_id), cutoff, cutoff, cutoff, cutoff),
@@ -455,6 +501,20 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
     manifest = cursor.fetchone()
     if manifest is None:
         raise ValueError("Exact realtime screening cohort/manifest is unavailable")
+    history_source_cohort_id = manifest.get("source_cohort_id")
+    history_source_provider_tier = manifest.get(
+        "source_provider_tier"
+    )
+    history_before = manifest.get("history_before")
+    history_binding_sha256 = manifest.get("binding_sha256")
+    if history_source_cohort_id is not None and (
+        manifest["provider_tier"] != "MASSIVE_ADVANCED"
+        or history_source_provider_tier != "MASSIVE_DEVELOPER"
+        or history_before is None
+        or history_before > cutoff
+        or history_binding_sha256 is None
+    ):
+        raise ValueError("Advanced cohort history binding is invalid")
     cursor.execute(
         "SELECT reference.security_id, reference.ticker, "
         "reference.revision_id AS security_revision_id, reference.company_name, "
@@ -479,6 +539,14 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
         cohort_id=cohort_id, provider_tier=manifest["provider_tier"],
         tickers=tuple(m["ticker"] for m in members),
         include_portal_history=include_portal_history, history_params=history_params,
+        history_source_cohort_id=(
+            UUID(str(history_source_cohort_id))
+            if history_source_cohort_id is not None
+            else None
+        ),
+        history_source_provider_tier=history_source_provider_tier,
+        history_before=history_before,
+        history_binding_sha256=history_binding_sha256,
     )
     request = BarRequest(
         scope=scope, cutoff=cutoff, known_by=known_by,
@@ -487,8 +555,18 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
             include_strategy_action_details, session, source_generation,
             str(manifest["manifest_id"]), manifest["manifest_sha256"],
             tuple((str(m["security_id"]), m["ticker"], str(m.get("instrument_id"))) for m in members),
+            str(history_source_cohort_id) if history_source_cohort_id is not None else None,
+            history_source_provider_tier,
+            history_before,
+            history_binding_sha256,
         ),
-        slot=(str(cohort_id), scope.provider_tier, include_portal_history, include_strategy_action_details),
+        slot=(
+            str(cohort_id),
+            scope.provider_tier,
+            include_portal_history,
+            include_strategy_action_details,
+            history_binding_sha256,
+        ),
     )
     bars = tuple(bar_loader(cursor, request))
     security_ids = [str(m["security_id"]) for m in members]
@@ -524,8 +602,23 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
     coverage = tuple(dict(row) for row in cursor.fetchall())
     return RealtimeScreeningInput(
         cohort_id=cohort_id, provider_tier=ProviderTier(manifest["provider_tier"]),
-        source_manifest_sha256=manifest["manifest_sha256"], source_generation=source_generation,
+        source_manifest_sha256=(
+            canonical_sha256({
+                "manifest_sha256": manifest["manifest_sha256"],
+                "history_binding_sha256": history_binding_sha256,
+            })
+            if history_binding_sha256 is not None
+            else manifest["manifest_sha256"]
+        ), source_generation=source_generation,
         session=session, cutoff=cutoff, members=members, bars=bars, actions=actions, coverage=coverage,
+        history_source_cohort_id=scope.history_source_cohort_id,
+        history_source_provider_tier=(
+            ProviderTier(scope.history_source_provider_tier)
+            if scope.history_source_provider_tier is not None
+            else None
+        ),
+        history_before=scope.history_before,
+        history_binding_sha256=scope.history_binding_sha256,
         known_by=requested_known_by,
     )
 

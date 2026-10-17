@@ -96,8 +96,22 @@ def persist_realtime_equity_bars_cursor(
         )
         for fact in rows
     }
-    if stored_catalog != expected_catalog:
-        raise ValueError("persisted realtime bar revision identity conflict")
+    for fact in rows:
+        key = str(fact.revision.bar_revision_id)
+        observed = stored_catalog.get(key)
+        expected = expected_catalog[key]
+        if observed == expected:
+            continue
+        content_idempotent_replay = (
+            observed is not None
+            and observed[:6] == expected[:6]
+            and observed[7:] == expected[7:]
+            and observed[6] <= expected[6]
+        )
+        if not content_idempotent_replay:
+            raise ValueError(
+                "persisted realtime bar revision identity conflict"
+            )
     values_executor(
         cursor,
         "INSERT INTO rt.bar_revisions ("
@@ -154,12 +168,19 @@ def persist_realtime_equity_bars_cursor(
         ],
         page_size=BAR_BATCH_PAGE_SIZE,
     )
-    observed = [fact.revision.system_observed_at for fact in rows]
+    observed_bounds = [
+        stored_catalog[str(fact.revision.bar_revision_id)][6]
+        for fact in rows
+    ] + [
+        fact.revision.system_observed_at
+        for fact in rows
+    ]
     cursor.execute(
         "SELECT bar_revision_id, cohort_id, provider_tier, instrument_id, "
         "payload_sha256 FROM rt.bar_revisions "
-        "WHERE bar_revision_id=ANY(%s::uuid[]) AND observed_at BETWEEN %s AND %s",
-        (id_values, min(observed), max(observed)),
+        "WHERE bar_revision_id=ANY(%s::uuid[]) "
+        "AND observed_at BETWEEN %s AND %s",
+        (id_values, min(observed_bounds), max(observed_bounds)),
     )
     stored = {
         str(row[0]): (
@@ -189,7 +210,13 @@ def persist_realtime_equity_bars_cursor(
         "provider_tier=EXCLUDED.provider_tier, source_kind=EXCLUDED.source_kind, "
         "bar_revision_id=EXCLUDED.bar_revision_id, "
         "observed_at=EXCLUDED.observed_at, updated_at=clock_timestamp() "
-        "WHERE rt.bar_current.provider_tier=EXCLUDED.provider_tier "
+        "WHERE (rt.bar_current.provider_tier=EXCLUDED.provider_tier "
+        "OR EXCLUDED.provider_tier=("
+        "SELECT profile.provider_tier FROM rt.cohorts AS cohort "
+        "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
+        "JOIN rt.capability_profiles AS profile USING(profile_id) "
+        "WHERE cohort.cohort_id=rt.bar_current.cohort_id"
+        ")) "
         "AND rt.bar_current.bar_end=EXCLUDED.bar_end AND ("
         + _current_source_precedence("EXCLUDED") + " > "
         + _current_source_precedence("rt.bar_current")
@@ -207,7 +234,9 @@ def persist_realtime_equity_bars_cursor(
                 fact.revision.source_kind.value,
                 str(fact.revision.bar_revision_id),
                 fact.revision.bar_end,
-                fact.revision.system_observed_at,
+                stored_catalog[
+                    str(fact.revision.bar_revision_id)
+                ][6],
             )
             for fact in rows
         ],
@@ -253,6 +282,9 @@ def load_current_bar_groups_cursor(
     security_id: UUID,
     ticker: str,
     groups: Mapping[str, tuple[datetime, datetime]],
+    history_source_cohort_id: UUID | None = None,
+    history_source_provider_tier: str | None = None,
+    history_before: datetime | None = None,
 ) -> dict[str, list[dict]]:
     """The bars `rt.bar_current` points at for one ticker, per lineage-head group (`interval:basis`).
 
@@ -273,6 +305,25 @@ def load_current_bar_groups_cursor(
             "(cur.interval=%s AND cur.adjustment_basis=%s AND cur.bar_start>=%s AND cur.bar_end<=%s)"
         )
         parameters.extend((interval, basis, first_bar_start, last_bar_end))
+    scope_sql = "(cur.cohort_id=%s AND cur.provider_tier=%s)"
+    scope_params: tuple = (str(cohort_id), provider_tier)
+    if history_source_cohort_id is not None:
+        if (
+            history_source_provider_tier is None
+            or history_before is None
+        ):
+            raise ValueError("bar group history binding is incomplete")
+        scope_sql = (
+            "(" + scope_sql
+            + " OR (cur.cohort_id=%s AND cur.provider_tier=%s "
+            "AND cur.bar_end<%s))"
+        )
+        scope_params = (
+            *scope_params,
+            str(history_source_cohort_id),
+            history_source_provider_tier,
+            history_before,
+        )
     cursor.execute(
         "SELECT cur.interval AS interval, cur.adjustment_basis AS adjustment_basis, "
         "revision.bar_revision_id AS bar_revision_id, revision.bar_start AS bar_start, "
@@ -285,11 +336,17 @@ def load_current_bar_groups_cursor(
         "AND revision.observed_at=cur.observed_at AND revision.cohort_id=cur.cohort_id "
         "AND revision.provider_tier=cur.provider_tier AND revision.instrument_id=cur.instrument_id "
         "AND revision.interval=cur.interval "
-        "WHERE cur.cohort_id=%s AND cur.provider_tier=%s AND cur.instrument_id=%s "
+        "WHERE " + scope_sql + " AND cur.instrument_id=%s "
         "AND cur.session_scope='RTH' AND revision.security_id=%s AND revision.ticker=%s "
         "AND revision.is_final AND (" + " OR ".join(predicates) + ") "
         "ORDER BY cur.interval, cur.adjustment_basis, cur.bar_start",
-        (str(cohort_id), provider_tier, instrument_id, str(security_id), ticker, *parameters),
+        (
+            *scope_params,
+            instrument_id,
+            str(security_id),
+            ticker,
+            *parameters,
+        ),
     )
     by_group: dict[str, list[dict]] = {key: [] for key in groups}
     for fetched in cursor.fetchall():

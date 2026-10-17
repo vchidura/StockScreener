@@ -61,7 +61,16 @@ class DashboardStore(TickerStore):
             identity = params[8] or self.current.get(key)
             row = self.snapshots.get(identity)
             if row and (row["cohort_id"], row["snapshot_type"], row["snapshot_key"]) == key and row["generated_at"] <= params[3]:
-                self.result = [dict(row, cohort_manifest_sha256="a" * 64, stock_count=9)]
+                self.result = [dict(
+                    row,
+                    cohort_manifest_sha256="a" * 64,
+                    stock_count=9,
+                    history_binding_sha256=getattr(
+                        self,
+                        "history_binding_sha256",
+                        None,
+                    ),
+                )]
         elif sql.startswith("SELECT revision_id"):
             self.statements.append(sql)
             reference = next(row for row in dashboard_fixture().members if str(row["security_id"]) == params[0])
@@ -80,6 +89,41 @@ def test_dashboard_reader_uses_reader_visible_screening_tier_identity():
     assert "rt.screening_generations AS screening" in source
     assert "snapshot.provider_tier=screening.provider_tier" in source
     assert "cohort.profile_id" not in source
+
+
+def test_dashboard_reader_accepts_bound_advanced_history_identity():
+    binding_sha256 = "b" * 64
+    inputs = replace(
+        dashboard_fixture(),
+        source_manifest_sha256=canonical_sha256({
+            "manifest_sha256": "a" * 64,
+            "history_binding_sha256": binding_sha256,
+        }),
+    )
+    store = DashboardStore()
+    store.history_binding_sha256 = binding_sha256
+    store.publish(produce_realtime_dashboard(inputs))
+    app = create_realtime_portal_app(
+        RealtimePortalRepositories(
+            None,
+            None,
+            None,
+            dashboard=RealtimeDashboardRepository(store.cursor),
+        ),
+        clock=lambda: OBSERVED_AT,
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/latest-price-date",
+            params={"cohort_id": str(COHORT_ID)},
+        )
+
+    assert response.status_code == 200
+    assert any(
+        "rt.cohort_history_bindings" in statement
+        for statement in store.statements
+    )
 
 
 def dashboard_app(*, snapshot=None, clock=lambda: OBSERVED_AT):

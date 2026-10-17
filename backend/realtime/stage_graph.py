@@ -13,6 +13,7 @@ from typing import Mapping
 
 STAGE_CATALOG_VERSION = "stages_v1"
 STAGE_CATALOG_VERSION_V2 = "stages_v2"
+STAGE_CATALOG_VERSION_V3 = "stages_v3"
 TERMINAL_STATES = frozenset({"COMPLETE", "FAILED", "BLOCKED_PREREQ", "BLOCKED_POLICY", "MISSED"})
 NON_COMPLETING_STATES = frozenset({"FAILED", "BLOCKED_PREREQ", "BLOCKED_POLICY", "MISSED"})
 
@@ -80,9 +81,64 @@ STAGES_V2: dict[str, StageDefinition] = {
     )
 }
 
+STAGES_V3: dict[str, StageDefinition] = {
+    stage.stage_id: stage for stage in (
+        StageDefinition("REFERENCE", "shared", (), DATA_LANE, "INTERVAL"),
+        StageDefinition(
+            "EQUITY_INPUT_GATE",
+            "equity",
+            ("REFERENCE",),
+            DATA_LANE,
+            "WINDOW",
+            deadline_offset_seconds=120,
+        ),
+        StageDefinition(
+            "EQUITY_MATERIALIZE",
+            "equity",
+            ("EQUITY_INPUT_GATE",),
+            DATA_LANE,
+            "WINDOW",
+            deadline_offset_seconds=120,
+        ),
+        StageDefinition(
+            "STOCK_ALERTS",
+            "equity",
+            ("EQUITY_MATERIALIZE",),
+            ALERT_LANE,
+            "WINDOW",
+            deadline_offset_seconds=120,
+        ),
+        StageDefinition(
+            "EQUITY_PROJECTION",
+            "equity",
+            ("EQUITY_MATERIALIZE",),
+            PORTAL_LANE,
+            "COALESCED",
+            deadline_offset_seconds=300,
+        ),
+        StageDefinition(
+            "PORTAL_PUBLISH",
+            "equity",
+            ("EQUITY_PROJECTION",),
+            PORTAL_LANE,
+            "COALESCED",
+            deadline_offset_seconds=300,
+        ),
+        StageDefinition(
+            "STRATEGY_PUBLISH",
+            "equity",
+            ("EQUITY_MATERIALIZE",),
+            PORTAL_LANE,
+            "COALESCED",
+            deadline_offset_seconds=300,
+        ),
+    )
+}
+
 STAGE_CATALOGS = {
     STAGE_CATALOG_VERSION: STAGES_V1,
     STAGE_CATALOG_VERSION_V2: STAGES_V2,
+    STAGE_CATALOG_VERSION_V3: STAGES_V3,
 }
 
 
@@ -101,10 +157,23 @@ class Decision:
     blocked_by: str | None = None
 
 
-def _satisfied(stage: str, states: Mapping[str, str], readiness: Mapping[str, str]) -> bool:
+def _satisfied(
+    stage: str,
+    states: Mapping[str, str],
+    readiness: Mapping[str, str],
+    stages: Mapping[str, StageDefinition],
+    enabled: frozenset[str] | set[str],
+) -> bool:
     """A prerequisite is satisfied by a completed run in this window, or by READY readiness
     for window-independent stages (for example the six-hourly reference refresh)."""
-    return states.get(stage) == "COMPLETE" or readiness.get(stage) == "READY" and stage not in states
+    return states.get(stage) == "COMPLETE" or (
+        (
+            stages[stage].schedule_kind in RESIDENT_SCHEDULES
+            or stage not in enabled
+        )
+        and readiness.get(stage) == "READY"
+        and stage not in states
+    )
 
 
 def decide_window(
@@ -134,7 +203,10 @@ def decide_window(
                          if states.get(item) in NON_COMPLETING_STATES), None)
         if blocking is not None:
             decisions[stage_id] = Decision(stage_id, Action.BLOCK_PREREQ, blocked_by=blocking)
-        elif all(_satisfied(item, states, readiness) for item in definition.prerequisites):
+        elif all(
+            _satisfied(item, states, readiness, stages, enabled)
+            for item in definition.prerequisites
+        ):
             decisions[stage_id] = Decision(stage_id, Action.RUN)
         else:
             decisions[stage_id] = Decision(stage_id, Action.WAIT)

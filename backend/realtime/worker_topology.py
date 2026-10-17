@@ -48,7 +48,7 @@ _WORKER_DATABASE_ROLES = {
     RealtimeWorkerKind.DEVELOPER_OPTION_ACQUISITION: RealtimeDatabaseRole.INGRESS,
     RealtimeWorkerKind.ADVANCED_STOCK_GATEWAY: RealtimeDatabaseRole.INGRESS,
     RealtimeWorkerKind.ADVANCED_OPTION_GATEWAY: RealtimeDatabaseRole.INGRESS,
-    RealtimeWorkerKind.RAW_JOURNAL_BRIDGE: RealtimeDatabaseRole.INGRESS,
+    RealtimeWorkerKind.RAW_JOURNAL_BRIDGE: RealtimeDatabaseRole.COMPUTE,
     RealtimeWorkerKind.DECODER: RealtimeDatabaseRole.INGRESS,
     RealtimeWorkerKind.NORMALIZED_DISPATCHER: RealtimeDatabaseRole.COMPUTE,
     RealtimeWorkerKind.FAST_MATERIALIZER: RealtimeDatabaseRole.COMPUTE,
@@ -179,30 +179,30 @@ def _cohort_workers(binding: TierCohortBinding) -> tuple[WorkerAssignment, ...]:
         ),
     )
     if binding.provider_tier is ProviderTier.MASSIVE_DEVELOPER:
-        return (
+        assignments = [
             WorkerAssignment(
                 RealtimeWorkerKind.DEVELOPER_STOCK_ACQUISITION,
                 WorkerLane.SLOW,
                 binding.cohort_id,
                 binding.provider_tier,
             ),
-            WorkerAssignment(
-                RealtimeWorkerKind.DEVELOPER_OPTION_ACQUISITION,
-                WorkerLane.SLOW,
-                binding.cohort_id,
-                binding.provider_tier,
-            ),
+        ]
+        if binding.options_tier is ProviderTier.MASSIVE_DEVELOPER:
+            assignments.append(
+                WorkerAssignment(
+                    RealtimeWorkerKind.DEVELOPER_OPTION_ACQUISITION,
+                    WorkerLane.SLOW,
+                    binding.cohort_id,
+                    binding.options_tier,
+                )
+            )
+        return (
+            *assignments,
             *common,
         )
-    return (
+    assignments = [
         WorkerAssignment(
             RealtimeWorkerKind.ADVANCED_STOCK_GATEWAY,
-            WorkerLane.HOT,
-            binding.cohort_id,
-            binding.provider_tier,
-        ),
-        WorkerAssignment(
-            RealtimeWorkerKind.ADVANCED_OPTION_GATEWAY,
             WorkerLane.HOT,
             binding.cohort_id,
             binding.provider_tier,
@@ -231,8 +231,26 @@ def _cohort_workers(binding: TierCohortBinding) -> tuple[WorkerAssignment, ...]:
             binding.cohort_id,
             binding.provider_tier,
         ),
-        *common,
-    )
+    ]
+    if binding.options_tier is ProviderTier.MASSIVE_ADVANCED:
+        assignments.append(
+            WorkerAssignment(
+                RealtimeWorkerKind.ADVANCED_OPTION_GATEWAY,
+                WorkerLane.HOT,
+                binding.cohort_id,
+                binding.options_tier,
+            )
+        )
+    elif binding.options_tier is ProviderTier.MASSIVE_DEVELOPER:
+        assignments.append(
+            WorkerAssignment(
+                RealtimeWorkerKind.DEVELOPER_OPTION_ACQUISITION,
+                WorkerLane.SLOW,
+                binding.cohort_id,
+                binding.options_tier,
+            )
+        )
+    return (*assignments, *common)
 
 
 def build_tier_worker_plan(

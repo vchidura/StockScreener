@@ -146,6 +146,8 @@ def test_stock_gateway_authenticates_subscribes_and_hands_off_raw_bytes():
     claim = buffer.claim_nowait(maximum_events=1, maximum_bytes=4096)
 
     assert result.final_state is GatewayFeedState.STOPPED
+    assert result.received_messages == 4
+    assert result.received_bytes > result.accepted_bytes
     assert result.accepted_messages == 1
     assert claim.messages[0].payload == market
     assert claim.messages[0].stream_session_id == SESSION
@@ -271,58 +273,6 @@ def test_gateway_uses_real_websockets_client_against_loopback_fake_server():
     assert [row["action"] for row in controls] == ["auth", "subscribe"]
     claim = buffer.claim_nowait(maximum_events=1, maximum_bytes=4096)
     assert claim.messages[0].payload.startswith(b'[{"ev":"Q"')
-
-
-def test_gateway_reconnects_once_and_reauthenticates_with_loopback_server():
-    async def scenario():
-        connections = 0
-        controls = []
-        delays = []
-
-        async def handler(websocket):
-            nonlocal connections
-            connections += 1
-            controls.append(json.loads(await websocket.recv()))
-            if connections == 1:
-                await websocket.close(code=1011, reason="synthetic transient failure")
-                return
-            await websocket.send(_status("auth_success").decode("ascii"))
-            controls.append(json.loads(await websocket.recv()))
-            await websocket.send(_status("success").decode("ascii"))
-            await websocket.send('[{"ev":"T","sym":"SPY","p":100,"s":1,"t":1}]')
-
-        async def fake_sleep(delay):
-            delays.append(delay)
-
-        async with serve(handler, "127.0.0.1", 0) as server:
-            port = server.sockets[0].getsockname()[1]
-            gateway = AdvancedGateway(
-                GatewayConfiguration(
-                    MarketFeed.STOCKS,
-                    f"ws://127.0.0.1:{port}",
-                    allow_insecure_loopback=True,
-                ),
-                _manifest(),
-                _buffer(),
-                api_key="loopback-only",
-                utc_clock=lambda: NOW,
-                monotonic_ns=lambda: 100,
-            )
-            result = await gateway.run_with_reconnect(
-                maximum_attempts=2,
-                maximum_market_messages=1,
-                sleep=fake_sleep,
-                jitter=lambda _: 0.25,
-            )
-        return result, connections, controls, delays
-
-    result, connections, controls, delays = asyncio.run(scenario())
-
-    assert result.connection_attempts == 2
-    assert connections == 2
-    assert [row["action"] for row in controls] == ["auth", "auth", "subscribe"]
-    assert delays == [0.25]
-    assert result.transitions.count(GatewayFeedState.CONNECTING) == 2
 
 
 def test_option_gateway_uses_real_loopback_server():

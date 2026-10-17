@@ -40,6 +40,24 @@ class OptionExchangeCalendar:
             timezone.utc
         )
 
+    def next_session_date(self, session_date: date) -> date:
+        session = self._calendar.date_to_session(
+            pd.Timestamp(session_date), direction="none"
+        )
+        return self._calendar.next_session(session).date()
+
+    def session_on_or_after(self, calendar_date: date) -> date:
+        session = self._calendar.date_to_session(
+            pd.Timestamp(calendar_date), direction="next"
+        )
+        return session.date()
+
+    def previous_session_date(self, session_date: date) -> date:
+        session = self._calendar.date_to_session(
+            pd.Timestamp(session_date), direction="none"
+        )
+        return self._calendar.previous_session(session).date()
+
     def latest_completed_minute_start(self, as_of: datetime) -> datetime:
         if as_of.tzinfo is None or as_of.utcoffset() is None:
             raise ValueError("as_of must be timezone-aware")

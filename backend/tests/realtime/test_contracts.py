@@ -157,6 +157,58 @@ def test_subscription_manifest_supports_exact_equity_only_membership():
     assert not any(member.asset_class is AssetClass.OPTION for member in manifest.members)
 
 
+def test_subscription_manifest_supports_exact_am_only_equity_membership():
+    universe = UniverseManifest(
+        version="advanced-spy-am-v1",
+        equity_tickers=("SPY",),
+        option_underlyings=(),
+    )
+    member = SubscriptionMember(
+        AssetClass.EQUITY,
+        "SPY",
+        "SPY",
+        MarketChannel.MINUTE_AGGREGATE,
+    )
+
+    manifest = SubscriptionManifest(
+        version="advanced-spy-am-v1",
+        session_date=date(2026, 10, 16),
+        universe=universe,
+        capability_profile_sha256=HASH_A,
+        allocation_policy_sha256=HASH_B,
+        members=(member,),
+        maximum_option_quote_contracts=0,
+    )
+
+    assert manifest.members == (member,)
+
+
+def test_subscription_manifest_requires_one_channel_for_every_equity():
+    universe = UniverseManifest(
+        version="advanced-two-name-v1",
+        equity_tickers=("SPY", "QQQ"),
+        option_underlyings=(),
+    )
+
+    with pytest.raises(ValueError, match="at least one explicit channel"):
+        SubscriptionManifest(
+            version="advanced-two-name-v1",
+            session_date=date(2026, 10, 16),
+            universe=universe,
+            capability_profile_sha256=HASH_A,
+            allocation_policy_sha256=HASH_B,
+            members=(
+                SubscriptionMember(
+                    AssetClass.EQUITY,
+                    "SPY",
+                    "SPY",
+                    MarketChannel.MINUTE_AGGREGATE,
+                ),
+            ),
+            maximum_option_quote_contracts=0,
+        )
+
+
 def test_option_universe_cannot_use_zero_quote_budget():
     with pytest.raises(ValueError, match="universe kind"):
         _manifest(maximum_quotes=0)

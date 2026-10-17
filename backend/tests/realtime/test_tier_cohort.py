@@ -19,6 +19,8 @@ from realtime.tier_cohort import (
     build_initial_developer_activation,
     build_tier_cohort_switch,
     persist_tier_cohort_activation,
+    product_capabilities,
+    product_disabled_detectors,
     persist_tier_cohort_binding_cursor,
 )
 
@@ -84,7 +86,22 @@ def test_initial_developer_activation_requires_exact_reduced_capabilities_and_wa
             DEVELOPER_DISABLED_DETECTORS,
             NOW,
         )
-    with pytest.raises(ValueError, match="stock/options tiers must both match"):
+    equity_only = TierCohortBinding(
+        ADVANCED_COHORT,
+        ADVANCED_PROFILE,
+        ProviderTier.MASSIVE_ADVANCED,
+        TierState.ADVANCED_READY,
+        "c" * 64,
+        "d" * 64,
+        product_capabilities(ProviderTier.MASSIVE_ADVANCED, None),
+        product_disabled_detectors(ProviderTier.MASSIVE_ADVANCED, None),
+        NOW,
+        options_enabled=False,
+    )
+    assert equity_only.stocks_tier is ProviderTier.MASSIVE_ADVANCED
+    assert equity_only.options_tier is None
+
+    with pytest.raises(ValueError, match="publication tier"):
         TierCohortBinding(
             ADVANCED_COHORT,
             ADVANCED_PROFILE,
@@ -92,11 +109,11 @@ def test_initial_developer_activation_requires_exact_reduced_capabilities_and_wa
             TierState.ADVANCED_READY,
             "c" * 64,
             "d" * 64,
-            ADVANCED_CAPABILITIES,
-            frozenset(),
+            product_capabilities(ProviderTier.MASSIVE_DEVELOPER, None),
+            product_disabled_detectors(ProviderTier.MASSIVE_DEVELOPER, None),
             NOW,
             stocks_tier=ProviderTier.MASSIVE_DEVELOPER,
-            options_tier=ProviderTier.MASSIVE_ADVANCED,
+            options_enabled=False,
         )
 
 

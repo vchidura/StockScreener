@@ -220,6 +220,13 @@ def _chart_source(manifest, *, cohort_id, snapshot_id):
         cohort_id=str(cohort_id), snapshot_id=str(snapshot_id), provider_tier=manifest["provider_tier"],
         instrument_id=reference["instrument_id"], security_id=str(reference["security_id"]),
         ticker=reference["ticker"], bar_lineage=manifest["bar_lineage"],
+        history_source_cohort_id=manifest.get(
+            "history_source_cohort_id"
+        ),
+        history_source_provider_tier=manifest.get(
+            "history_source_provider_tier"
+        ),
+        history_before=manifest.get("history_before"),
     )
 
 
@@ -585,6 +592,19 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 cursor, cohort_id=UUID(source["cohort_id"]), provider_tier=source["provider_tier"],
                 instrument_id=source["instrument_id"], security_id=UUID(source["security_id"]),
                 ticker=source["ticker"], groups=chart_group_ranges(manifest, refs),
+                history_source_cohort_id=(
+                    UUID(source["history_source_cohort_id"])
+                    if source.get("history_source_cohort_id")
+                    else None
+                ),
+                history_source_provider_tier=source.get(
+                    "history_source_provider_tier"
+                ),
+                history_before=(
+                    datetime.fromisoformat(source["history_before"])
+                    if source.get("history_before")
+                    else None
+                ),
             )
         try:
             return compose_charts(manifest, refs, chart_market_times, rows)[interval]
@@ -728,10 +748,14 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 raise TickerPublicationUnavailable("Ticker Workspace summary has no stored publication for this cohort")
             selected = str(entry["snapshot_id"])
         cursor.execute(
-            "SELECT snapshot.*, manifest.manifest_sha256 AS cohort_manifest_sha256 "
+            "SELECT snapshot.*, "
+            "manifest.manifest_sha256 AS cohort_manifest_sha256,"
+            "history_binding.binding_sha256 AS history_binding_sha256 "
             "FROM " + SNAPSHOT_RELATION + " "
             "JOIN rt.cohorts AS cohort ON cohort.cohort_id=snapshot.cohort_id "
             "JOIN rt.subscription_manifests AS manifest ON manifest.manifest_id=cohort.manifest_id "
+            "LEFT JOIN rt.cohort_history_bindings AS history_binding "
+            "ON history_binding.target_cohort_id=cohort.cohort_id "
             "WHERE snapshot.cohort_id=%s AND snapshot.snapshot_type=%s AND snapshot.snapshot_key='PLATFORM' "
             "AND snapshot.generated_at<=%s AND cohort.created_at<=%s AND cohort.effective_at<=%s "
             "AND manifest.created_at<=%s AND snapshot.snapshot_id=%s",
@@ -744,13 +768,24 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             raise ValueError("Ticker summary does not match the requested snapshot")
         self_contained = row.get("snapshot_class") == "SESSION_CLOSE"
         manifest, payload = row["source_manifest"], row["payload"]
+        expected_source_manifest_sha256 = (
+            canonical_sha256({
+                "manifest_sha256": row["cohort_manifest_sha256"],
+                "history_binding_sha256": row[
+                    "history_binding_sha256"
+                ],
+            })
+            if row["history_binding_sha256"] is not None
+            else row["cohort_manifest_sha256"]
+        )
         if (
             canonical_sha256(manifest) != row["source_manifest_sha256"]
             or canonical_sha256(payload) != row["payload_sha256"]
             or manifest["version"] != snapshot_type or payload["version"] != snapshot_type
             or str(manifest["cohort_id"]) != str(cohort_id)
             or str(payload["cohort_id"]) != str(cohort_id)
-            or manifest["source_manifest_sha256"] != row["cohort_manifest_sha256"]
+            or manifest["source_manifest_sha256"]
+            != expected_source_manifest_sha256
             or manifest["provider_tier"] != row["provider_tier"]
             or manifest["source_generation"] != row["source_generation"]
             or payload["provider_fetch_performed"] is not False
@@ -951,15 +986,20 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 "SELECT snapshot.snapshot_id, snapshot.payload_sha256, snapshot.source_manifest_sha256, "
                 "snapshot.generated_at, snapshot.provider_tier, snapshot.source_generation, "
                 "manifest.manifest_sha256 AS cohort_manifest_sha256, "
+                "history_binding.binding_sha256 AS history_binding_sha256, "
                 "snapshot.source_manifest->'reference' AS reference, "
                 "snapshot.source_manifest->>'version' AS manifest_version, "
                 "snapshot.source_manifest->>'cohort_id' AS manifest_cohort_id, "
                 "snapshot.source_manifest->>'source_manifest_sha256' AS manifest_cohort_sha256, "
+                "snapshot.source_manifest->>'history_binding_sha256' "
+                "AS manifest_history_binding_sha256, "
                 "snapshot.source_manifest->>'provider_tier' AS manifest_provider_tier, "
                 "(snapshot.source_manifest->>'source_generation')::integer AS manifest_source_generation "
                 "FROM " + SNAPSHOT_RELATION + " "
                 "JOIN rt.cohorts AS cohort ON cohort.cohort_id=snapshot.cohort_id "
                 "JOIN rt.subscription_manifests AS manifest ON manifest.manifest_id=cohort.manifest_id "
+                "LEFT JOIN rt.cohort_history_bindings AS history_binding "
+                "ON history_binding.target_cohort_id=cohort.cohort_id "
                 + (_CURRENT_SCREENING_JOIN if read_mode == "current" else "") +
                 "WHERE snapshot.cohort_id=%s AND snapshot.snapshot_type=%s AND snapshot.snapshot_key=%s "
                 "AND snapshot.generated_at<=%s AND cohort.created_at<=%s AND cohort.effective_at<=%s "
@@ -978,10 +1018,25 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             if str(row["snapshot_id"]) != selected:
                 raise ValueError("Ticker publication does not match the requested snapshot")
             reference = row["reference"]
+            expected_source_manifest_sha256 = (
+                canonical_sha256({
+                    "manifest_sha256": row[
+                        "cohort_manifest_sha256"
+                    ],
+                    "history_binding_sha256": row[
+                        "history_binding_sha256"
+                    ],
+                })
+                if row["history_binding_sha256"] is not None
+                else row["cohort_manifest_sha256"]
+            )
             if (
                 row["manifest_version"] != TICKER_WORKSPACE_VERSION
                 or reference["ticker"] != symbol
-                or row["manifest_cohort_sha256"] != row["cohort_manifest_sha256"]
+                or row["manifest_cohort_sha256"]
+                != expected_source_manifest_sha256
+                or row["manifest_history_binding_sha256"]
+                != row["history_binding_sha256"]
                 or str(row["manifest_cohort_id"]) != str(cohort_id)
                 or row["manifest_provider_tier"] != row["provider_tier"]
                 or row["manifest_source_generation"] != row["source_generation"]
@@ -1046,10 +1101,15 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
         with self._cursor() as cursor:
             self._begin(cursor)
             statement = (
-                "SELECT snapshot.*, manifest.manifest_sha256 AS cohort_manifest_sha256 "
+                "SELECT snapshot.*, "
+                "manifest.manifest_sha256 AS cohort_manifest_sha256,"
+                "history_binding.binding_sha256 "
+                "AS history_binding_sha256 "
                 "FROM " + SNAPSHOT_RELATION + " "
                 "JOIN rt.cohorts AS cohort ON cohort.cohort_id=snapshot.cohort_id "
                 "JOIN rt.subscription_manifests AS manifest ON manifest.manifest_id=cohort.manifest_id "
+                "LEFT JOIN rt.cohort_history_bindings AS history_binding "
+                "ON history_binding.target_cohort_id=cohort.cohort_id "
                 + (_CURRENT_SCREENING_JOIN if read_mode == "current" else "") +
                 "WHERE snapshot.cohort_id=%s AND snapshot.snapshot_type=%s AND snapshot.snapshot_key=%s "
                 "AND snapshot.generated_at<=%s AND cohort.created_at<=%s AND cohort.effective_at<=%s "
@@ -1067,12 +1127,25 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             if str(row["snapshot_id"]) != str(snapshot_id):
                 raise ValueError("Ticker payload does not match its selected snapshot")
             manifest, payload = row["source_manifest"], row["payload"]
+            expected_source_manifest_sha256 = (
+                canonical_sha256({
+                    "manifest_sha256": row[
+                        "cohort_manifest_sha256"
+                    ],
+                    "history_binding_sha256": row[
+                        "history_binding_sha256"
+                    ],
+                })
+                if row["history_binding_sha256"] is not None
+                else row["cohort_manifest_sha256"]
+            )
             if (
                 canonical_sha256(manifest) != row["source_manifest_sha256"]
                 or canonical_sha256(payload) != row["payload_sha256"]
                 or manifest["version"] != TICKER_WORKSPACE_VERSION or payload["version"] != TICKER_WORKSPACE_VERSION
                 or payload["ticker"] != symbol or manifest["reference"]["ticker"] != symbol
-                or manifest["source_manifest_sha256"] != row["cohort_manifest_sha256"]
+                or manifest["source_manifest_sha256"]
+                != expected_source_manifest_sha256
                 or str(manifest["cohort_id"]) != str(cohort_id)
                 or manifest["provider_tier"] != row["provider_tier"]
                 or manifest["source_generation"] != row["source_generation"]

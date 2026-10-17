@@ -1,4 +1,5 @@
 import hashlib
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
@@ -8,6 +9,7 @@ from realtime.journal import RawJournalRecord
 from realtime.normalizer import (
     InstrumentAdmission,
     MarketEventQuality,
+    NORMALIZER_VERSION,
     normalize_raw_message,
 )
 
@@ -129,6 +131,29 @@ def test_normalizer_handles_option_trade_and_stock_minute_aggregate():
     assert aggregate.price == Decimal("100.5")
     assert aggregate.size == Decimal("1000")
     assert aggregate.quality is MarketEventQuality.GOOD
+
+
+def test_normalizer_prefers_fractional_am_volume_and_versions_the_contract():
+    timestamp = int((RECEIVED.timestamp() - 0.2) * 1000)
+    start = timestamp - 60_000
+
+    aggregate = normalize_raw_message(
+        _raw(
+            (
+                '[{"ev":"AM","sym":"SPY","o":100,"h":101,"l":99,'
+                f'"c":100.5,"v":1000,"dv":"1000.125","vw":100.25,'
+                f'"s":{start},"e":{timestamp}}}]'
+            ).encode("ascii")
+        ),
+        ADMISSIONS,
+    ).events[0]
+
+    details = json.loads(aggregate.details_json)
+    assert NORMALIZER_VERSION == "massive_market_event_v2"
+    assert aggregate.normalizer_version == NORMALIZER_VERSION
+    assert aggregate.size == Decimal("1000.125")
+    assert details["provider_integer_volume"] == "1000"
+    assert details["provider_fractional_volume"] == "1000.125"
 
 
 def test_normalizer_quarantines_bad_siblings_and_unadmitted_symbols():

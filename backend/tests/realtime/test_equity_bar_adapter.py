@@ -14,6 +14,7 @@ from equity.domain import (
 from realtime.contracts import AssetClass, MarketChannel
 from realtime.equity_bar_adapter import (
     AdvancedMinuteFinality,
+    RealtimeEquityBarFact,
     adapt_advanced_minute_aggregate,
     adapt_developer_equity_bar,
     adapt_derived_equity_bar,
@@ -146,6 +147,70 @@ def test_advanced_am_bar_retains_exact_journal_and_finality_lineage():
     assert fact.journal_generation == GENERATION
     assert fact.stream_session_id == SESSION
     assert fact.source_offset == 10
+
+
+def test_identical_advanced_payload_replay_keeps_one_logical_revision():
+    first = adapt_advanced_minute_aggregate(
+        _advanced_record(),
+        cohort_id=COHORT,
+        security_id=SECURITY,
+        finality=_advanced_finality(),
+    )
+    replay_record = replace(
+        _advanced_record(),
+        event_offset=20,
+        raw_offset=15,
+        journal_generation=UUID(int=20),
+        stream_session_id=UUID(int=21),
+        received_at=NOW + timedelta(seconds=5),
+        committed_at=NOW + timedelta(seconds=6),
+    )
+    replay = adapt_advanced_minute_aggregate(
+        replay_record,
+        cohort_id=COHORT,
+        security_id=SECURITY,
+        finality=AdvancedMinuteFinality(
+            journal_generation=replay_record.journal_generation,
+            stream_session_id=replay_record.stream_session_id,
+            owner_epoch=4,
+            normalized_through_offset=20,
+            event_time_watermark=NOW,
+            proved_at=replay_record.committed_at,
+            gap_free=True,
+        ),
+    )
+
+    assert first.revision.bar_revision_id == replay.revision.bar_revision_id
+    assert first.source_offset != replay.source_offset
+    assert (
+        first.revision.system_observed_at
+        < replay.revision.system_observed_at
+    )
+
+
+def test_advanced_native_rest_requires_explicit_repair_quality():
+    revision = _developer_revision()
+    repaired = replace(
+        revision,
+        quality_codes=("EXPLICIT_ADVANCED_REST_REPAIR_V1",),
+    )
+
+    fact = RealtimeEquityBarFact(
+        cohort_id=COHORT,
+        provider_tier=ProviderTier.MASSIVE_ADVANCED,
+        instrument_id=1,
+        revision=repaired,
+    )
+
+    assert fact.revision.source_kind is BarSourceKind.NATIVE_REST
+
+    with pytest.raises(ValueError, match="explicit repair"):
+        RealtimeEquityBarFact(
+            cohort_id=COHORT,
+            provider_tier=ProviderTier.MASSIVE_ADVANCED,
+            instrument_id=1,
+            revision=revision,
+        )
 
 
 def test_bar_sources_cannot_be_relabelled_across_tiers():

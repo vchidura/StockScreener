@@ -12,6 +12,8 @@ from realtime.tier_cohort import (
     DEVELOPER_CAPABILITIES,
     DEVELOPER_DISABLED_DETECTORS,
     TierCohortBinding,
+    product_capabilities,
+    product_disabled_detectors,
 )
 from realtime.worker_topology import (
     API_READER_POOL_BUDGET,
@@ -52,6 +54,21 @@ def _advanced():
         ADVANCED_CAPABILITIES,
         frozenset(),
         NOW + timedelta(minutes=10),
+    )
+
+
+def _advanced_equity_only():
+    return TierCohortBinding(
+        UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"),
+        UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+        ProviderTier.MASSIVE_ADVANCED,
+        TierState.ADVANCED_READY,
+        "e" * 64,
+        "f" * 64,
+        product_capabilities(ProviderTier.MASSIVE_ADVANCED, None),
+        product_disabled_detectors(ProviderTier.MASSIVE_ADVANCED, None),
+        NOW + timedelta(minutes=10),
+        options_enabled=False,
     )
 
 
@@ -118,6 +135,22 @@ def test_advanced_active_removes_developer_acquisition_and_keeps_hot_lane_isolat
             RealtimeWorkerKind.FAST_MATERIALIZER,
         }
     )
+
+
+def test_advanced_equity_only_does_not_start_any_options_worker():
+    advanced = _advanced_equity_only()
+    plan = build_tier_worker_plan(active=advanced)
+    kinds = _kinds(plan, advanced.cohort_id)
+
+    assert RealtimeWorkerKind.ADVANCED_STOCK_GATEWAY in kinds
+    assert RealtimeWorkerKind.ADVANCED_OPTION_GATEWAY not in kinds
+    assert RealtimeWorkerKind.DEVELOPER_OPTION_ACQUISITION not in kinds
+    bridge = next(
+        row
+        for row in plan.assignments
+        if row.kind is RealtimeWorkerKind.RAW_JOURNAL_BRIDGE
+    )
+    assert bridge.database_role is RealtimeDatabaseRole.COMPUTE
 
 
 def test_worker_database_plans_use_one_runtime_connection_and_minimum_roles():

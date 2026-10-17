@@ -1,0 +1,17 @@
+{
+  "version": "advanced-equity-scale-v1",
+  "scale_control": "MANUAL_GATED",
+  "universe_ladder": [1, 9, 25, 50, 100, 200, 400],
+  "stable_sessions_before_up": 5,
+  "thresholds": {
+    "maximum_unresolved_gaps": 0,
+    "maximum_quarantines": 0,
+    "maximum_duplicate_bars": 0,
+    "maximum_release_failures": 0,
+    "maximum_p95_lag_ms": 5000,
+    "maximum_p99_lag_ms": 10000,
+    "maximum_buffer_utilization": 0.5,
+    "minimum_memory_headroom_percent": 30,
+    "minimum_database_headroom_percent": 30
+  }
+}

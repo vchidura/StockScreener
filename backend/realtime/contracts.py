@@ -299,13 +299,8 @@ class SubscriptionManifest:
                 if member.underlying not in self.universe.option_underlyings:
                     raise ValueError("option member is outside the option universe")
                 option_underlyings.add(member.underlying)
-        required_stock_channels = {
-            MarketChannel.TRADE,
-            MarketChannel.QUOTE,
-            MarketChannel.MINUTE_AGGREGATE,
-        }
-        if any(channels != required_stock_channels for channels in stock_channels.values()):
-            raise ValueError("every equity requires T, Q, and AM membership")
+        if any(not channels for channels in stock_channels.values()):
+            raise ValueError("every equity requires at least one explicit channel")
         if option_underlyings != set(self.universe.option_underlyings):
             raise ValueError("every option underlying requires admitted contracts")
 

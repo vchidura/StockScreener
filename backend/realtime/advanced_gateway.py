@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import random
-from dataclasses import replace
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -98,6 +96,8 @@ class GatewaySessionResult:
     stream_session_id: UUID
     feed: MarketFeed
     subscriptions: tuple[str, ...]
+    received_messages: int
+    received_bytes: int
     accepted_messages: int
     accepted_bytes: int
     final_state: GatewayFeedState
@@ -125,6 +125,7 @@ class AdvancedGateway:
         utc_clock: Callable[[], datetime] | None = None,
         monotonic_ns: Callable[[], int],
         session_id_factory: Callable[[], UUID] = uuid4,
+        state_observer: Callable[[GatewayFeedState], None] | None = None,
     ) -> None:
         if not api_key.strip():
             raise ValueError("Advanced gateway API key is required")
@@ -136,10 +137,13 @@ class AdvancedGateway:
         self._utc_clock = utc_clock or (lambda: datetime.now(timezone.utc))
         self._monotonic_ns = monotonic_ns
         self._session_id_factory = session_id_factory
+        self._state_observer = state_observer
         self._state = GatewayFeedState.DISCONNECTED
         self._transitions = [self._state]
         self._message_number = 0
         self._last_admitted_message_number = -1
+        self._received_messages = 0
+        self._received_bytes = 0
         self._subscriptions = self._build_subscriptions()
 
     @property
@@ -150,11 +154,21 @@ class AdvancedGateway:
     def subscriptions(self) -> tuple[str, ...]:
         return self._subscriptions
 
+    @property
+    def received_messages(self) -> int:
+        return self._received_messages
+
+    @property
+    def received_bytes(self) -> int:
+        return self._received_bytes
+
     def _set_state(self, state: GatewayFeedState) -> None:
         if state is self._state:
             return
         self._state = state
         self._transitions.append(state)
+        if self._state_observer is not None:
+            self._state_observer(state)
 
     def _build_subscriptions(self) -> tuple[str, ...]:
         expected_asset = (
@@ -197,11 +211,12 @@ class AdvancedGateway:
             max_queue=self.configuration.library_max_queue,
         )
 
-    @staticmethod
-    async def _receive_bytes(connection) -> bytes:
+    async def _receive_bytes(self, connection) -> bytes:
         message = await connection.recv(decode=False)
         if type(message) is not bytes:
             raise GatewayControlError("ADVANCED_NON_BYTES_MESSAGE")
+        self._received_messages += 1
+        self._received_bytes += len(message)
         return message
 
     @staticmethod
@@ -295,6 +310,8 @@ class AdvancedGateway:
         stream_session_id = self._session_id_factory()
         self._message_number = 0
         self._last_admitted_message_number = -1
+        self._received_messages = 0
+        self._received_bytes = 0
         accepted_messages = 0
         accepted_bytes = 0
         self._set_state(GatewayFeedState.CONNECTING)
@@ -355,41 +372,10 @@ class AdvancedGateway:
             stream_session_id=stream_session_id,
             feed=self.configuration.feed,
             subscriptions=self._subscriptions,
+            received_messages=self._received_messages,
+            received_bytes=self._received_bytes,
             accepted_messages=accepted_messages,
             accepted_bytes=accepted_bytes,
             final_state=self._state,
             transitions=tuple(self._transitions),
         )
-
-    async def run_with_reconnect(
-        self,
-        *,
-        maximum_attempts: int,
-        maximum_market_messages: int | None = None,
-        sleep: Callable[[float], object] = asyncio.sleep,
-        jitter: Callable[[int], float] | None = None,
-    ) -> GatewaySessionResult:
-        if maximum_attempts <= 0:
-            raise ValueError("maximum_attempts must be positive")
-        if jitter is None:
-            jitter = lambda attempt: random.uniform(
-                0,
-                min(30.0, 0.5 * 2 ** (attempt - 1)),
-            )
-        from websockets.exceptions import ConnectionClosed
-
-        for attempt in range(1, maximum_attempts + 1):
-            try:
-                result = await self.run_session(
-                    maximum_market_messages=maximum_market_messages,
-                )
-                return replace(result, connection_attempts=attempt)
-            except (ConnectionClosed, OSError, TimeoutError):
-                self._set_state(GatewayFeedState.DISCONNECTED)
-                if attempt == maximum_attempts:
-                    raise
-                delay = jitter(attempt)
-                if delay < 0 or delay > 30:
-                    raise ValueError("reconnect jitter must be in [0, 30]")
-                await sleep(delay)
-        raise RuntimeError("unreachable reconnect state")

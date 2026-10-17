@@ -105,10 +105,13 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                     raise DashboardPublicationUnavailable("Dashboard has no retained publication for this cohort")
                 pinned = str(entry["snapshot_id"])
             cursor.execute(
-                "SELECT snapshot.*, manifest.manifest_sha256 AS cohort_manifest_sha256, manifest.stock_count "
+                "SELECT snapshot.*, manifest.manifest_sha256 AS cohort_manifest_sha256, "
+                "manifest.stock_count, history_binding.binding_sha256 AS history_binding_sha256 "
                 "FROM " + SNAPSHOT_RELATION + " "
                 "JOIN rt.cohorts AS cohort ON cohort.cohort_id=snapshot.cohort_id "
                 "JOIN rt.subscription_manifests AS manifest ON manifest.manifest_id=cohort.manifest_id "
+                "LEFT JOIN rt.cohort_history_bindings AS history_binding "
+                "ON history_binding.target_cohort_id=cohort.cohort_id "
                 "JOIN rt.screening_current AS screening_current ON screening_current.cohort_id=cohort.cohort_id "
                 "JOIN rt.screening_generations AS screening ON screening.generation_id=screening_current.generation_id "
                 "AND screening.cohort_id=screening_current.cohort_id AND screening.status='COMPLETE' "
@@ -124,6 +127,18 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                 raise DashboardPublicationUnavailable("Dashboard has no retained publication for this cohort")
             manifest, payload = stored["source_manifest"], stored["payload"]
             tickers, references = payload["tickers"], payload["references"]
+            expected_source_manifest_sha256 = (
+                canonical_sha256({
+                    "manifest_sha256": stored[
+                        "cohort_manifest_sha256"
+                    ],
+                    "history_binding_sha256": stored[
+                        "history_binding_sha256"
+                    ],
+                })
+                if stored["history_binding_sha256"] is not None
+                else stored["cohort_manifest_sha256"]
+            )
             if (
                 canonical_sha256(manifest) != stored["source_manifest_sha256"]
                 or canonical_sha256(payload) != stored["payload_sha256"]
@@ -131,7 +146,8 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                 or str(stored["cohort_id"]) != str(cohort_id)
                 or (snapshot_id is not None and str(stored["snapshot_id"]) != str(snapshot_id))
                 or manifest["cohort_id"] != str(cohort_id) or payload["cohort_id"] != str(cohort_id)
-                or manifest["source_manifest_sha256"] != stored["cohort_manifest_sha256"]
+                or manifest["source_manifest_sha256"]
+                != expected_source_manifest_sha256
                 or manifest["provider_tier"] != stored["provider_tier"]
                 or manifest["source_generation"] != stored["source_generation"]
                 or manifest["generated_at"] != stored["generated_at"].isoformat()

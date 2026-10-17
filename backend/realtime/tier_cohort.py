@@ -7,7 +7,15 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from options.domain import DataCapability
 
 from .contracts import canonical_sha256
-from .preflight import DetectorFamily, ProviderTier, TierState, TierTransition
+from .preflight import (
+    DetectorFamily,
+    CapabilityVerdict,
+    ProductEntitlementProfile,
+    ProviderTier,
+    TierState,
+    TierTransition,
+    product_scoped_detector_availability,
+)
 
 
 DEVELOPER_CAPABILITIES = frozenset({
@@ -28,6 +36,41 @@ DEVELOPER_DISABLED_DETECTORS = frozenset({
     DetectorFamily.PERSISTENT_REALTIME_FLOW,
     DetectorFamily.SWEEP_LIKE_CLUSTER,
 })
+
+
+def product_capabilities(
+    stocks_tier: ProviderTier,
+    options_tier: ProviderTier | None,
+) -> frozenset[DataCapability]:
+    capabilities = {DataCapability.UNDERLYING_PRICE}
+    if stocks_tier is ProviderTier.MASSIVE_ADVANCED:
+        capabilities.add(DataCapability.REAL_TIME)
+    if options_tier is not None:
+        capabilities.update({
+            DataCapability.CHAIN_SNAPSHOT,
+            DataCapability.OPTION_TRADES,
+        })
+        if options_tier is ProviderTier.MASSIVE_ADVANCED:
+            capabilities.update({
+                DataCapability.OPTION_QUOTES,
+                DataCapability.REAL_TIME,
+            })
+    return frozenset(capabilities)
+
+
+def product_disabled_detectors(
+    stocks_tier: ProviderTier,
+    options_tier: ProviderTier | None,
+) -> frozenset[DetectorFamily]:
+    profile = ProductEntitlementProfile(stocks_tier, options_tier)
+    return frozenset(
+        detector
+        for detector in DetectorFamily
+        if product_scoped_detector_availability(
+            detector,
+            profile,
+        ).verdict is not CapabilityVerdict.PASS
+    )
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -66,29 +109,48 @@ class TierCohortBinding:
     effective_at: datetime
     stocks_tier: ProviderTier | None = None
     options_tier: ProviderTier | None = None
+    options_enabled: bool = True
 
     def __post_init__(self) -> None:
         effective = _utc(self.effective_at, "effective_at")
         stocks_tier = self.stocks_tier or self.provider_tier
-        options_tier = self.options_tier or self.provider_tier
-        if stocks_tier is not self.provider_tier or options_tier is not self.provider_tier:
-            raise ValueError(
-                "active cohort stock/options tiers must both match the provider tier"
-            )
+        options_tier = (
+            self.options_tier or self.provider_tier
+            if self.options_enabled
+            else None
+        )
+        if stocks_tier is not self.provider_tier:
+            raise ValueError("the publication tier must match the stocks tier")
+        expected_capabilities = product_capabilities(
+            stocks_tier,
+            options_tier,
+        )
+        expected_disabled = product_disabled_detectors(
+            stocks_tier,
+            options_tier,
+        )
         if self.provider_tier is ProviderTier.MASSIVE_DEVELOPER:
             if self.ready_state is not TierState.DEVELOPER_READY:
                 raise ValueError("Developer cohort must bind DEVELOPER_READY")
-            if self.capabilities != DEVELOPER_CAPABILITIES:
-                raise ValueError("Developer cohort capabilities must match the reduced contract")
-            if self.disabled_detectors != DEVELOPER_DISABLED_DETECTORS:
-                raise ValueError("Developer cohort must disable all Advanced-only detectors")
+            if self.capabilities != expected_capabilities:
+                raise ValueError(
+                    "Developer cohort capabilities must match the reduced contract"
+                )
+            if self.disabled_detectors != expected_disabled:
+                raise ValueError(
+                    "Developer cohort disabled detectors do not match its product tiers"
+                )
         else:
             if self.ready_state is not TierState.ADVANCED_READY:
                 raise ValueError("Advanced cohort must bind ADVANCED_READY")
-            if not ADVANCED_CAPABILITIES <= self.capabilities:
-                raise ValueError("Advanced cohort is missing required realtime capabilities")
-            if self.disabled_detectors:
-                raise ValueError("Advanced ready cohort cannot retain Developer disabled detectors")
+            if self.capabilities != expected_capabilities:
+                raise ValueError(
+                    "Advanced cohort capabilities do not match its product tiers"
+                )
+            if self.disabled_detectors != expected_disabled:
+                raise ValueError(
+                    "Advanced cohort disabled detectors do not match its product tiers"
+                )
         object.__setattr__(
             self,
             "source_manifest_sha256",
@@ -228,7 +290,11 @@ def persist_tier_cohort_binding_cursor(cursor, target: TierCohortBinding) -> Non
                     str(target.profile_id),
                     target.provider_tier.value,
                     target.stocks_tier.value,
-                    target.options_tier.value,
+                    (
+                        target.options_tier.value
+                        if target.options_tier is not None
+                        else None
+                    ),
                     target.ready_state.value,
                     target.source_manifest_sha256,
                     target.valuation_policy_sha256,
@@ -249,7 +315,11 @@ def persist_tier_cohort_binding_cursor(cursor, target: TierCohortBinding) -> Non
                 str(target.profile_id),
                 target.provider_tier.value,
                 target.stocks_tier.value,
-                target.options_tier.value,
+                (
+                    target.options_tier.value
+                    if target.options_tier is not None
+                    else None
+                ),
                 target.ready_state.value,
                 target.source_manifest_sha256,
                 target.valuation_policy_sha256,

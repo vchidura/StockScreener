@@ -141,14 +141,23 @@ def _seed(cursor):
     cursor.execute(
         "INSERT INTO rt.stream_sessions ("
         "session_id, provider, feed, manifest_id, owner_id, owner_epoch, "
-        "started_at, subscribed_at, status) "
-        "VALUES (%s,'massive','STOCKS',%s,%s,7,%s,%s,'LIVE')",
+        "started_at, subscribed_at, status,journal_generation,"
+        "normalizer_version,authorization_reference,budget_scope_sha256,"
+        "connection_attempt,connection_ceiling,decoded_byte_ceiling,"
+        "event_time_watermark,heartbeat_at) "
+        "VALUES (%s,'massive','STOCKS',%s,%s,7,%s,%s,'LIVE',"
+        "%s,'massive_market_event_v1','fixture-advanced-bridge',%s,"
+        "1,1,10485760,%s,%s)",
         (
             str(SESSION),
             str(manifest),
             str(owner),
             NOW - timedelta(minutes=5),
             NOW - timedelta(minutes=4),
+            str(GENERATION),
+            _digest(),
+            NOW + timedelta(minutes=10),
+            NOW,
         ),
     )
     return cohort, security, instrument

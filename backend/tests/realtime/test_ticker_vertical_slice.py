@@ -12,6 +12,9 @@ from fastapi.testclient import TestClient
 import pytest
 
 from realtime.contracts import EQUITY_VALIDATION_UNIVERSE, canonical_json, canonical_sha256
+from realtime.equity_interval_derivation import (
+    derive_realtime_interval_facts,
+)
 from realtime.equity_portal_history import (
     build_realtime_equity_portal_history_plan, build_realtime_equity_portal_history_package,
 )
@@ -147,6 +150,7 @@ def ticker_fixture():
             replay_available_at=b.replay_available_at, provider_published_at=b.provider_published_at,
             availability_mode=b.availability_mode.value, ingestion_segment_id=b.ingestion_segment_id,
             is_final=b.is_final, payload_sha256=b.payload_sha256,
+            quality_codes=b.quality_codes,
         ))
     return RealtimeScreeningInput(
         cohort_id=COHORT_ID, provider_tier=ProviderTier.MASSIVE_DEVELOPER, source_manifest_sha256="a" * 64,
@@ -1446,6 +1450,7 @@ def test_portal_loader_reads_exact_retained_intervals_and_causal_clocks():
     assert "interval IN ('15m','30m','1h','1d') AND source_kind='DERIVED' THEN 5" in bar_sql
     assert "interval='1d' AND source_kind='NATIVE_REST' THEN 5" in bar_sql
     assert "interval IN ('1wk','1mo') AND source_kind='DERIVED' THEN 5" in bar_sql
+    assert "quality_codes" in bar_sql
     assert "provider_published_at<=%s" in bar_sql and "created_at<=%s" in bar_sql
     action_sql = cursor.execute.call_args_list[-2].args[0]
     assert "newer.source_key=action.source_key" in action_sql
@@ -1482,6 +1487,82 @@ def test_native_5m_window_drift_fails_closed_even_when_long_derived_intervals_ar
                       coverage=tuple(row for row in inputs.coverage if row["security_id"] == member["security_id"]))
     with pytest.raises(ValueError, match="native 5m session windows"):
         produce_realtime_ticker_workspace(focused)
+
+
+def test_mixed_native_and_derived_monthly_history_is_available():
+    inputs = ticker_fixture()
+    member = next(
+        row for row in inputs.members if row["ticker"] == "AAPL"
+    )
+    own_rows = [
+        deepcopy(row)
+        for row in inputs.bars
+        if row["ticker"] == "AAPL"
+    ]
+    adjusted_daily = tuple(
+        _fact(row, inputs)
+        for row in own_rows
+        if row["interval"] == "1d"
+        and row["adjustment_basis"] == "ADJUSTED"
+    )
+    derived = derive_realtime_interval_facts(
+        _security("AAPL"),
+        adjusted_daily,
+        target_interval="1mo",
+        observed_at=inputs.cutoff,
+        ingestion_segment_id=UUID(int=900),
+    )[-1]
+    revision = derived.revision
+    target = next(
+        row
+        for row in own_rows
+        if row["interval"] == "1mo"
+        and row["session_date"] == revision.session_date
+    )
+    target.update({
+        "bar_revision_id": revision.bar_revision_id,
+        "bar_start": revision.bar_start,
+        "bar_end": revision.bar_end,
+        "open": float(revision.open_price),
+        "high": float(revision.high_price),
+        "low": float(revision.low_price),
+        "close": float(revision.close_price),
+        "volume": float(revision.volume),
+        "vwap": (
+            float(revision.vwap)
+            if revision.vwap is not None
+            else None
+        ),
+        "transaction_count": revision.transaction_count,
+        "source_kind": revision.source_kind.value,
+        "source_revision_ids": revision.source_bar_revision_ids,
+        "observed_at": revision.system_observed_at,
+        "replay_available_at": revision.replay_available_at,
+        "provider_published_at": revision.provider_published_at,
+        "availability_mode": revision.availability_mode.value,
+        "ingestion_segment_id": revision.ingestion_segment_id,
+        "payload_sha256": revision.payload_sha256,
+        "quality_codes": revision.quality_codes,
+    })
+    focused = replace(
+        inputs,
+        members=(member,),
+        bars=tuple(own_rows),
+        actions=tuple(
+            row for row in inputs.actions if row["ticker"] == "AAPL"
+        ),
+        coverage=tuple(
+            row
+            for row in inputs.coverage
+            if row["security_id"] == member["security_id"]
+        ),
+    )
+
+    projection = project_realtime_ticker_workspace(focused)
+
+    assert projection.snapshots[0].payload["chart_refs"]["1mo"] == (
+        "1mo:ADJUSTED"
+    )
 
 
 def test_stored_workspace_carries_references_not_bodies():

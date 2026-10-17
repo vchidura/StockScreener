@@ -6,7 +6,10 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from uuid import UUID
 
-from equity.derivation import derive_minute_bars
+from equity.derivation import (
+    derive_advanced_sparse_minute_window,
+    derive_minute_bars,
+)
 from equity.domain import (
     BarAvailabilityMode,
     BarSessionScope,
@@ -73,6 +76,7 @@ class FiveMinuteFinalizerOutcome(str, Enum):
     COMPLETE = "COMPLETE"
     GAP = "GAP"
     LATE = "LATE"
+    NO_TRADE = "NO_TRADE"
 
 
 class FiveMinuteFinalizerInputPending(RuntimeError):
@@ -111,6 +115,7 @@ class FiveMinuteFinalizerInput:
     policy_sha256: str
     build_id: str
     outcome: FiveMinuteFinalizerOutcome
+    gap_free_coverage: bool = False
 
     def __post_init__(self) -> None:
         if type(self.instrument_id) is not int or self.instrument_id <= 0:
@@ -126,6 +131,8 @@ class FiveMinuteFinalizerInput:
             raise ValueError("finalizer build ID must contain 1-96 characters")
         if not isinstance(self.outcome, FiveMinuteFinalizerOutcome):
             raise TypeError("finalizer outcome is invalid")
+        if type(self.gap_free_coverage) is not bool:
+            raise TypeError("finalizer coverage proof must be boolean")
         object.__setattr__(self, "source_bars", rows)
         object.__setattr__(self, "checked_at", checked)
         object.__setattr__(
@@ -150,6 +157,7 @@ class FiveMinuteFinalizerInput:
                 "policy_sha256": self.policy_sha256,
                 "build_id": self.build_id,
                 "outcome": self.outcome.value,
+                "gap_free_coverage": self.gap_free_coverage,
                 "source_bars": tuple(
                     (
                         row.bar_revision_id,
@@ -227,15 +235,28 @@ def build_five_minute_finalizer_input(
     checked_at: datetime,
     policy_sha256: str,
     build_id: str,
+    gap_free_coverage: bool = False,
 ) -> FiveMinuteFinalizerInput:
     if not isinstance(window, FiveMinuteFinalizerWindow):
         raise TypeError("finalizer window is invalid")
     checked = _utc(checked_at, "checked_at")
     rows = tuple(sorted(source_bars, key=lambda row: row.bar_start))
     _validate_source_bars(window, security, rows, checked)
-    if _has_complete_source_window(window, rows):
+    complete_source = _has_complete_source_window(window, rows)
+    if complete_source:
         outcome = (
             FiveMinuteFinalizerOutcome.LATE
+            if checked > window.deadline
+            else FiveMinuteFinalizerOutcome.COMPLETE
+        )
+    elif (
+        window.provider_tier is ProviderTier.MASSIVE_ADVANCED
+        and gap_free_coverage
+    ):
+        outcome = (
+            FiveMinuteFinalizerOutcome.NO_TRADE
+            if not rows
+            else FiveMinuteFinalizerOutcome.LATE
             if checked > window.deadline
             else FiveMinuteFinalizerOutcome.COMPLETE
         )
@@ -254,6 +275,7 @@ def build_five_minute_finalizer_input(
         policy_sha256=policy_sha256,
         build_id=build_id,
         outcome=outcome,
+        gap_free_coverage=gap_free_coverage,
     )
 
 
@@ -504,6 +526,69 @@ def _load_finalizer_source_bars_cursor(
     return tuple(_bar_revision(row) for row in cursor.fetchall())
 
 
+def _advanced_gap_free_coverage_cursor(
+    cursor,
+    *,
+    window: FiveMinuteFinalizerWindow,
+) -> bool:
+    cursor.execute(
+        "SELECT session.session_id,session.journal_generation,"
+        "session.owner_epoch "
+        "FROM rt.cohorts AS cohort "
+        "JOIN rt.stream_sessions AS session "
+        "ON session.manifest_id=cohort.manifest_id "
+        "WHERE cohort.cohort_id=%s AND session.feed='STOCKS' "
+        "AND session.journal_generation IS NOT NULL "
+        "AND session.status IN ('LIVE','STOPPING','STOPPED') "
+        "AND session.subscribed_at<=%s "
+        "AND (session.ended_at IS NULL OR session.ended_at>=%s) "
+        "AND session.event_time_watermark>=%s "
+        "ORDER BY session.owner_epoch DESC LIMIT 1",
+        (
+            str(window.cohort_id),
+            window.window_start,
+            window.window_end,
+            window.window_end,
+        ),
+    )
+    session = cursor.fetchone()
+    if session is None:
+        return False
+    cursor.execute(
+        "SELECT count(*) FROM rt.consumer_checkpoints AS checkpoint "
+        "WHERE checkpoint.cohort_id=%s "
+        "AND checkpoint.journal_generation=%s "
+        "AND checkpoint.owner_epoch=%s "
+        "AND (convert_from(checkpoint.state_payload,'UTF8')::jsonb"
+        "->>'stream_session_id')::uuid=%s "
+        "AND (convert_from(checkpoint.state_payload,'UTF8')::jsonb"
+        "->>'event_time_watermark')::timestamptz>=%s",
+        (
+            str(window.cohort_id),
+            str(session[1]),
+            int(session[2]),
+            str(session[0]),
+            window.window_end,
+        ),
+    )
+    if int(cursor.fetchone()[0]) <= 0:
+        return False
+    cursor.execute(
+        "SELECT count(*) FROM rt.stream_gaps "
+        "WHERE session_id=%s AND journal_generation=%s "
+        "AND gap_start<%s AND COALESCE(gap_end,%s)>%s "
+        "AND recovery_status NOT IN ('REPAIRED','WAIVED')",
+        (
+            str(session[0]),
+            str(session[1]),
+            window.window_end,
+            window.window_end,
+            window.window_start,
+        ),
+    )
+    return int(cursor.fetchone()[0]) == 0
+
+
 def _load_finalizer_member_input_cursor(
     cursor,
     *,
@@ -526,6 +611,14 @@ def _load_finalizer_member_input_cursor(
         security=security,
         as_of=checked_at,
     )
+    gap_free_coverage = (
+        _advanced_gap_free_coverage_cursor(
+            cursor,
+            window=window,
+        )
+        if window.provider_tier is ProviderTier.MASSIVE_ADVANCED
+        else False
+    )
     return build_five_minute_finalizer_input(
         window,
         instrument_id=instrument_id,
@@ -534,6 +627,7 @@ def _load_finalizer_member_input_cursor(
         checked_at=checked_at,
         policy_sha256=policy_sha256,
         build_id=build_id,
+        gap_free_coverage=gap_free_coverage,
     )
 
 
@@ -669,14 +763,36 @@ def prepare_five_minute_finalizer_output(
         }
     )
     facts = ()
-    if prepared.outcome is not FiveMinuteFinalizerOutcome.GAP and not native_complete:
-        derived = derive_minute_bars(
-            prepared.security,
-            prepared.source_bars,
-            target_interval=_FINALIZER_INTERVAL,
-            observed_at=prepared.checked_at,
-            ingestion_segment_id=job.job_id,
-        )
+    if (
+        prepared.outcome
+        not in {
+            FiveMinuteFinalizerOutcome.GAP,
+            FiveMinuteFinalizerOutcome.NO_TRADE,
+        }
+        and not native_complete
+    ):
+        if (
+            window.provider_tier is ProviderTier.MASSIVE_ADVANCED
+            and prepared.gap_free_coverage
+        ):
+            derived = (
+                derive_advanced_sparse_minute_window(
+                    prepared.security,
+                    prepared.source_bars,
+                    window_start=window.window_start,
+                    window_end=window.window_end,
+                    observed_at=prepared.checked_at,
+                    ingestion_segment_id=job.job_id,
+                ),
+            )
+        else:
+            derived = derive_minute_bars(
+                prepared.security,
+                prepared.source_bars,
+                target_interval=_FINALIZER_INTERVAL,
+                observed_at=prepared.checked_at,
+                ingestion_segment_id=job.job_id,
+            )
         if (
             len(derived) != 1
             or derived[0].bar_start != window.window_start
@@ -701,6 +817,9 @@ def prepare_five_minute_finalizer_output(
         FiveMinuteFinalizerOutcome.COMPLETE: (),
         FiveMinuteFinalizerOutcome.GAP: ("FINALIZER_GAP",),
         FiveMinuteFinalizerOutcome.LATE: ("FINALIZER_LATE",),
+        FiveMinuteFinalizerOutcome.NO_TRADE: (
+            "FINALIZER_NO_TRADE",
+        ),
     }[prepared.outcome]
     watermark = AcquisitionWatermark(
         cohort_id=job.cohort_id,

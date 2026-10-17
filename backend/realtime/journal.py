@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 
 JOURNAL_SCHEMA_VERSION = 1
+JOURNAL_CODEC = "sqlite-wal-raw-v1"
 
 
 def _utc_now() -> datetime:
@@ -142,6 +143,34 @@ class QuarantineJournalRecord:
     reason_code: str
     payload_sha256: str
     committed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class JournalRecoveryState:
+    generation: UUID
+    schema_version: int
+    raw_committed_offset: int
+    normalized_committed_raw_offset: int
+    normalized_committed_event_offset: int
+    quarantine_count: int
+    integrity_check: str
+
+
+def journal_files_sha256(path: str | Path) -> str:
+    journal = Path(path)
+    if not journal.is_file():
+        raise FileNotFoundError(journal)
+    digest = hashlib.sha256()
+    for suffix in ("", "-wal"):
+        candidate = Path(str(journal) + suffix)
+        if not candidate.is_file():
+            continue
+        digest.update(suffix.encode("ascii"))
+        digest.update(candidate.stat().st_size.to_bytes(8, "big"))
+        with candidate.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _connect(path: Path, *, timeout_seconds: float, read_only: bool) -> sqlite3.Connection:
@@ -656,6 +685,64 @@ class RawJournalReader:
             committed_raw_offset=row["committed_raw_offset"],
             committed_event_offset=row["committed_event_offset"],
             updated_at=_parse_stamp(row["updated_at"]),
+        )
+
+    def recovery_state(
+        self,
+        normalizer_version: str,
+    ) -> JournalRecoveryState:
+        version = normalizer_version.strip()
+        if not version:
+            raise ValueError("normalizer_version cannot be blank")
+        with closing(
+            _connect(
+                self.path,
+                timeout_seconds=self.timeout_seconds,
+                read_only=True,
+            )
+        ) as connection:
+            integrity = str(
+                connection.execute("PRAGMA quick_check").fetchone()[0]
+            )
+            metadata = connection.execute(
+                "SELECT journal_generation,schema_version "
+                "FROM journal_metadata WHERE singleton=1"
+            ).fetchone()
+            if metadata is None:
+                raise ValueError("raw journal metadata is unavailable")
+            raw_offset = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(raw_offset),0) FROM raw_messages"
+                ).fetchone()[0]
+            )
+            event_offset = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(event_offset),0) "
+                    "FROM normalized_events"
+                ).fetchone()[0]
+            )
+            progress = connection.execute(
+                "SELECT committed_raw_offset,committed_event_offset "
+                "FROM decoder_progress WHERE normalizer_version=?",
+                (version,),
+            ).fetchone()
+            quarantine_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM quarantined_events"
+                ).fetchone()[0]
+            )
+        normalized_raw = int(progress[0]) if progress is not None else 0
+        normalized_event = int(progress[1]) if progress is not None else 0
+        if normalized_raw > raw_offset or normalized_event > event_offset:
+            raise ValueError("journal decoder progress exceeds committed rows")
+        return JournalRecoveryState(
+            generation=UUID(metadata["journal_generation"]),
+            schema_version=int(metadata["schema_version"]),
+            raw_committed_offset=raw_offset,
+            normalized_committed_raw_offset=normalized_raw,
+            normalized_committed_event_offset=normalized_event,
+            quarantine_count=quarantine_count,
+            integrity_check=integrity,
         )
 
     def read_normalized_after(

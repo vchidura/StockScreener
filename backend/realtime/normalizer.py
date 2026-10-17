@@ -13,7 +13,7 @@ from .contracts import AssetClass, MarketChannel, MarketFeed, canonical_sha256
 from .journal import RawJournalRecord
 
 
-NORMALIZER_VERSION = "massive_market_event_v1"
+NORMALIZER_VERSION = "massive_market_event_v2"
 ET = ZoneInfo("America/New_York")
 
 
@@ -254,7 +254,15 @@ def _normalize_event(
         high = _decimal(row, "h", required=True)
         low = _decimal(row, "l", required=True)
         close = _decimal(row, "c", required=True)
-        volume = _decimal(row, "v", required=True)
+        integer_volume = _decimal(row, "v", required=False)
+        fractional_volume = _decimal(row, "dv", required=False)
+        volume = (
+            fractional_volume
+            if fractional_volume is not None
+            else integer_volume
+        )
+        if volume is None:
+            raise _EventError("MISSING_VOLUME")
         vwap = _decimal(row, "vw", required=False)
         if (
             min(open_price, high, low, close) <= 0
@@ -275,6 +283,16 @@ def _normalize_event(
             "high": str(high),
             "low": str(low),
             "open": str(open_price),
+            "provider_fractional_volume": (
+                str(fractional_volume)
+                if fractional_volume is not None
+                else None
+            ),
+            "provider_integer_volume": (
+                str(integer_volume)
+                if integer_volume is not None
+                else None
+            ),
             "start_timestamp": start_timestamp,
             "vwap": str(vwap) if vwap is not None else None,
         }

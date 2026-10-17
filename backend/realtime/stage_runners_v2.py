@@ -30,6 +30,9 @@ from .runner_environment import RunnerEnvironment
 from .stage_graph import STAGES_V1
 from .stage_orchestrator import StageRunner
 from .stage_runners_alerts import stock_alerts_runner, strategy_publish_runner
+from .stage_runners_advanced_equity import (
+    advanced_equity_input_gate_runner,
+)
 from .stage_runners_equity import (
     equity_evidence_runner,
     equity_materialize_runner,
@@ -51,6 +54,7 @@ RunnerFactory = Callable[[RunnerEnvironment], StageRunner]
 RUNNER_FACTORIES: dict[str, RunnerFactory] = {
     "REFERENCE": reference_runner,
     "EQUITY_INGEST": equity_ingest_runner,
+    "EQUITY_INPUT_GATE": advanced_equity_input_gate_runner,
     "EQUITY_EVIDENCE": equity_evidence_runner,
     "EQUITY_MATERIALIZE": equity_materialize_runner,
     "EQUITY_PROJECTION": equity_projection_runner,

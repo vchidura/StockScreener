@@ -72,6 +72,10 @@ class RealtimeScreeningInput:
     bars: tuple[Mapping[str, object], ...]
     actions: tuple[Mapping[str, object], ...]
     coverage: tuple[Mapping[str, object], ...]
+    history_source_cohort_id: UUID | None = None
+    history_source_provider_tier: ProviderTier | None = None
+    history_before: datetime | None = None
+    history_binding_sha256: str | None = None
     known_by: InitVar[datetime | None] = None
 
     def __post_init__(self, known_by):
@@ -136,9 +140,23 @@ def _validate_bars(rows, member, inputs):
         raise ValueError("Screening bar revisions are duplicated")
     recorded_by = inputs.recorded_by
     for row in rows:
+        target_identity = (
+            str(row["cohort_id"]) == str(inputs.cohort_id)
+            and row["provider_tier"] == inputs.provider_tier.value
+        )
+        history_identity = (
+            inputs.history_source_cohort_id is not None
+            and inputs.history_source_provider_tier is not None
+            and inputs.history_before is not None
+            and inputs.history_binding_sha256 is not None
+            and str(row["cohort_id"])
+            == str(inputs.history_source_cohort_id)
+            and row["provider_tier"]
+            == inputs.history_source_provider_tier.value
+            and row["bar_end"] < inputs.history_before
+        )
         if (
-            str(row["cohort_id"]) != str(inputs.cohort_id)
-            or row["provider_tier"] != inputs.provider_tier.value
+            not (target_identity or history_identity)
             or str(row["security_id"]) != str(member["security_id"])
             or row["instrument_id"] != member["instrument_id"]
             or row["ticker"] != member["ticker"]

@@ -26,13 +26,34 @@ DEFAULT_RESIDENT_INTERVALS = {"REFERENCE": 21_600, "OPTIONS_FLOW": 0.25}
 def window_specs_for_session(
     cohort_id: UUID, session_date: date, provider_tier: str, *, completion_budget_seconds: int,
     serving_lag_seconds: int, calendar=None,
+    advanced_finality_delay_seconds: int | None = None,
 ) -> tuple[WindowSpec, ...]:
-    """Fifteen-minute Developer windows for a session; the window key is the cutoff in UTC."""
-    from .session_windows import developer_session_windows
+    from .preflight import ProviderTier
+    from .session_windows import (
+        advanced_session_windows,
+        developer_session_windows,
+    )
 
-    windows = developer_session_windows(
-        session_date, completion_budget_seconds=completion_budget_seconds,
-        serving_lag_seconds=serving_lag_seconds, calendar=calendar)
+    tier = ProviderTier(provider_tier)
+    if tier is ProviderTier.MASSIVE_ADVANCED:
+        if advanced_finality_delay_seconds is None:
+            raise ValueError(
+                "Advanced windows require an explicit finality delay"
+            )
+        windows = advanced_session_windows(
+            session_date,
+            finality_delay_seconds=advanced_finality_delay_seconds,
+            completion_budget_seconds=completion_budget_seconds,
+            serving_lag_seconds=serving_lag_seconds,
+            calendar=calendar,
+        )
+    else:
+        windows = developer_session_windows(
+            session_date,
+            completion_budget_seconds=completion_budget_seconds,
+            serving_lag_seconds=serving_lag_seconds,
+            calendar=calendar,
+        )
     return tuple(
         WindowSpec(cohort_id, provider_tier, window.cutoff.astimezone(timezone.utc).isoformat(),
                    window.available_after, window.cutoff, window.deadline)
