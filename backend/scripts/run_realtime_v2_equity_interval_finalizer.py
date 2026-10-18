@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Callable
 from uuid import UUID, uuid4
 
-from dotenv import load_dotenv
 from psycopg2.pool import ThreadedConnectionPool
 
 
@@ -102,7 +101,6 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def _pool(args: argparse.Namespace) -> ThreadedConnectionPool:
-    load_dotenv(BACKEND_DIR / ".env", override=True)
     if args.security_mode == SECURITY_MODE_HARDENED:
         dsn = os.getenv("REALTIME_V2_APP_DSN", "").strip()
         if not dsn:

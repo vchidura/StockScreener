@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 from threading import Barrier
+from types import SimpleNamespace
 from uuid import uuid4
 
 import psycopg2
@@ -25,7 +26,6 @@ from realtime.advanced_ingress_repository import (
     prepare_advanced_ingress_plan_cursor,
     activate_advanced_runtime_profile_cursor,
     advanced_ingress_controller_status_cursor,
-    bind_advanced_ingress_cohort_cursor,
     load_advanced_ingress_runtime_plan_cursor,
     finish_advanced_ingress_plan_cursor,
     register_advanced_runtime_profile_cursor,
@@ -39,6 +39,7 @@ from realtime.advanced_ingress_runtime_profile import (
 from realtime.advanced_scheduler import (
     ADVANCED_WINDOW_BUILD_ID,
     audit_completed_session_coverage_cursor,
+    bind_advanced_input_gate_build_id,
     discover_advanced_window_recovery_cursor,
     ensure_advanced_scheduler_session_cursor,
     ensure_advanced_window_retry_cursor,
@@ -65,7 +66,6 @@ from realtime.advanced_journal_registry import (
     discover_incomplete_advanced_journals_cursor,
     mark_advanced_journal_writing_cursor,
     measure_journal_capacity,
-    record_journal_capacity_cursor,
     register_advanced_journal_cursor,
 )
 from realtime.advanced_journal_replay import replay_registered_journal_once
@@ -97,6 +97,9 @@ from realtime.orchestration_repository import (
 from realtime.stage_graph import STAGE_CATALOG_VERSION_V3
 from realtime.normalizer import NORMALIZER_VERSION
 from realtime.stage_database_v2 import V2WorkerDatabase
+from realtime.stage_runners_advanced_equity import (
+    advanced_input_gate_identity,
+)
 from scripts.run_realtime_v2_advanced_journal_replay import (
     replay_registered_once,
 )
@@ -789,13 +792,8 @@ def test_registered_raw_commit_replays_to_one_canonical_bar_and_checkpoint(
         minimum_free_bytes=1,
         minimum_free_percent=1,
     )
+    assert capacity.admitted
     with provider.transaction(APP_ROLE) as unit:
-        record_journal_capacity_cursor(
-            unit.cursor,
-            plan_id=plan.plan_id,
-            observation=capacity,
-            observed_at=scope.started_at,
-        )
         register_advanced_journal_cursor(unit.cursor, registration)
         mark_advanced_journal_writing_cursor(
             unit.cursor,
@@ -869,6 +867,199 @@ def test_registered_raw_commit_replays_to_one_canonical_bar_and_checkpoint(
         assert discover_incomplete_advanced_journals_cursor(
             unit.cursor
         ) == ()
+
+
+def test_input_ready_accepts_exact_bars_from_two_fenced_generations(
+    hardened_database,
+    tmp_path,
+):
+    pool, provider, roles, _cohort_id, _manifest_id = hardened_database
+    budgets = AdvancedIngressBudgets(2, 2, 100_000, 0, 0)
+    authorization = _create_authorization(
+        pool,
+        roles,
+        "multi-generation-input-ready",
+        budgets=budgets,
+    )
+    plan = _prepare_plan(provider, authorization, budgets=budgets)
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        unit.cursor.execute(
+            "SELECT instrument_id FROM rt.subscription_members "
+            "WHERE manifest_id=%s AND channel='AM'",
+            (str(plan.manifest_id),),
+        )
+        instrument_id = int(unit.cursor.fetchone()[0])
+    with _admin_cursor(pool, roles) as cursor:
+        cursor.execute(
+            "SELECT rt.ensure_partitions('rt.bar_revisions',%s)",
+            (SESSION_DATE,),
+        )
+    root = tmp_path / "multi-generation-journals"
+    root.mkdir()
+    window_start = SESSION_OPEN + timedelta(hours=2)
+    database = V2WorkerDatabase(
+        provider,
+        RealtimeDatabaseRole.COMPUTE,
+    )
+
+    def run_generation(
+        *,
+        attempt,
+        starts,
+        terminal,
+    ):
+        generation = uuid4()
+        scope = AdvancedStreamScope(
+            ingress_plan_id=plan.plan_id,
+            cohort_id=plan.cohort_id,
+            manifest_id=plan.manifest_id,
+            journal_generation=generation,
+            owner_id=uuid4(),
+            feed=MarketFeed.STOCKS,
+            normalizer_version=NORMALIZER_VERSION,
+            authorization_reference=plan.authorization_reference,
+            connection_attempt=attempt,
+            connection_ceiling=2,
+            decoded_byte_ceiling=100_000,
+            stale_after_seconds=60,
+            started_at=starts[0],
+        )
+        with provider.transaction(APP_ROLE) as unit:
+            session = register_advanced_stream_session_cursor(
+                unit.cursor,
+                scope,
+            )
+            update_advanced_stream_session_cursor(
+                unit.cursor,
+                session,
+                AdvancedStreamUsage(0, 0, 0, 0, 0, 0, None),
+                status="LIVE",
+                checked_at=scope.started_at,
+                terminal=False,
+            )
+        config = AdvancedEquityJournalBridgeConfig(
+            cohort_id=plan.cohort_id,
+            journal_generation=generation,
+            stream_session_id=session.session_id,
+            owner_epoch=session.owner_epoch,
+            normalizer_version=NORMALIZER_VERSION,
+            shard_ids=(0,),
+            batch_limit=100,
+        )
+        path = root / f"{generation}.sqlite"
+        registration = build_advanced_journal_registration(
+            root=root,
+            path=path,
+            journal_generation=generation,
+            plan_id=plan.plan_id,
+            stream_session_id=session.session_id,
+            cohort_id=plan.cohort_id,
+            manifest_id=plan.manifest_id,
+            session_date=plan.session_date,
+            owner_epoch=session.owner_epoch,
+            normalizer_version=NORMALIZER_VERSION,
+            shard_ids=(0,),
+            shard_map_sha256=config.shard_map_sha256,
+        )
+        with provider.transaction(APP_ROLE) as unit:
+            register_advanced_journal_cursor(unit.cursor, registration)
+            mark_advanced_journal_writing_cursor(
+                unit.cursor,
+                generation,
+                checked_at=scope.started_at,
+            )
+        payload = json.dumps([
+            {
+                "ev": "AM",
+                "sym": "SPY",
+                "o": 100,
+                "h": 101,
+                "l": 99,
+                "c": 100.5,
+                "v": 1000,
+                "vw": 100.25,
+                "s": int(start.timestamp() * 1000),
+                "e": int(
+                    (start + timedelta(minutes=1)).timestamp() * 1000
+                ),
+            }
+            for start in starts
+        ]).encode()
+        with RawJournalWriter(path, generation=generation) as writer:
+            writer.append_batch((
+                RawMessageEnvelope(
+                    session.session_id,
+                    0,
+                    MarketFeed.STOCKS,
+                    starts[-1] + timedelta(minutes=1),
+                    attempt,
+                    payload,
+                ),
+            ))
+        replay_registered_journal_once(
+            provider,
+            database,
+            root,
+            replace(registration, status="WRITING"),
+            checked_at=starts[-1] + timedelta(minutes=1, seconds=1),
+            batch_limit=100,
+        )
+        usage = AdvancedStreamUsage(
+            1,
+            len(payload),
+            1,
+            len(payload),
+            1,
+            len(starts),
+            starts[-1] + timedelta(minutes=1),
+        )
+        with provider.transaction(APP_ROLE) as unit:
+            update_advanced_stream_session_cursor(
+                unit.cursor,
+                session,
+                usage,
+                status="STOPPED" if terminal else "LIVE",
+                checked_at=starts[-1] + timedelta(minutes=1),
+                terminal=terminal,
+            )
+        return session, generation
+
+    first = run_generation(
+        attempt=1,
+        starts=(
+            window_start,
+            window_start + timedelta(minutes=1),
+        ),
+        terminal=True,
+    )
+    second = run_generation(
+        attempt=2,
+        starts=(
+            window_start + timedelta(minutes=2),
+            window_start + timedelta(minutes=3),
+            window_start + timedelta(minutes=4),
+        ),
+        terminal=True,
+    )
+    cutoff = window_start + timedelta(minutes=5)
+    identity = advanced_input_gate_identity(
+        database,
+        SimpleNamespace(
+            plan=SimpleNamespace(cohort_id=plan.cohort_id),
+            window=SimpleNamespace(window_id=uuid4(), cutoff=cutoff),
+        ),
+    )
+
+    assert len(identity) == 64
+    assert first[0].owner_epoch < second[0].owner_epoch
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        unit.cursor.execute(
+            "SELECT count(DISTINCT journal_generation) "
+            "FROM rt.bar_revisions WHERE cohort_id=%s "
+            "AND bar_start>=%s AND bar_end<=%s",
+            (str(plan.cohort_id), window_start, cutoff),
+        )
+        assert unit.cursor.fetchone()[0] == 2
 
 
 def test_missing_registered_journal_is_durably_quarantined(
@@ -1066,12 +1257,9 @@ def test_gap_reconnect_stays_open_until_authorized_exact_repair(
             sealed_at=SESSION_OPEN + timedelta(minutes=23),
         )
         unit.cursor.execute(
-            "UPDATE rt.advanced_gap_repairs SET status='REPLAYED',"
-            "replayed_at=%s WHERE repair_id=%s",
-            (
-                SESSION_OPEN + timedelta(minutes=24),
-                str(repair.repair_id),
-            ),
+            "UPDATE rt.stream_gaps SET repair_status='REPLAYED' "
+            "WHERE repair_id=%s",
+            (str(repair.repair_id),),
         )
     assert request_id and payload_id
 
@@ -1187,18 +1375,9 @@ def test_unauthorized_gap_repair_preserves_gap_and_performs_zero_requests(
         )
         assert unit.cursor.fetchone() == ("UNRESOLVED", True)
         unit.cursor.execute(
-            "SELECT status,reason_code FROM rt.advanced_gap_alerts "
-            "WHERE gap_id=%s",
-            (str(gap_id),),
-        )
-        assert unit.cursor.fetchone() == (
-            "OPEN",
-            "REPAIR_UNAUTHORIZED",
-        )
-        unit.cursor.execute(
             "SELECT COUNT(*) FROM rt.provider_request_ledger "
             "WHERE request_id=("
-            "SELECT request_id FROM rt.advanced_gap_repairs "
+            "SELECT repair_reference FROM rt.stream_gaps "
             "WHERE repair_id=%s)",
             (str(repair.repair_id),),
         )
@@ -1231,50 +1410,33 @@ def test_backfill_blocked_and_cohort_local_wait_state_are_durable(
     assert blocked.state == "BACKFILL_BLOCKED"
     with provider.transaction(APP_ROLE, read_only=True) as unit:
         unit.cursor.execute(
-            "SELECT state,reason_code,next_action,requests_reserved,"
-            "bytes_reserved FROM rt.advanced_backfill_runs "
-            "WHERE backfill_id=%s",
+            "SELECT state FROM rt.window_runs WHERE plan_id=%s",
             (str(blocked.backfill_id),),
         )
-        assert unit.cursor.fetchone() == (
-            "BACKFILL_BLOCKED",
-            "STARTUP_BACKFILL_UNAUTHORIZED_OR_EXHAUSTED",
-            "OPERATOR_AUTHORIZATION_REQUIRED",
-            0,
-            0,
-        )
+        assert unit.cursor.fetchone() == ("RETAINED_GAP",)
         unit.cursor.execute(
             "SELECT COUNT(*) FROM rt.provider_request_ledger "
-            "WHERE request_id IN ("
-            "SELECT request_id FROM rt.advanced_backfill_work "
-            "WHERE backfill_id=%s AND request_id IS NOT NULL)",
+            "WHERE window_id IN ("
+            "SELECT window_id FROM rt.window_runs WHERE plan_id=%s)",
             (str(blocked.backfill_id),),
         )
         request_count = int(unit.cursor.fetchone()[0])
     assert request_count == 0
 
-    complete_id = uuid4()
+    with _admin_cursor(pool, roles) as cursor:
+        cursor.execute(
+            "SELECT rt.ensure_partitions('rt.portal_releases',%s)",
+            (SESSION_DATE,),
+        )
     with provider.transaction(APP_ROLE) as unit:
         unit.cursor.execute(
-            "INSERT INTO rt.advanced_backfill_runs ("
-            "backfill_id,plan_id,cohort_id,session_dates,"
-            "universe_target,request_ceiling,decoded_byte_ceiling,"
-            "expected_cost,scope_sha256,state,reason_code,next_action,"
-            "completed_at) VALUES (%s,%s,%s,%s,1,0,0,'none',%s,"
-            "'BACKFILL_COMPLETE','EXACT_1M_5M_COVERAGE_COMPLETE',"
-            "'PUBLISH_COHORT_LOCAL_RELEASE',%s)",
-            (
-                str(complete_id),
-                str(plan.plan_id),
-                str(plan.cohort_id),
-                [historical_session],
-                _digest(),
-                SESSION_OPEN,
-            ),
+            "UPDATE rt.window_runs SET state='COMPLETE',updated_at=%s "
+            "WHERE plan_id=%s",
+            (SESSION_OPEN, str(blocked.backfill_id)),
         )
         release_id = publish_cohort_local_backfill_release_cursor(
             unit.cursor,
-            complete_id,
+            blocked.backfill_id,
             coverage_sha256="a" * 64,
             job_barrier_sha256="b" * 64,
             published_at=SESSION_OPEN + timedelta(minutes=1),
@@ -1282,13 +1444,17 @@ def test_backfill_blocked_and_cohort_local_wait_state_are_durable(
     assert release_id
     with provider.transaction(APP_ROLE, read_only=True) as unit:
         unit.cursor.execute(
-            "SELECT run.state,release.platform_pointer_advanced "
-            "FROM rt.advanced_backfill_runs AS run "
-            "JOIN rt.advanced_backfill_releases AS release "
-            "USING(backfill_id) WHERE run.backfill_id=%s",
-            (str(complete_id),),
+            "SELECT COUNT(*) FROM rt.portal_releases "
+            "WHERE release_id=%s",
+            (str(release_id),),
         )
-        assert unit.cursor.fetchone() == ("WAIT_NEXT_SESSION", False)
+        assert unit.cursor.fetchone()[0] == 1
+        unit.cursor.execute(
+            "SELECT COUNT(*) FROM rt.portal_release_current "
+            "WHERE cohort_id=%s",
+            (str(plan.cohort_id),),
+        )
+        assert unit.cursor.fetchone()[0] == 0
 
 
 def test_scheduler_restart_uses_durable_receipts_retries_and_lifecycle(
@@ -1354,7 +1520,10 @@ def test_scheduler_restart_uses_durable_receipts_retries_and_lifecycle(
                 cutoff,
                 universe_sha256,
                 "b" * 64,
-                ADVANCED_WINDOW_BUILD_ID,
+                bind_advanced_input_gate_build_id(
+                    ADVANCED_WINDOW_BUILD_ID,
+                    "c" * 64,
+                ),
             ),
         )
         scheduler_session = ensure_advanced_scheduler_session_cursor(
@@ -1403,24 +1572,18 @@ def test_scheduler_restart_uses_durable_receipts_retries_and_lifecycle(
         )
     assert retry == repeated
     assert retry.reused_input_receipt
+    assert recovery.input_gate_sha256 == "c" * 64
+    assert recovery.input_known_by == deadline
     assert retry.report_relative_path.endswith("-retry1.json")
-    blocked_backfill_id = uuid4()
     with provider.transaction(APP_ROLE) as unit:
-        unit.cursor.execute(
-            "INSERT INTO rt.advanced_backfill_runs ("
-            "backfill_id,plan_id,cohort_id,session_dates,"
-            "universe_target,request_ceiling,decoded_byte_ceiling,"
-            "expected_cost,scope_sha256,state,reason_code,next_action"
-            ") VALUES (%s,%s,%s,%s,1,0,0,'none',%s,"
-            "'BACKFILL_BLOCKED','HISTORY_MISSING',"
-            "'OPERATOR_AUTHORIZATION_REQUIRED')",
-            (
-                str(blocked_backfill_id),
-                str(ingress_plan.plan_id),
-                str(ingress_plan.cohort_id),
-                [date(2026, 10, 15)],
-                _digest(),
-            ),
+        blocked_backfill = plan_advanced_cold_start_cursor(
+            unit.cursor,
+            plan_id=ingress_plan.plan_id,
+            sessions=(date(2026, 10, 14),),
+            known_by=SESSION_OPEN,
+            request_ceiling=0,
+            decoded_byte_ceiling=0,
+            expected_cost="none",
         )
         assert prioritize_live_over_blocked_backfill_cursor(
             unit.cursor,
@@ -1428,14 +1591,14 @@ def test_scheduler_restart_uses_durable_receipts_retries_and_lifecycle(
             checked_at=SESSION_OPEN,
         ) == 1
         unit.cursor.execute(
-            "SELECT reason_code,next_action "
-            "FROM rt.advanced_backfill_runs WHERE backfill_id=%s",
-            (str(blocked_backfill_id),),
+            "SELECT state FROM rt.window_runs WHERE cohort_id=%s "
+            "AND window_key=%s",
+            (
+                str(ingress_plan.cohort_id),
+                "advanced-backfill-2026-10-14",
+            ),
         )
-        assert unit.cursor.fetchone() == (
-            "LIVE_INGRESS_PRIORITY",
-            "PAUSE_BACKFILL_KEEP_HISTORY_PUBLICATION_BLOCKED",
-        )
+        assert unit.cursor.fetchone() == ("RETAINED_GAP",)
 
     later_cutoff = cutoff + timedelta(minutes=5)
     later_window = repository.ensure_window(
@@ -1483,13 +1646,6 @@ def test_scheduler_restart_uses_durable_receipts_retries_and_lifecycle(
             checked_at=SESSION_OPEN,
         )
     assert audit["provider_requests"] == 0
-    with provider.transaction(APP_ROLE, read_only=True) as unit:
-        unit.cursor.execute(
-            "SELECT status,next_action FROM rt.advanced_scheduler_sessions "
-            "WHERE scheduler_session_id=%s",
-            (str(scheduler_session.scheduler_session_id),),
-        )
-        assert unit.cursor.fetchone() == ("IDLE", "WAIT_NEXT_SESSION")
 
 
 def test_two_controllers_reclaim_one_stale_owner_and_fence_old_writes(
@@ -1588,9 +1744,24 @@ def test_two_controllers_reclaim_one_stale_owner_and_fence_old_writes(
             (str(first_session.session_id),),
         )
         status, failure_code, ended_at = unit.cursor.fetchone()
+        unit.cursor.execute(
+            "SELECT journal_generation,last_durable_offset,"
+            "last_durable_watermark,reconnect_at,recovery_status,reason "
+            "FROM rt.stream_gaps WHERE session_id=%s",
+            (str(first_session.session_id),),
+        )
+        gaps = tuple(unit.cursor.fetchall())
     assert status == "FAILED"
     assert failure_code == "STALE_OWNER_RECLAIMED"
     assert ended_at is not None
+    assert gaps == ((
+        first_session.journal_generation,
+        0,
+        None,
+        SESSION_OPEN + timedelta(minutes=43),
+        "UNRESOLVED",
+        "STALE_OWNER_RECLAIMED",
+    ),)
 
 
 def test_promotion_requires_active_profile_next_session_and_one_ladder_rung(
@@ -1733,20 +1904,18 @@ def test_exact_resolution_requires_one_candidate_or_admin_binding_and_pins_profi
                 runtime_catalog=RUNTIME_CATALOG,
                 calendar=_Calendar(),
             )
-    with _admin_cursor(pool, roles) as cursor:
-        bind_advanced_ingress_cohort_cursor(
-            cursor,
-            session_date=SESSION_DATE,
-            universe_target=1,
-            runtime_profile_sha256=RUNTIME_PROFILE.sha256,
-            cohort_id=cohort_id,
-            authorized_end_at=SESSION_CLOSE,
-            approval_reference="explicit-ambiguity-resolution",
-        )
+    selected_request = AdvancedIngressPlanRequest(
+        ambiguous_authorization.authorization_id,
+        SESSION_DATE,
+        1,
+        AdvancedIngressBudgets(2, 2, 100, 1, 10),
+        preferred_cohort_id=cohort_id,
+        cohort_selection_reference="explicit-ambiguity-resolution",
+    )
     with provider.transaction(APP_ROLE, read_only=True) as unit:
         bound_plan = resolve_advanced_ingress_plan_cursor(
             unit.cursor,
-            ambiguous_request,
+            selected_request,
             runtime_catalog=RUNTIME_CATALOG,
             calendar=_Calendar(),
         )

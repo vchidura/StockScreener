@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import UUID
 
@@ -6,8 +7,10 @@ import pytest
 
 from realtime.advanced_scheduler import (
     ADVANCED_WINDOW_BUILD_ID,
+    bind_advanced_input_gate_build_id,
     discover_advanced_window_recovery_cursor,
     ensure_advanced_window_retry_cursor,
+    order_advanced_due_windows,
 )
 from realtime.orchestration_repository import CycleReceiptSpec
 from realtime.session_windows import advanced_session_windows
@@ -46,11 +49,15 @@ def test_database_state_not_report_files_controls_completion_and_retry():
             1,
             "a" * 64,
             "b" * 64,
-            ADVANCED_WINDOW_BUILD_ID,
+            bind_advanced_input_gate_build_id(
+                ADVANCED_WINDOW_BUILD_ID,
+                "c" * 64,
+            ),
             COHORT,
             "a" * 64,
             "stages_v3",
             COHORT,
+            NOW + timedelta(minutes=5),
         ),
     ))
 
@@ -63,8 +70,13 @@ def test_database_state_not_report_files_controls_completion_and_retry():
         1,
         "a" * 64,
         "b" * 64,
-        ADVANCED_WINDOW_BUILD_ID,
+        bind_advanced_input_gate_build_id(
+            ADVANCED_WINDOW_BUILD_ID,
+            "c" * 64,
+        ),
     )
+    assert recovery.input_known_by == NOW + timedelta(minutes=5)
+    assert recovery.input_gate_sha256 == "c" * 64
 
 
 def test_complete_durable_window_is_never_retried():
@@ -85,6 +97,7 @@ def test_complete_durable_window_is_never_retried():
             "a" * 64,
             "stages_v3",
             COHORT,
+            NOW + timedelta(minutes=5),
         ),
     ))
 
@@ -117,6 +130,22 @@ def test_retry_identity_derives_report_path_and_receipt_reuse():
     assert retry.report_relative_path.endswith("-retry2.json")
     assert retry.reused_input_receipt
     assert not retry.reused_portal_receipt
+
+
+def test_latest_slot_runs_first_and_oldest_retry_is_bounded_second():
+    windows = tuple(
+        SimpleNamespace(cutoff=CUTOFF + timedelta(minutes=offset))
+        for offset in (5, 15, 10, 0)
+    )
+
+    ordered = order_advanced_due_windows(windows)
+
+    assert [row.cutoff for row in ordered] == [
+        CUTOFF + timedelta(minutes=15),
+        CUTOFF,
+        CUTOFF + timedelta(minutes=10),
+        CUTOFF + timedelta(minutes=5),
+    ]
 
 
 def test_early_close_dst_and_holiday_follow_xnys_calendar():

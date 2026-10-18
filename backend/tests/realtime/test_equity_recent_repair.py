@@ -79,6 +79,54 @@ def test_repair_identity_pins_provider_scope_and_authorization():
     assert plan.sha256 != replace(plan, authorization_reference="different approval").sha256
 
 
+def test_full_minute_repair_scope_uses_two_requests_per_member_session():
+    plan = replace(
+        _plan(),
+        request_ceiling=2,
+        byte_ceiling=4 * 1024 * 1024 + 2,
+        native_intervals=("1m", "5m"),
+    )
+
+    assert plan.native_intervals == ("1m", "5m")
+    assert plan.identity()["native_widths"] == {"1m": 1, "5m": 5}
+
+
+def test_late_identity_continuity_requires_distinct_matching_post_cutoff():
+    from realtime.reference_continuity import (
+        classify_reference_identity_continuity,
+    )
+
+    cutoff = NOW - timedelta(days=1)
+    prior = {
+        "revision_id": UUID(int=1),
+        "security_id": UUID(int=2),
+        "ticker": "AAPL",
+        "active": True,
+        "observed_at": cutoff - timedelta(days=1),
+        "effective_from": cutoff - timedelta(days=2),
+        "effective_to": cutoff - timedelta(hours=1),
+    }
+    latest = {
+        **prior,
+        "revision_id": UUID(int=3),
+        "observed_at": NOW,
+        "effective_from": NOW,
+        "effective_to": NOW + timedelta(hours=6),
+    }
+
+    assert classify_reference_identity_continuity(
+        prior,
+        latest,
+        cutoff,
+    ) == "LATE_OBSERVED_CONTINUITY"
+    with pytest.raises(ValueError, match="distinct matching"):
+        classify_reference_identity_continuity(
+            prior,
+            {**latest, "ticker": "CHANGED"},
+            cutoff,
+        )
+
+
 def test_native_request_identity_binds_exact_endpoint_and_parameters():
     import realtime.equity_recent_repair as repair
 

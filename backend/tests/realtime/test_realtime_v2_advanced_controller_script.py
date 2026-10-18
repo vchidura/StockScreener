@@ -1,8 +1,11 @@
 import importlib
 import threading
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
+
+from realtime.advanced_ingress_controller import IngressFailureDisposition
 
 
 script = importlib.import_module(
@@ -10,7 +13,7 @@ script = importlib.import_module(
 )
 
 
-def _base(env_file):
+def _base():
     return [
         "--database",
         "stocks_realtime_v2",
@@ -30,18 +33,12 @@ def _base(env_file):
         "0",
         "--rest-repair-decoded-bytes",
         "0",
-        "--env-file",
-        str(env_file),
         "--execute",
     ]
 
 
-def test_controller_requires_explicit_execution_and_bounded_plan_budget(
-    tmp_path,
-):
-    env_file = tmp_path / ".env"
-    env_file.write_text("", encoding="utf-8")
-    base = _base(env_file)
+def test_controller_requires_explicit_execution_and_bounded_plan_budget():
+    base = _base()
 
     args = script.parse_args(base)
 
@@ -52,10 +49,8 @@ def test_controller_requires_explicit_execution_and_bounded_plan_budget(
         script.parse_args(base[:-1])
 
 
-def test_child_command_has_one_plan_scope_and_no_retry_tuning(tmp_path):
-    env_file = tmp_path / ".env"
-    env_file.write_text("", encoding="utf-8")
-    args = script.parse_args(_base(env_file))
+def test_child_command_has_one_plan_scope_and_no_retry_tuning():
+    args = script.parse_args(_base())
 
     command = script._child_command(
         args,
@@ -69,6 +64,13 @@ def test_child_command_has_one_plan_scope_and_no_retry_tuning(tmp_path):
     assert "--cohort-id" not in command
     assert "--connection-attempts" not in command
     assert "--debug-once" not in command
+    assert "--env-file" not in command
+
+
+def test_external_ingress_mode_is_explicit():
+    args = script.parse_args([*_base(), "--external-ingress"])
+
+    assert args.external_ingress is True
 
 
 def test_controller_child_runner_does_not_retry_a_finished_process():
@@ -98,3 +100,87 @@ def test_controller_child_runner_does_not_retry_a_finished_process():
 
     assert result[:2] == (2, False)
     assert calls == [("child",)]
+
+
+def test_blocked_backfill_delays_only_before_live_warmup():
+    warmup = datetime(2026, 10, 16, 13, 29, tzinfo=timezone.utc)
+    blocked = SimpleNamespace(state="BACKFILL_BLOCKED", work=(object(),))
+
+    assert script._backfill_delays_live(
+        blocked,
+        now=warmup - timedelta(seconds=1),
+        warmup_at=warmup,
+    )
+    assert not script._backfill_delays_live(
+        blocked,
+        now=warmup,
+        warmup_at=warmup,
+    )
+
+
+def test_safe_draining_journal_does_not_block_reconnect():
+    draining = SimpleNamespace(
+        registered=0,
+        writing=0,
+        draining=1,
+        quarantined=0,
+    )
+    writing = SimpleNamespace(
+        registered=0,
+        writing=1,
+        draining=0,
+        quarantined=0,
+    )
+
+    assert not script._recovery_blocks_reconnect(draining)
+    assert script._recovery_blocks_reconnect(writing)
+
+
+def test_no_report_child_exit_uses_durable_state_and_exit_code():
+    checked_at = datetime(2026, 10, 16, 14, 0, tzinfo=timezone.utc)
+    durable = {
+        "session_status": "FAILED",
+        "failure_code": None,
+        "started_at": checked_at - timedelta(seconds=5),
+        "ended_at": checked_at,
+        "journal_status": "DRAINING",
+        "quarantine_reason": None,
+    }
+
+    failure = script._classify_child_result(
+        return_code=9,
+        intentional=False,
+        report=None,
+        durable=durable,
+        stderr="child terminated before report",
+        checked_at=checked_at,
+    )
+
+    assert failure.failure_code == "CHILD_EXIT_9"
+    assert failure.disposition is IngressFailureDisposition.TRANSIENT
+    assert failure.live_seconds == 5
+
+
+def test_runtime_path_collision_allocates_a_new_path_attempt(tmp_path):
+    plan_id = script.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    session_date = datetime(2026, 10, 16).date()
+    _journal, report = script._derived_runtime_paths(
+        tmp_path,
+        plan_id=plan_id,
+        session_date=session_date,
+        connection_attempt=1,
+    )
+    report.touch()
+
+    journal, replacement_report, path_attempt = (
+        script._allocate_runtime_paths(
+            tmp_path,
+            plan_id=plan_id,
+            session_date=session_date,
+            connection_attempt=1,
+        )
+    )
+
+    assert path_attempt == 2
+    assert "-path-002" in journal.name
+    assert replacement_report.name == journal.with_suffix(".json").name

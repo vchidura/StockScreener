@@ -184,7 +184,8 @@ def register_advanced_stream_session_cursor(
         )
     cursor.execute(
         "SELECT session_id,owner_id,owner_epoch,journal_generation,"
-        "heartbeat_at FROM rt.stream_sessions "
+        "heartbeat_at,advanced_ingress_plan_id,last_event_offset,"
+        "event_time_watermark FROM rt.stream_sessions "
         "WHERE provider=%s AND feed=%s AND ended_at IS NULL "
         "AND status NOT IN ('STOPPED','FAILED','BLOCKED') "
         "ORDER BY owner_epoch DESC LIMIT 1 FOR UPDATE",
@@ -200,6 +201,29 @@ def register_advanced_stream_session_cursor(
             raise ValueError(
                 "an Advanced stream owner is already active for this feed"
             )
+        if active_owner[5] is None:
+            raise ValueError(
+                "stale Advanced stream owner lacks an ingress plan fence"
+            )
+        stale_session = RegisteredAdvancedStreamSession(
+            UUID(str(active_owner[0])),
+            UUID(str(active_owner[5])),
+            UUID(str(active_owner[3])),
+            UUID(str(active_owner[1])),
+            int(active_owner[2]),
+            scope.feed,
+            heartbeat_at,
+        )
+        record_advanced_stream_gap_cursor(
+            cursor,
+            stale_session,
+            gap_start=heartbeat_at,
+            gap_end=None,
+            last_durable_offset=int(active_owner[6]),
+            reason="STALE_OWNER_RECLAIMED",
+            last_durable_watermark=active_owner[7],
+            reconnect_at=scope.started_at,
+        )
         cursor.execute(
             "UPDATE rt.stream_sessions SET status='FAILED',"
             "failure_code='STALE_OWNER_RECLAIMED',ended_at=%s "
@@ -407,6 +431,7 @@ def record_advanced_stream_gap_cursor(
     last_durable_offset: int,
     reason: str,
     last_durable_watermark: datetime | None = None,
+    reconnect_at: datetime | None = None,
     instrument_id: int | None = None,
     shard_id: int = 0,
 ) -> UUID:
@@ -418,9 +443,16 @@ def record_advanced_stream_gap_cursor(
         if last_durable_watermark is not None
         else None
     )
+    reconnected = (
+        _utc(reconnect_at, "reconnect_at")
+        if reconnect_at is not None
+        else None
+    )
     if (
         ended is not None
         and ended < started
+        or reconnected is not None
+        and reconnected < started
         or type(last_durable_offset) is not int
         or last_durable_offset < 0
         or type(shard_id) is not int
@@ -441,8 +473,8 @@ def record_advanced_stream_gap_cursor(
         "INSERT INTO rt.stream_gaps ("
         "gap_id,session_id,instrument_id,channel,gap_start,gap_end,"
         "journal_generation,shard_id,last_durable_offset,reason,"
-        "recovery_status,plan_id,last_durable_watermark) VALUES ("
-        "%s,%s,%s,'AM',%s,%s,%s,%s,%s,%s,'UNRESOLVED',%s,%s) "
+        "recovery_status,plan_id,last_durable_watermark,reconnect_at) VALUES ("
+        "%s,%s,%s,'AM',%s,%s,%s,%s,%s,%s,'UNRESOLVED',%s,%s,%s) "
         "ON CONFLICT (gap_id) DO NOTHING",
         (
             str(gap_id),
@@ -456,6 +488,7 @@ def record_advanced_stream_gap_cursor(
             reason_code,
             str(session.ingress_plan_id),
             watermark,
+            reconnected,
         ),
     )
     return gap_id

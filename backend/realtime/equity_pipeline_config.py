@@ -22,6 +22,16 @@ class AdvancedScaleControl(str, Enum):
     AUTOMATIC_BOTH = "AUTOMATIC_BOTH"
 
 
+class RealtimeV2Process(str, Enum):
+    FULL = "FULL"
+    CONTROLLER = "CONTROLLER"
+    INGRESS = "INGRESS"
+    BRIDGE = "BRIDGE"
+    SCHEDULER = "SCHEDULER"
+    APP_WORKER = "APP_WORKER"
+    API = "API"
+
+
 _PLACEHOLDERS = frozenset(
     {
         "...",
@@ -52,25 +62,68 @@ def _enum(settings: Mapping[str, str | None], name: str, enum_type):
 class RealtimeV2PipelineConfig:
     equity_pipeline: EquityPipeline
     options_pipeline: OptionsPipeline
-    app_dsn: str = field(repr=False)
-    api_dsn: str = field(repr=False)
-    massive_api_key: str = field(repr=False)
+    process: RealtimeV2Process
+    app_dsn: str | None = field(repr=False)
+    api_dsn: str | None = field(repr=False)
+    massive_api_key: str | None = field(repr=False)
     advanced_journal_dir: Path | None = None
     advanced_ingress_policy_path: Path | None = None
     advanced_ingress_policy_version: str | None = None
 
     def __post_init__(self) -> None:
-        if self.app_dsn == self.api_dsn:
+        if (
+            self.app_dsn is not None
+            and self.api_dsn is not None
+            and self.app_dsn == self.api_dsn
+        ):
             raise ValueError("V2 app and API DSNs must use separate principals")
+        if (
+            self.process
+            in {
+                RealtimeV2Process.FULL,
+                RealtimeV2Process.CONTROLLER,
+                RealtimeV2Process.INGRESS,
+                RealtimeV2Process.BRIDGE,
+                RealtimeV2Process.SCHEDULER,
+                RealtimeV2Process.APP_WORKER,
+            }
+            and self.app_dsn is None
+        ):
+            raise ValueError("REALTIME_V2_APP_DSN is required for this process")
+        if (
+            self.process in {RealtimeV2Process.FULL, RealtimeV2Process.API}
+            and self.api_dsn is None
+        ):
+            raise ValueError("REALTIME_V2_API_DSN is required for this process")
+        if (
+            self.process
+            in {
+                RealtimeV2Process.FULL,
+                RealtimeV2Process.CONTROLLER,
+                RealtimeV2Process.INGRESS,
+            }
+            and self.massive_api_key is None
+        ):
+            raise ValueError("POLYGON_API_KEY is required for this process")
         if self.equity_pipeline is EquityPipeline.MASSIVE_ADVANCED:
-            if (
+            if self.process in {
+                RealtimeV2Process.FULL,
+                RealtimeV2Process.CONTROLLER,
+                RealtimeV2Process.INGRESS,
+                RealtimeV2Process.BRIDGE,
+            } and (
                 self.advanced_journal_dir is None
                 or not self.advanced_journal_dir.is_absolute()
             ):
                 raise ValueError(
                     "Advanced equity requires an absolute local journal directory"
                 )
-            if (
+            if self.process in {
+                RealtimeV2Process.FULL,
+                RealtimeV2Process.CONTROLLER,
+                RealtimeV2Process.INGRESS,
+                RealtimeV2Process.SCHEDULER,
+            } and (
                 self.advanced_ingress_policy_path is None
                 or not self.advanced_ingress_policy_path.is_absolute()
                 or not (self.advanced_ingress_policy_version or "").strip()
@@ -92,9 +145,10 @@ class RealtimeV2PipelineConfig:
         return {
             "equity_pipeline": self.equity_pipeline.value,
             "options_pipeline": self.options_pipeline.value,
-            "app_dsn_configured": True,
-            "api_dsn_configured": True,
-            "massive_api_key_configured": True,
+            "process": self.process.value,
+            "app_dsn_configured": self.app_dsn is not None,
+            "api_dsn_configured": self.api_dsn is not None,
+            "massive_api_key_configured": self.massive_api_key is not None,
             "advanced_journal_dir": (
                 str(self.advanced_journal_dir)
                 if self.advanced_journal_dir is not None
@@ -114,6 +168,8 @@ class RealtimeV2PipelineConfig:
     def from_mapping(
         cls,
         settings: Mapping[str, str | None],
+        *,
+        process: RealtimeV2Process = RealtimeV2Process.FULL,
     ) -> RealtimeV2PipelineConfig:
         equity = _enum(
             settings,
@@ -125,22 +181,74 @@ class RealtimeV2PipelineConfig:
             "REALTIME_V2_OPTIONS_PIPELINE",
             OptionsPipeline,
         )
-        app_dsn = _required(settings, "REALTIME_V2_APP_DSN")
-        api_dsn = _required(settings, "REALTIME_V2_API_DSN")
-        api_key = _required(settings, "POLYGON_API_KEY")
+        app_dsn = (
+            _required(settings, "REALTIME_V2_APP_DSN")
+            if process
+            in {
+                RealtimeV2Process.FULL,
+                RealtimeV2Process.CONTROLLER,
+                RealtimeV2Process.INGRESS,
+                RealtimeV2Process.BRIDGE,
+                RealtimeV2Process.SCHEDULER,
+                RealtimeV2Process.APP_WORKER,
+            }
+            else None
+        )
+        api_dsn = (
+            _required(settings, "REALTIME_V2_API_DSN")
+            if process in {RealtimeV2Process.FULL, RealtimeV2Process.API}
+            else None
+        )
+        api_key = (
+            _required(settings, "POLYGON_API_KEY")
+            if process
+            in {
+                RealtimeV2Process.FULL,
+                RealtimeV2Process.CONTROLLER,
+                RealtimeV2Process.INGRESS,
+            }
+            else None
+        )
         if equity is EquityPipeline.MASSIVE_ADVANCED:
-            journal_dir = Path(
-                _required(settings, "REALTIME_V2_ADVANCED_JOURNAL_DIR")
+            journal_dir = (
+                Path(
+                    _required(
+                        settings,
+                        "REALTIME_V2_ADVANCED_JOURNAL_DIR",
+                    )
+                )
+                if process
+                in {
+                    RealtimeV2Process.FULL,
+                    RealtimeV2Process.CONTROLLER,
+                    RealtimeV2Process.INGRESS,
+                    RealtimeV2Process.BRIDGE,
+                }
+                else None
             )
-            ingress_policy_path = Path(
+            ingress_policy_path = (
+                Path(
+                    _required(
+                        settings,
+                        "REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH",
+                    )
+                )
+                if process
+                in {
+                    RealtimeV2Process.FULL,
+                    RealtimeV2Process.CONTROLLER,
+                    RealtimeV2Process.INGRESS,
+                    RealtimeV2Process.SCHEDULER,
+                }
+                else None
+            )
+            ingress_policy_version = (
                 _required(
                     settings,
-                    "REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH",
+                    "REALTIME_V2_ADVANCED_INGRESS_POLICY_VERSION",
                 )
-            )
-            ingress_policy_version = _required(
-                settings,
-                "REALTIME_V2_ADVANCED_INGRESS_POLICY_VERSION",
+                if ingress_policy_path is not None
+                else None
             )
         else:
             journal_dir = None
@@ -149,6 +257,7 @@ class RealtimeV2PipelineConfig:
         return cls(
             equity_pipeline=equity,
             options_pipeline=options,
+            process=process,
             app_dsn=app_dsn,
             api_dsn=api_dsn,
             massive_api_key=api_key,

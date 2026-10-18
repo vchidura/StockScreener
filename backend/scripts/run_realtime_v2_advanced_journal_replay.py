@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dotenv import dotenv_values
+from psycopg2 import Error as PsycopgError
 from psycopg2.pool import ThreadedConnectionPool
 
 
@@ -26,13 +27,19 @@ from realtime.advanced_journal_replay import (  # noqa: E402
     JournalReplayQuarantine,
     replay_registered_journal_once,
 )
+from realtime.advanced_equity_journal_bridge import (  # noqa: E402
+    AdvancedJournalBlockedError,
+)
 from realtime.database_access import RealtimeDatabaseRole  # noqa: E402
 from realtime.database_access_v2 import (  # noqa: E402
     APP_ROLE,
     V2AccessConfig,
     V2ConnectionProvider,
 )
-from realtime.equity_pipeline_config import RealtimeV2PipelineConfig  # noqa: E402
+from realtime.equity_pipeline_config import (  # noqa: E402
+    RealtimeV2PipelineConfig,
+    RealtimeV2Process,
+)
 from realtime.migrations import (  # noqa: E402
     EXPECTED_V2_DATABASE_NAME,
     validate_target_database_v2,
@@ -52,11 +59,6 @@ def parse_args(argv=None):
     parser.add_argument("--database", required=True)
     parser.add_argument("--confirm-database-name", required=True)
     parser.add_argument("--journal-root", type=Path)
-    parser.add_argument(
-        "--env-file",
-        type=Path,
-        default=BACKEND_DIR / ".env",
-    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true")
     mode.add_argument("--continuous", action="store_true")
@@ -75,15 +77,14 @@ def parse_args(argv=None):
             parser.error(
                 "--journal-root must be an existing mounted directory"
             )
-    args.env_file = args.env_file.resolve()
-    if not args.env_file.is_file():
-        parser.error("--env-file must exist")
     if not args.execute:
         parser.error("Advanced journal replay requires --execute")
     return args
 
 
 def _provider(config):
+    if config.app_dsn is None:
+        raise ValueError("Advanced journal replay app DSN is unavailable")
     pool = ThreadedConnectionPool(
         1,
         2,
@@ -155,13 +156,47 @@ def replay_registered_once(
                 "reason": error.reason,
             }))
             quarantined += 1
+        except AdvancedJournalBlockedError as error:
+            emit(json.dumps({
+                "journal_generation": str(
+                    registration.journal_generation
+                ),
+                "status": "BLOCKED_GAP",
+                "reason": str(error)[:160],
+            }))
+        except (PsycopgError, OSError, TimeoutError) as error:
+            emit(json.dumps({
+                "journal_generation": str(
+                    registration.journal_generation
+                ),
+                "status": "RETRYABLE_INFRASTRUCTURE",
+                "reason": type(error).__name__,
+            }))
+        except ValueError as error:
+            with provider.transaction(APP_ROLE) as unit:
+                quarantine_advanced_journal_cursor(
+                    unit.cursor,
+                    registration.journal_generation,
+                    reason="BRIDGE_VALIDATION_FAILED",
+                    detail=str(error)[:320],
+                    checked_at=checked_at,
+                )
+            emit(json.dumps({
+                "journal_generation": str(
+                    registration.journal_generation
+                ),
+                "status": "QUARANTINED",
+                "reason": "BRIDGE_VALIDATION_FAILED",
+            }))
+            quarantined += 1
     return drained, quarantined
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
     config = RealtimeV2PipelineConfig.from_mapping(
-        dotenv_values(args.env_file)
+        os.environ,
+        process=RealtimeV2Process.BRIDGE,
     )
     journal_root = args.journal_root or config.advanced_journal_dir
     if journal_root is None or not journal_root.is_dir():

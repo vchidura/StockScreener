@@ -32,7 +32,6 @@ from realtime.advanced_ingress_runtime_profile import (  # noqa: E402
 from realtime.advanced_ingress_repository import (  # noqa: E402
     activate_advanced_runtime_profile_cursor,
     advanced_ingress_status_cursor,
-    bind_advanced_ingress_cohort_cursor,
     create_advanced_stream_authorization_cursor,
     prepare_advanced_ingress_plan_cursor,
     register_advanced_runtime_profile_cursor,
@@ -121,6 +120,8 @@ def parse_args(argv=None):
         required=True,
     )
     prepare.add_argument("--universe-target", type=int, required=True)
+    prepare.add_argument("--preferred-cohort-id", type=UUID)
+    prepare.add_argument("--cohort-selection-reference")
     prepare.add_argument("--execute", action="store_true")
 
     sync_profiles = commands.add_parser("sync-profiles")
@@ -146,18 +147,6 @@ def parse_args(argv=None):
         required=True,
     )
     activate_profile.add_argument("--execute", action="store_true")
-
-    bind_cohort = commands.add_parser("bind-cohort")
-    _common(bind_cohort)
-    bind_cohort.add_argument(
-        "--session-date",
-        type=date.fromisoformat,
-        required=True,
-    )
-    bind_cohort.add_argument("--universe-target", type=int, required=True)
-    bind_cohort.add_argument("--cohort-id", type=UUID, required=True)
-    bind_cohort.add_argument("--approval-reference", required=True)
-    bind_cohort.add_argument("--execute", action="store_true")
 
     revoke = commands.add_parser("revoke")
     _common(revoke)
@@ -454,40 +443,6 @@ def main(argv=None) -> int:
             "provider_requests": 0,
             "credentials_exposed": False,
         }
-    elif args.command == "bind-cohort":
-        from options.calendar import OptionExchangeCalendar
-
-        catalog = _runtime_catalog(settings)
-        profile = catalog.profile_for_target(args.universe_target)
-        authorized_end_at = OptionExchangeCalendar("XNYS").session_close(
-            args.session_date
-        )
-        binding_id = None
-        if args.execute:
-            with _admin_cursor(settings, database=args.database) as cursor:
-                binding_id = bind_advanced_ingress_cohort_cursor(
-                    cursor,
-                    session_date=args.session_date,
-                    universe_target=args.universe_target,
-                    runtime_profile_sha256=profile.sha256,
-                    cohort_id=args.cohort_id,
-                    authorized_end_at=authorized_end_at,
-                    approval_reference=args.approval_reference,
-                )
-        report = {
-            "command": "bind-cohort",
-            "mode": "EXECUTE" if args.execute else "PLAN",
-            "status": "READY" if args.execute else "PLANNED",
-            "binding_id": (
-                str(binding_id) if binding_id is not None else None
-            ),
-            "session_date": args.session_date.isoformat(),
-            "universe_target": args.universe_target,
-            "runtime_profile_sha256": profile.sha256,
-            "cohort_id": str(args.cohort_id),
-            "provider_requests": 0,
-            "credentials_exposed": False,
-        }
     elif args.command == "revoke":
         if not args.execute:
             report = {
@@ -532,6 +487,12 @@ def main(argv=None) -> int:
                             session_date=args.session_date,
                             universe_target=args.universe_target,
                             budgets=_budgets(args),
+                            preferred_cohort_id=(
+                                args.preferred_cohort_id
+                            ),
+                            cohort_selection_reference=(
+                                args.cohort_selection_reference
+                            ),
                         ),
                         runtime_catalog=catalog,
                     )

@@ -64,6 +64,10 @@ def parse_args(argv=None):
     )
     parser.add_argument("--member-limit", type=int, default=50_000)
     parser.add_argument("--missing-range-limit", type=int, default=2_000)
+    parser.add_argument(
+        "--allow-late-identity-continuity",
+        action="store_true",
+    )
     parser.add_argument("--report-path", type=Path)
     parser.add_argument("--persist", action="store_true")
     parser.add_argument("--execute", action="store_true")
@@ -151,6 +155,9 @@ def main(argv=None) -> int:
                 eligibility_policy=eligibility_policy,
                 member_limit=args.member_limit,
                 missing_range_limit=args.missing_range_limit,
+                allow_late_identity_continuity=(
+                    args.allow_late_identity_continuity
+                ),
             )
         persistence = None
         if args.persist:

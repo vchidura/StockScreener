@@ -31,6 +31,8 @@ export default function TickerWorkspace() {
   const readsEnabled = !realtimeOnly || !!publication
   const publicationLoading = realtimeOnly && !publication && !release.error
   const queryScope = realtimeOnly ? [publication?.cohort_id, snapshotId] : []
+  const publicationError = realtimeOnly ? release.error : null
+  const referenceWarning = publicationError ?? publication?.section_warnings?.reference ?? null
   const technicalWarning = release.error ?? ([publication?.section_warnings?.actions,
     publication?.section_warnings?.market].filter(Boolean).join(' ') || null)
 
@@ -110,7 +112,7 @@ export default function TickerWorkspace() {
             onAnalysisIntervalChange={setAnalysisInterval}
             onAnalysisSetupChange={setAnalysisSetup} />
           {active === 'financials' && <FinancialsView profile={profile} loading={publicationLoading || profileLoading}
-            availabilityError={realtimeOnly ? release.error : null} />}
+            availabilityError={referenceWarning} />}
         </div>
         {active === 'overview' && (
           <EntityRail
@@ -119,7 +121,8 @@ export default function TickerWorkspace() {
             calendar={calendar}
             calendarLoading={publicationLoading || calendarLoading}
             calendarError={calendarError}
-            availabilityError={realtimeOnly ? release.error : null}
+            referenceWarning={referenceWarning}
+            calendarAvailabilityError={publicationError}
             publication={publication}
             analysisInterval={analysisInterval}
             setup={analysisSetup}

@@ -3,7 +3,7 @@ import json
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from realtime.orchestration_repository import CycleReceiptSpec
@@ -70,6 +70,155 @@ def test_portal_reprojection_is_provider_free_and_scope_gated():
             "--portal-reprojection",
             "--window-key-suffix=-portal-correction-" + "x" * 40,
         ])
+
+
+def test_projection_only_continuity_omits_portal_publish():
+    args = script.parse_args([
+        *BASE,
+        "--execute",
+        "--authorization-reference",
+        "approved-projection-only",
+        "--portal-reprojection",
+        "--projection-only",
+        "--allow-late-identity-continuity",
+        "--window-key-suffix=-portal-correction-continuity",
+    ])
+
+    assert args.projection_only
+    assert args.allow_late_identity_continuity
+    assert "PORTAL_PUBLISH" not in script.PROJECTION_ONLY_STAGES
+    with pytest.raises(SystemExit):
+        script.parse_args([*BASE, "--projection-only"])
+
+
+def test_publication_only_requires_an_exact_projection_source_and_recovery_suffix():
+    source_window_id = uuid4()
+    args = script.parse_args([
+        *BASE,
+        "--portal-reprojection",
+        "--publication-only",
+        "--publication-source-window-id",
+        str(source_window_id),
+        "--allow-late-identity-continuity",
+        "--window-key-suffix=-portal-publish-recovery1",
+    ])
+
+    assert args.publication_only
+    assert args.publication_source_window_id == source_window_id
+    with pytest.raises(SystemExit):
+        script.parse_args([
+            *BASE,
+            "--portal-reprojection",
+            "--publication-only",
+            "--window-key-suffix=-portal-publish-recovery1",
+        ])
+    with pytest.raises(SystemExit):
+        script.parse_args([
+            *BASE,
+            "--portal-reprojection",
+            "--publication-only",
+            "--publication-source-window-id",
+            str(source_window_id),
+            "--window-key-suffix=-portal-correction-invalid",
+        ])
+
+
+def test_publication_recovery_state_binds_exact_receipts_and_pointer_effects():
+    cohort_id = UUID("d1baee6f-4ab2-543c-8a86-ce10f8952e69")
+    source_window_id = uuid4()
+    cutoff = script.datetime.fromisoformat(
+        "2026-10-16T20:00:00+00:00"
+    )
+    provider = MagicMock()
+    cursor = provider.transaction.return_value.__enter__.return_value.cursor
+    cursor.fetchone.side_effect = [
+        {
+            "window_id": source_window_id,
+            "window_key": cutoff.isoformat() + "-portal-correction-p8-retry2",
+            "state": "COMPLETE",
+            "provider_tier": "MASSIVE_DEVELOPER",
+            "cutoff": cutoff,
+            "deadline": cutoff + script.timedelta(minutes=10),
+            "plan_id": uuid4(),
+            "session_date": cutoff.date(),
+            "stage_catalog_version": script.STAGE_CATALOG_VERSION_V2,
+            "enabled_stages": list(script.PROJECTION_ONLY_STAGES),
+        },
+        {
+            "release_id": uuid4(),
+            "cutoff": cutoff - script.timedelta(days=1),
+            "session_date": (cutoff - script.timedelta(days=1)).date(),
+            "updated_at": cutoff,
+        },
+        {
+            "scope": "PLATFORM",
+            "cohort_id": cohort_id,
+            "provider_tier": "MASSIVE_DEVELOPER",
+            "activation_id": uuid4(),
+            "effective_at": cutoff,
+            "updated_at": cutoff,
+        },
+        {
+            "snapshot_catalog": 30,
+            "snapshot_hot": 20,
+            "snapshot_kept": 10,
+            "releases": 4,
+        },
+        {
+            "total_requests": 50,
+            "total_response_bytes": 2603113,
+            "cohort_requests": 50,
+            "cohort_response_bytes": 2603113,
+        },
+    ]
+    cursor.fetchall.side_effect = [
+        [
+            {"stage_id": "EQUITY_MATERIALIZE", "state": "COMPLETE", "attempt": 1},
+            {"stage_id": "EQUITY_PROJECTION", "state": "COMPLETE", "attempt": 1},
+        ],
+        [
+            {
+                "receipt_id": uuid4(),
+                "receipt_kind": "INPUT_READY",
+                "cohort_id": cohort_id,
+                "cutoff": cutoff,
+                "reference_generation": 4,
+                "universe_sha256": "a" * 64,
+                "input_sha256": "b" * 64,
+                "build_id": script.EQUITY_WINDOW_BUILD_ID,
+            },
+            {
+                "receipt_id": uuid4(),
+                "receipt_kind": "PORTAL_READY",
+                "cohort_id": cohort_id,
+                "cutoff": cutoff,
+                "reference_generation": 4,
+                "universe_sha256": "a" * 64,
+                "input_sha256": "c" * 64,
+                "build_id": script.EQUITY_WINDOW_BUILD_ID,
+            },
+        ],
+    ]
+
+    state = script._publication_recovery_state(
+        provider,
+        cohort_id=cohort_id,
+        cutoff=cutoff,
+        source_window_id=source_window_id,
+    )
+    effects = script._publication_effects(
+        state,
+        cutoff=cutoff,
+        session_close=True,
+    )
+
+    assert set(state["receipts"]) == {"INPUT_READY", "PORTAL_READY"}
+    assert effects["release_classes"] == ["INTRADAY", "SESSION_CLOSE"]
+    assert effects["platform_pointer"]["effect"] == "UNCHANGED"
+    provider.transaction.assert_called_once_with(
+        read_only=True,
+        dict_cursor=True,
+    )
 
 
 @pytest.mark.parametrize("has_receipt", (False, True))

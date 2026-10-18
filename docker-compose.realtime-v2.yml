@@ -1,0 +1,540 @@
+name: alpha-research-realtime-v2
+
+x-backend-service: &backend-service
+  image: alpha-research-realtime-v2-backend:latest
+  build:
+    context: ./backend
+    dockerfile: Dockerfile
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 60s
+  networks:
+    - application
+
+x-advanced-environment: &advanced-environment
+  REALTIME_V2_EQUITY_PIPELINE: MASSIVE_ADVANCED
+  REALTIME_V2_OPTIONS_PIPELINE: DISABLED
+  REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH: /app/realtime/policies/advanced_equity_ingress_v1.json
+  REALTIME_V2_ADVANCED_INGRESS_POLICY_VERSION: advanced-equity-ingress-v1
+
+services:
+  realtime-v2-advanced-controller:
+    <<: *backend-service
+    profiles: ["realtime-v2-advanced-provider"]
+    container_name: stock-screener-realtime-v2-advanced-controller
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - controller
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --provider-key-file
+      - /run/secrets/realtime_v2_provider_key
+      - --
+      - python
+      - -B
+      - scripts/run_realtime_v2_advanced_controller.py
+      - --database
+      - stocks_realtime_v2
+      - --confirm-database-name
+      - stocks_realtime_v2
+      - --authorization-id
+      - ${REALTIME_V2_ADVANCED_AUTHORIZATION_ID:-00000000-0000-0000-0000-000000000000}
+      - --universe-target
+      - ${REALTIME_V2_ADVANCED_UNIVERSE_TARGET:-1}
+      - --stream-sessions
+      - ${REALTIME_V2_ADVANCED_STREAM_SESSIONS:-1}
+      - --connection-attempts
+      - ${REALTIME_V2_ADVANCED_CONNECTION_ATTEMPTS:-1}
+      - --decoded-bytes
+      - ${REALTIME_V2_ADVANCED_DECODED_BYTES:-10485760}
+      - --rest-repair-requests
+      - ${REALTIME_V2_ADVANCED_REST_REPAIR_REQUESTS:-0}
+      - --rest-repair-decoded-bytes
+      - ${REALTIME_V2_ADVANCED_REST_REPAIR_DECODED_BYTES:-0}
+      - --external-ingress
+      - --execute
+    environment:
+      <<: *advanced-environment
+      REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
+    secrets:
+      - realtime_v2_app_dsn
+      - realtime_v2_provider_key
+    volumes:
+      - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
+      - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - controller
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --provider-key-file
+        - /run/secrets/realtime_v2_provider_key
+        - --
+        - python
+        - -B
+        - scripts/report_realtime_v2_advanced_health.py
+        - --component
+        - controller
+        - --authorization-id
+        - ${REALTIME_V2_ADVANCED_AUTHORIZATION_ID:-00000000-0000-0000-0000-000000000000}
+      interval: 15s
+      timeout: 10s
+      retries: 4
+      start_period: 30s
+
+  realtime-v2-advanced-ingress:
+    <<: *backend-service
+    profiles: ["realtime-v2-advanced-provider"]
+    container_name: stock-screener-realtime-v2-advanced-ingress
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - ingress
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --provider-key-file
+      - /run/secrets/realtime_v2_provider_key
+      - --
+      - python
+      - -B
+      - scripts/run_realtime_v2_advanced_ingress_service.py
+      - --database
+      - stocks_realtime_v2
+      - --confirm-database-name
+      - stocks_realtime_v2
+      - --authorization-id
+      - ${REALTIME_V2_ADVANCED_AUTHORIZATION_ID:-00000000-0000-0000-0000-000000000000}
+      - --execute
+    environment:
+      <<: *advanced-environment
+      REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
+    secrets:
+      - realtime_v2_app_dsn
+      - realtime_v2_provider_key
+    volumes:
+      - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - ingress
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --provider-key-file
+        - /run/secrets/realtime_v2_provider_key
+        - --
+        - python
+        - -B
+        - scripts/report_realtime_v2_advanced_health.py
+        - --component
+        - ingress
+        - --authorization-id
+        - ${REALTIME_V2_ADVANCED_AUTHORIZATION_ID:-00000000-0000-0000-0000-000000000000}
+      interval: 15s
+      timeout: 10s
+      retries: 4
+      start_period: 30s
+
+  realtime-v2-advanced-bridge:
+    <<: *backend-service
+    profiles: ["realtime-v2-advanced"]
+    container_name: stock-screener-realtime-v2-advanced-bridge
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - bridge
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --
+      - python
+      - -B
+      - scripts/run_realtime_v2_advanced_journal_replay.py
+      - --database
+      - stocks_realtime_v2
+      - --confirm-database-name
+      - stocks_realtime_v2
+      - --journal-root
+      - /var/lib/realtime-v2-advanced
+      - --continuous
+      - --execute
+    environment:
+      REALTIME_V2_EQUITY_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V2_OPTIONS_PIPELINE: DISABLED
+      REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
+    secrets:
+      - realtime_v2_app_dsn
+    volumes:
+      - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - bridge
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --
+        - python
+        - -B
+        - scripts/report_realtime_v2_advanced_health.py
+        - --component
+        - bridge
+      interval: 15s
+      timeout: 10s
+      retries: 4
+      start_period: 20s
+
+  realtime-v2-advanced-scheduler:
+    <<: *backend-service
+    profiles: ["realtime-v2-advanced"]
+    container_name: stock-screener-realtime-v2-advanced-scheduler
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - scheduler
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --
+      - python
+      - -B
+      - scripts/run_realtime_v2_advanced_equity_scheduler.py
+      - --database
+      - stocks_realtime_v2
+      - --confirm-database-name
+      - stocks_realtime_v2
+      - --authorization-id
+      - ${REALTIME_V2_ADVANCED_AUTHORIZATION_ID:-00000000-0000-0000-0000-000000000000}
+      - --cohort-id
+      - ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
+      - --session-date
+      - ${REALTIME_V2_ADVANCED_SESSION_DATE:-2000-01-03}
+      - --first-cutoff
+      - ${REALTIME_V2_ADVANCED_FIRST_CUTOFF:-2000-01-03T14:35:00+00:00}
+      - --finality-delay-seconds
+      - ${REALTIME_V2_ADVANCED_FINALITY_DELAY_SECONDS:-5}
+      - --authorization-reference
+      - ${REALTIME_V2_ADVANCED_AUTHORIZATION_REFERENCE:-not-authorized}
+      - --publication-mode
+      - projection-only
+      - --report-directory
+      - /var/lib/realtime-v2-reports/windows
+      - --continuous
+      - --execute
+    environment:
+      <<: *advanced-environment
+    secrets:
+      - realtime_v2_app_dsn
+    volumes:
+      - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - scheduler
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --
+        - python
+        - -B
+        - scripts/report_realtime_v2_advanced_health.py
+        - --component
+        - scheduler
+      interval: 15s
+      timeout: 10s
+      retries: 4
+      start_period: 20s
+
+  realtime-v2-advanced-finalizer:
+    <<: *backend-service
+    profiles: ["realtime-v2-advanced"]
+    container_name: stock-screener-realtime-v2-advanced-finalizer
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - finalizer
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --
+      - python
+      - -B
+      - scripts/run_realtime_v2_equity_interval_finalizer.py
+      - --database
+      - stocks_realtime_v2
+      - --confirm-database-name
+      - stocks_realtime_v2
+      - --security-mode
+      - hardened
+      - --cohort-id
+      - ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
+      - --continuous
+      - --claim-limit
+      - ${REALTIME_V2_ADVANCED_FINALIZER_CLAIM_LIMIT:-1}
+      - --execute
+    secrets:
+      - realtime_v2_app_dsn
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - finalizer
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --
+        - python
+        - -B
+        - scripts/report_realtime_v2_advanced_health.py
+        - --component
+        - finalizer
+        - --cohort-id
+        - ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
+      interval: 15s
+      timeout: 10s
+      retries: 4
+      start_period: 20s
+
+  realtime-v2-retention:
+    <<: *backend-service
+    profiles: ["realtime-v2-retention"]
+    container_name: stock-screener-realtime-v2-retention
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_retention_service.py
+      - --database
+      - stocks_realtime_v2
+      - --confirm-database-name
+      - stocks_realtime_v2
+      - --archive-root
+      - /var/lib/realtime-v2-retention/archive
+      - --status-path
+      - /var/lib/realtime-v2-retention/status.json
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --admin-dsn-file
+      - /run/secrets/realtime_v2_admin_dsn
+      - --partition-relation
+      - rt.raw_payloads
+      - --partition-relation
+      - rt.raw_payload_chunks
+      - --partition-relation
+      - rt.option_discovery_pages
+      - --partition-relation
+      - rt.acquisition_facts
+      - --partition-relation
+      - rt.bar_revisions
+      - --partition-relation
+      - rt.equity_evidence
+      - --partition-relation
+      - rt.equity_evidence_inputs
+      - --partition-relation
+      - rt.equity_evidence_dependencies
+      - --partition-relation
+      - rt.equity_evidence_source_windows
+      - --partition-relation
+      - rt.feature_snapshots
+      - --partition-relation
+      - rt.normalization_diagnostics
+      - --partition-relation
+      - rt.portal_snapshot_hot
+      - --partition-relation
+      - rt.portal_snapshot_kept
+      - --partition-relation
+      - rt.portal_releases
+      - --partition-relation
+      - rt.option_flow_events
+      - --partition-relation
+      - rt.option_flow_clusters
+      - --retention-relation
+      - rt.raw_payloads
+      - --retention-relation
+      - rt.raw_payload_chunks
+      - --retention-relation
+      - rt.option_discovery_pages
+      - --retention-relation
+      - rt.acquisition_facts
+      - --retention-relation
+      - rt.equity_evidence
+      - --retention-relation
+      - rt.equity_evidence_inputs
+      - --retention-relation
+      - rt.equity_evidence_dependencies
+      - --retention-relation
+      - rt.equity_evidence_source_windows
+      - --retention-relation
+      - rt.feature_snapshots
+      - --retention-relation
+      - rt.normalization_diagnostics
+      - --retention-relation
+      - rt.portal_snapshot_hot
+      - --retention-relation
+      - rt.portal_releases
+      - --archive-relation
+      - rt.option_flow_events
+      - --archive-relation
+      - rt.option_flow_clusters
+      - --archive-kind
+      - STOCK_ALERTS
+      - --archive-kind
+      - OPTION_ALERTS
+      - --archive-kind
+      - DETECTOR_EVALUATIONS
+      - --archive-kind
+      - OPTION_FLOW_EVENTS
+      - --archive-kind
+      - OPTION_FLOW_CLUSTERS
+      - --archive-build-id
+      - ${REALTIME_V2_RETENTION_ARCHIVE_BUILD_ID:-}
+      - --archive-policy-id
+      - ${REALTIME_V2_RETENTION_ARCHIVE_POLICY_ID:-retention-policy-v1}
+      - --authorization-reference
+      - ${REALTIME_V2_RETENTION_AUTHORIZATION_REFERENCE:-}
+      - --interval-seconds
+      - ${REALTIME_V2_RETENTION_INTERVAL_SECONDS:-3600}
+      - --continuous
+      - --execute
+    secrets:
+      - realtime_v2_app_dsn
+      - realtime_v2_admin_dsn
+    volumes:
+      - realtime_v2_retention:/var/lib/realtime-v2-retention
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_realtime_v2_retention_service.py
+        - --database
+        - stocks_realtime_v2
+        - --confirm-database-name
+        - stocks_realtime_v2
+        - --status-path
+        - /var/lib/realtime-v2-retention/status.json
+        - --maximum-status-age-seconds
+        - ${REALTIME_V2_RETENTION_MAXIMUM_STATUS_AGE_SECONDS:-7200}
+        - --failure-threshold
+        - ${REALTIME_V2_RETENTION_FAILURE_THRESHOLD:-2}
+        - --fail-on-degraded
+        - --status
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  realtime-v2-advanced-api:
+    <<: *backend-service
+    profiles: ["realtime-v2-advanced"]
+    container_name: stock-screener-realtime-v2-advanced-api
+    stop_grace_period: 30s
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - api
+      - --api-dsn-file
+      - /run/secrets/realtime_v2_api_dsn
+      - --
+      - python
+      - -B
+      - -m
+      - uvicorn
+      - scripts.run_realtime_v2_portal_api:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8002"
+    secrets:
+      - realtime_v2_api_dsn
+    ports:
+      - "127.0.0.1:${REALTIME_V2_ADVANCED_API_PORT:-8002}:8002"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/check_http_health.py
+        - http://127.0.0.1:8002/api/realtime/health
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  realtime-v2-advanced-frontend:
+    image: alpha-research-realtime-v2-frontend:latest
+    profiles: ["realtime-v2-advanced"]
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: /api
+        VITE_REALTIME_ONLY: "true"
+        VITE_REALTIME_COHORT_ID: ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
+    container_name: stock-screener-realtime-v2-advanced-frontend
+    restart: unless-stopped
+    stop_grace_period: 20s
+    depends_on:
+      realtime-v2-advanced-api:
+        condition: service_healthy
+    volumes:
+      - ./frontend/nginx.realtime-v2.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "127.0.0.1:${REALTIME_V2_ADVANCED_FRONTEND_PORT:-5174}:80"
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+volumes:
+  realtime_v2_advanced_journals:
+    name: alpha-research-realtime-v2-advanced-journals
+  realtime_v2_advanced_reports:
+    name: alpha-research-realtime-v2-advanced-reports
+  realtime_v2_retention:
+    name: ${REALTIME_V2_RETENTION_VOLUME_NAME:-alpha-research-realtime-v2-retention-volume-name-required}
+    external: true
+
+secrets:
+  realtime_v2_app_dsn:
+    file: ${REALTIME_V2_DOCKER_SECRET_DIR:-./backend/.realtime-canary/v2-docker-secrets}/realtime_v2_app_dsn
+  realtime_v2_admin_dsn:
+    file: ${REALTIME_V2_DOCKER_SECRET_DIR:-./backend/.realtime-canary/v2-docker-secrets}/realtime_v2_admin_dsn
+  realtime_v2_api_dsn:
+    file: ${REALTIME_V2_DOCKER_SECRET_DIR:-./backend/.realtime-canary/v2-docker-secrets}/realtime_v2_api_dsn
+  realtime_v2_provider_key:
+    file: ${REALTIME_V2_DOCKER_SECRET_DIR:-./backend/.realtime-canary/v2-docker-secrets}/realtime_v2_provider_key
+
+networks:
+  application:
+    name: alpha-research-realtime-v2-application

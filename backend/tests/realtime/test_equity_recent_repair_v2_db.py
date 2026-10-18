@@ -179,6 +179,52 @@ def test_native_repair_replays_without_provider_calls_and_preserves_basis(pool):
         assert unit.cursor.fetchone() == ("PENDING", 0)
 
 
+def test_full_minute_repair_persists_exact_1m_and_5m_inputs(pool):
+    plan = replace(
+        _scope(pool),
+        request_ceiling=2,
+        byte_ceiling=4 * 1024 * 1024 + 2,
+        native_intervals=("1m", "5m"),
+    )
+    provider = _provider(pool)
+    transport = Transport(provider)
+    clock = lambda: datetime.now(timezone.utc)
+
+    result = execute_recent_native_repair(
+        provider,
+        transport,
+        plan,
+        clock=clock,
+    )
+
+    assert len(transport.calls) == result["provider_requests"] == 2
+    assert {
+        row["interval"]
+        for row in result["outcomes"]
+        if row.get("session") and row["status"] == "COMPLETE"
+    } == {"1m", "5m"}
+    with provider.transaction(read_only=True) as unit:
+        unit.cursor.execute(
+            "SELECT interval,count(*) FROM rt.bar_current "
+            "WHERE cohort_id=%s AND interval IN ('1m','5m') "
+            "GROUP BY interval ORDER BY interval",
+            (str(plan.cohort_id),),
+        )
+        counts = dict(unit.cursor.fetchall())
+    assert counts["1m"] == 390
+    assert counts["5m"] == 78
+
+    replay = execute_recent_native_repair(
+        provider,
+        transport,
+        plan,
+        clock=clock,
+    )
+    assert replay["provider_requests"] == 0
+    assert len(transport.calls) == 2
+    assert replay["provider_response_replays"] == 2
+
+
 def test_adjusted_daily_repair_replays_without_provider_and_preserves_basis(pool):
     native = _scope(pool)
     provider = _provider(pool)

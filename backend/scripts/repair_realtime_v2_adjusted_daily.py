@@ -33,7 +33,10 @@ from realtime.migrations import (  # noqa: E402
     validate_target_database_v2,
 )
 from scripts.realtime_script_support import PacedPolygonTransport, write_report  # noqa: E402
-from scripts.repair_realtime_v2_recent_sessions import _repair_identity_cutoff  # noqa: E402
+from scripts.repair_realtime_v2_recent_sessions import (  # noqa: E402
+    _load_scope_with_identity_continuity,
+    _repair_identity_cutoff,
+)
 from scripts.run_realtime_v2_developer_window import _load_scope  # noqa: E402
 from realtime.equity_recent_repair import AuthorizedNativeRepairTransport  # noqa: E402
 
@@ -53,6 +56,10 @@ def parse_args(argv=None):
     parser.add_argument("--authorization-reference", required=True)
     parser.add_argument("--provider-authorization-reference", required=True)
     parser.add_argument("--expected-cost", required=True)
+    parser.add_argument(
+        "--allow-late-identity-continuity",
+        action="store_true",
+    )
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -124,11 +131,26 @@ def main(argv=None):
             write_report(args.report_path, report)
             print(json.dumps(report, sort_keys=True))
             return 0
-        identities, _ = _load_scope(
-            provider,
-            args.cohort_id,
-            _repair_identity_cutoff(args.session_date),
-        )
+        now = datetime.now(timezone.utc)
+        cutoff = _repair_identity_cutoff(args.session_date)
+        try:
+            identities, _ = _load_scope(
+                provider,
+                args.cohort_id,
+                cutoff,
+            )
+            identity_continuity = ()
+        except ValueError:
+            if not args.allow_late_identity_continuity:
+                raise
+            identities, identity_continuity = (
+                _load_scope_with_identity_continuity(
+                    provider,
+                    args.cohort_id,
+                    cutoff,
+                    known_by=now,
+                )
+            )
         plan = AdjustedDailyRepairPlan(
             args.cohort_id,
             identities,
@@ -140,6 +162,7 @@ def main(argv=None):
             args.authorization_reference,
             args.provider_authorization_reference,
             args.expected_cost,
+            identity_continuity,
         )
         api_key = os.getenv("POLYGON_API_KEY", "").strip()
         if not api_key:

@@ -384,8 +384,30 @@ def test_ticker_history_audit_reads_v2_evidence_pointers_and_bars_read_only(pool
         assert scale["ticker"] == "SPY" and scale["relative_difference"] == pytest.approx(1.0)
         assert {(row["interval"], row["adjustment_basis"]) for row in report["latest_retained_sessions"]} >= {
             ("1d", "ADJUSTED"), ("1d", "RAW_UNADJUSTED"), ("30m", "RAW_UNADJUSTED")}
+        assert len(report["one_minute_session_counts"]) == 5
+        assert all(
+            row["ticker"] == "SPY"
+            and row["observed_bars"] == 0
+            and row["missing_bars"] == row["expected_bars"]
+            and row["complete"] is False
+            for row in report["one_minute_session_counts"]
+        )
+        expected_one_minute = {
+            (row["ticker"], row["session_date"]): row["expected_bars"]
+            for row in report["one_minute_session_counts"]
+        }
+        assert len(report["one_minute_missing_ranges"]) == 5
+        assert all(
+            row["ticker"] == "SPY"
+            and len(row["ranges"]) == 1
+            and row["missing_bars"] == row["ranges"][0]["bars"]
+            == expected_one_minute[(row["ticker"], row["session_date"])]
+            for row in report["one_minute_missing_ranges"]
+        )
         empty = history.run_audit(connection, database=DATABASE, cohort_id=uuid4(), session_date=session)
         assert empty["reference_membership"] == () and empty["interval_counts"] == ()
+        assert empty["one_minute_session_counts"] == ()
+        assert empty["one_minute_missing_ranges"] == ()
 
 
 @requires_v2_database

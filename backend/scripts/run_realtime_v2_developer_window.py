@@ -41,6 +41,7 @@ from realtime.orchestration_repository import (  # noqa: E402
 )
 from realtime.reference_seed import SeedStatus  # noqa: E402
 from realtime.runner_environment import RunnerEnvironment  # noqa: E402
+from realtime.screening_delta_loader import ScreeningInputLoader  # noqa: E402
 from realtime.stage_database_v2 import V2StageDatabase, V2WorkerDatabase  # noqa: E402
 from realtime.stage_graph import STAGE_CATALOG_VERSION_V2, STAGES_V2  # noqa: E402
 from realtime.stage_orchestrator import StageOrchestrator  # noqa: E402
@@ -48,6 +49,7 @@ from realtime.stage_orchestrator import StageOutcome  # noqa: E402
 from realtime.stage_runners_equity import (  # noqa: E402
     INPUT_READY,
     input_ready_identity,
+    portal_publish_runner,
     reference_generation,
 )
 from realtime.stage_runners_v2 import build_runners, unwired_stages, wired_stages  # noqa: E402
@@ -67,6 +69,12 @@ PORTAL_REPROJECTION_STAGES = (
     "EQUITY_PROJECTION",
     "PORTAL_PUBLISH",
 )
+PROJECTION_ONLY_STAGES = tuple(
+    stage
+    for stage in PORTAL_REPROJECTION_STAGES
+    if stage != "PORTAL_PUBLISH"
+)
+PUBLICATION_ONLY_STAGES = ("PORTAL_PUBLISH",)
 MINIMUM_REQUEST_INTERVAL_SECONDS = 0.5
 
 
@@ -95,6 +103,13 @@ def parse_args(argv=None):
     parser.add_argument("--resume-prefill", action="store_true")
     parser.add_argument("--reuse-current-input", action="store_true")
     parser.add_argument("--portal-reprojection", action="store_true")
+    parser.add_argument("--projection-only", action="store_true")
+    parser.add_argument("--publication-only", action="store_true")
+    parser.add_argument("--publication-source-window-id", type=UUID)
+    parser.add_argument(
+        "--allow-late-identity-continuity",
+        action="store_true",
+    )
     parser.add_argument("--serial-lanes", action="store_true")
     parser.add_argument("--wait-for-input-receipt", action="store_true")
     args = parser.parse_args(argv)
@@ -124,15 +139,96 @@ def parse_args(argv=None):
         parser.error("receipt retries must reuse sealed current input")
     if args.resume_prefill and args.reuse_current_input:
         parser.error("prefill cannot be combined with receipt-only recovery")
-    if args.portal_reprojection and (
-        args.resume_prefill
-        or args.reuse_current_input
-        or not args.window_key_suffix.startswith("-portal-correction")
+    if args.portal_reprojection:
+        if args.resume_prefill or args.reuse_current_input:
+            parser.error("portal reprojection cannot acquire or reuse input")
+        if args.publication_only:
+            if not args.window_key_suffix.startswith(
+                "-portal-publish-recovery"
+            ):
+                parser.error(
+                    "publication-only recovery requires a "
+                    "-portal-publish-recovery suffix"
+                )
+        elif not args.window_key_suffix.startswith("-portal-correction"):
+            parser.error(
+                "portal reprojection requires a -portal-correction suffix"
+            )
+    if args.projection_only and not args.portal_reprojection:
+        parser.error("--projection-only requires --portal-reprojection")
+    if args.publication_only and (
+        not args.portal_reprojection
+        or args.projection_only
+        or args.publication_source_window_id is None
     ):
         parser.error(
-            "portal reprojection requires a -portal-correction suffix and cannot acquire or reuse input"
+            "--publication-only requires --portal-reprojection, an exact "
+            "--publication-source-window-id and no --projection-only"
+        )
+    if (
+        not args.publication_only
+        and args.publication_source_window_id is not None
+    ):
+        parser.error(
+            "--publication-source-window-id requires --publication-only"
+        )
+    if (
+        args.allow_late_identity_continuity
+        and not args.portal_reprojection
+    ):
+        parser.error(
+            "late identity continuity is limited to portal reprojection"
         )
     return args
+
+
+def _load_historical_reference_manifest(provider, cutoff, known_by):
+    with provider.transaction(read_only=True, dict_cursor=True) as unit:
+        unit.cursor.execute(
+            "SELECT seed.seed_id,seed.seed_sha256,seed.universe_sha256,"
+            "seed.session_date,seed.status,seed.reason_codes,"
+            "seed.member_count,seed.created_at,seed.effective_at,"
+            "seed.valid_until,seed.source_generations "
+            "FROM rt.seed_manifests AS seed "
+            "WHERE seed.status='READY' AND seed.universe_sha256=%s "
+            "AND seed.created_at<=%s AND seed.effective_at<=%s "
+            "AND seed.valid_until>%s "
+            "ORDER BY seed.created_at DESC,seed.seed_id DESC LIMIT 1",
+            (
+                EQUITY_VALIDATION_UNIVERSE.sha256,
+                known_by,
+                known_by,
+                known_by,
+            ),
+        )
+        seed = unit.cursor.fetchone()
+        unit.cursor.execute(
+            "SELECT seed_id FROM rt.seed_manifests "
+            "WHERE status='READY' AND universe_sha256=%s "
+            "AND created_at<=%s "
+            "ORDER BY created_at DESC,seed_id DESC LIMIT 1",
+            (EQUITY_VALIDATION_UNIVERSE.sha256, cutoff),
+        )
+        prior = unit.cursor.fetchone()
+    if seed is None or prior is None or seed["created_at"] <= cutoff:
+        raise ValueError(
+            "Developer historical reference seed continuity is unavailable"
+        )
+    return SimpleNamespace(
+        seed_id=seed["seed_id"],
+        seed_sha256=seed["seed_sha256"],
+        universe_sha256=seed["universe_sha256"],
+        session_date=seed["session_date"],
+        status=SeedStatus.READY,
+        reason_codes=tuple(seed["reason_codes"]),
+        member_count=seed["member_count"],
+        created_at=seed["created_at"],
+        effective_at=seed["effective_at"],
+        valid_until=seed["valid_until"],
+        source_generations=tuple(
+            sorted(seed["source_generations"].items())
+        ),
+    )
 
 
 def _pool(dsn):
@@ -244,12 +340,190 @@ def _validate_cutoff(cutoff):
     return session
 
 
+def _publication_recovery_state(
+    provider,
+    *,
+    cohort_id,
+    cutoff,
+    source_window_id,
+):
+    with provider.transaction(read_only=True, dict_cursor=True) as unit:
+        cursor = unit.cursor
+        cursor.execute(
+            "SELECT window_run.window_id,window_run.window_key,"
+            "window_run.state,window_run.provider_tier,window_run.cutoff,"
+            "window_run.deadline,plan.plan_id,plan.session_date,"
+            "plan.stage_catalog_version,plan.enabled_stages "
+            "FROM rt.window_runs AS window_run "
+            "JOIN rt.service_plans AS plan USING(plan_id) "
+            "WHERE window_run.window_id=%s AND window_run.cohort_id=%s "
+            "AND window_run.cutoff=%s",
+            (str(source_window_id), str(cohort_id), cutoff),
+        )
+        source = cursor.fetchone()
+        if source is None:
+            raise ValueError(
+                "publication source window does not match the exact cohort "
+                "and cutoff"
+            )
+        source = dict(source)
+        cursor.execute(
+            "SELECT DISTINCT ON (stage_id) stage_id,state,attempt "
+            "FROM rt.stage_runs WHERE window_id=%s "
+            "ORDER BY stage_id,attempt DESC",
+            (str(source_window_id),),
+        )
+        stage_runs = {
+            row["stage_id"]: dict(row)
+            for row in cursor.fetchall()
+        }
+        cursor.execute(
+            "SELECT receipt_id,receipt_kind,cohort_id,cutoff,"
+            "reference_generation,universe_sha256,input_sha256,build_id "
+            "FROM rt.cycle_receipts WHERE window_id=%s "
+            "AND receipt_kind=ANY(%s) ORDER BY receipt_kind",
+            (
+                str(source_window_id),
+                [INPUT_READY, "PORTAL_READY"],
+            ),
+        )
+        receipts = {
+            row["receipt_kind"]: dict(row)
+            for row in cursor.fetchall()
+        }
+        cursor.execute(
+            "SELECT release_id,cutoff,session_date,updated_at "
+            "FROM rt.portal_release_current WHERE cohort_id=%s "
+            "AND provider_tier='MASSIVE_DEVELOPER'",
+            (str(cohort_id),),
+        )
+        current_release = cursor.fetchone()
+        cursor.execute(
+            "SELECT scope,cohort_id,provider_tier,activation_id,"
+            "effective_at,updated_at FROM rt.portal_cohort_current "
+            "WHERE scope='PLATFORM'",
+        )
+        platform_pointer = cursor.fetchone()
+        cursor.execute(
+            "SELECT "
+            "(SELECT COUNT(*) FROM rt.snapshot_catalog "
+            "WHERE cohort_id=%s) AS snapshot_catalog,"
+            "(SELECT COUNT(*) FROM rt.portal_snapshot_hot "
+            "WHERE cohort_id=%s) AS snapshot_hot,"
+            "(SELECT COUNT(*) FROM rt.portal_snapshot_kept "
+            "WHERE cohort_id=%s) AS snapshot_kept,"
+            "(SELECT COUNT(*) FROM rt.portal_releases "
+            "WHERE cohort_id=%s) AS releases",
+            tuple(str(cohort_id) for _ in range(4)),
+        )
+        publication_counts = dict(cursor.fetchone())
+        cursor.execute(
+            "SELECT COUNT(*) AS total_requests,"
+            "COALESCE(SUM(response_bytes),0) AS total_response_bytes,"
+            "COUNT(*) FILTER (WHERE cohort_id=%s) AS cohort_requests,"
+            "COALESCE(SUM(response_bytes) FILTER (WHERE cohort_id=%s),0) "
+            "AS cohort_response_bytes FROM rt.provider_request_ledger",
+            (str(cohort_id), str(cohort_id)),
+        )
+        provider_ledger = dict(cursor.fetchone())
+    if (
+        source["state"] != "COMPLETE"
+        or source["provider_tier"] != "MASSIVE_DEVELOPER"
+        or source["cutoff"] != cutoff
+        or source["session_date"] != cutoff.date()
+        or source["stage_catalog_version"] != STAGE_CATALOG_VERSION_V2
+        or set(source["enabled_stages"]) != set(PROJECTION_ONLY_STAGES)
+    ):
+        raise ValueError(
+            "publication source is not the completed Developer "
+            "projection-only window"
+        )
+    if any(
+        stage_runs.get(stage, {}).get("state") != "COMPLETE"
+        for stage in ("EQUITY_MATERIALIZE", "EQUITY_PROJECTION")
+    ):
+        raise ValueError(
+            "publication source lacks completed materialization or projection"
+        )
+    if set(receipts) != {INPUT_READY, "PORTAL_READY"}:
+        raise ValueError(
+            "publication source lacks exact INPUT_READY and PORTAL_READY "
+            "receipts"
+        )
+    input_receipt = receipts[INPUT_READY]
+    portal_receipt = receipts["PORTAL_READY"]
+    if any(
+        receipt["cohort_id"] != cohort_id
+        or receipt["cutoff"] != cutoff
+        or receipt["reference_generation"] < 1
+        or receipt["build_id"] != EQUITY_WINDOW_BUILD_ID
+        or len(receipt["universe_sha256"]) != 64
+        or len(receipt["input_sha256"]) != 64
+        for receipt in receipts.values()
+    ) or (
+        input_receipt["reference_generation"]
+        != portal_receipt["reference_generation"]
+    ):
+        raise ValueError(
+            "publication source receipts disagree with the Developer "
+            "recovery scope"
+        )
+    return {
+        "source_window": source,
+        "stage_runs": stage_runs,
+        "receipts": receipts,
+        "current_release": (
+            dict(current_release)
+            if current_release is not None
+            else None
+        ),
+        "platform_pointer": (
+            dict(platform_pointer)
+            if platform_pointer is not None
+            else None
+        ),
+        "publication_counts": publication_counts,
+        "provider_ledger": provider_ledger,
+    }
+
+
+def _publication_effects(state, *, cutoff, session_close):
+    return {
+        "release_receipt_id": str(
+            state["receipts"][INPUT_READY]["receipt_id"]
+        ),
+        "projection_receipt_id": str(
+            state["receipts"]["PORTAL_READY"]["receipt_id"]
+        ),
+        "release_classes": [
+            "INTRADAY",
+            *(["SESSION_CLOSE"] if session_close else []),
+        ],
+        "cohort_current_pointer": {
+            "table": "rt.portal_release_current",
+            "before": state["current_release"],
+            "after_cutoff": cutoff,
+        },
+        "platform_pointer": {
+            "table": "rt.portal_cohort_current",
+            "effect": "UNCHANGED",
+            "identity": state["platform_pointer"],
+        },
+        "provider_effect": "ZERO_EXTERNAL_REQUESTS",
+    }
+
+
 def main(argv=None):
     args = parse_args(argv)
     session_date = _validate_cutoff(args.cutoff)
     enabled_stages = (
-        PORTAL_REPROJECTION_STAGES
-        if args.portal_reprojection else ENABLED_STAGES
+        PUBLICATION_ONLY_STAGES
+        if args.publication_only
+        else PROJECTION_ONLY_STAGES
+        if args.projection_only
+        else PORTAL_REPROJECTION_STAGES
+        if args.portal_reprojection
+        else ENABLED_STAGES
     )
     calendar = exchange_calendars.get_calendar("XNYS")
     if args.window_start != calendar.session_open(str(session_date)).to_pydatetime():
@@ -267,7 +541,49 @@ def main(argv=None):
         "minimum_request_interval_seconds": MINIMUM_REQUEST_INTERVAL_SECONDS,
     }
     if not args.execute:
-        print(json.dumps({**plan, "provider_requests": 0, "database_writes": 0}, sort_keys=True))
+        if not args.publication_only:
+            print(json.dumps({
+                **plan,
+                "provider_requests": 0,
+                "database_writes": 0,
+            }, sort_keys=True))
+            return 0
+        load_dotenv(BACKEND_DIR / ".env", override=True)
+        app_dsn = os.getenv("REALTIME_V2_APP_DSN", "").strip()
+        if not app_dsn:
+            raise RuntimeError(
+                "Developer publication preview requires REALTIME_V2_APP_DSN"
+            )
+        preview_pool = _pool(app_dsn)
+        try:
+            preview_provider = V2ConnectionProvider(
+                {APP_ROLE: preview_pool},
+                V2AccessConfig(
+                    security_mode="hardened",
+                    role_prefix=EXPECTED_V2_DATABASE_NAME,
+                    statement_timeout_ms=300_000,
+                ),
+            )
+            preview_provider.verify()
+            publication_state = _publication_recovery_state(
+                preview_provider,
+                cohort_id=args.cohort_id,
+                cutoff=args.cutoff,
+                source_window_id=args.publication_source_window_id,
+            )
+        finally:
+            preview_pool.closeall()
+        print(json.dumps({
+            **plan,
+            "publication_source": publication_state,
+            "publication_effects": _publication_effects(
+                publication_state,
+                cutoff=args.cutoff,
+                session_close=True,
+            ),
+            "provider_requests": 0,
+            "database_writes": 0,
+        }, default=str, sort_keys=True))
         return 0
     load_dotenv(BACKEND_DIR / ".env", override=True)
     app_dsn = os.getenv("REALTIME_V2_APP_DSN", "").strip()
@@ -288,6 +604,14 @@ def main(argv=None):
             ),
         )
         provider.verify()
+        publication_before = None
+        if args.publication_only:
+            publication_before = _publication_recovery_state(
+                provider,
+                cohort_id=args.cohort_id,
+                cutoff=args.cutoff,
+                source_window_id=args.publication_source_window_id,
+            )
         if args.reuse_current_input:
             with provider.transaction(read_only=True) as unit:
                 recovery = equity_window_recovery_cursor(
@@ -295,7 +619,24 @@ def main(argv=None):
                 )
             if not recovery["has_input_receipt"]:
                 raise ValueError("current-input recovery requires a matching durable INPUT_READY receipt")
-        identities, manifest = _load_scope(provider, args.cohort_id, args.cutoff)
+        if args.publication_only:
+            identities, manifest = (), None
+        elif (
+            args.portal_reprojection
+            and args.allow_late_identity_continuity
+        ):
+            identities = ()
+            manifest = _load_historical_reference_manifest(
+                provider,
+                args.cutoff,
+                datetime.now(timezone.utc),
+            )
+        else:
+            identities, manifest = _load_scope(
+                provider,
+                args.cohort_id,
+                args.cutoff,
+            )
         transport = history_source = equity_source = None
         if not args.reuse_current_input and not args.portal_reprojection:
             existing_revision_ids = _existing_revision_ids(
@@ -357,14 +698,30 @@ def main(argv=None):
         environment = RunnerEnvironment(
             provider,
             build_id=EQUITY_WINDOW_BUILD_ID,
-            reference_service=ExistingReferenceService(manifest),
+            reference_service=(
+                ExistingReferenceService(manifest)
+                if manifest is not None
+                else None
+            ),
             equity_source=equity_source,
             universe=EQUITY_VALIDATION_UNIVERSE,
             reference_scope="EQUITY_VALIDATION_REFERENCES",
             input_known_by=(
-                recovery["input_known_by"] if args.reuse_current_input else None
+                publication_before["source_window"]["deadline"]
+                if args.publication_only
+                else recovery["input_known_by"]
+                if args.reuse_current_input
+                else None
             ),
             freeze_heap=True,
+            screening_loader=(
+                None
+                if args.allow_late_identity_continuity
+                else ScreeningInputLoader()
+            ),
+            allow_late_identity_continuity=(
+                args.allow_late_identity_continuity
+            ),
         )
         repository = PostgresOrchestrationRepository(provider)
         config_sha256 = canonical_sha256({
@@ -375,6 +732,16 @@ def main(argv=None):
             "window_key_suffix": args.window_key_suffix,
             "enabled_stages": enabled_stages,
             "portal_reprojection": args.portal_reprojection,
+            "projection_only": args.projection_only,
+            "publication_only": args.publication_only,
+            "publication_source_window_id": (
+                str(args.publication_source_window_id)
+                if args.publication_source_window_id is not None
+                else None
+            ),
+            "allow_late_identity_continuity": (
+                args.allow_late_identity_continuity
+            ),
         })
         plan_id = repository.create_plan(
             args.cohort_id,
@@ -388,6 +755,11 @@ def main(argv=None):
         if unwired_stages(enabled_stages) or set(wired_stages(enabled_stages)) != set(enabled_stages):
             raise RuntimeError("Developer window stage wiring changed")
         runners = build_runners(enabled_stages, provider, environment=environment)
+        if args.publication_only:
+            runners["PORTAL_PUBLISH"] = portal_publish_runner(
+                environment,
+                receipt_window_id=args.publication_source_window_id,
+            )
         if args.reuse_current_input:
             input_receipt = recovery["input_receipt"]
             if not isinstance(input_receipt, CycleReceiptSpec):
@@ -407,7 +779,14 @@ def main(argv=None):
                     context,
                     RealtimeDatabaseRole.COMPUTE,
                 )
-                generation = reference_generation(compute, context.window.cutoff)
+                generation = reference_generation(
+                    compute,
+                    (
+                        environment.known_by(context.window)
+                        if environment.allow_late_identity_continuity
+                        else context.window.cutoff
+                    ),
+                )
                 if generation < 1:
                     return StageOutcome.blocked("REFERENCE_GENERATION_UNAVAILABLE")
                 universe_sha256, input_sha256 = input_ready_identity(
@@ -416,6 +795,9 @@ def main(argv=None):
                     cutoff=context.window.cutoff,
                     known_by=environment.known_by(context.window),
                     reference_generation=generation,
+                    allow_late_identity_continuity=(
+                        environment.allow_late_identity_continuity
+                    ),
                 )
                 return StageOutcome.complete(receipt=CycleReceiptSpec(
                     INPUT_READY,
@@ -474,7 +856,11 @@ def main(argv=None):
             now + timedelta(minutes=10),
         )
         service = V2Service(orchestrator, repository, plan_id, (spec,))
-        reference_state = service.tick_resident_once("REFERENCE")
+        reference_state = (
+            "NOT_RUN"
+            if args.publication_only
+            else service.tick_resident_once("REFERENCE")
+        )
         poll = service.poll_windows()
         with provider.transaction(read_only=True) as unit:
             unit.cursor.execute(
@@ -496,11 +882,14 @@ def main(argv=None):
             durable_stages = tuple(unit.cursor.fetchall())
         durable_complete = (
             durable_window == ("COMPLETE",)
-            and len(durable_stages) == len(enabled_stages) - 1
+            and len(durable_stages) == (
+                len(enabled_stages)
+                - int("REFERENCE" in enabled_stages)
+            )
             and all(state == "COMPLETE" for _, state in durable_stages)
         )
         if (
-            reference_state not in {"COMPLETE", "DEGRADED"}
+            reference_state not in {"COMPLETE", "DEGRADED", "NOT_RUN"}
             or poll.window_errors
             or not durable_complete
             or not poll.windows
@@ -519,6 +908,16 @@ def main(argv=None):
                 ),
             )
             persisted = dict(unit.cursor.fetchone())
+        publication_after = (
+            _publication_recovery_state(
+                provider,
+                cohort_id=args.cohort_id,
+                cutoff=args.cutoff,
+                source_window_id=args.publication_source_window_id,
+            )
+            if args.publication_only
+            else None
+        )
         completed_at = datetime.now(timezone.utc)
         report = {
             **plan,
@@ -528,6 +927,17 @@ def main(argv=None):
             "window": asdict(poll.windows[0]),
             "persisted": persisted,
             "prefill": prefill,
+            "publication_before": publication_before,
+            "publication_after": publication_after,
+            "publication_effects": (
+                _publication_effects(
+                    publication_before,
+                    cutoff=args.cutoff,
+                    session_close=True,
+                )
+                if publication_before is not None
+                else None
+            ),
             "provider_requests": transport.external_requests if transport is not None else 0,
             "provider_cache_hits": transport.cache_hits if transport is not None else 0,
             "logical_provider_requests": history_source.provider_requests if history_source is not None else 0,

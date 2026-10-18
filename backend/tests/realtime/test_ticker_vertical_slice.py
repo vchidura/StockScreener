@@ -513,7 +513,12 @@ class TickerStore(PortalV2Statements):
             row = self.snapshots.get(params[-1])
             if row and row["generated_at"] <= cutoff:
                 if (row["cohort_id"], row["snapshot_type"], row["snapshot_key"]) == key:
-                    self.result = [dict(row, cohort_manifest_sha256="a" * 64)]
+                    self.result = [dict(
+                        row,
+                        cohort_manifest_id=None,
+                        cohort_manifest_sha256="a" * 64,
+                        history_binding_sha256=None,
+                    )]
         elif sql.startswith("SELECT snapshot.snapshot_id, snapshot.payload_sha256"):
             row = self.snapshots.get(params[-1])
             if row and row["generated_at"] <= params[3]:
@@ -524,11 +529,17 @@ class TickerStore(PortalV2Statements):
                     snapshot_id=row["snapshot_id"], payload_sha256=row["payload_sha256"],
                     source_manifest_sha256=row["source_manifest_sha256"], generated_at=row["generated_at"],
                     provider_tier=row["provider_tier"], source_generation=row["source_generation"],
-                    cohort_manifest_sha256="a" * 64, reference=manifest["reference"],
+                    cohort_manifest_id=None, cohort_manifest_sha256="a" * 64,
+                    history_binding_sha256=None, reference=manifest["reference"],
                     manifest_version=manifest["version"], manifest_cohort_id=manifest["cohort_id"],
                     manifest_cohort_sha256=manifest["source_manifest_sha256"],
+                    manifest_history_binding_sha256=manifest.get("history_binding_sha256"),
                     manifest_provider_tier=manifest["provider_tier"],
                     manifest_source_generation=manifest["source_generation"],
+                    manifest_identity_continuity_sha256=manifest.get(
+                        "identity_continuity_sha256"
+                    ),
+                    manifest_known_by=manifest.get("known_by"),
                 )]
         elif sql.startswith("SELECT snapshot.snapshot_key, snapshot.generated_at"):
             for snapshot_id in params[2]:

@@ -28,6 +28,7 @@ from realtime.relation_registry import (
     ROLES,
     RUNTIME_ROLES,
     SECURITY_PHASES,
+    VIEWS,
     Relation,
     grants,
     security_policy,
@@ -36,6 +37,7 @@ from realtime.security_v2 import build_role_names_v2, record_security_audit_v2
 
 SQL_DIR = Path(V2_MIGRATIONS_DIR)
 _CREATE_TABLE = re.compile(r"^CREATE TABLE ((?:ref|rt)\.[a-z_0-9]+)", re.MULTILINE)
+_CREATE_VIEW = re.compile(r"^CREATE VIEW ((?:ref|rt)\.[a-z_0-9]+)", re.MULTILINE)
 _TRIGGER = re.compile(
     r"CREATE TRIGGER\s+\w+\s+BEFORE\s+([A-Z ]+?)\s+ON\s+((?:ref|rt)\.\w+)\s+"
     r"FOR EACH (ROW|STATEMENT)\s+EXECUTE FUNCTION\s+(rt\.\w+)\(\)", re.DOTALL)
@@ -57,9 +59,21 @@ def test_v2_migration_chain_is_contiguous_and_fingerprinted():
     assert len(schema_fingerprint(migrations)) == 64
 
 
+def test_session_archive_ledger_identity_includes_build_and_horizon():
+    text = " ".join(_sql("024_realtime_session_archive_build_identity.sql").split())
+    assert "DROP CONSTRAINT session_archives_session_date_kind_sha256_key" in text
+    assert (
+        "UNIQUE NULLS NOT DISTINCT "
+        "( session_date, kind, horizon_close_date, sha256, build_id )"
+        in text
+    )
+
+
 def test_every_sql_table_is_in_the_registry_and_back():
-    created = set(_CREATE_TABLE.findall(_all_sql()))
-    assert created == set(RELATIONS)
+    tables = set(_CREATE_TABLE.findall(_all_sql()))
+    views = set(_CREATE_VIEW.findall(_all_sql()))
+    assert views == set(VIEWS)
+    assert tables == set(RELATIONS) - set(VIEWS)
 
 
 def test_registry_partitioned_relations_match_sql_declarations():

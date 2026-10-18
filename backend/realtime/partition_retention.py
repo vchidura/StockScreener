@@ -215,6 +215,47 @@ class CatalogPruneOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class PartitionImpact:
+    relation: str
+    partition: str
+    rows: int
+    total_bytes: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "relation": self.relation,
+            "partition": self.partition,
+            "rows": self.rows,
+            "total_bytes": self.total_bytes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogCascadeImpact:
+    relation: str
+    rows: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {"relation": self.relation, "rows": self.rows}
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogPruneImpact:
+    catalog: str
+    before: date
+    rows: int
+    direct_cascades: tuple[CatalogCascadeImpact, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "catalog": self.catalog,
+            "before": self.before.isoformat(),
+            "rows": self.rows,
+            "direct_cascades": [impact.as_dict() for impact in self.direct_cascades],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RetentionReport:
     """`alarms` are run-level (policy lookup, refusals, catalog prune); each policy has its own."""
 
@@ -518,6 +559,36 @@ _REFERENCING_KEYS = (
 )
 
 
+def _catalog_delete_scope(
+    cursor: Any,
+    catalog: str,
+    rule: CatalogRule,
+    before: datetime,
+) -> tuple[list[Any], list[Any], Sequence[tuple[Any, ...]]]:
+    cursor.execute(_REFERENCING_KEYS, (catalog,))
+    references = cursor.fetchall()
+    conditions = [sql.SQL("c.{} < %s").format(sql.Identifier(rule.time_column))]
+    parameters: list[Any] = [before]
+    for column, value in rule.equals:
+        conditions.append(sql.SQL("c.{} = %s").format(sql.Identifier(column)))
+        parameters.append(value)
+    for ref_schema, ref_table, delete_action, ref_columns, key_columns in references:
+        if delete_action not in ("a", "r"):
+            continue
+        match = sql.SQL(" AND ").join(
+            sql.SQL("r.{} = c.{}").format(
+                sql.Identifier(ref_column),
+                sql.Identifier(key_column),
+            )
+            for ref_column, key_column in zip(ref_columns, key_columns)
+        )
+        conditions.append(sql.SQL("NOT EXISTS (SELECT 1 FROM {} AS r WHERE {})").format(
+            sql.Identifier(ref_schema, ref_table),
+            match,
+        ))
+    return conditions, parameters, references
+
+
 def _next_start(scheme: str, lower: date) -> date | None:
     if scheme == "DAILY":
         return lower + timedelta(days=1)
@@ -574,6 +645,26 @@ class PostgresPartitionRetentionRepository:
             _require_whole_utc_days(partition)
         return found
 
+    def partition_impact(self, partition: PartitionInfo | PartitionOutcome) -> PartitionImpact:
+        schema, _, _ = partition.relation.partition(".")
+        name = partition.name if isinstance(partition, PartitionInfo) else partition.partition
+        child = sql.Identifier(schema, name)
+        qualified = f"{schema}.{name}"
+        with self._read_cursor() as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "SELECT count(*)::bigint, pg_total_relation_size(%s::regclass)::bigint FROM {}"
+                ).format(child),
+                (qualified,),
+            )
+            rows, total_bytes = cursor.fetchone()
+        return PartitionImpact(
+            partition.relation,
+            name,
+            int(rows),
+            int(total_bytes),
+        )
+
     @staticmethod
     def _detached_parameters(relation: str) -> dict[str, str]:
         schema, _, name = relation.partition(".")
@@ -626,21 +717,12 @@ class PostgresPartitionRetentionRepository:
                 with connection.cursor() as cursor:
                     cursor.execute("SELECT set_config('lock_timeout', '10s', true), "
                                    "set_config('statement_timeout', %s, true)", (self._statement_timeout,))
-                    cursor.execute(_REFERENCING_KEYS, (catalog,))
-                    references = cursor.fetchall()
-                    conditions = [sql.SQL("c.{} < %s").format(sql.Identifier(rule.time_column))]
-                    parameters: list[Any] = [before]
-                    for column, value in rule.equals:
-                        conditions.append(sql.SQL("c.{} = %s").format(sql.Identifier(column)))
-                        parameters.append(value)
-                    for ref_schema, ref_table, delete_action, ref_columns, key_columns in references:
-                        if delete_action not in ("a", "r"):
-                            continue
-                        match = sql.SQL(" AND ").join(
-                            sql.SQL("r.{} = c.{}").format(sql.Identifier(ref_column), sql.Identifier(key_column))
-                            for ref_column, key_column in zip(ref_columns, key_columns))
-                        conditions.append(sql.SQL("NOT EXISTS (SELECT 1 FROM {} AS r WHERE {})").format(
-                            sql.Identifier(ref_schema, ref_table), match))
+                    conditions, parameters, _ = _catalog_delete_scope(
+                        cursor,
+                        catalog,
+                        rule,
+                        before,
+                    )
                     cursor.execute(
                         sql.SQL("DELETE FROM {} AS c WHERE {}").format(
                             sql.Identifier(schema, name), sql.SQL(" AND ").join(conditions)), parameters)
@@ -650,3 +732,62 @@ class PostgresPartitionRetentionRepository:
                 connection.rollback()
                 raise
         return deleted
+
+    def catalog_prune_impact(
+        self,
+        catalog: str,
+        rule: CatalogRule,
+        before: datetime,
+    ) -> CatalogPruneImpact:
+        if catalog not in CATALOG_RULES or CATALOG_RULES[catalog] != rule:
+            raise ValueError(f"{catalog} has no catalog prune rule")
+        schema, _, name = catalog.partition(".")
+        catalog_identifier = sql.Identifier(schema, name)
+        with self._read_cursor() as cursor:
+            conditions, parameters, references = _catalog_delete_scope(
+                cursor,
+                catalog,
+                rule,
+                before,
+            )
+            where = sql.SQL(" AND ").join(conditions)
+            cursor.execute(
+                sql.SQL("SELECT count(*)::bigint FROM {} AS c WHERE {}").format(
+                    catalog_identifier,
+                    where,
+                ),
+                parameters,
+            )
+            rows = int(cursor.fetchone()[0])
+            cascades: list[CatalogCascadeImpact] = []
+            for ref_schema, ref_table, delete_action, ref_columns, key_columns in references:
+                if delete_action != "c":
+                    continue
+                match = sql.SQL(" AND ").join(
+                    sql.SQL("r.{} = c.{}").format(
+                        sql.Identifier(ref_column),
+                        sql.Identifier(key_column),
+                    )
+                    for ref_column, key_column in zip(ref_columns, key_columns)
+                )
+                cursor.execute(
+                    sql.SQL(
+                        "SELECT count(*)::bigint FROM {} AS r JOIN {} AS c ON {} WHERE {}"
+                    ).format(
+                        sql.Identifier(ref_schema, ref_table),
+                        catalog_identifier,
+                        match,
+                        where,
+                    ),
+                    parameters,
+                )
+                cascades.append(CatalogCascadeImpact(
+                    f"{ref_schema}.{ref_table}",
+                    int(cursor.fetchone()[0]),
+                ))
+        return CatalogPruneImpact(
+            catalog,
+            before.astimezone(_UTC).date(),
+            rows,
+            tuple(cascades),
+        )

@@ -20,6 +20,14 @@ class WorkerLane(str, Enum):
     IO = "IO"
 
 
+class EquityRolloutMode(str, Enum):
+    DEVELOPER_ONLY = "DEVELOPER_ONLY"
+    ADVANCED_ONLY_REHEARSAL = "ADVANCED_ONLY_REHEARSAL"
+    DEVELOPER_ACTIVE_ADVANCED_SHADOW = (
+        "DEVELOPER_ACTIVE_ADVANCED_SHADOW"
+    )
+
+
 class RealtimeWorkerKind(str, Enum):
     PREFLIGHT_CONTROLLER = "PREFLIGHT_CONTROLLER"
     REFERENCE_SERVICE = "REFERENCE_SERVICE"
@@ -102,6 +110,14 @@ class TierWorkerPlan:
             raise ValueError("tier worker plan must have exactly one active publisher")
         if publishers and publishers[0].cohort_id != self.active_cohort_id:
             raise ValueError("portal publisher must belong to the active cohort")
+        if (
+            publishers
+            and publishers[0].provider_tier
+            is not ProviderTier.MASSIVE_DEVELOPER
+        ):
+            raise ValueError(
+                "Developer must remain the sole serving publisher"
+            )
         if any(
             row.kind in {
                 RealtimeWorkerKind.ADVANCED_STOCK_GATEWAY,
@@ -157,8 +173,12 @@ _GLOBAL_ASSIGNMENTS = (
 )
 
 
-def _cohort_workers(binding: TierCohortBinding) -> tuple[WorkerAssignment, ...]:
-    common = (
+def _cohort_workers(
+    binding: TierCohortBinding,
+    *,
+    detectors_enabled: bool = True,
+) -> tuple[WorkerAssignment, ...]:
+    common = [
         WorkerAssignment(
             RealtimeWorkerKind.BAR_FINALIZER,
             WorkerLane.SLOW,
@@ -171,13 +191,16 @@ def _cohort_workers(binding: TierCohortBinding) -> tuple[WorkerAssignment, ...]:
             binding.cohort_id,
             binding.provider_tier,
         ),
-        WorkerAssignment(
-            RealtimeWorkerKind.DETECTOR_RUNNER,
-            WorkerLane.SLOW,
-            binding.cohort_id,
-            binding.provider_tier,
-        ),
-    )
+    ]
+    if detectors_enabled:
+        common.append(
+            WorkerAssignment(
+                RealtimeWorkerKind.DETECTOR_RUNNER,
+                WorkerLane.SLOW,
+                binding.cohort_id,
+                binding.provider_tier,
+            )
+        )
     if binding.provider_tier is ProviderTier.MASSIVE_DEVELOPER:
         assignments = [
             WorkerAssignment(
@@ -198,7 +221,7 @@ def _cohort_workers(binding: TierCohortBinding) -> tuple[WorkerAssignment, ...]:
             )
         return (
             *assignments,
-            *common,
+            *tuple(common),
         )
     assignments = [
         WorkerAssignment(
@@ -250,7 +273,7 @@ def _cohort_workers(binding: TierCohortBinding) -> tuple[WorkerAssignment, ...]:
                 binding.options_tier,
             )
         )
-    return (*assignments, *common)
+    return (*assignments, *tuple(common))
 
 
 def build_tier_worker_plan(
@@ -265,6 +288,21 @@ def build_tier_worker_plan(
             raise ValueError("active and warming cohorts must be distinct")
         if active.provider_tier is warming.provider_tier:
             raise ValueError("warming plan must target a different provider tier")
+    if (
+        active is not None
+        and active.provider_tier is not ProviderTier.MASSIVE_DEVELOPER
+    ):
+        if warming is not None:
+            raise ValueError(
+                "Advanced rehearsal cannot have a second warming cohort"
+            )
+        warming = active
+        active = None
+    if (
+        warming is not None
+        and warming.provider_tier is not ProviderTier.MASSIVE_ADVANCED
+    ):
+        raise ValueError("warming cohort must use the Advanced tier")
     assignments = list(_GLOBAL_ASSIGNMENTS)
     if active is not None:
         assignments.extend(_cohort_workers(active))
@@ -276,11 +314,55 @@ def build_tier_worker_plan(
             publishes=True,
         ))
     if warming is not None:
-        assignments.extend(_cohort_workers(warming))
+        assignments.extend(
+            _cohort_workers(warming, detectors_enabled=False)
+        )
     return TierWorkerPlan(
         active_cohort_id=active.cohort_id if active is not None else None,
         warming_cohort_id=warming.cohort_id if warming is not None else None,
         assignments=tuple(assignments),
+    )
+
+
+def build_equity_rollout_plan(
+    mode: EquityRolloutMode,
+    *,
+    developer: TierCohortBinding | None = None,
+    advanced: TierCohortBinding | None = None,
+) -> TierWorkerPlan:
+    if not isinstance(mode, EquityRolloutMode):
+        raise TypeError("equity rollout mode is invalid")
+    if (
+        developer is not None
+        and developer.provider_tier
+        is not ProviderTier.MASSIVE_DEVELOPER
+    ):
+        raise ValueError("Developer rollout binding has the wrong tier")
+    if (
+        advanced is not None
+        and advanced.provider_tier
+        is not ProviderTier.MASSIVE_ADVANCED
+    ):
+        raise ValueError("Advanced rollout binding has the wrong tier")
+    if mode is EquityRolloutMode.DEVELOPER_ONLY:
+        if developer is None or advanced is not None:
+            raise ValueError(
+                "Developer-only mode requires only a Developer cohort"
+            )
+        return build_tier_worker_plan(active=developer)
+    if mode is EquityRolloutMode.ADVANCED_ONLY_REHEARSAL:
+        if advanced is None or developer is not None:
+            raise ValueError(
+                "Advanced-only rehearsal requires only an Advanced cohort"
+            )
+        return build_tier_worker_plan(active=None, warming=advanced)
+    if developer is None or advanced is None:
+        raise ValueError(
+            "Developer-active Advanced shadow requires both cohorts"
+        )
+    return build_tier_worker_plan(
+        active=developer,
+        warming=advanced,
     )
 
 

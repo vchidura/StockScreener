@@ -10,6 +10,9 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from psycopg2.extras import execute_values
 
 from .contracts import canonical_sha256
+from .reference_continuity import (
+    classify_reference_identity_continuity,
+)
 
 
 FIVE_MINUTES = timedelta(minutes=5)
@@ -374,6 +377,7 @@ def audit_session_close_cursor(
     eligibility_policy: SessionCloseEligibilityPolicy | None = None,
     member_limit: int = DEFAULT_MEMBER_LIMIT,
     missing_range_limit: int = DEFAULT_MISSING_RANGE_LIMIT,
+    allow_late_identity_continuity: bool = False,
 ) -> SessionCloseCoverage:
     """Audit current five-minute identities as known, without provider I/O or writes."""
     if not isinstance(cohort_id, UUID):
@@ -435,8 +439,107 @@ def audit_session_close_cursor(
     cohort_effective = _utc(cohort_effective_at, "cohort effective_at")
     if cohort_effective > session.opened_at or manifest_session > session_date:
         raise ValueError("cohort was not effective for the audited session")
+    continuity_evidence = ()
     if any(row[7] is None for row in rows):
-        raise ValueError("cohort equity security identity is incomplete")
+        if not allow_late_identity_continuity:
+            raise ValueError("cohort equity security identity is incomplete")
+        resolved_rows = []
+        evidence = []
+        for row in rows:
+            if row[7] is not None:
+                resolved_rows.append(row)
+                continue
+            cursor.execute(
+                "SELECT instrument.security_id,"
+                "prior.revision_id,prior.ticker,prior.effective_from,"
+                "prior.effective_to,prior.observed_at,prior.active,"
+                "prior.payload_sha256,"
+                "latest.revision_id,latest.ticker,latest.effective_from,"
+                "latest.effective_to,latest.observed_at,latest.active,"
+                "latest.payload_sha256 "
+                "FROM rt.instruments AS instrument "
+                "LEFT JOIN LATERAL ("
+                "SELECT revision.* FROM ref.security_revisions AS revision "
+                "WHERE revision.security_id=instrument.security_id "
+                "AND revision.observed_at<=%s "
+                "ORDER BY revision.observed_at DESC,"
+                "revision.revision_id DESC LIMIT 1"
+                ") AS prior ON true "
+                "LEFT JOIN LATERAL ("
+                "SELECT revision.* FROM ref.security_revisions AS revision "
+                "WHERE revision.security_id=instrument.security_id "
+                "AND revision.observed_at<=%s "
+                "ORDER BY revision.observed_at DESC,"
+                "revision.revision_id DESC LIMIT 1"
+                ") AS latest ON true "
+                "WHERE instrument.instrument_id=%s",
+                (session.closed_at, known, int(row[6])),
+            )
+            identity = cursor.fetchone()
+            if (
+                identity is None
+                or identity[1] is None
+                or identity[8] is None
+            ):
+                raise ValueError(
+                    "late identity continuity requires pre/post revisions"
+                )
+            prior = {
+                "revision_id": identity[1],
+                "security_id": identity[0],
+                "ticker": identity[2],
+                "effective_from": identity[3],
+                "effective_to": identity[4],
+                "observed_at": identity[5],
+                "active": identity[6],
+            }
+            latest = {
+                "revision_id": identity[8],
+                "security_id": identity[0],
+                "ticker": identity[9],
+                "effective_from": identity[10],
+                "effective_to": identity[11],
+                "observed_at": identity[12],
+                "active": identity[13],
+            }
+            mode = classify_reference_identity_continuity(
+                prior,
+                latest,
+                session.closed_at,
+            )
+            cursor.execute(
+                "SELECT count(*) FROM ref.security_revisions "
+                "WHERE security_id=%s AND observed_at>%s "
+                "AND observed_at<%s AND ticker<>%s",
+                (
+                    str(identity[0]),
+                    identity[5],
+                    identity[12],
+                    identity[9],
+                ),
+            )
+            if int(cursor.fetchone()[0]) != 0:
+                raise ValueError(
+                    "late identity continuity contains conflicting ticker evidence"
+                )
+            resolved_rows.append((*row[:7], identity[9]))
+            evidence.append((
+                int(row[6]),
+                identity[9],
+                mode,
+                str(identity[1]),
+                identity[7],
+                identity[5],
+                identity[3],
+                identity[4],
+                str(identity[8]),
+                identity[14],
+                identity[12],
+                identity[10],
+                identity[11],
+            ))
+        rows = tuple(resolved_rows)
+        continuity_evidence = tuple(sorted(evidence))
     members = tuple(
         EquityCloseMember(int(row[6]), str(row[7])) for row in rows
     )
@@ -519,7 +622,12 @@ def audit_session_close_cursor(
         for instrument_id, bar_start, bar_revision_id in coverage_rows
     )
     input_sha = canonical_sha256({
-        "version": "v2-session-close-input-v1",
+        "version": (
+            "v2-session-close-input-late-identity-v1"
+            if continuity_evidence
+            else "v2-session-close-input-v1"
+        ),
+        "identity_continuity": continuity_evidence,
         "members": input_members,
     })
     missing_rows = tuple(
@@ -551,6 +659,7 @@ def audit_session_close_cursor(
             "members": tuple(
                 (member.instrument_id, member.ticker) for member in members
             ),
+            "identity_continuity": continuity_evidence,
             "bar_starts": session.bar_starts,
         }
     )

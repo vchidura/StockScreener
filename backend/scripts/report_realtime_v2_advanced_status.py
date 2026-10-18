@@ -23,6 +23,7 @@ from realtime.database_access_v2 import (  # noqa: E402
 )
 from realtime.equity_pipeline_config import (  # noqa: E402
     RealtimeV2PipelineConfig,
+    RealtimeV2Process,
 )
 from realtime.migrations import EXPECTED_V2_DATABASE_NAME  # noqa: E402
 
@@ -37,7 +38,8 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     config = RealtimeV2PipelineConfig.from_mapping(
-        dotenv_values(args.env_file)
+        dotenv_values(args.env_file),
+        process=RealtimeV2Process.APP_WORKER,
     )
     pool = ThreadedConnectionPool(1, 1, dsn=config.app_dsn)
     provider = V2ConnectionProvider(

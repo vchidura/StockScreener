@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
-from dotenv import dotenv_values
 from psycopg2.pool import ThreadedConnectionPool
 
 
@@ -27,6 +27,7 @@ from realtime.equity_pipeline_config import (  # noqa: E402
     EquityPipeline,
     OptionsPipeline,
     RealtimeV2PipelineConfig,
+    RealtimeV2Process,
 )
 from realtime.migrations import (  # noqa: E402
     EXPECTED_V2_DATABASE_NAME,
@@ -48,6 +49,9 @@ from realtime.stage_graph import (  # noqa: E402
 from realtime.stage_orchestrator import (  # noqa: E402
     StageOrchestrator,
     StageOutcome,
+)
+from realtime.stage_runners_equity import (  # noqa: E402
+    reuse_advanced_input_ready_runner,
 )
 from realtime.stage_runners_v2 import build_runners  # noqa: E402
 from scripts.realtime_script_support import write_report  # noqa: E402
@@ -79,7 +83,6 @@ def parse_args(argv=None):
     parser.add_argument("--publish", action="store_true")
     parser.add_argument("--publication-reference", default="")
     parser.add_argument("--report-path", type=Path, required=True)
-    parser.add_argument("--env-file", type=Path, default=BACKEND_DIR / ".env")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     validate_target_database_v2(
@@ -117,6 +120,13 @@ def parse_args(argv=None):
         parser.error("--publish requires --publication-reference")
     if not args.publish and args.publication_reference.strip():
         parser.error("--publication-reference requires --publish")
+    if args.reuse_portal_receipt and not args.reuse_input_receipt:
+        parser.error("PORTAL_READY reuse requires INPUT_READY reuse")
+    if args.include_alerts or args.include_strategies or args.publish:
+        parser.error(
+            "Advanced alerts, strategies and publication remain disabled "
+            "until P11"
+        )
     stages = list(BASE_STAGES)
     if args.include_alerts:
         stages.append("STOCK_ALERTS")
@@ -207,7 +217,8 @@ def _ensure_reference_readiness(provider, repository, args):
 def main(argv=None) -> int:
     args = parse_args(argv)
     config = RealtimeV2PipelineConfig.from_mapping(
-        dotenv_values(args.env_file)
+        os.environ,
+        process=RealtimeV2Process.APP_WORKER,
     )
     if (
         config.equity_pipeline is not EquityPipeline.MASSIVE_ADVANCED
@@ -316,6 +327,11 @@ def main(argv=None) -> int:
             provider,
             build_id=ADVANCED_WINDOW_BUILD_ID,
             freeze_heap=True,
+            input_known_by=(
+                recovery.input_known_by
+                if args.reuse_input_receipt
+                else None
+            ),
         )
         runners = build_runners(
             set(args.enabled_stages),
@@ -324,26 +340,22 @@ def main(argv=None) -> int:
         )
         if args.reuse_input_receipt:
             input_receipt = recovery.input_receipt
-            runners["EQUITY_INPUT_GATE"] = (
-                lambda context: StageOutcome.complete(
-                    evidence_ref=(
-                        "durable-input-gate:"
-                        f"{context.window.cutoff.isoformat()}"
-                    )
+            if (
+                recovery.input_known_by is None
+                or recovery.input_gate_sha256 is None
+            ):
+                raise ValueError(
+                    "durable INPUT_READY recovery scope is unavailable"
                 )
+            runners["EQUITY_MATERIALIZE"] = reuse_advanced_input_ready_runner(
+                environment,
+                receipt=input_receipt,
+                input_known_by=recovery.input_known_by,
+                expected_gate_sha256=recovery.input_gate_sha256,
             )
-            runners["EQUITY_MATERIALIZE"] = (
-                lambda _context: StageOutcome.complete(
-                    receipt=input_receipt,
-                    evidence_ref=(
-                        "reused-input-ready:"
-                        f"{input_receipt.input_sha256}"
-                    ),
-                )
-            )
-        if args.reuse_portal_receipt and "PORTAL_PUBLISH" in runners:
+        if args.reuse_portal_receipt:
             portal_receipt = recovery.portal_receipt
-            runners["PORTAL_PUBLISH"] = (
+            runners["EQUITY_PROJECTION"] = (
                 lambda _context: StageOutcome.complete(
                     receipt=portal_receipt,
                     evidence_ref=(
@@ -370,6 +382,11 @@ def main(argv=None) -> int:
             "cohort_id": str(args.cohort_id),
             "cutoff": args.cutoff.isoformat(),
             "enabled_stages": args.enabled_stages,
+            "publication_mode": (
+                "COHORT_LOCAL_PORTAL_PUBLISH"
+                if args.publish
+                else "PROJECTION_ONLY"
+            ),
             "publication_advanced": args.publish,
             "provider_requests": 0,
             "credentials_exposed": False,

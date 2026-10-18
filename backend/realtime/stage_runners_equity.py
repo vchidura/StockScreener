@@ -1,6 +1,6 @@
-"""V1 compatibility and V2 split runners for canonical equity input and portal projection.
+"""V1 compatibility and V2/V3 split runners for canonical equity input and portal projection.
 
-The V1 EQUITY_EVIDENCE runner retains its combined bar-drain/projection EQUITY_CYCLE contract. V2
+The V1 EQUITY_EVIDENCE runner retains its combined bar-drain/projection EQUITY_CYCLE contract. V2/V3
 EQUITY_MATERIALIZE drains bars, completes exact per-ticker 5m finalizer jobs and seals INPUT_READY;
 EQUITY_PROJECTION consumes it and seals PORTAL_READY. Alerts can publish into the INPUT_READY release
 without waiting for projection. PORTAL_PUBLISH requires PORTAL_READY as proof but merges its snapshots
@@ -15,14 +15,15 @@ from __future__ import annotations
 
 import gc
 import logging
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import NamedTuple
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import exchange_calendars
 
 from .database_access import RealtimeDatabaseRole
 from .database_access_v2 import WriteFenceRejected
+from .advanced_scheduler import bind_advanced_input_gate_build_id
 from .contracts import canonical_sha256
 from .dashboard_repository import (
     compute_realtime_dashboard,
@@ -55,8 +56,12 @@ from .portal_projection_repository import (
 )
 from .preflight import ProviderTier
 from .runner_environment import RunnerEnvironment
+from .reference_continuity import (
+    load_reference_continuity_rows_cursor,
+)
 from .stage_database_v2 import V2StageDatabase
 from .stage_orchestrator import StageCancelled, StageContext, StageOutcome, StageRunner
+from .stage_runners_advanced_equity import advanced_input_gate_identity
 from .ticker_repository import (
     CycleRehydrationMismatch,
     compute_realtime_ticker_cycle,
@@ -72,11 +77,16 @@ PORTAL_READY = "PORTAL_READY"
 REFERENCE_GENERATION_UNAVAILABLE = "REFERENCE_GENERATION_UNAVAILABLE"
 EQUITY_CYCLE_RECEIPT_MISSING = "EQUITY_CYCLE_RECEIPT_MISSING"
 INPUT_READY_RECEIPT_MISSING = "INPUT_READY_RECEIPT_MISSING"
+INPUT_READY_REUSE_MISMATCH = "INPUT_READY_REUSE_MISMATCH"
+ADVANCED_INPUT_GATE_DIGEST_CHANGED = "ADVANCED_INPUT_GATE_DIGEST_CHANGED"
 CYCLE_REHYDRATION_MISMATCH = "CYCLE_REHYDRATION_MISMATCH"
+PUBLICATION_RECEIPT_SCOPE_MISMATCH = "PUBLICATION_RECEIPT_SCOPE_MISMATCH"
 STAGE_CANCELLED = "STAGE_CANCELLED"
 FINALIZER_INPUT_PENDING = "FINALIZER_INPUT_PENDING"
 FINALIZER_BARRIER_FAILED = "FINALIZER_BARRIER_FAILED"
 DERIVATION_FAILED = "DERIVATION_FAILED"
+
+
 def reference_generation(database: V2StageDatabase, cutoff) -> int:
     """Owner decision (2026-10-12): the generation every snapshot and receipt carries is the number
     of READY reference seed manifests created at or before the window cutoff. Monotonic, derived from
@@ -93,7 +103,24 @@ def _is_session_close(context: StageContext) -> bool:
     return context.window.cutoff == close
 
 
-def input_ready_identity(database: V2StageDatabase, *, cohort_id, cutoff, known_by, reference_generation):
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def input_ready_identity(
+    database: V2StageDatabase,
+    *,
+    cohort_id,
+    cutoff,
+    known_by,
+    reference_generation,
+    advanced_input_gate_sha256: str | None = None,
+    allow_late_identity_continuity: bool = False,
+):
     with database.transaction(read_only=True) as cursor:
         cursor.execute(
             "SELECT cohort.cohort_sha256, cohort.configuration_sha256, cohort.model_bundle_sha256, "
@@ -128,7 +155,11 @@ def input_ready_identity(database: V2StageDatabase, *, cohort_id, cutoff, known_
             "SELECT seed_id, seed_sha256, universe_sha256, source_generations "
             "FROM rt.seed_manifests WHERE status='READY' AND created_at<=%s "
             "ORDER BY created_at, seed_id",
-            (cutoff,),
+            (
+                known_by
+                if allow_late_identity_continuity
+                else cutoff,
+            ),
         )
         seeds = tuple(cursor.fetchall())
         if scope[14] == "MASSIVE_ADVANCED":
@@ -211,12 +242,44 @@ def input_ready_identity(database: V2StageDatabase, *, cohort_id, cutoff, known_
                 (str(cohort_id), cutoff),
             )
             sources = tuple(cursor.fetchall())
+    identity_continuity = ()
+    if (
+        scope[14] == "MASSIVE_DEVELOPER"
+        and len(members) != scope[8]
+        and allow_late_identity_continuity
+    ):
+        with database.transaction(
+            read_only=True,
+            dict_cursor=True,
+        ) as cursor:
+            continuity_rows, identity_continuity = (
+                load_reference_continuity_rows_cursor(
+                    cursor,
+                    manifest_id=scope[4],
+                    cutoff=cutoff,
+                    known_by=known_by,
+                )
+            )
+        members = tuple(
+            (
+                row["instrument_id"],
+                row["security_id"],
+                row["ticker"],
+                row["revision_id"],
+                row["payload_sha256"],
+            )
+            for row in continuity_rows
+        )
     if len(members) != scope[8] or len({row[0] for row in members}) != len(members):
         raise ValueError("INPUT_READY requires the exact manifest members")
     if len(seeds) != reference_generation:
         raise ValueError("INPUT_READY reference generation count changed")
     member_instruments = {row[0] for row in members}
     if scope[14] == "MASSIVE_ADVANCED":
+        if not _is_sha256(advanced_input_gate_sha256):
+            raise ValueError(
+                "INPUT_READY requires the exact Advanced input-gate digest"
+            )
         sessions = sources["stream_sessions"]
         checkpoints = sources["checkpoints"]
         gaps = sources["gaps"]
@@ -280,6 +343,10 @@ def input_ready_identity(database: V2StageDatabase, *, cohort_id, cutoff, known_
             if covered != member_instruments:
                 raise ValueError(f"INPUT_READY requires exact Advanced {interval} finalizer heads")
     else:
+        if advanced_input_gate_sha256 is not None:
+            raise ValueError(
+                "Developer INPUT_READY cannot bind an Advanced input gate"
+            )
         if {row[0] for row in sources} != member_instruments:
             raise ValueError("INPUT_READY requires one or more source watermarks for every exact manifest member")
         if any(
@@ -308,8 +375,10 @@ def input_ready_identity(database: V2StageDatabase, *, cohort_id, cutoff, known_
         "reference_generation": reference_generation,
         "scope": scope,
         "members": members,
+        "identity_continuity": identity_continuity,
         "reference_seeds": seeds,
         "sources": sources,
+        "advanced_input_gate_sha256": advanced_input_gate_sha256,
     })
     return universe_sha256, input_sha256
 
@@ -476,12 +545,23 @@ def equity_materialize_runner(environment: RunnerEnvironment) -> StageRunner:
                 )
                 if derivation_state == "FAILED":
                     return StageOutcome.failed(*derivation_reasons)
+            gate_digest = (
+                None
+                if getattr(
+                    context.plan,
+                    "stage_catalog_version",
+                    "stages_v1",
+                )
+                != "stages_v3"
+                else advanced_input_gate_identity(compute, context)
+            )
             universe_sha256, input_sha256 = input_ready_identity(
                 compute,
                 cohort_id=plan.cohort_id,
                 cutoff=window.cutoff,
                 known_by=environment.known_by(window),
                 reference_generation=generation,
+                advanced_input_gate_sha256=gate_digest,
             )
         except (StageCancelled, WriteFenceRejected):
             return StageOutcome.failed(STAGE_CANCELLED)
@@ -495,8 +575,64 @@ def equity_materialize_runner(environment: RunnerEnvironment) -> StageRunner:
             generation,
             universe_sha256=universe_sha256,
             input_sha256=input_sha256,
-            build_id=environment.build_id,
+            build_id=(
+                bind_advanced_input_gate_build_id(
+                    environment.build_id,
+                    gate_digest,
+                )
+                if gate_digest is not None
+                else environment.build_id
+            ),
         ))
+
+    return run
+
+
+def reuse_advanced_input_ready_runner(
+    environment: RunnerEnvironment,
+    *,
+    receipt: CycleReceiptSpec,
+    input_known_by,
+    expected_gate_sha256: str,
+) -> StageRunner:
+    if receipt.receipt_kind != INPUT_READY:
+        raise ValueError("Advanced input reuse requires an INPUT_READY receipt")
+    if not _is_sha256(expected_gate_sha256):
+        raise ValueError("Advanced input reuse requires an exact gate digest")
+
+    def run(context: StageContext) -> StageOutcome:
+        compute = V2StageDatabase(context, RealtimeDatabaseRole.COMPUTE)
+        try:
+            gate_digest = advanced_input_gate_identity(compute, context)
+            if gate_digest != expected_gate_sha256:
+                return StageOutcome.failed(
+                    ADVANCED_INPUT_GATE_DIGEST_CHANGED
+                )
+            universe_sha256, input_sha256 = input_ready_identity(
+                compute,
+                cohort_id=context.plan.cohort_id,
+                cutoff=context.window.cutoff,
+                known_by=input_known_by,
+                reference_generation=receipt.reference_generation,
+                advanced_input_gate_sha256=gate_digest,
+            )
+        except ValueError:
+            return StageOutcome.failed(INPUT_READY_REUSE_MISMATCH)
+        if (
+            receipt.cutoff != context.window.cutoff
+            or receipt.universe_sha256 != universe_sha256
+            or receipt.input_sha256 != input_sha256
+            or receipt.build_id
+            != bind_advanced_input_gate_build_id(
+                environment.build_id,
+                gate_digest,
+            )
+        ):
+            return StageOutcome.failed(INPUT_READY_REUSE_MISMATCH)
+        return StageOutcome.complete(
+            receipt=receipt,
+            evidence_ref=f"reused-input-ready:{input_sha256}",
+        )
 
     return run
 
@@ -544,6 +680,7 @@ class _WindowReceipt(NamedTuple):
     release: PortalReleaseReceipt
     reference_generation: int
     input_sha256: str
+    known_by: datetime
 
 
 def _window_cycle_receipt(
@@ -551,15 +688,16 @@ def _window_cycle_receipt(
     window,
     *,
     receipt_kind: str = EQUITY_CYCLE,
+    receipt_window_id: UUID | None = None,
 ) -> _WindowReceipt | None:
     with database.transaction(read_only=True, dict_cursor=True) as cursor:
         cursor.execute(
             "SELECT receipt.receipt_id, receipt.cohort_id, receipt.cutoff, receipt.universe_sha256, "
             "receipt.reference_generation, receipt.input_sha256, "
-            "window_run.provider_tier FROM rt.cycle_receipts AS receipt "
+            "window_run.provider_tier, window_run.deadline FROM rt.cycle_receipts AS receipt "
             "JOIN rt.window_runs AS window_run ON window_run.window_id = receipt.window_id "
             "WHERE receipt.window_id = %s AND receipt.receipt_kind = %s",
-            (str(window.window_id), receipt_kind),
+            (str(receipt_window_id or window.window_id), receipt_kind),
         )
         row = cursor.fetchone()
     if row is None:
@@ -567,7 +705,7 @@ def _window_cycle_receipt(
     return _WindowReceipt(
         PortalReleaseReceipt(row["receipt_id"], row["cohort_id"], ProviderTier(row["provider_tier"]),
                              row["cutoff"], row["universe_sha256"]),
-        int(row["reference_generation"]), row["input_sha256"],
+        int(row["reference_generation"]), row["input_sha256"], row["deadline"],
     )
 
 
@@ -577,7 +715,7 @@ def _window_receipt(
     *,
     receipt_kind: str = EQUITY_CYCLE,
 ) -> PortalReleaseReceipt | None:
-    """The release identity of the window's EQUITY_CYCLE receipt (what the alert and strategy stages need)."""
+    """Return the requested canonical release identity for alert or strategy work."""
     cycle_receipt = _window_cycle_receipt(database, window, receipt_kind=receipt_kind)
     return None if cycle_receipt is None else cycle_receipt.release
 
@@ -601,6 +739,9 @@ def equity_projection_runner(environment: RunnerEnvironment) -> StageRunner:
                 cutoff=window.cutoff,
                 known_by=environment.known_by(window),
                 source_generation=receipt.reference_generation,
+                allow_late_identity_continuity=(
+                    environment.allow_late_identity_continuity
+                ),
             )
         except (StageCancelled, WriteFenceRejected):
             return StageOutcome.failed(STAGE_CANCELLED)
@@ -659,7 +800,11 @@ def publish_realtime_portal_cycle_atomic(
             )
 
 
-def portal_publish_runner(environment: RunnerEnvironment) -> StageRunner:
+def portal_publish_runner(
+    environment: RunnerEnvironment,
+    *,
+    receipt_window_id: UUID | None = None,
+) -> StageRunner:
     def run(context: StageContext) -> StageOutcome:
         plan, window = context.plan, context.window
         publication = V2StageDatabase(context, RealtimeDatabaseRole.PUBLICATION)
@@ -675,15 +820,39 @@ def portal_publish_runner(environment: RunnerEnvironment) -> StageRunner:
                 receipt_kind=(
                     PORTAL_READY if is_split_graph else EQUITY_CYCLE
                 ),
+                receipt_window_id=receipt_window_id,
             )
             if projection_receipt is None:
                 return StageOutcome.failed(EQUITY_CYCLE_RECEIPT_MISSING)
             release_receipt = (
-                _window_cycle_receipt(publication, window, receipt_kind=INPUT_READY)
+                _window_cycle_receipt(
+                    publication,
+                    window,
+                    receipt_kind=INPUT_READY,
+                    receipt_window_id=receipt_window_id,
+                )
                 if is_split_graph else projection_receipt
             )
             if release_receipt is None:
                 return StageOutcome.failed(INPUT_READY_RECEIPT_MISSING)
+            if (
+                projection_receipt.release.cohort_id != plan.cohort_id
+                or projection_receipt.release.cutoff != window.cutoff
+                or projection_receipt.release.provider_tier.value
+                != getattr(
+                    window,
+                    "provider_tier",
+                    projection_receipt.release.provider_tier.value,
+                )
+                or release_receipt.release.cohort_id != plan.cohort_id
+                or release_receipt.release.cutoff != window.cutoff
+                or release_receipt.release.provider_tier
+                is not projection_receipt.release.provider_tier
+                or release_receipt.reference_generation
+                != projection_receipt.reference_generation
+                or release_receipt.known_by != projection_receipt.known_by
+            ):
+                return StageOutcome.failed(PUBLICATION_RECEIPT_SCOPE_MISMATCH)
             if context.is_cancelled():
                 return StageOutcome.failed(STAGE_CANCELLED)
             cycle = environment.handoff.peek(plan.cohort_id, window.cutoff)
@@ -696,8 +865,11 @@ def portal_publish_runner(environment: RunnerEnvironment) -> StageRunner:
                         publication, input_sha256=projection_receipt.input_sha256,
                         universe_sha256=projection_receipt.release.universe_sha256, cohort_id=plan.cohort_id,
                         session=plan.session_date, cutoff=window.cutoff,
-                        known_by=environment.known_by(window),
+                        known_by=projection_receipt.known_by,
                         source_generation=projection_receipt.reference_generation,
+                        allow_late_identity_continuity=(
+                            environment.allow_late_identity_continuity
+                        ),
                     )
                 except CycleRehydrationMismatch:
                     logger.error("portal publish: the rehydrated cycle does not match the receipt of window %s",
@@ -712,8 +884,11 @@ def portal_publish_runner(environment: RunnerEnvironment) -> StageRunner:
                     cohort_id=plan.cohort_id,
                     session=plan.session_date,
                     cutoff=window.cutoff,
-                    known_by=environment.known_by(window),
+                    known_by=projection_receipt.known_by,
                     source_generation=projection_receipt.reference_generation,
+                    allow_late_identity_continuity=(
+                        environment.allow_late_identity_continuity
+                    ),
                 )
                 if is_split_graph else None
             )

@@ -36,6 +36,7 @@ from .lineage_head import (
     assemble_lineage_head, group_head, reference_set, require_bounded_manifest, require_bounded_payload,
     revision_chain_sha256, rows_identity, workspace_set,
 )
+from .reference_continuity import reference_continuity_manifest_fields
 from .preflight import ProviderTier
 from .portal_projection import build_portal_snapshot
 from .screening_projection import RealtimeScreeningInput, produce_realtime_screening
@@ -1233,6 +1234,7 @@ def _project_realtime_ticker_workspace(
                 ),
                 history_before=inputs.history_before.isoformat(),
             )
+        source_manifest.update(reference_continuity_manifest_fields(inputs))
         require_bounded_manifest(source_manifest, name=f"Ticker workspace {security.ticker}")
         require_bounded_payload(payload, name=f"Ticker workspace {security.ticker}")
         snapshots.append(build_portal_snapshot(
@@ -1306,6 +1308,7 @@ def produce_realtime_pattern_watch_publication(inputs, snapshots):
         reference_set=reference_set(references), workspace_set=workspace_set(workspaces),
         window_policy="realtime-pattern-watch-input-v1", primary_window=300,
     )
+    manifest.update(reference_continuity_manifest_fields(inputs))
     require_bounded_manifest(manifest, name="Pattern Watch")
     return build_portal_snapshot(
         cohort_id=inputs.cohort_id, provider_tier=inputs.provider_tier,
@@ -1396,6 +1399,7 @@ def produce_realtime_ticker_workspace_summary(inputs, snapshots, charts):
         source_manifest_sha256=inputs.source_manifest_sha256,
         reference_set=reference_set(references), workspace_set=workspace_set(workspaces),
     )
+    manifest.update(reference_continuity_manifest_fields(inputs))
     require_bounded_manifest(manifest, name="Ticker Workspace summary")
     return build_portal_snapshot(
         cohort_id=inputs.cohort_id, provider_tier=inputs.provider_tier,

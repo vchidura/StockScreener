@@ -75,6 +75,8 @@ def _load_current_five_minute_facts(
         "WHERE current.cohort_id=%s AND current.instrument_id=%s "
         "AND current.interval='5m' AND current.session_scope='RTH' "
         "AND current.adjustment_basis='RAW_UNADJUSTED' "
+        "AND current.bar_start>=%s::date "
+        "AND current.bar_start<%s::date + INTERVAL '1 day' "
         "AND revision.session_date=%s AND revision.is_final "
         "AND revision.observed_at<=%s AND revision.created_at<=%s "
         "AND (revision.replay_available_at IS NULL "
@@ -85,6 +87,8 @@ def _load_current_five_minute_facts(
         (
             str(cohort_id),
             instrument_id,
+            session_date,
+            session_date,
             session_date,
             checked_at,
             checked_at,
@@ -98,6 +102,21 @@ def _load_current_five_minute_facts(
             provider_tier=ProviderTier(row["provider_tier"]),
             instrument_id=int(row["instrument_id"]),
             revision=_bar_revision(row),
+            journal_generation=(
+                UUID(str(row["journal_generation"]))
+                if row["journal_generation"] is not None
+                else None
+            ),
+            stream_session_id=(
+                UUID(str(row["stream_session_id"]))
+                if row["stream_session_id"] is not None
+                else None
+            ),
+            source_offset=(
+                int(row["source_offset"])
+                if row["source_offset"] is not None
+                else None
+            ),
         )
         for row in cursor.fetchall()
     )

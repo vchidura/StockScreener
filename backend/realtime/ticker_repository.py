@@ -34,6 +34,7 @@ from .portal_projection_repository import (
     persist_screening_generation_cursor,
     portal_session_date, publish_portal_release_cursor, session_close_snapshot,
 )
+from .reference_continuity import source_manifest_identity_cursor
 from .screening_repository import load_realtime_screening_input
 from .ticker_projection import TICKER_WORKSPACE_VERSION, TickerProjectionState, project_realtime_ticker_workspace
 from .ticker_projection import TICKER_WORKSPACE_SUMMARY_VERSION, produce_realtime_ticker_workspace_summary
@@ -749,6 +750,7 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             selected = str(entry["snapshot_id"])
         cursor.execute(
             "SELECT snapshot.*, "
+            "manifest.manifest_id AS cohort_manifest_id,"
             "manifest.manifest_sha256 AS cohort_manifest_sha256,"
             "history_binding.binding_sha256 AS history_binding_sha256 "
             "FROM " + SNAPSHOT_RELATION + " "
@@ -768,15 +770,15 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             raise ValueError("Ticker summary does not match the requested snapshot")
         self_contained = row.get("snapshot_class") == "SESSION_CLOSE"
         manifest, payload = row["source_manifest"], row["payload"]
-        expected_source_manifest_sha256 = (
-            canonical_sha256({
-                "manifest_sha256": row["cohort_manifest_sha256"],
-                "history_binding_sha256": row[
-                    "history_binding_sha256"
-                ],
-            })
-            if row["history_binding_sha256"] is not None
-            else row["cohort_manifest_sha256"]
+        expected_source_manifest_sha256, continuity_rows = (
+            source_manifest_identity_cursor(
+            cursor,
+            manifest,
+            manifest_id=row.get("cohort_manifest_id"),
+            cohort_manifest_sha256=row["cohort_manifest_sha256"],
+            history_binding_sha256=row["history_binding_sha256"],
+            cutoff=row["generated_at"],
+            )
         )
         if (
             canonical_sha256(manifest) != row["source_manifest_sha256"]
@@ -818,14 +820,27 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 raise TickerPublicationUnavailable("Ticker Workspace summary is behind current ticker publications")
         ids = [str(reference["security_id"]) for reference in payload["references"]]
         reference_cutoff = row["generated_at"] if read_mode == "retained" else cutoff
-        cursor.execute(
-            "SELECT security_id, ticker, revision_id, payload_sha256 FROM ref.security_revisions "
-            "WHERE security_id=ANY(%s::uuid[]) AND effective_from<=%s "
-            "AND (effective_to IS NULL OR effective_to>%s) AND observed_at<=%s "
-            "ORDER BY ticker, revision_id",
-            (ids, reference_cutoff, reference_cutoff, reference_cutoff),
-        )
-        current_references = [dict(item) for item in cursor.fetchall()]
+        if continuity_rows is None:
+            cursor.execute(
+                "SELECT security_id, ticker, revision_id, payload_sha256 FROM ref.security_revisions "
+                "WHERE security_id=ANY(%s::uuid[]) AND effective_from<=%s "
+                "AND (effective_to IS NULL OR effective_to>%s) AND observed_at<=%s "
+                "ORDER BY ticker, revision_id",
+                (ids, reference_cutoff, reference_cutoff, reference_cutoff),
+            )
+            current_references = [
+                dict(item) for item in cursor.fetchall()
+            ]
+        else:
+            current_references = [
+                dict(
+                    security_id=item["security_id"],
+                    ticker=item["ticker"],
+                    revision_id=item["revision_id"],
+                    payload_sha256=item["payload_sha256"],
+                )
+                for item in continuity_rows
+            ]
         expected_references = sorted(payload["references"], key=lambda item: (item["ticker"], str(item["security_revision_id"])))
         if not self_contained and not _reference_set_matches(expected_references, current_references):
             raise TickerPublicationUnavailable("Ticker Workspace summary reference identity changed; republish required")
@@ -985,6 +1000,7 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             statement = (
                 "SELECT snapshot.snapshot_id, snapshot.payload_sha256, snapshot.source_manifest_sha256, "
                 "snapshot.generated_at, snapshot.provider_tier, snapshot.source_generation, "
+                "manifest.manifest_id AS cohort_manifest_id, "
                 "manifest.manifest_sha256 AS cohort_manifest_sha256, "
                 "history_binding.binding_sha256 AS history_binding_sha256, "
                 "snapshot.source_manifest->'reference' AS reference, "
@@ -994,7 +1010,10 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 "snapshot.source_manifest->>'history_binding_sha256' "
                 "AS manifest_history_binding_sha256, "
                 "snapshot.source_manifest->>'provider_tier' AS manifest_provider_tier, "
-                "(snapshot.source_manifest->>'source_generation')::integer AS manifest_source_generation "
+                "(snapshot.source_manifest->>'source_generation')::integer AS manifest_source_generation, "
+                "snapshot.source_manifest->>'identity_continuity_sha256' "
+                "AS manifest_identity_continuity_sha256, "
+                "snapshot.source_manifest->>'known_by' AS manifest_known_by "
                 "FROM " + SNAPSHOT_RELATION + " "
                 "JOIN rt.cohorts AS cohort ON cohort.cohort_id=snapshot.cohort_id "
                 "JOIN rt.subscription_manifests AS manifest ON manifest.manifest_id=cohort.manifest_id "
@@ -1018,17 +1037,25 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             if str(row["snapshot_id"]) != selected:
                 raise ValueError("Ticker publication does not match the requested snapshot")
             reference = row["reference"]
-            expected_source_manifest_sha256 = (
-                canonical_sha256({
-                    "manifest_sha256": row[
+            continuity_manifest = {
+                "identity_continuity_sha256": row.get(
+                    "manifest_identity_continuity_sha256"
+                ),
+                "known_by": row.get("manifest_known_by"),
+            }
+            expected_source_manifest_sha256, continuity_rows = (
+                source_manifest_identity_cursor(
+                    cursor,
+                    continuity_manifest,
+                    manifest_id=row.get("cohort_manifest_id"),
+                    cohort_manifest_sha256=row[
                         "cohort_manifest_sha256"
                     ],
-                    "history_binding_sha256": row[
+                    history_binding_sha256=row[
                         "history_binding_sha256"
                     ],
-                })
-                if row["history_binding_sha256"] is not None
-                else row["cohort_manifest_sha256"]
+                    cutoff=row["generated_at"],
+                )
             )
             if (
                 row["manifest_version"] != TICKER_WORKSPACE_VERSION
@@ -1043,14 +1070,21 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             ):
                 raise ValueError("Ticker stored publication identity drift")
             reference_cutoff = row["generated_at"] if read_mode == "retained" else cutoff
-            cursor.execute(
-                "SELECT revision_id, payload_sha256 FROM ref.security_revisions "
-                "WHERE security_id=%s AND ticker=%s AND effective_from<=%s "
-                "AND (effective_to IS NULL OR effective_to>%s) AND observed_at<=%s "
-                "ORDER BY effective_from DESC, observed_at DESC, revision_id",
-                (str(reference["security_id"]), symbol, reference_cutoff, reference_cutoff, reference_cutoff),
-            )
-            references = cursor.fetchall()
+            if continuity_rows is None:
+                cursor.execute(
+                    "SELECT revision_id, payload_sha256 FROM ref.security_revisions "
+                    "WHERE security_id=%s AND ticker=%s AND effective_from<=%s "
+                    "AND (effective_to IS NULL OR effective_to>%s) AND observed_at<=%s "
+                    "ORDER BY effective_from DESC, observed_at DESC, revision_id",
+                    (str(reference["security_id"]), symbol, reference_cutoff, reference_cutoff, reference_cutoff),
+                )
+                references = cursor.fetchall()
+            else:
+                references = tuple(
+                    continuity
+                    for continuity in continuity_rows
+                    if continuity["ticker"] == symbol
+                )
             if not _reference_matches(reference, references):
                 raise TickerPublicationUnavailable("Ticker reference identity changed; republish required")
             if read_mode == "retained":
@@ -1102,6 +1136,7 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             self._begin(cursor)
             statement = (
                 "SELECT snapshot.*, "
+                "manifest.manifest_id AS cohort_manifest_id,"
                 "manifest.manifest_sha256 AS cohort_manifest_sha256,"
                 "history_binding.binding_sha256 "
                 "AS history_binding_sha256 "
@@ -1127,17 +1162,19 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             if str(row["snapshot_id"]) != str(snapshot_id):
                 raise ValueError("Ticker payload does not match its selected snapshot")
             manifest, payload = row["source_manifest"], row["payload"]
-            expected_source_manifest_sha256 = (
-                canonical_sha256({
-                    "manifest_sha256": row[
+            expected_source_manifest_sha256, continuity_rows = (
+                source_manifest_identity_cursor(
+                    cursor,
+                    manifest,
+                    manifest_id=row.get("cohort_manifest_id"),
+                    cohort_manifest_sha256=row[
                         "cohort_manifest_sha256"
                     ],
-                    "history_binding_sha256": row[
+                    history_binding_sha256=row[
                         "history_binding_sha256"
                     ],
-                })
-                if row["history_binding_sha256"] is not None
-                else row["cohort_manifest_sha256"]
+                    cutoff=row["generated_at"],
+                )
             )
             if (
                 canonical_sha256(manifest) != row["source_manifest_sha256"]
@@ -1154,14 +1191,21 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 raise ValueError("Ticker stored publication identity/checksum drift")
             reference = manifest["reference"]
             reference_cutoff = row["generated_at"] if read_mode == "retained" else cutoff
-            cursor.execute(
-                "SELECT revision_id, payload_sha256 FROM ref.security_revisions "
-                "WHERE security_id=%s AND ticker=%s AND effective_from<=%s "
-                "AND (effective_to IS NULL OR effective_to>%s) AND observed_at<=%s "
-                "ORDER BY effective_from DESC, observed_at DESC, revision_id",
-                (str(reference["security_id"]), symbol, reference_cutoff, reference_cutoff, reference_cutoff),
-            )
-            references = cursor.fetchall()
+            if continuity_rows is None:
+                cursor.execute(
+                    "SELECT revision_id, payload_sha256 FROM ref.security_revisions "
+                    "WHERE security_id=%s AND ticker=%s AND effective_from<=%s "
+                    "AND (effective_to IS NULL OR effective_to>%s) AND observed_at<=%s "
+                    "ORDER BY effective_from DESC, observed_at DESC, revision_id",
+                    (str(reference["security_id"]), symbol, reference_cutoff, reference_cutoff, reference_cutoff),
+                )
+                references = cursor.fetchall()
+            else:
+                references = tuple(
+                    continuity
+                    for continuity in continuity_rows
+                    if continuity["ticker"] == symbol
+                )
             if not _reference_matches(reference, references):
                 raise TickerPublicationUnavailable("Ticker reference identity changed; republish required")
             cursor.execute(

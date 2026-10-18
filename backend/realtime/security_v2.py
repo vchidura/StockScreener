@@ -118,10 +118,19 @@ def apply_database_security_v2(connection, roles: RoleNamesV2) -> None:
                 sql.Identifier(schema_name), sql.Identifier(owner)))
         cursor.execute(
             "SELECT n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE n.nspname IN ('ref', 'rt') AND c.relkind IN ('r', 'p', 'S') ORDER BY 1, 2")
+            "WHERE n.nspname IN ('ref', 'rt') "
+            "AND c.relkind IN ('r', 'p', 'v', 'm', 'S') ORDER BY 1, 2")
         for schema_name, object_name, kind in cursor.fetchall():
             cursor.execute(sql.SQL("ALTER {} {}.{} OWNER TO {}").format(
-                sql.SQL("SEQUENCE" if kind == "S" else "TABLE"), sql.Identifier(schema_name),
+                sql.SQL(
+                    "SEQUENCE"
+                    if kind == "S"
+                    else "MATERIALIZED VIEW"
+                    if kind == "m"
+                    else "VIEW"
+                    if kind == "v"
+                    else "TABLE"
+                ), sql.Identifier(schema_name),
                 sql.Identifier(object_name), sql.Identifier(owner)))
         cursor.execute(
             "SELECT p.oid::regprocedure::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
@@ -250,7 +259,9 @@ def audit_database_security_v2(connection, roles: RoleNamesV2) -> list[tuple[str
                 cursor.execute(
                     "SELECT n.nspname || '.' || c.relname, has_table_privilege(%s, c.oid, %s) FROM pg_class c "
                     "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                    "WHERE n.nspname IN ('ref','rt') AND c.relkind IN ('r','p') AND NOT c.relispartition",
+                    "WHERE n.nspname IN ('ref','rt') "
+                    "AND c.relkind IN ('r','p','v','m') "
+                    "AND NOT c.relispartition",
                     (role, privilege))
                 for relation, has_privilege in cursor.fetchall():
                     wanted = suffix in expected.get(relation, {}).get(privilege, ())
@@ -264,7 +275,8 @@ def audit_database_security_v2(connection, roles: RoleNamesV2) -> list[tuple[str
         results.append(("no_public_table_privileges", "PASS" if cursor.fetchone()[0] == 0 else "FAIL"))
         cursor.execute(
             "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE n.nspname IN ('ref','rt') AND c.relkind IN ('r','p','S') "
+            "WHERE n.nspname IN ('ref','rt') "
+            "AND c.relkind IN ('r','p','v','m','S') "
             "AND pg_get_userbyid(c.relowner) <> %s", (roles.name(ADMIN_ROLE),))
         results.append(("all_relations_owned_by_admin", "PASS" if cursor.fetchone()[0] == 0 else "FAIL"))
 

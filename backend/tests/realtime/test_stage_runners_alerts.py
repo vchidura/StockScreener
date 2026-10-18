@@ -33,6 +33,34 @@ def test_alerts_runner_fails_without_the_equity_cycle_receipt_and_computes_nothi
     assert outcome.state == "FAILED" and outcome.reason_codes == (runners.EQUITY_CYCLE_RECEIPT_MISSING,)
 
 
+@pytest.mark.parametrize("catalog_version", ["stages_v2", "stages_v3"])
+def test_split_catalog_alerts_require_input_ready(
+    monkeypatch,
+    catalog_version,
+):
+    monkeypatch.setattr(
+        runners,
+        "compute_realtime_stock_alerts",
+        lambda *a, **k: pytest.fail("no receipt"),
+    )
+    context = _context("STOCK_ALERTS")
+    context = replace(
+        context,
+        plan=SimpleNamespace(
+            cohort_id=context.plan.cohort_id,
+            session_date=SESSION,
+            stage_catalog_version=catalog_version,
+        ),
+        database=_Database([None]),
+    )
+    outcome = runners.stock_alerts_runner(
+        RunnerEnvironment(None)
+    )(context)
+    assert outcome.reason_codes == (
+        runners.INPUT_READY_RECEIPT_MISSING,
+    )
+
+
 def test_alerts_runner_blocks_without_a_ready_reference_generation(monkeypatch):
     monkeypatch.setattr(runners, "compute_realtime_stock_alerts", lambda *a, **k: pytest.fail("no generation"))
     context, database = _ready_context(generation=0)
@@ -142,6 +170,29 @@ def test_strategy_runner_fails_without_the_equity_cycle_receipt(monkeypatch):
     monkeypatch.setattr(runners, "materialize_due_realtime_strategies", lambda *a, **k: pytest.fail("no receipt"))
     outcome = runners.strategy_publish_runner(RunnerEnvironment(None))(_strategy_context(row=False))
     assert outcome.state == "FAILED" and outcome.reason_codes == (runners.EQUITY_CYCLE_RECEIPT_MISSING,)
+
+
+def test_v3_strategy_runner_requires_input_ready(monkeypatch):
+    monkeypatch.setattr(
+        runners,
+        "materialize_due_realtime_strategies",
+        lambda *a, **k: pytest.fail("no receipt"),
+    )
+    context = _strategy_context(row=False)
+    context = replace(
+        context,
+        plan=SimpleNamespace(
+            cohort_id=context.plan.cohort_id,
+            session_date=SESSION,
+            stage_catalog_version="stages_v3",
+        ),
+    )
+    outcome = runners.strategy_publish_runner(
+        RunnerEnvironment(None)
+    )(context)
+    assert outcome.reason_codes == (
+        runners.INPUT_READY_RECEIPT_MISSING,
+    )
 
 
 def test_strategy_runner_publishes_one_interval_at_a_time_under_both_roles(monkeypatch):

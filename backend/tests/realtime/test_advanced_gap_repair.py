@@ -164,9 +164,8 @@ def test_sealed_payload_replay_is_provider_free():
 def test_cold_start_plans_only_the_eight_missing_target9_members(monkeypatch):
     cursor = MagicMock()
     cohort = UUID("66666666-6666-6666-6666-666666666666")
-    cursor.fetchone.side_effect = (
-        (cohort, 9, 8, 80_000),
-        ("BACKFILL_PLANNED", "MISSING_RAW_1M", "RESERVE_MISSING_RAW_1M"),
+    cursor.fetchone.return_value = (
+        cohort, 9, NOW.date(), 8, 80_000, None
     )
     missing = tuple(
         {
@@ -236,9 +235,8 @@ def test_two_session_cold_start_has_exact_sixteen_request_scopes(
 ):
     cursor = MagicMock()
     cohort = UUID("77777777-7777-7777-7777-777777777777")
-    cursor.fetchone.side_effect = (
-        (cohort, 9, 16, 160_000),
-        ("BACKFILL_PLANNED", "MISSING_RAW_1M", "RESERVE_MISSING_RAW_1M"),
+    cursor.fetchone.return_value = (
+        cohort, 9, NOW.date(), 16, 160_000, None
     )
     sessions = (NOW.date(), (NOW + timedelta(days=1)).date())
     plans = []
@@ -284,14 +282,16 @@ def test_two_session_cold_start_has_exact_sixteen_request_scopes(
     assert plan.request_ceiling == 16
 
 
-def test_backfill_release_is_cohort_local_and_enters_wait_next_session():
+def test_backfill_release_uses_canonical_cohort_local_release_only():
     cursor = MagicMock()
     cohort = UUID("88888888-8888-8888-8888-888888888888")
     backfill = UUID("99999999-9999-9999-9999-999999999999")
-    cursor.fetchone.side_effect = (
-        (cohort, "BACKFILL_COMPLETE"),
-        (0,),
-        (backfill,),
+    cursor.fetchone.return_value = (
+        cohort,
+        NOW.date(),
+        UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        NOW,
+        "d" * 64,
     )
 
     release_id = publish_cohort_local_backfill_release_cursor(
@@ -305,12 +305,10 @@ def test_backfill_release_is_cohort_local_and_enters_wait_next_session():
     assert release_id
     inserts = [
         call for call in cursor.execute.call_args_list
-        if "INSERT INTO rt.advanced_backfill_releases" in call.args[0]
+        if "INSERT INTO rt.portal_releases" in call.args[0]
     ]
     assert len(inserts) == 1
-    assert "platform_pointer_advanced" in inserts[0].args[0]
-    updates = [
-        call for call in cursor.execute.call_args_list
-        if "UPDATE rt.advanced_backfill_runs SET state" in call.args[0]
-    ]
-    assert updates[-1].args[1][0] == "WAIT_NEXT_SESSION"
+    assert all(
+        "portal_release_current" not in call.args[0]
+        for call in cursor.execute.call_args_list
+    )

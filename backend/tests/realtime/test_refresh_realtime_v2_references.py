@@ -1,4 +1,5 @@
 import importlib
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,12 @@ BASE = [
     "stocks_realtime_v2",
     "--session-date",
     "2026-10-15",
+    "--authorized-until",
+    "2026-10-19T00:00:00+00:00",
+    "--provider-authorization-reference",
+    "provider-plan",
+    "--expected-cost",
+    "unapproved",
 ]
 
 
@@ -24,8 +31,11 @@ def test_reference_refresh_requires_canonical_exact_scope_and_authorization():
         "--authorization-reference",
         "approved",
     ]).execute
-    with pytest.raises(SystemExit):
-        script.parse_args([*BASE[:-1], "2026-10-14"])
+    assert script.parse_args([
+        *BASE[:BASE.index("2026-10-15")],
+        "2026-10-16",
+        *BASE[BASE.index("2026-10-15") + 1:],
+    ]).session_date.isoformat() == "2026-10-16"
 
 
 def test_reference_transport_has_global_ceiling_and_pacing():
@@ -52,3 +62,18 @@ def test_reference_transport_has_global_ceiling_and_pacing():
     assert len(calls) == 2 and sleeps == [0.25]
     with pytest.raises(RuntimeError, match="ceiling"):
         transport.get("https://api.massive.com/c", {}, {})
+
+
+def test_reference_transport_rechecks_authorization_after_pacing():
+    delegate = SimpleNamespace(
+        get=lambda *_args, **_kwargs: pytest.fail("provider call")
+    )
+    now = datetime(2026, 10, 18, tzinfo=timezone.utc)
+    transport = script.PacedAccountingReferenceTransport(
+        delegate,
+        authorized_until=now,
+        utc_clock=lambda: now + timedelta(seconds=1),
+    )
+
+    with pytest.raises(RuntimeError, match="authorization expired"):
+        transport.get("https://api.massive.com/a", {}, {})

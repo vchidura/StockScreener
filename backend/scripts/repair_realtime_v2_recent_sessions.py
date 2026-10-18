@@ -19,12 +19,18 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from options.data.polygon_http import RequestsPolygonHttpTransport  # noqa: E402
+from realtime.contracts import EQUITY_VALIDATION_UNIVERSE  # noqa: E402
 from realtime.database_access_v2 import API_ROLE, APP_ROLE, V2AccessConfig, V2ConnectionProvider  # noqa: E402
+from realtime.equity_validation_source import EquityValidationIdentity  # noqa: E402
 from realtime.equity_recent_repair import (  # noqa: E402
     NativeRepairPlan, execute_recent_native_repair, recent_completed_sessions,
     validate_native_repair_budget, AuthorizedNativeRepairTransport,
 )
 from realtime.migrations import EXPECTED_V2_DATABASE_NAME, validate_target_database_v2  # noqa: E402
+from realtime.reference_continuity import (  # noqa: E402
+    classify_reference_identity_continuity,
+)
+from realtime.ticker_projection import _security  # noqa: E402
 from scripts.realtime_script_support import PacedPolygonTransport, write_report  # noqa: E402
 from scripts.run_realtime_v2_developer_window import _load_scope  # noqa: E402
 
@@ -34,6 +40,112 @@ def _repair_identity_cutoff(session: date) -> datetime:
     return calendar.session_close(session.isoformat()).to_pydatetime()
 
 
+def _load_scope_with_identity_continuity(
+    provider,
+    cohort_id,
+    cutoff,
+    *,
+    known_by,
+):
+    with provider.transaction(APP_ROLE, read_only=True, dict_cursor=True) as unit:
+        cursor = unit.cursor
+        cursor.execute(
+            "SELECT instrument.instrument_id,instrument.security_id "
+            "FROM rt.cohorts AS cohort "
+            "JOIN rt.subscription_members AS member USING(manifest_id) "
+            "JOIN rt.instruments AS instrument USING(instrument_id) "
+            "WHERE cohort.cohort_id=%s AND member.channel='AM' "
+            "AND instrument.asset_class='EQUITY' "
+            "ORDER BY instrument.instrument_id",
+            (str(cohort_id),),
+        )
+        members = tuple(cursor.fetchall())
+        identities = []
+        evidence = []
+        for member in members:
+            cursor.execute(
+                "SELECT revision.*,revision.revision_id "
+                "AS security_revision_id "
+                "FROM ref.security_revisions AS revision "
+                "WHERE revision.security_id=%s "
+                "AND revision.observed_at<=%s "
+                "ORDER BY revision.observed_at DESC,"
+                "revision.revision_id DESC LIMIT 1",
+                (str(member["security_id"]), cutoff),
+            )
+            prior = cursor.fetchone()
+            cursor.execute(
+                "SELECT revision.*,revision.revision_id "
+                "AS security_revision_id "
+                "FROM ref.security_revisions AS revision "
+                "WHERE revision.security_id=%s "
+                "AND revision.observed_at<=%s "
+                "ORDER BY revision.observed_at DESC,"
+                "revision.revision_id DESC LIMIT 1",
+                (str(member["security_id"]), known_by),
+            )
+            latest = cursor.fetchone()
+            if prior is None or latest is None:
+                raise ValueError(
+                    "late identity continuity requires pre/post revisions"
+                )
+            mode = classify_reference_identity_continuity(
+                prior,
+                latest,
+                cutoff,
+            )
+            cursor.execute(
+                "SELECT count(*) FROM ref.security_revisions "
+                "WHERE security_id=%s AND observed_at>%s "
+                "AND observed_at<%s AND ticker<>%s",
+                (
+                    str(member["security_id"]),
+                    prior["observed_at"],
+                    latest["observed_at"],
+                    latest["ticker"],
+                ),
+            )
+            if int(cursor.fetchone()["count"]) != 0:
+                raise ValueError(
+                    "late identity continuity contains conflicting ticker evidence"
+                )
+            selected = prior if mode == "DIRECT_AT_CUTOFF" else latest
+            identities.append(
+                EquityValidationIdentity(
+                    selected["ticker"],
+                    _security(selected),
+                    int(member["instrument_id"]),
+                )
+            )
+            evidence.append((
+                int(member["instrument_id"]),
+                selected["ticker"],
+                mode,
+                str(prior["revision_id"]),
+                prior["payload_sha256"],
+                prior["observed_at"],
+                prior["effective_from"],
+                prior["effective_to"],
+                str(latest["revision_id"]),
+                latest["payload_sha256"],
+                latest["observed_at"],
+                latest["effective_from"],
+                latest["effective_to"],
+            ))
+    by_ticker = {row.ticker: row for row in identities}
+    if set(by_ticker) != set(EQUITY_VALIDATION_UNIVERSE.equity_tickers):
+        raise ValueError("late identity continuity is not the exact nine-name universe")
+    evidence_by_instrument = {row[0]: row for row in evidence}
+    ordered = tuple(
+        by_ticker[ticker]
+        for ticker in EQUITY_VALIDATION_UNIVERSE.equity_tickers
+    )
+    return ordered, tuple(
+        evidence_by_instrument[row.instrument_id]
+        for row in ordered
+    )
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
@@ -41,6 +153,12 @@ def parse_args(argv=None):
     parser.add_argument("--cohort-id", type=UUID, required=True)
     parser.add_argument("--through-session", type=date.fromisoformat, required=True)
     parser.add_argument("--repair-sessions", type=int, required=True)
+    parser.add_argument(
+        "--interval",
+        action="append",
+        choices=("1m", "5m", "15m", "30m"),
+        dest="intervals",
+    )
     parser.add_argument("--authorized-until", type=datetime.fromisoformat, required=True)
     parser.add_argument("--maximum-provider-requests", type=int, required=True)
     parser.add_argument("--maximum-response-bytes", type=int, required=True)
@@ -50,6 +168,10 @@ def parse_args(argv=None):
     parser.add_argument("--authorization-reference", required=True)
     parser.add_argument("--provider-authorization-reference", required=True)
     parser.add_argument("--expected-cost", required=True)
+    parser.add_argument(
+        "--allow-late-identity-continuity",
+        action="store_true",
+    )
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -67,6 +189,9 @@ def parse_args(argv=None):
         ))
     ):
         parser.error("repair scope, aware deadline, pacing and authorization are required")
+    args.intervals = tuple(
+        dict.fromkeys(args.intervals or ("5m", "15m", "30m"))
+    )
     args.report_path = args.report_path.resolve()
     if args.report_path.exists():
         parser.error("repair report must be new")
@@ -92,12 +217,27 @@ def main(argv=None):
             args.through_session, args.repair_sessions, known_by=now
         )
         if args.execute:
-            identities, _ = _load_scope(
-                provider,
-                args.cohort_id,
-                _repair_identity_cutoff(sessions[-1]),
-            )
+            cutoff = _repair_identity_cutoff(sessions[-1])
+            try:
+                identities, _ = _load_scope(
+                    provider,
+                    args.cohort_id,
+                    cutoff,
+                )
+                identity_continuity = ()
+            except ValueError:
+                if not args.allow_late_identity_continuity:
+                    raise
+                identities, identity_continuity = (
+                    _load_scope_with_identity_continuity(
+                        provider,
+                        args.cohort_id,
+                        cutoff,
+                        known_by=now,
+                    )
+                )
         else:
+            identity_continuity = ()
             with provider.transaction(API_ROLE, read_only=True) as unit:
                 unit.cursor.execute(
                     "SELECT manifest.stock_count FROM rt.cohorts cohort "
@@ -110,10 +250,11 @@ def main(argv=None):
             requests_required = validate_native_repair_budget(
                 int(row[0]), len(sessions), args.maximum_provider_requests,
                 args.maximum_response_bytes, args.response_byte_limit,
+                native_intervals=args.intervals,
             )
             report = {
                 "mode": "PLAN", "sessions": [str(value) for value in sessions],
-                "native_intervals": ["5m", "15m", "30m"],
+                "native_intervals": list(args.intervals),
                 "requests_required": requests_required, "provider_requests": 0,
                 "database_writes": 0, "adjusted_history": "RETAINED_ONLY",
                 "release_advanced": False,
@@ -126,6 +267,8 @@ def main(argv=None):
             args.maximum_provider_requests, args.maximum_response_bytes,
             args.response_byte_limit, args.authorization_reference,
             args.provider_authorization_reference, args.expected_cost,
+            args.intervals,
+            identity_continuity,
         )
         api_key = os.getenv("POLYGON_API_KEY", "").strip()
         if not api_key:

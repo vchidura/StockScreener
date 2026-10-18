@@ -19,6 +19,7 @@ from .portal_projection_repository import (
     RELEASE_CLASS_SESSION_CLOSE, RETENTION_HOT_AND_KEPT, persist_portal_snapshot_cursor,
     portal_session_date, publish_portal_release_cursor,
 )
+from .reference_continuity import source_manifest_identity_cursor
 from .screening_repository import load_realtime_screening_input
 from .worker_database import RealtimeProcessDatabase
 
@@ -105,7 +106,8 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                     raise DashboardPublicationUnavailable("Dashboard has no retained publication for this cohort")
                 pinned = str(entry["snapshot_id"])
             cursor.execute(
-                "SELECT snapshot.*, manifest.manifest_sha256 AS cohort_manifest_sha256, "
+                "SELECT snapshot.*, manifest.manifest_id AS cohort_manifest_id, "
+                "manifest.manifest_sha256 AS cohort_manifest_sha256, "
                 "manifest.stock_count, history_binding.binding_sha256 AS history_binding_sha256 "
                 "FROM " + SNAPSHOT_RELATION + " "
                 "JOIN rt.cohorts AS cohort ON cohort.cohort_id=snapshot.cohort_id "
@@ -127,17 +129,17 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                 raise DashboardPublicationUnavailable("Dashboard has no retained publication for this cohort")
             manifest, payload = stored["source_manifest"], stored["payload"]
             tickers, references = payload["tickers"], payload["references"]
-            expected_source_manifest_sha256 = (
-                canonical_sha256({
-                    "manifest_sha256": stored[
-                        "cohort_manifest_sha256"
-                    ],
-                    "history_binding_sha256": stored[
-                        "history_binding_sha256"
-                    ],
-                })
-                if stored["history_binding_sha256"] is not None
-                else stored["cohort_manifest_sha256"]
+            expected_source_manifest_sha256, _ = source_manifest_identity_cursor(
+                cursor,
+                manifest,
+                manifest_id=stored.get("cohort_manifest_id"),
+                cohort_manifest_sha256=stored[
+                    "cohort_manifest_sha256"
+                ],
+                history_binding_sha256=stored[
+                    "history_binding_sha256"
+                ],
+                cutoff=stored["generated_at"],
             )
             if (
                 canonical_sha256(manifest) != stored["source_manifest_sha256"]

@@ -57,6 +57,9 @@ def test_advanced_five_minute_sources_keep_their_provider_identity():
         "supersedes_revision_id": None,
         "payload_sha256": "a" * 64,
         "quality_codes": (),
+        "journal_generation": None,
+        "stream_session_id": None,
+        "source_offset": None,
     }]
 
     facts = _load_current_five_minute_facts(
@@ -71,6 +74,7 @@ def test_advanced_five_minute_sources_keep_their_provider_identity():
     assert facts[0].cohort_id == COHORT_ID
     assert facts[0].provider_tier is ProviderTier.MASSIVE_ADVANCED
     assert facts[0].revision.source_kind is BarSourceKind.DERIVED
+    assert "current.bar_start>=%s::date" in cursor.execute.call_args.args[0]
     output = _output_fact(
         facts[0],
         build_id=ADVANCED_DERIVATION_BUILD_ID,

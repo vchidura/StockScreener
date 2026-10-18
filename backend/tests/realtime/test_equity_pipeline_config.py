@@ -6,6 +6,7 @@ from realtime.equity_pipeline_config import (
     EquityPipeline,
     OptionsPipeline,
     RealtimeV2PipelineConfig,
+    RealtimeV2Process,
 )
 
 POLICY = (
@@ -82,3 +83,93 @@ def test_developer_pipeline_does_not_activate_advanced_runtime_values():
     assert config.equity_pipeline is EquityPipeline.MASSIVE_DEVELOPER
     assert config.advanced_journal_dir is None
     assert config.advanced_ingress_policy_path is None
+
+
+@pytest.mark.parametrize(
+    ("process", "required", "absent"),
+    (
+        (
+            RealtimeV2Process.CONTROLLER,
+            {
+                "REALTIME_V2_APP_DSN",
+                "POLYGON_API_KEY",
+                "REALTIME_V2_ADVANCED_JOURNAL_DIR",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_VERSION",
+            },
+            {"REALTIME_V2_API_DSN"},
+        ),
+        (
+            RealtimeV2Process.BRIDGE,
+            {
+                "REALTIME_V2_APP_DSN",
+                "REALTIME_V2_ADVANCED_JOURNAL_DIR",
+            },
+            {
+                "REALTIME_V2_API_DSN",
+                "POLYGON_API_KEY",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_VERSION",
+            },
+        ),
+        (
+            RealtimeV2Process.SCHEDULER,
+            {
+                "REALTIME_V2_APP_DSN",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_VERSION",
+            },
+            {
+                "REALTIME_V2_API_DSN",
+                "POLYGON_API_KEY",
+                "REALTIME_V2_ADVANCED_JOURNAL_DIR",
+            },
+        ),
+        (
+            RealtimeV2Process.APP_WORKER,
+            {"REALTIME_V2_APP_DSN"},
+            {
+                "REALTIME_V2_API_DSN",
+                "POLYGON_API_KEY",
+                "REALTIME_V2_ADVANCED_JOURNAL_DIR",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_VERSION",
+            },
+        ),
+        (
+            RealtimeV2Process.API,
+            {"REALTIME_V2_API_DSN"},
+            {
+                "REALTIME_V2_APP_DSN",
+                "POLYGON_API_KEY",
+                "REALTIME_V2_ADVANCED_JOURNAL_DIR",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_VERSION",
+            },
+        ),
+    ),
+)
+def test_process_configuration_requires_only_owned_secrets(
+    process,
+    required,
+    absent,
+):
+    settings = _advanced()
+    for name in absent:
+        settings.pop(name)
+
+    config = RealtimeV2PipelineConfig.from_mapping(
+        settings,
+        process=process,
+    )
+
+    assert config.process is process
+    assert (config.app_dsn is not None) == (
+        "REALTIME_V2_APP_DSN" in required
+    )
+    assert (config.api_dsn is not None) == (
+        "REALTIME_V2_API_DSN" in required
+    )
+    assert (config.massive_api_key is not None) == (
+        "POLYGON_API_KEY" in required
+    )

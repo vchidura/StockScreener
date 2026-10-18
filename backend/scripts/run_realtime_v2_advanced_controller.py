@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -14,7 +15,6 @@ from pathlib import Path
 from random import Random
 from uuid import UUID
 
-from dotenv import dotenv_values
 from psycopg2.pool import ThreadedConnectionPool
 
 
@@ -61,6 +61,7 @@ from realtime.equity_pipeline_config import (  # noqa: E402
     EquityPipeline,
     OptionsPipeline,
     RealtimeV2PipelineConfig,
+    RealtimeV2Process,
 )
 from realtime.migrations import (  # noqa: E402
     EXPECTED_V2_DATABASE_NAME,
@@ -107,12 +108,8 @@ def parse_args(argv=None):
     parser.add_argument("--startup-request-ceiling", type=int)
     parser.add_argument("--startup-decoded-bytes", type=int)
     parser.add_argument("--startup-expected-cost")
-    parser.add_argument(
-        "--env-file",
-        type=Path,
-        default=BACKEND_DIR / ".env",
-    )
     parser.add_argument("--debug-single-session", action="store_true")
+    parser.add_argument("--external-ingress", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     validate_target_database_v2(
@@ -122,9 +119,6 @@ def parse_args(argv=None):
     )
     if args.database != EXPECTED_V2_DATABASE_NAME:
         parser.error("Advanced controller targets only stocks_realtime_v2")
-    args.env_file = args.env_file.resolve()
-    if not args.env_file.is_file():
-        parser.error("--env-file must exist")
     if not args.execute:
         parser.error("Advanced controller requires --execute")
     args.budgets = AdvancedIngressBudgets(
@@ -157,6 +151,8 @@ def parse_args(argv=None):
 
 
 def _provider(config):
+    if config.app_dsn is None:
+        raise ValueError("Advanced controller app DSN is unavailable")
     pool = ThreadedConnectionPool(
         1,
         4,
@@ -182,6 +178,138 @@ def _read_child_report(path: Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError("Advanced ingress child report is invalid")
     return value
+
+
+def _backfill_delays_live(backfill, *, now: datetime, warmup_at: datetime) -> bool:
+    if now >= warmup_at:
+        return False
+    return bool(
+        backfill.work
+        or backfill.state in {"BACKFILL_BLOCKED", "WAIT_NEXT_SESSION"}
+    )
+
+
+def _recovery_blocks_reconnect(recovery_gate) -> bool:
+    return bool(
+        recovery_gate.registered
+        or recovery_gate.writing
+        or recovery_gate.quarantined
+    )
+
+
+def _allocate_runtime_paths(
+    journal_root: Path,
+    *,
+    plan_id: UUID,
+    session_date,
+    connection_attempt: int,
+) -> tuple[Path, Path, int]:
+    for runtime_path_attempt in range(1, 1_001):
+        try:
+            journal_path, report_path = _derived_runtime_paths(
+                journal_root,
+                plan_id=plan_id,
+                session_date=session_date,
+                connection_attempt=connection_attempt,
+                runtime_path_attempt=runtime_path_attempt,
+            )
+        except RuntimeError:
+            continue
+        return journal_path, report_path, runtime_path_attempt
+    raise RuntimeError("Advanced ingress runtime path attempts are exhausted")
+
+
+def _load_child_evidence(provider, plan_id, connection_attempt):
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        unit.cursor.execute(
+            "SELECT session.status,session.failure_code,"
+            "session.started_at,session.ended_at,registry.status,"
+            "registry.quarantine_reason "
+            "FROM rt.stream_sessions AS session "
+            "LEFT JOIN rt.advanced_journal_registry AS registry "
+            "ON registry.journal_generation=session.journal_generation "
+            "WHERE session.advanced_ingress_plan_id=%s "
+            "AND session.connection_attempt=%s "
+            "ORDER BY session.owner_epoch DESC LIMIT 1",
+            (str(plan_id), connection_attempt),
+        )
+        row = unit.cursor.fetchone()
+    if row is None:
+        return None
+    return {
+        "session_status": str(row[0]),
+        "failure_code": str(row[1]) if row[1] is not None else None,
+        "started_at": row[2],
+        "ended_at": row[3],
+        "journal_status": str(row[4]) if row[4] is not None else None,
+        "quarantine_reason": (
+            str(row[5]) if row[5] is not None else None
+        ),
+    }
+
+
+def _classify_child_result(
+    *,
+    return_code: int,
+    intentional: bool,
+    report: dict[str, object] | None,
+    durable: dict[str, object] | None,
+    stderr: str,
+    checked_at: datetime,
+):
+    if return_code == 0 and (
+        report is not None
+        and str(report.get("status") or "").upper() == "STOPPED"
+        or durable is not None
+        and durable.get("session_status") == "STOPPED"
+        and durable.get("journal_status") in {"DRAINING", "DRAINED"}
+    ):
+        return None
+    failure_code = (
+        str(report.get("failure_code") or "")
+        if report is not None
+        else ""
+    )
+    if not failure_code and durable is not None:
+        failure_code = str(durable.get("failure_code") or "")
+        if not failure_code and durable.get("quarantine_reason"):
+            failure_code = (
+                f"JOURNAL_{durable['quarantine_reason']}"
+            )
+    if not failure_code:
+        failure_code = f"CHILD_EXIT_{return_code}"
+    detail_parts = []
+    if report is not None and report.get("failure_detail"):
+        detail_parts.append(str(report["failure_detail"]))
+    if durable is not None:
+        detail_parts.append(
+            "durable="
+            f"{durable.get('session_status')}/"
+            f"{durable.get('journal_status')}"
+        )
+    if stderr:
+        detail_parts.append(stderr[-160:])
+    live_seconds = (
+        float(report.get("live_seconds") or 0)
+        if report is not None
+        else 0.0
+    )
+    if (
+        live_seconds == 0
+        and durable is not None
+        and durable.get("started_at") is not None
+    ):
+        ended_at = durable.get("ended_at") or checked_at
+        live_seconds = max(
+            0.0,
+            (ended_at - durable["started_at"]).total_seconds(),
+        )
+    return classify_advanced_ingress_failure(
+        failure_code,
+        detail="; ".join(detail_parts),
+        live_seconds=live_seconds,
+        intentional_shutdown=intentional,
+    )
 
 
 def _run_child(
@@ -215,7 +343,12 @@ def _run_child(
     return process.returncode, intentional, stdout, stderr
 
 
-def _child_command(args, plan_id: UUID) -> list[str]:
+def _child_command(
+    args,
+    plan_id: UUID,
+    *,
+    runtime_path_attempt: int = 1,
+) -> list[str]:
     return [
         sys.executable,
         "-B",
@@ -230,8 +363,8 @@ def _child_command(args, plan_id: UUID) -> list[str]:
         args.confirm_database_name,
         "--ingress-plan-id",
         str(plan_id),
-        "--env-file",
-        str(args.env_file),
+        "--runtime-path-attempt",
+        str(runtime_path_attempt),
         "--execute",
     ]
 
@@ -249,7 +382,8 @@ def _record_terminal(provider, plan_id, outcome, checked_at):
 def main(argv=None) -> int:
     args = parse_args(argv)
     config = RealtimeV2PipelineConfig.from_mapping(
-        dotenv_values(args.env_file)
+        os.environ,
+        process=RealtimeV2Process.CONTROLLER,
     )
     if (
         config.equity_pipeline is not EquityPipeline.MASSIVE_ADVANCED
@@ -363,10 +497,11 @@ def main(argv=None) -> int:
                             next_action="WAIT_FOR_NEXT_XNYS_SESSION",
                             checked_at=now,
                         )
-                if backfill.work or backfill.state == "BACKFILL_BLOCKED":
-                    stop.wait(settings.bridge_poll_interval_seconds)
-                    continue
-                if backfill.state == "WAIT_NEXT_SESSION":
+                if _backfill_delays_live(
+                    backfill,
+                    now=now,
+                    warmup_at=warmup_at,
+                ):
                     stop.wait(settings.bridge_poll_interval_seconds)
                     continue
             if now < warmup_at:
@@ -462,7 +597,15 @@ def main(argv=None) -> int:
                         now,
                     )
                     break
-                if recovery_gate.registered or recovery_gate.draining:
+                if _recovery_blocks_reconnect(recovery_gate):
+                    if recovery_gate.quarantined:
+                        _record_terminal(
+                            provider,
+                            plan.plan_id,
+                            "BLOCKED_CONFIGURATION",
+                            now,
+                        )
+                        break
                     stop.wait(settings.bridge_poll_interval_seconds)
                     continue
                 with provider.transaction(APP_ROLE, read_only=True) as unit:
@@ -470,7 +613,14 @@ def main(argv=None) -> int:
                         unit.cursor,
                         plan.plan_id,
                     )
-                _, child_report_path = _derived_runtime_paths(
+                if args.external_ingress:
+                    stop.wait(settings.bridge_poll_interval_seconds)
+                    continue
+                (
+                    _journal_path,
+                    child_report_path,
+                    runtime_path_attempt,
+                ) = _allocate_runtime_paths(
                     journal_root,
                     plan_id=plan.plan_id,
                     session_date=plan.session_date,
@@ -484,7 +634,11 @@ def main(argv=None) -> int:
                     _stdout,
                     stderr,
                 ) = _run_child(
-                    _child_command(args, plan.plan_id),
+                    _child_command(
+                        args,
+                        plan.plan_id,
+                        runtime_path_attempt=runtime_path_attempt,
+                    ),
                     stop=stop,
                     deadline=drain_deadline,
                     poll_seconds=settings.ingress_poll_interval_seconds,
@@ -499,18 +653,26 @@ def main(argv=None) -> int:
                             _now(),
                         )
                     break
-                report = _read_child_report(child_report_path)
-                if return_code == 0:
+                try:
+                    report = _read_child_report(child_report_path)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    report = None
+                durable = _load_child_evidence(
+                    provider,
+                    plan.plan_id,
+                    runtime_scope.next_connection_attempt,
+                )
+                failure = _classify_child_result(
+                    return_code=return_code,
+                    intentional=intentional,
+                    report=report,
+                    durable=durable,
+                    stderr=stderr,
+                    checked_at=_now(),
+                )
+                if failure is None:
                     stop.wait(settings.bridge_poll_interval_seconds)
                     continue
-                failure = classify_advanced_ingress_failure(
-                    str(report.get("failure_code") or "UNKNOWN_FAILURE"),
-                    detail=str(
-                        report.get("failure_detail")
-                        or stderr[-160:]
-                    ),
-                    live_seconds=float(report.get("live_seconds") or 0),
-                )
                 if (
                     failure.disposition
                     is IngressFailureDisposition.TERMINAL

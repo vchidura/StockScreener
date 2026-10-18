@@ -28,6 +28,77 @@ class AdvancedJournalProgress:
     event_time_watermark: datetime | None = None
 
 
+class BoundedAsyncProgressReporter:
+    def __init__(
+        self,
+        callback: Callable[[AdvancedJournalProgress], None],
+    ) -> None:
+        if not callable(callback):
+            raise TypeError("Advanced progress callback is invalid")
+        self._callback = callback
+        self._condition = threading.Condition()
+        self._pending: AdvancedJournalProgress | None = None
+        self._stopping = False
+        self._thread: threading.Thread | None = None
+        self._failure_count = 0
+        self._last_failure_name: str | None = None
+
+    @property
+    def failure_count(self) -> int:
+        with self._condition:
+            return self._failure_count
+
+    @property
+    def last_failure_name(self) -> str | None:
+        with self._condition:
+            return self._last_failure_name
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("Advanced progress reporter is already started")
+        self._thread = threading.Thread(
+            target=self._run,
+            name="advanced-journal-status-reporter",
+            daemon=False,
+        )
+        self._thread.start()
+
+    def publish(self, progress: AdvancedJournalProgress) -> None:
+        if not isinstance(progress, AdvancedJournalProgress):
+            raise TypeError("Advanced journal progress is invalid")
+        with self._condition:
+            if self._thread is None or self._stopping:
+                return
+            self._pending = progress
+            self._condition.notify()
+
+    def stop(self, timeout: float | None = None) -> None:
+        if self._thread is None:
+            return
+        with self._condition:
+            self._stopping = True
+            self._condition.notify()
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise TimeoutError("Advanced progress reporter did not stop")
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None and not self._stopping:
+                    self._condition.wait()
+                if self._pending is None and self._stopping:
+                    return
+                progress = self._pending
+                self._pending = None
+            try:
+                self._callback(progress)
+            except Exception as error:
+                with self._condition:
+                    self._failure_count += 1
+                    self._last_failure_name = type(error).__name__
+
+
 class AdvancedEquityJournalPump:
     def __init__(
         self,

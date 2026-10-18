@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import UUID
 
 from .advanced_ingress_plan import (
     ADVANCED_INGRESS_TERMINAL_OUTCOMES,
@@ -213,123 +213,6 @@ def activate_advanced_runtime_profile_cursor(
         str(row[3]),
         "ACTIVE",
     )
-
-
-def bind_advanced_ingress_cohort_cursor(
-    cursor,
-    *,
-    session_date,
-    universe_target: int,
-    runtime_profile_sha256: str,
-    cohort_id: UUID,
-    authorized_end_at: datetime,
-    approval_reference: str,
-) -> UUID:
-    approval = approval_reference.strip()
-    if not approval:
-        raise ValueError("cohort binding approval reference cannot be blank")
-    cursor.execute(
-        "SELECT runtime_profile_version,configuration_sha256,"
-        "runtime_policy_sha256,status "
-        "FROM rt.advanced_ingress_runtime_profiles "
-        "WHERE runtime_profile_sha256=%s FOR UPDATE",
-        (runtime_profile_sha256,),
-    )
-    profile = cursor.fetchone()
-    if profile is None or profile[3] != "ACTIVE":
-        raise ValueError("cohort binding requires an ACTIVE runtime profile")
-    cursor.execute(
-        "SELECT cohort.manifest_id,manifest.session_date,"
-        "manifest.stock_count,COUNT(member.instrument_id),"
-        "COUNT(member.instrument_id) FILTER (WHERE member.channel='AM'),"
-        "capability.provider_tier,capability.status,"
-        "capability.expires_at,capability.config_sha256,"
-        "cohort.configuration_sha256 "
-        "FROM rt.cohorts AS cohort "
-        "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
-        "JOIN rt.capability_profiles AS capability USING(profile_id) "
-        "LEFT JOIN rt.subscription_members AS member USING(manifest_id) "
-        "WHERE cohort.cohort_id=%s "
-        "GROUP BY cohort.manifest_id,manifest.session_date,"
-        "manifest.stock_count,capability.provider_tier,"
-        "capability.status,capability.expires_at,"
-        "capability.config_sha256,cohort.configuration_sha256",
-        (str(cohort_id),),
-    )
-    identity = cursor.fetchone()
-    if (
-        identity is None
-        or identity[1] != session_date
-        or int(identity[2]) != universe_target
-        or int(identity[3]) != universe_target
-        or int(identity[4]) != universe_target
-        or identity[5] != "MASSIVE_ADVANCED"
-        or identity[6] != "PASS"
-        or identity[7] < authorized_end_at
-        or str(identity[8]) != str(profile[1])
-        or str(identity[9]) != str(profile[1])
-    ):
-        raise ValueError("cohort binding scope is not exact and eligible")
-    manifest_id = UUID(str(identity[0]))
-    binding_identity = {
-        "contract": "advanced-ingress-cohort-binding-v1",
-        "session_date": session_date,
-        "universe_target": universe_target,
-        "runtime_profile_sha256": runtime_profile_sha256,
-        "configuration_sha256": str(profile[1]),
-        "runtime_policy_sha256": str(profile[2]),
-        "cohort_id": cohort_id,
-        "manifest_id": manifest_id,
-        "approval_reference": approval,
-    }
-    binding_id = uuid5(
-        NAMESPACE_URL,
-        "stockscreener:advanced-ingress-cohort-binding:"
-        f"{canonical_sha256(binding_identity)}",
-    )
-    cursor.execute(
-        "SELECT binding_id,cohort_id,manifest_id "
-        "FROM rt.advanced_ingress_cohort_bindings "
-        "WHERE session_date=%s AND universe_target=%s "
-        "AND runtime_profile_sha256=%s "
-        "AND runtime_policy_sha256=%s AND status='ACTIVE' FOR UPDATE",
-        (
-            session_date,
-            universe_target,
-            runtime_profile_sha256,
-            str(profile[2]),
-        ),
-    )
-    existing = cursor.fetchone()
-    if existing is not None:
-        if (
-            str(existing[0]) != str(binding_id)
-            or str(existing[1]) != str(cohort_id)
-            or str(existing[2]) != str(manifest_id)
-        ):
-            raise ValueError(
-                "another cohort is already bound to this exact plan scope"
-            )
-        return binding_id
-    cursor.execute(
-        "INSERT INTO rt.advanced_ingress_cohort_bindings ("
-        "binding_id,session_date,universe_target,runtime_profile_sha256,"
-        "configuration_sha256,runtime_policy_sha256,cohort_id,manifest_id,"
-        "approval_reference,status) VALUES ("
-        "%s,%s,%s,%s,%s,%s,%s,%s,%s,'ACTIVE')",
-        (
-            str(binding_id),
-            session_date,
-            universe_target,
-            runtime_profile_sha256,
-            str(profile[1]),
-            str(profile[2]),
-            str(cohort_id),
-            str(manifest_id),
-            approval,
-        ),
-    )
-    return binding_id
 
 
 def _authorization_from_row(row) -> AdvancedStreamAuthorization:
@@ -610,33 +493,11 @@ def resolve_advanced_ingress_plan_cursor(
         (UUID(str(row[0])), UUID(str(row[1])))
         for row in cursor.fetchall()
     )
-    cursor.execute(
-        "SELECT cohort_id,manifest_id "
-        "FROM rt.advanced_ingress_cohort_bindings "
-        "WHERE session_date=%s AND universe_target=%s "
-        "AND runtime_profile_sha256=%s "
-        "AND configuration_sha256=%s "
-        "AND runtime_policy_sha256=%s AND status='ACTIVE' "
-        "ORDER BY binding_id",
-        (
-            request.session_date,
-            request.universe_target,
-            source_profile.sha256,
-            configuration_sha256,
-            runtime_policy_sha256,
-        ),
-    )
-    bindings = tuple(
-        (UUID(str(row[0])), UUID(str(row[1])))
-        for row in cursor.fetchall()
-    )
-    if len(bindings) > 1:
-        raise AdvancedCohortResolutionError("COHORT_AMBIGUOUS")
-    if bindings:
+    if request.preferred_cohort_id is not None:
         candidates = tuple(
             candidate
             for candidate in candidates
-            if candidate == bindings[0]
+            if candidate[0] == request.preferred_cohort_id
         )
     if not candidates:
         raise AdvancedCohortResolutionError("COHORT_NOT_PROVISIONED")
@@ -647,6 +508,7 @@ def resolve_advanced_ingress_plan_cursor(
         authorization=authorization,
         cohort_id=cohort_id,
         manifest_id=manifest_id,
+        cohort_selection_reference=request.cohort_selection_reference,
         session_date=request.session_date,
         universe_target=request.universe_target,
         runtime_profile_version=source_profile.version,
@@ -718,7 +580,8 @@ def prepare_advanced_ingress_plan_cursor(
     cursor.execute(
         "INSERT INTO rt.advanced_ingress_plans ("
         "plan_id,plan_sha256,authorization_id,"
-        "authorization_scope_sha256,cohort_id,manifest_id,session_date,"
+        "authorization_scope_sha256,cohort_id,manifest_id,"
+        "cohort_selection_reference,session_date,"
         "universe_target,mode,runtime_profile_sha256,"
         "runtime_profile_version,configuration_sha256,"
         "runtime_policy_sha256,authorized_start_at,authorized_end_at,"
@@ -727,7 +590,7 @@ def prepare_advanced_ingress_plan_cursor(
         "maximum_rest_repair_decoded_bytes,status"
         ") VALUES ("
         "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-        "%s,%s,%s,%s,%s,'READY')",
+        "%s,%s,%s,%s,%s,%s,'READY')",
         (
             str(plan.plan_id),
             plan.plan_sha256,
@@ -735,6 +598,7 @@ def prepare_advanced_ingress_plan_cursor(
             plan.authorization_scope_sha256,
             str(plan.cohort_id),
             str(plan.manifest_id),
+            plan.cohort_selection_reference,
             plan.session_date,
             plan.universe_target,
             plan.mode,

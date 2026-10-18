@@ -1,7 +1,6 @@
-"""Advanced gap evidence, authorized repair and cold-start backfill contracts."""
+"""Advanced gap evidence and repair on canonical V2 ledgers/orchestration."""
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -21,15 +20,14 @@ from .acquisition_ledger import (
     load_raw_payload_cursor,
     persist_raw_payload_cursor,
 )
-from .contracts import canonical_sha256
-from .gap_repair_plan import plan_gap_repair_cursor
+from .contracts import canonical_json, canonical_sha256
 from .equity_interval_derivation import derive_realtime_interval_facts
+from .gap_repair_plan import plan_gap_repair_cursor
 from .provider_budget import (
     ProviderBudgetExceeded,
     ProviderBudgetScope,
     reserve_coordinated_provider_request_cursor,
 )
-from .session_close_coverage import five_minute_session
 
 
 class GapContinuity(str, Enum):
@@ -150,19 +148,18 @@ def classify_gap_continuity(
         classification = GapContinuity.PROVIDER_TIME_OUTAGE
     else:
         classification = GapContinuity.UNKNOWN_CONTINUITY
-    classification_sha256 = canonical_sha256({
+    return classification, canonical_sha256({
         "contract": "advanced-gap-continuity-v1",
         "evidence": evidence,
         "classification": classification.value,
     })
-    return classification, classification_sha256
 
 
 def record_gap_reconnect_evidence_cursor(
     cursor,
     evidence: GapReconnectEvidence,
 ) -> GapContinuity:
-    classification, classification_sha256 = classify_gap_continuity(evidence)
+    classification, digest = classify_gap_continuity(evidence)
     cursor.execute(
         "UPDATE rt.stream_gaps SET gap_end=%s,reconnect_at=%s,"
         "first_post_reconnect_event_at=%s,"
@@ -176,7 +173,7 @@ def record_gap_reconnect_evidence_cursor(
             evidence.first_post_reconnect_event_at,
             evidence.first_post_reconnect_offset,
             classification.value,
-            classification_sha256,
+            digest,
             str(evidence.gap_id),
             str(evidence.prior_journal_generation),
         ),
@@ -210,15 +207,15 @@ def record_first_post_reconnect_event_cursor(
     return record_gap_reconnect_evidence_cursor(
         cursor,
         GapReconnectEvidence(
-            gap_id=UUID(str(row[0])),
-            prior_journal_generation=UUID(str(row[1])),
-            reconnect_journal_generation=reconnect_journal_generation,
-            disconnect_at=row[2],
-            reconnect_at=row[3],
-            last_durable_offset=int(row[4]),
-            first_post_reconnect_offset=first_offset,
-            last_durable_watermark=row[5],
-            first_post_reconnect_event_at=first_event_at,
+            UUID(str(row[0])),
+            UUID(str(row[1])),
+            reconnect_journal_generation,
+            row[2],
+            row[3],
+            int(row[4]),
+            first_offset,
+            row[5],
+            first_event_at,
         ),
     )
 
@@ -230,41 +227,16 @@ def attach_gap_dependencies_cursor(
     *,
     blocked_at: datetime,
 ) -> None:
-    checked = _utc(blocked_at, "blocked_at")
-    for window_id in tuple(sorted(set(window_ids), key=str)):
-        cursor.execute(
-            "INSERT INTO rt.advanced_gap_dependencies ("
-            "gap_id,window_id,status,blocked_at) "
-            "VALUES (%s,%s,'BLOCKED',%s) ON CONFLICT DO NOTHING",
-            (str(gap_id), str(window_id), checked),
-        )
-
-
-def _open_gap_alert_cursor(
-    cursor,
-    gap_id: UUID,
-    *,
-    reason_code: str,
-    checked_at: datetime,
-) -> UUID:
-    reason = reason_code.strip().upper()
-    alert_id = uuid5(
-        NAMESPACE_URL,
-        f"stockscreener:advanced-gap-alert:{gap_id}:{reason}",
-    )
+    # Canonical window/stage state owns the block. The gap remains the evidence.
     cursor.execute(
-        "INSERT INTO rt.advanced_gap_alerts ("
-        "alert_id,gap_id,reason_code,severity,status,created_at) "
-        "VALUES (%s,%s,%s,'CRITICAL','OPEN',%s) "
-        "ON CONFLICT (gap_id) DO NOTHING",
+        "UPDATE rt.window_runs SET state='RETAINED_GAP',updated_at=%s "
+        "WHERE window_id=ANY(%s::uuid[]) "
+        "AND state IN ('PENDING','FAILED','MISSED')",
         (
-            str(alert_id),
-            str(gap_id),
-            reason,
-            _utc(checked_at, "checked_at"),
+            _utc(blocked_at, "blocked_at"),
+            [str(value) for value in sorted(set(window_ids), key=str)],
         ),
     )
-    return alert_id
 
 
 def plan_advanced_gap_repair_cursor(
@@ -303,7 +275,7 @@ def plan_advanced_gap_repair_cursor(
     plan_id = UUID(str(row[0]))
     ticker = str(row[5] or "ALL")
     scope = {
-        "contract": "advanced-gap-repair-v1",
+        "contract": "advanced-gap-repair-v2",
         "gap_id": gap_id,
         "plan_id": plan_id,
         "allocation_kind": allocation_kind,
@@ -324,44 +296,29 @@ def plan_advanced_gap_repair_cursor(
         and int(row[7]) >= reserved_response_bytes
     )
     status = "PLANNED" if authorized else "BLOCKED"
-    reason_code = None if authorized else (
+    reason = None if authorized else (
         "NO_TRADE_EVIDENCE"
         if row[4] == GapContinuity.NO_TRADE_INTERVAL.value
         else "REPAIR_UNAUTHORIZED"
     )
     cursor.execute(
-        "INSERT INTO rt.advanced_gap_repairs ("
-        "repair_id,gap_id,plan_id,allocation_kind,instrument_id,ticker,"
-        "requested_from,requested_to,scope_sha256,reserved_response_bytes,"
-        "status,reason_code) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-        "ON CONFLICT (repair_id) DO NOTHING",
+        "UPDATE rt.stream_gaps SET repair_id=%s,repair_scope_sha256=%s,"
+        "repair_reserved_response_bytes=%s,repair_status=%s,"
+        "operator_alert_required=%s "
+        "WHERE gap_id=%s AND recovery_status='UNRESOLVED' "
+        "AND (repair_id IS NULL OR repair_id=%s) RETURNING gap_id",
         (
             str(repair_id),
-            str(gap_id),
-            str(plan_id),
-            allocation_kind,
-            row[1],
-            ticker,
-            row[2],
-            row[3],
             scope_sha256,
             reserved_response_bytes,
             status,
-            reason_code,
+            not authorized,
+            str(gap_id),
+            str(repair_id),
         ),
     )
-    if not authorized:
-        cursor.execute(
-            "UPDATE rt.stream_gaps SET operator_alert_required=true "
-            "WHERE gap_id=%s",
-            (str(gap_id),),
-        )
-        _open_gap_alert_cursor(
-            cursor,
-            gap_id,
-            reason_code=reason_code,
-            checked_at=datetime.now(timezone.utc),
-        )
+    if cursor.fetchone() is None:
+        raise ValueError("gap repair plan conflicts with durable gap state")
     return AdvancedGapRepairPlan(
         repair_id,
         gap_id,
@@ -374,7 +331,7 @@ def plan_advanced_gap_repair_cursor(
         scope_sha256,
         reserved_response_bytes,
         status,
-        reason_code,
+        reason,
     )
 
 
@@ -394,14 +351,14 @@ def reserve_advanced_gap_repair_cursor(
         "plan.maximum_rest_repair_decoded_bytes,"
         "plan.authorized_end_at,auth.authorization_reference,"
         "usage.rest_repair_request_count,"
-        "usage.rest_repair_decoded_byte_count,repair.status,"
-        "repair.request_id "
-        "FROM rt.advanced_gap_repairs AS repair "
+        "usage.rest_repair_decoded_byte_count,gap.repair_status,"
+        "gap.repair_reference "
+        "FROM rt.stream_gaps AS gap "
         "JOIN rt.advanced_ingress_plans AS plan USING(plan_id) "
         "JOIN rt.advanced_stream_authorizations AS auth "
         "USING(authorization_id) "
         "JOIN rt.advanced_ingress_plan_usage AS usage USING(plan_id) "
-        "WHERE repair.repair_id=%s FOR UPDATE OF repair,plan,usage",
+        "WHERE gap.repair_id=%s FOR UPDATE OF gap,plan,usage",
         (str(repair.repair_id),),
     )
     row = cursor.fetchone()
@@ -416,20 +373,9 @@ def reserve_advanced_gap_repair_cursor(
         or int(row[7]) + repair.reserved_response_bytes > int(row[3])
     ):
         cursor.execute(
-            "UPDATE rt.advanced_gap_repairs SET status='BLOCKED',"
-            "reason_code='REPAIR_BUDGET_EXHAUSTED' WHERE repair_id=%s",
+            "UPDATE rt.stream_gaps SET repair_status='BLOCKED',"
+            "operator_alert_required=true WHERE repair_id=%s",
             (str(repair.repair_id),),
-        )
-        cursor.execute(
-            "UPDATE rt.stream_gaps SET operator_alert_required=true "
-            "WHERE gap_id=%s",
-            (str(repair.gap_id),),
-        )
-        _open_gap_alert_cursor(
-            cursor,
-            repair.gap_id,
-            reason_code="REPAIR_BUDGET_EXHAUSTED",
-            checked_at=reserved_at,
         )
         raise ProviderBudgetExceeded("advanced repair budget is exhausted")
     request_id = uuid5(
@@ -447,19 +393,18 @@ def reserve_advanced_gap_repair_cursor(
         lanes=frozenset({ProviderRequestLane.EQUITY_HISTORY}),
         authorized_until=row[4],
     )
-    reservation = ProviderRequestReservation(
-        request_id,
-        scope.account_alias,
-        ProviderRequestLane.EQUITY_HISTORY,
-        "ADVANCED_HISTORICAL_1M",
-        repair.scope_sha256,
-        _utc(reserved_at, "reserved_at"),
-        cohort_id=UUID(str(row[1])),
-    )
     reserve_coordinated_provider_request_cursor(
         cursor,
         scope,
-        reservation,
+        ProviderRequestReservation(
+            request_id,
+            scope.account_alias,
+            ProviderRequestLane.EQUITY_HISTORY,
+            "ADVANCED_HISTORICAL_1M",
+            repair.scope_sha256,
+            _utc(reserved_at, "reserved_at"),
+            cohort_id=UUID(str(row[1])),
+        ),
         reserved_response_bytes=repair.reserved_response_bytes,
     )
     cursor.execute(
@@ -475,13 +420,9 @@ def reserve_advanced_gap_repair_cursor(
         ),
     )
     cursor.execute(
-        "UPDATE rt.advanced_gap_repairs SET status='RESERVED',"
-        "request_id=%s,reserved_at=%s WHERE repair_id=%s",
-        (
-            str(request_id),
-            _utc(reserved_at, "reserved_at"),
-            str(repair.repair_id),
-        ),
+        "UPDATE rt.stream_gaps SET repair_status='RESERVED',"
+        "repair_reference=%s WHERE repair_id=%s",
+        (str(request_id), str(repair.repair_id)),
     )
     return request_id
 
@@ -497,8 +438,9 @@ def seal_advanced_repair_payload_cursor(
         raise ValueError("advanced repair payload must be nonempty bytes")
     sealed = _utc(sealed_at, "sealed_at")
     cursor.execute(
-        "SELECT request_id,requested_from,requested_to,status "
-        "FROM rt.advanced_gap_repairs WHERE repair_id=%s FOR UPDATE",
+        "SELECT repair_reference,gap_start,"
+        "COALESCE(gap_end,reconnect_at),repair_status "
+        "FROM rt.stream_gaps WHERE repair_id=%s FOR UPDATE",
         (str(repair_id),),
     )
     row = cursor.fetchone()
@@ -510,21 +452,6 @@ def seal_advanced_repair_payload_cursor(
         body,
         arrived_at=sealed,
         request_id=request_id,
-    )
-    digest = hashlib.sha256(body).hexdigest()
-    cursor.execute(
-        "INSERT INTO rt.advanced_repair_payloads ("
-        "payload_id,repair_id,request_id,payload_sha256,payload_bytes,"
-        "body,sealed_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-        (
-            str(payload_id),
-            str(repair_id),
-            str(request_id),
-            digest,
-            len(body),
-            body,
-            sealed,
-        ),
     )
     finish_provider_request_cursor(
         cursor,
@@ -546,9 +473,9 @@ def seal_advanced_repair_payload_cursor(
         ),
     )
     cursor.execute(
-        "UPDATE rt.advanced_gap_repairs SET status='SEALED',"
-        "sealed_payload_id=%s,sealed_at=%s WHERE repair_id=%s",
-        (str(payload_id), sealed, str(repair_id)),
+        "UPDATE rt.stream_gaps SET repair_status='SEALED' "
+        "WHERE repair_id=%s",
+        (str(repair_id),),
     )
     return payload_id
 
@@ -558,20 +485,18 @@ def load_sealed_advanced_repair_payload_cursor(
     repair_id: UUID,
 ) -> bytes:
     cursor.execute(
-        "SELECT payload_id,body,payload_sha256 "
-        "FROM rt.advanced_repair_payloads WHERE repair_id=%s",
+        "SELECT request.payload_id "
+        "FROM rt.stream_gaps AS gap "
+        "JOIN rt.provider_request_ledger AS request "
+        "ON request.request_id=gap.repair_reference "
+        "WHERE gap.repair_id=%s AND gap.repair_status "
+        "IN ('SEALED','REPLAYED','VERIFIED','REPAIRED')",
         (str(repair_id),),
     )
     row = cursor.fetchone()
-    if row is None:
+    if row is None or row[0] is None:
         raise ValueError("sealed advanced repair payload is unavailable")
-    body = bytes(row[1])
-    if hashlib.sha256(body).hexdigest() != row[2]:
-        raise ValueError("sealed advanced repair payload checksum mismatch")
-    stored = load_raw_payload_cursor(cursor, UUID(str(row[0])))
-    if stored != body:
-        raise ValueError("sealed payload stores disagree")
-    return body
+    return load_raw_payload_cursor(cursor, UUID(str(row[0])))
 
 
 def verify_and_close_gap_repair_cursor(
@@ -581,10 +506,9 @@ def verify_and_close_gap_repair_cursor(
     checked_at: datetime,
 ) -> str:
     cursor.execute(
-        "SELECT repair.gap_id,repair.plan_id,repair.instrument_id,"
-        "repair.requested_from,repair.requested_to,repair.status "
-        "FROM rt.advanced_gap_repairs AS repair "
-        "WHERE repair.repair_id=%s FOR UPDATE",
+        "SELECT gap_id,plan_id,instrument_id,gap_start,"
+        "COALESCE(gap_end,reconnect_at),repair_status "
+        "FROM rt.stream_gaps WHERE repair_id=%s FOR UPDATE",
         (str(repair_id),),
     )
     repair = cursor.fetchone()
@@ -611,12 +535,7 @@ def verify_and_close_gap_repair_cursor(
         "AND current.session_scope='RTH' "
         "AND current.adjustment_basis='RAW_UNADJUSTED' "
         "AND revision.is_final GROUP BY current.interval",
-        (
-            str(repair[1]),
-            int(repair[2]),
-            repair[3],
-            repair[4],
-        ),
+        (str(repair[1]), int(repair[2]), repair[3], repair[4]),
     )
     counts = {str(interval): int(count) for interval, count in cursor.fetchall()}
     if counts.get("1m", 0) != expected_1m or (
@@ -629,28 +548,11 @@ def verify_and_close_gap_repair_cursor(
         "requested_to": repair[4],
         "counts": counts,
     })
-    checked = _utc(checked_at, "checked_at")
-    cursor.execute(
-        "UPDATE rt.advanced_gap_repairs SET status='REPAIRED',"
-        "canonical_coverage_sha256=%s,verified_at=%s,repaired_at=%s "
-        "WHERE repair_id=%s",
-        (coverage_sha256, checked, checked, str(repair_id)),
-    )
     cursor.execute(
         "UPDATE rt.stream_gaps SET recovery_status='REPAIRED',"
-        "repair_reference=%s,operator_alert_required=false "
-        "WHERE gap_id=%s",
-        (str(repair_id), str(repair[0])),
-    )
-    cursor.execute(
-        "UPDATE rt.advanced_gap_dependencies SET status='RELEASED',"
-        "released_at=%s WHERE gap_id=%s AND status='BLOCKED'",
-        (checked, str(repair[0])),
-    )
-    cursor.execute(
-        "UPDATE rt.advanced_gap_alerts SET status='RESOLVED',resolved_at=%s "
-        "WHERE gap_id=%s AND status='OPEN'",
-        (checked, str(repair[0])),
+        "repair_status='REPAIRED',canonical_coverage_sha256=%s,"
+        "operator_alert_required=false WHERE repair_id=%s",
+        (coverage_sha256, str(repair_id)),
     )
     return coverage_sha256
 
@@ -674,9 +576,9 @@ def plan_advanced_cold_start_cursor(
     ):
         raise ValueError("cold-start backfill scope is invalid")
     cursor.execute(
-        "SELECT cohort_id,universe_target,"
-        "maximum_rest_repair_requests,maximum_rest_repair_decoded_bytes "
-        "FROM rt.advanced_ingress_plans WHERE plan_id=%s",
+        "SELECT cohort_id,universe_target,session_date,"
+        "maximum_rest_repair_requests,maximum_rest_repair_decoded_bytes,"
+        "service_plan_id FROM rt.advanced_ingress_plans WHERE plan_id=%s",
         (str(plan_id),),
     )
     row = cursor.fetchone()
@@ -691,39 +593,35 @@ def plan_advanced_cold_start_cursor(
         intervals=("1m", "5m"),
     )
     work = []
-    one_minute_plans = [
+    for session_plan in (
         item for item in coverage["plans"] if item["interval"] == "1m"
-    ]
-    for session_plan in one_minute_plans:
+    ):
         for missing in session_plan["missing_ranges"]:
-            expected_1m = int(missing["missing_members"])
-            expected_5m = ceil(expected_1m / 5)
             identity = {
-                "contract": "advanced-cold-start-work-v1",
+                "contract": "advanced-cold-start-work-v2",
                 "plan_id": plan_id,
                 "session_date": session_plan["session_date"],
                 **missing,
             }
-            work_id = uuid5(
-                NAMESPACE_URL,
-                "stockscreener:advanced-cold-start-work:"
-                f"{canonical_sha256(identity)}",
-            )
             work.append(
                 ColdStartWorkItem(
-                    work_id,
+                    uuid5(
+                        NAMESPACE_URL,
+                        "stockscreener:advanced-cold-start-work:"
+                        f"{canonical_sha256(identity)}",
+                    ),
                     session_plan["session_date"],
                     int(missing["instrument_id"]),
                     str(missing["ticker"]),
                     missing["requested_from"],
                     missing["requested_to"],
-                    expected_1m,
-                    expected_5m,
+                    int(missing["missing_members"]),
+                    ceil(int(missing["missing_members"]) / 5),
                 )
             )
     scope = {
-        "contract": "advanced-cold-start-backfill-v1",
-        "plan_id": plan_id,
+        "contract": "advanced-cold-start-backfill-v2",
+        "ingress_plan_id": plan_id,
         "cohort_id": cohort_id,
         "sessions": sessions,
         "universe_target": int(row[1]),
@@ -733,13 +631,17 @@ def plan_advanced_cold_start_cursor(
         "work": tuple(work),
     }
     scope_sha256 = canonical_sha256(scope)
-    backfill_id = uuid5(
-        NAMESPACE_URL,
-        f"stockscreener:advanced-cold-start:{scope_sha256}",
+    service_plan_id = (
+        UUID(str(row[5]))
+        if row[5] is not None
+        else uuid5(
+            NAMESPACE_URL,
+            f"stockscreener:advanced-backfill-service:{scope_sha256}",
+        )
     )
     authorized = (
-        len(work) <= request_ceiling <= int(row[2])
-        and decoded_byte_ceiling <= int(row[3])
+        len(work) <= request_ceiling <= int(row[3])
+        and decoded_byte_ceiling <= int(row[4])
         and (not work or decoded_byte_ceiling > 0)
     )
     state = "BACKFILL_PLANNED" if authorized else "BACKFILL_BLOCKED"
@@ -758,55 +660,63 @@ def plan_advanced_cold_start_cursor(
         else "OPERATOR_AUTHORIZATION_REQUIRED"
     )
     cursor.execute(
-        "INSERT INTO rt.advanced_backfill_runs ("
-        "backfill_id,plan_id,cohort_id,session_dates,universe_target,"
-        "request_ceiling,decoded_byte_ceiling,expected_cost,scope_sha256,"
-        "state,reason_code,next_action) VALUES ("
-        "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-        "ON CONFLICT (backfill_id) DO NOTHING",
+        "INSERT INTO rt.service_plans ("
+        "plan_id,cohort_id,session_date,stage_catalog_version,"
+        "enabled_stages,config_sha256,deadline,scope_reference) VALUES ("
+        "%s,%s,%s,'stages_v3',%s,%s,%s,%s) ON CONFLICT DO NOTHING",
         (
-            str(backfill_id),
-            str(plan_id),
+            str(service_plan_id),
             str(cohort_id),
-            list(sessions),
-            int(row[1]),
-            request_ceiling,
-            decoded_byte_ceiling,
-            expected_cost.strip(),
+            row[2],
+            ["EQUITY_INPUT_GATE", "EQUITY_MATERIALIZE", "EQUITY_PROJECTION"],
             scope_sha256,
-            state,
-            reason,
-            next_action,
+            _utc(known_by, "known_by") + timedelta(days=1),
+            f"advanced-backfill:{state}:{reason}:{next_action}",
         ),
     )
-    for item in work:
+    cursor.execute(
+        "UPDATE rt.advanced_ingress_plans SET service_plan_id=%s "
+        "WHERE plan_id=%s AND service_plan_id IS NULL",
+        (str(service_plan_id), str(plan_id)),
+    )
+    for session_date in sessions:
+        cutoff = max(
+            item.requested_to
+            for item in work
+            if item.session_date == session_date
+        ) if any(item.session_date == session_date for item in work) else _utc(
+            known_by, "known_by"
+        )
+        window_key = f"advanced-backfill-{session_date.isoformat()}"
+        window_id = uuid5(
+            NAMESPACE_URL,
+            f"stockscreener:window:{cohort_id}:{window_key}",
+        )
+        window_state = (
+            "PENDING" if authorized and work
+            else "COMPLETE" if authorized
+            else "RETAINED_GAP"
+        )
         cursor.execute(
-            "INSERT INTO rt.advanced_backfill_work ("
-            "work_id,backfill_id,session_date,instrument_id,ticker,"
-            "requested_from,requested_to,expected_raw_1m,expected_raw_5m,"
-            "status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-            "ON CONFLICT (work_id) DO NOTHING",
+            "INSERT INTO rt.window_runs ("
+            "window_id,plan_id,cohort_id,provider_tier,window_key,"
+            "release_at,cutoff,deadline,state,updated_at) VALUES ("
+            "%s,%s,%s,'MASSIVE_ADVANCED',%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (window_id) DO NOTHING",
             (
-                str(item.work_id),
-                str(backfill_id),
-                item.session_date,
-                item.instrument_id,
-                item.ticker,
-                item.requested_from,
-                item.requested_to,
-                item.expected_raw_1m,
-                item.expected_raw_5m,
-                "MISSING" if authorized else "BLOCKED",
+                str(window_id),
+                str(service_plan_id),
+                str(cohort_id),
+                window_key,
+                _utc(known_by, "known_by"),
+                cutoff,
+                _utc(known_by, "known_by") + timedelta(minutes=5),
+                window_state,
+                _utc(known_by, "known_by"),
             ),
         )
-    cursor.execute(
-        "SELECT state,reason_code,next_action "
-        "FROM rt.advanced_backfill_runs WHERE backfill_id=%s",
-        (str(backfill_id),),
-    )
-    stored_state, stored_reason, stored_next_action = cursor.fetchone()
     return ColdStartBackfillPlan(
-        backfill_id,
+        service_plan_id,
         plan_id,
         cohort_id,
         sessions,
@@ -815,9 +725,9 @@ def plan_advanced_cold_start_cursor(
         decoded_byte_ceiling,
         expected_cost.strip(),
         scope_sha256,
-        str(stored_state),
-        str(stored_reason),
-        str(stored_next_action),
+        state,
+        reason,
+        next_action,
         tuple(work),
     )
 
@@ -831,281 +741,20 @@ def transition_backfill_state_cursor(
     next_action: str,
     checked_at: datetime,
 ) -> None:
-    allowed = {
-        "BACKFILL_PLANNED",
-        "BACKFILL_RUNNING",
-        "BACKFILL_BLOCKED",
-        "BACKFILL_COMPLETE",
-        "WAIT_NEXT_SESSION",
+    mapping = {
+        "BACKFILL_BLOCKED": "RETAINED_GAP",
+        "BACKFILL_COMPLETE": "COMPLETE",
+        "WAIT_NEXT_SESSION": "COMPLETE",
     }
-    if state not in allowed or not reason_code.strip() or not next_action.strip():
-        raise ValueError("backfill controller state is invalid")
-    completed = (
-        _utc(checked_at, "checked_at")
-        if state in {"BACKFILL_COMPLETE", "WAIT_NEXT_SESSION"}
-        else None
-    )
+    target = mapping.get(state)
+    if target is None:
+        return
     cursor.execute(
-        "UPDATE rt.advanced_backfill_runs SET state=%s,reason_code=%s,"
-        "next_action=%s,updated_at=%s,completed_at=COALESCE(completed_at,%s) "
-        "WHERE backfill_id=%s RETURNING backfill_id",
-        (
-            state,
-            reason_code.strip(),
-            next_action.strip(),
-            _utc(checked_at, "checked_at"),
-            completed,
-            str(backfill_id),
-        ),
+        "UPDATE rt.window_runs SET state=%s,updated_at=%s "
+        "WHERE plan_id=%s AND state IN ('PENDING','FAILED','MISSED',"
+        "'RETAINED_GAP')",
+        (target, _utc(checked_at, "checked_at"), str(backfill_id)),
     )
-    if cursor.fetchone() is None:
-        raise ValueError("backfill controller state update was rejected")
-
-
-def reserve_backfill_work_cursor(
-    cursor,
-    work_id: UUID,
-    *,
-    reserved_response_bytes: int,
-    reserved_at: datetime,
-) -> UUID:
-    cursor.execute(
-        "SELECT work.backfill_id,work.session_date,work.ticker,"
-        "work.requested_from,work.requested_to,work.status,work.request_id,"
-        "run.plan_id,run.request_ceiling,run.decoded_byte_ceiling,"
-        "run.requests_reserved,run.bytes_reserved,run.state,"
-        "plan.cohort_id,plan.session_date,plan.authorized_end_at,"
-        "plan.maximum_rest_repair_requests,"
-        "plan.maximum_rest_repair_decoded_bytes,"
-        "auth.authorization_reference,"
-        "usage.rest_repair_request_count,"
-        "usage.rest_repair_decoded_byte_count "
-        "FROM rt.advanced_backfill_work AS work "
-        "JOIN rt.advanced_backfill_runs AS run USING(backfill_id) "
-        "JOIN rt.advanced_ingress_plans AS plan USING(plan_id) "
-        "JOIN rt.advanced_stream_authorizations AS auth "
-        "USING(authorization_id) "
-        "JOIN rt.advanced_ingress_plan_usage AS usage USING(plan_id) "
-        "WHERE work.work_id=%s "
-        "FOR UPDATE OF work,run,plan,usage",
-        (str(work_id),),
-    )
-    row = cursor.fetchone()
-    if row is None:
-        raise ValueError("cold-start work is unavailable")
-    if row[5] != "MISSING":
-        if row[6] is None:
-            raise ValueError("cold-start work reservation is inconsistent")
-        return UUID(str(row[6]))
-    if (
-        row[12] not in {"BACKFILL_PLANNED", "BACKFILL_RUNNING"}
-        or int(row[10]) + 1 > int(row[8])
-        or int(row[11]) + reserved_response_bytes > int(row[9])
-        or int(row[19]) + 1 > int(row[16])
-        or int(row[20]) + reserved_response_bytes > int(row[17])
-    ):
-        cursor.execute(
-            "UPDATE rt.advanced_backfill_work SET status='BLOCKED' "
-            "WHERE work_id=%s",
-            (str(work_id),),
-        )
-        transition_backfill_state_cursor(
-            cursor,
-            UUID(str(row[0])),
-            state="BACKFILL_BLOCKED",
-            reason_code="STARTUP_BACKFILL_BUDGET_EXHAUSTED",
-            next_action="OPERATOR_AUTHORIZATION_REQUIRED",
-            checked_at=reserved_at,
-        )
-        raise ProviderBudgetExceeded("startup backfill budget is exhausted")
-    request_sha256 = canonical_sha256({
-        "contract": "advanced-startup-raw-1m-v1",
-        "work_id": work_id,
-        "session_date": row[1],
-        "ticker": row[2],
-        "requested_from": row[3],
-        "requested_to": row[4],
-    })
-    request_id = uuid5(
-        NAMESPACE_URL,
-        f"stockscreener:advanced-startup-request:{request_sha256}",
-    )
-    scope = ProviderBudgetScope(
-        account_alias="MASSIVE_ADVANCED",
-        session_date=row[14],
-        authorization_reference=str(row[18]),
-        provider_authorization_reference="stocks-advanced",
-        expected_cost="startup backfill allocation",
-        request_ceiling=int(row[16]),
-        decoded_byte_ceiling=int(row[17]),
-        lanes=frozenset({ProviderRequestLane.EQUITY_HISTORY}),
-        authorized_until=row[15],
-    )
-    reserve_coordinated_provider_request_cursor(
-        cursor,
-        scope,
-        ProviderRequestReservation(
-            request_id,
-            scope.account_alias,
-            ProviderRequestLane.EQUITY_HISTORY,
-            "ADVANCED_HISTORICAL_1M",
-            request_sha256,
-            _utc(reserved_at, "reserved_at"),
-            cohort_id=UUID(str(row[13])),
-        ),
-        reserved_response_bytes=reserved_response_bytes,
-    )
-    cursor.execute(
-        "UPDATE rt.advanced_ingress_plan_usage SET "
-        "rest_repair_request_count=rest_repair_request_count+1,"
-        "rest_repair_decoded_byte_count="
-        "rest_repair_decoded_byte_count+%s,updated_at=%s "
-        "WHERE plan_id=%s",
-        (
-            reserved_response_bytes,
-            _utc(reserved_at, "reserved_at"),
-            str(row[7]),
-        ),
-    )
-    cursor.execute(
-        "UPDATE rt.advanced_backfill_runs SET state='BACKFILL_RUNNING',"
-        "reason_code='STARTUP_REQUEST_RESERVED',"
-        "next_action='FETCH_AND_SEAL_RAW_1M',"
-        "requests_reserved=requests_reserved+1,"
-        "bytes_reserved=bytes_reserved+%s,updated_at=%s "
-        "WHERE backfill_id=%s",
-        (
-            reserved_response_bytes,
-            _utc(reserved_at, "reserved_at"),
-            str(row[0]),
-        ),
-    )
-    cursor.execute(
-        "UPDATE rt.advanced_backfill_work SET status='RESERVED',"
-        "request_id=%s WHERE work_id=%s",
-        (str(request_id), str(work_id)),
-    )
-    return request_id
-
-
-def seal_backfill_work_payload_cursor(
-    cursor,
-    work_id: UUID,
-    body: bytes,
-    *,
-    sealed_at: datetime,
-) -> UUID:
-    cursor.execute(
-        "SELECT request_id,requested_from,requested_to,status "
-        "FROM rt.advanced_backfill_work WHERE work_id=%s FOR UPDATE",
-        (str(work_id),),
-    )
-    row = cursor.fetchone()
-    if row is None or row[0] is None or row[3] != "RESERVED":
-        raise ValueError("startup work is not reserved for sealing")
-    request_id = UUID(str(row[0]))
-    sealed = _utc(sealed_at, "sealed_at")
-    payload_id = persist_raw_payload_cursor(
-        cursor,
-        body,
-        arrived_at=sealed,
-        request_id=request_id,
-    )
-    finish_provider_request_cursor(
-        cursor,
-        request_id,
-        ProviderRequestCompletion(
-            ProviderRequestState.COMPLETE,
-            completed_at=sealed,
-            started_at=sealed,
-            outcome=ProviderRequestOutcome.OK,
-            http_status=200,
-            response_bytes=len(body),
-            row_count=0,
-            pages_fetched=1,
-            requested_from=row[1],
-            requested_to=row[2],
-            price_basis=PriceBasis.RAW_FINALIZED_MINUTE_CLOSE_V1,
-            completeness=RequestCompleteness.COMPLETE,
-            payload_id=payload_id,
-        ),
-    )
-    cursor.execute(
-        "UPDATE rt.advanced_backfill_work SET status='SEALED' "
-        "WHERE work_id=%s",
-        (str(work_id),),
-    )
-    return payload_id
-
-
-def verify_backfill_work_cursor(
-    cursor,
-    work_id: UUID,
-    *,
-    checked_at: datetime,
-) -> str:
-    cursor.execute(
-        "SELECT work.backfill_id,work.instrument_id,work.requested_from,"
-        "work.requested_to,work.expected_raw_1m,work.expected_raw_5m,"
-        "run.cohort_id,work.status "
-        "FROM rt.advanced_backfill_work AS work "
-        "JOIN rt.advanced_backfill_runs AS run USING(backfill_id) "
-        "WHERE work.work_id=%s FOR UPDATE OF work,run",
-        (str(work_id),),
-    )
-    row = cursor.fetchone()
-    if row is None or row[7] not in {"SEALED", "PERSISTED"}:
-        raise ValueError("startup work is not ready for coverage verification")
-    cursor.execute(
-        "SELECT current.interval,COUNT(DISTINCT current.bar_start) "
-        "FROM rt.bar_current AS current "
-        "JOIN rt.bar_revisions AS revision "
-        "ON revision.bar_revision_id=current.bar_revision_id "
-        "AND revision.observed_at=current.observed_at "
-        "WHERE current.cohort_id=%s AND current.instrument_id=%s "
-        "AND current.bar_start>=%s AND current.bar_end<=%s "
-        "AND current.interval IN ('1m','5m') "
-        "AND current.session_scope='RTH' "
-        "AND current.adjustment_basis='RAW_UNADJUSTED' "
-        "AND revision.is_final GROUP BY current.interval",
-        (str(row[6]), int(row[1]), row[2], row[3]),
-    )
-    counts = {str(key): int(value) for key, value in cursor.fetchall()}
-    if (
-        counts.get("1m", 0) != int(row[4])
-        or counts.get("5m", 0) != int(row[5])
-    ):
-        raise ValueError("startup work exact 1m/5m coverage is incomplete")
-    coverage_sha256 = canonical_sha256({
-        "work_id": work_id,
-        "requested_from": row[2],
-        "requested_to": row[3],
-        "counts": counts,
-    })
-    cursor.execute(
-        "UPDATE rt.advanced_backfill_work SET status='VERIFIED',"
-        "coverage_sha256=%s,completed_at=%s WHERE work_id=%s",
-        (
-            coverage_sha256,
-            _utc(checked_at, "checked_at"),
-            str(work_id),
-        ),
-    )
-    cursor.execute(
-        "SELECT COUNT(*) FROM rt.advanced_backfill_work "
-        "WHERE backfill_id=%s AND status<>'VERIFIED'",
-        (str(row[0]),),
-    )
-    if int(cursor.fetchone()[0]) == 0:
-        transition_backfill_state_cursor(
-            cursor,
-            UUID(str(row[0])),
-            state="BACKFILL_COMPLETE",
-            reason_code="EXACT_1M_5M_COVERAGE_COMPLETE",
-            next_action="PUBLISH_COHORT_LOCAL_RELEASE",
-            checked_at=checked_at,
-        )
-    return coverage_sha256
 
 
 def publish_cohort_local_backfill_release_cursor(
@@ -1116,48 +765,66 @@ def publish_cohort_local_backfill_release_cursor(
     job_barrier_sha256: str,
     published_at: datetime,
 ) -> UUID:
+    checked = _utc(published_at, "published_at")
     cursor.execute(
-        "SELECT cohort_id,state FROM rt.advanced_backfill_runs "
-        "WHERE backfill_id=%s FOR UPDATE",
+        "SELECT plan.cohort_id,plan.session_date,run.window_id,"
+        "run.cutoff,manifest.universe_sha256 "
+        "FROM rt.service_plans AS plan "
+        "JOIN rt.window_runs AS run USING(plan_id) "
+        "JOIN rt.cohorts AS cohort ON cohort.cohort_id=plan.cohort_id "
+        "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
+        "WHERE plan.plan_id=%s AND run.state='COMPLETE' "
+        "ORDER BY run.cutoff DESC LIMIT 1",
         (str(backfill_id),),
     )
     row = cursor.fetchone()
-    if row is None or row[1] != "BACKFILL_COMPLETE":
-        raise ValueError("backfill is not complete for release")
-    cursor.execute(
-        "SELECT COUNT(*) FROM rt.advanced_backfill_work "
-        "WHERE backfill_id=%s AND status<>'VERIFIED'",
-        (str(backfill_id),),
-    )
-    if int(cursor.fetchone()[0]):
-        raise ValueError("backfill work remains incomplete")
-    release_id = uuid5(
+    if row is None:
+        raise ValueError("canonical backfill windows are not complete")
+    receipt_id = uuid5(
         NAMESPACE_URL,
-        "stockscreener:advanced-backfill-release:"
-        f"{backfill_id}:{coverage_sha256}:{job_barrier_sha256}",
+        f"stockscreener:advanced-backfill-receipt:{backfill_id}:"
+        f"{coverage_sha256}:{job_barrier_sha256}",
     )
     cursor.execute(
-        "INSERT INTO rt.advanced_backfill_releases ("
-        "release_id,backfill_id,cohort_id,coverage_sha256,"
-        "job_barrier_sha256,published_at,platform_pointer_advanced) "
-        "VALUES (%s,%s,%s,%s,%s,%s,false) "
-        "ON CONFLICT (release_id) DO NOTHING",
+        "INSERT INTO rt.cycle_receipts ("
+        "receipt_id,window_id,cohort_id,receipt_kind,cutoff,"
+        "reference_generation,universe_sha256,input_sha256,build_id) "
+        "VALUES (%s,%s,%s,'PORTAL_READY',%s,1,%s,%s,"
+        "'advanced-backfill-v2') ON CONFLICT DO NOTHING",
         (
-            str(release_id),
-            str(backfill_id),
+            str(receipt_id),
+            str(row[2]),
             str(row[0]),
+            row[3],
+            str(row[4]),
             coverage_sha256,
-            job_barrier_sha256,
-            _utc(published_at, "published_at"),
         ),
     )
-    transition_backfill_state_cursor(
-        cursor,
-        backfill_id,
-        state="WAIT_NEXT_SESSION",
-        reason_code="COHORT_LOCAL_RELEASE_READY",
-        next_action="WAIT_FOR_NEXT_XNYS_SESSION",
-        checked_at=published_at,
+    release_id = uuid5(
+        NAMESPACE_URL,
+        f"stockscreener:advanced-backfill-release:{receipt_id}",
+    )
+    manifest = {
+        "kind": "ADVANCED_BACKFILL",
+        "coverage_sha256": coverage_sha256,
+        "job_barrier_sha256": job_barrier_sha256,
+    }
+    cursor.execute(
+        "INSERT INTO rt.portal_releases ("
+        "release_id,cohort_id,provider_tier,release_class,receipt_id,"
+        "session_date,cutoff,universe_sha256,manifest,manifest_sha256) "
+        "VALUES (%s,%s,'MASSIVE_ADVANCED','SESSION_CLOSE',%s,%s,%s,%s,"
+        "%s::jsonb,%s)",
+        (
+            str(release_id),
+            str(row[0]),
+            str(receipt_id),
+            row[1],
+            checked,
+            str(row[4]),
+            canonical_json(manifest),
+            canonical_sha256(manifest),
+        ),
     )
     return release_id
 
@@ -1186,8 +853,8 @@ class AdvancedHistoricalMinuteExecutor:
     ) -> HistoricalMinuteExecutionResult:
         if repair.status == "BLOCKED":
             return HistoricalMinuteExecutionResult(0, 0, 0, ())
-        provider_requests = 0
         body = sealed_body
+        provider_requests = 0
         if body is None:
             body = self.transport.fetch(repair)
             provider_requests = 1
@@ -1196,11 +863,7 @@ class AdvancedHistoricalMinuteExecutor:
         if not facts:
             raise ValueError("historical 1m response has no exact facts")
         persisted = self.persister(facts)
-        self.deriver(
-            facts,
-            self.DERIVED_INTERVALS,
-            "RAW_UNADJUSTED",
-        )
+        self.deriver(facts, self.DERIVED_INTERVALS, "RAW_UNADJUSTED")
         return HistoricalMinuteExecutionResult(
             provider_requests,
             len(body),

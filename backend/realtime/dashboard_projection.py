@@ -17,6 +17,7 @@ from .lineage_head import (
 )
 from .portal_projection import build_portal_snapshot
 from .preflight import ProviderTier
+from .reference_continuity import reference_continuity_manifest_fields
 from .screening_projection import RealtimeScreeningInput, produce_realtime_screening
 from .setup_summary_projection import produce_daily_setup_summary
 
@@ -212,6 +213,7 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
         scanner_contracts=list(DAILY_SCANNER_CONTRACTS.values()),
         scanner_basis=SCANNER_BASIS,
     )
+    manifest.update(reference_continuity_manifest_fields(inputs))
     payload = dict(
         version=DASHBOARD_VERSION, cohort_id=str(inputs.cohort_id), session=str(inputs.session),
         market_time=manifest["market_time"], generated_at=inputs.cutoff.isoformat(),

@@ -91,12 +91,13 @@ class RunnerEnvironment:
     build_id: str = "unversioned"
     ticker_state: TickerProjectionState = field(default_factory=TickerProjectionState)
     handoff: CycleHandoff = field(default_factory=CycleHandoff)
-    screening_loader: ScreeningInputLoader = field(default_factory=ScreeningInputLoader)
+    screening_loader: ScreeningInputLoader | None = field(default_factory=ScreeningInputLoader)
     reference_service: ReferenceSeedService | None = None
     equity_source: DeveloperAcquisitionSource | None = None
     universe: UniverseManifest | None = None
     reference_scope: str = "MARKET_REFERENCES"
     input_known_by: datetime | None = None
+    allow_late_identity_continuity: bool = False
     options_flow_source: OptionFlowSource | None = None
     options_flow_semantics: ConditionSemantics | None = None
     options_flow_policy: FlowStrategyPolicy | None = None

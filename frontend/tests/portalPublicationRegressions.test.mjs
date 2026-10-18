@@ -432,8 +432,9 @@ test('ticker publication failures stay within sections without blocking workspac
           'Chart workspace', publicationLoading && React.createElement('div', { role: 'status', 'aria-busy': true },
             React.createElement('div', { className: 'spinner' }), 'Loading chart data...'),
           availabilityError && React.createElement('p', { role: 'alert' }, availabilityError)) },
-        './EntityRail': { default: ({ availabilityError }) => React.createElement('aside', null,
-          'Reference panel', availabilityError && React.createElement('p', { role: 'alert' }, availabilityError)) },
+        './EntityRail': { default: ({ referenceWarning, calendarAvailabilityError }) => React.createElement('aside', null,
+          'Reference panel', referenceWarning && React.createElement('p', { role: 'alert' }, referenceWarning),
+          'Event calendar', calendarAvailabilityError && React.createElement('p', { role: 'alert' }, calendarAvailabilityError)) },
         './FinancialsView': { default: () => null },
         '../../layout/pageContext': { usePublishPageContext: () => {} },
         '../../services/api': {},
@@ -467,13 +468,11 @@ test('ticker publication failures stay within sections without blocking workspac
       assert.doesNotMatch(html, /Loading AAPL workspace|Loading ticker publication|ticker-workspace__state/)
       if (state === 'refreshing') assert.match(html, /Ticker reference identity changed/)
       if (state.startsWith('retained')) {
-        assert.ok(!html.includes(referenceNotice))
+        assert.equal((html.match(/Security reference is not current/g) ?? []).length, 1)
         assert.match(html, /data-reads-enabled="true"/)
         if (state === 'retained-with-warnings') {
           assert.match(html, /Corporate-action evidence changed/)
           assert.match(html, /Market data is not current/)
-        } else {
-          assert.doesNotMatch(html, /role="alert"/)
         }
       }
     } finally {
@@ -501,7 +500,8 @@ test('ticker reference, calendar and financial failures are labeled within their
   const Financials = compile('pages/ticker/FinancialsView.tsx', { './EntityRail': { compactMoney: rail.compactMoney } }).default
   for (const availabilityError of [failure, null]) {
     const referenceHtml = renderToStaticMarkup(React.createElement(rail.default, {
-      profile: null, loading: false, calendar: null, calendarLoading: false, calendarError: false, availabilityError,
+      profile: null, loading: false, calendar: null, calendarLoading: false, calendarError: false,
+      referenceWarning: availabilityError, calendarAvailabilityError: availabilityError,
     }))
     const financialHtml = renderToStaticMarkup(React.createElement(Financials, { profile: null, loading: false, availabilityError }))
     assert.match(referenceHtml, /Reference data/)

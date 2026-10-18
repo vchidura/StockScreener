@@ -13,6 +13,7 @@ from realtime.stage_graph import (
     PORTAL_LANE,
     STAGES_V1,
     STAGES_V2,
+    STAGES_V3,
     Action,
     decide_window,
     lanes_required,
@@ -95,6 +96,57 @@ def test_v2_catalog_splits_shared_materialization_from_alert_and_portal_lanes():
     assert STAGES_V2["PORTAL_PUBLISH"].deadline_offset_seconds == 300
     assert lanes_required(STAGES_V2, STAGES_V2) == frozenset(
         {DATA_LANE, ALERT_LANE, PORTAL_LANE, OPTIONS_LANE}
+    )
+
+
+def test_v3_catalog_keeps_alert_and_projection_as_independent_consumers():
+    text = (
+        Path(V2_MIGRATIONS_DIR)
+        / "018_realtime_advanced_stage_catalog.sql"
+    ).read_text(encoding="utf-8")
+    rows = re.findall(
+        r"\('([A-Z_]+)','stages_v3','(shared|equity)',"
+        r"ARRAY\[([^\]]*)\](?:::text\[\])?,'([a-z]+)',"
+        r"'([A-Z]+)',(true|false),(NULL|\d+)\)",
+        text,
+    )
+    parsed = {
+        name: (
+            domain,
+            tuple(re.findall(r"'([A-Z_]+)'", prerequisites)),
+            lane,
+            schedule,
+            gate == "true",
+            None if deadline == "NULL" else int(deadline),
+        )
+        for (
+            name,
+            domain,
+            prerequisites,
+            lane,
+            schedule,
+            gate,
+            deadline,
+        ) in rows
+    }
+    assert parsed == {
+        name: (
+            stage.domain,
+            stage.prerequisites,
+            stage.lane,
+            stage.schedule_kind,
+            stage.gates_strategy,
+            stage.deadline_offset_seconds,
+        )
+        for name, stage in STAGES_V3.items()
+    }
+    assert STAGES_V3["STOCK_ALERTS"].lane == ALERT_LANE
+    assert STAGES_V3["EQUITY_PROJECTION"].lane == PORTAL_LANE
+    assert STAGES_V3["STOCK_ALERTS"].prerequisites == (
+        "EQUITY_MATERIALIZE",
+    )
+    assert STAGES_V3["EQUITY_PROJECTION"].prerequisites == (
+        "EQUITY_MATERIALIZE",
     )
 
 

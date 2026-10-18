@@ -44,3 +44,7 @@ def test_health_separates_budget_gaps_backlog_and_served_cutoff():
     assert report["provider_budget"]["coordinated_requests"] == 2
     assert report["served_release"]["release_id"] == str(release_id)
     assert report["provider_requests"] == report["database_writes"] == 0
+    assert all(
+        "AS window " not in call.args[0]
+        for call in cursor.execute.call_args_list
+    )

@@ -75,6 +75,7 @@ ADVANCED_INGRESS_CONTRACT_MATRIX = AdvancedIngressContractMatrix(
         "authorization_id",
         "cohort_id",
         "manifest_id",
+        "cohort_selection_reference",
         "session_date",
         "universe_target",
         "mode",
@@ -362,6 +363,7 @@ class AdvancedIngressPlan:
     authorization_scope_sha256: str
     cohort_id: UUID
     manifest_id: UUID
+    cohort_selection_reference: str | None
     session_date: date
     universe_target: int
     mode: str
@@ -381,6 +383,16 @@ class AdvancedIngressPlan:
             raise ValueError("universe_target must be in [1, 400]")
         if self.mode != ADVANCED_INGRESS_MODE:
             raise ValueError("Advanced ingress mode must remain SHADOW")
+        if self.cohort_selection_reference is not None:
+            object.__setattr__(
+                self,
+                "cohort_selection_reference",
+                _text(
+                    self.cohort_selection_reference,
+                    "cohort_selection_reference",
+                    160,
+                ),
+            )
         object.__setattr__(
             self,
             "runtime_profile_version",
@@ -460,6 +472,7 @@ class AdvancedIngressPlan:
             ),
             "cohort_id": self.cohort_id,
             "manifest_id": self.manifest_id,
+            "cohort_selection_reference": self.cohort_selection_reference,
             "session_date": self.session_date,
             "universe_target": self.universe_target,
             "mode": self.mode,
@@ -478,6 +491,7 @@ def build_advanced_ingress_plan(
     authorization: AdvancedStreamAuthorization,
     cohort_id: UUID,
     manifest_id: UUID,
+    cohort_selection_reference: str | None = None,
     session_date: date,
     universe_target: int,
     runtime_profile_version: str,
@@ -513,6 +527,7 @@ def build_advanced_ingress_plan(
         "authorization_scope_sha256": authorization.scope_sha256,
         "cohort_id": cohort_id,
         "manifest_id": manifest_id,
+        "cohort_selection_reference": cohort_selection_reference,
         "session_date": session_date,
         "universe_target": universe_target,
         "mode": ADVANCED_INGRESS_MODE,
@@ -546,6 +561,7 @@ def build_advanced_ingress_plan(
         authorization_scope_sha256=authorization.scope_sha256,
         cohort_id=cohort_id,
         manifest_id=manifest_id,
+        cohort_selection_reference=cohort_selection_reference,
         session_date=session_date,
         universe_target=universe_target,
         mode=ADVANCED_INGRESS_MODE,
@@ -565,6 +581,16 @@ class AdvancedIngressPlanRequest:
     session_date: date
     universe_target: int
     budgets: AdvancedIngressBudgets
+    preferred_cohort_id: UUID | None = None
+    cohort_selection_reference: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.preferred_cohort_id is None) != (
+            self.cohort_selection_reference is None
+        ):
+            raise ValueError(
+                "explicit cohort selection requires id and reference"
+            )
 
 
 @dataclass(frozen=True, slots=True)

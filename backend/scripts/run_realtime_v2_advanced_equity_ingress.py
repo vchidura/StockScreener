@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import signal
 import sys
 import threading
@@ -14,7 +15,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from dotenv import dotenv_values
 from psycopg2.pool import ThreadedConnectionPool
 from websockets.exceptions import ConnectionClosed
 
@@ -26,6 +26,7 @@ if str(BACKEND_DIR) not in sys.path:
 from realtime.advanced_equity_ingress import (  # noqa: E402
     AdvancedEquityJournalPump,
     AdvancedJournalDecodeError,
+    BoundedAsyncProgressReporter,
 )
 from realtime.advanced_gateway import (  # noqa: E402
     AdvancedGateway,
@@ -60,7 +61,6 @@ from realtime.advanced_journal_registry import (  # noqa: E402
     build_advanced_journal_registration,
     mark_advanced_journal_writing_cursor,
     measure_journal_capacity,
-    record_journal_capacity_cursor,
     register_advanced_journal_cursor,
     seal_advanced_journal_cursor,
     update_advanced_journal_offsets_cursor,
@@ -83,6 +83,7 @@ from realtime.equity_pipeline_config import (  # noqa: E402
     EquityPipeline,
     OptionsPipeline,
     RealtimeV2PipelineConfig,
+    RealtimeV2Process,
 )
 from realtime.migrations import (  # noqa: E402
     EXPECTED_V2_DATABASE_NAME,
@@ -108,7 +109,7 @@ def parse_args(argv=None):
     parser.add_argument("--database", required=True)
     parser.add_argument("--confirm-database-name", required=True)
     parser.add_argument("--ingress-plan-id", type=UUID, required=True)
-    parser.add_argument("--env-file", type=Path, default=BACKEND_DIR / ".env")
+    parser.add_argument("--runtime-path-attempt", type=int, default=1)
     parser.add_argument("--debug-once", action="store_true")
     parser.add_argument("--maximum-market-messages", type=int)
     parser.add_argument("--duration-seconds", type=int)
@@ -121,6 +122,8 @@ def parse_args(argv=None):
     )
     if args.database != EXPECTED_V2_DATABASE_NAME:
         parser.error("Advanced ingress targets only stocks_realtime_v2")
+    if not 1 <= args.runtime_path_attempt <= 1_000:
+        parser.error("--runtime-path-attempt must be in [1, 1000]")
     if args.debug_once:
         if (
             args.maximum_market_messages is None
@@ -144,6 +147,8 @@ def parse_args(argv=None):
 
 
 def _provider(config):
+    if config.app_dsn is None:
+        raise ValueError("Advanced ingress app DSN is unavailable")
     pool = ThreadedConnectionPool(
         1,
         4,
@@ -314,11 +319,16 @@ def _derived_runtime_paths(
     plan_id: UUID,
     session_date,
     connection_attempt: int,
+    runtime_path_attempt: int = 1,
 ) -> tuple[Path, Path]:
+    if not 1 <= runtime_path_attempt <= 1_000:
+        raise ValueError("runtime path attempt must be in [1, 1000]")
     identity = (
         f"{session_date.isoformat()}-{plan_id}-"
         f"attempt-{connection_attempt:03d}"
     )
+    if runtime_path_attempt > 1:
+        identity += f"-path-{runtime_path_attempt:03d}"
     journal_path = journal_root / f"stocks-{identity}.sqlite"
     report_path = journal_root / f"stocks-{identity}.json"
     if journal_path.exists() or report_path.exists():
@@ -331,7 +341,8 @@ def _derived_runtime_paths(
 def main(argv=None) -> int:
     args = parse_args(argv)
     config = RealtimeV2PipelineConfig.from_mapping(
-        dotenv_values(args.env_file)
+        os.environ,
+        process=RealtimeV2Process.INGRESS,
     )
     if (
         config.equity_pipeline is not EquityPipeline.MASSIVE_ADVANCED
@@ -358,6 +369,7 @@ def main(argv=None) -> int:
     report_path = None
     started_at = None
     live_started_at = None
+    status_reporter = None
     try:
         (
             runtime_plan,
@@ -376,6 +388,7 @@ def main(argv=None) -> int:
             plan_id=runtime_plan.plan_id,
             session_date=runtime_plan.session_date,
             connection_attempt=attempt,
+            runtime_path_attempt=args.runtime_path_attempt,
         )
         generation = uuid4()
         owner_id = uuid4()
@@ -388,13 +401,6 @@ def main(argv=None) -> int:
                 settings.minimum_journal_free_percent
             ),
         )
-        with provider.transaction(APP_ROLE) as unit:
-            record_journal_capacity_cursor(
-                unit.cursor,
-                plan_id=runtime_plan.plan_id,
-                observation=capacity,
-                observed_at=_now(),
-            )
         if not capacity.admitted:
             raise JournalCapacityError("JOURNAL_DISK_HEADROOM_LOW")
         scope = AdvancedStreamScope(
@@ -470,24 +476,11 @@ def main(argv=None) -> int:
 
         def persist_state(state):
             nonlocal live_started_at
-            if state in {
-                GatewayFeedState.DISCONNECTED,
-                GatewayFeedState.BLOCKED,
-                GatewayFeedState.STOPPED,
-            }:
-                return
             checked_at = _now()
             if state is GatewayFeedState.LIVE and live_started_at is None:
                 live_started_at = checked_at
-            with provider.transaction(APP_ROLE) as unit:
-                update_advanced_stream_session_cursor(
-                    unit.cursor,
-                    session,
-                    usage(),
-                    status=state.value,
-                    checked_at=checked_at,
-                    terminal=False,
-                )
+            if status_reporter is not None and pump is not None:
+                status_reporter.publish(pump.progress)
 
         configuration = GatewayConfiguration(
             MarketFeed.STOCKS,
@@ -521,15 +514,23 @@ def main(argv=None) -> int:
         )
 
         def persist_progress(_progress):
-            if gateway.state in {
-                GatewayFeedState.CONNECTING,
-                GatewayFeedState.AUTHENTICATING,
-                GatewayFeedState.SUBSCRIBING,
-                GatewayFeedState.WARMING,
-                GatewayFeedState.LIVE,
-            }:
-                persist_state(gateway.state)
+            checked_at = _now()
             with provider.transaction(APP_ROLE) as unit:
+                if gateway.state in {
+                    GatewayFeedState.CONNECTING,
+                    GatewayFeedState.AUTHENTICATING,
+                    GatewayFeedState.SUBSCRIBING,
+                    GatewayFeedState.WARMING,
+                    GatewayFeedState.LIVE,
+                }:
+                    update_advanced_stream_session_cursor(
+                        unit.cursor,
+                        session,
+                        usage(),
+                        status=gateway.state.value,
+                        checked_at=checked_at,
+                        terminal=False,
+                    )
                 update_advanced_journal_offsets_cursor(
                     unit.cursor,
                     generation,
@@ -538,7 +539,7 @@ def main(argv=None) -> int:
                         _progress.last_event_offset
                     ),
                     bridge_committed_offset=None,
-                    checked_at=_now(),
+                    checked_at=checked_at,
                 )
                 if (
                     _progress.last_event_offset > 0
@@ -563,13 +564,15 @@ def main(argv=None) -> int:
             maximum_batch_bytes=settings.journal_batch_bytes,
             on_progress=None,
         )
-        pump.on_progress = persist_progress
+        status_reporter = BoundedAsyncProgressReporter(persist_progress)
+        pump.on_progress = status_reporter.publish
         with provider.transaction(APP_ROLE) as unit:
             mark_advanced_journal_writing_cursor(
                 unit.cursor,
                 generation,
                 checked_at=_now(),
             )
+        status_reporter.start()
         pump.start()
         signal.signal(signal.SIGINT, lambda *_: stop.set())
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -593,6 +596,13 @@ def main(argv=None) -> int:
             )
         pump.request_stop()
         progress = pump.join(settings.drain_deadline_seconds)
+        status_reporter.publish(progress)
+        status_reporter.stop(
+            max(
+                settings.shutdown_deadline_seconds,
+                settings.database_statement_timeout_ms / 1_000 + 1,
+            )
+        )
         with provider.transaction(APP_ROLE) as unit:
             seal_advanced_journal_cursor(
                 unit.cursor,
@@ -634,6 +644,10 @@ def main(argv=None) -> int:
             "last_raw_offset": progress.last_raw_offset,
             "last_event_offset": progress.last_event_offset,
             "journal_status": "DRAINING",
+            "status_update_failures": status_reporter.failure_count,
+            "last_status_update_failure": (
+                status_reporter.last_failure_name
+            ),
             "event_time_watermark": (
                 progress.event_time_watermark.isoformat()
                 if progress.event_time_watermark is not None
@@ -688,6 +702,16 @@ def main(argv=None) -> int:
                             ),
                             checked_at=_now(),
                         )
+        if status_reporter is not None:
+            with suppress(TimeoutError):
+                status_reporter.stop(
+                    max(
+                        runtime_profile.settings.shutdown_deadline_seconds,
+                        runtime_profile.settings.database_statement_timeout_ms
+                        / 1_000
+                        + 1,
+                    )
+                )
         if session is not None and gateway is not None and pump is not None:
             failure_code = (
                 str(error)
@@ -747,6 +771,16 @@ def main(argv=None) -> int:
             ),
             "credentials_exposed": False,
             "publication_advanced": False,
+            "status_update_failures": (
+                status_reporter.failure_count
+                if status_reporter is not None
+                else 0
+            ),
+            "last_status_update_failure": (
+                status_reporter.last_failure_name
+                if status_reporter is not None
+                else None
+            ),
         }
         classification = classify_advanced_ingress_failure(
             failure["failure_code"],

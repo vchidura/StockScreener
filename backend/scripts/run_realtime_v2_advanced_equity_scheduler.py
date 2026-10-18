@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -10,7 +11,6 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
-from dotenv import dotenv_values
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
@@ -26,17 +26,24 @@ from realtime.advanced_scheduler import (  # noqa: E402
     ensure_advanced_scheduler_session_cursor,
     ensure_advanced_window_retry_cursor,
     load_advanced_scheduler_scope_cursor,
+    order_advanced_due_windows,
     persist_advanced_scheduler_lifecycle_cursor,
     prioritize_live_over_blocked_backfill_cursor,
     set_advanced_window_retry_status_cursor,
 )
 from realtime.database_access_v2 import APP_ROLE  # noqa: E402
-from realtime.equity_pipeline_config import RealtimeV2PipelineConfig  # noqa: E402
+from realtime.equity_pipeline_config import (  # noqa: E402
+    RealtimeV2PipelineConfig,
+    RealtimeV2Process,
+)
 from realtime.session_windows import advanced_session_windows  # noqa: E402
 from scripts.run_realtime_v2_advanced_equity_window import (  # noqa: E402
     _provider,
     main as run_window,
 )
+
+
+PROJECTION_ONLY = "projection-only"
 
 
 def parse_args(argv=None):
@@ -50,8 +57,12 @@ def parse_args(argv=None):
     parser.add_argument("--finality-delay-seconds", type=int, required=True)
     parser.add_argument("--completion-budget-seconds", type=int, default=300)
     parser.add_argument("--authorization-reference", required=True)
+    parser.add_argument(
+        "--publication-mode",
+        choices=(PROJECTION_ONLY,),
+        required=True,
+    )
     parser.add_argument("--report-directory", type=Path, required=True)
-    parser.add_argument("--env-file", type=Path, default=BACKEND_DIR / ".env")
     parser.add_argument("--poll-seconds", type=float, default=1)
     parser.add_argument("--continuous", action="store_true")
     parser.add_argument("--execute", action="store_true")
@@ -97,7 +108,8 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     args.report_directory.mkdir(parents=True, exist_ok=True)
     config = RealtimeV2PipelineConfig.from_mapping(
-        dotenv_values(args.env_file)
+        os.environ,
+        process=RealtimeV2Process.SCHEDULER,
     )
     catalog = load_advanced_ingress_runtime_catalog(
         config.advanced_ingress_policy_path,
@@ -215,7 +227,7 @@ def main(argv=None) -> int:
                     initial_session = False
                 stop.wait(args.poll_seconds)
                 continue
-            due = tuple(
+            due = order_advanced_due_windows(
                 window for window in windows
                 if window.available_after <= now
             )
@@ -292,8 +304,6 @@ def main(argv=None) -> int:
                         args.report_directory
                         / retry.report_relative_path
                     ),
-                    "--env-file",
-                    str(args.env_file),
                     "--execute",
                 ]
                 if retry.attempt:

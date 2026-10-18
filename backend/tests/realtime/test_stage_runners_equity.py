@@ -14,6 +14,7 @@ import pytest
 import realtime.stage_runners_equity as runners
 from realtime.database_access_v2 import WriteFenceRejected
 from realtime.equity_bar_drain import EquityBarDrainResult, lease_owner_for
+from realtime.orchestration_repository import CycleReceiptSpec
 from realtime.preflight import ProviderTier
 from realtime.runner_environment import CycleHandoff, RunnerEnvironment
 from realtime.screening_projection import RealtimeScreeningInput
@@ -303,6 +304,7 @@ def test_advanced_input_ready_binds_stream_checkpoint_gap_and_finalizer_heads():
         cutoff=NOW,
         known_by=NOW + timedelta(minutes=1),
         reference_generation=1,
+        advanced_input_gate_sha256="a" * 64,
     )
     assert universe == "6" * 64 and len(digest) == 64
 
@@ -319,9 +321,25 @@ def test_advanced_input_ready_binds_stream_checkpoint_gap_and_finalizer_heads():
         cutoff=NOW,
         known_by=NOW + timedelta(minutes=1),
         reference_generation=1,
+        advanced_input_gate_sha256="a" * 64,
     )
     assert no_trade_universe == universe
     assert no_trade_digest != digest
+
+    changed_gate_raw = _advanced_input_identity_database()
+    changed_gate_database = V2StageDatabase(
+        _context("EQUITY_MATERIALIZE", database=changed_gate_raw),
+        RealtimeDatabaseRole.COMPUTE,
+    )
+    _, changed_gate_digest = runners.input_ready_identity(
+        changed_gate_database,
+        cohort_id=cohort_id,
+        cutoff=NOW,
+        known_by=NOW + timedelta(minutes=1),
+        reference_generation=1,
+        advanced_input_gate_sha256="b" * 64,
+    )
+    assert changed_gate_digest != digest
 
     gap = (UUID(int=30), UUID(int=20), 11, "AM", NOW, None, UUID(int=22), 0, 89, "OVERLOAD", "UNRESOLVED")
     raw_gap = _advanced_input_identity_database(gaps=(gap,))
@@ -336,7 +354,102 @@ def test_advanced_input_ready_binds_stream_checkpoint_gap_and_finalizer_heads():
             cutoff=NOW,
             known_by=NOW + timedelta(minutes=1),
             reference_generation=1,
+            advanced_input_gate_sha256="a" * 64,
         )
+
+
+def test_advanced_input_ready_requires_the_gate_digest():
+    from realtime.database_access import RealtimeDatabaseRole
+    from realtime.stage_database_v2 import V2StageDatabase
+
+    database = V2StageDatabase(
+        _context(
+            "EQUITY_MATERIALIZE",
+            database=_advanced_input_identity_database(),
+        ),
+        RealtimeDatabaseRole.COMPUTE,
+    )
+
+    with pytest.raises(ValueError, match="input-gate digest"):
+        runners.input_ready_identity(
+            database,
+            cohort_id=UUID(int=12),
+            cutoff=NOW,
+            known_by=NOW + timedelta(minutes=1),
+            reference_generation=1,
+        )
+
+
+def test_reused_advanced_input_ready_revalidates_the_exact_gate_digest(
+    monkeypatch,
+):
+    from realtime.database_access import RealtimeDatabaseRole
+    from realtime.stage_database_v2 import V2StageDatabase
+
+    cohort_id = UUID(int=12)
+    known_by = NOW + timedelta(minutes=1)
+    identity_database = V2StageDatabase(
+        _context(
+            "EQUITY_MATERIALIZE",
+            database=_advanced_input_identity_database(),
+        ),
+        RealtimeDatabaseRole.COMPUTE,
+    )
+    universe, input_sha256 = runners.input_ready_identity(
+        identity_database,
+        cohort_id=cohort_id,
+        cutoff=NOW,
+        known_by=known_by,
+        reference_generation=1,
+        advanced_input_gate_sha256="a" * 64,
+    )
+    receipt = CycleReceiptSpec(
+        runners.INPUT_READY,
+        NOW,
+        1,
+        universe,
+        input_sha256,
+        runners.bind_advanced_input_gate_build_id(
+            "advanced-equity-window-v1",
+            "a" * 64,
+        ),
+    )
+    environment = RunnerEnvironment(
+        None,
+        build_id="advanced-equity-window-v1",
+    )
+
+    def context(gate_digest):
+        base = _context(
+            "EQUITY_MATERIALIZE",
+            database=_advanced_input_identity_database(),
+        )
+        return replace(
+            base,
+            plan=SimpleNamespace(
+                cohort_id=cohort_id,
+                session_date=SESSION,
+                stage_catalog_version="stages_v3",
+                gate_digest=gate_digest,
+            ),
+        )
+
+    monkeypatch.setattr(
+        runners,
+        "advanced_input_gate_identity",
+        lambda _database, own_context: own_context.plan.gate_digest,
+    )
+    runner = runners.reuse_advanced_input_ready_runner(
+        environment,
+        receipt=receipt,
+        input_known_by=known_by,
+        expected_gate_sha256="a" * 64,
+    )
+
+    assert runner(context("a" * 64)).receipt == receipt
+    assert runner(context("b" * 64)).reason_codes == (
+        runners.ADVANCED_INPUT_GATE_DIGEST_CHANGED,
+    )
 
 
 def test_v2_projection_runner_requires_input_ready_and_emits_portal_ready(monkeypatch):
@@ -466,7 +579,8 @@ def test_a_stage_abandoned_during_the_bar_phase_is_a_cancelled_failure(monkeypat
 def _receipt_row(context):
     return {"receipt_id": uuid4(), "cohort_id": context.plan.cohort_id, "cutoff": NOW,
             "universe_sha256": "b" * 64, "provider_tier": "MASSIVE_DEVELOPER",
-            "reference_generation": 3, "input_sha256": "c" * 64}
+            "reference_generation": 3, "input_sha256": "c" * 64,
+            "deadline": context.window.deadline}
 
 
 def test_publish_runner_needs_the_durable_receipt(monkeypatch):
@@ -501,7 +615,8 @@ def test_publish_runner_rehydrates_a_missing_handoff_from_the_receipt_and_publis
     # Read-only rebuild under the publication role, for exactly the window's scope, proven against the receipt.
     assert rebuilt == [("PUBLICATION", dict(
         input_sha256="c" * 64, universe_sha256="b" * 64, cohort_id=context.plan.cohort_id, session=SESSION,
-        cutoff=NOW, known_by=context.window.deadline, source_generation=3))]
+        cutoff=NOW, known_by=context.window.deadline, source_generation=3,
+        allow_late_identity_continuity=False))]
     assert rebuilt[0][1]["known_by"] != NOW
     assert published[0][0] == "the-rebuilt-cycle"
     assert published[0][1] is None
@@ -586,6 +701,58 @@ def test_v2_portal_ready_proves_projection_but_publishes_into_the_input_ready_re
     assert published[0][0] == "dashboard"
     assert published[0][1].receipt_id == input_row["receipt_id"]
     assert dashboards[0]["known_by"] == context.window.deadline
+    assert dashboards[0]["allow_late_identity_continuity"] is False
+
+
+def test_publication_recovery_reads_both_receipts_from_the_explicit_source_window(monkeypatch):
+    source_window_id = uuid4()
+    rebuilt, dashboards = [], []
+    context = _context("PORTAL_PUBLISH")
+    context = replace(
+        context,
+        plan=SimpleNamespace(
+            cohort_id=context.plan.cohort_id,
+            session_date=SESSION,
+            stage_catalog_version="stages_v2",
+        ),
+    )
+    portal_row = _receipt_row(context)
+    input_row = dict(_receipt_row(context), receipt_id=uuid4())
+    database = _Database([portal_row, input_row])
+    context = replace(context, database=database)
+    environment = RunnerEnvironment(
+        None,
+        allow_late_identity_continuity=True,
+    )
+    monkeypatch.setattr(
+        runners,
+        "rehydrate_realtime_ticker_cycle",
+        lambda database, **options: rebuilt.append(options) or "cycle",
+    )
+    monkeypatch.setattr(
+        runners,
+        "compute_realtime_dashboard",
+        lambda *args, **kwargs: dashboards.append(kwargs) or "dashboard",
+    )
+    monkeypatch.setattr(
+        runners,
+        "publish_realtime_portal_cycle_atomic",
+        lambda *args, **kwargs: None,
+    )
+
+    outcome = runners.portal_publish_runner(
+        environment,
+        receipt_window_id=source_window_id,
+    )(context)
+
+    assert outcome.state == "COMPLETE"
+    assert [call[1][0] for call in database.cursor.statements[:2]] == [
+        str(source_window_id),
+        str(source_window_id),
+    ]
+    assert rebuilt[0]["known_by"] == context.window.deadline
+    assert rebuilt[0]["allow_late_identity_continuity"] is True
+    assert dashboards[0]["allow_late_identity_continuity"] is True
 
 
 def test_atomic_portal_publish_never_advances_pointer_after_dashboard_failure(

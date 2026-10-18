@@ -34,7 +34,16 @@ from .equity_interval_finalizer import _bar_revision
 from .equity_validation_source import EquityValidationIdentity
 from .stage_database_v2 import V2WorkerDatabase
 
-NATIVE_INTERVALS = {"5m": 5, "15m": 15, "30m": 30}
+SUPPORTED_NATIVE_INTERVALS = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+}
+NATIVE_INTERVALS = {
+    interval: SUPPORTED_NATIVE_INTERVALS[interval]
+    for interval in ("5m", "15m", "30m")
+}
 DERIVED_INTERVALS = ("15m", "30m", "1h", "1d", "1wk", "1mo")
 POLICY = "v2-native-recent-session-repair-v1"
 NATIVE_ENDPOINT_POLICY = {
@@ -88,14 +97,28 @@ class AuthorizedNativeRepairTransport:
         return self.delegate.get(url, params)
 
 
-def validate_native_repair_budget(member_count, session_count, requests_limit, bytes_limit, response_limit):
+def validate_native_repair_budget(
+    member_count,
+    session_count,
+    requests_limit,
+    bytes_limit,
+    response_limit,
+    *,
+    native_intervals=tuple(NATIVE_INTERVALS),
+):
     if any(type(value) is not int for value in (
         member_count, session_count, requests_limit, bytes_limit, response_limit,
     )):
         raise ValueError("native repair budget fields must be integers")
-    required = member_count * session_count * len(NATIVE_INTERVALS)
+    intervals = tuple(dict.fromkeys(native_intervals))
+    required = member_count * session_count * len(intervals)
     if (
         not 1 <= member_count <= 400 or not 1 <= session_count <= 10
+        or not intervals
+        or any(
+            interval not in SUPPORTED_NATIVE_INTERVALS
+            for interval in intervals
+        )
         or requests_limit != required or required > 2000
         or not 1024 <= response_limit <= 2 * 1024 * 1024
         or not required * (response_limit + 1) <= bytes_limit <= 512 * 1024 * 1024
@@ -116,14 +139,27 @@ class NativeRepairPlan:
     authorization_reference: str
     provider_authorization_reference: str
     expected_cost: str
+    native_intervals: tuple[str, ...] = tuple(NATIVE_INTERVALS)
+    identity_continuity: tuple[tuple[object, ...], ...] = ()
 
     def __post_init__(self):
         validate_native_repair_budget(
             len(self.identities), len(self.sessions), self.request_ceiling,
             self.byte_ceiling, self.response_byte_limit,
+            native_intervals=self.native_intervals,
         )
+        intervals = tuple(dict.fromkeys(self.native_intervals))
         if (
             not self.identities or not 1 <= len(self.sessions) <= 10
+            or not intervals
+            or any(
+                interval not in SUPPORTED_NATIVE_INTERVALS
+                for interval in intervals
+            )
+            or (
+                self.identity_continuity
+                and len(self.identity_continuity) != len(self.identities)
+            )
             or len({row.ticker for row in self.identities}) != len(self.identities)
             or len({row.instrument_id for row in self.identities}) != len(self.identities)
             or len(set(self.sessions)) != len(self.sessions)
@@ -137,6 +173,7 @@ class NativeRepairPlan:
         ):
             raise ValueError("native repair scope, authorization or budget is invalid")
         object.__setattr__(self, "authorized_until", self.authorized_until.astimezone(timezone.utc))
+        object.__setattr__(self, "native_intervals", intervals)
         for name in ("authorization_reference", "provider_authorization_reference", "expected_cost"):
             object.__setattr__(self, name, getattr(self, name).strip())
 
@@ -147,8 +184,13 @@ class NativeRepairPlan:
                 (row.instrument_id, row.ticker, row.security.security_id, row.security.payload_sha256)
                 for row in self.identities
             ),
-            "sessions": self.sessions, "native_intervals": tuple(NATIVE_INTERVALS),
-            "native_widths": NATIVE_INTERVALS,
+            "identity_continuity": self.identity_continuity,
+            "sessions": self.sessions,
+            "native_intervals": self.native_intervals,
+            "native_widths": {
+                interval: SUPPORTED_NATIVE_INTERVALS[interval]
+                for interval in self.native_intervals
+            },
             "derived_intervals": DERIVED_INTERVALS,
             "derivation_sources": REALTIME_DERIVATION_SOURCES,
             "endpoint_policy": NATIVE_ENDPOINT_POLICY,
@@ -182,7 +224,9 @@ def _native_request_spec(plan, identity, session, interval) -> NativeRequestSpec
     calendar = exchange_calendars.get_calendar("XNYS")
     opened = calendar.session_open(str(session)).to_pydatetime()
     closed = calendar.session_close(str(session)).to_pydatetime()
-    width = NATIVE_INTERVALS[interval]
+    if interval not in plan.native_intervals:
+        raise ValueError("native repair interval is outside the plan")
+    width = SUPPORTED_NATIVE_INTERVALS[interval]
     url = (
         f"{NATIVE_ENDPOINT_POLICY['base_url']}/{quote(identity.ticker, safe='')}"
         f"/range/{width}/minute/{int(opened.timestamp() * 1000)}/"
@@ -259,7 +303,9 @@ def _request(provider, transport, plan, identity, session, interval, clock):
     calendar = exchange_calendars.get_calendar("XNYS")
     opened = calendar.session_open(str(session)).to_pydatetime()
     closed = calendar.session_close(str(session)).to_pydatetime()
-    width = NATIVE_INTERVALS[interval]
+    if interval not in plan.native_intervals:
+        raise ValueError("native repair interval is outside the plan")
+    width = SUPPORTED_NATIVE_INTERVALS[interval]
     request = _native_request_spec(plan, identity, session, interval)
     digest = request.request_sha256
     request_id = uuid5(NAMESPACE_URL, f"{POLICY}:{digest}")
@@ -500,8 +546,9 @@ def execute_recent_native_repair(provider: V2ConnectionProvider, transport, plan
     outcomes = []
     observations: list[datetime] = []
     external = replayed = 0
+    external_response_bytes = sealed_response_bytes = 0
     for session in plan.sessions:
-        for interval in NATIVE_INTERVALS:
+        for interval in plan.native_intervals:
             facts, evidence_by_revision, unavailable = [], {}, []
             for identity in plan.identities:
                 try:
@@ -514,6 +561,12 @@ def execute_recent_native_repair(provider: V2ConnectionProvider, transport, plan
                     continue
                 external += used
                 replayed += 1 - used
+                response_bytes = int(
+                    recorded.completion.response_bytes or 0
+                )
+                sealed_response_bytes += response_bytes
+                if used:
+                    external_response_bytes += response_bytes
                 observed_at = recorded.completion.completed_at
                 if observed_at is None:
                     raise ValueError("sealed native repair response lacks its observation clock")
@@ -591,6 +644,8 @@ def execute_recent_native_repair(provider: V2ConnectionProvider, transport, plan
         "source_observed_from": min(observations).isoformat() if observations else None,
         "source_observed_through": max(observations).isoformat() if observations else None,
         "inspected_at": _clock_utc(clock).isoformat(),
+        "provider_response_bytes": external_response_bytes,
+        "sealed_response_bytes": sealed_response_bytes,
         "status": "COMPLETE" if all(row["status"] == "COMPLETE" for row in outcomes) else "BLOCKED",
         "release_advanced": False, "portal_readiness": "NOT_EVALUATED",
     }

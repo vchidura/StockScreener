@@ -112,9 +112,6 @@ RELATIONS: dict[str, Relation] = {
     "rt.advanced_ingress_runtime_profiles": _r(
         "control", "BOUNDED", api=True
     ),
-    "rt.advanced_ingress_cohort_bindings": _r(
-        "control", "BOUNDED", api=True
-    ),
     "rt.advanced_ingress_plans": _r(
         "control", "BOUNDED", mutable=True, api=True
     ),
@@ -123,36 +120,6 @@ RELATIONS: dict[str, Relation] = {
     ),
     "rt.advanced_journal_registry": _r(
         "control", "BOUNDED", mutable=True, api=True
-    ),
-    "rt.advanced_journal_capacity_events": _r(
-        "control", "KEPT_3M", append=True, api=True
-    ),
-    "rt.advanced_gap_repairs": _r(
-        "control", "KEPT_3M", mutable=True, api=True
-    ),
-    "rt.advanced_repair_payloads": _r(
-        "control", "HOT_TTL", append=True
-    ),
-    "rt.advanced_gap_dependencies": _r(
-        "control", "BOUNDED", mutable=True, api=True
-    ),
-    "rt.advanced_gap_alerts": _r(
-        "control", "KEPT_3M", mutable=True, api=True
-    ),
-    "rt.advanced_backfill_runs": _r(
-        "control", "KEPT_3M", mutable=True, api=True
-    ),
-    "rt.advanced_backfill_work": _r(
-        "control", "KEPT_3M", mutable=True, api=True
-    ),
-    "rt.advanced_backfill_releases": _r(
-        "control", "KEPT_3M", append=True, api=True
-    ),
-    "rt.advanced_scheduler_sessions": _r(
-        "control", "KEPT_3M", mutable=True, api=True
-    ),
-    "rt.advanced_window_retries": _r(
-        "control", "KEPT_3M", mutable=True, api=True
     ),
     "rt.stream_sessions": _r("shared", "BOUNDED", mutable=True),
     "rt.stream_gaps": _r("shared", "BOUNDED", mutable=True),
@@ -258,6 +225,7 @@ RELATIONS: dict[str, Relation] = {
     "rt.session_archives": _r("shared", "BOUNDED", append=True),
 }
 
+VIEWS = frozenset({"rt.advanced_stream_authorization_status"})
 PARTITIONED_RELATIONS = tuple(sorted(name for name, spec in RELATIONS.items() if spec.partitioned))
 
 # Retention windows (docs/REALTIME_SCHEMA_V2_DESIGN.md). Mirrors rt.partition_policies.

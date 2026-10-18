@@ -161,8 +161,6 @@ def build_commands(args):
             "stocks_realtime_v2",
             "--confirm-database-name",
             "stocks_realtime_v2",
-            "--env-file",
-            str(args.env_file),
             "--continuous",
             "--execute",
         ],
@@ -192,8 +190,6 @@ def build_commands(args):
             str(args.rest_repair_requests),
             "--rest-repair-decoded-bytes",
             str(args.rest_repair_decoded_bytes),
-            "--env-file",
-            str(args.env_file),
             "--execute",
         ],
         "scheduler": [
@@ -220,14 +216,42 @@ def build_commands(args):
             str(args.finality_delay_seconds),
             "--authorization-reference",
             args.authorization_reference,
+            "--publication-mode",
+            "projection-only",
             "--report-directory",
             str(run / "window-reports"),
-            "--env-file",
-            str(args.env_file),
             "--continuous",
             "--execute",
         ],
     }
+
+
+def process_environment(
+    environment: dict[str, str],
+    process_name: str,
+) -> dict[str, str]:
+    scoped = dict(environment)
+    allowed = {
+        "controller": {
+            "POLYGON_API_KEY",
+            "REALTIME_V2_APP_DSN",
+        },
+        "bridge": {"REALTIME_V2_APP_DSN"},
+        "finalizer": {"REALTIME_V2_APP_DSN"},
+        "scheduler": {"REALTIME_V2_APP_DSN"},
+        "api": {"REALTIME_V2_API_DSN"},
+        "frontend": set(),
+    }
+    if process_name not in allowed:
+        raise ValueError("unknown Advanced service process")
+    for name in (
+        "POLYGON_API_KEY",
+        "REALTIME_V2_APP_DSN",
+        "REALTIME_V2_API_DSN",
+    ):
+        if name not in allowed[process_name]:
+            scoped.pop(name, None)
+    return scoped
 
 
 def main(argv=None):
@@ -256,6 +280,7 @@ def main(argv=None):
         "session_date": args.session_date.isoformat(),
         "first_cutoff": args.first_cutoff.isoformat(),
         "publication_enabled": False,
+        "publication_mode": "PROJECTION_ONLY",
         "commands": commands,
     }
     args.run_directory.mkdir(parents=True)
@@ -264,7 +289,7 @@ def main(argv=None):
         encoding="utf-8",
     )
     environment = dict(os.environ)
-    frontend_environment = dict(environment)
+    frontend_environment = process_environment(environment, "frontend")
     frontend_environment.update({
         "VITE_API_PROXY_TARGET": f"http://127.0.0.1:{args.api_port}",
         "VITE_REALTIME_ONLY": "true",
@@ -288,7 +313,7 @@ def main(argv=None):
                     environment=(
                         frontend_environment
                         if name == "frontend"
-                        else environment
+                        else process_environment(environment, name)
                     ),
                     run_directory=args.run_directory,
                 )

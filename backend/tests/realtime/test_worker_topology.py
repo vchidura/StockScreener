@@ -18,9 +18,11 @@ from realtime.tier_cohort import (
 from realtime.worker_topology import (
     API_READER_POOL_BUDGET,
     RUNTIME_WORKER_POOL_BUDGET,
+    EquityRolloutMode,
     RealtimeWorkerKind,
     WorkerLane,
     build_api_reader_database_plan,
+    build_equity_rollout_plan,
     build_tier_worker_plan,
 )
 
@@ -113,9 +115,13 @@ def test_advanced_warms_in_parallel_without_replacing_developer_publisher():
         for row in plan.assignments
         if row.cohort_id == advanced.cohort_id
     )
+    assert RealtimeWorkerKind.DETECTOR_RUNNER not in _kinds(
+        plan,
+        advanced.cohort_id,
+    )
 
 
-def test_advanced_active_removes_developer_acquisition_and_keeps_hot_lane_isolated():
+def test_advanced_only_rehearsal_has_no_serving_publisher():
     advanced = _advanced()
     plan = build_tier_worker_plan(active=advanced)
     kinds = _kinds(plan, advanced.cohort_id)
@@ -124,6 +130,10 @@ def test_advanced_active_removes_developer_acquisition_and_keeps_hot_lane_isolat
     assert RealtimeWorkerKind.DEVELOPER_OPTION_ACQUISITION not in kinds
     assert RealtimeWorkerKind.ADVANCED_STOCK_GATEWAY in kinds
     assert RealtimeWorkerKind.ADVANCED_OPTION_GATEWAY in kinds
+    assert RealtimeWorkerKind.DETECTOR_RUNNER not in kinds
+    assert not any(row.publishes for row in plan.assignments)
+    assert plan.active_cohort_id is None
+    assert plan.warming_cohort_id == advanced.cohort_id
     assert all(
         row.lane is WorkerLane.HOT
         for row in plan.assignments
@@ -151,6 +161,41 @@ def test_advanced_equity_only_does_not_start_any_options_worker():
         if row.kind is RealtimeWorkerKind.RAW_JOURNAL_BRIDGE
     )
     assert bridge.database_role is RealtimeDatabaseRole.COMPUTE
+
+
+def test_canonical_rollout_modes_keep_developer_as_only_publisher():
+    developer = _developer()
+    advanced = _advanced()
+
+    developer_only = build_equity_rollout_plan(
+        EquityRolloutMode.DEVELOPER_ONLY,
+        developer=developer,
+    )
+    advanced_only = build_equity_rollout_plan(
+        EquityRolloutMode.ADVANCED_ONLY_REHEARSAL,
+        advanced=advanced,
+    )
+    shadow = build_equity_rollout_plan(
+        EquityRolloutMode.DEVELOPER_ACTIVE_ADVANCED_SHADOW,
+        developer=developer,
+        advanced=advanced,
+    )
+
+    assert {
+        row.cohort_id
+        for row in developer_only.assignments
+        if row.publishes
+    } == {developer.cohort_id}
+    assert not any(row.publishes for row in advanced_only.assignments)
+    assert {
+        row.cohort_id
+        for row in shadow.assignments
+        if row.publishes
+    } == {developer.cohort_id}
+    assert RealtimeWorkerKind.DETECTOR_RUNNER not in _kinds(
+        shadow,
+        advanced.cohort_id,
+    )
 
 
 def test_worker_database_plans_use_one_runtime_connection_and_minimum_roles():
@@ -187,4 +232,4 @@ def test_worker_and_api_budgets_have_a_preconstruction_aggregate_ceiling():
         (*plan.database_plans, api_plan),
         server_max_connections=60,
         reserved_connections=20,
-    ) == 38
+    ) == 37

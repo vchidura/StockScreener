@@ -76,6 +76,7 @@ class RealtimeScreeningInput:
     history_source_provider_tier: ProviderTier | None = None
     history_before: datetime | None = None
     history_binding_sha256: str | None = None
+    identity_continuity_sha256: str | None = None
     known_by: InitVar[datetime | None] = None
 
     def __post_init__(self, known_by):
@@ -231,7 +232,10 @@ def produce_realtime_screening(inputs: RealtimeScreeningInput) -> RealtimeScreen
         ticker, identity = member["ticker"], str(member["security_id"])
         if not member.get("security_revision_id") or member.get("security_type") not in {"CS", "ETF", "ETV"}:
             raise ValueError(f"Screening reference identity/type unavailable: {ticker}")
-        if member["observed_at"] > inputs.cutoff:
+        if (
+            member["observed_at"] > inputs.cutoff
+            and inputs.identity_continuity_sha256 is None
+        ):
             raise ValueError(f"Screening reference is not available: {ticker}")
         own = [dict(bar) for bar in bars_by_ticker.get(ticker, ())]
         _validate_bars(own, member, inputs)

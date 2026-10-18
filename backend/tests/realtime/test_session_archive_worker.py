@@ -29,7 +29,7 @@ from realtime.session_archive import (
     ArchiveRecord,
     ArchiveRow,
 )
-from realtime.session_archive_repository import _BOUND_PATTERN, _bound_date, _key_part
+from realtime.session_archive_repository import _BOUND_PATTERN, _archive_id, _bound_date, _key_part
 from realtime.session_archive_worker import (
     ALARM_BUILD_FAILED,
     ALARM_LEDGER_FAILED,
@@ -138,8 +138,23 @@ class FakeRepository:
         path = self.root / record.session_date.isoformat()
         assert any(hashlib.sha256(file.read_bytes()).hexdigest() == record.sha256
                    for file in path.glob("*.jsonl.gz")), "recorded before the file was on disk"
-        if any((r.session_date, r.kind, r.sha256) == (record.session_date, record.kind, record.sha256)
-               for r in self.records):
+        if any(
+            (
+                r.session_date,
+                r.kind,
+                r.horizon_close_date,
+                r.sha256,
+                r.build_id,
+            )
+            == (
+                record.session_date,
+                record.kind,
+                record.horizon_close_date,
+                record.sha256,
+                record.build_id,
+            )
+            for r in self.records
+        ):
             return False
         self.records.append(record)
         return True
@@ -292,6 +307,30 @@ def test_rerun_is_idempotent(repo):
     assert again.ok and {o.status for o in again.outcomes} == {STATUS_ALREADY_ARCHIVED}
     assert len(repo.records) == 3
     assert stamps == {path: path.stat().st_mtime_ns for path in repo.root.rglob("*") if path.is_file()}
+
+
+def test_rerun_fails_closed_when_existing_manifest_has_another_identity(repo):
+    session = SESSIONS[0]
+    prior_identity = ArchiveIdentity("prior-build", IDENTITY.policy_id)
+    prior_worker = SessionArchiveWorker(
+        repo,
+        repo.root,
+        prior_identity,
+        kinds=(OPTION_FLOW_CLUSTERS,),
+        clock=lambda: VERIFIED_AT,
+    )
+    assert prior_worker.archive_session(session).ok
+    manifest_path = _file(repo, session, "option_flow_clusters.manifest.json")
+    original_manifest = manifest_path.read_bytes()
+
+    result = _worker(repo, kinds=(OPTION_FLOW_CLUSTERS,)).archive_session(session)
+
+    assert not result.ok
+    assert _status(result, OPTION_FLOW_CLUSTERS) == STATUS_FAILED
+    assert _alarm_codes(result) == [ALARM_VERIFICATION_FAILED]
+    assert "IDENTITY_MISMATCH" in result.alarms[0].detail
+    assert len(repo.records) == 1
+    assert manifest_path.read_bytes() == original_manifest
 
 
 def test_a_changed_source_produces_a_new_revision_and_keeps_the_old_file(repo):
@@ -449,6 +488,69 @@ def test_failures_across_sessions_and_kinds_never_raise_and_never_stop_other_wor
         SESSIONS[0]: 3, SESSIONS[1]: 1, SESSIONS[2]: 3}
 
 
+def test_read_only_session_plan_counts_archive_sources_without_body_reads_or_writes(repo):
+    session = SESSIONS[0]
+    _seed_session(repo, session)
+    _seed_flow(repo, (session,))
+    repo.outcomes[session] = {SESSIONS[1]: [_outcome_row("m1", session)]}
+    repo.horizons[session] = [
+        AlertHorizon("closed", SESSIONS[1]),
+        AlertHorizon("open", None),
+    ]
+    repo.records.extend([
+        ArchiveRecord(
+            session,
+            STOCK_ALERTS,
+            "file:///prior-stock.jsonl.gz",
+            "1" * 64,
+            2,
+            "schema-v1",
+            "prior-build",
+            VERIFIED_AT,
+        ),
+        ArchiveRecord(
+            session,
+            STOCK_ALERTS,
+            "file:///current-stock.jsonl.gz",
+            "2" * 64,
+            2,
+            "schema-v1",
+            IDENTITY.build_id,
+            VERIFIED_AT,
+        ),
+        ArchiveRecord(
+            session,
+            OUTCOMES,
+            "file:///prior-outcomes.jsonl.gz",
+            "3" * 64,
+            1,
+            "schema-v1",
+            "prior-build",
+            VERIFIED_AT,
+            SESSIONS[1],
+        ),
+    ])
+    repo.failures[("read_rows",)] = RuntimeError("must not read archive bodies")
+    repo.failures[("record_archive",)] = RuntimeError("must not write archive ledger")
+    repo.failures[("detach_and_drop",)] = RuntimeError("must not detach")
+    plan = _worker(repo, kinds=SESSION_KINDS).plan_session_archive(session)
+    assert plan.ok and plan.open_alerts == 1
+    by_kind = {item.kind: item for item in plan.kinds}
+    assert by_kind[STOCK_ALERTS].rows == 2
+    assert by_kind[OPTION_ALERTS].rows == 1
+    assert by_kind[DETECTOR_EVALUATIONS].rows == 1
+    assert by_kind[OPTION_FLOW_EVENTS].rows == 1
+    assert by_kind[OPTION_FLOW_CLUSTERS].rows == 2
+    assert by_kind[STOCK_ALERTS].existing_archives == 2
+    assert by_kind[STOCK_ALERTS].matching_build_archives == 1
+    assert by_kind[OPTION_ALERTS].matching_build_archives == 0
+    assert by_kind[STOCK_ALERTS].as_dict()["matching_build_archives"] == 1
+    [outcome] = plan.outcomes
+    assert outcome.horizon_close_date == SESSIONS[1] and outcome.rows == 1
+    assert outcome.existing_archives == 1 and outcome.matching_build_archives == 0
+    assert repo.dropped == []
+
+
 # Drop pass ------------------------------------------------------------------------------------------
 
 
@@ -566,6 +668,52 @@ def test_only_partitions_older_than_the_online_window_are_considered(repo, as_of
     assert bool(repo.dropped) is dropped
     assert (len(report.partitions) == 1) is dropped
     assert len(repo.records) == (5 if dropped else 0)  # no archive work inside the window
+
+
+def test_read_only_drop_plan_reports_exact_missing_archives_without_writes(repo):
+    repo.failures[("read_rows",)] = RuntimeError("must not read source rows")
+    repo.failures[("record_archive",)] = RuntimeError("must not write the ledger")
+    repo.failures[("detach_and_drop",)] = RuntimeError("must not detach")
+    report = _worker(repo).plan_archived_partitions(
+        as_of_session=AS_OF_PAST_WINDOW,
+        relations=(RELATION,),
+        health_date=date(2026, 10, 26),
+    )
+    [plan] = report.partitions
+    assert report.ok
+    assert plan.partition == PARTITION.name
+    assert plan.sessions == tuple(SESSIONS)
+    assert plan.required_kinds == (OPTION_FLOW_CLUSTERS,)
+    assert plan.missing_archives == tuple(
+        (session, OPTION_FLOW_CLUSTERS) for session in SESSIONS
+    )
+    assert plan.partition_rows == plan.covered_rows == 0
+    assert not plan.ledger_decision.drop
+    assert repo.records == [] and repo.dropped == []
+
+
+def test_read_only_drop_plan_reports_ledger_ready_but_still_requires_refresh(repo):
+    for session in SESSIONS:
+        repo.records.append(ArchiveRecord(
+            session,
+            OPTION_FLOW_CLUSTERS,
+            f"file:///archive/{session.isoformat()}.jsonl.gz",
+            "c" * 64,
+            0,
+            "v1",
+            "build",
+            VERIFIED_AT,
+        ))
+    report = _worker(repo).plan_archived_partitions(
+        as_of_session=AS_OF_PAST_WINDOW,
+        relations=(RELATION,),
+    )
+    [plan] = report.partitions
+    assert report.ok and plan.ledger_decision.drop
+    assert plan.existing_archives == len(SESSIONS)
+    assert plan.missing_archives == ()
+    assert plan.as_dict()["refresh_required_before_drop"] is True
+    assert repo.dropped == []
 
 
 def test_detach_failure_alarms_and_keeps_the_data(repo, caplog):
@@ -698,6 +846,32 @@ def test_key_parts_sort_in_their_natural_order():
     early, late = datetime(2026, 10, 5, 14, 30, tzinfo=UTC), datetime(2026, 10, 5, 14, 30, 0, 500, tzinfo=UTC)
     assert _key_part(early) < _key_part(late) and _key_part(early) == "2026-10-05T14:30:00.000000Z"
     assert _key_part("O:SPY") == "O:SPY" and _key_part(date(2026, 10, 5)) == "2026-10-05"
+
+
+def test_archive_id_includes_build_identity():
+    base = ArchiveRecord(
+        SESSIONS[0],
+        OPTION_FLOW_CLUSTERS,
+        "file:///archive.jsonl.gz",
+        "a" * 64,
+        0,
+        "schema-v1",
+        "build-1",
+        VERIFIED_AT,
+    )
+    another_build = ArchiveRecord(
+        base.session_date,
+        base.kind,
+        base.uri,
+        base.sha256,
+        base.row_count,
+        base.schema_version,
+        "build-2",
+        base.verified_at,
+    )
+
+    assert _archive_id(base) == _archive_id(base)
+    assert _archive_id(base) != _archive_id(another_build)
 
 
 def test_partition_bounds_are_read_as_session_dates():

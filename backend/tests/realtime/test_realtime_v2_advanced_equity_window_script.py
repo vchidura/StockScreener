@@ -39,17 +39,13 @@ def test_advanced_window_is_unpublished_by_default(tmp_path, monkeypatch):
     assert not args.publish
 
 
-def test_publication_requires_a_separate_reference():
+def test_alert_strategy_and_publication_stages_remain_disabled_until_p11():
     with pytest.raises(SystemExit):
         script.parse_args([*BASE, "--publish"])
-
-    args = script.parse_args([
-        *BASE,
-        "--publish",
-        "--publication-reference",
-        "approved-release",
-    ])
-    assert "PORTAL_PUBLISH" in args.enabled_stages
+    with pytest.raises(SystemExit):
+        script.parse_args([*BASE, "--include-alerts"])
+    with pytest.raises(SystemExit):
+        script.parse_args([*BASE, "--include-strategies"])
 
 
 def test_window_requires_execution_and_aligned_scope():
@@ -76,3 +72,11 @@ def test_receipt_reuse_requires_a_durable_retry_identity():
 
     assert args.window_key_suffix == "-retry1"
     assert args.reuse_input_receipt
+
+    with pytest.raises(SystemExit):
+        script.parse_args([
+            *BASE,
+            "--window-key-suffix=-retry1",
+            "--retry-release-now",
+            "--reuse-portal-receipt",
+        ])

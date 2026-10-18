@@ -28,6 +28,10 @@ ADVANCED_EQUITY_BRIDGE_STATE_CODEC = "advanced_equity_am_checkpoint_v1"
 MAX_ADVANCED_EQUITY_BATCH = 1_000
 
 
+class AdvancedJournalBlockedError(ValueError):
+    pass
+
+
 def _utc(value: datetime, name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{name} must be timezone-aware")
@@ -294,7 +298,9 @@ def _require_no_unresolved_am_gaps_cursor(
         ),
     )
     if cursor.fetchone() is not None:
-        raise ValueError("unresolved Advanced equity AM gap blocks checkpoint advancement")
+        raise AdvancedJournalBlockedError(
+            "unresolved Advanced equity AM gap blocks checkpoint advancement"
+        )
 
 
 def _load_security_ids_cursor(

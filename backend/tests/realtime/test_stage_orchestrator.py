@@ -21,7 +21,13 @@ from realtime.orchestration_repository import (
     ServicePlan,
     WindowSpec,
 )
-from realtime.stage_graph import STAGE_CATALOGS, STAGES_V1, STAGES_V2, RESIDENT_SCHEDULES
+from realtime.stage_graph import (
+    RESIDENT_SCHEDULES,
+    STAGE_CATALOGS,
+    STAGES_V1,
+    STAGES_V2,
+    STAGES_V3,
+)
 from realtime.stage_orchestrator import (
     CatalogMismatch,
     MissingRunner,
@@ -244,6 +250,45 @@ def test_a_slow_v2_portal_lane_does_not_delay_the_alert_lane():
     states = harness.states(window.window_id)
     assert states["STOCK_ALERTS"] == states["EQUITY_PROJECTION"] == "COMPLETE"
     assert report.window_state == "COMPLETE"
+
+
+def test_a_failing_v3_alert_lane_does_not_cancel_portal_projection():
+    enabled = frozenset({"STOCK_ALERTS", "EQUITY_PROJECTION"})
+    harness = _memory_harness(
+        enabled,
+        catalog=STAGES_V3,
+        version="stages_v3",
+    )
+    harness.repository.upsert_readiness(
+        harness.plan.cohort_id,
+        "EQUITY_MATERIALIZE",
+        "stages_v3",
+        "READY",
+        (),
+        None,
+        NOW,
+    )
+    window = harness.window()
+    projected = threading.Event()
+
+    def fail_alert(_context):
+        return StageOutcome.failed("SYNTHETIC_ALERT_FAILURE")
+
+    def project(_context):
+        projected.set()
+        return StageOutcome.complete()
+
+    report = harness.orchestrator({
+        "STOCK_ALERTS": fail_alert,
+        "EQUITY_PROJECTION": project,
+    }).run_window(window.window_id)
+    states = harness.states(window.window_id)
+    assert projected.is_set()
+    assert states == {
+        "STOCK_ALERTS": "FAILED",
+        "EQUITY_PROJECTION": "COMPLETE",
+    }
+    assert report.window_state == "FAILED"
 
 
 def test_a_v2_alert_deadline_timeout_does_not_cancel_the_longer_portal_lane():

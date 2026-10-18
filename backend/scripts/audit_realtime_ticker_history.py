@@ -20,15 +20,18 @@ import argparse
 import json
 import sys
 from contextlib import closing
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from uuid import UUID
+
+import exchange_calendars
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 WORKSPACE_DIR = BACKEND_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from realtime.equity_portal_history import build_realtime_equity_portal_history_plan  # noqa: E402
 from realtime.migrations import validate_target_database_v2  # noqa: E402
 from scripts.realtime_script_support import write_report  # noqa: E402
 from scripts.realtime_v2_audit_support import (  # noqa: E402
@@ -152,6 +155,25 @@ def _scale(rows) -> list[dict]:
     return scale
 
 
+def _minute_ranges(starts):
+    ranges = []
+    for start in sorted(starts):
+        if not ranges or start != ranges[-1]["end"]:
+            ranges.append({
+                "start": start,
+                "end": start + timedelta(minutes=1),
+                "bars": 1,
+            })
+        else:
+            ranges[-1]["end"] = start + timedelta(minutes=1)
+            ranges[-1]["bars"] += 1
+    return tuple({
+        **item,
+        "start": item["start"].isoformat(),
+        "end": item["end"].isoformat(),
+    } for item in ranges)
+
+
 def build_report(cursor, control, *, cohort_id: UUID, session_date: date):
     cohort = str(cohort_id)
     reference_membership = query_rows(cursor, """
@@ -251,6 +273,111 @@ def build_report(cursor, control, *, cohort_id: UUID, session_date: date):
         GROUP BY tickers.ticker,bar.interval,bar.adjustment_basis
         ORDER BY tickers.ticker,bar.interval,bar.adjustment_basis
     """, (cohort, cohort, session_date))
+    one_minute_sessions = build_realtime_equity_portal_history_plan(
+        session_date,
+    ).one_minute_sessions
+    one_minute_counts = query_rows(cursor, _COHORT_MEMBERS + """
+        , selected AS (
+            SELECT bar.instrument_id,catalog.session_date,bar.source_kind
+            FROM rt.bar_current AS bar
+            JOIN rt.bar_catalog AS catalog
+                ON catalog.bar_revision_id=bar.bar_revision_id
+                AND catalog.cohort_id=bar.cohort_id
+            WHERE bar.cohort_id=%s AND bar.interval='1m'
+                AND bar.adjustment_basis='RAW_UNADJUSTED'
+                AND catalog.session_date=ANY(%s::date[])
+        )
+        SELECT tickers.ticker,sessions.session_date,
+            COUNT(selected.instrument_id) AS observed_bars,
+            ARRAY_REMOVE(
+                ARRAY_AGG(DISTINCT selected.source_kind),
+                NULL
+            ) AS sources
+        FROM tickers
+        CROSS JOIN UNNEST(%s::date[]) AS sessions(session_date)
+        LEFT JOIN selected ON selected.instrument_id=tickers.instrument_id
+            AND selected.session_date=sessions.session_date
+        GROUP BY tickers.ticker,sessions.session_date
+        ORDER BY tickers.ticker,sessions.session_date
+    """, (
+        cohort,
+        cohort,
+        list(one_minute_sessions),
+        list(one_minute_sessions),
+    ))
+    calendar = exchange_calendars.get_calendar("XNYS")
+    expected_one_minute = {
+        session: int((
+            calendar.session_close(str(session)).to_pydatetime()
+            - calendar.session_open(str(session)).to_pydatetime()
+        ).total_seconds() // 60)
+        for session in one_minute_sessions
+    }
+    one_minute_counts = tuple(
+        {
+            **row,
+            "expected_bars": expected_one_minute[row["session_date"]],
+            "missing_bars": max(
+                0,
+                expected_one_minute[row["session_date"]]
+                - int(row["observed_bars"]),
+            ),
+            "complete": (
+                int(row["observed_bars"])
+                == expected_one_minute[row["session_date"]]
+                and tuple(row["sources"]) == ("NATIVE_REST",)
+            ),
+        }
+        for row in one_minute_counts
+    )
+    one_minute_bars = query_rows(cursor, _COHORT_MEMBERS + """
+        SELECT tickers.ticker,catalog.session_date,bar.bar_start
+        FROM tickers
+        JOIN rt.bar_current AS bar
+            ON bar.cohort_id=%s
+            AND bar.instrument_id=tickers.instrument_id
+            AND bar.interval='1m'
+            AND bar.adjustment_basis='RAW_UNADJUSTED'
+        JOIN rt.bar_catalog AS catalog
+            ON catalog.bar_revision_id=bar.bar_revision_id
+            AND catalog.cohort_id=bar.cohort_id
+            AND catalog.session_date=ANY(%s::date[])
+        ORDER BY tickers.ticker,catalog.session_date,bar.bar_start
+    """, (cohort, cohort, list(one_minute_sessions)))
+    observed_one_minute = {}
+    for row in one_minute_bars:
+        observed_one_minute.setdefault(
+            (row["ticker"], row["session_date"]),
+            set(),
+        ).add(row["bar_start"])
+    expected_starts = {}
+    for selected_session in one_minute_sessions:
+        opened = calendar.session_open(
+            str(selected_session),
+        ).to_pydatetime()
+        closed = calendar.session_close(
+            str(selected_session),
+        ).to_pydatetime()
+        expected_starts[selected_session] = tuple(
+            opened + timedelta(minutes=offset)
+            for offset in range(int((closed - opened).total_seconds() // 60))
+        )
+    one_minute_missing_ranges = tuple(
+        {
+            "ticker": row["ticker"],
+            "session_date": row["session_date"],
+            "missing_bars": row["missing_bars"],
+            "ranges": _minute_ranges(
+                set(expected_starts[row["session_date"]])
+                - observed_one_minute.get(
+                    (row["ticker"], row["session_date"]),
+                    set(),
+                )
+            ),
+        }
+        for row in one_minute_counts
+        if row["missing_bars"]
+    )
     reference_integrity = by_reference_integrity(cursor, cohort)
     return {
         "database": control["database"],
@@ -268,6 +395,8 @@ def build_report(cursor, control, *, cohort_id: UUID, session_date: date):
         "current_screening": current_screening,
         "latest_retained_sessions": latest_sessions,
         "interval_counts": interval_counts,
+        "one_minute_session_counts": one_minute_counts,
+        "one_minute_missing_ranges": one_minute_missing_ranges,
         "daily_scale": _scale(interval_counts),
         "by_reference_integrity": reference_integrity,
         "database_writes": 0,

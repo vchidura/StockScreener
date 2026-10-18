@@ -87,11 +87,43 @@ def test_advanced_supervisor_has_no_developer_rest_process(
     assert "run_realtime_v2_advanced_equity_scheduler.py" in flattened
     assert "developer" not in flattened.lower()
     assert "--publish" not in flattened
+    scheduler = commands["scheduler"]
+    assert scheduler[
+        scheduler.index("--publication-mode") + 1
+    ] == "projection-only"
     controller = commands["controller"]
     assert "--authorization-id" in controller
     assert "--universe-target" in controller
     assert "--cohort-id" not in controller
     assert "--authorization-reference" not in controller
+
+
+def test_process_environments_scope_provider_and_database_secrets():
+    environment = {
+        "POLYGON_API_KEY": "provider",
+        "REALTIME_V2_APP_DSN": "app",
+        "REALTIME_V2_API_DSN": "api",
+        "PATH": "retained",
+    }
+
+    controller = script.process_environment(environment, "controller")
+    bridge = script.process_environment(environment, "bridge")
+    api = script.process_environment(environment, "api")
+    frontend = script.process_environment(environment, "frontend")
+
+    assert set(controller) >= {
+        "POLYGON_API_KEY",
+        "REALTIME_V2_APP_DSN",
+        "PATH",
+    }
+    assert "REALTIME_V2_API_DSN" not in controller
+    assert set(bridge) >= {"REALTIME_V2_APP_DSN", "PATH"}
+    assert "POLYGON_API_KEY" not in bridge
+    assert "REALTIME_V2_API_DSN" not in bridge
+    assert set(api) >= {"REALTIME_V2_API_DSN", "PATH"}
+    assert "POLYGON_API_KEY" not in api
+    assert "REALTIME_V2_APP_DSN" not in api
+    assert frontend == {"PATH": "retained"}
 
 
 def test_environment_selector_chooses_separate_supervisors():

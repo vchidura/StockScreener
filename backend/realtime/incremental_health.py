@@ -122,22 +122,23 @@ def collect_incremental_health_cursor(
     ))
 
     cursor.execute(
-        "SELECT window.state,COUNT(*) AS windows,MAX(window.cutoff) AS latest_cutoff "
-        "FROM rt.window_runs AS window "
+        "SELECT window_run.state,COUNT(*) AS windows,"
+        "MAX(window_run.cutoff) AS latest_cutoff "
+        "FROM rt.window_runs AS window_run "
         "JOIN rt.service_plans AS plan USING(plan_id) "
-        "WHERE window.cohort_id=%s AND plan.session_date=%s "
-        "GROUP BY window.state ORDER BY window.state",
+        "WHERE window_run.cohort_id=%s AND plan.session_date=%s "
+        "GROUP BY window_run.state ORDER BY window_run.state",
         (str(cohort_id), session_date),
     )
     windows = _rows(cursor, ("state", "windows", "latest_cutoff"))
 
     cursor.execute(
         "SELECT stage.stage_id,stage.state,COUNT(*) AS runs, "
-        "MAX(window.cutoff) AS latest_cutoff "
+        "MAX(window_run.cutoff) AS latest_cutoff "
         "FROM rt.stage_runs AS stage "
-        "JOIN rt.window_runs AS window USING(window_id) "
-        "JOIN rt.service_plans AS plan ON plan.plan_id=window.plan_id "
-        "WHERE window.cohort_id=%s AND plan.session_date=%s "
+        "JOIN rt.window_runs AS window_run USING(window_id) "
+        "JOIN rt.service_plans AS plan ON plan.plan_id=window_run.plan_id "
+        "WHERE window_run.cohort_id=%s AND plan.session_date=%s "
         "GROUP BY stage.stage_id,stage.state "
         "ORDER BY stage.stage_id,stage.state",
         (str(cohort_id), session_date),

@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager
 from contextlib import contextmanager
 from pathlib import Path
 
-from dotenv import load_dotenv
 from psycopg2.pool import ThreadedConnectionPool
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -64,7 +63,6 @@ class V2ApiDatabase(V2WorkerDatabase):
 
 
 def create_app():
-    load_dotenv(BACKEND_DIR / ".env", override=True)
     dsn = os.getenv("REALTIME_V2_API_DSN", "").strip()
     if not dsn:
         raise RuntimeError("V2 portal API requires REALTIME_V2_API_DSN")

@@ -8,6 +8,7 @@ import pytest
 from realtime.advanced_equity_ingress import (
     AdvancedEquityJournalPump,
     AdvancedJournalDecodeError,
+    BoundedAsyncProgressReporter,
 )
 from realtime.buffer import BufferLimits, RawMessageBuffer
 from realtime.contracts import (
@@ -127,3 +128,47 @@ def test_journal_pump_fails_closed_for_an_unexpected_channel(tmp_path):
         match="UNEXPECTED_CHANNEL",
     ):
         pump.join(5)
+
+
+def test_journal_pump_survives_postgresql_progress_outage(tmp_path):
+    start = int(NOW.timestamp() * 1000) - 60_000
+    payload = json.dumps([{
+        "ev": "AM",
+        "sym": "SPY",
+        "o": 100,
+        "h": 101,
+        "l": 99,
+        "c": 100.5,
+        "v": 1000,
+        "vw": 100.25,
+        "s": start,
+        "e": start + 60_000,
+    }]).encode()
+    buffer = _buffer()
+    buffer.put_nowait(_message(payload))
+    path = tmp_path / "postgres-outage.sqlite"
+
+    def unavailable(_progress):
+        raise ConnectionError("PostgreSQL unavailable")
+
+    reporter = BoundedAsyncProgressReporter(unavailable)
+    pump = AdvancedEquityJournalPump(
+        buffer,
+        path,
+        GENERATION,
+        _admissions(),
+        maximum_batch_messages=4,
+        maximum_batch_bytes=64 * 1024,
+        on_progress=reporter.publish,
+    )
+
+    reporter.start()
+    pump.start()
+    pump.request_stop()
+    progress = pump.join(5)
+    reporter.stop(5)
+
+    assert progress.last_raw_offset == progress.last_event_offset == 1
+    assert RawJournalReader(path).read_normalized_after(0)
+    assert reporter.failure_count == 1
+    assert reporter.last_failure_name == "ConnectionError"

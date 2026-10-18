@@ -1,4 +1,4 @@
-"""STOCK_ALERTS and STRATEGY_PUBLISH runners: publication stages dispatched from the EQUITY_CYCLE receipt.
+"""STOCK_ALERTS and STRATEGY_PUBLISH runners dispatched from the canonical input receipt.
 
 STOCK_ALERTS computes the alert snapshot read-only under the compute role and publishes it under the
 publication role (the V2 registry lets only `publication` insert portal snapshots). STRATEGY_PUBLISH
@@ -46,10 +46,22 @@ EVALUATED_ANALYSIS_STATUSES = frozenset({"COMPLETE", "COMPLETE_EMPTY"})
 
 
 def _input_receipt(database, plan, window):
-    is_v2 = getattr(plan, "stage_catalog_version", "stages_v1") == "stages_v2"
+    is_split_graph = getattr(
+        plan,
+        "stage_catalog_version",
+        "stages_v1",
+    ) in {"stages_v2", "stages_v3"}
     return (
-        _window_receipt(database, window, receipt_kind=INPUT_READY if is_v2 else EQUITY_CYCLE),
-        INPUT_READY_RECEIPT_MISSING if is_v2 else EQUITY_CYCLE_RECEIPT_MISSING,
+        _window_receipt(
+            database,
+            window,
+            receipt_kind=INPUT_READY if is_split_graph else EQUITY_CYCLE,
+        ),
+        (
+            INPUT_READY_RECEIPT_MISSING
+            if is_split_graph
+            else EQUITY_CYCLE_RECEIPT_MISSING
+        ),
     )
 
 

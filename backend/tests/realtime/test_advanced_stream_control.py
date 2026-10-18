@@ -89,7 +89,7 @@ def test_registration_reclaims_only_an_exact_stale_owner():
     stale = datetime(2026, 10, 16, 15, 58, tzinfo=timezone.utc)
     cursor.fetchone.side_effect = (
         ("MASSIVE_ADVANCED", MANIFEST, 1, 1),
-        (UUID(int=9), OWNER, 6, GENERATION, stale),
+        (UUID(int=9), OWNER, 6, GENERATION, stale, PLAN, 25, stale),
         (UUID(int=9),),
         (7,),
     )
@@ -108,6 +108,17 @@ def test_registration_reclaims_only_an_exact_stale_owner():
     )
     assert "owner_epoch=%s" in reclaim.args[0]
     assert "heartbeat_at=%s" in reclaim.args[0]
+    gap = next(
+        call
+        for call in cursor.execute.call_args_list
+        if "INSERT INTO rt.stream_gaps" in call.args[0]
+    )
+    assert str(GENERATION) in gap.args[1]
+    assert 25 in gap.args[1]
+    assert NOW in gap.args[1]
+    assert cursor.execute.call_args_list.index(gap) < (
+        cursor.execute.call_args_list.index(reclaim)
+    )
 
 
 def test_session_usage_is_fenced_and_gap_identity_is_replay_safe():

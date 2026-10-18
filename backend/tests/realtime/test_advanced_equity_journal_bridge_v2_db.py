@@ -412,6 +412,7 @@ def test_advanced_bridge_finalizer_and_input_ready_complete_one_exact_window(dat
         cutoff=cutoff,
         known_by=deadline,
         reference_generation=1,
+        advanced_input_gate_sha256="a" * 64,
     )
     assert universe == universe_sha256
     assert len(input_sha256) == 64

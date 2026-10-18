@@ -9,6 +9,7 @@ from uuid import UUID
 from .advanced_equity_journal_bridge import (
     AdvancedEquityJournalBridgeConfig,
     AdvancedEquityJournalBridgeStatus,
+    AdvancedJournalBlockedError,
     process_advanced_equity_journal_once,
 )
 from .advanced_journal_registry import (
@@ -321,12 +322,20 @@ def replay_registered_journal_once(
         shard_ids=registration.shard_ids,
         batch_limit=batch_limit,
     )
-    status = process_advanced_equity_journal_once(
-        database,
-        RawJournalReader(path),
-        config,
-        checked_at=checked_at,
-    )
+    try:
+        status = process_advanced_equity_journal_once(
+            database,
+            RawJournalReader(path),
+            config,
+            checked_at=checked_at,
+        )
+    except AdvancedJournalBlockedError:
+        raise
+    except ValueError as error:
+        raise JournalReplayQuarantine(
+            "BRIDGE_VALIDATION_FAILED",
+            str(error)[:320],
+        ) from error
     with provider.transaction(APP_ROLE) as unit:
         update_advanced_journal_offsets_cursor(
             unit.cursor,

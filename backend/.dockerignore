@@ -18,3 +18,8 @@ Dockerfile
 .pytest_cache/
 .coverage
 htmlcov/
+.realtime-canary/
+*.sqlite
+backups/
+.cache/
+tests/

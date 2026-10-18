@@ -54,60 +54,12 @@ def advanced_input_gate_identity(
                 "Advanced input gate AM membership is not exact"
             )
         cursor.execute(
-            "SELECT session_id,journal_generation,owner_epoch,status,"
-            "subscribed_at,ended_at,event_time_watermark,"
-            "received_byte_count,decoded_byte_ceiling "
-            "FROM rt.stream_sessions "
-            "WHERE manifest_id=%s AND feed='STOCKS' "
-            "AND journal_generation IS NOT NULL "
-            "AND subscribed_at<%s "
-            "AND (ended_at IS NULL OR ended_at>=%s) "
-            "ORDER BY owner_epoch DESC,started_at DESC LIMIT 1",
-            (str(scope[0]), window.cutoff, window.cutoff),
-        )
-        session = cursor.fetchone()
-        if (
-            session is None
-            or session[3] not in {"LIVE", "STOPPING", "STOPPED"}
-            or session[4] >= window.cutoff
-            or session[6] is None
-            or session[6] < window.cutoff
-            or int(session[7]) > int(session[8])
-        ):
-            raise ValueError(
-                "Advanced input gate lacks stream finality"
-            )
-        cursor.execute(
-            "SELECT checkpoint.journal_generation,"
-            "checkpoint.owner_epoch,checkpoint.committed_offset,"
-            "convert_from(checkpoint.state_payload,'UTF8')::jsonb"
-            "->>'stream_session_id',"
-            "(convert_from(checkpoint.state_payload,'UTF8')::jsonb"
-            "->>'event_time_watermark')::timestamptz "
-            "FROM rt.consumer_checkpoints AS checkpoint "
-            "WHERE checkpoint.cohort_id=%s "
-            "AND checkpoint.journal_generation=%s "
-            "ORDER BY checkpoint.shard_id",
-            (str(plan.cohort_id), str(session[1])),
-        )
-        checkpoints = tuple(cursor.fetchall())
-        if not checkpoints or any(
-            str(row[0]) != str(session[1])
-            or int(row[1]) != int(session[2])
-            or int(row[2]) <= 0
-            or str(row[3]) != str(session[0])
-            or row[4] < window.cutoff
-            for row in checkpoints
-        ):
-            raise ValueError(
-                "Advanced input gate checkpoint coverage is incomplete"
-            )
-        cursor.execute(
             "SELECT current.instrument_id,revision.bar_start,"
-            "revision.bar_revision_id,revision.payload_sha256,"
+            "revision.bar_end,revision.bar_revision_id,"
+            "revision.payload_sha256,"
             "revision.source_kind,revision.quality_codes,"
             "revision.journal_generation,revision.stream_session_id,"
-            "revision.source_offset "
+            "revision.source_offset,revision.ingestion_segment_id "
             "FROM rt.bar_current AS current "
             "JOIN rt.bar_revisions AS revision "
             "ON revision.bar_revision_id=current.bar_revision_id "
@@ -122,12 +74,14 @@ def advanced_input_gate_identity(
             "AND current.interval='1m' "
             "AND current.adjustment_basis='RAW_UNADJUSTED' "
             "AND current.session_scope='RTH' "
+            "AND revision.session_date=%s "
             "AND revision.is_final "
-            "AND revision.bar_start>=%s AND revision.bar_end<=%s "
+            "AND current.bar_start>=%s AND current.bar_end<=%s "
             "ORDER BY current.instrument_id,revision.bar_start",
             (
                 str(plan.cohort_id),
                 list(members),
+                window_start.date(),
                 window_start,
                 window.cutoff,
             ),
@@ -148,19 +102,21 @@ def advanced_input_gate_identity(
             or any(
                 not (
                     (
-                        row[4] == "REALTIME_STREAM"
-                        and str(row[6]) == str(session[1])
-                        and str(row[7]) == str(session[0])
+                        row[5] == "REALTIME_STREAM"
+                        and row[7] is not None
                         and row[8] is not None
-                        and int(row[8]) > 0
+                        and row[9] is not None
+                        and int(row[9]) > 0
+                        and row[10] is None
                     )
                     or (
-                        row[4] == "NATIVE_REST"
+                        row[5] == "NATIVE_REST"
                         and "EXPLICIT_ADVANCED_REST_REPAIR_V1"
-                        in tuple(row[5] or ())
-                        and row[6] is None
+                        in tuple(row[6] or ())
                         and row[7] is None
                         and row[8] is None
+                        and row[9] is None
+                        and row[10] is not None
                     )
                 )
                 for row in bars
@@ -169,14 +125,198 @@ def advanced_input_gate_identity(
             raise ValueError(
                 "Advanced input gate lacks exact stream/repair bar coverage"
             )
+        stream_bars = tuple(
+            row for row in bars if row[5] == "REALTIME_STREAM"
+        )
+        if not stream_bars:
+            raise ValueError(
+                "Advanced input gate lacks fenced stream lineage"
+            )
+        session_ids = tuple(
+            sorted({str(row[8]) for row in stream_bars})
+        )
+        cursor.execute(
+            "SELECT session_id,journal_generation,owner_epoch,status,"
+            "subscribed_at,ended_at,event_time_watermark,"
+            "received_byte_count,decoded_byte_ceiling,"
+            "advanced_ingress_plan_id "
+            "FROM rt.stream_sessions "
+            "WHERE manifest_id=%s AND feed='STOCKS' "
+            "AND session_id=ANY(%s::uuid[]) "
+            "ORDER BY owner_epoch,started_at,session_id",
+            (str(scope[0]), list(session_ids)),
+        )
+        sessions = tuple(cursor.fetchall())
+        sessions_by_id = {str(row[0]): row for row in sessions}
+        lineage = {
+            (str(row[8]), str(row[7]))
+            for row in stream_bars
+        }
+        if (
+            len(sessions_by_id) != len(session_ids)
+            or {
+                (str(row[0]), str(row[1]))
+                for row in sessions
+            }
+            != lineage
+            or any(
+                row[3]
+                not in {"LIVE", "STOPPING", "STOPPED", "FAILED"}
+                or row[4] is None
+                or row[4] >= window.cutoff
+                or row[6] is None
+                or int(row[7]) > int(row[8])
+                or row[9] is None
+                for row in sessions
+            )
+        ):
+            raise ValueError(
+                "Advanced input gate lacks fenced stream finality"
+            )
+        ingress_plan_ids = {str(row[9]) for row in sessions}
+        if len(ingress_plan_ids) != 1:
+            raise ValueError(
+                "Advanced input gate spans multiple ingress plans"
+            )
+        ingress_plan_id = next(iter(ingress_plan_ids))
+        maxima = {}
+        for row in stream_bars:
+            key = (str(row[8]), str(row[7]))
+            prior = maxima.get(key)
+            candidate = (int(row[9]), row[2])
+            maxima[key] = (
+                candidate
+                if prior is None
+                else (max(prior[0], candidate[0]), max(prior[1], candidate[1]))
+            )
+        generations = tuple(
+            sorted({generation for _session, generation in lineage})
+        )
+        cursor.execute(
+            "SELECT journal_generation,stream_session_id,owner_epoch,"
+            "plan_id,status,shard_ids,shard_map_sha256 "
+            "FROM rt.advanced_journal_registry "
+            "WHERE journal_generation=ANY(%s::uuid[]) "
+            "ORDER BY owner_epoch,journal_generation",
+            (list(generations),),
+        )
+        journals = tuple(cursor.fetchall())
+        journals_by_generation = {str(row[0]): row for row in journals}
+        if (
+            len(journals_by_generation) != len(generations)
+            or any(
+                str(row[4]) not in {"WRITING", "DRAINING", "DRAINED"}
+                or str(row[3]) != ingress_plan_id
+                or (str(row[1]), str(row[0])) not in lineage
+                or int(row[2])
+                != int(sessions_by_id[str(row[1])][2])
+                for row in journals
+            )
+        ):
+            raise ValueError(
+                "Advanced input gate journal lineage is unsafe"
+            )
+        cursor.execute(
+            "SELECT checkpoint.journal_generation,"
+            "checkpoint.owner_epoch,checkpoint.committed_offset,"
+            "convert_from(checkpoint.state_payload,'UTF8')::jsonb"
+            "->>'stream_session_id',"
+            "(convert_from(checkpoint.state_payload,'UTF8')::jsonb"
+            "->>'event_time_watermark')::timestamptz,"
+            "checkpoint.shard_id,checkpoint.shard_map_sha256,"
+            "checkpoint.checkpoint_id,checkpoint.state_hash "
+            "FROM rt.consumer_checkpoints AS checkpoint "
+            "WHERE checkpoint.cohort_id=%s "
+            "AND checkpoint.journal_generation=ANY(%s::uuid[]) "
+            "ORDER BY checkpoint.journal_generation,checkpoint.shard_id",
+            (str(plan.cohort_id), list(generations)),
+        )
+        checkpoints = tuple(cursor.fetchall())
+        checkpoints_by_generation = {
+            generation: tuple(
+                row for row in checkpoints if str(row[0]) == generation
+            )
+            for generation in generations
+        }
+        checkpoint_evidence = []
+        for session_id, generation in lineage:
+            own_session = sessions_by_id[session_id]
+            journal = journals_by_generation[generation]
+            own_checkpoints = checkpoints_by_generation[generation]
+            maximum_offset, maximum_bar_end = maxima[
+                (session_id, generation)
+            ]
+            if (
+                tuple(int(value) for value in journal[5])
+                != tuple(int(row[5]) for row in own_checkpoints)
+                or not own_checkpoints
+                or any(
+                    int(row[1]) != int(own_session[2])
+                    or int(row[2]) < maximum_offset
+                    or str(row[3]) != session_id
+                    or row[4] < maximum_bar_end
+                    or str(row[6]) != str(journal[6])
+                    for row in own_checkpoints
+                )
+            ):
+                raise ValueError(
+                    "Advanced input gate checkpoint coverage is incomplete"
+                )
+            checkpoint_evidence.extend(
+                (
+                    generation,
+                    int(own_session[2]),
+                    int(row[2]),
+                    session_id,
+                    row[4],
+                    int(row[5]),
+                    str(journal[6]),
+                    str(row[7]),
+                    str(row[8]),
+                )
+                for row in own_checkpoints
+            )
+        repair_segments = tuple(
+            sorted({str(row[10]) for row in bars if row[10] is not None})
+        )
+        repair_evidence = ()
+        if repair_segments:
+            cursor.execute(
+                "SELECT batch.acquisition_batch_id,request.request_id,"
+                "request.state,request.cohort_id,gap.plan_id,"
+                "gap.recovery_status,gap.repair_status "
+                "FROM rt.acquisition_batches AS batch "
+                "JOIN rt.provider_request_ledger AS request "
+                "ON request.request_id=batch.request_id "
+                "JOIN rt.stream_gaps AS gap "
+                "ON gap.repair_reference=request.request_id "
+                "WHERE batch.acquisition_batch_id=ANY(%s::uuid[]) "
+                "ORDER BY batch.acquisition_batch_id",
+                (list(repair_segments),),
+            )
+            repair_evidence = tuple(cursor.fetchall())
+            if (
+                {str(row[0]) for row in repair_evidence}
+                != set(repair_segments)
+                or any(
+                    row[2] != "COMPLETE"
+                    or str(row[3]) != str(plan.cohort_id)
+                    or str(row[4]) != ingress_plan_id
+                    or row[5] not in {"REPAIRED", "WAIVED"}
+                    or row[6] not in {"VERIFIED", "REPAIRED"}
+                    for row in repair_evidence
+                )
+            ):
+                raise ValueError(
+                    "Advanced input gate repair authorization is incomplete"
+                )
         cursor.execute(
             "SELECT count(*) FROM rt.stream_gaps "
-            "WHERE session_id=%s AND journal_generation=%s "
+            "WHERE plan_id=%s "
             "AND gap_start<%s AND COALESCE(gap_end,%s)>%s "
             "AND recovery_status NOT IN ('REPAIRED','WAIVED')",
             (
-                str(session[0]),
-                str(session[1]),
+                ingress_plan_id,
                 window.cutoff,
                 window.cutoff,
                 window_start,
@@ -190,12 +330,34 @@ def advanced_input_gate_identity(
         {
             "contract": "advanced-equity-input-gate-v1",
             "cohort_id": plan.cohort_id,
-            "window_id": window.window_id,
             "window_start": window_start,
             "cutoff": window.cutoff,
             "members": members,
-            "session": session,
-            "checkpoints": checkpoints,
+            "ingress_plan_id": ingress_plan_id,
+            "sessions": tuple(
+                (
+                    str(row[0]),
+                    str(row[1]),
+                    int(row[2]),
+                    row[4],
+                    str(row[9]),
+                )
+                for row in sessions
+            ),
+            "journals": tuple(
+                (
+                    str(row[0]),
+                    str(row[1]),
+                    int(row[2]),
+                    str(row[3]),
+                    tuple(int(value) for value in row[5]),
+                    str(row[6]),
+                )
+                for row in journals
+            ),
+            "checkpoints": tuple(sorted(checkpoint_evidence)),
+            "repair_evidence": repair_evidence,
+            "overlapping_gap_verdict": "CLEAR",
             "bars": bars,
         }
     )

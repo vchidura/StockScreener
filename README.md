@@ -1569,6 +1569,22 @@ docker compose --env-file backend/.env ps
 The `equity` profile starts both canonical workers. Do not enable the
 `equity-stream` profile.
 
+Advanced Equity V2 uses a separate Compose project and process-scoped Docker
+secrets. The initial authorized mode is provider-free and projection-only:
+
+```powershell
+$env:REALTIME_V2_ADVANCED_COHORT_ID = `
+  "713278f5-e83d-55f5-98c3-c930be03e9c8"
+docker compose -f docker-compose.realtime-v2.yml up -d --build `
+  realtime-v2-advanced-api realtime-v2-advanced-frontend `
+  realtime-v2-advanced-bridge realtime-v2-advanced-finalizer
+```
+
+See [deployment](docs/DEPLOYMENT.md) for secret preparation, redaction checks,
+health/status commands, stop, backup and rollback. Do not start
+`realtime-v2-advanced-provider` or the Advanced scheduler without an exact
+provider/session/cutoff authorization.
+
 ## Verification
 
 Run the storage validator after schema installation, ingestion, restoration, or

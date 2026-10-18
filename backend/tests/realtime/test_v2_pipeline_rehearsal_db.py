@@ -116,6 +116,10 @@ from realtime.advanced_equity_journal_bridge import (
     AdvancedEquityJournalBridgeConfig,
     process_advanced_equity_journal_once,
 )
+from realtime.advanced_scheduler import (
+    ADVANCED_WINDOW_BUILD_ID,
+    discover_advanced_window_recovery_cursor,
+)
 from realtime.advanced_gateway import AdvancedGateway, GatewayConfiguration
 from realtime.bridge import drain_raw_buffer_once
 from realtime.buffer import BufferLimits, RawMessageBuffer
@@ -137,6 +141,7 @@ from realtime.database_access import (
     RoleScopedConnectionProvider,
 )
 from realtime.database_access_v2 import (
+    APP_ROLE,
     OWNER_POOL,
     V2AccessConfig,
     V2ConnectionProvider,
@@ -154,6 +159,7 @@ from realtime.equity_interval_finalizer import (
     enqueue_five_minute_finalizer_jobs_cursor,
     run_five_minute_finalizer_once,
 )
+from realtime.equity_worker_service import EQUITY_INTERVAL_DERIVE_JOB
 from realtime.journal import RawJournalReader, RawJournalWriter
 from realtime.lineage_head import (
     BOUNDED_MANIFEST_BYTES,
@@ -161,12 +167,22 @@ from realtime.lineage_head import (
     inputs_sha256,
     reference_set,
 )
+from realtime.materialization_jobs import (
+    BarrierMember,
+    build_closure_materialization_job,
+    enqueue_materialization_job_cursor,
+    open_job_barrier_cursor,
+)
 from realtime.normalizer import (
     NORMALIZER_VERSION,
     InstrumentAdmission,
     normalize_raw_message,
 )
-from realtime.orchestration_repository import PostgresOrchestrationRepository, WindowSpec
+from realtime.orchestration_repository import (
+    CycleReceiptSpec,
+    PostgresOrchestrationRepository,
+    WindowSpec,
+)
 from realtime.portal_compatibility_repository import RealtimeScreeningRepository, load_session_close_releases
 from realtime.portal_api import build_realtime_portal_repositories, create_realtime_portal_app
 from realtime.portal_projection import build_portal_snapshot
@@ -191,7 +207,7 @@ from realtime.security_v2 import (
     harden_database_v2,
 )
 from realtime.stage_database_v2 import StageProcessPlan, V2StageDatabase, V2WorkerDatabase
-from realtime.stage_graph import STAGES_V2
+from realtime.stage_graph import STAGES_V2, STAGES_V3
 from realtime.stage_orchestrator import StageOrchestrator, StageOutcome
 from realtime.stage_runners_alerts import EVALUATED_ANALYSIS_STATUSES
 from realtime.stage_runners_equity import (
@@ -199,6 +215,7 @@ from realtime.stage_runners_equity import (
     INPUT_READY,
     PORTAL_READY,
     input_ready_identity,
+    reuse_advanced_input_ready_runner,
 )
 from realtime.stage_runners_v2 import build_runners
 from realtime.stock_alert_projection import STOCK_ALERTS_VERSION
@@ -261,7 +278,7 @@ def timed_phases(patch) -> None:
     import realtime.stage_runners_ingest as ingest_runners
 
     for module, name in ((equity_runners, "drain_equity_bar_jobs"), (equity_runners, "compute_realtime_ticker_cycle"),
-                         (equity_runners, "publish_realtime_ticker_cycle"),
+                         (equity_runners, "publish_realtime_portal_cycle_atomic"),
                          (alert_runners, "compute_realtime_stock_alerts"),
                          (alert_runners, "publish_realtime_stock_alerts"),
                          (alert_runners, "materialize_due_realtime_strategies"),
@@ -1901,11 +1918,22 @@ def _advanced_status(status):
     ).encode("ascii")
 
 
-def _seed_advanced_rehearsal(rehearsal, *, cutoff, enabled):
+def _seed_advanced_rehearsal(
+    rehearsal,
+    *,
+    cutoff,
+    enabled,
+    stage_catalog_version="stages_v2",
+):
     profile_id, manifest_id, cohort_id, plan_id = uuid4(), uuid4(), uuid4(), uuid4()
     session_id, owner_id = uuid4(), uuid4()
+    authorization_id, ingress_plan_id = uuid4(), uuid4()
     digest = lambda: uuid4().hex + uuid4().hex  # noqa: E731
     born = rehearsal.opened - timedelta(hours=1)
+    runtime_profile_sha256 = digest()
+    runtime_policy_sha256 = digest()
+    authorization_scope_sha256 = digest()
+    configuration_sha256 = digest()
     universe_sha256, allocation_policy_sha256 = rehearsal.q(
         "SELECT manifest.universe_sha256, manifest.allocation_policy_sha256 "
         "FROM rt.cohorts AS cohort JOIN rt.subscription_manifests AS manifest USING (manifest_id) "
@@ -1922,7 +1950,7 @@ def _seed_advanced_rehearsal(rehearsal, *, cutoff, enabled):
             "%s,'PASSIVE',false,false,%s)",
             (
                 str(profile_id),
-                digest(),
+                configuration_sha256,
                 digest(),
                 digest(),
                 universe_sha256,
@@ -1968,24 +1996,11 @@ def _seed_advanced_rehearsal(rehearsal, *, cutoff, enabled):
                 str(cohort_id),
                 digest(),
                 str(manifest_id),
-                digest(),
+                configuration_sha256,
                 digest(),
                 digest(),
                 born,
                 born,
-            ),
-        )
-        cursor.execute(
-            "INSERT INTO rt.stream_sessions ("
-            "session_id, provider, feed, manifest_id, owner_id, owner_epoch, "
-            "started_at, subscribed_at, status"
-            ") VALUES (%s,'synthetic-advanced','STOCKS',%s,%s,7,%s,%s,'LIVE')",
-            (
-                str(session_id),
-                str(manifest_id),
-                str(owner_id),
-                cutoff - timedelta(minutes=10),
-                cutoff - timedelta(minutes=9),
             ),
         )
         calendar = exchange_calendars.get_calendar("XNYS")
@@ -2021,14 +2036,121 @@ def _seed_advanced_rehearsal(rehearsal, *, cutoff, enabled):
             "INSERT INTO rt.service_plans ("
             "plan_id, cohort_id, session_date, stage_catalog_version, enabled_stages, "
             "config_sha256, deadline, scope_reference"
-            ") VALUES (%s,%s,%s,'stages_v2',%s,%s,%s,'synthetic Advanced e2e')",
+            ") VALUES (%s,%s,%s,%s,%s,%s,%s,'synthetic Advanced e2e')",
             (
                 str(plan_id),
                 str(cohort_id),
                 rehearsal.session,
+                stage_catalog_version,
                 sorted(enabled),
                 digest(),
                 datetime.now(UTC) + timedelta(hours=1),
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO rt.advanced_ingress_runtime_profiles ("
+            "runtime_profile_sha256,runtime_profile_version,universe_target,"
+            "ladder_position,provider_tier,feed,channels,profile_document,"
+            "configuration_sha256,runtime_policy_sha256,status,"
+            "created_at"
+            ") VALUES (%s,%s,%s,0,'MASSIVE_ADVANCED','STOCKS',"
+            "ARRAY['AM']::text[],'{}'::jsonb,%s,%s,'CANDIDATE',%s)",
+            (
+                runtime_profile_sha256,
+                f"ew-01-profile-{runtime_profile_sha256[:12]}",
+                len(TICKERS),
+                configuration_sha256,
+                runtime_policy_sha256,
+                born,
+            ),
+        )
+        cursor.execute(
+            "UPDATE rt.advanced_ingress_runtime_profiles SET status='ACTIVE',"
+            "stability_evidence_sha256=%s,capacity_evidence_sha256=%s,"
+            "activation_approval_reference='ew-01-rehearsal',activated_at=%s "
+            "WHERE runtime_profile_sha256=%s",
+            (
+                digest(),
+                digest(),
+                born,
+                runtime_profile_sha256,
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO rt.advanced_stream_authorizations ("
+            "authorization_id,authorization_reference,scope_sha256,provider,"
+            "feed,channel,allowed_universe_targets,valid_from,valid_through,"
+            "maximum_daily_stream_sessions,maximum_daily_connection_attempts,"
+            "maximum_daily_decoded_bytes,maximum_daily_rest_repair_requests,"
+            "maximum_daily_rest_repair_decoded_bytes,runtime_policy_sha256,"
+            "approval_source,approval_reference,status,created_at"
+            ") VALUES (%s,%s,%s,'massive','STOCKS','AM',%s,%s,%s,2,2,"
+            "1000000,0,0,%s,'synthetic','ew-01-rehearsal','READY',%s)",
+            (
+                str(authorization_id),
+                f"ew-01-{authorization_id}",
+                authorization_scope_sha256,
+                [len(TICKERS)],
+                rehearsal.session,
+                rehearsal.session,
+                runtime_policy_sha256,
+                born,
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO rt.advanced_ingress_plans ("
+            "plan_id,plan_sha256,authorization_id,authorization_scope_sha256,"
+            "service_plan_id,cohort_id,manifest_id,session_date,universe_target,"
+            "mode,runtime_profile_version,runtime_profile_sha256,"
+            "configuration_sha256,runtime_policy_sha256,authorized_start_at,"
+            "authorized_end_at,maximum_stream_sessions,"
+            "maximum_connection_attempts,maximum_decoded_bytes,"
+            "maximum_rest_repair_requests,"
+            "maximum_rest_repair_decoded_bytes,status,created_at,activated_at"
+            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'SHADOW',%s,%s,%s,%s,"
+            "%s,%s,2,2,1000000,0,0,'READY',%s,NULL)",
+            (
+                str(ingress_plan_id),
+                digest(),
+                str(authorization_id),
+                authorization_scope_sha256,
+                str(plan_id),
+                str(cohort_id),
+                str(manifest_id),
+                rehearsal.session,
+                len(TICKERS),
+                f"ew-01-profile-{runtime_profile_sha256[:12]}",
+                runtime_profile_sha256,
+                configuration_sha256,
+                runtime_policy_sha256,
+                rehearsal.opened,
+                rehearsal.closed + timedelta(hours=1),
+                born,
+            ),
+        )
+        cursor.execute(
+            "UPDATE rt.advanced_ingress_plans SET status='ACTIVE',"
+            "activated_at=%s WHERE plan_id=%s",
+            (born, str(ingress_plan_id)),
+        )
+        cursor.execute(
+            "INSERT INTO rt.advanced_ingress_plan_usage (plan_id) "
+            "VALUES (%s)",
+            (str(ingress_plan_id),),
+        )
+        cursor.execute(
+            "INSERT INTO rt.stream_sessions ("
+            "session_id,provider,feed,manifest_id,owner_id,owner_epoch,"
+            "started_at,subscribed_at,status,advanced_ingress_plan_id"
+            ") VALUES (%s,'synthetic-advanced','STOCKS',%s,%s,7,%s,%s,"
+            "'LIVE',%s)",
+            (
+                str(session_id),
+                str(manifest_id),
+                str(owner_id),
+                cutoff - timedelta(minutes=10),
+                cutoff - timedelta(minutes=9),
+                str(ingress_plan_id),
             ),
         )
     return SimpleNamespace(
@@ -2036,6 +2158,7 @@ def _seed_advanced_rehearsal(rehearsal, *, cutoff, enabled):
         plan_id=plan_id,
         manifest_id=manifest_id,
         session_id=session_id,
+        ingress_plan_id=ingress_plan_id,
     )
 
 
@@ -2343,7 +2466,7 @@ def _advanced_api_app(*, api_pool, api_role, clock):
     provider = RoleScopedConnectionProvider(
         {RealtimeDatabasePrincipal.API: api_pool},
         {RealtimeDatabaseRole.READER: api_role},
-        statement_timeout_ms=30_000,
+        statement_timeout_ms=60_000,
     )
     database = RealtimeProcessDatabase(plan, provider)
     repositories = build_realtime_portal_repositories(database)
@@ -2398,7 +2521,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
     provider = runtime.provider
     enabled = frozenset(
         {
-            "EQUITY_INGEST",
+            "EQUITY_INPUT_GATE",
             "EQUITY_MATERIALIZE",
             "STOCK_ALERTS",
             "EQUITY_PROJECTION",
@@ -2410,6 +2533,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
         rehearsal,
         cutoff=cutoff,
         enabled=enabled,
+        stage_catalog_version="stages_v3",
     )
     history = _advanced_history_facts(
         rehearsal,
@@ -2435,7 +2559,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
     repository.upsert_readiness(
         seeded.cohort_id,
         "REFERENCE",
-        "stages_v2",
+        "stages_v3",
         "READY",
         (),
         "synthetic-existing-seed",
@@ -2508,6 +2632,63 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
         shard_ids=tuple(range(len(TICKERS))),
         batch_limit=len(payloads) - 1,
     )
+    rehearsal.admin(
+        "UPDATE rt.stream_sessions SET journal_generation=%s,"
+        "normalizer_version=%s,authorization_reference=%s,"
+        "budget_scope_sha256=%s,connection_attempt=1,"
+        "connection_ceiling=2,decoded_byte_ceiling=1000000,"
+        "received_frame_count=%s,received_byte_count=1000,"
+        "admitted_market_message_count=%s,"
+        "admitted_market_byte_count=1000,last_raw_offset=%s,"
+        "last_event_offset=%s,event_time_watermark=%s,"
+        "heartbeat_at=%s WHERE session_id=%s",
+        (
+            str(journal_generation),
+            NORMALIZER_VERSION,
+            "ew-01-rehearsal",
+            "a" * 64,
+            len(payloads),
+            len(payloads),
+            len(payloads),
+            len(payloads),
+            cutoff,
+            cutoff,
+            str(seeded.session_id),
+        ),
+    )
+    rehearsal.admin(
+        "INSERT INTO rt.advanced_journal_registry ("
+        "journal_generation,plan_id,stream_session_id,cohort_id,"
+        "manifest_id,session_date,owner_epoch,relative_path,"
+        "path_sha256,metadata_sha256,journal_codec,"
+        "journal_schema_version,normalizer_version,shard_ids,"
+        "shard_map_sha256,status,raw_committed_offset,"
+        "normalized_committed_offset,bridge_committed_offset"
+        ") VALUES (%s,%s,%s,%s,%s,%s,7,%s,%s,%s,'sqlite-wal',1,"
+        "%s,%s,%s,'WRITING',%s,%s,%s)",
+        (
+            str(journal_generation),
+            str(seeded.ingress_plan_id),
+            str(seeded.session_id),
+            str(seeded.cohort_id),
+            str(seeded.manifest_id),
+            rehearsal.session,
+            f"ew-01/{journal_generation}.sqlite",
+            canonical_sha256(str(journal_path)),
+            canonical_sha256(
+                {
+                    "generation": journal_generation,
+                    "session": seeded.session_id,
+                }
+            ),
+            NORMALIZER_VERSION,
+            list(bridge_config.shard_ids),
+            bridge_config.shard_map_sha256,
+            len(payloads),
+            len(payloads),
+            0,
+        ),
+    )
     bridge_database = V2WorkerDatabase(
         provider,
         RealtimeDatabaseRole.COMPUTE,
@@ -2565,6 +2746,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
             cutoff=cutoff,
             known_by=spec.deadline,
             reference_generation=reference_generation,
+            advanced_input_gate_sha256="a" * 64,
         )
     assert rehearsal.q(
         "SELECT shard_id, committed_offset FROM rt.consumer_checkpoints "
@@ -2572,9 +2754,9 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
         (str(seeded.cohort_id),),
     ) == [(0, len(payloads) - 1), (1, len(payloads) - 1)]
     rehearsal.admin(
-        "UPDATE rt.stream_gaps SET recovery_status='REPAIRED', gap_end=%s, "
-        "repair_reference=%s WHERE gap_id=%s",
-        (cutoff, str(uuid4()), str(gap_id)),
+        "UPDATE rt.stream_gaps SET recovery_status='WAIVED',gap_end=%s "
+        "WHERE gap_id=%s",
+        (cutoff, str(gap_id)),
     )
     resumed = process_advanced_equity_journal_once(
         restarted_bridge,
@@ -2594,7 +2776,143 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
     )
     assert (replayed.persisted_bars, replayed.scanned_records) == (0, 0)
 
-    build_id = "advanced-e2e-rehearsal"
+    reconnect_session_id = uuid4()
+    reconnect_generation = uuid4()
+    reconnect_payloads = tuple(
+        payload.replace(b'"v":1000', b'"v":1001')
+        for payload in payloads[-3:-1]
+    )
+    reconnect_path = tmp_path / "advanced-e2e-reconnect.sqlite"
+    reconnect_buffer = _run_advanced_fake_gateway(
+        payloads=reconnect_payloads,
+        session_id=reconnect_session_id,
+        received_at=checked_at + timedelta(seconds=2),
+    )
+    with RawJournalWriter(
+        reconnect_path,
+        generation=reconnect_generation,
+        clock=lambda: checked_at + timedelta(seconds=2),
+    ) as writer:
+        reconnect_commits = _drain_advanced_buffer(
+            reconnect_buffer,
+            writer,
+        )
+        reconnect_reader = RawJournalReader(reconnect_path)
+        admissions = {
+            ticker: InstrumentAdmission(
+                rehearsal.instrument_ids[ticker],
+                ticker,
+                ticker,
+                AssetClass.EQUITY,
+                shard_id,
+            )
+            for shard_id, ticker in enumerate(TICKERS)
+        }
+        for raw in reconnect_reader.read_after(0):
+            writer.commit_normalized(normalize_raw_message(raw, admissions))
+    assert sum(
+        row.inserted_count for row in reconnect_commits
+    ) == len(reconnect_payloads)
+    reconnect_config = AdvancedEquityJournalBridgeConfig(
+        cohort_id=seeded.cohort_id,
+        journal_generation=reconnect_generation,
+        stream_session_id=reconnect_session_id,
+        owner_epoch=8,
+        normalizer_version=NORMALIZER_VERSION,
+        shard_ids=tuple(range(len(TICKERS))),
+        batch_limit=len(reconnect_payloads),
+    )
+    rehearsal.admin(
+        "UPDATE rt.stream_sessions SET status='STOPPED',ended_at=%s "
+        "WHERE session_id=%s",
+        (cutoff, str(seeded.session_id)),
+    )
+    rehearsal.admin(
+        "INSERT INTO rt.stream_sessions ("
+        "session_id,provider,feed,manifest_id,owner_id,owner_epoch,"
+        "started_at,subscribed_at,status,journal_generation,"
+        "normalizer_version,authorization_reference,budget_scope_sha256,"
+        "connection_attempt,connection_ceiling,decoded_byte_ceiling,"
+        "received_frame_count,received_byte_count,"
+        "admitted_market_message_count,admitted_market_byte_count,"
+        "last_raw_offset,last_event_offset,event_time_watermark,"
+        "heartbeat_at,advanced_ingress_plan_id"
+        ") VALUES (%s,'synthetic-advanced','STOCKS',%s,%s,8,%s,%s,"
+        "'LIVE',%s,%s,'ew-01-rehearsal',%s,2,2,1000000,%s,1000,%s,"
+        "1000,%s,%s,%s,%s,%s)",
+        (
+            str(reconnect_session_id),
+            str(seeded.manifest_id),
+            str(uuid4()),
+            cutoff - timedelta(minutes=2),
+            cutoff - timedelta(seconds=90),
+            str(reconnect_generation),
+            NORMALIZER_VERSION,
+            "a" * 64,
+            len(reconnect_payloads),
+            len(reconnect_payloads),
+            len(reconnect_payloads),
+            len(reconnect_payloads),
+            cutoff,
+            cutoff,
+            str(seeded.ingress_plan_id),
+        ),
+    )
+    rehearsal.admin(
+        "INSERT INTO rt.advanced_journal_registry ("
+        "journal_generation,plan_id,stream_session_id,cohort_id,"
+        "manifest_id,session_date,owner_epoch,relative_path,"
+        "path_sha256,metadata_sha256,journal_codec,"
+        "journal_schema_version,normalizer_version,shard_ids,"
+        "shard_map_sha256,status,raw_committed_offset,"
+        "normalized_committed_offset,bridge_committed_offset"
+        ") VALUES (%s,%s,%s,%s,%s,%s,8,%s,%s,%s,'sqlite-wal',1,"
+        "%s,%s,%s,'WRITING',%s,%s,0)",
+        (
+            str(reconnect_generation),
+            str(seeded.ingress_plan_id),
+            str(reconnect_session_id),
+            str(seeded.cohort_id),
+            str(seeded.manifest_id),
+            rehearsal.session,
+            f"ew-01/{reconnect_generation}.sqlite",
+            canonical_sha256(str(reconnect_path)),
+            canonical_sha256(
+                {
+                    "generation": reconnect_generation,
+                    "session": reconnect_session_id,
+                }
+            ),
+            NORMALIZER_VERSION,
+            list(reconnect_config.shard_ids),
+            reconnect_config.shard_map_sha256,
+            len(reconnect_payloads),
+            len(reconnect_payloads),
+        ),
+    )
+    reconnect_result = process_advanced_equity_journal_once(
+        V2WorkerDatabase(provider, RealtimeDatabaseRole.COMPUTE),
+        RawJournalReader(reconnect_path),
+        reconnect_config,
+        checked_at=checked_at + timedelta(seconds=3),
+    )
+    assert reconnect_result.persisted_bars == len(TICKERS)
+    assert rehearsal.scalar(
+        "SELECT count(DISTINCT revision.journal_generation) "
+        "FROM rt.bar_current AS current "
+        "JOIN rt.bar_revisions AS revision "
+        "ON revision.bar_revision_id=current.bar_revision_id "
+        "AND revision.observed_at=current.observed_at "
+        "WHERE current.cohort_id=%s AND current.interval='1m' "
+        "AND current.bar_start>=%s AND current.bar_end<=%s",
+        (
+            str(seeded.cohort_id),
+            cutoff - timedelta(minutes=5),
+            cutoff,
+        ),
+    ) == 2
+
+    build_id = ADVANCED_WINDOW_BUILD_ID
     barrier_id = uuid5(
         NAMESPACE_URL,
         f"stockscreener:equity-5m-finalizer:{window.window_id}",
@@ -2642,6 +2960,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
         cutoff=cutoff,
         known_by=spec.deadline,
         reference_generation=reference_generation,
+        advanced_input_gate_sha256="a" * 64,
     )
     assert len(universe_sha256) == len(exact_input_sha256) == 64
     with restarted_bridge.transaction(read_only=True, dict_cursor=True) as cursor:
@@ -2699,11 +3018,448 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
             expected_raw_daily_sessions,
         )
 
+    projection_plan_id = repository.create_plan(
+        seeded.cohort_id,
+        rehearsal.session,
+        (
+            "EQUITY_INPUT_GATE",
+            "EQUITY_MATERIALIZE",
+            "EQUITY_PROJECTION",
+        ),
+        config_sha256=canonical_sha256(
+            {
+                "contract": "ew-01-projection-only-v1",
+                "cohort_id": seeded.cohort_id,
+                "cutoff": cutoff,
+            }
+        ),
+        deadline=spec.deadline + timedelta(minutes=5),
+        scope_reference="ew-01 projection-only rehearsal",
+        catalog_version="stages_v3",
+    )
+    projection_window = repository.ensure_window(
+        projection_plan_id,
+        WindowSpec(
+            seeded.cohort_id,
+            ProviderTier.MASSIVE_ADVANCED.value,
+            f"advanced-projection-only-{cutoff:%Y%m%dT%H%M%SZ}",
+            release_at,
+            cutoff,
+            spec.deadline,
+        ),
+    )
+    developer_universe_sha256 = rehearsal.scalar(
+        "SELECT manifest.universe_sha256 FROM rt.cohorts AS cohort "
+        "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
+        "WHERE cohort.cohort_id=%s",
+        (str(rehearsal.cohort),),
+    )
+    developer_plan_id = repository.create_plan(
+        rehearsal.cohort,
+        rehearsal.session,
+        ("EQUITY_MATERIALIZE", "EQUITY_PROJECTION"),
+        config_sha256=canonical_sha256(
+            {
+                "contract": "ew-01-developer-lane-v1",
+                "cohort_id": rehearsal.cohort,
+                "cutoff": cutoff,
+            }
+        ),
+        deadline=spec.deadline + timedelta(minutes=5),
+        scope_reference="ew-01 Developer serving lane",
+        catalog_version="stages_v2",
+    )
+    developer_window = repository.ensure_window(
+        developer_plan_id,
+        WindowSpec(
+            rehearsal.cohort,
+            ProviderTier.MASSIVE_DEVELOPER.value,
+            f"developer-ew01-{cutoff:%Y%m%dT%H%M%SZ}",
+            release_at,
+            cutoff,
+            spec.deadline,
+        ),
+    )
+    repository.upsert_readiness(
+        rehearsal.cohort,
+        "EQUITY_INGEST",
+        "stages_v2",
+        "READY",
+        (),
+        "ew-01-existing-developer-input",
+        checked_at,
+    )
+    developer_job = build_closure_materialization_job(
+        job_kind="EW01_ISOLATION",
+        cohort_id=rehearsal.cohort,
+        instrument_id=rehearsal.instrument_ids[TICKERS[0]],
+        interval="5m",
+        primary_window_id=developer_window.window_id,
+        policy_sha256="d" * 64,
+        build_id="ew-01-developer-lane-v1",
+        available_at=checked_at,
+    )
+    developer_barrier_id = uuid5(
+        NAMESPACE_URL,
+        f"ew-01-developer-barrier:{developer_window.window_id}",
+    )
+    developer_database = V2WorkerDatabase(
+        provider,
+        RealtimeDatabaseRole.COMPUTE,
+    )
+    with developer_database.transaction() as cursor:
+        enqueue_materialization_job_cursor(cursor, developer_job)
+        open_job_barrier_cursor(
+            cursor,
+            barrier_id=developer_barrier_id,
+            cohort_id=rehearsal.cohort,
+            window_id=developer_window.window_id,
+            barrier_kind="EW01_ISOLATION",
+            universe_sha256=developer_universe_sha256,
+            members=(
+                BarrierMember(
+                    "developer",
+                    "e" * 64,
+                    developer_job.job_id,
+                ),
+            ),
+        )
+    developer_receipts = {
+        "EQUITY_MATERIALIZE": CycleReceiptSpec(
+            INPUT_READY,
+            cutoff,
+            reference_generation,
+            developer_universe_sha256,
+            "f" * 64,
+            "ew-01-developer-lane-v1",
+        ),
+        "EQUITY_PROJECTION": CycleReceiptSpec(
+            PORTAL_READY,
+            cutoff,
+            reference_generation,
+            developer_universe_sha256,
+            "1" * 64,
+            "ew-01-developer-lane-v1",
+        ),
+    }
+    developer_runners = {
+        stage_id: (
+            lambda _context, receipt=receipt: StageOutcome.complete(
+                receipt=receipt
+            )
+        )
+        for stage_id, receipt in developer_receipts.items()
+    }
+    developer_orchestrator = StageOrchestrator(
+        repository,
+        developer_runners,
+        database=provider,
+        stages=STAGES_V2,
+        catalog_version="stages_v2",
+        clock=Clock(checked_at),
+    )
+    developer_orchestrator.start(developer_plan_id)
+    serving_pointer_before = (
+        rehearsal.q(
+            "SELECT * FROM rt.portal_cohort_current "
+            "ORDER BY provider_tier"
+        ),
+        rehearsal.q(
+            "SELECT * FROM rt.provider_tier_cohorts "
+            "ORDER BY provider_tier,cohort_id"
+        ),
+    )
+    projection_environment = RunnerEnvironment(
+        provider,
+        build_id=build_id,
+    )
+    projection_runners = dict(
+        build_runners(
+            {
+                "EQUITY_INPUT_GATE",
+                "EQUITY_MATERIALIZE",
+                "EQUITY_PROJECTION",
+            },
+            provider,
+            environment=projection_environment,
+        )
+    )
+    project = projection_runners["EQUITY_PROJECTION"]
+
+    def crash_after_input_ready(context):
+        if context.attempt == 1:
+            raise SimulatedCrash("projection process stopped after INPUT_READY")
+        return project(context)
+
+    projection_runners["EQUITY_PROJECTION"] = crash_after_input_ready
+
+    def projection_orchestrator(runners=projection_runners):
+        return StageOrchestrator(
+            repository,
+            runners,
+            database=provider,
+            stages=STAGES_V3,
+            catalog_version="stages_v3",
+            clock=Clock(checked_at),
+            max_attempts=2,
+            max_lane_seconds=1_500.0,
+            lane_grace_seconds=1_200.0,
+        )
+
+    projection_orchestrator().start(projection_plan_id)
+    with swallow_simulated_crash():
+        projection_orchestrator().run_window(
+            projection_window.window_id
+        )
+    assert rehearsal.q(
+        "SELECT receipt_kind FROM rt.cycle_receipts "
+        "WHERE window_id=%s ORDER BY receipt_kind",
+        (str(projection_window.window_id),),
+    ) == [(INPUT_READY,)]
+    developer_report = developer_orchestrator.run_window(
+        developer_window.window_id
+    )
+    assert developer_report.window_state == "COMPLETE"
+    assert rehearsal.scalar(
+        "SELECT state FROM rt.window_runs WHERE window_id=%s",
+        (str(projection_window.window_id),),
+    ) == "PENDING"
+    _restart_advanced_projection(projection_environment)
+    projection_report = projection_orchestrator().run_window(
+        projection_window.window_id
+    )
+    assert projection_report.window_state == "COMPLETE"
+    assert rehearsal.q(
+        "SELECT receipt_kind FROM rt.cycle_receipts "
+        "WHERE window_id=%s ORDER BY receipt_kind",
+        (str(projection_window.window_id),),
+    ) == [(INPUT_READY,), (PORTAL_READY,)]
+    projection_state = rehearsal.q(
+        "SELECT "
+        "(SELECT count(*) FROM rt.equity_evidence "
+        " WHERE cohort_id=%s),"
+        "(SELECT count(*) FROM rt.screening_generations "
+        " WHERE cohort_id=%s),"
+        "(SELECT count(*) FROM rt.materialization_jobs "
+        " WHERE cohort_id=%s),"
+        "(SELECT count(*) FROM rt.portal_releases "
+        " WHERE cohort_id=%s),"
+        "(SELECT count(*) FROM rt.portal_release_current "
+        " WHERE cohort_id=%s),"
+        "(SELECT count(*) FROM rt.release_current "
+        " WHERE cohort_id=%s),"
+        "(SELECT count(*) FROM rt.portal_cohort_current "
+        " WHERE cohort_id=%s)",
+        tuple(str(seeded.cohort_id) for _ in range(7)),
+    )[0]
+    assert projection_state[0] > 0
+    assert projection_state[1] == 1
+    assert projection_state[3:] == (0, 0, 0, 0)
+    _restart_advanced_projection(projection_environment)
+    assert projection_orchestrator().run_window(
+        projection_window.window_id
+    ).status == "NOT_CLAIMED"
+
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        recovery = discover_advanced_window_recovery_cursor(
+            unit.cursor,
+            cohort_id=seeded.cohort_id,
+            cutoff=cutoff,
+            checked_at=checked_at,
+        )
+    assert recovery.complete
+    assert recovery.input_receipt is not None
+    assert recovery.portal_receipt is not None
+    retry_window = repository.ensure_window(
+        projection_plan_id,
+        WindowSpec(
+            seeded.cohort_id,
+            ProviderTier.MASSIVE_ADVANCED.value,
+            f"advanced-projection-only-{cutoff:%Y%m%dT%H%M%SZ}-retry1",
+            release_at,
+            cutoff,
+            spec.deadline,
+        ),
+    )
+    retry_environment = RunnerEnvironment(
+        provider,
+        build_id=build_id,
+        input_known_by=recovery.input_known_by,
+    )
+    retry_runners = dict(
+        build_runners(
+            {
+                "EQUITY_INPUT_GATE",
+                "EQUITY_MATERIALIZE",
+                "EQUITY_PROJECTION",
+            },
+            provider,
+            environment=retry_environment,
+        )
+    )
+    retry_runners["EQUITY_MATERIALIZE"] = (
+        reuse_advanced_input_ready_runner(
+            retry_environment,
+            receipt=recovery.input_receipt,
+            input_known_by=recovery.input_known_by,
+            expected_gate_sha256=recovery.input_gate_sha256,
+        )
+    )
+    retry_runners["EQUITY_PROJECTION"] = (
+        lambda _context: StageOutcome.complete(
+            receipt=recovery.portal_receipt,
+            evidence_ref=(
+                "reused-portal-ready:"
+                f"{recovery.portal_receipt.input_sha256}"
+            ),
+        )
+    )
+    retry_report = projection_orchestrator(
+        retry_runners
+    ).run_window(retry_window.window_id)
+    assert retry_report.window_state == "COMPLETE"
+    assert rehearsal.q(
+        "SELECT receipt_kind,reference_generation,universe_sha256,"
+        "input_sha256,build_id FROM rt.cycle_receipts "
+        "WHERE window_id=ANY(%s::uuid[]) "
+        "ORDER BY receipt_kind,window_id",
+        (
+            [
+                str(projection_window.window_id),
+                str(retry_window.window_id),
+            ],
+        ),
+    )[::2] == rehearsal.q(
+        "SELECT receipt_kind,reference_generation,universe_sha256,"
+        "input_sha256,build_id FROM rt.cycle_receipts "
+        "WHERE window_id=ANY(%s::uuid[]) "
+        "ORDER BY receipt_kind,window_id",
+        (
+            [
+                str(projection_window.window_id),
+                str(retry_window.window_id),
+            ],
+        ),
+    )[1::2]
+    assert rehearsal.q(
+        "SELECT "
+        "(SELECT count(*) FROM rt.equity_evidence "
+        " WHERE cohort_id=%s),"
+        "(SELECT count(*) FROM rt.screening_generations "
+        " WHERE cohort_id=%s),"
+        "(SELECT count(*) FROM rt.materialization_jobs "
+        " WHERE cohort_id=%s),"
+        "(SELECT count(*) FROM rt.portal_releases "
+        " WHERE cohort_id=%s),"
+        "(SELECT count(*) FROM rt.portal_release_current "
+        " WHERE cohort_id=%s),"
+        "(SELECT count(*) FROM rt.release_current "
+        " WHERE cohort_id=%s),"
+        "(SELECT count(*) FROM rt.portal_cohort_current "
+        " WHERE cohort_id=%s)",
+        tuple(str(seeded.cohort_id) for _ in range(7)),
+    )[0] == projection_state
+    assert (
+        rehearsal.q(
+            "SELECT * FROM rt.portal_cohort_current "
+            "ORDER BY provider_tier"
+        ),
+        rehearsal.q(
+            "SELECT * FROM rt.provider_tier_cohorts "
+            "ORDER BY provider_tier,cohort_id"
+        ),
+    ) == serving_pointer_before
+    assert set(rehearsal.q(
+        "SELECT plan.cohort_id,plan.stage_catalog_version,"
+        "run.window_id,receipt.receipt_kind "
+        "FROM rt.cycle_receipts AS receipt "
+        "JOIN rt.window_runs AS run USING(window_id) "
+        "JOIN rt.service_plans AS plan USING(plan_id) "
+        "WHERE run.window_id=ANY(%s::uuid[]) "
+        "ORDER BY plan.stage_catalog_version,receipt.receipt_kind",
+        (
+            [
+                str(developer_window.window_id),
+                str(projection_window.window_id),
+                str(retry_window.window_id),
+            ],
+        ),
+    )) == {
+        (
+            rehearsal.cohort,
+            "stages_v2",
+            developer_window.window_id,
+            INPUT_READY,
+        ),
+        (
+            rehearsal.cohort,
+            "stages_v2",
+            developer_window.window_id,
+            PORTAL_READY,
+        ),
+        (
+            seeded.cohort_id,
+            "stages_v3",
+            projection_window.window_id,
+            INPUT_READY,
+        ),
+        (
+            seeded.cohort_id,
+            "stages_v3",
+            retry_window.window_id,
+            INPUT_READY,
+        ),
+        (
+            seeded.cohort_id,
+            "stages_v3",
+            projection_window.window_id,
+            PORTAL_READY,
+        ),
+        (
+            seeded.cohort_id,
+            "stages_v3",
+            retry_window.window_id,
+            PORTAL_READY,
+        ),
+    }
+    assert {
+        (row[0], row[1])
+        for row in rehearsal.q(
+            "SELECT cohort_id,window_id FROM rt.job_barriers "
+            "WHERE window_id=ANY(%s::uuid[])",
+            (
+                [
+                    str(developer_window.window_id),
+                    str(projection_window.window_id),
+                ],
+            ),
+        )
+    } == {
+        (rehearsal.cohort, developer_window.window_id),
+        (seeded.cohort_id, projection_window.window_id),
+    }
+    assert {
+        (row[0], row[1])
+        for row in rehearsal.q(
+            "SELECT cohort_id,primary_window_id "
+            "FROM rt.materialization_jobs "
+            "WHERE primary_window_id=ANY(%s::uuid[])",
+            (
+                [
+                    str(developer_window.window_id),
+                    str(projection_window.window_id),
+                ],
+            ),
+        )
+    } == {
+        (rehearsal.cohort, developer_window.window_id),
+        (seeded.cohort_id, projection_window.window_id),
+    }
+
     environment = RunnerEnvironment(provider, build_id=build_id)
     runners = dict(
         build_runners(enabled, provider, environment=environment)
     )
-    runners["EQUITY_INGEST"] = lambda context: StageOutcome.complete()
     publish = runners["PORTAL_PUBLISH"]
 
     def crash_at_publication_boundaries(context):
@@ -2721,8 +3477,8 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
             repository,
             runners,
             database=provider,
-            stages=STAGES_V2,
-            catalog_version="stages_v2",
+            stages=STAGES_V3,
+            catalog_version="stages_v3",
             clock=Clock(checked_at),
             max_attempts=3,
             max_lane_seconds=1_500.0,
@@ -2755,7 +3511,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
     stored_after_commit = {
         "bars": rehearsal.q(
             "SELECT instrument_id, interval, bar_start, count(*) "
-            "FROM rt.bar_revisions WHERE cohort_id=%s "
+            "FROM rt.bar_current WHERE cohort_id=%s "
             "AND interval IN ('1m','5m') AND bar_start>=%s AND bar_end<=%s "
             "GROUP BY instrument_id, interval, bar_start ORDER BY 1,2,3",
             (
@@ -2791,7 +3547,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
     stored_after_retry = {
         "bars": rehearsal.q(
             "SELECT instrument_id, interval, bar_start, count(*) "
-            "FROM rt.bar_revisions WHERE cohort_id=%s "
+            "FROM rt.bar_current WHERE cohort_id=%s "
             "AND interval IN ('1m','5m') AND bar_start>=%s AND bar_end<=%s "
             "GROUP BY instrument_id, interval, bar_start ORDER BY 1,2,3",
             (
@@ -2827,14 +3583,19 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
     assert all(row[3] == 1 for row in stored_after_retry["bars"])
     assert len(stored_after_retry["bars"]) == len(TICKERS) * 6
     assert stored_after_retry["jobs"] == [
-        (EQUITY_INTERVAL_FINALIZE_JOB, "COMPLETE", len(TICKERS))
+        (EQUITY_INTERVAL_DERIVE_JOB, "COMPLETE", 84),
+        (
+            EQUITY_INTERVAL_FINALIZE_JOB,
+            "COMPLETE",
+            len(TICKERS) * 2,
+        ),
     ]
     assert len(stored_after_retry["screening"]) == 1
     snapshot_identities = {
         (row[0], row[1]) for row in stored_after_retry["snapshots"]
     }
     assert len(snapshot_identities) == len(stored_after_retry["snapshots"]) == (
-        len(TICKERS) + 3
+        len(TICKERS) + 4
     )
     assert (STOCK_ALERTS_VERSION, "PLATFORM") in snapshot_identities
     assert {
@@ -2897,7 +3658,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
         (snapshot_type, snapshot_key): snapshot_id
         for snapshot_type, snapshot_key, snapshot_id, _tier, _generation, _provider_fetch in snapshot_rows
     }
-    assert len(expected_snapshots) == 5
+    assert len(expected_snapshots) == len(TICKERS) + 4
     assert {
         tier for _type, _key, _id, tier, _generation, _provider_fetch in snapshot_rows
     } == {ProviderTier.MASSIVE_ADVANCED.value}
@@ -2938,7 +3699,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
         "workspace": 200,
         **{f"ticker:{ticker}": 200 for ticker in TICKERS},
         **{f"chart:{ticker}": 200 for ticker in TICKERS},
-        "dashboard": 503,
+        "dashboard": 200,
     }
 
     catalog = first_api["screening_catalog"][2]
@@ -2956,9 +3717,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
     assert query["generation"]["source_generation"] == screening_manifest["source_generation"]
     assert alerts["provider_fetch_performed"] is False
     assert set(alerts["missing_producers"]) == {"context", "forward", "replay"}
-    assert first_api["dashboard"][2] == {
-        "detail": "Dashboard has no retained publication for this cohort"
-    }
+    assert isinstance(first_api["dashboard"][2], list)
 
     exposed_snapshot_ids = {
         workspace["publication"]["snapshot_id"],
@@ -2974,7 +3733,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
         entry["snapshot_id"] for entry in release_manifest["snapshots"]
     }
     assert exposed_snapshot_ids <= release_snapshot_ids
-    assert len(release_snapshot_ids) == 5
+    assert len(release_snapshot_ids) == len(TICKERS) + 4
     for ticker in TICKERS:
         chart = first_api[f"chart:{ticker}"][2]
         assert len(chart) > 1

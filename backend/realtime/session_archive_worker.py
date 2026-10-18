@@ -238,6 +238,134 @@ class DropReport:
         return not self.all_alarms
 
 
+@dataclass(frozen=True, slots=True)
+class ArchivePartitionPlan:
+    relation: str
+    partition: str
+    lower: date
+    upper: date
+    sessions: tuple[date, ...]
+    required_kinds: tuple[str, ...]
+    existing_archives: int
+    missing_archives: tuple[tuple[date, str], ...]
+    partition_rows: int | None
+    covered_rows: int | None
+    ledger_decision: DropDecision
+    alarms: tuple[ArchiveAlarm, ...] = ()
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "relation": self.relation,
+            "partition": self.partition,
+            "lower": self.lower.isoformat(),
+            "upper": self.upper.isoformat(),
+            "sessions": [value.isoformat() for value in self.sessions],
+            "required_kinds": list(self.required_kinds),
+            "existing_archives": self.existing_archives,
+            "missing_archives": [
+                {"session_date": session.isoformat(), "kind": kind}
+                for session, kind in self.missing_archives
+            ],
+            "partition_rows": self.partition_rows,
+            "covered_rows": self.covered_rows,
+            "ledger_action": self.ledger_decision.action,
+            "ledger_reasons": [
+                reason.as_dict() for reason in self.ledger_decision.reasons
+            ],
+            "refresh_required_before_drop": True,
+            "alarms": [alarm.as_dict() for alarm in self.alarms],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveDropPlanReport:
+    partitions: tuple[ArchivePartitionPlan, ...]
+    alarms: tuple[ArchiveAlarm, ...] = ()
+
+    @property
+    def all_alarms(self) -> tuple[ArchiveAlarm, ...]:
+        return self.alarms + tuple(
+            alarm for partition in self.partitions for alarm in partition.alarms
+        )
+
+    @property
+    def ok(self) -> bool:
+        return not self.all_alarms
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "ok": self.ok,
+            "candidate_partitions": len(self.partitions),
+            "partitions": [partition.as_dict() for partition in self.partitions],
+            "alarms": [alarm.as_dict() for alarm in self.all_alarms],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveKindSourcePlan:
+    kind: str
+    relation_counts: tuple[tuple[str, int], ...]
+    existing_archives: int
+    matching_build_archives: int
+
+    @property
+    def rows(self) -> int:
+        return sum(count for _, count in self.relation_counts)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "rows": self.rows,
+            "relation_counts": dict(self.relation_counts),
+            "existing_archives": self.existing_archives,
+            "matching_build_archives": self.matching_build_archives,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveOutcomeSourcePlan:
+    horizon_close_date: date
+    relation_counts: tuple[tuple[str, int], ...]
+    existing_archives: int
+    matching_build_archives: int
+
+    @property
+    def rows(self) -> int:
+        return sum(count for _, count in self.relation_counts)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "horizon_close_date": self.horizon_close_date.isoformat(),
+            "rows": self.rows,
+            "relation_counts": dict(self.relation_counts),
+            "existing_archives": self.existing_archives,
+            "matching_build_archives": self.matching_build_archives,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveSessionPlan:
+    session_date: date
+    kinds: tuple[ArchiveKindSourcePlan, ...]
+    outcomes: tuple[ArchiveOutcomeSourcePlan, ...]
+    open_alerts: int
+    alarms: tuple[ArchiveAlarm, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return not self.alarms
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "session_date": self.session_date.isoformat(),
+            "ok": self.ok,
+            "kinds": [kind.as_dict() for kind in self.kinds],
+            "outcomes": [outcome.as_dict() for outcome in self.outcomes],
+            "open_alerts": self.open_alerts,
+            "alarms": [alarm.as_dict() for alarm in self.alarms],
+        }
+
+
 class _ArchiveFailure(Exception):
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(detail)
@@ -337,6 +465,100 @@ class SessionArchiveWorker:
             pins.extend(self._pins(session_date, verified_horizons, alarms))
         return SessionArchiveResult(session_date, tuple(outcomes), tuple(alarms), tuple(pins))
 
+    def plan_session_archive(
+        self,
+        session_date: date,
+        kinds: Sequence[str] | None = None,
+    ) -> ArchiveSessionPlan:
+        """Count source rows and existing ledger entries without reading bodies or writing files."""
+        selected = tuple(kinds) if kinds is not None else self._kinds
+        if not selected or set(selected) - set(SESSION_KINDS):
+            raise ValueError("kinds must be a nonempty subset of the session archive kinds")
+        alarms: list[ArchiveAlarm] = []
+        try:
+            records = tuple(self._repository.list_archives(session_date))
+        except Exception as error:  # noqa: BLE001
+            records = ()
+            alarms.append(self._alarm(
+                ALARM_PARTITION_LOOKUP_FAILED,
+                _describe(error),
+                session_date,
+            ))
+        plans: list[ArchiveKindSourcePlan] = []
+        for kind in selected:
+            try:
+                counts = tuple(sorted(
+                    (relation, int(count))
+                    for relation, count in self._repository.count_rows(session_date, kind).items()
+                ))
+                plans.append(ArchiveKindSourcePlan(
+                    kind,
+                    counts,
+                    sum(
+                        record.kind == kind and record.horizon_close_date is None
+                        for record in records
+                    ),
+                    sum(
+                        record.kind == kind
+                        and record.horizon_close_date is None
+                        and record.build_id == self._identity.build_id
+                        for record in records
+                    ),
+                ))
+            except Exception as error:  # noqa: BLE001
+                alarms.append(self._alarm(
+                    ALARM_SOURCE_READ_FAILED,
+                    _describe(error),
+                    session_date,
+                    kind,
+                ))
+        outcomes: list[ArchiveOutcomeSourcePlan] = []
+        open_alerts = 0
+        if any(kind in ALERT_KINDS for kind in selected):
+            try:
+                horizons = tuple(self._repository.alert_horizons(session_date))
+                open_alerts = sum(horizon.horizon_close_date is None for horizon in horizons)
+                for horizon_close_date in sorted({
+                    horizon.horizon_close_date
+                    for horizon in horizons
+                    if horizon.horizon_close_date is not None
+                }):
+                    counts = tuple(sorted(
+                        (relation, int(count))
+                        for relation, count in self._repository.count_outcomes(
+                            session_date,
+                            horizon_close_date,
+                        ).items()
+                    ))
+                    outcomes.append(ArchiveOutcomeSourcePlan(
+                        horizon_close_date,
+                        counts,
+                        sum(
+                            record.kind == OUTCOMES
+                            and record.horizon_close_date == horizon_close_date
+                            for record in records
+                        ),
+                        sum(
+                            record.kind == OUTCOMES
+                            and record.horizon_close_date == horizon_close_date
+                            and record.build_id == self._identity.build_id
+                            for record in records
+                        ),
+                    ))
+            except Exception as error:  # noqa: BLE001
+                alarms.append(self._alarm(
+                    ALARM_PIN_LOOKUP_FAILED,
+                    _describe(error),
+                    session_date,
+                ))
+        return ArchiveSessionPlan(
+            session_date,
+            tuple(plans),
+            tuple(outcomes),
+            open_alerts,
+            tuple(alarms),
+        )
+
     def check_partition_health(self, health_date: date | None = None) -> tuple[ArchiveAlarm, ...]:
         """One alarm per rt.partition_health() row that is not OK. Never raises."""
         try:
@@ -388,6 +610,119 @@ class SessionArchiveWorker:
                     continue
                 results.append(self._consider_partition(partition, window_start, required))
         return DropReport(tuple(results), tuple(alarms))
+
+    def plan_archived_partitions(
+        self, *, as_of_session: date, relations: Sequence[str], health_date: date | None = None,
+    ) -> ArchiveDropPlanReport:
+        """Inventory archive-first drop candidates without archive, ledger or DDL writes."""
+        for relation in relations:
+            spec = RELATIONS.get(relation)
+            if spec is None or spec.retention != "ARCHIVE_FIRST" or not spec.partitioned:
+                raise ValueError(f"{relation} is not a partitioned ARCHIVE_FIRST relation")
+        plans: list[ArchivePartitionPlan] = []
+        alarms: list[ArchiveAlarm] = list(self.check_partition_health(health_date))
+        for relation in relations:
+            try:
+                policy = self._repository.partition_policy(relation)
+                required = _required_kinds(policy)
+                window_start = self._repository.session_window_start(as_of_session, policy.window_value)
+                partitions = sorted(self._repository.partitions(relation), key=lambda item: item.lower)
+            except _PolicyRefusal as refusal:
+                alarms.append(self._alarm(ALARM_PARTITION_POLICY_UNSUPPORTED, str(refusal), relation=relation))
+                continue
+            except Exception as error:  # noqa: BLE001
+                alarms.append(self._alarm(ALARM_PARTITION_LOOKUP_FAILED, _describe(error), relation=relation))
+                continue
+            for partition in partitions:
+                if partition.upper <= window_start:
+                    plans.append(self._plan_partition(partition, window_start, required))
+        return ArchiveDropPlanReport(tuple(plans), tuple(alarms))
+
+    def _plan_partition(
+        self, partition: PartitionInfo, window_start: date, required_kinds: tuple[str, ...],
+    ) -> ArchivePartitionPlan:
+        alarms: list[ArchiveAlarm] = []
+        try:
+            sessions = tuple(self._repository.sessions_between(partition.lower, partition.upper))
+            records = tuple(
+                record
+                for session in sessions
+                for record in self._repository.list_archives(session)
+            )
+        except Exception as error:  # noqa: BLE001
+            alarm = self._alarm(ALARM_PARTITION_LOOKUP_FAILED, _describe(error), relation=partition.relation)
+            decision = DropDecision(KEEP, (DropReason(ALARM_PARTITION_LOOKUP_FAILED),))
+            return ArchivePartitionPlan(
+                partition.relation, partition.name, partition.lower, partition.upper,
+                (), required_kinds, 0, (), None, None, decision, (alarm,),
+            )
+        present = {
+            (record.session_date, record.kind)
+            for record in records
+            if record.horizon_close_date is None
+        }
+        missing = tuple(
+            (session, kind)
+            for session in sessions
+            for kind in required_kinds
+            if (session, kind) not in present
+        )
+        pins: list[Pin] = []
+        partition_rows: int | None = None
+        covered_rows: int | None = None
+        try:
+            partition_rows, covered_rows = self._repository.partition_row_coverage(partition, sessions)
+            if partition_rows != covered_rows:
+                alarms.append(self._alarm(
+                    ALARM_PARTITION_ROWS_OUTSIDE_SESSIONS,
+                    f"{partition_rows - covered_rows} of {partition_rows} rows in {partition.name} "
+                    "belong to no session in the partition",
+                    relation=partition.relation,
+                ))
+                pins.append(Pin(
+                    partition.lower,
+                    PIN_ROWS_OUTSIDE_SESSIONS,
+                    f"{partition.name}:{partition_rows - covered_rows}",
+                ))
+        except Exception as error:  # noqa: BLE001
+            alarms.append(self._alarm(
+                ALARM_PARTITION_LOOKUP_FAILED,
+                _describe(error),
+                relation=partition.relation,
+            ))
+            pins.append(Pin(partition.lower, PIN_COVERAGE_UNKNOWN, partition.name))
+        if any(kind in ALERT_KINDS for kind in required_kinds):
+            for session in sessions:
+                verified_horizons = {
+                    record.horizon_close_date
+                    for record in records
+                    if record.session_date == session
+                    and record.kind == OUTCOMES
+                    and record.horizon_close_date is not None
+                }
+                pins.extend(self._pins(session, verified_horizons, alarms))
+        decision = decide_partition_drop(
+            partition.as_range(),
+            sessions,
+            records,
+            pins,
+            required_kinds=required_kinds,
+            window_start=window_start,
+        )
+        return ArchivePartitionPlan(
+            partition.relation,
+            partition.name,
+            partition.lower,
+            partition.upper,
+            sessions,
+            required_kinds,
+            len(records),
+            missing,
+            partition_rows,
+            covered_rows,
+            decision,
+            tuple(alarms),
+        )
 
     def _consider_partition(
         self, partition: PartitionInfo, window_start: date, required_kinds: tuple[str, ...],
@@ -510,7 +845,8 @@ class SessionArchiveWorker:
         source_counts = _stage(ALARM_SOURCE_READ_FAILED, counts)
         verified = _stage(ALARM_VERIFICATION_FAILED, lambda: verify_archive(
             written.data_path, written.manifest_path, kind=kind, session_date=session_date,
-            horizon_close_date=horizon_close_date, source_counts=source_counts))
+            horizon_close_date=horizon_close_date, source_counts=source_counts,
+            identity=self._identity))
         record = ArchiveRecord(
             session_date=session_date, kind=kind, uri=verified.uri, sha256=verified.sha256,
             row_count=verified.row_count, schema_version=verified.schema_version,

@@ -1,16 +1,49 @@
-"""Durable Advanced window scheduling, retries and daily lifecycle."""
+"""Advanced scheduling decisions over canonical V2 orchestration state."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from .contracts import canonical_sha256
 from .gap_repair_plan import plan_gap_repair_cursor
 from .orchestration_repository import CycleReceiptSpec
 
 
 ADVANCED_WINDOW_BUILD_ID = "advanced-equity-window-v1"
+
+
+def bind_advanced_input_gate_build_id(
+    build_id: str,
+    gate_sha256: str,
+) -> str:
+    if (
+        not build_id.strip()
+        or len(gate_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in gate_sha256
+        )
+    ):
+        raise ValueError("Advanced input receipt gate identity is invalid")
+    bound = f"{build_id}:{gate_sha256}"
+    if len(bound) > 96:
+        raise ValueError("Advanced input receipt build identity is too long")
+    return bound
+
+
+def advanced_input_gate_from_build_id(
+    build_id: str,
+    *,
+    expected_build_id: str,
+) -> str:
+    prefix = f"{expected_build_id}:"
+    if not build_id.startswith(prefix):
+        raise ValueError("Advanced input receipt build identity is invalid")
+    gate_sha256 = build_id[len(prefix):]
+    bind_advanced_input_gate_build_id(expected_build_id, gate_sha256)
+    return gate_sha256
+
+
 @dataclass(frozen=True, slots=True)
 class AdvancedSchedulerSession:
     scheduler_session_id: UUID
@@ -33,6 +66,8 @@ class AdvancedWindowRecovery:
     retry_not_before: datetime
     input_receipt: CycleReceiptSpec | None
     portal_receipt: CycleReceiptSpec | None
+    input_known_by: datetime | None
+    input_gate_sha256: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,8 +90,29 @@ def _utc(value: datetime, name: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def order_advanced_due_windows(windows):
+    """Run the latest live slot first and the oldest backlog item second."""
+    rows = tuple(windows)
+    if not rows:
+        return ()
+    cutoffs = tuple(_utc(row.cutoff, "window cutoff") for row in rows)
+    if len(set(cutoffs)) != len(cutoffs):
+        raise ValueError("Advanced due windows must have unique cutoffs")
+    ordered = tuple(
+        row
+        for _cutoff, row in sorted(
+            zip(cutoffs, rows),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+    )
+    if len(ordered) <= 2:
+        return ordered
+    return (ordered[0], ordered[-1], *ordered[1:-1])
+
+
 def ensure_advanced_scheduler_session_cursor(
-    cursor,
+    _cursor,
     *,
     authorization_id: UUID,
     ingress_plan_id: UUID | None,
@@ -70,70 +126,22 @@ def ensure_advanced_scheduler_session_cursor(
     first = _utc(first_authorized_cutoff, "first_authorized_cutoff")
     closed = _utc(session_close_at, "session_close_at")
     drain = _utc(drain_deadline, "drain_deadline")
-    checked = _utc(checked_at, "checked_at")
-    identity = {
-        "contract": "advanced-scheduler-session-v1",
-        "authorization_id": authorization_id,
-        "session_date": session_date,
-        "first_authorized_cutoff": first,
-        "session_close_at": closed,
-        "drain_deadline": drain,
-    }
+    _utc(checked_at, "checked_at")
     scheduler_session_id = uuid5(
         NAMESPACE_URL,
-        f"stockscreener:advanced-scheduler:{canonical_sha256(identity)}",
+        "stockscreener:advanced-scheduler:"
+        f"{authorization_id}:{session_date}:{first.isoformat()}",
     )
-    cursor.execute(
-        "INSERT INTO rt.advanced_scheduler_sessions ("
-        "scheduler_session_id,authorization_id,ingress_plan_id,cohort_id,"
-        "session_date,first_authorized_cutoff,session_close_at,"
-        "drain_deadline,status,reason_code,next_action,updated_at"
-        ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'ACTIVE',"
-        "'WINDOW_DISCOVERY','DISCOVER_DUE_WINDOWS',%s) "
-        "ON CONFLICT (scheduler_session_id) DO UPDATE SET "
-        "ingress_plan_id=COALESCE("
-        "rt.advanced_scheduler_sessions.ingress_plan_id,"
-        "EXCLUDED.ingress_plan_id),"
-        "cohort_id=COALESCE("
-        "rt.advanced_scheduler_sessions.cohort_id,EXCLUDED.cohort_id),"
-        "updated_at=EXCLUDED.updated_at "
-        "RETURNING scheduler_session_id,authorization_id,ingress_plan_id,"
-        "cohort_id,session_date,first_authorized_cutoff,session_close_at,"
-        "drain_deadline,status",
-        (
-            str(scheduler_session_id),
-            str(authorization_id),
-            str(ingress_plan_id) if ingress_plan_id else None,
-            str(cohort_id) if cohort_id else None,
-            session_date,
-            first,
-            closed,
-            drain,
-            checked,
-        ),
-    )
-    row = cursor.fetchone()
     return AdvancedSchedulerSession(
-        UUID(str(row[0])),
-        UUID(str(row[1])),
-        UUID(str(row[2])) if row[2] else None,
-        UUID(str(row[3])) if row[3] else None,
-        row[4],
-        row[5],
-        row[6],
-        row[7],
-        str(row[8]),
-    )
-
-
-def _receipt(row, kind: str) -> CycleReceiptSpec:
-    return CycleReceiptSpec(
-        kind,
-        row[1],
-        int(row[2]),
-        str(row[3]),
-        str(row[4]),
-        str(row[5]),
+        scheduler_session_id,
+        authorization_id,
+        ingress_plan_id,
+        cohort_id,
+        session_date,
+        first,
+        closed,
+        drain,
+        "ACTIVE",
     )
 
 
@@ -155,7 +163,7 @@ def discover_advanced_window_recovery_cursor(
         "receipt.reference_generation,receipt.universe_sha256,"
         "receipt.input_sha256,receipt.build_id,receipt.cohort_id,"
         "manifest.universe_sha256,service.stage_catalog_version,"
-        "service.cohort_id "
+        "service.cohort_id,run.deadline "
         "FROM rt.window_runs AS run "
         "JOIN rt.cohorts AS cohort ON cohort.cohort_id=run.cohort_id "
         "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
@@ -171,19 +179,14 @@ def discover_advanced_window_recovery_cursor(
     rows = tuple(cursor.fetchall())
     if not rows:
         return AdvancedWindowRecovery(
-            False,
-            None,
-            None,
-            0,
-            now,
-            None,
-            None,
+            False, None, None, 0, now, None, None, None, None
         )
     windows = {}
     receipts: dict[str, set[CycleReceiptSpec]] = {
         "INPUT_READY": set(),
         "PORTAL_READY": set(),
     }
+    input_scopes: list[tuple[int, datetime, str]] = []
     for row in rows:
         windows[str(row[0])] = row[:5]
         if row[5] is None:
@@ -196,11 +199,25 @@ def discover_advanced_window_recovery_cursor(
             str(row[9]),
             str(row[10]),
         )
+        gate_digest = (
+            advanced_input_gate_from_build_id(
+                spec.build_id,
+                expected_build_id=ADVANCED_WINDOW_BUILD_ID,
+            )
+            if spec.receipt_kind == "INPUT_READY"
+            else None
+        )
         if (
             spec.cutoff != cutoff_utc
-            or spec.build_id != ADVANCED_WINDOW_BUILD_ID
+            or (
+                spec.receipt_kind != "INPUT_READY"
+                and spec.build_id != ADVANCED_WINDOW_BUILD_ID
+            )
             or str(row[11]) != str(cohort_id)
-            or str(row[8]) != str(row[12])
+            or (
+                spec.receipt_kind == "INPUT_READY"
+                and str(row[8]) != str(row[12])
+            )
             or row[13] != "stages_v3"
             or str(row[14]) != str(cohort_id)
         ):
@@ -208,8 +225,30 @@ def discover_advanced_window_recovery_cursor(
                 "durable Advanced receipt does not match recovery scope"
             )
         receipts[spec.receipt_kind].add(spec)
+        if spec.receipt_kind == "INPUT_READY":
+            marker = "-retry"
+            suffix = (
+                str(row[1]).rsplit(marker, 1)[1]
+                if marker in str(row[1])
+                else "0"
+            )
+            attempt = int(suffix) if suffix.isdigit() else 0
+            input_scopes.append((attempt, row[15], gate_digest))
     if any(len(values) > 1 for values in receipts.values()):
         raise ValueError("durable Advanced receipts disagree")
+    if receipts["INPUT_READY"] and not input_scopes:
+        raise ValueError(
+            "durable Advanced INPUT_READY lacks its recovery scope"
+        )
+    if len({row[2] for row in input_scopes}) > 1:
+        raise ValueError(
+            "durable Advanced INPUT_READY gate digests disagree"
+        )
+    input_scope = (
+        min(input_scopes, key=lambda row: (row[0], row[1]))
+        if input_scopes
+        else None
+    )
     own = tuple(windows.values())
     complete = any(row[2] == "COMPLETE" for row in own)
     latest = max(own, key=lambda row: (row[4], row[1]))
@@ -222,25 +261,18 @@ def discover_advanced_window_recovery_cursor(
     attempts = []
     for row in own:
         marker = "-retry"
-        if marker in row[1]:
-            suffix = row[1].rsplit(marker, 1)[1]
-            if suffix.isdigit():
-                attempts.append(int(suffix))
-        else:
-            attempts.append(0)
+        suffix = row[1].rsplit(marker, 1)[1] if marker in row[1] else "0"
+        attempts.append(int(suffix) if suffix.isdigit() else 0)
     latest_attempt = max(attempts, default=-1)
     next_attempt = (
-        latest_attempt
-        if active_window_id is not None
-        else latest_attempt + 1
+        latest_attempt if active_window_id is not None else latest_attempt + 1
     )
-    retry_delay = min(
+    delay = min(
         retry_max_backoff_seconds,
-        retry_initial_backoff_seconds
-        * (2 ** max(0, next_attempt - 1)),
+        retry_initial_backoff_seconds * (2 ** max(0, next_attempt - 1)),
     )
     retry_not_before = (
-        latest[4] + timedelta(seconds=retry_delay)
+        latest[4] + timedelta(seconds=delay)
         if latest[2] in {"FAILED", "MISSED", "RETAINED_GAP"}
         else now
     )
@@ -252,11 +284,13 @@ def discover_advanced_window_recovery_cursor(
         retry_not_before,
         next(iter(receipts["INPUT_READY"]), None),
         next(iter(receipts["PORTAL_READY"]), None),
+        None if input_scope is None else input_scope[1],
+        None if input_scope is None else input_scope[2],
     )
 
 
 def ensure_advanced_window_retry_cursor(
-    cursor,
+    _cursor,
     scheduler_session_id: UUID,
     *,
     cohort_id: UUID,
@@ -281,30 +315,6 @@ def ensure_advanced_window_retry_cursor(
         f"stockscreener:advanced-window-retry:{scheduler_session_id}:"
         f"{cutoff_utc.isoformat()}:{attempt}",
     )
-    report_relative_path = (
-        f"advanced-window-{cutoff_utc:%Y%m%dT%H%M%SZ}"
-        f"-retry{attempt}.json"
-    )
-    cursor.execute(
-        "INSERT INTO rt.advanced_window_retries ("
-        "retry_id,scheduler_session_id,cutoff,attempt,window_key,window_id,"
-        "retry_not_before,status,reason_code,reused_input_receipt,"
-        "reused_portal_receipt,report_relative_path) VALUES ("
-        "%s,%s,%s,%s,%s,%s,%s,'PLANNED','DURABLE_WINDOW_DUE',%s,%s,%s) "
-        "ON CONFLICT (retry_id) DO NOTHING",
-        (
-            str(retry_id),
-            str(scheduler_session_id),
-            cutoff_utc,
-            attempt,
-            window_key,
-            str(window_id),
-            available,
-            input_receipt is not None,
-            portal_receipt is not None,
-            report_relative_path,
-        ),
-    )
     return AdvancedWindowRetry(
         retry_id,
         scheduler_session_id,
@@ -313,10 +323,47 @@ def ensure_advanced_window_retry_cursor(
         window_key,
         window_id,
         available,
-        report_relative_path,
+        (
+            f"advanced-window-{cutoff_utc:%Y%m%dT%H%M%SZ}"
+            f"-retry{attempt}.json"
+        ),
         input_receipt is not None,
         portal_receipt is not None,
     )
+
+
+def set_advanced_window_retry_status_cursor(
+    _cursor,
+    _retry_id: UUID,
+    *,
+    status: str,
+    reason_code: str,
+    checked_at: datetime,
+) -> None:
+    if status not in {
+        "PLANNED", "RUNNING", "COMPLETE", "FAILED", "BLOCKED", "SKIPPED"
+    } or not reason_code.strip():
+        raise ValueError("window retry status is invalid")
+    _utc(checked_at, "checked_at")
+
+
+def persist_advanced_scheduler_lifecycle_cursor(
+    _cursor,
+    _scheduler_session_id: UUID,
+    *,
+    status: str,
+    reason_code: str,
+    next_action: str,
+    last_discovered_cutoff: datetime | None,
+    checked_at: datetime,
+) -> None:
+    if status not in {"ACTIVE", "DRAINING", "IDLE", "BLOCKED"}:
+        raise ValueError("scheduler lifecycle status is invalid")
+    if not reason_code.strip() or not next_action.strip():
+        raise ValueError("scheduler lifecycle evidence is invalid")
+    if last_discovered_cutoff is not None:
+        _utc(last_discovered_cutoff, "last_discovered_cutoff")
+    _utc(checked_at, "checked_at")
 
 
 def load_advanced_scheduler_scope_cursor(
@@ -351,64 +398,6 @@ def load_advanced_scheduler_scope_cursor(
     }
 
 
-def set_advanced_window_retry_status_cursor(
-    cursor,
-    retry_id: UUID,
-    *,
-    status: str,
-    reason_code: str,
-    checked_at: datetime,
-) -> None:
-    terminal = status in {"COMPLETE", "FAILED", "BLOCKED", "SKIPPED"}
-    cursor.execute(
-        "UPDATE rt.advanced_window_retries SET status=%s,reason_code=%s,"
-        "updated_at=%s,completed_at=CASE WHEN %s THEN %s "
-        "ELSE completed_at END WHERE retry_id=%s RETURNING retry_id",
-        (
-            status,
-            reason_code,
-            _utc(checked_at, "checked_at"),
-            terminal,
-            _utc(checked_at, "checked_at"),
-            str(retry_id),
-        ),
-    )
-    if cursor.fetchone() is None:
-        raise ValueError("durable window retry update was rejected")
-
-
-def persist_advanced_scheduler_lifecycle_cursor(
-    cursor,
-    scheduler_session_id: UUID,
-    *,
-    status: str,
-    reason_code: str,
-    next_action: str,
-    last_discovered_cutoff: datetime | None,
-    checked_at: datetime,
-) -> None:
-    completed = status in {"IDLE", "BLOCKED"}
-    cursor.execute(
-        "UPDATE rt.advanced_scheduler_sessions SET status=%s,"
-        "reason_code=%s,next_action=%s,last_discovered_cutoff=%s,"
-        "updated_at=%s,completed_at=CASE WHEN %s THEN COALESCE("
-        "completed_at,%s) ELSE completed_at END "
-        "WHERE scheduler_session_id=%s RETURNING scheduler_session_id",
-        (
-            status,
-            reason_code,
-            next_action,
-            last_discovered_cutoff,
-            _utc(checked_at, "checked_at"),
-            completed,
-            _utc(checked_at, "checked_at"),
-            str(scheduler_session_id),
-        ),
-    )
-    if cursor.fetchone() is None:
-        raise ValueError("scheduler lifecycle update was rejected")
-
-
 def audit_completed_session_coverage_cursor(
     cursor,
     *,
@@ -433,12 +422,17 @@ def prioritize_live_over_blocked_backfill_cursor(
     *,
     checked_at: datetime,
 ) -> int:
+    # The canonical windows remain RETAINED_GAP while live windows use their
+    # own identities. No separate backfill state row is mutated.
     cursor.execute(
-        "UPDATE rt.advanced_backfill_runs SET "
-        "reason_code='LIVE_INGRESS_PRIORITY',"
-        "next_action='PAUSE_BACKFILL_KEEP_HISTORY_PUBLICATION_BLOCKED',"
-        "updated_at=%s WHERE plan_id=%s AND state='BACKFILL_BLOCKED' "
-        "RETURNING backfill_id",
-        (_utc(checked_at, "checked_at"), str(plan_id)),
+        "SELECT COUNT(*) FROM rt.window_runs AS run "
+        "JOIN rt.service_plans AS service USING(plan_id) "
+        "WHERE (service.cohort_id,service.session_date)=("
+        "SELECT cohort_id,session_date FROM rt.advanced_ingress_plans "
+        "WHERE plan_id=%s) "
+        "AND service.scope_reference LIKE 'advanced-backfill:%%' "
+        "AND run.state='RETAINED_GAP'",
+        (str(plan_id),),
     )
-    return len(cursor.fetchall())
+    _utc(checked_at, "checked_at")
+    return int(cursor.fetchone()[0])

@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import exchange_calendars
 from dotenv import load_dotenv
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -32,9 +33,8 @@ from realtime.reference_transports import (  # noqa: E402
 from scripts.realtime_script_support import write_report  # noqa: E402
 from scripts.realtime_v2_audit_support import admin_settings, connect  # noqa: E402
 
-APPROVED_SESSION_DATE = date(2026, 10, 15)
 EXPECTED_REQUESTS = 31
-MAXIMUM_REQUESTS = 64
+MAXIMUM_REQUESTS = EXPECTED_REQUESTS
 MINIMUM_REQUEST_INTERVAL_SECONDS = 0.5
 ETF_TICKERS = frozenset({"SPY", "QQQ", "IWM"})
 SEED_SCOPE = "EQUITY_VALIDATION_REFERENCES"
@@ -47,16 +47,20 @@ class PacedAccountingReferenceTransport:
         *,
         maximum_requests: int = MAXIMUM_REQUESTS,
         minimum_interval_seconds: float = MINIMUM_REQUEST_INTERVAL_SECONDS,
+        authorized_until: datetime | None = None,
         monotonic=time.monotonic,
         sleep=time.sleep,
+        utc_clock=lambda: datetime.now(timezone.utc),
     ) -> None:
         if maximum_requests <= 0 or minimum_interval_seconds <= 0:
             raise ValueError("reference request bounds must be positive")
         self.delegate = delegate
         self.maximum_requests = maximum_requests
         self.minimum_interval_seconds = minimum_interval_seconds
+        self.authorized_until = authorized_until
         self.monotonic = monotonic
         self.sleep = sleep
+        self.utc_clock = utc_clock
         self.requests = []
         self._last_completed_at = None
         self._lock = threading.Lock()
@@ -73,6 +77,13 @@ class PacedAccountingReferenceTransport:
                 )
                 if remaining > 0:
                     self.sleep(remaining)
+            if (
+                self.authorized_until is not None
+                and self.utc_clock() > self.authorized_until
+            ):
+                raise RuntimeError(
+                    "reference refresh authorization expired"
+                )
             started = datetime.now(timezone.utc)
             response = self.delegate.get(url, params, headers)
             completed = datetime.now(timezone.utc)
@@ -94,14 +105,56 @@ def parse_args(argv=None):
     parser.add_argument("--confirm-database-name", required=True)
     parser.add_argument("--session-date", type=date.fromisoformat, required=True)
     parser.add_argument("--authorization-reference", default="")
+    parser.add_argument("--provider-authorization-reference", required=True)
+    parser.add_argument("--expected-cost", required=True)
+    parser.add_argument(
+        "--authorized-until",
+        type=datetime.fromisoformat,
+        required=True,
+    )
+    parser.add_argument(
+        "--maximum-requests",
+        type=int,
+        default=EXPECTED_REQUESTS,
+    )
+    parser.add_argument(
+        "--response-byte-limit",
+        type=int,
+        default=2_000_000,
+    )
+    parser.add_argument(
+        "--total-byte-ceiling",
+        type=int,
+        default=16_000_000,
+    )
     parser.add_argument("--output")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     validate_target_database_v2(args.database, args.confirm_database_name)
     if args.database != EXPECTED_V2_DATABASE_NAME:
         parser.error("the V2 reference refresh targets only stocks_realtime_v2")
-    if args.session_date != APPROVED_SESSION_DATE:
-        parser.error(f"the approved reference session is {APPROVED_SESSION_DATE}")
+    calendar = exchange_calendars.get_calendar("XNYS")
+    try:
+        calendar.date_to_session(
+            args.session_date.isoformat(),
+            direction="none",
+        )
+    except ValueError:
+        parser.error("--session-date must be an XNYS session")
+    if (
+        args.authorized_until.tzinfo is None
+        or args.authorized_until.utcoffset() is None
+        or args.maximum_requests != EXPECTED_REQUESTS
+        or not 1_024 <= args.response_byte_limit <= 2_000_000
+        or not 1_024 <= args.total_byte_ceiling <= 16_000_000
+        or not args.provider_authorization_reference.strip()
+        or not args.expected_cost.strip()
+    ):
+        parser.error(
+            "reference deadline, exact requests, bytes and provider scope "
+            "are invalid"
+        )
+    args.authorized_until = args.authorized_until.astimezone(timezone.utc)
     if args.execute and not args.authorization_reference.strip():
         parser.error("--execute requires --authorization-reference")
     return args
@@ -116,7 +169,14 @@ def main(argv=None):
         "session_date": args.session_date.isoformat(),
         "tickers": list(EQUITY_VALIDATION_UNIVERSE.equity_tickers),
         "expected_requests": EXPECTED_REQUESTS,
-        "maximum_requests": MAXIMUM_REQUESTS,
+        "maximum_requests": args.maximum_requests,
+        "response_byte_limit": args.response_byte_limit,
+        "total_byte_ceiling": args.total_byte_ceiling,
+        "authorized_until": args.authorized_until.isoformat(),
+        "provider_authorization_reference": (
+            args.provider_authorization_reference
+        ),
+        "expected_cost": args.expected_cost,
         "request_in_flight": 1,
         "minimum_request_interval_seconds": MINIMUM_REQUEST_INTERVAL_SECONDS,
         "fundamentals": False,
@@ -132,7 +192,11 @@ def main(argv=None):
     if not massive_key or not finnhub_key:
         raise RuntimeError("V2 reference refresh requires POLYGON_API_KEY and FINNHUB_API_KEY")
     started_at = datetime.now(timezone.utc)
-    transport = PacedAccountingReferenceTransport(RequestsReferenceHttpTransport())
+    transport = PacedAccountingReferenceTransport(
+        RequestsReferenceHttpTransport(),
+        maximum_requests=args.maximum_requests,
+        authorized_until=args.authorized_until,
+    )
     service = build_live_reference_service(
         massive_api_key=massive_key,
         finnhub_api_key=finnhub_key,
@@ -140,9 +204,9 @@ def main(argv=None):
         http=transport,
         massive_base_url="https://api.massive.com",
         limits=ReferenceTransportLimits(
-            maximum_requests=MAXIMUM_REQUESTS,
-            maximum_response_bytes=2_000_000,
-            maximum_total_bytes=16_000_000,
+            maximum_requests=args.maximum_requests,
+            maximum_response_bytes=args.response_byte_limit,
+            maximum_total_bytes=args.total_byte_ceiling,
             maximum_rows=50_000,
             maximum_pages=16,
         ),
@@ -157,7 +221,7 @@ def main(argv=None):
     ))
     if (
         result.provider_requests != len(transport.requests)
-        or result.provider_requests > MAXIMUM_REQUESTS
+        or result.provider_requests != EXPECTED_REQUESTS
         or result.manifest.status is not SeedStatus.READY
         or len(result.manifest.members) != 29
         or any(request["status_code"] != 200 for request in transport.requests)

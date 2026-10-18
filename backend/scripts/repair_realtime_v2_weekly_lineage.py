@@ -103,7 +103,8 @@ def main(argv=None):
                 for row in unit.cursor.fetchall()
             }
             unit.cursor.execute(
-                "SELECT revision.bar_revision_id,current.cohort_id,revision.security_id,"
+                "SELECT revision.bar_revision_id,current.cohort_id,"
+                "current.provider_tier,revision.security_id,"
                 "revision.instrument_id,revision.ticker,revision.interval,revision.session_date,"
                 "revision.session_scope,revision.adjustment_basis,revision.bar_start,revision.bar_end,"
                 "revision.open_price AS open,revision.high_price AS high,revision.low_price AS low,"

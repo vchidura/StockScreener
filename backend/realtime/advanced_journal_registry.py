@@ -5,7 +5,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import UUID
 
 from .contracts import canonical_sha256
 from .journal import JOURNAL_CODEC, JOURNAL_SCHEMA_VERSION
@@ -125,52 +125,6 @@ def measure_journal_capacity(
         minimum_free_bytes=minimum_free_bytes,
         minimum_free_percent=minimum_free_percent,
     )
-
-
-def record_journal_capacity_cursor(
-    cursor,
-    *,
-    plan_id: UUID,
-    observation: JournalCapacityObservation,
-    observed_at: datetime,
-) -> UUID:
-    checked = _utc(observed_at, "observed_at")
-    identity = {
-        "contract": "advanced-journal-capacity-v1",
-        "plan_id": plan_id,
-        "root_sha256": observation.root_sha256,
-        "total_bytes": observation.total_bytes,
-        "free_bytes": observation.free_bytes,
-        "free_percent": round(observation.free_percent, 4),
-        "minimum_free_bytes": observation.minimum_free_bytes,
-        "minimum_free_percent": observation.minimum_free_percent,
-        "observed_at": checked,
-    }
-    event_id = uuid5(
-        NAMESPACE_URL,
-        f"stockscreener:advanced-journal-capacity:{canonical_sha256(identity)}",
-    )
-    cursor.execute(
-        "INSERT INTO rt.advanced_journal_capacity_events ("
-        "capacity_event_id,plan_id,journal_root_sha256,total_bytes,"
-        "free_bytes,free_percent,minimum_free_bytes,"
-        "minimum_free_percent,status,observed_at) VALUES ("
-        "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-        "ON CONFLICT (capacity_event_id) DO NOTHING",
-        (
-            str(event_id),
-            str(plan_id),
-            observation.root_sha256,
-            observation.total_bytes,
-            observation.free_bytes,
-            round(observation.free_percent, 4),
-            observation.minimum_free_bytes,
-            observation.minimum_free_percent,
-            "PASS" if observation.admitted else "BLOCKED",
-            checked,
-        ),
-    )
-    return event_id
 
 
 def build_advanced_journal_registration(

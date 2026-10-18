@@ -69,6 +69,7 @@ class AdjustedDailyRepairPlan:
     authorization_reference: str
     provider_authorization_reference: str
     expected_cost: str
+    identity_continuity: tuple[tuple[object, ...], ...] = ()
 
     def __post_init__(self):
         if (
@@ -80,6 +81,10 @@ class AdjustedDailyRepairPlan:
             or self.request_ceiling != 1
             or not 1024 <= self.response_byte_limit <= 16 * 1024 * 1024
             or self.byte_ceiling != self.response_byte_limit + 1
+            or (
+                self.identity_continuity
+                and len(self.identity_continuity) != len(self.identities)
+            )
             or not all(value.strip() for value in (
                 self.authorization_reference,
                 self.provider_authorization_reference,
@@ -112,6 +117,7 @@ class AdjustedDailyRepairPlan:
                 )
                 for row in self.identities
             ),
+            "identity_continuity": self.identity_continuity,
             "session_date": self.session_date,
             "endpoint_policy": ENDPOINT_POLICY,
             "authorized_until": self.authorized_until,
@@ -477,6 +483,14 @@ def execute_adjusted_daily_repair(
         "tickers": sorted(identity_by_ticker),
         "provider_requests": external,
         "provider_response_replays": 1 - external,
+        "provider_response_bytes": (
+            int(recorded.completion.response_bytes or 0)
+            if external
+            else 0
+        ),
+        "sealed_response_bytes": int(
+            recorded.completion.response_bytes or 0
+        ),
         "source_observed_at": (
             observed_at.isoformat() if observed_at is not None else None
         ),

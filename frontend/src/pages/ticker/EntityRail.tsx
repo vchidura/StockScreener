@@ -77,7 +77,8 @@ export default function EntityRail({
   calendar,
   calendarLoading,
   calendarError,
-  availabilityError,
+  referenceWarning,
+  calendarAvailabilityError,
   publication,
   analysisInterval = '1d',
   setup,
@@ -87,7 +88,8 @@ export default function EntityRail({
   calendar: OptionsEnvelope<OptionTickerCalendarData> | null
   calendarLoading: boolean
   calendarError: boolean
-  availabilityError?: string | null
+  referenceWarning?: string | null
+  calendarAvailabilityError?: string | null
   publication?: TickerWorkspacePublication
   analysisInterval?: SetupTimeframe
   setup?: TradeSetup | null
@@ -105,7 +107,7 @@ export default function EntityRail({
   const calendarMessage = calendarLoading
     ? 'Loading calendar coverage…'
     : calendarError || !calendarAvailable
-      ? availabilityError ?? 'N/A'
+      ? calendarAvailabilityError ?? 'N/A'
       : calendarData.events.length === 0
         ? 'No dated events in the next 30 days.'
         : null
@@ -128,11 +130,11 @@ export default function EntityRail({
         <strong>{security?.company_name ?? profile?.ticker ?? 'Security'}</strong>
         <span>Reference data</span>
       </div>
-      {availabilityError && security && <p role="alert" className="ticker-entity__empty">{availabilityError}</p>}
+      {referenceWarning && security && <p role="alert" className="ticker-entity__empty">{referenceWarning}</p>}
       {loading && !security ? (
         <p className="ticker-entity__empty">Loading reference data…</p>
       ) : !security ? (
-        <p role={availabilityError ? 'alert' : undefined} className="ticker-entity__empty">{availabilityError ?? 'No published security reference record for this ticker.'}</p>
+        <p role={referenceWarning ? 'alert' : undefined} className="ticker-entity__empty">{referenceWarning ?? 'No published security reference record for this ticker.'}</p>
       ) : (
         <dl className="ticker-entity__rows">
           {rows.map(([label, value]) => (
@@ -199,7 +201,7 @@ export default function EntityRail({
           ))}
         </div>
       ) : null}
-      {(availabilityError || calendarMessage) && <p role={availabilityError ? 'alert' : undefined} className="ticker-calendar__message">{availabilityError ?? calendarMessage}</p>}
+      {(calendarAvailabilityError || calendarMessage) && <p role={calendarAvailabilityError ? 'alert' : undefined} className="ticker-calendar__message">{calendarAvailabilityError ?? calendarMessage}</p>}
       <div className="ticker-entity__note">
         News, insider transactions and institutional holdings are not integrated.
       </div>

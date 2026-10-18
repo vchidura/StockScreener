@@ -32,6 +32,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from realtime.migrations import (  # noqa: E402
+    EXPECTED_V2_DATABASE_NAME,
     PHASE_SECURITY,
     PHASE_STRUCTURE,
     SECURITY_MODE_DEFERRED,
@@ -47,6 +48,7 @@ from realtime.relation_registry import (  # noqa: E402
     PARTITIONED_RELATIONS,
     RELATIONS,
     SECURITY_POLICY_VERSION,
+    VIEWS,
     security_policy,
 )
 from realtime.security_v2 import (  # noqa: E402
@@ -135,11 +137,25 @@ def catalog_checks(cursor) -> list[tuple[str, str]]:
         "WHERE n.nspname IN ('ref', 'rt') AND c.relkind IN ('r', 'p') AND NOT c.relispartition"
     )
     live = {name: kind for name, kind in cursor.fetchall()}
-    registry = set(RELATIONS)
+    registry = set(RELATIONS) - set(VIEWS)
     missing = sorted(registry - set(live))
     extra = sorted(set(live) - registry)
     results.append(("registry_matches_catalog", "PASS" if not missing and not extra
                     else f"FAIL missing={missing} extra={extra}"))
+    cursor.execute(
+        "SELECT n.nspname || '.' || c.relname FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname IN ('ref', 'rt') AND c.relkind = 'v'"
+    )
+    live_views = {row[0] for row in cursor.fetchall()}
+    results.append((
+        "views_match_registry",
+        "PASS" if live_views == set(VIEWS)
+        else (
+            f"FAIL missing={sorted(set(VIEWS) - live_views)} "
+            f"extra={sorted(live_views - set(VIEWS))}"
+        ),
+    ))
     live_partitioned = sorted(name for name, kind in live.items() if kind == "p")
     results.append(("partitioned_relations_match", "PASS" if live_partitioned == list(PARTITIONED_RELATIONS)
                     else f"FAIL live={live_partitioned} registry={list(PARTITIONED_RELATIONS)}"))
@@ -539,13 +555,17 @@ def validate_existing_database(
     security_mode: str,
 ) -> int:
     phases = v2_provisioning_phases(security_mode)
-    roles = build_role_names_v2("test_rt_" + database[len("test_realtime_v2_"):])
+    roles = build_role_names_v2(
+        EXPECTED_V2_DATABASE_NAME
+        if database == EXPECTED_V2_DATABASE_NAME
+        else "test_rt_" + database[len("test_realtime_v2_"):]
+    )
     with closing(_connect(settings, "postgres")) as connection:
         connection.autocommit = True
         with connection.cursor() as cursor:
             cursor.execute("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname=%s)", (database,))
             if not cursor.fetchone()[0]:
-                raise RuntimeError("disposable database does not exist")
+                raise RuntimeError("target database does not exist")
     results: dict[str, list[tuple[str, str]]] = {phase: [] for phase in phases}
     with closing(_connect(settings, database)) as connection:
         with connection.cursor() as cursor:

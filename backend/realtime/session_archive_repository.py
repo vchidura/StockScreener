@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Callable, Iterator, Mapping, Sequence
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from psycopg2 import sql
 from psycopg2.extensions import ISOLATION_LEVEL_REPEATABLE_READ
@@ -35,6 +35,13 @@ MARKET_TIME_ZONE = "America/New_York"
 TERMINAL_STATUSES = ("TARGET", "STOP", "EXPIRED")
 _HORIZON_COLUMN = "__horizon_close_date"
 _BOUND_PATTERN = re.compile(r"^FOR VALUES FROM \('([^']+)'\) TO \('([^']+)'\)$")
+
+
+def _archive_id(record: ArchiveRecord) -> UUID:
+    return uuid5(NAMESPACE_URL, (
+        f"realtime-session-archive:{record.session_date}:{record.kind}:"
+        f"{record.horizon_close_date}:{record.sha256}:{record.build_id}"
+    ))
 
 
 def _session_window(column: str) -> str:
@@ -245,9 +252,7 @@ class PostgresSessionArchiveRepository:
     def record_archive(self, record: ArchiveRecord) -> bool:
         if record.verified_at is None:
             raise ValueError("only a verified archive is recorded")
-        archive_id = uuid5(NAMESPACE_URL, (
-            f"realtime-session-archive:{record.session_date}:{record.kind}:"
-            f"{record.horizon_close_date}:{record.sha256}"))
+        archive_id = _archive_id(record)
         with closing(self._connect()) as connection:
             try:
                 with connection.cursor() as cursor:

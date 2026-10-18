@@ -14,6 +14,9 @@ from .database_access import RealtimeDatabaseRole
 from .equity_portal_history import build_realtime_equity_portal_history_plan
 from .portal_projection_repository import persist_screening_generation_cursor
 from .preflight import ProviderTier
+from .reference_continuity import (
+    load_reference_continuity_rows_cursor,
+)
 from .screening_projection import RealtimeScreeningInput, produce_realtime_screening
 from .worker_database import RealtimeProcessDatabase
 
@@ -381,7 +384,8 @@ def load_realtime_screening_input(cursor, *, cohort_id: UUID, session: date,
                                   cutoff: datetime, source_generation: int,
                                   include_portal_history: bool = False,
                                   include_strategy_action_details: bool = False,
-                                  known_by: datetime | None = None) -> RealtimeScreeningInput:
+                                  known_by: datetime | None = None,
+                                  allow_late_identity_continuity: bool = False) -> RealtimeScreeningInput:
     """`cutoff` is the market boundary and the identity of the input; `known_by` (timezone-aware, not before
     the cutoff; default the cutoff) is the instant by which a bar must have been recorded (observed_at,
     created_at, replay_available_at, provider_published_at). Bars ending after the cutoff are never loaded."""
@@ -389,7 +393,9 @@ def load_realtime_screening_input(cursor, *, cohort_id: UUID, session: date,
         cursor, cohort_id=cohort_id, session=session, cutoff=cutoff, source_generation=source_generation,
         include_portal_history=include_portal_history,
         include_strategy_action_details=include_strategy_action_details,
-        known_by=known_by, bar_loader=load_full_bars,
+        known_by=known_by,
+        allow_late_identity_continuity=allow_late_identity_continuity,
+        bar_loader=load_full_bars,
     )
 
 
@@ -467,7 +473,8 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
                          include_portal_history: bool,
                          include_strategy_action_details: bool,
                          known_by: datetime | None,
-                         bar_loader: Callable[[object, BarRequest], tuple]) -> RealtimeScreeningInput:
+                         bar_loader: Callable[[object, BarRequest], tuple],
+                         allow_late_identity_continuity: bool = False) -> RealtimeScreeningInput:
     """The screening input with the bar set supplied by `bar_loader` (the full read or a retained one).
     Manifest, members, actions and coverage are read on every call, with the cutoff."""
     start, history_params = screening_history_window(
@@ -533,6 +540,19 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
         (str(manifest["manifest_id"]), cutoff, cutoff, cutoff),
     )
     members = tuple(dict(row) for row in cursor.fetchall())
+    identity_continuity = ()
+    if (
+        len(members) != manifest["stock_count"]
+        and allow_late_identity_continuity
+    ):
+        members, identity_continuity = (
+            load_reference_continuity_rows_cursor(
+                cursor,
+                manifest_id=manifest["manifest_id"],
+                cutoff=cutoff,
+                known_by=known_by,
+            )
+        )
     if len(members) != manifest["stock_count"]:
         raise ValueError("Exact realtime screening reference membership is incomplete")
     scope = BarScope(
@@ -559,6 +579,7 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
             history_source_provider_tier,
             history_before,
             history_binding_sha256,
+            identity_continuity,
         ),
         slot=(
             str(cohort_id),
@@ -606,8 +627,12 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
             canonical_sha256({
                 "manifest_sha256": manifest["manifest_sha256"],
                 "history_binding_sha256": history_binding_sha256,
+                "identity_continuity": identity_continuity,
             })
-            if history_binding_sha256 is not None
+            if (
+                history_binding_sha256 is not None
+                or identity_continuity
+            )
             else manifest["manifest_sha256"]
         ), source_generation=source_generation,
         session=session, cutoff=cutoff, members=members, bars=bars, actions=actions, coverage=coverage,
@@ -619,6 +644,11 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
         ),
         history_before=scope.history_before,
         history_binding_sha256=scope.history_binding_sha256,
+        identity_continuity_sha256=(
+            canonical_sha256(identity_continuity)
+            if identity_continuity
+            else None
+        ),
         known_by=requested_known_by,
     )
 

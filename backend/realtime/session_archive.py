@@ -519,11 +519,13 @@ def verify_archive(
     session_date: date,
     horizon_close_date: date | None = None,
     source_counts: Mapping[str, int] | None = None,
+    identity: ArchiveIdentity | None = None,
 ) -> VerifiedArchive:
     """Re-read the files from disk and check them against the manifest and the source.
 
     Recomputes sha256, decompresses, counts rows per relation and compares with the manifest;
-    with `source_counts` (a fresh COUNT of the source rows) it also compares those.
+    with `source_counts` (a fresh COUNT of the source rows) it also compares those. When an
+    identity is supplied, the manifest must match its build and policy.
     """
     _check_kind(kind, horizon_close_date)
     manifest = _load_manifest(manifest_path)
@@ -537,6 +539,11 @@ def verify_archive(
         or manifest["file"] != data_path.name
     ):
         raise _fail(VerificationCode.IDENTITY_MISMATCH, "manifest does not describe this archive file")
+    if identity is not None and (
+        manifest["build_id"] != identity.build_id
+        or manifest["policy_id"] != identity.policy_id
+    ):
+        raise _fail(VerificationCode.IDENTITY_MISMATCH, "manifest build or policy identity differs from requested identity")
     try:
         payload = data_path.read_bytes()
     except FileNotFoundError:

@@ -23,6 +23,8 @@ BASE = [
     "5",
     "--authorization-reference",
     "advanced-equity-v2-20261016",
+    "--publication-mode",
+    "projection-only",
     "--report-directory",
     "advanced-reports",
     "--continuous",
@@ -42,6 +44,7 @@ def test_scheduler_builds_exact_remaining_session_windows(
     assert args.report_directory == (
         tmp_path / "advanced-reports"
     ).resolve()
+    assert args.publication_mode == "projection-only"
 
 
 def test_scheduler_rejects_non_boundary_and_unexecuted_modes():
