@@ -90,9 +90,9 @@ export default function DailyStrategyTicker() {
     </CommandBar>
     {data?.interpretation === 'RECONSTRUCTED_RESEARCH_NOT_ORIGINAL_ON_TIME_DECISIONS' && <p>Reconstructed research | Not original on-time decisions</p>}
     {pin && cohort && <nav className="daily-research__navigation" aria-label="Daily strategy pages">
-      <Link to={publicationPath('/strategies/overview', pin, cohort, interval)}>Strategy Overview</Link>
-      <Link to={publicationPath('/stocks/persistence', pin, cohort, interval)}>Persistence</Link>
-      {PAGES.map(([path, label]) => <Link key={path} to={publicationPath(path, pin, cohort, interval)}>{label}</Link>)}
+      <Link to={publicationPath('/strategies/overview', pin, cohort, interval, evaluationSession)}>Strategy Overview</Link>
+      <Link to={publicationPath('/stocks/persistence', pin, cohort, interval, evaluationSession)}>Persistence</Link>
+      {PAGES.map(([path, label]) => <Link key={path} to={publicationPath(path, pin, cohort, interval, evaluationSession)}>{label}</Link>)}
       <Link to={navigationPublicationPath(`/ticker/${ticker}`, `/strategy-research/${ticker}`, pin, cohort, interval)}>Full ticker workspace</Link>
     </nav>}
     {query.loading && !data && <p role="status">Reading complete publication...</p>}

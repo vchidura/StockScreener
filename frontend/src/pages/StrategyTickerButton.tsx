@@ -11,7 +11,7 @@ export function StrategyTickerButton({ ticker, publication }: { ticker: string; 
     && !!publication.cohort_id
     && !!publication.snapshot_id
   if (retainedResearchAvailable) {
-    destination = publicationPath(`/strategy-research/${encodeURIComponent(ticker)}`, publication.snapshot_id, publication.cohort_id, publication.interval)
+    destination = publicationPath(`/strategy-research/${encodeURIComponent(ticker)}`, publication.snapshot_id, publication.cohort_id, publication.interval, publication.evaluation_session)
   }
   return <button type="button" className="ticker" title={retainedResearchAvailable ? 'Open retained strategy research' : 'Open ticker workspace'}
     onClick={event => { event.stopPropagation(); navigate(destination) }}>{ticker}</button>

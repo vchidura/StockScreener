@@ -17,12 +17,14 @@ from equity.domain import (
     BarAvailabilityMode, BarSessionScope, BarSourceKind, EquityBarRevision,
     EvidenceType, SecurityReferenceRevision,
 )
-from equity.materialization import SETUP_VERSION
+from equity.materialization import CHANNEL_VERSION, SETUP_VERSION, _json_safe, bars_to_frame
 from equity.ticker_contracts import (
-    PATTERN_WATCH_INTERVALS, build_ticker_confluence_zones, setup_summary_row,
+    PATTERN_WATCH_INTERVALS, PATTERN_WATCH_POLICY, RETIRED_PATTERN_WATCH_INTERVALS,
+    build_ticker_confluence_zones, setup_summary_row,
     sort_pattern_watch_rows,
 )
 from research.forming_patterns import summarize_cross_frame_patterns
+from research.price_channels import detect_price_channel
 
 from .contracts import canonical_sha256
 from .equity_bar_adapter import RealtimeEquityBarFact
@@ -419,11 +421,17 @@ def materialize_ticker_interval(
     inputs, security, bars, confirmations=(), *, interval, basis, policy_sha256, state=None,
 ):
     observed_at = max(fact.revision.system_observed_at for fact in (*bars, *confirmations))
+
+    def source_identity(facts):
+        return tuple((fact.cohort_id, fact.provider_tier.value, fact.instrument_id,
+            fact.revision.bar_revision_id, fact.revision.payload_sha256) for fact in facts)
+
     identity = canonical_sha256((
+        "ticker-materialization-input-v2",
         inputs.cohort_id, inputs.provider_tier.value, security.security_revision_id,
+        security.payload_sha256, bars[0].instrument_id,
         interval, basis, policy_sha256,
-        tuple(fact.revision.bar_revision_id for fact in bars),
-        tuple(fact.revision.bar_revision_id for fact in confirmations), observed_at,
+        source_identity(bars), source_identity(confirmations), observed_at,
     ))
 
     def build():
@@ -435,14 +443,7 @@ def materialize_ticker_interval(
             target_instrument_id=bars[0].instrument_id,
         )
 
-    # The identity names the exact bars and security revision; the chains add each bar's payload
-    # hash, so an equal key is an equal result.
-    key = ":".join((
-        identity,
-        revision_chain_sha256((f.revision.bar_revision_id, f.revision.payload_sha256) for f in bars),
-        revision_chain_sha256((f.revision.bar_revision_id, f.revision.payload_sha256) for f in confirmations),
-    ))
-    result = build() if state is None else state.remember("materialization", key, build)
+    result = build() if state is None else state.remember("materialization", identity, build)
     return identity, result
 
 
@@ -1048,9 +1049,7 @@ def _project_realtime_ticker_workspace(
         setups, metrics, errors, evidence_index, pattern_results, channels, pattern_refs = {}, {}, {}, {}, {}, {}, {}
 
         def compute(interval, bars, confirmations=(), *, basis, persisted):
-            # Only evidence that compute_realtime_ticker_cycle persists is referenced: the 5m and 15m
-            # pattern views are release-only (their patterns and channels live in the payload itself),
-            # so no durable body exists for the evidence rows they materialize.
+            # Only persisted technical and pattern materializations enter the evidence index.
             identity, result = materialize_ticker_interval(
                 inputs, security, bars, confirmations, interval=interval,
                 basis=basis, policy_sha256=plan.policy_sha256, state=state,
@@ -1113,6 +1112,18 @@ def _project_realtime_ticker_workspace(
                 ticker=security.ticker, interval=interval, status="CHANNEL_RESEARCH",
                 last_close=last_close, channel=channel, computed_at=inputs.cutoff.isoformat(),
             )
+        for interval in RETIRED_PATTERN_WATCH_INTERVALS:
+            missing[f"patterns:{interval}"] = "PATTERN_INTERVAL_RETIRED"
+            bars = available.get(interval, ())[-300:]
+            if len(bars) < 50:
+                missing[f"channel:{interval}"] = "CHANNEL_HISTORY_UNAVAILABLE"
+                continue
+            key = canonical_sha256((security.security_revision_id, interval, CHANNEL_VERSION, _fact_chain(bars)))
+            channel = state.remember("short_channel", key, lambda: _json_safe(detect_price_channel(
+                bars_to_frame(tuple(fact.revision for fact in bars)))))
+            channels[interval] = dict(ticker=security.ticker, interval=interval, status="CHANNEL_RESEARCH",
+                last_close=round(float(bars[-1].revision.close_price), 2), channel=channel,
+                computed_at=inputs.cutoff.isoformat())
         cross_rows = [
             dict(ticker=security.ticker, sector=security.sector, interval=interval,
                  last_close=response["last_close"], pattern=pattern, channel=channels[interval]["channel"])
@@ -1150,6 +1161,7 @@ def _project_realtime_ticker_workspace(
         }
         payload = dict(
             version=TICKER_WORKSPACE_VERSION, ticker=security.ticker, missing_producers=missing,
+            pattern_policy=PATTERN_WATCH_POLICY, pattern_intervals=list(PATTERN_WATCH_INTERVALS),
             provider_fetch_performed=False, execution_permission=False,
             profile=dict(ticker=security.ticker, security={
                 key: (
@@ -1176,7 +1188,8 @@ def _project_realtime_ticker_workspace(
             patterns=pattern_results, channels=channels, pattern_evidence_refs=pattern_refs,
             cross_patterns=dict(interval="all", scanned=1, matched_tickers=1 if cross_rows else 0,
                                 results=cross_rows, cross_frame=summarize_cross_frame_patterns(cross_rows),
-                                computed_at=inputs.cutoff.isoformat(), missing_intervals=sorted(set(PATTERN_WATCH_INTERVALS) - pattern_results.keys())),
+                                computed_at=inputs.cutoff.isoformat(), missing_intervals=sorted(set(PATTERN_WATCH_INTERVALS) - pattern_results.keys()),
+                                pattern_policy=PATTERN_WATCH_POLICY, retired_intervals=list(RETIRED_PATTERN_WATCH_INTERVALS)),
             context=dict(
                 schema="stock_equity_context_v1", as_of=inputs.cutoff.isoformat(), status="READY",
                 cohort=dict(generation=screening.manifest["generation"], universe=screening.manifest["universe"],
@@ -1303,6 +1316,7 @@ def produce_realtime_pattern_watch_publication(inputs, snapshots):
                        payload_sha256=snapshot.payload_sha256) for snapshot in snapshots]
     manifest = dict(
         version=PATTERN_WATCH_PUBLICATION_VERSION, cohort_id=str(inputs.cohort_id),
+        pattern_policy=PATTERN_WATCH_POLICY, pattern_intervals=list(PATTERN_WATCH_INTERVALS),
         provider_tier=inputs.provider_tier.value, source_generation=inputs.source_generation,
         source_manifest_sha256=inputs.source_manifest_sha256,
         reference_set=reference_set(references), workspace_set=workspace_set(workspaces),
@@ -1315,6 +1329,7 @@ def produce_realtime_pattern_watch_publication(inputs, snapshots):
         snapshot_type=PATTERN_WATCH_PUBLICATION_VERSION, snapshot_key="PLATFORM",
         source_generation=inputs.source_generation, source_manifest=manifest,
         payload=dict(version=PATTERN_WATCH_PUBLICATION_VERSION, cohort_id=str(inputs.cohort_id),
+                     pattern_policy=PATTERN_WATCH_POLICY, pattern_intervals=list(PATTERN_WATCH_INTERVALS),
                      views=views, references=references, workspaces=workspaces,
                      provider_fetch_performed=False, execution_permission=False),
         generated_at=inputs.cutoff,

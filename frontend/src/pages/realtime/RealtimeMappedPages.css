@@ -1,4 +1,9 @@
 .rt-page { display: grid; gap: 12px; min-width: 0; }
+.rt-isolation { display: flex; align-items: center; gap: 14px; padding: 10px 16px; border-block: 1px solid var(--tm-line); background: var(--tm-surface-sunken); }
+.rt-isolation > div { display: grid; margin-right: auto; }
+.rt-isolation span { color: var(--tm-faint); font-size: 10px; text-transform: uppercase; }
+.rt-state { display: inline-flex; align-items: center; gap: 5px; color: var(--tm-neg); font-weight: 650; white-space: nowrap; }
+.rt-state.is-ready { color: var(--tm-pos); }
 .rt-band { min-width: 0; border-block: 1px solid var(--tm-line); background: var(--tm-surface); }
 .rt-band > header { display: flex; align-items: end; justify-content: space-between; gap: 16px; padding: 12px 14px; border-bottom: 1px solid var(--tm-line); }
 .rt-band > header span { color: var(--tm-faint); font-size: 10px; text-transform: uppercase; }
@@ -34,6 +39,8 @@
 .screening-workspace.rt-page .sw-table-scroll th small { display: block; margin-top: 3px; color: var(--tm-faint); font-weight: 400; }
 .stock-alerts.rt-page .sd-table-panel { min-width: 0; }
 @media (max-width: 800px) {
+  .rt-isolation { align-items: flex-start; flex-wrap: wrap; }
+  .rt-isolation > div { flex: 1 1 100%; }
   .rt-facts { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .rt-facts div,.rt-facts div:nth-child(5n) { border-right: 1px solid var(--tm-line); }
   .rt-facts div:nth-child(2n) { border-right: 0; }

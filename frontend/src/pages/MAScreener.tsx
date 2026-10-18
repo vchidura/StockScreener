@@ -129,7 +129,7 @@ function MAScreener() {
   const interval = realtimeOnly ? storedInterval.interval : canonicalInterval
   const setInterval = (value: typeof canonicalInterval) => realtimeOnly ? storedInterval.setInterval(value === '1h' ? '1h' : '1d') : setCanonicalInterval(value)
 
-  const realtimeQuery = usePublicationQuery('daily-ma-crossover', pin => getDailyScannerPublication('ma-crossover', pin, interval === '1h' ? '1h' : '1d'))
+  const realtimeQuery = usePublicationQuery('daily-ma-crossover', (pin, session) => getDailyScannerPublication('ma-crossover', pin, interval === '1h' ? '1h' : '1d', session))
   const canonicalQuery = useQuery<MAScanResponse>({
     queryKey: ['scan', 'ma-crossover', interval, scanDate, shortPeriod, longPeriod],
     queryFn: () => scanMACrossover(undefined, shortPeriod, longPeriod, scanDate || undefined, interval),

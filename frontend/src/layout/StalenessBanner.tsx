@@ -46,12 +46,14 @@ export function StalenessBanner() {
   const [params] = useSearchParams()
   const location = useLocation()
   const ticker = activeTickerSymbol(location.pathname) ?? undefined
+  const historicalTicker = realtimeOnly && (ticker !== undefined || location.pathname === '/pattern-watch' || location.pathname === '/overview')
   const snapshotId = params.get('snapshot_id') ?? undefined
   const dailyStrategies = isDailyStrategyPath(location.pathname)
   const interval = params.get('interval') === '1h' ? '1h' : '1d'
-  const scope = JSON.stringify([realtimeOnly, snapshotId, ticker, dailyStrategies, interval])
+  const scope = JSON.stringify([realtimeOnly, snapshotId, ticker, dailyStrategies, interval, historicalTicker])
 
   useEffect(() => {
+    if (historicalTicker) return
     let cancelled = false
     let inFlight = false
     let boundaryTimer: ReturnType<typeof window.setTimeout> | undefined
@@ -95,9 +97,9 @@ export function StalenessBanner() {
       window.clearInterval(timer)
       if (boundaryTimer !== undefined) window.clearTimeout(boundaryTimer)
     }
-  }, [realtimeOnly, snapshotId, ticker, dailyStrategies, scope])
+  }, [realtimeOnly, snapshotId, ticker, dailyStrategies, scope, historicalTicker])
 
-  if (!notification || notification.scope !== scope
+  if (historicalTicker || !notification || notification.scope !== scope
     || !marketNotificationsEnabled(notification.market, Date.now() - notification.receivedAt)) return null
   const { status, unavailable } = notification
 

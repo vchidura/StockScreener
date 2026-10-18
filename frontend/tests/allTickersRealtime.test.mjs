@@ -10,9 +10,10 @@ test('original All Tickers is routed and navigable in both modes', () => {
   assert.match(read('../src/layout/navigation.ts'), /to: '\/overview', label: 'All Tickers'/)
   assert.match(read('../src/layout/AppShell.tsx'), /realtimeOnly \? pinnedPath\(baseDestination\) : baseDestination/)
   const page = read('../src/pages/TickersOverview.tsx')
-  assert.match(page, /usePublicationQuery\('all-tickers', getAllTickersPublication\)/)
+  assert.match(page, /usePublicationQuery\('all-tickers', \(pin, session\) => getAllTickersPublication\(pin, session, true\)\)/)
   assert.match(read('../src/pages/publicationNavigation.ts'), /const interval = name.startsWith\('daily-'\)/)
-  assert.match(read('../src/pages/publicationNavigation.ts'), /const key = \[name, cohort, pin, \.\.\.\(interval === '1h' \? \['1h'\] : \[\]\)\]/)
+  assert.match(read('../src/pages/publicationNavigation.ts'), /const key = queryKey\(pin\)/)
+  assert.match(read('../src/pages/publicationNavigation.ts'), /internalWorkspace = isTickerWorkspaceQuery\(name\) \|\| name === 'all-tickers'/)
   assert.match(read('../src/pages/publicationNavigation.ts'), /retry: false/)
   assert.match(page, /enabled: !realtimeOnly/)
   assert.match(page, /Retaining the previous publication/)
@@ -20,11 +21,58 @@ test('original All Tickers is routed and navigable in both modes', () => {
   assert.match(page, /disabled=\{realtimeOnly && sectors\.length === 0\}/)
   assert.match(page, /disabled=\{realtimeOnly && opt\.key === 'wsma_200' && !weekly200Available\}/)
   assert.match(page, /Market · selected realtime cohort/)
-  assert.match(page, /className="ticker-publication-link"\s+to=\{`\/ticker\/\$\{row\.ticker\}`\}/)
-  assert.doesNotMatch(page, /workspaceMap|publicationPath/)
+  assert.match(page, /className="ticker-publication-link"\s+to=\{realtimeOnly && publication/)
+  assert.match(page, /publicationPath\(`\/ticker\/\$\{row\.ticker\}`, undefined, publication\.cohort_id, undefined, publication\.session\)/)
+  assert.doesNotMatch(page, /workspaceMap/)
   assert.match(page, /aria-label=\{`Open \$\{row\.ticker\} ticker workspace`\}/)
   assert.doesNotMatch(page, /onClick=\{\(\) => navigate/)
   assert.doesNotMatch(page, /publication\?\.scope_note|Split-adjusted daily history; raw retained quotes|Observed <time/)
+})
+
+test('All Tickers closing reads use one exact saved bundle and never fall back to Dashboard', async () => {
+  const calls = []
+  let session = '2026-10-15', corruptRows = false, fail = false
+  globalThis.__allClosingEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'exact-cohort' }
+  globalThis.__allClosingApi = { get: async (url, options) => {
+    calls.push([url, options.params])
+    if (fail) throw new Error('Saved closing summary unavailable')
+    if (url === '/tickers/sessions') return { data: {
+      cohort_id: 'exact-cohort', interval: '1d', sessions: ['2026-10-15', '2026-10-16'],
+      data_as_of: '2026-10-16T20:00:00Z', data_interval: '1d',
+    } }
+    assert.equal(url, '/tickers/workspace-publication')
+    const publication = { cohort_id: 'exact-cohort', snapshot_id: 'closing-summary', session, read_mode: 'SESSION_CLOSE' }
+    return { data: { publication, overview: [{ ticker: 'SPY', date: corruptRows ? '2026-10-16' : session, close: 771.77 }],
+      setup: { publication, count: 1, results: [{ ticker: 'SPY', trend: 'stored' }] } } }
+  } }
+  const source = read('../src/services/api.ts')
+    .replace("import axios from 'axios'", 'const axios = { create: () => globalThis.__allClosingApi }')
+    .replaceAll('import.meta.env', 'globalThis.__allClosingEnvironment')
+  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText
+  try {
+    const api = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
+    const dates = await api.getAllTickersClosingSessions()
+    assert.equal(dates.data_as_of, '2026-10-16T20:00:00Z')
+    calls.length = 0
+    const result = await api.getAllTickersPublication(undefined, '2026-10-15', true)
+    assert.equal(result.overview[0].date, '2026-10-15')
+    assert.deepEqual(calls, [['/tickers/workspace-publication',
+      { cohort_id: 'exact-cohort', session_date: '2026-10-15', read_mode: 'session_close' }]])
+    session = '2026-10-16'
+    await assert.rejects(api.getAllTickersPublication(undefined, '2026-10-15', true), /selected session/)
+    session = '2026-10-15'
+    corruptRows = true
+    await assert.rejects(api.getAllTickersPublication(undefined, '2026-10-15', true), /selected session/)
+    corruptRows = false
+    fail = true
+    calls.length = 0
+    await assert.rejects(api.getAllTickersPublication(undefined, '2026-10-15', true), /Saved closing summary unavailable/)
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0][0], '/tickers/workspace-publication')
+  } finally {
+    delete globalThis.__allClosingApi
+    delete globalThis.__allClosingEnvironment
+  }
 })
 
 test('200-week columns stay visible and selectable even when published values are unavailable', () => {

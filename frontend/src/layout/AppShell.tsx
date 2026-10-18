@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { NavLink, useLocation, useSearchParams } from 'react-router-dom'
-import { ChevronDown, ChevronLeft, ChevronRight, Database, LogIn, Menu, Moon, PanelLeftClose, PanelLeftOpen, RotateCcw, Sun } from 'lucide-react'
+import { ChevronDown, ChevronLeft, ChevronRight, LogIn, Menu, Moon, PanelLeftClose, PanelLeftOpen, RotateCcw, Sun } from 'lucide-react'
 import GlobalSearch from './GlobalSearch'
 import { StalenessBanner } from './StalenessBanner'
 import { PageContextSetter, type PageContextValue } from './pageContext'
@@ -51,12 +51,12 @@ function storedExpandedGroups(pathname: string): Set<string> {
 }
 
 function SessionStepper({ interval }: { interval: string }) {
-  const { date, isLatest, canStepBack, canStepForward, step, reset, requestInterval } = useSessionDate()
+  const { date, sessions, isLatest, canStepBack, canStepForward, step, reset, requestInterval, choose, isStrategy, isTicker, isPattern, isAllTickers, error } = useSessionDate()
 
   useEffect(() => requestInterval(interval), [interval, requestInterval])
 
   return (
-    <div className="tm-session" role="group" aria-label="Scan session">
+    <><div className="tm-session" role="group" aria-label="Scan session">
       <button
         type="button"
         onClick={() => step(-1)}
@@ -66,7 +66,14 @@ function SessionStepper({ interval }: { interval: string }) {
       >
         <ChevronLeft size={15} aria-hidden="true" />
       </button>
-      <button
+      {isStrategy || isTicker || isPattern || isAllTickers ? <select className="tm-session__value"
+        aria-label={isTicker ? 'Ticker session date' : isPattern ? 'Pattern Watch session date'
+          : isAllTickers ? 'All Tickers session date' : 'Strategy session date'} value={date}
+        disabled={!sessions.length} onChange={event => choose(event.target.value)}>
+        {date && !sessions.includes(date) && <option value={date}>{sessionLabel(date)} (unavailable)</option>}
+        {!date && <option value="">No stored sessions</option>}
+        {[...sessions].reverse().map(session => <option key={session} value={session}>{sessionLabel(session)}</option>)}
+      </select> : <button
         type="button"
         className="tm-session__value"
         onClick={reset}
@@ -75,7 +82,7 @@ function SessionStepper({ interval }: { interval: string }) {
       >
         {sessionLabel(date)}
         {!isLatest && <small>Historical</small>}
-      </button>
+      </button>}
       <button
         type="button"
         onClick={() => step(1)}
@@ -85,7 +92,11 @@ function SessionStepper({ interval }: { interval: string }) {
       >
         <ChevronRight size={15} aria-hidden="true" />
       </button>
-    </div>
+      {(isStrategy || isTicker || isPattern || isAllTickers) && <button type="button" onClick={reset} disabled={isLatest}
+        aria-label="Return to latest trading session" title="Return to latest trading session">
+        <RotateCcw size={14} aria-hidden="true" />
+      </button>}
+    </div>{error && <span role="alert">{error}</span>}</>
   )
 }
 
@@ -142,12 +153,14 @@ function MarketDataStamp() {
   )
 }
 
-export default function AppShell({ children, realtimeOnly = false, realtimeHome = '/realtime-canary', realtimeCanary = '/realtime-canary' }: { children: ReactNode; realtimeOnly?: boolean; realtimeHome?: string; realtimeCanary?: string }) {
+export default function AppShell({ children, realtimeOnly = false }: { children: ReactNode; realtimeOnly?: boolean }) {
   const location = useLocation()
   const publicationPin = new URLSearchParams(location.search).get('snapshot_id') ?? undefined
   const publicationCohort = new URLSearchParams(location.search).get('cohort_id') ?? undefined
   const publicationInterval = new URLSearchParams(location.search).get('interval') === '1h' ? '1h' : '1d'
-  const pinnedPath = (path: string) => navigationPublicationPath(path, location.pathname, publicationPin, publicationCohort, publicationInterval)
+  const publicationSession = new URLSearchParams(location.search).get('session_date')
+    ?? new URLSearchParams(location.search).get('evaluation_session') ?? undefined
+  const pinnedPath = (path: string) => navigationPublicationPath(path, location.pathname, publicationPin, publicationCohort, publicationInterval, publicationSession)
   const { theme, toggleTheme } = useTheme()
   const [collapsed, setCollapsed] = useState(storedCollapsed)
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -205,12 +218,7 @@ export default function AppShell({ children, realtimeOnly = false, realtimeHome 
 
   const publishPageContext = useCallback((value: PageContextValue | null) => setPageContext(value), [])
 
-  const breadcrumb = location.pathname === '/realtime-canary'
-    ? ['Realtime', 'Validation status']
-    : breadcrumbFor(location.pathname)
-  const validationDestination = publicationPin || publicationCohort
-    ? pinnedPath('/realtime-canary')
-    : realtimeCanary
+  const breadcrumb = breadcrumbFor(location.pathname)
   const activeGroupId = groupForPath(location.pathname)
   const flyoutGroup = NAV_GROUPS.find(group => group.id === flyoutGroupId) ?? null
   const compactRail = collapsed && !drawerOpen
@@ -262,7 +270,7 @@ export default function AppShell({ children, realtimeOnly = false, realtimeHome 
     <div className={`tm-shell${collapsed ? ' tm-shell--collapsed' : ''}`}>
       <aside className={`tm-rail${drawerOpen ? ' is-open' : ''}`} aria-label="Primary navigation">
         <div className="tm-rail__brand">
-          <NavLink to={realtimeOnly ? pinnedPath(realtimeHome) : '/'} className="tm-brand" title={`${BRAND_NAME} ${BRAND_SUFFIX}`}>
+          <NavLink to={realtimeOnly ? pinnedPath('/') : '/'} className="tm-brand" title={`${BRAND_NAME} ${BRAND_SUFFIX}`}>
             <span className="tm-brand__mark">{BRAND_MARK}</span>
             <span className="tm-brand__text">
               <strong>{BRAND_NAME}</strong>
@@ -284,13 +292,6 @@ export default function AppShell({ children, realtimeOnly = false, realtimeHome 
         </div>
 
         <nav className="tm-rail__nav">
-          {realtimeOnly && <div className="tm-rail__group tm-rail__group--static">
-            <span className="tm-rail__group-label">Realtime</span>
-            <NavLink to={validationDestination} className="tm-rail__item" title="Equity validation status">
-              <Database size={15} aria-hidden="true" />
-              <span>Validation status</span>
-            </NavLink>
-          </div>}
           {NAV_GROUPS.map(group => {
             const GroupIcon = group.icon
             if (group.collapsible === false) {

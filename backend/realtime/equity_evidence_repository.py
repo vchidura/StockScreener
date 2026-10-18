@@ -1021,8 +1021,12 @@ def persist_realtime_equity_materialization_batch_cursor(
     cursor,
     writes: Sequence[RealtimeEquityMaterializationWrite],
     *,
+    publish_current: bool = True,
     values_executor=execute_values,
 ) -> RealtimeEquityBatchReceipt:
+    """Persist immutable closures; archive-only batches leave every discovery pointer unchanged."""
+    if type(publish_current) is not bool:
+        raise TypeError("equity materialization publication policy must be boolean")
     requested = tuple(writes)
     if not requested:
         return RealtimeEquityBatchReceipt((), ())
@@ -1151,6 +1155,9 @@ def persist_realtime_equity_materialization_batch_cursor(
         cursor, tuple(pending), values_executor=values_executor,
         page_size=EQUITY_EVIDENCE_BULK_PAGE_SIZE,
     )
+    receipt = RealtimeEquityBatchReceipt(tuple(row.snapshot_id for row in pending), tuple(skipped))
+    if not publish_current:
+        return receipt
 
     values_executor(
         cursor,
@@ -1194,6 +1201,4 @@ def persist_realtime_equity_materialization_batch_cursor(
             current_values,
             page_size=EQUITY_EVIDENCE_BULK_PAGE_SIZE,
         )
-    return RealtimeEquityBatchReceipt(
-        tuple(row.snapshot_id for row in pending), tuple(skipped),
-    )
+    return receipt

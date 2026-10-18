@@ -3,6 +3,27 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import ts from 'typescript'
 
+test('chart, pattern and channel reads expose the stored unavailable reason rather than a generic HTTP error', async () => {
+  const failure = Object.assign(new Error('Request failed with status code 503'), {
+    isAxiosError: true, response: { data: { detail: 'NATIVE_ADJUSTED_MONTHLY_HISTORY_INCOMPLETE' } },
+  })
+  globalThis.__tickerReadApi = { get: async () => { throw failure } }
+  globalThis.__tickerReadEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'cohort' }
+  try {
+    const source = readFileSync(new URL('../src/services/api.ts', import.meta.url), 'utf8')
+      .replace("import axios from 'axios'", 'const axios = { create: () => globalThis.__tickerReadApi, isAxiosError: error => error?.isAxiosError === true }')
+      .replaceAll('import.meta.env', 'globalThis.__tickerReadEnvironment')
+    const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } })
+    const services = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`)
+    for (const read of [services.getChartData, services.getChartPatterns, services.getPriceChannel]) {
+      await assert.rejects(() => read('NFLX'), { message: 'NATIVE_ADJUSTED_MONTHLY_HISTORY_INCOMPLETE' })
+    }
+  } finally {
+    delete globalThis.__tickerReadApi
+    delete globalThis.__tickerReadEnvironment
+  }
+})
+
 test('both deployment modes route every ticker view to the original workspace', () => {
   const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8')
   assert.equal(app.match(/path="\/ticker\/:symbol" element=\{<TickerWorkspace \/>\}/g)?.length, 2)
@@ -16,7 +37,7 @@ test('both deployment modes route every ticker view to the original workspace', 
   }
   assert.doesNotMatch(workspace, /availableViews/)
   assert.match(workspace, /usePublicationQuery\(`ticker-workspace:/)
-  assert.match(workspace, /queryScope = realtimeOnly \? \[publication\?\.cohort_id, snapshotId\] : \[\]/)
+  assert.match(workspace, /queryScope = realtimeOnly \? \[publication\?\.cohort_id, snapshotId, \.\.\.\(closingView \? \['session_close'\] : \[\]\)\] : \[\]/)
   assert.doesNotMatch(workspace, /view === 'financials'/)
   assert.match(workspace, /active === 'financials' && <FinancialsView/)
   assert.match(workspace, /<TickerDetail view=\{active\} publication=\{publication\} readsEnabled=\{readsEnabled\}/)
@@ -30,8 +51,8 @@ test('both deployment modes route every ticker view to the original workspace', 
   assert.match(workspace, /calendarAvailabilityError=\{publicationError\}/)
   assert.match(workspace, /active === 'overview' && \(\s*<EntityRail[\s\S]*publication=\{publication\}[\s\S]*analysisInterval=\{analysisInterval\}/)
   assert.match(workspace, /onAnalysisIntervalChange=\{setAnalysisInterval\}/)
-  assert.match(workspace, /onAnalysisSetupChange=\{setAnalysisSetup\}/)
-  assert.match(workspace, /setup=\{analysisSetup\}/)
+  assert.match(workspace, /onAnalysisSetupChange=\{onAnalysisSetupChange\}/)
+  assert.match(workspace, /setup=\{analysisSetup\?\.snapshotId === snapshotId \? analysisSetup\?\.setup \?\? null : null\}/)
   const detail = readFileSync(new URL('../src/pages/TickerDetail.tsx', import.meta.url), 'utf8')
   assert.match(detail, /const fibonacciSetupInterval: SetupTimeframe = tradeSetup\?\.strategy_results\.fibonacci/)
   assert.match(detail, /showing the nearest published/)
@@ -130,6 +151,18 @@ test('original ticker service contracts preserve parameters and add only explici
     assert.equal(calls.length, 9)
     assert.ok(calls.every(call => call[1].params.snapshot_id === 'release-pin'))
     calls.length = 0
+    await services.getChartData('SPY', '2y', '1h', false, 'close-pin', true)
+    await services.getChartPatterns('SPY', '15m', false, 'close-pin', true)
+    await services.getPriceChannel('SPY', '1wk', false, 'close-pin', true)
+    await services.scanTickerChartPatterns('SPY', false, 'close-pin', true)
+    await services.getLatestQuote('SPY', false, 'close-pin', true)
+    await services.getMultiTradeSetup('SPY', false, 'close-pin', true)
+    await services.getEquitySecurityProfile('SPY', 'close-pin', true)
+    await services.getOptionEventCalendar('SPY', 30, 'close-pin', true)
+    await context.getStockContext('SPY', 'close-pin', true)
+    assert.equal(calls.length, 9)
+    assert.ok(calls.every(call => call[1].params.snapshot_id === 'close-pin' && call[1].params.read_mode === 'session_close'))
+    calls.length = 0
     globalThis.__tickerEnvironment = { VITE_REALTIME_ONLY: 'true' }
     await assert.rejects(services.getLatestQuote('SPY'), /requires VITE_REALTIME_COHORT_ID/)
     await assert.rejects(context.getStockContext('SPY'), /requires VITE_REALTIME_COHORT_ID/)
@@ -155,6 +188,11 @@ test('ticker publication resolver rejects wrong ticker, cohort and substituted s
     assert.equal((await services.getTickerWorkspacePublication('AAPL', 'selected-release')).publication.snapshot_id, 'selected-release')
     assert.equal((await services.getTickerWorkspacePublication('aapl', 'selected-release')).publication.snapshot_id, 'selected-release')
     await assert.rejects(services.getTickerWorkspacePublication('AAPL', 'another-release'), /requested release/)
+    await assert.rejects(services.getTickerWorkspacePublication('AAPL', undefined, '2026-10-15'), /requested release/)
+    publication = { ...publication, session: '2026-10-15', read_mode: 'SESSION_CLOSE' }
+    assert.equal((await services.getTickerWorkspacePublication('AAPL', undefined, undefined, true)).publication.read_mode, 'SESSION_CLOSE')
+    assert.equal((await services.getTickerWorkspacePublication('AAPL', undefined, '2026-10-15')).publication.session, '2026-10-15')
+    await assert.rejects(services.getTickerWorkspacePublication('AAPL', undefined, '2026-10-14'), /requested release/)
     publication = { ...publication, ticker: 'MSFT' }
     await assert.rejects(services.getTickerWorkspacePublication('AAPL'), /requested release/)
     publication = { ...publication, ticker: 'AAPL', cohort_id: 'another-cohort' }

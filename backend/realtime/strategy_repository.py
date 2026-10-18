@@ -2,7 +2,7 @@
 from collections import OrderedDict
 from collections.abc import Mapping
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from threading import Lock
 from uuid import UUID
 
@@ -30,7 +30,8 @@ from .preflight import ProviderTier
 from .screening_repository import load_realtime_screening_input
 from .strategy_projection import (STRATEGY_KEY, STRATEGY_VERSION, HISTORY_VERSION, RECONSTRUCTED_VERSION,
     ROLLING_VERSION, HOURLY_ROLLING_VERSION, project_realtime_daily_strategies,
-    project_realtime_strategy_history, project_realtime_rolling_strategies, strategy_action_context)
+    project_realtime_strategy_history, project_realtime_rolling_strategies, strategy_action_context,
+    strategy_reference_identity)
 from .strategy_persistence import build_strategy_persistence
 from .hourly_strategy_projection import HOURLY_VERSION, HOURLY_HISTORY_VERSION, HOURLY_RECONSTRUCTED_VERSION, HOURLY_BASIS, split_coverage_ref
 from .worker_database import RealtimeProcessDatabase
@@ -154,7 +155,9 @@ def _validate_rolling_sources(cursor, manifest, *, known_by):
         entries = stored["source_manifest"].get("history", [dict(session=stored["payload"]["session"],
             source_manifest=stored["source_manifest"], payload=stored["payload"])])
         original = next((entry for entry in entries if entry["session"] == item["session"]), None)
-        if (original is None or original["source_manifest"] != item["source_manifest"] or original["payload"] != item["payload"]):
+        if (original is None
+                or canonical_json(original["source_manifest"]) != canonical_json(item["source_manifest"])
+                or canonical_json(original["payload"]) != canonical_json(item["payload"])):
             raise ValueError("Rolling strategy copied session differs from immutable source release")
 
 
@@ -254,6 +257,17 @@ def materialize_realtime_daily_strategies(compute_database, publication_database
         else:
             projection = (project_realtime_strategy_history(inputs, interval=interval, market_time=market_time) if reconstruct_history
                 else project_realtime_daily_strategies(inputs, **({"interval": interval, "market_time": market_time} if interval == "1h" else {})))
+    return persist_realtime_strategy_projection(compute_database, publication_database, projection,
+        expected_snapshot_id=expected_snapshot_id, progress=progress, receipt=receipt)
+
+
+def persist_realtime_strategy_projection(compute_database, publication_database, projection, *,
+                                        expected_snapshot_id=None, progress=None, receipt=None):
+    if (not isinstance(compute_database, RealtimeProcessDatabase)
+            or compute_database.process_plan.role is not RealtimeDatabaseRole.COMPUTE
+            or not isinstance(publication_database, RealtimeProcessDatabase)
+            or publication_database.process_plan.role is not RealtimeDatabaseRole.PUBLICATION):
+        raise ValueError("Strategy persistence requires target-local COMPUTE and PUBLICATION roles")
     snapshot = projection.snapshot
     _validate_strategy_snapshot(snapshot.source_manifest, snapshot.payload)
     if expected_snapshot_id is not None and str(snapshot.snapshot_id) != str(expected_snapshot_id):
@@ -269,7 +283,7 @@ def materialize_realtime_daily_strategies(compute_database, publication_database
         # The snapshot is known at its own `generated_at` (its evidence is observed then): a producer running
         # before that instant (a window's deadline) must not fail the durability check on the wall clock.
         durable_by = max(datetime.now(timezone.utc), snapshot.generated_at)
-        if rolling_history:
+        if snapshot.snapshot_type in {ROLLING_VERSION, HOURLY_ROLLING_VERSION}:
             _validate_rolling_sources(cursor, snapshot.source_manifest, known_by=durable_by)
         for manifest in _evaluation_manifests(snapshot.source_manifest):
             _validate_durable(cursor, manifest, known_by=durable_by)
@@ -360,12 +374,13 @@ def _validate_rolling_snapshot(manifest, payload):
                 or own["cohort_id"] != manifest["cohort_id"] or own["provider_tier"] != manifest["provider_tier"]
                 or own["source_manifest_sha256"] != manifest["source_manifest_sha256"]
                 or own["tickers"] != manifest["tickers"] or own["scanner_basis"] != manifest["scanner_basis"]
-                or any(tuple(reference[key] for key in ("ticker", "security_id", "instrument_id", "security_type"))
-                    != tuple(current[key] for key in ("ticker", "security_id", "instrument_id", "security_type"))
+                or any(strategy_reference_identity(reference) != strategy_reference_identity(current)
                     for reference, current in zip(own["references"], manifest["references"]))):
             raise ValueError("Rolling strategy retained evaluation identity/clock drift")
     latest = history[-1]
-    if (any(latest["payload"][key] != payload[key] for key in ("scanners", "analysis", "setup_summary", "overview", "market_time", "generated_at"))
+    if (any(latest["payload"][key] != payload[key] for key in ("scanners", "analysis", "setup_summary", "overview", "market_time"))
+            or manifest.get("evaluation_generated_at", manifest["generated_at"]) != latest["source_manifest"]["generated_at"]
+            or payload.get("evaluation_generated_at", payload["generated_at"]) != latest["payload"]["generated_at"]
             or any(latest["source_manifest"][key] != manifest[key] for key in ("references", "source_windows", "receipts", "evidence_refs"))
             or payload["persistence"] != build_strategy_persistence(history, manifest["tickers"], sessions, interval=interval)):
         raise ValueError("Rolling strategy stored outcome/recurrence parity drift")
@@ -373,6 +388,13 @@ def _validate_rolling_snapshot(manifest, payload):
 
 def _validate_release(manifest, payload):
     interval = manifest.get("interval", "1d")
+    evaluation_generated_at = payload.get("evaluation_generated_at", payload["generated_at"])
+    if (("evaluation_generated_at" in manifest or "evaluation_generated_at" in payload)
+            and (manifest["version"] not in {ROLLING_VERSION, HOURLY_ROLLING_VERSION}
+                or manifest.get("evaluation_generated_at") != payload.get("evaluation_generated_at")
+                or _utc(datetime.fromisoformat(evaluation_generated_at), "strategy evaluation observation")
+                    > _utc(datetime.fromisoformat(payload["generated_at"]), "strategy publication"))):
+        raise ValueError("Strategy evaluation/publication clock drift")
     if interval == "1h":
         from .hourly_strategy_projection import session_hourly_slots
         market_time = _utc(datetime.fromisoformat(payload["market_time"]), "hourly strategy market time")
@@ -420,7 +442,7 @@ def _validate_release(manifest, payload):
         daily_contract = next((key for key, value in HOURLY_SCANNER_CONTRACTS.items() if value == contract), contract)
         scanner, analysis = payload["scanners"][contract], payload["analysis"][contract]
         rows = scanner["results"]
-        if (scanner["scan_datetime"] != payload["generated_at"] or scanner["interval"] != interval
+        if (scanner["scan_datetime"] != evaluation_generated_at or scanner["interval"] != interval
                 or scanner["total_scanned"] != len(tickers) or scanner["total_signals"] != len(rows)
                 or any(row["ticker"] not in tickers for row in rows)
                 or [row["ticker"] for row in analysis["members"]] != tickers):
@@ -489,11 +511,11 @@ def _validate_release(manifest, payload):
     evidence = manifest["setup_evidence"]
     expected_tickers = [ticker for ticker in tickers if manifest["receipts"][ticker]]
     if (summary["interval"] != interval or summary["source"] != "MATERIALIZED_CURRENT_PROJECTION"
-            or summary["computed_at"] != payload["generated_at"] or summary["market_time"] != payload["market_time"]
+            or summary["computed_at"] != evaluation_generated_at or summary["market_time"] != payload["market_time"]
             or summary["count"] != len(expected_tickers)
             or [row["ticker"] for row in summary["results"]] != expected_tickers
             or [row["ticker"] for row in evidence] != expected_tickers
-            or any(row["market_time"] != payload["market_time"] or row["observed_at"] != payload["generated_at"]
+            or any(row["market_time"] != payload["market_time"] or row["observed_at"] != evaluation_generated_at
                    or canonical_sha256(row["payload"]) != row["payload_sha256"]
                    or setup_summary_row(row) != flattened for row, flattened in zip(evidence, summary["results"]))):
         raise ValueError("Strategy setup evidence/row parity drift")
@@ -653,7 +675,8 @@ class RealtimeDailyStrategyRepository(_RealtimeCompatibilityRepository):
                 for evaluation in _evaluation_manifests(manifest) for setup in evaluation["setup_evidence"]}
             entry["known_by"] = cutoff
 
-    def read(self, *, available_by, cohort_id, snapshot_id=None, strategy=None, ticker=None, view=None, evaluation_session=None, interval="1d", read_mode="current"):
+    def read(self, *, available_by, cohort_id, snapshot_id=None, strategy=None, ticker=None, view=None,
+             evaluation_session=None, interval="1d", read_mode="current", session_date=None):
         cutoff = _utc(available_by, "available_by")
         if read_mode not in {"current", "retained"}:
             raise StrategyQueryRejected("Unsupported strategy read mode")
@@ -661,8 +684,17 @@ class RealtimeDailyStrategyRepository(_RealtimeCompatibilityRepository):
             raise StrategyQueryRejected("Strategy releases support only 1d/1h")
         versions = [STRATEGY_VERSION, HISTORY_VERSION, ROLLING_VERSION] if interval == "1d" else [HOURLY_VERSION, HOURLY_HISTORY_VERSION, HOURLY_ROLLING_VERSION]
         contracts = DAILY_SCANNER_CONTRACTS if interval == "1d" else {name: HOURLY_SCANNER_CONTRACTS[key] for name, key in DAILY_SCANNER_CONTRACTS.items()}
-        if view is not None and (view not in {"evaluations", "persistence"} or strategy is not None or ticker is not None):
+        if view is not None and (view not in {"evaluations", "persistence", "sessions"} or strategy is not None or ticker is not None):
             raise StrategyQueryRejected("Unsupported or mixed daily strategy view")
+        if session_date is not None:
+            try:
+                selected = date.fromisoformat(session_date)
+            except (TypeError, ValueError) as error:
+                raise StrategyQueryRejected("Strategy session requires an ISO trading date") from error
+            if str(selected) != session_date or not exchange_calendars.get_calendar("XNYS").is_session(session_date):
+                raise StrategyQueryRejected("Strategy session must be an XNYS trading date")
+            if ticker is not None or view == "sessions":
+                raise StrategyQueryRejected("Strategy session cannot be mixed with ticker research or session listing")
         if cohort_id is None or strategy is not None and strategy not in DAILY_SCANNER_CONTRACTS:
             raise StrategyQueryRejected("Daily strategies require an explicit cohort and supported default strategy")
         if ticker is not None and snapshot_id is None:
@@ -735,6 +767,13 @@ class RealtimeDailyStrategyRepository(_RealtimeCompatibilityRepository):
             action_drift = cursor.fetchone()["action_drift"]
             if action_drift and read_mode != "retained":
                 raise StrategyPublicationUnavailable("Strategy action evidence changed; new reviewed release required")
+        release_manifest, release_payload = manifest, payload
+        if session_date is not None:
+            selected = next((item for item in manifest.get("history", []) if item["session"] == session_date), None)
+            if selected is not None:
+                manifest, payload = selected["source_manifest"], selected["payload"]
+            elif payload["session"] != session_date:
+                raise StrategyPublicationUnavailable("No stored strategy evaluation for the requested trading session")
         delay = timedelta(minutes=15 if stored["provider_tier"] == "MASSIVE_DEVELOPER" else 0)
         expected = latest_expected_market_time(cutoff - delay, interval)
         actual = _utc(datetime.fromisoformat(payload["market_time"]), "strategy market time")
@@ -745,9 +784,10 @@ class RealtimeDailyStrategyRepository(_RealtimeCompatibilityRepository):
             state = dict(state, status="EXPIRED")
         if read_mode == "retained" and (not reference_current or action_drift) and state["status"] == "READY":
             state = dict(state, status="STALE")
-        publication = dict(cohort_id=str(cohort_id), snapshot_id=str(stored["snapshot_id"]), release_type=manifest["version"],
+        publication = dict(cohort_id=str(cohort_id), snapshot_id=str(stored["snapshot_id"]), release_type=release_manifest["version"],
             payload_sha256=stored["payload_sha256"], strategy_ticker_available=True, status=state["status"],
-            session=payload["session"], market_time=payload["market_time"], generated_at=payload["generated_at"],
+            session=payload["session"], market_time=payload["market_time"], generated_at=release_payload["generated_at"],
+            evaluation_generated_at=payload.get("evaluation_generated_at", payload["generated_at"]),
             read_at=cutoff.isoformat(), expected_market_time=expected.isoformat(), scope_note=payload["scope_note"],
             staleness_sessions=state["staleness_sessions"], max_serveable_stale_sessions=state["max_serveable_stale_sessions"],
             price_basis=payload["price_basis"], missing_producers=payload["missing_producers"])
@@ -756,9 +796,15 @@ class RealtimeDailyStrategyRepository(_RealtimeCompatibilityRepository):
                 action_status="CHANGED" if action_drift else "CURRENT", execution_permission=False, provider_fetch_performed=False,
                 current_data_available=reference_current and not action_drift and state["status"] == "READY")
         result = dict(publication=publication)
+        if session_date is not None:
+            publication["evaluation_session"] = session_date
         if interval == "1h":
             publication["interval"] = interval
-        if view == "evaluations":
+        if view == "sessions":
+            result.update(interval=interval, sessions=release_payload.get("observed_sessions",
+                release_payload.get("evaluation_sessions", [release_payload["session"]])),
+                data_as_of=release_payload["market_time"], data_interval=interval)
+        elif view == "evaluations":
             result.update(scanner_basis=payload["scanner_basis"], members=manifest["tickers"],
                 observed_sessions=[payload["session"]], recurrence_available=False,
                 scanners=payload["scanners"], analysis=payload["analysis"], evidence_refs=manifest["evidence_refs"])
@@ -766,11 +812,18 @@ class RealtimeDailyStrategyRepository(_RealtimeCompatibilityRepository):
             calendar = exchange_calendars.get_calendar("XNYS")
             sessions = [str(session.date()) for session in calendar.sessions_in_range(
                 calendar.session_offset(payload["session"], -4), payload["session"])]
+            history = [item for item in release_manifest.get("history", []) if item["session"] in sessions]
+            selected_rolling = session_date is not None and release_manifest["version"] in {ROLLING_VERSION, HOURLY_ROLLING_VERSION}
             result.update(scanner_basis=payload["scanner_basis"], members=manifest["tickers"],
-                evaluation_sessions=sessions, observed_sessions=payload.get("observed_sessions", payload.get("evaluation_sessions", [payload["session"]])),
-                interpretation=payload.get("interpretation", "RETAINED_LATEST_EVALUATION_ONLY"),
-                session_provenance=payload.get("session_provenance", {}),
-                reconstruction_at=payload.get("reconstruction_at"), persistence=payload.get("persistence"),
+                evaluation_sessions=sessions, observed_sessions=[item["session"] for item in history] if selected_rolling
+                    else payload.get("observed_sessions", payload.get("evaluation_sessions", [payload["session"]])),
+                interpretation=release_payload.get("interpretation", "RETAINED_LATEST_EVALUATION_ONLY") if selected_rolling
+                    else payload.get("interpretation", "RETAINED_LATEST_EVALUATION_ONLY"),
+                session_provenance={session: provenance for session, provenance in release_payload.get("session_provenance", {}).items()
+                    if session in sessions},
+                reconstruction_at=release_payload.get("reconstruction_at"),
+                persistence=build_strategy_persistence(history, manifest["tickers"], sessions, interval=interval)
+                    if selected_rolling else payload.get("persistence"),
                 scanners=payload["scanners"], analysis=payload["analysis"], evidence_refs=manifest["evidence_refs"])
         elif ticker is not None:
             ticker = ticker.upper()

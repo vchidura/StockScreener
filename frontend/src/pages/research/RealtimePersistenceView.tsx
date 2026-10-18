@@ -57,7 +57,7 @@ export default function RealtimeStrategyOverview() {
   }
   const { interval, setInterval } = useStrategyInterval(searchState)
   const strategies = persistenceStrategies(interval)
-  const query = usePublicationQuery('daily-persistence', pin => getDailyStrategyEvaluations(pin, interval))
+  const query = usePublicationQuery('daily-persistence', (pin, session) => getDailyStrategyEvaluations(pin, interval, session))
   const strategy = strategies.find(item => item.contract === params.get('strategy_filter'))?.contract ?? 'all'
   const search = params.get('ticker_filter') ?? ''
   const rowsOnly = params.get('rows_only') === '1'
@@ -117,7 +117,7 @@ export default function RealtimeStrategyOverview() {
               aria-expanded={expanded === ticker} onClick={() => setExpanded(expanded === ticker ? null : ticker)}>
               {expanded === ticker ? <ChevronUp size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}</button>
               <Link className="pv-ticker" title={`Open exact release research for ${ticker}`}
-                to={publicationPath(`/strategy-research/${ticker}`, data.publication.snapshot_id, data.publication.cohort_id, interval)}>{ticker}</Link></td>
+                to={publicationPath(`/strategy-research/${ticker}`, data.publication.snapshot_id, data.publication.cohort_id, interval, data.publication.evaluation_session)}>{ticker}</Link></td>
               {columns.map(item => { const cell = evaluationCell(data, item.contract, ticker)
                 return <td key={item.contract} title={cell.member.reason ?? cell.member.status}>{cell.summary}</td> })}</tr>
             {expanded === ticker && <tr className="pv-detail"><td colSpan={columns.length + 1}>

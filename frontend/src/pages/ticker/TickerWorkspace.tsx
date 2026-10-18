@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useCallback, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link, Navigate, useLocation, useParams } from 'react-router-dom'
 import TickerDetail, { type TickerView } from '../TickerDetail'
@@ -23,28 +23,38 @@ export default function TickerWorkspace() {
   const location = useLocation()
   const active = (VIEWS.find(item => item.value === view)?.value ?? 'overview') as TickerView
   const [analysisInterval, setAnalysisInterval] = useState<SetupTimeframe>('1d')
-  const [analysisSetup, setAnalysisSetup] = useState<TradeSetup | null>(null)
+  const [analysisSetup, setAnalysisSetup] = useState<{ snapshotId?: string; setup: TradeSetup | null } | null>(null)
   const realtimeOnly = import.meta.env.VITE_REALTIME_ONLY === 'true'
-  const release = usePublicationQuery(`ticker-workspace:${symbol}`, pin => getTickerWorkspacePublication(symbol, pin))
+  const release = usePublicationQuery(`ticker-workspace:${symbol}`, (pin, session) => getTickerWorkspacePublication(symbol, pin, session, true))
   const publication = release.data?.publication
   const snapshotId = publication?.snapshot_id
+  const onAnalysisSetupChange = useCallback((setup: TradeSetup | null) => {
+    setAnalysisSetup({ snapshotId, setup })
+  }, [snapshotId])
+  const closingView = publication?.read_mode === 'SESSION_CLOSE'
   const readsEnabled = !realtimeOnly || !!publication
   const publicationLoading = realtimeOnly && !publication && !release.error
-  const queryScope = realtimeOnly ? [publication?.cohort_id, snapshotId] : []
+  const queryScope = realtimeOnly ? [publication?.cohort_id, snapshotId, ...(closingView ? ['session_close'] : [])] : []
   const publicationError = realtimeOnly ? release.error : null
   const referenceWarning = publicationError ?? publication?.section_warnings?.reference ?? null
-  const technicalWarning = release.error ?? ([publication?.section_warnings?.actions,
-    publication?.section_warnings?.market].filter(Boolean).join(' ') || null)
+  const laterActionEvidence = closingView && publication?.action_status === 'CHANGED'
+  const technicalWarning = release.error ?? ([
+    laterActionEvidence ? null : publication?.section_warnings?.actions,
+    closingView ? null : publication?.section_warnings?.market,
+  ].filter(Boolean).join(' ') || null)
+  const publicationNotice = laterActionEvidence
+    ? `This saved view uses the ${publication.session} closing inputs. Newer corporate-action evidence is not included in these frozen inputs.`
+    : null
 
   const { data: profile = null, isFetching: profileLoading } = useQuery({
     queryKey: ['equity-security-profile', symbol, ...queryScope],
-    queryFn: () => getEquitySecurityProfile(symbol, snapshotId),
+    queryFn: () => getEquitySecurityProfile(symbol, snapshotId, closingView),
     enabled: !!symbol && readsEnabled,
     staleTime: 24 * 60 * 60 * 1000,
   })
   const { data: quote = null } = useQuery({
     queryKey: ['latest-quote', symbol, ...queryScope],
-    queryFn: () => getLatestQuote(symbol, false, snapshotId),
+    queryFn: () => getLatestQuote(symbol, false, snapshotId, closingView),
     enabled: !!symbol && readsEnabled,
     refetchInterval: realtimeOnly ? false : 60_000,
   })
@@ -54,7 +64,7 @@ export default function TickerWorkspace() {
     isError: calendarError,
   } = useQuery({
     queryKey: ['option-event-calendar', symbol, 30, ...queryScope],
-    queryFn: () => getOptionEventCalendar(symbol, 30, snapshotId),
+    queryFn: () => getOptionEventCalendar(symbol, 30, snapshotId, closingView),
     enabled: !!symbol && active === 'overview' && readsEnabled,
     staleTime: 15 * 60 * 1000,
   })
@@ -71,7 +81,7 @@ export default function TickerWorkspace() {
       .join(' · ') || undefined,
     status: [
       {
-        label: 'Last',
+        label: realtimeOnly ? 'Close' : 'Last',
         value: quote
           ? `$${quote.price.toFixed(2)}${changePercent === null ? '' : `  ${changePercent >= 0 ? '+' : ''}${changePercent.toFixed(2)}%`}`
           : '—',
@@ -79,6 +89,7 @@ export default function TickerWorkspace() {
         tone: change === null ? undefined : change >= 0 ? 'positive' : 'negative',
       },
     ],
+    session: realtimeOnly ? '1d' : undefined,
   })
 
   if (view === 'scanner') {
@@ -110,7 +121,7 @@ export default function TickerWorkspace() {
               else await release.refresh()
             } : undefined}
             onAnalysisIntervalChange={setAnalysisInterval}
-            onAnalysisSetupChange={setAnalysisSetup} />
+            onAnalysisSetupChange={onAnalysisSetupChange} />
           {active === 'financials' && <FinancialsView profile={profile} loading={publicationLoading || profileLoading}
             availabilityError={referenceWarning} />}
         </div>
@@ -124,8 +135,9 @@ export default function TickerWorkspace() {
             referenceWarning={referenceWarning}
             calendarAvailabilityError={publicationError}
             publication={publication}
+            publicationNotice={realtimeOnly ? publicationNotice : null}
             analysisInterval={analysisInterval}
-            setup={analysisSetup}
+            setup={analysisSetup?.snapshotId === snapshotId ? analysisSetup?.setup ?? null : null}
           />
         )}
       </div>

@@ -31,10 +31,17 @@ test('portal render failures keep the shell available and reset on navigation', 
   const app = read('../src/App.tsx')
   const boundary = read('../src/layout/PortalViewBoundary.tsx')
   assert.equal(app.match(/<PortalViewBoundary>/g)?.length, 2)
-  assert.match(boundary, /key=\{`\$\{location\.pathname\}\$\{location\.search\}`\}/)
+  assert.match(boundary, /const resetKey = `\$\{location\.pathname\}\$\{location\.search\}`/)
+  assert.match(boundary, /key=\{location\.pathname\.startsWith\('\/ticker\/'\) \? location\.pathname : resetKey\} resetKey=\{resetKey\}/)
   assert.match(boundary, /This page could not be displayed/)
   assert.match(boundary, /The rest of the portal is still available/)
   assert.match(boundary, />\s*Retry\s*</)
+})
+
+test('Validation status is absent from both sidebar and portal routes', () => {
+  const shell = read('../src/layout/AppShell.tsx')
+  assert.doesNotMatch(shell, /validationDestination|title="Equity validation status"|<span>Validation status<\/span>/)
+  assert.doesNotMatch(read('../src/App.tsx'), /RealtimeCanaryPage|realtime-canary/)
 })
 
 test('all actual Dashboard requests preserve canonical contracts and pin realtime cohort/publication', async () => {
@@ -168,7 +175,8 @@ test('shell freshness status pins the realtime cohort and Dashboard publication'
     assert.match(banner, /params\.get\('snapshot_id'\)/)
     assert.match(banner, /fetchMaterializationStatus\(snapshotId, ticker, dailyStrategies, interval\)/)
     assert.match(banner, /activeTickerSymbol\(location.pathname\)/)
-    assert.match(banner, /\[realtimeOnly, snapshotId, ticker, dailyStrategies, scope\]/)
+    assert.match(banner, /\[realtimeOnly, snapshotId, ticker, dailyStrategies, scope, historicalTicker\]/)
+    assert.match(banner, /if \(historicalTicker\) return/)
     assert.match(banner, /Delayed market data/)
     assert.match(banner, /Pages remain available with their latest retained content/)
     assert.doesNotMatch(banner, /remain blocked|no longer served/)

@@ -422,20 +422,20 @@ def create_realtime_portal_app(
         ticker: str, interval: Literal["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"] = "1d",
         period: Literal["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "4y", "5y"] = "1y",
         refresh: bool = False, cohort_id: UUID | None = None, snapshot_id: UUID | None = None,
-        read_mode: Literal["current", "retained"] = "current",
+        read_mode: Literal["current", "retained", "session_close"] = "current",
     ):
         return ticker_read(ticker, "chart", cohort_id, interval=interval, period=period, snapshot_id=snapshot_id, read_mode=read_mode)
 
     @app.get("/api/stock/{ticker}/chart-patterns")
-    def ticker_patterns(ticker: str, interval: str = "1d", refresh: bool = False, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained"] = "current"):
+    def ticker_patterns(ticker: str, interval: str = "1d", refresh: bool = False, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained", "session_close"] = "current"):
         return ticker_read(ticker, "patterns", cohort_id, interval=interval, snapshot_id=snapshot_id, read_mode=read_mode)
 
     @app.get("/api/stock/{ticker}/price-channel")
-    def ticker_channel(ticker: str, interval: str = "1d", refresh: bool = False, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained"] = "current"):
+    def ticker_channel(ticker: str, interval: str = "1d", refresh: bool = False, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained", "session_close"] = "current"):
         return ticker_read(ticker, "channel", cohort_id, interval=interval, snapshot_id=snapshot_id, read_mode=read_mode)
 
     @app.get("/api/chart-patterns/ticker/{ticker}")
-    def ticker_cross_patterns(ticker: str, refresh: bool = False, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained"] = "current"):
+    def ticker_cross_patterns(ticker: str, refresh: bool = False, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained", "session_close"] = "current"):
         return ticker_read(ticker, "cross_patterns", cohort_id, snapshot_id=snapshot_id, read_mode=read_mode)
 
     @app.get("/api/tickers")
@@ -478,12 +478,14 @@ def create_realtime_portal_app(
             raise unavailable(error) from error
 
     @app.get("/api/tickers/workspace-publication")
-    def ticker_workspace_publication(cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained"] = "current"):
+    def ticker_workspace_publication(cohort_id: UUID | None = None, snapshot_id: UUID | None = None,
+                                    read_mode: Literal["current", "retained", "session_close"] = "current",
+                                    session_date: str | None = None):
         if repositories.ticker_workspace is None:
             raise HTTPException(503, "Realtime Ticker Workspace repository is unavailable")
         try:
             return repositories.ticker_workspace.workspace_publication(
-                available_by=cutoff(), cohort_id=cohort_id, snapshot_id=snapshot_id, read_mode=read_mode,
+                available_by=cutoff(), cohort_id=cohort_id, snapshot_id=snapshot_id, read_mode=read_mode, session_date=session_date,
             )
         except TickerPublicationUnavailable as error:
             raise HTTPException(503, str(error)) from error
@@ -493,20 +495,36 @@ def create_realtime_portal_app(
             logging.getLogger(__name__).exception("Realtime ticker workspace summary failed")
             raise unavailable(error) from error
 
+    @app.get("/api/tickers/sessions")
+    def all_ticker_closing_sessions(cohort_id: UUID):
+        if repositories.ticker_workspace is None:
+            raise HTTPException(503, "Realtime Ticker Workspace repository is unavailable")
+        try:
+            return repositories.ticker_workspace.workspace_closing_sessions(available_by=cutoff(), cohort_id=cohort_id)
+        except TickerPublicationUnavailable as error:
+            raise HTTPException(503, str(error)) from error
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        except Exception as error:
+            logging.getLogger(__name__).exception("All Tickers closing-session lookup failed")
+            raise unavailable(error) from error
+
     @app.get("/api/chart-patterns/scan")
     def pattern_watch_scan(
-        interval: Literal["15m", "30m", "1h", "1d", "1wk", "1mo"] = "1d",
+        interval: Literal["30m", "1h", "1d", "1wk", "1mo"] = "1d",
         limit: int = Query(1000, ge=1, le=1500),
         refresh: bool = False,
         cohort_id: UUID | None = None,
         snapshot_id: UUID | None = None,
-        read_mode: Literal["current", "retained"] = "current",
+        read_mode: Literal["current", "retained", "session_close"] = "current",
+        session_date: str | None = None,
     ):
         if repositories.ticker_workspace is None:
             raise HTTPException(503, "Realtime Ticker Workspace repository is unavailable")
         try:
             return repositories.ticker_workspace.scan_patterns(
                 interval=interval, limit=limit, available_by=cutoff(), cohort_id=cohort_id, snapshot_id=snapshot_id, read_mode=read_mode,
+                session_date=session_date,
             )
         except TickerPublicationUnavailable as error:
             raise HTTPException(503, str(error)) from error
@@ -515,24 +533,42 @@ def create_realtime_portal_app(
         except Exception as error:
             raise unavailable(error) from error
 
+    @app.get("/api/chart-patterns/sessions")
+    def pattern_watch_closing_sessions(cohort_id: UUID):
+        if repositories.ticker_workspace is None:
+            raise HTTPException(503, "Realtime Ticker Workspace repository is unavailable")
+        try:
+            return repositories.ticker_workspace.pattern_closing_sessions(available_by=cutoff(), cohort_id=cohort_id)
+        except TickerPublicationUnavailable as error:
+            raise HTTPException(503, str(error)) from error
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        except Exception as error:
+            logging.getLogger(__name__).exception("Pattern Watch closing-session lookup failed")
+            raise unavailable(error) from error
+
     @app.get("/api/stock/{ticker}/quote")
-    def ticker_quote(ticker: str, refresh: bool = False, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained"] = "current"):
+    def ticker_quote(ticker: str, refresh: bool = False, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained", "session_close"] = "current"):
         return ticker_read(ticker, "quote", cohort_id, snapshot_id=snapshot_id, read_mode=read_mode)
 
     @app.get("/api/stock/{ticker}/workspace-publication")
-    def ticker_publication(ticker: str, cohort_id: UUID, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained"] = "current"):
-        return ticker_read(ticker, "publication", cohort_id, snapshot_id=snapshot_id, read_mode=read_mode)
+    def ticker_publication(ticker: str, cohort_id: UUID, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained", "session_close"] = "current", session_date: str | None = None):
+        return ticker_read(ticker, "publication", cohort_id, snapshot_id=snapshot_id, read_mode=read_mode, session_date=session_date)
+
+    @app.get("/api/stock/{ticker}/sessions")
+    def ticker_closing_sessions(ticker: str, cohort_id: UUID):
+        return ticker_read(ticker, "sessions", cohort_id)
 
     @app.get("/api/stock/{ticker}/trade-setup/multi")
-    def ticker_multi(ticker: str, refresh: bool = False, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained"] = "current"):
+    def ticker_multi(ticker: str, refresh: bool = False, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained", "session_close"] = "current"):
         return ticker_read(ticker, "multi", cohort_id, snapshot_id=snapshot_id, read_mode=read_mode)
 
     @app.get("/api/equity/security/{ticker}")
-    def ticker_profile(ticker: str, report_limit: int = Query(12, ge=0, le=100), cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained"] = "current"):
+    def ticker_profile(ticker: str, report_limit: int = Query(12, ge=0, le=100), cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained", "session_close"] = "current"):
         return ticker_read(ticker, "profile", cohort_id, report_limit=report_limit, snapshot_id=snapshot_id, read_mode=read_mode)
 
     @app.get("/api/options/calendar/{ticker}")
-    def ticker_calendar(ticker: str, days_forward: int = Query(30, ge=1, le=120), cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained"] = "current"):
+    def ticker_calendar(ticker: str, days_forward: int = Query(30, ge=1, le=120), cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained", "session_close"] = "current"):
         return ticker_read(ticker, "calendar", cohort_id, days_forward=days_forward, snapshot_id=snapshot_id, read_mode=read_mode)
 
     @app.get("/api/options/flow")
@@ -669,15 +705,16 @@ def create_realtime_portal_app(
     @app.get("/api/strategies/daily")
     def daily_strategy_release(request: Request, cohort_id: UUID | None = None, snapshot_id: UUID | None = None,
                                strategy: str | None = None, ticker: str | None = None, view: str | None = None,
-                               evaluation_session: str | None = None, interval: str = "1d", read_mode: Literal["current", "retained"] = "current"):
-        if set(request.query_params) - {"cohort_id", "snapshot_id", "strategy", "ticker", "view", "evaluation_session", "interval", "read_mode"} or strategy and ticker:
+                               evaluation_session: str | None = None, interval: str = "1d", read_mode: Literal["current", "retained"] = "current",
+                               session_date: str | None = None):
+        if set(request.query_params) - {"cohort_id", "snapshot_id", "strategy", "ticker", "view", "evaluation_session", "interval", "read_mode", "session_date"} or strategy and ticker:
             raise HTTPException(422, "Daily strategy releases retain only exact-cohort defaults")
         if repositories.daily_strategies is None:
             raise HTTPException(503, "Independent daily strategy repository is unavailable")
         try:
             return repositories.daily_strategies.read(available_by=cutoff(), cohort_id=cohort_id,
                 snapshot_id=snapshot_id, strategy=strategy, ticker=ticker, view=view, evaluation_session=evaluation_session, interval=interval,
-                read_mode=read_mode)
+                read_mode=read_mode, session_date=session_date)
         except StrategyPublicationUnavailable as error:
             raise HTTPException(503, str(error)) from error
         except StrategyQueryRejected as error:
@@ -760,7 +797,7 @@ def create_realtime_portal_app(
         return dashboard_read("setup_summary", cohort_id, snapshot_id, interval=interval)
 
     @app.get("/api/stocks/context")
-    def ticker_context(ticker: str | None = None, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained"] = "current"):
+    def ticker_context(ticker: str | None = None, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained", "session_close"] = "current"):
         if ticker is not None:
             return ticker_read(ticker, "context", cohort_id, snapshot_id=snapshot_id, read_mode=read_mode)
         return dashboard_read("context", cohort_id, snapshot_id)

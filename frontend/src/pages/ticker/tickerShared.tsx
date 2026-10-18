@@ -289,10 +289,10 @@ export type SetupTimeframe = '30m' | '1h' | '1d' | '1wk' | '1mo'
 export const CHART_INTERVALS = ['1m', '5m', '15m', '30m', '1h', '1d', '1wk', '1mo'] as const
 export const INTERVAL_NOUN: Record<string, string> = { '1mo': 'monthly', '1wk': 'weekly', '1d': 'daily', '1h': 'hourly' }
 export const PATTERN_INTERVAL_LABEL: Record<string, string> = {
-  '1m': '1 minute', '5m': '5 minute', '15m': '15 minute',
   '30m': '30 minute', '1h': 'Hourly', '1d': 'Daily', '1wk': 'Weekly', '1mo': 'Monthly',
 }
-export const PATTERN_INTERVAL_ORDER = ['1mo', '1wk', '1d', '1h', '30m', '15m', '5m'] as const
+export const PATTERN_INTERVAL_ORDER = ['1mo', '1wk', '1d', '1h', '30m'] as const
+export const supportsPatternInterval = (interval: string) => PATTERN_INTERVAL_ORDER.some(frame => frame === interval)
 
 export const patternChoiceValue = (interval: string, type: string) => `frame|${interval}|${type}`
 
@@ -360,6 +360,14 @@ export const defaultPeriodForInterval = (interval: string) => {
   if (interval === '1mo') return '5y'
   if (interval === '1d') return '2y'
   return '1y'
+}
+
+export function formatTickerReadError(error: Error | null, session?: string): string | null {
+  if (!error) return null
+  if (error.message === 'NATIVE_ADJUSTED_MONTHLY_HISTORY_INCOMPLETE') {
+    return `Monthly closing history${session ? ` for ${session}` : ''} is incomplete in this saved publication. Choose another interval or session.`
+  }
+  return error.message
 }
 
 const INTERVAL_RANK: Record<string, number> = {

@@ -880,6 +880,23 @@ exchange-session window of exact hourly evaluation cutoffs, not five hourly bars
 or an hour-by-hour archive. Initial historical reconstruction requires separate
 bounded authorization and retains reconstructed-research provenance.
 
+Strategy freshness is determined by the independent strategy publication's
+`session` and `market_time`, not by the chart publication or a signal's formation
+date. Refreshing chart data alone does not republish strategy results. Rolling
+strategy releases retain prior outcomes without changing their original clocks;
+reference identity comparisons normalize database UUIDs and stored JSON IDs.
+
+The header's strategy session picker lists retained evaluation dates for the
+selected `1d` or `1h` interval. Previous/next, direct selection, refresh, reload,
+and navigation between strategy pages preserve the selected `session_date`;
+returning to latest removes it. Exact ticker-research links carry the selected
+`evaluation_session`. Missing dates are explicitly unavailable, never replaced
+with the latest results. Persistence's five-session window ends on the selected
+trading date. Historical reconstruction uses its actual observation time and is
+labelled reconstructed research; adding it to a rolling release does not
+recalculate the latest evaluation. `generated_at` is publication time and
+`evaluation_generated_at` retains the evaluation's original observation clock.
+
 ##### Scalable Staged Option Enrollment
 
 The scalable enrollment foundation is deployed: migration 019 and reviewed grants
@@ -963,10 +980,10 @@ sharded rather than silently widened. UI pagination/capacity still requires revi
 before target activation.
 
 Realtime-only mode maps stored projections into `/stocks/screener`,
-`/stocks/alerts`, `/options/alerts` and `/ticker/:symbol`; validation status
-remains at `/realtime-canary`. The fixed cohort is supplied by
-`VITE_REALTIME_COHORT_ID`. Navigation exposes only those mapped surfaces and
-unsupported legacy URLs redirect to Stock Screener without canonical requests.
+`/stocks/alerts`, `/options/alerts` and `/ticker/:symbol`. The fixed cohort is
+supplied by `VITE_REALTIME_COHORT_ID`. The validation-status page and its
+`/realtime-canary` route have been removed. Unknown portal URLs return to
+Dashboard without switching deployment modes or making canonical requests.
 Options Alerts explicitly reports not applicable for the equity cohort. The
 legacy Docker Compose stack still launches canonical `main:app` and is not an
 Advanced Realtime launcher. Container deployment requires a container-reachable
@@ -984,6 +1001,57 @@ The Stock Screener now uses the original `StockScreeningPage`, browser-local
 library and four `/api/stocks/screening/*` contracts in realtime-only mode.
 Ticker Workspace uses the original `TickerWorkspace`/`TickerDetail` layout, views,
 chart controls and compatible `/api/stock/*`, profile and stock-context contracts.
+Its date-only header picker defaults to the latest saved completed exchange
+session; there is no separate live/Latest option. The static **Market Data**
+stamp always shows the newest available session's closing datetime, including
+while an older date is selected, matching the strategy pages.
+The ticker-specific closing-date list is a bounded metadata read cached for one
+minute; choosing a date reuses the existing snapshot-pinned readers and chart
+cache, without provider fetches, technical recomputation, publication or extra
+retention. All ticker tabs, reload and refresh retain `session_date`. Historical
+reads use `read_mode=session_close` and reject missing, expired or non-closing
+snapshots rather than substituting current data. Only dates with retained full
+ticker workspaces are selectable; this is not an archive of every historical day.
+Ticker chart interval, lookback period, pattern selection, pattern/channel/RSI
+toggles and pinned analysis timeframe are URL-backed and survive session changes,
+reload and browser history. Date changes keep the chart mounted but replace its
+data and overlays with that session's saved values. A missing selected pattern
+stays selected with an unavailable notice; another pattern is never substituted.
+Pattern Watch uses the same date-only control over its self-contained, kept
+session-close pattern publications. Previous-date scans select frozen rows and
+never rerun pattern detection or require expired hot workspaces. Cross-frame
+ticker views still require that ticker's retained closing workspace and report
+unavailability if it has expired. Changing pattern intervals,
+refreshing, and opening a pattern's ticker preserve the selected closing date.
+Pattern research supports `30m`, `1h`, `1d`, `1wk` and `1mo` under
+`pattern_watch_long_frames_v2`. New portal projections do not run full `5m`/`15m`
+pattern materializations or publish their pattern views. Their price bars,
+chart intervals and independent cached price-channel context remain available.
+Existing immutable publications are not rewritten; archived cross-frame reads
+filter retired pattern rows and summarize only supported frames. Savings apply
+to future producer runs, not by deleting stored history.
+Linked chart patterns redraw after finalized candle data arrives and on theme
+changes. Pattern/channel canvas colors are resolved from theme tokens rather
+than passed as CSS variable strings. Cyan/violet pattern boundaries and amber
+necklines remain distinct from red/green candles; all pattern roles maintain at
+least 3:1 contrast against the chart background in both dark and light themes.
+All Tickers also selects a self-contained saved closing summary: its price rows,
+daily setup columns, and evidence references come from one date-bound publication.
+Previous/next, refresh, reload, and ticker drilldown preserve `session_date`;
+an inherited hot snapshot pin cannot override the selected close. Missing dates
+fail explicitly without a Dashboard/current-data fallback.
+Live freshness notifications are suppressed for these closing-only pages.
+Ticker closing charts also omit live-market freshness warnings. The routine note
+about corporate-action evidence newer than the frozen inputs belongs in collapsed
+Run details, not over the chart. Publication availability, reference identity and
+checksum failures remain visible errors; missing monthly history names the selected
+date rather than implying live-data staleness.
+Explicit provider-free closing reconstructions preserve the market cutoff,
+record the actual knowledge and publication clocks, and are labeled reconstructed
+research in Run details. They create new immutable publications without replacing
+the originals or advancing current feature/evidence/release pointers.
+The Validation status page implementation, route and sidebar entry are removed.
+Shared backend validation and health APIs remain independent of that retired UI.
 Stock Alerts uses the original page and its two compatible retained-read contracts;
 Options Alerts remains a validation adapter. Supported offline contracts are not
 durable/live parity.

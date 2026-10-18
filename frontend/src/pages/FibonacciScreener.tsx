@@ -94,7 +94,7 @@ function FibonacciScreener() {
   const interval = realtimeOnly ? storedInterval.interval : canonicalInterval
   const setInterval = (value: typeof canonicalInterval) => realtimeOnly ? storedInterval.setInterval(value === '1h' ? '1h' : '1d') : setCanonicalInterval(value)
 
-  const realtimeQuery = usePublicationQuery('daily-fibonacci', pin => getDailyScannerPublication('fibonacci', pin, interval === '1h' ? '1h' : '1d'))
+  const realtimeQuery = usePublicationQuery('daily-fibonacci', (pin, session) => getDailyScannerPublication('fibonacci', pin, interval === '1h' ? '1h' : '1d', session))
   const canonicalQuery = useQuery<FibonacciScanResponse>({
     queryKey: ['scan', 'fibonacci', interval, scanDate, minSwing],
     queryFn: () => scanFibonacci(undefined, scanDate || undefined, minSwing, interval),

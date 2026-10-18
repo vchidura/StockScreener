@@ -26,9 +26,9 @@ PATTERN_NAMES = {
     "TRIPLE_BOTTOM": "Triple bottom",
 }
 
-PATTERN_INTERVAL_ORDER = ("1wk", "1d", "1h", "30m", "15m", "5m")
+PATTERN_INTERVAL_ORDER = ("1mo", "1wk", "1d", "1h", "30m", "15m", "5m")
 PATTERN_INTERVAL_TIER = {
-    "1wk": "CONTEXT", "1d": "CONTEXT",
+    "1mo": "CONTEXT", "1wk": "CONTEXT", "1d": "CONTEXT",
     "1h": "SETUP", "30m": "SETUP",
     "15m": "TRIGGER", "5m": "TRIGGER",
 }

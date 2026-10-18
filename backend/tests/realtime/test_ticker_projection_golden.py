@@ -4,7 +4,7 @@ The stored workspace payloads (without the screening-code-dependent `context.coh
 manifest identity (everything except the source-code hash, which changes with any edit of the producer), every
 persisted evidence row and the inputs of the summary and Pattern Watch producers are pinned by digest. A
 performance change to the projection must leave all of them untouched. When an intentional change to the
-analysis (not a speed-up) alters them, regenerate with
+analysis or provenance identity (not a speed-up) alters them, regenerate with
 `python -B backend/tests/realtime/test_ticker_projection_golden.py` from the repository root and review the diff.
 """
 import json
@@ -28,54 +28,54 @@ GOLDEN = {
         "lineage": "f2b3c22ccd879dc85871d376abe26696f3320100360af7a890a08b9834a4ca92",
         "rows": "1951c5b76fb3c0d0c7af186937459dc840081dceef4b07235af97c0edf3591af"
     },
-    "pattern_watch": "12ecf98cb5af35be77947ce87c3defcad92a9bdb97950da737eadb3fd9069791",
+    "pattern_watch": "432b0026d4478a13aa0e741f13117a0bb19a33c86c46cdec3cfb49ee301ba3e4",
     "summary": "fc9ca6ddaa41d4c9830a33db77147398155d046e1d3057fd0515c19d37332000",
     "summary_charts": "b915396d4c175aa1bade66211327b530ecba96362fe89cd445d4b7ec5cb748c7",
     "workspaces": {
         "AAPL": {
-            "evidence": "e6de568ff0ae4f5f065c435f536da11b5ad9d28611e7174bcfd4a91e92257ec3",
+            "evidence": "96a6d3b1515786829953f36d1f518aba8a31b1edfd00c4508b8655c4cc83c646",
             "manifest": "2cf04ddda27d807f851d8baa9ae612ce2034d248836a8840d585e164ad858ea7",
-            "payload": "3816aa10f9dbeb7ae01f2e405d7c352674b0a5558a7296467df98fec2a2e8e93"
+            "payload": "3f06d9fb0bf58f7ca89e40db139b90948041bbf69ddbea7fbe1f61fed0523c8e"
         },
         "AMZN": {
-            "evidence": "d067de47138224251f647ad32141bed47ba96c35637ff3e9b4120a07a3b52056",
+            "evidence": "739f430e320c429907c6d88b832cc8f20ef6be9974fba11e20bddc86c187a8be",
             "manifest": "d6f72685d00ebfe107de3d19df0fef51c25e8cd466c80dd89946158033adb00f",
-            "payload": "fb3f6dc5a19a5e172c4222ddfd9448c1f179058ad823d74b1c9134f3acb4e472"
+            "payload": "a0c73fba3722692d2f5523c9eaac5ac297c56d94fac449707a06efa89038e710"
         },
         "IWM": {
-            "evidence": "316054b8f8399b639f09732fcfbc4be96f7b96e71d5b31cffcff5df98c8d1c71",
+            "evidence": "79dadd2b670be84379e7f508648e8ba27b5bd902fe93bb5cb32b5f487a9850ee",
             "manifest": "0b1bb5f8960a70a8f1103c9aac8151a5cca3708b0b61484e2c9b358fd2c3686b",
-            "payload": "73766b6daf60b318992dc27b285b82b759b66406ca13f6ccc74727afe8e27633"
+            "payload": "969bac58f58be7c30307c43c2e7ac8574728e01200a837229bfeb0003ca5bc45"
         },
         "MSFT": {
-            "evidence": "a76a820aa967d0f548365639c00a57e8959c0f9e5cd80e34a4d347def9fcac4e",
+            "evidence": "2e82d59436134841aa79fe38a345db6d00ba2a987e0590f3358c7fd9c71532ff",
             "manifest": "8348fd6bc19b7f6f9f5a67433dbdf5788f671a4d1208735c6145e31cfb7ee808",
-            "payload": "ba8989c8fe440bf2b7358fc987e265c5e84ce2791e24ee16b79ad21d6643f61a"
+            "payload": "d88c12f431fc1cdf9a3ff9d2a30e171737afa24e62b4a3a2a16575c7025b69bb"
         },
         "NFLX": {
-            "evidence": "825c85046c42ad67f7ecb6eeb1dfbedc7c2135265e6d441f320de649614783c5",
+            "evidence": "5b3ecc43b9a2c481278aa8d25186307e03035850ebcf85a2e37ae9690a10109e",
             "manifest": "92b5a33fc536895eefa0c91178f0eecc07478c9ec1058576ab3d00e72da4e8d5",
-            "payload": "6d858b2e3c41d937599d98649878f3174db113b30a056c49a654d4c121a030d2"
+            "payload": "be1007716fc120a02ee713b31c2c6079ddc0b6d37aa9cd8d7b94063a18f82978"
         },
         "NVDA": {
-            "evidence": "629dab8551373a749308e04a64b2197b46f4a80b57fc4222bf1b8e6908a663a1",
+            "evidence": "0657f19426e6fbfcfc338b24429e28043ddf8648d8ce60eee3711c69e06a5884",
             "manifest": "316b8796b997539fadd35cf8e85edab6fa1cb80abf034abe9681aea1da1e2b94",
-            "payload": "158ef572c1176a6d1e3eb6c304cd46a910fc4717fb1f1c5ff778f7a3f6cbf360"
+            "payload": "56acdd74d66ea97a04ef61b271241e4491b0456b11d149f6bd19304495ba5b40"
         },
         "QQQ": {
-            "evidence": "ad3c3a2c41639e90d34939cddc578268beba1a95a034bbe775d9367381d5018a",
+            "evidence": "75a78eb2d1694abab594481f608911178435cd12f2cce67a9d43dba9e540363a",
             "manifest": "aa5b0c7b6544559d19ed898eee18c1ab3286ae7f99753feff3c3d84c299ef090",
-            "payload": "f9d343d7a4df02164a87789c144c4a4331c1d8c9355aa83e3e598223f15f4b1b"
+            "payload": "f48011e3f63c2d206f71cacaff7d520c1bd111e475738a5dcacea99b52f1bc1e"
         },
         "SPY": {
-            "evidence": "40d2ec3dc60aa028351c9faf5fc366949f861167edb3d40fd81fc5af70ea4187",
+            "evidence": "00b44c93490a3a987fa70d100115b517b68950cc1da5f43191c9fc48f22294c9",
             "manifest": "65558d1354cb43af63a239bf38a7d6b78c864588f69e866c9fb33b80a9bd11ee",
-            "payload": "1779cc404c208b79e2994c0ad7056c9e53ff347ca80e75bea6196c309fbb9ed2"
+            "payload": "1affbc8bdf6b36e9016d1bd3ab75c5fb169a5458226f4ec5070ce9e08e7a3db3"
         },
         "TSLA": {
-            "evidence": "e3c87830a279c9dae86b8ae49347ea61c998dcbd3a9ccf6b2bfaa77370b81e8d",
+            "evidence": "fc9bdbe7d5b7de5bdf0b2922f5c4ee284f30802431950f76bd80c991b6157546",
             "manifest": "0b0a1e659b22e376c3fa77e74390233b80f18903fee08de89f9bf60213bc8447",
-            "payload": "9b6a5519322508bddc0dfcf8a290caecc94bdcba01298b0b9ac6133ad669a8c7"
+            "payload": "bc135e3f8d979fe5f42785e1cde500cbfe0fa0e962cf84d1fea4fbe2136d419e"
         }
     }
 }

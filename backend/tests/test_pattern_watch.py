@@ -53,11 +53,11 @@ def pattern(name: str, grade: str, touches: int, readiness: str = "FORMING", edg
 
 
 class PatternWatchEndpointTests(unittest.IsolatedAsyncioTestCase):
-    async def test_universe_scan_contract_reserves_five_minute_for_ticker_research(self):
+    async def test_universe_scan_contract_excludes_retired_short_pattern_intervals(self):
         operation = main.app.openapi()["paths"]["/api/chart-patterns/scan"]["get"]
         interval = next(parameter for parameter in operation["parameters"] if parameter["name"] == "interval")
 
-        self.assertEqual(interval["schema"]["pattern"], "^(15m|30m|1h|1d|1wk|1mo)$")
+        self.assertEqual(interval["schema"]["pattern"], "^(30m|1h|1d|1wk|1mo)$")
 
     async def test_ticker_patterns_report_the_close_used_by_the_detector(self):
         source = frame(100.0)
@@ -143,9 +143,9 @@ class PatternWatchEndpointTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "_invalidate_prefix"),
             patch("database.get_db_cursor", return_value=cursor_context()),
         ):
-            result = await main.scan_chart_patterns("15m", 1000, True)
+            result = await main.scan_chart_patterns("30m", 1000, True)
 
-        loader.assert_called_once_with(["AAA"], "15m", main.PATTERN_FRAME_ROWS)
+        loader.assert_called_once_with(["AAA"], "30m", main.PATTERN_FRAME_ROWS)
         channel_detector.assert_not_called()
         self.assertEqual(result["scanned"], 1)
 
@@ -225,11 +225,11 @@ class PatternWatchEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ticker_scan_combines_all_intervals_and_preserves_row_frames(self):
         responses = []
-        for interval in ("5m", "15m", "30m", "1h", "1d", "1wk"):
+        for interval in main.PATTERN_WATCH_INTERVALS:
             patterns = []
-            if interval == "15m":
+            if interval == "30m":
                 patterns = [pattern("Descending triangle", "VALID_GEOMETRY", 4, "NEAR_EDGE", 0.5)]
-            elif interval == "30m":
+            elif interval == "1h":
                 patterns = [pattern("Symmetrical triangle", "STRONG_GEOMETRY", 6, "AT_EDGE", 0.1)]
             responses.append({
                 "ticker": "AAA",
@@ -251,10 +251,10 @@ class PatternWatchEndpointTests(unittest.IsolatedAsyncioTestCase):
             {
                 "ticker": "AAA", "interval": interval,
                 "status": "CHANNEL_RESEARCH", "last_close": 100.0,
-                "channel": {"type": "RISING_CHANNEL"} if interval == "30m" else None,
+                "channel": {"type": "RISING_CHANNEL"} if interval == "1h" else None,
                 "computed_at": "2026-08-28T12:00:00+00:00",
             }
-            for interval in ("5m", "15m", "30m", "1h", "1d", "1wk", "1mo")
+            for interval in main.PATTERN_WATCH_INTERVALS
         ]
         channel_detector = AsyncMock(side_effect=channel_responses)
         with (
@@ -268,15 +268,15 @@ class PatternWatchEndpointTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await main.scan_ticker_chart_patterns("aaa", refresh=True)
 
-        self.assertEqual(detector.await_count, 7)
+        self.assertEqual(detector.await_count, 5)
         self.assertEqual(
             detector.await_args_list,
-            [call("AAA", interval, False) for interval in ("5m", "15m", "30m", "1h", "1d", "1wk", "1mo")],
+            [call("AAA", interval, False) for interval in main.PATTERN_WATCH_INTERVALS],
         )
-        self.assertEqual(channel_detector.await_count, 7)
+        self.assertEqual(channel_detector.await_count, 5)
         self.assertEqual(
             channel_detector.await_args_list,
-            [call("AAA", interval, False) for interval in ("5m", "15m", "30m", "1h", "1d", "1wk", "1mo")],
+            [call("AAA", interval, False) for interval in main.PATTERN_WATCH_INTERVALS],
         )
         clear_bulk_cache.assert_called_once_with()
         invalidate_prefix.assert_any_call(f"{main.CHART_PATTERN_TICKER_CACHE}_AAA")
@@ -286,7 +286,7 @@ class PatternWatchEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["matched_tickers"], 1)
         self.assertEqual(
             [(row["interval"], row["pattern"]["readiness"]) for row in result["results"]],
-            [("30m", "AT_EDGE"), ("15m", "NEAR_EDGE")],
+            [("1h", "AT_EDGE"), ("30m", "NEAR_EDGE")],
         )
         self.assertIsNotNone(result["results"][0]["channel"])
         self.assertIsNone(result["results"][1]["channel"])

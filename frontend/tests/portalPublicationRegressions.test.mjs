@@ -56,15 +56,15 @@ test('market-hours banner skips freshness validation on weekends, holidays and o
       const { StalenessBanner } = compile('layout/StalenessBanner.tsx', {
         react: { ...React, useState: () => [state ?? null, value => { state = value }],
           useEffect: callback => { effect ??= callback } },
-        'react-router-dom': { useLocation: () => ({ pathname: '/ticker/MSFT' }),
+        'react-router-dom': { useLocation: () => ({ pathname: '/stocks/screener' }),
           useSearchParams: () => [new URLSearchParams('snapshot_id=original-release')] },
-        './navigation': { activeTickerSymbol: () => 'MSFT' },
+        './navigation': { activeTickerSymbol: () => null },
         '../pages/publicationNavigation': { isDailyStrategyPath: () => false },
         '../services/api': {
           fetchMarketNotificationWindow: async () => market,
           fetchMaterializationStatus: async (pin, ticker, strategies) => {
             freshnessReads++
-            assert.deepEqual([pin, ticker, strategies], ['original-release', 'MSFT', false])
+            assert.deepEqual([pin, ticker, strategies], ['original-release', undefined, false])
             return { status: 'STALE', last_market_time: '2026-10-08T20:00:00Z',
               stale_intervals: ['1d', '30m'], staleness_sessions: 1 }
           },
@@ -133,6 +133,30 @@ test('market-hours banner suppresses unknown calendars and late responses, but r
   } finally {
     globalThis.window = originalWindow
     globalThis.__regressionEnvironment = originalEnvironment
+  }
+})
+
+test('date-only ticker and Pattern Watch closing views never poll the live publication', () => {
+  const previous = globalThis.__regressionEnvironment
+  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true' }
+  try {
+    for (const pathname of ['/ticker/SPY', '/pattern-watch', '/overview']) {
+      let effect, reads = 0
+      const { StalenessBanner } = compile('layout/StalenessBanner.tsx', {
+        react: { ...React, useState: () => [null, () => {}], useEffect: callback => { effect = callback } },
+        'react-router-dom': { useLocation: () => ({ pathname }),
+          useSearchParams: () => [new URLSearchParams()] },
+        './navigation': { activeTickerSymbol: () => pathname.startsWith('/ticker/') ? 'SPY' : null },
+        '../pages/publicationNavigation': { isDailyStrategyPath: () => false },
+        '../services/api': { fetchMarketNotificationWindow: () => { reads++ },
+          fetchMaterializationStatus: () => { reads++ } },
+      })
+      assert.equal(StalenessBanner(), null)
+      assert.equal(effect(), undefined)
+      assert.equal(reads, 0)
+    }
+  } finally {
+    globalThis.__regressionEnvironment = previous
   }
 })
 
@@ -214,18 +238,17 @@ test('brand navigation preserves explicit realtime identities and canonical home
   }
   visit(ast)
   assert.ok(destination)
-  const home = new Function('realtimeOnly', 'realtimeHome', 'pinnedPath', `return ${destination}`)
+  const home = new Function('realtimeOnly', 'pinnedPath', `return ${destination}`)
   globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'exact-cohort' }
   try {
     const { publicationPath } = compile('pages/publicationNavigation.ts')
-    assert.equal(home(true, '/', route => publicationPath(route, 'old', 'exact-cohort')),
+    assert.equal(home(true, route => publicationPath(route, 'old', 'exact-cohort')),
       '/?cohort_id=exact-cohort&snapshot_id=old')
-    assert.equal(home(true, '/', route => publicationPath(route, 'old', 'wrong-cohort')),
+    assert.equal(home(true, route => publicationPath(route, 'old', 'wrong-cohort')),
       '/?cohort_id=wrong-cohort&snapshot_id=old')
-    assert.equal(home(false, '/', () => { throw new Error('Canonical home must not request pins') }), '/')
+    assert.equal(home(false, () => { throw new Error('Canonical home must not request pins') }), '/')
     globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'false' }
-    assert.equal(home(true, '/realtime-canary?scope=equity', route => publicationPath(route, 'old')),
-      '/realtime-canary?scope=equity')
+    assert.equal(home(true, route => publicationPath(route, 'old')), '/')
   } finally {
     delete globalThis.__regressionEnvironment
   }
@@ -253,7 +276,7 @@ test('navigation clears incompatible ticker and summary pins without dropping th
     assert.equal(path('/overview', '/ticker/AAPL', 'selected-release', 'wrong-cohort'),
       '/overview?cohort_id=wrong-cohort')
     assert.match(read('layout/AppShell.tsx'),
-      /navigationPublicationPath\(path, location.pathname, publicationPin, publicationCohort, publicationInterval\)/)
+      /navigationPublicationPath\(path, location.pathname, publicationPin, publicationCohort, publicationInterval, publicationSession\)/)
     globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'false' }
     assert.equal(path('/overview', '/ticker/AAPL'), '/overview')
   } finally {
@@ -263,8 +286,9 @@ test('navigation clears incompatible ticker and summary pins without dropping th
 
 test('ticker page ignores a stale release pin and loads the current view', () => {
   const source = read('pages/publicationNavigation.ts')
-  assert.match(source, /const pin = isTickerWorkspaceQuery\(name\) \? undefined : params\.get\('snapshot_id'\) \?\? undefined/)
-  assert.match(source, /!isTickerWorkspaceQuery\(name\) && params\.has\('snapshot_id'\) && !pin/)
+  assert.match(source, /const internalWorkspace = isTickerWorkspaceQuery\(name\) \|\| name === 'all-tickers'/)
+  assert.match(source, /const pin = internalWorkspace \? undefined : params\.get\('snapshot_id'\) \?\? undefined/)
+  assert.match(source, /!internalWorkspace && params\.has\('snapshot_id'\) && !pin/)
   assert.match(source, /!isTickerPath\(path\)\) params\.set\('snapshot_id', snapshotId\)/)
 })
 
@@ -359,12 +383,12 @@ test('retrying a ticker publication ignores a stale pin and reloads the current 
 test('ordinary ticker, strategy and Persistence browsing keeps snapshot identities internal', async () => {
   globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'exact-cohort' }
   try {
-    const scenarios = [['ticker-workspace:NVDA', '1d'], ['daily-gaps', '1d'], ['daily-persistence', '1d'],
+    const scenarios = [['ticker-workspace:NVDA', '1d'], ['all-tickers', '1d'], ['daily-gaps', '1d'], ['daily-persistence', '1d'],
       ['daily-gaps', '1h'], ['daily-persistence', '1h']]
       .flatMap(([name, interval]) => [false, true].map(explicitPin => ({ name, interval, explicitPin })))
     for (const { name, interval, explicitPin: urlHasPin } of scenarios) {
       // The ticker page never honours a pin in the URL.
-      const explicitPin = urlHasPin && !name.startsWith('ticker-workspace:')
+      const explicitPin = urlHasPin && !name.startsWith('ticker-workspace:') && name !== 'all-tickers'
       const params = new URLSearchParams(urlHasPin ? 'cohort_id=exact-cohort&snapshot_id=selected' : '')
       if (interval === '1h') params.set('interval', interval)
       const originalSearch = params.toString()
@@ -417,8 +441,10 @@ test('ordinary ticker, strategy and Persistence browsing keeps snapshot identiti
 })
 
 test('ticker publication failures stay within sections without blocking workspace navigation', () => {
-  for (const state of ['loading', 'failed', 'ready', 'refreshing', 'retained', 'retained-with-warnings', 'canonical']) {
-    const retained = state === 'ready' || state === 'refreshing' || state.startsWith('retained')
+  for (const state of ['loading', 'failed', 'ready', 'refreshing', 'retained', 'retained-with-warnings', 'canonical',
+    'closing', 'closing-with-evidence-update', 'closing-with-failure']) {
+    const closing = state.startsWith('closing')
+    const retained = state === 'ready' || state === 'refreshing' || state.startsWith('retained') || closing
     const failure = 'Ticker reference identity changed; republish required'
     const referenceNotice = 'Security reference is not current; displaying the retained publication.'
     globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: state === 'canonical' ? 'false' : 'true' }
@@ -428,22 +454,31 @@ test('ticker publication failures stay within sections without blocking workspac
         '@tanstack/react-query': { useQuery: () => ({ data: null, isFetching: false }) },
         'react-router-dom': { useParams: () => ({ symbol: 'AAPL' }), useLocation: () => ({ search: '?snapshot_id=pinned' }),
           Link: ({ children, to }) => React.createElement('a', { href: to }, children) },
-        '../TickerDetail': { default: ({ readsEnabled, publicationLoading, availabilityError }) => React.createElement('div', { 'data-reads-enabled': readsEnabled },
+        '../TickerDetail': { default: ({ readsEnabled, publicationLoading, availabilityError, publicationNotice }) => React.createElement('div', { 'data-reads-enabled': readsEnabled },
           'Chart workspace', publicationLoading && React.createElement('div', { role: 'status', 'aria-busy': true },
             React.createElement('div', { className: 'spinner' }), 'Loading chart data...'),
-          availabilityError && React.createElement('p', { role: 'alert' }, availabilityError)) },
-        './EntityRail': { default: ({ referenceWarning, calendarAvailabilityError }) => React.createElement('aside', null,
+          availabilityError && React.createElement('p', { role: 'alert' }, availabilityError),
+          publicationNotice && React.createElement('p', { role: 'status' }, publicationNotice)) },
+        './EntityRail': { default: ({ referenceWarning, calendarAvailabilityError, publicationNotice }) => React.createElement('aside', null,
           'Reference panel', referenceWarning && React.createElement('p', { role: 'alert' }, referenceWarning),
-          'Event calendar', calendarAvailabilityError && React.createElement('p', { role: 'alert' }, calendarAvailabilityError)) },
+          'Event calendar', calendarAvailabilityError && React.createElement('p', { role: 'alert' }, calendarAvailabilityError),
+          publicationNotice && React.createElement('details', { 'aria-label': 'Run details' },
+            React.createElement('summary', null, 'Run details'),
+            React.createElement('p', { role: 'status' }, publicationNotice))) },
         './FinancialsView': { default: () => null },
         '../../layout/pageContext': { usePublishPageContext: () => {} },
         '../../services/api': {},
         '../publicationNavigation': { usePublicationQuery: () => ({
           data: retained ? { publication: { snapshot_id: 'pinned', cohort_id: 'cohort',
-            section_warnings: state.startsWith('retained') ? { reference: referenceNotice,
+            read_mode: closing ? 'SESSION_CLOSE' : 'RETAINED', session: '2026-10-15',
+            action_status: state === 'closing-with-evidence-update' ? 'CHANGED' : 'CURRENT',
+            section_warnings: closing ? { market: 'Market data is not current; displaying the retained publication.',
+              ...(state === 'closing-with-evidence-update' ? { actions: 'Corporate-action evidence changed; displaying the retained publication.' } : {}) }
+              : state.startsWith('retained') ? { reference: referenceNotice,
               ...(state === 'retained-with-warnings' ? { actions: 'Corporate-action evidence changed.', market: 'Market data is not current.' } : {}) } : {} } } : undefined,
           loading: state === 'loading' || state === 'refreshing',
-          error: state === 'failed' || state === 'refreshing' ? failure : null,
+          error: state === 'closing-with-failure' ? 'Ticker stored publication identity/checksum drift'
+            : state === 'failed' || state === 'refreshing' ? failure : null,
           retry: () => {}, refresh: () => {},
         }) },
         './tickerShared': { formatQuoteTime: () => '' }, './ticker.css': {},
@@ -467,6 +502,20 @@ test('ticker publication failures stay within sections without blocking workspac
       assert.match(html, /Reference panel/)
       assert.doesNotMatch(html, /Loading AAPL workspace|Loading ticker publication|ticker-workspace__state/)
       if (state === 'refreshing') assert.match(html, /Ticker reference identity changed/)
+      if (closing) {
+        assert.doesNotMatch(html, /Market data is not current|Corporate-action evidence changed/)
+        if (state === 'closing-with-evidence-update') {
+          assert.match(html, /role="status"/)
+          assert.match(html, /uses the 2026-10-15 closing inputs/)
+          assert.match(html, /Newer corporate-action evidence is not included/)
+          assert.doesNotMatch(html.split('<aside>')[0], /Newer corporate-action evidence/)
+          assert.match(html, /<details aria-label="Run details"/)
+        }
+        if (state === 'closing-with-failure') {
+          assert.match(html, /role="alert"/)
+          assert.match(html, /identity\/checksum drift/)
+        }
+      }
       if (state.startsWith('retained')) {
         assert.equal((html.match(/Security reference is not current/g) ?? []).length, 1)
         assert.match(html, /data-reads-enabled="true"/)
@@ -542,7 +591,8 @@ test('All Tickers renders weekly-200 columns for both missing and available publ
           '../layout/pageContext': { usePublishPageContext: () => {} },
           '../layout/sessionDate': { useSessionDate: () => ({ pinned: null }) },
           '../layout/pageChrome.css': {},
-          './publicationNavigation': { usePublicationQuery: () => ({ data: { overview: rows, setup, publication },
+          './publicationNavigation': { publicationPath: path => path,
+            usePublicationQuery: () => ({ data: { overview: rows, setup, publication },
             loading: false, refresh: () => {}, error: null }) },
           './setupPresentation': { NO_TREND_ADX: 20, momentumTitle: () => '',
             trendLabel: value => value, trendTitle: () => '' },

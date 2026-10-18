@@ -24,7 +24,6 @@ const OptionsScreenerPage = lazy(() => import('./pages/OptionsScreeningWorkspace
 const StockScreenerPage = lazy(() => import('./pages/StockScreeningPage'))
 const StockAlertsPage = lazy(() => import('./pages/StockAlertsPage'))
 const OptionsAlertsPage = lazy(() => import('./pages/OptionsAlertsPage'))
-const RealtimeCanaryPage = lazy(() => import('./pages/RealtimeCanaryPage'))
 const Account = lazy(() => import('./pages/auth/Account'))
 const SignIn = lazy(() => import('./pages/auth/SignIn'))
 const SignUp = lazy(() => import('./pages/auth/SignUp'))
@@ -44,7 +43,7 @@ function PersistenceRedirect() {
   return <Navigate to={`/stocks/persistence${location.search}`} replace />
 }
 
-function PortalRoutes({ realtimeOnly, realtimeHome }: { realtimeOnly: boolean; realtimeHome: string }) {
+function PortalRoutes({ realtimeOnly }: { realtimeOnly: boolean }) {
   if (realtimeOnly) return (
     <Suspense fallback={<RouteFallback />}>
       <Routes>
@@ -75,8 +74,7 @@ function PortalRoutes({ realtimeOnly, realtimeHome }: { realtimeOnly: boolean; r
         <Route path="/scanner-results" element={<PersistenceRedirect />} />
         <Route path="/scanner-evaluation" element={<PersistenceRedirect />} />
         <Route path="/backtest" element={<PersistenceRedirect />} />
-        <Route path="/realtime-canary" element={<RealtimeCanaryPage />} />
-        <Route path="*" element={<Navigate to={realtimeHome} replace />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </Suspense>
   )
@@ -104,7 +102,6 @@ function PortalRoutes({ realtimeOnly, realtimeHome }: { realtimeOnly: boolean; r
         <Route path="/options/alerts" element={<OptionsAlertsPage />} />
         <Route path="/stocks/screener" element={<StockScreenerPage />} />
         <Route path="/stocks/alerts" element={<StockAlertsPage />} />
-        <Route path="/realtime-canary" element={<RealtimeCanaryPage />} />
         <Route path="/options/*" element={<Navigate to="/options/screener" replace />} />
         <Route path="/account" element={<Account />} />
         <Route path="/scanner-results" element={<PersistenceRedirect />} />
@@ -112,27 +109,24 @@ function PortalRoutes({ realtimeOnly, realtimeHome }: { realtimeOnly: boolean; r
         <Route path="/backtest" element={<PersistenceRedirect />} />
         <Route path="/ticker/:symbol" element={<TickerWorkspace />} />
         <Route path="/ticker/:symbol/:view" element={<TickerWorkspace />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </Suspense>
   )
 }
 
 function App() {
-  const location = useLocation()
   const realtimeDeployment = import.meta.env.VITE_REALTIME_ONLY === 'true'
   const realtimeCohortId = import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
   if (realtimeDeployment && !realtimeCohortId) {
     throw new Error('Realtime-only portal requires VITE_REALTIME_COHORT_ID')
   }
-  const realtimeCanary = `/realtime-canary?scope=equity${realtimeCohortId ? `&cohort_id=${encodeURIComponent(realtimeCohortId)}` : ''}`
-  const realtimeHome = realtimeDeployment ? '/' : realtimeCanary
-  const realtimeOnly = realtimeDeployment || location.pathname === '/realtime-canary'
 
   if (realtimeDeployment) return (
     <SessionDateProvider>
-      <AppShell realtimeOnly realtimeHome={realtimeHome} realtimeCanary={realtimeCanary}>
+      <AppShell realtimeOnly>
         <PortalViewBoundary>
-          <PortalRoutes realtimeOnly realtimeHome={realtimeHome} />
+          <PortalRoutes realtimeOnly />
         </PortalViewBoundary>
       </AppShell>
     </SessionDateProvider>
@@ -147,9 +141,9 @@ function App() {
           path="*"
           element={
             <SessionDateProvider>
-              <AppShell realtimeOnly={realtimeOnly} realtimeHome={realtimeHome} realtimeCanary={realtimeCanary}>
+              <AppShell>
                 <PortalViewBoundary>
-                  <PortalRoutes realtimeOnly={false} realtimeHome={realtimeHome} />
+                  <PortalRoutes realtimeOnly={false} />
                 </PortalViewBoundary>
               </AppShell>
             </SessionDateProvider>

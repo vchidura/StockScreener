@@ -59,6 +59,10 @@ def strategy_action_context(row):
         handling="RECURRING_CASH_DIVIDEND_PRICE_SERIES_UNCHANGED" if verified else "CORPORATE_ACTION_REVIEW")
 
 
+def strategy_reference_identity(reference):
+    return (reference["ticker"], str(reference["security_id"]), reference["instrument_id"], reference["security_type"])
+
+
 def _validate_strategy_inputs(inputs):
     if (len(inputs.source_manifest_sha256) != 64
             or any(value not in "0123456789abcdef" for value in inputs.source_manifest_sha256)
@@ -284,14 +288,24 @@ def project_realtime_strategy_history(inputs, *, interval="1d", market_time=None
 
 
 def project_realtime_rolling_strategies(inputs, *, retained_history=(), interval="1d", market_time=None):
+    latest = project_realtime_daily_strategies(inputs, interval=interval, market_time=market_time)
+    snapshot = assemble_realtime_strategy_history(latest.snapshot, retained_history=retained_history,
+        published_at=inputs.cutoff, source_generation=inputs.source_generation)
+    return DailyStrategyProjection(snapshot, latest.materializations)
+
+
+def assemble_realtime_strategy_history(source, *, retained_history=(), published_at, source_generation):
     from .strategy_repository import _validate_release
+    _validate_release(source.source_manifest, source.payload)
+    if (published_at.tzinfo is None or published_at.utcoffset() is None
+            or published_at < source.generated_at or type(source_generation) is not int or source_generation < 1):
+        raise ValueError("Strategy history publication clock/generation is invalid")
     if len(retained_history) > 5:
         raise ValueError("Rolling strategy history exceeds five session outcomes")
-    latest = project_realtime_daily_strategies(inputs, interval=interval, market_time=market_time)
-    source = latest.snapshot
+    interval = source.source_manifest.get("interval", "1d")
     calendar = exchange_calendars.get_calendar("XNYS")
     sessions = [str(session.date()) for session in calendar.sessions_in_range(
-        calendar.session_offset(str(inputs.session), -4), str(inputs.session))]
+        calendar.session_offset(source.payload["session"], -4), source.payload["session"])]
     previous = {}
     for item in retained_history:
         manifest, payload = item["source_manifest"], item["payload"]
@@ -305,12 +319,11 @@ def project_realtime_rolling_strategies(inputs, *, retained_history=(), interval
                 or manifest["tickers"] != source.source_manifest["tickers"]
                 or manifest["scanner_basis"] != source.source_manifest["scanner_basis"]
                 or manifest["scanner_contracts"] != source.source_manifest["scanner_contracts"]
-                or datetime.fromisoformat(payload["generated_at"]) > inputs.cutoff
+                or datetime.fromisoformat(payload["generated_at"]) > published_at
                 or datetime.fromisoformat(payload["market_time"]) > datetime.fromisoformat(source.payload["market_time"])
                 or any(manifest["code_sha256"].get(name) != source.source_manifest["code_sha256"].get(name)
                     for name in source.source_manifest["code_sha256"] if name not in {"strategy_projection.py", "strategy_persistence.py"})
-                or any(tuple(reference[key] for key in ("ticker", "security_id", "instrument_id", "security_type"))
-                    != tuple(current[key] for key in ("ticker", "security_id", "instrument_id", "security_type"))
+                or any(strategy_reference_identity(reference) != strategy_reference_identity(current)
                     for reference, current in zip(manifest["references"], source.source_manifest["references"]))):
             raise ValueError("Rolling strategy retained session identity/basis/model/clock drift")
         previous[item["session"]] = item
@@ -322,15 +335,17 @@ def project_realtime_rolling_strategies(inputs, *, retained_history=(), interval
                   if "RECONSTRUCTED" in item["source_manifest"]["version"] else "STORED_EVALUATION"
                   for item in history}
     manifest = dict(source.source_manifest, version=version, interpretation="STORED_SESSION_OUTCOMES_WITH_EXPLICIT_PROVENANCE",
+        source_generation=source_generation, generated_at=published_at.isoformat(),
+        evaluation_generated_at=source.payload["generated_at"],
         evaluation_sessions=sessions, observed_sessions=[item["session"] for item in history], session_provenance=provenance,
         history=history)
     manifest["code_sha256"] = dict(manifest["code_sha256"])
     manifest["code_sha256"]["strategy_persistence.py"] = canonical_sha256(
         Path(__file__).with_name("strategy_persistence.py").read_text(encoding="utf-8"))
     payload = dict(source.payload, version=version, interpretation=manifest["interpretation"],
+        generated_at=manifest["generated_at"], evaluation_generated_at=manifest["evaluation_generated_at"],
         evaluation_sessions=sessions, observed_sessions=manifest["observed_sessions"], session_provenance=provenance,
         persistence=build_strategy_persistence(history, manifest["tickers"], sessions, interval=interval))
-    snapshot = build_portal_snapshot(cohort_id=inputs.cohort_id, provider_tier=inputs.provider_tier,
-        snapshot_type=version, snapshot_key=STRATEGY_KEY, source_generation=inputs.source_generation,
-        source_manifest=manifest, payload=payload, generated_at=inputs.cutoff)
-    return DailyStrategyProjection(snapshot, latest.materializations)
+    return build_portal_snapshot(cohort_id=source.cohort_id, provider_tier=source.provider_tier,
+        snapshot_type=version, snapshot_key=STRATEGY_KEY, source_generation=source_generation,
+        source_manifest=manifest, payload=payload, generated_at=published_at)

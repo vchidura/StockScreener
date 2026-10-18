@@ -688,6 +688,13 @@
   text-transform: uppercase;
 }
 
+.tm-session select {
+  border: 0;
+  background: var(--tm-surface);
+  color: var(--tm-ink);
+  cursor: pointer;
+}
+
 .tm-content {
   flex: 1;
   min-width: 0;

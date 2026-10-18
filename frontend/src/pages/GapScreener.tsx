@@ -145,7 +145,7 @@ function GapScreener() {
   const [gapClassFilter, setGapClassFilter] = useState<GapClassFilter>('all')
   const [gapAgeFilter, setGapAgeFilter] = useState<GapAgeFilter>('20')
 
-  const realtimeQuery = usePublicationQuery('daily-gaps', pin => getDailyScannerPublication('gaps', pin, interval === '1h' ? '1h' : '1d'))
+  const realtimeQuery = usePublicationQuery('daily-gaps', (pin, session) => getDailyScannerPublication('gaps', pin, interval === '1h' ? '1h' : '1d', session))
   const canonicalQuery = useQuery<GapScanResponse>({
     queryKey: ['scan', 'gaps', interval, scanDate],
     queryFn: () => scanGaps(undefined, scanDate || undefined, interval),

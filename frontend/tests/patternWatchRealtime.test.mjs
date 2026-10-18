@@ -11,11 +11,15 @@ test('original Pattern Watch route and page remain active in realtime', () => {
   const page = read('../src/pages/PatternWatch.tsx')
   assert.equal(app.match(/path="\/pattern-watch" element=\{<PatternWatch \/>\}/g)?.length, 2)
   assert.match(page, /queryFn: \(\) => getTickers\(\)/)
-  assert.match(page, /scanChartPatterns\(interval\)/)
-  assert.match(page, /const tickerOnlyIntervals = new Set\(\['all', '5m'\]\)/)
-  assert.match(page, /scanTickerChartPatterns\(selectedTicker\)/)
+  assert.match(page, /scanChartPatterns\(interval, refresh, undefined, true, sessionDate\)/)
+  assert.match(page, /const tickerOnlyIntervals = new Set\(\['all'\]\)/)
+  assert.match(page, /scanTickerChartPatterns\(selectedTicker, refresh, publication.snapshot_id, true\)/)
+  assert.match(page, /session: realtimeOnly \? '1d' : undefined/)
+  assert.match(page, /query\.set\('session_date', sessionDate\)/)
   assert.match(page, /'1mo': 'Monthly'/)
-  assert.match(page, /interval !== '5m' \|\| row\.interval === '5m'/)
+  assert.match(page, /if \(!supportsPatternInterval\(row.interval\)\) return false/)
+  assert.match(page, /5m and 15m pattern research is retired/)
+  assert.doesNotMatch(page, /'15m': '15 minutes'|'5m': '5 minutes/)
   assert.match(page, /useSearchParams\(\)/)
   assert.match(page, /const \[search, setSearch\] = useState\(linkedTicker\)/)
   const link = read('../src/pages/PatternWatchLink.tsx')
@@ -60,7 +64,7 @@ test('Pattern Watch ticker links open the selected pattern on its chart frame', 
   assert.match(shared, /if \(interval === '1mo'\) return '5y'/)
   const ticker = read('../src/pages/TickerDetail.tsx')
   assert.match(ticker, /<option value="1mo">Monthly<\/option>/)
-  assert.equal(ticker.match(/\['1d', '5d', '1mo', '3mo', '6mo', '1y', '2y', '5y'\]\.map/g)?.length, 2)
+  assert.equal(ticker.match(/CHART_PERIODS\.map/g)?.length, 2)
   assert.match(ticker, /\{loading && chartData\.length === 0 && \(/)
 })
 
@@ -75,6 +79,39 @@ test('ticker catalog and universe scan add only explicit realtime cohort scope',
     .replaceAll('import.meta.env', 'globalThis.__patternEnvironment')
   const compiled = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+  })
+
+  test('saved Pattern Watch requests retain exact dates and reject another date instead of substituting it', async () => {
+    const calls = []
+    let returnedSession = '2026-10-15'
+    globalThis.__patternCloseEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'exact-cohort' }
+    globalThis.__patternCloseApi = { get: async (url, options) => {
+      calls.push([url, options.params])
+      return { data: url.endsWith('/sessions')
+        ? { cohort_id: 'exact-cohort', interval: '1d', sessions: ['2026-10-15', '2026-10-16'],
+          data_as_of: '2026-10-16T20:00:00Z', data_interval: '1d' }
+        : { publication: { session: returnedSession, read_mode: 'SESSION_CLOSE' }, results: [] } }
+    } }
+    const source = read('../src/services/api.ts')
+      .replace("import axios from 'axios'", 'const axios = { create: () => globalThis.__patternCloseApi }')
+      .replaceAll('import.meta.env', 'globalThis.__patternCloseEnvironment')
+    const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } })
+    try {
+      const services = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`)
+      const dates = await services.getPatternClosingSessions()
+      assert.equal(dates.data_as_of, '2026-10-16T20:00:00Z')
+      const result = await services.scanChartPatterns('1d', false, undefined, true, '2026-10-15')
+      assert.equal(result.publication.session, '2026-10-15')
+      assert.deepEqual(calls, [
+        ['/chart-patterns/sessions', { cohort_id: 'exact-cohort' }],
+        ['/chart-patterns/scan', { interval: '1d', session_date: '2026-10-15', read_mode: 'session_close', cohort_id: 'exact-cohort' }],
+      ])
+      returnedSession = '2026-10-16'
+      await assert.rejects(services.scanChartPatterns('1d', true, undefined, true, '2026-10-15'), /selected session close/)
+    } finally {
+      delete globalThis.__patternCloseApi
+      delete globalThis.__patternCloseEnvironment
+    }
   })
   try {
     globalThis.__patternEnvironment = {}

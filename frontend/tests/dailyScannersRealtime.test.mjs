@@ -94,7 +94,7 @@ test('Strategy Overview is discoverable and shares exact pins with strategies an
       `${target}?cohort_id=exact-cohort`)
   }
   assert.match(read('../src/App.tsx'), /path="\/strategies\/overview" element={<StrategyOverviewPage \/>}/)
-  assert.match(read('../src/pages/DailyStrategyTicker.tsx'), /publicationPath\('\/strategies\/overview', pin, cohort, interval\)/)
+  assert.match(read('../src/pages/DailyStrategyTicker.tsx'), /publicationPath\('\/strategies\/overview', pin, cohort, interval, evaluationSession\)/)
 })
 
 test('hourly navigation retains compatible pins and interval selection clears only incompatible identity', () => {
@@ -137,6 +137,7 @@ function mockApi() {
             evaluationFault?.(result)
             return { data: result }
           }
+
           if (!params.strategy && !params.ticker) return { data: { publication: pub } }
           const selectedRoutes = params.ticker ? routes : params.strategy === 'gaps' ? ['gaps', 'fvg'] : [params.strategy]
           if (selectedRoutes.some(route => `/scan/${route}` === failRoute)
@@ -186,6 +187,106 @@ function mockApi() {
     research: () => { research = true }, legacy: () => { legacy = true }, actionReview: () => { actionReview = true },
     evaluationFault: fault => { evaluationFault = fault } }
 }
+
+test('historical navigation carries dates only within compatible strategy or ticker views', () => {
+  globalThis.__dailyEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'exact-cohort' }
+  const navigation = compiler(read('../src/pages/publicationNavigation.ts'), path.join(root, 'pages', 'publicationNavigation.ts'))
+  for (const [target, source, expected] of [
+    ['/fibonacci', '/gaps', '/fibonacci?cohort_id=exact-cohort&snapshot_id=archive&interval=1h&session_date=2026-10-12'],
+    ['/ticker/SPY', '/gaps', '/ticker/SPY?cohort_id=exact-cohort'],
+    ['/ticker/SPY/levels', '/ticker/SPY', '/ticker/SPY/levels?cohort_id=exact-cohort&session_date=2026-10-12'],
+    ['/ticker/MSFT', '/ticker/SPY', '/ticker/MSFT?cohort_id=exact-cohort&session_date=2026-10-12'],
+    ['/ticker/SPY', '/overview', '/ticker/SPY?cohort_id=exact-cohort&session_date=2026-10-12'],
+    ['/overview', '/ticker/SPY', '/overview?cohort_id=exact-cohort&session_date=2026-10-12'],
+    ['/gaps', '/ticker/SPY', '/gaps?cohort_id=exact-cohort'],
+  ]) assert.equal(navigation.navigationPublicationPath(target, source, 'archive', 'exact-cohort', '1h', '2026-10-12'), expected)
+  assert.equal(navigation.publicationPath('/strategy-research/SPY', 'archive', 'exact-cohort', '1h', '2026-10-12'),
+    '/strategy-research/SPY?cohort_id=exact-cohort&snapshot_id=archive&interval=1h&evaluation_session=2026-10-12')
+})
+
+test('strategy, ticker and Pattern Watch selectors use closing dates and a static market timestamp', () => {
+  globalThis.__dailyEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'exact-cohort' }
+  let params = new URLSearchParams('cohort_id=exact-cohort&snapshot_id=archive&interval=1h&ticker_filter=SPY')
+  let pathname = '/gaps'
+  const sessions = ['2026-10-12', '2026-10-13', '2026-10-14', '2026-10-15', '2026-10-16']
+  const navigation = compiler(read('../src/pages/publicationNavigation.ts'), path.join(root, 'pages', 'publicationNavigation.ts'))
+  const { SessionDateProvider } = compiler(read('../src/layout/sessionDate.tsx'), path.join(root, 'layout', 'sessionDate.tsx'), {
+    react: { ...React, useState: value => [value, () => {}], useMemo: callback => callback(),
+      useCallback: callback => callback, useEffect: () => {} },
+    'react-router-dom': { useLocation: () => ({ pathname }), useSearchParams: () => [params, update => { params = update(params) }] },
+    '@tanstack/react-query': { useQuery: () => ({ data: { sessions, data_as_of: '2026-10-16T20:00:00Z', data_interval: '1d' }, error: null }) },
+    '../services/api': {},
+    '../pages/publicationNavigation': navigation,
+    './navigation': { activeTickerSymbol: path => /^\/ticker\/([^/]+)/.exec(path)?.[1] ?? null },
+  })
+  const store = () => SessionDateProvider({ children: null }).props.value
+  store().step(-1)
+  assert.equal(params.get('session_date'), '2026-10-15')
+  assert.equal(params.has('snapshot_id'), false)
+  store().choose('2026-10-12')
+  params.set('interval', '1d')
+  assert.equal(store().date, '2026-10-12')
+  assert.equal(store().canStepBack, false)
+  store().reset()
+  assert.equal(store().isLatest, true)
+  pathname = '/ticker/SPY'
+  assert.equal(store().date, '2026-10-16')
+  store().step(-1)
+  assert.equal(params.get('session_date'), '2026-10-15')
+  assert.equal(store().isLatest, false)
+  assert.equal(store().dataAsOf, '2026-10-16T20:00:00Z')
+  store().step(1)
+  assert.equal(params.has('session_date'), false)
+  assert.equal(store().canStepForward, false)
+  pathname = '/pattern-watch'
+  assert.equal(store().isPattern, true)
+  assert.equal(store().date, '2026-10-16')
+  store().choose('2026-10-12')
+  assert.equal(store().date, '2026-10-12')
+  assert.equal(store().dataAsOf, '2026-10-16T20:00:00Z')
+  store().reset()
+  assert.equal(params.has('session_date'), false)
+  pathname = '/overview'
+  assert.equal(store().isAllTickers, true)
+  assert.equal(store().date, '2026-10-16')
+  store().step(-1)
+  assert.equal(params.get('session_date'), '2026-10-15')
+  assert.equal(store().dataAsOf, '2026-10-16T20:00:00Z')
+  store().reset()
+  pathname = '/strategy-research/SPY'
+  params = new URLSearchParams('cohort_id=exact-cohort&snapshot_id=archive&evaluation_session=2026-10-14')
+  store().step(-1)
+  assert.equal(params.get('snapshot_id'), 'archive')
+  assert.equal(params.get('evaluation_session'), '2026-10-13')
+})
+
+test('selected ticker dates isolate publication cache and refresh without an inherited foreign pin', async () => {
+  globalThis.__dailyEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'exact-cohort' }
+  const client = new QueryClient()
+  let params = new URLSearchParams('cohort_id=exact-cohort&snapshot_id=foreign&session_date=2026-10-15'), options
+  const calls = []
+  const hooks = compiler(read('../src/pages/publicationNavigation.ts'), path.join(root, 'pages', 'publicationNavigation.ts'), {
+    react: { useState: value => [value, () => {}], useRef: value => ({ current: value }), useEffect: () => {} },
+    'react-router-dom': { useSearchParams: () => [params, update => { params = update(params) }] },
+    '@tanstack/react-query': { useQueryClient: () => client, useQuery: spec => {
+      options = spec
+      return { data: client.getQueryData(spec.queryKey), isFetching: false, error: null }
+    } },
+  })
+  const selected = hooks.usePublicationQuery('ticker-workspace:SPY', async (pin, session) => {
+    calls.push([pin, session])
+    return { publication: { ...publication('archive'), session } }
+  })
+  assert.deepEqual(options.queryKey, ['ticker-workspace:SPY', 'exact-cohort', undefined, '2026-10-15'])
+  await options.queryFn()
+  await selected.refresh()
+  assert.deepEqual(calls, [[undefined, '2026-10-15'], [undefined, '2026-10-15']])
+  assert.equal(params.get('session_date'), '2026-10-15')
+  params.set('session_date', '2026-10-14')
+  hooks.usePublicationQuery('ticker-workspace:SPY', async () => ({ publication: publication('latest') }))
+  await assert.rejects(options.queryFn(), /selected trading session; no substitution/)
+  client.clear()
+})
 
 test('Persistence loads one exact daily evaluation bundle without legacy streak or unrelated overview requests', async () => {
   globalThis.__dailyEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'exact-cohort' }
@@ -540,7 +641,7 @@ test('realtime Persistence renders all six stored evaluations without false recu
   assert.doesNotMatch(html, /Independence reference|5\/5|Five-session source window|Loading coverage/)
   const source = read('../src/pages/research/PersistenceView.tsx')
   assert.match(source, /VITE_REALTIME_ONLY === 'true' \? <RealtimeSessionPersistenceView \/> : <CanonicalPersistenceView \/>/)
-  assert.match(read('../src/pages/research/RealtimePersistenceView.tsx'), /usePublicationQuery\('daily-persistence', pin => getDailyStrategyEvaluations\(pin, interval\)\)/)
+  assert.match(read('../src/pages/research/RealtimePersistenceView.tsx'), /usePublicationQuery\('daily-persistence', \(pin, session\) => getDailyStrategyEvaluations\(pin, interval, session\)\)/)
   assert.match(read('../src/pages/research/RealtimePersistenceView.tsx'), /new URLSearchParams\(searchState.current.pending\)/)
 })
 
@@ -672,7 +773,7 @@ test('Persistence keeps action exclusions distinct from eligible no-match and pr
   data.analysis.SCAN_MOMENTUM_1D.members.find(member => member.ticker === 'MSFT').status = 'COMPLETE'
   assert.equal(component.evaluationCell(data, 'SCAN_MOMENTUM_1D', 'MSFT').summary, 'B (score 68)')
   assert.equal(component.evaluationCell(data, 'SCAN_GAPS_1D', 'AAPL').summary, 'Action review')
-  assert.match(read('../src/pages/research/RealtimePersistenceView.tsx'), /publicationPath\(`\/strategy-research\/\$\{ticker\}`, data.publication.snapshot_id, data.publication.cohort_id, interval\)/)
+  assert.match(read('../src/pages/research/RealtimePersistenceView.tsx'), /publicationPath\(`\/strategy-research\/\$\{ticker\}`, data.publication.snapshot_id, data.publication.cohort_id, interval, data.publication.evaluation_session\)/)
 })
 
 test('all strategy pages begin with controls without publication prose and retain daily gates and sorting', () => {

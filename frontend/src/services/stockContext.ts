@@ -51,8 +51,9 @@ export interface StockContextResponse {
   execution_permission: false
 }
 
-export async function getStockContext(ticker?: string, snapshotId?: string): Promise<StockContextResponse> {
+export async function getStockContext(ticker?: string, snapshotId?: string, closingView = false): Promise<StockContextResponse> {
   const params = ticker ? { ticker } : snapshotId ? { snapshot_id: snapshotId } : undefined
-  const response = await api.get('/stocks/context', { params: (ticker ? retainedTickerParams : tickerParams)(params, ticker ? snapshotId : undefined) })
+  const response = await api.get('/stocks/context', { params: ticker
+    ? retainedTickerParams(params, snapshotId, closingView) : tickerParams(params) })
   return response.data
 }

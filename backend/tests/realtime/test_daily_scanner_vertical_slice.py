@@ -297,6 +297,146 @@ def test_rolling_strategy_reuses_prior_outcomes_without_reconstruction(monkeypat
     _validate_strategy_snapshot(missing.snapshot.source_manifest, missing.snapshot.payload)
 
 
+@pytest.mark.parametrize("interval", ["1d", "1h"])
+@pytest.mark.parametrize("changed_identity", [False, True])
+def test_rolling_strategy_compares_json_reference_ids_with_database_uuids(interval, changed_identity):
+    import realtime.strategy_projection as producer
+    inputs = persistence_history_inputs()
+    prior = producer.project_realtime_strategy_history(inputs, interval=interval)
+    retained = json.loads(canonical_json(prior.snapshot.source_manifest["history"][:-1]))
+    frozen = canonical_json(retained)
+    inputs = replace(inputs, members=tuple(
+        dict(member, security_id=UUID(str(member["security_id"]))) for member in inputs.members))
+    if changed_identity:
+        retained[0]["source_manifest"]["references"][0]["security_id"] = str(UUID(int=99))
+        with pytest.raises(ValueError):
+            producer.project_realtime_rolling_strategies(inputs, retained_history=retained, interval=interval)
+        return
+    projection = producer.project_realtime_rolling_strategies(inputs, retained_history=retained, interval=interval)
+    from realtime.strategy_repository import _validate_strategy_snapshot
+    _validate_strategy_snapshot(projection.snapshot.source_manifest, projection.snapshot.payload)
+    _validate_strategy_snapshot(
+        json.loads(canonical_json(projection.snapshot.source_manifest)),
+        json.loads(canonical_json(projection.snapshot.payload)))
+    assert canonical_json(projection.snapshot.source_manifest["history"][:-1]) == frozen
+    assert canonical_json(retained) == frozen
+    assert projection.snapshot.payload["observed_sessions"] == projection.snapshot.payload["evaluation_sessions"]
+
+
+@pytest.mark.parametrize("interval", ["1d", "1h"])
+def test_strategy_history_assembly_preserves_latest_evaluation_and_original_clocks(interval, monkeypatch):
+    import realtime.strategy_projection as producer
+    from realtime.strategy_repository import _validate_strategy_snapshot
+    inputs = persistence_history_inputs()
+    prior = producer.project_realtime_strategy_history(inputs, interval=interval)
+    latest = producer.project_realtime_daily_strategies(inputs, interval=interval)
+    frozen = canonical_json(latest.snapshot)
+    published_at = inputs.cutoff + timedelta(minutes=5)
+    prohibited = MagicMock(side_effect=AssertionError("History assembly cannot recalculate October 16"))
+    monkeypatch.setattr(producer, "project_realtime_daily_strategies", prohibited)
+    snapshot = producer.assemble_realtime_strategy_history(latest.snapshot,
+        retained_history=prior.snapshot.source_manifest["history"][:-1],
+        published_at=published_at, source_generation=inputs.source_generation + 10)
+    assert canonical_json(latest.snapshot) == frozen
+    assert snapshot.payload["scanners"] == latest.snapshot.payload["scanners"]
+    assert snapshot.payload["evaluation_generated_at"] == latest.snapshot.payload["generated_at"]
+    assert snapshot.generated_at == published_at
+    assert snapshot.source_manifest["history"][-1]["payload"] == latest.snapshot.payload
+    assert all(row["evaluated"] == 5 for row in snapshot.payload["persistence"]["rows"])
+    _validate_strategy_snapshot(snapshot.source_manifest, snapshot.payload)
+    with pytest.raises(ValueError, match="clock/generation"):
+        producer.assemble_realtime_strategy_history(latest.snapshot,
+            published_at=inputs.cutoff - timedelta(seconds=1), source_generation=inputs.source_generation + 10)
+    prohibited.assert_not_called()
+
+
+def test_rolling_strategy_source_release_compares_database_json_with_native_reference_types():
+    import realtime.strategy_projection as producer
+    from realtime.strategy_repository import _validate_rolling_sources
+    inputs = persistence_history_inputs()
+    inputs = replace(inputs, members=tuple(
+        dict(member, security_id=UUID(str(member["security_id"]))) for member in inputs.members))
+    prior = producer.project_realtime_strategy_history(inputs)
+    retained = deepcopy(prior.snapshot.source_manifest["history"][:-1])
+    for entry in retained:
+        entry["source_release"] = dict(snapshot_id=str(prior.snapshot.snapshot_id),
+            source_generation=prior.snapshot.source_generation,
+            source_manifest_sha256=prior.snapshot.source_manifest_sha256,
+            payload_sha256=prior.snapshot.payload_sha256, generated_at=prior.snapshot.generated_at.isoformat())
+    snapshot = producer.project_realtime_rolling_strategies(inputs, retained_history=retained).snapshot
+    cursor = MagicMock()
+    cursor.fetchone.return_value = dict(snapshot_id=prior.snapshot.snapshot_id, cohort_id=inputs.cohort_id,
+        source_generation=prior.snapshot.source_generation,
+        source_manifest=json.loads(canonical_json(prior.snapshot.source_manifest)),
+        source_manifest_sha256=prior.snapshot.source_manifest_sha256,
+        payload=json.loads(canonical_json(prior.snapshot.payload)), payload_sha256=prior.snapshot.payload_sha256,
+        generated_at=prior.snapshot.generated_at)
+    _validate_rolling_sources(cursor, snapshot.source_manifest, known_by=inputs.cutoff)
+    changed = deepcopy(snapshot.source_manifest)
+    changed["history"][0]["payload"]["scope_note"] += " tampered"
+    with pytest.raises(ValueError, match="differs from immutable source release"):
+        _validate_rolling_sources(cursor, changed, known_by=inputs.cutoff)
+
+
+@pytest.mark.parametrize("interval", ["1d", "1h"])
+def test_strategy_session_selection_uses_exact_stored_data_without_production(interval, monkeypatch):
+    import realtime.strategy_projection as producer
+    import realtime.strategy_repository as repository
+    inputs = persistence_history_inputs()
+    prior = producer.project_realtime_strategy_history(inputs, interval=interval)
+    latest = producer.project_realtime_daily_strategies(inputs, interval=interval)
+    published_at = inputs.cutoff + timedelta(minutes=5)
+    retained = deepcopy(prior.snapshot.source_manifest["history"][:-1])
+    for entry in retained:
+        entry["source_release"] = dict(snapshot_id=str(prior.snapshot.snapshot_id),
+            source_generation=prior.snapshot.source_generation,
+            source_manifest_sha256=prior.snapshot.source_manifest_sha256,
+            payload_sha256=prior.snapshot.payload_sha256, generated_at=prior.snapshot.generated_at.isoformat())
+    snapshot = producer.assemble_realtime_strategy_history(latest.snapshot,
+        retained_history=retained,
+        published_at=published_at, source_generation=inputs.source_generation + 10)
+    projection = producer.DailyStrategyProjection(snapshot, (*prior.materializations, *latest.materializations))
+    app, store = strategy_app(projection, clock=lambda: published_at)
+    _, prior_store = strategy_app(prior)
+    store.snapshots.update(prior_store.snapshots)
+    store.evidence.update(prior_store.evidence)
+    store.dependencies.update(prior_store.dependencies)
+    prohibited = MagicMock(side_effect=AssertionError("GET must remain stored-only"))
+    monkeypatch.setattr(repository, "project_realtime_daily_strategies", prohibited)
+    monkeypatch.setattr(repository, "project_realtime_strategy_history", prohibited)
+    params = dict(cohort_id=str(COHORT_ID), snapshot_id=str(snapshot.snapshot_id), interval=interval, read_mode="retained")
+    before = len(store.statements)
+    with TestClient(app) as client:
+        listed = client.get("/api/strategies/daily", params=dict(params, view="sessions"))
+        assert listed.status_code == 200, listed.text
+        assert listed.json()["sessions"] == snapshot.payload["evaluation_sessions"]
+        for entry in snapshot.source_manifest["history"]:
+            session = entry["session"]
+            for strategy in DAILY_SCANNER_CONTRACTS:
+                response = client.get("/api/strategies/daily", params=dict(params, session_date=session, strategy=strategy))
+                assert response.status_code == 200, response.text
+                result = response.json()
+                publication = result["publication"]
+                contract = DAILY_SCANNER_CONTRACTS[strategy]
+                if interval == "1h":
+                    from equity.portal_scanners import HOURLY_SCANNER_CONTRACTS
+                    contract = HOURLY_SCANNER_CONTRACTS[contract]
+                assert publication["session"] == publication["evaluation_session"] == session
+                assert publication["snapshot_id"] == str(snapshot.snapshot_id)
+                assert publication["generated_at"] == published_at.isoformat()
+                assert publication["evaluation_generated_at"] == entry["payload"]["generated_at"]
+                assert result["data"]["results"] == json.loads(canonical_json(entry["payload"]["scanners"][contract]["results"]))
+            persistence = client.get("/api/strategies/daily", params=dict(params, session_date=session, view="persistence"))
+            assert persistence.status_code == 200, persistence.text
+            assert persistence.json()["evaluation_sessions"][-1] == session
+            assert persistence.json()["observed_sessions"][-1] == session
+        assert client.get("/api/strategies/daily", params=dict(params, session_date="2026-09-18")).status_code == 503
+        for invalid in ("2026-10-03", "not-a-date", ""):
+            assert client.get("/api/strategies/daily", params=dict(params, session_date=invalid)).status_code == 422
+    assert all(statement.startswith(("SELECT", "SET")) for statement in store.statements[before:])
+    prohibited.assert_not_called()
+
+
 def test_rolling_strategy_stored_read_validates_prior_evidence_and_exact_provenance(monkeypatch):
     import realtime.strategy_projection as producer
     import realtime.strategy_repository as repository

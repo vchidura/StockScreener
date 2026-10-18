@@ -77,7 +77,7 @@ function BearishBounce() {
   const interval = realtimeOnly ? storedInterval.interval : canonicalInterval
   const setInterval = (value: ScanInterval) => realtimeOnly ? storedInterval.setInterval(value === '1h' ? '1h' : '1d') : setCanonicalInterval(value)
 
-  const realtimeQuery = usePublicationQuery('daily-bearish-bounce', pin => getDailyScannerPublication('bearish-bounce', pin, interval === '1h' ? '1h' : '1d'))
+  const realtimeQuery = usePublicationQuery('daily-bearish-bounce', (pin, session) => getDailyScannerPublication('bearish-bounce', pin, interval === '1h' ? '1h' : '1d', session))
   const canonicalQuery = useQuery<BearishBounceScanResponse>({
     queryKey: ['scan', 'bearish-bounce', interval, scanDate],
     queryFn: () => scanBearishBounce(undefined, scanDate || undefined, interval),

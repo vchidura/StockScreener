@@ -352,6 +352,37 @@ def test_ticker_projection_exposes_stable_supported_materialization_closures():
     }
 
 
+def test_short_pattern_materializations_are_skipped_but_bars_and_cached_price_channels_remain(monkeypatch):
+    import realtime.ticker_projection as producer
+    inputs = ticker_fixture()
+    member = next(row for row in inputs.members if row["ticker"] == "SPY")
+    inputs = replace(inputs, members=(member,), bars=tuple(row for row in inputs.bars if row["ticker"] == "SPY"),
+        actions=tuple(row for row in inputs.actions if row["ticker"] == "SPY"),
+        coverage=tuple(row for row in inputs.coverage if row["security_id"] == member["security_id"]))
+    calls = []
+    materialize = producer.materialize_ticker_interval
+
+    def record(*args, **kwargs):
+        calls.append(kwargs["interval"])
+        return materialize(*args, **kwargs)
+
+    monkeypatch.setattr(producer, "materialize_ticker_interval", record)
+    state = producer.TickerProjectionState()
+    projection = producer.project_realtime_ticker_workspace(inputs, state=state)
+    assert len(calls) == 10
+    assert set(calls) == {"30m", "1h", "1d", "1wk", "1mo"}
+    payload = projection.snapshots[0].payload
+    assert set(payload["patterns"]) == {"30m", "1h", "1d", "1wk", "1mo"}
+    assert {"1m", "5m", "15m"} <= set(payload["chart_refs"])
+    assert {"5m", "15m"} <= set(payload["channels"])
+    assert not {row["interval"] for row in payload["cross_patterns"]["results"]} & {"5m", "15m"}
+    assert payload["pattern_policy"] == "pattern_watch_long_frames_v2"
+    producer.project_realtime_ticker_workspace(replace(inputs,
+        source_generation=inputs.source_generation + 1, cutoff=inputs.cutoff + timedelta(minutes=1)), state=state)
+    assert state.stats["short_channel_reused"] == 2
+    assert state.stats["materialization_built"] == 0
+
+
 def test_ticker_evidence_storage_profile_is_bounded(record_property):
     rows = [
         row
@@ -507,7 +538,22 @@ class TickerStore(PortalV2Statements):
             return
         if self.portal_execute(sql, params):
             return
-        if sql.startswith("SELECT snapshot.*"):
+        if sql.startswith("SELECT DISTINCT ON (snapshot.session_date)"):
+            selected = {}
+            for row in self.snapshots.values():
+                quote = row["payload"].get("quote", {})
+                if ((row["cohort_id"], row["snapshot_type"], row["snapshot_key"]) != params[:3]
+                        or row["generated_at"] > params[5]
+                        or datetime.fromisoformat(quote["as_of"]) not in params[6]):
+                    continue
+                session = date.fromisoformat(quote["trade_date"])
+                if not params[3] <= session <= params[4]:
+                    continue
+                rank = (str(row["snapshot_id"]) == params[7], row["generated_at"], row["source_generation"], str(row["snapshot_id"]))
+                if session not in selected or rank > selected[session][0]:
+                    selected[session] = (rank, dict(session_date=session, snapshot_id=row["snapshot_id"], market_time=quote["as_of"]))
+            self.result = [selected[session][1] for session in sorted(selected)][:21]
+        elif sql.startswith("SELECT snapshot.*"):
             key = (params[0], params[1], "PLATFORM") if "snapshot_key='PLATFORM'" in sql else params[:3]
             cutoff = params[2] if key[-1] == "PLATFORM" else params[3]
             row = self.snapshots.get(params[-1])
@@ -540,6 +586,9 @@ class TickerStore(PortalV2Statements):
                         "identity_continuity_sha256"
                     ),
                     manifest_known_by=manifest.get("known_by"),
+                    reconstruction=manifest.get("reconstruction"),
+                    session_date=row["payload"].get("session"),
+                    market_time=row["payload"]["quote"]["as_of"],
                 )]
         elif sql.startswith("SELECT snapshot.snapshot_key, snapshot.generated_at"):
             for snapshot_id in params[2]:
@@ -714,6 +763,64 @@ def test_pin_older_than_the_hot_window_returns_the_current_view_with_a_notice():
             params, snapshot_id=str(current.snapshot_id))).status_code == 503
 
 
+def test_ticker_closing_picker_lists_only_existing_dates_and_all_slices_use_one_exact_snapshot(monkeypatch):
+    app, store = ticker_app()
+    snapshot = next(row for row in ticker_snapshots() if row.snapshot_key == "AAPL")
+    session = snapshot.payload["quote"]["trade_date"]
+    prohibited = MagicMock(side_effect=AssertionError("Historical browsing must not run producers"))
+    monkeypatch.setattr(ticker_repository, "project_realtime_ticker_workspace", prohibited)
+    before = len(store.statements)
+    with TestClient(app) as client:
+        params = dict(cohort_id=str(COHORT_ID))
+        listed = client.get("/api/stock/AAPL/sessions", params=params)
+        assert listed.status_code == 200, listed.text
+        assert listed.json()["sessions"] == [session]
+        assert listed.json()["snapshots"] == {session: str(snapshot.snapshot_id)}
+        assert listed.json()["provider_fetch_performed"] is False
+        assert listed.json()["data_as_of"] == snapshot.payload["quote"]["as_of"]
+        assert listed.json()["data_interval"] == "1d"
+        publication = client.get("/api/stock/AAPL/workspace-publication", params=dict(params, session_date=session))
+        assert publication.status_code == 200, publication.text
+        assert publication.json()["session"] == session
+        assert publication.json()["read_mode"] == "SESSION_CLOSE"
+        assert publication.json()["snapshot_id"] == str(snapshot.snapshot_id)
+        selected = dict(params, snapshot_id=str(snapshot.snapshot_id), read_mode="session_close")
+        for route in ("quote", "chart", "chart-patterns", "price-channel", "trade-setup/multi"):
+            response = client.get(f"/api/stock/AAPL/{route}", params=selected)
+            assert response.status_code == 200, response.text
+        for route in ("/api/equity/security/AAPL", "/api/options/calendar/AAPL", "/api/chart-patterns/ticker/AAPL"):
+            response = client.get(route, params=selected)
+            assert response.status_code == 200, response.text
+        context = client.get("/api/stocks/context", params=dict(selected, ticker="AAPL"))
+        assert context.status_code == 200, context.text
+        assert context.json()["cohort"]["snapshot_id"] == str(snapshot.snapshot_id)
+        assert client.get("/api/stock/AAPL/workspace-publication", params=dict(params, session_date="2026-09-30")).status_code == 503
+        for invalid in ("", "not-a-date", "2026-10-03"):
+            assert client.get("/api/stock/AAPL/workspace-publication", params=dict(params, session_date=invalid)).status_code == 422
+    assert all(statement.startswith(("SELECT", "SET")) for statement in store.statements[before:])
+    assert any("LIMIT 21" in statement for statement in store.statements[before:])
+    prohibited.assert_not_called()
+
+
+@pytest.mark.parametrize("route", ["workspace-publication", "quote", "chart", "trade-setup/multi"])
+def test_expired_ticker_closing_pin_never_substitutes_current_data(route):
+    app, store = ticker_app()
+    expired = str(uuid5(NAMESPACE_URL, "expired-session-close-workspace"))
+    with TestClient(app) as client:
+        response = client.get(f"/api/stock/AAPL/{route}", params=dict(
+            cohort_id=str(COHORT_ID), snapshot_id=expired, read_mode="session_close"))
+        assert response.status_code == 503, response.text
+        assert "no current view was substituted" in response.json()["detail"]
+        unpinned = client.get(f"/api/stock/AAPL/{route}", params=dict(
+            cohort_id=str(COHORT_ID), read_mode="session_close"))
+        if route == "workspace-publication":
+            assert unpinned.status_code == 200, unpinned.text
+            assert unpinned.json()["read_mode"] == "SESSION_CLOSE"
+            assert unpinned.json()["session"] == "2026-10-02"
+        else:
+            assert unpinned.status_code == 422
+
+
 def test_session_close_summary_is_self_contained_after_its_workspaces_expire():
     app, store = ticker_app()
     snapshots = ticker_snapshots()
@@ -847,6 +954,9 @@ def test_nine_ticker_real_domain_writer_and_original_api_contract_parity():
             for interval in ("5m", "15m", "30m", "1h", "1d", "1wk", "1mo"):
                 for suffix, key in (("chart-patterns", "patterns"), ("price-channel", "channels")):
                     response = client.get(f"/api/stock/{ticker}/{suffix}", params=dict(params, interval=interval, refresh=True))
+                    if key == "patterns" and interval in {"5m", "15m"}:
+                        assert response.status_code == 422, response.text
+                        continue
                     assert response.status_code == 200, response.text
                     assert response.json() == payload[key][interval]
             response = client.get("/api/stocks/context", params=dict(params, ticker=ticker))
@@ -909,7 +1019,8 @@ def test_ticker_get_reader_only_validates_and_projects_stored_payloads():
         "realtime", "ticker_repository.py",
     ).read_text(encoding="utf-8").split("class RealtimeTickerWorkspaceRepository", 1)[1]
 
-    assert "payload = self._snapshot(ticker, cutoff, cohort_id, snapshot_id, read_mode)" in source
+    assert "payload = self._snapshot(ticker, cutoff, cohort_id, snapshot_id," in source
+    assert '"retained" if closing_view else read_mode, strict_snapshot=closing_view)' in source
     assert "sort_pattern_watch_rows" not in source
     for prohibited in (
         "materialize_realtime_equity_evidence",
@@ -1151,7 +1262,8 @@ def test_pattern_publication_presorts_views_and_retains_empty_analysis_receipts(
     assert len(daily["analysis_refs"]) == 9
     assert all(sum(ref["evidence_type"] == "FEATURE_SNAPSHOT" for ref in refs) == 1
                for refs in daily["analysis_refs"].values())
-    assert publication.payload["views"]["15m"]["evidence_storage"] == "RELEASE_ONLY"
+    assert set(publication.payload["views"]) == {"30m", "1h", "1d", "1wk", "1mo"}
+    assert publication.payload["pattern_policy"] == "pattern_watch_long_frames_v2"
     assert publication.source_manifest["primary_window"] == 300
     empty = []
     for snapshot in snapshots:

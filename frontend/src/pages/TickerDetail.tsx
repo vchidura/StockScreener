@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { useParams, useSearchParams } from 'react-router-dom'
+import { useParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Eraser, ScanLine, TrendingUp, X } from 'lucide-react'
 import {
@@ -33,7 +33,6 @@ import { TickerEquityContext } from './EquityContextPanels'
 import { formingPatternRead } from '../utils/formingPatterns'
 
 import {
-  CHART_INTERVALS,
   INFO,
   INFO_SOFT,
   INK,
@@ -69,6 +68,7 @@ import {
   defaultPeriodForInterval,
   formatChartTick,
   formatChartTime,
+  formatTickerReadError,
   getVisibleChartData,
   gradeTone,
   money,
@@ -79,6 +79,7 @@ import {
   resolveAnalysisInterval,
   sideOfBias,
   signedPct,
+  supportsPatternInterval,
   trendTone,
 } from './ticker/tickerShared'
 import { NO_TREND_ADX, trendLabel } from './setupPresentation'
@@ -86,6 +87,7 @@ import { buildTradePlan, evaluatePlan } from './ticker/tickerPlan'
 import PriceLadder, { type LadderBadge, type LadderRow } from './ticker/PriceLadder'
 import { resolveChartTheme, useChartTheme } from './ticker/chartTheme'
 import { confluenceZonesAtPrice, fibonacciPriceContext } from './ticker/priceContext'
+import { CHART_PERIODS, selectChartPatterns, useChartPreferences } from './ticker/chartPreferences'
 
 export type TickerView = 'overview' | 'timeframes' | 'levels' | 'fibonacci' | 'financials'
 
@@ -113,13 +115,11 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
   onAnalysisSetupChange?: (setup: TradeSetup | null) => void
 }) {
   const { symbol } = useParams<{ symbol: string }>()
-  const [searchParams] = useSearchParams()
   const realtimeOnly = import.meta.env.VITE_REALTIME_ONLY === 'true'
   const snapshotId = publication?.snapshot_id
-  const queryScope = realtimeOnly ? [publication?.cohort_id, snapshotId] : []
-  const requestedInterval = searchParams.get('interval')
-  const initialInterval = requestedInterval && (CHART_INTERVALS as readonly string[]).includes(requestedInterval)
-    ? requestedInterval : '1d'
+  const closingView = publication?.read_mode === 'SESSION_CLOSE'
+  const queryScope = realtimeOnly ? [publication?.cohort_id, snapshotId, ...(closingView ? ['session_close'] : [])] : []
+  const { period, interval, analysisPin, showRsi, showAutoPatterns, showPriceChannel, patternSelection, updateChartPreferences } = useChartPreferences()
   const chartContainerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
@@ -142,21 +142,10 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
   const chartThemeRef = useRef(chartTheme)
 
   const queryClient = useQueryClient()
-  const [period, setPeriod] = useState(() => defaultPeriodForInterval(initialInterval))
-  const [interval, setInterval] = useState(initialInterval)
-  // null means the analysis follows the chart interval.
-  const [analysisPin, setAnalysisPin] = useState<string | null>(null)
   const [chartHeight, setChartHeight] = useState(450)
   const [isFullscreen, setIsFullscreen] = useState(false)
-  const [showRsi, setShowRsi] = useState(false)
-  const [showAutoPatterns, setShowAutoPatterns] = useState(() => searchParams.get('patterns') === 'on')
-  const [showPriceChannel, setShowPriceChannel] = useState(() => searchParams.get('channel') === 'on' && initialInterval !== '1m')
-  const [patternSelection, setPatternSelection] = useState(() => {
-    const requestedPattern = searchParams.get('pattern')
-    return requestedPattern ? patternChoiceValue(initialInterval, requestedPattern) : 'best'
-  })
   const [chartOverrides, setChartOverrides] = useState<Partial<Record<TickerView, boolean>>>({})
-  const [selectedLevel, setSelectedLevel] = useState<{ key: string; price: number; label: string } | null>(null)
+  const [selectedLevel, setSelectedLevel] = useState<{ key: string; price: number; label: string; snapshotId?: string } | null>(null)
 
   const chartLayout = view === 'overview'
     ? 'full'
@@ -167,23 +156,22 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
   const handleLevelSelect = (row: LadderRow) => {
     setSelectedLevel(current => current?.key === row.key
       ? null
-      : { key: row.key, price: row.price, label: row.title })
+      : { key: row.key, price: row.price, label: row.title, snapshotId })
     if (chartCollapsed) setChartOverrides(current => ({ ...current, [view]: false }))
   }
 
   const intervalRef = useRef(interval)
   const periodRef = useRef(period)
-  const patternScopeRef = useRef(`${symbol}-${interval}`)
-  const pendingPatternSelectionRef = useRef<{ scope: string; selection: string } | null>(null)
   const chartRequestPeriod = interval === '1h' ? '2y' : interval === '1wk' ? '5y' : period
 
   const {
     data: chartData = [],
     isFetching: chartLoading,
     isError: chartError,
+    error: chartReadError,
   } = useQuery<ChartDataPoint[]>({
     queryKey: ['chart', symbol, chartRequestPeriod, interval, ...queryScope],
-    queryFn: () => getChartData(symbol!, chartRequestPeriod, interval, false, snapshotId),
+    queryFn: () => getChartData(symbol!, chartRequestPeriod, interval, false, snapshotId, closingView),
     enabled: !!symbol && readsEnabled,
     placeholderData: (previous, previousQuery) =>
       previousQuery?.queryKey[3] === interval && (!realtimeOnly || previousQuery.queryKey[5] === snapshotId) ? previous : undefined,
@@ -195,43 +183,44 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
     () => chartData.filter(point => !point.provisional),
     [chartData],
   )
+  const patternSupported = supportsPatternInterval(interval)
 
-  const { data: chartPatterns = null, isFetching: patternLoading } = useQuery({
+  const { data: chartPatterns = null, isFetching: patternLoading, error: patternError } = useQuery({
     queryKey: ['chart-patterns', symbol, interval, ...queryScope],
-    queryFn: () => getChartPatterns(symbol!, interval, false, snapshotId),
-    enabled: !!symbol && showAutoPatterns && readsEnabled,
+    queryFn: () => getChartPatterns(symbol!, interval, false, snapshotId, closingView),
+    enabled: !!symbol && showAutoPatterns && patternSupported && readsEnabled,
     staleTime: interval in SESSION_BARS ? 60_000 : 300_000,
   })
   const { data: crossFramePatterns = null, isFetching: crossFrameLoading } = useQuery({
     queryKey: ['chart-patterns', symbol, 'all', ...queryScope],
-    queryFn: () => scanTickerChartPatterns(symbol!, false, snapshotId),
+    queryFn: () => scanTickerChartPatterns(symbol!, false, snapshotId, closingView),
     enabled: !!symbol && showAutoPatterns && readsEnabled,
     staleTime: 60_000,
     refetchInterval: realtimeOnly ? false : 60_000,
   })
-  const { data: priceChannelResponse = null, isFetching: channelLoading } = useQuery({
+  const { data: priceChannelResponse = null, isFetching: channelLoading, error: channelError } = useQuery({
     queryKey: ['price-channel', symbol, interval, ...queryScope],
-    queryFn: () => getPriceChannel(symbol!, interval, false, snapshotId),
+    queryFn: () => getPriceChannel(symbol!, interval, false, snapshotId, closingView),
     enabled: !!symbol && showPriceChannel && interval !== '1m' && readsEnabled,
     staleTime: interval in SESSION_BARS ? 60_000 : 300_000,
   })
   const priceChannel = priceChannelResponse?.channel ?? null
-  const availablePatterns = chartPatterns?.patterns ?? []
-  const displayedPatterns = useMemo(() => {
-    if (patternSelection === 'all') return availablePatterns
-    if (patternSelection === 'best') return availablePatterns.slice(0, 1)
-    const choice = parsePatternChoice(patternSelection)
-    const selected = choice?.interval === interval
-      ? availablePatterns.find(pattern => pattern.type === choice.type)
-      : undefined
-    return selected
-      ? [selected]
-      : availablePatterns.slice(0, 1)
-  }, [availablePatterns, interval, patternSelection])
+  const chartErrorMessage = formatTickerReadError(chartReadError, publication?.session)
+  const patternErrorMessage = formatTickerReadError(patternError, publication?.session)
+  const channelErrorMessage = formatTickerReadError(channelError, publication?.session)
+  const channelReadVisible = showPriceChannel && !(chartReadError && channelError?.message === chartReadError.message)
+  const availablePatterns = patternSupported ? chartPatterns?.patterns ?? [] : []
+  const displayedPatterns = useMemo(() => selectChartPatterns(availablePatterns, interval, patternSelection),
+    [availablePatterns, interval, patternSelection])
+  const selectedPatternChoice = parsePatternChoice(patternSelection)
+  const selectedPatternAbsent = selectedPatternChoice !== null
+    && !availablePatterns.some(pattern => pattern.type === selectedPatternChoice.type)
+  const selectedPatternUnavailable = selectedPatternAbsent && readsEnabled && !publicationLoading
+    && !patternLoading && chartPatterns !== null && !patternError
   const patternGroups = useMemo(() => {
     const grouped = new Map<string, FormingChartPattern[]>()
     for (const row of crossFramePatterns?.results ?? []) {
-      if (row.interval !== interval) {
+      if (supportsPatternInterval(row.interval) && row.interval !== interval) {
         grouped.set(row.interval, [...(grouped.get(row.interval) ?? []), row.pattern])
       }
     }
@@ -254,14 +243,14 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
 
   const { data: latestQuote = null } = useQuery({
     queryKey: ['latest-quote', symbol, ...queryScope],
-    queryFn: () => getLatestQuote(symbol!, false, snapshotId),
+    queryFn: () => getLatestQuote(symbol!, false, snapshotId, closingView),
     enabled: !!symbol && readsEnabled,
     refetchInterval: realtimeOnly ? false : 60_000,
   })
 
   const { data: multiSetup = null, isFetching: setupLoading } = useQuery<MultiTradeSetupResponse | null>({
     queryKey: ['trade-setup-multi', symbol, ...queryScope],
-    queryFn: () => getMultiTradeSetup(symbol!, false, snapshotId),
+    queryFn: () => getMultiTradeSetup(symbol!, false, snapshotId, closingView),
     enabled: !!symbol && readsEnabled,
     staleTime: 0,
     refetchInterval: realtimeOnly ? false : 120_000,
@@ -287,7 +276,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
 
   const { data: equityContext = null, isError: equityContextError } = useQuery({
     queryKey: ['stock-context', symbol, ...queryScope],
-    queryFn: () => getStockContext(symbol!, snapshotId),
+    queryFn: () => getStockContext(symbol!, snapshotId, closingView),
     enabled: !!symbol && readsEnabled,
     refetchInterval: realtimeOnly ? false : 60_000,
   })
@@ -312,18 +301,6 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
     onAnalysisIntervalChange?.(setupInterval as SetupTimeframe)
     onAnalysisSetupChange?.(tradeSetup)
   }, [setupInterval, tradeSetup, onAnalysisIntervalChange, onAnalysisSetupChange])
-  useEffect(() => {
-    if (interval === '1m') setShowPriceChannel(false)
-  }, [interval])
-  useEffect(() => {
-    const scope = `${symbol}-${interval}`
-    if (scope !== patternScopeRef.current) {
-      patternScopeRef.current = scope
-      const pending = pendingPatternSelectionRef.current
-      setPatternSelection(pending?.scope === scope ? pending.selection : 'best')
-      pendingPatternSelectionRef.current = null
-    }
-  }, [symbol, interval])
 
   const clearPatternSeries = useCallback(() => {
     const chart = chartRef.current
@@ -356,12 +333,10 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
   const clearResearchOverlays = useCallback(() => {
     clearPatternSeries()
     clearChannelSeries()
-    setShowAutoPatterns(false)
-    setShowPriceChannel(false)
-    setPatternSelection('best')
+    updateChartPreferences({ showAutoPatterns: false, showPriceChannel: false, patternSelection: 'best' })
     queryClient.removeQueries({ queryKey: ['chart-patterns', symbol] })
     queryClient.removeQueries({ queryKey: ['price-channel', symbol] })
-  }, [clearChannelSeries, clearPatternSeries, queryClient, symbol])
+  }, [clearChannelSeries, clearPatternSeries, queryClient, symbol, updateChartPreferences])
 
   const fitSelectedPeriod = useCallback(() => {
     if (!chartRef.current) return
@@ -406,10 +381,12 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
         queryKey: crossPatternKey,
         queryFn: () => scanTickerChartPatterns(symbol!, true),
       })
-      await queryClient.fetchQuery({
-        queryKey: patternKey,
-        queryFn: () => getChartPatterns(symbol!, interval),
-      })
+      if (patternSupported) {
+        await queryClient.fetchQuery({
+          queryKey: patternKey,
+          queryFn: () => getChartPatterns(symbol!, interval),
+        })
+      }
     }
     if (showPriceChannel && interval !== '1m') {
       await queryClient.fetchQuery({
@@ -417,21 +394,15 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
         queryFn: () => getPriceChannel(symbol!, interval, true),
       })
     }
-  }, [symbol, chartRequestPeriod, interval, queryClient, showAutoPatterns, showPriceChannel, onRefreshPublication])
+  }, [symbol, chartRequestPeriod, interval, queryClient, showAutoPatterns, showPriceChannel, patternSupported, onRefreshPublication])
 
   const handleChartIntervalChange = useCallback((nextInterval: string, nextPattern?: string) => {
-    if (nextPattern) {
-      pendingPatternSelectionRef.current = {
-        scope: `${symbol}-${nextInterval}`,
-        selection: nextPattern,
-      }
-      setPatternSelection(nextPattern)
-    } else {
-      pendingPatternSelectionRef.current = null
-    }
-    setInterval(nextInterval)
-    setPeriod(defaultPeriodForInterval(nextInterval))
-  }, [symbol])
+    updateChartPreferences({
+      interval: nextInterval,
+      period: defaultPeriodForInterval(nextInterval),
+      patternSelection: nextPattern ?? 'best',
+    })
+  }, [updateChartPreferences])
 
   const handlePatternSelectionChange = useCallback((selection: string) => {
     const choice = parsePatternChoice(selection)
@@ -439,8 +410,8 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
       handleChartIntervalChange(choice.interval, selection)
       return
     }
-    setPatternSelection(selection)
-  }, [handleChartIntervalChange, interval])
+    updateChartPreferences({ patternSelection: selection })
+  }, [handleChartIntervalChange, interval, updateChartPreferences])
 
   // Effect 1: Create chart once on mount
   useEffect(() => {
@@ -622,12 +593,12 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
     if (chartRef.current) fitSelectedPeriod()
   }, [effectiveChartHeight, isFullscreen, fitSelectedPeriod])
 
-  useEffect(() => setSelectedLevel(null), [symbol, view, setupInterval])
+  useEffect(() => setSelectedLevel(null), [symbol, view, setupInterval, snapshotId])
 
   // Levels are prices, so the chart draws them natively rather than as an overlay series.
   useEffect(() => {
     const series = candleSeriesRef.current
-    if (!series || !selectedLevel) return
+    if (!series || !selectedLevel || selectedLevel.snapshotId !== snapshotId) return
     const priceLine = series.createPriceLine({
       price: selectedLevel.price,
       color: chartTheme.accent,
@@ -643,7 +614,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
         // The chart may already be disposed during route teardown.
       }
     }
-  }, [selectedLevel, chartTheme])
+  }, [selectedLevel, chartTheme, snapshotId])
 
   const handleZoomIn = useCallback(() => {
     if (chartRef.current) {
@@ -746,23 +717,12 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
   useEffect(() => {
     clearPatternSeries()
     const chart = chartRef.current
-    if (!chart || !showAutoPatterns) return
-
-    const roleTone: Record<string, string> = {
-      resistance: NEG,
-      support: POS,
-      neckline: WARN,
-      structure: '#7c3aed',
-      rim: WARN,
-      cup: INFO,
-      handle: '#0f766e',
-      flagpole: MUTED,
-    }
+    if (!chart || !showAutoPatterns || !patternSupported || finalizedChartData.length === 0) return
     displayedPatterns.forEach((pattern, patternIndex) => {
       pattern.lines.forEach(line => {
         const series = chart.addSeries(LineSeries, {
-          color: roleTone[line.role] ?? INFO,
-          lineWidth: patternIndex === 0 ? 2 : 1,
+          color: chartTheme.pattern[line.role],
+          lineWidth: patternIndex === 0 ? 3 : 2,
           lineStyle: 2,
           lineType: line.role === 'cup' ? LineType.Curved : LineType.Simple,
           priceLineVisible: false,
@@ -779,16 +739,16 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
     })
 
     return clearPatternSeries
-  }, [clearPatternSeries, displayedPatterns, showAutoPatterns])
+  }, [clearPatternSeries, displayedPatterns, finalizedChartData, showAutoPatterns, patternSupported, chartTheme])
 
   useEffect(() => {
     clearChannelSeries()
     const chart = chartRef.current
-    if (!chart || !showPriceChannel || !priceChannel) return
+    if (!chart || !showPriceChannel || !priceChannel || finalizedChartData.length === 0) return
 
     priceChannel.lines.forEach(line => {
       const series = chart.addSeries(LineSeries, {
-        color: line.role === 'support' ? POS : NEG,
+        color: line.role === 'support' ? chartTheme.up : chartTheme.down,
         lineWidth: 2,
         priceLineVisible: false,
         lastValueVisible: false,
@@ -803,7 +763,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
     })
 
     return clearChannelSeries
-  }, [clearChannelSeries, priceChannel, showPriceChannel])
+  }, [clearChannelSeries, priceChannel, finalizedChartData, showPriceChannel, chartTheme])
 
   useEffect(() => {
     const chart = chartRef.current
@@ -925,12 +885,12 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
       <section className="tk-panel tk-panel--chart">
         <div className="tk-panel__bar">
           <div className="tk-segment" role="group" aria-label="Chart period">
-            {['1d', '5d', '1mo', '3mo', '6mo', '1y', '2y', '5y'].map(p => (
+            {CHART_PERIODS.map(p => (
               <button
                 key={p}
                 type="button"
                 className={period === p ? 'is-active' : undefined}
-                onClick={() => setPeriod(p)}
+                onClick={() => updateChartPreferences({ period: p })}
               >
                 {p.toUpperCase()}
               </button>
@@ -1013,10 +973,10 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
           }}>
             <span style={{ fontWeight: 700, fontSize: '1.1rem' }}>{symbol}</span>
             <div style={{ display: 'flex', gap: '2px', background: 'var(--tm-line)', borderRadius: '4px', padding: '2px' }}>
-              {['1d', '5d', '1mo', '3mo', '6mo', '1y', '2y', '5y'].map(p => (
+              {CHART_PERIODS.map(p => (
                 <button
                   key={p}
-                  onClick={() => setPeriod(p)}
+                  onClick={() => updateChartPreferences({ period: p })}
                   style={{
                     padding: '2px 8px',
                     fontSize: '0.75rem',
@@ -1034,6 +994,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
               ))}
             </div>
             <select
+              aria-label="Chart interval"
               value={interval}
               onChange={(e) => handleChartIntervalChange(e.target.value)}
               style={{ fontSize: '0.8rem', padding: '3px 6px', borderRadius: '4px', border: '1px solid var(--tm-line-strong)', background: 'var(--tm-surface)', color: 'var(--tm-ink)' }}
@@ -1072,10 +1033,11 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
           border: '1px solid var(--tm-line)',
         }}>
           <button
-            onClick={() => setShowAutoPatterns(value => !value)}
-            title="Toggle automatic forming-pattern trendlines"
+            onClick={() => updateChartPreferences({ showAutoPatterns: !showAutoPatterns })}
+            disabled={!patternSupported}
+            title={patternSupported ? 'Toggle automatic forming-pattern trendlines' : 'Pattern overlays use 30m, 1h, daily, weekly and monthly charts'}
             aria-label="Toggle automatic forming-pattern trendlines"
-            aria-pressed={showAutoPatterns}
+            aria-pressed={showAutoPatterns && patternSupported}
             style={{
               width: 30,
               height: 28,
@@ -1083,7 +1045,8 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
               borderRadius: '4px',
               background: showAutoPatterns ? INFO_SOFT : 'transparent',
               color: showAutoPatterns ? INFO : MUTED,
-              cursor: 'pointer',
+              cursor: patternSupported ? 'pointer' : 'default',
+              opacity: patternSupported ? 1 : 0.35,
               display: 'grid',
               placeItems: 'center',
             }}
@@ -1091,7 +1054,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
             <ScanLine size={17} strokeWidth={2} aria-hidden="true" />
           </button>
           <button
-            onClick={() => setShowPriceChannel(value => !value)}
+            onClick={() => updateChartPreferences({ showPriceChannel: !showPriceChannel })}
             disabled={interval === '1m'}
             title={interval === '1m' ? 'Price channels are available from 5 minutes through weekly' : 'Toggle selected-interval price channel'}
             aria-label="Toggle selected-interval price channel"
@@ -1132,7 +1095,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
             <Eraser size={16} strokeWidth={2} aria-hidden="true" />
           </button>
           <button
-            onClick={() => setShowRsi(value => !value)}
+            onClick={() => updateChartPreferences({ showRsi: !showRsi })}
             title="Toggle RSI (14) pane"
             aria-pressed={showRsi}
             style={{
@@ -1197,13 +1160,16 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
               <span style={{ color: MUTED, fontSize: '0.68rem', whiteSpace: 'nowrap' }}>
-                {patternLoading
+                {!patternSupported
+                  ? 'Pattern overlays are available from 30m through monthly'
+                  : patternLoading
                   ? 'Measuring current frame…'
+                  : patternError ? 'Pattern data unavailable'
                   : availablePatterns.length === 0
                     ? `No pattern · ${interval}`
                     : `${availablePatterns.length} possible · ${interval}`}
               </span>
-              {patternGroups.length > 0 && (
+              {(patternGroups.length > 0 || selectedPatternChoice || patternSelection === 'all') && (
               <select
                 aria-label="Possible patterns across intervals"
                 title="Possible patterns across intervals; the current interval's primary pattern is shown by default"
@@ -1212,7 +1178,12 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
                 style={{ border: `1px solid ${LINE}`, borderRadius: 4, padding: '2px 4px', fontSize: '0.68rem', background: 'var(--tm-surface)', color: 'var(--tm-ink)', maxWidth: 250 }}
               >
                 <option value="best">Possible patterns</option>
-                {availablePatterns.length > 1 && <option value="all">Show all on {PATTERN_INTERVAL_LABEL[interval] ?? interval}</option>}
+                {(availablePatterns.length > 1 || patternSelection === 'all') && <option value="all">Show all on {PATTERN_INTERVAL_LABEL[interval] ?? interval}</option>}
+                {selectedPatternAbsent && selectedPatternChoice && (
+                  <option value={patternSelection} disabled>
+                    {selectedPatternChoice.type.replace(/_/g, ' ')} · {publicationLoading || patternLoading ? 'Loading…' : patternError ? 'Data unavailable' : 'Not available for this date'}
+                  </option>
+                )}
                 {patternGroups.map(group => (
                   <optgroup
                     key={group.interval}
@@ -1231,6 +1202,10 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
               </select>
               )}
             </div>
+            {selectedPatternUnavailable && <div role="status" aria-live="polite" style={{ color: MUTED, fontSize: '0.68rem' }}>
+              Not available for this date. Your {selectedPatternChoice?.type.replace(/_/g, ' ')} selection is retained.
+            </div>}
+            {patternError && patternError.message !== chartReadError?.message && <div role="alert" style={{ color: MUTED, fontSize: '0.68rem' }}>Pattern data unavailable: {patternErrorMessage}</div>}
             <div style={{ color: crossFrameView?.tone ?? MUTED, fontSize: '0.66rem', fontWeight: 700, whiteSpace: 'nowrap' }}>
               {crossFrameLoading
                 ? 'Cross-frame · measuring…'
@@ -1250,8 +1225,8 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
         {(chartError || availabilityError) && !loading && chartData.length === 0 && (
           <div role="alert" style={{ position: 'absolute', inset: 0, zIndex: 10, display: 'grid', placeItems: 'center', background: 'var(--tm-scrim)', textAlign: 'center', padding: 24 }}>
             <div>
-              <strong style={{ color: INK }}>{availabilityError ? 'Chart unavailable.' : 'Chart data is not current yet.'}</strong>
-              <div style={{ color: MUTED, fontSize: '0.78rem', marginTop: 5 }}>{availabilityError ?? 'The latest completed market interval has not been published.'}</div>
+              <strong style={{ color: INK }}>Chart unavailable.</strong>
+              <div style={{ color: MUTED, fontSize: '0.78rem', marginTop: 5 }}>{availabilityError ?? chartErrorMessage ?? 'No saved chart data is available for this interval.'}</div>
               <button type="button" onClick={() => void handleRefresh()} style={{ marginTop: 12, border: 0, borderRadius: 5, padding: '7px 12px', background: 'var(--tm-accent)', color: 'var(--tm-on-accent)', fontWeight: 700, cursor: 'pointer' }}>Retry</button>
             </div>
           </div>
@@ -1280,7 +1255,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
               maxWidth: '60%',
             }}
           />
-          {(showPriceChannel || (showAutoPatterns && displayedPatterns.length > 0)) && (
+          {(channelReadVisible || (showAutoPatterns && displayedPatterns.length > 0)) && (
             <div style={{
               position: 'absolute',
               left: 10,
@@ -1291,7 +1266,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
               display: 'grid',
               gap: '0.25rem',
             }}>
-              {showPriceChannel && (
+              {channelReadVisible && (
                 <div style={{
                   padding: '0.3rem 0.45rem',
                   borderLeft: `3px solid ${priceChannel?.bias === 'BULLISH' ? POS : priceChannel?.bias === 'BEARISH' ? NEG : MUTED}`,
@@ -1300,6 +1275,8 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
                 }}>
                   {channelLoading ? (
                     <strong>Measuring directional channel…</strong>
+                  ) : channelError ? (
+                    <span role="alert" style={{ color: MUTED }}>Channel data unavailable: {channelErrorMessage}</span>
                   ) : priceChannel ? (() => {
                     const read = priceChannelReading(priceChannel)
                     return (
@@ -1370,9 +1347,12 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
             <select
               className="tk-select"
               value={analysisPin ?? ''}
-              onChange={event => setAnalysisPin(event.target.value || null)}
+              onChange={event => updateChartPreferences({ analysisPin: event.target.value || null })}
             >
               <option value="">Follow chart</option>
+              {analysisPin && !selectableSetupIntervals.includes(analysisPin) && <option value={analysisPin} disabled>
+                {PATTERN_INTERVAL_LABEL[analysisPin] ?? analysisPin} · {publicationLoading || setupLoading ? 'Loading…' : 'Unavailable'}
+              </option>}
               {selectableSetupIntervals.map(value => (
                 <option key={value} value={value}>
                   {INTERVAL_NOUN[value] ?? PATTERN_INTERVAL_LABEL[value] ?? value}
@@ -1394,7 +1374,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
                 : 'Analysis follows the chart interval.'}
           />
           {analysisPin && (
-            <button type="button" className="tk-toggle" onClick={() => setAnalysisPin(null)}>
+            <button type="button" className="tk-toggle" onClick={() => updateChartPreferences({ analysisPin: null })}>
               Follow chart
             </button>
           )}

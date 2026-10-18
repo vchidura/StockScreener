@@ -160,9 +160,9 @@ logger.info("ThreadPoolExecutor | workers=%s | cpu_cores=%s", _num_workers, os.c
 # Force refresh (?refresh=true) bypasses and also invalidates bulk_load_dataframes.
 _result_cache: dict[str, tuple[float, Any]] = {}
 _result_cache_lock = threading.Lock()
-CHART_PATTERN_DETAIL_CACHE = "chart_patterns_v9"
-CHART_PATTERN_TICKER_CACHE = "chart_pattern_ticker_v7"
-CHART_PATTERN_SCAN_CACHE = "chart_pattern_scan_v7"
+CHART_PATTERN_DETAIL_CACHE = "chart_patterns_v10"
+CHART_PATTERN_TICKER_CACHE = "chart_pattern_ticker_v8"
+CHART_PATTERN_SCAN_CACHE = "chart_pattern_scan_v8"
 PRICE_CHANNEL_CACHE = "price_channel_v1"
 
 # TTL in seconds per cache-key prefix
@@ -294,18 +294,17 @@ def _load_intraday_frames(tickers: List[str], interval: str, limit: int = 200) -
     return frames
 
 
-PATTERN_WATCH_INTERVALS = ("5m", "15m", "30m", "1h", "1d", "1wk", "1mo")
 PATTERN_FRAME_ROWS = 301
 
 
 def _load_pattern_frames(tickers: List[str], interval: str) -> dict:
     """Load one consistent detector window, including the newest excluded row."""
-    if interval in ("1d", "1wk"):
-        days = 2500 if interval == "1wk" else 500
+    if interval in ("1d", "1wk", "1mo"):
+        days = 2500 if interval in ("1wk", "1mo") else 500
         frames = bulk_load_dataframes(tickers, days)
-        if interval == "1wk":
+        if interval in ("1wk", "1mo"):
             frames = {
-                ticker: frame.resample("W-FRI").agg({
+                ticker: frame.resample("W-FRI" if interval == "1wk" else "ME").agg({
                     "open": "first", "high": "max", "low": "min",
                     "close": "last", "volume": "sum",
                 }).dropna(subset=["close"])
@@ -432,6 +431,7 @@ async def list_tickers(refresh: bool = False):
 
 
 from equity.ticker_contracts import (
+    PATTERN_WATCH_INTERVALS,
     build_ticker_confluence_zones as _build_ticker_confluence_zones,
     sort_pattern_watch_rows as _sort_pattern_watch_rows,
     setup_summary_row as _setup_summary_row,
@@ -814,10 +814,12 @@ def _materialized_pattern_report(interval: str, ticker: str | None = None) -> di
 @app.get("/api/stock/{ticker}/chart-patterns")
 async def get_chart_patterns(
     ticker: str,
-    interval: str = Query(default="1d", regex="^(1m|5m|15m|30m|1h|1d|1wk)$"),
+    interval: str = Query(default="1d", regex="^(30m|1h|1d|1wk|1mo)$"),
     refresh: bool = False,
 ):
     """Current chart-only formations for one interval, using completed bars."""
+    if interval not in PATTERN_WATCH_INTERVALS:
+        raise HTTPException(status_code=422, detail="Pattern Watch supports only 30m, 1h, 1d, 1wk and 1mo")
     symbol = ticker.upper()
     if MATERIALIZED_PATTERN_WATCH_ENABLED:
         report = _materialized_pattern_report(interval, symbol)
@@ -1001,11 +1003,13 @@ async def scan_ticker_chart_patterns(ticker: str, refresh: bool = False):
 
 @app.get("/api/chart-patterns/scan")
 async def scan_chart_patterns(
-    interval: str = Query(default="1d", regex="^(15m|30m|1h|1d|1wk|1mo)$"),
+    interval: str = Query(default="1d", regex="^(30m|1h|1d|1wk|1mo)$"),
     limit: int = Query(default=1000, ge=1, le=1500),
     refresh: bool = False,
 ):
     """Find current forming chart patterns across the active ticker universe."""
+    if interval not in PATTERN_WATCH_INTERVALS:
+        raise HTTPException(status_code=422, detail="Pattern Watch supports only 30m, 1h, 1d, 1wk and 1mo")
     if MATERIALIZED_PATTERN_WATCH_ENABLED:
         report = _materialized_pattern_report(interval)
         rows = report["results"][:limit]

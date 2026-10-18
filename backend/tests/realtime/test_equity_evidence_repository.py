@@ -394,6 +394,29 @@ def test_pattern_batch_keeps_technical_discovery_pointers_unchanged():
     assert any("INSERT INTO rt.feature_current" in s for s in store.statements)
     assert not any("INSERT INTO rt.equity_evidence_current" in s for s in store.statements)
 
+def test_archive_only_batch_persists_immutable_closures_without_any_current_pointer():
+    result, definition, store = _setup_result(), _definition(), EvidenceStore()
+    write = RealtimeEquityMaterializationWrite(result, definition, 7)
+    receipt = persist_realtime_equity_materialization_batch_cursor(store.cursor, (write,),
+        publish_current=False, values_executor=store.values_executor)
+    assert receipt.persisted_count == 1
+    assert len(store.evidence_bodies) == len(result.materialization.evidence)
+    assert len(store.snapshots) == 1
+    assert not any("INSERT INTO rt.feature_current" in sql or "INSERT INTO rt.equity_evidence_current" in sql
+        for sql in store.statements)
+
+
+def test_archive_only_batch_still_rejects_immutable_identity_drift():
+    result, definition, store = _setup_result(), _definition(), EvidenceStore()
+    write = RealtimeEquityMaterializationWrite(result, definition, 7)
+    store.persist_batch((write,))
+    window_id, durable = next(iter(store.window_bodies))
+    body = store.window_bodies[(window_id, durable)]
+    store.window_bodies[(window_id, durable)] = (*body[:10], "0" * 64)
+    with pytest.raises(ValueError, match="source window conflict"):
+        persist_realtime_equity_materialization_batch_cursor(store.cursor, (write,),
+            publish_current=False, values_executor=store.values_executor)
+
 
 def test_historical_batch_retains_all_snapshots_and_upserts_only_latest_feature_current():
     definition, store = _definition(), EvidenceStore()

@@ -1,11 +1,10 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import test from 'node:test'
 import ts from 'typescript'
 
 const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8')
-const page = readFileSync(new URL('../src/pages/RealtimeCanaryPage.tsx', import.meta.url), 'utf8')
-const service = readFileSync(new URL('../src/services/realtimeCanary.ts', import.meta.url), 'utf8')
+const service = readFileSync(new URL('../src/services/realtime.ts', import.meta.url), 'utf8')
 const navigation = readFileSync(new URL('../src/layout/navigation.ts', import.meta.url), 'utf8')
 const shell = readFileSync(new URL('../src/layout/AppShell.tsx', import.meta.url), 'utf8')
 const globalSearch = readFileSync(new URL('../src/layout/GlobalSearch.tsx', import.meta.url), 'utf8')
@@ -13,22 +12,25 @@ const mapped = readFileSync(new URL('../src/pages/realtime/RealtimeMappedPages.t
 const vite = readFileSync(new URL('../vite.config.ts', import.meta.url), 'utf8')
 const tasks = JSON.parse(readFileSync(new URL('../../.vscode/tasks.json', import.meta.url), 'utf8'))
 
-test('realtime deployment restores the full portal shell around the dedicated canary', () => {
-  assert.match(app, /path="\/realtime-canary" element=\{<RealtimeCanaryPage \/>\}/)
-  assert.match(service, /api\.get\('\/realtime\/canary'/)
-  assert.match(service, /const cohortParams =/)
-  assert.match(page, /searchParams\.get\('cohort_id'\)/)
-  assert.match(page, /getRealtimeCanaryStatus\(cohortId, signal\)/)
-  for (const value of ['getRealtimeTickerPage', 'getRealtimeScreening', 'getRealtimeStockAlerts', 'getRealtimeOptionAlerts']) {
-    assert.ok(page.includes(value), `missing ${value}`)
+test('the validation page and all dedicated client entry points are removed', () => {
+  for (const file of ['../src/pages/RealtimeCanaryPage.tsx', '../src/pages/RealtimeCanaryPage.css',
+    '../src/services/realtimeCanary.ts']) {
+    assert.equal(existsSync(new URL(file, import.meta.url)), false, file)
   }
+  assert.doesNotMatch(app + shell + mapped, /RealtimeCanaryPage|realtime-canary|realtimeCanary|Validation status/)
+  assert.doesNotMatch(service, /getRealtimeCanaryStatus|getRealtimeTickerPage|getRealtimeScreening|getRealtimeStockAlerts|\/realtime\/canary/)
+  assert.equal(app.match(/path="\*" element=\{<Navigate to="\/" replace \/>\}/g)?.length, 2)
+})
+
+test('both deployment modes retain the full portal shell and shared realtime adapters', () => {
+  assert.match(service, /const cohortParams =/)
   assert.doesNotMatch(service, /api\.(post|put|patch|delete)/)
   assert.doesNotMatch(service, /\/stocks\//)
   assert.doesNotMatch(service, /\/options\//)
   assert.doesNotMatch(navigation, /realtime-canary/)
   assert.match(app, /VITE_REALTIME_ONLY === 'true'/)
   assert.match(app, /Realtime-only portal requires VITE_REALTIME_COHORT_ID/)
-  assert.match(app, /<PortalRoutes realtimeOnly realtimeHome=\{realtimeHome\} \/>/)
+  assert.match(app, /<PortalRoutes realtimeOnly \/>/)
   assert.equal(app.match(/<SessionDateProvider>/g)?.length, 2)
   assert.doesNotMatch(app, /SessionDateProvider enabled=/)
   for (const route of [
@@ -44,10 +46,7 @@ test('realtime deployment restores the full portal shell around the dedicated ca
   }
   assert.match(shell, /NAV_GROUPS\.map/)
   assert.match(shell, /PINNED_ITEMS\.map/)
-  assert.match(shell, /Validation status/)
   assert.match(shell, /realtimeOnly \? pinnedPath\(baseDestination\) : baseDestination/)
-  assert.match(shell, /publicationPin \|\| publicationCohort/)
-  assert.match(shell, /pinnedPath\('\/realtime-canary'\)/)
   assert.match(shell, /<GlobalSearch \/>/)
   assert.match(shell, /<StalenessBanner \/>/)
   assert.doesNotMatch(shell, /!realtimeOnly && <GlobalSearch/)
@@ -111,16 +110,35 @@ test('all four original screening requests preserve bodies and abort signals in 
   }
 })
 
-test('canary page exposes exact coverage and isolation evidence', () => {
-  for (const field of ['expected_tickers', 'ready_tickers', 'screening_tickers', 'stock_alerts_available',
-    'option_alerts_available', 'database_target', 'provider_fetch_performed', 'canonical_fallback', 'reason_codes']) {
-    assert.ok(page.includes(`data.${field}`), `missing ${field}`)
+test('shared realtime readers retain their cohort and cancellation contracts', async () => {
+  const calls = []
+  globalThis.__realtimeApi = { get: async (...args) => { calls.push(args); return { data: 'stored' } } }
+  globalThis.__realtimeEnvironment = { VITE_REALTIME_COHORT_ID: ' cohort ' }
+  try {
+    const source = service.replace("import api from './api'", 'const api = globalThis.__realtimeApi')
+      .replaceAll('import.meta.env', 'globalThis.__realtimeEnvironment')
+    const compiled = ts.transpileModule(source, {
+      compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+    })
+    const readers = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`)
+    const signal = new AbortController().signal
+    assert.equal(readers.REALTIME_COHORT_ID, 'cohort')
+    assert.equal(await readers.getRealtimeHealth(signal), 'stored')
+    assert.equal(await readers.getRealtimeEquityValidationStatus('cohort', signal), 'stored')
+    assert.equal(await readers.getRealtimeOptionAlerts('cohort', signal), 'stored')
+    assert.deepEqual(calls, [
+      ['/realtime/health', { signal }],
+      ['/realtime/equity-validation', { signal, params: { cohort_id: 'cohort' } }],
+      ['/realtime/option-alerts', { signal, params: { cohort_id: 'cohort' } }],
+    ])
+    const styles = readFileSync(new URL('../src/pages/realtime/RealtimeMappedPages.css', import.meta.url), 'utf8')
+    assert.match(mapped, /services\/realtime'/)
+    assert.match(styles, /\.rt-isolation/)
+    assert.match(styles, /\.rt-state/)
+  } finally {
+    delete globalThis.__realtimeApi
+    delete globalThis.__realtimeEnvironment
   }
-  assert.match(page, /No canonical fallback/)
-  assert.match(page, /Stored projections only/)
-  assert.match(page, /refetchInterval: 15_000/)
-  assert.match(page, /Stored cohort values/)
-  assert.match(page, /Option evaluations/)
 })
 
 test('local portal has one realtime factory backend on port 8001', () => {

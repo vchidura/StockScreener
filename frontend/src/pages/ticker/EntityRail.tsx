@@ -80,6 +80,7 @@ export default function EntityRail({
   referenceWarning,
   calendarAvailabilityError,
   publication,
+  publicationNotice,
   analysisInterval = '1d',
   setup,
 }: {
@@ -91,6 +92,7 @@ export default function EntityRail({
   referenceWarning?: string | null
   calendarAvailabilityError?: string | null
   publication?: TickerWorkspacePublication
+  publicationNotice?: string | null
   analysisInterval?: SetupTimeframe
   setup?: TradeSetup | null
 }) {
@@ -205,9 +207,21 @@ export default function EntityRail({
       <div className="ticker-entity__note">
         News, insider transactions and institutional holdings are not integrated.
       </div>
-      {(setup || evidenceRef) && <details className="tk-analysis-provenance" aria-label="Run details">
+      {(setup || evidenceRef || publicationNotice || publication?.reconstruction) && <details className="tk-analysis-provenance" aria-label="Run details">
         <summary>Run details</summary>
         <dl>
+          {publicationNotice && <div><dt>Saved view</dt><dd>{publicationNotice}</dd></div>}
+          {publication?.reconstruction && <>
+            <div><dt>Provenance</dt><dd>Reconstructed closing research</dd></div>
+            {([['Market close', publication.reconstruction.market_cutoff],
+              ['Inputs recorded by', publication.reconstruction.knowledge_cutoff],
+              ['Reconstructed', publication.reconstruction.published_at]] as const).map(([label, timestamp]) => (
+              <div key={label}><dt>{label}</dt><dd><time dateTime={timestamp}>{new Intl.DateTimeFormat(undefined, {
+                timeZone: MARKET_TIME_ZONE, month: 'short', day: 'numeric', year: 'numeric',
+                hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+              }).format(new Date(timestamp))}</time></dd></div>
+            ))}
+          </>}
           <div><dt>Timeframe</dt><dd>{INTERVAL_NOUN[analysisInterval] ?? analysisInterval}</dd></div>
           {setup && <>
             <div><dt>Date</dt><dd><time dateTime={setup.date}>{setup.date}</time></dd></div>

@@ -6,14 +6,16 @@ import type { DashboardPublication } from '../services/api'
 const isTickerPath = (path: string) => /^\/ticker\/[^/]+(?:\/|$)/.test(path)
 export const isTickerWorkspaceQuery = (name: string) => name.startsWith('ticker-workspace:')
 
-export function publicationPath(path: string, snapshotId?: string, cohortId?: string, interval?: '1d' | '1h') {
-  if (import.meta.env.VITE_REALTIME_ONLY !== 'true' || (snapshotId === undefined && cohortId === undefined)) return path
+export function publicationPath(path: string, snapshotId?: string, cohortId?: string, interval?: '1d' | '1h', sessionDate?: string) {
+  if (import.meta.env.VITE_REALTIME_ONLY !== 'true' || (snapshotId === undefined && cohortId === undefined && sessionDate === undefined)) return path
   const cohort = cohortId ?? import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
   if (!cohort) throw new Error('Realtime publication requires VITE_REALTIME_COHORT_ID')
   const params = new URLSearchParams({ cohort_id: cohort })
-  // The ticker page always shows the current view, so a release pin never travels to it.
+  // Ticker pages resolve their own snapshot; a foreign release pin never travels to them.
   if (snapshotId !== undefined && !isTickerPath(path)) params.set('snapshot_id', snapshotId)
   if (interval === '1h') params.set('interval', interval)
+  if (sessionDate && isDailyStrategyPath(path)) params.set(path.startsWith('/strategy-research/') ? 'evaluation_session' : 'session_date', sessionDate)
+  if (sessionDate && (isTickerPath(path) || path === '/overview')) params.set('session_date', sessionDate)
   return `${path}?${params}`
 }
 
@@ -22,14 +24,16 @@ export function isDailyStrategyPath(path: string) {
     || path.startsWith('/strategy-research/') || path === '/stocks/persistence' || path === '/strategies/overview'
 }
 
-export function navigationPublicationPath(path: string, sourcePath: string, snapshotId?: string, cohortId?: string, interval?: '1d' | '1h') {
+export function navigationPublicationPath(path: string, sourcePath: string, snapshotId?: string, cohortId?: string, interval?: '1d' | '1h', sessionDate?: string) {
   const sourceTicker = /^\/ticker\/([^/]+)(?:\/|$)/.exec(sourcePath)?.[1]?.toUpperCase()
   const targetTicker = /^\/ticker\/([^/]+)(?:\/|$)/.exec(path)?.[1]?.toUpperCase()
   const changesTicker = (sourceTicker !== undefined || targetTicker !== undefined) && sourceTicker !== targetTicker
   const changesSummary = (sourcePath === '/overview' || path === '/overview') && sourcePath !== path
   const changesStrategyRelease = isDailyStrategyPath(sourcePath) !== isDailyStrategyPath(path)
   return publicationPath(path, changesTicker || changesSummary || changesStrategyRelease ? undefined : snapshotId, cohortId,
-    isDailyStrategyPath(path) && isDailyStrategyPath(sourcePath) ? interval : undefined)
+    isDailyStrategyPath(path) && isDailyStrategyPath(sourcePath) ? interval : undefined,
+    (isDailyStrategyPath(path) && isDailyStrategyPath(sourcePath))
+      || ((sourceTicker || sourcePath === '/overview') && (targetTicker || path === '/overview')) ? sessionDate : undefined)
 }
 
 export function useStrategyInterval(searchState?: { current: { pending: URLSearchParams } }): { interval: '1d' | '1h'; setInterval: (selected: '1d' | '1h') => void } {
@@ -52,18 +56,20 @@ export function useStrategyInterval(searchState?: { current: { pending: URLSearc
   return { interval, setInterval }
 }
 
-export function usePublicationQuery<T extends { publication: Pick<DashboardPublication, 'cohort_id' | 'snapshot_id'> }>(
-  name: string, load: (snapshotId?: string) => Promise<T>,
+export function usePublicationQuery<T extends { publication: Pick<DashboardPublication, 'cohort_id' | 'snapshot_id'> & { session?: string } }>(
+  name: string, load: (snapshotId?: string, sessionDate?: string) => Promise<T>,
   requireIdentity = false,
 ) {
   const realtimeOnly = import.meta.env.VITE_REALTIME_ONLY === 'true'
   const cohort = import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
   const [params, setParams] = useSearchParams()
-  // A stale ticker link may still carry a pin; the ticker page ignores it and loads the current view.
-  const pin = isTickerWorkspaceQuery(name) ? undefined : params.get('snapshot_id') ?? undefined
+  // Closing workspaces resolve their own date-bound identity, not an inherited hot pin.
+  const internalWorkspace = isTickerWorkspaceQuery(name) || name === 'all-tickers'
+  const pin = internalWorkspace ? undefined : params.get('snapshot_id') ?? undefined
   const internalSelection = !requireIdentity && pin === undefined
-    && (isTickerWorkspaceQuery(name) || name.startsWith('daily-'))
+    && (internalWorkspace || name.startsWith('daily-'))
   const interval = name.startsWith('daily-') ? params.get('interval') ?? '1d' : '1d'
+  const sessionDate = name.startsWith('daily-') || internalWorkspace ? params.get('session_date') ?? undefined : undefined
   const inheritedCohort = params.get('cohort_id')
   const scopeError = name.startsWith('daily-') && !['1d', '1h'].includes(interval)
     ? 'Unsupported strategy interval; no substitution was made.' : inheritedCohort && inheritedCohort !== cohort
@@ -71,7 +77,16 @@ export function usePublicationQuery<T extends { publication: Pick<DashboardPubli
     : requireIdentity && (!inheritedCohort || !pin)
       ? 'Daily strategy research requires explicit cohort and snapshot identities.' : null
   const queryClient = useQueryClient()
-  const key = [name, cohort, pin, ...(interval === '1h' ? ['1h'] : [])]
+  const queryKey = (snapshotId?: string) => [name, cohort, snapshotId, ...(interval === '1h' ? ['1h'] : []),
+    ...(sessionDate !== undefined ? [sessionDate] : [])]
+  const key = queryKey(pin)
+  const read = async (snapshotId?: string) => {
+    const result = await load(snapshotId, sessionDate)
+    if (sessionDate !== undefined && result.publication.session !== sessionDate) {
+      throw new Error('Stored publication does not match the selected trading session; no substitution was made.')
+    }
+    return result
+  }
   const [refreshError, setRefreshError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const generation = useRef(0)
@@ -81,13 +96,13 @@ export function usePublicationQuery<T extends { publication: Pick<DashboardPubli
     setRefreshing(false)
     refreshInFlight.current = false
     return () => { generation.current += 1; refreshInFlight.current = false }
-  }, [name, cohort, pin, interval])
+  }, [name, cohort, pin, interval, sessionDate])
   const query = useQuery({
     queryKey: key,
     queryFn: () => {
       if (scopeError) throw new Error(scopeError)
-      if (!isTickerWorkspaceQuery(name) && params.has('snapshot_id') && !pin) throw new Error('Requested snapshot identity is empty')
-      return load(pin)
+      if (!internalWorkspace && params.has('snapshot_id') && !pin) throw new Error('Requested snapshot identity is empty')
+      return read(pin)
     },
     enabled: realtimeOnly,
     retry: false,
@@ -97,7 +112,7 @@ export function usePublicationQuery<T extends { publication: Pick<DashboardPubli
   })
   const commit = (result: T) => {
     const snapshot = result.publication.snapshot_id
-    queryClient.setQueryData([name, cohort, snapshot, ...(interval === '1h' ? ['1h'] : [])], result)
+    queryClient.setQueryData(queryKey(snapshot), result)
     if (internalSelection) {
       queryClient.setQueryData(key, result)
       return
@@ -120,7 +135,7 @@ export function usePublicationQuery<T extends { publication: Pick<DashboardPubli
     setRefreshing(true)
     try {
       if (scopeError) throw new Error(scopeError)
-      const complete = await load()
+      const complete = await read()
       if (generation.current === requestedGeneration) commit(complete)
     } catch (error) {
       if (generation.current === requestedGeneration) {

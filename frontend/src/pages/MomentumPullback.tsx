@@ -76,7 +76,7 @@ function MomentumPullback() {
   const storedInterval = useStrategyInterval()
   const interval = realtimeOnly ? storedInterval.interval : canonicalInterval
   const setInterval = (value: ScanInterval) => realtimeOnly ? storedInterval.setInterval(value === '1h' ? '1h' : '1d') : setCanonicalInterval(value)
-  const realtimeQuery = usePublicationQuery('daily-momentum-pullback', pin => getDailyScannerPublication('momentum-pullback', pin, interval === '1h' ? '1h' : '1d'))
+  const realtimeQuery = usePublicationQuery('daily-momentum-pullback', (pin, session) => getDailyScannerPublication('momentum-pullback', pin, interval === '1h' ? '1h' : '1d', session))
   const canonicalQuery = useQuery<MomentumPullbackScanResponse>({
     queryKey: ['scan', 'momentum-pullback', interval, scanDate],
     queryFn: () => scanMomentumPullback(undefined, scanDate || undefined, interval),

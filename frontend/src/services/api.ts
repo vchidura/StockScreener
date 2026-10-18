@@ -25,8 +25,9 @@ export const tickerParams = (params?: Record<string, ApiQueryValue>, snapshotId?
   return { ...params, cohort_id, ...(snapshotId !== undefined ? { snapshot_id: snapshotId } : {}) }
 }
 
-export const retainedTickerParams = (params?: Record<string, ApiQueryValue>, snapshotId?: string) =>
-  tickerParams(import.meta.env.VITE_REALTIME_ONLY === 'true' ? { ...params, read_mode: 'retained' } : params, snapshotId)
+export const retainedTickerParams = (params?: Record<string, ApiQueryValue>, snapshotId?: string, closingView = false) =>
+  tickerParams(import.meta.env.VITE_REALTIME_ONLY === 'true'
+    ? { ...params, read_mode: closingView ? 'session_close' : 'retained' } : params, snapshotId)
 
 export interface TechnicalEvidenceRef {
   cohort_id: string
@@ -47,21 +48,34 @@ export interface TickerWorkspacePublication {
   generated_at: string
   read_at: string
   status: string
-  read_mode?: 'RETAINED'
+  read_mode?: 'RETAINED' | 'SESSION_CLOSE'
+  session?: string
   reference_status?: 'CURRENT' | 'UNAVAILABLE'
   action_status?: 'CURRENT' | 'CHANGED'
   current_data_available?: boolean
   section_warnings?: Partial<Record<'reference' | 'actions' | 'market', string>>
+  reconstruction?: {
+    kind: 'RECONSTRUCTED_RESEARCH'
+    session: string
+    market_cutoff: string
+    input_cutoff: string
+    knowledge_cutoff: string
+    published_at: string
+  }
   evidence_refs: Partial<Record<'30m' | '1h' | '1d' | '1wk' | '1mo', TechnicalEvidenceRef>>
 }
 
-export const getTickerWorkspacePublication = async (ticker: string, snapshotId?: string) => {
+export const getTickerWorkspacePublication = async (ticker: string, snapshotId?: string, sessionDate?: string, closingView = false) => {
   try {
-    const response = await api.get(`/stock/${ticker}/workspace-publication`, { params: retainedTickerParams(undefined, snapshotId) })
+    const response = await api.get(`/stock/${ticker}/workspace-publication`, {
+      params: retainedTickerParams(sessionDate !== undefined ? { session_date: sessionDate } : undefined, snapshotId, closingView),
+    })
     const publication = response.data as TickerWorkspacePublication
     if (!publication.snapshot_id || publication.ticker !== ticker.trim().toUpperCase()
       || publication.cohort_id !== import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
-      || (snapshotId !== undefined && publication.snapshot_id !== snapshotId)) {
+      || (snapshotId !== undefined && publication.snapshot_id !== snapshotId)
+      || sessionDate !== undefined && (publication.session !== sessionDate || publication.read_mode !== 'SESSION_CLOSE')
+      || closingView && publication.read_mode !== 'SESSION_CLOSE') {
       throw new Error('Ticker publication does not match the requested release')
     }
     return { publication }
@@ -814,6 +828,8 @@ export interface PatternWatchResponse {
     generated_at: string
     read_at: string
     status: string
+    session?: string
+    read_mode?: 'RETAINED' | 'SESSION_CLOSE'
     workspaces: Array<{ ticker: string; snapshot_id: string; payload_sha256: string }>
   }
 }
@@ -1117,7 +1133,7 @@ export const getTickers = async (refresh = false): Promise<string[]> => {
 export interface DashboardPublication {
   cohort_id?: string
   strategy_ticker_available?: boolean
-  read_mode?: 'RETAINED'
+  read_mode?: 'RETAINED' | 'SESSION_CLOSE'
   reference_status?: 'CURRENT' | 'UNAVAILABLE'
   action_status?: 'CURRENT' | 'CHANGED'
   current_data_available?: boolean
@@ -1134,6 +1150,8 @@ export interface DashboardPublication {
   session: string
   market_time: string
   generated_at: string
+  evaluation_generated_at?: string
+  evaluation_session?: string
   read_at: string
   expected_market_time: string
   scope_note: string
@@ -1180,12 +1198,13 @@ export interface DailyScannerCoverage {
   analysis?: ScannerAnalysis
 }
 
-const checkedDailyStrategyPublication = (publication: DashboardPublication | undefined, snapshotId?: string, interval: StrategyInterval = '1d') => {
+const checkedDailyStrategyPublication = (publication: DashboardPublication | undefined, snapshotId?: string, interval: StrategyInterval = '1d', sessionDate?: string) => {
   const versions = interval === '1d' ? ['DAILY_STRATEGIES_V1', 'DAILY_STRATEGY_HISTORY_V1', 'DAILY_STRATEGY_ROLLING_V1']
     : ['HOURLY_STRATEGIES_V1', 'HOURLY_STRATEGY_HISTORY_V1', 'HOURLY_STRATEGY_ROLLING_V1']
   if (!publication || !versions.includes(publication.release_type ?? '') || (publication.interval ?? '1d') !== interval
     || publication.cohort_id !== import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
-    || !publication.snapshot_id || (snapshotId !== undefined && publication.snapshot_id !== snapshotId)) {
+    || !publication.snapshot_id || (snapshotId !== undefined && publication.snapshot_id !== snapshotId)
+    || sessionDate !== undefined && publication.session !== sessionDate) {
     throw new Error('Stored independent strategy publication does not match the requested identity')
   }
   return publication
@@ -1229,7 +1248,7 @@ export const resolveDashboardPublication = async (snapshotId?: string) => {
 }
 
 export function requireMatchingPublication(actual: DashboardPublication | undefined, expected: DashboardPublication): asserts actual is DashboardPublication {
-  const fields: Array<keyof DashboardPublication> = ['cohort_id', 'snapshot_id', 'session', 'market_time', 'generated_at', 'status', 'expected_market_time', 'strategy_ticker_available', 'release_type', 'payload_sha256', 'interval']
+  const fields: Array<keyof DashboardPublication> = ['cohort_id', 'snapshot_id', 'session', 'market_time', 'generated_at', 'evaluation_generated_at', 'evaluation_session', 'status', 'expected_market_time', 'strategy_ticker_available', 'release_type', 'payload_sha256', 'interval']
   if (!actual || fields.some(
     key => actual[key] !== expected[key],
   )) throw new Error('Stored response does not match the requested publication')
@@ -1243,7 +1262,29 @@ export interface AllTickersPublication {
   setup_evidence_refs?: Record<string, TechnicalEvidenceRef>
 }
 
-export const getAllTickersPublication = async (snapshotId?: string): Promise<AllTickersPublication> => {
+export const getAllTickersPublication = async (snapshotId?: string, sessionDate?: string, closingView = false): Promise<AllTickersPublication> => {
+  if (import.meta.env.VITE_REALTIME_ONLY === 'true' && closingView) {
+    const response = await api.get('/tickers/workspace-publication', {
+      params: retainedTickerParams(sessionDate !== undefined ? { session_date: sessionDate } : undefined, snapshotId, true),
+    }).catch(error => { throw storedReadError(error) })
+    const result = response.data as AllTickersPublication
+    const publication = result.publication
+    const members = result.overview?.map(row => row.ticker)
+    const setups = result.setup?.results
+    if (!publication?.snapshot_id || publication.cohort_id !== import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
+      || publication.read_mode !== 'SESSION_CLOSE'
+      || snapshotId !== undefined && publication.snapshot_id !== snapshotId
+      || sessionDate !== undefined && publication.session !== sessionDate
+      || !members?.length || new Set(members).size !== members.length
+      || result.overview.some(row => row.date !== publication.session)
+      || !Array.isArray(setups) || setups.length !== members.length
+      || new Set(setups.map(row => row.ticker)).size !== members.length
+      || setups.some(row => !members.includes(row.ticker))) {
+      throw new Error('Saved All Tickers closing data does not match the selected session or cohort')
+    }
+    requireMatchingPublication(result.setup.publication, publication)
+    return result
+  }
   try {
     const publication = await resolveDashboardPublication(snapshotId)
     const [overview, setup] = await Promise.all([
@@ -1271,12 +1312,13 @@ export interface DailyScannerPages {
   fibonacci: { data: FibonacciScanResponse; publication: DashboardPublication }
 }
 
-export async function getDailyScannerPublication<K extends keyof DailyScannerPages>(kind: K, snapshotId?: string, interval: StrategyInterval = '1d'): Promise<DailyScannerPages[K]> {
+export async function getDailyScannerPublication<K extends keyof DailyScannerPages>(kind: K, snapshotId?: string, interval: StrategyInterval = '1d', sessionDate?: string): Promise<DailyScannerPages[K]> {
   if (import.meta.env.VITE_REALTIME_ONLY === 'true') {
     try {
-      const response = await api.get('/strategies/daily', { params: tickerParams({ strategy: kind, read_mode: 'retained', ...(interval === '1h' ? { interval } : {}) }, snapshotId) })
+      const response = await api.get('/strategies/daily', { params: tickerParams({ strategy: kind, read_mode: 'retained',
+        ...(sessionDate !== undefined ? { session_date: sessionDate } : {}), ...(interval === '1h' ? { interval } : {}) }, snapshotId) })
       const result = response.data as DailyScannerPages[K]
-      const publication = checkedDailyStrategyPublication(result.publication, snapshotId, interval)
+      const publication = checkedDailyStrategyPublication(result.publication, snapshotId, interval, sessionDate)
       const scanners = [result.data, ...('fvgData' in result ? [result.fvgData] : [])]
       for (const scanner of scanners) {
         requireMatchingPublication(scanner.publication, publication)
@@ -1362,12 +1404,13 @@ export interface DailyStrategyEvaluations {
   evidence_refs: Record<string, Record<string, { cohort_id: string; evidence_id: string; evidence_type: 'SCANNER_RESULT'; market_time: string; payload_sha256: string }>>
 }
 
-export async function getDailyStrategyEvaluations(snapshotId?: string, interval: StrategyInterval = '1d'): Promise<DailyStrategyEvaluations> {
+export async function getDailyStrategyEvaluations(snapshotId?: string, interval: StrategyInterval = '1d', sessionDate?: string): Promise<DailyStrategyEvaluations> {
   if (import.meta.env.VITE_REALTIME_ONLY !== 'true') throw new Error('Stored daily evaluations require realtime-only mode')
   try {
-    const response = await api.get('/strategies/daily', { params: tickerParams({ view: 'evaluations', read_mode: 'retained', ...(interval === '1h' ? { interval } : {}) }, snapshotId) })
+    const response = await api.get('/strategies/daily', { params: tickerParams({ view: 'evaluations', read_mode: 'retained',
+      ...(sessionDate !== undefined ? { session_date: sessionDate } : {}), ...(interval === '1h' ? { interval } : {}) }, snapshotId) })
     const result = response.data as DailyStrategyEvaluations
-    const publication = checkedDailyStrategyPublication(result.publication, snapshotId, interval)
+    const publication = checkedDailyStrategyPublication(result.publication, snapshotId, interval, sessionDate)
     const dailyContracts: DailyScannerContract[] = ['SCAN_GAPS_1D', 'SCAN_FVG_1D_50', 'SCAN_MA_1D_9_21',
       'SCAN_MOMENTUM_1D', 'SCAN_BEARISH_1D', 'SCAN_FIBONACCI_1D_5']
     const contracts = interval === '1d' ? dailyContracts : dailyContracts.map(key => HOURLY_STRATEGY_CONTRACTS[key])
@@ -1380,7 +1423,7 @@ export async function getDailyStrategyEvaluations(snapshotId?: string, interval:
     }
     for (const key of contracts) {
       const scanner = result.scanners[key], coverage = result.analysis[key]
-      if (scanner.interval !== interval || scanner.scan_datetime !== publication.generated_at
+      if (scanner.interval !== interval || scanner.scan_datetime !== (publication.evaluation_generated_at ?? publication.generated_at)
         || scanner.total_scanned !== result.members.length || scanner.total_signals !== scanner.results?.length
         || scanner.results.some(row => !result.members.includes(row.ticker))
         || coverage.members?.length !== result.members.length
@@ -1480,10 +1523,11 @@ export interface StrategyPersistencePublication extends Omit<DailyStrategyEvalua
   persistence: { sessions: string[]; window_unit: 'XNYS_TRADING_SESSIONS'; rows: PersistenceStrategyRow[] } | null
 }
 
-export async function getStrategyPersistence(snapshotId?: string, interval: StrategyInterval = '1d'): Promise<StrategyPersistencePublication> {
-  const response = await api.get('/strategies/daily', { params: tickerParams({ view: 'persistence', read_mode: 'retained', ...(interval === '1h' ? { interval } : {}) }, snapshotId) })
+export async function getStrategyPersistence(snapshotId?: string, interval: StrategyInterval = '1d', sessionDate?: string): Promise<StrategyPersistencePublication> {
+  const response = await api.get('/strategies/daily', { params: tickerParams({ view: 'persistence', read_mode: 'retained',
+    ...(sessionDate !== undefined ? { session_date: sessionDate } : {}), ...(interval === '1h' ? { interval } : {}) }, snapshotId) })
   const result = response.data as StrategyPersistencePublication
-  const publication = checkedDailyStrategyPublication(result.publication, snapshotId, interval)
+  const publication = checkedDailyStrategyPublication(result.publication, snapshotId, interval, sessionDate)
   if (result.evaluation_sessions?.length !== 5 || new Set(result.evaluation_sessions).size !== 5
     || result.evaluation_sessions[result.evaluation_sessions.length - 1] !== publication.session || !result.members?.length
     || new Set(result.members).size !== result.members.length || !result.observed_sessions?.length
@@ -1570,6 +1614,46 @@ export const getTradingSessions = async (interval = '1d', limit = 260): Promise<
   return response.data
 }
 
+export const getStrategyTradingSessions = async (interval = '1d', snapshotId?: string): Promise<TradingSessionsResponse> => {
+  const response = await api.get('/strategies/daily', { params: tickerParams({
+    view: 'sessions', interval, read_mode: 'retained',
+  }, snapshotId) })
+  const result = response.data as TradingSessionsResponse
+  if (result.interval !== interval || !result.sessions?.length || new Set(result.sessions).size !== result.sessions.length
+    || result.sessions.some((session, index) => !/^\d{4}-\d{2}-\d{2}$/.test(session)
+      || index > 0 && session <= result.sessions[index - 1])) {
+    throw new Error('Stored strategy trading sessions do not match the selected interval')
+  }
+  return result
+}
+
+export const getTickerClosingSessions = async (ticker: string): Promise<TradingSessionsResponse> => {
+  const response = await api.get(`/stock/${ticker}/sessions`, { params: tickerParams() })
+  const result = response.data as TradingSessionsResponse & { ticker: string }
+  if (result.ticker !== ticker.toUpperCase() || result.interval !== '1d' || !Array.isArray(result.sessions)
+    || new Set(result.sessions).size !== result.sessions.length
+    || result.sessions.some((session, index) => !/^\d{4}-\d{2}-\d{2}$/.test(session)
+      || index > 0 && session <= result.sessions[index - 1])) {
+    throw new Error('Stored ticker closing sessions do not match the requested ticker')
+  }
+  return result
+}
+
+const getClosingSummarySessions = async (path: string): Promise<TradingSessionsResponse> => {
+  const response = await api.get(path, { params: tickerParams() })
+  const result = response.data as TradingSessionsResponse & { cohort_id: string }
+  if (result.cohort_id !== import.meta.env.VITE_REALTIME_COHORT_ID?.trim() || result.interval !== '1d'
+    || !Array.isArray(result.sessions) || new Set(result.sessions).size !== result.sessions.length
+    || result.sessions.some((session, index) => !/^\d{4}-\d{2}-\d{2}$/.test(session)
+      || index > 0 && session <= result.sessions[index - 1])) {
+    throw new Error('Saved closing sessions do not match the requested cohort')
+  }
+  return result
+}
+
+export const getPatternClosingSessions = () => getClosingSummarySessions('/chart-patterns/sessions')
+export const getAllTickersClosingSessions = () => getClosingSummarySessions('/tickers/sessions')
+
 // Get Chart Data
 export const getChartData = async (
   ticker: string,
@@ -1577,10 +1661,12 @@ export const getChartData = async (
   interval = '1d',
   refresh = false,
   snapshotId?: string,
+  closingView = false,
 ): Promise<ChartDataPoint[]> => {
   const params: Record<string, string | boolean> = { period, interval }
   if (refresh) params.refresh = true
-  const response = await api.get(`/stock/${ticker}/chart`, { params: retainedTickerParams(params, snapshotId) })
+  const response = await api.get(`/stock/${ticker}/chart`, { params: retainedTickerParams(params, snapshotId, closingView) })
+    .catch(error => { throw storedReadError(error) })
   return response.data
 }
 
@@ -1589,10 +1675,12 @@ export const getChartPatterns = async (
   interval = '1d',
   refresh = false,
   snapshotId?: string,
+  closingView = false,
 ): Promise<ChartPatternsResponse> => {
   const params: Record<string, string | boolean> = { interval }
   if (refresh) params.refresh = true
-  const response = await api.get(`/stock/${ticker}/chart-patterns`, { params: retainedTickerParams(params, snapshotId) })
+  const response = await api.get(`/stock/${ticker}/chart-patterns`, { params: retainedTickerParams(params, snapshotId, closingView) })
+    .catch(error => { throw storedReadError(error) })
   return response.data
 }
 
@@ -1601,10 +1689,12 @@ export const getPriceChannel = async (
   interval = '1d',
   refresh = false,
   snapshotId?: string,
+  closingView = false,
 ): Promise<PriceChannelResponse> => {
   const params: Record<string, string | boolean> = { interval }
   if (refresh) params.refresh = true
-  const response = await api.get(`/stock/${ticker}/price-channel`, { params: retainedTickerParams(params, snapshotId) })
+  const response = await api.get(`/stock/${ticker}/price-channel`, { params: retainedTickerParams(params, snapshotId, closingView) })
+    .catch(error => { throw storedReadError(error) })
   return response.data
 }
 
@@ -1612,10 +1702,18 @@ export const scanChartPatterns = async (
   interval = '1d',
   refresh = false,
   snapshotId?: string,
+  closingView = false,
+  sessionDate?: string,
 ): Promise<PatternWatchResponse> => {
   const params: Record<string, string | boolean> = { interval }
   if (refresh) params.refresh = true
-  const response = await api.get('/chart-patterns/scan', { params: retainedTickerParams(params, snapshotId) })
+  if (sessionDate !== undefined) params.session_date = sessionDate
+  const response = await api.get('/chart-patterns/scan', { params: retainedTickerParams(params, snapshotId, closingView) })
+    .catch(error => { throw storedReadError(error) })
+  if (closingView && (!response.data.publication || response.data.publication.read_mode !== 'SESSION_CLOSE'
+    || sessionDate !== undefined && response.data.publication.session !== sessionDate)) {
+    throw new Error('Saved Pattern Watch publication does not match the selected session close')
+  }
   return response.data
 }
 
@@ -1623,26 +1721,28 @@ export const scanTickerChartPatterns = async (
   ticker: string,
   refresh = false,
   snapshotId?: string,
+  closingView = false,
 ): Promise<PatternWatchResponse> => {
   const response = await api.get(`/chart-patterns/ticker/${ticker}`, {
-    params: retainedTickerParams(refresh ? { refresh: true } : undefined, snapshotId),
-  })
+    params: retainedTickerParams(refresh ? { refresh: true } : undefined, snapshotId, closingView),
+  }).catch(error => { throw storedReadError(error) })
   return response.data
 }
 
-export const getLatestQuote = async (ticker: string, refresh = false, snapshotId?: string): Promise<LatestQuote> => {
+export const getLatestQuote = async (ticker: string, refresh = false, snapshotId?: string, closingView = false): Promise<LatestQuote> => {
   const params: Record<string, boolean> = {}
   if (refresh) params.refresh = true
-  const response = await api.get(`/stock/${ticker}/quote`, { params: retainedTickerParams(params, snapshotId) })
+  const response = await api.get(`/stock/${ticker}/quote`, { params: retainedTickerParams(params, snapshotId, closingView) })
   return response.data
 }
 
 export const getEquitySecurityProfile = async (
   ticker: string,
   snapshotId?: string,
+  closingView = false,
 ): Promise<EquitySecurityProfileResponse> => {
   const response = await api.get(`/equity/security/${ticker}`, {
-    params: retainedTickerParams({ report_limit: 12 }, snapshotId),
+    params: retainedTickerParams({ report_limit: 12 }, snapshotId, closingView),
   })
   return response.data
 }
@@ -1947,9 +2047,9 @@ export interface MultiTradeSetupResponse {
   as_of: string
 }
 
-export const getMultiTradeSetup = async (ticker: string, refresh = false, snapshotId?: string): Promise<MultiTradeSetupResponse> => {
+export const getMultiTradeSetup = async (ticker: string, refresh = false, snapshotId?: string, closingView = false): Promise<MultiTradeSetupResponse> => {
   const params = refresh ? { refresh: true } : undefined
-  const response = await api.get(`/stock/${ticker}/trade-setup/multi`, { params: retainedTickerParams(params, snapshotId) })
+  const response = await api.get(`/stock/${ticker}/trade-setup/multi`, { params: retainedTickerParams(params, snapshotId, closingView) })
   return response.data
 }
 
@@ -2862,9 +2962,10 @@ export const getOptionEventCalendar = async (
   underlyer: string,
   daysForward = 30,
   snapshotId?: string,
+  closingView = false,
 ): Promise<OptionsEnvelope<OptionTickerCalendarData>> => {
   const response = await api.get(`/options/calendar/${underlyer}`, {
-    params: retainedTickerParams({ days_forward: daysForward }, snapshotId),
+    params: retainedTickerParams({ days_forward: daysForward }, snapshotId, closingView),
   })
   return response.data
 }

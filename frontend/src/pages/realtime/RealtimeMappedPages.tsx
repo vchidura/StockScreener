@@ -6,10 +6,9 @@ import {
   getRealtimeEquityValidationStatus,
   getRealtimeHealth,
   getRealtimeOptionAlerts,
-  type RealtimeCanaryStatus,
+  type RealtimeValidationStatus,
   type RealtimeHealth,
-} from '../../services/realtimeCanary'
-import '../RealtimeCanaryPage.css'
+} from '../../services/realtime'
 import '../StockDiscoveryPage.css'
 import '../StockAlertsPage.css'
 import '../StockScreeningPage.css'
@@ -39,14 +38,14 @@ function useRealtimeBoundary() {
 }
 
 function State({ ready, children }: { ready: boolean; children: string }) {
-  return <span className={`rc-state ${ready ? 'is-ready' : 'is-blocked'}`}>
+  return <span className={`rt-state ${ready ? 'is-ready' : 'is-blocked'}`}>
     {ready ? <Check size={14} aria-hidden="true" /> : <CircleX size={14} aria-hidden="true" />}
     {children}
   </span>
 }
 
-function Isolation({ health, status }: { health?: RealtimeHealth; status?: RealtimeCanaryStatus }) {
-  return <section className="rc-isolation" aria-label="Database isolation">
+function Isolation({ health, status }: { health?: RealtimeHealth; status?: RealtimeValidationStatus }) {
+  return <section className="rt-isolation" aria-label="Database isolation">
     <Database size={17} aria-hidden="true" />
     <div><span>Database</span><strong>{health?.database_target ?? 'Unavailable'}</strong></div>
     <State ready={health?.canonical_fallback === false}>{health?.canonical_fallback ? 'Canonical fallback detected' : 'No canonical fallback'}</State>
@@ -66,7 +65,7 @@ function Failure({ retry }: { retry: () => void }) {
 
 function Boundary({ boundary, children }: {
   boundary: ReturnType<typeof useRealtimeBoundary>
-  children: (health: RealtimeHealth, status: RealtimeCanaryStatus) => React.ReactNode
+  children: (health: RealtimeHealth, status: RealtimeValidationStatus) => React.ReactNode
 }) {
   if (boundary.health.isPending || boundary.status.isPending) return <Loading />
   if (!boundary.health.data || !boundary.status.data || boundary.health.isError || boundary.status.isError) {

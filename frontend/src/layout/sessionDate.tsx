@@ -1,6 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { getTradingSessions } from '../services/api'
+import { useLocation, useSearchParams } from 'react-router-dom'
+import { getAllTickersClosingSessions, getPatternClosingSessions, getStrategyTradingSessions, getTickerClosingSessions, getTradingSessions } from '../services/api'
+import { isDailyStrategyPath } from '../pages/publicationNavigation'
+import { activeTickerSymbol } from './navigation'
 
 type SessionDateStore = {
   /** Empty while the newest session is selected, so callers keep published-snapshot semantics. */
@@ -13,6 +16,13 @@ type SessionDateStore = {
   canStepForward: boolean
   step: (delta: number) => void
   reset: () => void
+  choose: (session: string) => void
+  isStrategy: boolean
+  isTicker: boolean
+  isPattern: boolean
+  isAllTickers: boolean
+  error: string | null
+  loading: boolean
   /** Interval whose sessions are listed; today only appears once that interval has bars. */
   interval: string
   requestInterval: (interval: string) => void
@@ -24,12 +34,29 @@ type SessionDateStore = {
 const SessionDateContext = createContext<SessionDateStore | null>(null)
 
 export function SessionDateProvider({ children, enabled = true }: { children: ReactNode; enabled?: boolean }) {
-  const [pinned, setPinned] = useState('')
+  const [localPinned, setPinned] = useState('')
   const [interval, setInterval] = useState('1d')
+  const location = useLocation()
+  const [params, setParams] = useSearchParams()
+  const isStrategy = import.meta.env.VITE_REALTIME_ONLY === 'true' && isDailyStrategyPath(location.pathname)
+  const ticker = import.meta.env.VITE_REALTIME_ONLY === 'true' ? activeTickerSymbol(location.pathname) : null
+  const isTicker = ticker !== null
+  const isPattern = import.meta.env.VITE_REALTIME_ONLY === 'true' && location.pathname === '/pattern-watch'
+  const isAllTickers = import.meta.env.VITE_REALTIME_ONLY === 'true' && location.pathname === '/overview'
+  const persistedSelection = isStrategy || isTicker || isPattern || isAllTickers
+  const research = location.pathname.startsWith('/strategy-research/')
+  const sessionKey = research ? 'evaluation_session' : 'session_date'
+  const pinned = persistedSelection ? params.get(sessionKey) ?? '' : localPinned
+  const selectedInterval = isTicker || isPattern || isAllTickers ? '1d' : isStrategy ? params.get('interval') ?? '1d' : interval
+  const researchPin = isStrategy && research ? params.get('snapshot_id') ?? undefined : undefined
 
-  const { data } = useQuery({
-    queryKey: ['market', 'trading-sessions', interval],
-    queryFn: () => getTradingSessions(interval),
+  const { data, error, isFetching } = useQuery({
+    queryKey: ['market', isTicker ? 'ticker-closing-sessions' : isPattern ? 'pattern-closing-sessions'
+      : isAllTickers ? 'all-tickers-closing-sessions' : isStrategy ? 'strategy-sessions' : 'trading-sessions',
+      selectedInterval, ...(ticker ? [ticker] : []), ...(researchPin ? [researchPin] : [])],
+    queryFn: () => ticker ? getTickerClosingSessions(ticker) : isPattern ? getPatternClosingSessions()
+      : isAllTickers ? getAllTickersClosingSessions()
+      : isStrategy ? getStrategyTradingSessions(selectedInterval, researchPin) : getTradingSessions(selectedInterval),
     staleTime: 60 * 1000,
     enabled,
   })
@@ -38,30 +65,41 @@ export function SessionDateProvider({ children, enabled = true }: { children: Re
 
   // Switching interval can strand the pinned session: today exists for 5m but not yet for 1d.
   useEffect(() => {
-    if (!pinned || !sessions.length) return
+    if (persistedSelection || !pinned || !sessions.length) return
     const newest = sessions[sessions.length - 1]
     // At or past the newest available session there is nothing historical to pin.
     if (pinned >= newest) { setPinned(''); return }
     if (sessions.includes(pinned)) return
     const fallback = [...sessions].reverse().find(s => s < pinned)
     setPinned(fallback ?? '')
-  }, [pinned, sessions])
+  }, [pinned, sessions, persistedSelection])
 
   const latest = sessions.length ? sessions[sessions.length - 1] : ''
   const date = pinned || latest
 
-  const step = useCallback((delta: number) => {
-    setPinned(current => {
-      if (!sessions.length) return current
-      const from = current ? sessions.indexOf(current) : sessions.length - 1
-      if (from < 0) return current
-      const next = Math.min(Math.max(from + delta, 0), sessions.length - 1)
-      // Landing on the newest session unpins, restoring the live snapshot view.
-      return next === sessions.length - 1 ? '' : sessions[next]
+  const choose = useCallback((session: string) => {
+    const historical = session === latest ? '' : session
+    if (!persistedSelection) { setPinned(historical); return }
+    setParams(previous => {
+      const next = new URLSearchParams(previous)
+      if (historical) next.set(sessionKey, historical)
+      else next.delete(sessionKey)
+      if (!research) {
+        next.delete('snapshot_id')
+        next.delete('evaluation_session')
+      }
+      next.delete('page')
+      return next
     })
-  }, [sessions])
+  }, [persistedSelection, latest, research, sessionKey, setParams])
 
-  const reset = useCallback(() => setPinned(''), [])
+  const step = useCallback((delta: number) => {
+    const from = pinned ? sessions.indexOf(pinned) : sessions.length - 1
+    if (from < 0) return
+    const next = Math.min(Math.max(from + delta, 0), sessions.length - 1)
+    choose(sessions[next])
+  }, [pinned, sessions, choose])
+  const reset = useCallback(() => choose(latest), [choose, latest])
   const requestInterval = useCallback((next: string) => setInterval(next), [])
 
   const index = date ? sessions.indexOf(date) : -1
@@ -74,11 +112,18 @@ export function SessionDateProvider({ children, enabled = true }: { children: Re
     canStepForward: index >= 0 && index < sessions.length - 1,
     step,
     reset,
-    interval,
+    choose,
+    isStrategy,
+    isTicker,
+    isPattern,
+    isAllTickers,
+    error: persistedSelection ? error?.message ?? null : null,
+    loading: !!isFetching,
+    interval: selectedInterval,
     requestInterval,
     dataAsOf: data?.data_as_of ?? null,
     dataInterval: data?.data_interval ?? null,
-  }), [pinned, date, sessions, index, step, reset, interval, requestInterval, data])
+  }), [pinned, date, sessions, index, step, reset, choose, isStrategy, isTicker, isPattern, isAllTickers, persistedSelection, error, isFetching, selectedInterval, requestInterval, data])
 
   return <SessionDateContext.Provider value={value}>{children}</SessionDateContext.Provider>
 }

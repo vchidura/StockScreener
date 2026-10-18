@@ -2,7 +2,9 @@ import { Component, type ErrorInfo, type ReactNode } from 'react'
 import { AlertTriangle, RotateCcw } from 'lucide-react'
 import { useLocation } from 'react-router-dom'
 
-class PortalRenderBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+type BoundaryProps = { children: ReactNode; resetKey: string }
+
+class PortalRenderBoundary extends Component<BoundaryProps, { failed: boolean }> {
   state = { failed: false }
 
   static getDerivedStateFromError() {
@@ -11,6 +13,12 @@ class PortalRenderBoundary extends Component<{ children: ReactNode }, { failed: 
 
   componentDidCatch(error: Error, info: ErrorInfo) {
     console.error('Portal view render failed', error, info)
+  }
+
+  componentDidUpdate(previous: BoundaryProps, previousState: { failed: boolean }) {
+    if (this.state.failed && previousState.failed && previous.resetKey !== this.props.resetKey) {
+      this.setState({ failed: false })
+    }
   }
 
   render() {
@@ -33,8 +41,9 @@ class PortalRenderBoundary extends Component<{ children: ReactNode }, { failed: 
 
 export function PortalViewBoundary({ children }: { children: ReactNode }) {
   const location = useLocation()
+  const resetKey = `${location.pathname}${location.search}`
   return (
-    <PortalRenderBoundary key={`${location.pathname}${location.search}`}>
+    <PortalRenderBoundary key={location.pathname.startsWith('/ticker/') ? location.pathname : resetKey} resetKey={resetKey}>
       {children}
     </PortalRenderBoundary>
   )

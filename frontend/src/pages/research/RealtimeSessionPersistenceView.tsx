@@ -63,7 +63,7 @@ export default function RealtimeSessionPersistenceView() {
   if (pending.current.rendered !== params.toString()) pending.current = { rendered: params.toString(), pending: params }
   const { interval, setInterval } = useStrategyInterval(pending)
   const strategies = persistenceStrategies(interval).map(item => item.contract.startsWith('SCAN_MA_') ? { ...item, label: 'MA crossover / recent' } : item)
-  const query = usePublicationQuery('daily-session-persistence', pin => getStrategyPersistence(pin, interval))
+  const query = usePublicationQuery('daily-session-persistence', (pin, session) => getStrategyPersistence(pin, interval, session))
   const update = (key: string, value: string) => {
     const next = new URLSearchParams(pending.current.pending)
     if (value) next.set(key, value)
@@ -148,7 +148,7 @@ export default function RealtimeSessionPersistenceView() {
             return <Fragment key={key}>
               {heading && (index === 0 || heading !== groupLabel(visible[index - 1])) && <tr><td className="pv-group" colSpan={11}>{heading}</td></tr>}
               <tr><td><button type="button" className="pv-expand" aria-label={`Session details for ${row.ticker} ${strategyLabel(row)}`} aria-expanded={open} onClick={() => setExpanded(open ? null : key)}>{open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</button>
-                <Link className="pv-ticker" to={publicationPath(`/strategy-research/${row.ticker}`, data.publication.snapshot_id, data.publication.cohort_id, interval)}>{row.ticker}</Link></td>
+                <Link className="pv-ticker" to={publicationPath(`/strategy-research/${row.ticker}`, data.publication.snapshot_id, data.publication.cohort_id, interval, data.publication.evaluation_session)}>{row.ticker}</Link></td>
                 <td><div className="pv-axis"><strong>{strategyLabel(row)}</strong><small>{nativeAxes.direction}</small></div></td><td><strong className="pv-matched">{row.matched}/{row.evaluated}</strong><span className="pv-dots" aria-label="Session evaluation states">
                   {row.sessions.map(cell => <i key={cell.session} className={`pv-cell-${cell.state.toLowerCase()}`} title={`${cell.session}: ${label(cell.state)}${cell.reason ? ` | ${cell.reason}` : ''}`} />)}</span></td>
                 <td>{row.coverage}</td>

@@ -2,11 +2,12 @@ import { useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink, RefreshCw, Search, X } from 'lucide-react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
-import { CrossFramePatternSummary, FormingChartPattern, PriceChannel, getTickers, scanChartPatterns, scanTickerChartPatterns } from '../services/api'
+import { CrossFramePatternSummary, FormingChartPattern, PriceChannel, getTickerWorkspacePublication, getTickers, scanChartPatterns, scanTickerChartPatterns } from '../services/api'
 import { formingPatternRead } from '../utils/formingPatterns'
 import { usePublishPageContext } from '../layout/pageContext'
 import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
 import { patternTickerPath } from './patternWatchNavigation'
+import { useSessionDate } from '../layout/sessionDate'
 
 /** Secondary geometry detail starts hidden so the 15-column table fits a laptop screen. */
 const PATTERN_COLUMNS: ColumnSpec[] = [
@@ -37,13 +38,13 @@ const colors = {
 }
 
 const intervalLabels: Record<string, string> = {
-  all: 'All intervals',
-  '5m': '5 minutes · ticker only', '15m': '15 minutes',
+  all: 'All supported intervals',
   '30m': '30 minutes', '1h': 'Hourly', '1d': 'Daily', '1wk': 'Weekly',
   '1mo': 'Monthly',
 }
 
-const tickerOnlyIntervals = new Set(['all', '5m'])
+const tickerOnlyIntervals = new Set(['all'])
+const supportsPatternInterval = (value: string) => value !== 'all' && value in intervalLabels
 
 const patternLabels: Record<FormingChartPattern['type'], string> = {
   ASCENDING_TRIANGLE: 'Ascending triangle',
@@ -122,15 +123,20 @@ const crossFrameRead = (summary: CrossFramePatternSummary | null | undefined) =>
 export default function PatternWatch() {
   const navigate = useNavigate()
   const [urlParams] = useSearchParams()
+  const realtimeOnly = import.meta.env.VITE_REALTIME_ONLY === 'true'
+  const { date: sessionDate, loading: sessionLoading, error: sessionError } = useSessionDate()
+  const awaitingSession = realtimeOnly && !sessionDate
   const queryClient = useQueryClient()
   const linkedTicker = /^[A-Z][A-Z0-9.\-]{0,9}$/.test((urlParams.get('ticker') || '').toUpperCase())
     ? (urlParams.get('ticker') || '').toUpperCase()
     : ''
   const requestedInterval = urlParams.get('interval') || '1d'
   const [interval, setInterval] = useState(
-    requestedInterval in intervalLabels && (requestedInterval !== 'all' || linkedTicker)
+    (requestedInterval === '5m' || requestedInterval === '15m')
+      || requestedInterval in intervalLabels && (requestedInterval !== 'all' || linkedTicker)
       ? requestedInterval : '1d',
   )
+  const retiredInterval = interval === '5m' || interval === '15m'
   const [patternType, setPatternType] = useState('all')
   const [readinessFilter, setReadinessFilter] = useState('all')
   const [channelFilter, setChannelFilter] = useState('all')
@@ -148,23 +154,30 @@ export default function PatternWatch() {
   const selectedTicker = tickerOnly ? exactTicker : ''
   const awaitingTicker = tickerOnly && !selectedTicker
 
-  const queryKey = ['chart-patterns', 'scan', interval, selectedTicker]
+  const loadPatterns = async (refresh = false) => {
+    if (tickerOnly) {
+      if (!realtimeOnly) return scanTickerChartPatterns(selectedTicker, refresh)
+      const { publication } = await getTickerWorkspacePublication(selectedTicker, undefined, sessionDate, true)
+      return scanTickerChartPatterns(selectedTicker, refresh, publication.snapshot_id, true)
+    }
+    return realtimeOnly ? scanChartPatterns(interval, refresh, undefined, true, sessionDate) : scanChartPatterns(interval, refresh)
+  }
+  const queryKey = ['chart-patterns', 'scan', interval, selectedTicker, ...(realtimeOnly ? ['session_close', sessionDate] : [])]
   const patterns = useQuery({
     queryKey,
-    queryFn: () => tickerOnly
-      ? scanTickerChartPatterns(selectedTicker)
-      : scanChartPatterns(interval),
-    enabled: !awaitingTicker,
+    queryFn: () => loadPatterns(),
+    enabled: !awaitingTicker && !awaitingSession && !retiredInterval,
     staleTime: interval === '1d' || interval === '1wk' || interval === '1mo' ? 300_000 : 60_000,
   })
 
   const sectors = useMemo(() => (
     [...new Set((patterns.data?.results ?? [])
-      .filter(row => interval !== '5m' || row.interval === '5m')
+      .filter(row => supportsPatternInterval(row.interval))
       .map(row => row.sector).filter((value): value is string => !!value))]
       .sort((a, b) => a.localeCompare(b))
   ), [interval, patterns.data])
-  const rows = (patterns.data?.results ?? []).filter(row => {
+  const rows = (retiredInterval ? [] : patterns.data?.results ?? []).filter(row => {
+    if (!supportsPatternInterval(row.interval)) return false
     const term = search.trim().toUpperCase()
     const channel = row.channel ?? null
     const context = channelView(row.pattern, channel)
@@ -193,16 +206,15 @@ export default function PatternWatch() {
     status: [
       { label: 'Interval', value: intervalLabels[interval] ?? interval },
     ],
+    session: realtimeOnly ? '1d' : undefined,
   })
 
   const refresh = async () => {
-    if (awaitingTicker) return
+    if (awaitingTicker || awaitingSession || retiredInterval) return
     queryClient.removeQueries({ queryKey, exact: true })
     await queryClient.fetchQuery({
       queryKey,
-      queryFn: () => tickerOnly
-        ? scanTickerChartPatterns(selectedTicker, true)
-        : scanChartPatterns(interval, true),
+      queryFn: () => loadPatterns(true),
     })
   }
   const patternUrl = (ticker: string, pattern: FormingChartPattern, rowInterval: string, channel: PriceChannel | null) => {
@@ -211,6 +223,10 @@ export default function PatternWatch() {
     if (publication && !workspace) throw new Error('Pattern Watch member workspace is missing from the publication')
     const query = new URLSearchParams(urlParams)
     if (publication) query.set('cohort_id', publication.cohort_id)
+    if (realtimeOnly && sessionDate) {
+      query.set('session_date', sessionDate)
+      query.delete('snapshot_id')
+    }
     return patternTickerPath({
       ticker, interval: rowInterval, patternType: pattern.type, hasChannel: channel !== null,
       snapshotId: workspace?.snapshot_id,
@@ -246,6 +262,7 @@ export default function PatternWatch() {
             )}
           </div>
           <select aria-label="Pattern interval" value={interval} onChange={event => { setInterval(event.target.value); setPatternType('all'); setReadinessFilter('all'); setChannelFilter('all'); setSector('all') }} style={control}>
+            {retiredInterval && <option value={interval}>{interval} patterns retired</option>}
             {Object.entries(intervalLabels).map(([value, label]) => (
               <option key={value} value={value} disabled={tickerOnlyIntervals.has(value) && !exactTicker}>
                 {label}{tickerOnlyIntervals.has(value) && !exactTicker ? ' · enter ticker first' : ''}
@@ -278,12 +295,12 @@ export default function PatternWatch() {
             {sectors.map(value => <option key={value} value={value}>{value}</option>)}
             <option value="unclassified">Unclassified / ETF</option>
           </select>
-          <button type="button" onClick={refresh} disabled={patterns.isFetching || awaitingTicker} title="Refresh forming patterns" style={{ ...control, display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer', color: colors.blue }}>
+          <button type="button" onClick={refresh} disabled={patterns.isFetching || awaitingTicker || awaitingSession || retiredInterval} title="Refresh forming patterns" style={{ ...control, display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer', color: colors.blue }}>
             <RefreshCw size={14} aria-hidden="true" />
-            {patterns.isFetching ? 'Measuring…' : 'Refresh'}
+            {patterns.isFetching ? realtimeOnly ? 'Reading…' : 'Measuring…' : 'Refresh'}
           </button>
           <span style={{ marginLeft: 'auto', color: colors.muted, fontSize: 11.5, whiteSpace: 'nowrap' }}>
-            {patterns.data
+            {retiredInterval ? 'Short-interval patterns retired' : patterns.data
               ? `${rows.length} candidates · ${visibleTickers} tickers shown · ${patterns.data.matched_tickers}/${patterns.data.scanned} matched`
               : awaitingTicker ? 'Enter an exact active ticker' : 'Loading universe…'}
           </span>
@@ -314,10 +331,14 @@ export default function PatternWatch() {
               </tr>
             </thead>
             <tbody>
-              {awaitingTicker && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>Enter an exact active ticker for five-minute or cross-frame pattern research.</td></tr>}
-              {!awaitingTicker && patterns.isLoading && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>Measuring the active universe…</td></tr>}
-              {patterns.isError && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.red }}>Pattern Watch could not be loaded.</td></tr>}
-              {!awaitingTicker && !patterns.isLoading && !patterns.isError && rows.length === 0 && (
+              {retiredInterval && <tr><td role="alert" colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.red }}>5m and 15m pattern research is retired. Select 30m, hourly, daily, weekly or monthly.</td></tr>}
+              {awaitingTicker && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>Enter an exact active ticker for cross-frame pattern research.</td></tr>}
+              {!awaitingTicker && awaitingSession && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>
+                {sessionLoading ? 'Reading saved closing sessions…' : sessionError ?? 'No saved Pattern Watch closing publications are available.'}
+              </td></tr>}
+              {!awaitingTicker && !awaitingSession && patterns.isLoading && <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>{realtimeOnly ? 'Reading saved closing-session patterns…' : 'Measuring the active universe…'}</td></tr>}
+              {patterns.isError && <tr><td role="alert" colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.red }}>Pattern Watch could not be loaded. {patterns.error.message}</td></tr>}
+              {!retiredInterval && !awaitingTicker && !awaitingSession && !patterns.isLoading && !patterns.isError && rows.length === 0 && (
                 <tr><td colSpan={columns.visibleColumns.length} style={{ padding: 18, color: colors.muted }}>No forming candidates match this interval and filter set.</td></tr>
               )}
               {rows.map(row => {

@@ -5,7 +5,7 @@ import { Settings } from 'lucide-react'
 import { usePublishPageContext } from '../layout/pageContext'
 import { useSessionDate } from '../layout/sessionDate'
 import '../layout/pageChrome.css'
-import { usePublicationQuery } from './publicationNavigation'
+import { publicationPath, usePublicationQuery } from './publicationNavigation'
 import { NO_TREND_ADX, momentumTitle, trendLabel, trendTitle } from './setupPresentation'
 import {
   getTickersOverview, TickerOverviewRow,
@@ -56,7 +56,8 @@ function TickersOverview() {
   const [hiddenCols, setHiddenCols] = useState<Set<string>>(() => new Set(DEFAULT_HIDDEN_COLUMNS))
   const [showColPicker, setShowColPicker] = useState(false)
 
-  const realtimeQuery = usePublicationQuery('all-tickers', getAllTickersPublication)
+  const realtimeQuery = usePublicationQuery('all-tickers', (pin, session) => getAllTickersPublication(pin, session, true))
+  const publication = realtimeQuery.data?.publication
   const overviewQuery = useQuery<TickerOverviewRow[]>({
     queryKey: ['tickers', 'overview', scanDate],
     queryFn: () => getTickersOverview(scanDate || undefined),
@@ -757,7 +758,9 @@ function TickersOverview() {
                       }}>
                         {col.key === 'ticker' ? <Link
                           className="ticker-publication-link"
-                          to={`/ticker/${row.ticker}`}
+                          to={realtimeOnly && publication
+                            ? publicationPath(`/ticker/${row.ticker}`, undefined, publication.cohort_id, undefined, publication.session)
+                            : `/ticker/${row.ticker}`}
                           aria-label={`Open ${row.ticker} ticker workspace`}
                           title={evidenceRefs?.[row.ticker] ? `Daily evidence ${evidenceRefs[row.ticker].evidence_id}` : undefined}
                         >{content}</Link> : content}
