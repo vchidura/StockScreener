@@ -307,6 +307,10 @@ def materialize_realtime_option_package_mark(
             return _unavailable(f"PACKAGE_LEG_QUOTE_UNUSABLE:{leg.contract_id}")
         if not package.entry_market_time <= quote.event_at <= quote.received_at <= checked:
             return _unavailable(f"PACKAGE_LEG_QUOTE_CLOCK_INVALID:{leg.contract_id}")
+        if (
+            checked - quote.received_at
+        ).total_seconds() > policy.maximum_source_age_seconds:
+            return _unavailable(f"PACKAGE_LEG_QUOTE_STALE:{leg.contract_id}")
         generations.add(quote.journal_generation)
         stream_sessions.add(quote.stream_session_id)
         midpoint = (quote.bid + quote.ask) / Decimal(2)

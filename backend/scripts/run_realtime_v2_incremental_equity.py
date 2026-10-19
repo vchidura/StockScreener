@@ -8,7 +8,9 @@ import os
 import signal
 import sys
 import time
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from uuid import UUID, uuid5, NAMESPACE_URL
 
@@ -20,7 +22,15 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from options.data.polygon_http import RequestsPolygonHttpTransport  # noqa: E402
-from realtime.acquisition_ledger import ProviderRequestLane  # noqa: E402
+from equity.domain import BarSourceKind  # noqa: E402
+from realtime.acquisition_ledger import (  # noqa: E402
+    AcquisitionWatermark,
+    ProviderRequestLane,
+    advance_acquisition_watermark_cursor,
+)
+from realtime.advanced_ingress_repository import (  # noqa: E402
+    reserve_advanced_incremental_request_cursor,
+)
 from realtime.contracts import UniverseManifest  # noqa: E402
 from realtime.database_access import RealtimeDatabaseRole  # noqa: E402
 from realtime.database_access_v2 import (  # noqa: E402
@@ -32,6 +42,10 @@ from realtime.equity_bar_drain import drain_equity_bar_jobs  # noqa: E402
 from realtime.equity_interval_derivation_worker import (  # noqa: E402
     enqueue_interval_derivation_jobs_cursor,
     run_interval_derivation_worker_once,
+)
+from realtime.equity_bar_adapter import RealtimeEquityBarFact  # noqa: E402
+from realtime.equity_bar_repository import (  # noqa: E402
+    persist_realtime_equity_bars_cursor,
 )
 from realtime.equity_portal_projection_worker import (  # noqa: E402
     enqueue_portal_projection_job_cursor,
@@ -56,6 +70,7 @@ from realtime.migrations import (  # noqa: E402
     SECURITY_MODE_HARDENED,
     validate_target_database_v2,
 )
+from realtime.preflight import ProviderTier  # noqa: E402
 from realtime.provider_budget import ProviderBudgetScope  # noqa: E402
 from realtime.stage_database_v2 import V2WorkerDatabase  # noqa: E402
 from realtime.stage_runners_ingest import (  # noqa: E402
@@ -66,19 +81,26 @@ from scripts.realtime_script_support import PacedPolygonTransport, write_report 
 from scripts.run_realtime_v2_developer_window import _load_scope  # noqa: E402
 
 
+DEVELOPER_PROVIDER_DELAY_SECONDS = 900
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
     parser.add_argument("--confirm-database-name", required=True)
     parser.add_argument("--cohort-id", type=UUID, required=True)
+    parser.add_argument("--advanced-ingress-plan-id", type=UUID)
     parser.add_argument("--session-date", type=date.fromisoformat, required=True)
+    parser.add_argument("--cutoff", type=datetime.fromisoformat)
     parser.add_argument(
         "--interval",
         action="append",
         choices=("1m", "5m"),
         dest="intervals",
     )
-    parser.add_argument("--provider-delay-seconds", type=int, default=900)
+    parser.add_argument("--provider-delay-seconds", type=int)
+    parser.add_argument("--rest-endpoint-class")
+    parser.add_argument("--eligibility-policy-version")
     parser.add_argument("--response-byte-limit", type=int, required=True)
     parser.add_argument("--account-request-ceiling", type=int, required=True)
     parser.add_argument("--account-decoded-byte-ceiling", type=int, required=True)
@@ -106,8 +128,16 @@ def parse_args(argv=None):
     if args.authorized_until.tzinfo is None or args.authorized_until.utcoffset() is None:
         parser.error("--authorized-until must be timezone-aware")
     args.authorized_until = args.authorized_until.astimezone(timezone.utc)
+    if args.cutoff is not None:
+        if args.cutoff.tzinfo is None or args.cutoff.utcoffset() is None:
+            parser.error("--cutoff must be timezone-aware")
+        args.cutoff = args.cutoff.astimezone(timezone.utc)
+    advanced = args.advanced_ingress_plan_id is not None
+    if not advanced and args.provider_delay_seconds is None:
+        args.provider_delay_seconds = DEVELOPER_PROVIDER_DELAY_SECONDS
     if (
-        args.provider_delay_seconds < 0
+        args.provider_delay_seconds is None
+        or args.provider_delay_seconds < 0
         or args.response_byte_limit < 1_024
         or args.account_request_ceiling <= 0
         or args.account_decoded_byte_ceiling <= 0
@@ -129,6 +159,26 @@ def parse_args(argv=None):
         args.report_path = args.report_path.resolve()
         if args.report_path.exists():
             parser.error("--report-path must be new")
+    if advanced:
+        if (
+            args.intervals != ("1m",)
+            or args.cutoff is None
+            or not args.once
+            or not args.execute_shadow
+            or not (args.rest_endpoint_class or "").strip()
+            or not (args.eligibility_policy_version or "").strip()
+        ):
+            parser.error(
+                "Advanced incremental repair requires an explicit fixed-cutoff "
+                "1m eligibility policy and --once execution"
+            )
+    elif (
+        args.rest_endpoint_class is not None
+        or args.eligibility_policy_version is not None
+    ):
+        parser.error(
+            "REST eligibility identity is reserved for Advanced repair"
+        )
     return args
 
 
@@ -164,15 +214,26 @@ def _provider(args):
 
 
 def _scope(args):
+    advanced = args.advanced_ingress_plan_id is not None
     return ProviderBudgetScope(
-        account_alias="MASSIVE_DEVELOPER",
+        account_alias=(
+            "MASSIVE_ADVANCED" if advanced else "MASSIVE_DEVELOPER"
+        ),
         session_date=args.session_date,
         authorization_reference=args.authorization_reference,
-        provider_authorization_reference=args.provider_authorization_reference,
+        provider_authorization_reference=(
+            "stocks-advanced"
+            if advanced
+            else args.provider_authorization_reference
+        ),
         expected_cost=args.expected_cost,
         request_ceiling=args.account_request_ceiling,
         decoded_byte_ceiling=args.account_decoded_byte_ceiling,
-        lanes=frozenset({ProviderRequestLane.EQUITY_CURRENT}),
+        lanes=frozenset({
+            ProviderRequestLane.EQUITY_HISTORY
+            if advanced
+            else ProviderRequestLane.EQUITY_CURRENT
+        }),
         authorized_until=args.authorized_until,
     )
 
@@ -186,6 +247,12 @@ def _plan(provider, args, now):
             known_at=now,
             provider_delay=timedelta(seconds=args.provider_delay_seconds),
         )
+        if args.cutoff is not None:
+            if cutoff is None or args.cutoff > cutoff:
+                raise RuntimeError(
+                    "fixed incremental cutoff is not provider eligible"
+                )
+            cutoff = args.cutoff
         if cutoff is None:
             rows.append({"interval": interval, "cutoff": None, "requests": ()})
             continue
@@ -382,6 +449,136 @@ def _execute_cycle(provider, args, transport, budget_scope, now):
     return reports
 
 
+def _execute_advanced_cycle(
+    provider,
+    args,
+    transport,
+    budget_scope,
+    now,
+):
+    reports = []
+    for row in _plan(provider, args, now):
+        requests = row["requests"]
+        if not requests:
+            reports.append({
+                "interval": row["interval"],
+                "cutoff": row["cutoff"].isoformat(),
+                "status": "NO_WORK",
+            })
+            continue
+        source = IncrementalEquitySource(
+            provider,
+            transport,
+            budget_scope,
+            row["identities"],
+            requests,
+            response_byte_limit=args.response_byte_limit,
+            clock=lambda: datetime.now(timezone.utc),
+            reservation_repository=partial(
+                reserve_advanced_incremental_request_cursor,
+                plan_id=args.advanced_ingress_plan_id,
+            ),
+            endpoint_class=args.rest_endpoint_class,
+            eligibility_policy_version=args.eligibility_policy_version,
+        )
+        universe = UniverseManifest(
+            version="v2-advanced-hybrid-repair-v1",
+            equity_tickers=tuple(
+                item.ticker for item in row["identities"]
+            ),
+            option_underlyings=(),
+        )
+        result = source.collect(EquityAcquisitionRequest(
+            args.cohort_id,
+            universe,
+            row["cutoff"],
+        ))
+        facts = []
+        watermarks = []
+        for batch in result.batches:
+            request_id = batch.request_id
+            if request_id is None:
+                raise RuntimeError(
+                    "Advanced incremental batch lacks request identity"
+                )
+            latest = {}
+            for fact in batch.facts:
+                revision = replace(
+                    fact.revision,
+                    source_kind=BarSourceKind.NATIVE_REST,
+                    quality_codes=tuple(dict.fromkeys((
+                        *fact.revision.quality_codes,
+                        "EXPLICIT_ADVANCED_REST_REPAIR_V1",
+                    ))),
+                )
+                facts.append(RealtimeEquityBarFact(
+                    args.cohort_id,
+                    ProviderTier.MASSIVE_ADVANCED,
+                    fact.instrument_id,
+                    revision,
+                ))
+                latest[fact.instrument_id] = max(
+                    latest.get(fact.instrument_id, revision.bar_end),
+                    revision.bar_end,
+                )
+            watermarks.extend(
+                AcquisitionWatermark(
+                    cohort_id=args.cohort_id,
+                    instrument_id=instrument_id,
+                    interval="1m",
+                    source_kind="NATIVE_REST",
+                    last_complete_bar_end=bar_end,
+                    overlap_policy="advanced_hybrid_rest_overlap_v1",
+                    request_id=request_id,
+                )
+                for instrument_id, bar_end in sorted(latest.items())
+            )
+        database = V2WorkerDatabase(
+            provider,
+            RealtimeDatabaseRole.COMPUTE,
+        )
+        with database.transaction() as cursor:
+            for offset in range(0, len(facts), 1_000):
+                persist_realtime_equity_bars_cursor(
+                    cursor,
+                    tuple(facts[offset:offset + 1_000]),
+                )
+            for watermark in watermarks:
+                advance_acquisition_watermark_cursor(cursor, watermark)
+        checked_at = datetime.now(timezone.utc)
+        finalization = finalize_incremental_five_minute_windows(
+            provider,
+            cohort_id=args.cohort_id,
+            session_date=args.session_date,
+            instrument_ids=tuple(
+                item.instrument_id for item in row["identities"]
+            ),
+            through=row["cutoff"],
+            checked_at=checked_at,
+            authorization_reference=args.authorization_reference,
+            plan_deadline=budget_scope.authorized_until,
+            provider_tier="MASSIVE_ADVANCED",
+        )
+        reports.append({
+            "interval": "1m",
+            "cutoff": row["cutoff"].isoformat(),
+            "status": (
+                "COMPLETE"
+                if all(
+                    item["status"]
+                    in {"COMPLETE", "ALREADY_COMPLETE"}
+                    for item in finalization
+                )
+                else "BLOCKED_WINDOWS"
+            ),
+            "requests_planned": len(requests),
+            "provider_requests": result.provider_requests,
+            "facts": len(facts),
+            "finalization": finalization,
+        })
+    return reports
+
+
 def main(argv=None):
     args = parse_args(argv)
     provider, pool = _provider(args)
@@ -424,11 +621,13 @@ def main(argv=None):
         signal.signal(signal.SIGTERM, request_stop)
         cycles = []
         while not stop:
-            cycle = _execute_cycle(
-                provider,
-                args,
-                transport,
-                _scope(args),
+            executor = (
+                _execute_advanced_cycle
+                if args.advanced_ingress_plan_id is not None
+                else _execute_cycle
+            )
+            cycle = executor(
+                provider, args, transport, _scope(args),
                 datetime.now(timezone.utc),
             )
             cycles.append(cycle)
@@ -436,7 +635,11 @@ def main(argv=None):
                 break
             time.sleep(args.poll_seconds)
         report = {
-            "mode": "EXECUTE_SHADOW",
+            "mode": (
+                "EXECUTE_ADVANCED_HYBRID_REPAIR"
+                if args.advanced_ingress_plan_id is not None
+                else "EXECUTE_SHADOW"
+            ),
             "session_date": args.session_date.isoformat(),
             "cycles": cycles,
             "publication_advanced": False,

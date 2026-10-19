@@ -3,6 +3,9 @@ from __future__ import annotations
 import importlib
 import os
 import re
+import subprocess
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -192,6 +195,36 @@ def test_ingress_service_child_has_one_plan_and_no_env_file():
     assert "--ingress-plan-id" in command
     assert "--runtime-path-attempt" in command
     assert "--env-file" not in command
+
+
+def test_ingress_service_can_bootstrap_a_ready_plan_without_resetting_identity():
+    provider = MagicMock()
+    cursor = provider.transaction.return_value.__enter__.return_value.cursor
+    cursor.fetchone.return_value = (str(AUTHORIZATION),)
+
+    assert ingress._active_plan_id(provider, AUTHORIZATION, datetime.now(timezone.utc)) == AUTHORIZATION
+    statement = cursor.execute.call_args.args[0]
+    assert "status IN ('READY','ACTIVE')" in statement
+    assert "authorized_end_at>%s" in statement
+
+
+@pytest.mark.parametrize("needs_kill", [False, True])
+def test_ingress_supervisor_enforces_absolute_deadline_without_a_stop_signal(needs_kill):
+    deadline = datetime(2026, 10, 19, 13, 39, 30, tzinfo=timezone.utc)
+    process = MagicMock()
+    process.poll.return_value = None
+    process.returncode = -9 if needs_kill else 0
+    if needs_kill:
+        process.wait.side_effect = [subprocess.TimeoutExpired("synthetic-child", 30), 0]
+
+    result = ingress._wait_for_child(
+        process, threading.Event(), poll_seconds=1, shutdown_seconds=30,
+        deadline=deadline, utc_clock=lambda: deadline,
+    )
+
+    process.terminate.assert_called_once()
+    assert process.kill.call_count == int(needs_kill)
+    assert result == process.returncode
 
 
 def test_health_publication_fails_closed_on_any_advanced_authority():

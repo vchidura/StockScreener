@@ -1,0 +1,143 @@
+name: stockscreener-options-p6-20261018
+
+x-p6-service: &p6-service
+  image: alpha-research-realtime-v2-backend:latest
+  pull_policy: never
+  init: true
+  restart: "no"
+  working_dir: /app
+  volumes:
+    - ./backend:/app:ro
+    - stockscreener_options_p6_journal:/var/lib/options-p6
+    - stockscreener_options_p6_reports:/var/lib/options-p6-reports
+  networks:
+    - p6
+  environment:
+    PYTHONPATH: /app
+    P6_DURATION_SCALE: ${P6_DURATION_SCALE:-1}
+    P6_STATE_ROOT: /var/lib/options-p6
+    P6_REPORT_ROOT: /var/lib/options-p6-reports
+
+services:
+  p6-replay:
+    <<: *p6-service
+    container_name: stockscreener-options-p6-20261018-replay
+    command:
+      - python
+      - -B
+      - -m
+      - tests.realtime.advanced_options_p6_harness
+      - --component
+      - replay
+    cpus: 1.0
+    mem_limit: 1g
+
+  p6-consumer:
+    <<: *p6-service
+    container_name: stockscreener-options-p6-20261018-consumer
+    command:
+      - python
+      - -B
+      - -m
+      - tests.realtime.advanced_options_p6_harness
+      - --component
+      - consumer
+    depends_on:
+      p6-replay:
+        condition: service_started
+    cpus: 2.0
+    mem_limit: 2g
+
+  p6-orchestrator:
+    <<: *p6-service
+    container_name: stockscreener-options-p6-20261018-orchestrator
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - scheduler
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --
+      - python
+      - -B
+      - -m
+      - tests.realtime.advanced_options_p6_harness
+      - --component
+      - orchestrator
+    depends_on:
+      p6-consumer:
+        condition: service_started
+    secrets:
+      - realtime_v2_app_dsn
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    cpus: 2.0
+    mem_limit: 2g
+
+  p6-reader:
+    <<: *p6-service
+    container_name: stockscreener-options-p6-20261018-reader
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - api
+      - --api-dsn-file
+      - /run/secrets/realtime_v2_api_dsn
+      - --
+      - python
+      - -B
+      - -m
+      - tests.realtime.advanced_options_p6_harness
+      - --component
+      - reader
+    depends_on:
+      p6-orchestrator:
+        condition: service_started
+    secrets:
+      - realtime_v2_api_dsn
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    cpus: 1.0
+    mem_limit: 1g
+
+  p6-metrics:
+    <<: *p6-service
+    container_name: stockscreener-options-p6-20261018-metrics
+    command:
+      - python
+      - -B
+      - -m
+      - tests.realtime.advanced_options_p6_harness
+      - --component
+      - metrics
+    depends_on:
+      p6-replay:
+        condition: service_started
+      p6-consumer:
+        condition: service_started
+      p6-orchestrator:
+        condition: service_started
+      p6-reader:
+        condition: service_started
+    cpus: 0.5
+    mem_limit: 512m
+
+volumes:
+  stockscreener_options_p6_journal:
+    name: stockscreener-options-p6-20261018-journal
+  stockscreener_options_p6_reports:
+    name: stockscreener-options-p6-20261018-reports
+
+secrets:
+  realtime_v2_app_dsn:
+    file: ${P6_SECRET_DIRECTORY:-./backend/.realtime-canary/options-p6-20261018-secrets}/realtime_v2_app_dsn
+  realtime_v2_api_dsn:
+    file: ${P6_SECRET_DIRECTORY:-./backend/.realtime-canary/options-p6-20261018-secrets}/realtime_v2_api_dsn
+
+networks:
+  p6:
+    name: stockscreener-options-p6-20261018-internal

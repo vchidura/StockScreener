@@ -12,13 +12,24 @@ from .advanced_ingress_plan import (
     AdvancedIngressPlanRequest,
     AdvancedIngressUsage,
     AdvancedStreamAuthorization,
+    advanced_ingress_provider_deadline,
+    advanced_ingress_window,
     build_advanced_ingress_plan,
 )
 from .advanced_ingress_runtime_profile import (
     AdvancedIngressRuntimeCatalog,
     AdvancedIngressRuntimeProfile,
 )
+from .acquisition_ledger import (
+    ProviderRequestLane,
+    ProviderRequestReservation,
+)
 from .contracts import canonical_json, canonical_sha256
+from .provider_budget import (
+    ProviderBudgetExceeded,
+    ProviderBudgetScope,
+    reserve_coordinated_provider_request_cursor,
+)
 
 
 class AdvancedIngressAdmissionError(RuntimeError):
@@ -29,6 +40,81 @@ class AdvancedCohortResolutionError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def reserve_advanced_incremental_request_cursor(
+    cursor,
+    scope: ProviderBudgetScope,
+    reservation: ProviderRequestReservation,
+    *,
+    plan_id: UUID,
+    reserved_response_bytes: int,
+):
+    if (
+        scope.account_alias != "MASSIVE_ADVANCED"
+        or scope.lanes != frozenset({ProviderRequestLane.EQUITY_HISTORY})
+        or reservation.lane is not ProviderRequestLane.EQUITY_HISTORY
+    ):
+        raise ValueError("Advanced incremental request scope is invalid")
+    cursor.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+        (f"v2-advanced-ingress-usage:{plan_id}",),
+    )
+    cursor.execute(
+        "SELECT plan.cohort_id,plan.session_date,"
+        "plan.maximum_rest_repair_requests,"
+        "plan.maximum_rest_repair_decoded_bytes,"
+        "plan.authorized_end_at,plan.status,auth.status,"
+        "auth.authorization_reference,usage.rest_repair_request_count,"
+        "usage.rest_repair_decoded_byte_count "
+        "FROM rt.advanced_ingress_plans AS plan "
+        "JOIN rt.advanced_stream_authorizations AS auth "
+        "USING(authorization_id) "
+        "JOIN rt.advanced_ingress_plan_usage AS usage USING(plan_id) "
+        "WHERE plan.plan_id=%s FOR UPDATE OF plan,usage",
+        (str(plan_id),),
+    )
+    row = cursor.fetchone()
+    if (
+        row is None
+        or row[5] not in {"READY", "ACTIVE"}
+        or row[6] != "READY"
+        or str(row[0]) != str(reservation.cohort_id)
+        or row[1] != scope.session_date
+        or row[4] != scope.authorized_until
+        or str(row[7]) != scope.authorization_reference
+        or int(row[2]) != scope.request_ceiling
+        or int(row[3]) != scope.decoded_byte_ceiling
+    ):
+        raise ValueError("Advanced incremental plan binding changed")
+    cursor.execute(
+        "SELECT state FROM rt.provider_request_ledger WHERE request_id=%s",
+        (str(reservation.request_id),),
+    )
+    existing = cursor.fetchone()
+    if existing is None and (
+        int(row[8]) + 1 > int(row[2])
+        or int(row[9]) + reserved_response_bytes > int(row[3])
+    ):
+        raise ProviderBudgetExceeded(
+            "advanced incremental repair budget is exhausted"
+        )
+    admission = reserve_coordinated_provider_request_cursor(
+        cursor,
+        scope,
+        reservation,
+        reserved_response_bytes=reserved_response_bytes,
+    )
+    if admission.newly_reserved:
+        cursor.execute(
+            "UPDATE rt.advanced_ingress_plan_usage SET "
+            "rest_repair_request_count=rest_repair_request_count+1,"
+            "rest_repair_decoded_byte_count="
+            "rest_repair_decoded_byte_count+%s,updated_at=clock_timestamp() "
+            "WHERE plan_id=%s",
+            (reserved_response_bytes, str(plan_id)),
+        )
+    return admission
 
 
 def _sha256(value: str, name: str) -> str:
@@ -66,7 +152,11 @@ def register_advanced_runtime_profile_cursor(
     configuration_sha256 = profile.configuration_sha256(policy_sha256)
     cursor.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
-        (f"v2-advanced-runtime-profile:{profile.universe_target}",),
+        (
+            "v2-advanced-runtime-profile:"
+            f"{profile.feed}:{','.join(profile.channels)}:"
+            f"{profile.universe_target}",
+        ),
     )
     cursor.execute(
         "INSERT INTO rt.advanced_ingress_runtime_profiles ("
@@ -151,7 +241,7 @@ def activate_advanced_runtime_profile_cursor(
         "SELECT runtime_profile_version,universe_target,"
         "configuration_sha256,runtime_policy_sha256,status,"
         "stability_evidence_sha256,capacity_evidence_sha256,"
-        "activation_approval_reference "
+        "activation_approval_reference,feed,channels "
         "FROM rt.advanced_ingress_runtime_profiles "
         "WHERE runtime_profile_sha256=%s FOR UPDATE",
         (profile_sha256,),
@@ -162,7 +252,10 @@ def activate_advanced_runtime_profile_cursor(
     universe_target = int(row[1])
     cursor.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
-        (f"v2-advanced-runtime-profile:{universe_target}",),
+        (
+            "v2-advanced-runtime-profile:"
+            f"{row[8]}:{','.join(row[9])}:{universe_target}",
+        ),
     )
     if row[4] == "ACTIVE":
         if tuple(str(value) for value in row[5:8]) != (
@@ -186,8 +279,9 @@ def activate_advanced_runtime_profile_cursor(
     cursor.execute(
         "UPDATE rt.advanced_ingress_runtime_profiles "
         "SET status='SUPERSEDED',superseded_at=%s "
-        "WHERE universe_target=%s AND status='ACTIVE'",
-        (activated_at, universe_target),
+        "WHERE universe_target=%s AND feed=%s AND channels=%s "
+        "AND status='ACTIVE'",
+        (activated_at, universe_target, row[8], list(row[9])),
     )
     cursor.execute(
         "UPDATE rt.advanced_ingress_runtime_profiles SET status='ACTIVE',"
@@ -310,6 +404,8 @@ def create_advanced_stream_authorization_cursor(
                 )
             if (
                 parent.status != "READY"
+                or parent.feed != authorization.feed
+                or parent.channel != authorization.channel
                 or parent.allowed_universe_targets[0]
                 != promotion_ladder[position - 1]
                 or parent.runtime_policy_sha256
@@ -462,7 +558,20 @@ def resolve_advanced_ingress_plan_cursor(
         from options.calendar import OptionExchangeCalendar
 
         calendar = OptionExchangeCalendar("XNYS")
-    authorized_end_at = calendar.session_close(request.session_date)
+    authorized_start_at, authorized_end_at = advanced_ingress_window(
+        session_date=request.session_date,
+        universe_target=request.universe_target,
+        budgets=request.budgets,
+        canary_start_at=request.canary_start_at,
+        canary_end_at=request.canary_end_at,
+        calendar=calendar,
+    )
+    if request.canary_start_at is not None:
+        advanced_ingress_provider_deadline(
+            authorized_start_at, authorized_end_at,
+            drain_seconds=source_profile.settings.drain_deadline_seconds,
+            shutdown_seconds=source_profile.settings.shutdown_deadline_seconds,
+        )
     cursor.execute(
         "SELECT cohort.cohort_id,cohort.manifest_id "
         "FROM rt.cohorts AS cohort "
@@ -504,6 +613,21 @@ def resolve_advanced_ingress_plan_cursor(
     if len(candidates) > 1:
         raise AdvancedCohortResolutionError("COHORT_AMBIGUOUS")
     cohort_id, manifest_id = candidates[0]
+    if request.canary_start_at is not None:
+        cursor.execute(
+            "SELECT DISTINCT reference.ticker "
+            "FROM rt.subscription_members AS member "
+            "JOIN rt.instruments AS instrument USING(instrument_id) "
+            "JOIN ref.security_revisions AS reference USING(security_id) "
+            "WHERE member.manifest_id=%s AND member.channel='AM' "
+            "AND instrument.asset_class='EQUITY' AND reference.active "
+            "AND reference.effective_from<=%s "
+            "AND (reference.effective_to IS NULL OR reference.effective_to>%s) "
+            "AND reference.observed_at<=%s ORDER BY reference.ticker",
+            (str(manifest_id),) + (request.canary_start_at,) * 3,
+        )
+        if tuple(row[0] for row in cursor.fetchall()) != ("SPY",):
+            raise AdvancedCohortResolutionError("CANARY_REQUIRES_EXACT_SPY_AM")
     plan = build_advanced_ingress_plan(
         authorization=authorization,
         cohort_id=cohort_id,
@@ -515,6 +639,8 @@ def resolve_advanced_ingress_plan_cursor(
         runtime_profile_sha256=source_profile.sha256,
         configuration_sha256=configuration_sha256,
         budgets=request.budgets,
+        canary_start_at=request.canary_start_at,
+        canary_end_at=request.canary_end_at,
         calendar=calendar,
     )
     return plan
@@ -824,7 +950,7 @@ def admit_advanced_ingress_session_cursor(
         or row[8] != authorization_reference
         or row[9] != "READY"
         or not row[10] <= checked_at.date() <= row[11]
-        or not row[3] <= checked_at <= row[4]
+        or not row[3] <= checked_at < row[4]
     ):
         raise AdvancedIngressAdmissionError(
             "daily ingress plan is revoked, expired, or mismatched"

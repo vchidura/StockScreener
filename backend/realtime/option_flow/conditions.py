@@ -14,9 +14,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
 
+from ..advanced_options_provider_contract import (
+    MASSIVE_OPTIONS_PROVIDER_CONTRACT,
+)
 from ..contracts import canonical_sha256
 
 SEMANTICS_VERSION = "massive_options_conditions_v2"
+LIVE_SEMANTICS_VERSION = "massive_options_conditions_v3"
 PROVENANCE_LIVE_CAPTURE = "LIVE_CAPTURED"
 PROVENANCE_SYNTHETIC = "SYNTHETIC_SCHEMA_FIXTURE_NOT_LIVE_CAPTURED"
 PROVENANCES = frozenset({PROVENANCE_LIVE_CAPTURE, PROVENANCE_SYNTHETIC})
@@ -25,6 +29,22 @@ PROVIDER_SYNTHETIC = "massive_synthetic_fixture"
 ASSET_CLASS = "options"
 DATA_TYPE = "trade"
 _VERDICT_CACHE_LIMIT = 4096
+REFERENCE_DIRECTORY = (
+    Path(__file__).resolve().parent.parent
+    / "policies"
+    / "references"
+)
+DEFAULT_LIVE_CONDITION_PAYLOAD_PATH = (
+    REFERENCE_DIRECTORY / "massive_options_trade_conditions_20261019.json"
+)
+DEFAULT_LIVE_CONDITION_REVIEW_DRAFT_PATH = (
+    REFERENCE_DIRECTORY
+    / "massive_options_trade_conditions_20261019.review-draft.json"
+)
+DEFAULT_LIVE_CONDITION_REVIEW_PATH = (
+    REFERENCE_DIRECTORY
+    / "massive_options_trade_conditions_v3.review.json"
+)
 
 
 class ConditionPinError(ValueError):
@@ -108,6 +128,7 @@ class SemanticsPin:
     semantics_version: str
     payload_sha256: str
     provenance: str
+    provider_contract_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +147,7 @@ class TradeConditionRow:
     sip_mapping: Mapping[str, Any]
     fetched_at: datetime
     payload_sha256: str
+    provider_contract_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +264,9 @@ class ConditionSemantics:
                 sip_mapping=dict(row.sip_mapping),
                 fetched_at=self.fetched_at,
                 payload_sha256=self.pin.payload_sha256,
+                provider_contract_sha256=(
+                    self.pin.provider_contract_sha256
+                ),
             )
             for row in self.provider
             if DATA_TYPE in row.data_types
@@ -328,6 +353,15 @@ def parse_payload(document: Mapping[str, Any]) -> ConditionPayload:
 
 
 def _provider_condition(raw: Mapping[str, Any]) -> ProviderCondition:
+    keys = frozenset(raw)
+    allowed = frozenset(
+        MASSIVE_OPTIONS_PROVIDER_CONTRACT.condition_response_fields
+    )
+    if keys - allowed:
+        raise ConditionPinError(
+            "PAYLOAD_FIELD_UNKNOWN",
+            ",".join(sorted(keys - allowed)),
+        )
     for required in ("id", "name", "type"):
         if required not in raw:
             raise ConditionPinError("PAYLOAD_FIELD_MISSING", required)
@@ -344,18 +378,69 @@ def _provider_condition(raw: Mapping[str, Any]) -> ProviderCondition:
     data_types = raw.get("data_types", [])
     if not isinstance(update_rules, Mapping) or not isinstance(sip_mapping, Mapping):
         raise ConditionPinError("PAYLOAD_FIELD_INVALID", f"rules of {condition_id}")
-    if not isinstance(data_types, list) or any(not isinstance(item, str) for item in data_types):
+    if (
+        not isinstance(data_types, list)
+        or any(not isinstance(item, str) for item in data_types)
+        or len(data_types) != len(set(data_types))
+    ):
         raise ConditionPinError("PAYLOAD_FIELD_INVALID", f"data_types of {condition_id}")
+    legacy = raw.get("legacy", False)
+    if type(legacy) is not bool:
+        raise ConditionPinError("PAYLOAD_FIELD_INVALID", f"legacy of {condition_id}")
+    abbreviation = raw.get("abbreviation")
+    description = raw.get("description")
+    if abbreviation is not None and not isinstance(abbreviation, str):
+        raise ConditionPinError(
+            "PAYLOAD_FIELD_INVALID",
+            f"abbreviation of {condition_id}",
+        )
+    if description is not None and not isinstance(description, str):
+        raise ConditionPinError(
+            "PAYLOAD_FIELD_INVALID",
+            f"description of {condition_id}",
+        )
+    allowed_sips = {"CTA", "OPRA", "UTP"}
+    if (
+        set(sip_mapping) - allowed_sips
+        or any(
+            not isinstance(value, str) or not value
+            for value in sip_mapping.values()
+        )
+    ):
+        raise ConditionPinError(
+            "PAYLOAD_FIELD_INVALID",
+            f"sip_mapping of {condition_id}",
+        )
+    update_fields = {
+        "updates_high_low",
+        "updates_open_close",
+        "updates_volume",
+    }
+    if set(update_rules) - {"consolidated", "market_center"}:
+        raise ConditionPinError(
+            "PAYLOAD_FIELD_INVALID",
+            f"update_rules of {condition_id}",
+        )
+    for scope, rules in update_rules.items():
+        if (
+            not isinstance(rules, Mapping)
+            or set(rules) != update_fields
+            or any(type(value) is not bool for value in rules.values())
+        ):
+            raise ConditionPinError(
+                "PAYLOAD_FIELD_INVALID",
+                f"{scope} update_rules of {condition_id}",
+            )
     exchange = raw.get("exchange")
     if exchange is not None and (type(exchange) is not int or exchange < 0):
         raise ConditionPinError("PAYLOAD_FIELD_INVALID", f"exchange of {condition_id}")
     return ProviderCondition(
         condition_id=condition_id,
-        abbreviation=raw.get("abbreviation"),
+        abbreviation=abbreviation,
         name=name,
-        description=raw.get("description"),
+        description=description,
         condition_type=condition_type,
-        legacy=bool(raw.get("legacy", False)),
+        legacy=legacy,
         exchange=exchange,
         data_types=tuple(data_types),
         update_rules=update_rules,
@@ -439,10 +524,18 @@ def build_semantics(
         "semantics_version": review.semantics_version,
         "payload_sha256": payload.payload_sha256,
         "provenance": review.provenance,
+        "provider_contract_sha256": (
+            MASSIVE_OPTIONS_PROVIDER_CONTRACT.sha256
+        ),
         "codes": [reviewed[key] for key in sorted(reviewed)],
     })
     return ConditionSemantics(
-        pin=SemanticsPin(review.semantics_version, payload.payload_sha256, review.provenance),
+        pin=SemanticsPin(
+            review.semantics_version,
+            payload.payload_sha256,
+            review.provenance,
+            MASSIVE_OPTIONS_PROVIDER_CONTRACT.sha256,
+        ),
         semantics_sha256=semantics_sha256,
         fetched_at=payload.fetched_at,
         reviewed_at=review.reviewed_at,
@@ -462,3 +555,10 @@ def load_semantics(
     payload = parse_payload(json.loads(Path(payload_path).read_text(encoding="utf-8")))
     review = parse_review(json.loads(Path(review_path).read_text(encoding="utf-8")))
     return build_semantics(payload, review, expected_payload_sha256=expected_payload_sha256)
+
+
+def load_default_live_semantics() -> ConditionSemantics:
+    return load_semantics(
+        DEFAULT_LIVE_CONDITION_PAYLOAD_PATH,
+        DEFAULT_LIVE_CONDITION_REVIEW_PATH,
+    )

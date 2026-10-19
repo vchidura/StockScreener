@@ -3,7 +3,7 @@
   "ladder_policy_file": "advanced_equity_scale_v1.json",
   "profiles": [
     {
-      "version": "advanced-equity-ingress-1-v1",
+      "version": "advanced-equity-ingress-1-v2",
       "universe_target": 1,
       "provider_tier": "MASSIVE_ADVANCED",
       "feed": "STOCKS",
@@ -16,6 +16,9 @@
         "journal_batch_messages": 100,
         "journal_batch_bytes": 8388608,
         "bridge_batch_limit": 1000,
+        "rest_aggregate_endpoint_class": "MASSIVE_STOCKS_AGGREGATES_1M",
+        "rest_eligibility_policy_version": "conservative-unverified-delay-v1",
+        "rest_provider_delay_seconds": 900,
         "websocket_open_timeout_seconds": 10,
         "websocket_ping_interval_seconds": 20,
         "websocket_ping_timeout_seconds": 10,
@@ -45,7 +48,7 @@
       }
     },
     {
-      "version": "advanced-equity-ingress-9-v1",
+      "version": "advanced-equity-ingress-9-v2",
       "universe_target": 9,
       "provider_tier": "MASSIVE_ADVANCED",
       "feed": "STOCKS",
@@ -58,6 +61,9 @@
         "journal_batch_messages": 100,
         "journal_batch_bytes": 8388608,
         "bridge_batch_limit": 1000,
+        "rest_aggregate_endpoint_class": "MASSIVE_STOCKS_AGGREGATES_1M",
+        "rest_eligibility_policy_version": "conservative-unverified-delay-v1",
+        "rest_provider_delay_seconds": 900,
         "websocket_open_timeout_seconds": 10,
         "websocket_ping_interval_seconds": 20,
         "websocket_ping_timeout_seconds": 10,
@@ -87,7 +93,7 @@
       }
     },
     {
-      "version": "advanced-equity-ingress-25-v1",
+      "version": "advanced-equity-ingress-25-v2",
       "universe_target": 25,
       "provider_tier": "MASSIVE_ADVANCED",
       "feed": "STOCKS",
@@ -100,6 +106,9 @@
         "journal_batch_messages": 100,
         "journal_batch_bytes": 8388608,
         "bridge_batch_limit": 1000,
+        "rest_aggregate_endpoint_class": "MASSIVE_STOCKS_AGGREGATES_1M",
+        "rest_eligibility_policy_version": "conservative-unverified-delay-v1",
+        "rest_provider_delay_seconds": 900,
         "websocket_open_timeout_seconds": 10,
         "websocket_ping_interval_seconds": 20,
         "websocket_ping_timeout_seconds": 10,
@@ -129,7 +138,7 @@
       }
     },
     {
-      "version": "advanced-equity-ingress-50-v1",
+      "version": "advanced-equity-ingress-50-v2",
       "universe_target": 50,
       "provider_tier": "MASSIVE_ADVANCED",
       "feed": "STOCKS",
@@ -142,6 +151,9 @@
         "journal_batch_messages": 100,
         "journal_batch_bytes": 8388608,
         "bridge_batch_limit": 1000,
+        "rest_aggregate_endpoint_class": "MASSIVE_STOCKS_AGGREGATES_1M",
+        "rest_eligibility_policy_version": "conservative-unverified-delay-v1",
+        "rest_provider_delay_seconds": 900,
         "websocket_open_timeout_seconds": 10,
         "websocket_ping_interval_seconds": 20,
         "websocket_ping_timeout_seconds": 10,
@@ -171,7 +183,7 @@
       }
     },
     {
-      "version": "advanced-equity-ingress-100-v1",
+      "version": "advanced-equity-ingress-100-v2",
       "universe_target": 100,
       "provider_tier": "MASSIVE_ADVANCED",
       "feed": "STOCKS",
@@ -184,6 +196,9 @@
         "journal_batch_messages": 100,
         "journal_batch_bytes": 8388608,
         "bridge_batch_limit": 1000,
+        "rest_aggregate_endpoint_class": "MASSIVE_STOCKS_AGGREGATES_1M",
+        "rest_eligibility_policy_version": "conservative-unverified-delay-v1",
+        "rest_provider_delay_seconds": 900,
         "websocket_open_timeout_seconds": 10,
         "websocket_ping_interval_seconds": 20,
         "websocket_ping_timeout_seconds": 10,
@@ -213,7 +228,7 @@
       }
     },
     {
-      "version": "advanced-equity-ingress-200-v1",
+      "version": "advanced-equity-ingress-200-v2",
       "universe_target": 200,
       "provider_tier": "MASSIVE_ADVANCED",
       "feed": "STOCKS",
@@ -226,6 +241,9 @@
         "journal_batch_messages": 100,
         "journal_batch_bytes": 8388608,
         "bridge_batch_limit": 1000,
+        "rest_aggregate_endpoint_class": "MASSIVE_STOCKS_AGGREGATES_1M",
+        "rest_eligibility_policy_version": "conservative-unverified-delay-v1",
+        "rest_provider_delay_seconds": 900,
         "websocket_open_timeout_seconds": 10,
         "websocket_ping_interval_seconds": 20,
         "websocket_ping_timeout_seconds": 10,
@@ -255,7 +273,7 @@
       }
     },
     {
-      "version": "advanced-equity-ingress-400-v1",
+      "version": "advanced-equity-ingress-400-v2",
       "universe_target": 400,
       "provider_tier": "MASSIVE_ADVANCED",
       "feed": "STOCKS",
@@ -268,6 +286,9 @@
         "journal_batch_messages": 100,
         "journal_batch_bytes": 8388608,
         "bridge_batch_limit": 1000,
+        "rest_aggregate_endpoint_class": "MASSIVE_STOCKS_AGGREGATES_1M",
+        "rest_eligibility_policy_version": "conservative-unverified-delay-v1",
+        "rest_provider_delay_seconds": 900,
         "websocket_open_timeout_seconds": 10,
         "websocket_ping_interval_seconds": 20,
         "websocket_ping_timeout_seconds": 10,

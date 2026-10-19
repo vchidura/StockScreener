@@ -199,7 +199,9 @@ def catalog_checks(cursor) -> list[tuple[str, str]]:
                    "WHERE retention_class = 'ARCHIVE_FIRST' ORDER BY relation_name")
     archive_rows = cursor.fetchall()
     results.append(("archive_first_relations_name_their_required_archive_kinds", "PASS" if archive_rows == [
+        ("rt.option_flow_cluster_members", True, ["OPTION_FLOW_CLUSTERS"]),
         ("rt.option_flow_clusters", True, ["OPTION_FLOW_CLUSTERS"]),
+        ("rt.option_flow_event_profiles", True, ["OPTION_FLOW_EVENTS"]),
         ("rt.option_flow_events", True, ["OPTION_FLOW_EVENTS"])] else f"FAIL {archive_rows}"))
     cursor.execute("SELECT window_value FROM rt.partition_policies WHERE relation_name = 'rt.portal_snapshot_kept'")
     results.append(("kept_portal_snapshots_retain_the_26_session_strategy_window",
@@ -208,7 +210,13 @@ def catalog_checks(cursor) -> list[tuple[str, str]]:
     total, healthy = cursor.fetchone()
     results.append(("partition_health_is_ok_after_provisioning",
                     "PASS" if total == len(PARTITION_POLICY_SEEDS) and healthy == total else f"FAIL {healthy}/{total}"))
-    cursor.execute("SELECT count(*) FILTER (WHERE status = 'ALARM') FROM rt.partition_health(CURRENT_DATE + 30)")
+    cursor.execute(
+        "WITH missed AS ("
+        "SELECT max(horizon_date) AS checked_on "
+        "FROM rt.partition_health(CURRENT_DATE)"
+        ") SELECT count(*) FILTER (WHERE status = 'ALARM') "
+        "FROM missed CROSS JOIN LATERAL rt.partition_health(missed.checked_on)"
+    )
     results.append(("partition_health_alarms_when_creation_is_missed",
                     "PASS" if cursor.fetchone()[0] == len(PARTITION_POLICY_SEEDS) else "FAIL"))
     return results

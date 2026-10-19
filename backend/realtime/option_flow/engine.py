@@ -11,10 +11,27 @@ from uuid import UUID, uuid5
 
 from options.config import FlowStrategyPolicy
 
+from ..advanced_options_flow_policy import (
+    AdvancedOptionsContractScope,
+    AdvancedOptionsContractScopeEntry,
+    AdvancedOptionsFlowPolicy,
+)
+from ..advanced_options_provider_contract import (
+    MASSIVE_OPTIONS_PROVIDER_CONTRACT,
+    AdvancedOptionsExchangeReference,
+    AdvancedOptionsProviderContract,
+)
 from ..contracts import canonical_sha256
+from ..option_source_flow import OptionSourceFlowIdentity
 from .classifier import AggressionPolicy, SideClass, SideConfidence, classify_aggression
 from .clock import SessionClock, to_datetime
-from .clusters import ClusterConfig, ClusterEngine, ClusterPrint, cluster_bucket
+from .clusters import (
+    CANONICAL_ORDER_WINDOWS_SECONDS,
+    ClusterConfig,
+    ClusterEngine,
+    ClusterPrint,
+    cluster_bucket,
+)
 from .conditions import ConditionSemantics, Treatment
 from .labels import (
     OpeningInferencePolicy,
@@ -25,12 +42,19 @@ from .labels import (
 )
 from .messages import MessageRejected, QuoteMessage, TradeMessage, parse_quote, parse_trade, underlyer_of
 from .quote_cache import QuoteCache, QuoteCacheConfig
-from .records import EngineOutput, FlowEvent, GapRecord, ReconcileResult
+from .records import (
+    EngineOutput,
+    FlowEvent,
+    FlowRetentionEvidence,
+    GapRecord,
+    ReconcileResult,
+)
 from .volume import BaselineKind, PrintStatus, VolumeBook, VolumeConfig
 
 DETECTOR_VERSION = "option_flow_stream_v1"
 EVENT_NAMESPACE = UUID("2f0a7d52-8c61-4b0e-a3d9-71b4e5c0f9a2")
 PROVIDER_TIERS = frozenset({"MASSIVE_ADVANCED", "MASSIVE_DEVELOPER"})
+DEFAULT_SHARD_COUNT = 9
 _ROUTE_CACHE_LIMIT = 200_000
 _NEAR = 1e-9
 _SCORE_PLACES = Decimal("0.0001")
@@ -53,14 +77,17 @@ class EngineConfig:
     policy: FlowStrategyPolicy
     semantics: ConditionSemantics
     journal_generation: UUID | None = None
-    shard_count: int = 4
+    source_flow: OptionSourceFlowIdentity | None = None
+    shard_count: int = DEFAULT_SHARD_COUNT
     queue_capacity: int = 50_000
     multiplier: int = 100
     minimum_size: int | None = None
     quote_cache: QuoteCacheConfig = QuoteCacheConfig()
     aggression: AggressionPolicy = AggressionPolicy()
     volume: VolumeConfig = VolumeConfig()
-    cluster_windows_seconds: tuple[int, ...] = (1, 5, 60, 900)
+    cluster_windows_seconds: tuple[int, ...] = (
+        CANONICAL_ORDER_WINDOWS_SECONDS
+    )
     allowed_lateness_ms: int = 2_000
     finalized_retention_ms: int = 60_000
     emit_mixed_clusters: bool = True
@@ -69,6 +96,12 @@ class EngineConfig:
     allow_synthetic_semantics: bool = False
     persist_unknown_condition_prints: bool = True
     checkpoint_interval_ms: int = 5_000
+    advanced_flow_policy: AdvancedOptionsFlowPolicy | None = None
+    contract_scope: AdvancedOptionsContractScope | None = None
+    provider_contract: AdvancedOptionsProviderContract = (
+        MASSIVE_OPTIONS_PROVIDER_CONTRACT
+    )
+    exchange_reference: AdvancedOptionsExchangeReference | None = None
 
     def __post_init__(self) -> None:
         if self.provider_tier not in PROVIDER_TIERS:
@@ -81,6 +114,73 @@ class EngineConfig:
             raise ValueError("checkpoint_interval_ms must be positive")
         if not self.semantics.is_live_capture and not self.allow_synthetic_semantics:
             raise ValueError("SYNTHETIC_SEMANTICS_NOT_ALLOWED: the condition pin is not a live capture")
+        advanced = self.advanced_flow_policy
+        scope = self.contract_scope
+        if (
+            not isinstance(
+                self.provider_contract,
+                AdvancedOptionsProviderContract,
+            )
+            or self.provider_contract.sha256
+            != MASSIVE_OPTIONS_PROVIDER_CONTRACT.sha256
+        ):
+            raise ValueError("Massive Options provider contract is invalid")
+        if self.exchange_reference is not None:
+            if (
+                not isinstance(
+                    self.exchange_reference,
+                    AdvancedOptionsExchangeReference,
+                )
+                or self.exchange_reference.provider_contract_sha256
+                != self.provider_contract.sha256
+            ):
+                raise ValueError(
+                    "exchange reference does not match provider contract"
+                )
+        if (advanced is None) != (scope is None):
+            raise ValueError(
+                "Advanced Options flow policy and contract scope must be bound together"
+            )
+        if advanced is not None:
+            if not isinstance(advanced, AdvancedOptionsFlowPolicy):
+                raise TypeError("Advanced Options flow policy is invalid")
+            if not isinstance(scope, AdvancedOptionsContractScope):
+                raise TypeError("Advanced Options contract scope is invalid")
+            scope.validate_policy(advanced)
+        if self.source_flow is not None:
+            if self.journal_generation != self.source_flow.journal_generation:
+                raise ValueError("source-flow journal generation does not match")
+            if (
+                self.semantics.semantics_sha256
+                != self.source_flow.condition_semantics_sha256
+                or self._configuration_policy_sha256()
+                != self.source_flow.flow_policy_sha256
+            ):
+                raise ValueError(
+                    "source-flow condition or policy pin does not match"
+                )
+            if advanced is not None and (
+                self.source_flow.identity_version
+                != (4 if self.exchange_reference is not None else 3)
+                or self.source_flow.advanced_flow_policy_sha256
+                != advanced.sha256
+                or self.source_flow.contract_scope_sha256
+                != scope.sha256
+                or (
+                    self.exchange_reference is not None
+                    and (
+                        self.source_flow.provider_contract_sha256
+                        != self.provider_contract.sha256
+                        or self.source_flow.condition_reference_sha256
+                        != self.semantics.pin.payload_sha256
+                        or self.source_flow.exchange_reference_sha256
+                        != self.exchange_reference.sha256
+                    )
+                )
+            ):
+                raise ValueError(
+                    "source-flow Advanced policy or scope pin does not match"
+                )
 
     def cluster_config(self) -> ClusterConfig:
         return ClusterConfig.from_policy(
@@ -98,9 +198,9 @@ class EngineConfig:
             likely_threshold=self.likely_opening_threshold,
         )
 
-    def policy_sha256(self) -> str:
+    def _policy_identity(self) -> dict[str, object]:
         cluster = self.cluster_config()
-        return canonical_sha256({
+        return {
             "detector_version": DETECTOR_VERSION,
             "flow_policy": self.policy.model_dump(),
             "minimum_size": self.minimum_size,
@@ -114,7 +214,24 @@ class EngineConfig:
             "inference": self.inference_policy(),
             "semantics_version": self.semantics.version,
             "semantics_sha256": self.semantics.semantics_sha256,
-        })
+            "advanced_flow_policy": self.advanced_flow_policy,
+            "contract_scope": self.contract_scope,
+            "provider_contract_sha256": self.provider_contract.sha256,
+            "exchange_reference_sha256": (
+                None
+                if self.exchange_reference is None
+                else self.exchange_reference.sha256
+            ),
+        }
+
+    def _configuration_policy_sha256(self) -> str:
+        return canonical_sha256(self._policy_identity())
+
+    def policy_sha256(self) -> str:
+        identity = self._policy_identity()
+        if self.source_flow is not None:
+            identity["source_flow"] = self.source_flow.lineage_identity
+        return canonical_sha256(identity)
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +349,35 @@ class OptionFlowEngine:
         self._inference = config.inference_policy()
         self._cluster_config = config.cluster_config()
         self._policy_sha256 = config.policy_sha256()
+        self._source_flow = config.source_flow
+        self._advanced_policy = config.advanced_flow_policy
+        self._contract_scope = config.contract_scope
+        self._provider_contract = config.provider_contract
+        self._exchange_reference = config.exchange_reference
+        self._advanced_flow_policy_sha256 = (
+            None
+            if config.advanced_flow_policy is None
+            else config.advanced_flow_policy.sha256
+        )
+        self._contract_scope_sha256 = (
+            None
+            if config.contract_scope is None
+            else config.contract_scope.sha256
+        )
+        self._provider_contract_sha256 = config.provider_contract.sha256
+        self._condition_reference_sha256 = (
+            config.semantics.pin.payload_sha256
+        )
+        self._exchange_reference_sha256 = (
+            None
+            if config.exchange_reference is None
+            else config.exchange_reference.sha256
+        )
+        self._contract_scope_map = (
+            {}
+            if config.contract_scope is None
+            else config.contract_scope.contract_map
+        )
         self._clock = SessionClock()
         self._multiplier = config.multiplier
         self._min_size = config.minimum_size
@@ -249,6 +395,22 @@ class OptionFlowEngine:
                 QuoteCache(config.quote_cache),
                 ClusterEngine(self._cluster_config, cohort_id=config.cohort_id,
                               provider_tier=config.provider_tier, policy_sha256=self._policy_sha256,
+                              source_flow=config.source_flow,
+                              advanced_flow_policy_sha256=self._advanced_flow_policy_sha256,
+                              contract_scope_sha256=self._contract_scope_sha256,
+                              manifest_sha256=(
+                                  None
+                                  if config.contract_scope is None
+                                  else config.contract_scope.manifest_sha256
+                              ),
+                              slot_sha256=(
+                                  None
+                                  if config.contract_scope is None
+                                  else config.contract_scope.slot_sha256
+                              ),
+                              provider_contract_sha256=self._provider_contract_sha256,
+                              condition_reference_sha256=self._condition_reference_sha256,
+                              exchange_reference_sha256=self._exchange_reference_sha256,
                               clock=self._clock),
             )
             for index in range(config.shard_count)
@@ -274,7 +436,13 @@ class OptionFlowEngine:
             return None
         route = self._routes.get(symbol, False)
         if route is False:
-            underlyer = underlyer_of(symbol) if symbol.isupper() else None
+            scope_entry = self._contract_scope_map.get(symbol)
+            if self._contract_scope is not None:
+                underlyer = (
+                    None if scope_entry is None else scope_entry.underlyer
+                )
+            else:
+                underlyer = underlyer_of(symbol) if symbol.isupper() else None
             route = None if underlyer is None else (
                 underlyer, zlib.crc32(underlyer.encode("ascii")) % len(self._shards))
             if len(self._routes) >= _ROUTE_CACHE_LIMIT:
@@ -491,6 +659,12 @@ class OptionFlowEngine:
         shard.last_session = session_date
         if time_ms > shard.last_time_ms:
             shard.last_time_ms = time_ms
+        if (
+            self._contract_scope is not None
+            and session_date != self._contract_scope.session_date
+        ):
+            self._count_rejection("CONTRACT_SCOPE_SESSION_MISMATCH")
+            return
         shard.clusters.observe_time(time_ms, out.clusters)
         verdict = self._semantics.classify(message.conditions)
         if verdict.treatment is Treatment.INCLUDED:
@@ -509,6 +683,7 @@ class OptionFlowEngine:
             out.checkpoints.extend(shard.book.checkpoint_rows())
 
     def _passes_filter(self, price: float, size: int) -> bool:
+        """Legacy single-threshold retention used only without Advanced V2 policy."""
         if self._min_size is not None and size >= self._min_size:
             return True
         notional = price * size * self._multiplier
@@ -517,6 +692,59 @@ class OptionFlowEngine:
         if notional < self._threshold_low:
             return False
         return Decimal(repr(price)) * size * self._multiplier >= self._threshold
+
+    def _retention_matches(
+        self,
+        symbol: str,
+        price: float,
+        size: int,
+    ) -> tuple[FlowRetentionEvidence, ...]:
+        policy = self._advanced_policy
+        if policy is None:
+            return ()
+        entry = self._contract_scope_map.get(symbol)
+        if entry is None:
+            return ()
+        premium = Decimal(repr(price)) * size * self._multiplier
+        matches: list[FlowRetentionEvidence] = []
+        for profile in policy.profiles:
+            if entry.dte_lane not in profile.dte_lanes:
+                continue
+            threshold = profile.threshold_for(entry.universe_tier)
+            contracts_matched = size >= threshold.minimum_contracts
+            premium_matched = (
+                premium >= threshold.minimum_print_premium
+            )
+            if not (contracts_matched or premium_matched):
+                continue
+            matches.append(FlowRetentionEvidence(
+                profile=profile.kind.value,
+                universe_tier=entry.universe_tier.value,
+                dte_lane=entry.dte_lane.value,
+                threshold_mode=profile.threshold_mode.value,
+                minimum_contracts=threshold.minimum_contracts,
+                minimum_print_premium=threshold.minimum_print_premium,
+                contracts_matched=contracts_matched,
+                premium_matched=premium_matched,
+                minimum_cluster_prints=threshold.minimum_cluster_prints,
+                minimum_distinct_exchanges=(
+                    threshold.minimum_distinct_exchanges
+                ),
+                minimum_cluster_premium=(
+                    threshold.minimum_cluster_premium
+                ),
+                minimum_cumulative_contracts=(
+                    threshold.minimum_cumulative_contracts
+                ),
+                window_seconds=profile.window_for(entry.dte_lane),
+            ))
+        return tuple(matches)
+
+    def _scope_entry(
+        self,
+        symbol: str,
+    ) -> AdvancedOptionsContractScopeEntry | None:
+        return self._contract_scope_map.get(symbol)
 
     def _underlyer(self, symbol: str) -> str:
         route = self._routes.get(symbol) or self._route(symbol)
@@ -549,24 +777,101 @@ class OptionFlowEngine:
             return
         if outcome.late:
             stats.late_prints += 1
-        if not self._passes_filter(message.price, message.size):
+        if self._advanced_policy is not None:
+            shard.clusters.update_cumulative(
+                message.symbol,
+                outcome.after,
+                out.clusters,
+            )
+        matches = self._retention_matches(
+            message.symbol,
+            message.price,
+            message.size,
+        )
+        retained = (
+            bool(matches)
+            if self._advanced_policy is not None
+            else self._passes_filter(message.price, message.size)
+        )
+        if not retained:
             stats.below_filter += 1
             return
         event = self._build_event(shard, message, verdict, session_date, outcome.before, outcome.after,
-                                  outcome.baseline, outcome.late)
+                                  outcome.baseline, outcome.late, matches)
         outcome.record.event = event
         stats.persisted_events += 1
         out.events.append(event)
         bucket = cluster_bucket(event.side_class)
-        if bucket is not None and event.premium >= self._threshold:
+        if (
+            bucket is not None
+            and (
+                bool(event.retention_thresholds)
+                or event.premium >= self._threshold
+            )
+        ):
             shard.clusters.on_print(self._cluster_print(event, bucket), out.clusters)
 
-    def _cluster_print(self, event: FlowEvent, bucket: str) -> ClusterPrint:
-        return ClusterPrint(event.contract_ticker, event.underlyer, bucket, event.time_ms,
-                            event.source_seq, event.size, event.premium, event.exchange_id)
+    def _cluster_print(
+        self,
+        event: FlowEvent,
+        bucket: str,
+        *,
+        cumulative_contracts: int | None = None,
+    ) -> ClusterPrint:
+        return ClusterPrint(event.event_id, event.contract_ticker, event.underlyer, bucket, event.time_ms,
+                            event.source_seq, event.size, event.premium, event.exchange_id,
+                            (
+                                event.cumulative_volume_after
+                                if cumulative_contracts is None
+                                else cumulative_contracts
+                            ),
+                            event.retention_thresholds)
 
-    def _build_event(self, shard: _Shard, message: TradeMessage, verdict, session_date: date,
-                     before: int, after: int, baseline: BaselineKind, late: bool) -> FlowEvent:
+    def _event_id(
+        self,
+        contract_ticker: str,
+        source_seq: int,
+        time_ms: int,
+        *,
+        revision: int = 1,
+    ) -> UUID:
+        if self._source_flow is None:
+            suffix = "" if revision == 1 else f"|r{revision}"
+            identity = (
+                f"{self.config.cohort_id}|{contract_ticker}|"
+                f"{source_seq}|{time_ms}{suffix}"
+            )
+        else:
+            identity = (
+                f"{self._source_flow.source_flow_id}|{contract_ticker}|"
+                f"{source_seq}|{time_ms}|r{revision}"
+            )
+        return uuid5(EVENT_NAMESPACE, identity)
+
+    def _source_flow_values(
+        self,
+    ) -> tuple[UUID | None, str | None, str | None, int]:
+        if self._source_flow is None:
+            return None, None, None, 1
+        return (
+            self._source_flow.source_flow_id,
+            self._source_flow.condition_semantics_sha256,
+            self._source_flow.flow_policy_sha256,
+            self._source_flow.identity_version,
+        )
+
+    def _build_event(
+        self,
+        shard: _Shard,
+        message: TradeMessage,
+        verdict,
+        session_date: date,
+        before: int,
+        after: int,
+        baseline: BaselineKind,
+        late: bool,
+        retention_thresholds: tuple[FlowRetentionEvidence, ...],
+    ) -> FlowEvent:
         symbol = message.symbol
         listed = self._quote_listed(symbol)
         lookup = None
@@ -581,8 +886,13 @@ class OptionFlowEngine:
                                 self._inference)
         quote = aggression.quote
         reasons = verdict.reasons + aggression.reasons + oi.reasons
+        source_flow_id, condition_sha256, flow_sha256, lineage_version = (
+            self._source_flow_values()
+        )
+        scope_entry = self._scope_entry(symbol)
+        scope = self._contract_scope
         return FlowEvent(
-            event_id=uuid5(EVENT_NAMESPACE, f"{self.config.cohort_id}|{symbol}|{message.seq}|{message.time_ms}"),
+            event_id=self._event_id(symbol, message.seq, message.time_ms),
             event_time=to_datetime(message.time_ms),
             cohort_id=self.config.cohort_id,
             session_date=session_date,
@@ -620,6 +930,10 @@ class OptionFlowEngine:
             journal_generation=self.config.journal_generation,
             shard_id=shard.index,
             source_offset=message.offset if message.offset and message.offset > 0 else None,
+            source_flow_id=source_flow_id,
+            condition_semantics_sha256=condition_sha256,
+            flow_policy_sha256=flow_sha256,
+            lineage_version=lineage_version,
             revision=1,
             supersedes_event_id=None,
             time_ms=message.time_ms,
@@ -628,6 +942,31 @@ class OptionFlowEngine:
             is_sweep=verdict.is_sweep,
             is_floor=verdict.is_floor,
             is_late=late or verdict.is_late,
+            matched_profiles=tuple(
+                row.profile for row in retention_thresholds
+            ),
+            flow_universe_tier=(
+                None
+                if scope_entry is None
+                else scope_entry.universe_tier.value
+            ),
+            flow_dte_lane=(
+                None if scope_entry is None else scope_entry.dte_lane.value
+            ),
+            contract_expiration=(
+                None if scope_entry is None else scope_entry.expiration
+            ),
+            retention_thresholds=retention_thresholds,
+            advanced_flow_policy_sha256=self._advanced_flow_policy_sha256,
+            contract_scope_sha256=self._contract_scope_sha256,
+            manifest_sha256=(
+                None if scope is None else scope.manifest_sha256
+            ),
+            slot_sha256=None if scope is None else scope.slot_sha256,
+            runtime_policy_sha256=self._policy_sha256,
+            provider_contract_sha256=self._provider_contract_sha256,
+            condition_reference_sha256=self._condition_reference_sha256,
+            exchange_reference_sha256=self._exchange_reference_sha256,
         )
 
     def _cancel(self, shard: _Shard, message: TradeMessage, verdict, session_date: date,
@@ -645,11 +984,21 @@ class OptionFlowEngine:
             return
         previous = original.event
         if previous is None:
+            if self._advanced_policy is not None:
+                shard.clusters.update_cumulative(
+                    message.symbol,
+                    outcome.after,
+                    out.clusters,
+                )
             return
         revision_number = previous.revision + 1
         revision = FlowEvent(
-            event_id=uuid5(EVENT_NAMESPACE, f"{self.config.cohort_id}|{previous.contract_ticker}|"
-                                            f"{previous.source_seq}|{previous.time_ms}|r{revision_number}"),
+            event_id=self._event_id(
+                previous.contract_ticker,
+                previous.source_seq,
+                previous.time_ms,
+                revision=revision_number,
+            ),
             event_time=previous.event_time,
             cohort_id=self.config.cohort_id,
             session_date=previous.session_date,
@@ -684,17 +1033,49 @@ class OptionFlowEngine:
             journal_generation=self.config.journal_generation,
             shard_id=shard.index,
             source_offset=message.offset if message.offset and message.offset > 0 else None,
+            source_flow_id=previous.source_flow_id,
+            condition_semantics_sha256=previous.condition_semantics_sha256,
+            flow_policy_sha256=previous.flow_policy_sha256,
+            lineage_version=previous.lineage_version,
             revision=revision_number,
             supersedes_event_id=previous.event_id,
             time_ms=previous.time_ms,
             reasons=verdict.reasons + ("SUPERSEDES_PERSISTED_PRINT",),
             is_cross=False, is_sweep=False, is_floor=False, is_late=False,
+            matched_profiles=previous.matched_profiles,
+            flow_universe_tier=previous.flow_universe_tier,
+            flow_dte_lane=previous.flow_dte_lane,
+            contract_expiration=previous.contract_expiration,
+            retention_thresholds=previous.retention_thresholds,
+            advanced_flow_policy_sha256=(
+                previous.advanced_flow_policy_sha256
+            ),
+            contract_scope_sha256=previous.contract_scope_sha256,
+            manifest_sha256=previous.manifest_sha256,
+            slot_sha256=previous.slot_sha256,
+            runtime_policy_sha256=previous.runtime_policy_sha256,
+            provider_contract_sha256=(
+                previous.provider_contract_sha256
+            ),
+            condition_reference_sha256=(
+                previous.condition_reference_sha256
+            ),
+            exchange_reference_sha256=(
+                previous.exchange_reference_sha256
+            ),
         )
         stats.cancel_revisions += 1
         out.events.append(revision)
         bucket = cluster_bucket(previous.side_class)
         if bucket is not None:
-            shard.clusters.on_cancel(self._cluster_print(previous, bucket), out.clusters)
+            shard.clusters.on_cancel(
+                self._cluster_print(
+                    previous,
+                    bucket,
+                    cumulative_contracts=outcome.after,
+                ),
+                out.clusters,
+            )
 
     def _unknown(self, shard: _Shard, message: TradeMessage, verdict, session_date: date,
                  out: EngineOutput) -> None:
@@ -704,13 +1085,32 @@ class OptionFlowEngine:
             if code not in self._semantics.reviewed:
                 stats.unknown_condition_codes[code] = stats.unknown_condition_codes.get(code, 0) + 1
         shard.book.mark_incomplete(message.symbol, session_date, "UNKNOWN_TRADE_CONDITION", message.time_ms)
-        if not self.config.persist_unknown_condition_prints or not self._passes_filter(message.price, message.size):
+        matches = self._retention_matches(
+            message.symbol,
+            message.price,
+            message.size,
+        )
+        retained = (
+            bool(matches)
+            if self._advanced_policy is not None
+            else self._passes_filter(message.price, message.size)
+        )
+        if not self.config.persist_unknown_condition_prints or not retained:
             return
         cv = shard.book.get(message.symbol, session_date)
         volume = cv.cumulative if cv is not None else 0
         price = Decimal(repr(message.price))
+        source_flow_id, condition_sha256, flow_sha256, lineage_version = (
+            self._source_flow_values()
+        )
+        scope_entry = self._scope_entry(message.symbol)
+        scope = self._contract_scope
         event = FlowEvent(
-            event_id=uuid5(EVENT_NAMESPACE, f"{self.config.cohort_id}|{message.symbol}|{message.seq}|{message.time_ms}"),
+            event_id=self._event_id(
+                message.symbol,
+                message.seq,
+                message.time_ms,
+            ),
             event_time=to_datetime(message.time_ms),
             cohort_id=self.config.cohort_id,
             session_date=session_date,
@@ -744,11 +1144,38 @@ class OptionFlowEngine:
             journal_generation=self.config.journal_generation,
             shard_id=shard.index,
             source_offset=message.offset if message.offset and message.offset > 0 else None,
+            source_flow_id=source_flow_id,
+            condition_semantics_sha256=condition_sha256,
+            flow_policy_sha256=flow_sha256,
+            lineage_version=lineage_version,
             revision=1,
             supersedes_event_id=None,
             time_ms=message.time_ms,
             reasons=verdict.reasons,
             is_cross=False, is_sweep=False, is_floor=False, is_late=False,
+            matched_profiles=tuple(row.profile for row in matches),
+            flow_universe_tier=(
+                None
+                if scope_entry is None
+                else scope_entry.universe_tier.value
+            ),
+            flow_dte_lane=(
+                None if scope_entry is None else scope_entry.dte_lane.value
+            ),
+            contract_expiration=(
+                None if scope_entry is None else scope_entry.expiration
+            ),
+            retention_thresholds=matches,
+            advanced_flow_policy_sha256=self._advanced_flow_policy_sha256,
+            contract_scope_sha256=self._contract_scope_sha256,
+            manifest_sha256=(
+                None if scope is None else scope.manifest_sha256
+            ),
+            slot_sha256=None if scope is None else scope.slot_sha256,
+            runtime_policy_sha256=self._policy_sha256,
+            provider_contract_sha256=self._provider_contract_sha256,
+            condition_reference_sha256=self._condition_reference_sha256,
+            exchange_reference_sha256=self._exchange_reference_sha256,
         )
         stats.persisted_events += 1
         out.events.append(event)

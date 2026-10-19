@@ -42,6 +42,7 @@ from realtime.advanced_stream_control import (  # noqa: E402
     update_advanced_stream_session_cursor,
 )
 from realtime.advanced_ingress_repository import (  # noqa: E402
+    AdvancedIngressAdmissionError,
     load_advanced_ingress_runtime_plan_cursor,
 )
 from realtime.advanced_ingress_controller import (  # noqa: E402
@@ -52,6 +53,10 @@ from realtime.advanced_gap_repair import (  # noqa: E402
 )
 from realtime.advanced_ingress_runtime_profile import (  # noqa: E402
     load_advanced_ingress_runtime_catalog,
+)
+from realtime.advanced_ingress_plan import (  # noqa: E402
+    advanced_ingress_provider_deadline,
+    is_advanced_canary_window,
 )
 from realtime.advanced_equity_journal_bridge import (  # noqa: E402
     AdvancedEquityJournalBridgeConfig,
@@ -235,6 +240,11 @@ def _load_runtime_scope(
     actual_symbols = tuple(sorted(retained))
     if len(retained) != plan.universe_target:
         raise ValueError("Advanced ingress AM member count is incomplete")
+    if (
+        is_advanced_canary_window(plan.authorized_start_at, plan.authorized_end_at)
+        and actual_symbols != ("SPY",)
+    ):
+        raise ValueError("bounded canary requires exact SPY/AM membership")
     universe = UniverseManifest(
         version=f"advanced-equity-runtime:{scope['manifest_id']}",
         equity_tickers=actual_symbols,
@@ -277,7 +287,11 @@ def _load_runtime_scope(
     )
 
 
-async def _run_once(gateway, messages, duration):
+async def _run_once(gateway, messages, duration, *, deadline=None, utc_clock=_now):
+    if deadline is not None:
+        duration = min(duration, (deadline - utc_clock()).total_seconds())
+        if duration <= 0:
+            return None
     return await asyncio.wait_for(
         gateway.run_session(maximum_market_messages=messages),
         timeout=duration,
@@ -291,16 +305,30 @@ async def _run_continuous(
     drain_deadline,
     utc_clock=_now,
 ):
+    remaining = (drain_deadline - utc_clock()).total_seconds()
+    if remaining <= 0 or stop.is_set():
+        return None
+    loop = asyncio.get_running_loop()
+    monotonic_deadline = loop.time() + remaining
     task = asyncio.create_task(gateway.run_session())
     try:
         while (
             not stop.is_set()
             and not task.done()
             and utc_clock() < drain_deadline
+            and loop.time() < monotonic_deadline
         ):
-            await asyncio.sleep(poll_interval_seconds)
+            await asyncio.sleep(min(
+                poll_interval_seconds,
+                max(0, (drain_deadline - utc_clock()).total_seconds()),
+                max(0, monotonic_deadline - loop.time()),
+            ))
         if (
-            (stop.is_set() or utc_clock() >= drain_deadline)
+            (
+                stop.is_set()
+                or utc_clock() >= drain_deadline
+                or loop.time() >= monotonic_deadline
+            )
             and not task.done()
         ):
             task.cancel()
@@ -382,6 +410,15 @@ def main(argv=None) -> int:
             args.ingress_plan_id,
             runtime_catalog,
         )
+        settings = runtime_profile.settings
+        provider_deadline = advanced_ingress_provider_deadline(
+            runtime_plan.authorized_start_at,
+            runtime_plan.authorized_end_at,
+            drain_seconds=settings.drain_deadline_seconds,
+            shutdown_seconds=settings.shutdown_deadline_seconds,
+        )
+        if _now() >= provider_deadline:
+            raise AdvancedIngressAdmissionError("provider deadline has already ended")
         attempt = runtime_plan.next_connection_attempt
         journal_path, report_path = _derived_runtime_paths(
             journal_root,
@@ -393,7 +430,6 @@ def main(argv=None) -> int:
         generation = uuid4()
         owner_id = uuid4()
         started_at = _now()
-        settings = runtime_profile.settings
         capacity = measure_journal_capacity(
             journal_root,
             minimum_free_bytes=settings.minimum_journal_free_bytes,
@@ -582,6 +618,7 @@ def main(argv=None) -> int:
                     gateway,
                     args.maximum_market_messages,
                     args.duration_seconds,
+                    deadline=provider_deadline,
                 )
             )
         else:
@@ -590,8 +627,7 @@ def main(argv=None) -> int:
                     gateway,
                     stop,
                     settings.ingress_poll_interval_seconds,
-                    runtime_plan.authorized_end_at
-                    + timedelta(seconds=settings.drain_deadline_seconds),
+                    provider_deadline,
                 )
             )
         pump.request_stop()

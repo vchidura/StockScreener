@@ -19,6 +19,8 @@ from option_flow_support import (
     OTHER,
     PUT,
     UNKNOWN_CODE,
+    advanced_contract_scope,
+    advanced_policy,
     check_cluster_rules,
     check_event_rules,
     config,
@@ -36,18 +38,23 @@ from realtime.option_flow.records import EngineOutput
 from realtime.option_flow.volume import BaselineKind, VolumeConfig
 from realtime.option_flow.writer import (
     CHECKPOINT_COLUMNS,
+    CLUSTER_MEMBER_COLUMNS,
     CLUSTER_COLUMNS,
+    EVENT_PROFILE_COLUMNS,
     EVENT_COLUMNS,
     OptionFlowReplayDivergence,
     OptionFlowSchemaViolation,
     OptionFlowWriteError,
     OptionFlowWriter,
     checkpoint_values,
+    cluster_member_values,
     cluster_values,
     copy_text,
     event_values,
+    event_profile_values,
     write_condition_reference,
 )
+from realtime.option_source_flow import build_option_source_flow_identity
 from v2_database import disposable_v2_database, insert_cohort, requires_v2_database
 
 MIGRATION = Path(V2_MIGRATIONS_DIR) / "008_realtime_options_flow.sql"
@@ -150,6 +157,17 @@ def test_copy_text_writes_text_arrays_with_quoting_and_both_escape_layers():
 
 def test_writer_columns_match_the_schema_text():
     sql = MIGRATION.read_text(encoding="utf-8")
+    forward = "\n".join(
+        (
+            Path(V2_MIGRATIONS_DIR)
+            / name
+        ).read_text(encoding="utf-8")
+        for name in (
+            "025_realtime_advanced_options_control_plane.sql",
+            "026_advanced_options_flow_evidence.sql",
+            "027_advanced_options_provider_references.sql",
+        )
+    )
 
     def columns(table):
         block = sql.split(f"CREATE TABLE {table} (")[1].split("\n)")[0]
@@ -158,6 +176,10 @@ def test_writer_columns_match_the_schema_text():
             match = re.match(r"^    ([a-z_0-9]+) (?!KEY|\()\S", line)
             if match and not line.strip().startswith(("PRIMARY", "UNIQUE", "CHECK")):
                 found[match.group(1)] = "NOT NULL" in line and "DEFAULT" not in line
+        for alteration in forward.split(f"ALTER TABLE {table}")[1:]:
+            statement = alteration.split(";", 1)[0]
+            for name in re.findall(r"ADD COLUMN ([a-z_0-9]+) ", statement):
+                found[name] = False
         return found
 
     for table, written in (("rt.option_flow_events", EVENT_COLUMNS), ("rt.option_flow_clusters", CLUSTER_COLUMNS),
@@ -177,6 +199,89 @@ def test_row_tuples_line_up_with_their_column_lists():
     assert {len(event_values(item)) for item in out.events} == {len(EVENT_COLUMNS)}
     assert {len(cluster_values(item)) for item in out.clusters} == {len(CLUSTER_COLUMNS)}
     assert {len(checkpoint_values(item)) for item in out.checkpoints} == {len(CHECKPOINT_COLUMNS)}
+
+
+def test_advanced_rows_normalize_profiles_and_cluster_member_identity():
+    flow_policy = advanced_policy()
+    scope = advanced_contract_scope((CALL,))
+    base = config(
+        shard_count=1,
+        advanced_flow_policy=flow_policy,
+        contract_scope=scope,
+    )
+    source_flow = build_option_source_flow_identity(
+        journal_generation=JOURNAL_GENERATION,
+        stream_session_ids=(UUID(int=77),),
+        condition_semantics_sha256=base.semantics.semantics_sha256,
+        flow_policy_sha256=base.policy_sha256(),
+        advanced_flow_policy_sha256=flow_policy.sha256,
+        contract_scope_sha256=scope.sha256,
+    )
+    engine = OptionFlowEngine(replace(base, source_flow=source_flow))
+    messages = [quote(seq=1, time_ms=T0 - 100)]
+    messages += [
+        trade(
+            seq=index + 1,
+            time_ms=T0 + index * 80,
+            price=2.0,
+            size=50,
+            exchange=302 + index % 3,
+        )
+        for index in range(50)
+    ]
+    out = run(engine, messages)
+    profiles = [
+        values
+        for event in out.events
+        for values in event_profile_values(event)
+    ]
+    members = [
+        values
+        for cluster in out.clusters
+        for values in cluster_member_values(cluster)
+    ]
+
+    assert out.events and out.clusters and profiles and members
+    assert {len(row) for row in profiles} == {len(EVENT_PROFILE_COLUMNS)}
+    assert {len(row) for row in members} == {len(CLUSTER_MEMBER_COLUMNS)}
+    assert {row[3] for row in profiles} == {
+        "ACCUMULATION",
+        "SWEEP",
+    }
+    assert {row[3] for row in members} == {
+        "ACCUMULATION",
+        "SWEEP",
+    }
+    event_keys = {
+        (event.event_id, event.event_time, profile.profile)
+        for event in out.events
+        for profile in event.retention_thresholds
+    }
+    assert {
+        (row[4], row[5], row[3]) for row in members
+    } <= event_keys
+
+    connection = FakeConnection()
+    writer = OptionFlowWriter(connection)
+    writer.add(out)
+    writer.flush()
+    statements = [
+        entry[1]
+        for entry in connection.log
+        if entry[0] == "execute"
+    ]
+    assert any(
+        statement.startswith(
+            "INSERT INTO rt.option_flow_event_profiles"
+        )
+        for statement in statements
+    )
+    assert any(
+        statement.startswith(
+            "INSERT INTO rt.option_flow_cluster_members"
+        )
+        for statement in statements
+    )
 
 
 def test_writer_flushes_at_1000_rows_with_copy_into_a_staging_table_then_on_conflict():
@@ -342,22 +447,25 @@ def test_an_identical_replay_passes_the_divergence_check_without_error():
     writer.add(_output(2))
     report = writer.flush()
     compare = [entry[1] for entry in connection.log if entry[0] == "execute" and "IS DISTINCT FROM" in entry[1]]
-    assert len(compare) == 2 and report.events_inserted == 2
+    assert len(compare) == 3 and report.events_inserted == 2
     assert all("created_at" not in statement for statement in compare)
     assert any("t.event_id = s.event_id AND t.event_time = s.event_time" in statement for statement in compare)
-    assert any("t.revision = s.revision" in statement for statement in compare)
+    assert any("t.lineage_version = 1" in statement for statement in compare)
+    assert any("t.source_flow_id = s.source_flow_id" in statement for statement in compare)
 
 
 def test_a_divergent_replay_raises_with_identities_only_and_rolls_back():
     stamp = datetime(2026, 10, 12, 14, 30, tzinfo=timezone.utc)
-    connection = FakeConnection(divergent={"rt.option_flow_events": [(CALL, 1000, stamp, 1)]})
+    connection = FakeConnection(
+        divergent={"rt.option_flow_events": [(None, CALL, 1000, stamp, 1)]}
+    )
     writer = OptionFlowWriter(connection)
     writer.add(_output(2))
     with pytest.raises(OptionFlowReplayDivergence) as raised:
         writer.flush()
     error = raised.value
     assert isinstance(error, OptionFlowWriteError) and error.table == "rt.option_flow_events"
-    assert error.identities == ((CALL, 1000, stamp, 1),)
+    assert error.identities == ((None, CALL, 1000, stamp, 1),)
     text = str(error)
     assert CALL in text and "1000" in text and "5.0" not in text and "AT_OR_ABOVE_ASK" not in text
     assert connection.rollbacks == 1 and connection.commits == 0 and writer.pending_rows == 2
@@ -592,8 +700,13 @@ def test_writer_against_the_disposable_baseline_database():
                 with pytest.raises(OptionFlowReplayDivergence) as raised:
                     guard.flush()
                 assert raised.value.table == "rt.option_flow_events" and guard.pending_rows == 1
-                assert raised.value.identities == ((out.events[0].contract_ticker, out.events[0].source_seq,
-                                                    out.events[0].event_time, out.events[0].revision),)
+                assert raised.value.identities == ((
+                    out.events[0].source_flow_id,
+                    out.events[0].contract_ticker,
+                    out.events[0].source_seq,
+                    out.events[0].event_time,
+                    out.events[0].revision,
+                ),)
             revised = next(row for row in out.clusters if row.status == "FINAL")
             divergent = EngineOutput()
             divergent.clusters.append(replace(revised, total_size=revised.total_size + 1))

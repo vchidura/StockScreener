@@ -34,6 +34,10 @@ from realtime.equity_pipeline_config import (  # noqa: E402
     OptionsPipeline,
     RealtimeV2PipelineConfig,
 )
+from realtime.equity_live024_compatibility import (  # noqa: E402
+    LIVE024_SCHEMA_SHA256,
+    load_live_preflight_report,
+)
 from realtime.migrations import (  # noqa: E402
     EXPECTED_V2_DATABASE_NAME,
     V2_MIGRATIONS_DIR,
@@ -54,6 +58,9 @@ def parse_args(argv=None):
     parser.add_argument("--authorization-reference", required=True)
     parser.add_argument("--expires-at", type=datetime.fromisoformat, required=True)
     parser.add_argument("--report-path", type=Path, required=True)
+    parser.add_argument("--live024-preflight-report", type=Path)
+    parser.add_argument("--live024-preflight-report-sha256")
+    parser.add_argument("--live024-preflight-approval", type=Path)
     parser.add_argument("--env-file", type=Path, default=BACKEND_DIR / ".env")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -82,6 +89,28 @@ def parse_args(argv=None):
     args.report_path = args.report_path.resolve()
     if args.report_path.exists():
         parser.error("--report-path must be new")
+    compatibility_values = (
+        args.live024_preflight_report,
+        args.live024_preflight_report_sha256,
+        args.live024_preflight_approval,
+    )
+    if any(value is not None for value in compatibility_values) and any(
+        value is None for value in compatibility_values
+    ):
+        parser.error(
+            "live-024 report, SHA256 and approval must be supplied together"
+        )
+    if args.live024_preflight_report is not None:
+        args.live024_preflight_report = (
+            args.live024_preflight_report.resolve()
+        )
+        if not args.live024_preflight_report.is_file():
+            parser.error("--live024-preflight-report must exist")
+        args.live024_preflight_approval = (
+            args.live024_preflight_approval.resolve()
+        )
+        if not args.live024_preflight_approval.is_file():
+            parser.error("--live024-preflight-approval must exist")
     return args
 
 
@@ -123,6 +152,54 @@ def _provider(config):
     return provider, pool
 
 
+def _load_compatibility_preflight(args, checked_at):
+    if args.live024_preflight_report is None:
+        return None
+    if args.symbols != ("SPY",):
+        raise ValueError("live-024 compatibility is restricted to exact SPY")
+    report, digest = load_live_preflight_report(
+        args.live024_preflight_report,
+        args.live024_preflight_report_sha256,
+    )
+    if args.live024_preflight_approval.stat().st_size > 1024 * 1024:
+        raise ValueError("live-024 provisioning approval exceeds its bound")
+    approval = json.loads(
+        args.live024_preflight_approval.read_text(encoding="utf-8")
+    )
+    if (
+        approval.get("owner_decision")
+        != "approve_equity_live024_scope_provisioning"
+        or approval.get("conditional_execution_authorized") is not True
+        or approval.get("contract_id") != report["contract_id"]
+        or approval.get("preflight_report_sha256") != digest
+        or approval.get("qualification_report_sha256")
+        != report["qualification_report_sha256"]
+        or approval.get("manifest_id") != report.get("manifest_id")
+        or approval.get("authorization_reference")
+        != args.authorization_reference
+    ):
+        raise ValueError(
+            "live-024 preflight lacks exact scope-provisioning approval"
+        )
+    observed = datetime.fromisoformat(report["checked_at"]).astimezone(
+        timezone.utc
+    )
+    arm_deadline = datetime.fromisoformat(report["arm_deadline"]).astimezone(
+        timezone.utc
+    )
+    if (
+        report.get("database") != EXPECTED_V2_DATABASE_NAME
+        or report.get("schema_sha256") != LIVE024_SCHEMA_SHA256
+        or observed > checked_at
+        or checked_at - observed > timedelta(minutes=10)
+        or checked_at >= arm_deadline
+    ):
+        raise ValueError(
+            "live-024 preflight is stale, out of scope or past its arm deadline"
+        )
+    return report, digest
+
+
 def main(argv=None):
     args = parse_args(argv)
     config = RealtimeV2PipelineConfig.from_mapping(
@@ -159,19 +236,38 @@ def main(argv=None):
     )
     provider, pool = _provider(config)
     try:
+        compatibility = _load_compatibility_preflight(args, checked)
         with provider.transaction(APP_ROLE, read_only=True) as unit:
             cursor = unit.cursor
-            schema_sha256 = schema_fingerprint(
-                load_realtime_migrations(V2_MIGRATIONS_DIR)
+            schema_sha256 = (
+                schema_fingerprint(load_realtime_migrations(V2_MIGRATIONS_DIR))
+                if compatibility is None
+                else compatibility[0]["schema_sha256"]
             )
             cursor.execute(
-                "SELECT security_policy_sha256 "
-                "FROM rt.capability_profiles "
-                "ORDER BY created_at DESC,profile_id DESC LIMIT 1"
+                (
+                    "SELECT policy_sha256 "
+                    "FROM rt.database_security_policies "
+                    "WHERE policy_version='realtime_security_v3'"
+                )
+                if compatibility is not None
+                else (
+                    "SELECT security_policy_sha256 "
+                    "FROM rt.capability_profiles "
+                    "ORDER BY created_at DESC,profile_id DESC LIMIT 1"
+                )
             )
             security = cursor.fetchone()
             if security is None:
                 raise ValueError("V2 security policy identity is unavailable")
+            if (
+                compatibility is not None
+                and security[0].strip()
+                != compatibility[0]["security_policy_sha256"]
+            ):
+                raise ValueError(
+                    "live security policy differs from compatibility preflight"
+                )
             cursor.execute(
                 "SELECT DISTINCT ON (ticker) ticker,security_id "
                 "FROM ref.security_revisions "
@@ -207,6 +303,18 @@ def main(argv=None):
                 raise ValueError(
                     "selected universe runtime profile is not ACTIVE"
                 )
+            if (
+                compatibility is not None
+                and (
+                    runtime_profile.sha256
+                    != compatibility[0]["runtime_profile_sha256"]
+                    or runtime_policy_sha256
+                    != compatibility[0]["runtime_policy_sha256"]
+                )
+            ):
+                raise ValueError(
+                    "runtime profile differs from compatibility preflight"
+                )
         plan = build_advanced_equity_control_plane_plan(
             session_date=args.session_date,
             security_ids=security_ids,
@@ -238,6 +346,13 @@ def main(argv=None):
             "publication_advanced": False,
             "provider_requests": 0,
             "credentials_exposed": False,
+            "compatibility_contract": (
+                None if compatibility is None else compatibility[0]["contract_id"]
+            ),
+            "compatibility_preflight_sha256": (
+                None if compatibility is None else compatibility[1]
+            ),
+            "schema_sha256": schema_sha256,
         }
         write_report(args.report_path, report)
         print(json.dumps(report, indent=2))

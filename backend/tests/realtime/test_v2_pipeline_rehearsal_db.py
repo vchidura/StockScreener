@@ -338,7 +338,8 @@ class Runtime:
         self.clock = Clock(rehearsal.closed - timedelta(hours=1))
         self.environment = RunnerEnvironment(
             provider, build_id=f"rehearsal-{label}", reference_service=rehearsal.reference_service,
-            equity_source=rehearsal.source, universe=UNIVERSE)
+            equity_source=rehearsal.source,
+            universe=UniverseManifest(UNIVERSE.version, rehearsal.tickers, ()))
         self.transactions: list[Used] = []
         self.timings: dict[tuple, float] = {}
         self.crash_after: set[tuple] = set()
@@ -492,16 +493,28 @@ def anchor():
 
 
 class Rehearsal:
-    def __init__(self, pool, session: date) -> None:
+    def __init__(
+        self,
+        pool,
+        session: date,
+        *,
+        tickers=TICKERS,
+        started_at: datetime | None = None,
+    ) -> None:
         # REAL-TIME ANCHOR. The session replayed is the latest one that closed at least the provider delay ago
         # (see `anchor`), and its FINAL window (cutoff = the close) is W1: released now, the bars are fetched,
         # observed and inserted NOW, after the cutoff (close + provider delay) and before the window deadline,
         # which is what the two-clock loader (cutoff for bar_end, known_by = deadline for the recording clocks)
         # is for. The strategies read the deadline as the time the data is known (they subtract the provider
         # delay themselves), so they resolve this very session at every window of the run.
-        self.started = datetime.now(UTC)
+        self.tickers = tuple(tickers)
         self.session = session
         self.opened, self.closed = support.session_bounds(self.session)
+        self.started = (
+            datetime.now(UTC)
+            if started_at is None
+            else started_at.astimezone(UTC)
+        )
         horizon = self.started + RUN_HORIZON - PROVIDER_DELAY
         assert latest_expected_market_time(horizon, "1d") == latest_expected_market_time(horizon, "1h") == self.closed
         self.pool = pool
@@ -510,15 +523,15 @@ class Rehearsal:
         self.cohort, self.plan_id, self.security_ids, self.instrument_ids = self._seed_control_plane()
         started = time.perf_counter()
         self.history = support.build_history(
-            self.session, TICKERS, cohort_id=self.cohort, instrument_ids=self.instrument_ids,
+            self.session, self.tickers, cohort_id=self.cohort, instrument_ids=self.instrument_ids,
             fetched_at=self.started)
         self.history_seconds = time.perf_counter() - started
         self.chunks = {ticker: support.chunked_batches(self.history, ticker, segment_prefix="rehearsal-history")
-                       for ticker in TICKERS}
+                       for ticker in self.tickers}
         assert len({len(chunks) for chunks in self.chunks.values()}) == 1
         self.source = support.ChunkSource()
         self.reference_service = support.RehearsalReferenceService(
-            TICKERS, self.session, facts_base=self.closed - timedelta(minutes=40),
+            self.tickers, self.session, facts_base=self.closed - timedelta(minutes=40),
             facts_valid_until=self.closed + timedelta(hours=6))
         provider = V2ConnectionProvider({OWNER_POOL: pool}, V2AccessConfig(allow_disposable=True))
         provider.verify()
@@ -581,9 +594,9 @@ class Rehearsal:
                 "session_date, effective_at, profile_id, manifest_kind, stock_count, option_underlying_count, "
                 "member_count, allocation_policy_sha256, created_at) "
                 "VALUES (%s,%s,%s,%s,%s,%s,'EQUITY_VALIDATION',%s,0,%s,%s,%s)",
-                (str(manifest), digest(), digest(), self.session, born, str(profile), len(TICKERS), len(TICKERS),
+                (str(manifest), digest(), digest(), self.session, born, str(profile), len(self.tickers), len(self.tickers),
                  digest(), born))
-            for priority, ticker in enumerate(TICKERS, start=1):
+            for priority, ticker in enumerate(self.tickers, start=1):
                 security = support._security(ticker).security_id
                 security_ids[ticker] = security
                 cursor.execute("INSERT INTO ref.securities (security_id, asset_type, source_origin, created_at) "
@@ -1925,6 +1938,7 @@ def _seed_advanced_rehearsal(
     enabled,
     stage_catalog_version="stages_v2",
 ):
+    tickers = rehearsal.tickers
     profile_id, manifest_id, cohort_id, plan_id = uuid4(), uuid4(), uuid4(), uuid4()
     session_id, owner_id = uuid4(), uuid4()
     authorization_id, ingress_plan_id = uuid4(), uuid4()
@@ -1974,13 +1988,13 @@ def _seed_advanced_rehearsal(
                 rehearsal.session,
                 born,
                 str(profile_id),
-                len(TICKERS),
-                len(TICKERS),
+                len(tickers),
+                len(tickers),
                 allocation_policy_sha256,
                 born,
             ),
         )
-        for priority, ticker in enumerate(TICKERS, start=1):
+        for priority, ticker in enumerate(tickers, start=1):
             cursor.execute(
                 "INSERT INTO rt.subscription_members ("
                 "manifest_id, instrument_id, channel, priority, purpose, option_underlying"
@@ -2009,7 +2023,7 @@ def _seed_advanced_rehearsal(
             str(previous_session),
             -282,
         ).date()
-        for ticker in TICKERS:
+        for ticker in tickers:
             cursor.execute(
                 "INSERT INTO ref.corporate_action_coverage ("
                 "coverage_id, security_id, action_type, window_start, window_end, "
@@ -2058,7 +2072,7 @@ def _seed_advanced_rehearsal(
             (
                 runtime_profile_sha256,
                 f"ew-01-profile-{runtime_profile_sha256[:12]}",
-                len(TICKERS),
+                len(tickers),
                 configuration_sha256,
                 runtime_policy_sha256,
                 born,
@@ -2090,7 +2104,7 @@ def _seed_advanced_rehearsal(
                 str(authorization_id),
                 f"ew-01-{authorization_id}",
                 authorization_scope_sha256,
-                [len(TICKERS)],
+                [len(tickers)],
                 rehearsal.session,
                 rehearsal.session,
                 runtime_policy_sha256,
@@ -2118,7 +2132,7 @@ def _seed_advanced_rehearsal(
                 str(cohort_id),
                 str(manifest_id),
                 rehearsal.session,
-                len(TICKERS),
+                len(tickers),
                 f"ew-01-profile-{runtime_profile_sha256[:12]}",
                 runtime_profile_sha256,
                 configuration_sha256,
@@ -2170,15 +2184,16 @@ def _advanced_history_facts(
     stream_session_id,
     journal_generation,
 ):
+    tickers = rehearsal.tickers
     current_facts = tuple(
-        fact for ticker in TICKERS for fact in rehearsal.history[ticker]
+        fact for ticker in tickers for fact in rehearsal.history[ticker]
     )
     previous_session = exchange_calendars.get_calendar("XNYS").previous_session(
         str(rehearsal.session)
     ).date()
     previous_history = support.build_history(
         previous_session,
-        TICKERS,
+        tickers,
         cohort_id=rehearsal.cohort,
         instrument_ids=rehearsal.instrument_ids,
         fetched_at=rehearsal.started,
@@ -2194,7 +2209,7 @@ def _advanced_history_facts(
     }
     previous_by_id = {
         fact.revision.bar_revision_id: fact
-        for ticker in TICKERS
+        for ticker in tickers
         for fact in previous_history[ticker]
     }
     extra_ids = {
@@ -2341,13 +2356,13 @@ def _persist_advanced_history(rehearsal, facts):
             )
 
 
-def _advanced_payloads(cutoff):
+def _advanced_payloads(cutoff, *, tickers=TICKERS):
     payloads = []
     sequence = 1
     for minute in range(5):
         start = cutoff - timedelta(minutes=5 - minute)
         end = start + timedelta(minutes=1)
-        for ticker_index, ticker in enumerate(TICKERS):
+        for ticker_index, ticker in enumerate(tickers):
             base = 180 + ticker_index * 20 + minute
             payloads.append(
                 (
@@ -2376,7 +2391,7 @@ def _advanced_payloads(cutoff):
     payloads.append(
         (
             '[{"ev":"Q","sym":"'
-            + TICKERS[0]
+            + tickers[0]
             + '","bp":200,"ap":201,"bs":10,"as":11,"t":'
             + str(int(cutoff.timestamp() * 1000))
             + ',"q":'

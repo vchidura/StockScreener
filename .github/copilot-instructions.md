@@ -6,6 +6,10 @@ Keep this always-loaded file short. Detailed guidance is loaded only when needed
 
 - Start from the user's named file, symbol, command, or failure. Read the nearest
   owner and one relevant test before widening the search.
+- For Massive/Polygon provider, API, schema, field, entitlement or market-data
+  questions, use the Massive MCP server as the primary external authority before
+  general web search. Search its endpoint catalog first; actual provider-data
+  queries still require explicit scope authorization and must never expose secrets.
 - Before running commands, read [Windows execution](instructions/windows-execution.instructions.md)
   once for the current task. It also applies to read-only audits and commands
   that do not touch a matching file.

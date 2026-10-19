@@ -19,6 +19,7 @@ from option_flow_runner_support import (
     SESSION,
     FakeOptionsDatabase,
     MonotonicClock,
+    advanced_scope,
     harness,
     parse_rows,
     pinned_semantics,
@@ -26,14 +27,29 @@ from option_flow_runner_support import (
     scenario_messages,
     settings,
 )
-from option_flow_support import CALL, CANCEL, OTHER, PUT, T0, policy, semantics, trade
+from option_flow_support import (
+    CALL,
+    CANCEL,
+    OTHER,
+    PUT,
+    T0,
+    advanced_policy,
+    policy,
+    semantics,
+    trade,
+)
 from psycopg2 import errors
 from realtime.option_flow.checkpoint_state import CheckpointRow
 from realtime.option_flow.consumer import ConsumerLimits
+from realtime.option_flow.engine import DEFAULT_SHARD_COUNT, EngineConfig
 from realtime.option_flow.labels import PriorOpenInterest
 from realtime.option_flow.mock_feed import MockOptionFeed
 from realtime.option_flow.volume import BaselineKind
 from realtime.option_flow.writer import CHECKPOINT_COLUMNS, EVENT_COLUMNS
+from realtime.advanced_options_provider_contract import (
+    PROVENANCE_SYNTHETIC,
+    load_default_options_exchange_reference,
+)
 from realtime.orchestration_repository import ServicePlan
 from realtime.runner_environment import RunnerEnvironment
 from realtime.stage_orchestrator import StageContext, StageOutcome
@@ -42,6 +58,10 @@ from realtime.stage_runners_options import (
     OPTIONS_ACQUIRE_NOT_CONFIGURED,
     OPTIONS_ADMISSION_NOT_CONFIGURED,
     OPTIONS_FLOW_CONDITIONS_UNPINNED,
+    OPTIONS_FLOW_ADVANCED_IDENTITY_UNPINNED,
+    OPTIONS_FLOW_ADVANCED_POLICY_NOT_CONFIGURED,
+    OPTIONS_FLOW_CONTRACT_SCOPE_NOT_CONFIGURED,
+    OPTIONS_FLOW_EXCHANGE_REFERENCE_UNPINNED,
     OPTIONS_FLOW_POLICY_NOT_CONFIGURED,
     OPTIONS_FLOW_SOURCE_NOT_CONFIGURED,
     REPLAY_DIVERGENCE,
@@ -69,6 +89,19 @@ class SpySource:
 
     def last_offset(self):
         return self._feed.last_offset()
+
+
+def test_options_flow_uses_the_capacity_qualified_shard_count():
+    engine_config = EngineConfig(
+        cohort_id=uuid4(),
+        provider_tier="MASSIVE_ADVANCED",
+        policy=policy(),
+        semantics=pinned_semantics(),
+    )
+
+    assert DEFAULT_SHARD_COUNT == 9
+    assert OptionsFlowSettings().shard_count == DEFAULT_SHARD_COUNT
+    assert engine_config.shard_count == DEFAULT_SHARD_COUNT
 
 
 # --- fail-closed configuration -----------------------------------------------------------------------
@@ -106,6 +139,18 @@ def test_missing_conditions_and_missing_policy_each_block_with_their_own_code():
     environment.options_flow_semantics = pinned_semantics()
     assert options_flow_block_reason(environment) == OPTIONS_FLOW_POLICY_NOT_CONFIGURED
     environment.options_flow_policy = policy()
+    assert options_flow_block_reason(
+        environment
+    ) == OPTIONS_FLOW_ADVANCED_POLICY_NOT_CONFIGURED
+    environment.options_flow_advanced_policy = advanced_policy()
+    assert options_flow_block_reason(
+        environment
+    ) == OPTIONS_FLOW_CONTRACT_SCOPE_NOT_CONFIGURED
+    environment.options_flow_contract_scope = advanced_scope()
+    environment.options_flow_exchange_reference = (
+        load_default_options_exchange_reference()
+    )
+    environment.options_flow_settings = settings()
     assert options_flow_block_reason(environment) is None
     assert source.reads == 0
     # The source gate comes first, then the conditions pin.
@@ -116,7 +161,11 @@ def test_missing_conditions_and_missing_policy_each_block_with_their_own_code():
 def test_a_runner_without_a_database_blocks_instead_of_raising():
     source = SpySource(scenario_feed())
     environment = RunnerEnvironment(None, options_flow_source=source, options_flow_semantics=pinned_semantics(),
-                                    options_flow_policy=policy())
+                                    options_flow_policy=policy(),
+                                    options_flow_advanced_policy=advanced_policy(),
+                                    options_flow_contract_scope=advanced_scope(),
+                                    options_flow_exchange_reference=load_default_options_exchange_reference(),
+                                    options_flow_settings=settings())
     world = harness(source)
     context = StageContext(world.plan, world.orchestrator._placeholder_window(world.plan, NOW),
                            world.orchestrator._stages["OPTIONS_FLOW"], uuid4(), 1, NOW, None)
@@ -130,7 +179,7 @@ def test_the_runner_is_registered_and_reported_as_fail_closed_until_configured()
     assert RUNNER_FACTORIES["OPTIONS_FLOW"] is options_flow_runner
     assert RUNNER_FACTORIES["OPTIONS_ACQUIRE"] is options_acquire_runner
     assert RUNNER_FACTORIES["OPTIONS_ADMISSION"] is options_admission_runner
-    assert unwired_stages() == {"OPTIONS_CYCLE"}
+    assert unwired_stages() == frozenset()
     assert set(build_runners({"OPTIONS_FLOW"}, None)) == {"OPTIONS_FLOW"}
     assert fail_closed_stages(
         {"OPTIONS_ACQUIRE", "OPTIONS_ADMISSION", "OPTIONS_FLOW"}, RunnerEnvironment(None)
@@ -140,8 +189,74 @@ def test_the_runner_is_registered_and_reported_as_fail_closed_until_configured()
         "OPTIONS_FLOW": OPTIONS_FLOW_SOURCE_NOT_CONFIGURED,
     }
     configured = RunnerEnvironment(None, options_flow_source=SpySource(MockOptionFeed()),
-                                   options_flow_semantics=pinned_semantics(), options_flow_policy=policy())
+                                   options_flow_semantics=pinned_semantics(), options_flow_policy=policy(),
+                                   options_flow_advanced_policy=advanced_policy(),
+                                   options_flow_contract_scope=advanced_scope(),
+                                   options_flow_exchange_reference=load_default_options_exchange_reference(),
+                                   options_flow_settings=settings())
     assert fail_closed_stages({"OPTIONS_FLOW"}, configured) == {}
+
+
+def test_advanced_flow_policy_and_scope_identity_must_match_settings():
+    source = SpySource(scenario_feed())
+    flow_settings = settings(contract_scope_sha256="f" * 64)
+    environment = RunnerEnvironment(
+        None,
+        options_flow_source=source,
+        options_flow_semantics=pinned_semantics(),
+        options_flow_policy=policy(),
+        options_flow_advanced_policy=advanced_policy(),
+        options_flow_contract_scope=advanced_scope(),
+        options_flow_exchange_reference=load_default_options_exchange_reference(),
+        options_flow_settings=flow_settings,
+    )
+
+    assert (
+        options_flow_block_reason(environment)
+        == OPTIONS_FLOW_ADVANCED_IDENTITY_UNPINNED
+    )
+    assert source.reads == 0
+
+
+@pytest.mark.parametrize(
+    "reference,flow_settings",
+    (
+        (None, settings()),
+        (
+            replace(
+                load_default_options_exchange_reference(),
+                provenance=PROVENANCE_SYNTHETIC,
+            ),
+            settings(),
+        ),
+        (
+            load_default_options_exchange_reference(),
+            settings(exchange_reference_sha256="f" * 64),
+        ),
+    ),
+    ids=("missing", "synthetic", "settings-mismatch"),
+)
+def test_exchange_reference_failures_block_before_reads_or_state(
+    reference,
+    flow_settings,
+):
+    source = SpySource(scenario_feed())
+    world = harness(
+        source,
+        flow_settings=flow_settings,
+        environment_overrides={
+            "options_flow_exchange_reference": reference,
+        },
+    )
+
+    outcome = world.tick()
+
+    assert outcome.reason_codes == (
+        OPTIONS_FLOW_EXCHANGE_REFERENCE_UNPINNED,
+    )
+    assert source.reads == 0
+    assert world.database.transactions == []
+    assert world.environment.options_flow_state.session is None
 
 
 def test_acquire_and_admission_actions_are_typed_complete_and_fail_closed():

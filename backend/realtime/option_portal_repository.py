@@ -128,6 +128,13 @@ def _persist_package(cursor, package: RealtimeOptionPackage) -> None:
             raise ValueError("persisted option package leg identity conflict")
 
 
+def persist_realtime_option_package_cursor(
+    cursor,
+    package: RealtimeOptionPackage,
+) -> None:
+    _persist_package(cursor, package)
+
+
 def _persist_realtime_option_package_mark(
     connection,
     result: RealtimeOptionPackageMarkResult,

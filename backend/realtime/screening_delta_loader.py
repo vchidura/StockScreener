@@ -88,7 +88,9 @@ Integration
 loader=...)` calls `loader.load(cursor, **scope, include_portal_history=True)` (the scope may carry `known_by`),
 and `equity_evidence_runner` passes `known_by=window.deadline`. The loader needs no particular isolation level
 (the count is read with the delta, in one statement); the ticker cycle's read-only REPEATABLE READ transaction
-is fine. `load` serializes calls with a lock.
+is fine. The explicit `allow_late_identity_continuity` scope is forwarded unchanged to the shared input
+loader and defaults to false; retained bars never bypass its per-call identity checks. `load` serializes
+calls with a lock.
 """
 from __future__ import annotations
 
@@ -315,13 +317,15 @@ class ScreeningInputLoader:
     def load(self, cursor, *, cohort_id: UUID, session: date, cutoff: datetime, source_generation: int,
              include_portal_history: bool = False,
              include_strategy_action_details: bool = False,
-             known_by: datetime | None = None) -> RealtimeScreeningInput:
+             known_by: datetime | None = None,
+             allow_late_identity_continuity: bool = False) -> RealtimeScreeningInput:
         with self._lock:
             return load_screening_input(
                 cursor, cohort_id=cohort_id, session=session, cutoff=cutoff, source_generation=source_generation,
                 include_portal_history=include_portal_history,
                 include_strategy_action_details=include_strategy_action_details,
                 known_by=known_by, bar_loader=self._load_bars,
+                allow_late_identity_continuity=allow_late_identity_continuity,
             )
 
     def reset(self) -> None:

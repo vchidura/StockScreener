@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from realtime.advanced_ingress_controller import IngressFailureDisposition
+from realtime.advanced_ingress_controller import (
+    HybridRepairIdentity,
+    HybridStartupState,
+    IngressFailureDisposition,
+)
 
 
 script = importlib.import_module(
@@ -49,6 +53,28 @@ def test_controller_requires_explicit_execution_and_bounded_plan_budget():
         script.parse_args(base[:-1])
 
 
+def test_controller_requires_exact_rest_repair_allocation():
+    base = _base()
+    requests = base.index("--rest-repair-requests") + 1
+    decoded = base.index("--rest-repair-decoded-bytes") + 1
+    base[requests] = "2"
+    base[decoded] = "4096"
+
+    with pytest.raises(SystemExit):
+        script.parse_args(base)
+
+    args = script.parse_args([
+        *base,
+        "--rest-repair-response-byte-limit",
+        "2048",
+        "--rest-repair-expected-cost",
+        "standing authorization repair allocation",
+    ])
+
+    assert args.budgets.rest_repair_requests == 2
+    assert args.rest_repair_response_byte_limit == 2048
+
+
 def test_child_command_has_one_plan_scope_and_no_retry_tuning():
     args = script.parse_args(_base())
 
@@ -71,6 +97,28 @@ def test_external_ingress_mode_is_explicit():
     args = script.parse_args([*_base(), "--external-ingress"])
 
     assert args.external_ingress is True
+
+
+def test_controller_pins_canary_window_from_cli_or_container_environment(monkeypatch):
+    started = "2026-10-19T13:30:00+00:00"
+    ended = "2026-10-19T13:40:00+00:00"
+    args = script.parse_args([
+        *_base(), "--canary-start-at", started, "--canary-end-at", ended,
+    ])
+    assert args.canary_end_at - args.canary_start_at == timedelta(seconds=600)
+    monkeypatch.setenv("REALTIME_V2_ADVANCED_CANARY_START_AT", started)
+    monkeypatch.setenv("REALTIME_V2_ADVANCED_CANARY_END_AT", ended)
+    restarted = script.parse_args(_base())
+    assert restarted.canary_start_at == args.canary_start_at
+    assert restarted.canary_end_at == args.canary_end_at
+    assert restarted.budgets == args.budgets
+    with pytest.raises(SystemExit):
+        script.parse_args([*_base(), "--canary-end-at", "2026-10-19T13:40:01+00:00"])
+    with pytest.raises(SystemExit):
+        script.parse_args([*_base(), "--startup-backfill-sessions", "1"])
+    monkeypatch.delenv("REALTIME_V2_ADVANCED_CANARY_END_AT")
+    with pytest.raises(SystemExit):
+        script.parse_args(_base())
 
 
 def test_controller_child_runner_does_not_retry_a_finished_process():
@@ -100,6 +148,99 @@ def test_controller_child_runner_does_not_retry_a_finished_process():
 
     assert result[:2] == (2, False)
     assert calls == [("child",)]
+
+
+def test_websocket_child_starts_before_hybrid_repair_tick():
+    order = []
+
+    class Process:
+        returncode = 0
+
+        def __init__(self):
+            self.polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return None if self.polls == 1 else 0
+
+        def communicate(self):
+            return "", ""
+
+    def factory(command, **_kwargs):
+        order.append(("websocket", tuple(command)))
+        return Process()
+
+    result = script._run_child(
+        ["stream"],
+        stop=threading.Event(),
+        deadline=datetime.now(timezone.utc) + timedelta(minutes=1),
+        poll_seconds=0,
+        shutdown_seconds=1,
+        popen_factory=factory,
+        tick=lambda: order.append(("repair-tick", ())),
+    )
+
+    assert result[:2] == (0, False)
+    assert [item[0] for item in order] == ["websocket", "repair-tick"]
+
+
+def test_hybrid_repair_command_reuses_fixed_cutoff_incremental_runner(tmp_path):
+    args = script.parse_args([
+        *_base()[:-1],
+        "--rest-repair-requests",
+        "2",
+        "--rest-repair-decoded-bytes",
+        "4096",
+        "--rest-repair-response-byte-limit",
+        "2048",
+        "--rest-repair-expected-cost",
+        "bounded",
+        "--execute",
+    ])
+    runtime = SimpleNamespace(
+        cohort_id=script.UUID(int=2),
+        plan_id=script.UUID(int=3),
+        session_date=datetime(2026, 10, 19).date(),
+        authorized_end_at=datetime(
+            2026, 10, 19, 20, 0, tzinfo=timezone.utc,
+        ),
+        authorization_reference="owner-approved",
+        budgets=args.budgets,
+    )
+    identity = HybridRepairIdentity(
+        script.UUID(int=4),
+        "adv-hybrid-test",
+        HybridStartupState.REPAIR_READY,
+        datetime(2026, 10, 19, 13, 30, tzinfo=timezone.utc),
+        datetime(2026, 10, 19, 13, 45, tzinfo=timezone.utc),
+        datetime(2026, 10, 19, 13, 30, tzinfo=timezone.utc),
+        datetime(2026, 10, 19, 13, 40, tzinfo=timezone.utc),
+        datetime(2026, 10, 19, 13, 45, tzinfo=timezone.utc),
+        "MASSIVE_STOCKS_AGGREGATES_1M",
+        "conservative-unverified-delay-v1",
+        timedelta(minutes=15),
+    )
+
+    command = script._incremental_repair_command(
+        args,
+        runtime,
+        identity,
+        tmp_path / "repair.json",
+        SimpleNamespace(
+            rest_provider_delay_seconds=900,
+            rest_aggregate_endpoint_class=(
+                "MASSIVE_STOCKS_AGGREGATES_1M"
+            ),
+            rest_eligibility_policy_version=(
+                "conservative-unverified-delay-v1"
+            ),
+        ),
+    )
+
+    assert "run_realtime_v2_incremental_equity.py" in " ".join(command)
+    assert command[command.index("--cutoff") + 1].endswith("13:40:00+00:00")
+    assert "--advanced-ingress-plan-id" in command
+    assert command.count("--once") == 1
 
 
 def test_blocked_backfill_delays_only_before_live_warmup():

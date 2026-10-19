@@ -31,6 +31,10 @@ from realtime.advanced_scheduler import (  # noqa: E402
     prioritize_live_over_blocked_backfill_cursor,
     set_advanced_window_retry_status_cursor,
 )
+from realtime.advanced_ingress_plan import (  # noqa: E402
+    advanced_ingress_provider_deadline,
+    is_advanced_canary_window,
+)
 from realtime.database_access_v2 import APP_ROLE  # noqa: E402
 from realtime.equity_pipeline_config import (  # noqa: E402
     RealtimeV2PipelineConfig,
@@ -104,6 +108,18 @@ def parse_args(argv=None):
     return args
 
 
+def _authorized_windows(windows, *, first_cutoff, started, ended):
+    if not started < first_cutoff <= ended:
+        raise ValueError("first cutoff is outside the durable ingress window")
+    selected = tuple(
+        window for window in windows
+        if first_cutoff <= window.cutoff <= ended
+    )
+    if not selected:
+        raise ValueError("durable ingress window has no authorized cutoffs")
+    return selected
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     args.report_directory.mkdir(parents=True, exist_ok=True)
@@ -141,9 +157,19 @@ def main(argv=None) -> int:
             runtime_profile = catalog.profile_for_sha(
                 scope["runtime_profile_sha256"]
             )
-            session_close = calendar.session_close(session_date)
-            drain_deadline = session_close + timedelta(
-                seconds=runtime_profile.settings.drain_deadline_seconds
+            session_close = scope["authorized_end_at"]
+            bounded = is_advanced_canary_window(
+                scope["authorized_start_at"], session_close,
+            )
+            if bounded:
+                session_close = advanced_ingress_provider_deadline(
+                    scope["authorized_start_at"], session_close,
+                    drain_seconds=runtime_profile.settings.drain_deadline_seconds,
+                    shutdown_seconds=runtime_profile.settings.shutdown_deadline_seconds,
+                )
+            drain_deadline = (
+                scope["authorized_end_at"] if bounded
+                else session_close + timedelta(seconds=runtime_profile.settings.drain_deadline_seconds)
             )
             all_windows = advanced_session_windows(
                 session_date,
@@ -156,10 +182,11 @@ def main(argv=None) -> int:
                 if initial_session
                 else all_windows[0].cutoff
             )
-            windows = tuple(
-                window
-                for window in all_windows
-                if window.cutoff >= own_first_cutoff
+            windows = _authorized_windows(
+                all_windows,
+                first_cutoff=own_first_cutoff,
+                started=scope["authorized_start_at"],
+                ended=session_close,
             )
             with provider.transaction(APP_ROLE) as unit:
                 scheduler_session = ensure_advanced_scheduler_session_cursor(
@@ -223,10 +250,13 @@ def main(argv=None) -> int:
                         checked_at=now,
                     )
                 if now >= drain_deadline:
-                    session_date = calendar.next_session_date(session_date)
-                    initial_session = False
-                stop.wait(args.poll_seconds)
-                continue
+                    if not is_advanced_canary_window(
+                        scope["authorized_start_at"], session_close,
+                    ):
+                        session_date = calendar.next_session_date(session_date)
+                        initial_session = False
+                    stop.wait(args.poll_seconds)
+                    continue
             due = order_advanced_due_windows(
                 window for window in windows
                 if window.available_after <= now

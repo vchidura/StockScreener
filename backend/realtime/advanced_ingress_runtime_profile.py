@@ -29,6 +29,12 @@ def _positive_number(value: object, name: str) -> float:
     return float(value)
 
 
+def _nonnegative_int(value: object, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a nonnegative integer")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class AdvancedIngressTechnicalSettings:
     maximum_message_bytes: int
@@ -38,6 +44,9 @@ class AdvancedIngressTechnicalSettings:
     journal_batch_messages: int
     journal_batch_bytes: int
     bridge_batch_limit: int
+    rest_aggregate_endpoint_class: str
+    rest_eligibility_policy_version: str
+    rest_provider_delay_seconds: int
     websocket_open_timeout_seconds: int
     websocket_ping_interval_seconds: int
     websocket_ping_timeout_seconds: int
@@ -105,8 +114,21 @@ class AdvancedIngressTechnicalSettings:
         )
         for name in integer_fields:
             _positive_int(getattr(self, name), name)
+        _nonnegative_int(
+            self.rest_provider_delay_seconds,
+            "rest_provider_delay_seconds",
+        )
         for name in number_fields:
             _positive_number(getattr(self, name), name)
+        if (
+            self.rest_aggregate_endpoint_class
+            != "MASSIVE_STOCKS_AGGREGATES_1M"
+            or self.rest_eligibility_policy_version
+            != "conservative-unverified-delay-v1"
+        ):
+            raise ValueError(
+                "Advanced REST eligibility policy identity is invalid"
+            )
         if not 1_024 <= self.maximum_message_bytes <= 2 * 1024 * 1024:
             raise ValueError("maximum_message_bytes is outside gateway bounds")
         if self.buffer_byte_limit < self.maximum_message_bytes:
@@ -153,17 +175,24 @@ class AdvancedIngressRuntimeProfile:
             raise ValueError("runtime profile target must be in [1, 400]")
         if (
             self.provider_tier != "MASSIVE_ADVANCED"
-            or self.feed != "STOCKS"
-            or self.channels != ("AM",)
+            or (self.feed, self.channels)
+            not in {
+                ("STOCKS", ("AM",)),
+                ("OPTIONS", ("T", "Q")),
+            }
         ):
             raise ValueError(
-                "runtime profile must use MASSIVE_ADVANCED/STOCKS/AM"
+                "runtime profile must use an exact Advanced product scope"
             )
 
     @property
     def identity(self) -> dict[str, object]:
         return {
-            "contract": "advanced-equity-ingress-runtime-profile-v1",
+            "contract": (
+                "advanced-equity-ingress-runtime-profile-v1"
+                if self.feed == "STOCKS"
+                else "advanced-options-ingress-runtime-profile-v1"
+            ),
             "version": self.version,
             "universe_target": self.universe_target,
             "provider_tier": self.provider_tier,
@@ -178,7 +207,11 @@ class AdvancedIngressRuntimeProfile:
 
     def configuration_sha256(self, runtime_policy_sha256: str) -> str:
         return canonical_sha256({
-            "contract": "advanced-equity-ingress-configuration-v1",
+            "contract": (
+                "advanced-equity-ingress-configuration-v1"
+                if self.feed == "STOCKS"
+                else "advanced-options-ingress-configuration-v1"
+            ),
             "runtime_profile_sha256": self.sha256,
             "runtime_policy_sha256": runtime_policy_sha256,
             "provider_tier": self.provider_tier,

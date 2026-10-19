@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
+from uuid import UUID
 
 import pytest
 
@@ -21,7 +23,10 @@ from option_flow_support import (
     T0,
     UNKNOWN_CODE,
     UNREVIEWED,
+    advanced_contract_scope,
+    advanced_policy,
     check_event_rules,
+    config,
     engine,
     quote,
     run,
@@ -30,6 +35,18 @@ from option_flow_support import (
 from realtime.option_flow.engine import GapMarker, SubmitResult
 from realtime.option_flow.labels import PriorOpenInterest
 from realtime.option_flow.volume import BaselineKind
+from realtime.option_source_flow import build_option_source_flow_identity
+from realtime.advanced_options_flow_policy import (
+    AdvancedOptionsContractScope,
+    AdvancedOptionsFlowPolicy,
+)
+from realtime.advanced_options_provider_contract import (
+    PROVENANCE_SYNTHETIC,
+    AdvancedOptionsExchangeReference,
+    AdvancedOptionsProviderContract,
+    load_default_options_exchange_reference,
+    parse_exchange_reference,
+)
 
 SESSION = date(2026, 10, 12)
 PRIOR = date(2026, 10, 9)
@@ -53,6 +70,341 @@ def test_small_prints_count_toward_volume_but_are_not_persisted():
     assert (event.cumulative_volume_before, event.cumulative_volume_after) == (50, 150)
     assert eng.stats.below_filter == 5 and eng.stats.persisted_events == 1 and eng.stats.counted_prints == 6
     check_event_rules(event)
+
+
+def test_advanced_policy_and_contract_scope_must_be_bound_together():
+    flow_policy = advanced_policy()
+    scope = advanced_contract_scope((CALL,))
+
+    with pytest.raises(ValueError, match="bound together"):
+        config(advanced_flow_policy=flow_policy)
+    with pytest.raises(ValueError, match="bound together"):
+        config(contract_scope=scope)
+    with pytest.raises(ValueError, match="policy identity"):
+        config(
+            advanced_flow_policy=flow_policy,
+            contract_scope=replace(
+                scope,
+                flow_policy_sha256="f" * 64,
+            ),
+        )
+
+
+def test_advanced_routing_counts_volume_before_multi_profile_retention():
+    flow_policy = advanced_policy()
+    scope = advanced_contract_scope((CALL,))
+    eng = engine(
+        **_complete(
+            advanced_flow_policy=flow_policy,
+            contract_scope=scope,
+        )
+    )
+    out = run(eng, [
+        trade(seq=1, price=1.0, size=10),
+        trade(seq=2, price=5.0, size=500),
+    ])
+
+    assert len(out.events) == 1
+    event = out.events[0]
+    assert event.source_seq == 2
+    assert (
+        event.cumulative_volume_before,
+        event.cumulative_volume_after,
+    ) == (10, 510)
+    assert event.matched_profiles == (
+        "ACCUMULATION",
+        "BLOCK",
+        "SWEEP",
+    )
+    assert event.flow_universe_tier == "ETF"
+    assert event.flow_dte_lane == "CORE_SWING"
+    assert event.contract_expiration == date(2026, 10, 19)
+    assert event.advanced_flow_policy_sha256 == flow_policy.sha256
+    assert event.contract_scope_sha256 == scope.sha256
+    assert event.manifest_sha256 == scope.manifest_sha256
+    assert event.slot_sha256 == scope.slot_sha256
+    assert event.runtime_policy_sha256 == eng.policy_sha256
+    assert {row.profile for row in event.retention_thresholds} == {
+        "ACCUMULATION",
+        "BLOCK",
+        "SWEEP",
+    }
+    block = next(
+        row
+        for row in event.retention_thresholds
+        if row.profile == "BLOCK"
+    )
+    assert block.minimum_contracts == 500
+    assert block.minimum_print_premium == Decimal("250000")
+    assert block.contracts_matched and block.premium_matched
+    assert eng.stats.counted_prints == 2
+    assert eng.stats.below_filter == 1
+
+
+def test_advanced_profile_lane_routing_is_exact_and_keeps_one_event_identity():
+    ultra = "O:SPY261013C00650000"
+    position = "O:SPY261120C00650000"
+    flow_policy = advanced_policy()
+    scope = advanced_contract_scope((CALL, ultra, position))
+    eng = engine(
+        advanced_flow_policy=flow_policy,
+        contract_scope=scope,
+    )
+    out = run(eng, [
+        trade(symbol=ultra, seq=1, price=5.0, size=1000),
+        trade(symbol=CALL, seq=1, price=5.0, size=500),
+        trade(symbol=position, seq=1, price=5.0, size=500),
+    ])
+
+    assert len(out.events) == 3
+    by_contract = {
+        event.contract_ticker: event for event in out.events
+    }
+    assert by_contract[ultra].matched_profiles == ("ULTRA_SHORT",)
+    assert by_contract[CALL].matched_profiles == (
+        "ACCUMULATION",
+        "BLOCK",
+        "SWEEP",
+    )
+    assert by_contract[position].matched_profiles == (
+        "ACCUMULATION",
+        "BLOCK",
+    )
+    assert len({event.event_id for event in out.events}) == 3
+
+
+def test_advanced_retention_or_evidence_records_each_matched_branch():
+    flow_policy = advanced_policy()
+    scope = advanced_contract_scope((CALL,))
+    eng = engine(
+        advanced_flow_policy=flow_policy,
+        contract_scope=scope,
+    )
+    contracts_only = run(
+        eng,
+        [trade(seq=1, price=0.1, size=500)],
+    ).events[0]
+    premium_only = run(
+        eng,
+        [trade(seq=2, price=3000.0, size=1)],
+    ).events[0]
+
+    assert all(
+        row.contracts_matched and not row.premium_matched
+        for row in contracts_only.retention_thresholds
+    )
+    assert all(
+        not row.contracts_matched and row.premium_matched
+        for row in premium_only.retention_thresholds
+    )
+
+
+def test_advanced_scope_rejects_unadmitted_contracts_before_accounting():
+    flow_policy = advanced_policy()
+    scope = advanced_contract_scope((CALL,))
+    eng = engine(
+        advanced_flow_policy=flow_policy,
+        contract_scope=scope,
+    )
+
+    assert eng.submit(trade(symbol=OTHER)) is SubmitResult.REJECTED
+    assert eng.process().events == []
+    assert eng.stats.counted_prints == 0
+    assert eng.stats.rejected_by_reason == {"INVALID_FIELD_sym": 1}
+
+
+def test_advanced_scope_rejects_messages_from_another_session():
+    flow_policy = advanced_policy()
+    scope = advanced_contract_scope(
+        (CALL,),
+        session_date=date(2026, 10, 13),
+    )
+    eng = engine(
+        advanced_flow_policy=flow_policy,
+        contract_scope=scope,
+    )
+
+    out = run(eng, [trade(seq=1, price=5.0, size=500)])
+
+    assert out.events == []
+    assert eng.stats.counted_prints == 0
+    assert eng.stats.rejected_by_reason == {
+        "CONTRACT_SCOPE_SESSION_MISMATCH": 1,
+    }
+
+
+def test_source_flow_and_scope_identities_change_runtime_policy_identity():
+    flow_policy = advanced_policy()
+    scope = advanced_contract_scope((CALL,))
+    base = config(
+        advanced_flow_policy=flow_policy,
+        contract_scope=scope,
+    )
+    source_flow = build_option_source_flow_identity(
+        journal_generation=JOURNAL_GENERATION,
+        stream_session_ids=(
+            UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+        ),
+        condition_semantics_sha256=base.semantics.semantics_sha256,
+        flow_policy_sha256=base.policy_sha256(),
+        advanced_flow_policy_sha256=flow_policy.sha256,
+        contract_scope_sha256=scope.sha256,
+    )
+    bound = config(
+        advanced_flow_policy=flow_policy,
+        contract_scope=scope,
+        source_flow=source_flow,
+    )
+    changed_scope = replace(scope, slot_sha256="3" * 64)
+
+    assert bound.policy_sha256() != base.policy_sha256()
+    assert source_flow.flow_policy_sha256 == base.policy_sha256()
+    assert config(
+        advanced_flow_policy=flow_policy,
+        contract_scope=changed_scope,
+    ).policy_sha256() != base.policy_sha256()
+
+
+def test_exchange_mapping_identity_changes_policy_and_cluster_identity_only():
+    def reference(participant_id):
+        return parse_exchange_reference({
+            "provenance": PROVENANCE_SYNTHETIC,
+            "fetched_at": "2026-10-18T00:00:00Z",
+            "request": {"asset_class": "options", "locale": "us"},
+            "results": [
+                {
+                    "id": exchange_id,
+                    "asset_class": "options",
+                    "locale": "us",
+                    "name": f"SYNTHETIC EXCHANGE {exchange_id}",
+                    "participant_id": (
+                        participant_id
+                        if exchange_id == 302
+                        else str(exchange_id)
+                    ),
+                    "type": "exchange",
+                }
+                for exchange_id in (302, 303, 304)
+            ],
+        })
+
+    flow_policy = advanced_policy()
+    scope = advanced_contract_scope((CALL,))
+    messages = [quote(seq=1, time_ms=T0 - 100)]
+    messages += [
+        trade(
+            seq=index + 1,
+            time_ms=T0 + index * 80,
+            price=2.0,
+            size=50,
+            exchange=302 + index % 3,
+        )
+        for index in range(50)
+    ]
+    first = engine(
+        shard_count=1,
+        advanced_flow_policy=flow_policy,
+        contract_scope=scope,
+        exchange_reference=reference("S"),
+    )
+    second = engine(
+        shard_count=1,
+        advanced_flow_policy=flow_policy,
+        contract_scope=scope,
+        exchange_reference=reference("T"),
+    )
+    first_out = run(first, messages)
+    second_out = run(second, messages)
+
+    assert first.policy_sha256 != second.policy_sha256
+    assert {
+        event.exchange_reference_sha256
+        for event in first_out.events
+    } != {
+        event.exchange_reference_sha256
+        for event in second_out.events
+    }
+    assert {
+        row.cluster_id for row in first_out.clusters
+    }.isdisjoint({
+        row.cluster_id for row in second_out.clusters
+    })
+    assert all(
+        row.distinct_exchanges >= 2
+        for row in first_out.clusters
+        if row.qualifies
+    )
+
+
+def test_runtime_identity_hashes_are_not_recomputed_per_event(monkeypatch):
+    calls = {
+        "flow_policy": 0,
+        "contract_scope": 0,
+        "provider": 0,
+        "exchange": 0,
+    }
+    flow_policy_sha256 = AdvancedOptionsFlowPolicy.sha256.fget
+    contract_scope_sha256 = AdvancedOptionsContractScope.sha256.fget
+    provider_sha256 = AdvancedOptionsProviderContract.sha256.fget
+    exchange_sha256 = AdvancedOptionsExchangeReference.sha256.fget
+
+    def counted_flow_policy_sha256(value):
+        calls["flow_policy"] += 1
+        return flow_policy_sha256(value)
+
+    def counted_contract_scope_sha256(value):
+        calls["contract_scope"] += 1
+        return contract_scope_sha256(value)
+
+    def counted_provider_sha256(value):
+        calls["provider"] += 1
+        return provider_sha256(value)
+
+    def counted_exchange_sha256(value):
+        calls["exchange"] += 1
+        return exchange_sha256(value)
+
+    monkeypatch.setattr(
+        AdvancedOptionsFlowPolicy,
+        "sha256",
+        property(counted_flow_policy_sha256),
+    )
+    monkeypatch.setattr(
+        AdvancedOptionsContractScope,
+        "sha256",
+        property(counted_contract_scope_sha256),
+    )
+    monkeypatch.setattr(
+        AdvancedOptionsProviderContract,
+        "sha256",
+        property(counted_provider_sha256),
+    )
+    monkeypatch.setattr(
+        AdvancedOptionsExchangeReference,
+        "sha256",
+        property(counted_exchange_sha256),
+    )
+    flow_policy = advanced_policy()
+    eng = engine(
+        shard_count=1,
+        advanced_flow_policy=flow_policy,
+        contract_scope=advanced_contract_scope(
+            (CALL,),
+            flow_policy=flow_policy,
+        ),
+        exchange_reference=load_default_options_exchange_reference(),
+    )
+    initialized = dict(calls)
+    messages = [quote(seq=1, time_ms=T0 - 100)]
+    messages.extend(
+        trade(seq=index, time_ms=T0 + index, price=5.0, size=500)
+        for index in range(1, 101)
+    )
+
+    out = run(eng, messages)
+
+    assert out.events
+    assert calls == initialized
 
 
 def test_persisted_event_copies_the_quote_by_value_and_places_the_print():

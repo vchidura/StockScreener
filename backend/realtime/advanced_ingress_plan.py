@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from .contracts import canonical_sha256
@@ -11,7 +11,15 @@ from .contracts import canonical_sha256
 ADVANCED_INGRESS_PROVIDER = "massive"
 ADVANCED_INGRESS_FEED = "STOCKS"
 ADVANCED_INGRESS_CHANNEL = "AM"
+ADVANCED_OPTIONS_INGRESS_FEED = "OPTIONS"
+ADVANCED_OPTIONS_INGRESS_CHANNEL = "T,Q"
+ADVANCED_INGRESS_PRODUCT_SCOPES = frozenset({
+    (ADVANCED_INGRESS_FEED, ADVANCED_INGRESS_CHANNEL),
+    (ADVANCED_OPTIONS_INGRESS_FEED, ADVANCED_OPTIONS_INGRESS_CHANNEL),
+})
 ADVANCED_INGRESS_MODE = "SHADOW"
+ADVANCED_CANARY_MAX_SECONDS = 600
+ADVANCED_CANARY_MAX_DECODED_BYTES = 10 * 1024 * 1024
 ADVANCED_AUTHORIZATION_STATUSES = frozenset(
     {"READY", "REVOKED", "EXPIRED"}
 )
@@ -261,8 +269,8 @@ class AdvancedStreamAuthorization:
         )
         if (
             self.provider != ADVANCED_INGRESS_PROVIDER
-            or self.feed != ADVANCED_INGRESS_FEED
-            or self.channel != ADVANCED_INGRESS_CHANNEL
+            or (self.feed, self.channel)
+            not in ADVANCED_INGRESS_PRODUCT_SCOPES
         ):
             raise ValueError("authorization provider/feed/channel is invalid")
         if self.status not in ADVANCED_AUTHORIZATION_STATUSES:
@@ -315,6 +323,8 @@ def build_advanced_stream_authorization(
     runtime_policy_sha256: str,
     approval_source: str,
     approval_reference: str,
+    feed: str = ADVANCED_INGRESS_FEED,
+    channel: str = ADVANCED_INGRESS_CHANNEL,
 ) -> AdvancedStreamAuthorization:
     policy = _sha256(runtime_policy_sha256, "runtime_policy_sha256")
     source = _text(approval_source, "approval_source", 96)
@@ -324,8 +334,8 @@ def build_advanced_stream_authorization(
         "contract": "advanced-stream-authorization-v1",
         "parent_authorization_id": parent_authorization_id,
         "provider": ADVANCED_INGRESS_PROVIDER,
-        "feed": ADVANCED_INGRESS_FEED,
-        "channel": ADVANCED_INGRESS_CHANNEL,
+        "feed": feed,
+        "channel": channel,
         "allowed_universe_targets": targets,
         "valid_from": valid_from,
         "valid_through": valid_through,
@@ -351,6 +361,8 @@ def build_advanced_stream_authorization(
         runtime_policy_sha256=policy,
         approval_source=source,
         approval_reference=approval,
+        feed=feed,
+        channel=channel,
     )
 
 
@@ -486,6 +498,75 @@ class AdvancedIngressPlan:
         }
 
 
+def _canary_scope(
+    universe_target: int,
+    budgets: AdvancedIngressBudgets,
+    canary_start_at: datetime | None,
+    canary_end_at: datetime | None,
+) -> tuple[datetime, datetime]:
+    if canary_start_at is None or canary_end_at is None:
+        raise ValueError("canary requires both start and end timestamps")
+    started = _utc(canary_start_at, "canary_start_at")
+    ended = _utc(canary_end_at, "canary_end_at")
+    if not 0 < (ended - started).total_seconds() <= ADVANCED_CANARY_MAX_SECONDS:
+        raise ValueError("canary window must be positive and cannot exceed 600 seconds")
+    if (
+        universe_target != 1
+        or budgets.stream_sessions > 3
+        or budgets.connection_attempts > 3
+        or budgets.decoded_bytes > ADVANCED_CANARY_MAX_DECODED_BYTES
+        or budgets.rest_repair_requests
+        or budgets.rest_repair_decoded_bytes
+    ):
+        raise ValueError("canary exceeds target-1, 3/3/10-MiB or zero-repair bounds")
+    return started, ended
+
+
+def advanced_ingress_window(
+    *,
+    session_date: date,
+    universe_target: int,
+    budgets: AdvancedIngressBudgets,
+    canary_start_at: datetime | None = None,
+    canary_end_at: datetime | None = None,
+    calendar=None,
+) -> tuple[datetime, datetime]:
+    canary = None
+    if canary_start_at is not None or canary_end_at is not None:
+        canary = _canary_scope(universe_target, budgets, canary_start_at, canary_end_at)
+    if calendar is None:
+        from options.calendar import OptionExchangeCalendar
+
+        calendar = OptionExchangeCalendar("XNYS")
+    opened = _utc(calendar.session_open(session_date), "session_open")
+    closed = _utc(calendar.session_close(session_date), "session_close")
+    if canary is None:
+        return opened, closed
+    started, ended = canary
+    if not opened <= started < ended <= closed:
+        raise ValueError("canary window must be inside the exact XNYS session")
+    return started, ended
+
+
+def is_advanced_canary_window(started: datetime, ended: datetime) -> bool:
+    return 0 < (ended - started).total_seconds() <= ADVANCED_CANARY_MAX_SECONDS
+
+
+def advanced_ingress_provider_deadline(
+    started: datetime,
+    ended: datetime,
+    *,
+    drain_seconds: int,
+    shutdown_seconds: int,
+) -> datetime:
+    if is_advanced_canary_window(started, ended):
+        deadline = ended - timedelta(seconds=shutdown_seconds)
+        if deadline <= started:
+            raise ValueError("canary window cannot fit its reserved shutdown budget")
+        return deadline
+    return ended + timedelta(seconds=drain_seconds)
+
+
 def build_advanced_ingress_plan(
     *,
     authorization: AdvancedStreamAuthorization,
@@ -498,6 +579,8 @@ def build_advanced_ingress_plan(
     runtime_profile_sha256: str,
     configuration_sha256: str,
     budgets: AdvancedIngressBudgets,
+    canary_start_at: datetime | None = None,
+    canary_end_at: datetime | None = None,
     calendar=None,
 ) -> AdvancedIngressPlan:
     if authorization.status != "READY":
@@ -508,17 +591,19 @@ def build_advanced_ingress_plan(
         raise ValueError("universe target is not manually authorized")
     if not budgets.is_within(authorization.maximum_budgets):
         raise ValueError("daily plan budgets exceed standing authorization")
-    if calendar is None:
-        from options.calendar import OptionExchangeCalendar
-
-        calendar = OptionExchangeCalendar("XNYS")
-    authorized_start_at = _utc(
-        calendar.session_open(session_date),
-        "authorized_start_at",
-    )
-    authorized_end_at = _utc(
-        calendar.session_close(session_date),
-        "authorized_end_at",
+    if (
+        (canary_start_at is not None or canary_end_at is not None)
+        and (authorization.feed, authorization.channel)
+        != (ADVANCED_INGRESS_FEED, ADVANCED_INGRESS_CHANNEL)
+    ):
+        raise ValueError("bounded SPY canary requires STOCKS/AM authorization")
+    authorized_start_at, authorized_end_at = advanced_ingress_window(
+        session_date=session_date,
+        universe_target=universe_target,
+        budgets=budgets,
+        canary_start_at=canary_start_at,
+        canary_end_at=canary_end_at,
+        calendar=calendar,
     )
     identity = {
         "contract": "advanced-ingress-plan-v1",
@@ -583,6 +668,8 @@ class AdvancedIngressPlanRequest:
     budgets: AdvancedIngressBudgets
     preferred_cohort_id: UUID | None = None
     cohort_selection_reference: str | None = None
+    canary_start_at: datetime | None = None
+    canary_end_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if (self.preferred_cohort_id is None) != (
@@ -591,6 +678,15 @@ class AdvancedIngressPlanRequest:
             raise ValueError(
                 "explicit cohort selection requires id and reference"
             )
+        if self.canary_start_at is not None or self.canary_end_at is not None:
+            started, ended = _canary_scope(
+                self.universe_target, self.budgets,
+                self.canary_start_at, self.canary_end_at,
+            )
+            if started.date() != self.session_date or ended.date() != self.session_date:
+                raise ValueError("canary timestamps must belong to the requested session")
+            object.__setattr__(self, "canary_start_at", started)
+            object.__setattr__(self, "canary_end_at", ended)
 
 
 @dataclass(frozen=True, slots=True)

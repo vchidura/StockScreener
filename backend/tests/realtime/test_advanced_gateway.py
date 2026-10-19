@@ -193,6 +193,60 @@ def test_gateway_auth_failure_is_blocked_and_never_admitted():
     assert buffer.snapshot().admitted_events == 0
 
 
+def test_gateway_received_byte_ceiling_blocks_before_market_admission():
+    auth = _status("auth_success")
+    subscribed = _status("success")
+    market = (
+        b'[{"ev":"T","sym":"O:SPY261218C00000001",'
+        b'"p":1,"s":1,"t":1}]'
+    )
+    connection = FakeConnection((auth, subscribed, market))
+    buffer = _buffer()
+    gateway = _gateway(MarketFeed.OPTIONS, connection, buffer)
+
+    with pytest.raises(
+        GatewayOverload,
+        match="ADVANCED_SESSION_BYTE_CEILING_EXCEEDED",
+    ):
+        asyncio.run(
+            gateway.run_session(
+                maximum_market_messages=1,
+                maximum_received_bytes=len(auth) + len(subscribed),
+            )
+        )
+
+    assert gateway.state is GatewayFeedState.BLOCKED
+    assert gateway.received_bytes == len(auth) + len(subscribed) + len(market)
+    assert buffer.snapshot().admitted_events == 0
+    assert connection.closed == (
+        1009,
+        "session exceeds configured byte ceiling",
+    )
+
+
+def test_gateway_can_continue_message_numbers_across_reconnect_attempts():
+    market = (
+        b'[{"ev":"T","sym":"O:SPY261218C00000001",'
+        b'"p":1,"s":1,"t":1}]'
+    )
+    connection = FakeConnection(
+        (_status("auth_success"), _status("success"), market)
+    )
+    buffer = _buffer()
+    gateway = _gateway(MarketFeed.OPTIONS, connection, buffer)
+
+    asyncio.run(
+        gateway.run_session(
+            maximum_market_messages=1,
+            initial_message_number=7,
+        )
+    )
+    claim = buffer.claim_nowait(maximum_events=1, maximum_bytes=4096)
+
+    assert claim.messages[0].message_number == 7
+    assert gateway.next_message_number == 8
+
+
 def test_gateway_handoff_overload_disconnects_without_evicting():
     buffer = _buffer(maximum_events=1, maximum_bytes=128)
     buffer.put_nowait(

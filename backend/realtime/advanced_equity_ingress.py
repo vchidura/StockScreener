@@ -10,7 +10,7 @@ from uuid import UUID
 from .advanced_stream_control import AdvancedStreamUsage
 from .bridge import drain_raw_buffer_once
 from .buffer import RawMessageBuffer
-from .contracts import MarketChannel
+from .contracts import AssetClass, MarketChannel, MarketFeed
 from .journal import RawJournalReader, RawJournalWriter
 from .normalizer import InstrumentAdmission, normalize_raw_message
 
@@ -99,7 +99,7 @@ class BoundedAsyncProgressReporter:
                     self._last_failure_name = type(error).__name__
 
 
-class AdvancedEquityJournalPump:
+class AdvancedJournalPump:
     def __init__(
         self,
         buffer: RawMessageBuffer,
@@ -107,12 +107,34 @@ class AdvancedEquityJournalPump:
         journal_generation: UUID,
         admissions: Mapping[str, InstrumentAdmission],
         *,
+        feed: MarketFeed,
+        channels: frozenset[MarketChannel],
         maximum_batch_messages: int,
         maximum_batch_bytes: int,
         on_progress: Callable[[AdvancedJournalProgress], None] | None = None,
     ) -> None:
+        expected_channels = {
+            MarketFeed.STOCKS: frozenset({
+                MarketChannel.MINUTE_AGGREGATE,
+            }),
+            MarketFeed.OPTIONS: frozenset({
+                MarketChannel.TRADE,
+                MarketChannel.QUOTE,
+            }),
+        }
+        expected_asset = (
+            AssetClass.EQUITY
+            if feed is MarketFeed.STOCKS
+            else AssetClass.OPTION
+        )
         if (
             not admissions
+            or not isinstance(feed, MarketFeed)
+            or channels != expected_channels.get(feed)
+            or any(
+                admission.asset_class is not expected_asset
+                for admission in admissions.values()
+            )
             or type(maximum_batch_messages) is not int
             or maximum_batch_messages <= 0
             or type(maximum_batch_bytes) is not int
@@ -123,6 +145,9 @@ class AdvancedEquityJournalPump:
         self.journal_path = journal_path
         self.journal_generation = journal_generation
         self.admissions = dict(admissions)
+        self.feed = feed
+        self.channels = channels
+        self.expected_asset = expected_asset
         self.maximum_batch_messages = maximum_batch_messages
         self.maximum_batch_bytes = maximum_batch_bytes
         self.on_progress = on_progress
@@ -161,7 +186,7 @@ class AdvancedEquityJournalPump:
             raise RuntimeError("Advanced journal pump is already started")
         self._thread = threading.Thread(
             target=self._run,
-            name="advanced-equity-journal-pump",
+            name=f"advanced-{self.feed.value.lower()}-journal-pump",
             daemon=False,
         )
         self._thread.start()
@@ -229,17 +254,25 @@ class AdvancedEquityJournalPump:
                     event_watermark = progress.event_time_watermark
                     last_event_offset = progress.last_event_offset
                     for raw in raw_records:
+                        if raw.feed is not self.feed:
+                            raise AdvancedJournalDecodeError(
+                                "ADVANCED_FEED_SCOPE_MISMATCH"
+                            )
                         batch = normalize_raw_message(
                             raw,
                             self.admissions,
                         )
                         if batch.quarantines:
                             raise AdvancedJournalDecodeError(
-                                "ADVANCED_AM_QUARANTINED"
+                                (
+                                    "ADVANCED_AM_QUARANTINED"
+                                    if self.feed is MarketFeed.STOCKS
+                                    else "ADVANCED_OPTIONS_QUARANTINED"
+                                )
                             )
                         if any(
-                            event.event_kind
-                            is not MarketChannel.MINUTE_AGGREGATE
+                            event.event_kind not in self.channels
+                            or event.asset_class is not self.expected_asset
                             for event in batch.events
                         ):
                             raise AdvancedJournalDecodeError(
@@ -277,3 +310,28 @@ class AdvancedEquityJournalPump:
         except BaseException as error:
             self._error = error
             self._stop.set()
+
+
+class AdvancedEquityJournalPump(AdvancedJournalPump):
+    def __init__(
+        self,
+        buffer: RawMessageBuffer,
+        journal_path: Path,
+        journal_generation: UUID,
+        admissions: Mapping[str, InstrumentAdmission],
+        *,
+        maximum_batch_messages: int,
+        maximum_batch_bytes: int,
+        on_progress: Callable[[AdvancedJournalProgress], None] | None = None,
+    ) -> None:
+        super().__init__(
+            buffer,
+            journal_path,
+            journal_generation,
+            admissions,
+            feed=MarketFeed.STOCKS,
+            channels=frozenset({MarketChannel.MINUTE_AGGREGATE}),
+            maximum_batch_messages=maximum_batch_messages,
+            maximum_batch_bytes=maximum_batch_bytes,
+            on_progress=on_progress,
+        )

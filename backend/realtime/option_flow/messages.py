@@ -4,7 +4,13 @@ import math
 import re
 from typing import Any, Mapping, NamedTuple
 
+from ..advanced_options_provider_contract import (
+    MASSIVE_OPTIONS_PROVIDER_CONTRACT,
+)
+
 _OCC = re.compile(r"^O:([A-Z][A-Z0-9.]{0,9}?)(\d{6})([CP])(\d{8})$")
+TRADE_PROVIDER_FIELDS = MASSIVE_OPTIONS_PROVIDER_CONTRACT.trade_fields
+QUOTE_PROVIDER_FIELDS = MASSIVE_OPTIONS_PROVIDER_CONTRACT.quote_fields
 
 
 class MessageRejected(ValueError):
@@ -87,7 +93,7 @@ def _symbol(raw: Mapping[str, Any]) -> str:
 
 
 def parse_trade(raw: Mapping[str, Any], offset: int | None = None) -> TradeMessage:
-    """T.* fields: sym, x (exchange), p, s, c[] (conditions), t (ms), q (sequence)."""
+    """Parse the documentation-pinned T event fields."""
     symbol = _symbol(raw)
     price = _number(raw, "p", allow_zero=False)
     size = _integer(raw, "s", minimum=1)
@@ -109,7 +115,7 @@ def parse_trade(raw: Mapping[str, Any], offset: int | None = None) -> TradeMessa
 
 
 def parse_quote(raw: Mapping[str, Any], offset: int | None = None) -> QuoteMessage:
-    """Q.* fields: sym, bx, ax, bp, ap, bs, as, t (ms), q (sequence)."""
+    """Parse the documentation-pinned Q event fields."""
     symbol = _symbol(raw)
     bid = _number(raw, "bp", allow_zero=True)
     ask = _number(raw, "ap", allow_zero=True)

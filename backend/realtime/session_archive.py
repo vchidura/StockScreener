@@ -43,8 +43,14 @@ KIND_RELATIONS: Mapping[str, tuple[str, ...]] = {
         "rt.detector_datasets", "rt.detector_evaluations", "rt.detector_events",
         "rt.detector_event_inputs",
     ),
-    OPTION_FLOW_EVENTS: ("rt.option_flow_events",),
-    OPTION_FLOW_CLUSTERS: ("rt.option_flow_clusters",),
+    OPTION_FLOW_EVENTS: (
+        "rt.option_flow_events",
+        "rt.option_flow_event_profiles",
+    ),
+    OPTION_FLOW_CLUSTERS: (
+        "rt.option_flow_clusters",
+        "rt.option_flow_cluster_members",
+    ),
     OUTCOMES: ("rt.alert_management_assessments",),
 }
 

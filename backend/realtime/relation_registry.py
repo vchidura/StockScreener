@@ -209,7 +209,41 @@ RELATIONS: dict[str, Relation] = {
     "ref.exchange_codes": _r("shared", append=True, **_REF),
     "ref.option_condition_semantics": _r("shared", append=True, **_REF),
     "rt.option_flow_events": _r("options", "ARCHIVE_FIRST", append=True, partitioned=True, api=True),
+    "rt.option_flow_event_profiles": _r(
+        "options", "ARCHIVE_FIRST", append=True, partitioned=True, api=True
+    ),
     "rt.option_flow_clusters": _r("options", "ARCHIVE_FIRST", append=True, partitioned=True, api=True),
+    "rt.option_flow_cluster_members": _r(
+        "options", "ARCHIVE_FIRST", append=True, partitioned=True, api=True
+    ),
+    "rt.option_flow_contract_scopes": _r(
+        "options", "BOUNDED", append=True
+    ),
+    "rt.option_flow_contract_scope_members": _r(
+        "options", "BOUNDED", append=True
+    ),
+    "rt.option_flow_policies": _r(
+        "options", "BOUNDED", append=True
+    ),
+    "rt.advanced_options_reference_states": _r(
+        "options", "BOUNDED", append=True
+    ),
+    "rt.advanced_options_reference_state_members": _r(
+        "options", "BOUNDED", append=True
+    ),
+    "rt.advanced_options_reference_session_freezes": _r(
+        "options", "BOUNDED", append=True
+    ),
+    "rt.advanced_options_reference_cycle_bindings": _r(
+        "options", "BOUNDED", append=True
+    ),
+    "rt.advanced_options_rolling_checkpoints": _r(
+        "options", "BOUNDED", append=True
+    ),
+    "rt.advanced_options_flow_package_evidence": _r(
+        "options", "BOUNDED", append=True
+    ),
+    "rt.option_source_flows": _r("options", "BOUNDED", append=True),
     "rt.option_volume_checkpoints": _r("options", "HOT_TTL", mutable=True, delete=True),
     "rt.local_mock_requests": _r("options", "OWNER_ONLY"),
     "rt.local_mock_request_inputs": _r("options", "OWNER_ONLY"),
@@ -245,7 +279,9 @@ PARTITION_POLICY_SEEDS = {
     "rt.portal_snapshot_kept": ("WEEKLY", "SESSION_WINDOW", "SESSIONS", 26),
     "rt.portal_releases": ("MONTHLY", "KEPT_3M", "MONTHS", 3),
     "rt.option_flow_events": ("WEEKLY", "ARCHIVE_FIRST", "SESSIONS", 26),
+    "rt.option_flow_event_profiles": ("WEEKLY", "ARCHIVE_FIRST", "SESSIONS", 26),
     "rt.option_flow_clusters": ("WEEKLY", "ARCHIVE_FIRST", "SESSIONS", 26),
+    "rt.option_flow_cluster_members": ("WEEKLY", "ARCHIVE_FIRST", "SESSIONS", 26),
 }
 
 

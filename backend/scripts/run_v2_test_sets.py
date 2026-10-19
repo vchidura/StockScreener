@@ -39,7 +39,8 @@ FAST = (
     "test_ticker_projection_golden", "test_check_scripts_against_v2_registry", "test_realtime_v2_audit_scripts",
     "test_row_value_sharing", "test_rows_by_security", "test_run_v2_test_sets",
     "test_realtime_v2_finalizer_worker_script", "test_advanced_equity_journal_bridge",
-    "test_realtime_v2_advanced_equity_bridge_script",
+    "test_realtime_v2_advanced_equity_bridge_script", "test_advanced_options_p6_harness",
+    "test_advanced_options_flow_policy",
 )
 SLOW = (
     "test_ticker_vertical_slice", "test_ticker_projection_state", "test_realtime_architecture_profile",
@@ -56,6 +57,7 @@ DB = (
     "test_shadow_and_tier_cohort_v2_db",
     "test_option_cycle_input_v2_db", "test_screening_delta_loader_db", "test_ticker_reference_v2_db",
     "test_realtime_v2_audit_scripts", "test_stage_runners_bind_v2_db", "test_option_flow_runner_v2_db",
+    "test_advanced_options_p5_v2_db",
     "test_v2_pipeline_rehearsal_db", "test_equity_interval_finalizer_v2_db",
     "test_advanced_equity_journal_bridge_v2_db",
 )

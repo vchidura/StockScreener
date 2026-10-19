@@ -20,12 +20,17 @@ from option_flow_support import (
     REGULAR,
     REVIEW,
     T0,
+    advanced_contract_scope,
+    advanced_policy,
     policy,
     quote,
     trade,
 )
 from orchestration_fakes import InMemoryOrchestrationRepository
 from realtime.option_flow.conditions import ConditionSemantics, build_semantics, parse_payload, parse_review
+from realtime.advanced_options_provider_contract import (
+    load_default_options_exchange_reference,
+)
 from realtime.option_flow.consumer import ConsumerLimits
 from realtime.option_flow.mock_feed import MockOptionFeed
 from realtime.option_flow.volume import BaselineKind
@@ -39,8 +44,15 @@ from realtime.stage_runners_options import OptionsFlowSettings, options_flow_run
 SESSION = date(2026, 10, 12)
 NOW = datetime(2026, 10, 12, 15, 0, tzinfo=timezone.utc)
 ALL = frozenset(STAGES_V1)
-IWM = "O:IWM261218C00200000"
+IWM = "O:IWM261019C00200000"
 DIA = "O:DIA261218C00400000"
+
+
+def advanced_scope():
+    return advanced_contract_scope(
+        (CALL, PUT, OTHER, IWM),
+        session_date=SESSION,
+    )
 
 
 def pinned_semantics() -> ConditionSemantics:
@@ -88,10 +100,16 @@ def scenario_feed(base_ms: int = T0, *, frame_size: int = 1) -> MockOptionFeed:
 
 
 def settings(**overrides) -> OptionsFlowSettings:
+    flow_policy = advanced_policy()
+    scope = advanced_scope()
+    exchange_reference = load_default_options_exchange_reference()
     values = dict(
         shard_count=2, flush_rows=1, flush_interval_seconds=1_000_000.0, initial_baseline=BaselineKind.SESSION_COMPLETE,
         limits=ConsumerLimits(batch_size=4, max_messages=10_000, max_seconds=1_000_000.0),
-        history_per_contract=64, checkpoint_interval_ms=1_000, checkpoint_interval_seconds=0.0)
+        history_per_contract=64, checkpoint_interval_ms=1_000, checkpoint_interval_seconds=0.0,
+        advanced_flow_policy_sha256=flow_policy.sha256,
+        contract_scope_sha256=scope.sha256,
+        exchange_reference_sha256=exchange_reference.sha256)
     values.update(overrides)
     return OptionsFlowSettings(**values)
 
@@ -109,10 +127,17 @@ class FakeOptionsDatabase:
     checkpoints: dict = field(default_factory=dict)
     gaps: dict = field(default_factory=dict)
     events: list = field(default_factory=list)
+    event_profiles: list = field(default_factory=list)
     clusters: list = field(default_factory=list)
+    cluster_members: list = field(default_factory=list)
     volume: list = field(default_factory=list)
     event_keys: dict = field(default_factory=dict)
+    event_profile_keys: dict = field(default_factory=dict)
     cluster_keys: dict = field(default_factory=dict)
+    cluster_member_keys: dict = field(default_factory=dict)
+    contract_scopes: dict = field(default_factory=dict)
+    contract_scope_members: dict = field(default_factory=dict)
+    source_flows: dict = field(default_factory=dict)
     volume_store: dict = field(default_factory=dict)
     transactions: list = field(default_factory=list)
     commit_log: list = field(default_factory=list)
@@ -175,6 +200,41 @@ class _FakeCursor:
         rows, self._rows = self._rows, []
         return rows
 
+    def fetchone(self):
+        if not self._rows:
+            return None
+        return self._rows.pop(0)
+
+    def executemany(self, statement, parameters):
+        text = " ".join(statement.split())
+        if not text.startswith(
+            "INSERT INTO rt.option_flow_contract_scope_members"
+        ):
+            raise AssertionError(f"unexpected executemany: {text[:80]}")
+        pending = self._pending.setdefault(
+            "rt.option_flow_contract_scope_members",
+            {},
+        )
+        fresh = []
+        for values in parameters:
+            key = (values[0], values[1])
+            stored = self._db.contract_scope_members.get(
+                key,
+                pending.get(key),
+            )
+            if stored is None:
+                pending[key] = tuple(values)
+                fresh.append((key, tuple(values)))
+            elif stored != tuple(values):
+                raise ValueError("persisted contract scope members conflict")
+        self._effects.append(
+            lambda fresh=fresh: [
+                self._db.contract_scope_members.__setitem__(key, values)
+                for key, values in fresh
+            ]
+        )
+        self.rowcount = len(fresh)
+
     def copy_expert(self, statement, file):
         stage = statement.split()[1]
         self._staged[stage] = [line + "\n" for line in file.read().split("\n") if line]
@@ -205,9 +265,98 @@ class _FakeCursor:
         if text.startswith("INSERT INTO rt.option_flow_events"):
             self._keyed_insert("rt.option_flow_events", self._staged.get("_stage_option_flow_events", []),
                                db.events, db.event_keys, 2)
+        elif text.startswith("INSERT INTO rt.option_flow_event_profiles"):
+            self._keyed_insert(
+                "rt.option_flow_event_profiles",
+                self._staged.get("_stage_option_flow_event_profiles", []),
+                db.event_profiles,
+                db.event_profile_keys,
+                4,
+            )
         elif text.startswith("INSERT INTO rt.option_flow_clusters"):
             self._keyed_insert("rt.option_flow_clusters", self._staged.get("_stage_option_flow_clusters", []),
                                db.clusters, db.cluster_keys, 3)
+        elif text.startswith("INSERT INTO rt.option_flow_cluster_members"):
+            self._keyed_insert(
+                "rt.option_flow_cluster_members",
+                self._staged.get("_stage_option_flow_cluster_members", []),
+                db.cluster_members,
+                db.cluster_member_keys,
+                6,
+            )
+        elif text.startswith("INSERT INTO rt.option_flow_contract_scopes"):
+            key = parameters[0]
+            values = tuple(parameters)
+            pending = self._pending.setdefault(
+                "rt.option_flow_contract_scopes",
+                {},
+            )
+            stored = db.contract_scopes.get(key, pending.get(key))
+            if stored is None:
+                pending[key] = values
+                self._effects.append(
+                    lambda key=key, values=values:
+                    db.contract_scopes.__setitem__(key, values)
+                )
+                self.rowcount = 1
+            elif stored == values:
+                self.rowcount = 0
+            else:
+                raise ValueError("persisted contract scope conflicts")
+        elif text.startswith(
+            "SELECT contract_scope_sha256,scope_version,session_date"
+        ):
+            key = parameters[0]
+            pending = self._pending.get(
+                "rt.option_flow_contract_scopes",
+                {},
+            )
+            stored = pending.get(key, db.contract_scopes.get(key))
+            self._rows = [] if stored is None else [stored]
+        elif text.startswith(
+            "SELECT contract_scope_sha256,contract_ticker,underlyer"
+        ):
+            scope_sha256 = parameters[0]
+            pending = self._pending.get(
+                "rt.option_flow_contract_scope_members",
+                {},
+            )
+            combined = dict(db.contract_scope_members)
+            combined.update(pending)
+            self._rows = [
+                values
+                for key, values in sorted(combined.items())
+                if key[0] == scope_sha256
+            ]
+        elif text.startswith("INSERT INTO rt.option_source_flows"):
+            key = parameters[0]
+            values = tuple(parameters)
+            pending = self._pending.setdefault(
+                "rt.option_source_flows",
+                {},
+            )
+            stored = db.source_flows.get(key, pending.get(key))
+            if stored is None:
+                pending[key] = values
+                self._effects.append(
+                    lambda key=key, values=values:
+                    db.source_flows.__setitem__(key, values)
+                )
+                self.rowcount = 1
+            elif stored == values:
+                self.rowcount = 0
+            else:
+                raise ValueError("persisted source-flow identity conflicts")
+        elif text.startswith(
+            "SELECT source_flow_id,source_flow_sha256,source_cohort_id"
+        ):
+            key = parameters[0]
+            pending = self._pending.get(
+                "rt.option_source_flows",
+                {},
+            )
+            stored = pending.get(key, db.source_flows.get(key))
+            self._rows = [] if stored is None else [stored]
         elif text.startswith("INSERT INTO rt.option_volume_checkpoints"):
             written = []
             for line in self._staged.get("_stage_option_volume_checkpoints", []):
@@ -219,7 +368,16 @@ class _FakeCursor:
                                           for key, line in written])
             self.rowcount = len(written)
         elif "IS DISTINCT FROM" in text:
-            table = "rt.option_flow_events" if "rt.option_flow_events" in text else "rt.option_flow_clusters"
+            table = next(
+                name
+                for name in (
+                    "rt.option_flow_event_profiles",
+                    "rt.option_flow_cluster_members",
+                    "rt.option_flow_events",
+                    "rt.option_flow_clusters",
+                )
+                if name in text
+            )
             rows = [tuple(key) for key in self._divergent.get(table, [])]
             if db.diverge_events and table == "rt.option_flow_events":
                 rows = [(CALL, 1, "2026-10-12 14:30:00+00", 1)]
@@ -315,6 +473,11 @@ def harness(feed, *, database: FakeOptionsDatabase | None = None, flow_settings:
         options_flow_semantics=pinned_semantics() if semantics is None else semantics,
         options_flow_policy=policy(sweep_window_seconds=5, minimum_sweep_prints=3) if flow_policy is None else flow_policy,
         options_flow_settings=settings() if flow_settings is None else flow_settings,
+        options_flow_advanced_policy=advanced_policy(),
+        options_flow_contract_scope=advanced_scope(),
+        options_flow_exchange_reference=(
+            load_default_options_exchange_reference()
+        ),
         options_flow_oi_loader=oi_loader if oi_loader is not None else (lambda context, session: {}),
         options_flow_clock=clock if clock is not None else MonotonicClock(),
     )

@@ -617,6 +617,9 @@ def reuse_advanced_input_ready_runner(
                 advanced_input_gate_sha256=gate_digest,
             )
         except ValueError:
+            logger.exception(
+                "Advanced INPUT_READY reuse identity recomputation failed"
+            )
             return StageOutcome.failed(INPUT_READY_REUSE_MISMATCH)
         if (
             receipt.cutoff != context.window.cutoff
@@ -628,6 +631,21 @@ def reuse_advanced_input_ready_runner(
                 gate_digest,
             )
         ):
+            logger.error(
+                "Advanced INPUT_READY reuse mismatch: "
+                "cutoff=%s/%s universe=%s/%s input=%s/%s build=%s/%s",
+                receipt.cutoff,
+                context.window.cutoff,
+                receipt.universe_sha256,
+                universe_sha256,
+                receipt.input_sha256,
+                input_sha256,
+                receipt.build_id,
+                bind_advanced_input_gate_build_id(
+                    environment.build_id,
+                    gate_digest,
+                ),
+            )
             return StageOutcome.failed(INPUT_READY_REUSE_MISMATCH)
         return StageOutcome.complete(
             receipt=receipt,

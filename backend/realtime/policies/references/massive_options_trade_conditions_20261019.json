@@ -1,0 +1,874 @@
+{
+  "provenance": "LIVE_CAPTURED",
+  "provenance_note": "Captured once through the authorized Massive MCP reference endpoint; no WebSocket or market-data endpoint was called.",
+  "fetched_at": "2026-10-19T03:42:57.6100162Z",
+  "request": {
+    "asset_class": "options",
+    "data_type": "trade",
+    "limit": 1000,
+    "sort": "id",
+    "order": "asc"
+  },
+  "provider_contract_sha256": "81ead7adb8920facf158dc0d5e10d4154146d9cb90b2f29dcb1118fdeafba0f3",
+  "results": [
+    {
+      "id": 201,
+      "type": "sale_condition",
+      "abbreviation": "CANC",
+      "name": "Canceled",
+      "description": "Transaction previously reported (other than as the last or opening report for the particular option contract) is now to be canceled.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "A"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        },
+        "market_center": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        }
+      }
+    },
+    {
+      "id": 202,
+      "type": "sale_condition",
+      "abbreviation": "OSEQ",
+      "name": "Late and Out Of Sequence",
+      "description": "Transaction is being reported late and is out of sequence; i.e., later transactions have been reported for the particular option contract.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "B"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        },
+        "market_center": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        }
+      }
+    },
+    {
+      "id": 203,
+      "type": "sale_condition",
+      "abbreviation": "CNCL",
+      "name": "Last and Canceled",
+      "description": "Transaction is the last reported for the particular option contract and is now canceled.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "C"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        },
+        "market_center": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        }
+      }
+    },
+    {
+      "id": 204,
+      "type": "sale_condition",
+      "abbreviation": "LATE",
+      "name": "Late",
+      "description": "Transaction is being reported late, but is in the correct sequence; i.e., no later transactions have been reported for the particular option contract.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "D"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        },
+        "market_center": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        }
+      }
+    },
+    {
+      "id": 205,
+      "type": "sale_condition",
+      "abbreviation": "CNCO",
+      "name": "Opening Trade and Canceled",
+      "description": "Transaction was the first one (opening) reported this day for this particular option contract. Although later transactions have been reported, this transaction is now to be canceled.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "E"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        },
+        "market_center": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        }
+      }
+    },
+    {
+      "id": 206,
+      "type": "sale_condition",
+      "abbreviation": "OPEN",
+      "name": "Opening Trade, Late, and Out Of Sequence",
+      "description": "Transaction is a late report of the opening trade and is out of sequence; i.e., other transactions have been reported for the particular option contract.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "F"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        },
+        "market_center": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        }
+      }
+    },
+    {
+      "id": 207,
+      "type": "sale_condition",
+      "abbreviation": "CNOL",
+      "name": "Only Trade and Canceled",
+      "description": "Transaction was the only one reported this day for the particular option contract and is now to be canceled.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "G"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        },
+        "market_center": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": false
+        }
+      }
+    },
+    {
+      "id": 208,
+      "type": "sale_condition",
+      "abbreviation": "OPNL",
+      "name": "Opening Trade and Late",
+      "description": "Transaction is a late report of the opening trade, but is in the correct sequence; i.e., no other transactions have been reported for the particular option contract.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "H"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 209,
+      "type": "sale_condition",
+      "abbreviation": "AUTO",
+      "name": "Automatic Execution",
+      "description": "Transaction was executed electronically. Prefix appears solely for information; process as a regular transaction.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "I"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 210,
+      "type": "sale_condition",
+      "abbreviation": "REOP",
+      "name": "Reopening Trade",
+      "description": "Transaction is a reopening of an option contract in which trading has been previously halted. Prefix appears solely for information; process as a regular transaction.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "J"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 219,
+      "type": "sale_condition",
+      "abbreviation": "ISOI",
+      "name": "Intermarket Sweep Order",
+      "description": "Transaction was the execution of an order identified as an Intermarket Sweep Order. Process like normal transaction.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "S"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 227,
+      "type": "sale_condition",
+      "abbreviation": "SLAN",
+      "name": "Single Leg Auction Non ISO",
+      "description": "Transaction was the execution of an electronic order which was \"stopped\" at a price and traded in a two-sided auction mechanism that goes through an exposure period. Such auctions mechanisms include and are not limited to Price Improvement, Facilitation, or Solicitation Mechanism.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "a"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 228,
+      "type": "sale_condition",
+      "abbreviation": "SLAI",
+      "name": "Single Leg Auction ISO",
+      "description": "Transaction was the execution of an Intermarket Sweep electronic order which was \"stopped\" at a price and traded in a two-sided auction mechanism that goes through an exposure period. Such auctions mechanisms include and are not limited to Price Improvement, Facilitation, or Solicitation Mechanism marked as ISO.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "b"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 229,
+      "type": "sale_condition",
+      "abbreviation": "SLCN",
+      "name": "Single Leg Cross Non ISO",
+      "description": "Transaction was the execution of an electronic order which was \"stopped\" at a price and traded in a two-sided crossing mechanism that does not go through an exposure period. Such crossing mechanisms include and are not limited to Customer to Customer Cross and QCC with a single option leg.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "c"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 230,
+      "type": "sale_condition",
+      "abbreviation": "SLCI",
+      "name": "Single Leg Cross ISO",
+      "description": "Transaction was the execution of an Intermarket Sweep electronic order which was \"stopped\" at a price and traded in a two-sided crossing mechanism that does not go through an exposure period. Such crossing mechanisms include and are not limited to Customer to Customer Cross.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "d"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 231,
+      "type": "sale_condition",
+      "abbreviation": "SLFT",
+      "name": "Single Leg Floor Trade",
+      "description": "Transaction represents a non-electronic trade executed on a trading floor. Execution of Paired and Non-Paired Auctions and Cross orders on an exchange floor are also included in this category.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "e"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 232,
+      "type": "sale_condition",
+      "abbreviation": "MLET",
+      "name": "Multi Leg auto-electronic trade",
+      "description": "Transaction represents an electronic execution of a multi-leg order traded in a complex order book.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "f"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 233,
+      "type": "sale_condition",
+      "abbreviation": "MLAT",
+      "name": "Multi Leg Auction",
+      "description": "Transaction was the execution of an electronic multi-leg order which was stopped at a price and traded in a two-sided auction mechanism that goes through an exposure period in a complex order book. Such auctions mechanisms include and are not limited to Price Improvement, Facilitation, or Solicitation Mechanism.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "g"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 234,
+      "type": "sale_condition",
+      "abbreviation": "MLCT",
+      "name": "Multi Leg Cross",
+      "description": "Transaction was the execution of an electronic multi-leg order which was \"stopped\" at a price and traded in a two-sided crossing mechanism that does not go through an exposure period. Such crossing mechanisms include and are not limited to Customer to Customer Cross and QCC with two or more options legs.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "h"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 235,
+      "type": "sale_condition",
+      "abbreviation": "MLFT",
+      "name": "Multi Leg floor trade",
+      "description": "Transaction represents a non-electronic multi-leg order trade executed against other multi-leg order(s) on a trading floor. Execution of Paired and Non-Paired Auctions and Cross orders on an exchange floor are also included in this category.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "i"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 236,
+      "type": "sale_condition",
+      "abbreviation": "MESL",
+      "name": "Multi Leg auto-electronic trade against single leg(s)",
+      "description": "Transaction represents an electronic execution of a multi-leg order traded against single leg orders/quotes.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "j"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 237,
+      "type": "sale_condition",
+      "abbreviation": "TLAT",
+      "name": "Stock Options Auction",
+      "description": "Transaction was the execution of an electronic multi-leg stock/options order which was \"stopped\" at a price and traded in a two-sided auction mechanism that goes through an exposure period in a complex order book. Such auctions mechanisms include and are not limited to Price Improvement, Facilitation, or Solicitation Mechanism.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "k"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 238,
+      "type": "sale_condition",
+      "abbreviation": "MASL",
+      "name": "Multi Leg Auction against single leg(s)",
+      "description": "Transaction was the execution of an electronic multi-leg order which was \"stopped\" at a price and traded in a two-sided auction mechanism that goes through an exposure period and trades against single leg orders/quotes. Such auctions mechanisms include and are not limited to Price Improvement, Facilitation, or Solicitation Mechanism.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "l"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 239,
+      "type": "sale_condition",
+      "abbreviation": "MFSL",
+      "name": "Multi Leg floor trade against single leg(s)",
+      "description": "Transaction represents a non-electronic multi-leg order trade executed on a trading floof against single leg orders/quotes. Such auctions mechanisms include and are not limited to Price Improvement, Facilitation, or Solicitation Mechanism.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "m"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 240,
+      "type": "sale_condition",
+      "abbreviation": "TLET",
+      "name": "Stock Options auto-electronic trade",
+      "description": "Transaction represents the an electronic execution of a multi-leg stock/options order traded in a complex order book.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "n"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 241,
+      "type": "sale_condition",
+      "abbreviation": "TLCT",
+      "name": "Stock Options Cross",
+      "description": "Transaction was the execution of an electronic multi-leg stock/options order which was \"stopped\" at a price and traded in a two-sided crossing mechanism that does not go through an exposure period. Such crossing mechanisms include and are not limited to Customer to Customer Cross.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "o"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 242,
+      "type": "sale_condition",
+      "abbreviation": "TLFT",
+      "name": "Stock Options floor trade",
+      "description": "Transaction represents a non-electronic multi-leg order stock/options trade executed on a trading floor in a complex order book. Execution of Paired and Non-Paired Auctions and Cross orders on an exchange floor are also included in this category.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "p"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 243,
+      "type": "sale_condition",
+      "abbreviation": "TESL",
+      "name": "Stock Options auto-electronic trade against single leg(s)",
+      "description": "Transaction represents an electronic execution of a multi-leg stock/options order traded against single leg orders/quotes.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "q"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 244,
+      "type": "sale_condition",
+      "abbreviation": "TASL",
+      "name": "Stock Options Auction against single leg(s)",
+      "description": "Transaction was the execution of an electronic multi-leg stock/options order which was \"stopped\" at a price and traded in a two-sided auction mechanism that goes through an exposure perod and trades against single leg orders/quotes. Such auctions mechanisms include and are not limited to Price Improvement, Facilitation, or Solicitation Mechanism.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "r"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 245,
+      "type": "sale_condition",
+      "abbreviation": "TFSL",
+      "name": "Stock Options floor trade against single leg(s)",
+      "description": "Transaction represents a non-electronic multi-leg stock/options order trade executed on a trading floor against single leg orders/quotes. Execution of Paired and Non-Paired Auctions on an exchange floor are also included in this category.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "s"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": true,
+          "updates_open_close": true,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 246,
+      "type": "sale_condition",
+      "abbreviation": "CBMO",
+      "name": "Multi Leg Floor Trade of Proprietary Products",
+      "description": "Transaction represents execution of a proprietary product non-electronic multi-leg order with at least 3 legs. The trade price may be outside the current NBBO.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "t"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 247,
+      "type": "sale_condition",
+      "abbreviation": "MCTP",
+      "name": "Multilateral Compression Trade of Proprietary Products",
+      "description": "Transaction represents an execution in a proprietary product done as part of a multilateral compression. Trades are executed outside of regular trading hours at prices derived from end of day markets. Trades do not update Open High, Low, and Closing Prices.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "u"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": true
+        }
+      }
+    },
+    {
+      "id": 248,
+      "type": "sale_condition",
+      "abbreviation": "EXHT",
+      "name": "Extended Hours Trade",
+      "description": "Transaction represents a trade that was executed outside of regular market hours. Trades do not update Open, High, Low, and Closing Prices.",
+      "asset_class": "options",
+      "data_types": [
+        "trade"
+      ],
+      "sip_mapping": {
+        "OPRA": "v"
+      },
+      "update_rules": {
+        "consolidated": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": true
+        },
+        "market_center": {
+          "updates_high_low": false,
+          "updates_open_close": false,
+          "updates_volume": true
+        }
+      }
+    }
+  ],
+  "payload_sha256": "051dda5cd0e6d246709017b4d1af68982527aa628d54ac073d577d860c1cbd56"
+}

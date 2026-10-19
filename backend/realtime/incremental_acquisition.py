@@ -221,6 +221,9 @@ class IncrementalEquitySource:
         *,
         response_byte_limit: int,
         clock: Callable[[], datetime],
+        reservation_repository=reserve_coordinated_provider_request_cursor,
+        endpoint_class: str = INCREMENTAL_ENDPOINT_CLASS,
+        eligibility_policy_version: str = INCREMENTAL_POLICY_VERSION,
     ) -> None:
         if (
             type(response_byte_limit) is not int
@@ -236,12 +239,21 @@ class IncrementalEquitySource:
         self.plans = tuple(plans)
         self.response_byte_limit = response_byte_limit
         self.clock = clock
+        self.reservation_repository = reservation_repository
+        self.endpoint_class = endpoint_class.strip()
+        self.eligibility_policy_version = (
+            eligibility_policy_version.strip()
+        )
         if (
             not self.plans
             or set(plan.instrument_id for plan in self.plans)
             - set(self.identities)
+            or len(self.budget_scope.lanes) != 1
+            or not self.endpoint_class
+            or not self.eligibility_policy_version
         ):
             raise ValueError("incremental source plan/member scope is invalid")
+        self.request_lane = next(iter(self.budget_scope.lanes))
 
     def _request_identity(self, plan):
         width = INTERVAL_WIDTHS[plan.interval]
@@ -254,6 +266,10 @@ class IncrementalEquitySource:
         params = {"adjusted": "false", "sort": "asc", "limit": "50000"}
         request_sha256 = canonical_sha256({
             "policy": INCREMENTAL_POLICY_VERSION,
+            "eligibility_policy_version": (
+                self.eligibility_policy_version
+            ),
+            "endpoint_class": self.endpoint_class,
             "budget_scope_sha256": self.budget_scope.sha256,
             "cohort_id": plan.cohort_id,
             "instrument_id": plan.instrument_id,
@@ -298,15 +314,15 @@ class IncrementalEquitySource:
         reserved_at = _clock_utc(self.clock)
         base_reservation = ProviderRequestReservation(
             request_id,
-            INCREMENTAL_ACCOUNT_ALIAS,
-            ProviderRequestLane.EQUITY_CURRENT,
-            INCREMENTAL_ENDPOINT_CLASS,
+            self.budget_scope.account_alias,
+            self.request_lane,
+            self.endpoint_class,
             request_sha256,
             reserved_at,
             cohort_id=plan.cohort_id,
         )
         with self.provider.transaction(APP_ROLE) as unit:
-            admission = reserve_coordinated_provider_request_cursor(
+            admission = self.reservation_repository(
                 unit.cursor,
                 self.budget_scope,
                 base_reservation,

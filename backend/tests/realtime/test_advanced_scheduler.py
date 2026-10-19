@@ -11,6 +11,7 @@ from realtime.advanced_scheduler import (
     discover_advanced_window_recovery_cursor,
     ensure_advanced_window_retry_cursor,
     order_advanced_due_windows,
+    load_advanced_scheduler_scope_cursor,
 )
 from realtime.orchestration_repository import CycleReceiptSpec
 from realtime.session_windows import advanced_session_windows
@@ -146,6 +147,23 @@ def test_latest_slot_runs_first_and_oldest_retry_is_bounded_second():
         CUTOFF + timedelta(minutes=10),
         CUTOFF + timedelta(minutes=5),
     ]
+
+
+def test_scheduler_reloads_persisted_window_instead_of_resetting_its_duration():
+    cursor = MagicMock()
+    ended = CUTOFF + timedelta(minutes=10)
+    cursor.fetchall.return_value = [
+        (SCHEDULER, COHORT, 1, "a" * 64, "ACTIVE", CUTOFF, ended),
+    ]
+    first = load_advanced_scheduler_scope_cursor(
+        cursor, authorization_id=SCHEDULER, session_date=CUTOFF.date(),
+    )
+    restarted = load_advanced_scheduler_scope_cursor(
+        cursor, authorization_id=SCHEDULER, session_date=CUTOFF.date(),
+    )
+    assert first == restarted
+    assert first["authorized_start_at"] == CUTOFF
+    assert first["authorized_end_at"] == ended
 
 
 def test_early_close_dst_and_holiday_follow_xnys_calendar():

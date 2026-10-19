@@ -45,6 +45,9 @@ class BufferSnapshot:
     payload_bytes: int
     oldest_age_ns: int
     full_count: int
+    maximum_admitted_events: int
+    maximum_payload_bytes: int
+    maximum_oldest_age_ns: int
 
 
 class RawMessageBuffer:
@@ -60,6 +63,9 @@ class RawMessageBuffer:
         self._claim: BufferClaim | None = None
         self._payload_bytes = 0
         self._full_count = 0
+        self._maximum_admitted_events = 0
+        self._maximum_payload_bytes = 0
+        self._maximum_oldest_age_ns = 0
         self._lock = threading.Lock()
 
     def put_nowait(self, message: RawMessageEnvelope) -> None:
@@ -79,6 +85,18 @@ class RawMessageBuffer:
                 self._reject("MAXIMUM_BYTES_EXCEEDED")
             self._queued.append(message)
             self._payload_bytes += message.byte_length
+            self._maximum_admitted_events = max(
+                self._maximum_admitted_events,
+                admitted_events + 1,
+            )
+            self._maximum_payload_bytes = max(
+                self._maximum_payload_bytes,
+                self._payload_bytes,
+            )
+            self._maximum_oldest_age_ns = max(
+                self._maximum_oldest_age_ns,
+                self._oldest_age_ns(now),
+            )
 
     def _reject(self, reason: str) -> None:
         self._full_count += 1
@@ -134,13 +152,21 @@ class RawMessageBuffer:
         now = self._monotonic_ns()
         with self._lock:
             claimed_events = len(self._claim.messages) if self._claim else 0
+            oldest_age_ns = self._oldest_age_ns(now)
+            self._maximum_oldest_age_ns = max(
+                self._maximum_oldest_age_ns,
+                oldest_age_ns,
+            )
             return BufferSnapshot(
                 queued_events=len(self._queued),
                 claimed_events=claimed_events,
                 admitted_events=len(self._queued) + claimed_events,
                 payload_bytes=self._payload_bytes,
-                oldest_age_ns=self._oldest_age_ns(now),
+                oldest_age_ns=oldest_age_ns,
                 full_count=self._full_count,
+                maximum_admitted_events=self._maximum_admitted_events,
+                maximum_payload_bytes=self._maximum_payload_bytes,
+                maximum_oldest_age_ns=self._maximum_oldest_age_ns,
             )
 
     def _oldest_age_ns(self, now: int) -> int:

@@ -1,5 +1,7 @@
 import importlib
-from datetime import date
+import asyncio
+import threading
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -50,6 +52,37 @@ def test_ingress_cli_requires_explicit_execution_and_bounded_once():
         ])
 
 
+def test_expired_persisted_deadline_never_starts_a_gateway_even_after_restart():
+    ended = datetime(2026, 10, 19, 13, 40, tzinfo=timezone.utc)
+    gateway = SimpleNamespace(run_session=MagicMock(side_effect=AssertionError("expired provider I/O")))
+    for now in (ended, ended + timedelta(minutes=1)):
+        assert asyncio.run(script._run_continuous(
+            gateway, threading.Event(), 0.1, ended, utc_clock=lambda: now,
+        )) is None
+        assert asyncio.run(script._run_once(
+            gateway, 10, 600, deadline=ended, utc_clock=lambda: now,
+        )) is None
+    gateway.run_session.assert_not_called()
+
+
+def test_monotonic_deadline_stops_provider_when_wall_clock_stalls():
+    started = datetime(2026, 10, 19, 13, 30, tzinfo=timezone.utc)
+    stopped = []
+
+    async def run():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.append(True)
+
+    result = asyncio.run(script._run_continuous(
+        SimpleNamespace(run_session=run), threading.Event(), 1,
+        started + timedelta(milliseconds=10), utc_clock=lambda: started,
+    ))
+    assert result is None
+    assert stopped == [True]
+
+
 def test_ingress_paths_are_plan_session_attempt_derived_and_non_overwriting(
     tmp_path,
 ):
@@ -76,8 +109,11 @@ def test_ingress_paths_are_plan_session_attempt_derived_and_non_overwriting(
         )
 
 
+@pytest.mark.parametrize(("symbol", "bounded"), [("SPY", False), ("SPY", True), ("AAPL", True)])
 def test_ingress_runtime_scope_loads_pinned_plan_and_exact_am_members(
     monkeypatch,
+    symbol,
+    bounded,
 ):
     catalog = script.load_advanced_ingress_runtime_catalog(
         Path(script.BACKEND_DIR)
@@ -98,6 +134,9 @@ def test_ingress_runtime_scope_loads_pinned_plan_and_exact_am_members(
         configuration_sha256=profile.configuration_sha256(
             catalog.scale_policy.sha256
         ),
+        authorized_start_at=datetime(2026, 10, 16, 13, 30, tzinfo=timezone.utc),
+        authorized_end_at=datetime(2026, 10, 16, 13, 40, tzinfo=timezone.utc)
+        if bounded else datetime(2026, 10, 16, 20, 0, tzinfo=timezone.utc),
     )
     monkeypatch.setattr(
         script,
@@ -118,9 +157,13 @@ def test_ingress_runtime_scope_loads_pinned_plan_and_exact_am_members(
     unit.cursor.fetchall.return_value = [{
         "instrument_id": 1,
         "security_id": "33333333-3333-3333-3333-333333333333",
-        "ticker": "SPY",
+        "ticker": symbol,
     }]
 
+    if bounded and symbol != "SPY":
+        with pytest.raises(ValueError, match="exact SPY/AM"):
+            script._load_runtime_scope(provider, plan.plan_id, catalog)
+        return
     (
         loaded_plan,
         loaded_profile,

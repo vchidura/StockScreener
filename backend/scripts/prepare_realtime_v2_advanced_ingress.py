@@ -64,6 +64,8 @@ def _common(subparser) -> None:
         default=BACKEND_DIR / ".env",
     )
     subparser.add_argument("--report-path", type=Path, required=True)
+    subparser.add_argument("--ingress-policy-path", type=Path)
+    subparser.add_argument("--ingress-policy-version")
 
 
 def _budget_arguments(subparser) -> None:
@@ -122,10 +124,13 @@ def parse_args(argv=None):
     prepare.add_argument("--universe-target", type=int, required=True)
     prepare.add_argument("--preferred-cohort-id", type=UUID)
     prepare.add_argument("--cohort-selection-reference")
+    prepare.add_argument("--canary-start-at", type=datetime.fromisoformat)
+    prepare.add_argument("--canary-end-at", type=datetime.fromisoformat)
     prepare.add_argument("--execute", action="store_true")
 
     sync_profiles = commands.add_parser("sync-profiles")
     _common(sync_profiles)
+    sync_profiles.add_argument("--universe-target", type=int, action="append")
     sync_profiles.add_argument("--execute", action="store_true")
 
     activate_profile = commands.add_parser("activate-profile")
@@ -172,6 +177,18 @@ def parse_args(argv=None):
     args.report_path = args.report_path.resolve()
     if args.report_path.exists():
         parser.error("--report-path must be new")
+    if args.command == "prepare":
+        try:
+            AdvancedIngressPlanRequest(
+                args.authorization_id,
+                args.session_date,
+                args.universe_target,
+                _budgets(args),
+                canary_start_at=args.canary_start_at,
+                canary_end_at=args.canary_end_at,
+            )
+        except (TypeError, ValueError) as error:
+            parser.error(str(error))
     return args
 
 
@@ -322,6 +339,10 @@ def _plan_report(plan, *, executed: bool) -> dict[str, object]:
 def main(argv=None) -> int:
     args = parse_args(argv)
     settings = _settings(args.env_file)
+    if args.ingress_policy_path is not None:
+        settings["REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH"] = str(args.ingress_policy_path.resolve())
+    if args.ingress_policy_version is not None:
+        settings["REALTIME_V2_ADVANCED_INGRESS_POLICY_VERSION"] = args.ingress_policy_version
     now = datetime.now(UTC)
     if args.command == "authorize":
         catalog = _runtime_catalog(settings)
@@ -366,10 +387,18 @@ def main(argv=None) -> int:
         )
     elif args.command == "sync-profiles":
         catalog = _runtime_catalog(settings)
+        targets = None if args.universe_target is None else set(args.universe_target)
+        if targets is not None:
+            for target in targets:
+                catalog.profile_for_target(target)
+        selected = tuple(
+            (index, profile) for index, profile in enumerate(catalog.profiles)
+            if targets is None or profile.universe_target in targets
+        )
         registrations = []
         if args.execute:
             with _admin_cursor(settings, database=args.database) as cursor:
-                for index, profile in enumerate(catalog.profiles):
+                for index, profile in selected:
                     registrations.append(
                         register_advanced_runtime_profile_cursor(
                             cursor,
@@ -407,7 +436,7 @@ def main(argv=None) -> int:
                         else "CANDIDATE"
                     ),
                 }
-                for index, profile in enumerate(catalog.profiles)
+                for index, (_, profile) in enumerate(selected)
             ],
             "provider_requests": 0,
             "credentials_exposed": False,
@@ -493,6 +522,8 @@ def main(argv=None) -> int:
                             cohort_selection_reference=(
                                 args.cohort_selection_reference
                             ),
+                            canary_start_at=args.canary_start_at,
+                            canary_end_at=args.canary_end_at,
                         ),
                         runtime_catalog=catalog,
                     )

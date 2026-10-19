@@ -24,6 +24,10 @@ from realtime.option_flow.conditions import (
     PROVENANCE_LIVE_CAPTURE,
     PROVENANCE_SYNTHETIC,
     SEMANTICS_VERSION,
+    LIVE_SEMANTICS_VERSION,
+    DEFAULT_LIVE_CONDITION_PAYLOAD_PATH,
+    DEFAULT_LIVE_CONDITION_REVIEW_PATH,
+    DEFAULT_LIVE_CONDITION_REVIEW_DRAFT_PATH,
     ConditionPinError,
     Treatment,
     build_semantics,
@@ -50,6 +54,94 @@ def test_fixture_is_labelled_synthetic_and_never_presented_as_live():
     assert pinned.pin.provenance == PROVENANCE_SYNTHETIC
 
 
+def test_live_capture_is_pinned_while_owner_review_remains_unavailable():
+    payload = json.loads(
+        DEFAULT_LIVE_CONDITION_PAYLOAD_PATH.read_text(encoding="utf-8")
+    )
+    draft = json.loads(
+        DEFAULT_LIVE_CONDITION_REVIEW_DRAFT_PATH.read_text(
+            encoding="utf-8"
+        )
+    )
+    parsed = parse_payload(payload)
+
+    assert parsed.provenance == PROVENANCE_LIVE_CAPTURE
+    assert len(parsed.results) == 33
+    assert parsed.payload_sha256 == (
+        "051dda5cd0e6d246709017b4d1af68982527aa628d54ac073d577d860c1cbd56"
+    )
+    assert payload["provider_contract_sha256"] == (
+        conditions_module.MASSIVE_OPTIONS_PROVIDER_CONTRACT.sha256
+    )
+    assert draft["review_status"] == "OWNER_REVIEW_REQUIRED"
+    assert draft["reviewed_at"] is None
+    assert len(draft["codes"]) == 33
+    assert all(
+        row["treatment"] is None
+        and all(
+            row[name] is None
+            for name in (
+                "is_late",
+                "is_multi_leg",
+                "is_cross",
+                "is_sweep",
+                "is_floor",
+            )
+        )
+        for row in draft["codes"]
+    )
+    with pytest.raises(ConditionPinError):
+        parse_review(draft)
+
+
+def test_owner_approved_live_semantics_v3_covers_every_captured_code():
+    semantics_v3 = load_semantics(
+        DEFAULT_LIVE_CONDITION_PAYLOAD_PATH,
+        DEFAULT_LIVE_CONDITION_REVIEW_PATH,
+    )
+
+    assert semantics_v3.version == LIVE_SEMANTICS_VERSION
+    assert semantics_v3.is_live_capture
+    assert len(semantics_v3.provider) == 33
+    assert len(semantics_v3.reviewed) == 33
+    assert semantics_v3.unreviewed_ids == ()
+    assert {
+        code
+        for code, row in semantics_v3.reviewed.items()
+        if row.treatment is Treatment.CANCELED
+    } == {201, 203, 205, 207}
+    assert {
+        code
+        for code, row in semantics_v3.reviewed.items()
+        if row.treatment is Treatment.EXCLUDED
+    } == {202, 204, 206}
+    assert {
+        code for code, row in semantics_v3.reviewed.items() if row.is_late
+    } == {202, 204, 206, 208}
+    assert {
+        code for code, row in semantics_v3.reviewed.items() if row.is_sweep
+    } == {219, 228, 230}
+    assert {
+        code for code, row in semantics_v3.reviewed.items() if row.is_cross
+    } == {229, 230, 234, 241}
+    assert {
+        code for code, row in semantics_v3.reviewed.items() if row.is_floor
+    } == {231, 235, 239, 242, 245, 246}
+    assert {
+        code
+        for code, row in semantics_v3.reviewed.items()
+        if row.is_multi_leg
+    } == {
+        232, 233, 234, 235, 236, 237, 238, 239,
+        240, 241, 242, 243, 244, 245, 246, 247,
+    }
+    replace(
+        config(),
+        semantics=semantics_v3,
+        allow_synthetic_semantics=False,
+    )
+
+
 def test_semantics_version_is_new_and_v1_is_untouched():
     assert SEMANTICS_VERSION == "massive_options_conditions_v2"
     assert SEMANTICS_VERSION != TRADE_SEMANTICS_VERSION == "massive_options_conditions_v1"
@@ -62,6 +154,9 @@ def test_pin_is_the_canonical_payload_hash():
     assert pinned.pin.payload_sha256 == review["reviewed_payload_sha256"]
     assert pinned.pin.payload_sha256 == parse_payload(payload).payload_sha256
     assert len(pinned.semantics_sha256) == 64
+    assert pinned.pin.provider_contract_sha256 == (
+        conditions_module.MASSIVE_OPTIONS_PROVIDER_CONTRACT.sha256
+    )
 
 
 def test_envelope_changes_do_not_change_the_hash_but_content_changes_do():
@@ -158,6 +253,41 @@ def test_review_of_a_code_absent_from_the_payload_is_rejected():
     with pytest.raises(ConditionPinError) as raised:
         build_semantics(parse_payload(payload), parse_review(review))
     assert raised.value.reason == "REVIEW_CODE_NOT_IN_PAYLOAD"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        (
+            lambda row: row.update(unexpected=True),
+            "PAYLOAD_FIELD_UNKNOWN",
+        ),
+        (
+            lambda row: row.update(legacy="false"),
+            "PAYLOAD_FIELD_INVALID",
+        ),
+        (
+            lambda row: row.update(sip_mapping={"OTHER": "X"}),
+            "PAYLOAD_FIELD_INVALID",
+        ),
+        (
+            lambda row: row["update_rules"]["consolidated"].pop(
+                "updates_volume"
+            ),
+            "PAYLOAD_FIELD_INVALID",
+        ),
+    ),
+)
+def test_documented_condition_row_shape_fails_closed(mutation, reason):
+    payload, review = _documents()
+    mutation(payload["results"][0])
+    changed = parse_payload(payload)
+    review["reviewed_payload_sha256"] = changed.payload_sha256
+
+    with pytest.raises(ConditionPinError) as raised:
+        build_semantics(changed, parse_review(review))
+
+    assert raised.value.reason == reason
 
 
 def test_reference_rows_follow_the_database_rules():

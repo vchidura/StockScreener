@@ -8,8 +8,12 @@ from enum import Enum
 from typing import NamedTuple
 from uuid import UUID, uuid5
 
+from ..option_source_flow import OptionSourceFlowIdentity
 from .clock import SessionClock, to_datetime
-from .records import ClusterRow
+from .records import ClusterRow, FlowRetentionEvidence
+
+
+CANONICAL_ORDER_WINDOWS_SECONDS = (1, 5, 60, 180, 900)
 
 CLUSTER_NAMESPACE = UUID("6a1f0e7e-3b52-4d0e-9c1a-5c0f1d2e7a10")
 MIXED = "MIXED"
@@ -62,7 +66,7 @@ class ClusterConfig:
         cls,
         policy,
         *,
-        windows_seconds: tuple[int, ...] = (1, 5, 60, 900),
+        windows_seconds: tuple[int, ...] = CANONICAL_ORDER_WINDOWS_SECONDS,
         allowed_lateness_ms: int = 2_000,
         finalized_retention_ms: int = 60_000,
         emit_mixed: bool = True,
@@ -80,6 +84,7 @@ class ClusterConfig:
 
 
 class ClusterPrint(NamedTuple):
+    event_id: UUID
     contract: str
     underlyer: str
     bucket: str
@@ -88,15 +93,35 @@ class ClusterPrint(NamedTuple):
     size: int
     premium: Decimal
     exchange: int | None
+    cumulative_contracts: int | None
+    retention_thresholds: tuple[FlowRetentionEvidence, ...]
 
 
 class _State:
-    __slots__ = ("cluster_id", "contract", "underlyer", "side", "window_seconds", "start_ms",
-                 "end_ms", "session_date", "members", "revision", "emitted", "final", "retracted",
-                 "span_ms")
+    __slots__ = (
+        "cluster_id",
+        "contract",
+        "underlyer",
+        "side",
+        "window_seconds",
+        "start_ms",
+        "end_ms",
+        "session_date",
+        "profile_evidence",
+        "cumulative_contracts",
+        "members",
+        "revision",
+        "emitted",
+        "qualified",
+        "final",
+        "retracted",
+        "span_ms",
+    )
 
     def __init__(self, cluster_id: UUID, contract: str, underlyer: str, side: str, window_seconds: int,
-                 start_ms: int, end_ms: int, session_date: date) -> None:
+                 start_ms: int, end_ms: int, session_date: date,
+                 profile_evidence: FlowRetentionEvidence | None = None,
+                 cumulative_contracts: int | None = None) -> None:
         self.cluster_id = cluster_id
         self.contract = contract
         self.underlyer = underlyer
@@ -105,9 +130,15 @@ class _State:
         self.start_ms = start_ms
         self.end_ms = end_ms
         self.session_date = session_date
-        self.members: dict[tuple[int, int], tuple[int, Decimal, int | None, int, str]] = {}
+        self.profile_evidence = profile_evidence
+        self.cumulative_contracts = cumulative_contracts
+        self.members: dict[
+            tuple[int, int],
+            tuple[int, Decimal, int | None, int, str, UUID],
+        ] = {}
         self.revision = 0
         self.emitted = False
+        self.qualified = False
         self.final = False
         self.retracted = False
         # First and last print time of the latest emitted revision; a retraction reuses them.
@@ -130,16 +161,43 @@ class ClusterEngine:
     Prints older than the retention are counted and left out; their volume is unaffected.
     """
 
-    def __init__(self, config: ClusterConfig, *, cohort_id: UUID, provider_tier: str,
-                 policy_sha256: str, clock: SessionClock | None = None) -> None:
+    def __init__(
+        self,
+        config: ClusterConfig,
+        *,
+        cohort_id: UUID,
+        provider_tier: str,
+        policy_sha256: str,
+        source_flow: OptionSourceFlowIdentity | None = None,
+        advanced_flow_policy_sha256: str | None = None,
+        contract_scope_sha256: str | None = None,
+        manifest_sha256: str | None = None,
+        slot_sha256: str | None = None,
+        provider_contract_sha256: str | None = None,
+        condition_reference_sha256: str | None = None,
+        exchange_reference_sha256: str | None = None,
+        clock: SessionClock | None = None,
+    ) -> None:
         self._config = config
         self._cohort_id = cohort_id
         self._provider_tier = provider_tier
         self._policy_sha256 = policy_sha256
+        self._source_flow = source_flow
+        self._advanced_flow_policy_sha256 = (
+            advanced_flow_policy_sha256
+        )
+        self._contract_scope_sha256 = contract_scope_sha256
+        self._manifest_sha256 = manifest_sha256
+        self._slot_sha256 = slot_sha256
+        self._provider_contract_sha256 = provider_contract_sha256
+        self._condition_reference_sha256 = condition_reference_sha256
+        self._exchange_reference_sha256 = exchange_reference_sha256
         self._clock = clock or SessionClock()
-        self._states: dict[tuple[str, str, int, int], _State] = {}
-        self._open: list[tuple[int, str, str, int, int]] = []
-        self._purge: list[tuple[int, tuple[str, str, int, int]]] = []
+        self._states: dict[tuple[str, str, str, int, int], _State] = {}
+        self._open: list[tuple[int, str, str, str, int, int]] = []
+        self._purge: list[
+            tuple[int, tuple[str, str, str, int, int]]
+        ] = []
         self._max_time_ms = -1
         self._watermark_ms = -1
         self.late_beyond_retention = 0
@@ -168,8 +226,15 @@ class ClusterEngine:
         self._watermark_ms = watermark_ms
         retention = self._config.finalized_retention_ms
         while self._open and self._open[0][0] <= watermark_ms:
-            end_ms, contract, side, window, start = heapq.heappop(self._open)
-            key = (contract, side, window, start)
+            (
+                end_ms,
+                contract,
+                profile,
+                side,
+                window,
+                start,
+            ) = heapq.heappop(self._open)
+            key = (contract, profile, side, window, start)
             state = self._states.get(key)
             if state is None or state.final:
                 continue
@@ -183,19 +248,64 @@ class ClusterEngine:
 
     def _qualifies(self, state: _State) -> bool:
         members = state.members
-        if len(members) < self._config.minimum_prints:
+        evidence = state.profile_evidence
+        minimum_prints = (
+            self._config.minimum_prints
+            if evidence is None
+            else evidence.minimum_cluster_prints
+        )
+        minimum_exchanges = (
+            self._config.minimum_distinct_exchanges
+            if evidence is None
+            else evidence.minimum_distinct_exchanges
+        )
+        if (
+            minimum_prints is None
+            or minimum_exchanges is None
+            or len(members) < minimum_prints
+        ):
             return False
         exchanges = {member[2] for member in members.values() if member[2] is not None}
-        if len(exchanges) < self._config.minimum_distinct_exchanges:
+        if len(exchanges) < minimum_exchanges:
             return False
         if state.side == MIXED and len({member[4] for member in members.values()}) < 2:
             return False
+        if evidence is not None:
+            total_premium = sum(
+                (member[1] for member in members.values()),
+                Decimal(0),
+            )
+            if (
+                evidence.minimum_cluster_premium is None
+                or total_premium < evidence.minimum_cluster_premium
+            ):
+                return False
+            if (
+                evidence.minimum_cumulative_contracts is not None
+                and (
+                    state.cumulative_contracts is None
+                    or state.cumulative_contracts
+                    < evidence.minimum_cumulative_contracts
+                )
+            ):
+                return False
         return True
 
     def _keys(self, print_: ClusterPrint):
         sides = (print_.bucket, MIXED) if self._config.emit_mixed else (print_.bucket,)
         time_ms = print_.time_ms
-        for window_seconds in self._config.windows_seconds:
+        if print_.retention_thresholds:
+            profiles = tuple(
+                (evidence.profile, evidence.window_seconds, evidence)
+                for evidence in print_.retention_thresholds
+                if evidence.window_seconds is not None
+            )
+        else:
+            profiles = tuple(
+                ("", window_seconds, None)
+                for window_seconds in self._config.windows_seconds
+            )
+        for profile, window_seconds, evidence in profiles:
             window_ms = window_seconds * 1000
             hop = window_ms // 2
             index = time_ms // hop
@@ -204,23 +314,52 @@ class ClusterEngine:
                     continue
                 start = start_index * hop
                 for side in sides:
-                    yield side, window_seconds, window_ms, start
+                    yield (
+                        profile,
+                        side,
+                        window_seconds,
+                        window_ms,
+                        start,
+                        evidence,
+                    )
 
     def on_print(self, print_: ClusterPrint, clusters: list[ClusterRow]) -> None:
-        member = (print_.size, print_.premium, print_.exchange, print_.time_ms, print_.bucket)
+        member = (
+            print_.size,
+            print_.premium,
+            print_.exchange,
+            print_.time_ms,
+            print_.bucket,
+            print_.event_id,
+        )
         key_id = (print_.seq, print_.time_ms)
-        for side, window_seconds, window_ms, start in self._keys(print_):
-            key = (print_.contract, side, window_seconds, start)
+        for (
+            profile,
+            side,
+            window_seconds,
+            window_ms,
+            start,
+            evidence,
+        ) in self._keys(print_):
+            key = (
+                print_.contract,
+                profile,
+                side,
+                window_seconds,
+                start,
+            )
             state = self._states.get(key)
             if state is None:
                 if start + window_ms + self._config.finalized_retention_ms <= self._watermark_ms:
                     self.late_beyond_retention += 1
                     continue
                 state = _State(
-                    uuid5(CLUSTER_NAMESPACE, f"{self._cohort_id}|{print_.contract}|{side}|{window_seconds}|"
+                    uuid5(CLUSTER_NAMESPACE, f"{self._source_flow.source_flow_id if self._source_flow else self._cohort_id}|"
+                                             f"{print_.contract}|{profile}|{side}|{window_seconds}|"
                                              f"{start}|{self._policy_sha256}"),
                     print_.contract, print_.underlyer, side, window_seconds, start, start + window_ms,
-                    self._clock.session_date(start),
+                    self._clock.session_date(start), evidence,
+                    print_.cumulative_contracts,
                 )
                 self._states[key] = state
                 if start + window_ms <= self._watermark_ms:
@@ -228,9 +367,20 @@ class ClusterEngine:
                     state.final = True
                     heapq.heappush(self._purge, (start + window_ms + self._config.finalized_retention_ms, key))
                 else:
-                    heapq.heappush(self._open, (state.end_ms, print_.contract, side, window_seconds, start))
+                    heapq.heappush(
+                        self._open,
+                        (
+                            state.end_ms,
+                            print_.contract,
+                            profile,
+                            side,
+                            window_seconds,
+                            start,
+                        ),
+                    )
             if key_id in state.members:
                 continue
+            state.cumulative_contracts = print_.cumulative_contracts
             state.members[key_id] = member
             if state.final:
                 if state.emitted or self._qualifies(state):
@@ -241,10 +391,24 @@ class ClusterEngine:
 
     def on_cancel(self, print_: ClusterPrint, clusters: list[ClusterRow]) -> None:
         key_id = (print_.seq, print_.time_ms)
-        for side, window_seconds, _, start in self._keys(print_):
-            state = self._states.get((print_.contract, side, window_seconds, start))
+        for (
+            profile,
+            side,
+            window_seconds,
+            _,
+            start,
+            _,
+        ) in self._keys(print_):
+            state = self._states.get((
+                print_.contract,
+                profile,
+                side,
+                window_seconds,
+                start,
+            ))
             if state is None or key_id not in state.members:
                 continue
+            state.cumulative_contracts = print_.cumulative_contracts
             del state.members[key_id]
             if not state.emitted:
                 continue
@@ -257,6 +421,7 @@ class ClusterEngine:
         """RETRACTED revision: every print was canceled, so all counts are zero."""
         state.revision += 1
         state.retracted = True
+        state.qualified = False
         first_ms, last_ms = state.span_ms
         return ClusterRow(
             cluster_id=state.cluster_id,
@@ -278,6 +443,56 @@ class ClusterEngine:
             last_event_time=to_datetime(last_ms),
             status=ClusterStatus.RETRACTED.value,
             policy_sha256=self._policy_sha256,
+            source_flow_id=(
+                self._source_flow.source_flow_id
+                if self._source_flow is not None
+                else None
+            ),
+            condition_semantics_sha256=(
+                self._source_flow.condition_semantics_sha256
+                if self._source_flow is not None
+                else None
+            ),
+            flow_policy_sha256=(
+                self._source_flow.flow_policy_sha256
+                if self._source_flow is not None
+                else None
+            ),
+            lineage_version=(
+                self._source_flow.identity_version
+                if self._source_flow is not None
+                else 1
+            ),
+            profile=(
+                None
+                if state.profile_evidence is None
+                else state.profile_evidence.profile
+            ),
+            flow_universe_tier=(
+                None
+                if state.profile_evidence is None
+                else state.profile_evidence.universe_tier
+            ),
+            flow_dte_lane=(
+                None
+                if state.profile_evidence is None
+                else state.profile_evidence.dte_lane
+            ),
+            retention_threshold=state.profile_evidence,
+            advanced_flow_policy_sha256=(
+                self._advanced_flow_policy_sha256
+            ),
+            contract_scope_sha256=self._contract_scope_sha256,
+            manifest_sha256=self._manifest_sha256,
+            slot_sha256=self._slot_sha256,
+            runtime_policy_sha256=self._policy_sha256,
+            cumulative_contracts=state.cumulative_contracts,
+            qualifies=False,
+            member_event_ids=(),
+            member_event_keys=(),
+            provider_contract_sha256=self._provider_contract_sha256,
+            condition_reference_sha256=self._condition_reference_sha256,
+            exchange_reference_sha256=self._exchange_reference_sha256,
         )
 
     def _row(self, state: _State, status: ClusterStatus) -> ClusterRow:
@@ -285,6 +500,7 @@ class ClusterEngine:
         state.revision += 1
         state.emitted = True
         state.retracted = False
+        state.qualified = self._qualifies(state)
         times = [member[3] for member in members]
         state.span_ms = (min(times), max(times))
         exchanges = {member[2] for member in members if member[2] is not None}
@@ -308,8 +524,100 @@ class ClusterEngine:
             last_event_time=to_datetime(max(times)),
             status=status.value,
             policy_sha256=self._policy_sha256,
+            source_flow_id=(
+                self._source_flow.source_flow_id
+                if self._source_flow is not None
+                else None
+            ),
+            condition_semantics_sha256=(
+                self._source_flow.condition_semantics_sha256
+                if self._source_flow is not None
+                else None
+            ),
+            flow_policy_sha256=(
+                self._source_flow.flow_policy_sha256
+                if self._source_flow is not None
+                else None
+            ),
+            lineage_version=(
+                self._source_flow.identity_version
+                if self._source_flow is not None
+                else 1
+            ),
+            profile=(
+                None
+                if state.profile_evidence is None
+                else state.profile_evidence.profile
+            ),
+            flow_universe_tier=(
+                None
+                if state.profile_evidence is None
+                else state.profile_evidence.universe_tier
+            ),
+            flow_dte_lane=(
+                None
+                if state.profile_evidence is None
+                else state.profile_evidence.dte_lane
+            ),
+            retention_threshold=state.profile_evidence,
+            advanced_flow_policy_sha256=(
+                self._advanced_flow_policy_sha256
+            ),
+            contract_scope_sha256=self._contract_scope_sha256,
+            manifest_sha256=self._manifest_sha256,
+            slot_sha256=self._slot_sha256,
+            runtime_policy_sha256=self._policy_sha256,
+            cumulative_contracts=state.cumulative_contracts,
+            qualifies=state.qualified,
+            member_event_ids=tuple(
+                sorted(
+                    (member[5] for member in state.members.values()),
+                    key=str,
+                )
+            ),
+            member_event_keys=tuple(
+                sorted(
+                    (
+                        (member[5], to_datetime(member[3]))
+                        for member in state.members.values()
+                    ),
+                    key=lambda row: (row[1], str(row[0])),
+                )
+            ),
+            provider_contract_sha256=self._provider_contract_sha256,
+            condition_reference_sha256=self._condition_reference_sha256,
+            exchange_reference_sha256=self._exchange_reference_sha256,
         )
 
+    def update_cumulative(
+        self,
+        contract: str,
+        cumulative_contracts: int,
+        clusters: list[ClusterRow] | None = None,
+    ) -> None:
+        for state in self._states.values():
+            if state.contract != contract:
+                continue
+            was_qualified = state.qualified
+            state.cumulative_contracts = cumulative_contracts
+            qualifies = self._qualifies(state)
+            if clusters is None or not state.members:
+                continue
+            if (
+                (not state.emitted and qualifies)
+                or (state.emitted and qualifies != was_qualified)
+            ):
+                clusters.append(self._row(
+                    state,
+                    (
+                        ClusterStatus.FINAL
+                        if state.final
+                        else ClusterStatus.PROVISIONAL
+                    ),
+                ))
+
     def digest_state(self) -> list:
-        return [[key, state.revision, state.emitted, state.final, state.retracted, sorted(state.members)]
+        return [[key, state.profile_evidence, state.cumulative_contracts,
+                 state.revision, state.emitted, state.qualified,
+                 state.final, state.retracted, sorted(state.members)]
                 for key, state in sorted(self._states.items())]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -104,6 +105,8 @@ class GatewaySessionResult:
     transitions: tuple[GatewayFeedState, ...]
     connection_attempts: int = 1
     provider_requests: bool = False
+    library_max_queue: int = 0
+    kernel_receive_buffer_bytes: int | None = None
 
 
 _CHANNEL_ORDER = {
@@ -144,6 +147,9 @@ class AdvancedGateway:
         self._last_admitted_message_number = -1
         self._received_messages = 0
         self._received_bytes = 0
+        self._maximum_received_bytes: int | None = None
+        self._active_stream_session_id: UUID | None = None
+        self._kernel_receive_buffer_bytes: int | None = None
         self._subscriptions = self._build_subscriptions()
 
     @property
@@ -161,6 +167,22 @@ class AdvancedGateway:
     @property
     def received_bytes(self) -> int:
         return self._received_bytes
+
+    @property
+    def transitions(self) -> tuple[GatewayFeedState, ...]:
+        return tuple(self._transitions)
+
+    @property
+    def kernel_receive_buffer_bytes(self) -> int | None:
+        return self._kernel_receive_buffer_bytes
+
+    @property
+    def active_stream_session_id(self) -> UUID | None:
+        return self._active_stream_session_id
+
+    @property
+    def next_message_number(self) -> int:
+        return self._message_number
 
     def _set_state(self, state: GatewayFeedState) -> None:
         if state is self._state:
@@ -217,6 +239,21 @@ class AdvancedGateway:
             raise GatewayControlError("ADVANCED_NON_BYTES_MESSAGE")
         self._received_messages += 1
         self._received_bytes += len(message)
+        if (
+            self._maximum_received_bytes is not None
+            and self._received_bytes > self._maximum_received_bytes
+        ):
+            self._set_state(GatewayFeedState.BLOCKED)
+            await connection.close(
+                code=1009,
+                reason="session exceeds configured byte ceiling",
+            )
+            raise GatewayOverload(
+                "ADVANCED_SESSION_BYTE_CEILING_EXCEEDED",
+                self._active_stream_session_id or UUID(int=0),
+                self._message_number,
+                self._last_admitted_message_number,
+            )
         return message
 
     @staticmethod
@@ -304,19 +341,43 @@ class AdvancedGateway:
         self,
         *,
         maximum_market_messages: int | None = None,
+        maximum_received_bytes: int | None = None,
+        initial_message_number: int = 0,
     ) -> GatewaySessionResult:
         if maximum_market_messages is not None and maximum_market_messages <= 0:
             raise ValueError("maximum_market_messages must be positive")
+        if maximum_received_bytes is not None and maximum_received_bytes <= 0:
+            raise ValueError("maximum_received_bytes must be positive")
+        if type(initial_message_number) is not int or initial_message_number < 0:
+            raise ValueError("initial_message_number must be nonnegative")
         stream_session_id = self._session_id_factory()
-        self._message_number = 0
-        self._last_admitted_message_number = -1
+        self._active_stream_session_id = stream_session_id
+        self._message_number = initial_message_number
+        self._last_admitted_message_number = initial_message_number - 1
         self._received_messages = 0
         self._received_bytes = 0
+        self._maximum_received_bytes = maximum_received_bytes
+        self._kernel_receive_buffer_bytes = None
         accepted_messages = 0
         accepted_bytes = 0
+        kernel_receive_buffer_bytes = None
         self._set_state(GatewayFeedState.CONNECTING)
         try:
             async with self._connection_context() as connection:
+                transport = getattr(connection, "transport", None)
+                network_socket = (
+                    None
+                    if transport is None
+                    else transport.get_extra_info("socket")
+                )
+                if network_socket is not None:
+                    kernel_receive_buffer_bytes = network_socket.getsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_RCVBUF,
+                    )
+                    self._kernel_receive_buffer_bytes = (
+                        kernel_receive_buffer_bytes
+                    )
                 self._set_state(GatewayFeedState.AUTHENTICATING)
                 await connection.send(
                     json.dumps(
@@ -366,8 +427,14 @@ class AdvancedGateway:
                 self._set_state(GatewayFeedState.STOPPING)
                 await connection.close(code=1000, reason="bounded session complete")
             self._set_state(GatewayFeedState.STOPPED)
+        except asyncio.CancelledError:
+            self._set_state(GatewayFeedState.STOPPING)
+            raise
         except (GatewayControlError, GatewayOverload):
             raise
+        finally:
+            if self._state is GatewayFeedState.STOPPING:
+                self._set_state(GatewayFeedState.STOPPED)
         return GatewaySessionResult(
             stream_session_id=stream_session_id,
             feed=self.configuration.feed,
@@ -378,4 +445,6 @@ class AdvancedGateway:
             accepted_bytes=accepted_bytes,
             final_state=self._state,
             transitions=tuple(self._transitions),
+            library_max_queue=self.configuration.library_max_queue,
+            kernel_receive_buffer_bytes=kernel_receive_buffer_bytes,
         )

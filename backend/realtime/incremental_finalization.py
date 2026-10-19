@@ -60,6 +60,7 @@ def finalize_incremental_five_minute_windows(
     checked_at: datetime,
     authorization_reference: str,
     plan_deadline: datetime,
+    provider_tier: str = "MASSIVE_DEVELOPER",
 ) -> tuple[dict, ...]:
     checked = _utc(checked_at)
     deadline = _utc(plan_deadline)
@@ -68,6 +69,7 @@ def finalize_incremental_five_minute_windows(
         or len(set(instrument_ids)) != len(instrument_ids)
         or any(type(value) is not int or value <= 0 for value in instrument_ids)
         or not authorization_reference.strip()
+        or provider_tier not in {"MASSIVE_DEVELOPER", "MASSIVE_ADVANCED"}
     ):
         raise ValueError("incremental finalizer scope is invalid")
     repository = PostgresOrchestrationRepository(provider)
@@ -80,6 +82,7 @@ def finalize_incremental_five_minute_windows(
         "build_id": INCREMENTAL_FINALIZER_BUILD_ID,
         "authorization_reference": authorization_reference.strip(),
         "plan_deadline": deadline,
+        "provider_tier": provider_tier,
     })
     plan_id = repository.create_plan(
         cohort_id,
@@ -100,7 +103,7 @@ def finalize_incremental_five_minute_windows(
         key = f"inc5-{cutoff:%Y%m%dT%H%MZ}"
         spec = WindowSpec(
             cohort_id,
-            "MASSIVE_DEVELOPER",
+            provider_tier,
             key,
             cutoff + timedelta(minutes=15),
             cutoff,

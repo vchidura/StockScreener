@@ -58,6 +58,8 @@ services:
       - --execute
     environment:
       <<: *advanced-environment
+      REALTIME_V2_ADVANCED_CANARY_START_AT: ${REALTIME_V2_ADVANCED_CANARY_START_AT:-}
+      REALTIME_V2_ADVANCED_CANARY_END_AT: ${REALTIME_V2_ADVANCED_CANARY_END_AT:-}
       REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
     secrets:
       - realtime_v2_app_dsn

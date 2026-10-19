@@ -19,6 +19,13 @@ if TYPE_CHECKING:
     from options.config import FlowStrategyPolicy
 
     from .acquisition_producer import DeveloperAcquisitionSource
+    from .advanced_options_flow_policy import (
+        AdvancedOptionsContractScope,
+        AdvancedOptionsFlowPolicy,
+    )
+    from .advanced_options_provider_contract import (
+        AdvancedOptionsExchangeReference,
+    )
     from .option_flow.conditions import ConditionSemantics
     from .option_flow.consumer import OptionFlowSource
     from .option_flow.labels import PriorOpenInterest
@@ -29,6 +36,8 @@ if TYPE_CHECKING:
         OptionsAdmissionResult,
         OptionsFlowSettings,
         OptionsFlowState,
+        OptionsPublisherStageResult,
+        OptionsReceiptStageResult,
     )
 
 
@@ -83,9 +92,11 @@ class RunnerEnvironment:
     OPTIONS_FLOW is injected the same way and fails closed without them: `options_flow_source` (the
     journal read protocol, a local mock in tests), `options_flow_semantics` (must be a pinned live capture;
     the synthetic fixture is refused), `options_flow_policy` (FlowStrategyPolicy), optionally
-    `options_flow_settings`, `options_flow_oi_loader` (default: ref.oi_baselines) and the bounded-slice
-    `options_flow_clock` (monotonic seconds). `options_flow_state` holds the live engine session and the
-    divergence quarantine."""
+    `options_flow_settings`, `options_flow_advanced_policy`, `options_flow_contract_scope`,
+    `options_flow_oi_loader` (default: ref.oi_baselines) and the bounded-slice
+    `options_flow_clock` (monotonic seconds). A registered Advanced source also carries its immutable
+    `OptionSourceFlowIdentity`; legacy local fixtures without one remain v1 lineage.
+    `options_flow_state` holds the live engine session and the divergence quarantine."""
 
     database: V2ConnectionProvider | None
     build_id: str = "unversioned"
@@ -102,11 +113,18 @@ class RunnerEnvironment:
     options_flow_semantics: ConditionSemantics | None = None
     options_flow_policy: FlowStrategyPolicy | None = None
     options_flow_settings: OptionsFlowSettings | None = None
+    options_flow_advanced_policy: AdvancedOptionsFlowPolicy | None = None
+    options_flow_contract_scope: AdvancedOptionsContractScope | None = None
+    options_flow_exchange_reference: AdvancedOptionsExchangeReference | None = None
     options_flow_oi_loader: Callable[[StageContext, date], Mapping[str, PriorOpenInterest]] | None = None
     options_flow_clock: Callable[[], float] = time.monotonic
     options_flow_state: OptionsFlowState = field(default_factory=_new_options_flow_state)
     options_acquire_action: Callable[[StageContext], OptionsAcquireResult] | None = None
     options_admission_action: Callable[[StageContext], OptionsAdmissionResult] | None = None
+    options_input_gate_action: Callable[[StageContext], OptionsReceiptStageResult] | None = None
+    options_cycle_action: Callable[[StageContext], OptionsReceiptStageResult] | None = None
+    options_projection_action: Callable[[StageContext], OptionsReceiptStageResult] | None = None
+    options_publish_action: Callable[[StageContext], OptionsPublisherStageResult] | None = None
     # A long-running service sets `freeze_heap`: after the first successful ticker cycle the primed state is
     # moved out of the cyclic collector's view (gc.freeze), so later gen-2 collections skip the retained bars.
     freeze_heap: bool = False

@@ -8,6 +8,23 @@ from uuid import UUID
 
 
 @dataclass(frozen=True, slots=True)
+class FlowRetentionEvidence:
+    profile: str
+    universe_tier: str
+    dte_lane: str
+    threshold_mode: str
+    minimum_contracts: int
+    minimum_print_premium: Decimal
+    contracts_matched: bool
+    premium_matched: bool
+    minimum_cluster_prints: int | None
+    minimum_distinct_exchanges: int | None
+    minimum_cluster_premium: Decimal | None
+    minimum_cumulative_contracts: int | None
+    window_seconds: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class FlowEvent:
     """One persisted print. The first block maps 1:1 to rt.option_flow_events."""
 
@@ -49,6 +66,10 @@ class FlowEvent:
     journal_generation: UUID | None
     shard_id: int
     source_offset: int | None
+    source_flow_id: UUID | None
+    condition_semantics_sha256: str | None
+    flow_policy_sha256: str | None
+    lineage_version: int
     # 1 for a print; a cancel is a new row at the superseded row's revision + 1.
     revision: int
     supersedes_event_id: UUID | None
@@ -59,6 +80,19 @@ class FlowEvent:
     is_sweep: bool
     is_floor: bool
     is_late: bool
+    matched_profiles: tuple[str, ...] = ()
+    flow_universe_tier: str | None = None
+    flow_dte_lane: str | None = None
+    contract_expiration: date | None = None
+    retention_thresholds: tuple[FlowRetentionEvidence, ...] = ()
+    advanced_flow_policy_sha256: str | None = None
+    contract_scope_sha256: str | None = None
+    manifest_sha256: str | None = None
+    slot_sha256: str | None = None
+    runtime_policy_sha256: str | None = None
+    provider_contract_sha256: str | None = None
+    condition_reference_sha256: str | None = None
+    exchange_reference_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +121,26 @@ class ClusterRow:
     last_event_time: datetime
     status: str
     policy_sha256: str
+    source_flow_id: UUID | None
+    condition_semantics_sha256: str | None
+    lineage_version: int
+    flow_policy_sha256: str | None = None
+    profile: str | None = None
+    flow_universe_tier: str | None = None
+    flow_dte_lane: str | None = None
+    retention_threshold: FlowRetentionEvidence | None = None
+    advanced_flow_policy_sha256: str | None = None
+    contract_scope_sha256: str | None = None
+    manifest_sha256: str | None = None
+    slot_sha256: str | None = None
+    runtime_policy_sha256: str | None = None
+    cumulative_contracts: int | None = None
+    qualifies: bool | None = None
+    member_event_ids: tuple[UUID, ...] = ()
+    member_event_keys: tuple[tuple[UUID, datetime], ...] = ()
+    provider_contract_sha256: str | None = None
+    condition_reference_sha256: str | None = None
+    exchange_reference_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
