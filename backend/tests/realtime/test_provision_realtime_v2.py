@@ -92,6 +92,17 @@ def test_script_gates_targets_authorization_and_security_scope():
         provision.parse_args([*production, "--execute"])
     assert provision.parse_args([*production, "--execute", "--authorization-reference", "approved-2026-10-12"])
     with pytest.raises(SystemExit):
+        provision.parse_args([*production, "--repair-ownership"])
+    repaired = provision.parse_args([
+        *production,
+        "--execute",
+        "--resume",
+        "--repair-ownership",
+        "--authorization-reference",
+        "approved-ownership-repair",
+    ])
+    assert repaired.repair_ownership
+    with pytest.raises(SystemExit):
         provision.parse_args([*production, "--security-mode", "hardened"])
 
 

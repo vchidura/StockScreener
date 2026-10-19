@@ -39,7 +39,7 @@ from ..contracts import canonical_sha256
 from .clusters import ClusterEngine, _State as ClusterState
 from .engine import DETECTOR_VERSION, EngineStats, OptionFlowEngine, _Shard
 from .quote_cache import QuoteCache, QuoteView
-from .records import FlowEvent
+from .records import FlowEvent, FlowRetentionEvidence
 from .volume import BaselineKind, ContractVolume, PrintRecord, VolumeBook
 
 CHECKPOINT_SCHEMA_VERSION = 1
@@ -70,10 +70,25 @@ SERIALIZED_ATTRIBUTES: Mapping[str, frozenset[str]] = {
                             "ask_exchange"}),
     "ClusterEngine": frozenset({"_states", "_open", "_purge", "_max_time_ms", "_watermark_ms",
                                 "late_beyond_retention", "late_revisions", "finalized"}),
-    "ClusterEngine.derived": frozenset({"_config", "_cohort_id", "_provider_tier", "_policy_sha256", "_clock"}),
+    "ClusterEngine.derived": frozenset({
+        "_config",
+        "_cohort_id",
+        "_provider_tier",
+        "_policy_sha256",
+        "_source_flow",
+        "_advanced_flow_policy_sha256",
+        "_contract_scope_sha256",
+        "_manifest_sha256",
+        "_slot_sha256",
+        "_provider_contract_sha256",
+        "_condition_reference_sha256",
+        "_exchange_reference_sha256",
+        "_clock",
+    }),
     "ClusterState": frozenset({"cluster_id", "contract", "underlyer", "side", "window_seconds", "start_ms",
-                               "end_ms", "session_date", "members", "revision", "emitted", "final",
-                               "retracted", "span_ms"}),
+                               "end_ms", "session_date", "members", "revision", "emitted", "qualified", "final",
+                               "retracted", "span_ms", "profile_evidence",
+                               "cumulative_contracts"}),
     "Shard": frozenset({"last_session", "last_time_ms", "next_checkpoint_ms", "last_offset", "reported_offset"}),
     "Shard.derived": frozenset({"index", "queue", "pending", "book", "quotes", "clusters"}),
 }
@@ -163,6 +178,26 @@ def runtime_config_sha256(engine: OptionFlowEngine) -> str:
         "checkpoint_interval_ms": config.checkpoint_interval_ms,
         "journal_generation": config.journal_generation,
         "cohort_id": config.cohort_id,
+        "source_flow_id": (
+            config.source_flow.source_flow_id
+            if config.source_flow is not None
+            else None
+        ),
+        "source_flow_sha256": (
+            config.source_flow.source_flow_sha256
+            if config.source_flow is not None
+            else None
+        ),
+        "advanced_flow_policy_sha256": (
+            config.advanced_flow_policy.sha256
+            if config.advanced_flow_policy is not None
+            else None
+        ),
+        "contract_scope_sha256": (
+            config.contract_scope.sha256
+            if config.contract_scope is not None
+            else None
+        ),
     })
 
 
@@ -197,8 +232,13 @@ def _encode(value: Any) -> Any:
         return value.isoformat()
     if kind is Decimal:
         return str(value)
+    if kind is FlowRetentionEvidence:
+        return [
+            _encode(getattr(value, field.name))
+            for field in fields(FlowRetentionEvidence)
+        ]
     if kind is tuple:
-        return list(value)
+        return [_encode(item) for item in value]
     raise TypeError(f"unsupported checkpoint value: {kind.__name__}")
 
 
@@ -215,7 +255,25 @@ def _decoder(hint: Any):
         return date.fromisoformat
     if hint is Decimal:
         return Decimal
+    if hint is FlowRetentionEvidence:
+        evidence_fields = fields(FlowRetentionEvidence)
+        hints = typing.get_type_hints(FlowRetentionEvidence)
+        decoders = tuple(
+            _decoder(hints[field.name]) for field in evidence_fields
+        )
+        return lambda values: FlowRetentionEvidence(**{
+            field.name: decode(value)
+            for field, decode, value in zip(
+                evidence_fields,
+                decoders,
+                values,
+            )
+        })
     if origin is tuple:
+        arguments = typing.get_args(hint)
+        if len(arguments) == 2 and arguments[1] is Ellipsis:
+            inner = _decoder(arguments[0])
+            return lambda values: tuple(inner(value) for value in values)
         return tuple
     return lambda value: value
 
@@ -280,9 +338,12 @@ def _clusters_out(engine: ClusterEngine) -> dict:
     for key, state in engine._states.items():
         states.append([
             list(key), str(state.cluster_id), state.underlyer, state.end_ms, state.session_date.isoformat(),
-            state.revision, state.emitted, state.final, state.retracted,
+            state.revision, state.emitted, state.qualified, state.final, state.retracted,
             None if state.span_ms is None else list(state.span_ms),
-            [[member_key[0], member_key[1], member[0], str(member[1]), member[2], member[3], member[4]]
+            _encode(state.profile_evidence),
+            state.cumulative_contracts,
+            [[member_key[0], member_key[1], member[0], str(member[1]), member[2], member[3], member[4],
+              str(member[5])]
              for member_key, member in state.members.items()],
         ])
     return {
@@ -433,16 +494,41 @@ def _restore_quotes(cache: QuoteCache, data: Mapping[str, Any]) -> None:
 
 def _restore_clusters(engine: ClusterEngine, data: Mapping[str, Any]) -> None:
     states = {}
-    for (key, cluster_id, underlyer, end_ms, session, revision, emitted, final, retracted, span,
-         members) in data["states"]:
-        contract, side, window_seconds, start_ms = key
+    for (key, cluster_id, underlyer, end_ms, session, revision, emitted, qualified, final, retracted, span,
+         evidence, cumulative_contracts, members) in data["states"]:
+        contract, profile, side, window_seconds, start_ms = key
+        profile_evidence = (
+            None
+            if evidence is None
+            else _decoder(FlowRetentionEvidence)(evidence)
+        )
         state = ClusterState(UUID(cluster_id), contract, underlyer, side, window_seconds, start_ms, end_ms,
-                             date.fromisoformat(session))
-        state.revision, state.emitted, state.final, state.retracted = revision, emitted, final, retracted
+                             date.fromisoformat(session), profile_evidence,
+                             cumulative_contracts)
+        state.revision, state.emitted, state.qualified, state.final, state.retracted = (
+            revision, emitted, qualified, final, retracted)
         state.span_ms = None if span is None else (span[0], span[1])
-        for seq, time_ms, size, premium, exchange, member_time, bucket in members:
-            state.members[(seq, time_ms)] = (size, Decimal(premium), exchange, member_time, bucket)
-        states[(contract, side, window_seconds, start_ms)] = state
+        for (
+            seq,
+            time_ms,
+            size,
+            premium,
+            exchange,
+            member_time,
+            bucket,
+            event_id,
+        ) in members:
+            state.members[(seq, time_ms)] = (
+                size,
+                Decimal(premium),
+                exchange,
+                member_time,
+                bucket,
+                UUID(event_id),
+            )
+        states[
+            (contract, profile, side, window_seconds, start_ms)
+        ] = state
     engine._states = states
     engine._open = [tuple(item) for item in data["open"]]
     engine._purge = [(due, tuple(key)) for due, key in data["purge"]]

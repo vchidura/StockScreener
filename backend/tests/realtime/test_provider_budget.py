@@ -8,6 +8,9 @@ from realtime.acquisition_ledger import (
     ProviderRequestLane,
     ProviderRequestReservation,
 )
+from realtime.advanced_ingress_repository import (
+    reserve_advanced_incremental_request_cursor,
+)
 from realtime.provider_budget import (
     ProviderBudgetExceeded,
     ProviderBudgetScope,
@@ -139,3 +142,48 @@ def test_status_refuses_conflicting_account_ceilings():
     )
     with pytest.raises(ValueError, match="ceilings conflict"):
         provider_budget_status_cursor(cursor, _scope())
+
+
+def test_advanced_incremental_budget_exhaustion_blocks_before_reservation():
+    cursor = MagicMock()
+    plan_id = uuid4()
+    cohort_id = uuid4()
+    scope = _scope(
+        account_alias="MASSIVE_ADVANCED",
+        provider_authorization_reference="stocks-advanced",
+        lanes=frozenset({ProviderRequestLane.EQUITY_HISTORY}),
+    )
+    reservation = _reservation(
+        account_alias="MASSIVE_ADVANCED",
+        lane=ProviderRequestLane.EQUITY_HISTORY,
+        cohort_id=cohort_id,
+    )
+    cursor.fetchone.side_effect = [
+        (
+            cohort_id,
+            scope.session_date,
+            scope.request_ceiling,
+            scope.decoded_byte_ceiling,
+            scope.authorized_until,
+            "ACTIVE",
+            "READY",
+            scope.authorization_reference,
+            scope.request_ceiling,
+            0,
+        ),
+        None,
+    ]
+
+    with pytest.raises(ProviderBudgetExceeded, match="budget is exhausted"):
+        reserve_advanced_incremental_request_cursor(
+            cursor,
+            scope,
+            reservation,
+            plan_id=plan_id,
+            reserved_response_bytes=2_001,
+        )
+
+    assert not any(
+        "UPDATE rt.advanced_ingress_plan_usage" in call.args[0]
+        for call in cursor.execute.call_args_list
+    )

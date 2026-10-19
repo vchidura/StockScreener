@@ -22,6 +22,8 @@ from option_flow_support import (
     REGULAR,
     T0,
     UNKNOWN_CODE,
+    advanced_contract_scope,
+    advanced_policy,
     config,
     policy,
     quote,
@@ -183,6 +185,67 @@ def test_a_restored_engine_continues_exactly_like_the_uninterrupted_one(split):
     assert combined.gaps == expected.gaps and combined.reconciles == expected.reconciles
     assert after.state_digest() == uninterrupted.state_digest()
     assert asdict(after.stats) == asdict(uninterrupted.stats)
+
+
+def test_advanced_profile_state_restarts_and_replays_exactly():
+    flow_policy = advanced_policy()
+    scope = advanced_contract_scope((CALL,))
+    advanced_config = _config(
+        shard_count=1,
+        advanced_flow_policy=flow_policy,
+        contract_scope=scope,
+    )
+    steps = [(
+        "msg",
+        quote(seq=1, time_ms=T0 - 100, bid=1.9, ask=2.0),
+    )]
+    steps += [
+        (
+            "msg",
+            trade(
+                seq=index + 1,
+                time_ms=T0 + index * 80,
+                price=2.0,
+                size=50,
+                exchange=302 + index % 3,
+            ),
+        )
+        for index in range(50)
+    ]
+    split = 31
+
+    uninterrupted = OptionFlowEngine(advanced_config)
+    expected = run_steps(uninterrupted, steps)
+    expected.extend(uninterrupted.flush(final=True))
+
+    before = OptionFlowEngine(advanced_config)
+    first = run_steps(before, steps[:split])
+    rows = _rows(before, split)
+    after = OptionFlowEngine(advanced_config)
+    after, restored = _restore(rows, engine=after)
+    second = run_steps(after, steps[split:], first_offset=split + 1)
+    second.extend(after.flush(final=True))
+
+    assert restored.offset == split
+    combined = merged(first, second)
+    assert combined.events == expected.events
+    assert combined.clusters == expected.clusters
+    assert after.state_digest() == uninterrupted.state_digest()
+    assert {
+        row.profile for row in combined.clusters
+    } == {"ACCUMULATION", "SWEEP"}
+
+    changed_scope = replace(scope, manifest_sha256="3" * 64)
+    changed = OptionFlowEngine(_config(
+        shard_count=1,
+        advanced_flow_policy=flow_policy,
+        contract_scope=changed_scope,
+    ))
+    with pytest.raises(
+        CheckpointRejected,
+        match="CHECKPOINT_POLICY_MISMATCH",
+    ):
+        _restore(rows, engine=changed)
 
 
 def test_a_checkpoint_taken_after_a_restore_is_byte_identical_to_one_taken_without_it():

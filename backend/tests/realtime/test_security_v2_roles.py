@@ -15,11 +15,13 @@ from realtime.security_v2 import (
     EXECUTE_GRANTS,
     SEQUENCE_GRANTS,
     apply_database_security_v2,
+    apply_equity_live024_database_security_v2,
     audit_database_security_v2,
     build_role_names_v2,
     create_disposable_roles_v2,
     ensure_roles_v2,
 )
+from realtime.equity_live024_compatibility import POST024_RELATIONS
 
 PREFIX = "test_rt_x"
 ROLES = build_role_names_v2(PREFIX)
@@ -134,6 +136,21 @@ def test_apply_grants_exactly_what_the_registry_says_and_nothing_to_admin_or_pub
     assert f'ALTER TABLE "rt"."instruments" OWNER TO "{ADMIN}"' in statements
     assert f'ALTER SEQUENCE "rt"."readiness_transitions_transition_id_seq" OWNER TO "{ADMIN}"' in statements
     assert f'ALTER FUNCTION rt.fence_stage_run(uuid) OWNER TO "{ADMIN}"' in statements
+
+
+def test_live024_apply_uses_the_exact_historical_registry_not_a_domain_filter():
+    connection = _Connection(_apply_answer())
+
+    apply_equity_live024_database_security_v2(connection, ROLES)
+
+    granted = {
+        relation
+        for relations in _granted_tables(connection.statements).values()
+        for relation in relations
+    }
+    assert not granted & POST024_RELATIONS
+    assert "rt.option_flow_events" in granted
+    assert "rt.advanced_ingress_plans" in granted
 
 
 def test_apply_resets_then_grants_database_schema_sequence_and_function_privileges():

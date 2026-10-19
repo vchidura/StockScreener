@@ -10,17 +10,37 @@ equity window, and that every stage transaction runs as the single app role.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
-from uuid import uuid4
+from decimal import Decimal
+from uuid import UUID, uuid4
 
 import pytest
 
 from option_flow_runner_support import pinned_semantics, scenario_messages, settings
-from option_flow_support import CALL, OTHER, PUT, policy, semantics
+from option_flow_support import (
+    CALL,
+    OTHER,
+    PUT,
+    advanced_contract_scope,
+    advanced_policy,
+    policy,
+    semantics,
+)
+from realtime.advanced_options_provider_contract import (
+    MASSIVE_OPTIONS_PROVIDER_CONTRACT,
+    load_default_options_exchange_reference,
+)
 from realtime.database_access_v2 import OWNER_POOL, V2AccessConfig, V2ConnectionProvider
 from realtime.option_flow.clock import SessionClock
+from realtime.option_flow.engine import EngineConfig
 from realtime.option_flow.consumer import ConsumerLimits, GapEntry
 from realtime.option_flow.mock_feed import MockOptionFeed
+from realtime.option_flow.writer import write_condition_reference
+from realtime.option_source_flow import (
+    build_option_source_flow_identity,
+    persist_option_flow_policy_cursor,
+)
 from realtime.orchestration_repository import PostgresOrchestrationRepository, WindowSpec
 from realtime.runner_environment import RunnerEnvironment
 from realtime.stage_graph import STAGES_V1
@@ -66,6 +86,35 @@ CHECKPOINT_SQL = ("SELECT shard_id, committed_offset, octet_length(state_payload
                   "FROM rt.consumer_checkpoints WHERE cohort_id = %s AND consumer_name = %s ORDER BY shard_id")
 
 
+def _legacy_compatible_advanced_policy():
+    flow_policy = advanced_policy()
+    profiles = []
+    for profile in flow_policy.profiles:
+        thresholds = []
+        for threshold in profile.tier_thresholds:
+            clustered = threshold.minimum_cluster_prints is not None
+            thresholds.append(replace(
+                threshold,
+                minimum_contracts=1,
+                minimum_print_premium=Decimal("1"),
+                minimum_cluster_prints=1 if clustered else None,
+                minimum_distinct_exchanges=1 if clustered else None,
+                minimum_cluster_premium=(
+                    Decimal("1") if clustered else None
+                ),
+                minimum_cumulative_contracts=(
+                    1
+                    if threshold.minimum_cumulative_contracts is not None
+                    else None
+                ),
+            ))
+        profiles.append(replace(
+            profile,
+            tier_thresholds=tuple(thresholds),
+        ))
+    return replace(flow_policy, profiles=tuple(profiles))
+
+
 @pytest.fixture(scope="module")
 def pool():
     with disposable_v2_database(DATABASE) as connection_pool:
@@ -106,6 +155,8 @@ class Spy:
     def __init__(self, feed):
         self._feed = feed
         self.generation = feed.generation
+        self.records = feed.records
+        self.source_flow = getattr(feed, "source_flow", None)
         self.reads = 0
 
     def read_after(self, offset, *, limit=1000):
@@ -144,10 +195,17 @@ def relative(rows, base_ms, session_date=None):
 
 class World:
     def __init__(self, pool, feed, *, cohort=None, plan_id=None, base_ms=None, runners=None, enabled=ALL,
-                 database_open_interest=False, **environment):
+                 database_open_interest=False, provider=None, **environment):
         self.pool = pool
         self.now = datetime.now(UTC)
-        self.provider = V2ConnectionProvider({OWNER_POOL: pool}, V2AccessConfig(allow_disposable=True))
+        self.provider = (
+            provider
+            if provider is not None
+            else V2ConnectionProvider(
+                {OWNER_POOL: pool},
+                V2AccessConfig(allow_disposable=True),
+            )
+        )
         self.provider.verify()
         self.transactions = []
         original = self.provider.transaction
@@ -179,9 +237,120 @@ class World:
                 pool.putconn(connection)
         self.cohort, self.plan_id = cohort, plan_id
         self.repository = PostgresOrchestrationRepository(self.provider)
-        values = dict(options_flow_source=feed, options_flow_semantics=pinned_semantics(),
-                      options_flow_policy=policy(sweep_window_seconds=5, minimum_sweep_prints=3),
-                      options_flow_settings=settings(), options_flow_clock=Counter())
+        flow_semantics = environment.pop(
+            "options_flow_semantics",
+            pinned_semantics(),
+        )
+        detector_policy = environment.pop(
+            "options_flow_policy",
+            policy(
+                sweep_window_seconds=5,
+                minimum_sweep_prints=3,
+            ),
+        )
+        flow_policy = environment.pop(
+            "options_flow_advanced_policy",
+            _legacy_compatible_advanced_policy(),
+        )
+        scope = environment.pop(
+            "options_flow_contract_scope",
+            None,
+        )
+        if scope is None:
+            scope = advanced_contract_scope(
+                (CALL, PUT, OTHER),
+                session_date=self.session_date,
+                flow_policy=flow_policy,
+            )
+            with self.provider.transaction(read_only=True) as unit:
+                unit.cursor.execute(
+                    "SELECT manifest.manifest_sha256 "
+                    "FROM rt.cohorts AS cohort "
+                    "JOIN rt.subscription_manifests AS manifest "
+                    "USING(manifest_id) WHERE cohort.cohort_id=%s",
+                    (str(self.cohort),),
+                )
+                scope = replace(
+                    scope,
+                    manifest_sha256=str(unit.cursor.fetchone()[0]),
+                )
+        exchange_reference = environment.pop(
+            "options_flow_exchange_reference",
+            load_default_options_exchange_reference(),
+        )
+        requested_settings = environment.pop(
+            "options_flow_settings",
+            settings(),
+        )
+        flow_settings = replace(
+            requested_settings,
+            advanced_flow_policy_sha256=flow_policy.sha256,
+            contract_scope_sha256=scope.sha256,
+            provider_contract_sha256=(
+                MASSIVE_OPTIONS_PROVIDER_CONTRACT.sha256
+            ),
+            exchange_reference_sha256=exchange_reference.sha256,
+        )
+        if (
+            feed is not None
+            and isinstance(getattr(feed, "generation", None), UUID)
+            and getattr(feed, "source_flow", None) is None
+        ):
+            records = tuple(getattr(feed, "records", ()))
+            sessions = tuple(sorted({
+                row.stream_session_id for row in records
+            }, key=str))
+            if sessions:
+                unbound = EngineConfig(
+                    cohort_id=self.cohort,
+                    provider_tier=flow_settings.provider_tier,
+                    policy=detector_policy,
+                    semantics=flow_semantics,
+                    journal_generation=feed.generation,
+                    advanced_flow_policy=flow_policy,
+                    contract_scope=scope,
+                    exchange_reference=exchange_reference,
+                    shard_count=flow_settings.shard_count,
+                    queue_capacity=flow_settings.queue_capacity,
+                    checkpoint_interval_ms=(
+                        flow_settings.checkpoint_interval_ms
+                    ),
+                )
+                feed.source_flow = build_option_source_flow_identity(
+                    journal_generation=feed.generation,
+                    stream_session_ids=sessions,
+                    condition_semantics_sha256=(
+                        flow_semantics.semantics_sha256
+                    ),
+                    flow_policy_sha256=unbound.policy_sha256(),
+                    advanced_flow_policy_sha256=flow_policy.sha256,
+                    contract_scope_sha256=scope.sha256,
+                    provider_contract_sha256=(
+                        MASSIVE_OPTIONS_PROVIDER_CONTRACT.sha256
+                    ),
+                    condition_reference_sha256=(
+                        flow_semantics.pin.payload_sha256
+                    ),
+                    exchange_reference_sha256=exchange_reference.sha256,
+                )
+        connection = pool.getconn()
+        try:
+            write_condition_reference(connection, flow_semantics)
+            with connection.cursor() as cursor:
+                persist_option_flow_policy_cursor(cursor, flow_policy)
+            connection.commit()
+        finally:
+            pool.putconn(connection)
+        values = dict(
+            options_flow_source=feed,
+            options_flow_semantics=flow_semantics,
+            options_flow_policy=detector_policy,
+            options_flow_settings=flow_settings,
+            options_flow_advanced_policy=flow_policy,
+            options_flow_contract_scope=scope,
+            options_flow_exchange_reference=exchange_reference,
+            options_flow_clock=Counter(),
+        )
         if not database_open_interest:
             values["options_flow_oi_loader"] = lambda context, session: {}
         values.update(environment)
@@ -315,7 +484,13 @@ def test_a_crash_and_restart_persists_the_same_rows_as_an_uninterrupted_session(
     assert resumed_world.session().start.mode == "RESTORED"
     got = resumed_world.rows(normalized=True)
     assert got["events"] == expected["events"]
-    assert got["clusters"] == expected["clusters"]
+    assert [row[:-1] for row in got["clusters"]] == [
+        row[:-1] for row in expected["clusters"]
+    ]
+    got_policies = {row[-1] for row in got["clusters"]}
+    expected_policies = {row[-1] for row in expected["clusters"]}
+    assert len(got_policies) == len(expected_policies) == 1
+    assert got_policies.isdisjoint(expected_policies)
     assert got["volume"] == expected["volume"]
     assert resumed.engine.state_digest() == uninterrupted.engine.state_digest()
     assert asdict_stats(resumed) == asdict_stats(uninterrupted)

@@ -1,19 +1,26 @@
-from datetime import date
+from datetime import date, datetime, timezone
+from pathlib import Path
 from uuid import UUID
 
 import pytest
 
 from realtime.advanced_journal_registry import (
+    AdvancedJournalRecoveryEvent,
     build_advanced_journal_registration,
     journal_relative_path,
     measure_journal_capacity,
+    record_advanced_journal_recovery_event_cursor,
     resolve_registered_journal_path,
 )
 from realtime.advanced_journal_replay import (
     JournalReplayQuarantine,
     inspect_registered_journal,
 )
-from realtime.journal import RawJournalWriter, journal_files_sha256
+from realtime.journal import (
+    RawJournalWriter,
+    checkpoint_journal_wal,
+    journal_files_sha256,
+)
 
 
 GENERATION = UUID("11111111-1111-1111-1111-111111111111")
@@ -104,6 +111,18 @@ def test_registry_identity_and_empty_journal_recovery_are_deterministic(
     assert len(journal_files_sha256(path)) == 64
 
 
+def test_journal_checkpoint_truncates_wal_before_seal(tmp_path):
+    path = tmp_path / "journal.sqlite"
+    with RawJournalWriter(path, generation=GENERATION):
+        pass
+
+    logged, checkpointed = checkpoint_journal_wal(path)
+
+    assert logged == checkpointed
+    wal = Path(str(path) + "-wal")
+    assert not wal.exists() or wal.stat().st_size == 0
+
+
 def test_missing_registered_journal_is_explicit_quarantine_evidence(
     tmp_path,
 ):
@@ -118,3 +137,72 @@ def test_missing_registered_journal_is_explicit_quarantine_evidence(
         inspect_registered_journal(root, registration)
 
     assert captured.value.reason == "MISSING_JOURNAL"
+
+
+class _RecoveryCursor:
+    def __init__(self, event):
+        self.event = event
+        self.executions = []
+
+    def execute(self, statement, parameters=()):
+        self.executions.append((statement, parameters))
+
+    def fetchall(self):
+        event = self.event
+        return [(
+            str(event.recovery_event_id),
+            str(event.journal_generation),
+            str(event.plan_id),
+            event.event_type,
+            event.recovery_contract,
+            event.plan_report_sha256,
+            event.journal_files_sha256,
+            event.raw_committed_offset,
+            event.normalized_committed_offset,
+            event.bridge_committed_offset,
+            event.persisted_bars,
+            event.created_at,
+        )]
+
+
+def test_missing_journal_recovery_is_append_only_overlay(
+    tmp_path,
+):
+    root = tmp_path / "mounted"
+    root.mkdir()
+    registration = _registration(root, root / "journal.sqlite")
+    event = AdvancedJournalRecoveryEvent(
+        recovery_event_id=UUID(
+            "66666666-6666-6666-6666-666666666666"
+        ),
+        journal_generation=registration.journal_generation,
+        plan_id=registration.plan_id,
+        event_type="PREPARED",
+        recovery_contract="advanced-journal-root-recovery-v1",
+        plan_report_sha256="b" * 64,
+        journal_files_sha256="c" * 64,
+        raw_committed_offset=9,
+        normalized_committed_offset=9,
+        bridge_committed_offset=0,
+        persisted_bars=0,
+        created_at=datetime(2026, 10, 19, tzinfo=timezone.utc),
+    )
+    cursor = _RecoveryCursor(event)
+
+    stored = record_advanced_journal_recovery_event_cursor(
+        cursor,
+        event,
+        expected_relative_path=registration.relative_path,
+        expected_metadata_sha256=registration.metadata_sha256,
+        expected_quarantine_reason="MISSING_JOURNAL",
+        expected_quarantine_detail=registration.relative_path,
+    )
+
+    insert = cursor.executions[0][0]
+    assert stored == event
+    assert insert.startswith(
+        "INSERT INTO rt.advanced_journal_recovery_events"
+    )
+    assert "registry.status='QUARANTINED'" in insert
+    assert "registry.quarantine_reason=%s" in insert
+    assert "UPDATE rt.advanced_journal_registry" not in insert

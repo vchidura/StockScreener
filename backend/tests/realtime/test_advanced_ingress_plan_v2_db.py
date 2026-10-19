@@ -395,6 +395,64 @@ def _admit(provider, plan, *, attempt, owner_epoch, session_id):
         )
 
 
+def test_canary_persists_deadline_and_counters_and_rejects_widening(hardened_database):
+    pool, provider, roles, _cohort_id, _manifest_id = hardened_database
+    budgets = AdvancedIngressBudgets(3, 3, 10_000, 0, 0)
+    authorization = _create_authorization(pool, roles, "bounded-canary", budgets=budgets)
+    ended = SESSION_OPEN + timedelta(seconds=600)
+    request = AdvancedIngressPlanRequest(
+        authorization.authorization_id, SESSION_DATE, 1, budgets,
+        canary_start_at=SESSION_OPEN, canary_end_at=ended,
+    )
+    with provider.transaction(APP_ROLE) as unit:
+        plan = resolve_advanced_ingress_plan_cursor(
+            unit.cursor, request, runtime_catalog=RUNTIME_CATALOG, calendar=_Calendar(),
+        )
+        prepare_advanced_ingress_plan_cursor(unit.cursor, plan, checked_at=SESSION_OPEN)
+    session_id = uuid4()
+    _admit(provider, plan, attempt=1, owner_epoch=1, session_id=session_id)
+    with provider.transaction(APP_ROLE) as unit:
+        record_advanced_ingress_usage_cursor(
+            unit.cursor, plan_id=plan.plan_id, stream_session_id=session_id,
+            owner_epoch=1, decoded_bytes=123, checked_at=SESSION_OPEN + timedelta(minutes=2),
+        )
+    with provider.transaction(APP_ROLE) as unit:
+        restarted = resolve_advanced_ingress_plan_cursor(
+            unit.cursor, request, runtime_catalog=RUNTIME_CATALOG, calendar=_Calendar(),
+        )
+        prepare_advanced_ingress_plan_cursor(
+            unit.cursor, restarted, checked_at=SESSION_OPEN + timedelta(minutes=4),
+        )
+        scope = load_advanced_ingress_runtime_plan_cursor(unit.cursor, restarted.plan_id)
+        status = advanced_ingress_status_cursor(
+            unit.cursor, restarted.plan_id, checked_at=SESSION_OPEN + timedelta(minutes=4),
+        )
+    assert restarted.plan_id == plan.plan_id
+    assert scope.authorized_end_at == ended
+    assert scope.next_connection_attempt == 2
+    assert (status.stream_sessions, status.connection_attempts, status.decoded_bytes) == (1, 1, 123)
+    with pytest.raises(ValueError, match="another daily plan"):
+        with provider.transaction(APP_ROLE) as unit:
+            wider = resolve_advanced_ingress_plan_cursor(
+                unit.cursor,
+                AdvancedIngressPlanRequest(authorization.authorization_id, SESSION_DATE, 1, budgets),
+                runtime_catalog=RUNTIME_CATALOG, calendar=_Calendar(),
+            )
+            prepare_advanced_ingress_plan_cursor(
+                unit.cursor, wider, checked_at=SESSION_OPEN + timedelta(minutes=4),
+            )
+    with pytest.raises(AdvancedIngressAdmissionError, match="expired"):
+        with provider.transaction(APP_ROLE) as unit:
+            admit_advanced_ingress_session_cursor(
+                unit.cursor, plan_id=plan.plan_id, cohort_id=plan.cohort_id,
+                manifest_id=plan.manifest_id,
+                authorization_reference=plan.authorization_reference,
+                connection_attempt=2, connection_ceiling=budgets.connection_attempts,
+                decoded_byte_ceiling=budgets.decoded_bytes, stream_session_id=uuid4(),
+                owner_epoch=2, checked_at=ended,
+            )
+
+
 def _insert_repair_bar(
     cursor,
     *,

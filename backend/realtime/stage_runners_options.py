@@ -46,6 +46,14 @@ from uuid import UUID, uuid5
 
 from options.config import FlowStrategyPolicy
 from psycopg2 import Error as PsycopgError
+from .advanced_options_flow_policy import (
+    AdvancedOptionsContractScope,
+    AdvancedOptionsFlowPolicy,
+)
+from .advanced_options_provider_contract import (
+    MASSIVE_OPTIONS_PROVIDER_CONTRACT,
+    AdvancedOptionsExchangeReference,
+)
 from .option_flow.checkpoint_state import (
     DEFAULT_MAX_STATE_BYTES,
     CheckpointRegression,
@@ -63,7 +71,11 @@ from .option_flow.consumer import (
     OptionFlowSourceError,
     SliceReport,
 )
-from .option_flow.engine import EngineConfig, OptionFlowEngine
+from .option_flow.engine import (
+    DEFAULT_SHARD_COUNT,
+    EngineConfig,
+    OptionFlowEngine,
+)
 from .option_flow.labels import PriorOpenInterest
 from .option_flow.volume import BaselineKind, VolumeConfig
 from .option_flow.writer import (
@@ -74,6 +86,16 @@ from .option_flow.writer import (
     OptionFlowWriteError,
     OptionFlowWriter,
 )
+from .option_source_flow import (
+    OptionSourceFlowIdentity,
+    persist_option_source_flow_cursor,
+)
+from .orchestration_repository import (
+    OPTIONS_CYCLE,
+    OPTIONS_INPUT_READY,
+    OPTIONS_PORTAL_READY,
+    CycleReceiptSpec,
+)
 from .runner_environment import RunnerEnvironment
 from .stage_orchestrator import StageCancelled, StageContext, StageOutcome, StageRunner
 from .stage_runners_equity import STAGE_CANCELLED
@@ -83,6 +105,21 @@ logger = logging.getLogger(__name__)
 OPTIONS_FLOW_SOURCE_NOT_CONFIGURED = "OPTIONS_FLOW_SOURCE_NOT_CONFIGURED"
 OPTIONS_FLOW_CONDITIONS_UNPINNED = "OPTIONS_FLOW_CONDITIONS_UNPINNED"
 OPTIONS_FLOW_POLICY_NOT_CONFIGURED = "OPTIONS_FLOW_POLICY_NOT_CONFIGURED"
+OPTIONS_FLOW_ADVANCED_POLICY_NOT_CONFIGURED = (
+    "OPTIONS_FLOW_ADVANCED_POLICY_NOT_CONFIGURED"
+)
+OPTIONS_FLOW_CONTRACT_SCOPE_NOT_CONFIGURED = (
+    "OPTIONS_FLOW_CONTRACT_SCOPE_NOT_CONFIGURED"
+)
+OPTIONS_FLOW_ADVANCED_IDENTITY_UNPINNED = (
+    "OPTIONS_FLOW_ADVANCED_IDENTITY_UNPINNED"
+)
+OPTIONS_FLOW_EXCHANGE_REFERENCE_UNPINNED = (
+    "OPTIONS_FLOW_EXCHANGE_REFERENCE_UNPINNED"
+)
+OPTIONS_FLOW_SOURCE_IDENTITY_UNPINNED = (
+    "OPTIONS_FLOW_SOURCE_IDENTITY_UNPINNED"
+)
 OPTIONS_FLOW_DATABASE_NOT_CONFIGURED = "OPTIONS_FLOW_DATABASE_NOT_CONFIGURED"
 REPLAY_DIVERGENCE = "REPLAY_DIVERGENCE"
 OPTIONS_FLOW_SCHEMA_VIOLATION = "OPTIONS_FLOW_SCHEMA_VIOLATION"
@@ -97,6 +134,12 @@ OPTIONS_ACQUIRE_NOT_CONFIGURED = "OPTIONS_ACQUIRE_NOT_CONFIGURED"
 OPTIONS_ACQUIRE_INCOMPLETE = "OPTIONS_ACQUIRE_INCOMPLETE"
 OPTIONS_ADMISSION_NOT_CONFIGURED = "OPTIONS_ADMISSION_NOT_CONFIGURED"
 OPTIONS_ADMISSION_INCOMPLETE = "OPTIONS_ADMISSION_INCOMPLETE"
+OPTIONS_INPUT_GATE_NOT_CONFIGURED = "OPTIONS_INPUT_GATE_NOT_CONFIGURED"
+OPTIONS_CYCLE_NOT_CONFIGURED = "OPTIONS_CYCLE_NOT_CONFIGURED"
+OPTIONS_PROJECTION_NOT_CONFIGURED = "OPTIONS_PROJECTION_NOT_CONFIGURED"
+OPTIONS_PUBLISH_NOT_CONFIGURED = "OPTIONS_PUBLISH_NOT_CONFIGURED"
+OPTIONS_STAGE_RECEIPT_INVALID = "OPTIONS_STAGE_RECEIPT_INVALID"
+OPTIONS_PUBLISH_AUTHORITY_INVALID = "OPTIONS_PUBLISH_AUTHORITY_INVALID"
 WARMING_NO_CHECKPOINT = "NO_CHECKPOINT"
 WARMING_NEW_SESSION = "NEW_SESSION"
 _NAMESPACE = UUID("4a8e2b1c-7d03-4f95-a6e8-2c91d0b5f378")
@@ -181,10 +224,40 @@ class OptionsAdmissionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class OptionsReceiptStageResult:
+    receipt: CycleReceiptSpec
+    evidence_ref: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, CycleReceiptSpec):
+            raise TypeError("Options stage receipt result is invalid")
+        if not self.evidence_ref.strip():
+            raise ValueError("Options stage receipt evidence cannot be blank")
+
+
+@dataclass(frozen=True, slots=True)
+class OptionsPublisherStageResult:
+    handoff_sha256: str
+    evidence_ref: str
+    dispatch_authorized: bool = False
+    release_authorized: bool = False
+    pointer_authorized: bool = False
+
+    def __post_init__(self) -> None:
+        if len(self.handoff_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in self.handoff_sha256
+        ):
+            raise ValueError("Options publisher handoff hash is invalid")
+        if not self.evidence_ref.strip():
+            raise ValueError("Options publisher evidence cannot be blank")
+
+
+@dataclass(frozen=True, slots=True)
 class OptionsFlowSettings:
     consumer_name: str = "option_flow_stream_v1"
     provider_tier: str = "MASSIVE_ADVANCED"
-    shard_count: int = 4
+    shard_count: int = DEFAULT_SHARD_COUNT
     queue_capacity: int = 50_000
     history_per_contract: int = 512
     initial_baseline: BaselineKind = BaselineKind.WARMING
@@ -199,6 +272,31 @@ class OptionsFlowSettings:
     checkpoint_interval_ms: int = 5_000
     backlog_degraded_records: int = 10_000
     open_interest_max_rows: int = 500_000
+    advanced_flow_policy_sha256: str | None = None
+    contract_scope_sha256: str | None = None
+    provider_contract_sha256: str = (
+        MASSIVE_OPTIONS_PROVIDER_CONTRACT.sha256
+    )
+    exchange_reference_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            (
+                "advanced_flow_policy_sha256",
+                self.advanced_flow_policy_sha256,
+            ),
+            ("contract_scope_sha256", self.contract_scope_sha256),
+            ("provider_contract_sha256", self.provider_contract_sha256),
+            ("exchange_reference_sha256", self.exchange_reference_sha256),
+        ):
+            if value is not None and (
+                len(value) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in value
+                )
+            ):
+                raise ValueError(f"{name} must be a SHA-256 digest")
 
 
 def options_acquire_block_reason(environment: RunnerEnvironment) -> str | None:
@@ -207,6 +305,123 @@ def options_acquire_block_reason(environment: RunnerEnvironment) -> str | None:
 
 def options_admission_block_reason(environment: RunnerEnvironment) -> str | None:
     return None if callable(environment.options_admission_action) else OPTIONS_ADMISSION_NOT_CONFIGURED
+
+
+def options_input_gate_block_reason(
+    environment: RunnerEnvironment,
+) -> str | None:
+    return (
+        None
+        if callable(environment.options_input_gate_action)
+        else OPTIONS_INPUT_GATE_NOT_CONFIGURED
+    )
+
+
+def options_cycle_block_reason(environment: RunnerEnvironment) -> str | None:
+    return (
+        None
+        if callable(environment.options_cycle_action)
+        else OPTIONS_CYCLE_NOT_CONFIGURED
+    )
+
+
+def options_projection_block_reason(
+    environment: RunnerEnvironment,
+) -> str | None:
+    return (
+        None
+        if callable(environment.options_projection_action)
+        else OPTIONS_PROJECTION_NOT_CONFIGURED
+    )
+
+
+def options_publish_block_reason(
+    environment: RunnerEnvironment,
+) -> str | None:
+    return (
+        None
+        if callable(environment.options_publish_action)
+        else OPTIONS_PUBLISH_NOT_CONFIGURED
+    )
+
+
+def _options_receipt_runner(
+    environment: RunnerEnvironment,
+    *,
+    action_name: str,
+    expected_kind: str,
+    block_reason: Callable[[RunnerEnvironment], str | None],
+) -> StageRunner:
+    def run(context: StageContext) -> StageOutcome:
+        blocked = block_reason(environment)
+        if blocked is not None:
+            return StageOutcome.blocked(blocked)
+        if context.is_cancelled():
+            return StageOutcome.failed(STAGE_CANCELLED)
+        result = getattr(environment, action_name)(context)
+        if (
+            not isinstance(result, OptionsReceiptStageResult)
+            or result.receipt.receipt_kind != expected_kind
+            or result.receipt.advance_release
+        ):
+            return StageOutcome.failed(OPTIONS_STAGE_RECEIPT_INVALID)
+        return StageOutcome.complete(
+            receipt=result.receipt,
+            evidence_ref=result.evidence_ref,
+        )
+
+    return run
+
+
+def options_input_gate_runner(
+    environment: RunnerEnvironment,
+) -> StageRunner:
+    return _options_receipt_runner(
+        environment,
+        action_name="options_input_gate_action",
+        expected_kind=OPTIONS_INPUT_READY,
+        block_reason=options_input_gate_block_reason,
+    )
+
+
+def options_cycle_runner(environment: RunnerEnvironment) -> StageRunner:
+    return _options_receipt_runner(
+        environment,
+        action_name="options_cycle_action",
+        expected_kind=OPTIONS_CYCLE,
+        block_reason=options_cycle_block_reason,
+    )
+
+
+def options_projection_runner(
+    environment: RunnerEnvironment,
+) -> StageRunner:
+    return _options_receipt_runner(
+        environment,
+        action_name="options_projection_action",
+        expected_kind=OPTIONS_PORTAL_READY,
+        block_reason=options_projection_block_reason,
+    )
+
+
+def options_publish_runner(environment: RunnerEnvironment) -> StageRunner:
+    def run(context: StageContext) -> StageOutcome:
+        blocked = options_publish_block_reason(environment)
+        if blocked is not None:
+            return StageOutcome.blocked(blocked)
+        if context.is_cancelled():
+            return StageOutcome.failed(STAGE_CANCELLED)
+        result = environment.options_publish_action(context)
+        if (
+            not isinstance(result, OptionsPublisherStageResult)
+            or result.dispatch_authorized
+            or result.release_authorized
+            or result.pointer_authorized
+        ):
+            return StageOutcome.failed(OPTIONS_PUBLISH_AUTHORITY_INVALID)
+        return StageOutcome.complete(evidence_ref=result.evidence_ref)
+
+    return run
 
 
 def options_acquire_runner(environment: RunnerEnvironment) -> StageRunner:
@@ -453,27 +668,114 @@ def options_flow_block_reason(environment: RunnerEnvironment) -> str | None:
     if (source is None or not callable(getattr(source, "read_after", None))
             or not isinstance(getattr(source, "generation", None), UUID)):
         return OPTIONS_FLOW_SOURCE_NOT_CONFIGURED
+    source_flow = getattr(source, "source_flow", None)
+    if source_flow is not None and (
+        not isinstance(source_flow, OptionSourceFlowIdentity)
+        or source_flow.journal_generation != source.generation
+    ):
+        return OPTIONS_FLOW_SOURCE_IDENTITY_UNPINNED
     semantics = environment.options_flow_semantics
     if semantics is None or not semantics.is_live_capture:
         return OPTIONS_FLOW_CONDITIONS_UNPINNED
     if not isinstance(environment.options_flow_policy, FlowStrategyPolicy):
         return OPTIONS_FLOW_POLICY_NOT_CONFIGURED
+    advanced_policy = environment.options_flow_advanced_policy
+    if not isinstance(advanced_policy, AdvancedOptionsFlowPolicy):
+        return OPTIONS_FLOW_ADVANCED_POLICY_NOT_CONFIGURED
+    contract_scope = environment.options_flow_contract_scope
+    if not isinstance(contract_scope, AdvancedOptionsContractScope):
+        return OPTIONS_FLOW_CONTRACT_SCOPE_NOT_CONFIGURED
+    settings = environment.options_flow_settings
+    if (
+        settings is None
+        or settings.advanced_flow_policy_sha256
+        != advanced_policy.sha256
+        or settings.contract_scope_sha256 != contract_scope.sha256
+    ):
+        return OPTIONS_FLOW_ADVANCED_IDENTITY_UNPINNED
+    try:
+        contract_scope.validate_policy(advanced_policy)
+    except (TypeError, ValueError):
+        return OPTIONS_FLOW_ADVANCED_IDENTITY_UNPINNED
+    exchange_reference = environment.options_flow_exchange_reference
+    if (
+        not isinstance(
+            exchange_reference,
+            AdvancedOptionsExchangeReference,
+        )
+        or not exchange_reference.is_live_capture
+        or settings.provider_contract_sha256
+        != MASSIVE_OPTIONS_PROVIDER_CONTRACT.sha256
+        or settings.exchange_reference_sha256
+        != exchange_reference.sha256
+    ):
+        return OPTIONS_FLOW_EXCHANGE_REFERENCE_UNPINNED
+    if source_flow is not None:
+        unbound = _engine_config(
+            environment,
+            settings,
+            UUID(int=0),
+            source.generation,
+            source_flow=None,
+        )
+        if (
+            source_flow.condition_semantics_sha256
+            != environment.options_flow_semantics.semantics_sha256
+            or source_flow.flow_policy_sha256 != unbound.policy_sha256()
+            or source_flow.identity_version != 4
+            or source_flow.advanced_flow_policy_sha256
+            != advanced_policy.sha256
+            or source_flow.contract_scope_sha256
+            != contract_scope.sha256
+            or source_flow.provider_contract_sha256
+            != MASSIVE_OPTIONS_PROVIDER_CONTRACT.sha256
+            or source_flow.condition_reference_sha256
+            != environment.options_flow_semantics.pin.payload_sha256
+            or source_flow.exchange_reference_sha256
+            != exchange_reference.sha256
+        ):
+            return OPTIONS_FLOW_SOURCE_IDENTITY_UNPINNED
     return None
 
 
-def _engine_factory(environment: RunnerEnvironment, settings: OptionsFlowSettings, context: StageContext,
-                    generation: UUID) -> Callable[[], OptionFlowEngine]:
-    config = EngineConfig(
-        cohort_id=context.plan.cohort_id,
+def _engine_config(
+    environment: RunnerEnvironment,
+    settings: OptionsFlowSettings,
+    cohort_id: UUID,
+    generation: UUID,
+    *,
+    source_flow: OptionSourceFlowIdentity | None,
+) -> EngineConfig:
+    return EngineConfig(
+        cohort_id=cohort_id,
         provider_tier=settings.provider_tier,
         policy=environment.options_flow_policy,
         semantics=environment.options_flow_semantics,
         journal_generation=generation,
+        source_flow=source_flow,
+        advanced_flow_policy=environment.options_flow_advanced_policy,
+        contract_scope=environment.options_flow_contract_scope,
+        exchange_reference=environment.options_flow_exchange_reference,
         shard_count=settings.shard_count,
         queue_capacity=settings.queue_capacity,
         checkpoint_interval_ms=settings.checkpoint_interval_ms,
         volume=VolumeConfig(history_per_contract=settings.history_per_contract,
                             initial_baseline=settings.initial_baseline),
+    )
+
+
+def _engine_factory(environment: RunnerEnvironment, settings: OptionsFlowSettings, context: StageContext,
+                    generation: UUID) -> Callable[[], OptionFlowEngine]:
+    config = _engine_config(
+        environment,
+        settings,
+        context.plan.cohort_id,
+        generation,
+        source_flow=getattr(
+            environment.options_flow_source,
+            "source_flow",
+            None,
+        ),
     )
     return lambda: OptionFlowEngine(config)
 
@@ -487,6 +789,15 @@ def _start_session(environment: RunnerEnvironment, settings: OptionsFlowSettings
     store = CheckpointStore(consumer_name=settings.consumer_name, cohort_id=context.plan.cohort_id,
                             generation=generation, owner_epoch=settings.owner_epoch,
                             max_state_bytes=settings.max_checkpoint_bytes)
+    source_flow = getattr(source, "source_flow", None)
+    if source_flow is not None:
+        with context.transaction() as unit:
+            persist_option_source_flow_cursor(
+                unit.cursor,
+                source_flow,
+                source_cohort_id=context.plan.cohort_id,
+                contract_scope=environment.options_flow_contract_scope,
+            )
     with context.transaction(read_only=True) as unit:
         rows = store.load(unit.cursor)
     tail_reader = getattr(source, "last_offset", None)

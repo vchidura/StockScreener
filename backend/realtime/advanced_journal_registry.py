@@ -64,6 +64,22 @@ class AdvancedJournalRecoveryGate:
     quarantined: int
 
 
+@dataclass(frozen=True, slots=True)
+class AdvancedJournalRecoveryEvent:
+    recovery_event_id: UUID
+    journal_generation: UUID
+    plan_id: UUID
+    event_type: str
+    recovery_contract: str
+    plan_report_sha256: str
+    journal_files_sha256: str
+    raw_committed_offset: int
+    normalized_committed_offset: int
+    bridge_committed_offset: int
+    persisted_bars: int
+    created_at: datetime
+
+
 def _utc(value: datetime, name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{name} must be timezone-aware")
@@ -230,6 +246,41 @@ _REGISTRY_SELECT = (
     "bridge_committed_offset,sealed_files_sha256 "
     "FROM rt.advanced_journal_registry "
 )
+
+
+def load_advanced_journal_registration_cursor(
+    cursor,
+    journal_generation: UUID,
+    *,
+    for_update: bool = False,
+) -> AdvancedJournalRegistration | None:
+    cursor.execute(
+        _REGISTRY_SELECT
+        + "WHERE journal_generation=%s"
+        + (" FOR UPDATE" if for_update else ""),
+        (str(journal_generation),),
+    )
+    row = cursor.fetchone()
+    return _registration_from_row(row) if row is not None else None
+
+
+def discover_missing_advanced_journals_cursor(
+    cursor,
+    plan_id: UUID,
+) -> tuple[AdvancedJournalRegistration, ...]:
+    cursor.execute(
+        _REGISTRY_SELECT
+        + "WHERE plan_id=%s AND status='QUARANTINED' "
+        "AND quarantine_reason='MISSING_JOURNAL' "
+        "AND NOT EXISTS (SELECT 1 FROM "
+        "rt.advanced_journal_recovery_events AS recovery "
+        "WHERE recovery.journal_generation="
+        "rt.advanced_journal_registry.journal_generation "
+        "AND recovery.event_type='RECOVERED') "
+        "ORDER BY created_at,journal_generation",
+        (str(plan_id),),
+    )
+    return tuple(_registration_from_row(row) for row in cursor.fetchall())
 
 
 def register_advanced_journal_cursor(
@@ -424,6 +475,130 @@ def quarantine_advanced_journal_cursor(
     )
     if cursor.fetchone() is None:
         raise ValueError("Advanced journal quarantine was rejected")
+
+
+def load_advanced_journal_recovery_events_cursor(
+    cursor,
+    journal_generation: UUID,
+) -> tuple[AdvancedJournalRecoveryEvent, ...]:
+    cursor.execute(
+        "SELECT recovery_event_id,journal_generation,plan_id,event_type,"
+        "recovery_contract,plan_report_sha256,journal_files_sha256,"
+        "raw_committed_offset,normalized_committed_offset,"
+        "bridge_committed_offset,persisted_bars,created_at "
+        "FROM rt.advanced_journal_recovery_events "
+        "WHERE journal_generation=%s ORDER BY created_at,event_type",
+        (str(journal_generation),),
+    )
+    return tuple(
+        AdvancedJournalRecoveryEvent(
+            UUID(str(row[0])),
+            UUID(str(row[1])),
+            UUID(str(row[2])),
+            str(row[3]),
+            str(row[4]),
+            str(row[5]),
+            str(row[6]),
+            int(row[7]),
+            int(row[8]),
+            int(row[9]),
+            int(row[10]),
+            row[11],
+        )
+        for row in cursor.fetchall()
+    )
+
+
+def record_advanced_journal_recovery_event_cursor(
+    cursor,
+    event: AdvancedJournalRecoveryEvent,
+    *,
+    expected_relative_path: str,
+    expected_metadata_sha256: str,
+    expected_quarantine_reason: str,
+    expected_quarantine_detail: str,
+) -> AdvancedJournalRecoveryEvent:
+    quarantine_reason = expected_quarantine_reason.strip().upper()
+    if not isinstance(event, AdvancedJournalRecoveryEvent):
+        raise TypeError("Advanced journal recovery event is invalid")
+    if (
+        event.event_type not in {"PREPARED", "RECOVERED"}
+        or event.recovery_contract
+        != "advanced-journal-root-recovery-v1"
+        or not expected_relative_path
+        or not expected_metadata_sha256
+        or not quarantine_reason
+        or not expected_quarantine_detail
+        or event.raw_committed_offset <= 0
+        or event.normalized_committed_offset <= 0
+        or event.normalized_committed_offset
+        > event.raw_committed_offset
+        or event.bridge_committed_offset < 0
+        or event.bridge_committed_offset
+        > event.normalized_committed_offset
+        or event.persisted_bars < 0
+        or (
+            event.event_type == "PREPARED"
+            and (
+                event.bridge_committed_offset != 0
+                or event.persisted_bars != 0
+            )
+        )
+        or (
+            event.event_type == "RECOVERED"
+            and event.bridge_committed_offset
+            != event.normalized_committed_offset
+        )
+    ):
+        raise ValueError("Advanced journal recovery event is invalid")
+    cursor.execute(
+        "INSERT INTO rt.advanced_journal_recovery_events ("
+        "recovery_event_id,journal_generation,plan_id,event_type,"
+        "recovery_contract,plan_report_sha256,journal_files_sha256,"
+        "raw_committed_offset,normalized_committed_offset,"
+        "bridge_committed_offset,persisted_bars,created_at"
+        ") SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s "
+        "FROM rt.advanced_journal_registry AS registry "
+        "WHERE registry.journal_generation=%s AND registry.plan_id=%s "
+        "AND registry.relative_path=%s "
+        "AND registry.metadata_sha256=%s "
+        "AND registry.status='QUARANTINED' "
+        "AND registry.quarantine_reason=%s "
+        "AND registry.quarantine_detail=%s "
+        "ON CONFLICT (journal_generation,event_type) DO NOTHING",
+        (
+            str(event.recovery_event_id),
+            str(event.journal_generation),
+            str(event.plan_id),
+            event.event_type,
+            event.recovery_contract,
+            event.plan_report_sha256,
+            event.journal_files_sha256,
+            event.raw_committed_offset,
+            event.normalized_committed_offset,
+            event.bridge_committed_offset,
+            event.persisted_bars,
+            _utc(event.created_at, "created_at"),
+            str(event.journal_generation),
+            str(event.plan_id),
+            expected_relative_path,
+            expected_metadata_sha256,
+            quarantine_reason,
+            expected_quarantine_detail,
+        ),
+    )
+    stored = load_advanced_journal_recovery_events_cursor(
+        cursor,
+        event.journal_generation,
+    )
+    matching = tuple(
+        candidate
+        for candidate in stored
+        if candidate.event_type == event.event_type
+    )
+    if matching != (event,):
+        raise ValueError("Advanced journal recovery event conflicts")
+    return matching[0]
 
 
 def discover_incomplete_advanced_journals_cursor(

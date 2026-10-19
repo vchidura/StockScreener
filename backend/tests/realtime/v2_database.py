@@ -81,8 +81,12 @@ def drop_database_if_exists(name: str) -> None:
 
 
 @contextmanager
-def disposable_v2_database(name: str, *, preserve: bool = False):
-    """Yield a freshly provisioned database pool; normally drop the database afterwards."""
+def _disposable_v2_database(
+    name: str,
+    *,
+    preserve: bool,
+    migrations,
+):
     if not name.startswith("test_realtime_v2_"):
         raise ValueError("disposable database names must start with test_realtime_v2_")
     if type(preserve) is not bool:
@@ -101,7 +105,7 @@ def disposable_v2_database(name: str, *, preserve: bool = False):
                                .format(sql.Identifier(name)))
         created = True
         with closing(_connect(settings, name)) as connection:
-            for migration in load_realtime_migrations(V2_MIGRATIONS_DIR):
+            for migration in migrations:
                 with connection.cursor() as cursor:
                     cursor.execute(migration.sql)
                     cursor.execute("INSERT INTO rt.schema_migrations (version, checksum_sha256) VALUES (%s, %s)",
@@ -122,3 +126,44 @@ def disposable_v2_database(name: str, *, preserve: bool = False):
                     cursor.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
                                    "WHERE datname=%s AND pid <> pg_backend_pid()", (name,))
                     cursor.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(name)))
+
+
+@contextmanager
+def disposable_v2_database(name: str, *, preserve: bool = False):
+    """Yield a current-chain disposable database pool; normally drop it afterwards."""
+    with _disposable_v2_database(
+        name,
+        preserve=preserve,
+        migrations=load_realtime_migrations(V2_MIGRATIONS_DIR),
+    ) as pool:
+        yield pool
+
+
+@contextmanager
+def disposable_live024_database(name: str, *, preserve: bool = False):
+    """Yield a database containing the exact pinned 000-024 compatibility baseline."""
+    from realtime.equity_live024_compatibility import (
+        LIVE024_MIGRATION_VERSIONS,
+        live024_migrations,
+    )
+
+    migrations = live024_migrations(V2_MIGRATIONS_DIR)
+    if tuple(migration.version for migration in migrations) != LIVE024_MIGRATION_VERSIONS:
+        raise RuntimeError("live-024 fixture migration selection is not exact")
+    with _disposable_v2_database(
+        name,
+        preserve=preserve,
+        migrations=migrations,
+    ) as pool:
+        connection = pool.getconn()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT version FROM rt.schema_migrations ORDER BY version"
+                )
+                applied = tuple(row[0] for row in cursor.fetchall())
+            if applied != LIVE024_MIGRATION_VERSIONS:
+                raise RuntimeError("live-024 fixture ledger is not exactly 000-024")
+        finally:
+            pool.putconn(connection)
+        yield pool

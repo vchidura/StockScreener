@@ -3,6 +3,9 @@ from __future__ import annotations
 import importlib
 import os
 import re
+import subprocess
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -194,6 +197,36 @@ def test_ingress_service_child_has_one_plan_and_no_env_file():
     assert "--env-file" not in command
 
 
+def test_ingress_service_can_bootstrap_a_ready_plan_without_resetting_identity():
+    provider = MagicMock()
+    cursor = provider.transaction.return_value.__enter__.return_value.cursor
+    cursor.fetchone.return_value = (str(AUTHORIZATION),)
+
+    assert ingress._active_plan_id(provider, AUTHORIZATION, datetime.now(timezone.utc)) == AUTHORIZATION
+    statement = cursor.execute.call_args.args[0]
+    assert "status IN ('READY','ACTIVE')" in statement
+    assert "authorized_end_at>%s" in statement
+
+
+@pytest.mark.parametrize("needs_kill", [False, True])
+def test_ingress_supervisor_enforces_absolute_deadline_without_a_stop_signal(needs_kill):
+    deadline = datetime(2026, 10, 19, 13, 39, 30, tzinfo=timezone.utc)
+    process = MagicMock()
+    process.poll.return_value = None
+    process.returncode = -9 if needs_kill else 0
+    if needs_kill:
+        process.wait.side_effect = [subprocess.TimeoutExpired("synthetic-child", 30), 0]
+
+    result = ingress._wait_for_child(
+        process, threading.Event(), poll_seconds=1, shutdown_seconds=30,
+        deadline=deadline, utc_clock=lambda: deadline,
+    )
+
+    process.terminate.assert_called_once()
+    assert process.kill.call_count == int(needs_kill)
+    assert result == process.returncode
+
+
 def test_health_publication_fails_closed_on_any_advanced_authority():
     cursor = MagicMock()
     cursor.fetchone.side_effect = ((0,), (0,), (0,))
@@ -262,6 +295,22 @@ def test_compose_advanced_services_are_independent_and_secret_scoped():
         for service in services
     }
 
+    assert (
+        "image: ${REALTIME_V2_BACKEND_IMAGE:"
+        "?set REALTIME_V2_BACKEND_IMAGE to an approved immutable image}"
+        in standalone
+    )
+    assert "alpha-research-realtime-v2-backend:latest" not in standalone
+    for service in (
+        "realtime-v2-advanced-controller",
+        "realtime-v2-advanced-ingress",
+        "realtime-v2-advanced-bridge",
+    ):
+        assert (
+            "realtime_v2_advanced_journals:"
+            "/var/lib/realtime-v2-advanced"
+            in blocks[service]
+        )
     assert "realtime-v2-advanced-provider" in blocks[
         "realtime-v2-advanced-controller"
     ]

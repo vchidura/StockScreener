@@ -353,7 +353,10 @@ def test_option_flow_events_archive_every_revision_in_deterministic_order(tmp_pa
         (1, "INCLUDED"), (2, "CANCELED"), (10, "CANCELED"), (1, "INCLUDED")]  # revision 10 after 2
     assert lines[1]["row"]["supersedes_event_id"] == str(first.document["event_id"])
     assert lines[0]["row"]["price"] == "101.50000000" and lines[0]["row"]["conditions"] == [1, 2]
-    assert built.relation_counts == {"rt.option_flow_events": 4}
+    assert built.relation_counts == {
+        "rt.option_flow_events": 4,
+        "rt.option_flow_event_profiles": 0,
+    }
     assert built.clocks["market"]["columns"] == [
         "rt.option_flow_events.event_time", "rt.option_flow_events.quote_time"]
     assert built.clocks["market"]["min"] == "2026-10-05T14:29:00.000000Z"
@@ -369,7 +372,10 @@ def test_option_flow_clusters_archive_every_revision_including_retracted(tmp_pat
     assert [(line["row"]["revision"], line["row"]["status"]) for line in _lines(built)] == [
         (1, "PROVISIONAL"), (2, "FINAL"), (3, "RETRACTED")]
     assert _lines(built)[2]["row"]["print_count"] == 0
-    assert built.relation_counts == {"rt.option_flow_clusters": 3}
+    assert built.relation_counts == {
+        "rt.option_flow_clusters": 3,
+        "rt.option_flow_cluster_members": 0,
+    }
     built, written = _written(tmp_path, built)
     assert _verify(written, built).row_count == 3
     _expect(written, built, VerificationCode.SOURCE_COUNT_MISMATCH,

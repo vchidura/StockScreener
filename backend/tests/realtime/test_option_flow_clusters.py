@@ -9,6 +9,8 @@ from option_flow_support import (
     MULTI_LEG,
     OTHER,
     T0,
+    advanced_contract_scope,
+    advanced_policy,
     check_cluster_rules,
     engine,
     policy,
@@ -89,6 +91,185 @@ def test_thresholds_come_from_the_policy_prints_venues_and_notional():
                  _burst(exchanges=(302, 303)))
     assert looser.clusters
     assert ClusterConfig.from_policy(policy(sweep_window_seconds=5)).minimum_prints == 3
+
+
+def test_advanced_clusters_are_profile_scoped_with_exact_threshold_evidence():
+    flow_policy = advanced_policy()
+    scope = advanced_contract_scope((CALL,))
+    messages = [quote(seq=1, time_ms=T0 - 100)]
+    messages += [
+        trade(
+            seq=index + 1,
+            time_ms=T0 + index * 80,
+            price=2.0,
+            size=50,
+            exchange=302 + index % 3,
+        )
+        for index in range(50)
+    ]
+
+    out = run(engine(
+        advanced_flow_policy=flow_policy,
+        contract_scope=scope,
+        shard_count=1,
+        cluster_windows_seconds=(5,),
+    ), messages)
+
+    assert len(out.events) == 50
+    assert out.events[-1].cumulative_volume_after == 2500
+    advanced_rows = [row for row in out.clusters if row.profile]
+    assert {row.profile for row in advanced_rows} == {
+        "ACCUMULATION",
+        "SWEEP",
+    }
+    assert {
+        (row.profile, row.window_seconds)
+        for row in advanced_rows
+    } == {
+        ("ACCUMULATION", 180),
+        ("SWEEP", 5),
+    }
+    assert all(
+        row.flow_universe_tier == "ETF"
+        and row.flow_dte_lane == "CORE_SWING"
+        and row.retention_threshold.profile == row.profile
+        and row.advanced_flow_policy_sha256 == flow_policy.sha256
+        and row.contract_scope_sha256 == scope.sha256
+        and row.runtime_policy_sha256 == row.policy_sha256
+        for row in advanced_rows
+    )
+    event_ids = {event.event_id for event in out.events}
+    assert all(
+        len(row.member_event_ids) == row.print_count
+        and set(row.member_event_ids) <= event_ids
+        for row in advanced_rows
+    )
+    assert max(row.cumulative_contracts for row in advanced_rows) == 2500
+    assert all(
+        row.cumulative_contracts == 2500
+        for row in advanced_rows
+        if row.profile == "ACCUMULATION"
+    )
+    by_profile = defaultdict(set)
+    for row in advanced_rows:
+        by_profile[row.profile].add(row.cluster_id)
+    assert by_profile["ACCUMULATION"].isdisjoint(by_profile["SWEEP"])
+
+
+def test_advanced_cluster_cumulative_gate_uses_factual_small_print_volume():
+    flow_policy = advanced_policy()
+    scope = advanced_contract_scope((CALL,))
+    eng = engine(
+        advanced_flow_policy=flow_policy,
+        contract_scope=scope,
+        shard_count=1,
+        cluster_windows_seconds=(5,),
+    )
+    retained = [
+        trade(
+            seq=index + 1,
+            time_ms=T0 + index * 100,
+            price=10.0,
+            size=25,
+            exchange=302 + index % 3,
+        )
+        for index in range(20)
+    ]
+    small = [
+        trade(
+            seq=100 + index,
+            time_ms=T0 + 3_000 + index,
+            price=0.01,
+            size=10,
+            exchange=310,
+        )
+        for index in range(150)
+    ]
+    out = run(
+        eng,
+        [quote(seq=1, time_ms=T0 - 100), *retained, *small],
+        final=False,
+    )
+
+    assert len(out.events) == 20
+    assert out.events[-1].cumulative_volume_after == 500
+    accumulation = [
+        row for row in out.clusters
+        if row.profile == "ACCUMULATION"
+    ]
+    assert accumulation
+    assert all(row.cumulative_contracts == 2000 for row in accumulation)
+    assert all(row.qualifies for row in accumulation)
+
+    canceled = eng.feed(
+        trade(
+            seq=500,
+            time_ms=T0 + 4_000,
+            price=0.01,
+            size=10,
+            exchange=310,
+            conditions=(CANCEL,),
+        ),
+        500,
+    )
+    assert canceled.events == []
+    assert [
+        row
+        for row in canceled.clusters
+        if row.profile == "ACCUMULATION"
+        and row.cumulative_contracts == 1990
+        and row.qualifies is False
+    ]
+
+
+def test_advanced_cluster_cancel_revises_each_profile_without_new_volume():
+    flow_policy = advanced_policy()
+    scope = advanced_contract_scope((CALL,))
+    eng = engine(
+        advanced_flow_policy=flow_policy,
+        contract_scope=scope,
+        shard_count=1,
+        cluster_windows_seconds=(5,),
+    )
+    messages = [quote(seq=1, time_ms=T0 - 100)]
+    messages += [
+        trade(
+            seq=index + 1,
+            time_ms=T0 + index * 80,
+            price=2.0,
+            size=50,
+            exchange=302 + index % 3,
+        )
+        for index in range(50)
+    ]
+    initial = run(eng, messages, final=False)
+    canceled = eng.feed(
+        trade(
+            seq=100,
+            time_ms=T0 + 4_500,
+            price=2.0,
+            size=50,
+            exchange=302,
+            conditions=(CANCEL,),
+        ),
+        100,
+    )
+
+    assert initial.clusters
+    assert canceled.events[0].trade_treatment == "CANCELED"
+    assert canceled.events[0].matched_profiles == (
+        "ACCUMULATION",
+        "SWEEP",
+    )
+    assert {row.profile for row in canceled.clusters} == {
+        "ACCUMULATION",
+        "SWEEP",
+    }
+    assert {
+        row.profile
+        for row in canceled.clusters
+        if row.cumulative_contracts == 2450
+    } == {"ACCUMULATION", "SWEEP"}
 
 
 def test_prints_in_different_windows_do_not_cluster():

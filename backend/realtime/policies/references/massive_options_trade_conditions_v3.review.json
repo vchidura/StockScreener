@@ -1,0 +1,341 @@
+{
+  "semantics_version": "massive_options_conditions_v3",
+  "provenance": "LIVE_CAPTURED",
+  "reviewed_payload_sha256": "051dda5cd0e6d246709017b4d1af68982527aa628d54ac073d577d860c1cbd56",
+  "provider_contract_sha256": "81ead7adb8920facf158dc0d5e10d4154146d9cb90b2f29dcb1118fdeafba0f3",
+  "reviewed_at": "2026-10-19T04:13:33.6847984Z",
+  "approval_source": "owner",
+  "approval_reference": "P6D2 recommendation matrix accepted without exceptions",
+  "codes": [
+    {
+      "condition_id": 201,
+      "treatment": "CANCELED",
+      "is_late": false,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 202,
+      "treatment": "EXCLUDED",
+      "is_late": true,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 203,
+      "treatment": "CANCELED",
+      "is_late": false,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 204,
+      "treatment": "EXCLUDED",
+      "is_late": true,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 205,
+      "treatment": "CANCELED",
+      "is_late": false,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 206,
+      "treatment": "EXCLUDED",
+      "is_late": true,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 207,
+      "treatment": "CANCELED",
+      "is_late": false,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 208,
+      "treatment": "INCLUDED",
+      "is_late": true,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 209,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 210,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 219,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": true,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 227,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 228,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": true,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 229,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": false,
+      "is_cross": true,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 230,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": false,
+      "is_cross": true,
+      "is_sweep": true,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 231,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": true,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 232,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 233,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 234,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": true,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 235,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": true,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 236,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 237,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 238,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 239,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": true,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 240,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 241,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": true,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 242,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": true,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 243,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 244,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 245,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": true,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 246,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": true,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 247,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": true,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    },
+    {
+      "condition_id": 248,
+      "treatment": "INCLUDED",
+      "is_late": false,
+      "is_multi_leg": false,
+      "is_cross": false,
+      "is_sweep": false,
+      "is_floor": false,
+      "review_note": "Owner accepted the P6D2 recommendation matrix on 2026-10-19; classification is bound to the captured provider payload hash."
+    }
+  ]
+}

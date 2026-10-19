@@ -132,13 +132,15 @@ def test_a_stuck_reference_refresh_never_delays_windows_or_the_options_flow_loop
 
 
 def test_runner_bindings_fail_closed_until_a_stage_is_wired():
-    assert wired_stages() == ALL - {"OPTIONS_CYCLE"}
-    assert unwired_stages() == {"OPTIONS_CYCLE"}
+    assert wired_stages() == ALL
+    assert unwired_stages() == frozenset()
     assert set(build_runners({"OPTIONS_ACQUIRE"}, None)) == {
         "OPTIONS_ACQUIRE"
     }
-    with pytest.raises(LookupError, match="OPTIONS_CYCLE"):
-        build_runners({"EQUITY_EVIDENCE", "OPTIONS_CYCLE"}, None)
+    assert set(build_runners(
+        {"EQUITY_EVIDENCE", "OPTIONS_CYCLE"},
+        None,
+    )) == {"EQUITY_EVIDENCE", "OPTIONS_CYCLE"}
     assert set(build_runners(set(wired_stages()), None)) == wired_stages()
 
 

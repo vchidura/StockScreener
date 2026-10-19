@@ -14,6 +14,7 @@ from realtime.stage_graph import (
     STAGES_V1,
     STAGES_V2,
     STAGES_V3,
+    STAGES_V4,
     Action,
     decide_window,
     lanes_required,
@@ -147,6 +148,70 @@ def test_v3_catalog_keeps_alert_and_projection_as_independent_consumers():
     )
     assert STAGES_V3["EQUITY_PROJECTION"].prerequisites == (
         "EQUITY_MATERIALIZE",
+    )
+
+
+def test_v4_catalog_adds_options_without_changing_equity_dependencies():
+    text = (
+        Path(V2_MIGRATIONS_DIR)
+        / "025_realtime_advanced_options_control_plane.sql"
+    ).read_text(encoding="utf-8")
+    rows = re.findall(
+        r"\('([A-Z_]+)','stages_v4','(shared|equity|options)',"
+        r"ARRAY\[([^\]]*)\](?:::text\[\])?,'([a-z]+)',"
+        r"'([A-Z]+)',(true|false),(NULL|\d+)\)",
+        text,
+    )
+    parsed = {
+        name: (
+            domain,
+            tuple(re.findall(r"'([A-Z_]+)'", prerequisites)),
+            lane,
+            schedule,
+            gate == "true",
+            None if deadline == "NULL" else int(deadline),
+        )
+        for name, domain, prerequisites, lane, schedule, gate, deadline in rows
+    }
+    assert parsed == {
+        name: (
+            stage.domain,
+            stage.prerequisites,
+            stage.lane,
+            stage.schedule_kind,
+            stage.gates_strategy,
+            stage.deadline_offset_seconds,
+        )
+        for name, stage in STAGES_V4.items()
+    }
+    assert {
+        name: stage
+        for name, stage in STAGES_V4.items()
+        if stage.domain != "options"
+    } == STAGES_V3
+    assert STAGES_V4["OPTIONS_ACQUIRE"].schedule_kind == "SESSION"
+    assert STAGES_V4["OPTIONS_ADMISSION"].schedule_kind == "SESSION"
+    assert STAGES_V4["OPTIONS_FLOW"].prerequisites == ("REFERENCE",)
+    assert STAGES_V4["OPTIONS_INPUT_GATE"].prerequisites == (
+        "OPTIONS_ADMISSION",
+        "EQUITY_MATERIALIZE",
+    )
+    assert STAGES_V4["OPTIONS_CYCLE"].prerequisites == (
+        "OPTIONS_INPUT_GATE",
+    )
+    assert STAGES_V4["OPTIONS_PROJECTION"].prerequisites == (
+        "OPTIONS_CYCLE",
+    )
+    assert STAGES_V4["OPTIONS_PUBLISH"].prerequisites == (
+        "OPTIONS_PROJECTION",
+    )
+    assert all(
+        not any(
+            STAGES_V4[dependency].domain == "options"
+            for dependency in stage.prerequisites
+        )
+        for stage in STAGES_V4.values()
+        if stage.domain != "options"
     )
 
 

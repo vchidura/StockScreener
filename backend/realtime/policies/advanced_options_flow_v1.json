@@ -1,0 +1,211 @@
+{
+  "version": "advanced-options-flow-v1",
+  "universe_tiers": {
+    "ETF": ["IWM", "QQQ", "SPY"],
+    "CORE_MEGA_CAP": ["AAPL", "AMZN", "MSFT"],
+    "HIGH_BETA_HIGH_PREMIUM": ["NFLX", "NVDA", "TSLA"]
+  },
+  "dte_lanes": [
+    {"lane": "ULTRA_SHORT", "minimum_dte": 0, "maximum_dte": 2},
+    {"lane": "CORE_SWING", "minimum_dte": 5, "maximum_dte": 21},
+    {"lane": "POSITION", "minimum_dte": 22, "maximum_dte": 60}
+  ],
+  "excluded_dte_bands": [
+    {
+      "minimum_dte": 3,
+      "maximum_dte": 4,
+      "reason_code": "DTE_LANE_NOT_ACCEPTED"
+    }
+  ],
+  "profiles": [
+    {
+      "kind": "ULTRA_SHORT",
+      "dte_lanes": ["ULTRA_SHORT"],
+      "threshold_mode": "OR",
+      "tier_thresholds": [
+        {
+          "tier": "ETF",
+          "minimum_contracts": 1000,
+          "minimum_print_premium": "500000",
+          "minimum_cluster_prints": 10,
+          "minimum_distinct_exchanges": 3,
+          "minimum_cluster_premium": "1000000",
+          "minimum_cumulative_contracts": 5000
+        },
+        {
+          "tier": "CORE_MEGA_CAP",
+          "minimum_contracts": 500,
+          "minimum_print_premium": "300000",
+          "minimum_cluster_prints": 10,
+          "minimum_distinct_exchanges": 3,
+          "minimum_cluster_premium": "1000000",
+          "minimum_cumulative_contracts": 1500
+        },
+        {
+          "tier": "HIGH_BETA_HIGH_PREMIUM",
+          "minimum_contracts": 250,
+          "minimum_print_premium": "400000",
+          "minimum_cluster_prints": 10,
+          "minimum_distinct_exchanges": 3,
+          "minimum_cluster_premium": "1000000",
+          "minimum_cumulative_contracts": 750
+        }
+      ],
+      "window_seconds_by_lane": {"ULTRA_SHORT": 5},
+      "directional_side_classes": [
+        "AT_OR_ABOVE_ASK",
+        "AT_OR_BELOW_BID"
+      ],
+      "directional_confidences": ["HIGH", "MEDIUM"],
+      "retain_inside_spread_as_context": true
+    },
+    {
+      "kind": "BLOCK",
+      "dte_lanes": ["CORE_SWING", "POSITION"],
+      "threshold_mode": "OR",
+      "tier_thresholds": [
+        {
+          "tier": "ETF",
+          "minimum_contracts": 500,
+          "minimum_print_premium": "250000",
+          "minimum_cluster_prints": null,
+          "minimum_distinct_exchanges": null,
+          "minimum_cluster_premium": null,
+          "minimum_cumulative_contracts": null
+        },
+        {
+          "tier": "CORE_MEGA_CAP",
+          "minimum_contracts": 250,
+          "minimum_print_premium": "150000",
+          "minimum_cluster_prints": null,
+          "minimum_distinct_exchanges": null,
+          "minimum_cluster_premium": null,
+          "minimum_cumulative_contracts": null
+        },
+        {
+          "tier": "HIGH_BETA_HIGH_PREMIUM",
+          "minimum_contracts": 100,
+          "minimum_print_premium": "200000",
+          "minimum_cluster_prints": null,
+          "minimum_distinct_exchanges": null,
+          "minimum_cluster_premium": null,
+          "minimum_cumulative_contracts": null
+        }
+      ],
+      "window_seconds_by_lane": {},
+      "directional_side_classes": [
+        "AT_OR_ABOVE_ASK",
+        "AT_OR_BELOW_BID"
+      ],
+      "directional_confidences": ["HIGH", "MEDIUM"],
+      "retain_inside_spread_as_context": true
+    },
+    {
+      "kind": "SWEEP",
+      "dte_lanes": ["CORE_SWING"],
+      "threshold_mode": "OR",
+      "tier_thresholds": [
+        {
+          "tier": "ETF",
+          "minimum_contracts": 50,
+          "minimum_print_premium": "25000",
+          "minimum_cluster_prints": 8,
+          "minimum_distinct_exchanges": 2,
+          "minimum_cluster_premium": "250000",
+          "minimum_cumulative_contracts": null
+        },
+        {
+          "tier": "CORE_MEGA_CAP",
+          "minimum_contracts": 25,
+          "minimum_print_premium": "20000",
+          "minimum_cluster_prints": 6,
+          "minimum_distinct_exchanges": 2,
+          "minimum_cluster_premium": "150000",
+          "minimum_cumulative_contracts": null
+        },
+        {
+          "tier": "HIGH_BETA_HIGH_PREMIUM",
+          "minimum_contracts": 10,
+          "minimum_print_premium": "25000",
+          "minimum_cluster_prints": 5,
+          "minimum_distinct_exchanges": 2,
+          "minimum_cluster_premium": "200000",
+          "minimum_cumulative_contracts": null
+        }
+      ],
+      "window_seconds_by_lane": {"CORE_SWING": 5},
+      "directional_side_classes": [
+        "AT_OR_ABOVE_ASK",
+        "AT_OR_BELOW_BID"
+      ],
+      "directional_confidences": ["HIGH", "MEDIUM"],
+      "retain_inside_spread_as_context": true
+    },
+    {
+      "kind": "ACCUMULATION",
+      "dte_lanes": ["CORE_SWING", "POSITION"],
+      "threshold_mode": "OR",
+      "tier_thresholds": [
+        {
+          "tier": "ETF",
+          "minimum_contracts": 25,
+          "minimum_print_premium": "10000",
+          "minimum_cluster_prints": 10,
+          "minimum_distinct_exchanges": 2,
+          "minimum_cluster_premium": "500000",
+          "minimum_cumulative_contracts": 2000
+        },
+        {
+          "tier": "CORE_MEGA_CAP",
+          "minimum_contracts": 10,
+          "minimum_print_premium": "10000",
+          "minimum_cluster_prints": 10,
+          "minimum_distinct_exchanges": 2,
+          "minimum_cluster_premium": "250000",
+          "minimum_cumulative_contracts": 750
+        },
+        {
+          "tier": "HIGH_BETA_HIGH_PREMIUM",
+          "minimum_contracts": 5,
+          "minimum_print_premium": "15000",
+          "minimum_cluster_prints": 8,
+          "minimum_distinct_exchanges": 2,
+          "minimum_cluster_premium": "300000",
+          "minimum_cumulative_contracts": 500
+        }
+      ],
+      "window_seconds_by_lane": {
+        "CORE_SWING": 180,
+        "POSITION": 900
+      },
+      "directional_side_classes": [
+        "AT_OR_ABOVE_ASK",
+        "AT_OR_BELOW_BID"
+      ],
+      "directional_confidences": ["HIGH", "MEDIUM"],
+      "retain_inside_spread_as_context": true
+    }
+  ],
+  "opening_overlay": {
+    "minimum_prior_open_interest": 250,
+    "unusual_volume_oi_ratio": 2.0,
+    "high_conviction_volume_oi_ratio": 3.0,
+    "directional_side_classes": [
+      "AT_OR_ABOVE_ASK",
+      "AT_OR_BELOW_BID"
+    ],
+    "directional_confidences": ["HIGH", "MEDIUM"],
+    "retain_inside_spread_as_context": true
+  },
+  "candidate_caps": {
+    "global_maximum": 20,
+    "maximum_per_underlying": 3,
+    "contract_profile_dedup_seconds": 300,
+    "profile_budgets": {
+      "ULTRA_SHORT": 4,
+      "BLOCK": 6,
+      "SWEEP": 6,
+      "ACCUMULATION": 4
+    }
+  }
+}

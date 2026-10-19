@@ -1643,7 +1643,9 @@ secrets. The initial authorized mode is provider-free and projection-only:
 ```powershell
 $env:REALTIME_V2_ADVANCED_COHORT_ID = `
   "713278f5-e83d-55f5-98c3-c930be03e9c8"
-docker compose -f docker-compose.realtime-v2.yml up -d --build `
+$env:REALTIME_V2_BACKEND_IMAGE = `
+  "alpha-research-realtime-v2-p8-qualification:<approved-run-id>"
+docker compose -f docker-compose.realtime-v2.yml up -d --no-build `
   realtime-v2-advanced-api realtime-v2-advanced-frontend `
   realtime-v2-advanced-bridge realtime-v2-advanced-finalizer
 ```

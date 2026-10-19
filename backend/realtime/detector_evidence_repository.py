@@ -47,6 +47,23 @@ def _require_input_references(cursor, events: Sequence[RealtimeDetectorEvent]) -
         cursor.execute(statement, (wanted,))
         if {str(row[0]) for row in cursor.fetchall()} != set(wanted):
             raise ValueError(f"detector event input {attribute} is not available")
+    source_bindings = {
+        (str(row.source_flow_id), str(row.source_cohort_id))
+        for row in inputs
+        if row.source_flow_id is not None
+    }
+    if source_bindings:
+        cursor.execute(
+            "SELECT source_flow_id,source_cohort_id "
+            "FROM rt.option_source_flows "
+            "WHERE source_flow_id=ANY(%s::uuid[])",
+            ([source_flow_id for source_flow_id, _ in source_bindings],),
+        )
+        stored = {(str(row[0]), str(row[1])) for row in cursor.fetchall()}
+        if stored != source_bindings:
+            raise ValueError(
+                "detector event input source-flow binding is not available"
+            )
 
 
 def _persist_detector_evaluation_batch(
@@ -250,7 +267,10 @@ def _persist_detector_evaluation_batch(
                         str(row.source_record_id) if row.source_record_id else None,
                         str(row.journal_generation) if row.journal_generation else None,
                         str(row.stream_session_id) if row.stream_session_id else None,
-                        row.source_offset, row.input_sha256, row.available_at, row.received_at,
+                        row.source_offset,
+                        str(row.source_flow_id) if row.source_flow_id else None,
+                        str(row.source_cohort_id) if row.source_cohort_id else None,
+                        row.input_sha256, row.available_at, row.received_at,
                         canonical_json(row.retained_input),
                     )
                     for event in event_rows for row in event.inputs
@@ -262,8 +282,9 @@ def _persist_detector_evaluation_batch(
                         "INSERT INTO rt.detector_event_inputs ("
                         "event_id, input_role, input_key, source_kind, feature_snapshot_id, "
                         "bar_revision_id, option_mark_evidence_id, source_record_id, "
-                        "journal_generation, stream_session_id, source_offset, input_sha256, "
-                        "available_at, received_at, retained_input) VALUES %s ON CONFLICT DO NOTHING",
+                        "journal_generation, stream_session_id, source_offset, "
+                        "source_flow_id, source_cohort_id, input_sha256, available_at, "
+                        "received_at, retained_input) VALUES %s ON CONFLICT DO NOTHING",
                         inputs,
                         page_size=DETECTOR_BATCH_PAGE_SIZE,
                     )

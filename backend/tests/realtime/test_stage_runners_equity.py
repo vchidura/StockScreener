@@ -911,8 +911,10 @@ def test_the_runner_factories_are_registered_for_the_six_non_options_stages_and_
     assert set(RUNNER_FACTORIES) == {
         "REFERENCE", "EQUITY_INGEST", "EQUITY_EVIDENCE", "PORTAL_PUBLISH", "STRATEGY_PUBLISH", "STOCK_ALERTS",
         "OPTIONS_ACQUIRE", "OPTIONS_ADMISSION", "OPTIONS_FLOW",
+        "OPTIONS_INPUT_GATE", "OPTIONS_CYCLE", "OPTIONS_PROJECTION",
+        "OPTIONS_PUBLISH",
         "EQUITY_INPUT_GATE", "EQUITY_MATERIALIZE", "EQUITY_PROJECTION"}
-    assert unwired_stages() == {"OPTIONS_CYCLE"}
+    assert unwired_stages() == frozenset()
     assert unwired_stages(frozenset(
         name for name in STAGES_V2 if not name.startswith("OPTIONS_")
     )) == frozenset()

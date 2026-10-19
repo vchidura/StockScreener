@@ -36,7 +36,6 @@ from realtime.contracts import (  # noqa: E402
 )
 from realtime.equity_pipeline_config import (  # noqa: E402
     EquityPipeline,
-    RealtimeV2PipelineConfig,
 )
 from realtime.journal import RawJournalReader  # noqa: E402
 from realtime.normalizer import (  # noqa: E402
@@ -79,13 +78,37 @@ async def _capture(gateway, messages, duration):
     )
 
 
+def _entitlement_evidence(checked_at):
+    checked = checked_at.astimezone(timezone.utc)
+    return {
+        "checked_at": checked.isoformat(),
+        "credentials_printed": False,
+        "scope": {
+            "authorized_universe": ["SPY"],
+            "authorized_channels": ["AM"],
+        },
+    }
+
+
+def _canary_api_key(settings):
+    if (
+        str(settings.get("REALTIME_V2_EQUITY_PIPELINE") or "").strip()
+        != EquityPipeline.MASSIVE_ADVANCED.value
+    ):
+        raise RuntimeError("canary requires MASSIVE_ADVANCED equity")
+    api_key = str(settings.get("POLYGON_API_KEY") or "").strip()
+    if not api_key or api_key.lower() in {
+        "...",
+        "replace_with_provider_value",
+        "your_polygon_api_key_here",
+    }:
+        raise RuntimeError("canary requires a configured Massive API key")
+    return api_key
+
+
 def main(argv=None):
     args = parse_args(argv)
-    config = RealtimeV2PipelineConfig.from_mapping(
-        dotenv_values(args.env_file)
-    )
-    if config.equity_pipeline is not EquityPipeline.MASSIVE_ADVANCED:
-        raise RuntimeError("canary requires MASSIVE_ADVANCED equity")
+    api_key = _canary_api_key(dotenv_values(args.env_file))
     generation = uuid4()
     session_id = uuid4()
     universe = UniverseManifest(
@@ -126,7 +149,7 @@ def main(argv=None):
         ),
         manifest,
         buffer,
-        api_key=config.massive_api_key,
+        api_key=api_key,
         monotonic_ns=time.monotonic_ns,
         session_id_factory=lambda: session_id,
     )
@@ -175,6 +198,7 @@ def main(argv=None):
     )
     report = {
         "status": status,
+        **_entitlement_evidence(datetime.now(timezone.utc)),
         "session_date": args.session_date.isoformat(),
         "authorization_reference": args.authorization_reference,
         "symbols": ("SPY",),

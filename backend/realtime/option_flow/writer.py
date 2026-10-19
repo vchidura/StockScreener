@@ -25,11 +25,39 @@ EVENT_COLUMNS = (
     "cumulative_volume_before", "cumulative_volume_after", "volume_baseline_kind", "prior_open_interest",
     "open_interest_as_of", "volume_exceeds_prior_oi", "opening_inference", "spread_position", "opening_score",
     "opening_reasons", "journal_generation", "shard_id", "source_offset", "revision", "supersedes_event_id",
+    "source_flow_id", "condition_semantics_sha256", "flow_policy_sha256", "lineage_version",
+    "contract_expiration", "flow_universe_tier", "flow_dte_lane",
+    "advanced_flow_policy_sha256", "contract_scope_sha256", "manifest_sha256",
+    "slot_sha256", "runtime_policy_sha256",
+    "provider_contract_sha256", "condition_reference_sha256",
+    "exchange_reference_sha256",
+)
+EVENT_PROFILE_COLUMNS = (
+    "event_id", "event_time", "session_date", "profile", "universe_tier",
+    "dte_lane", "threshold_mode", "minimum_contracts",
+    "minimum_print_premium", "contracts_matched", "premium_matched",
+    "minimum_cluster_prints", "minimum_distinct_exchanges",
+    "minimum_cluster_premium", "minimum_cumulative_contracts",
+    "window_seconds",
 )
 CLUSTER_COLUMNS = (
     "cluster_id", "revision", "session_date", "cohort_id", "provider_tier", "contract_ticker", "underlyer",
     "window_seconds", "window_start", "window_end", "side_class", "print_count", "total_size",
     "total_premium", "distinct_exchanges", "first_event_time", "last_event_time", "status", "policy_sha256",
+    "source_flow_id", "condition_semantics_sha256", "lineage_version",
+    "flow_policy_sha256", "profile", "flow_universe_tier", "flow_dte_lane",
+    "threshold_mode", "minimum_contracts", "minimum_print_premium",
+    "contracts_matched", "premium_matched", "minimum_cluster_prints",
+    "minimum_distinct_exchanges", "minimum_cluster_premium",
+    "minimum_cumulative_contracts", "cumulative_contracts", "qualifies",
+    "advanced_flow_policy_sha256", "contract_scope_sha256", "manifest_sha256",
+    "slot_sha256", "runtime_policy_sha256",
+    "provider_contract_sha256", "condition_reference_sha256",
+    "exchange_reference_sha256",
+)
+CLUSTER_MEMBER_COLUMNS = (
+    "cluster_id", "revision", "session_date", "profile", "event_id",
+    "event_time",
 )
 CHECKPOINT_COLUMNS = (
     "cohort_id", "session_date", "contract_ticker", "cumulative_volume", "last_source_seq",
@@ -40,11 +68,41 @@ _CHECKPOINT_KEY = ("cohort_id", "session_date", "contract_ticker")
 _EVENT_JOINS = (
     "t.event_id = s.event_id AND t.event_time = s.event_time",
     "t.contract_ticker = s.contract_ticker AND t.source_seq = s.source_seq "
-    "AND t.event_time = s.event_time AND t.revision = s.revision",
+    "AND t.event_time = s.event_time AND t.revision = s.revision "
+    "AND t.lineage_version = 1 AND s.lineage_version = 1",
+    "t.source_flow_id = s.source_flow_id AND t.contract_ticker = s.contract_ticker "
+    "AND t.source_seq = s.source_seq AND t.event_time = s.event_time "
+    "AND t.revision = s.revision "
+    "AND t.lineage_version = s.lineage_version "
+    "AND t.lineage_version IN (2, 3)",
 )
-_EVENT_IDENTITY = ("contract_ticker", "source_seq", "event_time", "revision")
+_EVENT_IDENTITY = (
+    "source_flow_id",
+    "contract_ticker",
+    "source_seq",
+    "event_time",
+    "revision",
+)
 _CLUSTER_JOINS = ("t.cluster_id = s.cluster_id AND t.revision = s.revision AND t.session_date = s.session_date",)
 _CLUSTER_IDENTITY = ("cluster_id", "revision", "session_date")
+_EVENT_PROFILE_JOINS = (
+    "t.event_id = s.event_id AND t.event_time = s.event_time "
+    "AND t.profile = s.profile",
+)
+_EVENT_PROFILE_IDENTITY = ("event_id", "event_time", "profile")
+_CLUSTER_MEMBER_JOINS = (
+    "t.cluster_id = s.cluster_id AND t.revision = s.revision "
+    "AND t.session_date = s.session_date AND t.profile = s.profile "
+    "AND t.event_id = s.event_id AND t.event_time = s.event_time",
+)
+_CLUSTER_MEMBER_IDENTITY = (
+    "cluster_id",
+    "revision",
+    "session_date",
+    "profile",
+    "event_id",
+    "event_time",
+)
 
 
 class OptionFlowWriteError(RuntimeError):
@@ -89,16 +147,94 @@ def event_values(event: FlowEvent) -> tuple:
         event.volume_exceeds_prior_oi, event.opening_inference, event.spread_position, event.opening_score,
         event.opening_reasons, event.journal_generation, event.shard_id,
         event.source_offset, event.revision, event.supersedes_event_id,
+        event.source_flow_id, event.condition_semantics_sha256,
+        event.flow_policy_sha256, event.lineage_version,
+        event.contract_expiration, event.flow_universe_tier,
+        event.flow_dte_lane, event.advanced_flow_policy_sha256,
+        event.contract_scope_sha256, event.manifest_sha256,
+        event.slot_sha256, event.runtime_policy_sha256,
+        (
+            event.provider_contract_sha256
+            if event.lineage_version == 4 else None
+        ),
+        (
+            event.condition_reference_sha256
+            if event.lineage_version == 4 else None
+        ),
+        (
+            event.exchange_reference_sha256
+            if event.lineage_version == 4 else None
+        ),
     )
 
 
+def event_profile_values(event: FlowEvent) -> list[tuple]:
+    return [
+        (
+            event.event_id,
+            event.event_time,
+            event.session_date,
+            evidence.profile,
+            evidence.universe_tier,
+            evidence.dte_lane,
+            evidence.threshold_mode,
+            evidence.minimum_contracts,
+            evidence.minimum_print_premium,
+            evidence.contracts_matched,
+            evidence.premium_matched,
+            evidence.minimum_cluster_prints,
+            evidence.minimum_distinct_exchanges,
+            evidence.minimum_cluster_premium,
+            evidence.minimum_cumulative_contracts,
+            evidence.window_seconds,
+        )
+        for evidence in event.retention_thresholds
+    ]
+
+
 def cluster_values(row: ClusterRow) -> tuple:
+    evidence = row.retention_threshold
     return (
         row.cluster_id, row.revision, row.session_date, row.cohort_id, row.provider_tier,
         row.contract_ticker, row.underlyer, row.window_seconds, row.window_start, row.window_end,
         row.side_class, row.print_count, row.total_size, row.total_premium, row.distinct_exchanges,
         row.first_event_time, row.last_event_time, row.status, row.policy_sha256,
+        row.source_flow_id, row.condition_semantics_sha256,
+        row.lineage_version,
+        row.flow_policy_sha256, row.profile, row.flow_universe_tier,
+        row.flow_dte_lane,
+        None if evidence is None else evidence.threshold_mode,
+        None if evidence is None else evidence.minimum_contracts,
+        None if evidence is None else evidence.minimum_print_premium,
+        None if evidence is None else evidence.contracts_matched,
+        None if evidence is None else evidence.premium_matched,
+        None if evidence is None else evidence.minimum_cluster_prints,
+        None if evidence is None else evidence.minimum_distinct_exchanges,
+        None if evidence is None else evidence.minimum_cluster_premium,
+        None if evidence is None else evidence.minimum_cumulative_contracts,
+        row.cumulative_contracts, row.qualifies,
+        row.advanced_flow_policy_sha256, row.contract_scope_sha256,
+        row.manifest_sha256, row.slot_sha256, row.runtime_policy_sha256,
+        row.provider_contract_sha256 if row.lineage_version == 4 else None,
+        row.condition_reference_sha256 if row.lineage_version == 4 else None,
+        row.exchange_reference_sha256 if row.lineage_version == 4 else None,
     )
+
+
+def cluster_member_values(row: ClusterRow) -> list[tuple]:
+    if row.profile is None:
+        return []
+    return [
+        (
+            row.cluster_id,
+            row.revision,
+            row.session_date,
+            row.profile,
+            event_id,
+            event_time,
+        )
+        for event_id, event_time in row.member_event_keys
+    ]
 
 
 def checkpoint_values(row: VolumeCheckpoint) -> tuple:
@@ -218,6 +354,8 @@ class OptionFlowWriter:
         self._last_flush = clock()
         self.committed_offsets: dict[tuple[UUID | None, int], int] = {}
         self.flushes = 0
+        self.last_report: FlushReport | None = None
+        self.maximum_flush_seconds = 0.0
 
     @property
     def pending_rows(self) -> int:
@@ -257,6 +395,29 @@ class OptionFlowWriter:
                                                [event_values(item) for item in events], "ON CONFLICT DO NOTHING")
                 self._verify_replays(cursor, table, "_stage_option_flow_events", EVENT_COLUMNS,
                                      _EVENT_IDENTITY, _EVENT_JOINS)
+                event_profiles = [
+                    values
+                    for event in events
+                    for values in event_profile_values(event)
+                ]
+                if event_profiles:
+                    table = "rt.option_flow_event_profiles"
+                    self._insert(
+                        cursor,
+                        table,
+                        "_stage_option_flow_event_profiles",
+                        EVENT_PROFILE_COLUMNS,
+                        event_profiles,
+                        "ON CONFLICT DO NOTHING",
+                    )
+                    self._verify_replays(
+                        cursor,
+                        table,
+                        "_stage_option_flow_event_profiles",
+                        EVENT_PROFILE_COLUMNS,
+                        _EVENT_PROFILE_IDENTITY,
+                        _EVENT_PROFILE_JOINS,
+                    )
             if clusters:
                 table = "rt.option_flow_clusters"
                 clusters_inserted = self._insert(cursor, table, "_stage_option_flow_clusters", CLUSTER_COLUMNS,
@@ -264,6 +425,29 @@ class OptionFlowWriter:
                                                  "ON CONFLICT DO NOTHING")
                 self._verify_replays(cursor, table, "_stage_option_flow_clusters", CLUSTER_COLUMNS,
                                      _CLUSTER_IDENTITY, _CLUSTER_JOINS)
+                cluster_members = [
+                    values
+                    for cluster in clusters
+                    for values in cluster_member_values(cluster)
+                ]
+                if cluster_members:
+                    table = "rt.option_flow_cluster_members"
+                    self._insert(
+                        cursor,
+                        table,
+                        "_stage_option_flow_cluster_members",
+                        CLUSTER_MEMBER_COLUMNS,
+                        cluster_members,
+                        "ON CONFLICT DO NOTHING",
+                    )
+                    self._verify_replays(
+                        cursor,
+                        table,
+                        "_stage_option_flow_cluster_members",
+                        CLUSTER_MEMBER_COLUMNS,
+                        _CLUSTER_MEMBER_IDENTITY,
+                        _CLUSTER_MEMBER_JOINS,
+                    )
             if checkpoints:
                 table = "rt.option_volume_checkpoints"
                 updates = ", ".join(f"{name} = EXCLUDED.{name}" for name in CHECKPOINT_COLUMNS[3:])
@@ -306,6 +490,11 @@ class OptionFlowWriter:
                 self.committed_offsets[key] = offset
         self._last_flush = self._clock()
         self.flushes += 1
+        self.last_report = report
+        self.maximum_flush_seconds = max(
+            self.maximum_flush_seconds,
+            report.seconds,
+        )
         return report
 
     def close(self) -> FlushReport | None:
@@ -355,14 +544,29 @@ def write_condition_reference(connection, semantics: ConditionSemantics, *,
     try:
         inserted_codes = inserted_semantics = 0
         for row in codes:
+            columns = (
+                "provider,asset_class,data_type,condition_id,abbreviation,"
+                "name,description,condition_type,legacy,exchange,"
+                "update_rules,sip_mapping,fetched_at,payload_sha256"
+            )
+            values = (
+                row.provider, row.asset_class, row.data_type,
+                row.condition_id, row.abbreviation, row.name,
+                row.description, row.condition_type, row.legacy,
+                row.exchange, Json(dict(row.update_rules)),
+                Json(dict(row.sip_mapping)), row.fetched_at,
+                row.payload_sha256,
+            )
+            placeholders = ",".join(["%s"] * len(values))
+            if semantics.version == "massive_options_conditions_v3":
+                columns += ",provider_contract_sha256"
+                values = (*values, row.provider_contract_sha256)
+                placeholders += ",%s"
             cursor.execute(
-                "INSERT INTO ref.trade_condition_codes (provider, asset_class, data_type, condition_id, "
-                "abbreviation, name, description, condition_type, legacy, exchange, update_rules, sip_mapping, "
-                "fetched_at, payload_sha256) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                "ON CONFLICT DO NOTHING",
-                (row.provider, row.asset_class, row.data_type, row.condition_id, row.abbreviation, row.name,
-                 row.description, row.condition_type, row.legacy, row.exchange, Json(dict(row.update_rules)),
-                 Json(dict(row.sip_mapping)), row.fetched_at, row.payload_sha256))
+                f"INSERT INTO ref.trade_condition_codes ({columns}) "
+                f"VALUES ({placeholders}) ON CONFLICT DO NOTHING",
+                values,
+            )
             inserted_codes += cursor.rowcount
         for row in reviewed:
             cursor.execute(

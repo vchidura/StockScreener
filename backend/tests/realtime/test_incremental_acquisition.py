@@ -4,9 +4,13 @@ from unittest.mock import MagicMock
 from uuid import UUID
 
 from realtime.incremental_acquisition import (
+    IncrementalEquitySource,
+    IncrementalRequestPlan,
     latest_qualified_cutoff,
     plan_incremental_requests_cursor,
 )
+from realtime.acquisition_ledger import ProviderRequestLane
+from realtime.provider_budget import ProviderBudgetScope
 
 
 UTC = timezone.utc
@@ -109,3 +113,56 @@ def test_fully_complete_member_needs_no_request():
         interval="1m",
         cutoff=cutoff,
     ) == ()
+
+
+def test_retry_attempt_has_a_distinct_provider_request_identity():
+    start = datetime(2026, 10, 16, 13, 30, tzinfo=UTC)
+    end = start + timedelta(minutes=5)
+    identity = _identity(1, "SPY")
+    plan = IncrementalRequestPlan(
+        COHORT,
+        1,
+        identity.security.security_id,
+        "SPY",
+        date(2026, 10, 16),
+        "1m",
+        start,
+        end,
+        2,
+        None,
+        None,
+        None,
+    )
+    scope = ProviderBudgetScope(
+        account_alias="MASSIVE_ADVANCED",
+        session_date=date(2026, 10, 16),
+        authorization_reference="owner-approved",
+        provider_authorization_reference="stocks-advanced",
+        expected_cost="standing allocation",
+        request_ceiling=2,
+        decoded_byte_ceiling=4_098,
+        lanes=frozenset({ProviderRequestLane.EQUITY_HISTORY}),
+        authorized_until=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+
+    def source(attempt=1):
+        return IncrementalEquitySource(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            scope,
+            (identity,),
+            (plan,),
+            response_byte_limit=2_048,
+            clock=lambda: end,
+            endpoint_class="MASSIVE_STOCKS_AGGREGATES_1M",
+            eligibility_policy_version="advanced-real-time-closed-bar-v1",
+            request_attempt=attempt,
+        )
+
+    first = source(1)._request_identity(plan)
+    default = source()._request_identity(plan)
+    second = source(2)._request_identity(plan)
+
+    assert first == default
+    assert first[:3] != second[:3]
+    assert first[3] != second[3]

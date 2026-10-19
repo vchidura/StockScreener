@@ -14,6 +14,7 @@ from uuid import UUID
 import exchange_calendars
 import pytest
 
+import realtime.screening_delta_loader as delta_loader
 from realtime.screening_delta_loader import ScreeningInputLoader, _outranks
 from realtime.screening_repository import close_source_lineage, load_realtime_screening_input
 
@@ -26,6 +27,26 @@ MINUTE = timedelta(minutes=1)
 RAW, ADJ = "RAW_UNADJUSTED", "ADJUSTED"
 LENGTH = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "1d": 390}
 INTERVAL_ORDER = ["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"]
+
+
+@pytest.mark.parametrize("continuity", [None, False, True])
+def test_loader_preserves_explicit_identity_continuity_scope(monkeypatch, continuity):
+    captured = {}
+    marker = object()
+
+    def load(_cursor, **scope):
+        captured.update(scope)
+        return marker
+
+    monkeypatch.setattr(delta_loader, "load_screening_input", load)
+    loader = ScreeningInputLoader()
+    options = {} if continuity is None else {"allow_late_identity_continuity": continuity}
+    assert loader.load(
+        object(), cohort_id=UUID(int=1), session=SESSION,
+        cutoff=OPEN, source_generation=1, **options,
+    ) is marker
+    assert captured["allow_late_identity_continuity"] is (continuity is True)
+    assert captured["bar_loader"].__self__ is loader
 
 BASE_COLUMNS = (
     "bar_revision_id", "cohort_id", "provider_tier", "security_id", "instrument_id", "ticker", "interval",

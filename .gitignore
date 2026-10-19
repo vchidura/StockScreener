@@ -112,3 +112,10 @@ backend/research/scanner_confidence_study.json
 backend/research/options_technical_forward_*.json
 backend/research/options_observations_*.json
 !backend/research/options_observations_20260928_v28.json
+.copilot-diagnostic-stage.patch
+.mcp.json
+backend/Dockerfile.p6e
+backend/Dockerfile.p6e.dockerignore
+docker-compose.options-p6.yml
+docker-compose.realtime-v2.yml
+docker-compose.realtime-v2.yml

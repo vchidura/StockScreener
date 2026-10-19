@@ -374,7 +374,8 @@ def load_advanced_scheduler_scope_cursor(
 ):
     cursor.execute(
         "SELECT plan.plan_id,plan.cohort_id,plan.universe_target,"
-        "plan.runtime_profile_sha256,plan.status "
+        "plan.runtime_profile_sha256,plan.status,"
+        "plan.authorized_start_at,plan.authorized_end_at "
         "FROM rt.advanced_ingress_plans AS plan "
         "WHERE plan.authorization_id=%s AND plan.session_date=%s "
         "ORDER BY plan.created_at,plan.plan_id",
@@ -395,6 +396,8 @@ def load_advanced_scheduler_scope_cursor(
         "universe_target": int(row[2]),
         "runtime_profile_sha256": str(row[3]),
         "status": str(row[4]),
+        "authorized_start_at": row[5],
+        "authorized_end_at": row[6],
     }
 
 

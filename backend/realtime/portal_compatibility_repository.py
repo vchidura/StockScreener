@@ -935,7 +935,10 @@ class RealtimeOptionAlertRepository(_RealtimeCompatibilityRepository):
                 return self._unavailable("ACTIVE_COHORT_UNAVAILABLE", cutoff)
             dataset_query = (
                 "SELECT dataset_id, dataset_key, session_date, status, detector_ids, "
-                "started_at, completed_at, summary, source_manifest_sha256 "
+                "started_at, completed_at, summary, source_manifest_sha256, "
+                "flow_identity_version, source_flow_id, "
+                "advanced_flow_policy_sha256, contract_scope_sha256, "
+                "slot_sha256, runtime_policy_sha256 "
                 "FROM rt.detector_datasets WHERE cohort_id=%s AND started_at<=%s"
             )
             dataset_parameters: tuple[object, ...] = (

@@ -173,6 +173,35 @@ def journal_files_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def checkpoint_journal_wal(
+    path: str | Path,
+    *,
+    timeout_seconds: float = 5.0,
+) -> tuple[int, int]:
+    journal = Path(path)
+    if not journal.is_file():
+        raise FileNotFoundError(journal)
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    connection = _connect(
+        journal,
+        timeout_seconds=timeout_seconds,
+        read_only=False,
+    )
+    try:
+        busy, logged, checkpointed = (
+            int(value)
+            for value in connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+        )
+    finally:
+        connection.close()
+    if busy or logged != checkpointed:
+        raise RuntimeError("SQLite WAL checkpoint did not fully truncate")
+    return logged, checkpointed
+
+
 def _connect(path: Path, *, timeout_seconds: float, read_only: bool) -> sqlite3.Connection:
     if read_only:
         connection = sqlite3.connect(

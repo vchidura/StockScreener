@@ -18,6 +18,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from realtime.contracts import UniverseManifest  # noqa: E402
+from options.calendar import OptionExchangeCalendar  # noqa: E402
 from realtime.migrations import (  # noqa: E402
     EXPECTED_V2_DATABASE_NAME,
     validate_target_database_v2,
@@ -57,6 +58,7 @@ def parse_args(argv=None):
     parser.add_argument("--database", required=True)
     parser.add_argument("--confirm-database-name", required=True)
     parser.add_argument("--session-date", type=date.fromisoformat, required=True)
+    parser.add_argument("--authorized-session-date", type=date.fromisoformat)
     parser.add_argument("--authorization-reference", required=True)
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--execute", action="store_true")
@@ -67,8 +69,14 @@ def parse_args(argv=None):
     )
     if args.database != EXPECTED_V2_DATABASE_NAME:
         parser.error("SPY reference refresh targets only stocks_realtime_v2")
-    if args.session_date != date(2026, 10, 16):
-        parser.error("approved SPY reference session is 2026-10-16")
+    authorized_session = args.authorized_session_date or date(2026, 10, 16)
+    if args.session_date != authorized_session:
+        parser.error("--session-date differs from the explicitly authorized session")
+    try:
+        OptionExchangeCalendar("XNYS").session_open(args.session_date)
+    except ValueError as error:
+        parser.error(str(error))
+    args.authorized_session_date = authorized_session
     if not args.authorization_reference.strip():
         parser.error("--authorization-reference cannot be blank")
     args.report_path = args.report_path.resolve()
@@ -84,6 +92,8 @@ def main(argv=None):
         "database": args.database,
         "scope": SEED_SCOPE,
         "session_date": args.session_date.isoformat(),
+        "authorized_session_date": args.authorized_session_date.isoformat(),
+        "authorization_reference": args.authorization_reference,
         "symbols": ("SPY",),
         "maximum_requests": MAXIMUM_REQUESTS,
         "maximum_total_bytes": MAXIMUM_TOTAL_BYTES,

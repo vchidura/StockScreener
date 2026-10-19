@@ -101,13 +101,19 @@ def drop_disposable_roles_v2(connection, roles: RoleNamesV2) -> None:
             cursor.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(name)))
 
 
-def apply_database_security_v2(connection, roles: RoleNamesV2) -> None:
+def _apply_database_security_v2(
+    connection,
+    roles: RoleNamesV2,
+    *,
+    expected_policy,
+    expected_grants,
+) -> None:
     owner = roles.name(ADMIN_ROLE)
     with connection.cursor() as cursor:
         cursor.execute("SELECT policy FROM rt.database_security_policies WHERE policy_version = %s",
                        (SECURITY_POLICY_VERSION,))
         row = cursor.fetchone()
-        if row is None or row[0] != security_policy():
+        if row is None or row[0] != expected_policy:
             raise RuntimeError("database security policy does not match source")
         cursor.execute("SELECT current_database()")
         database_name = cursor.fetchone()[0]
@@ -156,7 +162,7 @@ def apply_database_security_v2(connection, roles: RoleNamesV2) -> None:
                 sql.SQL(kind), _identifier_list(roles.runtime_names)))
         cursor.execute(sql.SQL("GRANT USAGE ON SCHEMA ref, rt TO {}").format(_identifier_list(roles.runtime_names)))
         by_privilege: dict[tuple[str, str], list[str]] = {}
-        for relation, privileges in grants().items():
+        for relation, privileges in expected_grants.items():
             for privilege, role_suffixes in privileges.items():
                 for suffix in role_suffixes:
                     by_privilege.setdefault((privilege, suffix), []).append(relation)
@@ -173,6 +179,34 @@ def apply_database_security_v2(connection, roles: RoleNamesV2) -> None:
             cursor.execute(sql.SQL("ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA {} REVOKE ALL ON TABLES FROM PUBLIC")
                            .format(sql.Identifier(owner), sql.Identifier(schema_name)))
         _record_phase(cursor, "APPLIED", {"role_prefix": roles.prefix})
+
+
+def apply_database_security_v2(connection, roles: RoleNamesV2) -> None:
+    _apply_database_security_v2(
+        connection,
+        roles,
+        expected_policy=security_policy(),
+        expected_grants=grants(),
+    )
+
+
+def _live024_security_contract():
+    from .equity_live024_compatibility import live024_registry_contract
+
+    return live024_registry_contract()
+
+
+def apply_equity_live024_database_security_v2(
+    connection,
+    roles: RoleNamesV2,
+) -> None:
+    contract = _live024_security_contract()
+    _apply_database_security_v2(
+        connection,
+        roles,
+        expected_policy=contract.security_policy,
+        expected_grants=contract.object_grants,
+    )
 
 
 def current_security_phase_v2(connection) -> str | None:
@@ -247,11 +281,54 @@ def harden_database_v2(connection, roles: RoleNamesV2) -> tuple[list[str], list[
     return created, audit
 
 
-def audit_database_security_v2(connection, roles: RoleNamesV2) -> list[tuple[str, str]]:
+def harden_equity_live024_database_v2(
+    connection,
+    roles: RoleNamesV2,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    try:
+        created = ensure_roles_v2(connection, roles)
+        connection.commit()
+        apply_equity_live024_database_security_v2(connection, roles)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    audit = audit_equity_live024_database_security_v2(connection, roles)
+    if all(status.startswith("PASS") for _, status in audit):
+        record_security_audit_v2(connection, audit)
+        connection.commit()
+    else:
+        connection.rollback()
+    return created, audit
+
+
+def _audit_database_security_v2(
+    connection,
+    roles: RoleNamesV2,
+    *,
+    expected,
+    expected_relations: tuple[str, ...] | None = None,
+) -> list[tuple[str, str]]:
     """Return (check, PASS|FAIL detail). Compares live privileges with the registry exactly."""
     results: list[tuple[str, str]] = []
-    expected = grants()
     with connection.cursor() as cursor:
+        if expected_relations is not None:
+            cursor.execute(
+                "SELECT n.nspname || '.' || c.relname FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname IN ('ref','rt') "
+                "AND c.relkind IN ('r','p','v','m') "
+                "AND NOT c.relispartition ORDER BY 1"
+            )
+            actual_relations = tuple(row[0] for row in cursor.fetchall())
+            missing_relations = sorted(set(expected_relations) - set(actual_relations))
+            extra_relations = sorted(set(actual_relations) - set(expected_relations))
+            results.append((
+                "relations_match_live024_contract",
+                "PASS"
+                if not missing_relations and not extra_relations
+                else f"FAIL missing={missing_relations[:8]} extra={extra_relations[:8]}",
+            ))
         mismatches: list[str] = []
         for suffix in RUNTIME_ROLES:
             role = roles.name(suffix)
@@ -322,3 +399,24 @@ def audit_database_security_v2(connection, roles: RoleNamesV2) -> list[tuple[str
         results.append(("security_phase_ledger_records_hardening",
                         "PASS" if phase and phase[0] in ("APPLIED", "AUDITED") else f"FAIL phase={phase}"))
     return results
+
+
+def audit_database_security_v2(connection, roles: RoleNamesV2) -> list[tuple[str, str]]:
+    return _audit_database_security_v2(
+        connection,
+        roles,
+        expected=grants(),
+    )
+
+
+def audit_equity_live024_database_security_v2(
+    connection,
+    roles: RoleNamesV2,
+) -> list[tuple[str, str]]:
+    contract = _live024_security_contract()
+    return _audit_database_security_v2(
+        connection,
+        roles,
+        expected=contract.object_grants,
+        expected_relations=contract.relation_names,
+    )

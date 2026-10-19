@@ -112,6 +112,7 @@ class DividendReferenceWindow:
     dividends: tuple[DividendObservation, ...] = ()
     reason_codes: tuple[str, ...] = ()
     coverage_id: UUID | None = None
+    coverage_observed_at: datetime | None = None
     coverage_payload_sha256: str | None = None
     response_sha256: str | None = None
     checked_at: datetime | None = None
@@ -161,5 +162,6 @@ def dividend_reference_window(*, security_id: UUID, ticker: str, window_start: d
               else "AVAILABLE" if dividends else "KNOWN_NO_ANNOUNCED_DIVIDEND")
     return DividendReferenceWindow(**identity, status=status, dividends=dividends,
         reason_codes=("DIVIDEND_QUERY_REFRESH_DUE",) if stale else (), coverage_id=UUID(str(receipt["coverage_id"])),
+        coverage_observed_at=observed,
         coverage_payload_sha256=receipt["payload_sha256"], response_sha256=receipt["response_sha256"],
         checked_at=received, refresh_due_at=refresh_due)

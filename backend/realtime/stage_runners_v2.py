@@ -6,7 +6,7 @@ a service plan fails closed at start (MissingRunner) instead of being skipped si
 here when its repository ports run on the V2 schema; the orchestrator, lanes and readiness handling
 need no change. A runner writes only through its StageContext (fenced, cancellable transactions).
 
-Bound: all six non-options stages, OPTIONS_ACQUIRE, OPTIONS_ADMISSION and OPTIONS_FLOW.
+Bound: all non-options stages and every stages_v4 Options stage.
 EQUITY_EVIDENCE and PORTAL_PUBLISH (stage_runners_equity.py),
 STOCK_ALERTS and STRATEGY_PUBLISH (stage_runners_alerts.py: compute and publication are separate
 databases/roles) and REFERENCE and EQUITY_INGEST (stage_runners_ingest.py). EQUITY_EVIDENCE also drains
@@ -18,8 +18,8 @@ consumer of an injected journal source (a local mock feed until a gateway is aut
 BLOCKED_POLICY with OPTIONS_FLOW_SOURCE_NOT_CONFIGURED / OPTIONS_FLOW_CONDITIONS_UNPINNED / OPTIONS_FLOW_POLICY_NOT_CONFIGURED
 and reads nothing until all three are injected, and it fails closed (REPLAY_DIVERGENCE) when a replayed key
 differs from its stored row. OPTIONS_ACQUIRE and OPTIONS_ADMISSION call injected repository-backed actions
-and fail closed until those actions are configured. Not bound: OPTIONS_CYCLE, whose durable V2 publication
-schema and materialization port are not installed.
+and fail closed until those actions are configured. The P4 Options input/cycle/projection/publish stages
+also use injected typed actions and remain BLOCKED_POLICY until explicitly configured.
 """
 from __future__ import annotations
 
@@ -45,8 +45,16 @@ from .stage_runners_options import (
     options_acquire_runner,
     options_admission_block_reason,
     options_admission_runner,
+    options_cycle_block_reason,
+    options_cycle_runner,
     options_flow_block_reason,
     options_flow_runner,
+    options_input_gate_block_reason,
+    options_input_gate_runner,
+    options_projection_block_reason,
+    options_projection_runner,
+    options_publish_block_reason,
+    options_publish_runner,
 )
 
 RunnerFactory = Callable[[RunnerEnvironment], StageRunner]
@@ -64,6 +72,10 @@ RUNNER_FACTORIES: dict[str, RunnerFactory] = {
     "OPTIONS_ACQUIRE": options_acquire_runner,
     "OPTIONS_ADMISSION": options_admission_runner,
     "OPTIONS_FLOW": options_flow_runner,
+    "OPTIONS_INPUT_GATE": options_input_gate_runner,
+    "OPTIONS_CYCLE": options_cycle_runner,
+    "OPTIONS_PROJECTION": options_projection_runner,
+    "OPTIONS_PUBLISH": options_publish_runner,
 }
 
 # Wired stages that need an injected source, with the check that decides if they would block.
@@ -73,6 +85,10 @@ SOURCE_GATED_STAGES: dict[str, Callable[[RunnerEnvironment], str | None]] = {
     "OPTIONS_ACQUIRE": options_acquire_block_reason,
     "OPTIONS_ADMISSION": options_admission_block_reason,
     "OPTIONS_FLOW": options_flow_block_reason,
+    "OPTIONS_INPUT_GATE": options_input_gate_block_reason,
+    "OPTIONS_CYCLE": options_cycle_block_reason,
+    "OPTIONS_PROJECTION": options_projection_block_reason,
+    "OPTIONS_PUBLISH": options_publish_block_reason,
 }
 
 

@@ -1,12 +1,18 @@
 """Shared builders for the option flow tests (no provider or database I/O)."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
 from options.config import FlowStrategyPolicy
+from realtime.advanced_options_flow_policy import (
+    AdvancedOptionsContractScope,
+    AdvancedOptionsContractScopeEntry,
+    load_advanced_options_flow_policy,
+)
+from realtime.option_flow.messages import underlyer_of
 from realtime.option_flow.conditions import ConditionSemantics, load_semantics
 from realtime.option_flow.engine import EngineConfig, OptionFlowEngine
 
@@ -16,9 +22,9 @@ REVIEW = FIXTURES / "option_trade_conditions_synthetic_v1.review.json"
 COHORT = UUID("11111111-2222-3333-4444-555555555555")
 JOURNAL_GENERATION = UUID("66666666-7777-8888-9999-000000000000")
 
-CALL = "O:SPY261218C00650000"
-PUT = "O:SPY261218P00600000"
-OTHER = "O:QQQ261218C00500000"
+CALL = "O:SPY261019C00650000"
+PUT = "O:SPY261019P00600000"
+OTHER = "O:QQQ261019C00500000"
 
 # 2026-10-12 10:30:00 in New York.
 T0 = int(datetime(2026, 10, 12, 14, 30, tzinfo=timezone.utc).timestamp() * 1000)
@@ -50,6 +56,44 @@ def policy(**overrides) -> FlowStrategyPolicy:
     )
     values.update(overrides)
     return FlowStrategyPolicy(**values)
+
+
+def advanced_policy():
+    return load_advanced_options_flow_policy()
+
+
+def advanced_contract_scope(
+    contracts,
+    *,
+    session_date=date(2026, 10, 12),
+    flow_policy=None,
+):
+    flow_policy = flow_policy or advanced_policy()
+    entries = []
+    for contract in contracts:
+        underlyer = underlyer_of(contract)
+        expiration = datetime.strptime(
+            contract.split(":")[1][len(underlyer):len(underlyer) + 6],
+            "%y%m%d",
+        ).date()
+        lane = flow_policy.lane_for((expiration - session_date).days)
+        if lane is None:
+            raise ValueError("test contract is outside reviewed DTE lanes")
+        entries.append(AdvancedOptionsContractScopeEntry(
+            contract,
+            underlyer,
+            expiration,
+            flow_policy.tier_for(underlyer),
+            lane,
+        ))
+    return AdvancedOptionsContractScope(
+        version="advanced-options-contract-scope-v1",
+        session_date=session_date,
+        manifest_sha256="1" * 64,
+        slot_sha256="2" * 64,
+        flow_policy_sha256=flow_policy.sha256,
+        contracts=tuple(entries),
+    )
 
 
 def config(**overrides) -> EngineConfig:
@@ -142,9 +186,12 @@ def check_cluster_rules(row) -> None:
     if row.status == "RETRACTED":
         assert row.revision > 1
         assert (row.print_count, row.total_size, row.total_premium, row.distinct_exchanges) == (0, 0, 0, 0)
+        assert row.member_event_ids == ()
     else:
         assert row.print_count >= 1 and row.total_size >= row.print_count and row.total_premium >= 0
         assert 1 <= row.distinct_exchanges <= row.print_count
+        assert len(row.member_event_ids) == row.print_count
+        assert len(set(row.member_event_ids)) == row.print_count
     assert row.first_event_time >= row.window_start and row.last_event_time <= row.window_end
     assert row.last_event_time >= row.first_event_time
     assert row.contract_ticker == row.contract_ticker.upper()

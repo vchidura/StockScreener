@@ -19,6 +19,14 @@ from .stage_graph import StageDefinition
 TERMINAL_WINDOW_STATES = frozenset({"COMPLETE", "FAILED", "MISSED", "RETAINED_GAP"})
 OWNER_LOST = "OWNER_LOST"
 EQUITY_WINDOW_BUILD_ID = "v2-10-developer-window-v1"
+OPTIONS_INPUT_READY = "OPTIONS_INPUT_READY"
+OPTIONS_CYCLE = "OPTIONS_CYCLE"
+OPTIONS_PORTAL_READY = "OPTIONS_PORTAL_READY"
+OPTIONS_RECEIPT_KINDS = frozenset({
+    OPTIONS_INPUT_READY,
+    OPTIONS_CYCLE,
+    OPTIONS_PORTAL_READY,
+})
 
 
 def equity_window_recovery_cursor(cursor, cohort_id: UUID, cutoff: datetime) -> dict:
@@ -165,6 +173,42 @@ class CycleReceiptSpec:
     input_sha256: str
     build_id: str
     advance_release: bool = False
+
+
+def build_options_receipt_spec(
+    *,
+    receipt_kind: str,
+    cutoff: datetime,
+    reference_generation: int,
+    universe_sha256: str,
+    input_sha256: str,
+    build_id: str,
+) -> CycleReceiptSpec:
+    if receipt_kind not in OPTIONS_RECEIPT_KINDS:
+        raise ValueError("Options receipt kind is not product-scoped")
+    if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+        raise ValueError("Options receipt cutoff must be timezone-aware")
+    if type(reference_generation) is not int or reference_generation <= 0:
+        raise ValueError("Options receipt reference generation must be positive")
+    for name, value in (
+        ("universe_sha256", universe_sha256),
+        ("input_sha256", input_sha256),
+    ):
+        if len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ValueError(f"Options receipt {name} must be a SHA-256 digest")
+    if not build_id.strip():
+        raise ValueError("Options receipt build_id cannot be blank")
+    return CycleReceiptSpec(
+        receipt_kind=receipt_kind,
+        cutoff=cutoff,
+        reference_generation=reference_generation,
+        universe_sha256=universe_sha256,
+        input_sha256=input_sha256,
+        build_id=build_id.strip(),
+        advance_release=False,
+    )
 
 
 class OrchestrationRepository(Protocol):

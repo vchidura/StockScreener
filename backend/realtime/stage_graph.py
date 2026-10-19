@@ -14,6 +14,7 @@ from typing import Mapping
 STAGE_CATALOG_VERSION = "stages_v1"
 STAGE_CATALOG_VERSION_V2 = "stages_v2"
 STAGE_CATALOG_VERSION_V3 = "stages_v3"
+STAGE_CATALOG_VERSION_V4 = "stages_v4"
 TERMINAL_STATES = frozenset({"COMPLETE", "FAILED", "BLOCKED_PREREQ", "BLOCKED_POLICY", "MISSED"})
 NON_COMPLETING_STATES = frozenset({"FAILED", "BLOCKED_PREREQ", "BLOCKED_POLICY", "MISSED"})
 
@@ -135,10 +136,67 @@ STAGES_V3: dict[str, StageDefinition] = {
     )
 }
 
+STAGES_V4: dict[str, StageDefinition] = {
+    stage.stage_id: stage for stage in (
+        *STAGES_V3.values(),
+        StageDefinition(
+            "OPTIONS_ACQUIRE",
+            "options",
+            ("REFERENCE",),
+            OPTIONS_LANE,
+            "SESSION",
+        ),
+        StageDefinition(
+            "OPTIONS_ADMISSION",
+            "options",
+            ("OPTIONS_ACQUIRE",),
+            OPTIONS_LANE,
+            "SESSION",
+        ),
+        StageDefinition(
+            "OPTIONS_FLOW",
+            "options",
+            ("REFERENCE",),
+            OPTIONS_LANE,
+            "CONTINUOUS",
+        ),
+        StageDefinition(
+            "OPTIONS_INPUT_GATE",
+            "options",
+            ("OPTIONS_ADMISSION", "EQUITY_MATERIALIZE"),
+            OPTIONS_LANE,
+            "WINDOW",
+        ),
+        StageDefinition(
+            "OPTIONS_CYCLE",
+            "options",
+            ("OPTIONS_INPUT_GATE",),
+            OPTIONS_LANE,
+            "WINDOW",
+            True,
+        ),
+        StageDefinition(
+            "OPTIONS_PROJECTION",
+            "options",
+            ("OPTIONS_CYCLE",),
+            OPTIONS_LANE,
+            "COALESCED",
+        ),
+        StageDefinition(
+            "OPTIONS_PUBLISH",
+            "options",
+            ("OPTIONS_PROJECTION",),
+            OPTIONS_LANE,
+            "COALESCED",
+        ),
+    )
+}
+
 STAGE_CATALOGS = {
     STAGE_CATALOG_VERSION: STAGES_V1,
     STAGE_CATALOG_VERSION_V2: STAGES_V2,
     STAGE_CATALOG_VERSION_V3: STAGES_V3,
+    STAGE_CATALOG_VERSION_V4: STAGES_V4,
 }
 
 

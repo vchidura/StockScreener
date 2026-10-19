@@ -57,12 +57,15 @@ def _provider_health(cursor, args):
         }
     row = _one(
         cursor,
-        "SELECT auth.status,plan.plan_id,plan.status,"
+        "SELECT auth.status,plan.plan_id,plan.status,plan.terminal_outcome,"
         "usage.connection_attempt_count,usage.maximum_connection_attempts,"
-        "session.status,session.heartbeat_at,session.event_time_watermark "
+        "session.status,session.failure_code,session.heartbeat_at,"
+        "session.event_time_watermark,session.ended_at,"
+        "registry.status,registry.quarantine_reason,registry.relative_path "
         "FROM rt.advanced_stream_authorizations AS auth "
         "LEFT JOIN LATERAL ("
-        "SELECT own.plan_id,own.status FROM rt.advanced_ingress_plans AS own "
+        "SELECT own.plan_id,own.status,own.terminal_outcome "
+        "FROM rt.advanced_ingress_plans AS own "
         "WHERE own.authorization_id=auth.authorization_id "
         "ORDER BY own.session_date DESC,own.created_at DESC LIMIT 1"
         ") AS plan ON true "
@@ -76,12 +79,29 @@ def _provider_health(cursor, args):
         ") AS usage ON true "
         "LEFT JOIN rt.stream_sessions AS session "
         "ON session.session_id=usage.latest_stream_session_id "
+        "LEFT JOIN rt.advanced_journal_registry AS registry "
+        "ON registry.journal_generation=session.journal_generation "
         "WHERE auth.authorization_id=%s",
         (str(args.authorization_id),),
     )
     if row is None:
         return "BLOCKED", {"reason": "AUTHORIZATION_NOT_FOUND"}
-    auth_status, plan_id, plan_status, attempts, ceiling, session_status, heartbeat, watermark = row
+    (
+        auth_status,
+        plan_id,
+        plan_status,
+        terminal_outcome,
+        attempts,
+        ceiling,
+        session_status,
+        session_failure,
+        heartbeat,
+        watermark,
+        session_ended_at,
+        journal_status,
+        quarantine_reason,
+        journal_relative_path,
+    ) = row
     state = (
         "BLOCKED"
         if auth_status != "READY"
@@ -95,11 +115,17 @@ def _provider_health(cursor, args):
         "authorization_status": auth_status,
         "plan_configured": plan_id is not None,
         "plan_status": plan_status,
+        "terminal_outcome": terminal_outcome,
         "connection_attempts": attempts,
         "connection_ceiling": ceiling,
         "stream_status": session_status,
+        "stream_failure_code": session_failure,
         "heartbeat_at": heartbeat,
         "event_time_watermark": watermark,
+        "stream_ended_at": session_ended_at,
+        "journal_status": journal_status,
+        "journal_quarantine_reason": quarantine_reason,
+        "journal_relative_path": journal_relative_path,
     }
 
 
@@ -111,12 +137,28 @@ def _bridge_health(cursor):
         return "BLOCKED", {
             "reason": "ADVANCED_OVERLAY_SCHEMA_NOT_INSTALLED",
         }
+    has_recovery_overlay = bool(_one(
+        cursor,
+        "SELECT to_regclass('rt.advanced_journal_recovery_events') "
+        "IS NOT NULL",
+    )[0])
     journals = _one(
         cursor,
-        "SELECT count(*) FILTER (WHERE status='QUARANTINED'),"
-        "count(*) FILTER (WHERE status IN ('REGISTERED','WRITING','DRAINING')),"
-        "COALESCE(max(normalized_committed_offset-bridge_committed_offset),0) "
-        "FROM rt.advanced_journal_registry",
+        "SELECT count(*) FILTER (WHERE registry.status='QUARANTINED'"
+        + (
+            " AND NOT EXISTS (SELECT 1 FROM "
+            "rt.advanced_journal_recovery_events AS recovery "
+            "WHERE recovery.journal_generation="
+            "registry.journal_generation "
+            "AND recovery.event_type='RECOVERED')"
+            if has_recovery_overlay
+            else ""
+        )
+        + "),count(*) FILTER (WHERE registry.status IN "
+        "('REGISTERED','WRITING','DRAINING')),"
+        "COALESCE(max(registry.normalized_committed_offset-"
+        "registry.bridge_committed_offset),0) "
+        "FROM rt.advanced_journal_registry AS registry",
     )
     gaps = _one(
         cursor,

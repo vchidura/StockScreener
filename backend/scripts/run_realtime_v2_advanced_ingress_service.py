@@ -22,6 +22,7 @@ if str(BACKEND_DIR) not in sys.path:
 from realtime.advanced_ingress_repository import (  # noqa: E402
     load_advanced_ingress_runtime_plan_cursor,
 )
+from realtime.advanced_ingress_plan import advanced_ingress_provider_deadline  # noqa: E402
 from realtime.advanced_ingress_runtime_profile import (  # noqa: E402
     load_advanced_ingress_runtime_catalog,
 )
@@ -93,7 +94,7 @@ def _active_plan_id(provider, authorization_id, checked_at):
     with provider.transaction(APP_ROLE, read_only=True) as unit:
         unit.cursor.execute(
             "SELECT plan_id FROM rt.advanced_ingress_plans "
-            "WHERE authorization_id=%s AND status='ACTIVE' "
+            "WHERE authorization_id=%s AND status IN ('READY','ACTIVE') "
             "AND authorized_start_at<=%s AND authorized_end_at>%s "
             "ORDER BY session_date DESC,created_at DESC LIMIT 1",
             (str(authorization_id), checked_at, checked_at),
@@ -139,9 +140,14 @@ def _child_command(args, plan_id, runtime_path_attempt):
     ]
 
 
-def _wait_for_child(process, stop, *, poll_seconds, shutdown_seconds):
+def _wait_for_child(
+    process, stop, *, poll_seconds, shutdown_seconds, deadline=None, utc_clock=None,
+):
+    clock = utc_clock or (lambda: datetime.now(UTC))
     while process.poll() is None:
-        if not stop.wait(poll_seconds):
+        remaining = None if deadline is None else (deadline - clock()).total_seconds()
+        wait_seconds = poll_seconds if remaining is None else min(poll_seconds, max(0, remaining))
+        if not stop.wait(wait_seconds) and (deadline is None or clock() < deadline):
             continue
         process.terminate()
         try:
@@ -202,6 +208,15 @@ def main(argv=None) -> int:
             profile = catalog.profile_for_sha(
                 runtime_scope.runtime_profile_sha256
             )
+            deadline = advanced_ingress_provider_deadline(
+                runtime_scope.authorized_start_at,
+                runtime_scope.authorized_end_at,
+                drain_seconds=profile.settings.drain_deadline_seconds,
+                shutdown_seconds=profile.settings.shutdown_deadline_seconds,
+            )
+            if datetime.now(UTC) >= deadline:
+                stop.wait(args.poll_seconds)
+                continue
             runtime_path_attempt = _runtime_path_attempt(
                 journal_root,
                 runtime_scope,
@@ -214,6 +229,7 @@ def main(argv=None) -> int:
                 stop,
                 poll_seconds=args.poll_seconds,
                 shutdown_seconds=profile.settings.shutdown_deadline_seconds,
+                deadline=deadline,
             )
             if stop.is_set():
                 break

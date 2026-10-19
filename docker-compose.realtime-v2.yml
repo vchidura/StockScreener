@@ -1,7 +1,7 @@
 name: alpha-research-realtime-v2
 
 x-backend-service: &backend-service
-  image: alpha-research-realtime-v2-backend:latest
+  image: ${REALTIME_V2_BACKEND_IMAGE:?set REALTIME_V2_BACKEND_IMAGE to an approved immutable image}
   build:
     context: ./backend
     dockerfile: Dockerfile
@@ -58,6 +58,12 @@ services:
       - --execute
     environment:
       <<: *advanced-environment
+      REALTIME_V2_ADVANCED_CANARY_START_AT: ${REALTIME_V2_ADVANCED_CANARY_START_AT:-}
+      REALTIME_V2_ADVANCED_CANARY_END_AT: ${REALTIME_V2_ADVANCED_CANARY_END_AT:-}
+      REALTIME_V2_ADVANCED_PREFERRED_COHORT_ID: ${REALTIME_V2_ADVANCED_PREFERRED_COHORT_ID:-}
+      REALTIME_V2_ADVANCED_COHORT_SELECTION_REFERENCE: ${REALTIME_V2_ADVANCED_COHORT_SELECTION_REFERENCE:-}
+      REALTIME_V2_ADVANCED_REST_REPAIR_RESPONSE_BYTE_LIMIT: ${REALTIME_V2_ADVANCED_REST_REPAIR_RESPONSE_BYTE_LIMIT:-}
+      REALTIME_V2_ADVANCED_REST_REPAIR_EXPECTED_COST: ${REALTIME_V2_ADVANCED_REST_REPAIR_EXPECTED_COST:-}
       REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
     secrets:
       - realtime_v2_app_dsn

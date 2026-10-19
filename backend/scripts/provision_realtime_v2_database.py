@@ -53,6 +53,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--allow-disposable", action="store_true")
     parser.add_argument("--security-mode", choices=SECURITY_MODES_V2, default=SECURITY_MODE_DEFERRED)
     parser.add_argument("--resume", action="store_true", help="apply pending migrations to an existing database")
+    parser.add_argument("--repair-ownership", action="store_true")
     parser.add_argument("--authorization-reference", default="")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -62,6 +63,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error(f"provisioning {EXPECTED_V2_DATABASE_NAME} requires --authorization-reference")
     if args.security_mode != SECURITY_MODE_DEFERRED and args.database == EXPECTED_V2_DATABASE_NAME:
         parser.error("hardening stocks_realtime_v2 is a separate step: harden_realtime_v2_database.py")
+    if args.repair_ownership and not (
+        args.database == EXPECTED_V2_DATABASE_NAME
+        and args.execute
+        and args.resume
+    ):
+        parser.error(
+            "--repair-ownership requires an authorized live --resume execution"
+        )
     return args
 
 
@@ -98,6 +107,54 @@ def _applied(connection) -> dict[str, str]:
         return {version: checksum for version, checksum in cursor.fetchall()}
 
 
+def _repair_runtime_ownership(connection, owner: str) -> int:
+    changed = 0
+    with connection.cursor() as cursor:
+        cursor.execute(
+            sql.SQL("ALTER DATABASE {} OWNER TO {}").format(
+                sql.Identifier(EXPECTED_V2_DATABASE_NAME),
+                sql.Identifier(owner),
+            )
+        )
+        for schema_name in ("ref", "rt"):
+            cursor.execute(
+                sql.SQL("ALTER SCHEMA {} OWNER TO {}").format(
+                    sql.Identifier(schema_name),
+                    sql.Identifier(owner),
+                )
+            )
+        cursor.execute(
+            "SELECT n.nspname,c.relname,c.relkind "
+            "FROM pg_class AS c "
+            "JOIN pg_namespace AS n ON n.oid=c.relnamespace "
+            "WHERE n.nspname IN ('ref','rt') "
+            "AND c.relkind IN ('r','p','v','m','S') "
+            "AND pg_get_userbyid(c.relowner)<>%s "
+            "ORDER BY n.nspname,c.relname",
+            (owner,),
+        )
+        for schema_name, object_name, kind in cursor.fetchall():
+            object_type = (
+                "SEQUENCE"
+                if kind == "S"
+                else "MATERIALIZED VIEW"
+                if kind == "m"
+                else "VIEW"
+                if kind == "v"
+                else "TABLE"
+            )
+            cursor.execute(
+                sql.SQL("ALTER {} {}.{} OWNER TO {}").format(
+                    sql.SQL(object_type),
+                    sql.Identifier(schema_name),
+                    sql.Identifier(object_name),
+                    sql.Identifier(owner),
+                )
+            )
+            changed += 1
+    return changed
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     migrations = load_realtime_migrations(V2_MIGRATIONS_DIR)
@@ -123,8 +180,25 @@ def main(argv=None) -> int:
                                .format(sql.Identifier(args.database)))
     with closing(_connect(settings, args.database)) as connection:
         plan = plan_realtime_migrations(args.database, _applied(connection), migrations)
+        migration_owner = (
+            build_role_names_v2(args.database).name("admin")
+            if exists and args.database == EXPECTED_V2_DATABASE_NAME
+            else None
+        )
+        if args.repair_ownership:
+            report["ownership_repaired"] = _repair_runtime_ownership(
+                connection,
+                migration_owner,
+            )
+            connection.commit()
         for migration in plan.pending:
             with connection.cursor() as cursor:
+                if migration_owner is not None:
+                    cursor.execute(
+                        sql.SQL("SET LOCAL ROLE {}").format(
+                            sql.Identifier(migration_owner)
+                        )
+                    )
                 cursor.execute(migration.sql)
                 cursor.execute("INSERT INTO rt.schema_migrations (version, checksum_sha256) VALUES (%s, %s)",
                                (migration.version, migration.checksum_sha256))

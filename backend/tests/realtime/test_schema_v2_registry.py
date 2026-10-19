@@ -88,7 +88,10 @@ def test_registry_partitioned_relations_match_sql_declarations():
 
 
 def test_partition_policy_seed_rows_match_registry():
-    text = _sql("009_realtime_partition_maintenance.sql")
+    text = "\n".join((
+        _sql("009_realtime_partition_maintenance.sql"),
+        _sql("026_advanced_options_flow_evidence.sql"),
+    ))
     rows = re.findall(
         r"\('(rt\.[a-z_]+)', '(DAILY|WEEKLY|MONTHLY)', '[a-z_]+', '(?:timestamptz|date)', "
         r"'([A-Z_0-9]+)', '([A-Z_]+)', (\d+),", text)

@@ -29,6 +29,7 @@ UTC = timezone.utc
 AS_OF = date(2026, 10, 13)
 CLOCK = lambda: datetime(2026, 10, 13, 9, 30, tzinfo=UTC)  # noqa: E731
 SQL_009 = Path(__file__).resolve().parents[2] / "realtime" / "sql_v2" / "009_realtime_partition_maintenance.sql"
+SQL_026 = Path(__file__).resolve().parents[2] / "realtime" / "sql_v2" / "026_advanced_options_flow_evidence.sql"
 POLICY_ROW = re.compile(
     r"\('(rt\.[a-z_]+)', '([A-Z]+)', '([a-z_]+)', '([a-z]+)', '([A-Z_0-9]+)', '([A-Z_]+)', (\d+), \d+, \d+, "
     r"(true|false), ARRAY\[[^\]]*\](?:::text\[\])?, (NULL|'rt\.[a-z_]+')\)")
@@ -41,13 +42,18 @@ EXPECTED_ELIGIBLE = {
 }
 NOT_ELIGIBLE = (
     "rt.bar_revisions", "rt.portal_snapshot_kept", "rt.option_flow_events", "rt.option_flow_clusters",
+    "rt.option_flow_event_profiles", "rt.option_flow_cluster_members",
 )
 
 
 def policy_rows() -> dict[str, RetentionPolicy]:
-    """The rt.partition_policies rows exactly as 009 seeds them."""
+    """The partition-policy rows exactly as forward migrations seed them."""
     rows = {}
-    for match in POLICY_ROW.finditer(SQL_009.read_text(encoding="utf-8")):
+    text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (SQL_009, SQL_026)
+    )
+    for match in POLICY_ROW.finditer(text):
         relation, scheme, key, key_type, klass, kind, value, requires, catalog = match.groups()
         rows[relation] = RetentionPolicy(
             relation, scheme, key, key_type, klass, kind, int(value), requires == "true",
@@ -337,6 +343,16 @@ def test_other_retention_classes_are_never_touched_and_are_reported_as_skipped()
     attached["rt.bar_revisions"] = monthly("rt.bar_revisions", (2024, 1), (2026, 12))
     attached["rt.portal_snapshot_kept"] = daily("rt.portal_snapshot_kept", date(2026, 1, 1), date(2026, 2, 1))
     attached["rt.option_flow_events"] = daily("rt.option_flow_events", date(2026, 1, 1), date(2026, 2, 1))
+    attached["rt.option_flow_event_profiles"] = daily(
+        "rt.option_flow_event_profiles",
+        date(2026, 1, 1),
+        date(2026, 2, 1),
+    )
+    attached["rt.option_flow_cluster_members"] = daily(
+        "rt.option_flow_cluster_members",
+        date(2026, 1, 1),
+        date(2026, 2, 1),
+    )
     repository = FakeRepository(attached=attached)
     report = run(repository, execute=True)
     touched = {call[1] for call in repository.calls if call[0] in {"partitions", "detached_tables"}}

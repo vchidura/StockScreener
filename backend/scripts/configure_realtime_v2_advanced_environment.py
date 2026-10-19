@@ -41,6 +41,20 @@ def parse_args(argv=None):
         default=BACKEND_DIR / ".env",
     )
     parser.add_argument("--journal-directory", type=Path, required=True)
+    parser.add_argument(
+        "--ingress-policy-path",
+        type=Path,
+        default=(
+            BACKEND_DIR
+            / "realtime"
+            / "policies"
+            / "advanced_equity_ingress_v1.json"
+        ),
+    )
+    parser.add_argument(
+        "--ingress-policy-version",
+        default="advanced-equity-ingress-v1",
+    )
     parser.add_argument("--execute", action="store_true")
     parser.add_argument(
         "--scale-control",
@@ -68,10 +82,16 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     args.env_file = args.env_file.resolve()
     args.journal_directory = args.journal_directory.resolve()
+    args.ingress_policy_path = args.ingress_policy_path.resolve()
     if not args.env_file.is_file():
         parser.error("--env-file must exist")
     if not args.journal_directory.is_dir():
         parser.error("--journal-directory must exist")
+    if (
+        not args.ingress_policy_path.is_file()
+        or not args.ingress_policy_version.strip()
+    ):
+        parser.error("Advanced ingress policy identity is invalid")
     try:
         ladder = tuple(
             int(value.strip())
@@ -100,6 +120,12 @@ def parse_args(argv=None):
         ),
         "REALTIME_V2_ADVANCED_STABLE_SESSIONS_BEFORE_UP": str(
             args.stable_sessions_before_up
+        ),
+        "REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH": str(
+            args.ingress_policy_path
+        ),
+        "REALTIME_V2_ADVANCED_INGRESS_POLICY_VERSION": (
+            args.ingress_policy_version.strip()
         ),
     }
     return args

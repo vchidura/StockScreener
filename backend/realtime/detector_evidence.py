@@ -68,6 +68,8 @@ class RealtimeDetectorInput:
     journal_generation: UUID | None = None
     stream_session_id: UUID | None = None
     source_offset: int | None = None
+    source_flow_id: UUID | None = None
+    source_cohort_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if not self.input_role.strip() or not self.input_key.strip():
@@ -91,6 +93,13 @@ class RealtimeDetectorInput:
         has_journal = all(value is not None for value in journal_values)
         if any(value is not None for value in journal_values) and not has_journal:
             raise ValueError("journal detector input identity must be complete")
+        source_flow_values = (self.source_flow_id, self.source_cohort_id)
+        if any(value is not None for value in source_flow_values) and not all(
+            value is not None for value in source_flow_values
+        ):
+            raise ValueError("source-flow detector input binding must be complete")
+        if self.source_flow_id is not None and not has_journal:
+            raise ValueError("source-flow binding requires a journal detector input")
         if len(direct_sources) + int(has_journal) != 1:
             raise ValueError("detector input must name exactly one causal source")
         if self.source_offset is not None and self.source_offset <= 0:

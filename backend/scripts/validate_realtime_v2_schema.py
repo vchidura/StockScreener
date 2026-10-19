@@ -199,7 +199,9 @@ def catalog_checks(cursor) -> list[tuple[str, str]]:
                    "WHERE retention_class = 'ARCHIVE_FIRST' ORDER BY relation_name")
     archive_rows = cursor.fetchall()
     results.append(("archive_first_relations_name_their_required_archive_kinds", "PASS" if archive_rows == [
+        ("rt.option_flow_cluster_members", True, ["OPTION_FLOW_CLUSTERS"]),
         ("rt.option_flow_clusters", True, ["OPTION_FLOW_CLUSTERS"]),
+        ("rt.option_flow_event_profiles", True, ["OPTION_FLOW_EVENTS"]),
         ("rt.option_flow_events", True, ["OPTION_FLOW_EVENTS"])] else f"FAIL {archive_rows}"))
     cursor.execute("SELECT window_value FROM rt.partition_policies WHERE relation_name = 'rt.portal_snapshot_kept'")
     results.append(("kept_portal_snapshots_retain_the_26_session_strategy_window",
@@ -208,7 +210,13 @@ def catalog_checks(cursor) -> list[tuple[str, str]]:
     total, healthy = cursor.fetchone()
     results.append(("partition_health_is_ok_after_provisioning",
                     "PASS" if total == len(PARTITION_POLICY_SEEDS) and healthy == total else f"FAIL {healthy}/{total}"))
-    cursor.execute("SELECT count(*) FILTER (WHERE status = 'ALARM') FROM rt.partition_health(CURRENT_DATE + 30)")
+    cursor.execute(
+        "WITH missed AS ("
+        "SELECT max(horizon_date) AS checked_on "
+        "FROM rt.partition_health(CURRENT_DATE)"
+        ") SELECT count(*) FILTER (WHERE status = 'ALARM') "
+        "FROM missed CROSS JOIN LATERAL rt.partition_health(missed.checked_on)"
+    )
     results.append(("partition_health_alarms_when_creation_is_missed",
                     "PASS" if cursor.fetchone()[0] == len(PARTITION_POLICY_SEEDS) else "FAIL"))
     return results
@@ -372,8 +380,8 @@ def behavior_checks(cursor) -> list[tuple[str, str]]:
         "side_confidence, quote_bid, quote_ask, quote_bid_size, quote_ask_size, quote_time, quote_seq, "
         "cumulative_volume_before, cumulative_volume_after, volume_baseline_kind, prior_open_interest, "
         "open_interest_as_of, volume_exceeds_prior_oi, opening_inference, opening_reasons, spread_position, "
-        "opening_score")
-    flow_insert = f"INSERT INTO rt.option_flow_events ({flow_columns}) VALUES ({','.join(['%s'] * 33)})"
+        "opening_score, lineage_version")
+    flow_insert = f"INSERT INTO rt.option_flow_events ({flow_columns}) VALUES ({','.join(['%s'] * 34)})"
     trade_time = now - timedelta(seconds=5)
 
     def flow(seq=1, side="AT_OR_ABOVE_ASK", confidence="HIGH", quote_time=None, exceeds=False, oi=None,
@@ -386,7 +394,7 @@ def behavior_checks(cursor) -> list[tuple[str, str]]:
                 1.20 if has_quote else None, 1.25 if has_quote else None, 20 if has_quote else None,
                 30 if has_quote else None, quote_time if has_quote else None, 7 if has_quote else None,
                 after - 150, after, baseline, oi, trade_time.date() - timedelta(days=1) if oi else None,
-                exceeds, inference, reasons, spread, score)
+                exceeds, inference, reasons, spread, score, 1)
 
     results.append(_accept(cursor, "flow_event_accepts_aggressive_print_with_causal_quote", flow_insert, flow()))
     results.append(_expect(cursor, "flow_event_rejects_quote_after_the_trade", errors.CheckViolation, flow_insert,
@@ -423,9 +431,10 @@ def behavior_checks(cursor) -> list[tuple[str, str]]:
     cluster = (
         "INSERT INTO rt.option_flow_clusters (cluster_id, revision, session_date, cohort_id, provider_tier, "
         "contract_ticker, underlyer, window_seconds, window_start, window_end, side_class, print_count, total_size, "
-        "total_premium, distinct_exchanges, first_event_time, last_event_time, status, policy_sha256) VALUES "
+        "total_premium, distinct_exchanges, first_event_time, last_event_time, status, policy_sha256,"
+        "lineage_version) VALUES "
         "(%s,%s,%s,%s,'MASSIVE_ADVANCED','O:SPY261218C00650000','SPY',300,%s,%s,'AT_OR_ABOVE_ASK',%s,500,62500,%s,%s,%s,"
-        "'FINAL',%s)")
+        "'FINAL',%s,1)")
     start = trade_time - timedelta(minutes=2)
     cluster_id = str(uuid4())
     results.append(_accept(cursor, "flow_cluster_accepts_a_consistent_window", cluster,
@@ -443,8 +452,9 @@ def behavior_checks(cursor) -> list[tuple[str, str]]:
     retraction = (
         "INSERT INTO rt.option_flow_clusters (cluster_id, revision, session_date, cohort_id, provider_tier, "
         "contract_ticker, underlyer, window_seconds, window_start, window_end, side_class, print_count, total_size, "
-        "total_premium, distinct_exchanges, first_event_time, last_event_time, status, policy_sha256) VALUES "
-        "(%s,%s,%s,%s,'MASSIVE_ADVANCED','O:SPY261218C00650000','SPY',300,%s,%s,'AT_OR_ABOVE_ASK',%s,%s,0,%s,%s,%s,%s,%s)")
+        "total_premium, distinct_exchanges, first_event_time, last_event_time, status, policy_sha256,"
+        "lineage_version) VALUES "
+        "(%s,%s,%s,%s,'MASSIVE_ADVANCED','O:SPY261218C00650000','SPY',300,%s,%s,'AT_OR_ABOVE_ASK',%s,%s,0,%s,%s,%s,%s,%s,1)")
 
     def retract(revision=2, status="RETRACTED", prints=0, size=0, exchanges=0):
         return (cluster_id, revision, trade_time.date(), cohort, start, start + timedelta(seconds=300), prints, size,
@@ -461,7 +471,7 @@ def behavior_checks(cursor) -> list[tuple[str, str]]:
     original = flow(seq=20)
     results.append(_accept(cursor, "flow_event_original_print", flow_insert, original))
     revision_insert = (f"INSERT INTO rt.option_flow_events ({flow_columns}, revision, supersedes_event_id) "
-                       f"VALUES ({','.join(['%s'] * 35)})")
+                       f"VALUES ({','.join(['%s'] * 36)})")
     cancel = flow(seq=20)[1:] + (2, original[0])
     results.append(_accept(cursor, "cancel_revision_may_reuse_the_original_sequence_and_time", revision_insert,
                            (str(uuid4()),) + cancel))
