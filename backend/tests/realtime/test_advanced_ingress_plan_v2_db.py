@@ -705,6 +705,18 @@ def test_terminal_controller_outcome_is_durable_and_cannot_restart(
             plan.plan_id,
         )
     assert status.terminal_outcome == "BLOCKED_ENTITLEMENT"
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        with pytest.raises(
+            AdvancedIngressAdmissionError,
+            match=(
+                "daily ingress plan status is not "
+                "runtime-admissible: BLOCKED"
+            ),
+        ):
+            load_advanced_ingress_runtime_plan_cursor(
+                unit.cursor,
+                plan.plan_id,
+            )
     with pytest.raises(AdvancedIngressAdmissionError):
         _admit(
             provider,

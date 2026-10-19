@@ -690,9 +690,13 @@ def load_advanced_ingress_runtime_plan_cursor(
         raise AdvancedIngressAdmissionError(
             "daily ingress plan is unavailable"
         )
+    if row[17] not in {"READY", "ACTIVE"}:
+        raise AdvancedIngressAdmissionError(
+            "daily ingress plan status is not runtime-admissible: "
+            f"{row[17]}"
+        )
     if (
-        row[17] not in {"READY", "ACTIVE"}
-        or row[18] != "READY"
+        row[18] != "READY"
         or row[19] not in {"ACTIVE", "SUPERSEDED"}
         or row[4] != row[23]
         or int(row[5]) != int(row[24])

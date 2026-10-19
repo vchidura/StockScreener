@@ -2,10 +2,15 @@ import importlib
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from realtime.advanced_ingress_controller import IngressFailureDisposition
+from realtime.advanced_ingress_repository import (
+    AdvancedIngressAdmissionError,
+    load_advanced_ingress_runtime_plan_cursor,
+)
 
 
 script = importlib.import_module(
@@ -71,6 +76,27 @@ def test_external_ingress_mode_is_explicit():
     args = script.parse_args([*_base(), "--external-ingress"])
 
     assert args.external_ingress is True
+
+
+def test_runtime_scope_reports_terminal_plan_status_before_scope_mismatch():
+    cursor = MagicMock()
+    row = [None] * 32
+    row[17] = "BLOCKED"
+    cursor.fetchone.return_value = tuple(row)
+
+    with pytest.raises(
+        AdvancedIngressAdmissionError,
+        match=(
+            "daily ingress plan status is not "
+            "runtime-admissible: BLOCKED"
+        ),
+    ):
+        load_advanced_ingress_runtime_plan_cursor(
+            cursor,
+            script.UUID(int=1),
+        )
+
+    cursor.execute.assert_called_once()
 
 
 def test_controller_child_runner_does_not_retry_a_finished_process():
