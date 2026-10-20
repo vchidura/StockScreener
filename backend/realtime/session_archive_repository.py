@@ -64,7 +64,9 @@ _ALERT_KINDS = {STOCK_ALERTS: "STOCK", OPTION_ALERTS: "OPTION"}
 # The session date of a row of a partitioned relation, for the drop-time coverage check.
 _PARTITION_SESSION_DATE = {
     "rt.option_flow_events": f"(x.event_time AT TIME ZONE '{MARKET_TIME_ZONE}')::date",
+    "rt.option_flow_event_profiles": "x.session_date",
     "rt.option_flow_clusters": "x.session_date",
+    "rt.option_flow_cluster_members": "x.session_date",
 }
 
 
@@ -103,10 +105,22 @@ _EXTRACTS: Mapping[str, tuple[_Extract, ...]] = {
     OPTION_FLOW_EVENTS: (
         _Extract("rt.option_flow_events", ("event_time", "contract_ticker", "source_seq", "revision", "event_id"),
                  f"FROM rt.option_flow_events x WHERE {_session_window('x.event_time')}"),
+        _Extract(
+            "rt.option_flow_event_profiles",
+            ("event_time", "event_id", "profile"),
+            "FROM rt.option_flow_event_profiles x "
+            "WHERE x.session_date = %(session)s",
+        ),
     ),
     OPTION_FLOW_CLUSTERS: (
         _Extract("rt.option_flow_clusters", ("window_start", "cluster_id", "revision"),
                  "FROM rt.option_flow_clusters x WHERE x.session_date = %(session)s"),
+        _Extract(
+            "rt.option_flow_cluster_members",
+            ("cluster_id", "revision", "profile", "event_time", "event_id"),
+            "FROM rt.option_flow_cluster_members x "
+            "WHERE x.session_date = %(session)s",
+        ),
     ),
 }
 

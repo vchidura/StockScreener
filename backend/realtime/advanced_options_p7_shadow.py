@@ -68,6 +68,7 @@ EXPECTED_P7_MIGRATIONS = (
     "028_advanced_options_reference_state",
     "029_advanced_options_rolling_checkpoints",
     "030_advanced_options_flow_package_evidence",
+    "031_realtime_advanced_journal_recovery",
 )
 _COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _OPTION_PATTERN = re.compile(
@@ -131,12 +132,12 @@ def _source_bindings(backend_dir: Path) -> list[dict[str, str]]:
 def _migration_bindings() -> list[dict[str, str]]:
     migrations = load_realtime_migrations(V2_MIGRATIONS_DIR)
     if (
-        len(migrations) != 31
-        or migrations[-1].sequence != 30
-        or tuple(row.version for row in migrations[-6:])
+        len(migrations) != 32
+        or migrations[-1].sequence != 31
+        or tuple(row.version for row in migrations[-7:])
         != EXPECTED_P7_MIGRATIONS
     ):
-        raise ValueError("P7 requires the exact realtime migration lineage 000-030")
+        raise ValueError("P7 requires the exact realtime migration lineage 000-031")
     return [
         {
             "version": row.version,

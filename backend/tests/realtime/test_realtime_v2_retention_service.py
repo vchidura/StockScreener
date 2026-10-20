@@ -4,7 +4,7 @@ import json
 import re
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -272,6 +272,61 @@ def test_once_runs_one_exact_cycle_and_emits_status(tmp_path):
     assert request.archive_relations == ("rt.option_flow_clusters",)
     assert request.archive_kinds == ("OPTION_FLOW_CLUSTERS",)
     assert json.loads(output[0]) == {"state": STATUS_READY}
+
+
+def test_continuous_wait_uses_wall_clock_after_host_suspend(tmp_path):
+    args = script.parse_args(execution(tmp_path, "--continuous"))
+
+    class Clock:
+        current = NOW
+
+        def __call__(self):
+            return self.current
+
+    clock = Clock()
+
+    class Stop:
+        stopped = False
+        waits = []
+
+        def is_set(self):
+            return self.stopped
+
+        def set(self):
+            self.stopped = True
+
+        def wait(self, seconds):
+            self.waits.append(seconds)
+            clock.current += timedelta(hours=2)
+            return False
+
+    stop = Stop()
+    calls = []
+
+    class Cycle:
+        def run(self, request, *, execute):
+            calls.append((request, execute))
+            if len(calls) == 2:
+                stop.set()
+            return SimpleNamespace(
+                state=STATUS_READY,
+                as_dict=lambda: {"state": STATUS_READY},
+            )
+
+    class SuspendCalendar:
+        def latest_completed_session(self, _checked_at):
+            return date(2026, 10, 16)
+
+    assert script.run_cycles(
+        Cycle(),
+        args,
+        stop=stop,
+        clock=clock,
+        calendar=SuspendCalendar(),
+        emit=lambda _value: None,
+    ) == 0
+    assert len(calls) == 2
+    assert stop.waits == [60]
 
 
 def test_check_preflight_is_read_only_and_reports_exact_candidates(tmp_path, monkeypatch):

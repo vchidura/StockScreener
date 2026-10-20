@@ -104,6 +104,15 @@ def test_plan_freezes_exact_bounded_non_serving_scope(tmp_path):
         "test_rt_options_p7_20261020_app",
         "test_rt_options_p7_20261020_api",
     ]
+    assert [row["version"] for row in plan["migrations"][-7:]] == [
+        "025_realtime_advanced_options_control_plane",
+        "026_advanced_options_flow_evidence",
+        "027_advanced_options_provider_references",
+        "028_advanced_options_reference_state",
+        "029_advanced_options_rolling_checkpoints",
+        "030_advanced_options_flow_package_evidence",
+        "031_realtime_advanced_journal_recovery",
+    ]
     assert plan["evidence"]["files"] == list(EVIDENCE_FILES)
     assert not any(plan["production_authority"].values())
     assert plan["provider_requests_authorized"] == 0

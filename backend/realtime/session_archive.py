@@ -147,6 +147,12 @@ class ArchiveIdentity:
         object.__setattr__(self, "build_id", build_id)
         object.__setattr__(self, "policy_id", policy_id)
 
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(
+            f"{self.build_id}\n{self.policy_id}".encode("utf-8")
+        ).hexdigest()
+
 
 @dataclass(frozen=True, slots=True)
 class ArchiveRow:
@@ -395,12 +401,22 @@ def archive_file_names(
     kind: str,
     horizon_close_date: date | None = None,
     content_sha256: str | None = None,
+    identity_sha256: str | None = None,
 ) -> tuple[str, str]:
     """(data file, manifest file). A content-addressed suffix names a later revision."""
     _check_kind(kind, horizon_close_date)
     stem = f"outcomes-{horizon_close_date.isoformat()}" if kind == OUTCOMES else kind.lower()
     if content_sha256 is not None:
         stem += "." + _sha256_hex(content_sha256, "content_sha256")[:16]
+    if identity_sha256 is not None:
+        if content_sha256 is None:
+            raise ValueError(
+                "archive revision identity requires content identity"
+            )
+        stem += "." + _sha256_hex(
+            identity_sha256,
+            "identity_sha256",
+        )[:16]
     return stem + ".jsonl.gz", stem + ".manifest.json"
 
 
@@ -472,7 +488,12 @@ def write_archive(directory: Path, built: BuiltArchive, identity: ArchiveIdentit
     directory.mkdir(parents=True, exist_ok=True)
     candidates = (
         archive_file_names(built.kind, built.horizon_close_date),
-        archive_file_names(built.kind, built.horizon_close_date, built.content_sha256),
+        archive_file_names(
+            built.kind,
+            built.horizon_close_date,
+            built.content_sha256,
+            identity.sha256,
+        ),
     )
     for index, (data_name, manifest_name) in enumerate(candidates):
         data_path = directory / data_name
@@ -485,8 +506,19 @@ def write_archive(directory: Path, built: BuiltArchive, identity: ArchiveIdentit
                 continue
             raise FileExistsError("content-addressed archive revision holds different content")
         manifest_path = directory / manifest_name
+        expected_manifest = render_manifest(
+            built,
+            file_name=data_name,
+            identity=identity,
+        )
         if not manifest_path.exists():
-            _write_new_file(manifest_path, render_manifest(built, file_name=data_name, identity=identity))
+            _write_new_file(manifest_path, expected_manifest)
+        elif manifest_path.read_bytes() != expected_manifest:
+            if index == 0:
+                continue
+            raise FileExistsError(
+                "content-addressed archive revision manifest differs"
+            )
         return WrittenArchive(data_path, manifest_path, created, revision=index == 1)
     raise AssertionError("unreachable: the revision candidate always returns or raises")
 

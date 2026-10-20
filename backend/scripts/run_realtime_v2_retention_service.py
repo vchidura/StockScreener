@@ -15,7 +15,7 @@ import sys
 import threading
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -496,9 +496,31 @@ def run_cycles(
         emit(json.dumps(status.as_dict(), sort_keys=True))
         if status.state == STATUS_ALARM:
             exit_code = 1
-        if args.once or stop.wait(args.interval_seconds):
+        if args.once or _wait_until_next_cycle(
+            stop,
+            clock() + timedelta(seconds=args.interval_seconds),
+            clock=clock,
+        ):
             return exit_code
     return exit_code
+
+
+def _wait_until_next_cycle(
+    stop: threading.Event,
+    deadline: datetime,
+    *,
+    clock: Callable[[], datetime] = _now,
+    maximum_poll_seconds: float = 60,
+) -> bool:
+    if maximum_poll_seconds <= 0:
+        raise ValueError("retention wait poll must be positive")
+    while not stop.is_set():
+        remaining = (deadline - clock()).total_seconds()
+        if remaining <= 0:
+            return False
+        if stop.wait(min(remaining, maximum_poll_seconds)):
+            return True
+    return True
 
 
 def _build_cycle(

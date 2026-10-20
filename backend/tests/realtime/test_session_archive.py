@@ -233,11 +233,43 @@ def test_rerun_is_idempotent_and_does_not_touch_files(tmp_path):
     assert len(list(first.data_path.parent.iterdir())) == 2
 
 
-def test_rerun_with_a_new_build_identity_keeps_the_original_manifest(tmp_path):
-    _, first = _written(tmp_path)
-    again = write_archive(first.data_path.parent, _build(), ArchiveIdentity("build-2", "policy-2"))
+def test_rerun_with_a_new_build_identity_uses_revision_and_keeps_original(tmp_path):
+    built, first = _written(tmp_path)
+    original_manifest = first.manifest_path.read_bytes()
+    second_identity = ArchiveIdentity("build-2", "policy-2")
+    again = write_archive(first.data_path.parent, _build(), second_identity)
     manifest = json.loads(again.manifest_path.read_text(encoding="ascii"))
-    assert manifest["build_id"] == "build-1"
+    assert again.revision and manifest["build_id"] == "build-2"
+    assert first.manifest_path.read_bytes() == original_manifest
+    assert _verify(again, built, identity=second_identity)
+    third_identity = ArchiveIdentity("build-3", "policy-3")
+    third = write_archive(first.data_path.parent, _build(), third_identity)
+    assert third.revision and third.data_path not in {
+        first.data_path,
+        again.data_path,
+    }
+    assert _verify(third, built, identity=third_identity)
+
+
+def test_stale_primary_manifest_is_preserved_and_current_contract_uses_revision(
+    tmp_path,
+):
+    built = _build(rows=[], kind=OPTION_FLOW_EVENTS)
+    directory = archive_directory(tmp_path, SESSION)
+    first = write_archive(directory, built, IDENTITY)
+    manifest = json.loads(first.manifest_path.read_text(encoding="ascii"))
+    manifest["relation_counts"].pop("rt.option_flow_event_profiles")
+    stale = (
+        json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=True)
+        + "\n"
+    ).encode("ascii")
+    first.manifest_path.write_bytes(stale)
+
+    repaired = write_archive(directory, built, IDENTITY)
+
+    assert repaired.revision and repaired.data_path != first.data_path
+    assert first.manifest_path.read_bytes() == stale
+    assert _verify(repaired, built).row_count == 0
 
 
 def test_missing_manifest_is_completed_after_an_interrupted_write(tmp_path):
@@ -254,7 +286,10 @@ def test_changed_rows_never_rewrite_the_original_file(tmp_path):
     changed = _build(_alert_rows(4))
     second = write_archive(first.data_path.parent, changed, IDENTITY)
     assert second.revision and second.created
-    assert second.data_path.name == f"stock_alerts.{changed.content_sha256[:16]}.jsonl.gz"
+    assert second.data_path.name == (
+        f"stock_alerts.{changed.content_sha256[:16]}."
+        f"{IDENTITY.sha256[:16]}.jsonl.gz"
+    )
     assert first.data_path.read_bytes() == original
     assert _verify(first, built).sha256 == built.sha256
     assert _verify(second, changed).sha256 == changed.sha256 != built.sha256

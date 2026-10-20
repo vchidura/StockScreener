@@ -213,10 +213,14 @@ def _persist_detector_evaluation_batch(
                 cursor.execute(
                     "SELECT detector_sha256, cohort_id, state_key, revision, state_schema, "
                     "state_sha256 FROM rt.detector_state WHERE cohort_id=%s "
-                    "AND (detector_sha256, state_key)=ANY(%s)",
+                    "AND (detector_sha256,state_key) IN ("
+                    "SELECT detector_sha256,state_key FROM unnest("
+                    "%s::text[],%s::text[]) "
+                    "AS expected(detector_sha256,state_key))",
                     (
                         str(checkpoint.cohort_id),
-                        [(row.detector_sha256, row.state_key) for row in state_rows],
+                        [row.detector_sha256 for row in state_rows],
+                        [row.state_key for row in state_rows],
                     ),
                 )
                 stored_states = {
