@@ -309,7 +309,7 @@ def test_rerun_is_idempotent(repo):
     assert stamps == {path: path.stat().st_mtime_ns for path in repo.root.rglob("*") if path.is_file()}
 
 
-def test_rerun_fails_closed_when_existing_manifest_has_another_identity(repo):
+def test_rerun_with_another_identity_creates_an_immutable_revision(repo):
     session = SESSIONS[0]
     prior_identity = ArchiveIdentity("prior-build", IDENTITY.policy_id)
     prior_worker = SessionArchiveWorker(
@@ -325,11 +325,13 @@ def test_rerun_fails_closed_when_existing_manifest_has_another_identity(repo):
 
     result = _worker(repo, kinds=(OPTION_FLOW_CLUSTERS,)).archive_session(session)
 
-    assert not result.ok
-    assert _status(result, OPTION_FLOW_CLUSTERS) == STATUS_FAILED
-    assert _alarm_codes(result) == [ALARM_VERIFICATION_FAILED]
-    assert "IDENTITY_MISMATCH" in result.alarms[0].detail
-    assert len(repo.records) == 1
+    assert result.ok
+    assert _status(result, OPTION_FLOW_CLUSTERS) == STATUS_ARCHIVED
+    assert result.alarms == ()
+    assert result.outcomes[0].revision
+    assert len(repo.records) == 2
+    assert repo.records[-1].build_id == IDENTITY.build_id
+    assert repo.records[-1].uri != repo.records[0].uri
     assert manifest_path.read_bytes() == original_manifest
 
 

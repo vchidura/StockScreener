@@ -2383,6 +2383,31 @@ export interface OptionCandidatesData {
 
 export type OptionDetectorSort = 'triggered_at' | 'run' | 'underlyer' | 'detector' | 'category' | 'strategy' | 'rank' | 'entry_limit'
 
+export interface AdvancedOptionsV2Status {
+  version: 'advanced-options-v2-read-seam-v1'
+  enabled: boolean
+  stage_catalog: 'stages_v4'
+  snapshot_type: null
+  provider_fetch_performed: false
+  detector_work_performed: false
+  publication_performed: false
+  pointer_advanced: false
+}
+
+export const getAdvancedOptionsV2Status = async (): Promise<OptionsEnvelope<AdvancedOptionsV2Status>> =>
+  import.meta.env.VITE_REALTIME_OPTIONS_V2 === 'true'
+    ? (await api.get('/realtime/options-v2/status', { params: tickerParams() })).data
+    : (await api.get('/options/advanced-v2/status')).data
+
+export type AdvancedOptionsV2ProjectionType = 'OPTIONS_FLOW' | 'OPTIONS_SCREENER' | 'OPTIONS_ALERTS' | 'OPTIONS_MARKS'
+
+export const getAdvancedOptionsV2Projection = async (snapshotType: AdvancedOptionsV2ProjectionType) => {
+  if (import.meta.env.VITE_REALTIME_OPTIONS_V2 !== 'true') {
+    throw new Error('Advanced Options V2 stored reads are disabled')
+  }
+  return (await api.get(`/realtime/options-v2/projections/${snapshotType}`, { params: tickerParams() })).data
+}
+
 export interface OptionDetectorDatasets {
   storage_ready: boolean
   datasets: string[]

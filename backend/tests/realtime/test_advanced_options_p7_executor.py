@@ -11,7 +11,10 @@ from pathlib import Path
 from uuid import UUID
 
 from realtime.advanced_options_ingress import AdvancedOptionsJournalPump
-from realtime.advanced_options_p7_executor import execute_shadow
+from realtime.advanced_options_p7_executor import (
+    _subscription_manifest,
+    execute_shadow,
+)
 from realtime.advanced_options_p7_executor import (
     run_disposable_database_phase,
 )
@@ -109,6 +112,24 @@ def _database(_plan, _capture_report):
         "cleanup_verified": True,
         "database_absent": True,
         "roles_absent": True,
+    }
+
+
+def test_p7_subscription_manifest_is_options_only(tmp_path):
+    plan = _plan(tmp_path)
+
+    manifest = _subscription_manifest(plan)
+
+    assert manifest.universe.equity_tickers == ("QQQ", "SPY")
+    assert manifest.universe.option_underlyings == ("QQQ", "SPY")
+    assert {
+        (member.underlying, member.channel.value)
+        for member in manifest.members
+    } == {
+        ("SPY", "T"),
+        ("SPY", "Q"),
+        ("QQQ", "T"),
+        ("QQQ", "Q"),
     }
 
 

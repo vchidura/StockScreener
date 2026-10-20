@@ -5,7 +5,7 @@ import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ArrowUpDown, 
 import { usePublishPageContext, type PageContextValue } from '../layout/pageContext'
 import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
 import {
-  getOptionCandidate, getOptionCurrentAdvancedQuotes, getOptionDetectorEvaluations, getOptionDetectorAlerts, getOptionDetectorDatasets, getOptionAlertSchedule, previewOptionAlert,
+  getAdvancedOptionsV2Status, getOptionCandidate, getOptionCurrentAdvancedQuotes, getOptionDetectorEvaluations, getOptionDetectorAlerts, getOptionDetectorDatasets, getOptionAlertSchedule, previewOptionAlert,
   type OptionCurrentMark, type OptionAlertPreviewRequest, type OptionCandidateDetailData, type OptionCandidateLeg,
   type OptionCandidateResearchEvidence, type OptionStockBehaviorGateEvidence,
   type OptionDetectorEvaluationReview, type OptionDetectorAlertReview, type OptionDetectorSort, type OptionDetectorDatasets, type OptionDetectorRunSummary, type OptionLocalSurfaceObservation, type OptionO3CreditObservation,
@@ -789,6 +789,7 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
 export default function OptionsAlertsPage() {
   const [params, setParams] = useSearchParams()
   const [sessionContext, setSessionContext] = useState<NonNullable<PageContextValue['alertSessions']>>({ dates: [], selected: '', source: 'OPTIONS_DETECTIONS', emptyLabel: 'No completed runs' })
+  const advancedV2 = useQuery({ queryKey: ['advanced-options-v2-status'], queryFn: getAdvancedOptionsV2Status, retry: false, staleTime: 60_000 })
   const activeView: OptionAlertView = params.get('view') === 'daily' ? 'daily' : params.get('view') === 'day_history' ? 'day_history' : 'behavior'
   const offsetValue = Number(params.get('offset') || 0)
   const offset = Number.isSafeInteger(offsetValue) && offsetValue >= 0 ? offsetValue : 0
@@ -819,6 +820,7 @@ export default function OptionsAlertsPage() {
       <button type="button" role="tab" aria-selected={activeView === 'daily'} tabIndex={activeView === 'daily' ? 0 : -1} onKeyDown={tabKey} className={activeView === 'daily' ? 'active' : ''} onClick={() => switchTab('daily')}><BarChart3 size={14} />EOD Review</button>
     </div>
   return <div className="stock-discovery option-alerts">
+    {advancedV2.data && !advancedV2.data.available && <Notice>Advanced Options V2 resident integration is disabled. This page remains on the existing retained research path.</Notice>}
     {activeView === 'daily' && <div className="sd-toolbar">{tabs}</div>}
     {activeView === 'daily'
       ? <DetectorEvaluationPanel params={params} update={update} offset={offset} onSessionContext={setSessionContext} />

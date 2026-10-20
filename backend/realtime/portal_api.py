@@ -16,6 +16,11 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 from research.screening import Query as ScreeningQuery, SnapshotRowRequest, GapDetailRequest
 
 from .contracts import CANARY_UNIVERSE, EQUITY_VALIDATION_UNIVERSE
+from .advanced_options_api import (
+    AdvancedOptionsStoredProjectionRepository,
+    advanced_options_v2_disabled_payload,
+    advanced_options_v2_status_payload,
+)
 from .database_access import RealtimeDatabaseRole
 from .migrations import EXPECTED_DATABASE_NAME
 from .portal_compatibility_repository import (
@@ -52,6 +57,7 @@ class RealtimePortalRepositories:
     option_screener: RealtimeOptionScreenerRepository | None = None
     option_alert_views: RealtimeOptionsAlertsPageRepository | None = None
     daily_strategies: RealtimeDailyStrategyRepository | None = None
+    advanced_options: AdvancedOptionsStoredProjectionRepository | None = None
 
 
 def build_realtime_portal_repositories(
@@ -91,6 +97,9 @@ def build_realtime_portal_repositories(
         option_screener=RealtimeOptionScreenerRepository(cursor_factory, transaction_configured=True),
         option_alert_views=RealtimeOptionsAlertsPageRepository(cursor_factory, transaction_configured=True),
         daily_strategies=RealtimeDailyStrategyRepository(cursor_factory, transaction_configured=True),
+        advanced_options=AdvancedOptionsStoredProjectionRepository(
+            cursor_factory
+        ),
     )
 
 
@@ -286,6 +295,7 @@ def create_realtime_portal_app(
     *,
     clock: Callable[[], datetime] = _now,
     database_target: str = EXPECTED_DATABASE_NAME,
+    advanced_options_v2_enabled: bool = False,
 ) -> FastAPI:
     if not isinstance(repositories, RealtimePortalRepositories):
         raise TypeError("realtime portal repositories are invalid")
@@ -316,6 +326,37 @@ def create_realtime_portal_app(
             "canonical_fallback": False,
             "provider_fetch_performed": False,
         }
+
+    @app.get("/api/realtime/options-v2/status")
+    def advanced_options_v2_status():
+        return advanced_options_v2_status_payload(
+            enabled=advanced_options_v2_enabled,
+        )
+
+    @app.get(
+        "/api/realtime/options-v2/projections/{snapshot_type}"
+    )
+    def advanced_options_v2_projection(
+        snapshot_type: str,
+        cohort_id: UUID,
+    ):
+        if not advanced_options_v2_enabled:
+            return advanced_options_v2_disabled_payload(snapshot_type)
+        if repositories.advanced_options is None:
+            raise HTTPException(
+                503,
+                "Advanced Options V2 repository is unavailable",
+            )
+        try:
+            return repositories.advanced_options.read(
+                cohort_id=cohort_id,
+                snapshot_type=snapshot_type,
+                available_by=cutoff(),
+            )
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        except DatabaseError as error:
+            raise unavailable(error) from error
 
     @app.get("/api/equity/notification-window")
     def notification_window():

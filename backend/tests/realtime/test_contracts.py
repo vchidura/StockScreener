@@ -214,6 +214,46 @@ def test_option_universe_cannot_use_zero_quote_budget():
         _manifest(maximum_quotes=0)
 
 
+def test_options_feed_manifest_can_omit_equity_members():
+    universe = UniverseManifest(
+        version="options-only-feed-v1",
+        equity_tickers=("SPY", "QQQ"),
+        option_underlyings=("SPY", "QQQ"),
+    )
+    members = tuple(
+        SubscriptionMember(
+            AssetClass.OPTION,
+            contract,
+            underlyer,
+            channel,
+            catalog_version_id=index,
+        )
+        for index, (underlyer, contract) in enumerate(
+            (
+                ("SPY", "O:SPY261027C00768000"),
+                ("QQQ", "O:QQQ261027C00710000"),
+            ),
+            1,
+        )
+        for channel in (MarketChannel.TRADE, MarketChannel.QUOTE)
+    )
+
+    manifest = SubscriptionManifest(
+        version="options-only-feed-v1",
+        session_date=date(2026, 10, 20),
+        universe=universe,
+        capability_profile_sha256=HASH_A,
+        allocation_policy_sha256=HASH_B,
+        members=members,
+        maximum_option_quote_contracts=2,
+    )
+
+    assert not any(
+        member.asset_class is AssetClass.EQUITY
+        for member in manifest.members
+    )
+
+
 def test_subscription_manifest_rejects_trade_only_option_contract():
     members = list(_stock_members() + _option_members())
     members.pop()

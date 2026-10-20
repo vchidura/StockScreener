@@ -925,8 +925,7 @@ class AdvancedOptionsFlowPackageEvidenceBatch:
             key=lambda row: str(row.evaluation_id),
         ))
         if (
-            not rows
-            or any(row.dataset_id != self.dataset_id for row in rows)
+            any(row.dataset_id != self.dataset_id for row in rows)
             or len({row.evaluation_id for row in rows}) != len(rows)
             or any((
                 self.publication_authorized,

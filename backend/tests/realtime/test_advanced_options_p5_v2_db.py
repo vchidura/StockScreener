@@ -4,7 +4,7 @@ from __future__ import annotations
 import io
 import json
 from contextlib import closing, contextmanager, redirect_stdout
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -24,6 +24,7 @@ from realtime.advanced_options_cycle import (
     run_advanced_options_cycle,
 )
 from realtime.advanced_options_input import (
+    build_advanced_options_input_closure,
     build_advanced_options_input_gate_plan,
     reconstruct_options_input_ready_receipt,
 )
@@ -33,9 +34,35 @@ from realtime.advanced_options_projection import (
     persist_advanced_options_projection_cursor,
     read_advanced_options_projection_cursor,
 )
+from realtime.advanced_options_native_adapters import (
+    AdvancedOptionsLaneInputs,
+    AdvancedOptionsNativeInputBundle,
+)
+from realtime.advanced_options_package_evidence import (
+    build_flow_package_evidence_batch,
+)
+from realtime.advanced_options_postgres import (
+    AdvancedOptionsPostgresRuntimeScope,
+    PostgresAdvancedOptionsCanonicalRuntimePort,
+)
+from realtime.advanced_options_runtime import AdvancedOptionsInputStageData
+from realtime.advanced_options_producers import (
+    build_advanced_options_producer_plan,
+)
+from realtime.advanced_options_reference_repository import (
+    PostgresAdvancedOptionsReferenceStateRepository,
+)
+from realtime.advanced_options_rolling_repository import (
+    PostgresAdvancedOptionsRollingStateRepository,
+)
+from realtime.database_access_v2 import (
+    APP_ROLE as V2_APP_ROLE,
+    V2ConnectionProvider,
+)
 from realtime.database_access_v2 import V2AccessConfig, verify_pool_target_v2
 from realtime.materialization_jobs import (
     BarrierOutcome,
+    JobBarrierVerdict,
     enqueue_materialization_job_cursor,
     evaluate_job_barrier_cursor,
     open_job_barrier_cursor,
@@ -54,13 +81,23 @@ from realtime.option_slot_set import (
 from realtime.option_slot_set_repository import (
     persist_and_activate_slot_set_cursor,
 )
-from realtime.option_source_flow import persist_option_source_flow_cursor
+from realtime.option_discovery_repository import (
+    RealtimeOptionDiscoveryEvidence,
+    persist_realtime_option_discovery_cursor,
+)
+from realtime.option_discovery_scope import RealtimeOptionDiscoveryScope
+from realtime.option_source_flow import (
+    persist_option_contract_scope_cursor,
+    persist_option_flow_policy_cursor,
+    persist_option_source_flow_cursor,
+)
 from realtime.orchestration_repository import (
+    CycleReceiptSpec,
     OPTIONS_CYCLE,
     OPTIONS_INPUT_READY,
     OPTIONS_PORTAL_READY,
 )
-from realtime.preflight import DetectorFamily
+from realtime.preflight import DetectorFamily, ProviderTier
 from realtime.relation_registry import APP_ROLE, API_ROLE, ROLES
 from realtime.security_v2 import (
     build_role_names_v2,
@@ -79,6 +116,15 @@ from test_advanced_options_control_plane import (
 )
 from test_advanced_options_cycle import NOW, _complete, _reference_repository
 from test_advanced_options_input import EQUITY_WINDOW, WINDOW, _closure
+from test_advanced_options_producers import (
+    _clocks,
+    _discovery_scope,
+    _limits,
+)
+from advanced_options_reference_support import reference_state
+from advanced_options_rolling_support import rolling_state
+from test_option_discovery_repository import _result as _discovery_result
+from option_flow_support import advanced_contract_scope, advanced_policy
 from v2_database import _connect, _settings, requires_v2_database
 
 
@@ -276,7 +322,7 @@ def _seed_control_plane(database: P5Database) -> None:
             "VALUES (%s,%s,%s,%s,%s,%s,'MARKET_OPTIONS',2,1,2,%s)",
             (
                 str(control.manifest_id),
-                _digest(),
+                control.manifest_sha256,
                 control.universe.sha256,
                 SESSION,
                 PLANNED,
@@ -291,7 +337,7 @@ def _seed_control_plane(database: P5Database) -> None:
             "VALUES (%s,%s,%s,%s,%s,%s,%s,'SHADOW')",
             (
                 str(control.cohort_id),
-                _digest(),
+                control.cohort_sha256,
                 str(control.manifest_id),
                 CONFIGURATION_SHA256,
                 control.pins.model_bundle_sha256,
@@ -531,17 +577,23 @@ def _cycle_result():
     return control, gate, executors
 
 
-def test_p5_01_forward_migration_025_applies_once_on_024_baseline(
+def test_p5_01_forward_migrations_apply_once_on_024_baseline(
     p5_database,
 ):
     migration_025 = p5_database.migrations[-1]
+    current_migrations = load_realtime_migrations(V2_MIGRATIONS_DIR)
+    expected_applied = [
+        migration.version
+        for migration in current_migrations
+        if migration.sequence >= migration_025.sequence
+    ]
     assert migration_025.version == (
         "025_realtime_advanced_options_control_plane"
     )
     assert p5_database.staged_versions == tuple(
         migration.version for migration in p5_database.migrations[:-1]
     )
-    assert p5_database.resume_report["applied_now"] == [migration_025.version]
+    assert p5_database.resume_report["applied_now"] == expected_applied
     assert p5_database.replay_report["applied_now"] == []
     assert p5_database.resume_report["structure"]["failures"] == []
     with _transaction(p5_database, read_only=True) as cursor:
@@ -569,11 +621,17 @@ def test_p5_02_options_scope_slots_and_receipts_are_database_enforced(
         SlotSetMember(
             instrument_id,
             channel,
-            SlotSetPurpose.PRIMARY,
+            (
+                SlotSetPurpose.PRIMARY
+                if index == 0
+                else SlotSetPurpose.RESERVE
+            ),
             100,
             version_id,
         )
-        for _, version_id, instrument_id, _ in OPTION_CONTRACTS
+        for index, (_, version_id, instrument_id, _) in enumerate(
+            OPTION_CONTRACTS
+        )
         for channel in p5_database.control.feed_scope.channels
     )
     slot_set = SlotSetVersion(
@@ -743,6 +801,285 @@ def test_p5_02_options_scope_slots_and_receipts_are_database_enforced(
         assert cursor.fetchone() == ("OPTIONS", "T,Q")
 
 
+def test_p5_02b_postgres_port_reconstructs_exact_canonical_input(
+    p5_database,
+):
+    port_plan_id = UUID("22222222-3333-4444-5555-666666666666")
+    port_window_id = UUID("77777777-8888-9999-aaaa-bbbbbbbbbbbb")
+    slot_members = tuple(
+        SlotSetMember(
+            instrument_id,
+            channel,
+            (
+                SlotSetPurpose.PRIMARY
+                if index == 0
+                else SlotSetPurpose.RESERVE
+            ),
+            100,
+            version_id,
+        )
+        for index, (_, version_id, instrument_id, _) in enumerate(
+            OPTION_CONTRACTS
+        )
+        for channel in p5_database.control.feed_scope.channels
+    )
+    control = _control_plane(slot_members=slot_members)
+    base_result = _discovery_result()
+    discovery = RealtimeOptionDiscoveryEvidence(
+        RealtimeOptionDiscoveryScope(
+            ProviderTier.MASSIVE_ADVANCED,
+            control.profile_id,
+            control.profile_sha256,
+            control.universe,
+        ),
+        UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        replace(
+            base_result,
+            batch=replace(
+                base_result.batch,
+                underlyer="SPY",
+                scheduled_cycle=CUTOFF,
+                policy_sha256=control.manifest_policy.sha256,
+            ),
+        ),
+    )
+    flow_policy = advanced_policy()
+    contract_scope = replace(
+        advanced_contract_scope(
+            ("O:SPY261120C00500000",),
+            session_date=SESSION,
+            flow_policy=flow_policy,
+        ),
+        manifest_sha256=control.manifest_sha256,
+        slot_sha256=control.slot_set.member_sha256,
+    )
+    reference = reference_state(
+        contract_scope_sha256=contract_scope.sha256,
+    )
+    rolling = rolling_state(
+        cohort_id=control.cohort_id,
+        journal_generation=control.source_flow.journal_generation,
+    )
+    equity_receipt = CycleReceiptSpec(
+        "INPUT_READY",
+        CUTOFF,
+        reference.reference_generation,
+        control.universe.sha256,
+        "9" * 64,
+        "equity-build",
+    )
+    with _transaction(p5_database, APP_ROLE) as cursor:
+        cursor.execute(
+            "INSERT INTO rt.cohorts ("
+            "cohort_id,cohort_sha256,manifest_id,configuration_sha256,"
+            "model_bundle_sha256,valuation_sha256,effective_at,mode) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,'SHADOW')",
+            (
+                str(control.cohort_id),
+                control.cohort_sha256,
+                str(control.manifest_id),
+                CONFIGURATION_SHA256,
+                control.pins.model_bundle_sha256,
+                control.pins.valuation_policy_sha256,
+                PLANNED,
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO rt.service_plans ("
+            "plan_id,cohort_id,session_date,stage_catalog_version,"
+            "enabled_stages,config_sha256,deadline,scope_reference) "
+            "VALUES (%s,%s,%s,'stages_v1',ARRAY['REFERENCE'],%s,%s,%s)",
+            (
+                str(port_plan_id),
+                str(control.cohort_id),
+                SESSION,
+                CONFIGURATION_SHA256,
+                CUTOFF + timedelta(hours=2),
+                "advanced-options-postgres-port",
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO rt.window_runs ("
+            "window_id,plan_id,cohort_id,provider_tier,window_key,"
+            "release_at,cutoff,deadline) VALUES "
+            "(%s,%s,%s,'MASSIVE_ADVANCED',"
+            "'advanced-options-postgres-port',%s,%s,%s)",
+            (
+                str(port_window_id),
+                str(port_plan_id),
+                str(control.cohort_id),
+                CUTOFF + timedelta(minutes=1),
+                CUTOFF,
+                CUTOFF + timedelta(hours=1),
+            ),
+        )
+        persist_and_activate_slot_set_cursor(
+            cursor,
+            control.slot_set,
+            activated_at=PLANNED,
+        )
+        persist_option_flow_policy_cursor(cursor, flow_policy)
+        persist_option_contract_scope_cursor(cursor, contract_scope)
+        cursor.execute(
+            "SELECT rt.ensure_partitions(%s,%s)",
+            (
+                "rt.option_discovery_pages",
+                discovery.result.batch.completed_at.date(),
+            ),
+        )
+        persist_realtime_option_discovery_cursor(cursor, discovery)
+        cursor.execute(
+            "INSERT INTO rt.cycle_receipts ("
+            "receipt_id,window_id,cohort_id,receipt_kind,cutoff,"
+            "reference_generation,universe_sha256,input_sha256,build_id"
+            ") VALUES (%s,%s,%s,'INPUT_READY',%s,%s,%s,%s,%s)",
+            (
+                str(uuid4()),
+                str(port_window_id),
+                str(control.cohort_id),
+                equity_receipt.cutoff,
+                equity_receipt.reference_generation,
+                equity_receipt.universe_sha256,
+                equity_receipt.input_sha256,
+                equity_receipt.build_id,
+            ),
+        )
+
+    provider = V2ConnectionProvider(
+        {V2_APP_ROLE: p5_database.pool},
+        V2AccessConfig(
+            security_mode="hardened",
+            role_prefix=ROLE_PREFIX,
+            allow_disposable=True,
+        ),
+    )
+    provider.verify()
+    PostgresAdvancedOptionsReferenceStateRepository(provider).put(reference)
+    PostgresAdvancedOptionsRollingStateRepository(provider).put(rolling)
+    native = AdvancedOptionsNativeInputBundle(
+        o1=AdvancedOptionsLaneInputs(),
+        o3=AdvancedOptionsLaneInputs(),
+        s1=AdvancedOptionsLaneInputs(),
+        s2=AdvancedOptionsLaneInputs(),
+    )
+    scope = AdvancedOptionsPostgresRuntimeScope(
+        control_plane=control,
+        producer_plan=build_advanced_options_producer_plan(
+            control_plane=control,
+            discovery_scope=_discovery_scope(control),
+            provider_budget=control.provider_budget,
+            clocks=_clocks(control),
+            endpoint_response_byte_limits=_limits(),
+        ),
+        code_sha256="6" * 64,
+        native_inputs_loader=lambda _context: native,
+        evidence_builder=lambda cycle: build_flow_package_evidence_batch(
+            cycle,
+            (),
+        ),
+        close_data_loader=lambda _context, _projection: pytest.fail(
+            "input qualification attempted close"
+        ),
+    )
+    port = PostgresAdvancedOptionsCanonicalRuntimePort(provider, scope)
+    context = SimpleNamespace(
+        plan=SimpleNamespace(
+            cohort_id=control.cohort_id,
+            session_date=control.session_date,
+            config_sha256=CONFIGURATION_SHA256,
+        ),
+        window=SimpleNamespace(
+            window_id=port_window_id,
+            cutoff=CUTOFF,
+        ),
+    )
+
+    facts = port.load_input_facts(context)
+
+    assert facts.control_plane == control
+    assert facts.cycle_input.cohort_id == control.cohort_id
+    assert facts.cycle_input.slot_set_version == control.slot_set.version
+    assert facts.reference_state == reference
+    assert facts.rolling_state == rolling
+    assert facts.equity_input_receipt == equity_receipt
+    assert facts.instrument_ids == {"SPY": 101}
+
+    closure = build_advanced_options_input_closure(
+        control_plane=facts.control_plane,
+        producer_plan=facts.producer_plan,
+        cycle_input=facts.cycle_input,
+        reference_state=facts.reference_state,
+        rolling_state=facts.rolling_state,
+        reference_policy_sha256=facts.reference_policy_sha256,
+        oi_facts_sha256=facts.oi_facts_sha256,
+        market_state_checkpoint_sha256=(
+            facts.market_state_checkpoint_sha256
+        ),
+        flow_checkpoint_sha256=facts.flow_checkpoint_sha256,
+        unresolved_gaps_sha256=facts.unresolved_gaps_sha256,
+        market_state_heads_sha256=facts.market_state_heads_sha256,
+        equity_input_receipt_id=facts.equity_input_receipt_id,
+        equity_input_sha256=facts.equity_input_sha256,
+    )
+    gate = build_advanced_options_input_gate_plan(
+        closure,
+        window_id=port_window_id,
+        equity_window_id=facts.equity_window_id,
+        instrument_ids=facts.instrument_ids,
+        build_id="advanced-options-postgres-port-v1",
+        available_at=facts.available_at,
+    )
+    verdict = JobBarrierVerdict(
+        gate.barrier_id,
+        "COMPLETE",
+        len(gate.barrier_members),
+        tuple(row.member_key for row in gate.barrier_members),
+        (),
+        (),
+    )
+    input_stage = AdvancedOptionsInputStageData(
+        control,
+        gate,
+        verdict,
+        facts.reference_state.reference_generation,
+        "postgres-input",
+    )
+    options_receipt = CycleReceiptSpec(
+        OPTIONS_INPUT_READY,
+        CUTOFF,
+        facts.reference_state.reference_generation,
+        control.universe.sha256,
+        gate.closure_sha256,
+        "advanced-options-postgres-port-v1",
+    )
+    with _transaction(p5_database, APP_ROLE) as cursor:
+        cursor.execute(
+            "INSERT INTO rt.cycle_receipts ("
+            "receipt_id,window_id,cohort_id,receipt_kind,cutoff,"
+            "reference_generation,universe_sha256,input_sha256,build_id"
+            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                str(uuid4()),
+                str(port_window_id),
+                str(control.cohort_id),
+                options_receipt.receipt_kind,
+                options_receipt.cutoff,
+                options_receipt.reference_generation,
+                options_receipt.universe_sha256,
+                options_receipt.input_sha256,
+                options_receipt.build_id,
+            ),
+        )
+
+    cycle_facts = port.load_cycle_facts(context, input_stage)
+
+    assert cycle_facts.input_receipt == options_receipt
+    assert cycle_facts.native_inputs == native
+    assert cycle_facts.reference_repository.load_generation(
+        reference.reference_generation
+    ) == reference
+
+
 def test_p5_03_source_flow_lineage_is_idempotent_immutable_and_fk_bound(
     p5_database,
 ):
@@ -822,7 +1159,14 @@ def test_p5_03_source_flow_lineage_is_idempotent_immutable_and_fk_bound(
             "AND indexname='uq_rt_option_flow_event_source_policy'"
         )
         index = cursor.fetchone()[0]
-        assert "source_flow_id" in index and "lineage_version = 2" in index
+        assert all(
+            fragment in index
+            for fragment in (
+                "source_flow_id",
+                "lineage_version = ANY",
+                "ARRAY[2, 3, 4]",
+            )
+        )
 
 
 def test_p5_04_input_and_cycle_persist_under_hardened_app_role(p5_database):

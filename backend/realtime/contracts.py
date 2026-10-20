@@ -290,8 +290,10 @@ class SubscriptionManifest:
             ticker: set() for ticker in self.universe.equity_tickers
         }
         option_underlyings: set[str] = set()
+        has_equity_members = False
         for member in self.members:
             if member.asset_class is AssetClass.EQUITY:
+                has_equity_members = True
                 if member.underlying not in stock_channels:
                     raise ValueError("equity member is outside the universe")
                 stock_channels[member.underlying].add(member.channel)
@@ -299,7 +301,9 @@ class SubscriptionManifest:
                 if member.underlying not in self.universe.option_underlyings:
                     raise ValueError("option member is outside the option universe")
                 option_underlyings.add(member.underlying)
-        if any(not channels for channels in stock_channels.values()):
+        if has_equity_members and any(
+            not channels for channels in stock_channels.values()
+        ):
             raise ValueError("every equity requires at least one explicit channel")
         if option_underlyings != set(self.universe.option_underlyings):
             raise ValueError("every option underlying requires admitted contracts")

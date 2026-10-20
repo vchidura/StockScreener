@@ -114,6 +114,10 @@ def test_plan_freezes_exact_bounded_non_serving_scope(tmp_path):
         "031_realtime_advanced_journal_recovery",
     ]
     assert plan["evidence"]["files"] == list(EVIDENCE_FILES)
+    assert any(
+        row["path"] == "realtime/contracts.py"
+        for row in plan["source_bindings"]
+    )
     assert not any(plan["production_authority"].values())
     assert plan["provider_requests_authorized"] == 0
     assert plan["database_connections_authorized"] == 0

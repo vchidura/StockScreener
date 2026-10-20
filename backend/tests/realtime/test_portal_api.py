@@ -1,6 +1,8 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -91,6 +93,61 @@ def _app(*, missing_ticker=None):
 
 def _endpoint(app, path):
     return next(route.endpoint for route in app.routes if route.path == path)
+
+
+def test_advanced_options_projection_route_is_disabled_by_default():
+    advanced_options = MagicMock()
+    repositories = replace(
+        _repositories(),
+        advanced_options=advanced_options,
+    )
+    app = create_realtime_portal_app(
+        repositories,
+        clock=lambda: NOW,
+    )
+    endpoint = _endpoint(
+        app,
+        "/api/realtime/options-v2/projections/{snapshot_type}",
+    )
+
+    result = endpoint("OPTIONS_ALERTS", uuid4())
+
+    assert result["enabled"] is False
+    assert result["provider_fetch_performed"] is False
+    advanced_options.read.assert_not_called()
+
+
+def test_advanced_options_projection_route_reads_exact_enabled_cohort():
+    advanced_options = MagicMock()
+    advanced_options.read.return_value = {
+        "available": True,
+        "provider_fetch_performed": False,
+        "detector_work_performed": False,
+        "publication_performed": False,
+    }
+    repositories = replace(
+        _repositories(),
+        advanced_options=advanced_options,
+    )
+    cohort_id = uuid4()
+    app = create_realtime_portal_app(
+        repositories,
+        clock=lambda: NOW,
+        advanced_options_v2_enabled=True,
+    )
+    endpoint = _endpoint(
+        app,
+        "/api/realtime/options-v2/projections/{snapshot_type}",
+    )
+
+    result = endpoint("OPTIONS_ALERTS", cohort_id)
+
+    assert result["available"] is True
+    advanced_options.read.assert_called_once_with(
+        cohort_id=cohort_id,
+        snapshot_type="OPTIONS_ALERTS",
+        available_by=NOW,
+    )
 
 
 def _database(role):

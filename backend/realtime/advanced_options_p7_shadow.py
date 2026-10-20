@@ -49,6 +49,7 @@ SOURCE_BINDING_PATHS = (
     "realtime/advanced_options_control_plane.py",
     "realtime/advanced_options_p7_shadow.py",
     "realtime/advanced_options_p7_executor.py",
+    "realtime/contracts.py",
     "realtime/option_flow/consumer.py",
     "realtime/option_flow/engine.py",
     "realtime/option_flow/writer.py",

@@ -40,6 +40,7 @@ from options.stock_behavior_gates import (
 )
 from security_types import is_earnings_applicable_security_type
 from options.worker import OptionWorkerSettings
+from realtime.advanced_options_api import advanced_options_v2_disabled_payload
 
 
 DATA_TIER_LABEL = "15-MINUTE DELAYED RESEARCH DATA"
@@ -147,6 +148,39 @@ def _envelope(
         model_version=model_version,
         data=data,
     )
+
+
+def _advanced_options_v2_disabled(
+    snapshot_type: str | None = None,
+) -> OptionsEnvelope:
+    try:
+        data = advanced_options_v2_disabled_payload(snapshot_type)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=422,
+            detail=str(error),
+        ) from error
+    return _envelope(
+        available=False,
+        reason="ADVANCED_OPTIONS_V2_DISABLED",
+        model_version="advanced-options-v2-disabled",
+        data=data,
+    )
+
+
+@router.get("/advanced-v2/status", response_model=OptionsEnvelope)
+def advanced_options_v2_status() -> OptionsEnvelope:
+    return _advanced_options_v2_disabled()
+
+
+@router.get(
+    "/advanced-v2/projections/{snapshot_type}",
+    response_model=OptionsEnvelope,
+)
+def advanced_options_v2_projection(
+    snapshot_type: str,
+) -> OptionsEnvelope:
+    return _advanced_options_v2_disabled(snapshot_type)
 
 
 def _schema_available(cursor) -> bool:
