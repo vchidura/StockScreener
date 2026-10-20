@@ -25,7 +25,7 @@ from scripts import run_advanced_options_p7_shadow as live  # noqa: E402
 
 UTC = timezone.utc
 LIVE_AUTH_VERSION = "advanced-options-p7-live-execution-authorization-v1"
-LIVE_AUTH_REFERENCE = "ADVANCED-OPTIONS-P7-LIVE-20261020-01"
+LIVE_AUTH_REFERENCE = "ADVANCED-OPTIONS-P7-LIVE-20261020-02"
 
 
 def parser() -> argparse.ArgumentParser:

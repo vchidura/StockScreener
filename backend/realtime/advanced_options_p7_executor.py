@@ -74,6 +74,7 @@ _OPTION_PATTERN = re.compile(
 _INSTRUMENT_IDS = (1001, 1002)
 _CONTRACT_IDS = (101, 102)
 _VERSION_IDS = (201, 202)
+_JOURNAL_READ_LIMIT = 10_000
 
 
 def _timestamp(value: str) -> datetime:
@@ -95,6 +96,37 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
             handle.write(
                 json.dumps(row, sort_keys=True, default=str) + "\n"
             )
+
+
+def _read_bounded_journal(
+    reader: RawJournalReader,
+    *,
+    maximum_records: int,
+    normalized: bool,
+) -> tuple:
+    if type(maximum_records) is not int or maximum_records < 1:
+        raise ValueError("P7 journal read bound must be positive")
+    rows = []
+    offset = 0
+    method = (
+        reader.read_normalized_after
+        if normalized
+        else reader.read_after
+    )
+    offset_name = "event_offset" if normalized else "raw_offset"
+    while len(rows) < maximum_records:
+        limit = min(
+            _JOURNAL_READ_LIMIT,
+            maximum_records - len(rows),
+        )
+        batch = tuple(method(offset, limit=limit))
+        if not batch:
+            break
+        rows.extend(batch)
+        offset = int(getattr(batch[-1], offset_name))
+        if len(batch) < limit:
+            break
+    return tuple(rows)
 
 
 def _option_details(ticker: str) -> tuple[str, date, str, Decimal]:
@@ -402,10 +434,17 @@ async def capture_live_shadow(
             plan["application_bounds"]["final_drain_seconds"]
         )
     reader = RawJournalReader(journal_path)
-    raw = reader.read_after(0, limit=frame_ceiling + 1)
-    normalized = reader.read_normalized_after(
-        0,
-        limit=plan["socket_ceiling"]["decoded_market_messages"] + 1,
+    raw = _read_bounded_journal(
+        reader,
+        maximum_records=frame_ceiling + 1,
+        normalized=False,
+    )
+    normalized = _read_bounded_journal(
+        reader,
+        maximum_records=(
+            plan["socket_ceiling"]["decoded_market_messages"] + 1
+        ),
+        normalized=True,
     )
     snapshot = buffer.snapshot()
     event_counts = Counter(row.event_kind.value for row in normalized)

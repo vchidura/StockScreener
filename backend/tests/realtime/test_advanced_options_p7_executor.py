@@ -8,10 +8,12 @@ from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 from realtime.advanced_options_ingress import AdvancedOptionsJournalPump
 from realtime.advanced_options_p7_executor import (
+    _read_bounded_journal,
     _subscription_manifest,
     execute_shadow,
 )
@@ -131,6 +133,50 @@ def test_p7_subscription_manifest_is_options_only(tmp_path):
         ("QQQ", "T"),
         ("QQQ", "Q"),
     }
+
+
+def test_p7_journal_reads_chunk_at_the_reader_limit():
+    class Reader:
+        def __init__(self, count, offset_name):
+            self.rows = tuple(
+                SimpleNamespace(**{offset_name: index})
+                for index in range(1, count + 1)
+            )
+            self.limits = []
+            self.offset_name = offset_name
+
+        def _read(self, offset, *, limit):
+            assert 1 <= limit <= 10_000
+            self.limits.append(limit)
+            return tuple(
+                row for row in self.rows
+                if getattr(row, self.offset_name) > offset
+            )[:limit]
+
+        def read_after(self, offset, *, limit):
+            return self._read(offset, limit=limit)
+
+        def read_normalized_after(self, offset, *, limit):
+            return self._read(offset, limit=limit)
+
+    raw_reader = Reader(25_001, "raw_offset")
+    normalized_reader = Reader(30_001, "event_offset")
+
+    raw = _read_bounded_journal(
+        raw_reader,
+        maximum_records=25_001,
+        normalized=False,
+    )
+    normalized = _read_bounded_journal(
+        normalized_reader,
+        maximum_records=30_001,
+        normalized=True,
+    )
+
+    assert len(raw) == 25_001
+    assert raw_reader.limits == [10_000, 10_000, 5_001]
+    assert len(normalized) == 30_001
+    assert normalized_reader.limits == [10_000, 10_000, 10_000, 1]
 
 
 def test_executor_writes_all_evidence_and_cleans_owned_temporary_data(
