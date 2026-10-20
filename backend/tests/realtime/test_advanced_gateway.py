@@ -186,9 +186,13 @@ def test_gateway_auth_failure_is_blocked_and_never_admitted():
     buffer = _buffer()
     gateway = _gateway(MarketFeed.STOCKS, connection, buffer)
 
-    with pytest.raises(GatewayControlError, match="ADVANCED_AUTH_REJECTED"):
+    with pytest.raises(
+        GatewayControlError,
+        match="ADVANCED_AUTH_REJECTED:auth_failed",
+    ) as raised:
         asyncio.run(gateway.run_session(maximum_market_messages=1))
 
+    assert raised.value.statuses == ("auth_failed",)
     assert gateway.state is GatewayFeedState.BLOCKED
     assert buffer.snapshot().admitted_events == 0
 

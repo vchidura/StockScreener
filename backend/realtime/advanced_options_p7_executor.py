@@ -227,6 +227,7 @@ async def _run_attempt(
     )
     termination = "UNKNOWN"
     error_name = None
+    error_detail = None
     result = None
     try:
         while not task.done():
@@ -262,6 +263,7 @@ async def _run_attempt(
             except Exception as error:
                 termination = "PROVIDER_DISCONNECT"
                 error_name = type(error).__name__
+                error_detail = str(error)
     finally:
         await _cancel(task)
     ended = datetime.now(UTC)
@@ -276,6 +278,7 @@ async def _run_attempt(
         ),
         "termination": termination,
         "error_name": error_name,
+        "error_detail": error_detail,
         "received_frames": gateway.received_messages,
         "received_bytes": gateway.received_bytes,
         "accepted_frames": end_offset - start_offset,

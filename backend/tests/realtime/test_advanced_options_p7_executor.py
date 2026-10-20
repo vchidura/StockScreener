@@ -71,6 +71,7 @@ def _capture(plan, _api_key):
                 "received_frames": 4,
                 "received_bytes": 1024,
                 "termination": "DEADLINE",
+                "error_detail": None,
             }
         ],
         "telemetry": [

@@ -34,7 +34,22 @@ class GatewayFeedState(str, Enum):
 
 
 class GatewayControlError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        reason_code: str,
+        statuses: tuple[str, ...] = (),
+    ) -> None:
+        normalized = tuple(sorted({
+            status.strip().lower() for status in statuses if status.strip()
+        }))
+        self.reason_code = reason_code
+        self.statuses = normalized
+        detail = (
+            reason_code
+            if not normalized
+            else f"{reason_code}:{','.join(normalized)}"
+        )
+        super().__init__(detail)
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,7 +310,10 @@ class AdvancedGateway:
                 "max_connections",
             }:
                 self._set_state(GatewayFeedState.BLOCKED)
-                raise GatewayControlError(f"{failure_prefix}_REJECTED")
+                raise GatewayControlError(
+                    f"{failure_prefix}_REJECTED",
+                    tuple(statuses),
+                )
         self._set_state(GatewayFeedState.BLOCKED)
         raise GatewayControlError(f"{failure_prefix}_CONTROL_LIMIT_EXCEEDED")
 
