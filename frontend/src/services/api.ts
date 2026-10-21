@@ -2386,6 +2386,7 @@ export type OptionDetectorSort = 'triggered_at' | 'run' | 'underlyer' | 'detecto
 export interface AdvancedOptionsV2Status {
   version: 'advanced-options-v2-read-seam-v1'
   enabled: boolean
+  reason: string | null
   stage_catalog: 'stages_v4'
   snapshot_type: null
   provider_fetch_performed: false
@@ -2394,18 +2395,70 @@ export interface AdvancedOptionsV2Status {
   pointer_advanced: false
 }
 
-export const getAdvancedOptionsV2Status = async (): Promise<OptionsEnvelope<AdvancedOptionsV2Status>> =>
-  import.meta.env.VITE_REALTIME_OPTIONS_V2 === 'true'
-    ? (await api.get('/realtime/options-v2/status', { params: tickerParams() })).data
-    : (await api.get('/options/advanced-v2/status')).data
+export const getAdvancedOptionsV2Status = async (): Promise<AdvancedOptionsV2Status> => {
+  if (import.meta.env.VITE_REALTIME_OPTIONS_V2 === 'true') {
+    return (await api.get<AdvancedOptionsV2Status>('/realtime/options-v2/status', { params: tickerParams() })).data
+  }
+  const envelope = (await api.get<OptionsEnvelope<AdvancedOptionsV2Status>>('/options/advanced-v2/status')).data
+  return envelope.data
+}
 
 export type AdvancedOptionsV2ProjectionType = 'OPTIONS_FLOW' | 'OPTIONS_SCREENER' | 'OPTIONS_ALERTS' | 'OPTIONS_MARKS'
 
-export const getAdvancedOptionsV2Projection = async (snapshotType: AdvancedOptionsV2ProjectionType) => {
+export interface AdvancedOptionsV2AlertLane {
+  detector: string
+  state: string
+  reason_codes: string[]
+  outcome_sha256: string
+}
+
+export interface AdvancedOptionsV2AlertEvaluation {
+  evaluation_id: string
+  event_id: string
+  detector: string
+  underlyer: string
+  selection_status: string
+  observed_at: string
+  payload_sha256: string
+  payload: Record<string, unknown>
+  candidate_id: string | null
+}
+
+export interface AdvancedOptionsV2AlertsData {
+  status: string
+  lanes: AdvancedOptionsV2AlertLane[]
+  evaluations: AdvancedOptionsV2AlertEvaluation[]
+  production_authorized: false
+  delivery_authorized: false
+}
+
+export interface AdvancedOptionsV2AlertsProjection {
+  available: boolean
+  reason: string | null
+  cohort_id: string
+  snapshot_type: 'OPTIONS_ALERTS'
+  snapshot_id?: string
+  generated_at?: string
+  release_id?: string
+  release_cutoff?: string
+  release_manifest_sha256?: string
+  provider_fetch_performed: false
+  detector_work_performed: false
+  publication_performed: false
+  advanced_options_v2_enabled?: true
+  data: AdvancedOptionsV2AlertsData | null
+}
+
+export const getAdvancedOptionsV2Projection = async (
+  snapshotType: AdvancedOptionsV2ProjectionType,
+): Promise<AdvancedOptionsV2AlertsProjection> => {
   if (import.meta.env.VITE_REALTIME_OPTIONS_V2 !== 'true') {
     throw new Error('Advanced Options V2 stored reads are disabled')
   }
-  return (await api.get(`/realtime/options-v2/projections/${snapshotType}`, { params: tickerParams() })).data
+  return (await api.get<AdvancedOptionsV2AlertsProjection>(
+    `/realtime/options-v2/projections/${snapshotType}`,
+    { params: tickerParams() },
+  )).data
 }
 
 export interface OptionDetectorDatasets {

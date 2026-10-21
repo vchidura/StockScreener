@@ -17,6 +17,11 @@ test('Options Activity and Flow keep the original pages and explicit unavailable
   assert.match(flow, /No complete analyzed option matrices were retained/)
   assert.match(flow, /new URLSearchParams\(current\)/)
   assert.doesNotMatch(activity + flow, /realtime\/option-alerts/)
+  assert.doesNotMatch(activity + flow, /AdvancedOptionsV2|getAdvancedOptionsV2Projection/)
+  assert.match(activity, /<TickerBoard rows=\{data\.underlyers\}/)
+  assert.match(flow, /className="flow-summary"/)
+  assert.match(flow, /<ExpiryProfile rows=\{data\.expirations\}/)
+  assert.match(flow, /<StrikeProfile rows=\{strikeRows\}/)
 })
 
 test('Options Flow requests preserve realtime cohort identity without canonical fallback', async () => {

@@ -181,18 +181,22 @@ def test_option_gateway_uses_explicit_contract_trade_and_quote_membership():
     assert not any("*" in item for item in subscriptions)
 
 
-def test_gateway_auth_failure_is_blocked_and_never_admitted():
-    connection = FakeConnection((_status("connected"), _status("auth_failed")))
+@pytest.mark.parametrize("status", ("auth_failed", "max_connections"))
+def test_gateway_auth_failure_is_blocked_and_never_admitted(status):
+    connection = FakeConnection((_status("connected"), _status(status)))
     buffer = _buffer()
     gateway = _gateway(MarketFeed.STOCKS, connection, buffer)
 
     with pytest.raises(
         GatewayControlError,
-        match="ADVANCED_AUTH_REJECTED:auth_failed",
+        match=rf"ADVANCED_AUTH_REJECTED:{status}",
     ) as raised:
         asyncio.run(gateway.run_session(maximum_market_messages=1))
 
-    assert raised.value.statuses == ("auth_failed",)
+    assert raised.value.statuses == (status,)
+    assert raised.value.provider_messages == (
+        (status,) if status == "max_connections" else ()
+    )
     assert gateway.state is GatewayFeedState.BLOCKED
     assert buffer.snapshot().admitted_events == 0
 

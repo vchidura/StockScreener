@@ -325,6 +325,211 @@ services:
       retries: 4
       start_period: 20s
 
+  realtime-v2-options-p8-ingress:
+    <<: *backend-service
+    profiles: ["realtime-v2-options-p8"]
+    container_name: stock-screener-realtime-v2-options-p8-ingress
+    restart: "no"
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - options-p8-ingress
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --provider-key-file
+      - /run/secrets/realtime_v2_provider_key
+      - --
+      - python
+      - -B
+      - scripts/run_advanced_options_p8_canary.py
+      - --docker-service-kind
+      - INGRESS
+      - --package
+      - /run/advanced-options-p8/package.json
+      - --execution-bundle
+      - /run/advanced-options-p8/execution-bundle.json
+    environment:
+      REALTIME_V2_EQUITY_PIPELINE: DISABLED
+      REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
+    secrets:
+      - realtime_v2_app_dsn
+      - realtime_v2_provider_key
+    volumes:
+      - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
+      - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
+      - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
+      - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_advanced_options_p8_canary.py
+        - --docker-health-kind
+        - INGRESS
+        - --package
+        - /run/advanced-options-p8/package.json
+        - --execution-bundle
+        - /run/advanced-options-p8/execution-bundle.json
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  realtime-v2-options-p8-market-state:
+    <<: *backend-service
+    profiles: ["realtime-v2-options-p8"]
+    container_name: stock-screener-realtime-v2-options-p8-market-state
+    restart: "no"
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - options-p8-market-state
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --
+      - python
+      - -B
+      - scripts/run_advanced_options_p8_canary.py
+      - --docker-service-kind
+      - MARKET_STATE
+      - --package
+      - /run/advanced-options-p8/package.json
+      - --execution-bundle
+      - /run/advanced-options-p8/execution-bundle.json
+    environment:
+      REALTIME_V2_EQUITY_PIPELINE: DISABLED
+      REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
+    secrets:
+      - realtime_v2_app_dsn
+    volumes:
+      - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
+      - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
+      - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
+      - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_advanced_options_p8_canary.py
+        - --docker-health-kind
+        - MARKET_STATE
+        - --package
+        - /run/advanced-options-p8/package.json
+        - --execution-bundle
+        - /run/advanced-options-p8/execution-bundle.json
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  realtime-v2-options-p8-flow:
+    <<: *backend-service
+    profiles: ["realtime-v2-options-p8"]
+    container_name: stock-screener-realtime-v2-options-p8-flow
+    restart: "no"
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - options-p8-flow
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --
+      - python
+      - -B
+      - scripts/run_advanced_options_p8_canary.py
+      - --docker-service-kind
+      - FLOW
+      - --package
+      - /run/advanced-options-p8/package.json
+      - --execution-bundle
+      - /run/advanced-options-p8/execution-bundle.json
+    environment:
+      REALTIME_V2_EQUITY_PIPELINE: DISABLED
+      REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
+    secrets:
+      - realtime_v2_app_dsn
+    volumes:
+      - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
+      - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
+      - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
+      - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_advanced_options_p8_canary.py
+        - --docker-health-kind
+        - FLOW
+        - --package
+        - /run/advanced-options-p8/package.json
+        - --execution-bundle
+        - /run/advanced-options-p8/execution-bundle.json
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  realtime-v2-options-p8-window:
+    <<: *backend-service
+    profiles: ["realtime-v2-options-p8"]
+    container_name: stock-screener-realtime-v2-options-p8-window
+    restart: "no"
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - options-p8-window
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --
+      - python
+      - -B
+      - scripts/run_advanced_options_p8_canary.py
+      - --docker-service-kind
+      - WINDOW
+      - --package
+      - /run/advanced-options-p8/package.json
+      - --execution-bundle
+      - /run/advanced-options-p8/execution-bundle.json
+    environment:
+      REALTIME_V2_EQUITY_PIPELINE: DISABLED
+      REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
+    secrets:
+      - realtime_v2_app_dsn
+    volumes:
+      - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
+      - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
+      - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_advanced_options_p8_canary.py
+        - --docker-health-kind
+        - WINDOW
+        - --package
+        - /run/advanced-options-p8/package.json
+        - --execution-bundle
+        - /run/advanced-options-p8/execution-bundle.json
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
   realtime-v2-retention:
     <<: *backend-service
     profiles: ["realtime-v2-retention"]
@@ -376,7 +581,11 @@ services:
       - --partition-relation
       - rt.option_flow_events
       - --partition-relation
+      - rt.option_flow_event_profiles
+      - --partition-relation
       - rt.option_flow_clusters
+      - --partition-relation
+      - rt.option_flow_cluster_members
       - --retention-relation
       - rt.raw_payloads
       - --retention-relation
@@ -404,7 +613,11 @@ services:
       - --archive-relation
       - rt.option_flow_events
       - --archive-relation
+      - rt.option_flow_event_profiles
+      - --archive-relation
       - rt.option_flow_clusters
+      - --archive-relation
+      - rt.option_flow_cluster_members
       - --archive-kind
       - STOCK_ALERTS
       - --archive-kind

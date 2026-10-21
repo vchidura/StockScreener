@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import json
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
@@ -15,8 +16,14 @@ from realtime.advanced_options_p7_shadow import (
     OWNER_DECISION,
     approved_authorization,
     build_authorization,
+    build_live_authorization,
     provider_free_preflight,
     validate_authorization,
+)
+from realtime.advanced_options_p7_selection import (
+    P7TransportCandidate,
+    p7_transport_selection_payload,
+    select_p7_transport_contracts,
 )
 
 
@@ -24,10 +31,43 @@ UTC = timezone.utc
 START = datetime(2026, 10, 20, 13, 35, tzinfo=UTC)
 RUN_ID = UUID("77777777-7777-7777-7777-777777777777")
 HEAD = "89b6c1b142b411cc57c519ce2de57543311a1b48"
-SPY = "O:SPY261120C00500000"
-QQQ = "O:QQQ261120C00500000"
+SPY = "O:SPY261020C00100000"
+QQQ = "O:QQQ261020P00100000"
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 script = importlib.import_module("scripts.prepare_advanced_options_p7_shadow")
+live_script = importlib.import_module(
+    "scripts.prepare_advanced_options_p7_live_authorization"
+)
+
+
+def _selection(spy_contract, qqq_contract):
+    candidates = tuple(
+        P7TransportCandidate(
+            contract_ticker=contract,
+            underlyer=underlyer,
+            expiration_date=START.date(),
+            option_type=option_type,
+            strike=Decimal("100"),
+            spot=Decimal("100"),
+            bid=Decimal("1.00"),
+            ask=Decimal("1.10"),
+            day_volume=500,
+            open_interest=1_000,
+            calendar_dte=0,
+            market_data_time=START - timedelta(minutes=1),
+            source_sha256=source,
+        )
+        for contract, underlyer, option_type, source in (
+            (spy_contract, "SPY", "C", "1" * 64),
+            (qqq_contract, "QQQ", "P", "2" * 64),
+        )
+    )
+    return p7_transport_selection_payload(
+        select_p7_transport_contracts(
+            candidates,
+            reviewed_at=START - timedelta(seconds=30),
+        )
+    )
 
 
 def _plan(tmp_path, **changes):
@@ -42,11 +82,29 @@ def _plan(tmp_path, **changes):
         "stop_at": START + timedelta(minutes=10),
         "spy_contract": SPY,
         "qqq_contract": QQQ,
+        "contract_selection": None,
         "backend_dir": BACKEND_DIR,
         "artifact_root": tmp_path,
     }
     values.update(changes)
+    if values["contract_selection"] is None:
+        try:
+            values["contract_selection"] = _selection(
+                values["spy_contract"],
+                values["qqq_contract"],
+            )
+        except ValueError:
+            values["contract_selection"] = _selection(SPY, QQQ)
     return build_authorization(**values)
+
+
+def _selection_file(tmp_path):
+    path = tmp_path / "selection.json"
+    path.write_text(
+        json.dumps(_selection(SPY, QQQ), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return path
 
 
 def _approved_files(tmp_path, plan):
@@ -68,7 +126,7 @@ def _approved_files(tmp_path, plan):
                 ],
                 "owner_decision": OWNER_DECISION,
                 "conditional_live_shadow_authorized": True,
-                "provider_websocket_connection_attempts_authorized": 2,
+                "provider_websocket_connection_attempts_authorized": 6,
                 "provider_rest_requests_authorized": 0,
                 "production_effects_authorized": False,
             },
@@ -94,8 +152,15 @@ def test_plan_freezes_exact_bounded_non_serving_scope(tmp_path):
         f"T.{QQQ}",
         f"Q.{QQQ}",
     ]
-    assert plan["socket_ceiling"]["connection_attempts"] == 2
-    assert plan["socket_ceiling"]["reconnects"] == 1
+    assert plan["socket_ceiling"]["connection_attempts"] == 6
+    assert plan["socket_ceiling"]["reconnects"] == 5
+    assert plan["socket_ceiling"]["reconnect_backoff"] == {
+        "initial_seconds": 5,
+        "minimum_seconds": 5,
+        "multiplier": 2,
+        "maximum_seconds": 60,
+        "jitter_ceiling_seconds": 60,
+    }
     assert plan["database"]["name"] == (
         "test_realtime_v2_options_p7_20261020"
     )
@@ -164,7 +229,7 @@ def test_exact_approval_binds_raw_manifest_and_owner_decision(tmp_path):
     ) == plan
 
     content = json.loads(approval.read_text(encoding="utf-8"))
-    content["provider_websocket_connection_attempts_authorized"] = 3
+    content["provider_websocket_connection_attempts_authorized"] = 7
     approval.write_text(json.dumps(content), encoding="utf-8")
     with pytest.raises(ValueError, match="exact conditional owner approval"):
         approved_authorization(
@@ -172,6 +237,38 @@ def test_exact_approval_binds_raw_manifest_and_owner_decision(tmp_path):
             approval,
             backend_dir=BACKEND_DIR,
         )
+
+
+def test_live_authorization_generator_binds_exact_approved_scope(tmp_path):
+    plan = _plan(tmp_path)
+    manifest, approval = _approved_files(tmp_path, plan)
+    output = tmp_path / "live-authorization.json"
+
+    assert live_script.main([
+        "--manifest",
+        str(manifest),
+        "--approval",
+        str(approval),
+        "--output",
+        str(output),
+    ]) == 0
+
+    authorization = json.loads(output.read_text(encoding="utf-8"))
+    expected = build_live_authorization(
+        plan,
+        manifest_sha256=hashlib.sha256(
+            manifest.read_bytes()
+        ).hexdigest(),
+        approval_sha256=hashlib.sha256(
+            approval.read_bytes()
+        ).hexdigest(),
+        authorized_at=datetime.fromisoformat(
+            authorization["authorized_at_utc"]
+        ),
+    )
+    assert authorization == expected
+    assert authorization["provider_scope"]["connection_attempts"] == 6
+    assert authorization["provider_scope"]["lease_scope"] == "HOST_LOCAL"
 
 
 def test_manifest_mutation_or_extra_approval_field_fails(tmp_path):
@@ -266,6 +363,7 @@ def test_plan_cli_prints_only_and_exposes_no_execute_action(
     monkeypatch,
     capsys,
 ):
+    selection = _selection_file(tmp_path)
     monkeypatch.setattr(
         script,
         "provider_free_preflight",
@@ -290,6 +388,8 @@ def test_plan_cli_prints_only_and_exposes_no_execute_action(
             SPY,
             "--qqq-contract",
             QQQ,
+            "--contract-selection",
+            str(selection),
             "--artifact-root",
             str(tmp_path),
         ]
@@ -308,6 +408,7 @@ def test_plan_cli_create_exclusively_persists_the_exact_manifest(
     capsys,
 ):
     manifest = tmp_path / "authorization.json"
+    selection = _selection_file(tmp_path)
     arguments = [
         "plan",
         "--run-id",
@@ -326,6 +427,8 @@ def test_plan_cli_create_exclusively_persists_the_exact_manifest(
         SPY,
         "--qqq-contract",
         QQQ,
+        "--contract-selection",
+        str(selection),
         "--artifact-root",
         str(tmp_path / "evidence"),
         "--manifest-path",

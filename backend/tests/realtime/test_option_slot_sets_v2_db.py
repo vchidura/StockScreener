@@ -7,15 +7,35 @@ persistence and `persist_option_manifest_selection` end to end and reads the act
 from __future__ import annotations
 
 import itertools
+from contextlib import closing
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
 from psycopg2 import errors
+from psycopg2 import sql
 from psycopg2.extras import execute_values
 
+from advanced_options_reference_support import reference_state
+from realtime.advanced_equity_control_plane import (
+    build_advanced_equity_control_plane_plan,
+    persist_advanced_equity_control_plane_cursor,
+)
+from realtime.advanced_options_control_plane import (
+    ADVANCED_OPTIONS_CHANNELS,
+    ADVANCED_OPTIONS_REST_LANES,
+    AdvancedOptionsFeedScope,
+    AdvancedOptionsOwnerNames,
+    AdvancedOptionsPolicyPins,
+    AdvancedOptionsReceiptInputs,
+    AdvancedOptionsSocketBudget,
+    build_advanced_options_control_plane_plan,
+    build_advanced_options_enrollment_plan,
+    persist_advanced_options_enrollment_cursor,
+)
 from realtime.contracts import MarketChannel, UniverseManifest
 from realtime.option_manifest_repository import (
     option_manifest_selection_id,
@@ -24,8 +44,11 @@ from realtime.option_manifest_repository import (
 )
 from realtime.option_pre_session_target import persist_option_pre_session_package_cursor
 from realtime.option_session_manifest import (
+    BoundedOptionManifestPolicy,
     ContractSelectionStatus,
     ManifestSelectionStatus,
+    OptionActivityContract,
+    OptionActivitySelectionRecord,
     build_bounded_option_session_manifest,
 )
 from realtime.option_slot_set import (
@@ -43,7 +66,17 @@ from realtime.option_slot_set_repository import (
     persist_and_activate_slot_set,
     persist_slot_set_version_cursor,
 )
-from realtime.preflight import ProviderTier
+from realtime.preflight import (
+    DetectorFamily,
+    ProductEntitlementProfile,
+    ProviderTier,
+)
+from realtime.provider_budget import ProviderBudgetScope
+from realtime.security_v2 import (
+    build_role_names_v2,
+    drop_disposable_roles_v2,
+    harden_database_v2,
+)
 from tests.realtime.test_option_pre_session_producer import _packages, _security_id
 from tests.realtime.test_option_session_manifest import (
     MARKET_TIME,
@@ -53,6 +86,8 @@ from tests.realtime.test_option_session_manifest import (
     _scope,
 )
 from tests.realtime.v2_database import (
+    _connect,
+    _settings,
     disposable_v2_database,
     insert_cohort,
     requires_v2_database,
@@ -559,3 +594,380 @@ def test_a_refresh_keeps_the_manifest_and_cohort_and_moves_only_the_pointer(pool
         with cursor(pool) as database_cursor:
             activate_slot_set_cursor(database_cursor, pre_session.cohort_id, 1,
                                      activated_at=pre_session.effective_at + timedelta(hours=1))
+
+
+@contextmanager
+def _role_cursor(pool, role_name):
+    connection_value = pool.getconn()
+    try:
+        with connection_value:
+            with connection_value.cursor() as database_cursor:
+                database_cursor.execute(
+                    sql.SQL("SET LOCAL ROLE {}").format(
+                        sql.Identifier(role_name)
+                    )
+                )
+                yield database_cursor
+    finally:
+        pool.putconn(connection_value)
+
+
+def _owp4_enrollment(
+    pool,
+    *,
+    flow_policy_sha256="2" * 64,
+    condition_semantics_sha256="1" * 64,
+    security_free_float=None,
+    provider_request_ceiling=1,
+    provider_decoded_byte_ceiling=1,
+    valuation_policy_sha256="3" * 64,
+    activity_valid_until=None,
+    session=None,
+    checked=None,
+    planned=None,
+    cutoff=None,
+    expires=None,
+):
+    custom_clocks = any(
+        value is not None
+        for value in (session, checked, planned, cutoff, expires)
+    )
+    session = session or date(2026, 10, 16)
+    checked = checked or datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
+    planned = planned or datetime(2026, 10, 16, 13, 0, tzinfo=UTC)
+    cutoff = cutoff or datetime(2026, 10, 16, 14, 30, tzinfo=UTC)
+    expires = expires or datetime(2026, 10, 16, 23, 0, tzinfo=UTC)
+    security_ids = {"AAPL": uuid4(), "SPY": uuid4()}
+    catalog_payload_sha256 = _digest()
+    contract_id = 9_100_001
+    version_id = 14_100_001
+    with cursor(pool) as database_cursor:
+        for ticker, security_id in security_ids.items():
+            database_cursor.execute(
+                "INSERT INTO ref.securities ("
+                "security_id,asset_type,source_origin,created_at) "
+                "VALUES (%s,'STOCK','owp4-fixture',%s)",
+                (str(security_id), checked - timedelta(days=10)),
+            )
+            database_cursor.execute(
+                "INSERT INTO ref.security_revisions ("
+                "revision_id,security_id,ticker,calendar_id,"
+                "effective_from,observed_at,payload_sha256,free_float) VALUES ("
+                "%s,%s,%s,'XNYS',%s,%s,%s,%s)",
+                (
+                    str(uuid4()),
+                    str(security_id),
+                    ticker,
+                    checked - timedelta(days=9),
+                    checked - timedelta(days=9),
+                    _digest(),
+                    (
+                        security_free_float
+                        if ticker == "SPY"
+                        else None
+                    ),
+                ),
+            )
+        equity = build_advanced_equity_control_plane_plan(
+            session_date=session,
+            security_ids=security_ids,
+            entitlement_evidence_sha256="a" * 64,
+            authorization_reference="owp4-equity-source",
+            checked_at=checked,
+            expires_at=expires,
+            schema_sha256="b" * 64,
+            security_policy_sha256="c" * 64,
+        )
+        persist_advanced_equity_control_plane_cursor(
+            database_cursor,
+            equity,
+        )
+        database_cursor.execute(
+            "INSERT INTO ref.option_contracts ("
+            "contract_id,underlying_security_id,provider,contract_ticker,"
+            "first_observed_at,source_origin) VALUES ("
+            "%s,%s,'massive','O:SPY261120C00500000',%s,'owp4-fixture')",
+            (contract_id, str(security_ids["SPY"]), checked),
+        )
+        database_cursor.execute(
+            "INSERT INTO ref.option_contract_versions ("
+            "version_id,contract_id,call_put,expiration,strike,"
+            "exercise_style,multiplier,deliverables,eligibility,"
+            "effective_from,observed_at,payload_sha256) VALUES ("
+            "%s,%s,'C','2026-11-20',500,'AMERICAN',100,'[]'::jsonb,"
+            "'VALIDATED_ACTIVE',%s,%s,%s)",
+            (
+                version_id,
+                contract_id,
+                checked,
+                planned - timedelta(minutes=3),
+                catalog_payload_sha256,
+            ),
+        )
+        database_cursor.execute(
+            "INSERT INTO rt.instruments (asset_class,contract_id) "
+            "VALUES ('OPTION',%s) RETURNING instrument_id",
+            (contract_id,),
+        )
+        instrument_id = int(database_cursor.fetchone()[0])
+    policy = BoundedOptionManifestPolicy(
+        version="owp4-primary-activity-v1",
+        target_dtes=(21,),
+        maximum_target_dte_deviation=0,
+        strikes_per_side_per_expiry=1,
+        minimum_dte=0,
+        maximum_dte=60,
+        strike_corridor_fraction=Decimal("0.20"),
+        minimum_day_volume=100,
+        minimum_open_interest=100,
+        maximum_contracts_per_underlying=2,
+        maximum_option_quote_contracts=2,
+        reserved_option_quote_contracts=0,
+        required_detectors=(
+            DetectorFamily.S1,
+            DetectorFamily.S2,
+            DetectorFamily.O1,
+            DetectorFamily.O2,
+            DetectorFamily.O3,
+        ),
+    )
+    pins = AdvancedOptionsPolicyPins(
+        condition_semantics_sha256=condition_semantics_sha256,
+        flow_policy_sha256=flow_policy_sha256,
+        valuation_policy_sha256=valuation_policy_sha256,
+        model_bundle_sha256="4" * 64,
+        catalog_sha256="5" * 64,
+        slot_set_policy_sha256="6" * 64,
+    )
+    slot_members = tuple(
+        SlotSetMember(
+            instrument_id,
+            channel,
+            SlotSetPurpose.PRIMARY,
+            100,
+            version_id,
+        )
+        for channel in ADVANCED_OPTIONS_CHANNELS
+    )
+    state = (
+        reference_state(
+            session_date=session,
+            known_at=checked,
+            valid_until=expires,
+        )
+        if custom_clocks
+        else reference_state()
+    )
+    control = build_advanced_options_control_plane_plan(
+        equity_plan=equity,
+        entitlement=ProductEntitlementProfile(
+            ProviderTier.MASSIVE_ADVANCED,
+            ProviderTier.MASSIVE_ADVANCED,
+        ),
+        option_underlyings=("SPY",),
+        options_entitlement_evidence_sha256="0" * 64,
+        options_authorization_reference="owp4-options-scope",
+        checked_at=checked,
+        expires_at=expires,
+        planned_at=planned,
+        manifest_policy=policy,
+        slot_members=slot_members,
+        slot_effective_at=planned,
+        feed_scope=AdvancedOptionsFeedScope(),
+        pins=pins,
+        socket_budget=AdvancedOptionsSocketBudget(
+            stream_sessions=1,
+            connection_attempts=1,
+            reconnects=0,
+            decoded_messages=1,
+            decoded_bytes=1,
+        ),
+        provider_budget=ProviderBudgetScope(
+            account_alias="MASSIVE_ADVANCED",
+            session_date=session,
+            authorization_reference="owp4-options-scope",
+            provider_authorization_reference="external-selection-only",
+            expected_cost="zero provider calls by enrollment",
+            request_ceiling=provider_request_ceiling,
+            decoded_byte_ceiling=provider_decoded_byte_ceiling,
+            lanes=ADVANCED_OPTIONS_REST_LANES,
+            authorized_until=expires,
+        ),
+        owners=AdvancedOptionsOwnerNames(),
+        journal_generation=uuid4(),
+        stream_session_ids=(uuid4(),),
+        receipt_inputs=AdvancedOptionsReceiptInputs(
+            cutoff=cutoff,
+            reference_state=state,
+            equity_input_receipt_id=uuid4(),
+            equity_input_sha256="7" * 64,
+            discovery_batches_sha256="8" * 64,
+            open_interest_sha256=state.open_interest_sha256,
+            consumer_checkpoints_sha256="9" * 64,
+            unresolved_gaps_sha256="a" * 64,
+            market_state_sha256="b" * 64,
+            source_clocks_sha256="c" * 64,
+            detector_outcomes_sha256="d" * 64,
+            projection_sha256="e" * 64,
+            build_id="owp4-disposable",
+        ),
+    )
+    selection = OptionActivitySelectionRecord(
+        authorization_reference="owp4-external-activity-selection",
+        reviewed_at=planned - timedelta(minutes=1),
+        valid_until=(
+            planned + timedelta(minutes=2)
+            if activity_valid_until is None
+            else activity_valid_until
+        ),
+        policy_sha256="f" * 64,
+        source_sha256="e" * 64,
+        quote_ceiling=2,
+        contracts=(
+            OptionActivityContract(
+                instrument_id=instrument_id,
+                contract_id=contract_id,
+                catalog_version_id=version_id,
+                contract_ticker="O:SPY261120C00500000",
+                underlyer="SPY",
+                call_put="C",
+                expiration_date=date(2026, 11, 20),
+                strike=Decimal("500"),
+                exercise_style="AMERICAN",
+                multiplier=Decimal("100"),
+                deliverables=(),
+                eligibility="VALIDATED_ACTIVE",
+                catalog_effective_from=checked,
+                catalog_effective_to=None,
+                catalog_observed_at=planned - timedelta(minutes=3),
+                catalog_payload_sha256=catalog_payload_sha256,
+                market_data_time=planned - timedelta(minutes=2),
+                source_sha256="d" * 64,
+            ),
+        ),
+    )
+    return build_advanced_options_enrollment_plan(
+        control_plane=control,
+        equity_plan=equity,
+        activity_selection=selection,
+    )
+
+
+def _prohibited_effect_counts(database_cursor):
+    relations = (
+        "rt.stream_sessions",
+        "rt.provider_request_ledger",
+        "rt.service_plans",
+        "rt.window_runs",
+        "rt.stage_runs",
+        "rt.cycle_receipts",
+        "rt.release_current",
+        "rt.alert_outbox",
+        "rt.portal_releases",
+        "rt.portal_release_current",
+        "rt.archive_segments",
+        "rt.session_archives",
+    )
+    counts = {}
+    for relation in relations:
+        database_cursor.execute(f"SELECT count(*) FROM {relation}")
+        counts[relation] = int(database_cursor.fetchone()[0])
+    return counts
+
+
+def test_owp4_enrollment_is_idempotent_hardened_and_zero_effect():
+    suffix = uuid4().hex[:8]
+    database = f"test_realtime_v2_owp4_{suffix}"
+    roles = build_role_names_v2(f"test_rt_owp4_{suffix}")
+    roles_owned = False
+    try:
+        with disposable_v2_database(database) as database_pool:
+            enrollment = _owp4_enrollment(database_pool)
+            connection_value = database_pool.getconn()
+            try:
+                created, audit = harden_database_v2(
+                    connection_value,
+                    roles,
+                )
+                roles_owned = True
+                assert len(created) == 3
+                assert all(
+                    status.startswith("PASS") for _, status in audit
+                )
+            finally:
+                database_pool.putconn(connection_value)
+            with _role_cursor(
+                database_pool,
+                roles.name("admin"),
+            ) as database_cursor:
+                effects_before = _prohibited_effect_counts(database_cursor)
+                assert persist_advanced_options_enrollment_cursor(
+                    database_cursor,
+                    enrollment,
+                ) is True
+            with _role_cursor(
+                database_pool,
+                roles.name("admin"),
+            ) as database_cursor:
+                assert persist_advanced_options_enrollment_cursor(
+                    database_cursor,
+                    enrollment,
+                ) is False
+                active = load_active_slot_set_cursor(
+                    database_cursor,
+                    enrollment.control_plane.cohort_id,
+                )
+                assert active.slot_set == enrollment.control_plane.slot_set
+                assert active.slot_set.version == 1
+                assert active.slot_set.primary_contract_count == 1
+                assert active.slot_set.reserve_contract_count == 0
+                database_cursor.execute(
+                    "SELECT manifest_kind,option_underlying_count "
+                    "FROM rt.subscription_manifests WHERE manifest_id=%s",
+                    (str(enrollment.control_plane.manifest_id),),
+                )
+                assert database_cursor.fetchone() == ("MARKET_OPTIONS", 1)
+                database_cursor.execute(
+                    "SELECT channel,option_underlying "
+                    "FROM rt.subscription_members WHERE manifest_id=%s",
+                    (str(enrollment.equity_plan.manifest_id),),
+                )
+                assert database_cursor.fetchall() == [
+                    ("AM", False),
+                    ("AM", False),
+                ]
+                assert _prohibited_effect_counts(
+                    database_cursor
+                ) == effects_before
+            with pytest.raises(ValueError, match="identity changed"):
+                with _role_cursor(
+                    database_pool,
+                    roles.name("admin"),
+                ) as database_cursor:
+                    persist_advanced_options_enrollment_cursor(
+                        database_cursor,
+                        replace(
+                            enrollment,
+                            enrollment_sha256="0" * 64,
+                        ),
+                    )
+            with pytest.raises(errors.InsufficientPrivilege):
+                with _role_cursor(
+                    database_pool,
+                    roles.name("api"),
+                ) as database_cursor:
+                    persist_advanced_options_enrollment_cursor(
+                        database_cursor,
+                        enrollment,
+                    )
+    finally:
+        if roles_owned:
+            with closing(_connect(_settings(), "postgres")) as connection_value:
+                connection_value.autocommit = True
+                drop_disposable_roles_v2(connection_value, roles)
+                with connection_value.cursor() as database_cursor:
+                    database_cursor.execute(
+                        "SELECT count(*) FROM pg_roles WHERE rolname=ANY(%s)",
+                        (list(roles.all_names),),
+                    )
+                    assert database_cursor.fetchone()[0] == 0

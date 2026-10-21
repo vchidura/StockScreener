@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
+import re
 from typing import Literal
 
 from options.analytics.contract_filters import filter_contract
@@ -36,6 +37,406 @@ class ManifestSelectionStatus(str, Enum):
     BLOCKED = "BLOCKED"
 
 
+OPTION_ACTIVITY_SELECTION_VERSION = "option-activity-selection-v1"
+OPTION_ACTIVITY_SELECTION_MAXIMUM_AGE = timedelta(minutes=5)
+_OPTION_CONTRACT_PATTERN = re.compile(
+    r"^O:(?P<underlyer>[A-Z][A-Z0-9.-]{0,14})"
+    r"(?P<expiration>\d{6})(?P<call_put>[CP])(?P<strike>\d{8})$"
+)
+
+
+def _activity_utc(value: datetime, name: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError(f"{name} must be a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
+def _activity_sha256(value: str, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a SHA-256 digest")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class OptionActivityContract:
+    instrument_id: int
+    contract_id: int
+    catalog_version_id: int
+    contract_ticker: str
+    underlyer: str
+    call_put: Literal["C", "P"]
+    expiration_date: date
+    strike: Decimal
+    exercise_style: str
+    multiplier: Decimal
+    deliverables: tuple[str, ...]
+    eligibility: str
+    catalog_effective_from: datetime
+    catalog_effective_to: datetime | None
+    catalog_observed_at: datetime
+    catalog_payload_sha256: str
+    market_data_time: datetime
+    source_sha256: str
+
+    def __post_init__(self) -> None:
+        for name in ("instrument_id", "contract_id", "catalog_version_id"):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError(f"option activity {name} must be positive")
+        ticker = self.contract_ticker.strip().upper()
+        underlyer = self.underlyer.strip().upper()
+        call_put = self.call_put.strip().upper()
+        match = _OPTION_CONTRACT_PATTERN.fullmatch(ticker)
+        if (
+            match is None
+            or match.group("underlyer") != underlyer
+            or datetime.strptime(match.group("expiration"), "%y%m%d").date()
+            != self.expiration_date
+            or match.group("call_put") != call_put
+            or Decimal(match.group("strike")) / Decimal("1000") != self.strike
+        ):
+            raise ValueError("option activity contract ticker identity is invalid")
+        if (
+            call_put not in {"C", "P"}
+            or self.exercise_style != "AMERICAN"
+            or self.multiplier != Decimal("100")
+            or self.deliverables
+            or self.eligibility != "VALIDATED_ACTIVE"
+        ):
+            raise ValueError("option activity contract is adjusted or ineligible")
+        effective_from = _activity_utc(
+            self.catalog_effective_from,
+            "catalog_effective_from",
+        )
+        effective_to = (
+            None
+            if self.catalog_effective_to is None
+            else _activity_utc(
+                self.catalog_effective_to,
+                "catalog_effective_to",
+            )
+        )
+        observed_at = _activity_utc(
+            self.catalog_observed_at,
+            "catalog_observed_at",
+        )
+        market_data_time = _activity_utc(
+            self.market_data_time,
+            "market_data_time",
+        )
+        if (
+            effective_to is not None
+            or observed_at < effective_from
+            or market_data_time < observed_at
+        ):
+            raise ValueError("option activity contract source clocks are invalid")
+        object.__setattr__(self, "contract_ticker", ticker)
+        object.__setattr__(self, "underlyer", underlyer)
+        object.__setattr__(self, "call_put", call_put)
+        object.__setattr__(self, "catalog_effective_from", effective_from)
+        object.__setattr__(self, "catalog_effective_to", effective_to)
+        object.__setattr__(self, "catalog_observed_at", observed_at)
+        object.__setattr__(self, "market_data_time", market_data_time)
+        object.__setattr__(
+            self,
+            "catalog_payload_sha256",
+            _activity_sha256(
+                self.catalog_payload_sha256,
+                "catalog_payload_sha256",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "source_sha256",
+            _activity_sha256(self.source_sha256, "source_sha256"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OptionActivitySelectionRecord:
+    authorization_reference: str
+    reviewed_at: datetime
+    valid_until: datetime
+    policy_sha256: str
+    source_sha256: str
+    quote_ceiling: int
+    contracts: tuple[OptionActivityContract, ...]
+    source_clocks_sha256: str = ""
+    selection_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        authorization_reference = self.authorization_reference.strip()
+        reviewed_at = _activity_utc(self.reviewed_at, "reviewed_at")
+        valid_until = _activity_utc(self.valid_until, "valid_until")
+        contracts = tuple(sorted(
+            self.contracts,
+            key=lambda row: (row.underlyer, row.contract_ticker),
+        ))
+        if not authorization_reference:
+            raise ValueError(
+                "option activity selection requires an authorization reference"
+            )
+        if (
+            not contracts
+            or any(not isinstance(row, OptionActivityContract) for row in contracts)
+        ):
+            raise ValueError("option activity selection requires typed contracts")
+        for attribute in (
+            "instrument_id",
+            "contract_id",
+            "catalog_version_id",
+            "contract_ticker",
+            "underlyer",
+        ):
+            if len({getattr(row, attribute) for row in contracts}) != len(contracts):
+                raise ValueError(
+                    f"option activity selection contains duplicate {attribute}"
+                )
+        if type(self.quote_ceiling) is not int or not (
+            len(contracts) <= self.quote_ceiling <= 1_000
+        ):
+            raise ValueError("option activity selection quote ceiling is invalid")
+        latest_source = max(row.market_data_time for row in contracts)
+        earliest_expiry = min(
+            row.market_data_time + OPTION_ACTIVITY_SELECTION_MAXIMUM_AGE
+            for row in contracts
+        )
+        if (
+            reviewed_at < latest_source
+            or not reviewed_at < valid_until <= earliest_expiry
+        ):
+            raise ValueError("option activity selection source clocks are invalid")
+        policy_sha256 = _activity_sha256(
+            self.policy_sha256,
+            "policy_sha256",
+        )
+        source_sha256 = _activity_sha256(
+            self.source_sha256,
+            "source_sha256",
+        )
+        source_clocks_sha256 = canonical_sha256({
+            "reviewed_at": reviewed_at,
+            "valid_until": valid_until,
+            "contract_clocks": tuple(
+                (
+                    row.contract_ticker,
+                    row.catalog_effective_from,
+                    row.catalog_observed_at,
+                    row.market_data_time,
+                )
+                for row in contracts
+            ),
+        })
+        selection_sha256 = canonical_sha256({
+            "contract_version": OPTION_ACTIVITY_SELECTION_VERSION,
+            "authorization_reference": authorization_reference,
+            "reviewed_at": reviewed_at,
+            "valid_until": valid_until,
+            "policy_sha256": policy_sha256,
+            "source_sha256": source_sha256,
+            "source_clocks_sha256": source_clocks_sha256,
+            "quote_ceiling": self.quote_ceiling,
+            "contracts": contracts,
+        })
+        if self.source_clocks_sha256 and self.source_clocks_sha256 != source_clocks_sha256:
+            raise ValueError("option activity selection source clocks changed")
+        if self.selection_sha256 and self.selection_sha256 != selection_sha256:
+            raise ValueError("option activity selection digest changed")
+        object.__setattr__(
+            self,
+            "authorization_reference",
+            authorization_reference,
+        )
+        object.__setattr__(self, "reviewed_at", reviewed_at)
+        object.__setattr__(self, "valid_until", valid_until)
+        object.__setattr__(self, "policy_sha256", policy_sha256)
+        object.__setattr__(self, "source_sha256", source_sha256)
+        object.__setattr__(self, "contracts", contracts)
+        object.__setattr__(
+            self,
+            "source_clocks_sha256",
+            source_clocks_sha256,
+        )
+        object.__setattr__(self, "selection_sha256", selection_sha256)
+
+
+def validate_option_activity_selection(
+    selection: OptionActivitySelectionRecord,
+    *,
+    required_at: datetime,
+    expected_underlyings: tuple[str, ...],
+    expected_quote_ceiling: int,
+) -> None:
+    if not isinstance(selection, OptionActivitySelectionRecord):
+        raise TypeError("option activity selection record is invalid")
+    required = _activity_utc(required_at, "required_at")
+    underlyings = tuple(sorted({
+        value.strip().upper() for value in expected_underlyings if value.strip()
+    }))
+    if tuple(row.underlyer for row in selection.contracts) != underlyings:
+        raise ValueError("option activity selection expands or changes scope")
+    if selection.quote_ceiling != expected_quote_ceiling:
+        raise ValueError("option activity selection quote ceiling changed")
+    if not selection.reviewed_at <= required <= selection.valid_until:
+        raise ValueError("option activity selection is stale or expired")
+    if any(
+        row.catalog_effective_from > required
+        or row.expiration_date < required.date()
+        for row in selection.contracts
+    ):
+        raise ValueError("option activity contract is invalid for the session")
+
+
+def option_activity_selection_payload(
+    selection: OptionActivitySelectionRecord,
+) -> dict[str, object]:
+    if not isinstance(selection, OptionActivitySelectionRecord):
+        raise TypeError("option activity selection record is invalid")
+    return {
+        "contract_version": OPTION_ACTIVITY_SELECTION_VERSION,
+        "authorization_reference": selection.authorization_reference,
+        "reviewed_at": selection.reviewed_at.isoformat(),
+        "valid_until": selection.valid_until.isoformat(),
+        "policy_sha256": selection.policy_sha256,
+        "source_sha256": selection.source_sha256,
+        "source_clocks_sha256": selection.source_clocks_sha256,
+        "quote_ceiling": selection.quote_ceiling,
+        "contracts": [
+            {
+                "instrument_id": row.instrument_id,
+                "contract_id": row.contract_id,
+                "catalog_version_id": row.catalog_version_id,
+                "contract_ticker": row.contract_ticker,
+                "underlyer": row.underlyer,
+                "call_put": row.call_put,
+                "expiration_date": row.expiration_date.isoformat(),
+                "strike": str(row.strike),
+                "exercise_style": row.exercise_style,
+                "multiplier": str(row.multiplier),
+                "deliverables": list(row.deliverables),
+                "eligibility": row.eligibility,
+                "catalog_effective_from": row.catalog_effective_from.isoformat(),
+                "catalog_effective_to": None,
+                "catalog_observed_at": row.catalog_observed_at.isoformat(),
+                "catalog_payload_sha256": row.catalog_payload_sha256,
+                "market_data_time": row.market_data_time.isoformat(),
+                "source_sha256": row.source_sha256,
+            }
+            for row in selection.contracts
+        ],
+        "selection_sha256": selection.selection_sha256,
+    }
+
+
+def option_activity_selection_from_payload(
+    value: object,
+    *,
+    required_at: datetime,
+    expected_underlyings: tuple[str, ...],
+    expected_quote_ceiling: int,
+) -> OptionActivitySelectionRecord:
+    if not isinstance(value, dict) or set(value) != {
+        "contract_version",
+        "authorization_reference",
+        "reviewed_at",
+        "valid_until",
+        "policy_sha256",
+        "source_sha256",
+        "source_clocks_sha256",
+        "quote_ceiling",
+        "contracts",
+        "selection_sha256",
+    }:
+        raise ValueError("option activity selection fields are not exact")
+    if (
+        value["contract_version"] != OPTION_ACTIVITY_SELECTION_VERSION
+        or not isinstance(value["contracts"], list)
+    ):
+        raise ValueError("option activity selection contract version is invalid")
+    contract_fields = {
+        "instrument_id",
+        "contract_id",
+        "catalog_version_id",
+        "contract_ticker",
+        "underlyer",
+        "call_put",
+        "expiration_date",
+        "strike",
+        "exercise_style",
+        "multiplier",
+        "deliverables",
+        "eligibility",
+        "catalog_effective_from",
+        "catalog_effective_to",
+        "catalog_observed_at",
+        "catalog_payload_sha256",
+        "market_data_time",
+        "source_sha256",
+    }
+    contracts = []
+    for row in value["contracts"]:
+        if (
+            not isinstance(row, dict)
+            or set(row) != contract_fields
+            or row["catalog_effective_to"] is not None
+            or not isinstance(row["deliverables"], list)
+        ):
+            raise ValueError("option activity contract fields are not exact")
+        contracts.append(OptionActivityContract(
+            instrument_id=row["instrument_id"],
+            contract_id=row["contract_id"],
+            catalog_version_id=row["catalog_version_id"],
+            contract_ticker=row["contract_ticker"],
+            underlyer=row["underlyer"],
+            call_put=row["call_put"],
+            expiration_date=date.fromisoformat(str(row["expiration_date"])),
+            strike=Decimal(str(row["strike"])),
+            exercise_style=row["exercise_style"],
+            multiplier=Decimal(str(row["multiplier"])),
+            deliverables=tuple(row["deliverables"]),
+            eligibility=row["eligibility"],
+            catalog_effective_from=datetime.fromisoformat(
+                str(row["catalog_effective_from"]).replace("Z", "+00:00")
+            ),
+            catalog_effective_to=None,
+            catalog_observed_at=datetime.fromisoformat(
+                str(row["catalog_observed_at"]).replace("Z", "+00:00")
+            ),
+            catalog_payload_sha256=row["catalog_payload_sha256"],
+            market_data_time=datetime.fromisoformat(
+                str(row["market_data_time"]).replace("Z", "+00:00")
+            ),
+            source_sha256=row["source_sha256"],
+        ))
+    selection = OptionActivitySelectionRecord(
+        authorization_reference=value["authorization_reference"],
+        reviewed_at=datetime.fromisoformat(
+            str(value["reviewed_at"]).replace("Z", "+00:00")
+        ),
+        valid_until=datetime.fromisoformat(
+            str(value["valid_until"]).replace("Z", "+00:00")
+        ),
+        policy_sha256=value["policy_sha256"],
+        source_sha256=value["source_sha256"],
+        quote_ceiling=value["quote_ceiling"],
+        contracts=tuple(contracts),
+        source_clocks_sha256=value["source_clocks_sha256"],
+        selection_sha256=value["selection_sha256"],
+    )
+    validate_option_activity_selection(
+        selection,
+        required_at=required_at,
+        expected_underlyings=expected_underlyings,
+        expected_quote_ceiling=expected_quote_ceiling,
+    )
+    return selection
+
+
 @dataclass(frozen=True, slots=True)
 class BoundedOptionManifestPolicy:
     version: str
@@ -66,9 +467,12 @@ class BoundedOptionManifestPolicy:
         if (
             not targets
             or len(targets) != len(set(targets))
-            or any(type(value) is not int or value <= 0 for value in targets)
+            or any(type(value) is not int or value < 0 for value in targets)
         ):
-            raise ValueError("option manifest target DTEs must be unique positive integers")
+            raise ValueError(
+                "option manifest target DTEs must be unique "
+                "nonnegative integers"
+            )
         if not 0 <= self.minimum_dte <= min(targets):
             raise ValueError("option manifest minimum DTE excludes a target lane")
         if not max(targets) <= self.maximum_dte <= 365:

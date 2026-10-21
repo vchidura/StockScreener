@@ -49,7 +49,9 @@ def main(argv=None) -> int:
         "authorization_reference": reference,
         "owner_decision": OWNER_DECISION,
         "conditional_live_shadow_authorized": True,
-        "provider_websocket_connection_attempts_authorized": 2,
+        "provider_websocket_connection_attempts_authorized": plan[
+            "socket_ceiling"
+        ]["connection_attempts"],
         "provider_rest_requests_authorized": 0,
         "production_effects_authorized": False,
     }

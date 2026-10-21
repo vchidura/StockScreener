@@ -14,12 +14,23 @@ from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Callable, Mapping
+from random import Random
+from typing import Awaitable, Callable, Mapping
 from uuid import UUID, uuid4
 
 from psycopg2.extras import execute_batch
 
-from .advanced_gateway import AdvancedGateway, GatewayConfiguration
+from .advanced_gateway import (
+    AdvancedGateway,
+    GatewayConfiguration,
+    GatewayControlError,
+)
+from .advanced_ingress_controller import (
+    AdvancedReconnectState,
+    IngressFailureDisposition,
+    classify_advanced_ingress_failure,
+    full_jitter_backoff_seconds,
+)
 from .advanced_journal_registry import build_advanced_journal_registration
 from .advanced_options_consumers import (
     AdvancedOptionsMarketStateConsumer,
@@ -205,6 +216,39 @@ async def _cancel(task: asyncio.Task) -> None:
         await task
 
 
+async def _wait_for_reconnect_backoff(
+    delay_seconds: float,
+    *,
+    deadline: datetime,
+    now: Callable[[], datetime] | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    if delay_seconds <= 0:
+        raise ValueError("P7 reconnect backoff must be positive")
+    current = datetime.now(UTC) if now is None else now()
+    if current + timedelta(seconds=delay_seconds) >= deadline:
+        raise RuntimeError("P7 reconnect backoff leaves no capture time")
+    await sleep(delay_seconds)
+
+
+def _reconnect_backoff_seconds(
+    plan: Mapping[str, object],
+    reconnect_number: int,
+    *,
+    random_source: Random,
+) -> float:
+    policy = plan["socket_ceiling"]["reconnect_backoff"]
+    jittered = full_jitter_backoff_seconds(
+        AdvancedReconnectState(reconnect_number),
+        initial_seconds=policy["initial_seconds"],
+        multiplier=policy["multiplier"],
+        maximum_seconds=policy["maximum_seconds"],
+        jitter_ceiling_seconds=policy["jitter_ceiling_seconds"],
+        random_source=random_source,
+    )
+    return max(float(policy["minimum_seconds"]), jittered)
+
+
 async def _run_attempt(
     gateway: AdvancedGateway,
     pump: AdvancedOptionsJournalPump,
@@ -228,6 +272,10 @@ async def _run_attempt(
     termination = "UNKNOWN"
     error_name = None
     error_detail = None
+    provider_statuses: tuple[str, ...] = ()
+    provider_messages: tuple[str, ...] = ()
+    failure_disposition = None
+    failure_outcome = None
     result = None
     try:
         while not task.done():
@@ -264,6 +312,19 @@ async def _run_attempt(
                 termination = "PROVIDER_DISCONNECT"
                 error_name = type(error).__name__
                 error_detail = str(error)
+                if isinstance(error, GatewayControlError):
+                    provider_statuses = error.statuses
+                    provider_messages = error.provider_messages
+                failure = classify_advanced_ingress_failure(
+                    error_name,
+                    detail=error_detail,
+                    live_seconds=max(
+                        0.0,
+                        (datetime.now(UTC) - started).total_seconds(),
+                    ),
+                )
+                failure_disposition = failure.disposition.value
+                failure_outcome = failure.terminal_outcome
     finally:
         await _cancel(task)
     ended = datetime.now(UTC)
@@ -279,6 +340,10 @@ async def _run_attempt(
         "termination": termination,
         "error_name": error_name,
         "error_detail": error_detail,
+        "provider_statuses": list(provider_statuses),
+        "provider_messages": list(provider_messages),
+        "failure_disposition": failure_disposition,
+        "failure_outcome": failure_outcome,
         "received_frames": gateway.received_messages,
         "received_bytes": gateway.received_bytes,
         "accepted_frames": end_offset - start_offset,
@@ -295,6 +360,8 @@ async def _run_attempt(
 async def capture_live_shadow(
     plan: Mapping[str, object],
     api_key: str,
+    *,
+    random_source: Random | None = None,
 ) -> dict[str, object]:
     if not api_key.strip():
         raise ValueError("P7 live shadow requires the provider API key")
@@ -343,7 +410,7 @@ async def capture_live_shadow(
     )
     stream_session_id = uuid4()
     manifest = _subscription_manifest(plan)
-    outbound_control_bytes = 2 * (
+    outbound_control_bytes = plan["socket_ceiling"]["connection_attempts"] * (
         len(
             json.dumps(
                 {"action": "auth", "params": api_key},
@@ -374,16 +441,37 @@ async def capture_live_shadow(
     frame_ceiling = plan["socket_ceiling"]["websocket_frames"]
     byte_ceiling = plan["socket_ceiling"]["inbound_decoded_bytes"]
     maximum_frame = plan["socket_ceiling"]["maximum_frame_bytes"]
+    maximum_attempts = plan["socket_ceiling"]["connection_attempts"]
+    randomizer = random_source or Random()
+    backoff_window_exhausted = False
     pump.start()
     progress = None
     try:
-        for attempt_number, deadline in enumerate((reconnect_at, stop_at), 1):
+        attempt_deadlines = (reconnect_at,) + (
+            (stop_at,) * (maximum_attempts - 1)
+        )
+        for attempt_number, deadline in enumerate(attempt_deadlines, 1):
             remaining_frames = frame_ceiling - total_received_frames
             remaining_bytes = (
                 byte_ceiling - total_received_bytes - maximum_frame
             )
             if remaining_frames <= 0 or remaining_bytes <= 0:
                 break
+            reconnect_backoff_seconds = 0.0
+            if attempt_number > 1:
+                reconnect_backoff_seconds = _reconnect_backoff_seconds(
+                    plan,
+                    attempt_number - 1,
+                    random_source=randomizer,
+                )
+                try:
+                    await _wait_for_reconnect_backoff(
+                        reconnect_backoff_seconds,
+                        deadline=deadline,
+                    )
+                except RuntimeError:
+                    backoff_window_exhausted = True
+                    break
             gateway = AdvancedGateway(
                 GatewayConfiguration(
                     MarketFeed.OPTIONS,
@@ -423,6 +511,9 @@ async def capture_live_shadow(
             )
             next_message_number = gateway.next_message_number
             observation["attempt"] = attempt_number
+            observation["reconnect_backoff_seconds_before_attempt"] = (
+                reconnect_backoff_seconds
+            )
             attempts.append(observation)
             total_received_frames += int(observation["received_frames"])
             total_received_bytes += int(observation["received_bytes"])
@@ -430,6 +521,17 @@ async def capture_live_shadow(
                 "MESSAGE_CEILING",
                 "APPLICATION_ABORT_GATE",
             }:
+                break
+            if (
+                observation["termination"] == "PROVIDER_DISCONNECT"
+                and observation["failure_disposition"]
+                != IngressFailureDisposition.TRANSIENT.value
+            ):
+                break
+            if (
+                observation["termination"] == "DEADLINE"
+                and deadline == stop_at
+            ):
                 break
     finally:
         pump.request_stop()
@@ -460,12 +562,24 @@ async def capture_live_shadow(
     symbol_event_counts = Counter(
         (row.provider_symbol, row.event_kind.value) for row in normalized
     )
+    provider_status_counts = Counter(
+        provider_status
+        for attempt in attempts
+        for provider_status in attempt["provider_statuses"]
+    )
+    provider_messages = sorted({
+        message
+        for attempt in attempts
+        for message in attempt["provider_messages"]
+    })
     status = "PASS_CAPTURE"
     blockers = []
     if len(attempts) > plan["socket_ceiling"]["connection_attempts"]:
         blockers.append("CONNECTION_ATTEMPT_CEILING_EXCEEDED")
-    if len(attempts) != plan["socket_ceiling"]["connection_attempts"]:
+    if len(attempts) < 2:
         blockers.append("RECONNECT_WINDOW_NOT_EXERCISED")
+    if backoff_window_exhausted:
+        blockers.append("RECONNECT_BACKOFF_WINDOW_EXHAUSTED")
     if total_received_bytes > byte_ceiling:
         blockers.append("RECEIVED_BYTE_CEILING_EXCEEDED")
     if len(raw) > frame_ceiling:
@@ -491,6 +605,8 @@ async def capture_live_shadow(
         blockers.append("MESSAGE_CEILING_REACHED")
     if attempts and attempts[-1]["termination"] == "PROVIDER_DISCONNECT":
         blockers.append("FINAL_PROVIDER_DISCONNECT")
+        if len(attempts) >= maximum_attempts:
+            blockers.append("RECONNECT_ATTEMPT_BUDGET_EXHAUSTED")
     if not raw:
         blockers.append("NO_MARKET_FRAMES")
     required_membership = {
@@ -526,6 +642,10 @@ async def capture_live_shadow(
             f"{symbol}|{event}": value
             for (symbol, event), value in sorted(symbol_event_counts.items())
         },
+        "provider_status_counts": dict(
+            sorted(provider_status_counts.items())
+        ),
+        "provider_messages": provider_messages,
         "progress": asdict(progress),
         "buffer": asdict(snapshot),
         "telemetry": telemetry,
@@ -649,6 +769,13 @@ def _seed_scope(
                     (instrument_id, contract_id),
                 )
             attempts = capture["sessions"]
+            connection_ceiling = plan["socket_ceiling"][
+                "connection_attempts"
+            ]
+            if len(attempts) > connection_ceiling:
+                raise ValueError(
+                    "P7 capture exceeded its connection-attempt ceiling"
+                )
             cursor.execute(
                 "INSERT INTO rt.stream_sessions ("
                 "session_id,provider,feed,manifest_id,owner_id,owner_epoch,"
@@ -662,7 +789,7 @@ def _seed_scope(
                 "last_event_offset,event_time_watermark,heartbeat_at"
                 ") VALUES ("
                 "%s,'massive','OPTIONS',%s,%s,1,%s,%s,'STOPPED',"
-                "%s,%s,%s,%s,%s,2,33554432,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "%s,%s,%s,%s,%s,%s,33554432,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     capture["session_ids"][0],
                     str(manifest_id),
@@ -674,6 +801,7 @@ def _seed_scope(
                     plan["authorization_reference"],
                     plan["plan_sha256"],
                     len(attempts),
+                    connection_ceiling,
                     sum(row["received_frames"] for row in attempts),
                     sum(row["received_bytes"] for row in attempts),
                     sum(row["accepted_frames"] for row in attempts),
@@ -1171,6 +1299,8 @@ def execute_shadow(
                     "condition_counts",
                     "exchange_counts",
                     "symbol_event_counts",
+                    "provider_status_counts",
+                    "provider_messages",
                 )
             },
         )

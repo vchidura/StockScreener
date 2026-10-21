@@ -33,6 +33,7 @@ from .advanced_options_projection import (
     AdvancedOptionsProjectionBatch,
     build_advanced_options_projection_batch,
     build_advanced_options_publisher_handoff,
+    load_advanced_options_page_source_cursor,
     persist_advanced_options_projection_cursor,
 )
 from .advanced_options_reference_state import (
@@ -180,6 +181,8 @@ class AdvancedOptionsCloseStageData:
     open_alert_ids: tuple[UUID, ...]
     journal_retention_expires_at: datetime
     checked_at: datetime
+    selected_alert_ids: tuple[UUID, ...] = ()
+    active_hold_refs: tuple[str, ...] = ()
 
 
 InputLoader = Callable[[StageContext], AdvancedOptionsInputStageData]
@@ -202,6 +205,9 @@ class AdvancedOptionsRuntimeBinding:
     projection_writer: Callable[..., None] = (
         persist_advanced_options_projection_cursor
     )
+    page_source_loader: Callable = (
+        load_advanced_options_page_source_cursor
+    )
     handoff: AdvancedOptionsRuntimeHandoff = field(
         default_factory=AdvancedOptionsRuntimeHandoff
     )
@@ -216,6 +222,7 @@ class AdvancedOptionsRuntimeBinding:
             (self.publish_loader, "publish loader"),
             (self.cycle_writer, "cycle writer"),
             (self.projection_writer, "projection writer"),
+            (self.page_source_loader, "page source loader"),
         ):
             if not callable(value):
                 raise TypeError(f"Advanced Options runtime {name} is invalid")
@@ -292,13 +299,20 @@ class AdvancedOptionsRuntimeBinding:
     def projection(self, context: StageContext) -> OptionsReceiptStageResult:
         data = self.projection_loader(context)
         self._validate_scope(context, data.control_plane)
-        batch = build_advanced_options_projection_batch(
-            control_plane=data.control_plane,
-            cycle=data.cycle,
-            generated_at=context.window.cutoff,
-            build_id=self.build_id,
-        )
         with context.transaction() as unit:
+            page_source = self.page_source_loader(
+                unit.cursor,
+                control_plane=data.control_plane,
+                cycle=data.cycle,
+                generated_at=context.window.cutoff,
+            )
+            batch = build_advanced_options_projection_batch(
+                control_plane=data.control_plane,
+                cycle=data.cycle,
+                generated_at=context.window.cutoff,
+                build_id=self.build_id,
+                page_source=page_source,
+            )
             self.projection_writer(unit.cursor, batch)
         self.handoff.put_projection(
             data.control_plane.cohort_id,
@@ -358,6 +372,8 @@ class AdvancedOptionsRuntimeBinding:
                 data.journal_retention_expires_at
             ),
             checked_at=data.checked_at,
+            selected_alert_ids=data.selected_alert_ids,
+            active_hold_refs=data.active_hold_refs,
         )
 
     def bind(self, environment: RunnerEnvironment) -> RunnerEnvironment:

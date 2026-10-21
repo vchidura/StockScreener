@@ -8,6 +8,7 @@ import pytest
 from realtime.contracts import canonical_sha256
 from realtime.portal_projection import build_portal_snapshot
 from realtime.portal_projection_repository import (
+    PortalReleasePointer,
     PortalReleaseReceipt,
     RELEASE_CLASS_SESSION_CLOSE,
     RETENTION_HOT_AND_KEPT,
@@ -16,10 +17,12 @@ from realtime.portal_projection_repository import (
     claim_alert_outbox_cursor,
     fail_alert_outbox_delivery,
     mark_alert_outbox_delivered,
+    load_portal_release_pointer_cursor,
     persist_portal_snapshot,
     persist_portal_snapshot_cursor,
     portal_session_date,
     publish_portal_release_cursor,
+    restore_portal_release_pointer_cursor,
     session_close_snapshot,
 )
 from realtime.preflight import ProviderTier
@@ -227,6 +230,63 @@ def test_release_publication_swaps_the_single_pointer_after_the_immutable_releas
     assert inserted[5].isoformat() == "2026-10-05"
     pointer = next(params for statement, params in calls if statement.startswith("INSERT INTO rt.portal_release_current"))
     assert pointer == (str(COHORT), "MASSIVE_DEVELOPER", str(release.release_id), NOW, release.session_date)
+
+
+def test_release_pointer_rollback_is_exact_and_never_deletes_a_release():
+    current_release = UUID("11111111-1111-1111-1111-111111111111")
+    previous_release = UUID("22222222-2222-2222-2222-222222222222")
+    previous = PortalReleasePointer(
+        COHORT,
+        ProviderTier.MASSIVE_DEVELOPER,
+        previous_release,
+        NOW - timedelta(minutes=1),
+        NOW.date(),
+    )
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (
+        str(current_release),
+        NOW,
+        NOW.date(),
+    )
+    cursor.rowcount = 1
+
+    assert load_portal_release_pointer_cursor(
+        cursor,
+        cohort_id=COHORT,
+        provider_tier=ProviderTier.MASSIVE_DEVELOPER,
+    ) == PortalReleasePointer(
+        COHORT,
+        ProviderTier.MASSIVE_DEVELOPER,
+        current_release,
+        NOW,
+        NOW.date(),
+    )
+    cursor.reset_mock()
+    cursor.fetchone.return_value = (
+        str(current_release),
+        NOW,
+        NOW.date(),
+    )
+    cursor.rowcount = 1
+
+    restore_portal_release_pointer_cursor(
+        cursor,
+        cohort_id=COHORT,
+        provider_tier=ProviderTier.MASSIVE_DEVELOPER,
+        expected_current_release_id=current_release,
+        previous=previous,
+    )
+
+    statements = _statements(cursor)
+    assert statements[0].startswith("SELECT pg_advisory_xact_lock")
+    assert statements[1].endswith(" FOR UPDATE")
+    assert statements[2].startswith(
+        "UPDATE rt.portal_release_current"
+    )
+    assert not any(
+        statement.startswith("DELETE FROM rt.portal_releases")
+        for statement in statements
+    )
 
 
 def test_intraday_release_carries_forward_other_lanes_and_keeps_newer_generations():

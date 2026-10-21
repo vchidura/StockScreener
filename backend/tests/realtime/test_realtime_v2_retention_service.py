@@ -473,6 +473,13 @@ def test_retention_compose_service_is_isolated_disabled_and_fail_closed():
         in text
     )
     assert "--continuous" in block and "--execute" in block
-    assert block.count("--partition-relation") == 16
+    assert block.count("--partition-relation") == 18
+    for relation in (
+        "rt.option_flow_events",
+        "rt.option_flow_event_profiles",
+        "rt.option_flow_clusters",
+        "rt.option_flow_cluster_members",
+    ):
+        assert f"- {relation}" in block
     assert "--status" in block and "healthcheck:" in block
     assert "env_file:" not in block

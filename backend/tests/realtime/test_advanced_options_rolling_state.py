@@ -14,6 +14,7 @@ from realtime.advanced_options_rolling_state import (
     AdvancedOptionsOrderWindowMember,
     AdvancedOptionsOrderWindowState,
     AdvancedOptionsOptionalRollingLane,
+    AdvancedOptionsRollingProducerBinding,
     AdvancedOptionsRollingStateOwner,
     RollingAvailability,
     build_advanced_options_rolling_state,
@@ -154,7 +155,14 @@ def _order_windows(*, offset=11):
     )
 
 
-def _rolling_state(*, offset=11, committed_at=NOW, tick=None, volume=None):
+def _rolling_state(
+    *,
+    offset=11,
+    committed_at=NOW,
+    tick=None,
+    volume=None,
+    producer_binding=None,
+):
     return build_advanced_options_rolling_state(
         cohort_id=COHORT,
         session_date=SESSION,
@@ -167,6 +175,7 @@ def _rolling_state(*, offset=11, committed_at=NOW, tick=None, volume=None):
         underlying_ticks=(tick or _tick(),),
         contract_volumes=(volume or _volume(),),
         order_windows=_order_windows(offset=offset),
+        producer_binding=producer_binding,
     )
 
 
@@ -305,6 +314,33 @@ def test_rolling_checkpoint_cannot_lag_current_evidence():
 
 def test_persistence_document_round_trip_preserves_exact_rolling_state():
     state = _rolling_state()
+
+    assert decode_advanced_options_rolling_state(
+        state_id=state.state_id,
+        state_sha256=state.state_sha256,
+        document=json.loads(canonical_json(state.identity)),
+    ) == state
+
+
+def test_producer_binding_is_immutable_rolling_document_evidence():
+    binding = AdvancedOptionsRollingProducerBinding(
+        producer_plan_id=UUID("55555555-5555-5555-5555-555555555555"),
+        producer_plan_sha256="7" * 64,
+        reference_state_id=UUID(
+            "66666666-6666-6666-6666-666666666666"
+        ),
+        reference_state_sha256="8" * 64,
+        reference_generation=1,
+        source_flow_id=UUID("77777777-7777-7777-7777-777777777777"),
+        source_flow_sha256="9" * 64,
+        known_at=NOW,
+        valid_until=NOW + timedelta(hours=1),
+        unresolved_gaps_sha256="a" * 64,
+        source_watermarks_sha256="b" * 64,
+        market_state_heads_sha256="c" * 64,
+        volume_checkpoint_sha256="d" * 64,
+    )
+    state = _rolling_state(producer_binding=binding)
 
     assert decode_advanced_options_rolling_state(
         state_id=state.state_id,

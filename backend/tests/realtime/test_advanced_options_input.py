@@ -133,6 +133,27 @@ def test_every_live_input_change_changes_closure_identity():
     assert len({baseline.sha256, *(row.sha256 for row in changed)}) == 6
 
 
+def test_canonical_producer_evidence_is_all_or_nothing_and_hash_bound():
+    values = {
+        "native_input_plan_sha256": "7" * 64,
+        "native_input_sha256": "8" * 64,
+        "executor_membership_sha256": "9" * 64,
+        "mark_producer_plan_sha256": "a" * 64,
+        "marks_sha256": "b" * 64,
+    }
+    closure = _closure(**values)
+
+    assert closure.has_canonical_producer_evidence
+    assert _closure(
+        **{**values, "marks_sha256": "c" * 64}
+    ).sha256 != closure.sha256
+    with pytest.raises(
+        ValueError,
+        match="producer evidence is partial",
+    ):
+        _closure(native_input_plan_sha256="7" * 64)
+
+
 def test_closure_binds_exact_tier_a_state_and_rejects_drift():
     state = reference_state()
     closure = _closure(reference_state=state)

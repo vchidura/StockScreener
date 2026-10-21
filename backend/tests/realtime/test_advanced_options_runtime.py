@@ -2,9 +2,16 @@ from contextlib import contextmanager
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 import pytest
 
+from option_flow_runner_support import (
+    FakeOptionsDatabase,
+    harness as flow_harness,
+    scenario_feed,
+)
+from orchestration_fakes import InMemoryOrchestrationRepository
 from test_advanced_options_close import NOW, _journal, _projection
 from test_advanced_options_cycle import (
     _complete,
@@ -14,6 +21,13 @@ from test_advanced_options_cycle import (
 from test_advanced_options_control_plane import _plan as _control_plane
 from realtime.advanced_options_package_evidence import (
     build_flow_package_evidence_batch,
+)
+from realtime.advanced_options_projection import (
+    AdvancedOptionsPageSource,
+    OPTIONS_SNAPSHOT_TYPES,
+)
+from realtime.advanced_options_api import (
+    AdvancedOptionsStoredProjectionRepository,
 )
 from realtime.advanced_options_input import (
     reconstruct_options_input_ready_receipt,
@@ -28,15 +42,26 @@ from realtime.advanced_options_runtime import (
 )
 from realtime.materialization_jobs import JobBarrierVerdict
 from realtime.options_v2_runtime import OptionsPreSessionStageBinding
+from realtime.orchestration_repository import WindowSpec
 from realtime.preflight import DetectorFamily
 from realtime.runner_environment import RunnerEnvironment
 from realtime.session_archive import ArchiveIdentity
-from realtime.stage_graph import STAGE_CATALOG_VERSION_V4
+from realtime.stage_graph import STAGES_V4, STAGE_CATALOG_VERSION_V4
+from realtime.stage_orchestrator import StageOrchestrator
 from realtime.stage_runners_options import (
+    OptionsAcquireResult,
+    OptionsAdmissionResult,
     options_cycle_runner,
     options_input_gate_runner,
     options_projection_runner,
     options_publish_runner,
+)
+from realtime.stage_runners_v2 import (
+    build_advanced_options_non_serving_runners,
+)
+from realtime.advanced_options_service import (
+    OPTIONS_NON_SERVING_STAGE_ORDER,
+    build_advanced_options_non_serving_qualification_plan,
 )
 
 
@@ -109,6 +134,21 @@ def _binding(tmp_path):
         state["projection"] = batch
 
     operations = MagicMock()
+    operations.acquire.return_value = OptionsAcquireResult(
+        uuid4(),
+        ("SPY",),
+        ("SPY",),
+        0,
+        0,
+    )
+    operations.admit.return_value = OptionsAdmissionResult(
+        uuid4(),
+        "READY",
+        (),
+        control.cohort_id,
+        1,
+        1,
+    )
     pre_session = OptionsPreSessionStageBinding(operations)
     binding = AdvancedOptionsRuntimeBinding(
         build_id="provider-free-runtime-v1",
@@ -142,6 +182,9 @@ def _binding(tmp_path):
         ),
         cycle_writer=write_cycle,
         projection_writer=write_projection,
+        page_source_loader=(
+            lambda *_args, **_kwargs: AdvancedOptionsPageSource()
+        ),
     )
     return binding, control, state
 
@@ -233,4 +276,140 @@ def test_runtime_close_builds_inert_retention_handoff(tmp_path):
             handoff.retention_execution_authorized,
             handoff.journal_deletion_authorized,
         )
+    )
+
+
+def test_exact_v4_composition_executes_with_equity_isolated_and_no_effects(
+    tmp_path,
+):
+    binding, control, state = _binding(tmp_path)
+    flow = flow_harness(
+        scenario_feed(),
+        database=FakeOptionsDatabase(),
+        enabled={"OPTIONS_FLOW"},
+        cohort_id=control.cohort_id,
+    )
+    environment = binding.bind(flow.environment)
+    runners = build_advanced_options_non_serving_runners(
+        flow.database,
+        environment=environment,
+    )
+    qualification = build_advanced_options_non_serving_qualification_plan(
+        plan_id=control.plan_id,
+        cohort_id=control.cohort_id,
+        session_date=control.session_date,
+        config_sha256="9" * 64,
+        deadline=NOW + timedelta(hours=1),
+    )
+    repository = InMemoryOrchestrationRepository(
+        qualification.service_plan,
+        STAGES_V4,
+    )
+    for stage_id in ("REFERENCE", "EQUITY_MATERIALIZE"):
+        repository.upsert_readiness(
+            control.cohort_id,
+            stage_id,
+            STAGE_CATALOG_VERSION_V4,
+            "READY",
+            (),
+            f"qualified-{stage_id.lower()}",
+            NOW,
+        )
+    orchestrator = StageOrchestrator(
+        repository,
+        runners,
+        database=flow.database,
+        stages=STAGES_V4,
+        catalog_version=STAGE_CATALOG_VERSION_V4,
+        clock=lambda: NOW,
+        parallel_lanes=False,
+    )
+
+    start = orchestrator.start(control.plan_id)
+    flow_outcome = orchestrator.tick_resident(
+        control.plan_id,
+        "OPTIONS_FLOW",
+    )
+    window = repository.ensure_window(
+        control.plan_id,
+        WindowSpec(
+            control.cohort_id,
+            "MASSIVE_ADVANCED",
+            "owp3-qualified-window",
+            NOW,
+            NOW,
+            NOW + timedelta(minutes=30),
+        ),
+    )
+    report = orchestrator.run_window(window.window_id)
+
+    assert tuple(runners) == OPTIONS_NON_SERVING_STAGE_ORDER
+    assert start.enabled == frozenset(OPTIONS_NON_SERVING_STAGE_ORDER)
+    assert flow_outcome.state == "COMPLETE"
+    assert (report.status, report.window_state) == ("FINISHED", "COMPLETE")
+    assert {
+        row["stage"] for row in repository.runs
+    } == set(OPTIONS_NON_SERVING_STAGE_ORDER) - {"OPTIONS_FLOW"}
+    assert all(
+        STAGES_V4[row["stage"]].domain == "options"
+        for row in repository.runs
+    )
+    assert repository.release == {}
+    assert len(state["projection"].snapshots) == len(
+        OPTIONS_SNAPSHOT_TYPES
+    )
+    assert not state["projection"].publication_authorized
+    assert not any(qualification.effect_authorizations.values())
+
+    snapshot = state["projection"].snapshots[0]
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (
+        snapshot.snapshot_id,
+        snapshot.generated_at,
+        snapshot.payload_sha256,
+        snapshot.payload,
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        snapshot.generated_at,
+        "e" * 64,
+    )
+
+    @contextmanager
+    def stored_cursor():
+        yield cursor
+
+    stored = AdvancedOptionsStoredProjectionRepository(
+        stored_cursor
+    ).read(
+        cohort_id=control.cohort_id,
+        snapshot_type=snapshot.snapshot_type,
+        available_by=NOW,
+    )
+
+    assert stored["available"]
+    assert stored["provider_fetch_performed"] is False
+    assert stored["detector_work_performed"] is False
+    assert stored["publication_performed"] is False
+
+
+def test_integrated_flow_restart_replays_from_the_durable_checkpoint():
+    database = FakeOptionsDatabase()
+    first = flow_harness(scenario_feed(), database=database)
+    assert first.tick().state == "COMPLETE"
+    covered = (
+        first.environment.options_flow_state.session.consumer
+        .checkpointed_offset
+    )
+    restarted = flow_harness(
+        scenario_feed(),
+        database=database,
+        cohort_id=first.plan.cohort_id,
+    )
+
+    outcome = restarted.tick()
+
+    assert outcome.state == "COMPLETE"
+    assert "start=RESTORED" in outcome.evidence_ref
+    assert (
+        restarted.environment.options_flow_state.session.start.offset
+        == covered
     )

@@ -269,7 +269,23 @@ def test_stale_primary_manifest_is_preserved_and_current_contract_uses_revision(
 
     assert repaired.revision and repaired.data_path != first.data_path
     assert first.manifest_path.read_bytes() == stale
-    assert _verify(repaired, built).row_count == 0
+    verified = _verify(
+        repaired,
+        built,
+        require_retention_compatibility=True,
+    )
+    assert verified.row_count == 0
+    assert verified.source_identity == {
+        "complete": True,
+        "identified_rows": 0,
+        "journal_generations": [],
+        "primary_relation": "rt.option_flow_events",
+        "primary_rows": 0,
+        "source_flow_ids": [],
+    }
+    assert verified.partition_coverage["relations"] == list(
+        KIND_RELATIONS[OPTION_FLOW_EVENTS]
+    )
 
 
 def test_missing_manifest_is_completed_after_an_interrupted_write(tmp_path):
@@ -360,6 +376,8 @@ def _flow_event(revision, minute=30, supersedes=None, ticker="O:SPY261016C005000
         "size": 25, "conditions": [1, 2], "opening_reasons": [], "quote_time": datetime(2026, 10, 5, 14, minute - 1, tzinfo=UTC),
         "created_at": datetime(2026, 10, 5, 14, minute, 1, tzinfo=UTC),
         "trade_treatment": "CANCELED" if revision > 1 else "INCLUDED",
+        "source_flow_id": UUID("11111111-1111-1111-1111-111111111111"),
+        "journal_generation": UUID("22222222-2222-2222-2222-222222222222"),
     })
 
 
@@ -372,7 +390,92 @@ def _flow_cluster(revision, status, prints):
         "first_event_time": datetime(2026, 10, 5, 14, 30, 5, tzinfo=UTC),
         "last_event_time": datetime(2026, 10, 5, 14, 30, 9, tzinfo=UTC),
         "created_at": datetime(2026, 10, 5, 14, 31, tzinfo=UTC),
+        "source_flow_id": UUID("11111111-1111-1111-1111-111111111111"),
+        "journal_generation": UUID("22222222-2222-2222-2222-222222222222"),
     })
+
+
+def test_retention_manifest_binds_flow_source_generation_and_partition_coverage(
+    tmp_path,
+):
+    event = _flow_event(1)
+    profile = ArchiveRow(
+        "rt.option_flow_event_profiles",
+        (event.key[0], event.key[-1], "SWEEP"),
+        {
+            "event_id": event.document["event_id"],
+            "event_time": event.document["event_time"],
+            "session_date": SESSION,
+            "profile": "SWEEP",
+        },
+    )
+    built = build_archive(
+        OPTION_FLOW_EVENTS,
+        SESSION,
+        (profile, event),
+    )
+    written = write_archive(
+        archive_directory(tmp_path, SESSION),
+        built,
+        IDENTITY,
+    )
+
+    verified = _verify(
+        written,
+        built,
+        identity=IDENTITY,
+        require_retention_compatibility=True,
+    )
+
+    assert verified.source_identity == {
+        "complete": True,
+        "identified_rows": 1,
+        "journal_generations": [
+            "22222222-2222-2222-2222-222222222222",
+        ],
+        "primary_relation": "rt.option_flow_events",
+        "primary_rows": 1,
+        "source_flow_ids": [
+            "11111111-1111-1111-1111-111111111111",
+        ],
+    }
+    assert verified.partition_coverage == {
+        "complete": True,
+        "relation_counts": {
+            "rt.option_flow_events": 1,
+            "rt.option_flow_event_profiles": 1,
+        },
+        "relations": [
+            "rt.option_flow_events",
+            "rt.option_flow_event_profiles",
+        ],
+        "session_date": SESSION.isoformat(),
+    }
+
+
+def test_retention_manifest_refuses_incomplete_flow_source_identity(tmp_path):
+    legacy = _flow_event(1)
+    document = dict(legacy.document)
+    document.pop("journal_generation")
+    built = build_archive(
+        OPTION_FLOW_EVENTS,
+        SESSION,
+        (ArchiveRow(legacy.relation, legacy.key, document),),
+    )
+    written = write_archive(
+        archive_directory(tmp_path, SESSION),
+        built,
+        IDENTITY,
+    )
+
+    with pytest.raises(ArchiveVerificationError) as caught:
+        _verify(
+            written,
+            built,
+            require_retention_compatibility=True,
+        )
+
+    assert caught.value.code == VerificationCode.SOURCE_IDENTITY_MISMATCH
 
 
 def test_option_flow_events_archive_every_revision_in_deterministic_order(tmp_path):

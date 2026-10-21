@@ -102,6 +102,7 @@ class PortalPublicationConfig:
     lease_seconds: int = 30
     claim_limit: int = 100
     retry_delay_seconds: int = 30
+    dispatch_authorized: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider_tier, ProviderTier):
@@ -112,6 +113,8 @@ class PortalPublicationConfig:
             raise ValueError("portal publication claim limit must be in [1, 200]")
         if self.retry_delay_seconds <= 0:
             raise ValueError("portal publication retry delay must be positive")
+        if type(self.dispatch_authorized) is not bool:
+            raise TypeError("portal publication dispatch authority is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +145,10 @@ class PortalPublicationBatch:
                 for snapshot in self.snapshots
                 if snapshot.snapshot_type == "TICKER_PAGE"
             }
-            if ticker_keys != set(CANARY_UNIVERSE.equity_tickers):
+            if (
+                ticker_keys
+                and ticker_keys != set(CANARY_UNIVERSE.equity_tickers)
+            ):
                 raise ValueError("portal publication requires exact canary ticker pages")
 
 
@@ -255,16 +261,18 @@ def run_portal_publication_once(
                         release_class=RELEASE_CLASS_SESSION_CLOSE,
                         session_date=close_session,
                     )
-    with database.transaction() as cursor:
-        claimed_rows = claim_repository(
-            cursor,
-            cohort_id=config.cohort_id,
-            owner_id=config.owner_id,
-            owner_epoch=config.owner_epoch,
-            claimed_at=checked,
-            lease_until=checked + timedelta(seconds=config.lease_seconds),
-            limit=config.claim_limit,
-        )
+    claimed_rows = ()
+    if config.dispatch_authorized:
+        with database.transaction() as cursor:
+            claimed_rows = claim_repository(
+                cursor,
+                cohort_id=config.cohort_id,
+                owner_id=config.owner_id,
+                owner_epoch=config.owner_epoch,
+                claimed_at=checked,
+                lease_until=checked + timedelta(seconds=config.lease_seconds),
+                limit=config.claim_limit,
+            )
     delivered = retried = abandoned = 0
     reasons: list[str] = []
     for row in claimed_rows:

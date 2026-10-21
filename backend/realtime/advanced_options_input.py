@@ -5,9 +5,14 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
+from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from .advanced_options_control_plane import AdvancedOptionsControlPlanePlan
+from .advanced_options_control_plane import (
+    AdvancedOptionsControlPlanePlan,
+    AdvancedOptionsEnrollmentPlan,
+)
 from .advanced_options_producers import AdvancedOptionsProducerPlan
 from .advanced_options_reference_state import AdvancedOptionsReferenceState
 from .advanced_options_rolling_state import AdvancedOptionsRollingState
@@ -30,8 +35,23 @@ from .orchestration_repository import (
     build_options_receipt_spec,
 )
 
+if TYPE_CHECKING:
+    from .advanced_options_mark_producer import (
+        AdvancedOptionsMarkProducerPlan,
+    )
+    from .advanced_options_native_loader import AdvancedOptionsNativeInputPlan
+    from .advanced_options_reference_producer import (
+        AdvancedOptionsReferenceProducerPlan,
+    )
+    from .advanced_options_rolling_producer import (
+        AdvancedOptionsRollingProducerPlan,
+    )
 
-ADVANCED_OPTIONS_INPUT_VERSION = "advanced_options_input_closure_v2"
+
+ADVANCED_OPTIONS_INPUT_VERSION = "advanced_options_input_closure_v3"
+ADVANCED_OPTIONS_INPUT_READY_PLAN_VERSION = (
+    "advanced-options-input-ready-plan-v1"
+)
 MAX_ADVANCED_OPTIONS_INPUT_BYTES = MAX_OPTION_CYCLE_INPUT_BYTES
 OPTIONS_INPUT_BARRIER_KIND = "OPTIONS_INPUT_READY"
 
@@ -77,6 +97,11 @@ class AdvancedOptionsInputClosure:
     source_clocks_sha256: str
     equity_input_receipt_id: UUID
     equity_input_sha256: str
+    native_input_plan_sha256: str | None = None
+    native_input_sha256: str | None = None
+    executor_membership_sha256: str | None = None
+    mark_producer_plan_sha256: str | None = None
+    marks_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.cycle_input, OptionCycleInput):
@@ -124,10 +149,37 @@ class AdvancedOptionsInputClosure:
                 name,
                 _sha256(getattr(self, name), name),
             )
+        producer_digests = (
+            self.native_input_plan_sha256,
+            self.native_input_sha256,
+            self.executor_membership_sha256,
+            self.mark_producer_plan_sha256,
+            self.marks_sha256,
+        )
+        if any(value is None for value in producer_digests) and any(
+            value is not None for value in producer_digests
+        ):
+            raise ValueError(
+                "Advanced Options closure producer evidence is partial"
+            )
+        for name in (
+            "native_input_plan_sha256",
+            "native_input_sha256",
+            "executor_membership_sha256",
+            "mark_producer_plan_sha256",
+            "marks_sha256",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _sha256(value, name))
 
     @property
     def sha256(self) -> str:
         return encode_advanced_options_input_closure(self)[1]
+
+    @property
+    def has_canonical_producer_evidence(self) -> bool:
+        return self.native_input_plan_sha256 is not None
 
 
 def build_advanced_options_input_closure(
@@ -145,6 +197,11 @@ def build_advanced_options_input_closure(
     market_state_heads_sha256: str,
     equity_input_receipt_id: UUID,
     equity_input_sha256: str,
+    native_input_plan_sha256: str | None = None,
+    native_input_sha256: str | None = None,
+    executor_membership_sha256: str | None = None,
+    mark_producer_plan_sha256: str | None = None,
+    marks_sha256: str | None = None,
 ) -> AdvancedOptionsInputClosure:
     if (
         not isinstance(control_plane, AdvancedOptionsControlPlanePlan)
@@ -202,6 +259,23 @@ def build_advanced_options_input_closure(
         or rolling_state.committed_at > producer_plan.clocks.known_at
     ):
         raise ValueError("Advanced Options Tier B rolling state changed")
+    binding = rolling_state.producer_binding
+    if binding is not None and (
+        binding.reference_state_id != reference_state.state_id
+        or binding.reference_state_sha256 != reference_state.state_sha256
+        or binding.reference_generation != reference_state.reference_generation
+        or binding.known_at > producer_plan.clocks.known_at
+        or not (
+            binding.known_at
+            <= producer_plan.clocks.known_at
+            < binding.valid_until
+        )
+        or binding.unresolved_gaps_sha256
+        != _sha256(unresolved_gaps_sha256, "unresolved_gaps_sha256")
+        or binding.market_state_heads_sha256
+        != _sha256(market_state_heads_sha256, "market_state_heads_sha256")
+    ):
+        raise ValueError("Advanced Options rolling producer evidence changed")
     return AdvancedOptionsInputClosure(
         cycle_input=cycle_input,
         control_plane_plan_id=control_plane.plan_id,
@@ -219,7 +293,11 @@ def build_advanced_options_input_closure(
         rolling_owner_epoch=rolling_state.owner_epoch,
         rolling_committed_offset=rolling_state.committed_offset,
         rolling_committed_at=rolling_state.committed_at,
-        source_flow_sha256=control_plane.source_flow.source_flow_sha256,
+        source_flow_sha256=(
+            control_plane.source_flow.source_flow_sha256
+            if binding is None
+            else binding.source_flow_sha256
+        ),
         condition_semantics_sha256=(
             control_plane.pins.condition_semantics_sha256
         ),
@@ -238,6 +316,11 @@ def build_advanced_options_input_closure(
         source_clocks_sha256=producer_plan.clocks.sha256,
         equity_input_receipt_id=equity_input_receipt_id,
         equity_input_sha256=equity_input_sha256,
+        native_input_plan_sha256=native_input_plan_sha256,
+        native_input_sha256=native_input_sha256,
+        executor_membership_sha256=executor_membership_sha256,
+        mark_producer_plan_sha256=mark_producer_plan_sha256,
+        marks_sha256=marks_sha256,
     )
 
 
@@ -281,6 +364,15 @@ def _closure_payload(
         "source_clocks_sha256": closure.source_clocks_sha256,
         "equity_input_receipt_id": str(closure.equity_input_receipt_id),
         "equity_input_sha256": closure.equity_input_sha256,
+        "native_input_plan_sha256": closure.native_input_plan_sha256,
+        "native_input_sha256": closure.native_input_sha256,
+        "executor_membership_sha256": (
+            closure.executor_membership_sha256
+        ),
+        "mark_producer_plan_sha256": (
+            closure.mark_producer_plan_sha256
+        ),
+        "marks_sha256": closure.marks_sha256,
     }
 
 
@@ -364,6 +456,15 @@ def decode_advanced_options_input_closure(
         source_clocks_sha256=payload["source_clocks_sha256"],
         equity_input_receipt_id=UUID(payload["equity_input_receipt_id"]),
         equity_input_sha256=payload["equity_input_sha256"],
+        native_input_plan_sha256=payload["native_input_plan_sha256"],
+        native_input_sha256=payload["native_input_sha256"],
+        executor_membership_sha256=payload[
+            "executor_membership_sha256"
+        ],
+        mark_producer_plan_sha256=payload[
+            "mark_producer_plan_sha256"
+        ],
+        marks_sha256=payload["marks_sha256"],
     )
     if encode_advanced_options_input_closure(closure)[0] != payload_text:
         raise ValueError("Advanced Options closure is not canonical")
@@ -405,7 +506,367 @@ def _closure_payload_keys() -> tuple[str, ...]:
         "source_clocks_sha256",
         "equity_input_receipt_id",
         "equity_input_sha256",
+        "native_input_plan_sha256",
+        "native_input_sha256",
+        "executor_membership_sha256",
+        "mark_producer_plan_sha256",
+        "marks_sha256",
     )
+
+
+class AdvancedOptionsInputDependencyStatus(str, Enum):
+    AVAILABLE = "AVAILABLE"
+    COMPLETE_ZERO = "COMPLETE_ZERO"
+    BLOCKED = "BLOCKED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+@dataclass(frozen=True, slots=True)
+class AdvancedOptionsInputDependencyEvidence:
+    member_kind: str
+    member_key: str
+    status: AdvancedOptionsInputDependencyStatus
+    evidence_sha256: str
+    reason_codes: tuple[str, ...] = ()
+    accepted_unavailable: bool = False
+
+    def __post_init__(self) -> None:
+        kind = self.member_kind.strip().upper()
+        key = self.member_key.strip()
+        reasons = tuple(sorted({
+            value.strip().upper()
+            for value in self.reason_codes
+            if value.strip()
+        }))
+        if not kind or not key:
+            raise ValueError(
+                "Advanced Options input dependency identity is invalid"
+            )
+        if self.status in {
+            AdvancedOptionsInputDependencyStatus.AVAILABLE,
+            AdvancedOptionsInputDependencyStatus.COMPLETE_ZERO,
+        } and reasons:
+            raise ValueError(
+                "available Advanced Options input dependency has reasons"
+            )
+        if self.status in {
+            AdvancedOptionsInputDependencyStatus.BLOCKED,
+            AdvancedOptionsInputDependencyStatus.UNAVAILABLE,
+        } and not reasons:
+            raise ValueError(
+                "non-ready Advanced Options input dependency lacks reasons"
+            )
+        if self.accepted_unavailable and (
+            self.status is not AdvancedOptionsInputDependencyStatus.UNAVAILABLE
+        ):
+            raise ValueError(
+                "only an unavailable input dependency can be accepted"
+            )
+        object.__setattr__(self, "member_kind", kind)
+        object.__setattr__(self, "member_key", key)
+        object.__setattr__(
+            self,
+            "evidence_sha256",
+            _sha256(self.evidence_sha256, "evidence_sha256"),
+        )
+        object.__setattr__(self, "reason_codes", reasons)
+
+
+@dataclass(frozen=True, slots=True)
+class AdvancedOptionsInputReadyPlan:
+    plan_id: UUID
+    plan_sha256: str
+    enrollment: AdvancedOptionsEnrollmentPlan
+    producer_plan: AdvancedOptionsProducerPlan
+    reference_producer_plan: AdvancedOptionsReferenceProducerPlan
+    rolling_producer_plan: AdvancedOptionsRollingProducerPlan
+    native_input_plan: AdvancedOptionsNativeInputPlan
+    mark_producer_plan: AdvancedOptionsMarkProducerPlan
+    native_executor_membership_sha256: str
+    service_plan_id: UUID
+    window_id: UUID
+    cutoff: datetime
+    producer_build_id: str
+    producer_build_sha256: str
+    expected_closure_sha256: str | None = None
+    provider_calls_authorized: bool = False
+    runtime_actions_authorized: bool = False
+
+    @property
+    def control_plane(self) -> AdvancedOptionsControlPlanePlan:
+        return self.enrollment.control_plane
+
+    @property
+    def frozen(self) -> bool:
+        return self.expected_closure_sha256 is not None
+
+    @property
+    def zero_effect_counts(self) -> dict[str, int]:
+        return {
+            name: 0
+            for name in (
+                "provider",
+                "socket",
+                "service",
+                "stages_v4",
+                "publication",
+                "delivery",
+                "repair",
+                "backfill",
+                "replay",
+                "archive",
+                "retention",
+            )
+        }
+
+
+def _input_ready_plan_identity(
+    *,
+    enrollment: AdvancedOptionsEnrollmentPlan,
+    producer_plan: AdvancedOptionsProducerPlan,
+    reference_producer_plan: AdvancedOptionsReferenceProducerPlan,
+    rolling_producer_plan: AdvancedOptionsRollingProducerPlan,
+    native_input_plan: AdvancedOptionsNativeInputPlan,
+    mark_producer_plan: AdvancedOptionsMarkProducerPlan,
+    native_executor_membership_sha256: str,
+    service_plan_id: UUID,
+    window_id: UUID,
+    cutoff: datetime,
+    producer_build_id: str,
+    producer_build_sha256: str,
+    expected_closure_sha256: str | None,
+) -> dict[str, object]:
+    control = enrollment.control_plane
+    return {
+        "contract": ADVANCED_OPTIONS_INPUT_READY_PLAN_VERSION,
+        "enrollment_id": enrollment.enrollment_id,
+        "enrollment_sha256": enrollment.enrollment_sha256,
+        "control_plane_plan_id": control.plan_id,
+        "control_plane_plan_sha256": control.plan_sha256,
+        "cohort_id": control.cohort_id,
+        "cohort_sha256": control.cohort_sha256,
+        "profile_id": control.profile_id,
+        "profile_sha256": control.profile_sha256,
+        "manifest_id": control.manifest_id,
+        "manifest_sha256": control.manifest_sha256,
+        "slot_set_version": control.slot_set.version,
+        "slot_set_sha256": control.slot_set_sha256,
+        "slot_member_sha256": control.slot_set.member_sha256,
+        "producer_plan_id": producer_plan.plan_id,
+        "producer_plan_sha256": producer_plan.plan_sha256,
+        "reference_producer_plan_id": reference_producer_plan.plan_id,
+        "reference_producer_plan_sha256": (
+            reference_producer_plan.plan_sha256
+        ),
+        "rolling_producer_plan_id": rolling_producer_plan.plan_id,
+        "rolling_producer_plan_sha256": rolling_producer_plan.plan_sha256,
+        "native_input_plan_id": native_input_plan.plan_id,
+        "native_input_plan_sha256": native_input_plan.plan_sha256,
+        "native_input_sha256": native_input_plan.expected_input_sha256,
+        "native_executor_membership_sha256": (
+            native_executor_membership_sha256
+        ),
+        "mark_producer_plan_id": mark_producer_plan.plan_id,
+        "mark_producer_plan_sha256": mark_producer_plan.plan_sha256,
+        "marks_sha256": mark_producer_plan.expected_marks_sha256,
+        "reference_state_id": native_input_plan.reference_state.state_id,
+        "reference_state_sha256": (
+            native_input_plan.reference_state.state_sha256
+        ),
+        "reference_generation": (
+            native_input_plan.reference_state.reference_generation
+        ),
+        "rolling_state_id": native_input_plan.rolling_state.state_id,
+        "rolling_state_sha256": (
+            native_input_plan.rolling_state.state_sha256
+        ),
+        "source_flow_id": native_input_plan.source_flow.source_flow_id,
+        "source_flow_sha256": (
+            native_input_plan.source_flow.source_flow_sha256
+        ),
+        "journal_generation": (
+            native_input_plan.source_flow.journal_generation
+        ),
+        "equity_input_receipt_id": (
+            native_input_plan.equity_input_receipt_id
+        ),
+        "equity_input_sha256": (
+            native_input_plan.equity_input_receipt.input_sha256
+        ),
+        "equity_input_build_id": (
+            native_input_plan.equity_input_receipt.build_id
+        ),
+        "stock_detector_sha256s": (
+            native_input_plan.stock_detector_sha256s
+        ),
+        "service_plan_id": service_plan_id,
+        "window_id": window_id,
+        "cutoff": cutoff,
+        "producer_build_id": producer_build_id,
+        "producer_build_sha256": producer_build_sha256,
+        "expected_closure_sha256": expected_closure_sha256,
+        "provider_calls_authorized": False,
+        "runtime_actions_authorized": False,
+    }
+
+
+def _validate_input_ready_plan(
+    plan: AdvancedOptionsInputReadyPlan,
+) -> dict[str, object]:
+    if not isinstance(plan, AdvancedOptionsInputReadyPlan):
+        raise TypeError("Advanced Options input-ready PLAN is invalid")
+    control = plan.control_plane
+    reference_state = plan.native_input_plan.reference_state
+    rolling_state = plan.native_input_plan.rolling_state
+    source_flow = plan.native_input_plan.source_flow
+    cutoff = plan.cutoff
+    if (
+        not isinstance(plan.enrollment, AdvancedOptionsEnrollmentPlan)
+        or plan.producer_plan.control_plane_plan_id != control.plan_id
+        or plan.reference_producer_plan.enrollment != plan.enrollment
+        or plan.rolling_producer_plan.enrollment != plan.enrollment
+        or plan.native_input_plan.enrollment != plan.enrollment
+        or plan.mark_producer_plan.enrollment != plan.enrollment
+        or plan.native_input_plan.producer_plan != plan.producer_plan
+        or plan.rolling_producer_plan.reference_state != reference_state
+        or plan.mark_producer_plan.reference_state != reference_state
+        or plan.mark_producer_plan.rolling_state != rolling_state
+        or plan.rolling_producer_plan.source_flow != source_flow
+        or plan.mark_producer_plan.source_flow != source_flow
+        or plan.native_input_plan.cutoff != cutoff
+        or plan.mark_producer_plan.cutoff != cutoff
+        or plan.producer_plan.clocks.market_cutoff != cutoff
+        or not plan.native_input_plan.frozen
+        or not plan.mark_producer_plan.frozen
+        or plan.provider_calls_authorized
+        or plan.runtime_actions_authorized
+    ):
+        raise ValueError(
+            "Advanced Options input-ready PLAN scope or authority changed"
+        )
+    if (
+        not isinstance(plan.service_plan_id, UUID)
+        or not isinstance(plan.window_id, UUID)
+        or cutoff.tzinfo is None
+        or cutoff.utcoffset() is None
+        or not plan.producer_build_id.strip()
+    ):
+        raise ValueError(
+            "Advanced Options input-ready window or build is invalid"
+        )
+    executor_sha256 = _sha256(
+        plan.native_executor_membership_sha256,
+        "native_executor_membership_sha256",
+    )
+    build_sha256 = _sha256(
+        plan.producer_build_sha256,
+        "producer_build_sha256",
+    )
+    expected = (
+        None
+        if plan.expected_closure_sha256 is None
+        else _sha256(
+            plan.expected_closure_sha256,
+            "expected_closure_sha256",
+        )
+    )
+    identity = _input_ready_plan_identity(
+        enrollment=plan.enrollment,
+        producer_plan=plan.producer_plan,
+        reference_producer_plan=plan.reference_producer_plan,
+        rolling_producer_plan=plan.rolling_producer_plan,
+        native_input_plan=plan.native_input_plan,
+        mark_producer_plan=plan.mark_producer_plan,
+        native_executor_membership_sha256=executor_sha256,
+        service_plan_id=plan.service_plan_id,
+        window_id=plan.window_id,
+        cutoff=cutoff,
+        producer_build_id=plan.producer_build_id.strip(),
+        producer_build_sha256=build_sha256,
+        expected_closure_sha256=expected,
+    )
+    digest = canonical_sha256(identity)
+    identifier = uuid5(
+        NAMESPACE_URL,
+        f"stockscreener:advanced-options-input-ready-plan:{digest}",
+    )
+    if plan.plan_sha256 != digest or plan.plan_id != identifier:
+        raise ValueError(
+            "Advanced Options input-ready PLAN identity changed"
+        )
+    return identity
+
+
+def build_advanced_options_input_ready_plan(
+    *,
+    enrollment: AdvancedOptionsEnrollmentPlan,
+    producer_plan: AdvancedOptionsProducerPlan,
+    reference_producer_plan: AdvancedOptionsReferenceProducerPlan,
+    rolling_producer_plan: AdvancedOptionsRollingProducerPlan,
+    native_input_plan: AdvancedOptionsNativeInputPlan,
+    mark_producer_plan: AdvancedOptionsMarkProducerPlan,
+    native_executor_membership_sha256: str,
+    service_plan_id: UUID,
+    window_id: UUID,
+    cutoff: datetime,
+    producer_build_id: str,
+    producer_build_sha256: str,
+    expected_closure_sha256: str | None = None,
+) -> AdvancedOptionsInputReadyPlan:
+    identity = _input_ready_plan_identity(
+        enrollment=enrollment,
+        producer_plan=producer_plan,
+        reference_producer_plan=reference_producer_plan,
+        rolling_producer_plan=rolling_producer_plan,
+        native_input_plan=native_input_plan,
+        mark_producer_plan=mark_producer_plan,
+        native_executor_membership_sha256=(
+            native_executor_membership_sha256
+        ),
+        service_plan_id=service_plan_id,
+        window_id=window_id,
+        cutoff=cutoff,
+        producer_build_id=producer_build_id.strip(),
+        producer_build_sha256=producer_build_sha256,
+        expected_closure_sha256=expected_closure_sha256,
+    )
+    digest = canonical_sha256(identity)
+    plan = AdvancedOptionsInputReadyPlan(
+        plan_id=uuid5(
+            NAMESPACE_URL,
+            f"stockscreener:advanced-options-input-ready-plan:{digest}",
+        ),
+        plan_sha256=digest,
+        enrollment=enrollment,
+        producer_plan=producer_plan,
+        reference_producer_plan=reference_producer_plan,
+        rolling_producer_plan=rolling_producer_plan,
+        native_input_plan=native_input_plan,
+        mark_producer_plan=mark_producer_plan,
+        native_executor_membership_sha256=(
+            native_executor_membership_sha256
+        ),
+        service_plan_id=service_plan_id,
+        window_id=window_id,
+        cutoff=cutoff,
+        producer_build_id=producer_build_id.strip(),
+        producer_build_sha256=producer_build_sha256,
+        expected_closure_sha256=expected_closure_sha256,
+    )
+    _validate_input_ready_plan(plan)
+    return plan
+
+
+def advanced_options_input_ready_plan_payload(
+    plan: AdvancedOptionsInputReadyPlan,
+) -> dict[str, object]:
+    return {
+        "mode": "PLAN",
+        "plan_id": str(plan.plan_id),
+        "plan_sha256": plan.plan_sha256,
+        "identity": _validate_input_ready_plan(plan),
+        "effect_counts": plan.zero_effect_counts,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -519,4 +980,153 @@ def reconstruct_options_input_ready_receipt(
         universe_sha256=gate.closure.cycle_input.universe_sha256,
         input_sha256=gate.closure_sha256,
         build_id=build_id,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AdvancedOptionsInputReadyPreflight:
+    status: AdvancedOptionsInputDependencyStatus
+    plan_id: UUID
+    preflight_sha256: str
+    evidence: tuple[AdvancedOptionsInputDependencyEvidence, ...]
+    closure: AdvancedOptionsInputClosure | None = None
+    gate: AdvancedOptionsInputGatePlan | None = None
+    receipt: CycleReceiptSpec | None = None
+    existing_receipt_id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "preflight_sha256",
+            _sha256(self.preflight_sha256, "preflight_sha256"),
+        )
+        rows = tuple(self.evidence)
+        if (
+            len({
+                (row.member_kind, row.member_key) for row in rows
+            }) != len(rows)
+            or any(
+                not isinstance(
+                    row,
+                    AdvancedOptionsInputDependencyEvidence,
+                )
+                for row in rows
+            )
+        ):
+            raise ValueError(
+                "Advanced Options input-ready evidence is invalid"
+            )
+        ready = self.status is AdvancedOptionsInputDependencyStatus.AVAILABLE
+        if ready != (
+            self.closure is not None
+            and self.gate is not None
+            and self.receipt is not None
+        ):
+            raise ValueError(
+                "Advanced Options input-ready preflight payload is invalid"
+            )
+        blocking = tuple(
+            row
+            for row in rows
+            if row.status is AdvancedOptionsInputDependencyStatus.BLOCKED
+            or (
+                row.status
+                is AdvancedOptionsInputDependencyStatus.UNAVAILABLE
+                and not row.accepted_unavailable
+            )
+        )
+        if ready and blocking:
+            raise ValueError(
+                "ready Advanced Options input preflight has blockers"
+            )
+        if not ready and not blocking:
+            raise ValueError(
+                "blocked Advanced Options input preflight lacks blockers"
+            )
+
+    @property
+    def reason_codes(self) -> tuple[str, ...]:
+        return tuple(sorted({
+            reason
+            for row in self.evidence
+            for reason in row.reason_codes
+            if (
+                row.status is AdvancedOptionsInputDependencyStatus.BLOCKED
+                or (
+                    row.status
+                    is AdvancedOptionsInputDependencyStatus.UNAVAILABLE
+                    and not row.accepted_unavailable
+                )
+            )
+        }))
+
+
+@dataclass(frozen=True, slots=True)
+class AdvancedOptionsInputReadyResult:
+    receipt_id: UUID
+    receipt: CycleReceiptSpec
+    closure_sha256: str
+    preflight_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.receipt_id, UUID)
+            or not isinstance(self.receipt, CycleReceiptSpec)
+            or self.receipt.receipt_kind != OPTIONS_INPUT_READY
+            or self.receipt.input_sha256
+            != _sha256(self.closure_sha256, "closure_sha256")
+        ):
+            raise ValueError(
+                "Advanced Options input-ready result is invalid"
+            )
+        object.__setattr__(
+            self,
+            "preflight_sha256",
+            _sha256(self.preflight_sha256, "preflight_sha256"),
+        )
+
+
+class AdvancedOptionsInputReadyBlocked(ValueError):
+    def __init__(
+        self,
+        result: AdvancedOptionsInputReadyPreflight,
+    ) -> None:
+        self.result = result
+        super().__init__(
+            "Advanced Options input-ready preflight is blocked: "
+            + ",".join(result.reason_codes)
+        )
+
+
+def freeze_advanced_options_input_ready_plan(
+    plan: AdvancedOptionsInputReadyPlan,
+    preflight: AdvancedOptionsInputReadyPreflight,
+) -> AdvancedOptionsInputReadyPlan:
+    _validate_input_ready_plan(plan)
+    if (
+        plan.frozen
+        or preflight.plan_id != plan.plan_id
+        or preflight.status
+        is not AdvancedOptionsInputDependencyStatus.AVAILABLE
+        or preflight.closure is None
+    ):
+        raise ValueError(
+            "Advanced Options input-ready preflight does not match PLAN"
+        )
+    return build_advanced_options_input_ready_plan(
+        enrollment=plan.enrollment,
+        producer_plan=plan.producer_plan,
+        reference_producer_plan=plan.reference_producer_plan,
+        rolling_producer_plan=plan.rolling_producer_plan,
+        native_input_plan=plan.native_input_plan,
+        mark_producer_plan=plan.mark_producer_plan,
+        native_executor_membership_sha256=(
+            plan.native_executor_membership_sha256
+        ),
+        service_plan_id=plan.service_plan_id,
+        window_id=plan.window_id,
+        cutoff=plan.cutoff,
+        producer_build_id=plan.producer_build_id,
+        producer_build_sha256=plan.producer_build_sha256,
+        expected_closure_sha256=preflight.closure.sha256,
     )

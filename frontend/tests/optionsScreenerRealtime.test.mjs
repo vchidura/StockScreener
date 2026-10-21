@@ -16,6 +16,8 @@ test('Options Screener keeps its original catalog and explicit unavailable chain
   assert.match(library, /query\.data\?\.available === false \? 'Data unavailable'/)
   assert.match(library, /\['session_date', 'cohort_id', 'snapshot_id'\]/)
   assert.match(library, /'screen', 'builtin', 'session_date', 'cohort_id', 'snapshot_id'/)
+  assert.doesNotMatch(workspace + library, /AdvancedOptionsV2|getAdvancedOptionsV2Projection/)
+  assert.match(workspace, /<OptionsChainResults catalog=\{catalog\}/)
   assert.match(library, /publicationPath\(`\/ticker\//)
 })
 

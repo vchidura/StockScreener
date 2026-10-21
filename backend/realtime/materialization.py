@@ -384,15 +384,21 @@ def _trade_from_record(record: NormalizedJournalRecord) -> MaterializedTrade:
         eligibility = "INVALID"
         eligibility_reasons = record.reason_codes
         semantics_version = "invalid_trade_v1"
+        quality = record.quality
+        reason_codes = record.reason_codes
     elif record.asset_class is AssetClass.OPTION:
         classification = classify_option_trade(record.conditions, None)
         eligibility = classification.status.value
         eligibility_reasons = classification.reasons
         semantics_version = TRADE_SEMANTICS_VERSION
+        quality = "GOOD"
+        reason_codes = ()
     else:
         eligibility = "UNKNOWN"
         eligibility_reasons = ("EQUITY_TRADE_CONDITION_POLICY_PENDING",)
         semantics_version = "equity_trade_condition_policy_pending_v1"
+        quality = record.quality
+        reason_codes = record.reason_codes
     return MaterializedTrade(
         journal_generation=record.journal_generation,
         stream_session_id=record.stream_session_id,
@@ -409,8 +415,8 @@ def _trade_from_record(record: NormalizedJournalRecord) -> MaterializedTrade:
         size=record.size,
         exchange=record.exchange,
         conditions=record.conditions,
-        quality=record.quality,
-        reason_codes=record.reason_codes,
+        quality=quality,
+        reason_codes=reason_codes,
         eligibility=eligibility,
         eligibility_reason_codes=eligibility_reasons,
         semantics_version=semantics_version,

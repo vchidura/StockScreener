@@ -14,6 +14,7 @@ from realtime.advanced_options_control_plane import (
     ADVANCED_OPTIONS_CHANNELS,
     ADVANCED_OPTIONS_COHORT_KIND,
     ADVANCED_OPTIONS_REST_LANES,
+    ADVANCED_OPTIONS_ZERO_EFFECTS,
     OPTIONS_CYCLE,
     OPTIONS_INPUT_READY,
     OPTIONS_PORTAL_READY,
@@ -24,10 +25,20 @@ from realtime.advanced_options_control_plane import (
     AdvancedOptionsReceiptInputs,
     AdvancedOptionsRuntimeAuthorization,
     AdvancedOptionsSocketBudget,
+    advanced_options_enrollment_plan_payload,
+    advanced_options_history_binding_payload,
     build_advanced_options_control_plane_plan,
+    build_advanced_options_enrollment_plan,
+    build_advanced_options_history_binding,
+    build_advanced_options_prospective_reference_identity,
+    validate_advanced_options_enrollment_plan_payload,
 )
 from realtime.contracts import MarketChannel, MarketFeed
-from realtime.option_session_manifest import BoundedOptionManifestPolicy
+from realtime.option_session_manifest import (
+    BoundedOptionManifestPolicy,
+    OptionActivityContract,
+    OptionActivitySelectionRecord,
+)
 from realtime.option_slot_set import SlotSetMember, SlotSetPurpose
 from realtime.preflight import (
     DetectorFamily,
@@ -190,6 +201,69 @@ def _plan(**changes):
     )
     values.update(changes)
     return build_advanced_options_control_plane_plan(**values)
+
+
+def _activity_selection(**changes):
+    values = dict(
+        authorization_reference="external-activity-selection",
+        reviewed_at=PLANNED - timedelta(minutes=1),
+        valid_until=PLANNED + timedelta(minutes=2),
+        policy_sha256="9" * 64,
+        source_sha256="8" * 64,
+        quote_ceiling=3,
+        contracts=(
+            OptionActivityContract(
+                instrument_id=101,
+                contract_id=1_001,
+                catalog_version_id=1_101,
+                contract_ticker="O:SPY261120C00500000",
+                underlyer="SPY",
+                call_put="C",
+                expiration_date=date(2026, 11, 20),
+                strike=Decimal("500"),
+                exercise_style="AMERICAN",
+                multiplier=Decimal("100"),
+                deliverables=(),
+                eligibility="VALIDATED_ACTIVE",
+                catalog_effective_from=CHECKED,
+                catalog_effective_to=None,
+                catalog_observed_at=PLANNED - timedelta(minutes=3),
+                catalog_payload_sha256="7" * 64,
+                market_data_time=PLANNED - timedelta(minutes=2),
+                source_sha256="6" * 64,
+            ),
+        ),
+    )
+    values.update(changes)
+    return OptionActivitySelectionRecord(**values)
+
+
+def _enrollment_plan(**changes):
+    equity = changes.pop("equity_plan", _equity_plan())
+    control = changes.pop(
+        "control_plane",
+        _plan(
+            equity_plan=equity,
+            manifest_policy=_manifest_policy(
+                reserved_option_quote_contracts=0
+            ),
+            slot_members=tuple(
+                member
+                for member in _slot_members()
+                if member.purpose is SlotSetPurpose.PRIMARY
+            ),
+        ),
+    )
+    selection = changes.pop(
+        "activity_selection",
+        _activity_selection(),
+    )
+    assert not changes
+    return build_advanced_options_enrollment_plan(
+        control_plane=control,
+        equity_plan=equity,
+        activity_selection=selection,
+    )
 
 
 def test_plan_is_exact_combined_advanced_scope_without_runtime_authority():
@@ -422,3 +496,96 @@ def test_contracts_are_immutable():
         plan.runtime_enabled = True
     with pytest.raises(FrozenInstanceError):
         plan.source_flow.owner_name = "other"
+
+
+def test_enrollment_plan_binds_equity_activity_and_primary_tq_identities():
+    plan = _enrollment_plan()
+    payload = advanced_options_enrollment_plan_payload(plan)
+
+    assert plan.control_plane.cohort_id != plan.equity_plan.cohort_id
+    assert plan.control_plane.universe.equity_tickers == ("AAPL", "SPY")
+    assert plan.control_plane.universe.option_underlyings == ("SPY",)
+    assert plan.control_plane.slot_set.primary_contract_count == 1
+    assert plan.control_plane.slot_set.reserve_contract_count == 0
+    assert {
+        member.channel for member in plan.control_plane.slot_set.members
+    } == set(ADVANCED_OPTIONS_CHANNELS)
+    assert plan.zero_effect_counts == {
+        name: 0 for name in ADVANCED_OPTIONS_ZERO_EFFECTS
+    }
+    assert validate_advanced_options_enrollment_plan_payload(
+        payload
+    ) == payload
+
+
+def test_enrollment_plan_rejects_divergence_stale_selection_and_scope_change():
+    plan = _enrollment_plan()
+    with pytest.raises(ValueError, match="identity changed"):
+        advanced_options_enrollment_plan_payload(
+            replace(plan, enrollment_sha256="0" * 64)
+        )
+    with pytest.raises(ValueError, match="stale or expired"):
+        _enrollment_plan(activity_selection=_activity_selection(
+            reviewed_at=PLANNED - timedelta(minutes=4),
+            valid_until=PLANNED - timedelta(minutes=1),
+            contracts=(
+                replace(
+                    _activity_selection().contracts[0],
+                    catalog_observed_at=PLANNED - timedelta(minutes=6),
+                    market_data_time=PLANNED - timedelta(minutes=5),
+                ),
+            ),
+        ))
+    with pytest.raises(ValueError, match="primary slots only"):
+        _enrollment_plan(control_plane=_plan())
+
+
+def test_package_authorized_ids_and_immutable_developer_history_are_exact():
+    cohort_id = UUID(int=901)
+    plan_id = UUID(int=902)
+    control = _plan(
+        authorized_cohort_id=cohort_id,
+        authorized_plan_id=plan_id,
+    )
+    binding = build_advanced_options_history_binding(
+        target_cohort_id=cohort_id,
+        source_cohort_id=UUID(int=903),
+        history_before=PLANNED,
+        source_manifest_sha256="a" * 64,
+        authorization_reference="p8-history-test",
+    )
+
+    assert control.cohort_id == cohort_id
+    assert control.plan_id == plan_id
+    assert advanced_options_history_binding_payload(binding) == {
+        "contract_version": "advanced-options-history-binding-v1",
+        "target_cohort_id": str(cohort_id),
+        "source_cohort_id": str(UUID(int=903)),
+        "source_provider_tier": "MASSIVE_DEVELOPER",
+        "history_before": PLANNED.isoformat(),
+        "source_manifest_sha256": "a" * 64,
+        "authorization_reference": "p8-history-test",
+        "binding_sha256": binding.binding_sha256,
+    }
+    with pytest.raises(FrozenInstanceError):
+        binding.history_before = PLANNED + timedelta(seconds=1)
+
+
+def test_enrollment_accepts_frozen_prospective_reference_identity():
+    prospective = build_advanced_options_prospective_reference_identity(
+        reference_generation=1,
+        session_date=SESSION,
+        known_at=PLANNED,
+        valid_until=EXPIRES,
+        underlyings=("SPY",),
+        open_interest_sha256="6" * 64,
+    )
+    plan = _plan(
+        receipt_inputs=_receipt_inputs(
+            reference_state=prospective,
+            open_interest_sha256=prospective.open_interest_sha256,
+        )
+    )
+
+    assert plan.receipts.options_input_ready.spec.reference_generation == 1
+    assert plan.receipts.options_input_ready.spec.cutoff == CUTOFF

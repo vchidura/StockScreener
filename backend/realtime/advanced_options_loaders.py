@@ -66,6 +66,11 @@ class AdvancedOptionsCanonicalInputFacts:
     equity_window_id: UUID
     instrument_ids: dict[str, int]
     available_at: datetime
+    native_input_plan_sha256: str | None = None
+    native_input_sha256: str | None = None
+    executor_membership_sha256: str | None = None
+    mark_producer_plan_sha256: str | None = None
+    marks_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -172,6 +177,17 @@ class AdvancedOptionsCanonicalLoaders:
             market_state_heads_sha256=facts.market_state_heads_sha256,
             equity_input_receipt_id=facts.equity_input_receipt_id,
             equity_input_sha256=facts.equity_input_sha256,
+            native_input_plan_sha256=(
+                facts.native_input_plan_sha256
+            ),
+            native_input_sha256=facts.native_input_sha256,
+            executor_membership_sha256=(
+                facts.executor_membership_sha256
+            ),
+            mark_producer_plan_sha256=(
+                facts.mark_producer_plan_sha256
+            ),
+            marks_sha256=facts.marks_sha256,
         )
         gate = build_advanced_options_input_gate_plan(
             closure,
@@ -193,13 +209,25 @@ class AdvancedOptionsCanonicalLoaders:
                 universe_sha256=facts.control_plane.universe.sha256,
                 members=gate.barrier_members,
             )
-            self._record_barrier_outcome(
-                unit.cursor,
-                barrier_id=gate.barrier_id,
-                member_key="EQUITY_INPUT_READY",
-                outcome=BarrierOutcome.COMPLETE,
-                outcome_input_sha256=facts.equity_input_sha256,
+            completed_members = (
+                gate.barrier_members
+                if closure.has_canonical_producer_evidence
+                else tuple(
+                    member
+                    for member in gate.barrier_members
+                    if member.member_key == "EQUITY_INPUT_READY"
+                )
             )
+            for member in completed_members:
+                self._record_barrier_outcome(
+                    unit.cursor,
+                    barrier_id=gate.barrier_id,
+                    member_key=member.member_key,
+                    outcome=BarrierOutcome.COMPLETE,
+                    outcome_input_sha256=(
+                        member.expected_input_sha256
+                    ),
+                )
             verdict = self._evaluate_barrier(
                 unit.cursor,
                 gate.barrier_id,
@@ -298,6 +326,7 @@ def build_canonical_advanced_options_runtime_binding(
     port: AdvancedOptionsCanonicalRuntimePort,
     cycle_writer: Callable | None = None,
     projection_writer: Callable | None = None,
+    page_source_loader: Callable | None = None,
 ) -> tuple[
     AdvancedOptionsRuntimeBinding,
     AdvancedOptionsCanonicalLoaders,
@@ -321,5 +350,7 @@ def build_canonical_advanced_options_runtime_binding(
         values["cycle_writer"] = cycle_writer
     if projection_writer is not None:
         values["projection_writer"] = projection_writer
+    if page_source_loader is not None:
+        values["page_source_loader"] = page_source_loader
     binding = AdvancedOptionsRuntimeBinding(**values)
     return binding, loaders

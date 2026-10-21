@@ -100,6 +100,66 @@ def test_container_cli_requires_exact_component_secret_set(tmp_path):
         ])
 
 
+def test_container_windows_child_uses_subprocess(monkeypatch):
+    observed = {}
+
+    def run(command, *, env, check):
+        observed["command"] = command
+        observed["environment"] = env
+        observed["check"] = check
+        return SimpleNamespace(returncode=7)
+
+    monkeypatch.setattr(container.subprocess, "run", run)
+    monkeypatch.setattr(
+        container.os,
+        "execvpe",
+        lambda *_args: pytest.fail("Windows child used execvpe"),
+    )
+
+    assert container.run_child(
+        ["python", "-V"],
+        {"PATH": "retained"},
+        windows=True,
+    ) == 7
+    assert observed == {
+        "command": ["python", "-V"],
+        "environment": {"PATH": "retained"},
+        "check": False,
+    }
+
+
+def test_p8_executor_loads_only_owned_host_environment(tmp_path):
+    environment_file = tmp_path / ".env"
+    environment_file.write_text(
+        "REALTIME_V2_APP_DSN=host-dsn\n"
+        "POLYGON_API_KEY=provider-key\n"
+        "BROKER_PASSWORD=forbidden-extra\n",
+        encoding="utf-8",
+    )
+    args = container.parse_args([
+        "--component",
+        "options-p8-executor",
+        "--environment-file",
+        str(environment_file),
+        "--",
+        "python",
+        "-V",
+    ])
+
+    environment = container.child_environment_from_file(
+        args.component,
+        args.environment_file,
+        {"PATH": "retained"},
+    )
+
+    assert args.command == ["python", "-V"]
+    assert environment == {
+        "PATH": "retained",
+        "REALTIME_V2_APP_DSN": "host-dsn",
+        "POLYGON_API_KEY": "provider-key",
+    }
+
+
 def test_docker_secret_dsn_rewrites_only_loopback_host():
     rewritten = secrets._container_dsn(
         "postgresql://reader:secret@127.0.0.1:5432/stocks_realtime_v2",

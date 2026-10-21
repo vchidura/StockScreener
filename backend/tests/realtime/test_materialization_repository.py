@@ -144,6 +144,12 @@ def test_quote_and_checkpoint_commit_atomically_after_active_lease_fence():
     assert "event_at < EXCLUDED.event_at" in statements[quote_index]
     assert "received_at < EXCLUDED.received_at" in statements[quote_index]
     assert "source_session < EXCLUDED.source_session" in statements[trade_index]
+    trade_parameters = next(
+        call.args[1]
+        for call in cursor.execute.call_args_list
+        if "INSERT INTO rt.trade_current" in call.args[0]
+    )
+    assert trade_parameters[14] == []
     assert connection.commit.call_count == 1
     assert connection.rollback.call_count == 0
 

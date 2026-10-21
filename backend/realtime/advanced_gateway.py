@@ -38,12 +38,19 @@ class GatewayControlError(RuntimeError):
         self,
         reason_code: str,
         statuses: tuple[str, ...] = (),
+        provider_messages: tuple[str, ...] = (),
     ) -> None:
         normalized = tuple(sorted({
             status.strip().lower() for status in statuses if status.strip()
         }))
+        messages = tuple(sorted({
+            message.strip()[:256]
+            for message in provider_messages
+            if message.strip()
+        }))
         self.reason_code = reason_code
         self.statuses = normalized
+        self.provider_messages = messages
         detail = (
             reason_code
             if not normalized
@@ -310,9 +317,16 @@ class AdvancedGateway:
                 "max_connections",
             }:
                 self._set_state(GatewayFeedState.BLOCKED)
+                provider_messages = tuple(
+                    str(row.get("message") or "")
+                    for row in rows
+                    if str(row.get("status") or "").lower()
+                    == "max_connections"
+                )
                 raise GatewayControlError(
                     f"{failure_prefix}_REJECTED",
                     tuple(statuses),
+                    provider_messages,
                 )
         self._set_state(GatewayFeedState.BLOCKED)
         raise GatewayControlError(f"{failure_prefix}_CONTROL_LIMIT_EXCEEDED")

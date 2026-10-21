@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 
 from .database_access_v2 import V2ConnectionProvider
+from .advanced_options_service import OPTIONS_NON_SERVING_STAGE_ORDER
 from .runner_environment import RunnerEnvironment
 from .stage_graph import STAGES_V1
 from .stage_orchestrator import StageRunner
@@ -113,3 +114,18 @@ def build_runners(enabled: frozenset[str] | set[str], database: V2ConnectionProv
         raise LookupError("stages without a V2 runner binding: " + ", ".join(sorted(missing)))
     environment = environment or RunnerEnvironment(database)
     return {name: RUNNER_FACTORIES[name](environment) for name in enabled}
+
+
+def build_advanced_options_non_serving_runners(
+    database: V2ConnectionProvider | None,
+    *,
+    environment: RunnerEnvironment,
+) -> Mapping[str, StageRunner]:
+    if environment.database is not database:
+        raise ValueError(
+            "Advanced Options runner database ownership changed"
+        )
+    return {
+        name: RUNNER_FACTORIES[name](environment)
+        for name in OPTIONS_NON_SERVING_STAGE_ORDER
+    }

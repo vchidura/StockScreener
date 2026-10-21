@@ -28,6 +28,13 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from options.config import load_option_runtime_configuration  # noqa: E402
+from realtime.advanced_options_control_plane import (  # noqa: E402
+    AdvancedOptionsEnrollmentPlan,
+    AdvancedOptionsHistoryBinding,
+    advanced_options_enrollment_plan_payload,
+    persist_advanced_options_enrollment,
+    validate_advanced_options_enrollment_plan_payload,
+)
 from realtime.contracts import DEVELOPER_FORWARD_UNIVERSE  # noqa: E402
 from realtime.database_access import RealtimeDatabaseRole  # noqa: E402
 from realtime.database_access_v2 import APP_ROLE, V2AccessConfig, V2ConnectionProvider  # noqa: E402
@@ -71,17 +78,86 @@ MINIMUM_REQUEST_INTERVAL_SECONDS = 0.5
 MAXIMUM_DURATION_SECONDS = 300
 
 
+def execute_frozen_advanced_options_enrollment(
+    connection,
+    plan: AdvancedOptionsEnrollmentPlan,
+    history_binding: AdvancedOptionsHistoryBinding,
+    *,
+    database_name: str,
+    confirmed_database_name: str,
+) -> bool:
+    validate_target_database_v2(
+        database_name,
+        confirmed_database_name,
+        security_mode=SECURITY_MODE_HARDENED,
+    )
+    if database_name != EXPECTED_V2_DATABASE_NAME:
+        raise ValueError(
+            "Advanced Options enrollment targets only stocks_realtime_v2"
+        )
+    if not isinstance(plan, AdvancedOptionsEnrollmentPlan):
+        raise TypeError("frozen Advanced Options enrollment plan is required")
+    if not isinstance(history_binding, AdvancedOptionsHistoryBinding):
+        raise TypeError("frozen Advanced Options history binding is required")
+    advanced_options_enrollment_plan_payload(plan)
+    if history_binding.target_cohort_id != plan.control_plane.cohort_id:
+        raise ValueError(
+            "Advanced Options enrollment and history binding diverged"
+        )
+    return persist_advanced_options_enrollment(
+        connection,
+        plan,
+        history_binding=history_binding,
+    )
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", required=True)
-    parser.add_argument("--confirm-database-name", required=True)
-    parser.add_argument("--session-date", type=date.fromisoformat, required=True)
-    parser.add_argument("--deadline", type=datetime.fromisoformat, required=True)
-    parser.add_argument("--authorized-underlyings", nargs="+", required=True)
-    parser.add_argument("--authorization-reference", required=True)
+    parser.add_argument("--database")
+    parser.add_argument("--confirm-database-name")
+    parser.add_argument("--session-date", type=date.fromisoformat)
+    parser.add_argument("--deadline", type=datetime.fromisoformat)
+    parser.add_argument("--authorized-underlyings", nargs="+")
+    parser.add_argument("--authorization-reference")
     parser.add_argument("--report-path", type=Path, required=True)
+    parser.add_argument(
+        "--prospective-control-plane-plan",
+        type=Path,
+        help=(
+            "validate one prepared Advanced Options enrollment PLAN without "
+            "opening a database or provider"
+        ),
+    )
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
+    if args.report_path.exists():
+        parser.error("--report-path must be new")
+    if args.prospective_control_plane_plan is not None:
+        if args.execute:
+            parser.error(
+                "prospective Advanced Options enrollment cannot execute"
+            )
+        if args.database is not None or args.confirm_database_name is not None:
+            parser.error(
+                "prospective Advanced Options enrollment cannot select a database"
+            )
+        if not args.prospective_control_plane_plan.is_file():
+            parser.error("--prospective-control-plane-plan must be a file")
+        return args
+    missing = [
+        name
+        for name, value in (
+            ("--database", args.database),
+            ("--confirm-database-name", args.confirm_database_name),
+            ("--session-date", args.session_date),
+            ("--deadline", args.deadline),
+            ("--authorized-underlyings", args.authorized_underlyings),
+            ("--authorization-reference", args.authorization_reference),
+        )
+        if value is None
+    ]
+    if missing:
+        parser.error(f"legacy enrollment requires {', '.join(missing)}")
     validate_target_database_v2(
         args.database,
         args.confirm_database_name,
@@ -95,8 +171,6 @@ def parse_args(argv=None):
     args.authorized_underlyings = tuple(
         symbol.strip().upper() for symbol in args.authorized_underlyings
     )
-    if args.report_path.exists():
-        parser.error("--report-path must be new")
     if not args.authorization_reference.strip():
         parser.error("--authorization-reference cannot be blank")
     return args
@@ -186,8 +260,46 @@ def _report_base(args):
     }
 
 
+def _prospective_control_plane_report(args):
+    payload = json.loads(
+        args.prospective_control_plane_plan.read_text(encoding="utf-8")
+    )
+    plan = validate_advanced_options_enrollment_plan_payload(payload)
+    return {
+        "status": "PLAN",
+        "action": "PROSPECTIVE_MARKET_OPTIONS_ENROLLMENT",
+        "enrollment_id": plan["enrollment_id"],
+        "enrollment_sha256": plan["enrollment_sha256"],
+        "session_date": plan["session_date"],
+        "source_equity": plan["source_equity"],
+        "market_options": plan["market_options"],
+        "slot_set": plan["slot_set"],
+        "activity_selection_sha256": (
+            plan["activity_selection"]["selection_sha256"]
+        ),
+        "activity_source_sha256": (
+            plan["activity_selection"]["source_sha256"]
+        ),
+        "activity_source_clocks_sha256": (
+            plan["activity_selection"]["source_clocks_sha256"]
+        ),
+        "effect_counts": plan["effect_counts"],
+        "provider_requests": 0,
+        "provider_sockets": 0,
+        "database_writes": False,
+        "production_authority": False,
+        "execution_available": False,
+        "reason_codes": [],
+    }
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.prospective_control_plane_plan is not None:
+        report = _prospective_control_plane_report(args)
+        write_report(args.report_path, report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
     report = _report_base(args)
     if args.authorized_underlyings != DEVELOPER_FORWARD_UNIVERSE.option_underlyings:
         report.update(

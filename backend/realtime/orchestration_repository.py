@@ -175,6 +175,74 @@ class CycleReceiptSpec:
     advance_release: bool = False
 
 
+def persist_cycle_receipt_cursor(
+    cursor,
+    *,
+    window_id: UUID,
+    cohort_id: UUID,
+    spec: CycleReceiptSpec,
+) -> UUID:
+    if not isinstance(window_id, UUID) or not isinstance(cohort_id, UUID):
+        raise TypeError("cycle receipt scope is invalid")
+    if not isinstance(spec, CycleReceiptSpec):
+        raise TypeError("cycle receipt spec is invalid")
+    if spec.cutoff.tzinfo is None or spec.cutoff.utcoffset() is None:
+        raise ValueError("cycle receipt cutoff must be timezone-aware")
+    if type(spec.reference_generation) is not int or spec.reference_generation <= 0:
+        raise ValueError("cycle receipt reference generation must be positive")
+    for name, value in (
+        ("universe_sha256", spec.universe_sha256),
+        ("input_sha256", spec.input_sha256),
+    ):
+        if len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ValueError(f"cycle receipt {name} must be a SHA-256 digest")
+    if not spec.receipt_kind.strip() or not spec.build_id.strip():
+        raise ValueError("cycle receipt kind and build ID cannot be blank")
+    cursor.execute(
+        "INSERT INTO rt.cycle_receipts (receipt_id, window_id, cohort_id, "
+        "receipt_kind, cutoff, reference_generation, universe_sha256, "
+        "input_sha256, build_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (window_id, receipt_kind) DO NOTHING",
+        (
+            str(uuid4()),
+            str(window_id),
+            str(cohort_id),
+            spec.receipt_kind,
+            spec.cutoff,
+            spec.reference_generation,
+            spec.universe_sha256,
+            spec.input_sha256,
+            spec.build_id,
+        ),
+    )
+    cursor.execute(
+        "SELECT receipt_id, window_id, cohort_id, receipt_kind, cutoff, "
+        "reference_generation, universe_sha256, input_sha256, build_id "
+        "FROM rt.cycle_receipts WHERE window_id=%s AND receipt_kind=%s",
+        (str(window_id), spec.receipt_kind),
+    )
+    row = cursor.fetchone()
+    if row is None or tuple(
+        str(value) if isinstance(value, UUID) else value
+        for value in row[1:]
+    ) != (
+        str(window_id),
+        str(cohort_id),
+        spec.receipt_kind,
+        spec.cutoff,
+        spec.reference_generation,
+        spec.universe_sha256,
+        spec.input_sha256,
+        spec.build_id,
+    ):
+        raise ValueError(
+            f"receipt {spec.receipt_kind} already recorded with different inputs"
+        )
+    return UUID(str(row[0]))
+
+
 def build_options_receipt_spec(
     *,
     receipt_kind: str,
@@ -474,19 +542,12 @@ class PostgresOrchestrationRepository:
                                 "FOR SHARE", (str(run.stage_run_id),))
             if unit.cursor.fetchone() is None:
                 raise LeaseLost(f"stage run {run.stage_run_id} is no longer running; its receipt is rejected")
-            unit.cursor.execute(
-                "INSERT INTO rt.cycle_receipts (receipt_id, window_id, cohort_id, receipt_kind, cutoff, "
-                "reference_generation, universe_sha256, input_sha256, build_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (window_id, receipt_kind) DO NOTHING",
-                (str(uuid4()), str(claim.window.window_id), str(claim.window.cohort_id), spec.receipt_kind,
-                 spec.cutoff, spec.reference_generation, spec.universe_sha256, spec.input_sha256, spec.build_id))
-            unit.cursor.execute(
-                "SELECT receipt_id, input_sha256 FROM rt.cycle_receipts WHERE window_id = %s AND receipt_kind = %s",
-                (str(claim.window.window_id), spec.receipt_kind))
-            receipt_id, input_sha256 = unit.cursor.fetchone()
-        if input_sha256 != spec.input_sha256:
-            raise ValueError(f"receipt {spec.receipt_kind} already recorded with different inputs")
-        return UUID(str(receipt_id))
+            return persist_cycle_receipt_cursor(
+                unit.cursor,
+                window_id=claim.window.window_id,
+                cohort_id=claim.window.cohort_id,
+                spec=spec,
+            )
 
     def advance_release(self, claim: WindowClaim, receipt_id: UUID, cutoff: datetime, now: datetime) -> bool:
         with self._transaction() as unit:

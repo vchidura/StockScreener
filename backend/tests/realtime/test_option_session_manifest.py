@@ -20,8 +20,13 @@ from realtime.option_session_manifest import (
     BoundedOptionManifestPolicy,
     ContractSelectionStatus,
     ManifestSelectionStatus,
+    OptionActivityContract,
+    OptionActivitySelectionRecord,
     OptionManifestCandidate,
     build_bounded_option_session_manifest,
+    option_activity_selection_from_payload,
+    option_activity_selection_payload,
+    validate_option_activity_selection,
 )
 from realtime.preflight import DetectorFamily, ProviderTier
 
@@ -516,3 +521,105 @@ def test_tier_detector_contracts_cannot_be_relabelled():
             candidates,
             session_date=SESSION_DATE,
         )
+
+
+def _activity_contract(**changes):
+    values = dict(
+        instrument_id=501,
+        contract_id=601,
+        catalog_version_id=701,
+        contract_ticker="O:SPY261120C00500000",
+        underlyer="SPY",
+        call_put="C",
+        expiration_date=date(2026, 11, 20),
+        strike=Decimal("500"),
+        exercise_style="AMERICAN",
+        multiplier=Decimal("100"),
+        deliverables=(),
+        eligibility="VALIDATED_ACTIVE",
+        catalog_effective_from=MARKET_TIME - timedelta(days=1),
+        catalog_effective_to=None,
+        catalog_observed_at=MARKET_TIME,
+        catalog_payload_sha256="1" * 64,
+        market_data_time=MARKET_TIME + timedelta(minutes=1),
+        source_sha256="2" * 64,
+    )
+    values.update(changes)
+    return OptionActivityContract(**values)
+
+
+def _activity_selection(**changes):
+    values = dict(
+        authorization_reference="external-selection-20261005",
+        reviewed_at=MARKET_TIME + timedelta(minutes=2),
+        valid_until=MARKET_TIME + timedelta(minutes=5),
+        policy_sha256="3" * 64,
+        source_sha256="4" * 64,
+        quote_ceiling=2,
+        contracts=(_activity_contract(),),
+    )
+    values.update(changes)
+    return OptionActivitySelectionRecord(**values)
+
+
+def test_activity_selection_exact_replay_freezes_sources_and_clocks():
+    selection = _activity_selection()
+    payload = option_activity_selection_payload(selection)
+
+    replayed = option_activity_selection_from_payload(
+        payload,
+        required_at=MARKET_TIME + timedelta(minutes=3),
+        expected_underlyings=("SPY",),
+        expected_quote_ceiling=2,
+    )
+
+    assert replayed == selection
+    assert replayed.selection_sha256 == payload["selection_sha256"]
+    assert replayed.source_clocks_sha256 == payload["source_clocks_sha256"]
+
+
+def test_activity_selection_rejects_stale_scope_expansion_and_divergence():
+    selection = _activity_selection()
+    with pytest.raises(ValueError, match="stale or expired"):
+        validate_option_activity_selection(
+            selection,
+            required_at=MARKET_TIME + timedelta(minutes=6),
+            expected_underlyings=("SPY",),
+            expected_quote_ceiling=2,
+        )
+    with pytest.raises(ValueError, match="expands or changes scope"):
+        validate_option_activity_selection(
+            selection,
+            required_at=MARKET_TIME + timedelta(minutes=3),
+            expected_underlyings=("QQQ", "SPY"),
+            expected_quote_ceiling=2,
+        )
+    payload = option_activity_selection_payload(selection)
+    payload["source_sha256"] = "5" * 64
+    with pytest.raises(ValueError, match="digest changed"):
+        option_activity_selection_from_payload(
+            payload,
+            required_at=MARKET_TIME + timedelta(minutes=3),
+            expected_underlyings=("SPY",),
+            expected_quote_ceiling=2,
+        )
+
+
+def test_activity_selection_rejects_duplicate_adjusted_and_invalid_contracts():
+    contract = _activity_contract()
+    with pytest.raises(ValueError, match="duplicate underlyer"):
+        _activity_selection(contracts=(
+            contract,
+            replace(
+                contract,
+                instrument_id=502,
+                contract_id=602,
+                catalog_version_id=702,
+                contract_ticker="O:SPY261120P00500000",
+                call_put="P",
+            ),
+        ))
+    with pytest.raises(ValueError, match="adjusted or ineligible"):
+        replace(contract, multiplier=Decimal("150"))
+    with pytest.raises(ValueError, match="ticker identity"):
+        replace(contract, contract_ticker="O:SPY261120C00510000")

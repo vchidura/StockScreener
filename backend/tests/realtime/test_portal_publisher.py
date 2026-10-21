@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -278,6 +279,40 @@ def test_release_is_published_in_the_snapshot_transaction_only_with_a_receipt():
         release_repository=lambda *args, **options: pytest.fail("no receipt, no release"),
         claim_repository=lambda active, **kwargs: (),
     )
+
+
+def test_disposable_canary_publication_never_claims_or_delivers_outbox():
+    database, _, _ = _database()
+    claimed = []
+    delivered = []
+    config = replace(_config(), dispatch_authorized=False)
+
+    status = run_portal_publication_once(
+        database,
+        config,
+        PortalPublicationBatch(_batch().snapshots, receipt=_receipt()),
+        FakeSink(delivered),
+        checked_at=NOW,
+        snapshot_repository=lambda active, snapshot: None,
+        release_repository=lambda active, receipt, snapshots: None,
+        claim_repository=lambda active, **kwargs: claimed.append(kwargs),
+    )
+
+    assert status.promoted_snapshots == len(_batch().snapshots)
+    assert status.claimed == 0
+    assert claimed == []
+    assert delivered == []
+
+
+def test_non_ticker_lane_can_publish_without_synthesizing_ticker_pages():
+    summary = _summary()
+
+    batch = PortalPublicationBatch(
+        (summary,),
+        receipt=_receipt(),
+    )
+
+    assert batch.snapshots == (summary,)
 
 
 def test_session_close_publishes_kept_variants_and_never_keeps_per_ticker_pages():

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from uuid import UUID
 
 from .contracts import MarketChannel
@@ -30,7 +31,13 @@ class ActiveSlotSet:
     activated_at: datetime
 
 
-def _verify_member_identities(cursor, cohort_id: UUID, members: tuple[SlotSetMember, ...]) -> None:
+def _verify_member_identities(
+    cursor,
+    cohort_id: UUID,
+    members: tuple[SlotSetMember, ...],
+    *,
+    effective_at: datetime,
+) -> None:
     """The cohort must be a MARKET_OPTIONS cohort and every member an option contract of one of its underlyings.
 
     The foreign keys only prove that the instrument and the catalog version exist, not that they belong together.
@@ -63,16 +70,34 @@ def _verify_member_identities(cursor, cohort_id: UUID, members: tuple[SlotSetMem
         for instrument_id, asset_class, contract_id in cursor.fetchall()
     }
     cursor.execute(
-        "SELECT version.version_id, version.contract_id, contract.underlying_security_id::text "
+        "SELECT version.version_id, version.contract_id, "
+        "contract.underlying_security_id::text, version.expiration, "
+        "version.exercise_style, version.multiplier, version.deliverables, "
+        "version.eligibility, version.effective_from, version.effective_to "
         "FROM ref.option_contract_versions AS version "
         "JOIN ref.option_contracts AS contract ON contract.contract_id=version.contract_id "
         "WHERE version.version_id=ANY(%s)",
         (sorted({row.catalog_version_id for row in members}),),
     )
     versions = {
-        int(version_id): (int(contract_id), str(security_id))
-        for version_id, contract_id, security_id in cursor.fetchall()
+        int(row[0]): (
+            int(row[1]),
+            str(row[2]),
+            row[3],
+            str(row[4]),
+            Decimal(row[5]),
+            row[6],
+            str(row[7]),
+            _utc(row[8], "catalog effective_from"),
+            (
+                None
+                if row[9] is None
+                else _utc(row[9], "catalog effective_to")
+            ),
+        )
+        for row in cursor.fetchall()
     }
+    effective = _utc(effective_at, "slot set effective_at")
     for row in members:
         instrument = instruments.get(row.instrument_id)
         version = versions.get(row.catalog_version_id)
@@ -82,6 +107,18 @@ def _verify_member_identities(cursor, cohort_id: UUID, members: tuple[SlotSetMem
             raise ValueError("slot set member catalog version does not belong to its instrument")
         if version[1] not in underlying_securities:
             raise ValueError("slot set member underlying is outside the cohort option universe")
+        if (
+            version[2] < effective.date()
+            or version[3] != "AMERICAN"
+            or version[4] != Decimal("100")
+            or version[5] != []
+            or version[6] != "VALIDATED_ACTIVE"
+            or version[7] > effective
+            or (version[8] is not None and version[8] <= effective)
+        ):
+            raise ValueError(
+                "slot set member catalog version is adjusted, expired, or ineligible"
+            )
 
 
 def load_slot_set_version_cursor(
@@ -128,7 +165,12 @@ def load_slot_set_version_cursor(
     ):
         raise ValueError("stored slot set hash or counts do not match its members")
     if verify_identities:
-        _verify_member_identities(cursor, cohort_id, loaded.members)
+        _verify_member_identities(
+            cursor,
+            cohort_id,
+            loaded.members,
+            effective_at=loaded.effective_at,
+        )
     return loaded
 
 
@@ -141,7 +183,12 @@ def persist_slot_set_version_cursor(cursor, slot_set: SlotSetVersion) -> SlotSet
         if stored != slot_set:
             raise ValueError("persisted slot set conflicts with a divergent replay")
         return stored
-    _verify_member_identities(cursor, slot_set.cohort_id, slot_set.members)
+    _verify_member_identities(
+        cursor,
+        slot_set.cohort_id,
+        slot_set.members,
+        effective_at=slot_set.effective_at,
+    )
     cursor.execute(
         "SELECT COALESCE(max(version), 0) FROM rt.slot_set_versions WHERE cohort_id=%s",
         (str(slot_set.cohort_id),),

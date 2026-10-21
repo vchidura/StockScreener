@@ -251,6 +251,16 @@ def test_entitlement_configuration_gap_and_budget_failures_are_terminal(
     assert failure.terminal_outcome == outcome
 
 
+def test_max_connections_is_a_transient_concurrency_conflict():
+    failure = classify_advanced_ingress_failure(
+        "GatewayControlError",
+        detail="ADVANCED_AUTH_REJECTED:max_connections",
+    )
+
+    assert failure.disposition is IngressFailureDisposition.TRANSIENT
+    assert failure.terminal_outcome == "FAILED_INFRASTRUCTURE"
+
+
 def test_transient_streak_resets_only_after_stable_live_interval():
     unstable = classify_advanced_ingress_failure(
         "TimeoutError",

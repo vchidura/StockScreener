@@ -103,6 +103,9 @@ RELATIONS: dict[str, Relation] = {
         "control", "BOUNDED", append=True, api=True
     ),
     "rt.worker_leases": _r("control", "BOUNDED", mutable=True, delete=True),
+    "rt.advanced_options_read_pins": _r(
+        "control", "BOUNDED", mutable=True, api=True
+    ),
     "rt.readiness_current": _r("control", "BOUNDED", mutable=True, api=True),
     "rt.readiness_transitions": _r("control", "BOUNDED", append=True, api=True),
     "rt.advanced_stream_authorizations": _r("control", "BOUNDED"),

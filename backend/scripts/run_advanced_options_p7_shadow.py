@@ -8,6 +8,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import UUID
 
 from dotenv import dotenv_values
 
@@ -19,6 +20,10 @@ if str(BACKEND_DIR) not in sys.path:
 from realtime.advanced_options_p7_executor import execute_shadow  # noqa: E402
 from realtime.advanced_options_p7_shadow import (  # noqa: E402
     approved_authorization,
+)
+from realtime.provider_socket_lease import (  # noqa: E402
+    HostProviderSocketLease,
+    default_provider_lock_path,
 )
 
 
@@ -33,6 +38,11 @@ def parse_args(argv=None):
         "--env-file",
         type=Path,
         default=BACKEND_DIR / ".env",
+    )
+    parser.add_argument(
+        "--provider-lock-path",
+        type=Path,
+        default=default_provider_lock_path(),
     )
     parser.add_argument("--execute", action="store_true")
     return parser.parse_args(argv)
@@ -49,7 +59,11 @@ def _api_key(path: Path) -> str:
     return key
 
 
-def main(argv=None) -> int:
+def main(
+    argv=None,
+    *,
+    provider_lease: HostProviderSocketLease | None = None,
+) -> int:
     args = parse_args(argv)
     manifest_path = args.manifest.resolve()
     approval_path = args.approval.resolve()
@@ -80,15 +94,34 @@ def main(argv=None) -> int:
             )
         )
         return 0
-    manifest_body = manifest_path.read_bytes()
-    approval_body = approval_path.read_bytes()
-    report = execute_shadow(
-        plan,
-        manifest_sha256=hashlib.sha256(manifest_body).hexdigest(),
-        approval_sha256=hashlib.sha256(approval_body).hexdigest(),
-        api_key=_api_key(args.env_file.resolve()),
-        now=datetime.now(UTC),
+    lease = provider_lease or HostProviderSocketLease(
+        args.provider_lock_path.resolve(),
+        plan["provider"]["connection_lease_resource_key"],
+        UUID(str(plan["run_id"])),
     )
+    acquired_here = provider_lease is None
+    if provider_lease is not None and (
+        not provider_lease.acquired
+        or provider_lease.resource_key
+        != plan["provider"]["connection_lease_resource_key"]
+        or provider_lease.owner_id != UUID(str(plan["run_id"]))
+    ):
+        raise RuntimeError("P7 provider socket lease ownership changed")
+    if acquired_here:
+        lease.acquire(now=datetime.now(UTC))
+    try:
+        manifest_body = manifest_path.read_bytes()
+        approval_body = approval_path.read_bytes()
+        report = execute_shadow(
+            plan,
+            manifest_sha256=hashlib.sha256(manifest_body).hexdigest(),
+            approval_sha256=hashlib.sha256(approval_body).hexdigest(),
+            api_key=_api_key(args.env_file.resolve()),
+            now=datetime.now(UTC),
+        )
+    finally:
+        if acquired_here:
+            lease.release(now=datetime.now(UTC))
     print(
         json.dumps(
             {

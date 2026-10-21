@@ -66,14 +66,6 @@ def create_app():
     dsn = os.getenv("REALTIME_V2_API_DSN", "").strip()
     if not dsn:
         raise RuntimeError("V2 portal API requires REALTIME_V2_API_DSN")
-    advanced_options_setting = os.getenv(
-        "REALTIME_V2_ADVANCED_OPTIONS_READS",
-        "DISABLED",
-    ).strip().upper()
-    if advanced_options_setting not in {"DISABLED", "ENABLED"}:
-        raise RuntimeError(
-            "REALTIME_V2_ADVANCED_OPTIONS_READS must be DISABLED or ENABLED"
-        )
     pool = ThreadedConnectionPool(1, 4, dsn=dsn)
     try:
         provider = V2ConnectionProvider(
@@ -89,9 +81,7 @@ def create_app():
         app = create_realtime_portal_app(
             build_realtime_portal_repositories(database),
             database_target="stocks_realtime_v2",
-            advanced_options_v2_enabled=(
-                advanced_options_setting == "ENABLED"
-            ),
+            advanced_options_v2_enabled=True,
         )
     except Exception:
         pool.closeall()

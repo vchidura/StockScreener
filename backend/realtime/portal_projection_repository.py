@@ -73,6 +73,15 @@ class PortalRelease:
     pointer_swapped: bool
 
 
+@dataclass(frozen=True, slots=True)
+class PortalReleasePointer:
+    cohort_id: UUID
+    provider_tier: ProviderTier
+    release_id: UUID
+    cutoff: datetime
+    session_date: date
+
+
 def portal_session_date(snapshot: RealtimePortalSnapshot, session_date: date | None = None) -> date:
     if session_date is not None:
         return session_date
@@ -119,6 +128,93 @@ def _stored_row(stored, names: Sequence[str]):
     if isinstance(stored, Mapping):
         stored = tuple(stored[name] for name in names)
     return tuple(str(value) if isinstance(value, UUID) else value for value in stored)
+
+
+def load_portal_release_pointer_cursor(
+    cursor,
+    *,
+    cohort_id: UUID,
+    provider_tier: ProviderTier,
+    for_update: bool = False,
+) -> PortalReleasePointer | None:
+    if not isinstance(provider_tier, ProviderTier):
+        raise TypeError("portal pointer provider tier is invalid")
+    cursor.execute(
+        "SELECT release_id::text,cutoff,session_date "
+        "FROM rt.portal_release_current WHERE cohort_id=%s "
+        "AND provider_tier=%s"
+        + (" FOR UPDATE" if for_update else ""),
+        (str(cohort_id), provider_tier.value),
+    )
+    stored = _stored_row(
+        cursor.fetchone(),
+        ("release_id", "cutoff", "session_date"),
+    )
+    if stored is None:
+        return None
+    return PortalReleasePointer(
+        cohort_id,
+        provider_tier,
+        UUID(str(stored[0])),
+        stored[1],
+        stored[2],
+    )
+
+
+def restore_portal_release_pointer_cursor(
+    cursor,
+    *,
+    cohort_id: UUID,
+    provider_tier: ProviderTier,
+    expected_current_release_id: UUID,
+    previous: PortalReleasePointer | None,
+) -> None:
+    cursor.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"portal-release:{cohort_id}:{provider_tier.value}",),
+    )
+    current = load_portal_release_pointer_cursor(
+        cursor,
+        cohort_id=cohort_id,
+        provider_tier=provider_tier,
+        for_update=True,
+    )
+    if current is None or current.release_id != expected_current_release_id:
+        raise ValueError("portal pointer changed before rollback")
+    if previous is None:
+        cursor.execute(
+            "DELETE FROM rt.portal_release_current "
+            "WHERE cohort_id=%s AND provider_tier=%s "
+            "AND release_id=%s",
+            (
+                str(cohort_id),
+                provider_tier.value,
+                str(expected_current_release_id),
+            ),
+        )
+    else:
+        if (
+            previous.cohort_id != cohort_id
+            or previous.provider_tier is not provider_tier
+        ):
+            raise ValueError("prior portal pointer scope changed")
+        cursor.execute(
+            "UPDATE rt.portal_release_current SET "
+            "release_id=%s,cutoff=%s,session_date=%s,"
+            "updated_at=clock_timestamp() "
+            "WHERE cohort_id=%s AND provider_tier=%s "
+            "AND release_id=%s",
+            (
+                str(previous.release_id),
+                previous.cutoff,
+                previous.session_date,
+                str(cohort_id),
+                provider_tier.value,
+                str(expected_current_release_id),
+            ),
+        )
+    if cursor.rowcount != 1:
+        raise ValueError("portal pointer rollback was not exact")
 
 
 def _write_snapshot(

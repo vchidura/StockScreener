@@ -22,6 +22,7 @@ from uuid import UUID, uuid4
 
 
 ARCHIVE_SCHEMA_VERSION = "realtime-session-archive-jsonl-gzip-v1"
+ARCHIVE_MANIFEST_CONTRACT = "realtime-session-archive-manifest-v2"
 
 STOCK_ALERTS = "STOCK_ALERTS"
 OPTION_ALERTS = "OPTION_ALERTS"
@@ -84,6 +85,8 @@ CLOCK_COLUMNS: Mapping[str, tuple[tuple[str, str], ...]] = {
 
 PIN_OPEN_HORIZON = "OPEN_HORIZON"
 PIN_OUTCOME_UNVERIFIED = "OUTCOME_UNVERIFIED"
+PIN_SELECTED_ALERT_DEPENDENCY = "SELECTED_ALERT_DEPENDENCY"
+PIN_RETENTION_HOLD = "RETENTION_HOLD"
 PIN_ARCHIVE_REFRESH_FAILED = "ARCHIVE_REFRESH_FAILED"
 PIN_LOOKUP_FAILED = "PIN_LOOKUP_FAILED"
 PIN_ROWS_OUTSIDE_SESSIONS = "ROWS_OUTSIDE_SESSIONS"
@@ -116,6 +119,8 @@ class VerificationCode(str, Enum):
     RELATION_COUNT_MISMATCH = "RELATION_COUNT_MISMATCH"
     CLOCKS_MISMATCH = "CLOCKS_MISMATCH"
     SOURCE_COUNT_MISMATCH = "SOURCE_COUNT_MISMATCH"
+    SOURCE_IDENTITY_MISMATCH = "SOURCE_IDENTITY_MISMATCH"
+    PARTITION_COVERAGE_MISMATCH = "PARTITION_COVERAGE_MISMATCH"
 
 
 class ArchiveVerificationError(ValueError):
@@ -150,7 +155,10 @@ class ArchiveIdentity:
     @property
     def sha256(self) -> str:
         return hashlib.sha256(
-            f"{self.build_id}\n{self.policy_id}".encode("utf-8")
+            (
+                f"{ARCHIVE_MANIFEST_CONTRACT}\n"
+                f"{self.build_id}\n{self.policy_id}"
+            ).encode("utf-8")
         ).hexdigest()
 
 
@@ -180,6 +188,8 @@ class BuiltArchive:
     row_count: int
     relation_counts: Mapping[str, int]
     clocks: Mapping[str, object]
+    source_identity: Mapping[str, object]
+    partition_coverage: Mapping[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +213,8 @@ class VerifiedArchive:
     schema_version: str
     build_id: str
     policy_id: str
+    source_identity: Mapping[str, object]
+    partition_coverage: Mapping[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,6 +364,64 @@ def summarize_clocks(entries: Iterable[tuple[str, Mapping[str, object]]]) -> dic
     }
 
 
+def summarize_source_identity(
+    kind: str,
+    entries: Iterable[tuple[str, Mapping[str, object]]],
+) -> dict[str, object]:
+    """Bind every flow primary row to its source-flow and journal generation."""
+    if kind not in FLOW_KINDS:
+        return {
+            "complete": True,
+            "identified_rows": 0,
+            "journal_generations": [],
+            "primary_relation": None,
+            "primary_rows": 0,
+            "source_flow_ids": [],
+        }
+    primary_relation = KIND_RELATIONS[kind][0]
+    source_flow_ids: set[str] = set()
+    journal_generations: set[str] = set()
+    primary_rows = 0
+    identified_rows = 0
+    for relation, document in entries:
+        if relation != primary_relation:
+            continue
+        primary_rows += 1
+        try:
+            source_flow_id = str(UUID(str(document["source_flow_id"])))
+            journal_generation = str(UUID(str(document["journal_generation"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        source_flow_ids.add(source_flow_id)
+        journal_generations.add(journal_generation)
+        identified_rows += 1
+    return {
+        "complete": identified_rows == primary_rows,
+        "identified_rows": identified_rows,
+        "journal_generations": sorted(journal_generations),
+        "primary_relation": primary_relation,
+        "primary_rows": primary_rows,
+        "source_flow_ids": sorted(source_flow_ids),
+    }
+
+
+def summarize_partition_coverage(
+    kind: str,
+    session_date: date,
+    relation_counts: Mapping[str, int],
+) -> dict[str, object]:
+    """Exact session and primary/companion relation coverage of one archive."""
+    return {
+        "complete": set(relation_counts) == set(KIND_RELATIONS[kind]),
+        "relation_counts": {
+            relation: int(relation_counts.get(relation, 0))
+            for relation in KIND_RELATIONS[kind]
+        },
+        "relations": list(KIND_RELATIONS[kind]),
+        "session_date": session_date.isoformat(),
+    }
+
+
 def build_archive(
     kind: str,
     session_date: date,
@@ -383,6 +453,10 @@ def build_archive(
         lines.append(_dumps({"relation": relation, "row": document}).encode("ascii"))
     content = b"".join(line + b"\n" for line in lines)
     payload = gzip.compress(content, compresslevel=9, mtime=0)
+    entries = tuple(
+        (relation, document)
+        for _, _, relation, document in prepared
+    )
     return BuiltArchive(
         kind=kind,
         session_date=session_date,
@@ -393,7 +467,13 @@ def build_archive(
         uncompressed_bytes=len(content),
         row_count=len(lines),
         relation_counts=counts,
-        clocks=summarize_clocks((relation, document) for _, _, relation, document in prepared),
+        clocks=summarize_clocks(entries),
+        source_identity=summarize_source_identity(kind, entries),
+        partition_coverage=summarize_partition_coverage(
+            kind,
+            session_date,
+            counts,
+        ),
     )
 
 
@@ -428,17 +508,21 @@ def render_manifest(built: BuiltArchive, *, file_name: str, identity: ArchiveIde
     """Manifest bytes. No wall-clock value is included, so they are reproducible."""
     document = {
         "archive_kind": built.kind,
+        "archive_identity_sha256": identity.sha256,
+        "archive_manifest_contract": ARCHIVE_MANIFEST_CONTRACT,
         "build_id": identity.build_id,
         "clocks": built.clocks,
         "content_sha256": built.content_sha256,
         "file": file_name,
         "horizon_close_date": built.horizon_close_date.isoformat() if built.horizon_close_date else None,
         "policy_id": identity.policy_id,
+        "partition_coverage": built.partition_coverage,
         "relation_counts": dict(built.relation_counts),
         "row_count": built.row_count,
         "schema_version": ARCHIVE_SCHEMA_VERSION,
         "session_date": built.session_date.isoformat(),
         "sha256": built.sha256,
+        "source_identity": built.source_identity,
         "uncompressed_bytes": built.uncompressed_bytes,
     }
     return (json.dumps(document, sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
@@ -558,6 +642,7 @@ def verify_archive(
     horizon_close_date: date | None = None,
     source_counts: Mapping[str, int] | None = None,
     identity: ArchiveIdentity | None = None,
+    require_retention_compatibility: bool = False,
 ) -> VerifiedArchive:
     """Re-read the files from disk and check them against the manifest and the source.
 
@@ -582,6 +667,41 @@ def verify_archive(
         or manifest["policy_id"] != identity.policy_id
     ):
         raise _fail(VerificationCode.IDENTITY_MISMATCH, "manifest build or policy identity differs from requested identity")
+    compatibility_fields = {
+        "archive_identity_sha256",
+        "archive_manifest_contract",
+        "partition_coverage",
+        "source_identity",
+    }
+    present_compatibility_fields = compatibility_fields.intersection(manifest)
+    if require_retention_compatibility and present_compatibility_fields != compatibility_fields:
+        raise _fail(
+            VerificationCode.MANIFEST_INVALID,
+            "retention compatibility identity or partition coverage is incomplete",
+        )
+    if present_compatibility_fields:
+        if present_compatibility_fields != compatibility_fields:
+            raise _fail(
+                VerificationCode.MANIFEST_INVALID,
+                "retention compatibility fields are incomplete",
+            )
+        if manifest["archive_manifest_contract"] != ARCHIVE_MANIFEST_CONTRACT:
+            raise _fail(
+                VerificationCode.SCHEMA_UNSUPPORTED,
+                str(manifest["archive_manifest_contract"])[:64],
+            )
+        try:
+            manifest_identity = ArchiveIdentity(
+                str(manifest["build_id"]),
+                str(manifest["policy_id"]),
+            )
+        except ValueError as error:
+            raise _fail(VerificationCode.MANIFEST_INVALID, str(error)) from error
+        if manifest["archive_identity_sha256"] != manifest_identity.sha256:
+            raise _fail(
+                VerificationCode.IDENTITY_MISMATCH,
+                "archive build and policy identity hash differs",
+            )
     try:
         payload = data_path.read_bytes()
     except FileNotFoundError:
@@ -619,6 +739,28 @@ def verify_archive(
         raise _fail(VerificationCode.RELATION_COUNT_MISMATCH, "per-relation counts differ from the manifest")
     if summarize_clocks(entries) != manifest["clocks"]:
         raise _fail(VerificationCode.CLOCKS_MISMATCH, "clock ranges differ from the manifest")
+    source_identity = summarize_source_identity(kind, entries)
+    partition_coverage = summarize_partition_coverage(
+        kind,
+        session_date,
+        counts,
+    )
+    if present_compatibility_fields:
+        if source_identity != manifest["source_identity"]:
+            raise _fail(
+                VerificationCode.SOURCE_IDENTITY_MISMATCH,
+                "source-flow or journal-generation coverage differs from the manifest",
+            )
+        if partition_coverage != manifest["partition_coverage"]:
+            raise _fail(
+                VerificationCode.PARTITION_COVERAGE_MISMATCH,
+                "primary or companion partition coverage differs from the manifest",
+            )
+    if require_retention_compatibility and not source_identity["complete"]:
+        raise _fail(
+            VerificationCode.SOURCE_IDENTITY_MISMATCH,
+            "one or more primary flow rows lack source-flow or journal-generation identity",
+        )
     if source_counts is not None and {relation: int(source_counts.get(relation, 0)) for relation in allowed} != counts:
         raise _fail(VerificationCode.SOURCE_COUNT_MISMATCH, "source row counts differ from the file")
     return VerifiedArchive(
@@ -633,6 +775,8 @@ def verify_archive(
         schema_version=str(manifest["schema_version"]),
         build_id=str(manifest["build_id"]),
         policy_id=str(manifest["policy_id"]),
+        source_identity=source_identity,
+        partition_coverage=partition_coverage,
     )
 
 

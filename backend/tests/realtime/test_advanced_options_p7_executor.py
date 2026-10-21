@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 import json
@@ -7,20 +8,36 @@ import time
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
+from random import Random
 from types import SimpleNamespace
 from uuid import UUID
 
+import pytest
+
+import realtime.advanced_options_p7_executor as p7_executor
 from realtime.advanced_options_ingress import AdvancedOptionsJournalPump
 from realtime.advanced_options_p7_executor import (
     _read_bounded_journal,
+    _reconnect_backoff_seconds,
     _subscription_manifest,
+    _wait_for_reconnect_backoff,
     execute_shadow,
 )
 from realtime.advanced_options_p7_executor import (
     run_disposable_database_phase,
 )
-from realtime.advanced_options_p7_shadow import build_authorization
+from realtime.advanced_options_p7_shadow import (
+    APPROVAL_VERSION,
+    OWNER_DECISION,
+    build_authorization,
+)
+from realtime.advanced_options_p7_selection import (
+    P7TransportCandidate,
+    p7_transport_selection_payload,
+    select_p7_transport_contracts,
+)
 from realtime.buffer import BufferLimits, RawMessageBuffer
 from realtime.contracts import AssetClass, MarketFeed, RawMessageEnvelope
 from realtime.normalizer import InstrumentAdmission
@@ -36,6 +53,40 @@ script = importlib.import_module("scripts.run_advanced_options_p7_shadow")
 
 
 def _plan(tmp_path):
+    spy = "O:SPY261020C00100000"
+    qqq = "O:QQQ261020P00100000"
+    candidates = (
+        P7TransportCandidate(
+            spy,
+            "SPY",
+            START.date(),
+            "C",
+            Decimal("100"),
+            Decimal("100"),
+            Decimal("1.00"),
+            Decimal("1.10"),
+            500,
+            1_000,
+            0,
+            START - timedelta(minutes=1),
+            "1" * 64,
+        ),
+        P7TransportCandidate(
+            qqq,
+            "QQQ",
+            START.date(),
+            "P",
+            Decimal("100"),
+            Decimal("100"),
+            Decimal("1.00"),
+            Decimal("1.10"),
+            600,
+            1_200,
+            0,
+            START - timedelta(minutes=1),
+            "2" * 64,
+        ),
+    )
     return build_authorization(
         run_id=RUN_ID,
         authorization_reference=(
@@ -45,8 +96,14 @@ def _plan(tmp_path):
         start_at=START,
         controlled_reconnect_at=START + timedelta(minutes=5),
         stop_at=START + timedelta(minutes=10),
-        spy_contract="O:SPY261120C00500000",
-        qqq_contract="O:QQQ261120C00500000",
+        spy_contract=spy,
+        qqq_contract=qqq,
+        contract_selection=p7_transport_selection_payload(
+            select_p7_transport_contracts(
+                candidates,
+                reviewed_at=START - timedelta(seconds=30),
+            )
+        ),
         backend_dir=BACKEND_DIR,
         artifact_root=tmp_path,
     )
@@ -88,11 +145,13 @@ def _capture(plan, _api_key):
         "condition_counts": {"209": 2},
         "exchange_counts": {"302": 2},
         "symbol_event_counts": {
-            "O:SPY261120C00500000|Q": 1,
-            "O:SPY261120C00500000|T": 1,
-            "O:QQQ261120C00500000|Q": 1,
-            "O:QQQ261120C00500000|T": 1,
+            "O:SPY261020C00100000|Q": 1,
+            "O:SPY261020C00100000|T": 1,
+            "O:QQQ261020P00100000|Q": 1,
+            "O:QQQ261020P00100000|T": 1,
         },
+        "provider_status_counts": {},
+        "provider_messages": [],
         "progress": {
             "last_raw_offset": 2,
             "last_event_offset": 4,
@@ -180,6 +239,161 @@ def test_p7_journal_reads_chunk_at_the_reader_limit():
     assert normalized_reader.limits == [10_000, 10_000, 10_000, 1]
 
 
+def test_reconnect_backoff_is_bounded_before_next_attempt():
+    waited = []
+
+    async def sleep(seconds):
+        waited.append(seconds)
+
+    asyncio.run(
+        _wait_for_reconnect_backoff(
+            5,
+            deadline=START + timedelta(seconds=6),
+            now=lambda: START,
+            sleep=sleep,
+        )
+    )
+
+    assert waited == [5]
+
+    with pytest.raises(
+        RuntimeError,
+        match="reconnect backoff leaves no capture time",
+    ):
+        asyncio.run(
+            _wait_for_reconnect_backoff(
+                5,
+                deadline=START + timedelta(seconds=5),
+                now=lambda: START,
+                sleep=sleep,
+            )
+        )
+
+    assert waited == [5]
+
+
+def test_reconnect_backoff_policy_is_manifest_bounded(tmp_path):
+    plan = _plan(tmp_path)
+    delays = [
+        _reconnect_backoff_seconds(
+            plan,
+            reconnect_number,
+            random_source=Random(reconnect_number),
+        )
+        for reconnect_number in range(1, 6)
+    ]
+
+    assert delays[0] == 5
+    assert all(delay >= 5 for delay in delays)
+    assert all(
+        delay <= ceiling
+        for delay, ceiling in zip(delays, (5, 10, 20, 40, 60))
+    )
+
+
+def test_capture_waits_for_backoff_before_second_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    events = []
+
+    async def run_attempt(_gateway, _pump, _buffer, *, deadline, **_kwargs):
+        events.append(("attempt", deadline))
+        return {
+            "termination": "DEADLINE",
+            "received_frames": 0,
+            "received_bytes": 0,
+            "provider_statuses": [],
+            "provider_messages": [],
+        }
+
+    async def wait_for_backoff(seconds, *, deadline):
+        events.append(("wait", seconds, deadline))
+
+    monkeypatch.setattr(p7_executor, "_run_attempt", run_attempt)
+    monkeypatch.setattr(
+        p7_executor,
+        "_reconnect_backoff_seconds",
+        lambda *_args, **_kwargs: 5.0,
+    )
+    monkeypatch.setattr(
+        p7_executor,
+        "_wait_for_reconnect_backoff",
+        wait_for_backoff,
+    )
+
+    result = asyncio.run(
+        p7_executor.capture_live_shadow(_plan(tmp_path), "test-secret")
+    )
+
+    reconnect_at = START + timedelta(minutes=5)
+    stop_at = START + timedelta(minutes=10)
+    assert events == [
+        ("attempt", reconnect_at),
+        ("wait", 5, stop_at),
+        ("attempt", stop_at),
+    ]
+    assert [
+        row["reconnect_backoff_seconds_before_attempt"]
+        for row in result["sessions"]
+    ] == [0.0, 5.0]
+    assert len(result["sessions"]) == 2
+
+
+def test_capture_exhausts_only_the_authorized_transient_attempts(
+    tmp_path,
+    monkeypatch,
+):
+    attempt_count = 0
+
+    async def run_attempt(_gateway, _pump, _buffer, **_kwargs):
+        nonlocal attempt_count
+        attempt_count += 1
+        if attempt_count == 1:
+            return {
+                "termination": "DEADLINE",
+                "received_frames": 0,
+                "received_bytes": 0,
+                "provider_statuses": [],
+                "provider_messages": [],
+            }
+        return {
+            "termination": "PROVIDER_DISCONNECT",
+            "received_frames": 2,
+            "received_bytes": 313,
+            "failure_disposition": "TRANSIENT",
+            "provider_statuses": ["max_connections"],
+            "provider_messages": [
+                "Maximum number of websocket connections exceeded."
+            ],
+        }
+
+    async def wait_for_backoff(_seconds, *, deadline):
+        assert deadline == START + timedelta(minutes=10)
+
+    monkeypatch.setattr(p7_executor, "_run_attempt", run_attempt)
+    monkeypatch.setattr(
+        p7_executor,
+        "_reconnect_backoff_seconds",
+        lambda *_args, **_kwargs: 5.0,
+    )
+    monkeypatch.setattr(
+        p7_executor,
+        "_wait_for_reconnect_backoff",
+        wait_for_backoff,
+    )
+
+    result = asyncio.run(
+        p7_executor.capture_live_shadow(_plan(tmp_path), "test-secret")
+    )
+
+    assert len(result["sessions"]) == 6
+    assert result["blockers"][:2] == [
+        "FINAL_PROVIDER_DISCONNECT",
+        "RECONNECT_ATTEMPT_BUDGET_EXHAUSTED",
+    ]
+
+
 def test_executor_writes_all_evidence_and_cleans_owned_temporary_data(
     tmp_path,
 ):
@@ -250,7 +464,7 @@ def test_live_cli_plan_validates_approval_without_loading_credentials(
         json.dumps(
             {
                 "contract_version": (
-                    "advanced-options-p7-shadow-approval-v1"
+                    APPROVAL_VERSION
                 ),
                 "manifest_id": plan["manifest_id"],
                 "manifest_sha256": hashlib.sha256(
@@ -260,10 +474,10 @@ def test_live_cli_plan_validates_approval_without_loading_credentials(
                     "authorization_reference"
                 ],
                 "owner_decision": (
-                    "approve_bounded_advanced_options_p7_shadow"
+                    OWNER_DECISION
                 ),
                 "conditional_live_shadow_authorized": True,
-                "provider_websocket_connection_attempts_authorized": 2,
+                "provider_websocket_connection_attempts_authorized": 6,
                 "provider_rest_requests_authorized": 0,
                 "production_effects_authorized": False,
             },
@@ -295,6 +509,27 @@ def test_live_cli_plan_validates_approval_without_loading_credentials(
     assert result["database_ddl"] == 0
     assert result["files_written"] == 0
 
+    with pytest.raises(
+        RuntimeError,
+        match="provider socket lease ownership changed",
+    ):
+        script.main(
+            [
+                "--manifest",
+                str(manifest),
+                "--approval",
+                str(approval),
+                "--execute",
+            ],
+            provider_lease=SimpleNamespace(
+                acquired=False,
+                resource_key=plan["provider"][
+                    "connection_lease_resource_key"
+                ],
+                owner_id=RUN_ID,
+            ),
+        )
+
 
 @requires_v2_database
 def test_real_executor_database_phase_replays_and_cleans(tmp_path):
@@ -321,16 +556,16 @@ def test_real_executor_database_phase_replays_and_cleans(tmp_path):
         monotonic_ns=time.monotonic_ns,
     )
     admissions = {
-        "O:SPY261120C00500000": InstrumentAdmission(
+        "O:SPY261020C00100000": InstrumentAdmission(
             1001,
-            "O:SPY261120C00500000",
+            "O:SPY261020C00100000",
             "SPY",
             AssetClass.OPTION,
             0,
         ),
-        "O:QQQ261120C00500000": InstrumentAdmission(
+        "O:QQQ261020P00100000": InstrumentAdmission(
             1002,
-            "O:QQQ261120C00500000",
+            "O:QQQ261020P00100000",
             "QQQ",
             AssetClass.OPTION,
             0,

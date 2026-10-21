@@ -14,6 +14,7 @@ from .advanced_options_rolling_state import (
     AdvancedOptionsOptionalRollingLane,
     AdvancedOptionsOrderWindowMember,
     AdvancedOptionsOrderWindowState,
+    AdvancedOptionsRollingProducerBinding,
     AdvancedOptionsRollingState,
     AdvancedOptionsUnderlyingTick,
     RollingAvailability,
@@ -171,6 +172,28 @@ def _optional_lane(
     )
 
 
+def _producer_binding(
+    value: Mapping[str, object] | None,
+) -> AdvancedOptionsRollingProducerBinding | None:
+    if value is None:
+        return None
+    return AdvancedOptionsRollingProducerBinding(
+        producer_plan_id=UUID(value["producer_plan_id"]),
+        producer_plan_sha256=value["producer_plan_sha256"],
+        reference_state_id=UUID(value["reference_state_id"]),
+        reference_state_sha256=value["reference_state_sha256"],
+        reference_generation=value["reference_generation"],
+        source_flow_id=UUID(value["source_flow_id"]),
+        source_flow_sha256=value["source_flow_sha256"],
+        known_at=_datetime(value["known_at"]),
+        valid_until=_datetime(value["valid_until"]),
+        unresolved_gaps_sha256=value["unresolved_gaps_sha256"],
+        source_watermarks_sha256=value["source_watermarks_sha256"],
+        market_state_heads_sha256=value["market_state_heads_sha256"],
+        volume_checkpoint_sha256=value["volume_checkpoint_sha256"],
+    )
+
+
 def decode_advanced_options_rolling_state(
     *,
     state_id: UUID,
@@ -202,7 +225,106 @@ def decode_advanced_options_rolling_state(
         order_windows=_order_windows(document["order_windows"]),
         iv_surface=_optional_lane(document["iv_surface"]),
         dark_pool=_optional_lane(document["dark_pool"]),
+        producer_binding=_producer_binding(document.get("producer_binding")),
     )
+
+
+def persist_advanced_options_rolling_state_cursor(
+    cursor,
+    state: AdvancedOptionsRollingState,
+) -> AdvancedOptionsRollingState:
+    if not isinstance(state, AdvancedOptionsRollingState):
+        raise TypeError("rolling state is invalid")
+    document = json.loads(canonical_json(state.identity))
+    cursor.execute(
+        "SELECT state_id,state_sha256,state_document FROM "
+        "rt.advanced_options_rolling_checkpoints "
+        "WHERE cohort_id=%s AND session_date=%s "
+        "AND journal_generation=%s AND owner_epoch=%s "
+        "AND committed_offset=%s",
+        (
+            str(state.cohort_id),
+            state.session_date,
+            str(state.journal_generation),
+            state.owner_epoch,
+            state.committed_offset,
+        ),
+    )
+    existing = cursor.fetchone()
+    if existing is not None:
+        if (
+            UUID(str(existing[0])) != state.state_id
+            or str(existing[1]) != state.state_sha256
+            or canonical_json(existing[2]) != canonical_json(document)
+        ):
+            raise ValueError("persisted rolling checkpoint conflicts")
+        return state
+    cursor.execute(
+        "SELECT state_id,state_sha256,state_document,journal_generation,"
+        "owner_epoch,committed_offset FROM "
+        "rt.advanced_options_rolling_checkpoints "
+        "WHERE cohort_id=%s AND session_date=%s "
+        "ORDER BY owner_epoch DESC,committed_offset DESC LIMIT 1",
+        (str(state.cohort_id), state.session_date),
+    )
+    latest = cursor.fetchone()
+    if latest is not None:
+        latest_generation = UUID(str(latest[3]))
+        latest_epoch = int(latest[4])
+        latest_offset = int(latest[5])
+        if latest_generation != state.journal_generation:
+            raise ValueError("rolling checkpoint source generation drifted")
+        if (
+            latest_epoch > state.owner_epoch
+            or latest_epoch == state.owner_epoch
+            and latest_offset > state.committed_offset
+        ):
+            raise ValueError("rolling checkpoint regressed")
+    cursor.execute(
+        "INSERT INTO rt.advanced_options_rolling_checkpoints ("
+        "state_id,state_sha256,state_version,cohort_id,session_date,"
+        "journal_generation,owner_epoch,committed_offset,committed_at,"
+        "market_state_checkpoint_sha256,flow_checkpoint_sha256,"
+        "state_document) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT DO NOTHING",
+        (
+            str(state.state_id),
+            state.state_sha256,
+            state.version,
+            str(state.cohort_id),
+            state.session_date,
+            str(state.journal_generation),
+            state.owner_epoch,
+            state.committed_offset,
+            state.committed_at,
+            state.market_state_checkpoint_sha256,
+            state.flow_checkpoint_sha256,
+            Json(document),
+        ),
+    )
+    cursor.execute(
+        "SELECT state_id,state_sha256,state_document FROM "
+        "rt.advanced_options_rolling_checkpoints "
+        "WHERE cohort_id=%s AND session_date=%s "
+        "AND journal_generation=%s AND owner_epoch=%s "
+        "AND committed_offset=%s",
+        (
+            str(state.cohort_id),
+            state.session_date,
+            str(state.journal_generation),
+            state.owner_epoch,
+            state.committed_offset,
+        ),
+    )
+    stored = cursor.fetchone()
+    if (
+        stored is None
+        or UUID(str(stored[0])) != state.state_id
+        or str(stored[1]) != state.state_sha256
+        or canonical_json(stored[2]) != canonical_json(document)
+    ):
+        raise ValueError("persisted rolling checkpoint conflicts")
+    return state
 
 
 class PostgresAdvancedOptionsRollingStateRepository:
@@ -215,54 +337,11 @@ class PostgresAdvancedOptionsRollingStateRepository:
     ) -> AdvancedOptionsRollingState:
         if not isinstance(state, AdvancedOptionsRollingState):
             raise TypeError("rolling state is invalid")
-        document = json.loads(canonical_json(state.identity))
         with self._provider.transaction() as unit:
-            cursor = unit.cursor
-            cursor.execute(
-                "INSERT INTO rt.advanced_options_rolling_checkpoints ("
-                "state_id,state_sha256,state_version,cohort_id,session_date,"
-                "journal_generation,owner_epoch,committed_offset,committed_at,"
-                "market_state_checkpoint_sha256,flow_checkpoint_sha256,"
-                "state_document) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                "ON CONFLICT DO NOTHING",
-                (
-                    str(state.state_id),
-                    state.state_sha256,
-                    state.version,
-                    str(state.cohort_id),
-                    state.session_date,
-                    str(state.journal_generation),
-                    state.owner_epoch,
-                    state.committed_offset,
-                    state.committed_at,
-                    state.market_state_checkpoint_sha256,
-                    state.flow_checkpoint_sha256,
-                    Json(document),
-                ),
+            return persist_advanced_options_rolling_state_cursor(
+                unit.cursor,
+                state,
             )
-            cursor.execute(
-                "SELECT state_id,state_sha256,state_document FROM "
-                "rt.advanced_options_rolling_checkpoints "
-                "WHERE cohort_id=%s AND session_date=%s "
-                "AND journal_generation=%s AND owner_epoch=%s "
-                "AND committed_offset=%s",
-                (
-                    str(state.cohort_id),
-                    state.session_date,
-                    str(state.journal_generation),
-                    state.owner_epoch,
-                    state.committed_offset,
-                ),
-            )
-            stored = cursor.fetchone()
-            if (
-                stored is None
-                or UUID(str(stored[0])) != state.state_id
-                or str(stored[1]) != state.state_sha256
-                or canonical_json(stored[2]) != canonical_json(document)
-            ):
-                raise ValueError("persisted rolling checkpoint conflicts")
-        return state
 
     @staticmethod
     def _decode(row) -> AdvancedOptionsRollingState | None:

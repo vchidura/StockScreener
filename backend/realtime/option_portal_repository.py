@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -133,6 +133,158 @@ def persist_realtime_option_package_cursor(
     package: RealtimeOptionPackage,
 ) -> None:
     _persist_package(cursor, package)
+
+
+def load_realtime_option_packages_cursor(
+    cursor,
+    candidate_ids: Sequence[UUID],
+    *,
+    cohort_id: UUID,
+) -> tuple[RealtimeOptionPackage, ...]:
+    identifiers = tuple(sorted(set(candidate_ids), key=str))
+    if any(not isinstance(value, UUID) for value in identifiers):
+        raise TypeError("option package candidate IDs must be UUIDs")
+    if not identifiers:
+        return ()
+    cursor.execute(
+        "SELECT package.candidate_id,package.event_id,package.matrix_id,"
+        "package.candidate_identity_sha256,package.cohort_id,"
+        "package.provider_tier,"
+        "package.entry_market_time AS package_entry_market_time,"
+        "package.entry_net_premium,package.capital_at_risk,"
+        "package.exit_deadline,package.leg_count,leg.leg_index,"
+        "leg.instrument_id,leg.contract_id,leg.catalog_version_id,"
+        "leg.contract_ticker,leg.side,leg.ratio,leg.multiplier,leg.strike,"
+        "leg.expiration_date,leg.contract_type,leg.entry_mark,"
+        "leg.entry_market_time AS leg_entry_market_time,"
+        "leg.valuation_policy_sha256 "
+        "FROM rt.option_packages AS package "
+        "JOIN rt.option_package_legs AS leg USING (candidate_id) "
+        "WHERE package.candidate_id=ANY(%s::uuid[]) "
+        "AND package.cohort_id=%s "
+        "ORDER BY package.candidate_id,leg.leg_index",
+        ([str(value) for value in identifiers], str(cohort_id)),
+    )
+    grouped: dict[UUID, list[tuple[object, ...]]] = {}
+    for stored in cursor.fetchall():
+        row = (
+            tuple(stored.values())
+            if isinstance(stored, Mapping)
+            else tuple(stored)
+        )
+        grouped.setdefault(UUID(str(row[0])), []).append(row)
+    if tuple(sorted(grouped, key=str)) != identifiers:
+        raise ValueError("canonical option package membership is incomplete")
+    packages = []
+    for candidate_id in identifiers:
+        rows = grouped[candidate_id]
+        header = rows[0]
+        if (
+            len(rows) != int(header[10])
+            or tuple(int(row[11]) for row in rows)
+            != tuple(range(len(rows)))
+        ):
+            raise ValueError("canonical option package leg set is incomplete")
+        legs = tuple(
+            RealtimeOptionPackageLeg(
+                leg_index=int(row[11]),
+                instrument_id=int(row[12]),
+                contract_id=int(row[13]),
+                catalog_version_id=int(row[14]),
+                contract_ticker=str(row[15]),
+                side=OptionSide(str(row[16])),
+                ratio=int(row[17]),
+                multiplier=int(row[18]),
+                strike=row[19],
+                expiration_date=row[20],
+                contract_type=ContractType(str(row[21])),
+                entry_mark=row[22],
+                entry_market_time=row[23],
+                valuation_policy_sha256=str(row[24]),
+            )
+            for row in rows
+        )
+        packages.append(RealtimeOptionPackage(
+            candidate_id=candidate_id,
+            event_id=(
+                UUID(str(header[1])) if header[1] is not None else None
+            ),
+            matrix_id=UUID(str(header[2])),
+            candidate_identity_sha256=str(header[3]),
+            cohort_id=UUID(str(header[4])),
+            provider_tier=ProviderTier(str(header[5])),
+            entry_market_time=header[6],
+            entry_net_premium=header[7],
+            capital_at_risk=header[8],
+            exit_deadline=header[9],
+            legs=legs,
+        ))
+    return tuple(packages)
+
+
+def persist_realtime_quote_evidence_cursor(
+    cursor,
+    evidence: RealtimeQuoteEvidence,
+) -> RealtimeQuoteEvidence:
+    if not isinstance(evidence, RealtimeQuoteEvidence):
+        raise TypeError("realtime quote evidence is invalid")
+    cursor.execute(
+        "INSERT INTO rt.option_mark_evidence ("
+        "evidence_id,instrument_id,contract_id,catalog_version_id,"
+        "provider_tier,source_kind,mark_source,source_batch_id,"
+        "source_revision_id,journal_generation,stream_session_id,"
+        "source_offset,market_time,observed_time,bid,ask,mark,"
+        "payload_sha256) VALUES ("
+        "%s,%s,%s,%s,'MASSIVE_ADVANCED','ADVANCED_NBBO',"
+        "'ADVANCED_NBBO_MIDPOINT',NULL,NULL,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (evidence_id) DO NOTHING",
+        (
+            str(evidence.evidence_id),
+            evidence.instrument_id,
+            evidence.contract_id,
+            evidence.catalog_version_id,
+            str(evidence.journal_generation),
+            str(evidence.stream_session_id),
+            evidence.source_offset,
+            evidence.market_time,
+            evidence.observed_time,
+            evidence.bid,
+            evidence.ask,
+            evidence.midpoint,
+            evidence.payload_sha256,
+        ),
+    )
+    cursor.execute(
+        "SELECT instrument_id,contract_id,catalog_version_id,"
+        "provider_tier,source_kind,mark_source,source_batch_id,"
+        "source_revision_id,journal_generation,stream_session_id,"
+        "source_offset,market_time,observed_time,bid,ask,mark,"
+        "payload_sha256 FROM rt.option_mark_evidence "
+        "WHERE evidence_id=%s",
+        (str(evidence.evidence_id),),
+    )
+    expected = (
+        evidence.instrument_id,
+        evidence.contract_id,
+        evidence.catalog_version_id,
+        ProviderTier.MASSIVE_ADVANCED.value,
+        "ADVANCED_NBBO",
+        evidence.mark_source.value,
+        None,
+        None,
+        str(evidence.journal_generation),
+        str(evidence.stream_session_id),
+        evidence.source_offset,
+        evidence.market_time,
+        evidence.observed_time,
+        evidence.bid,
+        evidence.ask,
+        evidence.midpoint,
+        evidence.payload_sha256,
+    )
+    if _database_identity(cursor.fetchone()) != expected:
+        raise ValueError("persisted option quote evidence identity conflict")
+    return evidence
 
 
 def _persist_realtime_option_package_mark(

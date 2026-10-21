@@ -238,6 +238,8 @@ def test_trade_state_classifies_conditions_and_causal_nbbo_across_restart():
     trade = state.trades[0]
     assert trade.eligibility == "INCLUDED"
     assert trade.conditions == (208,)
+    assert trade.quality == "GOOD"
+    assert trade.reason_codes == ()
     assessment = assess_trade_at_nbbo(
         trade,
         state.quote_history,

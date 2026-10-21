@@ -12,6 +12,9 @@ from uuid import UUID
 
 from .contracts import CANARY_UNIVERSE
 from .contracts import canonical_sha256
+from .advanced_options_read_pin import (
+    load_enabled_advanced_options_release_cursor,
+)
 from .equity_bar_repository import load_current_bar_heads_cursor
 from .screening_projection import REALTIME_FIELDS, REALTIME_GAP_CATALOG, SCREENING_BASIS
 from . import screening_references
@@ -213,9 +216,13 @@ class _RealtimeCompatibilityRepository:
         cursor_factory: Callable,
         *,
         transaction_configured: bool = False,
+        require_read_pin: bool = False,
     ):
         self._cursor_factory = cursor_factory
         self._transaction_configured = transaction_configured
+        if type(require_read_pin) is not bool:
+            raise TypeError("Options read-pin policy is invalid")
+        self._require_read_pin = require_read_pin
         self._release_cache = BoundedCache(RELEASE_CACHE_SIZE)
 
     def _cursor(self):
@@ -227,6 +234,20 @@ class _RealtimeCompatibilityRepository:
             cursor.execute("SET LOCAL statement_timeout = '5s'")
 
     def _release(self, cursor, cohort_id) -> ReleaseView | None:
+        if self._require_read_pin:
+            release_pin = load_enabled_advanced_options_release_cursor(
+                cursor,
+                cohort_id=cohort_id,
+            )
+            if release_pin is None:
+                return None
+            release_id, release_cutoff = release_pin
+            return load_release(
+                cursor,
+                release_id,
+                release_cutoff,
+                cache=self._release_cache,
+            )
         return load_current_release(cursor, cohort_id, self._release_cache)
 
     def release_etag(
@@ -287,8 +308,36 @@ class RealtimeOptionFlowRepository(_RealtimeCompatibilityRepository):
                     else "NO_COMPLETE_MATRIX"
                 )
                 if int(scope["option_underlying_count"]) > 0:
-                    from .forward_reader import load_forward_release_cursor
-                    retained = load_forward_release_cursor(cursor, cohort_id=cohort_id, available_by=cutoff, artifact_kind="FLOW")
+                    if active["provider_tier"] == "MASSIVE_ADVANCED":
+                        from .advanced_options_projection import (
+                            load_advanced_options_page_release_cursor,
+                        )
+
+                        retained = load_advanced_options_page_release_cursor(
+                            cursor,
+                            cohort_id=cohort_id,
+                            available_by=cutoff,
+                            artifact_kind="FLOW",
+                        )
+                        if retained is not None:
+                            publication, release = retained
+                            return publication.read(
+                                underlyer=symbol,
+                                cohort_id=cohort_id,
+                                provider_tier=publication.provider_tier,
+                                scope_sha256=release["scope_sha256"],
+                            )
+                    else:
+                        from .forward_reader import (
+                            load_forward_release_cursor,
+                        )
+
+                        retained = load_forward_release_cursor(
+                            cursor,
+                            cohort_id=cohort_id,
+                            available_by=cutoff,
+                            artifact_kind="FLOW",
+                        )
                     if retained is not None:
                         publication, release = retained
                         publication = publication.get(symbol) if isinstance(publication, dict) else publication
@@ -352,8 +401,28 @@ class RealtimeOptionScreenerRepository(_RealtimeCompatibilityRepository):
                     else "NO_ACTIVE_POLICY_ELIGIBLE_CHAIN"
                 )
                 if int(scope["option_underlying_count"]) > 0:
-                    from .forward_reader import load_forward_release_cursor
-                    retained = load_forward_release_cursor(cursor, cohort_id=cohort_id, available_by=cutoff, artifact_kind="SCREENER")
+                    if active["provider_tier"] == "MASSIVE_ADVANCED":
+                        from .advanced_options_projection import (
+                            load_advanced_options_page_release_cursor,
+                        )
+
+                        retained = load_advanced_options_page_release_cursor(
+                            cursor,
+                            cohort_id=cohort_id,
+                            available_by=cutoff,
+                            artifact_kind="SCREENER",
+                        )
+                    else:
+                        from .forward_reader import (
+                            load_forward_release_cursor,
+                        )
+
+                        retained = load_forward_release_cursor(
+                            cursor,
+                            cohort_id=cohort_id,
+                            available_by=cutoff,
+                            artifact_kind="SCREENER",
+                        )
                     if retained is not None:
                         publication, release = retained
                         return publication.query(request, cohort_id=cohort_id, provider_tier=publication.provider_tier,
@@ -478,8 +547,31 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                     else self._REASONS[contract]
                 )
                 if int(scope["option_underlying_count"]) > 0:
-                    from .forward_reader import load_forward_release_cursor
-                    retained = load_forward_release_cursor(cursor, cohort_id=cohort_id, available_by=cutoff, artifact_kind="ALERTS")
+                    advanced = (
+                        active["provider_tier"] == "MASSIVE_ADVANCED"
+                    )
+                    if advanced:
+                        from .advanced_options_projection import (
+                            load_advanced_options_page_release_cursor,
+                        )
+
+                        retained = load_advanced_options_page_release_cursor(
+                            cursor,
+                            cohort_id=cohort_id,
+                            available_by=cutoff,
+                            artifact_kind="ALERTS",
+                        )
+                    else:
+                        from .forward_reader import (
+                            load_forward_release_cursor,
+                        )
+
+                        retained = load_forward_release_cursor(
+                            cursor,
+                            cohort_id=cohort_id,
+                            available_by=cutoff,
+                            artifact_kind="ALERTS",
+                        )
                     if retained is not None:
                         publication, release = retained
                         identity = dict(cohort_id=cohort_id, provider_tier=publication.provider_tier, scope_sha256=release["scope_sha256"])
@@ -493,7 +585,17 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                         if contract == "detector_runs":
                             from .option_alert_projection import DetectorRunQuery
                             envelope = publication.detector_runs(DetectorRunQuery(**(query or {})), **identity)
-                            return self._retained_marks(cursor, publication, envelope, cutoff=cutoff, cohort_id=cohort_id)
+                            return (
+                                envelope
+                                if advanced
+                                else self._retained_marks(
+                                    cursor,
+                                    publication,
+                                    envelope,
+                                    cutoff=cutoff,
+                                    cohort_id=cohort_id,
+                                )
+                            )
                         if contract == "candidate":
                             if candidate_id is None:
                                 raise ValueError("Candidate identity is required")

@@ -17,8 +17,13 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from realtime.migrations import (
+    EXPECTED_V2_DATABASE_NAME,
+    SECURITY_MODE_HARDENED,
+    V2_MIGRATIONS_DIR,
+    load_realtime_migrations,
     plan_realtime_migrations,
     validate_target_database,
+    validate_target_database_v2,
 )
 
 
@@ -35,11 +40,24 @@ def parse_args() -> argparse.Namespace:
         help="Allow a database whose name begins with test_realtime_.",
     )
     args = parser.parse_args()
-    validate_target_database(
-        args.database,
-        args.confirm_database_name,
-        allow_disposable=args.allow_disposable_target,
-    )
+    if args.database == EXPECTED_V2_DATABASE_NAME or (
+        args.allow_disposable_target
+        and args.database.startswith("test_realtime_v2_")
+    ):
+        validate_target_database_v2(
+            args.database,
+            args.confirm_database_name,
+            allow_disposable=args.allow_disposable_target,
+            security_mode=SECURITY_MODE_HARDENED,
+        )
+        args.migrations = load_realtime_migrations(V2_MIGRATIONS_DIR)
+    else:
+        validate_target_database(
+            args.database,
+            args.confirm_database_name,
+            allow_disposable=args.allow_disposable_target,
+        )
+        args.migrations = load_realtime_migrations()
     return args
 
 
@@ -93,6 +111,7 @@ def main() -> int:
         plan = plan_realtime_migrations(
             args.database,
             _read_applied(connection),
+            args.migrations,
         )
         print(
             json.dumps(

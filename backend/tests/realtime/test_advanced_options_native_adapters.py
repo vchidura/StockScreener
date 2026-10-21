@@ -6,8 +6,10 @@ from realtime.advanced_options_native_adapters import (
     AdvancedO3Invocation,
     AdvancedOptionsLaneInputs,
     AdvancedOptionsNativeInputBundle,
+    advanced_o3_invocation_document,
     build_advanced_o1_executor,
     build_advanced_o3_executor,
+    decode_advanced_o3_invocation_document,
 )
 from realtime.preflight import DetectorFamily
 from test_advanced_options_cycle import _gate_and_receipt
@@ -140,3 +142,35 @@ def test_o3_adapter_maps_real_qualified_credit_to_selected_package():
         "option_o3_credit_observation_v1"
     )
     assert result.evaluations[0].package == package
+
+
+def test_o3_invocation_document_round_trip_is_exact():
+    control = _control_plane()
+    candidate, decision, snapshots, invalidation = _credit_fixture()
+    package = replace(
+        _package(_policy().policy_sha256),
+        candidate_id=candidate.candidate_id,
+        matrix_id=candidate.matrix_id,
+        candidate_identity_sha256=candidate.identity_sha256,
+        cohort_id=control.cohort_id,
+    )
+    invocation = AdvancedO3Invocation(
+        decision.activity.episode_id,
+        candidate,
+        decision,
+        candidate.legs[0].contract_id,
+        snapshots,
+        invalidation,
+        decision.decision_at - timedelta(seconds=1),
+        package,
+    )
+
+    document = advanced_o3_invocation_document(invocation)
+    decoded = decode_advanced_o3_invocation_document(
+        document,
+        package=package,
+    )
+
+    assert advanced_o3_invocation_document(decoded) == document
+    assert decoded.candidate == candidate
+    assert decoded.package == package

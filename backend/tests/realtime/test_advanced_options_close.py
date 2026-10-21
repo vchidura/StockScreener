@@ -18,6 +18,8 @@ from realtime.advanced_options_projection import (
 from realtime.session_archive import (
     PIN_OPEN_HORIZON,
     PIN_OUTCOME_UNVERIFIED,
+    PIN_RETENTION_HOLD,
+    PIN_SELECTED_ALERT_DEPENDENCY,
     ArchiveIdentity,
 )
 
@@ -142,6 +144,7 @@ def test_retention_handoff_uses_existing_archive_kinds_and_never_executes(
         ADVANCED_OPTIONS_ARCHIVE_KINDS
     )
     assert handoff.raw_journal_removal_eligible
+    assert handoff.raw_journal_eligibility_reasons == ()
     assert not handoff.archive_execution_authorized
     assert not handoff.retention_execution_authorized
     assert not handoff.journal_deletion_authorized
@@ -194,3 +197,66 @@ def test_retention_expiry_and_close_status_are_both_required(tmp_path):
 
     assert not future.raw_journal_removal_eligible
     assert not blocked.raw_journal_removal_eligible
+    assert future.raw_journal_eligibility_reasons == (
+        "JOURNAL_RETENTION_NOT_EXPIRED",
+    )
+    assert blocked.raw_journal_eligibility_reasons == (
+        "UNRESOLVED_GAPS",
+    )
+
+
+def test_raw_journal_requires_replay_checkpoint_and_checksum_closure(tmp_path):
+    control, projection = _projection()
+    journal = replace(
+        _journal(tmp_path, control),
+        bridge_committed_offset=19,
+        sealed_files_sha256="not-a-checksum",
+    )
+
+    coverage = build_advanced_options_close_coverage(
+        control_plane=control,
+        input_gate=projection.cycle.input_gate,
+        projection=projection,
+        journal=journal,
+        flow_checkpoint_offset=10,
+        market_state_checkpoint_offset=20,
+        unresolved_gap_ids=(),
+        slot_coverage_sha256="c" * 64,
+        oi_coverage_sha256="d" * 64,
+        checked_at=NOW,
+    )
+
+    assert coverage.status == "BLOCKED"
+    assert set(coverage.reason_codes) == {
+        "JOURNAL_CHECKSUM_INVALID",
+        "JOURNAL_REPLAY_INCOMPLETE",
+    }
+
+
+def test_selected_dependencies_and_active_holds_remain_pinned(tmp_path):
+    control, coverage = _coverage(tmp_path)
+
+    handoff = build_advanced_options_retention_handoff(
+        control_plane=control,
+        close_coverage=coverage,
+        archive_identity=ArchiveIdentity("p4-build", "options-close-v1"),
+        archives_verified=False,
+        open_alert_ids=(),
+        selected_alert_ids=(ALERT,),
+        active_hold_refs=("incident:owp5",),
+        journal_retention_expires_at=NOW - timedelta(days=30),
+        checked_at=NOW,
+    )
+
+    assert not handoff.raw_journal_removal_eligible
+    assert {pin.reason for pin in handoff.pins} == {
+        PIN_SELECTED_ALERT_DEPENDENCY,
+        PIN_OUTCOME_UNVERIFIED,
+        PIN_RETENTION_HOLD,
+    }
+    assert set(handoff.raw_journal_eligibility_reasons) == {
+        "ARCHIVES_UNVERIFIED",
+        PIN_SELECTED_ALERT_DEPENDENCY,
+        PIN_OUTCOME_UNVERIFIED,
+        PIN_RETENTION_HOLD,
+    }

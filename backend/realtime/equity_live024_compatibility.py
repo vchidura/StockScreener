@@ -56,6 +56,7 @@ LIVE024_MIGRATION_VERSIONS = (
 )
 POST024_RELATIONS = frozenset({
     "rt.advanced_journal_recovery_events",
+    "rt.advanced_options_read_pins",
     "rt.advanced_options_flow_package_evidence",
     "rt.advanced_options_reference_cycle_bindings",
     "rt.advanced_options_reference_session_freezes",

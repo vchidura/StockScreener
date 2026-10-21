@@ -55,6 +55,11 @@ def parser() -> argparse.ArgumentParser:
     plan.add_argument("--spy-contract", required=True)
     plan.add_argument("--qqq-contract", required=True)
     plan.add_argument(
+        "--contract-selection",
+        type=Path,
+        required=True,
+    )
+    plan.add_argument(
         "--artifact-root",
         type=Path,
         default=BACKEND_DIR / "tests" / ".artifacts",
@@ -78,6 +83,11 @@ def main(argv=None) -> int:
             stop_at=args.stop_utc,
             spy_contract=args.spy_contract,
             qqq_contract=args.qqq_contract,
+            contract_selection=json.loads(
+                args.contract_selection.resolve().read_text(
+                    encoding="utf-8"
+                )
+            ),
             backend_dir=BACKEND_DIR,
             artifact_root=args.artifact_root,
         )

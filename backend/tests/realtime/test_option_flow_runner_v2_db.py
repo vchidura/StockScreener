@@ -43,7 +43,7 @@ from realtime.option_source_flow import (
 )
 from realtime.orchestration_repository import PostgresOrchestrationRepository, WindowSpec
 from realtime.runner_environment import RunnerEnvironment
-from realtime.stage_graph import STAGES_V1
+from realtime.stage_graph import STAGES_V1, STAGE_CATALOG_VERSION
 from realtime.stage_orchestrator import StageOrchestrator, StageOutcome
 from realtime.stage_runners_options import (
     OPEN_INTEREST_SQL,
@@ -195,7 +195,8 @@ def relative(rows, base_ms, session_date=None):
 
 class World:
     def __init__(self, pool, feed, *, cohort=None, plan_id=None, base_ms=None, runners=None, enabled=ALL,
-                 database_open_interest=False, provider=None, **environment):
+                 database_open_interest=False, provider=None, stages=STAGES_V1,
+                 catalog_version=STAGE_CATALOG_VERSION, **environment):
         self.pool = pool
         self.now = datetime.now(UTC)
         self.provider = (
@@ -358,7 +359,14 @@ class World:
         table = {name: (lambda context: StageOutcome.complete()) for name in enabled}
         table["OPTIONS_FLOW"] = options_flow_runner(self.environment)
         table.update(runners or {})
-        self.orchestrator = StageOrchestrator(self.repository, table, database=self.provider, clock=lambda: self.now)
+        self.orchestrator = StageOrchestrator(
+            self.repository,
+            table,
+            database=self.provider,
+            stages=stages,
+            catalog_version=catalog_version,
+            clock=lambda: self.now,
+        )
 
     def again(self, feed, **environment):
         """A new process over the same cohort and plan: nothing of this world's memory survives."""

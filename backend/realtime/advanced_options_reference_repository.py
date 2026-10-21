@@ -284,6 +284,95 @@ def _member_rows(
     return tuple(sorted(rows))
 
 
+def persist_advanced_options_reference_state_cursor(
+    cursor,
+    state: AdvancedOptionsReferenceState,
+) -> AdvancedOptionsReferenceState:
+    if not isinstance(state, AdvancedOptionsReferenceState):
+        raise TypeError("reference state is invalid")
+    document = json.loads(canonical_json(state.identity))
+    members = _member_rows(state)
+    cursor.execute(
+        "INSERT INTO rt.advanced_options_reference_states ("
+        "state_id,state_sha256,state_version,reference_generation,"
+        "session_date,known_at,valid_until,reference_policy_sha256,"
+        "contract_scope_sha256,underlyings,member_count,state_document"
+        ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT DO NOTHING",
+        (
+            str(state.state_id),
+            state.state_sha256,
+            state.version,
+            state.reference_generation,
+            state.session_date,
+            state.known_at,
+            state.valid_until,
+            state.reference_policy_sha256,
+            state.contract_scope_sha256,
+            list(state.underlyings),
+            len(members),
+            Json(document),
+        ),
+    )
+    cursor.execute(
+        "SELECT state_id,state_sha256,state_document,member_count "
+        "FROM rt.advanced_options_reference_states "
+        "WHERE reference_generation=%s",
+        (state.reference_generation,),
+    )
+    stored = cursor.fetchone()
+    if (
+        stored is None
+        or UUID(str(stored[0])) != state.state_id
+        or str(stored[1]) != state.state_sha256
+        or canonical_json(stored[2]) != canonical_json(document)
+        or int(stored[3]) != len(members)
+    ):
+        raise ValueError("persisted reference state conflicts")
+    cursor.executemany(
+        "INSERT INTO rt.advanced_options_reference_state_members ("
+        "state_id,member_kind,member_key,member_sha256,availability,"
+        "member_document) VALUES (%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT DO NOTHING",
+        tuple(
+            (
+                str(state.state_id),
+                kind,
+                key,
+                digest,
+                availability,
+                Json(member_document),
+            )
+            for kind, key, digest, availability, member_document
+            in members
+        ),
+    )
+    cursor.execute(
+        "SELECT member_kind,member_key,member_sha256,availability,"
+        "member_document FROM "
+        "rt.advanced_options_reference_state_members "
+        "WHERE state_id=%s ORDER BY member_kind,member_key",
+        (str(state.state_id),),
+    )
+    stored_members = tuple(
+        (
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            str(row[3]),
+            row[4],
+        )
+        for row in cursor.fetchall()
+    )
+    if len(stored_members) != len(members) or any(
+        actual[:4] != expected[:4]
+        or canonical_json(actual[4]) != canonical_json(expected[4])
+        for actual, expected in zip(stored_members, members)
+    ):
+        raise ValueError("persisted reference state members conflict")
+    return state
+
+
 class PostgresAdvancedOptionsReferenceStateRepository(
     AdvancedOptionsReferenceStateRepository
 ):
@@ -294,92 +383,11 @@ class PostgresAdvancedOptionsReferenceStateRepository(
         self,
         state: AdvancedOptionsReferenceState,
     ) -> AdvancedOptionsReferenceState:
-        if not isinstance(state, AdvancedOptionsReferenceState):
-            raise TypeError("reference state is invalid")
-        document = json.loads(canonical_json(state.identity))
-        members = _member_rows(state)
         with self._provider.transaction() as unit:
-            cursor = unit.cursor
-            cursor.execute(
-                "INSERT INTO rt.advanced_options_reference_states ("
-                "state_id,state_sha256,state_version,reference_generation,"
-                "session_date,known_at,valid_until,reference_policy_sha256,"
-                "contract_scope_sha256,underlyings,member_count,state_document"
-                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                "ON CONFLICT DO NOTHING",
-                (
-                    str(state.state_id),
-                    state.state_sha256,
-                    state.version,
-                    state.reference_generation,
-                    state.session_date,
-                    state.known_at,
-                    state.valid_until,
-                    state.reference_policy_sha256,
-                    state.contract_scope_sha256,
-                    list(state.underlyings),
-                    len(members),
-                    Json(document),
-                ),
+            return persist_advanced_options_reference_state_cursor(
+                unit.cursor,
+                state,
             )
-            cursor.execute(
-                "SELECT state_id,state_sha256,state_document,member_count "
-                "FROM rt.advanced_options_reference_states "
-                "WHERE reference_generation=%s",
-                (state.reference_generation,),
-            )
-            stored = cursor.fetchone()
-            if (
-                stored is None
-                or UUID(str(stored[0])) != state.state_id
-                or str(stored[1]) != state.state_sha256
-                or canonical_json(stored[2]) != canonical_json(document)
-                or int(stored[3]) != len(members)
-            ):
-                raise ValueError("persisted reference state conflicts")
-            cursor.executemany(
-                "INSERT INTO rt.advanced_options_reference_state_members ("
-                "state_id,member_kind,member_key,member_sha256,availability,"
-                "member_document) VALUES (%s,%s,%s,%s,%s,%s) "
-                "ON CONFLICT DO NOTHING",
-                tuple(
-                    (
-                        str(state.state_id),
-                        kind,
-                        key,
-                        digest,
-                        availability,
-                        Json(member_document),
-                    )
-                    for kind, key, digest, availability, member_document
-                    in members
-                ),
-            )
-            cursor.execute(
-                "SELECT member_kind,member_key,member_sha256,availability,"
-                "member_document FROM "
-                "rt.advanced_options_reference_state_members "
-                "WHERE state_id=%s ORDER BY member_kind,member_key",
-                (str(state.state_id),),
-            )
-            stored_members = tuple(
-                (
-                    str(row[0]),
-                    str(row[1]),
-                    str(row[2]),
-                    str(row[3]),
-                    row[4],
-                )
-                for row in cursor.fetchall()
-            )
-            if len(stored_members) != len(members) or any(
-                actual[:4] != expected[:4]
-                or canonical_json(actual[4])
-                != canonical_json(expected[4])
-                for actual, expected in zip(stored_members, members)
-            ):
-                raise ValueError("persisted reference state members conflict")
-        return state
 
     @staticmethod
     def _decode(row) -> AdvancedOptionsReferenceState | None:

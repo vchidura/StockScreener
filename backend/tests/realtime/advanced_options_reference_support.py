@@ -62,7 +62,7 @@ def adjusted_bars():
     )
 
 
-def open_interest(known_at=KNOWN):
+def open_interest(known_at=KNOWN, session_date=SESSION):
     return (
         AdvancedOptionsOpenInterestReference(
             contract_id=101,
@@ -71,8 +71,8 @@ def open_interest(known_at=KNOWN):
             availability=ReferenceAvailability.AVAILABLE,
             known_at=known_at,
             baseline_id=UUID("22222222-2222-2222-2222-222222222222"),
-            settlement_session=date(2026, 10, 15),
-            observed_session=SESSION,
+            settlement_session=session_date - timedelta(days=1),
+            observed_session=session_date,
             open_interest=2_500,
             source="massive",
             date_basis="PROVIDER_CHAIN_SNAPSHOT_PRIOR_SESSION",
@@ -114,7 +114,7 @@ def volatility(known_at=KNOWN):
     )
 
 
-def valuation(known_at=KNOWN):
+def valuation(known_at=KNOWN, session_date=SESSION):
     received = known_at - timedelta(minutes=20)
     action = AdvancedOptionsCorporateActionIdentity(
         action_id=UUID("33333333-3333-3333-3333-333333333333"),
@@ -126,7 +126,7 @@ def valuation(known_at=KNOWN):
         coverage_id=UUID("44444444-4444-4444-4444-444444444444"),
         security_id=SECURITY,
         ticker="SPY",
-        window_start=SESSION,
+        window_start=session_date,
         window_end=EXPIRATION,
         status="AVAILABLE",
         observed_at=received - timedelta(minutes=1),
@@ -138,7 +138,7 @@ def valuation(known_at=KNOWN):
     rates = (
         AdvancedOptionsRateReference(
             observation_id=UUID("55555555-5555-5555-5555-555555555555"),
-            rate_date=date(2026, 10, 15),
+            rate_date=session_date - timedelta(days=1),
             tenor_days=30,
             annual_rate=Decimal("0.04"),
             source="us_treasury_par_yield_v1",
@@ -149,7 +149,7 @@ def valuation(known_at=KNOWN):
         ),
         AdvancedOptionsRateReference(
             observation_id=UUID("66666666-6666-6666-6666-666666666666"),
-            rate_date=date(2026, 10, 15),
+            rate_date=session_date - timedelta(days=1),
             tenor_days=60,
             annual_rate=Decimal("0.041"),
             source="us_treasury_par_yield_v1",
@@ -163,7 +163,7 @@ def valuation(known_at=KNOWN):
         AdvancedOptionsValuationReference(
             security_id=SECURITY,
             ticker="SPY",
-            valuation_date=SESSION,
+            valuation_date=session_date,
             expiration_date=EXPIRATION,
             risk_free_rate=Decimal("0.0405"),
             dividend_yield=Decimal("0.012"),
@@ -181,10 +181,11 @@ def equity_metrics(
     known_at=KNOWN,
     *,
     short_interest=Decimal("0.08"),
+    session_date=SESSION,
 ):
     received = known_at - timedelta(minutes=30)
     sessions = tuple(
-        SESSION - timedelta(days=30 - index)
+        session_date - timedelta(days=30 - index)
         for index in range(30)
     )
     return (
@@ -238,6 +239,7 @@ def equity_metrics(
 def reference_state(
     *,
     generation=7,
+    session_date=SESSION,
     known_at=KNOWN,
     valid_until=VALID_UNTIL,
     short_interest=Decimal("0.08"),
@@ -245,17 +247,18 @@ def reference_state(
 ):
     return build_advanced_options_reference_state(
         reference_generation=generation,
-        session_date=SESSION,
+        session_date=session_date,
         known_at=known_at,
         valid_until=valid_until,
         reference_policy_sha256="f" * 64,
         contract_scope_sha256=contract_scope_sha256,
         underlyings=("SPY",),
-        open_interest=open_interest(known_at),
+        open_interest=open_interest(known_at, session_date),
         historical_volatility=volatility(known_at),
-        valuation_inputs=valuation(known_at),
+        valuation_inputs=valuation(known_at, session_date),
         equity_metrics=equity_metrics(
             known_at,
             short_interest=short_interest,
+            session_date=session_date,
         ),
     )

@@ -1,4 +1,5 @@
 from unittest.mock import MagicMock
+from uuid import UUID
 
 import pytest
 
@@ -11,7 +12,12 @@ from test_advanced_options_cycle import (
 )
 from realtime.advanced_options_cycle import run_advanced_options_cycle
 from realtime.advanced_options_projection import (
+    AdvancedOptionsCanaryPublicationAuthorization,
+    OPTIONS_PAGE_CONTRACTS,
+    OPTIONS_PAGE_SNAPSHOT_TYPES,
     OPTIONS_PROJECTION_TYPES,
+    OPTIONS_SNAPSHOT_TYPES,
+    authorize_advanced_options_canary_publication,
     build_advanced_options_projection_batch,
     build_advanced_options_publisher_handoff,
     persist_advanced_options_projection_cursor,
@@ -59,8 +65,20 @@ def test_projection_batch_is_deterministic_complete_and_nonpublishing():
 
     assert first == repeated
     assert tuple(row.snapshot_type for row in first.snapshots) == (
-        OPTIONS_PROJECTION_TYPES
+        OPTIONS_SNAPSHOT_TYPES
     )
+    pages = {
+        row.payload["artifact_kind"]: row
+        for row in first.snapshots
+        if row.snapshot_type in OPTIONS_PAGE_SNAPSHOT_TYPES.values()
+    }
+    assert set(pages) == set(OPTIONS_PAGE_SNAPSHOT_TYPES)
+    assert {
+        kind: row.payload["contract"] for kind, row in pages.items()
+    } == OPTIONS_PAGE_CONTRACTS
+    assert len({
+        row.payload["scope_sha256"] for row in pages.values()
+    }) == 1
     assert first.portal_ready_receipt.receipt_kind == OPTIONS_PORTAL_READY
     assert not first.portal_ready_receipt.advance_release
     assert not first.publication_authorized
@@ -116,6 +134,47 @@ def test_publisher_handoff_is_canonical_and_inert():
     assert not handoff.pointer_authorized
 
 
+def test_owned_disposable_canary_authorizes_only_release_and_pointer():
+    control, cycle = _cycle()
+    batch = build_advanced_options_projection_batch(
+        control_plane=control,
+        cycle=cycle,
+        generated_at=NOW,
+        build_id="p4-build",
+    )
+    inert = build_advanced_options_publisher_handoff(
+        control_plane=control,
+        batch=batch,
+    )
+    authorization = AdvancedOptionsCanaryPublicationAuthorization(
+        database_name="test_realtime_v2_p8_exact",
+        cohort_id=control.cohort_id,
+        batch_sha256=batch.batch_sha256,
+        receipt_id=UUID(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        ),
+    )
+
+    canary = authorize_advanced_options_canary_publication(
+        inert,
+        authorization,
+    )
+
+    assert canary.owner_name == "portal-publisher"
+    assert canary.release_authorized
+    assert canary.pointer_authorized
+    assert not canary.dispatch_authorized
+    with pytest.raises(ValueError, match="authority is invalid"):
+        AdvancedOptionsCanaryPublicationAuthorization(
+            database_name="stocks_realtime_v1",
+            cohort_id=control.cohort_id,
+            batch_sha256=batch.batch_sha256,
+            receipt_id=UUID(
+                "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            ),
+        )
+
+
 def test_stored_reader_performs_no_provider_detector_or_publication_work():
     control, cycle = _cycle()
     batch = build_advanced_options_projection_batch(
@@ -131,6 +190,9 @@ def test_stored_reader_performs_no_provider_detector_or_publication_work():
         snapshot.generated_at,
         snapshot.payload_sha256,
         snapshot.payload,
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        snapshot.generated_at,
+        "e" * 64,
     )
 
     result = read_advanced_options_projection_cursor(
@@ -145,8 +207,11 @@ def test_stored_reader_performs_no_provider_detector_or_publication_work():
     assert result["provider_fetch_performed"] is False
     assert result["detector_work_performed"] is False
     assert result["publication_performed"] is False
+    assert result["release_id"] == (
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    )
     assert cursor.execute.call_count == 1
-    assert "snapshot_catalog" in cursor.execute.call_args.args[0]
+    assert "portal_release_current" in cursor.execute.call_args.args[0]
 
 
 def test_stored_reader_rejects_hash_drift_and_missing_is_explicit():
@@ -164,6 +229,9 @@ def test_stored_reader_rejects_hash_drift_and_missing_is_explicit():
         snapshot.generated_at,
         "f" * 64,
         snapshot.payload,
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        snapshot.generated_at,
+        "e" * 64,
     )
     with pytest.raises(ValueError, match="hash mismatch"):
         read_advanced_options_projection_cursor(

@@ -11,6 +11,9 @@ from realtime.advanced_options_loaders import (
     AdvancedOptionsCanonicalLoaders,
     build_canonical_advanced_options_runtime_binding,
 )
+from realtime.advanced_options_projection import (
+    AdvancedOptionsPageSource,
+)
 from realtime.advanced_options_native_adapters import (
     AdvancedOptionsLaneInputs,
     AdvancedOptionsNativeInputBundle,
@@ -201,6 +204,9 @@ def test_canonical_binding_factory_wires_one_loader_owner():
         port=port,
         cycle_writer=lambda *_args, **_kwargs: None,
         projection_writer=lambda *_args, **_kwargs: None,
+        page_source_loader=(
+            lambda *_args, **_kwargs: AdvancedOptionsPageSource()
+        ),
     )
 
     assert binding.input_loader.__self__ is loaders

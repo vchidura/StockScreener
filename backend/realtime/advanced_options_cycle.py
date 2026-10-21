@@ -47,10 +47,10 @@ class AdvancedOptionsDatasetFlowIdentity:
     def __post_init__(self) -> None:
         if (
             not isinstance(self.source_flow, OptionSourceFlowIdentity)
-            or self.source_flow.identity_version != 3
+            or self.source_flow.identity_version not in (3, 4)
         ):
             raise ValueError(
-                "dataset flow identity requires source-flow v3"
+                "dataset flow identity requires source-flow v3 or v4"
             )
         for name in (
             "advanced_flow_policy_sha256",

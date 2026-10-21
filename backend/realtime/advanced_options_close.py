@@ -8,7 +8,10 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from .advanced_journal_registry import AdvancedJournalRegistration
 from .advanced_options_control_plane import AdvancedOptionsControlPlanePlan
 from .advanced_options_input import AdvancedOptionsInputGatePlan
-from .advanced_options_projection import AdvancedOptionsProjectionBatch
+from .advanced_options_projection import (
+    AdvancedOptionsProjectionBatch,
+    OPTIONS_SNAPSHOT_TYPES,
+)
 from .contracts import canonical_sha256
 from .retention_maintenance import RetentionMaintenanceRequest
 from .session_archive import (
@@ -18,6 +21,8 @@ from .session_archive import (
     OPTION_FLOW_EVENTS,
     PIN_OPEN_HORIZON,
     PIN_OUTCOME_UNVERIFIED,
+    PIN_RETENTION_HOLD,
+    PIN_SELECTED_ALERT_DEPENDENCY,
     ArchiveIdentity,
     Pin,
 )
@@ -45,8 +50,10 @@ class AdvancedOptionsCloseCoverage:
     reason_codes: tuple[str, ...]
     journal_generation: UUID
     journal_status: str
+    sealed_files_sha256: str | None
     raw_committed_offset: int
     normalized_committed_offset: int
+    bridge_committed_offset: int
     flow_checkpoint_offset: int
     market_state_checkpoint_offset: int
     input_closure_sha256: str
@@ -65,6 +72,7 @@ class AdvancedOptionsRetentionHandoff:
     pins: tuple[Pin, ...]
     request: RetentionMaintenanceRequest
     raw_journal_removal_eligible: bool
+    raw_journal_eligibility_reasons: tuple[str, ...]
     archive_execution_authorized: bool = False
     retention_execution_authorized: bool = False
     journal_deletion_authorized: bool = False
@@ -117,6 +125,16 @@ def build_advanced_options_close_coverage(
         reasons.append("JOURNAL_NOT_DRAINED")
     if journal.sealed_files_sha256 is None:
         reasons.append("JOURNAL_CHECKSUM_UNAVAILABLE")
+    elif (
+        len(journal.sealed_files_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in journal.sealed_files_sha256
+        )
+    ):
+        reasons.append("JOURNAL_CHECKSUM_INVALID")
+    if journal.bridge_committed_offset < journal.normalized_committed_offset:
+        reasons.append("JOURNAL_REPLAY_INCOMPLETE")
     if flow_checkpoint_offset < journal.raw_committed_offset:
         reasons.append("FLOW_CHECKPOINT_INCOMPLETE")
     if market_state_checkpoint_offset < journal.normalized_committed_offset:
@@ -127,7 +145,9 @@ def build_advanced_options_close_coverage(
         control_plane.manifest_policy.required_detectors
     ):
         reasons.append("DETECTOR_LANE_OUTCOMES_INCOMPLETE")
-    if len(projection.snapshots) != 4:
+    if tuple(
+        snapshot.snapshot_type for snapshot in projection.snapshots
+    ) != OPTIONS_SNAPSHOT_TYPES:
         reasons.append("OPTIONS_PROJECTION_MEMBERSHIP_INCOMPLETE")
     status = "COMPLETE" if not reasons else "BLOCKED"
     identity = {
@@ -139,6 +159,7 @@ def build_advanced_options_close_coverage(
         "sealed_files_sha256": journal.sealed_files_sha256,
         "raw_committed_offset": journal.raw_committed_offset,
         "normalized_committed_offset": journal.normalized_committed_offset,
+        "bridge_committed_offset": journal.bridge_committed_offset,
         "flow_checkpoint_offset": flow_checkpoint_offset,
         "market_state_checkpoint_offset": market_state_checkpoint_offset,
         "unresolved_gap_ids": gaps,
@@ -162,8 +183,10 @@ def build_advanced_options_close_coverage(
         reason_codes=tuple(reasons),
         journal_generation=journal.journal_generation,
         journal_status=journal.status,
+        sealed_files_sha256=journal.sealed_files_sha256,
         raw_committed_offset=journal.raw_committed_offset,
         normalized_committed_offset=journal.normalized_committed_offset,
+        bridge_committed_offset=journal.bridge_committed_offset,
         flow_checkpoint_offset=flow_checkpoint_offset,
         market_state_checkpoint_offset=market_state_checkpoint_offset,
         input_closure_sha256=input_gate.closure_sha256,
@@ -184,20 +207,47 @@ def build_advanced_options_retention_handoff(
     open_alert_ids: tuple[UUID, ...],
     journal_retention_expires_at: datetime,
     checked_at: datetime,
+    selected_alert_ids: tuple[UUID, ...] = (),
+    active_hold_refs: tuple[str, ...] = (),
 ) -> AdvancedOptionsRetentionHandoff:
     checked = _utc(checked_at, "checked_at")
     expiry = _utc(
         journal_retention_expires_at,
         "journal_retention_expires_at",
     )
+    if (
+        close_coverage.journal_generation
+        != control_plane.source_flow.journal_generation
+    ):
+        raise ValueError("Advanced Options retention source generation changed")
+    if type(archives_verified) is not bool:
+        raise TypeError("archives_verified must be boolean")
+    open_alerts = tuple(sorted(set(open_alert_ids), key=str))
+    selected_alerts = tuple(sorted(set(selected_alert_ids), key=str))
+    holds = tuple(sorted({
+        hold.strip()
+        for hold in active_hold_refs
+        if isinstance(hold, str) and hold.strip()
+    }))
+    if len(holds) != len(set(active_hold_refs)):
+        raise ValueError("active retention hold references are invalid")
     pins = tuple(
         Pin(
             control_plane.session_date,
             PIN_OPEN_HORIZON,
             str(alert_id),
         )
-        for alert_id in sorted(set(open_alert_ids), key=str)
+        for alert_id in open_alerts
     )
+    if not archives_verified:
+        pins += tuple(
+            Pin(
+                control_plane.session_date,
+                PIN_SELECTED_ALERT_DEPENDENCY,
+                str(alert_id),
+            )
+            for alert_id in selected_alerts
+        )
     if not archives_verified:
         pins += (
             Pin(
@@ -206,23 +256,33 @@ def build_advanced_options_retention_handoff(
                 close_coverage.coverage_sha256,
             ),
         )
+    pins += tuple(
+        Pin(
+            control_plane.session_date,
+            PIN_RETENTION_HOLD,
+            hold,
+        )
+        for hold in holds
+    )
     request = RetentionMaintenanceRequest(
         as_of_date=checked.date(),
         as_of_session=control_plane.session_date,
         archive_session_dates=(control_plane.session_date,),
         archive_kinds=ADVANCED_OPTIONS_ARCHIVE_KINDS,
     )
-    eligible = (
-        close_coverage.status == "COMPLETE"
-        and archives_verified
-        and not pins
-        and expiry <= checked
-    )
+    eligibility_reasons = list(close_coverage.reason_codes)
+    if not archives_verified:
+        eligibility_reasons.append("ARCHIVES_UNVERIFIED")
+    eligibility_reasons.extend(pin.reason for pin in pins)
+    if expiry > checked:
+        eligibility_reasons.append("JOURNAL_RETENTION_NOT_EXPIRED")
+    eligibility_reasons = list(dict.fromkeys(eligibility_reasons))
     return AdvancedOptionsRetentionHandoff(
         close_coverage=close_coverage,
         archive_identity=archive_identity,
         required_archive_kinds=ADVANCED_OPTIONS_ARCHIVE_KINDS,
         pins=pins,
         request=request,
-        raw_journal_removal_eligible=eligible,
+        raw_journal_removal_eligible=not eligibility_reasons,
+        raw_journal_eligibility_reasons=tuple(eligibility_reasons),
     )

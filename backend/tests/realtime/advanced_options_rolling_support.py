@@ -32,6 +32,7 @@ def rolling_state(
     owner_epoch=3,
     market_state_checkpoint_sha256="4" * 64,
     flow_checkpoint_sha256="5" * 64,
+    producer_binding=None,
 ):
     quote = MaterializedQuote(
         journal_generation=journal_generation,
@@ -133,4 +134,5 @@ def rolling_state(
         underlying_ticks=(tick,),
         contract_volumes=volumes,
         order_windows=order_windows,
+        producer_binding=producer_binding,
     )

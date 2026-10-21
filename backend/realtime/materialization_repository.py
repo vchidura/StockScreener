@@ -161,10 +161,14 @@ def _persist_quote_materialization(
             for trade in state.trades:
                 if trade.instrument_id not in dirty_instrument_ids:
                     continue
-                reasons = tuple(dict.fromkeys((
-                    *trade.reason_codes,
-                    *trade.eligibility_reason_codes,
-                )))
+                reasons = (
+                    ()
+                    if trade.eligibility == "INCLUDED"
+                    else tuple(dict.fromkeys((
+                        *trade.reason_codes,
+                        *trade.eligibility_reason_codes,
+                    )))
+                )
                 trade_batch.add(
                     "INSERT INTO rt.trade_current ("
                     "provider, instrument_id, source_session, source_sequence, "

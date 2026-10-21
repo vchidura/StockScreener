@@ -94,7 +94,7 @@ def _source_flow(base_config=None, *, generation=JOURNAL_GENERATION):
 def test_p2_is_one_forward_migration_with_no_parallel_lifecycle_tables():
     migrations = load_realtime_migrations(Path(V2_MIGRATIONS_DIR))
     assert migrations[-1].version == (
-        "031_realtime_advanced_journal_recovery"
+        "032_advanced_options_read_pins"
     )
     text = SQL_PATH.read_text(encoding="utf-8")
     assert "CREATE TABLE rt.option_source_flows" in text

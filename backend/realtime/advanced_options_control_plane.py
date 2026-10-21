@@ -1,8 +1,10 @@
 """Pure immutable contracts for a prospective Advanced Options control plane."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from .advanced_equity_control_plane import AdvancedEquityControlPlanePlan
@@ -14,7 +16,13 @@ from .contracts import (
     UniverseManifest,
     canonical_sha256,
 )
-from .option_session_manifest import BoundedOptionManifestPolicy
+from .option_session_manifest import (
+    BoundedOptionManifestPolicy,
+    OptionActivitySelectionRecord,
+    option_activity_selection_from_payload,
+    option_activity_selection_payload,
+    validate_option_activity_selection,
+)
 from .option_source_flow import (
     CANONICAL_OPTION_FLOW_OWNER,
     OptionSourceFlowIdentity,
@@ -26,6 +34,7 @@ from .option_slot_set import (
     SlotSetPurpose,
     SlotSetVersion,
 )
+from .option_slot_set_repository import persist_and_activate_slot_set_cursor
 from .orchestration_repository import (
     OPTIONS_CYCLE,
     OPTIONS_INPUT_READY,
@@ -37,6 +46,7 @@ from .preflight import ProductEntitlementProfile, ProviderTier, TierState
 from .provider_budget import ProviderBudgetScope
 from .tier_cohort import (
     TierCohortBinding,
+    persist_tier_cohort_binding_cursor,
     product_capabilities,
     product_disabled_detectors,
 )
@@ -55,6 +65,25 @@ ADVANCED_OPTIONS_REST_LANES = frozenset({
     ProviderRequestLane.REFERENCE,
 })
 PRESERVED_STAGE_CATALOGS = ("stages_v1", "stages_v2", "stages_v3")
+ADVANCED_OPTIONS_ENROLLMENT_VERSION = "advanced-options-enrollment-plan-v1"
+ADVANCED_OPTIONS_HISTORY_BINDING_VERSION = (
+    "advanced-options-history-binding-v1"
+)
+ADVANCED_OPTIONS_ZERO_EFFECTS = (
+    "provider",
+    "service",
+    "stages_v4",
+    "publication",
+    "release",
+    "pointer",
+    "outbox",
+    "delivery",
+    "repair",
+    "backfill",
+    "replay",
+    "archive",
+    "retention",
+)
 
 CANONICAL_SCHEDULER_OWNER = "advanced-scheduler"
 CANONICAL_INGRESS_OWNER = "advanced-options-ingress-v1"
@@ -247,9 +276,118 @@ class AdvancedOptionsRuntimeAuthorization:
 
 
 @dataclass(frozen=True, slots=True)
+class AdvancedOptionsProspectiveReferenceIdentity:
+    state_id: UUID
+    state_sha256: str
+    reference_generation: int
+    session_date: date
+    known_at: datetime
+    valid_until: datetime
+    underlyings: tuple[str, ...]
+    open_interest_sha256: str
+
+    def __post_init__(self) -> None:
+        known = _utc(self.known_at, "known_at")
+        valid = _utc(self.valid_until, "valid_until")
+        underlyings = tuple(sorted({
+            value.strip().upper()
+            for value in self.underlyings
+            if value.strip()
+        }))
+        identity = {
+            "contract": "advanced-options-prospective-reference-v1",
+            "reference_generation": self.reference_generation,
+            "session_date": self.session_date,
+            "known_at": known,
+            "valid_until": valid,
+            "underlyings": underlyings,
+            "open_interest_sha256": self.open_interest_sha256,
+        }
+        expected_sha256 = canonical_sha256(identity)
+        expected_id = uuid5(
+            NAMESPACE_URL,
+            (
+                "stockscreener:advanced-options-prospective-reference:"
+                f"{expected_sha256}"
+            ),
+        )
+        if (
+            self.state_id != expected_id
+            or self.state_sha256 != expected_sha256
+            or type(self.reference_generation) is not int
+            or self.reference_generation <= 0
+            or not isinstance(self.session_date, date)
+            or isinstance(self.session_date, datetime)
+            or known >= valid
+            or not underlyings
+            or _sha256(
+                self.open_interest_sha256,
+                "open_interest_sha256",
+            )
+            != self.open_interest_sha256
+        ):
+            raise ValueError(
+                "prospective Advanced Options reference identity is invalid"
+            )
+        object.__setattr__(self, "known_at", known)
+        object.__setattr__(self, "valid_until", valid)
+        object.__setattr__(self, "underlyings", underlyings)
+
+
+def build_advanced_options_prospective_reference_identity(
+    *,
+    reference_generation: int,
+    session_date: date,
+    known_at: datetime,
+    valid_until: datetime,
+    underlyings: tuple[str, ...],
+    open_interest_sha256: str,
+) -> AdvancedOptionsProspectiveReferenceIdentity:
+    known = _utc(known_at, "known_at")
+    valid = _utc(valid_until, "valid_until")
+    normalized_underlyings = tuple(sorted({
+        value.strip().upper()
+        for value in underlyings
+        if value.strip()
+    }))
+    identity = {
+        "contract": "advanced-options-prospective-reference-v1",
+        "reference_generation": reference_generation,
+        "session_date": session_date,
+        "known_at": known,
+        "valid_until": valid,
+        "underlyings": normalized_underlyings,
+        "open_interest_sha256": _sha256(
+            open_interest_sha256,
+            "open_interest_sha256",
+        ),
+    }
+    digest = canonical_sha256(identity)
+    return AdvancedOptionsProspectiveReferenceIdentity(
+        state_id=uuid5(
+            NAMESPACE_URL,
+            (
+                "stockscreener:advanced-options-prospective-reference:"
+                f"{digest}"
+            ),
+        ),
+        state_sha256=digest,
+        reference_generation=reference_generation,
+        session_date=session_date,
+        known_at=known,
+        valid_until=valid,
+        underlyings=normalized_underlyings,
+        open_interest_sha256=str(identity["open_interest_sha256"]),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class AdvancedOptionsReceiptInputs:
     cutoff: datetime
-    reference_state: AdvancedOptionsReferenceState
+    reference_state: (
+        AdvancedOptionsReferenceState
+        | AdvancedOptionsProspectiveReferenceIdentity
+    )
     equity_input_receipt_id: UUID
     equity_input_sha256: str
     discovery_batches_sha256: str
@@ -268,7 +406,10 @@ class AdvancedOptionsReceiptInputs:
         if (
             not isinstance(
                 self.reference_state,
-                AdvancedOptionsReferenceState,
+                (
+                    AdvancedOptionsReferenceState,
+                    AdvancedOptionsProspectiveReferenceIdentity,
+                ),
             )
             or not isinstance(self.equity_input_receipt_id, UUID)
             or not (
@@ -394,6 +535,119 @@ class AdvancedOptionsControlPlanePlan:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class AdvancedOptionsEnrollmentPlan:
+    enrollment_id: UUID
+    enrollment_sha256: str
+    control_plane: AdvancedOptionsControlPlanePlan
+    equity_plan: AdvancedEquityControlPlanePlan
+    activity_selection: OptionActivitySelectionRecord
+    equity_members_sha256: str
+
+    @property
+    def zero_effect_counts(self) -> dict[str, int]:
+        return {name: 0 for name in ADVANCED_OPTIONS_ZERO_EFFECTS}
+
+
+@dataclass(frozen=True, slots=True)
+class AdvancedOptionsHistoryBinding:
+    target_cohort_id: UUID
+    source_cohort_id: UUID
+    source_provider_tier: ProviderTier
+    history_before: datetime
+    source_manifest_sha256: str
+    authorization_reference: str
+    binding_sha256: str
+
+    def __post_init__(self) -> None:
+        before = _utc(self.history_before, "history_before")
+        source_manifest = _sha256(
+            self.source_manifest_sha256,
+            "source_manifest_sha256",
+        )
+        reference = _text(
+            self.authorization_reference,
+            "authorization_reference",
+        )
+        if (
+            self.target_cohort_id.int == 0
+            or self.source_cohort_id.int == 0
+            or self.target_cohort_id == self.source_cohort_id
+            or self.source_provider_tier is not ProviderTier.MASSIVE_DEVELOPER
+        ):
+            raise ValueError(
+                "Advanced Options history binding scope is invalid"
+            )
+        object.__setattr__(self, "history_before", before)
+        object.__setattr__(self, "source_manifest_sha256", source_manifest)
+        object.__setattr__(self, "authorization_reference", reference)
+        if self.binding_sha256 != canonical_sha256(
+            advanced_options_history_binding_payload(
+                self,
+                include_sha256=False,
+            )
+        ):
+            raise ValueError("Advanced Options history binding identity changed")
+
+
+def advanced_options_history_binding_payload(
+    binding: AdvancedOptionsHistoryBinding,
+    *,
+    include_sha256: bool = True,
+) -> dict[str, object]:
+    if not isinstance(binding, AdvancedOptionsHistoryBinding):
+        raise TypeError("Advanced Options history binding is invalid")
+    payload = {
+        "contract_version": ADVANCED_OPTIONS_HISTORY_BINDING_VERSION,
+        "target_cohort_id": str(binding.target_cohort_id),
+        "source_cohort_id": str(binding.source_cohort_id),
+        "source_provider_tier": binding.source_provider_tier.value,
+        "history_before": binding.history_before.isoformat(),
+        "source_manifest_sha256": binding.source_manifest_sha256,
+        "authorization_reference": binding.authorization_reference,
+    }
+    if include_sha256:
+        payload["binding_sha256"] = binding.binding_sha256
+    return payload
+
+
+def build_advanced_options_history_binding(
+    *,
+    target_cohort_id: UUID,
+    source_cohort_id: UUID,
+    history_before: datetime,
+    source_manifest_sha256: str,
+    authorization_reference: str,
+) -> AdvancedOptionsHistoryBinding:
+    body = {
+        "contract_version": ADVANCED_OPTIONS_HISTORY_BINDING_VERSION,
+        "target_cohort_id": str(target_cohort_id),
+        "source_cohort_id": str(source_cohort_id),
+        "source_provider_tier": ProviderTier.MASSIVE_DEVELOPER.value,
+        "history_before": _utc(
+            history_before,
+            "history_before",
+        ).isoformat(),
+        "source_manifest_sha256": _sha256(
+            source_manifest_sha256,
+            "source_manifest_sha256",
+        ),
+        "authorization_reference": _text(
+            authorization_reference,
+            "authorization_reference",
+        ),
+    }
+    return AdvancedOptionsHistoryBinding(
+        target_cohort_id=target_cohort_id,
+        source_cohort_id=source_cohort_id,
+        source_provider_tier=ProviderTier.MASSIVE_DEVELOPER,
+        history_before=datetime.fromisoformat(str(body["history_before"])),
+        source_manifest_sha256=str(body["source_manifest_sha256"]),
+        authorization_reference=str(body["authorization_reference"]),
+        binding_sha256=canonical_sha256(body),
+    )
+
+
 def _slot_set_identity(slot_set: SlotSetVersion) -> dict[str, object]:
     return {
         "version": slot_set.version,
@@ -504,6 +758,8 @@ def build_advanced_options_control_plane_plan(
     stream_session_ids: tuple[UUID, ...],
     receipt_inputs: AdvancedOptionsReceiptInputs,
     runtime_authorization: AdvancedOptionsRuntimeAuthorization | None = None,
+    authorized_cohort_id: UUID | None = None,
+    authorized_plan_id: UUID | None = None,
 ) -> AdvancedOptionsControlPlanePlan:
     _validate_equity_source(equity_plan)
     if (
@@ -529,6 +785,22 @@ def build_advanced_options_control_plane_plan(
         raise TypeError("Advanced Options owner names are invalid")
     if not isinstance(receipt_inputs, AdvancedOptionsReceiptInputs):
         raise TypeError("Advanced Options receipt inputs are invalid")
+    if (
+        authorized_cohort_id is not None
+        and (
+            not isinstance(authorized_cohort_id, UUID)
+            or authorized_cohort_id.int == 0
+        )
+    ):
+        raise ValueError("authorized Advanced Options cohort is invalid")
+    if (
+        authorized_plan_id is not None
+        and (
+            not isinstance(authorized_plan_id, UUID)
+            or authorized_plan_id.int == 0
+        )
+    ):
+        raise ValueError("authorized Advanced Options plan is invalid")
 
     evidence_sha256 = _sha256(
         options_entitlement_evidence_sha256,
@@ -652,7 +924,7 @@ def build_advanced_options_control_plane_plan(
         "mode": "SHADOW",
     }
     cohort_sha256 = canonical_sha256(cohort_identity)
-    cohort_id = uuid5(
+    cohort_id = authorized_cohort_id or uuid5(
         NAMESPACE_URL,
         f"stockscreener:advanced-options-cohort:{cohort_sha256}",
     )
@@ -794,7 +1066,7 @@ def build_advanced_options_control_plane_plan(
         cycle_receipt,
         portal_receipt,
     )
-    plan_sha256 = canonical_sha256({
+    plan_identity = {
         "control_sha256": control_sha256,
         "receipt_ids": receipts.ids,
         "receipt_sha256s": (
@@ -802,9 +1074,12 @@ def build_advanced_options_control_plane_plan(
             cycle_receipt.receipt_sha256,
             portal_receipt.receipt_sha256,
         ),
-    })
+    }
+    if authorized_plan_id is not None:
+        plan_identity["authorized_plan_id"] = authorized_plan_id
+    plan_sha256 = canonical_sha256(plan_identity)
     return AdvancedOptionsControlPlanePlan(
-        plan_id=uuid5(
+        plan_id=authorized_plan_id or uuid5(
             NAMESPACE_URL,
             f"stockscreener:advanced-options-control-plane:{plan_sha256}",
         ),
@@ -837,3 +1112,842 @@ def build_advanced_options_control_plane_plan(
         receipts=receipts,
         runtime_authorization=authorization,
     )
+
+
+def _enrollment_body(
+    *,
+    control_plane: AdvancedOptionsControlPlanePlan,
+    equity_plan: AdvancedEquityControlPlanePlan,
+    activity_selection: OptionActivitySelectionRecord,
+    equity_members_sha256: str,
+) -> dict[str, object]:
+    slot_set = control_plane.slot_set
+    return {
+        "session_date": control_plane.session_date.isoformat(),
+        "planned_at": control_plane.planned_at.isoformat(),
+        "checked_at": control_plane.checked_at.isoformat(),
+        "expires_at": control_plane.expires_at.isoformat(),
+        "source_equity": {
+            "cohort_id": str(equity_plan.cohort_id),
+            "cohort_sha256": equity_plan.cohort_sha256,
+            "manifest_id": str(equity_plan.manifest_id),
+            "manifest_sha256": equity_plan.manifest.sha256,
+            "profile_id": str(equity_plan.profile_id),
+            "profile_sha256": equity_plan.profile_sha256,
+            "members_sha256": equity_members_sha256,
+        },
+        "market_options": {
+            "plan_id": str(control_plane.plan_id),
+            "plan_sha256": control_plane.plan_sha256,
+            "profile_id": str(control_plane.profile_id),
+            "profile_sha256": control_plane.profile_sha256,
+            "manifest_id": str(control_plane.manifest_id),
+            "manifest_sha256": control_plane.manifest_sha256,
+            "cohort_id": str(control_plane.cohort_id),
+            "cohort_sha256": control_plane.cohort_sha256,
+            "universe_sha256": control_plane.universe.sha256,
+            "option_underlyings": list(
+                control_plane.universe.option_underlyings
+            ),
+            "manifest_policy_sha256": control_plane.manifest_policy.sha256,
+            "pins_sha256": control_plane.pins.sha256,
+            "source_flow_sha256": (
+                control_plane.source_flow.source_flow_sha256
+            ),
+            "options_input_sha256": (
+                control_plane.receipts.options_input_ready.spec.input_sha256
+            ),
+        },
+        "slot_set": {
+            "version": slot_set.version,
+            "kind": slot_set.kind.value,
+            "effective_at": slot_set.effective_at.isoformat(),
+            "policy_sha256": slot_set.policy_sha256,
+            "member_sha256": slot_set.member_sha256,
+            "slot_set_sha256": control_plane.slot_set_sha256,
+            "primary_contract_count": slot_set.primary_contract_count,
+            "reserve_contract_count": slot_set.reserve_contract_count,
+            "contract_count": slot_set.contract_count,
+            "quote_ceiling": (
+                control_plane.manifest_policy.maximum_option_quote_contracts
+            ),
+        },
+        "activity_selection": option_activity_selection_payload(
+            activity_selection
+        ),
+        "runtime_authorized": False,
+        "effect_counts": {
+            name: 0 for name in ADVANCED_OPTIONS_ZERO_EFFECTS
+        },
+    }
+
+
+def _equity_am_members_sha256(
+    equity_plan: AdvancedEquityControlPlanePlan,
+) -> str:
+    return canonical_sha256({
+        "manifest_id": equity_plan.manifest_id,
+        "manifest_sha256": equity_plan.manifest.sha256,
+        "members": tuple(
+            (
+                ticker,
+                security_id,
+                MarketChannel.MINUTE_AGGREGATE,
+                1,
+                SlotSetPurpose.PRIMARY,
+                False,
+            )
+            for ticker, security_id in equity_plan.security_ids
+        ),
+    })
+
+
+def _validated_enrollment_identity(
+    plan: AdvancedOptionsEnrollmentPlan,
+) -> dict[str, object]:
+    if not isinstance(plan, AdvancedOptionsEnrollmentPlan):
+        raise TypeError("Advanced Options enrollment plan is invalid")
+    control = plan.control_plane
+    equity = plan.equity_plan
+    selection = plan.activity_selection
+    if (
+        not isinstance(control, AdvancedOptionsControlPlanePlan)
+        or not isinstance(equity, AdvancedEquityControlPlanePlan)
+        or control.session_date != equity.session_date
+        or control.universe.equity_tickers != equity.universe.equity_tickers
+        or control.cohort_id == equity.cohort_id
+        or control.runtime_authorization.any_authorized
+        or control.runtime_enabled
+        or control.options_cycle_bound
+    ):
+        raise ValueError("Advanced Options enrollment source plans diverged")
+    expected_equity_members_sha256 = _equity_am_members_sha256(equity)
+    if plan.equity_members_sha256 != expected_equity_members_sha256:
+        raise ValueError("Advanced Equity AM membership changed")
+    validate_option_activity_selection(
+        selection,
+        required_at=control.planned_at,
+        expected_underlyings=control.universe.option_underlyings,
+        expected_quote_ceiling=(
+            control.manifest_policy.maximum_option_quote_contracts
+        ),
+    )
+    selected = {
+        (row.instrument_id, row.catalog_version_id)
+        for row in selection.contracts
+    }
+    slot_identities: dict[tuple[int, int], set[MarketChannel]] = {}
+    priorities: dict[tuple[int, int], set[int]] = {}
+    for member in control.slot_set.members:
+        if member.purpose is not SlotSetPurpose.PRIMARY:
+            raise ValueError(
+                "prospective Options enrollment permits primary slots only"
+            )
+        identity = (member.instrument_id, member.catalog_version_id)
+        slot_identities.setdefault(identity, set()).add(member.channel)
+        priorities.setdefault(identity, set()).add(member.priority)
+    if (
+        set(slot_identities) != selected
+        or any(
+            channels != set(ADVANCED_OPTIONS_CHANNELS)
+            for channels in slot_identities.values()
+        )
+        or any(len(values) != 1 for values in priorities.values())
+        or control.slot_set.version != 1
+        or control.slot_set.kind is not SlotSetKind.PRE_SESSION
+        or control.slot_set.reserve_contract_count != 0
+        or control.slot_set.primary_contract_count != len(selection.contracts)
+    ):
+        raise ValueError(
+            "activity selection and primary T/Q slot identities diverged"
+        )
+    body = _enrollment_body(
+        control_plane=control,
+        equity_plan=equity,
+        activity_selection=selection,
+        equity_members_sha256=expected_equity_members_sha256,
+    )
+    enrollment_sha256 = canonical_sha256(body)
+    enrollment_id = uuid5(
+        NAMESPACE_URL,
+        f"stockscreener:advanced-options-enrollment:{enrollment_sha256}",
+    )
+    if (
+        plan.enrollment_sha256 != enrollment_sha256
+        or plan.enrollment_id != enrollment_id
+    ):
+        raise ValueError("Advanced Options enrollment identity changed")
+    return body
+
+
+def build_advanced_options_enrollment_plan(
+    *,
+    control_plane: AdvancedOptionsControlPlanePlan,
+    equity_plan: AdvancedEquityControlPlanePlan,
+    activity_selection: OptionActivitySelectionRecord,
+) -> AdvancedOptionsEnrollmentPlan:
+    equity_members_sha256 = _equity_am_members_sha256(equity_plan)
+    body = _enrollment_body(
+        control_plane=control_plane,
+        equity_plan=equity_plan,
+        activity_selection=activity_selection,
+        equity_members_sha256=equity_members_sha256,
+    )
+    enrollment_sha256 = canonical_sha256(body)
+    plan = AdvancedOptionsEnrollmentPlan(
+        enrollment_id=uuid5(
+            NAMESPACE_URL,
+            f"stockscreener:advanced-options-enrollment:{enrollment_sha256}",
+        ),
+        enrollment_sha256=enrollment_sha256,
+        control_plane=control_plane,
+        equity_plan=equity_plan,
+        activity_selection=activity_selection,
+        equity_members_sha256=equity_members_sha256,
+    )
+    _validated_enrollment_identity(plan)
+    return plan
+
+
+def advanced_options_enrollment_plan_payload(
+    plan: AdvancedOptionsEnrollmentPlan,
+) -> dict[str, object]:
+    body = _validated_enrollment_identity(plan)
+    return {
+        "contract_version": ADVANCED_OPTIONS_ENROLLMENT_VERSION,
+        "enrollment_id": str(plan.enrollment_id),
+        "enrollment_sha256": plan.enrollment_sha256,
+        **body,
+    }
+
+
+def validate_advanced_options_enrollment_plan_payload(
+    value: object,
+) -> dict[str, object]:
+    expected_fields = {
+        "contract_version",
+        "enrollment_id",
+        "enrollment_sha256",
+        "session_date",
+        "planned_at",
+        "checked_at",
+        "expires_at",
+        "source_equity",
+        "market_options",
+        "slot_set",
+        "activity_selection",
+        "runtime_authorized",
+        "effect_counts",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise ValueError(
+            "Advanced Options enrollment plan fields are not exact"
+        )
+    if value["contract_version"] != ADVANCED_OPTIONS_ENROLLMENT_VERSION:
+        raise ValueError(
+            "Advanced Options enrollment contract version is invalid"
+        )
+    source_equity = value["source_equity"]
+    market_options = value["market_options"]
+    slot_set = value["slot_set"]
+    if (
+        not isinstance(source_equity, dict)
+        or set(source_equity) != {
+            "cohort_id",
+            "cohort_sha256",
+            "manifest_id",
+            "manifest_sha256",
+            "profile_id",
+            "profile_sha256",
+            "members_sha256",
+        }
+        or not isinstance(market_options, dict)
+        or set(market_options) != {
+            "plan_id",
+            "plan_sha256",
+            "profile_id",
+            "profile_sha256",
+            "manifest_id",
+            "manifest_sha256",
+            "cohort_id",
+            "cohort_sha256",
+            "universe_sha256",
+            "option_underlyings",
+            "manifest_policy_sha256",
+            "pins_sha256",
+            "source_flow_sha256",
+            "options_input_sha256",
+        }
+        or not isinstance(slot_set, dict)
+        or set(slot_set) != {
+            "version",
+            "kind",
+            "effective_at",
+            "policy_sha256",
+            "member_sha256",
+            "slot_set_sha256",
+            "primary_contract_count",
+            "reserve_contract_count",
+            "contract_count",
+            "quote_ceiling",
+        }
+    ):
+        raise ValueError(
+            "Advanced Options enrollment identities are not exact"
+        )
+    planned_at = _utc(
+        datetime.fromisoformat(
+            str(value["planned_at"]).replace("Z", "+00:00")
+        ),
+        "planned_at",
+    )
+    option_underlyings = tuple(market_options["option_underlyings"])
+    selection = option_activity_selection_from_payload(
+        value["activity_selection"],
+        required_at=planned_at,
+        expected_underlyings=option_underlyings,
+        expected_quote_ceiling=slot_set["quote_ceiling"],
+    )
+    if (
+        value["runtime_authorized"] is not False
+        or value["effect_counts"]
+        != {name: 0 for name in ADVANCED_OPTIONS_ZERO_EFFECTS}
+        or slot_set["version"] != 1
+        or slot_set["kind"] != SlotSetKind.PRE_SESSION.value
+        or slot_set["reserve_contract_count"] != 0
+        or slot_set["primary_contract_count"] != len(selection.contracts)
+        or slot_set["contract_count"] != len(selection.contracts)
+    ):
+        raise ValueError(
+            "Advanced Options enrollment is not a zero-effect primary plan"
+        )
+    body = {
+        key: value[key]
+        for key in expected_fields
+        if key not in {
+            "contract_version",
+            "enrollment_id",
+            "enrollment_sha256",
+        }
+    }
+    body["activity_selection"] = option_activity_selection_payload(selection)
+    enrollment_sha256 = canonical_sha256(body)
+    enrollment_id = uuid5(
+        NAMESPACE_URL,
+        f"stockscreener:advanced-options-enrollment:{enrollment_sha256}",
+    )
+    if (
+        value["enrollment_sha256"] != enrollment_sha256
+        or value["enrollment_id"] != str(enrollment_id)
+    ):
+        raise ValueError("Advanced Options enrollment payload diverged")
+    return {
+        "contract_version": ADVANCED_OPTIONS_ENROLLMENT_VERSION,
+        "enrollment_id": str(enrollment_id),
+        "enrollment_sha256": enrollment_sha256,
+        **body,
+    }
+
+
+def _verify_source_equity_cursor(
+    cursor,
+    plan: AdvancedOptionsEnrollmentPlan,
+) -> tuple[tuple[int, str, int, str, str], ...]:
+    equity = plan.equity_plan
+    cursor.execute(
+        "SELECT cohort.cohort_sha256, cohort.manifest_id::text, "
+        "manifest.manifest_sha256, manifest.manifest_kind, "
+        "profile.profile_sha256 "
+        "FROM rt.cohorts AS cohort "
+        "JOIN rt.subscription_manifests AS manifest "
+        "ON manifest.manifest_id=cohort.manifest_id "
+        "JOIN rt.capability_profiles AS profile "
+        "ON profile.profile_id=manifest.profile_id "
+        "WHERE cohort.cohort_id=%s",
+        (str(equity.cohort_id),),
+    )
+    if cursor.fetchone() != (
+        equity.cohort_sha256,
+        str(equity.manifest_id),
+        equity.manifest.sha256,
+        "EQUITY_VALIDATION",
+        equity.profile_sha256,
+    ):
+        raise ValueError("source Advanced Equity cohort identity changed")
+    cursor.execute(
+        "SELECT member.instrument_id, member.channel, member.priority, "
+        "member.purpose, instrument.security_id::text "
+        "FROM rt.subscription_members AS member "
+        "JOIN rt.instruments AS instrument "
+        "ON instrument.instrument_id=member.instrument_id "
+        "WHERE member.manifest_id=%s AND member.option_underlying=false "
+        "ORDER BY instrument.security_id, member.channel",
+        (str(equity.manifest_id),),
+    )
+    rows = tuple(
+        (
+            int(instrument_id),
+            str(channel),
+            int(priority),
+            str(purpose),
+            str(security_id),
+        )
+        for instrument_id, channel, priority, purpose, security_id
+        in cursor.fetchall()
+    )
+    security_ids = {str(value) for _, value in equity.security_ids}
+    expected_members = {
+        (
+            MarketChannel.MINUTE_AGGREGATE.value,
+            1,
+            SlotSetPurpose.PRIMARY.value,
+            str(security_id),
+        )
+        for _, security_id in equity.security_ids
+    }
+    if (
+        len(rows) != len(equity.manifest.members)
+        or {row[4] for row in rows} != security_ids
+        or {(row[1], row[2], row[3], row[4]) for row in rows}
+        != expected_members
+    ):
+        raise ValueError("source Advanced Equity AM membership changed")
+    return rows
+
+
+def _verify_activity_catalog_cursor(
+    cursor,
+    plan: AdvancedOptionsEnrollmentPlan,
+) -> None:
+    selection = plan.activity_selection
+    cursor.execute(
+        "SELECT instrument.instrument_id, contract.contract_id, "
+        "version.version_id, contract.contract_ticker, "
+        "contract.underlying_security_id::text, version.call_put, "
+        "version.expiration, version.strike, version.exercise_style, "
+        "version.multiplier, version.deliverables, version.eligibility, "
+        "version.effective_from, version.effective_to, "
+        "version.observed_at, version.payload_sha256 "
+        "FROM ref.option_contract_versions AS version "
+        "JOIN ref.option_contracts AS contract "
+        "ON contract.contract_id=version.contract_id "
+        "JOIN rt.instruments AS instrument "
+        "ON instrument.contract_id=contract.contract_id "
+        "WHERE version.version_id=ANY(%s)",
+        ([row.catalog_version_id for row in selection.contracts],),
+    )
+    stored = {
+        int(row[2]): row
+        for row in cursor.fetchall()
+    }
+    security_by_ticker = {
+        ticker: str(security_id)
+        for ticker, security_id in plan.equity_plan.security_ids
+    }
+    if len(stored) != len(selection.contracts):
+        raise ValueError("activity selection catalog identities are incomplete")
+    for selected in selection.contracts:
+        row = stored[selected.catalog_version_id]
+        actual = (
+            int(row[0]),
+            int(row[1]),
+            int(row[2]),
+            str(row[3]),
+            str(row[4]),
+            str(row[5]),
+            row[6],
+            Decimal(row[7]),
+            str(row[8]),
+            Decimal(row[9]),
+            tuple(row[10]),
+            str(row[11]),
+            _utc(row[12], "catalog effective_from"),
+            (
+                None
+                if row[13] is None
+                else _utc(row[13], "catalog effective_to")
+            ),
+            _utc(row[14], "catalog observed_at"),
+            str(row[15]),
+        )
+        expected = (
+            selected.instrument_id,
+            selected.contract_id,
+            selected.catalog_version_id,
+            selected.contract_ticker,
+            security_by_ticker[selected.underlyer],
+            selected.call_put,
+            selected.expiration_date,
+            selected.strike,
+            selected.exercise_style,
+            selected.multiplier,
+            selected.deliverables,
+            selected.eligibility,
+            selected.catalog_effective_from,
+            selected.catalog_effective_to,
+            selected.catalog_observed_at,
+            selected.catalog_payload_sha256,
+        )
+        if actual != expected:
+            raise ValueError(
+                "activity selection catalog identity changed or is adjusted"
+            )
+
+
+def persist_advanced_options_history_binding_cursor(
+    cursor,
+    binding: AdvancedOptionsHistoryBinding,
+) -> None:
+    advanced_options_history_binding_payload(binding)
+    cursor.execute(
+        "SELECT manifest.manifest_sha256,profile.provider_tier "
+        "FROM rt.cohorts AS cohort "
+        "JOIN rt.subscription_manifests AS manifest "
+        "ON manifest.manifest_id=cohort.manifest_id "
+        "JOIN rt.capability_profiles AS profile "
+        "ON profile.profile_id=manifest.profile_id "
+        "WHERE cohort.cohort_id=%s",
+        (str(binding.source_cohort_id),),
+    )
+    if cursor.fetchone() != (
+        binding.source_manifest_sha256,
+        binding.source_provider_tier.value,
+    ):
+        raise ValueError(
+            "Advanced Options history source identity changed"
+        )
+    cursor.execute(
+        "SELECT profile.provider_tier "
+        "FROM rt.cohorts AS cohort "
+        "JOIN rt.subscription_manifests AS manifest "
+        "ON manifest.manifest_id=cohort.manifest_id "
+        "JOIN rt.capability_profiles AS profile "
+        "ON profile.profile_id=manifest.profile_id "
+        "WHERE cohort.cohort_id=%s",
+        (str(binding.target_cohort_id),),
+    )
+    if cursor.fetchone() != (ProviderTier.MASSIVE_ADVANCED.value,):
+        raise ValueError(
+            "Advanced Options history target identity changed"
+        )
+    cursor.execute(
+        "INSERT INTO rt.cohort_history_bindings ("
+        "target_cohort_id,source_cohort_id,source_provider_tier,"
+        "history_before,source_manifest_sha256,authorization_reference,"
+        "binding_sha256) VALUES (%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (target_cohort_id) DO NOTHING",
+        (
+            str(binding.target_cohort_id),
+            str(binding.source_cohort_id),
+            binding.source_provider_tier.value,
+            binding.history_before,
+            binding.source_manifest_sha256,
+            binding.authorization_reference,
+            binding.binding_sha256,
+        ),
+    )
+    cursor.execute(
+        "SELECT source_cohort_id::text,source_provider_tier,"
+        "history_before,source_manifest_sha256,authorization_reference,"
+        "binding_sha256 FROM rt.cohort_history_bindings "
+        "WHERE target_cohort_id=%s",
+        (str(binding.target_cohort_id),),
+    )
+    if cursor.fetchone() != (
+        str(binding.source_cohort_id),
+        binding.source_provider_tier.value,
+        binding.history_before,
+        binding.source_manifest_sha256,
+        binding.authorization_reference,
+        binding.binding_sha256,
+    ):
+        raise ValueError(
+            "persisted Advanced Options history binding diverged"
+        )
+
+
+def persist_advanced_options_enrollment_cursor(
+    cursor,
+    plan: AdvancedOptionsEnrollmentPlan,
+    *,
+    history_binding: AdvancedOptionsHistoryBinding | None = None,
+) -> bool:
+    _validated_enrollment_identity(plan)
+    control = plan.control_plane
+    if (
+        history_binding is not None
+        and history_binding.target_cohort_id != control.cohort_id
+    ):
+        raise ValueError(
+            "Advanced Options history binding targets another cohort"
+        )
+    equity_rows = _verify_source_equity_cursor(cursor, plan)
+    _verify_activity_catalog_cursor(cursor, plan)
+    capabilities_sha256 = canonical_sha256(tuple(sorted(
+        capability.value for capability in control.binding.capabilities
+    )))
+    cursor.execute(
+        "INSERT INTO rt.capability_profiles ("
+        "profile_id,config_sha256,schema_sha256,account_alias,"
+        "capabilities_sha256,universe_sha256,checked_at,expires_at,"
+        "status,profile_sha256,provider_tier,security_policy_sha256,"
+        "preflight_mode,provider_requests,action_authorized) VALUES ("
+        "%s,%s,%s,'MASSIVE_ADVANCED',%s,%s,%s,%s,'PASS',%s,"
+        "'MASSIVE_ADVANCED',%s,'PASSIVE',false,false) "
+        "ON CONFLICT (profile_id) DO NOTHING",
+        (
+            str(control.profile_id),
+            plan.enrollment_sha256,
+            plan.equity_plan.schema_sha256,
+            capabilities_sha256,
+            control.universe.sha256,
+            control.checked_at,
+            control.expires_at,
+            control.profile_sha256,
+            plan.equity_plan.security_policy_sha256,
+        ),
+    )
+    cursor.execute(
+        "SELECT config_sha256,schema_sha256,account_alias,"
+        "capabilities_sha256,universe_sha256,checked_at,expires_at,"
+        "status,profile_sha256,provider_tier,security_policy_sha256,"
+        "preflight_mode,provider_requests,action_authorized "
+        "FROM rt.capability_profiles WHERE profile_id=%s",
+        (str(control.profile_id),),
+    )
+    if cursor.fetchone() != (
+        plan.enrollment_sha256,
+        plan.equity_plan.schema_sha256,
+        "MASSIVE_ADVANCED",
+        capabilities_sha256,
+        control.universe.sha256,
+        control.checked_at,
+        control.expires_at,
+        "PASS",
+        control.profile_sha256,
+        "MASSIVE_ADVANCED",
+        plan.equity_plan.security_policy_sha256,
+        "PASSIVE",
+        False,
+        False,
+    ):
+        raise ValueError("persisted Advanced Options profile diverged")
+    capability_evidence = (
+        (
+            "options_entitlement",
+            "options:entitlement",
+            {
+                "authorization_reference": (
+                    control.options_authorization_reference
+                ),
+                "evidence_sha256": (
+                    control.options_entitlement_evidence_sha256
+                ),
+                "provider_requests_by_action": 0,
+            },
+        ),
+        (
+            "options_activity_selection",
+            "options:activity-selection",
+            {
+                "authorization_reference": (
+                    plan.activity_selection.authorization_reference
+                ),
+                "selection_sha256": (
+                    plan.activity_selection.selection_sha256
+                ),
+                "source_sha256": plan.activity_selection.source_sha256,
+                "source_clocks_sha256": (
+                    plan.activity_selection.source_clocks_sha256
+                ),
+                "provider_requests_by_action": 0,
+            },
+        ),
+    )
+    for check_name, scope_key, evidence in capability_evidence:
+        cursor.execute(
+            "INSERT INTO rt.capability_checks ("
+            "profile_id,check_name,scope_key,verdict,required,"
+            "reason_codes,observed_at,expires_at,evidence) VALUES ("
+            "%s,%s,%s,'PASS',true,ARRAY[]::text[],%s,%s,%s::jsonb) "
+            "ON CONFLICT DO NOTHING",
+            (
+                str(control.profile_id),
+                check_name,
+                scope_key,
+                control.checked_at,
+                control.expires_at,
+                json.dumps(evidence, sort_keys=True),
+            ),
+        )
+        cursor.execute(
+            "SELECT verdict,required,reason_codes,observed_at,expires_at,"
+            "evidence FROM rt.capability_checks "
+            "WHERE profile_id=%s AND check_name=%s AND scope_key=%s",
+            (str(control.profile_id), check_name, scope_key),
+        )
+        if cursor.fetchone() != (
+            "PASS",
+            True,
+            [],
+            control.checked_at,
+            control.expires_at,
+            evidence,
+        ):
+            raise ValueError(
+                "persisted Advanced Options capability evidence diverged"
+            )
+    cursor.execute(
+        "INSERT INTO rt.subscription_manifests ("
+        "manifest_id,manifest_sha256,universe_sha256,session_date,"
+        "effective_at,profile_id,manifest_kind,stock_count,"
+        "option_underlying_count,member_count,allocation_policy_sha256"
+        ") VALUES (%s,%s,%s,%s,%s,%s,'MARKET_OPTIONS',%s,%s,%s,%s) "
+        "ON CONFLICT (manifest_id) DO NOTHING",
+        (
+            str(control.manifest_id),
+            control.manifest_sha256,
+            control.universe.sha256,
+            control.session_date,
+            control.planned_at,
+            str(control.profile_id),
+            len(control.universe.equity_tickers),
+            len(control.universe.option_underlyings),
+            len(equity_rows),
+            control.manifest_policy.sha256,
+        ),
+    )
+    cursor.execute(
+        "SELECT manifest_sha256,universe_sha256,session_date,effective_at,"
+        "profile_id::text,manifest_kind,stock_count,"
+        "option_underlying_count,member_count,allocation_policy_sha256 "
+        "FROM rt.subscription_manifests WHERE manifest_id=%s",
+        (str(control.manifest_id),),
+    )
+    if cursor.fetchone() != (
+        control.manifest_sha256,
+        control.universe.sha256,
+        control.session_date,
+        control.planned_at,
+        str(control.profile_id),
+        "MARKET_OPTIONS",
+        len(control.universe.equity_tickers),
+        len(control.universe.option_underlyings),
+        len(equity_rows),
+        control.manifest_policy.sha256,
+    ):
+        raise ValueError("persisted MARKET_OPTIONS manifest diverged")
+    underlying_security_ids = {
+        str(security_id)
+        for ticker, security_id in plan.equity_plan.security_ids
+        if ticker in control.universe.option_underlyings
+    }
+    for instrument_id, channel, priority, purpose, security_id in equity_rows:
+        cursor.execute(
+            "INSERT INTO rt.subscription_members ("
+            "manifest_id,instrument_id,channel,priority,purpose,"
+            "option_underlying) VALUES (%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT DO NOTHING",
+            (
+                str(control.manifest_id),
+                instrument_id,
+                channel,
+                priority,
+                purpose,
+                security_id in underlying_security_ids,
+            ),
+        )
+    cursor.execute(
+        "SELECT instrument_id,channel,priority,purpose,option_underlying "
+        "FROM rt.subscription_members WHERE manifest_id=%s "
+        "ORDER BY instrument_id,channel",
+        (str(control.manifest_id),),
+    )
+    expected_members = tuple(sorted(
+        (
+            instrument_id,
+            channel,
+            priority,
+            purpose,
+            security_id in underlying_security_ids,
+        )
+        for instrument_id, channel, priority, purpose, security_id
+        in equity_rows
+    ))
+    stored_members = tuple(
+        (
+            int(instrument_id),
+            str(channel),
+            int(priority),
+            str(purpose),
+            bool(option_underlying),
+        )
+        for instrument_id, channel, priority, purpose, option_underlying
+        in cursor.fetchall()
+    )
+    if stored_members != expected_members:
+        raise ValueError("persisted MARKET_OPTIONS membership diverged")
+    cursor.execute(
+        "INSERT INTO rt.cohorts ("
+        "cohort_id,cohort_sha256,manifest_id,configuration_sha256,"
+        "model_bundle_sha256,valuation_sha256,effective_at,mode"
+        ") VALUES (%s,%s,%s,%s,%s,%s,%s,'SHADOW') "
+        "ON CONFLICT (cohort_id) DO NOTHING",
+        (
+            str(control.cohort_id),
+            control.cohort_sha256,
+            str(control.manifest_id),
+            plan.enrollment_sha256,
+            control.pins.model_bundle_sha256,
+            control.pins.valuation_policy_sha256,
+            control.planned_at,
+        ),
+    )
+    cursor.execute(
+        "SELECT cohort_sha256,manifest_id::text,configuration_sha256,"
+        "model_bundle_sha256,valuation_sha256,effective_at,mode "
+        "FROM rt.cohorts WHERE cohort_id=%s",
+        (str(control.cohort_id),),
+    )
+    if cursor.fetchone() != (
+        control.cohort_sha256,
+        str(control.manifest_id),
+        plan.enrollment_sha256,
+        control.pins.model_bundle_sha256,
+        control.pins.valuation_policy_sha256,
+        control.planned_at,
+        "SHADOW",
+    ):
+        raise ValueError("persisted MARKET_OPTIONS cohort diverged")
+    persist_tier_cohort_binding_cursor(cursor, control.binding)
+    moved = persist_and_activate_slot_set_cursor(
+        cursor,
+        control.slot_set,
+        activated_at=control.slot_set.effective_at,
+    )
+    if history_binding is not None:
+        persist_advanced_options_history_binding_cursor(
+            cursor,
+            history_binding,
+        )
+    return moved
+
+
+def persist_advanced_options_enrollment(
+    connection,
+    plan: AdvancedOptionsEnrollmentPlan,
+    *,
+    history_binding: AdvancedOptionsHistoryBinding | None = None,
+) -> bool:
+    try:
+        with connection.cursor() as cursor:
+            moved = persist_advanced_options_enrollment_cursor(
+                cursor,
+                plan,
+                history_binding=history_binding,
+            )
+        connection.commit()
+        return moved
+    except Exception:
+        connection.rollback()
+        raise

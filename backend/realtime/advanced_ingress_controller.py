@@ -297,8 +297,8 @@ _ENTITLEMENT_MARKERS = (
     "SUBSCRIPTION_REJECTED",
     "NOT_AUTHORIZED",
     "ENTITLEMENT",
-    "MAX_CONNECTIONS",
 )
+_CONNECTION_CONCURRENCY_MARKERS = ("MAX_CONNECTIONS",)
 _AUTHORIZATION_MARKERS = (
     "AUTHORIZATION_EXHAUSTED",
     "BUDGET",
@@ -350,6 +350,16 @@ def classify_advanced_ingress_failure(
             IngressFailureDisposition.INTENTIONAL,
             None,
             normalized_code or "INTENTIONAL_SHUTDOWN",
+            max(0.0, float(live_seconds)),
+        )
+    if any(
+        marker in normalized
+        for marker in _CONNECTION_CONCURRENCY_MARKERS
+    ):
+        return AdvancedIngressFailure(
+            IngressFailureDisposition.TRANSIENT,
+            "FAILED_INFRASTRUCTURE",
+            normalized_code,
             max(0.0, float(live_seconds)),
         )
     for markers, outcome in (

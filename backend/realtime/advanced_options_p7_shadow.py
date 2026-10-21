@@ -12,12 +12,19 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from .contracts import canonical_sha256
 from .migrations import V2_MIGRATIONS_DIR, load_realtime_migrations
+from .advanced_options_p7_selection import (
+    validate_p7_transport_selection_payload,
+)
+from .provider_socket_lease import MASSIVE_OPTIONS_SOCKET_RESOURCE
 
 
 UTC = timezone.utc
-CONTRACT_VERSION = "advanced-options-p7-shadow-v1"
-APPROVAL_VERSION = "advanced-options-p7-shadow-approval-v1"
-OWNER_DECISION = "approve_bounded_advanced_options_p7_shadow"
+CONTRACT_VERSION = "advanced-options-p7-shadow-v3"
+APPROVAL_VERSION = "advanced-options-p7-shadow-approval-v3"
+LIVE_AUTHORIZATION_VERSION = (
+    "advanced-options-p7-live-execution-authorization-v3"
+)
+OWNER_DECISION = "approve_bounded_advanced_options_p7_shadow_v3"
 PROVIDER_ENDPOINT = "wss://socket.massive.com/options"
 EVIDENCE_FILES = (
     "authorization.json",
@@ -48,14 +55,21 @@ SOURCE_BINDING_PATHS = (
     "realtime/advanced_options_provider_contract.py",
     "realtime/advanced_options_control_plane.py",
     "realtime/advanced_options_p7_shadow.py",
+    "realtime/advanced_options_p7_selection.py",
     "realtime/advanced_options_p7_executor.py",
+    "realtime/advanced_ingress_controller.py",
     "realtime/contracts.py",
     "realtime/option_flow/consumer.py",
     "realtime/option_flow/engine.py",
     "realtime/option_flow/writer.py",
     "realtime/security_v2.py",
+    "realtime/provider_socket_lease.py",
+    "scripts/prepare_advanced_options_p7_approval.py",
+    "scripts/prepare_advanced_options_p7_live_authorization.py",
+    "scripts/prepare_advanced_options_p7_selection.py",
     "scripts/prepare_advanced_options_p7_shadow.py",
     "scripts/run_advanced_options_p7_shadow.py",
+    "scripts/schedule_advanced_options_p7_shadow.py",
     "tests/realtime/advanced_options_reference_support.py",
     "tests/realtime/option_flow_runner_support.py",
     "tests/realtime/option_flow_support.py",
@@ -72,6 +86,7 @@ EXPECTED_P7_MIGRATIONS = (
     "031_realtime_advanced_journal_recovery",
 )
 _COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _OPTION_PATTERN = re.compile(
     r"^O:(?P<underlyer>[A-Z][A-Z0-9.-]{0,14})"
     r"\d{6}[CP]\d{8}$"
@@ -158,6 +173,7 @@ def build_authorization(
     stop_at: datetime,
     spy_contract: str,
     qqq_contract: str,
+    contract_selection: Mapping[str, object],
     backend_dir: Path,
     artifact_root: Path,
 ) -> dict[str, object]:
@@ -182,6 +198,18 @@ def build_authorization(
     }
     if len(set(contracts.values())) != 2:
         raise ValueError("P7 shadow requires two distinct contracts")
+    selection = validate_p7_transport_selection_payload(
+        contract_selection,
+        required_at=start,
+    )
+    selected_by_underlyer = {
+        str(row["underlyer"]): str(row["contract_ticker"])
+        for row in selection["selected"]
+    }
+    if selected_by_underlyer != contracts:
+        raise ValueError(
+            "P7 contracts do not match the activity-ranked selection"
+        )
     date_token = start.strftime("%Y%m%d")
     evidence_directory = (
         artifact_root.resolve()
@@ -216,6 +244,10 @@ def build_authorization(
             "endpoint": PROVIDER_ENDPOINT,
             "feed": "OPTIONS",
             "channels": ["T", "Q"],
+            "concurrent_connections_per_asset_class": 1,
+            "connection_lease_resource_key": (
+                MASSIVE_OPTIONS_SOCKET_RESOURCE
+            ),
             "rest_requests_authorized": 0,
             "incremental_purchase_authorized": False,
         },
@@ -233,12 +265,20 @@ def build_authorization(
             "contract_substitution": False,
             "scope_expansion": False,
         },
+        "contract_selection": selection,
         "socket_ceiling": {
             "stream_sessions": 1,
-            "connection_attempts": 2,
-            "reconnects": 1,
-            "auth_messages": 2,
-            "subscription_messages": 2,
+            "connection_attempts": 6,
+            "reconnects": 5,
+            "auth_messages": 6,
+            "subscription_messages": 6,
+            "reconnect_backoff": {
+                "initial_seconds": 5,
+                "minimum_seconds": 5,
+                "multiplier": 2,
+                "maximum_seconds": 60,
+                "jitter_ceiling_seconds": 60,
+            },
             "websocket_frames": 25_000,
             "decoded_market_messages": 100_000,
             "inbound_decoded_bytes": 32 * 1024 * 1024,
@@ -320,7 +360,11 @@ def build_authorization(
         "database_ddl_authorized": 0,
         "files_written_by_preflight": 0,
         "live_shadow_authority": {
-            "provider_websocket_connection_attempts": 2,
+            "provider_websocket_connection_attempts": 6,
+            "provider_socket_lease_scope": "HOST_LOCAL",
+            "provider_socket_lease_resource_key": (
+                MASSIVE_OPTIONS_SOCKET_RESOURCE
+            ),
             "provider_rest_requests": 0,
             "disposable_database_ddl": True,
             "run_owned_local_files": True,
@@ -352,6 +396,7 @@ def validate_authorization(
         "baseline_head",
         "window",
         "scope",
+        "contract_selection",
         "evidence",
     }
     missing = required - set(manifest)
@@ -382,6 +427,7 @@ def validate_authorization(
         stop_at=_timestamp(str(window.get("stop_utc")), "stop_utc"),
         spy_contract=str(contracts[0]),
         qqq_contract=str(contracts[1]),
+        contract_selection=manifest["contract_selection"],
         backend_dir=backend_dir,
         artifact_root=Path(directory).resolve().parent,
     )
@@ -423,12 +469,72 @@ def approved_authorization(
         != hashlib.sha256(body).hexdigest()
         or approval["owner_decision"] != OWNER_DECISION
         or approval["conditional_live_shadow_authorized"] is not True
-        or approval["provider_websocket_connection_attempts_authorized"] != 2
+        or approval["provider_websocket_connection_attempts_authorized"]
+        != 6
         or approval["provider_rest_requests_authorized"] != 0
         or approval["production_effects_authorized"] is not False
     ):
         raise ValueError("P7 shadow lacks exact conditional owner approval")
     return validate_authorization(manifest, backend_dir=backend_dir)
+
+
+def build_live_authorization(
+    plan: Mapping[str, object],
+    *,
+    manifest_sha256: str,
+    approval_sha256: str,
+    authorized_at: datetime,
+) -> dict[str, object]:
+    for value, name in (
+        (manifest_sha256, "manifest_sha256"),
+        (approval_sha256, "approval_sha256"),
+    ):
+        if _SHA256_PATTERN.fullmatch(value) is None:
+            raise ValueError(f"{name} must be a SHA-256 digest")
+    authorized = _utc(authorized_at, "authorized_at")
+    return {
+        "version": LIVE_AUTHORIZATION_VERSION,
+        "state": "AUTHORIZED_FOR_ONE_EXECUTION",
+        "live_authorization_reference": (
+            f"{plan['authorization_reference']}:LIVE"
+        ),
+        "authorized_at_utc": authorized.isoformat(),
+        "manifest_id": plan["manifest_id"],
+        "manifest_sha256": manifest_sha256,
+        "approval_sha256": approval_sha256,
+        "window": plan["window"],
+        "contracts": plan["scope"]["contracts"],
+        "provider_scope": {
+            "feed": "OPTIONS",
+            "channels": ["T", "Q"],
+            "connection_attempts": plan["socket_ceiling"][
+                "connection_attempts"
+            ],
+            "reconnects": plan["socket_ceiling"]["reconnects"],
+            "reconnect_backoff": plan["socket_ceiling"][
+                "reconnect_backoff"
+            ],
+            "lease_scope": "HOST_LOCAL",
+            "lease_resource_key": plan["provider"][
+                "connection_lease_resource_key"
+            ],
+            "rest_requests": 0,
+        },
+        "disposable_scope": {
+            "database": plan["database"]["name"],
+            "role_prefix": plan["database"]["role_prefix"],
+            "owned_local_evidence": True,
+        },
+        "confirmations": {
+            "no_equity_qualification_overlap": True,
+            "no_stages_v4_selection": True,
+            "no_production_database_writes": True,
+            "no_publication_release_pointer": True,
+            "no_outbox_delivery_execution": True,
+            "no_repair_replay_backfill": True,
+            "no_archive_retention_execution": True,
+        },
+    }
 
 
 def provider_free_preflight(

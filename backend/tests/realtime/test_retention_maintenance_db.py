@@ -11,19 +11,40 @@ from psycopg2 import sql
 
 from realtime.partition_maintenance import ensure_partitions_and_check
 from realtime.partition_retention import PartitionRetentionExecutor, PostgresPartitionRetentionRepository
-from realtime.relation_registry import ADMIN_ROLE, APP_ROLE
+from realtime.relation_registry import ADMIN_ROLE, API_ROLE, APP_ROLE
 from realtime.retention_maintenance import (
     STATUS_READY,
     RetentionMaintenanceCycle,
     RetentionMaintenanceRequest,
     read_retention_status,
 )
+from realtime.retention_reconciliation_executor import (
+    EXPECTED_WINDOW_START,
+    STATUS_AMBIGUOUS,
+    STATUS_CONSUMED,
+    STATUS_POSTFLIGHT_PASS,
+    PostgresReconciliationRepository,
+    ReconciliationExecutionError,
+    ReconciliationExecutor,
+)
 from realtime.security_v2 import build_role_names_v2, drop_disposable_roles_v2, harden_database_v2
-from realtime.session_archive import OPTION_FLOW_CLUSTERS, ArchiveIdentity
+from realtime.session_archive import (
+    OPTION_FLOW_CLUSTERS,
+    OPTION_FLOW_EVENTS,
+    ArchiveIdentity,
+    verify_archive,
+)
 from realtime.session_archive_repository import PostgresSessionArchiveRepository
 from realtime.session_archive_worker import STATUS_ALREADY_ARCHIVED, STATUS_ARCHIVED, SessionArchiveWorker
 from scripts.validate_realtime_v2_schema import _connect, _settings
 from v2_database import disposable_v2_database, requires_v2_database
+from test_retention_reconciliation_executor import (
+    REPORT_PATH,
+    ROOT,
+    _package_and_plan,
+    _seed_original_files,
+    _services,
+)
 
 pytestmark = requires_v2_database
 
@@ -41,7 +62,12 @@ STATUS_PATH = Path(
 )
 FUTURE_PARTITION = "rt.raw_payloads_p20261031"
 EXPIRED_ORDINARY_PARTITION = "rt.raw_payloads_p20260901"
-EXPIRED_ARCHIVE_PARTITION = "rt.option_flow_clusters_p20260831"
+EXPIRED_ARCHIVE_PARTITIONS = (
+    "rt.option_flow_events_p20260831",
+    "rt.option_flow_event_profiles_p20260831",
+    "rt.option_flow_clusters_p20260831",
+    "rt.option_flow_cluster_members_p20260831",
+)
 UTC = timezone.utc
 
 
@@ -132,7 +158,21 @@ def test_hardened_disposable_retention_cycle(hardened_database):
                 "FOR VALUES FROM ('2026-09-01 00:00:00+00') TO ('2026-09-02 00:00:00+00')"
             )
             cursor.execute(
+                "CREATE TABLE rt.option_flow_events_p20260831 PARTITION OF rt.option_flow_events "
+                "FOR VALUES FROM ('2026-08-31 00:00:00+00') TO ('2026-09-07 00:00:00+00')"
+            )
+            cursor.execute(
+                "CREATE TABLE rt.option_flow_event_profiles_p20260831 "
+                "PARTITION OF rt.option_flow_event_profiles "
+                "FOR VALUES FROM ('2026-08-31 00:00:00+00') TO ('2026-09-07 00:00:00+00')"
+            )
+            cursor.execute(
                 "CREATE TABLE rt.option_flow_clusters_p20260831 PARTITION OF rt.option_flow_clusters "
+                "FOR VALUES FROM ('2026-08-31') TO ('2026-09-07')"
+            )
+            cursor.execute(
+                "CREATE TABLE rt.option_flow_cluster_members_p20260831 "
+                "PARTITION OF rt.option_flow_cluster_members "
                 "FOR VALUES FROM ('2026-08-31') TO ('2026-09-07')"
             )
 
@@ -142,7 +182,7 @@ def test_hardened_disposable_retention_cycle(hardened_database):
             archive_repository,
             ARCHIVE_ROOT,
             ArchiveIdentity("retention-q1-build", "retention-q1-policy"),
-            kinds=(OPTION_FLOW_CLUSTERS,),
+            kinds=(OPTION_FLOW_EVENTS, OPTION_FLOW_CLUSTERS),
             clock=lambda: datetime(2026, 10, 17, 20, 0, tzinfo=UTC),
         )
         partition_maintenance = AppPartitionMaintenance()
@@ -161,8 +201,13 @@ def test_hardened_disposable_retention_cycle(hardened_database):
             as_of_session=AS_OF_SESSION,
             archive_session_dates=(AS_OF_SESSION,),
             retention_relations=("rt.raw_payloads",),
-            archive_relations=("rt.option_flow_clusters",),
-            archive_kinds=(OPTION_FLOW_CLUSTERS,),
+            archive_relations=(
+                "rt.option_flow_events",
+                "rt.option_flow_event_profiles",
+                "rt.option_flow_clusters",
+                "rt.option_flow_cluster_members",
+            ),
+            archive_kinds=(OPTION_FLOW_EVENTS, OPTION_FLOW_CLUSTERS),
         )
 
         status = cycle.run(request, execute=True)
@@ -171,8 +216,8 @@ def test_hardened_disposable_retention_cycle(hardened_database):
         assert status.created_partitions == len(partition_maintenance.created)
         assert FUTURE_PARTITION in partition_maintenance.created
         assert status.retention_dropped == 1
-        assert status.archive_outcomes == 1
-        assert status.archive_partitions_dropped == 1
+        assert status.archive_outcomes == 2
+        assert status.archive_partitions_dropped == 4
         assert status.last_success_at == datetime(2026, 10, 17, 20, 0, tzinfo=UTC)
         assert status.consecutive_failures == 0
         assert read_retention_status(STATUS_PATH) == status
@@ -182,18 +227,42 @@ def test_hardened_disposable_retention_cycle(hardened_database):
         with _role_cursor(ADMIN_ROLE) as cursor:
             assert _exists(cursor, FUTURE_PARTITION)
             assert not _exists(cursor, EXPIRED_ORDINARY_PARTITION)
-            assert not _exists(cursor, EXPIRED_ARCHIVE_PARTITION)
-            cursor.execute(
-                "SELECT session_date FROM rt.session_archives "
-                "WHERE kind=%s ORDER BY session_date",
-                (OPTION_FLOW_CLUSTERS,),
+            assert all(
+                not _exists(cursor, relation)
+                for relation in EXPIRED_ARCHIVE_PARTITIONS
             )
-            assert {row[0] for row in cursor.fetchall()} == expected_sessions
+            cursor.execute(
+                "SELECT session_date, kind FROM rt.session_archives "
+                "WHERE kind = ANY(%s) ORDER BY session_date, kind",
+                ([OPTION_FLOW_EVENTS, OPTION_FLOW_CLUSTERS],),
+            )
+            assert set(cursor.fetchall()) == {
+                (session_date, kind)
+                for session_date in expected_sessions
+                for kind in (OPTION_FLOW_EVENTS, OPTION_FLOW_CLUSTERS)
+            }
 
         for session_date in expected_sessions:
             directory = ARCHIVE_ROOT / session_date.isoformat()
-            assert len(list(directory.glob("*.jsonl.gz"))) == 1
-            assert len(list(directory.glob("*.manifest.json"))) == 1
+            assert len(list(directory.glob("*.jsonl.gz"))) == 2
+            assert len(list(directory.glob("*.manifest.json"))) == 2
+            for kind in (OPTION_FLOW_EVENTS, OPTION_FLOW_CLUSTERS):
+                stem = kind.lower()
+                verified = verify_archive(
+                    directory / f"{stem}.jsonl.gz",
+                    directory / f"{stem}.manifest.json",
+                    kind=kind,
+                    session_date=session_date,
+                    require_retention_compatibility=True,
+                )
+                assert verified.row_count == 0
+                assert verified.partition_coverage["complete"]
+
+        replay = cycle.run(request, execute=True)
+        assert replay.state == STATUS_READY
+        assert replay.archive_outcomes == 2
+        assert replay.archive_partitions_dropped == 0
+        assert replay.retention_dropped == 0
     finally:
         if STATUS_PATH.exists():
             STATUS_PATH.unlink()
@@ -246,3 +315,138 @@ def test_hardened_disposable_archive_ledger_distinguishes_build_identity(
         )
         [definition] = cursor.fetchone()
         assert "NULLS NOT DISTINCT" in definition and "build_id" in definition
+
+
+def test_hardened_disposable_reconciliation_executor_is_one_use(
+    hardened_database,
+    tmp_path,
+):
+    package, plan = _package_and_plan()
+    active = EXPECTED_WINDOW_START.replace(minute=35)
+    expected_partitions = tuple(
+        package["authorization_scope"]["scope"]["read_partitions"]
+    )
+    target_sha256 = package["authorization_scope"]["revisions"][0][
+        "append_only_revision"
+    ]["data_sha256"]
+    with _role_cursor(ADMIN_ROLE) as cursor:
+        assert all(_exists(cursor, relation) for relation in expected_partitions)
+        cursor.execute(
+            "SELECT count(*) FROM rt.session_archives "
+            "WHERE session_date=%s AND kind=ANY(%s) AND sha256=%s",
+            (
+                date(2026, 10, 19),
+                [OPTION_FLOW_EVENTS, OPTION_FLOW_CLUSTERS],
+                target_sha256,
+            ),
+        )
+        assert cursor.fetchone()[0] == 0
+    with _role_cursor(API_ROLE) as cursor:
+        cursor.execute(
+            "SELECT has_table_privilege("
+            "current_user,'rt.session_archives','INSERT')"
+        )
+        assert cursor.fetchone()[0] is False
+
+    admin_connect = lambda: _role_connect(ADMIN_ROLE)  # noqa: E731
+    repository = PostgresReconciliationRepository(admin_connect)
+    crash_root = (tmp_path / "crash-archive").resolve()
+    crash_root.mkdir()
+    _seed_original_files(package, crash_root)
+    crash_lock = (tmp_path / "crash.lock").resolve()
+    crash_executor = ReconciliationExecutor(
+        repository,
+        repository_root=ROOT,
+        archive_root=crash_root,
+        report_path=REPORT_PATH,
+        lock_path=crash_lock,
+        service_probe=_services,
+    )
+
+    def crash_after_first_promote(stage):
+        if stage == "AFTER_FIRST_PROMOTE":
+            raise RuntimeError("owned disposable crash")
+
+    with pytest.raises(
+        ReconciliationExecutionError,
+        match="EXECUTION_INTERRUPTED",
+    ):
+        crash_executor.execute(
+            package,
+            plan,
+            checked_at=active,
+            fault=crash_after_first_promote,
+        )
+    assert crash_executor.status(
+        package,
+        checked_at=active,
+    ).state == STATUS_AMBIGUOUS
+    with _role_cursor(ADMIN_ROLE) as cursor:
+        cursor.execute(
+            "SELECT count(*) FROM rt.session_archives "
+            "WHERE session_date=%s AND kind=ANY(%s) AND sha256=%s",
+            (
+                date(2026, 10, 19),
+                [OPTION_FLOW_EVENTS, OPTION_FLOW_CLUSTERS],
+                target_sha256,
+            ),
+        )
+        assert cursor.fetchone()[0] == 0
+    if crash_lock.exists():
+        crash_lock.unlink()
+    shutil.rmtree(crash_root)
+
+    success_root = (tmp_path / "success-archive").resolve()
+    success_root.mkdir()
+    original_mtimes = _seed_original_files(package, success_root)
+    success_lock = (tmp_path / "success.lock").resolve()
+    executor = ReconciliationExecutor(
+        repository,
+        repository_root=ROOT,
+        archive_root=success_root,
+        report_path=REPORT_PATH,
+        lock_path=success_lock,
+        service_probe=_services,
+    )
+
+    result = executor.execute(package, plan, checked_at=active)
+
+    assert result["status"] == STATUS_POSTFLIGHT_PASS
+    assert result["postflight"]["status"] == STATUS_POSTFLIGHT_PASS
+    assert not result["postflight"]["retention_resume_authorized"]
+    assert executor.status(package, checked_at=active).state == STATUS_CONSUMED
+    assert not success_lock.exists()
+    assert all(
+        Path(path).stat().st_mtime_ns == mtime
+        for path, mtime in original_mtimes.items()
+    )
+    with _role_cursor(ADMIN_ROLE) as cursor:
+        cursor.execute(
+            "SELECT kind,uri,sha256,row_count,build_id "
+            "FROM rt.session_archives "
+            "WHERE session_date=%s AND kind=ANY(%s) AND sha256=%s "
+            "ORDER BY kind",
+            (
+                date(2026, 10, 19),
+                [OPTION_FLOW_EVENTS, OPTION_FLOW_CLUSTERS],
+                target_sha256,
+            ),
+        )
+        rows = cursor.fetchall()
+        assert len(rows) == 2
+        assert {row[0] for row in rows} == {
+            OPTION_FLOW_EVENTS,
+            OPTION_FLOW_CLUSTERS,
+        }
+        assert all(
+            row[1].startswith("file:")
+            and row[2] == target_sha256
+            and row[3] == 0
+            and row[4] == "retention-production-v1"
+            for row in rows
+        )
+    with pytest.raises(
+        ReconciliationExecutionError,
+        match="EXECUTION_NOT_READY",
+    ):
+        executor.execute(package, plan, checked_at=active)

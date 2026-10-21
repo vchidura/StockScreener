@@ -373,8 +373,13 @@ def build_cluster_observation(
         "window_seconds": cluster.window_seconds,
         "hop_milliseconds": cluster.window_seconds * 500,
         "side_bucket": cluster.side_class,
-        "event_ids": tuple(row.event_id for row in members),
-        "source_offsets": tuple(row.source_offset for row in members),
+        "event_ids": tuple(sorted(
+            (row.event_id for row in members),
+            key=str,
+        )),
+        "source_offsets": tuple(sorted(
+            row.source_offset for row in members
+        )),
         "exchange_ids": tuple(sorted({
             row.exchange_id for row in members
             if row.exchange_id is not None
@@ -382,7 +387,10 @@ def build_cluster_observation(
         "policy_sha256": cluster.policy_sha256,
         "watermark": _utc(watermark, "watermark"),
         "status": cluster.status,
-        "member_event_keys": cluster.member_event_keys,
+        "member_event_keys": tuple(sorted(
+            cluster.member_event_keys,
+            key=lambda row: (row[1], str(row[0])),
+        )),
         "rolling_state_id": rolling_state.state_id,
         "rolling_state_sha256": rolling_state.state_sha256,
     }

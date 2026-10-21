@@ -93,12 +93,25 @@ def build_realtime_portal_repositories(
         ticker_workspace=RealtimeTickerWorkspaceRepository(cursor_factory, transaction_configured=True),
         stock_alert_views=RealtimeStockAlertViewRepository(cursor_factory, transaction_configured=True),
         dashboard=RealtimeDashboardRepository(cursor_factory, transaction_configured=True),
-        option_flow=RealtimeOptionFlowRepository(cursor_factory, transaction_configured=True),
-        option_screener=RealtimeOptionScreenerRepository(cursor_factory, transaction_configured=True),
-        option_alert_views=RealtimeOptionsAlertsPageRepository(cursor_factory, transaction_configured=True),
+        option_flow=RealtimeOptionFlowRepository(
+            cursor_factory,
+            transaction_configured=True,
+            require_read_pin=True,
+        ),
+        option_screener=RealtimeOptionScreenerRepository(
+            cursor_factory,
+            transaction_configured=True,
+            require_read_pin=True,
+        ),
+        option_alert_views=RealtimeOptionsAlertsPageRepository(
+            cursor_factory,
+            transaction_configured=True,
+            require_read_pin=True,
+        ),
         daily_strategies=RealtimeDailyStrategyRepository(cursor_factory, transaction_configured=True),
         advanced_options=AdvancedOptionsStoredProjectionRepository(
-            cursor_factory
+            cursor_factory,
+            require_read_pin=True,
         ),
     )
 

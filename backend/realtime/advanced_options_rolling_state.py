@@ -405,6 +405,52 @@ class AdvancedOptionsOptionalRollingLane:
 
 
 @dataclass(frozen=True, slots=True)
+class AdvancedOptionsRollingProducerBinding:
+    producer_plan_id: UUID
+    producer_plan_sha256: str
+    reference_state_id: UUID
+    reference_state_sha256: str
+    reference_generation: int
+    source_flow_id: UUID
+    source_flow_sha256: str
+    known_at: datetime
+    valid_until: datetime
+    unresolved_gaps_sha256: str
+    source_watermarks_sha256: str
+    market_state_heads_sha256: str
+    volume_checkpoint_sha256: str
+
+    def __post_init__(self) -> None:
+        known = _utc(self.known_at, "known_at")
+        valid = _utc(self.valid_until, "valid_until")
+        if (
+            not isinstance(self.producer_plan_id, UUID)
+            or not isinstance(self.reference_state_id, UUID)
+            or not isinstance(self.source_flow_id, UUID)
+            or type(self.reference_generation) is not int
+            or self.reference_generation <= 0
+            or known >= valid
+        ):
+            raise ValueError("rolling producer binding identity is invalid")
+        for name in (
+            "producer_plan_sha256",
+            "reference_state_sha256",
+            "source_flow_sha256",
+            "unresolved_gaps_sha256",
+            "source_watermarks_sha256",
+            "market_state_heads_sha256",
+            "volume_checkpoint_sha256",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _sha256(getattr(self, name), name),
+            )
+        object.__setattr__(self, "known_at", known)
+        object.__setattr__(self, "valid_until", valid)
+
+
+@dataclass(frozen=True, slots=True)
 class AdvancedOptionsRollingState:
     state_id: UUID
     state_sha256: str
@@ -422,6 +468,7 @@ class AdvancedOptionsRollingState:
     order_windows: AdvancedOptionsOrderWindowState
     iv_surface: AdvancedOptionsOptionalRollingLane
     dark_pool: AdvancedOptionsOptionalRollingLane
+    producer_binding: AdvancedOptionsRollingProducerBinding | None = None
 
     def __post_init__(self) -> None:
         ticks = tuple(sorted(
@@ -464,6 +511,16 @@ class AdvancedOptionsRollingState:
             or self.order_windows.committed_offset != self.committed_offset
             or self.iv_surface.lane != "IV_SURFACE"
             or self.dark_pool.lane != "DARK_POOL"
+            or (
+                self.producer_binding is not None
+                and (
+                    not isinstance(
+                        self.producer_binding,
+                        AdvancedOptionsRollingProducerBinding,
+                    )
+                    or committed > self.producer_binding.known_at
+                )
+            )
         ):
             raise ValueError("Advanced Options rolling state is incomplete")
         object.__setattr__(self, "committed_at", committed)
@@ -502,6 +559,11 @@ class AdvancedOptionsRollingState:
             "order_windows": self.order_windows,
             "iv_surface": self.iv_surface,
             "dark_pool": self.dark_pool,
+            **(
+                {}
+                if self.producer_binding is None
+                else {"producer_binding": self.producer_binding}
+            ),
         }
 
 
@@ -520,6 +582,7 @@ def build_advanced_options_rolling_state(
     order_windows: AdvancedOptionsOrderWindowState,
     iv_surface: AdvancedOptionsOptionalRollingLane | None = None,
     dark_pool: AdvancedOptionsOptionalRollingLane | None = None,
+    producer_binding: AdvancedOptionsRollingProducerBinding | None = None,
 ) -> AdvancedOptionsRollingState:
     if (
         iv_surface is not None
@@ -564,6 +627,11 @@ def build_advanced_options_rolling_state(
         "order_windows": order_windows,
         "iv_surface": iv,
         "dark_pool": dark,
+        **(
+            {}
+            if producer_binding is None
+            else {"producer_binding": producer_binding}
+        ),
     }
     digest = canonical_sha256(identity)
     return AdvancedOptionsRollingState(
@@ -586,6 +654,7 @@ def build_advanced_options_rolling_state(
         order_windows=order_windows,
         iv_surface=iv,
         dark_pool=dark,
+        producer_binding=producer_binding,
     )
 
 

@@ -152,6 +152,87 @@ class RealtimeQuoteEvidence:
     ask: Decimal
     midpoint: Decimal
     payload_sha256: str
+    bid_size: int | None = None
+    ask_size: int | None = None
+    bid_exchange: int | None = None
+    ask_exchange: int | None = None
+    quote_payload_sha256: str | None = None
+    source_flow_id: UUID | None = None
+    source_flow_sha256: str | None = None
+    market_state_checkpoint_sha256: str | None = None
+    rolling_state_id: UUID | None = None
+    rolling_state_sha256: str | None = None
+    reference_state_id: UUID | None = None
+    reference_state_sha256: str | None = None
+    producer_plan_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        market_time = _utc(self.market_time, "market_time")
+        observed_time = _utc(self.observed_time, "observed_time")
+        if (
+            min(
+                self.instrument_id,
+                self.contract_id,
+                self.catalog_version_id,
+                self.source_offset,
+            )
+            <= 0
+            or market_time > observed_time
+            or self.bid <= 0
+            or self.ask < self.bid
+            or self.midpoint != (self.bid + self.ask) / Decimal(2)
+            or self.midpoint <= 0
+        ):
+            raise ValueError("realtime quote evidence is invalid")
+        object.__setattr__(self, "market_time", market_time)
+        object.__setattr__(self, "observed_time", observed_time)
+        object.__setattr__(
+            self,
+            "payload_sha256",
+            _sha256(self.payload_sha256, "payload_sha256"),
+        )
+        extended = (
+            self.bid_size,
+            self.ask_size,
+            self.bid_exchange,
+            self.ask_exchange,
+            self.quote_payload_sha256,
+            self.source_flow_id,
+            self.source_flow_sha256,
+            self.market_state_checkpoint_sha256,
+            self.rolling_state_id,
+            self.rolling_state_sha256,
+            self.reference_state_id,
+            self.reference_state_sha256,
+            self.producer_plan_sha256,
+        )
+        if any(value is not None for value in extended):
+            if (
+                any(value is None for value in extended)
+                or self.bid_size <= 0
+                or self.ask_size <= 0
+                or type(self.bid_exchange) is not int
+                or type(self.ask_exchange) is not int
+                or not isinstance(self.source_flow_id, UUID)
+                or not isinstance(self.rolling_state_id, UUID)
+                or not isinstance(self.reference_state_id, UUID)
+            ):
+                raise ValueError(
+                    "extended realtime quote evidence is incomplete"
+                )
+            for name in (
+                "quote_payload_sha256",
+                "source_flow_sha256",
+                "market_state_checkpoint_sha256",
+                "rolling_state_sha256",
+                "reference_state_sha256",
+                "producer_plan_sha256",
+            ):
+                object.__setattr__(
+                    self,
+                    name,
+                    _sha256(getattr(self, name), name),
+                )
 
     @property
     def mark(self) -> Decimal:

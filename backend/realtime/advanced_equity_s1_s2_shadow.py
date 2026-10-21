@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Callable
+from typing import Callable, Mapping
 from uuid import UUID
 
 from equity.domain import (
@@ -29,7 +29,11 @@ DETECTOR_VERSION = "advanced-equity-canonical-stock-signal-shadow-v1"
 PAYLOAD_SCHEMA = "advanced_equity_canonical_stock_signal_shadow_v1"
 
 
-def _revision(row) -> tuple[EquityBarRevision, datetime]:
+def advanced_equity_bar_revision_from_row(
+    row,
+) -> tuple[EquityBarRevision, datetime]:
+    if isinstance(row, Mapping):
+        row = tuple(row.values())
     return (
         EquityBarRevision(
             bar_revision_id=UUID(str(row[0])),
@@ -113,7 +117,10 @@ def _load_bars_cursor(
             record.bar_end.date(),
         ),
     )
-    daily = tuple(reversed(tuple(_revision(row) for row in cursor.fetchall())))
+    daily = tuple(reversed(tuple(
+        advanced_equity_bar_revision_from_row(row)
+        for row in cursor.fetchall()
+    )))
     cursor.execute(
         "SELECT " + columns
         + "FROM rt.bar_current AS current "
@@ -142,7 +149,10 @@ def _load_bars_cursor(
         ),
     )
     intraday = tuple(
-        reversed(tuple(_revision(row) for row in cursor.fetchall()))
+        reversed(tuple(
+            advanced_equity_bar_revision_from_row(row)
+            for row in cursor.fetchall()
+        ))
     )
     return (*daily, *intraday)
 

@@ -104,8 +104,13 @@ def test_versions_are_contiguous_from_one():
 
 def test_member_identity_failures_write_nothing():
     cases = {
-        "catalog version does not belong": lambda s: s.catalog.__setitem__(1_001, (99_999, UNDERLYING)),
-        "outside the cohort option universe": lambda s: s.catalog.__setitem__(1_001, (10_001, "other-security")),
+        "catalog version does not belong": lambda s: s.catalog.__setitem__(
+            1_001, (99_999, *s.catalog[1_001][1:])
+        ),
+        "outside the cohort option universe": lambda s: s.catalog.__setitem__(
+            1_001,
+            (s.catalog[1_001][0], "other-security", *s.catalog[1_001][2:]),
+        ),
         "catalog version is absent": lambda s: s.catalog.pop(1_001),
         "does not belong to its instrument": lambda s: s.instruments.__setitem__(1, ("EQUITY", None)),
     }
@@ -125,6 +130,33 @@ def test_member_identity_failures_write_nothing():
     del store.cohorts[str(COHORT)]
     with pytest.raises(ValueError, match="cohort is absent"):
         persist_slot_set_version_cursor(cursor, _slot_set())
+    assert _inserts(store) == []
+
+
+@pytest.mark.parametrize(
+    "index,value",
+    (
+        (2, datetime(2026, 10, 4, tzinfo=UTC).date()),
+        (3, "EUROPEAN"),
+        (4, 150),
+        (5, [{"symbol": "ADJUSTED"}]),
+        (6, "REJECTED_UNSUPPORTED"),
+        (7, NOW + timedelta(minutes=1)),
+        (8, NOW),
+    ),
+)
+def test_adjusted_expired_or_ineligible_catalog_members_are_rejected(
+    index,
+    value,
+):
+    store, cursor = _store()
+    catalog = list(store.catalog[1_001])
+    catalog[index] = value
+    store.catalog[1_001] = tuple(catalog)
+
+    with pytest.raises(ValueError, match="adjusted, expired, or ineligible"):
+        persist_slot_set_version_cursor(cursor, _slot_set())
+
     assert _inserts(store) == []
 
 
@@ -209,7 +241,10 @@ def test_the_pointer_never_moves_backwards_or_to_an_unpersisted_version():
 def test_a_failed_persist_leaves_the_active_pointer_untouched():
     store, cursor = _store()
     persist_and_activate_slot_set_cursor(cursor, _slot_set())
-    store.catalog[1_003] = (99_999, UNDERLYING)
+    store.catalog[1_003] = (
+        99_999,
+        *store.catalog[1_003][1:],
+    )
 
     with pytest.raises(ValueError, match="does not belong"):
         persist_and_activate_slot_set_cursor(cursor, _refresh(), activated_at=NOW + timedelta(minutes=5))
@@ -239,7 +274,10 @@ def test_connection_wrapper_commits_once_or_rolls_back():
     assert persist_and_activate_slot_set(connection, _slot_set()) is True
     assert (connection.commit.call_count, connection.rollback.call_count) == (1, 0)
 
-    store.catalog[1_003] = (99_999, UNDERLYING)
+    store.catalog[1_003] = (
+        99_999,
+        *store.catalog[1_003][1:],
+    )
     with pytest.raises(ValueError):
         persist_and_activate_slot_set(connection, _refresh())
     assert (connection.commit.call_count, connection.rollback.call_count) == (1, 1)

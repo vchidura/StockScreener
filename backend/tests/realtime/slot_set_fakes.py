@@ -6,6 +6,9 @@ The DB-backed variants live in test_option_slot_sets_v2_db.py.
 """
 from __future__ import annotations
 
+from datetime import date, datetime, timezone
+from decimal import Decimal
+
 
 class FakeSlotSetStore:
     def __init__(self):
@@ -14,7 +17,7 @@ class FakeSlotSetStore:
         self.current: dict[str, tuple] = {}
         self.cohorts: dict[str, tuple[str, set[str]]] = {}
         self.instruments: dict[int, tuple[str, int | None]] = {}
-        self.catalog: dict[int, tuple[int, str]] = {}
+        self.catalog: dict[int, tuple] = {}
         self.statements: list[str] = []
 
     def register_cohort(self, cohort_id, manifest_kind: str, underlying_security_ids) -> None:
@@ -22,7 +25,17 @@ class FakeSlotSetStore:
 
     def register_option(self, instrument_id: int, contract_id: int, version_id: int, underlying_security_id) -> None:
         self.instruments[instrument_id] = ("OPTION", contract_id)
-        self.catalog[version_id] = (contract_id, str(underlying_security_id))
+        self.catalog[version_id] = (
+            contract_id,
+            str(underlying_security_id),
+            date(2030, 1, 1),
+            "AMERICAN",
+            Decimal("100"),
+            [],
+            "VALIDATED_ACTIVE",
+            datetime(2020, 1, 1, tzinfo=timezone.utc),
+            None,
+        )
 
     def handles(self, statement: str) -> bool:
         return "rt.slot_set_" in statement or statement.startswith(self._IDENTITY_PREFIXES)
