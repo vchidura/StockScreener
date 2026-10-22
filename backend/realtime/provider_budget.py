@@ -140,6 +140,7 @@ def _budget_status_cursor(
     *,
     account_alias: str,
     session_date: date,
+    expected_scope_sha256: str,
     expected_request_ceiling: int,
     expected_byte_ceiling: int,
 ) -> ProviderBudgetStatus:
@@ -153,8 +154,8 @@ def _budget_status_cursor(
         "MIN(account_decoded_byte_ceiling), MAX(account_decoded_byte_ceiling) "
         "FROM rt.provider_request_ledger "
         "WHERE account_alias=%s AND budget_session_date=%s "
-        "AND budget_scope_sha256 IS NOT NULL",
-        (account_alias, session_date),
+        "AND budget_scope_sha256=%s",
+        (account_alias, session_date, expected_scope_sha256),
     )
     (
         requests_reserved,
@@ -175,7 +176,7 @@ def _budget_status_cursor(
         or maximum_bytes != expected_byte_ceiling
     ):
         raise ValueError(
-            "provider budget ceilings conflict for this account and session"
+            "provider budget ceilings conflict for this authorization scope"
         )
     return ProviderBudgetStatus(
         account_alias,
@@ -199,6 +200,7 @@ def provider_budget_status_cursor(
         cursor,
         account_alias=scope.account_alias,
         session_date=scope.session_date,
+        expected_scope_sha256=scope.sha256,
         expected_request_ceiling=scope.request_ceiling,
         expected_byte_ceiling=scope.decoded_byte_ceiling,
     )

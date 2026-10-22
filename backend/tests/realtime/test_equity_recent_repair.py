@@ -174,6 +174,42 @@ def test_adjusted_daily_plan_binds_one_exact_grouped_request():
     })
 
 
+def test_one_ticker_raw_daily_plan_uses_exact_aggregate_endpoint():
+    native = _plan()
+    plan = AdjustedDailyRepairPlan(
+        native.cohort_id,
+        (native.identities[0],),
+        native.sessions[0],
+        native.authorized_until,
+        1,
+        1_000_001,
+        1_000_000,
+        "operator",
+        "entitlement",
+        "approved cost",
+        adjusted=False,
+        per_ticker=True,
+    )
+
+    url, params, request_sha256 = adjusted_request_spec(plan)
+
+    assert url.endswith(
+        "/v2/aggs/ticker/AAPL/range/1/day/2026-10-19/2026-10-19"
+    )
+    assert params == {
+        "adjusted": "false",
+        "sort": "asc",
+        "limit": "50000",
+    }
+    assert request_sha256 == canonical_sha256({
+        "policy": "v2-adjusted-daily-session-repair-v1",
+        "plan_sha256": plan.sha256,
+        "method": "GET",
+        "url": url,
+        "params": params,
+    })
+
+
 def test_bounded_http_read_closes_response_and_never_retains_oversized_body():
     from options.data.polygon_http import PolygonResponseTooLarge, RequestsPolygonHttpTransport
 

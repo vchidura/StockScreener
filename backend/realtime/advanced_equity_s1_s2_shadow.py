@@ -29,6 +29,17 @@ DETECTOR_VERSION = "advanced-equity-canonical-stock-signal-shadow-v1"
 PAYLOAD_SCHEMA = "advanced_equity_canonical_stock_signal_shadow_v1"
 
 
+def _uuid_array(value) -> tuple[UUID, ...]:
+    if value is None:
+        return ()
+    values = (
+        tuple(item for item in value.strip("{}").split(",") if item)
+        if isinstance(value, str)
+        else tuple(value)
+    )
+    return tuple(UUID(str(item)) for item in values)
+
+
 def advanced_equity_bar_revision_from_row(
     row,
 ) -> tuple[EquityBarRevision, datetime]:
@@ -62,9 +73,7 @@ def advanced_equity_bar_revision_from_row(
             ingestion_segment_id=(
                 None if row[23] is None else UUID(str(row[23]))
             ),
-            source_bar_revision_ids=tuple(
-                UUID(str(value)) for value in (row[24] or ())
-            ),
+            source_bar_revision_ids=_uuid_array(row[24]),
             supersedes_bar_revision_id=(
                 None if row[25] is None else UUID(str(row[25]))
             ),

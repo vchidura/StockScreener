@@ -46,7 +46,8 @@ test('all original Options Alerts requests preserve the realtime cohort', async 
   const detector = { dataset_id: 'frozen-v1', scope: 'LATEST' }
   try {
     globalThis.__optionsAlertsEnvironment = {
-      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: ' exact-cohort ',
+      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_OPTIONS_V2: 'true',
+      VITE_REALTIME_COHORT_ID: ' exact-cohort ',
     }
     const api = await import(`data:text/javascript;base64,${Buffer.from(compile(source)).toString('base64')}`)
     await api.getOptionDetectorDatasets()
@@ -66,7 +67,9 @@ test('all original Options Alerts requests preserve the realtime cohort', async 
       ['post', `/options/alerts/preview/${candidate}`, {}, { params: cohort }],
     ])
     calls.length = 0
-    globalThis.__optionsAlertsEnvironment = { VITE_REALTIME_ONLY: 'true' }
+    globalThis.__optionsAlertsEnvironment = {
+      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_OPTIONS_V2: 'true',
+    }
     for (const readRequest of [
       () => api.getOptionDetectorDatasets(),
       () => api.getOptionAlertSchedule(),
@@ -76,6 +79,16 @@ test('all original Options Alerts requests preserve the realtime cohort', async 
       () => api.getOptionCurrentAdvancedQuotes([11]),
       () => api.previewOptionAlert(candidate, {}),
     ]) await assert.rejects(readRequest(), /requires VITE_REALTIME_COHORT_ID/)
+    assert.equal(calls.length, 0)
+    globalThis.__optionsAlertsEnvironment = {
+      VITE_REALTIME_ONLY: 'true',
+      VITE_REALTIME_OPTIONS_V2: 'false',
+      VITE_REALTIME_COHORT_ID: 'exact-cohort',
+    }
+    await assert.rejects(
+      api.getOptionDetectorDatasets(),
+      /require VITE_REALTIME_OPTIONS_V2=true/,
+    )
     assert.equal(calls.length, 0)
   } finally {
     delete globalThis.__optionsAlertsApi

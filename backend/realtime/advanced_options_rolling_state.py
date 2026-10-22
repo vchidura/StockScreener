@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from .contracts import AssetClass, canonical_sha256
@@ -15,6 +15,11 @@ from .materialization import (
 )
 from .option_flow.records import VolumeCheckpoint
 from .option_flow.volume import COMPLETE_BASELINES, BaselineKind
+
+if TYPE_CHECKING:
+    from .advanced_options_underlying_snapshot import (
+        UnderlyingSnapshotTick,
+    )
 
 
 ROLLING_STATE_VERSION = "advanced-options-rolling-state-v1"
@@ -463,7 +468,10 @@ class AdvancedOptionsRollingState:
     committed_at: datetime
     market_state_checkpoint_sha256: str
     flow_checkpoint_sha256: str
-    underlying_ticks: tuple[AdvancedOptionsUnderlyingTick, ...]
+    underlying_ticks: tuple[
+        AdvancedOptionsUnderlyingTick | UnderlyingSnapshotTick,
+        ...,
+    ]
     contract_volumes: tuple[AdvancedOptionsContractVolumeState, ...]
     order_windows: AdvancedOptionsOrderWindowState
     iv_surface: AdvancedOptionsOptionalRollingLane
@@ -471,6 +479,10 @@ class AdvancedOptionsRollingState:
     producer_binding: AdvancedOptionsRollingProducerBinding | None = None
 
     def __post_init__(self) -> None:
+        from .advanced_options_underlying_snapshot import (
+            UnderlyingSnapshotTick,
+        )
+
         ticks = tuple(sorted(
             self.underlying_ticks,
             key=lambda row: row.instrument_id,
@@ -490,6 +502,17 @@ class AdvancedOptionsRollingState:
             or type(self.committed_offset) is not int
             or self.committed_offset < 0
             or not ticks
+            or any(not isinstance(
+                row,
+                (AdvancedOptionsUnderlyingTick, UnderlyingSnapshotTick),
+            ) for row in ticks)
+            or (
+                any(isinstance(row, UnderlyingSnapshotTick) for row in ticks)
+                and not all(
+                    isinstance(row, UnderlyingSnapshotTick)
+                    for row in ticks
+                )
+            )
             or len({row.instrument_id for row in ticks}) != len(ticks)
             or not volumes
             or len({
@@ -577,7 +600,10 @@ def build_advanced_options_rolling_state(
     committed_at: datetime,
     market_state_checkpoint_sha256: str,
     flow_checkpoint_sha256: str,
-    underlying_ticks: tuple[AdvancedOptionsUnderlyingTick, ...],
+    underlying_ticks: tuple[
+        AdvancedOptionsUnderlyingTick | UnderlyingSnapshotTick,
+        ...,
+    ],
     contract_volumes: tuple[AdvancedOptionsContractVolumeState, ...],
     order_windows: AdvancedOptionsOrderWindowState,
     iv_surface: AdvancedOptionsOptionalRollingLane | None = None,

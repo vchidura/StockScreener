@@ -62,11 +62,15 @@ class RealtimePortalRepositories:
 
 def build_realtime_portal_repositories(
     database: RealtimeProcessDatabase,
+    *,
+    advanced_options_v2_enabled: bool,
 ) -> RealtimePortalRepositories:
     if not isinstance(database, RealtimeProcessDatabase):
         raise TypeError("realtime portal database is invalid")
     if database.process_plan.role is not RealtimeDatabaseRole.READER:
         raise ValueError("realtime portal requires the reader database role")
+    if type(advanced_options_v2_enabled) is not bool:
+        raise TypeError("Advanced Options stored-read flag is invalid")
 
     @contextmanager
     def cursor_factory():
@@ -97,16 +101,19 @@ def build_realtime_portal_repositories(
             cursor_factory,
             transaction_configured=True,
             require_read_pin=True,
+            reads_enabled=advanced_options_v2_enabled,
         ),
         option_screener=RealtimeOptionScreenerRepository(
             cursor_factory,
             transaction_configured=True,
             require_read_pin=True,
+            reads_enabled=advanced_options_v2_enabled,
         ),
         option_alert_views=RealtimeOptionsAlertsPageRepository(
             cursor_factory,
             transaction_configured=True,
             require_read_pin=True,
+            reads_enabled=advanced_options_v2_enabled,
         ),
         daily_strategies=RealtimeDailyStrategyRepository(cursor_factory, transaction_configured=True),
         advanced_options=AdvancedOptionsStoredProjectionRepository(

@@ -38,6 +38,23 @@ class JournalReplayQuarantine(ValueError):
         super().__init__(f"{reason}: {detail}")
 
 
+class JournalReplayPending(RuntimeError):
+    pass
+
+
+def _decoder_causal_checked_at(
+    reader: RawJournalReader,
+    normalizer_version: str,
+    checked_at: datetime,
+) -> datetime:
+    progress = reader.decoder_progress(normalizer_version)
+    return (
+        checked_at
+        if progress is None
+        else max(checked_at, progress.updated_at)
+    )
+
+
 def _load_admissions_cursor(
     cursor,
     registration: AdvancedJournalRegistration,
@@ -84,6 +101,8 @@ def _load_admissions_cursor(
 def inspect_registered_journal(
     root: Path,
     registration: AdvancedJournalRegistration,
+    *,
+    allow_initializing: bool = False,
 ):
     path = resolve_registered_journal_path(
         root,
@@ -98,6 +117,20 @@ def inspect_registered_journal(
         reader = RawJournalReader(path)
         state = reader.recovery_state(registration.normalizer_version)
     except Exception as error:
+        if (
+            registration.status == "REGISTERED"
+            and registration.raw_committed_offset == 0
+            and registration.normalized_committed_offset == 0
+            and registration.bridge_committed_offset == 0
+            and allow_initializing
+            and str(error) in {
+                "raw journal metadata is unavailable",
+                "no such table: journal_metadata",
+            }
+        ):
+            raise JournalReplayPending(
+                "raw journal initialization is pending"
+            ) from error
         raise JournalReplayQuarantine(
             "CORRUPT_JOURNAL",
             str(error)[:320],
@@ -166,7 +199,11 @@ def _normalize_committed_raw(
             generation=registration.journal_generation,
         ) as writer:
             for raw in rows:
-                batch = normalize_raw_message(raw, admissions)
+                batch = normalize_raw_message(
+                    raw,
+                    admissions,
+                    finality_observed_at=checked_at,
+                )
                 if batch.quarantines:
                     raise JournalReplayQuarantine(
                         "NORMALIZATION_QUARANTINE",
@@ -265,8 +302,24 @@ def replay_registered_journal_once(
     checked_at: datetime,
     batch_limit: int,
 ) -> AdvancedEquityJournalBridgeStatus:
-    path, _reader, state = inspect_registered_journal(root, registration)
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        _checkpoint, _canonical, initial_session_ended = (
+            _postgres_reconciliation_cursor(
+                unit.cursor,
+                registration,
+                checked_at=checked_at,
+            )
+        )
+    path, _reader, state = inspect_registered_journal(
+        root,
+        registration,
+        allow_initializing=not initial_session_ended,
+    )
     if state.normalized_committed_raw_offset < state.raw_committed_offset:
+        if not initial_session_ended:
+            raise JournalReplayPending(
+                "live journal normalization is owned by ingress"
+            )
         _normalize_committed_raw(
             provider,
             path,
@@ -323,11 +376,17 @@ def replay_registered_journal_once(
         batch_limit=batch_limit,
     )
     try:
+        reader = RawJournalReader(path)
+        bridge_checked_at = _decoder_causal_checked_at(
+            reader,
+            registration.normalizer_version,
+            checked_at,
+        )
         status = process_advanced_equity_journal_once(
             database,
-            RawJournalReader(path),
+            reader,
             config,
-            checked_at=checked_at,
+            checked_at=bridge_checked_at,
         )
     except AdvancedJournalBlockedError:
         raise
@@ -345,7 +404,7 @@ def replay_registered_journal_once(
                 state.normalized_committed_event_offset
             ),
             bridge_committed_offset=status.committed_offset,
-            checked_at=checked_at,
+            checked_at=bridge_checked_at,
         )
         if (
             registration.status == "DRAINING"
@@ -356,6 +415,6 @@ def replay_registered_journal_once(
                 unit.cursor,
                 registration.journal_generation,
                 bridge_committed_offset=status.committed_offset,
-                checked_at=checked_at,
+                checked_at=bridge_checked_at,
             )
     return status

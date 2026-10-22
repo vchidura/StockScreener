@@ -15,7 +15,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from psycopg2 import Error as PsycopgError, sql
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, register_uuid
 
 from .migrations import (
     EXPECTED_V2_DATABASE_NAME,
@@ -32,6 +32,8 @@ DISPOSABLE_V2_PREFIX = "test_realtime_v2_"
 OWNER_POOL = "owner"
 _PHASE_FOR_MODE = {SECURITY_MODE_DEFERRED: "DEFERRED", SECURITY_MODE_HARDENED: "AUDITED"}
 _ISOLATION_LEVELS = {None, "REPEATABLE READ", "SERIALIZABLE"}
+
+register_uuid()
 
 
 @dataclass(frozen=True, slots=True)

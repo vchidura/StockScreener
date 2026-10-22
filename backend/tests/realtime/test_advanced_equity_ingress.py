@@ -1,6 +1,6 @@
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 import pytest
@@ -98,6 +98,50 @@ def test_journal_pump_commits_and_normalizes_fractional_am_bytes(tmp_path):
         received_byte_count=len(payload) + 100,
     )
     assert usage.admitted_market_byte_count == len(payload)
+
+
+def test_journal_pump_defers_am_normalization_until_bar_end(tmp_path):
+    observed_at = datetime.now(timezone.utc)
+    event_at = observed_at.replace(microsecond=0) + timedelta(seconds=1)
+    start = int(event_at.timestamp() * 1000) - 60_000
+    end = start + 60_000
+    payload = json.dumps([{
+        "ev": "AM",
+        "sym": "SPY",
+        "o": 100,
+        "h": 101,
+        "l": 99,
+        "c": 100.5,
+        "v": 1000,
+        "vw": 100.25,
+        "s": start,
+        "e": end,
+    }]).encode()
+    buffer = _buffer()
+    buffer.put_nowait(_message(payload))
+    path = tmp_path / "deferred-finality.sqlite"
+    clocks = [observed_at, event_at]
+    waits = []
+    pump = AdvancedEquityJournalPump(
+        buffer,
+        path,
+        GENERATION,
+        _admissions(),
+        maximum_batch_messages=4,
+        maximum_batch_bytes=64 * 1024,
+        utc_clock=lambda: clocks.pop(0) if clocks else event_at,
+        wait=waits.append,
+    )
+
+    pump.start()
+    pump.request_stop()
+    pump.join(5)
+
+    normalized = RawJournalReader(path).read_normalized_after(0)
+    assert len(waits) == 1
+    assert waits[0] > 0
+    assert normalized[0].quality == "GOOD"
+    assert normalized[0].reason_codes == ()
 
 
 def test_journal_pump_fails_closed_for_an_unexpected_channel(tmp_path):

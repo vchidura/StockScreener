@@ -42,7 +42,8 @@ test('Options Screener GET and POST requests preserve the realtime cohort', asyn
   const request = { filters: [], sort: 'day_volume', descending: true, limit: 100, offset: 0 }
   try {
     globalThis.__optionScreenerEnvironment = {
-      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: ' exact-cohort ',
+      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_OPTIONS_V2: 'true',
+      VITE_REALTIME_COHORT_ID: ' exact-cohort ',
     }
     const api = await import(`data:text/javascript;base64,${Buffer.from(compile(source)).toString('base64')}`)
     await api.getOptionDiscoveryCatalog()
@@ -52,9 +53,21 @@ test('Options Screener GET and POST requests preserve the realtime cohort', asyn
       ['post', '/options/eligible-chain/query', request, { params: { cohort_id: 'exact-cohort' } }],
     ])
     calls.length = 0
-    globalThis.__optionScreenerEnvironment = { VITE_REALTIME_ONLY: 'true' }
+    globalThis.__optionScreenerEnvironment = {
+      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_OPTIONS_V2: 'true',
+    }
     await assert.rejects(api.getOptionDiscoveryCatalog(), /requires VITE_REALTIME_COHORT_ID/)
     await assert.rejects(api.queryEligibleChain(request), /requires VITE_REALTIME_COHORT_ID/)
+    assert.equal(calls.length, 0)
+    globalThis.__optionScreenerEnvironment = {
+      VITE_REALTIME_ONLY: 'true',
+      VITE_REALTIME_OPTIONS_V2: 'false',
+      VITE_REALTIME_COHORT_ID: 'exact-cohort',
+    }
+    await assert.rejects(
+      api.getOptionDiscoveryCatalog(),
+      /require VITE_REALTIME_OPTIONS_V2=true/,
+    )
     assert.equal(calls.length, 0)
   } finally {
     delete globalThis.__optionScreenerApi

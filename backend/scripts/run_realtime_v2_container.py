@@ -16,6 +16,7 @@ OWNED_SECRETS = {
     "bridge": frozenset({"app_dsn"}),
     "scheduler": frozenset({"app_dsn"}),
     "finalizer": frozenset({"app_dsn"}),
+    "detectors": frozenset({"app_dsn"}),
     "options-p8-ingress": frozenset({"app_dsn", "provider_key"}),
     "options-p8-market-state": frozenset({"app_dsn"}),
     "options-p8-flow": frozenset({"app_dsn"}),

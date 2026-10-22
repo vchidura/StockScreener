@@ -1,6 +1,7 @@
 import copy
 import json
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
@@ -22,9 +23,10 @@ from realtime.advanced_options_p8_canary_authorization import (
     validate_p8_live_observation,
     validate_p8_page_release_observation,
 )
-from realtime.advanced_options_rolling_producer import (
-    AdvancedOptionsEquityLiveHeadBinding,
-    advanced_options_equity_live_head_binding_payload,
+from realtime.advanced_options_underlying_snapshot import (
+    UnderlyingSnapshotBinding,
+    UnderlyingSnapshotPrice,
+    underlying_snapshot_binding_payload,
 )
 from scripts.audit_advanced_options_p8_canary_authorization import (
     main as audit_package,
@@ -150,27 +152,39 @@ def _selection(package):
 
 
 def _observation(package):
-    equity_live_heads = AdvancedOptionsEquityLiveHeadBinding(
-        cohort_id=UUID("99999999-2222-3333-4444-555555555555"),
-        manifest_id=UUID("99999999-aaaa-bbbb-cccc-dddddddddddd"),
-        manifest_sha256="8" * 64,
-        ingress_plan_id=UUID("88888888-aaaa-bbbb-cccc-dddddddddddd"),
-        ingress_plan_sha256="9" * 64,
-        journal_generation=UUID(
-            "77777777-aaaa-bbbb-cccc-dddddddddddd"
-        ),
-        stream_session_ids=(
-            UUID("66666666-aaaa-bbbb-cccc-dddddddddddd"),
-        ),
-        runtime_profile_sha256="a" * 64,
-        configuration_sha256="b" * 64,
-        runtime_policy_sha256="c" * 64,
-        journal_metadata_sha256="d" * 64,
-        shard_map_sha256="e" * 64,
-        session_date=START.date(),
-        committed_offset=10,
-        observed_at=CHECKED - timedelta(seconds=5),
+    selection = _selection(package)
+    underlying_prices = UnderlyingSnapshotBinding(
+        selection_sha256=selection["selection_sha256"],
+        source_snapshot_sha256=selection[
+            "source_snapshot_sha256"
+        ],
+        reviewed_at=CHECKED - timedelta(seconds=5),
         valid_until=STOP,
+        prices=tuple(
+            UnderlyingSnapshotPrice(
+                ticker=row["underlyer"],
+                session_date=START.date(),
+                price=(
+                    Decimal("715")
+                    if row["underlyer"] == "QQQ"
+                    else Decimal("770")
+                ),
+                market_time=CHECKED - timedelta(seconds=5),
+                timeframe="REAL-TIME",
+                selected_contract_ticker=row["contract_ticker"],
+                selected_contract_source_sha256=(
+                    "8" * 64
+                    if row["underlyer"] == "QQQ"
+                    else "9" * 64
+                ),
+                underlying_payload_sha256=(
+                    "a" * 64
+                    if row["underlyer"] == "QQQ"
+                    else "b" * 64
+                ),
+            )
+            for row in selection["selected"]
+        ),
     )
     return {
         "schema": LIVE_OBSERVATION_SCHEMA,
@@ -179,7 +193,7 @@ def _observation(package):
         "source_files": package["source"]["files"],
         "policy_hashes": package["policy_hashes"],
         "orchestration": package["orchestration"],
-        "selection": _selection(package),
+        "selection": selection,
         "advanced_enrollment": {
             "enrollment_id": "4d4edcd1-1643-5b65-91ee-2a5078f17761",
             "enrollment_sha256": "1" * 64,
@@ -207,9 +221,9 @@ def _observation(package):
                 "history_binding"
             ]["required_sessions"],
         },
-        "equity_live_head_binding": (
-            advanced_options_equity_live_head_binding_payload(
-                equity_live_heads
+        "underlying_price_binding": (
+            underlying_snapshot_binding_payload(
+                underlying_prices
             )
         ),
         "equity_windows": [],
@@ -242,11 +256,26 @@ def _resign_selection(observation):
     unsigned = dict(selection)
     unsigned.pop("selection_sha256")
     selection["selection_sha256"] = canonical_sha256(unsigned)
+    underlying = observation.get("underlying_price_binding")
+    if underlying is not None:
+        underlying["selection_sha256"] = selection["selection_sha256"]
+        underlying["source_snapshot_sha256"] = selection[
+            "source_snapshot_sha256"
+        ]
+        underlying["valid_until"] = min(
+            datetime.fromisoformat(underlying["valid_until"]),
+            datetime.fromisoformat(selection["valid_until_utc"]),
+        ).isoformat()
+        unsigned_binding = dict(underlying)
+        unsigned_binding.pop("binding_sha256")
+        underlying["binding_sha256"] = canonical_sha256(
+            unsigned_binding
+        )
 
 
-def test_live_observation_refuses_missing_or_stale_equity_binding(package):
+def test_live_observation_refuses_missing_or_stale_underlying_binding(package):
     missing = _observation(package)
-    missing.pop("equity_live_head_binding")
+    missing.pop("underlying_price_binding")
     with pytest.raises(ValueError, match="fields changed"):
         validate_p8_live_observation(
             package,
@@ -257,14 +286,14 @@ def test_live_observation_refuses_missing_or_stale_equity_binding(package):
             environ={},
         )
     stale = _observation(package)
-    equity = stale["equity_live_head_binding"]
-    equity["observed_at"] = (
-        CHECKED - timedelta(seconds=31)
+    underlying = stale["underlying_price_binding"]
+    underlying["valid_until"] = (
+        CHECKED - timedelta(seconds=1)
     ).isoformat()
-    unsigned = dict(equity)
+    unsigned = dict(underlying)
     unsigned.pop("binding_sha256")
-    equity["binding_sha256"] = canonical_sha256(unsigned)
-    with pytest.raises(ValueError, match="stale or divergent"):
+    underlying["binding_sha256"] = canonical_sha256(unsigned)
+    with pytest.raises(ValueError, match="stale or future"):
         validate_p8_live_observation(
             package,
             stale,
@@ -449,13 +478,14 @@ def test_live_binding_accepts_fresh_active_window_selection(package):
         "selected_at_utc": checked_at.isoformat(),
     })
     _resign_selection(observation)
-    equity = observation["equity_live_head_binding"]
-    equity["observed_at"] = (
-        checked_at - timedelta(seconds=5)
-    ).isoformat()
-    unsigned = dict(equity)
+    underlying = observation["underlying_price_binding"]
+    underlying["selection_sha256"] = observation[
+        "selection"
+    ]["selection_sha256"]
+    underlying["reviewed_at"] = checked_at.isoformat()
+    unsigned = dict(underlying)
     unsigned.pop("binding_sha256")
-    equity["binding_sha256"] = canonical_sha256(unsigned)
+    underlying["binding_sha256"] = canonical_sha256(unsigned)
     observation["owner_authorization"]["granted_at_utc"] = (
         checked_at.isoformat()
     )

@@ -1,5 +1,7 @@
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -13,9 +15,13 @@ from realtime.advanced_journal_registry import (
     resolve_registered_journal_path,
 )
 from realtime.advanced_journal_replay import (
+    JournalReplayPending,
     JournalReplayQuarantine,
+    _decoder_causal_checked_at,
     inspect_registered_journal,
+    replay_registered_journal_once,
 )
+from realtime import advanced_journal_replay as replay
 from realtime.journal import (
     RawJournalWriter,
     checkpoint_journal_wal,
@@ -121,6 +127,126 @@ def test_journal_checkpoint_truncates_wal_before_seal(tmp_path):
     assert logged == checkpointed
     wal = Path(str(path) + "-wal")
     assert not wal.exists() or wal.stat().st_size == 0
+
+
+def test_registered_zero_offset_journal_retries_until_metadata_exists(
+    tmp_path,
+):
+    root = tmp_path / "mounted"
+    root.mkdir()
+    path = root / "journal.sqlite"
+    path.touch()
+    registration = _registration(root, path)
+
+    with pytest.raises(JournalReplayPending, match="initialization"):
+        inspect_registered_journal(
+            root,
+            registration,
+            allow_initializing=True,
+        )
+    with pytest.raises(JournalReplayQuarantine, match="CORRUPT_JOURNAL"):
+        inspect_registered_journal(root, registration)
+
+
+def test_live_raw_normalization_remains_owned_by_ingress(
+    tmp_path,
+    monkeypatch,
+):
+    registration = _registration(tmp_path, tmp_path / "journal.sqlite")
+
+    class Transaction:
+        def __enter__(self):
+            return SimpleNamespace(cursor=object())
+
+        def __exit__(self, *_args):
+            return False
+
+    provider = SimpleNamespace(
+        transaction=lambda *_args, **_kwargs: Transaction()
+    )
+    monkeypatch.setattr(
+        replay,
+        "_postgres_reconciliation_cursor",
+        lambda *_args, **_kwargs: (0, 0, False),
+    )
+    monkeypatch.setattr(
+        replay,
+        "inspect_registered_journal",
+        lambda *_args, **_kwargs: (
+            tmp_path / "journal.sqlite",
+            object(),
+            SimpleNamespace(
+                raw_committed_offset=1,
+                normalized_committed_raw_offset=0,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        replay,
+        "_normalize_committed_raw",
+        lambda *_args, **_kwargs: pytest.fail(
+            "bridge replay normalized a live ingress journal"
+        ),
+    )
+
+    with pytest.raises(JournalReplayPending, match="owned by ingress"):
+        replay_registered_journal_once(
+            provider,
+            object(),
+            tmp_path,
+            registration,
+            checked_at=datetime(2026, 10, 22, tzinfo=timezone.utc),
+            batch_limit=100,
+        )
+
+
+def test_bridge_check_time_advances_to_durable_decoder_proof():
+    checked_at = datetime(2026, 10, 22, 18, 38, 59, tzinfo=timezone.utc)
+    proved_at = checked_at.replace(microsecond=500_000)
+    reader = SimpleNamespace(
+        decoder_progress=lambda _version: SimpleNamespace(
+            updated_at=proved_at
+        )
+    )
+
+    assert _decoder_causal_checked_at(
+        reader,
+        "massive_market_event_v5",
+        checked_at,
+    ) == proved_at
+    assert _decoder_causal_checked_at(
+        SimpleNamespace(decoder_progress=lambda _version: None),
+        "massive_market_event_v5",
+        checked_at,
+    ) == checked_at
+
+
+def test_sealed_journal_tolerates_empty_wal_sidecar(tmp_path):
+    root = tmp_path / "mounted"
+    root.mkdir()
+    path = root / "journal.sqlite"
+    with RawJournalWriter(path, generation=GENERATION):
+        pass
+    checkpoint_journal_wal(path)
+    wal = Path(str(path) + "-wal")
+    if wal.exists():
+        wal.unlink()
+    sealed_files_sha256 = journal_files_sha256(path)
+    wal.touch()
+    registration = replace(
+        _registration(root, path),
+        status="DRAINING",
+        sealed_files_sha256=sealed_files_sha256,
+    )
+
+    recovered_path, _reader, state = inspect_registered_journal(
+        root,
+        registration,
+    )
+
+    assert recovered_path == path
+    assert state.integrity_check == "ok"
+    assert journal_files_sha256(path) == sealed_files_sha256
 
 
 def test_missing_registered_journal_is_explicit_quarantine_evidence(

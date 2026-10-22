@@ -1,6 +1,6 @@
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
 
@@ -32,7 +32,14 @@ ADMISSIONS = {
 }
 
 
-def _raw(payload, *, feed=MarketFeed.STOCKS, offset=1):
+def _raw(
+    payload,
+    *,
+    feed=MarketFeed.STOCKS,
+    offset=1,
+    received_at=RECEIVED,
+    committed_at=RECEIVED,
+):
     digest = hashlib.sha256(payload).hexdigest()
     return RawJournalRecord(
         raw_offset=offset,
@@ -40,12 +47,12 @@ def _raw(payload, *, feed=MarketFeed.STOCKS, offset=1):
         stream_session_id=SESSION,
         message_number=offset - 1,
         feed=feed,
-        received_at=RECEIVED,
+        received_at=received_at,
         received_monotonic_ns=100 + offset,
         payload=payload,
         payload_sha256=digest,
         schema_version=1,
-        committed_at=RECEIVED,
+        committed_at=committed_at,
     )
 
 
@@ -149,11 +156,99 @@ def test_normalizer_prefers_fractional_am_volume_and_versions_the_contract():
     ).events[0]
 
     details = json.loads(aggregate.details_json)
-    assert NORMALIZER_VERSION == "massive_market_event_v2"
+    assert NORMALIZER_VERSION == "massive_market_event_v5"
     assert aggregate.normalizer_version == NORMALIZER_VERSION
     assert aggregate.size == Decimal("1000.125")
     assert details["provider_integer_volume"] == "1000"
     assert details["provider_fractional_volume"] == "1000.125"
+
+
+def test_normalizer_allows_only_bounded_stocks_am_finality_deferral():
+    maximum = int((RECEIVED.timestamp() + 2) * 1000)
+    excessive = maximum + 1
+
+    def aggregate(timestamp):
+        observed_at = datetime.fromtimestamp(
+            timestamp / 1000,
+            tz=UTC,
+        )
+        return normalize_raw_message(
+            _raw(
+                (
+                    '[{"ev":"AM","sym":"SPY","o":100,"h":101,"l":99,'
+                    f'"c":100.5,"v":1000,"vw":100.25,'
+                    f'"s":{timestamp - 60_000},"e":{timestamp}}}]'
+                ).encode("ascii")
+            ),
+            ADMISSIONS,
+            finality_observed_at=observed_at,
+        ).events[0]
+
+    accepted = aggregate(maximum)
+    rejected = aggregate(excessive)
+
+    assert accepted.quality is MarketEventQuality.GOOD
+    assert accepted.reason_codes == ()
+    assert rejected.quality is MarketEventQuality.INVALID
+    assert rejected.reason_codes == ("SOURCE_TIME_AFTER_RECEIPT",)
+
+
+def test_normalizer_defers_am_until_bar_end_without_changing_source_clocks():
+    event_at = datetime(
+        2026, 10, 22, 17, 33, tzinfo=UTC
+    )
+    received_at = datetime(
+        2026, 10, 22, 17, 32, 58, 985583, tzinfo=UTC
+    )
+    committed_at = datetime(
+        2026, 10, 22, 17, 32, 59, 1293, tzinfo=UTC
+    )
+    timestamp = int(event_at.timestamp() * 1000)
+
+    raw = _raw(
+        (
+            '[{"ev":"AM","sym":"SPY","o":100,"h":101,"l":99,'
+            f'"c":100.5,"v":1000,"vw":100.25,'
+            f'"s":{timestamp - 60_000},"e":{timestamp}}}]'
+        ).encode("ascii"),
+        received_at=received_at,
+        committed_at=committed_at,
+    )
+    pending = normalize_raw_message(
+        raw,
+        ADMISSIONS,
+        finality_observed_at=committed_at,
+    ).events[0]
+    aggregate = normalize_raw_message(
+        raw,
+        ADMISSIONS,
+        finality_observed_at=event_at,
+    ).events[0]
+
+    assert event_at - received_at > timedelta(seconds=1)
+    assert event_at - committed_at < timedelta(seconds=2)
+    assert pending.quality is MarketEventQuality.INVALID
+    assert pending.reason_codes == ("AM_FINALITY_PENDING",)
+    assert aggregate.quality is MarketEventQuality.GOOD
+    assert aggregate.reason_codes == ()
+
+
+def test_normalizer_keeps_trade_and_quote_future_time_gate_strict():
+    timestamp = int((RECEIVED.timestamp() + 0.001) * 1000)
+    batch = normalize_raw_message(
+        _raw(
+            (
+                '[{"ev":"Q","sym":"SPY","bp":100,"ap":101,"bs":1,'
+                f'"as":1,"t":{timestamp}}}]'
+            ).encode("ascii")
+        ),
+        ADMISSIONS,
+    )
+
+    assert batch.events[0].quality is MarketEventQuality.INVALID
+    assert batch.events[0].reason_codes == (
+        "SOURCE_TIME_AFTER_RECEIPT",
+    )
 
 
 def test_normalizer_quarantines_bad_siblings_and_unadmitted_symbols():

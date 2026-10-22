@@ -327,6 +327,84 @@ def test_hybrid_repair_command_reuses_fixed_cutoff_incremental_runner(tmp_path):
     assert command.count("--once") == 1
 
 
+def test_zero_repair_budget_blocks_hybrid_gap_without_byte_limit(
+    monkeypatch,
+    tmp_path,
+):
+    now = datetime(2026, 10, 22, 14, 10, tzinfo=timezone.utc)
+    args = script.parse_args(_base())
+    runtime = SimpleNamespace(
+        cohort_id=script.UUID(int=2),
+        plan_id=script.UUID(int=3),
+        budgets=args.budgets,
+    )
+
+    class Transaction:
+        def __enter__(self):
+            return SimpleNamespace(cursor=MagicMock())
+
+        def __exit__(self, *_args):
+            return False
+
+    provider = SimpleNamespace(
+        transaction=lambda *_args, **_kwargs: Transaction()
+    )
+    monkeypatch.setattr(
+        script,
+        "_load_hybrid_progress_cursor",
+        lambda *_args: (
+            now - timedelta(minutes=1),
+            None,
+            (1,),
+        ),
+    )
+    monkeypatch.setattr(
+        script,
+        "plan_hybrid_startup",
+        lambda **_kwargs: SimpleNamespace(
+            state=HybridStartupState.REPAIR_READY,
+        ),
+    )
+    monkeypatch.setattr(
+        script,
+        "hybrid_repair_identity",
+        lambda **_kwargs: SimpleNamespace(
+            maximum_attempts=2,
+            release_at=now,
+        ),
+    )
+    monkeypatch.setattr(
+        script,
+        "_ensure_hybrid_window_cursor",
+        lambda *_args, **_kwargs: pytest.fail(
+            "zero repair budget created a repair window"
+        ),
+    )
+    coordinator = script._HybridRepairCoordinator(
+        provider,
+        args,
+        runtime,
+        session_open=now - timedelta(minutes=40),
+        deadline=now + timedelta(minutes=5),
+        journal_root=tmp_path,
+        lease_seconds=60,
+        settings=SimpleNamespace(
+            rest_provider_delay_seconds=0,
+            rest_aggregate_endpoint_class="MASSIVE_STOCKS_AGGREGATES_1M",
+            rest_eligibility_policy_version=(
+                "advanced-real-time-closed-bar-v1"
+            ),
+            rest_publication_retry_grace_seconds=10,
+            rest_maximum_attempts=2,
+        ),
+    )
+
+    coordinator._plan_next(now)
+
+    assert coordinator.terminal_outcome == "AUTHORIZATION_EXHAUSTED"
+    assert coordinator.window is None
+
+
 def test_hybrid_attempt_paths_and_claims_are_durable_and_bounded(tmp_path):
     repair_id = script.UUID(int=4)
     first = script._hybrid_report_path(tmp_path, repair_id, 1)

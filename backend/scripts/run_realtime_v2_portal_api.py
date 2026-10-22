@@ -20,6 +20,21 @@ from realtime.portal_api import build_realtime_portal_repositories, create_realt
 from realtime.stage_database_v2 import V2WorkerDatabase  # noqa: E402
 
 
+def advanced_options_reads_enabled(environment) -> bool:
+    value = str(
+        environment.get(
+            "REALTIME_V2_ADVANCED_OPTIONS_READS",
+            "DISABLED",
+        )
+    ).strip().upper()
+    if value not in {"DISABLED", "ENABLED"}:
+        raise ValueError(
+            "REALTIME_V2_ADVANCED_OPTIONS_READS must be "
+            "DISABLED or ENABLED"
+        )
+    return value == "ENABLED"
+
+
 class V2ApiDatabase(V2WorkerDatabase):
     def __init__(
         self,
@@ -78,10 +93,14 @@ def create_app():
         )
         provider.verify()
         database = V2ApiDatabase(provider, RealtimeDatabaseRole.READER)
+        options_reads_enabled = advanced_options_reads_enabled(os.environ)
         app = create_realtime_portal_app(
-            build_realtime_portal_repositories(database),
+            build_realtime_portal_repositories(
+                database,
+                advanced_options_v2_enabled=options_reads_enabled,
+            ),
             database_target="stocks_realtime_v2",
-            advanced_options_v2_enabled=True,
+            advanced_options_v2_enabled=options_reads_enabled,
         )
     except Exception:
         pool.closeall()

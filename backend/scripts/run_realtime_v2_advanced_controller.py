@@ -943,6 +943,12 @@ class _HybridRepairCoordinator:
         )
         if identity is None:
             return
+        if (
+            self.runtime_scope.budgets.rest_repair_requests == 0
+            or self.runtime_scope.budgets.rest_repair_decoded_bytes == 0
+        ):
+            self.terminal_outcome = "AUTHORIZATION_EXHAUSTED"
+            return
         required_requests = len(instrument_ids) * identity.maximum_attempts
         required_bytes = required_requests * (
             self.args.rest_repair_response_byte_limit + 1

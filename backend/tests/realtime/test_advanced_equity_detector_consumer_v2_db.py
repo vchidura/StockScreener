@@ -24,7 +24,7 @@ from v2_database import (
 
 pytestmark = requires_v2_database
 UTC = timezone.utc
-NOW = datetime(2026, 10, 20, 13, 36, tzinfo=UTC)
+NOW = datetime.now(UTC).replace(microsecond=0)
 
 
 def _decision(record, inputs):

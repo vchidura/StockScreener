@@ -326,6 +326,25 @@ def test_bridge_health_reports_missing_overlay_schema():
     }
 
 
+def test_bridge_health_can_scope_unrelated_quarantine_by_cohort():
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = (
+        ("rt.advanced_journal_registry",),
+        (True,),
+        (0, 1, 0),
+        (0,),
+    )
+    cohort_id = UUID("22222222-2222-2222-2222-222222222222")
+
+    state, detail = health._bridge_health(cursor, cohort_id)
+
+    assert state == "READY"
+    assert detail["quarantined_journals"] == 0
+    assert detail["draining_journals"] == 1
+    assert cursor.execute.call_args_list[2].args[1] == (str(cohort_id),)
+    assert cursor.execute.call_args_list[3].args[1] == (str(cohort_id),)
+
+
 def _service_block(text, service):
     match = re.search(
         rf"^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|^volumes:\n)",
@@ -347,6 +366,7 @@ def test_compose_advanced_services_are_independent_and_secret_scoped():
         "realtime-v2-advanced-bridge",
         "realtime-v2-advanced-scheduler",
         "realtime-v2-advanced-finalizer",
+        "realtime-v2-advanced-detectors",
         "realtime-v2-advanced-api",
         "realtime-v2-advanced-frontend",
     }
@@ -440,6 +460,7 @@ def test_compose_advanced_services_are_independent_and_secret_scoped():
         "backend/scripts/run_realtime_v2_advanced_journal_replay.py",
         "backend/scripts/run_realtime_v2_advanced_equity_bridge.py",
         "backend/scripts/run_realtime_v2_equity_interval_finalizer.py",
+        "backend/scripts/run_realtime_v2_advanced_equity_detectors.py",
         "backend/scripts/run_realtime_v2_portal_api.py",
         "backend/scripts/run_realtime_v2_retention_service.py",
     ],

@@ -348,8 +348,9 @@ def _load_finalizer_security_cursor(
     instrument_id: int,
     window_end: datetime,
     as_of: datetime,
+    allow_late_reference: bool = False,
 ) -> SecurityReferenceRevision:
-    cursor.execute(
+    select = (
         "SELECT reference.revision_id, reference.security_id, reference.ticker, "
         "reference.active, reference.company_name, reference.security_type, "
         "reference.cik, reference.composite_figi, reference.share_class_figi, "
@@ -360,15 +361,34 @@ def _load_finalizer_security_cursor(
         "reference.effective_from, reference.observed_at, reference.payload_sha256 "
         "FROM rt.instruments AS instrument "
         "JOIN ref.security_revisions AS reference USING (security_id) "
-        "WHERE instrument.instrument_id=%s AND instrument.asset_class='EQUITY' "
+    )
+    order = (
+        "ORDER BY reference.effective_from DESC, reference.observed_at DESC, "
+        "reference.revision_id DESC LIMIT 1"
+    )
+    cursor.execute(
+        select
+        + "WHERE instrument.instrument_id=%s "
+        "AND instrument.asset_class='EQUITY' "
         "AND reference.effective_from<=%s "
         "AND (reference.effective_to IS NULL OR reference.effective_to>%s) "
         "AND reference.observed_at<=%s "
-        "ORDER BY reference.effective_from DESC, reference.observed_at DESC, "
-        "reference.revision_id DESC LIMIT 1",
+        + order,
         (instrument_id, window_end, window_end, as_of),
     )
     row = cursor.fetchone()
+    if row is None and allow_late_reference:
+        cursor.execute(
+            select
+            + "WHERE instrument.instrument_id=%s "
+            "AND instrument.asset_class='EQUITY' "
+            "AND reference.effective_from<=%s "
+            "AND (reference.effective_to IS NULL OR reference.effective_to>%s) "
+            "AND reference.observed_at<=%s "
+            + order,
+            (instrument_id, as_of, as_of, as_of),
+        )
+        row = cursor.fetchone()
     if row is None:
         raise ValueError("finalizer security reference is unavailable")
     if isinstance(row, Mapping):
@@ -603,6 +623,9 @@ def _load_finalizer_member_input_cursor(
         instrument_id=instrument_id,
         window_end=window.window_end,
         as_of=checked_at,
+        allow_late_reference=(
+            window.provider_tier is ProviderTier.MASSIVE_ADVANCED
+        ),
     )
     source_bars = _load_finalizer_source_bars_cursor(
         cursor,

@@ -40,7 +40,8 @@ test('Options Flow requests preserve realtime cohort identity without canonical 
     .replaceAll('import.meta.env', 'globalThis.__optionFlowEnvironment')
   try {
     globalThis.__optionFlowEnvironment = {
-      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: ' exact-cohort ',
+      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_OPTIONS_V2: 'true',
+      VITE_REALTIME_COHORT_ID: ' exact-cohort ',
     }
     const api = await import(`data:text/javascript;base64,${Buffer.from(compile(source)).toString('base64')}`)
     await api.getOptionFlow('AAPL', '2026-10-06')
@@ -49,8 +50,20 @@ test('Options Flow requests preserve realtime cohort identity without canonical 
       { params: { underlyer: 'AAPL', session_date: '2026-10-06', cohort_id: 'exact-cohort' } },
     ]])
     calls.length = 0
-    globalThis.__optionFlowEnvironment = { VITE_REALTIME_ONLY: 'true' }
+    globalThis.__optionFlowEnvironment = {
+      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_OPTIONS_V2: 'true',
+    }
     await assert.rejects(api.getOptionFlow('AAPL'), /requires VITE_REALTIME_COHORT_ID/)
+    assert.equal(calls.length, 0)
+    globalThis.__optionFlowEnvironment = {
+      VITE_REALTIME_ONLY: 'true',
+      VITE_REALTIME_OPTIONS_V2: 'false',
+      VITE_REALTIME_COHORT_ID: 'exact-cohort',
+    }
+    await assert.rejects(
+      api.getOptionFlow('AAPL'),
+      /require VITE_REALTIME_OPTIONS_V2=true/,
+    )
     assert.equal(calls.length, 0)
   } finally {
     delete globalThis.__optionFlowApi

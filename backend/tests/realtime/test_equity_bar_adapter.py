@@ -149,6 +149,72 @@ def test_advanced_am_bar_retains_exact_journal_and_finality_lineage():
     assert fact.source_offset == 10
 
 
+def test_advanced_am_bar_requires_bounded_deferral_and_bar_end_proof():
+    accepted = replace(
+        _advanced_record(),
+        received_at=NOW - timedelta(
+            seconds=1,
+            microseconds=14_417,
+        ),
+        committed_at=NOW - timedelta(
+            seconds=1,
+            microseconds=97_352,
+        ),
+    )
+    rejected = replace(
+        _advanced_record(),
+        committed_at=NOW - timedelta(
+            seconds=2,
+            microseconds=1,
+        ),
+    )
+
+    fact = adapt_advanced_minute_aggregate(
+        accepted,
+        cohort_id=COHORT,
+        security_id=SECURITY,
+        finality=_advanced_finality(),
+    )
+
+    assert fact.revision.bar_end == NOW
+    with pytest.raises(ValueError, match="proof"):
+        adapt_advanced_minute_aggregate(
+            accepted,
+            cohort_id=COHORT,
+            security_id=SECURITY,
+            finality=_advanced_finality(
+                proved_at=NOW - timedelta(microseconds=1),
+            ),
+        )
+    with pytest.raises(ValueError, match="clocks"):
+        adapt_advanced_minute_aggregate(
+            rejected,
+            cohort_id=COHORT,
+            security_id=SECURITY,
+            finality=_advanced_finality(),
+        )
+
+
+def test_advanced_am_uses_bar_end_as_earliest_final_availability():
+    record = replace(
+        _advanced_record(),
+        received_at=NOW - timedelta(milliseconds=500),
+        committed_at=NOW - timedelta(milliseconds=400),
+    )
+    finality = _advanced_finality(proved_at=NOW)
+
+    fact = adapt_advanced_minute_aggregate(
+        record,
+        cohort_id=COHORT,
+        security_id=SECURITY,
+        finality=finality,
+    )
+
+    assert fact.revision.system_observed_at == NOW
+    assert record.received_at < fact.revision.system_observed_at
+    assert finality.proved_at == fact.revision.system_observed_at
+
+
 def test_identical_advanced_payload_replay_keeps_one_logical_revision():
     first = adapt_advanced_minute_aggregate(
         _advanced_record(),

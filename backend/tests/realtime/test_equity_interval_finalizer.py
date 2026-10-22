@@ -71,6 +71,49 @@ def security(ticker="AAPL"):
     )
 
 
+def test_advanced_finalizer_allows_same_instrument_late_reference():
+    item = security("SPY")
+    row = (
+        item.security_revision_id,
+        item.security_id,
+        item.ticker,
+        item.active,
+        item.company_name,
+        item.security_type,
+        item.cik,
+        item.composite_figi,
+        item.share_class_figi,
+        item.primary_exchange,
+        item.sic_code,
+        item.sic_description,
+        item.sector,
+        item.industry,
+        item.list_date,
+        item.delisted_date,
+        item.weighted_shares,
+        item.free_float,
+        item.free_float_percent,
+        item.market_cap,
+        END + timedelta(minutes=1),
+        END + timedelta(minutes=1),
+        item.payload_sha256,
+    )
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [None, row]
+
+    loaded = finalizer._load_finalizer_security_cursor(
+        cursor,
+        instrument_id=1,
+        window_end=END,
+        as_of=END + timedelta(minutes=2),
+        allow_late_reference=True,
+    )
+
+    assert loaded.security_id == item.security_id
+    assert loaded.ticker == "SPY"
+    assert cursor.execute.call_count == 2
+
+
 def minute_bars(item, *, observed_offset_seconds=0):
     rows = []
     for index in range(5):

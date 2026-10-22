@@ -5,6 +5,7 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import quote
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import exchange_calendars
@@ -69,6 +70,8 @@ class AdjustedDailyRepairPlan:
     authorization_reference: str
     provider_authorization_reference: str
     expected_cost: str
+    adjusted: bool = True
+    per_ticker: bool = False
     identity_continuity: tuple[tuple[object, ...], ...] = ()
 
     def __post_init__(self):
@@ -81,6 +84,13 @@ class AdjustedDailyRepairPlan:
             or self.request_ceiling != 1
             or not 1024 <= self.response_byte_limit <= 16 * 1024 * 1024
             or self.byte_ceiling != self.response_byte_limit + 1
+            or (
+                not self.adjusted
+                and (
+                    len(self.identities) != 1
+                    or not self.per_ticker
+                )
+            )
             or (
                 self.identity_continuity
                 and len(self.identity_continuity) != len(self.identities)
@@ -119,7 +129,9 @@ class AdjustedDailyRepairPlan:
             ),
             "identity_continuity": self.identity_continuity,
             "session_date": self.session_date,
-            "endpoint_policy": ENDPOINT_POLICY,
+            "endpoint_policy": _endpoint_policy(self),
+            "adjusted": self.adjusted,
+            "per_ticker": self.per_ticker,
             "authorized_until": self.authorized_until,
             "request_ceiling": self.request_ceiling,
             "byte_ceiling": self.byte_ceiling,
@@ -135,11 +147,12 @@ class AdjustedDailyRepairPlan:
 
 
 def _request_spec(plan: AdjustedDailyRepairPlan):
-    url = (
-        f"{ENDPOINT_POLICY['base_url']}"
-        f"/v2/aggs/grouped/locale/us/market/stocks/{plan.session_date.isoformat()}"
+    policy = _endpoint_policy(plan)
+    path = policy["path"].format(
+        session_date=plan.session_date.isoformat()
     )
-    params = dict(ENDPOINT_POLICY["params"])
+    url = f"{policy['base_url']}{path}"
+    params = dict(policy["params"])
     request_sha256 = canonical_sha256({
         "policy": POLICY,
         "plan_sha256": plan.sha256,
@@ -148,6 +161,37 @@ def _request_spec(plan: AdjustedDailyRepairPlan):
         "params": params,
     })
     return url, params, request_sha256
+
+
+def _endpoint_policy(plan: AdjustedDailyRepairPlan):
+    if not plan.per_ticker:
+        if not plan.adjusted:
+            raise ValueError("raw daily repair requires one exact ticker")
+        return ENDPOINT_POLICY
+    if len(plan.identities) != 1:
+        raise ValueError("per-ticker daily repair requires one exact ticker")
+    ticker = quote(plan.identities[0].ticker, safe="")
+    session = plan.session_date.isoformat()
+    return {
+        "method": "GET",
+        "base_url": "https://api.massive.com",
+        "path": (
+            f"/v2/aggs/ticker/{ticker}/range/1/day/{session}/{session}"
+        ),
+        "params": {
+            "adjusted": "true" if plan.adjusted else "false",
+            "sort": "asc",
+            "limit": "50000",
+        },
+    }
+
+
+def _endpoint_class(plan: AdjustedDailyRepairPlan) -> str:
+    return (
+        ENDPOINT_CLASS
+        if plan.adjusted
+        else "RAW_DAILY_SESSION_REPAIR"
+    )
 
 
 def _remember_plan(
@@ -173,15 +217,26 @@ def _remember_plan(
             (str(plan.cohort_id),),
         )
         members = tuple(unit.cursor.fetchall())
+        retained_members = {
+            (row[0], str(row[1]))
+            for row in members
+        }
+        selected_members = {
+            (row.instrument_id, str(row.security.security_id))
+            for row in plan.identities
+        }
         if (
-            {(row[0], str(row[1])) for row in members}
-            != {
-                (row.instrument_id, str(row.security.security_id))
-                for row in plan.identities
-            }
+            (
+                not selected_members <= retained_members
+                if plan.per_ticker
+                else selected_members != retained_members
+            )
             or any(
                 row[2] != "MASSIVE_DEVELOPER"
-                or row[3] != len(plan.identities)
+                or (
+                    not plan.per_ticker
+                    and row[3] != len(plan.identities)
+                )
                 for row in members
             )
         ):
@@ -266,7 +321,7 @@ def _request(
                 request_id,
                 "MASSIVE_DEVELOPER",
                 ProviderRequestLane.EQUITY_HISTORY,
-                ENDPOINT_CLASS,
+                _endpoint_class(plan),
                 digest,
                 now,
                 cohort_id=plan.cohort_id,
@@ -343,10 +398,23 @@ def _request(
         if not isinstance(rows, list):
             raise ValueError("adjusted-daily results must be a list")
         identity_by_ticker = {row.ticker: row for row in plan.identities}
+        response_rows = (
+            tuple(
+                {
+                    **row,
+                    "T": plan.identities[0].ticker,
+                }
+                for row in rows
+            )
+            if plan.per_ticker
+            else tuple(rows)
+        )
         selected = tuple(
             row for row in rows
             if str(row.get("T") or "").strip().upper() in identity_by_ticker
         )
+        if plan.per_ticker:
+            selected = response_rows
         if {
             str(row.get("T") or "").strip().upper() for row in selected
         } != set(identity_by_ticker):
@@ -361,12 +429,13 @@ def _request(
             observed_at=completed,
             ingestion_segment_id=request_id,
             availability_mode=BarAvailabilityMode.HISTORICAL_RECONSTRUCTED,
-            adjusted=True,
+            adjusted=plan.adjusted,
         )
-        revisions = tuple(
-            bind_equity_validation_adjustment_identity(revision)
-            for revision in revisions
-        )
+        if plan.adjusted:
+            revisions = tuple(
+                bind_equity_validation_adjustment_identity(revision)
+                for revision in revisions
+            )
         if {row.ticker for row in revisions} != set(identity_by_ticker):
             raise ValueError("adjusted-daily normalization changed cohort membership")
     except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
@@ -405,7 +474,11 @@ def _request(
         pages_fetched=1,
         requested_from=opened,
         requested_to=closed,
-        price_basis=PriceBasis.ADJUSTED_BAR_START_V1,
+        price_basis=(
+            PriceBasis.ADJUSTED_BAR_START_V1
+            if plan.adjusted
+            else PriceBasis.RAW_FINALIZED_MINUTE_CLOSE_V1
+        ),
         completeness=RequestCompleteness.COMPLETE,
     )
     if external:
@@ -424,7 +497,7 @@ def _request(
         request_id,
         "MASSIVE_DEVELOPER",
         ProviderRequestLane.EQUITY_HISTORY,
-        ENDPOINT_CLASS,
+        _endpoint_class(plan),
         digest,
         reserved_at,
         cohort_id=plan.cohort_id,
@@ -481,6 +554,7 @@ def execute_adjusted_daily_repair(
         "plan_sha256": plan.sha256,
         "session_date": plan.session_date.isoformat(),
         "tickers": sorted(identity_by_ticker),
+        "adjusted": plan.adjusted,
         "provider_requests": external,
         "provider_response_replays": 1 - external,
         "provider_response_bytes": (

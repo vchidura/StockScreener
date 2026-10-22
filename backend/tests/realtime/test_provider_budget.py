@@ -126,7 +126,7 @@ def test_admission_rejects_request_or_byte_ceiling_exhaustion():
             )
 
 
-def test_status_refuses_conflicting_account_ceilings():
+def test_status_refuses_conflicting_scope_ceilings():
     cursor = MagicMock()
     cursor.fetchone.return_value = (
         1,
@@ -142,6 +142,34 @@ def test_status_refuses_conflicting_account_ceilings():
     )
     with pytest.raises(ValueError, match="ceilings conflict"):
         provider_budget_status_cursor(cursor, _scope())
+
+
+def test_status_is_bound_to_the_exact_authorized_budget_scope():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+        None,
+        None,
+    )
+    scope = _scope()
+
+    status = provider_budget_status_cursor(cursor, scope)
+
+    assert status.requests_reserved == 0
+    query, parameters = cursor.execute.call_args.args
+    assert "budget_scope_sha256=%s" in query
+    assert parameters == (
+        scope.account_alias,
+        scope.session_date,
+        scope.sha256,
+    )
 
 
 def test_advanced_incremental_budget_exhaustion_blocks_before_reservation():

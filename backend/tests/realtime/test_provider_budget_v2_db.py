@@ -105,3 +105,52 @@ def test_concurrent_v2_lanes_cannot_spend_the_same_last_reservation(pool):
         1,
         2_001,
     ),)
+
+
+def test_fresh_authorization_has_an_independent_explicit_budget_scope(pool):
+    session = date(2026, 10, 16)
+    first_scope = ProviderBudgetScope(
+        account_alias="MASSIVE_ADVANCED",
+        session_date=session,
+        authorization_reference="advanced-stream:first",
+        provider_authorization_reference="stocks-advanced",
+        expected_cost="bounded repair",
+        request_ceiling=1,
+        decoded_byte_ceiling=2_001,
+        lanes=frozenset({ProviderRequestLane.EQUITY_HISTORY}),
+        authorized_until=datetime(2026, 10, 16, 15, tzinfo=timezone.utc),
+    )
+    second_scope = ProviderBudgetScope(
+        account_alias="MASSIVE_ADVANCED",
+        session_date=session,
+        authorization_reference="advanced-stream:second",
+        provider_authorization_reference="stocks-advanced",
+        expected_cost="bounded repair",
+        request_ceiling=1,
+        decoded_byte_ceiling=2_001,
+        lanes=frozenset({ProviderRequestLane.EQUITY_HISTORY}),
+        authorized_until=datetime(2026, 10, 16, 16, tzinfo=timezone.utc),
+    )
+
+    connection = pool.getconn()
+    try:
+        with connection.cursor() as cursor:
+            for scope in (first_scope, second_scope):
+                admission = reserve_coordinated_provider_request_cursor(
+                    cursor,
+                    scope,
+                    ProviderRequestReservation(
+                        request_id=uuid4(),
+                        account_alias=scope.account_alias,
+                        lane=ProviderRequestLane.EQUITY_HISTORY,
+                        endpoint_class="MASSIVE_STOCKS_AGGREGATES_1M",
+                        request_sha256=uuid4().hex * 2,
+                        reserved_at=datetime.now(timezone.utc),
+                    ),
+                    reserved_response_bytes=2_001,
+                )
+                assert admission.newly_reserved
+                assert admission.status.requests_reserved == 1
+        connection.commit()
+    finally:
+        pool.putconn(connection)

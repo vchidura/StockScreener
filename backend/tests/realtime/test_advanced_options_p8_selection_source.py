@@ -45,6 +45,8 @@ def _contract(underlyer, ticker, kind, strike, spot, volume=500):
         "underlying_asset": {
             "ticker": underlyer,
             "price": spot,
+            "last_updated": MARKET_NS,
+            "timeframe": "REAL-TIME",
         },
     }
 

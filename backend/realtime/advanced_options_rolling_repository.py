@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Mapping
+from typing import TYPE_CHECKING, Mapping
 from uuid import UUID
 
 from psycopg2.extras import Json
@@ -24,6 +24,11 @@ from .database_access_v2 import V2ConnectionProvider
 from .materialization import MaterializedQuote, MaterializedTrade
 from .option_flow.records import VolumeCheckpoint
 from .option_flow.volume import BaselineKind
+
+if TYPE_CHECKING:
+    from .advanced_options_underlying_snapshot import (
+        UnderlyingSnapshotTick,
+    )
 
 
 def _datetime(value: str) -> datetime:
@@ -90,7 +95,39 @@ def _trade(value: Mapping[str, object] | None) -> MaterializedTrade | None:
     )
 
 
-def _tick(value: Mapping[str, object]) -> AdvancedOptionsUnderlyingTick:
+def _tick(
+    value: Mapping[str, object],
+) -> AdvancedOptionsUnderlyingTick | UnderlyingSnapshotTick:
+    if value.get("contract") == (
+        "advanced-options-underlying-snapshot-tick-v1"
+    ):
+        from .advanced_options_underlying_snapshot import (
+            UnderlyingSnapshotTick,
+            underlying_snapshot_price_from_payload,
+        )
+
+        if set(value) != {
+            "contract",
+            "instrument_id",
+            "evidence",
+            "selected_at",
+            "option_market_time",
+            "maximum_price_age_seconds",
+        }:
+            raise ValueError(
+                "stored underlying snapshot tick fields changed"
+            )
+        return UnderlyingSnapshotTick(
+            instrument_id=int(value["instrument_id"]),
+            evidence=underlying_snapshot_price_from_payload(
+                value["evidence"]
+            ),
+            selected_at=_datetime(value["selected_at"]),
+            option_market_time=_datetime(value["option_market_time"]),
+            maximum_price_age_seconds=int(
+                value["maximum_price_age_seconds"]
+            ),
+        )
     return AdvancedOptionsUnderlyingTick(
         instrument_id=value["instrument_id"],
         ticker=value["ticker"],

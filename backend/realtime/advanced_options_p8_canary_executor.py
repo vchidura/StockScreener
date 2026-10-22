@@ -29,9 +29,9 @@ from .advanced_options_service import (
     AdvancedOptionsProcessKind,
     AdvancedOptionsResidentLauncher,
 )
-from .advanced_options_rolling_producer import (
-    AdvancedOptionsEquityLiveHeadBinding,
-    advanced_options_equity_live_head_binding_payload,
+from .advanced_options_underlying_snapshot import (
+    UnderlyingSnapshotBinding,
+    underlying_snapshot_binding_payload,
 )
 from .contracts import MarketChannel
 from .option_slot_set import SlotSetPurpose
@@ -111,7 +111,7 @@ class P8CanaryExecutionBinding:
     enrollment: AdvancedOptionsEnrollmentPlan
     history: AdvancedOptionsHistoryBinding
     window_id: UUID
-    equity_live_heads: AdvancedOptionsEquityLiveHeadBinding | None = None
+    underlying_price_binding: UnderlyingSnapshotBinding | None = None
 
     def validate(
         self,
@@ -123,18 +123,18 @@ class P8CanaryExecutionBinding:
         if not isinstance(self.history, AdvancedOptionsHistoryBinding):
             raise TypeError("P8 execution requires a typed history binding")
         if not isinstance(
-            self.equity_live_heads,
-            AdvancedOptionsEquityLiveHeadBinding,
+            self.underlying_price_binding,
+            UnderlyingSnapshotBinding,
         ):
             raise TypeError(
-                "P8 execution requires a frozen Advanced Equity binding"
+                "P8 execution requires frozen underlying snapshot prices"
             )
         enrollment = advanced_options_enrollment_plan_payload(
             self.enrollment
         )
         history = advanced_options_history_binding_payload(self.history)
-        equity_live_heads = advanced_options_equity_live_head_binding_payload(
-            self.equity_live_heads
+        underlying_prices = underlying_snapshot_binding_payload(
+            self.underlying_price_binding
         )
         control = self.enrollment.control_plane
         observed = live_preflight["advanced_enrollment"]
@@ -173,8 +173,8 @@ class P8CanaryExecutionBinding:
             != package["orchestration"]["plan_id"]
             or str(control.cohort_id) != package["cohort"]["cohort_id"]
             or history != live_preflight["realized_history_binding"]
-            or equity_live_heads
-            != live_preflight["realized_equity_live_head_binding"]
+            or underlying_prices
+            != live_preflight["realized_underlying_price_binding"]
             or self.history.target_cohort_id != control.cohort_id
             or list(control.universe.option_underlyings)
             != package["cohort"]["underlyings"]

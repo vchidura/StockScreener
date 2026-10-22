@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, Mapping
@@ -13,8 +13,9 @@ from .contracts import AssetClass, MarketChannel, MarketFeed, canonical_sha256
 from .journal import RawJournalRecord
 
 
-NORMALIZER_VERSION = "massive_market_event_v2"
+NORMALIZER_VERSION = "massive_market_event_v5"
 ET = ZoneInfo("America/New_York")
+MAXIMUM_STOCKS_AM_FINALITY_DEFERRAL = timedelta(seconds=2)
 
 
 class MarketEventQuality(str, Enum):
@@ -194,6 +195,7 @@ def _normalize_event(
     event_index: int,
     row: Mapping[str, Any],
     admissions: Mapping[str, InstrumentAdmission],
+    finality_observed_at: datetime,
 ) -> NormalizedMarketEvent:
     event_code = str(row.get("ev") or "").upper()
     try:
@@ -297,7 +299,21 @@ def _normalize_event(
             "vwap": str(vwap) if vwap is not None else None,
         }
     event_at = _event_time(source_timestamp)
-    if event_at > raw.received_at:
+    is_stocks_am = (
+        raw.feed is MarketFeed.STOCKS
+        and event_kind is MarketChannel.MINUTE_AGGREGATE
+    )
+    if (
+        is_stocks_am
+        and event_at - raw.committed_at
+        > MAXIMUM_STOCKS_AM_FINALITY_DEFERRAL
+    ):
+        quality = MarketEventQuality.INVALID
+        reasons = tuple(dict.fromkeys((*reasons, "SOURCE_TIME_AFTER_RECEIPT")))
+    elif is_stocks_am and event_at > finality_observed_at:
+        quality = MarketEventQuality.INVALID
+        reasons = tuple(dict.fromkeys((*reasons, "AM_FINALITY_PENDING")))
+    elif not is_stocks_am and event_at > raw.received_at:
         quality = MarketEventQuality.INVALID
         reasons = tuple(dict.fromkeys((*reasons, "SOURCE_TIME_AFTER_RECEIPT")))
     return NormalizedMarketEvent(
@@ -335,12 +351,17 @@ def normalize_raw_message(
     admissions: Mapping[str, InstrumentAdmission],
     *,
     maximum_events: int = 10_000,
+    finality_observed_at: datetime | None = None,
 ) -> NormalizationBatch:
     if not 1 <= maximum_events <= 100_000:
         raise ValueError("maximum_events must be in [1, 100000]")
     normalized_admissions = {
         symbol.strip().upper(): admission for symbol, admission in admissions.items()
     }
+    observed_at = finality_observed_at or raw.committed_at
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("finality_observed_at must be timezone-aware")
+    observed_at = observed_at.astimezone(timezone.utc)
     try:
         payload = json.loads(
             raw.payload,
@@ -408,7 +429,13 @@ def normalize_raw_message(
             continue
         try:
             events.append(
-                _normalize_event(raw, event_index, row, normalized_admissions)
+                _normalize_event(
+                    raw,
+                    event_index,
+                    row,
+                    normalized_admissions,
+                    observed_at,
+                )
             )
         except _EventError as error:
             quarantines.append(

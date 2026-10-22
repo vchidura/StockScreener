@@ -18,6 +18,7 @@ COMPONENTS = (
     "bridge",
     "scheduler",
     "finalizer",
+    "detectors",
     "publication",
 )
 
@@ -34,7 +35,12 @@ def parse_args(argv=None):
             parser.error(f"{args.component} requires --authorization-id")
     elif args.authorization_id is not None:
         parser.error("--authorization-id is only valid for provider components")
-    if args.component in {"finalizer", "publication"}:
+    if args.component in {
+        "bridge",
+        "finalizer",
+        "detectors",
+        "publication",
+    }:
         if args.cohort_id is None:
             parser.error(f"{args.component} requires --cohort-id")
     elif args.cohort_id is not None:
@@ -129,7 +135,7 @@ def _provider_health(cursor, args):
     }
 
 
-def _bridge_health(cursor):
+def _bridge_health(cursor, cohort_id=None):
     if _one(
         cursor,
         "SELECT to_regclass('rt.advanced_journal_registry')",
@@ -142,6 +148,12 @@ def _bridge_health(cursor):
         "SELECT to_regclass('rt.advanced_journal_recovery_events') "
         "IS NOT NULL",
     )[0])
+    cohort_clause = (
+        ""
+        if cohort_id is None
+        else " WHERE registry.cohort_id=%s"
+    )
+    parameters = () if cohort_id is None else (str(cohort_id),)
     journals = _one(
         cursor,
         "SELECT count(*) FILTER (WHERE registry.status='QUARANTINED'"
@@ -158,13 +170,27 @@ def _bridge_health(cursor):
         "('REGISTERED','WRITING','DRAINING')),"
         "COALESCE(max(registry.normalized_committed_offset-"
         "registry.bridge_committed_offset),0) "
-        "FROM rt.advanced_journal_registry AS registry",
+        "FROM rt.advanced_journal_registry AS registry"
+        + cohort_clause,
+        parameters,
     )
-    gaps = _one(
-        cursor,
-        "SELECT count(*) FROM rt.stream_gaps "
-        "WHERE recovery_status NOT IN ('REPAIRED','WAIVED')",
-    )[0]
+    if cohort_id is None:
+        gaps = _one(
+            cursor,
+            "SELECT count(*) FROM rt.stream_gaps "
+            "WHERE recovery_status NOT IN ('REPAIRED','WAIVED')",
+        )[0]
+    else:
+        gaps = _one(
+            cursor,
+            "SELECT count(*) FROM rt.stream_gaps AS gap "
+            "JOIN rt.stream_sessions AS session USING(session_id) "
+            "JOIN rt.advanced_journal_registry AS registry "
+            "ON registry.journal_generation=session.journal_generation "
+            "WHERE gap.recovery_status NOT IN ('REPAIRED','WAIVED') "
+            "AND registry.cohort_id=%s",
+            (str(cohort_id),),
+        )[0]
     quarantined, draining, lag = map(int, journals)
     state = "BLOCKED" if quarantined else "DEGRADED" if gaps else "READY"
     return state, {
@@ -211,6 +237,53 @@ def _finalizer_health(cursor, cohort_id):
     }
 
 
+def _detector_health(cursor, cohort_id):
+    expected = int(_one(
+        cursor,
+        "SELECT count(DISTINCT member.instrument_id) * 2 "
+        "FROM rt.cohorts AS cohort "
+        "JOIN rt.subscription_members AS member USING(manifest_id) "
+        "WHERE cohort.cohort_id=%s AND member.channel='AM'",
+        (str(cohort_id),),
+    )[0])
+    active_journals = int(_one(
+        cursor,
+        "SELECT count(*) FROM rt.advanced_journal_registry "
+        "WHERE cohort_id=%s "
+        "AND status IN ('WRITING','DRAINING','DRAINED')",
+        (str(cohort_id),),
+    )[0])
+    active_leases = int(_one(
+        cursor,
+        "SELECT count(*) FROM rt.worker_leases "
+        "WHERE resource_key LIKE %s AND lease_until>%s",
+        (
+            f"advanced-equity-detector:{cohort_id}:%",
+            datetime.now(UTC),
+        ),
+    )[0])
+    checkpoints = int(_one(
+        cursor,
+        "SELECT count(*) FROM rt.consumer_checkpoints "
+        "WHERE cohort_id=%s AND consumer_name LIKE "
+        "'advanced-equity-detector-shadow:ADVANCED_EQUITY_S_:0'",
+        (str(cohort_id),),
+    )[0])
+    required_leases = expected * active_journals
+    state = (
+        "DEGRADED"
+        if required_leases and active_leases != required_leases
+        else "READY"
+    )
+    return state, {
+        "expected_consumers_per_journal": expected,
+        "active_journals": active_journals,
+        "required_leases": required_leases,
+        "active_leases": active_leases,
+        "durable_checkpoints": checkpoints,
+    }
+
+
 def _publication_health(cursor, cohort_id):
     releases = int(_one(
         cursor,
@@ -245,11 +318,13 @@ def collect_health(cursor, args):
     if args.component in {"controller", "ingress"}:
         return _provider_health(cursor, args)
     if args.component == "bridge":
-        return _bridge_health(cursor)
+        return _bridge_health(cursor, args.cohort_id)
     if args.component == "scheduler":
         return _scheduler_health(cursor)
     if args.component == "finalizer":
         return _finalizer_health(cursor, args.cohort_id)
+    if args.component == "detectors":
+        return _detector_health(cursor, args.cohort_id)
     return _publication_health(cursor, args.cohort_id)
 
 

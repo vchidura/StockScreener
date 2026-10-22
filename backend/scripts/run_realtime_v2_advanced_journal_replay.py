@@ -24,6 +24,7 @@ from realtime.advanced_journal_registry import (  # noqa: E402
     quarantine_advanced_journal_cursor,
 )
 from realtime.advanced_journal_replay import (  # noqa: E402
+    JournalReplayPending,
     JournalReplayQuarantine,
     replay_registered_journal_once,
 )
@@ -139,6 +140,14 @@ def replay_registered_once(
                 status.committed_offset
                 >= registration.normalized_committed_offset
             )
+        except JournalReplayPending as error:
+            emit(json.dumps({
+                "journal_generation": str(
+                    registration.journal_generation
+                ),
+                "status": "INITIALIZING",
+                "reason": str(error)[:160],
+            }))
         except JournalReplayQuarantine as error:
             with provider.transaction(APP_ROLE) as unit:
                 quarantine_advanced_journal_cursor(

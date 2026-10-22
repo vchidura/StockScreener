@@ -461,7 +461,15 @@ def build_and_run_p8_serial_window(
         ),
         known_at=cutoff,
         valid_until=expires,
-        equity_live_head_binding=binding.equity_live_heads,
+        maximum_underlying_age_ms=(
+            binding.underlying_price_binding.maximum_price_age_seconds
+            * 1000
+        ),
+        maximum_option_spot_skew_ms=(
+            binding.underlying_price_binding.maximum_price_age_seconds
+            * 1000
+        ),
+        equity_live_head_binding=binding.underlying_price_binding,
     )
     rolling = PostgresAdvancedOptionsRollingProducer(
         provider,

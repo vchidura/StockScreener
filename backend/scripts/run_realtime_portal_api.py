@@ -62,7 +62,10 @@ def _build_app(role_prefix):
             role_name=roles.reader,
         )
         app = create_realtime_portal_app(
-            build_realtime_portal_repositories(database)
+            build_realtime_portal_repositories(
+                database,
+                advanced_options_v2_enabled=False,
+            )
         )
     except Exception:
         principal_pool.closeall()

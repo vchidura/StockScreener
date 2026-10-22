@@ -15,6 +15,7 @@ from equity.domain import (
 
 from .contracts import AssetClass, MarketChannel
 from .journal import NormalizedJournalRecord
+from .normalizer import MAXIMUM_STOCKS_AM_FINALITY_DEFERRAL
 from .preflight import ProviderTier
 
 
@@ -147,7 +148,11 @@ def adapt_advanced_minute_aggregate(
         raise ValueError("Advanced AM source window is inconsistent")
     bar_start = datetime.fromtimestamp(start_timestamp / 1000, tz=timezone.utc)
     bar_end = datetime.fromtimestamp(end_timestamp / 1000, tz=timezone.utc)
-    if bar_end != record.event_at or record.received_at < bar_end:
+    if (
+        bar_end != record.event_at
+        or bar_end - record.committed_at
+        > MAXIMUM_STOCKS_AM_FINALITY_DEFERRAL
+    ):
         raise ValueError("Advanced AM clocks violate finality")
     if (
         finality.journal_generation != record.journal_generation
@@ -155,6 +160,7 @@ def adapt_advanced_minute_aggregate(
         or finality.normalized_through_offset < record.event_offset
         or finality.event_time_watermark < bar_end
         or not finality.gap_free
+        or finality.proved_at < bar_end
         or finality.proved_at < record.committed_at
     ):
         raise ValueError("Advanced AM finality proof does not cover the normalized event")
@@ -183,7 +189,11 @@ def adapt_advanced_minute_aggregate(
         source_kind=BarSourceKind.REALTIME_STREAM,
         availability_mode=BarAvailabilityMode.LIVE_OBSERVED,
         is_final=True,
-        system_observed_at=max(record.received_at, finality.proved_at),
+        system_observed_at=max(
+            record.received_at,
+            finality.proved_at,
+            bar_end,
+        ),
         replay_available_at=None,
         adjusted=False,
         payload_sha256=record.payload_sha256,

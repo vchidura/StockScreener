@@ -533,7 +533,22 @@ def assemble_advanced_options_marks_cursor(
             or int(row["ask_size"]) <= 0
         ):
             reasons.append("OPTION_NBBO_CROSSED_OR_NONPOSITIVE")
-        if (
+        from .advanced_options_underlying_snapshot import (
+            UnderlyingSnapshotTick,
+        )
+
+        if isinstance(tick, UnderlyingSnapshotTick):
+            if row["event_at"] is not None:
+                try:
+                    tick.require_usable(
+                        plan.cutoff,
+                        row["event_at"],
+                    )
+                except ValueError:
+                    reasons.append(
+                        "UNDERLYING_SNAPSHOT_STALE_OR_NONCAUSAL"
+                    )
+        elif (
             tick is None
             or tick.availability is not RollingAvailability.READY
             or tick.quote is None

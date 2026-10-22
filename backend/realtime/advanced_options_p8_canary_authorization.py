@@ -43,9 +43,14 @@ from .advanced_options_provider_contract import (
 )
 from .advanced_options_reference_producer import REFERENCE_PRODUCER_VERSION
 from .advanced_options_rolling_producer import ROLLING_PRODUCER_VERSION
-from .advanced_options_rolling_producer import (
-    advanced_options_equity_live_head_binding_from_payload,
-    advanced_options_equity_live_head_binding_payload,
+from .advanced_options_underlying_snapshot import (
+    MAXIMUM_PRICE_AGE_SECONDS,
+    PRICE_POLICY_SHA256,
+    PRICE_SOURCE,
+    REQUIRED_TIMEFRAME,
+    UnderlyingSnapshotBinding,
+    underlying_snapshot_binding_from_payload,
+    underlying_snapshot_binding_payload,
 )
 from .advanced_options_service import (
     AdvancedOptionsResidentPolicy,
@@ -56,8 +61,8 @@ from .provider_socket_lease import MASSIVE_OPTIONS_SOCKET_RESOURCE
 from .stage_graph import STAGES_V4, STAGE_CATALOG_VERSION_V4
 
 
-AUTHORIZATION_SCHEMA = "advanced-options-p8-live-canary-authorization-v3"
-LIVE_OBSERVATION_SCHEMA = "advanced-options-p8-live-canary-observation-v1"
+AUTHORIZATION_SCHEMA = "advanced-options-p8-live-canary-authorization-v4"
+LIVE_OBSERVATION_SCHEMA = "advanced-options-p8-live-canary-observation-v2"
 PAGE_RELEASE_OBSERVATION_SCHEMA = (
     "advanced-options-p8-page-release-observation-v2"
 )
@@ -89,6 +94,7 @@ SOURCE_BINDING_PATHS = (
     "backend/realtime/advanced_options_p8_runtime.py",
     "backend/realtime/advanced_options_p8_window.py",
     "backend/realtime/advanced_options_p8_selection_source.py",
+    "backend/realtime/advanced_options_underlying_snapshot.py",
     "backend/realtime/advanced_options_read_pin.py",
     "backend/scripts/prepare_advanced_options_p8_canary_authorization.py",
     "backend/scripts/audit_advanced_options_p8_canary_authorization.py",
@@ -101,6 +107,7 @@ SOURCE_BINDING_PATHS = (
     "backend/realtime/advanced_options_control_plane.py",
     "backend/realtime/advanced_options_service.py",
     "backend/realtime/provider_socket_lease.py",
+    "backend/realtime/normalizer.py",
     "backend/realtime/stage_graph.py",
     "backend/realtime/advanced_options_input.py",
     "backend/realtime/advanced_options_reference_producer.py",
@@ -318,6 +325,7 @@ def _contract_payload(
         "condition_reference_sha256": semantics.pin.payload_sha256,
         "exchange_reference_sha256": exchange.sha256,
         "activity_selection_policy_sha256": selection.sha256,
+        "underlying_price_policy_sha256": PRICE_POLICY_SHA256,
         "flow_policy_sha256": flow.sha256,
         "rolling_policy_sha256": canonical_sha256({
             "producer_version": ROLLING_PRODUCER_VERSION,
@@ -631,29 +639,20 @@ def build_p8_canary_authorization(
                 (start.date() - timedelta(days=1)).isoformat(),
             ],
         },
-        "equity_live_head_binding": {
+        "underlying_price_binding": {
             "required": True,
             "bound_by_live_preflight": True,
-            "provider_tier": "MASSIVE_ADVANCED",
-            "feed": "STOCKS",
-            "required_head_channels": ["Q", "T"],
-            "same_session_required": True,
-            "maximum_observation_age_seconds": 30,
-            "frozen_identity_fields": [
-                "cohort_id",
-                "manifest_id",
-                "manifest_sha256",
-                "ingress_plan_id",
-                "ingress_plan_sha256",
-                "journal_generation",
-                "stream_session_ids",
-                "runtime_profile_sha256",
-                "configuration_sha256",
-                "runtime_policy_sha256",
-                "journal_metadata_sha256",
-                "shard_map_sha256",
-                "committed_offset",
-            ],
+            "source": PRICE_SOURCE,
+            "provider_request_count": 2,
+            "additional_provider_requests": 0,
+            "underlyings": ["QQQ", "SPY"],
+            "required_timeframe": REQUIRED_TIMEFRAME,
+            "maximum_price_age_seconds": MAXIMUM_PRICE_AGE_SECONDS,
+            "policy_sha256": PRICE_POLICY_SHA256,
+            "selection_sha256_bound": True,
+            "source_snapshot_sha256_bound": True,
+            "no_equity_service_required": True,
+            "no_equity_tick_or_bar_fallback": True,
         },
         "owners": {
             "host_socket_lock_count": 1,
@@ -1295,7 +1294,7 @@ def validate_p8_live_observation(
         "selection",
         "advanced_enrollment",
         "history_source",
-        "equity_live_head_binding",
+        "underlying_price_binding",
         "equity_windows",
         "running_peer_owners",
         "retention_dependencies",
@@ -1361,37 +1360,50 @@ def validate_p8_live_observation(
         raise ValueError(
             "retained Developer history binding changed or became executable"
         )
-    equity_live_heads = (
-        advanced_options_equity_live_head_binding_from_payload(
-            observation["equity_live_head_binding"]
-        )
+    binding = _selection_binding(
+        package,
+        observation["selection"],
+        checked_at=checked_at,
     )
+    underlying_prices = underlying_snapshot_binding_from_payload(
+        observation["underlying_price_binding"]
+    )
+    underlying_scope = package["underlying_price_binding"]
+    selected_contracts = {
+        str(row["underlyer"]): str(row["contract_ticker"])
+        for row in observation["selection"]["selected"]
+    }
     if (
-        equity_live_heads.session_date
-        != _timestamp(
-            package["window"]["start_utc"],
-            "window.start_utc",
-        ).date()
-        or equity_live_heads.cohort_id
-        in {
-            UUID(str(package["cohort"]["cohort_id"])),
-            UUID(str(history_scope["source_cohort_id"])),
-        }
-        or not equity_live_heads.observed_at
-        <= checked_at
-        < equity_live_heads.valid_until
-        or (
-            checked_at - equity_live_heads.observed_at
-        ).total_seconds()
-        > int(
-            package["equity_live_head_binding"][
-                "maximum_observation_age_seconds"
-            ]
+        underlying_scope["source"] != PRICE_SOURCE
+        or underlying_scope["required_timeframe"]
+        != REQUIRED_TIMEFRAME
+        or underlying_scope["maximum_price_age_seconds"]
+        != underlying_prices.maximum_price_age_seconds
+        or underlying_scope["policy_sha256"] != PRICE_POLICY_SHA256
+        or underlying_prices.selection_sha256
+        != observation["selection"]["selection_sha256"]
+        or underlying_prices.source_snapshot_sha256
+        != observation["selection"]["source_snapshot_sha256"]
+        or tuple(row.ticker for row in underlying_prices.prices)
+        != tuple(package["cohort"]["underlyings"])
+        or any(
+            row.selected_contract_ticker
+            != selected_contracts.get(row.ticker)
+            for row in underlying_prices.prices
+        )
+        or any(
+            row.session_date
+            != _timestamp(
+                package["window"]["start_utc"],
+                "window.start_utc",
+            ).date()
+            for row in underlying_prices.prices
         )
     ):
         raise ValueError(
-            "Advanced Equity live-head binding is stale or divergent"
+            "P8 underlying snapshot binding is divergent"
         )
+    underlying_prices.require_fresh(checked_at)
     start = _timestamp(package["window"]["start_utc"], "window.start_utc")
     stop = _timestamp(package["window"]["stop_utc"], "window.stop_utc")
     equity_windows = observation["equity_windows"]
@@ -1409,7 +1421,9 @@ def validate_p8_live_observation(
             "equity_window.stop_utc",
         )
         if equity_start < stop and start < equity_stop:
-            raise ValueError("P8 canary overlaps an Equity qualification window")
+            raise ValueError(
+                "P8 canary overlaps an Equity qualification window"
+            )
     owner = observation["owner_authorization"]
     expected_owner_keys = {
         "authorization_reference",
@@ -1445,11 +1459,6 @@ def validate_p8_live_observation(
         or granted_at > checked_at
     ):
         raise ValueError("owner authority is absent, expanded or stale")
-    binding = _selection_binding(
-        package,
-        observation["selection"],
-        checked_at=checked_at,
-    )
     enrollment = observation["advanced_enrollment"]
     expected_enrollment_keys = {
         "enrollment_id",
@@ -1516,9 +1525,9 @@ def validate_p8_live_observation(
         "realized_binding": binding,
         "advanced_enrollment": enrollment,
         "realized_history_binding": history_binding,
-        "realized_equity_live_head_binding": (
-            advanced_options_equity_live_head_binding_payload(
-                equity_live_heads
+        "realized_underlying_price_binding": (
+            underlying_snapshot_binding_payload(
+                underlying_prices
             )
         ),
         "owner_authorities": list(PREPARED_AUTHORITIES),

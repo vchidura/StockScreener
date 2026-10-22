@@ -8,6 +8,7 @@ from realtime.advanced_equity_detector_consumer import (
     AdvancedEquityDetectorSourceRecord,
 )
 from realtime.advanced_equity_s1_s2_shadow import (
+    _uuid_array,
     build_s1_s2_consumer_config,
     s1_s2_evaluator_cursor,
     s1_s2_requirements,
@@ -24,6 +25,14 @@ UTC = timezone.utc
 COHORT = UUID("11111111-1111-1111-1111-111111111111")
 GENERATION = UUID("22222222-2222-2222-2222-222222222222")
 SESSION = UUID("33333333-3333-3333-3333-333333333333")
+
+
+def test_uuid_array_accepts_postgres_text_representation():
+    first = UUID(int=31)
+    second = UUID(int=32)
+
+    assert _uuid_array(f"{{{first},{second}}}") == (first, second)
+    assert _uuid_array((first, second)) == (first, second)
 
 
 def _row(revision):

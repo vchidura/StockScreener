@@ -148,6 +148,10 @@ def snapshot(provider):
     with provider.transaction(APP_ROLE, read_only=True) as unit:
         counts = {}
         for relation in relations:
+            unit.cursor.execute("SELECT to_regclass(%s)", (relation,))
+            if unit.cursor.fetchone()[0] is None:
+                counts[relation] = 0
+                continue
             unit.cursor.execute(f"SELECT count(*) FROM {relation}")
             counts[relation] = int(unit.cursor.fetchone()[0])
         unit.cursor.execute(

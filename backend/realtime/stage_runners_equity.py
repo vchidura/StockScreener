@@ -193,18 +193,25 @@ def input_ready_identity(
             )
             gaps = tuple(cursor.fetchall())
             cursor.execute(
-                "SELECT DISTINCT ON (current.instrument_id, current.interval) "
+                "SELECT DISTINCT ON ("
+                "current.instrument_id,current.interval,"
+                "current.adjustment_basis,current.session_scope"
+                ") "
                 "current.instrument_id, current.interval, revision.bar_revision_id, "
                 "revision.payload_sha256, revision.bar_end, revision.journal_generation, "
-                "revision.stream_session_id, revision.source_offset, revision.source_revision_ids "
+                "revision.stream_session_id, revision.source_offset, revision.source_revision_ids, "
+                "current.adjustment_basis,current.session_scope "
                 "FROM rt.bar_current AS current "
                 "JOIN rt.bar_revisions AS revision ON revision.bar_revision_id=current.bar_revision_id "
                 "AND revision.observed_at=current.observed_at "
                 "WHERE current.cohort_id=%s AND current.provider_tier='MASSIVE_ADVANCED' "
                 "AND current.interval IN ('1m','5m','15m','30m','1h','1d') "
                 "AND revision.bar_end<=%s "
-                "AND revision.created_at<=%s ORDER BY current.instrument_id, current.interval, "
-                "revision.bar_end DESC, revision.observed_at DESC",
+                "AND revision.created_at<=%s "
+                "ORDER BY current.instrument_id,current.interval,"
+                "current.adjustment_basis,current.session_scope,"
+                "revision.bar_end DESC,revision.observed_at DESC,"
+                "revision.bar_revision_id DESC",
                 (str(cohort_id), cutoff, known_by),
             )
             bar_heads = tuple(cursor.fetchall())

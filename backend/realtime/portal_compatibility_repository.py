@@ -217,12 +217,16 @@ class _RealtimeCompatibilityRepository:
         *,
         transaction_configured: bool = False,
         require_read_pin: bool = False,
+        reads_enabled: bool = True,
     ):
         self._cursor_factory = cursor_factory
         self._transaction_configured = transaction_configured
         if type(require_read_pin) is not bool:
             raise TypeError("Options read-pin policy is invalid")
+        if type(reads_enabled) is not bool:
+            raise TypeError("Options stored-read flag is invalid")
         self._require_read_pin = require_read_pin
+        self._reads_enabled = reads_enabled
         self._release_cache = BoundedCache(RELEASE_CACHE_SIZE)
 
     def _cursor(self):
@@ -234,6 +238,8 @@ class _RealtimeCompatibilityRepository:
             cursor.execute("SET LOCAL statement_timeout = '5s'")
 
     def _release(self, cursor, cohort_id) -> ReleaseView | None:
+        if not self._reads_enabled:
+            return None
         if self._require_read_pin:
             release_pin = load_enabled_advanced_options_release_cursor(
                 cursor,

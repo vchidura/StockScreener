@@ -2484,7 +2484,10 @@ def _advanced_api_app(*, api_pool, api_role, clock):
         statement_timeout_ms=60_000,
     )
     database = RealtimeProcessDatabase(plan, provider)
-    repositories = build_realtime_portal_repositories(database)
+    repositories = build_realtime_portal_repositories(
+        database,
+        advanced_options_v2_enabled=True,
+    )
     return create_realtime_portal_app(repositories, clock=lambda: clock)
 
 

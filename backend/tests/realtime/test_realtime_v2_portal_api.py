@@ -9,7 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 from realtime.database_access import RealtimeDatabaseRole
-from scripts.run_realtime_v2_portal_api import V2ApiDatabase
+from scripts.run_realtime_v2_portal_api import (
+    V2ApiDatabase,
+    advanced_options_reads_enabled,
+)
 
 
 class ConcurrentProvider:
@@ -55,3 +58,14 @@ def test_api_database_rejects_invalid_transaction_limits():
             RealtimeDatabaseRole.READER,
             maximum_concurrent_transactions=0,
         )
+
+
+def test_advanced_options_reads_flag_is_explicit_and_fail_closed():
+    assert advanced_options_reads_enabled({}) is False
+    assert advanced_options_reads_enabled({
+        "REALTIME_V2_ADVANCED_OPTIONS_READS": "ENABLED",
+    }) is True
+    with pytest.raises(ValueError, match="DISABLED or ENABLED"):
+        advanced_options_reads_enabled({
+            "REALTIME_V2_ADVANCED_OPTIONS_READS": "true",
+        })

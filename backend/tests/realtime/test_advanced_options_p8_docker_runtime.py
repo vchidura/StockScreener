@@ -923,6 +923,9 @@ def test_production_live_state_uses_the_current_selection_capture():
     live = object.__new__(production._P8ProductionCapture)
     live._provider = Provider()
     live._package = _package()
+    live.underlying_price_binding = SimpleNamespace(
+        valid_until=STOP,
+    )
 
     assert live._live_state(START, capture) == (
         [],

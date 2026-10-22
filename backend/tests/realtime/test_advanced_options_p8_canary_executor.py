@@ -5,6 +5,7 @@ import hashlib
 import os
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -27,9 +28,10 @@ from realtime.advanced_options_service import (
     OPTIONS_NON_SERVING_STAGE_ORDER,
     AdvancedOptionsProcessKind,
 )
-from realtime.advanced_options_rolling_producer import (
-    AdvancedOptionsEquityLiveHeadBinding,
-    advanced_options_equity_live_head_binding_payload,
+from realtime.advanced_options_underlying_snapshot import (
+    UnderlyingSnapshotBinding,
+    UnderlyingSnapshotPrice,
+    underlying_snapshot_binding_payload,
 )
 from realtime.contracts import MarketChannel, UniverseManifest
 from realtime.option_slot_set import (
@@ -44,6 +46,7 @@ from tests.realtime.test_advanced_options_control_plane import (
 from tests.realtime.test_advanced_options_p8_canary_authorization import (
     _observation,
     _page_release_observation,
+    _selection,
 )
 
 
@@ -89,7 +92,7 @@ def _qualification(tmp_path):
     ).hexdigest()
 
 
-def _package(tmp_path):
+def _package(tmp_path, *, stored_reads_prepared=False):
     report, semantic, file_sha = _qualification(tmp_path)
     package = build_p8_canary_authorization(
         report,
@@ -103,6 +106,7 @@ def _package(tmp_path):
         expected_qualification_semantic_sha256=semantic,
         expected_qualification_file_sha256=file_sha,
         source_files=SOURCE_FILES,
+        stored_reads_prepared=stored_reads_prepared,
     )
     return package, report, semantic, file_sha
 
@@ -178,33 +182,45 @@ def _binding(package):
         source_manifest_sha256="7" * 64,
         authorization_reference=package["authorization_reference"],
     )
-    equity_live_heads = AdvancedOptionsEquityLiveHeadBinding(
-        cohort_id=UUID("99999999-2222-3333-4444-555555555555"),
-        manifest_id=UUID("99999999-aaaa-bbbb-cccc-dddddddddddd"),
-        manifest_sha256="8" * 64,
-        ingress_plan_id=UUID("88888888-aaaa-bbbb-cccc-dddddddddddd"),
-        ingress_plan_sha256="9" * 64,
-        journal_generation=UUID(
-            "77777777-aaaa-bbbb-cccc-dddddddddddd"
-        ),
-        stream_session_ids=(
-            UUID("66666666-aaaa-bbbb-cccc-dddddddddddd"),
-        ),
-        runtime_profile_sha256="a" * 64,
-        configuration_sha256="b" * 64,
-        runtime_policy_sha256="c" * 64,
-        journal_metadata_sha256="d" * 64,
-        shard_map_sha256="e" * 64,
-        session_date=START.date(),
-        committed_offset=10,
-        observed_at=CHECKED - timedelta(seconds=5),
+    live_selection = _executor_selection(package)
+    underlying_prices = UnderlyingSnapshotBinding(
+        selection_sha256=live_selection["selection_sha256"],
+        source_snapshot_sha256=live_selection[
+            "source_snapshot_sha256"
+        ],
+        reviewed_at=CHECKED - timedelta(seconds=5),
         valid_until=STOP,
+        prices=tuple(
+            UnderlyingSnapshotPrice(
+                ticker=row["underlyer"],
+                session_date=START.date(),
+                price=(
+                    Decimal("715")
+                    if row["underlyer"] == "QQQ"
+                    else Decimal("770")
+                ),
+                market_time=CHECKED - timedelta(seconds=5),
+                timeframe="REAL-TIME",
+                selected_contract_ticker=row["contract_ticker"],
+                selected_contract_source_sha256=(
+                    "8" * 64
+                    if row["underlyer"] == "QQQ"
+                    else "9" * 64
+                ),
+                underlying_payload_sha256=(
+                    "a" * 64
+                    if row["underlyer"] == "QQQ"
+                    else "b" * 64
+                ),
+            )
+            for row in live_selection["selected"]
+        ),
     )
     return P8CanaryExecutionBinding(
         enrollment,
         history,
         uuid4(),
-        equity_live_heads,
+        underlying_prices,
     )
 
 
@@ -215,36 +231,8 @@ def _enrollment_payload(plan):
     }
 
 
-def _live_observation(package, binding):
-    observation = _observation(package)
-    observation["checked_at_utc"] = CHECKED.isoformat()
-    observation["owner_authorization"]["granted_at_utc"] = (
-        CHECKED - timedelta(seconds=5)
-    ).isoformat()
-    observation["equity_live_head_binding"] = (
-        advanced_options_equity_live_head_binding_payload(
-            binding.equity_live_heads
-        )
-    )
-    control = binding.enrollment.control_plane
-    observation["advanced_enrollment"] = {
-        "enrollment_id": str(binding.enrollment.enrollment_id),
-        "enrollment_sha256": binding.enrollment.enrollment_sha256,
-        "control_plane_plan_id": str(control.plan_id),
-        "control_plane_plan_sha256": control.plan_sha256,
-        "cohort_id": str(control.cohort_id),
-        "cohort_sha256": control.cohort_sha256,
-        "profile_id": str(control.profile_id),
-        "profile_sha256": control.profile_sha256,
-        "manifest_id": str(control.manifest_id),
-        "manifest_sha256": control.manifest_sha256,
-        "slot_set_sha256": control.slot_set_sha256,
-        "selected_contracts": [
-            row.contract_ticker
-            for row in binding.enrollment.activity_selection.contracts
-        ],
-    }
-    selection = observation["selection"]
+def _executor_selection(package):
+    selection = _selection(package)
     selection["source_snapshot_at_utc"] = (
         START - timedelta(minutes=2)
     ).isoformat()
@@ -265,14 +253,65 @@ def _live_observation(package, binding):
     unsigned = dict(selection)
     unsigned.pop("selection_sha256")
     selection["selection_sha256"] = canonical_sha256(unsigned)
+    return selection
+
+
+def _live_observation(
+    package,
+    binding,
+    *,
+    stored_reads_authorized=False,
+):
+    observation = _observation(package)
+    observation["checked_at_utc"] = CHECKED.isoformat()
+    observation["owner_authorization"]["granted_at_utc"] = (
+        CHECKED - timedelta(seconds=5)
+    ).isoformat()
+    observation["owner_authorization"]["stored_reads"] = (
+        stored_reads_authorized
+    )
+    observation["underlying_price_binding"] = (
+        underlying_snapshot_binding_payload(
+            binding.underlying_price_binding
+        )
+    )
+    control = binding.enrollment.control_plane
+    observation["advanced_enrollment"] = {
+        "enrollment_id": str(binding.enrollment.enrollment_id),
+        "enrollment_sha256": binding.enrollment.enrollment_sha256,
+        "control_plane_plan_id": str(control.plan_id),
+        "control_plane_plan_sha256": control.plan_sha256,
+        "cohort_id": str(control.cohort_id),
+        "cohort_sha256": control.cohort_sha256,
+        "profile_id": str(control.profile_id),
+        "profile_sha256": control.profile_sha256,
+        "manifest_id": str(control.manifest_id),
+        "manifest_sha256": control.manifest_sha256,
+        "slot_set_sha256": control.slot_set_sha256,
+        "selected_contracts": [
+            row.contract_ticker
+            for row in binding.enrollment.activity_selection.contracts
+        ],
+    }
+    observation["selection"] = _executor_selection(package)
     return observation
 
 
 class FakeLifecyclePort:
-    def __init__(self, package, binding):
+    def __init__(
+        self,
+        package,
+        binding,
+        *,
+        stored_reads_authorized=False,
+    ):
         self.package = package
         self.binding = binding
-        self.observation = _live_observation(package, binding)
+        self.observation = _live_observation(
+            package,
+            binding,
+            stored_reads_authorized=stored_reads_authorized,
+        )
         self.enrollments = 0
         self.starts = 0
         self.stops = 0
@@ -280,6 +319,9 @@ class FakeLifecyclePort:
         self.publications = 0
         self.rollbacks = 0
         self.cleanups = 0
+        self.stored_read_enables = 0
+        self.stored_read_disables = 0
+        self.stored_reads_enabled = False
 
     def capture_binding(self, package, *, checked_at):
         assert package is self.package
@@ -325,11 +367,23 @@ class FakeLifecyclePort:
         return observation
 
     def enable_stored_reads(self, binding, publication):
-        raise AssertionError("stored reads were not authorized")
+        assert binding is self.binding
+        self.stored_read_enables += 1
+        self.stored_reads_enabled = True
+        return {
+            "cohort_id": str(
+                binding.enrollment.control_plane.cohort_id
+            ),
+            "release_id": publication["release_id"],
+            "verified": True,
+        }
 
     def rollback(self, binding, publication):
         assert binding is self.binding
         self.rollbacks += 1
+        if self.stored_reads_enabled:
+            self.stored_read_disables += 1
+            self.stored_reads_enabled = False
 
     def stop_residents(self, binding):
         assert binding is self.binding
@@ -492,6 +546,136 @@ def test_release_failure_rolls_back_stops_and_consumes_package(
             )
         assert port.rollbacks == port.stops == port.cleanups == 1
         assert not _lock_path(package).exists()
+        receipt = json.loads(
+            _receipt_path(package).read_text(encoding="utf-8")
+        )
+        assert receipt["state"] == "CONSUMED_ROLLED_BACK"
+    finally:
+        _dispose(package)
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected"),
+    (
+        (
+            "AFTER_LIVE_BINDING",
+            (0, 0, 0, 0),
+        ),
+        (
+            "AFTER_ENROLLMENT",
+            (1, 0, 0, 0),
+        ),
+        (
+            "AFTER_RESIDENT_START",
+            (1, 1, 0, 0),
+        ),
+        (
+            "AFTER_STAGES",
+            (1, 1, 1, 0),
+        ),
+        (
+            "AFTER_PUBLICATION",
+            (1, 1, 1, 1),
+        ),
+    ),
+)
+def test_each_executor_failure_boundary_rolls_back_and_cleans(
+    tmp_path,
+    monkeypatch,
+    phase,
+    expected,
+):
+    package, report, semantic, file_sha = _package(tmp_path)
+    binding = _binding(package)
+    port = FakeLifecyclePort(package, binding)
+    monkeypatch.setattr(
+        executor_module,
+        "advanced_options_enrollment_plan_payload",
+        _enrollment_payload,
+    )
+    executor = _executor(
+        package,
+        report,
+        semantic,
+        file_sha,
+        port,
+    )
+    try:
+        with pytest.raises(
+            P8CanaryExecutionError,
+            match="EXECUTION_FAILED",
+        ):
+            executor.execute(
+                package,
+                checked_at=CHECKED,
+                fault=lambda current: (
+                    (_ for _ in ()).throw(RuntimeError(phase))
+                    if current == phase
+                    else None
+                ),
+            )
+        assert (
+            port.enrollments,
+            port.starts,
+            port.stage_runs,
+            port.publications,
+        ) == expected
+        assert port.rollbacks == port.cleanups == 1
+        assert port.stops == int(port.starts > 0)
+        assert not _lock_path(package).exists()
+        receipt = json.loads(
+            _receipt_path(package).read_text(encoding="utf-8")
+        )
+        assert receipt["state"] == "CONSUMED_ROLLED_BACK"
+    finally:
+        _dispose(package)
+
+
+def test_failure_after_stored_read_activation_disables_exact_pin(
+    tmp_path,
+    monkeypatch,
+):
+    package, report, semantic, file_sha = _package(
+        tmp_path,
+        stored_reads_prepared=True,
+    )
+    binding = _binding(package)
+    port = FakeLifecyclePort(
+        package,
+        binding,
+        stored_reads_authorized=True,
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "advanced_options_enrollment_plan_payload",
+        _enrollment_payload,
+    )
+    executor = _executor(
+        package,
+        report,
+        semantic,
+        file_sha,
+        port,
+    )
+    try:
+        with pytest.raises(
+            P8CanaryExecutionError,
+            match="EXECUTION_FAILED",
+        ):
+            executor.execute(
+                package,
+                checked_at=CHECKED,
+                stored_reads_authorized=True,
+                fault=lambda phase: (
+                    (_ for _ in ()).throw(RuntimeError(phase))
+                    if phase == "AFTER_STORED_READS"
+                    else None
+                ),
+            )
+        assert port.stored_read_enables == 1
+        assert port.stored_read_disables == 1
+        assert port.stored_reads_enabled is False
+        assert port.rollbacks == port.stops == port.cleanups == 1
         receipt = json.loads(
             _receipt_path(package).read_text(encoding="utf-8")
         )

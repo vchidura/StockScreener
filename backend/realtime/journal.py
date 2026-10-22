@@ -165,8 +165,11 @@ def journal_files_sha256(path: str | Path) -> str:
         candidate = Path(str(journal) + suffix)
         if not candidate.is_file():
             continue
+        size = candidate.stat().st_size
+        if suffix == "-wal" and size == 0:
+            continue
         digest.update(suffix.encode("ascii"))
-        digest.update(candidate.stat().st_size.to_bytes(8, "big"))
+        digest.update(size.to_bytes(8, "big"))
         with candidate.open("rb") as handle:
             while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)

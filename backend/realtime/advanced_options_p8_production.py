@@ -41,10 +41,11 @@ from .advanced_options_p8_selection_source import (
 from .advanced_options_read_pin import (
     PostgresAdvancedOptionsStoredReadPort,
 )
-from .advanced_options_rolling_producer import (
-    AdvancedOptionsEquityLiveHeadBinding,
-    advanced_options_equity_live_head_binding_from_payload,
-    advanced_options_equity_live_head_binding_payload,
+from .advanced_options_underlying_snapshot import (
+    UnderlyingSnapshotBinding,
+    binding_from_selection_capture,
+    underlying_snapshot_binding_from_payload,
+    underlying_snapshot_binding_payload,
 )
 from .advanced_options_service import OPTIONS_NON_SERVING_STAGE_ORDER
 from .advanced_options_projection import (
@@ -92,7 +93,7 @@ from .worker_database import RealtimeProcessDatabase
 
 UTC = timezone.utc
 BUILD_ID = "advanced-options-p8-live-canary-v1"
-P8_PRODUCTION_BINDING_SCHEMA = "advanced-options-p8-production-binding-v1"
+P8_PRODUCTION_BINDING_SCHEMA = "advanced-options-p8-production-binding-v2"
 
 
 def _open_interest_sha256(selected) -> str:
@@ -131,10 +132,23 @@ def _p8_manifest_policy() -> BoundedOptionManifestPolicy:
     )
 
 
-def _cycle_cutoff(capture, checked_at: datetime, stop: datetime) -> datetime:
+def _cycle_cutoff(
+    capture,
+    checked_at: datetime,
+    stop: datetime,
+    underlying_valid_until: datetime | None = None,
+) -> datetime:
     cutoff = min(
         capture.selection.valid_until,
         stop - timedelta(minutes=1),
+        *(
+            ()
+            if underlying_valid_until is None
+            else (
+                underlying_valid_until
+                - timedelta(microseconds=1),
+            )
+        ),
     )
     if cutoff <= checked_at:
         raise RuntimeError("P8 canonical cycle cutoff is not prospective")
@@ -453,9 +467,9 @@ def _production_binding_payload(
             "authorized_plan_id": str(control.plan_id),
         },
         "selection": option_activity_selection_payload(selection),
-        "equity_live_head_binding": (
-            advanced_options_equity_live_head_binding_payload(
-                binding.equity_live_heads
+        "underlying_price_binding": (
+            underlying_snapshot_binding_payload(
+                binding.underlying_price_binding
             )
         ),
     }
@@ -665,8 +679,8 @@ def p8_production_binding_from_payload(value):
             authorization_reference=control.options_authorization_reference,
         ),
         UUID(value["window_id"]),
-        advanced_options_equity_live_head_binding_from_payload(
-            value["equity_live_head_binding"]
+        underlying_snapshot_binding_from_payload(
+            value["underlying_price_binding"]
         ),
     )
 
@@ -751,6 +765,7 @@ class _P8ProductionCapture:
         self.cycle_cutoff: datetime | None = None
         self.production_binding_payload: Mapping[str, object] | None = None
         self.selection_capture = None
+        self.underlying_price_binding: UnderlyingSnapshotBinding | None = None
 
     def _catalog(self, capture, checked_at):
         tickers = list(capture.selection.contracts)
@@ -898,7 +913,14 @@ class _P8ProductionCapture:
         package = self._package
         start = datetime.fromisoformat(str(package["window"]["start_utc"]))
         stop = datetime.fromisoformat(str(package["window"]["stop_utc"]))
-        _cycle_cutoff(capture, checked_at, stop)
+        if self.underlying_price_binding is None:
+            raise RuntimeError("P8 underlying snapshot binding is unavailable")
+        _cycle_cutoff(
+            capture,
+            checked_at,
+            stop,
+            self.underlying_price_binding.valid_until,
+        )
         resources = [
             str(row["lease_resource_key"])
             for row in package["owners"]["processes"]
@@ -965,170 +987,20 @@ class _P8ProductionCapture:
             ]
         return peers, releases, pointers, windows, retention, read_pins
 
-    def _equity_live_heads(self, checked_at, enrollment):
-        required_tickers = tuple(
-            enrollment.control_plane.universe.option_underlyings
-        )
-        with self._provider.transaction(
-            APP_ROLE,
-            read_only=True,
-            dict_cursor=True,
-            isolation_level="REPEATABLE READ",
-        ) as unit:
-            cursor = unit.cursor
-            cursor.execute(
-                "SELECT ingress.plan_id::text,ingress.plan_sha256,"
-                "ingress.cohort_id::text,ingress.manifest_id::text,"
-                "manifest.manifest_sha256,ingress.session_date,"
-                "ingress.runtime_profile_sha256,"
-                "ingress.configuration_sha256,"
-                "ingress.runtime_policy_sha256,"
-                "ingress.authorized_end_at,"
-                "registry.journal_generation::text,"
-                "registry.stream_session_id::text,"
-                "registry.metadata_sha256,registry.shard_map_sha256,"
-                "registry.bridge_committed_offset,registry.status,"
-                "session.heartbeat_at "
-                "FROM rt.advanced_ingress_plans AS ingress "
-                "JOIN rt.advanced_ingress_runtime_profiles AS profile "
-                "ON profile.runtime_profile_sha256="
-                "ingress.runtime_profile_sha256 "
-                "JOIN rt.subscription_manifests AS manifest "
-                "ON manifest.manifest_id=ingress.manifest_id "
-                "JOIN rt.advanced_journal_registry AS registry "
-                "ON registry.plan_id=ingress.plan_id "
-                "JOIN rt.stream_sessions AS session "
-                "ON session.session_id=registry.stream_session_id "
-                "AND session.journal_generation="
-                "registry.journal_generation "
-                "WHERE ingress.session_date=%s "
-                "AND ingress.status='ACTIVE' "
-                "AND ingress.authorized_start_at<=%s "
-                "AND ingress.authorized_end_at>%s "
-                "AND profile.feed='STOCKS' "
-                "AND profile.channels=ARRAY['AM']::text[] "
-                "AND profile.status='ACTIVE' "
-                "AND registry.status IN ('WRITING','DRAINING','DRAINED') "
-                "AND registry.bridge_committed_offset>0 "
-                "ORDER BY session.heartbeat_at DESC LIMIT 2",
-                (checked_at.date(), checked_at, checked_at),
-            )
-            candidates = tuple(cursor.fetchall())
-            if len(candidates) != 1:
-                raise RuntimeError(
-                    "P8 Advanced Equity live-head binding is absent or ambiguous"
-                )
-            source = candidates[0]
-            stale_after = int(
-                self._package["owners"]["resident_policy"][
-                    "stale_after_seconds"
-                ]
-            )
-            if (
-                source["heartbeat_at"] is None
-                or checked_at - source["heartbeat_at"]
-                > timedelta(seconds=stale_after)
-            ):
-                raise RuntimeError(
-                    "P8 Advanced Equity live-head binding is stale"
-                )
-            cursor.execute(
-                "SELECT revision.ticker,instrument.instrument_id "
-                "FROM rt.subscription_members AS member "
-                "JOIN rt.instruments AS instrument "
-                "ON instrument.instrument_id=member.instrument_id "
-                "JOIN LATERAL (SELECT ticker "
-                "FROM ref.security_revisions AS own "
-                "WHERE own.security_id=instrument.security_id "
-                "AND own.effective_from<=%s "
-                "AND (own.effective_to IS NULL OR own.effective_to>%s) "
-                "AND own.observed_at<=%s "
-                "ORDER BY own.effective_from DESC,own.observed_at DESC "
-                "LIMIT 1) AS revision ON true "
-                "WHERE member.manifest_id=%s AND member.channel='AM' "
-                "AND revision.ticker=ANY(%s) ORDER BY revision.ticker",
-                (
-                    checked_at,
-                    checked_at,
-                    checked_at,
-                    source["manifest_id"],
-                    list(required_tickers),
-                ),
-            )
-            members = tuple(cursor.fetchall())
-            if tuple(row["ticker"] for row in members) != required_tickers:
-                raise RuntimeError(
-                    "P8 Advanced Equity live-head membership changed"
-                )
-            instrument_ids = [int(row["instrument_id"]) for row in members]
-            cursor.execute(
-                "SELECT 'Q' AS kind,instrument_id,"
-                "journal_generation::text,session_id::text,"
-                "source_session,source_offset,event_at,received_at "
-                "FROM rt.quote_current WHERE provider='massive' "
-                "AND instrument_id=ANY(%s) UNION ALL "
-                "SELECT 'T',instrument_id,journal_generation::text,"
-                "session_id::text,source_session,source_offset,event_at,"
-                "received_at FROM rt.trade_current WHERE provider='massive' "
-                "AND instrument_id=ANY(%s) ORDER BY kind,instrument_id",
-                (instrument_ids, instrument_ids),
-            )
-            heads = tuple(cursor.fetchall())
-        expected = {
-            (kind, instrument_id)
-            for kind in ("Q", "T")
-            for instrument_id in instrument_ids
-        }
-        if {
-            (str(row["kind"]), int(row["instrument_id"]))
-            for row in heads
-        } != expected:
-            raise RuntimeError(
-                "P8 Advanced Equity live Q/T heads are incomplete"
-            )
-        for row in heads:
-            if (
-                str(row["journal_generation"])
-                != str(source["journal_generation"])
-                or str(row["session_id"]) != str(
-                    source["stream_session_id"]
-                )
-                or row["source_session"] != source["session_date"]
-                or int(row["source_offset"])
-                > int(source["bridge_committed_offset"])
-                or row["event_at"] > source["heartbeat_at"]
-                or row["received_at"] > source["heartbeat_at"]
-            ):
-                raise RuntimeError(
-                    "P8 Advanced Equity live Q/T identity diverged"
-                )
-        return AdvancedOptionsEquityLiveHeadBinding(
-            cohort_id=UUID(str(source["cohort_id"])),
-            manifest_id=UUID(str(source["manifest_id"])),
-            manifest_sha256=str(source["manifest_sha256"]),
-            ingress_plan_id=UUID(str(source["plan_id"])),
-            ingress_plan_sha256=str(source["plan_sha256"]),
-            journal_generation=UUID(str(source["journal_generation"])),
-            stream_session_ids=(
-                UUID(str(source["stream_session_id"])),
-            ),
-            runtime_profile_sha256=str(
-                source["runtime_profile_sha256"]
-            ),
-            configuration_sha256=str(source["configuration_sha256"]),
-            runtime_policy_sha256=str(source["runtime_policy_sha256"]),
-            journal_metadata_sha256=str(source["metadata_sha256"]),
-            shard_map_sha256=str(source["shard_map_sha256"]),
-            session_date=source["session_date"],
-            committed_offset=int(source["bridge_committed_offset"]),
-            observed_at=source["heartbeat_at"],
-            valid_until=source["authorized_end_at"],
-        )
-
     def _binding(self, capture, checked_at, history_manifest):
         package = self._package
         stop = datetime.fromisoformat(str(package["window"]["stop_utc"]))
-        cycle_cutoff = _cycle_cutoff(capture, checked_at, stop)
+        underlying_price_binding = binding_from_selection_capture(capture)
+        checked_at = max(
+            checked_at,
+            underlying_price_binding.reviewed_at,
+        )
+        cycle_cutoff = _cycle_cutoff(
+            capture,
+            checked_at,
+            stop,
+            underlying_price_binding.valid_until,
+        )
         contracts = self._catalog(capture, checked_at)
         selection = OptionActivitySelectionRecord(
             authorization_reference=package["authorization_reference"],
@@ -1277,15 +1149,12 @@ class _P8ProductionCapture:
             NAMESPACE_URL,
             f"p8-window:{package['package_nonce']}:{cycle_cutoff.isoformat()}",
         )
-        equity_live_heads = self._equity_live_heads(
-            checked_at,
-            enrollment,
-        )
+        self.underlying_price_binding = underlying_price_binding
         binding = P8CanaryExecutionBinding(
             enrollment,
             history,
             window_id,
-            equity_live_heads,
+            underlying_price_binding,
         )
         self.production_binding_payload = _production_binding_payload(
             package=package,
@@ -1323,6 +1192,7 @@ class _P8ProductionCapture:
         self.selection_capture = capture
         history_manifest = self._history_manifest()
         binding = self._binding(capture, captured_at, history_manifest)
+        captured_at = binding.underlying_price_binding.reviewed_at
         (
             peers,
             releases,
@@ -1367,9 +1237,9 @@ class _P8ProductionCapture:
                     "required_sessions"
                 ],
             },
-            "equity_live_head_binding": (
-                advanced_options_equity_live_head_binding_payload(
-                    binding.equity_live_heads
+            "underlying_price_binding": (
+                underlying_snapshot_binding_payload(
+                    binding.underlying_price_binding
                 )
             ),
             "equity_windows": windows,

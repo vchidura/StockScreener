@@ -37,8 +37,8 @@ from .advanced_options_service import (
     AdvancedOptionsResidentLauncher,
     build_owp3_advanced_options_resident_plan,
 )
-from .advanced_options_rolling_producer import (
-    advanced_options_equity_live_head_binding_payload,
+from .advanced_options_underlying_snapshot import (
+    underlying_snapshot_binding_payload,
 )
 from .portal_projection_repository import PortalReleasePointer
 from .portal_publisher import (
@@ -52,7 +52,7 @@ from .worker_database import RealtimeProcessDatabase
 
 
 UTC = timezone.utc
-P8_EXECUTION_BUNDLE_SCHEMA = "advanced-options-p8-execution-bundle-v1"
+P8_EXECUTION_BUNDLE_SCHEMA = "advanced-options-p8-execution-bundle-v2"
 P8_EXECUTION_BUNDLE_MAX_BYTES = 1_048_576
 P8_HEARTBEAT_INTERVAL_SECONDS = 10
 P8_EFFECT_DENIALS = {
@@ -214,9 +214,9 @@ class P8ExecutionBundleStore:
             "history_binding": advanced_options_history_binding_payload(
                 binding.history
             ),
-            "equity_live_head_binding": (
-                advanced_options_equity_live_head_binding_payload(
-                    binding.equity_live_heads
+            "underlying_price_binding": (
+                underlying_snapshot_binding_payload(
+                    binding.underlying_price_binding
                 )
             ),
             "production_binding": (

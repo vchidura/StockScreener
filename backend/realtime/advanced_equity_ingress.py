@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -112,6 +113,10 @@ class AdvancedJournalPump:
         maximum_batch_messages: int,
         maximum_batch_bytes: int,
         on_progress: Callable[[AdvancedJournalProgress], None] | None = None,
+        utc_clock: Callable[[], datetime] = (
+            lambda: datetime.now(timezone.utc)
+        ),
+        wait: Callable[[float], None] = time.sleep,
     ) -> None:
         expected_channels = {
             MarketFeed.STOCKS: frozenset({
@@ -139,6 +144,8 @@ class AdvancedJournalPump:
             or maximum_batch_messages <= 0
             or type(maximum_batch_bytes) is not int
             or maximum_batch_bytes <= 0
+            or not callable(utc_clock)
+            or not callable(wait)
         ):
             raise ValueError("Advanced journal pump bounds are invalid")
         self.buffer = buffer
@@ -151,6 +158,8 @@ class AdvancedJournalPump:
         self.maximum_batch_messages = maximum_batch_messages
         self.maximum_batch_bytes = maximum_batch_bytes
         self.on_progress = on_progress
+        self.utc_clock = utc_clock
+        self.wait = wait
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._error: BaseException | None = None
@@ -258,10 +267,26 @@ class AdvancedJournalPump:
                             raise AdvancedJournalDecodeError(
                                 "ADVANCED_FEED_SCOPE_MISMATCH"
                             )
-                        batch = normalize_raw_message(
-                            raw,
-                            self.admissions,
-                        )
+                        while True:
+                            observed_at = self.utc_clock()
+                            batch = normalize_raw_message(
+                                raw,
+                                self.admissions,
+                                finality_observed_at=observed_at,
+                            )
+                            pending = tuple(
+                                event.event_at
+                                for event in batch.events
+                                if "AM_FINALITY_PENDING"
+                                in event.reason_codes
+                            )
+                            if not pending:
+                                break
+                            delay = (
+                                max(pending) - observed_at
+                            ).total_seconds()
+                            if delay > 0:
+                                self.wait(delay)
                         if batch.quarantines:
                             raise AdvancedJournalDecodeError(
                                 (
@@ -323,6 +348,10 @@ class AdvancedEquityJournalPump(AdvancedJournalPump):
         maximum_batch_messages: int,
         maximum_batch_bytes: int,
         on_progress: Callable[[AdvancedJournalProgress], None] | None = None,
+        utc_clock: Callable[[], datetime] = (
+            lambda: datetime.now(timezone.utc)
+        ),
+        wait: Callable[[float], None] = time.sleep,
     ) -> None:
         super().__init__(
             buffer,
@@ -334,4 +363,6 @@ class AdvancedEquityJournalPump(AdvancedJournalPump):
             maximum_batch_messages=maximum_batch_messages,
             maximum_batch_bytes=maximum_batch_bytes,
             on_progress=on_progress,
+            utc_clock=utc_clock,
+            wait=wait,
         )

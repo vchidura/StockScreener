@@ -12,6 +12,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid5, NAMESPACE_URL
 
 from dotenv import load_dotenv
@@ -57,6 +58,7 @@ from realtime.equity_worker_service import (  # noqa: E402
     EquityWorkerConfig,
 )
 from realtime.equity_recent_repair import AuthorizedNativeRepairTransport  # noqa: E402
+from realtime.equity_validation_source import EquityValidationIdentity  # noqa: E402
 from realtime.incremental_acquisition import (  # noqa: E402
     IncrementalCoveragePending,
     IncrementalEquitySource,
@@ -78,8 +80,11 @@ from realtime.stage_runners_ingest import (  # noqa: E402
     EquityAcquisitionRequest,
     acquire_equity_bars,
 )
+from realtime.ticker_projection import _security  # noqa: E402
 from scripts.realtime_script_support import PacedPolygonTransport, write_report  # noqa: E402
-from scripts.run_realtime_v2_developer_window import _load_scope  # noqa: E402
+from scripts.run_realtime_v2_developer_window import (  # noqa: E402
+    _load_scope as _load_developer_scope,
+)
 
 
 DEVELOPER_PROVIDER_DELAY_SECONDS = 900
@@ -242,6 +247,88 @@ def _scope(args):
     )
 
 
+def _load_advanced_scope(provider, cohort_id, cutoff):
+    with provider.transaction(read_only=True, dict_cursor=True) as unit:
+        cursor = unit.cursor
+        cursor.execute(
+            "SELECT DISTINCT ON (member.instrument_id) revision.*,"
+            "revision.revision_id AS security_revision_id,"
+            "instrument.instrument_id "
+            "FROM rt.cohorts AS cohort "
+            "JOIN rt.subscription_members AS member USING(manifest_id) "
+            "JOIN rt.instruments AS instrument USING(instrument_id) "
+            "JOIN ref.security_revisions AS revision "
+            "ON revision.security_id=instrument.security_id "
+            "WHERE cohort.cohort_id=%s AND member.channel='AM' "
+            "AND instrument.asset_class='EQUITY' AND revision.active "
+            "AND revision.effective_from<=%s "
+            "AND (revision.effective_to IS NULL OR revision.effective_to>%s) "
+            "AND revision.observed_at<=%s "
+            "ORDER BY member.instrument_id,revision.observed_at DESC,"
+            "revision.revision_id DESC",
+            (str(cohort_id), cutoff, cutoff, cutoff),
+        )
+        rows = tuple(cursor.fetchall())
+        cursor.execute(
+            "SELECT cohort.manifest_id,"
+            "count(*) AS member_count,"
+            "count(DISTINCT member.instrument_id) "
+            "AS distinct_member_count "
+            "FROM rt.cohorts AS cohort "
+            "JOIN rt.subscription_members AS member USING(manifest_id) "
+            "WHERE cohort.cohort_id=%s AND member.channel='AM' "
+            "GROUP BY cohort.manifest_id",
+            (str(cohort_id),),
+        )
+        membership = cursor.fetchone()
+    if (
+        membership is None
+        or not rows
+        or len(rows) != int(membership["member_count"])
+        or int(membership["member_count"])
+        != int(membership["distinct_member_count"])
+    ):
+        raise ValueError(
+            "Advanced incremental repair has incomplete cohort-local identities"
+        )
+    identities = tuple(
+        EquityValidationIdentity(
+            row["ticker"],
+            _security(row),
+            row["instrument_id"],
+        )
+        for row in rows
+    )
+    return identities, SimpleNamespace(
+        manifest_id=membership["manifest_id"]
+    )
+
+
+def _load_incremental_scope(provider, args, cutoff):
+    loader = (
+        _load_advanced_scope
+        if args.advanced_ingress_plan_id is not None
+        else _load_developer_scope
+    )
+    return loader(provider, args.cohort_id, cutoff)
+
+
+def _advanced_repair_revision(revision, cohort_id):
+    return replace(
+        revision,
+        bar_revision_id=uuid5(
+            NAMESPACE_URL,
+            "v2-advanced-hybrid-rest:"
+            f"{cohort_id}:{revision.bar_revision_id}",
+        ),
+        source_kind=BarSourceKind.NATIVE_REST,
+        quality_codes=tuple(dict.fromkeys((
+            *revision.quality_codes,
+            "EXPLICIT_ADVANCED_REST_REPAIR_V1",
+        ))),
+    )
+
+
 def _plan(provider, args, now):
     rows = []
     for interval in args.intervals:
@@ -260,7 +347,11 @@ def _plan(provider, args, now):
         if cutoff is None:
             rows.append({"interval": interval, "cutoff": None, "requests": ()})
             continue
-        identities, _ = _load_scope(provider, args.cohort_id, cutoff)
+        identities, _ = _load_incremental_scope(
+            provider,
+            args,
+            cutoff,
+        )
         with provider.transaction(APP_ROLE, read_only=True) as unit:
             requests = plan_incremental_requests_cursor(
                 unit.cursor,
@@ -508,13 +599,9 @@ def _execute_advanced_cycle(
                 )
             latest = {}
             for fact in batch.facts:
-                revision = replace(
+                revision = _advanced_repair_revision(
                     fact.revision,
-                    source_kind=BarSourceKind.NATIVE_REST,
-                    quality_codes=tuple(dict.fromkeys((
-                        *fact.revision.quality_codes,
-                        "EXPLICIT_ADVANCED_REST_REPAIR_V1",
-                    ))),
+                    args.cohort_id,
                 )
                 facts.append(RealtimeEquityBarFact(
                     args.cohort_id,

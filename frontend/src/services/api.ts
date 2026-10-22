@@ -25,6 +25,13 @@ export const tickerParams = (params?: Record<string, ApiQueryValue>, snapshotId?
   return { ...params, cohort_id, ...(snapshotId !== undefined ? { snapshot_id: snapshotId } : {}) }
 }
 
+const requireRealtimeOptionsReads = () => {
+  if (
+    import.meta.env.VITE_REALTIME_ONLY === 'true'
+    && import.meta.env.VITE_REALTIME_OPTIONS_V2 !== 'true'
+  ) throw new Error('Advanced Options stored reads require VITE_REALTIME_OPTIONS_V2=true')
+}
+
 export const retainedTickerParams = (params?: Record<string, ApiQueryValue>, snapshotId?: string, closingView = false) =>
   tickerParams(import.meta.env.VITE_REALTIME_ONLY === 'true'
     ? { ...params, read_mode: closingView ? 'session_close' : 'retained' } : params, snapshotId)
@@ -2474,7 +2481,10 @@ export interface OptionDetectorDatasets {
   configured_effective_from: string | null
 }
 
-export const getOptionDetectorDatasets = async (): Promise<OptionsEnvelope<OptionDetectorDatasets>> => (await api.get('/options/alerts/datasets', { params: tickerParams() })).data
+export const getOptionDetectorDatasets = async (): Promise<OptionsEnvelope<OptionDetectorDatasets>> => {
+  requireRealtimeOptionsReads()
+  return (await api.get('/options/alerts/datasets', { params: tickerParams() })).data
+}
 
 export interface OptionAlertSchedule {
   dataset_id: string
@@ -2494,7 +2504,10 @@ export interface OptionAlertSchedule {
   dataset_timing: 'EXPECTED_CHECK_WINDOW_NOT_COMPLETION_DEADLINE'
 }
 
-export const getOptionAlertSchedule = async (): Promise<OptionsEnvelope<OptionAlertSchedule>> => (await api.get('/options/alerts/schedule', { params: tickerParams() })).data
+export const getOptionAlertSchedule = async (): Promise<OptionsEnvelope<OptionAlertSchedule>> => {
+  requireRealtimeOptionsReads()
+  return (await api.get('/options/alerts/schedule', { params: tickerParams() })).data
+}
 
 export interface OptionAlertOriginalPackage {
   status: 'AVAILABLE' | 'UNAVAILABLE'
@@ -2647,7 +2660,10 @@ export const getOptionDetectorEvaluations = async (params: {
   session_date?: string; dataset_id?: string; detector?: OptionDetectorId;
   underlyer?: string; sort_by?: OptionDetectorSort; sort_order?: 'asc' | 'desc';
   selection_status?: 'SELECTED' | 'NOT_SELECTED' | 'REPEAT' | 'OBSERVATION'; limit?: number; offset?: number;
-}): Promise<OptionsEnvelope<OptionDetectorEvaluationReview>> => (await api.get('/options/alerts/evaluations', { params: tickerParams(params) })).data
+}): Promise<OptionsEnvelope<OptionDetectorEvaluationReview>> => {
+  requireRealtimeOptionsReads()
+  return (await api.get('/options/alerts/evaluations', { params: tickerParams(params) })).data
+}
 
 export interface OptionCurrentMark {
   status: 'FRESH' | 'STALE' | 'UNAVAILABLE'
@@ -2715,7 +2731,10 @@ export const getOptionDetectorAlerts = async (params: {
   session_rollup?: boolean;
   underlyer?: string; sort_by?: OptionDetectorSort; sort_order?: 'asc' | 'desc';
   detector?: OptionDetectorId; limit?: number; offset?: number;
-}): Promise<OptionsEnvelope<OptionDetectorAlertReview>> => (await api.get('/options/alerts/detector-runs', { params: tickerParams(params) })).data
+}): Promise<OptionsEnvelope<OptionDetectorAlertReview>> => {
+  requireRealtimeOptionsReads()
+  return (await api.get('/options/alerts/detector-runs', { params: tickerParams(params) })).data
+}
 
 export interface OptionDiscoveryCatalog {
   version: string
@@ -3052,6 +3071,7 @@ export const getOptionFlow = async (
   underlyer?: string,
   sessionDate?: string,
 ): Promise<OptionsEnvelope<OptionFlowData>> => {
+  requireRealtimeOptionsReads()
   const response = await api.get('/options/flow', { params: tickerParams({ underlyer, session_date: sessionDate }) })
   return response.data
 }
@@ -3078,11 +3098,13 @@ export const getOptionCandidates = async (params?: {
 }
 
 export const getOptionDiscoveryCatalog = async (): Promise<OptionDiscoveryCatalog> => {
+  requireRealtimeOptionsReads()
   const response = await api.get('/options/discovery-catalog', { params: tickerParams() })
   return response.data
 }
 
 export const queryEligibleChain = async (request: EligibleChainRequest): Promise<OptionsEnvelope<EligibleChainData>> => {
+  requireRealtimeOptionsReads()
   const response = await api.post('/options/eligible-chain/query', request, { params: tickerParams() })
   return response.data
 }
@@ -3090,6 +3112,7 @@ export const queryEligibleChain = async (request: EligibleChainRequest): Promise
 export const getOptionCandidate = async (
   candidateId: string,
 ): Promise<OptionsEnvelope<OptionCandidateDetailData>> => {
+  requireRealtimeOptionsReads()
   const response = await api.get(`/options/candidates/${candidateId}`, { params: tickerParams() })
   return response.data
 }
@@ -3097,6 +3120,7 @@ export const getOptionCandidate = async (
 export const getOptionCurrentAdvancedQuotes = async (
   contractIds: number[],
 ): Promise<OptionsEnvelope<OptionCurrentAdvancedQuotesData>> => {
+  requireRealtimeOptionsReads()
   const response = await api.get('/options/quotes/current', { params: tickerParams({ contract_id: contractIds }) })
   return response.data
 }
@@ -3145,6 +3169,7 @@ export interface OptionAlertPreviewData {
 }
 
 export const previewOptionAlert = async (candidateId: string, request: OptionAlertPreviewRequest = {}): Promise<OptionsEnvelope<OptionAlertPreviewData>> => {
+  requireRealtimeOptionsReads()
   const response = await api.post(`/options/alerts/preview/${candidateId}`, request, { params: tickerParams() })
   return response.data
 }

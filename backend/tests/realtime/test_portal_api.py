@@ -412,7 +412,8 @@ def test_uvicorn_factory_closes_pool_when_target_verification_fails(monkeypatch)
 def test_repository_composition_requires_verified_reader_role():
     reader_database, cursor = _database(RealtimeDatabaseRole.READER)
     repositories = build_realtime_portal_repositories(
-        reader_database
+        reader_database,
+        advanced_options_v2_enabled=True,
     )
 
     assert isinstance(
@@ -421,6 +422,15 @@ def test_repository_composition_requires_verified_reader_role():
     )
     assert isinstance(repositories.stock_alerts, RealtimeStockAlertRepository)
     assert isinstance(repositories.option_alerts, RealtimeOptionAlertRepository)
+    assert repositories.option_flow._require_read_pin is True
+    assert repositories.option_flow._reads_enabled is True
+    disabled = build_realtime_portal_repositories(
+        reader_database,
+        advanced_options_v2_enabled=False,
+    )
+    assert disabled.option_flow._reads_enabled is False
+    assert disabled.option_screener._reads_enabled is False
+    assert disabled.option_alert_views._reads_enabled is False
     with repositories.ticker_screener._cursor():
         pass
     assert cursor.execute.call_args_list[0].args[0] == (
@@ -429,5 +439,6 @@ def test_repository_composition_requires_verified_reader_role():
     compute_database, _ = _database(RealtimeDatabaseRole.COMPUTE)
     with pytest.raises(ValueError, match="requires the reader database role"):
         build_realtime_portal_repositories(
-            compute_database
+            compute_database,
+            advanced_options_v2_enabled=True,
         )

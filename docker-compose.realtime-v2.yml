@@ -202,6 +202,8 @@ services:
         - scripts/report_realtime_v2_advanced_health.py
         - --component
         - bridge
+        - --cohort-id
+        - ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
       interval: 15s
       timeout: 10s
       retries: 4
@@ -320,6 +322,60 @@ services:
         - finalizer
         - --cohort-id
         - ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
+      interval: 15s
+      timeout: 10s
+      retries: 4
+      start_period: 20s
+
+  realtime-v2-advanced-detectors:
+    <<: *backend-service
+    profiles: ["realtime-v2-advanced"]
+    container_name: stock-screener-realtime-v2-advanced-detectors
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - detectors
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --
+      - python
+      - -B
+      - scripts/run_realtime_v2_advanced_equity_detectors.py
+      - --database
+      - stocks_realtime_v2
+      - --confirm-database-name
+      - stocks_realtime_v2
+      - --cohort-id
+      - ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
+      - --session-date
+      - ${REALTIME_V2_ADVANCED_SESSION_DATE:-2000-01-03}
+      - --continuous
+      - --execute
+    environment:
+      <<: *advanced-environment
+    secrets:
+      - realtime_v2_app_dsn
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - detectors
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --
+        - python
+        - -B
+        - scripts/report_realtime_v2_advanced_health.py
+        - --component
+        - detectors
+        - --cohort-id
+        - ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
+        - --fail-on-degraded
       interval: 15s
       timeout: 10s
       retries: 4
@@ -692,6 +748,8 @@ services:
       - "8002"
     secrets:
       - realtime_v2_api_dsn
+    environment:
+      REALTIME_V2_ADVANCED_OPTIONS_READS: ${REALTIME_V2_ADVANCED_OPTIONS_READS:-DISABLED}
     ports:
       - "127.0.0.1:${REALTIME_V2_ADVANCED_API_PORT:-8002}:8002"
     healthcheck:
@@ -716,6 +774,7 @@ services:
         VITE_API_BASE_URL: /api
         VITE_REALTIME_ONLY: "true"
         VITE_REALTIME_COHORT_ID: ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
+        VITE_REALTIME_OPTIONS_V2: ${VITE_REALTIME_OPTIONS_V2:-false}
     container_name: stock-screener-realtime-v2-advanced-frontend
     restart: unless-stopped
     stop_grace_period: 20s

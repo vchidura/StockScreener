@@ -93,8 +93,9 @@ class Transport:
 
 
 class AdjustedDailyTransport:
-    def __init__(self, provider):
+    def __init__(self, provider, *, raw=False):
         self.provider = provider
+        self.raw = raw
         self.calls = []
 
     def get(self, url, params):
@@ -102,7 +103,12 @@ class AdjustedDailyTransport:
             unit.cursor.execute(
                 "SELECT count(*) FROM rt.provider_request_ledger "
                 "WHERE state='RESERVED' "
-                "AND endpoint_class='ADJUSTED_DAILY_SESSION_REPAIR'"
+                "AND endpoint_class=%s",
+                (
+                    "RAW_DAILY_SESSION_REPAIR"
+                    if self.raw
+                    else "ADJUSTED_DAILY_SESSION_REPAIR",
+                ),
             )
             assert unit.cursor.fetchone()[0] == 1
         self.calls.append((url, params))
@@ -110,7 +116,7 @@ class AdjustedDailyTransport:
             200,
             json.dumps({
                 "results": [{
-                    "T": "AAPL",
+                    **({} if self.raw else {"T": "AAPL"}),
                     "o": 100,
                     "h": 101,
                     "l": 99,
@@ -272,6 +278,48 @@ def test_adjusted_daily_repair_replays_without_provider_and_preserves_basis(pool
             1,
             datetime(2026, 10, 15, 20, tzinfo=timezone.utc),
         )
+
+
+def test_exact_raw_daily_repair_uses_per_ticker_response(pool):
+    native = _scope(pool)
+    provider = _provider(pool)
+    plan = AdjustedDailyRepairPlan(
+        native.cohort_id,
+        (native.identities[0],),
+        native.sessions[0],
+        datetime.now(timezone.utc) + timedelta(minutes=30),
+        1,
+        1_000_001,
+        1_000_000,
+        f"raw-{uuid4()}",
+        "fixture entitlement",
+        "fixture cost",
+        adjusted=False,
+        per_ticker=True,
+    )
+    transport = AdjustedDailyTransport(provider, raw=True)
+
+    result = execute_adjusted_daily_repair(
+        provider,
+        transport,
+        plan,
+        clock=lambda: datetime.now(timezone.utc),
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result["adjusted"] is False
+    assert len(transport.calls) == 1
+    url, params = transport.calls[0]
+    assert "/v2/aggs/ticker/AAPL/range/1/day/" in url
+    assert params["adjusted"] == "false"
+    with provider.transaction(read_only=True) as unit:
+        unit.cursor.execute(
+            "SELECT count(*) FROM rt.bar_current "
+            "WHERE cohort_id=%s AND interval='1d' "
+            "AND adjustment_basis='RAW_UNADJUSTED'",
+            (str(plan.cohort_id),),
+        )
+        assert unit.cursor.fetchone()[0] == 1
 
 
 def test_ambiguous_request_is_never_automatically_refetched(pool):

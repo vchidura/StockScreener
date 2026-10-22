@@ -36,6 +36,12 @@ from .advanced_options_rolling_state import (
     build_underlying_tick,
     contract_volume_state,
 )
+from .advanced_options_underlying_snapshot import (
+    UnderlyingSnapshotBinding,
+    UnderlyingSnapshotTick,
+    underlying_snapshot_binding_from_payload,
+    underlying_snapshot_binding_payload,
+)
 from .contracts import AssetClass, canonical_sha256
 from .database_access_v2 import APP_ROLE, V2ConnectionProvider
 from .materialization import MaterializedQuote, MaterializedTrade
@@ -274,6 +280,32 @@ def advanced_options_equity_live_head_binding_from_payload(
     )
 
 
+def advanced_options_underlying_price_binding_payload(
+    binding: (
+        AdvancedOptionsEquityLiveHeadBinding
+        | UnderlyingSnapshotBinding
+    ),
+) -> dict[str, object]:
+    if isinstance(binding, UnderlyingSnapshotBinding):
+        return underlying_snapshot_binding_payload(binding)
+    return advanced_options_equity_live_head_binding_payload(binding)
+
+
+def advanced_options_underlying_price_binding_from_payload(
+    value: object,
+) -> (
+    AdvancedOptionsEquityLiveHeadBinding
+    | UnderlyingSnapshotBinding
+):
+    if (
+        isinstance(value, dict)
+        and value.get("contract")
+        == "advanced-options-underlying-snapshot-binding-v1"
+    ):
+        return underlying_snapshot_binding_from_payload(value)
+    return advanced_options_equity_live_head_binding_from_payload(value)
+
+
 @dataclass(frozen=True, slots=True)
 class AdvancedOptionsRollingProducerPlan:
     plan_id: UUID
@@ -293,7 +325,9 @@ class AdvancedOptionsRollingProducerPlan:
     maximum_option_spot_skew_ms: int
     maximum_cluster_members: int
     equity_live_head_binding: (
-        AdvancedOptionsEquityLiveHeadBinding | None
+        AdvancedOptionsEquityLiveHeadBinding
+        | UnderlyingSnapshotBinding
+        | None
     ) = None
     provider_calls_authorized: bool = False
     runtime_actions_authorized: bool = False
@@ -368,7 +402,9 @@ def _plan_identity(
     maximum_option_spot_skew_ms: int,
     maximum_cluster_members: int,
     equity_live_head_binding: (
-        AdvancedOptionsEquityLiveHeadBinding | None
+        AdvancedOptionsEquityLiveHeadBinding
+        | UnderlyingSnapshotBinding
+        | None
     ),
 ) -> dict[str, object]:
     control = enrollment.control_plane
@@ -407,7 +443,7 @@ def _plan_identity(
         "equity_live_head_binding": (
             None
             if equity_live_head_binding is None
-            else advanced_options_equity_live_head_binding_payload(
+            else advanced_options_underlying_price_binding_payload(
                 equity_live_head_binding
             )
         ),
@@ -495,7 +531,16 @@ def _validate_plan(
     ):
         raise ValueError("rolling producer clocks, bounds or authority changed")
     equity_binding = plan.equity_live_head_binding
-    if equity_binding is not None and (
+    if isinstance(equity_binding, UnderlyingSnapshotBinding):
+        if (
+            tuple(row.ticker for row in equity_binding.prices)
+            != control.universe.option_underlyings
+        ):
+            raise ValueError(
+                "rolling underlying snapshot membership changed"
+            )
+        equity_binding.require_fresh(known)
+    elif equity_binding is not None and (
         not isinstance(
             equity_binding,
             AdvancedOptionsEquityLiveHeadBinding,
@@ -566,7 +611,9 @@ def build_advanced_options_rolling_producer_plan(
     maximum_option_spot_skew_ms: int = 500,
     maximum_cluster_members: int = 10_000,
     equity_live_head_binding: (
-        AdvancedOptionsEquityLiveHeadBinding | None
+        AdvancedOptionsEquityLiveHeadBinding
+        | UnderlyingSnapshotBinding
+        | None
     ) = None,
 ) -> AdvancedOptionsRollingProducerPlan:
     known = _utc(known_at, "known_at")
@@ -1226,6 +1273,20 @@ def _equity_live_head_source(
     binding = plan.equity_live_head_binding
     if binding is None:
         return
+    if isinstance(binding, UnderlyingSnapshotBinding):
+        binding.require_fresh(plan.known_at)
+        evidence.append(_evidence(
+            "UNDERLYING_SNAPSHOT_BINDING",
+            binding.selection_sha256,
+            RollingAvailability.READY,
+            underlying_snapshot_binding_payload(binding),
+            observed_at=max(
+                row.market_time for row in binding.prices
+            ),
+            known_at=plan.known_at,
+            valid_until=binding.valid_until,
+        ))
+        return
     cursor.execute(
         "SELECT ingress.plan_sha256,ingress.cohort_id::text,"
         "ingress.manifest_id::text,manifest.manifest_sha256,"
@@ -1315,22 +1376,33 @@ def _market_state(
     contracts,
     equities,
     evidence: list[AdvancedOptionsRollingProducerEvidence],
-) -> tuple[tuple[AdvancedOptionsUnderlyingTick, ...], str] | None:
+) -> tuple[
+    tuple[AdvancedOptionsUnderlyingTick | UnderlyingSnapshotTick, ...],
+    str,
+] | None:
     option_ids = tuple(sorted({
         int(row["instrument_id"]) for row in contracts
     }))
     equity_ids = tuple(int(row["instrument_id"]) for row in equities)
+    equity_binding = plan.equity_live_head_binding
+    snapshot_based = isinstance(
+        equity_binding,
+        UnderlyingSnapshotBinding,
+    )
     rows = _current_rows(
         cursor,
-        tuple(sorted((*option_ids, *equity_ids))),
+        (
+            option_ids
+            if snapshot_based
+            else tuple(sorted((*option_ids, *equity_ids)))
+        ),
     )
     option_sessions = {
         str(value) for value in plan.source_flow.stream_session_ids
     }
-    equity_binding = plan.equity_live_head_binding
     equity_sessions = (
         option_sessions
-        if equity_binding is None
+        if equity_binding is None or snapshot_based
         else {
             str(value) for value in equity_binding.stream_session_ids
         }
@@ -1343,7 +1415,11 @@ def _market_state(
     expected_keys = {
         (kind, instrument_id)
         for kind in ("Q", "T")
-        for instrument_id in (*option_ids, *equity_ids)
+        for instrument_id in (
+            option_ids
+            if snapshot_based
+            else (*option_ids, *equity_ids)
+        )
     }
     if set(by_key) != expected_keys:
         reasons.append("CANONICAL_CURRENT_HEADS_INCOMPLETE")
@@ -1352,7 +1428,7 @@ def _market_state(
         is_equity = instrument_id in equity_ids
         expected_generation = (
             plan.source_flow.journal_generation
-            if not is_equity or equity_binding is None
+            if not is_equity or equity_binding is None or snapshot_based
             else equity_binding.journal_generation
         )
         expected_sessions = (
@@ -1362,7 +1438,7 @@ def _market_state(
         )
         expected_session_date = (
             plan.control_plane.session_date
-            if not is_equity or equity_binding is None
+            if not is_equity or equity_binding is None or snapshot_based
             else equity_binding.session_date
         )
         if (
@@ -1376,12 +1452,12 @@ def _market_state(
             )
         maximum_offset = (
             plan.committed_offset
-            if not is_equity or equity_binding is None
+            if not is_equity or equity_binding is None or snapshot_based
             else equity_binding.committed_offset
         )
         maximum_clock = (
             plan.known_at
-            if not is_equity or equity_binding is None
+            if not is_equity or equity_binding is None or snapshot_based
             else equity_binding.observed_at
         )
         if (
@@ -1409,8 +1485,23 @@ def _market_state(
             )
         ):
             reasons.append("CANONICAL_CURRENT_HEAD_INVALID")
-    digest = canonical_sha256(tuple(tuple(row.values()) for row in rows))
-    ticks: list[AdvancedOptionsUnderlyingTick] = []
+    digest = (
+        canonical_sha256({
+            "option_heads": tuple(
+                tuple(row.values()) for row in rows
+            ),
+            "underlying_snapshot": (
+                underlying_snapshot_binding_payload(equity_binding)
+            ),
+        })
+        if snapshot_based
+        else canonical_sha256(
+            tuple(tuple(row.values()) for row in rows)
+        )
+    )
+    ticks: list[
+        AdvancedOptionsUnderlyingTick | UnderlyingSnapshotTick
+    ] = []
     if not reasons:
         option_time_by_security = {}
         for row in contracts:
@@ -1424,6 +1515,22 @@ def _market_state(
             )
         for equity in equities:
             instrument_id = int(equity["instrument_id"])
+            if snapshot_based:
+                snapshot = equity_binding.price_for(
+                    str(equity["ticker"])
+                )
+                ticks.append(UnderlyingSnapshotTick(
+                    instrument_id=instrument_id,
+                    evidence=snapshot,
+                    selected_at=plan.known_at,
+                    option_market_time=option_time_by_security[
+                        str(equity["security_id"])
+                    ],
+                    maximum_price_age_seconds=(
+                        equity_binding.maximum_price_age_seconds
+                    ),
+                ))
+                continue
             quote_row = by_key[("Q", instrument_id)]
             trade_row = by_key[("T", instrument_id)]
             quote = MaterializedQuote(
