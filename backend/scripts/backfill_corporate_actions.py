@@ -11,11 +11,9 @@ import argparse
 import json
 import os
 import sys
-import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
 
 
@@ -25,13 +23,18 @@ if str(BACKEND_DIR) not in sys.path:
 load_dotenv(BACKEND_DIR / ".env")
 
 from equity.domain import BarAvailabilityMode, DecisionWatermark
-from equity.polygon import PolygonEquityClient, normalize_corporate_actions, sha256_json
+from equity.polygon import normalize_corporate_actions, sha256_json
 from equity.repositories import (
     EquityCorporateActionRepository,
     EquityReferenceRepository,
     EquityUniverseRepository,
 )
-from scripts.run_corporate_action_worker import build_coverage
+from equity.corporate_action_coverage import build_corporate_action_coverage
+from realtime.reference_transports import (
+    MassiveReferenceTransport,
+    ReferenceTransportLimits,
+    RequestsReferenceHttpTransport,
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -45,24 +48,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--apply", action="store_true")
     result.add_argument("--confirm-database-name",
                         help="Required with --apply and must exactly match DB_NAME")
+    result.add_argument("--authorized-until", type=datetime.fromisoformat, required=True)
+    result.add_argument("--maximum-provider-requests", type=int, required=True)
+    result.add_argument("--response-byte-limit", type=int, required=True)
+    result.add_argument("--maximum-total-bytes", type=int, required=True)
+    result.add_argument("--authorization-reference", required=True)
     result.add_argument("--output", type=Path)
     return result
-
-
-def with_backoff(operation, *, attempts: int = 6):
-    """Polygon's client raises on 429; retry with exponential backoff."""
-    delay = 2.0
-    for attempt in range(1, attempts + 1):
-        try:
-            return operation()
-        except requests.HTTPError as error:
-            status = getattr(error.response, "status_code", None)
-            if status not in (429, 502, 503, 504) or attempt == attempts:
-                raise
-            print(f"  polygon {status}; retrying in {delay:.0f}s", flush=True)
-            time.sleep(delay)
-            delay = min(delay * 2, 60.0)
-    raise RuntimeError("unreachable")
 
 
 def main() -> int:
@@ -83,6 +75,22 @@ def main() -> int:
     ):
         raise SystemExit("--apply requires --confirm-database-name matching DB_NAME")
     observed_at = datetime.now(timezone.utc)
+    if arguments.authorized_until.tzinfo is None:
+        raise SystemExit("--authorized-until must be timezone-aware")
+    authorized_until = arguments.authorized_until.astimezone(timezone.utc)
+    expected_requests = len(requested_tickers) * (
+        2 if arguments.dividends else 1
+    )
+    if (
+        not requested_tickers
+        or expected_requests != arguments.maximum_provider_requests
+        or arguments.response_byte_limit != 5_000_000
+        or arguments.maximum_total_bytes
+        != arguments.maximum_provider_requests * arguments.response_byte_limit
+        or not observed_at <= authorized_until <= observed_at + timedelta(hours=1)
+        or not arguments.authorization_reference.strip()
+    ):
+        raise SystemExit("corporate-action authorization scope is invalid")
 
     universe = EquityUniverseRepository().get_latest_as_of(
         DecisionWatermark(market_time=observed_at, observed_time=observed_at)
@@ -101,13 +109,35 @@ def main() -> int:
     if set(security_ids) != set(tickers):
         raise SystemExit("exact current security references are required for every selected ticker")
 
-    client = PolygonEquityClient()
+    api_key = os.getenv("POLYGON_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("corporate-action backfill requires POLYGON_API_KEY")
+    client = MassiveReferenceTransport(
+        api_key,
+        RequestsReferenceHttpTransport(timeout_seconds=30),
+        limits=ReferenceTransportLimits(
+            maximum_requests=arguments.maximum_provider_requests,
+            maximum_response_bytes=arguments.response_byte_limit,
+            maximum_total_bytes=arguments.maximum_total_bytes,
+            maximum_rows=10_000,
+            maximum_pages=1,
+        ),
+    )
     print(f"fetching splits {start}..{end}", flush=True)
-    split_rows = list(with_backoff(lambda: client.fetch_splits(start, end)))
+    split_rows = [
+        row
+        for ticker in tickers
+        for row in client.fetch_splits(ticker, start, end)
+    ]
     dividend_rows: list = []
     if arguments.dividends:
         print(f"fetching dividends {start}..{end}", flush=True)
-        dividend_rows = list(with_backoff(lambda: client.fetch_dividends(start, end)))
+        dividend_rows = [
+            row
+            for ticker in tickers
+            for row in client.fetch_dividends(ticker, start, end)
+        ]
+    transport = client.snapshot()
 
     split_actions = normalize_corporate_actions(
             split_rows, security_ids=security_ids, action_type="SPLIT",
@@ -126,6 +156,9 @@ def main() -> int:
         "end": end.isoformat(),
         "universe_members": len(tickers),
         "selected_tickers": sorted(tickers),
+        "authorization_reference": arguments.authorization_reference,
+        "provider_requests": transport.provider_requests,
+        "provider_response_bytes": transport.response_bytes,
         "security_reference_count": len(security_ids),
         "splits_fetched": len(split_rows),
         "split_response_sha256": sha256_json(split_rows),
@@ -147,7 +180,7 @@ def main() -> int:
     }
     if arguments.apply:
         repository = EquityCorporateActionRepository()
-        all_coverage = build_coverage(
+        all_coverage = build_corporate_action_coverage(
             security_ids,
             start=start,
             end=end,

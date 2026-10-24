@@ -76,6 +76,26 @@ def test_detector_code_identity_binds_exact_source_bytes(tmp_path):
     assert detectors.detector_code_sha256((first, second)) != digest
 
 
+def test_detector_scopes_exclude_journals_that_predate_history_binding():
+    cursor = MagicMock()
+    cursor.fetchall.return_value = ()
+
+    assert detectors.load_advanced_equity_detector_scopes_cursor(
+        cursor,
+        cohort_id=COHORT,
+        session_date=date(2026, 10, 21),
+    ) == ()
+
+    statement, params = cursor.execute.call_args.args
+    assert "rt.cohort_history_bindings" in statement
+    assert "registry.created_at>=binding.created_at" in statement
+    assert "count(DISTINCT history.session_date)" in statement
+    assert "history.observed_at<=registry.created_at" in statement
+    assert "history.created_at<=registry.created_at" in statement
+    assert "history.session_date<plan.session_date" in statement
+    assert params == (str(COHORT), date(2026, 10, 21))
+
+
 def test_detector_cycle_fences_both_s1_s2_consumers(monkeypatch):
     provider = _Provider()
     scope = detectors.AdvancedEquityDetectorScope(

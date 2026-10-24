@@ -1,4 +1,4 @@
-"""Pure Advanced O1/O3/S1/S2 adapters over exact frozen cycle inputs."""
+"""Pure Advanced O1/O3 adapters over exact frozen cycle inputs."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass
@@ -34,7 +34,6 @@ from .advanced_options_cycle import (
 )
 from .contracts import canonical_sha256
 from .detector_adapters import (
-    run_canonical_stock_signal_adapter,
     run_o1_adapter,
     run_o3_adapter,
 )
@@ -371,22 +370,6 @@ def decode_advanced_o3_invocation_document(
     return invocation
 
 
-@dataclass(frozen=True, slots=True)
-class AdvancedStockInvocation:
-    detector: DetectorFamily
-    security_id: UUID
-    underlyer: str
-    bars: tuple
-    market_cutoff: datetime
-    decision_at: datetime
-    session_close: datetime
-    packages: Mapping[UUID, RealtimeOptionPackage]
-
-    def __post_init__(self) -> None:
-        if self.detector not in {DetectorFamily.S1, DetectorFamily.S2}:
-            raise ValueError("Advanced stock invocation requires S1 or S2")
-
-
 def _blocked_or_none(
     context: AdvancedOptionsDetectorContext,
     expected: DetectorFamily,
@@ -504,64 +487,10 @@ def build_advanced_o3_executor(
     return execute
 
 
-def build_advanced_stock_executor(
-    detector: DetectorFamily,
-    inputs: AdvancedOptionsLaneInputs,
-) -> NativeDetectorExecutor:
-    if detector not in {DetectorFamily.S1, DetectorFamily.S2}:
-        raise ValueError("Advanced stock executor requires S1 or S2")
-    if any(
-        not isinstance(row, AdvancedStockInvocation)
-        or row.detector is not detector
-        for row in inputs.invocations
-    ):
-        raise TypeError("Advanced stock invocation is invalid")
-
-    def execute(
-        context: AdvancedOptionsDetectorContext,
-    ) -> AdvancedOptionsNativeLaneResult:
-        blocked = _blocked_or_none(context, detector, inputs)
-        if blocked is not None:
-            return blocked
-        evaluations = []
-        for invocation in inputs.invocations:
-            result = run_canonical_stock_signal_adapter(
-                detector_id=detector.value,
-                security_id=invocation.security_id,
-                underlyer=invocation.underlyer,
-                bars=invocation.bars,
-                cohort_id=context.input_gate.closure.cycle_input.cohort_id,
-                provider_tier=ProviderTier.MASSIVE_ADVANCED,
-                input_sha256=_input_sha256(context),
-                market_cutoff=invocation.market_cutoff,
-                decision_at=invocation.decision_at,
-                session_close=invocation.session_close,
-            )
-            for signal in result.output:
-                package = invocation.packages.get(signal.signal_id)
-                evaluations.append(AdvancedOptionsNativeEvaluation(
-                    signal.signal_id,
-                    signal.underlyer,
-                    "SELECTED" if package is not None else "OBSERVATION",
-                    signal.decision_at,
-                    _plain(signal),
-                    package,
-                ))
-        return AdvancedOptionsNativeLaneResult(
-            NativeLaneState.COMPLETE,
-            (),
-            tuple(evaluations),
-        )
-
-    return execute
-
-
 @dataclass(frozen=True, slots=True)
 class AdvancedOptionsNativeInputBundle:
     o1: AdvancedOptionsLaneInputs
     o3: AdvancedOptionsLaneInputs
-    s1: AdvancedOptionsLaneInputs
-    s2: AdvancedOptionsLaneInputs
     plan_id: UUID | None = None
     input_sha256: str | None = None
     executor_membership_sha256: str | None = None
@@ -597,12 +526,4 @@ class AdvancedOptionsNativeInputBundle:
         return {
             DetectorFamily.O1: build_advanced_o1_executor(self.o1),
             DetectorFamily.O3: build_advanced_o3_executor(self.o3),
-            DetectorFamily.S1: build_advanced_stock_executor(
-                DetectorFamily.S1,
-                self.s1,
-            ),
-            DetectorFamily.S2: build_advanced_stock_executor(
-                DetectorFamily.S2,
-                self.s2,
-            ),
         }

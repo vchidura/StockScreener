@@ -1655,6 +1655,16 @@ health/status commands, stop, backup and rollback. Do not start
 `realtime-v2-advanced-provider` or the Advanced scheduler without an exact
 provider/session/cutoff authorization.
 
+Advanced Options V3 is a separate disabled four-role profile. Its retained
+2026-10-23 package is `DISABLED_NOT_PREPARED` and operations readiness is
+`BLOCKED`; do not start `realtime-v3-options`. Validate the package with the
+provider-free `inspect_advanced_options_v3_package.py` PLAN/preflight/status
+modes documented in [deployment](docs/DEPLOYMENT.md). A later run requires a
+reviewed immutable image ID, `--no-build`, applied migrations 033-035, complete
+H/reference inputs, a passing owned Docker rehearsal and separate session,
+window, publication and stored-read authorities. Nine-underlying Options
+expansion remains unauthorized; Equity remains exact target 9.
+
 ## Verification
 
 Run the storage validator after schema installation, ingestion, restoration, or

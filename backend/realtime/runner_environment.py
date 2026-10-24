@@ -37,6 +37,7 @@ if TYPE_CHECKING:
         OptionsFlowSettings,
         OptionsFlowState,
         OptionsPublisherStageResult,
+        OptionsReferenceStageResult,
         OptionsReceiptStageResult,
     )
 
@@ -121,6 +122,7 @@ class RunnerEnvironment:
     options_flow_state: OptionsFlowState = field(default_factory=_new_options_flow_state)
     options_acquire_action: Callable[[StageContext], OptionsAcquireResult] | None = None
     options_admission_action: Callable[[StageContext], OptionsAdmissionResult] | None = None
+    options_reference_action: Callable[[StageContext], OptionsReferenceStageResult] | None = None
     options_input_gate_action: Callable[[StageContext], OptionsReceiptStageResult] | None = None
     options_cycle_action: Callable[[StageContext], OptionsReceiptStageResult] | None = None
     options_projection_action: Callable[[StageContext], OptionsReceiptStageResult] | None = None

@@ -116,7 +116,10 @@ def _load_dated_identity(provider, args):
     report = json.loads(body)
     result = report.get("result")
     if (
-        report.get("contract") != "v2-dated-spy-reference-v1"
+        report.get("contract") not in {
+            "v2-dated-spy-reference-v1",
+            "v2-dated-equity-reference-v1",
+        }
         or report.get("status") != "PASS"
         or report.get("ticker") != args.tickers[0]
         or report.get("source_as_of_date") != args.session_date.isoformat()
@@ -150,7 +153,7 @@ def _load_dated_identity(provider, args):
         expected_security_id
     ):
         raise ValueError(
-            "dated reference does not match the retained SPY security identity"
+            "dated reference does not match the retained security identity"
         )
     dated_cik = str(result.get("cik") or "").lstrip("0")
     current_cik = str(member.get("cik") or "").lstrip("0")
@@ -163,7 +166,7 @@ def _load_dated_identity(provider, args):
         not dated_cik or not current_cik or dated_cik != current_cik
     ):
         raise ValueError(
-            "dated reference FIGI/CIK conflicts with retained SPY identity"
+            "dated reference FIGI/CIK conflicts with retained identity"
         )
     revision = _security(member)
     identity = EquityValidationIdentity(
@@ -269,6 +272,9 @@ def main(argv=None):
                         args.cohort_id,
                         cutoff,
                         known_by=now,
+                        selected_tickers=(
+                            args.tickers if args.tickers else None
+                        ),
                     )
                 )
         if args.tickers:

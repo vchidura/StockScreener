@@ -7,9 +7,9 @@ window owner epoch, so a stale owner cannot change a window another owner has ta
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -128,7 +128,15 @@ class WindowSpec:
 
     @property
     def window_id(self) -> UUID:
-        return uuid5(NAMESPACE_URL, f"stockscreener:window:{self.cohort_id}:{self.window_key}")
+        cutoff = self.cutoff.astimezone(timezone.utc)
+        return uuid5(
+            NAMESPACE_URL,
+            (
+                "stockscreener:window:"
+                f"{cutoff.date().isoformat()}:{self.cohort_id}:"
+                f"{self.window_key}:{cutoff.isoformat()}"
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +170,9 @@ class StageRunRecord:
     state: str
     blocked_by_stage: str | None
     reason_codes: tuple[str, ...]
+    retry_not_before: datetime | None = None
+    original_deadline: datetime | None = None
+    maximum_attempts: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +184,12 @@ class CycleReceiptSpec:
     input_sha256: str
     build_id: str
     advance_release: bool = False
+
+
+WindowStageEffectAuthorizer = Callable[
+    [object, WindowClaim, StageDefinition, str, datetime],
+    object,
+]
 
 
 def persist_cycle_receipt_cursor(
@@ -301,10 +318,11 @@ class OrchestrationRepository(Protocol):
                                now: datetime) -> Sequence[StageRunRecord]: ...
 
     def start_stage(self, claim: WindowClaim, stage: StageDefinition, version: str, attempt: int,
-                    now: datetime) -> StageRunRecord: ...
+                    maximum_attempts: int, now: datetime) -> StageRunRecord: ...
 
     def finish_stage(self, claim: WindowClaim, run: StageRunRecord, state: str, reason_codes: Sequence[str],
-                     receipt_id: UUID | None, now: datetime) -> None: ...
+                     receipt_id: UUID | None, now: datetime, *,
+                     retry_not_before: datetime | None = None) -> None: ...
 
     def record_blocked(self, claim: WindowClaim, stage_id: str, version: str, blocked_by: str,
                        blocker_state: str, now: datetime) -> StageRunRecord: ...
@@ -328,7 +346,7 @@ class OrchestrationRepository(Protocol):
 
 _WINDOW_COLUMNS = "window_id, plan_id, cohort_id, provider_tier, window_key, release_at, cutoff, deadline, state"
 _RUN_COLUMNS = ("stage_run_id, window_id, stage_id, stage_version, attempt, state, blocked_by_stage, "
-                "reason_codes")
+                "reason_codes, retry_not_before, original_deadline, maximum_attempts")
 
 
 def _window(row) -> WindowRecord:
@@ -338,12 +356,20 @@ def _window(row) -> WindowRecord:
 
 def _run(row) -> StageRunRecord:
     return StageRunRecord(UUID(str(row[0])), UUID(str(row[1])), row[2], row[3], row[4], row[5], row[6],
-                          tuple(row[7] or ()))
+                          tuple(row[7] or ()), row[8], row[9], row[10])
 
 
 class PostgresOrchestrationRepository:
-    def __init__(self, provider: V2ConnectionProvider) -> None:
+    def __init__(
+        self,
+        provider: V2ConnectionProvider,
+        *,
+        window_stage_effect_authorizer: WindowStageEffectAuthorizer | None = None,
+    ) -> None:
         self._provider = provider
+        self._window_stage_effect_authorizer = (
+            window_stage_effect_authorizer
+        )
 
     def _transaction(self, *, read_only: bool = False):
         return self._provider.transaction(read_only=read_only)
@@ -380,12 +406,13 @@ class PostgresOrchestrationRepository:
         with self._transaction(read_only=True) as unit:
             unit.cursor.execute(
                 "SELECT stage_id, domain, prerequisites, execution_lane, schedule_kind, gates_strategy, "
-                "deadline_offset_seconds "
+                "deadline_offset_seconds, external_prerequisites "
                 "FROM rt.stage_catalog WHERE version = %s ORDER BY stage_id", (version,))
             rows = unit.cursor.fetchall()
         return {
             row[0]: StageDefinition(
                 row[0], row[1], tuple(row[2]), row[3], row[4], bool(row[5]), row[6],
+                tuple(row[7]),
             )
             for row in rows
         }
@@ -483,25 +510,57 @@ class PostgresOrchestrationRepository:
             return [_run(row) for row in unit.cursor.fetchall()]
 
     def start_stage(self, claim: WindowClaim, stage: StageDefinition, version: str, attempt: int,
-                    now: datetime) -> StageRunRecord:
+                    maximum_attempts: int, now: datetime) -> StageRunRecord:
         with self._transaction() as unit:
             self._fence(unit.cursor, claim)
+            if version == "stages_v5" and stage.stage_id == "OPTIONS_INPUT_GATE":
+                if self._window_stage_effect_authorizer is None:
+                    raise ValueError(
+                        "stages_v5 OPTIONS_INPUT_GATE lacks a window cycle authority consumer"
+                    )
+                self._window_stage_effect_authorizer(
+                    unit.cursor,
+                    claim,
+                    stage,
+                    version,
+                    now,
+                )
             unit.cursor.execute(
                 "INSERT INTO rt.stage_runs (stage_run_id, window_id, stage_id, stage_version, attempt, state, "
-                f"started_at, updated_at) VALUES (%s, %s, %s, %s, %s, 'RUNNING', %s, %s) RETURNING {_RUN_COLUMNS}",
-                (str(uuid4()), str(claim.window.window_id), stage.stage_id, version, attempt, now, now))
+                "started_at, original_deadline, maximum_attempts, updated_at) "
+                f"VALUES (%s, %s, %s, %s, %s, 'RUNNING', %s, %s, %s, %s) RETURNING {_RUN_COLUMNS}",
+                (
+                    str(uuid4()),
+                    str(claim.window.window_id),
+                    stage.stage_id,
+                    version,
+                    attempt,
+                    now,
+                    claim.window.deadline,
+                    maximum_attempts,
+                    now,
+                ))
             return _run(unit.cursor.fetchone())
 
     def finish_stage(self, claim: WindowClaim, run: StageRunRecord, state: str, reason_codes: Sequence[str],
-                     receipt_id: UUID | None, now: datetime) -> None:
+                     receipt_id: UUID | None, now: datetime, *,
+                     retry_not_before: datetime | None = None) -> None:
         with self._transaction() as unit:
             self._fence(unit.cursor, claim)
             unit.cursor.execute(
                 "UPDATE rt.stage_runs SET state = %s, reason_codes = %s, receipt_id = %s, "
-                "finished_at = GREATEST(%s, started_at), updated_at = %s WHERE stage_run_id = %s "
+                "retry_not_before = %s, finished_at = GREATEST(%s, started_at), updated_at = %s "
+                "WHERE stage_run_id = %s "
                 "AND state = 'RUNNING'",
-                (state, list(reason_codes), str(receipt_id) if receipt_id else None, now, now,
-                 str(run.stage_run_id)))
+                (
+                    state,
+                    list(reason_codes),
+                    str(receipt_id) if receipt_id else None,
+                    retry_not_before,
+                    now,
+                    now,
+                    str(run.stage_run_id),
+                ))
             if unit.cursor.rowcount != 1:
                 raise LeaseLost(f"stage run {run.stage_run_id} is not running")
 

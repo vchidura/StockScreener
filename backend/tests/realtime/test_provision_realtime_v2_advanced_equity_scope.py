@@ -47,6 +47,30 @@ def test_local_am_canary_emits_provisionable_entitlement_evidence(tmp_path):
     assert observed == checked_at.isoformat()
 
 
+def test_local_am_canary_emits_exact_target9_entitlement(tmp_path):
+    checked_at = datetime(2026, 10, 23, 13, 31, tzinfo=timezone.utc)
+    symbols = (
+        "AAPL",
+        "AMZN",
+        "IWM",
+        "MSFT",
+        "NFLX",
+        "NVDA",
+        "QQQ",
+        "SPY",
+        "TSLA",
+    )
+    path = tmp_path / "target9-entitlement.json"
+    path.write_text(json.dumps({
+        "status": "PASS",
+        **capture._entitlement_evidence(checked_at, symbols),
+    }), encoding="utf-8")
+
+    _digest, observed = script._load_entitlement(path, symbols)
+
+    assert observed == checked_at.isoformat()
+
+
 def test_local_am_canary_requires_only_bounded_provider_settings():
     assert capture._canary_api_key({
         "REALTIME_V2_EQUITY_PIPELINE": "MASSIVE_ADVANCED",

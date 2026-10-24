@@ -176,13 +176,21 @@ def test_targeted_backfill_persists_response_bound_split_observation_atomically(
     monkeypatch.setattr(backfill_corporate_actions.EquityReferenceRepository, "list_securities_as_of",
                         lambda self, tickers, context: tuple(references))
     client = type("Client", (), {
-        "fetch_splits": lambda self, start, end: ({
-            "id": "split", "ticker": "AAPL", "execution_date": "2026-08-10",
+        "fetch_splits": lambda self, ticker, start, end: ({
+            "id": "split", "ticker": ticker, "execution_date": "2026-08-10",
             "split_from": 1, "split_to": 2,
-        },),
-        "fetch_dividends": lambda self, start, end: pytest.fail("dividends not requested"),
+        },) if ticker == "AAPL" else (),
+        "fetch_dividends": lambda self, ticker, start, end: pytest.fail("dividends not requested"),
+        "snapshot": lambda self: type("Snapshot", (), {
+            "provider_requests": 2,
+            "response_bytes": 100,
+        })(),
     })()
-    monkeypatch.setattr(backfill_corporate_actions, "PolygonEquityClient", lambda: client)
+    monkeypatch.setattr(
+        backfill_corporate_actions,
+        "MassiveReferenceTransport",
+        lambda *args, **kwargs: client,
+    )
     repository = type("Repository", (), {})()
     repository.calls = []
     repository.persist_observation = lambda coverage, actions: (
@@ -190,10 +198,16 @@ def test_targeted_backfill_persists_response_bound_split_observation_atomically(
     )
     monkeypatch.setattr(backfill_corporate_actions, "EquityCorporateActionRepository", lambda: repository)
     monkeypatch.setenv("DB_NAME", "stocks")
+    monkeypatch.setenv("POLYGON_API_KEY", "fixture")
     arguments = type("Arguments", (), {
         "start": "2026-08-04", "end": "2026-08-14", "dividends": False,
         "ticker": ["AAPL", "IWM"], "apply": True,
         "confirm_database_name": "stocks", "output": None,
+        "authorized_until": datetime.now(timezone.utc) + timedelta(hours=1),
+        "maximum_provider_requests": 2,
+        "response_byte_limit": 5_000_000,
+        "maximum_total_bytes": 10_000_000,
+        "authorization_reference": "test-approval",
     })()
     monkeypatch.setattr(backfill_corporate_actions, "parser",
                         lambda: type("Parser", (), {"parse_args": lambda self: arguments})())

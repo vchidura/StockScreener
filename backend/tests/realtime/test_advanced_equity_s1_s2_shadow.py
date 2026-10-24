@@ -130,6 +130,7 @@ def test_existing_s1_s2_models_bind_to_advanced_5m_shadow(
     )
 
     decision = evaluator(source, source.detector_inputs())
+    daily_statement, daily_params = cursor.execute.call_args_list[0].args
 
     assert decision.disposition == "DETECTED"
     assert decision.direction in {-1, 1}
@@ -138,6 +139,13 @@ def test_existing_s1_s2_models_bind_to_advanced_5m_shadow(
     assert len(decision.additional_inputs) == (
         15 + len(intraday) - 1
     )
+    assert "rt.cohort_history_bindings" in daily_statement
+    assert "revision.cohort_id=binding.source_cohort_id" in daily_statement
+    assert "binding.created_at<=%s" in daily_statement
+    assert "revision.bar_end<binding.history_before" in daily_statement
+    assert "HISTORICAL_RECONSTRUCTED" in daily_statement
+    assert daily_params[:2] == (str(COHORT), str(COHORT))
+    assert daily_params[2] == source.observed_at
     assert s1_s2_requirements(detector_id)["trigger_interval"] == "5m"
     config = build_s1_s2_consumer_config(
         detector_id=detector_id,

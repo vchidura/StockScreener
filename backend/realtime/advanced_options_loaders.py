@@ -14,6 +14,7 @@ from .advanced_options_cycle import (
 from .advanced_options_input import (
     build_advanced_options_input_closure,
     build_advanced_options_input_gate_plan,
+    reconstruct_options_input_ready_receipt,
 )
 from .advanced_options_native_adapters import (
     AdvancedOptionsNativeInputBundle,
@@ -38,12 +39,14 @@ from .materialization_jobs import (
     JobBarrierVerdict,
     enqueue_materialization_job_cursor,
     evaluate_job_barrier_cursor,
+    load_job_barrier_verdict_cursor,
     open_job_barrier_cursor,
     record_job_barrier_outcome_cursor,
 )
 from .option_cycle_input import OptionCycleInput
 from .orchestration_repository import CycleReceiptSpec
 from .stage_orchestrator import StageContext
+from .stage_runners_options import OptionsReferenceStageResult
 from .options_v2_runtime import OptionsPreSessionStageBinding
 
 
@@ -66,6 +69,7 @@ class AdvancedOptionsCanonicalInputFacts:
     equity_window_id: UUID
     instrument_ids: dict[str, int]
     available_at: datetime
+    maximum_equity_input_age_seconds: int | None
     native_input_plan_sha256: str | None = None
     native_input_sha256: str | None = None
     executor_membership_sha256: str | None = None
@@ -77,8 +81,27 @@ class AdvancedOptionsCanonicalInputFacts:
             self.equity_input_receipt.receipt_kind != "INPUT_READY"
             or self.equity_input_receipt.input_sha256
             != self.equity_input_sha256
+            or self.equity_input_receipt.cutoff.date()
+            != self.cycle_input.scheduled_cycle.date()
             or self.equity_input_receipt.cutoff
-            != self.cycle_input.scheduled_cycle
+            > self.cycle_input.scheduled_cycle
+            or (
+                self.maximum_equity_input_age_seconds is None
+                and self.equity_input_receipt.cutoff
+                != self.cycle_input.scheduled_cycle
+            )
+            or (
+                self.maximum_equity_input_age_seconds is not None
+                and (
+                    type(self.maximum_equity_input_age_seconds) is not int
+                    or self.maximum_equity_input_age_seconds <= 0
+                    or (
+                        self.cycle_input.scheduled_cycle
+                        - self.equity_input_receipt.cutoff
+                    ).total_seconds()
+                    > self.maximum_equity_input_age_seconds
+                )
+            )
             or self.equity_input_receipt.advance_release
         ):
             raise ValueError(
@@ -97,6 +120,8 @@ class AdvancedOptionsCanonicalCycleFacts:
 
 
 class AdvancedOptionsCanonicalRuntimePort(Protocol):
+    def produce_reference_state(self): ...
+
     def load_input_facts(
         self,
         context: StageContext,
@@ -107,6 +132,23 @@ class AdvancedOptionsCanonicalRuntimePort(Protocol):
         context: StageContext,
         input_stage: AdvancedOptionsInputStageData,
     ) -> AdvancedOptionsCanonicalCycleFacts: ...
+
+    def load_input_receipt(
+        self,
+        context: StageContext,
+    ) -> CycleReceiptSpec: ...
+
+    def load_completed_cycle(
+        self,
+        context: StageContext,
+        input_stage: AdvancedOptionsInputStageData,
+    ): ...
+
+    def load_completed_projection(
+        self,
+        context: StageContext,
+        cycle,
+    ): ...
 
     def load_close_data(
         self,
@@ -129,6 +171,7 @@ class AdvancedOptionsCanonicalLoaders:
             record_job_barrier_outcome_cursor
         ),
         evaluate_barrier: Callable = evaluate_job_barrier_cursor,
+        load_barrier: Callable | None = None,
     ) -> None:
         if not build_id.strip():
             raise ValueError("Advanced Options loader build ID cannot be blank")
@@ -148,6 +191,20 @@ class AdvancedOptionsCanonicalLoaders:
         self._open_barrier = open_barrier
         self._record_barrier_outcome = record_barrier_outcome
         self._evaluate_barrier = evaluate_barrier
+        self._load_barrier = (
+            load_job_barrier_verdict_cursor
+            if (
+                load_barrier is None
+                and evaluate_barrier is evaluate_job_barrier_cursor
+            )
+            else evaluate_barrier
+            if load_barrier is None
+            else load_barrier
+        )
+        if not callable(self._load_barrier):
+            raise TypeError(
+                "Advanced Options loader load barrier callback is invalid"
+            )
         self._inputs: dict[
             tuple[UUID, datetime],
             AdvancedOptionsInputStageData,
@@ -160,6 +217,36 @@ class AdvancedOptionsCanonicalLoaders:
         return context.plan.cohort_id, context.window.cutoff
 
     def input(self, context: StageContext) -> AdvancedOptionsInputStageData:
+        return self._input(context, persist=True)
+
+    def reference(
+        self,
+        _context: StageContext,
+    ) -> OptionsReferenceStageResult:
+        result = self._port.produce_reference_state()
+        state = getattr(result, "state", None)
+        if state is None:
+            reasons = tuple(getattr(result, "reason_codes", ()))
+            raise ValueError(
+                "Advanced Options reference stage is incomplete"
+                + (": " + ",".join(reasons) if reasons else "")
+            )
+        return OptionsReferenceStageResult(
+            state.state_id,
+            state.state_sha256,
+            state.reference_generation,
+            (
+                f"options-reference:{state.state_id}:"
+                f"{state.state_sha256}"
+            ),
+        )
+
+    def _input(
+        self,
+        context: StageContext,
+        *,
+        persist: bool,
+    ) -> AdvancedOptionsInputStageData:
         facts = self._port.load_input_facts(context)
         closure = build_advanced_options_input_closure(
             control_plane=facts.control_plane,
@@ -197,38 +284,43 @@ class AdvancedOptionsCanonicalLoaders:
             build_id=self._build_id,
             available_at=facts.available_at,
         )
-        with context.transaction() as unit:
-            for job in gate.jobs:
-                self._enqueue_job(unit.cursor, job)
-            self._open_barrier(
-                unit.cursor,
-                barrier_id=gate.barrier_id,
-                cohort_id=facts.control_plane.cohort_id,
-                window_id=gate.window_id,
-                barrier_kind="OPTIONS_INPUT_READY",
-                universe_sha256=facts.control_plane.universe.sha256,
-                members=gate.barrier_members,
-            )
-            completed_members = (
-                gate.barrier_members
-                if closure.has_canonical_producer_evidence
-                else tuple(
-                    member
-                    for member in gate.barrier_members
-                    if member.member_key == "EQUITY_INPUT_READY"
-                )
-            )
-            for member in completed_members:
-                self._record_barrier_outcome(
+        with context.transaction(read_only=not persist) as unit:
+            if persist:
+                for job in gate.jobs:
+                    self._enqueue_job(unit.cursor, job)
+                self._open_barrier(
                     unit.cursor,
                     barrier_id=gate.barrier_id,
-                    member_key=member.member_key,
-                    outcome=BarrierOutcome.COMPLETE,
-                    outcome_input_sha256=(
-                        member.expected_input_sha256
-                    ),
+                    cohort_id=facts.control_plane.cohort_id,
+                    window_id=gate.window_id,
+                    barrier_kind="OPTIONS_INPUT_READY",
+                    universe_sha256=facts.control_plane.universe.sha256,
+                    members=gate.barrier_members,
                 )
-            verdict = self._evaluate_barrier(
+                completed_members = (
+                    gate.barrier_members
+                    if closure.has_canonical_producer_evidence
+                    else tuple(
+                        member
+                        for member in gate.barrier_members
+                        if member.member_key == "EQUITY_INPUT_READY"
+                    )
+                )
+                for member in completed_members:
+                    self._record_barrier_outcome(
+                        unit.cursor,
+                        barrier_id=gate.barrier_id,
+                        member_key=member.member_key,
+                        outcome=BarrierOutcome.COMPLETE,
+                        outcome_input_sha256=(
+                            member.expected_input_sha256
+                        ),
+                    )
+            verdict = (
+                self._evaluate_barrier
+                if persist
+                else self._load_barrier
+            )(
                 unit.cursor,
                 gate.barrier_id,
             )
@@ -239,15 +331,34 @@ class AdvancedOptionsCanonicalLoaders:
             facts.reference_state.reference_generation,
             f"options-input:{gate.barrier_id}:{gate.closure_sha256}",
         )
+        if not persist:
+            reconstructed = reconstruct_options_input_ready_receipt(
+                gate,
+                verdict,
+                cutoff=context.window.cutoff,
+                reference_generation=facts.reference_state.reference_generation,
+                build_id=self._build_id,
+            )
+            durable = self._port.load_input_receipt(context)
+            if reconstructed != durable:
+                raise ValueError(
+                    "durable OPTIONS_INPUT_READY receipt hash changed"
+                )
         self._inputs[self._key(context)] = stage
         return stage
 
+    def _input_for_downstream(
+        self,
+        context: StageContext,
+    ) -> AdvancedOptionsInputStageData:
+        stage = self._inputs.get(self._key(context))
+        return stage if stage is not None else self._input(
+            context,
+            persist=False,
+        )
+
     def cycle(self, context: StageContext) -> AdvancedOptionsCycleStageData:
-        input_stage = self._inputs.get(self._key(context))
-        if input_stage is None:
-            raise RuntimeError(
-                "Advanced Options input stage handoff is unavailable"
-            )
+        input_stage = self._input_for_downstream(context)
         facts = self._port.load_cycle_facts(context, input_stage)
         return AdvancedOptionsCycleStageData(
             input_stage.control_plane,
@@ -266,14 +377,20 @@ class AdvancedOptionsCanonicalLoaders:
         binding: AdvancedOptionsRuntimeBinding,
         context: StageContext,
     ) -> AdvancedOptionsProjectionStageData:
-        input_stage = self._inputs.get(self._key(context))
+        input_stage = self._input_for_downstream(context)
         cycle = binding.handoff.cycle(
             context.plan.cohort_id,
             context.window.cutoff,
         )
-        if input_stage is None or cycle is None:
-            raise RuntimeError(
-                "Advanced Options cycle handoff is unavailable"
+        if cycle is None:
+            cycle = self._port.load_completed_cycle(
+                context,
+                input_stage,
+            )
+            binding.handoff.put_cycle(
+                context.plan.cohort_id,
+                context.window.cutoff,
+                cycle,
             )
         return AdvancedOptionsProjectionStageData(
             input_stage.control_plane,
@@ -286,14 +403,34 @@ class AdvancedOptionsCanonicalLoaders:
         binding: AdvancedOptionsRuntimeBinding,
         context: StageContext,
     ) -> AdvancedOptionsPublishStageData:
-        input_stage = self._inputs.get(self._key(context))
+        input_stage = self._input_for_downstream(context)
         projection = binding.handoff.projection(
             context.plan.cohort_id,
             context.window.cutoff,
         )
-        if input_stage is None or projection is None:
-            raise RuntimeError(
-                "Advanced Options projection handoff is unavailable"
+        if projection is None:
+            cycle = binding.handoff.cycle(
+                context.plan.cohort_id,
+                context.window.cutoff,
+            )
+            if cycle is None:
+                cycle = self._port.load_completed_cycle(
+                    context,
+                    input_stage,
+                )
+                binding.handoff.put_cycle(
+                    context.plan.cohort_id,
+                    context.window.cutoff,
+                    cycle,
+                )
+            projection = self._port.load_completed_projection(
+                context,
+                cycle,
+            )
+            binding.handoff.put_projection(
+                context.plan.cohort_id,
+                context.window.cutoff,
+                projection,
             )
         return AdvancedOptionsPublishStageData(
             input_stage.control_plane,
@@ -327,6 +464,9 @@ def build_canonical_advanced_options_runtime_binding(
     cycle_writer: Callable | None = None,
     projection_writer: Callable | None = None,
     page_source_loader: Callable | None = None,
+    catalog_version: str | None = None,
+    publication_authority_loader: Callable | None = None,
+    canonical_publisher: Callable | None = None,
 ) -> tuple[
     AdvancedOptionsRuntimeBinding,
     AdvancedOptionsCanonicalLoaders,
@@ -335,6 +475,7 @@ def build_canonical_advanced_options_runtime_binding(
     values = {
         "build_id": build_id,
         "pre_session": pre_session,
+        "reference_loader": loaders.reference,
         "input_loader": loaders.input,
         "cycle_loader": loaders.cycle,
         "projection_loader": lambda context: loaders.projection(
@@ -352,5 +493,13 @@ def build_canonical_advanced_options_runtime_binding(
         values["projection_writer"] = projection_writer
     if page_source_loader is not None:
         values["page_source_loader"] = page_source_loader
+    if catalog_version is not None:
+        values["catalog_version"] = catalog_version
+    if publication_authority_loader is not None:
+        values["publication_authority_loader"] = (
+            publication_authority_loader
+        )
+    if canonical_publisher is not None:
+        values["canonical_publisher"] = canonical_publisher
     binding = AdvancedOptionsRuntimeBinding(**values)
     return binding, loaders

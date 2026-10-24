@@ -163,6 +163,74 @@ def test_stock_gateway_authenticates_subscribes_and_hands_off_raw_bytes():
     assert "never-print-this" not in repr(result)
 
 
+def test_stock_gateway_skips_delayed_per_subscription_acknowledgements():
+    market = b'[{"ev":"Q","sym":"SPY","bp":100,"ap":101,"t":1}]'
+    delayed = json.dumps(
+        [
+            {
+                "ev": "status",
+                "status": "success",
+                "message": "subscribed to: AM.SPY",
+            },
+            {
+                "ev": "status",
+                "status": "success",
+                "message": "subscribed to: AM.TSLA",
+            },
+        ],
+        separators=(",", ":"),
+    ).encode("ascii")
+    connection = FakeConnection(
+        (_status("auth_success"), _status("success"), delayed, market)
+    )
+    buffer = _buffer()
+    gateway = _gateway(MarketFeed.STOCKS, connection, buffer)
+
+    result = asyncio.run(gateway.run_session(maximum_market_messages=1))
+    claim = buffer.claim_nowait(maximum_events=1, maximum_bytes=4096)
+
+    assert result.received_messages == 4
+    assert result.accepted_messages == 1
+    assert claim.messages[0].payload == market
+
+
+def test_stock_gateway_fails_closed_on_delayed_control_rejection():
+    connection = FakeConnection(
+        (
+            _status("auth_success"),
+            _status("success"),
+            _status("error"),
+        )
+    )
+    buffer = _buffer()
+    gateway = _gateway(MarketFeed.STOCKS, connection, buffer)
+
+    with pytest.raises(
+        GatewayControlError,
+        match="ADVANCED_STREAM_CONTROL_REJECTED:error",
+    ):
+        asyncio.run(gateway.run_session(maximum_market_messages=1))
+
+    assert gateway.state is GatewayFeedState.BLOCKED
+    assert buffer.snapshot().admitted_events == 0
+
+
+def test_stock_gateway_can_verify_subscription_without_market_data():
+    connection = FakeConnection(
+        (_status("auth_success"), _status("success"))
+    )
+    gateway = _gateway(MarketFeed.STOCKS, connection)
+
+    result = asyncio.run(
+        gateway.run_session(maximum_market_messages=0)
+    )
+
+    assert result.final_state is GatewayFeedState.STOPPED
+    assert result.accepted_messages == 0
+    assert result.subscriptions
+    assert connection.sent[1]["action"] == "subscribe"
+
+
 def test_option_gateway_uses_explicit_contract_trade_and_quote_membership():
     connection = FakeConnection(
         (

@@ -383,8 +383,8 @@ services:
 
   realtime-v2-options-p8-ingress:
     <<: *backend-service
-    profiles: ["realtime-v2-options-p8"]
-    container_name: stock-screener-realtime-v2-options-p8-ingress
+    profiles: ["realtime-v2-options-p8", "realtime-v3-options"]
+    container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-ingress
     restart: "no"
     command:
       - python
@@ -399,7 +399,7 @@ services:
       - --
       - python
       - -B
-      - scripts/run_advanced_options_p8_canary.py
+      - scripts/run_advanced_options_v3_production.py
       - --docker-service-kind
       - INGRESS
       - --package
@@ -423,7 +423,7 @@ services:
         - CMD
         - python
         - -B
-        - scripts/run_advanced_options_p8_canary.py
+        - scripts/run_advanced_options_v3_production.py
         - --docker-health-kind
         - INGRESS
         - --package
@@ -437,8 +437,8 @@ services:
 
   realtime-v2-options-p8-market-state:
     <<: *backend-service
-    profiles: ["realtime-v2-options-p8"]
-    container_name: stock-screener-realtime-v2-options-p8-market-state
+    profiles: ["realtime-v2-options-p8", "realtime-v3-options"]
+    container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-market-state
     restart: "no"
     command:
       - python
@@ -451,7 +451,7 @@ services:
       - --
       - python
       - -B
-      - scripts/run_advanced_options_p8_canary.py
+      - scripts/run_advanced_options_v3_production.py
       - --docker-service-kind
       - MARKET_STATE
       - --package
@@ -474,7 +474,7 @@ services:
         - CMD
         - python
         - -B
-        - scripts/run_advanced_options_p8_canary.py
+        - scripts/run_advanced_options_v3_production.py
         - --docker-health-kind
         - MARKET_STATE
         - --package
@@ -488,8 +488,8 @@ services:
 
   realtime-v2-options-p8-flow:
     <<: *backend-service
-    profiles: ["realtime-v2-options-p8"]
-    container_name: stock-screener-realtime-v2-options-p8-flow
+    profiles: ["realtime-v2-options-p8", "realtime-v3-options"]
+    container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-flow
     restart: "no"
     command:
       - python
@@ -502,7 +502,7 @@ services:
       - --
       - python
       - -B
-      - scripts/run_advanced_options_p8_canary.py
+      - scripts/run_advanced_options_v3_production.py
       - --docker-service-kind
       - FLOW
       - --package
@@ -525,7 +525,7 @@ services:
         - CMD
         - python
         - -B
-        - scripts/run_advanced_options_p8_canary.py
+        - scripts/run_advanced_options_v3_production.py
         - --docker-health-kind
         - FLOW
         - --package
@@ -539,8 +539,8 @@ services:
 
   realtime-v2-options-p8-window:
     <<: *backend-service
-    profiles: ["realtime-v2-options-p8"]
-    container_name: stock-screener-realtime-v2-options-p8-window
+    profiles: ["realtime-v2-options-p8", "realtime-v3-options"]
+    container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-window
     restart: "no"
     command:
       - python
@@ -553,7 +553,7 @@ services:
       - --
       - python
       - -B
-      - scripts/run_advanced_options_p8_canary.py
+      - scripts/run_advanced_options_v3_production.py
       - --docker-service-kind
       - WINDOW
       - --package
@@ -574,7 +574,7 @@ services:
         - CMD
         - python
         - -B
-        - scripts/run_advanced_options_p8_canary.py
+        - scripts/run_advanced_options_v3_production.py
         - --docker-health-kind
         - WINDOW
         - --package
@@ -796,9 +796,9 @@ services:
 
 volumes:
   realtime_v2_advanced_journals:
-    name: alpha-research-realtime-v2-advanced-journals
+    name: ${REALTIME_V2_ADVANCED_JOURNALS_VOLUME_NAME:-alpha-research-realtime-v2-advanced-journals}
   realtime_v2_advanced_reports:
-    name: alpha-research-realtime-v2-advanced-reports
+    name: ${REALTIME_V2_ADVANCED_REPORTS_VOLUME_NAME:-alpha-research-realtime-v2-advanced-reports}
   realtime_v2_retention:
     name: ${REALTIME_V2_RETENTION_VOLUME_NAME:-alpha-research-realtime-v2-retention-volume-name-required}
     external: true
@@ -815,4 +815,4 @@ secrets:
 
 networks:
   application:
-    name: alpha-research-realtime-v2-application
+    name: ${REALTIME_V2_APPLICATION_NETWORK_NAME:-alpha-research-realtime-v2-application}

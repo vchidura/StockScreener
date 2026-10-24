@@ -13,6 +13,7 @@ def test_dated_spy_reference_requires_exact_etf_identity():
             "type": "ETF",
             "composite_figi": "BBG000BDTBL9",
         },
+        ticker="SPY",
         session_date=date(2026, 10, 21),
     )
 
@@ -25,9 +26,20 @@ def test_dated_spy_reference_requires_exact_etf_identity():
     with pytest.raises(ValueError, match="identity"):
         validate_result(
             {
-                "ticker": "QQQ",
+                "ticker": "IWM",
                 "type": "ETF",
                 "composite_figi": "BBG000BDTBL9",
             },
+            ticker="QQQ",
             session_date=date(2026, 10, 21),
         )
+
+    assert validate_result(
+        {
+            "ticker": "qqq",
+            "type": "ETF",
+            "composite_figi": "BBG000BDTBL9",
+        },
+        ticker="QQQ",
+        session_date=date(2026, 10, 21),
+    )["ticker"] == "QQQ"

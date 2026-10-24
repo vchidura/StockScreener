@@ -1,11 +1,15 @@
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
+
+import pytest
 
 from realtime.advanced_equity_control_plane import (
     build_advanced_equity_control_plane_plan,
     persist_advanced_equity_control_plane_cursor,
+    validate_active_target9_equity_source_cursor,
 )
+from realtime.contracts import EQUITY_VALIDATION_UNIVERSE
 from realtime.preflight import DetectorFamily, ProviderTier
 
 
@@ -23,6 +27,23 @@ def _plan():
         expires_at=NOW + timedelta(hours=8),
         schema_sha256="b" * 64,
         security_policy_sha256="c" * 64,
+    )
+
+
+def _target9_plan():
+    return build_advanced_equity_control_plane_plan(
+        session_date=date(2026, 10, 16),
+        security_ids={
+            ticker: uuid5(NAMESPACE_URL, f"test-security:{ticker}")
+            for ticker in EQUITY_VALIDATION_UNIVERSE.equity_tickers
+        },
+        entitlement_evidence_sha256="a" * 64,
+        authorization_reference="advanced-equity-target9-20261016",
+        checked_at=NOW,
+        expires_at=NOW + timedelta(hours=8),
+        schema_sha256="b" * 64,
+        security_policy_sha256="c" * 64,
+        configuration_sha256="d" * 64,
     )
 
 
@@ -82,3 +103,32 @@ def test_advanced_control_plane_persists_without_portal_activation():
         for value in statements
     )
     assert all("portal_cohort_current" not in value for value in statements)
+
+
+def test_options_source_requires_active_target9_runtime_profile():
+    plan = _target9_plan()
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {
+        "universe_target": 9,
+        "provider_tier": "MASSIVE_ADVANCED",
+        "feed": "STOCKS",
+        "channels": ["AM"],
+        "status": "ACTIVE",
+        "configuration_sha256": plan.configuration_sha256,
+    }
+
+    validate_active_target9_equity_source_cursor(cursor, plan)
+
+    cursor.fetchone.return_value = {
+        "universe_target": 9,
+        "provider_tier": "MASSIVE_ADVANCED",
+        "feed": "STOCKS",
+        "channels": ["AM"],
+        "status": "CANDIDATE",
+        "configuration_sha256": plan.configuration_sha256,
+    }
+    with pytest.raises(ValueError, match="runtime profile is not active"):
+        validate_active_target9_equity_source_cursor(cursor, plan)
+
+    with pytest.raises(ValueError, match="exact target-9"):
+        validate_active_target9_equity_source_cursor(cursor, _plan())

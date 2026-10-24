@@ -16,6 +16,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import psycopg2
 
 from .advanced_options_control_plane import (
+    advanced_options_equity_input_binding_payload,
     advanced_options_enrollment_plan_payload,
     advanced_options_history_binding_payload,
 )
@@ -52,7 +53,7 @@ from .worker_database import RealtimeProcessDatabase
 
 
 UTC = timezone.utc
-P8_EXECUTION_BUNDLE_SCHEMA = "advanced-options-p8-execution-bundle-v2"
+P8_EXECUTION_BUNDLE_SCHEMA = "advanced-options-p8-execution-bundle-v3"
 P8_EXECUTION_BUNDLE_MAX_BYTES = 1_048_576
 P8_HEARTBEAT_INTERVAL_SECONDS = 10
 P8_EFFECT_DENIALS = {
@@ -184,6 +185,24 @@ class P8ExecutionBundleStore:
             raise TypeError("P8 execution bundle requires a typed binding")
         checked = _utc(written_at, "written_at")
         control = binding.enrollment.control_plane
+        deployment = self.package.get("v3_deployment")
+        authority_references = None
+        if isinstance(deployment, Mapping):
+            from .advanced_options_v3_deployment import (
+                build_advanced_options_v3_authority_references,
+            )
+
+            authorities = self.package.get("v3_authorities")
+            if not isinstance(authorities, Mapping):
+                raise ValueError(
+                    "V3 package session acquisition authority is unavailable"
+                )
+            authority_references = (
+                build_advanced_options_v3_authority_references(
+                    authorities.get("session_acquisition"),
+                    target_window_id=binding.window_id,
+                )
+            )
         payload = {
             "schema": P8_EXECUTION_BUNDLE_SCHEMA,
             "package_sha256": self.package["package_sha256"],
@@ -193,6 +212,13 @@ class P8ExecutionBundleStore:
             "cohort_id": str(control.cohort_id),
             "plan_id": str(control.plan_id),
             "window_id": str(binding.window_id),
+            "orchestration": dict(self.package["orchestration"]),
+            "v3_authorities": (
+                None
+                if self.package.get("v3_authorities") is None
+                else dict(self.package["v3_authorities"])
+            ),
+            "v3_authority_references": authority_references,
             "written_at_utc": checked.isoformat(),
             "services": [
                 {
@@ -213,6 +239,11 @@ class P8ExecutionBundleStore:
             ),
             "history_binding": advanced_options_history_binding_payload(
                 binding.history
+            ),
+            "equity_input_binding": (
+                advanced_options_equity_input_binding_payload(
+                    binding.equity_input
+                )
             ),
             "underlying_price_binding": (
                 underlying_snapshot_binding_payload(
@@ -284,6 +315,9 @@ def validate_p8_execution_bundle(
         or bundle.get("plan_id") != package.get("orchestration", {}).get(
             "plan_id"
         )
+        or bundle.get("orchestration") != package.get("orchestration")
+        or bundle.get("v3_authorities")
+        != package.get("v3_authorities")
         or bundle.get("effect_authorizations") != P8_EFFECT_DENIALS
         or not isinstance(services, list)
         or [row.get("kind") for row in services] != [
@@ -298,6 +332,18 @@ def validate_p8_execution_bundle(
         ]
     ):
         raise ValueError("P8 execution bundle identity changed")
+    if (
+        isinstance(package.get("v3_deployment"), Mapping)
+        and package.get("v3_authorities") is not None
+    ):
+        from .advanced_options_v3_deployment import (
+            validate_advanced_options_v3_authority_references,
+        )
+
+        validate_advanced_options_v3_authority_references(
+            package,
+            bundle,
+        )
     validate_p8_service_membership(package)
     if expected_kind is not None and (
         not isinstance(expected_kind, AdvancedOptionsProcessKind)

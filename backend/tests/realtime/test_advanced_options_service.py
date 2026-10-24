@@ -13,6 +13,8 @@ from test_advanced_options_cycle import NOW
 from realtime.advanced_options_service import (
     OPTIONS_NON_SERVING_STAGE_ORDER,
     OPTIONS_RESIDENT_STAGE_SUBSET,
+    OPTIONS_V3_STAGE_ORDER,
+    OPTIONS_V3_STAGE_SUBSET,
     PASSING_P7_MANIFEST_ID,
     PASSING_P7_MANIFEST_SHA256,
     PASSING_P7_REPORT_SHA256,
@@ -24,6 +26,7 @@ from realtime.advanced_options_service import (
     AdvancedOptionsResidentSupervisor,
     AdvancedOptionsSubprocessPort,
     build_advanced_options_non_serving_qualification_plan,
+    build_advanced_options_v3_service_plan,
     build_owp3_advanced_options_resident_plan,
     build_provider_free_advanced_options_resident_plan,
     evaluate_advanced_options_process_health,
@@ -227,6 +230,38 @@ def test_non_serving_qualification_plan_freezes_full_inert_v4_subset():
     assert plan.p7_source_commit == PASSING_P7_SOURCE_COMMIT
     assert plan.cohort_kind == "MARKET_OPTIONS"
     assert not any(plan.effect_authorizations.values())
+
+
+def test_v3_service_plan_is_prospective_and_keeps_v4_plan_unchanged():
+    plan = build_advanced_options_v3_service_plan(
+        plan_id=uuid4(),
+        cohort_id=uuid4(),
+        session_date=NOW.date(),
+        config_sha256="d" * 64,
+        deadline=NOW + timedelta(hours=1),
+    )
+
+    assert plan.stage_catalog_version == "stages_v5"
+    assert plan.enabled_stages == OPTIONS_V3_STAGE_SUBSET
+    assert OPTIONS_V3_STAGE_ORDER == (
+        "OPTIONS_ACQUIRE",
+        "OPTIONS_ADMISSION",
+        "OPTIONS_REFERENCE",
+        "OPTIONS_FLOW",
+        "OPTIONS_INPUT_GATE",
+        "OPTIONS_CYCLE",
+        "OPTIONS_PROJECTION",
+        "OPTIONS_PUBLISH",
+    )
+    assert OPTIONS_NON_SERVING_STAGE_ORDER == (
+        "OPTIONS_ACQUIRE",
+        "OPTIONS_ADMISSION",
+        "OPTIONS_FLOW",
+        "OPTIONS_INPUT_GATE",
+        "OPTIONS_CYCLE",
+        "OPTIONS_PROJECTION",
+        "OPTIONS_PUBLISH",
+    )
 
 
 def test_owp3_resident_plan_is_bound_to_the_passing_p7_evidence():

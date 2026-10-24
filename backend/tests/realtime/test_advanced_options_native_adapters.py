@@ -26,15 +26,11 @@ def test_native_bundle_has_exact_accepted_executor_membership():
     bundle = AdvancedOptionsNativeInputBundle(
         o1=AdvancedOptionsLaneInputs(),
         o3=AdvancedOptionsLaneInputs(),
-        s1=AdvancedOptionsLaneInputs(),
-        s2=AdvancedOptionsLaneInputs(),
     )
 
     assert set(bundle.executors()) == {
         DetectorFamily.O1,
         DetectorFamily.O3,
-        DetectorFamily.S1,
-        DetectorFamily.S2,
     }
 
 
@@ -43,8 +39,6 @@ def test_empty_complete_inputs_produce_complete_zero_for_every_lane():
     bundle = AdvancedOptionsNativeInputBundle(
         o1=AdvancedOptionsLaneInputs(),
         o3=AdvancedOptionsLaneInputs(),
-        s1=AdvancedOptionsLaneInputs(),
-        s2=AdvancedOptionsLaneInputs(),
     )
 
     for detector, executor in bundle.executors().items():
@@ -66,12 +60,6 @@ def test_missing_canonical_inputs_are_blocked_not_complete_zero():
         ),
         o3=AdvancedOptionsLaneInputs(
             blocked_reason_codes=("O3_INPUT_UNAVAILABLE",),
-        ),
-        s1=AdvancedOptionsLaneInputs(
-            blocked_reason_codes=("S1_INPUT_UNAVAILABLE",),
-        ),
-        s2=AdvancedOptionsLaneInputs(
-            blocked_reason_codes=("S2_INPUT_UNAVAILABLE",),
         ),
     )
 

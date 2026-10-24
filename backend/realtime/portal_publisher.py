@@ -13,13 +13,17 @@ from .portal_projection import RealtimePortalSnapshot
 from .portal_projection_repository import (
     RELEASE_CLASS_SESSION_CLOSE,
     RETENTION_HOT_AND_KEPT,
+    PortalRelease,
+    PortalReleasePointer,
     PortalReleaseReceipt,
     claim_alert_outbox_cursor,
     fail_alert_outbox_delivery_cursor,
+    load_portal_release_pointer_cursor,
     mark_alert_outbox_delivered_cursor,
     persist_portal_snapshot_cursor,
     portal_session_date,
     publish_portal_release_cursor,
+    restore_portal_release_pointer_cursor,
 )
 from .preflight import ProviderTier
 from .worker_database import RealtimeProcessDatabase
@@ -161,6 +165,7 @@ class PortalPublicationStatus:
     retried: int
     abandoned: int
     reason_codes: tuple[str, ...]
+    release: PortalRelease | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "checked_at", _utc(self.checked_at, "checked_at"))
@@ -175,6 +180,11 @@ class PortalPublicationStatus:
             raise ValueError("portal publication counters must be nonnegative")
         if self.claimed != self.delivered + self.retried + self.abandoned:
             raise ValueError("portal publication delivery counters are unbalanced")
+        if self.release is not None and not isinstance(
+            self.release,
+            PortalRelease,
+        ):
+            raise TypeError("portal publication release result is invalid")
 
     @property
     def verdict(self) -> PortalPublisherVerdict:
@@ -183,6 +193,145 @@ class PortalPublicationStatus:
         if self.promoted_snapshots or self.claimed:
             return PortalPublisherVerdict.COMPLETE
         return PortalPublisherVerdict.IDLE
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalPortalPublicationResult:
+    status: PortalPublicationStatus
+    release: PortalRelease
+    pointer: PortalReleasePointer
+
+    def __post_init__(self) -> None:
+        if (
+            self.status.release != self.release
+            or self.pointer.release_id != self.release.release_id
+            or self.pointer.cohort_id != self.release.cohort_id
+            or self.pointer.provider_tier is not self.release.provider_tier
+            or self.pointer.cutoff != self.release.cutoff
+        ):
+            raise ValueError(
+                "canonical portal publication result is inconsistent"
+            )
+
+
+class _ForbiddenPortalDeliverySink:
+    def deliver(self, _message):
+        raise RuntimeError("portal delivery is not authorized")
+
+
+class CanonicalPortalPublisher:
+    """One release/pointer operation with exact rollback on post-publish failure."""
+
+    def __init__(
+        self,
+        database: RealtimeProcessDatabase,
+        config: PortalPublicationConfig,
+        *,
+        sink: PortalDeliverySink | None = None,
+        publication_runner: Callable | None = None,
+        pointer_loader: Callable = load_portal_release_pointer_cursor,
+        pointer_restorer: Callable = restore_portal_release_pointer_cursor,
+    ) -> None:
+        if not isinstance(database, RealtimeProcessDatabase):
+            raise TypeError("canonical portal publisher database is invalid")
+        if (
+            not isinstance(config, PortalPublicationConfig)
+            or config.dispatch_authorized
+        ):
+            raise ValueError(
+                "canonical portal stage publisher must disable dispatch"
+            )
+        self._database = database
+        self._config = config
+        self._sink = sink or _ForbiddenPortalDeliverySink()
+        self._publication_runner = (
+            run_portal_publication_once
+            if publication_runner is None
+            else publication_runner
+        )
+        self._pointer_loader = pointer_loader
+        self._pointer_restorer = pointer_restorer
+        if any(
+            not callable(value)
+            for value in (
+                self._publication_runner,
+                self._pointer_loader,
+                self._pointer_restorer,
+            )
+        ):
+            raise TypeError("canonical portal publisher callback is invalid")
+
+    def _pointer(self) -> PortalReleasePointer | None:
+        with self._database.transaction(read_only=True) as cursor:
+            return self._pointer_loader(
+                cursor,
+                cohort_id=self._config.cohort_id,
+                provider_tier=self._config.provider_tier,
+            )
+
+    def publish(
+        self,
+        batch: PortalPublicationBatch,
+        *,
+        checked_at: datetime,
+    ) -> CanonicalPortalPublicationResult:
+        if batch.receipt is None:
+            raise ValueError(
+                "canonical portal publication requires a release receipt"
+            )
+        previous = self._pointer()
+        release = None
+        try:
+            status = self._publication_runner(
+                self._database,
+                self._config,
+                batch,
+                self._sink,
+                checked_at=checked_at,
+            )
+            if not isinstance(status, PortalPublicationStatus):
+                raise TypeError(
+                    "canonical portal publisher returned an invalid status"
+                )
+            release = status.release
+            if (
+                release is None
+                or release.receipt_id != batch.receipt.receipt_id
+                or release.cohort_id != self._config.cohort_id
+                or release.provider_tier is not self._config.provider_tier
+                or release.cutoff != batch.receipt.cutoff
+                or not release.pointer_swapped
+                or any((
+                    status.claimed,
+                    status.delivered,
+                    status.retried,
+                    status.abandoned,
+                ))
+            ):
+                raise ValueError(
+                    "canonical portal publication result changed authority"
+                )
+            pointer = self._pointer()
+            if pointer is None or pointer.release_id != release.release_id:
+                raise ValueError(
+                    "canonical portal publication did not advance its pointer"
+                )
+            return CanonicalPortalPublicationResult(
+                status,
+                release,
+                pointer,
+            )
+        except Exception:
+            if release is not None and release.pointer_swapped:
+                with self._database.transaction() as cursor:
+                    self._pointer_restorer(
+                        cursor,
+                        cohort_id=self._config.cohort_id,
+                        provider_tier=self._config.provider_tier,
+                        expected_current_release_id=release.release_id,
+                        previous=previous,
+                    )
+            raise
 
 
 def _message(row: Mapping[str, object]) -> PortalOutboxMessage:
@@ -236,6 +385,7 @@ def run_portal_publication_once(
         )
     ):
         raise ValueError("portal snapshot batch conflicts with publisher identity or clock")
+    release = None
     if batch.snapshots:
         close_session = None
         if batch.session_close:
@@ -254,7 +404,11 @@ def run_portal_publication_once(
                 else:
                     snapshot_repository(cursor, snapshot)
             if batch.receipt is not None:
-                release_repository(cursor, batch.receipt, batch.snapshots)
+                release = release_repository(
+                    cursor,
+                    batch.receipt,
+                    batch.snapshots,
+                )
                 if kept:
                     release_repository(
                         cursor, batch.receipt, tuple(kept),
@@ -326,4 +480,5 @@ def run_portal_publication_once(
         retried=retried,
         abandoned=abandoned,
         reason_codes=tuple(dict.fromkeys(reasons)),
+        release=release,
     )

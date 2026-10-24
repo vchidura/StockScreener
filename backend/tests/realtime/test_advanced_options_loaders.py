@@ -1,7 +1,11 @@
 from contextlib import contextmanager
+from dataclasses import replace
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
+
+import pytest
 
 from advanced_options_reference_support import reference_state
 from advanced_options_rolling_support import rolling_state
@@ -13,12 +17,15 @@ from realtime.advanced_options_loaders import (
 )
 from realtime.advanced_options_projection import (
     AdvancedOptionsPageSource,
+    build_advanced_options_projection_batch,
 )
+from realtime.advanced_options_cycle import run_advanced_options_cycle
 from realtime.advanced_options_native_adapters import (
     AdvancedOptionsLaneInputs,
     AdvancedOptionsNativeInputBundle,
 )
 from realtime.options_v2_runtime import OptionsPreSessionStageBinding
+from realtime.advanced_options_runtime import AdvancedOptionsRuntimeHandoff
 from realtime.advanced_options_package_evidence import (
     build_flow_package_evidence_batch,
 )
@@ -94,7 +101,32 @@ def _input_facts():
         equity_window_id=EQUITY_WINDOW,
         instrument_ids={"SPY": 101},
         available_at=NOW,
+        maximum_equity_input_age_seconds=None,
     )
+
+
+def test_unbound_equity_receipt_preserves_exact_cutoff_behavior():
+    facts = _input_facts()
+    stale_receipt = replace(
+        facts.equity_input_receipt,
+        cutoff=NOW - timedelta(seconds=1),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Equity input receipt changed",
+    ):
+        replace(
+            facts,
+            equity_input_receipt=stale_receipt,
+            maximum_equity_input_age_seconds=None,
+        )
+
+    assert replace(
+        facts,
+        equity_input_receipt=stale_receipt,
+        maximum_equity_input_age_seconds=1,
+    ).maximum_equity_input_age_seconds == 1
 
 
 def test_canonical_loader_reconstructs_and_opens_exact_input_barrier():
@@ -172,8 +204,6 @@ def test_canonical_loader_builds_exact_native_executor_membership():
     native = AdvancedOptionsNativeInputBundle(
         o1=AdvancedOptionsLaneInputs(),
         o3=AdvancedOptionsLaneInputs(),
-        s1=AdvancedOptionsLaneInputs(),
-        s2=AdvancedOptionsLaneInputs(),
     )
     port.load_cycle_facts.return_value = AdvancedOptionsCanonicalCycleFacts(
         receipt,
@@ -189,8 +219,6 @@ def test_canonical_loader_builds_exact_native_executor_membership():
     assert set(cycle.executors) == {
         DetectorFamily.O1,
         DetectorFamily.O3,
-        DetectorFamily.S1,
-        DetectorFamily.S2,
     }
 
 
@@ -212,3 +240,116 @@ def test_canonical_binding_factory_wires_one_loader_owner():
     assert binding.input_loader.__self__ is loaders
     assert binding.cycle_loader.__self__ is loaders
     assert binding.pre_session.operations is operations
+
+
+def test_completed_stage_handoffs_rehydrate_from_durable_hashes():
+    facts = _input_facts()
+    context = _Context(facts.control_plane)
+    port = MagicMock()
+    port.load_input_facts.return_value = facts
+
+    def evaluate(_cursor, barrier_id):
+        return JobBarrierVerdict(
+            barrier_id,
+            "COMPLETE",
+            2,
+            ("EQUITY_INPUT_READY", "UNDERLYER:SPY"),
+            (),
+            (),
+        )
+
+    initial = AdvancedOptionsCanonicalLoaders(
+        port,
+        build_id="advanced-options-runtime-v1",
+        enqueue_job=lambda *_args: None,
+        open_barrier=lambda *_args, **_kwargs: None,
+        record_barrier_outcome=lambda *_args, **_kwargs: None,
+        evaluate_barrier=evaluate,
+    )
+    input_stage = initial.input(context)
+    receipt = reconstruct_options_input_ready_receipt(
+        input_stage.input_gate,
+        input_stage.barrier_verdict,
+        cutoff=NOW,
+        reference_generation=input_stage.reference_generation,
+        build_id="advanced-options-runtime-v1",
+    )
+    native = AdvancedOptionsNativeInputBundle(
+        o1=AdvancedOptionsLaneInputs(),
+        o3=AdvancedOptionsLaneInputs(),
+    )
+    cycle = run_advanced_options_cycle(
+        control_plane=facts.control_plane,
+        input_gate=input_stage.input_gate,
+        input_receipt=receipt,
+        executors=native.executors(),
+        cutoff=NOW,
+        reference_generation=input_stage.reference_generation,
+        reference_repository=_reference_repository(),
+        build_id="advanced-options-runtime-v1",
+    )
+    projection = build_advanced_options_projection_batch(
+        control_plane=facts.control_plane,
+        cycle=cycle,
+        generated_at=NOW,
+        build_id="advanced-options-runtime-v1",
+        page_source=AdvancedOptionsPageSource(),
+    )
+    port.load_input_receipt.return_value = receipt
+    port.load_cycle_facts.return_value = AdvancedOptionsCanonicalCycleFacts(
+        receipt,
+        native,
+        _reference_repository(),
+        lambda value: build_flow_package_evidence_batch(value, ()),
+        "cycle-evidence",
+    )
+    port.load_completed_cycle.return_value = cycle
+    port.load_completed_projection.return_value = projection
+
+    def unexpected_write(*_args, **_kwargs):
+        raise AssertionError("completed input stage attempted a write")
+
+    restarted = AdvancedOptionsCanonicalLoaders(
+        port,
+        build_id="advanced-options-runtime-v1",
+        enqueue_job=unexpected_write,
+        open_barrier=unexpected_write,
+        record_barrier_outcome=unexpected_write,
+        evaluate_barrier=evaluate,
+    )
+    cycle_data = restarted.cycle(context)
+
+    assert cycle_data.input_gate.closure_sha256 == (
+        receipt.input_sha256
+    )
+    after_cycle = SimpleNamespace(
+        handoff=AdvancedOptionsRuntimeHandoff()
+    )
+    projection_data = restarted.projection(after_cycle, context)
+    assert projection_data.cycle.cycle_sha256 == cycle.cycle_sha256
+    assert after_cycle.handoff.cycle(
+        facts.control_plane.cohort_id,
+        NOW,
+    ) == cycle
+
+    after_projection = AdvancedOptionsCanonicalLoaders(
+        port,
+        build_id="advanced-options-runtime-v1",
+        enqueue_job=unexpected_write,
+        open_barrier=unexpected_write,
+        record_barrier_outcome=unexpected_write,
+        evaluate_barrier=evaluate,
+    )
+    publish_binding = SimpleNamespace(
+        handoff=AdvancedOptionsRuntimeHandoff()
+    )
+    publish_data = after_projection.publish(
+        publish_binding,
+        context,
+    )
+
+    assert publish_data.projection.batch_sha256 == (
+        projection.portal_ready_receipt.input_sha256
+    )
+    assert port.load_completed_cycle.call_count == 2
+    assert port.load_completed_projection.call_count == 1

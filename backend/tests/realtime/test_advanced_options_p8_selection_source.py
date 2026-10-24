@@ -10,6 +10,7 @@ import pytest
 from options.data.polygon_http import PolygonHttpResponse
 from realtime.advanced_options_p8_selection_source import (
     MassiveAdvancedOptionsSelectionSource,
+    p8_activity_selection_capture_from_sealed,
 )
 from realtime.advanced_options_p8_production import (
     _cycle_cutoff,
@@ -243,6 +244,76 @@ def test_advanced_source_rejects_excessive_provider_clock_skew():
         ).capture(reviewed_at=REVIEWED, session_date=SESSION)
 
 
+def test_sealed_capture_reconstructs_exact_call_put_scope_provider_free():
+    selected_snapshots = {}
+    for underlyer, strike in (("QQQ", 600), ("SPY", 670)):
+        for kind, option_type in (("call", "C"), ("put", "P")):
+            ticker = (
+                f"O:{underlyer}261021{option_type}"
+                f"{strike * 1000:08d}"
+            )
+            selected_snapshots[ticker] = _contract(
+                underlyer,
+                ticker,
+                kind,
+                strike,
+                strike,
+            )
+    capture = p8_activity_selection_capture_from_sealed({
+        "contract": "advanced-options-v3-pre-session-capture-v1",
+        "captured_at_utc": REVIEWED.isoformat(),
+        "session_date": SESSION.isoformat(),
+        "provider_requests": 2,
+        "decoded_bytes": 4096,
+        "responses": [
+            {"underlyer": "QQQ", "request_id": "q"},
+            {"underlyer": "SPY", "request_id": "s"},
+        ],
+        "selected_snapshots": selected_snapshots,
+        "semantic_sha256": "a" * 64,
+    })
+
+    assert capture.request_count == 2
+    assert capture.pagination_requests == 0
+    assert capture.selection.contracts == (
+        "O:QQQ261021C00600000",
+        "O:QQQ261021P00600000",
+        "O:SPY261021C00670000",
+        "O:SPY261021P00670000",
+    )
+    assert capture.evidence["sealed_capture_semantic_sha256"] == "a" * 64
+
+
+def test_sealed_capture_rejects_missing_call_put_member():
+    snapshots = {}
+    for underlyer, strikes in (
+        ("QQQ", (600, 601)),
+        ("SPY", (670, 671)),
+    ):
+        for strike in strikes:
+            ticker = f"O:{underlyer}261021C{strike * 1000:08d}"
+            snapshots[ticker] = _contract(
+                underlyer,
+                ticker,
+                "call",
+                strike,
+                strikes[0],
+            )
+    with pytest.raises(ValueError, match="call/put membership"):
+        p8_activity_selection_capture_from_sealed({
+            "contract": "advanced-options-v3-pre-session-capture-v1",
+            "captured_at_utc": REVIEWED.isoformat(),
+            "session_date": SESSION.isoformat(),
+            "provider_requests": 2,
+            "decoded_bytes": 4096,
+            "responses": [
+                {"underlyer": "QQQ"},
+                {"underlyer": "SPY"},
+            ],
+            "selected_snapshots": snapshots,
+        })
+
+
 def test_open_interest_identity_serializes_market_time():
     digest = _open_interest_sha256((
         SimpleNamespace(
@@ -262,6 +333,7 @@ def test_p8_manifest_policy_is_same_day_and_bounded():
     assert policy.target_dtes == (0,)
     assert policy.minimum_dte == policy.maximum_dte == 0
     assert policy.maximum_contracts_per_underlying == 2
+    assert policy.maximum_option_quote_contracts == 4
 
 
 def test_p8_cycle_cutoff_is_prospective_and_window_bounded():

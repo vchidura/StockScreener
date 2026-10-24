@@ -56,13 +56,18 @@ LIVE024_MIGRATION_VERSIONS = (
 )
 POST024_RELATIONS = frozenset({
     "rt.advanced_journal_recovery_events",
+    "rt.advanced_options_equity_input_bindings",
+    "rt.advanced_options_authority_receipts",
     "rt.advanced_options_read_pins",
+    "rt.advanced_options_resident_completions",
+    "rt.advanced_options_session_acquisition_authorizations",
     "rt.advanced_options_flow_package_evidence",
     "rt.advanced_options_reference_cycle_bindings",
     "rt.advanced_options_reference_session_freezes",
     "rt.advanced_options_reference_state_members",
     "rt.advanced_options_reference_states",
     "rt.advanced_options_rolling_checkpoints",
+    "rt.advanced_options_window_cycle_authorizations",
     "rt.option_flow_cluster_members",
     "rt.option_flow_contract_scope_members",
     "rt.option_flow_contract_scopes",

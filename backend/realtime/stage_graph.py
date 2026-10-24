@@ -15,8 +15,13 @@ STAGE_CATALOG_VERSION = "stages_v1"
 STAGE_CATALOG_VERSION_V2 = "stages_v2"
 STAGE_CATALOG_VERSION_V3 = "stages_v3"
 STAGE_CATALOG_VERSION_V4 = "stages_v4"
+STAGE_CATALOG_VERSION_V5 = "stages_v5"
 TERMINAL_STATES = frozenset({"COMPLETE", "FAILED", "BLOCKED_PREREQ", "BLOCKED_POLICY", "MISSED"})
 NON_COMPLETING_STATES = frozenset({"FAILED", "BLOCKED_PREREQ", "BLOCKED_POLICY", "MISSED"})
+DEFERRED_STATES = frozenset({"DEFERRED"})
+
+TARGET_WINDOW_E_BINDING = "TARGET_WINDOW_E_BINDING"
+OPTIONS_RESIDENT_COMPLETION = "OPTIONS_RESIDENT_COMPLETION"
 
 
 DATA_LANE = "data"
@@ -35,6 +40,7 @@ class StageDefinition:
     schedule_kind: str
     gates_strategy: bool = False
     deadline_offset_seconds: int | None = None
+    external_prerequisites: tuple[str, ...] = ()
 
     @property
     def lane(self) -> str:
@@ -192,11 +198,79 @@ STAGES_V4: dict[str, StageDefinition] = {
     )
 }
 
+STAGES_V5: dict[str, StageDefinition] = {
+    stage.stage_id: stage for stage in (
+        *STAGES_V3.values(),
+        StageDefinition(
+            "OPTIONS_ACQUIRE",
+            "options",
+            ("REFERENCE",),
+            OPTIONS_LANE,
+            "SESSION",
+        ),
+        StageDefinition(
+            "OPTIONS_ADMISSION",
+            "options",
+            ("OPTIONS_ACQUIRE",),
+            OPTIONS_LANE,
+            "SESSION",
+        ),
+        StageDefinition(
+            "OPTIONS_REFERENCE",
+            "options",
+            ("OPTIONS_ACQUIRE",),
+            OPTIONS_LANE,
+            "SESSION",
+        ),
+        StageDefinition(
+            "OPTIONS_FLOW",
+            "options",
+            ("OPTIONS_ADMISSION", "OPTIONS_REFERENCE"),
+            OPTIONS_LANE,
+            "CONTINUOUS",
+        ),
+        StageDefinition(
+            "OPTIONS_INPUT_GATE",
+            "options",
+            ("OPTIONS_REFERENCE",),
+            OPTIONS_LANE,
+            "WINDOW",
+            external_prerequisites=(
+                TARGET_WINDOW_E_BINDING,
+                OPTIONS_RESIDENT_COMPLETION,
+            ),
+        ),
+        StageDefinition(
+            "OPTIONS_CYCLE",
+            "options",
+            ("OPTIONS_INPUT_GATE",),
+            OPTIONS_LANE,
+            "WINDOW",
+            True,
+        ),
+        StageDefinition(
+            "OPTIONS_PROJECTION",
+            "options",
+            ("OPTIONS_CYCLE",),
+            OPTIONS_LANE,
+            "COALESCED",
+        ),
+        StageDefinition(
+            "OPTIONS_PUBLISH",
+            "options",
+            ("OPTIONS_PROJECTION",),
+            OPTIONS_LANE,
+            "COALESCED",
+        ),
+    )
+}
+
 STAGE_CATALOGS = {
     STAGE_CATALOG_VERSION: STAGES_V1,
     STAGE_CATALOG_VERSION_V2: STAGES_V2,
     STAGE_CATALOG_VERSION_V3: STAGES_V3,
     STAGE_CATALOG_VERSION_V4: STAGES_V4,
+    STAGE_CATALOG_VERSION_V5: STAGES_V5,
 }
 
 
@@ -257,6 +331,9 @@ def decide_window(
         if own == "RUNNING":
             decisions[stage_id] = Decision(stage_id, Action.WAIT)
             continue
+        if own in DEFERRED_STATES:
+            decisions[stage_id] = Decision(stage_id, Action.WAIT)
+            continue
         blocking = next((item for item in definition.prerequisites
                          if states.get(item) in NON_COMPLETING_STATES), None)
         if blocking is not None:
@@ -284,6 +361,15 @@ def startable_stages(
     for stage_id in enabled:
         definition = stages[stage_id]
         if readiness.get(stage_id) == "BLOCKED":
+            continue
+        if (
+            definition.schedule_kind in RESIDENT_SCHEDULES
+            and any(
+                stages[item].schedule_kind == "SESSION"
+                and readiness.get(item) != "READY"
+                for item in definition.prerequisites
+            )
+        ):
             continue
         if all(readiness.get(item) != "BLOCKED" and (item in enabled or stages[item].domain == "shared")
                for item in definition.prerequisites):

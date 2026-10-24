@@ -8,6 +8,7 @@ from uuid import UUID
 import pytest
 
 import realtime.advanced_options_p8_canary_authorization as authorization
+from realtime.contracts import EQUITY_VALIDATION_UNIVERSE
 from realtime.advanced_options_p8_canary_authorization import (
     LIVE_OBSERVATION_SCHEMA,
     PAGE_RELEASE_OBSERVATION_SCHEMA,
@@ -50,6 +51,27 @@ STOP = datetime(2026, 10, 22, 17, 10, tzinfo=UTC)
 CHECKED = datetime(2026, 10, 22, 16, 59, tzinfo=UTC)
 
 
+def _equity_input_source():
+    return {
+        "source_cohort_id": "11111111-1111-4111-8111-111111111111",
+        "source_cohort_sha256": "8" * 64,
+        "source_manifest_id": "22222222-2222-4222-8222-222222222222",
+        "source_manifest_sha256": "9" * 64,
+        "source_profile_id": "33333333-3333-4333-8333-333333333333",
+        "source_profile_sha256": "a" * 64,
+        "equity_window_id": "44444444-4444-4444-8444-444444444444",
+        "equity_receipt_id": "55555555-5555-4555-8555-555555555555",
+        "equity_cutoff_utc": (
+            START - timedelta(minutes=2)
+        ).isoformat(),
+        "reference_generation": 1,
+        "universe_sha256": "b" * 64,
+        "input_sha256": "c" * 64,
+        "build_id": "advanced-equity-test-v1",
+        "symbols": list(EQUITY_VALIDATION_UNIVERSE.equity_tickers),
+    }
+
+
 def test_source_binding_covers_repository_owned_p8_docker_runtime():
     expected = {
         "backend/realtime/advanced_options_p8_docker.py",
@@ -58,9 +80,12 @@ def test_source_binding_covers_repository_owned_p8_docker_runtime():
         "backend/realtime/advanced_options_p8_runtime.py",
         "backend/realtime/advanced_options_p8_selection_source.py",
         "backend/realtime/advanced_options_p8_window.py",
+        "backend/realtime/advanced_options_equity_input.py",
         "backend/realtime/advanced_options_read_pin.py",
         "backend/scripts/run_realtime_v2_container.py",
         "backend/realtime/sql_v2/032_advanced_options_read_pins.sql",
+        "backend/realtime/sql_v2/033_advanced_options_equity_input_bindings.sql",
+        "backend/scripts/prepare_advanced_options_p8_equity_input_source.py",
         "docker-compose.realtime-v2.yml",
     }
 
@@ -112,10 +137,35 @@ def package(qualification):
         prepared_at=PREPARED,
         window_start=START,
         window_end=STOP,
+        equity_input_source=_equity_input_source(),
         expected_qualification_semantic_sha256=semantic_sha256,
         expected_qualification_file_sha256=file_sha256,
         source_files=SOURCE_FILES,
     )
+
+
+def test_package_rejects_non_target9_equity_source(qualification):
+    report, semantic_sha256, file_sha256 = qualification
+    source = _equity_input_source()
+    source["symbols"] = ["QQQ", "SPY"]
+    with pytest.raises(
+        ValueError,
+        match="Equity input source scope changed",
+    ):
+        build_p8_canary_authorization(
+            report,
+            repository_root=ROOT,
+            source_commit=COMMIT,
+            authorization_reference=REFERENCE,
+            package_nonce=NONCE,
+            prepared_at=PREPARED,
+            window_start=START,
+            window_end=STOP,
+            equity_input_source=source,
+            expected_qualification_semantic_sha256=semantic_sha256,
+            expected_qualification_file_sha256=file_sha256,
+            source_files=SOURCE_FILES,
+        )
 
 
 def _selection(package):
@@ -220,6 +270,38 @@ def _observation(package):
             "repaired_sessions": package[
                 "history_binding"
             ]["required_sessions"],
+            "coverage_requirements": {
+                "underlyings": package["history_binding"][
+                    "required_underlyings"
+                ],
+                "adjusted_daily_sessions": package[
+                    "history_binding"
+                ]["required_adjusted_daily_sessions"],
+                "raw_daily_sessions": package[
+                    "history_binding"
+                ]["required_raw_daily_sessions"],
+            },
+        },
+        "equity_input_source": {
+            key: value
+            for key, value in package["equity_input_binding"].items()
+            if key != "symbols"
+        },
+        "equity_input_readiness": {
+            "status": "READY",
+            "history_source_cohort_id": package[
+                "history_binding"
+            ]["source_cohort_id"],
+            "equity_source_cohort_id": package[
+                "equity_input_binding"
+            ]["source_cohort_id"],
+            "equity_cutoff_utc": package[
+                "equity_input_binding"
+            ]["equity_cutoff"],
+            "lane_context": {
+                "O1": {"status": "AVAILABLE"},
+                "O3": {"status": "AVAILABLE"},
+            },
         },
         "underlying_price_binding": (
             underlying_snapshot_binding_payload(
@@ -429,6 +511,15 @@ def test_package_plan_preflight_status_and_live_binding_pass(
     ) == package
     plan = p8_canary_plan(package)
     assert plan["status"] == "PASS_INERT_EXACT_P8_CANARY_PLAN"
+    assert plan["v3_authority_classification"]["path"] == (
+        "POST_E_ACTIVITY_RANKED_LATE_CANARY"
+    )
+    assert not plan["v3_authority_classification"][
+        "opening_coverage_claimed"
+    ]
+    assert not plan["v3_authority_classification"][
+        "accumulation_900_second_coverage_claimed"
+    ]
     assert plan["prepared_authorities"] == list(PREPARED_AUTHORITIES)
     assert not plan["automatic_execution_available"]
     assert plan["guarded_one_use_execution_available"]
@@ -438,6 +529,9 @@ def test_package_plan_preflight_status_and_live_binding_pass(
         prior_run_records=[],
     )
     assert status["state"] == "PREPARED_UNARMED_UNCONSUMED"
+    assert status["v3_authority_classification"] == package[
+        "v3_authority_classification"
+    ]
     preflight = provider_free_p8_canary_preflight(
         package,
         repository_root=ROOT,
@@ -550,6 +644,7 @@ def test_live_preflight_accepts_separately_prepared_exact_cohort_reads(
         prepared_at=PREPARED,
         window_start=START,
         window_end=STOP,
+        equity_input_source=_equity_input_source(),
         expected_qualification_semantic_sha256=semantic_sha256,
         expected_qualification_file_sha256=file_sha256,
         source_files=SOURCE_FILES,
@@ -871,6 +966,20 @@ def test_prepare_and_audit_cli_use_owned_files_only(
 ):
     report, semantic_sha256, file_sha256 = qualification
     package_path = tmp_path / "package.json"
+    equity_source = _equity_input_source()
+    equity_semantic = canonical_sha256(equity_source)
+    equity_report = tmp_path / "equity-input.json"
+    equity_report.write_text(
+        json.dumps({
+            "schema": "advanced-options-p8-equity-input-source-v1",
+            **equity_source,
+            "report_sha256": equity_semantic,
+        }, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    equity_file = authorization.hashlib.sha256(
+        equity_report.read_bytes()
+    ).hexdigest()
     assert prepare_package([
         "--qualification-report",
         str(report),
@@ -890,6 +999,12 @@ def test_prepare_and_audit_cli_use_owned_files_only(
         START.isoformat(),
         "--window-end",
         STOP.isoformat(),
+        "--equity-input-source-report",
+        str(equity_report),
+        "--expected-equity-input-source-semantic-sha256",
+        equity_semantic,
+        "--expected-equity-input-source-file-sha256",
+        equity_file,
         "--output",
         str(package_path),
     ]) == 0
@@ -923,6 +1038,7 @@ def test_prepare_and_audit_cli_use_owned_files_only(
     assert plan.is_file()
     assert set(tmp_path.iterdir()) == {
         report,
+        equity_report,
         package_path,
         prior,
         plan,

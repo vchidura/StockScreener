@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch one bounded, late-observed SPY reference as-of one prior session."""
+"""Fetch one bounded, late-observed ETF reference as-of one prior session."""
 from __future__ import annotations
 
 import argparse
@@ -27,12 +27,13 @@ from realtime.equity_recent_repair import (  # noqa: E402
 from scripts.realtime_script_support import write_report  # noqa: E402
 
 
-CONTRACT = "v2-dated-spy-reference-v1"
-URL = "https://api.massive.com/v3/reference/tickers/SPY"
+CONTRACT = "v2-dated-equity-reference-v1"
+URL = "https://api.massive.com/v3/reference/tickers/{ticker}"
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ticker", required=True)
     parser.add_argument("--session-date", type=date.fromisoformat, required=True)
     parser.add_argument("--authorized-until", type=datetime.fromisoformat, required=True)
     parser.add_argument("--maximum-provider-requests", type=int, required=True)
@@ -48,7 +49,10 @@ def parse_args(argv=None):
         or args.response_byte_limit != 1_000_000
         or not args.authorization_reference.strip()
     ):
-        parser.error("dated SPY reference scope or budget is invalid")
+        parser.error("dated ETF reference scope or budget is invalid")
+    args.ticker = args.ticker.strip().upper()
+    if not args.ticker or not args.ticker.isascii() or not args.ticker.isalnum():
+        parser.error("--ticker must be one exact ASCII symbol")
     args.authorized_until = args.authorized_until.astimezone(timezone.utc)
     args.report_path = args.report_path.resolve()
     if args.report_path.exists():
@@ -56,14 +60,14 @@ def parse_args(argv=None):
     return args
 
 
-def validate_result(result, *, session_date):
+def validate_result(result, *, ticker, session_date):
     if not isinstance(result, dict):
-        raise ValueError("dated SPY reference result is unavailable")
-    ticker = str(result.get("ticker") or "").strip().upper()
+        raise ValueError("dated ETF reference result is unavailable")
+    returned_ticker = str(result.get("ticker") or "").strip().upper()
     security_type = str(result.get("type") or "").strip().upper()
     cik = str(result.get("cik") or "").strip()
     if (
-        ticker != "SPY"
+        returned_ticker != ticker
         or security_type not in {"ETF", "ETV"}
         or not (
             result.get("composite_figi")
@@ -71,10 +75,10 @@ def validate_result(result, *, session_date):
             or (cik.isdigit() and cik.lstrip("0"))
         )
     ):
-        raise ValueError("dated SPY reference identity is invalid")
+        raise ValueError("dated ETF reference identity is invalid")
     return {
         **result,
-        "ticker": ticker,
+        "ticker": returned_ticker,
         "type": security_type,
         "source_as_of_date": session_date.isoformat(),
     }
@@ -85,7 +89,7 @@ def main(argv=None):
     plan = {
         "contract": CONTRACT,
         "mode": "EXECUTE" if args.execute else "PLAN",
-        "ticker": "SPY",
+        "ticker": args.ticker,
         "source_as_of_date": args.session_date.isoformat(),
         "maximum_provider_requests": 1,
         "response_byte_limit": args.response_byte_limit,
@@ -104,7 +108,7 @@ def main(argv=None):
     load_dotenv(BACKEND_DIR / ".env", override=True)
     api_key = os.getenv("POLYGON_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("dated SPY reference requires POLYGON_API_KEY")
+        raise RuntimeError("dated ETF reference requires POLYGON_API_KEY")
     transport = AuthorizedNativeRepairTransport(
         RequestsPolygonHttpTransport(
             api_key,
@@ -116,21 +120,22 @@ def main(argv=None):
     )
     try:
         response = transport.get(
-            URL,
+            URL.format(ticker=args.ticker),
             {"date": args.session_date.isoformat()},
         )
     except PolygonResponseTooLarge:
-        raise RuntimeError("dated SPY reference exceeded its response limit")
+        raise RuntimeError("dated ETF reference exceeded its response limit")
     observed_at = datetime.now(timezone.utc)
     if response.status_code != 200:
         raise RuntimeError(
-            f"dated SPY reference returned HTTP {response.status_code}"
+            f"dated ETF reference returned HTTP {response.status_code}"
         )
     payload = json.loads(response.body)
     if not isinstance(payload, dict) or payload.get("next_url"):
-        raise ValueError("dated SPY reference response is invalid")
+        raise ValueError("dated ETF reference response is invalid")
     result = validate_result(
         payload.get("results"),
+        ticker=args.ticker,
         session_date=args.session_date,
     )
     report = {

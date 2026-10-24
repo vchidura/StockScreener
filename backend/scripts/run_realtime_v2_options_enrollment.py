@@ -29,6 +29,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 from options.config import load_option_runtime_configuration  # noqa: E402
 from realtime.advanced_options_control_plane import (  # noqa: E402
+    AdvancedOptionsEquityInputBinding,
     AdvancedOptionsEnrollmentPlan,
     AdvancedOptionsHistoryBinding,
     advanced_options_enrollment_plan_payload,
@@ -82,6 +83,7 @@ def execute_frozen_advanced_options_enrollment(
     connection,
     plan: AdvancedOptionsEnrollmentPlan,
     history_binding: AdvancedOptionsHistoryBinding,
+    equity_input_binding: AdvancedOptionsEquityInputBinding,
     *,
     database_name: str,
     confirmed_database_name: str,
@@ -99,15 +101,32 @@ def execute_frozen_advanced_options_enrollment(
         raise TypeError("frozen Advanced Options enrollment plan is required")
     if not isinstance(history_binding, AdvancedOptionsHistoryBinding):
         raise TypeError("frozen Advanced Options history binding is required")
+    if not isinstance(
+        equity_input_binding,
+        AdvancedOptionsEquityInputBinding,
+    ):
+        raise TypeError(
+            "frozen Advanced Options Equity input binding is required"
+        )
     advanced_options_enrollment_plan_payload(plan)
     if history_binding.target_cohort_id != plan.control_plane.cohort_id:
         raise ValueError(
             "Advanced Options enrollment and history binding diverged"
         )
+    if (
+        equity_input_binding.target_cohort_id
+        != plan.control_plane.cohort_id
+        or equity_input_binding.source_cohort_id
+        != plan.equity_plan.cohort_id
+    ):
+        raise ValueError(
+            "Advanced Options enrollment and Equity input binding diverged"
+        )
     return persist_advanced_options_enrollment(
         connection,
         plan,
         history_binding=history_binding,
+        equity_input_binding=equity_input_binding,
     )
 
 

@@ -8,6 +8,7 @@ import json
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from uuid import UUID
 
 from dotenv import dotenv_values
 from psycopg2.pool import ThreadedConnectionPool
@@ -55,6 +56,7 @@ def parse_args(argv=None):
     parser.add_argument("--session-date", type=date.fromisoformat, required=True)
     parser.add_argument("--symbol", action="append", required=True)
     parser.add_argument("--entitlement-report", type=Path, required=True)
+    parser.add_argument("--source-cohort-id", type=UUID)
     parser.add_argument("--authorization-reference", required=True)
     parser.add_argument("--expires-at", type=datetime.fromisoformat, required=True)
     parser.add_argument("--report-path", type=Path, required=True)
@@ -282,6 +284,36 @@ def main(argv=None):
                 str(ticker): security_id
                 for ticker, security_id in cursor.fetchall()
             }
+            if (
+                tuple(sorted(security_ids)) != args.symbols
+                and args.source_cohort_id is not None
+            ):
+                cursor.execute(
+                    "SELECT DISTINCT ON (revision.ticker) "
+                    "revision.ticker,instrument.security_id "
+                    "FROM rt.cohorts AS cohort "
+                    "JOIN rt.subscription_members AS member "
+                    "USING(manifest_id) "
+                    "JOIN rt.instruments AS instrument "
+                    "USING(instrument_id) "
+                    "JOIN ref.security_revisions AS revision "
+                    "ON revision.security_id=instrument.security_id "
+                    "WHERE cohort.cohort_id=%s "
+                    "AND member.channel='AM' "
+                    "AND revision.ticker=ANY(%s) "
+                    "AND revision.observed_at<=%s "
+                    "ORDER BY revision.ticker,"
+                    "revision.observed_at DESC,revision.revision_id DESC",
+                    (
+                        str(args.source_cohort_id),
+                        list(args.symbols),
+                        checked,
+                    ),
+                )
+                security_ids = {
+                    str(ticker): security_id
+                    for ticker, security_id in cursor.fetchall()
+                }
             if tuple(sorted(security_ids)) != args.symbols:
                 raise ValueError(
                     "selected Advanced security identities are unavailable"
@@ -351,6 +383,11 @@ def main(argv=None):
             ),
             "compatibility_preflight_sha256": (
                 None if compatibility is None else compatibility[1]
+            ),
+            "source_cohort_id": (
+                None
+                if args.source_cohort_id is None
+                else str(args.source_cohort_id)
             ),
             "schema_sha256": schema_sha256,
         }

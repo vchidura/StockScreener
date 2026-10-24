@@ -90,8 +90,6 @@ def _manifest_policy(**changes):
         maximum_option_quote_contracts=3,
         reserved_option_quote_contracts=1,
         required_detectors=(
-            DetectorFamily.S1,
-            DetectorFamily.S2,
             DetectorFamily.O1,
             DetectorFamily.O2,
             DetectorFamily.O3,
@@ -424,6 +422,24 @@ def test_stale_mismatched_unpinned_and_incomplete_inputs_fail_explicitly():
         _plan(option_underlyings=("AAPL", "SPY"))
 
 
+def test_completed_equity_entitlement_is_checked_at_equity_cutoff():
+    equity_cutoff = PLANNED - timedelta(minutes=2)
+    equity = replace(
+        _equity_plan(),
+        expires_at=PLANNED - timedelta(minutes=1),
+    )
+    plan = _plan(
+        equity_plan=equity,
+        equity_input_cutoff=equity_cutoff,
+    )
+    assert plan.planned_at == PLANNED
+    with pytest.raises(ValueError, match="stale for Options"):
+        _plan(
+            equity_plan=equity,
+            equity_input_cutoff=PLANNED,
+        )
+
+
 def test_over_cap_or_unpaired_slot_members_fail_through_slot_owner():
     over_cap = tuple(
         SlotSetMember(
@@ -516,6 +532,18 @@ def test_enrollment_plan_binds_equity_activity_and_primary_tq_identities():
     assert validate_advanced_options_enrollment_plan_payload(
         payload
     ) == payload
+
+
+def test_options_membership_is_native_and_equity_detectors_stay_independent():
+    equity = _equity_plan()
+    plan = _plan(equity_plan=equity)
+
+    assert set(plan.manifest_policy.required_detectors) == {
+        DetectorFamily.O1,
+        DetectorFamily.O2,
+        DetectorFamily.O3,
+    }
+    assert equity == _equity_plan()
 
 
 def test_enrollment_plan_rejects_divergence_stale_selection_and_scope_change():

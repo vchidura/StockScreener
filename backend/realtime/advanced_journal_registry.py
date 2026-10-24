@@ -334,8 +334,9 @@ def mark_advanced_journal_writing_cursor(
 ) -> None:
     cursor.execute(
         "UPDATE rt.advanced_journal_registry SET status='WRITING',"
-        "updated_at=%s WHERE journal_generation=%s "
-        "AND status='REGISTERED' RETURNING journal_generation",
+        "updated_at=GREATEST(updated_at,%s) WHERE journal_generation=%s "
+        "AND status IN ('REGISTERED','WRITING') "
+        "RETURNING journal_generation",
         (_utc(checked_at, "checked_at"), str(journal_generation)),
     )
     if cursor.fetchone() is None:

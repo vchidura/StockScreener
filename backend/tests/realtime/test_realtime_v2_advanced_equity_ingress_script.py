@@ -83,6 +83,79 @@ def test_monotonic_deadline_stops_provider_when_wall_clock_stalls():
     assert stopped == [True]
 
 
+def test_journal_progress_commits_before_diagnostic_session_failure(
+    monkeypatch,
+):
+    events = []
+    provider = MagicMock()
+    first = MagicMock()
+    second = MagicMock()
+    provider.transaction.side_effect = [first, second]
+    first.__enter__.return_value.cursor = object()
+    second.__enter__.return_value.cursor = object()
+    monkeypatch.setattr(
+        script,
+        "update_advanced_journal_offsets_cursor",
+        lambda *_args, **_kwargs: events.append("journal"),
+    )
+    monkeypatch.setattr(
+        script,
+        "record_first_post_reconnect_event_cursor",
+        lambda *_args, **_kwargs: events.append("reconnect"),
+    )
+
+    def fail_session(*_args, **_kwargs):
+        events.append("session")
+        raise ValueError("diagnostic usage rejected")
+
+    monkeypatch.setattr(
+        script,
+        "update_advanced_stream_session_cursor",
+        fail_session,
+    )
+
+    with pytest.raises(ValueError, match="diagnostic usage rejected"):
+        script._persist_progress(
+            provider,
+            gateway=SimpleNamespace(
+                state=script.GatewayFeedState.LIVE
+            ),
+            session=SimpleNamespace(),
+            generation=UUID(
+                "99999999-8888-7777-6666-555555555555"
+            ),
+            runtime_plan=SimpleNamespace(
+                plan_id=UUID(
+                    "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+                )
+            ),
+            progress=SimpleNamespace(
+                last_raw_offset=9,
+                last_event_offset=9,
+                event_time_watermark=datetime(
+                    2026,
+                    10,
+                    23,
+                    14,
+                    35,
+                    tzinfo=timezone.utc,
+                ),
+            ),
+            usage=lambda: SimpleNamespace(),
+            checked_at=datetime(
+                2026,
+                10,
+                23,
+                14,
+                35,
+                tzinfo=timezone.utc,
+            ),
+        )
+
+    assert events == ["journal", "reconnect", "session"]
+    assert provider.transaction.call_count == 2
+
+
 def test_ingress_paths_are_plan_session_attempt_derived_and_non_overwriting(
     tmp_path,
 ):

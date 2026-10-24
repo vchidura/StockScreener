@@ -33,6 +33,8 @@ from realtime.advanced_options_consumers import (
 )
 from realtime.advanced_options_control_plane import (
     CANONICAL_MARKET_STATE_OWNER,
+    build_advanced_options_equity_input_binding,
+    persist_advanced_options_equity_input_binding_cursor,
     persist_advanced_options_enrollment_cursor,
 )
 from realtime.advanced_options_cycle import (
@@ -47,6 +49,9 @@ from realtime.advanced_options_input import (
     AdvancedOptionsInputDependencyStatus,
     build_advanced_options_input_ready_plan,
     freeze_advanced_options_input_ready_plan,
+)
+from realtime.advanced_options_equity_input import (
+    initial_advanced_options_equity_context_requirements,
 )
 from realtime.advanced_options_loaders import (
     build_canonical_advanced_options_runtime_binding,
@@ -1116,6 +1121,8 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
     checked = now - timedelta(hours=2)
     planned = now
     cutoff = now + timedelta(minutes=3)
+    equity_cutoff = cutoff - timedelta(minutes=2)
+    history_cohort_id = uuid4()
     expires = now + timedelta(hours=8)
     try:
         with disposable_v2_database(database_name) as database_pool:
@@ -1184,8 +1191,23 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                 prior_oi_session=control.session_date - timedelta(days=1),
                 treasury_maximum_age_seconds=3_600,
                 model_version="black-scholes-merton-v1",
+                history_source_cohort_id=history_cohort_id,
             )
             with cursor(database_pool) as database_cursor:
+                database_cursor.execute(
+                    "INSERT INTO rt.cohorts ("
+                    "cohort_id,cohort_sha256,manifest_id,"
+                    "configuration_sha256,model_bundle_sha256,"
+                    "valuation_sha256,effective_at,mode) "
+                    "SELECT %s,%s,manifest_id,configuration_sha256,"
+                    "model_bundle_sha256,valuation_sha256,effective_at,"
+                    "mode FROM rt.cohorts WHERE cohort_id=%s",
+                    (
+                        str(history_cohort_id),
+                        _digest("p8-history-cohort"),
+                        str(enrollment.equity_plan.cohort_id),
+                    ),
+                )
                 persist_advanced_options_enrollment_cursor(
                     database_cursor,
                     enrollment,
@@ -1208,6 +1230,7 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                     database_cursor,
                     enrollment,
                     reference_plan,
+                    history_source_cohort_id=history_cohort_id,
                 )
                 _seed_discovery_coverage(
                     database_cursor,
@@ -1334,13 +1357,36 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                     equity_receipt_id,
                     equity_window_id,
                     equity_receipt,
-                    detector_sha256s,
-                    _equity_event_ids,
                 ) = _seed_native_equity_inputs(
                     database_cursor,
                     enrollment,
                     source_flow,
-                    cutoff=cutoff,
+                    equity_cutoff=equity_cutoff,
+                )
+                equity = enrollment.equity_plan
+                persist_advanced_options_equity_input_binding_cursor(
+                    database_cursor,
+                    build_advanced_options_equity_input_binding(
+                        target_options_window_id=window_id,
+                        target_cohort_id=control.cohort_id,
+                        source_cohort_id=equity.cohort_id,
+                        source_cohort_sha256=equity.cohort_sha256,
+                        source_manifest_id=equity.manifest_id,
+                        source_manifest_sha256=equity.manifest.sha256,
+                        source_profile_id=equity.profile_id,
+                        source_profile_sha256=equity.profile_sha256,
+                        equity_window_id=equity_window_id,
+                        equity_receipt_id=equity_receipt_id,
+                        equity_cutoff=equity_receipt.cutoff,
+                        reference_generation=(
+                            equity_receipt.reference_generation
+                        ),
+                        universe_sha256=equity_receipt.universe_sha256,
+                        input_sha256=equity_receipt.input_sha256,
+                        build_id=equity_receipt.build_id,
+                        maximum_age_seconds=300,
+                        authorization_reference="p8-equity-input",
+                    ),
                 )
             market_slice, actual_market_map = _persist_market_state(
                 database_pool,
@@ -1526,7 +1572,11 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                 equity_input_receipt=equity_receipt,
                 equity_window_id=equity_window_id,
                 loader_build_id="advanced-options-native-loader-v1",
-                stock_detector_sha256s=detector_sha256s,
+                history_source_cohort_id=history_cohort_id,
+                maximum_equity_input_age_seconds=300,
+                equity_context_requirements=(
+                    initial_advanced_options_equity_context_requirements()
+                ),
             )
             native_preflight = PostgresAdvancedOptionsNativeInputLoader(
                 provider,
@@ -1743,14 +1793,14 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
             outcomes = {
                 row.detector.value: row for row in cycle.outcomes
             }
-            assert set(outcomes) == {"O1", "O2", "O3", "S1", "S2"}
+            assert set(outcomes) == {"O1", "O2", "O3"}
             assert outcomes["O2"].state.value == "UNAVAILABLE"
             assert outcomes["O2"].reason_codes == (
                 "O2_MODEL_NOT_ACCEPTED",
             )
             assert all(
                 outcomes[name].state.value.startswith("COMPLETE")
-                for name in ("O1", "O3", "S1", "S2")
+                for name in ("O1", "O3")
             )
             assert tuple(
                 row.snapshot_type for row in projection.snapshots
@@ -2390,6 +2440,8 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                 database_pool,
                 enrollment,
                 cutoff,
+                equity_cutoff=equity_cutoff,
+                history_source_cohort_id=history_cohort_id,
             )
             assert all(
                 row["status"] in {"AVAILABLE", "COMPLETE_ZERO"}
@@ -2416,7 +2468,7 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
             report = {
                 "contract": (
                     "advanced-options-p8-provider-free-"
-                    "qualification-report-v2"
+                    "qualification-report-v3"
                 ),
                 "verdict": "PASS",
                 "database": database_name,
@@ -2429,6 +2481,29 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                     "frames": len(frames),
                     "normalized_messages": len(normalized_records),
                     "buffer_full_count": buffer_snapshot.full_count,
+                },
+                "equity_dependencies": {
+                    "historical_source_cohort_id": str(
+                        history_cohort_id
+                    ),
+                    "live_source_cohort_id": str(
+                        enrollment.equity_plan.cohort_id
+                    ),
+                    "equity_cutoff_utc": equity_cutoff.isoformat(),
+                    "options_cutoff_utc": cutoff.isoformat(),
+                    "equity_input_age_seconds": int(
+                        (cutoff - equity_cutoff).total_seconds()
+                    ),
+                    "maximum_equity_input_age_seconds": 300,
+                    "sources_are_distinct": (
+                        history_cohort_id
+                        != enrollment.equity_plan.cohort_id
+                    ),
+                    "full_path_fixture_underlyings": list(
+                        control.universe.option_underlyings
+                    ),
+                    "required_live_underlyings": ["QQQ", "SPY"],
+                    "pre_provider_gate": "EXACT_PER_UNDERLYING",
                 },
                 "canonical_state": {
                     "market_checkpoint_offset": market_slice.end_offset,

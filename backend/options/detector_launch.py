@@ -14,6 +14,7 @@ from pydantic import AwareDatetime, Field, model_validator
 
 from equity.behavior import Contract, Name, Sha256
 from equity.behavior_setup import DirectSetupSourcePolicy, DirectResumptionSourcePolicy
+from equity.stock_alert_payload import decode_original_setup_payload
 from options.alert_plans import TECHNICAL_EXIT_POLICY
 from options.dual_origin import TECHNICAL_QUALIFICATION_POLICY
 
@@ -26,7 +27,8 @@ RUNTIME_FILES = (
     "options/orchestration.py", "options/repositories/alert_evaluations.py",
     "options/repositories/stock_behavior_assessments.py", "options/stock_setup_binding.py",
     "options/strategies/engine.py", "options/surface_detection.py", "options/worker.py", "equity/stock_alert_results.py",
-    "equity/polygon.py", "equity/materialization.py", "equity/setup_composition.py",
+    "equity/stock_alert_payload.py", "equity/polygon.py", "equity/materialization.py",
+    "equity/setup_composition.py",
     "scripts/run_option_worker.py",
 )
 INTRADAY_RUNTIME_FILES = (*RUNTIME_FILES, "options/intraday_participation.py", "equity/behavior.py",
@@ -296,7 +298,6 @@ def prepare_detector_forward_launch(*, backend_dir, configuration, dataset_id, e
                                    stock_setup_wait=False, stock_source_launch=None,
                                    canonical_stock_first=False, canonical_trend=False, direct_structure=False,
                                    partial_coverage=False):
-    from equity.stock_alert_results import _decode_original_setup_payload
     from research.stock_alert_results import strategy_instance
     from research.stock_idea_engine import digest
 
@@ -372,8 +373,8 @@ def prepare_detector_forward_launch(*, backend_dir, configuration, dataset_id, e
             latest = connection.execute("SELECT CASE WHEN length(payload)<=4194304 THEN payload END FROM forward_publications ORDER BY window_key DESC LIMIT 1").fetchone()
             if not checkpoint or not latest:
                 raise ValueError("forward launch source manifest, checkpoint or publication is missing")
-            state = _decode_original_setup_payload(checkpoint[0])
-            publication = _decode_original_setup_payload(latest[0])
+            state = decode_original_setup_payload(checkpoint[0])
+            publication = decode_original_setup_payload(latest[0])
         if digest(config) != manifest[0] or config["policy_version"] != "stock_ideas_forward_quality_v2":
             raise ValueError("forward launch stock source identity mismatch")
         instance = strategy_instance(config, state, "intraday")
@@ -442,9 +443,6 @@ def load_detector_forward_launch(path, *, expected_sha256, configuration, backen
 
 def build_detector_collector(launch, *, configuration, backend_dir):
     from equity.repositories import EquityCorporateActionRepository, EquityEvidenceRepository, EquityReferenceRepository
-    from equity.stock_alert_results import (
-        read_direct_stock_setups, read_direct_stock_setup_shadow_windows, read_direct_stock_setup_windows,
-    )
     from options.detector_collection import DetectorCycleCollector, ProductionDetectorSourceReader, RetainedDetectorSourceReader
     from options.repositories.alert_evaluations import OptionAlertEvaluationRepository
     from options.repositories.stock_behavior_assessments import OptionStockBehaviorAssessmentRepository
@@ -452,6 +450,12 @@ def build_detector_collector(launch, *, configuration, backend_dir):
     launch = validate_detector_forward_launch(launch, configuration=configuration, backend_dir=backend_dir)
     repository = OptionStockBehaviorAssessmentRepository()
     canonical_stock_first = isinstance(launch, CanonicalStockFirstDetectorForwardLaunch)
+    if not canonical_stock_first:
+        from equity.stock_alert_results import (
+            read_direct_stock_setups,
+            read_direct_stock_setup_shadow_windows,
+            read_direct_stock_setup_windows,
+        )
     aligned = isinstance(launch, SourceReadyDetectorForwardLaunch) or canonical_stock_first
     wait_for_setups = isinstance(launch, StockSetupReadyDetectorForwardLaunch)
     def setups(*, market_cutoff, as_of, market_cutoffs=None, wait_deadline=None, progress_callback=None):

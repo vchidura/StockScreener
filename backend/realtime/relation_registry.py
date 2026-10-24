@@ -102,6 +102,21 @@ RELATIONS: dict[str, Relation] = {
     "rt.cohort_history_bindings": _r(
         "control", "BOUNDED", append=True, api=True
     ),
+    "rt.advanced_options_equity_input_bindings": _r(
+        "control", "BOUNDED", append=True
+    ),
+    "rt.advanced_options_session_acquisition_authorizations": _r(
+        "control", "BOUNDED", append=True
+    ),
+    "rt.advanced_options_window_cycle_authorizations": _r(
+        "control", "BOUNDED", append=True
+    ),
+    "rt.advanced_options_authority_receipts": _r(
+        "control", "BOUNDED", append=True
+    ),
+    "rt.advanced_options_resident_completions": _r(
+        "options", "BOUNDED", append=True
+    ),
     "rt.worker_leases": _r("control", "BOUNDED", mutable=True, delete=True),
     "rt.advanced_options_read_pins": _r(
         "control", "BOUNDED", mutable=True, api=True

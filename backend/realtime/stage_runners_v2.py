@@ -27,6 +27,7 @@ from collections.abc import Callable, Mapping
 
 from .database_access_v2 import V2ConnectionProvider
 from .advanced_options_service import OPTIONS_NON_SERVING_STAGE_ORDER
+from .advanced_options_service import OPTIONS_V3_STAGE_ORDER
 from .runner_environment import RunnerEnvironment
 from .stage_graph import STAGES_V1
 from .stage_orchestrator import StageRunner
@@ -56,6 +57,8 @@ from .stage_runners_options import (
     options_projection_runner,
     options_publish_block_reason,
     options_publish_runner,
+    options_reference_block_reason,
+    options_reference_runner,
 )
 
 RunnerFactory = Callable[[RunnerEnvironment], StageRunner]
@@ -72,6 +75,7 @@ RUNNER_FACTORIES: dict[str, RunnerFactory] = {
     "STOCK_ALERTS": stock_alerts_runner,
     "OPTIONS_ACQUIRE": options_acquire_runner,
     "OPTIONS_ADMISSION": options_admission_runner,
+    "OPTIONS_REFERENCE": options_reference_runner,
     "OPTIONS_FLOW": options_flow_runner,
     "OPTIONS_INPUT_GATE": options_input_gate_runner,
     "OPTIONS_CYCLE": options_cycle_runner,
@@ -85,6 +89,7 @@ SOURCE_GATED_STAGES: dict[str, Callable[[RunnerEnvironment], str | None]] = {
     "EQUITY_INGEST": equity_block_reason,
     "OPTIONS_ACQUIRE": options_acquire_block_reason,
     "OPTIONS_ADMISSION": options_admission_block_reason,
+    "OPTIONS_REFERENCE": options_reference_block_reason,
     "OPTIONS_FLOW": options_flow_block_reason,
     "OPTIONS_INPUT_GATE": options_input_gate_block_reason,
     "OPTIONS_CYCLE": options_cycle_block_reason,
@@ -128,4 +133,19 @@ def build_advanced_options_non_serving_runners(
     return {
         name: RUNNER_FACTORIES[name](environment)
         for name in OPTIONS_NON_SERVING_STAGE_ORDER
+    }
+
+
+def build_advanced_options_v3_runners(
+    database: V2ConnectionProvider | None,
+    *,
+    environment: RunnerEnvironment,
+) -> Mapping[str, StageRunner]:
+    if environment.database is not database:
+        raise ValueError(
+            "Advanced Options V3 runner database ownership changed"
+        )
+    return {
+        name: RUNNER_FACTORIES[name](environment)
+        for name in OPTIONS_V3_STAGE_ORDER
     }

@@ -129,6 +129,26 @@ def reference_continuity_manifest_fields(inputs):
     }
 
 
+def source_manifest_identity(
+    *,
+    cohort_manifest_sha256,
+    history_binding_sha256,
+    identity_continuity=(),
+):
+    if identity_continuity:
+        return canonical_sha256({
+            "manifest_sha256": cohort_manifest_sha256,
+            "history_binding_sha256": history_binding_sha256,
+            "identity_continuity": identity_continuity,
+        })
+    if history_binding_sha256 is not None:
+        return canonical_sha256({
+            "manifest_sha256": cohort_manifest_sha256,
+            "history_binding_sha256": history_binding_sha256,
+        })
+    return cohort_manifest_sha256
+
+
 def source_manifest_identity_cursor(
     cursor,
     manifest,
@@ -141,13 +161,9 @@ def source_manifest_identity_cursor(
     continuity_sha256 = manifest.get("identity_continuity_sha256")
     known_by_value = manifest.get("known_by")
     if continuity_sha256 is None and known_by_value is None:
-        return (
-            canonical_sha256({
-                "manifest_sha256": cohort_manifest_sha256,
-                "history_binding_sha256": history_binding_sha256,
-            })
-            if history_binding_sha256 is not None
-            else cohort_manifest_sha256
+        return source_manifest_identity(
+            cohort_manifest_sha256=cohort_manifest_sha256,
+            history_binding_sha256=history_binding_sha256,
         ), None
     if continuity_sha256 is None or known_by_value is None:
         raise ValueError("late identity continuity manifest is incomplete")
@@ -170,8 +186,8 @@ def source_manifest_identity_cursor(
     )
     if canonical_sha256(evidence) != continuity_sha256:
         raise ValueError("late identity continuity digest changed")
-    return canonical_sha256({
-        "manifest_sha256": cohort_manifest_sha256,
-        "history_binding_sha256": history_binding_sha256,
-        "identity_continuity": evidence,
-    }), rows
+    return source_manifest_identity(
+        cohort_manifest_sha256=cohort_manifest_sha256,
+        history_binding_sha256=history_binding_sha256,
+        identity_continuity=evidence,
+    ), rows

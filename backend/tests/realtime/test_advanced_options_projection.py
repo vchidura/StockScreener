@@ -1,5 +1,5 @@
 from unittest.mock import MagicMock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -13,11 +13,13 @@ from test_advanced_options_cycle import (
 from realtime.advanced_options_cycle import run_advanced_options_cycle
 from realtime.advanced_options_projection import (
     AdvancedOptionsCanaryPublicationAuthorization,
+    AdvancedOptionsPublicationAuthorization,
     OPTIONS_PAGE_CONTRACTS,
     OPTIONS_PAGE_SNAPSHOT_TYPES,
     OPTIONS_PROJECTION_TYPES,
     OPTIONS_SNAPSHOT_TYPES,
     authorize_advanced_options_canary_publication,
+    authorize_advanced_options_publication,
     build_advanced_options_projection_batch,
     build_advanced_options_publisher_handoff,
     persist_advanced_options_projection_cursor,
@@ -171,6 +173,50 @@ def test_owned_disposable_canary_authorizes_only_release_and_pointer():
             batch_sha256=batch.batch_sha256,
             receipt_id=UUID(
                 "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            ),
+        )
+
+
+def test_v5_publication_authority_is_exact_and_keeps_forbidden_effects_false():
+    control, cycle = _cycle()
+    batch = build_advanced_options_projection_batch(
+        control_plane=control,
+        cycle=cycle,
+        generated_at=NOW,
+        build_id="v5-build",
+    )
+    inert = build_advanced_options_publisher_handoff(
+        control_plane=control,
+        batch=batch,
+    )
+    authority = AdvancedOptionsPublicationAuthorization(
+        uuid4(),
+        control.cohort_id,
+        control.binding.provider_tier,
+        batch.batch_sha256,
+        uuid4(),
+        "OWNED_DISPOSABLE_V5_PUBLICATION",
+    )
+
+    authorized = authorize_advanced_options_publication(
+        inert,
+        authority,
+    )
+
+    assert authorized.release_authorized
+    assert authorized.pointer_authorized
+    assert not authorized.dispatch_authorized
+    assert authorized.receipt.receipt_id == authority.receipt_id
+    with pytest.raises(ValueError, match="authority scope changed"):
+        authorize_advanced_options_publication(
+            inert,
+            AdvancedOptionsPublicationAuthorization(
+                uuid4(),
+                control.cohort_id,
+                control.binding.provider_tier,
+                "f" * 64,
+                uuid4(),
+                "OWNED_DISPOSABLE_V5_PUBLICATION",
             ),
         )
 

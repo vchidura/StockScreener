@@ -12,7 +12,9 @@ from uuid import UUID, uuid4
 import pytest
 
 import realtime.advanced_options_p8_canary_executor as executor_module
+from realtime.contracts import EQUITY_VALIDATION_UNIVERSE
 from realtime.advanced_options_control_plane import (
+    build_advanced_options_equity_input_binding,
     build_advanced_options_history_binding,
 )
 from realtime.advanced_options_p8_canary_authorization import (
@@ -24,6 +26,7 @@ from realtime.advanced_options_p8_canary_executor import (
     P8CanaryExecutionError,
     P8CanaryExecutor,
 )
+from realtime.advanced_options_p8_production import _EnrollmentConnection
 from realtime.advanced_options_service import (
     OPTIONS_NON_SERVING_STAGE_ORDER,
     AdvancedOptionsProcessKind,
@@ -70,6 +73,27 @@ PIPELINE_QUALIFICATION_FILE_SHA256 = (
 )
 
 
+def _equity_input_source():
+    return {
+        "source_cohort_id": "11111111-1111-4111-8111-111111111111",
+        "source_cohort_sha256": "8" * 64,
+        "source_manifest_id": "22222222-2222-4222-8222-222222222222",
+        "source_manifest_sha256": "9" * 64,
+        "source_profile_id": "33333333-3333-4333-8333-333333333333",
+        "source_profile_sha256": "a" * 64,
+        "equity_window_id": "44444444-4444-4444-8444-444444444444",
+        "equity_receipt_id": "55555555-5555-4555-8555-555555555555",
+        "equity_cutoff_utc": (
+            START - timedelta(minutes=2)
+        ).isoformat(),
+        "reference_generation": 1,
+        "universe_sha256": "b" * 64,
+        "input_sha256": "c" * 64,
+        "build_id": "advanced-equity-test-v1",
+        "symbols": list(EQUITY_VALIDATION_UNIVERSE.equity_tickers),
+    }
+
+
 def _qualification(tmp_path):
     semantic = {
         "contract": "p8-executor-test-qualification-v1",
@@ -103,6 +127,7 @@ def _package(tmp_path, *, stored_reads_prepared=False):
         prepared_at=PREPARED,
         window_start=START,
         window_end=STOP,
+        equity_input_source=_equity_input_source(),
         expected_qualification_semantic_sha256=semantic,
         expected_qualification_file_sha256=file_sha,
         source_files=SOURCE_FILES,
@@ -167,6 +192,24 @@ def _binding(package):
     enrollment = replace(
         base,
         control_plane=control,
+        equity_plan=replace(
+            base.equity_plan,
+            cohort_id=UUID(
+                package["equity_input_binding"]["source_cohort_id"]
+            ),
+            cohort_sha256=package[
+                "equity_input_binding"
+            ]["source_cohort_sha256"],
+            manifest_id=UUID(
+                package["equity_input_binding"]["source_manifest_id"]
+            ),
+            profile_id=UUID(
+                package["equity_input_binding"]["source_profile_id"]
+            ),
+            profile_sha256=package[
+                "equity_input_binding"
+            ]["source_profile_sha256"],
+        ),
         activity_selection=selection,
         enrollment_id=UUID("4d4edcd1-1643-5b65-91ee-2a5078f17761"),
         enrollment_sha256="1" * 64,
@@ -181,6 +224,30 @@ def _binding(package):
         ),
         source_manifest_sha256="7" * 64,
         authorization_reference=package["authorization_reference"],
+    )
+    equity_value = package["equity_input_binding"]
+    equity_input = build_advanced_options_equity_input_binding(
+        target_options_window_id=UUID(
+            equity_value["target_options_window_id"]
+        ),
+        target_cohort_id=UUID(equity_value["target_cohort_id"]),
+        source_cohort_id=UUID(equity_value["source_cohort_id"]),
+        source_cohort_sha256=equity_value["source_cohort_sha256"],
+        source_manifest_id=UUID(equity_value["source_manifest_id"]),
+        source_manifest_sha256=equity_value["source_manifest_sha256"],
+        source_profile_id=UUID(equity_value["source_profile_id"]),
+        source_profile_sha256=equity_value["source_profile_sha256"],
+        equity_window_id=UUID(equity_value["equity_window_id"]),
+        equity_receipt_id=UUID(equity_value["equity_receipt_id"]),
+        equity_cutoff=datetime.fromisoformat(equity_value["equity_cutoff"]),
+        reference_generation=equity_value["reference_generation"],
+        universe_sha256=equity_value["universe_sha256"],
+        input_sha256=equity_value["input_sha256"],
+        build_id=equity_value["build_id"],
+        maximum_age_seconds=equity_value["maximum_age_seconds"],
+        authorization_reference=equity_value[
+            "authorization_reference"
+        ],
     )
     live_selection = _executor_selection(package)
     underlying_prices = UnderlyingSnapshotBinding(
@@ -219,7 +286,8 @@ def _binding(package):
     return P8CanaryExecutionBinding(
         enrollment,
         history,
-        uuid4(),
+        equity_input,
+        equity_input.target_options_window_id,
         underlying_prices,
     )
 
@@ -295,6 +363,86 @@ def _live_observation(
     }
     observation["selection"] = _executor_selection(package)
     return observation
+
+
+def test_enrollment_commit_never_synthesizes_equity_lifecycle(tmp_path):
+    package, _report, _semantic, _file_sha = _package(tmp_path)
+    statements = []
+    expected = _binding(package)
+
+    class Cursor:
+        statement = ""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, parameters=()):
+            self.statement = statement
+            statements.append((statement, parameters))
+
+        def fetchone(self):
+            if "FROM rt.advanced_options_equity_input_bindings" not in (
+                self.statement
+            ):
+                raise AssertionError(self.statement)
+            binding = expected.equity_input
+            return (
+                str(binding.target_cohort_id),
+                str(binding.source_cohort_id),
+                binding.source_cohort_sha256,
+                str(binding.source_manifest_id),
+                binding.source_manifest_sha256,
+                str(binding.source_profile_id),
+                binding.source_profile_sha256,
+                str(binding.equity_window_id),
+                str(binding.equity_receipt_id),
+                binding.equity_cutoff,
+                binding.reference_generation,
+                binding.universe_sha256,
+                binding.input_sha256,
+                binding.build_id,
+                binding.maximum_age_seconds,
+                binding.authorization_reference,
+                binding.binding_sha256,
+                str(binding.target_cohort_id),
+                CHECKED,
+                CHECKED.date(),
+            )
+
+    class Connection:
+        commits = 0
+
+        def cursor(self, *_args, **_kwargs):
+            return Cursor()
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            raise AssertionError("enrollment unexpectedly rolled back")
+
+    class Capture:
+        binding = expected
+        checked_at = CHECKED
+        cycle_cutoff = CHECKED
+
+        @staticmethod
+        def persist_selection_cursor(_cursor, _binding):
+            return None
+
+    connection = Connection()
+    _EnrollmentConnection(connection, Capture(), package).commit()
+
+    sql = "\n".join(statement for statement, _ in statements)
+    assert "INSERT INTO rt.service_plans" in sql
+    assert "INSERT INTO rt.window_runs" in sql
+    assert "rt.cycle_receipts" not in sql
+    assert "EQUITY_INPUT_GATE" not in sql
+    assert "p8-equity-history" not in sql
+    assert connection.commits == 1
 
 
 class FakeLifecyclePort:

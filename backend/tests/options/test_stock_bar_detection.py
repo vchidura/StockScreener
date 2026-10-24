@@ -13,13 +13,22 @@ OPEN = datetime(2026, 9, 28, 13, 30, tzinfo=UTC)
 SECURITY = uuid4()
 
 
-def bar(interval, start, minutes, close, *, session=SESSION, observed=None):
+def bar(
+    interval,
+    start,
+    minutes,
+    close,
+    *,
+    session=SESSION,
+    observed=None,
+    availability_mode=BarAvailabilityMode.LIVE_OBSERVED,
+):
     close = Decimal(str(close))
     return EquityBarRevision(bar_revision_id=uuid4(), security_id=SECURITY, ticker="AAPL",
         interval=interval, session_date=session, bar_start=start, bar_end=start + timedelta(minutes=minutes),
         open_price=close, high_price=close + 1, low_price=close - 1, close_price=close,
         volume=Decimal("1000"), vwap=None, transaction_count=None, source_kind=BarSourceKind.NATIVE_REST,
-        availability_mode=BarAvailabilityMode.LIVE_OBSERVED, is_final=True,
+        availability_mode=availability_mode, is_final=True,
         system_observed_at=observed or start + timedelta(minutes=minutes), replay_available_at=None,
         adjusted=False, payload_sha256="a" * 64, session_scope=BarSessionScope.RTH)
 
@@ -53,6 +62,54 @@ def test_s1_uses_completed_5m_fallback_then_prefers_15m_when_evaluable():
         session_close=datetime(2026, 9, 28, 20, tzinfo=UTC))
     s1 = next(signal for signal in preferred if signal.detector_id == "S1")
     assert s1.interval == "15m" and s1.direction == -1
+
+
+def test_reconstructed_daily_history_is_allowed_but_intraday_must_be_live():
+    daily = tuple(
+        replace(
+            item,
+            availability_mode=BarAvailabilityMode.HISTORICAL_RECONSTRUCTED,
+            quality_codes=(
+                ("DERIVED_FROM_CANONICAL_5M",)
+                if index % 2
+                else ("GROUPED_DAILY_EXACT_TICKER_V2",)
+            ),
+        )
+        for index, item in enumerate(daily_history())
+    )
+    five = (
+        bar("5m", OPEN, 5, 100),
+        bar("5m", OPEN + timedelta(minutes=5), 5, 101.1),
+    )
+
+    signals = detect_canonical_stock_signals(
+        security_id=SECURITY,
+        underlyer="AAPL",
+        bars=tuple(
+            (item, item.system_observed_at)
+            for item in (*daily, *five)
+        ),
+        market_cutoff=five[-1].bar_end,
+        decision_at=five[-1].bar_end + timedelta(minutes=15),
+        session_close=datetime(2026, 9, 28, 20, tzinfo=UTC),
+    )
+
+    assert next(signal for signal in signals if signal.detector_id == "S1")
+    reconstructed_intraday = replace(
+        five[-1],
+        availability_mode=BarAvailabilityMode.HISTORICAL_RECONSTRUCTED,
+    )
+    assert not detect_canonical_stock_signals(
+        security_id=SECURITY,
+        underlyer="AAPL",
+        bars=tuple(
+            (item, item.system_observed_at)
+            for item in (*daily, five[0], reconstructed_intraday)
+        ),
+        market_cutoff=five[-1].bar_end,
+        decision_at=five[-1].bar_end + timedelta(minutes=15),
+        session_close=datetime(2026, 9, 28, 20, tzinfo=UTC),
+    )
 
 
 def test_s2_detects_outside_pullback_resume_and_prefers_highest_evaluable_timeframe():

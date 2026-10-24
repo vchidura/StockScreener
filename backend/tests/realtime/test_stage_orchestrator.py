@@ -190,6 +190,154 @@ def test_blocked_options_admission_leaves_every_other_stage_running(harness):
     assert ("OPTIONS_CYCLE", 1, "BLOCKED_PREREQ", ("PREREQUISITE_BLOCKED_POLICY:OPTIONS_ADMISSION",)) in runs
 
 
+def test_transient_input_lag_defers_and_retries_the_same_window():
+    deferred = _memory_harness(enabled={"EQUITY_INGEST"})
+    deferred.mark_reference_ready()
+    window = deferred.window()
+    calls = []
+
+    def lagging(_context):
+        calls.append(True)
+        if len(calls) == 1:
+            return StageOutcome.blocked("FINALIZER_INPUT_PENDING")
+        return StageOutcome.complete()
+
+    orchestrator = deferred.orchestrator(
+        {"EQUITY_INGEST": lagging},
+        max_attempts=3,
+        retry_initial_seconds=10,
+        retry_maximum_seconds=10,
+    )
+    first = orchestrator.run_window(window.window_id)
+    first_run = deferred.repository.stage_states(window.window_id)[
+        "EQUITY_INGEST"
+    ]
+
+    assert (first.status, first.window_state) == (
+        "PENDING_STAGES",
+        "PENDING",
+    )
+    assert first_run.state == "DEFERRED"
+    assert first_run.attempt == 1
+    assert first_run.original_deadline == window.deadline
+    assert first_run.maximum_attempts == 3
+    assert first_run.retry_not_before == NOW + timedelta(seconds=10)
+    assert deferred.repository.readiness(deferred.plan.cohort_id)[
+        "EQUITY_INGEST"
+    ] == "WAITING_INPUT"
+
+    held = orchestrator.run_window(window.window_id)
+    assert held.status == "PENDING_STAGES"
+    assert len(calls) == 1
+
+    deferred.clock.value += timedelta(seconds=10)
+    completed = orchestrator.run_window(window.window_id)
+    assert (completed.status, completed.window_state) == (
+        "FINISHED",
+        "COMPLETE",
+    )
+    assert deferred.repository.stage_states(window.window_id)[
+        "EQUITY_INGEST"
+    ].attempt == 2
+    assert len(calls) == 2
+
+
+def test_deferred_attempt_bound_becomes_terminal_failure():
+    deferred = _memory_harness(enabled={"EQUITY_INGEST"})
+    deferred.mark_reference_ready()
+    window = deferred.window()
+    orchestrator = deferred.orchestrator(
+        {
+            "EQUITY_INGEST": lambda _context: StageOutcome.blocked(
+                "JOURNAL_DRAIN_NOT_COMPLETE"
+            )
+        },
+        max_attempts=2,
+        retry_initial_seconds=1,
+        retry_maximum_seconds=1,
+    )
+
+    orchestrator.run_window(window.window_id)
+    deferred.clock.value += timedelta(seconds=1)
+    report = orchestrator.run_window(window.window_id)
+    record = deferred.repository.stage_states(window.window_id)[
+        "EQUITY_INGEST"
+    ]
+
+    assert report.window_state == "FAILED"
+    assert record.state == "FAILED"
+    assert record.attempt == 2
+    assert record.reason_codes == (
+        "DEFERRED_ATTEMPTS_EXHAUSTED",
+        "JOURNAL_DRAIN_NOT_COMPLETE",
+    )
+
+
+def test_retryable_postgres_conflict_uses_deferred_state():
+    deferred = _memory_harness(enabled={"EQUITY_INGEST"})
+    deferred.mark_reference_ready()
+    window = deferred.window()
+
+    class SerializationConflict(RuntimeError):
+        pgcode = "40001"
+
+    report = deferred.orchestrator(
+        {
+            "EQUITY_INGEST": lambda _context: (
+                (_ for _ in ()).throw(SerializationConflict())
+            )
+        },
+        retry_initial_seconds=1,
+        retry_maximum_seconds=1,
+    ).run_window(window.window_id)
+    record = deferred.repository.stage_states(window.window_id)[
+        "EQUITY_INGEST"
+    ]
+
+    assert report.status == "PENDING_STAGES"
+    assert record.state == "DEFERRED"
+    assert record.reason_codes == ("RETRYABLE_POSTGRES:40001",)
+
+
+def test_deferred_state_is_durable_in_owned_postgres(database):
+    deferred = _postgres_harness(
+        database,
+        enabled={"EQUITY_INGEST"},
+    )
+    deferred.mark_reference_ready()
+    window = deferred.window()
+    calls = []
+
+    def lagging(_context):
+        calls.append(True)
+        if len(calls) == 1:
+            return StageOutcome.blocked("CHECKPOINT_NOT_CAUGHT_UP")
+        return StageOutcome.complete()
+
+    orchestrator = deferred.orchestrator(
+        {"EQUITY_INGEST": lagging},
+        retry_initial_seconds=1,
+        retry_maximum_seconds=1,
+    )
+    first = orchestrator.run_window(window.window_id)
+    record = deferred.repository.stage_states(window.window_id)[
+        "EQUITY_INGEST"
+    ]
+
+    assert first.status == "PENDING_STAGES"
+    assert record.state == "DEFERRED"
+    assert record.retry_not_before == NOW + timedelta(seconds=1)
+    assert record.original_deadline == window.deadline
+    assert record.maximum_attempts == 2
+
+    deferred.clock.value += timedelta(seconds=1)
+    second = orchestrator.run_window(window.window_id)
+    assert second.window_state == "COMPLETE"
+    assert deferred.repository.stage_states(window.window_id)[
+        "EQUITY_INGEST"
+    ].attempt == 2
+
+
 def test_options_exception_never_blocks_equity_and_its_message_is_not_persisted(harness):
     harness.mark_reference_ready()
     window = harness.window()
@@ -363,7 +511,7 @@ def test_orphaned_running_stage_is_failed_owner_lost_and_retried_as_attempt_two(
     window = harness.window()
     repository = harness.repository
     dead = repository.claim_window(window.window_id, uuid4(), NOW, 30)
-    repository.start_stage(dead, STAGES_V1["EQUITY_INGEST"], "stages_v1", 1, NOW)
+    repository.start_stage(dead, STAGES_V1["EQUITY_INGEST"], "stages_v1", 1, 2, NOW)
     harness.clock.value = NOW + timedelta(seconds=60)  # the dead owner's lease expired
     report = harness.orchestrator({}).run_window(window.window_id)
     runs = harness.query_runs(window.window_id)
@@ -378,10 +526,10 @@ def test_a_second_crash_exhausts_attempts_and_blocks_dependents(harness):
     repository = harness.repository
     ingest = STAGES_V1["EQUITY_INGEST"]
     first = repository.claim_window(window.window_id, uuid4(), NOW, 30)
-    repository.start_stage(first, ingest, "stages_v1", 1, NOW)
+    repository.start_stage(first, ingest, "stages_v1", 1, 2, NOW)
     second = repository.claim_window(window.window_id, uuid4(), NOW + timedelta(seconds=40), 30)
     repository.recover_orphans(second, NOW + timedelta(seconds=40))
-    repository.start_stage(second, ingest, "stages_v1", 2, NOW + timedelta(seconds=40))
+    repository.start_stage(second, ingest, "stages_v1", 2, 2, NOW + timedelta(seconds=40))
     harness.clock.value = NOW + timedelta(seconds=100)
     harness.orchestrator({}).run_window(window.window_id)
     states = harness.states(window.window_id)
@@ -397,7 +545,7 @@ def test_a_window_held_by_a_live_owner_is_not_claimed_and_a_stale_owner_is_fence
     assert holder is not None
     other = harness.orchestrator({}).run_window(window.window_id)
     assert other.status == "NOT_CLAIMED"
-    run = repository.start_stage(holder, STAGES_V1["EQUITY_INGEST"], "stages_v1", 1, NOW)
+    run = repository.start_stage(holder, STAGES_V1["EQUITY_INGEST"], "stages_v1", 1, 2, NOW)
     successor = repository.claim_window(window.window_id, uuid4(), NOW + timedelta(seconds=61), 60)
     assert successor is not None and successor.epoch == holder.epoch + 1
     with pytest.raises(LeaseLost):
@@ -732,10 +880,17 @@ def test_a_repository_failure_in_one_lane_does_not_stop_the_other_lane(memory):
     memory.mark_reference_ready()
 
     class FlakyOptions(InMemoryOrchestrationRepository):
-        def start_stage(self, claim, stage, version, attempt, now):
+        def start_stage(self, claim, stage, version, attempt, maximum_attempts, now):
             if stage.domain == "options":
                 raise ConnectionError("options store is unavailable")
-            return super().start_stage(claim, stage, version, attempt, now)
+            return super().start_stage(
+                claim,
+                stage,
+                version,
+                attempt,
+                maximum_attempts,
+                now,
+            )
 
     flaky = FlakyOptions(memory.plan)
     flaky.upsert_readiness(memory.plan.cohort_id, "REFERENCE", "stages_v1", "READY", (), None, NOW)

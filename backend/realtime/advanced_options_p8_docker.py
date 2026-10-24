@@ -18,6 +18,11 @@ from .advanced_options_service import (
     AdvancedOptionsProcessKind,
     AdvancedOptionsProcessSpec,
 )
+from .advanced_options_v3_deployment import (
+    ADVANCED_OPTIONS_V3_COMPOSE_PROFILE,
+    ADVANCED_OPTIONS_V3_PROFILE_SHA256,
+    validate_immutable_image_id,
+)
 from .retention_lifecycle_docker import (
     DOCKER_HOST,
     MAX_CAPTURE_BYTES,
@@ -66,6 +71,7 @@ _FORBIDDEN_ENVIRONMENT_TOKENS = (
 )
 _INSPECT_FORMAT = (
     '{"id":{{json .Id}},'
+    '"image":{{json .Image}},'
     '"command":{{json .Config.Cmd}},'
     '"entrypoint":{{json .Config.Entrypoint}},'
     '"running":{{json .State.Running}},'
@@ -163,38 +169,7 @@ def isolated_p8_compose_environment(
     package_path: Path,
     bundle_path: Path,
 ) -> dict[str, str]:
-    image = backend_image.strip()
-    image_name, separator, digest = image.rpartition("@sha256:")
-    local_digest = (
-        image.removeprefix("sha256:")
-        if image.startswith("sha256:")
-        else ""
-    )
-    if (
-        (
-            not image_name
-            or separator != "@sha256:"
-            or len(digest) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in digest
-            )
-        )
-        and (
-            len(local_digest) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in local_digest
-            )
-        )
-        or any(character.isspace() for character in image)
-    ):
-        raise ValueError("P8 backend image identity is invalid")
-    if (
-        image.startswith("sha256:")
-        and image != f"sha256:{local_digest}"
-    ):
-        raise ValueError("P8 backend image identity is invalid")
+    image = validate_immutable_image_id(backend_image)
     paths = {
         "REALTIME_V2_DOCKER_SECRET_DIR": secret_directory.resolve(),
         "REALTIME_V2_P8_PACKAGE_PATH": package_path.resolve(),
@@ -335,6 +310,16 @@ class AdvancedOptionsDockerServicePort:
         self._compose_file = compose_file
         self._docker = executable
         self._environment = environment_value
+        deployment = package.get("v3_deployment")
+        self._compose_profile = (
+            ADVANCED_OPTIONS_V3_COMPOSE_PROFILE
+            if (
+                isinstance(deployment, Mapping)
+                and deployment.get("profile_sha256")
+                == ADVANCED_OPTIONS_V3_PROFILE_SHA256
+            )
+            else P8_COMPOSE_PROFILE
+        )
         self._runner = runner or BoundedSubprocessRunner()
         self._specs = {
             AdvancedOptionsProcessKind(str(row["kind"])): (
@@ -360,7 +345,7 @@ class AdvancedOptionsDockerServicePort:
             "--project-name",
             P8_COMPOSE_PROJECT,
             "--profile",
-            P8_COMPOSE_PROFILE,
+            self._compose_profile,
             *arguments,
         )
 
@@ -468,8 +453,15 @@ class AdvancedOptionsDockerServicePort:
             )
         labels = value.get("labels")
         restart = value.get("restart")
+        image = self._environment["REALTIME_V2_BACKEND_IMAGE"]
+        expected_image_id = (
+            image
+            if image.startswith("sha256:")
+            else "sha256:" + image.rsplit("@sha256:", 1)[1]
+        )
         if (
             value.get("id") != handle.container_id
+            or value.get("image") != expected_image_id
             or value.get("command") != list(
                 p8_container_command(handle.kind)
             )

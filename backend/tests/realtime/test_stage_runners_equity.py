@@ -307,6 +307,18 @@ def test_advanced_input_ready_binds_stream_checkpoint_gap_and_finalizer_heads():
         advanced_input_gate_sha256="a" * 64,
     )
     assert universe == "6" * 64 and len(digest) == 64
+    member_query = raw.cursor.statements[1][0]
+    assert "DISTINCT ON (instrument.instrument_id)" in member_query
+    assert (
+        "reference.observed_at DESC,reference.revision_id DESC"
+        in member_query
+    )
+    gap_query, gap_parameters = raw.cursor.statements[5]
+    assert (
+        "COALESCE(gap.gap_end,gap_session.ended_at,%s)>%s"
+        in gap_query
+    )
+    assert gap_parameters[-1] == NOW - timedelta(minutes=5)
 
     no_trade_raw = _advanced_input_identity_database(
         no_trade_instrument=12,

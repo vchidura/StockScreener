@@ -174,6 +174,40 @@ def test_adjusted_daily_plan_binds_one_exact_grouped_request():
     })
 
 
+def test_multi_ticker_subset_uses_one_grouped_request():
+    native = _plan()
+    second = SimpleNamespace(
+        ticker="MSFT",
+        instrument_id=2,
+        security=SimpleNamespace(
+            security_id=UUID(int=2),
+            payload_sha256="b" * 64,
+        ),
+    )
+    plan = AdjustedDailyRepairPlan(
+        native.cohort_id,
+        (native.identities[0], second),
+        native.sessions[0],
+        native.authorized_until,
+        1,
+        3_000_001,
+        3_000_000,
+        "operator",
+        "entitlement",
+        "approved cost",
+        adjusted=True,
+        per_ticker=True,
+    )
+
+    url, params, _ = adjusted_request_spec(plan)
+
+    assert url.endswith(
+        "/v2/aggs/grouped/locale/us/market/stocks/2026-10-19"
+    )
+    assert params == {"adjusted": "true"}
+    assert plan.identity()["endpoint_policy"] == ADJUSTED_ENDPOINT_POLICY
+
+
 def test_one_ticker_raw_daily_plan_uses_exact_aggregate_endpoint():
     native = _plan()
     plan = AdjustedDailyRepairPlan(

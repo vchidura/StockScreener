@@ -46,7 +46,16 @@ def _load_scope_with_identity_continuity(
     cutoff,
     *,
     known_by,
+    selected_tickers=None,
 ):
+    selected_tickers = (
+        None
+        if selected_tickers is None
+        else {
+            str(value).strip().upper()
+            for value in selected_tickers
+        }
+    )
     with provider.transaction(APP_ROLE, read_only=True, dict_cursor=True) as unit:
         cursor = unit.cursor
         cursor.execute(
@@ -71,9 +80,18 @@ def _load_scope_with_identity_continuity(
                 "AND revision.observed_at<=%s "
                 "ORDER BY revision.observed_at DESC,"
                 "revision.revision_id DESC LIMIT 1",
-                (str(member["security_id"]), cutoff),
+                (str(member["security_id"]), known_by),
             )
-            prior = cursor.fetchone()
+            latest = cursor.fetchone()
+            if latest is None:
+                raise ValueError(
+                    "late identity continuity requires a current revision"
+                )
+            if (
+                selected_tickers is not None
+                and latest["ticker"] not in selected_tickers
+            ):
+                continue
             cursor.execute(
                 "SELECT revision.*,revision.revision_id "
                 "AS security_revision_id "
@@ -82,10 +100,10 @@ def _load_scope_with_identity_continuity(
                 "AND revision.observed_at<=%s "
                 "ORDER BY revision.observed_at DESC,"
                 "revision.revision_id DESC LIMIT 1",
-                (str(member["security_id"]), known_by),
+                (str(member["security_id"]), cutoff),
             )
-            latest = cursor.fetchone()
-            if prior is None or latest is None:
+            prior = cursor.fetchone()
+            if prior is None:
                 raise ValueError(
                     "late identity continuity requires pre/post revisions"
                 )
@@ -133,12 +151,22 @@ def _load_scope_with_identity_continuity(
                 latest["effective_to"],
             ))
     by_ticker = {row.ticker: row for row in identities}
-    if set(by_ticker) != set(EQUITY_VALIDATION_UNIVERSE.equity_tickers):
-        raise ValueError("late identity continuity is not the exact nine-name universe")
+    expected_tickers = (
+        set(EQUITY_VALIDATION_UNIVERSE.equity_tickers)
+        if selected_tickers is None
+        else selected_tickers
+    )
+    if set(by_ticker) != expected_tickers:
+        raise ValueError("late identity continuity changed selected membership")
     evidence_by_instrument = {row[0]: row for row in evidence}
+    ordered_tickers = tuple(
+        ticker
+        for ticker in EQUITY_VALIDATION_UNIVERSE.equity_tickers
+        if ticker in expected_tickers
+    )
     ordered = tuple(
         by_ticker[ticker]
-        for ticker in EQUITY_VALIDATION_UNIVERSE.equity_tickers
+        for ticker in ordered_tickers
     )
     return ordered, tuple(
         evidence_by_instrument[row.instrument_id]

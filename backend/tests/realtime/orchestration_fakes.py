@@ -20,6 +20,7 @@ from realtime.orchestration_repository import (
 from realtime.stage_graph import STAGES_V1, StageDefinition
 
 FAILING = ("FAILED", "BLOCKED_PREREQ", "BLOCKED_POLICY", "MISSED")
+REASONED = (*FAILING, "DEFERRED")
 
 
 class InMemoryOrchestrationRepository:
@@ -102,7 +103,8 @@ class InMemoryOrchestrationRepository:
     @staticmethod
     def _run_record(run) -> StageRunRecord:
         return StageRunRecord(run["id"], run["window"], run["stage"], run["version"], run["attempt"], run["state"],
-                              run["blocked_by"], tuple(run["reasons"]))
+                              run["blocked_by"], tuple(run["reasons"]), run["retry_not_before"],
+                              run["original_deadline"], run["maximum_attempts"])
 
     def stage_states(self, window_id):
         with self.lock:
@@ -133,7 +135,7 @@ class InMemoryOrchestrationRepository:
         if any(r["window"] == claim.window.window_id and r["stage"] == stage_id and r["attempt"] == attempt
                for r in self.runs):
             raise ValueError("duplicate stage attempt")
-        if state in FAILING and not reasons:
+        if state in REASONED and not reasons:
             raise ValueError("reason codes are required")
         if (state == "BLOCKED_PREREQ") != (blocked_by is not None):
             raise ValueError("blocked_by_stage is required exactly for BLOCKED_PREREQ")
@@ -145,24 +147,31 @@ class InMemoryOrchestrationRepository:
                 raise ValueError("prerequisite has not failed or been blocked in this window")
         run = {"id": uuid4(), "window": claim.window.window_id, "stage": stage_id, "version": version,
                "attempt": attempt, "state": state, "blocked_by": blocked_by, "reasons": list(reasons),
-               "receipt": None, "started": now if state == "RUNNING" else None, "finished": None}
+               "receipt": None, "started": now if state == "RUNNING" else None, "finished": None,
+               "retry_not_before": None, "original_deadline": claim.window.deadline,
+               "maximum_attempts": None}
         self.runs.append(run)
         return self._run_record(run)
 
-    def start_stage(self, claim, stage: StageDefinition, version, attempt, now):
+    def start_stage(self, claim, stage: StageDefinition, version, attempt, maximum_attempts, now):
         with self.lock:
             self._fence(claim)
-            return self._insert(claim, stage.stage_id, version, attempt, "RUNNING", now=now)
+            run = self._insert(claim, stage.stage_id, version, attempt, "RUNNING", now=now)
+            row = next(value for value in self.runs if value["id"] == run.stage_run_id)
+            row["maximum_attempts"] = maximum_attempts
+            return self._run_record(row)
 
-    def finish_stage(self, claim, run, state, reason_codes, receipt_id, now):
+    def finish_stage(self, claim, run, state, reason_codes, receipt_id, now, *,
+                     retry_not_before=None):
         with self.lock:
             self._fence(claim)
             row = next(r for r in self.runs if r["id"] == run.stage_run_id)
             if row["state"] != "RUNNING":
                 raise LeaseLost("stage run is not running")
-            if state in FAILING and not reason_codes:
+            if state in REASONED and not reason_codes:
                 raise ValueError("reason codes are required")
-            row.update(state=state, reasons=list(reason_codes), receipt=receipt_id, finished=now)
+            row.update(state=state, reasons=list(reason_codes), receipt=receipt_id, finished=now,
+                       retry_not_before=retry_not_before)
 
     def _next_attempt(self, window_id, stage_id):
         return max((r["attempt"] for r in self.runs if r["window"] == window_id and r["stage"] == stage_id),

@@ -14,15 +14,20 @@ from realtime.database_access import (
 from realtime.portal_projection import build_portal_snapshot
 from realtime.portal_projection_repository import (
     RELEASE_CLASS_SESSION_CLOSE,
+    RELEASE_CLASS_INTRADAY,
     RETENTION_HOT_AND_KEPT,
+    PortalRelease,
+    PortalReleasePointer,
     PortalReleaseReceipt,
     session_close_snapshot,
 )
 from realtime.portal_publisher import (
+    CanonicalPortalPublisher,
     PortalDeliveryDisposition,
     PortalDeliveryStatus,
     PortalPublicationBatch,
     PortalPublicationConfig,
+    PortalPublicationStatus,
     PortalPublisherVerdict,
     run_portal_publication_once,
 )
@@ -360,3 +365,91 @@ def test_receipt_and_session_close_batches_are_validated_before_any_write():
             FakeSink(()), checked_at=NOW,
         )
     assert connection.cursor.call_count == 0
+
+
+def test_canonical_stage_publisher_returns_one_pointer_and_rolls_back_failure():
+    receipt = _receipt()
+    batch = PortalPublicationBatch(
+        _batch().snapshots,
+        receipt=receipt,
+    )
+    release_id = uuid5(NAMESPACE_URL, "canonical-options-release")
+    manifest = {
+        "version": "realtime-portal-release-v1",
+        "release_class": RELEASE_CLASS_INTRADAY,
+        "session_date": NOW.date().isoformat(),
+        "snapshots": [],
+    }
+    release = PortalRelease(
+        release_id,
+        COHORT,
+        ProviderTier.MASSIVE_DEVELOPER,
+        RELEASE_CLASS_INTRADAY,
+        receipt.receipt_id,
+        NOW.date(),
+        NOW,
+        receipt.universe_sha256,
+        manifest,
+        "a" * 64,
+        True,
+    )
+    previous = PortalReleasePointer(
+        COHORT,
+        ProviderTier.MASSIVE_DEVELOPER,
+        uuid5(NAMESPACE_URL, "prior-release"),
+        NOW - timedelta(minutes=1),
+        NOW.date(),
+    )
+    current = PortalReleasePointer(
+        COHORT,
+        ProviderTier.MASSIVE_DEVELOPER,
+        release_id,
+        NOW,
+        NOW.date(),
+    )
+    status = PortalPublicationStatus(
+        NOW,
+        len(batch.snapshots),
+        0,
+        0,
+        0,
+        0,
+        (),
+        release,
+    )
+    database, _, _ = _database()
+    pointers = iter((previous, current))
+    publisher = CanonicalPortalPublisher(
+        database,
+        replace(_config(), dispatch_authorized=False),
+        publication_runner=lambda *_args, **_kwargs: status,
+        pointer_loader=lambda *_args, **_kwargs: next(pointers),
+    )
+
+    result = publisher.publish(batch, checked_at=NOW)
+
+    assert result.release.release_id == result.pointer.release_id
+    assert result.status.release == result.release
+
+    database, _, _ = _database()
+    restored = []
+    pointers = iter((previous, None))
+    failing = CanonicalPortalPublisher(
+        database,
+        replace(_config(), dispatch_authorized=False),
+        publication_runner=lambda *_args, **_kwargs: status,
+        pointer_loader=lambda *_args, **_kwargs: next(pointers),
+        pointer_restorer=lambda _cursor, **values: restored.append(values),
+    )
+    with pytest.raises(
+        ValueError,
+        match="did not advance its pointer",
+    ):
+        failing.publish(batch, checked_at=NOW)
+
+    assert restored == [{
+        "cohort_id": COHORT,
+        "provider_tier": ProviderTier.MASSIVE_DEVELOPER,
+        "expected_current_release_id": release_id,
+        "previous": previous,
+    }]

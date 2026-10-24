@@ -15,6 +15,8 @@ from options.config import load_valuation_policy
 from options.domain import ContractType, MarkSource
 from options.strategies.domain import OptionSide
 from realtime.advanced_options_control_plane import (
+    build_advanced_options_equity_input_binding,
+    persist_advanced_options_equity_input_binding_cursor,
     persist_advanced_options_enrollment_cursor,
 )
 from realtime.advanced_options_input import (
@@ -22,6 +24,9 @@ from realtime.advanced_options_input import (
     advanced_options_input_ready_plan_payload,
     build_advanced_options_input_ready_plan,
     freeze_advanced_options_input_ready_plan,
+)
+from realtime.advanced_options_equity_input import (
+    initial_advanced_options_equity_context_requirements,
 )
 from realtime.advanced_options_mark_producer import (
     PostgresAdvancedOptionsMarkProducer,
@@ -572,13 +577,36 @@ def test_owp4f_input_ready_action_and_disposable_readiness(monkeypatch):
                     equity_receipt_id,
                     equity_window_id,
                     equity_receipt,
-                    detector_sha256s,
-                    _event_ids,
                 ) = _seed_native_equity_inputs(
                     database_cursor,
                     enrollment,
                     source_flow,
-                    cutoff=cutoff,
+                    equity_cutoff=cutoff,
+                )
+                equity = enrollment.equity_plan
+                persist_advanced_options_equity_input_binding_cursor(
+                    database_cursor,
+                    build_advanced_options_equity_input_binding(
+                        target_options_window_id=window_id,
+                        target_cohort_id=control.cohort_id,
+                        source_cohort_id=equity.cohort_id,
+                        source_cohort_sha256=equity.cohort_sha256,
+                        source_manifest_id=equity.manifest_id,
+                        source_manifest_sha256=equity.manifest.sha256,
+                        source_profile_id=equity.profile_id,
+                        source_profile_sha256=equity.profile_sha256,
+                        equity_window_id=equity_window_id,
+                        equity_receipt_id=equity_receipt_id,
+                        equity_cutoff=equity_receipt.cutoff,
+                        reference_generation=(
+                            equity_receipt.reference_generation
+                        ),
+                        universe_sha256=equity_receipt.universe_sha256,
+                        input_sha256=equity_receipt.input_sha256,
+                        build_id=equity_receipt.build_id,
+                        maximum_age_seconds=300,
+                        authorization_reference="owp4f-equity-input",
+                    ),
                 )
             rolling_plan = build_advanced_options_rolling_producer_plan(
                 enrollment=enrollment,
@@ -645,7 +673,11 @@ def test_owp4f_input_ready_action_and_disposable_readiness(monkeypatch):
                     equity_input_receipt=equity_receipt,
                     equity_window_id=equity_window_id,
                     loader_build_id="advanced-options-native-loader-v1",
-                    stock_detector_sha256s=detector_sha256s,
+                    history_source_cohort_id=uuid4(),
+                    maximum_equity_input_age_seconds=300,
+                    equity_context_requirements=(
+                        initial_advanced_options_equity_context_requirements()
+                    ),
                 )
                 preflight = PostgresAdvancedOptionsNativeInputLoader(
                     provider,
@@ -891,8 +923,14 @@ def test_owp4f_input_ready_action_and_disposable_readiness(monkeypatch):
             assert set(categories) == set(audit.REQUIRED_CATEGORIES)
             assert all(
                 row["status"] in {"AVAILABLE", "COMPLETE_ZERO"}
-                for row in categories.values()
+                for name, row in categories.items()
+                if name not in {
+                    "o1_equity_context",
+                    "o3_equity_context",
+                }
             ), categories
+            assert categories["o1_equity_context"]["status"] == "AVAILABLE"
+            assert categories["o3_equity_context"]["status"] == "AVAILABLE"
             assert audit._next_actionable_blocker(categories) is None
     finally:
         if roles_owned:

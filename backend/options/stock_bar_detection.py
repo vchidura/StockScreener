@@ -14,8 +14,14 @@ from equity.domain import BarAvailabilityMode, BarSessionScope, EquityBarRevisio
 from options.strategies.domain import canonical_json
 
 
+DAILY_HISTORY_QUALITY_CODES = (
+    (),
+    ("DERIVED_FROM_CANONICAL_30M",),
+    ("DERIVED_FROM_CANONICAL_5M",),
+    ("GROUPED_DAILY_EXACT_TICKER_V2",),
+)
 STOCK_BAR_SIGNAL_POLICY = {
-    "version": "canonical_stock_bar_signal_v1",
+    "version": "canonical_stock_bar_signal_v2",
     "universe": "CONFIGURED_OPTION_UNDERLYERS",
     "timeframe_precedence": ["1h", "30m", "15m", "5m"],
     "minimum_bars": {"S1": 2, "S2": 3},
@@ -27,6 +33,15 @@ STOCK_BAR_SIGNAL_POLICY = {
     "target": "SYMMETRIC_TRIGGER_DISTANCE_FROM_PRIOR_CLOSE",
     "maximum_validity_seconds": 1800,
     "completed_bars_only": True,
+    "daily_history_availability": [
+        "HISTORICAL_RECONSTRUCTED",
+        "LIVE_OBSERVED",
+    ],
+    "daily_history_quality_codes": [
+        list(value)
+        for value in DAILY_HISTORY_QUALITY_CODES
+    ],
+    "intraday_availability": "LIVE_OBSERVED",
     "execution_permission": False,
 }
 STOCK_BAR_SIGNAL_POLICY_SHA256 = hashlib.sha256(
@@ -48,7 +63,10 @@ class CanonicalStockBarPoint(Contract):
     created_at: AwareDatetime
     payload_sha256: Sha256
     source_kind: Name = "NATIVE_REST"
-    availability_mode: Literal["LIVE_OBSERVED"] = "LIVE_OBSERVED"
+    availability_mode: Literal[
+        "HISTORICAL_RECONSTRUCTED",
+        "LIVE_OBSERVED",
+    ] = "LIVE_OBSERVED"
     quality_codes: tuple[Name, ...] = ()
 
     @model_validator(mode="after")
@@ -56,7 +74,20 @@ class CanonicalStockBarPoint(Contract):
         if (not self.bar_start < self.bar_end <= self.system_observed_at <= self.created_at
                 or self.high < max(self.open, self.close, self.low)
             or self.low > min(self.open, self.close, self.high)
-            or (self.interval in ("1d", "1h") and self.quality_codes not in ((), ("DERIVED_FROM_CANONICAL_30M",)))
+            or (
+                self.interval != "1d"
+                and self.availability_mode != "LIVE_OBSERVED"
+            )
+            or (
+                self.interval == "1d"
+                and self.quality_codes
+                not in DAILY_HISTORY_QUALITY_CODES
+            )
+            or (
+                self.interval == "1h"
+                and self.quality_codes
+                not in ((), ("DERIVED_FROM_CANONICAL_30M",))
+            )
             or (self.interval not in ("1d", "1h") and self.quality_codes)):
             raise ValueError("canonical stock signal bar is invalid")
         return self
@@ -64,7 +95,7 @@ class CanonicalStockBarPoint(Contract):
 
 class CanonicalStockSignal(Contract):
     schema_version: Literal["option_canonical_stock_signal_v1"] = "option_canonical_stock_signal_v1"
-    policy_version: Literal["canonical_stock_bar_signal_v1"] = "canonical_stock_bar_signal_v1"
+    policy_version: Literal["canonical_stock_bar_signal_v2"] = "canonical_stock_bar_signal_v2"
     policy_sha256: Sha256 = STOCK_BAR_SIGNAL_POLICY_SHA256
     signal_id: UUID
     detector_id: Literal["S1", "S2"]
@@ -164,10 +195,25 @@ def detect_canonical_stock_signals(*, security_id: UUID, underlyer: str,
     eligible = []
     signal_session = market_cutoff.astimezone(ZoneInfo("America/New_York")).date()
     for bar, created_at in bars:
-        quality_eligible = not bar.quality_codes or (
-            bar.interval in ("1d", "1h") and bar.quality_codes == ("DERIVED_FROM_CANONICAL_30M",))
+        quality_eligible = (
+            bar.interval == "1d"
+            and bar.quality_codes in DAILY_HISTORY_QUALITY_CODES
+            or bar.interval == "1h"
+            and bar.quality_codes
+            in ((), ("DERIVED_FROM_CANONICAL_30M",))
+            or bar.interval not in ("1d", "1h")
+            and not bar.quality_codes
+        )
+        availability_eligible = (
+            bar.availability_mode is BarAvailabilityMode.LIVE_OBSERVED
+            or (
+                bar.interval == "1d"
+                and bar.availability_mode
+                is BarAvailabilityMode.HISTORICAL_RECONSTRUCTED
+            )
+        )
         if (bar.security_id != security_id or bar.ticker != underlyer or not bar.is_final
-                or bar.adjusted or bar.availability_mode is not BarAvailabilityMode.LIVE_OBSERVED
+                or bar.adjusted or not availability_eligible
             or bar.session_scope is not BarSessionScope.RTH or not quality_eligible
                 or bar.bar_end > market_cutoff or bar.system_observed_at > decision_at
                 or created_at > decision_at):

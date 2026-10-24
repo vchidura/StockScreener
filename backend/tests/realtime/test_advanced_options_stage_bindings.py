@@ -1,11 +1,12 @@
 from types import SimpleNamespace
+from uuid import uuid4
 
 from test_advanced_options_projection import _cycle
 from realtime.advanced_options_projection import (
     build_advanced_options_projection_batch,
 )
 from realtime.runner_environment import RunnerEnvironment
-from realtime.stage_graph import STAGES_V4
+from realtime.stage_graph import STAGES_V4, STAGE_CATALOG_VERSION_V4
 from realtime.stage_runners_options import (
     OPTIONS_PUBLISH_AUTHORITY_INVALID,
     OptionsPublisherStageResult,
@@ -19,7 +20,12 @@ from realtime.stage_runners_v2 import fail_closed_stages, unwired_stages
 
 
 def _context():
-    return SimpleNamespace(is_cancelled=lambda: False)
+    return SimpleNamespace(
+        is_cancelled=lambda: False,
+        plan=SimpleNamespace(
+            stage_catalog_version=STAGE_CATALOG_VERSION_V4,
+        ),
+    )
 
 
 def test_all_stages_v4_are_bound_but_fail_closed_without_actions():
@@ -69,6 +75,7 @@ def test_injected_p4_receipt_actions_preserve_product_receipt_kinds():
 
 
 def test_publisher_runner_accepts_only_inert_handoff():
+    release_id = uuid4()
     safe = RunnerEnvironment(
         None,
         options_publish_action=lambda _context: OptionsPublisherStageResult(
@@ -82,6 +89,9 @@ def test_publisher_runner_accepts_only_inert_handoff():
             "a" * 64,
             "unauthorized-release",
             release_authorized=True,
+            pointer_authorized=True,
+            release_id=release_id,
+            pointer_release_id=release_id,
         ),
     )
 

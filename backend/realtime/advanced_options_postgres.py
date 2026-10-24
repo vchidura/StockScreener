@@ -10,7 +10,11 @@ from uuid import UUID
 from psycopg2 import Error as PsycopgError
 from psycopg2.extras import RealDictCursor
 
-from .advanced_options_cycle import AdvancedOptionsDatasetFlowIdentity
+from .advanced_options_cycle import (
+    AdvancedOptionsCycleResult,
+    AdvancedOptionsDatasetFlowIdentity,
+    load_advanced_options_cycle_cursor,
+)
 from .advanced_options_input import (
     AdvancedOptionsInputDependencyEvidence,
     AdvancedOptionsInputDependencyStatus,
@@ -71,6 +75,10 @@ from .advanced_options_runtime import (
     AdvancedOptionsCloseStageData,
     EvidenceBuilder,
 )
+from .advanced_options_projection import (
+    AdvancedOptionsProjectionBatch,
+    load_advanced_options_projection_batch_cursor,
+)
 from .contracts import canonical_sha256
 from .database_access_v2 import APP_ROLE, V2ConnectionProvider
 from .materialization_jobs import (
@@ -89,7 +97,9 @@ from .option_cycle_input import (
 from .option_discovery_verify import read_discovery_batches
 from .option_slot_set_repository import load_active_slot_set_cursor
 from .orchestration_repository import (
+    OPTIONS_CYCLE,
     OPTIONS_INPUT_READY,
+    OPTIONS_PORTAL_READY,
     CycleReceiptSpec,
     ServicePlan,
     WindowRecord,
@@ -831,6 +841,14 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
             equity_window_id=equity_window_id,
             instrument_ids=instrument_ids,
             available_at=self._scope.producer_plan.clocks.known_at,
+            maximum_equity_input_age_seconds=(
+                None
+                if input_plan is None
+                else (
+                    input_plan.native_input_plan
+                    .maximum_equity_input_age_seconds
+                )
+            ),
             native_input_plan_sha256=(
                 None
                 if input_plan is None
@@ -1081,8 +1099,6 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
         for detector, lane in (
             ("O1", native.bundle.o1),
             ("O3", native.bundle.o3),
-            ("S1", native.bundle.s1),
-            ("S2", native.bundle.s2),
         ):
             reasons = tuple(lane.blocked_reason_codes)
             status = (
@@ -1226,6 +1242,7 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
                 and not row.accepted_unavailable
             )
             for row in evidence
+            if row.member_kind != "NATIVE"
         )
         if blocked:
             digest = canonical_sha256({
@@ -1509,34 +1526,7 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
         context: StageContext,
         input_stage,
     ) -> AdvancedOptionsCanonicalCycleFacts:
-        with self._provider.transaction(
-            APP_ROLE,
-            read_only=True,
-        ) as unit:
-            unit.cursor.execute(
-                "SELECT cutoff,reference_generation,universe_sha256,"
-                "input_sha256,build_id FROM rt.cycle_receipts "
-                "WHERE window_id=%s AND cohort_id=%s "
-                "AND receipt_kind=%s",
-                (
-                    str(context.window.window_id),
-                    str(context.plan.cohort_id),
-                    OPTIONS_INPUT_READY,
-                ),
-            )
-            row = unit.cursor.fetchone()
-        if row is None:
-            raise ValueError(
-                "Advanced Options durable input receipt is absent"
-            )
-        receipt = CycleReceiptSpec(
-            OPTIONS_INPUT_READY,
-            row[0],
-            int(row[1]),
-            str(row[2]),
-            str(row[3]),
-            str(row[4]),
-        )
+        receipt = self.load_input_receipt(context)
         if (
             receipt.input_sha256 != input_stage.input_gate.closure_sha256
             or receipt.reference_generation
@@ -1579,6 +1569,84 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
             f"postgres-options-cycle:{receipt.input_sha256}",
             self._scope.flow_identity,
         )
+
+    def _load_receipt(
+        self,
+        context: StageContext,
+        receipt_kind: str,
+    ) -> CycleReceiptSpec:
+        with self._provider.transaction(
+            APP_ROLE,
+            read_only=True,
+        ) as unit:
+            unit.cursor.execute(
+                "SELECT cutoff,reference_generation,universe_sha256,"
+                "input_sha256,build_id FROM rt.cycle_receipts "
+                "WHERE window_id=%s AND cohort_id=%s "
+                "AND receipt_kind=%s",
+                (
+                    str(context.window.window_id),
+                    str(context.plan.cohort_id),
+                    receipt_kind,
+                ),
+            )
+            row = unit.cursor.fetchone()
+        if row is None:
+            raise ValueError(
+                f"Advanced Options durable {receipt_kind} receipt is absent"
+            )
+        return CycleReceiptSpec(
+            receipt_kind,
+            row[0],
+            int(row[1]),
+            str(row[2]),
+            str(row[3]),
+            str(row[4]),
+        )
+
+    def load_input_receipt(
+        self,
+        context: StageContext,
+    ) -> CycleReceiptSpec:
+        return self._load_receipt(context, OPTIONS_INPUT_READY)
+
+    def load_completed_cycle(
+        self,
+        context: StageContext,
+        input_stage,
+    ) -> AdvancedOptionsCycleResult:
+        input_receipt = self.load_input_receipt(context)
+        cycle_receipt = self._load_receipt(context, OPTIONS_CYCLE)
+        with self._provider.transaction(
+            APP_ROLE,
+            read_only=True,
+            isolation_level="REPEATABLE READ",
+        ) as unit:
+            return load_advanced_options_cycle_cursor(
+                unit.cursor,
+                control_plane=input_stage.control_plane,
+                input_gate=input_stage.input_gate,
+                input_receipt=input_receipt,
+                cycle_receipt=cycle_receipt,
+            )
+
+    def load_completed_projection(
+        self,
+        context: StageContext,
+        cycle: AdvancedOptionsCycleResult,
+    ) -> AdvancedOptionsProjectionBatch:
+        receipt = self._load_receipt(context, OPTIONS_PORTAL_READY)
+        with self._provider.transaction(
+            APP_ROLE,
+            read_only=True,
+            isolation_level="REPEATABLE READ",
+        ) as unit:
+            return load_advanced_options_projection_batch_cursor(
+                unit.cursor,
+                control_plane=self._scope.control_plane,
+                cycle=cycle,
+                portal_ready_receipt=receipt,
+            )
 
     def load_close_data(
         self,

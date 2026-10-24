@@ -369,6 +369,57 @@ def _derived_runtime_paths(
     return journal_path, report_path
 
 
+def _persist_progress(
+    provider,
+    *,
+    gateway,
+    session,
+    generation,
+    runtime_plan,
+    progress,
+    usage,
+    checked_at,
+) -> None:
+    with provider.transaction(APP_ROLE) as unit:
+        update_advanced_journal_offsets_cursor(
+            unit.cursor,
+            generation,
+            raw_committed_offset=progress.last_raw_offset,
+            normalized_committed_offset=(
+                progress.last_event_offset
+            ),
+            bridge_committed_offset=None,
+            checked_at=checked_at,
+        )
+        if (
+            progress.last_event_offset > 0
+            and progress.event_time_watermark is not None
+        ):
+            record_first_post_reconnect_event_cursor(
+                unit.cursor,
+                plan_id=runtime_plan.plan_id,
+                reconnect_journal_generation=generation,
+                first_event_at=progress.event_time_watermark,
+                first_offset=progress.last_event_offset,
+            )
+    if gateway.state in {
+        GatewayFeedState.CONNECTING,
+        GatewayFeedState.AUTHENTICATING,
+        GatewayFeedState.SUBSCRIBING,
+        GatewayFeedState.WARMING,
+        GatewayFeedState.LIVE,
+    }:
+        with provider.transaction(APP_ROLE) as unit:
+            update_advanced_stream_session_cursor(
+                unit.cursor,
+                session,
+                usage(),
+                status=gateway.state.value,
+                checked_at=checked_at,
+                terminal=False,
+            )
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     config = RealtimeV2PipelineConfig.from_mapping(
@@ -554,45 +605,16 @@ def main(argv=None) -> int:
 
         def persist_progress(_progress):
             checked_at = _now()
-            with provider.transaction(APP_ROLE) as unit:
-                if gateway.state in {
-                    GatewayFeedState.CONNECTING,
-                    GatewayFeedState.AUTHENTICATING,
-                    GatewayFeedState.SUBSCRIBING,
-                    GatewayFeedState.WARMING,
-                    GatewayFeedState.LIVE,
-                }:
-                    update_advanced_stream_session_cursor(
-                        unit.cursor,
-                        session,
-                        usage(),
-                        status=gateway.state.value,
-                        checked_at=checked_at,
-                        terminal=False,
-                    )
-                update_advanced_journal_offsets_cursor(
-                    unit.cursor,
-                    generation,
-                    raw_committed_offset=_progress.last_raw_offset,
-                    normalized_committed_offset=(
-                        _progress.last_event_offset
-                    ),
-                    bridge_committed_offset=None,
-                    checked_at=checked_at,
-                )
-                if (
-                    _progress.last_event_offset > 0
-                    and _progress.event_time_watermark is not None
-                ):
-                    record_first_post_reconnect_event_cursor(
-                        unit.cursor,
-                        plan_id=runtime_plan.plan_id,
-                        reconnect_journal_generation=generation,
-                        first_event_at=(
-                            _progress.event_time_watermark
-                        ),
-                        first_offset=_progress.last_event_offset,
-                    )
+            _persist_progress(
+                provider,
+                gateway=gateway,
+                session=session,
+                generation=generation,
+                runtime_plan=runtime_plan,
+                progress=_progress,
+                usage=usage,
+                checked_at=checked_at,
+            )
 
         pump = AdvancedEquityJournalPump(
             buffer,

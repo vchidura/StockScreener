@@ -792,3 +792,66 @@ def evaluate_job_barrier_cursor(cursor, barrier_id: UUID) -> JobBarrierVerdict:
         failed_members=tuple(failed),
         open_members=tuple(pending),
     )
+
+
+def load_job_barrier_verdict_cursor(
+    cursor,
+    barrier_id: UUID,
+) -> JobBarrierVerdict:
+    cursor.execute(
+        "SELECT state,expected_count FROM rt.job_barriers "
+        "WHERE barrier_id=%s",
+        (str(barrier_id),),
+    )
+    barrier = cursor.fetchone()
+    if barrier is None:
+        raise ValueError("job barrier does not exist")
+    state, expected_count = str(barrier[0]), int(barrier[1])
+    cursor.execute(
+        "SELECT member_key,expected_input_sha256,outcome,"
+        "outcome_input_sha256 FROM rt.job_barrier_members "
+        "WHERE barrier_id=%s ORDER BY member_key",
+        (str(barrier_id),),
+    )
+    rows = tuple(cursor.fetchall())
+    if len(rows) != expected_count:
+        raise ValueError(
+            "job barrier members do not match its expected universe"
+        )
+    complete = tuple(
+        str(key)
+        for key, expected_sha, outcome, outcome_sha in rows
+        if outcome == BarrierOutcome.COMPLETE.value
+        and outcome_sha == expected_sha
+    )
+    failed = tuple(
+        str(key)
+        for key, expected_sha, outcome, outcome_sha in rows
+        if outcome is not None
+        and (
+            outcome != BarrierOutcome.COMPLETE.value
+            or outcome_sha != expected_sha
+        )
+    )
+    pending = tuple(
+        str(key)
+        for key, _expected_sha, outcome, _outcome_sha in rows
+        if outcome is None
+    )
+    if (
+        state not in {"COMPLETE", "FAILED"}
+        or pending
+        or (state == "COMPLETE" and failed)
+        or (state == "FAILED" and not failed)
+    ):
+        raise ValueError(
+            "durable job barrier is not terminal or diverged"
+        )
+    return JobBarrierVerdict(
+        barrier_id=barrier_id,
+        state=state,
+        expected_count=expected_count,
+        complete_members=complete,
+        failed_members=failed,
+        open_members=pending,
+    )

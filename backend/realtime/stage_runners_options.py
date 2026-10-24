@@ -99,6 +99,7 @@ from .orchestration_repository import (
 from .runner_environment import RunnerEnvironment
 from .stage_orchestrator import StageCancelled, StageContext, StageOutcome, StageRunner
 from .stage_runners_equity import STAGE_CANCELLED
+from .stage_graph import STAGE_CATALOG_VERSION_V4, STAGE_CATALOG_VERSION_V5
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,8 @@ OPTIONS_ACQUIRE_NOT_CONFIGURED = "OPTIONS_ACQUIRE_NOT_CONFIGURED"
 OPTIONS_ACQUIRE_INCOMPLETE = "OPTIONS_ACQUIRE_INCOMPLETE"
 OPTIONS_ADMISSION_NOT_CONFIGURED = "OPTIONS_ADMISSION_NOT_CONFIGURED"
 OPTIONS_ADMISSION_INCOMPLETE = "OPTIONS_ADMISSION_INCOMPLETE"
+OPTIONS_REFERENCE_NOT_CONFIGURED = "OPTIONS_REFERENCE_NOT_CONFIGURED"
+OPTIONS_REFERENCE_INCOMPLETE = "OPTIONS_REFERENCE_INCOMPLETE"
 OPTIONS_INPUT_GATE_NOT_CONFIGURED = "OPTIONS_INPUT_GATE_NOT_CONFIGURED"
 OPTIONS_CYCLE_NOT_CONFIGURED = "OPTIONS_CYCLE_NOT_CONFIGURED"
 OPTIONS_PROJECTION_NOT_CONFIGURED = "OPTIONS_PROJECTION_NOT_CONFIGURED"
@@ -236,12 +239,37 @@ class OptionsReceiptStageResult:
 
 
 @dataclass(frozen=True, slots=True)
+class OptionsReferenceStageResult:
+    state_id: UUID
+    state_sha256: str
+    reference_generation: int
+    evidence_ref: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.state_id, UUID)
+            or self.state_id.int == 0
+            or len(self.state_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.state_sha256
+            )
+            or type(self.reference_generation) is not int
+            or self.reference_generation <= 0
+            or not self.evidence_ref.strip()
+        ):
+            raise ValueError("Options reference stage result is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class OptionsPublisherStageResult:
     handoff_sha256: str
     evidence_ref: str
     dispatch_authorized: bool = False
     release_authorized: bool = False
     pointer_authorized: bool = False
+    release_id: UUID | None = None
+    pointer_release_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if len(self.handoff_sha256) != 64 or any(
@@ -251,6 +279,21 @@ class OptionsPublisherStageResult:
             raise ValueError("Options publisher handoff hash is invalid")
         if not self.evidence_ref.strip():
             raise ValueError("Options publisher evidence cannot be blank")
+        authorized = self.release_authorized or self.pointer_authorized
+        if (
+            self.dispatch_authorized
+            or self.release_authorized != self.pointer_authorized
+            or authorized
+            != (
+                self.release_id is not None
+                and self.pointer_release_id is not None
+            )
+            or (
+                authorized
+                and self.release_id != self.pointer_release_id
+            )
+        ):
+            raise ValueError("Options publisher release result is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +348,16 @@ def options_acquire_block_reason(environment: RunnerEnvironment) -> str | None:
 
 def options_admission_block_reason(environment: RunnerEnvironment) -> str | None:
     return None if callable(environment.options_admission_action) else OPTIONS_ADMISSION_NOT_CONFIGURED
+
+
+def options_reference_block_reason(
+    environment: RunnerEnvironment,
+) -> str | None:
+    return (
+        None
+        if callable(environment.options_reference_action)
+        else OPTIONS_REFERENCE_NOT_CONFIGURED
+    )
 
 
 def options_input_gate_block_reason(
@@ -412,12 +465,24 @@ def options_publish_runner(environment: RunnerEnvironment) -> StageRunner:
         if context.is_cancelled():
             return StageOutcome.failed(STAGE_CANCELLED)
         result = environment.options_publish_action(context)
-        if (
-            not isinstance(result, OptionsPublisherStageResult)
-            or result.dispatch_authorized
-            or result.release_authorized
-            or result.pointer_authorized
-        ):
+        if not isinstance(result, OptionsPublisherStageResult):
+            return StageOutcome.failed(OPTIONS_PUBLISH_AUTHORITY_INVALID)
+        catalog = context.plan.stage_catalog_version
+        inert_v4 = (
+            catalog == STAGE_CATALOG_VERSION_V4
+            and not result.release_authorized
+            and not result.pointer_authorized
+            and result.release_id is None
+            and result.pointer_release_id is None
+        )
+        published_v5 = (
+            catalog == STAGE_CATALOG_VERSION_V5
+            and result.release_authorized
+            and result.pointer_authorized
+            and result.release_id is not None
+            and result.release_id == result.pointer_release_id
+        )
+        if result.dispatch_authorized or not (inert_v4 or published_v5):
             return StageOutcome.failed(OPTIONS_PUBLISH_AUTHORITY_INVALID)
         return StageOutcome.complete(evidence_ref=result.evidence_ref)
 
@@ -453,6 +518,21 @@ def options_admission_runner(environment: RunnerEnvironment) -> StageRunner:
             return StageOutcome.failed(OPTIONS_ADMISSION_INCOMPLETE)
         if result.status == "BLOCKED":
             return StageOutcome("BLOCKED_POLICY", result.reason_codes, None, result.evidence_ref)
+        return StageOutcome.complete(evidence_ref=result.evidence_ref)
+
+    return run
+
+
+def options_reference_runner(environment: RunnerEnvironment) -> StageRunner:
+    def run(context: StageContext) -> StageOutcome:
+        blocked = options_reference_block_reason(environment)
+        if blocked is not None:
+            return StageOutcome.blocked(blocked)
+        if context.is_cancelled():
+            return StageOutcome.failed(STAGE_CANCELLED)
+        result = environment.options_reference_action(context)
+        if not isinstance(result, OptionsReferenceStageResult):
+            return StageOutcome.failed(OPTIONS_REFERENCE_INCOMPLETE)
         return StageOutcome.complete(evidence_ref=result.evidence_ref)
 
     return run

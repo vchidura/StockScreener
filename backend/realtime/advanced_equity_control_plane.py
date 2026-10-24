@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from .contracts import (
     AssetClass,
+    EQUITY_VALIDATION_UNIVERSE,
     MarketChannel,
     SubscriptionManifest,
     SubscriptionMember,
@@ -216,6 +218,211 @@ def build_advanced_equity_control_plane_plan(
         valuation_sha256=valuation_sha256,
         binding=binding,
     )
+
+
+def load_advanced_equity_control_plane_plan_cursor(
+    cursor,
+    cohort_id: UUID,
+) -> AdvancedEquityControlPlanePlan:
+    if not isinstance(cohort_id, UUID) or cohort_id.int == 0:
+        raise ValueError("Advanced Equity source cohort is invalid")
+    cursor.execute(
+        "SELECT cohort.cohort_sha256,cohort.configuration_sha256,"
+        "cohort.model_bundle_sha256,cohort.valuation_sha256,"
+        "cohort.effective_at,cohort.mode,manifest.manifest_id::text,"
+        "manifest.manifest_sha256,manifest.universe_sha256,"
+        "manifest.session_date,manifest.effective_at AS manifest_effective_at,"
+        "manifest.manifest_kind,manifest.allocation_policy_sha256,"
+        "profile.profile_id::text,profile.config_sha256,"
+        "profile.schema_sha256,profile.capabilities_sha256,"
+        "profile.checked_at,profile.expires_at,profile.profile_sha256,"
+        "profile.provider_tier,profile.security_policy_sha256 "
+        "FROM rt.cohorts AS cohort "
+        "JOIN rt.subscription_manifests AS manifest "
+        "ON manifest.manifest_id=cohort.manifest_id "
+        "JOIN rt.capability_profiles AS profile "
+        "ON profile.profile_id=manifest.profile_id "
+        "WHERE cohort.cohort_id=%s",
+        (str(cohort_id),),
+    )
+    row = cursor.fetchone()
+    if row is not None and not isinstance(row, Mapping):
+        row = dict(zip(
+            (description.name for description in cursor.description),
+            row,
+        ))
+    if (
+        row is None
+        or str(row["manifest_kind"]) != "EQUITY_VALIDATION"
+        or str(row["provider_tier"])
+        != ProviderTier.MASSIVE_ADVANCED.value
+        or str(row["mode"]) != "SHADOW"
+    ):
+        raise ValueError(
+            "Advanced Equity source control plane is unavailable"
+        )
+    cursor.execute(
+        "SELECT revision.ticker,instrument.security_id::text,"
+        "member.channel,member.priority,member.purpose "
+        "FROM rt.subscription_members AS member "
+        "JOIN rt.instruments AS instrument "
+        "ON instrument.instrument_id=member.instrument_id "
+        "JOIN LATERAL ("
+        "SELECT candidate.ticker "
+        "FROM ref.security_revisions AS candidate "
+        "WHERE candidate.security_id=instrument.security_id "
+        "AND candidate.effective_from<=%s "
+        "AND candidate.observed_at<=%s "
+        "ORDER BY candidate.effective_from DESC,"
+        "candidate.observed_at DESC LIMIT 1"
+        ") AS revision ON true "
+        "WHERE member.manifest_id=%s "
+        "AND member.option_underlying=false "
+        "ORDER BY revision.ticker",
+        (
+            row["checked_at"],
+            row["checked_at"],
+            str(row["manifest_id"]),
+        ),
+    )
+    member_columns = tuple(
+        description.name for description in cursor.description
+    )
+    members = tuple(
+        member
+        if isinstance(member, Mapping)
+        else dict(zip(member_columns, member))
+        for member in cursor.fetchall()
+    )
+    if (
+        not members
+        or any(
+            str(member["channel"])
+            != MarketChannel.MINUTE_AGGREGATE.value
+            or int(member["priority"]) != 1
+            or str(member["purpose"]) != "PRIMARY"
+            for member in members
+        )
+    ):
+        raise ValueError(
+            "Advanced Equity source membership is unavailable"
+        )
+    security_ids = {
+        str(member["ticker"]): UUID(str(member["security_id"]))
+        for member in members
+    }
+    if len(security_ids) != len(members):
+        raise ValueError("Advanced Equity source membership is ambiguous")
+    cursor.execute(
+        "SELECT evidence FROM rt.capability_checks "
+        "WHERE profile_id=%s AND check_name='entitlement' "
+        "ORDER BY observed_at DESC LIMIT 1",
+        (str(row["profile_id"]),),
+    )
+    capability = cursor.fetchone()
+    if capability is not None and not isinstance(capability, Mapping):
+        capability = dict(zip(
+            (description.name for description in cursor.description),
+            capability,
+        ))
+    evidence = None if capability is None else capability["evidence"]
+    if (
+        not isinstance(evidence, dict)
+        or not str(evidence.get("authorization_reference", "")).strip()
+        or len(str(evidence.get("evidence_sha256", ""))) != 64
+    ):
+        raise ValueError(
+            "Advanced Equity source authorization is unavailable"
+        )
+    plan = build_advanced_equity_control_plane_plan(
+        session_date=row["session_date"],
+        security_ids=security_ids,
+        entitlement_evidence_sha256=str(evidence["evidence_sha256"]),
+        authorization_reference=str(
+            evidence["authorization_reference"]
+        ),
+        checked_at=row["checked_at"],
+        expires_at=row["expires_at"],
+        schema_sha256=str(row["schema_sha256"]),
+        security_policy_sha256=str(row["security_policy_sha256"]),
+        configuration_sha256=str(row["config_sha256"]),
+    )
+    actual = (
+        plan.cohort_sha256,
+        plan.configuration_sha256,
+        plan.model_bundle_sha256,
+        plan.valuation_sha256,
+        plan.checked_at,
+        plan.manifest_id,
+        plan.manifest.sha256,
+        plan.universe.sha256,
+        plan.session_date,
+        plan.manifest.allocation_policy_sha256,
+        plan.profile_id,
+        plan.capabilities_sha256,
+        plan.profile_sha256,
+    )
+    expected = (
+        str(row["cohort_sha256"]),
+        str(row["configuration_sha256"]),
+        str(row["model_bundle_sha256"]),
+        str(row["valuation_sha256"]),
+        row["effective_at"],
+        UUID(str(row["manifest_id"])),
+        str(row["manifest_sha256"]),
+        str(row["universe_sha256"]),
+        row["session_date"],
+        str(row["allocation_policy_sha256"]),
+        UUID(str(row["profile_id"])),
+        str(row["capabilities_sha256"]),
+        str(row["profile_sha256"]),
+    )
+    if plan.cohort_id != cohort_id or actual != expected:
+        raise ValueError(
+            "Advanced Equity source control plane identity changed"
+        )
+    return plan
+
+
+def validate_active_target9_equity_source_cursor(
+    cursor,
+    plan: AdvancedEquityControlPlanePlan,
+) -> None:
+    if (
+        not isinstance(plan, AdvancedEquityControlPlanePlan)
+        or plan.universe.equity_tickers
+        != EQUITY_VALIDATION_UNIVERSE.equity_tickers
+    ):
+        raise ValueError(
+            "Advanced Options requires the exact target-9 Equity universe"
+        )
+    cursor.execute(
+        "SELECT universe_target,provider_tier,feed,channels,status,"
+        "configuration_sha256 "
+        "FROM rt.advanced_ingress_runtime_profiles "
+        "WHERE configuration_sha256=%s",
+        (plan.configuration_sha256,),
+    )
+    row = cursor.fetchone()
+    if row is not None and not isinstance(row, Mapping):
+        row = dict(zip(
+            (description.name for description in cursor.description),
+            row,
+        ))
+    if (
+        row is None
+        or int(row["universe_target"]) != 9
+        or str(row["provider_tier"])
+        != ProviderTier.MASSIVE_ADVANCED.value
+        or str(row["feed"]) != "STOCKS"
+        or tuple(row["channels"]) != ("AM",)
+        or str(row["status"]) != "ACTIVE"
+        or str(row["configuration_sha256"])
+        != plan.configuration_sha256
+    ):
+        raise ValueError(
+            "Advanced Options target-9 Equity runtime profile is not active"
+        )
 
 
 def persist_advanced_equity_control_plane_cursor(

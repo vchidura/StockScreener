@@ -163,13 +163,15 @@ def _request_spec(plan: AdjustedDailyRepairPlan):
     return url, params, request_sha256
 
 
+def _uses_per_ticker_endpoint(plan: AdjustedDailyRepairPlan) -> bool:
+    return plan.per_ticker and len(plan.identities) == 1
+
+
 def _endpoint_policy(plan: AdjustedDailyRepairPlan):
-    if not plan.per_ticker:
+    if not _uses_per_ticker_endpoint(plan):
         if not plan.adjusted:
             raise ValueError("raw daily repair requires one exact ticker")
         return ENDPOINT_POLICY
-    if len(plan.identities) != 1:
-        raise ValueError("per-ticker daily repair requires one exact ticker")
     ticker = quote(plan.identities[0].ticker, safe="")
     session = plan.session_date.isoformat()
     return {
@@ -398,6 +400,7 @@ def _request(
         if not isinstance(rows, list):
             raise ValueError("adjusted-daily results must be a list")
         identity_by_ticker = {row.ticker: row for row in plan.identities}
+        uses_per_ticker_endpoint = _uses_per_ticker_endpoint(plan)
         response_rows = (
             tuple(
                 {
@@ -406,14 +409,14 @@ def _request(
                 }
                 for row in rows
             )
-            if plan.per_ticker
+            if uses_per_ticker_endpoint
             else tuple(rows)
         )
         selected = tuple(
             row for row in rows
             if str(row.get("T") or "").strip().upper() in identity_by_ticker
         )
-        if plan.per_ticker:
+        if uses_per_ticker_endpoint:
             selected = response_rows
         if {
             str(row.get("T") or "").strip().upper() for row in selected

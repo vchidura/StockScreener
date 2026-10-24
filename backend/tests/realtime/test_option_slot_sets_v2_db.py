@@ -724,8 +724,6 @@ def _owp4_enrollment(
         maximum_option_quote_contracts=2,
         reserved_option_quote_contracts=0,
         required_detectors=(
-            DetectorFamily.S1,
-            DetectorFamily.S2,
             DetectorFamily.O1,
             DetectorFamily.O2,
             DetectorFamily.O3,

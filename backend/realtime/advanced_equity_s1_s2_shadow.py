@@ -113,17 +113,36 @@ def _load_bars_cursor(
         "AND revision.bar_start=current.bar_start "
         "AND revision.session_scope=current.session_scope "
         "AND revision.adjustment_basis=current.adjustment_basis "
-        "WHERE revision.cohort_id=%s AND revision.security_id=%s "
+        "LEFT JOIN rt.cohort_history_bindings AS binding "
+        "ON binding.target_cohort_id=%s "
+        "WHERE ((revision.cohort_id=%s "
+        "AND revision.availability_mode='LIVE_OBSERVED') "
+        "OR (revision.cohort_id=binding.source_cohort_id "
+        "AND revision.provider_tier=binding.source_provider_tier "
+        "AND binding.created_at<=%s "
+        "AND revision.bar_end<binding.history_before "
+        "AND revision.availability_mode='HISTORICAL_RECONSTRUCTED')) "
+        "AND revision.security_id=%s "
         "AND revision.interval='1d' AND revision.is_final "
-        "AND revision.availability_mode='LIVE_OBSERVED' "
         "AND revision.adjustment_basis='RAW_UNADJUSTED' "
         "AND revision.session_scope='RTH' "
         "AND revision.session_date<%s "
+        "AND revision.observed_at<=%s AND revision.created_at<=%s "
+        "AND (revision.replay_available_at IS NULL "
+        "OR revision.replay_available_at<=%s) "
+        "AND (revision.provider_published_at IS NULL "
+        "OR revision.provider_published_at<=%s) "
         "ORDER BY revision.bar_end DESC LIMIT 15",
         (
             str(record.cohort_id),
+            str(record.cohort_id),
+            record.observed_at,
             str(record.security_id),
             record.bar_end.date(),
+            record.observed_at,
+            record.observed_at,
+            record.observed_at,
+            record.observed_at,
         ),
     )
     daily = tuple(reversed(tuple(

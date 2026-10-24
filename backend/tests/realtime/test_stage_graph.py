@@ -15,6 +15,9 @@ from realtime.stage_graph import (
     STAGES_V2,
     STAGES_V3,
     STAGES_V4,
+    STAGES_V5,
+    OPTIONS_RESIDENT_COMPLETION,
+    TARGET_WINDOW_E_BINDING,
     Action,
     decide_window,
     lanes_required,
@@ -212,6 +215,83 @@ def test_v4_catalog_adds_options_without_changing_equity_dependencies():
         )
         for stage in STAGES_V4.values()
         if stage.domain != "options"
+    )
+
+
+def test_v5_catalog_has_exact_v3_session_and_window_ownership():
+    text = (
+        Path(V2_MIGRATIONS_DIR)
+        / "035_advanced_options_v3_stage_barrier.sql"
+    ).read_text(encoding="utf-8")
+    rows = re.findall(
+        r"\('([A-Z_]+)','stages_v5','(shared|equity|options)',"
+        r"ARRAY\[([^\]]*)\](?:::text\[\])?,'([a-z]+)',"
+        r"'([A-Z]+)',(true|false),(NULL|\d+),"
+        r"ARRAY\[([^\]]*)\](?:::text\[\])?\)",
+        text,
+    )
+    parsed = {
+        name: (
+            domain,
+            tuple(re.findall(r"'([A-Z_]+)'", prerequisites)),
+            lane,
+            schedule,
+            gate == "true",
+            None if deadline == "NULL" else int(deadline),
+            tuple(re.findall(r"'([A-Z_]+)'", external)),
+        )
+        for (
+            name,
+            domain,
+            prerequisites,
+            lane,
+            schedule,
+            gate,
+            deadline,
+            external,
+        ) in rows
+    }
+    assert parsed == {
+        name: (
+            stage.domain,
+            stage.prerequisites,
+            stage.lane,
+            stage.schedule_kind,
+            stage.gates_strategy,
+            stage.deadline_offset_seconds,
+            stage.external_prerequisites,
+        )
+        for name, stage in STAGES_V5.items()
+    }
+    assert {
+        name: stage
+        for name, stage in STAGES_V5.items()
+        if stage.domain != "options"
+    } == STAGES_V3
+    assert STAGES_V5["OPTIONS_ACQUIRE"].prerequisites == ("REFERENCE",)
+    assert STAGES_V5["OPTIONS_ADMISSION"].prerequisites == (
+        "OPTIONS_ACQUIRE",
+    )
+    assert STAGES_V5["OPTIONS_REFERENCE"].prerequisites == (
+        "OPTIONS_ACQUIRE",
+    )
+    assert STAGES_V5["OPTIONS_FLOW"].prerequisites == (
+        "OPTIONS_ADMISSION",
+        "OPTIONS_REFERENCE",
+    )
+    assert STAGES_V5["OPTIONS_INPUT_GATE"].prerequisites == (
+        "OPTIONS_REFERENCE",
+    )
+    assert STAGES_V5["OPTIONS_INPUT_GATE"].external_prerequisites == (
+        TARGET_WINDOW_E_BINDING,
+        OPTIONS_RESIDENT_COMPLETION,
+    )
+    assert "EQUITY_MATERIALIZE" not in STAGES_V5[
+        "OPTIONS_INPUT_GATE"
+    ].prerequisites
+    assert STAGES_V4["OPTIONS_INPUT_GATE"].prerequisites == (
+        "OPTIONS_ADMISSION",
+        "EQUITY_MATERIALIZE",
     )
 
 

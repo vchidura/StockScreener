@@ -1099,6 +1099,7 @@ class AdvancedIngressControllerStatus:
     authorized_end_at: datetime
     maximum_connection_attempts: int
     connection_attempt_count: int
+    latest_stream_status: str | None
 
 
 def advanced_ingress_controller_status_cursor(
@@ -1108,11 +1109,13 @@ def advanced_ingress_controller_status_cursor(
     cursor.execute(
         "SELECT plan.status,plan.terminal_outcome,auth.status,"
         "plan.authorized_end_at,plan.maximum_connection_attempts,"
-        "usage.connection_attempt_count "
+        "usage.connection_attempt_count,session.status "
         "FROM rt.advanced_ingress_plans AS plan "
         "JOIN rt.advanced_stream_authorizations AS auth "
         "USING(authorization_id) "
         "JOIN rt.advanced_ingress_plan_usage AS usage USING(plan_id) "
+        "LEFT JOIN rt.stream_sessions AS session "
+        "ON session.session_id=usage.latest_stream_session_id "
         "WHERE plan.plan_id=%s",
         (str(plan_id),),
     )
@@ -1127,6 +1130,7 @@ def advanced_ingress_controller_status_cursor(
         row[3],
         int(row[4]),
         int(row[5]),
+        None if row[6] is None else str(row[6]),
     )
 
 

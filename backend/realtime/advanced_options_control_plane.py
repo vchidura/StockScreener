@@ -42,7 +42,12 @@ from .orchestration_repository import (
     CycleReceiptSpec,
     build_options_receipt_spec,
 )
-from .preflight import ProductEntitlementProfile, ProviderTier, TierState
+from .preflight import (
+    DetectorFamily,
+    ProductEntitlementProfile,
+    ProviderTier,
+    TierState,
+)
 from .provider_budget import ProviderBudgetScope
 from .tier_cohort import (
     TierCohortBinding,
@@ -68,6 +73,9 @@ PRESERVED_STAGE_CATALOGS = ("stages_v1", "stages_v2", "stages_v3")
 ADVANCED_OPTIONS_ENROLLMENT_VERSION = "advanced-options-enrollment-plan-v1"
 ADVANCED_OPTIONS_HISTORY_BINDING_VERSION = (
     "advanced-options-history-binding-v1"
+)
+ADVANCED_OPTIONS_EQUITY_INPUT_BINDING_VERSION = (
+    "advanced-options-equity-input-binding-v2"
 )
 ADVANCED_OPTIONS_ZERO_EFFECTS = (
     "provider",
@@ -558,6 +566,7 @@ class AdvancedOptionsHistoryBinding:
     source_manifest_sha256: str
     authorization_reference: str
     binding_sha256: str
+    evidence_sha256: str | None = None
 
     def __post_init__(self) -> None:
         before = _utc(self.history_before, "history_before")
@@ -581,6 +590,12 @@ class AdvancedOptionsHistoryBinding:
         object.__setattr__(self, "history_before", before)
         object.__setattr__(self, "source_manifest_sha256", source_manifest)
         object.__setattr__(self, "authorization_reference", reference)
+        if self.evidence_sha256 is not None:
+            object.__setattr__(
+                self,
+                "evidence_sha256",
+                _sha256(self.evidence_sha256, "evidence_sha256"),
+            )
         if self.binding_sha256 != canonical_sha256(
             advanced_options_history_binding_payload(
                 self,
@@ -606,6 +621,8 @@ def advanced_options_history_binding_payload(
         "source_manifest_sha256": binding.source_manifest_sha256,
         "authorization_reference": binding.authorization_reference,
     }
+    if binding.evidence_sha256 is not None:
+        payload["evidence_sha256"] = binding.evidence_sha256
     if include_sha256:
         payload["binding_sha256"] = binding.binding_sha256
     return payload
@@ -618,6 +635,7 @@ def build_advanced_options_history_binding(
     history_before: datetime,
     source_manifest_sha256: str,
     authorization_reference: str,
+    evidence_sha256: str | None = None,
 ) -> AdvancedOptionsHistoryBinding:
     body = {
         "contract_version": ADVANCED_OPTIONS_HISTORY_BINDING_VERSION,
@@ -637,12 +655,204 @@ def build_advanced_options_history_binding(
             "authorization_reference",
         ),
     }
+    if evidence_sha256 is not None:
+        body["evidence_sha256"] = _sha256(
+            evidence_sha256,
+            "evidence_sha256",
+        )
     return AdvancedOptionsHistoryBinding(
         target_cohort_id=target_cohort_id,
         source_cohort_id=source_cohort_id,
         source_provider_tier=ProviderTier.MASSIVE_DEVELOPER,
         history_before=datetime.fromisoformat(str(body["history_before"])),
         source_manifest_sha256=str(body["source_manifest_sha256"]),
+        authorization_reference=str(body["authorization_reference"]),
+        binding_sha256=canonical_sha256(body),
+        evidence_sha256=body.get("evidence_sha256"),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AdvancedOptionsEquityInputBinding:
+    target_options_window_id: UUID
+    target_cohort_id: UUID
+    source_cohort_id: UUID
+    source_cohort_sha256: str
+    source_manifest_id: UUID
+    source_manifest_sha256: str
+    source_profile_id: UUID
+    source_profile_sha256: str
+    equity_window_id: UUID
+    equity_receipt_id: UUID
+    equity_cutoff: datetime
+    reference_generation: int
+    universe_sha256: str
+    input_sha256: str
+    build_id: str
+    maximum_age_seconds: int
+    authorization_reference: str
+    binding_sha256: str
+
+    def __post_init__(self) -> None:
+        cutoff = _utc(self.equity_cutoff, "equity_cutoff")
+        if (
+            self.target_cohort_id.int == 0
+            or self.target_options_window_id.int == 0
+            or self.source_cohort_id.int == 0
+            or self.target_cohort_id == self.source_cohort_id
+            or self.source_manifest_id.int == 0
+            or self.source_profile_id.int == 0
+            or self.equity_window_id.int == 0
+            or self.equity_receipt_id.int == 0
+            or type(self.reference_generation) is not int
+            or self.reference_generation <= 0
+            or type(self.maximum_age_seconds) is not int
+            or self.maximum_age_seconds <= 0
+        ):
+            raise ValueError(
+                "Advanced Options Equity input binding scope is invalid"
+            )
+        for value, name in (
+            (self.source_cohort_sha256, "source_cohort_sha256"),
+            (self.source_manifest_sha256, "source_manifest_sha256"),
+            (self.source_profile_sha256, "source_profile_sha256"),
+            (self.universe_sha256, "universe_sha256"),
+            (self.input_sha256, "input_sha256"),
+        ):
+            _sha256(value, name)
+        _text(self.build_id, "build_id")
+        _text(self.authorization_reference, "authorization_reference")
+        if len(self.build_id) > 96:
+            raise ValueError(
+                "Advanced Options Equity input build_id is too long"
+            )
+        object.__setattr__(self, "equity_cutoff", cutoff)
+        if self.binding_sha256 != canonical_sha256(
+            advanced_options_equity_input_binding_payload(
+                self,
+                include_sha256=False,
+            )
+        ):
+            raise ValueError(
+                "Advanced Options Equity input binding identity changed"
+            )
+
+
+def advanced_options_equity_input_binding_payload(
+    binding: AdvancedOptionsEquityInputBinding,
+    *,
+    include_sha256: bool = True,
+) -> dict[str, object]:
+    if not isinstance(binding, AdvancedOptionsEquityInputBinding):
+        raise TypeError(
+            "Advanced Options Equity input binding is invalid"
+        )
+    payload = {
+        "contract_version": (
+            ADVANCED_OPTIONS_EQUITY_INPUT_BINDING_VERSION
+        ),
+        "target_options_window_id": str(
+            binding.target_options_window_id
+        ),
+        "target_cohort_id": str(binding.target_cohort_id),
+        "source_cohort_id": str(binding.source_cohort_id),
+        "source_cohort_sha256": binding.source_cohort_sha256,
+        "source_manifest_id": str(binding.source_manifest_id),
+        "source_manifest_sha256": binding.source_manifest_sha256,
+        "source_profile_id": str(binding.source_profile_id),
+        "source_profile_sha256": binding.source_profile_sha256,
+        "equity_window_id": str(binding.equity_window_id),
+        "equity_receipt_id": str(binding.equity_receipt_id),
+        "equity_cutoff": binding.equity_cutoff.isoformat(),
+        "reference_generation": binding.reference_generation,
+        "universe_sha256": binding.universe_sha256,
+        "input_sha256": binding.input_sha256,
+        "build_id": binding.build_id,
+        "maximum_age_seconds": binding.maximum_age_seconds,
+        "authorization_reference": binding.authorization_reference,
+    }
+    if include_sha256:
+        payload["binding_sha256"] = binding.binding_sha256
+    return payload
+
+
+def build_advanced_options_equity_input_binding(
+    *,
+    target_options_window_id: UUID,
+    target_cohort_id: UUID,
+    source_cohort_id: UUID,
+    source_cohort_sha256: str,
+    source_manifest_id: UUID,
+    source_manifest_sha256: str,
+    source_profile_id: UUID,
+    source_profile_sha256: str,
+    equity_window_id: UUID,
+    equity_receipt_id: UUID,
+    equity_cutoff: datetime,
+    reference_generation: int,
+    universe_sha256: str,
+    input_sha256: str,
+    build_id: str,
+    maximum_age_seconds: int,
+    authorization_reference: str,
+) -> AdvancedOptionsEquityInputBinding:
+    body = {
+        "contract_version": (
+            ADVANCED_OPTIONS_EQUITY_INPUT_BINDING_VERSION
+        ),
+        "target_options_window_id": str(target_options_window_id),
+        "target_cohort_id": str(target_cohort_id),
+        "source_cohort_id": str(source_cohort_id),
+        "source_cohort_sha256": _sha256(
+            source_cohort_sha256,
+            "source_cohort_sha256",
+        ),
+        "source_manifest_id": str(source_manifest_id),
+        "source_manifest_sha256": _sha256(
+            source_manifest_sha256,
+            "source_manifest_sha256",
+        ),
+        "source_profile_id": str(source_profile_id),
+        "source_profile_sha256": _sha256(
+            source_profile_sha256,
+            "source_profile_sha256",
+        ),
+        "equity_window_id": str(equity_window_id),
+        "equity_receipt_id": str(equity_receipt_id),
+        "equity_cutoff": _utc(
+            equity_cutoff,
+            "equity_cutoff",
+        ).isoformat(),
+        "reference_generation": reference_generation,
+        "universe_sha256": _sha256(
+            universe_sha256,
+            "universe_sha256",
+        ),
+        "input_sha256": _sha256(input_sha256, "input_sha256"),
+        "build_id": _text(build_id, "build_id"),
+        "maximum_age_seconds": maximum_age_seconds,
+        "authorization_reference": _text(
+            authorization_reference,
+            "authorization_reference",
+        ),
+    }
+    return AdvancedOptionsEquityInputBinding(
+        target_options_window_id=target_options_window_id,
+        target_cohort_id=target_cohort_id,
+        source_cohort_id=source_cohort_id,
+        source_cohort_sha256=str(body["source_cohort_sha256"]),
+        source_manifest_id=source_manifest_id,
+        source_manifest_sha256=str(body["source_manifest_sha256"]),
+        source_profile_id=source_profile_id,
+        source_profile_sha256=str(body["source_profile_sha256"]),
+        equity_window_id=equity_window_id,
+        equity_receipt_id=equity_receipt_id,
+        equity_cutoff=datetime.fromisoformat(str(body["equity_cutoff"])),
+        reference_generation=reference_generation,
+        universe_sha256=str(body["universe_sha256"]),
+        input_sha256=str(body["input_sha256"]),
+        build_id=str(body["build_id"]),
+        maximum_age_seconds=maximum_age_seconds,
         authorization_reference=str(body["authorization_reference"]),
         binding_sha256=canonical_sha256(body),
     )
@@ -757,6 +967,7 @@ def build_advanced_options_control_plane_plan(
     journal_generation: UUID,
     stream_session_ids: tuple[UUID, ...],
     receipt_inputs: AdvancedOptionsReceiptInputs,
+    equity_input_cutoff: datetime | None = None,
     runtime_authorization: AdvancedOptionsRuntimeAuthorization | None = None,
     authorized_cohort_id: UUID | None = None,
     authorized_plan_id: UUID | None = None,
@@ -775,6 +986,14 @@ def build_advanced_options_control_plane_plan(
         raise TypeError("Advanced Options feed scope is invalid")
     if not isinstance(manifest_policy, BoundedOptionManifestPolicy):
         raise TypeError("Advanced Options manifest policy is invalid")
+    if set(manifest_policy.required_detectors) != {
+        DetectorFamily.O1,
+        DetectorFamily.O2,
+        DetectorFamily.O3,
+    }:
+        raise ValueError(
+            "Advanced Options requires exact O1/O2/O3 detector membership"
+        )
     if not isinstance(pins, AdvancedOptionsPolicyPins):
         raise TypeError("Advanced Options policy pins are invalid")
     if not isinstance(socket_budget, AdvancedOptionsSocketBudget):
@@ -817,10 +1036,26 @@ def build_advanced_options_control_plane_plan(
     cutoff = receipt_inputs.cutoff
     if not checked <= planned <= cutoff < expires:
         raise ValueError("Advanced Options entitlement is stale or out of scope")
-    if not equity_plan.checked_at <= planned <= cutoff < equity_plan.expires_at:
+    bound_equity_cutoff = (
+        cutoff
+        if equity_input_cutoff is None
+        else _utc(equity_input_cutoff, "equity_input_cutoff")
+    )
+    equity_entitlement_valid = (
+        equity_plan.checked_at <= planned <= cutoff < equity_plan.expires_at
+        if equity_input_cutoff is None
+        else (
+            equity_plan.checked_at
+            <= bound_equity_cutoff
+            < equity_plan.expires_at
+            and bound_equity_cutoff <= planned
+        )
+    )
+    if not equity_entitlement_valid:
         raise ValueError("Advanced Equity entitlement is stale for Options")
     if (
         equity_plan.session_date != cutoff.date()
+        or bound_equity_cutoff.date() != equity_plan.session_date
         or slot_effective.date() != equity_plan.session_date
         or slot_effective > cutoff
     ):
@@ -1666,11 +1901,212 @@ def persist_advanced_options_history_binding_cursor(
         )
 
 
+def persist_advanced_options_equity_input_binding_cursor(
+    cursor,
+    binding: AdvancedOptionsEquityInputBinding,
+) -> None:
+    advanced_options_equity_input_binding_payload(binding)
+    cursor.execute(
+        "SELECT cohort.cohort_sha256,cohort.manifest_id::text,"
+        "manifest.manifest_sha256,manifest.profile_id::text,"
+        "profile.profile_sha256,profile.provider_tier "
+        "FROM rt.cohorts AS cohort "
+        "JOIN rt.subscription_manifests AS manifest "
+        "ON manifest.manifest_id=cohort.manifest_id "
+        "JOIN rt.capability_profiles AS profile "
+        "ON profile.profile_id=manifest.profile_id "
+        "WHERE cohort.cohort_id=%s",
+        (str(binding.source_cohort_id),),
+    )
+    if cursor.fetchone() != (
+        binding.source_cohort_sha256,
+        str(binding.source_manifest_id),
+        binding.source_manifest_sha256,
+        str(binding.source_profile_id),
+        binding.source_profile_sha256,
+        ProviderTier.MASSIVE_ADVANCED.value,
+    ):
+        raise ValueError(
+            "Advanced Options Equity input source identity changed"
+        )
+    cursor.execute(
+        "SELECT receipt.window_id::text,receipt.cohort_id::text,"
+        "receipt.receipt_kind,receipt.cutoff,"
+        "receipt.reference_generation,receipt.universe_sha256,"
+        "receipt.input_sha256,receipt.build_id,window_run.state "
+        "FROM rt.cycle_receipts AS receipt "
+        "JOIN rt.window_runs AS window_run "
+        "ON window_run.window_id=receipt.window_id "
+        "WHERE receipt.receipt_id=%s",
+        (str(binding.equity_receipt_id),),
+    )
+    if cursor.fetchone() != (
+        str(binding.equity_window_id),
+        str(binding.source_cohort_id),
+        "INPUT_READY",
+        binding.equity_cutoff,
+        binding.reference_generation,
+        binding.universe_sha256,
+        binding.input_sha256,
+        binding.build_id,
+        "COMPLETE",
+    ):
+        raise ValueError(
+            "Advanced Options Equity input receipt identity changed"
+        )
+    cursor.execute(
+        "SELECT window_run.cohort_id::text,window_run.cutoff,"
+        "service.session_date "
+        "FROM rt.window_runs AS window_run "
+        "JOIN rt.service_plans AS service "
+        "ON service.plan_id=window_run.plan_id "
+        "WHERE window_run.window_id=%s",
+        (str(binding.target_options_window_id),),
+    )
+    target = cursor.fetchone()
+    if target is not None and (
+        target[0] != str(binding.target_cohort_id)
+        or target[1].date() != target[2]
+        or binding.equity_cutoff.date() != target[2]
+        or binding.equity_cutoff > target[1]
+        or (
+            target[1] - binding.equity_cutoff
+        ).total_seconds() > binding.maximum_age_seconds
+    ):
+        raise ValueError(
+            "Advanced Options target window binding changed"
+        )
+    cursor.execute(
+        "INSERT INTO rt.advanced_options_equity_input_bindings ("
+        "target_options_window_id,target_cohort_id,"
+        "source_cohort_id,source_cohort_sha256,"
+        "source_manifest_id,source_manifest_sha256,source_profile_id,"
+        "source_profile_sha256,equity_window_id,equity_receipt_id,"
+        "equity_cutoff,reference_generation,universe_sha256,"
+        "input_sha256,build_id,maximum_age_seconds,"
+        "authorization_reference,binding_sha256) VALUES ("
+        "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (target_options_window_id) DO NOTHING",
+        (
+            str(binding.target_options_window_id),
+            str(binding.target_cohort_id),
+            str(binding.source_cohort_id),
+            binding.source_cohort_sha256,
+            str(binding.source_manifest_id),
+            binding.source_manifest_sha256,
+            str(binding.source_profile_id),
+            binding.source_profile_sha256,
+            str(binding.equity_window_id),
+            str(binding.equity_receipt_id),
+            binding.equity_cutoff,
+            binding.reference_generation,
+            binding.universe_sha256,
+            binding.input_sha256,
+            binding.build_id,
+            binding.maximum_age_seconds,
+            binding.authorization_reference,
+            binding.binding_sha256,
+        ),
+    )
+    cursor.execute(
+        "SELECT source_cohort_id::text,source_cohort_sha256,"
+        "source_manifest_id::text,source_manifest_sha256,"
+        "source_profile_id::text,source_profile_sha256,"
+        "equity_window_id::text,equity_receipt_id::text,equity_cutoff,"
+        "reference_generation,universe_sha256,input_sha256,build_id,"
+        "maximum_age_seconds,authorization_reference,binding_sha256 "
+        "FROM rt.advanced_options_equity_input_bindings "
+        "WHERE target_options_window_id=%s",
+        (str(binding.target_options_window_id),),
+    )
+    if cursor.fetchone() != (
+        str(binding.source_cohort_id),
+        binding.source_cohort_sha256,
+        str(binding.source_manifest_id),
+        binding.source_manifest_sha256,
+        str(binding.source_profile_id),
+        binding.source_profile_sha256,
+        str(binding.equity_window_id),
+        str(binding.equity_receipt_id),
+        binding.equity_cutoff,
+        binding.reference_generation,
+        binding.universe_sha256,
+        binding.input_sha256,
+        binding.build_id,
+        binding.maximum_age_seconds,
+        binding.authorization_reference,
+        binding.binding_sha256,
+    ):
+        raise ValueError(
+            "persisted Advanced Options Equity input binding diverged"
+        )
+
+
+def load_advanced_options_equity_input_binding_cursor(
+    cursor,
+    target_options_window_id: UUID,
+) -> AdvancedOptionsEquityInputBinding | None:
+    cursor.execute(
+        "SELECT target_cohort_id::text,source_cohort_id::text,"
+        "source_cohort_sha256,source_manifest_id::text,"
+        "source_manifest_sha256,source_profile_id::text,"
+        "source_profile_sha256,equity_window_id::text,"
+        "equity_receipt_id::text,equity_cutoff,reference_generation,"
+        "universe_sha256,input_sha256,build_id,maximum_age_seconds,"
+        "authorization_reference,binding.binding_sha256,"
+        "target.cohort_id::text,target.cutoff,service.session_date "
+        "FROM rt.advanced_options_equity_input_bindings AS binding "
+        "JOIN rt.window_runs AS target "
+        "ON target.window_id=binding.target_options_window_id "
+        "JOIN rt.service_plans AS service "
+        "ON service.plan_id=target.plan_id "
+        "WHERE binding.target_options_window_id=%s",
+        (str(target_options_window_id),),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    binding = build_advanced_options_equity_input_binding(
+        target_options_window_id=target_options_window_id,
+        target_cohort_id=UUID(str(row[0])),
+        source_cohort_id=UUID(str(row[1])),
+        source_cohort_sha256=str(row[2]),
+        source_manifest_id=UUID(str(row[3])),
+        source_manifest_sha256=str(row[4]),
+        source_profile_id=UUID(str(row[5])),
+        source_profile_sha256=str(row[6]),
+        equity_window_id=UUID(str(row[7])),
+        equity_receipt_id=UUID(str(row[8])),
+        equity_cutoff=row[9],
+        reference_generation=int(row[10]),
+        universe_sha256=str(row[11]),
+        input_sha256=str(row[12]),
+        build_id=str(row[13]),
+        maximum_age_seconds=int(row[14]),
+        authorization_reference=str(row[15]),
+    )
+    if (
+        binding.binding_sha256 != str(row[16])
+        or str(row[17]) != str(binding.target_cohort_id)
+        or row[18].date() != row[19]
+        or binding.equity_cutoff.date() != row[19]
+        or binding.equity_cutoff > row[18]
+        or (
+            row[18] - binding.equity_cutoff
+        ).total_seconds() > binding.maximum_age_seconds
+    ):
+        raise ValueError(
+            "persisted Advanced Options Equity input binding changed"
+        )
+    return binding
+
+
 def persist_advanced_options_enrollment_cursor(
     cursor,
     plan: AdvancedOptionsEnrollmentPlan,
     *,
     history_binding: AdvancedOptionsHistoryBinding | None = None,
+    equity_input_binding: AdvancedOptionsEquityInputBinding | None = None,
 ) -> bool:
     _validated_enrollment_identity(plan)
     control = plan.control_plane
@@ -1680,6 +2116,37 @@ def persist_advanced_options_enrollment_cursor(
     ):
         raise ValueError(
             "Advanced Options history binding targets another cohort"
+        )
+    if (
+        equity_input_binding is not None
+        and (
+            equity_input_binding.target_cohort_id != control.cohort_id
+            or equity_input_binding.source_cohort_id
+            != plan.equity_plan.cohort_id
+            or equity_input_binding.source_cohort_sha256
+            != plan.equity_plan.cohort_sha256
+            or equity_input_binding.source_manifest_id
+            != plan.equity_plan.manifest_id
+            or equity_input_binding.source_manifest_sha256
+            != plan.equity_plan.manifest.sha256
+            or equity_input_binding.source_profile_id
+            != plan.equity_plan.profile_id
+            or equity_input_binding.source_profile_sha256
+            != plan.equity_plan.profile_sha256
+            or equity_input_binding.universe_sha256
+            != plan.equity_plan.universe.sha256
+            or equity_input_binding.equity_cutoff
+            > control.receipts.options_input_ready.spec.cutoff
+            or equity_input_binding.equity_cutoff.date()
+            != control.receipts.options_input_ready.spec.cutoff.date()
+            or (
+                control.receipts.options_input_ready.spec.cutoff
+                - equity_input_binding.equity_cutoff
+            ).total_seconds() > equity_input_binding.maximum_age_seconds
+        )
+    ):
+        raise ValueError(
+            "Advanced Options Equity input binding diverged"
         )
     equity_rows = _verify_source_equity_cursor(cursor, plan)
     _verify_activity_catalog_cursor(cursor, plan)
@@ -1930,6 +2397,11 @@ def persist_advanced_options_enrollment_cursor(
             cursor,
             history_binding,
         )
+    if equity_input_binding is not None:
+        persist_advanced_options_equity_input_binding_cursor(
+            cursor,
+            equity_input_binding,
+        )
     return moved
 
 
@@ -1938,6 +2410,7 @@ def persist_advanced_options_enrollment(
     plan: AdvancedOptionsEnrollmentPlan,
     *,
     history_binding: AdvancedOptionsHistoryBinding | None = None,
+    equity_input_binding: AdvancedOptionsEquityInputBinding | None = None,
 ) -> bool:
     try:
         with connection.cursor() as cursor:
@@ -1945,6 +2418,7 @@ def persist_advanced_options_enrollment(
                 cursor,
                 plan,
                 history_binding=history_binding,
+                equity_input_binding=equity_input_binding,
             )
         connection.commit()
         return moved

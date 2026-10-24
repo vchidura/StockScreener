@@ -1,5 +1,6 @@
 from contextlib import closing
-from datetime import datetime, time, timedelta, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import uuid4
 
@@ -10,6 +11,9 @@ from psycopg2.extras import Json
 from option_flow_support import advanced_policy
 from realtime.advanced_options_control_plane import (
     persist_advanced_options_enrollment_cursor,
+)
+from realtime.advanced_options_equity_input import (
+    initial_advanced_options_equity_context_requirements,
 )
 from realtime.advanced_options_native_loader import (
     NativeInputPlanStatus,
@@ -42,6 +46,7 @@ from realtime.option_source_flow import (
     persist_option_flow_policy_cursor,
     persist_option_source_flow_cursor,
 )
+from realtime.preflight import DetectorFamily
 from realtime.orchestration_repository import CycleReceiptSpec
 from realtime.security_v2 import (
     build_role_names_v2,
@@ -97,6 +102,7 @@ def _seed_bar(
     bar_start,
     bar_end,
     source_offset,
+    availability_mode="LIVE_OBSERVED",
 ):
     revision_id = uuid4()
     observed_at = bar_end
@@ -131,7 +137,7 @@ def _seed_bar(
         "source_offset,payload_sha256,created_at) VALUES ("
         "%s,%s,'MASSIVE_ADVANCED',%s,%s,'SPY',%s,%s,'RTH',"
         "'RAW_UNADJUSTED',%s,%s,%s,%s,%s,%s,1000000,%s,100,"
-        "'REALTIME_STREAM','LIVE_OBSERVED',true,%s,%s,%s,%s,%s,%s,%s)",
+        "'REALTIME_STREAM',%s,true,%s,%s,%s,%s,%s,%s,%s)",
         (
             str(revision_id),
             str(cohort_id),
@@ -146,6 +152,7 @@ def _seed_bar(
             close - Decimal("1"),
             close,
             close,
+            availability_mode,
             observed_at,
             observed_at,
             str(generation),
@@ -181,7 +188,7 @@ def _seed_native_equity_inputs(
     enrollment,
     source_flow,
     *,
-    cutoff,
+    equity_cutoff,
 ):
     equity = enrollment.equity_plan
     security_id = dict(equity.security_ids)["SPY"]
@@ -193,45 +200,14 @@ def _seed_native_equity_inputs(
         (str(equity.manifest_id), str(security_id)),
     )
     instrument_id = int(database_cursor.fetchone()[0])
-    daily_sessions = tuple(
-        cutoff.date() - timedelta(days=value)
-        for value in range(15, 0, -1)
+    database_cursor.execute(
+        "SELECT rt.ensure_partitions('rt.bar_revisions',%s)",
+        (equity_cutoff.date(),),
     )
-    for partition_date in {daily_sessions[0], cutoff.date()}:
-        database_cursor.execute(
-            "SELECT rt.ensure_partitions('rt.bar_revisions',%s)",
-            (partition_date,),
-        )
-    bars = []
     offset = 1
-    for session_date in daily_sessions:
-        bar_start = datetime.combine(
-            session_date,
-            time(13, 30),
-            tzinfo=UTC,
-        )
-        bar_end = datetime.combine(
-            session_date,
-            time(20),
-            tzinfo=UTC,
-        )
-        bars.append(_seed_bar(
-            database_cursor,
-            cohort_id=equity.cohort_id,
-            security_id=security_id,
-            instrument_id=instrument_id,
-            generation=source_flow.journal_generation,
-            stream_session_id=source_flow.stream_session_ids[0],
-            interval="1d",
-            session_date=session_date,
-            bar_start=bar_start,
-            bar_end=bar_end,
-            source_offset=offset,
-        ))
-        offset += 1
     for minutes in (15, 10, 5):
-        bar_end = cutoff - timedelta(minutes=minutes - 5)
-        bars.append(_seed_bar(
+        bar_end = equity_cutoff - timedelta(minutes=minutes - 5)
+        _seed_bar(
             database_cursor,
             cohort_id=equity.cohort_id,
             security_id=security_id,
@@ -239,11 +215,11 @@ def _seed_native_equity_inputs(
             generation=source_flow.journal_generation,
             stream_session_id=source_flow.stream_session_ids[0],
             interval="5m",
-            session_date=cutoff.date(),
+            session_date=equity_cutoff.date(),
             bar_start=bar_end - timedelta(minutes=5),
             bar_end=bar_end,
             source_offset=offset,
-        ))
+        )
         offset += 1
     service_plan_id = uuid4()
     database_cursor.execute(
@@ -254,14 +230,14 @@ def _seed_native_equity_inputs(
         (
             str(service_plan_id),
             str(equity.cohort_id),
-            cutoff.date(),
+            equity_cutoff.date(),
             [
                 "EQUITY_INPUT_GATE",
                 "EQUITY_MATERIALIZE",
                 "EQUITY_PROJECTION",
             ],
             _digest("equity-service-plan"),
-            cutoff + timedelta(hours=8),
+            equity_cutoff + timedelta(hours=8),
             "owp4d disposable Equity input",
         ),
     )
@@ -276,15 +252,15 @@ def _seed_native_equity_inputs(
             str(window_id),
             str(service_plan_id),
             str(equity.cohort_id),
-            cutoff,
-            cutoff,
-            cutoff + timedelta(minutes=5),
+            equity_cutoff,
+            equity_cutoff,
+            equity_cutoff + timedelta(minutes=5),
         ),
     )
     receipt_id = uuid4()
     receipt = CycleReceiptSpec(
         "INPUT_READY",
-        cutoff,
+        equity_cutoff,
         1,
         equity.universe.sha256,
         _digest("equity-input"),
@@ -307,84 +283,10 @@ def _seed_native_equity_inputs(
             receipt.build_id,
         ),
     )
-    detector_sha256s = {}
-    event_ids = []
-    for detector in ("S1", "S2"):
-        detector_sha256 = _digest(("detector", detector))
-        detector_sha256s[detector] = detector_sha256
-        database_cursor.execute(
-            "INSERT INTO rt.detector_versions ("
-            "detector_sha256,detector_id,version,code_sha256,"
-            "policy_sha256,requirements,output_kind) VALUES ("
-            "%s,%s,'owp4d-v1',%s,%s,%s,'SIGNAL')",
-            (
-                detector_sha256,
-                f"ADVANCED_EQUITY_{detector}",
-                _digest(("code", detector)),
-                _digest(("policy", detector)),
-                Json({
-                    "completed_bars_only": True,
-                    "execution_permission": False,
-                }),
-            ),
-        )
-        event_id = uuid4()
-        event_ids.append(event_id)
-        database_cursor.execute(
-            "INSERT INTO rt.detector_events ("
-            "event_id,dedup_sha256,cohort_id,provider_tier,"
-            "detector_sha256,instrument_id,trigger_identity,trigger_at,"
-            "decision_at,disposition,reason_codes,readiness_epoch,"
-            "evidence_sha256,payload_schema,payload) VALUES ("
-            "%s,%s,%s,'MASSIVE_ADVANCED',%s,%s,%s,%s,%s,"
-            "'COMPLETE_ZERO',ARRAY[]::text[],1,%s,%s,%s)",
-            (
-                str(event_id),
-                _digest(("event", detector)),
-                str(equity.cohort_id),
-                detector_sha256,
-                instrument_id,
-                f"{detector}:{security_id}:{cutoff.isoformat()}",
-                cutoff,
-                cutoff,
-                _digest(("evidence", detector)),
-                "advanced_equity_canonical_stock_signal_shadow_v1",
-                Json({
-                    "detector_id": detector,
-                    "ticker": "SPY",
-                    "market_cutoff": cutoff.isoformat(),
-                    "disposition": "COMPLETE_ZERO",
-                }),
-            ),
-        )
-        for index, (
-            revision_id,
-            payload_sha256,
-            available_at,
-            received_at,
-        ) in enumerate(bars):
-            database_cursor.execute(
-                "INSERT INTO rt.detector_event_inputs ("
-                "event_id,input_role,input_key,source_kind,"
-                "bar_revision_id,input_sha256,available_at,received_at,"
-                "retained_input) VALUES ("
-                "%s,'HISTORY_BAR',%s,'BAR_REVISION',%s,%s,%s,%s,%s)",
-                (
-                    str(event_id),
-                    f"{index:02d}:{revision_id}",
-                    str(revision_id),
-                    payload_sha256,
-                    available_at,
-                    received_at,
-                    Json({"bar_revision_id": str(revision_id)}),
-                ),
-            )
     return (
         receipt_id,
         window_id,
         receipt,
-        tuple(sorted(detector_sha256s.items())),
-        tuple(event_ids),
     )
 
 
@@ -513,21 +415,35 @@ def test_owp4d_native_loader_and_disposable_readiness_audit(monkeypatch):
                 retry_initial_seconds=0,
             ).produce()
             cutoff = control.receipts.options_input_ready.spec.cutoff
+            equity_cutoff = cutoff - timedelta(minutes=2)
+            history_cohort_id = uuid4()
             with _role_cursor(
                 database_pool,
                 roles.name("admin"),
             ) as database_cursor:
+                database_cursor.execute(
+                    "INSERT INTO rt.cohorts ("
+                    "cohort_id,cohort_sha256,manifest_id,"
+                    "configuration_sha256,model_bundle_sha256,"
+                    "valuation_sha256,effective_at,mode) "
+                    "SELECT %s,%s,manifest_id,configuration_sha256,"
+                    "model_bundle_sha256,valuation_sha256,effective_at,"
+                    "mode FROM rt.cohorts WHERE cohort_id=%s",
+                    (
+                        str(history_cohort_id),
+                        _digest("history-cohort"),
+                        str(enrollment.equity_plan.cohort_id),
+                    ),
+                )
                 (
                     equity_receipt_id,
                     equity_window_id,
                     equity_receipt,
-                    detector_sha256s,
-                    _event_ids,
                 ) = _seed_native_equity_inputs(
                     database_cursor,
                     enrollment,
                     source_flow,
-                    cutoff=cutoff,
+                    equity_cutoff=equity_cutoff,
                 )
             producer_plan = build_advanced_options_producer_plan(
                 control_plane=control,
@@ -547,7 +463,11 @@ def test_owp4d_native_loader_and_disposable_readiness_audit(monkeypatch):
                 equity_input_receipt=equity_receipt,
                 equity_window_id=equity_window_id,
                 loader_build_id="advanced-options-native-loader-v1",
-                stock_detector_sha256s=detector_sha256s,
+                history_source_cohort_id=history_cohort_id,
+                maximum_equity_input_age_seconds=300,
+                equity_context_requirements=(
+                    initial_advanced_options_equity_context_requirements()
+                ),
             )
             loader = PostgresAdvancedOptionsNativeInputLoader(
                 provider,
@@ -562,8 +482,42 @@ def test_owp4d_native_loader_and_disposable_readiness_audit(monkeypatch):
             assert preflight.bundle.o3.blocked_reason_codes == (
                 "CANONICAL_MARKS_UNAVAILABLE",
             )
-            assert not preflight.bundle.s1.invocations
-            assert not preflight.bundle.s2.invocations
+            assert set(preflight.bundle.executors()) == {
+                DetectorFamily.O1,
+                DetectorFamily.O3,
+            }
+            missing_context_plan = build_advanced_options_native_input_plan(
+                enrollment=enrollment,
+                producer_plan=producer_plan,
+                reference_state=reference,
+                rolling_state=rolling,
+                source_flow=source_flow,
+                cutoff=cutoff,
+                equity_input_receipt_id=equity_receipt_id,
+                equity_input_receipt=equity_receipt,
+                equity_window_id=equity_window_id,
+                loader_build_id="advanced-options-native-loader-v1",
+                history_source_cohort_id=history_cohort_id,
+                maximum_equity_input_age_seconds=300,
+                equity_context_requirements=(
+                    replace(
+                        initial_advanced_options_equity_context_requirements()[
+                            0
+                        ],
+                        session_count=4,
+                    ),
+                ),
+            )
+            missing_context = PostgresAdvancedOptionsNativeInputLoader(
+                provider,
+                missing_context_plan,
+            ).preflight()
+            assert missing_context.status is NativeInputPlanStatus.READY
+            assert not missing_context.bundle.o1.blocked_reason_codes
+            assert (
+                "O3_SPY_E_CONTEXT_INCOMPLETE"
+                in missing_context.bundle.o3.blocked_reason_codes
+            )
             frozen = freeze_advanced_options_native_input_plan(
                 plan,
                 preflight,
@@ -610,7 +564,11 @@ def test_owp4d_native_loader_and_disposable_readiness_audit(monkeypatch):
                 equity_input_receipt=equity_receipt,
                 equity_window_id=equity_window_id,
                 loader_build_id="advanced-options-native-loader-v1",
-                stock_detector_sha256s=detector_sha256s,
+                history_source_cohort_id=history_cohort_id,
+                maximum_equity_input_age_seconds=300,
+                equity_context_requirements=(
+                    initial_advanced_options_equity_context_requirements()
+                ),
                 expected_input_sha256="0" * 64,
             )
             with pytest.raises(
@@ -636,16 +594,18 @@ def test_owp4d_native_loader_and_disposable_readiness_audit(monkeypatch):
                 database_pool,
                 enrollment,
                 cutoff,
+                equity_cutoff=equity_cutoff,
+                history_source_cohort_id=history_cohort_id,
             )
-            assert categories["s1_finalized_window"]["status"] == "AVAILABLE", (
-                categories["s1_finalized_window"]
+            assert categories["o1_equity_context"]["status"] == "AVAILABLE", (
+                categories["o1_equity_context"]
             )
-            assert categories["s2_finalized_window"]["status"] == "AVAILABLE", (
-                categories["s2_finalized_window"]
+            assert categories["o3_equity_context"]["status"] == "AVAILABLE", (
+                categories["o3_equity_context"]
             )
             assert audit._next_actionable_blocker(categories)[
                 "reason_code"
-            ] == "CANONICAL_MARK_PRODUCER_UNWIRED"
+            ] == "OPTIONS_INPUT_READY_RECEIPT_ABSENT"
     finally:
         if roles_owned:
             with closing(_connect(_settings(), "postgres")) as connection_value:

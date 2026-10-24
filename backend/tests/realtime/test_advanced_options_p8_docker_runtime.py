@@ -40,6 +40,12 @@ from realtime.advanced_options_p8_runtime import (
     validate_p8_docker_service_environment,
     validate_p8_execution_bundle,
 )
+from realtime.advanced_options_v3_deployment import (
+    ADVANCED_OPTIONS_V3_COMPOSE_PROFILE,
+    ADVANCED_OPTIONS_V3_PROFILE_SHA256,
+    ADVANCED_OPTIONS_V3_QUALIFICATION_STATE,
+    advanced_options_v3_profile_payload,
+)
 import realtime.advanced_options_p8_runtime as runtime_module
 import realtime.advanced_options_p8_roles as roles_module
 from realtime.advanced_options_service import (
@@ -50,6 +56,10 @@ from realtime.advanced_gateway import AdvancedGateway, GatewayConfiguration
 from realtime.buffer import BufferLimits, RawMessageBuffer
 from realtime.portal_publisher import PortalPublicationConfig
 from realtime.preflight import ProviderTier
+from realtime.contracts import EQUITY_VALIDATION_UNIVERSE
+from realtime.orchestration_repository import WindowSpec
+from realtime.stage_graph import STAGE_CATALOG_VERSION_V5
+from realtime.advanced_options_service import OPTIONS_V3_STAGE_ORDER
 from realtime.retention_lifecycle_docker import CommandResult
 
 
@@ -58,6 +68,43 @@ START = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=1)
 STOP = START + timedelta(minutes=10)
 CONTAINER_ID = "a" * 64
 ROOT = Path(__file__).resolve().parents[3]
+
+
+def test_target_window_id_binds_session_cohort_key_and_cutoff():
+    cohort_id = UUID("8bce9685-d379-5bdd-8aa5-b4990844380d")
+    first = WindowSpec(
+        cohort_id,
+        "MASSIVE_ADVANCED",
+        "OPENING-1",
+        START,
+        START,
+        STOP,
+    )
+
+    assert first.window_id == WindowSpec(
+        cohort_id,
+        "MASSIVE_ADVANCED",
+        "OPENING-1",
+        START,
+        START,
+        STOP,
+    ).window_id
+    assert first.window_id != WindowSpec(
+        cohort_id,
+        "MASSIVE_ADVANCED",
+        "OPENING-2",
+        START,
+        START,
+        STOP,
+    ).window_id
+    assert first.window_id != WindowSpec(
+        cohort_id,
+        "MASSIVE_ADVANCED",
+        "OPENING-1",
+        START + timedelta(seconds=1),
+        START + timedelta(seconds=1),
+        STOP,
+    ).window_id
 
 
 def _package():
@@ -120,6 +167,8 @@ def _write_bundle(tmp_path, package=None):
         "cohort_id": package["cohort"]["cohort_id"],
         "plan_id": package["orchestration"]["plan_id"],
         "window_id": "11111111-2222-3333-4444-555555555555",
+        "orchestration": dict(package["orchestration"]),
+        "v3_authorities": package.get("v3_authorities"),
         "written_at_utc": START.isoformat(),
         "services": [
             {
@@ -174,11 +223,19 @@ def test_compose_has_exact_four_p8_services_commands_and_isolated_secrets():
     assert len(set(P8_SERVICE_NAMES.values())) == 4
     for kind in AdvancedOptionsProcessKind:
         block = _service_block(text, P8_SERVICE_NAMES[kind])
-        assert f'profiles: ["{P8_COMPOSE_PROFILE}"]' in block
+        assert (
+            f'profiles: ["{P8_COMPOSE_PROFILE}", '
+            f'"{ADVANCED_OPTIONS_V3_COMPOSE_PROFILE}"]'
+        ) in block
         assert 'restart: "no"' in block
         assert "- --docker-service-kind" in block
         assert f"- {kind.value}" in block
         assert "- --docker-health-kind" in block
+        assert (
+            "- scripts/run_advanced_options_v3_production.py"
+            in block
+        )
+        assert "- scripts/run_advanced_options_p8_canary.py" not in block
         assert "- /run/advanced-options-p8/package.json" in block
         assert "- /run/advanced-options-p8/execution-bundle.json" in block
         assert "REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED" in block
@@ -555,6 +612,260 @@ def test_window_role_requires_dependencies_and_exact_serial_result(
     assert set(observed) == {"INGRESS", "MARKET_STATE", "FLOW"}
 
 
+def test_v5_window_uses_durable_barrier_and_exact_v3_identity(
+    monkeypatch,
+):
+    package = _package()
+    package.update({
+        "equity_input_binding": {
+            "symbols": list(
+                EQUITY_VALIDATION_UNIVERSE.equity_tickers
+            ),
+        },
+        "cohort": {
+            **package["cohort"],
+            "underlyings": ["QQQ", "SPY"],
+        },
+        "v3_deployment": {
+            "profile": advanced_options_v3_profile_payload(),
+            "profile_sha256": ADVANCED_OPTIONS_V3_PROFILE_SHA256,
+            "state": ADVANCED_OPTIONS_V3_QUALIFICATION_STATE,
+            "window_role_authorized": True,
+            "qualification_verdict": "PASS",
+        },
+    })
+    package["orchestration"].update({
+        "catalog_version": STAGE_CATALOG_VERSION_V5,
+        "stage_order": list(OPTIONS_V3_STAGE_ORDER),
+    })
+    bundle = {
+        "package_sha256": package["package_sha256"],
+        "orchestration": dict(package["orchestration"]),
+        "production_binding": {
+            "control": {"option_underlyings": ["QQQ", "SPY"]},
+        },
+    }
+    dependencies = {
+        name: {"status": "COMPLETE"}
+        for name in ("INGRESS", "MARKET_STATE", "FLOW")
+    }
+    monkeypatch.setattr(
+        roles_module,
+        "_v3_resident_dependencies",
+        lambda *_args, **_kwargs: dependencies,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_wait_role_evidence",
+        lambda *_args, **_kwargs: pytest.fail(
+            "V5 used filesystem role evidence"
+        ),
+    )
+    observed = {}
+    stopped = threading.Event()
+
+    def serial(**kwargs):
+        observed.update(kwargs)
+        stopped.set()
+        return {
+            "status": "FINISHED",
+            "window_state": "COMPLETE",
+            "stage_order": list(OPTIONS_V3_STAGE_ORDER),
+        }
+
+    from realtime import advanced_options_p8_production as production
+
+    monkeypatch.setattr(production, "run_v3_serial_window", serial)
+    binding = SimpleNamespace(
+        window_id=UUID("11111111-2222-3333-4444-555555555555"),
+    )
+    monkeypatch.setattr(
+        production,
+        "load_v3_pending_window_bindings",
+        lambda **_kwargs: (binding,),
+    )
+
+    result = roles_module._run_window(
+        package=package,
+        bundle=bundle,
+        binding=binding,
+        provider=object(),
+        pool=object(),
+        environment={},
+        stop_event=stopped,
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert observed["dependency_evidence"] == dependencies
+    assert observed["pool"] is not None
+
+
+def test_v5_window_loop_isolates_four_successive_deterministic_windows(
+    monkeypatch,
+):
+    package = _package()
+    package.update({
+        "equity_input_binding": {
+            "symbols": list(
+                EQUITY_VALIDATION_UNIVERSE.equity_tickers
+            ),
+        },
+        "cohort": {
+            **package["cohort"],
+            "underlyings": ["QQQ", "SPY"],
+        },
+        "v3_deployment": {
+            "profile": advanced_options_v3_profile_payload(),
+            "profile_sha256": ADVANCED_OPTIONS_V3_PROFILE_SHA256,
+            "state": ADVANCED_OPTIONS_V3_QUALIFICATION_STATE,
+            "window_role_authorized": True,
+            "qualification_verdict": "PASS",
+        },
+    })
+    package["orchestration"].update({
+        "catalog_version": STAGE_CATALOG_VERSION_V5,
+        "stage_order": list(OPTIONS_V3_STAGE_ORDER),
+    })
+    bundle = {
+        "package_sha256": package["package_sha256"],
+        "orchestration": dict(package["orchestration"]),
+        "production_binding": {
+            "control": {"option_underlyings": ["QQQ", "SPY"]},
+        },
+    }
+    windows = tuple(
+        SimpleNamespace(window_id=uuid5(
+            NAMESPACE_URL,
+            f"continuous-v3-window:{index}",
+        ))
+        for index in range(1, 5)
+    )
+    offsets = {
+        window.window_id: index * 10
+        for index, window in enumerate(windows, start=1)
+    }
+    pending_rounds = iter((
+        (windows[0],),
+        (windows[0], windows[1]),
+        (windows[1], windows[2], windows[3]),
+    ))
+    last_round = [()]
+
+    def pending(**_kwargs):
+        try:
+            last_round[0] = next(pending_rounds)
+        except StopIteration:
+            pass
+        return last_round[0]
+
+    from realtime import advanced_options_p8_production as production
+
+    monkeypatch.setattr(
+        production,
+        "load_v3_pending_window_bindings",
+        pending,
+    )
+    deferred = {windows[1].window_id: 0}
+
+    def dependencies(_provider, window_binding, _bundle):
+        if (
+            window_binding.window_id == windows[1].window_id
+            and deferred[windows[1].window_id] == 0
+        ):
+            deferred[windows[1].window_id] += 1
+            return {
+                "status": "DEFERRED",
+                "reason_codes": ("RESIDENT_ROLE_NOT_COMPLETE:FLOW",),
+            }
+        offset = offsets[window_binding.window_id]
+        return {
+            "INGRESS": {
+                "raw_end_offset": offset,
+                "normalized_end_offset": offset,
+            },
+            "MARKET_STATE": {
+                "normalized_end_offset": offset,
+            },
+            "FLOW": {
+                "raw_end_offset": offset,
+                "checkpoint_end_offset": offset,
+                "owner_epoch": 1,
+            },
+        }
+
+    monkeypatch.setattr(
+        roles_module,
+        "_v3_resident_dependencies",
+        dependencies,
+    )
+    publications = set()
+    alerts = set()
+    invocations = []
+    first_stop = threading.Event()
+    second_stop = threading.Event()
+
+    def serial(**kwargs):
+        window_id = kwargs["binding"].window_id
+        if window_id in publications:
+            return {
+                "status": "NOT_CLAIMED",
+                "window_state": "COMPLETE",
+                "stage_order": list(OPTIONS_V3_STAGE_ORDER),
+            }
+        invocations.append(window_id)
+        publications.add(window_id)
+        alerts.add((window_id, "O1"))
+        result = {
+            "status": "FINISHED",
+            "window_state": "COMPLETE",
+            "stage_order": list(OPTIONS_V3_STAGE_ORDER),
+            "lane_outcomes": {
+                "O1": "COMPLETE_SELECTED",
+                "O3": (
+                    "BLOCKED"
+                    if window_id == windows[2].window_id
+                    else "COMPLETE_ZERO"
+                ),
+            },
+        }
+        if window_id == windows[0].window_id:
+            first_stop.set()
+        if window_id == windows[3].window_id:
+            second_stop.set()
+        return result
+
+    monkeypatch.setattr(production, "run_v3_serial_window", serial)
+    roles_module._run_window(
+        package=package,
+        bundle=bundle,
+        binding=windows[0],
+        provider=object(),
+        pool=object(),
+        environment={},
+        stop_event=first_stop,
+    )
+    roles_module._run_window(
+        package=package,
+        bundle=bundle,
+        binding=windows[0],
+        provider=object(),
+        pool=object(),
+        environment={},
+        stop_event=second_stop,
+    )
+
+    assert deferred[windows[1].window_id] == 1
+    assert invocations == [
+        windows[0].window_id,
+        windows[1].window_id,
+        windows[2].window_id,
+        windows[3].window_id,
+    ]
+    assert [offsets[value] for value in invocations] == [10, 20, 30, 40]
+    assert len(alerts) == 4
+    assert len(publications) == 4
+
+
 def test_p8_options_gateway_subscriptions_remain_option_only():
     contracts = (
         SimpleNamespace(
@@ -666,6 +977,7 @@ class _Transcript:
             kind = AdvancedOptionsProcessKind.INGRESS
             output = json.dumps({
                 "id": CONTAINER_ID,
+                "image": "sha256:" + "b" * 64,
                 "command": list(p8_container_command(kind)),
                 "entrypoint": None,
                 "running": self.running,
@@ -758,6 +1070,63 @@ def test_docker_port_start_health_stop_and_cleanup_contract(tmp_path):
             "timed_out",
         }
         for row in port.evidence()
+    )
+
+
+def test_docker_port_selects_disabled_by_default_v3_profile(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "docker-compose.realtime-v2.yml").write_text(
+        "services: {}\n",
+        encoding="utf-8",
+    )
+    docker = tmp_path / "docker.exe"
+    docker.write_bytes(b"fake")
+    package = _package()
+    package["v3_deployment"] = {
+        "profile_sha256": ADVANCED_OPTIONS_V3_PROFILE_SHA256,
+    }
+    package_path, bundle_path, _ = _write_bundle(root, package)
+    secrets = root / "secrets"
+    secrets.mkdir()
+    (secrets / "realtime_v2_app_dsn").write_text(
+        "fixture",
+        encoding="utf-8",
+    )
+    (secrets / "realtime_v2_provider_key").write_text(
+        "fixture",
+        encoding="utf-8",
+    )
+    environment = isolated_p8_compose_environment(
+        {},
+        backend_image="backend@sha256:" + "b" * 64,
+        secret_directory=secrets,
+        package_path=package_path,
+        bundle_path=bundle_path,
+    )
+    transcript = _Transcript()
+    port = AdvancedOptionsDockerServicePort(
+        package=package,
+        repository_root=root,
+        docker_executable=docker.resolve(),
+        environment=environment,
+        runner=transcript,
+    )
+    spec = AdvancedOptionsProcessSpec(
+        AdvancedOptionsProcessKind.INGRESS,
+        "advanced-options-ingress-v1",
+        "massive:options:websocket",
+    )
+
+    port.start(spec)
+
+    compose_calls = [
+        call for call in transcript.calls if call[1] == "compose"
+    ]
+    assert compose_calls
+    assert all(
+        ADVANCED_OPTIONS_V3_COMPOSE_PROFILE in call
+        for call in compose_calls
     )
 
 

@@ -26,6 +26,25 @@ _RELATION_ORDER = {
     ReferenceFactRelation.MARKET_EVENT_COVERAGE: 8,
     ReferenceFactRelation.RATE_OBSERVATION: 9,
 }
+_COMPATIBLE_OPTION_CONTRACT_ORIGINS = frozenset({
+    "MASSIVE_OPTION_REFERENCE_V3",
+    "PRE_SESSION_DISCOVERY",
+})
+
+
+def _option_contract_identity_matches(stored, expected) -> bool:
+    return (
+        stored is not None
+        and tuple(stored[:3]) == tuple(expected[:3])
+        and (
+            stored[3] == expected[3]
+            or {
+                str(stored[3]),
+                str(expected[3]),
+            }
+            <= _COMPATIBLE_OPTION_CONTRACT_ORIGINS
+        )
+    )
 
 
 def _persist_reference_fact(cursor, fact: ReferenceFact) -> None:
@@ -101,7 +120,7 @@ def _persist_reference_fact(cursor, fact: ReferenceFact) -> None:
             row["underlying_security_id"], row["provider"],
             row["contract_ticker"], row["source_origin"],
         )
-        if stored is None or tuple(stored) != expected:
+        if not _option_contract_identity_matches(stored, expected):
             raise ValueError("persisted option contract identity conflict")
         cursor.execute(
             "INSERT INTO ref.option_contract_versions (version_id, contract_id, call_put, "

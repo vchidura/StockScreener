@@ -485,8 +485,7 @@ def process_advanced_equity_journal_once(
     if batch is None:
         offset = min(expected_offsets.values())
         return AdvancedEquityJournalBridgeStatus(checked, offset, offset, 0, 0, 0)
-    if checked < batch.proved_at:
-        raise ValueError("Advanced equity bridge check time predates decoder proof")
+    checked = max(checked, batch.proved_at)
     with database.transaction(isolation_level="SERIALIZABLE") as cursor:
         _verify_stream_session_cursor(cursor, config)
         _require_no_unresolved_am_gaps_cursor(

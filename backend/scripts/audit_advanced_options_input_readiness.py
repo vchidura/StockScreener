@@ -19,7 +19,6 @@ from dotenv import dotenv_values
 from psycopg2.extensions import make_dsn
 from psycopg2.extras import RealDictCursor
 
-
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 REPOSITORY_DIR = BACKEND_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
@@ -52,6 +51,8 @@ SOURCE_ANCHORS = (
     "backend/realtime/advanced_options_postgres.py",
     "backend/realtime/advanced_options_loaders.py",
     "backend/realtime/advanced_options_input.py",
+    "backend/realtime/advanced_options_equity_input.py",
+    "backend/realtime/advanced_options_control_plane.py",
     "backend/realtime/advanced_options_mark_producer.py",
     "backend/realtime/advanced_options_native_loader.py",
     "backend/realtime/advanced_options_reference_state.py",
@@ -68,8 +69,8 @@ REQUIRED_CATEGORIES = (
     "dividend_inputs",
     "model_inputs",
     "equity_input_receipt",
-    "s1_finalized_window",
-    "s2_finalized_window",
+    "o1_equity_context",
+    "o3_equity_context",
     "market_state_checkpoint",
     "flow_checkpoint",
     "unresolved_gaps",
@@ -112,8 +113,15 @@ def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--session-date", type=date.fromisoformat, required=True)
     value.add_argument("--cutoff-utc", type=_timestamp, required=True)
+    value.add_argument("--equity-cutoff-utc", type=_timestamp)
+    value.add_argument(
+        "--maximum-equity-input-age-seconds",
+        type=int,
+        required=True,
+    )
     value.add_argument("--observed-at-utc", type=_timestamp, required=True)
     value.add_argument("--cohort-id", type=UUID)
+    value.add_argument("--history-source-cohort-id", type=UUID)
     value.add_argument("--output", type=Path, required=True)
     value.add_argument("--allow-admin-read-only", action="store_true")
     return value
@@ -525,9 +533,11 @@ def _receipts(
     cursor: ReadOnlyCursor,
     cohort_id: str | None,
     cutoff: datetime,
+    equity_cutoff: datetime | None = None,
 ):
     if cohort_id is None:
         return ()
+    bound_equity_cutoff = equity_cutoff or cutoff
     cursor.execute(
         """
         SELECT
@@ -569,12 +579,13 @@ def _receipts(
           ON member.barrier_id=barrier.barrier_id
         LEFT JOIN rt.materialization_jobs AS job
           ON job.job_id=member.job_id
-        WHERE receipt.cutoff=%s AND (
+        WHERE (
             receipt.receipt_kind='INPUT_READY'
-            OR (
-                receipt.cohort_id=%s
-                AND receipt.receipt_kind='OPTIONS_INPUT_READY'
-            )
+            AND receipt.cutoff=%s
+          ) OR (
+            receipt.cohort_id=%s
+            AND receipt.receipt_kind='OPTIONS_INPUT_READY'
+            AND receipt.cutoff=%s
           )
         GROUP BY
             receipt.receipt_id,receipt.window_id,receipt.cohort_id,
@@ -586,7 +597,7 @@ def _receipts(
             barrier.expected_count,barrier.completed_at
         ORDER BY receipt.receipt_kind,receipt.window_id,receipt.receipt_id
         """,
-        (cutoff, cohort_id),
+        (bound_equity_cutoff, cohort_id, cutoff),
     )
     return tuple(dict(row) for row in cursor.fetchall())
 
@@ -594,11 +605,14 @@ def _receipts(
 def _bar_windows(
     cursor: ReadOnlyCursor,
     cohort_id: str | None,
-    source_cohort_id: str | None,
+    equity_source_cohort_id: str | None,
     session_date: date,
-    cutoff: datetime,
+    equity_cutoff: datetime,
 ):
-    if cohort_id is None or source_cohort_id is None:
+    if (
+        cohort_id is None
+        or equity_source_cohort_id is None
+    ):
         return ()
     cursor.execute(
         """
@@ -615,7 +629,6 @@ def _bar_windows(
         ),
         option_underlyings AS (
             SELECT DISTINCT
-                instrument.instrument_id,
                 instrument.security_id,
                 security.ticker
             FROM rt.cohorts AS cohort
@@ -630,122 +643,79 @@ def _bar_windows(
         )
         SELECT
             underlying.ticker,
-            COUNT(*) FILTER (
-                WHERE revision.interval='1d'
-                  AND revision.session_date<%s
-            ) AS finalized_daily_count,
-            MAX(revision.bar_end) FILTER (
-                WHERE revision.interval='1d'
-                  AND revision.session_date<%s
-            ) AS latest_daily_bar_end,
-            COUNT(*) FILTER (
-                WHERE revision.interval='5m'
-                  AND revision.session_date=%s
-                  AND revision.bar_end<=%s
-            ) AS finalized_intraday_count,
-            MAX(revision.bar_end) FILTER (
-                WHERE revision.interval='5m'
-                  AND revision.session_date=%s
-                  AND revision.bar_end<=%s
-            ) AS latest_intraday_bar_end
+            COALESCE(intraday.finalized_count,0)
+                AS finalized_intraday_count,
+            intraday.latest_bar_end AS latest_intraday_bar_end,
+            intraday.bar_ends AS finalized_intraday_bar_ends
         FROM option_underlyings AS underlying
-        LEFT JOIN rt.bar_current AS current
-          ON current.cohort_id=%s
-         AND current.instrument_id=underlying.instrument_id
-        LEFT JOIN rt.bar_revisions AS revision
-          ON revision.bar_revision_id=current.bar_revision_id
-         AND revision.observed_at=current.observed_at
-         AND revision.cohort_id=current.cohort_id
-         AND revision.provider_tier=current.provider_tier
-         AND revision.instrument_id=current.instrument_id
-         AND revision.interval=current.interval
-         AND revision.bar_start=current.bar_start
-         AND revision.session_scope=current.session_scope
-         AND revision.adjustment_basis=current.adjustment_basis
-         AND revision.is_final
-         AND revision.availability_mode='LIVE_OBSERVED'
-         AND revision.adjustment_basis='RAW_UNADJUSTED'
-         AND revision.session_scope='RTH'
-        GROUP BY underlying.ticker
+        LEFT JOIN LATERAL (
+            SELECT
+                COUNT(*) AS finalized_count,
+                MAX(bar.bar_end) AS latest_bar_end,
+                array_agg(bar.bar_end ORDER BY bar.bar_end) AS bar_ends
+            FROM (
+                SELECT revision.bar_end
+                FROM rt.bar_current AS current
+                JOIN rt.bar_revisions AS revision
+                  ON revision.bar_revision_id=current.bar_revision_id
+                 AND revision.observed_at=current.observed_at
+                WHERE current.cohort_id=%s
+                  AND revision.security_id=underlying.security_id
+                  AND revision.interval='5m'
+                  AND revision.session_date=%s
+                  AND revision.bar_end<=%s
+                  AND revision.is_final
+                  AND revision.availability_mode='LIVE_OBSERVED'
+                  AND revision.adjustment_basis='RAW_UNADJUSTED'
+                  AND revision.session_scope='RTH'
+                ORDER BY revision.bar_end DESC
+                LIMIT 3
+            ) AS bar
+        ) AS intraday ON true
         ORDER BY underlying.ticker
         """,
         (
-            cutoff,
+            equity_cutoff,
             cohort_id,
+            equity_source_cohort_id,
             session_date,
-            session_date,
-            session_date,
-            cutoff,
-            session_date,
-            cutoff,
-            source_cohort_id,
+            equity_cutoff,
         ),
     )
     return tuple(dict(row) for row in cursor.fetchall())
 
 
-def _native_stock_decisions(
+def _equity_input_bindings(
     cursor: ReadOnlyCursor,
-    *,
-    equity_cohort_id: str | None,
-    options_cohort_id: str | None,
+    cohort_id: str | None,
     cutoff: datetime,
 ):
-    if equity_cohort_id is None or options_cohort_id is None:
+    if cohort_id is None:
         return ()
     cursor.execute(
         """
         SELECT
-            version.detector_id,
-            event.event_id::text,
-            revision.ticker,
-            event.disposition,
-            event.trigger_at,
-            event.decision_at,
-            event.detector_sha256,
-            COUNT(input.input_key) FILTER (
-                WHERE input.source_kind='BAR_REVISION'
-            ) AS retained_bar_count,
-            CASE
-                WHEN event.disposition='DETECTED'
-                THEN (
-                    SELECT COUNT(*)
-                    FROM rt.option_packages AS package
-                    WHERE package.cohort_id=%s
-                      AND package.event_id=(
-                          event.payload->>'signal_id'
-                      )::uuid
-                )
-                ELSE 0
-            END AS package_count
-        FROM rt.detector_events AS event
-        JOIN rt.detector_versions AS version
-          ON version.detector_sha256=event.detector_sha256
-        JOIN rt.instruments AS instrument
-          ON instrument.instrument_id=event.instrument_id
-        JOIN LATERAL (
-            SELECT ticker
-            FROM ref.security_revisions
-            WHERE security_id=instrument.security_id
-              AND effective_from<=%s
-            ORDER BY effective_from DESC,observed_at DESC
-            LIMIT 1
-        ) AS revision ON TRUE
-        LEFT JOIN rt.detector_event_inputs AS input
-          ON input.event_id=event.event_id
-        WHERE event.cohort_id=%s
-          AND event.trigger_at=%s
-          AND version.detector_id IN (
-              'ADVANCED_EQUITY_S1',
-              'ADVANCED_EQUITY_S2'
-          )
-        GROUP BY
-            version.detector_id,event.event_id,revision.ticker,
-            event.disposition,event.trigger_at,event.decision_at,
-            event.detector_sha256,event.payload
-        ORDER BY version.detector_id,revision.ticker,event.event_id
+            binding.target_options_window_id::text,
+            binding.target_cohort_id::text,
+            binding.source_cohort_id::text,
+            binding.equity_window_id::text,
+            binding.equity_receipt_id::text,
+            binding.equity_cutoff,
+            binding.reference_generation,
+            binding.universe_sha256,
+            binding.input_sha256,
+            binding.build_id,
+            binding.maximum_age_seconds,
+            binding.binding_sha256,
+            target.cutoff AS options_cutoff
+        FROM rt.advanced_options_equity_input_bindings AS binding
+        JOIN rt.window_runs AS target
+          ON target.window_id=binding.target_options_window_id
+        WHERE binding.target_cohort_id=%s
+          AND target.cutoff=%s
+        ORDER BY binding.target_options_window_id
         """,
-        (options_cohort_id, cutoff, equity_cohort_id, cutoff),
+        (cohort_id, cutoff),
     )
     return tuple(dict(row) for row in cursor.fetchall())
 
@@ -897,6 +867,7 @@ def _classify(
     session_date: date,
     cutoff: datetime,
     observed_at: datetime,
+    maximum_equity_input_age_seconds: int | None = None,
 ) -> dict[str, dict[str, object]]:
     categories: dict[str, dict[str, object]] = {}
     cohort = snapshot["cohort"]
@@ -1634,99 +1605,63 @@ def _classify(
     )
 
     bars = tuple(snapshot["bar_windows"])
-    native_decisions = tuple(snapshot.get("native_stock_decisions", ()))
-    for category, needed, detector_id in (
-        ("s1_finalized_window", 2, "ADVANCED_EQUITY_S1"),
-        ("s2_finalized_window", 3, "ADVANCED_EQUITY_S2"),
-    ):
-        missing = tuple(
-            row["ticker"]
-            for row in bars
-            if int(row["finalized_daily_count"]) < 15
-            or int(row["finalized_intraday_count"]) < needed
+    equity_cutoff = snapshot.get("equity_cutoff", cutoff)
+    equity_bindings = tuple(snapshot.get("equity_input_bindings", ()))
+    categories["o1_equity_context"] = _result(
+        "AVAILABLE",
+        (),
+        evidence={
+            "requirements": (),
+            "binding_count": len(equity_bindings),
+        },
+        observed_at=observed_at,
+    )
+    missing = []
+    for row in bars:
+        intraday_ends = tuple(
+            row.get("finalized_intraday_bar_ends") or ()
         )
-        reasons = []
-        if cohort is None or not bars:
-            reasons.append("EQUITY_FINALIZED_BAR_SCOPE_ABSENT")
-        if missing:
-            reasons.append(
-                f"{category[:2].upper()}_FINALIZED_WINDOW_INCOMPLETE"
-            )
-        decisions = tuple(
-            row
-            for row in native_decisions
-            if row["detector_id"] == detector_id
-        )
-        by_ticker: dict[str, list[Mapping[str, object]]] = {}
-        for row in decisions:
-            by_ticker.setdefault(str(row["ticker"]), []).append(row)
-        expected_tickers = {str(row["ticker"]) for row in bars}
         if (
-            set(by_ticker) != expected_tickers
-            or any(len(rows) != 1 for rows in by_ticker.values())
+            len(intraday_ends) != 3
+            or intraday_ends[-1:] != (equity_cutoff,)
+            or any(
+                (later - earlier).total_seconds() != 300
+                for earlier, later in zip(
+                    intraday_ends,
+                    intraday_ends[1:],
+                )
+            )
         ):
-            reasons.append(
-                f"{category[:2].upper()}_DECISION_SCOPE_INCOMPLETE"
-            )
-        elif any(
-            row["disposition"] not in {"DETECTED", "COMPLETE_ZERO"}
-            or row["decision_at"] > cutoff
-            or int(row["retained_bar_count"]) < 15 + needed
-            or (
-                row["disposition"] == "DETECTED"
-                and int(row["package_count"]) != 1
-            )
-            or (
-                row["disposition"] == "COMPLETE_ZERO"
-                and int(row["package_count"]) != 0
-            )
-            for row in decisions
-        ):
-            reasons.append(
-                f"{category[:2].upper()}_DECISION_EVIDENCE_INVALID"
-            )
-        if (
-            source["production_wiring_counts"].get(
-                "native_input_loader_production_calls",
-                0,
-            )
-            == 0
-        ):
-            reasons.append("CANONICAL_NATIVE_INPUT_LOADER_UNWIRED")
-        lane_evidence = {
-                "table": "rt.bar_current/rt.bar_revisions",
-                "required_daily_bars": 15,
-                "required_intraday_bars": needed,
-                "members": bars,
-                "decision_table": (
-                    "rt.detector_events/rt.detector_event_inputs/"
-                    "rt.option_packages"
-                ),
-                "decisions": decisions,
-                "production_loader_calls": source[
-                    "production_wiring_counts"
-                ].get("native_input_loader_production_calls", 0),
-            }
-        categories[category] = (
-            _blocked(
-                tuple(reasons),
-                evidence=lane_evidence,
-                observed_at=observed_at,
-            )
-            if reasons
-            else _result(
-                "AVAILABLE",
-                (),
-                evidence=lane_evidence,
-                observed_at=observed_at,
-                source_clocks={
-                    "cutoff": cutoff,
-                    "latest_decision_at": max(
-                        row["decision_at"] for row in decisions
-                    ),
-                },
-            )
+            missing.append(row["ticker"])
+    o3_reasons = []
+    if cohort is None or not bars:
+        o3_reasons.append("EQUITY_E_CONTEXT_SCOPE_ABSENT")
+    if missing:
+        o3_reasons.append("O3_E_CONTEXT_INCOMPLETE")
+    lane_evidence = {
+        "table": "rt.bar_current/rt.bar_revisions",
+        "source": "E",
+        "interval": "5m",
+        "adjustment_basis": "RAW_UNADJUSTED",
+        "availability_mode": "LIVE_OBSERVED",
+        "required_current_session_bars": 3,
+        "members": bars,
+    }
+    categories["o3_equity_context"] = (
+        _blocked(
+            tuple(o3_reasons),
+            evidence=lane_evidence,
+            observed_at=observed_at,
         )
+        if o3_reasons
+        else _result(
+            "AVAILABLE",
+            (),
+            evidence=lane_evidence,
+            observed_at=observed_at,
+            source_clocks={"equity_cutoff": equity_cutoff},
+        )
+    )
 
     receipts = tuple(snapshot["receipts"])
     equity = tuple(
@@ -1737,7 +1672,52 @@ def _classify(
         for row in receipts
         if row["receipt_kind"] == "OPTIONS_INPUT_READY"
     )
-    equity_identities = {
+    equity_binding = (
+        equity_bindings[0] if len(equity_bindings) == 1 else None
+    )
+    binding_reasons = []
+    if equity_binding is not None and (
+        equity_binding["target_cohort_id"] != cohort["cohort_id"]
+        or equity_binding["options_cutoff"] != cutoff
+        or equity_binding["equity_cutoff"].date() != session_date
+        or equity_binding["equity_cutoff"] > cutoff
+        or (
+            cutoff - equity_binding["equity_cutoff"]
+        ).total_seconds() > int(equity_binding["maximum_age_seconds"])
+    ):
+        binding_reasons.append("EQUITY_TO_OPTIONS_BINDING_SCOPE_INVALID")
+    if (
+        equity_binding is not None
+        and maximum_equity_input_age_seconds is not None
+        and int(equity_binding["maximum_age_seconds"])
+        != maximum_equity_input_age_seconds
+    ):
+        binding_reasons.append("EQUITY_INPUT_AGE_POLICY_MISMATCH")
+    exact_equity = tuple(
+        row
+        for row in equity
+        if equity_binding is not None and not binding_reasons
+        and row["receipt_id"] == equity_binding["equity_receipt_id"]
+        and row["window_id"] == equity_binding["equity_window_id"]
+        and row["cohort_id"] == equity_binding["source_cohort_id"]
+        and row["cutoff"] == equity_binding["equity_cutoff"]
+        and row["input_sha256"] == equity_binding["input_sha256"]
+        and row["build_id"] == equity_binding["build_id"]
+    )
+    if equity_binding is None or binding_reasons or not exact_equity:
+        categories["equity_input_receipt"] = _blocked(
+            tuple(binding_reasons) or (
+                "EXACT_BOUND_EQUITY_INPUT_READY_RECEIPT_ABSENT",
+            ),
+            evidence={
+                "table": "rt.cycle_receipts",
+                "cutoff": cutoff,
+                "binding_count": len(equity_bindings),
+                "row_count": len(exact_equity),
+            },
+            observed_at=observed_at,
+        )
+    elif len({
         (
             row["cohort_id"],
             row["cutoff"],
@@ -1746,25 +1726,14 @@ def _classify(
             row["input_sha256"],
             row["build_id"],
         )
-        for row in equity
-    }
-    if not equity:
-        categories["equity_input_receipt"] = _blocked(
-            ("EXACT_EQUITY_INPUT_READY_RECEIPT_ABSENT",),
-            evidence={
-                "table": "rt.cycle_receipts",
-                "cutoff": cutoff,
-                "row_count": 0,
-            },
-            observed_at=observed_at,
-        )
-    elif len(equity_identities) != 1:
+        for row in exact_equity
+    }) != 1 or len(exact_equity) != 1:
         categories["equity_input_receipt"] = _blocked(
             ("EQUITY_INPUT_READY_RECEIPT_IDENTITY_DISAGREEMENT",),
             evidence={
                 "table": "rt.cycle_receipts",
                 "cutoff": cutoff,
-                "row_count": len(equity),
+                "row_count": len(exact_equity),
             },
             observed_at=observed_at,
         )
@@ -1775,12 +1744,18 @@ def _classify(
             evidence={
                 "table": "rt.cycle_receipts",
                 "cutoff": cutoff,
-                "row_count": len(equity),
-                "receipt_ids": tuple(row["receipt_id"] for row in equity),
+                "row_count": 1,
+                "receipt_ids": (exact_equity[0]["receipt_id"],),
+                "target_options_window_id": equity_binding[
+                    "target_options_window_id"
+                ],
+                "maximum_age_seconds": equity_binding[
+                    "maximum_age_seconds"
+                ],
             },
             observed_at=observed_at,
             source_clocks={
-                "latest_created_at": max(row["created_at"] for row in equity),
+                "latest_created_at": exact_equity[0]["created_at"],
             },
         )
 
@@ -1836,7 +1811,11 @@ def _classify(
     dependency_blockers = tuple(
         key
         for key in REQUIRED_CATEGORIES
-        if key != "options_input_ready_closure"
+        if key not in {
+            "options_input_ready_closure",
+            "o1_equity_context",
+            "o3_equity_context",
+        }
         and key in categories
         and categories[key]["status"] not in {"AVAILABLE", "COMPLETE_ZERO"}
     )
@@ -1938,11 +1917,21 @@ def _snapshot(
     cutoff: datetime,
     observed_at: datetime,
     requested_cohort_id: UUID | None,
+    equity_cutoff: datetime | None = None,
+    history_source_cohort_id: str | None = None,
 ) -> dict[str, object]:
+    bound_equity_cutoff = equity_cutoff or cutoff
     cohorts = _cohorts(cursor, session_date)
     cohort, cohort_reasons = _select_cohort(cohorts, requested_cohort_id)
     cohort_id = None if cohort is None else str(cohort["cohort_id"])
     slots = _slot_members(cursor, cohort_id) if cohort_id else ()
+    equity_input_bindings = _equity_input_bindings(
+        cursor,
+        cohort_id,
+        cutoff,
+    )
+    if len(equity_input_bindings) == 1:
+        bound_equity_cutoff = equity_input_bindings[0]["equity_cutoff"]
     references = _reference_rows(cursor, session_date)
     reference = None
     reference_error = None
@@ -1979,15 +1968,39 @@ def _snapshot(
     instrument_ids = tuple(
         sorted({int(row["instrument_id"]) for row in slots})
     )
-    receipts = _receipts(cursor, cohort_id, cutoff)
-    equity_cohort_ids = tuple(sorted({
-        str(row["cohort_id"])
-        for row in receipts
-        if row["receipt_kind"] == "INPUT_READY"
-    }))
-    equity_cohort_id = (
-        equity_cohort_ids[0] if len(equity_cohort_ids) == 1 else None
+    receipts = _receipts(
+        cursor,
+        cohort_id,
+        cutoff,
+        bound_equity_cutoff,
     )
+    if len(equity_input_bindings) == 1:
+        equity_cohort_id = equity_input_bindings[0]["source_cohort_id"]
+    else:
+        exact_cutoff_equity_cohorts = tuple(sorted({
+            str(row["cohort_id"])
+            for row in receipts
+            if row["receipt_kind"] == "INPUT_READY"
+            and row["cutoff"] == bound_equity_cutoff
+        }))
+        equity_cohort_id = (
+            exact_cutoff_equity_cohorts[0]
+            if len(exact_cutoff_equity_cohorts) == 1
+            else None
+        )
+    if history_source_cohort_id is None and cohort_id is not None:
+        cursor.execute(
+            "SELECT source_cohort_id::text "
+            "FROM rt.cohort_history_bindings "
+            "WHERE target_cohort_id=%s",
+            (cohort_id,),
+        )
+        history_row = cursor.fetchone()
+        history_source_cohort_id = (
+            None if history_row is None else str(
+                history_row["source_cohort_id"]
+            )
+        )
     return {
         "cohorts": cohorts,
         "cohort": cohort,
@@ -2003,18 +2016,14 @@ def _snapshot(
         "quotes": _quotes(cursor, instrument_ids),
         "marks": _marks(cursor, instrument_ids, cutoff),
         "receipts": receipts,
+        "equity_cutoff": bound_equity_cutoff,
+        "equity_input_bindings": equity_input_bindings,
         "bar_windows": _bar_windows(
             cursor,
             cohort_id,
             equity_cohort_id,
             session_date,
-            cutoff,
-        ),
-        "native_stock_decisions": _native_stock_decisions(
-            cursor,
-            equity_cohort_id=equity_cohort_id,
-            options_cohort_id=cohort_id,
-            cutoff=cutoff,
+            bound_equity_cutoff,
         ),
         "checkpoints": _checkpoints(cursor, cohort_id, generation),
         "gaps": _gaps(cursor, session_ids),
@@ -2054,8 +2063,8 @@ def _next_actionable_blocker(
             "Wire and preflight the canonical rolling-state producer."
         ),
         "CANONICAL_NATIVE_INPUT_LOADER_UNWIRED": (
-            "Wire the canonical native S1/S2 input loader without activating "
-            "production stages."
+            "Wire the canonical native O1/O3 input loader and typed Equity "
+            "lane context without activating production stages."
         ),
         "CANONICAL_MARK_PRODUCER_UNWIRED": (
             "Wire the exact canonical NBBO midpoint mark producer."
@@ -2073,8 +2082,20 @@ def _next_actionable_blocker(
 
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
+    equity_cutoff = args.equity_cutoff_utc or args.cutoff_utc
     if args.cutoff_utc.date() != args.session_date:
         raise ValueError("Options readiness cutoff must match session date")
+    if (
+        equity_cutoff.date() != args.session_date
+        or equity_cutoff > args.cutoff_utc
+        or args.maximum_equity_input_age_seconds <= 0
+        or (
+            args.cutoff_utc - equity_cutoff
+        ).total_seconds() > args.maximum_equity_input_age_seconds
+    ):
+        raise ValueError(
+            "Equity input cutoff is stale or outside the Options session"
+        )
     if args.observed_at_utc < args.cutoff_utc:
         raise ValueError("Options readiness observation cannot predate cutoff")
     output = args.output.resolve()
@@ -2116,6 +2137,12 @@ def main(argv=None) -> int:
                 cutoff=args.cutoff_utc,
                 observed_at=args.observed_at_utc,
                 requested_cohort_id=args.cohort_id,
+                equity_cutoff=equity_cutoff,
+                history_source_cohort_id=(
+                    None
+                    if args.history_source_cohort_id is None
+                    else str(args.history_source_cohort_id)
+                ),
             )
             statement_count = cursor.statement_count
         connection.rollback()
@@ -2125,10 +2152,20 @@ def main(argv=None) -> int:
         session_date=args.session_date,
         cutoff=args.cutoff_utc,
         observed_at=args.observed_at_utc,
+        maximum_equity_input_age_seconds=(
+            args.maximum_equity_input_age_seconds
+        ),
     )
+    lane_categories = {"o1_equity_context", "o3_equity_context"}
     blocking_categories = tuple(
         name
         for name in REQUIRED_CATEGORIES
+        if name not in lane_categories
+        and categories[name]["status"] == "BLOCKED"
+    )
+    blocked_lanes = tuple(
+        name
+        for name in lane_categories
         if categories[name]["status"] == "BLOCKED"
     )
     status = "AVAILABLE" if not blocking_categories else "BLOCKED"
@@ -2136,11 +2173,17 @@ def main(argv=None) -> int:
     report = {
         "version": "advanced-options-input-readiness-audit-v1",
         "status": status,
+        "blocked_lanes": blocked_lanes,
         "scope": {
             "session_date": args.session_date,
             "cutoff_utc": args.cutoff_utc,
+            "equity_cutoff_utc": equity_cutoff,
+            "maximum_equity_input_age_seconds": (
+                args.maximum_equity_input_age_seconds
+            ),
             "observed_at_utc": args.observed_at_utc,
             "requested_cohort_id": args.cohort_id,
+            "history_source_cohort_id": args.history_source_cohort_id,
             "database": EXPECTED_V2_DATABASE_NAME,
             "database_access": database_access,
         },

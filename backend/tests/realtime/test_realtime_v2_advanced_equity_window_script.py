@@ -39,13 +39,46 @@ def test_advanced_window_is_unpublished_by_default(tmp_path, monkeypatch):
     assert not args.publish
 
 
-def test_alert_strategy_and_publication_stages_remain_disabled_until_p11():
-    with pytest.raises(SystemExit):
-        script.parse_args([*BASE, "--publish"])
+def test_alert_and_strategy_stages_remain_disabled():
     with pytest.raises(SystemExit):
         script.parse_args([*BASE, "--include-alerts"])
     with pytest.raises(SystemExit):
         script.parse_args([*BASE, "--include-strategies"])
+
+
+def test_p11_publication_requires_exact_authority_and_receipt_retry(
+    tmp_path,
+):
+    authority = tmp_path / "authority.json"
+    authority.write_text("{}", encoding="utf-8")
+    digest = "a" * 64
+    publish = [
+        *BASE[:BASE.index("advanced-window.json")],
+        str(tmp_path / "advanced-window.json"),
+        *BASE[BASE.index("advanced-window.json") + 1:],
+        "--publish",
+        "--publication-reference",
+        "P11-TEST",
+        "--publication-authority",
+        str(authority),
+        "--publication-authority-semantic-sha256",
+        digest,
+        "--publication-authority-file-sha256",
+        digest,
+    ]
+    with pytest.raises(SystemExit):
+        script.parse_args(publish)
+
+    args = script.parse_args([
+        *publish,
+        "--window-key-suffix=-retry1",
+        "--retry-release-now",
+        "--reuse-input-receipt",
+        "--reuse-portal-receipt",
+    ])
+
+    assert args.enabled_stages[-1] == "PORTAL_PUBLISH"
+    assert args.publish
 
 
 def test_window_requires_execution_and_aligned_scope():

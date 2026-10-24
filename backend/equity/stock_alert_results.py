@@ -10,6 +10,9 @@ import zlib
 from psycopg2.extras import Json
 
 from database import get_db_cursor
+from equity.stock_alert_payload import (
+    decode_original_setup_payload as _decode_original_setup_payload,
+)
 from research.stock_alert_annotations import binding, context_path, read_context, validate_context
 from research.stock_alert_results import (VERSION, combine_snapshots, namespace_snapshot, plan_record,
     strategy_instance, validate_result_transition)
@@ -362,19 +365,6 @@ def read_original_setup_publications(path, record_ids):
                 raise ValueError("original setup publication key mismatch")
             publications[record_id] = publication
     return manifest[0], publications
-
-
-def _decode_original_setup_payload(blob):
-    if blob is None or len(blob) > 4194304:
-        raise ValueError("original setup compressed payload exceeds bound")
-    decoder = zlib.decompressobj()
-    raw = decoder.decompress(blob, 16777217)
-    if len(raw) > 16777216 or not decoder.eof or decoder.unused_data:
-        raise ValueError("original setup decompressed payload exceeds bound or is invalid")
-    payload = json.loads(raw)
-    if not isinstance(payload, dict):
-        raise ValueError("original setup payload must be an object")
-    return payload
 
 
 def read_direct_stock_setup(path, *, policy, record_id, payload_sha256, episode_id,

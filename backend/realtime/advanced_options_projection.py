@@ -1883,6 +1883,54 @@ class AdvancedOptionsPublisherHandoff:
 
 
 @dataclass(frozen=True, slots=True)
+class AdvancedOptionsPublicationAuthorization:
+    authorization_id: UUID
+    cohort_id: UUID
+    provider_tier: ProviderTier
+    batch_sha256: str
+    receipt_id: UUID
+    scope_reference: str
+    release_authorized: bool = True
+    pointer_authorized: bool = True
+    dispatch_authorized: bool = False
+    delivery_authorized: bool = False
+    broker_authorized: bool = False
+    trading_authorized: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.authorization_id, UUID)
+            or self.authorization_id.int == 0
+            or not isinstance(self.cohort_id, UUID)
+            or self.cohort_id.int == 0
+            or not isinstance(self.provider_tier, ProviderTier)
+            or not isinstance(self.receipt_id, UUID)
+            or self.receipt_id.int == 0
+            or len(self.batch_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.batch_sha256
+            )
+            or not self.scope_reference.strip()
+            or any((
+                not self.release_authorized,
+                not self.pointer_authorized,
+                self.dispatch_authorized,
+                self.delivery_authorized,
+                self.broker_authorized,
+                self.trading_authorized,
+            ))
+        ):
+            raise ValueError(
+                "Advanced Options publication authority is invalid"
+            )
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256(self)
+
+
+@dataclass(frozen=True, slots=True)
 class AdvancedOptionsCanaryPublicationAuthorization:
     database_name: str
     cohort_id: UUID
@@ -2106,6 +2154,136 @@ def persist_advanced_options_projection_cursor(
         snapshot_repository(cursor, snapshot)
 
 
+def load_advanced_options_projection_batch_cursor(
+    cursor,
+    *,
+    control_plane: AdvancedOptionsControlPlanePlan,
+    cycle: AdvancedOptionsCycleResult,
+    portal_ready_receipt: CycleReceiptSpec,
+) -> AdvancedOptionsProjectionBatch:
+    if (
+        portal_ready_receipt.receipt_kind != OPTIONS_PORTAL_READY
+        or portal_ready_receipt.cutoff != cycle.receipt.cutoff
+        or portal_ready_receipt.reference_generation
+        != cycle.receipt.reference_generation
+        or portal_ready_receipt.universe_sha256
+        != control_plane.universe.sha256
+    ):
+        raise ValueError(
+            "durable OPTIONS_PORTAL_READY receipt scope changed"
+        )
+    cursor.execute(
+        "SELECT catalog.snapshot_id,catalog.cohort_id,"
+        "catalog.provider_tier,catalog.snapshot_type,"
+        "catalog.snapshot_key,catalog.source_generation,"
+        "catalog.manifest_sha256,hot.source_manifest,"
+        "catalog.payload_sha256,hot.payload,catalog.generated_at,"
+        "catalog.valid_until FROM rt.snapshot_catalog AS catalog "
+        "JOIN rt.portal_snapshot_hot AS hot "
+        "ON hot.snapshot_id=catalog.snapshot_id "
+        "AND hot.generated_at=catalog.generated_at "
+        "WHERE catalog.cohort_id=%s "
+        "AND catalog.provider_tier=%s "
+        "AND catalog.snapshot_class='EPHEMERAL_PORTAL' "
+        "AND catalog.snapshot_type=ANY(%s) "
+        "AND catalog.snapshot_key='CURRENT' "
+        "AND catalog.generated_at=%s "
+        "ORDER BY catalog.snapshot_type",
+        (
+            str(control_plane.cohort_id),
+            control_plane.binding.provider_tier.value,
+            list(OPTIONS_SNAPSHOT_TYPES),
+            portal_ready_receipt.cutoff,
+        ),
+    )
+    names = (
+        "snapshot_id",
+        "cohort_id",
+        "provider_tier",
+        "snapshot_type",
+        "snapshot_key",
+        "source_generation",
+        "manifest_sha256",
+        "source_manifest",
+        "payload_sha256",
+        "payload",
+        "generated_at",
+        "valid_until",
+    )
+    stored = {}
+    for row in cursor.fetchall():
+        value = (
+            dict(row)
+            if isinstance(row, Mapping)
+            else dict(zip(names, row, strict=True))
+        )
+        snapshot = RealtimePortalSnapshot(
+            snapshot_id=UUID(str(value["snapshot_id"])),
+            cohort_id=UUID(str(value["cohort_id"])),
+            provider_tier=ProviderTier(str(value["provider_tier"])),
+            snapshot_type=str(value["snapshot_type"]),
+            snapshot_key=str(value["snapshot_key"]),
+            source_generation=int(value["source_generation"]),
+            source_manifest_sha256=str(value["manifest_sha256"]),
+            source_manifest=value["source_manifest"],
+            payload_sha256=str(value["payload_sha256"]),
+            payload=value["payload"],
+            generated_at=value["generated_at"],
+            valid_until=value["valid_until"],
+        )
+        rebuilt = build_portal_snapshot(
+            cohort_id=snapshot.cohort_id,
+            provider_tier=snapshot.provider_tier,
+            snapshot_type=snapshot.snapshot_type,
+            snapshot_key=snapshot.snapshot_key,
+            source_generation=snapshot.source_generation,
+            source_manifest=snapshot.source_manifest,
+            payload=snapshot.payload,
+            generated_at=snapshot.generated_at,
+            valid_until=snapshot.valid_until,
+        )
+        if (
+            rebuilt != snapshot
+            or snapshot.cohort_id != control_plane.cohort_id
+            or snapshot.provider_tier
+            is not control_plane.binding.provider_tier
+            or snapshot.source_generation
+            != portal_ready_receipt.reference_generation
+            or snapshot.generated_at != portal_ready_receipt.cutoff
+            or snapshot.source_manifest.get("cycle_sha256")
+            != cycle.cycle_sha256
+        ):
+            raise ValueError(
+                "durable Advanced Options projection identity changed"
+            )
+        if snapshot.snapshot_type in stored:
+            raise ValueError(
+                "durable Advanced Options projection is ambiguous"
+            )
+        stored[snapshot.snapshot_type] = snapshot
+    if set(stored) != set(OPTIONS_SNAPSHOT_TYPES):
+        raise ValueError(
+            "durable Advanced Options projection is incomplete"
+        )
+    snapshots = tuple(stored[name] for name in OPTIONS_SNAPSHOT_TYPES)
+    batch_sha256 = canonical_sha256({
+        "contract": "advanced-options-projection-batch-v1",
+        "cycle_sha256": cycle.cycle_sha256,
+        "snapshot_ids": tuple(row.snapshot_id for row in snapshots),
+        "publication_authorized": False,
+    })
+    if portal_ready_receipt.input_sha256 != batch_sha256:
+        raise ValueError(
+            "durable OPTIONS_PORTAL_READY projection hash changed"
+        )
+    return AdvancedOptionsProjectionBatch(
+        cycle,
+        snapshots,
+        batch_sha256,
+        portal_ready_receipt,
+    )
+
+
 def build_advanced_options_publisher_handoff(
     *,
     control_plane: AdvancedOptionsControlPlanePlan,
@@ -2127,6 +2305,52 @@ def build_advanced_options_publisher_handoff(
         ),
         snapshots=batch.snapshots,
         batch_sha256=batch.batch_sha256,
+    )
+
+
+def authorize_advanced_options_publication(
+    handoff: AdvancedOptionsPublisherHandoff,
+    authorization: AdvancedOptionsPublicationAuthorization,
+) -> AdvancedOptionsPublisherHandoff:
+    if (
+        not isinstance(handoff, AdvancedOptionsPublisherHandoff)
+        or not isinstance(
+            authorization,
+            AdvancedOptionsPublicationAuthorization,
+        )
+        or handoff.owner_name != CANONICAL_PUBLISHER_OWNER
+        or handoff.receipt.cohort_id != authorization.cohort_id
+        or handoff.receipt.provider_tier is not authorization.provider_tier
+        or handoff.batch_sha256 != authorization.batch_sha256
+        or any((
+            handoff.dispatch_authorized,
+            handoff.release_authorized,
+            handoff.pointer_authorized,
+            authorization.dispatch_authorized,
+            authorization.delivery_authorized,
+            authorization.broker_authorized,
+            authorization.trading_authorized,
+            not authorization.release_authorized,
+            not authorization.pointer_authorized,
+        ))
+    ):
+        raise ValueError(
+            "Advanced Options publisher authority scope changed"
+        )
+    return AdvancedOptionsPublisherHandoff(
+        owner_name=handoff.owner_name,
+        receipt=PortalReleaseReceipt(
+            authorization.receipt_id,
+            handoff.receipt.cohort_id,
+            handoff.receipt.provider_tier,
+            handoff.receipt.cutoff,
+            handoff.receipt.universe_sha256,
+        ),
+        snapshots=handoff.snapshots,
+        batch_sha256=handoff.batch_sha256,
+        dispatch_authorized=False,
+        release_authorized=True,
+        pointer_authorized=True,
     )
 
 

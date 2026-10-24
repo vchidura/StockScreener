@@ -11,8 +11,10 @@ from typing import Protocol
 from uuid import UUID
 
 from .advanced_options_control_plane import (
+    AdvancedOptionsEquityInputBinding,
     AdvancedOptionsEnrollmentPlan,
     AdvancedOptionsHistoryBinding,
+    advanced_options_equity_input_binding_payload,
     advanced_options_enrollment_plan_payload,
     advanced_options_history_binding_payload,
 )
@@ -110,6 +112,7 @@ class P8CanaryExecutionError(RuntimeError):
 class P8CanaryExecutionBinding:
     enrollment: AdvancedOptionsEnrollmentPlan
     history: AdvancedOptionsHistoryBinding
+    equity_input: AdvancedOptionsEquityInputBinding
     window_id: UUID
     underlying_price_binding: UnderlyingSnapshotBinding | None = None
 
@@ -123,6 +126,13 @@ class P8CanaryExecutionBinding:
         if not isinstance(self.history, AdvancedOptionsHistoryBinding):
             raise TypeError("P8 execution requires a typed history binding")
         if not isinstance(
+            self.equity_input,
+            AdvancedOptionsEquityInputBinding,
+        ):
+            raise TypeError(
+                "P8 execution requires a typed Equity input binding"
+            )
+        if not isinstance(
             self.underlying_price_binding,
             UnderlyingSnapshotBinding,
         ):
@@ -133,6 +143,9 @@ class P8CanaryExecutionBinding:
             self.enrollment
         )
         history = advanced_options_history_binding_payload(self.history)
+        equity_input = advanced_options_equity_input_binding_payload(
+            self.equity_input
+        )
         underlying_prices = underlying_snapshot_binding_payload(
             self.underlying_price_binding
         )
@@ -173,9 +186,15 @@ class P8CanaryExecutionBinding:
             != package["orchestration"]["plan_id"]
             or str(control.cohort_id) != package["cohort"]["cohort_id"]
             or history != live_preflight["realized_history_binding"]
+            or equity_input
+            != live_preflight["realized_equity_input_binding"]
             or underlying_prices
             != live_preflight["realized_underlying_price_binding"]
             or self.history.target_cohort_id != control.cohort_id
+            or self.equity_input.target_cohort_id != control.cohort_id
+            or self.equity_input.target_options_window_id != self.window_id
+            or self.equity_input.source_cohort_id
+            != self.enrollment.equity_plan.cohort_id
             or list(control.universe.option_underlyings)
             != package["cohort"]["underlyings"]
             or set(slot_channels) != selected
@@ -495,6 +514,7 @@ class AdvancedOptionsP8LifecyclePort:
             self._enrollment_connection,
             binding.enrollment,
             binding.history,
+            binding.equity_input,
             database_name="stocks_realtime_v2",
             confirmed_database_name="stocks_realtime_v2",
         )
@@ -719,13 +739,16 @@ class P8CanaryExecutor:
             "package_sha256": package["package_sha256"],
             "package_nonce": package["package_nonce"],
             "window": package["window"],
+            "v3_authority_classification": package[
+                "v3_authority_classification"
+            ],
             "operations": [
                 "acquire_one_use_lock_and_receipt",
                 "capture_and_validate_fresh_live_binding",
                 "persist_advanced_enrollment_and_history_binding",
                 "start_exact_four_residents",
-                "run_serial_stages_v4",
-                "publish_one_cohort_local_release_and_pointer",
+                "run_post_e_late_canary_stages_v4",
+                "publish_after_inert_late_canary_v4_handoff",
                 "optionally_enable_exact_cohort_stored_reads",
                 "stop_exact_four_residents",
             ],
@@ -899,7 +922,9 @@ class P8CanaryExecutor:
                 or stages.get("stage_order")
                 != list(OPTIONS_NON_SERVING_STAGE_ORDER)
             ):
-                raise RuntimeError("serial P8 stages_v4 did not complete")
+                raise RuntimeError(
+                    "post-E late-canary P8 stages_v4 did not complete"
+                )
             receipt.update("STAGES_COMPLETE", checked_at=checked)
             fault("AFTER_STAGES")
             publication = self._port.publish(
@@ -948,6 +973,9 @@ class P8CanaryExecutor:
                 "page_gate": page_gate,
                 "stored_reads": stored_read_result,
                 "postflight": postflight,
+                "v3_authority_classification": package[
+                    "v3_authority_classification"
+                ],
             }
         except BaseException as error:
             failure = error
@@ -1036,5 +1064,10 @@ class P8CanaryExecutor:
             ) from failure
         if result is None:
             raise AssertionError("P8 execution completed without a result")
-        result["cleanup"] = dict(cleanup)
+        result["cleanup"] = {
+            **dict(cleanup),
+            "v3_authority_classification": package[
+                "v3_authority_classification"
+            ],
+        }
         return result

@@ -307,8 +307,6 @@ class AdvancedGateway:
                     return payload
                 raise GatewayControlError(f"{failure_prefix}_MARKET_BEFORE_READY")
             statuses = {str(row.get("status") or "").lower() for row in rows}
-            if statuses & accepted_statuses:
-                return None
             if statuses & {
                 "auth_failed",
                 "failed",
@@ -328,8 +326,46 @@ class AdvancedGateway:
                     tuple(statuses),
                     provider_messages,
                 )
+            if statuses & accepted_statuses:
+                return None
         self._set_state(GatewayFeedState.BLOCKED)
         raise GatewayControlError(f"{failure_prefix}_CONTROL_LIMIT_EXCEEDED")
+
+    def _accept_delayed_subscription_control(
+        self,
+        rows: tuple[dict[str, object], ...],
+    ) -> int:
+        statuses = {
+            str(row.get("status") or "").strip().lower()
+            for row in rows
+        }
+        if statuses != {"success"}:
+            self._set_state(GatewayFeedState.BLOCKED)
+            raise GatewayControlError(
+                "ADVANCED_STREAM_CONTROL_REJECTED",
+                tuple(statuses),
+                tuple(str(row.get("message") or "") for row in rows),
+            )
+        for row in rows:
+            message = str(row.get("message") or "").strip()
+            prefix = "subscribed to:"
+            if message.lower().startswith(prefix):
+                subscription = message[len(prefix):].strip()
+                if subscription not in self._subscriptions:
+                    self._set_state(GatewayFeedState.BLOCKED)
+                    raise GatewayControlError(
+                        "ADVANCED_SUBSCRIPTION_ACK_SCOPE_MISMATCH",
+                        tuple(statuses),
+                        (message,),
+                    )
+            elif message.lower() != "success":
+                self._set_state(GatewayFeedState.BLOCKED)
+                raise GatewayControlError(
+                    "ADVANCED_SUBSCRIPTION_ACK_INVALID",
+                    tuple(statuses),
+                    (message,),
+                )
+        return len(rows)
 
     async def _admit(
         self,
@@ -376,8 +412,8 @@ class AdvancedGateway:
         maximum_received_bytes: int | None = None,
         initial_message_number: int = 0,
     ) -> GatewaySessionResult:
-        if maximum_market_messages is not None and maximum_market_messages <= 0:
-            raise ValueError("maximum_market_messages must be positive")
+        if maximum_market_messages is not None and maximum_market_messages < 0:
+            raise ValueError("maximum_market_messages must be nonnegative")
         if maximum_received_bytes is not None and maximum_received_bytes <= 0:
             raise ValueError("maximum_received_bytes must be positive")
         if type(initial_message_number) is not int or initial_message_number < 0:
@@ -440,6 +476,7 @@ class AdvancedGateway:
                     allow_market_message=True,
                 )
                 self._set_state(GatewayFeedState.WARMING)
+                delayed_subscription_rows = 0
                 while (
                     maximum_market_messages is None
                     or accepted_messages < maximum_market_messages
@@ -448,6 +485,21 @@ class AdvancedGateway:
                     pending = None
                     if payload is None:
                         payload = await self._receive_bytes(connection)
+                    control_rows = self._control_rows(payload)
+                    if control_rows is not None:
+                        delayed_subscription_rows += (
+                            self._accept_delayed_subscription_control(
+                                control_rows
+                            )
+                        )
+                        if delayed_subscription_rows > len(
+                            self._subscriptions
+                        ):
+                            self._set_state(GatewayFeedState.BLOCKED)
+                            raise GatewayControlError(
+                                "ADVANCED_SUBSCRIPTION_ACK_LIMIT_EXCEEDED"
+                            )
+                        continue
                     accepted_bytes += await self._admit(
                         payload,
                         stream_session_id,

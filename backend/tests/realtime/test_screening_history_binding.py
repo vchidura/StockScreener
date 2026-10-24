@@ -8,6 +8,8 @@ from realtime.screening_repository import (
     select_source_bars,
     select_winning_bars,
 )
+from realtime.reference_continuity import source_manifest_identity
+from realtime.contracts import canonical_sha256
 
 
 NOW = datetime(2026, 10, 16, 16, 0, tzinfo=timezone.utc)
@@ -49,6 +51,20 @@ def test_winning_bars_union_target_with_prior_source_history():
     assert str(SOURCE) in params
     assert "MASSIVE_ADVANCED" in params
     assert "MASSIVE_DEVELOPER" in params
+
+
+def test_advanced_source_manifest_omits_empty_identity_continuity():
+    manifest_sha256 = "b" * 64
+    history_binding_sha256 = "a" * 64
+
+    assert source_manifest_identity(
+        cohort_manifest_sha256=manifest_sha256,
+        history_binding_sha256=history_binding_sha256,
+        identity_continuity=(),
+    ) == canonical_sha256({
+        "manifest_sha256": manifest_sha256,
+        "history_binding_sha256": history_binding_sha256,
+    })
 
 
 def test_source_lineage_can_resolve_from_both_bound_cohorts():

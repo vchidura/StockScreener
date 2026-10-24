@@ -23,9 +23,11 @@ from realtime.advanced_options_package_evidence import (
     build_flow_package_evidence_batch,
 )
 from realtime.advanced_options_projection import (
+    AdvancedOptionsPublicationAuthorization,
     AdvancedOptionsPageSource,
     OPTIONS_SNAPSHOT_TYPES,
 )
+from realtime.contracts import canonical_sha256
 from realtime.advanced_options_api import (
     AdvancedOptionsStoredProjectionRepository,
 )
@@ -39,6 +41,7 @@ from realtime.advanced_options_runtime import (
     AdvancedOptionsProjectionStageData,
     AdvancedOptionsPublishStageData,
     AdvancedOptionsRuntimeBinding,
+    build_advanced_options_v3_runtime_composition,
 )
 from realtime.materialization_jobs import JobBarrierVerdict
 from realtime.options_v2_runtime import OptionsPreSessionStageBinding
@@ -46,22 +49,39 @@ from realtime.orchestration_repository import WindowSpec
 from realtime.preflight import DetectorFamily
 from realtime.runner_environment import RunnerEnvironment
 from realtime.session_archive import ArchiveIdentity
-from realtime.stage_graph import STAGES_V4, STAGE_CATALOG_VERSION_V4
+from realtime.stage_graph import (
+    STAGES_V4,
+    STAGES_V5,
+    STAGE_CATALOG_VERSION_V4,
+    STAGE_CATALOG_VERSION_V5,
+)
 from realtime.stage_orchestrator import StageOrchestrator
 from realtime.stage_runners_options import (
     OptionsAcquireResult,
     OptionsAdmissionResult,
+    OptionsReferenceStageResult,
     options_cycle_runner,
     options_input_gate_runner,
     options_projection_runner,
     options_publish_runner,
+    options_reference_runner,
 )
 from realtime.stage_runners_v2 import (
     build_advanced_options_non_serving_runners,
 )
 from realtime.advanced_options_service import (
     OPTIONS_NON_SERVING_STAGE_ORDER,
+    OPTIONS_V3_STAGE_ORDER,
     build_advanced_options_non_serving_qualification_plan,
+)
+from realtime.portal_projection_repository import (
+    RELEASE_CLASS_INTRADAY,
+    PortalRelease,
+    PortalReleasePointer,
+)
+from realtime.portal_publisher import (
+    CanonicalPortalPublicationResult,
+    PortalPublicationStatus,
 )
 
 
@@ -92,7 +112,7 @@ class _Context:
         yield self._unit
 
 
-def _binding(tmp_path):
+def _binding(tmp_path, *, catalog=STAGE_CATALOG_VERSION_V4):
     control = _control_plane()
     gate, receipt = _gate_and_receipt()
     verdict = JobBarrierVerdict(
@@ -150,7 +170,69 @@ def _binding(tmp_path):
         1,
     )
     pre_session = OptionsPreSessionStageBinding(operations)
-    binding = AdvancedOptionsRuntimeBinding(
+    reference = _reference_repository().load_generation(7)
+    authority_id = uuid4()
+
+    def authority(_context, handoff):
+        return AdvancedOptionsPublicationAuthorization(
+            authority_id,
+            control.cohort_id,
+            control.binding.provider_tier,
+            handoff.batch_sha256,
+            uuid4(),
+            "PROVIDER_FREE_V5_QUALIFICATION",
+        )
+
+    def publish(batch, *, checked_at):
+        state["publication_calls"] = (
+            state.get("publication_calls", 0) + 1
+        )
+        manifest = {
+            "version": "realtime-portal-release-v1",
+            "release_class": RELEASE_CLASS_INTRADAY,
+            "session_date": batch.receipt.cutoff.date().isoformat(),
+            "snapshots": [],
+        }
+        release_id = uuid4()
+        release = PortalRelease(
+            release_id,
+            control.cohort_id,
+            control.binding.provider_tier,
+            RELEASE_CLASS_INTRADAY,
+            batch.receipt.receipt_id,
+            batch.receipt.cutoff.date(),
+            batch.receipt.cutoff,
+            batch.receipt.universe_sha256,
+            manifest,
+            canonical_sha256(manifest),
+            True,
+        )
+        pointer = PortalReleasePointer(
+            control.cohort_id,
+            control.binding.provider_tier,
+            release_id,
+            batch.receipt.cutoff,
+            batch.receipt.cutoff.date(),
+        )
+        status = PortalPublicationStatus(
+            checked_at,
+            len(batch.snapshots),
+            0,
+            0,
+            0,
+            0,
+            (),
+            release,
+        )
+        result = CanonicalPortalPublicationResult(
+            status,
+            release,
+            pointer,
+        )
+        state["publication"] = result
+        return result
+
+    values = dict(
         build_id="provider-free-runtime-v1",
         pre_session=pre_session,
         input_loader=lambda _context: AdvancedOptionsInputStageData(
@@ -186,6 +268,19 @@ def _binding(tmp_path):
             lambda *_args, **_kwargs: AdvancedOptionsPageSource()
         ),
     )
+    if catalog == STAGE_CATALOG_VERSION_V5:
+        values.update(
+            catalog_version=catalog,
+            reference_loader=lambda _context: OptionsReferenceStageResult(
+                reference.state_id,
+                reference.state_sha256,
+                reference.reference_generation,
+                f"reference:{reference.state_id}",
+            ),
+            publication_authority_loader=authority,
+            canonical_publisher=publish,
+        )
+    binding = AdvancedOptionsRuntimeBinding(**values)
     return binding, control, state
 
 
@@ -233,6 +328,47 @@ def test_runtime_binding_requires_v4_exact_scope_and_all_native_executors(
     object.__setattr__(binding, "cycle_loader", lambda _context: incomplete)
     with pytest.raises(ValueError, match="receipt or executor membership"):
         environment.options_cycle_action(_Context(control))
+
+
+def test_v5_runtime_composition_uses_v5_graph_and_truthful_publish(
+    tmp_path,
+):
+    binding, control, state = _binding(
+        tmp_path,
+        catalog=STAGE_CATALOG_VERSION_V5,
+    )
+    composition = build_advanced_options_v3_runtime_composition(
+        binding=binding,
+        repository=MagicMock(),
+        database=None,
+    )
+    context = _Context(control, catalog=STAGE_CATALOG_VERSION_V5)
+
+    assert tuple(composition.runners) == OPTIONS_V3_STAGE_ORDER
+    assert composition.orchestrator._stages == STAGES_V5
+    assert composition.orchestrator._catalog_version == (
+        STAGE_CATALOG_VERSION_V5
+    )
+    assert options_reference_runner(composition.environment)(
+        context
+    ).state == "COMPLETE"
+    assert options_input_gate_runner(composition.environment)(
+        context
+    ).state == "COMPLETE"
+    assert options_cycle_runner(composition.environment)(
+        context
+    ).state == "COMPLETE"
+    assert options_projection_runner(composition.environment)(
+        context
+    ).state == "COMPLETE"
+    published = options_publish_runner(composition.environment)(context)
+
+    assert published.state == "COMPLETE"
+    assert state["publication"].release.release_id == (
+        state["publication"].pointer.release_id
+    )
+    assert state["publication_calls"] == 1
+    assert not state["publication"].status.claimed
 
 
 def test_runtime_binding_refuses_action_override(tmp_path):

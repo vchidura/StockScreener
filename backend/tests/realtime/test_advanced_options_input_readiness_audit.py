@@ -74,7 +74,12 @@ def test_absent_canonical_scope_blocks_every_required_dependency():
     )
 
     assert set(categories) == set(REQUIRED_CATEGORIES)
-    assert all(row["status"] == "BLOCKED" for row in categories.values())
+    assert categories["o1_equity_context"]["status"] == "AVAILABLE"
+    assert all(
+        row["status"] == "BLOCKED"
+        for name, row in categories.items()
+        if name != "o1_equity_context"
+    )
     assert categories["unresolved_gaps"]["reason_codes"] == [
         "SOURCE_FLOW_IDENTITY_ABSENT"
     ]

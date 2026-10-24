@@ -189,6 +189,58 @@ def test_process_builds_exact_finality_and_persists_bars_with_all_shard_checkpoi
     assert checkpoint_args.kwargs["target_offsets"] == {0: 1, 1: 1}
 
 
+def test_process_advances_check_time_to_concurrent_decoder_proof(
+    monkeypatch,
+):
+    database = Database()
+    own_progress = progress(1)
+    source = reader((record(1),), own_progress)
+    monkeypatch.setattr(
+        bridge,
+        "_load_checkpoint_offsets_cursor",
+        MagicMock(return_value={0: 0, 1: 0}),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_verify_stream_session_cursor",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_require_no_unresolved_am_gaps_cursor",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_load_security_ids_cursor",
+        MagicMock(return_value={1: SECURITY}),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_persist_consumer_checkpoints_cursor",
+        MagicMock(return_value=2),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "persist_realtime_equity_bars_cursor",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "adapt_advanced_minute_aggregate",
+        MagicMock(return_value=object()),
+    )
+
+    status = bridge.process_advanced_equity_journal_once(
+        database,
+        source,
+        config(),
+        checked_at=own_progress.updated_at - timedelta(microseconds=1),
+    )
+
+    assert status.checked_at == own_progress.updated_at
+
+
 def test_unresolved_relevant_gap_prevents_bar_and_checkpoint_advancement(monkeypatch):
     database = Database()
     source = reader((record(1),), progress(1))

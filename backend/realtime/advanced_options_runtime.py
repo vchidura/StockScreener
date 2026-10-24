@@ -30,7 +30,10 @@ from .advanced_options_package_evidence import (
     persist_advanced_options_cycle_with_evidence_cursor,
 )
 from .advanced_options_projection import (
+    AdvancedOptionsPublicationAuthorization,
     AdvancedOptionsProjectionBatch,
+    AdvancedOptionsPublisherHandoff,
+    authorize_advanced_options_publication,
     build_advanced_options_projection_batch,
     build_advanced_options_publisher_handoff,
     load_advanced_options_page_source_cursor,
@@ -43,12 +46,21 @@ from .materialization_jobs import JobBarrierVerdict
 from .options_v2_runtime import OptionsPreSessionStageBinding
 from .orchestration_repository import CycleReceiptSpec
 from .preflight import DetectorFamily
+from .portal_publisher import (
+    CanonicalPortalPublicationResult,
+    PortalPublicationBatch,
+)
 from .runner_environment import RunnerEnvironment
 from .session_archive import ArchiveIdentity
-from .stage_graph import STAGE_CATALOG_VERSION_V4
-from .stage_orchestrator import StageContext
+from .stage_graph import (
+    STAGES_V5,
+    STAGE_CATALOG_VERSION_V4,
+    STAGE_CATALOG_VERSION_V5,
+)
+from .stage_orchestrator import StageContext, StageOrchestrator
 from .stage_runners_options import (
     OptionsPublisherStageResult,
+    OptionsReferenceStageResult,
     OptionsReceiptStageResult,
 )
 
@@ -189,6 +201,15 @@ InputLoader = Callable[[StageContext], AdvancedOptionsInputStageData]
 CycleLoader = Callable[[StageContext], AdvancedOptionsCycleStageData]
 ProjectionLoader = Callable[[StageContext], AdvancedOptionsProjectionStageData]
 PublishLoader = Callable[[StageContext], AdvancedOptionsPublishStageData]
+ReferenceLoader = Callable[[StageContext], OptionsReferenceStageResult]
+PublicationAuthorityLoader = Callable[
+    [StageContext, AdvancedOptionsPublisherHandoff],
+    AdvancedOptionsPublicationAuthorization,
+]
+CanonicalPublisher = Callable[
+    [PortalPublicationBatch],
+    CanonicalPortalPublicationResult,
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +220,10 @@ class AdvancedOptionsRuntimeBinding:
     cycle_loader: CycleLoader
     projection_loader: ProjectionLoader
     publish_loader: PublishLoader
+    catalog_version: str = STAGE_CATALOG_VERSION_V4
+    reference_loader: ReferenceLoader | None = None
+    publication_authority_loader: PublicationAuthorityLoader | None = None
+    canonical_publisher: CanonicalPublisher | None = None
     cycle_writer: Callable[..., None] = (
         persist_advanced_options_cycle_with_evidence_cursor
     )
@@ -215,6 +240,13 @@ class AdvancedOptionsRuntimeBinding:
     def __post_init__(self) -> None:
         if not self.build_id.strip():
             raise ValueError("Advanced Options runtime build ID cannot be blank")
+        if self.catalog_version not in {
+            STAGE_CATALOG_VERSION_V4,
+            STAGE_CATALOG_VERSION_V5,
+        }:
+            raise ValueError(
+                "Advanced Options runtime catalog version is invalid"
+            )
         for value, name in (
             (self.input_loader, "input loader"),
             (self.cycle_loader, "cycle loader"),
@@ -226,20 +258,49 @@ class AdvancedOptionsRuntimeBinding:
         ):
             if not callable(value):
                 raise TypeError(f"Advanced Options runtime {name} is invalid")
+        if self.catalog_version == STAGE_CATALOG_VERSION_V5 and any(
+            not callable(value)
+            for value in (
+                self.reference_loader,
+                self.publication_authority_loader,
+                self.canonical_publisher,
+            )
+        ):
+            raise ValueError(
+                "Advanced Options V5 runtime composition is incomplete"
+            )
 
-    @staticmethod
     def _validate_scope(
+        self,
         context: StageContext,
         control_plane: AdvancedOptionsControlPlanePlan,
     ) -> None:
         if (
-            context.plan.stage_catalog_version != STAGE_CATALOG_VERSION_V4
+            context.plan.stage_catalog_version != self.catalog_version
             or context.plan.cohort_id != control_plane.cohort_id
             or context.plan.session_date != control_plane.session_date
             or context.window.plan_id != context.plan.plan_id
             or context.window.cohort_id != control_plane.cohort_id
         ):
             raise ValueError("Advanced Options runtime scope changed")
+
+    def reference(
+        self,
+        context: StageContext,
+    ) -> OptionsReferenceStageResult:
+        if (
+            self.catalog_version != STAGE_CATALOG_VERSION_V5
+            or self.reference_loader is None
+        ):
+            raise ValueError(
+                "Advanced Options reference stage is not V5-bound"
+            )
+        result = self.reference_loader(context)
+        if not isinstance(result, OptionsReferenceStageResult):
+            raise TypeError(
+                "Advanced Options reference loader returned invalid data"
+            )
+        return result
 
     def input_gate(self, context: StageContext) -> OptionsReceiptStageResult:
         data = self.input_loader(context)
@@ -331,19 +392,64 @@ class AdvancedOptionsRuntimeBinding:
             control_plane=data.control_plane,
             batch=data.projection,
         )
-        if any(
-            (
-                handoff.dispatch_authorized,
-                handoff.release_authorized,
-                handoff.pointer_authorized,
+        if self.catalog_version == STAGE_CATALOG_VERSION_V4:
+            if any(
+                (
+                    handoff.dispatch_authorized,
+                    handoff.release_authorized,
+                    handoff.pointer_authorized,
+                )
+            ):
+                raise ValueError(
+                    "Advanced Options V4 inert publisher gained authority"
+                )
+            return OptionsPublisherStageResult(
+                handoff.batch_sha256,
+                data.evidence_ref,
             )
+        if (
+            self.publication_authority_loader is None
+            or self.canonical_publisher is None
         ):
             raise ValueError(
-                "Advanced Options non-serving publisher gained authority"
+                "Advanced Options V5 publication is not composed"
+            )
+        authorization = self.publication_authority_loader(
+            context,
+            handoff,
+        )
+        authorized = authorize_advanced_options_publication(
+            handoff,
+            authorization,
+        )
+        result = self.canonical_publisher(
+            PortalPublicationBatch(
+                authorized.snapshots,
+                receipt=authorized.receipt,
+            ),
+            checked_at=max(
+                context.started_at,
+                authorized.receipt.cutoff,
+            ),
+        )
+        if (
+            not isinstance(result, CanonicalPortalPublicationResult)
+            or result.release.receipt_id != authorized.receipt.receipt_id
+            or result.release.release_id != result.pointer.release_id
+        ):
+            raise ValueError(
+                "Advanced Options canonical publication result changed"
             )
         return OptionsPublisherStageResult(
-            handoff.batch_sha256,
-            data.evidence_ref,
+            authorized.batch_sha256,
+            (
+                f"options-publish:{result.release.release_id}:"
+                f"{result.release.manifest_sha256}"
+            ),
+            release_authorized=True,
+            pointer_authorized=True,
+            release_id=result.release.release_id,
+            pointer_release_id=result.pointer.release_id,
         )
 
     def close(
@@ -380,6 +486,7 @@ class AdvancedOptionsRuntimeBinding:
         action_names = (
             "options_acquire_action",
             "options_admission_action",
+            "options_reference_action",
             "options_input_gate_action",
             "options_cycle_action",
             "options_projection_action",
@@ -389,8 +496,57 @@ class AdvancedOptionsRuntimeBinding:
             raise ValueError("Advanced Options runtime actions are already bound")
         environment.options_acquire_action = self.pre_session.acquire
         environment.options_admission_action = self.pre_session.admit
+        if self.catalog_version == STAGE_CATALOG_VERSION_V5:
+            environment.options_reference_action = self.reference
         environment.options_input_gate_action = self.input_gate
         environment.options_cycle_action = self.cycle
         environment.options_projection_action = self.projection
         environment.options_publish_action = self.publish
         return environment
+
+
+@dataclass(frozen=True, slots=True)
+class AdvancedOptionsV3RuntimeComposition:
+    binding: AdvancedOptionsRuntimeBinding
+    environment: RunnerEnvironment
+    runners: Mapping[str, object]
+    orchestrator: StageOrchestrator
+
+
+def build_advanced_options_v3_runtime_composition(
+    *,
+    binding: AdvancedOptionsRuntimeBinding,
+    repository,
+    database,
+    environment: RunnerEnvironment | None = None,
+) -> AdvancedOptionsV3RuntimeComposition:
+    if binding.catalog_version != STAGE_CATALOG_VERSION_V5:
+        raise ValueError(
+            "Advanced Options V3 composition requires stages_v5"
+        )
+    from .advanced_options_service import OPTIONS_V3_STAGE_ORDER
+    from .stage_runners_v2 import build_advanced_options_v3_runners
+
+    bound = binding.bind(environment or RunnerEnvironment(database))
+    runners = build_advanced_options_v3_runners(
+        database,
+        environment=bound,
+    )
+    if tuple(runners) != OPTIONS_V3_STAGE_ORDER:
+        raise ValueError(
+            "Advanced Options V3 runtime stage order changed"
+        )
+    orchestrator = StageOrchestrator(
+        repository,
+        runners,
+        database=database,
+        stages=STAGES_V5,
+        catalog_version=STAGE_CATALOG_VERSION_V5,
+        parallel_lanes=False,
+    )
+    return AdvancedOptionsV3RuntimeComposition(
+        binding,
+        bound,
+        runners,
+        orchestrator,
+    )

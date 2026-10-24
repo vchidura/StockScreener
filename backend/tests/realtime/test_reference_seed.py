@@ -270,6 +270,61 @@ def test_reference_security_identity_conflict_rolls_back():
     assert connection.rollback.call_count == 1
 
 
+def test_option_contract_accepts_compatible_massive_source_origin():
+    from realtime.reference_adapters import _option_fact
+    from tests.realtime.test_reference_adapters import _request
+
+    fact = _option_fact(
+        "SPY",
+        {"ticker": "O:SPY261023C00760000"},
+        _request(),
+    )
+    row = dict(fact.values)
+    _, cursor = _connection((
+        row["underlying_security_id"],
+        row["provider"],
+        row["contract_ticker"],
+        "PRE_SESSION_DISCOVERY",
+    ))
+
+    persist_reference_facts_cursor(cursor, (fact,))
+
+    statements = [
+        call.args[0]
+        for call in cursor.execute.call_args_list
+    ]
+    assert any(
+        statement.startswith(
+            "INSERT INTO ref.option_contract_versions"
+        )
+        for statement in statements
+    )
+
+
+def test_option_contract_rejects_provider_or_ticker_drift():
+    from realtime.reference_adapters import _option_fact
+    from tests.realtime.test_reference_adapters import _request
+
+    fact = _option_fact(
+        "SPY",
+        {"ticker": "O:SPY261023C00760000"},
+        _request(),
+    )
+    row = dict(fact.values)
+    _, cursor = _connection((
+        row["underlying_security_id"],
+        "other-provider",
+        row["contract_ticker"],
+        "PRE_SESSION_DISCOVERY",
+    ))
+
+    with pytest.raises(
+        ValueError,
+        match="option contract identity conflict",
+    ):
+        persist_reference_facts_cursor(cursor, (fact,))
+
+
 def test_dividend_facts_and_coverage_persist_exact_original_metadata_before_commit():
     from realtime.reference_adapters import _corporate_action_fact, _corporate_action_coverage_fact
     from tests.realtime.test_reference_adapters import _request, _dividend_payload

@@ -74,6 +74,9 @@ def load_manifest(
         raise TypeError("P8 hydration manifest must be an object")
     unsigned = dict(value)
     manifest_sha256 = unsigned.pop("manifest_sha256", None)
+    captured_at = datetime.fromisoformat(
+        str(value.get("captured_at_utc"))
+    )
     if (
         value.get("schema") != SCHEMA
         or manifest_sha256 != expected_manifest_sha256
@@ -81,7 +84,7 @@ def load_manifest(
         or value.get("provider_requests") != 2
         or value.get("pagination_requests") != 0
         or value.get("database_writes") != 0
-        or value.get("session_date") != "2026-10-21"
+        or value.get("session_date") != captured_at.date().isoformat()
     ):
         raise ValueError("P8 hydration manifest contract changed")
     responses = value.get("responses")

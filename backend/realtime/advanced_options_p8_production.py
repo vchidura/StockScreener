@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -15,6 +16,8 @@ from psycopg2.pool import ThreadedConnectionPool
 
 from .advanced_equity_control_plane import (
     build_advanced_equity_control_plane_plan,
+    load_advanced_equity_control_plane_plan_cursor,
+    validate_active_target9_equity_source_cursor,
 )
 from .advanced_options_control_plane import (
     ADVANCED_OPTIONS_REST_LANES,
@@ -23,10 +26,17 @@ from .advanced_options_control_plane import (
     AdvancedOptionsPolicyPins,
     AdvancedOptionsReceiptInputs,
     AdvancedOptionsSocketBudget,
+    advanced_options_equity_input_binding_payload,
+    advanced_options_history_binding_payload,
     build_advanced_options_control_plane_plan,
+    build_advanced_options_equity_input_binding,
     build_advanced_options_enrollment_plan,
     build_advanced_options_history_binding,
     build_advanced_options_prospective_reference_identity,
+    load_advanced_options_equity_input_binding_cursor,
+)
+from .advanced_options_equity_input import (
+    validate_advanced_options_equity_dependencies_cursor,
 )
 from .advanced_options_p8_canary_authorization import (
     LIVE_OBSERVATION_SCHEMA,
@@ -37,6 +47,7 @@ from .advanced_options_p8_canary_authorization import (
 from .advanced_options_p8_canary_executor import P8CanaryExecutionBinding
 from .advanced_options_p8_selection_source import (
     MassiveAdvancedOptionsSelectionSource,
+    P8ActivitySelectionCapture,
 )
 from .advanced_options_read_pin import (
     PostgresAdvancedOptionsStoredReadPort,
@@ -51,9 +62,18 @@ from .advanced_options_service import OPTIONS_NON_SERVING_STAGE_ORDER
 from .advanced_options_projection import (
     OPTIONS_PAGE_SNAPSHOT_TYPES,
     OPTIONS_PROJECTION_TYPES,
+    AdvancedOptionsPublicationAuthorization,
     AdvancedOptionsCanaryPublicationAuthorization,
     authorize_advanced_options_canary_publication,
     build_advanced_options_publisher_handoff,
+)
+from .advanced_options_v3_authority import (
+    AdvancedOptionsWindowStageEffectAuthorizer,
+    load_window_cycle_authorization_cursor,
+    session_acquisition_authorization_from_payload,
+)
+from .advanced_options_v3_history import (
+    AdvancedOptionsHistoryBindingIdentityError,
 )
 from .contracts import MarketChannel
 from .database_access import (
@@ -66,9 +86,6 @@ from .database_access import (
 from .database_access_v2 import APP_ROLE, V2AccessConfig, V2ConnectionProvider
 from .migrations import (
     EXPECTED_V2_DATABASE_NAME,
-    V2_MIGRATIONS_DIR,
-    load_realtime_migrations,
-    schema_fingerprint,
 )
 from .option_session_manifest import (
     BoundedOptionManifestPolicy,
@@ -79,11 +96,14 @@ from .option_session_manifest import (
 )
 from .option_slot_set import SlotSetMember, SlotSetPurpose
 from .orchestration_repository import PostgresOrchestrationRepository
-from .portal_publisher import PortalPublicationBatch, PortalPublicationConfig
+from .portal_publisher import (
+    CanonicalPortalPublisher,
+    PortalPublicationBatch,
+    PortalPublicationConfig,
+)
 from .preflight import DetectorFamily, ProductEntitlementProfile, ProviderTier
 from .provider_budget import ProviderBudgetScope
 from .acquisition_ledger import ProviderRequestLane
-from .relation_registry import security_policy_sha256
 from .runner_environment import RunnerEnvironment
 from .stage_graph import STAGES_V4, STAGE_CATALOG_VERSION_V4
 from .stage_orchestrator import StageOrchestrator
@@ -93,7 +113,7 @@ from .worker_database import RealtimeProcessDatabase
 
 UTC = timezone.utc
 BUILD_ID = "advanced-options-p8-live-canary-v1"
-P8_PRODUCTION_BINDING_SCHEMA = "advanced-options-p8-production-binding-v2"
+P8_PRODUCTION_BINDING_SCHEMA = "advanced-options-p8-production-binding-v3"
 
 
 def _open_interest_sha256(selected) -> str:
@@ -120,11 +140,9 @@ def _p8_manifest_policy() -> BoundedOptionManifestPolicy:
         minimum_day_volume=100,
         minimum_open_interest=100,
         maximum_contracts_per_underlying=2,
-        maximum_option_quote_contracts=2,
+        maximum_option_quote_contracts=4,
         reserved_option_quote_contracts=0,
         required_detectors=(
-            DetectorFamily.S1,
-            DetectorFamily.S2,
             DetectorFamily.O1,
             DetectorFamily.O2,
             DetectorFamily.O3,
@@ -230,6 +248,19 @@ class _DockerWindowOrchestrator:
 
 
 def run_p8_production_role(**kwargs):
+    environment = kwargs.get("environment")
+    if (
+        isinstance(environment, Mapping)
+        and environment.get(
+            "REALTIME_V3_PROVIDER_FREE_QUALIFICATION"
+        )
+        == "ENABLED"
+    ):
+        from .advanced_options_v3_qualification import (
+            run_provider_free_v3_role,
+        )
+
+        return run_provider_free_v3_role(**kwargs)
     from .advanced_options_p8_roles import run_p8_role
 
     return run_p8_role(**kwargs)
@@ -290,6 +321,234 @@ def run_p8_serial_window(
         source_flow=flow_environment.options_flow_source.source_flow,
         dependency_evidence=dependency_evidence,
     )
+
+
+def run_v3_serial_window(
+    *,
+    provider,
+    pool,
+    binding,
+    package,
+    bundle,
+    environment,
+    dependency_evidence,
+):
+    from .advanced_journal_registry import (
+        load_advanced_journal_registration_cursor,
+    )
+    from .advanced_options_ingress import AdvancedOptionsJournalSource
+    from .advanced_options_p8_roles import (
+        _contract_scope,
+        _flow_environment,
+        _journal_root,
+    )
+    from .advanced_options_p8_window import (
+        build_and_run_p8_serial_window,
+    )
+    from .stage_graph import STAGE_CATALOG_VERSION_V5
+
+    authorities = bundle.get("v3_authorities")
+    references = bundle.get("v3_authority_references")
+    if (
+        not isinstance(authorities, Mapping)
+        or set(authorities) != {"session_acquisition"}
+        or not isinstance(references, Mapping)
+    ):
+        raise RuntimeError("V3 durable authority references are unavailable")
+    session_authority = session_acquisition_authorization_from_payload(
+        authorities.get("session_acquisition")
+    )
+    control = binding.enrollment.control_plane
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        cycle_authority = load_window_cycle_authorization_cursor(
+            unit.cursor,
+            target_window_id=binding.window_id,
+            session_authorization_id=(
+                session_authority.authorization_id
+            ),
+        )
+        equity_input = load_advanced_options_equity_input_binding_cursor(
+            unit.cursor,
+            binding.window_id,
+        )
+    publication = references.get("canonical_publication")
+    publication_authorization_id = uuid5(
+        NAMESPACE_URL,
+        (
+            "advanced-options-v3-window-publication:"
+            f"{publication['authorization_id']}:"
+            f"{cycle_authority.authorization_id}"
+        ),
+    ) if isinstance(publication, Mapping) else None
+    if (
+        equity_input != binding.equity_input
+        or cycle_authority.target_window_id != binding.window_id
+        or cycle_authority.target_cohort_id != control.cohort_id
+        or cycle_authority.session_authorization_sha256
+        != session_authority.authorization_sha256
+        or not isinstance(publication, Mapping)
+        or publication.get("session_authorization_id")
+        != str(session_authority.authorization_id)
+        or not isinstance(publication_authorization_id, UUID)
+        or cycle_authority.publication_authorization_reference is None
+    ):
+        raise RuntimeError("V3 durable split authority scope changed")
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        registration = load_advanced_journal_registration_cursor(
+            unit.cursor,
+            control.source_flow.journal_generation,
+        )
+    if (
+        registration is None
+        or registration.status
+        not in {"WRITING", "DRAINING", "DRAINED"}
+    ):
+        raise RuntimeError("V3 WINDOW journal is unavailable")
+    source = AdvancedOptionsJournalSource(
+        root=_journal_root(environment),
+        registration=registration,
+        source_flow=control.source_flow,
+    )
+    flow_owner_epoch = int(
+        dependency_evidence["FLOW"].get("owner_epoch", 1)
+    )
+    flow_environment = _flow_environment(
+        provider,
+        binding,
+        source,
+        flow_owner_epoch,
+    )
+    role_provider = RoleScopedConnectionProvider(
+        {RealtimeDatabasePrincipal.RUNTIME: pool},
+        {
+            RealtimeDatabaseRole.PUBLICATION: (
+                f"{EXPECTED_V2_DATABASE_NAME}_app"
+            ),
+        },
+    )
+    publisher_database = RealtimeProcessDatabase(
+        RealtimeProcessDatabasePlan(
+            "worker:portal_publisher:advanced_options_v3",
+            RealtimeDatabaseRole.PUBLICATION,
+            RealtimePoolBudget(0, 1),
+        ),
+        role_provider,
+    )
+    publisher = CanonicalPortalPublisher(
+        publisher_database,
+        PortalPublicationConfig(
+            cohort_id=control.cohort_id,
+            provider_tier=ProviderTier.MASSIVE_ADVANCED,
+            owner_id=uuid5(
+                NAMESPACE_URL,
+                (
+                    "advanced-options-v3-publisher:"
+                    f"{publication['authorization_id']}"
+                ),
+            ),
+            owner_epoch=1,
+            dispatch_authorized=False,
+        ),
+    )
+
+    def publication_authority(context, handoff):
+        with provider.transaction(APP_ROLE, read_only=True) as unit:
+            unit.cursor.execute(
+                "SELECT receipt_id::text,input_sha256 "
+                "FROM rt.cycle_receipts WHERE window_id=%s "
+                "AND cohort_id=%s "
+                "AND receipt_kind='OPTIONS_PORTAL_READY'",
+                (
+                    str(context.window.window_id),
+                    str(context.plan.cohort_id),
+                ),
+            )
+            row = unit.cursor.fetchone()
+        if row is None or str(row[1]) != handoff.batch_sha256:
+            raise RuntimeError(
+                "V3 canonical publication receipt identity changed"
+            )
+        return AdvancedOptionsPublicationAuthorization(
+            authorization_id=UUID(
+                str(publication_authorization_id)
+            ),
+            cohort_id=control.cohort_id,
+            provider_tier=ProviderTier.MASSIVE_ADVANCED,
+            batch_sha256=handoff.batch_sha256,
+            receipt_id=UUID(str(row[0])),
+            scope_reference=(
+                cycle_authority.publication_authorization_reference
+            ),
+        )
+
+    return build_and_run_p8_serial_window(
+        provider=provider,
+        binding=binding,
+        package=package,
+        flow_environment=flow_environment,
+        contract_scope=flow_environment.options_flow_contract_scope,
+        source_flow=flow_environment.options_flow_source.source_flow,
+        dependency_evidence=dependency_evidence,
+        catalog_version=STAGE_CATALOG_VERSION_V5,
+        publication_authority_loader=publication_authority,
+        canonical_publisher=publisher.publish,
+        window_stage_effect_authorizer=(
+            AdvancedOptionsWindowStageEffectAuthorizer(
+                cycle_authority
+            )
+        ),
+        window_cutoff=cycle_authority.options_cutoff,
+    )
+
+
+def load_v3_pending_window_bindings(
+    *,
+    provider,
+    binding,
+    bundle,
+    available_at: datetime,
+):
+    authorities = bundle.get("v3_authorities")
+    if not isinstance(authorities, Mapping):
+        raise RuntimeError("V3 session authority is unavailable")
+    session = session_acquisition_authorization_from_payload(
+        authorities.get("session_acquisition")
+    )
+    checked = available_at.astimezone(UTC)
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        unit.cursor.execute(
+            "SELECT cycle.target_window_id::text "
+            "FROM rt.advanced_options_window_cycle_authorizations AS cycle "
+            "JOIN rt.window_runs AS window "
+            "ON window.window_id=cycle.target_window_id "
+            "WHERE cycle.session_authorization_id=%s "
+            "AND cycle.target_cohort_id=%s "
+            "AND window.state IN ('PENDING','RUNNING') "
+            "AND window.release_at<=%s "
+            "ORDER BY cycle.options_cutoff,cycle.target_window_id",
+            (
+                str(session.authorization_id),
+                str(binding.enrollment.control_plane.cohort_id),
+                checked,
+            ),
+        )
+        window_ids = tuple(
+            UUID(str(row[0])) for row in unit.cursor.fetchall()
+        )
+        values = []
+        for window_id in window_ids:
+            equity_input = load_advanced_options_equity_input_binding_cursor(
+                unit.cursor,
+                window_id,
+            )
+            if equity_input is None:
+                continue
+            values.append(replace(
+                binding,
+                equity_input=equity_input,
+                window_id=window_id,
+            ))
+    return tuple(values)
 
 
 def _manifest_policy_payload(policy):
@@ -365,6 +624,9 @@ def _production_binding_payload(
             "checked_at": control.checked_at.isoformat(),
             "expires_at": control.expires_at.isoformat(),
             "planned_at": control.planned_at.isoformat(),
+            "equity_input_cutoff": (
+                binding.equity_input.equity_cutoff.isoformat()
+            ),
             "manifest_policy": _manifest_policy_payload(
                 control.manifest_policy
             ),
@@ -467,6 +729,14 @@ def _production_binding_payload(
             "authorized_plan_id": str(control.plan_id),
         },
         "selection": option_activity_selection_payload(selection),
+        "history_binding": advanced_options_history_binding_payload(
+            binding.history
+        ),
+        "equity_input_binding": (
+            advanced_options_equity_input_binding_payload(
+                binding.equity_input
+            )
+        ),
         "underlying_price_binding": (
             underlying_snapshot_binding_payload(
                 binding.underlying_price_binding
@@ -644,6 +914,9 @@ def p8_production_binding_from_payload(value):
             UUID(row) for row in control_value["stream_session_ids"]
         ),
         receipt_inputs=receipt_inputs,
+        equity_input_cutoff=datetime.fromisoformat(
+            control_value["equity_input_cutoff"]
+        ),
         authorized_cohort_id=UUID(
             control_value["authorized_cohort_id"]
         ),
@@ -669,15 +942,79 @@ def p8_production_binding_from_payload(value):
         raise ValueError("P8 rebuilt enrollment identity changed")
     return P8CanaryExecutionBinding(
         enrollment,
-        build_advanced_options_history_binding(
-            target_cohort_id=control.cohort_id,
-            source_cohort_id=UUID(
-                "d1baee6f-4ab2-543c-8a86-ce10f8952e69"
+        build_advanced_options_history_binding(**{
+            "target_cohort_id": UUID(
+                value["history_binding"]["target_cohort_id"]
             ),
-            history_before=control.planned_at,
-            source_manifest_sha256="0" * 64,
-            authorization_reference=control.options_authorization_reference,
-        ),
+            "source_cohort_id": UUID(
+                value["history_binding"]["source_cohort_id"]
+            ),
+            "history_before": datetime.fromisoformat(
+                value["history_binding"]["history_before"]
+            ),
+            "source_manifest_sha256": value[
+                "history_binding"
+            ]["source_manifest_sha256"],
+            "authorization_reference": value[
+                "history_binding"
+            ]["authorization_reference"],
+            "evidence_sha256": value["history_binding"].get(
+                "evidence_sha256"
+            ),
+        }),
+        build_advanced_options_equity_input_binding(**{
+            "target_options_window_id": UUID(
+                value["equity_input_binding"][
+                    "target_options_window_id"
+                ]
+            ),
+            "target_cohort_id": UUID(
+                value["equity_input_binding"]["target_cohort_id"]
+            ),
+            "source_cohort_id": UUID(
+                value["equity_input_binding"]["source_cohort_id"]
+            ),
+            "source_cohort_sha256": value[
+                "equity_input_binding"
+            ]["source_cohort_sha256"],
+            "source_manifest_id": UUID(
+                value["equity_input_binding"]["source_manifest_id"]
+            ),
+            "source_manifest_sha256": value[
+                "equity_input_binding"
+            ]["source_manifest_sha256"],
+            "source_profile_id": UUID(
+                value["equity_input_binding"]["source_profile_id"]
+            ),
+            "source_profile_sha256": value[
+                "equity_input_binding"
+            ]["source_profile_sha256"],
+            "equity_window_id": UUID(
+                value["equity_input_binding"]["equity_window_id"]
+            ),
+            "equity_receipt_id": UUID(
+                value["equity_input_binding"]["equity_receipt_id"]
+            ),
+            "equity_cutoff": datetime.fromisoformat(
+                value["equity_input_binding"]["equity_cutoff"]
+            ),
+            "reference_generation": value[
+                "equity_input_binding"
+            ]["reference_generation"],
+            "universe_sha256": value[
+                "equity_input_binding"
+            ]["universe_sha256"],
+            "input_sha256": value[
+                "equity_input_binding"
+            ]["input_sha256"],
+            "build_id": value["equity_input_binding"]["build_id"],
+            "maximum_age_seconds": value[
+                "equity_input_binding"
+            ]["maximum_age_seconds"],
+            "authorization_reference": value[
+                "equity_input_binding"
+            ]["authorization_reference"],
+        }),
         UUID(value["window_id"]),
         underlying_snapshot_binding_from_payload(
             value["underlying_price_binding"]
@@ -743,7 +1080,7 @@ class _P8ProductionCapture:
         self,
         provider: V2ConnectionProvider,
         package: Mapping[str, object],
-        api_key: str,
+        api_key: str | None,
         stored_reads_authorized: bool,
     ) -> None:
         self._provider = provider
@@ -752,13 +1089,17 @@ class _P8ProductionCapture:
         source_cohort_id = UUID(
             str(package["history_binding"]["source_cohort_id"])
         )
-        self._selection = MassiveAdvancedOptionsSelectionSource(
-            RequestsPolygonHttpTransport(
-                api_key,
-                maximum_response_bytes=100_000_000,
-            ),
-            _PostgresSelectionSpots(provider, source_cohort_id),
-            clock=lambda: datetime.now(UTC),
+        self._selection = (
+            None
+            if api_key is None
+            else MassiveAdvancedOptionsSelectionSource(
+                RequestsPolygonHttpTransport(
+                    api_key,
+                    maximum_response_bytes=100_000_000,
+                ),
+                _PostgresSelectionSpots(provider, source_cohort_id),
+                clock=lambda: datetime.now(UTC),
+            )
         )
         self.binding: P8CanaryExecutionBinding | None = None
         self.checked_at: datetime | None = None
@@ -766,6 +1107,7 @@ class _P8ProductionCapture:
         self.production_binding_payload: Mapping[str, object] | None = None
         self.selection_capture = None
         self.underlying_price_binding: UnderlyingSnapshotBinding | None = None
+        self.equity_input_readiness: Mapping[str, object] | None = None
 
     def _catalog(self, capture, checked_at):
         tickers = list(capture.selection.contracts)
@@ -853,38 +1195,29 @@ class _P8ProductionCapture:
             ))
         return tuple(contracts)
 
-    def _security_ids(self, checked_at):
-        underlyings = tuple(self._package["cohort"]["underlyings"])
-        with self._provider.transaction(
-            APP_ROLE,
-            read_only=True,
-            dict_cursor=True,
-            isolation_level="REPEATABLE READ",
-        ) as unit:
-            unit.cursor.execute(
-                "SELECT DISTINCT ON (revision.ticker) revision.ticker,"
-                "revision.security_id::text "
-                "FROM ref.security_revisions AS revision "
-                "WHERE revision.ticker=ANY(%s) "
-                "AND revision.effective_from<=%s "
-                "AND (revision.effective_to IS NULL "
-                "OR revision.effective_to>%s) "
-                "AND revision.observed_at<=%s "
-                "ORDER BY revision.ticker,revision.effective_from DESC,"
-                "revision.observed_at DESC",
-                (list(underlyings), checked_at, checked_at, checked_at),
-            )
-            rows = tuple(unit.cursor.fetchall())
-        result = {
-            str(row["ticker"]): UUID(str(row["security_id"]))
-            for row in rows
-        }
-        if set(result) != set(underlyings):
-            raise RuntimeError("P8 underlying security identity is incomplete")
-        return result
-
     def _history_manifest(self):
-        source_cohort = self._package["history_binding"]["source_cohort_id"]
+        history_scope = self._package["history_binding"]
+        source_cohort = history_scope["source_cohort_id"]
+        v3_history = self._package.get("v3_history_binding")
+        v3_binding = (
+            v3_history.get("binding")
+            if isinstance(v3_history, Mapping)
+            else None
+        )
+        if isinstance(self._package.get("v3_deployment"), Mapping) and (
+            not isinstance(v3_history, Mapping)
+            or not isinstance(v3_history.get("evidence"), Mapping)
+            or not isinstance(v3_binding, Mapping)
+            or v3_binding.get("source_cohort_id")
+            != str(source_cohort)
+            or v3_binding.get(
+                "source_manifest_sha256"
+            )
+            != history_scope.get("source_manifest_sha256")
+        ):
+            raise AdvancedOptionsHistoryBindingIdentityError(
+                "V3 H binding package identity is absent or divergent"
+            )
         with self._provider.transaction(
             APP_ROLE,
             read_only=True,
@@ -987,7 +1320,119 @@ class _P8ProductionCapture:
             ]
         return peers, releases, pointers, windows, retention, read_pins
 
-    def _binding(self, capture, checked_at, history_manifest):
+    def _equity_source(self, checked_at):
+        value = self._package["equity_input_binding"]
+        binding = build_advanced_options_equity_input_binding(
+            target_options_window_id=UUID(str(
+                value["target_options_window_id"]
+            )),
+            target_cohort_id=UUID(str(value["target_cohort_id"])),
+            source_cohort_id=UUID(str(value["source_cohort_id"])),
+            source_cohort_sha256=str(value["source_cohort_sha256"]),
+            source_manifest_id=UUID(str(value["source_manifest_id"])),
+            source_manifest_sha256=str(
+                value["source_manifest_sha256"]
+            ),
+            source_profile_id=UUID(str(value["source_profile_id"])),
+            source_profile_sha256=str(value["source_profile_sha256"]),
+            equity_window_id=UUID(str(value["equity_window_id"])),
+            equity_receipt_id=UUID(str(value["equity_receipt_id"])),
+            equity_cutoff=datetime.fromisoformat(
+                str(value["equity_cutoff"])
+            ),
+            reference_generation=int(value["reference_generation"]),
+            universe_sha256=str(value["universe_sha256"]),
+            input_sha256=str(value["input_sha256"]),
+            build_id=str(value["build_id"]),
+            maximum_age_seconds=int(value["maximum_age_seconds"]),
+            authorization_reference=str(
+                value["authorization_reference"]
+            ),
+        )
+        if (
+            binding.equity_cutoff > checked_at
+            or (
+                checked_at - binding.equity_cutoff
+            ).total_seconds() > binding.maximum_age_seconds
+        ):
+            raise RuntimeError(
+                "P8 completed Equity input is stale before provider capture"
+            )
+        with self._provider.transaction(
+            APP_ROLE,
+            read_only=True,
+            dict_cursor=True,
+            isolation_level="REPEATABLE READ",
+        ) as unit:
+            plan = load_advanced_equity_control_plane_plan_cursor(
+                unit.cursor,
+                binding.source_cohort_id,
+            )
+            validate_active_target9_equity_source_cursor(
+                unit.cursor,
+                plan,
+            )
+            unit.cursor.execute(
+                "SELECT receipt.window_id::text,receipt.cohort_id::text,"
+                "receipt.receipt_kind,receipt.cutoff,"
+                "receipt.reference_generation,receipt.universe_sha256,"
+                "receipt.input_sha256,receipt.build_id,window_run.state "
+                "FROM rt.cycle_receipts AS receipt "
+                "JOIN rt.window_runs AS window_run "
+                "ON window_run.window_id=receipt.window_id "
+                "WHERE receipt.receipt_id=%s",
+                (str(binding.equity_receipt_id),),
+            )
+            receipt = unit.cursor.fetchone()
+            readiness = validate_advanced_options_equity_dependencies_cursor(
+                unit.cursor,
+                equity_plan=plan,
+                equity_input=binding,
+                history_source_cohort_id=UUID(str(
+                    self._package["history_binding"]["source_cohort_id"]
+                )),
+                underlyings=tuple(
+                    self._package["cohort"]["underlyings"]
+                ),
+            )
+        if (
+            plan.cohort_id != binding.source_cohort_id
+            or plan.cohort_sha256 != binding.source_cohort_sha256
+            or plan.manifest_id != binding.source_manifest_id
+            or plan.manifest.sha256 != binding.source_manifest_sha256
+            or plan.profile_id != binding.source_profile_id
+            or plan.profile_sha256 != binding.source_profile_sha256
+            or plan.universe.sha256 != binding.universe_sha256
+            or not set(self._package["cohort"]["underlyings"]).issubset(
+                set(plan.universe.equity_tickers)
+            )
+            or receipt is None
+            or tuple(receipt.values()) != (
+                str(binding.equity_window_id),
+                str(binding.source_cohort_id),
+                "INPUT_READY",
+                binding.equity_cutoff,
+                binding.reference_generation,
+                binding.universe_sha256,
+                binding.input_sha256,
+                binding.build_id,
+                "COMPLETE",
+            )
+        ):
+            raise RuntimeError(
+                "P8 completed Equity input binding is unavailable"
+            )
+        self.equity_input_readiness = readiness
+        return plan, binding
+
+    def _binding(
+        self,
+        capture,
+        checked_at,
+        history_manifest,
+        equity,
+        equity_input,
+    ):
         package = self._package
         stop = datetime.fromisoformat(str(package["window"]["stop_utc"]))
         underlying_price_binding = binding_from_selection_capture(capture)
@@ -1008,7 +1453,7 @@ class _P8ProductionCapture:
             valid_until=capture.selection.valid_until,
             policy_sha256=capture.selection.policy.sha256,
             source_sha256=capture.selection.source_sha256,
-            quote_ceiling=2,
+            quote_ceiling=4,
             contracts=contracts,
         )
         oi_sha256 = _open_interest_sha256(
@@ -1022,21 +1467,16 @@ class _P8ProductionCapture:
             underlyings=tuple(package["cohort"]["underlyings"]),
             open_interest_sha256=oi_sha256,
         )
-        equity = build_advanced_equity_control_plane_plan(
-            session_date=checked_at.date(),
-            security_ids=self._security_ids(checked_at),
-            entitlement_evidence_sha256=canonical_sha256({
-                "package_sha256": package["package_sha256"],
-                "authority": "provider_snapshot_selection",
-            }),
-            authorization_reference=package["authorization_reference"],
-            checked_at=checked_at,
-            expires_at=stop + timedelta(minutes=30),
-            schema_sha256=schema_fingerprint(
-                load_realtime_migrations(V2_MIGRATIONS_DIR)
-            ),
-            security_policy_sha256=security_policy_sha256(),
-        )
+        if (
+            equity.session_date != checked_at.date()
+            or equity_input.equity_cutoff > cycle_cutoff
+            or (
+                cycle_cutoff - equity_input.equity_cutoff
+            ).total_seconds() > equity_input.maximum_age_seconds
+        ):
+            raise RuntimeError(
+                "P8 completed Equity input is stale for Options"
+            )
         hashes = package["policy_hashes"]
         policy = _p8_manifest_policy()
         slots = tuple(
@@ -1053,11 +1493,8 @@ class _P8ProductionCapture:
         receipt = AdvancedOptionsReceiptInputs(
             cutoff=cycle_cutoff,
             reference_state=reference,
-            equity_input_receipt_id=uuid5(
-                NAMESPACE_URL,
-                f"p8-equity-input:{package['package_nonce']}",
-            ),
-            equity_input_sha256=canonical_sha256((package["package_sha256"], "equity")),
+            equity_input_receipt_id=equity_input.equity_receipt_id,
+            equity_input_sha256=equity_input.input_sha256,
             discovery_batches_sha256=capture.evidence["source_snapshot_sha256"],
             open_interest_sha256=oi_sha256,
             consumer_checkpoints_sha256=canonical_sha256((package["package_sha256"], "checkpoints")),
@@ -1111,7 +1548,7 @@ class _P8ProductionCapture:
                 authorization_reference=package["authorization_reference"],
                 provider_authorization_reference=package["authorization_reference"],
                 expected_cost="exact two-request P8 activity selection",
-                request_ceiling=4,
+                request_ceiling=2,
                 decoded_byte_ceiling=100_000_000,
                 lanes=ADVANCED_OPTIONS_REST_LANES,
                 authorized_until=stop,
@@ -1126,6 +1563,7 @@ class _P8ProductionCapture:
                 f"p8-stream:{package['package_nonce']}",
             ),),
             receipt_inputs=receipt,
+            equity_input_cutoff=equity_input.equity_cutoff,
             authorized_cohort_id=UUID(str(package["cohort"]["cohort_id"])),
             authorized_plan_id=UUID(str(package["orchestration"]["plan_id"])),
         )
@@ -1144,15 +1582,25 @@ class _P8ProductionCapture:
             ),
             source_manifest_sha256=history_manifest,
             authorization_reference=package["authorization_reference"],
+            evidence_sha256=(
+                None
+                if package.get("v3_history_binding") is None
+                else package["v3_history_binding"]["evidence"][
+                    "evidence_sha256"
+                ]
+            ),
         )
         window_id = uuid5(
             NAMESPACE_URL,
-            f"p8-window:{package['package_nonce']}:{cycle_cutoff.isoformat()}",
+            f"p8-window:{package['package_nonce']}",
         )
+        if equity_input.target_options_window_id != window_id:
+            raise RuntimeError("P8 target Options window binding changed")
         self.underlying_price_binding = underlying_price_binding
         binding = P8CanaryExecutionBinding(
             enrollment,
             history,
+            equity_input,
             window_id,
             underlying_price_binding,
         )
@@ -1171,28 +1619,34 @@ class _P8ProductionCapture:
         )
         if (
             rebuilt.enrollment != binding.enrollment
+            or rebuilt.history != binding.history
+            or rebuilt.equity_input != binding.equity_input
             or rebuilt.window_id != binding.window_id
+            or rebuilt.underlying_price_binding
+            != binding.underlying_price_binding
         ):
             raise RuntimeError(
                 "P8 production binding did not round-trip exactly"
             )
         return binding
 
-    def capture(self, package, *, checked_at):
+    def _capture_selection(self, package, checked_at, capture):
         if package is not self._package and dict(package) != dict(self._package):
             raise ValueError("P8 production package identity changed")
         checked = checked_at.astimezone(UTC)
-        capture = self._selection.capture(
-            reviewed_at=checked,
-            session_date=checked.date(),
-        )
-        captured_at = datetime.fromisoformat(
-            str(capture.evidence["selected_at_utc"])
-        ).astimezone(UTC)
-        self.selection_capture = capture
         history_manifest = self._history_manifest()
-        binding = self._binding(capture, captured_at, history_manifest)
-        captured_at = binding.underlying_price_binding.reviewed_at
+        equity, equity_input = self._equity_source(checked)
+        if not isinstance(capture, P8ActivitySelectionCapture):
+            raise TypeError("P8 activity selection capture is invalid")
+        self.selection_capture = capture
+        binding = self._binding(
+            capture,
+            checked,
+            history_manifest,
+            equity,
+            equity_input,
+        )
+        captured_at = binding.enrollment.control_plane.planned_at
         (
             peers,
             releases,
@@ -1236,7 +1690,26 @@ class _P8ProductionCapture:
                 "repaired_sessions": package["history_binding"][
                     "required_sessions"
                 ],
+                "coverage_requirements": {
+                    "underlyings": package["history_binding"][
+                        "required_underlyings"
+                    ],
+                    "adjusted_daily_sessions": package[
+                        "history_binding"
+                    ]["required_adjusted_daily_sessions"],
+                    "raw_daily_sessions": package[
+                        "history_binding"
+                    ]["required_raw_daily_sessions"],
+                },
             },
+            "equity_input_source": (
+                advanced_options_equity_input_binding_payload(
+                    binding.equity_input
+                )
+            ),
+            "equity_input_readiness": dict(
+                self.equity_input_readiness or {}
+            ),
             "underlying_price_binding": (
                 underlying_snapshot_binding_payload(
                     binding.underlying_price_binding
@@ -1266,6 +1739,35 @@ class _P8ProductionCapture:
         self.binding = binding
         self.checked_at = captured_at
         return observation, binding
+
+    def capture(self, package, *, checked_at):
+        if self._selection is None:
+            raise RuntimeError(
+                "P8 provider selection is disabled for this capture"
+            )
+        checked = checked_at.astimezone(UTC)
+        capture = self._selection.capture(
+            reviewed_at=checked,
+            session_date=checked.date(),
+        )
+        return self._capture_selection(
+            package,
+            checked,
+            capture,
+        )
+
+    def capture_from_selection(
+        self,
+        package,
+        *,
+        checked_at,
+        selection_capture,
+    ):
+        return self._capture_selection(
+            package,
+            checked_at,
+            selection_capture,
+        )
 
     def persist_selection_cursor(self, cursor, binding):
         capture = self.selection_capture
@@ -1424,73 +1926,13 @@ class _EnrollmentConnection:
                     ),
                 ),
             )
-            receipt = self._capture.production_binding_payload[
-                "control"
-            ]["receipt_inputs"]
-            equity_plan_id = uuid5(
-                NAMESPACE_URL,
-                f"p8-equity-history-plan:{self._package['package_nonce']}",
-            )
-            equity_window_id = uuid5(
-                NAMESPACE_URL,
-                f"p8-equity-history-window:{self._package['package_nonce']}",
-            )
-            cursor.execute(
-                "INSERT INTO rt.service_plans ("
-                "plan_id,cohort_id,session_date,stage_catalog_version,"
-                "enabled_stages,config_sha256,deadline,scope_reference"
-                ") VALUES (%s,%s,%s,'stages_v3',%s,%s,%s,%s) "
-                "ON CONFLICT (plan_id) DO NOTHING",
-                (
-                    str(equity_plan_id),
-                    str(binding.enrollment.equity_plan.cohort_id),
-                    control.session_date,
-                    ["EQUITY_INPUT_GATE"],
-                    receipt["equity_input_sha256"],
-                    datetime.fromisoformat(
-                        str(self._package["window"]["stop_utc"])
-                    ),
-                    (
-                        f"{self._package['authorization_reference']}:"
-                        "IMMUTABLE_HISTORY_BINDING"
-                    ),
-                ),
-            )
-            cursor.execute(
-                "INSERT INTO rt.window_runs ("
-                "window_id,plan_id,cohort_id,provider_tier,window_key,"
-                "release_at,cutoff,deadline,state"
-                ") VALUES (%s,%s,%s,'MASSIVE_ADVANCED',%s,%s,%s,%s,"
-                "'COMPLETE') ON CONFLICT (window_id) DO NOTHING",
-                (
-                    str(equity_window_id),
-                    str(equity_plan_id),
-                    str(binding.enrollment.equity_plan.cohort_id),
-                    f"p8-history-{self._package['package_nonce']}",
-                    cutoff,
-                    cutoff,
-                    datetime.fromisoformat(
-                        str(self._package["window"]["stop_utc"])
-                    ),
-                ),
-            )
-            cursor.execute(
-                "INSERT INTO rt.cycle_receipts ("
-                "receipt_id,window_id,cohort_id,receipt_kind,cutoff,"
-                "reference_generation,universe_sha256,input_sha256,"
-                "build_id) VALUES (%s,%s,%s,'INPUT_READY',%s,%s,%s,%s,%s) "
-                "ON CONFLICT (window_id,receipt_kind) DO NOTHING",
-                (
-                    receipt["equity_input_receipt_id"],
-                    str(equity_window_id),
-                    str(binding.enrollment.equity_plan.cohort_id),
-                    cutoff,
-                    receipt["reference"]["reference_generation"],
-                    binding.enrollment.equity_plan.universe.sha256,
-                    receipt["equity_input_sha256"],
-                    "advanced-options-p8-history-binding-v1",
-                ),
-            )
+            if load_advanced_options_equity_input_binding_cursor(
+                cursor,
+                binding.window_id,
+            ) != binding.equity_input:
+                raise RuntimeError(
+                    "P8 persisted Equity input binding changed"
+                )
         self._connection.commit()
 
 
@@ -1499,11 +1941,16 @@ def build_advanced_options_p8_production_components(
     package: Mapping[str, object],
     repository_root: Path,
     stored_reads_authorized: bool,
+    provider_free_selection: bool = False,
 ):
     from .advanced_options_p8_runtime import P8RuntimeComponents
 
     app_dsn = _required_environment("REALTIME_V2_APP_DSN")
-    api_key = _required_environment("POLYGON_API_KEY")
+    api_key = (
+        None
+        if provider_free_selection
+        else _required_environment("POLYGON_API_KEY")
+    )
     pool = ThreadedConnectionPool(
         1,
         12,

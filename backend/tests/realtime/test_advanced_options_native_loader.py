@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
+from uuid import UUID
 
 from psycopg2 import Error as PsycopgError
 
@@ -8,6 +9,9 @@ from advanced_options_rolling_support import rolling_state
 from realtime.advanced_options_native_adapters import (
     AdvancedOptionsLaneInputs,
     AdvancedOptionsNativeInputBundle,
+)
+from realtime.advanced_options_equity_input import (
+    initial_advanced_options_equity_context_requirements,
 )
 from realtime.advanced_options_native_loader import (
     AdvancedOptionsNativeInputPreflight,
@@ -94,9 +98,12 @@ def _plan():
         equity_input_receipt=receipt,
         equity_window_id=EQUITY_WINDOW,
         loader_build_id="advanced-options-native-loader-v1",
-        stock_detector_sha256s=(
-            ("S1", "7" * 64),
-            ("S2", "8" * 64),
+        history_source_cohort_id=(
+            UUID("77777777-7777-4777-8777-777777777777")
+        ),
+        maximum_equity_input_age_seconds=300,
+        equity_context_requirements=(
+            initial_advanced_options_equity_context_requirements()
         ),
     )
 
@@ -107,8 +114,6 @@ def _preflight(plan):
         o3=AdvancedOptionsLaneInputs(
             blocked_reason_codes=("CANONICAL_MARKS_UNAVAILABLE",),
         ),
-        s1=AdvancedOptionsLaneInputs(),
-        s2=AdvancedOptionsLaneInputs(),
         plan_id=plan.plan_id,
         input_sha256="9" * 64,
         executor_membership_sha256="a" * 64,

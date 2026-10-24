@@ -56,23 +56,24 @@ from .advanced_options_service import (
     AdvancedOptionsResidentPolicy,
     OPTIONS_NON_SERVING_STAGE_ORDER,
 )
+from .contracts import EQUITY_VALIDATION_UNIVERSE
 from .option_flow.conditions import load_default_live_semantics
 from .provider_socket_lease import MASSIVE_OPTIONS_SOCKET_RESOURCE
 from .stage_graph import STAGES_V4, STAGE_CATALOG_VERSION_V4
 
 
-AUTHORIZATION_SCHEMA = "advanced-options-p8-live-canary-authorization-v4"
-LIVE_OBSERVATION_SCHEMA = "advanced-options-p8-live-canary-observation-v2"
+AUTHORIZATION_SCHEMA = "advanced-options-p8-live-canary-authorization-v5"
+LIVE_OBSERVATION_SCHEMA = "advanced-options-p8-live-canary-observation-v3"
 PAGE_RELEASE_OBSERVATION_SCHEMA = (
     "advanced-options-p8-page-release-observation-v2"
 )
 SELECTION_EVIDENCE_SCHEMA = "advanced-options-p8-activity-selection-v1"
 MISSED_WINDOW_POLICY = "EXPIRE_WITHOUT_ROLLOVER_OR_REUSE"
 QUALIFICATION_SEMANTIC_SHA256 = (
-    "d5a9f012958fba20c64e2cc54c9a923fdae89d6417e619f6fe7f2a9617b588fa"
+    "3aa845435af4523d1206b69214895413c495d8cebaae56a531e4bef0c6777bdb"
 )
 QUALIFICATION_FILE_SHA256 = (
-    "7f63c7a3cc35ada25d7b9db38b66d4c970bb8ce0c379f8a4db55e08771c87e74"
+    "56ed324ee9df11ea9019a7a2f955164e5447219f13b3e520545efdf181d0cbd5"
 )
 PREPARED_AUTHORITIES = (
     "provider_snapshot_selection",
@@ -85,6 +86,7 @@ PREPARED_AUTHORITIES = (
 RETAINED_DEVELOPER_HISTORY_COHORT_ID = (
     "d1baee6f-4ab2-543c-8a86-ce10f8952e69"
 )
+EQUITY_INPUT_MAXIMUM_AGE_SECONDS = 300
 SOURCE_BINDING_PATHS = (
     "backend/realtime/advanced_options_p8_canary_authorization.py",
     "backend/realtime/advanced_options_p8_canary_executor.py",
@@ -99,12 +101,15 @@ SOURCE_BINDING_PATHS = (
     "backend/scripts/prepare_advanced_options_p8_canary_authorization.py",
     "backend/scripts/audit_advanced_options_p8_canary_authorization.py",
     "backend/scripts/run_advanced_options_p8_canary.py",
+    "backend/scripts/inspect_advanced_options_v3_package.py",
     "backend/scripts/run_realtime_v2_container.py",
     "backend/scripts/run_realtime_v2_options_enrollment.py",
     "docker-compose.realtime-v2.yml",
     "backend/realtime/advanced_options_p7_selection.py",
     "backend/realtime/advanced_options_provider_contract.py",
+    "backend/realtime/advanced_equity_control_plane.py",
     "backend/realtime/advanced_options_control_plane.py",
+    "backend/realtime/advanced_options_equity_input.py",
     "backend/realtime/advanced_options_service.py",
     "backend/realtime/provider_socket_lease.py",
     "backend/realtime/normalizer.py",
@@ -116,6 +121,9 @@ SOURCE_BINDING_PATHS = (
     "backend/realtime/advanced_options_mark_producer.py",
     "backend/realtime/advanced_options_loaders.py",
     "backend/realtime/advanced_options_runtime.py",
+    "backend/realtime/advanced_options_v3_authority.py",
+    "backend/realtime/advanced_options_v3_deployment.py",
+    "backend/realtime/advanced_options_resident_barrier.py",
     "backend/realtime/advanced_options_cycle.py",
     "backend/realtime/advanced_options_package_evidence.py",
     "backend/realtime/advanced_options_projection.py",
@@ -127,6 +135,9 @@ SOURCE_BINDING_PATHS = (
     "backend/realtime/relation_registry.py",
     "backend/realtime/equity_live024_compatibility.py",
     "backend/realtime/sql_v2/032_advanced_options_read_pins.sql",
+    "backend/realtime/sql_v2/033_advanced_options_equity_input_bindings.sql",
+    "backend/scripts/prepare_advanced_options_p8_equity_input_source.py",
+    "backend/scripts/audit_advanced_options_input_readiness.py",
     "backend/realtime/screening_projection.py",
     "backend/realtime/screening_repository.py",
     "backend/realtime/stock_alert_projection.py",
@@ -236,6 +247,13 @@ def _source_identity(
     return rows
 
 
+def source_binding_identity(
+    repository_root: Path,
+    source_files: Sequence[str],
+) -> list[dict[str, object]]:
+    return _source_identity(repository_root, source_files)
+
+
 def _stage_payload() -> dict[str, object]:
     stages = [
         {
@@ -316,7 +334,7 @@ def _contract_payload(
         "wildcards": False,
         "contract_substitution": False,
         "scope_expansion": False,
-        "required_detectors": ["O1", "O2", "O3", "S1", "S2"],
+        "required_detectors": ["O1", "O2", "O3"],
         "o2_policy": "UNAVAILABLE/O2_MODEL_NOT_ACCEPTED",
     }
     policy_hashes = {
@@ -413,6 +431,106 @@ def _authority_payload(
     return result
 
 
+def _equity_input_source(
+    value: Mapping[str, object],
+    *,
+    target_options_window_id: UUID,
+    target_cohort_id: UUID,
+    window_start: datetime,
+    authorization_reference: str,
+) -> dict[str, object]:
+    required = {
+        "source_cohort_id",
+        "source_cohort_sha256",
+        "source_manifest_id",
+        "source_manifest_sha256",
+        "source_profile_id",
+        "source_profile_sha256",
+        "equity_window_id",
+        "equity_receipt_id",
+        "equity_cutoff_utc",
+        "reference_generation",
+        "universe_sha256",
+        "input_sha256",
+        "build_id",
+        "symbols",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise ValueError("P8 Equity input source fields changed")
+    source_cohort_id = UUID(str(value["source_cohort_id"]))
+    source_manifest_id = UUID(str(value["source_manifest_id"]))
+    source_profile_id = UUID(str(value["source_profile_id"]))
+    equity_window_id = UUID(str(value["equity_window_id"]))
+    equity_receipt_id = UUID(str(value["equity_receipt_id"]))
+    equity_cutoff = _utc(
+        datetime.fromisoformat(str(value["equity_cutoff_utc"])),
+        "equity_cutoff_utc",
+    )
+    reference_generation = value["reference_generation"]
+    symbols = tuple(sorted(str(item) for item in value["symbols"]))
+    if (
+        source_cohort_id.int == 0
+        or source_cohort_id == target_cohort_id
+        or source_manifest_id.int == 0
+        or source_profile_id.int == 0
+        or equity_window_id.int == 0
+        or equity_receipt_id.int == 0
+        or type(reference_generation) is not int
+        or reference_generation <= 0
+        or equity_cutoff.date() != window_start.date()
+        or equity_cutoff > window_start
+        or (
+            window_start - equity_cutoff
+        ).total_seconds() > EQUITY_INPUT_MAXIMUM_AGE_SECONDS
+        or symbols != EQUITY_VALIDATION_UNIVERSE.equity_tickers
+        or not str(value["build_id"]).strip()
+    ):
+        raise ValueError("P8 Equity input source scope changed")
+    result = {
+        "contract_version": "advanced-options-equity-input-binding-v2",
+        "target_options_window_id": str(target_options_window_id),
+        "target_cohort_id": str(target_cohort_id),
+        "source_cohort_id": str(source_cohort_id),
+        "source_cohort_sha256": _sha256(
+            str(value["source_cohort_sha256"]),
+            "source_cohort_sha256",
+        ),
+        "source_manifest_id": str(source_manifest_id),
+        "source_manifest_sha256": _sha256(
+            str(value["source_manifest_sha256"]),
+            "source_manifest_sha256",
+        ),
+        "source_profile_id": str(source_profile_id),
+        "source_profile_sha256": _sha256(
+            str(value["source_profile_sha256"]),
+            "source_profile_sha256",
+        ),
+        "equity_window_id": str(equity_window_id),
+        "equity_receipt_id": str(equity_receipt_id),
+        "equity_cutoff": equity_cutoff.isoformat(),
+        "reference_generation": reference_generation,
+        "universe_sha256": _sha256(
+            str(value["universe_sha256"]),
+            "universe_sha256",
+        ),
+        "input_sha256": _sha256(
+            str(value["input_sha256"]),
+            "input_sha256",
+        ),
+        "build_id": str(value["build_id"]).strip(),
+        "maximum_age_seconds": EQUITY_INPUT_MAXIMUM_AGE_SECONDS,
+        "authorization_reference": authorization_reference,
+        "symbols": list(symbols),
+    }
+    binding = {
+        key: result[key]
+        for key in result
+        if key != "symbols"
+    }
+    result["binding_sha256"] = canonical_sha256(binding)
+    return result
+
+
 def build_p8_canary_authorization(
     qualification_report_path: Path,
     *,
@@ -423,6 +541,7 @@ def build_p8_canary_authorization(
     prepared_at: datetime,
     window_start: datetime,
     window_end: datetime,
+    equity_input_source: Mapping[str, object],
     expected_qualification_semantic_sha256: str = (
         QUALIFICATION_SEMANTIC_SHA256
     ),
@@ -483,9 +602,20 @@ def build_p8_canary_authorization(
         NAMESPACE_URL,
         f"stockscreener:{reference}:{nonce}:stages_v4",
     )
+    target_options_window_id = uuid5(
+        NAMESPACE_URL,
+        f"p8-window:{nonce}",
+    )
     contract = _contract_payload(
         repository_root,
         cohort_id=cohort_id,
+    )
+    equity_input_binding = _equity_input_source(
+        equity_input_source,
+        target_options_window_id=target_options_window_id,
+        target_cohort_id=cohort_id,
+        window_start=start,
+        authorization_reference=reference,
     )
     superseded = (
         None
@@ -555,6 +685,7 @@ def build_p8_canary_authorization(
             "rollover_authorized": False,
             "reuse_authorized": False,
         },
+        "equity_input_binding": equity_input_binding,
         "supersession": (
             None
             if superseded is None
@@ -566,6 +697,7 @@ def build_p8_canary_authorization(
         ),
         "provider_selection": {
             "evidence_schema": SELECTION_EVIDENCE_SCHEMA,
+            "admission_role": "POST_E_ACTIVITY_RANKED_LATE_CANARY",
             "policy": {
                 "version": P8_SELECTION_POLICY.version,
                 "sha256": P8_SELECTION_POLICY.sha256,
@@ -586,6 +718,32 @@ def build_p8_canary_authorization(
             },
             "fresh_evidence_required": True,
             "selection_result_bound_by_live_preflight": True,
+        },
+        "v3_authority_classification": {
+            "path": "POST_E_ACTIVITY_RANKED_LATE_CANARY",
+            "prospective_opening_admission": {
+                "status": "UNAVAILABLE",
+                "authority_id": None,
+                "reason_code": (
+                    "POST_E_SELECTION_CANNOT_BIND_PREOPEN_CONTRACTS"
+                ),
+            },
+            "session_acquisition_authority": {
+                "status": "UNAVAILABLE",
+                "authority_id": None,
+                "reason_code": (
+                    "EXACT_PREOPEN_SESSION_AUTHORITY_NOT_PREPARED"
+                ),
+            },
+            "window_cycle_authority": {
+                "status": "UNAVAILABLE",
+                "authority_id": None,
+                "reason_code": (
+                    "LEGACY_SINGLE_PACKAGE_CANARY_AUTHORITY"
+                ),
+            },
+            "opening_coverage_claimed": False,
+            "accumulation_900_second_coverage_claimed": False,
         },
         "websocket_ingress": {
             "provider": "massive",
@@ -634,6 +792,9 @@ def build_p8_canary_authorization(
             "immutable_history_only": True,
             "detector_ready_required": False,
             "source_manifest_bound_by_live_preflight": True,
+            "required_underlyings": ["QQQ", "SPY"],
+            "required_adjusted_daily_sessions": 31,
+            "required_raw_daily_sessions": 15,
             "required_sessions": [
                 (start.date() - timedelta(days=2)).isoformat(),
                 (start.date() - timedelta(days=1)).isoformat(),
@@ -857,6 +1018,7 @@ def build_p8_canary_authorization(
             "preserve_original_timestamps": True,
             "equity_cleanup_authorized": False,
             "retention_cleanup_authorized": False,
+            "v3_authority_classification_carried": True,
         },
         "authorities": _authority_payload(
             stored_reads_prepared=stored_reads_prepared,
@@ -915,6 +1077,11 @@ def validate_p8_canary_authorization(
     window = package.get("window")
     if not isinstance(window, dict):
         raise ValueError("P8 canary authorization window is unavailable")
+    equity_input = package.get("equity_input_binding")
+    if not isinstance(equity_input, Mapping):
+        raise ValueError(
+            "P8 canary Equity input binding is unavailable"
+        )
     expected = build_p8_canary_authorization(
         qualification_report_path,
         repository_root=repository_root,
@@ -935,6 +1102,30 @@ def validate_p8_canary_authorization(
             window.get("stop_utc"),
             "window.stop_utc",
         ),
+        equity_input_source={
+            "source_cohort_id": equity_input["source_cohort_id"],
+            "source_cohort_sha256": equity_input[
+                "source_cohort_sha256"
+            ],
+            "source_manifest_id": equity_input["source_manifest_id"],
+            "source_manifest_sha256": equity_input[
+                "source_manifest_sha256"
+            ],
+            "source_profile_id": equity_input["source_profile_id"],
+            "source_profile_sha256": equity_input[
+                "source_profile_sha256"
+            ],
+            "equity_window_id": equity_input["equity_window_id"],
+            "equity_receipt_id": equity_input["equity_receipt_id"],
+            "equity_cutoff_utc": equity_input["equity_cutoff"],
+            "reference_generation": equity_input[
+                "reference_generation"
+            ],
+            "universe_sha256": equity_input["universe_sha256"],
+            "input_sha256": equity_input["input_sha256"],
+            "build_id": equity_input["build_id"],
+            "symbols": equity_input["symbols"],
+        },
         expected_qualification_semantic_sha256=(
             expected_qualification_semantic_sha256
         ),
@@ -965,6 +1156,9 @@ def p8_canary_plan(package: Mapping[str, object]) -> dict[str, object]:
         "package_sha256": package["package_sha256"],
         "package_nonce": package["package_nonce"],
         "window": package["window"],
+        "v3_authority_classification": package[
+            "v3_authority_classification"
+        ],
         "prepared_authorities": list(PREPARED_AUTHORITIES),
         "stored_reads_prepared": bool(
             package["stored_reads"]["authority_prepared"]
@@ -1043,6 +1237,9 @@ def p8_canary_status(
         "package_sha256": package["package_sha256"],
         "package_nonce": package["package_nonce"],
         "window": package["window"],
+        "v3_authority_classification": package[
+            "v3_authority_classification"
+        ],
         "automatic_execution_available": False,
         "guarded_one_use_execution_available": True,
         "provider_requests": 0,
@@ -1294,6 +1491,8 @@ def validate_p8_live_observation(
         "selection",
         "advanced_enrollment",
         "history_source",
+        "equity_input_source",
+        "equity_input_readiness",
         "underlying_price_binding",
         "equity_windows",
         "running_peer_owners",
@@ -1341,6 +1540,7 @@ def validate_p8_live_observation(
         "immutable",
         "detector_ready",
         "repaired_sessions",
+        "coverage_requirements",
     }
     history_scope = package["history_binding"]
     if (
@@ -1356,9 +1556,62 @@ def validate_p8_live_observation(
         or history["detector_ready"] is not False
         or history["repaired_sessions"]
         != history_scope["required_sessions"]
+        or history["coverage_requirements"] != {
+            "underlyings": history_scope["required_underlyings"],
+            "adjusted_daily_sessions": history_scope[
+                "required_adjusted_daily_sessions"
+            ],
+            "raw_daily_sessions": history_scope[
+                "required_raw_daily_sessions"
+            ],
+        }
     ):
         raise ValueError(
             "retained Developer history binding changed or became executable"
+        )
+    equity_input = observation["equity_input_source"]
+    expected_equity_input = {
+        key: value
+        for key, value in package["equity_input_binding"].items()
+        if key != "symbols"
+    }
+    if (
+        not isinstance(equity_input, dict)
+        or equity_input != expected_equity_input
+        or _timestamp(
+            equity_input["equity_cutoff"],
+            "equity_input_source.equity_cutoff",
+        ) > checked_at
+        or (
+            checked_at
+            - _timestamp(
+                equity_input["equity_cutoff"],
+                "equity_input_source.equity_cutoff",
+            )
+        ).total_seconds() > equity_input["maximum_age_seconds"]
+    ):
+        raise ValueError(
+            "completed Equity input binding is stale or divergent"
+        )
+    equity_readiness = observation["equity_input_readiness"]
+    if (
+        not isinstance(equity_readiness, dict)
+        or equity_readiness.get("status") != "READY"
+        or equity_readiness.get("history_source_cohort_id")
+        != package["history_binding"]["source_cohort_id"]
+        or equity_readiness.get("equity_source_cohort_id")
+        != equity_input["source_cohort_id"]
+        or equity_readiness.get("equity_cutoff_utc")
+        != equity_input["equity_cutoff"]
+        or set(equity_readiness.get("lane_context", {}))
+        != {"O1", "O3"}
+        or equity_readiness["lane_context"]["O1"].get("status")
+        != "AVAILABLE"
+        or equity_readiness["lane_context"]["O3"].get("status")
+        not in {"AVAILABLE", "BLOCKED"}
+    ):
+        raise ValueError(
+            "P8 Equity dependency readiness is incomplete"
         )
     binding = _selection_binding(
         package,
@@ -1525,6 +1778,7 @@ def validate_p8_live_observation(
         "realized_binding": binding,
         "advanced_enrollment": enrollment,
         "realized_history_binding": history_binding,
+        "realized_equity_input_binding": equity_input,
         "realized_underlying_price_binding": (
             underlying_snapshot_binding_payload(
                 underlying_prices

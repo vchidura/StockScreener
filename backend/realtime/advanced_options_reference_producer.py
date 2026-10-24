@@ -10,6 +10,8 @@ from enum import Enum
 from typing import Callable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from options.calendar import OptionExchangeCalendar
+
 from options.model_inputs import (
     DividendCashFlow,
     RiskFreeRateObservation,
@@ -198,6 +200,7 @@ class AdvancedOptionsReferenceProducerPreflight:
         return tuple(sorted({
             reason
             for row in self.evidence
+            if not _accepted_unavailable_metric(row)
             for reason in row.reason_codes
         }))
 
@@ -493,6 +496,25 @@ def _evidence(
     )
 
 
+def _accepted_unavailable_metric(
+    row: AdvancedOptionsReferenceProducerEvidence,
+) -> bool:
+    accepted = {
+        EquityMetricKind.TOTAL_FLOAT.value: "TOTAL_FLOAT_UNAVAILABLE",
+        EquityMetricKind.SHORT_INTEREST_PERCENT.value: (
+            "SHORT_INTEREST_PERCENT_UNAVAILABLE"
+        ),
+    }
+    metric = row.member_key.rsplit(":", 1)[-1]
+    reason = accepted.get(metric)
+    return (
+        row.member_kind == "EQUITY_METRIC"
+        and row.availability is ReferenceAvailability.UNAVAILABLE
+        and reason is not None
+        and row.reason_codes == (reason,)
+    )
+
+
 def _result(
     plan: AdvancedOptionsReferenceProducerPlan,
     evidence: list[AdvancedOptionsReferenceProducerEvidence],
@@ -507,6 +529,7 @@ def _result(
         if state is not None
         and all(
             row.availability is ReferenceAvailability.AVAILABLE
+            or _accepted_unavailable_metric(row)
             for row in ordered
         )
         else ReferenceProducerStatus.BLOCKED
@@ -959,6 +982,10 @@ def _load_bars_and_metrics(
     volatility = []
     metrics = []
     missing = False
+    required_sessions = OptionExchangeCalendar().trailing_sessions_before(
+        plan.control_plane.session_date,
+        31,
+    )
     for ticker in plan.control_plane.universe.option_underlyings:
         security_id = spots[ticker][1]
         cursor.execute(
@@ -994,6 +1021,8 @@ def _load_bars_and_metrics(
         if (
             len(rows) != 31
             or len({row["session_date"] for row in rows}) != 31
+            or tuple(row["session_date"] for row in rows)
+            != required_sessions
         ):
             missing = True
             evidence.append(_evidence(
@@ -1110,12 +1139,21 @@ def _load_bars_and_metrics(
             row for row in security_rows if row["free_float"] is not None
         )
         if not float_rows:
-            missing = True
+            metric = AdvancedOptionsEquityMetric(
+                security_id=security_id,
+                ticker=ticker,
+                metric_kind=EquityMetricKind.TOTAL_FLOAT,
+                as_of_session=adv_sessions[-1],
+                availability=ReferenceAvailability.UNAVAILABLE,
+                known_at=plan.known_at,
+                reason_codes=("TOTAL_FLOAT_UNAVAILABLE",),
+            )
+            metrics.append(metric)
             evidence.append(_evidence(
                 "EQUITY_METRIC",
                 f"{ticker}:{EquityMetricKind.TOTAL_FLOAT.value}",
                 ReferenceAvailability.UNAVAILABLE,
-                tuple(tuple(row.values()) for row in security_rows),
+                metric,
                 known_at=plan.known_at,
                 valid_until=plan.valid_until,
                 reason_codes=("TOTAL_FLOAT_UNAVAILABLE",),
@@ -1158,12 +1196,21 @@ def _load_bars_and_metrics(
         )
         report_rows = tuple(cursor.fetchall())
         if not report_rows:
-            missing = True
+            metric = AdvancedOptionsEquityMetric(
+                security_id=security_id,
+                ticker=ticker,
+                metric_kind=EquityMetricKind.SHORT_INTEREST_PERCENT,
+                as_of_session=adv_sessions[-1],
+                availability=ReferenceAvailability.UNAVAILABLE,
+                known_at=plan.known_at,
+                reason_codes=("SHORT_INTEREST_PERCENT_UNAVAILABLE",),
+            )
+            metrics.append(metric)
             evidence.append(_evidence(
                 "EQUITY_METRIC",
                 f"{ticker}:{EquityMetricKind.SHORT_INTEREST_PERCENT.value}",
                 ReferenceAvailability.UNAVAILABLE,
-                (),
+                metric,
                 known_at=plan.known_at,
                 valid_until=plan.valid_until,
                 reason_codes=("SHORT_INTEREST_PERCENT_UNAVAILABLE",),

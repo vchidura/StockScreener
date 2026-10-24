@@ -696,8 +696,8 @@ def _input_ready_plan_identity(
         "equity_input_build_id": (
             native_input_plan.equity_input_receipt.build_id
         ),
-        "stock_detector_sha256s": (
-            native_input_plan.stock_detector_sha256s
+        "equity_context_requirements": (
+            native_input_plan.equity_context_requirements
         ),
         "service_plan_id": service_plan_id,
         "window_id": window_id,

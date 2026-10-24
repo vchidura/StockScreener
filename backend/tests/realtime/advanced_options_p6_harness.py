@@ -124,8 +124,6 @@ def _control_plane():
         maximum_option_quote_contracts=3,
         reserved_option_quote_contracts=1,
         required_detectors=(
-            DetectorFamily.S1,
-            DetectorFamily.S2,
             DetectorFamily.O1,
             DetectorFamily.O2,
             DetectorFamily.O3,

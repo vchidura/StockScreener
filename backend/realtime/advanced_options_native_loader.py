@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Callable, Mapping
@@ -14,18 +14,19 @@ from options.dual_origin import ActivitySource
 from psycopg2 import Error as PsycopgError
 from psycopg2.extras import RealDictCursor
 
-from .advanced_equity_s1_s2_shadow import (
-    advanced_equity_bar_revision_from_row,
-)
 from .advanced_options_control_plane import (
     AdvancedOptionsEnrollmentPlan,
     advanced_options_enrollment_plan_payload,
+)
+from .advanced_options_equity_input import (
+    AdvancedOptionsEquityContextRequirement,
+    advanced_options_equity_context_requirements_payload,
+    load_advanced_options_equity_context_cursor,
 )
 from .advanced_options_native_adapters import (
     AdvancedO1Invocation,
     AdvancedOptionsLaneInputs,
     AdvancedOptionsNativeInputBundle,
-    AdvancedStockInvocation,
     advanced_o3_invocation_document,
     decode_advanced_o3_invocation_document,
 )
@@ -41,12 +42,8 @@ from .orchestration_repository import CycleReceiptSpec
 from .preflight import DetectorFamily
 
 
-NATIVE_INPUT_PLAN_VERSION = "advanced-options-native-input-plan-v1"
+NATIVE_INPUT_PLAN_VERSION = "advanced-options-native-input-plan-v2"
 _RETRYABLE_POSTGRES_SQLSTATES = frozenset({"40001", "40P01"})
-_STOCK_DETECTORS = {
-    DetectorFamily.S1: "ADVANCED_EQUITY_S1",
-    DetectorFamily.S2: "ADVANCED_EQUITY_S2",
-}
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -119,9 +116,13 @@ class AdvancedOptionsNativeInputPlan:
     equity_input_receipt_id: UUID
     equity_input_receipt: CycleReceiptSpec
     equity_window_id: UUID
+    maximum_equity_input_age_seconds: int
     loader_build_id: str
-    stock_detector_sha256s: tuple[tuple[str, str], ...]
-    history_source_cohort_id: UUID | None = None
+    history_source_cohort_id: UUID
+    equity_context_requirements: tuple[
+        AdvancedOptionsEquityContextRequirement,
+        ...,
+    ]
     expected_input_sha256: str | None = None
     provider_calls_authorized: bool = False
     runtime_actions_authorized: bool = False
@@ -193,9 +194,13 @@ def _plan_identity(
     equity_input_receipt_id: UUID,
     equity_input_receipt: CycleReceiptSpec,
     equity_window_id: UUID,
+    maximum_equity_input_age_seconds: int,
     loader_build_id: str,
-    stock_detector_sha256s: tuple[tuple[str, str], ...],
-    history_source_cohort_id: UUID | None,
+    history_source_cohort_id: UUID,
+    equity_context_requirements: tuple[
+        AdvancedOptionsEquityContextRequirement,
+        ...,
+    ],
     expected_input_sha256: str | None,
 ) -> dict[str, object]:
     control = enrollment.control_plane
@@ -225,17 +230,21 @@ def _plan_identity(
         "source_flow_sha256": source_flow.source_flow_sha256,
         "journal_generation": source_flow.journal_generation,
         "cutoff": cutoff,
-        "equity_cohort_id": (
-            history_source_cohort_id
-            or enrollment.equity_plan.cohort_id
-        ),
+        "equity_cohort_id": enrollment.equity_plan.cohort_id,
         "history_source_cohort_id": history_source_cohort_id,
         "equity_manifest_id": enrollment.equity_plan.manifest_id,
         "equity_input_receipt_id": equity_input_receipt_id,
         "equity_input_receipt": equity_input_receipt,
         "equity_window_id": equity_window_id,
+        "maximum_equity_input_age_seconds": (
+            maximum_equity_input_age_seconds
+        ),
         "loader_build_id": loader_build_id,
-        "stock_detector_sha256s": stock_detector_sha256s,
+        "equity_context_policy": (
+            advanced_options_equity_context_requirements_payload(
+                equity_context_requirements
+            )
+        ),
         "expected_input_sha256": expected_input_sha256,
         "provider_calls_authorized": False,
         "runtime_actions_authorized": False,
@@ -248,7 +257,9 @@ def _validate_plan(plan: AdvancedOptionsNativeInputPlan) -> dict[str, object]:
     advanced_options_enrollment_plan_payload(plan.enrollment)
     control = plan.control_plane
     cutoff = _utc(plan.cutoff, "cutoff")
-    detectors = tuple(sorted(plan.stock_detector_sha256s))
+    advanced_options_equity_context_requirements_payload(
+        plan.equity_context_requirements
+    )
     binding = plan.rolling_state.producer_binding
     if (
         plan.producer_plan.control_plane_plan_id != control.plan_id
@@ -281,24 +292,24 @@ def _validate_plan(plan: AdvancedOptionsNativeInputPlan) -> dict[str, object]:
         not isinstance(plan.equity_input_receipt_id, UUID)
         or not isinstance(plan.equity_window_id, UUID)
         or plan.equity_input_receipt.receipt_kind != "INPUT_READY"
-        or plan.equity_input_receipt.cutoff != cutoff
+        or plan.equity_input_receipt.cutoff.date() != cutoff.date()
+        or plan.equity_input_receipt.cutoff > cutoff
         or plan.equity_input_receipt.advance_release
-        or not plan.loader_build_id.strip()
-        or tuple(name for name, _ in detectors) != ("S1", "S2")
+        or type(plan.maximum_equity_input_age_seconds) is not int
+        or plan.maximum_equity_input_age_seconds <= 0
         or (
-            plan.history_source_cohort_id is not None
-            and (
-                not isinstance(plan.history_source_cohort_id, UUID)
-                or plan.history_source_cohort_id.int == 0
-                or plan.history_source_cohort_id == control.cohort_id
-            )
-        )
+            cutoff - plan.equity_input_receipt.cutoff
+        ).total_seconds() > plan.maximum_equity_input_age_seconds
+        or not plan.loader_build_id.strip()
+        or not isinstance(plan.history_source_cohort_id, UUID)
+        or plan.history_source_cohort_id.int == 0
+        or plan.history_source_cohort_id == control.cohort_id
+        or plan.history_source_cohort_id
+        == plan.enrollment.equity_plan.cohort_id
         or plan.provider_calls_authorized
         or plan.runtime_actions_authorized
     ):
         raise ValueError("native input receipt, build or authority changed")
-    for _, digest in detectors:
-        _sha256(digest, "stock_detector_sha256")
     expected = (
         None
         if plan.expected_input_sha256 is None
@@ -314,9 +325,12 @@ def _validate_plan(plan: AdvancedOptionsNativeInputPlan) -> dict[str, object]:
         equity_input_receipt_id=plan.equity_input_receipt_id,
         equity_input_receipt=plan.equity_input_receipt,
         equity_window_id=plan.equity_window_id,
+        maximum_equity_input_age_seconds=(
+            plan.maximum_equity_input_age_seconds
+        ),
         loader_build_id=plan.loader_build_id.strip(),
-        stock_detector_sha256s=detectors,
         history_source_cohort_id=plan.history_source_cohort_id,
+        equity_context_requirements=plan.equity_context_requirements,
         expected_input_sha256=expected,
     )
     digest = canonical_sha256(identity)
@@ -341,12 +355,15 @@ def build_advanced_options_native_input_plan(
     equity_input_receipt: CycleReceiptSpec,
     equity_window_id: UUID,
     loader_build_id: str,
-    stock_detector_sha256s: tuple[tuple[str, str], ...],
-    history_source_cohort_id: UUID | None = None,
+    history_source_cohort_id: UUID,
+    maximum_equity_input_age_seconds: int,
+    equity_context_requirements: tuple[
+        AdvancedOptionsEquityContextRequirement,
+        ...,
+    ],
     expected_input_sha256: str | None = None,
 ) -> AdvancedOptionsNativeInputPlan:
     normalized_cutoff = _utc(cutoff, "cutoff")
-    detectors = tuple(sorted(stock_detector_sha256s))
     identity = _plan_identity(
         enrollment=enrollment,
         producer_plan=producer_plan,
@@ -357,9 +374,12 @@ def build_advanced_options_native_input_plan(
         equity_input_receipt_id=equity_input_receipt_id,
         equity_input_receipt=equity_input_receipt,
         equity_window_id=equity_window_id,
+        maximum_equity_input_age_seconds=(
+            maximum_equity_input_age_seconds
+        ),
         loader_build_id=loader_build_id.strip(),
-        stock_detector_sha256s=detectors,
         history_source_cohort_id=history_source_cohort_id,
+        equity_context_requirements=equity_context_requirements,
         expected_input_sha256=expected_input_sha256,
     )
     digest = canonical_sha256(identity)
@@ -378,9 +398,12 @@ def build_advanced_options_native_input_plan(
         equity_input_receipt_id=equity_input_receipt_id,
         equity_input_receipt=equity_input_receipt,
         equity_window_id=equity_window_id,
+        maximum_equity_input_age_seconds=(
+            maximum_equity_input_age_seconds
+        ),
         loader_build_id=loader_build_id.strip(),
-        stock_detector_sha256s=detectors,
         history_source_cohort_id=history_source_cohort_id,
+        equity_context_requirements=equity_context_requirements,
         expected_input_sha256=expected_input_sha256,
     )
     _validate_plan(plan)
@@ -416,9 +439,12 @@ def freeze_advanced_options_native_input_plan(
         equity_input_receipt_id=plan.equity_input_receipt_id,
         equity_input_receipt=plan.equity_input_receipt,
         equity_window_id=plan.equity_window_id,
+        maximum_equity_input_age_seconds=(
+            plan.maximum_equity_input_age_seconds
+        ),
         loader_build_id=plan.loader_build_id,
-        stock_detector_sha256s=plan.stock_detector_sha256s,
         history_source_cohort_id=plan.history_source_cohort_id,
+        equity_context_requirements=plan.equity_context_requirements,
         expected_input_sha256=preflight.input_sha256,
     )
 
@@ -573,10 +599,7 @@ def _verify_scope(
     receipt = cursor.fetchone()
     expected_receipt = (
         str(plan.equity_window_id),
-        str(
-            plan.history_source_cohort_id
-            or plan.enrollment.equity_plan.cohort_id
-        ),
+        str(plan.enrollment.equity_plan.cohort_id),
         plan.equity_input_receipt.receipt_kind,
         plan.equity_input_receipt.cutoff,
         plan.equity_input_receipt.reference_generation,
@@ -857,231 +880,48 @@ def _load_o3(
     return AdvancedOptionsLaneInputs(invocations), identity, False
 
 
-def _stock_bar_columns() -> str:
-    return (
-        "revision.bar_revision_id,revision.security_id,revision.ticker,"
-        "revision.interval,revision.session_date,revision.bar_start,"
-        "revision.bar_end,revision.open_price,revision.high_price,"
-        "revision.low_price,revision.close_price,revision.volume,"
-        "revision.vwap,revision.transaction_count,revision.source_kind,"
-        "revision.availability_mode,revision.is_final,revision.observed_at,"
-        "revision.replay_available_at,revision.adjustment_basis,"
-        "revision.payload_sha256,revision.quality_codes,"
-        "revision.provider_published_at,revision.ingestion_segment_id,"
-        "revision.source_revision_ids,revision.supersedes_revision_id,"
-        "revision.session_scope,revision.created_at "
-    )
-
-
-def _stock_bars(cursor, plan, security_id: UUID):
-    columns = _stock_bar_columns()
-    cursor.execute(
-        "SELECT " + columns
-        + "FROM rt.bar_current AS current "
-        "JOIN rt.bar_revisions AS revision "
-        "ON revision.bar_revision_id=current.bar_revision_id "
-        "AND revision.observed_at=current.observed_at "
-        "AND revision.cohort_id=current.cohort_id "
-        "AND revision.provider_tier=current.provider_tier "
-        "AND revision.instrument_id=current.instrument_id "
-        "AND revision.interval=current.interval "
-        "AND revision.bar_start=current.bar_start "
-        "AND revision.session_scope=current.session_scope "
-        "AND revision.adjustment_basis=current.adjustment_basis "
-        "WHERE revision.cohort_id=%s AND revision.security_id=%s "
-        "AND revision.interval='1d' AND revision.is_final "
-        "AND revision.availability_mode='LIVE_OBSERVED' "
-        "AND revision.adjustment_basis='RAW_UNADJUSTED' "
-        "AND revision.session_scope='RTH' "
-        "AND revision.session_date<%s "
-        "ORDER BY revision.bar_end DESC LIMIT 15",
-        (
-            str(
-                plan.history_source_cohort_id
-                or plan.enrollment.equity_plan.cohort_id
-            ),
-            str(security_id),
-            plan.cutoff.date(),
-        ),
-    )
-    daily = tuple(reversed(tuple(
-        advanced_equity_bar_revision_from_row(row)
-        for row in cursor.fetchall()
-    )))
-    cursor.execute(
-        "SELECT " + columns
-        + "FROM rt.bar_current AS current "
-        "JOIN rt.bar_revisions AS revision "
-        "ON revision.bar_revision_id=current.bar_revision_id "
-        "AND revision.observed_at=current.observed_at "
-        "AND revision.cohort_id=current.cohort_id "
-        "AND revision.provider_tier=current.provider_tier "
-        "AND revision.instrument_id=current.instrument_id "
-        "AND revision.interval=current.interval "
-        "AND revision.bar_start=current.bar_start "
-        "AND revision.session_scope=current.session_scope "
-        "AND revision.adjustment_basis=current.adjustment_basis "
-        "WHERE revision.cohort_id=%s AND revision.security_id=%s "
-        "AND revision.interval='5m' AND revision.is_final "
-        "AND revision.availability_mode='LIVE_OBSERVED' "
-        "AND revision.adjustment_basis='RAW_UNADJUSTED' "
-        "AND revision.session_scope='RTH' "
-        "AND revision.session_date=%s AND revision.bar_end<=%s "
-        "ORDER BY revision.bar_end DESC LIMIT 3",
-        (
-            str(
-                plan.history_source_cohort_id
-                or plan.enrollment.equity_plan.cohort_id
-            ),
-            str(security_id),
-            plan.cutoff.date(),
-            plan.cutoff,
-        ),
-    )
-    intraday = tuple(reversed(tuple(
-        advanced_equity_bar_revision_from_row(row)
-        for row in cursor.fetchall()
-    )))
-    return (*daily, *intraday)
-
-
-def _load_stock_lane(
+def _load_equity_context(
     cursor,
     plan: AdvancedOptionsNativeInputPlan,
-    detector: DetectorFamily,
     evidence: list[AdvancedOptionsNativeInputEvidence],
-) -> tuple[AdvancedOptionsLaneInputs, object]:
-    detector_id = _STOCK_DETECTORS[detector]
-    expected_sha256 = dict(plan.stock_detector_sha256s)[detector.value]
-    cursor.execute(
-        "SELECT event.event_id::text,event.instrument_id,event.trigger_at,"
-        "event.decision_at,event.disposition,event.payload,"
-        "version.detector_sha256,instrument.security_id::text,"
-        "revision.ticker "
-        "FROM rt.detector_events AS event "
-        "JOIN rt.detector_versions AS version "
-        "ON version.detector_sha256=event.detector_sha256 "
-        "JOIN rt.instruments AS instrument "
-        "ON instrument.instrument_id=event.instrument_id "
-        "JOIN LATERAL (SELECT ticker FROM ref.security_revisions "
-        "WHERE security_id=instrument.security_id "
-        "AND effective_from<=%s ORDER BY effective_from DESC,"
-        "observed_at DESC LIMIT 1) AS revision ON TRUE "
-        "WHERE event.cohort_id=%s AND version.detector_id=%s "
-        "AND event.trigger_at=%s "
-        "ORDER BY revision.ticker,event.event_id",
-        (
-            plan.cutoff,
-            str(
-                plan.history_source_cohort_id
-                or plan.enrollment.equity_plan.cohort_id
-            ),
-            detector_id,
-            plan.cutoff,
-        ),
+) -> tuple[dict[DetectorFamily, tuple[str, ...]], object]:
+    contexts = load_advanced_options_equity_context_cursor(
+        cursor,
+        equity_plan=plan.enrollment.equity_plan,
+        history_source_cohort_id=plan.history_source_cohort_id,
+        equity_cutoff=plan.equity_input_receipt.cutoff,
+        requirements=plan.equity_context_requirements,
+        underlyings=plan.control_plane.universe.option_underlyings,
     )
-    rows = tuple(cursor.fetchall())
-    underlyings = plan.control_plane.universe.option_underlyings
-    grouped: dict[str, list[Mapping[str, object]]] = {}
-    for row in rows:
-        grouped.setdefault(str(row["ticker"]), []).append(row)
-    if set(grouped) != set(underlyings) or any(
-        len(values) != 1 for values in grouped.values()
-    ):
-        reasons = (f"{detector.value}_DECISION_SCOPE_INCOMPLETE",)
-        evidence.append(_evidence(
-            detector.value,
-            "DECISIONS",
-            tuple(tuple(row.values()) for row in rows),
-            reasons=reasons,
-        ))
-        return AdvancedOptionsLaneInputs(
-            blocked_reason_codes=reasons,
-        ), {"blocked_reason_codes": reasons}
-    invocations = []
+    reasons_by_lane = {}
     identities = []
-    session_close = OptionExchangeCalendar().session_close(
-        plan.cutoff.date()
-    )
-    for underlyer in underlyings:
-        row = grouped[underlyer][0]
-        if (
-            str(row["detector_sha256"]) != expected_sha256
-            or row["decision_at"] > plan.cutoff
-            or str(row["disposition"]) not in {"DETECTED", "COMPLETE_ZERO"}
-        ):
-            raise ValueError("native stock decision identity changed")
-        security_id = UUID(str(row["security_id"]))
-        bars = _stock_bars(cursor, plan, security_id)
-        needed = 2 if detector is DetectorFamily.S1 else 3
-        daily = tuple(item for item in bars if item[0].interval == "1d")
-        intraday = tuple(item for item in bars if item[0].interval == "5m")
-        if len(daily) != 15 or len(intraday) < needed:
-            reasons = (f"{detector.value}_FINALIZED_WINDOW_INCOMPLETE",)
-            evidence.append(_evidence(
-                detector.value,
-                underlyer,
-                tuple(
-                    (item[0].bar_revision_id, item[0].payload_sha256)
-                    for item in bars
-                ),
-                reasons=reasons,
-            ))
-            return AdvancedOptionsLaneInputs(
-                blocked_reason_codes=reasons,
-            ), {"blocked_reason_codes": reasons}
-        cursor.execute(
-            "SELECT bar_revision_id::text FROM rt.detector_event_inputs "
-            "WHERE event_id=%s AND source_kind='BAR_REVISION' "
-            "ORDER BY input_role,input_key",
-            (str(row["event_id"]),),
-        )
-        retained_ids = {
-            UUID(str(item["bar_revision_id"]))
-            for item in cursor.fetchall()
+    for context in contexts:
+        reasons_by_lane[context.lane] = context.reason_codes
+        identity = {
+            "lane": context.lane.value,
+            "policy_version": context.policy_version,
+            "requirements_sha256": context.requirements_sha256,
+            "membership_sha256": context.membership_sha256,
+            "members": tuple(
+                (
+                    row.ticker,
+                    str(row.source_cohort_id),
+                    str(row.bar_revision_id),
+                    row.bar_end,
+                    row.observed_at,
+                    row.payload_sha256,
+                )
+                for row in context.members
+            ),
         }
-        bar_ids = {item[0].bar_revision_id for item in bars}
-        if retained_ids != bar_ids:
-            raise ValueError("native stock decision bar membership changed")
-        packages = {}
-        if str(row["disposition"]) == "DETECTED":
-            signal_id = UUID(str(row["payload"]["signal_id"]))
-            packages = _packages_for_events(
-                cursor,
-                cohort_id=plan.control_plane.cohort_id,
-                event_ids=(signal_id,),
-            )
-            if signal_id not in packages:
-                raise ValueError("native stock decision package mapping absent")
-            invocations.append(AdvancedStockInvocation(
-                detector=detector,
-                security_id=security_id,
-                underlyer=underlyer,
-                bars=bars,
-                market_cutoff=plan.cutoff,
-                decision_at=row["decision_at"],
-                session_close=session_close,
-                packages=packages,
-            ))
-        identities.append((
-            str(row["event_id"]),
-            str(row["detector_sha256"]),
-            str(row["disposition"]),
-            tuple(
-                (str(item[0].bar_revision_id), item[0].payload_sha256)
-                for item in bars
-            ),
-            tuple(
-                (str(key), str(value.candidate_id))
-                for key, value in sorted(packages.items(), key=lambda item: str(item[0]))
-            ),
+        identities.append(identity)
+        evidence.append(_evidence(
+            "EQUITY_CONTEXT",
+            context.lane.value,
+            identity,
+            reasons=context.reason_codes,
         ))
-    evidence.append(_evidence(
-        detector.value,
-        "DECISIONS",
-        tuple(identities),
-    ))
-    return AdvancedOptionsLaneInputs(tuple(invocations)), tuple(identities)
+    return reasons_by_lane, tuple(identities)
 
 
 def assemble_advanced_options_native_inputs_cursor(
@@ -1091,24 +931,26 @@ def assemble_advanced_options_native_inputs_cursor(
     _validate_plan(plan)
     evidence: list[AdvancedOptionsNativeInputEvidence] = []
     _verify_scope(cursor, plan, evidence)
+    equity_context, equity_context_identity = _load_equity_context(
+        cursor,
+        plan,
+        evidence,
+    )
     o1, o1_identity = _load_o1(cursor, plan, evidence)
     o3, o3_identity, o3_accepted_unavailable = _load_o3(
         cursor,
         plan,
         evidence,
     )
-    s1, s1_identity = _load_stock_lane(
-        cursor,
-        plan,
-        DetectorFamily.S1,
-        evidence,
-    )
-    s2, s2_identity = _load_stock_lane(
-        cursor,
-        plan,
-        DetectorFamily.S2,
-        evidence,
-    )
+    o3_context_reasons = equity_context.get(DetectorFamily.O3, ())
+    if o3_context_reasons:
+        o3 = AdvancedOptionsLaneInputs(
+            invocations=o3.invocations,
+            blocked_reason_codes=tuple(sorted({
+                *o3.blocked_reason_codes,
+                *o3_context_reasons,
+            })),
+        )
     input_identity = {
         "contract": NATIVE_INPUT_PLAN_VERSION,
         "scope": {
@@ -1123,8 +965,7 @@ def assemble_advanced_options_native_inputs_cursor(
         },
         "O1": o1_identity,
         "O3": o3_identity,
-        "S1": s1_identity,
-        "S2": s2_identity,
+        "equity_context": equity_context_identity,
         "O2": {"state": "UNAVAILABLE", "reason": "O2_MODEL_NOT_ACCEPTED"},
     }
     input_sha256 = canonical_sha256(input_identity)
@@ -1136,16 +977,12 @@ def assemble_advanced_options_native_inputs_cursor(
         for detector, lane in (
             (DetectorFamily.O1, o1),
             (DetectorFamily.O3, o3),
-            (DetectorFamily.S1, s1),
-            (DetectorFamily.S2, s2),
         )
     }
     membership_sha256 = canonical_sha256(membership)
     bundle = AdvancedOptionsNativeInputBundle(
         o1=o1,
         o3=o3,
-        s1=s1,
-        s2=s2,
         plan_id=plan.plan_id,
         input_sha256=input_sha256,
         executor_membership_sha256=membership_sha256,
@@ -1153,12 +990,9 @@ def assemble_advanced_options_native_inputs_cursor(
     blocking = tuple(
         row
         for row in evidence
-        if not row.available
+        if not row.available and row.member_kind != "EQUITY_CONTEXT"
     )
-    if o3_accepted_unavailable and not any(
-        row.member_kind in {"S1", "S2"} and not row.available
-        for row in evidence
-    ):
+    if o3_accepted_unavailable:
         blocking = tuple(
             row for row in blocking if row.member_kind != "O3"
         )

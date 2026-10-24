@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -18,6 +19,10 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from realtime.contracts import canonical_sha256  # noqa: E402
+from realtime.advanced_equity_publication_authority import (  # noqa: E402
+    advanced_equity_publication_authority_from_payload,
+    validate_advanced_equity_publication_authority,
+)
 from realtime.database_access_v2 import (  # noqa: E402
     APP_ROLE,
     V2AccessConfig,
@@ -37,6 +42,10 @@ from realtime.orchestration_repository import (  # noqa: E402
     PostgresOrchestrationRepository,
     WindowSpec,
 )
+from realtime.portal_projection_repository import (  # noqa: E402
+    load_portal_release_pointer_cursor,
+)
+from realtime.preflight import ProviderTier  # noqa: E402
 from realtime.advanced_scheduler import (  # noqa: E402
     ADVANCED_WINDOW_BUILD_ID,
     discover_advanced_window_recovery_cursor,
@@ -82,6 +91,9 @@ def parse_args(argv=None):
     parser.add_argument("--include-strategies", action="store_true")
     parser.add_argument("--publish", action="store_true")
     parser.add_argument("--publication-reference", default="")
+    parser.add_argument("--publication-authority", type=Path)
+    parser.add_argument("--publication-authority-semantic-sha256")
+    parser.add_argument("--publication-authority-file-sha256")
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -120,12 +132,30 @@ def parse_args(argv=None):
         parser.error("--publish requires --publication-reference")
     if not args.publish and args.publication_reference.strip():
         parser.error("--publication-reference requires --publish")
+    publication_values = (
+        args.publication_authority,
+        args.publication_authority_semantic_sha256,
+        args.publication_authority_file_sha256,
+    )
+    if args.publish and any(value is None for value in publication_values):
+        parser.error("--publish requires the exact publication authority")
+    if not args.publish and any(
+        value is not None for value in publication_values
+    ):
+        parser.error("publication authority requires --publish")
     if args.reuse_portal_receipt and not args.reuse_input_receipt:
         parser.error("PORTAL_READY reuse requires INPUT_READY reuse")
-    if args.include_alerts or args.include_strategies or args.publish:
+    if args.include_alerts or args.include_strategies:
         parser.error(
-            "Advanced alerts, strategies and publication remain disabled "
-            "until P11"
+            "Advanced alerts and strategies remain disabled"
+        )
+    if args.publish and (
+        not args.retry_release_now
+        or not args.reuse_input_receipt
+        or not args.reuse_portal_receipt
+    ):
+        parser.error(
+            "P11 publication requires an explicit durable receipt retry"
         )
     stages = list(BASE_STAGES)
     if args.include_alerts:
@@ -136,11 +166,79 @@ def parse_args(argv=None):
         stages.append("PORTAL_PUBLISH")
     args.enabled_stages = tuple(stages)
     args.report_path = args.report_path.resolve()
+    if args.publication_authority is not None:
+        args.publication_authority = (
+            args.publication_authority.resolve()
+        )
+        if not args.publication_authority.is_file():
+            parser.error("--publication-authority must exist")
+        for name in (
+            "publication_authority_semantic_sha256",
+            "publication_authority_file_sha256",
+        ):
+            value = getattr(args, name)
+            if len(value) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in value
+            ):
+                parser.error(
+                    f"--{name.replace('_', '-')} must be a SHA-256"
+                )
     if args.report_path.exists():
         parser.error("--report-path must be new")
     if not args.execute:
         parser.error("Advanced windows mutate V2 state and require --execute")
     return args
+
+
+def _load_publication_authority(
+    args,
+    *,
+    recovery,
+    prior_pointer,
+    checked_at,
+):
+    body = args.publication_authority.read_bytes()
+    document = json.loads(body)
+    unsigned = dict(document)
+    semantic_sha256 = unsigned.pop("semantic_sha256", None)
+    if (
+        hashlib.sha256(body).hexdigest()
+        != args.publication_authority_file_sha256
+        or semantic_sha256
+        != args.publication_authority_semantic_sha256
+        or canonical_sha256(unsigned) != semantic_sha256
+        or document.get("contract")
+        != "advanced-equity-p11-publication-authority-document-v1"
+    ):
+        raise ValueError("P11 publication authority identity changed")
+    authority = advanced_equity_publication_authority_from_payload(
+        document.get("authority")
+    )
+    if (
+        authority.authorization_reference
+        != args.publication_reference
+    ):
+        raise ValueError("P11 publication reference changed")
+    validate_advanced_equity_publication_authority(
+        authority,
+        cohort_id=args.cohort_id,
+        session_date=args.session_date,
+        cutoff=args.cutoff,
+        window_key_suffix=args.window_key_suffix,
+        input_receipt=recovery.input_receipt,
+        portal_receipt=recovery.portal_receipt,
+        prior_release_id=(
+            None
+            if prior_pointer is None
+            else prior_pointer.release_id
+        ),
+        prior_cutoff=(
+            None if prior_pointer is None else prior_pointer.cutoff
+        ),
+        checked_at=checked_at,
+    )
+    return authority
 
 
 def _provider(config):
@@ -230,8 +328,9 @@ def main(argv=None) -> int:
     provider, pool = _provider(config)
     try:
         repository = PostgresOrchestrationRepository(provider)
-        _ensure_reference_readiness(provider, repository, args)
         recovery = None
+        prior_pointer = None
+        publication_authority = None
         if args.reuse_input_receipt or args.reuse_portal_receipt:
             with provider.transaction(APP_ROLE, read_only=True) as unit:
                 recovery = discover_advanced_window_recovery_cursor(
@@ -240,6 +339,12 @@ def main(argv=None) -> int:
                     cutoff=args.cutoff,
                     checked_at=datetime.now(timezone.utc),
                 )
+                if args.publish:
+                    prior_pointer = load_portal_release_pointer_cursor(
+                        unit.cursor,
+                        cohort_id=args.cohort_id,
+                        provider_tier=ProviderTier.MASSIVE_ADVANCED,
+                    )
             if (
                 args.reuse_input_receipt
                 and recovery.input_receipt is None
@@ -254,6 +359,14 @@ def main(argv=None) -> int:
                 raise ValueError(
                     "durable PORTAL_READY receipt is unavailable"
                 )
+            if args.publish:
+                publication_authority = _load_publication_authority(
+                    args,
+                    recovery=recovery,
+                    prior_pointer=prior_pointer,
+                    checked_at=datetime.now(timezone.utc),
+                )
+        _ensure_reference_readiness(provider, repository, args)
         release_at = (
             datetime.now(timezone.utc)
             if args.retry_release_now
@@ -277,6 +390,11 @@ def main(argv=None) -> int:
                 "retry_release_now": args.retry_release_now,
                 "enabled_stages": args.enabled_stages,
                 "publication": args.publish,
+                "publication_authority_sha256": (
+                    None
+                    if publication_authority is None
+                    else publication_authority.authority_sha256
+                ),
                 "scope_reference": scope_reference,
             }
         )
@@ -347,12 +465,35 @@ def main(argv=None) -> int:
                 raise ValueError(
                     "durable INPUT_READY recovery scope is unavailable"
                 )
-            runners["EQUITY_MATERIALIZE"] = reuse_advanced_input_ready_runner(
-                environment,
-                receipt=input_receipt,
-                input_known_by=recovery.input_known_by,
-                expected_gate_sha256=recovery.input_gate_sha256,
+            runners["EQUITY_INPUT_GATE"] = (
+                lambda _context: StageOutcome.complete(
+                    evidence_ref=(
+                        "reused-input-gate:"
+                        f"{recovery.input_gate_sha256}"
+                    ),
+                )
             )
+            if args.publish:
+                runners["EQUITY_MATERIALIZE"] = (
+                    lambda _context: StageOutcome.complete(
+                        receipt=input_receipt,
+                        evidence_ref=(
+                            "publication-authorized-input-ready:"
+                            f"{input_receipt.input_sha256}"
+                        ),
+                    )
+                )
+            else:
+                runners["EQUITY_MATERIALIZE"] = (
+                    reuse_advanced_input_ready_runner(
+                        environment,
+                        receipt=input_receipt,
+                        input_known_by=recovery.input_known_by,
+                        expected_gate_sha256=(
+                            recovery.input_gate_sha256
+                        ),
+                    )
+                )
         if args.reuse_portal_receipt:
             portal_receipt = recovery.portal_receipt
             runners["EQUITY_PROJECTION"] = (
@@ -374,6 +515,36 @@ def main(argv=None) -> int:
         )
         orchestrator.start(plan_id)
         report = orchestrator.run_window(window.window_id)
+        pointer = None
+        pointer_advanced = False
+        if args.publish:
+            with provider.transaction(APP_ROLE, read_only=True) as unit:
+                pointer = load_portal_release_pointer_cursor(
+                    unit.cursor,
+                    cohort_id=args.cohort_id,
+                    provider_tier=ProviderTier.MASSIVE_ADVANCED,
+                )
+            pointer_advanced = (
+                pointer is not None
+                and (
+                    prior_pointer is None
+                    or pointer.release_id != prior_pointer.release_id
+                )
+            )
+            if (
+                report.window_state == "COMPLETE"
+                and not pointer_advanced
+            ):
+                raise RuntimeError(
+                    "P11 publication did not advance one cohort-local pointer"
+                )
+            if (
+                report.window_state != "COMPLETE"
+                and pointer_advanced
+            ):
+                raise RuntimeError(
+                    "P11 failed publication advanced the pointer"
+                )
         result = {
             "status": report.status,
             "window_state": report.window_state,
@@ -388,6 +559,20 @@ def main(argv=None) -> int:
                 else "PROJECTION_ONLY"
             ),
             "publication_advanced": args.publish,
+            "publication_authority_id": (
+                None
+                if publication_authority is None
+                else str(publication_authority.authority_id)
+            ),
+            "prior_release_id": (
+                None
+                if prior_pointer is None
+                else str(prior_pointer.release_id)
+            ),
+            "current_release_id": (
+                None if pointer is None else str(pointer.release_id)
+            ),
+            "pointer_advances": 1 if pointer_advanced else 0,
             "provider_requests": 0,
             "credentials_exposed": False,
             "executed": report.executed,

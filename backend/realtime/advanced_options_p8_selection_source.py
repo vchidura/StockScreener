@@ -95,6 +95,213 @@ class P8ActivitySelectionCapture:
         )
 
 
+def _candidate_from_snapshot(
+    row: Mapping[str, object],
+    *,
+    session_date: date,
+) -> P7TransportCandidate | None:
+    details = row.get("details")
+    quote_row = row.get("last_quote")
+    day_row = row.get("day")
+    underlying = row.get("underlying_asset")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (details, quote_row, day_row, underlying)
+    ):
+        return None
+    ticker = str(details.get("ticker", "")).strip().upper()
+    option_type = {
+        "call": "C",
+        "put": "P",
+    }.get(str(details.get("contract_type", "")).strip().lower())
+    if option_type is None:
+        return None
+    expiration = date.fromisoformat(str(details["expiration_date"]))
+    return P7TransportCandidate(
+        contract_ticker=ticker,
+        underlyer=str(underlying.get("ticker", "")),
+        expiration_date=expiration,
+        option_type=option_type,
+        strike=_decimal(
+            details["strike_price"],
+            "details.strike_price",
+        ),
+        spot=_decimal(
+            underlying.get("price", underlying.get("value")),
+            "underlying_asset.price",
+        ),
+        bid=_decimal(quote_row["bid"], "last_quote.bid"),
+        ask=_decimal(quote_row["ask"], "last_quote.ask"),
+        day_volume=int(day_row.get("volume", 0)),
+        open_interest=int(row.get("open_interest", 0)),
+        calendar_dte=(expiration - session_date).days,
+        market_data_time=_nanoseconds(
+            quote_row.get("last_updated"),
+            "last_quote.last_updated",
+        ),
+        source_sha256=canonical_sha256(row),
+    )
+
+
+def p8_activity_selection_capture_from_sealed(
+    value: Mapping[str, object],
+) -> P8ActivitySelectionCapture:
+    if (
+        value.get("contract")
+        != "advanced-options-v3-pre-session-capture-v1"
+        or value.get("provider_requests") != P8_SELECTION_REQUEST_COUNT
+        or type(value.get("decoded_bytes")) is not int
+        or not 0 < value["decoded_bytes"]
+        <= P8_SELECTION_MAXIMUM_DECODED_BYTES
+        or not isinstance(value.get("responses"), list)
+        or len(value["responses"]) != P8_SELECTION_REQUEST_COUNT
+        or not isinstance(value.get("selected_snapshots"), Mapping)
+        or len(value["selected_snapshots"]) != 4
+    ):
+        raise ValueError("sealed P8 activity selection scope changed")
+    session_date = date.fromisoformat(str(value["session_date"]))
+    reviewed_at = _utc(
+        datetime.fromisoformat(
+            str(value["captured_at_utc"]).replace("Z", "+00:00")
+        ),
+        "captured_at_utc",
+    )
+    if reviewed_at.date() != session_date:
+        raise ValueError("sealed P8 activity selection session changed")
+    responses = value["responses"]
+    if (
+        any(not isinstance(row, Mapping) for row in responses)
+        or tuple(row.get("underlyer") for row in responses)
+        != P8_SELECTION_POLICY.underlyings
+    ):
+        raise ValueError("sealed P8 response membership changed")
+    snapshots = value["selected_snapshots"]
+    candidates = []
+    selected_snapshots = {}
+    for ticker, row in sorted(snapshots.items()):
+        if not isinstance(row, Mapping):
+            raise TypeError("sealed P8 option snapshot must be an object")
+        candidate = _candidate_from_snapshot(
+            row,
+            session_date=session_date,
+        )
+        if (
+            candidate is None
+            or candidate.contract_ticker != str(ticker).strip().upper()
+        ):
+            raise ValueError("sealed P8 option snapshot identity changed")
+        candidates.append(candidate)
+        selected_snapshots[candidate.contract_ticker] = row
+    pairs = {
+        (row.underlyer, row.option_type)
+        for row in candidates
+    }
+    if pairs != {
+        ("QQQ", "C"),
+        ("QQQ", "P"),
+        ("SPY", "C"),
+        ("SPY", "P"),
+    }:
+        raise ValueError("sealed P8 call/put membership changed")
+    for option_type in ("C", "P"):
+        selection = select_p7_transport_contracts(
+            tuple(
+                row
+                for row in candidates
+                if row.option_type == option_type
+            ),
+            reviewed_at=reviewed_at,
+            policy=P8_SELECTION_POLICY,
+        )
+        if selection.status is not P7TransportSelectionStatus.READY:
+            raise ValueError(
+                "sealed P8 activity selection is no longer eligible"
+            )
+    selected = tuple(sorted(
+        candidates,
+        key=lambda row: (
+            row.underlyer,
+            row.option_type,
+            row.contract_ticker,
+        ),
+    ))
+    source_sha256 = canonical_sha256(tuple(
+        (
+            row.contract_ticker,
+            row.market_data_time,
+            row.source_sha256,
+        )
+        for row in sorted(
+            selected,
+            key=lambda row: (
+                row.underlyer,
+                row.contract_ticker,
+                row.market_data_time,
+            ),
+        )
+    ))
+    valid_until = min(
+        row.market_data_time
+        + timedelta(
+            seconds=P8_SELECTION_POLICY.maximum_snapshot_age_seconds
+        )
+        for row in selected
+    )
+    selection_sha256 = canonical_sha256({
+        "status": P7TransportSelectionStatus.READY,
+        "policy_sha256": P8_SELECTION_POLICY.sha256,
+        "reviewed_at": reviewed_at,
+        "valid_until": valid_until,
+        "source_sha256": source_sha256,
+        "selected": selected,
+        "reason_codes": (),
+    })
+    selection = P7TransportSelection(
+        P7TransportSelectionStatus.READY,
+        P8_SELECTION_POLICY,
+        reviewed_at,
+        valid_until,
+        selected,
+        source_sha256,
+        selection_sha256,
+        (),
+    )
+    source_snapshot_at = min(
+        row.market_data_time for row in selected
+    )
+    evidence = {
+        "schema": "advanced-options-p8-activity-selection-v1",
+        "source_snapshot_at_utc": source_snapshot_at.isoformat(),
+        "selected_at_utc": reviewed_at.isoformat(),
+        "valid_until_utc": valid_until.isoformat(),
+        "policy_sha256": P8_SELECTION_POLICY.sha256,
+        "source_snapshot_sha256": canonical_sha256(responses),
+        "request_count": P8_SELECTION_REQUEST_COUNT,
+        "decoded_bytes": value["decoded_bytes"],
+        "pages": P8_SELECTION_REQUEST_COUNT,
+        "pagination_requests": 0,
+        "sealed_capture_semantic_sha256": value.get("semantic_sha256"),
+        "selected": [
+            {
+                "underlyer": row.underlyer,
+                "contract_ticker": row.contract_ticker,
+            }
+            for row in selected
+        ],
+    }
+    evidence["selection_sha256"] = canonical_sha256(evidence)
+    return P8ActivitySelectionCapture(
+        selection=selection,
+        request_count=P8_SELECTION_REQUEST_COUNT,
+        decoded_bytes=value["decoded_bytes"],
+        pages=P8_SELECTION_REQUEST_COUNT,
+        pagination_requests=0,
+        source_snapshot_at=source_snapshot_at,
+        evidence=evidence,
+        selected_snapshots=selected_snapshots,
+    )
+
+
 class MassiveAdvancedOptionsSelectionSource:
     """Exactly one filtered option-chain snapshot request per QQQ/SPY."""
 
@@ -188,54 +395,13 @@ class MassiveAdvancedOptionsSelectionSource:
         for row in payload["results"]:
             if not isinstance(row, dict):
                 raise TypeError("P8 option snapshot row must be an object")
-            details = row.get("details")
-            quote_row = row.get("last_quote")
-            day_row = row.get("day")
-            underlying = row.get("underlying_asset")
-            if not all(
-                isinstance(value, dict)
-                for value in (details, quote_row, day_row, underlying)
-            ):
-                continue
-            ticker = str(details.get("ticker", "")).strip().upper()
-            option_type = {
-                "call": "C",
-                "put": "P",
-            }.get(str(details.get("contract_type", "")).strip().lower())
-            if option_type is None:
-                continue
-            market_time = _nanoseconds(
-                quote_row.get("last_updated"),
-                "last_quote.last_updated",
+            candidate = _candidate_from_snapshot(
+                row,
+                session_date=session_date,
             )
-            snapshot_clocks.append(market_time)
-            source_sha256 = canonical_sha256(row)
-            candidate = P7TransportCandidate(
-                contract_ticker=ticker,
-                underlyer=underlyer,
-                expiration_date=date.fromisoformat(
-                    str(details["expiration_date"])
-                ),
-                option_type=option_type,
-                strike=_decimal(
-                    details["strike_price"],
-                    "details.strike_price",
-                ),
-                spot=_decimal(
-                    underlying.get("price", underlying.get("value")),
-                    "underlying_asset.price",
-                ),
-                bid=_decimal(quote_row["bid"], "last_quote.bid"),
-                ask=_decimal(quote_row["ask"], "last_quote.ask"),
-                day_volume=int(day_row.get("volume", 0)),
-                open_interest=int(row.get("open_interest", 0)),
-                calendar_dte=(
-                    date.fromisoformat(str(details["expiration_date"]))
-                    - session_date
-                ).days,
-                market_data_time=market_time,
-                source_sha256=source_sha256,
-            )
+            if candidate is None:
+                continue
+            snapshot_clocks.append(candidate.market_data_time)
             candidates.append(candidate)
             snapshots[candidate.contract_ticker] = row
         if not candidates or not snapshot_clocks:

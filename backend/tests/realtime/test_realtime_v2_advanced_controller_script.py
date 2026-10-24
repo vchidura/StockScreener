@@ -137,6 +137,52 @@ def test_external_ingress_mode_is_explicit():
     assert args.external_ingress is True
 
 
+def test_active_external_ingress_does_not_exhaust_in_use_connection():
+    active = SimpleNamespace(
+        connection_attempt_count=1,
+        maximum_connection_attempts=1,
+        latest_stream_status="SUBSCRIBING",
+    )
+    stopped = SimpleNamespace(
+        connection_attempt_count=1,
+        maximum_connection_attempts=1,
+        latest_stream_status="STOPPED",
+    )
+
+    assert not script._connection_budget_exhausted(
+        active,
+        external_ingress=True,
+    )
+    assert script._connection_budget_exhausted(
+        active,
+        external_ingress=False,
+    )
+    assert script._connection_budget_exhausted(
+        stopped,
+        external_ingress=True,
+    )
+
+
+def test_external_ingress_with_zero_rest_does_not_plan_hybrid_repair():
+    hybrid = MagicMock()
+
+    script._tick_hybrid_repair(
+        hybrid,
+        external_ingress=True,
+        rest_repair_requests=0,
+        rest_repair_decoded_bytes=0,
+    )
+
+    hybrid.tick.assert_not_called()
+    script._tick_hybrid_repair(
+        hybrid,
+        external_ingress=True,
+        rest_repair_requests=1,
+        rest_repair_decoded_bytes=1,
+    )
+    hybrid.tick.assert_called_once_with()
+
+
 def test_runtime_scope_reports_terminal_plan_status_before_scope_mismatch():
     cursor = MagicMock()
     row = [None] * 32

@@ -8,6 +8,7 @@ from psycopg2 import errors
 from psycopg2.extras import Json, RealDictCursor
 
 from option_flow_support import advanced_policy
+from options.calendar import OptionExchangeCalendar
 from realtime.advanced_options_control_plane import (
     persist_advanced_options_enrollment_cursor,
 )
@@ -85,10 +86,21 @@ def _contract_scope(enrollment, policy):
     )
 
 
-def _seed_reference_inputs(database_cursor, enrollment, plan):
+def _seed_reference_inputs(
+    database_cursor,
+    enrollment,
+    plan,
+    *,
+    history_source_cohort_id=None,
+    include_optional_metrics=True,
+):
     control = enrollment.control_plane
     session = control.session_date
     known = plan.known_at
+    history_cohort_id = (
+        history_source_cohort_id
+        or enrollment.equity_plan.cohort_id
+    )
     ticker = "SPY"
     security_id = dict(enrollment.equity_plan.security_ids)[ticker]
     database_cursor.execute(
@@ -99,26 +111,27 @@ def _seed_reference_inputs(database_cursor, enrollment, plan):
         (str(enrollment.equity_plan.manifest_id), str(security_id)),
     )
     equity_instrument_id = int(database_cursor.fetchone()[0])
-    metrics = {"short_interest_percent": "0.08"}
-    raw_report = {"ticker": ticker, "metrics": metrics}
-    database_cursor.execute(
-        "INSERT INTO ref.fundamental_reports ("
-        "report_id,security_id,timeframe,period_end,availability_time,"
-        "observed_at,source,source_key,metrics,raw_payload,payload_sha256,"
-        "quality_codes) VALUES (%s,%s,'quarterly',%s,%s,%s,"
-        "'canonical-fundamentals','SPY:SHORT_INTEREST',%s,%s,%s,"
-        "ARRAY[]::text[])",
-        (
-            str(uuid4()),
-            str(security_id),
-            session - timedelta(days=1),
-            known - timedelta(days=2),
-            known - timedelta(days=1),
-            Json(metrics),
-            Json(raw_report),
-            canonical_sha256(raw_report),
-        ),
-    )
+    if include_optional_metrics:
+        metrics = {"short_interest_percent": "0.08"}
+        raw_report = {"ticker": ticker, "metrics": metrics}
+        database_cursor.execute(
+            "INSERT INTO ref.fundamental_reports ("
+            "report_id,security_id,timeframe,period_end,availability_time,"
+            "observed_at,source,source_key,metrics,raw_payload,payload_sha256,"
+            "quality_codes) VALUES (%s,%s,'quarterly',%s,%s,%s,"
+            "'canonical-fundamentals','SPY:SHORT_INTEREST',%s,%s,%s,"
+            "ARRAY[]::text[])",
+            (
+                str(uuid4()),
+                str(security_id),
+                session - timedelta(days=1),
+                known - timedelta(days=2),
+                known - timedelta(days=1),
+                Json(metrics),
+                Json(raw_report),
+                canonical_sha256(raw_report),
+            ),
+        )
     for tenor, rate in ((30, Decimal("0.0400")), (60, Decimal("0.0410"))):
         database_cursor.execute(
             "INSERT INTO ref.risk_free_rate_observations ("
@@ -214,9 +227,9 @@ def _seed_reference_inputs(database_cursor, enrollment, plan):
             coverage_payload_sha256,
         ),
     )
-    sessions = tuple(
-        session - timedelta(days=31 - index)
-        for index in range(31)
+    sessions = OptionExchangeCalendar().trailing_sessions_before(
+        session,
+        31,
     )
     for partition_date in {sessions[0], sessions[-1]}:
         database_cursor.execute(
@@ -246,7 +259,7 @@ def _seed_reference_inputs(database_cursor, enrollment, plan):
             "%s,%s,'MASSIVE_ADVANCED',%s,'1d',%s,%s,%s,%s)",
             (
                 str(revision_id),
-                str(enrollment.equity_plan.cohort_id),
+                str(history_cohort_id),
                 equity_instrument_id,
                 bar_start,
                 bar_end,
@@ -267,7 +280,7 @@ def _seed_reference_inputs(database_cursor, enrollment, plan):
             "'DERIVED','HISTORICAL_RECONSTRUCTED',true,%s,%s,%s,%s)",
             (
                 str(revision_id),
-                str(enrollment.equity_plan.cohort_id),
+                str(history_cohort_id),
                 str(security_id),
                 equity_instrument_id,
                 bar_session,
@@ -293,7 +306,7 @@ def _seed_reference_inputs(database_cursor, enrollment, plan):
             "%s,'MASSIVE_ADVANCED',%s,'1d',%s,'FULL_DAY','ADJUSTED',"
             "'DERIVED',%s,%s,%s,%s)",
             (
-                str(enrollment.equity_plan.cohort_id),
+                str(history_cohort_id),
                 equity_instrument_id,
                 bar_start,
                 str(revision_id),
@@ -304,7 +317,14 @@ def _seed_reference_inputs(database_cursor, enrollment, plan):
         )
 
 
-def _disposable_audit(database_pool, enrollment, cutoff):
+def _disposable_audit(
+    database_pool,
+    enrollment,
+    cutoff,
+    *,
+    equity_cutoff=None,
+    history_source_cohort_id=None,
+):
     connection_value = database_pool.getconn()
     observed_at = cutoff
     try:
@@ -324,6 +344,8 @@ def _disposable_audit(database_pool, enrollment, cutoff):
                 cutoff=cutoff,
                 observed_at=observed_at,
                 requested_cohort_id=enrollment.control_plane.cohort_id,
+                equity_cutoff=equity_cutoff,
+                history_source_cohort_id=history_source_cohort_id,
             )
         connection_value.rollback()
     finally:
@@ -350,7 +372,6 @@ def test_owp4b_reference_producer_and_disposable_readiness_audit(
             enrollment = _owp4_enrollment(
                 database_pool,
                 flow_policy_sha256=flow_policy.sha256,
-                security_free_float=Decimal("1000000000"),
             )
             scope = _contract_scope(enrollment, flow_policy)
             control = enrollment.control_plane
@@ -430,11 +451,28 @@ def test_owp4b_reference_producer_and_disposable_readiness_audit(
                     database_cursor,
                     enrollment,
                     plan,
+                    include_optional_metrics=False,
                 )
             preflight = producer.preflight()
             assert preflight.status is ReferenceProducerStatus.READY
             assert preflight.state is not None
             assert not preflight.reason_codes
+            assert {
+                (row.metric_kind.value, row.availability.value)
+                for row in preflight.state.equity_metrics
+            } == {
+                ("AVERAGE_DAILY_VOLUME_30", "AVAILABLE"),
+                ("SHORT_INTEREST_PERCENT", "UNAVAILABLE"),
+                ("TOTAL_FLOAT", "UNAVAILABLE"),
+            }
+            assert {
+                row.member_key
+                for row in preflight.evidence
+                if row.availability.value == "UNAVAILABLE"
+            } == {
+                "SPY:SHORT_INTEREST_PERCENT",
+                "SPY:TOTAL_FLOAT",
+            }
             with provider.transaction(APP_ROLE, read_only=True) as unit:
                 effects_before = _prohibited_effect_counts(unit.cursor)
             original_assemble = producer._assemble
@@ -488,10 +526,12 @@ def test_owp4b_reference_producer_and_disposable_readiness_audit(
             assert categories["treasury_inputs"]["status"] == "AVAILABLE"
             assert categories["dividend_inputs"]["status"] == "COMPLETE_ZERO"
             assert categories["model_inputs"]["status"] == "AVAILABLE"
-            assert (
-                "CANONICAL_ROLLING_STATE_PRODUCER_UNWIRED"
-                in categories["rolling_state_generation"]["reason_codes"]
-            )
+            assert categories["rolling_state_generation"][
+                "reason_codes"
+            ] == [
+                "ROLLING_STATE_ABSENT",
+                "SOURCE_FLOW_IDENTITY_ABSENT",
+            ]
     finally:
         if roles_owned:
             with closing(_connect(_settings(), "postgres")) as connection_value:

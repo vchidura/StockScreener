@@ -1,4 +1,4 @@
-"""Canonical serial stages_v4 assembly for the P8 WINDOW Docker role."""
+"""Post-E late-canary stages_v4 assembly for the P8 WINDOW Docker role."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -15,9 +15,15 @@ from .advanced_options_input import (
     build_advanced_options_input_ready_plan,
     freeze_advanced_options_input_ready_plan,
 )
+from .advanced_options_equity_input import (
+    initial_advanced_options_equity_context_requirements,
+)
 from .advanced_options_cycle import AdvancedOptionsDatasetFlowIdentity
 from .advanced_options_loaders import (
     build_canonical_advanced_options_runtime_binding,
+)
+from .advanced_options_runtime import (
+    build_advanced_options_v3_runtime_composition,
 )
 from .advanced_options_mark_producer import (
     PostgresAdvancedOptionsMarkProducer,
@@ -55,6 +61,7 @@ from .advanced_options_rolling_producer import (
     PostgresAdvancedOptionsRollingProducer,
     build_advanced_options_rolling_producer_plan,
 )
+from .advanced_options_service import OPTIONS_V3_STAGE_ORDER
 from .contracts import canonical_sha256
 from .database_access_v2 import APP_ROLE
 from .option_discovery_scope import RealtimeOptionDiscoveryScope
@@ -69,7 +76,11 @@ from .orchestration_repository import (
     PostgresOrchestrationRepository,
 )
 from .preflight import ProviderTier
-from .stage_graph import STAGES_V4, STAGE_CATALOG_VERSION_V4
+from .stage_graph import (
+    STAGES_V4,
+    STAGE_CATALOG_VERSION_V4,
+    STAGE_CATALOG_VERSION_V5,
+)
 from .stage_orchestrator import StageOrchestrator
 from .stage_runners_options import (
     OptionsAcquireResult,
@@ -85,7 +96,16 @@ BUILD_ID = "advanced-options-p8-live-canary-v1"
 
 
 def _equity_receipt(provider, binding, cutoff):
-    target = binding.enrollment.equity_plan.cohort_id
+    source = binding.equity_input
+    if (
+        source.target_options_window_id != binding.window_id
+        or source.equity_cutoff.date() != cutoff.date()
+        or source.equity_cutoff > cutoff
+        or (
+            cutoff - source.equity_cutoff
+        ).total_seconds() > source.maximum_age_seconds
+    ):
+        raise RuntimeError("P8 bound Equity input receipt is stale")
     with provider.transaction(APP_ROLE, read_only=True) as unit:
         unit.cursor.execute(
             "SELECT receipt.receipt_id::text,receipt.window_id::text,"
@@ -94,14 +114,27 @@ def _equity_receipt(provider, binding, cutoff):
             "receipt.build_id FROM rt.cycle_receipts AS receipt "
             "JOIN rt.window_runs AS window_run "
             "ON window_run.window_id=receipt.window_id "
-            "WHERE receipt.cohort_id=%s "
+            "WHERE receipt.receipt_id=%s "
+            "AND receipt.cohort_id=%s "
             "AND receipt.receipt_kind='INPUT_READY' "
-            "AND receipt.cutoff<=%s AND window_run.state='COMPLETE' "
-            "ORDER BY receipt.cutoff DESC LIMIT 1",
-            (str(target), cutoff),
+            "AND receipt.cutoff=%s AND window_run.state='COMPLETE'",
+            (
+                str(source.equity_receipt_id),
+                str(source.source_cohort_id),
+                source.equity_cutoff,
+            ),
         )
         row = unit.cursor.fetchone()
-    if row is None:
+    if (
+        row is None
+        or UUID(str(row[0])) != source.equity_receipt_id
+        or UUID(str(row[1])) != source.equity_window_id
+        or row[2] != source.equity_cutoff
+        or int(row[3]) != source.reference_generation
+        or str(row[4]) != source.universe_sha256
+        or str(row[5]) != source.input_sha256
+        or str(row[6]) != source.build_id
+    ):
         raise RuntimeError(
             "P8 canonical Equity INPUT_READY receipt is unavailable"
         )
@@ -117,27 +150,6 @@ def _equity_receipt(provider, binding, cutoff):
             str(row[6]),
         ),
     )
-
-
-def _stock_detectors(provider):
-    with provider.transaction(APP_ROLE, read_only=True) as unit:
-        unit.cursor.execute(
-            "SELECT DISTINCT ON (detector_id) detector_id,"
-            "detector_sha256 FROM rt.detector_versions "
-            "WHERE detector_id=ANY(%s) "
-            "ORDER BY detector_id,created_at DESC",
-            (["ADVANCED_EQUITY_S1", "ADVANCED_EQUITY_S2"],),
-        )
-        rows = tuple(unit.cursor.fetchall())
-    values = {
-        str(row[0]).removeprefix("ADVANCED_EQUITY_"): str(row[1])
-        for row in rows
-    }
-    if set(values) != {"S1", "S2"}:
-        raise RuntimeError(
-            "P8 canonical S1/S2 detector identities are unavailable"
-        )
-    return tuple(sorted(values.items()))
 
 
 def _flow_event(row, profile):
@@ -418,9 +430,23 @@ def build_and_run_p8_serial_window(
     contract_scope,
     source_flow,
     dependency_evidence,
+    catalog_version=STAGE_CATALOG_VERSION_V4,
+    publication_authority_loader=None,
+    canonical_publisher=None,
+    window_stage_effect_authorizer=None,
+    window_cutoff=None,
 ):
+    if catalog_version not in {
+        STAGE_CATALOG_VERSION_V4,
+        STAGE_CATALOG_VERSION_V5,
+    }:
+        raise ValueError("Advanced Options WINDOW catalog changed")
     control = binding.enrollment.control_plane
-    cutoff = control.receipts.options_input_ready.spec.cutoff
+    cutoff = (
+        control.receipts.options_input_ready.spec.cutoff
+        if window_cutoff is None
+        else window_cutoff
+    )
     expires = control.expires_at
     reference_plan = build_advanced_options_reference_producer_plan(
         enrollment=binding.enrollment,
@@ -544,8 +570,13 @@ def build_and_run_p8_serial_window(
         equity_input_receipt=equity_receipt,
         equity_window_id=equity_window_id,
         loader_build_id="advanced-options-native-loader-v1",
-        stock_detector_sha256s=_stock_detectors(provider),
         history_source_cohort_id=binding.history.source_cohort_id,
+        maximum_equity_input_age_seconds=(
+            binding.equity_input.maximum_age_seconds
+        ),
+        equity_context_requirements=(
+            initial_advanced_options_equity_context_requirements()
+        ),
     )
     native_preflight = PostgresAdvancedOptionsNativeInputLoader(
         provider,
@@ -633,10 +664,12 @@ def build_and_run_p8_serial_window(
         input_preflight.status
         is not AdvancedOptionsInputDependencyStatus.AVAILABLE
     ):
-        raise RuntimeError(
-            "P8 input-ready preflight blocked: "
-            + ",".join(input_preflight.reason_codes)
-        )
+        return {
+            "status": "DEFERRED",
+            "window_state": "PENDING",
+            "stage_order": list(OPTIONS_V3_STAGE_ORDER),
+            "reason_codes": list(input_preflight.reason_codes),
+        }
     input_plan = freeze_advanced_options_input_ready_plan(
         input_candidate,
         input_preflight,
@@ -674,21 +707,42 @@ def build_and_run_p8_serial_window(
             build_id=BUILD_ID,
             pre_session=OptionsPreSessionStageBinding(operations),
             port=port,
+            catalog_version=catalog_version,
+            publication_authority_loader=(
+                publication_authority_loader
+            ),
+            canonical_publisher=canonical_publisher,
         )
     )
-    environment = runtime_binding.bind(flow_environment)
-    runners = build_advanced_options_non_serving_runners(
+    repository = PostgresOrchestrationRepository(
         provider,
-        environment=environment,
+        window_stage_effect_authorizer=(
+            window_stage_effect_authorizer
+        ),
     )
-    orchestrator = StageOrchestrator(
-        PostgresOrchestrationRepository(provider),
-        runners,
-        database=provider,
-        stages=STAGES_V4,
-        catalog_version=STAGE_CATALOG_VERSION_V4,
-        parallel_lanes=False,
-    )
+    if catalog_version == STAGE_CATALOG_VERSION_V5:
+        composition = build_advanced_options_v3_runtime_composition(
+            binding=runtime_binding,
+            repository=repository,
+            database=provider,
+            environment=flow_environment,
+        )
+        runners = composition.runners
+        orchestrator = composition.orchestrator
+    else:
+        environment = runtime_binding.bind(flow_environment)
+        runners = build_advanced_options_non_serving_runners(
+            provider,
+            environment=environment,
+        )
+        orchestrator = StageOrchestrator(
+            repository,
+            runners,
+            database=provider,
+            stages=STAGES_V4,
+            catalog_version=STAGE_CATALOG_VERSION_V4,
+            parallel_lanes=False,
+        )
     started = orchestrator.start(control.plan_id)
     report = orchestrator.run_window(binding.window_id)
     if started.enabled != frozenset(runners):

@@ -16,6 +16,7 @@ from .portal_projection_repository import persist_screening_generation_cursor
 from .preflight import ProviderTier
 from .reference_continuity import (
     load_reference_continuity_rows_cursor,
+    source_manifest_identity,
 )
 from .screening_projection import RealtimeScreeningInput, produce_realtime_screening
 from .worker_database import RealtimeProcessDatabase
@@ -523,7 +524,8 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
     ):
         raise ValueError("Advanced cohort history binding is invalid")
     cursor.execute(
-        "SELECT reference.security_id, reference.ticker, "
+        "SELECT DISTINCT ON (instrument.instrument_id) "
+        "reference.security_id, reference.ticker, "
         "reference.revision_id AS security_revision_id, reference.company_name, "
         "reference.security_type, reference.exchange, reference.active, reference.cik, "
         "reference.composite_figi, reference.share_class_figi, reference.sic_code, "
@@ -536,7 +538,9 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
         "JOIN ref.security_revisions AS reference USING (security_id) "
         "WHERE member.manifest_id=%s AND instrument.asset_class='EQUITY' AND member.channel='AM' "
         "AND reference.effective_from<=%s AND (reference.effective_to IS NULL OR reference.effective_to>%s) "
-        "AND reference.observed_at<=%s ORDER BY reference.ticker",
+        "AND reference.observed_at<=%s "
+        "ORDER BY instrument.instrument_id,"
+        "reference.observed_at DESC,reference.revision_id DESC",
         (str(manifest["manifest_id"]), cutoff, cutoff, cutoff),
     )
     members = tuple(dict(row) for row in cursor.fetchall())
@@ -623,18 +627,12 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
     coverage = tuple(dict(row) for row in cursor.fetchall())
     return RealtimeScreeningInput(
         cohort_id=cohort_id, provider_tier=ProviderTier(manifest["provider_tier"]),
-        source_manifest_sha256=(
-            canonical_sha256({
-                "manifest_sha256": manifest["manifest_sha256"],
-                "history_binding_sha256": history_binding_sha256,
-                "identity_continuity": identity_continuity,
-            })
-            if (
-                history_binding_sha256 is not None
-                or identity_continuity
-            )
-            else manifest["manifest_sha256"]
-        ), source_generation=source_generation,
+        source_manifest_sha256=source_manifest_identity(
+            cohort_manifest_sha256=manifest["manifest_sha256"],
+            history_binding_sha256=history_binding_sha256,
+            identity_continuity=identity_continuity,
+        ),
+        source_generation=source_generation,
         session=session, cutoff=cutoff, members=members, bars=bars, actions=actions, coverage=coverage,
         history_source_cohort_id=scope.history_source_cohort_id,
         history_source_provider_tier=(

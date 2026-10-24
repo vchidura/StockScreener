@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 from realtime.advanced_options_control_plane import (
     advanced_options_enrollment_plan_payload,
+    build_advanced_options_equity_input_binding,
     build_advanced_options_history_binding,
 )
 from realtime.contracts import DEVELOPER_FORWARD_UNIVERSE
@@ -131,12 +133,37 @@ def test_frozen_advanced_plan_executes_without_developer_enrollment(
         source_manifest_sha256=plan.equity_plan.manifest.sha256,
         authorization_reference="p8-history",
     )
+    equity_input = build_advanced_options_equity_input_binding(
+        target_options_window_id=uuid4(),
+        target_cohort_id=plan.control_plane.cohort_id,
+        source_cohort_id=plan.equity_plan.cohort_id,
+        source_cohort_sha256=plan.equity_plan.cohort_sha256,
+        source_manifest_id=plan.equity_plan.manifest_id,
+        source_manifest_sha256=plan.equity_plan.manifest.sha256,
+        source_profile_id=plan.equity_plan.profile_id,
+        source_profile_sha256=plan.equity_plan.profile_sha256,
+        equity_window_id=uuid4(),
+        equity_receipt_id=uuid4(),
+        equity_cutoff=plan.control_plane.receipts.options_input_ready.spec.cutoff,
+        reference_generation=1,
+        universe_sha256=plan.equity_plan.universe.sha256,
+        input_sha256="d" * 64,
+        build_id="advanced-equity-test-v1",
+        maximum_age_seconds=300,
+        authorization_reference="p8-equity-input",
+    )
     persisted = []
     monkeypatch.setattr(
         script,
         "persist_advanced_options_enrollment",
-        lambda connection, frozen, *, history_binding: persisted.append(
-            (connection, frozen, history_binding)
+        lambda connection, frozen, *, history_binding,
+        equity_input_binding: persisted.append(
+            (
+                connection,
+                frozen,
+                history_binding,
+                equity_input_binding,
+            )
         ) or True,
     )
     monkeypatch.setattr(
@@ -152,7 +179,8 @@ def test_frozen_advanced_plan_executes_without_developer_enrollment(
         connection,
         plan,
         history,
+        equity_input,
         database_name="stocks_realtime_v2",
         confirmed_database_name="stocks_realtime_v2",
     )
-    assert persisted == [(connection, plan, history)]
+    assert persisted == [(connection, plan, history, equity_input)]

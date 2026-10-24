@@ -191,7 +191,6 @@ class OptionActivitySelectionRecord:
             "contract_id",
             "catalog_version_id",
             "contract_ticker",
-            "underlyer",
         ):
             if len({getattr(row, attribute) for row in contracts}) != len(contracts):
                 raise ValueError(
@@ -278,7 +277,9 @@ def validate_option_activity_selection(
     underlyings = tuple(sorted({
         value.strip().upper() for value in expected_underlyings if value.strip()
     }))
-    if tuple(row.underlyer for row in selection.contracts) != underlyings:
+    if {
+        row.underlyer for row in selection.contracts
+    } != set(underlyings):
         raise ValueError("option activity selection expands or changes scope")
     if selection.quote_ceiling != expected_quote_ceiling:
         raise ValueError("option activity selection quote ceiling changed")

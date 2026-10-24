@@ -837,6 +837,26 @@ class RawJournalReader:
             for row in rows
         )
 
+    def offsets_at(self, cutoff: datetime) -> tuple[int, int]:
+        if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+            raise ValueError("cutoff must be timezone-aware")
+        value = cutoff.astimezone(timezone.utc).isoformat()
+        with closing(
+            _connect(
+                self.path,
+                timeout_seconds=self.timeout_seconds,
+                read_only=True,
+            )
+        ) as connection:
+            row = connection.execute(
+                "SELECT raw_offset,event_offset FROM normalized_events "
+                "WHERE event_at <= ? ORDER BY event_offset DESC LIMIT 1",
+                (value,),
+            ).fetchone()
+        if row is None:
+            return 0, 0
+        return int(row["raw_offset"]), int(row["event_offset"])
+
     def read_quarantines(
         self, *, raw_offset: int | None = None
     ) -> tuple[QuarantineJournalRecord, ...]:

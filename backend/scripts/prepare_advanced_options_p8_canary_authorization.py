@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import datetime
@@ -17,6 +18,7 @@ if str(BACKEND_DIR) not in sys.path:
 from realtime.advanced_options_p8_canary_authorization import (  # noqa: E402
     build_p8_canary_authorization,
 )
+from realtime.contracts import canonical_sha256  # noqa: E402
 
 
 def parse_args(argv=None):
@@ -36,6 +38,19 @@ def parse_args(argv=None):
     parser.add_argument("--prepared-at", required=True)
     parser.add_argument("--window-start", required=True)
     parser.add_argument("--window-end", required=True)
+    parser.add_argument(
+        "--equity-input-source-report",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument(
+        "--expected-equity-input-source-semantic-sha256",
+        required=True,
+    )
+    parser.add_argument(
+        "--expected-equity-input-source-file-sha256",
+        required=True,
+    )
     parser.add_argument("--supersedes-package-sha256")
     parser.add_argument("--prepare-stored-reads", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
@@ -53,6 +68,27 @@ def main(argv=None) -> int:
         raise FileExistsError("P8 canary package output must be new")
     if not output.parent.is_dir():
         raise FileNotFoundError("P8 canary package output parent is absent")
+    equity_report_path = args.equity_input_source_report.resolve()
+    raw_equity_report = equity_report_path.read_bytes()
+    if (
+        hashlib.sha256(raw_equity_report).hexdigest()
+        != args.expected_equity_input_source_file_sha256
+    ):
+        raise ValueError("P8 Equity input source file identity changed")
+    equity_report = json.loads(raw_equity_report)
+    if not isinstance(equity_report, dict):
+        raise TypeError("P8 Equity input source report must be an object")
+    equity_source = dict(equity_report)
+    report_sha256 = equity_source.pop("report_sha256", None)
+    if (
+        equity_source.pop("schema", None)
+        != "advanced-options-p8-equity-input-source-v1"
+        or report_sha256
+        != args.expected_equity_input_source_semantic_sha256
+        or canonical_sha256(equity_source)
+        != args.expected_equity_input_source_semantic_sha256
+    ):
+        raise ValueError("P8 Equity input source identity changed")
     package = build_p8_canary_authorization(
         args.qualification_report.resolve(),
         repository_root=REPOSITORY_ROOT,
@@ -62,6 +98,7 @@ def main(argv=None) -> int:
         prepared_at=_timestamp(args.prepared_at),
         window_start=_timestamp(args.window_start),
         window_end=_timestamp(args.window_end),
+        equity_input_source=equity_source,
         expected_qualification_semantic_sha256=(
             args.expected_qualification_semantic_sha256
         ),

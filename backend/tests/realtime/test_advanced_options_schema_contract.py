@@ -79,6 +79,18 @@ PACKAGE_EVIDENCE_SQL_PATH = (
     Path(V2_MIGRATIONS_DIR)
     / "030_advanced_options_flow_package_evidence.sql"
 )
+EQUITY_BINDING_SQL_PATH = (
+    Path(V2_MIGRATIONS_DIR)
+    / "033_advanced_options_equity_input_bindings.sql"
+)
+V3_AUTHORITY_SQL_PATH = (
+    Path(V2_MIGRATIONS_DIR)
+    / "034_advanced_options_v3_authorities.sql"
+)
+V3_STAGE_BARRIER_SQL_PATH = (
+    Path(V2_MIGRATIONS_DIR)
+    / "035_advanced_options_v3_stage_barrier.sql"
+)
 
 
 def _source_flow(base_config=None, *, generation=JOURNAL_GENERATION):
@@ -94,7 +106,7 @@ def _source_flow(base_config=None, *, generation=JOURNAL_GENERATION):
 def test_p2_is_one_forward_migration_with_no_parallel_lifecycle_tables():
     migrations = load_realtime_migrations(Path(V2_MIGRATIONS_DIR))
     assert migrations[-1].version == (
-        "032_advanced_options_read_pins"
+        "035_advanced_options_v3_stage_barrier"
     )
     text = SQL_PATH.read_text(encoding="utf-8")
     assert "CREATE TABLE rt.option_source_flows" in text
@@ -108,6 +120,89 @@ def test_p2_is_one_forward_migration_with_no_parallel_lifecycle_tables():
         "options_retention",
     ):
         assert f"CREATE TABLE rt.{prohibited}" not in text
+
+
+def test_migration_034_adds_only_split_immutable_authorities_and_receipts():
+    text = " ".join(
+        V3_AUTHORITY_SQL_PATH.read_text(encoding="utf-8").split()
+    )
+
+    for relation in (
+        "advanced_options_session_acquisition_authorizations",
+        "advanced_options_window_cycle_authorizations",
+        "advanced_options_authority_receipts",
+    ):
+        assert f"CREATE TABLE rt.{relation}" in text
+        assert f"trg_rt_{relation}_immutable" in text
+        assert f"trg_rt_{relation}_no_truncate" in text
+        assert RELATIONS[f"rt.{relation}"].writes == "APPEND"
+    assert "FIRST_PROVIDER_EFFECT" not in text
+    assert "stages_v5" not in text
+    for prohibited in (
+        "options_scheduler",
+        "options_retry",
+        "options_jobs",
+        "options_lifecycle",
+    ):
+        assert f"CREATE TABLE rt.{prohibited}" not in text
+
+
+def test_migration_035_adds_one_bounded_resident_barrier_and_deferred_state():
+    text = " ".join(
+        V3_STAGE_BARRIER_SQL_PATH.read_text(encoding="utf-8").split()
+    )
+
+    assert "('OPTIONS_REFERENCE','stages_v5'" in text
+    assert (
+        "('OPTIONS_INPUT_GATE','stages_v5','options',"
+        "ARRAY['OPTIONS_REFERENCE']"
+    ) in text
+    assert "EQUITY_MATERIALIZE','options'" not in text
+    assert "ADD COLUMN retry_not_before timestamptz" in text
+    assert "ADD COLUMN original_deadline timestamptz" in text
+    assert "ADD COLUMN maximum_attempts integer" in text
+    assert "'DEFERRED'" in text
+    assert "'WAITING_INPUT'" in text
+    relation = "advanced_options_resident_completions"
+    assert f"CREATE TABLE rt.{relation}" in text
+    assert "evidence_document jsonb NOT NULL" in text
+    assert f"trg_rt_{relation}_immutable" in text
+    assert f"trg_rt_{relation}_no_truncate" in text
+    assert RELATIONS[f"rt.{relation}"].retention == "BOUNDED"
+    assert RELATIONS[f"rt.{relation}"].writes == "APPEND"
+    assert "target-window Equity binding" in text
+    assert "exact resident completion" in text
+    for prohibited in (
+        "options_scheduler",
+        "options_retry",
+        "options_jobs",
+        "options_lifecycle",
+        "options_status_files",
+    ):
+        assert f"CREATE TABLE rt.{prohibited}" not in text
+
+
+def test_migration_033_binds_each_immutable_options_window():
+    text = " ".join(
+        EQUITY_BINDING_SQL_PATH.read_text(encoding="utf-8").split()
+    )
+
+    assert "target_options_window_id uuid PRIMARY KEY" in text
+    assert "DEFERRABLE INITIALLY DEFERRED" in text
+    assert "target_cohort_id uuid PRIMARY KEY" not in text
+    assert "reference_generation bigint NOT NULL" in text
+    assert "build_id varchar(96) NOT NULL" in text
+    assert (
+        "trg_rt_advanced_options_equity_input_bindings_immutable"
+        in text
+    )
+    assert (
+        "trg_rt_advanced_options_equity_input_bindings_no_truncate"
+        in text
+    )
+    relation = RELATIONS["rt.advanced_options_equity_input_bindings"]
+    assert relation.writes == "APPEND"
+    assert relation.api is False
 
 
 def test_p6d3_migration_has_one_immutable_reference_state_owner():

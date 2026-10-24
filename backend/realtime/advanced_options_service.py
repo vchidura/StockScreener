@@ -25,7 +25,10 @@ from .provider_socket_lease import (
     ProviderSocketLeaseUnavailable,
     default_provider_lock_path,
 )
-from .stage_graph import STAGE_CATALOG_VERSION_V4
+from .stage_graph import (
+    STAGE_CATALOG_VERSION_V4,
+    STAGE_CATALOG_VERSION_V5,
+)
 
 
 PASSING_P7_MANIFEST_ID = UUID("c1136851-b496-5efe-aaa7-1eb8c8a7efd5")
@@ -37,7 +40,7 @@ PASSING_P7_REPORT_SHA256 = (
 )
 PASSING_P7_SOURCE_COMMIT = "071062a5e6ba585add9e8c59ef58b86d16f0c0ad"
 ADVANCED_OPTIONS_COHORT_KIND = "MARKET_OPTIONS"
-OPTIONS_NON_SERVING_STAGE_ORDER = (
+OPTIONS_LATE_CANARY_V4_STAGE_ORDER = (
     "OPTIONS_ACQUIRE",
     "OPTIONS_ADMISSION",
     "OPTIONS_FLOW",
@@ -46,9 +49,21 @@ OPTIONS_NON_SERVING_STAGE_ORDER = (
     "OPTIONS_PROJECTION",
     "OPTIONS_PUBLISH",
 )
+OPTIONS_NON_SERVING_STAGE_ORDER = OPTIONS_LATE_CANARY_V4_STAGE_ORDER
 OPTIONS_RESIDENT_STAGE_SUBSET = frozenset(
     OPTIONS_NON_SERVING_STAGE_ORDER
 )
+OPTIONS_V3_STAGE_ORDER = (
+    "OPTIONS_ACQUIRE",
+    "OPTIONS_ADMISSION",
+    "OPTIONS_REFERENCE",
+    "OPTIONS_FLOW",
+    "OPTIONS_INPUT_GATE",
+    "OPTIONS_CYCLE",
+    "OPTIONS_PROJECTION",
+    "OPTIONS_PUBLISH",
+)
+OPTIONS_V3_STAGE_SUBSET = frozenset(OPTIONS_V3_STAGE_ORDER)
 _RETRYABLE_POSTGRES_SQLSTATES = frozenset({"40001", "40P01"})
 
 
@@ -438,6 +453,44 @@ def build_advanced_options_non_serving_qualification_plan(
         PASSING_P7_MANIFEST_SHA256,
         PASSING_P7_REPORT_SHA256,
         PASSING_P7_SOURCE_COMMIT,
+    )
+
+
+def build_advanced_options_v3_service_plan(
+    *,
+    plan_id: UUID,
+    cohort_id: UUID,
+    session_date: date,
+    config_sha256: str,
+    deadline: datetime,
+) -> ServicePlan:
+    if (
+        not isinstance(plan_id, UUID)
+        or not isinstance(cohort_id, UUID)
+        or min(plan_id.int, cohort_id.int) == 0
+        or not isinstance(session_date, date)
+        or len(config_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in config_sha256
+        )
+    ):
+        raise ValueError(
+            "Advanced Options V3 service plan identity is invalid"
+        )
+    frozen_deadline = _utc(deadline, "deadline")
+    if frozen_deadline.date() != session_date:
+        raise ValueError(
+            "Advanced Options V3 service plan deadline changed session"
+        )
+    return ServicePlan(
+        plan_id,
+        cohort_id,
+        session_date,
+        STAGE_CATALOG_VERSION_V5,
+        OPTIONS_V3_STAGE_SUBSET,
+        config_sha256,
+        frozen_deadline,
     )
 
 

@@ -20,6 +20,7 @@ from realtime.advanced_options_close import (
 )
 from realtime.advanced_options_cycle import (
     O2_MODEL_NOT_ACCEPTED,
+    load_advanced_options_cycle_cursor,
     persist_advanced_options_cycle_cursor,
     run_advanced_options_cycle,
 )
@@ -29,8 +30,11 @@ from realtime.advanced_options_input import (
     reconstruct_options_input_ready_receipt,
 )
 from realtime.advanced_options_projection import (
+    OPTIONS_SNAPSHOT_TYPES,
+    AdvancedOptionsPublicationAuthorization,
     OPTIONS_PROJECTION_TYPES,
     build_advanced_options_projection_batch,
+    load_advanced_options_projection_batch_cursor,
     persist_advanced_options_projection_cursor,
     read_advanced_options_projection_cursor,
 )
@@ -45,7 +49,11 @@ from realtime.advanced_options_postgres import (
     AdvancedOptionsPostgresRuntimeScope,
     PostgresAdvancedOptionsCanonicalRuntimePort,
 )
-from realtime.advanced_options_runtime import AdvancedOptionsInputStageData
+from realtime.advanced_options_runtime import (
+    AdvancedOptionsInputStageData,
+    AdvancedOptionsPublishStageData,
+    AdvancedOptionsRuntimeBinding,
+)
 from realtime.advanced_options_producers import (
     build_advanced_options_producer_plan,
 )
@@ -58,6 +66,13 @@ from realtime.advanced_options_rolling_repository import (
 from realtime.database_access_v2 import (
     APP_ROLE as V2_APP_ROLE,
     V2ConnectionProvider,
+)
+from realtime.database_access import (
+    RealtimeDatabasePrincipal,
+    RealtimeDatabaseRole,
+    RealtimePoolBudget,
+    RealtimeProcessDatabasePlan,
+    RoleScopedConnectionProvider,
 )
 from realtime.database_access_v2 import V2AccessConfig, verify_pool_target_v2
 from realtime.materialization_jobs import (
@@ -97,6 +112,18 @@ from realtime.orchestration_repository import (
     OPTIONS_INPUT_READY,
     OPTIONS_PORTAL_READY,
 )
+from realtime.options_v2_runtime import OptionsPreSessionStageBinding
+from realtime.portal_projection import build_portal_snapshot
+from realtime.portal_projection_repository import (
+    PortalReleaseReceipt,
+    load_portal_release_pointer_cursor,
+    persist_portal_snapshot_cursor,
+    publish_portal_release_cursor,
+)
+from realtime.portal_publisher import (
+    CanonicalPortalPublisher,
+    PortalPublicationConfig,
+)
 from realtime.preflight import DetectorFamily, ProviderTier
 from realtime.relation_registry import APP_ROLE, API_ROLE, ROLES
 from realtime.security_v2 import (
@@ -105,6 +132,8 @@ from realtime.security_v2 import (
     harden_database_v2,
 )
 from realtime.session_archive import ArchiveIdentity
+from realtime.stage_graph import STAGE_CATALOG_VERSION_V5
+from realtime.worker_database import RealtimeProcessDatabase
 from scripts import provision_realtime_v2_database as provision
 from test_advanced_options_close import NOW as CLOSE_NOW, _coverage
 from test_advanced_options_control_plane import (
@@ -959,8 +988,6 @@ def test_p5_02b_postgres_port_reconstructs_exact_canonical_input(
     native = AdvancedOptionsNativeInputBundle(
         o1=AdvancedOptionsLaneInputs(),
         o3=AdvancedOptionsLaneInputs(),
-        s1=AdvancedOptionsLaneInputs(),
-        s2=AdvancedOptionsLaneInputs(),
     )
     scope = AdvancedOptionsPostgresRuntimeScope(
         control_plane=control,
@@ -1314,6 +1341,323 @@ def test_p5_05_projection_is_stored_readable_and_never_publishes(
             assert result["provider_fetch_performed"] is False
             assert result["detector_work_performed"] is False
             assert result["publication_performed"] is False
+
+
+def test_p5_05b_v5_restart_publish_replay_and_rollback(p5_database):
+    control, gate, executors = _cycle_result()
+    with _transaction(p5_database, APP_ROLE) as cursor:
+        for job in gate.jobs:
+            enqueue_materialization_job_cursor(cursor, job)
+        open_job_barrier_cursor(
+            cursor,
+            barrier_id=gate.barrier_id,
+            cohort_id=control.cohort_id,
+            window_id=gate.window_id,
+            barrier_kind=OPTIONS_INPUT_READY,
+            universe_sha256=control.universe.sha256,
+            members=gate.barrier_members,
+        )
+        cursor.execute(
+            "UPDATE rt.materialization_jobs SET status='COMPLETE' "
+            "WHERE job_id=ANY(%s::uuid[])",
+            ([str(job.job_id) for job in gate.jobs],),
+        )
+        for member in gate.barrier_members:
+            record_job_barrier_outcome_cursor(
+                cursor,
+                barrier_id=gate.barrier_id,
+                member_key=member.member_key,
+                outcome=BarrierOutcome.COMPLETE,
+                outcome_input_sha256=member.expected_input_sha256,
+            )
+        verdict = evaluate_job_barrier_cursor(
+            cursor,
+            gate.barrier_id,
+        )
+        initial_input_receipt = (
+            reconstruct_options_input_ready_receipt(
+                gate,
+                verdict,
+                cutoff=NOW,
+                reference_generation=7,
+                build_id="p4-build",
+            )
+        )
+        _insert_receipt(
+            cursor,
+            p5_database,
+            initial_input_receipt,
+        )
+        initial_cycle = run_advanced_options_cycle(
+            control_plane=control,
+            input_gate=gate,
+            input_receipt=initial_input_receipt,
+            executors=executors,
+            cutoff=NOW,
+            reference_generation=7,
+            reference_repository=_reference_repository(),
+            build_id="p4-build",
+        )
+        persist_advanced_options_cycle_cursor(
+            cursor,
+            initial_cycle,
+            control_plane=control,
+        )
+        _insert_receipt(
+            cursor,
+            p5_database,
+            initial_cycle.receipt,
+        )
+        initial_projection = build_advanced_options_projection_batch(
+            control_plane=control,
+            cycle=initial_cycle,
+            generated_at=NOW,
+            build_id="p4-build",
+        )
+        persist_advanced_options_projection_cursor(
+            cursor,
+            initial_projection,
+        )
+        _insert_receipt(
+            cursor,
+            p5_database,
+            initial_projection.portal_ready_receipt,
+        )
+
+    def receipt(kind):
+        with _transaction(
+            p5_database,
+            APP_ROLE,
+            read_only=True,
+        ) as cursor:
+            cursor.execute(
+                "SELECT receipt_id,cutoff,reference_generation,"
+                "universe_sha256,input_sha256,build_id "
+                "FROM rt.cycle_receipts WHERE window_id=%s "
+                "AND receipt_kind=%s",
+                (str(WINDOW), kind),
+            )
+            row = cursor.fetchone()
+        assert row is not None
+        return row[0], CycleReceiptSpec(
+            kind,
+            row[1],
+            int(row[2]),
+            str(row[3]),
+            str(row[4]),
+            str(row[5]),
+        )
+
+    input_receipt_id, input_receipt = receipt(OPTIONS_INPUT_READY)
+    _cycle_receipt_id, cycle_receipt = receipt(OPTIONS_CYCLE)
+    portal_receipt_id, portal_receipt = receipt(OPTIONS_PORTAL_READY)
+    input_stage = AdvancedOptionsInputStageData(
+        control,
+        gate,
+        verdict,
+        input_receipt.reference_generation,
+        "rehydrated-input",
+    )
+    with _transaction(
+        p5_database,
+        APP_ROLE,
+        read_only=True,
+    ) as cursor:
+        cycle = load_advanced_options_cycle_cursor(
+            cursor,
+            control_plane=control,
+            input_gate=input_stage.input_gate,
+            input_receipt=input_receipt,
+            cycle_receipt=cycle_receipt,
+        )
+        projection = load_advanced_options_projection_batch_cursor(
+            cursor,
+            control_plane=control,
+            cycle=cycle,
+            portal_ready_receipt=portal_receipt,
+        )
+    assert cycle.cycle_sha256 == cycle_receipt.input_sha256
+    assert projection.batch_sha256 == portal_receipt.input_sha256
+    assert tuple(
+        row.snapshot_type for row in projection.snapshots
+    ) == OPTIONS_SNAPSHOT_TYPES
+
+    equity_snapshot = build_portal_snapshot(
+        cohort_id=control.cohort_id,
+        provider_tier=control.binding.provider_tier,
+        snapshot_type="TICKER_WORKSPACE_SUMMARY_V1",
+        snapshot_key="PLATFORM",
+        source_generation=input_receipt.reference_generation,
+        source_manifest={"lane": "EQUITY"},
+        payload={"lane": "EQUITY"},
+        generated_at=NOW - timedelta(seconds=1),
+    )
+    with _transaction(p5_database, APP_ROLE) as cursor:
+        persist_portal_snapshot_cursor(cursor, equity_snapshot)
+        prior_release = publish_portal_release_cursor(
+            cursor,
+            PortalReleaseReceipt(
+                input_receipt_id,
+                control.cohort_id,
+                control.binding.provider_tier,
+                input_receipt.cutoff,
+                input_receipt.universe_sha256,
+            ),
+            (equity_snapshot,),
+        )
+    provider = RoleScopedConnectionProvider(
+        {RealtimeDatabasePrincipal.RUNTIME: p5_database.pool},
+        {
+            RealtimeDatabaseRole.PUBLICATION: (
+                p5_database.roles.name(APP_ROLE)
+            ),
+        },
+    )
+    publisher_database = RealtimeProcessDatabase(
+        RealtimeProcessDatabasePlan(
+            "worker:portal_publisher:v5_qualification",
+            RealtimeDatabaseRole.PUBLICATION,
+            RealtimePoolBudget(0, 1),
+        ),
+        provider,
+    )
+    config = PortalPublicationConfig(
+        control.cohort_id,
+        control.binding.provider_tier,
+        uuid4(),
+        1,
+        dispatch_authorized=False,
+    )
+    authority = AdvancedOptionsPublicationAuthorization(
+        uuid4(),
+        control.cohort_id,
+        control.binding.provider_tier,
+        projection.batch_sha256,
+        portal_receipt_id,
+        "OWNED_DISPOSABLE_V5_PUBLICATION",
+    )
+    context = SimpleNamespace(
+        plan=SimpleNamespace(
+            plan_id=control.plan_id,
+            cohort_id=control.cohort_id,
+            session_date=control.session_date,
+            stage_catalog_version=STAGE_CATALOG_VERSION_V5,
+        ),
+        window=SimpleNamespace(
+            plan_id=control.plan_id,
+            cohort_id=control.cohort_id,
+            cutoff=portal_receipt.cutoff,
+        ),
+        started_at=portal_receipt.cutoff,
+    )
+
+    def binding(canonical_publisher):
+        return AdvancedOptionsRuntimeBinding(
+            build_id=portal_receipt.build_id,
+            pre_session=OptionsPreSessionStageBinding(
+                SimpleNamespace()
+            ),
+            input_loader=lambda _context: input_stage,
+            cycle_loader=lambda _context: None,
+            projection_loader=lambda _context: None,
+            publish_loader=lambda _context: (
+                AdvancedOptionsPublishStageData(
+                    control,
+                    projection,
+                    "v5-canonical-publication",
+                )
+            ),
+            catalog_version=STAGE_CATALOG_VERSION_V5,
+            reference_loader=lambda _context: None,
+            publication_authority_loader=(
+                lambda _context, _handoff: authority
+            ),
+            canonical_publisher=canonical_publisher,
+        )
+
+    pointer_reads = 0
+
+    def fail_after_publish(cursor, **values):
+        nonlocal pointer_reads
+        pointer_reads += 1
+        if pointer_reads == 2:
+            return None
+        return load_portal_release_pointer_cursor(cursor, **values)
+
+    failing = CanonicalPortalPublisher(
+        publisher_database,
+        config,
+        pointer_loader=fail_after_publish,
+    )
+    with pytest.raises(
+        ValueError,
+        match="did not advance its pointer",
+    ):
+        binding(failing.publish).publish(context)
+    with _transaction(
+        p5_database,
+        APP_ROLE,
+        read_only=True,
+    ) as cursor:
+        after_failure = load_portal_release_pointer_cursor(
+            cursor,
+            cohort_id=control.cohort_id,
+            provider_tier=control.binding.provider_tier,
+        )
+    assert after_failure is not None
+    assert after_failure.release_id == prior_release.release_id
+
+    canonical = CanonicalPortalPublisher(
+        publisher_database,
+        config,
+    )
+    runtime = binding(canonical.publish)
+    first = runtime.publish(context)
+    replay = runtime.publish(context)
+
+    assert first.release_id == first.pointer_release_id
+    assert replay.release_id == first.release_id
+    assert not first.dispatch_authorized
+    with _transaction(
+        p5_database,
+        APP_ROLE,
+        read_only=True,
+    ) as cursor:
+        cursor.execute(
+            "SELECT manifest FROM rt.portal_releases "
+            "WHERE release_id=%s",
+            (str(first.release_id),),
+        )
+        manifest = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT count(*) FROM rt.portal_releases "
+            "WHERE receipt_id=%s",
+            (str(portal_receipt_id),),
+        )
+        release_count = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT count(*) FROM rt.detector_datasets "
+            "WHERE dataset_id=%s",
+            (str(cycle.dataset_id),),
+        )
+        dataset_count = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT count(*) FROM rt.snapshot_catalog "
+            "WHERE snapshot_id=ANY(%s::uuid[])",
+            ([str(row.snapshot_id) for row in projection.snapshots],),
+        )
+        snapshot_count = cursor.fetchone()[0]
+    identities = {
+        (row["snapshot_type"], row["snapshot_key"])
+        for row in manifest["snapshots"]
+    }
+    assert (
+        equity_snapshot.snapshot_type,
+        equity_snapshot.snapshot_key,
+    ) in identities
+    assert release_count == 1
+    assert dataset_count == 1
+    assert snapshot_count == len(projection.snapshots)
 
 
 def test_p5_06_close_handoff_has_no_archive_or_retention_effect(

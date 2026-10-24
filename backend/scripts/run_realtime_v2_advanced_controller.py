@@ -86,6 +86,14 @@ from scripts.run_realtime_v2_advanced_equity_ingress import (  # noqa: E402
 
 
 UTC = timezone.utc
+ACTIVE_EXTERNAL_INGRESS_STATUSES = frozenset({
+    "CONNECTING",
+    "AUTHENTICATING",
+    "SUBSCRIBING",
+    "WARMING",
+    "LIVE",
+    "BACKOFF",
+})
 
 
 def _now() -> datetime:
@@ -497,6 +505,39 @@ def _record_terminal(provider, plan_id, outcome, checked_at):
             terminal_outcome=outcome,
             completed_at=checked_at,
         )
+
+
+def _connection_budget_exhausted(
+    controller_status,
+    *,
+    external_ingress: bool,
+) -> bool:
+    if (
+        controller_status.connection_attempt_count
+        < controller_status.maximum_connection_attempts
+    ):
+        return False
+    return not (
+        external_ingress
+        and controller_status.latest_stream_status
+        in ACTIVE_EXTERNAL_INGRESS_STATUSES
+    )
+
+
+def _tick_hybrid_repair(
+    hybrid,
+    *,
+    external_ingress: bool,
+    rest_repair_requests: int,
+    rest_repair_decoded_bytes: int,
+) -> None:
+    if (
+        external_ingress
+        and rest_repair_requests == 0
+        and rest_repair_decoded_bytes == 0
+    ):
+        return
+    hybrid.tick()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1356,7 +1397,17 @@ def main(argv=None) -> int:
             )
             while not stop.is_set():
                 now = _now()
-                hybrid.tick()
+                _tick_hybrid_repair(
+                    hybrid,
+                    external_ingress=args.external_ingress,
+                    rest_repair_requests=(
+                        initial_runtime_scope.budgets.rest_repair_requests
+                    ),
+                    rest_repair_decoded_bytes=(
+                        initial_runtime_scope.budgets
+                        .rest_repair_decoded_bytes
+                    ),
+                )
                 if hybrid.terminal_outcome is not None:
                     _record_terminal(
                         provider,
@@ -1456,9 +1507,9 @@ def main(argv=None) -> int:
                         break
                     stop.wait(settings.bridge_poll_interval_seconds)
                     continue
-                if (
-                    controller_status.connection_attempt_count
-                    >= controller_status.maximum_connection_attempts
+                if _connection_budget_exhausted(
+                    controller_status,
+                    external_ingress=args.external_ingress,
                 ):
                     _record_terminal(
                         provider, plan.plan_id, "AUTHORIZATION_EXHAUSTED", now,

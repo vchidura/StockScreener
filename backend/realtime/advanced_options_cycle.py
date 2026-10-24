@@ -14,7 +14,10 @@ from .advanced_options_reference_state import (
 )
 from .contracts import canonical_json, canonical_sha256
 from .option_portal_adapter import RealtimeOptionPackage
-from .option_portal_repository import persist_realtime_option_package_cursor
+from .option_portal_repository import (
+    load_realtime_option_packages_cursor,
+    persist_realtime_option_package_cursor,
+)
 from .option_source_flow import OptionSourceFlowIdentity
 from .orchestration_repository import (
     OPTIONS_CYCLE,
@@ -191,6 +194,44 @@ NativeDetectorExecutor = Callable[
 ]
 
 
+def _dataset_identity(
+    control_plane: AdvancedOptionsControlPlanePlan,
+    input_gate: AdvancedOptionsInputGatePlan,
+    cutoff: datetime,
+) -> tuple[str, UUID]:
+    dataset_key = (
+        f"advanced-options:{control_plane.cohort_id}:"
+        f"{cutoff.isoformat()}:{input_gate.closure_sha256}"
+    )
+    return dataset_key, uuid5(
+        NAMESPACE_URL,
+        f"stockscreener:advanced-options-dataset:{dataset_key}",
+    )
+
+
+def _cycle_sha256(
+    *,
+    dataset_id: UUID,
+    input_receipt: CycleReceiptSpec,
+    input_gate: AdvancedOptionsInputGatePlan,
+    control_plane: AdvancedOptionsControlPlanePlan,
+    outcomes: tuple[AdvancedOptionsLaneOutcome, ...],
+    build_id: str,
+) -> str:
+    return canonical_sha256({
+        "contract": "advanced-options-cycle-v1",
+        "dataset_id": dataset_id,
+        "input_receipt_sha256": canonical_sha256(input_receipt),
+        "input_closure_sha256": input_gate.closure_sha256,
+        "model_bundle_sha256": control_plane.pins.model_bundle_sha256,
+        "valuation_policy_sha256": (
+            control_plane.pins.valuation_policy_sha256
+        ),
+        "outcomes": tuple(row.outcome_sha256 for row in outcomes),
+        "build_id": build_id,
+    })
+
+
 def run_advanced_options_cycle(
     *,
     control_plane: AdvancedOptionsControlPlanePlan,
@@ -229,13 +270,10 @@ def run_advanced_options_cycle(
         control_plane.manifest_policy.required_detectors,
         key=lambda value: value.value,
     ))
-    dataset_key = (
-        f"advanced-options:{control_plane.cohort_id}:"
-        f"{checked_cutoff.isoformat()}:{input_gate.closure_sha256}"
-    )
-    dataset_id = uuid5(
-        NAMESPACE_URL,
-        f"stockscreener:advanced-options-dataset:{dataset_key}",
+    dataset_key, dataset_id = _dataset_identity(
+        control_plane,
+        input_gate,
+        checked_cutoff,
     )
     reference_repository.freeze_for_cycle(
         reference_state,
@@ -323,19 +361,15 @@ def run_advanced_options_cycle(
             tuple(row.evaluation_id for row in lane_evaluations),
             canonical_sha256(outcome_identity),
         ))
-    cycle_identity = {
-        "contract": "advanced-options-cycle-v1",
-        "dataset_id": dataset_id,
-        "input_receipt_sha256": canonical_sha256(input_receipt),
-        "input_closure_sha256": input_gate.closure_sha256,
-        "model_bundle_sha256": control_plane.pins.model_bundle_sha256,
-        "valuation_policy_sha256": (
-            control_plane.pins.valuation_policy_sha256
-        ),
-        "outcomes": tuple(row.outcome_sha256 for row in outcomes),
-        "build_id": build_id,
-    }
-    cycle_sha256 = canonical_sha256(cycle_identity)
+    outcome_rows = tuple(outcomes)
+    cycle_sha256 = _cycle_sha256(
+        dataset_id=dataset_id,
+        input_receipt=input_receipt,
+        input_gate=input_gate,
+        control_plane=control_plane,
+        outcomes=outcome_rows,
+        build_id=build_id,
+    )
     receipt = build_options_receipt_spec(
         receipt_kind=OPTIONS_CYCLE,
         cutoff=checked_cutoff,
@@ -358,10 +392,283 @@ def run_advanced_options_cycle(
         dataset_status,
         input_gate,
         input_receipt,
-        tuple(outcomes),
+        outcome_rows,
         tuple(evaluations),
         cycle_sha256,
         receipt,
+    )
+
+
+def load_advanced_options_cycle_cursor(
+    cursor,
+    *,
+    control_plane: AdvancedOptionsControlPlanePlan,
+    input_gate: AdvancedOptionsInputGatePlan,
+    input_receipt: CycleReceiptSpec,
+    cycle_receipt: CycleReceiptSpec,
+) -> AdvancedOptionsCycleResult:
+    if (
+        input_receipt.receipt_kind != OPTIONS_INPUT_READY
+        or input_receipt.input_sha256 != input_gate.closure_sha256
+        or cycle_receipt.receipt_kind != OPTIONS_CYCLE
+        or cycle_receipt.cutoff != input_receipt.cutoff
+        or cycle_receipt.reference_generation
+        != input_receipt.reference_generation
+        or cycle_receipt.universe_sha256
+        != control_plane.universe.sha256
+    ):
+        raise ValueError("durable Advanced Options cycle receipt changed")
+    dataset_key, dataset_id = _dataset_identity(
+        control_plane,
+        input_gate,
+        cycle_receipt.cutoff,
+    )
+    cursor.execute(
+        "SELECT dataset_id,cohort_id,provider_tier,dataset_key,"
+        "session_date,status,detector_ids,source_manifest_sha256,"
+        "started_at,completed_at,summary "
+        "FROM rt.detector_datasets WHERE dataset_id=%s",
+        (str(dataset_id),),
+    )
+    stored = cursor.fetchone()
+    if stored is None:
+        raise ValueError("durable Advanced Options cycle is absent")
+    names = (
+        "dataset_id",
+        "cohort_id",
+        "provider_tier",
+        "dataset_key",
+        "session_date",
+        "status",
+        "detector_ids",
+        "source_manifest_sha256",
+        "started_at",
+        "completed_at",
+        "summary",
+    )
+    dataset = (
+        dict(stored)
+        if isinstance(stored, Mapping)
+        else dict(zip(names, stored, strict=True))
+    )
+    summary = dataset["summary"]
+    expected_detectors = tuple(sorted(
+        (
+            detector.value
+            for detector in control_plane.manifest_policy.required_detectors
+        )
+    ))
+    if (
+        UUID(str(dataset["dataset_id"])) != dataset_id
+        or UUID(str(dataset["cohort_id"])) != control_plane.cohort_id
+        or str(dataset["provider_tier"])
+        != control_plane.binding.provider_tier.value
+        or str(dataset["dataset_key"]) != dataset_key
+        or dataset["session_date"] != control_plane.session_date
+        or tuple(sorted(dataset["detector_ids"])) != expected_detectors
+        or str(dataset["source_manifest_sha256"])
+        != input_gate.closure.manifest_sha256
+        or dataset["started_at"] != input_receipt.cutoff
+        or dataset["completed_at"] != cycle_receipt.cutoff
+        or not isinstance(summary, Mapping)
+        or summary.get("input_sha256") != input_gate.closure_sha256
+        or summary.get("cycle_sha256") != cycle_receipt.input_sha256
+        or summary.get("o2_activation") is not False
+    ):
+        raise ValueError("durable Advanced Options dataset identity changed")
+    cursor.execute(
+        "SELECT evaluation_id,dataset_id,event_id,detector_id,"
+        "underlyer,selection_status,observed_at,payload_sha256,payload "
+        "FROM rt.detector_evaluations WHERE dataset_id=%s "
+        "ORDER BY evaluation_id",
+        (str(dataset_id),),
+    )
+    evaluation_names = (
+        "evaluation_id",
+        "dataset_id",
+        "event_id",
+        "detector_id",
+        "underlyer",
+        "selection_status",
+        "observed_at",
+        "payload_sha256",
+        "payload",
+    )
+    evaluation_rows = tuple(
+        (
+            dict(row)
+            if isinstance(row, Mapping)
+            else dict(zip(evaluation_names, row, strict=True))
+        )
+        for row in cursor.fetchall()
+    )
+    cursor.execute(
+        "SELECT evaluation_id,candidate_id,selection_status,"
+        "evidence_sha256,evidence_document "
+        "FROM rt.advanced_options_flow_package_evidence "
+        "WHERE dataset_id=%s ORDER BY evaluation_id",
+        (str(dataset_id),),
+    )
+    evidence_names = (
+        "evaluation_id",
+        "candidate_id",
+        "selection_status",
+        "evidence_sha256",
+        "evidence_document",
+    )
+    evidence_rows = tuple(
+        (
+            dict(row)
+            if isinstance(row, Mapping)
+            else dict(zip(evidence_names, row, strict=True))
+        )
+        for row in cursor.fetchall()
+    )
+    evidence_by_evaluation = {
+        UUID(str(row["evaluation_id"])): row for row in evidence_rows
+    }
+    if (
+        len(evidence_by_evaluation) != len(evidence_rows)
+        or set(evidence_by_evaluation)
+        != {
+            UUID(str(row["evaluation_id"]))
+            for row in evaluation_rows
+        }
+        or any(
+            canonical_sha256(row["evidence_document"])
+            != str(row["evidence_sha256"])
+            for row in evidence_rows
+        )
+    ):
+        raise ValueError(
+            "durable Advanced Options package evidence is incomplete"
+        )
+    candidate_ids = tuple(
+        UUID(str(row["candidate_id"]))
+        for row in evidence_rows
+        if row["candidate_id"] is not None
+    )
+    packages = {
+        package.candidate_id: package
+        for package in load_realtime_option_packages_cursor(
+            cursor,
+            candidate_ids,
+            cohort_id=control_plane.cohort_id,
+        )
+    }
+    evaluations = []
+    for row in evaluation_rows:
+        evaluation_id = UUID(str(row["evaluation_id"]))
+        evidence = evidence_by_evaluation[evaluation_id]
+        payload = row["payload"]
+        candidate_id = (
+            None
+            if evidence["candidate_id"] is None
+            else UUID(str(evidence["candidate_id"]))
+        )
+        package = None if candidate_id is None else packages[candidate_id]
+        evaluation = AdvancedOptionsDetectorEvaluation(
+            evaluation_id=evaluation_id,
+            dataset_id=UUID(str(row["dataset_id"])),
+            event_id=UUID(str(row["event_id"])),
+            detector=DetectorFamily(str(row["detector_id"])),
+            underlyer=str(row["underlyer"]),
+            selection_status=str(row["selection_status"]),
+            observed_at=row["observed_at"],
+            payload_sha256=str(row["payload_sha256"]),
+            payload=payload,
+            package=package,
+        )
+        if (
+            evaluation.dataset_id != dataset_id
+            or canonical_sha256(payload) != evaluation.payload_sha256
+            or str(evidence["selection_status"])
+            != evaluation.selection_status
+            or evidence["evidence_document"].get("dataset_id")
+            != str(dataset_id)
+            or evidence["evidence_document"].get("evaluation_id")
+            != str(evaluation_id)
+            or (
+                evaluation.selection_status == "SELECTED"
+                and package is None
+            )
+            or (
+                evaluation.selection_status != "SELECTED"
+                and package is not None
+            )
+        ):
+            raise ValueError(
+                "durable Advanced Options evaluation identity changed"
+            )
+        evaluations.append(evaluation)
+    lanes = summary.get("lanes")
+    if not isinstance(lanes, list):
+        raise ValueError("durable Advanced Options lane outcomes are absent")
+    outcomes = []
+    for row in lanes:
+        detector = DetectorFamily(str(row["detector"]))
+        evaluation_ids = tuple(
+            evaluation.evaluation_id
+            for evaluation in evaluations
+            if evaluation.detector is detector
+        )
+        state = CycleLaneState(str(row["state"]))
+        reason_codes = tuple(str(value) for value in row["reason_codes"])
+        outcome_sha256 = canonical_sha256({
+            "detector": detector,
+            "state": state,
+            "reason_codes": reason_codes,
+            "evaluation_ids": evaluation_ids,
+        })
+        if outcome_sha256 != str(row["outcome_sha256"]):
+            raise ValueError(
+                "durable Advanced Options lane outcome hash changed"
+            )
+        outcomes.append(AdvancedOptionsLaneOutcome(
+            detector,
+            state,
+            reason_codes,
+            evaluation_ids,
+            outcome_sha256,
+        ))
+    outcome_rows = tuple(outcomes)
+    cycle_sha256 = _cycle_sha256(
+        dataset_id=dataset_id,
+        input_receipt=input_receipt,
+        input_gate=input_gate,
+        control_plane=control_plane,
+        outcomes=outcome_rows,
+        build_id=cycle_receipt.build_id,
+    )
+    dataset_status = (
+        "DEGRADED"
+        if any(
+            row.state in {
+                CycleLaneState.BLOCKED,
+                CycleLaneState.UNAVAILABLE,
+            }
+            for row in outcome_rows
+        )
+        else "COMPLETE"
+    )
+    if (
+        cycle_sha256 != cycle_receipt.input_sha256
+        or str(dataset["status"]) != dataset_status
+        or tuple(sorted(
+            row.detector.value for row in outcome_rows
+        )) != expected_detectors
+    ):
+        raise ValueError("durable Advanced Options cycle hash changed")
+    return AdvancedOptionsCycleResult(
+        dataset_id,
+        dataset_key,
+        dataset_status,
+        input_gate,
+        input_receipt,
+        outcome_rows,
+        tuple(evaluations),
+        cycle_sha256,
+        cycle_receipt,
     )
 
 

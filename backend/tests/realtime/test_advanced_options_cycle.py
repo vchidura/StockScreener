@@ -97,13 +97,6 @@ def test_cycle_records_every_lane_and_keeps_o2_explicitly_unavailable():
         {"native": "O1", "score": "1.0"},
         package,
     )
-    observed = AdvancedOptionsNativeEvaluation(
-        UUID("11111111-aaaa-bbbb-cccc-222222222222"),
-        "SPY",
-        "OBSERVATION",
-        NOW,
-        {"native": "S2", "value": 0},
-    )
     o2_calls = []
     reference_repository = _reference_repository()
     executors = {
@@ -112,13 +105,6 @@ def test_cycle_records_every_lane_and_keeps_o2_explicitly_unavailable():
             o2_calls.append(True) or _complete()
         ),
         DetectorFamily.O3: lambda _context: _complete(),
-        DetectorFamily.S1: lambda _context: (
-            AdvancedOptionsNativeLaneResult(
-                NativeLaneState.BLOCKED,
-                ("PACKAGE_PREREQUISITE_MISSING",),
-            )
-        ),
-        DetectorFamily.S2: lambda _context: _complete(observed),
     }
 
     first = run_advanced_options_cycle(
@@ -155,7 +141,6 @@ def test_cycle_records_every_lane_and_keeps_o2_explicitly_unavailable():
     assert outcomes[DetectorFamily.O3].state is (
         CycleLaneState.COMPLETE_ZERO
     )
-    assert outcomes[DetectorFamily.S1].state is CycleLaneState.BLOCKED
     assert outcomes[DetectorFamily.O2].state is CycleLaneState.UNAVAILABLE
     assert outcomes[DetectorFamily.O2].reason_codes == (
         O2_MODEL_NOT_ACCEPTED,
@@ -183,6 +168,49 @@ def test_missing_executors_are_blocked_not_missing_cycle_rows():
         row.state in {CycleLaneState.BLOCKED, CycleLaneState.UNAVAILABLE}
         for row in cycle.outcomes
     )
+    assert cycle.evaluations == ()
+
+
+def test_options_lane_failure_does_not_touch_equity_detector_state():
+    control = _control_plane()
+    gate, receipt = _gate_and_receipt()
+    equity_detector_state = {
+        "ADVANCED_EQUITY_S1": "DETECTED",
+        "ADVANCED_EQUITY_S2": "COMPLETE_ZERO",
+    }
+
+    cycle = run_advanced_options_cycle(
+        control_plane=control,
+        input_gate=gate,
+        input_receipt=receipt,
+        executors={
+            DetectorFamily.O1: lambda _context: (
+                AdvancedOptionsNativeLaneResult(
+                    NativeLaneState.BLOCKED,
+                    ("O1_INPUT_UNAVAILABLE",),
+                )
+            ),
+            DetectorFamily.O3: lambda _context: _complete(),
+        },
+        cutoff=NOW,
+        reference_generation=7,
+        reference_repository=_reference_repository(),
+        build_id="p4-build",
+    )
+
+    assert equity_detector_state == {
+        "ADVANCED_EQUITY_S1": "DETECTED",
+        "ADVANCED_EQUITY_S2": "COMPLETE_ZERO",
+    }
+    outcomes = {row.detector: row for row in cycle.outcomes}
+    assert set(outcomes) == {
+        DetectorFamily.O1,
+        DetectorFamily.O2,
+        DetectorFamily.O3,
+    }
+    assert outcomes[DetectorFamily.O1].state is CycleLaneState.BLOCKED
+    assert outcomes[DetectorFamily.O2].state is CycleLaneState.UNAVAILABLE
+    assert outcomes[DetectorFamily.O3].state is CycleLaneState.COMPLETE_ZERO
     assert cycle.evaluations == ()
 
 

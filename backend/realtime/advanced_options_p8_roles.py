@@ -49,6 +49,22 @@ from .advanced_options_provider_contract import (
     MASSIVE_OPTIONS_PROVIDER_CONTRACT,
     load_default_options_exchange_reference,
 )
+from .advanced_options_resident_barrier import (
+    ResidentCompletion,
+    ResidentCompletionBarrierState,
+    ResidentCompletionMember,
+    ResidentCompletionStatus,
+    evaluate_resident_completion_barrier_cursor,
+    load_ready_resident_window_targets_cursor,
+    record_resident_completion_cursor,
+)
+from .advanced_options_v3_authority import (
+    consume_session_acquisition_authority_cursor,
+    session_acquisition_authorization_from_payload,
+)
+from .advanced_options_v3_deployment import (
+    validate_advanced_options_v3_runtime_identity,
+)
 from .advanced_options_service import AdvancedOptionsProcessKind
 from .advanced_options_service import AdvancedOptionsPostgresLeasePort
 from .buffer import BufferLimits, RawMessageBuffer
@@ -84,9 +100,10 @@ from .orchestration_repository import (
     WindowRecord,
 )
 from .runner_environment import RunnerEnvironment
-from .stage_graph import STAGES_V4
+from .stage_graph import STAGE_CATALOG_VERSION_V5
 from .stage_orchestrator import StageContext
 from .stage_runners_options import OptionsFlowSettings, options_flow_runner
+from .advanced_options_service import OPTIONS_LATE_CANARY_V4_STAGE_ORDER
 
 
 UTC = timezone.utc
@@ -96,6 +113,234 @@ _EFFECTS = {
     "broker": False,
     "trading": False,
 }
+
+
+def _record_v3_resident_completion(
+    provider,
+    binding,
+    *,
+    bundle,
+    member: ResidentCompletionMember,
+    journal_generation: UUID,
+    owner_epoch: int,
+    ending_offset: int,
+    evidence: dict[str, object],
+    target_window_id: UUID | None = None,
+) -> None:
+    if (
+        bundle.get("orchestration", {}).get("catalog_version")
+        != STAGE_CATALOG_VERSION_V5
+    ):
+        return
+    completion = ResidentCompletion(
+        target_window_id=target_window_id or binding.window_id,
+        target_cohort_id=binding.enrollment.control_plane.cohort_id,
+        member=member,
+        journal_generation=journal_generation,
+        owner_epoch=owner_epoch,
+        ending_offset=ending_offset,
+        evidence_sha256=canonical_sha256(evidence),
+        evidence=evidence,
+        status=ResidentCompletionStatus.COMPLETE,
+        reason_codes=(),
+        completed_at=datetime.now(UTC),
+    )
+    with provider.transaction(APP_ROLE) as unit:
+        record_resident_completion_cursor(unit.cursor, completion)
+
+
+def _snapshot_v3_resident_windows(
+    provider,
+    binding,
+    *,
+    bundle,
+    member: ResidentCompletionMember,
+    owner_epoch: int,
+    reader: RawJournalReader,
+    raw_offset: int,
+    event_offset: int,
+    connection_attempts: int = 1,
+    shard_map_sha256_value: str | None = None,
+    evidence_ref: str | None = None,
+) -> int:
+    if (
+        bundle.get("orchestration", {}).get("catalog_version")
+        != STAGE_CATALOG_VERSION_V5
+    ):
+        return 0
+    authorities = bundle.get("v3_authorities")
+    if not isinstance(authorities, dict):
+        raise RuntimeError("V3 session authority is unavailable")
+    session = session_acquisition_authorization_from_payload(
+        authorities.get("session_acquisition")
+    )
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        targets = load_ready_resident_window_targets_cursor(
+            unit.cursor,
+            session_authorization_id=session.authorization_id,
+            member=member,
+        )
+    recorded = 0
+    for target in targets:
+        target_raw, target_event = reader.offsets_at(
+            target.options_cutoff
+        )
+        if target_raw <= 0 or target_event <= 0:
+            continue
+        if member is ResidentCompletionMember.INGRESS:
+            ready = (
+                raw_offset >= target_raw
+                and event_offset >= target_event
+            )
+            evidence = {
+                "status": "COMPLETE",
+                "kind": member.value,
+                "raw_end_offset": target_raw,
+                "normalized_end_offset": target_event,
+                "connection_attempts": connection_attempts,
+                "effects": dict(_EFFECTS),
+            }
+            ending_offset = target_event
+        elif member is ResidentCompletionMember.MARKET_STATE:
+            ready = event_offset >= target_event
+            if shard_map_sha256_value is None:
+                raise RuntimeError(
+                    "V3 market-state snapshot lacks shard identity"
+                )
+            evidence = {
+                "status": "COMPLETE",
+                "kind": member.value,
+                "normalized_end_offset": target_event,
+                "state_sha256": canonical_sha256({
+                    "target_window_id": str(target.target_window_id),
+                    "journal_generation": str(
+                        target.journal_generation
+                    ),
+                    "normalized_end_offset": target_event,
+                }),
+                "shard_map_sha256": shard_map_sha256_value,
+                "effects": dict(_EFFECTS),
+            }
+            ending_offset = target_event
+        else:
+            ready = (
+                raw_offset >= target_raw
+                and event_offset >= target_raw
+            )
+            if evidence_ref is None:
+                raise RuntimeError(
+                    "V3 flow snapshot lacks durable evidence"
+                )
+            evidence = {
+                "status": "COMPLETE",
+                "kind": member.value,
+                "raw_end_offset": target_raw,
+                "checkpoint_end_offset": target_raw,
+                "owner_epoch": owner_epoch,
+                "evidence_ref": (
+                    f"{evidence_ref}:window:{target.target_window_id}:"
+                    f"{target_raw}"
+                ),
+                "effects": dict(_EFFECTS),
+            }
+            ending_offset = target_raw
+        if not ready:
+            continue
+        _record_v3_resident_completion(
+            provider,
+            binding,
+            bundle=bundle,
+            member=member,
+            journal_generation=target.journal_generation,
+            owner_epoch=owner_epoch,
+            ending_offset=ending_offset,
+            evidence=evidence,
+            target_window_id=target.target_window_id,
+        )
+        recorded += 1
+    return recorded
+
+
+def _v3_resident_dependencies(provider, binding, bundle):
+    if (
+        bundle.get("orchestration", {}).get("catalog_version")
+        != STAGE_CATALOG_VERSION_V5
+    ):
+        return None
+    control = binding.enrollment.control_plane
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        verdict = evaluate_resident_completion_barrier_cursor(
+            unit.cursor,
+            target_window_id=binding.window_id,
+            target_cohort_id=control.cohort_id,
+            journal_generation=control.source_flow.journal_generation,
+        )
+    if verdict.state is ResidentCompletionBarrierState.FAILED:
+        raise RuntimeError(
+            "P8 V3 resident completion failed: "
+            + ",".join(verdict.reason_codes)
+        )
+    if verdict.state is ResidentCompletionBarrierState.WAITING_INPUT:
+        return {
+            "status": "DEFERRED",
+            "reason_codes": verdict.reason_codes,
+        }
+    return {
+        member.member.value: dict(member.evidence)
+        for member in verdict.members
+    }
+
+
+def _record_v3_resident_failure(
+    provider,
+    binding,
+    *,
+    bundle,
+    kind: AdvancedOptionsProcessKind,
+    error: BaseException,
+) -> None:
+    member_by_kind = {
+        AdvancedOptionsProcessKind.INGRESS: ResidentCompletionMember.INGRESS,
+        AdvancedOptionsProcessKind.MARKET_STATE: (
+            ResidentCompletionMember.MARKET_STATE
+        ),
+        AdvancedOptionsProcessKind.FLOW: ResidentCompletionMember.FLOW,
+    }
+    member = member_by_kind.get(kind)
+    if (
+        member is None
+        or bundle.get("orchestration", {}).get("catalog_version")
+        != STAGE_CATALOG_VERSION_V5
+    ):
+        return
+    try:
+        _owner_id, owner_epoch = _lease(provider, bundle, kind)
+    except BaseException:
+        return
+    reason = f"ROLE_EXCEPTION:{type(error).__name__}"
+    evidence = {
+        "status": "FAILED",
+        "kind": kind.value,
+        "reason_codes": [reason],
+        "effects": dict(_EFFECTS),
+    }
+    completion = ResidentCompletion(
+        target_window_id=binding.window_id,
+        target_cohort_id=binding.enrollment.control_plane.cohort_id,
+        member=member,
+        journal_generation=(
+            binding.enrollment.control_plane.source_flow.journal_generation
+        ),
+        owner_epoch=owner_epoch,
+        ending_offset=0,
+        evidence_sha256=canonical_sha256(evidence),
+        evidence=evidence,
+        status=ResidentCompletionStatus.FAILED,
+        reason_codes=(reason,),
+        completed_at=datetime.now(UTC),
+    )
+    with provider.transaction(APP_ROLE) as unit:
+        record_resident_completion_cursor(unit.cursor, completion)
 
 
 def _provider(environment):
@@ -255,6 +500,45 @@ def _shard_map(binding):
 
 def _run_ingress(*, package, bundle, binding, provider, environment, stop_event):
     control = binding.enrollment.control_plane
+    if (
+        bundle.get("orchestration", {}).get("catalog_version")
+        == STAGE_CATALOG_VERSION_V5
+    ):
+        validate_advanced_options_v3_runtime_identity(package, bundle)
+        authorities = bundle.get("v3_authorities")
+        if not isinstance(authorities, dict):
+            raise RuntimeError("V3 split authorities are unavailable")
+        session_authority = (
+            session_acquisition_authorization_from_payload(
+                authorities.get("session_acquisition")
+            )
+        )
+        if (
+            session_authority.cohort_id != control.cohort_id
+            or session_authority.journal_generation
+            != control.source_flow.journal_generation
+        ):
+            raise RuntimeError(
+                "V3 session acquisition authority scope changed"
+            )
+        effect_sha256 = canonical_sha256({
+            "schema": "advanced-options-v3-provider-effect-v1",
+            "package_sha256": package["package_sha256"],
+            "bundle_sha256": bundle["bundle_sha256"],
+            "cohort_id": str(control.cohort_id),
+            "journal_generation": str(
+                control.source_flow.journal_generation
+            ),
+            "channels": ["T", "Q"],
+        })
+        with provider.transaction(APP_ROLE) as unit:
+            consume_session_acquisition_authority_cursor(
+                unit.cursor,
+                session_authority,
+                effect_kind="PROVIDER_SOCKET",
+                effect_identity_sha256=effect_sha256,
+                consumed_at=datetime.now(UTC),
+            )
     owner_id, owner_epoch = _lease(
         provider,
         bundle,
@@ -286,6 +570,7 @@ def _run_ingress(*, package, bundle, binding, provider, environment, stop_event)
         )
 
     latest_progress = [None]
+    attempts_state = [1]
 
     def progress(value):
         latest_progress[0] = value
@@ -298,6 +583,17 @@ def _run_ingress(*, package, bundle, binding, provider, environment, stop_event)
                 bridge_committed_offset=None,
                 checked_at=datetime.now(UTC),
             )
+        _snapshot_v3_resident_windows(
+            provider,
+            binding,
+            bundle=bundle,
+            member=ResidentCompletionMember.INGRESS,
+            owner_epoch=owner_epoch,
+            reader=RawJournalReader(path),
+            raw_offset=value.last_raw_offset,
+            event_offset=value.last_event_offset,
+            connection_attempts=attempts_state[0],
+        )
 
     limits = package["websocket_ingress"]
     buffer = RawMessageBuffer(
@@ -342,13 +638,22 @@ def _run_ingress(*, package, bundle, binding, provider, environment, stop_event)
     async def capture():
         attempts = 0
         stop = datetime.fromisoformat(package["window"]["stop_utc"])
-        stop_at = min(
-            stop,
-            control.receipts.options_input_ready.spec.cutoff,
+        continuous = (
+            bundle.get("orchestration", {}).get("catalog_version")
+            == STAGE_CATALOG_VERSION_V5
         )
-        message_target = min(
-            int(limits["decoded_messages"]),
-            2_000,
+        stop_at = (
+            stop
+            if continuous
+            else min(
+                stop,
+                control.receipts.options_input_ready.spec.cutoff,
+            )
+        )
+        message_target = (
+            int(limits["decoded_messages"])
+            if continuous
+            else min(int(limits["decoded_messages"]), 2_000)
         )
         while (
             not stop_event.is_set()
@@ -357,6 +662,7 @@ def _run_ingress(*, package, bundle, binding, provider, environment, stop_event)
             and gateway.received_messages < message_target
         ):
             attempts += 1
+            attempts_state[0] = attempts
             remaining = max(
                 0.1,
                 (stop_at - datetime.now(UTC)).total_seconds(),
@@ -374,6 +680,25 @@ def _run_ingress(*, package, bundle, binding, provider, environment, stop_event)
                 break
             if attempts < int(limits["connection_attempts"]):
                 await asyncio.sleep(min(5.0 * (2 ** (attempts - 1)), 60.0))
+        if continuous:
+            while (
+                not stop_event.is_set()
+                and datetime.now(UTC) < stop_at
+            ):
+                value = latest_progress[0]
+                if value is not None:
+                    _snapshot_v3_resident_windows(
+                        provider,
+                        binding,
+                        bundle=bundle,
+                        member=ResidentCompletionMember.INGRESS,
+                        owner_epoch=owner_epoch,
+                        reader=RawJournalReader(path),
+                        raw_offset=value.last_raw_offset,
+                        event_offset=value.last_event_offset,
+                        connection_attempts=max(1, attempts),
+                    )
+                await asyncio.sleep(0.1)
         return attempts
 
     pump.start()
@@ -402,7 +727,7 @@ def _run_ingress(*, package, bundle, binding, provider, environment, stop_event)
             sealed_files_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
             checked_at=datetime.now(UTC),
         )
-    return {
+    evidence = {
         "status": "COMPLETE",
         "kind": AdvancedOptionsProcessKind.INGRESS.value,
         "raw_end_offset": final.last_raw_offset,
@@ -410,13 +735,40 @@ def _run_ingress(*, package, bundle, binding, provider, environment, stop_event)
         "connection_attempts": attempts,
         "effects": dict(_EFFECTS),
     }
+    if (
+        bundle.get("orchestration", {}).get("catalog_version")
+        == STAGE_CATALOG_VERSION_V5
+    ):
+        _snapshot_v3_resident_windows(
+            provider,
+            binding,
+            bundle=bundle,
+            member=ResidentCompletionMember.INGRESS,
+            owner_epoch=owner_epoch,
+            reader=RawJournalReader(path),
+            raw_offset=final.last_raw_offset,
+            event_offset=final.last_event_offset,
+            connection_attempts=attempts,
+        )
+    else:
+        _record_v3_resident_completion(
+            provider,
+            binding,
+            bundle=bundle,
+            member=ResidentCompletionMember.INGRESS,
+            journal_generation=registration.journal_generation,
+            owner_epoch=owner_epoch,
+            ending_offset=final.last_event_offset,
+            evidence=evidence,
+        )
+    return evidence
 
 
 def _run_market_state(
     *, package, bundle, binding, provider, environment, stop_event
 ):
     control = binding.enrollment.control_plane
-    owner_id, _owner_epoch = _lease(
+    owner_id, owner_epoch = _lease(
         provider,
         bundle,
         AdvancedOptionsProcessKind.MARKET_STATE,
@@ -452,7 +804,13 @@ def _run_market_state(
     )
     planned = None
     try:
-        while not stop_event.is_set():
+        while True:
+            current = _registration(
+                provider,
+                registration.journal_generation,
+            )
+            if current is not None:
+                source.registration = current
             planned = consumer.plan_slice(maximum_records=10_000)
             if planned.record_count:
                 with provider.transaction(APP_ROLE) as unit:
@@ -473,9 +831,16 @@ def _run_market_state(
                 now=datetime.now(UTC),
             ):
                 raise RuntimeError("P8 market-state shard lease was lost")
-            current = _registration(
+            _snapshot_v3_resident_windows(
                 provider,
-                registration.journal_generation,
+                binding,
+                bundle=bundle,
+                member=ResidentCompletionMember.MARKET_STATE,
+                owner_epoch=owner_epoch,
+                reader=RawJournalReader(source.path),
+                raw_offset=0,
+                event_offset=consumer.committed_offset,
+                shard_map_sha256_value=consumer.shard_map.sha256,
             )
             if (
                 current is not None
@@ -485,12 +850,15 @@ def _run_market_state(
             ):
                 break
             if not planned.record_count:
-                stop_event.wait(0.1)
+                if stop_event.is_set():
+                    time.sleep(0.05)
+                else:
+                    stop_event.wait(0.1)
     finally:
         leases.release(resource, owner_id, shard_epoch)
     if consumer.committed_offset <= 0 or planned is None:
         raise RuntimeError("P8 market-state consumed no normalized data")
-    return {
+    evidence = {
         "status": "COMPLETE",
         "kind": AdvancedOptionsProcessKind.MARKET_STATE.value,
         "normalized_end_offset": consumer.committed_offset,
@@ -498,6 +866,33 @@ def _run_market_state(
         "shard_map_sha256": consumer.shard_map.sha256,
         "effects": dict(_EFFECTS),
     }
+    if (
+        bundle.get("orchestration", {}).get("catalog_version")
+        == STAGE_CATALOG_VERSION_V5
+    ):
+        _snapshot_v3_resident_windows(
+            provider,
+            binding,
+            bundle=bundle,
+            member=ResidentCompletionMember.MARKET_STATE,
+            owner_epoch=owner_epoch,
+            reader=RawJournalReader(source.path),
+            raw_offset=0,
+            event_offset=consumer.committed_offset,
+            shard_map_sha256_value=consumer.shard_map.sha256,
+        )
+    else:
+        _record_v3_resident_completion(
+            provider,
+            binding,
+            bundle=bundle,
+            member=ResidentCompletionMember.MARKET_STATE,
+            journal_generation=registration.journal_generation,
+            owner_epoch=owner_epoch,
+            ending_offset=consumer.committed_offset,
+            evidence=evidence,
+        )
+    return evidence
 
 
 def _contract_scope(binding, policy):
@@ -644,7 +1039,13 @@ def _run_flow(*, package, bundle, binding, provider, environment, stop_event):
     )
     runner = options_flow_runner(runner_environment)
     outcome = None
-    while not stop_event.is_set():
+    while True:
+        current = _registration(
+            provider,
+            registration.journal_generation,
+        )
+        if current is not None:
+            source.registration = current
         outcome = runner(context)
         if outcome.state != "COMPLETE":
             raise RuntimeError(
@@ -652,7 +1053,18 @@ def _run_flow(*, package, bundle, binding, provider, environment, stop_event):
                 + ",".join(outcome.reason_codes)
             )
         session = runner_environment.options_flow_state.session
-        current = _registration(provider, registration.journal_generation)
+        if session is not None and outcome.evidence_ref is not None:
+            _snapshot_v3_resident_windows(
+                provider,
+                binding,
+                bundle=bundle,
+                member=ResidentCompletionMember.FLOW,
+                owner_epoch=owner_epoch,
+                reader=RawJournalReader(source.path),
+                raw_offset=session.consumer.fed_offset,
+                event_offset=session.consumer.checkpointed_offset,
+                evidence_ref=outcome.evidence_ref,
+            )
         if (
             session is not None
             and current is not None
@@ -663,11 +1075,14 @@ def _run_flow(*, package, bundle, binding, provider, environment, stop_event):
         ):
             session.consumer.finish()
             break
-        stop_event.wait(0.1)
+        if stop_event.is_set():
+            time.sleep(0.05)
+        else:
+            stop_event.wait(0.1)
     session = runner_environment.options_flow_state.session
     if session is None or session.consumer.checkpointed_offset <= 0:
         raise RuntimeError("P8 flow produced no durable checkpoint")
-    return {
+    evidence = {
         "status": "COMPLETE",
         "kind": AdvancedOptionsProcessKind.FLOW.value,
         "raw_end_offset": session.consumer.fed_offset,
@@ -676,6 +1091,33 @@ def _run_flow(*, package, bundle, binding, provider, environment, stop_event):
         "evidence_ref": outcome.evidence_ref,
         "effects": dict(_EFFECTS),
     }
+    if (
+        bundle.get("orchestration", {}).get("catalog_version")
+        == STAGE_CATALOG_VERSION_V5
+    ):
+        _snapshot_v3_resident_windows(
+            provider,
+            binding,
+            bundle=bundle,
+            member=ResidentCompletionMember.FLOW,
+            owner_epoch=owner_epoch,
+            reader=RawJournalReader(source.path),
+            raw_offset=session.consumer.fed_offset,
+            event_offset=session.consumer.checkpointed_offset,
+            evidence_ref=outcome.evidence_ref,
+        )
+    else:
+        _record_v3_resident_completion(
+            provider,
+            binding,
+            bundle=bundle,
+            member=ResidentCompletionMember.FLOW,
+            journal_generation=registration.journal_generation,
+            owner_epoch=owner_epoch,
+            ending_offset=session.consumer.checkpointed_offset,
+            evidence=evidence,
+        )
+    return evidence
 
 
 def _wait_role_evidence(environment, kind, stop_event):
@@ -708,20 +1150,101 @@ def _wait_role_evidence(environment, kind, stop_event):
 
 
 def _run_window(
-    *, package, bundle, binding, provider, environment, stop_event
+    *,
+    package,
+    bundle,
+    binding,
+    provider,
+    environment,
+    stop_event,
+    pool=None,
 ):
-    dependencies = {
-        kind.value: _wait_role_evidence(
-            environment,
-            kind,
-            stop_event,
+    catalog_version = bundle.get("orchestration", {}).get(
+        "catalog_version"
+    )
+    if catalog_version == STAGE_CATALOG_VERSION_V5:
+        validate_advanced_options_v3_runtime_identity(package, bundle)
+        if pool is None:
+            raise RuntimeError("V3 WINDOW publication pool is unavailable")
+        from .advanced_options_p8_production import (
+            load_v3_pending_window_bindings,
+            run_v3_serial_window,
         )
-        for kind in (
-            AdvancedOptionsProcessKind.INGRESS,
-            AdvancedOptionsProcessKind.MARKET_STATE,
-            AdvancedOptionsProcessKind.FLOW,
-        )
-    }
+
+        results: dict[str, dict[str, object]] = {}
+        while not stop_event.is_set():
+            windows = load_v3_pending_window_bindings(
+                provider=provider,
+                binding=binding,
+                bundle=bundle,
+                available_at=datetime.now(UTC),
+            )
+            if not windows:
+                stop_event.wait(0.1)
+                continue
+            progressed = False
+            for window_binding in windows:
+                dependencies = _v3_resident_dependencies(
+                    provider,
+                    window_binding,
+                    bundle,
+                )
+                window_key = str(window_binding.window_id)
+                if (
+                    dependencies is not None
+                    and dependencies.get("status") == "DEFERRED"
+                ):
+                    results[window_key] = {
+                        "status": "DEFERRED",
+                        "reason_codes": list(
+                            dependencies["reason_codes"]
+                        ),
+                    }
+                    continue
+                result = run_v3_serial_window(
+                    provider=provider,
+                    pool=pool,
+                    binding=window_binding,
+                    package=package,
+                    bundle=bundle,
+                    environment=environment,
+                    dependency_evidence=dependencies,
+                )
+                results[window_key] = dict(result)
+                progressed = True
+            if not progressed:
+                stop_event.wait(0.1)
+        return {
+            "status": "COMPLETE",
+            "kind": AdvancedOptionsProcessKind.WINDOW.value,
+            "windows": results,
+            "effects": dict(_EFFECTS),
+        }
+    dependencies = _v3_resident_dependencies(provider, binding, bundle)
+    if (
+        dependencies is not None
+        and dependencies.get("status") == "DEFERRED"
+    ):
+        return {
+            "status": "DEFERRED",
+            "kind": AdvancedOptionsProcessKind.WINDOW.value,
+            "window_id": str(binding.window_id),
+            "reason_codes": list(dependencies["reason_codes"]),
+            "effects": dict(_EFFECTS),
+        }
+    if dependencies is None:
+        dependencies = {
+            kind.value: _wait_role_evidence(
+                environment,
+                kind,
+                stop_event,
+            )
+            for kind in (
+                AdvancedOptionsProcessKind.INGRESS,
+                AdvancedOptionsProcessKind.MARKET_STATE,
+                AdvancedOptionsProcessKind.FLOW,
+            )
+        }
     from .advanced_options_p8_production import run_p8_serial_window
 
     result = run_p8_serial_window(
@@ -731,21 +1254,15 @@ def _run_window(
         environment=environment,
         dependency_evidence=dependencies,
     )
+    expected_order = list(OPTIONS_LATE_CANARY_V4_STAGE_ORDER)
     if (
         result.get("status") != "FINISHED"
         or result.get("window_state") != "COMPLETE"
-        or result.get("stage_order")
-        != [
-            "OPTIONS_ACQUIRE",
-            "OPTIONS_ADMISSION",
-            "OPTIONS_FLOW",
-            "OPTIONS_INPUT_GATE",
-            "OPTIONS_CYCLE",
-            "OPTIONS_PROJECTION",
-            "OPTIONS_PUBLISH",
-        ]
+        or result.get("stage_order") != expected_order
     ):
-        raise RuntimeError("P8 serial WINDOW did not complete")
+        raise RuntimeError(
+            "Advanced Options WINDOW did not complete its exact stages"
+        )
     return {
         "status": "COMPLETE",
         "kind": AdvancedOptionsProcessKind.WINDOW.value,
@@ -791,7 +1308,16 @@ def run_p8_role(
         if kind is AdvancedOptionsProcessKind.FLOW:
             return _run_flow(**arguments)
         if kind is AdvancedOptionsProcessKind.WINDOW:
-            return _run_window(**arguments)
+            return _run_window(**arguments, pool=pool)
         raise RuntimeError("P8 Docker role kind is invalid")
+    except BaseException as error:
+        _record_v3_resident_failure(
+            provider,
+            binding,
+            bundle=bundle,
+            kind=kind,
+            error=error,
+        )
+        raise
     finally:
         pool.closeall()

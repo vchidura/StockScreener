@@ -395,6 +395,48 @@ def _admit(provider, plan, *, attempt, owner_epoch, session_id):
         )
 
 
+def test_controller_status_reports_active_external_stream(
+    hardened_database,
+):
+    pool, provider, roles, _cohort_id, _manifest_id = hardened_database
+    authorization = _create_authorization(
+        pool,
+        roles,
+        "active-external-stream",
+    )
+    plan = _prepare_plan(provider, authorization)
+    session_id = uuid4()
+    _admit(
+        provider,
+        plan,
+        attempt=1,
+        owner_epoch=1,
+        session_id=session_id,
+    )
+    with provider.transaction(APP_ROLE) as unit:
+        unit.cursor.execute(
+            "INSERT INTO rt.stream_sessions ("
+            "session_id,provider,feed,manifest_id,owner_id,owner_epoch,"
+            "started_at,status) VALUES "
+            "(%s,'fixture','STOCKS',%s,%s,1,%s,'CONNECTING')",
+            (
+                str(session_id),
+                str(plan.manifest_id),
+                str(uuid4()),
+                SESSION_OPEN + timedelta(minutes=1),
+            ),
+        )
+
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        status = advanced_ingress_controller_status_cursor(
+            unit.cursor,
+            plan.plan_id,
+        )
+
+    assert status.connection_attempt_count == 1
+    assert status.latest_stream_status == "CONNECTING"
+
+
 def test_canary_persists_deadline_and_counters_and_rejects_widening(hardened_database):
     pool, provider, roles, _cohort_id, _manifest_id = hardened_database
     budgets = AdvancedIngressBudgets(3, 3, 10_000, 0, 0)
@@ -783,6 +825,95 @@ def test_terminal_controller_outcome_is_durable_and_cannot_restart(
             owner_epoch=1,
             session_id=uuid4(),
         )
+
+
+def test_journal_writing_transition_is_idempotent_with_stale_check_time(
+    hardened_database,
+    tmp_path,
+):
+    pool, provider, roles, _cohort_id, _manifest_id = hardened_database
+    budgets = AdvancedIngressBudgets(2, 2, 10_000, 0, 0)
+    authorization = _create_authorization(
+        pool,
+        roles,
+        "journal-writing-idempotent",
+        budgets=budgets,
+    )
+    plan = _prepare_plan(provider, authorization, budgets=budgets)
+    generation = uuid4()
+    scope = AdvancedStreamScope(
+        ingress_plan_id=plan.plan_id,
+        cohort_id=plan.cohort_id,
+        manifest_id=plan.manifest_id,
+        journal_generation=generation,
+        owner_id=uuid4(),
+        feed=MarketFeed.STOCKS,
+        normalizer_version=NORMALIZER_VERSION,
+        authorization_reference=plan.authorization_reference,
+        connection_attempt=1,
+        connection_ceiling=2,
+        decoded_byte_ceiling=10_000,
+        stale_after_seconds=60,
+        started_at=SESSION_OPEN + timedelta(minutes=1),
+    )
+    with provider.transaction(APP_ROLE) as unit:
+        session = register_advanced_stream_session_cursor(
+            unit.cursor,
+            scope,
+        )
+
+    root = tmp_path / "mounted-journals"
+    root.mkdir()
+    path = root / "crash.sqlite"
+    bridge_config = AdvancedEquityJournalBridgeConfig(
+        cohort_id=plan.cohort_id,
+        journal_generation=generation,
+        stream_session_id=session.session_id,
+        owner_epoch=session.owner_epoch,
+        normalizer_version=NORMALIZER_VERSION,
+        shard_ids=(0,),
+        batch_limit=100,
+    )
+    registration = build_advanced_journal_registration(
+        root=root,
+        path=path,
+        journal_generation=generation,
+        plan_id=plan.plan_id,
+        stream_session_id=session.session_id,
+        cohort_id=plan.cohort_id,
+        manifest_id=plan.manifest_id,
+        session_date=plan.session_date,
+        owner_epoch=session.owner_epoch,
+        normalizer_version=NORMALIZER_VERSION,
+        shard_ids=(0,),
+        shard_map_sha256=bridge_config.shard_map_sha256,
+    )
+    capacity = measure_journal_capacity(
+        root,
+        minimum_free_bytes=1,
+        minimum_free_percent=1,
+    )
+    assert capacity.admitted
+    with provider.transaction(APP_ROLE) as unit:
+        register_advanced_journal_cursor(unit.cursor, registration)
+        mark_advanced_journal_writing_cursor(
+            unit.cursor,
+            generation,
+            checked_at=scope.started_at,
+        )
+    with provider.transaction(APP_ROLE) as unit:
+        mark_advanced_journal_writing_cursor(
+            unit.cursor,
+            generation,
+            checked_at=scope.started_at - timedelta(seconds=1),
+        )
+        unit.cursor.execute(
+            "SELECT status,updated_at "
+            "FROM rt.advanced_journal_registry "
+            "WHERE journal_generation=%s",
+            (str(generation),),
+        )
+        assert unit.cursor.fetchone() == ("WRITING", scope.started_at)
 
 
 def test_registered_raw_commit_replays_to_one_canonical_bar_and_checkpoint(

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import gc
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -139,7 +139,8 @@ def input_ready_identity(
         if scope is None:
             raise ValueError("INPUT_READY requires the exact cohort, manifest and profile")
         cursor.execute(
-            "SELECT instrument.instrument_id, reference.security_id, reference.ticker, "
+            "SELECT DISTINCT ON (instrument.instrument_id) "
+            "instrument.instrument_id, reference.security_id, reference.ticker, "
             "reference.revision_id, reference.payload_sha256 "
             "FROM rt.subscription_members AS member "
             "JOIN rt.instruments AS instrument USING (instrument_id) "
@@ -147,7 +148,9 @@ def input_ready_identity(
             "WHERE member.manifest_id=%s AND instrument.asset_class='EQUITY' AND member.channel='AM' "
             "AND reference.effective_from<=%s "
             "AND (reference.effective_to IS NULL OR reference.effective_to>%s) "
-            "AND reference.observed_at<=%s ORDER BY instrument.instrument_id",
+            "AND reference.observed_at<=%s "
+            "ORDER BY instrument.instrument_id,"
+            "reference.observed_at DESC,reference.revision_id DESC",
             (str(scope[4]), cutoff, cutoff, cutoff),
         )
         members = tuple(cursor.fetchall())
@@ -185,11 +188,25 @@ def input_ready_identity(
             )
             checkpoints = tuple(cursor.fetchall())
             cursor.execute(
-                "SELECT gap_id, session_id, instrument_id, channel, gap_start, gap_end, journal_generation, "
-                "shard_id, last_durable_offset, reason, recovery_status FROM rt.stream_gaps "
-                "WHERE session_id=ANY(%s::uuid[]) AND gap_start<=%s "
-                "AND recovery_status NOT IN ('REPAIRED','WAIVED') ORDER BY gap_start, gap_id",
-                ([str(row[0]) for row in stream_sessions], cutoff),
+                "SELECT gap.gap_id,gap.session_id,gap.instrument_id,"
+                "gap.channel,gap.gap_start,gap.gap_end,"
+                "gap.journal_generation,gap.shard_id,"
+                "gap.last_durable_offset,gap.reason,gap.recovery_status "
+                "FROM rt.stream_gaps AS gap "
+                "JOIN rt.stream_sessions AS gap_session "
+                "ON gap_session.session_id=gap.session_id "
+                "WHERE gap.session_id=ANY(%s::uuid[]) "
+                "AND gap.gap_start<%s "
+                "AND COALESCE("
+                "gap.gap_end,gap_session.ended_at,%s)>%s "
+                "AND gap.recovery_status NOT IN ('REPAIRED','WAIVED') "
+                "ORDER BY gap.gap_start,gap.gap_id",
+                (
+                    [str(row[0]) for row in stream_sessions],
+                    cutoff,
+                    cutoff,
+                    cutoff - timedelta(minutes=5),
+                ),
             )
             gaps = tuple(cursor.fetchall())
             cursor.execute(

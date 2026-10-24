@@ -42,6 +42,7 @@ from realtime.normalizer import (  # noqa: E402
     InstrumentAdmission,
     NORMALIZER_VERSION,
 )
+from realtime.contracts import EQUITY_VALIDATION_UNIVERSE  # noqa: E402
 from scripts.realtime_script_support import write_report  # noqa: E402
 
 
@@ -49,15 +50,32 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session-date", type=date.fromisoformat, required=True)
     parser.add_argument("--authorization-reference", required=True)
+    parser.add_argument("--symbol", action="append")
     parser.add_argument("--decoded-byte-ceiling", type=int, required=True)
     parser.add_argument("--maximum-market-messages", type=int, default=2)
+    parser.add_argument("--subscription-only", action="store_true")
     parser.add_argument("--duration-seconds", type=int, default=300)
     parser.add_argument("--journal-path", type=Path, required=True)
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, default=BACKEND_DIR / ".env")
     args = parser.parse_args(argv)
-    if args.maximum_market_messages != 2:
-        parser.error("the approved canary requires exactly two market messages")
+    args.symbols = tuple(sorted({
+        value.strip().upper()
+        for value in (args.symbol or ("SPY",))
+        if value.strip()
+    }))
+    target9 = tuple(sorted(EQUITY_VALIDATION_UNIVERSE.equity_tickers))
+    if args.symbols not in {("SPY",), target9}:
+        parser.error("the canary requires exact SPY or target-9 membership")
+    expected_messages = (
+        0
+        if args.subscription_only
+        else 2 if args.symbols == ("SPY",) else 90
+    )
+    if args.maximum_market_messages != expected_messages:
+        parser.error(
+            f"the approved canary requires {expected_messages} market messages"
+        )
     if not 1 <= args.duration_seconds <= 300:
         parser.error("--duration-seconds must be in [1, 300]")
     if args.decoded_byte_ceiling != 10 * 1024 * 1024:
@@ -78,13 +96,13 @@ async def _capture(gateway, messages, duration):
     )
 
 
-def _entitlement_evidence(checked_at):
+def _entitlement_evidence(checked_at, symbols=("SPY",)):
     checked = checked_at.astimezone(timezone.utc)
     return {
         "checked_at": checked.isoformat(),
         "credentials_printed": False,
         "scope": {
-            "authorized_universe": ["SPY"],
+            "authorized_universe": list(symbols),
             "authorized_channels": ["AM"],
         },
     }
@@ -111,30 +129,32 @@ def main(argv=None):
     api_key = _canary_api_key(dotenv_values(args.env_file))
     generation = uuid4()
     session_id = uuid4()
-    universe = UniverseManifest(
-        "advanced-spy-am-live-canary-v2",
-        ("SPY",),
-        (),
+    version = (
+        "advanced-spy-am-live-canary-v2"
+        if args.symbols == ("SPY",)
+        else "advanced-target9-am-live-canary-v1"
     )
+    universe = UniverseManifest(version, args.symbols, ())
     manifest = SubscriptionManifest(
-        version="advanced-spy-am-live-canary-v2",
+        version=version,
         session_date=args.session_date,
         universe=universe,
         capability_profile_sha256="a" * 64,
         allocation_policy_sha256="b" * 64,
-        members=(
+        members=tuple(
             SubscriptionMember(
                 AssetClass.EQUITY,
-                "SPY",
-                "SPY",
+                symbol,
+                symbol,
                 MarketChannel.MINUTE_AGGREGATE,
-            ),
+            )
+            for symbol in args.symbols
         ),
         maximum_option_quote_contracts=0,
     )
     buffer = RawMessageBuffer(
         BufferLimits(
-            2,
+            max(1, args.maximum_market_messages),
             4 * 1024 * 1024,
             330_000_000_000,
         ),
@@ -158,15 +178,16 @@ def main(argv=None):
         args.journal_path,
         generation,
         {
-            "SPY": InstrumentAdmission(
-                1,
-                "SPY",
-                "SPY",
+            symbol: InstrumentAdmission(
+                priority,
+                symbol,
+                symbol,
                 AssetClass.EQUITY,
                 0,
             )
+            for priority, symbol in enumerate(args.symbols, start=1)
         },
-        maximum_batch_messages=2,
+        maximum_batch_messages=max(1, args.maximum_market_messages),
         maximum_batch_bytes=4 * 1024 * 1024,
     )
     pump.start()
@@ -184,25 +205,35 @@ def main(argv=None):
     normalized = RawJournalReader(
         args.journal_path
     ).read_normalized_after(0)
-    status = (
-        "PASS"
-        if len(normalized) == 2
-        and all(
-            row.normalizer_version == NORMALIZER_VERSION
-            and row.event_kind is MarketChannel.MINUTE_AGGREGATE
-            and row.quality == "GOOD"
-            for row in normalized
+    status = "PASS" if (
+        (
+            args.subscription_only
+            and result.accepted_messages == 0
+            and not normalized
         )
-        and result.received_bytes <= args.decoded_byte_ceiling
-        else "FAIL"
-    )
+        or (
+            not args.subscription_only
+            and len(normalized) == args.maximum_market_messages
+            and {row.ticker for row in normalized} == set(args.symbols)
+            and all(
+                row.normalizer_version == NORMALIZER_VERSION
+                and row.event_kind is MarketChannel.MINUTE_AGGREGATE
+                and row.quality == "GOOD"
+                for row in normalized
+            )
+        )
+    ) and result.received_bytes <= args.decoded_byte_ceiling else "FAIL"
     report = {
         "status": status,
-        **_entitlement_evidence(datetime.now(timezone.utc)),
+        **_entitlement_evidence(
+            datetime.now(timezone.utc),
+            args.symbols,
+        ),
         "session_date": args.session_date.isoformat(),
         "authorization_reference": args.authorization_reference,
-        "symbols": ("SPY",),
+        "symbols": args.symbols,
         "channels": ("AM",),
+        "subscription_only": args.subscription_only,
         "journal_generation": str(generation),
         "stream_session_id": str(session_id),
         "normalizer_version": NORMALIZER_VERSION,

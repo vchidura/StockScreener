@@ -51,7 +51,22 @@ from .stage_graph import (
 )
 
 logger = logging.getLogger(__name__)
-_OUTCOME_STATES = frozenset({"COMPLETE", "FAILED", "BLOCKED_POLICY"})
+_OUTCOME_STATES = frozenset({
+    "COMPLETE",
+    "FAILED",
+    "BLOCKED_POLICY",
+    "DEFERRED",
+})
+_RETRYABLE_POSTGRES_SQLSTATES = frozenset({"40001", "40P01"})
+TRANSIENT_STAGE_REASONS = frozenset({
+    "CHECKPOINT_NOT_CAUGHT_UP",
+    "FINALIZER_INPUT_PENDING",
+    "FINALIZER_NOT_COMPLETE",
+    "JOURNAL_DRAIN_NOT_COMPLETE",
+    "RESIDENT_ROLE_NOT_COMPLETE",
+    "ROLE_NOT_COMPLETE",
+})
+DEFERRED_ATTEMPTS_EXHAUSTED = "DEFERRED_ATTEMPTS_EXHAUSTED"
 
 
 class CatalogMismatch(RuntimeError):
@@ -70,6 +85,7 @@ class StageOutcome:
     reason_codes: tuple[str, ...] = ()
     receipt: CycleReceiptSpec | None = None
     evidence_ref: str | None = None
+    retry_not_before: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.state not in _OUTCOME_STATES:
@@ -78,6 +94,14 @@ class StageOutcome:
             raise ValueError("a failed or blocked stage outcome requires reason codes")
         if self.receipt is not None and self.state != "COMPLETE":
             raise ValueError("only a completed stage can record a receipt")
+        if self.retry_not_before is not None and (
+            self.state != "DEFERRED"
+            or self.retry_not_before.tzinfo is None
+            or self.retry_not_before.utcoffset() is None
+        ):
+            raise ValueError(
+                "retry_not_before is valid only for a deferred stage"
+            )
 
     @classmethod
     def complete(cls, *, degraded: tuple[str, ...] = (), receipt: CycleReceiptSpec | None = None,
@@ -91,6 +115,18 @@ class StageOutcome:
     @classmethod
     def blocked(cls, *reasons: str) -> StageOutcome:
         return cls("BLOCKED_POLICY", tuple(reasons))
+
+    @classmethod
+    def deferred(
+        cls,
+        *reasons: str,
+        retry_not_before: datetime | None = None,
+    ) -> StageOutcome:
+        return cls(
+            "DEFERRED",
+            tuple(reasons),
+            retry_not_before=retry_not_before,
+        )
 
 
 class StageCancelled(RuntimeError):
@@ -178,11 +214,18 @@ class StageOrchestrator:
         max_lane_seconds: float = 900.0,
         lane_grace_seconds: float = 30.0,
         heartbeat_seconds: float = 20.0,
+        retry_initial_seconds: float = 0.25,
+        retry_maximum_seconds: float = 5.0,
     ) -> None:
         if lease_seconds <= 0 or max_attempts < 1:
             raise ValueError("lease seconds and max attempts must be positive")
         if max_lane_seconds <= 0 or lane_grace_seconds < 0 or heartbeat_seconds <= 0:
             raise ValueError("lane budget, grace and heartbeat must be positive")
+        if (
+            retry_initial_seconds <= 0
+            or retry_maximum_seconds < retry_initial_seconds
+        ):
+            raise ValueError("stage retry bounds are invalid")
         unknown = set(runners) - set(stages)
         if unknown:
             raise ValueError(f"runners for unknown stages: {sorted(unknown)}")
@@ -201,6 +244,8 @@ class StageOrchestrator:
         self._max_lane_seconds = max_lane_seconds
         self._lane_grace_seconds = lane_grace_seconds
         self._heartbeat_seconds = heartbeat_seconds
+        self._retry_initial_seconds = retry_initial_seconds
+        self._retry_maximum_seconds = retry_maximum_seconds
         self._plans: dict[UUID, ServicePlan] = {}
 
     @property
@@ -235,7 +280,15 @@ class StageOrchestrator:
         context = StageContext(plan, window or self._placeholder_window(plan, now), stage, uuid4(), 1, now,
                                self._database)
         outcome = self._invoke(self._runners[stage_id], context)
-        status = "BLOCKED" if outcome.state != "COMPLETE" else ("DEGRADED" if outcome.reason_codes else "READY")
+        status = (
+            "WAITING_INPUT"
+            if outcome.state == "DEFERRED"
+            else "BLOCKED"
+            if outcome.state != "COMPLETE"
+            else "DEGRADED"
+            if outcome.reason_codes
+            else "READY"
+        )
         self._repository.upsert_readiness(plan.cohort_id, stage_id, plan.stage_catalog_version, status,
                                           outcome.reason_codes, outcome.evidence_ref, self._clock())
         return outcome
@@ -360,10 +413,24 @@ class StageOrchestrator:
         states = {}
         for stage_id, record in records.items():
             if (record.state == "FAILED" and OWNER_LOST in record.reason_codes
-                    and record.attempt < self._max_attempts):
+                    and record.attempt < self._attempt_limit(record)):
                 continue  # a crashed attempt is retried as a new attempt
+            if record.state == "DEFERRED":
+                if (
+                    record.attempt < self._attempt_limit(record)
+                    and record.retry_not_before is not None
+                    and record.retry_not_before <= self._clock()
+                ):
+                    continue
+                states[stage_id] = "RUNNING"
+                continue
             states[stage_id] = record.state
         return records, states
+
+    def _attempt_limit(self, record: StageRunRecord | None) -> int:
+        if record is None or record.maximum_attempts is None:
+            return self._max_attempts
+        return min(self._max_attempts, record.maximum_attempts)
 
     def _advance_lane(self, claim: WindowClaim, plan: ServicePlan, window_stages: frozenset[str],
                       lane: set[str], report: WindowReport, cancelled: threading.Event) -> bool:
@@ -393,8 +460,16 @@ class StageOrchestrator:
                 continue
             previous = records.get(step.stage_id)
             attempt = previous.attempt + 1 if previous is not None else 1
+            maximum_attempts = self._attempt_limit(previous)
             self._repository.renew_lease(claim, now, self._lease_seconds)
-            run = self._repository.start_stage(claim, stage, plan.stage_catalog_version, attempt, now)
+            run = self._repository.start_stage(
+                claim,
+                stage,
+                plan.stage_catalog_version,
+                attempt,
+                maximum_attempts,
+                now,
+            )
             outcome = self._invoke(self._runners[step.stage_id], StageContext(
                 plan, claim.window, stage, run.stage_run_id, attempt, now, self._database, cancelled,
                 fenced=True))
@@ -407,13 +482,69 @@ class StageOrchestrator:
         except LeaseLost:
             raise
         except Exception as error:  # noqa: BLE001 - recorded against this stage only
+            sqlstate = getattr(error, "pgcode", None) or getattr(
+                error,
+                "sqlstate",
+                None,
+            )
+            if sqlstate in _RETRYABLE_POSTGRES_SQLSTATES:
+                logger.warning(
+                    "stage %s deferred after retryable PostgreSQL conflict %s",
+                    context.stage.stage_id,
+                    sqlstate,
+                )
+                return self._deferred_outcome(
+                    context,
+                    f"RETRYABLE_POSTGRES:{sqlstate}",
+                )
             logger.exception("stage %s raised", context.stage.stage_id)
             return StageOutcome.failed(f"STAGE_EXCEPTION:{type(error).__name__}")
         if not isinstance(outcome, StageOutcome):
             return StageOutcome.failed("STAGE_RETURNED_INVALID_OUTCOME")
+        if (
+            outcome.state == "BLOCKED_POLICY"
+            and outcome.reason_codes
+            and outcome.reason_codes[0].split(":", 1)[0]
+            in TRANSIENT_STAGE_REASONS
+        ):
+            return self._deferred_outcome(
+                context,
+                *outcome.reason_codes,
+            )
+        if outcome.state == "DEFERRED" and outcome.retry_not_before is None:
+            return self._deferred_outcome(
+                context,
+                *outcome.reason_codes,
+            )
         return outcome
 
+    def _deferred_outcome(
+        self,
+        context: StageContext,
+        *reason_codes: str,
+    ) -> StageOutcome:
+        delay = min(
+            self._retry_maximum_seconds,
+            self._retry_initial_seconds * (2 ** (context.attempt - 1)),
+        )
+        retry_not_before = min(
+            self._clock() + timedelta(seconds=delay),
+            context.window.deadline,
+        )
+        return StageOutcome.deferred(
+            *reason_codes,
+            retry_not_before=retry_not_before,
+        )
+
     def _finish(self, claim: WindowClaim, plan: ServicePlan, run: StageRunRecord, outcome: StageOutcome) -> None:
+        if (
+            outcome.state == "DEFERRED"
+            and run.attempt >= self._attempt_limit(run)
+        ):
+            outcome = StageOutcome.failed(
+                DEFERRED_ATTEMPTS_EXHAUSTED,
+                *outcome.reason_codes,
+            )
         receipt_id = None
         if outcome.receipt is not None:
             try:
@@ -424,10 +555,26 @@ class StageOrchestrator:
                 logger.exception("stage %s receipt was rejected", run.stage_id)
                 outcome = StageOutcome.failed(f"RECEIPT_REJECTED:{type(error).__name__}")
         now = self._clock()
-        self._repository.finish_stage(claim, run, outcome.state, outcome.reason_codes, receipt_id, now)
+        self._repository.finish_stage(
+            claim,
+            run,
+            outcome.state,
+            outcome.reason_codes,
+            receipt_id,
+            now,
+            retry_not_before=outcome.retry_not_before,
+        )
         if receipt_id is not None and outcome.receipt is not None and outcome.receipt.advance_release:
             self._repository.advance_release(claim, receipt_id, outcome.receipt.cutoff, now)
-        status = "BLOCKED" if outcome.state != "COMPLETE" else ("DEGRADED" if outcome.reason_codes else "READY")
+        status = (
+            "WAITING_INPUT"
+            if outcome.state == "DEFERRED"
+            else "BLOCKED"
+            if outcome.state != "COMPLETE"
+            else "DEGRADED"
+            if outcome.reason_codes
+            else "READY"
+        )
         self._repository.upsert_readiness(plan.cohort_id, run.stage_id, plan.stage_catalog_version, status,
                                           outcome.reason_codes, outcome.evidence_ref, now)
 
@@ -436,9 +583,9 @@ class StageOrchestrator:
         records, _ = self._decision_states(claim)
         now = self._clock()
         pending = sorted(name for name in window_stages
-                         if name not in records or records[name].state in ("PENDING", "RUNNING")
+                         if name not in records or records[name].state in ("PENDING", "RUNNING", "DEFERRED")
                          or (records[name].state == "FAILED" and OWNER_LOST in records[name].reason_codes
-                             and records[name].attempt < self._max_attempts))
+                             and records[name].attempt < self._attempt_limit(records[name])))
         if pending and now >= claim.window.deadline:
             readiness = self._repository.readiness(plan.cohort_id)
             for name in pending:
