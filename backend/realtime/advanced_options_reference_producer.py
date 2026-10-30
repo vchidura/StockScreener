@@ -15,6 +15,7 @@ from options.calendar import OptionExchangeCalendar
 from options.model_inputs import (
     DividendCashFlow,
     RiskFreeRateObservation,
+    TREASURY_PRIOR_SESSION_PUBLICATION_POLICY,
     prepare_expiration_valuation_candidate,
 )
 from psycopg2 import Error as PsycopgError
@@ -48,6 +49,8 @@ from .reference_repository import load_dividend_reference_cursor
 REFERENCE_PRODUCER_VERSION = "advanced-options-reference-producer-v1"
 _RETRYABLE_POSTGRES_SQLSTATES = frozenset({"40001", "40P01"})
 _TREASURY_SOURCE = "us_treasury_par_yield_v1"
+_TREASURY_FRESHNESS_POLICY = TREASURY_PRIOR_SESSION_PUBLICATION_POLICY
+_DIVIDEND_MAXIMUM_AGE_SECONDS = 86_400
 _OI_SOURCE = "massive"
 _OI_DATE_BASIS = "PROVIDER_CHAIN_SNAPSHOT_PRIOR_SESSION"
 
@@ -155,7 +158,8 @@ class AdvancedOptionsReferenceProducerPlan:
     valid_until: datetime
     discovery_scheduled_cycle: datetime
     prior_oi_session: date
-    treasury_maximum_age_seconds: int
+    treasury_freshness_policy: str
+    dividend_maximum_age_seconds: int
     model_version: str
     reference_policy_sha256: str
     source_clocks_sha256: str
@@ -226,7 +230,8 @@ def _plan_identity(
     valid_until: datetime,
     discovery_scheduled_cycle: datetime,
     prior_oi_session: date,
-    treasury_maximum_age_seconds: int,
+    treasury_freshness_policy: str,
+    dividend_maximum_age_seconds: int,
     model_version: str,
     reference_policy_sha256: str,
     source_clocks_sha256: str,
@@ -252,7 +257,8 @@ def _plan_identity(
         "valid_until": valid_until,
         "discovery_scheduled_cycle": discovery_scheduled_cycle,
         "prior_oi_session": prior_oi_session,
-        "treasury_maximum_age_seconds": treasury_maximum_age_seconds,
+        "treasury_freshness_policy": treasury_freshness_policy,
+        "dividend_maximum_age_seconds": dividend_maximum_age_seconds,
         "model_version": model_version,
         "model_bundle_sha256": control.pins.model_bundle_sha256,
         "valuation_policy_sha256": control.pins.valuation_policy_sha256,
@@ -299,8 +305,9 @@ def _validate_plan(
         or not control.planned_at <= discovery <= known < valid
         or known > plan.enrollment.activity_selection.valid_until
         or valid > control.expires_at
-        or type(plan.treasury_maximum_age_seconds) is not int
-        or plan.treasury_maximum_age_seconds <= 0
+        or plan.treasury_freshness_policy != _TREASURY_FRESHNESS_POLICY
+        or type(plan.dividend_maximum_age_seconds) is not int
+        or plan.dividend_maximum_age_seconds <= 0
         or (
             plan.history_source_cohort_id is not None
             and (
@@ -331,8 +338,9 @@ def _validate_plan(
         "model_bundle_sha256": control.pins.model_bundle_sha256,
         "valuation_policy_sha256": control.pins.valuation_policy_sha256,
         "treasury_source": _TREASURY_SOURCE,
-        "treasury_maximum_age_seconds": (
-            plan.treasury_maximum_age_seconds
+        "treasury_freshness_policy": plan.treasury_freshness_policy,
+        "dividend_maximum_age_seconds": (
+            plan.dividend_maximum_age_seconds
         ),
         "oi_source": _OI_SOURCE,
         "oi_date_basis": _OI_DATE_BASIS,
@@ -351,9 +359,8 @@ def _validate_plan(
         valid_until=valid,
         discovery_scheduled_cycle=discovery,
         prior_oi_session=plan.prior_oi_session,
-        treasury_maximum_age_seconds=(
-            plan.treasury_maximum_age_seconds
-        ),
+        treasury_freshness_policy=plan.treasury_freshness_policy,
+        dividend_maximum_age_seconds=plan.dividend_maximum_age_seconds,
         model_version=plan.model_version,
         reference_policy_sha256=reference_policy_sha256,
         source_clocks_sha256=source_clocks_sha256,
@@ -381,9 +388,10 @@ def build_advanced_options_reference_producer_plan(
     valid_until: datetime,
     discovery_scheduled_cycle: datetime,
     prior_oi_session: date,
-    treasury_maximum_age_seconds: int,
     model_version: str,
     history_source_cohort_id: UUID | None = None,
+    treasury_freshness_policy: str = _TREASURY_FRESHNESS_POLICY,
+    dividend_maximum_age_seconds: int = _DIVIDEND_MAXIMUM_AGE_SECONDS,
 ) -> AdvancedOptionsReferenceProducerPlan:
     advanced_options_enrollment_plan_payload(enrollment)
     known = _utc(known_at, "known_at")
@@ -417,7 +425,8 @@ def build_advanced_options_reference_producer_plan(
             enrollment.control_plane.pins.valuation_policy_sha256
         ),
         "treasury_source": _TREASURY_SOURCE,
-        "treasury_maximum_age_seconds": treasury_maximum_age_seconds,
+        "treasury_freshness_policy": treasury_freshness_policy,
+        "dividend_maximum_age_seconds": dividend_maximum_age_seconds,
         "oi_source": _OI_SOURCE,
         "oi_date_basis": _OI_DATE_BASIS,
         "model_version": model_version,
@@ -430,7 +439,8 @@ def build_advanced_options_reference_producer_plan(
         valid_until=valid,
         discovery_scheduled_cycle=discovery,
         prior_oi_session=prior_oi_session,
-        treasury_maximum_age_seconds=treasury_maximum_age_seconds,
+        treasury_freshness_policy=treasury_freshness_policy,
+        dividend_maximum_age_seconds=dividend_maximum_age_seconds,
         model_version=model_version,
         reference_policy_sha256=reference_policy_sha256,
         source_clocks_sha256=source_clocks_sha256,
@@ -450,7 +460,8 @@ def build_advanced_options_reference_producer_plan(
         valid_until=valid,
         discovery_scheduled_cycle=discovery,
         prior_oi_session=prior_oi_session,
-        treasury_maximum_age_seconds=treasury_maximum_age_seconds,
+        treasury_freshness_policy=treasury_freshness_policy,
+        dividend_maximum_age_seconds=dividend_maximum_age_seconds,
         model_version=model_version.strip(),
         reference_policy_sha256=reference_policy_sha256,
         source_clocks_sha256=source_clocks_sha256,
@@ -727,6 +738,46 @@ def _load_active_scope(
     return tuple(contracts)
 
 
+_OI_SEMANTIC_FIELDS = (
+    "contract_id",
+    "settlement_session",
+    "open_interest",
+    "source",
+    "date_basis",
+    "observed_session",
+)
+
+
+def _coalesce_terminal_open_interest(candidates, observed_session):
+    superseded = {
+        str(row["supersedes_baseline_id"])
+        for row in candidates
+        if row["supersedes_baseline_id"] is not None
+    }
+    terminal = tuple(
+        row
+        for row in candidates
+        if str(row["baseline_id"]) not in superseded
+        and row["observed_session"] == observed_session
+    )
+    if len(terminal) <= 1:
+        return terminal
+    identities = {
+        tuple(row[name] for name in _OI_SEMANTIC_FIELDS)
+        for row in terminal
+    }
+    if len(identities) != 1:
+        return terminal
+    return (max(
+        terminal,
+        key=lambda row: (
+            row["received_at"],
+            row["observed_at"],
+            str(row["baseline_id"]),
+        ),
+    ),)
+
+
 def _load_open_interest(
     cursor,
     plan: AdvancedOptionsReferenceProducerPlan,
@@ -752,16 +803,9 @@ def _load_open_interest(
     for contract in contracts:
         contract_id = int(contract["contract_id"])
         candidates = by_contract.get(contract_id, [])
-        superseded = {
-            str(row["supersedes_baseline_id"])
-            for row in candidates
-            if row["supersedes_baseline_id"] is not None
-        }
-        terminal = tuple(
-            row
-            for row in candidates
-            if str(row["baseline_id"]) not in superseded
-            and row["observed_session"] == plan.control_plane.session_date
+        terminal = _coalesce_terminal_open_interest(
+            candidates,
+            plan.control_plane.session_date,
         )
         if len(terminal) != 1:
             missing = True
@@ -857,8 +901,12 @@ def _load_treasury_curve(
         ))
         return (), None
     rate_date = rows[0]["rate_date"]
+    expected_rate_date = OptionExchangeCalendar().previous_session_date(
+        plan.control_plane.session_date
+    )
     if (
         len(rows) > 64
+        or rate_date != expected_rate_date
         or len({int(row["tenor_days"]) for row in rows}) != len(rows)
         or any(
             row["rate_date"] != rate_date
@@ -867,9 +915,6 @@ def _load_treasury_curve(
             or not row["source_observed_at"]
             <= row["received_at"]
             <= plan.known_at
-            or (
-                plan.known_at - row["received_at"]
-            ).total_seconds() > plan.treasury_maximum_age_seconds
             for row in rows
         )
     ):
@@ -1334,9 +1379,7 @@ def _load_valuations(
                 expiration_date=expiration,
                 spot=spot,
                 selected_at=plan.known_at,
-                maximum_age_seconds=(
-                    plan.treasury_maximum_age_seconds
-                ),
+                maximum_age_seconds=plan.dividend_maximum_age_seconds,
                 cash_flows=tuple(
                     row for row in flows if row.ex_date <= expiration
                 ),
@@ -1348,6 +1391,12 @@ def _load_valuations(
                     f"{ticker}:DIVIDEND:{coverage.coverage_id}"
                 ),
                 dividend_payload_sha256=coverage.payload_sha256,
+                treasury_freshness_policy=(
+                    plan.treasury_freshness_policy
+                ),
+                dividend_maximum_age_seconds=(
+                    plan.dividend_maximum_age_seconds
+                ),
             )
             valuation = valuation_reference_from_candidate(
                 candidate,

@@ -207,8 +207,8 @@ def _detectors(ticker):
         )
 
     return (
-        DeveloperDetectorInvocation("S1", hashes["S1"], stock("S1")),
-        DeveloperDetectorInvocation("S2", hashes["S2"], stock("S2")),
+        DeveloperDetectorInvocation("OS1", hashes["OS1"], stock("OS1")),
+        DeveloperDetectorInvocation("OS2", hashes["OS2"], stock("OS2")),
         DeveloperDetectorInvocation(
             "O1",
             hashes["O1"],

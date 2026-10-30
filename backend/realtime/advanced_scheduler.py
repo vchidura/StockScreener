@@ -163,7 +163,7 @@ def discover_advanced_window_recovery_cursor(
         "receipt.reference_generation,receipt.universe_sha256,"
         "receipt.input_sha256,receipt.build_id,receipt.cohort_id,"
         "manifest.universe_sha256,service.stage_catalog_version,"
-        "service.cohort_id,run.deadline "
+        "service.cohort_id,run.deadline,run.release_at "
         "FROM rt.window_runs AS run "
         "JOIN rt.cohorts AS cohort ON cohort.cohort_id=run.cohort_id "
         "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
@@ -233,7 +233,7 @@ def discover_advanced_window_recovery_cursor(
                 else "0"
             )
             attempt = int(suffix) if suffix.isdigit() else 0
-            input_scopes.append((attempt, row[15], gate_digest))
+            input_scopes.append((attempt, row[16], gate_digest))
     if any(len(values) > 1 for values in receipts.values()):
         raise ValueError("durable Advanced receipts disagree")
     if receipts["INPUT_READY"] and not input_scopes:

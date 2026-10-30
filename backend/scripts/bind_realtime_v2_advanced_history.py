@@ -28,6 +28,9 @@ from realtime.equity_pipeline_config import (  # noqa: E402
     RealtimeV2PipelineConfig,
 )
 from realtime.migrations import EXPECTED_V2_DATABASE_NAME  # noqa: E402
+from realtime.equity_portal_history import (  # noqa: E402
+    build_realtime_equity_portal_history_plan,
+)
 from scripts.realtime_script_support import write_report  # noqa: E402
 
 
@@ -138,15 +141,43 @@ def main(argv=None):
                 .session_open(args.session_date)
                 .astimezone(timezone.utc)
             )
+            source_session_date = (
+                OptionExchangeCalendar()
+                .previous_session_date(args.session_date)
+            )
+            history_plan = build_realtime_equity_portal_history_plan(
+                source_session_date
+            )
             cursor.execute(
-                "SELECT count(DISTINCT revision.session_date) FILTER ("
+                "SELECT revision.ticker,"
+                "count(DISTINCT revision.session_date) FILTER ("
                 "WHERE revision.interval='1d' "
                 "AND revision.adjustment_basis='ADJUSTED'),"
                 "count(DISTINCT revision.session_date) FILTER ("
                 "WHERE revision.interval='1d' "
                 "AND revision.adjustment_basis='RAW_UNADJUSTED'),"
                 "count(*) FILTER (WHERE revision.interval='5m'),"
-                "count(*) FILTER (WHERE revision.interval='1h') "
+                "count(*) FILTER (WHERE revision.interval='1h'),"
+                "array_agg(DISTINCT revision.session_date "
+                "ORDER BY revision.session_date) FILTER (WHERE "
+                "revision.interval='1d' "
+                "AND revision.adjustment_basis='ADJUSTED' "
+                "AND revision.session_date=ANY(%s)),"
+                "array_agg(DISTINCT revision.session_date "
+                "ORDER BY revision.session_date) FILTER (WHERE "
+                "revision.interval='1d' "
+                "AND revision.adjustment_basis='RAW_UNADJUSTED' "
+                "AND revision.session_date=ANY(%s)),"
+                "array_agg(DISTINCT revision.session_date "
+                "ORDER BY revision.session_date) FILTER (WHERE "
+                "revision.interval='1wk' "
+                "AND revision.adjustment_basis='ADJUSTED' "
+                "AND revision.session_date=ANY(%s)),"
+                "array_agg(DISTINCT revision.session_date "
+                "ORDER BY revision.session_date) FILTER (WHERE "
+                "revision.interval='1mo' "
+                "AND revision.adjustment_basis='ADJUSTED' "
+                "AND revision.session_date=ANY(%s)) "
                 "FROM rt.bar_current AS current "
                 "JOIN rt.bar_revisions AS revision "
                 "ON revision.bar_revision_id=current.bar_revision_id "
@@ -161,23 +192,64 @@ def main(argv=None):
                 "JOIN ref.security_revisions AS reference USING(security_id) "
                 "WHERE cohort.cohort_id=%s AND member.channel='AM' "
                 "AND reference.ticker=ANY(%s)) "
-                "AND revision.bar_end<%s",
+                "AND revision.bar_end<%s "
+                "GROUP BY revision.ticker "
+                "ORDER BY revision.ticker",
                 (
+                    list(history_plan.adjusted_sessions),
+                    list(history_plan.raw_sessions),
+                    list(history_plan.weekly_sessions),
+                    list(history_plan.monthly_sessions),
                     str(args.source_cohort_id),
                     str(args.source_cohort_id),
                     list(target[3]),
                     history_before,
                 ),
             )
-            coverage = tuple(int(value) for value in cursor.fetchone())
+            coverage_rows = cursor.fetchall()
+        coverage_by_symbol = {
+            str(row[0]): {
+                "adjusted_daily_sessions": int(row[1]),
+                "raw_daily_sessions": int(row[2]),
+                "five_minute_bars": int(row[3]),
+                "one_hour_bars": int(row[4]),
+                "adjusted_sessions_exact": (
+                    tuple(row[5] or ())
+                    == history_plan.adjusted_sessions
+                ),
+                "raw_sessions_exact": (
+                    tuple(row[6] or ())
+                    == history_plan.raw_sessions
+                ),
+                "weekly_sessions_exact": (
+                    tuple(row[7] or ())
+                    == history_plan.weekly_sessions
+                ),
+                "monthly_sessions_exact": (
+                    tuple(row[8] or ())
+                    == history_plan.monthly_sessions
+                ),
+            }
+            for row in coverage_rows
+        }
+        expected_symbols = set(target[3])
         if (
-            coverage[0] < 283
-            or coverage[1] < 90
-            or coverage[2] < 1
-            or coverage[3] < 1
+            set(coverage_by_symbol) != expected_symbols
+            or any(
+                values["adjusted_daily_sessions"] < 283
+                or values["raw_daily_sessions"] < 90
+                or values["five_minute_bars"] < 1
+                or values["one_hour_bars"] < 1
+                or not values["adjusted_sessions_exact"]
+                or not values["raw_sessions_exact"]
+                or not values["weekly_sessions_exact"]
+                or not values["monthly_sessions_exact"]
+                for values in coverage_by_symbol.values()
+            )
         ):
             raise ValueError(
-                "Developer source cohort lacks required retained portal history"
+                "Developer source cohort lacks per-symbol retained portal history: "
+                + json.dumps(coverage_by_symbol, sort_keys=True)
             )
         identity = {
             "contract": "advanced-cohort-history-binding-v1",
@@ -230,10 +302,24 @@ def main(argv=None):
             "source_manifest_sha256": source[0],
             "binding_sha256": binding_sha256,
             "coverage": {
-                "adjusted_daily_sessions": coverage[0],
-                "raw_daily_sessions": coverage[1],
-                "five_minute_bars": coverage[2],
-                "one_hour_bars": coverage[3],
+                "adjusted_daily_sessions": min(
+                    row["adjusted_daily_sessions"]
+                    for row in coverage_by_symbol.values()
+                ),
+                "raw_daily_sessions": min(
+                    row["raw_daily_sessions"]
+                    for row in coverage_by_symbol.values()
+                ),
+                "five_minute_bars": min(
+                    row["five_minute_bars"]
+                    for row in coverage_by_symbol.values()
+                ),
+                "one_hour_bars": min(
+                    row["one_hour_bars"]
+                    for row in coverage_by_symbol.values()
+                ),
+                "symbols": coverage_by_symbol,
+                "source_session_date": source_session_date.isoformat(),
             },
             "provider_requests": 0,
             "publication_advanced": False,

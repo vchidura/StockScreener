@@ -151,6 +151,7 @@ class AdvancedGateway:
         monotonic_ns: Callable[[], int],
         session_id_factory: Callable[[], UUID] = uuid4,
         state_observer: Callable[[GatewayFeedState], None] | None = None,
+        usage_observer: Callable[[int, int], None] | None = None,
     ) -> None:
         if not api_key.strip():
             raise ValueError("Advanced gateway API key is required")
@@ -163,6 +164,9 @@ class AdvancedGateway:
         self._monotonic_ns = monotonic_ns
         self._session_id_factory = session_id_factory
         self._state_observer = state_observer
+        if usage_observer is not None and not callable(usage_observer):
+            raise TypeError("Advanced gateway usage observer is invalid")
+        self._usage_observer = usage_observer
         self._state = GatewayFeedState.DISCONNECTED
         self._transitions = [self._state]
         self._message_number = 0
@@ -261,6 +265,11 @@ class AdvancedGateway:
             raise GatewayControlError("ADVANCED_NON_BYTES_MESSAGE")
         self._received_messages += 1
         self._received_bytes += len(message)
+        if self._usage_observer is not None:
+            self._usage_observer(
+                self._received_messages,
+                self._received_bytes,
+            )
         if (
             self._maximum_received_bytes is not None
             and self._received_bytes > self._maximum_received_bytes

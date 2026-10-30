@@ -11,6 +11,10 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 
 TREASURY_CURVE_SOURCE = "us_treasury_par_yield_v1"
+TREASURY_RECEIPT_AGE_POLICY = "treasury-receipt-age-v1"
+TREASURY_PRIOR_SESSION_PUBLICATION_POLICY = (
+    "treasury-prior-xnys-session-publication-v1"
+)
 TREASURY_CURVE_URL = (
     "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
     "pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value={year}"
@@ -98,13 +102,25 @@ def prepare_expiration_valuation_candidate(
     dividend_coverage_start: date, dividend_coverage_end: date,
     dividend_coverage_complete: bool, dividend_received_at: datetime,
     dividend_source_key: str, dividend_payload_sha256: str,
+    treasury_freshness_policy: str = TREASURY_RECEIPT_AGE_POLICY,
+    dividend_maximum_age_seconds: int | None = None,
 ) -> ExpirationValuationCandidate:
     selected = _utc(selected_at)
     dividend_received = _utc(dividend_received_at)
+    dividend_maximum_age = (
+        maximum_age_seconds
+        if dividend_maximum_age_seconds is None
+        else dividend_maximum_age_seconds
+    )
     if (type(maximum_age_seconds) is not int or maximum_age_seconds <= 0
+            or type(dividend_maximum_age) is not int or dividend_maximum_age <= 0
             or valuation_date > expiration_date or expected_rate_date > valuation_date
             or valuation_date > selected.date()
-            or not spot.is_finite() or spot <= 0):
+            or not spot.is_finite() or spot <= 0
+            or treasury_freshness_policy not in {
+                TREASURY_RECEIPT_AGE_POLICY,
+                TREASURY_PRIOR_SESSION_PUBLICATION_POLICY,
+            }):
         raise ValueError("valuation candidate requires finite spot, valid dates and explicit freshness")
     if (dividend_coverage_complete is not True
             or not dividend_coverage_start <= valuation_date <= expiration_date <= dividend_coverage_end):
@@ -112,7 +128,7 @@ def prepare_expiration_valuation_candidate(
     if (not dividend_source_key.strip() or len(dividend_payload_sha256) != 64
             or any(character not in "0123456789abcdef" for character in dividend_payload_sha256)):
         raise ValueError("dividend/distribution provenance is missing")
-    if not 0 <= (selected - dividend_received).total_seconds() <= maximum_age_seconds:
+    if not 0 <= (selected - dividend_received).total_seconds() <= dividend_maximum_age:
         raise ValueError("dividend/distribution observation is stale or future")
     rates = tuple(row for row in curve if row.rate_date == expected_rate_date)
     if not rates or len({row.tenor_days for row in rates}) != len(rates):
@@ -123,7 +139,15 @@ def prepare_expiration_valuation_candidate(
                 or row.replay_available_at is not None or row.tenor_days <= 0
                 or not math.isfinite(row.annual_rate) or row.source_observed_at is None
                 or not _utc(row.source_observed_at) <= _utc(row.first_observed_at) <= selected
-                or not 0 <= (selected - _utc(row.first_observed_at)).total_seconds() <= maximum_age_seconds
+                or (
+                    treasury_freshness_policy
+                    == TREASURY_RECEIPT_AGE_POLICY
+                    and not 0
+                    <= (
+                        selected - _utc(row.first_observed_at)
+                    ).total_seconds()
+                    <= maximum_age_seconds
+                )
                 or len(row.payload_sha256) != 64
                 or any(character not in "0123456789abcdef" for character in row.payload_sha256)):
             raise ValueError("Treasury source/availability/freshness provenance is invalid")

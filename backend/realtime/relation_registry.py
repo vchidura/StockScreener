@@ -117,6 +117,27 @@ RELATIONS: dict[str, Relation] = {
     "rt.advanced_options_resident_completions": _r(
         "options", "BOUNDED", append=True
     ),
+    "rt.stock_alert_result_instances": _r(
+        "equity", "DEFERRED", append=True
+    ),
+    "rt.stock_alert_result_records": _r(
+        "equity", "DEFERRED", append=True
+    ),
+    "rt.stock_alert_result_revisions": _r(
+        "equity", "DEFERRED", append=True
+    ),
+    "rt.stock_alert_result_streams": _r(
+        "equity", "DEFERRED", mutable=True
+    ),
+    "rt.stock_alert_result_storage_identities": _r(
+        "equity", "DEFERRED", append=True
+    ),
+    "rt.canonical_stock_alert_batches": _r(
+        "equity", "DEFERRED", append=True
+    ),
+    "rt.canonical_stock_alert_evaluations": _r(
+        "equity", "ARCHIVE_FIRST", append=True, api=True
+    ),
     "rt.worker_leases": _r("control", "BOUNDED", mutable=True, delete=True),
     "rt.advanced_options_read_pins": _r(
         "control", "BOUNDED", mutable=True, api=True

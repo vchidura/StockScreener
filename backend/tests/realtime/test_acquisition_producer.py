@@ -26,6 +26,7 @@ from realtime.acquisition_producer import (
     DeveloperAcquisitionProducer,
     DeveloperAcquisitionRequest,
     DeveloperSourceResult,
+    MAX_DEVELOPER_SOURCE_FACTS,
     developer_equity_watermarks,
 )
 from realtime.contracts import CANARY_UNIVERSE
@@ -142,6 +143,32 @@ def _sources(*, omit_equity=None, add_equity=None):
         ),
     )
     return equity, options
+
+
+def test_target9_full_session_fact_bound_is_exact():
+    batch_id, _option_batch_id, facts, _option_facts = _facts()
+    fact = facts[0]
+    batch = lambda count: CompletedDeveloperSourceBatch(
+        DeveloperAcquisitionFactKind.EQUITY_BAR,
+        batch_id,
+        NOW - timedelta(seconds=1),
+        NOW + timedelta(seconds=1),
+        (fact,) * count,
+    )
+
+    assert DeveloperSourceResult(
+        "massive_developer",
+        (batch(MAX_DEVELOPER_SOURCE_FACTS),),
+        9,
+        1,
+    ).batches[0].facts
+    with pytest.raises(ValueError, match="fact bound"):
+        DeveloperSourceResult(
+            "massive_developer",
+            (batch(MAX_DEVELOPER_SOURCE_FACTS + 1),),
+            9,
+            1,
+        )
 
 
 def _database(role=RealtimeDatabaseRole.INGRESS):

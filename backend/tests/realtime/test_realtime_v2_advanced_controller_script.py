@@ -81,6 +81,26 @@ def test_controller_requires_exact_rest_repair_allocation():
     assert args.rest_repair_response_byte_limit == 2048
 
 
+def test_controller_auto_catch_up_derives_target_budget():
+    base = _base()
+    base[base.index("--universe-target") + 1] = "9"
+    args = script.parse_args([
+        *base,
+        "--catch-up-mode",
+        "AUTO",
+    ])
+
+    assert args.catch_up_mode == "AUTO"
+    assert args.budgets.rest_repair_requests == 18
+    assert args.budgets.rest_repair_decoded_bytes == (
+        18 * (1024 * 1024 + 1)
+    )
+    assert args.rest_repair_response_byte_limit == 1024 * 1024
+    assert args.rest_repair_expected_cost == (
+        "included Massive Advanced aggregate entitlement"
+    )
+
+
 def test_controller_reads_exact_plan_and_rest_allocation_from_environment(
     monkeypatch,
 ):
@@ -577,6 +597,72 @@ def test_coverage_pending_gets_one_durable_retry_then_blocks(tmp_path):
         and call.args[1][0] == "RETAINED_GAP"
         for call in cursor.execute.call_args_list
     )
+
+
+def test_reportless_child_exit_accepts_complete_durable_closure(
+    tmp_path,
+    monkeypatch,
+):
+    now = datetime(2026, 10, 27, 14, 50, tzinfo=timezone.utc)
+    identity = HybridRepairIdentity(
+        script.UUID(int=4),
+        "adv-hybrid-test",
+        HybridStartupState.REPAIR_READY,
+        now - timedelta(minutes=5),
+        now,
+        now - timedelta(minutes=5),
+        now,
+        now,
+        "MASSIVE_STOCKS_AGGREGATES_1M",
+        "advanced-real-time-closed-bar-v1",
+        timedelta(0),
+        timedelta(seconds=10),
+        2,
+    )
+    coordinator = script._HybridRepairCoordinator(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(
+            plan_id=script.UUID(int=3),
+            cohort_id=script.UUID(int=2),
+        ),
+        session_open=now - timedelta(minutes=15),
+        deadline=now + timedelta(minutes=30),
+        journal_root=tmp_path,
+        lease_seconds=330,
+        settings=SimpleNamespace(),
+        utc_clock=lambda: now,
+    )
+    coordinator.window = script._HybridRepairWindow(
+        identity,
+        "RUNNING",
+        1,
+        now,
+        None,
+        script._hybrid_report_path(
+            tmp_path,
+            identity.repair_id,
+            1,
+        ),
+    )
+    coordinator.instrument_ids = (1, 2)
+    verify = MagicMock()
+    monkeypatch.setattr(
+        coordinator,
+        "_durable_closure_complete",
+        lambda: True,
+    )
+    monkeypatch.setattr(coordinator, "_verify_completed", verify)
+
+    coordinator._handle_attempt_result(
+        now,
+        return_code=1,
+        stderr="post-write wrapper failure",
+    )
+
+    verify.assert_called_once_with(now)
+    assert coordinator.terminal_outcome is None
+    assert not coordinator.window.report_path.exists()
 
 
 def test_blocked_backfill_delays_only_before_live_warmup():

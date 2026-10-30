@@ -372,12 +372,12 @@ def test_observation_without_ordered_legs_remains_an_observation():
         EVALUATION,
         DATASET,
         EVENT,
-        DetectorFamily.S2,
+        DetectorFamily.OS2,
         "SPY",
         "OBSERVATION",
         NOW,
         "f" * 64,
-        {"native": "S2"},
+        {"native": "OS2"},
         None,
     )
 

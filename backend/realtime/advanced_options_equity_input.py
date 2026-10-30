@@ -48,20 +48,49 @@ class AdvancedOptionsEquityContextRequirement:
         modes = tuple(sorted(set(self.availability_modes)))
         if (
             self.version != EQUITY_CONTEXT_REQUIREMENT_VERSION
-            or self.lane not in {DetectorFamily.O1, DetectorFamily.O3}
-            or self.source is not AdvancedOptionsEquityContextSource.LIVE_EQUITY
-            or self.interval != "5m"
+            or self.lane not in {
+                DetectorFamily.O1,
+                DetectorFamily.O3,
+                DetectorFamily.OS1,
+                DetectorFamily.OS2,
+            }
             or self.adjustment_basis != "RAW_UNADJUSTED"
             or self.session_scope != "RTH"
             or type(self.session_count) is not int
             or self.session_count <= 0
-            or not self.current_session
             or not self.final_required
-            or modes != ("LIVE_OBSERVED",)
-            or self.known_by_clock != "E_CUTOFF"
             or self.missing_behavior
             is not AdvancedOptionsEquityContextMissingBehavior.BLOCK_LANE
         ):
+            raise ValueError("Advanced Options Equity-context requirement is invalid")
+        live_requirement = (
+            self.source is AdvancedOptionsEquityContextSource.LIVE_EQUITY
+            and self.interval == "5m"
+            and self.current_session
+            and modes == ("LIVE_OBSERVED",)
+            and self.known_by_clock == "E_CUTOFF"
+            and (
+                self.lane is DetectorFamily.O3
+                and self.session_count == 3
+                or self.lane is DetectorFamily.OS1
+                and self.session_count == 2
+                or self.lane is DetectorFamily.OS2
+                and self.session_count == 3
+            )
+        )
+        history_requirement = (
+            self.lane in {DetectorFamily.OS1, DetectorFamily.OS2}
+            and self.source is AdvancedOptionsEquityContextSource.HISTORY
+            and self.interval == "1d"
+            and self.session_count == 15
+            and not self.current_session
+            and modes == (
+                "HISTORICAL_RECONSTRUCTED",
+                "LIVE_OBSERVED",
+            )
+            and self.known_by_clock == "H_REFERENCE"
+        )
+        if not (live_requirement or history_requirement):
             raise ValueError("Advanced Options Equity-context requirement is invalid")
         object.__setattr__(self, "availability_modes", modes)
 
@@ -121,6 +150,48 @@ def initial_advanced_options_equity_context_requirements(
             missing_behavior=(
                 AdvancedOptionsEquityContextMissingBehavior.BLOCK_LANE
             ),
+        ),
+        *tuple(
+            requirement
+            for lane, intraday_count in (
+                (DetectorFamily.OS1, 2),
+                (DetectorFamily.OS2, 3),
+            )
+            for requirement in (
+                AdvancedOptionsEquityContextRequirement(
+                    lane=lane,
+                    source=AdvancedOptionsEquityContextSource.HISTORY,
+                    interval="1d",
+                    adjustment_basis="RAW_UNADJUSTED",
+                    session_scope="RTH",
+                    session_count=15,
+                    current_session=False,
+                    final_required=True,
+                    availability_modes=(
+                        "HISTORICAL_RECONSTRUCTED",
+                        "LIVE_OBSERVED",
+                    ),
+                    known_by_clock="H_REFERENCE",
+                    missing_behavior=(
+                        AdvancedOptionsEquityContextMissingBehavior.BLOCK_LANE
+                    ),
+                ),
+                AdvancedOptionsEquityContextRequirement(
+                    lane=lane,
+                    source=AdvancedOptionsEquityContextSource.LIVE_EQUITY,
+                    interval="5m",
+                    adjustment_basis="RAW_UNADJUSTED",
+                    session_scope="RTH",
+                    session_count=intraday_count,
+                    current_session=True,
+                    final_required=True,
+                    availability_modes=("LIVE_OBSERVED",),
+                    known_by_clock="E_CUTOFF",
+                    missing_behavior=(
+                        AdvancedOptionsEquityContextMissingBehavior.BLOCK_LANE
+                    ),
+                ),
+            )
         ),
     )
 
@@ -202,7 +273,12 @@ def load_advanced_options_equity_context_cursor(
         requirements_by_lane.setdefault(requirement.lane, []).append(
             requirement
         )
-    for lane in (DetectorFamily.O1, DetectorFamily.O3):
+    for lane in (
+        DetectorFamily.O1,
+        DetectorFamily.O3,
+        DetectorFamily.OS1,
+        DetectorFamily.OS2,
+    ):
         lane_requirements = tuple(requirements_by_lane.get(lane, ()))
         members = []
         reasons = []
@@ -230,17 +306,26 @@ def load_advanced_options_equity_context_cursor(
                     "AND revision.session_scope=%s "
                     "AND revision.availability_mode=ANY(%s) "
                     "AND revision.is_final "
-                    "AND revision.session_date=%s "
+                    "AND (%s OR revision.session_date=%s) "
+                    "AND (%s OR revision.session_date<%s) "
                     "AND revision.bar_end<=%s "
                     "AND revision.observed_at<=%s "
                     "ORDER BY revision.bar_end DESC LIMIT %s",
                     (
-                        str(equity_plan.cohort_id),
+                        str(
+                            equity_plan.cohort_id
+                            if requirement.source
+                            is AdvancedOptionsEquityContextSource.LIVE_EQUITY
+                            else history_source_cohort_id
+                        ),
                         str(security_ids[ticker]),
                         requirement.interval,
                         requirement.adjustment_basis,
                         requirement.session_scope,
                         list(requirement.availability_modes),
+                        not requirement.current_session,
+                        equity_cutoff.date(),
+                        requirement.current_session,
                         equity_cutoff.date(),
                         equity_cutoff,
                         equity_cutoff,
@@ -248,16 +333,25 @@ def load_advanced_options_equity_context_cursor(
                     ),
                 )
                 rows = tuple(reversed(tuple(cursor.fetchall())))
-                if (
-                    len(rows) != requirement.session_count
-                    or rows[-1]["bar_end"] != equity_cutoff
-                    or any(
-                        (later["bar_end"] - earlier["bar_end"])
-                        .total_seconds()
-                        != 300
-                        for earlier, later in zip(rows, rows[1:])
+                incomplete = len(rows) != requirement.session_count
+                if requirement.current_session:
+                    incomplete = incomplete or (
+                        rows[-1]["bar_end"] != equity_cutoff
+                        or any(
+                            (later["bar_end"] - earlier["bar_end"])
+                            .total_seconds()
+                            != 300
+                            for earlier, later in zip(rows, rows[1:])
+                        )
                     )
-                ):
+                else:
+                    incomplete = incomplete or (
+                        len({row["bar_end"].date() for row in rows})
+                        != requirement.session_count
+                        or rows[-1]["bar_end"].date()
+                        >= equity_cutoff.date()
+                    )
+                if incomplete:
                     reasons.append(
                         f"{lane.value}_{ticker}_E_CONTEXT_INCOMPLETE"
                     )
@@ -265,7 +359,12 @@ def load_advanced_options_equity_context_cursor(
                 members.extend(
                     AdvancedOptionsEquityContextMember(
                         ticker=ticker,
-                        source_cohort_id=equity_plan.cohort_id,
+                        source_cohort_id=(
+                            equity_plan.cohort_id
+                            if requirement.source
+                            is AdvancedOptionsEquityContextSource.LIVE_EQUITY
+                            else history_source_cohort_id
+                        ),
                         bar_revision_id=UUID(str(row["bar_revision_id"])),
                         bar_end=row["bar_end"],
                         observed_at=row["observed_at"],

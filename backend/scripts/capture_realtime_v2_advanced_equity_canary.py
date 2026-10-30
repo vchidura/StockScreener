@@ -76,8 +76,16 @@ def parse_args(argv=None):
         parser.error(
             f"the approved canary requires {expected_messages} market messages"
         )
-    if not 1 <= args.duration_seconds <= 300:
-        parser.error("--duration-seconds must be in [1, 300]")
+    allowed_durations = (
+        {300, 660}
+        if args.symbols == target9
+        else set(range(1, 301))
+    )
+    if args.duration_seconds not in allowed_durations:
+        parser.error(
+            "--duration-seconds must be in [1, 300] for SPY "
+            "or exactly 300/660 for target-9"
+        )
     if args.decoded_byte_ceiling != 10 * 1024 * 1024:
         parser.error("the approved canary decoded-byte ceiling is 10 MiB")
     if not args.authorization_reference.strip():
@@ -90,10 +98,13 @@ def parse_args(argv=None):
 
 
 async def _capture(gateway, messages, duration):
-    return await asyncio.wait_for(
-        gateway.run_session(maximum_market_messages=messages),
-        timeout=duration,
-    )
+    try:
+        return await asyncio.wait_for(
+            gateway.run_session(maximum_market_messages=messages),
+            timeout=duration,
+        ), False
+    except TimeoutError:
+        return None, True
 
 
 def _entitlement_evidence(checked_at, symbols=("SPY",)):
@@ -122,6 +133,19 @@ def _canary_api_key(settings):
     }:
         raise RuntimeError("canary requires a configured Massive API key")
     return api_key
+
+
+def _normalized_scope_matches(normalized, symbols, expected_messages):
+    return (
+        len(normalized) == expected_messages
+        and {row.provider_symbol for row in normalized} == set(symbols)
+        and all(
+            row.normalizer_version == NORMALIZER_VERSION
+            and row.event_kind is MarketChannel.MINUTE_AGGREGATE
+            and row.quality == "GOOD"
+            for row in normalized
+        )
+    )
 
 
 def main(argv=None):
@@ -192,7 +216,7 @@ def main(argv=None):
     )
     pump.start()
     try:
-        result = asyncio.run(
+        result, timed_out = asyncio.run(
             _capture(
                 gateway,
                 args.maximum_market_messages,
@@ -202,10 +226,16 @@ def main(argv=None):
     finally:
         pump.request_stop()
     progress = pump.join(30)
-    normalized = RawJournalReader(
-        args.journal_path
-    ).read_normalized_after(0)
+    reader = RawJournalReader(args.journal_path)
+    raw = reader.read_after(
+        0,
+        limit=max(1, args.maximum_market_messages),
+    )
+    normalized = reader.read_normalized_after(0)
     status = "PASS" if (
+        not timed_out
+        and result is not None
+        and
         (
             args.subscription_only
             and result.accepted_messages == 0
@@ -213,13 +243,10 @@ def main(argv=None):
         )
         or (
             not args.subscription_only
-            and len(normalized) == args.maximum_market_messages
-            and {row.ticker for row in normalized} == set(args.symbols)
-            and all(
-                row.normalizer_version == NORMALIZER_VERSION
-                and row.event_kind is MarketChannel.MINUTE_AGGREGATE
-                and row.quality == "GOOD"
-                for row in normalized
+            and _normalized_scope_matches(
+                normalized,
+                args.symbols,
+                args.maximum_market_messages,
             )
         )
     ) and result.received_bytes <= args.decoded_byte_ceiling else "FAIL"
@@ -237,10 +264,27 @@ def main(argv=None):
         "journal_generation": str(generation),
         "stream_session_id": str(session_id),
         "normalizer_version": NORMALIZER_VERSION,
-        "received_frames": result.received_messages,
-        "received_bytes": result.received_bytes,
-        "market_messages": result.accepted_messages,
-        "market_bytes": result.accepted_bytes,
+        "timed_out": timed_out,
+        "received_frames": (
+            result.received_messages
+            if result is not None
+            else gateway.received_messages
+        ),
+        "received_bytes": (
+            result.received_bytes
+            if result is not None
+            else gateway.received_bytes
+        ),
+        "market_messages": (
+            result.accepted_messages
+            if result is not None
+            else len(raw)
+        ),
+        "market_bytes": (
+            result.accepted_bytes
+            if result is not None
+            else sum(len(row.payload) for row in raw)
+        ),
         "last_raw_offset": progress.last_raw_offset,
         "last_event_offset": progress.last_event_offset,
         "event_time_watermark": (

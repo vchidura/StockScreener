@@ -456,7 +456,6 @@ def build_and_run_p8_serial_window(
         valid_until=expires,
         discovery_scheduled_cycle=control.planned_at,
         prior_oi_session=control.session_date - timedelta(days=1),
-        treasury_maximum_age_seconds=3_600,
         model_version="black-scholes-merton-v1",
         history_source_cohort_id=binding.history.source_cohort_id,
     )

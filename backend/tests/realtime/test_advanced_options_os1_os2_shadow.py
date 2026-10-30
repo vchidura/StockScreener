@@ -7,11 +7,11 @@ import pytest
 from realtime.advanced_equity_detector_consumer import (
     AdvancedEquityDetectorSourceRecord,
 )
-from realtime.advanced_equity_s1_s2_shadow import (
+from realtime.advanced_options_os1_os2_shadow import (
     _uuid_array,
-    build_s1_s2_consumer_config,
-    s1_s2_evaluator_cursor,
-    s1_s2_requirements,
+    build_os1_os2_consumer_config,
+    os1_os2_evaluator_cursor,
+    os1_os2_requirements,
 )
 from tests.options.test_stock_bar_detection import (
     OPEN,
@@ -96,14 +96,14 @@ def _record(revision, offset):
     ("detector_id", "intraday"),
     (
         (
-            "S1",
+            "OS1",
             (
                 bar("5m", OPEN, 5, 100),
                 bar("5m", OPEN + timedelta(minutes=5), 5, 101.1),
             ),
         ),
         (
-            "S2",
+            "OS2",
             (
                 bar("5m", OPEN, 5, 101.2),
                 bar("5m", OPEN + timedelta(minutes=5), 5, 100.6),
@@ -112,7 +112,7 @@ def _record(revision, offset):
         ),
     ),
 )
-def test_existing_s1_s2_models_bind_to_advanced_5m_shadow(
+def test_existing_os1_os2_models_bind_to_advanced_5m_shadow(
     detector_id,
     intraday,
 ):
@@ -122,7 +122,7 @@ def test_existing_s1_s2_models_bind_to_advanced_5m_shadow(
         tuple(_row(value) for value in reversed(intraday)),
     )
     source = _record(intraday[-1], offset=len(intraday) * 5)
-    evaluator = s1_s2_evaluator_cursor(
+    evaluator = os1_os2_evaluator_cursor(
         cursor,
         detector_id=detector_id,
         session_close=datetime(2026, 9, 28, 20, tzinfo=UTC),
@@ -146,8 +146,8 @@ def test_existing_s1_s2_models_bind_to_advanced_5m_shadow(
     assert "HISTORICAL_RECONSTRUCTED" in daily_statement
     assert daily_params[:2] == (str(COHORT), str(COHORT))
     assert daily_params[2] == source.observed_at
-    assert s1_s2_requirements(detector_id)["trigger_interval"] == "5m"
-    config = build_s1_s2_consumer_config(
+    assert os1_os2_requirements(detector_id)["trigger_interval"] == "5m"
+    config = build_os1_os2_consumer_config(
         detector_id=detector_id,
         cohort_id=COHORT,
         journal_generation=GENERATION,
@@ -160,4 +160,4 @@ def test_existing_s1_s2_models_bind_to_advanced_5m_shadow(
         readiness_epoch=1,
     )
     assert config.interval == "5m"
-    assert config.detector_id == f"ADVANCED_EQUITY_{detector_id}"
+    assert config.detector_id == f"ADVANCED_OPTIONS_{detector_id}"

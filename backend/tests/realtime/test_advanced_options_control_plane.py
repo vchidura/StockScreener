@@ -93,6 +93,8 @@ def _manifest_policy(**changes):
             DetectorFamily.O1,
             DetectorFamily.O2,
             DetectorFamily.O3,
+            DetectorFamily.OS1,
+            DetectorFamily.OS2,
         ),
     )
     values.update(changes)
@@ -542,6 +544,8 @@ def test_options_membership_is_native_and_equity_detectors_stay_independent():
         DetectorFamily.O1,
         DetectorFamily.O2,
         DetectorFamily.O3,
+        DetectorFamily.OS1,
+        DetectorFamily.OS2,
     }
     assert equity == _equity_plan()
 

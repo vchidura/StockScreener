@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
-from uuid import uuid4
+from types import SimpleNamespace
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -37,6 +39,7 @@ from scripts import (
     audit_advanced_options_v3_operations,
     inspect_advanced_options_v3_package,
     qualify_advanced_options_v3_docker,
+    render_advanced_realtime_v3_compose,
     run_advanced_options_v3_docker_rehearsal,
 )
 from tests.realtime.test_advanced_options_v3_authority import (
@@ -46,6 +49,118 @@ from tests.realtime.test_advanced_options_v3_authority import (
 
 ROOT = Path(__file__).resolve().parents[3]
 UTC = timezone.utc
+
+
+def test_docker_qualification_requires_exact_image_labels(monkeypatch):
+    args = SimpleNamespace(
+        image_id=f"sha256:{'a' * 64}",
+        qualification_semantic_sha256="b" * 64,
+        session_date=date(2026, 10, 30),
+    )
+    labels = {
+        "com.stockscreener.source-semantic-sha256": "b" * 64,
+        "com.stockscreener.session-date": "2026-10-30",
+    }
+    monkeypatch.setattr(
+        qualify_advanced_options_v3_docker,
+        "_docker",
+        lambda *_args: json.dumps(labels),
+    )
+
+    assert (
+        qualify_advanced_options_v3_docker._assert_image_binding(args)
+        == labels
+    )
+
+    labels["com.stockscreener.session-date"] = "2026-10-29"
+    with pytest.raises(RuntimeError, match="not bound"):
+        qualify_advanced_options_v3_docker._assert_image_binding(args)
+
+
+def test_operations_audit_exposes_named_freeze_facts():
+    profile_sha = "a" * 64
+    cohort_sha = "b" * 64
+    manifest_sha = "c" * 64
+    normalizer_sha = "d" * 64
+    scheduler_sha = "e" * 64
+    gaps = {
+        "buckets": {
+            "AVAILABLE": [
+                {
+                    "fact": "active_target9_stocks_am_profile",
+                    "evidence": [{
+                        "runtime_profile_sha256": profile_sha,
+                    }],
+                },
+                {
+                    "fact": "target9_equity_cohort",
+                    "evidence": [{
+                        "cohort_sha256": cohort_sha,
+                        "manifest_sha256": manifest_sha,
+                    }],
+                },
+            ],
+        },
+        "counts": {
+            "AVAILABLE": 2,
+            "MISSING_STORED": 0,
+            "STALE": 0,
+            "AMBIGUOUS": 0,
+            "REQUIRES_PROVIDER": 0,
+        },
+    }
+    source = {
+        "files": [
+            {
+                "path": "backend/realtime/normalizer.py",
+                "sha256": normalizer_sha,
+            },
+            {
+                "path": (
+                    "backend/realtime/"
+                    "advanced_realtime_session_scheduler.py"
+                ),
+                "sha256": scheduler_sha,
+            },
+        ],
+    }
+
+    facts = audit_advanced_options_v3_operations._freeze_facts(
+        gaps,
+        source,
+    )
+
+    assert facts["stored_active_profile_sha256"] == profile_sha
+    assert facts["rendered_source_profile_sha256"] == profile_sha
+    assert facts["normalizer_source_sha256"] == normalizer_sha
+    assert facts["policy_command_sha256"] == scheduler_sha
+    assert facts["all_gap_counts_zero"] is True
+
+
+def test_compose_render_requires_exact_images_and_redaction():
+    image_id = f"sha256:{'a' * 64}"
+    rendered = {
+        "services": {
+            name: {"image": image_id}
+            for name in render_advanced_realtime_v3_compose.TARGET_SERVICES
+        },
+    }
+
+    render_advanced_realtime_v3_compose._validate_rendered(
+        rendered,
+        image_id,
+        ("not-present-secret",),
+    )
+
+    rendered["services"][
+        render_advanced_realtime_v3_compose.TARGET_SERVICES[0]
+    ]["environment"] = {"KEY": "secret-value"}
+    with pytest.raises(ValueError, match="exposed"):
+        render_advanced_realtime_v3_compose._validate_rendered(
+            rendered,
+            image_id,
+            ("secret-value",),
+        )
 
 
 def _docker_rehearsal_files(tmp_path):
@@ -306,24 +421,70 @@ def test_docker_rehearsal_main_owns_connection_without_reentry(
     assert connection.closed
 
 
-def test_docker_qualification_uses_only_production_role_entrypoint():
-    override = qualify_advanced_options_v3_docker._override()
+def test_docker_qualification_uses_actual_production_entrypoints(
+    tmp_path,
+):
+    environment = {
+        "REALTIME_V2_ADVANCED_COHORT_ID": (
+            "11111111-2222-3333-4444-555555555555"
+        ),
+        "REALTIME_V2_ADVANCED_SESSION_DATE": "2026-10-28",
+        "REALTIME_V3_DIAGNOSTIC_AUTHORIZATION_ID": (
+            "22222222-3333-4444-5555-666666666666"
+        ),
+    }
+    override = qualify_advanced_options_v3_docker._override(
+        environment=environment,
+        diagnostic_path=tmp_path / "diagnostic.json",
+    )
 
     for role, service in (
         qualify_advanced_options_v3_docker.SERVICES.items()
     ):
-        assert "command" not in override["services"][service]
-        assert override["services"][service]["environment"] == {
+        expected_environment = {
+            "REALTIME_V3_VALIDATION_MODE": (
+                "DEVELOPMENT_DIAGNOSTIC"
+            ),
             "REALTIME_V3_PROVIDER_FREE_QUALIFICATION": "ENABLED",
         }
-        command = qualify_advanced_options_v3_docker._expected_command(
-            role
+        if role == "CANONICAL_STOCK_ALERTS":
+            expected_environment[
+                "REALTIME_V3_DIAGNOSTIC_AUTHORIZATION_ID"
+            ] = environment[
+                "REALTIME_V3_DIAGNOSTIC_AUTHORIZATION_ID"
+            ]
+            assert "command" in override["services"][service]
+        else:
+            assert "command" not in override["services"][service]
+        assert (
+            override["services"][service]["environment"]
+            == expected_environment
         )
-        assert "scripts/run_advanced_options_v3_production.py" in command
+        command = qualify_advanced_options_v3_docker._expected_command(
+            role,
+            environment,
+        )
+        expected_script = (
+            "scripts/run_realtime_v2_canonical_stock_alerts.py"
+            if role == "CANONICAL_STOCK_ALERTS"
+            else "scripts/run_advanced_options_v3_acquisition.py"
+            if role == "OPTIONS_ACQUISITION"
+            else "scripts/run_advanced_options_v3_production.py"
+        )
+        assert expected_script in command
         assert "scripts/run_advanced_options_v3_docker_rehearsal.py" not in (
             command
         )
-        assert "--docker-service-kind" in command
+        if role == "CANONICAL_STOCK_ALERTS":
+            assert "--continuous" in command
+            assert "DIAGNOSTIC_NON_SERVING" in command
+            assert "--diagnostic-authorization" in command
+        elif role == "OPTIONS_ACQUISITION":
+            assert "--continuous" in command
+            assert "--binding" in command
+            assert "--docker-service-kind" not in command
+        else:
+            assert "--docker-service-kind" in command
 
 
 def test_docker_qualification_waits_for_completed_role_evidence(
@@ -368,26 +529,47 @@ def test_operations_audit_separates_missing_and_stale_runtime_state():
     stale_window = {
         "deadline": observed - timedelta(hours=12),
         "lease_until": observed - timedelta(hours=11),
+        "state": "RUNNING",
     }
     active_window = {
         "deadline": observed + timedelta(hours=1),
         "lease_until": None,
+        "state": "PENDING",
+    }
+    terminal_window = {
+        "deadline": observed + timedelta(hours=1),
+        "lease_until": None,
+        "state": "COMPLETE",
     }
     ended_stream = {"ended_at": observed - timedelta(hours=10)}
-    live_stream = {"ended_at": None}
+    ended_stream["session_date"] = date(2026, 10, 22)
+    current_ended_stream = {
+        "ended_at": observed - timedelta(hours=1),
+        "session_date": date(2026, 10, 23),
+    }
+    live_stream = {
+        "ended_at": None,
+        "session_date": date(2026, 10, 23),
+    }
 
-    conflicts, stale = (
+    conflicts, stale, retained = (
         audit_advanced_options_v3_operations
         ._runtime_record_classification(
             {
                 "live_worker_leases": (),
-                "conflicting_windows": (stale_window, active_window),
+                "conflicting_windows": (
+                    stale_window,
+                    active_window,
+                    terminal_window,
+                ),
                 "nonterminal_stream_sessions": (
                     ended_stream,
+                    current_ended_stream,
                     live_stream,
                 ),
             },
             observed,
+            date(2026, 10, 23),
         )
     )
 
@@ -397,7 +579,56 @@ def test_operations_audit_separates_missing_and_stale_runtime_state():
     assert conflicts["windows"] == (active_window,)
     assert conflicts["streams"] == (live_stream,)
     assert stale["windows"] == (stale_window,)
-    assert stale["streams"] == (ended_stream,)
+    assert stale["streams"] == (current_ended_stream,)
+    assert retained["streams"] == (ended_stream,)
+
+
+def test_operations_audit_coalesces_identical_catalog_versions():
+    base = {
+        "contract_id": 7,
+        "contract_ticker": "O:SPY261027C00768000",
+        "underlying_security_id": str(UUID(int=8)),
+        "version_id": 1,
+        "call_put": "C",
+        "expiration": date(2026, 10, 27),
+        "strike": Decimal("768"),
+        "exercise_style": "AMERICAN",
+        "multiplier": Decimal("100"),
+        "eligibility": "VALIDATED_ACTIVE",
+        "effective_from": datetime(2026, 10, 27, 12, tzinfo=UTC),
+        "observed_at": datetime(2026, 10, 27, 12, tzinfo=UTC),
+        "payload_sha256": "a" * 64,
+    }
+    latest = {
+        **base,
+        "version_id": 2,
+        "effective_from": datetime(
+            2026,
+            10,
+            27,
+            12,
+            1,
+            tzinfo=UTC,
+        ),
+        "observed_at": datetime(
+            2026,
+            10,
+            27,
+            12,
+            1,
+            tzinfo=UTC,
+        ),
+    }
+
+    assert (
+        audit_advanced_options_v3_operations
+        ._coalesce_option_catalog_rows((base, latest))
+    ) == (latest,)
+    divergent = {**latest, "strike": Decimal("769")}
+    assert len(
+        audit_advanced_options_v3_operations
+        ._coalesce_option_catalog_rows((base, divergent))
+    ) == 2
 
 
 def test_cli_has_no_execute_mode(tmp_path, capsys):

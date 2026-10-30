@@ -2576,7 +2576,7 @@ export interface OptionO1IndicatorObservation {
 
 export interface OptionStockSetupIndicatorObservation {
   schema_version: 'option_stock_setup_indicator_observation_v1'
-  detector_id: 'S1' | 'S2'
+  detector_id: 'OS1' | 'OS2'
   baseline_disposition: string
   baseline_reasons: string[]
   decision_at: string
@@ -2621,7 +2621,7 @@ export interface OptionO3CreditObservation {
     valuation_policy_sha256: string }>
 }
 
-export type OptionDetectorId = 'O1' | 'O2' | 'O3' | 'S1' | 'S2'
+export type OptionDetectorId = 'O1' | 'O2' | 'O3' | 'OS1' | 'OS2'
 
 export interface OptionDetectorEvaluationReview {
   storage_ready: boolean
@@ -2637,6 +2637,8 @@ export interface OptionDetectorEvaluationReview {
   models: Array<{
     detector_id: OptionDetectorId; evaluated: number; detected: number; selected: number;
     not_selected: number; repeats: number; observations: number;
+    accepted?: boolean; lane_state?: 'COMPLETE_SELECTED' | 'COMPLETE_ZERO' | 'BLOCKED' | 'UNAVAILABLE';
+    reason_codes?: string[];
     measured: number | null; positive_rate: number | null; mean_net_return: number | null; outcome_status: string;
   }>
   rows: Array<{

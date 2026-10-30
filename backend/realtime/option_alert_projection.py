@@ -54,7 +54,7 @@ class DetectorEvaluationQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
     session_date: date | None = None
     dataset_id: str | None = Field(default=None, min_length=1, max_length=80)
-    detector: Literal["O1", "O2", "O3", "S1", "S2"] | None = None
+    detector: Literal["O1", "O2", "O3", "OS1", "OS2"] | None = None
     selection_status: Literal["SELECTED", "NOT_SELECTED", "REPEAT", "OBSERVATION"] | None = None
     underlyer: str | None = None
     sort_by: Literal["triggered_at", "run", "underlyer", "detector", "category", "strategy", "rank", "entry_limit"] = "run"
@@ -271,7 +271,7 @@ class OfflineOptionAlertPublication(OfflineForwardPublication):
         data.update(rows=chosen[request.offset:request.offset + request.limit], total=len(chosen), limit=request.limit, offset=request.offset)
         if indicative:
             data["context_availability"] = (stored["context_availability"] if technical else
-                {family: "AVAILABLE_INDICATIVE" if family == "O1" else "UNAVAILABLE" for family in ("O1", "O2", "O3", "S1", "S2")})
+                {family: "AVAILABLE_INDICATIVE" if family == "O1" else "UNAVAILABLE" for family in ("O1", "O2", "O3", "OS1", "OS2")})
         if request.selection_status is not None and not indicative:
             for cell in data["cells"]:
                 if cell["selection_status"] != request.selection_status:
@@ -305,7 +305,7 @@ class OfflineOptionAlertPublication(OfflineForwardPublication):
             data.update(rows=ordered[request.offset:request.offset + request.limit], total=len(ordered),
                 limit=request.limit, offset=request.offset)
             data["context_availability"] = (stored["context_availability"] if technical else
-                {family: "AVAILABLE_INDICATIVE" if family == "O1" else "UNAVAILABLE" for family in ("O1", "O2", "O3", "S1", "S2")})
+                {family: "AVAILABLE_INDICATIVE" if family == "O1" else "UNAVAILABLE" for family in ("O1", "O2", "O3", "OS1", "OS2")})
             return self._envelope(stored, available=True, data=data)
         if view:
             view = deepcopy(view)
@@ -594,7 +594,7 @@ def _decode_indicative_packages(source, base_run, configuration):
             raise ValueError("indicative display receipt policy/clock/capability drift")
         if technical:
             enabled = tuple(sorted(family.value for family in source.scope.selection.policy.required_detectors))
-            if (tuple(payload["enabled_detectors"]) != enabled or set(enabled) - {"O1", "O3", "S1", "S2"}
+            if (tuple(payload["enabled_detectors"]) != enabled or set(enabled) - {"O1", "O3", "OS1", "OS2"}
                     or set(payload["detector_dependencies"]) != set(enabled)):
                 raise ValueError("technical package detector capability drift")
             if any(not reasons for reasons in payload["detector_dependencies"].values()):
@@ -846,7 +846,7 @@ def seal_offline_indicative_alert_publication(
             valuation_policy_sha256=configuration.valuation_policy_sha256,
             candidate_details={identity: original["detail"] for identity, original in originals.items() if "detail" in original},
             context_availability={family: "AVAILABLE_INDICATIVE" if model_ready.get(family) else "UNAVAILABLE"
-            for family in ("O1", "O2", "O3", "S1", "S2")}) if technical else {}))
+            for family in ("O1", "O2", "O3", "OS1", "OS2")}) if technical else {}))
     serialized = json.dumps(payload, default=lambda value: value.isoformat() if isinstance(value, (date, datetime)) else str(value),
         sort_keys=True, separators=(",", ":"), allow_nan=False)
     if len(serialized.encode("ascii")) > 67108864:

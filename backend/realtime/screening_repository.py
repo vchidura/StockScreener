@@ -469,6 +469,72 @@ def load_realtime_stock_alert_input(
     )
 
 
+def select_canonical_stock_alert_bars(
+    cursor,
+    request: BarRequest,
+    session: date,
+) -> tuple[dict, ...]:
+    scope, clocks = request.scope, request.clocks
+    predicate = (
+        "cohort_id=%s AND provider_tier=%s AND ticker=ANY(%s) "
+        "AND session_scope='RTH' AND is_final AND "
+        + _BAR_VISIBLE_AT
+        + "AND interval='5m' "
+        "AND adjustment_basis='RAW_UNADJUSTED' "
+        "AND session_date=%s AND bar_end<=%s "
+    )
+    parameters = (
+        str(scope.cohort_id),
+        scope.provider_tier,
+        list(scope.tickers),
+        *clocks.params(),
+        session,
+        request.cutoff,
+    )
+    precedence = source_precedence_case(False)
+    cursor.execute(
+        "SELECT DISTINCT ON (ticker, interval, adjustment_basis, bar_start) "
+        + bar_columns(True)
+        + " FROM rt.bar_revisions WHERE "
+        + predicate
+        + "ORDER BY ticker, interval, adjustment_basis, bar_start, "
+        + precedence
+        + " DESC, observed_at DESC, created_at DESC, bar_revision_id",
+        parameters,
+    )
+    return tuple(
+        share_bar_values([dict(row) for row in cursor.fetchall()])
+    )
+
+
+def load_realtime_canonical_stock_alert_input(
+    cursor,
+    *,
+    cohort_id: UUID,
+    session: date,
+    cutoff: datetime,
+    source_generation: int,
+    known_by: datetime | None = None,
+) -> RealtimeScreeningInput:
+    return load_screening_input(
+        cursor,
+        cohort_id=cohort_id,
+        session=session,
+        cutoff=cutoff,
+        source_generation=source_generation,
+        include_portal_history=False,
+        include_strategy_action_details=False,
+        known_by=known_by,
+        bar_loader=lambda active_cursor, request: (
+            select_canonical_stock_alert_bars(
+                active_cursor,
+                request,
+                session,
+            )
+        ),
+    )
+
+
 def load_screening_input(cursor, *, cohort_id: UUID, session: date,
                          cutoff: datetime, source_generation: int,
                          include_portal_history: bool,

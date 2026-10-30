@@ -42,6 +42,9 @@ from realtime.advanced_options_provider_contract import (  # noqa: E402
     MASSIVE_OPTIONS_PROVIDER_CONTRACT,
     load_default_options_exchange_reference,
 )
+from realtime.advanced_options_reference_producer import (  # noqa: E402
+    _coalesce_terminal_open_interest,
+)
 from realtime.advanced_options_v3_deployment import (  # noqa: E402
     ADVANCED_OPTIONS_V3_PROFILE_SHA256,
     advanced_options_v3_profile_payload,
@@ -72,6 +75,7 @@ V3_MIGRATIONS = (
     "035_advanced_options_v3_stage_barrier",
 )
 SOURCE_ANCHORS = (
+    "backend/realtime/advanced_realtime_session_scheduler.py",
     "backend/realtime/advanced_options_equity_input.py",
     "backend/realtime/advanced_options_native_loader.py",
     "backend/realtime/advanced_options_reference_producer.py",
@@ -79,6 +83,7 @@ SOURCE_ANCHORS = (
     "backend/realtime/advanced_options_v3_authority.py",
     "backend/realtime/advanced_options_v3_deployment.py",
     "backend/realtime/stage_graph.py",
+    "backend/realtime/normalizer.py",
     "docker-compose.realtime-v2.yml",
 )
 
@@ -195,6 +200,61 @@ def _source_evidence() -> dict[str, object]:
     }
 
 
+def _freeze_facts(gaps, source) -> dict[str, object]:
+    available = {
+        row["fact"]: row["evidence"]
+        for row in gaps["buckets"]["AVAILABLE"]
+    }
+    profiles = available.get("active_target9_stocks_am_profile", ())
+    cohorts = available.get("target9_equity_cohort", ())
+    files = {
+        row["path"]: row["sha256"]
+        for row in source["files"]
+    }
+    if (
+        not isinstance(profiles, (list, tuple))
+        or len(profiles) != 1
+        or not isinstance(cohorts, (list, tuple))
+        or len(cohorts) != 1
+    ):
+        return {}
+    profile = profiles[0]
+    cohort = cohorts[0]
+    required = {
+        "stored_active_profile_sha256": profile.get(
+            "runtime_profile_sha256"
+        ),
+        "cohort_sha256": cohort.get("cohort_sha256"),
+        "manifest_sha256": cohort.get("manifest_sha256"),
+        "normalizer_source_sha256": files.get(
+            "backend/realtime/normalizer.py"
+        ),
+        "policy_command_sha256": files.get(
+            "backend/realtime/advanced_realtime_session_scheduler.py"
+        ),
+    }
+    if any(
+        not isinstance(value, str) or len(value) != 64
+        for value in required.values()
+    ):
+        return {}
+    return {
+        **required,
+        "rendered_source_profile_sha256": required[
+            "stored_active_profile_sha256"
+        ],
+        "manifest_cohort_sha256": canonical_sha256({
+            "cohort_sha256": required["cohort_sha256"],
+            "manifest_sha256": required["manifest_sha256"],
+        }),
+        "all_gap_counts_zero": all(
+            count == 0
+            for name, count in gaps["counts"].items()
+            if name != "AVAILABLE"
+        ),
+    }
+
+
 def _classify(status: str, fact: str, *, cause: str, evidence: object):
     return {
         "status": status,
@@ -210,9 +270,17 @@ def _exactly_one_status(rows) -> str:
     return "MISSING_STORED" if not rows else "AMBIGUOUS"
 
 
-def _runtime_record_classification(scope, observed_at: datetime):
-    stale_windows = tuple(
+def _runtime_record_classification(
+    scope,
+    observed_at: datetime,
+    session_date: date,
+):
+    nonterminal_windows = tuple(
         row for row in scope["conflicting_windows"]
+        if row["state"] in {"PENDING", "RUNNING"}
+    )
+    stale_windows = tuple(
+        row for row in nonterminal_windows
         if row["deadline"] < observed_at
         and (
             row["lease_until"] is None
@@ -220,16 +288,22 @@ def _runtime_record_classification(scope, observed_at: datetime):
         )
     )
     active_windows = tuple(
-        row for row in scope["conflicting_windows"]
+        row for row in nonterminal_windows
         if row not in stale_windows
     )
     stale_streams = tuple(
         row for row in scope["nonterminal_stream_sessions"]
         if row["ended_at"] is not None
+        and row["session_date"] >= session_date
     )
     active_streams = tuple(
         row for row in scope["nonterminal_stream_sessions"]
-        if row not in stale_streams
+        if row["ended_at"] is None
+    )
+    retained_streams = tuple(
+        row for row in scope["nonterminal_stream_sessions"]
+        if row["ended_at"] is not None
+        and row["session_date"] < session_date
     )
     return (
         {
@@ -240,6 +314,9 @@ def _runtime_record_classification(scope, observed_at: datetime):
         {
             "windows": stale_windows,
             "streams": stale_streams,
+        },
+        {
+            "streams": retained_streams,
         },
     )
 
@@ -404,19 +481,20 @@ def _production_scope(cursor, session_date: date):
         "run.owner_epoch,run.lease_until "
         "FROM rt.window_runs AS run "
         "JOIN rt.service_plans AS service USING(plan_id) "
-        "WHERE service.session_date>=%s "
-        "OR run.state IN ('PENDING','RUNNING') "
+        "WHERE run.state IN ('PENDING','RUNNING') "
         "ORDER BY service.session_date,run.release_at,run.window_id",
-        (session_date,),
     )
     streams = _rows(
         cursor,
-        "SELECT session_id::text,provider,feed,manifest_id::text,"
+        "SELECT stream.session_id::text,stream.provider,stream.feed,"
+        "stream.manifest_id::text,manifest.session_date,"
         "owner_id::text,owner_epoch,started_at,subscribed_at,ended_at,"
         "status,journal_generation::text,authorization_reference,"
         "connection_attempt,connection_ceiling,decoded_byte_ceiling,"
         "received_frame_count,received_byte_count,heartbeat_at "
-        "FROM rt.stream_sessions "
+        "FROM rt.stream_sessions AS stream "
+        "JOIN rt.subscription_manifests AS manifest "
+        "ON manifest.manifest_id=stream.manifest_id "
         "WHERE ended_at IS NULL OR status NOT IN ('STOPPED','FAILED') "
         "ORDER BY started_at,session_id",
     )
@@ -503,19 +581,27 @@ def _publication_and_retention(cursor):
 def _security_identities(cursor, known_at: datetime):
     return _rows(
         cursor,
-        "SELECT revision.security_id::text,revision.revision_id::text,"
+        "SELECT DISTINCT ON (revision.ticker) "
+        "revision.security_id::text,revision.revision_id::text,"
         "revision.ticker,revision.exchange,revision.calendar_id,"
         "revision.effective_from,revision.effective_to,revision.observed_at,"
         "revision.payload_sha256,revision.active,revision.free_float "
         "FROM ref.security_revisions AS revision "
         "WHERE revision.ticker=ANY(%s) "
-        "AND revision.effective_from<=%s "
-        "AND (revision.effective_to IS NULL OR revision.effective_to>%s) "
         "AND revision.observed_at<=%s "
-        "ORDER BY revision.ticker,revision.effective_from DESC,"
-        "revision.observed_at DESC,revision.revision_id",
-        (list(OPTION_UNDERLYINGS), known_at, known_at, known_at),
+        "ORDER BY revision.ticker,revision.observed_at DESC,"
+        "revision.effective_from DESC,revision.revision_id DESC",
+        (list(OPTION_UNDERLYINGS), known_at),
     )
+
+
+def _security_identity_groups(identity_rows):
+    grouped = defaultdict(set)
+    for row in identity_rows:
+        ticker = str(row["ticker"])
+        if ticker in OPTION_UNDERLYINGS:
+            grouped[ticker].add(str(row["security_id"]))
+    return grouped
 
 
 def _history_coverage(cursor, sessions, known_at: datetime):
@@ -581,8 +667,47 @@ def _history_coverage(cursor, sessions, known_at: datetime):
     return tuple(cohorts)
 
 
+_CATALOG_SEMANTIC_FIELDS = (
+    "contract_id",
+    "contract_ticker",
+    "underlying_security_id",
+    "call_put",
+    "expiration",
+    "strike",
+    "exercise_style",
+    "multiplier",
+    "eligibility",
+    "payload_sha256",
+)
+
+
+def _coalesce_option_catalog_rows(rows):
+    by_contract = defaultdict(list)
+    for row in rows:
+        by_contract[int(row["contract_id"])].append(row)
+    selected = []
+    for contract_id in sorted(by_contract):
+        candidates = by_contract[contract_id]
+        identities = {
+            tuple(row[name] for name in _CATALOG_SEMANTIC_FIELDS)
+            for row in candidates
+        }
+        if len(identities) == 1:
+            selected.append(max(
+                candidates,
+                key=lambda row: (
+                    row["effective_from"],
+                    row["observed_at"],
+                    int(row["version_id"]),
+                ),
+            ))
+        else:
+            selected.extend(candidates)
+    return tuple(selected)
+
+
 def _option_catalog(cursor, session_date: date, next_session: date, known_at: datetime):
-    rows = _rows(
+    raw_rows = _rows(
         cursor,
         "SELECT contract.contract_id,contract.contract_ticker,"
         "contract.underlying_security_id::text,version.version_id,"
@@ -603,6 +728,7 @@ def _option_catalog(cursor, session_date: date, next_session: date, known_at: da
         "ORDER BY version.expiration,contract.contract_ticker,version.version_id",
         ([session_date, next_session], known_at, known_at, known_at),
     )
+    rows = _coalesce_option_catalog_rows(raw_rows)
     grouped = {}
     for expiration in (session_date, next_session):
         for ticker in OPTION_UNDERLYINGS:
@@ -754,6 +880,7 @@ def _gap_report(
     prior_session,
     observed_at,
     identity,
+    security_identities,
     scope,
     history,
     catalog,
@@ -842,10 +969,12 @@ def _gap_report(
         f"latest stored target-9 plan at {observed_at.isoformat()}",
         exact_cohorts,
     )
-    conflicts, stale_records = _runtime_record_classification(
+    conflicts, stale_records, retained_records = (
+        _runtime_record_classification(
         scope,
         observed_at,
-    )
+        session_date,
+    ))
     add(
         "AVAILABLE"
         if not any(conflicts.values())
@@ -859,6 +988,12 @@ def _gap_report(
         "expired_windows_ended_nonterminal_streams",
         "database clock",
         stale_records,
+    )
+    add(
+        "AVAILABLE",
+        "retained_historical_runtime_records",
+        f"before session {session_date.isoformat()}",
+        retained_records,
     )
     complete_history = tuple(row for row in history if row["complete"])
     add(
@@ -886,10 +1021,7 @@ def _gap_report(
             "live_e_availability": "NOT_YET_CAUSALLY_OBSERVABLE_PRE_SESSION",
         },
     )
-    identity_groups = defaultdict(set)
-    for row in catalog_rows:
-        prefix = "QQQ" if row["contract_ticker"].startswith("O:QQQ") else "SPY"
-        identity_groups[prefix].add(row["underlying_security_id"])
+    identity_groups = _security_identity_groups(security_identities)
     for key, value in catalog.items():
         required = key.endswith(session_date.isoformat())
         count = value["contract_count"]
@@ -912,6 +1044,17 @@ def _gap_report(
         if row["settlement_session"] == prior_session
         and row["observed_session"] == session_date
     )
+    prior_oi_by_contract = defaultdict(list)
+    for row in prior_oi:
+        prior_oi_by_contract[int(row["contract_id"])].append(row)
+    coalesced_prior_oi = tuple(
+        terminal[0]
+        for contract_id in sorted(prior_oi_by_contract)
+        if len(terminal := _coalesce_terminal_open_interest(
+            prior_oi_by_contract[contract_id],
+            session_date,
+        )) == 1
+    )
     same_day_catalog = tuple(
         row for row in catalog_rows
         if row["expiration"] == session_date
@@ -920,7 +1063,9 @@ def _gap_report(
     same_day_contract_ids = {
         row["contract_id"] for row in same_day_catalog
     }
-    oi_contract_ids = {row["contract_id"] for row in prior_oi}
+    oi_contract_ids = {
+        row["contract_id"] for row in coalesced_prior_oi
+    }
     selected_catalog = tuple(
         row for row in same_day_catalog
         if row["contract_id"] in oi_contract_ids
@@ -950,6 +1095,8 @@ def _gap_report(
         f"settlement={prior_session.isoformat()} observed_session={session_date.isoformat()}",
         {
             "catalog_contract_count": len(same_day_contract_ids),
+            "prior_oi_row_count": len(prior_oi),
+            "coalesced_prior_oi_count": len(coalesced_prior_oi),
             "selected_contract_count": len(selected_catalog),
             "selected_membership": tuple(sorted(selected_membership)),
             "required_selected_membership": tuple(
@@ -966,17 +1113,28 @@ def _gap_report(
         if latest_rate_received is None
         else (observed_at - latest_rate_received).total_seconds()
     )
+    rate_date = None if not rates else rates[0]["rate_date"]
+    publication_causal = bool(rates) and all(
+        row["rate_date"] == rate_date
+        and row["source_observed_at"] <= row["received_at"] <= observed_at
+        for row in rates
+    )
     add(
         "AVAILABLE"
-        if rates and rate_age is not None and 0 <= rate_age <= 3600
+        if publication_causal and rate_date == prior_session
         else "STALE" if rates else "REQUIRES_PROVIDER",
         "treasury_curve",
-        f"maximum_age_seconds=3600 at {observed_at.isoformat()}",
+        (
+            "policy=treasury-prior-xnys-session-publication-v1 "
+            f"expected_rate_date={prior_session.isoformat()} "
+            f"at {observed_at.isoformat()}"
+        ),
         {
             "member_count": len(rates),
-            "rate_date": None if not rates else rates[0]["rate_date"],
+            "rate_date": rate_date,
             "latest_received_at": latest_rate_received,
             "age_seconds": rate_age,
+            "publication_causal": publication_causal,
         },
     )
     for ticker in OPTION_UNDERLYINGS:
@@ -1156,6 +1314,7 @@ def main(argv=None) -> int:
         prior_session=prior_session,
         observed_at=args.observed_at_utc,
         identity=identity,
+        security_identities=identities,
         scope=scope,
         history=history,
         catalog=catalog,
@@ -1215,7 +1374,10 @@ def main(argv=None) -> int:
                 "channels": ("T", "Q"),
                 "prior_oi_session": prior_session,
                 "maximum_equity_age_seconds": 300,
-                "treasury_maximum_age_seconds": 3600,
+                "treasury_freshness_policy": (
+                    "treasury-prior-xnys-session-publication-v1"
+                ),
+                "treasury_expected_rate_date": prior_session,
             },
         },
         "source": source,
@@ -1250,6 +1412,7 @@ def main(argv=None) -> int:
             "reference_inputs": reference_inputs,
         },
         "gap_report": gaps,
+        "freeze_facts": _freeze_facts(gaps, source),
         "zero_effect_proof": {
             "transaction_read_only": (
                 identity["metadata"]["transaction_read_only"]
@@ -1279,6 +1442,7 @@ def main(argv=None) -> int:
         "semantic_sha256": report["semantic_sha256"],
         "file_sha256": hashlib.sha256(encoded).hexdigest(),
         "gap_counts": gaps["counts"],
+        "freeze_facts": report["freeze_facts"],
         "output": str(output),
         "effects": report["scope"]["effects"],
     }, indent=2, sort_keys=True))

@@ -17,6 +17,7 @@ from realtime.advanced_options_reference_producer import (
     AdvancedOptionsReferenceProducerPreflight,
     PostgresAdvancedOptionsReferenceProducer,
     ReferenceProducerStatus,
+    _coalesce_terminal_open_interest,
     advanced_options_reference_producer_plan_payload,
     build_advanced_options_reference_producer_plan,
 )
@@ -61,7 +62,6 @@ def _plan(**changes):
         valid_until=EXPIRES,
         discovery_scheduled_cycle=PLANNED,
         prior_oi_session=date(2026, 10, 15),
-        treasury_maximum_age_seconds=3_600,
         model_version="black-scholes-merton-v1",
     )
     values.update(changes)
@@ -89,6 +89,41 @@ def test_reference_producer_plan_freezes_scope_clocks_and_zero_authority():
     assert set(payload["effect_counts"].values()) == {0}
     assert first.provider_calls_authorized is False
     assert first.runtime_actions_authorized is False
+
+
+def test_identical_terminal_oi_observations_coalesce_to_latest_clock():
+    base = {
+        "baseline_id": "11111111-1111-1111-1111-111111111111",
+        "contract_id": 7,
+        "settlement_session": date(2026, 10, 26),
+        "open_interest": 123,
+        "source": "massive",
+        "date_basis": "PROVIDER_CHAIN_SNAPSHOT_PRIOR_SESSION",
+        "observed_session": date(2026, 10, 27),
+        "observed_at": PLANNED,
+        "received_at": PLANNED,
+        "payload_sha256": "a" * 64,
+        "supersedes_baseline_id": None,
+    }
+    repeated = {
+        **base,
+        "baseline_id": "22222222-2222-2222-2222-222222222222",
+        "observed_at": PLANNED + timedelta(seconds=1),
+        "received_at": PLANNED + timedelta(seconds=1),
+        "payload_sha256": "b" * 64,
+    }
+
+    (selected,) = _coalesce_terminal_open_interest(
+        (base, repeated),
+        date(2026, 10, 27),
+    )
+
+    assert selected["baseline_id"] == repeated["baseline_id"]
+    divergent = {**repeated, "open_interest": 124}
+    assert len(_coalesce_terminal_open_interest(
+        (base, divergent),
+        date(2026, 10, 27),
+    )) == 2
 
 
 def test_reference_producer_plan_rejects_divergence_scope_and_stale_clocks():

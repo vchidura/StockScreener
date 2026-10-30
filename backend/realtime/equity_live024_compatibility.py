@@ -74,6 +74,13 @@ POST024_RELATIONS = frozenset({
     "rt.option_flow_event_profiles",
     "rt.option_flow_policies",
     "rt.option_source_flows",
+    "rt.stock_alert_result_instances",
+    "rt.stock_alert_result_records",
+    "rt.stock_alert_result_revisions",
+    "rt.stock_alert_result_streams",
+    "rt.stock_alert_result_storage_identities",
+    "rt.canonical_stock_alert_batches",
+    "rt.canonical_stock_alert_evaluations",
 })
 SYMBOLS = ("SPY",)
 CHANNELS = ("AM",)

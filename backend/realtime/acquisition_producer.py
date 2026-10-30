@@ -21,13 +21,19 @@ from .acquisition_ledger import (
     advance_acquisition_watermark_cursor,
     record_provider_request_cursor,
 )
-from .contracts import CANARY_UNIVERSE, UniverseManifest
+from .contracts import (
+    CANARY_UNIVERSE,
+    EQUITY_VALIDATION_UNIVERSE,
+    UniverseManifest,
+)
 from .database_access import RealtimeDatabaseRole
 from .worker_database import RealtimeProcessDatabase
 
 
 MAX_DEVELOPER_SOURCE_BATCHES = 100
-MAX_DEVELOPER_SOURCE_FACTS = 2_400
+MAX_DEVELOPER_SOURCE_FACTS = (
+    len(EQUITY_VALIDATION_UNIVERSE.equity_tickers) * 391
+)
 MAX_DEVELOPER_CANARY_REQUESTS = 88
 MAX_DEVELOPER_CANARY_RESPONSE_BYTES = 32 * 1024 * 1024
 DEVELOPER_ACQUISITION_OVERLAP_POLICY = "developer_rest_overlap_v1"

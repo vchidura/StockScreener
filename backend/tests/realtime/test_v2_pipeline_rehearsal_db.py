@@ -271,6 +271,24 @@ ACTIVE = threading.local()
 PHASES: dict[tuple, float] = {}
 
 
+def _retained_alert_projection(loaded_at):
+    body = {
+        "contract": "realtime-stock-alert-retained-projection-v1",
+        "loaded_at": loaded_at.isoformat(),
+        "streams": [],
+        "shadow": {
+            "status": "UNAVAILABLE",
+            "alerts": [],
+        },
+        "review_publications": [],
+        "schedule_streams": [],
+    }
+    return {
+        **body,
+        "projection_sha256": canonical_sha256(body),
+    }
+
+
 def timed_phases(patch) -> None:
     """Wrap the heavy calls of the runners so the report can split a stage's time into its phases."""
     import realtime.stage_runners_alerts as alert_runners
@@ -339,7 +357,10 @@ class Runtime:
         self.environment = RunnerEnvironment(
             provider, build_id=f"rehearsal-{label}", reference_service=rehearsal.reference_service,
             equity_source=rehearsal.source,
-            universe=UniverseManifest(UNIVERSE.version, rehearsal.tickers, ()))
+            universe=UniverseManifest(UNIVERSE.version, rehearsal.tickers, ()),
+            stock_alert_projection_loader=lambda known_by: (
+                _retained_alert_projection(known_by)
+            ))
         self.transactions: list[Used] = []
         self.timings: dict[tuple, float] = {}
         self.crash_after: set[tuple] = set()
@@ -758,12 +779,16 @@ def test_a2_the_real_window_runs_through_v2_service_with_one_receipt_and_the_rea
     (report,) = w1.report.windows
     states = {stage: (state, codes) for stage, _, state, codes in rehearsal.stage_rows("w1")}
     # The whole window COMPLETEs, every stage included. The only degraded codes are what the producers say they
-    # did not produce (STOCK_ALERTS has no forward/replay/context producer yet): in particular the strategy stage
+    # did not produce (the retained forward source is present; replay/context remain unavailable): in particular
+    # the strategy stage
     # reports no STRATEGY_*_FAILED and no unevaluated analysis.
     assert report.window_state == "COMPLETE", (states, report)
     assert {stage: state for stage, (state, _) in states.items()} == {stage: "COMPLETE" for stage in WINDOW_STAGES}
     assert {stage: codes for stage, (state, codes) in states.items() if codes} == {
-        "STOCK_ALERTS": ("MISSING_PRODUCER:context", "MISSING_PRODUCER:forward", "MISSING_PRODUCER:replay")}
+        "STOCK_ALERTS": (
+            "MISSING_PRODUCER:context",
+            "MISSING_PRODUCER:replay",
+        )}
     receipts = rehearsal.q("SELECT receipt_kind, reference_generation, cutoff FROM rt.cycle_receipts "
                            "WHERE window_id = %s", (str(report.window_id),))
     assert receipts == [("EQUITY_CYCLE", 1, rehearsal.c1)]

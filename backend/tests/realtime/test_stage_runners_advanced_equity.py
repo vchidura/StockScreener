@@ -219,14 +219,24 @@ def _context(*, window_id=WINDOW):
         window=SimpleNamespace(
             window_id=window_id,
             cutoff=NOW,
+            release_at=NOW + timedelta(seconds=5),
         ),
     )
 
 
 def test_advanced_input_gate_binds_session_checkpoint_and_budget():
-    digest = advanced_input_gate_identity(Database(), _context())
+    database = Database()
+    digest = advanced_input_gate_identity(database, _context())
 
     assert len(digest) == 64
+    bar_query = database.cursor.execute.call_args_list[2].args[0]
+    checkpoint_query = (
+        database.cursor.execute.call_args_list[5].args[0]
+    )
+    assert "FROM rt.bar_revisions AS revision" in bar_query
+    assert "rt.bar_current" not in bar_query
+    assert "revision.created_at<=%s" in bar_query
+    assert "checkpoint.committed_at<=%s" in checkpoint_query
 
 
 def test_advanced_input_gate_accepts_explicit_repair_before_subscription():

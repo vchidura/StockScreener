@@ -13,7 +13,9 @@ from options.domain import ContractType, OptionContractSnapshot
 from options.dual_origin import (
     ActivitySource,
     LatestCompletedSignalDecision,
+    assess_canonical_stock_first,
 )
+from options.stock_bar_detection import CanonicalStockSignal
 from options.strategies.domain import (
     CandidateKind,
     CandidateLeg,
@@ -117,6 +119,14 @@ class AdvancedO3Invocation:
     structural_invalidation: Decimal
     scheduled_cycle: datetime
     package: RealtimeOptionPackage
+
+
+@dataclass(frozen=True, slots=True)
+class AdvancedOSInvocation:
+    event_id: UUID
+    signal: CanonicalStockSignal
+    source: ActivitySource | None
+    package: RealtimeOptionPackage | None = None
 
 
 def advanced_o3_invocation_document(
@@ -487,10 +497,87 @@ def build_advanced_o3_executor(
     return execute
 
 
+def build_advanced_os_executor(
+    detector: DetectorFamily,
+    inputs: AdvancedOptionsLaneInputs,
+) -> NativeDetectorExecutor:
+    if detector not in {DetectorFamily.OS1, DetectorFamily.OS2}:
+        raise ValueError("Advanced stock-first Options detector is invalid")
+    if any(
+        not isinstance(row, AdvancedOSInvocation)
+        for row in inputs.invocations
+    ):
+        raise TypeError("Advanced stock-first Options invocation is invalid")
+
+    def execute(
+        context: AdvancedOptionsDetectorContext,
+    ) -> AdvancedOptionsNativeLaneResult:
+        blocked = _blocked_or_none(context, detector, inputs)
+        if blocked is not None:
+            return blocked
+        evaluations = []
+        for invocation in inputs.invocations:
+            if invocation.signal.detector_id != detector.value:
+                raise ValueError(
+                    "Advanced stock-first Options signal changed detector"
+                )
+            market_cutoff = max(
+                invocation.signal.market_time,
+                (
+                    invocation.source.market_time
+                    if invocation.source is not None
+                    else invocation.signal.market_time
+                ),
+            )
+            decision = assess_canonical_stock_first(
+                invocation.signal,
+                invocation.source,
+                market_cutoff=market_cutoff,
+                decision_at=context.cutoff,
+            )
+            selected = (
+                decision.disposition == "CONFIRMED"
+                and invocation.package is not None
+            )
+            evaluations.append(AdvancedOptionsNativeEvaluation(
+                invocation.event_id,
+                invocation.signal.underlyer,
+                (
+                    "SELECTED"
+                    if selected
+                    else "OBSERVATION"
+                    if decision.disposition == "CONFIRMED"
+                    else "NOT_SELECTED"
+                ),
+                context.cutoff,
+                {
+                    "contract": "advanced-options-stock-first-evaluation-v1",
+                    "detector_id": detector.value,
+                    "signal": _plain(invocation.signal),
+                    "decision": _plain(decision),
+                    "source_event_id": (
+                        None
+                        if invocation.source is None
+                        else str(invocation.source.snapshot_id)
+                    ),
+                },
+                invocation.package if selected else None,
+            ))
+        return AdvancedOptionsNativeLaneResult(
+            NativeLaneState.COMPLETE,
+            (),
+            tuple(evaluations),
+        )
+
+    return execute
+
+
 @dataclass(frozen=True, slots=True)
 class AdvancedOptionsNativeInputBundle:
     o1: AdvancedOptionsLaneInputs
     o3: AdvancedOptionsLaneInputs
+    os1: AdvancedOptionsLaneInputs = AdvancedOptionsLaneInputs()
+    os2: AdvancedOptionsLaneInputs = AdvancedOptionsLaneInputs()
     plan_id: UUID | None = None
     input_sha256: str | None = None
     executor_membership_sha256: str | None = None
@@ -526,4 +613,12 @@ class AdvancedOptionsNativeInputBundle:
         return {
             DetectorFamily.O1: build_advanced_o1_executor(self.o1),
             DetectorFamily.O3: build_advanced_o3_executor(self.o3),
+            DetectorFamily.OS1: build_advanced_os_executor(
+                DetectorFamily.OS1,
+                self.os1,
+            ),
+            DetectorFamily.OS2: build_advanced_os_executor(
+                DetectorFamily.OS2,
+                self.os2,
+            ),
         }

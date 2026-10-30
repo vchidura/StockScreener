@@ -1099,6 +1099,8 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
         for detector, lane in (
             ("O1", native.bundle.o1),
             ("O3", native.bundle.o3),
+            ("OS1", native.bundle.os1),
+            ("OS2", native.bundle.os2),
         ):
             reasons = tuple(lane.blocked_reason_codes)
             status = (

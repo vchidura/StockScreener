@@ -34,7 +34,12 @@ class RetainedForwardState(ValueError):
     """The retained alert release carries forward state this producer cannot reproduce."""
 
 
-def compute_realtime_stock_alerts(compute_database: RealtimeProcessDatabase, **scope):
+def compute_realtime_stock_alerts(
+    compute_database: RealtimeProcessDatabase,
+    *,
+    retained_projection=None,
+    **scope,
+):
     """STOCK_ALERTS compute half: read-only. Loads the screening input and produces the snapshot;
     nothing is persisted or published. Refuses to run over a retained release with forward state."""
     if not isinstance(compute_database, RealtimeProcessDatabase) or compute_database.process_plan.role is not RealtimeDatabaseRole.COMPUTE:
@@ -53,11 +58,19 @@ def compute_realtime_stock_alerts(compute_database: RealtimeProcessDatabase, **s
                 (str(entry["snapshot_id"]),),
             )
             previous = cursor.fetchone()
-        if previous is not None and previous["retained_body"] and previous["retained_forward"] is not False:
+        if (
+            retained_projection is None
+            and previous is not None
+            and previous["retained_body"]
+            and previous["retained_forward"] is not False
+        ):
             raise RetainedForwardState(
                 "Forward checkpoint loader is unavailable; refusing to replace retained publications")
         inputs = load_realtime_stock_alert_input(cursor, **scope)
-        return produce_realtime_stock_alerts(inputs)
+        return produce_realtime_stock_alerts(
+            inputs,
+            retained_projection=retained_projection,
+        )
 
 
 def publish_realtime_stock_alerts(publication_database: RealtimeProcessDatabase, snapshot, *, receipt=None,
@@ -174,7 +187,7 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
         if source == "REPLAY":
             raise StockAlertPublicationUnavailable(payload["missing_producers"]["replay"])
         snapshot = payload["shadow"]
-        if combined is False:
+        if combined is False and not payload.get("canonical_product"):
             snapshot = next((stream for stream in payload["streams"]
                              if stream["strategy_instance"]["stream"] == "intraday"), None)
             if snapshot is None:
@@ -205,6 +218,32 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
     def eod_review(self, *, available_by, cohort_id=None, session_date=None, **filters):
         cutoff = _utc(available_by, "available_by")
         payload, generated_at = self._snapshot(cutoff, cohort_id)
+        if payload.get("canonical_product"):
+            dates = session_dates(
+                cutoff.astimezone(
+                    ZoneInfo("America/New_York")
+                ).date().isoformat()
+            )
+            session = str(session_date) if session_date else dates[-1]
+            result = build_stock_eod_review(
+                [],
+                {},
+                as_of=generated_at,
+                session_date=session,
+                sessions=dates,
+                storage_ready=False,
+                **filters,
+            )
+            result.update(
+                missing_producers={
+                    "outcomes": (
+                        "Canonical Stock Alert outcomes are not implemented"
+                    )
+                },
+                provider_fetch_performed=False,
+                read_at=cutoff.isoformat(),
+            )
+            return result
         dates = session_dates(cutoff.astimezone(ZoneInfo("America/New_York")).date().isoformat())
         session = str(session_date) if session_date else dates[-1]
         if session not in dates:

@@ -60,8 +60,8 @@ def _developer_policy():
         maximum_option_quote_contracts=1_000,
         reserved_option_quote_contracts=200,
         required_detectors=(
-            DetectorFamily.S1,
-            DetectorFamily.S2,
+            DetectorFamily.OS1,
+            DetectorFamily.OS2,
             DetectorFamily.O1,
             DetectorFamily.O3,
         ),
@@ -84,8 +84,8 @@ def _advanced_policy():
         maximum_option_quote_contracts=1_000,
         reserved_option_quote_contracts=200,
         required_detectors=(
-            DetectorFamily.S1,
-            DetectorFamily.S2,
+            DetectorFamily.OS1,
+            DetectorFamily.OS2,
             DetectorFamily.O1,
             DetectorFamily.O2,
             DetectorFamily.O3,
@@ -215,7 +215,7 @@ def _candidates(universe, target_dtes, strikes_per_side, *, spot=Decimal("100"))
     return tuple(rows)
 
 
-def test_forward_liquidity_policy_uses_reviewed_floors_and_preserves_legacy_hashes():
+def test_forward_liquidity_policy_uses_reviewed_floors_and_current_os_lane_hash():
     from scripts.run_realtime_option_pre_session import build_process_plan
 
     legacy = build_process_plan("stocks_realtime_v1", environ={
@@ -226,7 +226,7 @@ def test_forward_liquidity_policy_uses_reviewed_floors_and_preserves_legacy_hash
         "OPTION_VALUATION_POLICY_FILE": "options/policies/valuation_raw_spot_v2.json"},
         universe=DEVELOPER_FORWARD_UNIVERSE)
     assert legacy.discovery_policy_sha256 == "c2e0b422384688378b3dc064e50852be12ea7ed84495117277fe1d0e1d37dd6d"
-    assert legacy.manifest_policy.sha256 == "65bf73ea598201d68b55371afbe6024adf08d444ea7bff7a540060a9f825109e"
+    assert legacy.manifest_policy.sha256 == "8045391e45f0c57002199745c713f5b55be8caeb552e43fb27e51131912940c4"
     assert legacy.manifest_policy.liquidity_rule == "OR"
     assert strict.manifest_policy.minimum_day_volume == 250
     assert strict.manifest_policy.minimum_open_interest == 500
@@ -347,8 +347,8 @@ def test_developer_manifest_covers_exact_strategy_lanes_and_disables_o2():
     assert len(option_quotes) == 128
     assert DetectorFamily.O2 in policy.unavailable_detectors
     assert set(policy.required_detectors) >= {
-        DetectorFamily.S1,
-        DetectorFamily.S2,
+        DetectorFamily.OS1,
+        DetectorFamily.OS2,
         DetectorFamily.O1,
         DetectorFamily.O3,
     }

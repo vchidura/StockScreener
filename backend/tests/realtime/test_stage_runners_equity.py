@@ -189,6 +189,9 @@ def _advanced_input_identity_database(
     *,
     gaps=(),
     no_trade_instrument=None,
+    session_status="LIVE",
+    session_watermark=NOW,
+    finalizer_progress_override=None,
 ):
     scope = (
         "1" * 64, "2" * 64, "3" * 64, "4" * 64,
@@ -204,7 +207,8 @@ def _advanced_input_identity_database(
     sessions = (
         (
             UUID(int=20), "massive", "STOCKS", UUID(int=1),
-            UUID(int=21), 4, NOW, "LIVE", UUID(int=22), NOW,
+            UUID(int=21), 4, NOW, session_status, UUID(int=22),
+            session_watermark,
         ),
     )
     checkpoints = (
@@ -228,6 +232,8 @@ def _advanced_input_identity_database(
             ["FINALIZER_NO_TRADE"],
         ),
     ) if no_trade_instrument is not None else ()
+    if finalizer_progress_override is not None:
+        finalizer_progress = finalizer_progress_override
     return _Database([
         scope,
         members,
@@ -319,6 +325,11 @@ def test_advanced_input_ready_binds_stream_checkpoint_gap_and_finalizer_heads():
         in gap_query
     )
     assert gap_parameters[-1] == NOW - timedelta(minutes=5)
+    bar_head_query, bar_head_parameters = raw.cursor.statements[6]
+    assert "FROM rt.bar_revisions AS revision" in bar_head_query
+    assert "rt.bar_current" not in bar_head_query
+    assert "revision.created_at<=%s" in bar_head_query
+    assert bar_head_parameters[-1] == NOW + timedelta(minutes=1)
 
     no_trade_raw = _advanced_input_identity_database(
         no_trade_instrument=12,
@@ -337,6 +348,28 @@ def test_advanced_input_ready_binds_stream_checkpoint_gap_and_finalizer_heads():
     )
     assert no_trade_universe == universe
     assert no_trade_digest != digest
+
+    advanced_rows = _advanced_input_identity_database(
+        session_status="STOPPED",
+        session_watermark=NOW + timedelta(minutes=5),
+        finalizer_progress_override=(
+            (11, NOW, NOW + timedelta(minutes=5), "COMPLETE", ()),
+            (12, NOW, NOW + timedelta(minutes=5), "COMPLETE", ()),
+        ),
+    )
+    advanced_database = V2StageDatabase(
+        _context("EQUITY_MATERIALIZE", database=advanced_rows),
+        RealtimeDatabaseRole.COMPUTE,
+    )
+    _, advanced_digest = runners.input_ready_identity(
+        advanced_database,
+        cohort_id=cohort_id,
+        cutoff=NOW,
+        known_by=NOW + timedelta(minutes=1),
+        reference_generation=1,
+        advanced_input_gate_sha256="a" * 64,
+    )
+    assert advanced_digest == digest
 
     changed_gate_raw = _advanced_input_identity_database()
     changed_gate_database = V2StageDatabase(
@@ -390,6 +423,17 @@ def test_advanced_input_ready_requires_the_gate_digest():
             known_by=NOW + timedelta(minutes=1),
             reference_generation=1,
         )
+
+
+def test_runner_input_visibility_defaults_to_window_release():
+    release_at = NOW + timedelta(seconds=5)
+    environment = RunnerEnvironment(None)
+
+    assert environment.known_by(SimpleNamespace(
+        cutoff=NOW,
+        release_at=release_at,
+        deadline=NOW + timedelta(minutes=5),
+    )) == release_at
 
 
 def test_reused_advanced_input_ready_revalidates_the_exact_gate_digest(
@@ -918,11 +962,11 @@ def test_the_final_window_of_a_session_publishes_the_kept_session_close_release(
     assert published[0]["session_close"] is True
 
 
-def test_the_runner_factories_are_registered_for_the_six_non_options_stages_and_options_flow():
+def test_the_runner_factories_cover_every_registered_equity_and_options_stage():
     from realtime.stage_runners_v2 import RUNNER_FACTORIES, unwired_stages
     assert set(RUNNER_FACTORIES) == {
         "REFERENCE", "EQUITY_INGEST", "EQUITY_EVIDENCE", "PORTAL_PUBLISH", "STRATEGY_PUBLISH", "STOCK_ALERTS",
-        "OPTIONS_ACQUIRE", "OPTIONS_ADMISSION", "OPTIONS_FLOW",
+        "OPTIONS_ACQUIRE", "OPTIONS_ADMISSION", "OPTIONS_REFERENCE", "OPTIONS_FLOW",
         "OPTIONS_INPUT_GATE", "OPTIONS_CYCLE", "OPTIONS_PROJECTION",
         "OPTIONS_PUBLISH",
         "EQUITY_INPUT_GATE", "EQUITY_MATERIALIZE", "EQUITY_PROJECTION"}

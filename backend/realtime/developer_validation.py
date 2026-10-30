@@ -162,8 +162,8 @@ def assess_sanitized_developer_report(
         DetectorFamily.STOCK_SWING.value,
         DetectorFamily.O1.value,
         DetectorFamily.O3.value,
-        DetectorFamily.S1.value,
-        DetectorFamily.S2.value,
+        DetectorFamily.OS1.value,
+        DetectorFamily.OS2.value,
     }
     blockers = []
     o2_unavailable = []
@@ -560,10 +560,10 @@ class DeveloperCanaryValidator:
             DetectorFamily.O3.value: (
                 DependencyDisposition.READY if options_ready else DependencyDisposition.UNAVAILABLE
             ),
-            DetectorFamily.S1.value: (
+            DetectorFamily.OS1.value: (
                 DependencyDisposition.READY if options_ready and stock_ready else DependencyDisposition.UNAVAILABLE
             ),
-            DetectorFamily.S2.value: (
+            DetectorFamily.OS2.value: (
                 DependencyDisposition.READY if options_ready and stock_ready else DependencyDisposition.UNAVAILABLE
             ),
         }

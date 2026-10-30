@@ -13,7 +13,11 @@ from .bridge import drain_raw_buffer_once
 from .buffer import RawMessageBuffer
 from .contracts import AssetClass, MarketChannel, MarketFeed
 from .journal import RawJournalReader, RawJournalWriter
-from .normalizer import InstrumentAdmission, normalize_raw_message
+from .normalizer import (
+    NORMALIZER_VERSION,
+    InstrumentAdmission,
+    normalize_raw_message,
+)
 
 
 class AdvancedJournalDecodeError(RuntimeError):
@@ -229,12 +233,35 @@ class AdvancedJournalPump:
     def _run(self) -> None:
         try:
             self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            recovered = None
+            if self.journal_path.is_file():
+                recovered = RawJournalReader(
+                    self.journal_path
+                ).recovery_state(NORMALIZER_VERSION)
+                if recovered.generation != self.journal_generation:
+                    raise ValueError(
+                        "Advanced journal recovery generation changed"
+                    )
             with RawJournalWriter(
                 self.journal_path,
                 generation=self.journal_generation,
             ) as writer:
-                last_raw_offset = 0
-                progress = self._progress
+                last_raw_offset = (
+                    0
+                    if recovered is None
+                    else recovered.normalized_committed_raw_offset
+                )
+                progress = (
+                    self._progress
+                    if recovered is None
+                    else AdvancedJournalProgress(
+                        last_raw_offset=recovered.raw_committed_offset,
+                        last_event_offset=(
+                            recovered.normalized_committed_event_offset
+                        ),
+                    )
+                )
+                self._publish_progress(progress)
                 while (
                     not self._stop.is_set()
                     or self.buffer.snapshot().admitted_events > 0

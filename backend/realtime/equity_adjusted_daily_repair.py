@@ -56,6 +56,10 @@ ENDPOINT_POLICY = {
     "path": "/v2/aggs/grouped/locale/us/market/stocks/{session_date}",
     "params": {"adjusted": "true"},
 }
+RAW_GROUPED_ENDPOINT_POLICY = {
+    **ENDPOINT_POLICY,
+    "params": {"adjusted": "false"},
+}
 
 
 @dataclass(frozen=True)
@@ -86,10 +90,8 @@ class AdjustedDailyRepairPlan:
             or self.byte_ceiling != self.response_byte_limit + 1
             or (
                 not self.adjusted
-                and (
-                    len(self.identities) != 1
-                    or not self.per_ticker
-                )
+                and self.per_ticker
+                and len(self.identities) != 1
             )
             or (
                 self.identity_continuity
@@ -169,9 +171,11 @@ def _uses_per_ticker_endpoint(plan: AdjustedDailyRepairPlan) -> bool:
 
 def _endpoint_policy(plan: AdjustedDailyRepairPlan):
     if not _uses_per_ticker_endpoint(plan):
-        if not plan.adjusted:
-            raise ValueError("raw daily repair requires one exact ticker")
-        return ENDPOINT_POLICY
+        return (
+            ENDPOINT_POLICY
+            if plan.adjusted
+            else RAW_GROUPED_ENDPOINT_POLICY
+        )
     ticker = quote(plan.identities[0].ticker, safe="")
     session = plan.session_date.isoformat()
     return {

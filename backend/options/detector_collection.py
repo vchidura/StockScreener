@@ -18,6 +18,25 @@ from options.dual_origin import bind_activity_source, detect_option_participatio
 from options.surface_detection import assess_surface_first, bind_surface_source, surface_snapshot_eligible
 
 
+def _options_stock_source_rejections(rejections):
+    translated = Counter()
+    prefixes = {
+        "ACCEPTANCE_": "S1_",
+        "RESUMPTION_": "S2_",
+    }
+    for reason, count in rejections.items():
+        target = next(
+            (
+                option_prefix + reason[len(source_prefix):]
+                for source_prefix, option_prefix in prefixes.items()
+                if reason.startswith(source_prefix)
+            ),
+            reason,
+        )
+        translated[target] += count
+    return translated
+
+
 @dataclass(frozen=True)
 class DetectorCycleInputs:
     matrices: tuple[Mapping, ...]
@@ -550,8 +569,16 @@ class ProductionDetectorSourceReader:
             references[row["contract_id"]].append(row)
         raw_bars = package_sources["raw_bars"]
         rejected = Counter(retained["rejections"])
-        rejected.update(setup_rejections)
-        rejected.update({key: value for key, value in shadow_rejections.items() if "SHADOW_SOURCE_UNAVAILABLE" in key})
+        rejected.update(
+            _options_stock_source_rejections(setup_rejections)
+        )
+        rejected.update({
+            key: value
+            for key, value in _options_stock_source_rejections(
+                shadow_rejections
+            ).items()
+            if "SHADOW_SOURCE_UNAVAILABLE" in key
+        })
         if technical_sources.get("source_error"):
             rejected[technical_sources["source_error"]] += 1
         packages = []

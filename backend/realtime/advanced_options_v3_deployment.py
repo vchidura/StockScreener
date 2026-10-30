@@ -37,18 +37,57 @@ ADVANCED_OPTIONS_V3_AUTHORITY_REFERENCES_SCHEMA = (
 ADVANCED_OPTIONS_V3_SOURCE_BINDING_PATHS = tuple(dict.fromkeys((
     *SOURCE_BINDING_PATHS,
     "backend/realtime/advanced_options_v3_deployment.py",
+    "backend/realtime/advanced_options_acquisition_runtime.py",
     "backend/realtime/advanced_options_v3_history.py",
     "backend/realtime/advanced_options_v3_qualification.py",
     "backend/realtime/advanced_options_v3_authority.py",
     "backend/realtime/advanced_options_resident_barrier.py",
+    "backend/realtime/advanced_realtime_session_scheduler.py",
+    "backend/realtime/advanced_realtime_session_operations.py",
+    "backend/realtime/equity_bulk_backfill.py",
+    "backend/realtime/equity_recent_repair.py",
+    "backend/options/model_inputs.py",
+    "backend/realtime/canonical_stock_alert_product.py",
+    "backend/realtime/canonical_stock_alert_repository.py",
+    "backend/realtime/advanced_ingress_controller.py",
+    "backend/realtime/advanced_journal_replay.py",
     "backend/realtime/journal.py",
     "backend/realtime/orchestration_repository.py",
+    "backend/realtime/sql_v2/038_realtime_stock_alert_input_bindings.sql",
+    "backend/equity/model_detection/__init__.py",
+    "backend/equity/model_detection/codec.py",
+    "backend/equity/model_detection/contracts.py",
+    "backend/equity/model_detection/engine.py",
+    "backend/equity/model_detection/feature_definitions.py",
+    "backend/equity/model_detection/feature_engine.py",
+    "backend/equity/model_detection/policies.py",
+    "backend/equity/model_detection/v2_adapter.py",
     "backend/scripts/inspect_advanced_options_v3_package.py",
     "backend/scripts/inspect_advanced_options_v3_history.py",
+    "backend/scripts/prepare_advanced_options_v3_pre_session.py",
+    "backend/scripts/apply_advanced_options_v3_pre_session_capture.py",
+    "backend/scripts/qualify_advanced_realtime_session_scheduler.py",
+    "backend/scripts/render_advanced_realtime_v3_freeze_inputs.py",
+    "backend/scripts/render_advanced_realtime_v3_compose.py",
+    "backend/scripts/run_advanced_options_v3_acquisition.py",
     "backend/scripts/prepare_advanced_options_v3_pre_session_authority.py",
+    "backend/scripts/prepare_realtime_v2_docker_secrets.py",
+    "backend/scripts/prepare_realtime_v2_advanced_ingress.py",
     "backend/scripts/qualify_advanced_options_v3_docker.py",
+    "backend/scripts/run_realtime_v2_canonical_stock_alerts.py",
+    "backend/scripts/audit_advanced_options_v3_operations.py",
+    "backend/scripts/assemble_advanced_realtime_v3_freeze.py",
+    "backend/scripts/audit_realtime_v2_target9_scanner_warmup.py",
+    "backend/scripts/bind_realtime_v2_advanced_history.py",
+    "backend/scripts/replay_realtime_v2_retained_native_plan.py",
+    "backend/scripts/register_advanced_realtime_v3_session_task.ps1",
+    "backend/scripts/run_advanced_realtime_one_shot.py",
     "backend/scripts/run_advanced_options_v3_market_loop.py",
     "backend/scripts/run_advanced_options_v3_production.py",
+    "backend/scripts/run_advanced_realtime_session_scheduler.py",
+    "backend/scripts/run_realtime_v2_advanced_controller.py",
+    "backend/scripts/run_realtime_v2_advanced_equity_window.py",
+    "backend/scripts/validate_advanced_realtime_v3_holistic.py",
     "docker-compose.realtime-v2.yml",
 )))
 _SHA256_HEX = frozenset("0123456789abcdef")
@@ -432,6 +471,7 @@ def validate_advanced_options_v3_runtime_identity(
         if isinstance(owners, Mapping)
         else None
     )
+    waiting = bundle.get("session_binding") is not None
     if (
         not isinstance(deployment, Mapping)
         or deployment.get("profile")
@@ -457,10 +497,38 @@ def validate_advanced_options_v3_runtime_identity(
         or not isinstance(processes, list)
         or [row.get("kind") for row in processes]
         != [kind.value for kind in AdvancedOptionsProcessKind]
-        or not isinstance(control, Mapping)
-        or control.get("option_underlyings") != ["QQQ", "SPY"]
         or bundle.get("package_sha256")
         != package.get("package_sha256")
+    ):
+        raise ValueError(
+            "V5 WINDOW requires the exact qualified V3 identity"
+        )
+    if waiting:
+        from .advanced_options_p8_runtime import (
+            p8_preopen_session_binding_from_payload,
+        )
+
+        session_binding = p8_preopen_session_binding_from_payload(
+            bundle["session_binding"]
+        )
+        if (
+            production is not None
+            or bundle.get("window_id") is not None
+            or session_binding.package_sha256
+            != package.get("package_sha256")
+            or str(session_binding.cohort_id)
+            != cohort.get("cohort_id")
+            or str(session_binding.plan_id)
+            != orchestration.get("plan_id")
+            or list(session_binding.contract_tickers)
+            != sorted(package.get("v3_admitted_contracts") or ())
+        ):
+            raise ValueError(
+                "V5 waiting session identity contains cycle authority"
+            )
+    elif (
+        not isinstance(control, Mapping)
+        or control.get("option_underlyings") != ["QQQ", "SPY"]
     ):
         raise ValueError(
             "V5 WINDOW requires the exact qualified V3 identity"
@@ -469,10 +537,16 @@ def validate_advanced_options_v3_runtime_identity(
         package.get("v3_authorities") is not None
         or bundle.get("v3_authority_references") is not None
     ):
-        validate_advanced_options_v3_authority_references(
-            package,
-            bundle,
-        )
+        if waiting:
+            if bundle.get("v3_authority_references") is not None:
+                raise ValueError(
+                    "V5 waiting session has prewritten cycle authority"
+                )
+        else:
+            validate_advanced_options_v3_authority_references(
+                package,
+                bundle,
+            )
 
 
 def file_sha256(path: Path) -> str:

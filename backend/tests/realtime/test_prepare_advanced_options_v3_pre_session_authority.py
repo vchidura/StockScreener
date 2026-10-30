@@ -38,6 +38,14 @@ def _args(tmp_path, captured_at):
         package_nonce=UUID(
             "11111111-2222-3333-4444-555555555555"
         ),
+        acquisition_start=datetime(
+            2026,
+            10,
+            23,
+            13,
+            10,
+            tzinfo=UTC,
+        ),
         hard_stop=datetime(2026, 10, 23, 20, 0, tzinfo=UTC),
         output=tmp_path / "authority.json",
     )
@@ -93,6 +101,14 @@ def test_pre_session_authority_uses_capture_clock_before_open(
     assert document["provider_requests"] == 0
     assert document["source_capture_semantic_sha256"] == "a" * 64
     assert calls[0][2]["prepared_at"] == captured_at
+    assert calls[0][2]["acquisition_start"] == datetime(
+        2026,
+        10,
+        23,
+        13,
+        10,
+        tzinfo=UTC,
+    )
     assert calls[0][2]["capture_boundary"] == datetime(
         2026,
         10,
@@ -111,3 +127,61 @@ def test_pre_session_authority_rejects_post_open_capture(tmp_path):
 
     with pytest.raises(ValueError, match="actual pre-opening capture"):
         script.execute(args)
+
+
+def test_pre_session_authority_accepts_only_five_minute_close_drain(
+    tmp_path,
+):
+    capture = tmp_path / "capture.json"
+    capture.write_text("{}", encoding="utf-8")
+    common = [
+        "--database",
+        "stocks_realtime_v2",
+        "--confirm-database-name",
+        "stocks_realtime_v2",
+        "--session-date",
+        "2026-10-28",
+        "--capture",
+        str(capture),
+        "--capture-semantic-sha256",
+        "a" * 64,
+        "--capture-file-sha256",
+        "b" * 64,
+        "--authorization-reference",
+        "close-drain-test",
+        "--package-nonce",
+        "11111111-2222-3333-4444-555555555555",
+        "--acquisition-start",
+        "2026-10-28T13:10:00+00:00",
+        "--output",
+        str(tmp_path / "authority.json"),
+        "--execute",
+    ]
+
+    accepted = script.parse_args([
+        *common,
+        "--hard-stop",
+        "2026-10-28T20:05:00+00:00",
+    ])
+    assert accepted.hard_stop == datetime(
+        2026,
+        10,
+        28,
+        20,
+        5,
+        tzinfo=UTC,
+    )
+    assert accepted.acquisition_start == datetime(
+        2026,
+        10,
+        28,
+        13,
+        10,
+        tzinfo=UTC,
+    )
+    with pytest.raises(SystemExit):
+        script.parse_args([
+            *common,
+            "--hard-stop",
+            "2026-10-28T20:05:00.000001+00:00",
+        ])

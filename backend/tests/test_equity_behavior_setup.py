@@ -414,36 +414,45 @@ def test_aligned_stock_setup_windows_never_fall_back_or_rewrite(tmp_path, model)
     arguments = dict(policies=(policy,), windows={stock.ticker: (stock.trigger_at, stock.trigger_at)},
         as_of=NOW, clock=lambda: NOW)
     evidence, reasons = read_direct_stock_setup_windows(path, **arguments)
-    assert evidence == () and reasons["S1_STOCK_WINDOW_NOT_AVAILABLE"] == 1
+    assert evidence == () and reasons["ACCEPTANCE_STOCK_WINDOW_NOT_AVAILABLE"] == 1
+    assert reasons["RESUMPTION_STOCK_WINDOW_NOT_AVAILABLE"] == 1
     with sqlite3.connect(path) as writer:
         writer.execute("INSERT INTO forward_publications VALUES(?,?)", (publication["window_key"], zlib.compress(json.dumps(publication).encode())))
     before = hashlib.sha256(path.read_bytes()).hexdigest()
     evidence, reasons = read_direct_stock_setup_windows(path, **arguments)
     assert len(evidence) == 1 and evidence[0].candidate.model == model
-    assert not reasons.get(("S2" if model == "resumption" else "S1") + "_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW")
+    assert not reasons.get(
+        model.upper() + "_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"
+    )
     for boundary in (None, stock.trigger_at + timedelta(minutes=30)):
         cutoff = max(NOW, boundary or NOW)
         evidence, reasons = read_direct_stock_setup_windows(path, **dict(arguments,
             windows={stock.ticker: (cutoff, boundary)}, as_of=cutoff, clock=lambda: cutoff))
         assert not evidence and reasons
     evidence, reasons = read_direct_stock_setup_windows(path, **dict(arguments, as_of=stock.trigger_at))
-    assert not evidence and reasons["S1_STOCK_WINDOW_NOT_AVAILABLE"] == 1
+    assert not evidence and reasons["ACCEPTANCE_STOCK_WINDOW_NOT_AVAILABLE"] == 1
     evidence, reasons = read_direct_stock_setup_windows(path, **dict(arguments, clock=lambda: stock.expires_at))
-    assert not evidence and reasons["S1_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"] == 1
+    assert not evidence and reasons[
+        "ACCEPTANCE_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"
+    ] == 1
     from equity.stock_alert_results import read_direct_stock_setup_shadow_windows
     shadows, shadow_reasons = read_direct_stock_setup_shadow_windows(path,
         **dict(arguments, clock=lambda: stock.expires_at))
     assert len(shadows) == 1
     assert shadows[0].episode_id == stock.episode_id
     assert shadows[0].source_status == "EXPIRED_BEFORE_SOURCE_READ"
-    assert shadow_reasons["S1_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"] == 1
+    assert shadow_reasons[
+        "ACCEPTANCE_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"
+    ] == 1
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
     retry = dict(publication, window_key=publication["window_key"] + ":source-ready-retry",
         market_time=publication["window_key"], actual_publication_at=(NOW - timedelta(seconds=1)).isoformat(), candidates={})
     with sqlite3.connect(path) as writer:
         writer.execute("INSERT INTO forward_publications VALUES(?,?)", (retry["window_key"], zlib.compress(json.dumps(retry).encode())))
     evidence, reasons = read_direct_stock_setup_windows(path, **arguments)
-    assert not evidence and reasons["S1_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"] == 1
+    assert not evidence and reasons[
+        "ACCEPTANCE_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"
+    ] == 1
 
 
 @pytest.mark.parametrize("mutation,reason", [("runtime", "STOCK_WINDOW_POLICY_OR_RUNTIME_MISMATCH"),
@@ -468,7 +477,7 @@ def test_aligned_stock_window_reports_source_failures_without_old_fallback(tmp_p
             payload))
     evidence, reasons = read_direct_stock_setup_windows(path, policies=(policy,),
         windows={stock.ticker: (stock.trigger_at, stock.trigger_at)}, as_of=NOW, clock=lambda: NOW)
-    assert not evidence and reasons["S1_" + reason] == 1
+    assert not evidence and reasons["ACCEPTANCE_" + reason] == 1
 
 
 @pytest.mark.parametrize("mutation", ["hash", "clock", "expiry", "cutoff", "schema"])

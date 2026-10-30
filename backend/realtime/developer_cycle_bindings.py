@@ -92,8 +92,8 @@ def build_target_developer_detector_bindings(
     hashes = {
         detector: canonical_sha256({**input_identity, "detector": detector})
         for detector in (
-            DetectorFamily.S1.value,
-            DetectorFamily.S2.value,
+            DetectorFamily.OS1.value,
+            DetectorFamily.OS2.value,
             DetectorFamily.O1.value,
             DetectorFamily.O2.value,
             DetectorFamily.O3.value,
@@ -372,32 +372,32 @@ def build_target_developer_detector_bindings(
         o3_reason = str(error) or type(error).__name__
     return (
         DeveloperDetectorInvocation(
-            DetectorFamily.S1.value,
-            hashes[DetectorFamily.S1.value],
+            DetectorFamily.OS1.value,
+            hashes[DetectorFamily.OS1.value],
             lambda: run_canonical_stock_signal_adapter(
-                detector_id=DetectorFamily.S1.value,
+                detector_id=DetectorFamily.OS1.value,
                 security_id=security.security_id,
                 underlyer=ticker,
                 bars=stock_bars,
                 cohort_id=cohort_id,
                 provider_tier=ProviderTier.MASSIVE_DEVELOPER,
-                input_sha256=hashes[DetectorFamily.S1.value],
+                input_sha256=hashes[DetectorFamily.OS1.value],
                 market_cutoff=market_cutoff,
                 decision_at=max(checked_at, market_cutoff),
                 session_close=session_close,
             ),
         ),
         DeveloperDetectorInvocation(
-            DetectorFamily.S2.value,
-            hashes[DetectorFamily.S2.value],
+            DetectorFamily.OS2.value,
+            hashes[DetectorFamily.OS2.value],
             lambda: run_canonical_stock_signal_adapter(
-                detector_id=DetectorFamily.S2.value,
+                detector_id=DetectorFamily.OS2.value,
                 security_id=security.security_id,
                 underlyer=ticker,
                 bars=stock_bars,
                 cohort_id=cohort_id,
                 provider_tier=ProviderTier.MASSIVE_DEVELOPER,
-                input_sha256=hashes[DetectorFamily.S2.value],
+                input_sha256=hashes[DetectorFamily.OS2.value],
                 market_cutoff=market_cutoff,
                 decision_at=max(checked_at, market_cutoff),
                 session_close=session_close,

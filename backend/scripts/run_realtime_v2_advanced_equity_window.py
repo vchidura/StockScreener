@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import sys
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
@@ -18,7 +19,10 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from realtime.contracts import canonical_sha256  # noqa: E402
+from realtime.contracts import (  # noqa: E402
+    EQUITY_VALIDATION_UNIVERSE,
+    canonical_sha256,
+)
 from realtime.advanced_equity_publication_authority import (  # noqa: E402
     advanced_equity_publication_authority_from_payload,
     validate_advanced_equity_publication_authority,
@@ -46,6 +50,10 @@ from realtime.portal_projection_repository import (  # noqa: E402
     load_portal_release_pointer_cursor,
 )
 from realtime.preflight import ProviderTier  # noqa: E402
+from realtime.advanced_options_validation_mode import (  # noqa: E402
+    AdvancedOptionsValidationMode,
+    advanced_options_projection_policy,
+)
 from realtime.advanced_scheduler import (  # noqa: E402
     ADVANCED_WINDOW_BUILD_ID,
     discover_advanced_window_recovery_cursor,
@@ -89,6 +97,8 @@ def parse_args(argv=None):
     parser.add_argument("--reuse-portal-receipt", action="store_true")
     parser.add_argument("--include-alerts", action="store_true")
     parser.add_argument("--include-strategies", action="store_true")
+    parser.add_argument("--history-binding-report", type=Path)
+    parser.add_argument("--history-binding-file-sha256")
     parser.add_argument("--publish", action="store_true")
     parser.add_argument("--publication-reference", default="")
     parser.add_argument("--publication-authority", type=Path)
@@ -145,9 +155,21 @@ def parse_args(argv=None):
         parser.error("publication authority requires --publish")
     if args.reuse_portal_receipt and not args.reuse_input_receipt:
         parser.error("PORTAL_READY reuse requires INPUT_READY reuse")
-    if args.include_alerts or args.include_strategies:
+    history_values = (
+        args.history_binding_report,
+        args.history_binding_file_sha256,
+    )
+    if args.include_strategies and any(
+        value is None for value in history_values
+    ):
         parser.error(
-            "Advanced alerts and strategies remain disabled"
+            "Advanced strategies require exact bound history evidence"
+        )
+    if not args.include_strategies and any(
+        value is not None for value in history_values
+    ):
+        parser.error(
+            "history binding evidence requires --include-strategies"
         )
     if args.publish and (
         not args.retry_release_now
@@ -166,6 +188,21 @@ def parse_args(argv=None):
         stages.append("PORTAL_PUBLISH")
     args.enabled_stages = tuple(stages)
     args.report_path = args.report_path.resolve()
+    if args.history_binding_report is not None:
+        args.history_binding_report = (
+            args.history_binding_report.resolve()
+        )
+        if (
+            not args.history_binding_report.is_file()
+            or len(args.history_binding_file_sha256) != 64
+            or any(
+                value not in "0123456789abcdef"
+                for value in args.history_binding_file_sha256
+            )
+        ):
+            parser.error(
+                "Advanced strategy history evidence is invalid"
+            )
     if args.publication_authority is not None:
         args.publication_authority = (
             args.publication_authority.resolve()
@@ -189,6 +226,32 @@ def parse_args(argv=None):
     if not args.execute:
         parser.error("Advanced windows mutate V2 state and require --execute")
     return args
+
+
+def _validate_strategy_history_binding(args):
+    if not args.include_strategies:
+        return None
+    body = args.history_binding_report.read_bytes()
+    report = json.loads(body)
+    coverage = report.get("coverage") or {}
+    if (
+        hashlib.sha256(body).hexdigest()
+        != args.history_binding_file_sha256
+        or report.get("mode") != "EXECUTE"
+        or report.get("status") != "BOUND"
+        or report.get("target_cohort_id") != str(args.cohort_id)
+        or tuple(sorted(report.get("symbols") or ()))
+        != tuple(sorted(EQUITY_VALIDATION_UNIVERSE.equity_tickers))
+        or int(coverage.get("adjusted_daily_sessions") or 0) < 283
+        or int(coverage.get("raw_daily_sessions") or 0) < 90
+        or int(coverage.get("five_minute_bars") or 0) < 1
+        or int(coverage.get("one_hour_bars") or 0) < 1
+        or report.get("provider_requests") != 0
+    ):
+        raise ValueError(
+            "Advanced strategy history binding is incomplete"
+        )
+    return report
 
 
 def _load_publication_authority(
@@ -241,6 +304,19 @@ def _load_publication_authority(
     return authority
 
 
+def _validation_policy(args, environment):
+    policy = advanced_options_projection_policy(environment)
+    if (
+        policy.validation_mode
+        is AdvancedOptionsValidationMode.DEVELOPMENT_DIAGNOSTIC
+        and args.publish
+    ):
+        raise RuntimeError(
+            "development diagnostic Equity windows cannot publish"
+        )
+    return policy
+
+
 def _provider(config):
     pool = ThreadedConnectionPool(
         1,
@@ -260,6 +336,26 @@ def _provider(config):
     return provider, pool
 
 
+def _load_stock_alert_projection(provider, request):
+    from realtime.canonical_stock_alert_repository import (
+        load_canonical_stock_alert_projection_cursor,
+    )
+
+    with provider.transaction(
+        APP_ROLE,
+        read_only=True,
+        dict_cursor=True,
+        isolation_level="REPEATABLE READ",
+    ) as unit:
+        unit.cursor.execute(
+            "SET LOCAL search_path TO rt,ref,pg_catalog"
+        )
+        return load_canonical_stock_alert_projection_cursor(
+            unit.cursor,
+            request,
+        )
+
+
 def _ensure_reference_readiness(provider, repository, args):
     with provider.transaction(APP_ROLE, read_only=True) as unit:
         cursor = unit.cursor
@@ -268,7 +364,12 @@ def _ensure_reference_readiness(provider, repository, args):
             "seed.valid_until "
             "FROM rt.seed_current AS current "
             "JOIN rt.seed_manifests AS seed USING(seed_id) "
-            "WHERE current.scope='ADVANCED_SPY_REFERENCES'"
+            "WHERE current.scope IN ("
+            "'EQUITY_VALIDATION_REFERENCES',"
+            "'ADVANCED_SPY_REFERENCES') "
+            "ORDER BY "
+            "(current.scope='EQUITY_VALIDATION_REFERENCES') DESC "
+            "LIMIT 1"
         )
         seed = cursor.fetchone()
         cursor.execute(
@@ -300,7 +401,7 @@ def _ensure_reference_readiness(provider, repository, args):
         or reference_row is None
         or int(reference_row[0]) != int(reference_row[1])
     ):
-        raise ValueError("Advanced SPY reference readiness is unavailable")
+        raise ValueError("Advanced reference readiness is unavailable")
     repository.upsert_readiness(
         args.cohort_id,
         "REFERENCE",
@@ -314,6 +415,8 @@ def _ensure_reference_readiness(provider, repository, args):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    strategy_history = _validate_strategy_history_binding(args)
+    validation_policy = _validation_policy(args, os.environ)
     config = RealtimeV2PipelineConfig.from_mapping(
         os.environ,
         process=RealtimeV2Process.APP_WORKER,
@@ -389,6 +492,9 @@ def main(argv=None) -> int:
                 "window_key_suffix": args.window_key_suffix,
                 "retry_release_now": args.retry_release_now,
                 "enabled_stages": args.enabled_stages,
+                "validation_mode": (
+                    validation_policy.validation_mode.value
+                ),
                 "publication": args.publish,
                 "publication_authority_sha256": (
                     None
@@ -445,6 +551,16 @@ def main(argv=None) -> int:
             provider,
             build_id=ADVANCED_WINDOW_BUILD_ID,
             freeze_heap=True,
+            stock_alert_projection_loader=(
+                (
+                    lambda request: _load_stock_alert_projection(
+                        provider,
+                        request,
+                    )
+                )
+                if args.include_alerts
+                else None
+            ),
             input_known_by=(
                 recovery.input_known_by
                 if args.reuse_input_receipt
@@ -553,6 +669,20 @@ def main(argv=None) -> int:
             "cohort_id": str(args.cohort_id),
             "cutoff": args.cutoff.isoformat(),
             "enabled_stages": args.enabled_stages,
+            "validation_mode": (
+                validation_policy.validation_mode.value
+            ),
+            "terminal_receipt": (
+                validation_policy.equity_terminal_receipt
+            ),
+            "portal_projection_complete": (
+                report.window_state == "COMPLETE"
+                and any(
+                    stage_id == "EQUITY_PROJECTION"
+                    and state == "COMPLETE"
+                    for stage_id, state in report.executed
+                )
+            ),
             "publication_mode": (
                 "COHORT_LOCAL_PORTAL_PUBLISH"
                 if args.publish
@@ -573,8 +703,25 @@ def main(argv=None) -> int:
                 None if pointer is None else str(pointer.release_id)
             ),
             "pointer_advances": 1 if pointer_advanced else 0,
+            "release_allowed_by_validation_mode": (
+                validation_policy.release_allowed
+            ),
+            "pointer_allowed_by_validation_mode": (
+                validation_policy.pointer_allowed
+            ),
+            "read_pin_allowed_by_validation_mode": (
+                validation_policy.read_pin_allowed
+            ),
+            "normal_portal_serving_allowed_by_validation_mode": (
+                validation_policy.normal_portal_serving_allowed
+            ),
             "provider_requests": 0,
             "credentials_exposed": False,
+            "strategy_history_binding_sha256": (
+                None
+                if strategy_history is None
+                else strategy_history["binding_sha256"]
+            ),
             "executed": report.executed,
             "lane_errors": report.lane_errors,
         }

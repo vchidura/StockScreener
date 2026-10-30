@@ -37,25 +37,22 @@ class _Cursor:
             ):
                 return []
             cutoff = self.parameters[-2]
+            count = self.parameters[-1]
+            interval = self.parameters[2]
+            step = (
+                timedelta(days=1)
+                if interval == "1d"
+                else timedelta(minutes=5)
+            )
+            start = 1 if interval == "1d" else 0
             return [
                 {
                     "bar_revision_id": str(uuid4()),
-                    "bar_end": cutoff,
-                    "observed_at": cutoff,
-                    "payload_sha256": "a" * 64,
-                },
-                {
-                    "bar_revision_id": str(uuid4()),
-                    "bar_end": cutoff - timedelta(minutes=5),
-                    "observed_at": cutoff - timedelta(minutes=5),
-                    "payload_sha256": "b" * 64,
-                },
-                {
-                    "bar_revision_id": str(uuid4()),
-                    "bar_end": cutoff - timedelta(minutes=10),
-                    "observed_at": cutoff - timedelta(minutes=10),
-                    "payload_sha256": "c" * 64,
-                },
+                    "bar_end": cutoff - step * (index + start),
+                    "observed_at": cutoff - step * (index + start),
+                    "payload_sha256": f"{index:064x}",
+                }
+                for index in range(count)
             ]
         raise AssertionError(self.query)
 
@@ -115,9 +112,13 @@ def test_two_underlying_dependencies_are_exact_and_ready():
     assert result["lane_context"]["O1"]["status"] == "AVAILABLE"
     assert result["lane_context"]["O3"]["status"] == "AVAILABLE"
     assert result["lane_context"]["O3"]["member_count"] == 6
+    assert result["lane_context"]["OS1"]["status"] == "AVAILABLE"
+    assert result["lane_context"]["OS1"]["member_count"] == 34
+    assert result["lane_context"]["OS2"]["status"] == "AVAILABLE"
+    assert result["lane_context"]["OS2"]["member_count"] == 36
 
 
-def test_missing_qqq_context_blocks_only_o3_lane_before_provider_work():
+def test_missing_qqq_context_blocks_only_declared_lanes_before_provider_work():
     equity, binding = _dependencies()
     result = validate_advanced_options_equity_dependencies_cursor(
         _Cursor(omit_qqq_context=True),
@@ -133,3 +134,5 @@ def test_missing_qqq_context_blocks_only_o3_lane_before_provider_work():
     assert result["lane_context"]["O3"]["reason_codes"] == (
         "O3_QQQ_E_CONTEXT_INCOMPLETE",
     )
+    assert result["lane_context"]["OS1"]["status"] == "BLOCKED"
+    assert result["lane_context"]["OS2"]["status"] == "BLOCKED"

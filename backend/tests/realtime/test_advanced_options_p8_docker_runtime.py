@@ -227,10 +227,18 @@ def test_compose_has_exact_four_p8_services_commands_and_isolated_secrets():
             f'profiles: ["{P8_COMPOSE_PROFILE}", '
             f'"{ADVANCED_OPTIONS_V3_COMPOSE_PROFILE}"]'
         ) in block
-        assert 'restart: "no"' in block
+        assert 'restart: "on-failure:3"' in block
         assert "- --docker-service-kind" in block
         assert f"- {kind.value}" in block
         assert "- --docker-health-kind" in block
+        assert (
+            "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: "
+            "/run/advanced-options-downstream"
+        ) in block
+        assert (
+            "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH"
+            ":?set REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH"
+        ) in block
         assert (
             "- scripts/run_advanced_options_v3_production.py"
             in block
@@ -241,9 +249,13 @@ def test_compose_has_exact_four_p8_services_commands_and_isolated_secrets():
         assert "REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED" in block
         assert "REALTIME_V2_EQUITY_PIPELINE: DISABLED" in block
         assert "- realtime_v2_app_dsn" in block
-        assert (
-            "- realtime_v2_provider_key" in block
-        ) is (kind is AdvancedOptionsProcessKind.INGRESS)
+        assert "- realtime_v2_provider_key" not in block
+        if kind is AdvancedOptionsProcessKind.INGRESS:
+            assert "REALTIME_V3_ACQUISITION_SPLIT: ENABLED" in block
+            assert (
+                "/run/advanced-options-acquisition/binding.json:ro"
+                in block
+            )
         assert tuple(P8_COMPONENT_NAMES) == tuple(
             AdvancedOptionsProcessKind
         )
@@ -392,6 +404,22 @@ def test_service_environment_denies_provider_leak_and_execution_authority():
     )
     with pytest.raises(RuntimeError, match="provider credential"):
         validate_p8_docker_service_environment(
+            AdvancedOptionsProcessKind.INGRESS,
+            {
+                "REALTIME_V2_APP_DSN": "fixture",
+                "POLYGON_API_KEY": "leaked",
+                "REALTIME_V3_ACQUISITION_SPLIT": "ENABLED",
+            },
+        )
+    validate_p8_docker_service_environment(
+        AdvancedOptionsProcessKind.INGRESS,
+        {
+            "REALTIME_V2_APP_DSN": "fixture",
+            "REALTIME_V3_ACQUISITION_SPLIT": "ENABLED",
+        },
+    )
+    with pytest.raises(RuntimeError, match="provider credential"):
+        validate_p8_docker_service_environment(
             AdvancedOptionsProcessKind.FLOW,
             {
                 "REALTIME_V2_APP_DSN": "fixture",
@@ -430,6 +458,7 @@ def test_health_requires_fresh_lease_identity_and_zero_effects(tmp_path):
             checked + timedelta(seconds=30)
         ).isoformat(),
         "role_evidence": None,
+        "downstream_binding": None,
         "effects": dict(P8_EFFECT_DENIALS),
     }
     status_path.write_text(json.dumps(status), encoding="utf-8")
@@ -445,6 +474,50 @@ def test_health_requires_fresh_lease_identity_and_zero_effects(tmp_path):
 
     assert result["status"] == "READY"
     assert result["effects"] == P8_EFFECT_DENIALS
+    status["state"] = "READY_WAITING_FOR_E"
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+    waiting = check_p8_docker_service_health(
+        kind,
+        package_path,
+        bundle_path,
+        environment=environment,
+        checked_at=checked,
+    )
+    assert waiting["status"] == "READY_WAITING_FOR_E"
+    downstream_binding = {
+        "schema": "advanced-options-p8-downstream-binding-v1",
+        "session_authorization_id": (
+            "11111111-2222-3333-4444-555555555555"
+        ),
+        "target_window_id": bundle["window_id"],
+        "equity_receipt_id": (
+            "22222222-3333-4444-5555-666666666666"
+        ),
+        "equity_input_sha256": "1" * 64,
+        "finalized_cutoff_utc": checked.isoformat(),
+        "options_cutoff_utc": (
+            checked + timedelta(seconds=300)
+        ).isoformat(),
+        "e_o_seconds": 300.0,
+        "equity_binding_sha256": "2" * 64,
+        "window_cycle_authorization_sha256": "3" * 64,
+    }
+    downstream_binding["binding_sha256"] = canonical_sha256(
+        downstream_binding
+    )
+    status["state"] = "BOUND_TO_E"
+    status["downstream_binding"] = downstream_binding
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+    bound = check_p8_docker_service_health(
+        kind,
+        package_path,
+        bundle_path,
+        environment=environment,
+        checked_at=checked,
+    )
+    assert bound["status"] == "READY"
+    assert bound["downstream_binding"] == downstream_binding
+    status["state"] = "ROLE_RUNNING"
     status["effects"]["broker"] = True
     status_path.write_text(json.dumps(status), encoding="utf-8")
     with pytest.raises(RuntimeError, match="health identity"):
@@ -983,7 +1056,10 @@ class _Transcript:
                 "running": self.running,
                 "status": "running" if self.running else "exited",
                 "health": "healthy",
-                "restart": {"Name": "no", "MaximumRetryCount": 0},
+                "restart": {
+                    "Name": "on-failure",
+                    "MaximumRetryCount": 3,
+                },
                 "labels": {
                     "com.docker.compose.project": P8_COMPOSE_PROJECT,
                     "com.docker.compose.service": P8_SERVICE_NAMES[kind],

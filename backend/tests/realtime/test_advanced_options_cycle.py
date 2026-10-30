@@ -171,12 +171,12 @@ def test_missing_executors_are_blocked_not_missing_cycle_rows():
     assert cycle.evaluations == ()
 
 
-def test_options_lane_failure_does_not_touch_equity_detector_state():
+def test_options_lane_failure_does_not_mutate_independent_shadow_state():
     control = _control_plane()
     gate, receipt = _gate_and_receipt()
-    equity_detector_state = {
-        "ADVANCED_EQUITY_S1": "DETECTED",
-        "ADVANCED_EQUITY_S2": "COMPLETE_ZERO",
+    options_shadow_state = {
+        "ADVANCED_OPTIONS_OS1": "DETECTED",
+        "ADVANCED_OPTIONS_OS2": "COMPLETE_ZERO",
     }
 
     cycle = run_advanced_options_cycle(
@@ -198,19 +198,23 @@ def test_options_lane_failure_does_not_touch_equity_detector_state():
         build_id="p4-build",
     )
 
-    assert equity_detector_state == {
-        "ADVANCED_EQUITY_S1": "DETECTED",
-        "ADVANCED_EQUITY_S2": "COMPLETE_ZERO",
+    assert options_shadow_state == {
+        "ADVANCED_OPTIONS_OS1": "DETECTED",
+        "ADVANCED_OPTIONS_OS2": "COMPLETE_ZERO",
     }
     outcomes = {row.detector: row for row in cycle.outcomes}
     assert set(outcomes) == {
         DetectorFamily.O1,
         DetectorFamily.O2,
         DetectorFamily.O3,
+        DetectorFamily.OS1,
+        DetectorFamily.OS2,
     }
     assert outcomes[DetectorFamily.O1].state is CycleLaneState.BLOCKED
     assert outcomes[DetectorFamily.O2].state is CycleLaneState.UNAVAILABLE
     assert outcomes[DetectorFamily.O3].state is CycleLaneState.COMPLETE_ZERO
+    assert outcomes[DetectorFamily.OS1].state is CycleLaneState.BLOCKED
+    assert outcomes[DetectorFamily.OS2].state is CycleLaneState.BLOCKED
     assert cycle.evaluations == ()
 
 

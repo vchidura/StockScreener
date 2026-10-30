@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -23,6 +24,7 @@ from scripts import (
 
 
 DATABASE = "stocks_realtime_v2"
+UTC = timezone.utc
 
 
 def _database_args():
@@ -81,6 +83,123 @@ def test_prepare_cli_dispatches_exact_production_command(
     assert json.loads(capsys.readouterr().out) == expected
 
 
+def test_prepare_waiting_cli_dispatches_receipt_free_command(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    expected = {"status": "READY_WAITING_FOR_E"}
+    calls = _capture(monkeypatch, "_prepare_waiting", expected)
+
+    assert cli.main([
+        "prepare-waiting",
+        *_database_args(),
+        "--package-source",
+        str(tmp_path / "source.json"),
+        "--acquisition-binding",
+        str(tmp_path / "acquisition.json"),
+        "--output-directory",
+        str(tmp_path / "new-output"),
+        "--execute",
+    ]) == 0
+
+    assert len(calls) == 1
+    assert calls[0][0].command == "prepare-waiting"
+    assert json.loads(capsys.readouterr().out) == expected
+
+
+def test_preopen_package_builder_contains_no_equity_receipt(
+    monkeypatch,
+    tmp_path,
+):
+    package = {
+        "window": {},
+        "orchestration": {},
+        "equity_input_binding": {},
+        "history_binding": {},
+        "cohort": {},
+        "v3_authority_classification": {},
+    }
+    monkeypatch.setattr(
+        market_loop,
+        "build_p8_canary_authorization",
+        lambda *_args, **_kwargs: package,
+    )
+    monkeypatch.setattr(
+        market_loop.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout="abc123\n"),
+    )
+    monkeypatch.setattr(
+        market_loop,
+        "advanced_options_history_binding_payload",
+        lambda _binding: {"binding_sha256": "5" * 64},
+    )
+    monkeypatch.setattr(
+        market_loop,
+        "session_acquisition_authorization_payload",
+        lambda _authority: {"authorization_sha256": "6" * 64},
+    )
+    args = SimpleNamespace(
+        qualification_report=tmp_path / "source.json",
+        authorization_reference="preopen-package-test",
+        package_nonce=UUID(
+            "11111111-2222-3333-4444-555555555555"
+        ),
+        qualification_semantic_sha256="a" * 64,
+        qualification_file_sha256="b" * 64,
+        hard_stop=datetime(2026, 10, 29, 20, 5, tzinfo=UTC),
+        docker_qualification_semantic_sha256="c" * 64,
+        docker_qualification_file_sha256="d" * 64,
+        image_id="sha256:" + "e" * 64,
+    )
+    authority = SimpleNamespace(
+        acquisition_start=datetime(
+            2026,
+            10,
+            29,
+            13,
+            10,
+            tzinfo=UTC,
+        ),
+    )
+    binding = SimpleNamespace(
+        target_cohort_id=UUID(
+            "22222222-3333-4444-5555-666666666666"
+        ),
+        source_cohort_id=UUID(
+            "33333333-4444-5555-6666-777777777777"
+        ),
+        source_provider_tier=SimpleNamespace(value="MASSIVE_ADVANCED"),
+        history_before=datetime(2026, 10, 29, 13, 30, tzinfo=UTC),
+        source_manifest_sha256="f" * 64,
+    )
+    history = SimpleNamespace(
+        binding=binding,
+        evidence={"coverage": {"sessions": ["2026-10-28"]}},
+    )
+
+    value, start = market_loop._build_live_package(
+        args,
+        None,
+        authority,
+        ("O:QQQ-C", "O:QQQ-P", "O:SPY-C", "O:SPY-P"),
+        {
+            "semantic_sha256": "1" * 64,
+            "file_sha256": "2" * 64,
+            "admission_sha256": "3" * 64,
+            "source_capture_semantic_sha256": "4" * 64,
+        },
+        history,
+    )
+
+    assert start == authority.acquisition_start
+    assert value["equity_input_binding"] == {
+        "symbols": list(market_loop.EQUITY_VALIDATION_UNIVERSE.equity_tickers)
+    }
+    assert "receipt" not in json.dumps(value).lower()
+
+
 def test_start_residents_cli_starts_only_resident_roles(
     monkeypatch,
     tmp_path,
@@ -127,6 +246,8 @@ def test_authorize_window_cli_preserves_exact_clocks_and_receipt(
         "2026-10-23T13:03:00+00:00",
         "--equity-receipt-id",
         str(receipt_id),
+        "--activity-evidence-sha256",
+        "a" * 64,
         "--execute",
     ]) == 0
 
@@ -134,6 +255,7 @@ def test_authorize_window_cli_preserves_exact_clocks_and_receipt(
     assert args.equity_receipt_id == receipt_id
     assert args.options_cutoff.isoformat() == "2026-10-23T13:00:00+00:00"
     assert args.window_deadline.isoformat() == "2026-10-23T13:03:00+00:00"
+    assert args.activity_evidence_sha256 == "a" * 64
     assert json.loads(capsys.readouterr().out) == expected
 
 
@@ -447,7 +569,73 @@ def test_market_loop_equity_lookup_uses_non_reserved_window_alias(
     ) is None
     assert "AS window_run" in statements[0]
     assert "AS window " not in statements[0]
-    assert statements[0].endswith("receipt.cutoff=%s")
+    assert "stage.stage_id='EQUITY_MATERIALIZE'" in statements[0]
+    assert statements[0].endswith("AND receipt.cutoff=%s")
+
+
+def test_market_loop_equity_source_includes_exact_target9_symbols(
+    monkeypatch,
+):
+    cutoff = market_loop.datetime(
+        2026,
+        10,
+        23,
+        18,
+        15,
+        tzinfo=market_loop.UTC,
+    )
+    receipt = {
+        "receipt_id": UUID(int=1),
+        "window_id": UUID(int=2),
+        "cutoff": cutoff,
+        "reference_generation": 1,
+        "universe_sha256": "a" * 64,
+        "input_sha256": "b" * 64,
+        "build_id": "advanced-equity-window-v1:" + "c" * 64,
+    }
+
+    class Transaction:
+        cursor = SimpleNamespace(
+            execute=lambda *_args: None,
+            fetchone=lambda: receipt,
+        )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    plan = SimpleNamespace(
+        cohort_id=UUID(int=3),
+        cohort_sha256="d" * 64,
+        manifest_id=UUID(int=4),
+        manifest=SimpleNamespace(sha256="e" * 64),
+        profile_id=UUID(int=5),
+        profile_sha256="f" * 64,
+    )
+    monkeypatch.setattr(
+        market_loop,
+        "load_advanced_equity_control_plane_plan_cursor",
+        lambda *_args: plan,
+    )
+    monkeypatch.setattr(
+        market_loop,
+        "validate_active_target9_equity_source_cursor",
+        lambda *_args: None,
+    )
+
+    source = market_loop._frozen_equity_input(
+        SimpleNamespace(
+            transaction=lambda *_args, **_kwargs: Transaction()
+        ),
+        plan.cohort_id,
+        cutoff,
+    )
+
+    assert source["symbols"] == list(
+        market_loop.EQUITY_VALIDATION_UNIVERSE.equity_tickers
+    )
 
 
 def test_market_loop_capture_binding_is_provider_free(
@@ -500,6 +688,22 @@ def test_market_loop_capture_binding_is_provider_free(
     assert selection is selection_capture
     assert build_calls[0]["provider_free_selection"] is True
     assert "POLYGON_API_KEY" not in market_loop.os.environ
+
+
+def test_preopen_package_report_returns_cli_identity(tmp_path):
+    path = tmp_path / "PREPARE-PACKAGE-REPORT.json"
+    report = {
+        "contract": "advanced-options-v3-preopen-package-report-v1",
+        "status": "PREOPEN_PACKAGE_PREPARED",
+        "semantic_sha256": "a" * 64,
+    }
+
+    result = market_loop._write_preopen_package_report(path, report)
+
+    assert result["verdict"] == "PASS"
+    assert result["report"] == str(path)
+    assert len(result["file_sha256"]) == 64
+    assert json.loads(path.read_text(encoding="utf-8")) == report
 
 
 def test_market_loop_rejects_sealed_capture_outside_frozen_equity_age(
@@ -643,3 +847,137 @@ def test_market_loop_loads_separate_pre_session_authority(
     ]
     assert identity["admission_sha256"] == "a" * 64
     assert identity["source_capture_semantic_sha256"] == "b" * 64
+
+
+def test_market_loop_validates_exact_pinned_reader_responses(
+    monkeypatch,
+):
+    cohort_id = UUID("11111111-2222-3333-4444-555555555555")
+    release_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    calls = []
+
+    class Repository:
+        def __init__(self, _cursor_factory, *, require_read_pin):
+            assert require_read_pin is True
+
+        def read(self, *, cohort_id, snapshot_type, available_by):
+            calls.append((cohort_id, snapshot_type, available_by))
+            return {
+                "available": True,
+                "reason": None,
+                "cohort_id": str(cohort_id),
+                "snapshot_type": snapshot_type,
+                "snapshot_id": str(UUID(int=len(calls))),
+                "generated_at": available_by,
+                "release_id": str(release_id),
+                "release_cutoff": available_by,
+                "release_manifest_sha256": "a" * 64,
+                "advanced_options_v2_enabled": True,
+                "provider_fetch_performed": False,
+                "detector_work_performed": False,
+                "publication_performed": False,
+                "data": {},
+            }
+
+    monkeypatch.setattr(
+        market_loop,
+        "AdvancedOptionsStoredProjectionRepository",
+        Repository,
+    )
+
+    result = market_loop._validate_stored_readers(
+        object(),
+        cohort_id,
+        release_id,
+    )
+
+    assert tuple(result["responses"]) == (
+        "OPTIONS_FLOW",
+        "OPTIONS_SCREENER",
+        "OPTIONS_ALERTS",
+        "OPTIONS_MARKS",
+    )
+    assert {row[1] for row in calls} == set(
+        market_loop.OPTIONS_PROJECTION_TYPES
+    )
+
+
+def test_market_loop_reader_gate_rejects_release_drift(monkeypatch):
+    cohort_id = UUID("11111111-2222-3333-4444-555555555555")
+    release_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+    class Repository:
+        def __init__(self, _cursor_factory, *, require_read_pin):
+            assert require_read_pin is True
+
+        def read(self, *, cohort_id, snapshot_type, available_by):
+            return {
+                "available": True,
+                "reason": None,
+                "cohort_id": str(cohort_id),
+                "snapshot_type": snapshot_type,
+                "release_id": str(UUID(int=3)),
+                "advanced_options_v2_enabled": True,
+                "provider_fetch_performed": False,
+                "detector_work_performed": False,
+                "publication_performed": False,
+                "data": {},
+            }
+
+    monkeypatch.setattr(
+        market_loop,
+        "AdvancedOptionsStoredProjectionRepository",
+        Repository,
+    )
+
+    with pytest.raises(RuntimeError, match="stored Options reader failed"):
+        market_loop._validate_stored_readers(
+            object(),
+            cohort_id,
+            release_id,
+        )
+
+
+def test_market_loop_rolls_back_pin_before_pointer(monkeypatch):
+    cohort_id = UUID("11111111-2222-3333-4444-555555555555")
+    release_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    events = []
+
+    class Transaction:
+        cursor = object()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    provider = SimpleNamespace(
+        transaction=lambda *_args, **_kwargs: Transaction()
+    )
+    read_port = SimpleNamespace(
+        restore=lambda **kwargs: events.append(("pin", kwargs))
+    )
+
+    def restore_pointer(_cursor, **kwargs):
+        events.append(("pointer", kwargs))
+
+    monkeypatch.setattr(
+        market_loop,
+        "restore_portal_release_pointer_cursor",
+        restore_pointer,
+    )
+
+    result = market_loop._rollback_post_publication(
+        provider,
+        read_port,
+        cohort_id=cohort_id,
+        published_release_id=release_id,
+        prior_pointer=None,
+        prior_read_pin=None,
+    )
+
+    assert result["status"] == "RESTORED"
+    assert [event[0] for event in events] == ["pin", "pointer"]
+    assert events[0][1]["expected_release_id"] == release_id
+    assert events[1][1]["expected_current_release_id"] == release_id

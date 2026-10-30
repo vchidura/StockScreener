@@ -128,7 +128,7 @@ def cycle():
         minimum_day_volume=20, minimum_open_interest=100,
         maximum_contracts_per_underlying=2, maximum_option_quote_contracts=1000,
         reserved_option_quote_contracts=200,
-        required_detectors=(DetectorFamily.S1, DetectorFamily.S2, DetectorFamily.O1, DetectorFamily.O3),
+        required_detectors=(DetectorFamily.OS1, DetectorFamily.OS2, DetectorFamily.O1, DetectorFamily.O3),
         unavailable_detectors=(DetectorFamily.O2,),
     )
     plan = build_bounded_option_session_manifest(discovery_scope, policy, candidates, session_date=MARKET.date())
@@ -892,7 +892,7 @@ def test_technical_package_receipt_preserves_o1_and_reports_other_model_dependen
         o1_package_source(scope, matrix, context), selected_at=scope.available_after)
     payload = receipt.read(scope_sha256=scope.sha256, matrix_id=matrix.matrix_id)
     assert payload["contract"] == TECHNICAL_PACKAGE_CONTEXT_CONTRACT
-    assert payload["enabled_detectors"] == ["O1", "O3", "S1", "S2"]
+    assert payload["enabled_detectors"] == ["O1", "O3", "OS1", "OS2"]
     assert payload["detector_dependencies"]["O1"] == []
     assert payload["detector_dependencies"]["O3"] == ["O3_CREDIT_POLICY_UNAVAILABLE"]
     assert any(row["package"]["detector_id"] == "O1" for row in payload["qualified_indicative"])
@@ -937,7 +937,7 @@ def test_technical_package_credit_does_not_inherit_debit_holding_prerequisites(c
     payload = receipt.read(scope_sha256=scope.sha256, matrix_id=matrix.matrix_id)
     assert payload["o3_observations"] and payload["detector_dependencies"]["O3"] == []
     assert "EXACT_RAW_SPOT_UNAVAILABLE" in payload["detector_dependencies"]["O1"]
-    assert "PACKAGE_HOLDING_CLOCKS_UNAVAILABLE" in payload["detector_dependencies"]["S1"]
+    assert "PACKAGE_HOLDING_CLOCKS_UNAVAILABLE" in payload["detector_dependencies"]["OS1"]
     assert payload["qualified_indicative"] == []
 
 
@@ -1019,7 +1019,7 @@ def stock_first_package_cycle(cycle, detector):
     symbol = matrices[0].analysis.underlying.underlyer
     current = tuple(bar for bar, _ in context.source.bars
         if bar.ticker == symbol and bar.interval == "30m" and bar.session_date == scope.selection.session_date)
-    prices = (Decimal("99.6"), Decimal("100")) if detector == "S1" else (
+    prices = (Decimal("99.6"), Decimal("100")) if detector == "OS1" else (
         Decimal("100.2"), Decimal("99.8"), Decimal("100"))
     changed = {bar.bar_revision_id: price for bar, price in zip(current[-len(prices):], prices)}
     bars = []
@@ -1037,7 +1037,7 @@ def stock_first_package_cycle(cycle, detector):
     return config, scope, matrices, context
 
 
-@pytest.mark.parametrize("detector", ("S1", "S2"))
+@pytest.mark.parametrize("detector", ("OS1", "OS2"))
 def test_technical_packages_qualify_native_stock_first_models_without_execution(cycle, detector):
     from realtime.option_package_context import load_forward_technical_package_context
 
@@ -1056,15 +1056,15 @@ def test_technical_packages_qualify_native_stock_first_models_without_execution(
 def test_technical_stock_first_missing_split_coverage_is_not_empty_success(cycle):
     from realtime.option_package_context import load_forward_technical_package_context
 
-    config, scope, matrices, context = stock_first_package_cycle(cycle, "S1")
+    config, scope, matrices, context = stock_first_package_cycle(cycle, "OS1")
     source = replace(context.source, split_coverage=())
     context = load_forward_detector_context(scope, matrices, config, source, selected_at=scope.available_after)
     matrix = matrices[0]
     receipt = load_forward_technical_package_context(scope, matrix, config, context,
         o1_package_source(scope, matrix, context), selected_at=scope.available_after)
     payload = receipt.read(scope_sha256=scope.sha256, matrix_id=matrix.matrix_id)
-    assert "CANONICAL_STOCK_SPLIT_COVERAGE_UNAVAILABLE" in payload["detector_dependencies"]["S1"]
-    assert not any(row["package"]["detector_id"] == "S1" for row in payload["qualified_indicative"])
+    assert "CANONICAL_STOCK_SPLIT_COVERAGE_UNAVAILABLE" in payload["detector_dependencies"]["OS1"]
+    assert not any(row["package"]["detector_id"] == "OS1" for row in payload["qualified_indicative"])
 
 
 @pytest.mark.parametrize(("defect", "reason"), (

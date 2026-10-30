@@ -42,6 +42,32 @@ if TYPE_CHECKING:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class StockAlertProjectionRequest:
+    """Exact V3 input boundary a retained Stock Alerts result must match."""
+
+    cohort_id: UUID
+    window_id: UUID
+    input_receipt_id: UUID
+    cutoff: datetime
+    input_sha256: str
+    known_by: datetime
+
+    def __post_init__(self) -> None:
+        for name in ("cutoff", "known_by"):
+            value = getattr(self, name)
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError(f"Stock Alert {name} must be timezone-aware")
+            object.__setattr__(self, name, value.astimezone(timezone.utc))
+        if self.known_by < self.cutoff:
+            raise ValueError("Stock Alert known-by cannot precede the cutoff")
+        if len(self.input_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in self.input_sha256
+        ):
+            raise ValueError("Stock Alert input identity must be SHA-256")
+
+
 def _new_options_flow_state() -> OptionsFlowState:
     from .stage_runners_options import OptionsFlowState
 
@@ -104,6 +130,7 @@ class RunnerEnvironment:
     ticker_state: TickerProjectionState = field(default_factory=TickerProjectionState)
     handoff: CycleHandoff = field(default_factory=CycleHandoff)
     screening_loader: ScreeningInputLoader | None = field(default_factory=ScreeningInputLoader)
+    stock_alert_projection_loader: Callable[[StockAlertProjectionRequest], Mapping[str, object]] | None = None
     reference_service: ReferenceSeedService | None = None
     equity_source: DeveloperAcquisitionSource | None = None
     universe: UniverseManifest | None = None
@@ -133,7 +160,11 @@ class RunnerEnvironment:
     heap_frozen: bool = False
 
     def known_by(self, window) -> datetime:
-        value = self.input_known_by or window.deadline
+        value = self.input_known_by or getattr(
+            window,
+            "release_at",
+            getattr(window, "deadline", window.cutoff),
+        )
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("runner input visibility clock must be timezone-aware")
         known_by = value.astimezone(timezone.utc)

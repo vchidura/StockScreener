@@ -9,7 +9,6 @@ import zlib
 
 from psycopg2.extras import Json
 
-from database import get_db_cursor
 from equity.stock_alert_payload import (
     decode_original_setup_payload as _decode_original_setup_payload,
 )
@@ -18,6 +17,16 @@ from research.stock_alert_results import (VERSION, combine_snapshots, namespace_
     strategy_instance, validate_result_transition)
 from research.stock_idea_engine import digest
 from research.stock_idea_replay import utc
+
+
+def get_db_cursor():
+    from database import get_db_cursor as cursor_factory
+
+    return cursor_factory()
+
+
+def _cursor_factory(value):
+    return value or get_db_cursor
 
 
 def capture_result_source(directory, stream, now=None):
@@ -89,113 +98,490 @@ def capture_result_source(directory, stream, now=None):
 
 def retain_record(cursor, instance_id, kind, record_id, payload):
     checksum = digest(payload)
-    cursor.execute("SELECT payload_sha256 FROM stock_alert_result_records WHERE instance_id=%s AND kind=%s AND record_id=%s",
+    cursor.execute("SELECT payload_sha256,payload FROM stock_alert_result_records WHERE instance_id=%s AND kind=%s AND record_id=%s",
         (instance_id, kind, record_id))
     previous = cursor.fetchone()
     if previous:
         if previous["payload_sha256"] != checksum:
             raise ValueError("immutable shared result differs from retained source")
-        return
-    cursor.execute("INSERT INTO stock_alert_result_records(instance_id,kind,record_id,payload_sha256,payload) VALUES(%s,%s,%s,%s,%s)",
-        (instance_id, kind, record_id, checksum, Json(payload)))
+    else:
+        cursor.execute("INSERT INTO stock_alert_result_records(instance_id,kind,record_id,payload_sha256,payload) VALUES(%s,%s,%s,%s,%s)",
+            (instance_id, kind, record_id, checksum, Json(payload)))
+        cursor.execute("SELECT payload_sha256,payload FROM stock_alert_result_records WHERE instance_id=%s AND kind=%s AND record_id=%s",
+            (instance_id, kind, record_id))
+        previous = cursor.fetchone()
+    storage_sha256 = digest(previous["payload"])
+    cursor.execute(
+        "INSERT INTO stock_alert_result_storage_identities ("
+        "instance_id,kind,record_id,source_payload_sha256,"
+        "storage_payload_sha256) VALUES (%s,%s,%s,%s,%s) "
+        "ON CONFLICT DO NOTHING",
+        (
+            instance_id,
+            kind,
+            record_id,
+            checksum,
+            storage_sha256,
+        ),
+    )
+    cursor.execute(
+        "SELECT source_payload_sha256,storage_payload_sha256 "
+        "FROM stock_alert_result_storage_identities "
+        "WHERE instance_id=%s AND kind=%s AND record_id=%s",
+        (instance_id, kind, record_id),
+    )
+    identity = cursor.fetchone()
+    if (
+        identity is None
+        or identity["source_payload_sha256"] != checksum
+        or identity["storage_payload_sha256"] != storage_sha256
+    ):
+        raise ValueError("retained result storage identity changed")
 
 
-def persist_capture(capture, now):
+def persist_capture_cursor(cursor, capture, now):
     instance, snapshot = capture["instance"], capture["snapshot"]
     identity = instance["instance_id"]
-    with get_db_cursor() as cursor:
-        cursor.execute("SET LOCAL statement_timeout='30s'")
-        cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (VERSION + ":" + instance["stream"],))
-        cursor.execute("SELECT source_as_of FROM stock_alert_result_streams WHERE stream=%s", (instance["stream"],))
-        previous_stream = cursor.fetchone()
-        if previous_stream and previous_stream["source_as_of"] and previous_stream["source_as_of"] > utc(snapshot["as_of"]):
-            raise ValueError("source view moved backwards")
-        cursor.execute("INSERT INTO stock_alert_result_instances(instance_id,payload) VALUES(%s,%s) ON CONFLICT DO NOTHING", (identity, Json(instance)))
-        cursor.execute("SELECT payload FROM stock_alert_result_instances WHERE instance_id=%s", (identity,))
-        if cursor.fetchone()["payload"] != instance:
-            raise ValueError("strategy instance identity changed")
-        cursor.execute("SELECT record_id FROM stock_alert_result_records WHERE instance_id=%s AND kind='plan'", (identity,))
-        if {row["record_id"] for row in cursor.fetchall()} - {row["alert_id"] for row in snapshot["alerts"]}:
-            raise ValueError("source view lost retained alert plans")
-        for row in snapshot["publications"]:
-            retain_record(cursor, identity, "publication", row["run_id"], row)
-        for key, publication in capture["publications"].items():
-            retain_record(cursor, identity, "publication_evidence", key, publication)
-        for row in snapshot["observations"]:
-            retain_record(cursor, identity, "observation", digest(row), row)
-        for key, bundle in capture["contexts"].items():
-            retain_record(cursor, identity, "context", key, bundle)
-        for row in snapshot["alerts"]:
-            retain_record(cursor, identity, "plan", row["alert_id"], plan_record(row))
-            cursor.execute("SELECT payload FROM stock_alert_result_revisions WHERE instance_id=%s AND alert_id=%s ORDER BY source_as_of DESC,imported_at DESC LIMIT 1", (identity, row["alert_id"]))
-            previous = cursor.fetchone()
-            if previous:
-                validate_result_transition(previous["payload"], row)
-            cursor.execute("INSERT INTO stock_alert_result_revisions(instance_id,alert_id,source_as_of,payload_sha256,payload) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-                (identity, row["alert_id"], snapshot["as_of"], digest(row), Json(row)))
-        metadata = {key: value for key, value in snapshot.items() if key not in ("alerts", "publications", "observations")}
-        cursor.execute("""INSERT INTO stock_alert_result_streams(stream,instance_id,source_as_of,source_sha256,metadata,checked_at,imported_at,error)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,NULL) ON CONFLICT(stream) DO UPDATE SET instance_id=excluded.instance_id,
-            source_as_of=excluded.source_as_of,source_sha256=excluded.source_sha256,metadata=excluded.metadata,
-            checked_at=excluded.checked_at,imported_at=excluded.imported_at,error=NULL""",
-            (instance["stream"], identity, snapshot["as_of"], capture["source_sha256"], Json(metadata), now, now))
+    cursor.execute("SET LOCAL statement_timeout='30s'")
+    cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (VERSION + ":" + instance["stream"],))
+    cursor.execute("SELECT source_as_of FROM stock_alert_result_streams WHERE stream=%s", (instance["stream"],))
+    previous_stream = cursor.fetchone()
+    if previous_stream and previous_stream["source_as_of"] and previous_stream["source_as_of"] > utc(snapshot["as_of"]):
+        raise ValueError("source view moved backwards")
+    cursor.execute("INSERT INTO stock_alert_result_instances(instance_id,payload) VALUES(%s,%s) ON CONFLICT DO NOTHING", (identity, Json(instance)))
+    cursor.execute("SELECT payload FROM stock_alert_result_instances WHERE instance_id=%s", (identity,))
+    if cursor.fetchone()["payload"] != instance:
+        raise ValueError("strategy instance identity changed")
+    cursor.execute("SELECT record_id FROM stock_alert_result_records WHERE instance_id=%s AND kind='plan'", (identity,))
+    if {row["record_id"] for row in cursor.fetchall()} - {row["alert_id"] for row in snapshot["alerts"]}:
+        raise ValueError("source view lost retained alert plans")
+    for row in snapshot["publications"]:
+        retain_record(cursor, identity, "publication", row["run_id"], row)
+    for key, publication in capture["publications"].items():
+        retain_record(cursor, identity, "publication_evidence", key, publication)
+    for row in snapshot["observations"]:
+        retain_record(cursor, identity, "observation", digest(row), row)
+    for key, bundle in capture["contexts"].items():
+        retain_record(cursor, identity, "context", key, bundle)
+    for row in snapshot["alerts"]:
+        retain_record(cursor, identity, "plan", row["alert_id"], plan_record(row))
+        cursor.execute("SELECT payload FROM stock_alert_result_revisions WHERE instance_id=%s AND alert_id=%s ORDER BY source_as_of DESC,imported_at DESC LIMIT 1", (identity, row["alert_id"]))
+        previous = cursor.fetchone()
+        if previous:
+            validate_result_transition(previous["payload"], row)
+        cursor.execute("INSERT INTO stock_alert_result_revisions(instance_id,alert_id,source_as_of,payload_sha256,payload) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+            (identity, row["alert_id"], snapshot["as_of"], digest(row), Json(row)))
+    metadata = {key: value for key, value in snapshot.items() if key not in ("alerts", "publications", "observations")}
+    cursor.execute(
+        """INSERT INTO stock_alert_result_stream_heads(
+            stream,source_sha256,instance_id,source_as_of,metadata,
+            checked_at,imported_at)
+        VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+        (
+            instance["stream"],
+            capture["source_sha256"],
+            identity,
+            snapshot["as_of"],
+            Json(metadata),
+            now,
+            now,
+        ),
+    )
+    cursor.execute(
+        "SELECT instance_id,source_as_of,metadata,checked_at,imported_at "
+        "FROM stock_alert_result_stream_heads "
+        "WHERE stream=%s AND source_sha256=%s",
+        (instance["stream"], capture["source_sha256"]),
+    )
+    retained_head = cursor.fetchone()
+    if (
+        retained_head is None
+        or retained_head["instance_id"] != identity
+        or retained_head["source_as_of"] != utc(snapshot["as_of"])
+        or retained_head["metadata"] != metadata
+    ):
+        raise ValueError("immutable Stock Alert stream head changed")
+    cursor.execute("""INSERT INTO stock_alert_result_streams(stream,instance_id,source_as_of,source_sha256,metadata,checked_at,imported_at,error)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,NULL) ON CONFLICT(stream) DO UPDATE SET instance_id=excluded.instance_id,
+        source_as_of=excluded.source_as_of,source_sha256=excluded.source_sha256,metadata=excluded.metadata,
+        checked_at=excluded.checked_at,imported_at=excluded.imported_at,error=NULL""",
+        (instance["stream"], identity, snapshot["as_of"], capture["source_sha256"], Json(metadata), now, now))
     return dict(stream=instance["stream"], instance_id=identity, alerts=len(snapshot["alerts"]), publications=len(snapshot["publications"]),
         contexts=len(capture["contexts"]), source_as_of=snapshot["as_of"], status="IMPORTED")
 
 
-def record_stream_error(stream, now, error):
-    with get_db_cursor() as cursor:
+def persist_capture(capture, now, cursor_factory=None):
+    with _cursor_factory(cursor_factory)() as cursor:
+        return persist_capture_cursor(cursor, capture, now)
+
+
+def record_stream_error(stream, now, error, cursor_factory=None):
+    with _cursor_factory(cursor_factory)() as cursor:
         cursor.execute("""INSERT INTO stock_alert_result_streams(stream,checked_at,error) VALUES(%s,%s,%s)
             ON CONFLICT(stream) DO UPDATE SET checked_at=excluded.checked_at,error=excluded.error""", (stream, now, error))
 
 
-def load_shared_results(now=None):
-    now = now or datetime.now(timezone.utc)
+def _load_shared_results_cursor(cursor, now, *, retained_heads=None):
     snapshots, streams = [], []
-    with get_db_cursor() as cursor:
+    if retained_heads is None:
+        cursor.execute("SELECT * FROM stock_alert_result_streams WHERE checked_at<=%s ORDER BY stream", (now,))
+        stored = {row["stream"]: row for row in cursor.fetchall()}
+    else:
+        stored = {
+            row["stream"]: {**dict(row), "error": None}
+            for row in retained_heads
+        }
+    source_identity = []
+    instances = {}
+    for stream in ("intraday", "swing"):
+        record = stored.get(stream)
+        if (not record or not record["instance_id"]
+                or record["source_as_of"] > now or record["imported_at"] > now):
+            streams.append(dict(stream=stream, label=stream.title(),
+                error=(record or {}).get("error") or "NOT_IMPORTED", status="UNAVAILABLE"))
+            continue
+        cursor.execute("SELECT payload FROM stock_alert_result_instances WHERE instance_id=%s AND created_at<=%s",
+            (record["instance_id"], now))
+        instance_row = cursor.fetchone()
+        if instance_row is None:
+            raise ValueError("shared result instance is unavailable at the read cutoff")
+        instance = instance_row["payload"]
+        instances[record["instance_id"]] = instance
+        cursor.execute("""SELECT kind,payload,payload_sha256 FROM stock_alert_result_records
+            WHERE instance_id=%s AND kind IN ('publication','observation') AND imported_at<=%s
+            LIMIT 100001""", (record["instance_id"], now))
+        rows = cursor.fetchall()
+        if len(rows) > 100000 or any(digest(row["payload"]) != row["payload_sha256"] for row in rows):
+            raise ValueError("shared result read bound or checksum failed")
+        cursor.execute("""SELECT DISTINCT ON(alert_id) payload,payload_sha256 FROM stock_alert_result_revisions
+            WHERE instance_id=%s AND imported_at<=%s
+            ORDER BY alert_id,source_as_of DESC,imported_at DESC LIMIT 20001""",
+            (record["instance_id"], now))
+        alerts = cursor.fetchall()
+        if len(alerts) > 20000 or any(digest(row["payload"]) != row["payload_sha256"] for row in alerts):
+            raise ValueError("shared alert read bound or checksum failed")
+        snapshot = dict(record["metadata"],
+            publications=[row["payload"] for row in rows if row["kind"] == "publication"],
+            observations=[row["payload"] for row in rows if row["kind"] == "observation"],
+            alerts=[row["payload"] for row in alerts])
+        snapshots.append(namespace_snapshot(instance, snapshot))
+        age = (now - record["checked_at"]).total_seconds()
+        streams.append(dict(stream=stream, label=instance["label"], instance_id=instance["instance_id"],
+            source_id=instance["policy_version"], as_of=record["source_as_of"].isoformat(),
+            source_age_seconds=max(0, (now - record["source_as_of"]).total_seconds()),
+            checked_at=record["checked_at"].isoformat(), imported_at=record["imported_at"].isoformat(),
+            status="UNAVAILABLE" if record["error"] else "STALE" if age > 180 else snapshot["status"],
+            error=record["error"], projector_stale=age > 180, worker=snapshot.get("worker"),
+            publication_window_start=snapshot.get("publication_window_start"),
+            publication_deadline=snapshot.get("publication_deadline")))
+        source_identity.append(dict(
+            stream=stream,
+            instance_id=record["instance_id"],
+            source_as_of=record["source_as_of"].isoformat(),
+            source_sha256=record["source_sha256"],
+            checked_at=record["checked_at"].isoformat(),
+            imported_at=record["imported_at"].isoformat(),
+            instance_sha256=digest(instance),
+        ))
+    return snapshots, streams, source_identity, instances
+
+
+def load_shared_results(now=None, cursor_factory=None):
+    now = now or datetime.now(timezone.utc)
+    with _cursor_factory(cursor_factory)() as cursor:
         cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         cursor.execute("SET LOCAL statement_timeout='10s'")
-        cursor.execute("SELECT * FROM stock_alert_result_streams ORDER BY stream")
-        stored = {row["stream"]: row for row in cursor.fetchall()}
-        for stream in ("intraday", "swing"):
-            record = stored.get(stream)
-            if not record or not record["instance_id"]:
-                streams.append(dict(stream=stream, label=stream.title(), error=(record or {}).get("error") or "NOT_IMPORTED", status="UNAVAILABLE"))
-                continue
-            cursor.execute("SELECT payload FROM stock_alert_result_instances WHERE instance_id=%s", (record["instance_id"],))
-            instance = cursor.fetchone()["payload"]
-            cursor.execute("SELECT kind,payload,payload_sha256 FROM stock_alert_result_records WHERE instance_id=%s AND kind IN ('publication','observation') LIMIT 100001", (record["instance_id"],))
-            rows = cursor.fetchall()
-            if len(rows) > 100000 or any(digest(row["payload"]) != row["payload_sha256"] for row in rows):
-                raise ValueError("shared result read bound or checksum failed")
-            cursor.execute("""SELECT DISTINCT ON(alert_id) payload,payload_sha256 FROM stock_alert_result_revisions
-                WHERE instance_id=%s ORDER BY alert_id,source_as_of DESC,imported_at DESC LIMIT 20001""", (record["instance_id"],))
-            alerts = cursor.fetchall()
-            if len(alerts) > 20000 or any(digest(row["payload"]) != row["payload_sha256"] for row in alerts):
-                raise ValueError("shared alert read bound or checksum failed")
-            snapshot = dict(record["metadata"], publications=[row["payload"] for row in rows if row["kind"] == "publication"],
-                observations=[row["payload"] for row in rows if row["kind"] == "observation"], alerts=[row["payload"] for row in alerts])
-            snapshots.append(namespace_snapshot(instance, snapshot))
-            age = (now - record["checked_at"]).total_seconds()
-            streams.append(dict(stream=stream, label=instance["label"], instance_id=instance["instance_id"],
-                source_id=instance["policy_version"], as_of=record["source_as_of"].isoformat(),
-                source_age_seconds=max(0, (now - record["source_as_of"]).total_seconds()),
-                checked_at=record["checked_at"].isoformat(), imported_at=record["imported_at"].isoformat(),
-                status="UNAVAILABLE" if record["error"] else "STALE" if age > 180 else snapshot["status"],
-                error=record["error"], projector_stale=age > 180, worker=snapshot.get("worker"),
-                publication_window_start=snapshot.get("publication_window_start"), publication_deadline=snapshot.get("publication_deadline")))
+        snapshots, streams, _, _ = _load_shared_results_cursor(cursor, now)
     return combine_snapshots(snapshots, streams)
+
+
+class StockAlertResultBindingUnavailable(LookupError):
+    """No immutable result head has been bound to the requested INPUT_READY receipt."""
+
+
+def persist_stock_alert_input_binding_cursor(
+    cursor,
+    *,
+    binding_id,
+    request,
+    detector_input_sha256,
+):
+    """Bind two V3-produced stream heads to one exact INPUT_READY receipt.
+
+    The projector cannot manufacture this declaration. Both retained source heads
+    must carry the same producer-written V3 input declaration before a binding is
+    accepted.
+    """
+    expected = {
+        "binding_id": str(binding_id),
+        "cohort_id": str(request.cohort_id),
+        "window_id": str(request.window_id),
+        "input_receipt_id": str(request.input_receipt_id),
+        "cutoff": request.cutoff.isoformat(),
+        "input_sha256": request.input_sha256,
+        "detector_input_sha256": detector_input_sha256,
+    }
+    cursor.execute(
+        "SELECT head.* FROM stock_alert_result_streams AS current "
+        "JOIN stock_alert_result_stream_heads AS head "
+        "ON head.stream=current.stream "
+        "AND head.source_sha256=current.source_sha256 "
+        "WHERE current.error IS NULL ORDER BY head.stream"
+    )
+    heads = tuple(cursor.fetchall())
+    snapshots, streams, source_identity, _ = _load_shared_results_cursor(
+        cursor,
+        request.known_by,
+        retained_heads=heads,
+    )
+    if (
+        len(snapshots) != 2
+        or tuple(row["stream"] for row in source_identity)
+        != ("intraday", "swing")
+        or any(
+            row.get("error")
+            or row.get("projector_stale")
+            or row.get("status") == "UNAVAILABLE"
+            for row in streams
+        )
+    ):
+        raise StockAlertResultBindingUnavailable(
+            "both Stock Alert result streams are required"
+        )
+    def declared_input_matches(metadata):
+        declared = metadata.get("v3_input_binding")
+        return (
+            isinstance(declared, dict)
+            and set(declared) == set(expected)
+            and str(declared.get("binding_id")) == expected["binding_id"]
+            and str(declared.get("cohort_id")) == expected["cohort_id"]
+            and str(declared.get("window_id")) == expected["window_id"]
+            and str(declared.get("input_receipt_id"))
+            == expected["input_receipt_id"]
+            and utc(declared.get("cutoff")) == request.cutoff
+            and declared.get("input_sha256") == request.input_sha256
+            and declared.get("detector_input_sha256")
+            == detector_input_sha256
+        )
+    if (
+        len(heads) != 2
+        or any(not declared_input_matches(row["metadata"]) for row in heads)
+    ):
+        raise ValueError(
+            "Stock Alert result heads do not declare the exact V3 input"
+        )
+    source_identity_sha256 = digest(source_identity)
+    result_available_at = max(row["imported_at"] for row in heads)
+    body = {
+        **expected,
+        "source_identity_sha256": source_identity_sha256,
+        "streams": [
+            {
+                "stream": row["stream"],
+                "source_sha256": row["source_sha256"],
+            }
+            for row in heads
+        ],
+        "result_available_at": result_available_at.isoformat(),
+    }
+    binding_sha256 = digest(body)
+    cursor.execute(
+        "INSERT INTO stock_alert_input_bindings("
+        "binding_id,cohort_id,window_id,input_receipt_id,cutoff,"
+        "input_sha256,detector_input_sha256,source_identity_sha256,"
+        "result_available_at,binding_sha256) "
+        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+        (
+            str(binding_id),
+            str(request.cohort_id),
+            str(request.window_id),
+            str(request.input_receipt_id),
+            request.cutoff,
+            request.input_sha256,
+            detector_input_sha256,
+            source_identity_sha256,
+            result_available_at,
+            binding_sha256,
+        ),
+    )
+    for head in heads:
+        cursor.execute(
+            "INSERT INTO stock_alert_input_binding_streams("
+            "binding_id,stream,source_sha256) VALUES(%s,%s,%s) "
+            "ON CONFLICT DO NOTHING",
+            (str(binding_id), head["stream"], head["source_sha256"]),
+        )
+    cursor.execute(
+        "SELECT binding_sha256 FROM stock_alert_input_bindings "
+        "WHERE binding_id=%s",
+        (str(binding_id),),
+    )
+    retained = cursor.fetchone()
+    if retained is None or retained["binding_sha256"] != binding_sha256:
+        raise ValueError("Stock Alert input binding identity changed")
+    return {**body, "binding_sha256": binding_sha256}
+
+
+def _load_stock_alert_input_binding_cursor(cursor, request):
+    cursor.execute(
+        "SELECT binding.* FROM stock_alert_input_bindings AS binding "
+        "WHERE binding.window_id=%s AND binding.input_receipt_id=%s",
+        (str(request.window_id), str(request.input_receipt_id)),
+    )
+    binding = cursor.fetchone()
+    if binding is None:
+        cursor.execute(
+            "SELECT input_receipt_id FROM stock_alert_input_bindings "
+            "WHERE window_id=%s",
+            (str(request.window_id),),
+        )
+        if cursor.fetchone() is not None:
+            raise ValueError(
+                "Stock Alert result binding diverges from INPUT_READY"
+            )
+        raise StockAlertResultBindingUnavailable(
+            "Stock Alert result binding is unavailable"
+        )
+    if (
+        str(binding["cohort_id"]) != str(request.cohort_id)
+        or binding["cutoff"] != request.cutoff
+        or binding["input_sha256"] != request.input_sha256
+        or binding["result_available_at"] > request.known_by
+        or binding["created_at"] > request.known_by
+    ):
+        raise ValueError("Stock Alert result binding scope or clock changed")
+    cursor.execute(
+        "SELECT head.* FROM stock_alert_input_binding_streams AS member "
+        "JOIN stock_alert_result_stream_heads AS head "
+        "ON head.stream=member.stream "
+        "AND head.source_sha256=member.source_sha256 "
+        "WHERE member.binding_id=%s ORDER BY head.stream",
+        (str(binding["binding_id"]),),
+    )
+    heads = tuple(cursor.fetchall())
+    if (
+        tuple(row["stream"] for row in heads) != ("intraday", "swing")
+        or any(
+            row["imported_at"] > request.known_by
+            or row["checked_at"] > request.known_by
+            for row in heads
+        )
+    ):
+        raise ValueError("Stock Alert result binding stream set changed")
+    return binding, heads
+
+
+def load_realtime_stock_alert_projection(
+    now=None,
+    cursor_factory=None,
+    configure_transaction=True,
+    binding_request=None,
+):
+    now = now or datetime.now(timezone.utc)
+    if now.utcoffset() is None:
+        raise ValueError("realtime Stock Alert projection cutoff must be aware")
+    now = now.astimezone(timezone.utc)
+    with _cursor_factory(cursor_factory)() as cursor:
+        if configure_transaction:
+            cursor.execute(
+                "SET TRANSACTION ISOLATION LEVEL "
+                "REPEATABLE READ, READ ONLY"
+            )
+        cursor.execute("SET LOCAL statement_timeout='10s'")
+        binding = None
+        retained_heads = None
+        if binding_request is not None:
+            binding, retained_heads = _load_stock_alert_input_binding_cursor(
+                cursor,
+                binding_request,
+            )
+        snapshots, streams, source_identity, instances = _load_shared_results_cursor(
+            cursor,
+            now,
+            retained_heads=retained_heads,
+        )
+        if binding is not None and digest(source_identity) != binding["source_identity_sha256"]:
+            raise ValueError("Stock Alert result source identity changed")
+        if binding is not None and any(
+            row.get("error")
+            or row.get("projector_stale")
+            or row.get("status") in {"STALE", "UNAVAILABLE"}
+            for row in streams
+        ):
+            raise ValueError("Stock Alert result binding is stale or unavailable")
+        active_instances = tuple(sorted(instances))
+        review_publications = []
+        if active_instances:
+            cursor.execute("""SELECT stream.stream,record.instance_id,record.record_id,
+                    record.payload_sha256,record.payload,record.imported_at,
+                    identity.source_payload_sha256,
+                    identity.storage_payload_sha256
+                FROM stock_alert_result_records AS record
+                JOIN stock_alert_result_streams AS stream USING(instance_id)
+                JOIN stock_alert_result_storage_identities AS identity
+                  ON identity.instance_id=record.instance_id
+                 AND identity.kind=record.kind
+                 AND identity.record_id=record.record_id
+                WHERE record.instance_id=ANY(%s) AND record.kind='publication_evidence'
+                  AND record.imported_at<=%s
+                ORDER BY stream.stream,record.record_id LIMIT 10001""",
+                (list(active_instances), now))
+            rows = tuple(cursor.fetchall())
+            if len(rows) > 10000 or any(
+                row["payload_sha256"]
+                != row["source_payload_sha256"]
+                or digest(row["payload"])
+                != row["storage_payload_sha256"]
+                for row in rows
+            ):
+                raise ValueError("realtime Stock Alert publication evidence is incomplete")
+            review_publications = [
+                dict(
+                    instance_id=row["instance_id"],
+                    stream=row["stream"],
+                    label=instances[row["instance_id"]]["label"],
+                    record_id=row["record_id"],
+                    payload=row["payload"],
+                )
+                for row in rows
+            ]
+    document = dict(
+        contract="realtime-stock-alert-retained-projection-v1",
+        loaded_at=now.isoformat(),
+        input_binding=(
+            None
+            if binding is None
+            else {
+                "binding_id": str(binding["binding_id"]),
+                "cohort_id": str(binding["cohort_id"]),
+                "window_id": str(binding["window_id"]),
+                "input_receipt_id": str(binding["input_receipt_id"]),
+                "cutoff": binding["cutoff"].isoformat(),
+                "input_sha256": binding["input_sha256"],
+                "detector_input_sha256": binding["detector_input_sha256"],
+                "source_identity_sha256": binding["source_identity_sha256"],
+                "result_available_at": binding["result_available_at"].isoformat(),
+                "binding_sha256": binding["binding_sha256"],
+            }
+        ),
+        source_identity=source_identity,
+        streams=snapshots,
+        shadow=combine_snapshots(snapshots, streams),
+        review_publications=review_publications,
+        schedule_streams=streams,
+    )
+    return {**document, "projection_sha256": digest(document)}
 
 
 def load_stock_eod_review(*, as_of=None, session_date=None, search="", model=None,
                           selection_status=None, direction=None, trade_type=None,
-                          offset=0, limit=100, cursor_factory=get_db_cursor):
+                          offset=0, limit=100, cursor_factory=None):
     from research.stock_alert_review import build_stock_eod_review
 
     as_of = as_of or datetime.now(timezone.utc)
     if as_of.utcoffset() is None:
         raise ValueError("stock EOD review requires an aware cutoff")
-    with cursor_factory() as cursor:
+    with _cursor_factory(cursor_factory)() as cursor:
         cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         cursor.execute("SET LOCAL statement_timeout='10s'")
         cursor.execute("""SELECT to_regclass('public.stock_alert_result_records') IS NOT NULL
@@ -259,13 +645,13 @@ def load_stock_eod_review(*, as_of=None, session_date=None, search="", model=Non
 
 def read_published_stock_setup(*, policy, record_id, payload_sha256, episode_id,
                               security_id, ticker, market_cutoff, observed_cutoff,
-                              cursor_factory=get_db_cursor, clock=None):
+                              cursor_factory=None, clock=None):
     from equity.behavior_setup import PublishedSetupSourcePolicy, bind_published_stock_setup
 
     policy = PublishedSetupSourcePolicy.model_validate(policy)
     if market_cutoff.tzinfo is None or observed_cutoff.tzinfo is None or market_cutoff > observed_cutoff:
         raise ValueError("setup reader requires causal aware cutoffs")
-    with cursor_factory() as cursor:
+    with _cursor_factory(cursor_factory)() as cursor:
         cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         cursor.execute("SET LOCAL statement_timeout='5s'")
         cursor.execute("""SELECT to_regclass('public.stock_alert_result_records') IS NOT NULL
@@ -302,11 +688,11 @@ def read_published_stock_setup(*, policy, record_id, payload_sha256, episode_id,
         received_at=received_at, episode_id=episode_id, security_id=security_id, ticker=ticker, policy=policy)
 
 
-def read_setup_publication_inventory(*, limit=12, cursor_factory=get_db_cursor, clock=None):
+def read_setup_publication_inventory(*, limit=12, cursor_factory=None, clock=None):
     if not 1 <= limit <= 48:
         raise ValueError("setup inventory requires 1..48 publications")
     cutoff = clock() if clock else datetime.now(timezone.utc)
-    with cursor_factory() as cursor:
+    with _cursor_factory(cursor_factory)() as cursor:
         cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         cursor.execute("SET LOCAL statement_timeout='5s'")
         cursor.execute("""SELECT to_regclass('public.stock_alert_result_records') IS NOT NULL
@@ -431,7 +817,10 @@ def read_direct_stock_setup_windows(path, *, policies, windows, as_of, clock=Non
             market_cutoff=max(cutoff for cutoff, _ in windows.values()), as_of=as_of,
             clock=clock, windows=windows)
     except (OSError, sqlite3.Error, zlib.error, ValueError, KeyError, TypeError):
-        return (), Counter({"S1_STOCK_SOURCE_UNAVAILABLE": len(windows), "S2_STOCK_SOURCE_UNAVAILABLE": len(windows)})
+        return (), Counter({
+            "ACCEPTANCE_STOCK_SOURCE_UNAVAILABLE": len(windows),
+            "RESUMPTION_STOCK_SOURCE_UNAVAILABLE": len(windows),
+        })
 
 
 def read_direct_stock_setup_shadow_windows(path, *, policies, windows, as_of, clock=None):
@@ -449,7 +838,10 @@ def read_direct_stock_setup_shadow_windows(path, *, policies, windows, as_of, cl
             clock=clock, windows=windows, include_shadow=True)
         return shadows, rejections
     except (OSError, sqlite3.Error, zlib.error, ValueError, KeyError, TypeError):
-        return (), Counter({"S1_SHADOW_SOURCE_UNAVAILABLE": len(windows), "S2_SHADOW_SOURCE_UNAVAILABLE": len(windows)})
+        return (), Counter({
+            "ACCEPTANCE_SHADOW_SOURCE_UNAVAILABLE": len(windows),
+            "RESUMPTION_SHADOW_SOURCE_UNAVAILABLE": len(windows),
+        })
 
 
 def _read_direct_stock_setup_batch(path, *, policies, underlyers, market_cutoff, as_of, clock=None, windows=None,
@@ -516,8 +908,8 @@ def _read_direct_stock_setup_batch(path, *, policies, underlyers, market_cutoff,
                     or securities.get(ticker) in latest[1].get("missing_members", ())):
                 reason = "STOCK_MEMBER_UNAVAILABLE"
             if reason:
-                for model in ("S1", "S2"):
-                    rejections[f"{model}_{reason}"] += 1
+                for family in ("ACCEPTANCE", "RESUMPTION"):
+                    rejections[f"{family}_{reason}"] += 1
                 continue
             selected.append((*latest, ticker))
         publications = selected
@@ -564,20 +956,22 @@ def _read_direct_stock_setup_batch(path, *, policies, underlyers, market_cutoff,
                 continue
             results.append(evidence)
             seen.add(episode_id)
-            matched_models.add("S2" if evidence.expected_model == "resumption" else "S1")
+            matched_models.add(evidence.expected_model.upper())
             if len(results) > 5000:
                 raise ValueError("direct setup batch exceeds episode bound")
         if ticker is not None:
-            for model in {"S1", "S2"} - matched_models:
-                rejections[f"{model}_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"] += 1
+            for family in {"ACCEPTANCE", "RESUMPTION"} - matched_models:
+                rejections[
+                    f"{family}_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW"
+                ] += 1
     if include_shadow:
         return tuple(results), rejections, tuple(shadows)
     return tuple(results), rejections
 
 
-def attach_shared_context(page):
+def attach_shared_context(page, cursor_factory=None):
     rows = []
-    with get_db_cursor() as cursor:
+    with _cursor_factory(cursor_factory)() as cursor:
         cursor.execute("SET TRANSACTION READ ONLY")
         cursor.execute("SET LOCAL statement_timeout='10s'")
         cache, budget = {}, 10_000_000

@@ -19,6 +19,11 @@ def advanced_input_gate_identity(
 ) -> str:
     plan, window = context.plan, context.window
     window_start = window.cutoff - timedelta(minutes=5)
+    visibility_at = getattr(
+        window,
+        "release_at",
+        getattr(window, "deadline", window.cutoff),
+    )
     with database.transaction(read_only=True) as cursor:
         cursor.execute(
             "SELECT cohort.manifest_id,manifest.stock_count,"
@@ -54,36 +59,35 @@ def advanced_input_gate_identity(
                 "Advanced input gate AM membership is not exact"
             )
         cursor.execute(
-            "SELECT current.instrument_id,revision.bar_start,"
+            "SELECT DISTINCT ON ("
+            "revision.instrument_id,revision.bar_start"
+            ") revision.instrument_id,revision.bar_start,"
             "revision.bar_end,revision.bar_revision_id,"
             "revision.payload_sha256,"
             "revision.source_kind,revision.quality_codes,"
             "revision.journal_generation,revision.stream_session_id,"
             "revision.source_offset,revision.ingestion_segment_id "
-            "FROM rt.bar_current AS current "
-            "JOIN rt.bar_revisions AS revision "
-            "ON revision.bar_revision_id=current.bar_revision_id "
-            "AND revision.observed_at=current.observed_at "
-            "AND revision.cohort_id=current.cohort_id "
-            "AND revision.provider_tier=current.provider_tier "
-            "AND revision.instrument_id=current.instrument_id "
-            "AND revision.interval=current.interval "
-            "WHERE current.cohort_id=%s "
-            "AND current.provider_tier='MASSIVE_ADVANCED' "
-            "AND current.instrument_id=ANY(%s) "
-            "AND current.interval='1m' "
-            "AND current.adjustment_basis='RAW_UNADJUSTED' "
-            "AND current.session_scope='RTH' "
+            "FROM rt.bar_revisions AS revision "
+            "WHERE revision.cohort_id=%s "
+            "AND revision.provider_tier='MASSIVE_ADVANCED' "
+            "AND revision.instrument_id=ANY(%s) "
+            "AND revision.interval='1m' "
+            "AND revision.adjustment_basis='RAW_UNADJUSTED' "
+            "AND revision.session_scope='RTH' "
             "AND revision.session_date=%s "
             "AND revision.is_final "
-            "AND current.bar_start>=%s AND current.bar_end<=%s "
-            "ORDER BY current.instrument_id,revision.bar_start",
+            "AND revision.bar_start>=%s AND revision.bar_end<=%s "
+            "AND revision.created_at<=%s "
+            "ORDER BY revision.instrument_id,revision.bar_start,"
+            "revision.observed_at DESC,revision.created_at DESC,"
+            "revision.bar_revision_id DESC",
             (
                 str(plan.cohort_id),
                 list(members),
                 window_start.date(),
                 window_start,
                 window.cutoff,
+                visibility_at,
             ),
         )
         bars = tuple(cursor.fetchall())
@@ -228,8 +232,13 @@ def advanced_input_gate_identity(
             "FROM rt.consumer_checkpoints AS checkpoint "
             "WHERE checkpoint.cohort_id=%s "
             "AND checkpoint.journal_generation=ANY(%s::uuid[]) "
+            "AND checkpoint.committed_at<=%s "
             "ORDER BY checkpoint.journal_generation,checkpoint.shard_id",
-            (str(plan.cohort_id), list(generations)),
+            (
+                str(plan.cohort_id),
+                list(generations),
+                visibility_at,
+            ),
         )
         checkpoints = tuple(cursor.fetchall())
         checkpoints_by_generation = {

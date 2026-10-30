@@ -775,8 +775,8 @@ def build_bounded_option_session_manifest(
         and (
             DetectorFamily.O2 not in policy.unavailable_detectors
             or not {
-                DetectorFamily.S1,
-                DetectorFamily.S2,
+                DetectorFamily.OS1,
+                DetectorFamily.OS2,
                 DetectorFamily.O1,
                 DetectorFamily.O3,
             }.issubset(policy.required_detectors)

@@ -17,11 +17,15 @@ x-advanced-environment: &advanced-environment
   REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH: /app/realtime/policies/advanced_equity_ingress_v1.json
   REALTIME_V2_ADVANCED_INGRESS_POLICY_VERSION: advanced-equity-ingress-v1
 
+x-downstream-labels: &downstream-labels
+  stockscreener.realtime.transition-plane: downstream
+
 services:
   realtime-v2-advanced-controller:
     <<: *backend-service
     profiles: ["realtime-v2-advanced-provider"]
     container_name: stock-screener-realtime-v2-advanced-controller
+    restart: "on-failure:3"
     command:
       - python
       - -B
@@ -54,6 +58,8 @@ services:
       - ${REALTIME_V2_ADVANCED_REST_REPAIR_REQUESTS:-0}
       - --rest-repair-decoded-bytes
       - ${REALTIME_V2_ADVANCED_REST_REPAIR_DECODED_BYTES:-0}
+      - --catch-up-mode
+      - ${REALTIME_V2_ADVANCED_CATCH_UP_MODE:-DISABLED}
       - --external-ingress
       - --execute
     environment:
@@ -100,6 +106,7 @@ services:
     <<: *backend-service
     profiles: ["realtime-v2-advanced-provider"]
     container_name: stock-screener-realtime-v2-advanced-ingress
+    restart: "on-failure:3"
     command:
       - python
       - -B
@@ -158,6 +165,7 @@ services:
     <<: *backend-service
     profiles: ["realtime-v2-advanced"]
     container_name: stock-screener-realtime-v2-advanced-bridge
+    restart: "on-failure:3"
     command:
       - python
       - -B
@@ -213,6 +221,7 @@ services:
     <<: *backend-service
     profiles: ["realtime-v2-advanced"]
     container_name: stock-screener-realtime-v2-advanced-scheduler
+    restart: "on-failure:3"
     command:
       - python
       - -B
@@ -278,6 +287,7 @@ services:
     <<: *backend-service
     profiles: ["realtime-v2-advanced"]
     container_name: stock-screener-realtime-v2-advanced-finalizer
+    restart: "on-failure:3"
     command:
       - python
       - -B
@@ -329,6 +339,7 @@ services:
 
   realtime-v2-advanced-detectors:
     <<: *backend-service
+    labels: *downstream-labels
     profiles: ["realtime-v2-advanced"]
     container_name: stock-screener-realtime-v2-advanced-detectors
     command:
@@ -342,7 +353,7 @@ services:
       - --
       - python
       - -B
-      - scripts/run_realtime_v2_advanced_equity_detectors.py
+      - scripts/run_realtime_v2_advanced_options_os_detectors.py
       - --database
       - stocks_realtime_v2
       - --confirm-database-name
@@ -381,11 +392,77 @@ services:
       retries: 4
       start_period: 20s
 
+  realtime-v2-canonical-stock-alerts:
+    <<: *backend-service
+    labels: *downstream-labels
+    profiles: ["realtime-v2-advanced"]
+    container_name: ${REALTIME_V2_CANONICAL_STOCK_ALERT_CONTAINER_PREFIX:-stock-screener}-realtime-v2-canonical-stock-alerts
+    restart: "on-failure:3"
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - canonical-stock-alerts
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --
+      - python
+      - -B
+      - -u
+      - scripts/run_realtime_v2_canonical_stock_alerts.py
+      - --database
+      - stocks_realtime_v2
+      - --confirm-database-name
+      - stocks_realtime_v2
+      - --cohort-id
+      - ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
+      - --session-date
+      - ${REALTIME_V2_ADVANCED_SESSION_DATE:-2000-01-03}
+      - --operation
+      - PRIMARY_SERVING
+      - --continuous
+      - --execute
+    environment:
+      <<: *advanced-environment
+      REALTIME_V2_ROLE_PREFIX: ${REALTIME_V2_ROLE_PREFIX:-stocks_realtime_v2}
+    secrets:
+      - realtime_v2_app_dsn
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - canonical-stock-alerts
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --
+        - python
+        - -B
+        - scripts/run_realtime_v2_canonical_stock_alerts.py
+        - --database
+        - stocks_realtime_v2
+        - --confirm-database-name
+        - stocks_realtime_v2
+        - --cohort-id
+        - ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
+        - --session-date
+        - ${REALTIME_V2_ADVANCED_SESSION_DATE:-2000-01-03}
+        - --operation
+        - PRIMARY_SERVING
+        - --health
+      interval: 5s
+      timeout: 15s
+      retries: 6
+      start_period: 10s
+
   realtime-v2-options-p8-ingress:
     <<: *backend-service
     profiles: ["realtime-v2-options-p8", "realtime-v3-options"]
     container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-ingress
-    restart: "no"
+    restart: "on-failure:3"
     command:
       - python
       - -B
@@ -394,8 +471,6 @@ services:
       - options-p8-ingress
       - --app-dsn-file
       - /run/secrets/realtime_v2_app_dsn
-      - --provider-key-file
-      - /run/secrets/realtime_v2_provider_key
       - --
       - python
       - -B
@@ -409,19 +484,27 @@ services:
     environment:
       REALTIME_V2_EQUITY_PIPELINE: DISABLED
       REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
+      REALTIME_V3_ACQUISITION_SPLIT: ENABLED
+      REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH: /run/advanced-options-acquisition/binding.json
+      REALTIME_V3_OPTIONS_ACQUISITION_STATUS_PATH: /var/lib/realtime-v2-reports/options-acquisition-status.json
+      REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: /run/advanced-options-downstream
       REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
     secrets:
       - realtime_v2_app_dsn
-      - realtime_v2_provider_key
     volumes:
       - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
       - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
+      - ${REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH:?set REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH}:/run/advanced-options-acquisition/binding.json:ro
+      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:?set REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH}:/run/advanced-options-downstream:ro
       - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
       - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
     healthcheck:
       test:
         - CMD
         - python
+        - -W
+        - ignore
         - -B
         - scripts/run_advanced_options_v3_production.py
         - --docker-health-kind
@@ -431,7 +514,74 @@ services:
         - --execution-bundle
         - /run/advanced-options-p8/execution-bundle.json
       interval: 5s
-      timeout: 5s
+      timeout: 15s
+      retries: 6
+      start_period: 10s
+
+  realtime-v3-options-acquisition:
+    <<: *backend-service
+    profiles: ["realtime-v3-options-acquisition"]
+    container_name: ${REALTIME_V3_ACQUISITION_CONTAINER_PREFIX:-stock-screener}-realtime-v3-options-acquisition
+    restart: "on-failure:3"
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - options-v3-acquisition
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --provider-key-file
+      - /run/secrets/realtime_v2_provider_key
+      - --
+      - python
+      - -B
+      - -u
+      - scripts/run_advanced_options_v3_acquisition.py
+      - run
+      - --database
+      - stocks_realtime_v2
+      - --confirm-database-name
+      - stocks_realtime_v2
+      - --binding
+      - /run/advanced-options-acquisition/binding.json
+      - --journal-root
+      - /var/lib/realtime-v2-advanced
+      - --status-path
+      - /var/lib/realtime-v2-reports/options-acquisition-status.json
+      - --lock-path
+      - /var/lib/realtime-v2-advanced/options-acquisition-provider.lock
+      - --continuous
+      - --execute
+    environment:
+      REALTIME_V2_EQUITY_PIPELINE: DISABLED
+      REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
+      REALTIME_V2_ROLE_PREFIX: ${REALTIME_V2_ROLE_PREFIX:-stocks_realtime_v2}
+    secrets:
+      - realtime_v2_app_dsn
+      - realtime_v2_provider_key
+    volumes:
+      - ${REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH:?set REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH}:/run/advanced-options-acquisition/binding.json:ro
+      - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
+      - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_advanced_options_v3_acquisition.py
+        - health
+        - --database
+        - stocks_realtime_v2
+        - --confirm-database-name
+        - stocks_realtime_v2
+        - --binding
+        - /run/advanced-options-acquisition/binding.json
+        - --status-path
+        - /var/lib/realtime-v2-reports/options-acquisition-status.json
+      interval: 5s
+      timeout: 15s
       retries: 6
       start_period: 10s
 
@@ -439,7 +589,7 @@ services:
     <<: *backend-service
     profiles: ["realtime-v2-options-p8", "realtime-v3-options"]
     container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-market-state
-    restart: "no"
+    restart: "on-failure:3"
     command:
       - python
       - -B
@@ -461,18 +611,23 @@ services:
     environment:
       REALTIME_V2_EQUITY_PIPELINE: DISABLED
       REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
+      REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: /run/advanced-options-downstream
       REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
     secrets:
       - realtime_v2_app_dsn
     volumes:
       - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
       - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
+      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:?set REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH}:/run/advanced-options-downstream:ro
       - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
       - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
     healthcheck:
       test:
         - CMD
         - python
+        - -W
+        - ignore
         - -B
         - scripts/run_advanced_options_v3_production.py
         - --docker-health-kind
@@ -482,15 +637,16 @@ services:
         - --execution-bundle
         - /run/advanced-options-p8/execution-bundle.json
       interval: 5s
-      timeout: 5s
+      timeout: 15s
       retries: 6
       start_period: 10s
 
   realtime-v2-options-p8-flow:
     <<: *backend-service
+    labels: *downstream-labels
     profiles: ["realtime-v2-options-p8", "realtime-v3-options"]
     container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-flow
-    restart: "no"
+    restart: "on-failure:3"
     command:
       - python
       - -B
@@ -512,18 +668,23 @@ services:
     environment:
       REALTIME_V2_EQUITY_PIPELINE: DISABLED
       REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
+      REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: /run/advanced-options-downstream
       REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
     secrets:
       - realtime_v2_app_dsn
     volumes:
       - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
       - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
+      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:?set REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH}:/run/advanced-options-downstream:ro
       - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
       - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
     healthcheck:
       test:
         - CMD
         - python
+        - -W
+        - ignore
         - -B
         - scripts/run_advanced_options_v3_production.py
         - --docker-health-kind
@@ -533,15 +694,16 @@ services:
         - --execution-bundle
         - /run/advanced-options-p8/execution-bundle.json
       interval: 5s
-      timeout: 5s
+      timeout: 15s
       retries: 6
       start_period: 10s
 
   realtime-v2-options-p8-window:
     <<: *backend-service
+    labels: *downstream-labels
     profiles: ["realtime-v2-options-p8", "realtime-v3-options"]
     container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-window
-    restart: "no"
+    restart: "on-failure:3"
     command:
       - python
       - -B
@@ -563,16 +725,21 @@ services:
     environment:
       REALTIME_V2_EQUITY_PIPELINE: DISABLED
       REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
+      REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: /run/advanced-options-downstream
     secrets:
       - realtime_v2_app_dsn
     volumes:
       - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
       - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
+      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:?set REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH}:/run/advanced-options-downstream:ro
       - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
     healthcheck:
       test:
         - CMD
         - python
+        - -W
+        - ignore
         - -B
         - scripts/run_advanced_options_v3_production.py
         - --docker-health-kind
@@ -582,7 +749,7 @@ services:
         - --execution-bundle
         - /run/advanced-options-p8/execution-bundle.json
       interval: 5s
-      timeout: 5s
+      timeout: 15s
       retries: 6
       start_period: 10s
 
@@ -724,6 +891,7 @@ services:
 
   realtime-v2-advanced-api:
     <<: *backend-service
+    labels: *downstream-labels
     profiles: ["realtime-v2-advanced"]
     container_name: stock-screener-realtime-v2-advanced-api
     stop_grace_period: 30s

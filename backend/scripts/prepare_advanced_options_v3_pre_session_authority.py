@@ -6,7 +6,7 @@ import argparse
 import hashlib
 import json
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -48,6 +48,10 @@ def parse_args(argv=None):
     parser.add_argument("--capture-file-sha256", required=True)
     parser.add_argument("--authorization-reference", required=True)
     parser.add_argument("--package-nonce", type=UUID, required=True)
+    parser.add_argument(
+        "--acquisition-start",
+        type=datetime.fromisoformat,
+    )
     parser.add_argument("--hard-stop", type=datetime.fromisoformat, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--execute", action="store_true")
@@ -60,18 +64,38 @@ def parse_args(argv=None):
     if (
         args.database != EXPECTED_V2_DATABASE_NAME
         or not args.authorization_reference.strip()
+        or (
+            args.acquisition_start is not None
+            and (
+                args.acquisition_start.tzinfo is None
+                or args.acquisition_start.utcoffset() is None
+            )
+        )
         or args.hard_stop.tzinfo is None
         or args.hard_stop.utcoffset() is None
         or not args.execute
     ):
         parser.error("pre-session authority scope is invalid")
+    if args.acquisition_start is not None:
+        args.acquisition_start = args.acquisition_start.astimezone(UTC)
     args.hard_stop = args.hard_stop.astimezone(UTC)
     calendar = OptionExchangeCalendar()
+    session_open = calendar.session_open(args.session_date)
+    decision_stop = (
+        calendar.session_close(args.session_date)
+        + timedelta(seconds=300)
+    )
     if (
         args.hard_stop.date() != args.session_date
-        or not calendar.session_open(args.session_date)
-        < args.hard_stop
-        <= calendar.session_close(args.session_date)
+        or not session_open < args.hard_stop
+        <= decision_stop
+        or (
+            args.acquisition_start is not None
+            and not (
+                args.acquisition_start.date() == args.session_date
+                and args.acquisition_start <= session_open
+            )
+        )
     ):
         parser.error("pre-session authority hard stop changed")
     args.capture = args.capture.resolve()
@@ -130,6 +154,7 @@ def execute(args):
             cohort_id=cohort_id,
             prepared_at=captured_at,
             capture_boundary=boundary,
+            acquisition_start=args.acquisition_start,
         )
     finally:
         pool.closeall()

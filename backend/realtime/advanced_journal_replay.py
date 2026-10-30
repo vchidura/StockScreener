@@ -197,6 +197,7 @@ def _normalize_committed_raw(
         with RawJournalWriter(
             path,
             generation=registration.journal_generation,
+            clock=lambda: checked_at,
         ) as writer:
             for raw in rows:
                 batch = normalize_raw_message(

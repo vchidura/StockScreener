@@ -727,6 +727,8 @@ def _owp4_enrollment(
             DetectorFamily.O1,
             DetectorFamily.O2,
             DetectorFamily.O3,
+            DetectorFamily.OS1,
+            DetectorFamily.OS2,
         ),
     )
     pins = AdvancedOptionsPolicyPins(

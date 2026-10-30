@@ -1189,7 +1189,6 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                 valid_until=expires,
                 discovery_scheduled_cycle=cutoff,
                 prior_oi_session=control.session_date - timedelta(days=1),
-                treasury_maximum_age_seconds=3_600,
                 model_version="black-scholes-merton-v1",
                 history_source_cohort_id=history_cohort_id,
             )

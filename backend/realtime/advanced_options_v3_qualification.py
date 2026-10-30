@@ -11,15 +11,28 @@ import psycopg2
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
-from .advanced_options_p8_runtime import P8_EFFECT_DENIALS
+from pathlib import Path
+
+from .advanced_options_p8_runtime import (
+    P8_EFFECT_DENIALS,
+    P8DownstreamBindingStore,
+    p8_downstream_binding_payload,
+    p8_preopen_session_binding_from_payload,
+)
 from .advanced_options_service import AdvancedOptionsProcessKind
 from .advanced_options_v3_deployment import (
     ADVANCED_OPTIONS_V3_PROFILE_SHA256,
     ADVANCED_OPTIONS_V3_QUALIFICATION_STATE,
 )
+from .advanced_options_validation_mode import (
+    AdvancedOptionsValidationMode,
+    advanced_options_validation_mode,
+)
 from .contracts import canonical_sha256
 from .stage_graph import STAGE_CATALOG_VERSION_V5
-from .advanced_options_service import OPTIONS_V3_STAGE_ORDER
+from .advanced_options_service import (
+    OPTIONS_PROJECTION_ONLY_STAGE_ORDER,
+)
 
 
 UTC = timezone.utc
@@ -40,6 +53,10 @@ def _qualification_payload(package, bundle) -> Mapping[str, object]:
         or len(qualification.get("window_ids") or ()) != 3
         or len(qualification.get("contracts") or ()) != 4
         or qualification.get("channels") != ["T", "Q"]
+        or package.get("validation_mode")
+        != AdvancedOptionsValidationMode.DEVELOPMENT_DIAGNOSTIC.value
+        or bundle.get("validation_mode")
+        != AdvancedOptionsValidationMode.DEVELOPMENT_DIAGNOSTIC.value
         or qualification.get("acceptance") != {
             "window_count": 3,
             "window_2": "DEFERRED_THEN_COMPLETE",
@@ -48,12 +65,15 @@ def _qualification_payload(package, bundle) -> Mapping[str, object]:
                 "O3": "BLOCKED",
             },
             "restart": "REHYDRATED",
+            "projection": {
+                "equity_terminal_receipt": "PORTAL_READY",
+                "options_terminal_receipt": "OPTIONS_PORTAL_READY",
+            },
             "publication": {
-                "pointer_advances": 1,
-                "idempotent": True,
-                "rollback": True,
-                "duplicate_alerts": 0,
-                "duplicate_publications": 0,
+                "release_created": False,
+                "pointer_advanced": False,
+                "read_pin_enabled": False,
+                "normal_portal_serving": False,
             },
         }
         or not isinstance(deployment, Mapping)
@@ -64,7 +84,7 @@ def _qualification_payload(package, bundle) -> Mapping[str, object]:
         or bundle.get("orchestration", {}).get("catalog_version")
         != STAGE_CATALOG_VERSION_V5
         or bundle.get("orchestration", {}).get("stage_order")
-        != list(OPTIONS_V3_STAGE_ORDER)
+        != list(OPTIONS_PROJECTION_ONLY_STAGE_ORDER)
     ):
         raise RuntimeError(
             "V3 provider-free production role qualification identity changed"
@@ -350,19 +370,47 @@ def run_provider_free_v3_role(
     bundle,
     environment,
     stop_event,
+    state_observer=None,
 ):
-    del stop_event
+    mode = advanced_options_validation_mode(environment)
     if (
-        environment.get("REALTIME_V3_PROVIDER_FREE_QUALIFICATION")
-        != "ENABLED"
+        mode is not AdvancedOptionsValidationMode.DEVELOPMENT_DIAGNOSTIC
         or (
             kind is AdvancedOptionsProcessKind.INGRESS
-            and environment.get("POLYGON_API_KEY") != _PROVIDER_SENTINEL
+            and (
+                environment.get("REALTIME_V3_ACQUISITION_SPLIT")
+                != "ENABLED"
+                or environment.get("POLYGON_API_KEY")
+            )
         )
     ):
         raise RuntimeError(
             "V3 provider-free production role injection is not authorized"
         )
+    if bundle.get("session_binding") is not None:
+        session_binding = p8_preopen_session_binding_from_payload(
+            bundle["session_binding"]
+        )
+        store = P8DownstreamBindingStore(
+            Path(environment[
+                "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR"
+            ]),
+            session_binding=session_binding,
+        )
+        while not stop_event.is_set():
+            attached = store.latest()
+            if attached is not None:
+                if state_observer is not None:
+                    state_observer(
+                        "BOUND_TO_E",
+                        p8_downstream_binding_payload(attached),
+                    )
+                break
+            stop_event.wait(0.1)
+        else:
+            raise RuntimeError(
+                "V3 provider-free role stopped before E attachment"
+            )
     qualification = _qualification_payload(package, bundle)
     connection = psycopg2.connect(
         environment["REALTIME_V2_APP_DSN"],
@@ -383,6 +431,7 @@ def run_provider_free_v3_role(
     return {
         "status": "COMPLETE",
         "kind": kind.value,
+        "validation_mode": mode.value,
         "qualification": evidence,
         "effects": dict(P8_EFFECT_DENIALS),
     }

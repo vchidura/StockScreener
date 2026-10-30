@@ -21,6 +21,7 @@ from .advanced_equity_control_plane import (
 )
 from .advanced_options_control_plane import (
     ADVANCED_OPTIONS_REST_LANES,
+    AdvancedOptionsEquityInputBinding,
     AdvancedOptionsFeedScope,
     AdvancedOptionsOwnerNames,
     AdvancedOptionsPolicyPins,
@@ -146,6 +147,8 @@ def _p8_manifest_policy() -> BoundedOptionManifestPolicy:
             DetectorFamily.O1,
             DetectorFamily.O2,
             DetectorFamily.O3,
+            DetectorFamily.OS1,
+            DetectorFamily.OS2,
         ),
     )
 
@@ -171,6 +174,23 @@ def _cycle_cutoff(
     if cutoff <= checked_at:
         raise RuntimeError("P8 canonical cycle cutoff is not prospective")
     return cutoff
+
+
+def p8_options_cycle_cutoff_from_capture(
+    capture: P8ActivitySelectionCapture,
+    *,
+    checked_at: datetime,
+    stop: datetime,
+) -> datetime:
+    if not isinstance(capture, P8ActivitySelectionCapture):
+        raise TypeError("P8 activity selection capture is invalid")
+    underlying = binding_from_selection_capture(capture)
+    return _cycle_cutoff(
+        capture,
+        checked_at.astimezone(UTC),
+        stop.astimezone(UTC),
+        underlying.valid_until,
+    )
 
 
 class P8ProductionConfigurationError(RuntimeError):
@@ -248,14 +268,16 @@ class _DockerWindowOrchestrator:
 
 
 def run_p8_production_role(**kwargs):
+    from .advanced_options_validation_mode import (
+        AdvancedOptionsValidationMode,
+        advanced_options_validation_mode,
+    )
+
     environment = kwargs.get("environment")
-    if (
-        isinstance(environment, Mapping)
-        and environment.get(
-            "REALTIME_V3_PROVIDER_FREE_QUALIFICATION"
-        )
-        == "ENABLED"
-    ):
+    mode = advanced_options_validation_mode(
+        environment if isinstance(environment, Mapping) else None
+    )
+    if mode is AdvancedOptionsValidationMode.DEVELOPMENT_DIAGNOSTIC:
         from .advanced_options_v3_qualification import (
             run_provider_free_v3_role,
         )
@@ -1320,35 +1342,48 @@ class _P8ProductionCapture:
             ]
         return peers, releases, pointers, windows, retention, read_pins
 
-    def _equity_source(self, checked_at):
-        value = self._package["equity_input_binding"]
-        binding = build_advanced_options_equity_input_binding(
-            target_options_window_id=UUID(str(
-                value["target_options_window_id"]
-            )),
-            target_cohort_id=UUID(str(value["target_cohort_id"])),
-            source_cohort_id=UUID(str(value["source_cohort_id"])),
-            source_cohort_sha256=str(value["source_cohort_sha256"]),
-            source_manifest_id=UUID(str(value["source_manifest_id"])),
-            source_manifest_sha256=str(
-                value["source_manifest_sha256"]
-            ),
-            source_profile_id=UUID(str(value["source_profile_id"])),
-            source_profile_sha256=str(value["source_profile_sha256"]),
-            equity_window_id=UUID(str(value["equity_window_id"])),
-            equity_receipt_id=UUID(str(value["equity_receipt_id"])),
-            equity_cutoff=datetime.fromisoformat(
-                str(value["equity_cutoff"])
-            ),
-            reference_generation=int(value["reference_generation"]),
-            universe_sha256=str(value["universe_sha256"]),
-            input_sha256=str(value["input_sha256"]),
-            build_id=str(value["build_id"]),
-            maximum_age_seconds=int(value["maximum_age_seconds"]),
-            authorization_reference=str(
-                value["authorization_reference"]
-            ),
-        )
+    def _equity_source(
+        self,
+        checked_at,
+        binding: AdvancedOptionsEquityInputBinding | None = None,
+    ):
+        if binding is None:
+            value = self._package["equity_input_binding"]
+            binding = build_advanced_options_equity_input_binding(
+                target_options_window_id=UUID(str(
+                    value["target_options_window_id"]
+                )),
+                target_cohort_id=UUID(str(value["target_cohort_id"])),
+                source_cohort_id=UUID(str(value["source_cohort_id"])),
+                source_cohort_sha256=str(value["source_cohort_sha256"]),
+                source_manifest_id=UUID(str(value["source_manifest_id"])),
+                source_manifest_sha256=str(
+                    value["source_manifest_sha256"]
+                ),
+                source_profile_id=UUID(str(value["source_profile_id"])),
+                source_profile_sha256=str(
+                    value["source_profile_sha256"]
+                ),
+                equity_window_id=UUID(str(value["equity_window_id"])),
+                equity_receipt_id=UUID(str(value["equity_receipt_id"])),
+                equity_cutoff=datetime.fromisoformat(
+                    str(value["equity_cutoff"])
+                ),
+                reference_generation=int(
+                    value["reference_generation"]
+                ),
+                universe_sha256=str(value["universe_sha256"]),
+                input_sha256=str(value["input_sha256"]),
+                build_id=str(value["build_id"]),
+                maximum_age_seconds=int(
+                    value["maximum_age_seconds"]
+                ),
+                authorization_reference=str(
+                    value["authorization_reference"]
+                ),
+            )
+        elif not isinstance(binding, AdvancedOptionsEquityInputBinding):
+            raise TypeError("P8 per-E Equity binding is invalid")
         if (
             binding.equity_cutoff > checked_at
             or (
@@ -1432,6 +1467,8 @@ class _P8ProductionCapture:
         history_manifest,
         equity,
         equity_input,
+        *,
+        target_window_id=None,
     ):
         package = self._package
         stop = datetime.fromisoformat(str(package["window"]["stop_utc"]))
@@ -1590,10 +1627,16 @@ class _P8ProductionCapture:
                 ]
             ),
         )
-        window_id = uuid5(
-            NAMESPACE_URL,
-            f"p8-window:{package['package_nonce']}",
+        window_id = (
+            uuid5(
+                NAMESPACE_URL,
+                f"p8-window:{package['package_nonce']}",
+            )
+            if target_window_id is None
+            else target_window_id
         )
+        if not isinstance(window_id, UUID) or not window_id.int:
+            raise ValueError("P8 target window identity is invalid")
         if equity_input.target_options_window_id != window_id:
             raise RuntimeError("P8 target Options window binding changed")
         self.underlying_price_binding = underlying_price_binding
@@ -1630,12 +1673,23 @@ class _P8ProductionCapture:
             )
         return binding
 
-    def _capture_selection(self, package, checked_at, capture):
+    def _capture_selection(
+        self,
+        package,
+        checked_at,
+        capture,
+        *,
+        equity_input_binding=None,
+        target_window_id=None,
+    ):
         if package is not self._package and dict(package) != dict(self._package):
             raise ValueError("P8 production package identity changed")
         checked = checked_at.astimezone(UTC)
         history_manifest = self._history_manifest()
-        equity, equity_input = self._equity_source(checked)
+        equity, equity_input = self._equity_source(
+            checked,
+            equity_input_binding,
+        )
         if not isinstance(capture, P8ActivitySelectionCapture):
             raise TypeError("P8 activity selection capture is invalid")
         self.selection_capture = capture
@@ -1645,6 +1699,7 @@ class _P8ProductionCapture:
             history_manifest,
             equity,
             equity_input,
+            target_window_id=target_window_id,
         )
         captured_at = binding.enrollment.control_plane.planned_at
         (
@@ -1762,11 +1817,15 @@ class _P8ProductionCapture:
         *,
         checked_at,
         selection_capture,
+        equity_input_binding=None,
+        target_window_id=None,
     ):
         return self._capture_selection(
             package,
             checked_at,
             selection_capture,
+            equity_input_binding=equity_input_binding,
+            target_window_id=target_window_id,
         )
 
     def persist_selection_cursor(self, cursor, binding):
@@ -1792,7 +1851,8 @@ class _P8ProductionCapture:
                 NAMESPACE_URL,
                 (
                     "p8-discovery:"
-                    f"{self._package['package_nonce']}:{underlyer}"
+                    f"{self._package['package_nonce']}:"
+                    f"{binding.window_id}:{underlyer}"
                 ),
             )
             lower = candidate.spot * Decimal("0.95")
@@ -1842,7 +1902,8 @@ class _P8ProductionCapture:
                 NAMESPACE_URL,
                 (
                     "p8-oi:"
-                    f"{self._package['package_nonce']}:{ticker}"
+                    f"{self._package['package_nonce']}:"
+                    f"{binding.window_id}:{ticker}"
                 ),
             )
             cursor.execute(

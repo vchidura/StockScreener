@@ -13,9 +13,10 @@ from .contracts import AssetClass, MarketChannel, MarketFeed, canonical_sha256
 from .journal import RawJournalRecord
 
 
-NORMALIZER_VERSION = "massive_market_event_v5"
+NORMALIZER_VERSION = "massive_market_event_v6"
 ET = ZoneInfo("America/New_York")
 MAXIMUM_STOCKS_AM_FINALITY_DEFERRAL = timedelta(seconds=2)
+MAXIMUM_MARKET_EVENT_PROVIDER_CLOCK_SKEW = timedelta(seconds=5)
 
 
 class MarketEventQuality(str, Enum):
@@ -313,7 +314,11 @@ def _normalize_event(
     elif is_stocks_am and event_at > finality_observed_at:
         quality = MarketEventQuality.INVALID
         reasons = tuple(dict.fromkeys((*reasons, "AM_FINALITY_PENDING")))
-    elif not is_stocks_am and event_at > raw.received_at:
+    elif (
+        not is_stocks_am
+        and event_at - raw.received_at
+        > MAXIMUM_MARKET_EVENT_PROVIDER_CLOCK_SKEW
+    ):
         quality = MarketEventQuality.INVALID
         reasons = tuple(dict.fromkeys((*reasons, "SOURCE_TIME_AFTER_RECEIPT")))
     return NormalizedMarketEvent(

@@ -383,7 +383,6 @@ def test_owp4b_reference_producer_and_disposable_readiness_audit(
                 valid_until=control.expires_at,
                 discovery_scheduled_cycle=control.planned_at,
                 prior_oi_session=control.session_date - timedelta(days=1),
-                treasury_maximum_age_seconds=3_600,
                 model_version="black-scholes-merton-v1",
             )
             with cursor(database_pool) as database_cursor:

@@ -8,6 +8,7 @@ from realtime.contracts import AssetClass, MarketChannel, MarketFeed
 from realtime.journal import RawJournalRecord
 from realtime.normalizer import (
     InstrumentAdmission,
+    MAXIMUM_MARKET_EVENT_PROVIDER_CLOCK_SKEW,
     MarketEventQuality,
     NORMALIZER_VERSION,
     normalize_raw_message,
@@ -156,7 +157,7 @@ def test_normalizer_prefers_fractional_am_volume_and_versions_the_contract():
     ).events[0]
 
     details = json.loads(aggregate.details_json)
-    assert NORMALIZER_VERSION == "massive_market_event_v5"
+    assert NORMALIZER_VERSION == "massive_market_event_v6"
     assert aggregate.normalizer_version == NORMALIZER_VERSION
     assert aggregate.size == Decimal("1000.125")
     assert details["provider_integer_volume"] == "1000"
@@ -233,20 +234,36 @@ def test_normalizer_defers_am_until_bar_end_without_changing_source_clocks():
     assert aggregate.reason_codes == ()
 
 
-def test_normalizer_keeps_trade_and_quote_future_time_gate_strict():
-    timestamp = int((RECEIVED.timestamp() + 0.001) * 1000)
-    batch = normalize_raw_message(
+def test_normalizer_allows_only_bounded_trade_and_quote_provider_clock_skew():
+    maximum = int(
+        (
+            RECEIVED + MAXIMUM_MARKET_EVENT_PROVIDER_CLOCK_SKEW
+        ).timestamp()
+        * 1000
+    )
+    accepted = normalize_raw_message(
         _raw(
             (
                 '[{"ev":"Q","sym":"SPY","bp":100,"ap":101,"bs":1,'
-                f'"as":1,"t":{timestamp}}}]'
+                f'"as":1,"t":{maximum}}}]'
             ).encode("ascii")
         ),
         ADMISSIONS,
-    )
+    ).events[0]
+    rejected = normalize_raw_message(
+        _raw(
+            (
+                '[{"ev":"Q","sym":"SPY","bp":100,"ap":101,"bs":1,'
+                f'"as":1,"t":{maximum + 1}}}]'
+            ).encode("ascii")
+        ),
+        ADMISSIONS,
+    ).events[0]
 
-    assert batch.events[0].quality is MarketEventQuality.INVALID
-    assert batch.events[0].reason_codes == (
+    assert accepted.quality is MarketEventQuality.GOOD
+    assert accepted.reason_codes == ()
+    assert rejected.quality is MarketEventQuality.INVALID
+    assert rejected.reason_codes == (
         "SOURCE_TIME_AFTER_RECEIPT",
     )
 

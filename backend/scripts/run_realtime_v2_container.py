@@ -17,7 +17,12 @@ OWNED_SECRETS = {
     "scheduler": frozenset({"app_dsn"}),
     "finalizer": frozenset({"app_dsn"}),
     "detectors": frozenset({"app_dsn"}),
-    "options-p8-ingress": frozenset({"app_dsn", "provider_key"}),
+    "canonical-stock-alerts": frozenset({"app_dsn"}),
+    "options-v3-acquisition": frozenset({
+        "app_dsn",
+        "provider_key",
+    }),
+    "options-p8-ingress": frozenset({"app_dsn"}),
     "options-p8-market-state": frozenset({"app_dsn"}),
     "options-p8-flow": frozenset({"app_dsn"}),
     "options-p8-window": frozenset({"app_dsn"}),

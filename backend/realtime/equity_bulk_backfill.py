@@ -25,6 +25,7 @@ from .acquisition_ledger import (
     ProviderRequestState,
     RecordedProviderRequest,
     RequestCompleteness,
+    load_recorded_provider_request_cursor,
 )
 from .acquisition_producer import CompletedDeveloperSourceBatch, DeveloperSourceResult
 from .contracts import UniverseManifest, canonical_sha256
@@ -272,6 +273,47 @@ def _recorded_retained_read(
     return RecordedProviderRequest(reservation, completion)
 
 
+def _retained_request_effect(
+    value: RecordedProviderRequest,
+) -> tuple[object, ...]:
+    reservation = value.reservation
+    completion = value.completion
+    return (
+        reservation.request_id,
+        reservation.account_alias,
+        reservation.lane,
+        reservation.endpoint_class,
+        reservation.request_sha256,
+        reservation.attempt,
+        reservation.cohort_id,
+        reservation.window_id,
+        reservation.stage_run_id,
+        completion.state,
+        completion.outcome,
+        completion.http_status,
+        completion.response_bytes,
+        completion.row_count,
+        completion.pages_fetched,
+        completion.requested_from,
+        completion.requested_to,
+        completion.price_basis,
+        completion.completeness,
+        completion.failure_code,
+        completion.payload_id,
+    )
+
+
+def _validate_retained_request_replay(
+    stored: RecordedProviderRequest,
+    expected: RecordedProviderRequest,
+) -> RecordedProviderRequest:
+    if _retained_request_effect(stored) != _retained_request_effect(expected):
+        raise ValueError(
+            "retained provider request effect changed on replay"
+        )
+    return stored
+
+
 class RetainedEquityBulkSource:
     fact_kind = DeveloperAcquisitionFactKind.EQUITY_BAR
 
@@ -350,8 +392,25 @@ def execute_equity_bulk_backfill(
             (chunk.source_segment_id, chunk.ticker, chunk.interval),
             evidence_by_segment.get(chunk.source_segment_id),
         )
+        external_evidence = evidence is not None
         if evidence is None:
             retained_chunks += 1
+            expected = _recorded_retained_read(
+                chunk,
+                cohort_id=plan.cohort_id,
+                recorded_at=recorded,
+                retained_lineage=retained_lineage,
+            )
+            with ingress_database.transaction(read_only=True) as cursor:
+                evidence = load_recorded_provider_request_cursor(
+                    cursor,
+                    expected.reservation.request_id,
+                )
+            if evidence is not None:
+                evidence = _validate_retained_request_replay(
+                    evidence,
+                    expected,
+                )
         else:
             external_request_ids.add(evidence.reservation.request_id)
         universe = UniverseManifest(
@@ -366,7 +425,7 @@ def execute_equity_bulk_backfill(
                 cohort_id=plan.cohort_id,
                 recorded_at=recorded,
                 request_evidence=evidence,
-                external_provider_request=evidence is not None,
+                external_provider_request=external_evidence,
                 retained_lineage=retained_lineage,
             ),
             EquityAcquisitionRequest(

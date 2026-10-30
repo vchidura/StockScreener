@@ -453,7 +453,7 @@ def load_forward_technical_package_context(
 
     require_options_lineage(lineage)
     enabled = tuple(sorted(family.value for family in scope.selection.policy.required_detectors))
-    if not enabled or set(enabled) - {"O1", "O3", "S1", "S2"}:
+    if not enabled or set(enabled) - {"O1", "O3", "OS1", "OS2"}:
         raise ValueError("Developer technical packages cannot enable unsupported detectors, including O2")
     original = load_forward_o1_package_context(scope, matrix, configuration, detector_context, source,
         selected_at=selected_at, lineage=lineage)
@@ -477,7 +477,7 @@ def load_forward_technical_package_context(
                 "PACKAGE_HOLDING_CLOCKS_UNAVAILABLE")):
         if missing:
             debit_missing.append(reason)
-    for family in {"O1", "S1", "S2"} & set(enabled):
+    for family in {"O1", "OS1", "OS2"} & set(enabled):
         dependencies[family].extend(debit_missing)
     qualified = list(payload["qualified_indicative"])
     credits, credit_candidates, rejected = [], [], list(payload["rejected"])
@@ -500,7 +500,7 @@ def load_forward_technical_package_context(
             matrix.analysis.context.observed_time, scope.cutoff, configuration.configuration_sha256,
             configuration.policy_sha256, configuration.strategy_policy_sha256)
         signals = ()
-        if {"S1", "S2"} & set(enabled):
+        if {"OS1", "OS2"} & set(enabled):
             bars = tuple((bar, recorded) for bar, recorded in detector_context.source.bars if bar.ticker == symbol)
             coverage = next((receipt for receipt, _ in detector_context.source.split_coverage if receipt.ticker == symbol), None)
             daily = tuple(bar for bar, _ in bars if bar.interval == "1d")
@@ -508,15 +508,16 @@ def load_forward_technical_package_context(
                     or coverage.window_start > min(bar.session_date for bar in daily)
                     or coverage.window_end < scope.selection.session_date
                     or selected_at - coverage.first_observed_at > timedelta(hours=24)):
-                for family in {"S1", "S2"} & set(enabled):
+                for family in {"OS1", "OS2"} & set(enabled):
                     dependencies[family].append("CANONICAL_STOCK_SPLIT_COVERAGE_UNAVAILABLE")
             else:
                 try:
                     signals = detect_canonical_stock_signals(security_id=security.security_id, underlyer=symbol,
                         bars=bars, market_cutoff=scope.cutoff, decision_at=selected_at,
-                        session_close=OptionExchangeCalendar().session_close(scope.selection.session_date))
+                        session_close=OptionExchangeCalendar().session_close(scope.selection.session_date),
+                        detector_ids=("OS1", "OS2"))
                 except ValueError:
-                    for family in {"S1", "S2"} & set(enabled):
+                    for family in {"OS1", "OS2"} & set(enabled):
                         dependencies[family].append("CANONICAL_STOCK_SIGNAL_SOURCE_UNAVAILABLE")
         levels = None
         if "O3" in enabled:

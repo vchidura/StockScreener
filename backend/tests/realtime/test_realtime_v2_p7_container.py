@@ -460,7 +460,7 @@ def test_compose_advanced_services_are_independent_and_secret_scoped():
         "backend/scripts/run_realtime_v2_advanced_journal_replay.py",
         "backend/scripts/run_realtime_v2_advanced_equity_bridge.py",
         "backend/scripts/run_realtime_v2_equity_interval_finalizer.py",
-        "backend/scripts/run_realtime_v2_advanced_equity_detectors.py",
+        "backend/scripts/run_realtime_v2_advanced_options_os_detectors.py",
         "backend/scripts/run_realtime_v2_portal_api.py",
         "backend/scripts/run_realtime_v2_retention_service.py",
     ],

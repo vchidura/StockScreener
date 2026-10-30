@@ -258,7 +258,7 @@ def test_options_advanced_without_stocks_advanced_does_not_create_advanced_platf
     assert o2.verdict is CapabilityVerdict.UNAVAILABLE
     assert o2.reason_codes == ("EQUITY_ADVANCED_SPOT_REQUIRED",)
 
-    s1 = product_scoped_detector_availability(DetectorFamily.S1, mixed)
+    s1 = product_scoped_detector_availability(DetectorFamily.OS1, mixed)
     assert s1.verdict is CapabilityVerdict.PASS
     assert s1.realtime_qualified is False
 
@@ -286,8 +286,8 @@ def test_full_advanced_products_qualify_cross_asset_detectors():
     for detector in (
         DetectorFamily.O2,
         DetectorFamily.O3,
-        DetectorFamily.S1,
-        DetectorFamily.S2,
+        DetectorFamily.OS1,
+        DetectorFamily.OS2,
         DetectorFamily.PERSISTENT_REALTIME_FLOW,
     ):
         availability = product_scoped_detector_availability(detector, advanced)

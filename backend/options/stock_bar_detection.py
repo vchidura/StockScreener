@@ -47,6 +47,17 @@ STOCK_BAR_SIGNAL_POLICY = {
 STOCK_BAR_SIGNAL_POLICY_SHA256 = hashlib.sha256(
     canonical_json(STOCK_BAR_SIGNAL_POLICY).encode("ascii")
 ).hexdigest()
+ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY = {
+    **STOCK_BAR_SIGNAL_POLICY,
+    "minimum_bars": {"OS1": 2, "OS2": 3},
+    "OS1": STOCK_BAR_SIGNAL_POLICY["S1"],
+    "OS2": STOCK_BAR_SIGNAL_POLICY["S2"],
+}
+del ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY["S1"]
+del ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY["S2"]
+ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY_SHA256 = hashlib.sha256(
+    canonical_json(ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY).encode("ascii")
+).hexdigest()
 
 
 class CanonicalStockBarPoint(Contract):
@@ -98,7 +109,7 @@ class CanonicalStockSignal(Contract):
     policy_version: Literal["canonical_stock_bar_signal_v2"] = "canonical_stock_bar_signal_v2"
     policy_sha256: Sha256 = STOCK_BAR_SIGNAL_POLICY_SHA256
     signal_id: UUID
-    detector_id: Literal["S1", "S2"]
+    detector_id: Literal["S1", "S2", "OS1", "OS2"]
     security_id: UUID
     underlyer: Name
     direction: Literal[-1, 1]
@@ -122,11 +133,17 @@ class CanonicalStockSignal(Contract):
 
     @model_validator(mode="after")
     def validate_signal(self):
-        expected_count = 2 if self.detector_id == "S1" else 3
+        advanced = self.detector_id in ("OS1", "OS2")
+        expected_policy_sha256 = (
+            ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY_SHA256
+            if advanced
+            else STOCK_BAR_SIGNAL_POLICY_SHA256
+        )
+        expected_count = 2 if self.detector_id in ("S1", "OS1") else 3
         expected_id = uuid5(NAMESPACE_URL, ":".join(("canonical-stock-signal", self.policy_sha256,
             self.detector_id, str(self.security_id), self.session_date.isoformat(), str(self.direction),
             str(self.bars[-1].bar_revision_id))))
-        if (self.policy_sha256 != STOCK_BAR_SIGNAL_POLICY_SHA256 or len(self.bars) != expected_count
+        if (self.policy_sha256 != expected_policy_sha256 or len(self.bars) != expected_count
                 or self.signal_id != expected_id or any(bar.interval != self.interval for bar in self.bars)
                 or tuple(bar.bar_end for bar in self.bars) != tuple(sorted(bar.bar_end for bar in self.bars))
                 or any(bar.session_date != self.session_date for bar in self.bars)
@@ -147,7 +164,7 @@ class CanonicalStockSignal(Contract):
             raise ValueError("canonical stock signal daily ATR lineage mismatch")
         closes = tuple(bar.close for bar in self.bars)
         upper, lower = self.prior_close + self.threshold, self.prior_close - self.threshold
-        if self.detector_id == "S1":
+        if self.detector_id in ("S1", "OS1"):
             valid_pattern = lower <= closes[0] <= upper and (
                 self.direction == 1 and closes[1] > upper or self.direction == -1 and closes[1] < lower)
         else:
@@ -188,10 +205,20 @@ def _atr14(daily: tuple[tuple[EquityBarRevision, datetime], ...]):
 def detect_canonical_stock_signals(*, security_id: UUID, underlyer: str,
                                    bars: tuple[tuple[EquityBarRevision, datetime], ...],
                                    market_cutoff: datetime, decision_at: datetime,
-                                   session_close: datetime) -> tuple[CanonicalStockSignal, ...]:
+                                   session_close: datetime,
+                                   detector_ids: tuple[str, str] = ("S1", "S2"),
+                                   ) -> tuple[CanonicalStockSignal, ...]:
     if (market_cutoff.utcoffset() is None or decision_at.utcoffset() is None
             or session_close.utcoffset() is None or market_cutoff > decision_at):
         raise ValueError("canonical stock signal requires causal aware cutoffs")
+    if detector_ids == ("S1", "S2"):
+        policy = STOCK_BAR_SIGNAL_POLICY
+        policy_sha256 = STOCK_BAR_SIGNAL_POLICY_SHA256
+    elif detector_ids == ("OS1", "OS2"):
+        policy = ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY
+        policy_sha256 = ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY_SHA256
+    else:
+        raise ValueError("canonical stock signal detector family is invalid")
     eligible = []
     signal_session = market_cutoff.astimezone(ZoneInfo("America/New_York")).date()
     for bar, created_at in bars:
@@ -225,9 +252,9 @@ def detect_canonical_stock_signals(*, security_id: UUID, underlyer: str,
     threshold = prior_atr * Decimal("0.5")
     upper, lower = prior_close + threshold, prior_close - threshold
     outputs = []
-    for detector_id, required in (("S1", 2), ("S2", 3)):
+    for detector_id, required in zip(detector_ids, (2, 3)):
         selected = None
-        for interval in STOCK_BAR_SIGNAL_POLICY["timeframe_precedence"]:
+        for interval in policy["timeframe_precedence"]:
             values = sorted(((bar, created) for bar, created in eligible
                 if bar.interval == interval and bar.session_date == signal_session), key=lambda value: value[0].bar_end)
             if len(values) >= required:
@@ -237,7 +264,7 @@ def detect_canonical_stock_signals(*, security_id: UUID, underlyer: str,
             continue
         closes = tuple(value[0].close_price for value in selected)
         direction = None
-        if detector_id == "S1":
+        if detector_id in ("S1", "OS1"):
             if lower <= closes[0] <= upper and closes[1] > upper:
                 direction = 1
             elif lower <= closes[0] <= upper and closes[1] < lower:
@@ -254,13 +281,14 @@ def detect_canonical_stock_signals(*, security_id: UUID, underlyer: str,
             continue
         points = tuple(_point(bar, created) for bar, created in selected)
         available_at = max(max(point.system_observed_at, point.created_at) for point in points)
-        valid_until = min(points[-1].bar_end + timedelta(seconds=STOCK_BAR_SIGNAL_POLICY["maximum_validity_seconds"]), session_close)
+        valid_until = min(points[-1].bar_end + timedelta(seconds=policy["maximum_validity_seconds"]), session_close)
         if decision_at >= valid_until:
             continue
         signal_id = uuid5(NAMESPACE_URL, ":".join(("canonical-stock-signal",
-            STOCK_BAR_SIGNAL_POLICY_SHA256, detector_id, str(security_id),
+            policy_sha256, detector_id, str(security_id),
             signal_session.isoformat(), str(direction), str(points[-1].bar_revision_id))))
         outputs.append(CanonicalStockSignal(signal_id=signal_id, detector_id=detector_id,
+            policy_sha256=policy_sha256,
             security_id=security_id, underlyer=underlyer, direction=direction,
             interval=points[-1].interval, session_date=signal_session,
             prior_close=prior_close, prior_atr14=prior_atr, threshold=threshold,

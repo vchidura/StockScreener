@@ -154,8 +154,8 @@ def _policy():
         maximum_option_quote_contracts=1_000,
         reserved_option_quote_contracts=998,
         required_detectors=(
-            DetectorFamily.S1,
-            DetectorFamily.S2,
+            DetectorFamily.OS1,
+            DetectorFamily.OS2,
             DetectorFamily.O1,
             DetectorFamily.O3,
         ),

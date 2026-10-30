@@ -1,0 +1,117 @@
+{
+  "security": {
+    "security_id": "11111111-1111-4111-8111-111111111111",
+    "ticker": "TEST",
+    "exchange": "XNYS",
+    "currency": "USD"
+  },
+  "adjustment": {
+    "basis": "RAW",
+    "action_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "version": "frozen_action_coverage_v1"
+  },
+  "model": {
+    "model_id": "completed_bar_breakout_reference",
+    "version": "1",
+    "style": "INTRADAY",
+    "origin": "COMPLETED_BAR",
+    "policy_sha256": "327ff5383844db51034cce7073f05fab42a5fec8a9a95c3f26833d9a0200dfe6"
+  },
+  "bars": [
+    {
+      "source": {
+        "security_id": "11111111-1111-4111-8111-111111111111",
+        "source_id": "frozen-bar-1",
+        "revision": "1",
+        "payload_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "clocks": {
+        "market_start": "2026-10-23T14:00:00Z",
+        "market_end": "2026-10-23T14:05:00Z",
+        "available_at": "2026-10-23T14:05:01Z",
+        "received_at": "2026-10-23T14:05:02Z"
+      },
+      "adjustment": {
+        "basis": "RAW",
+        "action_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "version": "frozen_action_coverage_v1"
+      },
+      "interval": "5m",
+      "open": "100", "high": "102", "low": "99", "close": "101", "volume": "100",
+      "completed": true
+    },
+    {
+      "source": {
+        "security_id": "11111111-1111-4111-8111-111111111111",
+        "source_id": "frozen-bar-2",
+        "revision": "1",
+        "payload_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "clocks": {
+        "market_start": "2026-10-23T14:05:00Z",
+        "market_end": "2026-10-23T14:10:00Z",
+        "available_at": "2026-10-23T14:10:01Z",
+        "received_at": "2026-10-23T14:10:02Z"
+      },
+      "adjustment": {
+        "basis": "RAW",
+        "action_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "version": "frozen_action_coverage_v1"
+      },
+      "interval": "5m",
+      "open": "101", "high": "103", "low": "100", "close": "102", "volume": "100",
+      "completed": true
+    },
+    {
+      "source": {
+        "security_id": "11111111-1111-4111-8111-111111111111",
+        "source_id": "frozen-bar-3",
+        "revision": "1",
+        "payload_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "clocks": {
+        "market_start": "2026-10-23T14:10:00Z",
+        "market_end": "2026-10-23T14:15:00Z",
+        "available_at": "2026-10-23T14:15:01Z",
+        "received_at": "2026-10-23T14:15:02Z"
+      },
+      "adjustment": {
+        "basis": "RAW",
+        "action_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "version": "frozen_action_coverage_v1"
+      },
+      "interval": "5m",
+      "open": "102", "high": "105", "low": "101", "close": "104", "volume": "200",
+      "completed": true
+    }
+  ],
+  "events": [
+    {
+      "source": {
+        "security_id": "11111111-1111-4111-8111-111111111111",
+        "source_id": "frozen-event-1", "revision": "1",
+        "payload_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "clocks": {
+        "market_start": "2026-10-23T14:00:00Z", "market_end": "2026-10-23T14:00:00Z",
+        "available_at": "2026-10-23T14:00:01Z", "received_at": "2026-10-23T14:00:02Z"
+      },
+      "event_kind": "EVENT_COVERAGE", "value": "CLEAR", "completed": true
+    }
+  ],
+  "context": {
+    "source": {
+      "security_id": "11111111-1111-4111-8111-111111111111",
+      "source_id": "frozen-context-1", "revision": "1",
+      "payload_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    "clocks": {
+      "market_start": "2026-10-23T14:00:00Z", "market_end": "2026-10-23T14:00:00Z",
+      "available_at": "2026-10-23T14:00:01Z", "received_at": "2026-10-23T14:00:02Z"
+    },
+    "market_trend": "0.01", "sector_trend": "0.02", "event_risk": false
+  },
+  "market_cutoff": "2026-10-23T14:15:00Z",
+  "decision_at": "2026-10-23T14:15:03Z",
+  "prior_state": null
+}

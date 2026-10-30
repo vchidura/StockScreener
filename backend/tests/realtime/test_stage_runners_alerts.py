@@ -9,6 +9,9 @@ from uuid import uuid4
 import pytest
 
 import realtime.stage_runners_alerts as runners
+from realtime.canonical_stock_alert_repository import (
+    CanonicalStockAlertBatchUnavailable,
+)
 from realtime.database_access_v2 import WriteFenceRejected
 from realtime.preflight import ProviderTier
 from realtime.runner_environment import RunnerEnvironment
@@ -17,6 +20,14 @@ from realtime.stock_alert_repository import RetainedForwardState
 from tests.realtime.test_stage_runners_equity import NOW, SESSION, _context, _Database, _receipt_row
 
 SNAPSHOT = SimpleNamespace(payload={"missing_producers": {"replay": "x", "forward": "y"}})
+RETAINED_PROJECTION = {"contract": "test-retained-alert-projection"}
+
+
+def _alert_environment():
+    return RunnerEnvironment(
+        None,
+        stock_alert_projection_loader=lambda _known_by: RETAINED_PROJECTION,
+    )
 
 
 def _ready_context(generation=3, **options):
@@ -29,7 +40,7 @@ def _ready_context(generation=3, **options):
 def test_alerts_runner_fails_without_the_equity_cycle_receipt_and_computes_nothing(monkeypatch):
     monkeypatch.setattr(runners, "compute_realtime_stock_alerts", lambda *a, **k: pytest.fail("no receipt"))
     context = replace(_context("STOCK_ALERTS"), database=_Database([None]))
-    outcome = runners.stock_alerts_runner(RunnerEnvironment(None))(context)
+    outcome = runners.stock_alerts_runner(_alert_environment())(context)
     assert outcome.state == "FAILED" and outcome.reason_codes == (runners.EQUITY_CYCLE_RECEIPT_MISSING,)
 
 
@@ -54,7 +65,7 @@ def test_split_catalog_alerts_require_input_ready(
         database=_Database([None]),
     )
     outcome = runners.stock_alerts_runner(
-        RunnerEnvironment(None)
+        _alert_environment()
     )(context)
     assert outcome.reason_codes == (
         runners.INPUT_READY_RECEIPT_MISSING,
@@ -64,10 +75,52 @@ def test_split_catalog_alerts_require_input_ready(
 def test_alerts_runner_blocks_without_a_ready_reference_generation(monkeypatch):
     monkeypatch.setattr(runners, "compute_realtime_stock_alerts", lambda *a, **k: pytest.fail("no generation"))
     context, database = _ready_context(generation=0)
-    outcome = runners.stock_alerts_runner(RunnerEnvironment(None))(context)
+    outcome = runners.stock_alerts_runner(_alert_environment())(context)
     assert outcome.state == "BLOCKED_POLICY" and outcome.reason_codes == (runners.REFERENCE_GENERATION_UNAVAILABLE,)
     assert "rt.seed_manifests" in database.cursor.statements[1][0]
     assert [role for role, _ in database.calls] == ["app", "app"]
+
+
+def test_alerts_runner_blocks_without_the_retained_results_source(monkeypatch):
+    monkeypatch.setattr(
+        runners,
+        "compute_realtime_stock_alerts",
+        lambda *a, **k: pytest.fail("no retained source"),
+    )
+    context, _ = _ready_context()
+
+    outcome = runners.stock_alerts_runner(
+        RunnerEnvironment(None)
+    )(context)
+
+    assert outcome.state == "BLOCKED_POLICY"
+    assert outcome.reason_codes == (
+        runners.STOCK_ALERTS_RETAINED_RESULTS_SOURCE_UNAVAILABLE,
+    )
+
+
+def test_alerts_runner_blocks_when_no_canonical_batch_is_bound_to_input_ready(monkeypatch):
+    monkeypatch.setattr(
+        runners,
+        "compute_realtime_stock_alerts",
+        lambda *a, **k: pytest.fail("unbound results cannot compute"),
+    )
+    context, _ = _ready_context()
+
+    def unavailable(_request):
+        raise CanonicalStockAlertBatchUnavailable("not bound")
+
+    outcome = runners.stock_alerts_runner(
+        RunnerEnvironment(
+            None,
+            stock_alert_projection_loader=unavailable,
+        )
+    )(context)
+
+    assert outcome.state == "BLOCKED_POLICY"
+    assert outcome.reason_codes == (
+        runners.STOCK_ALERTS_RETAINED_RESULTS_SOURCE_UNAVAILABLE,
+    )
 
 
 def test_alerts_runner_computes_read_only_then_publishes_under_the_publication_role(monkeypatch):
@@ -83,13 +136,14 @@ def test_alerts_runner_computes_read_only_then_publishes_under_the_publication_r
     monkeypatch.setattr(runners, "compute_realtime_stock_alerts", compute)
     monkeypatch.setattr(runners, "publish_realtime_stock_alerts", publish)
     context, database = _ready_context(generation=3)
-    outcome = runners.stock_alerts_runner(RunnerEnvironment(None))(context)
+    outcome = runners.stock_alerts_runner(_alert_environment())(context)
     assert outcome.state == "COMPLETE" and outcome.receipt is None
     assert outcome.reason_codes == ("MISSING_PRODUCER:forward", "MISSING_PRODUCER:replay")
     role, scope = seen["compute"]
     assert role == "COMPUTE"
     assert scope == dict(cohort_id=context.plan.cohort_id, session=SESSION, cutoff=NOW,
-                         known_by=context.window.deadline, source_generation=3)
+                         known_by=context.window.deadline, source_generation=3,
+                         retained_projection=RETAINED_PROJECTION)
     role, snapshot, options = seen["publish"]
     assert (role, snapshot) == ("PUBLICATION", SNAPSHOT)
     assert options["receipt"].cohort_id == context.plan.cohort_id and options["receipt"].cutoff == NOW
@@ -101,7 +155,7 @@ def test_a_snapshot_without_missing_producers_completes_clean(monkeypatch):
     monkeypatch.setattr(runners, "compute_realtime_stock_alerts", lambda *a, **k: SimpleNamespace(payload={}))
     monkeypatch.setattr(runners, "publish_realtime_stock_alerts", lambda *a, **k: None)
     context, _ = _ready_context()
-    outcome = runners.stock_alerts_runner(RunnerEnvironment(None))(context)
+    outcome = runners.stock_alerts_runner(_alert_environment())(context)
     assert outcome.state == "COMPLETE" and outcome.reason_codes == ()
 
 
@@ -115,7 +169,7 @@ def test_the_final_window_of_a_session_publishes_the_kept_release(monkeypatch):
                         lambda database, snapshot, **options: published.append(options))
     context = _context("STOCK_ALERTS", cutoff=close)
     context = replace(context, database=_Database([dict(_receipt_row(context), cutoff=close), (3,)]))
-    runners.stock_alerts_runner(RunnerEnvironment(None))(context)
+    runners.stock_alerts_runner(_alert_environment())(context)
     assert published[0]["session_close"] is True
 
 
@@ -126,7 +180,7 @@ def test_a_retained_forward_state_blocks_instead_of_replacing_the_release(monkey
     monkeypatch.setattr(runners, "compute_realtime_stock_alerts", refuse)
     monkeypatch.setattr(runners, "publish_realtime_stock_alerts", lambda *a, **k: pytest.fail("must not publish"))
     context, _ = _ready_context()
-    outcome = runners.stock_alerts_runner(RunnerEnvironment(None))(context)
+    outcome = runners.stock_alerts_runner(_alert_environment())(context)
     assert outcome.state == "BLOCKED_POLICY" and outcome.reason_codes == (runners.STOCK_ALERTS_RETAINED_FORWARD_STATE,)
 
 
@@ -141,12 +195,12 @@ def test_alerts_runner_stops_between_phases_when_the_stage_is_cancelled(monkeypa
 
     monkeypatch.setattr(runners, "compute_realtime_stock_alerts", compute)
     context, _ = _ready_context(cancelled=cancelled)
-    outcome = runners.stock_alerts_runner(RunnerEnvironment(None))(context)
+    outcome = runners.stock_alerts_runner(_alert_environment())(context)
     assert outcome.state == "FAILED" and outcome.reason_codes == (runners.STAGE_CANCELLED,) and published == []
 
     monkeypatch.setattr(runners, "compute_realtime_stock_alerts", lambda *a, **k: pytest.fail("cancelled"))
     context, _ = _ready_context(cancelled=cancelled)  # already cancelled before the compute phase
-    assert runners.stock_alerts_runner(RunnerEnvironment(None))(context).reason_codes == (runners.STAGE_CANCELLED,)
+    assert runners.stock_alerts_runner(_alert_environment())(context).reason_codes == (runners.STAGE_CANCELLED,)
 
 
 @pytest.mark.parametrize("error", [StageCancelled("abandoned"), WriteFenceRejected("fenced")])
@@ -157,7 +211,7 @@ def test_a_rejected_publication_write_is_a_cancelled_failure_not_a_crash(monkeyp
     monkeypatch.setattr(runners, "compute_realtime_stock_alerts", lambda *a, **k: SNAPSHOT)
     monkeypatch.setattr(runners, "publish_realtime_stock_alerts", publish)
     context, _ = _ready_context()
-    outcome = runners.stock_alerts_runner(RunnerEnvironment(None))(context)
+    outcome = runners.stock_alerts_runner(_alert_environment())(context)
     assert outcome.state == "FAILED" and outcome.reason_codes == (runners.STAGE_CANCELLED,)
 
 

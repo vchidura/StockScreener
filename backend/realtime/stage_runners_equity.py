@@ -211,22 +211,21 @@ def input_ready_identity(
             gaps = tuple(cursor.fetchall())
             cursor.execute(
                 "SELECT DISTINCT ON ("
-                "current.instrument_id,current.interval,"
-                "current.adjustment_basis,current.session_scope"
+                "revision.instrument_id,revision.interval,"
+                "revision.adjustment_basis,revision.session_scope"
                 ") "
-                "current.instrument_id, current.interval, revision.bar_revision_id, "
+                "revision.instrument_id, revision.interval, revision.bar_revision_id, "
                 "revision.payload_sha256, revision.bar_end, revision.journal_generation, "
                 "revision.stream_session_id, revision.source_offset, revision.source_revision_ids, "
-                "current.adjustment_basis,current.session_scope "
-                "FROM rt.bar_current AS current "
-                "JOIN rt.bar_revisions AS revision ON revision.bar_revision_id=current.bar_revision_id "
-                "AND revision.observed_at=current.observed_at "
-                "WHERE current.cohort_id=%s AND current.provider_tier='MASSIVE_ADVANCED' "
-                "AND current.interval IN ('1m','5m','15m','30m','1h','1d') "
+                "revision.adjustment_basis,revision.session_scope "
+                "FROM rt.bar_revisions AS revision "
+                "WHERE revision.cohort_id=%s "
+                "AND revision.provider_tier='MASSIVE_ADVANCED' "
+                "AND revision.interval IN ('1m','5m','15m','30m','1h','1d') "
                 "AND revision.bar_end<=%s "
                 "AND revision.created_at<=%s "
-                "ORDER BY current.instrument_id,current.interval,"
-                "current.adjustment_basis,current.session_scope,"
+                "ORDER BY revision.instrument_id,revision.interval,"
+                "revision.adjustment_basis,revision.session_scope,"
                 "revision.bar_end DESC,revision.observed_at DESC,"
                 "revision.bar_revision_id DESC",
                 (str(cohort_id), cutoff, known_by),
@@ -366,6 +365,18 @@ def input_ready_identity(
             } | no_trade_instruments
             if covered != member_instruments:
                 raise ValueError(f"INPUT_READY requires exact Advanced {interval} finalizer heads")
+        identity_sources = {
+            "stream_sessions": tuple(
+                (*row[:7], row[8])
+                for row in stream_sessions
+            ),
+            "checkpoints": checkpoints,
+            "gaps": gaps,
+            "bar_heads": heads,
+            "finalizer_no_trade_instruments": tuple(
+                sorted(no_trade_instruments)
+            ),
+        }
     else:
         if advanced_input_gate_sha256 is not None:
             raise ValueError(
@@ -386,6 +397,7 @@ def input_ready_identity(
             for row in sources
         ):
             raise ValueError("INPUT_READY source coverage is incomplete or unsealed")
+        identity_sources = sources
     universe_sha256 = scope[6]
     input_sha256 = canonical_sha256({
         "contract": (
@@ -401,7 +413,7 @@ def input_ready_identity(
         "members": members,
         "identity_continuity": identity_continuity,
         "reference_seeds": seeds,
-        "sources": sources,
+        "sources": identity_sources,
         "advanced_input_gate_sha256": advanced_input_gate_sha256,
     })
     return universe_sha256, input_sha256

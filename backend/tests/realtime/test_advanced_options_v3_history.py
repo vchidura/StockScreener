@@ -29,8 +29,15 @@ TARGET_COHORT_ID = UUID("11111111-2222-3333-4444-555555555555")
 
 
 class Cursor:
-    def __init__(self, *, missing=None, manifest_sha256=None):
+    def __init__(
+        self,
+        *,
+        missing=None,
+        manifest_sha256=None,
+        include_older_raw=False,
+    ):
         self.missing = missing
+        self.include_older_raw = include_older_raw
         self.manifest_sha256 = (
             manifest_sha256
             or ADVANCED_OPTIONS_V3_HISTORY_SOURCE_MANIFEST_SHA256
@@ -74,18 +81,28 @@ class Cursor:
                         ADVANCED_OPTIONS_V3_HISTORY_SECURITY_IDS[ticker]
                     ),
                     "session_date": session,
+                    "adjustment_basis": basis,
                     "bar_revision_id": str(uuid5(
                         NAMESPACE_URL,
-                        f"{ticker}:{session}",
+                        f"{ticker}:{basis}:{session}",
                     )),
                     "observed_at": KNOWN_AT,
                     "payload_sha256": canonical_sha256(
-                        (ticker, session)
+                        (ticker, basis, session)
                     ),
                 }
                 for ticker in ("QQQ", "SPY")
-                for session in sessions
-                if (ticker, session) != self.missing
+                for basis, selected_sessions in (
+                    ("ADJUSTED", sessions),
+                    (
+                        "RAW_UNADJUSTED",
+                        sessions
+                        if self.include_older_raw
+                        else sessions[-15:],
+                    ),
+                )
+                for session in selected_sessions
+                if (ticker, basis, session) != self.missing
             ]
             return
         raise AssertionError(statement)
@@ -122,11 +139,14 @@ def test_exact_adjusted_h_binding_freezes_members_and_clocks():
     assert verified.evidence["coverage"]["session_count"] == 31
     assert verified.evidence["coverage"][
         "adjustment_basis"
-    ] == "ADJUSTED"
+    ] == ["ADJUSTED", "RAW_UNADJUSTED"]
     assert verified.evidence["coverage"][
         "raw_daily_sessions_required"
-    ] == 0
-    assert verified.evidence["coverage"]["raw_members_bound"] == []
+    ] == 15
+    assert verified.evidence["coverage"]["raw_members_bound"] == [
+        "QQQ",
+        "SPY",
+    ]
     assert set(verified.evidence["coverage"]["symbols"]) == {
         "QQQ",
         "SPY",
@@ -138,6 +158,13 @@ def test_exact_adjusted_h_binding_freezes_members_and_clocks():
     ) == verified.binding
 
 
+def test_older_raw_history_does_not_expand_exact_h_membership():
+    expected = _load()
+    with_older_raw = _load(Cursor(include_older_raw=True))
+
+    assert with_older_raw == expected
+
+
 def test_missing_h_coverage_is_not_reported_as_identity_drift():
     missing = OptionExchangeCalendar().trailing_sessions_before(
         SESSION_DATE,
@@ -146,9 +173,9 @@ def test_missing_h_coverage_is_not_reported_as_identity_drift():
 
     with pytest.raises(
         AdvancedOptionsHistoryCoverageError,
-        match="adjusted daily coverage is missing",
+        match="adjusted/raw daily coverage is missing",
     ):
-        _load(Cursor(missing=("QQQ", missing)))
+        _load(Cursor(missing=("QQQ", "ADJUSTED", missing)))
 
 
 def test_h_manifest_divergence_is_an_identity_defect():

@@ -38,9 +38,14 @@ from realtime.advanced_options_p8_production import (  # noqa: E402
 )
 from realtime.advanced_options_p8_runtime import (  # noqa: E402
     P8ExecutionBundleStore,
+    build_p8_preopen_session_binding,
     check_p8_docker_service_health,
+    p8_preopen_session_binding_from_payload,
     run_p8_docker_service,
     validate_p8_execution_bundle,
+)
+from realtime.advanced_options_acquisition_runtime import (  # noqa: E402
+    acquisition_binding_from_payload,
 )
 from realtime.advanced_options_resident_barrier import (  # noqa: E402
     advanced_options_v3_session_status_cursor,
@@ -62,6 +67,7 @@ from realtime.advanced_options_v3_deployment import (  # noqa: E402
 )
 from realtime.advanced_options_v3_history import (  # noqa: E402
     AdvancedOptionsHistoryBindingIdentityError,
+    advanced_options_v3_history_binding_from_payload,
     verify_advanced_options_v3_history_binding_cursor,
 )
 from realtime.contracts import canonical_sha256  # noqa: E402
@@ -124,6 +130,17 @@ def parse_args(argv=None):
     prepare.add_argument("--output-directory", type=Path, required=True)
     prepare.add_argument("--execute", action="store_true")
 
+    waiting = subparsers.add_parser("prepare-waiting")
+    _add_database_scope(waiting)
+    waiting.add_argument("--package-source", type=Path, required=True)
+    waiting.add_argument(
+        "--acquisition-binding",
+        type=Path,
+        required=True,
+    )
+    waiting.add_argument("--output-directory", type=Path, required=True)
+    waiting.add_argument("--execute", action="store_true")
+
     residents = subparsers.add_parser("start-residents")
     _add_artifacts(residents)
     residents.add_argument(
@@ -160,6 +177,9 @@ def parse_args(argv=None):
         type=UUID,
         required=True,
     )
+    authorize.add_argument(
+        "--activity-evidence-sha256",
+    )
     authorize.add_argument("--execute", action="store_true")
 
     window = subparsers.add_parser("run-window")
@@ -181,6 +201,7 @@ def parse_args(argv=None):
         "bundle",
         "package_source",
         "production_binding",
+        "acquisition_binding",
         "live_observation",
         "output_directory",
         "docker_executable",
@@ -197,13 +218,14 @@ def parse_args(argv=None):
         if args.database != EXPECTED_V2_DATABASE_NAME:
             parser.error("V3 production targets stocks_realtime_v2")
     if (
-        args.command == "prepare"
+        args.command in {"prepare", "prepare-waiting"}
         and args.output_directory.exists()
     ):
         parser.error("--output-directory must be new")
     if (
         args.command in {
             "prepare",
+            "prepare-waiting",
             "start-residents",
             "authorize-window",
             "run-window",
@@ -223,6 +245,19 @@ def parse_args(argv=None):
             parser.error("authorize-window clocks or key are invalid")
         args.options_cutoff = args.options_cutoff.astimezone(UTC)
         args.window_deadline = args.window_deadline.astimezone(UTC)
+        if (
+            args.activity_evidence_sha256 is not None
+            and (
+                len(args.activity_evidence_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in args.activity_evidence_sha256
+                )
+            )
+        ):
+            parser.error(
+                "--activity-evidence-sha256 must be a SHA-256 digest"
+            )
     return args
 
 
@@ -554,6 +589,147 @@ def _compose(args, kinds) -> dict[str, object]:
     })
 
 
+def _prepare_waiting(args) -> dict[str, object]:
+    package = _load(args.package_source)
+    acquisition = acquisition_binding_from_payload(
+        _load(args.acquisition_binding)
+    )
+    authorities = package.get("v3_authorities")
+    session_payload = (
+        authorities.get("session_acquisition")
+        if isinstance(authorities, dict)
+        else None
+    )
+    session = session_acquisition_authorization_from_payload(
+        session_payload
+    )
+    history_value = package.get("v3_history_binding")
+    if (
+        acquisition.authority != session
+        or acquisition.authority.cohort_id
+        != UUID(str(package["cohort"]["cohort_id"]))
+        or acquisition.contract_tickers
+        != tuple(sorted(package.get("v3_admitted_contracts") or ()))
+        or not isinstance(history_value, dict)
+    ):
+        raise ValueError("V3 waiting preparation identity changed")
+    history = advanced_options_v3_history_binding_from_payload(
+        history_value.get("binding")
+    )
+    session_binding = build_p8_preopen_session_binding(
+        package=package,
+        acquisition_binding=acquisition,
+    )
+    provider, pool = _provider()
+    try:
+        with provider.transaction(APP_ROLE) as unit:
+            verified_history = (
+                verify_advanced_options_v3_history_binding_cursor(
+                    unit.cursor,
+                    binding=history,
+                    evidence=history_value.get("evidence"),
+                )
+            )
+            persist_session_acquisition_authorization_cursor(
+                unit.cursor,
+                session,
+            )
+            orchestration = package["orchestration"]
+            unit.cursor.execute(
+                "INSERT INTO rt.service_plans ("
+                "plan_id,cohort_id,session_date,stage_catalog_version,"
+                "enabled_stages,config_sha256,deadline,scope_reference"
+                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (plan_id) DO NOTHING",
+                (
+                    str(session_binding.plan_id),
+                    str(session_binding.cohort_id),
+                    session.session_date,
+                    orchestration["catalog_version"],
+                    list(orchestration["stage_order"]),
+                    session_binding.binding_sha256,
+                    session_binding.decision_stop,
+                    (
+                        "advanced-options-v3-waiting:"
+                        f"{session_binding.binding_id}"
+                    ),
+                ),
+            )
+            unit.cursor.execute(
+                "SELECT cohort_id::text,session_date,"
+                "stage_catalog_version,enabled_stages,config_sha256,"
+                "deadline,scope_reference FROM rt.service_plans "
+                "WHERE plan_id=%s",
+                (str(session_binding.plan_id),),
+            )
+            if unit.cursor.fetchone() != (
+                str(session_binding.cohort_id),
+                session.session_date,
+                orchestration["catalog_version"],
+                list(orchestration["stage_order"]),
+                session_binding.binding_sha256,
+                session_binding.decision_stop,
+                (
+                    "advanced-options-v3-waiting:"
+                    f"{session_binding.binding_id}"
+                ),
+            ):
+                raise ValueError(
+                    "V3 waiting service plan identity changed"
+                )
+            unit.cursor.execute(
+                "SELECT count(*) FROM "
+                "rt.advanced_options_window_cycle_authorizations "
+                "WHERE session_authorization_id=%s",
+                (str(session.authorization_id),),
+            )
+            if unit.cursor.fetchone()[0] != 0:
+                raise ValueError(
+                    "V3 waiting prepare refuses a prewritten cycle authority"
+                )
+    finally:
+        pool.closeall()
+    args.output_directory.mkdir()
+    package_path = args.output_directory / "PACKAGE.json"
+    bundle_path = args.output_directory / "SESSION-BUNDLE.json"
+    with package_path.open("xb") as stream:
+        stream.write(args.package_source.read_bytes())
+    store = P8ExecutionBundleStore(
+        bundle_path,
+        package=package,
+        package_path=package_path,
+        repository_root=REPOSITORY_ROOT,
+    )
+    bundle = store.write_waiting(
+        acquisition,
+        written_at=datetime.now(UTC),
+    )
+    validate_advanced_options_v3_runtime_identity(package, bundle)
+    report = _report({
+        "contract": "advanced-options-v3-waiting-prepare-v1",
+        "status": "READY_WAITING_FOR_E",
+        "package_sha256": package["package_sha256"],
+        "bundle_sha256": bundle["bundle_sha256"],
+        "session_binding_sha256": (
+            bundle["session_binding"]["binding_sha256"]
+        ),
+        "acquisition_binding_sha256": (
+            acquisition.binding_sha256
+        ),
+        "cohort_id": str(session.cohort_id),
+        "journal_generation": str(session.journal_generation),
+        "history_binding_sha256": (
+            verified_history.binding.binding_sha256
+        ),
+        "prewritten_cycle_authorities": 0,
+        "publication_authority": False,
+        "read_pin_authority": False,
+        "effects": dict(ZERO_EFFECTS),
+    })
+    _write_json(args.output_directory / "PREPARE-REPORT.json", report)
+    return report
+
+
 def _authorize_window(args) -> dict[str, object]:
     package = _load(args.package)
     bundle = validate_p8_execution_bundle(
@@ -561,21 +737,38 @@ def _authorize_window(args) -> dict[str, object]:
         args.bundle,
     )
     validate_advanced_options_v3_runtime_identity(package, bundle)
-    binding = p8_production_binding_from_payload(
-        bundle["production_binding"]
+    production_binding = bundle.get("production_binding")
+    binding = (
+        None
+        if production_binding is None
+        else p8_production_binding_from_payload(production_binding)
     )
     session = session_acquisition_authorization_from_payload(
         bundle["v3_authorities"]["session_acquisition"]
     )
+    if binding is None:
+        session_binding = p8_preopen_session_binding_from_payload(
+            bundle.get("session_binding")
+        )
+        history = advanced_options_v3_history_binding_from_payload(
+            package["v3_history_binding"]["binding"]
+        )
+        target_plan_id = session_binding.plan_id
+        target_cohort_id = session_binding.cohort_id
+        history_binding_sha256 = history.binding_sha256
+    else:
+        control = binding.enrollment.control_plane
+        target_plan_id = control.plan_id
+        target_cohort_id = control.cohort_id
+        history_binding_sha256 = binding.history.binding_sha256
     provider, pool = _provider()
     try:
-        control = binding.enrollment.control_plane
         window = PostgresOrchestrationRepository(
             provider
         ).ensure_window(
-            control.plan_id,
+            target_plan_id,
             WindowSpec(
-                cohort_id=control.cohort_id,
+                cohort_id=target_cohort_id,
                 provider_tier="MASSIVE_ADVANCED",
                 window_key=args.window_key.strip(),
                 release_at=args.options_cutoff,
@@ -589,7 +782,12 @@ def _authorize_window(args) -> dict[str, object]:
                 "receipt.receipt_kind,window.state,"
                 "receipt.reference_generation,receipt.universe_sha256,"
                 "receipt.input_sha256,receipt.build_id,"
-                "window.window_id::text,window.cohort_id::text "
+                "window.window_id::text,window.cohort_id::text,"
+                "(SELECT stage.state FROM rt.stage_runs AS stage "
+                "WHERE stage.window_id=receipt.window_id "
+                "AND stage.stage_id='EQUITY_MATERIALIZE' "
+                "ORDER BY stage.attempt DESC LIMIT 1) "
+                "AS materialize_state "
                 "FROM rt.cycle_receipts AS receipt "
                 "JOIN rt.window_runs AS window USING(window_id) "
                 "WHERE receipt.receipt_id=%s",
@@ -599,10 +797,10 @@ def _authorize_window(args) -> dict[str, object]:
             if (
                 equity_receipt is None
                 or str(equity_receipt[2]) != "INPUT_READY"
-                or str(equity_receipt[3]) != "COMPLETE"
+                or str(equity_receipt[10]) != "COMPLETE"
             ):
                 raise ValueError(
-                    "V3 authorize-window requires exact completed INPUT_READY"
+                    "V3 authorize-window requires exact materialized INPUT_READY"
                 )
             equity_plan = load_advanced_equity_control_plane_plan_cursor(
                 unit.cursor,
@@ -614,7 +812,7 @@ def _authorize_window(args) -> dict[str, object]:
                 )
             equity_input = build_advanced_options_equity_input_binding(
                 target_options_window_id=window.window_id,
-                target_cohort_id=control.cohort_id,
+                target_cohort_id=target_cohort_id,
                 source_cohort_id=equity_plan.cohort_id,
                 source_cohort_sha256=equity_plan.cohort_sha256,
                 source_manifest_id=equity_plan.manifest_id,
@@ -637,10 +835,10 @@ def _authorize_window(args) -> dict[str, object]:
                 session,
                 authorization_reference=args.authorization_reference,
                 target_window_id=window.window_id,
-                target_cohort_id=control.cohort_id,
+                target_cohort_id=target_cohort_id,
                 prepared_at=prepared_at,
                 history_binding_sha256=(
-                    binding.history.binding_sha256
+                    history_binding_sha256
                 ),
                 equity_binding_sha256=(
                     equity_input.binding_sha256
@@ -666,6 +864,15 @@ def _authorize_window(args) -> dict[str, object]:
                         args.equity_receipt_id
                     ),
                     "options_cutoff": options_cutoff,
+                    **(
+                        {}
+                        if args.activity_evidence_sha256 is None
+                        else {
+                            "activity_evidence_sha256": (
+                                args.activity_evidence_sha256
+                            )
+                        }
+                    ),
                 }),
                 build_id=equity_input.build_id,
                 publication_authorization_reference=(
@@ -710,6 +917,9 @@ def _authorize_window(args) -> dict[str, object]:
         "publication_authorization_reference": (
             authority.publication_authorization_reference
         ),
+        "activity_evidence_sha256": (
+            args.activity_evidence_sha256
+        ),
         "stored_reads": "NOT_AUTHORIZED",
         "effects": dict(ZERO_EFFECTS),
     })
@@ -722,9 +932,6 @@ def _status(args) -> dict[str, object]:
         args.bundle,
     )
     validate_advanced_options_v3_runtime_identity(package, bundle)
-    binding = p8_production_binding_from_payload(
-        bundle["production_binding"]
-    )
     session = session_acquisition_authorization_from_payload(
         bundle["v3_authorities"]["session_acquisition"]
     )
@@ -755,6 +962,8 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     if args.command == "prepare":
         result = _prepare(args)
+    elif args.command == "prepare-waiting":
+        result = _prepare_waiting(args)
     elif args.command == "start-residents":
         result = _compose(args, RESIDENT_KINDS)
     elif args.command == "authorize-window":

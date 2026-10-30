@@ -59,6 +59,7 @@ def test_database_state_not_report_files_controls_completion_and_retry():
             "stages_v3",
             COHORT,
             NOW + timedelta(minutes=5),
+            CUTOFF + timedelta(seconds=5),
         ),
     ))
 
@@ -76,7 +77,7 @@ def test_database_state_not_report_files_controls_completion_and_retry():
             "c" * 64,
         ),
     )
-    assert recovery.input_known_by == NOW + timedelta(minutes=5)
+    assert recovery.input_known_by == CUTOFF + timedelta(seconds=5)
     assert recovery.input_gate_sha256 == "c" * 64
 
 
@@ -99,6 +100,7 @@ def test_complete_durable_window_is_never_retried():
             "stages_v3",
             COHORT,
             NOW + timedelta(minutes=5),
+            CUTOFF + timedelta(seconds=5),
         ),
     ))
 

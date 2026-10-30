@@ -42,8 +42,8 @@ DEVELOPER_DETECTORS = (
     DetectorFamily.O1.value,
     DetectorFamily.O2.value,
     DetectorFamily.O3.value,
-    DetectorFamily.S1.value,
-    DetectorFamily.S2.value,
+    DetectorFamily.OS1.value,
+    DetectorFamily.OS2.value,
 )
 
 
@@ -262,8 +262,8 @@ def produce_developer_cycle_values(
                 else False
             )
             if invocation.detector_id in {
-                DetectorFamily.S1.value,
-                DetectorFamily.S2.value,
+                DetectorFamily.OS1.value,
+                DetectorFamily.OS2.value,
             }:
                 selected_stock = selected_stock or selected
                 stock_observations.append({

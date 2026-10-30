@@ -471,8 +471,8 @@ class AdvancedOptionsDockerServicePort:
             or labels.get("com.docker.compose.service")
             != handle.service_name
             or not isinstance(restart, dict)
-            or restart.get("Name") != "no"
-            or restart.get("MaximumRetryCount") != 0
+            or restart.get("Name") != "on-failure"
+            or restart.get("MaximumRetryCount") != 3
             or value.get("status") not in {"created", "running", "exited"}
             or type(value.get("running")) is not bool
         ):

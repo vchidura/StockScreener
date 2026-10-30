@@ -14,7 +14,7 @@ import time
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from psycopg2 import sql
 from psycopg2.extensions import make_dsn
@@ -28,6 +28,14 @@ for path in (BACKEND_DIR, TEST_SUPPORT):
         sys.path.insert(0, str(path))
 
 from realtime.contracts import canonical_sha256  # noqa: E402
+from realtime.advanced_options_acquisition_runtime import (  # noqa: E402
+    acquisition_binding_payload,
+    build_acquisition_binding,
+)
+from realtime.advanced_realtime_session_operations import (  # noqa: E402
+    build_diagnostic_authorization,
+    diagnostic_authorization_payload,
+)
 from realtime.advanced_options_control_plane import (  # noqa: E402
     CANONICAL_FLOW_OWNER,
     CANONICAL_INGRESS_OWNER,
@@ -42,17 +50,26 @@ from realtime.security_v2 import (  # noqa: E402
 from realtime.stage_graph import STAGE_CATALOG_VERSION_V5  # noqa: E402
 from realtime.advanced_options_p8_docker import P8_SERVICE_NAMES  # noqa: E402
 from realtime.advanced_options_p8_runtime import (  # noqa: E402
+    P8DownstreamBindingStore,
     P8_EFFECT_DENIALS,
     P8_EXECUTION_BUNDLE_SCHEMA,
+    build_p8_downstream_binding,
+    build_p8_preopen_session_binding,
+    p8_preopen_session_binding_from_payload,
+    p8_preopen_session_binding_payload,
 )
 from realtime.advanced_options_service import (  # noqa: E402
     AdvancedOptionsProcessKind,
-    OPTIONS_V3_STAGE_ORDER,
+    OPTIONS_PROJECTION_ONLY_STAGE_ORDER,
 )
 from realtime.advanced_options_v3_deployment import (  # noqa: E402
     ADVANCED_OPTIONS_V3_PROFILE_SHA256,
     ADVANCED_OPTIONS_V3_QUALIFICATION_STATE,
     advanced_options_v3_profile_payload,
+)
+from realtime.advanced_options_v3_authority import (  # noqa: E402
+    SessionAcquisitionAuthorization,
+    session_acquisition_authorization_payload,
 )
 from scripts.prepare_realtime_v2_docker_secrets import (  # noqa: E402
     _container_dsn,
@@ -64,10 +81,12 @@ from v2_database import disposable_v2_database  # noqa: E402
 
 UTC = timezone.utc
 SERVICES = {
+    "OPTIONS_ACQUISITION": "realtime-v3-options-acquisition",
     "INGRESS": "realtime-v2-options-p8-ingress",
     "MARKET_STATE": "realtime-v2-options-p8-market-state",
     "FLOW": "realtime-v2-options-p8-flow",
     "WINDOW": "realtime-v2-options-p8-window",
+    "CANONICAL_STOCK_ALERTS": "realtime-v2-canonical-stock-alerts",
 }
 QUALIFICATION_SCHEMA = (
     "advanced-options-v3-production-role-qualification-v1"
@@ -83,6 +102,7 @@ ZERO_EFFECTS = {
     "delivery": 0,
     "trading": 0,
 }
+SUFFIX_ENV = "STOCKS_V3_DOCKER_QUALIFICATION_SUFFIX"
 
 
 def parse_args(argv=None):
@@ -153,6 +173,33 @@ def _docker(*args, environment=None, timeout=120) -> str:
         timeout=timeout,
     )
     return result.stdout.decode("utf-8").strip()
+
+
+def _assert_image_binding(args) -> dict[str, str]:
+    try:
+        labels = json.loads(_docker(
+            "image",
+            "inspect",
+            "--format",
+            "{{json .Config.Labels}}",
+            args.image_id,
+        ))
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("candidate image labels are invalid") from exc
+    expected = {
+        "com.stockscreener.source-semantic-sha256": (
+            args.qualification_semantic_sha256
+        ),
+        "com.stockscreener.session-date": args.session_date.isoformat(),
+    }
+    if not isinstance(labels, dict) or any(
+        labels.get(name) != value
+        for name, value in expected.items()
+    ):
+        raise RuntimeError(
+            "candidate image is not bound to the qualified source and session"
+        )
+    return labels
 
 
 def _write_json(path: Path, value) -> None:
@@ -243,7 +290,7 @@ def _seed(pool, *, session_date: date, suffix: str):
                         str(cohort_id),
                         session_date,
                         STAGE_CATALOG_VERSION_V5,
-                        list(OPTIONS_V3_STAGE_ORDER),
+                        list(OPTIONS_PROJECTION_ONLY_STAGE_ORDER),
                         digest("service"),
                         now + timedelta(minutes=10),
                         f"OWNED_V3_DOCKER_REHEARSAL:{suffix}",
@@ -331,16 +378,23 @@ def _drop_login(settings, login: str) -> None:
         connection.commit()
 
 
-def _override() -> dict[str, object]:
-    return {
+def _override(
+    *,
+    environment: dict[str, str],
+    diagnostic_path: Path,
+) -> dict[str, object]:
+    value = {
         "services": {
             service: {
                 "environment": {
+                    "REALTIME_V3_VALIDATION_MODE": (
+                        "DEVELOPMENT_DIAGNOSTIC"
+                    ),
                     "REALTIME_V3_PROVIDER_FREE_QUALIFICATION": "ENABLED",
                 },
                 "healthcheck": {
                     "interval": "2s",
-                    "timeout": "5s",
+                    "timeout": "15s",
                     "retries": 45,
                     "start_period": "2s",
                 },
@@ -348,14 +402,61 @@ def _override() -> dict[str, object]:
             for service in SERVICES.values()
         },
     }
+    canonical = value["services"][
+        SERVICES["CANONICAL_STOCK_ALERTS"]
+    ]
+    canonical["environment"][
+        "REALTIME_V3_DIAGNOSTIC_AUTHORIZATION_ID"
+    ] = environment["REALTIME_V3_DIAGNOSTIC_AUTHORIZATION_ID"]
+    canonical["command"] = _expected_command(
+        "CANONICAL_STOCK_ALERTS",
+        environment,
+    )
+    canonical["volumes"] = [
+        f"{diagnostic_path}:/run/diagnostic/authorization.json:ro"
+    ]
+    canonical["healthcheck"]["test"] = [
+        "CMD",
+        "python",
+        "-B",
+        "scripts/run_realtime_v2_container.py",
+        "--component",
+        "canonical-stock-alerts",
+        "--app-dsn-file",
+        "/run/secrets/realtime_v2_app_dsn",
+        "--",
+        "python",
+        "-B",
+        "scripts/run_realtime_v2_canonical_stock_alerts.py",
+        "--database",
+        "stocks_realtime_v2",
+        "--confirm-database-name",
+        "stocks_realtime_v2",
+        "--cohort-id",
+        environment["REALTIME_V2_ADVANCED_COHORT_ID"],
+        "--session-date",
+        environment["REALTIME_V2_ADVANCED_SESSION_DATE"],
+        "--operation",
+        "DIAGNOSTIC_NON_SERVING",
+        "--diagnostic-authorization",
+        "/run/diagnostic/authorization.json",
+        "--health",
+    ]
+    return value
 
 
-def _expected_command(role: str) -> list[str]:
+def _expected_command(
+    role: str,
+    environment: dict[str, str] | None = None,
+) -> list[str]:
+    values = os.environ if environment is None else environment
     component = {
+        "OPTIONS_ACQUISITION": "options-v3-acquisition",
         "INGRESS": "options-p8-ingress",
         "MARKET_STATE": "options-p8-market-state",
         "FLOW": "options-p8-flow",
         "WINDOW": "options-p8-window",
+        "CANONICAL_STOCK_ALERTS": "canonical-stock-alerts",
     }[role]
     command = [
         "python",
@@ -366,11 +467,72 @@ def _expected_command(role: str) -> list[str]:
         "--app-dsn-file",
         "/run/secrets/realtime_v2_app_dsn",
     ]
-    if role == "INGRESS":
+    if role == "OPTIONS_ACQUISITION":
         command.extend([
             "--provider-key-file",
             "/run/secrets/realtime_v2_provider_key",
+            "--",
+            "python",
+            "-B",
+            "-u",
+            "scripts/run_advanced_options_v3_acquisition.py",
+            "run",
+            "--database",
+            "stocks_realtime_v2",
+            "--confirm-database-name",
+            "stocks_realtime_v2",
+            "--binding",
+            "/run/advanced-options-acquisition/binding.json",
+            "--journal-root",
+            "/var/lib/realtime-v2-advanced",
+            "--status-path",
+            "/var/lib/realtime-v2-reports/options-acquisition-status.json",
+            "--lock-path",
+            "/var/lib/realtime-v2-advanced/options-acquisition-provider.lock",
+            "--continuous",
+            "--execute",
         ])
+        return command
+    if role == "CANONICAL_STOCK_ALERTS":
+        command.extend([
+            "--",
+            "python",
+            "-B",
+            "-u",
+            "scripts/run_realtime_v2_canonical_stock_alerts.py",
+            "--database",
+            "stocks_realtime_v2",
+            "--confirm-database-name",
+            "stocks_realtime_v2",
+            "--cohort-id",
+            values.get(
+                "REALTIME_V2_ADVANCED_COHORT_ID",
+                "00000000-0000-0000-0000-000000000000",
+            ),
+            "--session-date",
+            values.get(
+                "REALTIME_V2_ADVANCED_SESSION_DATE",
+                "2000-01-03",
+            ),
+            "--operation",
+            (
+                "DIAGNOSTIC_NON_SERVING"
+                if values.get(
+                    "REALTIME_V3_DIAGNOSTIC_AUTHORIZATION_ID"
+                )
+                else "PRIMARY_SERVING"
+            ),
+        ])
+        if values.get("REALTIME_V3_DIAGNOSTIC_AUTHORIZATION_ID"):
+            command.extend([
+                "--diagnostic-authorization",
+                "/run/diagnostic/authorization.json",
+            ])
+        command.extend([
+            "--continuous",
+            "--execute",
+        ])
+        return command
     command.extend([
         "--",
         "python",
@@ -402,6 +564,10 @@ def _compose_args(
         project,
         "--profile",
         "realtime-v3-options",
+        "--profile",
+        "realtime-v3-options-acquisition",
+        "--profile",
+        "realtime-v2-advanced",
         *arguments,
     )
 
@@ -479,11 +645,12 @@ def _inspect_service(environment, override_path, project, service, role):
     if not isinstance(value, list) or len(value) != 1:
         raise RuntimeError(f"{service} inspect result is ambiguous")
     row = value[0]
-    expected = _expected_command(role)
+    expected = _expected_command(role, environment)
     if (
         row["Image"] != environment["REALTIME_V2_BACKEND_IMAGE"]
         or row["Config"]["Cmd"] != expected
-        or row["HostConfig"]["RestartPolicy"]["Name"] != "no"
+        or row["HostConfig"]["RestartPolicy"]
+        != {"Name": "on-failure", "MaximumRetryCount": 3}
         or row["State"]["Health"]["Status"] != "healthy"
         or row["Config"]["Labels"]["com.docker.compose.project"] != project
         or row["Config"]["Labels"]["com.docker.compose.service"] != service
@@ -530,7 +697,48 @@ def _role_status(container_id: str, role: str) -> dict[str, object]:
     raise RuntimeError(f"{role} production role evidence is incomplete")
 
 
-def _qualification_artifacts(seed, args):
+def _acquisition_status(container_id: str) -> dict[str, object]:
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        result = _run(
+            (
+                "docker",
+                "exec",
+                container_id,
+                "cat",
+                (
+                    "/var/lib/realtime-v2-reports/"
+                    "options-acquisition-status.json"
+                ),
+            ),
+            check=False,
+        )
+        if result.returncode == 0:
+            value = json.loads(result.stdout)
+            effects = value.get("forbidden_effects")
+            if (
+                value.get("state") == "READY"
+                and value.get("diagnostic") is True
+                and isinstance(effects, dict)
+                and set(effects.values()) == {0}
+            ):
+                return value
+        time.sleep(0.1)
+    raise RuntimeError(
+        "Options acquisition role evidence is incomplete"
+    )
+
+
+def _qualification_artifacts(
+    seed,
+    args,
+    acquisition_binding=None,
+):
+    if acquisition_binding is None:
+        acquisition_binding = _qualification_acquisition_binding(
+            seed,
+            args,
+        )
     now = datetime.now(UTC)
     nonce = uuid4()
     cohort_id = seed["cohort_id"]
@@ -587,22 +795,26 @@ def _qualification_artifacts(seed, args):
                 "O3": "BLOCKED",
             },
             "restart": "REHYDRATED",
+            "projection": {
+                "equity_terminal_receipt": "PORTAL_READY",
+                "options_terminal_receipt": "OPTIONS_PORTAL_READY",
+            },
             "publication": {
-                "pointer_advances": 1,
-                "idempotent": True,
-                "rollback": True,
-                "duplicate_alerts": 0,
-                "duplicate_publications": 0,
+                "release_created": False,
+                "pointer_advanced": False,
+                "read_pin_enabled": False,
+                "normal_portal_serving": False,
             },
         },
     }
     orchestration = {
         "plan_id": seed["plan_id"],
         "catalog_version": STAGE_CATALOG_VERSION_V5,
-        "stage_order": list(OPTIONS_V3_STAGE_ORDER),
+        "stage_order": list(OPTIONS_PROJECTION_ONLY_STAGE_ORDER),
     }
     package = {
         "schema": "advanced-options-v3-production-qualification-package-v1",
+        "validation_mode": "DEVELOPMENT_DIAGNOSTIC",
         "package_nonce": str(nonce),
         "window": {
             "session_date": session_date,
@@ -627,7 +839,16 @@ def _qualification_artifacts(seed, args):
             "window_role_authorized": True,
             "qualification_verdict": "PASS",
         },
-        "v3_authorities": None,
+        "v3_authorities": {
+            "session_acquisition": (
+                session_acquisition_authorization_payload(
+                    acquisition_binding.authority
+                )
+            ),
+        },
+        "v3_admitted_contracts": list(
+            acquisition_binding.contract_tickers
+        ),
         "provider_free_qualification": qualification,
         "effects": dict(ZERO_EFFECTS),
     }
@@ -642,17 +863,23 @@ def _qualification_artifacts(seed, args):
         )
         for row in owners
     }
+    session_binding = build_p8_preopen_session_binding(
+        package=package,
+        acquisition_binding=acquisition_binding,
+    )
     bundle = {
         "schema": P8_EXECUTION_BUNDLE_SCHEMA,
+        "validation_mode": "DEVELOPMENT_DIAGNOSTIC",
         "package_sha256": package["package_sha256"],
         "package_nonce": str(nonce),
         "package_path": "/run/advanced-options-p8/package.json",
         "window": dict(package["window"]),
         "cohort_id": cohort_id,
         "plan_id": seed["plan_id"],
-        "window_id": seed["window_id"],
+        "window_id": None,
         "orchestration": orchestration,
-        "v3_authorities": None,
+        "v3_authorities": dict(package["v3_authorities"]),
+        "v3_authority_references": None,
         "written_at_utc": now.isoformat(),
         "services": [
             {
@@ -664,15 +891,17 @@ def _qualification_artifacts(seed, args):
             }
             for row in owners
         ],
-        "enrollment": {},
-        "history_binding": {},
-        "equity_input_binding": dict(
-            package["equity_input_binding"]
+        "session_binding": p8_preopen_session_binding_payload(
+            session_binding
         ),
-        "underlying_price_binding": {},
-        "production_binding": {
-            "control": {"option_underlyings": ["QQQ", "SPY"]},
-        },
+        "acquisition_binding": acquisition_binding_payload(
+            acquisition_binding
+        ),
+        "enrollment": None,
+        "history_binding": None,
+        "equity_input_binding": None,
+        "underlying_price_binding": None,
+        "production_binding": None,
         "live_observation_sha256": canonical_sha256({
             "transport": "LOOPBACK_WS",
             "provider_effects": 0,
@@ -682,6 +911,285 @@ def _qualification_artifacts(seed, args):
     }
     bundle["bundle_sha256"] = canonical_sha256(bundle)
     return package, bundle
+
+
+def _qualification_acquisition_binding(seed, args):
+    now = datetime(
+        args.session_date.year,
+        args.session_date.month,
+        args.session_date.day,
+        13,
+        10,
+        tzinfo=UTC,
+    )
+    values = {
+        "authorization_reference": (
+            f"owned-docker-acquisition:{seed['cohort_id']}"
+        ),
+        "cohort_id": UUID(str(seed["cohort_id"])),
+        "session_date": args.session_date,
+        "prepared_at": now - timedelta(minutes=2),
+        "acquisition_start": now - timedelta(minutes=1),
+        "capture_boundary": now + timedelta(minutes=1),
+        "acquisition_stop": now + timedelta(minutes=10),
+        "admission_id": uuid5(
+            NAMESPACE_URL,
+            f"owned-docker-admission:{seed['cohort_id']}",
+        ),
+        "admission_sha256": canonical_sha256({
+            "cohort_id": seed["cohort_id"],
+            "contracts": (
+                "O:QQQ261023C00350000",
+                "O:QQQ261023P00350000",
+                "O:SPY261023C00600000",
+                "O:SPY261023P00600000",
+            ),
+        }),
+        "readiness_sha256": canonical_sha256({
+            "cohort_id": seed["cohort_id"],
+            "state": "READY",
+        }),
+        "slot_set_member_sha256": canonical_sha256({
+            "contracts": (
+                "O:QQQ261023C00350000",
+                "O:QQQ261023P00350000",
+                "O:SPY261023C00600000",
+                "O:SPY261023P00600000",
+            ),
+            "channels": ("T", "Q"),
+        }),
+        "provider_budget_sha256": canonical_sha256({
+            "requests": 0,
+            "provider_socket": 1,
+        }),
+        "socket_budget_sha256": canonical_sha256({
+            "connection_attempts": 3,
+            "decoded_messages": 100,
+            "decoded_bytes": 1_048_576,
+        }),
+        "journal_generation": UUID(str(seed["journal_generation"])),
+        "journal_identity_sha256": canonical_sha256({
+            "journal_generation": seed["journal_generation"],
+            "normalizer": "massive_market_event_v6",
+        }),
+    }
+    unsigned = SessionAcquisitionAuthorization.__new__(
+        SessionAcquisitionAuthorization
+    )
+    object.__setattr__(unsigned, "authorization_id", UUID(int=1))
+    object.__setattr__(unsigned, "authorization_sha256", "0" * 64)
+    for name, value in values.items():
+        object.__setattr__(unsigned, name, value)
+    digest = canonical_sha256(
+        session_acquisition_authorization_payload(
+            unsigned,
+            include_identity=False,
+        )
+    )
+    authority = SessionAcquisitionAuthorization(
+        authorization_id=uuid5(
+            NAMESPACE_URL,
+            f"stockscreener:options-session-acquisition:{digest}",
+        ),
+        authorization_sha256=digest,
+        **values,
+    )
+    return build_acquisition_binding(
+        source_sha256=args.qualification_semantic_sha256,
+        backend_image_id=getattr(
+            args,
+            "image_id",
+            f"sha256:{'c' * 64}",
+        ),
+        authority=authority,
+        contract_tickers=(
+            "O:QQQ261023C00350000",
+            "O:QQQ261023P00350000",
+            "O:SPY261023C00600000",
+            "O:SPY261023P00600000",
+        ),
+        connection_attempt_ceiling=3,
+        decoded_message_ceiling=100,
+        decoded_byte_ceiling=1_048_576,
+    )
+
+
+def _attach_qualification_downstream_bindings(
+    directory,
+    bundle,
+    seed,
+    args,
+):
+    session_binding = p8_preopen_session_binding_from_payload(
+        bundle["session_binding"]
+    )
+    store = P8DownstreamBindingStore(
+        directory,
+        session_binding=session_binding,
+    )
+    previous = None
+    attached = []
+    for sequence, window_id in enumerate(seed["window_ids"], start=1):
+        equity_cutoff = datetime(
+            args.session_date.year,
+            args.session_date.month,
+            args.session_date.day,
+            13,
+            30 + (sequence * 5),
+            tzinfo=UTC,
+        )
+        options_cutoff = equity_cutoff + timedelta(seconds=120)
+        receipt_id = uuid5(
+            NAMESPACE_URL,
+            f"owned-docker-equity-receipt:{window_id}",
+        )
+        input_sha256 = canonical_sha256({
+            "window_id": window_id,
+            "kind": "INPUT_READY",
+        })
+        history_sha256 = "4" * 64
+        equity_binding_sha256 = canonical_sha256({
+            "window_id": window_id,
+            "receipt_id": str(receipt_id),
+        })
+        production = {
+            "schema": "advanced-options-p8-production-binding-v3",
+            "window_id": str(window_id),
+            "control": {
+                "receipt_inputs": {
+                    "cutoff": options_cutoff.isoformat(),
+                },
+            },
+            "history_binding": {
+                "binding_sha256": history_sha256,
+            },
+            "equity_input_binding": {
+                "equity_receipt_id": str(receipt_id),
+                "input_sha256": input_sha256,
+                "equity_cutoff": equity_cutoff.isoformat(),
+                "binding_sha256": equity_binding_sha256,
+            },
+        }
+        production["binding_sha256"] = canonical_sha256(production)
+        binding = build_p8_downstream_binding(
+            session_binding=session_binding,
+            sequence=sequence,
+            previous_binding_sha256=previous,
+            target_window_id=UUID(str(window_id)),
+            equity_receipt_id=receipt_id,
+            equity_input_sha256=input_sha256,
+            finalized_cutoff=equity_cutoff,
+            receipt_created_at=(
+                equity_cutoff + timedelta(seconds=30)
+            ),
+            options_cutoff=options_cutoff,
+            history_binding_sha256=history_sha256,
+            equity_binding_sha256=equity_binding_sha256,
+            options_activity_evidence_sha256=canonical_sha256({
+                "window_id": window_id,
+                "kind": "OPTIONS_ACTIVITY",
+            }),
+            window_cycle_authorization_sha256=canonical_sha256({
+                "window_id": window_id,
+                "kind": "WINDOW_CYCLE_AUTHORITY",
+            }),
+            publication_authorization_reference=(
+                f"owned-docker-publication:{window_id}"
+            ),
+            production_binding=production,
+        )
+        store.attach(binding)
+        attached.append({
+            "sequence": sequence,
+            "binding_sha256": binding.binding_sha256,
+            "target_window_id": str(binding.target_window_id),
+        })
+        previous = binding.binding_sha256
+    return attached
+
+
+def _seed_acquisition_catalog(pool) -> None:
+    contracts = (
+        ("O:QQQ261023C00350000", "C", "350"),
+        ("O:QQQ261023P00350000", "P", "350"),
+        ("O:SPY261023C00600000", "C", "600"),
+        ("O:SPY261023P00600000", "P", "600"),
+    )
+    now = datetime.now(UTC)
+    connection = pool.getconn()
+    try:
+        with connection:
+            with connection.cursor() as cursor:
+                for underlyer in ("QQQ", "SPY"):
+                    cursor.execute(
+                        "INSERT INTO ref.securities ("
+                        "security_id,asset_type,source_origin,created_at"
+                        ") VALUES (%s,'ETF',"
+                        "'OWNED_DOCKER_QUALIFICATION',%s) "
+                        "ON CONFLICT DO NOTHING",
+                        (
+                            str(uuid5(
+                                NAMESPACE_URL,
+                                f"owned-docker-underlyer:{underlyer}",
+                            )),
+                            now,
+                        ),
+                    )
+                for index, (ticker, call_put, strike) in enumerate(
+                    contracts,
+                    start=1,
+                ):
+                    contract_id = 9_000_000 + index
+                    version_id = 9_100_000 + index
+                    instrument_id = 9_200_000 + index
+                    underlyer = ticker[2:5]
+                    cursor.execute(
+                        "INSERT INTO ref.option_contracts ("
+                        "contract_id,underlying_security_id,provider,"
+                        "contract_ticker,first_observed_at,source_origin"
+                        ") VALUES (%s,%s,'massive',%s,%s,"
+                        "'OWNED_DOCKER_QUALIFICATION')",
+                        (
+                            contract_id,
+                            str(uuid5(
+                                NAMESPACE_URL,
+                                f"owned-docker-underlyer:{underlyer}",
+                            )),
+                            ticker,
+                            now,
+                        ),
+                    )
+                    cursor.execute(
+                        "INSERT INTO ref.option_contract_versions ("
+                        "version_id,contract_id,call_put,expiration,"
+                        "strike,exercise_style,multiplier,deliverables,"
+                        "eligibility,effective_from,effective_to,"
+                        "observed_at,payload_sha256,imported_at"
+                        ") VALUES (%s,%s,%s,'2026-10-23',%s,"
+                        "'AMERICAN',100,'[]'::jsonb,'VALIDATED_ACTIVE',"
+                        "%s,NULL,%s,%s,%s)",
+                        (
+                            version_id,
+                            contract_id,
+                            call_put,
+                            strike,
+                            now,
+                            now,
+                            canonical_sha256({
+                                "ticker": ticker,
+                                "qualification": True,
+                            }),
+                            now,
+                        ),
+                    )
+                    cursor.execute(
+                        "INSERT INTO rt.instruments ("
+                        "instrument_id,asset_class,contract_id"
+                        ") VALUES (%s,'OPTION',%s)",
+                        (instrument_id, contract_id),
+                    )
+    finally:
+        pool.putconn(connection)
 
 
 def _seed_service_leases(pool, bundle) -> None:
@@ -747,7 +1255,7 @@ def _durable_evidence(pool, seed):
                 row[:3]
                 != (
                     STAGE_CATALOG_VERSION_V5,
-                    list(OPTIONS_V3_STAGE_ORDER),
+                    list(OPTIONS_PROJECTION_ONLY_STAGE_ORDER),
                     "COMPLETE",
                 )
                 for row in windows
@@ -790,7 +1298,15 @@ def _durable_evidence(pool, seed):
 
 
 def execute(args) -> dict[str, object]:
-    suffix = uuid4().hex[:12]
+    suffix = os.getenv(SUFFIX_ENV) or uuid4().hex[:12]
+    if (
+        len(suffix) != 12
+        or any(value not in "0123456789abcdef" for value in suffix)
+    ):
+        raise ValueError(
+            f"{SUFFIX_ENV} must be exactly twelve lowercase hexadecimal "
+            "characters"
+        )
     output = args.output_directory
     output.mkdir(parents=True)
     database = f"test_realtime_v2_v3dr_{suffix}"
@@ -805,6 +1321,9 @@ def execute(args) -> dict[str, object]:
     package_path = output / "package.json"
     bundle_path = output / "execution-bundle.json"
     override_path = output / "compose.override.json"
+    diagnostic_path = output / "diagnostic-authorization.json"
+    acquisition_binding_path = output / "acquisition-binding.json"
+    downstream_binding_directory = output / "downstream-bindings"
     settings = _settings()
     cleanup = {
         "containers": None,
@@ -819,17 +1338,20 @@ def execute(args) -> dict[str, object]:
     durable = None
     resident_identity_before = {}
     resident_identity_after = {}
+    acquisition_restart = None
+    downstream_attachments = []
     started_at = datetime.now(UTC)
     roles_owned = False
     login_owned = False
     try:
-        _docker("image", "inspect", args.image_id)
+        _assert_image_binding(args)
         with disposable_v2_database(database) as pool:
             seed = _seed(
                 pool,
                 session_date=args.session_date,
                 suffix=suffix,
             )
+            _seed_acquisition_catalog(pool)
             connection = pool.getconn()
             try:
                 _, security = harden_database_v2(connection, roles)
@@ -845,6 +1367,7 @@ def execute(args) -> dict[str, object]:
             )
             login_owned = True
             secrets_dir.mkdir()
+            downstream_binding_directory.mkdir()
             _write_secret(
                 secrets_dir / "realtime_v2_app_dsn",
                 _container_dsn(host_dsn, "host.docker.internal"),
@@ -853,29 +1376,81 @@ def execute(args) -> dict[str, object]:
                 secrets_dir / "realtime_v2_provider_key",
                 "provider-free-loopback-not-a-provider-credential",
             )
-            package, bundle = _qualification_artifacts(seed, args)
+            acquisition_binding = (
+                _qualification_acquisition_binding(seed, args)
+            )
+            package, bundle = _qualification_artifacts(
+                seed,
+                args,
+                acquisition_binding,
+            )
+            diagnostic = build_diagnostic_authorization(
+                authorization_reference=(
+                    f"owned-docker-qualification:{suffix}"
+                ),
+                owner=f"stockscreener-v3dr-{suffix}",
+                session_date=args.session_date,
+                cohort_id=UUID(str(seed["cohort_id"])),
+                source_sha256=(
+                    args.qualification_semantic_sha256
+                ),
+                backend_image_id=args.image_id,
+                input_evidence_sha256=(
+                    args.qualification_file_sha256
+                ),
+            )
             _seed_service_leases(pool, bundle)
             _write_json(package_path, package)
             _write_json(bundle_path, bundle)
-            _write_json(override_path, _override())
             compose_environment = {
                 **os.environ,
                 "REALTIME_V2_BACKEND_IMAGE": args.image_id,
                 "REALTIME_V2_DOCKER_SECRET_DIR": str(secrets_dir),
                 "REALTIME_V2_P8_PACKAGE_PATH": str(package_path),
                 "REALTIME_V2_P8_BUNDLE_PATH": str(bundle_path),
+                "REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH": str(
+                    acquisition_binding_path
+                ),
+                "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH": str(
+                    downstream_binding_directory
+                ),
+                "REALTIME_V3_ACQUISITION_CONTAINER_PREFIX": (
+                    container_prefix
+                ),
                 "REALTIME_V2_P8_CONTAINER_PREFIX": container_prefix,
+                "REALTIME_V2_CANONICAL_STOCK_ALERT_CONTAINER_PREFIX": (
+                    container_prefix
+                ),
                 "REALTIME_V2_ADVANCED_JOURNALS_VOLUME_NAME": (
                     journal_volume
                 ),
                 "REALTIME_V2_ADVANCED_REPORTS_VOLUME_NAME": report_volume,
                 "REALTIME_V2_APPLICATION_NETWORK_NAME": network,
+                "REALTIME_V2_ADVANCED_COHORT_ID": str(seed["cohort_id"]),
+                "REALTIME_V2_ADVANCED_SESSION_DATE": (
+                    args.session_date.isoformat()
+                ),
+                "REALTIME_V2_ROLE_PREFIX": roles.prefix,
+                "REALTIME_V3_DIAGNOSTIC_AUTHORIZATION_ID": str(
+                    diagnostic.authorization_id
+                ),
             }
-            resident_services = {
-                role: service
-                for role, service in SERVICES.items()
-                if role != "WINDOW"
-            }
+            _write_json(
+                diagnostic_path,
+                diagnostic_authorization_payload(diagnostic),
+            )
+            _write_json(
+                acquisition_binding_path,
+                acquisition_binding_payload(acquisition_binding),
+            )
+            _write_json(
+                override_path,
+                _override(
+                    environment=compose_environment,
+                    diagnostic_path=diagnostic_path,
+                ),
+            )
+            resident_services = dict(SERVICES)
             resident_command = _compose_args(
                 override_path,
                 project,
@@ -899,17 +1474,13 @@ def execute(args) -> dict[str, object]:
                     )
                     for role, service in resident_services.items()
                 }
-                _run(
-                    _compose_args(
-                        override_path,
-                        project,
-                        "up",
-                        "--detach",
-                        "--no-build",
-                        SERVICES["WINDOW"],
-                    ),
-                    environment=compose_environment,
-                    timeout=120,
+                downstream_attachments = (
+                    _attach_qualification_downstream_bindings(
+                        downstream_binding_directory,
+                        bundle,
+                        seed,
+                        args,
+                    )
                 )
                 _run(
                     _compose_args(
@@ -964,15 +1535,7 @@ def execute(args) -> dict[str, object]:
                 )
                 for role, service in resident_services.items()
             ]
-            services = resident_rows + [
-                _inspect_service(
-                    compose_environment,
-                    override_path,
-                    project,
-                    SERVICES["WINDOW"],
-                    "WINDOW",
-                )
-            ]
+            services = resident_rows
             resident_identity_after = {
                 role: _inspect_service(
                     compose_environment,
@@ -985,9 +1548,9 @@ def execute(args) -> dict[str, object]:
             }
             if resident_identity_after != resident_identity_before:
                 raise RuntimeError(
-                    "V3 WINDOW start recreated a resident container"
+                    "V3 initial role start changed a container identity"
                 )
-            window_container_before = services[-1]["container_id"]
+            window_container_before = resident_identity_before["WINDOW"]
             first_window_status = _role_status(
                 window_container_before,
                 "WINDOW",
@@ -1073,6 +1636,71 @@ def execute(args) -> dict[str, object]:
                 raise RuntimeError(
                     "V3 WINDOW defer/restart qualification changed"
                 )
+            acquisition_container_before = (
+                resident_identity_after["OPTIONS_ACQUISITION"]
+            )
+            acquisition_status_before = _acquisition_status(
+                acquisition_container_before
+            )
+            _run(
+                _compose_args(
+                    override_path,
+                    project,
+                    "restart",
+                    SERVICES["OPTIONS_ACQUISITION"],
+                ),
+                environment=compose_environment,
+                timeout=90,
+            )
+            _run(
+                _compose_args(
+                    override_path,
+                    project,
+                    "up",
+                    "--detach",
+                    "--no-build",
+                    "--wait",
+                    "--wait-timeout",
+                    "90",
+                    SERVICES["OPTIONS_ACQUISITION"],
+                ),
+                environment=compose_environment,
+                timeout=120,
+            )
+            acquisition_container_after = _service_container_id(
+                compose_environment,
+                override_path,
+                project,
+                SERVICES["OPTIONS_ACQUISITION"],
+            )
+            acquisition_status_after = _acquisition_status(
+                acquisition_container_after
+            )
+            if (
+                acquisition_container_after
+                != acquisition_container_before
+                or acquisition_status_after["binding_sha256"]
+                != acquisition_status_before["binding_sha256"]
+                or acquisition_status_after["owner_id"]
+                != acquisition_status_before["owner_id"]
+                or acquisition_status_after["journal_generation"]
+                != acquisition_status_before["journal_generation"]
+                or acquisition_status_after["connection_attempts"]
+                <= acquisition_status_before["connection_attempts"]
+                or acquisition_status_after["last_raw_offset"]
+                <= acquisition_status_before["last_raw_offset"]
+                or acquisition_status_after["last_event_offset"]
+                <= acquisition_status_before["last_event_offset"]
+            ):
+                raise RuntimeError(
+                    "Options acquisition restart identity changed"
+                )
+            acquisition_restart = {
+                "container_id": acquisition_container_after,
+                "before": acquisition_status_before,
+                "after": acquisition_status_after,
+                "rehydrated": True,
+            }
             _run(
                 _compose_args(
                     override_path,
@@ -1212,21 +1840,42 @@ def execute(args) -> dict[str, object]:
                 bundle_path.read_bytes()
             ).hexdigest(),
         },
+        "acquisition_binding": {
+            "path": str(acquisition_binding_path),
+            "sha256": acquisition_binding.binding_sha256,
+            "file_sha256": hashlib.sha256(
+                acquisition_binding_path.read_bytes()
+            ).hexdigest(),
+            "restart": acquisition_restart,
+        },
+        "downstream_bindings": {
+            "initial_state": "READY_WAITING_FOR_E",
+            "attachments": downstream_attachments,
+            "acquisition_restarted_for_attachment": False,
+            "rehydrated_latest_sequence": 3,
+        },
         "entrypoint": {
-            "script": "scripts/run_advanced_options_v3_production.py",
+            "scripts": [
+                "scripts/run_advanced_options_v3_production.py",
+                "scripts/run_advanced_options_v3_acquisition.py",
+            ],
             "service_flag": "--docker-service-kind",
             "health_flag": "--docker-health-kind",
             "provider_free_injection": (
                 "REALTIME_V3_PROVIDER_FREE_QUALIFICATION=ENABLED"
             ),
+            "validation_mode": (
+                "REALTIME_V3_VALIDATION_MODE="
+                "DEVELOPMENT_DIAGNOSTIC"
+            ),
             "rehearsal_process_used": False,
         },
         "services": services,
         "single_bundle_handoff": {
-            "resident_roles_started_first": list(
+            "roles_started_together": list(
                 resident_identity_before
             ),
-            "window_started_after_residents": True,
+            "window_started_after_residents": False,
             "resident_container_ids_before": resident_identity_before,
             "resident_container_ids_after": resident_identity_after,
             "resident_recreation_count": 0,
@@ -1258,6 +1907,7 @@ def execute(args) -> dict[str, object]:
             "semantic_sha256": args.qualification_semantic_sha256,
             "file_sha256": args.qualification_file_sha256,
         },
+        "validation_mode": "DEVELOPMENT_DIAGNOSTIC",
         "durable_database_barrier": durable,
         "effects": dict(ZERO_EFFECTS),
         "cleanup": cleanup,

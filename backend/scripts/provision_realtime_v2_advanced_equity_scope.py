@@ -49,6 +49,9 @@ from realtime.migrations import (  # noqa: E402
 from scripts.realtime_script_support import write_report  # noqa: E402
 
 
+ENTITLEMENT_EVIDENCE_TTL = timedelta(hours=24)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
@@ -133,6 +136,20 @@ def _load_entitlement(path, expected_symbols):
             "entitlement report is not exact selected-universe/AM PASS evidence"
         )
     return hashlib.sha256(body).hexdigest(), report["checked_at"]
+
+
+def _validate_entitlement_clock(
+    *,
+    checked: datetime,
+    evidence_checked: datetime,
+) -> None:
+    if (
+        checked < evidence_checked
+        or checked - evidence_checked > ENTITLEMENT_EVIDENCE_TTL
+    ):
+        raise ValueError(
+            "entitlement evidence is outside its 24-hour TTL"
+        )
 
 
 def _provider(config):
@@ -222,11 +239,10 @@ def main(argv=None):
         evidence_checked_at
     ).astimezone(timezone.utc)
     checked = datetime.now(timezone.utc)
-    if (
-        checked < evidence_checked
-        or checked - evidence_checked > timedelta(hours=4)
-    ):
-        raise ValueError("entitlement evidence is outside its four-hour TTL")
+    _validate_entitlement_clock(
+        checked=checked,
+        evidence_checked=evidence_checked,
+    )
     runtime_catalog = load_advanced_ingress_runtime_catalog(
         config.advanced_ingress_policy_path,
         expected_version=config.advanced_ingress_policy_version,

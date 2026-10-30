@@ -628,6 +628,10 @@ def _flow_response(
 def _alert_evaluation_row(evaluation, cutoff: datetime):
     direction = evaluation.payload.get("direction")
     if direction not in (-1, 1):
+        decision = evaluation.payload.get("decision")
+        if isinstance(decision, Mapping):
+            direction = decision.get("direction")
+    if direction not in (-1, 1):
         direction = None
     detector = evaluation.detector.value
     return {
@@ -679,7 +683,15 @@ def _alert_evaluation_row(evaluation, cutoff: datetime):
         "net_return": None,
         "event_horizon_status": None,
         "shared_model_exposure": False,
-        "observation": _json_value(evaluation.payload),
+        "observation": (
+            None
+            if evaluation.package is not None
+            and evaluation.detector in {
+                DetectorFamily.OS1,
+                DetectorFamily.OS2,
+            }
+            else _json_value(evaluation.payload)
+        ),
     }
 
 
@@ -1353,6 +1365,22 @@ class AdvancedOptionsAlertsPagePublication:
 
     def evaluations(self, request, **identity):
         stored = self._stored(identity)
+        lane_by_detector = {
+            row["detector"]: row for row in stored["lanes"]
+        }
+        if (
+            len(lane_by_detector) != len(stored["lanes"])
+            or request.detector is not None
+            and request.detector not in lane_by_detector
+        ):
+            return self._envelope(
+                stored,
+                available=False,
+                reason="DETECTOR_LANE_UNAVAILABLE",
+                data={
+                    "available_detectors": sorted(lane_by_detector),
+                },
+            )
         rows = [
             deepcopy(row)
             for row in stored["evaluation_rows"]
@@ -1378,12 +1406,8 @@ class AdvancedOptionsAlertsPagePublication:
             reverse=reverse,
         )
         page = rows[request.offset:request.offset + request.limit]
-        statuses = Counter(
-            row["selection_status"]
-            for row in stored["evaluation_rows"]
-        )
         models = []
-        for detector in ("O1", "O2", "O3", "S1", "S2"):
+        for detector, lane in lane_by_detector.items():
             detector_rows = [
                 row for row in stored["evaluation_rows"]
                 if row["detector_id"] == detector
@@ -1393,6 +1417,12 @@ class AdvancedOptionsAlertsPagePublication:
             )
             models.append({
                 "detector_id": detector,
+                "accepted": not any(
+                    reason.endswith("MODEL_NOT_ACCEPTED")
+                    for reason in lane["reason_codes"]
+                ),
+                "lane_state": lane["state"],
+                "reason_codes": list(lane["reason_codes"]),
                 "evaluated": len(detector_rows),
                 "detected": detector_statuses["SELECTED"],
                 "selected": detector_statuses["SELECTED"],
@@ -1434,8 +1464,12 @@ class AdvancedOptionsAlertsPagePublication:
                         "NOT_BOUND_TO_PROSPECTIVE_OUTCOMES"
                     ),
                 }
-                for detector in ("O1", "O2", "O3", "S1", "S2")
-                for status, count in sorted(statuses.items())
+                for detector in lane_by_detector
+                for status, count in sorted(Counter(
+                    row["selection_status"]
+                    for row in stored["evaluation_rows"]
+                    if row["detector_id"] == detector
+                ).items())
             ],
         }
         return self._envelope(stored, available=True, data=data)

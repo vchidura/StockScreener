@@ -20,6 +20,11 @@ from .advanced_options_control_plane import (
     advanced_options_enrollment_plan_payload,
     advanced_options_history_binding_payload,
 )
+from .advanced_options_acquisition_runtime import (
+    AdvancedOptionsAcquisitionBinding,
+    acquisition_binding_from_payload,
+    acquisition_binding_payload,
+)
 from .advanced_options_p8_canary_authorization import canonical_sha256
 from .advanced_options_p8_canary_executor import (
     AdvancedOptionsP8LifecyclePort,
@@ -49,6 +54,7 @@ from .portal_publisher import (
 )
 from .preflight import ProviderTier
 from .stage_orchestrator import StageOrchestrator
+from .stage_graph import STAGE_CATALOG_VERSION_V5
 from .worker_database import RealtimeProcessDatabase
 
 
@@ -64,6 +70,15 @@ P8_EFFECT_DENIALS = {
 }
 P8_STATUS_SCHEMA = "advanced-options-p8-docker-service-status-v1"
 P8_STATUS_MAXIMUM_AGE_SECONDS = 20
+P8_READY_WAITING_FOR_E = "READY_WAITING_FOR_E"
+P8_BOUND_TO_E = "BOUND_TO_E"
+P8_PREOPEN_SESSION_BINDING_SCHEMA = (
+    "advanced-options-p8-preopen-session-binding-v1"
+)
+P8_DOWNSTREAM_BINDING_SCHEMA = "advanced-options-p8-downstream-binding-v2"
+P8_DOWNSTREAM_LATEST_SCHEMA = (
+    "advanced-options-p8-downstream-binding-latest-v1"
+)
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -80,6 +95,679 @@ def _json(path: Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError(f"{path.name} must contain a JSON object")
     return value
+
+
+def _sha256(value: object, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a SHA-256 digest")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class P8PreopenSessionBinding:
+    binding_id: UUID
+    binding_sha256: str
+    package_sha256: str
+    acquisition_binding_id: UUID
+    acquisition_binding_sha256: str
+    source_sha256: str
+    backend_image_id: str
+    session_authorization_id: UUID
+    session_authorization_sha256: str
+    cohort_id: UUID
+    plan_id: UUID
+    journal_generation: UUID
+    contract_tickers: tuple[str, ...]
+    service_owner_ids: tuple[tuple[str, UUID], ...]
+    decision_stop: datetime
+
+    def __post_init__(self) -> None:
+        contracts = tuple(sorted(
+            str(value).strip().upper()
+            for value in self.contract_tickers
+        ))
+        owners = tuple(sorted(
+            (str(kind), owner_id)
+            for kind, owner_id in self.service_owner_ids
+        ))
+        decision_stop = _utc(self.decision_stop, "decision_stop")
+        if (
+            not all(
+                isinstance(value, UUID) and value.int
+                for value in (
+                    self.binding_id,
+                    self.acquisition_binding_id,
+                    self.session_authorization_id,
+                    self.cohort_id,
+                    self.plan_id,
+                    self.journal_generation,
+                )
+            )
+            or len(contracts) != 4
+            or len(set(contracts)) != 4
+            or [kind for kind, _owner_id in owners]
+            != sorted(kind.value for kind in AdvancedOptionsProcessKind)
+            or any(
+                not isinstance(owner_id, UUID) or not owner_id.int
+                for _kind, owner_id in owners
+            )
+            or not isinstance(self.backend_image_id, str)
+            or not self.backend_image_id.startswith("sha256:")
+        ):
+            raise ValueError("P8 pre-open session binding scope is invalid")
+        for value, name in (
+            (self.binding_sha256, "binding_sha256"),
+            (self.package_sha256, "package_sha256"),
+            (
+                self.acquisition_binding_sha256,
+                "acquisition_binding_sha256",
+            ),
+            (self.source_sha256, "source_sha256"),
+            (
+                self.session_authorization_sha256,
+                "session_authorization_sha256",
+            ),
+            (
+                self.backend_image_id.removeprefix("sha256:"),
+                "backend_image_id",
+            ),
+        ):
+            _sha256(value, name)
+        object.__setattr__(self, "contract_tickers", contracts)
+        object.__setattr__(self, "service_owner_ids", owners)
+        object.__setattr__(self, "decision_stop", decision_stop)
+        expected = canonical_sha256(
+            p8_preopen_session_binding_payload(
+                self,
+                include_identity=False,
+            )
+        )
+        expected_id = uuid5(
+            NAMESPACE_URL,
+            f"stockscreener:p8-preopen-session-binding:{expected}",
+        )
+        if (
+            self.binding_sha256 != expected
+            or self.binding_id != expected_id
+        ):
+            raise ValueError("P8 pre-open session binding identity changed")
+
+
+def p8_preopen_session_binding_payload(
+    binding: P8PreopenSessionBinding,
+    *,
+    include_identity: bool = True,
+) -> dict[str, object]:
+    value: dict[str, object] = {
+        "schema": P8_PREOPEN_SESSION_BINDING_SCHEMA,
+        "package_sha256": binding.package_sha256,
+        "acquisition_binding_id": str(binding.acquisition_binding_id),
+        "acquisition_binding_sha256": (
+            binding.acquisition_binding_sha256
+        ),
+        "source_sha256": binding.source_sha256,
+        "backend_image_id": binding.backend_image_id,
+        "session_authorization_id": str(
+            binding.session_authorization_id
+        ),
+        "session_authorization_sha256": (
+            binding.session_authorization_sha256
+        ),
+        "cohort_id": str(binding.cohort_id),
+        "plan_id": str(binding.plan_id),
+        "journal_generation": str(binding.journal_generation),
+        "contract_tickers": list(binding.contract_tickers),
+        "service_owner_ids": [
+            {"kind": kind, "owner_id": str(owner_id)}
+            for kind, owner_id in binding.service_owner_ids
+        ],
+        "decision_stop_utc": binding.decision_stop.isoformat(),
+        "authority": {
+            "provider_socket": False,
+            "journal": False,
+            "detector": False,
+            "projection": False,
+            "publication": False,
+            "pointer": False,
+            "read_pin": False,
+            "dispatch": False,
+            "delivery": False,
+            "broker": False,
+            "trading": False,
+        },
+        "state": P8_READY_WAITING_FOR_E,
+    }
+    if include_identity:
+        value.update({
+            "binding_id": str(binding.binding_id),
+            "binding_sha256": binding.binding_sha256,
+        })
+    return value
+
+
+def build_p8_preopen_session_binding(
+    *,
+    package: Mapping[str, object],
+    acquisition_binding: AdvancedOptionsAcquisitionBinding,
+) -> P8PreopenSessionBinding:
+    cohort = package.get("cohort")
+    orchestration = package.get("orchestration")
+    owners = package.get("owners")
+    processes = (
+        owners.get("processes")
+        if isinstance(owners, Mapping)
+        else None
+    )
+    if (
+        not isinstance(cohort, Mapping)
+        or not isinstance(orchestration, Mapping)
+        or not isinstance(processes, list)
+    ):
+        raise ValueError("P8 pre-open package identity is unavailable")
+    cohort_id = UUID(str(cohort["cohort_id"]))
+    plan_id = UUID(str(orchestration["plan_id"]))
+    service_owner_ids = tuple(sorted(
+        (
+            str(row["kind"]),
+            _owner_ids(package)[
+                AdvancedOptionsProcessKind(str(row["kind"]))
+            ],
+        )
+        for row in processes
+    ))
+    if (
+        cohort_id != acquisition_binding.authority.cohort_id
+        or tuple(sorted(
+            str(value)
+            for value in package.get("v3_admitted_contracts", ())
+        ))
+        != acquisition_binding.contract_tickers
+    ):
+        raise ValueError("P8 pre-open acquisition identity changed")
+    values = {
+        "package_sha256": _sha256(
+            package.get("package_sha256"),
+            "package_sha256",
+        ),
+        "acquisition_binding_id": acquisition_binding.binding_id,
+        "acquisition_binding_sha256": (
+            acquisition_binding.binding_sha256
+        ),
+        "source_sha256": acquisition_binding.source_sha256,
+        "backend_image_id": acquisition_binding.backend_image_id,
+        "session_authorization_id": (
+            acquisition_binding.authority.authorization_id
+        ),
+        "session_authorization_sha256": (
+            acquisition_binding.authority.authorization_sha256
+        ),
+        "cohort_id": cohort_id,
+        "plan_id": plan_id,
+        "journal_generation": (
+            acquisition_binding.authority.journal_generation
+        ),
+        "contract_tickers": acquisition_binding.contract_tickers,
+        "service_owner_ids": service_owner_ids,
+        "decision_stop": acquisition_binding.authority.acquisition_stop,
+    }
+    unsigned = P8PreopenSessionBinding.__new__(
+        P8PreopenSessionBinding
+    )
+    object.__setattr__(unsigned, "binding_id", UUID(int=1))
+    object.__setattr__(unsigned, "binding_sha256", "0" * 64)
+    for name, value in values.items():
+        object.__setattr__(unsigned, name, value)
+    digest = canonical_sha256(
+        p8_preopen_session_binding_payload(
+            unsigned,
+            include_identity=False,
+        )
+    )
+    return P8PreopenSessionBinding(
+        binding_id=uuid5(
+            NAMESPACE_URL,
+            f"stockscreener:p8-preopen-session-binding:{digest}",
+        ),
+        binding_sha256=digest,
+        **values,
+    )
+
+
+def p8_preopen_session_binding_from_payload(
+    value: object,
+) -> P8PreopenSessionBinding:
+    if not isinstance(value, Mapping):
+        raise TypeError("P8 pre-open session binding must be an object")
+    if value.get("schema") != P8_PREOPEN_SESSION_BINDING_SCHEMA:
+        raise ValueError("P8 pre-open session binding schema changed")
+    binding = P8PreopenSessionBinding(
+        binding_id=UUID(str(value["binding_id"])),
+        binding_sha256=str(value["binding_sha256"]),
+        package_sha256=str(value["package_sha256"]),
+        acquisition_binding_id=UUID(
+            str(value["acquisition_binding_id"])
+        ),
+        acquisition_binding_sha256=str(
+            value["acquisition_binding_sha256"]
+        ),
+        source_sha256=str(value["source_sha256"]),
+        backend_image_id=str(value["backend_image_id"]),
+        session_authorization_id=UUID(
+            str(value["session_authorization_id"])
+        ),
+        session_authorization_sha256=str(
+            value["session_authorization_sha256"]
+        ),
+        cohort_id=UUID(str(value["cohort_id"])),
+        plan_id=UUID(str(value["plan_id"])),
+        journal_generation=UUID(str(value["journal_generation"])),
+        contract_tickers=tuple(
+            str(item) for item in value["contract_tickers"]
+        ),
+        service_owner_ids=tuple(
+            (
+                str(row["kind"]),
+                UUID(str(row["owner_id"])),
+            )
+            for row in value["service_owner_ids"]
+        ),
+        decision_stop=datetime.fromisoformat(
+            str(value["decision_stop_utc"])
+        ),
+    )
+    if p8_preopen_session_binding_payload(binding) != dict(value):
+        raise ValueError("P8 pre-open session binding payload changed")
+    return binding
+
+
+@dataclass(frozen=True, slots=True)
+class P8DownstreamBinding:
+    binding_id: UUID
+    binding_sha256: str
+    session_binding_sha256: str
+    sequence: int
+    previous_binding_sha256: str | None
+    target_window_id: UUID
+    equity_receipt_id: UUID
+    equity_input_sha256: str
+    finalized_cutoff: datetime
+    receipt_created_at: datetime
+    options_cutoff: datetime
+    history_binding_sha256: str
+    equity_binding_sha256: str
+    options_activity_evidence_sha256: str
+    window_cycle_authorization_sha256: str
+    publication_authorization_reference: str
+    production_binding: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        finalized = _utc(self.finalized_cutoff, "finalized_cutoff")
+        created = _utc(self.receipt_created_at, "receipt_created_at")
+        options = _utc(self.options_cutoff, "options_cutoff")
+        production = dict(self.production_binding)
+        if (
+            not all(
+                isinstance(value, UUID) and value.int
+                for value in (
+                    self.binding_id,
+                    self.target_window_id,
+                    self.equity_receipt_id,
+                )
+            )
+            or type(self.sequence) is not int
+            or not 1 <= self.sequence <= 78
+            or not finalized <= created <= options
+            or not 0 <= (options - finalized).total_seconds() <= 300
+            or not self.publication_authorization_reference.strip()
+            or production.get("schema")
+            != "advanced-options-p8-production-binding-v3"
+            or production.get("window_id")
+            != str(self.target_window_id)
+        ):
+            raise ValueError("P8 downstream binding scope is invalid")
+        for value, name in (
+            (self.binding_sha256, "binding_sha256"),
+            (
+                self.session_binding_sha256,
+                "session_binding_sha256",
+            ),
+            (
+                self.previous_binding_sha256,
+                "previous_binding_sha256",
+            ),
+            (self.equity_input_sha256, "equity_input_sha256"),
+            (
+                self.history_binding_sha256,
+                "history_binding_sha256",
+            ),
+            (self.equity_binding_sha256, "equity_binding_sha256"),
+            (
+                self.options_activity_evidence_sha256,
+                "options_activity_evidence_sha256",
+            ),
+            (
+                self.window_cycle_authorization_sha256,
+                "window_cycle_authorization_sha256",
+            ),
+            (production.get("binding_sha256"), "production_binding"),
+        ):
+            if value is not None:
+                _sha256(value, name)
+        equity = production.get("equity_input_binding")
+        control = production.get("control")
+        history = production.get("history_binding")
+        if (
+            not isinstance(equity, Mapping)
+            or not isinstance(control, Mapping)
+            or not isinstance(history, Mapping)
+            or equity.get("equity_receipt_id")
+            != str(self.equity_receipt_id)
+            or equity.get("input_sha256") != self.equity_input_sha256
+            or equity.get("equity_cutoff") != finalized.isoformat()
+            or equity.get("binding_sha256")
+            != self.equity_binding_sha256
+            or history.get("binding_sha256")
+            != self.history_binding_sha256
+            or control.get("receipt_inputs", {}).get("cutoff")
+            != options.isoformat()
+            or canonical_sha256({
+                key: item
+                for key, item in production.items()
+                if key != "binding_sha256"
+            })
+            != production.get("binding_sha256")
+        ):
+            raise ValueError("P8 downstream production binding changed")
+        object.__setattr__(self, "finalized_cutoff", finalized)
+        object.__setattr__(self, "receipt_created_at", created)
+        object.__setattr__(self, "options_cutoff", options)
+        object.__setattr__(self, "production_binding", production)
+        expected = canonical_sha256(
+            p8_downstream_binding_payload(
+                self,
+                include_identity=False,
+            )
+        )
+        expected_id = uuid5(
+            NAMESPACE_URL,
+            f"stockscreener:p8-downstream-binding:{expected}",
+        )
+        if (
+            self.binding_sha256 != expected
+            or self.binding_id != expected_id
+        ):
+            raise ValueError("P8 downstream binding identity changed")
+
+
+def p8_downstream_binding_payload(
+    binding: P8DownstreamBinding,
+    *,
+    include_identity: bool = True,
+) -> dict[str, object]:
+    value: dict[str, object] = {
+        "schema": P8_DOWNSTREAM_BINDING_SCHEMA,
+        "session_binding_sha256": binding.session_binding_sha256,
+        "sequence": binding.sequence,
+        "previous_binding_sha256": binding.previous_binding_sha256,
+        "target_window_id": str(binding.target_window_id),
+        "equity_receipt_id": str(binding.equity_receipt_id),
+        "equity_input_sha256": binding.equity_input_sha256,
+        "finalized_cutoff_utc": binding.finalized_cutoff.isoformat(),
+        "receipt_created_at_utc": binding.receipt_created_at.isoformat(),
+        "options_cutoff_utc": binding.options_cutoff.isoformat(),
+        "e_o_seconds": (
+            binding.options_cutoff - binding.finalized_cutoff
+        ).total_seconds(),
+        "history_binding_sha256": binding.history_binding_sha256,
+        "equity_binding_sha256": binding.equity_binding_sha256,
+        "options_activity_evidence_sha256": (
+            binding.options_activity_evidence_sha256
+        ),
+        "window_cycle_authorization_sha256": (
+            binding.window_cycle_authorization_sha256
+        ),
+        "publication_authorization_reference": (
+            binding.publication_authorization_reference
+        ),
+        "production_binding": dict(binding.production_binding),
+    }
+    if include_identity:
+        value.update({
+            "binding_id": str(binding.binding_id),
+            "binding_sha256": binding.binding_sha256,
+        })
+    return value
+
+
+def build_p8_downstream_binding(
+    *,
+    session_binding: P8PreopenSessionBinding,
+    sequence: int,
+    previous_binding_sha256: str | None,
+    target_window_id: UUID,
+    equity_receipt_id: UUID,
+    equity_input_sha256: str,
+    finalized_cutoff: datetime,
+    receipt_created_at: datetime,
+    options_cutoff: datetime,
+    history_binding_sha256: str,
+    equity_binding_sha256: str,
+    options_activity_evidence_sha256: str,
+    window_cycle_authorization_sha256: str,
+    publication_authorization_reference: str,
+    production_binding: Mapping[str, object],
+) -> P8DownstreamBinding:
+    values = {
+        "session_binding_sha256": session_binding.binding_sha256,
+        "sequence": sequence,
+        "previous_binding_sha256": previous_binding_sha256,
+        "target_window_id": target_window_id,
+        "equity_receipt_id": equity_receipt_id,
+        "equity_input_sha256": equity_input_sha256,
+        "finalized_cutoff": finalized_cutoff,
+        "receipt_created_at": receipt_created_at,
+        "options_cutoff": options_cutoff,
+        "history_binding_sha256": history_binding_sha256,
+        "equity_binding_sha256": equity_binding_sha256,
+        "options_activity_evidence_sha256": (
+            options_activity_evidence_sha256
+        ),
+        "window_cycle_authorization_sha256": (
+            window_cycle_authorization_sha256
+        ),
+        "publication_authorization_reference": (
+            publication_authorization_reference
+        ),
+        "production_binding": dict(production_binding),
+    }
+    unsigned = P8DownstreamBinding.__new__(P8DownstreamBinding)
+    object.__setattr__(unsigned, "binding_id", UUID(int=1))
+    object.__setattr__(unsigned, "binding_sha256", "0" * 64)
+    for name, value in values.items():
+        object.__setattr__(unsigned, name, value)
+    digest = canonical_sha256(
+        p8_downstream_binding_payload(
+            unsigned,
+            include_identity=False,
+        )
+    )
+    return P8DownstreamBinding(
+        binding_id=uuid5(
+            NAMESPACE_URL,
+            f"stockscreener:p8-downstream-binding:{digest}",
+        ),
+        binding_sha256=digest,
+        **values,
+    )
+
+
+def p8_downstream_binding_from_payload(
+    value: object,
+) -> P8DownstreamBinding:
+    if not isinstance(value, Mapping):
+        raise TypeError("P8 downstream binding must be an object")
+    if value.get("schema") != P8_DOWNSTREAM_BINDING_SCHEMA:
+        raise ValueError("P8 downstream binding schema changed")
+    binding = P8DownstreamBinding(
+        binding_id=UUID(str(value["binding_id"])),
+        binding_sha256=str(value["binding_sha256"]),
+        session_binding_sha256=str(value["session_binding_sha256"]),
+        sequence=int(value["sequence"]),
+        previous_binding_sha256=(
+            None
+            if value.get("previous_binding_sha256") is None
+            else str(value["previous_binding_sha256"])
+        ),
+        target_window_id=UUID(str(value["target_window_id"])),
+        equity_receipt_id=UUID(str(value["equity_receipt_id"])),
+        equity_input_sha256=str(value["equity_input_sha256"]),
+        finalized_cutoff=datetime.fromisoformat(
+            str(value["finalized_cutoff_utc"])
+        ),
+        receipt_created_at=datetime.fromisoformat(
+            str(value["receipt_created_at_utc"])
+        ),
+        options_cutoff=datetime.fromisoformat(
+            str(value["options_cutoff_utc"])
+        ),
+        history_binding_sha256=str(value["history_binding_sha256"]),
+        equity_binding_sha256=str(value["equity_binding_sha256"]),
+        options_activity_evidence_sha256=str(
+            value["options_activity_evidence_sha256"]
+        ),
+        window_cycle_authorization_sha256=str(
+            value["window_cycle_authorization_sha256"]
+        ),
+        publication_authorization_reference=str(
+            value["publication_authorization_reference"]
+        ),
+        production_binding=dict(value["production_binding"]),
+    )
+    if p8_downstream_binding_payload(binding) != dict(value):
+        raise ValueError("P8 downstream binding payload changed")
+    return binding
+
+
+class P8DownstreamBindingStore:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        session_binding: P8PreopenSessionBinding,
+        create: bool = False,
+    ) -> None:
+        self.root = root.resolve()
+        self.session_binding = session_binding
+        if create:
+            self.root.mkdir(parents=True, exist_ok=False)
+        if not self.root.is_dir():
+            raise ValueError("P8 downstream binding directory is unavailable")
+
+    @property
+    def latest_path(self) -> Path:
+        return self.root / "LATEST.json"
+
+    def _binding_path(self, sequence: int) -> Path:
+        return self.root / f"{sequence:03d}.json"
+
+    def bindings(self) -> tuple[P8DownstreamBinding, ...]:
+        bindings = tuple(
+            p8_downstream_binding_from_payload(_json(path))
+            for path in sorted(self.root.glob("[0-9][0-9][0-9].json"))
+        )
+        previous = None
+        for expected_sequence, binding in enumerate(bindings, start=1):
+            if (
+                binding.session_binding_sha256
+                != self.session_binding.binding_sha256
+                or binding.sequence != expected_sequence
+                or binding.previous_binding_sha256 != previous
+            ):
+                raise RuntimeError("P8 downstream binding chain changed")
+            previous = binding.binding_sha256
+        if self.latest_path.exists():
+            latest = _json(self.latest_path)
+            if (
+                latest.get("schema") != P8_DOWNSTREAM_LATEST_SCHEMA
+                or not bindings
+                or latest.get("sequence") != bindings[-1].sequence
+                or latest.get("binding_sha256")
+                != bindings[-1].binding_sha256
+                or latest.get("file") != self._binding_path(
+                    bindings[-1].sequence
+                ).name
+            ):
+                raise RuntimeError(
+                    "P8 downstream latest binding changed"
+                )
+        elif bindings:
+            raise RuntimeError("P8 downstream latest binding is unavailable")
+        return bindings
+
+    def latest(self) -> P8DownstreamBinding | None:
+        bindings = self.bindings()
+        return None if not bindings else bindings[-1]
+
+    def attach(
+        self,
+        binding: P8DownstreamBinding,
+    ) -> P8DownstreamBinding:
+        if (
+            binding.session_binding_sha256
+            != self.session_binding.binding_sha256
+        ):
+            raise ValueError("P8 downstream binding targets another session")
+        latest = self.latest()
+        expected_sequence = 1 if latest is None else latest.sequence + 1
+        expected_previous = (
+            None if latest is None else latest.binding_sha256
+        )
+        path = self._binding_path(binding.sequence)
+        if path.exists():
+            stored = p8_downstream_binding_from_payload(_json(path))
+            if stored != binding:
+                raise RuntimeError("P8 downstream binding replay diverged")
+            return stored
+        if (
+            binding.sequence != expected_sequence
+            or binding.previous_binding_sha256 != expected_previous
+            or (
+                latest is not None
+                and binding.finalized_cutoff <= latest.finalized_cutoff
+            )
+        ):
+            raise ValueError("P8 downstream binding order changed")
+        encoded = (
+            json.dumps(
+                p8_downstream_binding_payload(binding),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        with path.open("xb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        latest_value = {
+            "schema": P8_DOWNSTREAM_LATEST_SCHEMA,
+            "sequence": binding.sequence,
+            "binding_sha256": binding.binding_sha256,
+            "file": path.name,
+        }
+        temporary = self.latest_path.with_suffix(".partial")
+        with temporary.open("xb") as stream:
+            stream.write((
+                json.dumps(latest_value, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, self.latest_path)
+        return binding
 
 
 def _inside(root: Path, path: Path, name: str) -> Path:
@@ -171,6 +859,89 @@ class P8ExecutionBundleStore:
             raise ValueError("P8 execution bundle parent is absent")
         self.package = package
 
+    def write_waiting(
+        self,
+        acquisition_binding: AdvancedOptionsAcquisitionBinding,
+        *,
+        written_at: datetime,
+    ) -> Mapping[str, object]:
+        if self.path.exists():
+            raise FileExistsError("P8 execution bundle must be new")
+        if not isinstance(
+            acquisition_binding,
+            AdvancedOptionsAcquisitionBinding,
+        ):
+            raise TypeError(
+                "P8 waiting bundle requires an acquisition binding"
+            )
+        checked = _utc(written_at, "written_at")
+        session_binding = build_p8_preopen_session_binding(
+            package=self.package,
+            acquisition_binding=acquisition_binding,
+        )
+        payload = {
+            "schema": P8_EXECUTION_BUNDLE_SCHEMA,
+            "package_sha256": self.package["package_sha256"],
+            "package_nonce": self.package["package_nonce"],
+            "package_path": str(self.package_path),
+            "window": dict(self.package["window"]),
+            "cohort_id": str(session_binding.cohort_id),
+            "plan_id": str(session_binding.plan_id),
+            "window_id": None,
+            "orchestration": dict(self.package["orchestration"]),
+            "v3_authorities": dict(self.package["v3_authorities"]),
+            "v3_authority_references": None,
+            "validation_mode": self.package.get("validation_mode"),
+            "written_at_utc": checked.isoformat(),
+            "services": [
+                {
+                    "kind": row["kind"],
+                    "owner_name": row["owner_name"],
+                    "lease_resource_key": row["lease_resource_key"],
+                    "owner_id": str(_owner_ids(self.package)[
+                        AdvancedOptionsProcessKind(str(row["kind"]))
+                    ]),
+                    "service_name": P8_SERVICE_NAMES[
+                        AdvancedOptionsProcessKind(str(row["kind"]))
+                    ],
+                }
+                for row in self.package["owners"]["processes"]
+            ],
+            "session_binding": p8_preopen_session_binding_payload(
+                session_binding
+            ),
+            "acquisition_binding": acquisition_binding_payload(
+                acquisition_binding
+            ),
+            "enrollment": None,
+            "history_binding": None,
+            "equity_input_binding": None,
+            "underlying_price_binding": None,
+            "production_binding": None,
+            "live_observation_sha256": canonical_sha256({
+                "schema": P8_PREOPEN_SESSION_BINDING_SCHEMA,
+                "session_binding_sha256": (
+                    session_binding.binding_sha256
+                ),
+                "acquisition_binding_sha256": (
+                    acquisition_binding.binding_sha256
+                ),
+                "state": P8_READY_WAITING_FOR_E,
+            }),
+            "effect_authorizations": dict(P8_EFFECT_DENIALS),
+        }
+        payload["bundle_sha256"] = canonical_sha256(payload)
+        encoded = (
+            json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        if len(encoded) > P8_EXECUTION_BUNDLE_MAX_BYTES:
+            raise ValueError("P8 execution bundle exceeded its byte ceiling")
+        with self.path.open("xb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return payload
+
     def write(
         self,
         observation: Mapping[str, object],
@@ -219,6 +990,7 @@ class P8ExecutionBundleStore:
                 else dict(self.package["v3_authorities"])
             ),
             "v3_authority_references": authority_references,
+            "validation_mode": self.package.get("validation_mode"),
             "written_at_utc": checked.isoformat(),
             "services": [
                 {
@@ -250,6 +1022,8 @@ class P8ExecutionBundleStore:
                     binding.underlying_price_binding
                 )
             ),
+            "session_binding": None,
+            "acquisition_binding": None,
             "production_binding": (
                 None
                 if production_binding is None
@@ -318,6 +1092,8 @@ def validate_p8_execution_bundle(
         or bundle.get("orchestration") != package.get("orchestration")
         or bundle.get("v3_authorities")
         != package.get("v3_authorities")
+        or bundle.get("validation_mode")
+        != package.get("validation_mode")
         or bundle.get("effect_authorizations") != P8_EFFECT_DENIALS
         or not isinstance(services, list)
         or [row.get("kind") for row in services] != [
@@ -332,6 +1108,50 @@ def validate_p8_execution_bundle(
         ]
     ):
         raise ValueError("P8 execution bundle identity changed")
+    session_payload = bundle.get("session_binding")
+    if session_payload is not None:
+        session_binding = p8_preopen_session_binding_from_payload(
+            session_payload
+        )
+        acquisition = acquisition_binding_from_payload(
+            bundle.get("acquisition_binding")
+        )
+        authorities = bundle.get("v3_authorities")
+        session_authority = (
+            authorities.get("session_acquisition")
+            if isinstance(authorities, Mapping)
+            else None
+        )
+        if (
+            session_binding.package_sha256
+            != package.get("package_sha256")
+            or session_binding.acquisition_binding_id
+            != acquisition.binding_id
+            or session_binding.acquisition_binding_sha256
+            != acquisition.binding_sha256
+            or session_binding.session_authorization_id
+            != acquisition.authority.authorization_id
+            or session_binding.session_authorization_sha256
+            != acquisition.authority.authorization_sha256
+            or not isinstance(session_authority, Mapping)
+            or session_authority.get("authorization_id")
+            != str(session_binding.session_authorization_id)
+            or session_authority.get("authorization_sha256")
+            != session_binding.session_authorization_sha256
+            or bundle.get("window_id") is not None
+            or bundle.get("v3_authority_references") is not None
+            or any(
+                bundle.get(name) is not None
+                for name in (
+                    "enrollment",
+                    "history_binding",
+                    "equity_input_binding",
+                    "underlying_price_binding",
+                    "production_binding",
+                )
+            )
+        ):
+            raise ValueError("P8 waiting bundle identity changed")
     if (
         isinstance(package.get("v3_deployment"), Mapping)
         and package.get("v3_authorities") is not None
@@ -340,10 +1160,11 @@ def validate_p8_execution_bundle(
             validate_advanced_options_v3_authority_references,
         )
 
-        validate_advanced_options_v3_authority_references(
-            package,
-            bundle,
-        )
+        if session_payload is None:
+            validate_advanced_options_v3_authority_references(
+                package,
+                bundle,
+            )
     validate_p8_service_membership(package)
     if expected_kind is not None and (
         not isinstance(expected_kind, AdvancedOptionsProcessKind)
@@ -748,11 +1569,16 @@ def validate_p8_docker_service_environment(
     if not str(environment.get("REALTIME_V2_APP_DSN", "")).strip():
         raise RuntimeError("P8 Docker service app DSN is unavailable")
     provider = str(environment.get("POLYGON_API_KEY", "")).strip()
-    if kind is AdvancedOptionsProcessKind.INGRESS:
+    split_acquisition = (
+        environment.get("REALTIME_V3_ACQUISITION_SPLIT") == "ENABLED"
+    )
+    if kind is AdvancedOptionsProcessKind.INGRESS and not split_acquisition:
         if not provider:
             raise RuntimeError("P8 ingress provider credential is unavailable")
     elif provider:
-        raise RuntimeError("P8 non-ingress service received a provider credential")
+        raise RuntimeError(
+            "P8 downstream service received a provider credential"
+        )
     forbidden = [
         name
         for name, value in environment.items()
@@ -790,6 +1616,7 @@ def _write_service_status(
     owner_epoch: int | None = None,
     lease_until: datetime | None = None,
     role_evidence: Mapping[str, object] | None = None,
+    downstream_binding: Mapping[str, object] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -814,6 +1641,11 @@ def _write_service_status(
         "role_evidence": (
             None if role_evidence is None else dict(role_evidence)
         ),
+        "downstream_binding": (
+            None
+            if downstream_binding is None
+            else dict(downstream_binding)
+        ),
         "effects": dict(P8_EFFECT_DENIALS),
     }
     temporary = path.with_suffix(".partial")
@@ -822,6 +1654,62 @@ def _write_service_status(
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+
+
+def _validate_downstream_binding_evidence(value: object) -> None:
+    if not isinstance(value, Mapping):
+        raise RuntimeError("P8 downstream binding evidence is unavailable")
+    if value.get("schema") == P8_DOWNSTREAM_BINDING_SCHEMA:
+        try:
+            p8_downstream_binding_from_payload(value)
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "P8 downstream binding evidence changed"
+            ) from error
+        return
+    unsigned = dict(value)
+    digest = unsigned.pop("binding_sha256", None)
+    try:
+        receipt_id = UUID(str(value["equity_receipt_id"]))
+        equity_cutoff = _utc(
+            datetime.fromisoformat(str(value["finalized_cutoff_utc"])),
+            "finalized_cutoff_utc",
+        )
+        options_cutoff = _utc(
+            datetime.fromisoformat(str(value["options_cutoff_utc"])),
+            "options_cutoff_utc",
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "P8 downstream binding evidence is invalid"
+        ) from error
+    e_o_seconds = (options_cutoff - equity_cutoff).total_seconds()
+    if (
+        value.get("schema")
+        != "advanced-options-p8-downstream-binding-v1"
+        or not receipt_id.int
+        or digest != canonical_sha256(unsigned)
+        or value.get("e_o_seconds") != e_o_seconds
+        or not 0 <= e_o_seconds <= 300
+    ):
+        raise RuntimeError("P8 downstream binding evidence changed")
+    for name in (
+        "equity_input_sha256",
+        "equity_binding_sha256",
+        "window_cycle_authorization_sha256",
+    ):
+        candidate = value.get(name)
+        if (
+            not isinstance(candidate, str)
+            or len(candidate) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in candidate
+            )
+        ):
+            raise RuntimeError(
+                "P8 downstream binding digest changed"
+            )
 
 
 def run_p8_docker_service(
@@ -853,6 +1741,27 @@ def run_p8_docker_service(
         signal.signal(signal.SIGTERM, lambda *_args: stop.set())
     status_path = _p8_status_path(kind, service_environment)
     window_stop = datetime.fromisoformat(str(bundle["window"]["stop_utc"]))
+    session_binding = (
+        None
+        if bundle.get("session_binding") is None
+        else p8_preopen_session_binding_from_payload(
+            bundle["session_binding"]
+        )
+    )
+    downstream_store = (
+        None
+        if session_binding is None
+        else P8DownstreamBindingStore(
+            Path(service_environment.get(
+                "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR",
+                "/var/lib/realtime-v2-reports/downstream-bindings",
+            )),
+            session_binding=session_binding,
+        )
+    )
+    latest_binding = (
+        None if downstream_store is None else downstream_store.latest()
+    )
     service = next(
         row for row in bundle["services"] if row["kind"] == kind.value
     )
@@ -860,17 +1769,55 @@ def run_p8_docker_service(
         from .advanced_options_p8_production import run_p8_production_role
 
         role_runner = run_p8_production_role
+        observes_binding = True
+    else:
+        observes_binding = False
     role_result: dict[str, object] = {}
     role_failure: list[BaseException] = []
+    role_state = {
+        "state": (
+            P8_BOUND_TO_E
+            if latest_binding is not None
+            else (
+                P8_READY_WAITING_FOR_E
+                if bundle.get("orchestration", {}).get("catalog_version")
+                == STAGE_CATALOG_VERSION_V5
+                else "ROLE_RUNNING"
+            )
+        ),
+        "downstream_binding": (
+            None
+            if latest_binding is None
+            else p8_downstream_binding_payload(latest_binding)
+        ),
+    }
+    role_state_lock = threading.Lock()
+
+    def observe_binding(
+        state: str,
+        evidence: Mapping[str, object] | None = None,
+    ) -> None:
+        if state not in {P8_READY_WAITING_FOR_E, P8_BOUND_TO_E}:
+            raise ValueError("P8 downstream binding state is invalid")
+        with role_state_lock:
+            role_state["state"] = state
+            role_state["downstream_binding"] = (
+                None if evidence is None else dict(evidence)
+            )
 
     def run_role() -> None:
         try:
+            arguments = {
+                "kind": kind,
+                "package": package,
+                "bundle": bundle,
+                "environment": service_environment,
+                "stop_event": stop,
+            }
+            if observes_binding:
+                arguments["state_observer"] = observe_binding
             result = role_runner(
-                kind=kind,
-                package=package,
-                bundle=bundle,
-                environment=service_environment,
-                stop_event=stop,
+                **arguments,
             )
             if not isinstance(result, Mapping):
                 raise TypeError("P8 Docker role evidence must be an object")
@@ -913,6 +1860,25 @@ def run_p8_docker_service(
                 raise RuntimeError(
                     f"P8 {kind.value} lease ownership changed"
                 )
+            with role_state_lock:
+                if downstream_store is not None:
+                    attached = downstream_store.latest()
+                    if (
+                        attached is not None
+                        and (
+                            role_state["downstream_binding"] is None
+                            or role_state["downstream_binding"].get(
+                                "binding_sha256"
+                            )
+                            != attached.binding_sha256
+                        )
+                    ):
+                        role_state["state"] = P8_BOUND_TO_E
+                        role_state["downstream_binding"] = (
+                            p8_downstream_binding_payload(attached)
+                        )
+                current_state = str(role_state["state"])
+                downstream_binding = role_state["downstream_binding"]
             _write_service_status(
                 status_path,
                 kind=kind,
@@ -921,11 +1887,12 @@ def run_p8_docker_service(
                 state=(
                     "ROLE_COMPLETE"
                     if not role_thread.is_alive()
-                    else "ROLE_RUNNING"
+                    else current_state
                 ),
                 owner_epoch=int(lease[1]),
                 lease_until=lease[2],
                 role_evidence=role_result or None,
+                downstream_binding=downstream_binding,
             )
             if role_failure:
                 raise RuntimeError(
@@ -988,6 +1955,12 @@ def check_p8_docker_service_health(
     )
     status = _json(_p8_status_path(kind, service_environment))
     observed = datetime.fromisoformat(str(status.get("observed_at_utc")))
+    state = status.get("state")
+    downstream_binding = status.get("downstream_binding")
+    if state == P8_READY_WAITING_FOR_E and downstream_binding is not None:
+        raise RuntimeError("P8 waiting service has an E binding")
+    if state == P8_BOUND_TO_E:
+        _validate_downstream_binding_evidence(downstream_binding)
     if (
         status.get("schema") != P8_STATUS_SCHEMA
         or status.get("kind") != kind.value
@@ -996,7 +1969,13 @@ def check_p8_docker_service_health(
         or status.get("package_nonce") != bundle["package_nonce"]
         or status.get("bundle_sha256") != bundle["bundle_sha256"]
         or status.get("window_id") != bundle["window_id"]
-        or status.get("state") not in {"ROLE_RUNNING", "ROLE_COMPLETE"}
+        or state
+        not in {
+            P8_READY_WAITING_FOR_E,
+            P8_BOUND_TO_E,
+            "ROLE_RUNNING",
+            "ROLE_COMPLETE",
+        }
         or type(status.get("owner_epoch")) is not int
         or status["owner_epoch"] < 1
         or datetime.fromisoformat(
@@ -1010,11 +1989,16 @@ def check_p8_docker_service_health(
     ):
         raise RuntimeError("P8 Docker service health identity changed")
     return {
-        "status": "READY",
+        "status": (
+            P8_READY_WAITING_FOR_E
+            if state == P8_READY_WAITING_FOR_E
+            else "READY"
+        ),
         "kind": kind.value,
         "service_name": P8_SERVICE_NAMES[kind],
         "observed_at_utc": observed.isoformat(),
-        "state": status["state"],
+        "state": state,
         "role_evidence": status.get("role_evidence"),
+        "downstream_binding": status.get("downstream_binding"),
         "effects": dict(P8_EFFECT_DENIALS),
     }

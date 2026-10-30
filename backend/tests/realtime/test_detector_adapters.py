@@ -128,7 +128,7 @@ def test_canonical_stock_adapter_returns_real_no_match_without_substitution():
         (row, row.system_observed_at) for row in (*daily_history(), *intraday)
     )
     adapted = run_canonical_stock_signal_adapter(
-        detector_id="S1",
+        detector_id="OS1",
         security_id=SECURITY,
         underlyer="AAPL",
         bars=bars,

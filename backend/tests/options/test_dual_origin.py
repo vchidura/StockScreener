@@ -1951,6 +1951,25 @@ def test_stock_windows_follow_market_clock_without_double_provider_delay(cutoff,
     assert result == (cutoff, datetime.fromisoformat(expected) if expected else None)
 
 
+def test_options_layer_translates_neutral_stock_source_rejections():
+    from collections import Counter
+    from options.detector_collection import (
+        _options_stock_source_rejections,
+    )
+
+    result = _options_stock_source_rejections(Counter({
+        "ACCEPTANCE_STOCK_WINDOW_NOT_AVAILABLE": 2,
+        "RESUMPTION_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW": 1,
+        "UNRELATED_SOURCE_REASON": 3,
+    }))
+
+    assert result == Counter({
+        "S1_STOCK_WINDOW_NOT_AVAILABLE": 2,
+        "S2_NO_ACTIVE_EPISODE_IN_STOCK_WINDOW": 1,
+        "UNRELATED_SOURCE_REASON": 3,
+    })
+
+
 def test_exact_stock_publication_wait_is_bounded_and_heartbeat_safe():
     from collections import Counter
     from options.detector_launch import read_stock_setup_windows_when_ready
@@ -1961,7 +1980,10 @@ def test_exact_stock_publication_wait_is_bounded_and_heartbeat_safe():
     def reader(_path, **arguments):
         reads.append(arguments["as_of"])
         if len(reads) < 3:
-            return (), Counter({"S1_STOCK_WINDOW_NOT_AVAILABLE": 1, "S2_STOCK_WINDOW_NOT_AVAILABLE": 1})
+            return (), Counter({
+                "ACCEPTANCE_STOCK_WINDOW_NOT_AVAILABLE": 1,
+                "RESUMPTION_STOCK_WINDOW_NOT_AVAILABLE": 1,
+            })
         return ("setup",), Counter()
     def wait(seconds):
         current[0] += timedelta(seconds=seconds)
@@ -1977,10 +1999,10 @@ def test_exact_stock_publication_wait_is_bounded_and_heartbeat_safe():
     current[0] = boundary + timedelta(minutes=29, seconds=54)
     reads.clear()
     evidence, reasons = read_stock_setup_windows_when_ready(lambda *args, **kwargs: (
-        (), Counter({"S1_STOCK_WINDOW_NOT_AVAILABLE": 1})), path="unused", policies=("policy",),
+        (), Counter({"ACCEPTANCE_STOCK_WINDOW_NOT_AVAILABLE": 1})), path="unused", policies=("policy",),
         windows={"AAPL": (current[0], boundary)}, as_of=current[0], wait_deadline=boundary + timedelta(hours=1),
         clock=lambda: current[0], wait=wait)
-    assert evidence == () and reasons["S1_STOCK_WINDOW_NOT_AVAILABLE"] == 1
+    assert evidence == () and reasons["ACCEPTANCE_STOCK_WINDOW_NOT_AVAILABLE"] == 1
     assert current[0] == boundary + timedelta(minutes=29, seconds=55)
 
     reads.clear()

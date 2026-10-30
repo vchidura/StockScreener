@@ -15,7 +15,16 @@ from research.stock_idea_engine import digest
 from research.stock_idea_replay import derive_hours, publication_windows, run_replay, session_windows, utc, validate_inputs, write_once
 
 
-def freeze_inputs(config, cutoff, requested_cohort=None, evaluation_plan=None):
+def freeze_inputs(
+    config,
+    cutoff,
+    requested_cohort=None,
+    evaluation_plan=None,
+    *,
+    include_all_daily_members=True,
+    allow_any_adjusted_daily_mode=False,
+    canonicalize_security_ids=False,
+):
     from collections import defaultdict
     from dotenv import load_dotenv
     import exchange_calendars
@@ -53,10 +62,15 @@ def freeze_inputs(config, cutoff, requested_cohort=None, evaluation_plan=None):
         if requested_cohort is not None and not set(requested_cohort) <= set(initial):
             raise ValueError("requested cohort contains identities outside the first dated universe")
         intraday_names = sorted({initial[security] for security in (requested_cohort or initial)})
-        daily_names = sorted({member["ticker"] for member in members} | {"SPY"})
+        daily_names = (
+            sorted({member["ticker"] for member in members} | {"SPY"})
+            if include_all_daily_members
+            else sorted(set(intraday_names) | {"SPY"})
+        )
 
         def read_bars(names, interval, start, adjusted):
             records = []
+            enforce_grouped_adjusted = bool(adjusted and not allow_any_adjusted_daily_mode)
             for offset in range(0, len(names), 40):
                 cursor.execute("""
                     SELECT DISTINCT ON(ticker,bar_start) ticker,security_id::text,interval,
@@ -70,12 +84,12 @@ def freeze_inputs(config, cutoff, requested_cohort=None, evaluation_plan=None):
                                             AND bar_start>=%s::date AT TIME ZONE 'UTC'
                                             AND bar_start<(%s::date + INTERVAL '1 day') AT TIME ZONE 'UTC'
                       AND system_observed_at<=%s AND created_at<=%s AND bar_end<=%s
-                      AND (NOT %s OR (availability_mode='HISTORICAL_RECONSTRUCTED'
+                      AND (%s OR (availability_mode='HISTORICAL_RECONSTRUCTED'
                            AND quality_codes @> ARRAY['GROUPED_DAILY_EXACT_TICKER_V2']::text[]))
                     ORDER BY ticker,bar_start,
                         CASE source_kind WHEN 'RECONCILED' THEN 0 WHEN 'DERIVED' THEN 1 ELSE 2 END,
                         system_observed_at DESC,created_at DESC,bar_revision_id
-                """, (names[offset:offset + 40], interval, adjusted, start, config["exit_end"], start, config["exit_end"], cutoff, cutoff, cutoff, adjusted))
+                """, (names[offset:offset + 40], interval, adjusted, start, config["exit_end"], start, config["exit_end"], cutoff, cutoff, cutoff, not enforce_grouped_adjusted))
                 records.extend(dict(row) for row in cursor.fetchall())
                 if offset % 200 == 0 or offset + 40 >= len(names):
                     print(f"Pinned {interval} adjusted={adjusted}: {min(offset + 40, len(names))}/{len(names)} tickers, {len(records):,} rows",
@@ -83,6 +97,18 @@ def freeze_inputs(config, cutoff, requested_cohort=None, evaluation_plan=None):
             return json.loads(json.dumps(records, default=str))
 
         native = read_bars(intraday_names, "30m", config["intraday_warmup_start"], False)
+        if canonicalize_security_ids:
+            canonical = {(member["session"], member["ticker"]): member["security_id"] for member in members}
+            canonicalized = []
+            for bar in native:
+                mapped = canonical.get((bar["session"], bar["ticker"]))
+                if mapped is None:
+                    continue
+                bar = dict(bar)
+                bar["source_security_id"] = bar["security_id"]
+                bar["security_id"] = mapped
+                canonicalized.append(bar)
+            native = canonicalized
         opening = session_windows(config["start"])[0][0]
         hours = derive_hours([bar for bar in native if utc(bar["bar_end"]) < opening], config)
         by_security = defaultdict(set)
@@ -98,10 +124,17 @@ def freeze_inputs(config, cutoff, requested_cohort=None, evaluation_plan=None):
         print(f"Frozen pre-pilot covered cohort: {len(cohort)}/{len(initial)} dated members", file=sys.stderr, flush=True)
         native = [bar for bar in native if bar["security_id"] in cohort]
         daily = read_bars(daily_names, "1d", config["warmup_start"], True)
+        if canonicalize_security_ids:
+            canonical = {(member["session"], member["ticker"]): member["security_id"] for member in members}
+            daily = [
+                (dict(bar, source_security_id=bar["security_id"], security_id=canonical[(bar["session"], bar["ticker"])])
+                 if (bar["session"], bar["ticker"]) in canonical else bar)
+                for bar in daily
+            ]
         raw_daily = read_bars(sorted({initial[security] for security in cohort}), "1d", config["warmup_start"], False)
-        raw_by_key = {(bar["security_id"], bar["session"]): bar for bar in raw_daily}
+        raw_by_key = {(bar["ticker"], bar["session"]): bar for bar in raw_daily}
         for bar in daily:
-            raw = raw_by_key.get((bar["security_id"], bar["session"]))
+            raw = raw_by_key.get((bar["ticker"], bar["session"]))
             bar["price_basis"] = "SPLIT_ADJUSTED"
             bar["execution_scale"] = raw["close"] / bar["close"] if raw is not None and bar["close"] > 0 else None
             bar["execution_scale_revision_ids"] = [raw["revision_id"]] if raw else []

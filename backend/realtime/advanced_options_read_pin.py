@@ -65,6 +65,24 @@ def load_enabled_advanced_options_release_cursor(
     )
 
 
+def _pin_state(pin: Mapping[str, object] | None) -> tuple[object, ...] | None:
+    if pin is None:
+        return None
+    return tuple(
+        pin[name]
+        for name in (
+            "cohort_id",
+            "release_id",
+            "package_sha256",
+            "release_cutoff",
+            "enabled",
+            "enabled_at",
+            "disabled_at",
+            "updated_at",
+        )
+    )
+
+
 class PostgresAdvancedOptionsStoredReadPort:
     def __init__(
         self,
@@ -207,3 +225,182 @@ class PostgresAdvancedOptionsStoredReadPort:
                 raise RuntimeError(
                     "Advanced Options exact read pin could not be disabled"
                 )
+
+    def advance(
+        self,
+        *,
+        cohort_id: UUID,
+        release_id: UUID,
+        previous: Mapping[str, object] | None,
+    ) -> Mapping[str, object]:
+        if (
+            previous is not None
+            and previous.get("cohort_id") != str(cohort_id)
+        ):
+            raise ValueError("prior Advanced Options read pin scope changed")
+        checked = _utc(self._clock(), "clock")
+        with self._provider.transaction(
+            APP_ROLE,
+            isolation_level="SERIALIZABLE",
+        ) as unit:
+            cursor = unit.cursor
+            cursor.execute(
+                "SELECT release.release_id::text,release.cutoff "
+                "FROM rt.portal_releases AS release "
+                "JOIN rt.portal_release_current AS current "
+                "ON current.cohort_id=release.cohort_id "
+                "AND current.provider_tier=release.provider_tier "
+                "AND current.release_id=release.release_id "
+                "AND current.cutoff=release.cutoff "
+                "WHERE release.release_id=%s AND release.cohort_id=%s "
+                "AND release.provider_tier='MASSIVE_ADVANCED' FOR UPDATE",
+                (str(release_id), str(cohort_id)),
+            )
+            release = cursor.fetchone()
+            if release is None:
+                raise RuntimeError(
+                    "Advanced Options read pin is not the exact current release"
+                )
+            release_cutoff = (
+                release["cutoff"]
+                if isinstance(release, Mapping)
+                else release[1]
+            )
+            current = load_advanced_options_read_pin_cursor(
+                cursor,
+                cohort_id=cohort_id,
+                for_update=True,
+            )
+            if (
+                current is not None
+                and current["release_id"] == str(release_id)
+                and current["release_cutoff"] == release_cutoff
+                and current["package_sha256"] == self._package_sha256
+                and current["enabled"] is True
+            ):
+                stored = current
+            else:
+                if _pin_state(current) != _pin_state(previous):
+                    raise RuntimeError(
+                        "Advanced Options read pin changed before advance"
+                    )
+                cursor.execute(
+                    "INSERT INTO rt.advanced_options_read_pins ("
+                    "cohort_id,release_id,release_cutoff,package_sha256,"
+                    "enabled,enabled_at,disabled_at,updated_at) "
+                    "VALUES (%s,%s,%s,%s,true,%s,NULL,%s) "
+                    "ON CONFLICT (cohort_id) DO UPDATE SET "
+                    "release_id=EXCLUDED.release_id,"
+                    "release_cutoff=EXCLUDED.release_cutoff,"
+                    "package_sha256=EXCLUDED.package_sha256,enabled=true,"
+                    "enabled_at=EXCLUDED.enabled_at,disabled_at=NULL,"
+                    "updated_at=EXCLUDED.updated_at",
+                    (
+                        str(cohort_id),
+                        str(release_id),
+                        release_cutoff,
+                        self._package_sha256,
+                        checked,
+                        checked,
+                    ),
+                )
+                stored = load_advanced_options_read_pin_cursor(
+                    cursor,
+                    cohort_id=cohort_id,
+                    for_update=True,
+                )
+        if (
+            stored is None
+            or stored["enabled"] is not True
+            or stored["release_id"] != str(release_id)
+            or stored["release_cutoff"] != release_cutoff
+            or stored["package_sha256"] != self._package_sha256
+        ):
+            raise RuntimeError(
+                "Advanced Options read pin advance verification failed"
+            )
+        return {
+            "cohort_id": str(cohort_id),
+            "release_id": str(release_id),
+            "release_cutoff_utc": release_cutoff.isoformat(),
+            "verified": True,
+            "enabled_at_utc": stored["enabled_at"].isoformat(),
+        }
+
+    def restore(
+        self,
+        *,
+        cohort_id: UUID,
+        expected_release_id: UUID,
+        previous: Mapping[str, object] | None,
+    ) -> Mapping[str, object] | None:
+        if (
+            previous is not None
+            and previous.get("cohort_id") != str(cohort_id)
+        ):
+            raise ValueError("prior Advanced Options read pin scope changed")
+        with self._provider.transaction(
+            APP_ROLE,
+            isolation_level="SERIALIZABLE",
+        ) as unit:
+            cursor = unit.cursor
+            current = load_advanced_options_read_pin_cursor(
+                cursor,
+                cohort_id=cohort_id,
+                for_update=True,
+            )
+            if _pin_state(current) == _pin_state(previous):
+                return previous
+            if (
+                current is None
+                or current["release_id"] != str(expected_release_id)
+                or current["package_sha256"] != self._package_sha256
+            ):
+                raise RuntimeError(
+                    "Advanced Options read pin changed before rollback"
+                )
+            if previous is None:
+                cursor.execute(
+                    "DELETE FROM rt.advanced_options_read_pins "
+                    "WHERE cohort_id=%s AND release_id=%s "
+                    "AND package_sha256=%s RETURNING cohort_id",
+                    (
+                        str(cohort_id),
+                        str(expected_release_id),
+                        self._package_sha256,
+                    ),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE rt.advanced_options_read_pins SET "
+                    "release_id=%s,release_cutoff=%s,package_sha256=%s,"
+                    "enabled=%s,enabled_at=%s,disabled_at=%s,updated_at=%s "
+                    "WHERE cohort_id=%s AND release_id=%s "
+                    "AND package_sha256=%s RETURNING cohort_id",
+                    (
+                        previous["release_id"],
+                        previous["release_cutoff"],
+                        previous["package_sha256"],
+                        previous["enabled"],
+                        previous["enabled_at"],
+                        previous["disabled_at"],
+                        previous["updated_at"],
+                        str(cohort_id),
+                        str(expected_release_id),
+                        self._package_sha256,
+                    ),
+                )
+            if cursor.fetchone() is None:
+                raise RuntimeError(
+                    "Advanced Options exact read pin could not be restored"
+                )
+            restored = load_advanced_options_read_pin_cursor(
+                cursor,
+                cohort_id=cohort_id,
+                for_update=True,
+            )
+        if _pin_state(restored) != _pin_state(previous):
+            raise RuntimeError(
+                "Advanced Options read pin rollback verification failed"
+            )
+        return restored

@@ -94,6 +94,9 @@ SOURCE_BINDING_PATHS = (
     "backend/realtime/advanced_options_p8_production.py",
     "backend/realtime/advanced_options_p8_roles.py",
     "backend/realtime/advanced_options_p8_runtime.py",
+    "backend/realtime/advanced_options_validation_mode.py",
+    "backend/realtime/advanced_options_development_fixture.py",
+    "backend/realtime/advanced_options_development_plan.py",
     "backend/realtime/advanced_options_p8_window.py",
     "backend/realtime/advanced_options_p8_selection_source.py",
     "backend/realtime/advanced_options_underlying_snapshot.py",
@@ -137,6 +140,9 @@ SOURCE_BINDING_PATHS = (
     "backend/realtime/sql_v2/032_advanced_options_read_pins.sql",
     "backend/realtime/sql_v2/033_advanced_options_equity_input_bindings.sql",
     "backend/scripts/prepare_advanced_options_p8_equity_input_source.py",
+    "backend/scripts/verify_advanced_options_v3_development_projections.py",
+    "backend/scripts/prepare_advanced_options_v3_development_fixture_e.py",
+    "backend/scripts/prepare_advanced_options_v3_development_diagnostic.py",
     "backend/scripts/audit_advanced_options_input_readiness.py",
     "backend/realtime/screening_projection.py",
     "backend/realtime/screening_repository.py",
@@ -334,7 +340,7 @@ def _contract_payload(
         "wildcards": False,
         "contract_substitution": False,
         "scope_expansion": False,
-        "required_detectors": ["O1", "O2", "O3"],
+        "required_detectors": ["O1", "O2", "O3", "OS1", "OS2"],
         "o2_policy": "UNAVAILABLE/O2_MODEL_NOT_ACCEPTED",
     }
     policy_hashes = {
@@ -354,7 +360,7 @@ def _contract_payload(
         }),
         "native_policy_sha256": canonical_sha256({
             "plan_version": NATIVE_INPUT_PLAN_VERSION,
-            "detectors": ["O1", "O2", "O3", "S1", "S2"],
+            "detectors": ["O1", "O2", "O3", "OS1", "OS2"],
             "o2_policy": "UNAVAILABLE/O2_MODEL_NOT_ACCEPTED",
         }),
         "mark_policy_sha256": canonical_sha256({
@@ -541,7 +547,7 @@ def build_p8_canary_authorization(
     prepared_at: datetime,
     window_start: datetime,
     window_end: datetime,
-    equity_input_source: Mapping[str, object],
+    equity_input_source: Mapping[str, object] | None,
     expected_qualification_semantic_sha256: str = (
         QUALIFICATION_SEMANTIC_SHA256
     ),
@@ -554,7 +560,18 @@ def build_p8_canary_authorization(
     report = _load_object(report_path, "P8 qualification report")
     report_file_sha256 = hashlib.sha256(report_path.read_bytes()).hexdigest()
     semantic_report = dict(report)
-    embedded_report_sha256 = semantic_report.pop("report_sha256", None)
+    embedded_report_sha256 = semantic_report.pop(
+        "semantic_sha256",
+        None,
+    )
+    legacy_report_sha256 = semantic_report.pop("report_sha256", None)
+    if embedded_report_sha256 is None:
+        embedded_report_sha256 = legacy_report_sha256
+    elif (
+        legacy_report_sha256 is not None
+        and legacy_report_sha256 != embedded_report_sha256
+    ):
+        raise ValueError("P8 qualification report identities disagree")
     report_semantic_sha256 = canonical_sha256(semantic_report)
     expected_semantic = _sha256(
         expected_qualification_semantic_sha256,
@@ -610,12 +627,16 @@ def build_p8_canary_authorization(
         repository_root,
         cohort_id=cohort_id,
     )
-    equity_input_binding = _equity_input_source(
-        equity_input_source,
-        target_options_window_id=target_options_window_id,
-        target_cohort_id=cohort_id,
-        window_start=start,
-        authorization_reference=reference,
+    equity_input_binding = (
+        {}
+        if equity_input_source is None
+        else _equity_input_source(
+            equity_input_source,
+            target_options_window_id=target_options_window_id,
+            target_cohort_id=cohort_id,
+            window_start=start,
+            authorization_reference=reference,
+        )
     )
     superseded = (
         None

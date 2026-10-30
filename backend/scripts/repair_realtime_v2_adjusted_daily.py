@@ -85,7 +85,6 @@ def parse_args(argv=None):
             args.provider_authorization_reference,
             args.expected_cost,
         ))
-        or (args.raw and not args.ticker)
     ):
         parser.error("adjusted-daily scope, budget, pacing or authorization is invalid")
     args.authorized_until = args.authorized_until.astimezone(timezone.utc)

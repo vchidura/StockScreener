@@ -109,7 +109,7 @@ def build_detector_evaluation_review(*, as_of, session_date=None, dataset_id=Non
         O1IndicatorEvaluationEvidence, O3CreditEvaluationEvidence, StockSetupIndicatorEvaluationEvidence, SurfaceEvaluationEvidence,
     )
 
-    if not 1 <= limit <= 200 or offset < 0 or detector not in (None, "O1", "O2", "O3", "S1", "S2") or selection_status not in (None, "SELECTED", "NOT_SELECTED", "REPEAT", "OBSERVATION"):
+    if not 1 <= limit <= 200 or offset < 0 or detector not in (None, "O1", "O2", "O3", "S1", "S2", "OS1", "OS2") or selection_status not in (None, "SELECTED", "NOT_SELECTED", "REPEAT", "OBSERVATION"):
         raise ValueError("invalid detector evaluation review filters")
     inputs = (repository or OptionAlertEvaluationRepository()).review_inputs(
         as_of=as_of, session_date=session_date, dataset_id=dataset_id)
@@ -211,7 +211,12 @@ def build_detector_evaluation_review(*, as_of, session_date=None, dataset_id=Non
                     O1IndicatorEvaluationEvidence, StockSetupIndicatorEvaluationEvidence)) for row in values)
                 else "NOT_BOUND_TO_PROSPECTIVE_OUTCOMES"))
     models = []
-    for model in ("O1", "O2", "O3", "S1", "S2"):
+    stock_models = (
+        ("OS1", "OS2")
+        if any(record.detector_id in {"OS1", "OS2"} for record in scoped)
+        else ("S1", "S2")
+    )
+    for model in ("O1", "O2", "O3", *stock_models):
         model_records = [record for record in scoped if record.detector_id == model]
         models.append(dict(detector_id=model, evaluated=len(model_records),
             detected=sum(record.observation.finding_disposition == "DETECTED" if isinstance(record, SurfaceEvaluationEvidence)
@@ -249,7 +254,7 @@ def build_detector_alert_review(*, dataset_id, as_of, scope="LATEST", session_da
 
     history_dataset_ids = tuple(dict.fromkeys(history_dataset_ids or ()))
     if (not dataset_id or len(dataset_id) > 80 or as_of.utcoffset() is None
-            or scope not in ("LATEST", "HISTORY") or detector not in (None, "O1", "O2", "O3", "S1", "S2")
+            or scope not in ("LATEST", "HISTORY") or detector not in (None, "O1", "O2", "O3", "S1", "S2", "OS1", "OS2")
             or not 1 <= limit <= 200 or offset < 0 or len(history_dataset_ids) > 20
             or any(not value or len(value) > 80 for value in history_dataset_ids)):
         raise ValueError("invalid detector alert scope")

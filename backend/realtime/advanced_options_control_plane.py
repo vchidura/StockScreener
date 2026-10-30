@@ -990,9 +990,11 @@ def build_advanced_options_control_plane_plan(
         DetectorFamily.O1,
         DetectorFamily.O2,
         DetectorFamily.O3,
+        DetectorFamily.OS1,
+        DetectorFamily.OS2,
     }:
         raise ValueError(
-            "Advanced Options requires exact O1/O2/O3 detector membership"
+            "Advanced Options requires exact O1/O2/O3/OS1/OS2 detector membership"
         )
     if not isinstance(pins, AdvancedOptionsPolicyPins):
         raise TypeError("Advanced Options policy pins are invalid")

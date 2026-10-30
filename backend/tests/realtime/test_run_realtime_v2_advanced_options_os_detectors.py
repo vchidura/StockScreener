@@ -11,7 +11,7 @@ import pytest
 
 
 detectors = importlib.import_module(
-    "scripts.run_realtime_v2_advanced_equity_detectors"
+    "scripts.run_realtime_v2_advanced_options_os_detectors"
 )
 health = importlib.import_module(
     "scripts.report_realtime_v2_advanced_health"
@@ -80,7 +80,7 @@ def test_detector_scopes_exclude_journals_that_predate_history_binding():
     cursor = MagicMock()
     cursor.fetchall.return_value = ()
 
-    assert detectors.load_advanced_equity_detector_scopes_cursor(
+    assert detectors.load_advanced_options_detector_scopes_cursor(
         cursor,
         cohort_id=COHORT,
         session_date=date(2026, 10, 21),
@@ -96,9 +96,9 @@ def test_detector_scopes_exclude_journals_that_predate_history_binding():
     assert params == (str(COHORT), date(2026, 10, 21))
 
 
-def test_detector_cycle_fences_both_s1_s2_consumers(monkeypatch):
+def test_detector_cycle_fences_both_os1_os2_consumers(monkeypatch):
     provider = _Provider()
-    scope = detectors.AdvancedEquityDetectorScope(
+    scope = detectors.AdvancedOptionsDetectorScope(
         GENERATION,
         "a" * 64,
         17,
@@ -108,7 +108,7 @@ def test_detector_cycle_fences_both_s1_s2_consumers(monkeypatch):
 
     monkeypatch.setattr(
         detectors,
-        "load_advanced_equity_detector_scopes_cursor",
+        "load_advanced_options_detector_scopes_cursor",
         lambda *_args, **_kwargs: (scope,),
     )
 
@@ -123,12 +123,12 @@ def test_detector_cycle_fences_both_s1_s2_consumers(monkeypatch):
     )
     monkeypatch.setattr(
         detectors,
-        "build_s1_s2_consumer_config",
+        "build_os1_os2_consumer_config",
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
     monkeypatch.setattr(
         detectors,
-        "s1_s2_evaluator_cursor",
+        "os1_os2_evaluator_cursor",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
@@ -169,8 +169,8 @@ def test_detector_cycle_fences_both_s1_s2_consumers(monkeypatch):
     }
     assert len(claims) == len(persisted) == 2
     assert {row["resource_key"].rsplit(":", 1)[-1] for row in claims} == {
-        "S1",
-        "S2",
+        "OS1",
+        "OS2",
     }
     assert all(row["owner_id"] == OWNER for row in claims)
 

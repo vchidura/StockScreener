@@ -13,9 +13,13 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 
+from .canonical_stock_alert_repository import (
+    CanonicalStockAlertBatchUnavailable,
+)
+
 from .database_access import RealtimeDatabaseRole
 from .database_access_v2 import WriteFenceRejected
-from .runner_environment import RunnerEnvironment
+from .runner_environment import RunnerEnvironment, StockAlertProjectionRequest
 from .stage_database_v2 import V2StageDatabase
 from .stage_orchestrator import StageCancelled, StageContext, StageOutcome, StageRunner
 from .stage_runners_equity import (
@@ -26,7 +30,7 @@ from .stage_runners_equity import (
     REFERENCE_GENERATION_UNAVAILABLE,
     STAGE_CANCELLED,
     _is_session_close,
-    _window_receipt,
+    _window_cycle_receipt,
     reference_generation,
 )
 from .stock_alert_repository import (
@@ -39,6 +43,9 @@ from .strategy_repository import materialize_due_realtime_strategies
 logger = logging.getLogger(__name__)
 
 STOCK_ALERTS_RETAINED_FORWARD_STATE = "STOCK_ALERTS_RETAINED_FORWARD_STATE"
+STOCK_ALERTS_RETAINED_RESULTS_SOURCE_UNAVAILABLE = (
+    "STOCK_ALERTS_RETAINED_RESULTS_SOURCE_UNAVAILABLE"
+)
 STRATEGY_INTERVALS = ("1d", "1h")
 # Analysis coverage statuses of a strategy snapshot that mean its members were evaluated (an evaluation without
 # any setup is COMPLETE_EMPTY); everything else (PARTIAL, INSUFFICIENT_HISTORY, UNAVAILABLE) degrades the stage.
@@ -52,7 +59,7 @@ def _input_receipt(database, plan, window):
         "stages_v1",
     ) in {"stages_v2", "stages_v3"}
     return (
-        _window_receipt(
+        _window_cycle_receipt(
             database,
             window,
             receipt_kind=INPUT_READY if is_split_graph else EQUITY_CYCLE,
@@ -87,17 +94,37 @@ def stock_alerts_runner(environment: RunnerEnvironment) -> StageRunner:
                 return StageOutcome.blocked(REFERENCE_GENERATION_UNAVAILABLE)
             if context.is_cancelled():
                 return StageOutcome.failed(STAGE_CANCELLED)
+            if environment.stock_alert_projection_loader is None:
+                return StageOutcome.blocked(
+                    STOCK_ALERTS_RETAINED_RESULTS_SOURCE_UNAVAILABLE
+                )
+            try:
+                retained_projection = environment.stock_alert_projection_loader(
+                    StockAlertProjectionRequest(
+                        cohort_id=plan.cohort_id,
+                        window_id=window.window_id,
+                        input_receipt_id=receipt.release.receipt_id,
+                        cutoff=window.cutoff,
+                        input_sha256=receipt.input_sha256,
+                        known_by=environment.known_by(window),
+                    )
+                )
+            except CanonicalStockAlertBatchUnavailable:
+                return StageOutcome.blocked(
+                    STOCK_ALERTS_RETAINED_RESULTS_SOURCE_UNAVAILABLE
+                )
             try:
                 snapshot = compute_realtime_stock_alerts(
                     compute, cohort_id=plan.cohort_id, session=plan.session_date, cutoff=window.cutoff,
                     known_by=environment.known_by(window), source_generation=generation,
+                    retained_projection=retained_projection,
                 )
             except RetainedForwardState:
                 return StageOutcome.blocked(STOCK_ALERTS_RETAINED_FORWARD_STATE)
             if context.is_cancelled():
                 return StageOutcome.failed(STAGE_CANCELLED)
             publish_realtime_stock_alerts(
-                publication, snapshot, receipt=receipt, session_close=_is_session_close(context),
+                publication, snapshot, receipt=receipt.release, session_close=_is_session_close(context),
             )
         except (StageCancelled, WriteFenceRejected):
             return StageOutcome.failed(STAGE_CANCELLED)
@@ -126,7 +153,7 @@ def strategy_publish_runner(environment: RunnerEnvironment) -> StageRunner:
                     outcomes = materialize_due_realtime_strategies(
                         compute, publication, cohort_id=plan.cohort_id,
                         available_by=environment.known_by(window),
-                        intervals=(interval,), receipt=receipt,
+                        intervals=(interval,), receipt=receipt.release,
                     )
                 except (StageCancelled, WriteFenceRejected):
                     raise

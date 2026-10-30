@@ -10,7 +10,9 @@ from realtime.advanced_options_p7_shadow import (
     EXPECTED_P7_MIGRATIONS,
     _migration_bindings,
 )
-from realtime.advanced_equity_s1_s2_shadow import s1_s2_requirements
+from realtime.advanced_options_os1_os2_shadow import (
+    os1_os2_requirements,
+)
 
 
 equity_window = importlib.import_module(
@@ -58,17 +60,26 @@ def test_cross_lane_detector_readiness_is_bound_to_031_and_shadow_only():
     }
     assert not any(PRODUCTION_AUTHORITY.values())
     assert {
-        detector: s1_s2_requirements(detector)["trigger_interval"]
-        for detector in ("S1", "S2")
-    } == {"S1": "5m", "S2": "5m"}
+        detector: os1_os2_requirements(detector)["trigger_interval"]
+        for detector in ("OS1", "OS2")
+    } == {"OS1": "5m", "OS2": "5m"}
 
 
 @pytest.mark.parametrize(
     "prohibited_flag",
-    ("--include-alerts", "--include-strategies", "--publish"),
+    ("--include-strategies", "--publish"),
 )
 def test_detector_shadow_does_not_unlock_legacy_window_lanes(
     prohibited_flag,
 ):
     with pytest.raises(SystemExit):
         equity_window.parse_args([*WINDOW_BASE, prohibited_flag])
+
+
+def test_existing_stock_alert_lane_can_be_bound_to_the_exact_window():
+    args = equity_window.parse_args([
+        *WINDOW_BASE,
+        "--include-alerts",
+    ])
+
+    assert args.enabled_stages[-1] == "STOCK_ALERTS"

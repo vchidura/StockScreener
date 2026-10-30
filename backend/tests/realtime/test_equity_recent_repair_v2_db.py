@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from contextlib import closing
 from dataclasses import replace
@@ -27,11 +28,23 @@ from tests.realtime.test_session_close_coverage_v2_db import _seed_session
 from v2_database import _connect, _settings, disposable_v2_database, requires_v2_database
 
 pytestmark = requires_v2_database
+QUALIFICATION_SUFFIX_ENV = "STOCKS_REPAIR_QUALIFICATION_SUFFIX"
 
 
 @pytest.fixture
 def pool():
-    with disposable_v2_database(f"test_realtime_v2_native_repair_{uuid4().hex[:8]}") as value:
+    suffix = os.getenv(QUALIFICATION_SUFFIX_ENV) or uuid4().hex[:8]
+    if (
+        len(suffix) != 8
+        or any(value not in "0123456789abcdef" for value in suffix)
+    ):
+        raise ValueError(
+            f"{QUALIFICATION_SUFFIX_ENV} must be exactly eight lowercase "
+            "hexadecimal characters"
+        )
+    with disposable_v2_database(
+        f"test_realtime_v2_native_repair_{suffix}"
+    ) as value:
         yield value
 
 
@@ -116,7 +129,11 @@ class AdjustedDailyTransport:
             200,
             json.dumps({
                 "results": [{
-                    **({} if self.raw else {"T": "AAPL"}),
+                    **(
+                        {"T": "AAPL"}
+                        if not self.raw or "/grouped/" in url
+                        else {}
+                    ),
                     "o": 100,
                     "h": 101,
                     "l": 99,
@@ -320,6 +337,48 @@ def test_exact_raw_daily_repair_uses_per_ticker_response(pool):
             (str(plan.cohort_id),),
         )
         assert unit.cursor.fetchone()[0] == 1
+
+
+def test_exact_raw_daily_grouped_repair_preserves_selected_members(pool):
+    native = _scope(pool)
+    provider = _provider(pool)
+    plan = AdjustedDailyRepairPlan(
+        native.cohort_id,
+        native.identities,
+        native.sessions[0],
+        datetime.now(timezone.utc) + timedelta(minutes=30),
+        1,
+        8 * 1024 * 1024 + 1,
+        8 * 1024 * 1024,
+        f"raw-grouped-{uuid4()}",
+        "fixture entitlement",
+        "fixture cost",
+        adjusted=False,
+    )
+    transport = AdjustedDailyTransport(provider, raw=True)
+
+    result = execute_adjusted_daily_repair(
+        provider,
+        transport,
+        plan,
+        clock=lambda: datetime.now(timezone.utc),
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result["adjusted"] is False
+    assert result["facts"] == len(native.identities)
+    assert len(transport.calls) == 1
+    url, params = transport.calls[0]
+    assert "/v2/aggs/grouped/locale/us/market/stocks/" in url
+    assert params == {"adjusted": "false"}
+    with provider.transaction(read_only=True) as unit:
+        unit.cursor.execute(
+            "SELECT count(*) FROM rt.bar_current "
+            "WHERE cohort_id=%s AND interval='1d' "
+            "AND adjustment_basis='RAW_UNADJUSTED'",
+            (str(plan.cohort_id),),
+        )
+        assert unit.cursor.fetchone()[0] == len(native.identities)
 
 
 def test_ambiguous_request_is_never_automatically_refetched(pool):

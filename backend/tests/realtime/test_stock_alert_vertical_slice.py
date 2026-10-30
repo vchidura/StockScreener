@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import replace
 from datetime import timedelta
 from functools import lru_cache
@@ -8,10 +9,11 @@ from fastapi.testclient import TestClient
 import pytest
 
 from realtime.contracts import EQUITY_VALIDATION_UNIVERSE, canonical_json, canonical_sha256
+from realtime.lineage_head import inputs_sha256
 from realtime.portal_api import RealtimePortalRepositories, create_realtime_portal_app
 from realtime.stock_alert_projection import (
-    STOCK_ALERTS_VERSION, RetainedAlertStream, alert_domain_inputs, evaluate_alert_inputs,
-    produce_realtime_stock_alerts,
+    STOCK_ALERTS_VERSION, RetainedAlertStream, alert_domain_inputs,
+    alert_source_inputs, evaluate_alert_inputs, produce_realtime_stock_alerts,
 )
 from realtime.stock_alert_repository import RealtimeStockAlertViewRepository
 from research.stock_alerts import alert_page
@@ -124,8 +126,53 @@ def retained_streams():
 
 
 @lru_cache(maxsize=1)
+def retained_projection():
+    snapshot = produce_realtime_stock_alerts(
+        timely_fixture(),
+        streams=retained_streams(),
+    )
+    streams = deepcopy(snapshot.payload["streams"])
+    for projected, retained in zip(
+        streams,
+        retained_streams(),
+        strict=True,
+    ):
+        projected["strategy_instance"].update(
+            policy=dict(retained.policy),
+            enrollment=retained.state["members"],
+        )
+    source_identity = []
+    inputs = alert_source_inputs(timely_fixture())
+    document = dict(
+        contract="realtime-stock-alert-retained-projection-v1",
+        loaded_at=timely_fixture().recorded_by.isoformat(),
+        input_binding=dict(
+            binding_id="11111111-1111-4111-8111-111111111111",
+            cohort_id=str(inputs.cohort_id),
+            window_id="22222222-2222-4222-8222-222222222222",
+            input_receipt_id="33333333-3333-4333-8333-333333333333",
+            cutoff=inputs.cutoff.isoformat(),
+            input_sha256="a" * 64,
+            detector_input_sha256=inputs_sha256(inputs),
+            source_identity_sha256=digest(source_identity),
+            result_available_at=timely_fixture().recorded_by.isoformat(),
+            binding_sha256="b" * 64,
+        ),
+        source_identity=source_identity,
+        streams=streams,
+        shadow=snapshot.payload["shadow"],
+        review_publications=snapshot.payload["review_publications"],
+        schedule_streams=snapshot.payload["schedule_streams"],
+    )
+    return {**document, "projection_sha256": digest(document)}
+
+
+@lru_cache(maxsize=1)
 def retained_snapshot():
-    return produce_realtime_stock_alerts(timely_fixture(), streams=retained_streams())
+    return produce_realtime_stock_alerts(
+        timely_fixture(),
+        retained_projection=retained_projection(),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -219,7 +266,7 @@ def test_retained_original_contracts_match_the_shared_domain_engine():
     snapshot = retained_snapshot()
     app, store = alert_app(snapshot=snapshot)
     stored = json.loads(canonical_json(snapshot.payload))
-    assert all(row["status"] == "EVALUATED" for row in stored["observations"])
+    assert stored["observations"] == []
     with TestClient(app) as client:
         for view in ("latest", "history", "open"):
             for trade_type in (None, "INTRADAY", "SWING"):
@@ -443,7 +490,11 @@ def test_alert_compute_and_publication_each_require_their_own_role_and_the_split
     persisted = []
     monkeypatch.setattr(repository, "load_current_release", lambda cursor, cohort_id: None)
     monkeypatch.setattr(repository, "load_realtime_stock_alert_input", lambda cursor, **scope: scope)
-    monkeypatch.setattr(repository, "produce_realtime_stock_alerts", lambda inputs: snapshot)
+    monkeypatch.setattr(
+        repository,
+        "produce_realtime_stock_alerts",
+        lambda inputs, **_kwargs: snapshot,
+    )
     monkeypatch.setattr(repository, "persist_portal_snapshot_cursor",
                         lambda cursor, row, **options: persisted.append((cursor, options)) or row)
     published = []

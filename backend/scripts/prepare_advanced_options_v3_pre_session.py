@@ -70,8 +70,17 @@ def parse_args(argv=None):
     parser.add_argument("--authorized-until", type=datetime.fromisoformat, required=True)
     parser.add_argument("--reference-valid-until", type=datetime.fromisoformat, required=True)
     parser.add_argument("--maximum-provider-requests", type=int, required=True)
+    parser.add_argument(
+        "--maximum-response-decoded-bytes",
+        type=int,
+        required=True,
+    )
     parser.add_argument("--maximum-decoded-bytes", type=int, required=True)
     parser.add_argument("--authorization-reference", required=True)
+    parser.add_argument(
+        "--required-contract-ticker",
+        action="append",
+    )
     parser.add_argument("--capture-path", type=Path, required=True)
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--execute", action="store_true")
@@ -87,8 +96,10 @@ def parse_args(argv=None):
         args.authorized_until.tzinfo is None
         or args.reference_valid_until.tzinfo is None
         or args.maximum_provider_requests != P8_SELECTION_REQUEST_COUNT
-        or args.maximum_decoded_bytes
-        != P8_SELECTION_MAXIMUM_DECODED_BYTES
+        or not 0
+        < args.maximum_response_decoded_bytes
+        <= args.maximum_decoded_bytes
+        <= P8_SELECTION_MAXIMUM_DECODED_BYTES
         or not args.authorization_reference.strip()
     ):
         parser.error("V3 pre-session scope or budget is invalid")
@@ -98,6 +109,19 @@ def parse_args(argv=None):
     args.report_path = args.report_path.resolve()
     if args.capture_path.exists() or args.report_path.exists():
         parser.error("capture and report paths must be new")
+    args.required_contract_tickers = tuple(sorted({
+        value.strip().upper()
+        for value in (args.required_contract_ticker or ())
+        if value.strip()
+    }))
+    if args.required_contract_ticker and (
+        len(args.required_contract_tickers) != 4
+        or len(args.required_contract_tickers)
+        != len(args.required_contract_ticker)
+    ):
+        parser.error(
+            "required contract scope must contain four unique tickers"
+        )
     return args
 
 
@@ -223,6 +247,9 @@ def main(argv=None) -> int:
         "channels": ("T", "Q"),
         "selected_contracts_per_underlying": 2,
         "maximum_provider_requests": args.maximum_provider_requests,
+        "maximum_response_decoded_bytes": (
+            args.maximum_response_decoded_bytes
+        ),
         "maximum_decoded_bytes": args.maximum_decoded_bytes,
         "authorization_reference": args.authorization_reference,
     }
@@ -266,7 +293,9 @@ def main(argv=None) -> int:
                 RequestsPolygonHttpTransport(
                     api_key,
                     timeout_seconds=30,
-                    maximum_response_bytes=args.maximum_decoded_bytes,
+                    maximum_response_bytes=(
+                        args.maximum_response_decoded_bytes
+                    ),
                 ),
                 args.authorized_until,
                 lambda: datetime.now(UTC),
@@ -281,6 +310,12 @@ def main(argv=None) -> int:
             transport,
             spots,
             clock=lambda: datetime.now(UTC),
+            maximum_response_decoded_bytes=(
+                args.maximum_response_decoded_bytes
+            ),
+            maximum_total_decoded_bytes=(
+                args.maximum_decoded_bytes
+            ),
         )
         spot_values = spots.load_spots(
             underlyings=UNDERLYINGS,
@@ -313,7 +348,34 @@ def main(argv=None) -> int:
                 "response_sha256": canonical_sha256(payload),
                 "row_count": len(payload["results"]),
             })
-        selected_rows = _select(tuple(candidates))
+        if args.required_contract_tickers:
+            candidates_by_ticker = {
+                row.contract_ticker: row for row in candidates
+            }
+            if (
+                set(candidates_by_ticker)
+                < set(args.required_contract_tickers)
+            ):
+                raise ValueError(
+                    "required admitted contract is absent from fresh snapshots"
+                )
+            selected_rows = tuple(
+                candidates_by_ticker[ticker]
+                for ticker in args.required_contract_tickers
+            )
+            if {
+                (row.underlyer, row.option_type)
+                for row in selected_rows
+            } != {
+                (underlyer, option_type)
+                for underlyer in UNDERLYINGS
+                for option_type in ("C", "P")
+            }:
+                raise ValueError(
+                    "required admitted contract membership changed"
+                )
+        else:
+            selected_rows = _select(tuple(candidates))
         selected_snapshots = {
             row.contract_ticker: snapshots[row.contract_ticker]
             for row in selected_rows

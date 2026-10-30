@@ -61,6 +61,11 @@ def _pool(dsn):
 def main(argv=None):
     args = parse_args(argv)
     portal_plan = build_realtime_equity_portal_history_plan(args.session_date)
+    adjusted_source_sessions = tuple(
+        session
+        for session in portal_plan.adjusted_sessions
+        if session <= portal_plan.weekly_end
+    )
     plan = {
         "mode": "EXECUTE" if args.execute else "PLAN",
         "database": args.database,
@@ -121,14 +126,17 @@ def main(argv=None):
                 (
                     str(args.cohort_id),
                     list(EQUITY_VALIDATION_UNIVERSE.equity_tickers),
-                    list(portal_plan.adjusted_sessions),
+                    list(adjusted_source_sessions),
                 ),
             )
             inputs = SimpleNamespace(provider_tier=ProviderTier.MASSIVE_DEVELOPER)
             daily = tuple(_fact(row, inputs) for row in unit.cursor.fetchall())
         if (
             set(securities) != set(EQUITY_VALIDATION_UNIVERSE.equity_tickers)
-            or len(daily) != 283 * len(EQUITY_VALIDATION_UNIVERSE.equity_tickers)
+            or len(daily) != (
+                len(adjusted_source_sessions)
+                * len(EQUITY_VALIDATION_UNIVERSE.equity_tickers)
+            )
         ):
             raise ValueError("weekly repair inputs are incomplete")
         repaired = []
@@ -160,7 +168,17 @@ def main(argv=None):
             if str(fact.revision.bar_revision_id) not in existing
         ]
         if not repaired:
-            raise ValueError("weekly repair produced no new immutable identities")
+            report = {
+                **plan,
+                "status": "ALREADY_CURRENT",
+                "candidate_revisions": candidate_count,
+                "weekly_revisions": 0,
+                "provider_requests": 0,
+                "database_writes": 0,
+            }
+            write_report(args.report_path.resolve(), report)
+            print(json.dumps(report, sort_keys=True))
+            return 0
         backfill_plan = build_equity_bulk_backfill_plan(
             repaired,
             cohort_id=args.cohort_id,
@@ -174,6 +192,7 @@ def main(argv=None):
         )
         report = {
             **plan,
+            "status": "COMPLETE",
             "status": "COMPLETE",
             "daily_inputs": len(daily),
             "weekly_candidates": candidate_count,

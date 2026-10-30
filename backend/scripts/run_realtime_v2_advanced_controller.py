@@ -40,6 +40,9 @@ from realtime.advanced_gap_repair import (  # noqa: E402
     transition_backfill_state_cursor,
 )
 from realtime.advanced_ingress_plan import (  # noqa: E402
+    AUTOMATIC_CATCH_UP_EXPECTED_COST,
+    AUTOMATIC_CATCH_UP_RESPONSE_BYTE_LIMIT,
+    automatic_advanced_ingress_budgets,
     AdvancedIngressBudgets,
     AdvancedIngressPlanRequest,
     advanced_ingress_provider_deadline,
@@ -104,11 +107,19 @@ def _budget_arguments(parser) -> None:
     parser.add_argument("--stream-sessions", type=int, required=True)
     parser.add_argument("--connection-attempts", type=int, required=True)
     parser.add_argument("--decoded-bytes", type=int, required=True)
-    parser.add_argument("--rest-repair-requests", type=int, required=True)
+    parser.add_argument("--rest-repair-requests", type=int, default=0)
     parser.add_argument(
         "--rest-repair-decoded-bytes",
         type=int,
-        required=True,
+        default=0,
+    )
+    parser.add_argument(
+        "--catch-up-mode",
+        choices=("DISABLED", "AUTO"),
+        default=(
+            os.getenv("REALTIME_V2_ADVANCED_CATCH_UP_MODE")
+            or "DISABLED"
+        ),
     )
 
 
@@ -191,13 +202,45 @@ def parse_args(argv=None):
         parser.error("Advanced controller targets only stocks_realtime_v2")
     if not args.execute:
         parser.error("Advanced controller requires --execute")
-    args.budgets = AdvancedIngressBudgets(
-        args.stream_sessions,
-        args.connection_attempts,
-        args.decoded_bytes,
-        args.rest_repair_requests,
-        args.rest_repair_decoded_bytes,
-    )
+    if args.catch_up_mode == "AUTO":
+        if (
+            args.rest_repair_requests
+            or args.rest_repair_decoded_bytes
+        ):
+            parser.error(
+                "automatic catch-up derives REST repair budgets"
+            )
+        args.budgets = automatic_advanced_ingress_budgets(
+            universe_target=args.universe_target,
+            stream_sessions=args.stream_sessions,
+            connection_attempts=args.connection_attempts,
+            decoded_bytes=args.decoded_bytes,
+        )
+        args.rest_repair_response_byte_limit = (
+            args.rest_repair_response_byte_limit
+            or AUTOMATIC_CATCH_UP_RESPONSE_BYTE_LIMIT
+        )
+        args.rest_repair_expected_cost = (
+            args.rest_repair_expected_cost
+            or AUTOMATIC_CATCH_UP_EXPECTED_COST
+        )
+        if (
+            args.rest_repair_response_byte_limit
+            != AUTOMATIC_CATCH_UP_RESPONSE_BYTE_LIMIT
+            or args.rest_repair_expected_cost
+            != AUTOMATIC_CATCH_UP_EXPECTED_COST
+        ):
+            parser.error(
+                "automatic catch-up policy identity changed"
+            )
+    else:
+        args.budgets = AdvancedIngressBudgets(
+            args.stream_sessions,
+            args.connection_attempts,
+            args.decoded_bytes,
+            args.rest_repair_requests,
+            args.rest_repair_decoded_bytes,
+        )
     if (args.preferred_cohort_id is None) != (
         args.cohort_selection_reference is None
     ):
@@ -926,6 +969,10 @@ class _HybridRepairCoordinator:
         self.instrument_ids = ()
         self.process = None
         self.terminal_outcome = None
+        self.stream_started_at = None
+        self.complete_through = None
+        self.repaired_through = None
+        self.provider_requests = 0
 
     @property
     def unresolved(self):
@@ -952,6 +999,8 @@ class _HybridRepairCoordinator:
             )
         if stream_started_at is None:
             return
+        self.stream_started_at = stream_started_at
+        self.complete_through = complete_through
         startup = plan_hybrid_startup(
             session_open=self.session_open,
             stream_started_at=stream_started_at,
@@ -1059,13 +1108,44 @@ class _HybridRepairCoordinator:
                 state="COMPLETE",
                 checked_at=now,
             )
+        self.complete_through = through
+        self.repaired_through = through
         self.window = None
+
+    def _durable_closure_complete(self):
+        identity = self.window.identity
+        through = identity.repair_end or identity.gap_end
+        with self.provider.transaction(
+            APP_ROLE,
+            read_only=True,
+        ) as unit:
+            bars = _load_hybrid_bars_cursor(
+                unit.cursor,
+                cohort_id=self.runtime_scope.cohort_id,
+                instrument_ids=self.instrument_ids,
+                requested_from=identity.gap_start,
+                requested_to=through,
+            )
+        closure = reconcile_hybrid_minute_closure(
+            requested_from=identity.gap_start,
+            requested_to=through,
+            instrument_ids=self.instrument_ids,
+            bars=bars,
+        )
+        return closure.complete_through == through
 
     def _handle_attempt_result(self, now, *, return_code, stderr):
         try:
             report = _read_child_report(self.window.report_path)
         except (OSError, ValueError, json.JSONDecodeError):
             report = None
+        if report is not None:
+            self.provider_requests += sum(
+                int(item.get("provider_requests") or 0)
+                for cycle in report.get("cycles") or ()
+                for item in cycle
+                if isinstance(item, dict)
+            )
         if (
             report is not None
             and report.get("status") == "RETRYABLE_COVERAGE_PENDING"
@@ -1091,10 +1171,23 @@ class _HybridRepairCoordinator:
             self.terminal_outcome = "BLOCKED_GAP"
             return
         if return_code:
+            if (
+                report is None
+                and self._durable_closure_complete()
+            ):
+                self._verify_completed(now)
+                return
             failure = classify_advanced_ingress_failure(
                 f"CHILD_EXIT_{return_code}",
                 detail=stderr[-320:],
             )
+            if report is None and not self.window.report_path.exists():
+                write_report(self.window.report_path, {
+                    "status": "FAILED",
+                    "failure_code": f"CHILD_EXIT_{return_code}",
+                    "detail": stderr[-320:],
+                    "provider_requests": self.provider_requests,
+                })
             with self.provider.transaction(APP_ROLE) as unit:
                 _finish_hybrid_window_cursor(
                     unit.cursor,
@@ -1642,7 +1735,26 @@ def main(argv=None) -> int:
                 "plan_id": str(plan.plan_id),
                 "session_date": plan.session_date.isoformat(),
                 "budgets": asdict(plan.budgets),
-                "provider_requests": 0,
+                "catch_up_mode": args.catch_up_mode,
+                "provider_requests": hybrid.provider_requests,
+                "equity_watermark": {
+                    "session_open_utc": session_open.isoformat(),
+                    "websocket_started_at_utc": (
+                        None
+                        if hybrid.stream_started_at is None
+                        else hybrid.stream_started_at.isoformat()
+                    ),
+                    "complete_through_utc": (
+                        None
+                        if hybrid.complete_through is None
+                        else hybrid.complete_through.isoformat()
+                    ),
+                    "repaired_through_utc": (
+                        None
+                        if hybrid.repaired_through is None
+                        else hybrid.repaired_through.isoformat()
+                    ),
+                },
                 "hybrid_repair_pending": hybrid.unresolved,
                 "hybrid_repair_terminal_outcome": (
                     hybrid.terminal_outcome

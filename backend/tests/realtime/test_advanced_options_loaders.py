@@ -219,6 +219,8 @@ def test_canonical_loader_builds_exact_native_executor_membership():
     assert set(cycle.executors) == {
         DetectorFamily.O1,
         DetectorFamily.O3,
+        DetectorFamily.OS1,
+        DetectorFamily.OS2,
     }
 
 

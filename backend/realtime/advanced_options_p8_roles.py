@@ -18,6 +18,10 @@ from psycopg2.extras import execute_batch
 from psycopg2.pool import ThreadedConnectionPool
 
 from .advanced_gateway import AdvancedGateway, GatewayConfiguration
+from .advanced_options_acquisition_runtime import (
+    ACQUISITION_STATUS_SCHEMA,
+    acquisition_binding_from_payload,
+)
 from .advanced_journal_registry import (
     build_advanced_journal_registration,
     load_advanced_journal_registration_cursor,
@@ -60,6 +64,7 @@ from .advanced_options_resident_barrier import (
 )
 from .advanced_options_v3_authority import (
     consume_session_acquisition_authority_cursor,
+    load_window_cycle_authorization_cursor,
     session_acquisition_authorization_from_payload,
 )
 from .advanced_options_v3_deployment import (
@@ -432,6 +437,233 @@ def _wait_registration(provider, generation, stop_event):
     raise RuntimeError("P8 role stopped before journal registration")
 
 
+def _wait_v3_binding(provider, binding, bundle, stop_event):
+    from .advanced_options_p8_production import (
+        load_v3_pending_window_bindings,
+    )
+
+    while not stop_event.is_set():
+        values = load_v3_pending_window_bindings(
+            provider=provider,
+            binding=binding,
+            bundle=bundle,
+            available_at=datetime.now(UTC),
+        )
+        if values:
+            return values[0]
+        stop_event.wait(0.1)
+    raise RuntimeError("P8 role stopped before exact E binding")
+
+
+def _downstream_binding_evidence(provider, binding, bundle):
+    authorities = bundle.get("v3_authorities")
+    if not isinstance(authorities, dict):
+        raise RuntimeError("V3 session authority is unavailable")
+    session = session_acquisition_authorization_from_payload(
+        authorities.get("session_acquisition")
+    )
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        authority = load_window_cycle_authorization_cursor(
+            unit.cursor,
+            target_window_id=binding.window_id,
+            session_authorization_id=session.authorization_id,
+        )
+    equity = binding.equity_input
+    e_o_seconds = (
+        authority.options_cutoff - equity.equity_cutoff
+    ).total_seconds()
+    if (
+        authority.target_cohort_id
+        != binding.enrollment.control_plane.cohort_id
+        or authority.equity_binding_sha256
+        != equity.binding_sha256
+        or authority.equity_receipt_id != equity.equity_receipt_id
+        or authority.equity_cutoff != equity.equity_cutoff
+        or not 0 <= e_o_seconds <= 300
+    ):
+        raise RuntimeError("P8 exact per-E downstream binding changed")
+    evidence = {
+        "schema": "advanced-options-p8-downstream-binding-v1",
+        "session_authorization_id": str(session.authorization_id),
+        "target_window_id": str(binding.window_id),
+        "equity_receipt_id": str(equity.equity_receipt_id),
+        "equity_input_sha256": equity.input_sha256,
+        "finalized_cutoff_utc": equity.equity_cutoff.isoformat(),
+        "options_cutoff_utc": authority.options_cutoff.isoformat(),
+        "e_o_seconds": e_o_seconds,
+        "equity_binding_sha256": equity.binding_sha256,
+        "window_cycle_authorization_sha256": (
+            authority.authorization_sha256
+        ),
+    }
+    evidence["binding_sha256"] = canonical_sha256(evidence)
+    return evidence
+
+
+def _acquisition_document(path: Path):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "V3 acquisition binding is unavailable"
+        ) from error
+    return acquisition_binding_from_payload(value)
+
+
+def _run_v3_acquisition_observer(
+    *,
+    package,
+    bundle,
+    binding,
+    provider,
+    environment,
+    stop_event,
+):
+    control = binding.enrollment.control_plane
+    acquisition = _acquisition_document(Path(str(
+        environment.get(
+            "REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH",
+            "/run/advanced-options-acquisition/binding.json",
+        )
+    )))
+    authorities = bundle.get("v3_authorities")
+    if not isinstance(authorities, dict):
+        raise RuntimeError("V3 session authority is unavailable")
+    session = session_acquisition_authorization_from_payload(
+        authorities.get("session_acquisition")
+    )
+    contracts = tuple(sorted(
+        row.contract_ticker
+        for row in binding.enrollment.activity_selection.contracts
+    ))
+    if (
+        acquisition.authority != session
+        or acquisition.authority.cohort_id != control.cohort_id
+        or acquisition.authority.journal_generation
+        != control.source_flow.journal_generation
+        or acquisition.contract_tickers != contracts
+    ):
+        raise RuntimeError("V3 acquisition/downstream identity changed")
+    _owner_id, owner_epoch = _lease(
+        provider,
+        bundle,
+        AdvancedOptionsProcessKind.INGRESS,
+    )
+    root = _journal_root(environment)
+    path = (
+        root
+        / "options-acquisition"
+        / str(acquisition.authority.journal_generation)
+        / "options.sqlite"
+    )
+    while not path.is_file() and not stop_event.is_set():
+        stop_event.wait(0.1)
+    if not path.is_file():
+        raise RuntimeError("V3 acquisition journal is unavailable")
+    shard_map = _shard_map(binding)
+    registration = _registration(
+        provider,
+        acquisition.authority.journal_generation,
+    )
+    if registration is None:
+        registration = build_advanced_journal_registration(
+            root=root,
+            path=path,
+            journal_generation=acquisition.authority.journal_generation,
+            plan_id=control.plan_id,
+            stream_session_id=acquisition.stream_session_id,
+            cohort_id=control.cohort_id,
+            manifest_id=control.manifest_id,
+            session_date=control.session_date,
+            owner_epoch=owner_epoch,
+            normalizer_version=NORMALIZER_VERSION,
+            shard_ids=(0,),
+            shard_map_sha256=shard_map.sha256,
+        )
+        with provider.transaction(APP_ROLE) as unit:
+            register_advanced_journal_cursor(unit.cursor, registration)
+            mark_advanced_journal_writing_cursor(
+                unit.cursor,
+                registration.journal_generation,
+                checked_at=datetime.now(UTC),
+            )
+    status_path = Path(str(environment.get(
+        "REALTIME_V3_OPTIONS_ACQUISITION_STATUS_PATH",
+        "/var/lib/realtime-v2-reports/options-acquisition-status.json",
+    )))
+    last_raw_offset = 0
+    last_event_offset = 0
+    connection_attempts = 0
+    while not stop_event.is_set():
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            stop_event.wait(0.1)
+            continue
+        if (
+            not isinstance(status, dict)
+            or status.get("schema") != ACQUISITION_STATUS_SCHEMA
+            or status.get("binding_sha256")
+            != acquisition.binding_sha256
+            or status.get("owner_id") != str(acquisition.owner_id)
+            or status.get("journal_generation")
+            != str(acquisition.authority.journal_generation)
+        ):
+            raise RuntimeError("V3 acquisition durable status changed")
+        last_raw_offset = int(status.get("last_raw_offset", 0))
+        last_event_offset = int(status.get("last_event_offset", 0))
+        connection_attempts = int(
+            status.get("connection_attempts", 0)
+        )
+        with provider.transaction(APP_ROLE) as unit:
+            update_advanced_journal_offsets_cursor(
+                unit.cursor,
+                registration.journal_generation,
+                raw_committed_offset=last_raw_offset,
+                normalized_committed_offset=last_event_offset,
+                bridge_committed_offset=None,
+                checked_at=datetime.now(UTC),
+            )
+        if last_raw_offset > 0 and last_event_offset > 0:
+            _snapshot_v3_resident_windows(
+                provider,
+                binding,
+                bundle=bundle,
+                member=ResidentCompletionMember.INGRESS,
+                owner_epoch=owner_epoch,
+                reader=RawJournalReader(path),
+                raw_offset=last_raw_offset,
+                event_offset=last_event_offset,
+                connection_attempts=connection_attempts,
+            )
+        if status.get("state") == "COMPLETE":
+            break
+        stop_event.wait(0.1)
+    if last_raw_offset <= 0 or last_event_offset <= 0:
+        raise RuntimeError("V3 acquisition journal has no durable data")
+    with provider.transaction(APP_ROLE) as unit:
+        seal_advanced_journal_cursor(
+            unit.cursor,
+            registration.journal_generation,
+            raw_committed_offset=last_raw_offset,
+            normalized_committed_offset=last_event_offset,
+            sealed_files_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            checked_at=datetime.now(UTC),
+        )
+    return {
+        "status": "COMPLETE",
+        "kind": AdvancedOptionsProcessKind.INGRESS.value,
+        "raw_end_offset": last_raw_offset,
+        "normalized_end_offset": last_event_offset,
+        "connection_attempts": connection_attempts,
+        "acquisition_owner_id": str(acquisition.owner_id),
+        "journal_generation": str(
+            acquisition.authority.journal_generation
+        ),
+        "effects": dict(_EFFECTS),
+    }
+
+
 def _manifest(binding):
     control = binding.enrollment.control_plane
     members = (
@@ -505,40 +737,14 @@ def _run_ingress(*, package, bundle, binding, provider, environment, stop_event)
         == STAGE_CATALOG_VERSION_V5
     ):
         validate_advanced_options_v3_runtime_identity(package, bundle)
-        authorities = bundle.get("v3_authorities")
-        if not isinstance(authorities, dict):
-            raise RuntimeError("V3 split authorities are unavailable")
-        session_authority = (
-            session_acquisition_authorization_from_payload(
-                authorities.get("session_acquisition")
-            )
+        return _run_v3_acquisition_observer(
+            package=package,
+            bundle=bundle,
+            binding=binding,
+            provider=provider,
+            environment=environment,
+            stop_event=stop_event,
         )
-        if (
-            session_authority.cohort_id != control.cohort_id
-            or session_authority.journal_generation
-            != control.source_flow.journal_generation
-        ):
-            raise RuntimeError(
-                "V3 session acquisition authority scope changed"
-            )
-        effect_sha256 = canonical_sha256({
-            "schema": "advanced-options-v3-provider-effect-v1",
-            "package_sha256": package["package_sha256"],
-            "bundle_sha256": bundle["bundle_sha256"],
-            "cohort_id": str(control.cohort_id),
-            "journal_generation": str(
-                control.source_flow.journal_generation
-            ),
-            "channels": ["T", "Q"],
-        })
-        with provider.transaction(APP_ROLE) as unit:
-            consume_session_acquisition_authority_cursor(
-                unit.cursor,
-                session_authority,
-                effect_kind="PROVIDER_SOCKET",
-                effect_identity_sha256=effect_sha256,
-                consumed_at=datetime.now(UTC),
-            )
     owner_id, owner_epoch = _lease(
         provider,
         bundle,
@@ -1158,6 +1364,7 @@ def _run_window(
     environment,
     stop_event,
     pool=None,
+    binding_observer=None,
 ):
     catalog_version = bundle.get("orchestration", {}).get(
         "catalog_version"
@@ -1172,6 +1379,7 @@ def _run_window(
         )
 
         results: dict[str, dict[str, object]] = {}
+        observed_bindings: set[UUID] = set()
         while not stop_event.is_set():
             windows = load_v3_pending_window_bindings(
                 provider=provider,
@@ -1184,6 +1392,13 @@ def _run_window(
                 continue
             progressed = False
             for window_binding in windows:
+                if (
+                    callable(binding_observer)
+                    and window_binding.window_id
+                    not in observed_bindings
+                ):
+                    binding_observer(window_binding)
+                    observed_bindings.add(window_binding.window_id)
                 dependencies = _v3_resident_dependencies(
                     provider,
                     window_binding,
@@ -1280,23 +1495,119 @@ def run_p8_role(
     bundle,
     environment,
     stop_event: Event,
+    state_observer=None,
 ):
+    if state_observer is not None and not callable(state_observer):
+        raise TypeError("P8 role state observer is invalid")
+    v3 = (
+        bundle.get("orchestration", {}).get("catalog_version")
+        == STAGE_CATALOG_VERSION_V5
+    )
     production_binding = bundle.get("production_binding")
+    attached_binding = None
     if not isinstance(production_binding, dict):
-        raise RuntimeError("P8 production binding is unavailable")
-    binding = p8_production_binding_from_payload(production_binding)
+        if not v3:
+            raise RuntimeError("P8 production binding is unavailable")
+        from .advanced_options_p8_runtime import (
+            P8DownstreamBindingStore,
+            p8_downstream_binding_payload,
+            p8_preopen_session_binding_from_payload,
+        )
+
+        session_binding = p8_preopen_session_binding_from_payload(
+            bundle.get("session_binding")
+        )
+        store = P8DownstreamBindingStore(
+            Path(str(environment.get(
+                "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR",
+                "/var/lib/realtime-v2-reports/downstream-bindings",
+            ))),
+            session_binding=session_binding,
+        )
+        while not stop_event.is_set():
+            attached_binding = store.latest()
+            if attached_binding is not None:
+                production_binding = dict(
+                    attached_binding.production_binding
+                )
+                if state_observer is not None:
+                    state_observer(
+                        "BOUND_TO_E",
+                        p8_downstream_binding_payload(
+                            attached_binding
+                        ),
+                    )
+                break
+            stop_event.wait(0.1)
+        if not isinstance(production_binding, dict):
+            raise RuntimeError("P8 role stopped before exact E binding")
+    template_binding = p8_production_binding_from_payload(
+        production_binding
+    )
     if (
-        binding.enrollment.enrollment_sha256
-        != bundle["enrollment"]["enrollment_sha256"]
-        or str(binding.window_id) != bundle["window_id"]
+        template_binding.enrollment.enrollment_sha256
+        != (
+            template_binding.enrollment.enrollment_sha256
+            if attached_binding is not None
+            else bundle["enrollment"]["enrollment_sha256"]
+        )
+        or (
+            attached_binding is None
+            and str(template_binding.window_id) != bundle["window_id"]
+        )
     ):
         raise RuntimeError("P8 role binding changed")
     provider, pool = _provider(environment)
+    bound_binding = None
     try:
+        if v3:
+            validate_advanced_options_v3_runtime_identity(
+                package,
+                bundle,
+            )
+            if kind is AdvancedOptionsProcessKind.WINDOW:
+                def observe_binding(binding):
+                    nonlocal bound_binding
+                    evidence = _downstream_binding_evidence(
+                        provider,
+                        binding,
+                        bundle,
+                    )
+                    bound_binding = binding
+                    if state_observer is not None:
+                        state_observer("BOUND_TO_E", evidence)
+
+                return _run_window(
+                    package=package,
+                    bundle=bundle,
+                    binding=template_binding,
+                    provider=provider,
+                    environment=environment,
+                    stop_event=stop_event,
+                    pool=pool,
+                    binding_observer=observe_binding,
+                )
+            bound_binding = _wait_v3_binding(
+                provider,
+                template_binding,
+                bundle,
+                stop_event,
+            )
+            if state_observer is not None:
+                state_observer(
+                    "BOUND_TO_E",
+                    _downstream_binding_evidence(
+                        provider,
+                        bound_binding,
+                        bundle,
+                    ),
+                )
+        else:
+            bound_binding = template_binding
         arguments = {
             "package": package,
             "bundle": bundle,
-            "binding": binding,
+            "binding": bound_binding,
             "provider": provider,
             "environment": environment,
             "stop_event": stop_event,
@@ -1311,13 +1622,14 @@ def run_p8_role(
             return _run_window(**arguments, pool=pool)
         raise RuntimeError("P8 Docker role kind is invalid")
     except BaseException as error:
-        _record_v3_resident_failure(
-            provider,
-            binding,
-            bundle=bundle,
-            kind=kind,
-            error=error,
-        )
+        if bound_binding is not None:
+            _record_v3_resident_failure(
+                provider,
+                bound_binding,
+                bundle=bundle,
+                kind=kind,
+                error=error,
+            )
         raise
     finally:
         pool.closeall()

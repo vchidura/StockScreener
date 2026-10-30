@@ -23,8 +23,10 @@ from .contracts import canonical_sha256
 
 MASSIVE_OPTIONS_SNAPSHOT_BASE_URL = "https://api.massive.com"
 P8_SELECTION_REQUEST_COUNT = 2
+P8_EXACT_CONTRACT_REQUEST_COUNT = 1
 P8_SELECTION_MAXIMUM_DECODED_BYTES = 100_000_000
 P8_SELECTION_MAXIMUM_RESULTS_PER_UNDERLYING = 250
+P8_EXACT_CONTRACT_RESULT_COUNT = 4
 P8_SELECTION_MAXIMUM_PROVIDER_CLOCK_SKEW_SECONDS = 5
 P8_SELECTION_POLICY = P7TransportSelectionPolicy(
     version="advanced-options-p8-same-day-activity-v1",
@@ -80,10 +82,13 @@ class P8ActivitySelectionCapture:
     def __post_init__(self) -> None:
         if (
             self.selection.status is not P7TransportSelectionStatus.READY
-            or self.request_count != P8_SELECTION_REQUEST_COUNT
+            or self.request_count not in {
+                P8_SELECTION_REQUEST_COUNT,
+                P8_EXACT_CONTRACT_REQUEST_COUNT,
+            }
             or not 0 < self.decoded_bytes
             <= P8_SELECTION_MAXIMUM_DECODED_BYTES
-            or self.pages != P8_SELECTION_REQUEST_COUNT
+            or self.pages != self.request_count
             or self.pagination_requests != 0
             or set(self.selected_snapshots) != set(self.selection.contracts)
         ):
@@ -102,14 +107,16 @@ def _candidate_from_snapshot(
 ) -> P7TransportCandidate | None:
     details = row.get("details")
     quote_row = row.get("last_quote")
-    day_row = row.get("day")
+    day_row = row.get("day", row.get("session"))
     underlying = row.get("underlying_asset")
     if not all(
         isinstance(value, Mapping)
         for value in (details, quote_row, day_row, underlying)
     ):
         return None
-    ticker = str(details.get("ticker", "")).strip().upper()
+    ticker = str(
+        details.get("ticker", row.get("ticker", ""))
+    ).strip().upper()
     option_type = {
         "call": "C",
         "put": "P",
@@ -140,6 +147,71 @@ def _candidate_from_snapshot(
             "last_quote.last_updated",
         ),
         source_sha256=canonical_sha256(row),
+    )
+
+
+def _select_exact_call_put_contracts(
+    candidates: tuple[P7TransportCandidate, ...],
+    *,
+    reviewed_at: datetime,
+    policy: P7TransportSelectionPolicy,
+) -> P7TransportSelection:
+    selected = []
+    for option_type in ("C", "P"):
+        selection = select_p7_transport_contracts(
+            tuple(
+                row
+                for row in candidates
+                if row.option_type == option_type
+            ),
+            reviewed_at=reviewed_at,
+            policy=policy,
+        )
+        if selection.status is not P7TransportSelectionStatus.READY:
+            raise RuntimeError(
+                "P8 Massive exact-contract activity blocked: "
+                + ",".join(selection.reason_codes)
+            )
+        selected.extend(selection.selected)
+    selected_rows = tuple(sorted(
+        selected,
+        key=lambda row: (
+            row.underlyer,
+            row.option_type,
+            row.contract_ticker,
+        ),
+    ))
+    source_sha256 = canonical_sha256(tuple(
+        (
+            row.contract_ticker,
+            row.market_data_time,
+            row.source_sha256,
+        )
+        for row in selected_rows
+    ))
+    valid_until = min(
+        row.market_data_time
+        + timedelta(seconds=policy.maximum_snapshot_age_seconds)
+        for row in selected_rows
+    )
+    selection_sha256 = canonical_sha256({
+        "status": P7TransportSelectionStatus.READY,
+        "policy_sha256": policy.sha256,
+        "reviewed_at": reviewed_at,
+        "valid_until": valid_until,
+        "source_sha256": source_sha256,
+        "selected": selected_rows,
+        "reason_codes": (),
+    })
+    return P7TransportSelection(
+        P7TransportSelectionStatus.READY,
+        policy,
+        reviewed_at,
+        valid_until,
+        selected_rows,
+        source_sha256,
+        selection_sha256,
+        (),
     )
 
 
@@ -313,6 +385,12 @@ class MassiveAdvancedOptionsSelectionSource:
         policy: P7TransportSelectionPolicy | None = None,
         base_url: str = MASSIVE_OPTIONS_SNAPSHOT_BASE_URL,
         clock: Callable[[], datetime] | None = None,
+        maximum_response_decoded_bytes: int = (
+            P8_SELECTION_MAXIMUM_DECODED_BYTES
+        ),
+        maximum_total_decoded_bytes: int = (
+            P8_SELECTION_MAXIMUM_DECODED_BYTES
+        ),
     ) -> None:
         if not callable(getattr(transport, "get", None)):
             raise TypeError("P8 Massive transport is invalid")
@@ -324,11 +402,28 @@ class MassiveAdvancedOptionsSelectionSource:
             "https://api.polygon.io",
         }:
             raise ValueError("P8 Massive base URL is not approved")
+        if (
+            type(maximum_response_decoded_bytes) is not int
+            or type(maximum_total_decoded_bytes) is not int
+            or not 0
+            < maximum_response_decoded_bytes
+            <= maximum_total_decoded_bytes
+            <= P8_SELECTION_MAXIMUM_DECODED_BYTES
+        ):
+            raise ValueError(
+                "P8 selection decoded-byte ceilings are invalid"
+            )
         self._transport = transport
         self._spots = spots
         self._policy = policy or P8_SELECTION_POLICY
         self._base_url = normalized_base
         self._clock = clock
+        self._maximum_response_decoded_bytes = (
+            maximum_response_decoded_bytes
+        )
+        self._maximum_total_decoded_bytes = (
+            maximum_total_decoded_bytes
+        )
 
     def _request(
         self,
@@ -371,6 +466,13 @@ class MassiveAdvancedOptionsSelectionSource:
             raise RuntimeError(
                 f"P8 Massive selection failed for {underlyer}: "
                 f"HTTP {response.status_code}"
+            )
+        if not 0 < len(response.body) <= (
+            self._maximum_response_decoded_bytes
+        ):
+            raise ValueError(
+                "P8 Massive selection response decoded-byte ceiling "
+                "exceeded"
             )
         try:
             payload = json.loads(response.body)
@@ -452,7 +554,7 @@ class MassiveAdvancedOptionsSelectionSource:
                 "row_count": len(payload["results"]),
             })
             snapshots.update(raw_snapshots)
-            if decoded_bytes > P8_SELECTION_MAXIMUM_DECODED_BYTES:
+            if decoded_bytes > self._maximum_total_decoded_bytes:
                 raise ValueError(
                     "P8 Massive selection exceeded decoded-byte ceiling"
                 )
@@ -509,5 +611,189 @@ class MassiveAdvancedOptionsSelectionSource:
             selected_snapshots={
                 row.contract_ticker: snapshots[row.contract_ticker]
                 for row in selection.selected
+            },
+        )
+
+
+class MassiveAdvancedOptionsExactContractSource:
+    """One unified snapshot request for the exact four admitted contracts."""
+
+    def __init__(
+        self,
+        transport: PolygonHttpTransport,
+        *,
+        policy: P7TransportSelectionPolicy | None = None,
+        base_url: str = MASSIVE_OPTIONS_SNAPSHOT_BASE_URL,
+        clock: Callable[[], datetime] | None = None,
+        maximum_decoded_bytes: int = (
+            P8_SELECTION_MAXIMUM_DECODED_BYTES
+        ),
+    ) -> None:
+        if not callable(getattr(transport, "get", None)):
+            raise TypeError("P8 Massive transport is invalid")
+        normalized_base = base_url.rstrip("/")
+        if normalized_base not in {
+            "https://api.massive.com",
+            "https://api.polygon.io",
+        }:
+            raise ValueError("P8 Massive base URL is not approved")
+        if (
+            type(maximum_decoded_bytes) is not int
+            or maximum_decoded_bytes <= 0
+        ):
+            raise ValueError(
+                "exact-contract response byte ceiling must be positive"
+            )
+        self._transport = transport
+        self._policy = policy or P8_SELECTION_POLICY
+        self._base_url = normalized_base
+        self._clock = clock
+        self._maximum_decoded_bytes = maximum_decoded_bytes
+
+    def capture(
+        self,
+        *,
+        contract_tickers: tuple[str, ...],
+        reviewed_at: datetime,
+        session_date: date,
+    ) -> P8ActivitySelectionCapture:
+        reviewed = _utc(reviewed_at, "reviewed_at")
+        tickers = tuple(sorted(
+            str(value).strip().upper()
+            for value in contract_tickers
+        ))
+        if (
+            reviewed.date() != session_date
+            or len(tickers) != P8_EXACT_CONTRACT_RESULT_COUNT
+            or len(set(tickers)) != P8_EXACT_CONTRACT_RESULT_COUNT
+            or {
+                (ticker[2:5], ticker[11:12])
+                for ticker in tickers
+                if len(ticker) >= 12 and ticker.startswith("O:")
+            }
+            != {
+                ("QQQ", "C"),
+                ("QQQ", "P"),
+                ("SPY", "C"),
+                ("SPY", "P"),
+            }
+        ):
+            raise ValueError(
+                "P8 exact-contract request membership changed"
+            )
+        response = self._transport.get(
+            f"{self._base_url}/v3/snapshot",
+            {
+                "ticker.any_of": ",".join(tickers),
+                "type": "options",
+                "limit": str(P8_EXACT_CONTRACT_RESULT_COUNT),
+                "sort": "ticker",
+                "order": "asc",
+            },
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                "P8 Massive exact-contract snapshot failed: "
+                f"HTTP {response.status_code}"
+            )
+        if not 0 < len(response.body) <= self._maximum_decoded_bytes:
+            raise ValueError(
+                "P8 Massive exact-contract decoded-byte ceiling exceeded"
+            )
+        try:
+            payload = json.loads(response.body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                "P8 Massive exact-contract snapshot returned invalid JSON"
+            ) from error
+        if (
+            not isinstance(payload, dict)
+            or payload.get("status") not in {"OK", "DELAYED"}
+            or payload.get("next_url")
+            or not isinstance(payload.get("results"), list)
+            or len(payload["results"])
+            != P8_EXACT_CONTRACT_RESULT_COUNT
+        ):
+            raise ValueError(
+                "P8 Massive exact-contract scope or pagination changed"
+            )
+        candidates: list[P7TransportCandidate] = []
+        snapshots: dict[str, Mapping[str, object]] = {}
+        snapshot_clocks: list[datetime] = []
+        for row in payload["results"]:
+            if not isinstance(row, dict):
+                raise TypeError(
+                    "P8 exact-contract snapshot row must be an object"
+                )
+            candidate = _candidate_from_snapshot(
+                row,
+                session_date=session_date,
+            )
+            if candidate is None:
+                raise ValueError(
+                    "P8 exact-contract snapshot row is incomplete"
+                )
+            candidates.append(candidate)
+            snapshots[candidate.contract_ticker] = row
+            snapshot_clocks.append(candidate.market_data_time)
+        if set(snapshots) != set(tickers):
+            raise ValueError(
+                "P8 Massive exact-contract response membership changed"
+            )
+        local_completed_at = (
+            reviewed
+            if self._clock is None
+            else max(
+                reviewed,
+                _utc(self._clock(), "selection clock"),
+            )
+        )
+        latest_snapshot_at = max(snapshot_clocks)
+        if (
+            latest_snapshot_at - local_completed_at
+        ).total_seconds() > P8_SELECTION_MAXIMUM_PROVIDER_CLOCK_SKEW_SECONDS:
+            raise ValueError("P8 provider clock skew exceeded")
+        selected_at = max(local_completed_at, latest_snapshot_at)
+        selection = _select_exact_call_put_contracts(
+            tuple(candidates),
+            reviewed_at=selected_at,
+            policy=self._policy,
+        )
+        if (
+            set(selection.contracts) != set(tickers)
+        ):
+            raise RuntimeError(
+                "P8 Massive exact-contract response selection changed"
+            )
+        evidence = {
+            "schema": (
+                "advanced-options-p8-exact-contract-snapshot-v1"
+            ),
+            "endpoint": "/v3/snapshot",
+            "source_snapshot_at_utc": min(
+                snapshot_clocks
+            ).isoformat(),
+            "selected_at_utc": selected_at.isoformat(),
+            "valid_until_utc": selection.valid_until.isoformat(),
+            "policy_sha256": self._policy.sha256,
+            "source_snapshot_sha256": canonical_sha256(payload),
+            "request_id": payload.get("request_id"),
+            "request_count": P8_EXACT_CONTRACT_REQUEST_COUNT,
+            "decoded_bytes": len(response.body),
+            "pages": P8_EXACT_CONTRACT_REQUEST_COUNT,
+            "pagination_requests": 0,
+            "contracts": list(tickers),
+        }
+        evidence["selection_sha256"] = canonical_sha256(evidence)
+        return P8ActivitySelectionCapture(
+            selection=selection,
+            request_count=P8_EXACT_CONTRACT_REQUEST_COUNT,
+            decoded_bytes=len(response.body),
+            pages=P8_EXACT_CONTRACT_REQUEST_COUNT,
+            pagination_requests=0,
+            source_snapshot_at=min(snapshot_clocks),
+            evidence=evidence,
+            selected_snapshots={
+                ticker: snapshots[ticker] for ticker in tickers
             },
         )

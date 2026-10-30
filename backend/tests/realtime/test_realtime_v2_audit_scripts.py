@@ -29,9 +29,12 @@ from realtime.equity_evidence_repository import (  # noqa: E402
     RealtimeFeatureDefinition, persist_realtime_equity_materialization_cursor,
 )
 from realtime.equity_materialization_adapter import materialize_realtime_equity_evidence  # noqa: E402
+from scripts import audit_advanced_options_v3_operations as operations  # noqa: E402
 from scripts import audit_realtime_historical_coverage as coverage  # noqa: E402
 from scripts import audit_realtime_ticker_history as history  # noqa: E402
+from scripts import audit_realtime_v2_target9_scanner_warmup as scanner  # noqa: E402
 from scripts import realtime_v2_audit_support as support  # noqa: E402
+from scripts import validate_advanced_realtime_v3_holistic as holistic  # noqa: E402
 from tests.realtime.test_equity_bar_adapter import _developer_revision  # noqa: E402
 from tests.realtime.test_equity_materialization_adapter import _security  # noqa: E402
 from v2_database import disposable_v2_database, insert_cohort, requires_v2_database  # noqa: E402
@@ -110,6 +113,143 @@ def test_bar_gap_report_counts_missing_and_incomplete_sessions():
     assert report["covered_session_count"] == 2 and report["missing_session_count"] == 1
     assert report["missing_session_ranges"] == ({"start": "2026-10-07", "end": "2026-10-07"},)
     assert report["incomplete_sessions"] == ({"session_date": "2026-10-06", "actual_count": 4, "expected_count": 13},)
+
+
+def test_options_security_identity_does_not_depend_on_same_day_catalog():
+    identities = (
+        {"ticker": "QQQ", "security_id": str(UUID(int=1))},
+        {"ticker": "QQQ", "security_id": str(UUID(int=1))},
+        {"ticker": "SPY", "security_id": str(UUID(int=2))},
+        {"ticker": "AAPL", "security_id": str(UUID(int=3))},
+    )
+
+    grouped = operations._security_identity_groups(identities)
+
+    assert grouped == {
+        "QQQ": {str(UUID(int=1))},
+        "SPY": {str(UUID(int=2))},
+    }
+
+
+def test_target9_scanner_warmups_require_exact_derived_lineage():
+    coverage_rows = []
+    lineage_rows = []
+    for ticker in scanner.ADVANCED_SESSION_EQUITY_SYMBOLS:
+        coverage_rows.extend((
+            {
+                "ticker": ticker,
+                "interval": "1d",
+                "bar_count": 283,
+                "latest_session": date(2026, 10, 28),
+                "source_kinds": ["NATIVE_REST"],
+                "availability_modes": ["HISTORICAL_RECONSTRUCTED"],
+            },
+            {
+                "ticker": ticker,
+                "interval": "1h",
+                "bar_count": 700,
+                "latest_session": date(2026, 10, 28),
+                "source_kinds": ["DERIVED"],
+                "availability_modes": ["HISTORICAL_RECONSTRUCTED"],
+            },
+        ))
+        lineage_rows.append({
+            "ticker": ticker,
+            "parent_count": 210,
+            "source_count_mismatch": 0,
+            "invalid_source_links": 0,
+        })
+
+    assert scanner._failures(
+        coverage_rows,
+        lineage_rows,
+        through_session=date(2026, 10, 28),
+    ) == ()
+    lineage_rows[0]["invalid_source_links"] = 1
+    assert scanner._failures(
+        coverage_rows,
+        lineage_rows,
+        through_session=date(2026, 10, 28),
+    ) == ("AAPL:HOURLY_WARMUP_OR_LINEAGE",)
+
+
+def test_holistic_validator_requires_zero_effects_and_readiness_gaps():
+    bar_gaps = {
+        "adjusted_final_daily": {
+            "missing_session_count": 0,
+            "incomplete_sessions": [],
+        },
+    }
+    history_report = {
+        "per_ticker": [
+            {"bar_gaps": bar_gaps}
+            for _ in range(9)
+        ],
+        "global_references": {"downstream_blockers": []},
+    }
+    operations_report = {
+        "verdict": "GO_PROVIDER_AUTHORITY_REQUIRED",
+        "scope": {"effects": {"provider_rest": 0, "database_writes": 0}},
+        "gap_report": {
+            "buckets": {
+                "AVAILABLE": [{
+                    "fact": "treasury_curve",
+                    "status": "AVAILABLE",
+                    "evidence": {"publication_causal": True},
+                }],
+                "MISSING_STORED": [],
+                "STALE": [],
+                "AMBIGUOUS": [],
+                "REQUIRES_PROVIDER": [],
+            },
+        },
+    }
+
+    checks = holistic.evaluate(
+        {"verdict": "PASS", "effects": {"provider_rest": 0}},
+        {
+            "status": "COMPLETE",
+            "provider_requests": 0,
+            "provider_transport_calls": 0,
+            "release_advanced": False,
+        },
+        history_report,
+        {
+            "verdict": "PASS",
+            "failures": [],
+            "controls": {
+                "provider_requests": 0,
+                "database_writes": 0,
+                "transaction_read_only": "on",
+            },
+        },
+        (operations_report,),
+        operations_report,
+    )
+
+    assert set(checks.values()) == {True}
+    operations_report["gap_report"]["buckets"]["REQUIRES_PROVIDER"] = [{}]
+    assert holistic.evaluate(
+        {"verdict": "PASS", "effects": {"provider_rest": 0}},
+        {
+            "status": "COMPLETE",
+            "provider_requests": 0,
+            "provider_transport_calls": 0,
+            "release_advanced": False,
+        },
+        history_report,
+        {
+            "verdict": "PASS",
+            "failures": [],
+            "controls": {
+                "provider_requests": 0,
+                "database_writes": 0,
+                "transaction_read_only": "on",
+            },
+        },
+        (operations_report,),
+        operations_report,
+    )["readiness"] is False
 
 
 def test_daily_scale_compares_adjusted_and_raw_closes():

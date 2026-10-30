@@ -34,8 +34,8 @@ class DetectorFamily(str, Enum):
     O1 = "O1"
     O2 = "O2"
     O3 = "O3"
-    S1 = "S1"
-    S2 = "S2"
+    OS1 = "OS1"
+    OS2 = "OS2"
     AGGRESSIVE_PREMIUM_BURST = "AGGRESSIVE_PREMIUM_BURST"
     PERSISTENT_REALTIME_FLOW = "PERSISTENT_REALTIME_FLOW"
     SWEEP_LIKE_CLUSTER = "SWEEP_LIKE_CLUSTER"
@@ -47,8 +47,8 @@ PORTABLE_DETECTORS = frozenset(
         DetectorFamily.STOCK_SWING,
         DetectorFamily.O1,
         DetectorFamily.O3,
-        DetectorFamily.S1,
-        DetectorFamily.S2,
+        DetectorFamily.OS1,
+        DetectorFamily.OS2,
     }
 )
 
@@ -471,7 +471,12 @@ def product_scoped_detector_availability(
             ready,
             () if ready else (reason,),
         )
-    if detector in {DetectorFamily.O1, DetectorFamily.O3, DetectorFamily.S1, DetectorFamily.S2}:
+    if detector in {
+        DetectorFamily.O1,
+        DetectorFamily.O3,
+        DetectorFamily.OS1,
+        DetectorFamily.OS2,
+    }:
         if stocks is None or options is None:
             return ProductScopedDetectorAvailability(
                 detector, CapabilityVerdict.UNAVAILABLE, False,

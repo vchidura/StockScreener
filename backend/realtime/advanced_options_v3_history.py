@@ -33,6 +33,7 @@ ADVANCED_OPTIONS_V3_HISTORY_SECURITY_IDS = {
 }
 ADVANCED_OPTIONS_V3_HISTORY_UNDERLYINGS = ("QQQ", "SPY")
 ADVANCED_OPTIONS_V3_HISTORY_SESSION_COUNT = 31
+ADVANCED_OPTIONS_V3_RAW_HISTORY_SESSION_COUNT = 15
 
 
 class AdvancedOptionsHistoryBindingIdentityError(ValueError):
@@ -134,20 +135,23 @@ def _manifest_member_identity(cursor, manifest_id: str):
 def _coverage(cursor, sessions: tuple[date, ...], known_at: datetime):
     cursor.execute(
         "SELECT revision.ticker,revision.security_id::text,"
-        "revision.session_date,revision.bar_revision_id::text,"
+        "revision.session_date,current.adjustment_basis,"
+        "revision.bar_revision_id::text,"
         "revision.observed_at,revision.payload_sha256 "
         "FROM rt.bar_current AS current "
         "JOIN rt.bar_revisions AS revision "
         "ON revision.bar_revision_id=current.bar_revision_id "
         "AND revision.observed_at=current.observed_at "
         "WHERE current.cohort_id=%s AND current.interval='1d' "
-        "AND current.adjustment_basis='ADJUSTED' "
+        "AND current.adjustment_basis=ANY(%s) "
         "AND revision.is_final AND revision.ticker=ANY(%s) "
         "AND revision.session_date=ANY(%s) "
         "AND revision.observed_at<=%s "
-        "ORDER BY revision.ticker,revision.session_date",
+        "ORDER BY revision.ticker,current.adjustment_basis,"
+        "revision.session_date",
         (
             str(ADVANCED_OPTIONS_V3_HISTORY_SOURCE_COHORT_ID),
+            ["ADJUSTED", "RAW_UNADJUSTED"],
             list(ADVANCED_OPTIONS_V3_HISTORY_UNDERLYINGS),
             list(sessions),
             known_at,
@@ -159,55 +163,91 @@ def _coverage(cursor, sessions: tuple[date, ...], known_at: datetime):
             "ticker": raw[0],
             "security_id": raw[1],
             "session_date": raw[2],
-            "bar_revision_id": raw[3],
-            "observed_at": raw[4],
-            "payload_sha256": raw[5],
+            "adjustment_basis": raw[3],
+            "bar_revision_id": raw[4],
+            "observed_at": raw[5],
+            "payload_sha256": raw[6],
         }
-        grouped[str(row["ticker"])].append(row)
+        grouped[
+            (str(row["ticker"]), str(row["adjustment_basis"]))
+        ].append(row)
     symbols = {}
     missing = {}
     for ticker in ADVANCED_OPTIONS_V3_HISTORY_UNDERLYINGS:
-        members = grouped.get(ticker, ())
-        found = tuple(row["session_date"] for row in members)
-        missing_sessions = tuple(
-            session for session in sessions if session not in found
-        )
-        if missing_sessions:
-            missing[ticker] = tuple(
-                session.isoformat() for session in missing_sessions
-            )
-            continue
-        security_ids = {
-            str(row["security_id"]) for row in members
+        expected_by_basis = {
+            "ADJUSTED": sessions,
+            "RAW_UNADJUSTED": sessions[
+                -ADVANCED_OPTIONS_V3_RAW_HISTORY_SESSION_COUNT:
+            ],
         }
+        members_by_basis = {}
+        for basis, expected in expected_by_basis.items():
+            members_by_basis[basis] = tuple(
+                row
+                for row in grouped.get((ticker, basis), ())
+                if row["session_date"] in expected
+            )
+        for basis, expected in expected_by_basis.items():
+            found = tuple(
+                row["session_date"]
+                for row in members_by_basis[basis]
+            )
+            missing_sessions = tuple(
+                session for session in expected
+                if session not in found
+            )
+            if missing_sessions:
+                missing[f"{ticker}:{basis}"] = tuple(
+                    session.isoformat()
+                    for session in missing_sessions
+                )
+            elif (
+                found != expected
+                or len(members_by_basis[basis]) != len(expected)
+            ):
+                raise AdvancedOptionsHistoryBindingIdentityError(
+                    f"V3 H {ticker} {basis} session membership diverged"
+                )
+        if any(key.startswith(f"{ticker}:") for key in missing):
+            continue
+        members = tuple(
+            row
+            for basis in ("ADJUSTED", "RAW_UNADJUSTED")
+            for row in members_by_basis[basis]
+        )
+        security_ids = {str(row["security_id"]) for row in members}
         if security_ids != {
             ADVANCED_OPTIONS_V3_HISTORY_SECURITY_IDS[ticker]
         }:
             raise AdvancedOptionsHistoryBindingIdentityError(
                 f"V3 H {ticker} security identity diverged"
             )
-        if found != sessions or len(members) != len(sessions):
-            raise AdvancedOptionsHistoryBindingIdentityError(
-                f"V3 H {ticker} session membership diverged"
-            )
         symbols[ticker] = {
             "security_id": next(iter(security_ids)),
-            "session_count": len(members),
-            "member_sha256": canonical_sha256(tuple(
-                (
-                    str(row["bar_revision_id"]),
-                    row["session_date"],
-                    str(row["payload_sha256"]),
+            "adjusted_session_count": len(
+                members_by_basis["ADJUSTED"]
+            ),
+            "raw_session_count": len(
+                members_by_basis["RAW_UNADJUSTED"]
+            ),
+            "member_sha256": canonical_sha256({
+                basis: tuple(
+                    (
+                        str(row["bar_revision_id"]),
+                        row["session_date"],
+                        str(row["payload_sha256"]),
+                    )
+                    for row in members_by_basis[basis]
                 )
-                for row in members
-            )),
+                for basis in ("ADJUSTED", "RAW_UNADJUSTED")
+            }),
             "latest_known_at_utc": max(
                 row["observed_at"] for row in members
             ).isoformat(),
         }
     if missing:
         raise AdvancedOptionsHistoryCoverageError(
-            "V3 H adjusted daily coverage is missing: "
+            "V3 H adjusted/raw daily coverage is missing: "
             + canonical_sha256(missing)
         )
     return symbols
@@ -267,13 +307,32 @@ def load_verified_advanced_options_v3_history_binding_cursor(
                 ADVANCED_OPTIONS_V3_HISTORY_UNDERLYINGS
             ),
             "interval": "1d",
-            "adjustment_basis": "ADJUSTED",
+            "adjustment_basis": [
+                "ADJUSTED",
+                "RAW_UNADJUSTED",
+            ],
             "session_count": ADVANCED_OPTIONS_V3_HISTORY_SESSION_COUNT,
+            "adjusted_session_count": (
+                ADVANCED_OPTIONS_V3_HISTORY_SESSION_COUNT
+            ),
+            "raw_session_count": (
+                ADVANCED_OPTIONS_V3_RAW_HISTORY_SESSION_COUNT
+            ),
             "sessions": [
                 session.isoformat() for session in sessions
             ],
-            "raw_daily_sessions_required": 0,
-            "raw_members_bound": [],
+            "raw_daily_sessions_required": (
+                ADVANCED_OPTIONS_V3_RAW_HISTORY_SESSION_COUNT
+            ),
+            "raw_sessions": [
+                session.isoformat()
+                for session in sessions[
+                    -ADVANCED_OPTIONS_V3_RAW_HISTORY_SESSION_COUNT:
+                ]
+            ],
+            "raw_members_bound": list(
+                ADVANCED_OPTIONS_V3_HISTORY_UNDERLYINGS
+            ),
             "symbols": symbols,
         },
         "mixed_history_reconstruction": False,

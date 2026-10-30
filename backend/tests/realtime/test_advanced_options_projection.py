@@ -12,6 +12,7 @@ from test_advanced_options_cycle import (
 )
 from realtime.advanced_options_cycle import run_advanced_options_cycle
 from realtime.advanced_options_projection import (
+    AdvancedOptionsAlertsPagePublication,
     AdvancedOptionsCanaryPublicationAuthorization,
     AdvancedOptionsPublicationAuthorization,
     OPTIONS_PAGE_CONTRACTS,
@@ -26,6 +27,7 @@ from realtime.advanced_options_projection import (
     read_advanced_options_projection_cursor,
 )
 from realtime.contracts import canonical_sha256
+from realtime.option_alert_projection import DetectorEvaluationQuery
 from realtime.orchestration_repository import OPTIONS_PORTAL_READY
 from realtime.preflight import DetectorFamily
 
@@ -92,6 +94,47 @@ def test_projection_batch_is_deterministic_complete_and_nonpublishing():
     assert alerts.payload["delivery_authorized"] is False
 
 
+def test_alert_page_reports_only_actual_cycle_lanes_and_acceptance():
+    control, cycle = _cycle()
+    batch = build_advanced_options_projection_batch(
+        control_plane=control,
+        cycle=cycle,
+        generated_at=NOW,
+        build_id="p4-build",
+    )
+    snapshot = next(
+        row
+        for row in batch.snapshots
+        if row.snapshot_type == OPTIONS_PAGE_SNAPSHOT_TYPES["ALERTS"]
+    )
+    publication = AdvancedOptionsAlertsPagePublication(snapshot.payload)
+    identity = {
+        "cohort_id": control.cohort_id,
+        "provider_tier": control.binding.provider_tier,
+        "scope_sha256": snapshot.payload["scope_sha256"],
+    }
+
+    result = publication.evaluations(
+        DetectorEvaluationQuery(),
+        **identity,
+    )
+    models = {
+        row["detector_id"]: row
+        for row in result["data"]["models"]
+    }
+
+    assert set(models) == {"O1", "O2", "O3", "OS1", "OS2"}
+    assert models["O1"]["accepted"]
+    assert models["O1"]["lane_state"] == "COMPLETE_ZERO"
+    assert models["O3"]["accepted"]
+    assert models["O3"]["lane_state"] == "COMPLETE_ZERO"
+    assert models["OS1"]["accepted"]
+    assert models["OS1"]["lane_state"] == "COMPLETE_ZERO"
+    assert models["OS2"]["accepted"]
+    assert models["OS2"]["lane_state"] == "COMPLETE_ZERO"
+    assert not models["O2"]["accepted"]
+    assert models["O2"]["lane_state"] == "UNAVAILABLE"
+    assert models["O2"]["reason_codes"] == ["O2_MODEL_NOT_ACCEPTED"]
 def test_projection_persistence_uses_snapshot_owner_and_no_release_owner():
     control, cycle = _cycle()
     batch = build_advanced_options_projection_batch(

@@ -22,6 +22,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from realtime.advanced_ingress_plan import (  # noqa: E402
+    automatic_advanced_ingress_budgets,
     AdvancedIngressBudgets,
     AdvancedIngressPlanRequest,
     build_advanced_stream_authorization,
@@ -76,15 +77,16 @@ def _budget_arguments(subparser) -> None:
         required=True,
     )
     subparser.add_argument("--decoded-bytes", type=int, required=True)
-    subparser.add_argument(
-        "--rest-repair-requests",
-        type=int,
-        required=True,
-    )
+    subparser.add_argument("--rest-repair-requests", type=int, default=0)
     subparser.add_argument(
         "--rest-repair-decoded-bytes",
         type=int,
-        required=True,
+        default=0,
+    )
+    subparser.add_argument(
+        "--catch-up-mode",
+        choices=("DISABLED", "AUTO"),
+        default="DISABLED",
     )
 
 
@@ -193,6 +195,27 @@ def parse_args(argv=None):
 
 
 def _budgets(args) -> AdvancedIngressBudgets:
+    target = args.universe_target
+    if isinstance(target, list):
+        if len(target) != 1:
+            raise ValueError(
+                "automatic catch-up requires one universe target"
+            )
+        target = target[0]
+    if args.catch_up_mode == "AUTO":
+        if (
+            args.rest_repair_requests
+            or args.rest_repair_decoded_bytes
+        ):
+            raise ValueError(
+                "automatic catch-up derives REST repair budgets"
+            )
+        return automatic_advanced_ingress_budgets(
+            universe_target=target,
+            stream_sessions=args.stream_sessions,
+            connection_attempts=args.connection_attempts,
+            decoded_bytes=args.decoded_bytes,
+        )
     return AdvancedIngressBudgets(
         args.stream_sessions,
         args.connection_attempts,
@@ -285,7 +308,12 @@ def _app_provider(
     return provider, pool
 
 
-def _authorization_report(authorization, *, executed: bool) -> dict[str, object]:
+def _authorization_report(
+    authorization,
+    *,
+    executed: bool,
+    catch_up_mode: str,
+) -> dict[str, object]:
     return {
         "command": "authorize",
         "mode": "EXECUTE" if executed else "PLAN",
@@ -305,12 +333,18 @@ def _authorization_report(authorization, *, executed: bool) -> dict[str, object]
         "valid_through": authorization.valid_through.isoformat(),
         "maximum_budgets": asdict(authorization.maximum_budgets),
         "runtime_policy_sha256": authorization.runtime_policy_sha256,
+        "catch_up_mode": catch_up_mode,
         "provider_requests": 0,
         "credentials_exposed": False,
     }
 
 
-def _plan_report(plan, *, executed: bool) -> dict[str, object]:
+def _plan_report(
+    plan,
+    *,
+    executed: bool,
+    catch_up_mode: str,
+) -> dict[str, object]:
     return {
         "command": "prepare",
         "mode": "EXECUTE" if executed else "PLAN",
@@ -331,6 +365,7 @@ def _plan_report(plan, *, executed: bool) -> dict[str, object]:
         "authorized_start_at": plan.authorized_start_at.isoformat(),
         "authorized_end_at": plan.authorized_end_at.isoformat(),
         "budgets": asdict(plan.budgets),
+        "catch_up_mode": catch_up_mode,
         "provider_requests": 0,
         "credentials_exposed": False,
     }
@@ -384,6 +419,7 @@ def main(argv=None) -> int:
         report = _authorization_report(
             authorization,
             executed=args.execute,
+            catch_up_mode=args.catch_up_mode,
         )
     elif args.command == "sync-profiles":
         catalog = _runtime_catalog(settings)
@@ -533,7 +569,11 @@ def main(argv=None) -> int:
                             plan,
                             checked_at=now,
                         )
-                report = _plan_report(plan, executed=args.execute)
+                report = _plan_report(
+                    plan,
+                    executed=args.execute,
+                    catch_up_mode=args.catch_up_mode,
+                )
             else:
                 with provider.transaction(
                     APP_ROLE,

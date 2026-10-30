@@ -22,6 +22,7 @@ NOW = datetime(2026, 10, 21, 13, 35, tzinfo=UTC)
 CUTOFF = NOW - timedelta(minutes=1)
 COHORT = UUID("11111111-2222-3333-4444-555555555555")
 RELEASE = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+RELEASE_2 = UUID("bbbbbbbb-cccc-dddd-eeee-ffffffffffff")
 PACKAGE = "1" * 64
 
 
@@ -29,10 +30,15 @@ class _Cursor:
     def __init__(self):
         self.pin = None
         self._row = None
+        self.current_release_id = RELEASE
+        self.current_cutoff = CUTOFF
 
     def execute(self, statement, parameters=()):
         if statement.startswith("SELECT release.release_id"):
-            self._row = (str(RELEASE), CUTOFF)
+            self._row = (
+                str(self.current_release_id),
+                self.current_cutoff,
+            )
         elif statement.startswith(
             "SELECT cohort_id::text,release_id::text"
         ):
@@ -41,14 +47,14 @@ class _Cursor:
             "INSERT INTO rt.advanced_options_read_pins"
         ):
             self.pin = {
-                "cohort_id": str(COHORT),
-                "release_id": str(RELEASE),
-                "package_sha256": PACKAGE,
-                "release_cutoff": CUTOFF,
+                "cohort_id": parameters[0],
+                "release_id": parameters[1],
+                "package_sha256": parameters[3],
+                "release_cutoff": parameters[2],
                 "enabled": True,
-                "enabled_at": NOW,
+                "enabled_at": parameters[4],
                 "disabled_at": None,
-                "updated_at": NOW,
+                "updated_at": parameters[5],
             }
             self._row = None
         elif statement.startswith(
@@ -60,6 +66,38 @@ class _Cursor:
                     disabled_at=NOW,
                     updated_at=NOW,
                 )
+                self._row = (str(COHORT),)
+            else:
+                self._row = None
+        elif statement.startswith(
+            "DELETE FROM rt.advanced_options_read_pins"
+        ):
+            self._row = (
+                (str(COHORT),)
+                if self.pin
+                and self.pin["release_id"] == parameters[1]
+                and self.pin["package_sha256"] == parameters[2]
+                else None
+            )
+            if self._row is not None:
+                self.pin = None
+        elif statement.startswith(
+            "UPDATE rt.advanced_options_read_pins SET release_id="
+        ):
+            if (
+                self.pin
+                and self.pin["release_id"] == parameters[8]
+                and self.pin["package_sha256"] == parameters[9]
+            ):
+                self.pin.update({
+                    "release_id": parameters[0],
+                    "release_cutoff": parameters[1],
+                    "package_sha256": parameters[2],
+                    "enabled": parameters[3],
+                    "enabled_at": parameters[4],
+                    "disabled_at": parameters[5],
+                    "updated_at": parameters[6],
+                })
                 self._row = (str(COHORT),)
             else:
                 self._row = None
@@ -121,6 +159,109 @@ def test_read_pin_refuses_another_enabled_package():
 
     with pytest.raises(RuntimeError, match="already pinned"):
         port.enable(cohort_id=COHORT, release_id=RELEASE)
+
+
+def test_read_pin_rollback_removes_new_pin_when_prior_pin_is_absent():
+    provider = _Provider()
+    port = PostgresAdvancedOptionsStoredReadPort(
+        provider,
+        package_sha256=PACKAGE,
+        clock=lambda: NOW,
+    )
+
+    port.enable(cohort_id=COHORT, release_id=RELEASE)
+    restored = port.restore(
+        cohort_id=COHORT,
+        expected_release_id=RELEASE,
+        previous=None,
+    )
+
+    assert restored is None
+    assert provider.cursor.pin is None
+
+
+def test_read_pin_rollback_restores_exact_disabled_prior_pin():
+    provider = _Provider()
+    previous = {
+        "cohort_id": str(COHORT),
+        "release_id": str(UUID(int=3)),
+        "package_sha256": "2" * 64,
+        "release_cutoff": CUTOFF - timedelta(minutes=1),
+        "enabled": False,
+        "enabled_at": NOW - timedelta(minutes=2),
+        "disabled_at": NOW - timedelta(minutes=1),
+        "updated_at": NOW - timedelta(minutes=1),
+    }
+    provider.cursor.pin = dict(previous)
+    port = PostgresAdvancedOptionsStoredReadPort(
+        provider,
+        package_sha256=PACKAGE,
+        clock=lambda: NOW,
+    )
+
+    port.enable(cohort_id=COHORT, release_id=RELEASE)
+    restored = port.restore(
+        cohort_id=COHORT,
+        expected_release_id=RELEASE,
+        previous=previous,
+    )
+
+    assert restored == previous
+    assert provider.cursor.pin == previous
+
+
+def test_read_pin_advances_from_exact_prior_release():
+    provider = _Provider()
+    port = PostgresAdvancedOptionsStoredReadPort(
+        provider,
+        package_sha256=PACKAGE,
+        clock=lambda: NOW,
+    )
+    port.enable(cohort_id=COHORT, release_id=RELEASE)
+    previous = dict(provider.cursor.pin)
+    provider.cursor.current_release_id = RELEASE_2
+    provider.cursor.current_cutoff = CUTOFF + timedelta(minutes=5)
+
+    advanced = port.advance(
+        cohort_id=COHORT,
+        release_id=RELEASE_2,
+        previous=previous,
+    )
+
+    assert advanced["release_id"] == str(RELEASE_2)
+    assert provider.cursor.pin["release_id"] == str(RELEASE_2)
+    assert provider.cursor.pin["release_cutoff"] == (
+        CUTOFF + timedelta(minutes=5)
+    )
+    assert provider.cursor.pin["enabled"] is True
+
+
+def test_read_pin_advance_rejects_unexpected_prior_pin():
+    provider = _Provider()
+    provider.cursor.pin = {
+        "cohort_id": str(COHORT),
+        "release_id": str(RELEASE),
+        "package_sha256": PACKAGE,
+        "release_cutoff": CUTOFF,
+        "enabled": True,
+        "enabled_at": NOW,
+        "disabled_at": None,
+        "updated_at": NOW,
+    }
+    provider.cursor.current_release_id = RELEASE_2
+    provider.cursor.current_cutoff = CUTOFF + timedelta(minutes=5)
+    port = PostgresAdvancedOptionsStoredReadPort(
+        provider,
+        package_sha256=PACKAGE,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(RuntimeError, match="changed before advance"):
+        port.advance(
+            cohort_id=COHORT,
+            release_id=RELEASE_2,
+            previous=None,
+        )
 
 
 class _ReadCursor:

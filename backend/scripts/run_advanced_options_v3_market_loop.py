@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -18,13 +19,12 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from dotenv import dotenv_values
 from psycopg2.pool import ThreadedConnectionPool
 
-from options.calendar import OptionExchangeCalendar
-
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 REPOSITORY_ROOT = BACKEND_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from options.calendar import OptionExchangeCalendar  # noqa: E402
 from realtime.advanced_equity_control_plane import (  # noqa: E402
     load_advanced_equity_control_plane_plan_cursor,
     validate_active_target9_equity_source_cursor,
@@ -38,8 +38,15 @@ from realtime.advanced_options_p8_production import (  # noqa: E402
 from realtime.advanced_options_p8_selection_source import (  # noqa: E402
     p8_activity_selection_capture_from_sealed,
 )
+from realtime.advanced_options_api import (  # noqa: E402
+    AdvancedOptionsStoredProjectionRepository,
+)
+from realtime.advanced_options_projection import (  # noqa: E402
+    OPTIONS_PROJECTION_TYPES,
+)
 from realtime.advanced_options_read_pin import (  # noqa: E402
     PostgresAdvancedOptionsStoredReadPort,
+    load_advanced_options_read_pin_cursor,
 )
 from realtime.advanced_options_service import (  # noqa: E402
     AdvancedOptionsProcessKind,
@@ -89,6 +96,12 @@ from realtime.option_slot_set import (  # noqa: E402
     SlotSetPurpose,
     SlotSetVersion,
 )
+from realtime.portal_projection_repository import (  # noqa: E402
+    PortalReleasePointer,
+    load_portal_release_pointer_cursor,
+    restore_portal_release_pointer_cursor,
+)
+from realtime.preflight import ProviderTier  # noqa: E402
 from realtime.provider_budget import ProviderBudgetScope  # noqa: E402
 from realtime.advanced_options_control_plane import (  # noqa: E402
     ADVANCED_OPTIONS_REST_LANES,
@@ -165,6 +178,7 @@ def parse_args(argv=None):
     parser.add_argument("--package-nonce", type=UUID, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--maximum-window-attempts", type=int, default=4)
+    parser.add_argument("--prepare-package-only", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     validate_target_database_v2(
@@ -191,7 +205,13 @@ def parse_args(argv=None):
     session_close = calendar.session_close(args.session_date)
     if (
         args.hard_stop.date() != args.session_date
-        or not session_open < args.hard_stop <= session_close
+        or not session_open
+        < args.hard_stop
+        <= (
+            session_close + timedelta(minutes=5)
+            if args.prepare_package_only
+            else session_close
+        )
         or args.equity_cutoff.date() != args.session_date
         or not session_open < args.equity_cutoff < args.hard_stop
         or args.equity_cutoff.second
@@ -366,6 +386,7 @@ def _prepare_session_authority(
     cohort_id,
     prepared_at,
     capture_boundary,
+    acquisition_start=None,
 ):
     snapshots = capture["selected_snapshots"]
     tickers = tuple(sorted(snapshots))
@@ -515,9 +536,13 @@ def _prepare_session_authority(
         ),
         authorization_reference=args.authorization_reference,
         prepared_at=prepared_at,
-        acquisition_start=max(
-            prepared_at,
-            capture_boundary - timedelta(minutes=1),
+        acquisition_start=(
+            acquisition_start
+            if acquisition_start is not None
+            else max(
+                prepared_at,
+                capture_boundary - timedelta(minutes=1),
+            )
         ),
         acquisition_stop=args.hard_stop,
     )
@@ -544,7 +569,11 @@ def _frozen_equity_input(provider, cohort_id, equity_cutoff):
             "JOIN rt.window_runs AS window_run USING(window_id) "
             "WHERE receipt.cohort_id=%s "
             "AND receipt.receipt_kind='INPUT_READY' "
-            "AND window_run.state='COMPLETE' AND receipt.cutoff=%s",
+            "AND (SELECT stage.state FROM rt.stage_runs AS stage "
+            "WHERE stage.window_id=receipt.window_id "
+            "AND stage.stage_id='EQUITY_MATERIALIZE' "
+            "ORDER BY stage.attempt DESC LIMIT 1)='COMPLETE' "
+            "AND receipt.cutoff=%s",
             (str(cohort_id), equity_cutoff),
         )
         receipt = unit.cursor.fetchone()
@@ -564,6 +593,7 @@ def _frozen_equity_input(provider, cohort_id, equity_cutoff):
         "universe_sha256": str(receipt["universe_sha256"]),
         "input_sha256": str(receipt["input_sha256"]),
         "build_id": str(receipt["build_id"]),
+        "symbols": list(EQUITY_VALIDATION_UNIVERSE.equity_tickers),
     }
 def _load_history_binding(provider, args, target_cohort_id):
     report = _load_bound_json(
@@ -609,7 +639,11 @@ def _build_live_package(
     history: VerifiedAdvancedOptionsHistoryBinding,
 ):
     now = datetime.now(UTC)
-    start = now + timedelta(seconds=30)
+    start = (
+        authority.acquisition_start
+        if equity_source is None
+        else now + timedelta(seconds=30)
+    )
     temporary_stop = start + timedelta(minutes=10)
     source_commit = subprocess.run(
         ("git", "rev-parse", "HEAD"),
@@ -645,9 +679,10 @@ def _build_live_package(
     package["orchestration"]["stage_order"] = list(
         OPTIONS_V3_STAGE_ORDER
     )
-    package["equity_input_binding"]["symbols"] = list(
-        EQUITY_VALIDATION_UNIVERSE.equity_tickers
-    )
+    package["equity_input_binding"] = {
+        **package["equity_input_binding"],
+        "symbols": list(EQUITY_VALIDATION_UNIVERSE.equity_tickers),
+    }
     package["history_binding"].update({
         "target_cohort_id": str(history.binding.target_cohort_id),
         "source_cohort_id": str(history.binding.source_cohort_id),
@@ -701,6 +736,103 @@ def _build_live_package(
     package.pop("package_sha256", None)
     package["package_sha256"] = canonical_sha256(package)
     return package, start
+
+
+def _prepare_preopen_package(args):
+    output = args.output_directory
+    output.mkdir(parents=True)
+    provider, pool, _values = _provider()
+    try:
+        capture = _load_bound_json(
+            args.pre_session_capture,
+            args.pre_session_capture_semantic_sha256,
+            args.pre_session_capture_file_sha256,
+            "semantic_sha256",
+        )
+        docker_qualification = _load_bound_json(
+            args.docker_qualification_report,
+            args.docker_qualification_semantic_sha256,
+            args.docker_qualification_file_sha256,
+            "semantic_sha256",
+        )
+        if (
+            capture.get("provider_requests") != 2
+            or docker_qualification.get("verdict") != "PASS"
+            or docker_qualification.get("scope", {}).get("image_id")
+            != args.image_id
+        ):
+            raise ValueError(
+                "pre-open package evidence identity changed"
+            )
+        cohort_id = uuid5(
+            NAMESPACE_URL,
+            (
+                f"stockscreener:{args.authorization_reference}:"
+                f"{args.package_nonce}:MARKET_OPTIONS"
+            ),
+        )
+        history = _load_history_binding(provider, args, cohort_id)
+        (
+            session_authority,
+            admitted_contracts,
+            pre_session_identity,
+        ) = _load_pre_session_authority(args, cohort_id)
+        package, _start = _build_live_package(
+            args,
+            None,
+            session_authority,
+            admitted_contracts,
+            pre_session_identity,
+            history,
+        )
+        if any(
+            name in package["equity_input_binding"]
+            for name in (
+                "equity_receipt_id",
+                "input_sha256",
+                "equity_cutoff",
+                "binding_sha256",
+            )
+        ):
+            raise ValueError(
+                "pre-open package contains an E-bound identity"
+            )
+        package_path = output / "PACKAGE-SOURCE.json"
+        _write_json(package_path, package)
+        report = {
+            "contract": "advanced-options-v3-preopen-package-report-v1",
+            "status": "PREOPEN_PACKAGE_PREPARED",
+            "package_sha256": package["package_sha256"],
+            "package_file_sha256": _file_sha256(package_path),
+            "session_authorization_sha256": (
+                session_authority.authorization_sha256
+            ),
+            "history_binding_sha256": (
+                history.binding.binding_sha256
+            ),
+            "admitted_contracts": admitted_contracts,
+            "equity_receipt_bound": False,
+            "provider_requests": 0,
+            "database_writes": 0,
+            "service_actions": 0,
+            "publication": 0,
+            "output": str(package_path),
+        }
+        report["semantic_sha256"] = canonical_sha256(report)
+        report_path = output / "PREPARE-PACKAGE-REPORT.json"
+        return _write_preopen_package_report(report_path, report)
+    finally:
+        pool.closeall()
+
+
+def _write_preopen_package_report(path, report):
+    _write_json(path, report)
+    return {
+        **report,
+        "verdict": "PASS",
+        "report": str(path),
+        "file_sha256": _file_sha256(path),
+    }
 
 
 def _capture_binding(package, checked_at, values, sealed_capture):
@@ -885,27 +1017,155 @@ def _load_pre_session_authority(args, cohort_id):
     return session, admitted_contracts, identity
 
 
-def _current_pointer(provider, cohort_id):
+def _portal_pointer(provider, cohort_id):
+    with provider.transaction(
+        APP_ROLE,
+        read_only=True,
+    ) as unit:
+        return load_portal_release_pointer_cursor(
+            unit.cursor,
+            cohort_id=cohort_id,
+            provider_tier=ProviderTier.MASSIVE_ADVANCED,
+        )
+
+
+def _pointer_payload(pointer: PortalReleasePointer | None):
+    return None if pointer is None else {
+        "release_id": str(pointer.release_id),
+        "cutoff": pointer.cutoff,
+        "session_date": pointer.session_date,
+    }
+
+
+def _current_read_pin(provider, cohort_id):
     with provider.transaction(
         APP_ROLE,
         read_only=True,
         dict_cursor=True,
     ) as unit:
-        unit.cursor.execute(
-            "SELECT current.release_id::text,current.cutoff,"
-            "release.manifest FROM rt.portal_release_current AS current "
-            "JOIN rt.portal_releases AS release "
-            "ON release.release_id=current.release_id "
-            "WHERE current.cohort_id=%s "
-            "AND current.provider_tier='MASSIVE_ADVANCED'",
-            (str(cohort_id),),
+        return load_advanced_options_read_pin_cursor(
+            unit.cursor,
+            cohort_id=cohort_id,
         )
-        row = unit.cursor.fetchone()
-    return None if row is None else {
-        "release_id": str(row["release_id"]),
-        "cutoff": row["cutoff"],
-        "manifest": row["manifest"],
+
+
+def _validate_stored_readers(provider, cohort_id, release_id):
+    @contextmanager
+    def cursor_factory():
+        with provider.transaction(
+            APP_ROLE,
+            read_only=True,
+            dict_cursor=True,
+            isolation_level="REPEATABLE READ",
+        ) as unit:
+            yield unit.cursor
+
+    repository = AdvancedOptionsStoredProjectionRepository(
+        cursor_factory,
+        require_read_pin=True,
+    )
+    checked_at = datetime.now(UTC)
+    responses = {}
+    for snapshot_type in OPTIONS_PROJECTION_TYPES:
+        response = repository.read(
+            cohort_id=cohort_id,
+            snapshot_type=snapshot_type,
+            available_by=checked_at,
+        )
+        if (
+            response.get("available") is not True
+            or response.get("reason") is not None
+            or response.get("cohort_id") != str(cohort_id)
+            or response.get("snapshot_type") != snapshot_type
+            or response.get("release_id") != str(release_id)
+            or response.get("advanced_options_v2_enabled") is not True
+            or response.get("provider_fetch_performed") is not False
+            or response.get("detector_work_performed") is not False
+            or response.get("publication_performed") is not False
+            or response.get("data") is None
+        ):
+            raise RuntimeError(
+                f"stored Options reader failed for {snapshot_type}"
+            )
+        responses[snapshot_type] = {
+            key: response[key]
+            for key in (
+                "snapshot_id",
+                "generated_at",
+                "release_id",
+                "release_cutoff",
+                "release_manifest_sha256",
+                "provider_fetch_performed",
+                "detector_work_performed",
+                "publication_performed",
+            )
+        }
+    return {
+        "contract": "advanced-options-v3-stored-reader-gate-v1",
+        "checked_at_utc": checked_at,
+        "cohort_id": str(cohort_id),
+        "release_id": str(release_id),
+        "responses": responses,
     }
+
+
+def _rollback_post_publication(
+    provider,
+    read_port,
+    *,
+    cohort_id,
+    published_release_id,
+    prior_pointer,
+    prior_read_pin,
+):
+    result = {
+        "status": "RUNNING",
+        "read_pin": "NOT_ATTEMPTED",
+        "pointer": "NOT_ATTEMPTED",
+    }
+    failures = []
+    try:
+        read_port.restore(
+            cohort_id=cohort_id,
+            expected_release_id=published_release_id,
+            previous=prior_read_pin,
+        )
+        result["read_pin"] = "RESTORED"
+    except BaseException as error:
+        result["read_pin"] = "FAILED"
+        failures.append(("read_pin", error))
+    try:
+        with provider.transaction(
+            APP_ROLE,
+            isolation_level="SERIALIZABLE",
+        ) as unit:
+            restore_portal_release_pointer_cursor(
+                unit.cursor,
+                cohort_id=cohort_id,
+                provider_tier=ProviderTier.MASSIVE_ADVANCED,
+                expected_current_release_id=published_release_id,
+                previous=prior_pointer,
+            )
+        result["pointer"] = "RESTORED"
+    except BaseException as error:
+        result["pointer"] = "FAILED"
+        failures.append(("pointer", error))
+    if failures:
+        result["status"] = "FAILED"
+        result["errors"] = [
+            {
+                "scope": scope,
+                "type": type(error).__name__,
+                "message": str(error),
+            }
+            for scope, error in failures
+        ]
+        raise RuntimeError(
+            "post-publication rollback failed: "
+            + ", ".join(scope for scope, _error in failures)
+        )
+    result["status"] = "RESTORED"
+    return result
 
 
 def _cleanup(environment, baseline):
@@ -999,6 +1259,7 @@ def execute(args):
         },
         "publication": {"status": "NOT_ATTEMPTED"},
         "stored_reads": {"status": "NOT_AUTHORIZED"},
+        "rollback": {"status": "NOT_REQUIRED"},
         "forbidden_effects": dict(ZERO_FORBIDDEN_EFFECTS),
     }
     service_lifecycle_attempted = False
@@ -1128,7 +1389,8 @@ def execute(args):
             production_cli.RESIDENT_KINDS,
         )
         report["provider_effects"]["options_websocket_sessions"] = 1
-        prior_pointer = _current_pointer(provider, cohort_id)
+        prior_pointer = _portal_pointer(provider, cohort_id)
+        prior_read_pin = _current_read_pin(provider, cohort_id)
         window_started = False
         repeated_cause = None
         for attempt in range(1, args.maximum_window_attempts + 1):
@@ -1238,13 +1500,13 @@ def execute(args):
                 break
             repeated_cause = cause
         if report["verdict"] == "PASS":
-            pointer = _current_pointer(provider, cohort_id)
+            pointer = _portal_pointer(provider, cohort_id)
             if (
                 pointer is None
                 or (
                     prior_pointer is not None
-                    and pointer["release_id"]
-                    == prior_pointer["release_id"]
+                    and pointer.release_id
+                    == prior_pointer.release_id
                 )
             ):
                 raise RuntimeError(
@@ -1254,46 +1516,73 @@ def execute(args):
                 provider,
                 package_sha256=package["package_sha256"],
             )
-            first_pin = read_port.enable(
-                cohort_id=cohort_id,
-                release_id=UUID(pointer["release_id"]),
-            )
-            replay_pin = read_port.enable(
-                cohort_id=cohort_id,
-                release_id=UUID(pointer["release_id"]),
-            )
-            if {
-                key: first_pin[key]
-                for key in (
-                    "cohort_id",
-                    "release_id",
-                    "release_cutoff_utc",
-                    "verified",
-                )
-            } != {
-                key: replay_pin[key]
-                for key in (
-                    "cohort_id",
-                    "release_id",
-                    "release_cutoff_utc",
-                    "verified",
-                )
-            }:
-                raise RuntimeError(
-                    "stored-read activation is not idempotent"
-                )
             report["publication"] = {
                 "status": "PUBLISHED",
-                "prior_pointer": prior_pointer,
-                "current_pointer": pointer,
+                "prior_pointer": _pointer_payload(prior_pointer),
+                "current_pointer": _pointer_payload(pointer),
                 "pointer_advances": 1,
             }
-            report["stored_reads"] = {
-                "status": "DURABLE_PIN_ENABLED",
-                "pin": first_pin,
-                "idempotent_replay": True,
-                "process_flags_changed": False,
-            }
+            try:
+                first_pin = read_port.enable(
+                    cohort_id=cohort_id,
+                    release_id=pointer.release_id,
+                )
+                replay_pin = read_port.enable(
+                    cohort_id=cohort_id,
+                    release_id=pointer.release_id,
+                )
+                if {
+                    key: first_pin[key]
+                    for key in (
+                        "cohort_id",
+                        "release_id",
+                        "release_cutoff_utc",
+                        "verified",
+                    )
+                } != {
+                    key: replay_pin[key]
+                    for key in (
+                        "cohort_id",
+                        "release_id",
+                        "release_cutoff_utc",
+                        "verified",
+                    )
+                }:
+                    raise RuntimeError(
+                        "stored-read activation is not idempotent"
+                    )
+                reader_responses = _validate_stored_readers(
+                    provider,
+                    cohort_id,
+                    pointer.release_id,
+                )
+                report["stored_reads"] = {
+                    "status": "DURABLE_PIN_ENABLED",
+                    "pin": first_pin,
+                    "idempotent_replay": True,
+                    "reader_gate": reader_responses,
+                    "process_flags_changed": False,
+                }
+            except BaseException:
+                try:
+                    report["rollback"] = _rollback_post_publication(
+                        provider,
+                        read_port,
+                        cohort_id=cohort_id,
+                        published_release_id=pointer.release_id,
+                        prior_pointer=prior_pointer,
+                        prior_read_pin=prior_read_pin,
+                    )
+                    report["publication"]["status"] = "ROLLED_BACK"
+                    report["stored_reads"] = {
+                        "status": "ROLLED_BACK",
+                    }
+                except BaseException:
+                    report["rollback"] = {
+                        "status": "FAILED",
+                    }
+                    raise
+                raise
         elif report["verdict"] == "RUNNING":
             report["verdict"] = "BLOCKED_ATTEMPTS_OR_HARD_STOP"
         report["package"] = {
@@ -1360,7 +1649,11 @@ def execute(args):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    report = execute(args)
+    report = (
+        _prepare_preopen_package(args)
+        if args.prepare_package_only
+        else execute(args)
+    )
     print(json.dumps({
         key: report.get(key)
         for key in (

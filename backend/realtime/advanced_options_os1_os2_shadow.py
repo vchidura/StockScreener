@@ -1,4 +1,4 @@
-"""Canonical S1/S2 evaluator binding for the Advanced Equity detector shadow."""
+"""Canonical OS1/OS2 evaluator binding over Advanced Equity bar inputs."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -11,7 +11,9 @@ from equity.domain import (
     BarSourceKind,
     EquityBarRevision,
 )
-from options.stock_bar_detection import STOCK_BAR_SIGNAL_POLICY_SHA256
+from options.stock_bar_detection import (
+    ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY_SHA256,
+)
 
 from .advanced_equity_detector_consumer import (
     AdvancedEquityDetectorConsumerConfig,
@@ -24,9 +26,9 @@ from .detector_evidence import RealtimeDetectorInput
 from .preflight import ProviderTier
 
 
-DETECTORS = ("S1", "S2")
-DETECTOR_VERSION = "advanced-equity-canonical-stock-signal-shadow-v1"
-PAYLOAD_SCHEMA = "advanced_equity_canonical_stock_signal_shadow_v1"
+DETECTORS = ("OS1", "OS2")
+DETECTOR_VERSION = "advanced-options-canonical-stock-signal-shadow-v1"
+PAYLOAD_SCHEMA = "advanced_options_canonical_stock_signal_shadow_v1"
 
 
 def _uuid_array(value) -> tuple[UUID, ...]:
@@ -40,7 +42,7 @@ def _uuid_array(value) -> tuple[UUID, ...]:
     return tuple(UUID(str(item)) for item in values)
 
 
-def advanced_equity_bar_revision_from_row(
+def advanced_options_bar_revision_from_row(
     row,
 ) -> tuple[EquityBarRevision, datetime]:
     if isinstance(row, Mapping):
@@ -146,7 +148,7 @@ def _load_bars_cursor(
         ),
     )
     daily = tuple(reversed(tuple(
-        advanced_equity_bar_revision_from_row(row)
+        advanced_options_bar_revision_from_row(row)
         for row in cursor.fetchall()
     )))
     cursor.execute(
@@ -178,7 +180,7 @@ def _load_bars_cursor(
     )
     intraday = tuple(
         reversed(tuple(
-            advanced_equity_bar_revision_from_row(row)
+            advanced_options_bar_revision_from_row(row)
             for row in cursor.fetchall()
         ))
     )
@@ -219,7 +221,7 @@ def _retained_bar_input(
     )
 
 
-def s1_s2_evaluator_cursor(
+def os1_os2_evaluator_cursor(
     cursor,
     *,
     detector_id: str,
@@ -230,7 +232,7 @@ def s1_s2_evaluator_cursor(
     AdvancedEquityDetectorDecision,
 ]:
     if detector_id not in DETECTORS:
-        raise ValueError("Advanced Equity stock-bar detector must be S1 or S2")
+        raise ValueError("Advanced Options stock-bar detector must be OS1 or OS2")
 
     def evaluate(
         record: AdvancedEquityDetectorSourceRecord,
@@ -311,21 +313,21 @@ def s1_s2_evaluator_cursor(
     return evaluate
 
 
-def s1_s2_requirements(detector_id: str) -> dict[str, object]:
+def os1_os2_requirements(detector_id: str) -> dict[str, object]:
     if detector_id not in DETECTORS:
-        raise ValueError("Advanced Equity stock-bar detector must be S1 or S2")
+        raise ValueError("Advanced Options stock-bar detector must be OS1 or OS2")
     return {
         "detector_id": detector_id,
-        "policy_sha256": STOCK_BAR_SIGNAL_POLICY_SHA256,
+        "policy_sha256": ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY_SHA256,
         "trigger_interval": "5m",
         "daily_history_bars": 15,
-        "intraday_history_bars": 2 if detector_id == "S1" else 3,
+        "intraday_history_bars": 2 if detector_id == "OS1" else 3,
         "completed_bars_only": True,
         "execution_permission": False,
     }
 
 
-def build_s1_s2_consumer_config(
+def build_os1_os2_consumer_config(
     *,
     detector_id: str,
     cohort_id: UUID,
@@ -338,7 +340,7 @@ def build_s1_s2_consumer_config(
     code_sha256: str,
     readiness_epoch: int,
 ) -> AdvancedEquityDetectorConsumerConfig:
-    requirements = s1_s2_requirements(detector_id)
+    requirements = os1_os2_requirements(detector_id)
     return AdvancedEquityDetectorConsumerConfig(
         cohort_id=cohort_id,
         journal_generation=journal_generation,
@@ -348,10 +350,10 @@ def build_s1_s2_consumer_config(
         owner_id=owner_id,
         owner_epoch=owner_epoch,
         lease_resource_key=lease_resource_key,
-        detector_id=f"ADVANCED_EQUITY_{detector_id}",
+        detector_id=f"ADVANCED_OPTIONS_{detector_id}",
         detector_version=DETECTOR_VERSION,
         code_sha256=code_sha256,
-        policy_sha256=STOCK_BAR_SIGNAL_POLICY_SHA256,
+        policy_sha256=ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY_SHA256,
         requirements=requirements,
         output_kind="SIGNAL",
         readiness_epoch=readiness_epoch,

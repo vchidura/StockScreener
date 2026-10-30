@@ -965,7 +965,7 @@ def test_original_alert_missing_context_and_unsupported_detectors_never_report_z
 
     config, scope, receipt = original_alert_fixture(cycle, source_change=lambda source: replace(source, open_interest=()))
     publication = seal_offline_option_alert_publication(scope, config, selected_at=scope.available_after, cycles=(receipt,))
-    for detector in (None, "O1", "O2", "O3", "S1", "S2"):
+    for detector in (None, "O1", "O2", "O3", "OS1", "OS2"):
         result = publication.evaluations(DetectorEvaluationQuery(detector=detector), **alert_identity(publication))
         assert result["available"] is False and result["reason"] == "DETECTOR_CONTEXT_UNAVAILABLE"
     complete_config, complete_scope, complete = original_alert_fixture(cycle, volume=200)
@@ -1287,7 +1287,7 @@ def test_indicative_display_uses_original_alert_rows_and_preserves_delayed_data_
     assert "qualified_indicative" not in result["data"]
 
 
-@pytest.mark.parametrize("detector", ("S1", "S2"))
+@pytest.mark.parametrize("detector", ("OS1", "OS2"))
 def test_technical_display_filters_native_stock_first_packages_and_disables_o2(cycle, detector):
     from realtime.option_alert_projection import DetectorEvaluationQuery, DetectorRunQuery, ForwardAlertCycleSource, seal_offline_indicative_alert_publication
     from realtime.option_package_context import load_forward_technical_package_context
@@ -1343,7 +1343,7 @@ def test_original_alert_stored_candidate_detail_has_exact_identity_and_no_calcul
     from realtime.option_package_context import load_forward_technical_package_context
     from test_forward_ingestion import stock_first_package_cycle, o1_package_source, seal_offline_forward_publication, EmptyPriorEvaluations
 
-    config, scope, matrices, context = stock_first_package_cycle(cycle, "S1")
+    config, scope, matrices, context = stock_first_package_cycle(cycle, "OS1")
     forward = seal_offline_forward_publication(scope, matrices, config, selected_at=scope.available_after,
         detector_context=context, prior_evaluations=EmptyPriorEvaluations())
     receipt = load_forward_technical_package_context(scope, matrices[0], config, context,
@@ -1378,7 +1378,7 @@ def test_original_alert_preview_reuses_native_blockers_and_never_reopens_deadlin
     from realtime.option_package_context import load_forward_technical_package_context
     from test_forward_ingestion import stock_first_package_cycle, o1_package_source, seal_offline_forward_publication, EmptyPriorEvaluations
 
-    config, scope, matrices, context = stock_first_package_cycle(cycle, "S1")
+    config, scope, matrices, context = stock_first_package_cycle(cycle, "OS1")
     forward = seal_offline_forward_publication(scope, matrices, config, selected_at=scope.available_after,
         detector_context=context, prior_evaluations=EmptyPriorEvaluations())
     receipt = load_forward_technical_package_context(scope, matrices[0], config, context,
@@ -1500,7 +1500,7 @@ def test_indicative_display_original_review_parity_and_observation_identity_isol
     evaluation = publication.evaluations(alerts.DetectorEvaluationQuery(selection_status="SELECTED"), **alert_identity(publication))
     assert evaluation["available"] is True and evaluation["data"]["total"] == 1
     assert evaluation["data"]["rows"][0]["event_horizon_status"] == "UNAVAILABLE"
-    assert evaluation["data"]["context_availability"]["S1"] == "UNAVAILABLE"
+    assert evaluation["data"]["context_availability"]["OS1"] == "UNAVAILABLE"
 
 
 def test_indicative_display_requires_native_packages_but_not_complete_execution_context(cycle):
@@ -1511,7 +1511,7 @@ def test_indicative_display_requires_native_packages_but_not_complete_execution_
         cycles=(replace(source, package_contexts=()),))
     assert absent.detector_runs(DetectorRunQuery(dataset_id=absent.dataset_id), **alert_identity(absent))["available"] is False
     publication = seal_offline_indicative_alert_publication(scope, config, selected_at=scope.available_after, cycles=(source,))
-    for detector in ("O2", "O3", "S1", "S2"):
+    for detector in ("O2", "O3", "OS1", "OS2"):
         result = publication.detector_runs(DetectorRunQuery(dataset_id=publication.dataset_id, detector=detector), **alert_identity(publication))
         assert result["available"] is False and result["reason"] == "DETECTOR_CONTEXT_UNAVAILABLE"
     unknown = publication.detector_runs(DetectorRunQuery(dataset_id=publication.dataset_id, underlyer="SPY"), **alert_identity(publication))

@@ -165,6 +165,43 @@ def test_prepare_cli_emits_redacted_provider_free_plan(
         assert report["authorized_end_at"] == "2026-10-16T13:40:00+00:00"
 
 
+def test_auto_catch_up_plan_derives_target9_rest_budget():
+    args = script.parse_args([
+        "authorize",
+        "--database",
+        "stocks_realtime_v2",
+        "--confirm-database-name",
+        "stocks_realtime_v2",
+        "--report-path",
+        "auto-catch-up-plan.json",
+        "--stream-sessions",
+        "1",
+        "--connection-attempts",
+        "1",
+        "--decoded-bytes",
+        "10485760",
+        "--catch-up-mode",
+        "AUTO",
+        "--universe-target",
+        "9",
+        "--valid-from",
+        "2026-10-27",
+        "--valid-through",
+        "2026-10-27",
+        "--approval-source",
+        "owner",
+        "--approval-reference",
+        "next-session",
+    ])
+
+    budgets = script._budgets(args)
+
+    assert budgets.rest_repair_requests == 18
+    assert budgets.rest_repair_decoded_bytes == (
+        18 * (1024 * 1024 + 1)
+    )
+
+
 @pytest.mark.parametrize("target", [None, 1, 9])
 def test_sync_profiles_uses_explicit_policy_without_editing_shared_environment(tmp_path, monkeypatch, target):
     env_file = tmp_path / ".env"

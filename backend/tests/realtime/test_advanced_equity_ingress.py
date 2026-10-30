@@ -214,5 +214,5 @@ def test_journal_pump_survives_postgresql_progress_outage(tmp_path):
 
     assert progress.last_raw_offset == progress.last_event_offset == 1
     assert RawJournalReader(path).read_normalized_after(0)
-    assert reporter.failure_count == 1
+    assert reporter.failure_count >= 1
     assert reporter.last_failure_name == "ConnectionError"

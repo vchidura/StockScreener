@@ -221,7 +221,7 @@ def test_stock_alert_view_preserves_alert_and_schedule_contract():
         {"payload": {
             "schedule_streams": [{"stream": "INTRADAY"}],
             "sessions": ["2026-10-05"],
-            "observations": [{"ticker": "SPY", "detector_id": "S1"}],
+            "observations": [{"ticker": "SPY", "detector_id": "OS1"}],
         }},
     )
     cursor.fetchall.return_value = ({
@@ -239,7 +239,7 @@ def test_stock_alert_view_preserves_alert_and_schedule_contract():
 
     assert result["alerts"][0]["ticker"] == "SPY"
     assert result["schedule_streams"] == [{"stream": "INTRADAY"}]
-    assert result["observations"] == [{"ticker": "SPY", "detector_id": "S1"}]
+    assert result["observations"] == [{"ticker": "SPY", "detector_id": "OS1"}]
     assert result["source"] == "REALTIME"
     alert_statement = next(
         call.args[0] for call in cursor.execute.call_args_list

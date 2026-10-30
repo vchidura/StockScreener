@@ -1,8 +1,37 @@
 from copy import deepcopy
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from research.stock_alerts import alert_page, directional_risk_warnings, price_return_fields, risk_fields, session_dates
+
+
+def test_stream_error_uses_injected_v2_cursor():
+    from equity import stock_alert_results
+
+    calls = []
+    cursor = SimpleNamespace(
+        execute=lambda statement, parameters: calls.append(
+            (statement, parameters)
+        )
+    )
+
+    @contextmanager
+    def cursor_factory():
+        yield cursor
+
+    now = datetime(2026, 10, 27, 17, tzinfo=timezone.utc)
+    stock_alert_results.record_stream_error(
+        "intraday",
+        now,
+        "TEST_ERROR",
+        cursor_factory=cursor_factory,
+    )
+
+    assert "stock_alert_result_streams" in calls[0][0]
+    assert calls[0][1] == ("intraday", now, "TEST_ERROR")
 
 
 def snapshot():

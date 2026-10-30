@@ -64,6 +64,10 @@ def parse_args(argv=None):
     parser.add_argument("--expected-capture-file-sha256", required=True)
     parser.add_argument("--reference-valid-until", type=datetime.fromisoformat, required=True)
     parser.add_argument("--authorization-reference", required=True)
+    parser.add_argument("--expected-contract-inserts", type=int)
+    parser.add_argument("--expected-version-inserts", type=int)
+    parser.add_argument("--expected-instrument-inserts", type=int)
+    parser.add_argument("--expected-oi-inserts", type=int)
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
@@ -84,6 +88,27 @@ def parse_args(argv=None):
         args.reference_valid_until.tzinfo is None
         or args.reference_valid_until.utcoffset() is None
         or not args.authorization_reference.strip()
+        or any(
+            getattr(args, name) < 0
+            for name in (
+                "expected_contract_inserts",
+                "expected_version_inserts",
+                "expected_instrument_inserts",
+                "expected_oi_inserts",
+            )
+        )
+        or (
+            args.apply
+            and any(
+                getattr(args, name) is None
+                for name in (
+                    "expected_contract_inserts",
+                    "expected_version_inserts",
+                    "expected_instrument_inserts",
+                    "expected_oi_inserts",
+                )
+            )
+        )
     ):
         parser.error("V3 capture application scope is invalid")
     args.reference_valid_until = args.reference_valid_until.astimezone(UTC)
@@ -216,6 +241,39 @@ def _provider():
     return provider, pool
 
 
+def _authorized_effects(
+    args,
+    catalog_effects,
+    oi_inserts,
+    *,
+    enforce=True,
+):
+    authorized = {
+        "contract_inserts": args.expected_contract_inserts,
+        "version_inserts": args.expected_version_inserts,
+        "instrument_inserts": args.expected_instrument_inserts,
+        "oi_inserts": args.expected_oi_inserts,
+    }
+    observed = {
+        key: catalog_effects[key]
+        for key in (
+            "contract_inserts",
+            "version_inserts",
+            "instrument_inserts",
+        )
+    }
+    observed = {
+        **observed,
+        "oi_inserts": oi_inserts,
+    }
+    if enforce and observed != authorized:
+        raise ValueError(
+            "sealed capture application effects changed: "
+            f"authorized={authorized}, observed={observed}"
+        )
+    return observed
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     capture = _load_capture(args)
@@ -261,6 +319,23 @@ def main(argv=None) -> int:
             expected = _diff(entries, current)
             if expected["conflicts"]:
                 raise ValueError("sealed capture catalog conflicts")
+            oi_baseline_ids = tuple(
+                str(fact.identity[1]) for fact in oi_facts
+            )
+            unit.cursor.execute(
+                "SELECT baseline_id::text FROM ref.oi_baselines "
+                "WHERE baseline_id=ANY(%s::uuid[]) ORDER BY baseline_id",
+                (list(oi_baseline_ids),),
+            )
+            existing_oi_ids = {
+                str(row["baseline_id"]) for row in unit.cursor.fetchall()
+            }
+            effects = _authorized_effects(
+                args,
+                expected,
+                len(oi_baseline_ids) - len(existing_oi_ids),
+                enforce=args.apply,
+            )
             if args.apply:
                 applied = apply_manifest_cursor(
                     unit.cursor,
@@ -277,6 +352,18 @@ def main(argv=None) -> int:
                     ],
                 )
                 persist_reference_facts_cursor(unit.cursor, oi_facts)
+                unit.cursor.execute(
+                    "SELECT baseline_id::text FROM ref.oi_baselines "
+                    "WHERE baseline_id=ANY(%s::uuid[])",
+                    (list(oi_baseline_ids),),
+                )
+                if {
+                    str(row["baseline_id"])
+                    for row in unit.cursor.fetchall()
+                } != set(oi_baseline_ids):
+                    raise RuntimeError(
+                        "sealed capture OI postcondition failed"
+                    )
             else:
                 applied = {
                     "contract_inserts": 0,
@@ -292,13 +379,13 @@ def main(argv=None) -> int:
         "capture_semantic_sha256": capture["semantic_sha256"],
         "hydration_manifest_sha256": manifest["manifest_sha256"],
         "authorization_reference": args.authorization_reference,
-        "expected": expected,
+        "expected": effects,
         "applied": applied,
-        "oi_inserts": len(oi_facts) if args.apply else 0,
+        "oi_inserts": effects["oi_inserts"] if args.apply else 0,
         "settlement_session": settlement.isoformat(),
         "provider_requests": 0,
         "database_writes": (
-            sum(applied.values()) + len(oi_facts)
+            sum(applied.values()) + effects["oi_inserts"]
             if args.apply
             else 0
         ),

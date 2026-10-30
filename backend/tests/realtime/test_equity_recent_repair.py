@@ -14,6 +14,7 @@ from realtime.contracts import canonical_sha256
 from realtime.equity_adjusted_daily_repair import (
     AdjustedDailyRepairPlan,
     ENDPOINT_POLICY as ADJUSTED_ENDPOINT_POLICY,
+    RAW_GROUPED_ENDPOINT_POLICY,
     _request_spec as adjusted_request_spec,
 )
 
@@ -244,6 +245,46 @@ def test_one_ticker_raw_daily_plan_uses_exact_aggregate_endpoint():
     })
 
 
+def test_raw_daily_plan_binds_one_exact_grouped_request():
+    native = _plan()
+    second = SimpleNamespace(
+        ticker="MSFT",
+        instrument_id=2,
+        security=SimpleNamespace(
+            security_id=UUID(int=2),
+            payload_sha256="b" * 64,
+        ),
+    )
+    plan = AdjustedDailyRepairPlan(
+        native.cohort_id,
+        (native.identities[0], second),
+        native.sessions[0],
+        native.authorized_until,
+        1,
+        8 * 1024 * 1024 + 1,
+        8 * 1024 * 1024,
+        "operator",
+        "entitlement",
+        "approved cost",
+        adjusted=False,
+    )
+
+    url, params, request_sha256 = adjusted_request_spec(plan)
+
+    assert url.endswith(
+        "/v2/aggs/grouped/locale/us/market/stocks/2026-10-19"
+    )
+    assert params == {"adjusted": "false"}
+    assert plan.identity()["endpoint_policy"] == RAW_GROUPED_ENDPOINT_POLICY
+    assert request_sha256 == canonical_sha256({
+        "policy": "v2-adjusted-daily-session-repair-v1",
+        "plan_sha256": plan.sha256,
+        "method": "GET",
+        "url": url,
+        "params": params,
+    })
+
+
 def test_bounded_http_read_closes_response_and_never_retains_oversized_body():
     from options.data.polygon_http import PolygonResponseTooLarge, RequestsPolygonHttpTransport
 
@@ -315,3 +356,25 @@ def test_repair_verifies_target_before_any_mutation_or_provider_call():
         execute_recent_native_repair(provider, transport, _plan(), clock=lambda: NOW)
     provider.transaction.assert_not_called()
     transport.get.assert_not_called()
+
+
+def test_retained_plan_replay_selects_one_exact_stored_identity():
+    from scripts.replay_realtime_v2_retained_native_plan import (
+        _select_stored_plan,
+    )
+
+    identity = _plan().identity()
+    plan_sha256 = canonical_sha256(identity)
+
+    assert _select_stored_plan(
+        ((plan_sha256, identity),),
+        plan_sha256,
+    ) == identity
+    with pytest.raises(ValueError, match="found 2"):
+        _select_stored_plan(
+            (
+                (plan_sha256, identity),
+                (plan_sha256, identity),
+            ),
+            plan_sha256,
+        )

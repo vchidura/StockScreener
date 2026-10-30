@@ -254,6 +254,7 @@ pytestmark = requires_v2_database
 UTC = timezone.utc
 BUILD_ID = "advanced-options-v3-provider-free-v1"
 REPORT_ENV = "STOCKS_V3_RETAIN_REPORT"
+SUFFIX_ENV = "STOCKS_V3_QUALIFICATION_SUFFIX"
 REPORT_ROOT = Path(__file__).parents[2] / ".realtime-canary"
 
 
@@ -685,6 +686,8 @@ def _exact_enrollment(database_cursor, authority):
             DetectorFamily.O1,
             DetectorFamily.O2,
             DetectorFamily.O3,
+            DetectorFamily.OS1,
+            DetectorFamily.OS2,
         ),
     )
     pins = AdvancedOptionsPolicyPins(
@@ -1153,7 +1156,14 @@ def test_v3_exact_provider_free_restart_publication_and_cleanup(
     tmp_path,
     capsys,
 ):
-    suffix = uuid4().hex[:8]
+    suffix = os.getenv(SUFFIX_ENV) or uuid4().hex[:8]
+    if (
+        len(suffix) != 8
+        or any(value not in "0123456789abcdef" for value in suffix)
+    ):
+        raise ValueError(
+            f"{SUFFIX_ENV} must be exactly eight lowercase hexadecimal characters"
+        )
     database_name = f"test_realtime_v2_v3_{suffix}"
     roles = build_role_names_v2(f"test_rt_v3_{suffix}")
     settings = _settings()

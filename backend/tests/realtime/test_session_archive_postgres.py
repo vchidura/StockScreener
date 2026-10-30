@@ -156,7 +156,7 @@ def _insert_alert_fixture(connection, first: date, second: date) -> dict[str, st
         cursor.execute(
             "INSERT INTO rt.detector_versions (detector_sha256, detector_id, version, code_sha256, "
             "policy_sha256, valuation_sha256, requirements, output_kind) "
-            "VALUES (%s, 'S1', 'v1', %s, %s, NULL, '{}'::jsonb, 'ALERT')", (_hash(2), _hash(2), _hash(2)))
+            "VALUES (%s, 'OS1', 'v1', %s, %s, NULL, '{}'::jsonb, 'ALERT')", (_hash(2), _hash(2), _hash(2)))
         for index, event_id in enumerate(events):
             cursor.execute(
                 "INSERT INTO rt.detector_events (event_id, dedup_sha256, cohort_id, provider_tier, "
@@ -184,14 +184,14 @@ def _insert_alert_fixture(connection, first: date, second: date) -> dict[str, st
         cursor.execute(
             "INSERT INTO rt.detector_datasets (dataset_id, cohort_id, provider_tier, dataset_key, session_date, "
             "status, detector_ids, source_manifest_sha256, started_at, completed_at, summary) "
-            "VALUES (%s,%s,'MASSIVE_DEVELOPER','dataset-1',%s,'COMPLETE',ARRAY['S1'],%s,%s,%s,'{}'::jsonb)",
+            "VALUES (%s,%s,'MASSIVE_DEVELOPER','dataset-1',%s,'COMPLETE',ARRAY['OS1'],%s,%s,%s,'{}'::jsonb)",
             (ids["dataset"], ids["cohort"], first, _hash(500), _at(first, 14), _at(first, 15)))
         statuses = ("SELECTED", "SELECTED", "NOT_SELECTED", "REPEAT", "OBSERVATION")
         for index, (event_id, status) in enumerate(zip(events, statuses)):
             cursor.execute(
                 "INSERT INTO rt.detector_evaluations (evaluation_id, dataset_id, event_id, detector_id, "
                 "underlyer, selection_status, observed_at, payload_sha256, payload) "
-                "VALUES (%s,%s,%s,'S1','SPY',%s,%s,%s,%s::jsonb)",
+                "VALUES (%s,%s,%s,'OS1','SPY',%s,%s,%s,%s::jsonb)",
                 (str(uuid4()), ids["dataset"], event_id, status, _at(first, 14, index), _hash(600 + index),
                  json.dumps({"reason": status.lower(), "score": 0.5 + index})))
         for alert_id, assessed in ((ids["stock_alert"], _at(first, 18)), (ids["option_alert"], _at(first, 18))):

@@ -11,6 +11,7 @@ import exchange_calendars
 
 from research.stock_alert_results import combine_snapshots, namespace_snapshot, strategy_instance
 from research.stock_alerts import empty_snapshot, enrich_replay, replay_snapshot, session_dates
+from research.stock_idea_engine import digest
 from research.stock_idea_forward import (
     READINESS_POLICY, forward_config, readiness_deadline, update_positions, window_clock,
 )
@@ -284,6 +285,75 @@ def evaluate_alert_inputs(inputs, bars, actions, policy):
     return packets
 
 
+def _retained_projection(inputs, projection):
+    if not isinstance(projection, Mapping):
+        raise TypeError("retained Stock Alert projection is invalid")
+    body = dict(projection)
+    projection_sha256 = body.pop("projection_sha256", None)
+    if (
+        body.get("contract")
+        != "realtime-stock-alert-retained-projection-v1"
+        or digest(body) != projection_sha256
+    ):
+        raise ValueError("retained Stock Alert projection identity changed")
+    loaded_at = utc(body["loaded_at"])
+    if loaded_at > inputs.recorded_by:
+        raise ValueError("retained Stock Alert projection is not yet available")
+    input_binding = body.get("input_binding")
+    if (
+        not isinstance(input_binding, Mapping)
+        or str(input_binding.get("cohort_id")) != str(inputs.cohort_id)
+        or utc(input_binding.get("cutoff")) != inputs.cutoff
+        or input_binding.get("detector_input_sha256")
+        != inputs_sha256(inputs)
+        or input_binding.get("source_identity_sha256")
+        != digest(body.get("source_identity", ()))
+    ):
+        raise ValueError(
+            "retained Stock Alert projection is not bound to the exact input"
+        )
+    expected_members = sorted(
+        (str(row["security_id"]), row["ticker"])
+        for row in inputs.members
+    )
+    snapshots = tuple(body["streams"])
+    for snapshot in snapshots:
+        instance = snapshot.get("strategy_instance")
+        if (
+            snapshot.get("source") != "SHADOW"
+            or not isinstance(instance, Mapping)
+            or instance.get("stream") not in {"intraday", "swing"}
+        ):
+            raise ValueError("retained Stock Alert stream identity changed")
+        expected_policy = forward_config(
+            quality_version=2,
+            swing=instance["stream"] == "swing",
+        )
+        enrollment = sorted(
+            (str(row["security_id"]), row["ticker"])
+            for row in instance.get("enrollment", ())
+        )
+        if (
+            instance.get("policy") != expected_policy
+            or instance.get("policy_hash") != digest(expected_policy)
+            or enrollment != expected_members
+        ):
+            raise ValueError(
+                "retained Stock Alert policy or enrollment changed"
+            )
+    allowed = set(expected_members)
+    for row in body["shadow"].get("alerts", ()):
+        if (str(row["security_id"]), row["ticker"]) not in allowed:
+            raise ValueError(
+                "retained Stock Alert extends beyond the exact cohort"
+            )
+    return {
+        **body,
+        "projection_sha256": projection_sha256,
+        "streams": snapshots,
+    }
+
+
 def _retained_snapshot(inputs, retained, bars, actions):
     if retained.stream not in {"intraday", "swing"}:
         raise ValueError("Unknown realtime alert stream")
@@ -386,24 +456,57 @@ def _retained_snapshot(inputs, retained, bars, actions):
     return namespace_snapshot(instance, snapshot), instance, records, schedule
 
 
-def produce_realtime_stock_alerts(inputs: RealtimeScreeningInput, *, streams=()):
+def produce_realtime_stock_alerts(
+    inputs: RealtimeScreeningInput,
+    *,
+    streams=(),
+    retained_projection=None,
+):
+    if (
+        isinstance(retained_projection, Mapping)
+        and retained_projection.get("contract")
+        == "canonical-stock-alert-retained-projection-v1"
+    ):
+        return _produce_canonical_realtime_stock_alerts(
+            inputs,
+            retained_projection,
+        )
     inputs = alert_source_inputs(inputs)
     bars, actions = alert_domain_inputs(inputs)
     policy = forward_config(quality_version=2)
-    packets = evaluate_alert_inputs(inputs, bars, actions, policy)
+    retained = (
+        None
+        if retained_projection is None
+        else _retained_projection(inputs, retained_projection)
+    )
+    packets = (
+        evaluate_alert_inputs(inputs, bars, actions, policy)
+        if retained is None
+        else ()
+    )
+    if retained is not None and streams:
+        raise ValueError(
+            "retained Stock Alert sources cannot be supplied twice"
+        )
     if len({stream.stream for stream in streams}) != len(streams):
         raise ValueError("Realtime alert streams must remain independent and unique")
     snapshots, instances, records, schedules = [], [], [], []
-    for stream in streams:
-        snapshot, instance, publications, schedule = _retained_snapshot(inputs, stream, bars, actions)
-        snapshots.append(snapshot)
-        instances.append(instance)
-        records.extend(publications)
-        schedules.append(schedule)
-    if snapshots:
+    if retained is not None:
+        snapshots = list(deepcopy(retained["streams"]))
+        shadow = deepcopy(retained["shadow"])
+        records = deepcopy(retained["review_publications"])
+        schedules = deepcopy(retained["schedule_streams"])
+    else:
+        for stream in streams:
+            snapshot, instance, publications, schedule = _retained_snapshot(inputs, stream, bars, actions)
+            snapshots.append(snapshot)
+            instances.append(instance)
+            records.extend(publications)
+            schedules.append(schedule)
+    if retained is None and snapshots:
         shadow = combine_snapshots(snapshots, instances)
         shadow["current_session"] = str(inputs.session)
-    else:
+    elif retained is None:
         shadow = empty_snapshot("SHADOW")
         shadow.update(status="UNAVAILABLE", as_of=inputs.cutoff.isoformat(),
                       sessions=session_dates(str(inputs.session)), current_session=str(inputs.session),
@@ -412,24 +515,26 @@ def produce_realtime_stock_alerts(inputs: RealtimeScreeningInput, *, streams=())
     packets_by_member_interval = {}
     for row in packets:
         packets_by_member_interval.setdefault((row["security_id"], row["interval"]), []).append(row)
-    for member in inputs.members:
-        for interval in ("30m", "1h", "1d"):
-            own = packets_by_member_interval.get((str(member["security_id"]), interval), ())
-            latest = max(own, key=lambda row: row["market_time"], default=None)
-            ready = latest is not None and latest["ready"] and latest["available_at"] <= inputs.cutoff
-            observations.append(dict(
-                ticker=member["ticker"], security_id=str(member["security_id"]), interval=interval,
-                status="EVALUATED" if ready else "UNAVAILABLE",
-                candidates=len(latest["candidates"]) if latest else 0, selected=False,
-                reason_codes=[] if ready else ["ALERT_DATED_CONTEXT_OR_TIMELY_INPUT_UNAVAILABLE"],
-                market_time=latest["market_time"].isoformat() if latest else None,
-                available_at=latest["available_at"].isoformat() if latest else None,
-            ))
+    if retained is None:
+        for member in inputs.members:
+            for interval in ("30m", "1h", "1d"):
+                own = packets_by_member_interval.get((str(member["security_id"]), interval), ())
+                latest = max(own, key=lambda row: row["market_time"], default=None)
+                ready = latest is not None and latest["ready"] and latest["available_at"] <= inputs.cutoff
+                observations.append(dict(
+                    ticker=member["ticker"], security_id=str(member["security_id"]), interval=interval,
+                    status="EVALUATED" if ready else "UNAVAILABLE",
+                    candidates=len(latest["candidates"]) if latest else 0, selected=False,
+                    reason_codes=[] if ready else ["ALERT_DATED_CONTEXT_OR_TIMELY_INPUT_UNAVAILABLE"],
+                    market_time=latest["market_time"].isoformat() if latest else None,
+                    available_at=latest["available_at"].isoformat() if latest else None,
+                ))
     payload = dict(
         version=STOCK_ALERTS_VERSION, references=list(inputs.members), shadow=shadow, streams=snapshots,
         review_publications=records, observations=observations, schedule_streams=schedules,
+        input_binding=(None if retained is None else deepcopy(retained["input_binding"])),
         missing_producers={key: value for key, value in MISSING_PRODUCERS.items()
-                           if key != "forward" or not streams},
+                           if key != "forward" or retained is None and not streams},
         provider_fetch_performed=False, publication_permission=False, execution_permission=False,
     )
     hourly_lineage = {row["revision_id"]: row["source_revision_ids"] for row in derive_hours(bars, policy)}
@@ -446,7 +551,21 @@ def produce_realtime_stock_alerts(inputs: RealtimeScreeningInput, *, streams=())
         producer_sha256=canonical_sha256(Path(__file__).read_text(encoding="utf-8")),
         detector_sha256=policy["model_source_sha256"],
         price_basis="ADJUSTED_DAILY_FEATURES_PINNED_RAW_SCALE_AND_RAW_30M_EXECUTION",
-        retained_stream_sha256=canonical_sha256(streams),
+        retained_stream_sha256=(
+            retained["projection_sha256"]
+            if retained is not None
+            else canonical_sha256(streams)
+        ),
+        input_binding_sha256=(
+            None
+            if retained is None
+            else retained["input_binding"]["binding_sha256"]
+        ),
+        input_receipt_id=(
+            None
+            if retained is None
+            else retained["input_binding"]["input_receipt_id"]
+        ),
     )
     require_bounded_manifest(manifest, name="Stock Alerts")
     return build_portal_snapshot(
@@ -454,4 +573,186 @@ def produce_realtime_stock_alerts(inputs: RealtimeScreeningInput, *, streams=())
         snapshot_type=STOCK_ALERTS_VERSION, snapshot_key="PLATFORM",
         source_generation=inputs.source_generation, source_manifest=manifest,
         payload=payload, generated_at=inputs.cutoff,
+    )
+
+
+def _produce_canonical_realtime_stock_alerts(
+    inputs: RealtimeScreeningInput,
+    retained: Mapping[str, object],
+):
+    body = dict(retained)
+    projection_sha256 = body.pop("projection_sha256", None)
+    batch = body.get("batch")
+    evaluations = body.get("evaluations")
+    if (
+        canonical_sha256(body) != projection_sha256
+        or not isinstance(batch, Mapping)
+        or not isinstance(evaluations, list)
+        or str(batch.get("cohort_id")) != str(inputs.cohort_id)
+        or batch.get("cutoff") != inputs.cutoff.isoformat()
+        or batch.get("detector_input_sha256") != inputs_sha256(inputs)
+    ):
+        raise ValueError(
+            "canonical Stock Alert projection is not bound to exact E"
+        )
+    expected_members = {
+        (str(row["security_id"]), row["ticker"])
+        for row in inputs.members
+    }
+    observed_members = {
+        (str(row["security_id"]), row["ticker"])
+        for row in evaluations
+    }
+    if observed_members != expected_members:
+        raise ValueError(
+            "canonical Stock Alert evaluation membership changed"
+        )
+    publication = {
+        "run_id": str(batch["batch_id"]),
+        "strategy_instance_id": "canonical-equity-stock-alert-v1",
+        "session": str(inputs.session),
+        "published_at": batch["completed_at"],
+        "selected": sum(
+            row["disposition"] == "MATCH" for row in evaluations
+        ),
+        "expected": len(evaluations),
+        "missing": sum(
+            row["disposition"] in {"UNAVAILABLE", "ERROR"}
+            for row in evaluations
+        ),
+        "status": "COMPLETE",
+    }
+    alerts = []
+    for evaluation in evaluations:
+        projection = evaluation.get("alert")
+        if projection is None:
+            continue
+        row = deepcopy(dict(projection))
+        row.update({
+            "alert_id": evaluation["alert_id"],
+            "run_id": publication["run_id"],
+            "strategy_instance_id": publication[
+                "strategy_instance_id"
+            ],
+            "session": publication["session"],
+            "security_id": evaluation["security_id"],
+            "ticker": evaluation["ticker"],
+            "disposition": evaluation["disposition"],
+            "reason_codes": list(evaluation["reason_codes"]),
+            "entry_price": None,
+            "entry_at": None,
+            "exit_price": None,
+            "exit_at": None,
+            "exit_due_at": None,
+            "latest_price": None,
+            "latest_price_at": None,
+            "paper_return": None,
+            "daily_context_at": None,
+            "indicator_at": None,
+            "indicator_interval": "5m",
+        })
+        alerts.append(row)
+    unavailable_reasons = sorted({
+        reason
+        for row in evaluations
+        if row["disposition"] in {"UNAVAILABLE", "ERROR"}
+        for reason in row["reason_codes"]
+    })
+    snapshot = {
+        "schema": "stock_alert_view_v1",
+        "source": "SHADOW",
+        "source_id": str(batch["batch_id"]),
+        "source_label": "Advanced realtime Equity models",
+        "status": (
+            "DEGRADED" if unavailable_reasons else "READY"
+        ),
+        "as_of": batch["completed_at"],
+        "price_as_of": inputs.cutoff.isoformat(),
+        "sessions": session_dates(str(inputs.session)),
+        "current_session": str(inputs.session),
+        "publications": [publication],
+        "alerts": alerts,
+        "observations": [],
+        "hit_coverage": False,
+        "warnings": [
+            "Canonical context unavailable: " + reason
+            for reason in unavailable_reasons
+        ],
+        "combined": False,
+        "strategy_streams": [{
+            "stream": "canonical",
+            "label": "Advanced realtime Equity models",
+            "status": publication["status"],
+        }],
+        "publication_mode": "FINALIZED_5M",
+    }
+    observations = [
+        {
+            "evaluation_id": row["evaluation_id"],
+            "event_id": row["event_id"],
+            "security_id": row["security_id"],
+            "ticker": row["ticker"],
+            "model": "canonical-equity-stock-alert-v1",
+            "interval": "5m",
+            "status": row["disposition"],
+            "selected": row["disposition"] == "MATCH",
+            "reason_codes": list(row["reason_codes"]),
+            "market_time": inputs.cutoff.isoformat(),
+            "available_at": row["observed_at"],
+        }
+        for row in evaluations
+    ]
+    payload = {
+        "version": STOCK_ALERTS_VERSION,
+        "canonical_product": True,
+        "references": list(inputs.members),
+        "shadow": snapshot,
+        "streams": [],
+        "review_publications": [],
+        "observations": observations,
+        "schedule_streams": snapshot["strategy_streams"],
+        "input_binding": dict(batch),
+        "missing_producers": {
+            "sector_context": (
+                "Canonical sector context is not implemented"
+            ),
+            "event_context": (
+                "Canonical event-risk context is not implemented"
+            ),
+            "replay": (
+                "Canonical historical replay is not implemented"
+            ),
+        },
+        "provider_fetch_performed": False,
+        "publication_permission": False,
+        "execution_permission": False,
+    }
+    manifest = {
+        "version": STOCK_ALERTS_VERSION,
+        "cohort_id": str(inputs.cohort_id),
+        "provider_tier": inputs.provider_tier.value,
+        "source_generation": inputs.source_generation,
+        "source_manifest_sha256": inputs.source_manifest_sha256,
+        "input_sha256": inputs_sha256(inputs),
+        "reference_set": reference_set(inputs.members),
+        "bar_lineage_sha256": inputs_bar_lineage_sha256(inputs),
+        "policy_sha256": batch["detector_sha256"],
+        "producer_sha256": canonical_sha256(
+            Path(__file__).read_text(encoding="utf-8")
+        ),
+        "detector_sha256": batch["detector_sha256"],
+        "price_basis": "RAW_UNADJUSTED_FINALIZED_5M",
+        "canonical_batch_sha256": batch["batch_sha256"],
+        "input_receipt_id": batch["input_receipt_id"],
+    }
+    require_bounded_manifest(manifest, name="Stock Alerts")
+    return build_portal_snapshot(
+        cohort_id=inputs.cohort_id,
+        provider_tier=inputs.provider_tier,
+        snapshot_type=STOCK_ALERTS_VERSION,
+        snapshot_key="PLATFORM",
+        source_generation=inputs.source_generation,
+        source_manifest=manifest,
+        payload=payload,
+        generated_at=inputs.cutoff,
     )

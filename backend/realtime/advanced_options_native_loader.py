@@ -9,8 +9,15 @@ from enum import Enum
 from typing import Callable, Mapping
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from equity.domain import (
+    BarAvailabilityMode,
+    BarSessionScope,
+    BarSourceKind,
+    EquityBarRevision,
+)
 from options.calendar import OptionExchangeCalendar
 from options.dual_origin import ActivitySource
+from options.stock_bar_detection import detect_canonical_stock_signals
 from psycopg2 import Error as PsycopgError
 from psycopg2.extras import RealDictCursor
 
@@ -25,6 +32,7 @@ from .advanced_options_equity_input import (
 )
 from .advanced_options_native_adapters import (
     AdvancedO1Invocation,
+    AdvancedOSInvocation,
     AdvancedOptionsLaneInputs,
     AdvancedOptionsNativeInputBundle,
     advanced_o3_invocation_document,
@@ -884,7 +892,11 @@ def _load_equity_context(
     cursor,
     plan: AdvancedOptionsNativeInputPlan,
     evidence: list[AdvancedOptionsNativeInputEvidence],
-) -> tuple[dict[DetectorFamily, tuple[str, ...]], object]:
+) -> tuple[
+    dict[DetectorFamily, tuple[str, ...]],
+    object,
+    tuple,
+]:
     contexts = load_advanced_options_equity_context_cursor(
         cursor,
         equity_plan=plan.enrollment.equity_plan,
@@ -921,7 +933,171 @@ def _load_equity_context(
             identity,
             reasons=context.reason_codes,
         ))
-    return reasons_by_lane, tuple(identities)
+    return reasons_by_lane, tuple(identities), contexts
+
+
+def _equity_bar(row) -> EquityBarRevision:
+    return EquityBarRevision(
+        bar_revision_id=UUID(str(row["bar_revision_id"])),
+        security_id=UUID(str(row["security_id"])),
+        ticker=str(row["ticker"]),
+        interval=str(row["interval"]),
+        session_date=row["session_date"],
+        bar_start=row["bar_start"],
+        bar_end=row["bar_end"],
+        open_price=Decimal(str(row["open_price"])),
+        high_price=Decimal(str(row["high_price"])),
+        low_price=Decimal(str(row["low_price"])),
+        close_price=Decimal(str(row["close_price"])),
+        volume=Decimal(str(row["volume"])),
+        vwap=(
+            None
+            if row.get("vwap") is None
+            else Decimal(str(row["vwap"]))
+        ),
+        transaction_count=row.get("transaction_count"),
+        source_kind=BarSourceKind(str(row["source_kind"])),
+        availability_mode=BarAvailabilityMode(
+            str(row["availability_mode"])
+        ),
+        is_final=bool(row["is_final"]),
+        system_observed_at=row["observed_at"],
+        replay_available_at=row.get("replay_available_at"),
+        adjusted=str(row["adjustment_basis"]) != "RAW_UNADJUSTED",
+        payload_sha256=str(row["payload_sha256"]),
+        quality_codes=tuple(row.get("quality_codes") or ()),
+        provider_published_at=row.get("provider_published_at"),
+        ingestion_segment_id=(
+            None
+            if row.get("ingestion_segment_id") is None
+            else UUID(str(row["ingestion_segment_id"]))
+        ),
+        source_bar_revision_ids=tuple(
+            UUID(str(value))
+            for value in row.get("source_revision_ids") or ()
+        ),
+        supersedes_bar_revision_id=(
+            None
+            if row.get("supersedes_bar_revision_id") is None
+            else UUID(str(row["supersedes_bar_revision_id"]))
+        ),
+        reconciliation_status=row.get("reconciliation_status"),
+        session_scope=BarSessionScope(str(row["session_scope"])),
+    )
+
+
+def _load_os(
+    cursor,
+    plan: AdvancedOptionsNativeInputPlan,
+    *,
+    detector: DetectorFamily,
+    contexts,
+    o1_inputs: AdvancedOptionsLaneInputs,
+    evidence: list[AdvancedOptionsNativeInputEvidence],
+) -> tuple[AdvancedOptionsLaneInputs, object]:
+    if detector not in {DetectorFamily.OS1, DetectorFamily.OS2}:
+        raise ValueError("Advanced stock-first Options lane is invalid")
+    if o1_inputs.blocked_reason_codes:
+        reasons = tuple(o1_inputs.blocked_reason_codes)
+        return (
+            AdvancedOptionsLaneInputs(blocked_reason_codes=reasons),
+            {"blocked_reason_codes": reasons},
+        )
+    context = next(row for row in contexts if row.lane is detector)
+    if context.reason_codes:
+        reasons = tuple(context.reason_codes)
+        return (
+            AdvancedOptionsLaneInputs(blocked_reason_codes=reasons),
+            {"blocked_reason_codes": reasons},
+        )
+    member_ids = tuple(row.bar_revision_id for row in context.members)
+    cursor.execute(
+        "SELECT * FROM rt.bar_revisions "
+        "WHERE bar_revision_id=ANY(%s::uuid[]) "
+        "AND observed_at<=%s AND created_at<=%s "
+        "ORDER BY ticker,interval,bar_end,bar_revision_id",
+        (
+            [str(value) for value in member_ids],
+            plan.equity_input_receipt.cutoff,
+            plan.equity_input_receipt.cutoff,
+        ),
+    )
+    rows = tuple(cursor.fetchall())
+    if (
+        len(rows) != len(member_ids)
+        or {UUID(str(row["bar_revision_id"])) for row in rows}
+        != set(member_ids)
+    ):
+        reasons = (f"{detector.value}_BAR_MEMBERSHIP_UNAVAILABLE",)
+        return (
+            AdvancedOptionsLaneInputs(blocked_reason_codes=reasons),
+            {"blocked_reason_codes": reasons},
+        )
+    by_ticker = {}
+    for row in rows:
+        by_ticker.setdefault(str(row["ticker"]), []).append(
+            (_equity_bar(row), row["created_at"])
+        )
+    security_ids = dict(plan.enrollment.equity_plan.security_ids)
+    calendar = OptionExchangeCalendar()
+    signals = []
+    for ticker in plan.control_plane.universe.option_underlyings:
+        signals.extend(detect_canonical_stock_signals(
+            security_id=security_ids[ticker],
+            underlyer=ticker,
+            bars=tuple(by_ticker.get(ticker, ())),
+            market_cutoff=plan.equity_input_receipt.cutoff,
+            decision_at=plan.cutoff,
+            session_close=calendar.session_close(
+                plan.control_plane.session_date
+            ),
+            detector_ids=("OS1", "OS2"),
+        ))
+    invocations = []
+    for signal in signals:
+        if signal.detector_id != detector.value:
+            continue
+        matching = tuple(
+            row
+            for row in o1_inputs.invocations
+            if row.source.underlyer == signal.underlyer
+            and row.source.contract_type
+            == ("CALL" if signal.direction == 1 else "PUT")
+        )
+        for source in matching:
+            event_id = uuid5(
+                NAMESPACE_URL,
+                "advanced-options-stock-first:"
+                f"{detector.value}:{signal.signal_id}:{source.event_id}",
+            )
+            invocations.append(AdvancedOSInvocation(
+                event_id,
+                signal,
+                source.source,
+                source.package,
+            ))
+    identity = tuple(
+        (
+            str(row.event_id),
+            str(row.signal.signal_id),
+            str(row.source.snapshot_id) if row.source is not None else None,
+            (
+                str(row.package.candidate_id)
+                if row.package is not None
+                else None
+            ),
+        )
+        for row in invocations
+    )
+    evidence.append(_evidence(
+        detector.value,
+        "CANONICAL_STOCK_FIRST",
+        (
+            context.membership_sha256,
+            identity,
+        ),
+    ))
+    return AdvancedOptionsLaneInputs(tuple(invocations)), identity
 
 
 def assemble_advanced_options_native_inputs_cursor(
@@ -931,12 +1107,28 @@ def assemble_advanced_options_native_inputs_cursor(
     _validate_plan(plan)
     evidence: list[AdvancedOptionsNativeInputEvidence] = []
     _verify_scope(cursor, plan, evidence)
-    equity_context, equity_context_identity = _load_equity_context(
+    equity_context, equity_context_identity, equity_contexts = _load_equity_context(
         cursor,
         plan,
         evidence,
     )
     o1, o1_identity = _load_o1(cursor, plan, evidence)
+    os1, os1_identity = _load_os(
+        cursor,
+        plan,
+        detector=DetectorFamily.OS1,
+        contexts=equity_contexts,
+        o1_inputs=o1,
+        evidence=evidence,
+    )
+    os2, os2_identity = _load_os(
+        cursor,
+        plan,
+        detector=DetectorFamily.OS2,
+        contexts=equity_contexts,
+        o1_inputs=o1,
+        evidence=evidence,
+    )
     o3, o3_identity, o3_accepted_unavailable = _load_o3(
         cursor,
         plan,
@@ -965,6 +1157,8 @@ def assemble_advanced_options_native_inputs_cursor(
         },
         "O1": o1_identity,
         "O3": o3_identity,
+        "OS1": os1_identity,
+        "OS2": os2_identity,
         "equity_context": equity_context_identity,
         "O2": {"state": "UNAVAILABLE", "reason": "O2_MODEL_NOT_ACCEPTED"},
     }
@@ -977,12 +1171,16 @@ def assemble_advanced_options_native_inputs_cursor(
         for detector, lane in (
             (DetectorFamily.O1, o1),
             (DetectorFamily.O3, o3),
+            (DetectorFamily.OS1, os1),
+            (DetectorFamily.OS2, os2),
         )
     }
     membership_sha256 = canonical_sha256(membership)
     bundle = AdvancedOptionsNativeInputBundle(
         o1=o1,
         o3=o3,
+        os1=os1,
+        os2=os2,
         plan_id=plan.plan_id,
         input_sha256=input_sha256,
         executor_membership_sha256=membership_sha256,

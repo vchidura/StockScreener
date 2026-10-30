@@ -1,14 +1,18 @@
 from dataclasses import replace
 from datetime import timedelta
+from decimal import Decimal
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from realtime.advanced_options_native_adapters import (
     AdvancedO1Invocation,
     AdvancedO3Invocation,
+    AdvancedOSInvocation,
     AdvancedOptionsLaneInputs,
     AdvancedOptionsNativeInputBundle,
     advanced_o3_invocation_document,
     build_advanced_o1_executor,
     build_advanced_o3_executor,
+    build_advanced_os_executor,
     decode_advanced_o3_invocation_document,
 )
 from realtime.preflight import DetectorFamily
@@ -20,6 +24,12 @@ from test_developer_cycle_compute import (
 )
 from test_option_portal_adapter import _package, _policy
 from realtime.advanced_options_cycle import AdvancedOptionsDetectorContext
+from options.stock_bar_detection import (
+    ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY_SHA256,
+    CanonicalStockBarPoint,
+    CanonicalStockSignal,
+)
+from options.calendar import OptionExchangeCalendar
 
 
 def test_native_bundle_has_exact_accepted_executor_membership():
@@ -31,6 +41,8 @@ def test_native_bundle_has_exact_accepted_executor_membership():
     assert set(bundle.executors()) == {
         DetectorFamily.O1,
         DetectorFamily.O3,
+        DetectorFamily.OS1,
+        DetectorFamily.OS2,
     }
 
 
@@ -61,6 +73,12 @@ def test_missing_canonical_inputs_are_blocked_not_complete_zero():
         o3=AdvancedOptionsLaneInputs(
             blocked_reason_codes=("O3_INPUT_UNAVAILABLE",),
         ),
+        os1=AdvancedOptionsLaneInputs(
+            blocked_reason_codes=("OS1_INPUT_UNAVAILABLE",),
+        ),
+        os2=AdvancedOptionsLaneInputs(
+            blocked_reason_codes=("OS2_INPUT_UNAVAILABLE",),
+        ),
     )
 
     for detector, executor in bundle.executors().items():
@@ -74,6 +92,114 @@ def test_missing_canonical_inputs_are_blocked_not_complete_zero():
         assert result.reason_codes == (
             f"{detector.value}_INPUT_UNAVAILABLE",
         )
+
+
+def test_os1_executor_reuses_canonical_stock_first_model():
+    gate, receipt = _gate_and_receipt()
+    _, original = _confirmation_inputs()
+    cutoff = receipt.cutoff
+    source = original.model_copy(update={
+        "volume_session": cutoff.date(),
+        "market_time": cutoff - timedelta(minutes=2),
+        "observed_at": cutoff - timedelta(minutes=1),
+        "recorded_at": cutoff - timedelta(minutes=1),
+        "received_at": cutoff - timedelta(minutes=1),
+        "oi_observed_at": cutoff - timedelta(minutes=3),
+        "oi_settlement_session": (
+            OptionExchangeCalendar().previous_session(cutoff.date())
+        ),
+        "expiration_cutoff": cutoff + timedelta(days=7),
+    })
+    points = tuple(
+        CanonicalStockBarPoint(
+            bar_revision_id=uuid4(),
+            interval="5m",
+            session_date=cutoff.date(),
+            bar_start=cutoff - timedelta(minutes=12 - index * 5),
+            bar_end=cutoff - timedelta(minutes=7 - index * 5),
+            open=Decimal(value),
+            high=Decimal(value) + 1,
+            low=Decimal(value) - 1,
+            close=Decimal(value),
+            system_observed_at=cutoff - timedelta(minutes=2),
+            created_at=cutoff - timedelta(minutes=2),
+            payload_sha256="a" * 64,
+        )
+        for index, value in enumerate(("100", "101.1"))
+    )
+    daily = tuple(
+        CanonicalStockBarPoint(
+            bar_revision_id=uuid4(),
+            interval="1d",
+            session_date=cutoff.date() - timedelta(days=15 - index),
+            bar_start=cutoff - timedelta(days=15 - index, hours=7),
+            bar_end=cutoff - timedelta(days=15 - index),
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("99"),
+            close=Decimal("100"),
+            system_observed_at=cutoff - timedelta(days=15 - index),
+            created_at=cutoff - timedelta(days=15 - index),
+            payload_sha256="b" * 64,
+        )
+        for index in range(15)
+    )
+    signal_id = uuid5(
+        NAMESPACE_URL,
+        ":".join((
+            "canonical-stock-signal",
+            ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY_SHA256,
+            "OS1",
+            str(source.security_id),
+            cutoff.date().isoformat(),
+            "1",
+            str(points[-1].bar_revision_id),
+        )),
+    )
+    signal = CanonicalStockSignal(
+        signal_id=signal_id,
+        detector_id="OS1",
+        policy_sha256=ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY_SHA256,
+        security_id=source.security_id,
+        underlyer=source.underlyer,
+        direction=1,
+        interval="5m",
+        session_date=cutoff.date(),
+        prior_close=Decimal("100"),
+        prior_atr14=Decimal("2"),
+        threshold=Decimal("1"),
+        trigger_price=Decimal("101.1"),
+        stop=Decimal("100"),
+        target=Decimal("102.2"),
+        daily_bars=daily,
+        bars=points,
+        market_time=points[-1].bar_end,
+        available_at=cutoff - timedelta(minutes=2),
+        received_at=cutoff - timedelta(minutes=1),
+        valid_until=cutoff + timedelta(minutes=10),
+    )
+    executor = build_advanced_os_executor(
+        DetectorFamily.OS1,
+        AdvancedOptionsLaneInputs((
+            AdvancedOSInvocation(uuid4(), signal, source),
+        )),
+    )
+
+    result = executor(AdvancedOptionsDetectorContext(
+        gate,
+        receipt,
+        DetectorFamily.OS1,
+        cutoff,
+    ))
+
+    assert result.state.value == "COMPLETE"
+    assert len(result.evaluations) == 1
+    assert result.evaluations[0].payload["detector_id"] == "OS1"
+    assert (
+        result.evaluations[0].payload["decision"]["disposition"]
+        == "CONFIRMED"
+    ), result.evaluations[0].payload["decision"]["reasons"]
+    assert result.evaluations[0].selection_status == "OBSERVATION"
 
 
 def test_o1_adapter_retains_real_stable_detector_output():

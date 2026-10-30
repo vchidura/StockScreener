@@ -333,6 +333,36 @@ def hardened_database():
                 drop_disposable_roles_v2(connection, roles)
 
 
+@pytest.fixture(autouse=True)
+def isolate_active_stream_owners(hardened_database):
+    pool, _provider, roles, _cohort_id, _manifest_id = hardened_database
+
+    def close_active():
+        with _admin_cursor(pool, roles) as cursor:
+            cursor.execute(
+                "UPDATE rt.stream_sessions SET status='STOPPED',"
+                "ended_at=COALESCE(ended_at,%s),heartbeat_at=%s "
+                "WHERE ended_at IS NULL",
+                (SESSION_CLOSE, SESSION_CLOSE),
+            )
+            cursor.execute(
+                "UPDATE rt.advanced_journal_registry "
+                "SET status='QUARANTINED',"
+                "quarantine_reason='TEST_ISOLATION',"
+                "quarantine_detail='terminalized between test cases',"
+                "quarantined_at=%s,updated_at=%s "
+                "WHERE status NOT IN ('DRAINED','QUARANTINED')",
+                (
+                    SESSION_CLOSE + timedelta(days=1),
+                    SESSION_CLOSE + timedelta(days=1),
+                ),
+            )
+
+    close_active()
+    yield
+    close_active()
+
+
 def _authorization(ticket, *, budgets=None):
     return build_advanced_stream_authorization(
         parent_authorization_id=None,
@@ -864,7 +894,7 @@ def test_journal_writing_transition_is_idempotent_with_stale_check_time(
 
     root = tmp_path / "mounted-journals"
     root.mkdir()
-    path = root / "crash.sqlite"
+    path = root / f"crash-{generation}.sqlite"
     bridge_config = AdvancedEquityJournalBridgeConfig(
         cohort_id=plan.cohort_id,
         journal_generation=generation,
@@ -964,7 +994,7 @@ def test_registered_raw_commit_replays_to_one_canonical_bar_and_checkpoint(
 
     root = tmp_path / "mounted-journals"
     root.mkdir()
-    path = root / "crash.sqlite"
+    path = root / f"crash-{generation}.sqlite"
     bridge_config = AdvancedEquityJournalBridgeConfig(
         cohort_id=plan.cohort_id,
         journal_generation=generation,
@@ -1016,7 +1046,11 @@ def test_registered_raw_commit_replays_to_one_canonical_bar_and_checkpoint(
         "s": start,
         "e": end,
     }]).encode()
-    with RawJournalWriter(path, generation=generation) as writer:
+    with RawJournalWriter(
+        path,
+        generation=generation,
+        clock=lambda: SESSION_OPEN + timedelta(minutes=1),
+    ) as writer:
         writer.append_batch((
             RawMessageEnvelope(
                 session.session_id,
@@ -1186,7 +1220,11 @@ def test_input_ready_accepts_exact_bars_from_two_fenced_generations(
             }
             for start in starts
         ]).encode()
-        with RawJournalWriter(path, generation=generation) as writer:
+        with RawJournalWriter(
+            path,
+            generation=generation,
+            clock=lambda: starts[-1] + timedelta(minutes=1),
+        ) as writer:
             writer.append_batch((
                 RawMessageEnvelope(
                     session.session_id,
@@ -1247,7 +1285,11 @@ def test_input_ready_accepts_exact_bars_from_two_fenced_generations(
         database,
         SimpleNamespace(
             plan=SimpleNamespace(cohort_id=plan.cohort_id),
-            window=SimpleNamespace(window_id=uuid4(), cutoff=cutoff),
+            window=SimpleNamespace(
+                window_id=uuid4(),
+                cutoff=cutoff,
+                release_at=cutoff + timedelta(seconds=5),
+            ),
         ),
     )
 
@@ -1774,7 +1816,7 @@ def test_scheduler_restart_uses_durable_receipts_retries_and_lifecycle(
     assert retry == repeated
     assert retry.reused_input_receipt
     assert recovery.input_gate_sha256 == "c" * 64
-    assert recovery.input_known_by == deadline
+    assert recovery.input_known_by == release_at
     assert retry.report_relative_path.endswith("-retry1.json")
     with provider.transaction(APP_ROLE) as unit:
         blocked_backfill = plan_advanced_cold_start_cursor(

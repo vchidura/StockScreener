@@ -9,6 +9,7 @@ from realtime.equity_bar_adapter import adapt_developer_equity_bar
 from realtime.equity_bulk_backfill import (
     RETAINED_BACKFILL_ENDPOINT,
     RetainedEquityBulkSource,
+    _validate_retained_request_replay,
     build_equity_bulk_backfill_plan,
 )
 from realtime.stage_runners_ingest import EquityAcquisitionRequest
@@ -78,6 +79,52 @@ def test_retained_chunk_records_internal_lineage_but_zero_external_requests():
     assert len(result.requests) == 1
     assert result.requests[0].reservation.endpoint_class == RETAINED_BACKFILL_ENDPOINT
     assert result.batches[0].request_id == result.requests[0].reservation.request_id
+
+
+def test_retained_replay_reuses_terminal_effect_across_observation_clocks():
+    plan = build_equity_bulk_backfill_plan(
+        _facts(2),
+        cohort_id=COHORT,
+        tickers=("SPY",),
+    )
+    chunk = plan.chunks[0]
+    first = RetainedEquityBulkSource(
+        chunk,
+        cohort_id=COHORT,
+        recorded_at=NOW,
+    ).collect(EquityAcquisitionRequest(
+        COHORT,
+        universe=type("Universe", (), {
+            "equity_tickers": ("SPY",),
+            "option_underlyings": (),
+        })(),
+        requested_at=NOW,
+    )).requests[0]
+    later = RetainedEquityBulkSource(
+        chunk,
+        cohort_id=COHORT,
+        recorded_at=NOW + timedelta(minutes=1),
+    ).collect(EquityAcquisitionRequest(
+        COHORT,
+        universe=type("Universe", (), {
+            "equity_tickers": ("SPY",),
+            "option_underlyings": (),
+        })(),
+        requested_at=NOW + timedelta(minutes=1),
+    )).requests[0]
+
+    assert _validate_retained_request_replay(first, later) == first
+    with pytest.raises(ValueError, match="effect changed"):
+        _validate_retained_request_replay(
+            first,
+            replace(
+                later,
+                completion=replace(
+                    later.completion,
+                    row_count=later.completion.row_count + 1,
+                ),
+            ),
+        )
 
 
 def test_bulk_plan_rejects_partial_or_duplicate_scope():

@@ -78,6 +78,9 @@ def test_source_binding_covers_repository_owned_p8_docker_runtime():
         "backend/realtime/advanced_options_p8_production.py",
         "backend/realtime/advanced_options_p8_roles.py",
         "backend/realtime/advanced_options_p8_runtime.py",
+        "backend/realtime/advanced_options_validation_mode.py",
+        "backend/realtime/advanced_options_development_fixture.py",
+        "backend/realtime/advanced_options_development_plan.py",
         "backend/realtime/advanced_options_p8_selection_source.py",
         "backend/realtime/advanced_options_p8_window.py",
         "backend/realtime/advanced_options_equity_input.py",
@@ -86,6 +89,9 @@ def test_source_binding_covers_repository_owned_p8_docker_runtime():
         "backend/realtime/sql_v2/032_advanced_options_read_pins.sql",
         "backend/realtime/sql_v2/033_advanced_options_equity_input_bindings.sql",
         "backend/scripts/prepare_advanced_options_p8_equity_input_source.py",
+        "backend/scripts/verify_advanced_options_v3_development_projections.py",
+        "backend/scripts/prepare_advanced_options_v3_development_fixture_e.py",
+        "backend/scripts/prepare_advanced_options_v3_development_diagnostic.py",
         "docker-compose.realtime-v2.yml",
     }
 
@@ -166,6 +172,44 @@ def test_package_rejects_non_target9_equity_source(qualification):
             expected_qualification_file_sha256=file_sha256,
             source_files=SOURCE_FILES,
         )
+
+
+def test_package_accepts_v3_semantic_qualification_identity(
+    qualification,
+    tmp_path,
+):
+    report, semantic_sha256, _file_sha256 = qualification
+    value = json.loads(report.read_text(encoding="utf-8"))
+    value["semantic_sha256"] = value.pop("report_sha256")
+    v3_report = tmp_path / "v3-qualification.json"
+    v3_report.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    package = build_p8_canary_authorization(
+        v3_report,
+        repository_root=ROOT,
+        source_commit=COMMIT,
+        authorization_reference=REFERENCE,
+        package_nonce=NONCE,
+        prepared_at=PREPARED,
+        window_start=START,
+        window_end=STOP,
+        equity_input_source=_equity_input_source(),
+        expected_qualification_semantic_sha256=semantic_sha256,
+        expected_qualification_file_sha256=(
+            authorization.hashlib.sha256(
+                v3_report.read_bytes()
+            ).hexdigest()
+        ),
+        source_files=SOURCE_FILES,
+    )
+
+    assert (
+        package["qualification"]["report_semantic_sha256"]
+        == semantic_sha256
+    )
 
 
 def _selection(package):

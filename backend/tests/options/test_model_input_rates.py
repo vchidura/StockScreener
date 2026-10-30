@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from options.model_inputs import (
     DividendCashFlow,
+    TREASURY_PRIOR_SESSION_PUBLICATION_POLICY,
     equivalent_continuous_dividend_yield,
     interpolate_rate,
     parse_treasury_curve,
@@ -58,6 +59,31 @@ def test_provider_valuation_candidate_uses_native_maturity_matched_math_and_prov
     longer = prepare_expiration_valuation_candidate(**_candidate_inputs(expiration_date=date(2026, 11, 10)))
     assert longer.risk_free_rate == pytest.approx(0.041)
     assert longer.dividend_yield != pytest.approx(result.dividend_yield)
+
+
+def test_prior_session_treasury_publication_supports_all_78_cutoffs():
+    cutoffs = tuple(
+        datetime(2026, 9, 11, 13, 35, tzinfo=UTC)
+        + timedelta(minutes=5 * index)
+        for index in range(78)
+    )
+
+    results = tuple(
+        prepare_expiration_valuation_candidate(**_candidate_inputs(
+            selected_at=cutoff,
+            treasury_freshness_policy=(
+                TREASURY_PRIOR_SESSION_PUBLICATION_POLICY
+            ),
+            dividend_maximum_age_seconds=86_400,
+        ))
+        for cutoff in cutoffs
+    )
+
+    assert len(results) == 78
+    assert all(
+        row.risk_free_rate == pytest.approx(0.04)
+        for row in results
+    )
 
 
 @pytest.mark.parametrize("updates", [

@@ -216,6 +216,41 @@ class AdvancedIngressBudgets:
         )
 
 
+AUTOMATIC_CATCH_UP_MAXIMUM_ATTEMPTS = 2
+AUTOMATIC_CATCH_UP_RESPONSE_BYTE_LIMIT = 1024 * 1024
+AUTOMATIC_CATCH_UP_EXPECTED_COST = (
+    "included Massive Advanced aggregate entitlement"
+)
+
+
+def automatic_advanced_ingress_budgets(
+    *,
+    universe_target: int,
+    stream_sessions: int,
+    connection_attempts: int,
+    decoded_bytes: int,
+) -> AdvancedIngressBudgets:
+    target = _bounded_int(
+        universe_target,
+        "universe_target",
+        minimum=1,
+        maximum=400,
+    )
+    request_ceiling = (
+        target * AUTOMATIC_CATCH_UP_MAXIMUM_ATTEMPTS
+    )
+    return AdvancedIngressBudgets(
+        stream_sessions=stream_sessions,
+        connection_attempts=connection_attempts,
+        decoded_bytes=decoded_bytes,
+        rest_repair_requests=request_ceiling,
+        rest_repair_decoded_bytes=(
+            request_ceiling
+            * (AUTOMATIC_CATCH_UP_RESPONSE_BYTE_LIMIT + 1)
+        ),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AdvancedStreamAuthorization:
     authorization_id: UUID

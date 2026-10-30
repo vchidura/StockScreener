@@ -292,7 +292,8 @@ function CandidateDetail({ candidateId, close }: { candidateId: string; close: (
 
 const detectorNames = { O1: 'High Volume/OI Participation', O2: 'Local IV Surface Distortion',
   O3: 'Defined-Risk Credit',
-  S1: 'Range Breakout Acceptance', S2: 'Relative Trend Resumption' }
+  OS1: 'Range Breakout Acceptance',
+  OS2: 'Relative Trend Resumption' }
 const selectionNames: Record<string, string> = { SELECTED: 'Selected', NOT_SELECTED: 'Not selected', REPEAT: 'Repeat', OBSERVATION: 'Observation' }
 
 function DetectorSortHeader({ title, field, params, update }: {
@@ -330,7 +331,7 @@ function DetectorVersionControl({ data, params, update }: {
 }) {
   const explicit = params.get('evaluation_dataset')
   return <><label>Results version<select aria-label="Results version" value={explicit || ''} onChange={event => update({ evaluation_dataset: event.target.value, session_date: null, offset: null })}>
-    <option value="">Current five-model results</option>
+    <option value="">Current detector results</option>
     {data?.datasets.map(value => <option key={value} value={value}>{value === data.current_dataset_id ? `Current: ${value}` : value}</option>)}
   </select></label><code>{explicit || data?.default_dataset_id || 'No configured results version'}</code></>
 }
@@ -501,7 +502,7 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, t
   const explicitDataset = params.get('evaluation_dataset') || ''
   const dataset = explicitDataset || (requestedSession ? index?.session_datasets[requestedSession] : undefined) || index?.default_dataset_id || ''
   const rawDetector = params.get('evaluation_detector')
-  const detector = rawDetector === 'O1' || rawDetector === 'O2' || rawDetector === 'O3' || rawDetector === 'S1' || rawDetector === 'S2' ? rawDetector : undefined
+  const detector = rawDetector === 'O1' || rawDetector === 'O2' || rawDetector === 'O3' || rawDetector === 'OS1' || rawDetector === 'OS2' ? rawDetector : undefined
   const underlyer = useDeferredValue((params.get('underlyer') || '').trim().toUpperCase())
   const requestSession = requestedSession || (view === 'day_history' ? index?.current_session_date : undefined)
   const request = { dataset_id: dataset, scope: view === 'behavior' ? 'LATEST' : 'HISTORY',
@@ -580,7 +581,7 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, t
       <label>Underlying<input aria-label="Detector alert underlying" type="search" placeholder="All underlyings" maxLength={12}
         value={params.get('underlyer') || ''} onChange={event => { setSelectedPreset(''); update({ underlyer: event.target.value.toUpperCase() }) }} /></label>
       <label>Model<select aria-label="Detector alert model" value={detector || ''} onChange={event => { setSelectedPreset(''); update({ evaluation_detector: event.target.value }) }}>
-        <option value="">All models</option>{(['O1', 'O2', 'O3', 'S1', 'S2'] as const).map(id => <option key={id} value={id}>{detectorNames[id]}</option>)}
+        <option value="">All models</option>{(['O1', 'O2', 'O3', 'OS1', 'OS2'] as const).map(id => <option key={id} value={id}>{detectorNames[id]}</option>)}
       </select></label>
       {data?.latest_attempt && view === 'behavior' ? <div className="oa-filter-status oa-filter-status--warning" role="status"><span>Latest attempted run</span><strong>{time(data.latest_attempt.scheduled_cycle)} ET / {label(data.status)}</strong></div>
         : showNextWindow ? <div className={`oa-filter-status${schedule?.warning ? ' oa-filter-status--warning' : ''}`} role="status"><span>Next alert window</span><strong>{time(schedule?.window_start)}-{time(schedule?.window_end)} ET</strong></div>
@@ -688,12 +689,15 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
   const requestedSession = params.get('session_date') || ''
   const requestedDataset = params.get('evaluation_dataset') || (requestedSession ? index?.session_datasets[requestedSession] : undefined) || index?.default_dataset_id
   const request = { session_date: requestedSession || undefined, dataset_id: requestedDataset || undefined,
-    detector: detector === 'O1' || detector === 'O2' || detector === 'O3' || detector === 'S1' || detector === 'S2' ? detector : undefined,
+    detector: detector === 'O1' || detector === 'O2' || detector === 'O3' || detector === 'OS1' || detector === 'OS2' ? detector : undefined,
     selection_status: status === 'SELECTED' || status === 'NOT_SELECTED' || status === 'REPEAT' || status === 'OBSERVATION' ? status : undefined,
     underlyer: underlyer || undefined, ...optionDetectorSort(params), limit: pageSize, offset } as const
   const review = useQuery({ queryKey: ['option-detector-evaluations', request], queryFn: () => getOptionDetectorEvaluations(request), retry: false,
     enabled: Boolean(index), refetchInterval: 30_000 })
   const data = review.data?.available ? review.data.data : undefined
+  const detectorChoices = data?.models?.length
+    ? data.models.map(model => model.detector_id)
+    : (Object.keys(detectorNames) as Array<keyof typeof detectorNames>)
   const surfaceObservation = observationDetail ? detectorSurfaceObservation(observationDetail) : null
   const creditObservation = observationDetail ? detectorCreditObservation(observationDetail) : null
   useEffect(() => { setObservationDetail(null) }, [params])
@@ -708,7 +712,7 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
       <label>Underlying<input aria-label="Evaluation underlying" type="search" placeholder="All underlyings" maxLength={12}
         value={params.get('underlyer') || ''} onChange={event => update({ underlyer: event.target.value.toUpperCase() })} /></label>
       <label>Model<select aria-label="Evaluation model" value={detector || ''} onChange={event => update({ evaluation_detector: event.target.value, offset: null })}>
-        <option value="">All five models</option>{Object.entries(detectorNames).map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+        <option value="">All cycle lanes</option>{detectorChoices.map(id => <option key={id} value={id}>{detectorNames[id]}</option>)}
       </select></label>
       <label>Selection<select aria-label="Evaluation selection" value={status || ''} onChange={event => update({ evaluation_status: event.target.value, offset: null })}>
         <option value="">All retained results</option><option value="SELECTED">Selected</option><option value="NOT_SELECTED">Not selected</option><option value="REPEAT">Repeats</option><option value="OBSERVATION">Observations</option>
@@ -725,11 +729,11 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
       <p className="oa-permission">Prospective outcomes are not connected. Success rates are unavailable.</p>
       <div className="sd-table-panel"><div className="sd-table-scroll" tabIndex={0} role="region" aria-label="Selection comparison summary"><table>
         <thead><tr><th>Model</th><th title="Qualified package occurrences, including repeats; O2 counts detected surface groups only.">Detected occurrences</th><th>Selected</th><th>Not selected</th><th>Repeats</th><th>Evaluations</th><th>Measured returns</th><th>Positive rate</th><th>Mean net return</th></tr></thead>
-        <tbody>{(data.models || []).map(cell => <tr key={cell.detector_id}>
-          <td>{detectorNames[cell.detector_id]}</td><td>{cell.detected}</td><td>{cell.detector_id === 'O2' ? 'Not applicable' : cell.selected}</td>
-          <td>{cell.detector_id === 'O2' ? 'Not applicable' : cell.not_selected}</td><td>{cell.detector_id === 'O2' ? 'Not applicable' : cell.repeats}</td><td>{cell.evaluated}</td>
-          <td>{cell.detector_id === 'O2' ? 'Not applicable' : cell.measured ?? 'Unavailable'}</td><td>{cell.detector_id === 'O2' ? 'Not applicable' : optionAlertPercent(cell.positive_rate)}</td><td>{cell.detector_id === 'O2' ? 'Not applicable' : optionAlertPercent(cell.mean_net_return)}</td>
-        </tr>)}</tbody>
+        <tbody>{(data.models || []).map(cell => { const unavailable = cell.accepted === false || cell.lane_state === 'UNAVAILABLE'; return <tr key={cell.detector_id}>
+          <td>{detectorNames[cell.detector_id]}<small>{cell.accepted === false ? 'Not accepted' : label(cell.lane_state || 'ACCEPTED')}</small>{cell.reason_codes?.length ? <small>{cell.reason_codes.map(label).join(' / ')}</small> : null}</td><td>{cell.detected}</td><td>{unavailable ? 'Unavailable' : cell.detector_id === 'O2' ? 'Not applicable' : cell.selected}</td>
+          <td>{unavailable ? 'Unavailable' : cell.detector_id === 'O2' ? 'Not applicable' : cell.not_selected}</td><td>{unavailable ? 'Unavailable' : cell.detector_id === 'O2' ? 'Not applicable' : cell.repeats}</td><td>{cell.evaluated}</td>
+          <td>{unavailable ? 'Unavailable' : cell.detector_id === 'O2' ? 'Not applicable' : cell.measured ?? 'Unavailable'}</td><td>{unavailable ? 'Unavailable' : cell.detector_id === 'O2' ? 'Not applicable' : optionAlertPercent(cell.positive_rate)}</td><td>{unavailable ? 'Unavailable' : cell.detector_id === 'O2' ? 'Not applicable' : optionAlertPercent(cell.mean_net_return)}</td>
+        </tr> })}</tbody>
       </table></div></div>
       <div className="sd-table-panel"><div className="sd-table-scroll" tabIndex={0} role="region" aria-label="All qualified detector packages"><table>
         <thead><tr><DetectorSortHeader title="Underlying" field="underlyer" params={params} update={update} />

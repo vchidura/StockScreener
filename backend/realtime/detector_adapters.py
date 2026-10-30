@@ -321,8 +321,13 @@ def run_canonical_stock_signal_adapter(
     decision_at: datetime,
     session_close: datetime,
 ) -> StableDetectorAdapterResult:
-    if detector_id not in {"S1", "S2"}:
-        raise ValueError("canonical stock adapter requires S1 or S2")
+    if detector_id not in {"S1", "S2", "OS1", "OS2"}:
+        raise ValueError("canonical stock adapter requires S1/S2 or OS1/OS2")
+    detector_ids = (
+        ("OS1", "OS2")
+        if detector_id in {"OS1", "OS2"}
+        else ("S1", "S2")
+    )
     signals = detect_canonical_stock_signals(
         security_id=security_id,
         underlyer=underlyer,
@@ -330,6 +335,7 @@ def run_canonical_stock_signal_adapter(
         market_cutoff=market_cutoff,
         decision_at=decision_at,
         session_close=session_close,
+        detector_ids=detector_ids,
     )
     return _result(
         "canonical-stock-bar-signal-v1",

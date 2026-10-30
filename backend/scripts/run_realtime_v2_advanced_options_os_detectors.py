@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the provider-free Advanced Equity S1/S2 detector shadow."""
+"""Run the provider-free Advanced Options OS1/OS2 stock-bar shadow."""
 from __future__ import annotations
 
 import argparse
@@ -27,10 +27,10 @@ from realtime.advanced_equity_detector_consumer import (  # noqa: E402
     persist_advanced_equity_detector_slice_cursor,
     plan_advanced_equity_detector_slice_cursor,
 )
-from realtime.advanced_equity_s1_s2_shadow import (  # noqa: E402
+from realtime.advanced_options_os1_os2_shadow import (  # noqa: E402
     DETECTORS,
-    build_s1_s2_consumer_config,
-    s1_s2_evaluator_cursor,
+    build_os1_os2_consumer_config,
+    os1_os2_evaluator_cursor,
 )
 from realtime.database_access_v2 import (  # noqa: E402
     APP_ROLE,
@@ -53,12 +53,12 @@ UTC = timezone.utc
 CODE_PATHS = (
     BACKEND_DIR / "realtime" / "advanced_equity_detector_consumer.py",
     BACKEND_DIR / "realtime" / "advanced_equity_detector_shadow.py",
-    BACKEND_DIR / "realtime" / "advanced_equity_s1_s2_shadow.py",
+    BACKEND_DIR / "realtime" / "advanced_options_os1_os2_shadow.py",
 )
 
 
 @dataclass(frozen=True, slots=True)
-class AdvancedEquityDetectorScope:
+class AdvancedOptionsDetectorScope:
     journal_generation: UUID
     shard_map_sha256: str
     instrument_id: int
@@ -123,12 +123,12 @@ def detector_code_sha256(paths=CODE_PATHS) -> str:
     return digest.hexdigest()
 
 
-def load_advanced_equity_detector_scopes_cursor(
+def load_advanced_options_detector_scopes_cursor(
     cursor,
     *,
     cohort_id: UUID,
     session_date: date,
-) -> tuple[AdvancedEquityDetectorScope, ...]:
+) -> tuple[AdvancedOptionsDetectorScope, ...]:
     cursor.execute(
         "SELECT registry.journal_generation::text,"
         "registry.shard_map_sha256,instrument.instrument_id "
@@ -192,7 +192,7 @@ def load_advanced_equity_detector_scopes_cursor(
         (str(cohort_id), session_date),
     )
     scopes = tuple(
-        AdvancedEquityDetectorScope(
+        AdvancedOptionsDetectorScope(
             journal_generation=UUID(str(row[0])),
             shard_map_sha256=str(row[1]),
             instrument_id=int(row[2]),
@@ -208,11 +208,11 @@ def detector_lease_resource_key(
     *,
     cohort_id: UUID,
     session_date: date,
-    scope: AdvancedEquityDetectorScope,
+    scope: AdvancedOptionsDetectorScope,
     detector_id: str,
 ) -> str:
     if detector_id not in DETECTORS:
-        raise ValueError("Advanced Equity detector must be S1 or S2")
+        raise ValueError("Advanced Options detector must be OS1 or OS2")
     return (
         f"advanced-equity-detector:{cohort_id}:{session_date}:"
         f"{scope.journal_generation}:{scope.instrument_id}:{detector_id}"
@@ -233,7 +233,7 @@ def run_detector_cycle(
 ) -> dict[str, object]:
     checked_at = clock().astimezone(UTC)
     with provider.transaction(APP_ROLE, read_only=True) as unit:
-        scopes = load_advanced_equity_detector_scopes_cursor(
+        scopes = load_advanced_options_detector_scopes_cursor(
             unit.cursor,
             cohort_id=cohort_id,
             session_date=session_date,
@@ -259,7 +259,7 @@ def run_detector_cycle(
                     checked_at=checked_at,
                     lease_seconds=lease_seconds,
                 )
-                config = build_s1_s2_consumer_config(
+                config = build_os1_os2_consumer_config(
                     detector_id=detector_id,
                     cohort_id=cohort_id,
                     journal_generation=scope.journal_generation,
@@ -271,7 +271,7 @@ def run_detector_cycle(
                     code_sha256=code_sha256,
                     readiness_epoch=1,
                 )
-                evaluator = s1_s2_evaluator_cursor(
+                evaluator = os1_os2_evaluator_cursor(
                     unit.cursor,
                     detector_id=detector_id,
                     session_close=session_close,
