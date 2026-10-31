@@ -7,7 +7,7 @@ import hashlib
 import json
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 
@@ -23,6 +23,7 @@ from realtime.advanced_options_v3_deployment import (  # noqa: E402
     provider_free_advanced_options_v3_preflight,
 )
 from realtime.contracts import canonical_sha256  # noqa: E402
+from options.calendar import OptionExchangeCalendar  # noqa: E402
 
 
 UTC = timezone.utc
@@ -46,14 +47,22 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--production-preflight", type=Path, required=True)
     parser.add_argument("--qualification-report", type=Path, required=True)
-    parser.add_argument("--docker-rehearsal-report", type=Path, required=True)
+    parser.add_argument(
+        "--docker-role-qualification",
+        "--docker-rehearsal-report",
+        dest="docker_role_qualification",
+        type=Path,
+        required=True,
+    )
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--image-id", required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     args = parser.parse_args(argv)
     args.production_preflight = args.production_preflight.resolve()
     args.qualification_report = args.qualification_report.resolve()
-    args.docker_rehearsal_report = args.docker_rehearsal_report.resolve()
+    args.docker_role_qualification = (
+        args.docker_role_qualification.resolve()
+    )
     args.output_directory = args.output_directory.resolve()
     if args.output_directory.exists():
         parser.error("--output-directory must be new")
@@ -152,6 +161,9 @@ def _compact_gap(preflight):
 
 
 def _repair_plan(preflight):
+    session_date = date.fromisoformat(str(preflight["scope"]["session_date"]))
+    calendar = OptionExchangeCalendar("XNYS")
+    prior_session = calendar.previous_session_date(session_date)
     history = preflight["stored_data"]["history_coverage"][0]
     requests = []
     by_session = {}
@@ -207,7 +219,7 @@ def _repair_plan(preflight):
             "owner": "backend/scripts/backfill_corporate_actions.py",
             "state": "BLOCKED_OWNER_BYTE_GATES_REQUIRED",
             "symbols": ["QQQ", "SPY"],
-            "window": ["2026-10-23", "2026-10-26"],
+            "window": [prior_session.isoformat(), session_date.isoformat()],
             "endpoints": [
                 "/stocks/v1/splits",
                 "/stocks/v1/dividends",
@@ -220,7 +232,7 @@ def _repair_plan(preflight):
             "owner": "backend/scripts/backfill_option_model_inputs.py",
             "state": "BLOCKED_OWNER_DATE_AND_BYTE_GATES_REQUIRED",
             "canonical_source": "us_treasury_par_yield_v1",
-            "required_rate_date_lte": "2026-10-23",
+            "required_rate_date_lte": prior_session.isoformat(),
             "maximum_age_seconds_at_reference_freeze": 3600,
             "request_ceiling": 1,
             "response_byte_limit": 2_000_000,
@@ -232,7 +244,7 @@ def _repair_plan(preflight):
             ),
             "endpoint": "/v3/snapshot/options/{underlyingAsset}",
             "underlyings": ["QQQ", "SPY"],
-            "expiration_date": "2026-10-23",
+            "expiration_date": session_date.isoformat(),
             "request_ceiling": 2,
             "maximum_results_per_underlying": 250,
             "pagination": 0,
@@ -261,11 +273,52 @@ def _repair_plan(preflight):
     }
 
 
+def _validate_docker_role_qualification(report, image_id):
+    services = report.get("services")
+    roles = {
+        row.get("role")
+        for row in services
+    } if isinstance(services, list) else set()
+    expected_roles = {
+        "OPTIONS_ACQUISITION",
+        "INGRESS",
+        "MARKET_STATE",
+        "FLOW",
+        "WINDOW",
+        "CANONICAL_STOCK_ALERTS",
+    }
+    cleanup = report.get("cleanup")
+    effects = report.get("effects")
+    if (
+        report.get("contract")
+        != "advanced-options-v3-production-role-docker-qualification-report-v1"
+        or report.get("verdict") != "PASS"
+        or report.get("scope", {}).get("image_id") != image_id
+        or report.get("scope", {}).get("execution_flag") != "--no-build"
+        or report.get("entrypoint", {}).get("rehearsal_process_used")
+        is not False
+        or roles != expected_roles
+        or any(row.get("health") != "healthy" for row in services)
+        or report.get("single_bundle_handoff", {}).get(
+            "resident_offsets_monotonic"
+        ) is not True
+        or not isinstance(cleanup, dict)
+        or any(cleanup.values())
+        or not isinstance(effects, dict)
+        or any(value != 0 for value in effects.values())
+    ):
+        raise ValueError("actual-role Docker qualification identity changed")
+    return report
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     preflight = _load(args.production_preflight)
     qualification = _load(args.qualification_report)
-    docker_rehearsal = _load(args.docker_rehearsal_report)
+    docker_qualification = _validate_docker_role_qualification(
+        _load(args.docker_role_qualification),
+        args.image_id,
+    )
     unsigned_qualification = dict(qualification)
     qualification_semantic_sha256 = unsigned_qualification.pop(
         "semantic_sha256",
@@ -277,9 +330,6 @@ def main(argv=None) -> int:
         or qualification.get("verdict") != "PASS"
         or qualification_semantic_sha256
         != canonical_sha256(unsigned_qualification)
-        or docker_rehearsal.get("verdict") != "PASS"
-        or docker_rehearsal.get("scope", {}).get("image_id")
-        != args.image_id
     ):
         raise ValueError("V3 preparation evidence identity changed")
     args.output_directory.mkdir()
@@ -344,41 +394,40 @@ def main(argv=None) -> int:
         args.output_directory / "SERVICE-OBSERVATION.json",
         service_observation,
     )
-    rehearsal = {
-        "contract": "advanced-options-v3-docker-rehearsal-status-v1",
+    role_qualification = {
+        "contract": "advanced-options-v3-docker-role-qualification-status-v1",
         "verdict": "PASS",
         "image_id": args.image_id,
         "profile": "realtime-v3-options",
         "execution_flag": "--no-build",
-        "source_report_semantic_sha256": docker_rehearsal[
+        "source_report_semantic_sha256": docker_qualification[
             "semantic_sha256"
         ],
         "source_report_file_sha256": _file_sha256(
-            args.docker_rehearsal_report
+            args.docker_role_qualification
         ),
         "verified": {
-            "four_role_health": all(
+            "six_role_health": all(
                 row["health"] == "healthy"
-                for row in docker_rehearsal["services"]
+                for row in docker_qualification["services"]
             ),
             "durable_database_barrier": True,
-            "v5_window_completion": (
-                docker_rehearsal["durable_database_barrier"]["window"][
-                    "state"
-                ] == "COMPLETE"
-            ),
+            "resident_offsets_monotonic": docker_qualification[
+                "single_bundle_handoff"
+            ]["resident_offsets_monotonic"],
+            "rehearsal_process_used": False,
         },
-        "cleanup": docker_rehearsal["cleanup"],
+        "cleanup": docker_qualification["cleanup"],
         "effects": dict(ZERO_EFFECTS),
     }
-    artifacts["rehearsal"] = _write(
-        args.output_directory / "REHEARSAL.json",
-        rehearsal,
+    artifacts["docker_role_qualification"] = _write(
+        args.output_directory / "DOCKER-ROLE-QUALIFICATION.json",
+        role_qualification,
     )
     operations_status = {
         "contract": "advanced-options-v3-operations-status-v1",
         "verdict": "BLOCKED",
-        "session_date": "2026-10-23",
+        "session_date": preflight["scope"]["session_date"],
         "qualification": {
             "semantic_sha256": qualification["semantic_sha256"],
             "file_sha256": _file_sha256(args.qualification_report),

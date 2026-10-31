@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, timezone
 from uuid import UUID
 
 from options.calendar import OptionExchangeCalendar
@@ -19,7 +19,10 @@ from .contracts import canonical_sha256
 
 UTC = timezone.utc
 ADVANCED_OPTIONS_V3_HISTORY_EVIDENCE_SCHEMA = (
-    "advanced-options-v3-history-binding-evidence-v1"
+    "advanced-options-v3-history-binding-evidence-v2"
+)
+ADVANCED_OPTIONS_V3_HISTORY_SOURCE_CONFIGURATION_SCHEMA = (
+    "advanced-options-v3-history-source-configuration-v1"
 )
 ADVANCED_OPTIONS_V3_HISTORY_SOURCE_COHORT_ID = UUID(
     "d1baee6f-4ab2-543c-8a86-ce10f8952e69"
@@ -48,6 +51,33 @@ class AdvancedOptionsHistoryCoverageError(ValueError):
 class VerifiedAdvancedOptionsHistoryBinding:
     binding: AdvancedOptionsHistoryBinding
     evidence: dict[str, object]
+
+
+def advanced_options_v3_history_source_configuration():
+    value = {
+        "schema": (
+            ADVANCED_OPTIONS_V3_HISTORY_SOURCE_CONFIGURATION_SCHEMA
+        ),
+        "source_cohort_id": str(
+            ADVANCED_OPTIONS_V3_HISTORY_SOURCE_COHORT_ID
+        ),
+        "source_manifest_sha256": (
+            ADVANCED_OPTIONS_V3_HISTORY_SOURCE_MANIFEST_SHA256
+        ),
+        "source_provider_tier": "MASSIVE_DEVELOPER",
+        "underlyings": list(ADVANCED_OPTIONS_V3_HISTORY_UNDERLYINGS),
+        "security_ids": dict(ADVANCED_OPTIONS_V3_HISTORY_SECURITY_IDS),
+        "adjusted_session_count": (
+            ADVANCED_OPTIONS_V3_HISTORY_SESSION_COUNT
+        ),
+        "raw_session_count": (
+            ADVANCED_OPTIONS_V3_RAW_HISTORY_SESSION_COUNT
+        ),
+        "refresh_policy": "REQUIRED_THROUGH_PREVIOUS_XNYS_SESSION",
+        "copy_into_target": False,
+    }
+    value["configuration_sha256"] = canonical_sha256(value)
+    return value
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -284,16 +314,21 @@ def load_verified_advanced_options_v3_history_binding_cursor(
         source["manifest_id"],
     )
     symbols = _coverage(cursor, sessions, checked)
-    history_before = datetime.combine(
-        session_date,
-        time(13, 30),
-        tzinfo=UTC,
+    required_through = calendar.previous_session_date(session_date)
+    if not sessions or sessions[-1] != required_through:
+        raise AdvancedOptionsHistoryCoverageError(
+            "V3 H baseline does not reach the required prior session"
+        )
+    history_before = calendar.session_open(session_date)
+    source_configuration = (
+        advanced_options_v3_history_source_configuration()
     )
     evidence = {
         "schema": ADVANCED_OPTIONS_V3_HISTORY_EVIDENCE_SCHEMA,
         "target_cohort_id": str(target_cohort_id),
         "source_cohort_id": source["cohort_id"],
         "source_provider_tier": source["provider_tier"],
+        "source_configuration": source_configuration,
         "session_date": session_date.isoformat(),
         "history_before_utc": history_before.isoformat(),
         "known_at_utc": checked.isoformat(),
@@ -334,6 +369,13 @@ def load_verified_advanced_options_v3_history_binding_cursor(
                 ADVANCED_OPTIONS_V3_HISTORY_UNDERLYINGS
             ),
             "symbols": symbols,
+        },
+        "readiness": {
+            "status": "READY",
+            "required_through_session": required_through.isoformat(),
+            "latest_covered_session": sessions[-1].isoformat(),
+            "known_at_utc": checked.isoformat(),
+            "refresh_policy": source_configuration["refresh_policy"],
         },
         "mixed_history_reconstruction": False,
         "rows_copied_to_target": 0,

@@ -14,6 +14,10 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Bundle,
     [Parameter(Mandatory = $true)]
+    [string]$AcquisitionBinding,
+    [Parameter(Mandatory = $true)]
+    [string]$SecretDirectory,
+    [Parameter(Mandatory = $true)]
     [string]$OutputDirectory,
     [string]$DockerExecutable = 'docker.exe',
     [string]$EnvFile = '',
@@ -45,6 +49,8 @@ $authorizationPath = Resolve-RootPath $Authorization
 $freezePath = Resolve-RootPath $FreezeReport
 $packagePath = Resolve-RootPath $Package
 $bundlePath = Resolve-RootPath $Bundle
+$acquisitionBindingPath = Resolve-RootPath $AcquisitionBinding
+$secretDirectoryPath = Resolve-RootPath $SecretDirectory
 $outputPath = Resolve-RootPath $OutputDirectory
 $envPath = if ($EnvFile) {
     Resolve-RootPath $EnvFile
@@ -70,11 +76,16 @@ $argumentValues = @(
     $packagePath,
     '--bundle',
     $bundlePath,
+    '--acquisition-binding',
+    $acquisitionBindingPath,
     '--docker-executable',
     $DockerExecutable,
+    '--secret-directory',
+    $secretDirectoryPath,
     '--output-directory',
     $outputPath,
     '--continuous',
+    '--resume',
     '--execute'
 )
 $arguments = ($argumentValues | ForEach-Object { Quote-Argument $_ }) -join ' '
@@ -85,19 +96,25 @@ $requiredFiles = @(
     $freezePath,
     $envPath,
     $packagePath,
-    $bundlePath
+    $bundlePath,
+    $acquisitionBindingPath
 )
 $missingFiles = @(
     $requiredFiles | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }
 )
+$requiredDirectories = @($secretDirectoryPath)
+$missingDirectories = @(
+    $requiredDirectories | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Container) }
+)
 $readyToInstall = (
     ($missingFiles.Count -eq 0) -and
+    ($missingDirectories.Count -eq 0) -and
     (-not (Test-Path -LiteralPath $outputPath)) -and
     ($ScheduledAt -gt [DateTimeOffset]::Now)
 )
 
 $plan = [ordered]@{
-    Contract = 'advanced-realtime-v3-windows-session-task-v1'
+    Contract = 'advanced-realtime-v3-windows-session-task-v2'
     Mode = $Mode.ToUpperInvariant()
     TaskName = $TaskName
     ScheduledAt = $ScheduledAt.ToUniversalTime().ToString('o')
@@ -111,6 +128,8 @@ $plan = [ordered]@{
     OutputDirectory = $outputPath
     RequiredFiles = $requiredFiles
     MissingFiles = $missingFiles
+    RequiredDirectories = $requiredDirectories
+    MissingDirectories = $missingDirectories
     ReadyToInstall = $readyToInstall
     ProviderRequests = 0
     ProductionServiceActions = 0

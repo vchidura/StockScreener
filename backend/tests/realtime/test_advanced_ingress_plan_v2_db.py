@@ -2080,6 +2080,35 @@ def test_promotion_requires_active_profile_next_session_and_one_ladder_rung(
             )
 
 
+def test_promotion_rejects_same_session_child(hardened_database):
+    pool, _provider, roles, _cohort_id, _manifest_id = hardened_database
+    parent = _create_authorization(pool, roles, "same-session-parent")
+    promoted = build_advanced_stream_authorization(
+        parent_authorization_id=parent.authorization_id,
+        allowed_universe_targets=(9,),
+        valid_from=SESSION_DATE,
+        valid_through=SESSION_DATE,
+        maximum_budgets=parent.maximum_budgets,
+        runtime_policy_sha256=POLICY_SHA,
+        approval_source="db-test",
+        approval_reference="same-session-child",
+    )
+
+    with _admin_cursor(pool, roles) as cursor:
+        with pytest.raises(
+            ValueError,
+            match="promotion must become effective next market session",
+        ):
+            create_advanced_stream_authorization_cursor(
+                cursor,
+                promoted,
+                promotion_ladder=(
+                    RUNTIME_CATALOG.scale_policy.universe_ladder
+                ),
+                calendar=_PromotionCalendar(),
+            )
+
+
 def test_exact_resolution_requires_one_candidate_or_admin_binding_and_pins_profile(
     hardened_database,
 ):

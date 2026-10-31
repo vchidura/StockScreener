@@ -18,7 +18,7 @@ from .session_windows import advanced_session_windows
 
 UTC = timezone.utc
 ADVANCED_SESSION_SCHEDULER_VERSION = (
-    "advanced-realtime-session-scheduler-v1"
+    "advanced-realtime-session-scheduler-v2"
 )
 ADVANCED_SESSION_PROVIDER_CONTRACT_VERSION = (
     "advanced-options-exact-snapshot-budget-v1"
@@ -264,7 +264,7 @@ class AdvancedRealtimeSessionAuthorization:
                 seconds=ADVANCED_SESSION_MAXIMUM_E_O_SECONDS
             )
             or self.windows != expected_windows
-            or len(self.windows) != 78
+            or not self.windows
             or self.provider_contract.budget.session_date
             != self.session_date
             or self.provider_contract.budget.account_alias
@@ -359,6 +359,12 @@ def advanced_realtime_session_authorization_payload(
         "acquisition_start": authority.acquisition_start.isoformat(),
         "market_capture_stop": authority.market_capture_stop.isoformat(),
         "decision_stop": authority.decision_stop.isoformat(),
+        "run_scope": {
+            "kind": "FULL_EXCHANGE_SESSION",
+            "window_count": len(authority.windows),
+            "first_window_index": authority.windows[0].index,
+            "last_window_index": authority.windows[-1].index,
+        },
         "equity": {
             "target": len(ADVANCED_SESSION_EQUITY_SYMBOLS),
             "symbols": list(ADVANCED_SESSION_EQUITY_SYMBOLS),

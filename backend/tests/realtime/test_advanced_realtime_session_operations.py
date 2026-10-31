@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+import re
+import shutil
+import subprocess
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -552,4 +555,100 @@ def test_windows_session_task_is_catch_up_disabled_and_single_owner():
     assert "no second coordinator was registered" in script
     assert "'--continuous'" in script
     assert "'--execute'" in script
+    assert "[string]$AcquisitionBinding" in script
+    assert "[string]$SecretDirectory" in script
+    assert "'--acquisition-binding'" in script
+    assert "$acquisitionBindingPath" in script
+    assert "'--secret-directory'" in script
+    assert "$secretDirectoryPath" in script
+    assert "-PathType Container" in script
     assert "requires every frozen artifact" in script
+
+
+def test_windows_session_task_plan_satisfies_scheduler_parser_contract(
+    tmp_path,
+    monkeypatch,
+):
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell is unavailable")
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "register_advanced_realtime_v3_session_task.ps1"
+    )
+    artifacts = {
+        name: tmp_path / name
+        for name in (
+            "python.exe",
+            "authorization.json",
+            "freeze.json",
+            "package.json",
+            "bundle.json",
+            "acquisition-binding.json",
+            "runtime.env",
+            "docker.exe",
+        )
+    }
+    for path in artifacts.values():
+        path.write_text("{}\n", encoding="utf-8")
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    output = tmp_path / "new-output"
+    scheduled_at = datetime.now(timezone.utc) + timedelta(days=2)
+    completed = subprocess.run(
+        (
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+            "-Mode",
+            "Plan",
+            "-TaskName",
+            "provider-free-parser-contract",
+            "-ScheduledAt",
+            scheduled_at.isoformat(),
+            "-Authorization",
+            str(artifacts["authorization.json"]),
+            "-FreezeReport",
+            str(artifacts["freeze.json"]),
+            "-Package",
+            str(artifacts["package.json"]),
+            "-Bundle",
+            str(artifacts["bundle.json"]),
+            "-AcquisitionBinding",
+            str(artifacts["acquisition-binding.json"]),
+            "-SecretDirectory",
+            str(secrets),
+            "-OutputDirectory",
+            str(output),
+            "-EnvFile",
+            str(artifacts["runtime.env"]),
+            "-Python",
+            str(artifacts["python.exe"]),
+            "-DockerExecutable",
+            str(artifacts["docker.exe"]),
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    plan = json.loads(completed.stdout)
+    assert plan["ReadyToInstall"] is True
+    assert plan["MissingFiles"] == []
+    assert plan["MissingDirectories"] == []
+    tokens = [
+        value.replace('\\"', '"')
+        for value in re.findall(r'"((?:\\"|[^"])*)"', plan["Arguments"])
+    ]
+    assert tokens[:3] == ["-B", str(script.with_name(
+        "run_advanced_realtime_session_scheduler.py"
+    )), "run"]
+    monkeypatch.setattr(cli, "_load_authority", lambda _path: object())
+    parsed = cli.parse_args(tokens[2:])
+    assert parsed.acquisition_binding == artifacts[
+        "acquisition-binding.json"
+    ].resolve()
+    assert parsed.secret_directory == secrets.resolve()

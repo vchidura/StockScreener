@@ -25,6 +25,7 @@ from realtime.advanced_options_control_plane import (  # noqa: E402
 from realtime.advanced_options_v3_history import (  # noqa: E402
     AdvancedOptionsHistoryBindingIdentityError,
     AdvancedOptionsHistoryCoverageError,
+    advanced_options_v3_history_source_configuration,
     load_verified_advanced_options_v3_history_binding_cursor,
 )
 from realtime.contracts import canonical_sha256  # noqa: E402
@@ -111,6 +112,9 @@ def main(argv=None) -> int:
         "mode": "READ_ONLY",
         "status": "BLOCKED",
         "failure_class": None,
+        "source_configuration": (
+            advanced_options_v3_history_source_configuration()
+        ),
         "binding": None,
         "evidence": None,
         "effects": {

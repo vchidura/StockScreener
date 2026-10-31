@@ -9,10 +9,18 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from threading import Event
+from threading import Event, RLock, Thread
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from .advanced_gateway import AdvancedGateway, GatewayConfiguration
+from websockets.exceptions import ConnectionClosed
+
+from .advanced_gateway import (
+    AdvancedGateway,
+    GatewayConfiguration,
+    GatewayControlError,
+    GatewayFeedState,
+    GatewayOverload,
+)
 from .advanced_options_ingress import AdvancedOptionsJournalPump
 from .advanced_options_v3_authority import (
     SessionAcquisitionAuthorization,
@@ -50,6 +58,8 @@ ACQUISITION_STATUS_SCHEMA = (
 )
 ACQUISITION_OWNER_NAME = "advanced-options-v3-session-acquisition-v1"
 CONTROL_MESSAGES_PER_ATTEMPT = 8
+STATUS_MESSAGE_RESERVATION_QUANTUM = 1024
+STATUS_BYTE_RESERVATION_MESSAGES = 2
 ZERO_FORBIDDEN_EFFECTS = {
     "detector": 0,
     "projection": 0,
@@ -405,6 +415,114 @@ def _load_status(
     return value
 
 
+def _resume_budget_usage(status: Mapping[str, object]):
+    decoded_messages = int(status["decoded_messages"])
+    decoded_bytes = int(status["decoded_bytes"])
+    reserved_messages = int(
+        status.get("reserved_decoded_messages") or decoded_messages
+    )
+    reserved_bytes = int(
+        status.get("reserved_decoded_bytes") or decoded_bytes
+    )
+    return (
+        max(decoded_messages, reserved_messages),
+        max(decoded_bytes, reserved_bytes),
+        max(0, reserved_messages - decoded_messages),
+        max(0, reserved_bytes - decoded_bytes),
+    )
+
+
+class _AcquisitionStatusPublisher:
+    """Serialize status updates and persist a process heartbeat at a fixed pace."""
+
+    def __init__(
+        self,
+        path: Path,
+        binding: AdvancedOptionsAcquisitionBinding,
+        value: Mapping[str, object],
+        *,
+        clock: Callable[[], datetime],
+        interval_seconds: float = 1.0,
+    ) -> None:
+        self.path = path
+        self.binding = binding
+        self.clock = clock
+        self.interval_seconds = interval_seconds
+        self._value = dict(value)
+        self._lock = RLock()
+        self._stop = Event()
+        self._failure: BaseException | None = None
+        self._thread = Thread(
+            target=self._run,
+            name="advanced-options-acquisition-status",
+            daemon=True,
+        )
+
+    def update(self, *, persist: bool = False, **values: object) -> None:
+        with self._lock:
+            self._value.update(values)
+        if persist:
+            self.persist()
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return dict(self._value)
+
+    def persist(self) -> None:
+        self.raise_if_failed()
+        with self._lock:
+            heartbeat = _utc(self.clock(), "clock").isoformat()
+            self._value["runtime_heartbeat_at_utc"] = heartbeat
+            # Retained for readers of the v1 status schema. Health uses the
+            # explicit runtime heartbeat, never market activity.
+            self._value["observed_at_utc"] = heartbeat
+            try:
+                _write_json(self.path, self._value)
+            except BaseException as error:
+                self._failure = error
+                self._stop.set()
+                raise
+
+    def start(self) -> None:
+        self.persist()
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.ident is not None:
+            self._thread.join(timeout=max(2.0, self.interval_seconds * 2))
+        if self._failure is not None:
+            raise RuntimeError(
+                "Options acquisition status persistence failed"
+            ) from self._failure
+        self.persist()
+
+    def failed(self) -> bool:
+        return self._failure is not None
+
+    def raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise RuntimeError(
+                "Options acquisition status persistence failed"
+            ) from self._failure
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                self.persist()
+            except BaseException as error:
+                self._failure = error
+                self._stop.set()
+                return
+
+
+def _transient_transport_failure(error: BaseException) -> bool:
+    return isinstance(
+        error,
+        (ConnectionClosed, ConnectionError, OSError, TimeoutError),
+    )
+
+
 def _catalog_scope(provider, binding):
     with provider.transaction(
         APP_ROLE,
@@ -486,18 +604,37 @@ def acquisition_health(
     maximum_age_seconds: int = 30,
 ) -> dict[str, object]:
     status = _load_status(path, binding)
-    observed = datetime.fromisoformat(str(status["observed_at_utc"]))
+    heartbeat = datetime.fromisoformat(str(
+        status.get("runtime_heartbeat_at_utc")
+        or status["observed_at_utc"]
+    ))
     checked = _utc(checked_at, "checked_at")
     if (
         status.get("state")
         not in {"READY", "CAPTURING", "DRAINING", "COMPLETE"}
-        or observed > checked
-        or (checked - observed).total_seconds() > maximum_age_seconds
+        or heartbeat > checked
+        or (checked - heartbeat).total_seconds() > maximum_age_seconds
     ):
         raise RuntimeError("Options acquisition health is stale")
+    if status.get("state") == "CAPTURING" and (
+        status.get("socket_state")
+        not in {GatewayFeedState.WARMING.value, GatewayFeedState.LIVE.value}
+        or status.get("subscription_ready") is not True
+    ):
+        raise RuntimeError("Options acquisition socket is not ready")
     return {
         "status": "READY",
         "state": status["state"],
+        "runtime_heartbeat_at_utc": heartbeat.isoformat(),
+        "socket_state": status.get("socket_state"),
+        "subscription_ready": status.get("subscription_ready", False),
+        "last_market_event_at_utc": status.get(
+            "last_market_event_at_utc"
+        ),
+        "last_consumer_progress_at_utc": status.get(
+            "last_consumer_progress_at_utc"
+        ),
+        "transport_gaps": list(status.get("transport_gaps") or ()),
         "binding_sha256": binding.binding_sha256,
         "owner_id": str(binding.owner_id),
         "journal_generation": str(
@@ -538,8 +675,12 @@ def run_acquisition(
     admissions, manifest = _catalog_scope(provider, binding)
     status = _load_status(status_path, binding)
     attempts = int(status["connection_attempts"])
-    decoded_messages = int(status["decoded_messages"])
-    decoded_bytes = int(status["decoded_bytes"])
+    (
+        decoded_messages,
+        decoded_bytes,
+        recovered_reserved_messages,
+        recovered_reserved_bytes,
+    ) = _resume_budget_usage(status)
     journal_path = (
         journal_root.resolve()
         / "options-acquisition"
@@ -570,9 +711,19 @@ def run_acquisition(
         monotonic_ns=monotonic_ns,
     )
     latest = [None]
+    publisher_holder = [None]
 
     def progress(value):
         latest[0] = value
+        publisher = publisher_holder[0]
+        if publisher is not None:
+            publisher.update(
+                last_raw_offset=value.last_raw_offset,
+                last_event_offset=value.last_event_offset,
+                last_consumer_progress_at_utc=(
+                    _utc(clock(), "clock").isoformat()
+                ),
+            )
 
     pump = AdvancedOptionsJournalPump(
         buffer,
@@ -596,8 +747,49 @@ def run_acquisition(
     )
     pump.start()
     lease.acquire(now=now)
-    state = "CAPTURING"
     active_stream_session_id = binding.stream_session_id
+    gaps = list(status.get("transport_gaps") or ())
+    publisher = _AcquisitionStatusPublisher(
+        status_path,
+        binding,
+        {
+            "schema": ACQUISITION_STATUS_SCHEMA,
+            "state": "CONNECTING",
+            "binding_sha256": binding.binding_sha256,
+            "owner_id": str(binding.owner_id),
+            "journal_generation": str(
+                binding.authority.journal_generation
+            ),
+            "stream_session_id": str(active_stream_session_id),
+            "connection_attempts": attempts,
+            "decoded_messages": decoded_messages,
+            "decoded_bytes": decoded_bytes,
+            "reserved_decoded_messages": decoded_messages,
+            "reserved_decoded_bytes": decoded_bytes,
+            "recovered_reserved_messages": recovered_reserved_messages,
+            "recovered_reserved_bytes": recovered_reserved_bytes,
+            "buffer_capacity_events": binding.buffer_event_limit,
+            "buffer_capacity_bytes": binding.buffer_byte_limit,
+            "last_raw_offset": int(status.get("last_raw_offset") or 0),
+            "last_event_offset": int(
+                status.get("last_event_offset") or 0
+            ),
+            "last_market_event_at_utc": status.get(
+                "last_market_event_at_utc"
+            ),
+            "last_consumer_progress_at_utc": status.get(
+                "last_consumer_progress_at_utc"
+            ),
+            "socket_state": GatewayFeedState.DISCONNECTED.value,
+            "subscription_ready": False,
+            "transport_gaps": gaps,
+            "diagnostic": diagnostic,
+            "forbidden_effects": dict(ZERO_FORBIDDEN_EFFECTS),
+        },
+        clock=clock,
+    )
+    publisher_holder[0] = publisher
+    publisher.start()
     try:
         while (
             not stop_event.is_set()
@@ -630,43 +822,110 @@ def run_acquisition(
                 binding.stream_session_id,
                 f"connection-attempt:{attempts}",
             )
-            _write_json(status_path, {
-                "schema": ACQUISITION_STATUS_SCHEMA,
-                "state": "CONNECTING",
-                "binding_sha256": binding.binding_sha256,
-                "owner_id": str(binding.owner_id),
-                "journal_generation": str(
-                    binding.authority.journal_generation
+            publisher.update(
+                persist=True,
+                state="CONNECTING",
+                stream_session_id=str(active_stream_session_id),
+                connection_attempts=attempts,
+                decoded_messages=decoded_messages,
+                decoded_bytes=decoded_bytes,
+                socket_state=GatewayFeedState.CONNECTING.value,
+                subscription_ready=False,
+            )
+
+            attempt_messages = decoded_messages
+            attempt_bytes = decoded_bytes
+            reserved_messages = min(
+                binding.decoded_message_ceiling,
+                attempt_messages
+                + CONTROL_MESSAGES_PER_ATTEMPT
+                + STATUS_MESSAGE_RESERVATION_QUANTUM,
+            )
+            reserved_bytes = min(
+                binding.decoded_byte_ceiling,
+                attempt_bytes
+                + (
+                    binding.maximum_message_bytes
+                    * STATUS_BYTE_RESERVATION_MESSAGES
                 ),
-                "stream_session_id": str(active_stream_session_id),
-                "connection_attempts": attempts,
-                "decoded_messages": decoded_messages,
-                "decoded_bytes": decoded_bytes,
-                "last_raw_offset": (
-                    0 if latest[0] is None else latest[0].last_raw_offset
-                ),
-                "last_event_offset": (
-                    0 if latest[0] is None else latest[0].last_event_offset
-                ),
-                "observed_at_utc": _utc(clock(), "clock").isoformat(),
-                "diagnostic": diagnostic,
-                "forbidden_effects": dict(ZERO_FORBIDDEN_EFFECTS),
-            })
+            )
+            publisher.update(
+                persist=True,
+                reserved_decoded_messages=reserved_messages,
+                reserved_decoded_bytes=reserved_bytes,
+            )
 
             def usage(session_messages, session_bytes):
-                _write_json(status_path, {
-                    **_load_status(status_path, binding),
-                    "state": "CAPTURING",
-                    "decoded_messages": (
-                        decoded_messages
-                        + CONTROL_MESSAGES_PER_ATTEMPT
-                        + session_messages
-                    ),
-                    "decoded_bytes": decoded_bytes + session_bytes,
-                    "observed_at_utc": (
+                nonlocal reserved_messages, reserved_bytes
+                current_messages = (
+                    attempt_messages
+                    + CONTROL_MESSAGES_PER_ATTEMPT
+                    + session_messages
+                )
+                current_bytes = attempt_bytes + session_bytes
+                extend = False
+                if (
+                    current_messages
+                    + STATUS_MESSAGE_RESERVATION_QUANTUM
+                    > reserved_messages
+                    and reserved_messages
+                    < binding.decoded_message_ceiling
+                ):
+                    reserved_messages = min(
+                        binding.decoded_message_ceiling,
+                        current_messages
+                        + STATUS_MESSAGE_RESERVATION_QUANTUM,
+                    )
+                    extend = True
+                if (
+                    current_bytes + binding.maximum_message_bytes
+                    > reserved_bytes
+                    and reserved_bytes < binding.decoded_byte_ceiling
+                ):
+                    reserved_bytes = min(
+                        binding.decoded_byte_ceiling,
+                        current_bytes
+                        + (
+                            binding.maximum_message_bytes
+                            * STATUS_BYTE_RESERVATION_MESSAGES
+                        ),
+                    )
+                    extend = True
+                publisher.update(
+                    persist=extend,
+                    decoded_messages=current_messages,
+                    decoded_bytes=current_bytes,
+                    reserved_decoded_messages=reserved_messages,
+                    reserved_decoded_bytes=reserved_bytes,
+                )
+
+            def market_activity(_session_messages, _session_bytes):
+                publisher.update(
+                    last_market_event_at_utc=(
                         _utc(clock(), "clock").isoformat()
-                    ),
-                })
+                    )
+                )
+
+            def gateway_state(value):
+                ready = value in {
+                    GatewayFeedState.WARMING,
+                    GatewayFeedState.LIVE,
+                }
+                if ready and gaps and gaps[-1].get("status") == "OPEN":
+                    gaps[-1] = {
+                        **gaps[-1],
+                        "status": "RECONNECTED",
+                        "reconnected_at_utc": (
+                            _utc(clock(), "clock").isoformat()
+                        ),
+                    }
+                publisher.update(
+                    persist=True,
+                    state="CAPTURING" if ready else "CONNECTING",
+                    socket_state=value.value,
+                    subscription_ready=ready,
+                    transport_gaps=list(gaps),
+                )
 
             gateway = AdvancedGateway(
                 configuration,
@@ -677,60 +936,139 @@ def run_acquisition(
                 utc_clock=clock,
                 monotonic_ns=monotonic_ns,
                 session_id_factory=lambda: active_stream_session_id,
+                state_observer=gateway_state,
                 usage_observer=usage,
+                market_observer=market_activity,
             )
-            result = asyncio.run(gateway.run_session(
-                maximum_market_messages=(
-                    len(binding.contract_tickers)
-                    if diagnostic
-                    else remaining_messages
-                ),
-                maximum_received_bytes=remaining_bytes,
-            ))
+            try:
+                result = asyncio.run(gateway.run_session(
+                    maximum_market_messages=(
+                        len(binding.contract_tickers)
+                        if diagnostic
+                        else remaining_messages
+                    ),
+                    maximum_received_bytes=remaining_bytes,
+                    stop_requested=lambda: (
+                        stop_event.is_set() or publisher.failed()
+                    ),
+                    stop_at=binding.authority.acquisition_stop,
+                ))
+            except (GatewayControlError, GatewayOverload) as error:
+                publisher.update(
+                    persist=True,
+                    state="FAILED_PERMANENT",
+                    subscription_ready=False,
+                    failure_class="PERMANENT_PROVIDER_OR_SAFETY",
+                    failure_code=getattr(
+                        error,
+                        "reason_code",
+                        type(error).__name__,
+                    ),
+                )
+                raise
+            except Exception as error:
+                # Local status publication is part of acquisition safety. An
+                # I/O failure raised by a synchronous observer must not be
+                # mistaken for a reconnectable provider transport failure.
+                publisher.raise_if_failed()
+                if not _transient_transport_failure(error):
+                    publisher.update(
+                        persist=True,
+                        state="FAILED_INTERNAL",
+                        subscription_ready=False,
+                        failure_class="INTERNAL",
+                        failure_code=type(error).__name__,
+                    )
+                    raise
+                decoded_messages = (
+                    attempt_messages
+                    + CONTROL_MESSAGES_PER_ATTEMPT
+                    + gateway.received_messages
+                )
+                decoded_bytes = attempt_bytes + gateway.received_bytes
+                gaps.append({
+                    "attempt": attempts,
+                    "status": "OPEN",
+                    "disconnected_at_utc": (
+                        _utc(clock(), "clock").isoformat()
+                    ),
+                    "error_type": type(error).__name__,
+                })
+                publisher.update(
+                    persist=True,
+                    state="RECONNECTING",
+                    socket_state=GatewayFeedState.DISCONNECTED.value,
+                    subscription_ready=False,
+                    decoded_messages=decoded_messages,
+                    decoded_bytes=decoded_bytes,
+                    reserved_decoded_messages=decoded_messages,
+                    reserved_decoded_bytes=decoded_bytes,
+                    transport_gaps=list(gaps),
+                )
+                stop_event.wait(
+                    min(30.0, 0.5 * (2 ** (attempts - 1)))
+                )
+                continue
+            publisher.raise_if_failed()
             decoded_messages += (
                 result.received_messages
                 + CONTROL_MESSAGES_PER_ATTEMPT
             )
             decoded_bytes += result.received_bytes
-            _write_json(status_path, {
-                "schema": ACQUISITION_STATUS_SCHEMA,
-                "state": state,
-                "binding_sha256": binding.binding_sha256,
-                "owner_id": str(binding.owner_id),
-                "journal_generation": str(
-                    binding.authority.journal_generation
-                ),
-                "stream_session_id": str(active_stream_session_id),
-                "connection_attempts": attempts,
-                "decoded_messages": decoded_messages,
-                "decoded_bytes": decoded_bytes,
-                "last_raw_offset": (
-                    0 if latest[0] is None else latest[0].last_raw_offset
-                ),
-                "last_event_offset": (
-                    0 if latest[0] is None else latest[0].last_event_offset
-                ),
-                "observed_at_utc": _utc(clock(), "clock").isoformat(),
-                "diagnostic": diagnostic,
-                "forbidden_effects": dict(ZERO_FORBIDDEN_EFFECTS),
-            })
+            publisher.update(
+                persist=True,
+                state="CAPTURING",
+                decoded_messages=decoded_messages,
+                decoded_bytes=decoded_bytes,
+                reserved_decoded_messages=decoded_messages,
+                reserved_decoded_bytes=decoded_bytes,
+            )
+            if result.stop_reason is not None:
+                break
             if diagnostic:
                 while not stop_event.wait(0.1):
-                    _write_json(status_path, {
-                        **_load_status(status_path, binding),
-                        "state": "READY",
-                        "observed_at_utc": (
-                            _utc(clock(), "clock").isoformat()
-                        ),
-                    })
+                    publisher.update(state="READY")
                 break
             stop_event.wait(min(30.0, 0.5 * (2 ** (attempts - 1))))
-        state = "DRAINING"
     finally:
+        status_failure = None
+        try:
+            if not str(publisher.snapshot().get("state", "")).startswith(
+                "FAILED_"
+            ):
+                publisher.update(
+                    persist=True,
+                    state="DRAINING",
+                    subscription_ready=False,
+                )
+        except BaseException as error:
+            status_failure = error
         pump.request_stop()
         final = pump.join(30)
-        lease.release(now=_utc(clock(), "clock"))
+        try:
+            publisher.update(
+                persist=True,
+                last_raw_offset=final.last_raw_offset,
+                last_event_offset=final.last_event_offset,
+                last_consumer_progress_at_utc=(
+                    _utc(clock(), "clock").isoformat()
+                ),
+            )
+            publisher.stop()
+        except BaseException as error:
+            status_failure = status_failure or error
+        finally:
+            lease.release(now=_utc(clock(), "clock"))
+        if status_failure is not None:
+            raise RuntimeError(
+                "Options acquisition stopped after status persistence failure"
+            ) from status_failure
     if final.last_raw_offset <= 0 or final.last_event_offset <= 0:
+        publisher.update(
+            persist=True,
+            state="FAILED_NO_EVIDENCE",
+            failure_class="NO_MARKET_EVIDENCE",
+        )
         raise RuntimeError("Options acquisition captured no T/Q evidence")
     recovery = RawJournalReader(journal_path).recovery_state(
         NORMALIZER_VERSION
@@ -741,6 +1079,7 @@ def run_acquisition(
         or recovery.quarantine_count != 0
     ):
         raise RuntimeError("Options acquisition journal recovery failed")
+    current_status = publisher.snapshot()
     report = {
         "schema": ACQUISITION_STATUS_SCHEMA,
         "state": "COMPLETE",
@@ -753,9 +1092,27 @@ def run_acquisition(
         "connection_attempts": attempts,
         "decoded_messages": decoded_messages,
         "decoded_bytes": decoded_bytes,
+        "reserved_decoded_messages": decoded_messages,
+        "reserved_decoded_bytes": decoded_bytes,
+        "recovered_reserved_messages": recovered_reserved_messages,
+        "recovered_reserved_bytes": recovered_reserved_bytes,
+        "buffer_capacity_events": binding.buffer_event_limit,
+        "buffer_capacity_bytes": binding.buffer_byte_limit,
         "last_raw_offset": final.last_raw_offset,
         "last_event_offset": final.last_event_offset,
+        "runtime_heartbeat_at_utc": _utc(
+            clock(), "clock"
+        ).isoformat(),
         "observed_at_utc": _utc(clock(), "clock").isoformat(),
+        "socket_state": GatewayFeedState.STOPPED.value,
+        "subscription_ready": False,
+        "last_market_event_at_utc": current_status.get(
+            "last_market_event_at_utc"
+        ),
+        "last_consumer_progress_at_utc": current_status.get(
+            "last_consumer_progress_at_utc"
+        ),
+        "transport_gaps": list(gaps),
         "journal_path": str(journal_path),
         "journal_integrity": recovery.integrity_check,
         "quarantine_count": recovery.quarantine_count,

@@ -28,6 +28,9 @@ for path in (BACKEND_DIR, TEST_SUPPORT):
         sys.path.insert(0, str(path))
 
 from realtime.contracts import canonical_sha256  # noqa: E402
+from realtime.advanced_realtime_v3_local_preflight import (  # noqa: E402
+    LOCAL_PREFLIGHT_SCHEMA,
+)
 from realtime.advanced_options_acquisition_runtime import (  # noqa: E402
     acquisition_binding_payload,
     build_acquisition_binding,
@@ -112,9 +115,25 @@ def parse_args(argv=None):
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--qualification-semantic-sha256", required=True)
     parser.add_argument("--qualification-file-sha256", required=True)
+    parser.add_argument(
+        "--local-preflight-report",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument(
+        "--local-preflight-semantic-sha256",
+        required=True,
+    )
+    parser.add_argument(
+        "--local-preflight-file-sha256",
+        required=True,
+    )
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     args.output_directory = args.output_directory.resolve()
+    args.local_preflight_report = (
+        args.local_preflight_report.resolve()
+    )
     if (
         not args.image_id.startswith("sha256:")
         or len(args.image_id) != 71
@@ -127,6 +146,8 @@ def parse_args(argv=None):
     for name in (
         "qualification_semantic_sha256",
         "qualification_file_sha256",
+        "local_preflight_semantic_sha256",
+        "local_preflight_file_sha256",
     ):
         value = getattr(args, name)
         if len(value) != 64 or any(
@@ -135,9 +156,47 @@ def parse_args(argv=None):
             parser.error(f"--{name.replace('_', '-')} must be a SHA-256")
     if args.output_directory.exists():
         parser.error("--output-directory must be new")
+    if not args.local_preflight_report.is_file():
+        parser.error("--local-preflight-report must exist")
     if not args.execute:
         parser.error("Docker qualification requires explicit --execute")
     return args
+
+
+def _assert_local_preflight(args):
+    body = args.local_preflight_report.read_bytes()
+    if hashlib.sha256(body).hexdigest() != (
+        args.local_preflight_file_sha256
+    ):
+        raise RuntimeError("local preflight file identity changed")
+    try:
+        report = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("local preflight report is invalid") from error
+    document = dict(report)
+    semantic_sha256 = document.pop("semantic_sha256", None)
+    if (
+        semantic_sha256 != args.local_preflight_semantic_sha256
+        or canonical_sha256(document) != semantic_sha256
+        or report.get("schema") != LOCAL_PREFLIGHT_SCHEMA
+        or report.get("status") != "PASS"
+        or report.get("session_date") != args.session_date.isoformat()
+        or report.get("effects") != {
+            "provider_requests": 0,
+            "production_database_writes": 0,
+            "production_service_actions": 0,
+            "publication": 0,
+            "pointer_changes": 0,
+            "read_pin_changes": 0,
+        }
+    ):
+        raise RuntimeError("local preflight qualification changed")
+    return {
+        "report": str(args.local_preflight_report),
+        "semantic_sha256": semantic_sha256,
+        "file_sha256": args.local_preflight_file_sha256,
+        "mode": report.get("mode"),
+    }
 
 
 def _run(
@@ -190,14 +249,13 @@ def _assert_image_binding(args) -> dict[str, str]:
         "com.stockscreener.source-semantic-sha256": (
             args.qualification_semantic_sha256
         ),
-        "com.stockscreener.session-date": args.session_date.isoformat(),
     }
     if not isinstance(labels, dict) or any(
         labels.get(name) != value
         for name, value in expected.items()
     ):
         raise RuntimeError(
-            "candidate image is not bound to the qualified source and session"
+            "candidate image is not bound to the qualified release source"
         )
     return labels
 
@@ -210,13 +268,47 @@ def _write_json(path: Path, value) -> None:
         stream.write(encoded)
 
 
-def _seed(pool, *, session_date: date, suffix: str):
+def _seed(
+    pool,
+    *,
+    session_date: date,
+    suffix: str,
+    window_cutoffs=None,
+    validation_duration_minutes=10,
+    identity_time=None,
+):
     now = datetime.now(UTC)
+    if (
+        identity_time is not None
+        and (
+            identity_time.tzinfo is None
+            or identity_time.utcoffset() is None
+        )
+    ):
+        raise ValueError("qualification identity time must be timezone-aware")
+    identity_at = now if identity_time is None else identity_time.astimezone(UTC)
+    cutoffs = tuple(window_cutoffs or (
+        now + timedelta(seconds=index)
+        for index in range(1, 4)
+    ))
+    if (
+        not cutoffs
+        or len(cutoffs) > 78
+        or any(
+            cutoff.tzinfo is None or cutoff.utcoffset() is None
+            for cutoff in cutoffs
+        )
+        or tuple(sorted(cutoffs)) != cutoffs
+        or len(set(cutoffs)) != len(cutoffs)
+        or type(validation_duration_minutes) is not int
+        or not 1 <= validation_duration_minutes <= 120
+    ):
+        raise ValueError("qualification window cutoffs are invalid")
     profile_id = uuid4()
     manifest_id = uuid4()
     cohort_id = uuid4()
     plan_id = uuid4()
-    window_ids = tuple(uuid4() for _ in range(3))
+    window_ids = tuple(uuid4() for _ in cutoffs)
     journal_generation = uuid4()
     digest = lambda name: hashlib.sha256(
         f"{suffix}:{name}".encode("utf-8")
@@ -231,19 +323,20 @@ def _seed(pool, *, session_date: date, suffix: str):
                     "capabilities_sha256,universe_sha256,checked_at,"
                     "expires_at,status,profile_sha256,provider_tier,"
                     "security_policy_sha256,preflight_mode,"
-                    "provider_requests,action_authorized) VALUES ("
+                    "provider_requests,action_authorized,created_at) VALUES ("
                     "%s,%s,%s,'v3-production-qualification',%s,%s,%s,%s,'PASS',"
-                    "%s,'MASSIVE_ADVANCED',%s,'PASSIVE',false,false)",
+                    "%s,'MASSIVE_ADVANCED',%s,'PASSIVE',false,false,%s)",
                     (
                         str(profile_id),
                         digest("config"),
                         digest("schema"),
                         digest("capabilities"),
                         digest("universe"),
-                        now,
-                        now + timedelta(hours=1),
+                        identity_at,
+                        identity_at + timedelta(hours=1),
                         digest("profile"),
                         digest("security"),
+                        identity_at,
                     ),
                 )
                 cursor.execute(
@@ -251,24 +344,25 @@ def _seed(pool, *, session_date: date, suffix: str):
                     "manifest_id,manifest_sha256,universe_sha256,"
                     "session_date,effective_at,profile_id,manifest_kind,"
                     "stock_count,option_underlying_count,member_count,"
-                    "allocation_policy_sha256) VALUES ("
-                    "%s,%s,%s,%s,%s,%s,'MARKET_OPTIONS',9,2,9,%s)",
+                    "allocation_policy_sha256,created_at) VALUES ("
+                    "%s,%s,%s,%s,%s,%s,'MARKET_OPTIONS',9,2,9,%s,%s)",
                     (
                         str(manifest_id),
                         digest("manifest"),
                         digest("universe"),
                         session_date,
-                        now,
+                        identity_at,
                         str(profile_id),
                         digest("allocation"),
+                        identity_at,
                     ),
                 )
                 cursor.execute(
                     "INSERT INTO rt.cohorts ("
                     "cohort_id,cohort_sha256,manifest_id,"
                     "configuration_sha256,model_bundle_sha256,"
-                    "valuation_sha256,effective_at,mode) VALUES ("
-                    "%s,%s,%s,%s,%s,%s,%s,'SHADOW')",
+                    "valuation_sha256,effective_at,mode,created_at) VALUES ("
+                    "%s,%s,%s,%s,%s,%s,%s,'SHADOW',%s)",
                     (
                         str(cohort_id),
                         digest("cohort"),
@@ -276,7 +370,8 @@ def _seed(pool, *, session_date: date, suffix: str):
                         digest("configuration"),
                         digest("model"),
                         digest("valuation"),
-                        now,
+                        identity_at,
+                        identity_at,
                     ),
                 )
                 cursor.execute(
@@ -292,15 +387,16 @@ def _seed(pool, *, session_date: date, suffix: str):
                         STAGE_CATALOG_VERSION_V5,
                         list(OPTIONS_PROJECTION_ONLY_STAGE_ORDER),
                         digest("service"),
-                        now + timedelta(minutes=10),
+                        now + timedelta(
+                            minutes=validation_duration_minutes
+                        ),
                         f"OWNED_V3_DOCKER_REHEARSAL:{suffix}",
                     ),
                 )
-                for index, window_id in enumerate(
-                    window_ids,
+                for index, (window_id, cutoff) in enumerate(
+                    zip(window_ids, cutoffs, strict=True),
                     start=1,
                 ):
-                    cutoff = now + timedelta(seconds=index)
                     cursor.execute(
                         "INSERT INTO rt.window_runs ("
                         "window_id,plan_id,cohort_id,provider_tier,"
@@ -314,13 +410,16 @@ def _seed(pool, *, session_date: date, suffix: str):
                             f"v3-production-qualification-{suffix}-{index}",
                             cutoff,
                             cutoff,
-                            now + timedelta(minutes=10),
+                            now + timedelta(
+                                minutes=validation_duration_minutes
+                            ),
                         ),
                     )
     finally:
         pool.putconn(connection)
     return {
         "cohort_id": str(cohort_id),
+        "manifest_id": str(manifest_id),
         "plan_id": str(plan_id),
         "window_id": str(window_ids[0]),
         "window_ids": [str(value) for value in window_ids],
@@ -729,6 +828,36 @@ def _acquisition_status(container_id: str) -> dict[str, object]:
     )
 
 
+def _qualification_acceptance(window_count):
+    if not 1 <= window_count <= 78:
+        raise ValueError("qualification window count is invalid")
+    acceptance = {
+        "window_count": window_count,
+        "restart": "REHYDRATED",
+        "projection": {
+            "equity_terminal_receipt": "PORTAL_READY",
+            "options_terminal_receipt": "OPTIONS_PORTAL_READY",
+        },
+        "publication": {
+            "release_created": False,
+            "pointer_advanced": False,
+            "read_pin_enabled": False,
+            "normal_portal_serving": False,
+        },
+    }
+    if window_count == 3:
+        acceptance.update({
+            "window_2": "DEFERRED_THEN_COMPLETE",
+            "window_3": {
+                "O1": "COMPLETE_SELECTED",
+                "O3": "BLOCKED",
+            },
+        })
+    else:
+        acceptance["window_mode"] = "ALL_COMPLETE"
+    return acceptance
+
+
 def _qualification_artifacts(
     seed,
     args,
@@ -779,7 +908,13 @@ def _qualification_artifacts(
         ],
         "channels": ["T", "Q"],
         "flow_release_at_utc": (
-            now + timedelta(seconds=60)
+            now + timedelta(
+                seconds=getattr(
+                    args,
+                    "flow_release_delay_seconds",
+                    60,
+                )
+            )
         ).isoformat(),
         "qualification_semantic_sha256": (
             args.qualification_semantic_sha256
@@ -787,25 +922,9 @@ def _qualification_artifacts(
         "qualification_file_sha256": (
             args.qualification_file_sha256
         ),
-        "acceptance": {
-            "window_count": 3,
-            "window_2": "DEFERRED_THEN_COMPLETE",
-            "window_3": {
-                "O1": "COMPLETE_SELECTED",
-                "O3": "BLOCKED",
-            },
-            "restart": "REHYDRATED",
-            "projection": {
-                "equity_terminal_receipt": "PORTAL_READY",
-                "options_terminal_receipt": "OPTIONS_PORTAL_READY",
-            },
-            "publication": {
-                "release_created": False,
-                "pointer_advanced": False,
-                "read_pin_enabled": False,
-                "normal_portal_serving": False,
-            },
-        },
+        "acceptance": _qualification_acceptance(
+            len(seed["window_ids"])
+        ),
     }
     orchestration = {
         "plan_id": seed["plan_id"],
@@ -819,7 +938,16 @@ def _qualification_artifacts(
         "window": {
             "session_date": session_date,
             "start_utc": (now - timedelta(minutes=1)).isoformat(),
-            "stop_utc": (now + timedelta(minutes=10)).isoformat(),
+            "stop_utc": (
+                now
+                + timedelta(
+                    minutes=getattr(
+                        args,
+                        "package_window_minutes",
+                        10,
+                    )
+                )
+            ).isoformat(),
         },
         "cohort": {
             "cohort_id": cohort_id,
@@ -913,8 +1041,23 @@ def _qualification_artifacts(
     return package, bundle
 
 
-def _qualification_acquisition_binding(seed, args):
-    now = datetime(
+def _qualification_acquisition_binding(
+    seed,
+    args,
+    *,
+    contract_tickers=None,
+    now=None,
+    connection_attempt_ceiling=3,
+    decoded_message_ceiling=100,
+    decoded_byte_ceiling=1_048_576,
+):
+    tickers = tuple(contract_tickers or (
+        "O:QQQ261023C00350000",
+        "O:QQQ261023P00350000",
+        "O:SPY261023C00600000",
+        "O:SPY261023P00600000",
+    ))
+    now = now or datetime(
         args.session_date.year,
         args.session_date.month,
         args.session_date.day,
@@ -938,24 +1081,14 @@ def _qualification_acquisition_binding(seed, args):
         ),
         "admission_sha256": canonical_sha256({
             "cohort_id": seed["cohort_id"],
-            "contracts": (
-                "O:QQQ261023C00350000",
-                "O:QQQ261023P00350000",
-                "O:SPY261023C00600000",
-                "O:SPY261023P00600000",
-            ),
+            "contracts": tickers,
         }),
         "readiness_sha256": canonical_sha256({
             "cohort_id": seed["cohort_id"],
             "state": "READY",
         }),
         "slot_set_member_sha256": canonical_sha256({
-            "contracts": (
-                "O:QQQ261023C00350000",
-                "O:QQQ261023P00350000",
-                "O:SPY261023C00600000",
-                "O:SPY261023P00600000",
-            ),
+            "contracts": tickers,
             "channels": ("T", "Q"),
         }),
         "provider_budget_sha256": canonical_sha256({
@@ -963,9 +1096,9 @@ def _qualification_acquisition_binding(seed, args):
             "provider_socket": 1,
         }),
         "socket_budget_sha256": canonical_sha256({
-            "connection_attempts": 3,
-            "decoded_messages": 100,
-            "decoded_bytes": 1_048_576,
+            "connection_attempts": connection_attempt_ceiling,
+            "decoded_messages": decoded_message_ceiling,
+            "decoded_bytes": decoded_byte_ceiling,
         }),
         "journal_generation": UUID(str(seed["journal_generation"])),
         "journal_identity_sha256": canonical_sha256({
@@ -1002,15 +1135,10 @@ def _qualification_acquisition_binding(seed, args):
             f"sha256:{'c' * 64}",
         ),
         authority=authority,
-        contract_tickers=(
-            "O:QQQ261023C00350000",
-            "O:QQQ261023P00350000",
-            "O:SPY261023C00600000",
-            "O:SPY261023P00600000",
-        ),
-        connection_attempt_ceiling=3,
-        decoded_message_ceiling=100,
-        decoded_byte_ceiling=1_048_576,
+        contract_tickers=tickers,
+        connection_attempt_ceiling=connection_attempt_ceiling,
+        decoded_message_ceiling=decoded_message_ceiling,
+        decoded_byte_ceiling=decoded_byte_ceiling,
     )
 
 
@@ -1019,6 +1147,10 @@ def _attach_qualification_downstream_bindings(
     bundle,
     seed,
     args,
+    *,
+    equity_source_sha256=None,
+    cycle_cutoffs=None,
+    options_activity_sha256s=None,
 ):
     session_binding = p8_preopen_session_binding_from_payload(
         bundle["session_binding"]
@@ -1030,13 +1162,17 @@ def _attach_qualification_downstream_bindings(
     previous = None
     attached = []
     for sequence, window_id in enumerate(seed["window_ids"], start=1):
-        equity_cutoff = datetime(
-            args.session_date.year,
-            args.session_date.month,
-            args.session_date.day,
-            13,
-            30 + (sequence * 5),
-            tzinfo=UTC,
+        equity_cutoff = (
+            cycle_cutoffs[sequence - 1]
+            if cycle_cutoffs is not None
+            else datetime(
+                args.session_date.year,
+                args.session_date.month,
+                args.session_date.day,
+                13,
+                30 + (sequence * 5),
+                tzinfo=UTC,
+            )
         )
         options_cutoff = equity_cutoff + timedelta(seconds=120)
         receipt_id = uuid5(
@@ -1046,6 +1182,7 @@ def _attach_qualification_downstream_bindings(
         input_sha256 = canonical_sha256({
             "window_id": window_id,
             "kind": "INPUT_READY",
+            "equity_source_sha256": equity_source_sha256,
         })
         history_sha256 = "4" * 64
         equity_binding_sha256 = canonical_sha256({
@@ -1085,10 +1222,14 @@ def _attach_qualification_downstream_bindings(
             options_cutoff=options_cutoff,
             history_binding_sha256=history_sha256,
             equity_binding_sha256=equity_binding_sha256,
-            options_activity_evidence_sha256=canonical_sha256({
-                "window_id": window_id,
-                "kind": "OPTIONS_ACTIVITY",
-            }),
+            options_activity_evidence_sha256=(
+                options_activity_sha256s[sequence - 1]
+                if options_activity_sha256s is not None
+                else canonical_sha256({
+                    "window_id": window_id,
+                    "kind": "OPTIONS_ACTIVITY",
+                })
+            ),
             window_cycle_authorization_sha256=canonical_sha256({
                 "window_id": window_id,
                 "kind": "WINDOW_CYCLE_AUTHORITY",
@@ -1108,13 +1249,19 @@ def _attach_qualification_downstream_bindings(
     return attached
 
 
-def _seed_acquisition_catalog(pool) -> None:
-    contracts = (
+def _seed_acquisition_catalog(
+    pool,
+    *,
+    contracts=None,
+    expiration=None,
+) -> None:
+    contracts = contracts or (
         ("O:QQQ261023C00350000", "C", "350"),
         ("O:QQQ261023P00350000", "P", "350"),
         ("O:SPY261023C00600000", "C", "600"),
         ("O:SPY261023P00600000", "P", "600"),
     )
+    expiration = expiration or date(2026, 10, 23)
     now = datetime.now(UTC)
     connection = pool.getconn()
     try:
@@ -1165,13 +1312,14 @@ def _seed_acquisition_catalog(pool) -> None:
                         "strike,exercise_style,multiplier,deliverables,"
                         "eligibility,effective_from,effective_to,"
                         "observed_at,payload_sha256,imported_at"
-                        ") VALUES (%s,%s,%s,'2026-10-23',%s,"
+                        ") VALUES (%s,%s,%s,%s,%s,"
                         "'AMERICAN',100,'[]'::jsonb,'VALIDATED_ACTIVE',"
                         "%s,NULL,%s,%s,%s)",
                         (
                             version_id,
                             contract_id,
                             call_put,
+                            expiration,
                             strike,
                             now,
                             now,
@@ -1239,7 +1387,7 @@ def _durable_evidence(pool, seed):
                 )
                 windows = cursor.fetchall()
         if (
-            len(residents) != 9
+            len(residents) != len(seed["window_ids"]) * 3
             or {
                 (row[0], row[1])
                 for row in residents
@@ -1250,7 +1398,7 @@ def _durable_evidence(pool, seed):
                 for member in {"INGRESS", "MARKET_STATE", "FLOW"}
             }
             or any(row[2] != "COMPLETE" for row in residents)
-            or len(windows) != 3
+            or len(windows) != len(seed["window_ids"])
             or any(
                 row[:3]
                 != (
@@ -1344,6 +1492,7 @@ def execute(args) -> dict[str, object]:
     roles_owned = False
     login_owned = False
     try:
+        local_preflight = _assert_local_preflight(args)
         _assert_image_binding(args)
         with disposable_v2_database(database) as pool:
             seed = _seed(
@@ -1907,6 +2056,7 @@ def execute(args) -> dict[str, object]:
             "semantic_sha256": args.qualification_semantic_sha256,
             "file_sha256": args.qualification_file_sha256,
         },
+        "local_preflight": local_preflight,
         "validation_mode": "DEVELOPMENT_DIAGNOSTIC",
         "durable_database_barrier": durable,
         "effects": dict(ZERO_EFFECTS),

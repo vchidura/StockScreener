@@ -14,6 +14,7 @@ from realtime.advanced_options_v3_deployment import (
     ADVANCED_OPTIONS_V3_COMPOSE_PROFILE,
     ADVANCED_OPTIONS_V3_PROFILE_SHA256,
     ADVANCED_OPTIONS_V3_QUALIFICATION_STATE,
+    ADVANCED_OPTIONS_V3_SOURCE_BINDING_PATHS,
     advanced_options_v3_package_plan,
     advanced_options_v3_package_status,
     advanced_options_v3_profile_payload,
@@ -38,6 +39,7 @@ from realtime.stage_graph import STAGE_CATALOG_VERSION_V5
 from scripts import (
     audit_advanced_options_v3_operations,
     inspect_advanced_options_v3_package,
+    prepare_advanced_options_v3_operations,
     qualify_advanced_options_v3_docker,
     render_advanced_realtime_v3_compose,
     run_advanced_options_v3_docker_rehearsal,
@@ -51,7 +53,109 @@ ROOT = Path(__file__).resolve().parents[3]
 UTC = timezone.utc
 
 
-def test_docker_qualification_requires_exact_image_labels(monkeypatch):
+def test_docker_qualification_allows_provider_free_pre_session_clock():
+    class ReachedDatabase(RuntimeError):
+        pass
+
+    class Pool:
+        def getconn(self):
+            raise ReachedDatabase("validated seed reached disposable database")
+
+    observed = datetime(2026, 10, 31, 15, tzinfo=UTC)
+    with pytest.raises(ReachedDatabase, match="reached disposable"):
+        qualify_advanced_options_v3_docker._seed(
+            Pool(),
+            session_date=date(2026, 11, 2),
+            suffix="c031a001",
+            window_cutoffs=(observed + timedelta(seconds=1),),
+            identity_time=observed,
+        )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        qualify_advanced_options_v3_docker._seed(
+            Pool(),
+            session_date=date(2026, 11, 2),
+            suffix="c031a001",
+            window_cutoffs=(observed + timedelta(seconds=1),),
+            identity_time=datetime(2026, 10, 31, 15),
+        )
+
+
+def test_v3_release_identity_covers_lifecycle_remediation_sources():
+    required = {
+        "backend/realtime/advanced_gateway.py",
+        "backend/realtime/advanced_options_acquisition_runtime.py",
+        "backend/realtime/advanced_options_p8_runtime.py",
+        "backend/realtime/advanced_options_v3_history.py",
+        "backend/realtime/advanced_realtime_daily_supervisor.py",
+        "backend/realtime/advanced_realtime_session_scheduler.py",
+        "backend/scripts/qualify_advanced_options_v3_docker.py",
+        "backend/scripts/prepare_advanced_options_v3_operations.py",
+        "backend/scripts/register_advanced_realtime_v3_session_task.ps1",
+        "backend/scripts/run_advanced_realtime_session_scheduler.py",
+        "backend/scripts/run_advanced_realtime_v3_daily_supervisor.py",
+        "backend/scripts/validate_advanced_realtime_v3_local_holistic.py",
+        "backend/scripts/validate_advanced_realtime_v3_post_close_replay.py",
+    }
+    assert required <= set(ADVANCED_OPTIONS_V3_SOURCE_BINDING_PATHS)
+
+
+def test_operations_preparation_requires_actual_roles_and_dynamic_date():
+    image_id = "sha256:" + "a" * 64
+    report = {
+        "contract": (
+            "advanced-options-v3-production-role-docker-"
+            "qualification-report-v1"
+        ),
+        "verdict": "PASS",
+        "scope": {"image_id": image_id, "execution_flag": "--no-build"},
+        "entrypoint": {"rehearsal_process_used": False},
+        "services": [
+            {"role": role, "health": "healthy"}
+            for role in (
+                "OPTIONS_ACQUISITION",
+                "INGRESS",
+                "MARKET_STATE",
+                "FLOW",
+                "WINDOW",
+                "CANONICAL_STOCK_ALERTS",
+            )
+        ],
+        "single_bundle_handoff": {"resident_offsets_monotonic": True},
+        "cleanup": {"containers": [], "database": False},
+        "effects": {"provider_rest": 0, "provider_websocket": 0},
+    }
+    validate = getattr(
+        prepare_advanced_options_v3_operations,
+        "_validate_docker_role_qualification",
+    )
+    assert validate(report, image_id) is report
+    report["entrypoint"]["rehearsal_process_used"] = True
+    with pytest.raises(ValueError, match="actual-role"):
+        validate(report, image_id)
+
+    plan = prepare_advanced_options_v3_operations._repair_plan({
+        "scope": {"session_date": "2026-11-27"},
+        "stored_data": {
+            "history_coverage": [{
+                "cohort_id": "history",
+                "symbols": {
+                    "QQQ": {"missing_sessions": []},
+                    "SPY": {"missing_sessions": []},
+                },
+            }],
+        },
+    })
+    assert plan["corporate_actions"]["window"] == [
+        "2026-11-25",
+        "2026-11-27",
+    ]
+    assert plan["treasury"]["required_rate_date_lte"] == "2026-11-25"
+    assert plan["pre_session_not_historical_repair"]["expiration_date"] == (
+        "2026-11-27"
+    )
+
+
+def test_docker_qualification_reuses_release_image_across_sessions(monkeypatch):
     args = SimpleNamespace(
         image_id=f"sha256:{'a' * 64}",
         qualification_semantic_sha256="b" * 64,
@@ -72,7 +176,12 @@ def test_docker_qualification_requires_exact_image_labels(monkeypatch):
         == labels
     )
 
-    labels["com.stockscreener.session-date"] = "2026-10-29"
+    labels["com.stockscreener.session-date"] = "2026-11-02"
+    assert (
+        qualify_advanced_options_v3_docker._assert_image_binding(args)
+        == labels
+    )
+    labels["com.stockscreener.source-semantic-sha256"] = "c" * 64
     with pytest.raises(RuntimeError, match="not bound"):
         qualify_advanced_options_v3_docker._assert_image_binding(args)
 

@@ -320,12 +320,28 @@ def _provider():
         dsn=dsn,
         options="-c timezone=UTC",
     )
+    qualification = (
+        os.environ.get("REALTIME_V3_VALIDATION_MODE")
+        == "DEVELOPMENT_DIAGNOSTIC"
+        and os.environ.get(
+            "REALTIME_V3_PROVIDER_FREE_QUALIFICATION"
+        )
+        == "ENABLED"
+    )
+    role_prefix = (
+        os.environ.get("REALTIME_V2_ROLE_PREFIX", "").strip()
+        if qualification
+        else EXPECTED_V2_DATABASE_NAME
+    )
+    if not role_prefix:
+        raise RuntimeError("V3 qualification role prefix is unavailable")
     provider = V2ConnectionProvider(
         {APP_ROLE: pool},
         V2AccessConfig(
             security_mode="hardened",
-            role_prefix=EXPECTED_V2_DATABASE_NAME,
+            role_prefix=role_prefix,
             statement_timeout_ms=300_000,
+            allow_disposable=qualification,
         ),
     )
     provider.verify()

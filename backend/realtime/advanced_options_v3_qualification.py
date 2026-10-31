@@ -46,36 +46,52 @@ _RESIDENTS = ("INGRESS", "MARKET_STATE", "FLOW")
 def _qualification_payload(package, bundle) -> Mapping[str, object]:
     qualification = bundle.get("provider_free_qualification")
     deployment = package.get("v3_deployment")
+    window_ids = (
+        ()
+        if not isinstance(qualification, Mapping)
+        else tuple(qualification.get("window_ids") or ())
+    )
+    acceptance = (
+        None
+        if not isinstance(qualification, Mapping)
+        else qualification.get("acceptance")
+    )
+    expected_acceptance = {
+        "window_count": len(window_ids),
+        "restart": "REHYDRATED",
+        "projection": {
+            "equity_terminal_receipt": "PORTAL_READY",
+            "options_terminal_receipt": "OPTIONS_PORTAL_READY",
+        },
+        "publication": {
+            "release_created": False,
+            "pointer_advanced": False,
+            "read_pin_enabled": False,
+            "normal_portal_serving": False,
+        },
+    }
+    if len(window_ids) == 3:
+        expected_acceptance.update({
+            "window_2": "DEFERRED_THEN_COMPLETE",
+            "window_3": {
+                "O1": "COMPLETE_SELECTED",
+                "O3": "BLOCKED",
+            },
+        })
+    else:
+        expected_acceptance["window_mode"] = "ALL_COMPLETE"
     if (
         not isinstance(qualification, Mapping)
         or qualification != package.get("provider_free_qualification")
         or qualification.get("schema") != _QUALIFICATION_SCHEMA
-        or len(qualification.get("window_ids") or ()) != 3
+        or not 1 <= len(window_ids) <= 78
         or len(qualification.get("contracts") or ()) != 4
         or qualification.get("channels") != ["T", "Q"]
         or package.get("validation_mode")
         != AdvancedOptionsValidationMode.DEVELOPMENT_DIAGNOSTIC.value
         or bundle.get("validation_mode")
         != AdvancedOptionsValidationMode.DEVELOPMENT_DIAGNOSTIC.value
-        or qualification.get("acceptance") != {
-            "window_count": 3,
-            "window_2": "DEFERRED_THEN_COMPLETE",
-            "window_3": {
-                "O1": "COMPLETE_SELECTED",
-                "O3": "BLOCKED",
-            },
-            "restart": "REHYDRATED",
-            "projection": {
-                "equity_terminal_receipt": "PORTAL_READY",
-                "options_terminal_receipt": "OPTIONS_PORTAL_READY",
-            },
-            "publication": {
-                "release_created": False,
-                "pointer_advanced": False,
-                "read_pin_enabled": False,
-                "normal_portal_serving": False,
-            },
-        }
+        or acceptance != expected_acceptance
         or not isinstance(deployment, Mapping)
         or deployment.get("state")
         != ADVANCED_OPTIONS_V3_QUALIFICATION_STATE

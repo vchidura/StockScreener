@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from options.data.polygon_http import PolygonHttpResponse
 from realtime.advanced_options_p8_selection_source import (
     MassiveAdvancedOptionsExactContractSource,
     MassiveAdvancedOptionsSelectionSource,
+    _candidate_from_snapshot,
     p8_activity_selection_capture_from_sealed,
 )
 from realtime.advanced_options_p8_production import (
@@ -18,7 +20,9 @@ from realtime.advanced_options_p8_production import (
     _open_interest_sha256,
     _p8_manifest_policy,
 )
+from realtime.contracts import canonical_sha256
 from scripts import prepare_advanced_options_v3_pre_session
+from scripts import replay_advanced_options_v3_capture_local
 
 
 UTC = timezone.utc
@@ -211,6 +215,67 @@ def test_pre_session_cli_accepts_stricter_granted_byte_ceilings(
     assert args.maximum_decoded_bytes == 18_874_386
 
 
+def test_pre_session_cli_accepts_capture_only_mode(tmp_path):
+    args = prepare_advanced_options_v3_pre_session.parse_args([
+        "--database",
+        "stocks_realtime_v2",
+        "--confirm-database-name",
+        "stocks_realtime_v2",
+        "--source-cohort-id",
+        "11111111-1111-1111-1111-111111111111",
+        "--session-date",
+        "2026-10-30",
+        "--authorized-until",
+        "2026-10-30T13:29:00+00:00",
+        "--reference-valid-until",
+        "2026-10-30T20:05:00+00:00",
+        "--maximum-provider-requests",
+        "2",
+        "--maximum-response-decoded-bytes",
+        "50000000",
+        "--maximum-decoded-bytes",
+        "100000000",
+        "--authorization-reference",
+        "local-capture-test",
+        "--capture-path",
+        str(tmp_path / "capture.json"),
+        "--report-path",
+        str(tmp_path / "report.json"),
+        "--capture-only",
+        "--execute",
+    ])
+
+    assert args.capture_only is True
+
+
+def test_capture_only_skips_reference_fact_transaction():
+    class _Provider:
+        def transaction(self, *_args, **_kwargs):
+            raise AssertionError("capture-only must not open a transaction")
+
+    assert prepare_advanced_options_v3_pre_session._persist_facts(
+        _Provider(),
+        (object(),),
+        capture_only=True,
+    ) == 0
+
+
+def test_chain_candidate_skips_unquoted_contract():
+    row = _contract(
+        "QQQ",
+        "O:QQQ261030C00600000",
+        "call",
+        600,
+        600,
+    )
+    row["last_quote"]["ask"] = 0
+
+    assert _candidate_from_snapshot(
+        row,
+        session_date=date(2026, 10, 30),
+    ) is None
+
+
 def test_advanced_source_rejects_pagination_or_incomplete_activity():
     paginated = _Transport([
         _payload(
@@ -366,7 +431,6 @@ def test_exact_contract_source_uses_one_unified_snapshot_request():
     assert url == "https://api.massive.com/v3/snapshot"
     assert params == {
         "ticker.any_of": ",".join(sorted(tickers)),
-        "type": "options",
         "limit": "4",
         "sort": "ticker",
         "order": "asc",
@@ -419,6 +483,12 @@ def test_sealed_capture_reconstructs_exact_call_put_scope_provider_free():
                 strike,
                 strike,
             )
+    future = REVIEWED + timedelta(seconds=1)
+    selected_snapshots[
+        "O:SPY261021C00670000"
+    ]["last_quote"]["last_updated"] = int(
+        future.timestamp() * 1_000_000_000
+    )
     capture = p8_activity_selection_capture_from_sealed({
         "contract": "advanced-options-v3-pre-session-capture-v1",
         "captured_at_utc": REVIEWED.isoformat(),
@@ -435,6 +505,7 @@ def test_sealed_capture_reconstructs_exact_call_put_scope_provider_free():
 
     assert capture.request_count == 2
     assert capture.pagination_requests == 0
+    assert capture.selection.reviewed_at == future
     assert capture.selection.contracts == (
         "O:QQQ261021C00600000",
         "O:QQQ261021P00600000",
@@ -442,6 +513,92 @@ def test_sealed_capture_reconstructs_exact_call_put_scope_provider_free():
         "O:SPY261021P00670000",
     )
     assert capture.evidence["sealed_capture_semantic_sha256"] == "a" * 64
+
+
+def test_sealed_capture_rejects_provider_clock_skew_over_five_seconds():
+    selected_snapshots = {}
+    for underlyer, strike in (("QQQ", 600), ("SPY", 670)):
+        for kind, option_type in (("call", "C"), ("put", "P")):
+            ticker = (
+                f"O:{underlyer}261021{option_type}"
+                f"{strike * 1000:08d}"
+            )
+            selected_snapshots[ticker] = _contract(
+                underlyer,
+                ticker,
+                kind,
+                strike,
+                strike,
+            )
+    selected_snapshots[
+        "O:SPY261021C00670000"
+    ]["last_quote"]["last_updated"] = int(
+        (REVIEWED + timedelta(seconds=6)).timestamp()
+        * 1_000_000_000
+    )
+
+    with pytest.raises(ValueError, match="clock skew exceeded"):
+        p8_activity_selection_capture_from_sealed({
+            "contract": "advanced-options-v3-pre-session-capture-v1",
+            "captured_at_utc": REVIEWED.isoformat(),
+            "session_date": SESSION.isoformat(),
+            "provider_requests": 2,
+            "decoded_bytes": 4096,
+            "responses": [
+                {"underlyer": "QQQ", "request_id": "q"},
+                {"underlyer": "SPY", "request_id": "s"},
+            ],
+            "selected_snapshots": selected_snapshots,
+            "semantic_sha256": "a" * 64,
+        })
+
+
+def test_local_replay_cli_is_provider_and_database_free(tmp_path):
+    snapshots = {}
+    for underlyer, strike in (("QQQ", 600), ("SPY", 670)):
+        for kind, option_type in (("call", "C"), ("put", "P")):
+            ticker = (
+                f"O:{underlyer}261021{option_type}"
+                f"{strike * 1000:08d}"
+            )
+            snapshots[ticker] = _contract(
+                underlyer,
+                ticker,
+                kind,
+                strike,
+                strike,
+            )
+    document = {
+        "contract": "advanced-options-v3-pre-session-capture-v1",
+        "captured_at_utc": REVIEWED.isoformat(),
+        "session_date": SESSION.isoformat(),
+        "provider_requests": 2,
+        "decoded_bytes": 4096,
+        "responses": [
+            {"underlyer": "QQQ", "request_id": "q"},
+            {"underlyer": "SPY", "request_id": "s"},
+        ],
+        "selected_snapshots": snapshots,
+    }
+    document["semantic_sha256"] = canonical_sha256(document)
+    capture = tmp_path / "capture.json"
+    body = (
+        json.dumps(document, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    capture.write_bytes(body)
+    output = tmp_path / "replay.json"
+
+    result = replay_advanced_options_v3_capture_local.execute(
+        SimpleNamespace(
+            capture=capture,
+            capture_file_sha256=hashlib.sha256(body).hexdigest(),
+            output=output,
+        )
+    )
+
+    assert result["status"] == "PASS"
+    assert result["contract_count"] == 4
+    assert all(value == 0 for value in result["effects"].values())
 
 
 def test_sealed_capture_rejects_missing_call_put_member():

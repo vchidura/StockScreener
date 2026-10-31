@@ -12,6 +12,7 @@ from realtime.advanced_options_v3_history import (
     ADVANCED_OPTIONS_V3_HISTORY_SOURCE_MANIFEST_SHA256,
     AdvancedOptionsHistoryBindingIdentityError,
     AdvancedOptionsHistoryCoverageError,
+    advanced_options_v3_history_source_configuration,
     advanced_options_v3_history_binding_from_payload,
     load_verified_advanced_options_v3_history_binding_cursor,
     verify_advanced_options_v3_history_binding_cursor,
@@ -153,6 +154,17 @@ def test_exact_adjusted_h_binding_freezes_members_and_clocks():
     }
     assert verified.evidence["rows_copied_to_target"] == 0
     assert verified.evidence["mixed_history_reconstruction"] is False
+    assert verified.evidence["readiness"] == {
+        "status": "READY",
+        "required_through_session": "2026-10-22",
+        "latest_covered_session": "2026-10-22",
+        "known_at_utc": KNOWN_AT.isoformat(),
+        "refresh_policy": "REQUIRED_THROUGH_PREVIOUS_XNYS_SESSION",
+    }
+    source = advanced_options_v3_history_source_configuration()
+    assert verified.evidence["source_configuration"] == source
+    assert source["source_provider_tier"] == "MASSIVE_DEVELOPER"
+    assert source["copy_into_target"] is False
     assert advanced_options_v3_history_binding_from_payload(
         advanced_options_history_binding_payload(verified.binding)
     ) == verified.binding

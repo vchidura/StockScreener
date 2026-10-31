@@ -497,33 +497,70 @@ class RawJournalWriter:
         )
 
     def commit_normalized(self, batch: NormalizationBatch) -> NormalizedCommit:
+        return self.commit_normalized_many((batch,))
+
+    def commit_normalized_many(
+        self,
+        batches: tuple[NormalizationBatch, ...],
+    ) -> NormalizedCommit:
         self._assert_owner()
-        version = batch.normalizer_version.strip()
-        if not version:
-            raise ValueError("normalizer_version cannot be blank")
-        if batch.raw_offset <= 0:
-            raise ValueError("normalized batch raw_offset must be positive")
-        event_indices = [event.event_index for event in batch.events]
-        quarantine_indices = [row.event_index for row in batch.quarantines]
-        all_indices = event_indices + quarantine_indices
-        if len(all_indices) != len(set(all_indices)):
-            raise ValueError("normalized batch event indexes must be unique")
-        if any(
-            event.raw_offset != batch.raw_offset
-            or event.normalizer_version != version
-            for event in batch.events
-        ) or any(
-            row.raw_offset != batch.raw_offset
-            or row.normalizer_version != version
-            for row in batch.quarantines
+        if not batches:
+            raise ValueError("normalized batches cannot be empty")
+        version = batches[0].normalizer_version.strip()
+        if (
+            not version
+            or any(
+                batch.normalizer_version.strip() != version
+                for batch in batches
+            )
         ):
-            raise ValueError("normalized batch lineage does not match its events")
-        raw = self._connection.execute(
-            "SELECT journal_generation FROM raw_messages WHERE raw_offset = ?",
-            (batch.raw_offset,),
-        ).fetchone()
-        if raw is None or UUID(raw["journal_generation"]) != self.generation:
-            raise ValueError("normalized batch has no raw lineage in this generation")
+            raise ValueError("normalizer_version cannot be blank")
+        raw_offsets = tuple(batch.raw_offset for batch in batches)
+        if (
+            raw_offsets[0] <= 0
+            or raw_offsets != tuple(range(
+                raw_offsets[0],
+                raw_offsets[0] + len(raw_offsets),
+            ))
+        ):
+            raise ValueError("normalized batch raw offsets must be consecutive")
+        for batch in batches:
+            event_indices = [event.event_index for event in batch.events]
+            quarantine_indices = [
+                row.event_index for row in batch.quarantines
+            ]
+            all_indices = event_indices + quarantine_indices
+            if len(all_indices) != len(set(all_indices)):
+                raise ValueError(
+                    "normalized batch event indexes must be unique"
+                )
+            if any(
+                event.raw_offset != batch.raw_offset
+                or event.normalizer_version != version
+                for event in batch.events
+            ) or any(
+                row.raw_offset != batch.raw_offset
+                or row.normalizer_version != version
+                for row in batch.quarantines
+            ):
+                raise ValueError(
+                    "normalized batch lineage does not match its events"
+                )
+        raw_rows = self._connection.execute(
+            "SELECT raw_offset,journal_generation FROM raw_messages "
+            "WHERE raw_offset BETWEEN ? AND ? ORDER BY raw_offset",
+            (raw_offsets[0], raw_offsets[-1]),
+        ).fetchall()
+        if (
+            tuple(row["raw_offset"] for row in raw_rows) != raw_offsets
+            or any(
+                UUID(row["journal_generation"]) != self.generation
+                for row in raw_rows
+            )
+        ):
+            raise ValueError(
+                "normalized batch has no raw lineage in this generation"
+            )
         progress = self._connection.execute(
             "SELECT committed_raw_offset, committed_event_offset "
             "FROM decoder_progress WHERE normalizer_version = ?",
@@ -538,16 +575,62 @@ class RawJournalWriter:
         else:
             expected_raw_offset = progress["committed_raw_offset"] + 1
             committed_event_offset = progress["committed_event_offset"]
-        if batch.raw_offset != expected_raw_offset:
+        if raw_offsets[0] != expected_raw_offset:
             raise ValueError(
                 "normalized progress must consume the next retained raw offset"
             )
         committed_at = self._clock()
         committed_stamp = _stamp(committed_at)
+        event_values = []
+        quarantine_values = []
+        for batch in batches:
+            event_values.extend(
+                (
+                    event.raw_offset,
+                    event.event_index,
+                    event.normalizer_version,
+                    event.instrument_id,
+                    event.provider_symbol,
+                    event.underlying,
+                    event.asset_class.value,
+                    event.shard_id,
+                    event.event_kind.value,
+                    event.source_session.isoformat(),
+                    event.source_sequence,
+                    event.source_timestamp,
+                    event.source_timestamp_unit,
+                    _stamp(event.event_at),
+                    str(event.price) if event.price is not None else None,
+                    str(event.size) if event.size is not None else None,
+                    str(event.bid) if event.bid is not None else None,
+                    str(event.ask) if event.ask is not None else None,
+                    event.bid_size,
+                    event.ask_size,
+                    event.exchange,
+                    json.dumps(event.conditions, separators=(",", ":")),
+                    event.quality.value,
+                    json.dumps(event.reason_codes, separators=(",", ":")),
+                    event.details_json,
+                    event.payload_sha256,
+                    committed_stamp,
+                )
+                for event in batch.events
+            )
+            quarantine_values.extend(
+                (
+                    row.raw_offset,
+                    row.event_index,
+                    row.normalizer_version,
+                    row.reason_code,
+                    row.payload_sha256,
+                    committed_stamp,
+                )
+                for row in batch.quarantines
+            )
         try:
             self._connection.execute("BEGIN IMMEDIATE")
-            for event in batch.events:
-                cursor = self._connection.execute(
+            if event_values:
+                self._connection.executemany(
                     "INSERT INTO normalized_events ("
                     "raw_offset, event_index, normalizer_version, instrument_id, "
                     "provider_symbol, underlying, asset_class, shard_id, event_kind, "
@@ -557,50 +640,19 @@ class RawJournalWriter:
                     "reason_codes_json, details_json, payload_sha256, committed_at"
                     ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                     "?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        event.raw_offset,
-                        event.event_index,
-                        event.normalizer_version,
-                        event.instrument_id,
-                        event.provider_symbol,
-                        event.underlying,
-                        event.asset_class.value,
-                        event.shard_id,
-                        event.event_kind.value,
-                        event.source_session.isoformat(),
-                        event.source_sequence,
-                        event.source_timestamp,
-                        event.source_timestamp_unit,
-                        _stamp(event.event_at),
-                        str(event.price) if event.price is not None else None,
-                        str(event.size) if event.size is not None else None,
-                        str(event.bid) if event.bid is not None else None,
-                        str(event.ask) if event.ask is not None else None,
-                        event.bid_size,
-                        event.ask_size,
-                        event.exchange,
-                        json.dumps(event.conditions, separators=(",", ":")),
-                        event.quality.value,
-                        json.dumps(event.reason_codes, separators=(",", ":")),
-                        event.details_json,
-                        event.payload_sha256,
-                        committed_stamp,
-                    ),
+                    event_values,
                 )
-                committed_event_offset = cursor.lastrowid
-            for row in batch.quarantines:
-                self._connection.execute(
+                committed_event_offset = self._connection.execute(
+                    "SELECT MAX(event_offset) FROM normalized_events "
+                    "WHERE normalizer_version = ? AND raw_offset BETWEEN ? AND ?",
+                    (version, raw_offsets[0], raw_offsets[-1]),
+                ).fetchone()[0]
+            if quarantine_values:
+                self._connection.executemany(
                     "INSERT INTO quarantined_events ("
                     "raw_offset, event_index, normalizer_version, reason_code, "
                     "payload_sha256, committed_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        row.raw_offset,
-                        row.event_index,
-                        row.normalizer_version,
-                        row.reason_code,
-                        row.payload_sha256,
-                        committed_stamp,
-                    ),
+                    quarantine_values,
                 )
             self._connection.execute(
                 "INSERT INTO decoder_progress ("
@@ -614,7 +666,7 @@ class RawJournalWriter:
                 (
                     version,
                     str(self.generation),
-                    batch.raw_offset,
+                    raw_offsets[-1],
                     committed_event_offset,
                     committed_stamp,
                 ),
@@ -626,10 +678,12 @@ class RawJournalWriter:
         return NormalizedCommit(
             generation=self.generation,
             normalizer_version=version,
-            committed_raw_offset=batch.raw_offset,
+            committed_raw_offset=raw_offsets[-1],
             committed_event_offset=committed_event_offset,
-            event_count=len(batch.events),
-            quarantine_count=len(batch.quarantines),
+            event_count=sum(len(batch.events) for batch in batches),
+            quarantine_count=sum(
+                len(batch.quarantines) for batch in batches
+            ),
             committed_at=committed_at,
         )
 

@@ -1,7 +1,8 @@
 import asyncio
 import json
+import threading
 from collections import deque
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
 import pytest
@@ -27,6 +28,9 @@ from realtime.contracts import (
 )
 from realtime.journal import RawJournalReader, RawJournalWriter
 from realtime.normalizer import InstrumentAdmission, normalize_raw_message
+from scripts.capture_advanced_realtime_v3_websockets import (
+    _manifest as provider_test_manifest,
+)
 
 
 UTC = timezone.utc
@@ -66,6 +70,13 @@ class FakeConnection:
 
     async def close(self, *, code, reason):
         self.closed = (code, reason)
+
+
+class QuietConnection(FakeConnection):
+    async def recv(self, *, decode=None):
+        if self.incoming:
+            return await super().recv(decode=decode)
+        await asyncio.Future()
 
 
 def _manifest():
@@ -132,6 +143,24 @@ def _gateway(feed, connection, buffer=None):
         monotonic_ns=lambda: 100,
         session_id_factory=lambda: SESSION,
     )
+
+
+def test_host_provider_test_uses_separate_equity_and_options_manifests():
+    contracts = (
+        "O:QQQ261030C00696000",
+        "O:QQQ261030P00696000",
+        "O:SPY261030C00761000",
+        "O:SPY261030P00761000",
+    )
+    session = date(2026, 10, 30)
+
+    equity = provider_test_manifest(session, contracts, options=False)
+    options = provider_test_manifest(session, contracts, options=True)
+
+    assert equity.universe.option_underlyings == ()
+    assert equity.maximum_option_quote_contracts == 0
+    assert options.universe.option_underlyings == ("QQQ", "SPY")
+    assert options.maximum_option_quote_contracts == 4
 
 
 def test_stock_gateway_authenticates_subscribes_and_hands_off_raw_bytes():
@@ -229,6 +258,56 @@ def test_stock_gateway_can_verify_subscription_without_market_data():
     assert result.accepted_messages == 0
     assert result.subscriptions
     assert connection.sent[1]["action"] == "subscribe"
+
+
+def test_quiet_subscribed_gateway_stops_without_waiting_for_market_data():
+    stop = threading.Event()
+    connection = QuietConnection(
+        (_status("auth_success"), _status("success"))
+    )
+    gateway = _gateway(MarketFeed.OPTIONS, connection)
+
+    async def scenario():
+        asyncio.get_running_loop().call_later(0.05, stop.set)
+        return await gateway.run_session(
+            stop_requested=stop.is_set,
+            stop_at=NOW + timedelta(hours=1),
+            receive_poll_seconds=0.01,
+        )
+
+    result = asyncio.run(scenario())
+
+    assert result.stop_reason == "REQUESTED"
+    assert result.accepted_messages == 0
+    assert result.final_state is GatewayFeedState.STOPPED
+    assert GatewayFeedState.WARMING in result.transitions
+    assert connection.closed == (1000, "session stop: requested")
+
+
+def test_gateway_separates_received_usage_from_market_activity():
+    market = b'[{"ev":"Q","sym":"SPY","bp":100,"ap":101,"t":1}]'
+    connection = FakeConnection(
+        (_status("auth_success"), _status("success"), market)
+    )
+    usage = []
+    activity = []
+    gateway = AdvancedGateway(
+        GatewayConfiguration.stocks(),
+        _manifest(),
+        _buffer(),
+        api_key="never-print-this",
+        connection_factory=lambda _: connection,
+        utc_clock=lambda: NOW,
+        monotonic_ns=lambda: 100,
+        session_id_factory=lambda: SESSION,
+        usage_observer=lambda messages, size: usage.append((messages, size)),
+        market_observer=lambda messages, size: activity.append((messages, size)),
+    )
+
+    asyncio.run(gateway.run_session(maximum_market_messages=1))
+
+    assert len(usage) == 3
+    assert activity == [usage[-1]]
 
 
 def test_option_gateway_uses_explicit_contract_trade_and_quote_membership():

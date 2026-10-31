@@ -289,6 +289,7 @@ class AdvancedJournalPump:
                         )
                     event_watermark = progress.event_time_watermark
                     last_event_offset = progress.last_event_offset
+                    normalized_batches = []
                     for raw in raw_records:
                         if raw.feed is not self.feed:
                             raise AdvancedJournalDecodeError(
@@ -330,10 +331,7 @@ class AdvancedJournalPump:
                             raise AdvancedJournalDecodeError(
                                 "ADVANCED_UNEXPECTED_CHANNEL"
                             )
-                        normalized = writer.commit_normalized(batch)
-                        last_event_offset = (
-                            normalized.committed_event_offset
-                        )
+                        normalized_batches.append(batch)
                         if batch.events:
                             own_watermark = max(
                                 event.event_at for event in batch.events
@@ -343,7 +341,11 @@ class AdvancedJournalPump:
                                 if event_watermark is None
                                 else max(event_watermark, own_watermark)
                             )
-                        last_raw_offset = raw.raw_offset
+                    normalized = writer.commit_normalized_many(
+                        tuple(normalized_batches)
+                    )
+                    last_event_offset = normalized.committed_event_offset
+                    last_raw_offset = normalized.committed_raw_offset
                     progress = AdvancedJournalProgress(
                         admitted_market_messages=(
                             progress.admitted_market_messages

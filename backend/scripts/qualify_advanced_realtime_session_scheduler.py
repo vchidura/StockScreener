@@ -38,6 +38,7 @@ from options.calendar import OptionExchangeCalendar  # noqa: E402
 FOCUSED_TESTS = (
     "backend/tests/realtime/test_advanced_options_acquisition_runtime.py",
     "backend/tests/realtime/test_advanced_realtime_session_scheduler.py",
+    "backend/tests/realtime/test_advanced_realtime_v3_local_preflight.py",
     "backend/tests/realtime/test_advanced_realtime_session_operations.py",
     "backend/tests/realtime/test_advanced_options_p8_selection_source.py",
     "backend/tests/realtime/test_advanced_options_read_pin.py",

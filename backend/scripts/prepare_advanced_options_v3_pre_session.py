@@ -83,6 +83,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--capture-path", type=Path, required=True)
     parser.add_argument("--report-path", type=Path, required=True)
+    parser.add_argument("--capture-only", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     validate_target_database_v2(
@@ -144,6 +145,14 @@ def _provider():
     )
     provider.verify()
     return provider, pool
+
+
+def _persist_facts(provider, facts, *, capture_only):
+    if capture_only:
+        return 0
+    with provider.transaction(APP_ROLE) as unit:
+        persist_reference_facts_cursor(unit.cursor, facts)
+    return len(facts)
 
 
 def _facts(selected_rows, selected_snapshots, request, settlement_session):
@@ -246,6 +255,7 @@ def main(argv=None) -> int:
         "underlyings": UNDERLYINGS,
         "channels": ("T", "Q"),
         "selected_contracts_per_underlying": 2,
+        "capture_only": args.capture_only,
         "maximum_provider_requests": args.maximum_provider_requests,
         "maximum_response_decoded_bytes": (
             args.maximum_response_decoded_bytes
@@ -416,20 +426,27 @@ def main(argv=None) -> int:
             request,
             settlement,
         )
-        with provider.transaction(APP_ROLE) as unit:
-            persist_reference_facts_cursor(unit.cursor, facts)
+        database_writes = _persist_facts(
+            provider,
+            facts,
+            capture_only=args.capture_only,
+        )
     finally:
         pool.closeall()
     report = {
         **plan,
-        "status": "COMPLETE",
+        "status": (
+            "CAPTURED_NOT_APPLIED"
+            if args.capture_only
+            else "COMPLETE"
+        ),
         "provider_requests": len(responses),
         "provider_response_bytes": decoded_bytes,
         "source_snapshot_at_utc": min(snapshot_times).isoformat(),
         "selection_sha256": selection_sha256,
         "selected": selected,
         "settlement_session": settlement.isoformat(),
-        "database_writes": len(facts),
+        "database_writes": database_writes,
         "fact_sha256": canonical_sha256(facts),
         "credentials_exposed": False,
     }

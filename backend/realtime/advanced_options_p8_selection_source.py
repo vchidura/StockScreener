@@ -124,6 +124,18 @@ def _candidate_from_snapshot(
     if option_type is None:
         return None
     expiration = date.fromisoformat(str(details["expiration_date"]))
+    bid = _decimal(quote_row["bid"], "last_quote.bid")
+    ask = _decimal(quote_row["ask"], "last_quote.ask")
+    day_volume = int(day_row.get("volume", 0))
+    open_interest = int(row.get("open_interest", 0))
+    if (
+        bid < 0
+        or ask <= 0
+        or ask < bid
+        or day_volume < 0
+        or open_interest < 0
+    ):
+        return None
     return P7TransportCandidate(
         contract_ticker=ticker,
         underlyer=str(underlying.get("ticker", "")),
@@ -137,10 +149,10 @@ def _candidate_from_snapshot(
             underlying.get("price", underlying.get("value")),
             "underlying_asset.price",
         ),
-        bid=_decimal(quote_row["bid"], "last_quote.bid"),
-        ask=_decimal(quote_row["ask"], "last_quote.ask"),
-        day_volume=int(day_row.get("volume", 0)),
-        open_interest=int(row.get("open_interest", 0)),
+        bid=bid,
+        ask=ask,
+        day_volume=day_volume,
+        open_interest=open_interest,
         calendar_dte=(expiration - session_date).days,
         market_data_time=_nanoseconds(
             quote_row.get("last_updated"),
@@ -275,6 +287,19 @@ def p8_activity_selection_capture_from_sealed(
         ("SPY", "P"),
     }:
         raise ValueError("sealed P8 call/put membership changed")
+    latest_market_time = max(
+        row.market_data_time for row in candidates
+    )
+    if latest_market_time > reviewed_at:
+        if (
+            latest_market_time - reviewed_at
+        ).total_seconds() > (
+            P8_SELECTION_MAXIMUM_PROVIDER_CLOCK_SKEW_SECONDS
+        ):
+            raise ValueError(
+                "sealed P8 provider clock skew exceeded"
+            )
+        reviewed_at = latest_market_time
     for option_type in ("C", "P"):
         selection = select_p7_transport_contracts(
             tuple(
@@ -685,7 +710,6 @@ class MassiveAdvancedOptionsExactContractSource:
             f"{self._base_url}/v3/snapshot",
             {
                 "ticker.any_of": ",".join(tickers),
-                "type": "options",
                 "limit": str(P8_EXACT_CONTRACT_RESULT_COUNT),
                 "sort": "ticker",
                 "order": "asc",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -223,6 +224,91 @@ def test_20261028_schedule_is_exact_target9_and_78_five_minute_cycles():
     assert advanced_realtime_session_authorization_from_payload(
         payload
     ) == authority
+
+
+def test_short_session_derives_42_windows_deadline_and_provider_budget():
+    session_date = date(2026, 11, 27)
+    windows = build_advanced_session_windows(session_date)
+    decision_stop = windows[-1].latest_options_cutoff
+    options = SessionAcquisitionAuthorization.__new__(
+        SessionAcquisitionAuthorization
+    )
+    for name, value in {
+        "authorization_id": SESSION_AUTHORIZATION_ID,
+        "authorization_sha256": "a" * 64,
+        "cohort_id": COHORT_ID,
+        "session_date": session_date,
+        "acquisition_stop": decision_stop,
+    }.items():
+        object.__setattr__(options, name, value)
+    response_ceiling = 1_000_000
+    provider = AdvancedSessionProviderContract(
+        budget=ProviderBudgetScope(
+            account_alias="MASSIVE_ADVANCED",
+            session_date=session_date,
+            authorization_reference="short-session-test",
+            provider_authorization_reference="provider-short-test",
+            expected_cost="calendar-derived short session",
+            request_ceiling=len(windows),
+            decoded_byte_ceiling=len(windows) * response_ceiling,
+            lanes=frozenset({ProviderRequestLane.OPTIONS_ALIGNMENT}),
+            authorized_until=decision_stop,
+        ),
+        response_byte_ceiling=response_ceiling,
+        contract_tickers=CONTRACTS,
+    )
+
+    authority = build_advanced_realtime_session_authorization(
+        authorization_reference="short-session-test",
+        session_date=session_date,
+        prepared_at=datetime(2026, 11, 27, 14, 0, tzinfo=UTC),
+        acquisition_start=datetime(2026, 11, 27, 14, 10, tzinfo=UTC),
+        equity_authorization_id=EQUITY_AUTHORIZATION_ID,
+        equity_cohort_id=COHORT_ID,
+        options_session_authority=options,
+        package_sha256="2" * 64,
+        bundle_sha256="3" * 64,
+        provider_contract=provider,
+    )
+    payload = advanced_realtime_session_authorization_payload(authority)
+
+    assert len(authority.windows) == 42
+    assert authority.market_capture_stop == datetime(
+        2026, 11, 27, 18, 0, tzinfo=UTC
+    )
+    assert authority.decision_stop == datetime(
+        2026, 11, 27, 18, 5, tzinfo=UTC
+    )
+    assert authority.provider_contract.budget.request_ceiling == 42
+    assert payload["run_scope"] == {
+        "kind": "FULL_EXCHANGE_SESSION",
+        "window_count": 42,
+        "first_window_index": 1,
+        "last_window_index": 42,
+    }
+    assert advanced_realtime_session_authorization_from_payload(
+        payload
+    ) == authority
+
+
+def test_calendar_windows_cover_holiday_and_dst_transitions():
+    with pytest.raises(ValueError):
+        build_advanced_session_windows(date(2026, 11, 26))
+    with pytest.raises(ValueError):
+        build_advanced_session_windows(date(2026, 10, 31))
+
+    before_dst = build_advanced_session_windows(date(2026, 3, 6))
+    after_dst = build_advanced_session_windows(date(2026, 3, 9))
+    assert len(before_dst) == len(after_dst) == 78
+    assert before_dst[0].equity_cutoff.hour == 14
+    assert after_dst[0].equity_cutoff.hour == 13
+    assert (
+        before_dst[-1].latest_options_cutoff
+        - before_dst[0].equity_cutoff
+    ) == (
+        after_dst[-1].latest_options_cutoff
+        - after_dst[0].equity_cutoff
+    )
 
 
 def test_scheduler_contract_refuses_naive_156_request_budget():
@@ -809,6 +895,243 @@ def test_runtime_metrics_must_remain_monotonic():
     cli._assert_monotonic_runtime(snapshot(2), snapshot(3))
     with pytest.raises(RuntimeError, match="regressed"):
         cli._assert_monotonic_runtime(snapshot(3), snapshot(2))
+
+
+def test_runtime_monitor_recovers_from_bounded_sampling_failures(
+    monkeypatch,
+    tmp_path,
+):
+    monitor_stop = threading.Event()
+    session_stop = threading.Event()
+    failures = []
+    calls = []
+
+    def snapshot(*_args, **_kwargs):
+        calls.append(len(calls) + 1)
+        if len(calls) < 3:
+            raise RuntimeError("Docker inspect failed with 1")
+        monitor_stop.set()
+        return {
+            "identity_sha256": "a" * 64,
+            "database": {"equity": {}, "options": {
+                "consumer_checkpoints": {},
+                "resident_barriers": {},
+            }},
+            "options_acquisition": {},
+            "containers": {},
+        }
+
+    monkeypatch.setattr(cli, "_runtime_snapshot", snapshot)
+    monkeypatch.setattr(cli, "_assert_monotonic_runtime", lambda *_: None)
+    cli._monitor_runtime(
+        SimpleNamespace(
+            output_directory=tmp_path,
+            monitor_seconds=0.001,
+        ),
+        object(),
+        _authority(),
+        {},
+        "sha256:" + "1" * 64,
+        "a" * 64,
+        session_stop,
+        monitor_stop,
+        failures,
+    )
+
+    reports = sorted((tmp_path / "monitoring").glob("failure-*.json"))
+    assert calls == [1, 2, 3]
+    assert session_stop.is_set() is False
+    assert failures == []
+    assert len(reports) == 2
+    assert all(
+        json.loads(path.read_text(encoding="utf-8"))["terminal"] is False
+        for path in reports
+    )
+
+
+def test_runtime_monitor_resumes_after_existing_immutable_samples(
+    monkeypatch,
+    tmp_path,
+):
+    monitoring = tmp_path / "monitoring"
+    monitoring.mkdir()
+    prior = {
+        "schema": "advanced-realtime-v3-runtime-monitor-sample-v1",
+        "interval_seconds": 15,
+        "identity_sha256": "a" * 64,
+        "database": {"equity": {}, "options": {
+            "consumer_checkpoints": {}, "resident_barriers": {},
+        }},
+        "options_acquisition": {},
+        "containers": {},
+    }
+    cli._write_runtime_report(monitoring / "sample-00001.json", prior)
+    monitor_stop = threading.Event()
+
+    def snapshot(*_args, **_kwargs):
+        monitor_stop.set()
+        return {key: value for key, value in prior.items() if key != "schema"}
+
+    monkeypatch.setattr(cli, "_runtime_snapshot", snapshot)
+    monkeypatch.setattr(cli, "_assert_monotonic_runtime", lambda *_: None)
+    cli._monitor_runtime(
+        SimpleNamespace(output_directory=tmp_path, monitor_seconds=0.001),
+        object(), _authority(), {}, "sha256:" + "1" * 64,
+        "a" * 64, threading.Event(), monitor_stop, [],
+    )
+
+    assert (monitoring / "sample-00001.json").is_file()
+    assert (monitoring / "sample-00002.json").is_file()
+
+
+def test_runtime_monitor_stops_immediately_for_identity_corruption(
+    monkeypatch,
+    tmp_path,
+):
+    monitor_stop = threading.Event()
+    session_stop = threading.Event()
+    failures = []
+    monkeypatch.setattr(
+        cli,
+        "_runtime_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("runtime identity diverged from final GO")
+        ),
+    )
+
+    cli._monitor_runtime(
+        SimpleNamespace(
+            output_directory=tmp_path,
+            monitor_seconds=0.001,
+        ),
+        object(),
+        _authority(),
+        {},
+        "sha256:" + "1" * 64,
+        "a" * 64,
+        session_stop,
+        monitor_stop,
+        failures,
+    )
+
+    report = json.loads(next(
+        (tmp_path / "monitoring").glob("failure-*.json")
+    ).read_text(encoding="utf-8"))
+    assert session_stop.is_set() is True
+    assert len(failures) == 1
+    assert report["classification"] == "FATAL_IDENTITY_OR_INTEGRITY"
+    assert report["terminal"] is True
+
+
+def test_coordinator_identity_allows_only_exact_owned_resume(
+    monkeypatch,
+    tmp_path,
+):
+    authority = _authority()
+    acquisition_path = tmp_path / "acquisition.json"
+    acquisition_path.write_text("{}", encoding="utf-8")
+    output = tmp_path / "run"
+    monkeypatch.setattr(
+        cli,
+        "acquisition_binding_from_payload",
+        lambda _value: SimpleNamespace(binding_sha256="f" * 64),
+    )
+    args = SimpleNamespace(
+        output_directory=output,
+        acquisition_binding=acquisition_path,
+        resume=True,
+    )
+
+    assert cli._initialize_coordinator_identity(args, authority) is False
+    identity = json.loads(
+        (output / "COORDINATOR.json").read_text(encoding="utf-8")
+    )
+    assert identity["authorization_sha256"] == (
+        authority.authorization_sha256
+    )
+    assert cli._initialize_coordinator_identity(args, authority) is True
+
+    identity["authorization_sha256"] = "0" * 64
+    (output / "COORDINATOR.json").write_text(
+        json.dumps(identity),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="resume identity changed"):
+        cli._initialize_coordinator_identity(args, authority)
+
+
+def test_coordinator_reuses_complete_topology_but_rejects_partial(
+    monkeypatch,
+):
+    services = (*cli.EQUITY_SERVICES, *cli.OPTIONS_SERVICES)
+    starts = []
+    args = SimpleNamespace()
+
+    monkeypatch.setattr(
+        cli,
+        "_compose_command",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout="\n".join(
+                f"container-{index}"
+                for index, _service in enumerate(services)
+            ).encode("ascii")
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_start_services",
+        lambda _args: starts.append(True),
+    )
+
+    assert cli._reconcile_or_start_services(
+        args,
+        resuming=True,
+    ) == "RECONCILED_EXISTING"
+    assert starts == []
+
+    monkeypatch.setattr(
+        cli,
+        "_compose_command",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout=b"only-one\n"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="partial container topology"):
+        cli._reconcile_or_start_services(args, resuming=True)
+
+
+def test_coordinator_refuses_restart_over_active_durable_owners(monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "_cleanup_database_state",
+        lambda *_args: {
+            "active_stream_sessions": 1,
+            "active_worker_leases": 0,
+            "open_or_ambiguous_provider_requests": 0,
+        },
+    )
+    with pytest.raises(RuntimeError, match="durable streams"):
+        cli._assert_resume_can_start_services(object(), _authority(), {})
+
+
+def test_coordinator_preserves_terminal_failed_window_on_resume(tmp_path):
+    window = _authority().windows[1]
+    failure = {
+        "contract": cli.ADVANCED_SESSION_SCHEDULER_VERSION,
+        "status": "FAILED_CYCLE",
+        "window": window.key,
+        "error_type": "RuntimeError",
+        "message": "explicit missed window",
+    }
+    (tmp_path / f"{window.key}-failure.json").write_text(
+        json.dumps(failure),
+        encoding="utf-8",
+    )
+
+    assert cli._existing_terminal_cycle_failure(
+        tmp_path,
+        window,
+    ) == failure
 
 
 def test_secret_cleanup_refuses_unowned_paths(tmp_path):

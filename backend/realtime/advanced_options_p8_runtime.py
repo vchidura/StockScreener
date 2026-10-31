@@ -674,7 +674,10 @@ class P8DownstreamBindingStore:
     def _binding_path(self, sequence: int) -> Path:
         return self.root / f"{sequence:03d}.json"
 
-    def bindings(self) -> tuple[P8DownstreamBinding, ...]:
+    def _binding_partial_path(self, sequence: int) -> Path:
+        return self.root / f"{sequence:03d}.json.partial"
+
+    def _read_chain(self) -> tuple[P8DownstreamBinding, ...]:
         bindings = tuple(
             p8_downstream_binding_from_payload(_json(path))
             for path in sorted(self.root.glob("[0-9][0-9][0-9].json"))
@@ -689,24 +692,41 @@ class P8DownstreamBindingStore:
             ):
                 raise RuntimeError("P8 downstream binding chain changed")
             previous = binding.binding_sha256
-        if self.latest_path.exists():
-            latest = _json(self.latest_path)
-            if (
-                latest.get("schema") != P8_DOWNSTREAM_LATEST_SCHEMA
-                or not bindings
-                or latest.get("sequence") != bindings[-1].sequence
-                or latest.get("binding_sha256")
-                != bindings[-1].binding_sha256
-                or latest.get("file") != self._binding_path(
-                    bindings[-1].sequence
-                ).name
-            ):
-                raise RuntimeError(
-                    "P8 downstream latest binding changed"
-                )
-        elif bindings:
-            raise RuntimeError("P8 downstream latest binding is unavailable")
         return bindings
+
+    def _validate_pointer(
+        self,
+        bindings: tuple[P8DownstreamBinding, ...],
+    ) -> bool:
+        """Return False only for a bounded concurrent publication race."""
+        if not self.latest_path.exists():
+            # A complete numbered tail is itself durable and recoverable. The
+            # pointer is an acceleration/index record, not the commit record.
+            return True
+        latest = _json(self.latest_path)
+        sequence = latest.get("sequence")
+        if (
+            latest.get("schema") != P8_DOWNSTREAM_LATEST_SCHEMA
+            or type(sequence) is not int
+            or sequence < 1
+        ):
+            raise RuntimeError("P8 downstream latest binding changed")
+        if sequence > len(bindings):
+            return False
+        pointed = bindings[sequence - 1]
+        if (
+            latest.get("binding_sha256") != pointed.binding_sha256
+            or latest.get("file") != self._binding_path(sequence).name
+        ):
+            raise RuntimeError("P8 downstream latest binding changed")
+        return True
+
+    def bindings(self) -> tuple[P8DownstreamBinding, ...]:
+        for _ in range(3):
+            bindings = self._read_chain()
+            if self._validate_pointer(bindings):
+                return bindings
+        raise RuntimeError("P8 downstream latest binding raced publication")
 
     def latest(self) -> P8DownstreamBinding | None:
         bindings = self.bindings()
@@ -731,6 +751,7 @@ class P8DownstreamBindingStore:
             stored = p8_downstream_binding_from_payload(_json(path))
             if stored != binding:
                 raise RuntimeError("P8 downstream binding replay diverged")
+            self._publish_latest(latest or stored)
             return stored
         if (
             binding.sequence != expected_sequence
@@ -749,25 +770,42 @@ class P8DownstreamBindingStore:
             )
             + "\n"
         ).encode("utf-8")
-        with path.open("xb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
+        temporary_binding = self._binding_partial_path(binding.sequence)
+        if temporary_binding.exists():
+            try:
+                partial = p8_downstream_binding_from_payload(
+                    _json(temporary_binding)
+                )
+            except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                partial = None
+            if partial == binding:
+                os.replace(temporary_binding, path)
+            else:
+                temporary_binding.unlink()
+        if not path.exists():
+            with temporary_binding.open("xb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_binding, path)
+        self._publish_latest(binding)
+        return binding
+
+    def _publish_latest(self, binding: P8DownstreamBinding) -> None:
         latest_value = {
             "schema": P8_DOWNSTREAM_LATEST_SCHEMA,
             "sequence": binding.sequence,
             "binding_sha256": binding.binding_sha256,
-            "file": path.name,
+            "file": self._binding_path(binding.sequence).name,
         }
         temporary = self.latest_path.with_suffix(".partial")
-        with temporary.open("xb") as stream:
+        with temporary.open("wb") as stream:
             stream.write((
                 json.dumps(latest_value, indent=2, sort_keys=True) + "\n"
             ).encode("utf-8"))
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, self.latest_path)
-        return binding
 
 
 def _inside(root: Path, path: Path, name: str) -> Path:

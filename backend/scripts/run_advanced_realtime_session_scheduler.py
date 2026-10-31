@@ -150,6 +150,10 @@ PREOPEN_IDENTITY_OFFSET = timedelta(minutes=10)
 PREOPEN_FINAL_GO_OFFSET = timedelta(minutes=15)
 MONITOR_INTERVAL_SECONDS = 15
 MAX_SERVICE_RESTARTS = 3
+MAX_CONSECUTIVE_MONITOR_FAILURES = 3
+COORDINATOR_IDENTITY_SCHEMA = (
+    "advanced-realtime-v3-coordinator-identity-v1"
+)
 EXPECTED_SECRET_FILES = frozenset({
     "realtime_v2_app_dsn",
     "realtime_v2_api_dsn",
@@ -417,6 +421,7 @@ def parse_args(argv=None):
         default=MONITOR_INTERVAL_SECONDS,
     )
     run.add_argument("--continuous", action="store_true")
+    run.add_argument("--resume", action="store_true")
     run.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     for name in (
@@ -522,7 +527,13 @@ def parse_args(argv=None):
             or args.monitor_seconds != MONITOR_INTERVAL_SECONDS
             or not args.continuous
             or not args.execute
-            or args.output_directory.exists()
+            or (
+                args.output_directory.exists()
+                and (
+                    not args.resume
+                    or not args.output_directory.is_dir()
+                )
+            )
             or not args.acquisition_binding.is_file()
             or not args.secret_directory.is_dir()
             or not args.freeze_report.is_file()
@@ -530,7 +541,8 @@ def parse_args(argv=None):
         ):
             parser.error(
                 "session scheduler requires exact target database, a new "
-                "output directory and --continuous --execute"
+                "output directory (or owned --resume directory) and "
+                "--continuous --execute"
             )
     return args
 
@@ -589,9 +601,8 @@ def _prepare_authorization(args):
         raise ValueError(
             "scheduler package or session identity is invalid"
         )
-    decision_stop = build_advanced_session_windows(
-        args.session_date
-    )[-1].latest_options_cutoff
+    windows = build_advanced_session_windows(args.session_date)
+    decision_stop = windows[-1].latest_options_cutoff
     provider_contract = AdvancedSessionProviderContract(
         budget=ProviderBudgetScope(
             account_alias="MASSIVE_ADVANCED",
@@ -603,9 +614,9 @@ def _prepare_authorization(args):
                 args.provider_authorization_reference
             ),
             expected_cost=args.expected_cost,
-            request_ceiling=78,
+            request_ceiling=len(windows),
             decoded_byte_ceiling=(
-                78 * args.response_byte_ceiling
+                len(windows) * args.response_byte_ceiling
             ),
             lanes=frozenset({ADVANCED_SESSION_OPTIONS_LANE}),
             authorized_until=decision_stop,
@@ -642,7 +653,7 @@ def _prepare_authorization(args):
         "provider_contract_sha256": provider_contract.sha256,
         "package_sha256": package_sha256,
         "bundle_sha256": bundle_sha256,
-        "options_rest_request_ceiling": 78,
+        "options_rest_request_ceiling": len(windows),
         "options_rest_decoded_byte_ceiling": (
             provider_contract.budget.decoded_byte_ceiling
         ),
@@ -1061,7 +1072,7 @@ class _ProductionPort:
         latest = self._downstream_bindings.latest()
         downstream = build_p8_downstream_binding(
             session_binding=self._session_binding,
-            sequence=window.index,
+            sequence=(1 if latest is None else latest.sequence + 1),
             previous_binding_sha256=(
                 None if latest is None else latest.binding_sha256
             ),
@@ -2206,6 +2217,104 @@ def _write_runtime_report(path, value):
     return report
 
 
+def _read_verified_runtime_report(path: Path, schema: str):
+    report = _read_json(path)
+    semantic = report.get("semantic_sha256")
+    unsigned = {
+        key: value
+        for key, value in report.items()
+        if key != "semantic_sha256"
+    }
+    if (
+        report.get("schema") != schema
+        or semantic != canonical_sha256(unsigned)
+    ):
+        raise RuntimeError(f"runtime report identity changed: {path.name}")
+    return report
+
+
+def _initialize_coordinator_identity(args, authority):
+    existed = args.output_directory.exists()
+    if existed and not args.resume:
+        raise RuntimeError("existing coordinator output requires --resume")
+    if not existed:
+        args.output_directory.mkdir()
+    acquisition = acquisition_binding_from_payload(
+        _read_json(args.acquisition_binding)
+    )
+    identity = {
+        "schema": COORDINATOR_IDENTITY_SCHEMA,
+        "coordinator_id": str(uuid5(
+            NAMESPACE_URL,
+            (
+                "stockscreener:advanced-realtime-v3-coordinator:"
+                f"{authority.authorization_sha256}"
+            ),
+        )),
+        "authorization_id": str(authority.authorization_id),
+        "authorization_sha256": authority.authorization_sha256,
+        "session_date": authority.session_date.isoformat(),
+        "package_sha256": authority.package_sha256,
+        "bundle_sha256": authority.bundle_sha256,
+        "options_session_authorization_sha256": (
+            authority.options_session_authorization_sha256
+        ),
+        "acquisition_binding_sha256": acquisition.binding_sha256,
+    }
+    identity["semantic_sha256"] = canonical_sha256(identity)
+    path = args.output_directory / "COORDINATOR.json"
+    if existed:
+        if not path.is_file() or _read_json(path) != identity:
+            raise RuntimeError("coordinator resume identity changed")
+        if (args.output_directory / "CLEANUP.json").exists():
+            raise RuntimeError("completed coordinator scope cannot resume")
+        return True
+    _write_json(path, identity)
+    return False
+
+
+def _monitor_failure_is_fatal(error: BaseException) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "identity changed",
+            "identity diverged",
+            "binding changed",
+            "journal identity",
+            "monotonic counters regressed",
+            "unauthorized ownership",
+        )
+    )
+
+
+def _monitor_resume_state(directory: Path, prefix: str):
+    samples = sorted(directory.glob(f"{prefix}sample-*.json"))
+    failures = sorted(directory.glob(f"{prefix}failure-*.json"))
+
+    def index(path):
+        try:
+            return int(path.stem.rsplit("-", 1)[1])
+        except (IndexError, ValueError) as error:
+            raise RuntimeError("monitor evidence filename changed") from error
+
+    previous = None
+    if samples:
+        previous = _read_verified_runtime_report(
+            samples[-1],
+            (
+                "advanced-realtime-v3-preopen-monitor-sample-v1"
+                if prefix == "preopen-"
+                else "advanced-realtime-v3-runtime-monitor-sample-v1"
+            ),
+        )
+    return (
+        previous,
+        max((index(path) for path in samples), default=0),
+        max((index(path) for path in failures), default=0),
+    )
+
+
 def _monitor_runtime(
     args,
     provider,
@@ -2217,10 +2326,13 @@ def _monitor_runtime(
     monitor_stop,
     failures,
 ):
-    previous = None
-    sample_index = 0
     monitoring_directory = args.output_directory / "monitoring"
     monitoring_directory.mkdir(exist_ok=True)
+    previous, sample_index, failure_index = _monitor_resume_state(
+        monitoring_directory,
+        "",
+    )
+    consecutive_failures = 0
     while not monitor_stop.wait(args.monitor_seconds):
         try:
             allow_provider_stopped = (
@@ -2252,10 +2364,19 @@ def _monitor_runtime(
                 },
             )
             previous = sample
-        except BaseException as error:
-            failures.append(error)
+            consecutive_failures = 0
+        except Exception as error:
+            failure_index += 1
+            consecutive_failures += 1
+            fatal = _monitor_failure_is_fatal(error)
+            terminal = (
+                fatal
+                or consecutive_failures
+                >= MAX_CONSECUTIVE_MONITOR_FAILURES
+            )
             _write_runtime_report(
-                monitoring_directory / "failure.json",
+                monitoring_directory
+                / f"failure-{failure_index:05d}.json",
                 {
                     "schema": (
                         "advanced-realtime-v3-runtime-monitor-failure-v1"
@@ -2263,10 +2384,19 @@ def _monitor_runtime(
                     "failed_at_utc": datetime.now(UTC).isoformat(),
                     "error_type": type(error).__name__,
                     "message": str(error),
+                    "classification": (
+                        "FATAL_IDENTITY_OR_INTEGRITY"
+                        if fatal
+                        else "TRANSIENT_TELEMETRY_OR_READINESS"
+                    ),
+                    "consecutive_failures": consecutive_failures,
+                    "terminal": terminal,
                 },
             )
-            session_stop.set()
-            return
+            if terminal:
+                failures.append(error)
+                session_stop.set()
+                return
 
 
 def _monitor_preopen_runtime(
@@ -2276,9 +2406,13 @@ def _monitor_preopen_runtime(
     monitor_stop,
     failures,
 ):
-    sample_index = 0
     monitoring_directory = args.output_directory / "monitoring"
     monitoring_directory.mkdir(exist_ok=True)
+    _previous, sample_index, failure_index = _monitor_resume_state(
+        monitoring_directory,
+        "preopen-",
+    )
+    consecutive_failures = 0
     while not monitor_stop.wait(args.monitor_seconds):
         try:
             containers = _runtime_container_state(
@@ -2308,10 +2442,19 @@ def _monitor_preopen_runtime(
                     },
                 },
             )
-        except BaseException as error:
-            failures.append(error)
+            consecutive_failures = 0
+        except Exception as error:
+            failure_index += 1
+            consecutive_failures += 1
+            fatal = _monitor_failure_is_fatal(error)
+            terminal = (
+                fatal
+                or consecutive_failures
+                >= MAX_CONSECUTIVE_MONITOR_FAILURES
+            )
             _write_runtime_report(
-                monitoring_directory / "preopen-failure.json",
+                monitoring_directory
+                / f"preopen-failure-{failure_index:05d}.json",
                 {
                     "schema": (
                         "advanced-realtime-v3-preopen-monitor-failure-v1"
@@ -2319,10 +2462,19 @@ def _monitor_preopen_runtime(
                     "failed_at_utc": datetime.now(UTC).isoformat(),
                     "error_type": type(error).__name__,
                     "message": str(error),
+                    "classification": (
+                        "FATAL_IDENTITY_OR_INTEGRITY"
+                        if fatal
+                        else "TRANSIENT_TELEMETRY_OR_READINESS"
+                    ),
+                    "consecutive_failures": consecutive_failures,
+                    "terminal": terminal,
                 },
             )
-            session_stop.set()
-            return
+            if terminal:
+                failures.append(error)
+                session_stop.set()
+                return
 
 
 def _read_runtime_status(output_directory):
@@ -2335,7 +2487,7 @@ def _read_runtime_status(output_directory):
         ),
         key=lambda path: path.stat().st_mtime_ns,
     )
-    failures = sorted(monitoring_directory.glob("*failure.json"))
+    failures = sorted(monitoring_directory.glob("*failure*.json"))
     gates = {}
     for name in (
         "PREOPEN-HEALTH.json",
@@ -2378,6 +2530,44 @@ def _assert_services_absent(args):
         raise RuntimeError(
             "session scheduler refuses pre-existing target containers"
         )
+
+
+def _reconcile_or_start_services(args, *, resuming):
+    completed = _compose_command(
+        args,
+        "ps",
+        "--all",
+        "--quiet",
+        *EQUITY_SERVICES,
+        *OPTIONS_SERVICES,
+    )
+    identifiers = completed.stdout.decode(
+        "utf-8",
+        errors="replace",
+    ).split()
+    if not identifiers:
+        _start_services(args)
+        return "STARTED"
+    if not resuming:
+        raise RuntimeError(
+            "session scheduler refuses pre-existing target containers"
+        )
+    expected = len(EQUITY_SERVICES) + len(OPTIONS_SERVICES)
+    if len(set(identifiers)) != expected:
+        raise RuntimeError(
+            "coordinator resume found a partial container topology"
+        )
+    return "RECONCILED_EXISTING"
+
+
+def _assert_resume_can_start_services(provider, authority, bundle):
+    state = _cleanup_database_state(provider, authority, bundle)
+    if any(state.values()):
+        raise RuntimeError(
+            "coordinator resume refuses new containers while durable "
+            "streams, leases, or provider requests remain active"
+        )
+    return state
 
 
 def _start_services(args):
@@ -2440,12 +2630,13 @@ def _close_seal(
     )
     if (
         snapshot["identity_sha256"] != baseline_identity_sha256
-        or len(results) != 78
+        or len(results) != len(authority.windows)
         or any(
             row.get("status") != "COMPLETE_PUBLISHED_PINNED"
             for row in results
         )
-        or results[-1].get("window", {}).get("index") != 78
+        or results[-1].get("window", {}).get("index")
+        != len(authority.windows)
     ):
         raise RuntimeError("close seal evidence is incomplete")
     expected_release_id = str(results[-1]["release_id"])
@@ -2612,6 +2803,20 @@ def _write_cycle_report(path: Path, report: dict[str, object]):
     _write_json(path, document)
 
 
+def _existing_terminal_cycle_failure(output_directory, window):
+    path = output_directory / f"{window.key}-failure.json"
+    if not path.is_file():
+        return None
+    failure = _read_json(path)
+    if (
+        failure.get("contract") != ADVANCED_SESSION_SCHEDULER_VERSION
+        or failure.get("status") != "FAILED_CYCLE"
+        or failure.get("window") != window.key
+    ):
+        raise RuntimeError("stored scheduler failure identity changed")
+    return failure
+
+
 def _write_cycle_deadline_report(
     args,
     window,
@@ -2709,11 +2914,17 @@ def _run(args):
         or session.acquisition_stop < authority.decision_stop
     ):
         raise ValueError("session scheduler artifact identity changed")
-    args.output_directory.mkdir()
+    resuming = _initialize_coordinator_identity(args, authority)
     args.downstream_binding_directory = (
         args.output_directory / "downstream-bindings"
     )
-    args.downstream_binding_directory.mkdir()
+    if resuming:
+        if not args.downstream_binding_directory.is_dir():
+            raise RuntimeError(
+                "coordinator downstream binding state is unavailable"
+            )
+    else:
+        args.downstream_binding_directory.mkdir()
     os.environ[
         "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH"
     ] = str(args.downstream_binding_directory)
@@ -2727,6 +2938,7 @@ def _run(args):
     cleanup = {"status": "NOT_STARTED"}
     exit_code = 1
     owns_scope = False
+    cleanup_authorized = False
     monitor_failures = []
     monitor_thread = None
     preopen_monitor_thread = None
@@ -2736,14 +2948,31 @@ def _run(args):
         frozen_identities["acquisition_image_id"]
     )
     try:
-        _assert_services_absent(args)
-        owns_scope = True
         _wait_until(
             authority.acquisition_start,
             stop,
             args.poll_seconds,
         )
-        _start_services(args)
+        if resuming:
+            existing = _compose_command(
+                args,
+                "ps",
+                "--all",
+                "--quiet",
+                *EQUITY_SERVICES,
+                *OPTIONS_SERVICES,
+            ).stdout.strip()
+            if not existing:
+                _assert_resume_can_start_services(
+                    provider,
+                    authority,
+                    bundle,
+                )
+        service_reconciliation = _reconcile_or_start_services(
+            args,
+            resuming=resuming,
+        )
+        owns_scope = service_reconciliation == "STARTED"
         preopen_monitor_thread = threading.Thread(
             target=_monitor_preopen_runtime,
             args=(
@@ -2763,55 +2992,92 @@ def _run(args):
             stop,
             args.poll_seconds,
         )
-        health_containers = _runtime_container_state(
-            args,
-            backend_image_id=backend_image_id,
-        )
-        _write_runtime_report(
-            args.output_directory / "PREOPEN-HEALTH.json",
-            {
-                "schema": "advanced-realtime-v3-preopen-health-v1",
-                "gate_utc": gate_times["health"].isoformat(),
-                "checked_at_utc": datetime.now(UTC).isoformat(),
-                "status": "PASS",
-                "containers": health_containers,
-            },
-        )
+        health_path = args.output_directory / "PREOPEN-HEALTH.json"
+        if resuming and health_path.is_file():
+            health_report = _read_verified_runtime_report(
+                health_path,
+                "advanced-realtime-v3-preopen-health-v1",
+            )
+            if health_report.get("status") != "PASS":
+                raise RuntimeError("resumed pre-open health is not PASS")
+        else:
+            health_containers = _runtime_container_state(
+                args,
+                backend_image_id=backend_image_id,
+            )
+            _write_runtime_report(
+                health_path,
+                {
+                    "schema": "advanced-realtime-v3-preopen-health-v1",
+                    "gate_utc": gate_times["health"].isoformat(),
+                    "checked_at_utc": datetime.now(UTC).isoformat(),
+                    "status": "PASS",
+                    "containers": health_containers,
+                },
+            )
         _wait_until(
             gate_times["identity"],
             stop,
             args.poll_seconds,
         )
-        identity_snapshot = _runtime_snapshot(
-            args,
-            provider,
-            authority,
-            bundle,
-            backend_image_id=backend_image_id,
-            require_preopen=True,
-        )
-        _write_runtime_report(
-            args.output_directory / "PREOPEN-IDENTITY.json",
-            {
-                "schema": "advanced-realtime-v3-preopen-identity-v1",
-                "gate_utc": gate_times["identity"].isoformat(),
-                "status": "PASS",
-                **identity_snapshot,
-            },
-        )
+        identity_path = args.output_directory / "PREOPEN-IDENTITY.json"
+        if resuming and identity_path.is_file():
+            identity_snapshot = _read_verified_runtime_report(
+                identity_path,
+                "advanced-realtime-v3-preopen-identity-v1",
+            )
+            if identity_snapshot.get("status") != "PASS":
+                raise RuntimeError("resumed pre-open identity is not PASS")
+        else:
+            identity_snapshot = _runtime_snapshot(
+                args,
+                provider,
+                authority,
+                bundle,
+                backend_image_id=backend_image_id,
+                require_preopen=True,
+            )
+            owns_scope = True
+            _write_runtime_report(
+                identity_path,
+                {
+                    "schema": "advanced-realtime-v3-preopen-identity-v1",
+                    "gate_utc": gate_times["identity"].isoformat(),
+                    "status": "PASS",
+                    **identity_snapshot,
+                },
+            )
         _wait_until(
             gate_times["final_go"],
             stop,
             args.poll_seconds,
         )
-        final_go_snapshot = _runtime_snapshot(
+        final_go_path = args.output_directory / "FINAL-GO.json"
+        recovered_snapshot = _runtime_snapshot(
             args,
             provider,
             authority,
             bundle,
             backend_image_id=backend_image_id,
-            require_preopen=True,
+            require_preopen=not (
+                resuming and final_go_path.is_file()
+            ),
         )
+        owns_scope = True
+        final_go_snapshot = recovered_snapshot
+        if resuming and final_go_path.is_file():
+            prior_final_go = _read_verified_runtime_report(
+                final_go_path,
+                "advanced-realtime-v3-final-go-v1",
+            )
+            if (
+                prior_final_go.get("decision") != "GO"
+                or prior_final_go.get("identity_sha256")
+                != recovered_snapshot["identity_sha256"]
+            ):
+                raise RuntimeError(
+                    "resumed runtime identity diverged from final GO"
+                )
         if (
             final_go_snapshot["identity_sha256"]
             != identity_snapshot["identity_sha256"]
@@ -2822,22 +3088,23 @@ def _run(args):
         baseline_identity_sha256 = final_go_snapshot[
             "identity_sha256"
         ]
-        _write_runtime_report(
-            args.output_directory / "FINAL-GO.json",
-            {
-                "schema": "advanced-realtime-v3-final-go-v1",
-                "gate_utc": gate_times["final_go"].isoformat(),
-                "decision": "GO",
-                "scheduler_armed": True,
-                "no_prewritten_cycle_authority": (
-                    final_go_snapshot["database"]["options"][
-                        "cycle_authority_count"
-                    ]
-                    == 0
-                ),
-                **final_go_snapshot,
-            },
-        )
+        if not final_go_path.exists():
+            _write_runtime_report(
+                final_go_path,
+                {
+                    "schema": "advanced-realtime-v3-final-go-v1",
+                    "gate_utc": gate_times["final_go"].isoformat(),
+                    "decision": "GO",
+                    "scheduler_armed": True,
+                    "no_prewritten_cycle_authority": (
+                        final_go_snapshot["database"]["options"][
+                            "cycle_authority_count"
+                        ]
+                        == 0
+                    ),
+                    **final_go_snapshot,
+                },
+            )
         preopen_monitor_stop.set()
         preopen_monitor_thread.join(
             timeout=args.monitor_seconds + 5
@@ -2875,6 +3142,17 @@ def _run(args):
         for window in authority.windows:
             if stop.is_set():
                 break
+            terminal_failure = _existing_terminal_cycle_failure(
+                args.output_directory,
+                window,
+            )
+            if (
+                terminal_failure is not None
+                and not port._report_path(window).exists()
+                and datetime.now(UTC) > window.latest_options_cutoff
+            ):
+                results.append(terminal_failure)
+                continue
             while datetime.now(UTC) < window.equity_available_after:
                 if (
                     not provider_stopped
@@ -3012,10 +3290,11 @@ def _run(args):
                     **capture_stop,
                 },
             )
-        exit_code = 0 if len(results) == 78 and all(
+        exit_code = 0 if len(results) == len(authority.windows) and all(
             row["status"] == "COMPLETE_PUBLISHED_PINNED"
             for row in results
         ) else 1
+        cleanup_authorized = True
         if monitor_failures:
             raise RuntimeError(
                 "runtime monitoring failed"
@@ -3063,18 +3342,34 @@ def _run(args):
                     authority,
                     bundle,
                 )
-                if owns_scope
+                if owns_scope and (
+                    cleanup_authorized or monitor_failures
+                )
                 else {
-                    "status": "NOT_OWNED",
+                    "status": (
+                        "PRESERVED_FOR_RESUME"
+                        if owns_scope
+                        else "NOT_OWNED"
+                    ),
                     "containers": [],
                 }
             )
         finally:
             pool.closeall()
-            _write_json(
-                args.output_directory / "CLEANUP.json",
-                cleanup,
-            )
+            if cleanup.get("status") == "PRESERVED_FOR_RESUME":
+                _write_json(
+                    args.output_directory
+                    / (
+                        "COORDINATOR-INTERRUPTED-"
+                        f"{time.time_ns()}.json"
+                    ),
+                    cleanup,
+                )
+            else:
+                _write_json(
+                    args.output_directory / "CLEANUP.json",
+                    cleanup,
+                )
     if (
         cleanup.get("containers")
         or cleanup.get("stop_returncode", 0)
@@ -3178,7 +3473,9 @@ def main(argv=None) -> int:
                 first_window_index=(
                     args.completed_window_index + 1
                 ),
-                last_window_index=78,
+                last_window_index=len(
+                    build_advanced_session_windows(args.session_date)
+                ),
             ),
             services=tuple(args.service),
             tier_a_qualification_sha256=(

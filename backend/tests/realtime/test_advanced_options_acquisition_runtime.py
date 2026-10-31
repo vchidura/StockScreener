@@ -9,6 +9,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import pytest
 
 from realtime import advanced_options_acquisition_runtime as runtime
+from realtime import advanced_options_p8_runtime as p8_runtime
 from realtime.advanced_options_acquisition_runtime import (
     acquisition_binding_from_payload,
     acquisition_binding_payload,
@@ -16,6 +17,7 @@ from realtime.advanced_options_acquisition_runtime import (
     build_acquisition_binding,
     run_acquisition,
 )
+from realtime.advanced_gateway import GatewayControlError, GatewayFeedState
 from realtime.advanced_options_p8_runtime import (
     P8DownstreamBindingStore,
     P8ExecutionBundleStore,
@@ -170,6 +172,69 @@ class _Provider:
         return _Transaction()
 
 
+class _DisconnectConnection:
+    def __init__(self):
+        self.incoming = [
+            b'[{"ev":"status","status":"auth_success"}]',
+            b'[{"ev":"status","status":"success"}]',
+        ]
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def send(self, _payload):
+        return None
+
+    async def recv(self, *, decode=None):
+        del decode
+        if self.incoming:
+            return self.incoming.pop(0)
+        raise ConnectionError("provider-free disconnect")
+
+    async def close(self, *, code, reason):
+        del code, reason
+
+
+class _RejectedConnection(_DisconnectConnection):
+    def __init__(self):
+        self.incoming = [
+            b'[{"ev":"status","status":"auth_failed"}]',
+        ]
+
+
+def _install_runtime_fakes(monkeypatch, binding):
+    monkeypatch.setattr(
+        runtime,
+        "_catalog_scope",
+        lambda *_: _scope(binding),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "persist_session_acquisition_authorization_cursor",
+        lambda *_: None,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "consume_session_acquisition_authority_cursor",
+        lambda *_args, **_kwargs: None,
+    )
+
+    class _Lease:
+        def __init__(self, *_args):
+            pass
+
+        def acquire(self, **_kwargs):
+            pass
+
+        def release(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(runtime, "HostProviderSocketLease", _Lease)
+
+
 def test_acquisition_binding_has_no_equity_or_serving_authority():
     binding = _binding()
     payload = acquisition_binding_payload(binding)
@@ -275,6 +340,51 @@ def _production_binding(
     return value
 
 
+def _downstream_binding(session, sequence, *, market_index=None):
+    market_index = sequence if market_index is None else market_index
+    equity_cutoff = datetime(
+        2026,
+        10,
+        29,
+        13,
+        30 + (market_index * 5),
+        tzinfo=timezone.utc,
+    )
+    receipt_id = uuid5(NAMESPACE_URL, f"receipt:{market_index}")
+    window_id = uuid5(NAMESPACE_URL, f"window:{market_index}")
+    input_sha256 = f"{market_index:064x}"
+    history_sha256 = "a" * 64
+    equity_sha256 = f"{market_index + 10:064x}"
+    options_cutoff = equity_cutoff + timedelta(seconds=120)
+    return build_p8_downstream_binding(
+        session_binding=session,
+        sequence=sequence,
+        previous_binding_sha256=None,
+        target_window_id=window_id,
+        equity_receipt_id=receipt_id,
+        equity_input_sha256=input_sha256,
+        finalized_cutoff=equity_cutoff,
+        receipt_created_at=equity_cutoff + timedelta(seconds=30),
+        options_cutoff=options_cutoff,
+        history_binding_sha256=history_sha256,
+        equity_binding_sha256=equity_sha256,
+        options_activity_evidence_sha256=f"{market_index + 20:064x}",
+        window_cycle_authorization_sha256=f"{market_index + 30:064x}",
+        publication_authorization_reference=(
+            f"owned-publication-{market_index}"
+        ),
+        production_binding=_production_binding(
+            window_id=window_id,
+            receipt_id=receipt_id,
+            input_sha256=input_sha256,
+            equity_cutoff=equity_cutoff,
+            options_cutoff=options_cutoff,
+            history_sha256=history_sha256,
+            equity_sha256=equity_sha256,
+        ),
+    )
+
+
 def test_waiting_session_attaches_three_e_bindings_and_rehydrates(
     tmp_path,
 ):
@@ -375,6 +485,115 @@ def test_waiting_session_attaches_three_e_bindings_and_rehydrates(
         match="binding",
     ):
         rehydrated.latest()
+
+
+def test_downstream_append_sequence_does_not_require_market_window_ordinal(
+    tmp_path,
+):
+    acquisition = _binding()
+    session = build_p8_preopen_session_binding(
+        package=_waiting_package(acquisition),
+        acquisition_binding=acquisition,
+    )
+    store = P8DownstreamBindingStore(
+        tmp_path / "downstream",
+        session_binding=session,
+        create=True,
+    )
+    first = _downstream_binding(session, 1, market_index=1)
+    store.attach(first)
+    third_window = _downstream_binding(session, 2, market_index=3)
+    third_window = build_p8_downstream_binding(
+        session_binding=session,
+        sequence=2,
+        previous_binding_sha256=first.binding_sha256,
+        target_window_id=third_window.target_window_id,
+        equity_receipt_id=third_window.equity_receipt_id,
+        equity_input_sha256=third_window.equity_input_sha256,
+        finalized_cutoff=third_window.finalized_cutoff,
+        receipt_created_at=third_window.receipt_created_at,
+        options_cutoff=third_window.options_cutoff,
+        history_binding_sha256=third_window.history_binding_sha256,
+        equity_binding_sha256=third_window.equity_binding_sha256,
+        options_activity_evidence_sha256=(
+            third_window.options_activity_evidence_sha256
+        ),
+        window_cycle_authorization_sha256=(
+            third_window.window_cycle_authorization_sha256
+        ),
+        publication_authorization_reference=(
+            third_window.publication_authorization_reference
+        ),
+        production_binding=third_window.production_binding,
+    )
+
+    attached = store.attach(third_window)
+
+    assert attached.sequence == 2
+    assert attached.target_window_id == uuid5(NAMESPACE_URL, "window:3")
+    assert [item.sequence for item in store.bindings()] == [1, 2]
+
+
+def test_downstream_binding_recovers_unpointed_atomic_tail(
+    tmp_path,
+    monkeypatch,
+):
+    acquisition = _binding()
+    session = build_p8_preopen_session_binding(
+        package=_waiting_package(acquisition),
+        acquisition_binding=acquisition,
+    )
+    root = tmp_path / "downstream"
+    store = P8DownstreamBindingStore(
+        root,
+        session_binding=session,
+        create=True,
+    )
+    binding = _downstream_binding(session, 1)
+    real_replace = p8_runtime.os.replace
+
+    def interrupted_replace(source, destination):
+        if Path(destination).name == "LATEST.json":
+            raise OSError("injected pointer interruption")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(p8_runtime.os, "replace", interrupted_replace)
+    with pytest.raises(OSError, match="pointer interruption"):
+        store.attach(binding)
+
+    assert (root / "001.json").is_file()
+    assert (root / "LATEST.partial").is_file()
+    assert P8DownstreamBindingStore(
+        root,
+        session_binding=session,
+    ).latest() == binding
+
+    monkeypatch.setattr(p8_runtime.os, "replace", real_replace)
+    assert store.attach(binding) == binding
+    assert (root / "LATEST.json").is_file()
+    assert not (root / "LATEST.partial").exists()
+
+
+def test_downstream_binding_discards_only_uncommitted_corrupt_partial(
+    tmp_path,
+):
+    acquisition = _binding()
+    session = build_p8_preopen_session_binding(
+        package=_waiting_package(acquisition),
+        acquisition_binding=acquisition,
+    )
+    root = tmp_path / "downstream"
+    store = P8DownstreamBindingStore(
+        root,
+        session_binding=session,
+        create=True,
+    )
+    (root / "001.json.partial").write_text("{truncated", encoding="utf-8")
+    binding = _downstream_binding(session, 1)
+
+    assert store.attach(binding) == binding
+    assert not (root / "001.json.partial").exists()
+    assert store.latest() == binding
 
 
 def test_waiting_execution_bundle_is_receipt_free(tmp_path):
@@ -494,6 +713,222 @@ def test_acquisition_runtime_rehydrates_same_owner_and_journal(
     assert health["status"] == "READY"
     assert events.index("persist") < events.index("lease")
     assert events.index("lease") < events.index("consume")
+
+
+def test_quiet_subscribed_health_uses_process_heartbeat_not_market_activity(
+    tmp_path,
+):
+    binding = _binding()
+    current = [NOW]
+    status_path = tmp_path / "status.json"
+    publisher = runtime._AcquisitionStatusPublisher(
+        status_path,
+        binding,
+        {
+            "schema": runtime.ACQUISITION_STATUS_SCHEMA,
+            "state": "CAPTURING",
+            "binding_sha256": binding.binding_sha256,
+            "owner_id": str(binding.owner_id),
+            "journal_generation": str(
+                binding.authority.journal_generation
+            ),
+            "connection_attempts": 1,
+            "decoded_messages": 8,
+            "decoded_bytes": 100,
+            "last_raw_offset": 0,
+            "last_event_offset": 0,
+            "socket_state": GatewayFeedState.WARMING.value,
+            "subscription_ready": True,
+            "last_market_event_at_utc": None,
+            "transport_gaps": [],
+        },
+        clock=lambda: current[0],
+        interval_seconds=0.02,
+    )
+    publisher.start()
+    try:
+        current[0] = NOW + timedelta(seconds=31)
+        threading.Event().wait(0.05)
+        health = acquisition_health(
+            status_path,
+            binding,
+            checked_at=current[0],
+        )
+    finally:
+        publisher.stop()
+
+    assert health["status"] == "READY"
+    assert health["subscription_ready"] is True
+    assert health["last_market_event_at_utc"] is None
+
+
+def test_status_publisher_paces_hot_path_updates(monkeypatch, tmp_path):
+    binding = _binding()
+    writes = []
+    monkeypatch.setattr(
+        runtime,
+        "_write_json",
+        lambda _path, value: writes.append(dict(value)),
+    )
+    publisher = runtime._AcquisitionStatusPublisher(
+        tmp_path / "status.json",
+        binding,
+        {"decoded_messages": 0, "decoded_bytes": 0},
+        clock=lambda: NOW,
+        interval_seconds=60,
+    )
+    publisher.start()
+    for index in range(1000):
+        publisher.update(
+            decoded_messages=index + 1,
+            decoded_bytes=(index + 1) * 100,
+        )
+    publisher.stop()
+
+    assert len(writes) == 2
+    assert writes[-1]["decoded_messages"] == 1000
+    assert writes[-1]["decoded_bytes"] == 100_000
+
+
+def test_status_publisher_surfaces_background_storage_failure(
+    monkeypatch,
+    tmp_path,
+):
+    binding = _binding()
+    calls = []
+
+    def write(_path, _value):
+        calls.append(True)
+        if len(calls) > 1:
+            raise OSError("injected status storage failure")
+
+    monkeypatch.setattr(runtime, "_write_json", write)
+    publisher = runtime._AcquisitionStatusPublisher(
+        tmp_path / "status.json",
+        binding,
+        {"decoded_messages": 0, "decoded_bytes": 0},
+        clock=lambda: NOW,
+        interval_seconds=0.01,
+    )
+    publisher.start()
+    threading.Event().wait(0.03)
+
+    assert publisher.failed() is True
+    with pytest.raises(RuntimeError, match="status persistence failed"):
+        publisher.stop()
+
+
+def test_status_publisher_latches_synchronous_storage_failure(
+    monkeypatch,
+    tmp_path,
+):
+    binding = _binding()
+    monkeypatch.setattr(
+        runtime,
+        "_write_json",
+        lambda _path, _value: (_ for _ in ()).throw(
+            OSError("injected synchronous status storage failure")
+        ),
+    )
+    publisher = runtime._AcquisitionStatusPublisher(
+        tmp_path / "status.json",
+        binding,
+        {"decoded_messages": 0, "decoded_bytes": 0},
+        clock=lambda: NOW,
+        interval_seconds=60,
+    )
+
+    with pytest.raises(OSError, match="synchronous status"):
+        publisher.start()
+
+    assert publisher.failed() is True
+    with pytest.raises(RuntimeError, match="status persistence failed"):
+        publisher.persist()
+
+
+def test_crash_resume_burns_only_durable_reserved_budget():
+    usage = runtime._resume_budget_usage({
+        "decoded_messages": 100,
+        "decoded_bytes": 1_000,
+        "reserved_decoded_messages": 1124,
+        "reserved_decoded_bytes": 4_195_304,
+    })
+
+    assert usage == (1124, 4_195_304, 1024, 4_194_304)
+
+
+def test_acquisition_reconnects_transient_transport_and_records_gap(
+    tmp_path,
+    monkeypatch,
+):
+    binding = _binding()
+    _install_runtime_fakes(monkeypatch, binding)
+    calls = []
+
+    def connection_factory(_configuration):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            return _DisconnectConnection()
+        return _FixtureConnection(binding, now=NOW)
+
+    stop = threading.Event()
+    timer = threading.Timer(1.0, stop.set)
+    timer.start()
+    try:
+        report = run_acquisition(
+            binding,
+            provider=_Provider(),
+            api_key="provider-free",
+            journal_root=tmp_path / "journal",
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "socket.lock",
+            stop_event=stop,
+            connection_factory=connection_factory,
+            clock=lambda: NOW,
+            monotonic_ns=lambda: 100,
+            diagnostic=True,
+        )
+    finally:
+        timer.cancel()
+
+    assert report["connection_attempts"] == 2
+    assert report["transport_gaps"] == [{
+        "attempt": 1,
+        "status": "RECONNECTED",
+        "disconnected_at_utc": NOW.isoformat(),
+        "error_type": "ConnectionError",
+        "reconnected_at_utc": NOW.isoformat(),
+    }]
+    assert report["last_market_event_at_utc"] == NOW.isoformat()
+
+
+def test_acquisition_does_not_retry_permanent_provider_rejection(
+    tmp_path,
+    monkeypatch,
+):
+    binding = _binding()
+    _install_runtime_fakes(monkeypatch, binding)
+    status_path = tmp_path / "status.json"
+
+    with pytest.raises(GatewayControlError, match="ADVANCED_AUTH_REJECTED"):
+        run_acquisition(
+            binding,
+            provider=_Provider(),
+            api_key="provider-free",
+            journal_root=tmp_path / "journal",
+            status_path=status_path,
+            lock_path=tmp_path / "socket.lock",
+            stop_event=threading.Event(),
+            connection_factory=lambda _: _RejectedConnection(),
+            clock=lambda: NOW,
+            monotonic_ns=lambda: 100,
+            diagnostic=True,
+        )
+
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["connection_attempts"] == 1
+    assert status["state"] == "FAILED_PERMANENT"
+    assert status["failure_class"] == "PERMANENT_PROVIDER_OR_SAFETY"
 
 
 def test_compose_exposes_only_the_acquisition_role():
