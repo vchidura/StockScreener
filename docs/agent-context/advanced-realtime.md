@@ -10,7 +10,7 @@ self-reconciling continuous worker for local and Docker development.
 Canonical design and assessment:
 [REALTIME_V3_PIPELINE.md](../REALTIME_V3_PIPELINE.md).
 
-Mode: consolidation packages C0/C1 implemented and validated; review pending.
+Mode: C0/C1 committed at `eafe5f7`; C2 implemented and validated, review pending.
 
 ## Settled Runtime Decisions
 
@@ -42,7 +42,7 @@ Mode: consolidation packages C0/C1 implemented and validated; review pending.
 
 ## Main Integration Gaps
 
-- Select one desired-universe source and automatically snapshot it per session.
+- Wire durable desired-state reconciliation into the continuous lifecycle owner.
 - Remove fixed initial date/cutoff/authorization arguments from normal resident startup.
 - Generalize exact target-9 and exact-four QQQ/SPY assertions across bindings,
   scheduler counts, Stock Alerts and tests.
@@ -80,8 +80,37 @@ Mode: consolidation packages C0/C1 implemented and validated; review pending.
   writer.
 - Exact target-9 and exact-four QQQ/SPY validation remains active. No provider,
   schema, Docker, publication or database effects ran.
-- PostgreSQL session state, desired-universe storage and old-path retirement are not
-  started.
+- C2 leaves the compatibility seam unchanged. Old-path retirement is not started.
+
+## C2 Completion Evidence
+
+- Migration `039_realtime_desired_state` adds append-only desired revisions and role
+  members, one scoped mutable current-revision pointer, mutable per-member
+  `WARMING`/`READY`/`FAILED` preparation, and an append-only link to canonical
+  immutable session objects. It adds no coordinator, provider authority or
+  publication pointer.
+- The provider-free maintenance command records only identities already present in
+  `ref.security_revisions`, `rt.instruments` and a stored manifest/slot-set
+  lineage. Invalid or ambiguous identities fail explicitly.
+- Current selection is deterministic by effective session, revision timestamp and
+  revision ID. Same-session corrections keep prior evidence and replay cannot move
+  the pointer backwards.
+- Before-open changes target the upcoming XNYS session. Market-hours and after-close
+  changes target the next XNYS session; the source/active session is never updated.
+- Reconciliation waits while any enabled member is `WARMING`, blocks when an enabled
+  source Equity or Options-underlying member is `FAILED`, and may omit only failed
+  new or explicitly disabled members. It idempotently creates the existing immutable
+  subscription manifest/members, SHADOW cohort, tier binding and PRE_SESSION slot set.
+- C2 preparation uses one set-based identity read, two batched desired-state writes
+  and one set-based instrument read for up to 400 names. Maintenance timestamps
+  default to aware current UTC and retain explicit test/operator overrides.
+- The default remains exact target-9 plus exact-four QQQ/SPY T/Q. C2 does not add
+  runtime count generalization, sharding, provider work, live sockets, publication,
+  Docker changes or old-path retirement.
+- Focused offline/schema tests: 39 passed. Final adjacent offline/seam selection:
+  109 passed, 1 pre-existing malformed fake negative test deselected and 5 warnings.
+  C2 plus adjacent disposable PostgreSQL control-plane and slot-set tests: 21 passed
+  with 4 existing warnings.
 
 ## Exact Anchors
 
@@ -92,8 +121,14 @@ Mode: consolidation packages C0/C1 implemented and validated; review pending.
 - `backend/realtime/advanced_realtime_session_scheduler.py`
 - `backend/realtime/advanced_options_acquisition_runtime.py`
 - `backend/realtime/advanced_options_p8_runtime.py`
+- `backend/realtime/advanced_realtime_desired_state.py`
+- `backend/realtime/advanced_realtime_desired_state_repository.py`
+- `backend/realtime/sql_v2/039_realtime_desired_state.sql`
+- `backend/scripts/manage_advanced_realtime_desired_state.py`
 - `docker-compose.realtime-v2.yml`
 
-Focused completion check: PASS. Existing bounded V3 tests run through the
-compatibility seam with identical typed session state and no provider, schema,
-Docker, publication or database effects.
+Focused completion check: PASS. A provider-free desired revision derives the next
+XNYS session, atomically selects one current revision, blocks baseline shrinkage,
+replays one immutable manifest/cohort/slot-set snapshot idempotently, defers
+market-hours edits without changing the active snapshot, and performs zero provider,
+production or publication effects.

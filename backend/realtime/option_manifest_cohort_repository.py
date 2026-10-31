@@ -24,6 +24,12 @@ def option_universe_manifest_id(manifest: SubscriptionManifest) -> UUID:
     return uuid5(NAMESPACE_URL, f"realtime-subscription:{option_universe_manifest_sha256(manifest)}")
 
 
+def equity_universe_manifest_id(manifest: SubscriptionManifest) -> UUID:
+    if manifest.universe.option_underlyings:
+        raise ValueError("equity manifest identity cannot contain Options underlyings")
+    return uuid5(NAMESPACE_URL, f"realtime-equity-subscription:{manifest.sha256}")
+
+
 def option_subscription_manifest_id(plan: SelectedContractManifestPlan) -> UUID | None:
     if plan.manifest is None:
         return None
@@ -117,6 +123,85 @@ def persist_option_universe_manifest_cursor(
         raise ValueError("persisted option subscription members are incomplete")
 
 
+def persist_equity_universe_manifest_cursor(
+    cursor,
+    manifest: SubscriptionManifest,
+    *,
+    manifest_id: UUID,
+    profile_id: UUID,
+    effective_at: datetime,
+    equity_instrument_ids: Mapping[str, int],
+) -> None:
+    universe = manifest.universe
+    equity_members = equity_manifest_members(manifest)
+    if universe.option_underlyings or len(equity_members) < len(universe.equity_tickers):
+        raise ValueError("equity universe manifest counts are outside the control plane contract")
+    if manifest_id != equity_universe_manifest_id(manifest):
+        raise ValueError("equity universe manifest id does not match its identity")
+    if set(equity_instrument_ids) != set(universe.equity_tickers):
+        raise ValueError("equity universe manifest identities are incomplete")
+    expected_members = tuple(sorted(
+        (
+            row.channel.value,
+            equity_instrument_ids[row.provider_symbol],
+            row.priority,
+            row.purpose.value,
+            False,
+        )
+        for row in equity_members
+    ))
+    expected_manifest = (
+        manifest.sha256,
+        universe.sha256,
+        str(profile_id),
+        manifest.session_date,
+        "EQUITY_VALIDATION",
+        len(universe.equity_tickers),
+        0,
+        len(equity_members),
+        manifest.allocation_policy_sha256,
+    )
+    cursor.execute(
+        "INSERT INTO rt.subscription_manifests ("
+        "manifest_id, manifest_sha256, universe_sha256, session_date, effective_at, profile_id, "
+        "manifest_kind, stock_count, option_underlying_count, member_count, allocation_policy_sha256) "
+        "VALUES (%s, %s, %s, %s, %s, %s, 'EQUITY_VALIDATION', %s, 0, %s, %s) "
+        "ON CONFLICT (manifest_id) DO NOTHING",
+        (
+            str(manifest_id), manifest.sha256, universe.sha256, manifest.session_date,
+            _utc(effective_at), str(profile_id), len(universe.equity_tickers),
+            len(equity_members), manifest.allocation_policy_sha256,
+        ),
+    )
+    cursor.execute(
+        "SELECT manifest_sha256, universe_sha256, profile_id::text, session_date, manifest_kind, "
+        "stock_count, option_underlying_count, member_count, allocation_policy_sha256 "
+        "FROM rt.subscription_manifests WHERE manifest_id=%s",
+        (str(manifest_id),),
+    )
+    stored_manifest = cursor.fetchone()
+    if stored_manifest is None or tuple(stored_manifest) != expected_manifest:
+        raise ValueError("persisted equity subscription manifest identity conflict")
+    for channel, instrument_id, priority, purpose, option_underlying in expected_members:
+        cursor.execute(
+            "INSERT INTO rt.subscription_members ("
+            "manifest_id, instrument_id, channel, priority, purpose, option_underlying) "
+            "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+            (str(manifest_id), instrument_id, channel, priority, purpose, option_underlying),
+        )
+    cursor.execute(
+        "SELECT channel, instrument_id, priority, purpose, option_underlying "
+        "FROM rt.subscription_members WHERE manifest_id=%s",
+        (str(manifest_id),),
+    )
+    stored_members = tuple(sorted(
+        (str(channel), int(instrument_id), int(priority), str(purpose), bool(option_underlying))
+        for channel, instrument_id, priority, purpose, option_underlying in cursor.fetchall()
+    ))
+    if stored_members != expected_members:
+        raise ValueError("persisted equity subscription members are incomplete")
+
+
 @dataclass(frozen=True, slots=True)
 class DeveloperForwardCohortBinding:
     configuration_sha256: str
@@ -143,7 +228,13 @@ class DeveloperForwardCohortBinding:
         )), configuration.valuation_policy_sha256, universe.sha256)
 
 
-def _shadow_cohort_identity(manifest_id, configuration_sha256, model_bundle_sha256, valuation_sha256, effective_at):
+def shadow_cohort_identity(
+    manifest_id,
+    configuration_sha256,
+    model_bundle_sha256,
+    valuation_sha256,
+    effective_at,
+):
     cohort_sha256 = canonical_sha256(dict(
         manifest_id=str(manifest_id), configuration_sha256=configuration_sha256,
         model_bundle_sha256=model_bundle_sha256, valuation_sha256=valuation_sha256,
@@ -152,13 +243,69 @@ def _shadow_cohort_identity(manifest_id, configuration_sha256, model_bundle_sha2
     return uuid5(NAMESPACE_URL, f"realtime-selected-manifest-shadow:{cohort_sha256}"), cohort_sha256
 
 
+def persist_shadow_cohort_cursor(
+    cursor,
+    *,
+    manifest_id: UUID,
+    configuration_sha256: str,
+    model_bundle_sha256: str,
+    valuation_sha256: str,
+    effective_at: datetime,
+) -> tuple[UUID, str]:
+    effective = _utc(effective_at)
+    cohort_id, cohort_sha256 = shadow_cohort_identity(
+        manifest_id,
+        configuration_sha256,
+        model_bundle_sha256,
+        valuation_sha256,
+        effective,
+    )
+    cursor.execute(
+        "INSERT INTO rt.cohorts ("
+        "cohort_id, cohort_sha256, manifest_id, configuration_sha256, "
+        "model_bundle_sha256, valuation_sha256, effective_at, mode) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, 'SHADOW') "
+        "ON CONFLICT (cohort_id) DO NOTHING",
+        (
+            str(cohort_id),
+            cohort_sha256,
+            str(manifest_id),
+            configuration_sha256,
+            model_bundle_sha256,
+            valuation_sha256,
+            effective,
+        ),
+    )
+    cursor.execute(
+        "SELECT cohort_sha256, manifest_id::text, configuration_sha256, "
+        "model_bundle_sha256, valuation_sha256, effective_at, mode "
+        "FROM rt.cohorts WHERE cohort_id=%s",
+        (str(cohort_id),),
+    )
+    stored = cursor.fetchone()
+    if (
+        stored is None
+        or stored[:5] != (
+            cohort_sha256,
+            str(manifest_id),
+            configuration_sha256,
+            model_bundle_sha256,
+            valuation_sha256,
+        )
+        or _utc(stored[5]) != effective
+        or stored[6] != "SHADOW"
+    ):
+        raise ValueError("SHADOW cohort identity conflict")
+    return cohort_id, cohort_sha256
+
+
 def developer_forward_cohort_id(plan, binding, *, effective_at):
     if (not isinstance(binding, DeveloperForwardCohortBinding) or plan.manifest is None
             or plan.status is not ManifestSelectionStatus.READY
             or plan.scope.universe.sha256 != binding.universe_sha256):
         raise ValueError("forward cohort identity requires a ready reviewed selected manifest")
     manifest_id = option_universe_manifest_id(plan.manifest)
-    return _shadow_cohort_identity(manifest_id, binding.configuration_sha256, binding.model_bundle_sha256,
+    return shadow_cohort_identity(manifest_id, binding.configuration_sha256, binding.model_bundle_sha256,
         binding.valuation_sha256, effective_at)[0]
 
 
@@ -221,7 +368,7 @@ def bind_ready_manifest_shadow_cohort_cursor(
         configuration_sha256 = cohort_binding.configuration_sha256
         model_bundle_sha256 = cohort_binding.model_bundle_sha256
         valuation_sha256 = cohort_binding.valuation_sha256
-    cohort_id, cohort_sha256 = _shadow_cohort_identity(
+    cohort_id, cohort_sha256 = shadow_cohort_identity(
         manifest_id, configuration_sha256, model_bundle_sha256, valuation_sha256, effective,
     )
     cursor.execute(

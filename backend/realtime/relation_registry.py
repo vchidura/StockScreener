@@ -98,6 +98,21 @@ RELATIONS: dict[str, Relation] = {
     "rt.slot_set_versions": _r("options", "BOUNDED", append=True),
     "rt.slot_set_members": _r("options", "BOUNDED", append=True),
     "rt.slot_set_current": _r("options", "BOUNDED", mutable=True),
+    "rt.realtime_desired_revisions": _r(
+        "control", "BOUNDED", append=True, api=True
+    ),
+    "rt.realtime_desired_current": _r(
+        "control", "BOUNDED", mutable=True, api=True
+    ),
+    "rt.realtime_desired_members": _r(
+        "control", "BOUNDED", append=True, api=True
+    ),
+    "rt.realtime_desired_member_readiness": _r(
+        "control", "BOUNDED", mutable=True, api=True
+    ),
+    "rt.realtime_desired_session_snapshots": _r(
+        "control", "BOUNDED", append=True, api=True
+    ),
     "rt.cohorts": _r("control", "BOUNDED", append=True, api=True),
     "rt.cohort_history_bindings": _r(
         "control", "BOUNDED", append=True, api=True
