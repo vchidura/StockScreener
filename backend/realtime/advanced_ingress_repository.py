@@ -663,6 +663,21 @@ def prepare_advanced_ingress_plan_cursor(
         "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
         (f"v2-advanced-authorization:{plan.authorization_id}",),
     )
+    cursor.execute(
+        "SELECT plan_id,plan_sha256 FROM rt.advanced_ingress_plans "
+        "WHERE authorization_id=%s AND session_date=%s FOR UPDATE",
+        (str(plan.authorization_id), plan.session_date),
+    )
+    existing = cursor.fetchone()
+    if existing is not None:
+        if (
+            str(existing[0]) != str(plan.plan_id)
+            or str(existing[1]) != plan.plan_sha256
+        ):
+            raise ValueError(
+                "standing authorization already has another daily plan"
+            )
+        return plan
     authorization = load_advanced_stream_authorization_cursor(
         cursor,
         plan.authorization_id,
@@ -688,21 +703,6 @@ def prepare_advanced_ingress_plan_cursor(
         raise AdvancedIngressAdmissionError(
             "daily ingress plan exceeds standing authorization"
         )
-    cursor.execute(
-        "SELECT plan_id,plan_sha256 FROM rt.advanced_ingress_plans "
-        "WHERE authorization_id=%s AND session_date=%s FOR UPDATE",
-        (str(plan.authorization_id), plan.session_date),
-    )
-    existing = cursor.fetchone()
-    if existing is not None:
-        if (
-            str(existing[0]) != str(plan.plan_id)
-            or str(existing[1]) != plan.plan_sha256
-        ):
-            raise ValueError(
-                "standing authorization already has another daily plan"
-            )
-        return plan
     cursor.execute(
         "INSERT INTO rt.advanced_ingress_plans ("
         "plan_id,plan_sha256,authorization_id,"
@@ -746,6 +746,80 @@ def prepare_advanced_ingress_plan_cursor(
         (str(plan.plan_id),),
     )
     return plan
+
+
+def load_pinned_advanced_ingress_plan_cursor(
+    cursor,
+    *,
+    cohort_id: UUID,
+    manifest_id: UUID,
+    session_date,
+) -> AdvancedIngressPlan | None:
+    cursor.execute(
+        "SELECT plan.plan_id::text,plan.plan_sha256,"
+        "plan.authorization_id::text,auth.authorization_reference,"
+        "plan.authorization_scope_sha256,plan.cohort_id::text,"
+        "plan.manifest_id::text,plan.cohort_selection_reference,"
+        "plan.session_date,plan.universe_target,plan.mode,"
+        "plan.runtime_profile_version,plan.runtime_profile_sha256,"
+        "plan.configuration_sha256,plan.runtime_policy_sha256,"
+        "plan.authorized_start_at,plan.authorized_end_at,"
+        "plan.maximum_stream_sessions,"
+        "plan.maximum_connection_attempts,plan.maximum_decoded_bytes,"
+        "plan.maximum_rest_repair_requests,"
+        "plan.maximum_rest_repair_decoded_bytes,plan.status,"
+        "usage.plan_id IS NOT NULL "
+        "FROM rt.advanced_ingress_plans AS plan "
+        "JOIN rt.advanced_stream_authorizations AS auth "
+        "USING(authorization_id) "
+        "LEFT JOIN rt.advanced_ingress_plan_usage AS usage "
+        "USING(plan_id) "
+        "WHERE plan.cohort_id=%s AND plan.manifest_id=%s "
+        "AND plan.session_date=%s "
+        "ORDER BY plan.created_at,plan.plan_id",
+        (str(cohort_id), str(manifest_id), session_date),
+    )
+    rows = tuple(cursor.fetchall())
+    if len(rows) > 1:
+        raise ValueError(
+            "desired session already has multiple ingress plans"
+        )
+    if not rows:
+        return None
+    row = rows[0]
+    if not row[23]:
+        raise AdvancedIngressAdmissionError(
+            "pinned daily ingress usage ledger is unavailable"
+        )
+    return AdvancedIngressPlan(
+        plan_id=UUID(str(row[0])),
+        plan_sha256=str(row[1]),
+        authorization_id=UUID(str(row[2])),
+        authorization_reference=str(row[3]),
+        authorization_scope_sha256=str(row[4]),
+        cohort_id=UUID(str(row[5])),
+        manifest_id=UUID(str(row[6])),
+        cohort_selection_reference=(
+            None if row[7] is None else str(row[7])
+        ),
+        session_date=row[8],
+        universe_target=int(row[9]),
+        mode=str(row[10]),
+        runtime_profile_version=str(row[11]),
+        runtime_profile_sha256=str(row[12]),
+        configuration_sha256=str(row[13]),
+        runtime_policy_sha256=str(row[14]),
+        authorized_start_at=row[15],
+        authorized_end_at=row[16],
+        budgets=AdvancedIngressBudgets(
+            int(row[17]),
+            int(row[18]),
+            int(row[19]),
+            int(row[20]),
+            int(row[21]),
+        ),
+        status=str(row[22]),
+    )
 
 
 @dataclass(frozen=True, slots=True)

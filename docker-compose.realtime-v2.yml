@@ -44,30 +44,20 @@ services:
       - stocks_realtime_v2
       - --confirm-database-name
       - stocks_realtime_v2
-      - --authorization-id
-      - ${REALTIME_V2_ADVANCED_AUTHORIZATION_ID:-00000000-0000-0000-0000-000000000000}
-      - --universe-target
-      - ${REALTIME_V2_ADVANCED_UNIVERSE_TARGET:-1}
+      - --runtime-mode
+      - continuous
       - --stream-sessions
-      - ${REALTIME_V2_ADVANCED_STREAM_SESSIONS:-1}
+      - ${REALTIME_V2_ADVANCED_STREAM_SESSIONS:-4}
       - --connection-attempts
-      - ${REALTIME_V2_ADVANCED_CONNECTION_ATTEMPTS:-1}
+      - ${REALTIME_V2_ADVANCED_CONNECTION_ATTEMPTS:-12}
       - --decoded-bytes
-      - ${REALTIME_V2_ADVANCED_DECODED_BYTES:-10485760}
-      - --rest-repair-requests
-      - ${REALTIME_V2_ADVANCED_REST_REPAIR_REQUESTS:-0}
-      - --rest-repair-decoded-bytes
-      - ${REALTIME_V2_ADVANCED_REST_REPAIR_DECODED_BYTES:-0}
+      - ${REALTIME_V2_ADVANCED_DECODED_BYTES:-1073741824}
       - --catch-up-mode
-      - ${REALTIME_V2_ADVANCED_CATCH_UP_MODE:-DISABLED}
+      - ${REALTIME_V2_ADVANCED_CATCH_UP_MODE:-AUTO}
       - --external-ingress
       - --execute
     environment:
       <<: *advanced-environment
-      REALTIME_V2_ADVANCED_CANARY_START_AT: ${REALTIME_V2_ADVANCED_CANARY_START_AT:-}
-      REALTIME_V2_ADVANCED_CANARY_END_AT: ${REALTIME_V2_ADVANCED_CANARY_END_AT:-}
-      REALTIME_V2_ADVANCED_PREFERRED_COHORT_ID: ${REALTIME_V2_ADVANCED_PREFERRED_COHORT_ID:-}
-      REALTIME_V2_ADVANCED_COHORT_SELECTION_REFERENCE: ${REALTIME_V2_ADVANCED_COHORT_SELECTION_REFERENCE:-}
       REALTIME_V2_ADVANCED_REST_REPAIR_RESPONSE_BYTE_LIMIT: ${REALTIME_V2_ADVANCED_REST_REPAIR_RESPONSE_BYTE_LIMIT:-}
       REALTIME_V2_ADVANCED_REST_REPAIR_EXPECTED_COST: ${REALTIME_V2_ADVANCED_REST_REPAIR_EXPECTED_COST:-}
       REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
@@ -95,12 +85,66 @@ services:
         - scripts/report_realtime_v2_advanced_health.py
         - --component
         - controller
-        - --authorization-id
-        - ${REALTIME_V2_ADVANCED_AUTHORIZATION_ID:-00000000-0000-0000-0000-000000000000}
+        - --runtime-mode
+        - continuous
       interval: 15s
       timeout: 10s
       retries: 4
       start_period: 30s
+
+  realtime-v2-advanced-capability-refresh:
+    <<: *backend-service
+    profiles: ["realtime-v2-advanced-provider"]
+    container_name: stock-screener-realtime-v2-advanced-capability-refresh
+    restart: unless-stopped
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - capability-refresh
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --provider-key-file
+      - /run/secrets/realtime_v2_provider_key
+      - --
+      - python
+      - -B
+      - scripts/run_realtime_v2_advanced_capability_refresh.py
+      - --database
+      - stocks_realtime_v2
+      - --confirm-database-name
+      - stocks_realtime_v2
+      - --execute
+    environment:
+      <<: *advanced-environment
+    secrets:
+      - realtime_v2_app_dsn
+      - realtime_v2_provider_key
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - capability-refresh
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --provider-key-file
+        - /run/secrets/realtime_v2_provider_key
+        - --
+        - python
+        - -B
+        - scripts/report_realtime_v2_advanced_health.py
+        - --component
+        - capability-refresh
+        - --runtime-mode
+        - continuous
+      interval: 15s
+      timeout: 10s
+      retries: 4
+      start_period: 20s
 
   realtime-v2-advanced-ingress:
     <<: *backend-service
@@ -125,8 +169,8 @@ services:
       - stocks_realtime_v2
       - --confirm-database-name
       - stocks_realtime_v2
-      - --authorization-id
-      - ${REALTIME_V2_ADVANCED_AUTHORIZATION_ID:-00000000-0000-0000-0000-000000000000}
+      - --runtime-mode
+      - continuous
       - --execute
     environment:
       <<: *advanced-environment
@@ -154,8 +198,8 @@ services:
         - scripts/report_realtime_v2_advanced_health.py
         - --component
         - ingress
-        - --authorization-id
-        - ${REALTIME_V2_ADVANCED_AUTHORIZATION_ID:-00000000-0000-0000-0000-000000000000}
+        - --runtime-mode
+        - continuous
       interval: 15s
       timeout: 10s
       retries: 4
@@ -210,8 +254,8 @@ services:
         - scripts/report_realtime_v2_advanced_health.py
         - --component
         - bridge
-        - --cohort-id
-        - ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
+        - --runtime-mode
+        - continuous
       interval: 15s
       timeout: 10s
       retries: 4
@@ -238,18 +282,10 @@ services:
       - stocks_realtime_v2
       - --confirm-database-name
       - stocks_realtime_v2
-      - --authorization-id
-      - ${REALTIME_V2_ADVANCED_AUTHORIZATION_ID:-00000000-0000-0000-0000-000000000000}
-      - --cohort-id
-      - ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
-      - --session-date
-      - ${REALTIME_V2_ADVANCED_SESSION_DATE:-2000-01-03}
-      - --first-cutoff
-      - ${REALTIME_V2_ADVANCED_FIRST_CUTOFF:-2000-01-03T14:35:00+00:00}
+      - --runtime-mode
+      - continuous
       - --finality-delay-seconds
       - ${REALTIME_V2_ADVANCED_FINALITY_DELAY_SECONDS:-5}
-      - --authorization-reference
-      - ${REALTIME_V2_ADVANCED_AUTHORIZATION_REFERENCE:-not-authorized}
       - --publication-mode
       - projection-only
       - --report-directory
@@ -278,6 +314,8 @@ services:
         - scripts/report_realtime_v2_advanced_health.py
         - --component
         - scheduler
+        - --runtime-mode
+        - continuous
       interval: 15s
       timeout: 10s
       retries: 4
@@ -306,8 +344,9 @@ services:
       - stocks_realtime_v2
       - --security-mode
       - hardened
-      - --cohort-id
-      - ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
+      - --desired-state
+      - --desired-state-drain-seconds
+      - ${REALTIME_V2_ADVANCED_DRAIN_SECONDS:-30}
       - --continuous
       - --claim-limit
       - ${REALTIME_V2_ADVANCED_FINALIZER_CLAIM_LIMIT:-1}
@@ -330,8 +369,8 @@ services:
         - scripts/report_realtime_v2_advanced_health.py
         - --component
         - finalizer
-        - --cohort-id
-        - ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
+        - --runtime-mode
+        - continuous
       interval: 15s
       timeout: 10s
       retries: 4

@@ -1,5 +1,6 @@
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
@@ -53,6 +54,70 @@ def test_effective_session_is_upcoming_before_open_and_next_during_or_after_mark
     assert effective_next_session(
         datetime(2026, 10, 31, 16, 0, tzinfo=UTC)
     ) == date(2026, 11, 2)
+
+
+def test_internal_rollover_rejects_a_non_session_target():
+    change = default_advanced_realtime_desired_state(SOURCE_COHORT)
+
+    with pytest.raises(ValueError, match="XNYS session"):
+        repository.record_desired_state_rollover_revision_cursor(
+            object(),
+            change,
+            effective_session_date=date(2026, 7, 3),
+            recorded_at=datetime(2026, 7, 3, 15, 0, tzinfo=UTC),
+        )
+
+
+def test_effective_snapshot_selection_is_bounded_when_pointer_is_next_session(
+    monkeypatch,
+):
+    active_session = date(2026, 10, 30)
+    active_revision_id = UUID(int=2)
+    revision = SimpleNamespace(
+        revision_id=active_revision_id,
+        effective_session_date=active_session,
+    )
+    snapshot = SimpleNamespace(
+        revision_id=active_revision_id,
+        session_date=active_session,
+    )
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = (
+        (date(2026, 11, 2),),
+        (str(active_revision_id),),
+    )
+    load_revision = MagicMock(return_value=revision)
+    load_snapshot = MagicMock(return_value=snapshot)
+    load_preparations = MagicMock(return_value=())
+    monkeypatch.setattr(
+        repository,
+        "load_desired_state_revision_cursor",
+        load_revision,
+    )
+    monkeypatch.setattr(
+        repository,
+        "_load_desired_snapshot_cursor",
+        load_snapshot,
+    )
+    monkeypatch.setattr(
+        repository,
+        "load_desired_member_preparations_cursor",
+        load_preparations,
+    )
+
+    result = (
+        repository.load_effective_desired_state_reconciliation_cursor(
+            cursor,
+            session_date=active_session,
+        )
+    )
+
+    assert result.state == "READY"
+    assert result.snapshot == snapshot
+    assert cursor.execute.call_count == 2
+    assert "LIMIT 1" in cursor.execute.call_args_list[1].args[0]
+    load_revision.assert_called_once_with(cursor, active_revision_id)
+    load_snapshot.assert_called_once_with(cursor, active_revision_id)
 
 
 def test_desired_state_rejects_invalid_or_unbacked_options_membership():

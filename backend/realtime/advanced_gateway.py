@@ -59,6 +59,26 @@ class GatewayControlError(RuntimeError):
         super().__init__(detail)
 
 
+class GatewaySubscriptionProbeFailure(RuntimeError):
+    def __init__(
+        self,
+        reason_code: str,
+        *,
+        received_control_messages: int,
+        received_bytes: int,
+        accepted_subscriptions: tuple[str, ...] = (),
+        rejected_subscriptions: tuple[str, ...] = (),
+        unconfirmed_subscriptions: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.received_control_messages = received_control_messages
+        self.received_bytes = received_bytes
+        self.accepted_subscriptions = accepted_subscriptions
+        self.rejected_subscriptions = rejected_subscriptions
+        self.unconfirmed_subscriptions = unconfirmed_subscriptions
+
+
 class _GatewayStopRequested(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
@@ -136,6 +156,19 @@ class GatewaySessionResult:
     library_max_queue: int = 0
     kernel_receive_buffer_bytes: int | None = None
     stop_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GatewaySubscriptionProbeResult:
+    stream_session_id: UUID
+    feed: MarketFeed
+    requested_subscriptions: tuple[str, ...]
+    accepted_subscriptions: tuple[str, ...]
+    rejected_subscriptions: tuple[str, ...]
+    received_control_messages: int
+    received_bytes: int
+    subscribe_request_bytes: int
+    transitions: tuple[GatewayFeedState, ...]
 
 
 _CHANNEL_ORDER = {
@@ -410,6 +443,214 @@ class AdvancedGateway:
                     (message,),
                 )
         return len(rows)
+
+    def _accumulate_subscription_membership(
+        self,
+        rows: tuple[dict[str, object], ...],
+        accepted: set[str],
+        rejected: set[str],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        statuses = {
+            str(row.get("status") or "").strip().lower()
+            for row in rows
+        }
+        for row in rows:
+            status = str(row.get("status") or "").strip().lower()
+            message = str(row.get("message") or "").strip()
+            if status == "success" and message.lower() == "success":
+                continue
+            prefixes = (
+                ("subscribed to:", accepted),
+                ("rejected:", rejected),
+                ("not subscribed to:", rejected),
+                ("subscription rejected:", rejected),
+            )
+            matched = False
+            for prefix, destination in prefixes:
+                if not message.lower().startswith(prefix):
+                    continue
+                destination.update(
+                    value.strip()
+                    for value in message[len(prefix):].split(",")
+                    if value.strip()
+                )
+                matched = True
+                break
+            if not matched:
+                raise GatewayControlError(
+                    "ADVANCED_SUBSCRIPTION_ACK_INVALID",
+                    tuple(statuses),
+                    (message,),
+                )
+        requested = set(self._subscriptions)
+        extras = (accepted | rejected) - requested
+        if extras:
+            raise GatewayControlError(
+                "ADVANCED_SUBSCRIPTION_ACK_SCOPE_MISMATCH",
+                tuple(statuses),
+                tuple(sorted(extras)),
+            )
+        overlap = accepted & rejected
+        if overlap:
+            raise GatewayControlError(
+                "ADVANCED_SUBSCRIPTION_ACK_CONFLICT",
+                tuple(statuses),
+                tuple(sorted(overlap)),
+            )
+        return tuple(sorted(accepted)), tuple(
+            sorted(rejected)
+        )
+
+    async def run_subscription_probe(
+        self,
+        *,
+        timeout_seconds: float = 10.0,
+        maximum_control_bytes: int = 64 * 1024,
+    ) -> GatewaySubscriptionProbeResult:
+        if not 0 < timeout_seconds <= 60:
+            raise ValueError(
+                "subscription probe timeout must be in (0, 60]"
+            )
+        if not 1024 <= maximum_control_bytes <= 1024 * 1024:
+            raise ValueError(
+                "subscription probe control-byte ceiling is invalid"
+            )
+        try:
+            return await asyncio.wait_for(
+                self._run_subscription_probe(
+                    maximum_control_bytes=maximum_control_bytes,
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError as error:
+            self._set_state(GatewayFeedState.BLOCKED)
+            accepted = tuple(sorted(self._probe_accepted))
+            rejected = tuple(sorted(self._probe_rejected))
+            raise GatewaySubscriptionProbeFailure(
+                "ADVANCED_SUBSCRIPTION_PROBE_TIMEOUT",
+                received_control_messages=self._received_messages,
+                received_bytes=self._received_bytes,
+                accepted_subscriptions=accepted,
+                rejected_subscriptions=rejected,
+                unconfirmed_subscriptions=tuple(sorted(
+                    set(self._subscriptions)
+                    - set(accepted)
+                    - set(rejected)
+                )),
+            ) from error
+        except GatewayOverload as error:
+            if (
+                error.reason_code
+                != "ADVANCED_SESSION_BYTE_CEILING_EXCEEDED"
+            ):
+                raise
+            raise GatewaySubscriptionProbeFailure(
+                "ADVANCED_SUBSCRIPTION_PROBE_BYTE_CEILING_EXCEEDED",
+                received_control_messages=self._received_messages,
+                received_bytes=self._received_bytes,
+                accepted_subscriptions=tuple(
+                    sorted(self._probe_accepted)
+                ),
+                rejected_subscriptions=tuple(
+                    sorted(self._probe_rejected)
+                ),
+                unconfirmed_subscriptions=tuple(sorted(
+                    set(self._subscriptions)
+                    - self._probe_accepted
+                    - self._probe_rejected
+                )),
+            ) from error
+
+    async def _run_subscription_probe(
+        self,
+        *,
+        maximum_control_bytes: int,
+    ) -> GatewaySubscriptionProbeResult:
+        stream_session_id = self._session_id_factory()
+        self._active_stream_session_id = stream_session_id
+        self._received_messages = 0
+        self._received_bytes = 0
+        self._maximum_received_bytes = maximum_control_bytes
+        self._stop_requested = None
+        self._stop_at = None
+        self._receive_poll_seconds = 1.0
+        self._probe_accepted = set()
+        self._probe_rejected = set()
+        subscribe_payload = json.dumps(
+            {
+                "action": "subscribe",
+                "params": ",".join(self._subscriptions),
+            },
+            separators=(",", ":"),
+        )
+        self._set_state(GatewayFeedState.CONNECTING)
+        connection = None
+        try:
+            async with self._connection_context() as connection:
+                self._set_state(GatewayFeedState.AUTHENTICATING)
+                await connection.send(
+                    json.dumps(
+                        {"action": "auth", "params": self._api_key},
+                        separators=(",", ":"),
+                    )
+                )
+                await self._await_control(
+                    connection,
+                    accepted_statuses=frozenset({"auth_success"}),
+                    failure_prefix="ADVANCED_AUTH",
+                    allow_market_message=False,
+                )
+                self._set_state(GatewayFeedState.SUBSCRIBING)
+                await connection.send(subscribe_payload)
+                requested = set(self._subscriptions)
+                while (
+                    self._probe_accepted | self._probe_rejected
+                ) != requested:
+                    payload = await self._receive_bytes(connection)
+                    rows = self._control_rows(payload)
+                    if rows is None:
+                        self._set_state(GatewayFeedState.BLOCKED)
+                        raise GatewayControlError(
+                            "ADVANCED_SUBSCRIPTION_MARKET_BEFORE_READY"
+                        )
+                    accepted, rejected = (
+                        self._accumulate_subscription_membership(
+                            rows,
+                            self._probe_accepted,
+                            self._probe_rejected,
+                        )
+                    )
+                if rejected:
+                    self._set_state(GatewayFeedState.BLOCKED)
+                else:
+                    self._set_state(GatewayFeedState.WARMING)
+                await connection.close(
+                    code=1000,
+                    reason="subscription probe complete",
+                )
+            if not rejected:
+                self._set_state(GatewayFeedState.STOPPED)
+            return GatewaySubscriptionProbeResult(
+                stream_session_id=stream_session_id,
+                feed=self.configuration.feed,
+                requested_subscriptions=self._subscriptions,
+                accepted_subscriptions=accepted,
+                rejected_subscriptions=rejected,
+                received_control_messages=self._received_messages,
+                received_bytes=self._received_bytes,
+                subscribe_request_bytes=len(
+                    subscribe_payload.encode("utf-8")
+                ),
+                transitions=tuple(self._transitions),
+            )
+        except asyncio.CancelledError:
+            self._set_state(GatewayFeedState.STOPPING)
+            if connection is not None:
+                await connection.close(
+                    code=1001,
+                    reason="subscription probe timeout",
+                )
+            raise
 
     async def _admit(
         self,

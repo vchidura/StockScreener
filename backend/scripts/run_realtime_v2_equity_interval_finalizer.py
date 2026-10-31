@@ -15,7 +15,7 @@ import os
 import signal
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 from uuid import UUID, uuid4
@@ -33,6 +33,12 @@ from realtime.database_access_v2 import (  # noqa: E402
     OWNER_POOL,
     V2AccessConfig,
     V2ConnectionProvider,
+)
+from realtime.advanced_equity_lifecycle import (  # noqa: E402
+    AdvancedEquityLifecyclePlanner,
+)
+from realtime.advanced_realtime_desired_state_repository import (  # noqa: E402
+    load_effective_desired_state_reconciliation_cursor,
 )
 from realtime.equity_interval_finalizer import (  # noqa: E402
     EQUITY_INTERVAL_FINALIZE_JOB,
@@ -65,7 +71,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         choices=SECURITY_MODES_V2,
         default=SECURITY_MODE_DEFERRED,
     )
-    parser.add_argument("--cohort-id", type=UUID, required=True)
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--cohort-id", type=UUID)
+    scope.add_argument("--desired-state", action="store_true")
     parser.add_argument("--lease-owner", type=UUID, default=None)
     parser.add_argument("--claim-limit", type=int, default=10)
     parser.add_argument("--lease-seconds", type=int, default=60)
@@ -73,6 +81,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--retry-delay-seconds", type=int, default=30)
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--statement-timeout-ms", type=int, default=5_000)
+    parser.add_argument(
+        "--desired-state-reconcile-seconds",
+        type=float,
+        default=15.0,
+    )
+    parser.add_argument(
+        "--desired-state-drain-seconds",
+        type=int,
+        default=int(
+            os.getenv("REALTIME_V2_ADVANCED_DRAIN_SECONDS") or 30
+        ),
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true")
     mode.add_argument("--continuous", action="store_true")
@@ -96,6 +116,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--poll-seconds must be positive")
     if args.statement_timeout_ms <= 0:
         parser.error("--statement-timeout-ms must be positive")
+    if args.desired_state_reconcile_seconds <= 0:
+        parser.error(
+            "--desired-state-reconcile-seconds must be positive"
+        )
+    if args.desired_state_drain_seconds < 0:
+        parser.error("--desired-state-drain-seconds must be nonnegative")
+    if args.desired_state and not args.continuous:
+        parser.error("--desired-state requires --continuous")
     args.lease_owner = args.lease_owner or uuid4()
     return args
 
@@ -165,6 +193,82 @@ def run_worker(
     return exit_code
 
 
+def run_desired_state_worker(
+    provider: V2ConnectionProvider,
+    database: V2WorkerDatabase,
+    args: argparse.Namespace,
+    *,
+    stop: threading.Event,
+    now: Callable[[], datetime] | None = None,
+    emit: Callable[[str], None] = print,
+) -> int:
+    clock = now or _now
+    planner = AdvancedEquityLifecyclePlanner(clock=clock)
+    config = None
+    next_reconcile_at = None
+    exit_code = 0
+    while not stop.is_set():
+        checked = clock()
+        if next_reconcile_at is None or checked >= next_reconcile_at:
+            lifecycle = planner.plan(
+                drain_seconds=args.desired_state_drain_seconds,
+                finality_delay_seconds=5,
+                completion_budget_seconds=300,
+            )
+            with provider.transaction(
+                APP_ROLE,
+                read_only=True,
+            ) as unit:
+                desired = (
+                    load_effective_desired_state_reconciliation_cursor(
+                        unit.cursor,
+                        session_date=lifecycle.target_session_date,
+                    )
+                )
+            if (
+                desired is None
+                or desired.state != "READY"
+                or desired.snapshot is None
+            ):
+                config = None
+                emit(json.dumps({
+                    "checked_at": checked.isoformat(),
+                    "job_kind": EQUITY_INTERVAL_FINALIZE_JOB,
+                    "status": "IDLE",
+                    "reason_codes": (
+                        "DESIRED_SNAPSHOT_UNAVAILABLE",
+                    ),
+                }, indent=2))
+            elif (
+                config is None
+                or config.cohort_id != desired.snapshot.cohort_id
+            ):
+                config = EquityWorkerConfig(
+                    cohort_id=desired.snapshot.cohort_id,
+                    job_kind=EQUITY_INTERVAL_FINALIZE_JOB,
+                    lease_owner=args.lease_owner,
+                    claim_limit=args.claim_limit,
+                    lease_seconds=args.lease_seconds,
+                    maximum_attempts=args.maximum_attempts,
+                    retry_delay_seconds=args.retry_delay_seconds,
+                )
+            next_reconcile_at = checked + timedelta(
+                seconds=args.desired_state_reconcile_seconds
+            )
+        if config is not None:
+            status = run_five_minute_finalizer_once(
+                database,
+                config,
+                checked_at=checked,
+            )
+            emit(_status_json(status))
+            if status.failed or status.blocked:
+                exit_code = 1
+        if stop.wait(args.poll_seconds):
+            return exit_code
+    return exit_code
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     pool = _pool(args)
@@ -186,6 +290,17 @@ def main(argv=None) -> int:
         )
         provider.verify()
         database = V2WorkerDatabase(provider, RealtimeDatabaseRole.COMPUTE)
+        stop = threading.Event()
+        if args.continuous:
+            signal.signal(signal.SIGINT, lambda *_: stop.set())
+            signal.signal(signal.SIGTERM, lambda *_: stop.set())
+        if args.desired_state:
+            return run_desired_state_worker(
+                provider,
+                database,
+                args,
+                stop=stop,
+            )
         config = EquityWorkerConfig(
             cohort_id=args.cohort_id,
             job_kind=EQUITY_INTERVAL_FINALIZE_JOB,
@@ -195,10 +310,6 @@ def main(argv=None) -> int:
             maximum_attempts=args.maximum_attempts,
             retry_delay_seconds=args.retry_delay_seconds,
         )
-        stop = threading.Event()
-        if args.continuous:
-            signal.signal(signal.SIGINT, lambda *_: stop.set())
-            signal.signal(signal.SIGTERM, lambda *_: stop.set())
         return run_worker(
             database,
             config,

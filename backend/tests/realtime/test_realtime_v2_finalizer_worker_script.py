@@ -1,4 +1,6 @@
+from contextlib import nullcontext
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import UUID
 
@@ -77,6 +79,14 @@ def test_cli_requires_explicit_safe_target_execution_and_mode():
         "--cohort-id", str(COHORT),
         "--once", "--execute", "--security-mode", "hardened",
     ]).security_mode == "hardened"
+    continuous = script.parse_args([
+        "--database", "stocks_realtime_v2",
+        "--confirm-database-name", "stocks_realtime_v2",
+        "--desired-state", "--continuous", "--execute",
+        "--security-mode", "hardened",
+    ])
+    assert continuous.cohort_id is None
+    assert continuous.desired_state is True
 
 
 def test_once_wires_v2_worker_database_and_runs_one_bounded_claim(monkeypatch, capsys):
@@ -140,3 +150,53 @@ def test_continuous_mode_polls_until_stopped_without_unbounded_claims(monkeypatc
     assert all(call.args[1].claim_limit == 4 for call in run.call_args_list)
     assert stop.wait.call_args_list == [((0.25,),), ((0.25,),)]
     assert emit.call_count == 2
+
+
+def test_desired_state_finalizer_reconciles_on_bounded_cadence(monkeypatch):
+    provider = SimpleNamespace(
+        transaction=lambda *_args, **_kwargs: nullcontext(
+            SimpleNamespace(cursor=object())
+        )
+    )
+    desired = SimpleNamespace(
+        state="READY",
+        snapshot=SimpleNamespace(cohort_id=COHORT),
+    )
+    load = MagicMock(return_value=desired)
+    monkeypatch.setattr(
+        script,
+        "load_effective_desired_state_reconciliation_cursor",
+        load,
+    )
+    status = EquityWorkerStatus(NOW, 1, 1, 0, 0, 0, 1, ())
+    run = MagicMock(return_value=status)
+    monkeypatch.setattr(
+        script,
+        "run_five_minute_finalizer_once",
+        run,
+    )
+    stop = MagicMock()
+    stop.is_set.return_value = False
+    stop.wait.side_effect = (False, True)
+    args = SimpleNamespace(
+        lease_owner=OWNER,
+        claim_limit=4,
+        lease_seconds=60,
+        maximum_attempts=3,
+        retry_delay_seconds=30,
+        desired_state_reconcile_seconds=15,
+        desired_state_drain_seconds=30,
+        poll_seconds=1,
+    )
+
+    assert script.run_desired_state_worker(
+        provider,
+        MagicMock(),
+        args,
+        stop=stop,
+        now=lambda: NOW,
+        emit=MagicMock(),
+    ) == 0
+
+    assert load.call_count == 1
+    assert run.call_count == 2

@@ -12,6 +12,7 @@ from dotenv import dotenv_values
 
 OWNED_SECRETS = {
     "controller": frozenset({"app_dsn", "provider_key"}),
+    "capability-refresh": frozenset({"app_dsn", "provider_key"}),
     "ingress": frozenset({"app_dsn", "provider_key"}),
     "bridge": frozenset({"app_dsn"}),
     "scheduler": frozenset({"app_dsn"}),

@@ -35,34 +35,69 @@ from scripts.run_realtime_v2_services import (  # noqa: E402
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cohort-id", type=UUID, required=True)
-    parser.add_argument("--authorization-id", type=UUID, required=True)
-    parser.add_argument("--universe-target", type=int, required=True)
-    parser.add_argument("--session-date", type=date.fromisoformat, required=True)
-    parser.add_argument("--first-cutoff", type=datetime.fromisoformat, required=True)
-    parser.add_argument("--authorization-reference", required=True)
-    parser.add_argument("--decoded-byte-ceiling", type=int, required=True)
-    parser.add_argument("--stream-sessions", type=int, required=True)
-    parser.add_argument("--connection-attempts", type=int, required=True)
-    parser.add_argument("--rest-repair-requests", type=int, required=True)
+    parser.add_argument(
+        "--runtime-mode",
+        choices=("continuous", "legacy-diagnostic"),
+        default="continuous",
+    )
+    parser.add_argument("--cohort-id", type=UUID)
+    parser.add_argument("--authorization-id", type=UUID)
+    parser.add_argument("--universe-target", type=int)
+    parser.add_argument("--session-date", type=date.fromisoformat)
+    parser.add_argument("--first-cutoff", type=datetime.fromisoformat)
+    parser.add_argument("--authorization-reference")
+    parser.add_argument(
+        "--decoded-byte-ceiling",
+        type=int,
+        default=1024 * 1024 * 1024,
+    )
+    parser.add_argument("--stream-sessions", type=int, default=4)
+    parser.add_argument("--connection-attempts", type=int, default=12)
+    parser.add_argument("--rest-repair-requests", type=int, default=0)
     parser.add_argument(
         "--rest-repair-decoded-bytes",
         type=int,
-        required=True,
+        default=0,
     )
-    parser.add_argument("--finality-delay-seconds", type=int, required=True)
+    parser.add_argument("--finality-delay-seconds", type=int, default=5)
     parser.add_argument("--api-port", type=int, default=8002)
     parser.add_argument("--frontend-port", type=int, default=5174)
     parser.add_argument("--run-directory", type=Path)
     parser.add_argument("--env-file", type=Path, default=BACKEND_DIR / ".env")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
-    if (
+    explicit = (
+        args.cohort_id,
+        args.authorization_id,
+        args.universe_target,
+        args.session_date,
+        args.first_cutoff,
+        args.authorization_reference,
+    )
+    if args.runtime_mode == "continuous":
+        if any(value is not None for value in explicit):
+            parser.error(
+                "continuous Advanced services derive cohort, authorization, "
+                "session and cutoff; use --runtime-mode legacy-diagnostic "
+                "for explicit scope"
+            )
+        if args.rest_repair_requests or args.rest_repair_decoded_bytes:
+            parser.error(
+                "continuous Advanced services derive repair budgets"
+            )
+    elif any(value is None for value in explicit):
+        parser.error(
+            "legacy diagnostic services require the complete explicit scope"
+        )
+    if args.first_cutoff is not None and (
         args.first_cutoff.tzinfo is None
         or args.first_cutoff.utcoffset() is None
     ):
         parser.error("--first-cutoff must be timezone-aware")
-    if not args.authorization_reference.strip():
+    if (
+        args.authorization_reference is not None
+        and not args.authorization_reference.strip()
+    ):
         parser.error("--authorization-reference cannot be blank")
     if (
         args.decoded_byte_ceiling <= 0
@@ -99,7 +134,7 @@ def parse_args(argv=None):
 
 def build_commands(args):
     run = args.run_directory
-    return {
+    commands = {
         "api": [
             str(PYTHON),
             "-B",
@@ -140,8 +175,7 @@ def build_commands(args):
             "stocks_realtime_v2",
             "--security-mode",
             "hardened",
-            "--cohort-id",
-            str(args.cohort_id),
+            "--desired-state",
             "--continuous",
             "--poll-seconds",
             "1",
@@ -176,10 +210,8 @@ def build_commands(args):
             "stocks_realtime_v2",
             "--confirm-database-name",
             "stocks_realtime_v2",
-            "--authorization-id",
-            str(args.authorization_id),
-            "--universe-target",
-            str(args.universe_target),
+            "--runtime-mode",
+            args.runtime_mode,
             "--stream-sessions",
             str(args.stream_sessions),
             "--connection-attempts",
@@ -190,6 +222,39 @@ def build_commands(args):
             str(args.rest_repair_requests),
             "--rest-repair-decoded-bytes",
             str(args.rest_repair_decoded_bytes),
+            "--catch-up-mode",
+            "AUTO" if args.runtime_mode == "continuous" else "DISABLED",
+            "--external-ingress",
+            "--execute",
+        ],
+        "capability-refresh": [
+            str(PYTHON),
+            "-B",
+            str(
+                BACKEND_DIR
+                / "scripts"
+                / "run_realtime_v2_advanced_capability_refresh.py"
+            ),
+            "--database",
+            "stocks_realtime_v2",
+            "--confirm-database-name",
+            "stocks_realtime_v2",
+            "--execute",
+        ],
+        "ingress": [
+            str(PYTHON),
+            "-B",
+            str(
+                BACKEND_DIR
+                / "scripts"
+                / "run_realtime_v2_advanced_ingress_service.py"
+            ),
+            "--database",
+            "stocks_realtime_v2",
+            "--confirm-database-name",
+            "stocks_realtime_v2",
+            "--runtime-mode",
+            args.runtime_mode,
             "--execute",
         ],
         "scheduler": [
@@ -204,18 +269,10 @@ def build_commands(args):
             "stocks_realtime_v2",
             "--confirm-database-name",
             "stocks_realtime_v2",
-            "--authorization-id",
-            str(args.authorization_id),
-            "--cohort-id",
-            str(args.cohort_id),
-            "--session-date",
-            args.session_date.isoformat(),
-            "--first-cutoff",
-            args.first_cutoff.isoformat(),
+            "--runtime-mode",
+            args.runtime_mode,
             "--finality-delay-seconds",
             str(args.finality_delay_seconds),
-            "--authorization-reference",
-            args.authorization_reference,
             "--publication-mode",
             "projection-only",
             "--report-directory",
@@ -224,6 +281,42 @@ def build_commands(args):
             "--execute",
         ],
     }
+    if args.runtime_mode == "legacy-diagnostic":
+        commands.pop("capability-refresh")
+        controller_scope = (
+            commands["controller"].index("--runtime-mode") + 2
+        )
+        commands["controller"][controller_scope:controller_scope] = [
+            "--authorization-id",
+            str(args.authorization_id),
+            "--universe-target",
+            str(args.universe_target),
+        ]
+        commands["ingress"][-1:-1] = [
+            "--authorization-id",
+            str(args.authorization_id),
+        ]
+        scheduler_scope = (
+            commands["scheduler"].index("--runtime-mode") + 2
+        )
+        commands["scheduler"][scheduler_scope:scheduler_scope] = [
+            "--authorization-id",
+            str(args.authorization_id),
+            "--cohort-id",
+            str(args.cohort_id),
+            "--session-date",
+            args.session_date.isoformat(),
+            "--first-cutoff",
+            args.first_cutoff.isoformat(),
+            "--authorization-reference",
+            args.authorization_reference,
+        ]
+        finalizer_execute = commands["finalizer"].index("--desired-state")
+        commands["finalizer"][finalizer_execute:finalizer_execute + 1] = [
+            "--cohort-id",
+            str(args.cohort_id),
+        ]
+    return commands
 
 
 def process_environment(
@@ -233,6 +326,14 @@ def process_environment(
     scoped = dict(environment)
     allowed = {
         "controller": {
+            "POLYGON_API_KEY",
+            "REALTIME_V2_APP_DSN",
+        },
+        "capability-refresh": {
+            "POLYGON_API_KEY",
+            "REALTIME_V2_APP_DSN",
+        },
+        "ingress": {
             "POLYGON_API_KEY",
             "REALTIME_V2_APP_DSN",
         },
@@ -254,6 +355,12 @@ def process_environment(
     return scoped
 
 
+def _capability_restart_delay(attempt: int) -> int:
+    if type(attempt) is not int or attempt < 1:
+        raise ValueError("capability restart attempt must be positive")
+    return min(60, 2 ** min(attempt - 1, 6))
+
+
 def main(argv=None):
     args = parse_args(argv)
     config = RealtimeV2PipelineConfig.from_mapping(
@@ -273,12 +380,9 @@ def main(argv=None):
         raise RuntimeError("Advanced journal directory is unavailable")
     commands = build_commands(args)
     plan = {
-        "mode": "EXECUTE",
+        "mode": args.runtime_mode,
         "pipeline": config.equity_pipeline.value,
         "options_pipeline": config.options_pipeline.value,
-        "cohort_id": str(args.cohort_id),
-        "session_date": args.session_date.isoformat(),
-        "first_cutoff": args.first_cutoff.isoformat(),
         "publication_enabled": False,
         "publication_mode": "PROJECTION_ONLY",
         "commands": commands,
@@ -293,19 +397,28 @@ def main(argv=None):
     frontend_environment.update({
         "VITE_API_PROXY_TARGET": f"http://127.0.0.1:{args.api_port}",
         "VITE_REALTIME_ONLY": "true",
-        "VITE_REALTIME_COHORT_ID": str(args.cohort_id),
     })
+    if args.cohort_id is not None:
+        frontend_environment["VITE_REALTIME_COHORT_ID"] = str(
+            args.cohort_id
+        )
     children = []
     exit_code = 0
+    capability_restart_attempt = 0
+    capability_restart_at = None
     try:
         for name in (
-            "api",
-            "finalizer",
-            "frontend",
-            "bridge",
+            "capability-refresh",
             "controller",
+            "ingress",
+            "bridge",
+            "finalizer",
             "scheduler",
+            "api",
+            "frontend",
         ):
+            if name not in commands:
+                continue
             children.append(
                 _start(
                     name,
@@ -337,9 +450,44 @@ def main(argv=None):
             )
         )
         while True:
+            if (
+                "capability-refresh" in commands
+                and not any(
+                    child.name == "capability-refresh"
+                    for child in children
+                )
+                and capability_restart_at is not None
+                and time.monotonic() >= capability_restart_at
+            ):
+                children.append(
+                    _start(
+                        "capability-refresh",
+                        commands["capability-refresh"],
+                        environment=process_environment(
+                            environment,
+                            "capability-refresh",
+                        ),
+                        run_directory=args.run_directory,
+                    )
+                )
+                capability_restart_at = None
             for child in tuple(children):
                 result = child.process.poll()
                 if result is None:
+                    continue
+                if child.name == "capability-refresh":
+                    children.remove(child)
+                    child.output.close()
+                    capability_restart_attempt += 1
+                    delay = _capability_restart_delay(
+                        capability_restart_attempt
+                    )
+                    capability_restart_at = time.monotonic() + delay
+                    print(
+                        "Advanced capability refresh exited with "
+                        f"code {result}; retrying in {delay}s",
+                        file=sys.stderr,
+                    )
                     continue
                 if child.name == "scheduler" and result == 0:
                     children.remove(child)

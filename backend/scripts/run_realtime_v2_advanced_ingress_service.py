@@ -8,7 +8,7 @@ import signal
 import subprocess
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -53,7 +53,15 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
     parser.add_argument("--confirm-database-name", required=True)
-    parser.add_argument("--authorization-id", type=UUID, required=True)
+    parser.add_argument(
+        "--runtime-mode",
+        choices=("continuous", "legacy-diagnostic"),
+        default=(
+            os.getenv("REALTIME_V2_ADVANCED_RUNTIME_MODE")
+            or "continuous"
+        ),
+    )
+    parser.add_argument("--authorization-id", type=UUID)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -66,6 +74,21 @@ def parse_args(argv=None):
         parser.error("Advanced ingress service targets stocks_realtime_v2")
     if args.poll_seconds <= 0:
         parser.error("--poll-seconds must be positive")
+    if (
+        args.runtime_mode == "continuous"
+        and args.authorization_id is not None
+    ):
+        parser.error(
+            "continuous ingress derives the active plan; use "
+            "--runtime-mode legacy-diagnostic for --authorization-id"
+        )
+    if (
+        args.runtime_mode == "legacy-diagnostic"
+        and args.authorization_id is None
+    ):
+        parser.error(
+            "legacy diagnostic ingress requires --authorization-id"
+        )
     if not args.execute:
         parser.error("Advanced ingress service requires --execute")
     return args
@@ -92,15 +115,62 @@ def _provider(config):
 
 def _active_plan_id(provider, authorization_id, checked_at):
     with provider.transaction(APP_ROLE, read_only=True) as unit:
-        unit.cursor.execute(
-            "SELECT plan_id FROM rt.advanced_ingress_plans "
-            "WHERE authorization_id=%s AND status IN ('READY','ACTIVE') "
-            "AND authorized_start_at<=%s AND authorized_end_at>%s "
-            "ORDER BY session_date DESC,created_at DESC LIMIT 1",
-            (str(authorization_id), checked_at, checked_at),
-        )
+        if authorization_id is None:
+            unit.cursor.execute(
+                "SELECT plan.plan_id "
+                "FROM rt.advanced_ingress_plans AS plan "
+                "JOIN rt.realtime_desired_session_snapshots AS snapshot "
+                "ON snapshot.manifest_id=plan.manifest_id "
+                "AND snapshot.cohort_id=plan.cohort_id "
+                "JOIN rt.realtime_desired_revisions AS revision "
+                "USING(revision_id) "
+                "WHERE plan.status IN ('READY','ACTIVE') "
+                "AND plan.authorized_start_at<=%s "
+                "AND plan.authorized_end_at>%s "
+                "ORDER BY plan.session_date DESC,"
+                "revision.recorded_at DESC,plan.created_at DESC LIMIT 1",
+                (checked_at, checked_at),
+            )
+        else:
+            unit.cursor.execute(
+                "SELECT plan_id FROM rt.advanced_ingress_plans "
+                "WHERE authorization_id=%s "
+                "AND status IN ('READY','ACTIVE') "
+                "AND authorized_start_at<=%s AND authorized_end_at>%s "
+                "ORDER BY session_date DESC,created_at DESC LIMIT 1",
+                (str(authorization_id), checked_at, checked_at),
+            )
         row = unit.cursor.fetchone()
     return None if row is None else UUID(str(row[0]))
+
+
+def _active_stream_owner(provider, *, checked_at, stale_after_seconds):
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        unit.cursor.execute(
+            "SELECT session_id::text,advanced_ingress_plan_id::text,"
+            "owner_id::text,owner_epoch,journal_generation::text,"
+            "heartbeat_at FROM rt.stream_sessions "
+            "WHERE provider='massive' AND feed='STOCKS' "
+            "AND ended_at IS NULL "
+            "AND status IN ('CONNECTING','AUTHENTICATING','SUBSCRIBING',"
+            "'WARMING','LIVE','BACKOFF') "
+            "AND heartbeat_at>%s ORDER BY owner_epoch DESC LIMIT 1",
+            (
+                checked_at
+                - timedelta(seconds=stale_after_seconds),
+            ),
+        )
+        row = unit.cursor.fetchone()
+    if row is None:
+        return None
+    return {
+        "session_id": UUID(str(row[0])),
+        "plan_id": UUID(str(row[1])),
+        "owner_id": UUID(str(row[2])),
+        "owner_epoch": int(row[3]),
+        "journal_generation": UUID(str(row[4])),
+        "heartbeat_at": row[5],
+    }
 
 
 def _runtime_path_attempt(journal_root, runtime_scope):
@@ -208,6 +278,14 @@ def main(argv=None) -> int:
             profile = catalog.profile_for_sha(
                 runtime_scope.runtime_profile_sha256
             )
+            active_owner = _active_stream_owner(
+                provider,
+                checked_at=datetime.now(UTC),
+                stale_after_seconds=profile.settings.stale_after_seconds,
+            )
+            if active_owner is not None:
+                stop.wait(args.poll_seconds)
+                continue
             deadline = advanced_ingress_provider_deadline(
                 runtime_scope.authorized_start_at,
                 runtime_scope.authorized_end_at,

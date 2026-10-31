@@ -57,9 +57,17 @@ def _security_id(ticker: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"c2-security:{ticker}")
 
 
-def _seed_source(cursor):
+def _seed_source(cursor, *, runtime_configuration_sha256=None):
     profile_id = uuid5(NAMESPACE_URL, "c2-profile")
     profile_sha256 = _digest("profile")
+    profile_configuration_sha256 = (
+        runtime_configuration_sha256
+        or _digest("profile-config")
+    )
+    cohort_configuration_sha256 = (
+        runtime_configuration_sha256
+        or _digest("source-configuration")
+    )
     cursor.execute(
         "INSERT INTO rt.capability_profiles ("
         "profile_id,config_sha256,schema_sha256,account_alias,"
@@ -70,7 +78,7 @@ def _seed_source(cursor):
         "'MASSIVE_ADVANCED',%s,'PASSIVE',false,false)",
         (
             str(profile_id),
-            _digest("profile-config"),
+            profile_configuration_sha256,
             _digest("schema"),
             _digest("capabilities"),
             EQUITY_VALIDATION_UNIVERSE.sha256,
@@ -246,7 +254,7 @@ def _seed_source(cursor):
     cohort_id, _cohort_sha256 = persist_shadow_cohort_cursor(
         cursor,
         manifest_id=manifest_id,
-        configuration_sha256=_digest("source-configuration"),
+        configuration_sha256=cohort_configuration_sha256,
         model_bundle_sha256=_digest("source-model"),
         valuation_sha256=_digest("source-valuation"),
         effective_at=SOURCE_EFFECTIVE,

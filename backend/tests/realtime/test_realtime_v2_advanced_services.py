@@ -7,6 +7,8 @@ from realtime.equity_pipeline_config import RealtimeV2PipelineConfig
 script = importlib.import_module("scripts.run_realtime_v2_advanced_services")
 selector = importlib.import_module("scripts.run_realtime_v2_equity_services")
 BASE = [
+    "--runtime-mode",
+    "legacy-diagnostic",
     "--cohort-id",
     "11111111-1111-1111-1111-111111111111",
     "--authorization-id",
@@ -75,6 +77,7 @@ def test_advanced_supervisor_has_no_developer_rest_process(
         "finalizer",
         "bridge",
         "controller",
+        "ingress",
         "scheduler",
     }
     flattened = " ".join(
@@ -83,6 +86,7 @@ def test_advanced_supervisor_has_no_developer_rest_process(
         for value in command
     )
     assert "run_realtime_v2_advanced_controller.py" in flattened
+    assert "run_realtime_v2_advanced_ingress_service.py" in flattened
     assert "run_realtime_v2_advanced_journal_replay.py" in flattened
     assert "run_realtime_v2_advanced_equity_scheduler.py" in flattened
     assert "developer" not in flattened.lower()
@@ -98,6 +102,54 @@ def test_advanced_supervisor_has_no_developer_rest_process(
     assert "--authorization-reference" not in controller
 
 
+def test_continuous_supervisor_has_same_resident_roles_without_daily_scope(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    args = script.parse_args([
+        "--run-directory",
+        "continuous-services",
+        "--execute",
+    ])
+    commands = script.build_commands(args)
+
+    assert args.runtime_mode == "continuous"
+    assert args.authorization_id is None
+    assert args.cohort_id is None
+    assert args.session_date is None
+    assert args.first_cutoff is None
+    assert set(commands) == {
+        "api",
+        "frontend",
+        "finalizer",
+        "bridge",
+        "controller",
+        "capability-refresh",
+        "ingress",
+        "scheduler",
+    }
+    for role in ("controller", "ingress", "scheduler"):
+        assert "--runtime-mode" in commands[role]
+        assert commands[role][
+            commands[role].index("--runtime-mode") + 1
+        ] == "continuous"
+    flattened = " ".join(
+        value
+        for command in commands.values()
+        for value in command
+    )
+    for selector in (
+        "--authorization-id",
+        "--cohort-id",
+        "--session-date",
+        "--first-cutoff",
+        "--authorization-reference",
+    ):
+        assert selector not in flattened
+    assert "--desired-state" in commands["finalizer"]
+
+
 def test_process_environments_scope_provider_and_database_secrets():
     environment = {
         "POLYGON_API_KEY": "provider",
@@ -107,6 +159,11 @@ def test_process_environments_scope_provider_and_database_secrets():
     }
 
     controller = script.process_environment(environment, "controller")
+    capability_refresh = script.process_environment(
+        environment,
+        "capability-refresh",
+    )
+    ingress = script.process_environment(environment, "ingress")
     bridge = script.process_environment(environment, "bridge")
     api = script.process_environment(environment, "api")
     frontend = script.process_environment(environment, "frontend")
@@ -117,6 +174,16 @@ def test_process_environments_scope_provider_and_database_secrets():
         "PATH",
     }
     assert "REALTIME_V2_API_DSN" not in controller
+    assert set(ingress) >= {
+        "POLYGON_API_KEY",
+        "REALTIME_V2_APP_DSN",
+        "PATH",
+    }
+    assert set(capability_refresh) >= {
+        "POLYGON_API_KEY",
+        "REALTIME_V2_APP_DSN",
+        "PATH",
+    }
     assert set(bridge) >= {"REALTIME_V2_APP_DSN", "PATH"}
     assert "POLYGON_API_KEY" not in bridge
     assert "REALTIME_V2_API_DSN" not in bridge
@@ -140,3 +207,10 @@ def test_environment_selector_chooses_separate_supervisors():
     assert developer_main.__module__.endswith(
         "run_realtime_v2_services"
     )
+
+
+def test_capability_refresh_restart_backoff_is_bounded():
+    assert [
+        script._capability_restart_delay(attempt)
+        for attempt in range(1, 9)
+    ] == [1, 2, 4, 8, 16, 32, 60, 60]

@@ -58,6 +58,12 @@ class AdvancedSchedulerSession:
 
 
 @dataclass(frozen=True, slots=True)
+class AdvancedSchedulerProgress:
+    last_discovered_cutoff: datetime | None
+    last_completed_cutoff: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class AdvancedWindowRecovery:
     complete: bool
     active_window_id: UUID | None
@@ -399,6 +405,123 @@ def load_advanced_scheduler_scope_cursor(
         "authorized_start_at": row[5],
         "authorized_end_at": row[6],
     }
+
+
+def load_continuous_advanced_scheduler_scope_cursor(
+    cursor,
+    *,
+    session_date: date,
+):
+    cursor.execute(
+        "WITH effective AS ("
+        "SELECT snapshot.manifest_id,snapshot.cohort_id "
+        "FROM rt.realtime_desired_revisions AS revision "
+        "JOIN rt.realtime_desired_session_snapshots AS snapshot "
+        "USING(revision_id) "
+        "WHERE snapshot.session_date=%s "
+        "ORDER BY revision.recorded_at DESC,"
+        "revision.revision_id::text DESC LIMIT 1"
+        ") SELECT plan.plan_id,plan.authorization_id,plan.cohort_id,"
+        "plan.universe_target,plan.runtime_profile_sha256,plan.status,"
+        "plan.authorized_start_at,plan.authorized_end_at,"
+        "auth.authorization_reference "
+        "FROM effective "
+        "JOIN rt.advanced_ingress_plans AS plan "
+        "ON plan.manifest_id=effective.manifest_id "
+        "AND plan.cohort_id=effective.cohort_id "
+        "JOIN rt.advanced_stream_authorizations AS auth "
+        "USING(authorization_id) "
+        "WHERE plan.session_date=%s "
+        "AND plan.status IN ('READY','ACTIVE','COMPLETE') "
+        "ORDER BY plan.created_at DESC,plan.plan_id DESC",
+        (session_date, session_date),
+    )
+    rows = tuple(cursor.fetchall())
+    if len(rows) > 1:
+        raise ValueError("continuous daily scheduler scope is ambiguous")
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "plan_id": UUID(str(row[0])),
+        "authorization_id": UUID(str(row[1])),
+        "cohort_id": UUID(str(row[2])),
+        "universe_target": int(row[3]),
+        "runtime_profile_sha256": str(row[4]),
+        "status": str(row[5]),
+        "authorized_start_at": row[6],
+        "authorized_end_at": row[7],
+        "authorization_reference": str(row[8]),
+    }
+
+
+def load_advanced_scheduler_progress_cursor(
+    cursor,
+    *,
+    cohort_id: UUID,
+    session_date: date,
+    first_cutoff: datetime,
+    final_cutoff: datetime,
+) -> AdvancedSchedulerProgress:
+    first = _utc(first_cutoff, "first_cutoff")
+    final = _utc(final_cutoff, "final_cutoff")
+    if (
+        first > final
+        or first.second
+        or first.microsecond
+        or final.second
+        or final.microsecond
+        or (final - first).total_seconds() % 300
+    ):
+        raise ValueError("Advanced scheduler progress scope is invalid")
+    lower_key = f"advanced-{first:%Y%m%dT%H%M%SZ}"
+    upper_key = (
+        "advanced-"
+        f"{final + timedelta(minutes=5):%Y%m%dT%H%M%SZ}"
+    )
+    cursor.execute(
+        "WITH scoped AS ("
+        "SELECT run.cutoff,run.state FROM rt.window_runs AS run "
+        "WHERE run.cohort_id=%s "
+        "AND run.provider_tier='MASSIVE_ADVANCED' "
+        "AND run.window_key>=%s AND run.window_key<%s "
+        "AND run.cutoff BETWEEN %s AND %s "
+        "AND EXISTS (SELECT 1 FROM rt.service_plans AS service "
+        "WHERE service.plan_id=run.plan_id "
+        "AND service.cohort_id=%s AND service.session_date=%s)"
+        "), completed AS ("
+        "SELECT DISTINCT cutoff FROM scoped WHERE state='COMPLETE'"
+        "), ordered AS ("
+        "SELECT cutoff,row_number() OVER (ORDER BY cutoff) AS ordinal "
+        "FROM completed"
+        ") SELECT "
+        "(SELECT MAX(cutoff) FROM scoped),"
+        "(SELECT MAX(cutoff) FROM ordered "
+        "WHERE cutoff=%s + (ordinal-1) * interval '5 minutes')",
+        (
+            str(cohort_id),
+            lower_key,
+            upper_key,
+            first,
+            final,
+            str(cohort_id),
+            session_date,
+            first,
+        ),
+    )
+    row = cursor.fetchone()
+    return AdvancedSchedulerProgress(
+        last_discovered_cutoff=(
+            None
+            if row is None or row[0] is None
+            else _utc(row[0], "stored last_discovered_cutoff")
+        ),
+        last_completed_cutoff=(
+            None
+            if row is None or row[1] is None
+            else _utc(row[1], "stored last_completed_cutoff")
+        ),
+    )
 
 
 def audit_completed_session_coverage_cursor(

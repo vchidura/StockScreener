@@ -48,6 +48,14 @@ from realtime.advanced_ingress_repository import (  # noqa: E402
 from realtime.advanced_ingress_controller import (  # noqa: E402
     classify_advanced_ingress_failure,
 )
+from realtime.advanced_equity_capability_refresh import (  # noqa: E402
+    MASSIVE_STOCKS_CONNECTION_RESOURCE,
+)
+from realtime.advanced_equity_lifecycle import (  # noqa: E402
+    claim_lifecycle_lease_cursor,
+    release_lifecycle_lease_cursor,
+    renew_lifecycle_lease_cursor,
+)
 from realtime.advanced_gap_repair import (  # noqa: E402
     record_first_post_reconnect_event_cursor,
 )
@@ -452,6 +460,10 @@ def main(argv=None) -> int:
     started_at = None
     live_started_at = None
     status_reporter = None
+    connection_lease = None
+    connection_lease_stop = threading.Event()
+    connection_lease_thread = None
+    connection_lease_failures = []
     try:
         (
             runtime_plan,
@@ -512,11 +524,54 @@ def main(argv=None) -> int:
             stale_after_seconds=settings.stale_after_seconds,
             started_at=started_at,
         )
+        connection_lease_seconds = int(max(
+            180,
+            settings.stale_after_seconds * 2,
+        ))
         with provider.transaction(APP_ROLE) as unit:
+            connection_lease = claim_lifecycle_lease_cursor(
+                unit.cursor,
+                owner_id=owner_id,
+                checked_at=started_at,
+                lease_seconds=connection_lease_seconds,
+                resource_key=MASSIVE_STOCKS_CONNECTION_RESOURCE,
+            )
+            if connection_lease is None:
+                raise AdvancedIngressAdmissionError(
+                    "another Massive Stocks provider connection is active"
+                )
             session = register_advanced_stream_session_cursor(
                 unit.cursor,
                 scope,
             )
+
+        def renew_connection_lease():
+            interval = connection_lease_seconds / 3
+            while not connection_lease_stop.wait(interval):
+                try:
+                    with provider.transaction(APP_ROLE) as unit:
+                        renewed = renew_lifecycle_lease_cursor(
+                            unit.cursor,
+                            connection_lease,
+                            checked_at=_now(),
+                            lease_seconds=connection_lease_seconds,
+                        )
+                    if renewed is None:
+                        raise RuntimeError(
+                            "Advanced Stocks provider connection "
+                            "lease was lost"
+                        )
+                except Exception as error:
+                    connection_lease_failures.append(error)
+                    stop.set()
+                    return
+
+        connection_lease_thread = threading.Thread(
+            target=renew_connection_lease,
+            name="advanced-stocks-connection-lease",
+            daemon=True,
+        )
+        connection_lease_thread.start()
         bridge_config = AdvancedEquityJournalBridgeConfig(
             cohort_id=runtime_plan.cohort_id,
             journal_generation=generation,
@@ -664,6 +719,8 @@ def main(argv=None) -> int:
                 settings.database_statement_timeout_ms / 1_000 + 1,
             )
         )
+        if connection_lease_failures:
+            raise connection_lease_failures[0]
         checkpoint_journal_wal(journal_path)
         with provider.transaction(APP_ROLE) as unit:
             seal_advanced_journal_cursor(
@@ -857,6 +914,15 @@ def main(argv=None) -> int:
         print(json.dumps(failure, indent=2))
         return 2
     finally:
+        connection_lease_stop.set()
+        if connection_lease_thread is not None:
+            connection_lease_thread.join(timeout=5)
+        if connection_lease is not None:
+            with provider.transaction(APP_ROLE) as unit:
+                release_lifecycle_lease_cursor(
+                    unit.cursor,
+                    connection_lease,
+                )
         pool.closeall()
 
 

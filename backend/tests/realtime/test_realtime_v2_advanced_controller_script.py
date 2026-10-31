@@ -29,6 +29,8 @@ def _base():
         "stocks_realtime_v2",
         "--confirm-database-name",
         "stocks_realtime_v2",
+        "--runtime-mode",
+        "legacy-diagnostic",
         "--authorization-id",
         "11111111-1111-1111-1111-111111111111",
         "--universe-target",
@@ -57,6 +59,103 @@ def test_controller_requires_explicit_execution_and_bounded_plan_budget():
     assert args.budgets.connection_attempts == 3
     with pytest.raises(SystemExit):
         script.parse_args(base[:-1])
+
+
+def test_continuous_controller_derives_daily_scope_and_finite_budgets():
+    args = script.parse_args([
+        "--database",
+        "stocks_realtime_v2",
+        "--confirm-database-name",
+        "stocks_realtime_v2",
+        "--external-ingress",
+        "--execute",
+    ])
+
+    assert args.runtime_mode == "continuous"
+    assert args.authorization_id is None
+    assert args.universe_target is None
+    assert args.budgets is None
+    assert args.stream_sessions > 0
+    assert args.connection_attempts >= args.stream_sessions
+    assert args.decoded_bytes > 0
+    assert args.catch_up_mode == "AUTO"
+    assert args.external_ingress is True
+    derived = script._continuous_session_budgets(args, 9)
+    assert derived.rest_repair_requests == 18
+    assert derived.rest_repair_decoded_bytes > 0
+
+
+def test_continuous_controller_rejects_legacy_daily_selectors():
+    for selector in (
+        ("--authorization-id", "11111111-1111-1111-1111-111111111111"),
+        ("--universe-target", "9"),
+        (
+            "--canary-start-at",
+            "2026-10-30T13:30:00+00:00",
+        ),
+    ):
+        with pytest.raises(SystemExit):
+            script.parse_args([
+                "--database",
+                "stocks_realtime_v2",
+                "--confirm-database-name",
+                "stocks_realtime_v2",
+                "--external-ingress",
+                *selector,
+                "--execute",
+            ])
+
+
+def test_continuous_controller_requires_external_ingress_role():
+    with pytest.raises(SystemExit):
+        script.parse_args([
+            "--database",
+            "stocks_realtime_v2",
+            "--confirm-database-name",
+            "stocks_realtime_v2",
+            "--execute",
+        ])
+
+    legacy = script.parse_args(_base())
+    assert legacy.external_ingress is False
+
+
+def test_desired_pointer_probe_is_one_bounded_control_plane_query():
+    provider = MagicMock()
+    cursor = provider.transaction.return_value.__enter__.return_value.cursor
+    revision_id = script.UUID(int=9)
+    session_date = datetime(2026, 11, 2).date()
+    cursor.fetchone.return_value = (
+        str(revision_id),
+        session_date,
+    )
+
+    assert script._load_current_desired_pointer(provider) == (
+        revision_id,
+        session_date,
+    )
+    cursor.execute.assert_called_once()
+    assert "realtime_desired_current" in cursor.execute.call_args.args[0]
+
+
+def test_lifecycle_lease_renewal_is_time_bounded_not_loop_bounded():
+    provider = MagicMock()
+    lease = SimpleNamespace(owner_epoch=1)
+    checked = datetime(2026, 11, 2, 16, 0, tzinfo=timezone.utc)
+    next_renew = checked + timedelta(seconds=15)
+
+    for _message_count in range(1_000):
+        current, due = script._renew_lifecycle_lease_if_due(
+            provider,
+            lease,
+            checked_at=checked,
+            next_renew_at=next_renew,
+            lease_seconds=45,
+        )
+
+    assert current is lease
+    assert due == next_renew
+    provider.transaction.assert_not_called()
 
 
 def test_controller_requires_exact_rest_repair_allocation():

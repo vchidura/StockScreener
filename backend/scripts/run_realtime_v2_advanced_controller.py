@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from random import Random
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from psycopg2.pool import ThreadedConnectionPool
 
@@ -35,6 +35,21 @@ from realtime.advanced_ingress_controller import (  # noqa: E402
     plan_hybrid_startup,
     reconcile_hybrid_minute_closure,
 )
+from realtime.advanced_equity_lifecycle import (  # noqa: E402
+    AdvancedEquityLifecyclePlanner,
+    claim_lifecycle_lease_cursor,
+    ensure_desired_session_revision_cursor,
+    ensure_automatic_stream_authorization_cursor,
+    load_or_roll_effective_desired_session_cursor,
+    release_lifecycle_lease_cursor,
+    renew_lifecycle_lease_cursor,
+)
+from realtime.advanced_scheduler import (  # noqa: E402
+    load_advanced_scheduler_progress_cursor,
+)
+from realtime.advanced_realtime_desired_state_repository import (  # noqa: E402
+    load_effective_desired_state_reconciliation_cursor,
+)
 from realtime.advanced_gap_repair import (  # noqa: E402
     plan_advanced_cold_start_cursor,
     transition_backfill_state_cursor,
@@ -51,6 +66,7 @@ from realtime.advanced_ingress_repository import (  # noqa: E402
     AdvancedCohortResolutionError,
     advanced_ingress_controller_status_cursor,
     finish_advanced_ingress_plan_cursor,
+    load_pinned_advanced_ingress_plan_cursor,
     load_advanced_ingress_runtime_plan_cursor,
     load_advanced_stream_authorization_cursor,
     prepare_advanced_ingress_plan_cursor,
@@ -77,6 +93,7 @@ from realtime.equity_pipeline_config import (  # noqa: E402
     RealtimeV2PipelineConfig,
     RealtimeV2Process,
 )
+from realtime.session_windows import advanced_session_windows  # noqa: E402
 from realtime.migrations import (  # noqa: E402
     EXPECTED_V2_DATABASE_NAME,
     validate_target_database_v2,
@@ -104,9 +121,28 @@ def _now() -> datetime:
 
 
 def _budget_arguments(parser) -> None:
-    parser.add_argument("--stream-sessions", type=int, required=True)
-    parser.add_argument("--connection-attempts", type=int, required=True)
-    parser.add_argument("--decoded-bytes", type=int, required=True)
+    parser.add_argument(
+        "--stream-sessions",
+        type=int,
+        default=int(
+            os.getenv("REALTIME_V2_ADVANCED_STREAM_SESSIONS") or 4
+        ),
+    )
+    parser.add_argument(
+        "--connection-attempts",
+        type=int,
+        default=int(
+            os.getenv("REALTIME_V2_ADVANCED_CONNECTION_ATTEMPTS") or 12
+        ),
+    )
+    parser.add_argument(
+        "--decoded-bytes",
+        type=int,
+        default=int(
+            os.getenv("REALTIME_V2_ADVANCED_DECODED_BYTES")
+            or 1024 * 1024 * 1024
+        ),
+    )
     parser.add_argument("--rest-repair-requests", type=int, default=0)
     parser.add_argument(
         "--rest-repair-decoded-bytes",
@@ -118,7 +154,7 @@ def _budget_arguments(parser) -> None:
         choices=("DISABLED", "AUTO"),
         default=(
             os.getenv("REALTIME_V2_ADVANCED_CATCH_UP_MODE")
-            or "DISABLED"
+            or None
         ),
     )
 
@@ -127,22 +163,24 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
     parser.add_argument("--confirm-database-name", required=True)
-    parser.add_argument("--authorization-id", type=UUID, required=True)
-    parser.add_argument("--universe-target", type=int, required=True)
+    parser.add_argument(
+        "--runtime-mode",
+        choices=("continuous", "legacy-diagnostic"),
+        default=(
+            os.getenv("REALTIME_V2_ADVANCED_RUNTIME_MODE")
+            or "continuous"
+        ),
+    )
+    parser.add_argument("--authorization-id", type=UUID)
+    parser.add_argument("--universe-target", type=int)
     parser.add_argument(
         "--preferred-cohort-id",
         type=UUID,
-        default=(
-            os.getenv("REALTIME_V2_ADVANCED_PREFERRED_COHORT_ID")
-            or None
-        ),
+        default=None,
     )
     parser.add_argument(
         "--cohort-selection-reference",
-        default=(
-            os.getenv("REALTIME_V2_ADVANCED_COHORT_SELECTION_REFERENCE")
-            or None
-        ),
+        default=None,
     )
     _budget_arguments(parser)
     parser.add_argument(
@@ -182,14 +220,32 @@ def parse_args(argv=None):
     parser.add_argument("--debug-single-session", action="store_true")
     parser.add_argument("--external-ingress", action="store_true")
     parser.add_argument(
+        "--lifecycle-owner-id",
+        type=UUID,
+        default=(
+            os.getenv("REALTIME_V2_ADVANCED_LIFECYCLE_OWNER_ID")
+            or None
+        ),
+    )
+    parser.add_argument(
+        "--lifecycle-lease-seconds",
+        type=int,
+        default=45,
+    )
+    parser.add_argument(
+        "--lifecycle-reconcile-seconds",
+        type=float,
+        default=15.0,
+    )
+    parser.add_argument(
         "--canary-start-at",
         type=datetime.fromisoformat,
-        default=os.getenv("REALTIME_V2_ADVANCED_CANARY_START_AT") or None,
+        default=None,
     )
     parser.add_argument(
         "--canary-end-at",
         type=datetime.fromisoformat,
-        default=os.getenv("REALTIME_V2_ADVANCED_CANARY_END_AT") or None,
+        default=None,
     )
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -202,7 +258,110 @@ def parse_args(argv=None):
         parser.error("Advanced controller targets only stocks_realtime_v2")
     if not args.execute:
         parser.error("Advanced controller requires --execute")
+    if (
+        not 10 <= args.lifecycle_lease_seconds <= 3600
+        or args.lifecycle_reconcile_seconds <= 0
+        or args.lifecycle_reconcile_seconds
+        >= args.lifecycle_lease_seconds
+    ):
+        parser.error("Advanced lifecycle lease/cadence is invalid")
+    if args.runtime_mode == "continuous":
+        if not args.external_ingress:
+            parser.error(
+                "continuous mode requires --external-ingress; direct "
+                "provider child execution is legacy-diagnostic only"
+            )
+        if any((
+            args.authorization_id is not None,
+            args.universe_target is not None,
+            args.preferred_cohort_id is not None,
+            args.cohort_selection_reference is not None,
+            args.canary_start_at is not None,
+            args.canary_end_at is not None,
+            args.startup_backfill_sessions != 0,
+            args.startup_request_ceiling is not None,
+            args.startup_decoded_bytes is not None,
+            args.startup_expected_cost is not None,
+            args.rest_repair_requests != 0,
+            args.rest_repair_decoded_bytes != 0,
+            args.debug_single_session,
+        )):
+            parser.error(
+                "continuous mode derives authorization, cohort, session, "
+                "snapshot and repair budgets; use --runtime-mode "
+                "legacy-diagnostic for explicit scope"
+            )
+        if (
+            args.stream_sessions <= 0
+            or args.connection_attempts < args.stream_sessions
+            or args.decoded_bytes <= 0
+        ):
+            parser.error("continuous Advanced session budgets are invalid")
+        args.catch_up_mode = args.catch_up_mode or "AUTO"
+        args.budgets = None
+    else:
+        try:
+            args.preferred_cohort_id = (
+                args.preferred_cohort_id
+                or (
+                    UUID(value)
+                    if (
+                        value := os.getenv(
+                            "REALTIME_V2_ADVANCED_PREFERRED_COHORT_ID"
+                        )
+                    )
+                    else None
+                )
+            )
+            args.canary_start_at = (
+                args.canary_start_at
+                or (
+                    datetime.fromisoformat(value)
+                    if (
+                        value := os.getenv(
+                            "REALTIME_V2_ADVANCED_CANARY_START_AT"
+                        )
+                    )
+                    else None
+                )
+            )
+            args.canary_end_at = (
+                args.canary_end_at
+                or (
+                    datetime.fromisoformat(value)
+                    if (
+                        value := os.getenv(
+                            "REALTIME_V2_ADVANCED_CANARY_END_AT"
+                        )
+                    )
+                    else None
+                )
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        args.cohort_selection_reference = (
+            args.cohort_selection_reference
+            or os.getenv(
+                "REALTIME_V2_ADVANCED_COHORT_SELECTION_REFERENCE"
+            )
+            or None
+        )
+        if args.authorization_id is None or args.universe_target is None:
+            parser.error(
+                "legacy diagnostic mode requires --authorization-id "
+                "and --universe-target"
+            )
+        args.catch_up_mode = args.catch_up_mode or "DISABLED"
     if args.catch_up_mode == "AUTO":
+        if args.universe_target is None:
+            args.budgets = None
+        else:
+            args.budgets = automatic_advanced_ingress_budgets(
+                universe_target=args.universe_target,
+                stream_sessions=args.stream_sessions,
+                connection_attempts=args.connection_attempts,
+                decoded_bytes=args.decoded_bytes,
+            )
         if (
             args.rest_repair_requests
             or args.rest_repair_decoded_bytes
@@ -210,12 +369,6 @@ def parse_args(argv=None):
             parser.error(
                 "automatic catch-up derives REST repair budgets"
             )
-        args.budgets = automatic_advanced_ingress_budgets(
-            universe_target=args.universe_target,
-            stream_sessions=args.stream_sessions,
-            connection_attempts=args.connection_attempts,
-            decoded_bytes=args.decoded_bytes,
-        )
         args.rest_repair_response_byte_limit = (
             args.rest_repair_response_byte_limit
             or AUTOMATIC_CATCH_UP_RESPONSE_BYTE_LIMIT
@@ -286,13 +439,22 @@ def parse_args(argv=None):
         parser.error(
             "startup allocation requires --startup-backfill-sessions"
         )
-    repair_enabled = args.budgets.rest_repair_requests > 0
+    repair_enabled = (
+        args.catch_up_mode == "AUTO"
+        or (
+            args.budgets is not None
+            and args.budgets.rest_repair_requests > 0
+        )
+    )
     if repair_enabled:
         if (
             args.rest_repair_response_byte_limit is None
             or args.rest_repair_response_byte_limit < 1_024
-            or args.rest_repair_response_byte_limit + 1
-            > args.budgets.rest_repair_decoded_bytes
+            or (
+                args.budgets is not None
+                and args.rest_repair_response_byte_limit + 1
+                > args.budgets.rest_repair_decoded_bytes
+            )
             or not (args.rest_repair_expected_cost or "").strip()
         ):
             parser.error(
@@ -581,6 +743,126 @@ def _tick_hybrid_repair(
     ):
         return
     hybrid.tick()
+
+
+def _continuous_session_budgets(args, universe_target):
+    if args.catch_up_mode == "AUTO":
+        return automatic_advanced_ingress_budgets(
+            universe_target=universe_target,
+            stream_sessions=args.stream_sessions,
+            connection_attempts=args.connection_attempts,
+            decoded_bytes=args.decoded_bytes,
+        )
+    return AdvancedIngressBudgets(
+        args.stream_sessions,
+        args.connection_attempts,
+        args.decoded_bytes,
+        0,
+        0,
+    )
+
+
+def _load_current_desired_pointer(provider):
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        unit.cursor.execute(
+            "SELECT revision_id::text,effective_session_date "
+            "FROM rt.realtime_desired_current "
+            "WHERE scope_key='ADVANCED_REALTIME'"
+        )
+        row = unit.cursor.fetchone()
+    if row is None:
+        return None
+    return UUID(str(row[0])), row[1]
+
+
+def _renew_lifecycle_lease_if_due(
+    provider,
+    lease,
+    *,
+    checked_at,
+    next_renew_at,
+    lease_seconds,
+):
+    if checked_at < next_renew_at:
+        return lease, next_renew_at
+    with provider.transaction(APP_ROLE) as unit:
+        renewed = renew_lifecycle_lease_cursor(
+            unit.cursor,
+            lease,
+            checked_at=checked_at,
+            lease_seconds=lease_seconds,
+        )
+    if renewed is None:
+        raise RuntimeError(
+            "Advanced Equity lifecycle leadership was lost"
+        )
+    return (
+        renewed,
+        checked_at + timedelta(seconds=lease_seconds / 3),
+    )
+
+
+def _prepare_continuous_session_cursor(
+    cursor,
+    *,
+    args,
+    catalog,
+    calendar,
+    session_date,
+    checked_at,
+):
+    desired = load_or_roll_effective_desired_session_cursor(
+        cursor,
+        target_session_date=session_date,
+        checked_at=checked_at,
+        calendar=calendar,
+    )
+    plan = load_pinned_advanced_ingress_plan_cursor(
+        cursor,
+        cohort_id=desired.snapshot.cohort_id,
+        manifest_id=desired.snapshot.manifest_id,
+        session_date=session_date,
+    )
+    if plan is None:
+        budgets = _continuous_session_budgets(
+            args,
+            desired.equity_member_count,
+        )
+        authorization = ensure_automatic_stream_authorization_cursor(
+            cursor,
+            desired=desired,
+            budgets=budgets,
+            runtime_policy_sha256=catalog.scale_policy.sha256,
+            promotion_ladder=(
+                catalog.scale_policy.universe_ladder
+            ),
+            calendar=calendar,
+        )
+        plan = resolve_advanced_ingress_plan_cursor(
+            cursor,
+            AdvancedIngressPlanRequest(
+                authorization.authorization_id,
+                session_date,
+                desired.equity_member_count,
+                budgets,
+                preferred_cohort_id=desired.snapshot.cohort_id,
+                cohort_selection_reference=(
+                    "desired-snapshot:"
+                    f"{desired.snapshot.snapshot_sha256}"
+                ),
+            ),
+            runtime_catalog=catalog,
+            calendar=calendar,
+        )
+    runtime_profile = catalog.profile_for_sha(
+        plan.runtime_profile_sha256
+    )
+    prepare_advanced_ingress_plan_cursor(
+        cursor,
+        plan,
+        checked_at=checked_at,
+    )
+    return desired, plan, runtime_profile
 
 
 @dataclass(frozen=True, slots=True)
@@ -1321,41 +1603,202 @@ def main(argv=None) -> int:
         config.advanced_ingress_policy_path,
         expected_version=config.advanced_ingress_policy_version,
     )
-    runtime_profile = catalog.profile_for_target(args.universe_target)
+    continuous = args.runtime_mode == "continuous"
+    runtime_profile = catalog.profile_for_target(
+        9 if continuous else args.universe_target
+    )
     settings = runtime_profile.settings
     calendar = OptionExchangeCalendar("XNYS")
+    planner = AdvancedEquityLifecyclePlanner(
+        calendar=calendar,
+        clock=_now,
+    )
     provider, pool = _provider(config)
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     reconnect = AdvancedReconnectState()
     random_source = Random()
+    lifecycle_lease = None
+    last_reconcile_error = None
+    last_preparation_error = None
+    observed_desired_pointer = None
+    next_desired_pointer_check = None
+    next_lifecycle_lease_renew_at = None
     try:
+        if continuous:
+            owner_id = args.lifecycle_owner_id or uuid4()
+            with provider.transaction(APP_ROLE) as unit:
+                lifecycle_lease = claim_lifecycle_lease_cursor(
+                    unit.cursor,
+                    owner_id=owner_id,
+                    checked_at=_now(),
+                    lease_seconds=args.lifecycle_lease_seconds,
+                )
+            if lifecycle_lease is None:
+                raise RuntimeError(
+                    "another Advanced Equity lifecycle owner is active"
+                )
+            next_lifecycle_lease_renew_at = (
+                _now()
+                + timedelta(
+                    seconds=args.lifecycle_lease_seconds / 3
+                )
+            )
         while not stop.is_set():
             now = _now()
             if args.canary_end_at is not None and now >= args.canary_end_at:
                 stop.wait(settings.bridge_poll_interval_seconds)
                 continue
-            session_date = (
-                args.canary_start_at.date()
-                if args.canary_start_at is not None
-                else calendar.session_on_or_after(now.date())
-            )
-            with provider.transaction(APP_ROLE, read_only=True) as unit:
-                authorization = load_advanced_stream_authorization_cursor(
-                    unit.cursor,
-                    args.authorization_id,
+            if continuous:
+                lifecycle = planner.plan(
+                    drain_seconds=settings.drain_deadline_seconds,
+                    finality_delay_seconds=5,
+                    completion_budget_seconds=300,
                 )
-            if session_date < authorization.valid_from:
-                session_date = calendar.session_on_or_after(
-                    authorization.valid_from
+                session_date = lifecycle.processing_session_date
+                lifecycle_windows = advanced_session_windows(
+                    session_date,
+                    finality_delay_seconds=5,
+                    completion_budget_seconds=300,
+                    serving_lag_seconds=30,
                 )
-            if (
-                authorization.status != "READY"
-                or session_date > authorization.valid_through
-            ):
-                stop.wait(settings.bridge_poll_interval_seconds)
-                continue
+                try:
+                    (
+                        lifecycle_lease,
+                        next_lifecycle_lease_renew_at,
+                    ) = _renew_lifecycle_lease_if_due(
+                        provider,
+                        lifecycle_lease,
+                        checked_at=now,
+                        next_renew_at=(
+                            next_lifecycle_lease_renew_at
+                        ),
+                        lease_seconds=args.lifecycle_lease_seconds,
+                    )
+                    with provider.transaction(APP_ROLE) as unit:
+                        ensure_desired_session_revision_cursor(
+                            unit.cursor,
+                            target_session_date=session_date,
+                            checked_at=now,
+                            calendar=calendar,
+                        )
+                    with provider.transaction(APP_ROLE) as unit:
+                        (
+                            desired,
+                            plan,
+                            runtime_profile,
+                        ) = _prepare_continuous_session_cursor(
+                            unit.cursor,
+                            args=args,
+                            catalog=catalog,
+                            calendar=calendar,
+                            session_date=session_date,
+                            checked_at=now,
+                        )
+                        settings = runtime_profile.settings
+                        progress = (
+                            load_advanced_scheduler_progress_cursor(
+                                unit.cursor,
+                                cohort_id=desired.snapshot.cohort_id,
+                                session_date=session_date,
+                                first_cutoff=(
+                                    lifecycle_windows[0].cutoff
+                                ),
+                                final_cutoff=(
+                                    lifecycle_windows[-1].cutoff
+                                ),
+                            )
+                        )
+                    if (
+                        lifecycle.preparation_session_date
+                        != lifecycle.processing_session_date
+                    ):
+                        try:
+                            with provider.transaction(APP_ROLE) as unit:
+                                ensure_desired_session_revision_cursor(
+                                    unit.cursor,
+                                    target_session_date=(
+                                        lifecycle.preparation_session_date
+                                    ),
+                                    checked_at=now,
+                                    calendar=calendar,
+                                )
+                            with provider.transaction(APP_ROLE) as unit:
+                                _prepare_continuous_session_cursor(
+                                    unit.cursor,
+                                    args=args,
+                                    catalog=catalog,
+                                    calendar=calendar,
+                                    session_date=(
+                                        lifecycle.preparation_session_date
+                                    ),
+                                    checked_at=now,
+                                )
+                            last_preparation_error = None
+                        except (
+                            AdvancedCohortResolutionError,
+                            ValueError,
+                        ) as error:
+                            detail = str(error)
+                            if detail != last_preparation_error:
+                                print(
+                                    "Advanced Equity next-session "
+                                    f"preparation waiting: {detail}",
+                                    file=sys.stderr,
+                                )
+                            last_preparation_error = detail
+                    lifecycle = planner.plan(
+                        drain_seconds=settings.drain_deadline_seconds,
+                        finality_delay_seconds=5,
+                        completion_budget_seconds=300,
+                        last_completed_cutoff=(
+                            progress.last_completed_cutoff
+                        ),
+                    )
+                    last_reconcile_error = None
+                    observed_desired_pointer = (
+                        desired.revision.revision_id,
+                        desired.revision.effective_session_date,
+                    )
+                    next_desired_pointer_check = (
+                        now
+                        + timedelta(
+                            seconds=args.lifecycle_reconcile_seconds
+                        )
+                    )
+                except (AdvancedCohortResolutionError, ValueError) as error:
+                    detail = str(error)
+                    if detail != last_reconcile_error:
+                        print(
+                            "Advanced Equity lifecycle waiting: "
+                            f"{detail}",
+                            file=sys.stderr,
+                        )
+                        last_reconcile_error = detail
+                    stop.wait(args.lifecycle_reconcile_seconds)
+                    continue
+            else:
+                session_date = (
+                    args.canary_start_at.date()
+                    if args.canary_start_at is not None
+                    else calendar.session_on_or_after(now.date())
+                )
+                with provider.transaction(APP_ROLE, read_only=True) as unit:
+                    authorization = load_advanced_stream_authorization_cursor(
+                        unit.cursor,
+                        args.authorization_id,
+                    )
+                if session_date < authorization.valid_from:
+                    session_date = calendar.session_on_or_after(
+                        authorization.valid_from
+                    )
+                if (
+                    authorization.status != "READY"
+                    or session_date > authorization.valid_through
+                ):
+                    stop.wait(settings.bridge_poll_interval_seconds)
+                    continue
             session_open = calendar.session_open(session_date)
             session_close = calendar.session_close(session_date)
             warmup_at = session_open - timedelta(
@@ -1364,7 +1807,7 @@ def main(argv=None) -> int:
             drain_deadline = session_close + timedelta(
                 seconds=settings.drain_deadline_seconds
             )
-            if now > drain_deadline:
+            if not continuous and now > drain_deadline:
                 session_date = calendar.next_session_date(session_date)
                 session_open = calendar.session_open(session_date)
                 session_close = calendar.session_close(session_date)
@@ -1377,35 +1820,36 @@ def main(argv=None) -> int:
                 if session_date > authorization.valid_through:
                     stop.wait(settings.bridge_poll_interval_seconds)
                     continue
-            try:
-                with provider.transaction(APP_ROLE) as unit:
-                    plan = resolve_advanced_ingress_plan_cursor(
-                        unit.cursor,
-                        AdvancedIngressPlanRequest(
-                            args.authorization_id,
-                            session_date,
-                            args.universe_target,
-                            args.budgets,
-                            preferred_cohort_id=(
-                                args.preferred_cohort_id
+            if not continuous:
+                try:
+                    with provider.transaction(APP_ROLE) as unit:
+                        plan = resolve_advanced_ingress_plan_cursor(
+                            unit.cursor,
+                            AdvancedIngressPlanRequest(
+                                args.authorization_id,
+                                session_date,
+                                args.universe_target,
+                                args.budgets,
+                                preferred_cohort_id=(
+                                    args.preferred_cohort_id
+                                ),
+                                cohort_selection_reference=(
+                                    args.cohort_selection_reference
+                                ),
+                                canary_start_at=args.canary_start_at,
+                                canary_end_at=args.canary_end_at,
                             ),
-                            cohort_selection_reference=(
-                                args.cohort_selection_reference
-                            ),
-                            canary_start_at=args.canary_start_at,
-                            canary_end_at=args.canary_end_at,
-                        ),
-                        runtime_catalog=catalog,
-                        calendar=calendar,
-                    )
-                    prepare_advanced_ingress_plan_cursor(
-                        unit.cursor,
-                        plan,
-                        checked_at=now,
-                    )
-            except AdvancedCohortResolutionError:
-                stop.wait(settings.bridge_poll_interval_seconds)
-                continue
+                            runtime_catalog=catalog,
+                            calendar=calendar,
+                        )
+                        prepare_advanced_ingress_plan_cursor(
+                            unit.cursor,
+                            plan,
+                            checked_at=now,
+                        )
+                except AdvancedCohortResolutionError:
+                    stop.wait(settings.bridge_poll_interval_seconds)
+                    continue
             provider_deadline = advanced_ingress_provider_deadline(
                 plan.authorized_start_at,
                 plan.authorized_end_at,
@@ -1414,6 +1858,9 @@ def main(argv=None) -> int:
             )
             if args.canary_end_at is not None:
                 drain_deadline = plan.authorized_end_at
+            if continuous and now >= plan.authorized_end_at:
+                stop.wait(args.lifecycle_reconcile_seconds)
+                continue
             if args.startup_backfill_sessions:
                 own_sessions = []
                 previous = session_date
@@ -1452,7 +1899,11 @@ def main(argv=None) -> int:
             if now < warmup_at:
                 stop.wait(
                     min(
-                        settings.bridge_poll_interval_seconds,
+                        (
+                            args.lifecycle_reconcile_seconds
+                            if continuous
+                            else settings.bridge_poll_interval_seconds
+                        ),
                         max(0.0, (warmup_at - now).total_seconds()),
                     )
                 )
@@ -1460,7 +1911,11 @@ def main(argv=None) -> int:
             if now < plan.authorized_start_at:
                 stop.wait(
                     min(
-                        settings.bridge_poll_interval_seconds,
+                        (
+                            args.lifecycle_reconcile_seconds
+                            if continuous
+                            else settings.bridge_poll_interval_seconds
+                        ),
                         max(
                             0.0,
                             (plan.authorized_start_at - now).total_seconds(),
@@ -1490,6 +1945,71 @@ def main(argv=None) -> int:
             )
             while not stop.is_set():
                 now = _now()
+                if continuous:
+                    (
+                        lifecycle_lease,
+                        next_lifecycle_lease_renew_at,
+                    ) = _renew_lifecycle_lease_if_due(
+                        provider,
+                        lifecycle_lease,
+                        checked_at=now,
+                        next_renew_at=(
+                            next_lifecycle_lease_renew_at
+                        ),
+                        lease_seconds=args.lifecycle_lease_seconds,
+                    )
+                    if (
+                        next_desired_pointer_check is None
+                        or now >= next_desired_pointer_check
+                    ):
+                        pointer = _load_current_desired_pointer(provider)
+                        if pointer is None:
+                            detail = (
+                                "Advanced realtime desired-state pointer "
+                                "is missing"
+                            )
+                        elif pointer != observed_desired_pointer:
+                            with provider.transaction(
+                                APP_ROLE,
+                                read_only=True,
+                            ) as unit:
+                                pointer_state = (
+                                    load_effective_desired_state_reconciliation_cursor(
+                                        unit.cursor,
+                                        session_date=pointer[1],
+                                    )
+                                )
+                            detail = (
+                                None
+                                if (
+                                    pointer_state is not None
+                                    and pointer_state.state == "READY"
+                                    and pointer_state.snapshot is not None
+                                )
+                                else (
+                                    "Advanced realtime desired pointer "
+                                    "changed without a READY immutable snapshot"
+                                )
+                            )
+                            observed_desired_pointer = pointer
+                        else:
+                            detail = None
+                        if detail is not None:
+                            if detail != last_reconcile_error:
+                                print(
+                                    "Advanced Equity lifecycle waiting: "
+                                    f"{detail}",
+                                    file=sys.stderr,
+                                )
+                            last_reconcile_error = detail
+                        else:
+                            last_reconcile_error = None
+                        next_desired_pointer_check = (
+                            now
+                            + timedelta(
+                                seconds=args.lifecycle_reconcile_seconds
+                            )
+                        )
                 _tick_hybrid_repair(
                     hybrid,
                     external_ingress=args.external_ingress,
@@ -1736,6 +2256,12 @@ def main(argv=None) -> int:
                 "session_date": plan.session_date.isoformat(),
                 "budgets": asdict(plan.budgets),
                 "catch_up_mode": args.catch_up_mode,
+                "lifecycle_phase": (
+                    lifecycle.phase.value if continuous else "DIAGNOSTIC"
+                ),
+                "catch_up_needed": (
+                    lifecycle.catch_up_needed if continuous else None
+                ),
                 "provider_requests": hybrid.provider_requests,
                 "equity_watermark": {
                     "session_open_utc": session_open.isoformat(),
@@ -1769,9 +2295,19 @@ def main(argv=None) -> int:
                 write_report(controller_report, terminal_report)
             if args.debug_single_session:
                 return 0
-            stop.wait(settings.bridge_poll_interval_seconds)
+            stop.wait(
+                args.lifecycle_reconcile_seconds
+                if continuous
+                else settings.bridge_poll_interval_seconds
+            )
         return 0
     finally:
+        if lifecycle_lease is not None:
+            with provider.transaction(APP_ROLE) as unit:
+                release_lifecycle_lease_cursor(
+                    unit.cursor,
+                    lifecycle_lease,
+                )
         pool.closeall()
 
 

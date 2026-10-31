@@ -528,6 +528,16 @@ Actions:
 - remove normal CLI dependence on authorization ID, session date and first cutoff;
 - generate finite session budgets internally from configuration and reset them only at
   the derived session boundary;
+- pin the first selected plan and budgets for a session so a restart or same-day
+  configuration change cannot create a second usage ledger;
+- separate provider acquisition cutoff, current-session processing drain and
+  next-session preparation clocks;
+- automatically reconcile a pending effective desired revision after member
+  preparation changes, without requiring a manual reconcile command;
+- retain and recover the current session's durable processing after market close while
+  preparing the next session independently;
+- assign capability refresh/revalidation ownership and keep expired-only state visibly
+  blocked rather than copying expired capability into a new session;
 - retain current lease/owner epoch, journal generation and cumulative counters;
 - make native and Docker launchers start the same resident set;
 - keep current one-session scheduler disabled but available for diagnostics.
@@ -542,17 +552,56 @@ Exit:
 
 Rollback: select the legacy bounded runtime mode; no durable data conversion required.
 
+##### C3 Review Findings And Resolutions
+
+Status: `IMPLEMENTED_PROVIDER_FREE_REVIEWED`; manual/runtime validation remains
+separate before C4.
+
+| ID | Finding | Resolution | Status |
+| --- | --- | --- | --- |
+| C3-R1 | A current desired revision can remain `MISSING_SNAPSHOT` after its members become ready. | The bounded lifecycle owner automatically reconciles pending effective intent on readiness change/startup; no separate operator reconcile step. | `RESOLVED_PROVIDER_FREE` |
+| C3-R2 | Acquisition close, processing drain and next-session selection are conflated. | Provider acquisition, current processing drain and future preparation use distinct clocks; existing identical plans remain recoverable after close. | `RESOLVED_PROVIDER_FREE` |
+| C3-R3 | Changing same-day configured budgets can mint another authorization/usage ledger. | The first session plan/budgets/counters are pinned and reused; changed configuration applies at the next session boundary. | `RESOLVED_PROVIDER_FREE` |
+| C3-R4 | Direct-controller continuous mode can wait inside ingress while its lifecycle lease expires. | Normal continuous mode requires the independently fenced external ingress resident; direct child execution remains diagnostic-only. | `RESOLVED_PROVIDER_FREE` |
+| C3-R5 | A copied capability profile can expire before the next session closes. | An independent resident verifies exact intended `STOCKS/AM` WebSocket subscription scope, schedules one TTL-valid bounded probe, records exact accepted/rejected membership and remains visibly waiting/degraded on failure. The probe has an explicit deadline and cumulative control-byte ceiling. | `RESOLVED_PROVIDER_FREE` |
+| C3-R6 | Continuous health can prefer a future snapshot and report `IDLE` while today's plan is stalled. | Health reports current acquisition, unfinished prior processing and future preparation separately and evaluates stream heartbeat freshness. | `RESOLVED_PROVIDER_FREE` |
+| C3-R7 | Readiness update and snapshot materialization are not serialized per revision. | A shared revision lock serializes readiness/reconcile and reconcile/reconcile; equivalent concurrent callers return the first committed snapshot while real identity conflicts still fail. | `RESOLVED_DISPOSABLE_DB` |
+| C3-R8 | Rollover intent can be rolled back together with a `REFRESH_REQUIRED` reconciliation result, leaving the refresh worker pointed at the prior session. | Target-session desired intent is committed before capability-dependent reconciliation, so refresh observes the new session even when snapshot creation waits. | `RESOLVED_DISPOSABLE_DB` |
+| C3-R9 | Capability refresh can open a second Stocks WebSocket while live ingress owns the account's default single Stocks connection. | Live ingress and capability probe share one database-fenced account/Stocks connection owner; a probe waits while ingress owns the default connection. | `RESOLVED_DISPOSABLE_DB` |
+| C3-R10 | Subscription acknowledgements may arrive across frames, while a generic `success` does not prove exact member acceptance. | The bounded probe accumulates explicit accepted/rejected/unconfirmed membership across frames; generic success alone is not exact-membership PASS. | `RESOLVED_PROVIDER_FREE` |
+| C3-R11 | Processing drain can end at close plus completion budget while the final window deadline also includes finality delay. | Processing ownership is derived from the actual final-window deadline and any longer provider drain. | `RESOLVED_PROVIDER_FREE` |
+| C3-R12 | Lifecycle, refresh, scheduler and health coordination can repeat more often than their state can change. | Lease heartbeat is separated from expensive reconciliation; capability/scheduler work is paced by pointer, expiry, retry and next-window times; immutable session state is cached and health stays scoped to active work. | `RESOLVED_PROVIDER_FREE` |
+
 #### C4 - Complete Equity Catch-Up And Off-Hours Warmup
 
-Purpose: make missing historical data self-healing without delaying current work.
+Purpose: make missing historical data self-healing and support arbitrary configured
+Equity/ETF membership without delaying established work.
 
 Actions:
 
 - expand hybrid repair from the current limited scope into bounded chunks derived from
   acquisition/finalization watermarks;
 - preserve explicit REST repair lineage and stream precedence;
+- make one off-hours desired-membership change the only operator action: workers
+  resolve stored identity, backfill history, derive intervals, track readiness and
+  create the effective manifest/cohort/session state automatically;
+- never require the operator to create a snapshot, cohort, hash, authorization or
+  dated session file for a newly configured member;
+- replace the fixed `1/9/25/50/100/200/400` runtime-profile ladder as a membership
+  validity constraint; any configured membership inside the supported 1-400 bound must
+  receive a deterministic runtime configuration without source edits;
+- keep immutable intended membership separate from changing operational readiness;
 - reconcile new Equity/ETF members independently;
 - derive technical warmup and per-member readiness;
+- prevent one new `WARMING` or failed optional member from suspending already-ready
+  members or unrelated lanes;
+- automatically reconcile a member into the next effective snapshot when its required
+  warmup becomes ready;
+- expose stored backfill coverage and readiness in the portal while a member warms,
+  then include the ready member in normal stored projections without a manual publish
+  step;
+- retry failed backfill from its durable watermark/attempt state without discarding
+  completed intervals or restarting established members;
 - persist recovered detector results at their original cutoffs;
 - suppress stale delivery and pointer regression.
 
@@ -562,6 +611,12 @@ Exit:
   current finalized interval;
 - live journal offsets continue advancing during repair;
 - one missing member blocks only products that explicitly require complete membership;
+- adding a tenth, eleventh or other non-ladder member is accepted without choosing a
+  fake larger universe or weakening resource bounds;
+- a newly configured member's available historical data/readiness becomes visible in
+  the portal during preparation and its ready projections appear automatically;
+- interrupted/failed backfill resumes from durable progress and does not replay
+  completed work;
 - current pointer and detector state remain monotonic.
 
 Rollback: stop automatic repair and retain explicit gaps; live capture continues.
@@ -575,6 +630,9 @@ Actions:
 
 - implement the database session-state repository returning current P8 typed objects;
 - persist pre-open/session and downstream E/O bindings transactionally;
+- revalidate session-specific contract membership, catalog versions, prior OI and
+  reference freshness before creating the session acquisition state; carrying
+  yesterday's slot set forward is not evidence of today's valid subscription set;
 - keep the file adapter and export command for replay;
 - start Options residents from effective session state and keep them waiting when no
   window E exists;
@@ -600,6 +658,9 @@ Actions:
 - replace hard-coded QQQ/SPY/four-member validation with configured membership;
 - retain the exact-four selection policy as one supported default;
 - generalize scheduler expected counts and stored-reader coverage;
+- calculate account-wide connection capacity before shard construction, including
+  concurrently active Equity and Options owners, reconnect headroom and provider
+  entitlement limits;
 - build deterministic contract shards within the configured/provider maximum;
 - give every shard independent owner, journal generation, counters and reconnect gaps;
 - aggregate readiness without hiding a failed shard;
@@ -611,6 +672,8 @@ Exit:
 - a larger provider-free membership partitions deterministically and rehydrates;
 - adding one Options underlying during maintenance backfills catalog/OI and becomes
   ready without changing existing shard identities unnecessarily;
+- the session refuses an over-capacity shard plan explicitly rather than truncating
+  contracts or discovering the connection limit during live startup;
 - removing an underlying affects the next session only and retains old evidence.
 
 Rollback: configure the exact-four default membership; generic schema remains additive.
@@ -626,6 +689,10 @@ Actions:
 - keep Options lane independence and H/E/O source requirements;
 - add monotonic publication guards for late catch-up completion;
 - ensure publication failure does not stop acquisition;
+- retry failed projection/publication from durable receipts/outbox state without
+  recomputing provider input or requiring a manual release/pointer operation;
+- merge a newly ready member into the next canonical stored release while preserving
+  established members and the prior readable release until the new publish commits;
 - keep stale catch-up alerts stored but non-delivered.
 
 Exit:
@@ -647,6 +714,10 @@ Actions:
   journal/report/retention volumes;
 - remove required date, package, bundle and binding mounts from that profile;
 - use `restart: unless-stopped` for resident roles and preserve graceful drain;
+- isolate provider, processing, API and frontend failures so an API/frontend exit does
+  not stop healthy acquisition or processing children;
+- replace bounded restart exhaustion for long-lived residents with per-role degraded
+  state, bounded backoff and explicit operator-visible terminal conditions;
 - expose one status summary with per-service, per-shard and per-member readiness;
 - configure ordinary partition creation, retention and archive cadence;
 - document one startup, status, stop, backup and restore workflow.
@@ -690,17 +761,34 @@ reverting schema or data-plane changes.
 | --- | --- |
 | Before-open cold start | Correct XNYS session, no manual date, ready members subscribe once. |
 | Market-hours cold start | Live capture begins first; recoverable gap catches up; raw gap remains explicit. |
+| Readiness completes after startup | Pending desired intent reconciles automatically; no manual reconcile command is required. |
 | Weekend/holiday/DST/half day | Correct next session, open/close and dynamic window count. |
+| Restart during post-close drain | Existing plan is reused; current final window completes through its full deadline while next-session preparation remains separate. |
+| Rollover requires capability refresh | Target-session desired intent remains committed/visible even when snapshot reconciliation waits for fresh capability; refresh never targets only the prior session because of controller rollback. |
+| Same-day configuration change | Current plan/budgets/usage remain pinned; new values apply only to the next session. |
 | Add Equity/ETF after close | History/warmup progresses per member; next session snapshot includes only ready/effective state as designed. |
+| Add non-ladder Equity/ETF member | Any supported 1-400 count receives a deterministic profile; ready existing members continue while the new member warms. |
+| Automatic member onboarding | One desired-state edit triggers history repair, derived warmup, readiness, immutable session state and portal inclusion with no manual snapshot/cohort/hash/authorization step. |
+| Warming member with established universe | Established acquisition, detectors and portal releases continue; the warming member exposes partial stored coverage/readiness independently. |
+| Backfill interruption | Retry resumes from the member's durable watermark/attempt and preserves completed intervals. |
 | Add Options underlying after close | Catalog/OI/history reconcile; deterministic contracts/shards; existing members unchanged. |
+| Options next-session rollover | Contract/catalog/OI/reference evidence is revalidated for the new session; stale prior slot membership is not reused as current proof. |
 | Equity ingress crash | Same journal generation/owner recovery or explicit new fenced generation; no duplicate bars. |
 | Options shard crash | Only that shard reconnects; gaps/counters survive; other shards continue. |
 | Lifecycle supervisor crash | Existing live children are detected; no second coordinator/socket starts. |
+| Capability profile expires | Refresh owner performs one bounded exact-scope `STOCKS/AM` subscription probe within the valid pre-session window, supplies a fresh profile or leaves lifecycle visibly blocked; validity is never silently extended and weekends do not cause repeated premature provider calls. |
+| Capability refresh while ingress is live | No second Stocks connection is opened under the default account limit; ingress evidence is reused or a probe waits for the shared asset-class connection owner. |
+| Split subscription acknowledgements | Explicit acknowledgements accumulate across frames; accepted, rejected and unconfirmed members are distinct at deadline. |
+| Final window drain | Processing ownership remains on the current session through the exact final-window deadline including finality delay plus completion budget. |
+| Current stalled plus future prepared | Health reports the stalled current session, unfinished prior processing and future preparation independently. |
+| Bounded coordination overhead | Lease heartbeat, desired/capability reconciliation, scheduler progress and health queries run on separate bounded cadences driven by their next possible state change, not each message or tight poll. |
 | Database interruption | Journals remain bounded/durable; consumers resume from checkpoints. |
+| Concurrent readiness/reconcile | One revision lock yields one immutable snapshot; concurrent callers return the same first committed identity. |
 | Journal partial write/corrupt tail | Recovery stops at verified durable boundary and surfaces the error. |
 | One failed window | Immutable failure retained; later windows continue. |
 | Catch-up completes late | Historical evidence persists; newer current pointer/state does not regress. |
 | Publication failure | Prior release remains readable; acquisition and unrelated products continue. |
+| New-member publication failure | Durable projection/publication retry resumes without re-fetching provider data or manually advancing a pointer. |
 | Retention/archive failure | Alarm/status visible; source rows and live ingestion remain intact. |
 | Exact-four regression | Current validated QQQ/SPY path remains equivalent. |
 | Larger membership | Deterministic sharding, bounded memory, visible partial readiness and no silent truncation. |
@@ -742,8 +830,17 @@ exact-four and target-9 fixtures as known examples.
 | Exact count assumptions remain in readers | Inventory validators, health, result counts, tests and UI summaries before generic activation. |
 | Options membership exceeds one connection | Deterministic shards; no truncation; explicit over-limit status. |
 | One Options shard blocks all products | Per-shard and per-underlying readiness with product-declared completeness. |
+| Intended membership and readiness collapse | Immutable desired membership remains intact while operational readiness changes independently. |
 | P8 file append guarantees are lost in DB move | Transactional append sequence, previous hash and idempotent replay tests. |
 | Session rollover resets cumulative usage after crash | Session-keyed counters persist independently of process lifetime. |
+| Same-day budget change creates another plan | First session plan/budgets remain pinned; changed configuration is next-session intent. |
+| Provider close switches processing too early | Separate acquisition, processing-drain and future-preparation clocks retain the current final window through completion. |
+| Rollover rollback hides capability demand | Pending target-session intent is durable before capability-dependent snapshot reconciliation. |
+| Capability probe competes with live ingress | One shared account/asset-class connection owner serializes live ingress and subscription probes. |
+| One-frame subscription assumption | Bounded multi-frame acknowledgement accumulation retains accepted/rejected/unconfirmed membership. |
+| Coordination churn grows despite quiet market | Heartbeats remain cheap and separate from desired/profile/window/health reconciliation. |
+| Future snapshot masks current health | Health selects current acquisition/processing by clock and reports future preparation separately. |
+| Readiness races immutable snapshot creation | Shared revision serialization and first-writer timestamp semantics prevent divergent equivalent snapshots. |
 | Retention drops data still needed by catch-up | Open pins/watermarks prevent drop; maintenance stays separate from live scheduling. |
 | Existing uncommitted V3 source changes are overwritten | Implement from the current working tree, preserve user changes and commit coherent packages only. |
 
@@ -757,16 +854,21 @@ The consolidation is complete when:
    or dated scheduled task;
 3. desired membership changes during maintenance and becomes an immutable automatic
    next-session snapshot;
-4. the platform catches up after downtime while continuing current capture;
-5. exact current V3 journal, receipt, H/E/O, P8, detector, publication and reader
+4. new members backfill and expose available portal data automatically without manual
+   snapshots, cohorts, hashes, authorizations or publication actions;
+5. one warming member never blocks established members unless a product explicitly
+   declares complete-universe membership;
+6. backfill and publication retries resume from durable progress;
+7. the platform catches up after downtime while continuing current capture;
+8. exact current V3 journal, receipt, H/E/O, P8, detector, publication and reader
    contracts remain covered by their regression suites;
-6. exact-four QQQ/SPY remains a supported configuration while larger configurations
+9. exact-four QQQ/SPY remains a supported configuration while larger configurations
    shard deterministically;
-7. restart cannot create duplicate provider owners, stage completion or publication;
-8. old runtime control paths are removed or clearly diagnostic-only;
-9. status makes missing history, raw gaps, warming members, failed shards and stale
+10. restart cannot create duplicate provider owners, stage completion or publication;
+11. old runtime control paths are removed or clearly diagnostic-only;
+12. status makes missing history, raw gaps, warming members, failed shards and stale
    publications visible without stopping unrelated work;
-10. README, deployment, canonical design and compact checkpoint all name only the
+13. README, deployment, canonical design and compact checkpoint all name only the
     consolidated normal runtime.
 
 ## Existing Detailed Pipeline Reference

@@ -25,11 +25,16 @@ from realtime.advanced_scheduler import (  # noqa: E402
     discover_advanced_window_recovery_cursor,
     ensure_advanced_scheduler_session_cursor,
     ensure_advanced_window_retry_cursor,
+    load_advanced_scheduler_progress_cursor,
     load_advanced_scheduler_scope_cursor,
+    load_continuous_advanced_scheduler_scope_cursor,
     order_advanced_due_windows,
     persist_advanced_scheduler_lifecycle_cursor,
     prioritize_live_over_blocked_backfill_cursor,
     set_advanced_window_retry_status_cursor,
+)
+from realtime.advanced_equity_lifecycle import (  # noqa: E402
+    AdvancedEquityLifecyclePlanner,
 )
 from realtime.advanced_ingress_plan import (  # noqa: E402
     advanced_ingress_provider_deadline,
@@ -54,57 +59,116 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
     parser.add_argument("--confirm-database-name", required=True)
-    parser.add_argument("--authorization-id", type=UUID, required=True)
-    parser.add_argument("--cohort-id", type=UUID, required=True)
-    parser.add_argument("--session-date", type=date.fromisoformat, required=True)
-    parser.add_argument("--first-cutoff", type=datetime.fromisoformat, required=True)
-    parser.add_argument("--finality-delay-seconds", type=int, required=True)
+    parser.add_argument(
+        "--runtime-mode",
+        choices=("continuous", "legacy-diagnostic"),
+        default=(
+            os.getenv("REALTIME_V2_ADVANCED_RUNTIME_MODE")
+            or "continuous"
+        ),
+    )
+    parser.add_argument("--authorization-id", type=UUID)
+    parser.add_argument("--cohort-id", type=UUID)
+    parser.add_argument("--session-date", type=date.fromisoformat)
+    parser.add_argument("--first-cutoff", type=datetime.fromisoformat)
+    parser.add_argument(
+        "--finality-delay-seconds",
+        type=int,
+        default=int(
+            os.getenv("REALTIME_V2_ADVANCED_FINALITY_DELAY_SECONDS")
+            or 5
+        ),
+    )
     parser.add_argument("--completion-budget-seconds", type=int, default=300)
-    parser.add_argument("--authorization-reference", required=True)
+    parser.add_argument("--authorization-reference")
     parser.add_argument(
         "--publication-mode",
         choices=(PROJECTION_ONLY,),
-        required=True,
+        default=PROJECTION_ONLY,
     )
-    parser.add_argument("--report-directory", type=Path, required=True)
+    parser.add_argument(
+        "--report-directory",
+        type=Path,
+        default=(
+            BACKEND_DIR
+            / ".realtime-canary"
+            / "v2-advanced-windows"
+        ),
+    )
     parser.add_argument("--poll-seconds", type=float, default=1)
+    parser.add_argument(
+        "--scope-reconcile-seconds",
+        type=float,
+        default=15,
+    )
     parser.add_argument("--continuous", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
-    if (
-        args.first_cutoff.tzinfo is None
-        or args.first_cutoff.utcoffset() is None
-    ):
-        parser.error("--first-cutoff must be timezone-aware")
-    args.first_cutoff = args.first_cutoff.astimezone(timezone.utc)
+    explicit = (
+        args.authorization_id,
+        args.cohort_id,
+        args.session_date,
+        args.first_cutoff,
+        args.authorization_reference,
+    )
+    if args.runtime_mode == "continuous":
+        if any(value is not None for value in explicit):
+            parser.error(
+                "continuous scheduler derives authorization, cohort, "
+                "session, first cutoff and reference; use "
+                "--runtime-mode legacy-diagnostic for explicit scope"
+            )
+    elif any(value is None for value in explicit):
+        parser.error(
+            "legacy diagnostic scheduler requires authorization, cohort, "
+            "session, first cutoff and authorization reference"
+        )
+    if args.first_cutoff is not None:
+        if (
+            args.first_cutoff.tzinfo is None
+            or args.first_cutoff.utcoffset() is None
+        ):
+            parser.error("--first-cutoff must be timezone-aware")
+        args.first_cutoff = args.first_cutoff.astimezone(timezone.utc)
     if not 1 <= args.finality_delay_seconds <= 60:
         parser.error("--finality-delay-seconds must be in [1, 60]")
     if not 1 <= args.completion_budget_seconds <= 300:
         parser.error("--completion-budget-seconds must be in [1, 300]")
-    if args.poll_seconds <= 0:
+    if (
+        args.poll_seconds <= 0
+        or args.scope_reconcile_seconds < args.poll_seconds
+    ):
         parser.error("--poll-seconds must be positive")
-    if not args.authorization_reference.strip():
+    if (
+        args.authorization_reference is not None
+        and not args.authorization_reference.strip()
+    ):
         parser.error("--authorization-reference cannot be blank")
     if not args.continuous or not args.execute:
         parser.error("Advanced scheduler requires --continuous --execute")
     args.report_directory = args.report_directory.resolve()
-    windows = advanced_session_windows(
-        args.session_date,
-        finality_delay_seconds=args.finality_delay_seconds,
-        completion_budget_seconds=args.completion_budget_seconds,
-        serving_lag_seconds=30,
-    )
-    args.windows = tuple(
-        window
-        for window in windows
-        if window.cutoff.astimezone(timezone.utc) >= args.first_cutoff
-    )
-    if (
-        not args.windows
-        or args.windows[0].cutoff.astimezone(timezone.utc)
-        != args.first_cutoff
-    ):
-        parser.error("--first-cutoff is not an Advanced five-minute boundary")
+    args.windows = ()
+    if args.runtime_mode == "legacy-diagnostic":
+        windows = advanced_session_windows(
+            args.session_date,
+            finality_delay_seconds=args.finality_delay_seconds,
+            completion_budget_seconds=args.completion_budget_seconds,
+            serving_lag_seconds=30,
+        )
+        args.windows = tuple(
+            window
+            for window in windows
+            if window.cutoff.astimezone(timezone.utc)
+            >= args.first_cutoff
+        )
+        if (
+            not args.windows
+            or args.windows[0].cutoff.astimezone(timezone.utc)
+            != args.first_cutoff
+        ):
+            parser.error(
+                "--first-cutoff is not an Advanced five-minute boundary"
+            )
     return args
 
 
@@ -133,26 +197,84 @@ def main(argv=None) -> int:
     )
     provider, pool = _provider(config)
     calendar = OptionExchangeCalendar("XNYS")
+    planner = AdvancedEquityLifecyclePlanner(calendar=calendar)
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    continuous = args.runtime_mode == "continuous"
     session_date = args.session_date
     first_cutoff = args.first_cutoff
     initial_session = True
     audited_sessions: set[UUID] = set()
+    cached_session_date = None
+    cached_scope = None
+    cached_windows = None
+    cached_progress = None
+    next_scope_reconcile_at = None
     try:
         while not stop.is_set():
             now = datetime.now(timezone.utc)
-            with provider.transaction(APP_ROLE, read_only=True) as unit:
-                scope = load_advanced_scheduler_scope_cursor(
-                    unit.cursor,
-                    authorization_id=args.authorization_id,
-                    session_date=session_date,
+            if continuous:
+                bootstrap_profile = catalog.profile_for_target(9)
+                lifecycle = planner.plan(
+                    drain_seconds=(
+                        bootstrap_profile.settings.drain_deadline_seconds
+                    ),
+                    finality_delay_seconds=args.finality_delay_seconds,
+                    completion_budget_seconds=(
+                        args.completion_budget_seconds
+                    ),
                 )
+                session_date = lifecycle.target_session_date
+                first_cutoff = lifecycle.first_due_cutoff
+            refresh_scope = (
+                not continuous
+                or cached_session_date != session_date
+                or next_scope_reconcile_at is None
+                or now >= next_scope_reconcile_at
+            )
+            if refresh_scope:
+                with provider.transaction(
+                    APP_ROLE,
+                    read_only=True,
+                ) as unit:
+                    scope = (
+                        load_continuous_advanced_scheduler_scope_cursor(
+                            unit.cursor,
+                            session_date=session_date,
+                        )
+                        if continuous
+                        else load_advanced_scheduler_scope_cursor(
+                            unit.cursor,
+                            authorization_id=args.authorization_id,
+                            session_date=session_date,
+                        )
+                    )
+                if continuous:
+                    cached_session_date = session_date
+                    cached_scope = scope
+                    cached_windows = None
+                    cached_progress = None
+                    next_scope_reconcile_at = (
+                        now
+                        + timedelta(
+                            seconds=args.scope_reconcile_seconds
+                        )
+                    )
+            else:
+                scope = cached_scope
             if scope is None:
-                stop.wait(args.poll_seconds)
+                stop.wait(
+                    args.scope_reconcile_seconds
+                    if continuous
+                    else args.poll_seconds
+                )
                 continue
-            if initial_session and scope["cohort_id"] != args.cohort_id:
+            if (
+                not continuous
+                and initial_session
+                and scope["cohort_id"] != args.cohort_id
+            ):
                 raise ValueError("initial scheduler cohort differs from plan")
             runtime_profile = catalog.profile_for_sha(
                 scope["runtime_profile_sha256"]
@@ -171,17 +293,67 @@ def main(argv=None) -> int:
                 scope["authorized_end_at"] if bounded
                 else session_close + timedelta(seconds=runtime_profile.settings.drain_deadline_seconds)
             )
-            all_windows = advanced_session_windows(
+            all_windows = cached_windows or advanced_session_windows(
                 session_date,
                 finality_delay_seconds=args.finality_delay_seconds,
                 completion_budget_seconds=args.completion_budget_seconds,
                 serving_lag_seconds=30,
             )
+            if continuous:
+                cached_windows = all_windows
+            if continuous:
+                refresh_progress = (
+                    cached_progress is None
+                    or refresh_scope
+                    or (
+                        first_cutoff is not None
+                        and first_cutoff <= now
+                    )
+                )
+                if refresh_progress:
+                    with provider.transaction(
+                        APP_ROLE,
+                        read_only=True,
+                    ) as unit:
+                        cached_progress = (
+                            load_advanced_scheduler_progress_cursor(
+                                unit.cursor,
+                                cohort_id=scope["cohort_id"],
+                                session_date=session_date,
+                                first_cutoff=all_windows[0].cutoff,
+                                final_cutoff=all_windows[-1].cutoff,
+                            )
+                        )
+                progress = cached_progress
+                lifecycle = planner.plan(
+                    drain_seconds=(
+                        runtime_profile.settings.drain_deadline_seconds
+                    ),
+                    finality_delay_seconds=args.finality_delay_seconds,
+                    completion_budget_seconds=(
+                        args.completion_budget_seconds
+                    ),
+                    last_completed_cutoff=(
+                        progress.last_completed_cutoff
+                    ),
+                )
+                if lifecycle.target_session_date != session_date:
+                    stop.wait(args.poll_seconds)
+                    continue
+                first_cutoff = lifecycle.first_due_cutoff
+                drain_deadline = lifecycle.processing_deadline
             own_first_cutoff = (
                 first_cutoff
-                if initial_session
+                if continuous or initial_session
                 else all_windows[0].cutoff
             )
+            if own_first_cutoff is None:
+                stop.wait(
+                    args.scope_reconcile_seconds
+                    if continuous
+                    else args.poll_seconds
+                )
+                continue
             windows = _authorized_windows(
                 all_windows,
                 first_cutoff=own_first_cutoff,
@@ -191,7 +363,10 @@ def main(argv=None) -> int:
             with provider.transaction(APP_ROLE) as unit:
                 scheduler_session = ensure_advanced_scheduler_session_cursor(
                     unit.cursor,
-                    authorization_id=args.authorization_id,
+                    authorization_id=scope.get(
+                        "authorization_id",
+                        args.authorization_id,
+                    ),
                     ingress_plan_id=scope["plan_id"],
                     cohort_id=scope["cohort_id"],
                     session_date=session_date,
@@ -253,8 +428,11 @@ def main(argv=None) -> int:
                     if not is_advanced_canary_window(
                         scope["authorized_start_at"], session_close,
                     ):
-                        session_date = calendar.next_session_date(session_date)
-                        initial_session = False
+                        if not continuous:
+                            session_date = calendar.next_session_date(
+                                session_date
+                            )
+                            initial_session = False
                     stop.wait(args.poll_seconds)
                     continue
             due = order_advanced_due_windows(
@@ -328,7 +506,10 @@ def main(argv=None) -> int:
                     "--completion-budget-seconds",
                     str(args.completion_budget_seconds),
                     "--authorization-reference",
-                    args.authorization_reference,
+                    scope.get(
+                        "authorization_reference",
+                        args.authorization_reference,
+                    ),
                     "--report-path",
                     str(
                         args.report_directory

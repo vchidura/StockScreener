@@ -10,7 +10,8 @@ self-reconciling continuous worker for local and Docker development.
 Canonical design and assessment:
 [REALTIME_V3_PIPELINE.md](../REALTIME_V3_PIPELINE.md).
 
-Mode: C0/C1 committed at `eafe5f7`; C2 implemented and validated, review pending.
+Mode: C0/C1 committed at `eafe5f7`; C2 committed at `3754337`; C3 implemented
+and validated, review pending.
 
 ## Settled Runtime Decisions
 
@@ -112,10 +113,108 @@ Mode: C0/C1 committed at `eafe5f7`; C2 implemented and validated, review pending
   C2 plus adjacent disposable PostgreSQL control-plane and slot-set tests: 21 passed
   with 4 existing warnings.
 
+## C3 Completion Evidence
+
+- The existing Advanced controller is the sole lifecycle leader. It fences one owner
+  in `rt.worker_leases`; the existing STOCKS stream owner epoch, journal generation
+  and cumulative plan-usage ledgers remain authoritative.
+- The provider-free injected-clock planner derives XNYS before-open, market-hours,
+  drain and idle phases; current/next sessions; dynamic half-day/DST windows; first
+  due cutoff; and catch-up-needed state.
+- The controller selects the C2 current/effective immutable snapshot and carries
+  unchanged intent into a new immutable revision/snapshot only at a derived session
+  boundary. Its internal rollover may explicitly target the planner's active XNYS
+  session after offline downtime; operator changes still use C2 market-hours
+  deferral. A current revision with no snapshot is reconciled automatically after
+  readiness changes; readiness and materialization share one revision advisory lock,
+  and concurrent reconcilers reuse first-writer `materialized_at` evidence.
+- Target-session desired intent/current selection commits before capability-dependent
+  snapshot reconciliation. A REFRESH_REQUIRED rollback therefore retains one durable
+  target revision for the refresh resident; success later creates one snapshot/plan.
+- Continuous mode derives the session cohort, authorization, date and cutoff.
+  Session-scoped finite stream/connection/byte/repair budgets create a deterministic
+  internal authorization ladder and daily plan without resetting durable counters.
+  A restart pins the existing same-session plan, budgets and usage even if runtime
+  configuration changed; the change applies only when preparing the next session.
+- Acquisition stops at exchange close. Provider drain, exact final-window deadline
+  (`close + finality delay + completion budget`, including half days) and
+  next-session preparation are separate: scheduler/finalizer retain today's scope
+  through that deadline while the controller may prepare tomorrow.
+- Continuous controller mode requires the independent external ingress resident;
+  direct provider-child execution remains `legacy-diagnostic` only.
+- An independent capability-refresh resident now owns
+  `CAPABILITY_REFRESH_REQUIRED:REFERENCE` in native and Compose lineups. On startup,
+  desired/profile change, approaching expiry and bounded cadence it checks the exact
+  Equity AM scope with one AdvancedGateway subscription-only WebSocket session, then
+  reuses the existing Advanced control-plane builder/persistence to append honest
+  profile/check evidence. Historical REST success is not capability evidence.
+- The probe persists exact accepted/rejected `AM.*` membership plus bounded
+  connection/control/request/byte evidence. Partial or rejected membership is never
+  PASS. A 400-member scope remains one subscription request/connection.
+- Subscription acknowledgement accumulates across bounded frames. Generic success
+  confirms only request/control success; PASS requires every requested member
+  explicitly accepted with zero rejected or unconfirmed members.
+- Probe runtime is bounded by a configurable event-loop timeout and cumulative
+  control-byte ceiling, both smaller than the resident lease by validation. Silent
+  auth, silent subscription acknowledgement and byte overflow close the socket,
+  raise typed probe failures and return to persisted DEGRADED/backoff.
+- TTL planning derives the earliest `probe_not_before` whose evidence can cover the
+  target XNYS close. Earlier weekend/holiday checks expose `WAITING`/next check and
+  make zero provider calls; unchanged fresh scope also makes zero calls.
+- Temporary provider failure persists `DEGRADED`, heartbeat, last success and bounded
+  next retry in existing readiness/lease state. It does not exit or stop controller,
+  ingress, scheduler, bridge or finalizer; successful fake-source refresh unblocks the
+  next lifecycle reconciliation without a manual command.
+- Ingress and capability probe share one atomic database-visible
+  `provider-connection:massive:STOCKS` owner fence. Live ingress blocks probes;
+  release/expiry permits one probe, and concurrent claims cannot open two sockets.
+- One bounded `window_runs` query uses the existing cohort/window-key index to load
+  latest discovered and contiguous-complete progress. Controller/scheduler planning
+  starts after that durable prefix; complete sessions have no due cutoff and midday
+  catch-up does not rescan earlier completed windows.
+- Initial lifecycle claim refuses every unexpired lease, including the same owner
+  UUID. Renewal is the only same-process continuation; expired takeover advances the
+  durable owner epoch.
+- `legacy-diagnostic` retains explicit authorization/cohort/session/cutoff arguments.
+  Native and Compose continuous launchers now share capability refresh, controller,
+  ingress, bridge, finalizer and scheduler residents; ingress detects a surviving
+  live stream before spawning another child.
+- Desired state is read on startup, pointer change, session transition and bounded
+  supervisor cadence only. The live ingress/message path has no lifecycle,
+  calendar, desired-state or leadership query.
+- Controller lease renewal runs at one-third of its lease instead of every supervisor
+  loop. Capability membership/readiness reloads use retry/expiry or bounded status
+  cadence, scheduler caches immutable session scope/windows, and runtime health scopes
+  current processing without aggregating historical failures.
+- Continuous health reports current acquisition, unfinished processing and future
+  preparation separately; active stale streams are `STALE`, failures are `DEGRADED`,
+  completed acquisition is `TERMINAL` and future-only preparation is `IDLE`. It also
+  exposes capability-refresh owner epoch, heartbeat, last success, TTL waiting and
+  next retry.
+- Final provider-free offline compatibility selection: 282 passed, 7 skipped
+  (including six opt-in PostgreSQL tests), 1 pre-existing malformed delayed-pong
+  fake deselected and 5 existing warnings.
+- Final owned disposable PostgreSQL selection: 30 passed with 5 existing warnings.
+  Evidence includes refresh failure visibility, fake-source capability/check
+  persistence, next-reconcile success, readiness/reconcile races, first-writer
+  snapshot identity, Friday-to-Monday rollover, post-close plan reuse, budget
+  pinning, scheduler scope, ingress-plan compatibility and lease fencing.
+- Remaining C4+: remove fixed count ladders and split intended membership from
+  per-member/lane readiness in C4; revalidate daily Options/reference evidence and
+  account-wide connection capacity in C5/C6; isolate resident/API/frontend failures
+  and long-lived recovery in C8. C3 intentionally retains the global WARMING gate.
+  No migration or new coordination table was added.
+
 ## Exact Anchors
 
+- `backend/realtime/advanced_equity_capability_refresh.py`
+- `backend/realtime/advanced_equity_lifecycle.py`
+- `backend/scripts/run_realtime_v2_advanced_capability_refresh.py`
 - `backend/scripts/run_realtime_v2_advanced_equity_scheduler.py`
 - `backend/scripts/run_realtime_v2_advanced_controller.py`
+- `backend/scripts/run_realtime_v2_advanced_ingress_service.py`
+- `backend/scripts/run_realtime_v2_advanced_services.py`
+- `backend/scripts/run_realtime_v2_equity_interval_finalizer.py`
 - `backend/realtime/advanced_ingress_controller.py`
 - `backend/realtime/advanced_gap_repair.py`
 - `backend/realtime/advanced_realtime_session_scheduler.py`
@@ -127,8 +226,10 @@ Mode: C0/C1 committed at `eafe5f7`; C2 implemented and validated, review pending
 - `backend/scripts/manage_advanced_realtime_desired_state.py`
 - `docker-compose.realtime-v2.yml`
 
-Focused completion check: PASS. A provider-free desired revision derives the next
-XNYS session, atomically selects one current revision, blocks baseline shrinkage,
-replays one immutable manifest/cohort/slot-set snapshot idempotently, defers
-market-hours edits without changing the active snapshot, and performs zero provider,
-production or publication effects.
+Focused completion check: PASS. Provider-free continuous Equity startup needs no
+manual session/cohort/cutoff identity, selects the effective C2 snapshot, refuses a
+duplicate leader, preserves active stream ownership and durable usage, idles across
+close/weekend, rolls a missed session during market hours with catch-up still
+required, pins same-session budgets, preserves a full processing drain, serializes
+snapshot creation and performs zero provider, production, Docker or publication
+effects.

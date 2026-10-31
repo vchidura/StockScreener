@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from uuid import UUID
 
 from options.calendar import OptionExchangeCalendar
@@ -54,6 +54,7 @@ from .tier_cohort import (
 
 DESIRED_STATE_SCOPE = "ADVANCED_REALTIME"
 _DESIRED_MEMBER_BATCH_SIZE = 1_000
+CAPABILITY_REFRESH_OWNER = "REFERENCE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,8 @@ class _SourceControlPlane:
     profile_id: UUID
     profile_sha256: str
     provider_tier: ProviderTier
+    universe_sha256: str
+    capability_config_sha256: str
     configuration_sha256: str
     model_bundle_sha256: str
     valuation_sha256: str
@@ -101,6 +104,7 @@ def _load_source_control_plane_cursor(
     cursor.execute(
         "SELECT manifest.manifest_id::text,manifest.profile_id::text,"
         "profile.profile_sha256,profile.provider_tier,"
+        "profile.universe_sha256,profile.config_sha256,"
         "cohort.configuration_sha256,cohort.model_bundle_sha256,"
         "cohort.valuation_sha256 "
         "FROM rt.cohorts AS cohort "
@@ -119,10 +123,43 @@ def _load_source_control_plane_cursor(
         profile_id=UUID(str(row[1])),
         profile_sha256=str(row[2]),
         provider_tier=ProviderTier(str(row[3])),
-        configuration_sha256=str(row[4]),
-        model_bundle_sha256=str(row[5]),
-        valuation_sha256=str(row[6]),
+        universe_sha256=str(row[4]),
+        capability_config_sha256=str(row[5]),
+        configuration_sha256=str(row[6]),
+        model_bundle_sha256=str(row[7]),
+        valuation_sha256=str(row[8]),
     )
+
+
+def _fresh_capability_profile_cursor(
+    cursor,
+    source: _SourceControlPlane,
+    *,
+    desired_universe_sha256: str,
+    required_through: datetime,
+) -> tuple[UUID, str] | None:
+    required = _utc(required_through, "capability required_through")
+    cursor.execute(
+        "SELECT profile_id::text,profile_sha256 "
+        "FROM rt.capability_profiles "
+        "WHERE provider_tier=%s AND config_sha256=%s "
+        "AND universe_sha256=ANY(%s) AND status='PASS' "
+        "AND expires_at>=%s "
+        "ORDER BY (universe_sha256=%s) DESC,"
+        "expires_at DESC,checked_at DESC,profile_id DESC "
+        "LIMIT 1",
+        (
+            source.provider_tier.value,
+            source.capability_config_sha256,
+            [desired_universe_sha256, source.universe_sha256],
+            required,
+            desired_universe_sha256,
+        ),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return UUID(str(row[0])), str(row[1])
 
 
 def _selection_policy_cursor(
@@ -473,6 +510,81 @@ def load_current_desired_state_revision_cursor(
     return revision
 
 
+def load_effective_desired_state_reconciliation_cursor(
+    cursor,
+    *,
+    session_date: date,
+    scope_key: str = DESIRED_STATE_SCOPE,
+) -> DesiredStateReconciliation | None:
+    scope = scope_key.strip()
+    if not scope:
+        raise ValueError("desired state current scope cannot be blank")
+    cursor.execute(
+        "SELECT current.effective_session_date "
+        "FROM rt.realtime_desired_current AS current "
+        "WHERE current.scope_key=%s",
+        (scope,),
+    )
+    current = cursor.fetchone()
+    if current is None:
+        return None
+    if current[0] <= session_date:
+        revision = load_current_desired_state_revision_cursor(
+            cursor,
+            scope_key=scope,
+        )
+        if revision is None:
+            return None
+    else:
+        cursor.execute(
+            "SELECT revision.revision_id::text "
+            "FROM rt.realtime_desired_revisions AS revision "
+            "JOIN rt.realtime_desired_session_snapshots AS snapshot "
+            "USING(revision_id) "
+            "WHERE revision.effective_session_date<=%s "
+            "ORDER BY revision.effective_session_date DESC,"
+            "revision.recorded_at DESC,revision.revision_id::text DESC "
+            "LIMIT 1",
+            (session_date,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        revision = load_desired_state_revision_cursor(
+            cursor,
+            UUID(str(row[0])),
+        )
+    snapshot = _load_desired_snapshot_cursor(
+        cursor,
+        revision.revision_id,
+    )
+    if snapshot is None:
+        return DesiredStateReconciliation(
+            state="MISSING_SNAPSHOT",
+            revision=revision,
+            preparations=load_desired_member_preparations_cursor(
+                cursor,
+                revision.revision_id,
+            ),
+            snapshot=None,
+            reason_codes=("IMMUTABLE_SNAPSHOT_MISSING",),
+        )
+    if (
+        snapshot.session_date != revision.effective_session_date
+        or snapshot.session_date > session_date
+    ):
+        raise ValueError("effective desired snapshot metadata diverged")
+    return DesiredStateReconciliation(
+        state="READY",
+        revision=revision,
+        preparations=load_desired_member_preparations_cursor(
+            cursor,
+            revision.revision_id,
+        ),
+        snapshot=snapshot,
+    )
+
+
 def _select_current_desired_state_revision_cursor(
     cursor,
     revision: DesiredStateRevision,
@@ -592,6 +704,53 @@ def record_desired_state_revision_cursor(
     calendar: OptionExchangeCalendar | None = None,
 ) -> DesiredStateRevision:
     observed = _utc(observed_at, "desired state observed_at")
+    return _record_desired_state_revision_cursor(
+        cursor,
+        change,
+        observed_at=observed,
+        effective_session_date=effective_next_session(
+            observed,
+            calendar=calendar,
+        ),
+        calendar=calendar,
+    )
+
+
+def record_desired_state_rollover_revision_cursor(
+    cursor,
+    change: DesiredStateChange,
+    *,
+    effective_session_date: date,
+    recorded_at: datetime,
+    calendar: OptionExchangeCalendar | None = None,
+) -> DesiredStateRevision:
+    return _record_desired_state_revision_cursor(
+        cursor,
+        change,
+        observed_at=_utc(recorded_at, "desired rollover recorded_at"),
+        effective_session_date=effective_session_date,
+        calendar=calendar,
+    )
+
+
+def _record_desired_state_revision_cursor(
+    cursor,
+    change: DesiredStateChange,
+    *,
+    observed_at: datetime,
+    effective_session_date: date,
+    calendar: OptionExchangeCalendar | None,
+) -> DesiredStateRevision:
+    observed = _utc(observed_at, "desired state observed_at")
+    exchange = calendar or OptionExchangeCalendar("XNYS")
+    if (
+        not isinstance(effective_session_date, date)
+        or exchange.session_on_or_after(effective_session_date)
+        != effective_session_date
+    ):
+        raise ValueError(
+            "desired state rollover target must be an XNYS session"
+        )
     source = _load_source_control_plane_cursor(cursor, change.source_cohort_id)
     policy_reference, policy_sha256 = _selection_policy_cursor(cursor, change, source)
     security_ids, _instrument_ids = _stored_security_identities_cursor(
@@ -601,10 +760,7 @@ def record_desired_state_revision_cursor(
     )
     revision = build_desired_state_revision(
         change,
-        effective_session_date=effective_next_session(
-            observed,
-            calendar=calendar,
-        ),
+        effective_session_date=effective_session_date,
         recorded_at=observed,
         security_ids=security_ids,
         selection_policy_reference=policy_reference,
@@ -692,6 +848,13 @@ def record_desired_state_revision_cursor(
     return stored
 
 
+def _lock_desired_revision_cursor(cursor, revision_id: UUID) -> None:
+    cursor.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+        (f"advanced-realtime-desired-revision:{revision_id}",),
+    )
+
+
 def set_desired_member_preparation_cursor(
     cursor,
     revision_id: UUID,
@@ -703,6 +866,7 @@ def set_desired_member_preparation_cursor(
     reasons: tuple[str, ...] = (),
 ) -> DesiredMemberPreparation:
     checked = _utc(checked_at, "desired member checked_at")
+    _lock_desired_revision_cursor(cursor, revision_id)
     if not isinstance(kind, DesiredMemberKind):
         raise TypeError("desired member readiness kind is invalid")
     if not isinstance(status, MemberPreparationStatus):
@@ -819,6 +983,7 @@ def reconcile_desired_state_revision_cursor(
     calendar: OptionExchangeCalendar | None = None,
 ) -> DesiredStateReconciliation:
     materialized = _utc(materialized_at, "desired snapshot materialized_at")
+    _lock_desired_revision_cursor(cursor, revision_id)
     revision = load_desired_state_revision_cursor(cursor, revision_id)
     preparations = load_desired_member_preparations_cursor(cursor, revision_id)
     if len(preparations) != len(revision.members):
@@ -916,6 +1081,30 @@ def reconcile_desired_state_revision_cursor(
         raise ValueError("READY Options underlyings require READY Equity membership")
     exchange = calendar or OptionExchangeCalendar("XNYS")
     effective_at = exchange.session_open(revision.effective_session_date)
+    capability_universe = UniverseManifest(
+        version=f"advanced-equity-{len(base_tickers)}-am-v1",
+        equity_tickers=base_tickers,
+        option_underlyings=(),
+    )
+    capability = _fresh_capability_profile_cursor(
+        cursor,
+        source,
+        desired_universe_sha256=capability_universe.sha256,
+        required_through=exchange.session_close(
+            revision.effective_session_date
+        ),
+    )
+    if capability is None:
+        return DesiredStateReconciliation(
+            state="REFRESH_REQUIRED",
+            revision=revision,
+            preparations=preparations,
+            snapshot=None,
+            reason_codes=(
+                f"CAPABILITY_REFRESH_REQUIRED:{CAPABILITY_REFRESH_OWNER}",
+            ),
+        )
+    capability_profile_id, capability_profile_sha256 = capability
     universe = UniverseManifest(
         version="advanced-realtime-desired-session-v1",
         equity_tickers=base_tickers,
@@ -978,7 +1167,7 @@ def reconcile_desired_state_revision_cursor(
         version="advanced-realtime-desired-session-v1",
         session_date=revision.effective_session_date,
         universe=universe,
-        capability_profile_sha256=source.profile_sha256,
+        capability_profile_sha256=capability_profile_sha256,
         allocation_policy_sha256=allocation_policy_sha256,
         members=equity_members + option_members,
         maximum_option_quote_contracts=1000 if option_tickers else 0,
@@ -993,7 +1182,7 @@ def reconcile_desired_state_revision_cursor(
             cursor,
             manifest,
             manifest_id=manifest_id,
-            profile_id=source.profile_id,
+            profile_id=capability_profile_id,
             effective_at=effective_at,
             equity_instrument_ids=instrument_ids,
         )
@@ -1003,7 +1192,7 @@ def reconcile_desired_state_revision_cursor(
             cursor,
             manifest,
             manifest_id=manifest_id,
-            profile_id=source.profile_id,
+            profile_id=capability_profile_id,
             effective_at=effective_at,
             equity_instrument_ids=instrument_ids,
         )
@@ -1021,7 +1210,7 @@ def reconcile_desired_state_revision_cursor(
         cursor,
         TierCohortBinding(
             cohort_id=cohort_id,
-            profile_id=source.profile_id,
+            profile_id=capability_profile_id,
             provider_tier=source.provider_tier,
             ready_state=(
                 TierState.ADVANCED_READY
@@ -1162,6 +1351,11 @@ def update_desired_member_preparation(
                 status=status,
                 checked_at=checked_at,
                 reasons=reasons,
+            )
+            reconcile_desired_state_revision_cursor(
+                cursor,
+                revision_id,
+                materialized_at=checked_at,
             )
         connection.commit()
         return result

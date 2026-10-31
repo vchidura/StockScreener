@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -246,6 +246,8 @@ def test_ingress_service_child_has_one_plan_and_no_env_file():
         "stocks_realtime_v2",
         "--confirm-database-name",
         "stocks_realtime_v2",
+        "--runtime-mode",
+        "legacy-diagnostic",
         "--authorization-id",
         str(AUTHORIZATION),
         "--execute",
@@ -266,6 +268,55 @@ def test_ingress_service_can_bootstrap_a_ready_plan_without_resetting_identity()
     statement = cursor.execute.call_args.args[0]
     assert "status IN ('READY','ACTIVE')" in statement
     assert "authorized_end_at>%s" in statement
+
+
+def test_continuous_ingress_selects_desired_plan_without_daily_identity():
+    args = ingress.parse_args([
+        "--database",
+        "stocks_realtime_v2",
+        "--confirm-database-name",
+        "stocks_realtime_v2",
+        "--execute",
+    ])
+    provider = MagicMock()
+    cursor = provider.transaction.return_value.__enter__.return_value.cursor
+    cursor.fetchone.return_value = (str(AUTHORIZATION),)
+
+    assert args.authorization_id is None
+    assert ingress._active_plan_id(
+        provider,
+        None,
+        datetime.now(timezone.utc),
+    ) == AUTHORIZATION
+    statement = cursor.execute.call_args.args[0]
+    assert "realtime_desired_session_snapshots" in statement
+    assert "LIMIT 1" in statement
+
+
+def test_surviving_stream_owner_is_detected_before_spawn():
+    provider = MagicMock()
+    cursor = provider.transaction.return_value.__enter__.return_value.cursor
+    heartbeat = datetime.now(timezone.utc)
+    cursor.fetchone.return_value = (
+        str(UUID(int=1)),
+        str(AUTHORIZATION),
+        str(UUID(int=2)),
+        7,
+        str(UUID(int=3)),
+        heartbeat,
+    )
+
+    owner = ingress._active_stream_owner(
+        provider,
+        checked_at=heartbeat,
+        stale_after_seconds=30,
+    )
+
+    assert owner["owner_epoch"] == 7
+    assert owner["plan_id"] == AUTHORIZATION
+    statement = cursor.execute.call_args.args[0]
+    assert "ended_at IS NULL" in statement
+    assert "heartbeat_at>%s" in statement
 
 
 @pytest.mark.parametrize("needs_kill", [False, True])
@@ -345,6 +396,270 @@ def test_bridge_health_can_scope_unrelated_quarantine_by_cohort():
     assert cursor.execute.call_args_list[3].args[1] == (str(cohort_id),)
 
 
+def _continuous_health_args():
+    return SimpleNamespace(
+        runtime_mode="continuous",
+        component="controller",
+        authorization_id=None,
+        cohort_id=None,
+    )
+
+
+def _health_scope_row(identity, session_date):
+    return (
+        str(UUID(int=identity)),
+        str(UUID(int=identity + 10)),
+        str(UUID(int=identity + 20)),
+        session_date,
+    )
+
+
+def test_continuous_health_reports_stalled_today_before_future_plan(
+    monkeypatch,
+):
+    checked = datetime(2026, 11, 2, 16, 0, tzinfo=timezone.utc)
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = (
+        _health_scope_row(1, date(2026, 11, 2)),
+        None,
+        _health_scope_row(2, date(2026, 11, 3)),
+        (
+            "READY",
+            "ACTIVE",
+            None,
+            1,
+            12,
+            "LIVE",
+            None,
+            checked - timedelta(minutes=5),
+            checked - timedelta(minutes=1),
+            None,
+            "WRITING",
+            None,
+            "journal",
+            date(2026, 11, 2),
+        ),
+    )
+    monkeypatch.setenv(
+        "REALTIME_V2_ADVANCED_HEALTH_STALE_SECONDS",
+        "60",
+    )
+    monkeypatch.setattr(
+        health,
+        "_capability_refresh_health",
+        lambda *_args, **_kwargs: ("READY", {"status": "READY"}),
+    )
+
+    state, detail = health.collect_health(
+        cursor,
+        _continuous_health_args(),
+        checked_at=checked,
+    )
+
+    assert state == "STALE"
+    assert detail["acquisition_session"] == date(2026, 11, 2)
+    assert detail["future_prepared_session"] == date(2026, 11, 3)
+    assert detail["reason"] == "STREAM_HEARTBEAT_STALE"
+
+
+def test_continuous_health_keeps_prior_drain_before_future_prep(
+    monkeypatch,
+):
+    checked = datetime(2026, 11, 2, 21, 1, tzinfo=timezone.utc)
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = (
+        None,
+        _health_scope_row(1, date(2026, 11, 2)),
+        _health_scope_row(2, date(2026, 11, 3)),
+    )
+    monkeypatch.setattr(
+        health,
+        "_capability_refresh_health",
+        lambda *_args, **_kwargs: ("READY", {"status": "READY"}),
+    )
+
+    state, detail = health.collect_health(
+        cursor,
+        _continuous_health_args(),
+        checked_at=checked,
+    )
+
+    assert state == "IDLE"
+    assert detail == {
+        "reason": "PROCESSING_DRAIN",
+        "processing_session": date(2026, 11, 2),
+        "future_prepared_session": date(2026, 11, 3),
+        "capability_refresh": {"status": "READY"},
+    }
+
+
+def test_continuous_health_reports_no_current_plan(monkeypatch):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = (None, None, None)
+    monkeypatch.setattr(
+        health,
+        "_capability_refresh_health",
+        lambda *_args, **_kwargs: ("READY", {"status": "READY"}),
+    )
+
+    state, detail = health.collect_health(
+        cursor,
+        _continuous_health_args(),
+        checked_at=datetime(
+            2026, 11, 2, 16, 0, tzinfo=timezone.utc
+        ),
+    )
+
+    assert state == "IDLE"
+    assert detail == {
+        "reason": "NO_CURRENT_PLAN",
+        "capability_refresh": {"status": "READY"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("plan_status", "terminal", "stream_status", "expected"),
+    (
+        ("ACTIVE", None, "LIVE", "READY"),
+        ("FAILED", "FAILED_INFRASTRUCTURE", None, "DEGRADED"),
+        ("COMPLETE", "SESSION_COMPLETE", "STOPPED", "TERMINAL"),
+    ),
+)
+def test_continuous_provider_health_distinguishes_runtime_states(
+    plan_status,
+    terminal,
+    stream_status,
+    expected,
+):
+    checked = datetime(2026, 11, 2, 16, 0, tzinfo=timezone.utc)
+    plan = health.ContinuousHealthPlan(
+        UUID(int=1),
+        UUID(int=2),
+        UUID(int=3),
+        date(2026, 11, 2),
+    )
+    scope = health.ContinuousHealthScope(plan, None, None)
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (
+        "READY",
+        plan_status,
+        terminal,
+        1,
+        12,
+        stream_status,
+        None,
+        checked,
+        checked,
+        None,
+        "WRITING",
+        None,
+        "journal",
+        date(2026, 11, 2),
+    )
+
+    state, _detail = health._provider_plan_health(
+        cursor,
+        plan.plan_id,
+        checked_at=checked,
+        scope=scope,
+    )
+
+    assert state == expected
+
+
+def test_capability_refresh_health_exposes_owner_and_retry_state():
+    checked = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = (
+        (
+            str(UUID(int=1)),
+            4,
+            checked + timedelta(seconds=30),
+            checked,
+        ),
+        (
+            "DEGRADED",
+            ["CAPABILITY_PROVIDER_UNAVAILABLE"],
+            checked,
+            {
+                "last_success_at": "2026-11-09T11:00:00+00:00",
+                "next_retry_at": "2026-11-09T12:00:15+00:00",
+                "request_identity_sha256": "a" * 64,
+            },
+        ),
+    )
+
+    state, detail = health._capability_refresh_health(
+        cursor,
+        checked_at=checked,
+    )
+
+    assert state == "DEGRADED"
+    assert detail["owner_epoch"] == 4
+    assert detail["heartbeat_at"] == checked
+    assert detail["last_success_at"] == "2026-11-09T11:00:00+00:00"
+    assert detail["next_retry_at"] == "2026-11-09T12:00:15+00:00"
+
+
+def test_capability_refresh_health_reports_ttl_waiting_not_failure():
+    checked = datetime(2026, 11, 7, 16, 0, tzinfo=timezone.utc)
+    next_check = "2026-11-09T19:00:00+00:00"
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = (
+        (
+            str(UUID(int=1)),
+            4,
+            checked + timedelta(seconds=30),
+            checked,
+        ),
+        (
+            "DEGRADED",
+            ["CAPABILITY_PROBE_NOT_BEFORE"],
+            checked,
+            {
+                "state": "WAITING",
+                "last_success_at": None,
+                "next_retry_at": next_check,
+                "request_identity_sha256": "a" * 64,
+            },
+        ),
+    )
+
+    state, detail = health._capability_refresh_health(
+        cursor,
+        checked_at=checked,
+    )
+
+    assert state == "WAITING"
+    assert detail["status"] == "WAITING"
+    assert detail["next_retry_at"] == next_check
+
+
+def test_scheduler_health_scopes_runtime_query_to_current_session():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (
+        1,
+        0,
+        datetime(2026, 11, 2, 16, 0, tzinfo=timezone.utc),
+    )
+
+    state, detail = health._scheduler_health(
+        cursor,
+        cohort_id=UUID(int=1),
+        session_date=date(2026, 11, 2),
+    )
+
+    assert state == "READY"
+    assert detail["historical_failures_excluded"] is True
+    statement = cursor.execute.call_args.args[0]
+    assert "service.session_date=%s" in statement
+    assert cursor.execute.call_args.args[1] == (
+        str(UUID(int=1)),
+        str(UUID(int=1)),
+        date(2026, 11, 2),
+    )
+
+
 def _service_block(text, service):
     match = re.search(
         rf"^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|^volumes:\n)",
@@ -362,6 +677,7 @@ def test_compose_advanced_services_are_independent_and_secret_scoped():
     text = standalone
     services = {
         "realtime-v2-advanced-controller",
+        "realtime-v2-advanced-capability-refresh",
         "realtime-v2-advanced-ingress",
         "realtime-v2-advanced-bridge",
         "realtime-v2-advanced-scheduler",
@@ -397,9 +713,13 @@ def test_compose_advanced_services_are_independent_and_secret_scoped():
     assert "realtime-v2-advanced-provider" in blocks[
         "realtime-v2-advanced-ingress"
     ]
+    assert "realtime-v2-advanced-provider" in blocks[
+        "realtime-v2-advanced-capability-refresh"
+    ]
     for service in services - {
         "realtime-v2-advanced-controller",
         "realtime-v2-advanced-ingress",
+        "realtime-v2-advanced-capability-refresh",
     }:
         assert "realtime-v2-advanced" in blocks[service]
     assert "realtime_v2_provider_key" in blocks[
@@ -408,14 +728,35 @@ def test_compose_advanced_services_are_independent_and_secret_scoped():
     assert "realtime_v2_provider_key" in blocks[
         "realtime-v2-advanced-ingress"
     ]
+    assert "realtime_v2_provider_key" in blocks[
+        "realtime-v2-advanced-capability-refresh"
+    ]
     for service in services - {
         "realtime-v2-advanced-controller",
         "realtime-v2-advanced-ingress",
+        "realtime-v2-advanced-capability-refresh",
     }:
         assert "realtime_v2_provider_key" not in blocks[service]
     for block in blocks.values():
         assert "env_file:" not in block
         assert "healthcheck:" in block
+    for service in {
+        "realtime-v2-advanced-controller",
+        "realtime-v2-advanced-capability-refresh",
+        "realtime-v2-advanced-ingress",
+        "realtime-v2-advanced-bridge",
+        "realtime-v2-advanced-scheduler",
+        "realtime-v2-advanced-finalizer",
+    }:
+        block = blocks[service]
+        for selector in (
+            "REALTIME_V2_ADVANCED_AUTHORIZATION_ID",
+            "REALTIME_V2_ADVANCED_COHORT_ID",
+            "REALTIME_V2_ADVANCED_SESSION_DATE",
+            "REALTIME_V2_ADVANCED_FIRST_CUTOFF",
+            "REALTIME_V2_ADVANCED_AUTHORIZATION_REFERENCE",
+        ):
+            assert selector not in block
     assert all(
         "<<: *backend-service" in blocks[service]
         for service in services
@@ -454,6 +795,7 @@ def test_compose_advanced_services_are_independent_and_secret_scoped():
     "relative",
     [
         "backend/scripts/run_realtime_v2_advanced_controller.py",
+        "backend/scripts/run_realtime_v2_advanced_capability_refresh.py",
         "backend/scripts/run_realtime_v2_advanced_equity_ingress.py",
         "backend/scripts/run_realtime_v2_advanced_equity_scheduler.py",
         "backend/scripts/run_realtime_v2_advanced_equity_window.py",

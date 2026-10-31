@@ -14,6 +14,7 @@ from realtime.advanced_gateway import (
     GatewayControlError,
     GatewayFeedState,
     GatewayOverload,
+    GatewaySubscriptionProbeFailure,
 )
 from realtime.buffer import BufferLimits, RawMessageBuffer
 from realtime.bridge import drain_raw_buffer_once
@@ -258,6 +259,287 @@ def test_stock_gateway_can_verify_subscription_without_market_data():
     assert result.accepted_messages == 0
     assert result.subscriptions
     assert connection.sent[1]["action"] == "subscribe"
+
+
+def test_subscription_probe_reports_exact_accepted_membership():
+    manifest = _manifest()
+    subscriptions = tuple(sorted(
+        f"{member.channel.value}.{member.provider_symbol}"
+        for member in manifest.members
+        if member.asset_class is AssetClass.EQUITY
+    ))
+    acknowledged = json.dumps([
+        {
+            "ev": "status",
+            "status": "success",
+            "message": f"subscribed to: {subscription}",
+        }
+        for subscription in subscriptions
+    ]).encode("ascii")
+    connection = FakeConnection((
+        _status("auth_success"),
+        acknowledged,
+    ))
+    gateway = _gateway(MarketFeed.STOCKS, connection)
+
+    result = asyncio.run(gateway.run_subscription_probe())
+
+    assert result.accepted_subscriptions == subscriptions
+    assert result.rejected_subscriptions == ()
+    assert result.received_control_messages == 2
+    assert connection.sent[1]["action"] == "subscribe"
+
+
+def test_subscription_probe_accumulates_split_acknowledgements():
+    subscriptions = tuple(sorted(
+        f"{member.channel.value}.{member.provider_symbol}"
+        for member in _manifest().members
+        if member.asset_class is AssetClass.EQUITY
+    ))
+    midpoint = len(subscriptions) // 2
+
+    def frame(values):
+        return json.dumps([
+            {
+                "ev": "status",
+                "status": "success",
+                "message": f"subscribed to: {subscription}",
+            }
+            for subscription in values
+        ]).encode("ascii")
+
+    connection = FakeConnection((
+        _status("auth_success"),
+        frame(subscriptions[:midpoint]),
+        frame(subscriptions[midpoint:]),
+    ))
+    gateway = _gateway(MarketFeed.STOCKS, connection)
+
+    result = asyncio.run(gateway.run_subscription_probe())
+
+    assert result.accepted_subscriptions == subscriptions
+    assert result.rejected_subscriptions == ()
+
+
+def test_generic_success_waits_for_explicit_member_acknowledgements():
+    subscriptions = tuple(sorted(
+        f"{member.channel.value}.{member.provider_symbol}"
+        for member in _manifest().members
+        if member.asset_class is AssetClass.EQUITY
+    ))
+    explicit = json.dumps([
+        {
+            "ev": "status",
+            "status": "success",
+            "message": f"subscribed to: {subscription}",
+        }
+        for subscription in subscriptions
+    ]).encode("ascii")
+    connection = FakeConnection((
+        _status("auth_success"),
+        _status("success"),
+        explicit,
+    ))
+    gateway = _gateway(MarketFeed.STOCKS, connection)
+
+    result = asyncio.run(gateway.run_subscription_probe())
+
+    assert result.accepted_subscriptions == subscriptions
+    assert result.received_control_messages == 3
+
+
+def test_duplicate_ack_is_idempotent_and_out_of_scope_ack_fails():
+    subscriptions = tuple(sorted(
+        f"{member.channel.value}.{member.provider_symbol}"
+        for member in _manifest().members
+        if member.asset_class is AssetClass.EQUITY
+    ))
+    duplicate = json.dumps([
+        *[
+            {
+                "ev": "status",
+                "status": "success",
+                "message": f"subscribed to: {subscription}",
+            }
+            for subscription in subscriptions
+        ],
+        {
+            "ev": "status",
+            "status": "success",
+            "message": f"subscribed to: {subscriptions[0]}",
+        },
+    ]).encode("ascii")
+    result = asyncio.run(
+        _gateway(
+            MarketFeed.STOCKS,
+            FakeConnection((_status("auth_success"), duplicate)),
+        ).run_subscription_probe()
+    )
+    assert result.accepted_subscriptions == subscriptions
+
+    out_of_scope = json.dumps([{
+        "ev": "status",
+        "status": "success",
+        "message": "subscribed to: AM.NOT_REQUESTED",
+    }]).encode("ascii")
+    with pytest.raises(
+        GatewayControlError,
+        match="ADVANCED_SUBSCRIPTION_ACK_SCOPE_MISMATCH",
+    ):
+        asyncio.run(
+            _gateway(
+                MarketFeed.STOCKS,
+                FakeConnection((
+                    _status("auth_success"),
+                    out_of_scope,
+                )),
+            ).run_subscription_probe()
+        )
+
+
+def test_subscription_probe_reports_unconfirmed_missing_member():
+    manifest = _manifest()
+    subscriptions = tuple(sorted(
+        f"{member.channel.value}.{member.provider_symbol}"
+        for member in manifest.members
+        if member.asset_class is AssetClass.EQUITY
+    ))
+    acknowledged = json.dumps([
+        {
+            "ev": "status",
+            "status": "success",
+            "message": f"subscribed to: {subscription}",
+        }
+        for subscription in subscriptions[:-1]
+    ]).encode("ascii")
+    connection = QuietConnection((
+        _status("auth_success"),
+        acknowledged,
+    ))
+    gateway = _gateway(MarketFeed.STOCKS, connection)
+
+    with pytest.raises(GatewaySubscriptionProbeFailure) as captured:
+        asyncio.run(gateway.run_subscription_probe(
+            timeout_seconds=0.05,
+            maximum_control_bytes=64 * 1024,
+        ))
+
+    assert captured.value.accepted_subscriptions == subscriptions[:-1]
+    assert captured.value.rejected_subscriptions == ()
+    assert captured.value.unconfirmed_subscriptions == subscriptions[-1:]
+    assert gateway.state is GatewayFeedState.BLOCKED
+
+
+def test_subscription_probe_reports_explicit_rejection():
+    manifest = _manifest()
+    subscriptions = tuple(sorted(
+        f"{member.channel.value}.{member.provider_symbol}"
+        for member in manifest.members
+        if member.asset_class is AssetClass.EQUITY
+    ))
+    acknowledged = json.dumps([
+        *[
+            {
+                "ev": "status",
+                "status": "success",
+                "message": f"subscribed to: {subscription}",
+            }
+            for subscription in subscriptions[:-1]
+        ],
+        {
+            "ev": "status",
+            "status": "error",
+            "message": f"rejected: {subscriptions[-1]}",
+        },
+    ]).encode("ascii")
+    connection = FakeConnection((
+        _status("auth_success"),
+        acknowledged,
+    ))
+    gateway = _gateway(MarketFeed.STOCKS, connection)
+
+    result = asyncio.run(gateway.run_subscription_probe())
+
+    assert result.accepted_subscriptions == subscriptions[:-1]
+    assert result.rejected_subscriptions == subscriptions[-1:]
+
+
+def test_subscription_probe_times_out_and_closes_during_silent_auth():
+    connection = QuietConnection(())
+    gateway = _gateway(MarketFeed.STOCKS, connection)
+
+    with pytest.raises(
+        GatewaySubscriptionProbeFailure,
+        match="ADVANCED_SUBSCRIPTION_PROBE_TIMEOUT",
+    ) as captured:
+        asyncio.run(gateway.run_subscription_probe(
+            timeout_seconds=0.05,
+            maximum_control_bytes=4096,
+        ))
+
+    assert captured.value.received_control_messages == 0
+    assert captured.value.received_bytes == 0
+    assert connection.closed == (
+        1001,
+        "subscription probe timeout",
+    )
+    assert gateway.state is GatewayFeedState.BLOCKED
+
+
+def test_subscription_probe_times_out_during_silent_subscription_ack():
+    connection = QuietConnection((
+        _status("auth_success"),
+        _status("success"),
+    ))
+    gateway = _gateway(MarketFeed.STOCKS, connection)
+
+    with pytest.raises(
+        GatewaySubscriptionProbeFailure,
+        match="ADVANCED_SUBSCRIPTION_PROBE_TIMEOUT",
+    ) as captured:
+        asyncio.run(gateway.run_subscription_probe(
+            timeout_seconds=0.05,
+            maximum_control_bytes=4096,
+        ))
+
+    assert captured.value.received_control_messages == 2
+    assert captured.value.received_bytes > 0
+    assert captured.value.accepted_subscriptions == ()
+    assert captured.value.rejected_subscriptions == ()
+    assert captured.value.unconfirmed_subscriptions
+    assert connection.closed == (
+        1001,
+        "subscription probe timeout",
+    )
+
+
+def test_subscription_probe_closes_on_cumulative_control_byte_ceiling():
+    oversized = json.dumps([{
+        "ev": "status",
+        "status": "success",
+        "message": "x" * 2048,
+    }]).encode("ascii")
+    connection = FakeConnection((
+        _status("auth_success"),
+        oversized,
+    ))
+    gateway = _gateway(MarketFeed.STOCKS, connection)
+
+    with pytest.raises(
+        GatewaySubscriptionProbeFailure,
+        match="ADVANCED_SUBSCRIPTION_PROBE_BYTE_CEILING_EXCEEDED",
+    ) as captured:
+        asyncio.run(gateway.run_subscription_probe(
+            timeout_seconds=1,
+            maximum_control_bytes=1024,
+        ))
+
+    assert captured.value.received_control_messages == 2
+    assert captured.value.received_bytes > 1024
+    assert connection.closed == (
+        1009,
+        "session exceeds configured byte ceiling",
+    )
 
 
 def test_quiet_subscribed_gateway_stops_without_waiting_for_market_data():

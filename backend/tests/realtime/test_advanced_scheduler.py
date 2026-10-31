@@ -12,6 +12,8 @@ from realtime.advanced_scheduler import (
     ensure_advanced_window_retry_cursor,
     order_advanced_due_windows,
     load_advanced_scheduler_scope_cursor,
+    load_advanced_scheduler_progress_cursor,
+    load_continuous_advanced_scheduler_scope_cursor,
 )
 from realtime.orchestration_repository import CycleReceiptSpec
 from realtime.session_windows import advanced_session_windows
@@ -166,6 +168,56 @@ def test_scheduler_reloads_persisted_window_instead_of_resetting_its_duration():
     assert first == restarted
     assert first["authorized_start_at"] == CUTOFF
     assert first["authorized_end_at"] == ended
+
+
+def test_continuous_scheduler_selects_one_immutable_desired_snapshot_plan():
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [(
+        UUID(int=1),
+        SCHEDULER,
+        COHORT,
+        9,
+        "a" * 64,
+        "READY",
+        CUTOFF,
+        CUTOFF + timedelta(hours=6, minutes=30),
+        "advanced-stream:test",
+    )]
+
+    scope = load_continuous_advanced_scheduler_scope_cursor(
+        cursor,
+        session_date=CUTOFF.date(),
+    )
+
+    assert scope["authorization_id"] == SCHEDULER
+    assert scope["cohort_id"] == COHORT
+    assert scope["universe_target"] == 9
+    statement = cursor.execute.call_args.args[0]
+    assert "realtime_desired_session_snapshots" in statement
+    assert "LIMIT 1" in statement
+
+
+def test_scheduler_progress_uses_one_bounded_window_key_query():
+    cursor = MagicMock()
+    discovered = CUTOFF + timedelta(minutes=30)
+    completed = CUTOFF + timedelta(minutes=20)
+    cursor.fetchone.return_value = (discovered, completed)
+
+    progress = load_advanced_scheduler_progress_cursor(
+        cursor,
+        cohort_id=COHORT,
+        session_date=CUTOFF.date(),
+        first_cutoff=CUTOFF,
+        final_cutoff=CUTOFF + timedelta(hours=6),
+    )
+
+    assert progress.last_discovered_cutoff == discovered
+    assert progress.last_completed_cutoff == completed
+    cursor.execute.assert_called_once()
+    statement = cursor.execute.call_args.args[0]
+    assert "run.window_key>=%s AND run.window_key<%s" in statement
+    assert "row_number() OVER (ORDER BY cutoff)" in statement
+    assert "service.session_date=%s" in statement
 
 
 def test_early_close_dst_and_holiday_follow_xnys_calendar():

@@ -17,6 +17,8 @@ BASE = [
     "stocks_realtime_v2",
     "--confirm-database-name",
     "stocks_realtime_v2",
+    "--runtime-mode",
+    "legacy-diagnostic",
     "--authorization-id",
     "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
     "--cohort-id",
@@ -53,6 +55,29 @@ def test_scheduler_builds_exact_remaining_session_windows(
     assert args.publication_mode == "projection-only"
 
 
+def test_continuous_scheduler_needs_no_daily_identity_arguments(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    args = script.parse_args([
+        "--database",
+        "stocks_realtime_v2",
+        "--confirm-database-name",
+        "stocks_realtime_v2",
+        "--continuous",
+        "--execute",
+    ])
+
+    assert args.runtime_mode == "continuous"
+    assert args.authorization_id is None
+    assert args.cohort_id is None
+    assert args.session_date is None
+    assert args.first_cutoff is None
+    assert args.authorization_reference is None
+    assert args.publication_mode == "projection-only"
+
+
 def test_scheduler_rejects_non_boundary_and_unexecuted_modes():
     with pytest.raises(SystemExit):
         script.parse_args(BASE[:-1])
@@ -74,6 +99,42 @@ def test_scheduler_includes_last_authorized_cutoff_but_not_later_windows():
     for cutoff in (started, ended + timedelta(minutes=5)):
         with pytest.raises(ValueError, match="outside"):
             script._authorized_windows(windows, first_cutoff=cutoff, started=started, ended=ended)
+
+
+def test_continuous_scheduler_does_not_rescan_durable_completed_prefix():
+    session_date = datetime(2026, 11, 2).date()
+    windows = script.advanced_session_windows(
+        session_date,
+        finality_delay_seconds=5,
+        completion_budget_seconds=300,
+        serving_lag_seconds=30,
+    )
+    planner = script.AdvancedEquityLifecyclePlanner(
+        clock=lambda: datetime(2026, 11, 2, 17, 0, tzinfo=timezone.utc)
+    )
+
+    first = planner.plan(
+        drain_seconds=30,
+        finality_delay_seconds=5,
+        completion_budget_seconds=300,
+        last_completed_cutoff=windows[29].cutoff,
+    )
+    second = planner.plan(
+        drain_seconds=30,
+        finality_delay_seconds=5,
+        completion_budget_seconds=300,
+        last_completed_cutoff=windows[29].cutoff,
+    )
+    remaining = script._authorized_windows(
+        windows,
+        first_cutoff=first.first_due_cutoff,
+        started=windows[0].cutoff - timedelta(minutes=5),
+        ended=windows[-1].cutoff,
+    )
+
+    assert first.first_due_cutoff == windows[30].cutoff
+    assert second.first_due_cutoff == windows[30].cutoff
+    assert remaining == windows[30:]
 
 
 def test_scheduler_drains_final_cutoff_after_provider_window_ends(tmp_path, monkeypatch):
@@ -114,6 +175,13 @@ def test_scheduler_drains_final_cutoff_after_provider_window_ends(tmp_path, monk
         "cohort_id": cohort_id, "plan_id": plan_id, "runtime_profile_sha256": "a" * 64,
         "authorized_start_at": started, "authorized_end_at": ended,
     })
+    monkeypatch.setattr(
+        script,
+        "load_advanced_scheduler_progress_cursor",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            last_completed_cutoff=None,
+        ),
+    )
     monkeypatch.setattr(script, "ensure_advanced_scheduler_session_cursor", lambda *_args, **_kwargs:
         SimpleNamespace(scheduler_session_id=plan_id))
     monkeypatch.setattr(script, "prioritize_live_over_blocked_backfill_cursor", lambda *_args, **_kwargs: None)
