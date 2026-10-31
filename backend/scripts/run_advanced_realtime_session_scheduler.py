@@ -65,9 +65,9 @@ from realtime.advanced_options_v3_authority import (  # noqa: E402
     session_acquisition_authorization_from_payload,
 )
 from realtime.advanced_options_p8_runtime import (  # noqa: E402
-    P8DownstreamBindingStore,
+    LegacyArtifactSessionStateAdapter,
+    SessionRuntimeStatePort,
     build_p8_downstream_binding,
-    p8_preopen_session_binding_from_payload,
     validate_p8_execution_bundle,
 )
 from realtime.advanced_options_v3_deployment import (  # noqa: E402
@@ -192,6 +192,29 @@ def _file_sha256(path: Path) -> str:
 def _load_authority(path: Path) -> AdvancedRealtimeSessionAuthorization:
     return advanced_realtime_session_authorization_from_payload(
         _read_json(path)
+    )
+
+
+def _session_state(args) -> SessionRuntimeStatePort:
+    state = getattr(args, "session_state", None)
+    if state is not None:
+        return state
+    return LegacyArtifactSessionStateAdapter(
+        package_path=getattr(args, "package", None),
+        bundle_path=getattr(args, "bundle", None),
+        acquisition_binding_path=getattr(
+            args,
+            "acquisition_binding",
+            None,
+        ),
+        downstream_binding_directory=getattr(
+            args,
+            "downstream_binding_directory",
+            None,
+        ),
+        json_loader=_read_json,
+        bundle_validator=validate_p8_execution_bundle,
+        acquisition_parser=acquisition_binding_from_payload,
     )
 
 
@@ -580,11 +603,9 @@ def _plan(authority: AdvancedRealtimeSessionAuthorization):
 
 
 def _prepare_authorization(args):
-    package = _read_json(args.package)
-    bundle = validate_p8_execution_bundle(
-        args.package,
-        args.bundle,
-    )
+    state = _session_state(args)
+    package = state.load_package()
+    bundle = state.load_execution_bundle()
     session_payload = bundle.get("v3_authorities", {}).get(
         "session_acquisition"
     )
@@ -695,22 +716,10 @@ class _ProductionPort:
         self._provider = provider
         self._output = output_directory
         self._selection_captures = {}
-        bundle = _read_json(args.bundle)
-        session_payload = bundle.get("session_binding")
+        self._session_state = _session_state(args)
+        bundle = self._session_state.load_bundle_document()
         self._session_binding = (
-            None
-            if session_payload is None
-            else p8_preopen_session_binding_from_payload(
-                session_payload
-            )
-        )
-        self._downstream_bindings = (
-            None
-            if self._session_binding is None
-            else P8DownstreamBindingStore(
-                args.downstream_binding_directory,
-                session_binding=self._session_binding,
-            )
+            self._session_state.load_preopen_session_binding(bundle)
         )
 
     def _report_path(
@@ -1004,7 +1013,7 @@ class _ProductionPort:
         authorized,
         target_window_id,
     ):
-        if self._downstream_bindings is None:
+        if self._session_binding is None:
             return None
         selection_capture = self._selection_captures.get(
             capture.evidence_sha256
@@ -1032,7 +1041,7 @@ class _ProductionPort:
             raise RuntimeError(
                 "per-E Equity input binding is unavailable"
             )
-        package = _read_json(self._args.package)
+        package = self._session_state.load_package()
         components = None
         try:
             components = build_advanced_options_p8_production_components(
@@ -1069,7 +1078,9 @@ class _ProductionPort:
         finally:
             if components is not None:
                 components.close()
-        latest = self._downstream_bindings.latest()
+        latest = self._session_state.load_latest_downstream_binding(
+            self._session_binding
+        )
         downstream = build_p8_downstream_binding(
             session_binding=self._session_binding,
             sequence=(1 if latest is None else latest.sequence + 1),
@@ -1101,7 +1112,10 @@ class _ProductionPort:
             ),
             production_binding=production_binding,
         )
-        attached = self._downstream_bindings.attach(downstream)
+        attached = self._session_state.attach_downstream_binding(
+            self._session_binding,
+            downstream,
+        )
         self._selection_captures.pop(
             capture.evidence_sha256,
             None,
@@ -1513,8 +1527,9 @@ def _run_transition(args):
         raise ValueError(
             "transition acquisition identity differs from the freeze"
         )
-    package = _read_json(args.package)
-    bundle = _read_json(args.bundle)
+    state = _session_state(args)
+    package = state.load_package()
+    bundle = state.load_bundle_document()
     if (
         package.get("package_sha256")
         != transition.preserved_package_sha256
@@ -2054,12 +2069,11 @@ def _runtime_snapshot(
         backend_image_id=backend_image_id,
         allow_provider_stopped=allow_provider_stopped,
     )
-    acquisition = acquisition_binding_from_payload(
-        _read_json(args.acquisition_binding)
-    )
-    session_binding = p8_preopen_session_binding_from_payload(
-        bundle["session_binding"]
-    )
+    state = _session_state(args)
+    acquisition = state.load_acquisition_binding()
+    session_binding = state.load_preopen_session_binding(bundle)
+    if session_binding is None:
+        raise TypeError("P8 pre-open session binding must be an object")
     database = _database_runtime_status(
         provider,
         authority,
@@ -2239,9 +2253,7 @@ def _initialize_coordinator_identity(args, authority):
         raise RuntimeError("existing coordinator output requires --resume")
     if not existed:
         args.output_directory.mkdir()
-    acquisition = acquisition_binding_from_payload(
-        _read_json(args.acquisition_binding)
-    )
+    acquisition = _session_state(args).load_acquisition_binding()
     identity = {
         "schema": COORDINATOR_IDENTITY_SCHEMA,
         "coordinator_id": str(uuid5(
@@ -2692,9 +2704,12 @@ def _remove_secret_directory(path):
 
 
 def _cleanup_database_state(provider, authority, bundle):
-    session_binding = p8_preopen_session_binding_from_payload(
-        bundle["session_binding"]
-    )
+    session_binding = LegacyArtifactSessionStateAdapter(
+        json_loader=_read_json,
+        acquisition_parser=acquisition_binding_from_payload,
+    ).load_preopen_session_binding(bundle)
+    if session_binding is None:
+        raise TypeError("P8 pre-open session binding must be an object")
     owner_ids = [
         str(owner_id)
         for _kind, owner_id in session_binding.service_owner_ids
@@ -2856,11 +2871,9 @@ def _run(args):
     frozen_identities = freeze_report.get("frozen_identities")
     if not isinstance(frozen_identities, dict):
         raise ValueError("pre-open frozen identities are unavailable")
-    package = _read_json(args.package)
-    bundle = validate_p8_execution_bundle(
-        args.package,
-        args.bundle,
-    )
+    initial_session_state = _session_state(args)
+    package = initial_session_state.load_package()
+    bundle = initial_session_state.load_execution_bundle()
     validate_advanced_options_v3_runtime_identity(package, bundle)
     session = session_acquisition_authorization_from_payload(
         bundle["v3_authorities"]["session_acquisition"]
@@ -2928,6 +2941,18 @@ def _run(args):
     os.environ[
         "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH"
     ] = str(args.downstream_binding_directory)
+    if getattr(args, "session_state", None) is None:
+        args.session_state = LegacyArtifactSessionStateAdapter(
+            package_path=args.package,
+            bundle_path=args.bundle,
+            acquisition_binding_path=args.acquisition_binding,
+            downstream_binding_directory=(
+                args.downstream_binding_directory
+            ),
+            json_loader=_read_json,
+            bundle_validator=validate_p8_execution_bundle,
+            acquisition_parser=acquisition_binding_from_payload,
+        )
     provider, pool = production_cli._provider()
     stop = threading.Event()
     monitor_stop = threading.Event()

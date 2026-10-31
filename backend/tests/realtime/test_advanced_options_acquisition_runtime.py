@@ -19,10 +19,13 @@ from realtime.advanced_options_acquisition_runtime import (
 )
 from realtime.advanced_gateway import GatewayControlError, GatewayFeedState
 from realtime.advanced_options_p8_runtime import (
+    LegacyArtifactSessionStateAdapter,
     P8DownstreamBindingStore,
     P8ExecutionBundleStore,
     build_p8_downstream_binding,
     build_p8_preopen_session_binding,
+    p8_downstream_binding_payload,
+    p8_preopen_session_binding_from_payload,
     p8_preopen_session_binding_payload,
     validate_p8_execution_bundle,
 )
@@ -340,7 +343,13 @@ def _production_binding(
     return value
 
 
-def _downstream_binding(session, sequence, *, market_index=None):
+def _downstream_binding(
+    session,
+    sequence,
+    *,
+    market_index=None,
+    previous_binding_sha256=None,
+):
     market_index = sequence if market_index is None else market_index
     equity_cutoff = datetime(
         2026,
@@ -359,7 +368,7 @@ def _downstream_binding(session, sequence, *, market_index=None):
     return build_p8_downstream_binding(
         session_binding=session,
         sequence=sequence,
-        previous_binding_sha256=None,
+        previous_binding_sha256=previous_binding_sha256,
         target_window_id=window_id,
         equity_receipt_id=receipt_id,
         equity_input_sha256=input_sha256,
@@ -629,6 +638,167 @@ def test_waiting_execution_bundle_is_receipt_free(tmp_path):
     assert "ready_waiting_for_e" in serialized
     assert "equity_receipt" not in serialized
     assert "publication_authorization" not in serialized
+
+
+def _legacy_session_artifacts(tmp_path):
+    acquisition = _binding()
+    package = _waiting_package(acquisition)
+    package_path = tmp_path / "package.json"
+    bundle_path = tmp_path / "bundle.json"
+    acquisition_path = tmp_path / "acquisition.json"
+    downstream_path = tmp_path / "downstream"
+    package_path.write_text(json.dumps(package), encoding="utf-8")
+    acquisition_path.write_text(
+        json.dumps(acquisition_binding_payload(acquisition)),
+        encoding="utf-8",
+    )
+    bundle = P8ExecutionBundleStore(
+        bundle_path,
+        package=package,
+        package_path=package_path,
+        repository_root=tmp_path,
+    ).write_waiting(
+        acquisition,
+        written_at=acquisition.authority.prepared_at,
+    )
+    session = p8_preopen_session_binding_from_payload(
+        bundle["session_binding"]
+    )
+    downstream = _downstream_binding(session, 1)
+    P8DownstreamBindingStore(
+        downstream_path,
+        session_binding=session,
+        create=True,
+    ).attach(downstream)
+    adapter = LegacyArtifactSessionStateAdapter(
+        package_path=package_path,
+        bundle_path=bundle_path,
+        acquisition_binding_path=acquisition_path,
+        downstream_binding_directory=downstream_path,
+    )
+    return (
+        adapter,
+        package_path,
+        bundle_path,
+        acquisition_path,
+        downstream_path,
+        acquisition,
+        session,
+        downstream,
+    )
+
+
+def test_legacy_session_state_adapter_preserves_typed_payloads_and_files(
+    tmp_path,
+):
+    (
+        adapter,
+        package_path,
+        bundle_path,
+        acquisition_path,
+        downstream_path,
+        acquisition,
+        session,
+        downstream,
+    ) = _legacy_session_artifacts(tmp_path)
+    files = (
+        package_path,
+        bundle_path,
+        acquisition_path,
+        downstream_path / "001.json",
+        downstream_path / "LATEST.json",
+    )
+    before = {path: path.read_bytes() for path in files}
+
+    package = adapter.load_package()
+    bundle_document = adapter.load_bundle_document()
+    validated_bundle = adapter.load_execution_bundle()
+    loaded_acquisition = adapter.load_acquisition_binding()
+    loaded_session = adapter.load_preopen_session_binding(validated_bundle)
+    loaded_downstream = adapter.load_downstream_bindings(session)
+
+    assert package == json.loads(package_path.read_text(encoding="utf-8"))
+    assert bundle_document == validated_bundle
+    assert loaded_acquisition == acquisition
+    assert loaded_session == session
+    assert loaded_downstream == (downstream,)
+    assert adapter.load_latest_downstream_binding(session) == downstream
+    assert acquisition_binding_payload(loaded_acquisition) == json.loads(
+        acquisition_path.read_text(encoding="utf-8")
+    )
+    assert p8_preopen_session_binding_payload(loaded_session) == (
+        validated_bundle["session_binding"]
+    )
+    assert p8_downstream_binding_payload(loaded_downstream[0]) == json.loads(
+        (downstream_path / "001.json").read_text(encoding="utf-8")
+    )
+    assert {path: path.read_bytes() for path in files} == before
+    next_binding = _downstream_binding(
+        session,
+        2,
+        previous_binding_sha256=downstream.binding_sha256,
+    )
+    assert adapter.attach_downstream_binding(
+        session,
+        next_binding,
+    ) == next_binding
+    assert adapter.load_downstream_bindings(session) == (
+        downstream,
+        next_binding,
+    )
+
+
+def test_legacy_session_state_adapter_preserves_parser_error(tmp_path):
+    (
+        adapter,
+        _package_path,
+        _bundle_path,
+        acquisition_path,
+        _downstream_path,
+        _acquisition,
+        _session,
+        _downstream,
+    ) = _legacy_session_artifacts(tmp_path)
+    payload = json.loads(acquisition_path.read_text(encoding="utf-8"))
+    payload["binding_sha256"] = "0" * 64
+    acquisition_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError) as direct:
+        acquisition_binding_from_payload(payload)
+    with pytest.raises(ValueError) as adapted:
+        adapter.load_acquisition_binding()
+
+    assert str(adapted.value) == str(direct.value)
+
+
+def test_legacy_session_state_adapter_preserves_chain_divergence(
+    tmp_path,
+):
+    (
+        adapter,
+        _package_path,
+        _bundle_path,
+        _acquisition_path,
+        downstream_path,
+        _acquisition,
+        session,
+        _downstream,
+    ) = _legacy_session_artifacts(tmp_path)
+    divergent = _downstream_binding(session, 2)
+    (downstream_path / "002.json").write_text(
+        json.dumps(p8_downstream_binding_payload(divergent)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError) as direct:
+        P8DownstreamBindingStore(
+            downstream_path,
+            session_binding=session,
+        ).bindings()
+    with pytest.raises(RuntimeError) as adapted:
+        adapter.load_downstream_bindings(session)
+
+    assert str(adapted.value) == str(direct.value)
 
 
 def test_acquisition_runtime_rehydrates_same_owner_and_journal(

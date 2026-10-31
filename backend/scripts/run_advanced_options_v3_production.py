@@ -37,10 +37,10 @@ from realtime.advanced_options_p8_production import (  # noqa: E402
     p8_production_binding_from_payload,
 )
 from realtime.advanced_options_p8_runtime import (  # noqa: E402
+    LegacyArtifactSessionStateAdapter,
     P8ExecutionBundleStore,
     build_p8_preopen_session_binding,
     check_p8_docker_service_health,
-    p8_preopen_session_binding_from_payload,
     run_p8_docker_service,
     validate_p8_execution_bundle,
 )
@@ -430,7 +430,10 @@ def _validate_pre_session_identity(package, binding, session) -> None:
 
 
 def _prepare(args) -> dict[str, object]:
-    package = _load(args.package_source)
+    package = LegacyArtifactSessionStateAdapter(
+        package_path=args.package_source,
+        json_loader=_load,
+    ).load_package()
     production = _load(args.production_binding)
     observation = _load(args.live_observation)
     binding = p8_production_binding_from_payload(production)
@@ -556,11 +559,14 @@ def _prepare(args) -> dict[str, object]:
 
 
 def _compose(args, kinds) -> dict[str, object]:
-    package = _load(args.package)
-    bundle = validate_p8_execution_bundle(
-        args.package,
-        args.bundle,
+    state = LegacyArtifactSessionStateAdapter(
+        package_path=args.package,
+        bundle_path=args.bundle,
+        json_loader=_load,
+        bundle_validator=validate_p8_execution_bundle,
     )
+    package = state.load_package()
+    bundle = state.load_execution_bundle()
     validate_advanced_options_v3_runtime_identity(package, bundle)
     services = [P8_SERVICE_NAMES[kind] for kind in kinds]
     command = (
@@ -606,10 +612,14 @@ def _compose(args, kinds) -> dict[str, object]:
 
 
 def _prepare_waiting(args) -> dict[str, object]:
-    package = _load(args.package_source)
-    acquisition = acquisition_binding_from_payload(
-        _load(args.acquisition_binding)
+    state = LegacyArtifactSessionStateAdapter(
+        package_path=args.package_source,
+        acquisition_binding_path=args.acquisition_binding,
+        json_loader=_load,
+        acquisition_parser=acquisition_binding_from_payload,
     )
+    package = state.load_package()
+    acquisition = state.load_acquisition_binding()
     authorities = package.get("v3_authorities")
     session_payload = (
         authorities.get("session_acquisition")
@@ -747,11 +757,14 @@ def _prepare_waiting(args) -> dict[str, object]:
 
 
 def _authorize_window(args) -> dict[str, object]:
-    package = _load(args.package)
-    bundle = validate_p8_execution_bundle(
-        args.package,
-        args.bundle,
+    state = LegacyArtifactSessionStateAdapter(
+        package_path=args.package,
+        bundle_path=args.bundle,
+        json_loader=_load,
+        bundle_validator=validate_p8_execution_bundle,
     )
+    package = state.load_package()
+    bundle = state.load_execution_bundle()
     validate_advanced_options_v3_runtime_identity(package, bundle)
     production_binding = bundle.get("production_binding")
     binding = (
@@ -763,9 +776,11 @@ def _authorize_window(args) -> dict[str, object]:
         bundle["v3_authorities"]["session_acquisition"]
     )
     if binding is None:
-        session_binding = p8_preopen_session_binding_from_payload(
-            bundle.get("session_binding")
-        )
+        session_binding = state.load_preopen_session_binding(bundle)
+        if session_binding is None:
+            raise TypeError(
+                "P8 pre-open session binding must be an object"
+            )
         history = advanced_options_v3_history_binding_from_payload(
             package["v3_history_binding"]["binding"]
         )
@@ -942,11 +957,14 @@ def _authorize_window(args) -> dict[str, object]:
 
 
 def _status(args) -> dict[str, object]:
-    package = _load(args.package)
-    bundle = validate_p8_execution_bundle(
-        args.package,
-        args.bundle,
+    state = LegacyArtifactSessionStateAdapter(
+        package_path=args.package,
+        bundle_path=args.bundle,
+        json_loader=_load,
+        bundle_validator=validate_p8_execution_bundle,
     )
+    package = state.load_package()
+    bundle = state.load_execution_bundle()
     validate_advanced_options_v3_runtime_identity(package, bundle)
     session = session_acquisition_authorization_from_payload(
         bundle["v3_authorities"]["session_acquisition"]

@@ -20,7 +20,6 @@ from psycopg2.pool import ThreadedConnectionPool
 from .advanced_gateway import AdvancedGateway, GatewayConfiguration
 from .advanced_options_acquisition_runtime import (
     ACQUISITION_STATUS_SCHEMA,
-    acquisition_binding_from_payload,
 )
 from .advanced_journal_registry import (
     build_advanced_journal_registration,
@@ -500,14 +499,24 @@ def _downstream_binding_evidence(provider, binding, bundle):
     return evidence
 
 
-def _acquisition_document(path: Path):
+def _load_acquisition_document(path: Path) -> object:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeError(
             "V3 acquisition binding is unavailable"
         ) from error
-    return acquisition_binding_from_payload(value)
+
+
+def _acquisition_document(path: Path):
+    from .advanced_options_p8_runtime import (
+        LegacyArtifactSessionStateAdapter,
+    )
+
+    return LegacyArtifactSessionStateAdapter(
+        acquisition_binding_path=path,
+        acquisition_loader=_load_acquisition_document,
+    ).load_acquisition_binding()
 
 
 def _run_v3_acquisition_observer(
@@ -518,14 +527,19 @@ def _run_v3_acquisition_observer(
     provider,
     environment,
     stop_event,
+    session_state=None,
 ):
     control = binding.enrollment.control_plane
-    acquisition = _acquisition_document(Path(str(
-        environment.get(
-            "REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH",
-            "/run/advanced-options-acquisition/binding.json",
-        )
-    )))
+    acquisition = (
+        _acquisition_document(Path(str(
+            environment.get(
+                "REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH",
+                "/run/advanced-options-acquisition/binding.json",
+            )
+        )))
+        if session_state is None
+        else session_state.load_acquisition_binding()
+    )
     authorities = bundle.get("v3_authorities")
     if not isinstance(authorities, dict):
         raise RuntimeError("V3 session authority is unavailable")
@@ -730,7 +744,16 @@ def _shard_map(binding):
     )
 
 
-def _run_ingress(*, package, bundle, binding, provider, environment, stop_event):
+def _run_ingress(
+    *,
+    package,
+    bundle,
+    binding,
+    provider,
+    environment,
+    stop_event,
+    session_state=None,
+):
     control = binding.enrollment.control_plane
     if (
         bundle.get("orchestration", {}).get("catalog_version")
@@ -744,6 +767,7 @@ def _run_ingress(*, package, bundle, binding, provider, environment, stop_event)
             provider=provider,
             environment=environment,
             stop_event=stop_event,
+            session_state=session_state,
         )
     owner_id, owner_epoch = _lease(
         provider,
@@ -1496,6 +1520,7 @@ def run_p8_role(
     environment,
     stop_event: Event,
     state_observer=None,
+    session_state=None,
 ):
     if state_observer is not None and not callable(state_observer):
         raise TypeError("P8 role state observer is invalid")
@@ -1509,23 +1534,31 @@ def run_p8_role(
         if not v3:
             raise RuntimeError("P8 production binding is unavailable")
         from .advanced_options_p8_runtime import (
-            P8DownstreamBindingStore,
+            LegacyArtifactSessionStateAdapter,
             p8_downstream_binding_payload,
-            p8_preopen_session_binding_from_payload,
         )
 
-        session_binding = p8_preopen_session_binding_from_payload(
-            bundle.get("session_binding")
-        )
-        store = P8DownstreamBindingStore(
-            Path(str(environment.get(
+        state = session_state or LegacyArtifactSessionStateAdapter(
+            acquisition_binding_path=Path(str(environment.get(
+                "REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH",
+                "/run/advanced-options-acquisition/binding.json",
+            ))),
+            downstream_binding_directory=Path(str(environment.get(
                 "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR",
                 "/var/lib/realtime-v2-reports/downstream-bindings",
             ))),
-            session_binding=session_binding,
+            acquisition_loader=_load_acquisition_document,
         )
+        session_state = state
+        session_binding = state.load_preopen_session_binding(bundle)
+        if session_binding is None:
+            raise TypeError(
+                "P8 pre-open session binding must be an object"
+            )
         while not stop_event.is_set():
-            attached_binding = store.latest()
+            attached_binding = state.load_latest_downstream_binding(
+                session_binding
+            )
             if attached_binding is not None:
                 production_binding = dict(
                     attached_binding.production_binding
@@ -1613,7 +1646,10 @@ def run_p8_role(
             "stop_event": stop_event,
         }
         if kind is AdvancedOptionsProcessKind.INGRESS:
-            return _run_ingress(**arguments)
+            return _run_ingress(
+                **arguments,
+                session_state=session_state,
+            )
         if kind is AdvancedOptionsProcessKind.MARKET_STATE:
             return _run_market_state(**arguments)
         if kind is AdvancedOptionsProcessKind.FLOW:

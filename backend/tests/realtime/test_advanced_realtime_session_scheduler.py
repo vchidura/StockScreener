@@ -584,6 +584,210 @@ def test_provider_free_authorization_preparation_binds_exact_artifacts(
     assert authority.bundle_sha256 == "3" * 64
 
 
+def test_bounded_consumers_use_injected_session_state_without_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    package = {"source": "in-memory"}
+    bundle = {"session_binding": {"source": "in-memory"}}
+    session_binding = SimpleNamespace(binding_sha256="8" * 64)
+    acquisition_binding = SimpleNamespace(binding_sha256="4" * 64)
+    latest_binding = SimpleNamespace(
+        sequence=3,
+        binding_sha256="9" * 64,
+    )
+
+    class State:
+        def __init__(self):
+            self.calls = []
+            self.attached = None
+
+        def load_package(self):
+            self.calls.append("load_package")
+            return package
+
+        def load_bundle_document(self):
+            self.calls.append("load_bundle_document")
+            return bundle
+
+        def load_execution_bundle(self, **_kwargs):
+            self.calls.append("load_execution_bundle")
+            return bundle
+
+        def load_acquisition_binding(self):
+            self.calls.append("load_acquisition_binding")
+            return acquisition_binding
+
+        def load_preopen_session_binding(self, value):
+            assert value is bundle
+            self.calls.append("load_preopen_session_binding")
+            return session_binding
+
+        def load_downstream_bindings(self, value):
+            assert value is session_binding
+            self.calls.append("load_downstream_bindings")
+            return (latest_binding,)
+
+        def load_latest_downstream_binding(self, value):
+            assert value is session_binding
+            self.calls.append("load_latest_downstream_binding")
+            return latest_binding
+
+        def attach_downstream_binding(self, session, binding):
+            assert session is session_binding
+            self.calls.append("attach_downstream_binding")
+            self.attached = binding
+            return binding
+
+    state = State()
+    missing = tmp_path / "missing"
+    args = SimpleNamespace(
+        session_state=state,
+        package=missing / "package.json",
+        bundle=missing / "bundle.json",
+        acquisition_binding=missing / "acquisition.json",
+        downstream_binding_directory=missing / "downstream",
+        output_directory=tmp_path / "coordinator",
+        resume=False,
+    )
+    authority = SimpleNamespace(
+        authorization_id=UUID(
+            "11111111-2222-3333-4444-555555555555"
+        ),
+        authorization_sha256="6" * 64,
+        session_date=SESSION_DATE,
+        package_sha256="1" * 64,
+        bundle_sha256="2" * 64,
+        options_session_authorization_sha256="3" * 64,
+    )
+
+    assert cli._initialize_coordinator_identity(args, authority) is False
+
+    class Unit:
+        cursor = object()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Provider:
+        @staticmethod
+        def transaction(*_args, **_kwargs):
+            return Unit()
+
+    target_window_id = UUID(
+        "66666666-7777-8888-9999-aaaaaaaaaaaa"
+    )
+    receipt_id = UUID(
+        "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
+    )
+    cutoff = datetime(2026, 10, 28, 13, 35, tzinfo=UTC)
+    options_cutoff = cutoff + timedelta(seconds=120)
+    receipt = SimpleNamespace(
+        receipt_id=receipt_id,
+        input_sha256="1" * 64,
+        cutoff=cutoff,
+        created_at=cutoff + timedelta(seconds=30),
+    )
+    equity_input = SimpleNamespace(
+        equity_receipt_id=receipt_id,
+        input_sha256=receipt.input_sha256,
+        equity_cutoff=cutoff,
+        binding_sha256="2" * 64,
+    )
+    production_binding = {
+        "schema": "advanced-options-p8-production-binding-v3",
+        "window_id": str(target_window_id),
+        "control": {
+            "receipt_inputs": {"cutoff": options_cutoff.isoformat()},
+        },
+        "history_binding": {"binding_sha256": "3" * 64},
+        "equity_input_binding": {
+            "equity_receipt_id": str(receipt_id),
+            "input_sha256": receipt.input_sha256,
+            "equity_cutoff": cutoff.isoformat(),
+            "binding_sha256": equity_input.binding_sha256,
+        },
+    }
+    production_binding["binding_sha256"] = cli.canonical_sha256(
+        production_binding
+    )
+    captured_binding = SimpleNamespace(
+        window_id=target_window_id,
+        equity_input=equity_input,
+        history=SimpleNamespace(binding_sha256="3" * 64),
+    )
+
+    class Capture:
+        production_binding_payload = production_binding
+
+        @staticmethod
+        def capture_from_selection(*_args, **_kwargs):
+            return {}, captured_binding
+
+        @staticmethod
+        def persist_selection_cursor(*_args, **_kwargs):
+            return None
+
+    components = SimpleNamespace(
+        capture=Capture(),
+        close=lambda: None,
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_advanced_options_equity_input_binding_cursor",
+        lambda *_args: equity_input,
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_advanced_options_p8_production_components",
+        lambda **values: (
+            components
+            if values["package"] is package
+            else pytest.fail("consumer bypassed in-memory package")
+        ),
+    )
+
+    consumer = cli._ProductionPort(
+        args=args,
+        authority=authority,
+        provider=Provider(),
+        output_directory=args.output_directory,
+    )
+    capture = SimpleNamespace(
+        evidence_sha256="4" * 64,
+        reviewed_at=cutoff + timedelta(seconds=45),
+        options_cutoff=options_cutoff,
+    )
+    consumer._selection_captures[capture.evidence_sha256] = object()
+
+    attached = consumer._attach_downstream_binding(
+        window=SimpleNamespace(equity_cutoff=cutoff),
+        receipt=receipt,
+        capture=capture,
+        authorized={
+            "window_cycle_authorization_sha256": "5" * 64,
+            "publication_authorization_reference": "in-memory-test",
+        },
+        target_window_id=target_window_id,
+    )
+
+    assert attached is state.attached
+    assert attached.sequence == 4
+    assert attached.previous_binding_sha256 == latest_binding.binding_sha256
+    assert state.calls == [
+        "load_acquisition_binding",
+        "load_bundle_document",
+        "load_preopen_session_binding",
+        "load_package",
+        "load_latest_downstream_binding",
+        "attach_downstream_binding",
+    ]
+    assert not missing.exists()
+
+
 class _Port:
     def __init__(self, window, *, replay=False):
         self.window = window

@@ -10,7 +10,7 @@ self-reconciling continuous worker for local and Docker development.
 Canonical design and assessment:
 [REALTIME_V3_PIPELINE.md](../REALTIME_V3_PIPELINE.md).
 
-Mode: design consolidation complete; implementation planning next.
+Mode: consolidation packages C0/C1 implemented and validated; review pending.
 
 ## Settled Runtime Decisions
 
@@ -56,17 +56,32 @@ Mode: design consolidation complete; implementation planning next.
 - Measure retention, journal rotation, disk growth and backup/restore without making
   them startup gates.
 
-## Next Work Package
+## C0/C1 Completion Evidence
 
-Start implementation package C0/C1 from the canonical consolidation plan:
-
-1. capture the current provider-free regression baseline and socket/pointer ownership
-   map;
-2. define one session-state loading port;
-3. route the existing file-driven bounded path through a compatibility adapter without
-   changing behavior;
-4. add database-repository contract tests before moving any runtime owner;
-5. keep all current exact target-9/four-contract fixtures passing.
+- Provider-free pre-change baseline: 66 focused tests passed.
+- `SessionRuntimeStatePort` and `LegacyArtifactSessionStateAdapter` now isolate
+  package, bundle, acquisition, pre-open and downstream binding reads plus
+  downstream append.
+- The adapter delegates to the existing JSON loaders, bundle validator, typed parsers
+  and downstream chain store; payload/hash/error, append sequence, replay and atomic
+  publication semantics are unchanged.
+- The bounded scheduler, acquisition/production CLIs and P8 service, health and
+  resident paths use the compatibility seam. The scheduler no longer constructs or
+  reads/writes the downstream file store directly.
+- Consumer-injection regressions run the bounded scheduler and P8 service with
+  in-memory session state while package, bundle, acquisition and downstream artifact
+  paths are absent.
+- Corrected bounded seam suites: 107 tests passed with 5 existing warnings. Adjacent
+  continuous Equity,
+  session-operations, production and deployment suites: 50 tests passed.
+- Equity ingress remains the STOCKS socket owner; the split Options acquisition
+  runtime remains the OPTIONS socket/journal owner. The Equity bridge owns its
+  consumer checkpoints and the canonical publisher remains the sole release-pointer
+  writer.
+- Exact target-9 and exact-four QQQ/SPY validation remains active. No provider,
+  schema, Docker, publication or database effects ran.
+- PostgreSQL session state, desired-universe storage and old-path retirement are not
+  started.
 
 ## Exact Anchors
 
@@ -79,6 +94,6 @@ Start implementation package C0/C1 from the canonical consolidation plan:
 - `backend/realtime/advanced_options_p8_runtime.py`
 - `docker-compose.realtime-v2.yml`
 
-Focused completion check for the next implementation session: existing bounded V3
-tests pass through the new compatibility seam with identical typed session state and
-no provider, schema, Docker or publication effects.
+Focused completion check: PASS. Existing bounded V3 tests run through the
+compatibility seam with identical typed session state and no provider, schema,
+Docker, publication or database effects.

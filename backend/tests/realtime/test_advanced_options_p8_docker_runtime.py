@@ -614,6 +614,83 @@ def test_docker_service_invokes_real_role_boundary(tmp_path, monkeypatch):
     assert stored["role_evidence"]["status"] == "COMPLETE"
 
 
+def test_docker_service_uses_injected_state_without_artifact_paths(
+    tmp_path,
+    monkeypatch,
+):
+    _package_path, _bundle_path, bundle = _write_bundle(tmp_path)
+    package = _package()
+    session_binding = SimpleNamespace(binding_sha256="8" * 64)
+
+    class State:
+        def __init__(self):
+            self.calls = []
+
+        def load_package(self):
+            self.calls.append("load_package")
+            return package
+
+        def load_execution_bundle(self, **arguments):
+            self.calls.append(("load_execution_bundle", arguments))
+            return bundle
+
+        def load_preopen_session_binding(self, value):
+            assert value is bundle
+            self.calls.append("load_preopen_session_binding")
+            return session_binding
+
+        def load_latest_downstream_binding(self, value):
+            assert value is session_binding
+            self.calls.append("load_latest_downstream_binding")
+            return None
+
+    state = State()
+    missing = tmp_path / "missing"
+    status = tmp_path / "in-memory-status"
+    status.mkdir()
+
+    def role_runner(**kwargs):
+        kwargs["stop_event"].set()
+        return {
+            "status": "COMPLETE",
+            "kind": kwargs["kind"].value,
+            "effects": dict(P8_EFFECT_DENIALS),
+        }
+
+    monkeypatch.setattr(
+        runtime_module.psycopg2,
+        "connect",
+        lambda *_args, **_kwargs: _LeaseConnection(),
+    )
+
+    assert run_p8_docker_service(
+        AdvancedOptionsProcessKind.FLOW,
+        missing / "package.json",
+        missing / "bundle.json",
+        environment={
+            "REALTIME_V2_APP_DSN": "fixture",
+            "REALTIME_V2_P8_STATUS_DIR": str(status),
+        },
+        clock=lambda: START + timedelta(minutes=2),
+        role_runner=role_runner,
+        session_state=state,
+    ) == 0
+
+    assert state.calls[:3] == [
+        (
+            "load_execution_bundle",
+            {
+                "expected_kind": AdvancedOptionsProcessKind.FLOW,
+                "checked_at": START + timedelta(minutes=2),
+            },
+        ),
+        "load_package",
+        "load_preopen_session_binding",
+    ]
+    assert "load_latest_downstream_binding" in state.calls
+    assert not missing.exists()
+
+
 def test_production_role_refuses_missing_binding():
     with pytest.raises(RuntimeError, match="binding is unavailable"):
         roles_module.run_p8_role(

@@ -282,6 +282,7 @@ def run_p8_production_role(**kwargs):
             run_provider_free_v3_role,
         )
 
+        kwargs.pop("session_state", None)
         return run_provider_free_v3_role(**kwargs)
     from .advanced_options_p8_roles import run_p8_role
 

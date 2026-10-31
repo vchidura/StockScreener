@@ -97,6 +97,15 @@ def _json(path: Path) -> dict[str, object]:
     return value
 
 
+def _resident_acquisition_json(path: Path) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "V3 acquisition binding is unavailable"
+        ) from error
+
+
 def _sha256(value: object, name: str) -> str:
     if (
         not isinstance(value, str)
@@ -1088,9 +1097,10 @@ class P8ExecutionBundleStore:
         expected_kind: AdvancedOptionsProcessKind | None = None,
         checked_at: datetime | None = None,
     ) -> dict[str, object]:
-        return validate_p8_execution_bundle(
-            self.package_path,
-            self.path,
+        return LegacyArtifactSessionStateAdapter(
+            package_path=self.package_path,
+            bundle_path=self.path,
+        ).load_execution_bundle(
             expected_kind=expected_kind,
             checked_at=checked_at,
         )
@@ -1218,6 +1228,172 @@ def validate_p8_execution_bundle(
         if not start <= checked < stop:
             raise ValueError("P8 Docker service is outside its exact window")
     return bundle
+
+
+class SessionRuntimeStatePort(Protocol):
+    def load_package(self) -> Mapping[str, object]: ...
+
+    def load_bundle_document(self) -> Mapping[str, object]: ...
+
+    def load_execution_bundle(
+        self,
+        *,
+        expected_kind: AdvancedOptionsProcessKind | None = None,
+        checked_at: datetime | None = None,
+    ) -> Mapping[str, object]: ...
+
+    def load_acquisition_binding(
+        self,
+    ) -> AdvancedOptionsAcquisitionBinding: ...
+
+    def load_preopen_session_binding(
+        self,
+        bundle: Mapping[str, object],
+    ) -> P8PreopenSessionBinding | None: ...
+
+    def load_downstream_bindings(
+        self,
+        session_binding: P8PreopenSessionBinding,
+    ) -> tuple[P8DownstreamBinding, ...]: ...
+
+    def load_latest_downstream_binding(
+        self,
+        session_binding: P8PreopenSessionBinding,
+    ) -> P8DownstreamBinding | None: ...
+
+    def attach_downstream_binding(
+        self,
+        session_binding: P8PreopenSessionBinding,
+        binding: P8DownstreamBinding,
+    ) -> P8DownstreamBinding: ...
+
+
+class LegacyArtifactSessionStateAdapter:
+    def __init__(
+        self,
+        *,
+        package_path: Path | None = None,
+        bundle_path: Path | None = None,
+        acquisition_binding_path: Path | None = None,
+        downstream_binding_directory: Path | None = None,
+        json_loader: Callable[[Path], dict[str, object]] = _json,
+        acquisition_loader: Callable[[Path], object] | None = None,
+        bundle_validator: Callable[..., dict[str, object]] = (
+            validate_p8_execution_bundle
+        ),
+        acquisition_parser: Callable[
+            [object], AdvancedOptionsAcquisitionBinding
+        ] = acquisition_binding_from_payload,
+        session_binding_parser: Callable[
+            [object], P8PreopenSessionBinding
+        ] = p8_preopen_session_binding_from_payload,
+    ) -> None:
+        if not all(
+            callable(value)
+            for value in (
+                json_loader,
+                acquisition_loader or json_loader,
+                bundle_validator,
+                acquisition_parser,
+                session_binding_parser,
+            )
+        ):
+            raise TypeError("legacy session-state parser is invalid")
+        self._package_path = package_path
+        self._bundle_path = bundle_path
+        self._acquisition_binding_path = acquisition_binding_path
+        self._downstream_binding_directory = downstream_binding_directory
+        self._json_loader = json_loader
+        self._acquisition_loader = acquisition_loader or json_loader
+        self._bundle_validator = bundle_validator
+        self._acquisition_parser = acquisition_parser
+        self._session_binding_parser = session_binding_parser
+
+    @staticmethod
+    def _path(path: Path | None, name: str) -> Path:
+        if not isinstance(path, Path):
+            raise ValueError(f"legacy {name} path is unavailable")
+        return path
+
+    def load_package(self) -> Mapping[str, object]:
+        return self._json_loader(
+            self._path(self._package_path, "package")
+        )
+
+    def load_bundle_document(self) -> Mapping[str, object]:
+        return self._json_loader(
+            self._path(self._bundle_path, "execution bundle")
+        )
+
+    def load_execution_bundle(
+        self,
+        *,
+        expected_kind: AdvancedOptionsProcessKind | None = None,
+        checked_at: datetime | None = None,
+    ) -> Mapping[str, object]:
+        arguments: dict[str, object] = {}
+        if expected_kind is not None:
+            arguments["expected_kind"] = expected_kind
+        if checked_at is not None:
+            arguments["checked_at"] = checked_at
+        return self._bundle_validator(
+            self._path(self._package_path, "package"),
+            self._path(self._bundle_path, "execution bundle"),
+            **arguments,
+        )
+
+    def load_acquisition_binding(
+        self,
+    ) -> AdvancedOptionsAcquisitionBinding:
+        return self._acquisition_parser(
+            self._acquisition_loader(
+                self._path(
+                    self._acquisition_binding_path,
+                    "acquisition binding",
+                )
+            )
+        )
+
+    def load_preopen_session_binding(
+        self,
+        bundle: Mapping[str, object],
+    ) -> P8PreopenSessionBinding | None:
+        session_payload = bundle.get("session_binding")
+        if session_payload is None:
+            return None
+        return self._session_binding_parser(session_payload)
+
+    def load_downstream_bindings(
+        self,
+        session_binding: P8PreopenSessionBinding,
+    ) -> tuple[P8DownstreamBinding, ...]:
+        return self._downstream_store(session_binding).bindings()
+
+    def _downstream_store(
+        self,
+        session_binding: P8PreopenSessionBinding,
+    ) -> P8DownstreamBindingStore:
+        return P8DownstreamBindingStore(
+            self._path(
+                self._downstream_binding_directory,
+                "downstream binding directory",
+            ),
+            session_binding=session_binding,
+        )
+
+    def load_latest_downstream_binding(
+        self,
+        session_binding: P8PreopenSessionBinding,
+    ) -> P8DownstreamBinding | None:
+        bindings = self.load_downstream_bindings(session_binding)
+        return None if not bindings else bindings[-1]
+
+    def attach_downstream_binding(
+        self,
+        session_binding: P8PreopenSessionBinding,
+        binding: P8DownstreamBinding,
+    ) -> P8DownstreamBinding:
+        return self._downstream_store(session_binding).attach(binding)
 
 
 class _BundleCapture:
@@ -1760,45 +1936,42 @@ def run_p8_docker_service(
     wait: Callable[[float], None] = time.sleep,
     stop_event: threading.Event | None = None,
     role_runner: Callable[..., Mapping[str, object]] | None = None,
+    session_state: SessionRuntimeStatePort | None = None,
 ) -> int:
     """Run one real bounded role while continuously proving lease ownership."""
     service_environment = dict(
         os.environ if environment is None else environment
     )
     validate_p8_docker_service_environment(kind, service_environment)
-    bundle = validate_p8_execution_bundle(
-        package_path,
-        bundle_path,
+    state = session_state or LegacyArtifactSessionStateAdapter(
+        package_path=package_path,
+        bundle_path=bundle_path,
+        acquisition_binding_path=Path(service_environment.get(
+            "REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH",
+            "/run/advanced-options-acquisition/binding.json",
+        )),
+        downstream_binding_directory=Path(service_environment.get(
+            "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR",
+            "/var/lib/realtime-v2-reports/downstream-bindings",
+        )),
+        acquisition_loader=_resident_acquisition_json,
+    )
+    bundle = state.load_execution_bundle(
         expected_kind=kind,
         checked_at=clock(),
     )
-    package = _json(package_path.resolve())
+    package = state.load_package()
     stop = stop_event or threading.Event()
     if stop_event is None:
         signal.signal(signal.SIGINT, lambda *_args: stop.set())
         signal.signal(signal.SIGTERM, lambda *_args: stop.set())
     status_path = _p8_status_path(kind, service_environment)
     window_stop = datetime.fromisoformat(str(bundle["window"]["stop_utc"]))
-    session_binding = (
-        None
-        if bundle.get("session_binding") is None
-        else p8_preopen_session_binding_from_payload(
-            bundle["session_binding"]
-        )
-    )
-    downstream_store = (
+    session_binding = state.load_preopen_session_binding(bundle)
+    latest_binding = (
         None
         if session_binding is None
-        else P8DownstreamBindingStore(
-            Path(service_environment.get(
-                "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR",
-                "/var/lib/realtime-v2-reports/downstream-bindings",
-            )),
-            session_binding=session_binding,
-        )
-    )
-    latest_binding = (
-        None if downstream_store is None else downstream_store.latest()
+        else state.load_latest_downstream_binding(session_binding)
     )
     service = next(
         row for row in bundle["services"] if row["kind"] == kind.value
@@ -1854,6 +2027,7 @@ def run_p8_docker_service(
             }
             if observes_binding:
                 arguments["state_observer"] = observe_binding
+                arguments["session_state"] = state
             result = role_runner(
                 **arguments,
             )
@@ -1899,8 +2073,10 @@ def run_p8_docker_service(
                     f"P8 {kind.value} lease ownership changed"
                 )
             with role_state_lock:
-                if downstream_store is not None:
-                    attached = downstream_store.latest()
+                if session_binding is not None:
+                    attached = state.load_latest_downstream_binding(
+                        session_binding
+                    )
                     if (
                         attached is not None
                         and (
@@ -1977,6 +2153,7 @@ def check_p8_docker_service_health(
     *,
     environment: Mapping[str, str] | None = None,
     checked_at: datetime | None = None,
+    session_state: SessionRuntimeStatePort | None = None,
 ) -> Mapping[str, object]:
     service_environment = dict(
         os.environ if environment is None else environment
@@ -1985,9 +2162,11 @@ def check_p8_docker_service_health(
         checked_at or datetime.now(UTC),
         "checked_at",
     )
-    bundle = validate_p8_execution_bundle(
-        package_path,
-        bundle_path,
+    state = session_state or LegacyArtifactSessionStateAdapter(
+        package_path=package_path,
+        bundle_path=bundle_path,
+    )
+    bundle = state.load_execution_bundle(
         expected_kind=kind,
         checked_at=checked,
     )

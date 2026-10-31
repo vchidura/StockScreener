@@ -28,6 +28,9 @@ from realtime.advanced_options_acquisition_runtime import (  # noqa: E402
     build_acquisition_binding,
     run_acquisition,
 )
+from realtime.advanced_options_p8_runtime import (  # noqa: E402
+    LegacyArtifactSessionStateAdapter,
+)
 from realtime.advanced_options_v3_authority import (  # noqa: E402
     session_acquisition_authorization_from_payload,
 )
@@ -127,7 +130,11 @@ def parse_args(argv=None):
 
 
 def _binding(path: Path):
-    return acquisition_binding_from_payload(_read(path))
+    return LegacyArtifactSessionStateAdapter(
+        acquisition_binding_path=path,
+        json_loader=_read,
+        acquisition_parser=acquisition_binding_from_payload,
+    ).load_acquisition_binding()
 
 
 def _provider():
