@@ -1,5 +1,9 @@
 # Advanced Real-Time Implementation Plan
 
+> **Historical Windows-first implementation foundation.** Current V3 lifecycle,
+> integration decisions and work packages are maintained in
+> [REALTIME_V3_PIPELINE.md](REALTIME_V3_PIPELINE.md).
+
 Status: tracked offline implementation is in progress. No operational authorization
 is granted by this document.
 Date: 2026-10-03.

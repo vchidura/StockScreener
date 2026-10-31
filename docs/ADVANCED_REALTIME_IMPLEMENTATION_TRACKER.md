@@ -1,5 +1,10 @@
 # Advanced Real-Time Implementation Tracker
 
+> **Historical implementation tracker.** Do not append current V3 progress here.
+> Maintain consolidated decisions and the implementation matrix in
+> [REALTIME_V3_PIPELINE.md](REALTIME_V3_PIPELINE.md), with only the current focused
+> checkpoint in [agent-context/advanced-realtime.md](agent-context/advanced-realtime.md).
+
 Forward-ingestion stage: Developer matrix/O1 context, original Flow/Screener and
 observation-only Alerts plus indicative O1 package inputs implemented offline.
 See [forward-ingestion design](ADVANCED_REALTIME_FORWARD_INGESTION.md)

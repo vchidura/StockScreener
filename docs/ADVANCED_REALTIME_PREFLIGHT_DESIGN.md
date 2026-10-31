@@ -1,5 +1,11 @@
 # Advanced Real-Time Three-Tier System Design Specification
 
+> **Foundational architecture reference.** Current V3 runtime decisions,
+> integration assessment and implementation status are maintained in
+> [REALTIME_V3_PIPELINE.md](REALTIME_V3_PIPELINE.md). Enterprise-style activation
+> gates in this older specification are not normal personal local/Docker startup
+> requirements.
+
 Status: approved for tracked offline implementation; operational activation remains unapproved.
 Date: 2026-10-03.
 Scope: Stocks Advanced, Options Advanced, cross-asset detectors, and a shared
