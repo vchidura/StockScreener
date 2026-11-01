@@ -3,7 +3,7 @@ from dataclasses import replace
 from datetime import timedelta
 from functools import lru_cache
 import json
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 import pytest
@@ -186,7 +186,12 @@ class AlertStore(TickerStore):
         self.references = references
 
     def execute(self, sql, params=()):
-        if sql.startswith("SELECT revision_id"):
+        if sql.startswith(
+            "SELECT work_id::text,source_receipt_id::text"
+        ):
+            self.statements.append(sql)
+            self.result = []
+        elif sql.startswith("SELECT revision_id"):
             self.statements.append(sql)
             reference = next(row for row in self.references if str(row["security_id"]) == params[0])
             self.result = [dict(revision_id="wrong" if self.reference_drift else reference["security_revision_id"],
@@ -476,6 +481,8 @@ def test_alert_compute_and_publication_each_require_their_own_role_and_the_split
         monkeypatch):
     from realtime.database_access import RealtimeDatabaseRole
     from realtime import stock_alert_repository as repository
+    from realtime.portal_projection_repository import PortalReleaseReceipt
+    from realtime.preflight import ProviderTier
     compute, compute_cursor = _alert_database(RealtimeDatabaseRole.COMPUTE)
     publication, publication_cursor = _alert_database(RealtimeDatabaseRole.PUBLICATION)
     snapshot = alert_snapshot()
@@ -487,7 +494,6 @@ def test_alert_compute_and_publication_each_require_their_own_role_and_the_split
         repository.materialize_realtime_stock_alerts(publication, publication, cohort_id=COHORT_ID)
     with pytest.raises(ValueError, match="PUBLICATION"):
         repository.materialize_realtime_stock_alerts(compute, compute, cohort_id=COHORT_ID)
-    persisted = []
     monkeypatch.setattr(repository, "load_current_release", lambda cursor, cohort_id: None)
     monkeypatch.setattr(repository, "load_realtime_stock_alert_input", lambda cursor, **scope: scope)
     monkeypatch.setattr(
@@ -495,37 +501,78 @@ def test_alert_compute_and_publication_each_require_their_own_role_and_the_split
         "produce_realtime_stock_alerts",
         lambda inputs, **_kwargs: snapshot,
     )
-    monkeypatch.setattr(repository, "persist_portal_snapshot_cursor",
-                        lambda cursor, row, **options: persisted.append((cursor, options)) or row)
     published = []
-    monkeypatch.setattr(repository, "publish_portal_release_cursor",
-                        lambda cursor, receipt, rows, **options: published.append((cursor, rows, options)))
+    monkeypatch.setattr(
+        repository,
+        "run_portal_publication_once",
+        lambda database, config, batch, sink, **options: published.append(
+            (database, config, batch, sink, options)
+        ),
+    )
+    receipt = PortalReleaseReceipt(
+        uuid4(),
+        COHORT_ID,
+        ProviderTier.MASSIVE_DEVELOPER,
+        OBSERVED_AT,
+        "9" * 64,
+    )
     assert repository.materialize_realtime_stock_alerts(
-        compute, publication, receipt="receipt", cohort_id=COHORT_ID) is snapshot
-    assert persisted == [(publication_cursor, {})] and not compute_cursor.method_calls
-    assert published == [(publication_cursor, (snapshot,), {})]
+        compute,
+        publication,
+        receipt=receipt,
+        cohort_id=COHORT_ID,
+    ) is snapshot
+    assert not compute_cursor.method_calls
+    assert len(published) == 1
+    database, config, batch, sink, options = published[0]
+    assert database is publication
+    assert config.dispatch_authorized is False
+    assert batch.snapshots == (snapshot,)
+    assert batch.receipt == receipt
+    assert sink is None
+    assert options["checked_at"] == OBSERVED_AT
     assert compute.transaction.call_args.kwargs["read_only"] is True
-    assert publication.transaction.call_args.kwargs.get("read_only") is None
 
 
 def test_alert_session_close_persists_the_kept_variant_and_publishes_the_kept_release(monkeypatch):
     from realtime.database_access import RealtimeDatabaseRole
     from realtime import stock_alert_repository as repository
-    from realtime.portal_projection_repository import RELEASE_CLASS_SESSION_CLOSE, RETENTION_HOT_AND_KEPT
+    from realtime.portal_projection_repository import PortalReleaseReceipt
+    from realtime.preflight import ProviderTier
     publication, cursor = _alert_database(RealtimeDatabaseRole.PUBLICATION)
-    snapshot, kept = alert_snapshot(), object()
-    persisted, published = [], []
-    monkeypatch.setattr(repository, "persist_portal_snapshot_cursor",
-                        lambda cur, row, **options: persisted.append(options) or kept)
-    monkeypatch.setattr(repository, "publish_portal_release_cursor",
-                        lambda cur, receipt, rows, **options: published.append((rows, options)))
-    repository.publish_realtime_stock_alerts(publication, snapshot, receipt="receipt", session_close=True)
-    assert persisted == [{"retention": RETENTION_HOT_AND_KEPT}]
-    assert published[0] == ((snapshot,), {})
-    assert published[1][0] == (kept,) and published[1][1]["release_class"] == RELEASE_CLASS_SESSION_CLOSE
-    persisted.clear(), published.clear()
-    repository.publish_realtime_stock_alerts(publication, snapshot, receipt=None, session_close=True)
-    assert published == [] and persisted == [{"retention": RETENTION_HOT_AND_KEPT}]
+    snapshot = alert_snapshot()
+    receipt = PortalReleaseReceipt(
+        uuid4(),
+        COHORT_ID,
+        ProviderTier.MASSIVE_DEVELOPER,
+        OBSERVED_AT,
+        "9" * 64,
+    )
+    published = []
+    monkeypatch.setattr(
+        repository,
+        "run_portal_publication_once",
+        lambda database, config, batch, sink, **options: published.append(
+            batch
+        ),
+    )
+    repository.publish_realtime_stock_alerts(
+        publication,
+        snapshot,
+        receipt=receipt,
+        session_close=True,
+    )
+    assert len(published) == 1
+    assert published[0].snapshots == (snapshot,)
+    assert published[0].receipt == receipt
+    assert published[0].session_close is True
+    with pytest.raises(ValueError, match="requires its source receipt"):
+        repository.publish_realtime_stock_alerts(
+            publication,
+            snapshot,
+            receipt=None,
+            session_close=True,
+        )
 
 
 @pytest.mark.parametrize("defect", ["clock", "identity", "lineage", "coverage", "native-window"])

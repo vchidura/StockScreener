@@ -207,6 +207,12 @@ RELATIONS: dict[str, Relation] = {
     "rt.canonical_stock_alert_evaluations": _r(
         "equity", "ARCHIVE_FIRST", append=True, api=True
     ),
+    "rt.portal_publication_work": _r(
+        "control", "BOUNDED", mutable=True, api=True
+    ),
+    "rt.portal_publication_receipts": _r(
+        "control", "BOUNDED", append=True, api=True
+    ),
     "rt.worker_leases": _r("control", "BOUNDED", mutable=True, delete=True),
     "rt.advanced_options_read_pins": _r(
         "control", "BOUNDED", mutable=True, api=True

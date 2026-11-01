@@ -95,7 +95,10 @@ def _batch(*, omit=None):
         for ticker in CANARY_UNIVERSE.equity_tickers
         if ticker != omit
     )
-    return PortalPublicationBatch(snapshots)
+    return PortalPublicationBatch(
+        snapshots,
+        expected_ticker_keys=CANARY_UNIVERSE.equity_tickers,
+    )
 
 
 def _outbox(index=1):
@@ -201,8 +204,11 @@ def test_publication_retries_or_abandons_without_losing_claim(
     assert connection.commit.call_count == 2
 
 
-def test_publication_rejects_partial_canary_and_nonpublication_role():
-    with pytest.raises(ValueError, match="exact canary ticker pages"):
+def test_publication_rejects_membership_drift_and_nonpublication_role():
+    with pytest.raises(
+        ValueError,
+        match="changed from declared membership",
+    ):
         _batch(omit="AAPL")
 
     database, connection, _ = _database(RealtimeDatabaseRole.COMPUTE)
@@ -216,6 +222,56 @@ def test_publication_rejects_partial_canary_and_nonpublication_role():
             checked_at=NOW,
         )
     assert connection.cursor.call_count == 0
+
+
+def test_publication_accepts_declared_variable_ticker_membership():
+    snapshots = _batch().snapshots[:3]
+    batch = PortalPublicationBatch(
+        snapshots,
+        expected_ticker_keys=tuple(
+            row.snapshot_key for row in snapshots
+        ),
+    )
+
+    assert len(batch.snapshots) == 3
+    assert {
+        row.snapshot_key for row in batch.snapshots
+    } == set(batch.expected_ticker_keys)
+
+
+def test_declared_ticker_membership_is_persisted_with_publication_work():
+    database, _, _ = _database()
+    receipt = _receipt()
+    snapshots = _batch().snapshots[:3]
+    expected = tuple(row.snapshot_key for row in snapshots)
+    enqueued = []
+    batch = PortalPublicationBatch(
+        snapshots,
+        receipt=receipt,
+        expected_ticker_keys=expected,
+    )
+
+    run_portal_publication_once(
+        database,
+        replace(_config(), dispatch_authorized=False),
+        batch,
+        FakeSink(()),
+        checked_at=NOW,
+        snapshot_repository=lambda *_args, **_kwargs: None,
+        enqueue_repository=(
+            lambda _cursor, _receipt, _snapshots, **options: (
+                enqueued.append(options)
+                or {"work_id": uuid5(NAMESPACE_URL, "publication-work")}
+            )
+        ),
+        publication_work_runner=_completed_work_runner(
+            _release(receipt)
+        ),
+    )
+
+    assert enqueued[0]["expected_ticker_keys"] == tuple(
+        sorted(expected)
+    )
 
 
 def test_sink_exception_becomes_retryable_fenced_failure():
@@ -263,21 +319,83 @@ def _summary(session_date="2026-10-05"):
     )
 
 
+def _release(receipt=None, *, pointer_swapped=True):
+    source = receipt or _receipt()
+    manifest = {
+        "version": "realtime-portal-release-v1",
+        "release_class": RELEASE_CLASS_INTRADAY,
+        "session_date": NOW.date().isoformat(),
+        "source_receipt_ids": [str(source.receipt_id)],
+        "snapshots": [],
+    }
+    return PortalRelease(
+        uuid5(NAMESPACE_URL, f"release:{source.receipt_id}"),
+        COHORT,
+        ProviderTier.MASSIVE_DEVELOPER,
+        RELEASE_CLASS_INTRADAY,
+        source.receipt_id,
+        NOW.date(),
+        NOW,
+        source.universe_sha256,
+        manifest,
+        "a" * 64,
+        pointer_swapped,
+    )
+
+
+def _completed_work_runner(release, events=None):
+    def run(database, config, work, **options):
+        if events is not None:
+            events.append(("work", work, options))
+        return PortalPublicationStatus(
+            NOW,
+            0,
+            0,
+            0,
+            0,
+            0,
+            (),
+            release,
+            uuid5(NAMESPACE_URL, "publication-work"),
+        )
+
+    return run
+
+
 def test_release_is_published_in_the_snapshot_transaction_only_with_a_receipt():
     database, connection, cursor = _database()
     events = []
-    batch = PortalPublicationBatch(_batch().snapshots, receipt=_receipt())
+    receipt = _receipt()
+    batch = PortalPublicationBatch(
+        _batch().snapshots,
+        receipt=receipt,
+        product_key="TEST_EQUITY",
+    )
 
     run_portal_publication_once(
         database, _config(), batch, FakeSink(()), checked_at=NOW,
         snapshot_repository=lambda active, snapshot: events.append(("snapshot", connection.commit.call_count)),
-        release_repository=lambda active, receipt, snapshots, **options: events.append(
-            ("release", len(snapshots), options, connection.commit.call_count)),
+        enqueue_repository=lambda active, source, snapshots, **options: (
+            events.append((
+                "enqueue",
+                len(snapshots),
+                options,
+                connection.commit.call_count,
+            ))
+            or {"work_id": uuid5(NAMESPACE_URL, "publication-work")}
+        ),
+        publication_work_runner=_completed_work_runner(
+            _release(receipt),
+            events,
+        ),
         claim_repository=lambda active, **kwargs: (),
     )
 
-    assert [event[0] for event in events] == ["snapshot"] * 8 + ["release"]
-    assert events[-1][1:] == (8, {}, 0)
+    assert [event[0] for event in events[:9]] == [
+        "snapshot"
+    ] * 8 + ["enqueue"]
+    assert events[8][1] == 8
+    assert events[-1][0] == "work"
     run_portal_publication_once(
         database, _config(), _batch(), FakeSink(()), checked_at=NOW,
         snapshot_repository=lambda active, snapshot: None,
@@ -292,14 +410,20 @@ def test_disposable_canary_publication_never_claims_or_delivers_outbox():
     delivered = []
     config = replace(_config(), dispatch_authorized=False)
 
+    receipt = _receipt()
     status = run_portal_publication_once(
         database,
         config,
-        PortalPublicationBatch(_batch().snapshots, receipt=_receipt()),
+        PortalPublicationBatch(_batch().snapshots, receipt=receipt),
         FakeSink(delivered),
         checked_at=NOW,
         snapshot_repository=lambda active, snapshot: None,
-        release_repository=lambda active, receipt, snapshots: None,
+        enqueue_repository=lambda active, source, snapshots, **options: {
+            "work_id": uuid5(NAMESPACE_URL, "publication-work")
+        },
+        publication_work_runner=_completed_work_runner(
+            _release(receipt)
+        ),
         claim_repository=lambda active, **kwargs: claimed.append(kwargs),
     )
 
@@ -324,30 +448,41 @@ def test_session_close_publishes_kept_variants_and_never_keeps_per_ticker_pages(
     database, connection, cursor = _database()
     summary = _summary()
     kept_summary = session_close_snapshot(summary)
-    written, releases = [], []
+    written, enqueued = [], []
 
     def persist(active, snapshot, **options):
         written.append((snapshot.snapshot_type, options.get("retention")))
         return kept_summary if options.get("retention") == RETENTION_HOT_AND_KEPT else None
 
-    def release(active, receipt, snapshots, **options):
-        releases.append((tuple(row.snapshot_id for row in snapshots), options))
+    def enqueue(active, receipt, snapshots, **options):
+        enqueued.append((
+            tuple(row.snapshot_id for row in snapshots),
+            options,
+        ))
+        return {"work_id": uuid5(NAMESPACE_URL, "publication-work")}
 
+    receipt = _receipt()
     batch = PortalPublicationBatch(
-        (*_batch().snapshots, summary), receipt=_receipt(), session_close=True,
+        (*_batch().snapshots, summary),
+        receipt=receipt,
+        session_close=True,
     )
     run_portal_publication_once(
         database, _config(), batch, FakeSink(()), checked_at=NOW,
-        snapshot_repository=persist, release_repository=release,
+        snapshot_repository=persist,
+        enqueue_repository=enqueue,
+        publication_work_runner=_completed_work_runner(
+            _release(receipt)
+        ),
         claim_repository=lambda active, **kwargs: (),
     )
 
     assert written.count(("TICKER_PAGE", None)) == 8
     assert written[-1] == ("TICKER_WORKSPACE_SUMMARY_V1", RETENTION_HOT_AND_KEPT)
-    assert len(releases) == 2
-    assert len(releases[0][0]) == 9 and releases[0][1] == {}
-    assert releases[1][0] == (kept_summary.snapshot_id,)
-    assert releases[1][1] == {"release_class": RELEASE_CLASS_SESSION_CLOSE, "session_date": date(2026, 10, 5)}
+    assert len(enqueued) == 1
+    assert len(enqueued[0][0]) == 9
+    assert enqueued[0][1]["kept_snapshots"] == (kept_summary,)
+    assert enqueued[0][1]["session_date"] == date(2026, 10, 5)
 
 
 def test_receipt_and_session_close_batches_are_validated_before_any_write():
@@ -367,7 +502,7 @@ def test_receipt_and_session_close_batches_are_validated_before_any_write():
     assert connection.cursor.call_count == 0
 
 
-def test_canonical_stage_publisher_returns_one_pointer_and_rolls_back_failure():
+def test_canonical_stage_publisher_returns_one_pointer_without_racy_rollback():
     receipt = _receipt()
     batch = PortalPublicationBatch(
         _batch().snapshots,
@@ -418,12 +553,11 @@ def test_canonical_stage_publisher_returns_one_pointer_and_rolls_back_failure():
         release,
     )
     database, _, _ = _database()
-    pointers = iter((previous, current))
     publisher = CanonicalPortalPublisher(
         database,
         replace(_config(), dispatch_authorized=False),
         publication_runner=lambda *_args, **_kwargs: status,
-        pointer_loader=lambda *_args, **_kwargs: next(pointers),
+        pointer_loader=lambda *_args, **_kwargs: current,
     )
 
     result = publisher.publish(batch, checked_at=NOW)
@@ -433,23 +567,69 @@ def test_canonical_stage_publisher_returns_one_pointer_and_rolls_back_failure():
 
     database, _, _ = _database()
     restored = []
-    pointers = iter((previous, None))
     failing = CanonicalPortalPublisher(
         database,
         replace(_config(), dispatch_authorized=False),
         publication_runner=lambda *_args, **_kwargs: status,
-        pointer_loader=lambda *_args, **_kwargs: next(pointers),
+        pointer_loader=lambda *_args, **_kwargs: None,
         pointer_restorer=lambda _cursor, **values: restored.append(values),
     )
     with pytest.raises(
         ValueError,
-        match="did not advance its pointer",
+        match="did not retain its pointer outcome",
     ):
         failing.publish(batch, checked_at=NOW)
 
-    assert restored == [{
-        "cohort_id": COHORT,
-        "provider_tier": ProviderTier.MASSIVE_DEVELOPER,
-        "expected_current_release_id": release_id,
-        "previous": previous,
-    }]
+    assert restored == []
+
+
+def test_canonical_publisher_reports_noncurrent_without_pointer_authority(
+    monkeypatch,
+):
+    receipt = _receipt()
+    batch = PortalPublicationBatch(
+        _batch().snapshots,
+        receipt=receipt,
+    )
+    release = replace(
+        _release(receipt),
+        pointer_swapped=False,
+        publication_disposition="HISTORICAL_NONCURRENT",
+        deliverable=False,
+    )
+    status = PortalPublicationStatus(
+        NOW,
+        len(batch.snapshots),
+        0,
+        0,
+        0,
+        0,
+        ("PORTAL_PUBLICATION_HISTORICAL_NONCURRENT",),
+        release,
+    )
+    database, _, _ = _database()
+    publisher = CanonicalPortalPublisher(
+        database,
+        replace(_config(), dispatch_authorized=False),
+        publication_runner=lambda *_args, **_kwargs: status,
+        pointer_loader=lambda *_args, **_kwargs: None,
+    )
+
+    result = publisher.publish(batch, checked_at=NOW)
+    monkeypatch.setattr(
+        "realtime.portal_publisher.resume_portal_publication_once",
+        lambda *_args, **_kwargs: status,
+    )
+    resumed = publisher.resume(
+        source_receipt_id=receipt.receipt_id,
+        checked_at=NOW + timedelta(seconds=1),
+    )
+
+    assert result.release == release
+    assert result.pointer is None
+    assert result.status.verdict is PortalPublisherVerdict.DEGRADED
+    assert resumed.release == release
+    assert resumed.pointer is None
+    assert resumed.status.reason_codes == (
+        "PORTAL_PUBLICATION_HISTORICAL_NONCURRENT",
+    )

@@ -17,6 +17,7 @@ from equity.model_detection.contracts import (
 from .canonical_stock_alert_product import (
     CANONICAL_STOCK_ALERT_PRODUCT,
     CanonicalStockAlertBatch,
+    canonical_stock_alert_membership,
     produce_canonical_stock_alert_batch,
 )
 from .contracts import canonical_sha256
@@ -130,6 +131,66 @@ def _prior_states_cursor(
     return values
 
 
+def _membership_cursor(cursor, inputs):
+    cursor.execute(
+        "SELECT snapshot.revision_id::text,snapshot.snapshot_sha256 "
+        "FROM rt.realtime_desired_session_snapshots AS snapshot "
+        "WHERE snapshot.cohort_id=%s AND snapshot.session_date=%s "
+        "ORDER BY snapshot.materialized_at,snapshot.revision_id",
+        (str(inputs.cohort_id), inputs.session),
+    )
+    snapshots = tuple(cursor.fetchall())
+    if not snapshots:
+        return canonical_stock_alert_membership(inputs)
+    if len(snapshots) != 1:
+        raise ValueError(
+            "canonical Stock Alert cohort has ambiguous desired snapshots"
+        )
+    revision_id, snapshot_sha256 = _values(
+        snapshots[0],
+        ("revision_id", "snapshot_sha256"),
+    )
+    cursor.execute(
+        "SELECT intent.ticker,intent.member_kind,intent.enabled,"
+        "readiness.status,readiness.reasons,"
+        "binding.security_id::text,binding.instrument_id "
+        "FROM rt.realtime_desired_member_intents AS intent "
+        "JOIN rt.realtime_desired_intent_readiness AS readiness "
+        "ON readiness.intent_id=intent.intent_id "
+        "LEFT JOIN rt.realtime_desired_member_bindings AS binding "
+        "ON binding.intent_id=intent.intent_id "
+        "WHERE intent.revision_id=%s "
+        "AND intent.member_kind IN ('EQUITY','SECTOR_ETF') "
+        "ORDER BY intent.ticker,intent.member_kind",
+        (str(revision_id),),
+    )
+    names = (
+        "ticker",
+        "member_kind",
+        "enabled",
+        "status",
+        "reason_codes",
+        "security_id",
+        "instrument_id",
+    )
+    intended = tuple(
+        dict(row)
+        if isinstance(row, Mapping)
+        else dict(zip(names, row, strict=True))
+        for row in cursor.fetchall()
+    )
+    if not intended:
+        raise ValueError(
+            "canonical Stock Alert desired membership is unavailable"
+        )
+    return canonical_stock_alert_membership(
+        inputs,
+        desired_revision_id=UUID(str(revision_id)),
+        desired_snapshot_sha256=str(snapshot_sha256),
+        intended_members=intended,
+    )
+
+
 def build_canonical_stock_alert_batch_cursor(
     cursor,
     receipt: Mapping[str, object],
@@ -157,6 +218,8 @@ def build_canonical_stock_alert_batch_cursor(
         window_id=UUID(str(receipt["window_id"])),
         input_receipt_id=UUID(str(receipt["receipt_id"])),
         receipt_input_sha256=str(receipt["input_sha256"]),
+        membership=_membership_cursor(cursor, inputs),
+        deadline=_utc(receipt["deadline"], "receipt deadline"),
         prior_states=_prior_states_cursor(
             cursor,
             detector_sha256=version.detector_sha256,
@@ -321,7 +384,8 @@ def _persist_states_cursor(cursor, batch: CanonicalStockAlertBatch) -> None:
         "state_sha256=EXCLUDED.state_sha256,"
         "state_payload=EXCLUDED.state_payload,"
         "updated_at=EXCLUDED.updated_at "
-        "WHERE rt.detector_state.revision < EXCLUDED.revision",
+        "WHERE rt.detector_state.revision < EXCLUDED.revision "
+        "AND rt.detector_state.updated_at < EXCLUDED.updated_at",
         [
             (
                 state.detector_sha256,
@@ -412,12 +476,19 @@ def persist_canonical_stock_alert_batch_cursor(
         "cohort_id": str(batch.cohort_id),
         "window_id": str(batch.window_id),
         "input_receipt_id": str(batch.input_receipt_id),
+        "session_date": batch.session_date.isoformat(),
         "cutoff": batch.cutoff.isoformat(),
         "receipt_input_sha256": batch.receipt_input_sha256,
         "detector_input_sha256": batch.detector_input_sha256,
+        "membership": batch.membership.document,
         "detector_sha256": batch.version.detector_sha256,
         "counts": counts,
         "completed_at": batch.completed_at.isoformat(),
+        "deadline": (
+            None if batch.deadline is None else batch.deadline.isoformat()
+        ),
+        "late_catch_up": batch.is_late,
+        "deliverable": not batch.is_late,
     }
     cursor.execute(
         "INSERT INTO rt.canonical_stock_alert_batches("
@@ -425,8 +496,11 @@ def persist_canonical_stock_alert_batch_cursor(
         "receipt_input_sha256,detector_input_sha256,detector_sha256,"
         "status,evaluation_count,match_count,no_match_count,"
         "unavailable_count,error_count,batch_sha256,batch_document,"
-        "completed_at) VALUES("
-        "%s,%s,%s,%s,%s,%s,%s,%s,'COMPLETE',%s,%s,%s,%s,%s,%s,%s,%s) "
+        "completed_at,desired_revision_id,desired_snapshot_sha256,"
+        "membership_sha256,membership_document,observation_session,"
+        "deadline,late_catch_up,deliverable) VALUES("
+        "%s,%s,%s,%s,%s,%s,%s,%s,'COMPLETE',%s,%s,%s,%s,%s,%s,%s,%s,"
+        "%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT DO NOTHING",
         (
             str(batch_id),
@@ -445,6 +519,18 @@ def persist_canonical_stock_alert_batch_cursor(
             batch.batch_sha256,
             Json(document),
             batch.completed_at,
+            (
+                None
+                if batch.membership.desired_revision_id is None
+                else str(batch.membership.desired_revision_id)
+            ),
+            batch.membership.desired_snapshot_sha256,
+            batch.membership.membership_sha256,
+            Json(batch.membership.document),
+            batch.session_date,
+            batch.deadline,
+            batch.is_late,
+            not batch.is_late,
         ),
     )
     evaluations = []
@@ -464,6 +550,19 @@ def persist_canonical_stock_alert_batch_cursor(
             "input_sha256": row.input_sha256,
             "disposition": row.decision.disposition.value,
             "reason_codes": list(row.decision.reason_codes),
+            "desired_revision_id": (
+                None
+                if batch.membership.desired_revision_id is None
+                else str(batch.membership.desired_revision_id)
+            ),
+            "desired_snapshot_sha256": (
+                batch.membership.desired_snapshot_sha256
+            ),
+            "membership_sha256": batch.membership.membership_sha256,
+            "observation_session": batch.session_date.isoformat(),
+            "observation_cutoff": batch.cutoff.isoformat(),
+            "late_catch_up": batch.is_late,
+            "deliverable": not batch.is_late,
             "decision": canonical_value(row.decision),
             "alert": (
                 None
@@ -485,13 +584,27 @@ def persist_canonical_stock_alert_batch_cursor(
             canonical_sha256(payload),
             Json(payload),
             row.event.decision_at,
+            (
+                None
+                if batch.membership.desired_revision_id is None
+                else str(batch.membership.desired_revision_id)
+            ),
+            batch.membership.desired_snapshot_sha256,
+            batch.membership.membership_sha256,
+            batch.session_date,
+            batch.cutoff,
+            batch.is_late,
+            not batch.is_late,
         ))
     execute_values(
         cursor,
         "INSERT INTO rt.canonical_stock_alert_evaluations("
         "evaluation_id,batch_id,event_id,security_id,instrument_id,ticker,"
         "disposition,reason_codes,input_sha256,alert_id,evaluation_sha256,"
-        "evaluation_payload,observed_at) VALUES %s ON CONFLICT DO NOTHING",
+        "evaluation_payload,observed_at,desired_revision_id,"
+        "desired_snapshot_sha256,membership_sha256,observation_session,"
+        "observation_cutoff,late_catch_up,deliverable) "
+        "VALUES %s ON CONFLICT DO NOTHING",
         evaluations,
     )
     cursor.execute(
@@ -548,10 +661,8 @@ def load_canonical_stock_alert_projection_cursor(
             "canonical Stock Alert batch scope or clock changed"
         )
     cursor.execute(
-        "SELECT evaluation.*,alert.projection "
+        "SELECT evaluation.* "
         "FROM rt.canonical_stock_alert_evaluations AS evaluation "
-        "LEFT JOIN rt.alert_current AS alert "
-        "ON alert.alert_id=evaluation.alert_id "
         "WHERE evaluation.batch_id=%s "
         "ORDER BY evaluation.ticker,evaluation.evaluation_id",
         (str(batch["batch_id"]),),
@@ -577,6 +688,24 @@ def load_canonical_stock_alert_projection_cursor(
             "receipt_input_sha256": batch["receipt_input_sha256"],
             "detector_input_sha256": batch["detector_input_sha256"],
             "detector_sha256": batch["detector_sha256"],
+            "session_date": batch["observation_session"].isoformat(),
+            "desired_revision_id": (
+                None
+                if batch["desired_revision_id"] is None
+                else str(batch["desired_revision_id"])
+            ),
+            "desired_snapshot_sha256": batch[
+                "desired_snapshot_sha256"
+            ],
+            "membership_sha256": batch["membership_sha256"],
+            "membership": batch["membership_document"],
+            "deadline": (
+                None
+                if batch["deadline"] is None
+                else batch["deadline"].isoformat()
+            ),
+            "late_catch_up": bool(batch["late_catch_up"]),
+            "deliverable": bool(batch["deliverable"]),
             "completed_at": batch["completed_at"].isoformat(),
         },
         "evaluations": [
@@ -591,13 +720,30 @@ def load_canonical_stock_alert_projection_cursor(
                 "input_sha256": row["input_sha256"],
                 "evaluation_sha256": row["evaluation_sha256"],
                 "payload": row["evaluation_payload"],
-                "alert": row["projection"],
+                "alert": row["evaluation_payload"].get("alert"),
                 "alert_id": (
                     None
                     if row["alert_id"] is None
                     else str(row["alert_id"])
                 ),
                 "observed_at": row["observed_at"].isoformat(),
+                "desired_revision_id": (
+                    None
+                    if row["desired_revision_id"] is None
+                    else str(row["desired_revision_id"])
+                ),
+                "desired_snapshot_sha256": row[
+                    "desired_snapshot_sha256"
+                ],
+                "membership_sha256": row["membership_sha256"],
+                "observation_session": row[
+                    "observation_session"
+                ].isoformat(),
+                "observation_cutoff": row[
+                    "observation_cutoff"
+                ].isoformat(),
+                "late_catch_up": bool(row["late_catch_up"]),
+                "deliverable": bool(row["deliverable"]),
             }
             for row in evaluations
         ],
@@ -614,19 +760,167 @@ def canonical_stock_alert_health_cursor(
     cursor.execute(
         "SELECT to_regclass('rt.canonical_stock_alert_batches')"
     )
-    if cursor.fetchone()[0] is None:
+    schema_row = cursor.fetchone()
+    schema_relation = (
+        next(iter(schema_row.values()))
+        if isinstance(schema_row, Mapping)
+        else schema_row[0]
+    )
+    if schema_relation is None:
         return {"status": "BLOCKED", "reason": "SCHEMA_UNAVAILABLE"}
     cursor.execute(
         "SELECT count(*),max(completed_at) "
         "FROM rt.canonical_stock_alert_batches WHERE cohort_id=%s",
         (str(cohort_id),),
     )
-    count, completed_at = cursor.fetchone()
+    count_row = cursor.fetchone()
+    count, completed_at = (
+        (
+            count_row["count"],
+            count_row["max"],
+        )
+        if isinstance(count_row, Mapping)
+        else count_row
+    )
+    cursor.execute(
+        "SELECT desired_revision_id::text,desired_snapshot_sha256,"
+        "membership_sha256,membership_document,observation_session,"
+        "cutoff,late_catch_up,deliverable "
+        "FROM rt.canonical_stock_alert_batches WHERE cohort_id=%s "
+        "ORDER BY cutoff DESC,completed_at DESC,batch_id LIMIT 1",
+        (str(cohort_id),),
+    )
+    batch_row = cursor.fetchone()
+    batch = (
+        None
+        if batch_row is None
+        else dict(batch_row)
+        if isinstance(batch_row, Mapping)
+        else dict(zip((
+            "desired_revision_id",
+            "desired_snapshot_sha256",
+            "membership_sha256",
+            "membership_document",
+            "observation_session",
+            "cutoff",
+            "late_catch_up",
+            "deliverable",
+        ), batch_row, strict=True))
+    )
+    cursor.execute(
+        "SELECT work_id::text,state,disposition,attempts,"
+        "next_attempt_at,failure_reason,release_id::text,deliverable "
+        "FROM rt.portal_publication_work WHERE cohort_id=%s "
+        "AND product_key='STOCK_ALERTS' "
+        "ORDER BY cutoff DESC,created_at DESC LIMIT 1",
+        (str(cohort_id),),
+    )
+    work_row = cursor.fetchone()
+    work = (
+        None
+        if work_row is None
+        else dict(work_row)
+        if isinstance(work_row, Mapping)
+        else dict(zip((
+            "work_id",
+            "state",
+            "disposition",
+            "attempts",
+            "next_attempt_at",
+            "failure_reason",
+            "release_id",
+            "deliverable",
+        ), work_row, strict=True))
+    )
+    membership = (
+        None if batch is None else batch["membership_document"]
+    )
+    intended = (
+        () if membership is None else membership["intended_members"]
+    )
+    effective = (
+        () if membership is None else membership["effective_members"]
+    )
+    partial = (
+        membership is not None
+        and (
+            any(
+                row["enabled"] and row["status"] != "READY"
+                for row in intended
+            )
+            or {
+                (str(row["security_id"]), row["ticker"])
+                for row in effective
+            }
+            != {
+                (str(row["security_id"]), row["ticker"])
+                for row in intended
+                if row["enabled"]
+                and row["status"] == "READY"
+                and row["security_id"] is not None
+            }
+        )
+    )
+    degraded = bool(
+        partial
+        or (batch is not None and not batch["deliverable"])
+        or (
+            work is not None
+            and work["state"] in {"RETRY", "TERMINAL"}
+        )
+        or (
+            work is not None
+            and work["disposition"] in {
+                "HISTORICAL_STALE",
+                "HISTORICAL_NONCURRENT",
+            }
+        )
+    )
     return {
-        "status": "READY",
-        "reason": None,
+        "status": "DEGRADED" if degraded else "READY",
+        "reason": (
+            "PARTIAL_OR_NONCURRENT_PUBLICATION"
+            if degraded
+            else None
+        ),
         "completed_batches": int(count),
         "latest_completed_at": (
             None if completed_at is None else completed_at.isoformat()
+        ),
+        "membership": (
+            None
+            if batch is None
+            else {
+                "desired_revision_id": batch["desired_revision_id"],
+                "desired_snapshot_sha256": batch[
+                    "desired_snapshot_sha256"
+                ],
+                "membership_sha256": batch["membership_sha256"],
+                "observation_session": batch[
+                    "observation_session"
+                ].isoformat(),
+                "cutoff": batch["cutoff"].isoformat(),
+                "intended_members": intended,
+                "effective_members": effective,
+                "partial": partial,
+                "late_catch_up": bool(batch["late_catch_up"]),
+                "deliverable": bool(batch["deliverable"]),
+            }
+        ),
+        "publication": (
+            None
+            if work is None
+            else {
+                "work_id": work["work_id"],
+                "state": work["state"],
+                "disposition": work["disposition"],
+                "attempts": int(work["attempts"]),
+                "next_attempt_at": work[
+                    "next_attempt_at"
+                ].isoformat(),
+                "failure_reason": work["failure_reason"],
+                "release_id": work["release_id"],
+                "deliverable": bool(work["deliverable"]),
+            }
         ),
     }

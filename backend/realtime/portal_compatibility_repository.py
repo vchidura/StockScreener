@@ -105,6 +105,11 @@ class ReleaseView:
     session_date: date
     cutoff: datetime
     entries: Mapping[tuple[str, str], Mapping[str, object]]
+    publication_generation: int | None = None
+    desired_snapshot_sha256: str | None = None
+    membership_sha256: str | None = None
+    deliverable: bool = True
+    publication_disposition: str = "CURRENT"
 
     def entry(self, snapshot_type: str, snapshot_key: str) -> Mapping[str, object] | None:
         return self.entries.get((snapshot_type, snapshot_key))
@@ -145,6 +150,16 @@ def load_release(cursor, release_id, cutoff, cache: BoundedCache | None = None) 
         release_id=UUID(str(row["release_id"])), cohort_id=UUID(str(row["cohort_id"])),
         provider_tier=row["provider_tier"], release_class=row["release_class"],
         session_date=row["session_date"], cutoff=row["cutoff"], entries=entries,
+        publication_generation=manifest.get("publication_generation"),
+        desired_snapshot_sha256=manifest.get(
+            "desired_snapshot_sha256"
+        ),
+        membership_sha256=manifest.get("membership_sha256"),
+        deliverable=bool(manifest.get("deliverable", True)),
+        publication_disposition=manifest.get(
+            "publication_disposition",
+            "CURRENT",
+        ),
     )
     if cache is not None:
         cache.put(key, view)

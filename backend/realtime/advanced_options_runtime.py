@@ -434,7 +434,15 @@ class AdvancedOptionsRuntimeBinding:
         )
         if (
             not isinstance(result, CanonicalPortalPublicationResult)
-            or result.release.receipt_id != authorized.receipt.receipt_id
+            or str(authorized.receipt.receipt_id)
+            not in {
+                str(value)
+                for value in result.release.manifest.get(
+                    "source_receipt_ids",
+                    (result.release.receipt_id,),
+                )
+            }
+            or result.pointer is None
             or result.release.release_id != result.pointer.release_id
         ):
             raise ValueError(

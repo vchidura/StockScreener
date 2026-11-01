@@ -203,6 +203,7 @@ from realtime.portal_projection_repository import (
 from realtime.portal_publisher import (
     CanonicalPortalPublisher,
     PortalPublicationConfig,
+    run_portal_publication_once,
 )
 from realtime.preflight import (
     DetectorFamily,
@@ -2228,21 +2229,45 @@ def test_v3_exact_provider_free_restart_publication_and_cleanup(
 
                 canonical = publisher.publish
                 if fail_publication[0]:
-                    pointer_reads = [0]
-
-                    def fail_after_publish(cursor_value, **values):
-                        pointer_reads[0] += 1
-                        if pointer_reads[0] == 2:
-                            return None
-                        return load_portal_release_pointer_cursor(
+                    def fail_release(
+                        cursor_value,
+                        receipt,
+                        snapshots,
+                        **options,
+                    ):
+                        publish_portal_release_cursor(
                             cursor_value,
-                            **values,
+                            receipt,
+                            snapshots,
+                            **options,
+                        )
+                        raise RuntimeError(
+                            "injected publication transaction failure"
+                        )
+
+                    def fail_publication_runner(
+                        database,
+                        config,
+                        batch,
+                        sink,
+                        *,
+                        checked_at,
+                    ):
+                        return run_portal_publication_once(
+                            database,
+                            config,
+                            batch,
+                            sink,
+                            checked_at=checked_at,
+                            release_repository=fail_release,
                         )
 
                     failing = CanonicalPortalPublisher(
                         publisher_database,
                         publication_config,
-                        pointer_loader=fail_after_publish,
+                        publication_runner=(
+                            fail_publication_runner
+                        ),
                     )
                     canonical = failing.publish
                 operations = SimpleNamespace(
@@ -2317,7 +2342,12 @@ def test_v3_exact_provider_free_restart_publication_and_cleanup(
                     runners[stage] = counted
                 return repository, composition, runners, port
 
-            def run_through(stop_stage, *, fail_publish=False):
+            def run_through(
+                stop_stage,
+                *,
+                fail_publish=False,
+                now_offset_seconds=0,
+            ):
                 fail_publication[0] = fail_publish
                 repository, composition, runners, port = (
                     build_composition()
@@ -2328,7 +2358,9 @@ def test_v3_exact_provider_free_restart_publication_and_cleanup(
                 assert start.enabled == frozenset(
                     OPTIONS_V3_STAGE_ORDER
                 )
-                now = authority.cycle.prepared_at
+                now = authority.cycle.prepared_at + timedelta(
+                    seconds=now_offset_seconds
+                )
                 claim = repository.claim_window(
                     window_id,
                     uuid4(),
@@ -2554,7 +2586,10 @@ def test_v3_exact_provider_free_restart_publication_and_cleanup(
             assert pointer_after_failure.release_id == (
                 prior_release.release_id
             )
-            run_through("OPTIONS_PUBLISH")
+            run_through(
+                "OPTIONS_PUBLISH",
+                now_offset_seconds=3600,
+            )
             with provider.transaction(APP_ROLE, read_only=True) as unit:
                 pointer = load_portal_release_pointer_cursor(
                     unit.cursor,
@@ -2569,7 +2604,8 @@ def test_v3_exact_provider_free_restart_publication_and_cleanup(
                 manifest = unit.cursor.fetchone()[0]
                 unit.cursor.execute(
                     "SELECT count(*) FROM rt.portal_releases "
-                    "WHERE receipt_id=(SELECT receipt_id "
+                    "WHERE manifest->'source_receipt_ids' ? ("
+                    "SELECT receipt_id::text "
                     "FROM rt.cycle_receipts WHERE window_id=%s "
                     "AND receipt_kind='OPTIONS_PORTAL_READY')",
                     (str(window_id),),
@@ -2603,7 +2639,10 @@ def test_v3_exact_provider_free_restart_publication_and_cleanup(
             assert authority_status["window_cycle"]["state"] == "CONSUMED"
             assert outbox_count == 0
             release_before_replay = pointer.release_id
-            replay_port = run_through("OPTIONS_PUBLISH")
+            replay_port = run_through(
+                "OPTIONS_PUBLISH",
+                now_offset_seconds=3600,
+            )
             assert replay_port is not None
             with provider.transaction(APP_ROLE, read_only=True) as unit:
                 replay_pointer = load_portal_release_pointer_cursor(

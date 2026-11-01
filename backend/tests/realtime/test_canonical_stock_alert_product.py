@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import NAMESPACE_URL, uuid5
@@ -8,8 +9,10 @@ from equity.model_detection.contracts import Disposition
 from realtime.canonical_stock_alert_product import (
     CanonicalStockAlertContext,
     canonical_stock_alert_contexts,
+    canonical_stock_alert_membership,
     produce_canonical_stock_alert_batch,
 )
+from realtime.canonical_stock_alert_repository import _membership_cursor
 from realtime.contracts import canonical_sha256
 from realtime.preflight import ProviderTier
 from realtime.screening_projection import RealtimeScreeningInput
@@ -111,6 +114,88 @@ def _inputs():
     )
 
 
+def _retained_projection(batch):
+    retained = {
+        "contract": "canonical-stock-alert-retained-projection-v1",
+        "loaded_at": batch.completed_at.isoformat(),
+        "batch": {
+            "batch_id": str(uuid5(
+                NAMESPACE_URL,
+                f"batch:{batch.batch_sha256}",
+            )),
+            "batch_sha256": batch.batch_sha256,
+            "cohort_id": str(batch.cohort_id),
+            "window_id": str(batch.window_id),
+            "input_receipt_id": str(batch.input_receipt_id),
+            "session_date": batch.session_date.isoformat(),
+            "cutoff": batch.cutoff.isoformat(),
+            "receipt_input_sha256": batch.receipt_input_sha256,
+            "detector_input_sha256": batch.detector_input_sha256,
+            "detector_sha256": batch.version.detector_sha256,
+            "desired_revision_id": (
+                None
+                if batch.membership.desired_revision_id is None
+                else str(batch.membership.desired_revision_id)
+            ),
+            "desired_snapshot_sha256": (
+                batch.membership.desired_snapshot_sha256
+            ),
+            "membership_sha256": batch.membership.membership_sha256,
+            "membership": batch.membership.document,
+            "late_catch_up": batch.is_late,
+            "deliverable": not batch.is_late,
+            "completed_at": batch.completed_at.isoformat(),
+        },
+        "evaluations": [
+            {
+                "evaluation_id": str(uuid5(
+                    NAMESPACE_URL,
+                    f"evaluation:{batch.batch_sha256}:{row.ticker}",
+                )),
+                "event_id": str(row.event.event_id),
+                "security_id": str(row.security_id),
+                "instrument_id": row.instrument_id,
+                "ticker": row.ticker,
+                "disposition": row.decision.disposition.value,
+                "reason_codes": list(row.decision.reason_codes),
+                "input_sha256": row.input_sha256,
+                "evaluation_sha256": canonical_sha256(
+                    row.event.payload
+                ),
+                "payload": row.event.payload,
+                "alert_id": (
+                    None
+                    if row.alert is None
+                    else str(row.alert.alert_id)
+                ),
+                "alert": (
+                    None
+                    if row.alert is None
+                    else dict(row.alert.projection)
+                ),
+                "observed_at": row.event.decision_at.isoformat(),
+                "desired_revision_id": (
+                    None
+                    if batch.membership.desired_revision_id is None
+                    else str(batch.membership.desired_revision_id)
+                ),
+                "desired_snapshot_sha256": (
+                    batch.membership.desired_snapshot_sha256
+                ),
+                "membership_sha256": (
+                    batch.membership.membership_sha256
+                ),
+                "observation_cutoff": batch.cutoff.isoformat(),
+                "late_catch_up": batch.is_late,
+                "deliverable": not batch.is_late,
+            }
+            for row in batch.evaluations
+        ],
+    }
+    retained["projection_sha256"] = canonical_sha256(retained)
+    return retained
+
+
 def test_e_context_provides_market_only_and_retains_spy_lineage():
     inputs = _inputs()
     contexts = canonical_stock_alert_contexts(inputs)
@@ -198,44 +283,7 @@ def test_canonical_portal_snapshot_exposes_unavailable_reasons():
         input_receipt_id=RECEIPT,
         receipt_input_sha256="b" * 64,
     )
-    retained = {
-        "contract": "canonical-stock-alert-retained-projection-v1",
-        "loaded_at": (CUTOFF + timedelta(seconds=2)).isoformat(),
-        "batch": {
-            "batch_id": str(uuid5(NAMESPACE_URL, "batch")),
-            "batch_sha256": batch.batch_sha256,
-            "cohort_id": str(COHORT),
-            "window_id": str(WINDOW),
-            "input_receipt_id": str(RECEIPT),
-            "cutoff": CUTOFF.isoformat(),
-            "receipt_input_sha256": "b" * 64,
-            "detector_input_sha256": batch.detector_input_sha256,
-            "detector_sha256": batch.version.detector_sha256,
-            "completed_at": batch.completed_at.isoformat(),
-        },
-        "evaluations": [
-            {
-                "evaluation_id": str(uuid5(
-                    NAMESPACE_URL,
-                    f"evaluation:{row.ticker}",
-                )),
-                "event_id": str(row.event.event_id),
-                "security_id": str(row.security_id),
-                "instrument_id": row.instrument_id,
-                "ticker": row.ticker,
-                "disposition": row.decision.disposition.value,
-                "reason_codes": list(row.decision.reason_codes),
-                "input_sha256": row.input_sha256,
-                "evaluation_sha256": canonical_sha256(row.event.payload),
-                "payload": row.event.payload,
-                "alert_id": str(row.alert.alert_id),
-                "alert": dict(row.alert.projection),
-                "observed_at": row.event.decision_at.isoformat(),
-            }
-            for row in batch.evaluations
-        ],
-    }
-    retained["projection_sha256"] = canonical_sha256(retained)
+    retained = _retained_projection(batch)
 
     snapshot = produce_realtime_stock_alerts(
         inputs,
@@ -262,3 +310,164 @@ def test_canonical_portal_snapshot_exposes_unavailable_reasons():
         and row["non_actionable"] is True
         for row in page["rows"]
     )
+
+
+def test_variable_membership_and_one_warming_member_are_partial_not_blocked():
+    base = _inputs()
+    members = (
+        *base.members,
+        _member("MSFT", 3),
+        _member("QQQ", 4),
+        _member("XLF", 5),
+    )
+    bars = tuple(
+        _bar(
+            member,
+            index,
+            closes=(100, 101, 102),
+            volumes=(100, 110, 120),
+        )
+        for member in members
+        for index in range(3)
+    )
+    inputs = replace(base, members=members, bars=bars)
+    intended = tuple({
+        "security_id": row["security_id"],
+        "instrument_id": row["instrument_id"],
+        "ticker": row["ticker"],
+        "member_kind": (
+            "SECTOR_ETF" if row["ticker"] == "XLF" else "EQUITY"
+        ),
+        "enabled": True,
+        "status": "READY",
+        "reason_codes": (),
+    } for row in members) + ({
+        "security_id": None,
+        "instrument_id": None,
+        "ticker": "NVDA",
+        "member_kind": "EQUITY",
+        "enabled": True,
+        "status": "WARMING",
+        "reason_codes": ("HISTORY_WARMING",),
+    },)
+    membership = canonical_stock_alert_membership(
+        inputs,
+        desired_revision_id=uuid5(
+            NAMESPACE_URL,
+            "desired-revision:variable",
+        ),
+        desired_snapshot_sha256="c" * 64,
+        intended_members=intended,
+    )
+    batch = produce_canonical_stock_alert_batch(
+        inputs,
+        window_id=WINDOW,
+        input_receipt_id=RECEIPT,
+        receipt_input_sha256="b" * 64,
+        membership=membership,
+    )
+    snapshot = produce_realtime_stock_alerts(
+        inputs,
+        retained_projection=_retained_projection(batch),
+    )
+
+    assert len(batch.evaluations) == len(members) == 5
+    assert {
+        row.ticker for row in batch.evaluations
+    } == {row["ticker"] for row in members}
+    assert batch.membership.partial is True
+    assert snapshot.payload["membership_status"] == "PARTIAL"
+    assert snapshot.payload["shadow"]["membership_status"] == "PARTIAL"
+    assert snapshot.payload["shadow"]["status"] == "DEGRADED"
+    assert snapshot.payload["shadow"]["publications"][0]["expected"] == 5
+    assert snapshot.payload["shadow"]["publications"][0]["status"] == "PARTIAL"
+    assert any(
+        row["ticker"] == "NVDA" and row["status"] == "WARMING"
+        for row in snapshot.payload["membership"]["intended_members"]
+    )
+
+
+def test_late_catch_up_keeps_original_cutoff_and_is_not_deliverable():
+    inputs = _inputs()
+    batch = produce_canonical_stock_alert_batch(
+        inputs,
+        window_id=WINDOW,
+        input_receipt_id=RECEIPT,
+        receipt_input_sha256="b" * 64,
+        deadline=CUTOFF + timedelta(seconds=1),
+    )
+    snapshot = produce_realtime_stock_alerts(
+        inputs,
+        retained_projection=_retained_projection(batch),
+    )
+
+    assert batch.is_late is True
+    assert all(
+        row.event.payload["observation_cutoff"] == CUTOFF.isoformat()
+        and row.event.payload["deliverable"] is False
+        for row in batch.evaluations
+    )
+    assert snapshot.generated_at == CUTOFF
+    assert snapshot.payload["late_catch_up"] is True
+    assert snapshot.payload["deliverable"] is False
+    assert snapshot.payload["shadow"]["status"] == "STALE"
+    assert snapshot.payload["shadow"]["deliverable"] is False
+    assert all(
+        row["deliverable"] is False
+        and row["delivery_permission"] is False
+        for row in snapshot.payload["shadow"]["alerts"]
+    )
+
+
+def test_repository_membership_uses_snapshot_and_keeps_warming_intent():
+    inputs = _inputs()
+    revision_id = uuid5(NAMESPACE_URL, "desired-revision:repository")
+    rows = [
+        ((str(revision_id), "d" * 64),),
+        tuple(
+            (
+                row["ticker"],
+                "EQUITY",
+                True,
+                "READY",
+                [],
+                str(row["security_id"]),
+                row["instrument_id"],
+            )
+            for row in inputs.members
+        ) + ((
+            "NVDA",
+            "EQUITY",
+            True,
+            "WARMING",
+            ["HISTORY_WARMING"],
+            None,
+            None,
+        ),),
+    ]
+
+    class Cursor:
+        def __init__(self):
+            self.index = -1
+
+        def execute(self, _statement, _parameters):
+            self.index += 1
+
+        def fetchall(self):
+            return rows[self.index]
+
+    membership = _membership_cursor(Cursor(), inputs)
+
+    assert membership.desired_revision_id == revision_id
+    assert membership.desired_snapshot_sha256 == "d" * 64
+    assert membership.partial is True
+    assert [row["ticker"] for row in membership.effective_members] == [
+        "AAPL",
+        "SPY",
+    ]
+    warming = next(
+        row
+        for row in membership.intended_members
+        if row["ticker"] == "NVDA"
+    )
+    assert warming["status"] == "WARMING"

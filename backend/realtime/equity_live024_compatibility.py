@@ -104,6 +104,8 @@ POST024_RELATIONS = frozenset({
     "rt.stock_alert_result_storage_identities",
     "rt.canonical_stock_alert_batches",
     "rt.canonical_stock_alert_evaluations",
+    "rt.portal_publication_work",
+    "rt.portal_publication_receipts",
 })
 SYMBOLS = ("SPY",)
 CHANNELS = ("AM",)

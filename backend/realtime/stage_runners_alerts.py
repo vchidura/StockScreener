@@ -37,7 +37,9 @@ from .stock_alert_repository import (
     RetainedForwardState,
     compute_realtime_stock_alerts,
     publish_realtime_stock_alerts,
+    resume_realtime_stock_alert_publication,
 )
+from .portal_publisher import PortalPublicationRetryable
 from .strategy_repository import materialize_due_realtime_strategies
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,29 @@ def stock_alerts_runner(environment: RunnerEnvironment) -> StageRunner:
             receipt, missing_reason = _input_receipt(compute, plan, window)
             if receipt is None:
                 return StageOutcome.failed(missing_reason)
+            publication_clock = max(context.started_at, window.cutoff)
+            try:
+                resumed = resume_realtime_stock_alert_publication(
+                    publication,
+                    receipt.release,
+                    owner_id=context.stage_run_id,
+                    owner_epoch=context.attempt,
+                    checked_at=publication_clock,
+                )
+            except PortalPublicationRetryable as error:
+                return StageOutcome.deferred(
+                    error.reason_code,
+                    retry_not_before=error.retry_at,
+                )
+            if resumed is not None:
+                return StageOutcome.complete(
+                    degraded=resumed.reason_codes,
+                    evidence_ref=(
+                        None
+                        if resumed.work_id is None
+                        else str(resumed.work_id)
+                    ),
+                )
             generation = reference_generation(compute, window.cutoff)
             if generation < 1:
                 return StageOutcome.blocked(REFERENCE_GENERATION_UNAVAILABLE)
@@ -124,7 +149,18 @@ def stock_alerts_runner(environment: RunnerEnvironment) -> StageRunner:
             if context.is_cancelled():
                 return StageOutcome.failed(STAGE_CANCELLED)
             publish_realtime_stock_alerts(
-                publication, snapshot, receipt=receipt.release, session_close=_is_session_close(context),
+                publication,
+                snapshot,
+                receipt=receipt.release,
+                session_close=_is_session_close(context),
+                owner_id=context.stage_run_id,
+                owner_epoch=context.attempt,
+                checked_at=publication_clock,
+            )
+        except PortalPublicationRetryable as error:
+            return StageOutcome.deferred(
+                error.reason_code,
+                retry_not_before=error.retry_at,
             )
         except (StageCancelled, WriteFenceRejected):
             return StageOutcome.failed(STAGE_CANCELLED)

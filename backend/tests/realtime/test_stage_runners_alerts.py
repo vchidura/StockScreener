@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import replace
+from datetime import timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -13,6 +14,7 @@ from realtime.canonical_stock_alert_repository import (
     CanonicalStockAlertBatchUnavailable,
 )
 from realtime.database_access_v2 import WriteFenceRejected
+from realtime.portal_publisher import PortalPublicationRetryable
 from realtime.preflight import ProviderTier
 from realtime.runner_environment import RunnerEnvironment
 from realtime.stage_orchestrator import StageCancelled
@@ -21,6 +23,15 @@ from tests.realtime.test_stage_runners_equity import NOW, SESSION, _context, _Da
 
 SNAPSHOT = SimpleNamespace(payload={"missing_producers": {"replay": "x", "forward": "y"}})
 RETAINED_PROJECTION = {"contract": "test-retained-alert-projection"}
+
+
+@pytest.fixture(autouse=True)
+def _no_durable_publication_to_resume(monkeypatch):
+    monkeypatch.setattr(
+        runners,
+        "resume_realtime_stock_alert_publication",
+        lambda *args, **kwargs: None,
+    )
 
 
 def _alert_environment():
@@ -149,6 +160,62 @@ def test_alerts_runner_computes_read_only_then_publishes_under_the_publication_r
     assert options["receipt"].cohort_id == context.plan.cohort_id and options["receipt"].cutoff == NOW
     assert options["receipt"].provider_tier is ProviderTier.MASSIVE_DEVELOPER
     assert options["session_close"] is False
+
+
+def test_alerts_runner_resumes_durable_publication_before_recomputing(monkeypatch):
+    work_id = uuid4()
+    monkeypatch.setattr(
+        runners,
+        "resume_realtime_stock_alert_publication",
+        lambda *args, **kwargs: SimpleNamespace(
+            reason_codes=("PORTAL_PUBLICATION_HISTORICAL_STALE",),
+            work_id=work_id,
+        ),
+    )
+    monkeypatch.setattr(
+        runners,
+        "compute_realtime_stock_alerts",
+        lambda *args, **kwargs: pytest.fail(
+            "durable publication retry must not recompute"
+        ),
+    )
+    context, _ = _ready_context()
+
+    outcome = runners.stock_alerts_runner(
+        _alert_environment()
+    )(context)
+
+    assert outcome.state == "COMPLETE"
+    assert outcome.reason_codes == (
+        "PORTAL_PUBLICATION_HISTORICAL_STALE",
+    )
+    assert outcome.evidence_ref == str(work_id)
+
+
+def test_alerts_runner_defers_until_durable_publication_retry(monkeypatch):
+    retry_at = NOW + timedelta(seconds=30)
+    monkeypatch.setattr(
+        runners,
+        "resume_realtime_stock_alert_publication",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            PortalPublicationRetryable(
+                uuid4(),
+                retry_at,
+                "PORTAL_PUBLICATION_RETRY_PENDING",
+            )
+        ),
+    )
+    context, _ = _ready_context()
+
+    outcome = runners.stock_alerts_runner(
+        _alert_environment()
+    )(context)
+
+    assert outcome.state == "DEFERRED"
+    assert outcome.reason_codes == (
+        "PORTAL_PUBLICATION_RETRY_PENDING",
+    )
+    assert outcome.retry_not_before == retry_at
 
 
 def test_a_snapshot_without_missing_producers_completes_clean(monkeypatch):

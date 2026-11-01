@@ -197,10 +197,26 @@ def _recording_cursor(snapshots, *, classes=None, previous=None, swapped=True):
     def fetchone():
         statement = state["statement"]
         if "FOR UPDATE OF pointer" in statement:
+            if previous is None:
+                return None
+            if len(previous) == 2:
+                cutoff, manifest = previous
+                return (
+                    str(UUID(int=9)),
+                    NOW.date(),
+                    cutoff,
+                    max(
+                        entry["source_generation"]
+                        for entry in manifest["snapshots"]
+                    ),
+                    str(UUID(int=8)),
+                    None,
+                    manifest,
+                )
             return previous
         if statement.startswith("SELECT release_id, cohort_id"):
             values = state["release"]
-            return (*values[:8], values[9])
+            return (*values[:8], *values[9:])
         if "RETURNING release_id" in statement:
             return (state["release"][0],) if swapped else None
         return None
@@ -221,7 +237,7 @@ def test_release_publication_swaps_the_single_pointer_after_the_immutable_releas
     assert [s.split(" (")[0].split(" FROM")[0] for s in statements if s.startswith("INSERT")] == [
         "INSERT INTO rt.portal_releases", "INSERT INTO rt.portal_release_current",
     ]
-    assert "WHERE rt.portal_release_current.cutoff <= EXCLUDED.cutoff" in statements[-1]
+    assert "rt.portal_release_current.session_date" in statements[-1]
     assert release.pointer_swapped is True and release.release_class == "INTRADAY"
     assert [entry["snapshot_key"] for entry in release.manifest["snapshots"]] == ["AAPL", "SPY"]
     assert release.manifest_sha256 == canonical_sha256(release.manifest)
@@ -229,7 +245,14 @@ def test_release_publication_swaps_the_single_pointer_after_the_immutable_releas
     assert inserted[0] == str(release.release_id) and inserted[4] == str(RECEIPT) and inserted[6] == NOW
     assert inserted[5].isoformat() == "2026-10-05"
     pointer = next(params for statement, params in calls if statement.startswith("INSERT INTO rt.portal_release_current"))
-    assert pointer == (str(COHORT), "MASSIVE_DEVELOPER", str(release.release_id), NOW, release.session_date)
+    assert pointer[:5] == (
+        str(COHORT),
+        "MASSIVE_DEVELOPER",
+        str(release.release_id),
+        NOW,
+        release.session_date,
+    )
+    assert pointer[5] == 7
 
 
 def test_release_pointer_rollback_is_exact_and_never_deletes_a_release():
@@ -247,6 +270,9 @@ def test_release_pointer_rollback_is_exact_and_never_deletes_a_release():
         str(current_release),
         NOW,
         NOW.date(),
+        7,
+        None,
+        None,
     )
     cursor.rowcount = 1
 
@@ -260,12 +286,18 @@ def test_release_pointer_rollback_is_exact_and_never_deletes_a_release():
         current_release,
         NOW,
         NOW.date(),
+        7,
+        None,
+        None,
     )
     cursor.reset_mock()
     cursor.fetchone.return_value = (
         str(current_release),
         NOW,
         NOW.date(),
+        7,
+        None,
+        None,
     )
     cursor.rowcount = 1
 
@@ -312,8 +344,179 @@ def test_intraday_release_carries_forward_other_lanes_and_keeps_newer_generation
 
 def test_stale_cutoff_does_not_swap_the_pointer():
     snapshots = [_snapshot("SPY")]
-    cursor, _ = _recording_cursor(snapshots, swapped=False)
-    assert publish_portal_release_cursor(cursor, _receipt(), snapshots).pointer_swapped is False
+    previous = (
+        NOW + timedelta(minutes=5),
+        {
+            "snapshots": [{
+                "snapshot_id": str(UUID(int=1)),
+                "snapshot_class": "EPHEMERAL_PORTAL",
+                "snapshot_type": "TICKER_PAGE",
+                "snapshot_key": "SPY",
+                "source_generation": 9,
+                "generated_at": (
+                    NOW + timedelta(minutes=5)
+                ).isoformat(),
+            }],
+        },
+    )
+    cursor, _ = _recording_cursor(snapshots, previous=previous)
+    release = publish_portal_release_cursor(
+        cursor,
+        _receipt(),
+        snapshots,
+    )
+    assert release.pointer_swapped is False
+    assert release.publication_disposition == "HISTORICAL_STALE"
+    assert release.deliverable is False
+
+
+def test_forward_non_deliverable_release_is_historical_and_never_swaps():
+    snapshot = _snapshot(
+        "SPY",
+        generation=8,
+        manifest={"deliverable": False},
+    )
+    previous = (
+        NOW - timedelta(minutes=5),
+        {
+            "snapshots": [{
+                "snapshot_id": str(UUID(int=1)),
+                "snapshot_class": "EPHEMERAL_PORTAL",
+                "snapshot_type": "DAILY_STRATEGY_ROLLING_V1",
+                "snapshot_key": "COHORT",
+                "source_generation": 7,
+                "generated_at": (
+                    NOW - timedelta(minutes=5)
+                ).isoformat(),
+            }],
+        },
+    )
+    cursor, calls = _recording_cursor(
+        [snapshot],
+        previous=previous,
+    )
+
+    release = publish_portal_release_cursor(
+        cursor,
+        _receipt(),
+        [snapshot],
+    )
+
+    assert release.publication_disposition == "HISTORICAL_NONCURRENT"
+    assert release.deliverable is False
+    assert release.pointer_swapped is False
+    assert [
+        entry["snapshot_type"]
+        for entry in release.manifest["snapshots"]
+    ] == ["TICKER_PAGE"]
+    assert not any(
+        statement.startswith("INSERT INTO rt.portal_release_current")
+        for statement, _parameters in calls
+    )
+
+
+def test_non_deliverable_release_without_prior_pointer_stays_noncurrent():
+    snapshot = _snapshot(
+        "SPY",
+        generation=8,
+        manifest={"deliverable": False},
+    )
+    cursor, calls = _recording_cursor([snapshot])
+
+    release = publish_portal_release_cursor(
+        cursor,
+        _receipt(),
+        [snapshot],
+    )
+
+    assert release.publication_disposition == "HISTORICAL_NONCURRENT"
+    assert release.pointer_swapped is False
+    assert release.deliverable is False
+    assert not any(
+        "portal_release_current" in statement
+        and statement.startswith("INSERT")
+        for statement, _parameters in calls
+    )
+
+
+def test_explicit_ticker_replacement_prunes_removed_members_only():
+    previous_manifest = {
+        "snapshots": [
+            {
+                "snapshot_id": str(UUID(int=1)),
+                "snapshot_class": "EPHEMERAL_PORTAL",
+                "snapshot_type": "TICKER_PAGE",
+                "snapshot_key": "AAPL",
+                "source_generation": 7,
+                "generated_at": (
+                    NOW - timedelta(minutes=5)
+                ).isoformat(),
+            },
+            {
+                "snapshot_id": str(UUID(int=2)),
+                "snapshot_class": "EPHEMERAL_PORTAL",
+                "snapshot_type": "TICKER_PAGE",
+                "snapshot_key": "MSFT",
+                "source_generation": 7,
+                "generated_at": (
+                    NOW - timedelta(minutes=5)
+                ).isoformat(),
+            },
+            {
+                "snapshot_id": str(UUID(int=3)),
+                "snapshot_class": "EPHEMERAL_PORTAL",
+                "snapshot_type": "DAILY_STRATEGY_ROLLING_V1",
+                "snapshot_key": "COHORT",
+                "source_generation": 7,
+                "generated_at": (
+                    NOW - timedelta(minutes=5)
+                ).isoformat(),
+            },
+        ],
+    }
+    incoming = _snapshot("AAPL", generation=8)
+    cursor, _ = _recording_cursor(
+        [incoming],
+        previous=(NOW - timedelta(minutes=5), previous_manifest),
+    )
+
+    release = publish_portal_release_cursor(
+        cursor,
+        _receipt(),
+        [incoming],
+        replacement_ticker_keys=("AAPL",),
+    )
+
+    identities = {
+        (entry["snapshot_type"], entry["snapshot_key"])
+        for entry in release.manifest["snapshots"]
+    }
+    assert identities == {
+        ("TICKER_PAGE", "AAPL"),
+        ("DAILY_STRATEGY_ROLLING_V1", "COHORT"),
+    }
+    assert release.manifest["replacement_ticker_keys"] == ["AAPL"]
+
+    replay_cursor, _ = _recording_cursor(
+        [incoming],
+        previous=(
+            str(release.release_id),
+            release.session_date,
+            release.cutoff,
+            release.publication_generation,
+            str(release.receipt_id),
+            release.desired_snapshot_sha256,
+            release.manifest,
+        ),
+    )
+    replay = publish_portal_release_cursor(
+        replay_cursor,
+        _receipt(),
+        [incoming],
+        replacement_ticker_keys=("AAPL",),
+    )
+    assert replay.release_id == release.release_id
+    assert replay.publication_disposition == "EQUIVALENT_CURRENT"
 
 
 def test_session_close_release_never_touches_the_pointer_and_requires_kept_snapshots():

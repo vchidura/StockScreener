@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 import hashlib
 from pathlib import Path
@@ -117,6 +117,55 @@ class CanonicalStockAlertContext:
 
 
 @dataclass(frozen=True, slots=True)
+class CanonicalStockAlertMembership:
+    desired_revision_id: UUID | None
+    desired_snapshot_sha256: str
+    intended_members: tuple[Mapping[str, object], ...]
+    effective_members: tuple[Mapping[str, object], ...]
+
+    @property
+    def document(self) -> Mapping[str, object]:
+        body = {
+            "contract": "canonical-stock-alert-membership-v1",
+            "desired_revision_id": (
+                None
+                if self.desired_revision_id is None
+                else str(self.desired_revision_id)
+            ),
+            "desired_snapshot_sha256": self.desired_snapshot_sha256,
+            "intended_members": self.intended_members,
+            "effective_members": self.effective_members,
+            "complete_universe_required": False,
+        }
+        return {
+            **body,
+            "membership_sha256": canonical_sha256(body),
+        }
+
+    @property
+    def membership_sha256(self) -> str:
+        return str(self.document["membership_sha256"])
+
+    @property
+    def partial(self) -> bool:
+        intended = {
+            (row["security_id"], row["ticker"])
+            for row in self.intended_members
+            if row["enabled"]
+            and row["status"] == "READY"
+            and row["security_id"] is not None
+        }
+        effective = {
+            (row["security_id"], row["ticker"])
+            for row in self.effective_members
+        }
+        return intended != effective or any(
+            row["enabled"] and row["status"] != "READY"
+            for row in self.intended_members
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class CanonicalStockAlertEvaluation:
     security_id: UUID
     instrument_id: int
@@ -133,12 +182,16 @@ class CanonicalStockAlertBatch:
     cohort_id: UUID
     window_id: UUID
     input_receipt_id: UUID
+    session_date: date
     cutoff: datetime
     receipt_input_sha256: str
     detector_input_sha256: str
+    membership: CanonicalStockAlertMembership
     version: RealtimeDetectorVersion
     evaluations: tuple[CanonicalStockAlertEvaluation, ...]
     completed_at: datetime
+    deadline: datetime | None = None
+    is_late: bool = False
 
     @property
     def status(self) -> str:
@@ -151,13 +204,120 @@ class CanonicalStockAlertBatch:
             "cohort_id": self.cohort_id,
             "window_id": self.window_id,
             "input_receipt_id": self.input_receipt_id,
+            "session_date": self.session_date,
             "cutoff": self.cutoff,
             "receipt_input_sha256": self.receipt_input_sha256,
             "detector_input_sha256": self.detector_input_sha256,
+            "membership_sha256": self.membership.membership_sha256,
             "detector_sha256": self.version.detector_sha256,
             "events": tuple(row.event.event_id for row in self.evaluations),
             "completed_at": self.completed_at,
+            "deadline": self.deadline,
+            "is_late": self.is_late,
         })
+
+
+def canonical_stock_alert_membership(
+    inputs: RealtimeScreeningInput,
+    *,
+    desired_revision_id: UUID | None = None,
+    desired_snapshot_sha256: str | None = None,
+    intended_members: tuple[Mapping[str, object], ...] | None = None,
+) -> CanonicalStockAlertMembership:
+    effective = tuple(
+        {
+            "security_id": str(row["security_id"]),
+            "instrument_id": int(row["instrument_id"]),
+            "ticker": str(row["ticker"]),
+        }
+        for row in sorted(
+            inputs.members,
+            key=lambda value: (
+                str(value["ticker"]),
+                str(value["security_id"]),
+            ),
+        )
+    )
+    if not 1 <= len(effective) <= 400:
+        raise ValueError(
+            "canonical Stock Alert effective membership must contain 1-400 names"
+        )
+    if intended_members is None:
+        intended = tuple({
+            **row,
+            "member_kind": "EQUITY",
+            "enabled": True,
+            "status": "READY",
+            "reason_codes": (),
+        } for row in effective)
+    else:
+        intended = tuple(
+            {
+                "security_id": (
+                    None
+                    if row.get("security_id") is None
+                    else str(row["security_id"])
+                ),
+                "instrument_id": (
+                    None
+                    if row.get("instrument_id") is None
+                    else int(row["instrument_id"])
+                ),
+                "ticker": str(row["ticker"]),
+                "member_kind": str(row["member_kind"]),
+                "enabled": bool(row["enabled"]),
+                "status": str(row["status"]),
+                "reason_codes": tuple(row.get("reason_codes", ())),
+            }
+            for row in sorted(
+                intended_members,
+                key=lambda value: (
+                    str(value["ticker"]),
+                    str(value["member_kind"]),
+                ),
+            )
+        )
+    if len({(row["ticker"], row["member_kind"]) for row in intended}) != len(
+        intended
+    ):
+        raise ValueError("canonical Stock Alert intended membership is ambiguous")
+    if any(
+        row["status"] not in {"WARMING", "READY", "FAILED"}
+        for row in intended
+    ):
+        raise ValueError("canonical Stock Alert readiness status is invalid")
+    snapshot_sha256 = (
+        inputs.source_manifest_sha256
+        if desired_snapshot_sha256 is None
+        else desired_snapshot_sha256
+    )
+    if len(snapshot_sha256) != 64 or any(
+        value not in "0123456789abcdef" for value in snapshot_sha256
+    ):
+        raise ValueError("canonical Stock Alert snapshot identity is invalid")
+    effective_identities = {
+        (row["security_id"], row["ticker"]) for row in effective
+    }
+    ready_identities = {
+        (row["security_id"], row["ticker"])
+        for row in intended
+        if row["enabled"]
+        and row["status"] == "READY"
+        and row["security_id"] is not None
+    }
+    if (
+        desired_revision_id is not None
+        and not effective_identities.issubset(ready_identities)
+    ):
+        raise ValueError(
+            "canonical Stock Alert effective membership changed from its snapshot"
+        )
+    return CanonicalStockAlertMembership(
+        desired_revision_id=desired_revision_id,
+        desired_snapshot_sha256=snapshot_sha256,
+        intended_members=intended,
+        effective_members=effective,
+    )
 
 
 def _member_bars(
@@ -214,8 +374,10 @@ def _bar_received_at(row: Mapping[str, object]) -> datetime:
 def canonical_stock_alert_contexts(
     inputs: RealtimeScreeningInput,
     policy: BreakoutPolicy = BreakoutPolicy(),
+    membership: CanonicalStockAlertMembership | None = None,
 ) -> Mapping[str, CanonicalStockAlertContext]:
     """Derive only context owned by E; unavailable event context stays explicit."""
+    membership = membership or canonical_stock_alert_membership(inputs)
     members = {str(row["security_id"]): row for row in inputs.members}
     bars = {
         identity: _member_bars(inputs, UUID(identity), policy)
@@ -264,6 +426,15 @@ def canonical_stock_alert_contexts(
             "contract": "canonical-equity-context-v1",
             "security_id": identity,
             "cohort_id": str(inputs.cohort_id),
+            "desired_revision_id": (
+                None
+                if membership.desired_revision_id is None
+                else str(membership.desired_revision_id)
+            ),
+            "desired_snapshot_sha256": (
+                membership.desired_snapshot_sha256
+            ),
+            "membership_sha256": membership.membership_sha256,
             "cutoff": inputs.cutoff.isoformat(),
             "market_trend": None if market_trend is None else str(market_trend),
             "sector_trend": None if sector_trend is None else str(sector_trend),
@@ -424,7 +595,13 @@ def _event_inputs(packet, wire) -> tuple[RealtimeDetectorInput, ...]:
     return tuple(values)
 
 
-def _alert_projection(event: RealtimeDetectorEvent, member, decision: Decision):
+def _alert_projection(
+    event: RealtimeDetectorEvent,
+    member,
+    decision: Decision,
+    *,
+    deliverable: bool,
+):
     if decision.disposition is Disposition.NO_MATCH:
         return None
     matched = (
@@ -498,6 +675,8 @@ def _alert_projection(event: RealtimeDetectorEvent, member, decision: Decision):
             ]
         ),
         "non_actionable": not matched,
+        "deliverable": deliverable and matched,
+        "delivery_permission": False,
         "publication_permission": False,
         "execution_permission": False,
     }
@@ -519,10 +698,22 @@ def produce_canonical_stock_alert_batch(
     receipt_input_sha256: str,
     prior_states: Mapping[str, Mapping[str, object] | PriorState] | None = None,
     contexts: Mapping[str, CanonicalStockAlertContext] | None = None,
+    membership: CanonicalStockAlertMembership | None = None,
+    deadline: datetime | None = None,
     policy: BreakoutPolicy = BreakoutPolicy(),
 ) -> CanonicalStockAlertBatch:
     prior_states = prior_states or {}
-    contexts = contexts or canonical_stock_alert_contexts(inputs, policy)
+    membership = membership or canonical_stock_alert_membership(inputs)
+    contexts = contexts or canonical_stock_alert_contexts(
+        inputs,
+        policy,
+        membership,
+    )
+    normalized_deadline = None if deadline is None else _utc(deadline)
+    is_late = (
+        normalized_deadline is not None
+        and inputs.recorded_by > normalized_deadline
+    )
     version = canonical_stock_alert_version(policy)
     evaluations = []
     for member in inputs.members:
@@ -565,10 +756,24 @@ def produce_canonical_stock_alert_batch(
             "input_receipt_id": str(input_receipt_id),
             "receipt_input_sha256": receipt_input_sha256,
             "screening_input_sha256": inputs_sha256(inputs),
+            "desired_revision_id": (
+                None
+                if membership.desired_revision_id is None
+                else str(membership.desired_revision_id)
+            ),
+            "desired_snapshot_sha256": (
+                membership.desired_snapshot_sha256
+            ),
+            "membership_sha256": membership.membership_sha256,
             "security_id": identity,
             "ticker": member["ticker"],
             "decision": canonical_value(decision),
             "context_reason_codes": list(contexts[identity].reason_codes),
+            "observation_session": inputs.session.isoformat(),
+            "observation_cutoff": inputs.cutoff.isoformat(),
+            "completed_at": inputs.recorded_by.isoformat(),
+            "late_catch_up": is_late,
+            "deliverable": not is_late,
             "publication_permission": False,
             "execution_permission": False,
         }
@@ -603,9 +808,14 @@ def produce_canonical_stock_alert_batch(
                 state_schema=CANONICAL_STOCK_STATE_SCHEMA,
                 state_sha256=canonical_sha256(state_payload),
                 state_payload=state_payload,
-                updated_at=inputs.recorded_by,
+                updated_at=inputs.cutoff,
             )
-        alert = _alert_projection(event, member, decision)
+        alert = _alert_projection(
+            event,
+            member,
+            decision,
+            deliverable=not is_late,
+        )
         evaluations.append(CanonicalStockAlertEvaluation(
             security_id=UUID(identity),
             instrument_id=int(member["instrument_id"]),
@@ -620,10 +830,14 @@ def produce_canonical_stock_alert_batch(
         cohort_id=inputs.cohort_id,
         window_id=window_id,
         input_receipt_id=input_receipt_id,
+        session_date=inputs.session,
         cutoff=inputs.cutoff,
         receipt_input_sha256=receipt_input_sha256,
         detector_input_sha256=inputs_sha256(inputs),
+        membership=membership,
         version=version,
         evaluations=tuple(evaluations),
         completed_at=inputs.recorded_by,
+        deadline=normalized_deadline,
+        is_late=is_late,
     )

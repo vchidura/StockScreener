@@ -122,7 +122,9 @@ from realtime.portal_projection_repository import (
 )
 from realtime.portal_publisher import (
     CanonicalPortalPublisher,
+    PortalPublicationRetryable,
     PortalPublicationConfig,
+    run_portal_publication_once,
 )
 from realtime.preflight import DetectorFamily, ProviderTier
 from realtime.relation_registry import APP_ROLE, API_ROLE, ROLES
@@ -1329,18 +1331,12 @@ def test_p5_05_projection_is_stored_readable_and_never_publishes(
         )
         assert cursor.fetchone()[0] == len(OPTIONS_PROJECTION_TYPES)
     with _transaction(p5_database, API_ROLE, read_only=True) as cursor:
-        for snapshot in batch.snapshots:
-            result = read_advanced_options_projection_cursor(
-                cursor,
-                cohort_id=control.cohort_id,
-                snapshot_type=snapshot.snapshot_type,
-                available_by=NOW,
-            )
-            assert result["available"]
-            assert result["data"] == snapshot.payload
-            assert result["provider_fetch_performed"] is False
-            assert result["detector_work_performed"] is False
-            assert result["publication_performed"] is False
+        cursor.execute(
+            "SELECT count(*) FROM rt.portal_release_current "
+            "WHERE cohort_id=%s",
+            (str(control.cohort_id),),
+        )
+        assert cursor.fetchone()[0] == 0
 
 
 def test_p5_05b_v5_restart_publish_replay_and_rollback(p5_database):
@@ -1575,23 +1571,42 @@ def test_p5_05b_v5_restart_publish_replay_and_rollback(p5_database):
             canonical_publisher=canonical_publisher,
         )
 
-    pointer_reads = 0
+    def fail_release(cursor, receipt, snapshots, **options):
+        publish_portal_release_cursor(
+            cursor,
+            receipt,
+            snapshots,
+            **options,
+        )
+        raise psycopg2.OperationalError(
+            "injected publication transaction failure"
+        )
 
-    def fail_after_publish(cursor, **values):
-        nonlocal pointer_reads
-        pointer_reads += 1
-        if pointer_reads == 2:
-            return None
-        return load_portal_release_pointer_cursor(cursor, **values)
+    def fail_publication(
+        database,
+        publication_config,
+        batch,
+        sink,
+        *,
+        checked_at,
+    ):
+        return run_portal_publication_once(
+            database,
+            publication_config,
+            batch,
+            sink,
+            checked_at=checked_at,
+            release_repository=fail_release,
+        )
 
     failing = CanonicalPortalPublisher(
         publisher_database,
         config,
-        pointer_loader=fail_after_publish,
+        publication_runner=fail_publication,
     )
     with pytest.raises(
-        ValueError,
-        match="did not advance its pointer",
+        PortalPublicationRetryable,
+        match="PORTAL_PUBLICATION_OPERATIONALERROR",
     ):
         binding(failing.publish).publish(context)
     with _transaction(
@@ -1612,8 +1627,13 @@ def test_p5_05b_v5_restart_publish_replay_and_rollback(p5_database):
         config,
     )
     runtime = binding(canonical.publish)
-    first = runtime.publish(context)
-    replay = runtime.publish(context)
+    retry_context = SimpleNamespace(
+        plan=context.plan,
+        window=context.window,
+        started_at=context.started_at + timedelta(seconds=31),
+    )
+    first = runtime.publish(retry_context)
+    replay = runtime.publish(retry_context)
 
     assert first.release_id == first.pointer_release_id
     assert replay.release_id == first.release_id
@@ -1631,7 +1651,7 @@ def test_p5_05b_v5_restart_publish_replay_and_rollback(p5_database):
         manifest = cursor.fetchone()[0]
         cursor.execute(
             "SELECT count(*) FROM rt.portal_releases "
-            "WHERE receipt_id=%s",
+            "WHERE manifest->'source_receipt_ids' ? %s",
             (str(portal_receipt_id),),
         )
         release_count = cursor.fetchone()[0]

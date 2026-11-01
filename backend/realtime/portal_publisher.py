@@ -7,17 +7,24 @@ from enum import Enum
 from typing import Protocol
 from uuid import UUID
 
-from .contracts import CANARY_UNIVERSE
 from .database_access import RealtimeDatabaseRole
 from .portal_projection import RealtimePortalSnapshot
 from .portal_projection_repository import (
+    RELEASE_CLASS_INTRADAY,
     RELEASE_CLASS_SESSION_CLOSE,
     RETENTION_HOT_AND_KEPT,
     PortalRelease,
     PortalReleasePointer,
     PortalReleaseReceipt,
+    claim_portal_publication_work_cursor,
     claim_alert_outbox_cursor,
+    complete_portal_publication_work_cursor,
+    enqueue_portal_publication_work_cursor,
+    fail_portal_publication_work_cursor,
     fail_alert_outbox_delivery_cursor,
+    load_portal_publication_snapshots_cursor,
+    load_portal_publication_work_cursor,
+    load_portal_release_cursor,
     load_portal_release_pointer_cursor,
     mark_alert_outbox_delivered_cursor,
     persist_portal_snapshot_cursor,
@@ -50,6 +57,19 @@ class PortalPublisherVerdict(str, Enum):
     IDLE = "IDLE"
     COMPLETE = "COMPLETE"
     DEGRADED = "DEGRADED"
+
+
+class PortalPublicationRetryable(RuntimeError):
+    def __init__(
+        self,
+        work_id: UUID,
+        retry_at: datetime,
+        reason_code: str,
+    ) -> None:
+        super().__init__(reason_code)
+        self.work_id = work_id
+        self.retry_at = _utc(retry_at, "publication retry_at")
+        self.reason_code = reason_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +147,8 @@ class PortalPublicationBatch:
     receipt: PortalReleaseReceipt | None = None
     session_close: bool = False
     session_date: date | None = None
+    product_key: str = "PORTAL"
+    expected_ticker_keys: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if len(self.snapshots) > MAX_PORTAL_SNAPSHOT_BATCH:
@@ -137,23 +159,42 @@ class PortalPublicationBatch:
             raise ValueError("a session-close publication requires its cycle receipt")
         if self.receipt is not None and not self.snapshots:
             raise ValueError("a receipt publication requires snapshots")
+        key = self.product_key.strip().upper()
+        if not key or len(key) > 64:
+            raise ValueError("portal publication product key is invalid")
+        object.__setattr__(self, "product_key", key)
         identities = tuple(
             (snapshot.snapshot_type, snapshot.snapshot_key)
             for snapshot in self.snapshots
         )
         if len(identities) != len(set(identities)):
             raise ValueError("portal snapshot batch identities must be unique")
-        if self.snapshots:
+        if self.expected_ticker_keys is not None:
+            expected_ticker_keys = tuple(
+                sorted(set(self.expected_ticker_keys))
+            )
+            if (
+                not expected_ticker_keys
+                or len(expected_ticker_keys)
+                != len(self.expected_ticker_keys)
+            ):
+                raise ValueError(
+                    "portal publication expected ticker membership is invalid"
+                )
             ticker_keys = {
                 snapshot.snapshot_key
                 for snapshot in self.snapshots
                 if snapshot.snapshot_type == "TICKER_PAGE"
             }
-            if (
-                ticker_keys
-                and ticker_keys != set(CANARY_UNIVERSE.equity_tickers)
-            ):
-                raise ValueError("portal publication requires exact canary ticker pages")
+            if ticker_keys != set(expected_ticker_keys):
+                raise ValueError(
+                    "portal publication ticker pages changed from declared membership"
+                )
+            object.__setattr__(
+                self,
+                "expected_ticker_keys",
+                expected_ticker_keys,
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +207,8 @@ class PortalPublicationStatus:
     abandoned: int
     reason_codes: tuple[str, ...]
     release: PortalRelease | None = None
+    work_id: UUID | None = None
+    retry_at: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "checked_at", _utc(self.checked_at, "checked_at"))
@@ -185,10 +228,16 @@ class PortalPublicationStatus:
             PortalRelease,
         ):
             raise TypeError("portal publication release result is invalid")
+        if self.retry_at is not None:
+            object.__setattr__(
+                self,
+                "retry_at",
+                _utc(self.retry_at, "publication retry_at"),
+            )
 
     @property
     def verdict(self) -> PortalPublisherVerdict:
-        if self.retried or self.abandoned:
+        if self.retried or self.abandoned or self.reason_codes:
             return PortalPublisherVerdict.DEGRADED
         if self.promoted_snapshots or self.claimed:
             return PortalPublisherVerdict.COMPLETE
@@ -199,15 +248,56 @@ class PortalPublicationStatus:
 class CanonicalPortalPublicationResult:
     status: PortalPublicationStatus
     release: PortalRelease
-    pointer: PortalReleasePointer
+    pointer: PortalReleasePointer | None
 
     def __post_init__(self) -> None:
+        historical = self.release.publication_disposition in {
+            "HISTORICAL_STALE",
+            "HISTORICAL_NONCURRENT",
+        }
+        historical_reason = (
+            "PORTAL_PUBLICATION_"
+            + self.release.publication_disposition
+        )
         if (
             self.status.release != self.release
-            or self.pointer.release_id != self.release.release_id
-            or self.pointer.cohort_id != self.release.cohort_id
-            or self.pointer.provider_tier is not self.release.provider_tier
-            or self.pointer.cutoff != self.release.cutoff
+            or (
+                self.pointer is None
+                and (
+                    self.release.pointer_swapped
+                    or not historical
+                )
+            )
+            or (
+                historical
+                and (
+                    historical_reason not in self.status.reason_codes
+                    or self.status.verdict
+                    is not PortalPublisherVerdict.DEGRADED
+                )
+            )
+            or (
+                self.pointer is not None
+                and (
+                    self.pointer.cohort_id != self.release.cohort_id
+                    or self.pointer.provider_tier
+                    is not self.release.provider_tier
+                )
+            )
+            or (
+                self.release.pointer_swapped
+                and (
+                    self.pointer is None
+                    or
+                    self.pointer.release_id != self.release.release_id
+                    or self.pointer.cutoff != self.release.cutoff
+                )
+            )
+            or (
+                not self.release.pointer_swapped
+                and self.pointer is not None
+                and self.pointer.release_id == self.release.release_id
+            )
         ):
             raise ValueError(
                 "canonical portal publication result is inconsistent"
@@ -220,7 +310,7 @@ class _ForbiddenPortalDeliverySink:
 
 
 class CanonicalPortalPublisher:
-    """One release/pointer operation with exact rollback on post-publish failure."""
+    """The sole durable release/pointer publisher."""
 
     def __init__(
         self,
@@ -279,59 +369,92 @@ class CanonicalPortalPublisher:
             raise ValueError(
                 "canonical portal publication requires a release receipt"
             )
-        previous = self._pointer()
-        release = None
-        try:
-            status = self._publication_runner(
-                self._database,
-                self._config,
-                batch,
-                self._sink,
-                checked_at=checked_at,
+        status = self._publication_runner(
+            self._database,
+            self._config,
+            batch,
+            self._sink,
+            checked_at=checked_at,
+        )
+        if not isinstance(status, PortalPublicationStatus):
+            raise TypeError(
+                "canonical portal publisher returned an invalid status"
             )
-            if not isinstance(status, PortalPublicationStatus):
-                raise TypeError(
-                    "canonical portal publisher returned an invalid status"
+        release = status.release
+        if (
+            release is None
+            or batch.receipt.receipt_id
+            not in {
+                UUID(str(value))
+                for value in release.manifest.get(
+                    "source_receipt_ids",
+                    (release.receipt_id,),
                 )
-            release = status.release
-            if (
-                release is None
-                or release.receipt_id != batch.receipt.receipt_id
-                or release.cohort_id != self._config.cohort_id
-                or release.provider_tier is not self._config.provider_tier
-                or release.cutoff != batch.receipt.cutoff
-                or not release.pointer_swapped
-                or any((
-                    status.claimed,
-                    status.delivered,
-                    status.retried,
-                    status.abandoned,
-                ))
-            ):
-                raise ValueError(
-                    "canonical portal publication result changed authority"
-                )
-            pointer = self._pointer()
-            if pointer is None or pointer.release_id != release.release_id:
-                raise ValueError(
-                    "canonical portal publication did not advance its pointer"
-                )
-            return CanonicalPortalPublicationResult(
-                status,
-                release,
-                pointer,
+            }
+            or release.cohort_id != self._config.cohort_id
+            or release.provider_tier is not self._config.provider_tier
+            or release.cutoff != batch.receipt.cutoff
+            or any((
+                status.claimed,
+                status.delivered,
+                status.retried,
+                status.abandoned,
+            ))
+        ):
+            raise ValueError(
+                "canonical portal publication result changed authority"
             )
-        except Exception:
-            if release is not None and release.pointer_swapped:
-                with self._database.transaction() as cursor:
-                    self._pointer_restorer(
-                        cursor,
-                        cohort_id=self._config.cohort_id,
-                        provider_tier=self._config.provider_tier,
-                        expected_current_release_id=release.release_id,
-                        previous=previous,
-                    )
-            raise
+        pointer = self._pointer()
+        if (
+            release.pointer_swapped
+            and (
+                pointer is None
+                or pointer.release_id != release.release_id
+            )
+        ) or (
+            not release.pointer_swapped
+            and pointer is not None
+            and pointer.release_id == release.release_id
+        ):
+            raise ValueError(
+                "canonical portal publication did not retain its pointer outcome"
+            )
+        return CanonicalPortalPublicationResult(
+            status,
+            release,
+            pointer,
+        )
+
+    def resume(
+        self,
+        *,
+        source_receipt_id: UUID,
+        checked_at: datetime,
+        product_key: str = "PORTAL",
+    ) -> CanonicalPortalPublicationResult | None:
+        status = resume_portal_publication_once(
+            self._database,
+            self._config,
+            product_key=product_key,
+            source_receipt_id=source_receipt_id,
+            checked_at=checked_at,
+        )
+        if status is None:
+            return None
+        if status.release is None:
+            raise ValueError(
+                "resumed portal publication has no release"
+            )
+        pointer = self._pointer()
+        if status.release.pointer_swapped and pointer is None:
+            raise ValueError(
+                "resumed portal publication has no readable pointer"
+            )
+        return CanonicalPortalPublicationResult(
+            status,
+            status.release,
+            pointer,
+        )
 
 
 def _message(row: Mapping[str, object]) -> PortalOutboxMessage:
@@ -349,6 +472,268 @@ def _message(row: Mapping[str, object]) -> PortalOutboxMessage:
     )
 
 
+def _completed_publication_status(
+    database: RealtimeProcessDatabase,
+    work: Mapping[str, object],
+    *,
+    checked_at: datetime,
+) -> PortalPublicationStatus:
+    if work["release_id"] is None or work["release_cutoff"] is None:
+        raise ValueError(
+            "completed portal publication work has no release identity"
+        )
+    with database.transaction(read_only=True) as cursor:
+        release = load_portal_release_cursor(
+            cursor,
+            release_id=UUID(str(work["release_id"])),
+            cutoff=work["release_cutoff"],
+        )
+    reasons = (
+        ()
+        if work["disposition"] in {
+            "CURRENT",
+            "EQUIVALENT_CURRENT",
+        }
+        else (f"PORTAL_PUBLICATION_{work['disposition']}",)
+    )
+    return PortalPublicationStatus(
+        checked_at,
+        0,
+        0,
+        0,
+        0,
+        0,
+        reasons,
+        release,
+        UUID(str(work["work_id"])),
+    )
+
+
+def _run_portal_publication_work_once(
+    database: RealtimeProcessDatabase,
+    config: PortalPublicationConfig,
+    work: Mapping[str, object],
+    *,
+    checked_at: datetime,
+    release_repository: Callable,
+) -> PortalPublicationStatus:
+    checked = _utc(checked_at, "checked_at")
+    if work["state"] == "COMPLETE":
+        return _completed_publication_status(
+            database,
+            work,
+            checked_at=checked,
+        )
+    if work["state"] == "TERMINAL":
+        raise ValueError(
+            "portal publication work is terminal: "
+            + str(work["failure_reason"])
+        )
+    retry_at = work["next_attempt_at"]
+    if retry_at > checked:
+        raise PortalPublicationRetryable(
+            UUID(str(work["work_id"])),
+            retry_at,
+            "PORTAL_PUBLICATION_RETRY_PENDING",
+        )
+    with database.transaction() as cursor:
+        claimed = claim_portal_publication_work_cursor(
+            cursor,
+            work_id=UUID(str(work["work_id"])),
+            owner_id=config.owner_id,
+            owner_epoch=config.owner_epoch,
+            claimed_at=checked,
+            lease_until=checked + timedelta(
+                seconds=config.lease_seconds
+            ),
+        )
+    if claimed is None:
+        with database.transaction(read_only=True) as cursor:
+            retained = load_portal_publication_work_cursor(
+                cursor,
+                product_key=str(work["product_key"]),
+                source_receipt_id=UUID(str(work["source_receipt_id"])),
+                release_class=str(work["release_class"]),
+            )
+        if retained is not None and retained["state"] == "COMPLETE":
+            return _completed_publication_status(
+                database,
+                retained,
+                checked_at=checked,
+            )
+        retry = (
+            checked + timedelta(seconds=config.retry_delay_seconds)
+            if retained is None
+            else retained["lease_until"]
+            or retained["next_attempt_at"]
+        )
+        raise PortalPublicationRetryable(
+            UUID(str(work["work_id"])),
+            retry,
+            "PORTAL_PUBLICATION_ALREADY_CLAIMED",
+        )
+
+    try:
+        with database.transaction() as cursor:
+            previous = load_portal_release_pointer_cursor(
+                cursor,
+                cohort_id=config.cohort_id,
+                provider_tier=config.provider_tier,
+                for_update=True,
+            )
+            snapshots = load_portal_publication_snapshots_cursor(
+                cursor,
+                claimed,
+            )
+            document = claimed["work_document"]
+            receipt = PortalReleaseReceipt(
+                UUID(str(claimed["source_receipt_id"])),
+                UUID(str(claimed["cohort_id"])),
+                ProviderTier(str(claimed["provider_tier"])),
+                claimed["cutoff"],
+                str(document["universe_sha256"]),
+                source_receipt_sha256=str(
+                    claimed["source_receipt_sha256"]
+                ),
+                source_generation=int(
+                    document["publication_generation"]
+                ),
+                desired_revision_id=(
+                    None
+                    if claimed["desired_revision_id"] is None
+                    else UUID(str(claimed["desired_revision_id"]))
+                ),
+                desired_snapshot_sha256=claimed[
+                    "desired_snapshot_sha256"
+                ],
+                membership_sha256=claimed["membership_sha256"],
+            )
+            release = release_repository(
+                cursor,
+                receipt,
+                snapshots,
+                release_class=str(claimed["release_class"]),
+                session_date=claimed["session_date"],
+                replacement_ticker_keys=document.get(
+                    "replacement_ticker_keys"
+                ),
+            )
+            if not isinstance(release, PortalRelease):
+                raise TypeError(
+                    "portal release repository returned an invalid result"
+                )
+            kept = load_portal_publication_snapshots_cursor(
+                cursor,
+                claimed,
+                kept=True,
+            )
+            if kept:
+                release_repository(
+                    cursor,
+                    receipt,
+                    kept,
+                    release_class=RELEASE_CLASS_SESSION_CLOSE,
+                    session_date=claimed["session_date"],
+                )
+            current = load_portal_release_pointer_cursor(
+                cursor,
+                cohort_id=config.cohort_id,
+                provider_tier=config.provider_tier,
+                for_update=True,
+            )
+            complete_portal_publication_work_cursor(
+                cursor,
+                claimed,
+                release,
+                owner_id=config.owner_id,
+                owner_epoch=int(claimed["lease_epoch"]),
+                completed_at=checked,
+                previous_release_id=(
+                    None if previous is None else previous.release_id
+                ),
+                current_release_id=(
+                    None if current is None else current.release_id
+                ),
+            )
+    except Exception as error:
+        retryable = not isinstance(error, (TypeError, ValueError))
+        reason = (
+            "PORTAL_PUBLICATION_"
+            + type(error).__name__.upper()
+        )[:160]
+        next_attempt = checked + timedelta(
+            seconds=config.retry_delay_seconds
+        )
+        with database.transaction() as cursor:
+            fail_portal_publication_work_cursor(
+                cursor,
+                claimed,
+                owner_id=config.owner_id,
+                owner_epoch=int(claimed["lease_epoch"]),
+                failed_at=checked,
+                next_attempt_at=next_attempt,
+                failure_reason=reason,
+                retryable=retryable,
+            )
+        if retryable:
+            raise PortalPublicationRetryable(
+                UUID(str(claimed["work_id"])),
+                next_attempt,
+                reason,
+            ) from error
+        raise
+    reasons = (
+        ()
+        if release.publication_disposition in {
+            "CURRENT",
+            "EQUIVALENT_CURRENT",
+        }
+        else (
+            "PORTAL_PUBLICATION_"
+            + release.publication_disposition,
+        )
+    )
+    return PortalPublicationStatus(
+        checked,
+        0,
+        0,
+        0,
+        0,
+        0,
+        reasons,
+        release,
+        UUID(str(claimed["work_id"])),
+    )
+
+
+def resume_portal_publication_once(
+    database: RealtimeProcessDatabase,
+    config: PortalPublicationConfig,
+    *,
+    product_key: str,
+    source_receipt_id: UUID,
+    checked_at: datetime,
+    release_class: str = "INTRADAY",
+    release_repository: Callable = publish_portal_release_cursor,
+) -> PortalPublicationStatus | None:
+    with database.transaction(read_only=True) as cursor:
+        work = load_portal_publication_work_cursor(
+            cursor,
+            product_key=product_key,
+            source_receipt_id=source_receipt_id,
+            release_class=release_class,
+        )
+    if work is None:
+        return None
+    return _run_portal_publication_work_once(
+        database,
+        config,
+        work,
+        checked_at=checked_at,
+        release_repository=release_repository,
+    )
+
+
 def run_portal_publication_once(
     database: RealtimeProcessDatabase,
     config: PortalPublicationConfig,
@@ -361,6 +746,8 @@ def run_portal_publication_once(
     delivered_repository: Callable = mark_alert_outbox_delivered_cursor,
     failed_repository: Callable = fail_alert_outbox_delivery_cursor,
     release_repository: Callable = publish_portal_release_cursor,
+    enqueue_repository: Callable = enqueue_portal_publication_work_cursor,
+    publication_work_runner: Callable = _run_portal_publication_work_once,
 ) -> PortalPublicationStatus:
     if not isinstance(database, RealtimeProcessDatabase):
         raise TypeError("portal publisher database is invalid")
@@ -386,6 +773,8 @@ def run_portal_publication_once(
     ):
         raise ValueError("portal snapshot batch conflicts with publisher identity or clock")
     release = None
+    publication_reasons: tuple[str, ...] = ()
+    publication_work_id = None
     if batch.snapshots:
         close_session = None
         if batch.session_close:
@@ -404,17 +793,28 @@ def run_portal_publication_once(
                 else:
                     snapshot_repository(cursor, snapshot)
             if batch.receipt is not None:
-                release = release_repository(
+                work = enqueue_repository(
                     cursor,
                     batch.receipt,
                     batch.snapshots,
+                    product_key=batch.product_key,
+                    created_at=checked,
+                    kept_snapshots=tuple(kept),
+                    expected_ticker_keys=batch.expected_ticker_keys,
+                    release_class=RELEASE_CLASS_INTRADAY,
+                    session_date=close_session,
                 )
-                if kept:
-                    release_repository(
-                        cursor, batch.receipt, tuple(kept),
-                        release_class=RELEASE_CLASS_SESSION_CLOSE,
-                        session_date=close_session,
-                    )
+        if batch.receipt is not None:
+            publication_status = publication_work_runner(
+                database,
+                config,
+                work,
+                checked_at=checked,
+                release_repository=release_repository,
+            )
+            release = publication_status.release
+            publication_reasons = publication_status.reason_codes
+            publication_work_id = publication_status.work_id
     claimed_rows = ()
     if config.dispatch_authorized:
         with database.transaction() as cursor:
@@ -428,7 +828,7 @@ def run_portal_publication_once(
                 limit=config.claim_limit,
             )
     delivered = retried = abandoned = 0
-    reasons: list[str] = []
+    reasons: list[str] = list(publication_reasons)
     for row in claimed_rows:
         message = _message(row)
         try:
@@ -481,4 +881,5 @@ def run_portal_publication_once(
         abandoned=abandoned,
         reason_codes=tuple(dict.fromkeys(reasons)),
         release=release,
+        work_id=publication_work_id,
     )

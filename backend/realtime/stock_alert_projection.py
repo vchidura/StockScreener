@@ -607,6 +607,53 @@ def _produce_canonical_realtime_stock_alerts(
         raise ValueError(
             "canonical Stock Alert evaluation membership changed"
         )
+    membership = batch.get("membership")
+    if not isinstance(membership, Mapping):
+        raise ValueError(
+            "canonical Stock Alert membership identity is unavailable"
+        )
+    membership_body = {
+        key: value
+        for key, value in membership.items()
+        if key != "membership_sha256"
+    }
+    effective_members = membership.get("effective_members")
+    if (
+        canonical_sha256(membership_body)
+        != membership.get("membership_sha256")
+        or batch.get("membership_sha256")
+        != membership.get("membership_sha256")
+        or not isinstance(effective_members, (list, tuple))
+        or {
+            (str(row["security_id"]), str(row["ticker"]))
+            for row in effective_members
+        }
+        != expected_members
+    ):
+        raise ValueError(
+            "canonical Stock Alert membership identity changed"
+        )
+    intended_members = membership.get("intended_members")
+    if not isinstance(intended_members, (list, tuple)):
+        raise ValueError(
+            "canonical Stock Alert intended membership is unavailable"
+        )
+    ready_intended = {
+        (str(row["security_id"]), str(row["ticker"]))
+        for row in intended_members
+        if row["enabled"]
+        and row["status"] == "READY"
+        and row["security_id"] is not None
+    }
+    partial_membership = (
+        ready_intended != expected_members
+        or any(
+            row["enabled"] and row["status"] != "READY"
+            for row in intended_members
+        )
+    )
+    deliverable = bool(batch.get("deliverable", True))
+    late_catch_up = bool(batch.get("late_catch_up", False))
     publication = {
         "run_id": str(batch["batch_id"]),
         "strategy_instance_id": "canonical-equity-stock-alert-v1",
@@ -620,7 +667,21 @@ def _produce_canonical_realtime_stock_alerts(
             row["disposition"] in {"UNAVAILABLE", "ERROR"}
             for row in evaluations
         ),
-        "status": "COMPLETE",
+        "status": (
+            "STALE"
+            if not deliverable
+            else "PARTIAL"
+            if partial_membership
+            else "COMPLETE"
+        ),
+        "desired_revision_id": batch.get("desired_revision_id"),
+        "desired_snapshot_sha256": batch.get(
+            "desired_snapshot_sha256"
+        ),
+        "membership_sha256": batch["membership_sha256"],
+        "observation_cutoff": batch["cutoff"],
+        "late_catch_up": late_catch_up,
+        "deliverable": deliverable,
     }
     alerts = []
     for evaluation in evaluations:
@@ -650,6 +711,21 @@ def _produce_canonical_realtime_stock_alerts(
             "daily_context_at": None,
             "indicator_at": None,
             "indicator_interval": "5m",
+            "desired_revision_id": batch.get("desired_revision_id"),
+            "desired_snapshot_sha256": batch.get(
+                "desired_snapshot_sha256"
+            ),
+            "membership_sha256": batch["membership_sha256"],
+            "observation_cutoff": batch["cutoff"],
+            "late_catch_up": bool(
+                evaluation.get("late_catch_up", late_catch_up)
+            ),
+            "deliverable": (
+                deliverable
+                and bool(evaluation.get("deliverable", True))
+                and bool(row.get("deliverable", True))
+            ),
+            "delivery_permission": False,
         })
         alerts.append(row)
     unavailable_reasons = sorted({
@@ -664,7 +740,11 @@ def _produce_canonical_realtime_stock_alerts(
         "source_id": str(batch["batch_id"]),
         "source_label": "Advanced realtime Equity models",
         "status": (
-            "DEGRADED" if unavailable_reasons else "READY"
+            "STALE"
+            if not deliverable
+            else "DEGRADED"
+            if unavailable_reasons or partial_membership
+            else "READY"
         ),
         "as_of": batch["completed_at"],
         "price_as_of": inputs.cutoff.isoformat(),
@@ -685,6 +765,13 @@ def _produce_canonical_realtime_stock_alerts(
             "status": publication["status"],
         }],
         "publication_mode": "FINALIZED_5M",
+        "membership": dict(membership),
+        "membership_status": (
+            "PARTIAL" if partial_membership else "COMPLETE"
+        ),
+        "late_catch_up": late_catch_up,
+        "deliverable": deliverable,
+        "current_disposition": "PENDING_PUBLICATION",
     }
     observations = [
         {
@@ -699,6 +786,21 @@ def _produce_canonical_realtime_stock_alerts(
             "reason_codes": list(row["reason_codes"]),
             "market_time": inputs.cutoff.isoformat(),
             "available_at": row["observed_at"],
+            "desired_revision_id": row.get("desired_revision_id"),
+            "desired_snapshot_sha256": row.get(
+                "desired_snapshot_sha256"
+            ),
+            "membership_sha256": row.get("membership_sha256"),
+            "observation_cutoff": row.get(
+                "observation_cutoff",
+                inputs.cutoff.isoformat(),
+            ),
+            "late_catch_up": bool(
+                row.get("late_catch_up", late_catch_up)
+            ),
+            "deliverable": (
+                deliverable and bool(row.get("deliverable", True))
+            ),
         }
         for row in evaluations
     ]
@@ -712,6 +814,13 @@ def _produce_canonical_realtime_stock_alerts(
         "observations": observations,
         "schedule_streams": snapshot["strategy_streams"],
         "input_binding": dict(batch),
+        "membership": dict(membership),
+        "membership_status": (
+            "PARTIAL" if partial_membership else "COMPLETE"
+        ),
+        "late_catch_up": late_catch_up,
+        "deliverable": deliverable,
+        "current_disposition": "PENDING_PUBLICATION",
         "missing_producers": {
             "sector_context": (
                 "Canonical sector context is not implemented"
@@ -722,6 +831,12 @@ def _produce_canonical_realtime_stock_alerts(
             "replay": (
                 "Canonical historical replay is not implemented"
             ),
+            **({
+                "membership": (
+                    "Intended membership is not fully effective; "
+                    "established members remain available"
+                )
+            } if partial_membership else {}),
         },
         "provider_fetch_performed": False,
         "publication_permission": False,
@@ -744,6 +859,18 @@ def _produce_canonical_realtime_stock_alerts(
         "price_basis": "RAW_UNADJUSTED_FINALIZED_5M",
         "canonical_batch_sha256": batch["batch_sha256"],
         "input_receipt_id": batch["input_receipt_id"],
+        "desired_revision_id": batch.get("desired_revision_id"),
+        "desired_snapshot_sha256": batch.get(
+            "desired_snapshot_sha256"
+        ),
+        "membership_sha256": batch["membership_sha256"],
+        "observation_session": batch.get(
+            "session_date",
+            str(inputs.session),
+        ),
+        "observation_cutoff": batch["cutoff"],
+        "late_catch_up": late_catch_up,
+        "deliverable": deliverable,
     }
     require_bounded_manifest(manifest, name="Stock Alerts")
     return build_portal_snapshot(

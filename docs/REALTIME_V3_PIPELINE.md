@@ -1025,6 +1025,58 @@ Exit:
 
 Rollback: disable variable-membership products while retaining consolidated ingestion.
 
+Implemented C7 evidence (2026-11-01):
+
+- Canonical Stock Alert batches now bind the immutable desired revision/snapshot,
+  effective 1-400 Equity/sector-ETF membership and distinct intended readiness. The
+  evaluated set is exactly the effective snapshot; warming or failed intent remains
+  visible as partial status and does not block established members. The existing
+  target-9/eight-ticker publication fixtures remain exact compatibility cases.
+- Missing market/sector/event context remains `UNAVAILABLE`, non-actionable and
+  lane-local. Catch-up batches retain their original session/cutoff; late alerts and
+  projections are immutable, non-deliverable evidence, and detector state updates
+  require both forward revision and forward observation time.
+- Migration `043_realtime_product_publication` adds only C7 membership columns plus
+  durable `portal_publication_work` and immutable
+  `portal_publication_receipts`. Snapshot bodies and work enqueue commit before a
+  claimed attempt; release creation, monotonic pointer swap and work completion then
+  commit together. A failed attempt records its reason/retry clock while the prior
+  pointer remains readable. Restart claims the stored snapshot identities and does not
+  refetch provider input or rerun completed detectors. An expired `CLAIMED` lease is
+  atomically reclaimable with an incremented attempt and fencing epoch; a live lease
+  and every superseded owner/epoch remain fenced.
+- The sole publisher serializes by cohort/tier and compares
+  `(session_date, cutoff, publication_generation)`. Same-work divergent replay fails,
+  equivalent replay is idempotent, same-rank divergent snapshots fail, and stale
+  completions remain explicit `HISTORICAL_STALE` releases without pointer or delivery
+  authority. Forward/equal non-deliverable evidence is
+  `HISTORICAL_NONCURRENT`: it never merges the current manifest and never creates or
+  swaps a pointer, including when no prior pointer exists. Same-session independent
+  lanes merge deterministically through one content-addressed release. The public
+  publisher represents a first historical release with `pointer=None`, degraded
+  historical status and no current authority; resume/equivalent replay returns the
+  same completed result, while a later deliverable release may create the first
+  current pointer normally.
+- A declared complete `TICKER_PAGE` membership is hashed into durable publication
+  work and replayed after restart. Its release merge prunes removed membership-owned
+  ticker entries while retaining unrelated independent-lane snapshots. Publishers
+  without an explicit replacement scope retain legacy partial-merge behavior.
+- Stored Stock Alert readers remain pointer-bound and expose exact membership,
+  partial/unavailable status, durable retry/failure state and current disposition.
+  Reference validation is one indexed bounded set read rather than one query per
+  member. Options publication continues to consume its existing exact H/E/O snapshots
+  through the same publisher; acquisition and detector completion remain independent.
+  Dispatch is disabled for the C7 stage publisher, and broker/trading effects remain
+  absent.
+- Provider-free command:
+  `.\backend\.venv\Scripts\python.exe -B -m pytest -p backend.tests.realtime.offline_io_guard backend\tests\realtime\test_canonical_stock_alert_product.py backend\tests\realtime\test_portal_projection_repository.py backend\tests\realtime\test_portal_publisher.py backend\tests\realtime\test_stage_runners_alerts.py backend\tests\realtime\test_stock_alert_vertical_slice.py backend\tests\realtime\test_portal_compatibility_repository.py backend\tests\realtime\test_advanced_options_projection.py backend\tests\realtime\test_advanced_options_runtime.py backend\tests\realtime\test_advanced_options_activity_momentum_c6.py backend\tests\realtime\test_advanced_options_consumers.py backend\tests\realtime\test_advanced_options_p8_canary_executor.py backend\tests\realtime\test_advanced_options_p8_canary_authorization.py backend\tests\realtime\test_advanced_options_p8_docker_runtime.py backend\tests\realtime\test_advanced_options_schema_contract.py backend\tests\realtime\test_security_v2_roles.py backend\tests\realtime\test_equity_live024_compatibility.py backend\tests\realtime\test_check_scripts_against_v2_registry.py -q --tb=short --disable-warnings -p no:cacheprovider`
+  passed 321 tests with 23 existing warnings.
+- Owned-disposable PostgreSQL command (with `STOCKS_V2_DB_TESTS=1`):
+  `.\backend\.venv\Scripts\python.exe -B -m pytest backend\tests\realtime\test_c7_product_publication_v2_db.py backend\tests\realtime\test_portal_v2_database.py::test_release_publication_swaps_the_pointer_and_older_releases_stay_readable backend\tests\realtime\test_portal_v2_database.py::test_release_publication_rejects_unpersisted_snapshots_and_rolls_back_atomically backend\tests\realtime\test_stock_alert_source_v2_db.py backend\tests\realtime\test_advanced_options_p5_v2_db.py backend\tests\realtime\test_advanced_options_selection_c6_v2_db.py backend\tests\realtime\test_advanced_options_v3_integration_v2_db.py -q --tb=short --disable-warnings -p no:cacheprovider`
+  passed 24 tests with 5 existing warnings. No provider/network, live database,
+  Docker, delivery, broker or trading effect ran. Long-lived lifecycle/Compose/status
+  consolidation remains C8; old-path retirement remains C9.
+
 #### C8 - Consolidate Docker, Maintenance And Status
 
 Purpose: provide one understandable local/Docker operating path.

@@ -14,8 +14,15 @@ from .portal_compatibility_repository import (
     SNAPSHOT_RELATION, _RealtimeCompatibilityRepository, _active_cohort, _utc, load_current_release,
 )
 from .portal_projection_repository import (
-    RELEASE_CLASS_SESSION_CLOSE, RETENTION_HOT_AND_KEPT, persist_portal_snapshot_cursor,
-    portal_session_date, publish_portal_release_cursor,
+    PortalReleaseReceipt,
+    persist_portal_snapshot_cursor,
+    publish_portal_release_cursor,
+)
+from .portal_publisher import (
+    PortalPublicationBatch,
+    PortalPublicationConfig,
+    resume_portal_publication_once,
+    run_portal_publication_once,
 )
 from .screening_repository import load_realtime_stock_alert_input
 from .stock_alert_projection import STOCK_ALERTS_VERSION, produce_realtime_stock_alerts
@@ -73,25 +80,82 @@ def compute_realtime_stock_alerts(
         )
 
 
-def publish_realtime_stock_alerts(publication_database: RealtimeProcessDatabase, snapshot, *, receipt=None,
-                                  session_close=False):
+def publish_realtime_stock_alerts(
+    publication_database: RealtimeProcessDatabase,
+    snapshot,
+    *,
+    receipt=None,
+    session_close=False,
+    owner_id: UUID | None = None,
+    owner_epoch: int = 1,
+    checked_at: datetime | None = None,
+):
     """STOCK_ALERTS publication half: persist the snapshot and, with a receipt, publish the intraday
     release plus (at session close) the kept session-close release."""
     if not isinstance(publication_database, RealtimeProcessDatabase) or publication_database.process_plan.role is not RealtimeDatabaseRole.PUBLICATION:
         raise ValueError("Realtime alert persistence requires the target-local PUBLICATION role")
-    with publication_database.transaction() as cursor:
-        if session_close:
-            kept = persist_portal_snapshot_cursor(cursor, snapshot, retention=RETENTION_HOT_AND_KEPT)
-        else:
-            persist_portal_snapshot_cursor(cursor, snapshot)
-        if receipt is not None:
-            publish_portal_release_cursor(cursor, receipt, (snapshot,))
-            if session_close:
-                publish_portal_release_cursor(
-                    cursor, receipt, (kept,), release_class=RELEASE_CLASS_SESSION_CLOSE,
-                    session_date=portal_session_date(snapshot),
-                )
+    if receipt is None:
+        raise ValueError(
+            "Realtime alert publication requires its source receipt"
+        )
+    if not isinstance(receipt, PortalReleaseReceipt):
+        raise TypeError("Realtime alert source receipt is invalid")
+    publisher_owner = owner_id or receipt.receipt_id
+    run_portal_publication_once(
+        publication_database,
+        PortalPublicationConfig(
+            receipt.cohort_id,
+            receipt.provider_tier,
+            publisher_owner,
+            owner_epoch,
+            dispatch_authorized=False,
+        ),
+        PortalPublicationBatch(
+            (snapshot,),
+            receipt=receipt,
+            session_close=session_close,
+            product_key="STOCK_ALERTS",
+        ),
+        None,
+        checked_at=(
+            max(snapshot.generated_at, receipt.cutoff)
+            if checked_at is None
+            else checked_at
+        ),
+        snapshot_repository=persist_portal_snapshot_cursor,
+        release_repository=publish_portal_release_cursor,
+    )
     return snapshot
+
+
+def resume_realtime_stock_alert_publication(
+    publication_database: RealtimeProcessDatabase,
+    receipt: PortalReleaseReceipt,
+    *,
+    owner_id: UUID,
+    owner_epoch: int,
+    checked_at: datetime,
+):
+    if not isinstance(publication_database, RealtimeProcessDatabase) or (
+        publication_database.process_plan.role
+        is not RealtimeDatabaseRole.PUBLICATION
+    ):
+        raise ValueError(
+            "Realtime alert retry requires the target-local PUBLICATION role"
+        )
+    return resume_portal_publication_once(
+        publication_database,
+        PortalPublicationConfig(
+            receipt.cohort_id,
+            receipt.provider_tier,
+            owner_id,
+            owner_epoch,
+            dispatch_authorized=False,
+        ),
+        product_key="STOCK_ALERTS",
+        source_receipt_id=receipt.receipt_id,
+        checked_at=checked_at,
+    )
 
 
 def materialize_realtime_stock_alerts(compute_database: RealtimeProcessDatabase,
@@ -153,20 +217,42 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
                 raise ValueError("Stored realtime alert identity/checksum drift")
             references = payload["references"]
             require_member_set(manifest["reference_set"], reference_set(references), name="Stock Alerts")
+            reference_ids = [
+                str(reference["security_id"])
+                for reference in references
+            ]
+            cursor.execute(
+                "SELECT security_id, ticker, revision_id, payload_sha256 "
+                "FROM ref.security_revisions "
+                "WHERE security_id=ANY(%s::uuid[]) "
+                "AND effective_from<=%s "
+                "AND (effective_to IS NULL OR effective_to>%s) "
+                "AND observed_at<=%s "
+                "ORDER BY security_id,effective_from DESC,"
+                "observed_at DESC,revision_id",
+                (reference_ids, cutoff, cutoff, cutoff),
+            )
+            current_by_security = {}
+            for current in cursor.fetchall():
+                current_by_security.setdefault(
+                    str(current["security_id"]),
+                    [],
+                ).append(current)
             for reference in references:
-                cursor.execute(
-                    "SELECT revision_id, payload_sha256 FROM ref.security_revisions "
-                    "WHERE security_id=%s AND ticker=%s AND effective_from<=%s "
-                    "AND (effective_to IS NULL OR effective_to>%s) AND observed_at<=%s "
-                    "ORDER BY effective_from DESC, observed_at DESC, revision_id",
-                    (str(reference["security_id"]), reference["ticker"], cutoff, cutoff, cutoff),
+                current = current_by_security.get(
+                    str(reference["security_id"]),
+                    (),
                 )
-                current = cursor.fetchall()
-                if (len(current) != 1
-                    or str(current[0]["revision_id"]) != str(reference["security_revision_id"])
-                    or current[0]["payload_sha256"] != reference["payload_sha256"]):
+                if (
+                    len(current) != 1
+                    or current[0]["ticker"] != reference["ticker"]
+                    or str(current[0]["revision_id"])
+                    != str(reference["security_revision_id"])
+                    or current[0]["payload_sha256"]
+                    != reference["payload_sha256"]
+                ):
                     raise StockAlertPublicationUnavailable("Realtime alert reference changed; republish required")
-            ids = [str(reference["security_id"]) for reference in references]
+            ids = reference_ids
             cursor.execute(
                 "SELECT EXISTS (SELECT 1 FROM ref.corporate_action_revisions "
                 "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) "
@@ -176,7 +262,84 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
             )
             if cursor.fetchone()["action_drift"]:
                 raise StockAlertPublicationUnavailable("Realtime alert action evidence changed; republish required")
-        return deepcopy(payload), row["generated_at"]
+            cursor.execute(
+                "SELECT work_id::text,source_receipt_id::text,cutoff,"
+                "publication_generation,desired_snapshot_sha256,"
+                "membership_sha256,state,disposition,deliverable,"
+                "attempts,next_attempt_at,failure_reason,release_id::text,"
+                "completed_at FROM rt.portal_publication_work "
+                "WHERE cohort_id=%s AND product_key='STOCK_ALERTS' "
+                "ORDER BY cutoff DESC,created_at DESC LIMIT 1",
+                (str(cohort_id),),
+            )
+            publication_work = cursor.fetchone()
+        result = deepcopy(payload)
+        result["current_disposition"] = "CURRENT"
+        result["current_release"] = {
+            "release_id": str(release.release_id),
+            "cutoff": release.cutoff.isoformat(),
+            "publication_generation": (
+                release.publication_generation
+            ),
+            "desired_snapshot_sha256": (
+                release.desired_snapshot_sha256
+            ),
+            "membership_sha256": release.membership_sha256,
+            "deliverable": release.deliverable,
+        }
+        result["publication_status"] = (
+            None
+            if publication_work is None
+            else {
+                "work_id": str(publication_work["work_id"]),
+                "source_receipt_id": str(
+                    publication_work["source_receipt_id"]
+                ),
+                "cutoff": publication_work["cutoff"].isoformat(),
+                "publication_generation": int(
+                    publication_work["publication_generation"]
+                ),
+                "desired_snapshot_sha256": publication_work[
+                    "desired_snapshot_sha256"
+                ],
+                "membership_sha256": publication_work[
+                    "membership_sha256"
+                ],
+                "state": publication_work["state"],
+                "disposition": publication_work["disposition"],
+                "deliverable": bool(
+                    publication_work["deliverable"]
+                ),
+                "attempts": int(publication_work["attempts"]),
+                "next_attempt_at": publication_work[
+                    "next_attempt_at"
+                ].isoformat(),
+                "failure_reason": publication_work["failure_reason"],
+                "release_id": (
+                    None
+                    if publication_work["release_id"] is None
+                    else str(publication_work["release_id"])
+                ),
+                "completed_at": (
+                    None
+                    if publication_work["completed_at"] is None
+                    else publication_work[
+                        "completed_at"
+                    ].isoformat()
+                ),
+                "current": (
+                    publication_work["release_id"] is not None
+                    and str(publication_work["release_id"])
+                    == str(release.release_id)
+                ),
+            }
+        )
+        if isinstance(result.get("shadow"), dict):
+            result["shadow"]["current_disposition"] = "CURRENT"
+            result["shadow"]["publication_status"] = result[
+                "publication_status"
+            ]
+        return result, row["generated_at"]
 
     def alert_view(self, *, available_by, cohort_id=None, source="SHADOW", session_date=None,
                    combined=None, offset=0, limit=100, **filters):

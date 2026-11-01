@@ -758,7 +758,9 @@ def _window_cycle_receipt(
         return None
     return _WindowReceipt(
         PortalReleaseReceipt(row["receipt_id"], row["cohort_id"], ProviderTier(row["provider_tier"]),
-                             row["cutoff"], row["universe_sha256"]),
+                             row["cutoff"], row["universe_sha256"],
+                             source_receipt_sha256=row["input_sha256"],
+                             source_generation=int(row["reference_generation"])),
         int(row["reference_generation"]), row["input_sha256"], row["deadline"],
     )
 

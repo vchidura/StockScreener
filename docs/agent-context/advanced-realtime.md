@@ -12,7 +12,8 @@ Canonical design and assessment:
 
 Mode: C0/C1 committed at `eafe5f7`; C2 committed at `3754337`; reviewed C3
 committed at `d8fd82d`; reviewed C4 committed at `d78dcf2`; reviewed C5
-committed at `56cd1a9`; C6 reviewed and validated in the current package.
+committed at `56cd1a9`; reviewed C6 committed at `b2ff055`; C7 implemented and
+validated in the current uncommitted package.
 
 ## Settled Runtime Decisions
 
@@ -435,9 +436,46 @@ hot paths perform no chain/calendar work or v2-v3 profile comparison.
 - Account-specific provider extras and full-session message/byte/memory/journal/drain
   measurements remain operational validation, not a startup software qualification
   gate or a claim made by C6.
-- C7 still owns product/release/pointer/outbox/publication/delivery changes. C8 owns
+- C7 completes product/release/pointer/outbox/publication/delivery boundaries. C8 owns
   unattended lifecycle, automatic next-session activation and resident rollover.
   C9 owns retirement of manual activation, daily supervisors and duplicate paths.
+
+## C7 Completion Evidence
+
+- Migration `043_realtime_product_publication` adds immutable Stock Alert
+  desired-snapshot/membership lineage, durable claimed publication work and immutable
+  attempt receipts. It registers only post-024 relations; the pinned live-024 vector
+  and SHA remain unchanged.
+- Canonical Stock Alerts evaluate the effective immutable 1-400 member snapshot.
+  Intended WARMING/FAILED members stay visible as partial status without blocking
+  effective members. Missing sector/event context remains explicit `UNAVAILABLE` and
+  non-actionable. The target-9/eight-ticker and Options exact-four fixtures remain
+  compatibility examples.
+- Snapshot/work enqueue is durable before publication. One claimed attempt atomically
+  creates the release, compares session/cutoff/generation, swaps the pointer and
+  completes the work. Failure preserves the prior pointer and records retry state;
+  restart loads the stored snapshot bodies. Expired claims are reclaimable with an
+  incremented durable fencing epoch; live claims and superseded owners remain fenced.
+  Equivalent replay is idempotent, divergent replay fails, rank-backward catch-up is
+  non-deliverable `HISTORICAL_STALE`, and forward/equal non-deliverable evidence is
+  pointer-ineligible `HISTORICAL_NONCURRENT`. A first historical public-API result is
+  explicitly degraded with `pointer=None`; resume/replay returns the same completed
+  release, and a later deliverable publication can create the first pointer.
+- Explicit complete ticker membership is part of the durable work identity. Restart
+  applies the same replacement scope, pruning removed per-ticker entries while keeping
+  unrelated independent-lane snapshots; publishers without a replacement scope keep
+  legacy merge behavior.
+- Stored readers follow the durable pointer and expose membership, unavailable context,
+  current/non-current disposition and publication retry/failure. Reference validation
+  is one bounded set read. Options H/E/O publication uses the same sole publisher and
+  does not add an Equity-completion dependency.
+- Provider-free affected C7/C6/C5/schema/security/live-024 selection: 321 passed with
+  23 existing warnings. Owned-disposable PostgreSQL C7 pointer/retry plus C6/C5
+  exact-Options selection: 24 passed with 5 existing warnings. Targeted Python compile
+  also passed. No provider/network, live database, Docker, dispatch, delivery, broker
+  or trading effect ran.
+- C8 still owns long-lived lifecycle/Compose/status consolidation. C9 still owns
+  retirement of manual activation, daily supervisors and duplicate paths.
 
 ## Exact Anchors
 
