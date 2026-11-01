@@ -137,6 +137,167 @@ def test_continuous_scheduler_does_not_rescan_durable_completed_prefix():
     assert remaining == windows[30:]
 
 
+def test_progress_check_due_prefers_retry_then_reconciliation_expiry():
+    now = datetime(2026, 11, 2, 17, 0, tzinfo=timezone.utc)
+    future = SimpleNamespace(
+        cutoff=now + timedelta(minutes=5),
+        available_after=now + timedelta(minutes=5, seconds=35),
+    )
+
+    assert script._next_progress_check(
+        (future,),
+        first_cutoff=future.cutoff,
+        now=now,
+        retry_not_before=now + timedelta(seconds=30),
+        reconciliation_expires_at=now + timedelta(seconds=60),
+    ) == now + timedelta(seconds=30)
+    assert script._next_progress_check(
+        (future,),
+        first_cutoff=future.cutoff,
+        now=now,
+        retry_not_before=None,
+        reconciliation_expires_at=now + timedelta(seconds=60),
+    ) == now + timedelta(seconds=60)
+
+
+@pytest.mark.parametrize(
+    "completed_windows",
+    (0, 30),
+)
+def test_continuous_progress_cache_waits_for_next_cutoff_availability(
+    tmp_path,
+    monkeypatch,
+    completed_windows,
+):
+    monkeypatch.chdir(tmp_path)
+    now = [
+        datetime(2026, 11, 2, 14, 0, tzinfo=timezone.utc)
+        if completed_windows == 0
+        else datetime(2026, 11, 2, 17, 0, tzinfo=timezone.utc)
+    ]
+    windows = script.advanced_session_windows(
+        now[0].date(),
+        finality_delay_seconds=5,
+        completion_budget_seconds=300,
+        serving_lag_seconds=30,
+    )
+    last_completed = (
+        None
+        if completed_windows == 0
+        else windows[completed_windows - 1].cutoff
+    )
+
+    class Stop:
+        waits = 0
+
+        def is_set(self):
+            return self.waits >= 4
+
+        def wait(self, _seconds):
+            now[0] += timedelta(seconds=1)
+            self.waits += 1
+            return self.is_set()
+
+    stop = Stop()
+    monkeypatch.setattr(script.threading, "Event", lambda: stop)
+    monkeypatch.setattr(script.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(
+        script,
+        "RealtimeV2PipelineConfig",
+        SimpleNamespace(
+            from_mapping=lambda *_args, **_kwargs: SimpleNamespace(
+                advanced_ingress_policy_path=tmp_path,
+                advanced_ingress_policy_version="test",
+            ),
+        ),
+    )
+    settings = SimpleNamespace(
+        drain_deadline_seconds=30,
+        shutdown_deadline_seconds=30,
+        scheduler_window_retry_initial_backoff_seconds=30,
+        scheduler_window_retry_max_backoff_seconds=300,
+        scheduler_window_retry_max_attempts=3,
+    )
+    profile = SimpleNamespace(
+        sha256="a" * 64,
+        settings=settings,
+    )
+    monkeypatch.setattr(
+        script,
+        "load_advanced_ingress_runtime_catalog",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            profile_for_target=lambda _target: profile,
+            profile_for_sha=lambda _sha: profile,
+        ),
+    )
+    provider = SimpleNamespace(
+        transaction=lambda *_args, **_kwargs: nullcontext(
+            SimpleNamespace(cursor=object())
+        )
+    )
+    pool = MagicMock()
+    monkeypatch.setattr(script, "_provider", lambda _config: (provider, pool))
+    scope = {
+        "authorization_id": UUID(int=1),
+        "authorization_reference": "continuous-test",
+        "cohort_id": UUID(int=2),
+        "plan_id": UUID(int=3),
+        "runtime_profile_sha256": profile.sha256,
+        "authorized_start_at": windows[0].cutoff - timedelta(minutes=5),
+        "authorized_end_at": windows[-1].cutoff,
+    }
+    scope_queries = []
+    monkeypatch.setattr(
+        script,
+        "load_continuous_advanced_scheduler_scope_cursor",
+        lambda *_args, **_kwargs: scope_queries.append(now[0]) or scope,
+    )
+    progress_queries = []
+    monkeypatch.setattr(
+        script,
+        "load_advanced_scheduler_progress_cursor",
+        lambda *_args, **_kwargs: (
+            progress_queries.append(now[0])
+            or SimpleNamespace(last_completed_cutoff=last_completed)
+        ),
+    )
+    monkeypatch.setattr(
+        script,
+        "ensure_advanced_scheduler_session_cursor",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            scheduler_session_id=UUID(int=4)
+        ),
+    )
+    monkeypatch.setattr(
+        script,
+        "prioritize_live_over_blocked_backfill_cursor",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        script,
+        "audit_completed_session_coverage_cursor",
+        lambda *_args, **_kwargs: {"status": "COMPLETE"},
+    )
+
+    assert script.main([
+        "--database",
+        "stocks_realtime_v2",
+        "--confirm-database-name",
+        "stocks_realtime_v2",
+        "--poll-seconds",
+        "1",
+        "--scope-reconcile-seconds",
+        "60",
+        "--report-directory",
+        str(tmp_path / "reports"),
+        "--continuous",
+        "--execute",
+    ], clock=lambda: now[0]) == 0
+    assert len(scope_queries) == 1
+    assert len(progress_queries) == 1
+    pool.closeall.assert_called_once()
+
+
 def test_scheduler_drains_final_cutoff_after_provider_window_ends(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     started = datetime(2026, 10, 16, 13, 30, 30, tzinfo=timezone.utc)

@@ -309,6 +309,104 @@ def activate_advanced_runtime_profile_cursor(
     )
 
 
+def ensure_exact_advanced_runtime_profile_cursor(
+    cursor,
+    runtime_catalog: AdvancedIngressRuntimeCatalog,
+    *,
+    universe_target: int,
+    activated_at: datetime,
+) -> AdvancedRuntimeProfileRegistration:
+    profile = runtime_catalog.profile_for_target(universe_target)
+    cursor.execute(
+        "SELECT runtime_profile_version,configuration_sha256,"
+        "runtime_policy_sha256,status "
+        "FROM rt.advanced_ingress_runtime_profiles "
+        "WHERE runtime_profile_sha256=%s",
+        (profile.sha256,),
+    )
+    stored = cursor.fetchone()
+    expected_configuration = profile.configuration_sha256(
+        runtime_catalog.scale_policy.sha256
+    )
+    if stored is not None:
+        if tuple(str(value) for value in stored) != (
+            profile.version,
+            expected_configuration,
+            runtime_catalog.scale_policy.sha256,
+            "ACTIVE",
+        ):
+            raise ValueError(
+                "stored exact-target runtime profile conflicts"
+            )
+        return AdvancedRuntimeProfileRegistration(
+            profile.sha256,
+            profile.version,
+            profile.universe_target,
+            expected_configuration,
+            runtime_catalog.scale_policy.sha256,
+            "ACTIVE",
+        )
+    if universe_target in runtime_catalog.scale_policy.universe_ladder:
+        raise ValueError(
+            "reviewed ladder runtime profile is not ACTIVE"
+        )
+    capacity_target = runtime_catalog.capacity_target_for(universe_target)
+    capacity = runtime_catalog.profile_for_target(capacity_target)
+    cursor.execute(
+        "SELECT stability_evidence_sha256,capacity_evidence_sha256 "
+        "FROM rt.advanced_ingress_runtime_profiles "
+        "WHERE runtime_profile_sha256=%s AND status='ACTIVE'",
+        (capacity.sha256,),
+    )
+    evidence = cursor.fetchone()
+    stability_evidence_sha256 = (
+        str(evidence[0])
+        if evidence is not None
+        else canonical_sha256({
+            "contract": "reviewed-capacity-settings-v1",
+            "catalog_version": runtime_catalog.version,
+            "capacity_profile_sha256": capacity.sha256,
+            "runtime_policy_sha256": (
+                runtime_catalog.scale_policy.sha256
+            ),
+        })
+    )
+    capacity_evidence_sha256 = (
+        str(evidence[1])
+        if evidence is not None
+        else canonical_sha256({
+            "contract": "exact-target-capacity-bound-v1",
+            "universe_target": universe_target,
+            "capacity_target": capacity_target,
+            "capacity_profile_sha256": capacity.sha256,
+        })
+    )
+    promotion_ladder = runtime_catalog.promotion_ladder_for_target(
+        universe_target
+    )
+    register_advanced_runtime_profile_cursor(
+        cursor,
+        profile,
+        runtime_policy_sha256=runtime_catalog.scale_policy.sha256,
+        ladder_position=len(promotion_ladder) - 1,
+        previous_universe_target=(
+            None if len(promotion_ladder) == 1
+            else promotion_ladder[-2]
+        ),
+    )
+    return activate_advanced_runtime_profile_cursor(
+        cursor,
+        profile.sha256,
+        stability_evidence_sha256=stability_evidence_sha256,
+        capacity_evidence_sha256=capacity_evidence_sha256,
+        approval_reference=(
+            "derived-exact-target:"
+            f"{capacity.sha256}:{universe_target}"
+        ),
+        activated_at=activated_at,
+    )
+
+
 def _authorization_from_row(row) -> AdvancedStreamAuthorization:
     budgets = AdvancedIngressBudgets(
         int(row[7]),

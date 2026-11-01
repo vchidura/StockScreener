@@ -87,6 +87,13 @@ def test_contract_pins_exact_000_through_024_and_historical_registry():
     assert migrations[-1].sequence == 24
     assert registry.sha256 == LIVE024_REGISTRY_SHA256
     assert not POST024_RELATIONS & set(registry.relation_names)
+    assert {
+        "rt.realtime_desired_revisions",
+        "rt.realtime_desired_current",
+        "rt.realtime_desired_members",
+        "rt.realtime_desired_member_readiness",
+        "rt.realtime_desired_session_snapshots",
+    }.issubset(POST024_RELATIONS)
     assert "rt.option_flow_events" in registry.relation_names
     assert "rt.advanced_ingress_plans" in registry.relation_names
 

@@ -206,12 +206,38 @@ def provider_budget_status_cursor(
     )
 
 
+def account_provider_budget_status_cursor(
+    cursor,
+    scope: ProviderBudgetScope,
+) -> ProviderBudgetStatus:
+    cursor.execute(
+        "SELECT COUNT(*),COALESCE(SUM(reserved_response_bytes),0),"
+        "COUNT(*) FILTER (WHERE state='RESERVED'),"
+        "COUNT(*) FILTER (WHERE state='COMPLETE'),"
+        "COUNT(*) FILTER (WHERE state='FAILED'),"
+        "COUNT(*) FILTER (WHERE state='AMBIGUOUS') "
+        "FROM rt.provider_request_ledger "
+        "WHERE account_alias=%s AND budget_session_date=%s "
+        "AND budget_scope_sha256 IS NOT NULL",
+        (scope.account_alias, scope.session_date),
+    )
+    values = tuple(int(value) for value in cursor.fetchone())
+    return ProviderBudgetStatus(
+        scope.account_alias,
+        scope.session_date,
+        scope.request_ceiling,
+        scope.decoded_byte_ceiling,
+        *values,
+    )
+
+
 def reserve_coordinated_provider_request_cursor(
     cursor,
     scope: ProviderBudgetScope,
     reservation: ProviderRequestReservation,
     *,
     reserved_response_bytes: int,
+    account_wide: bool = False,
 ) -> ProviderBudgetAdmission:
     coordinated = scope.bind(
         reservation,
@@ -235,9 +261,17 @@ def reserve_coordinated_provider_request_cursor(
             coordinated.request_id,
             False,
             str(existing[0]),
-            provider_budget_status_cursor(cursor, scope),
+            (
+                account_provider_budget_status_cursor(cursor, scope)
+                if account_wide
+                else provider_budget_status_cursor(cursor, scope)
+            ),
         )
-    status = provider_budget_status_cursor(cursor, scope)
+    status = (
+        account_provider_budget_status_cursor(cursor, scope)
+        if account_wide
+        else provider_budget_status_cursor(cursor, scope)
+    )
     if status.requests_reserved + 1 > scope.request_ceiling:
         raise ProviderBudgetExceeded(
             "provider account request ceiling is exhausted"

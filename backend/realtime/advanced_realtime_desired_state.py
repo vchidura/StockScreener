@@ -122,7 +122,7 @@ class DesiredStateRevision:
 @dataclass(frozen=True, slots=True)
 class DesiredMemberPreparation:
     revision_id: UUID
-    security_id: UUID
+    security_id: UUID | None
     ticker: str
     kind: DesiredMemberKind
     enabled: bool
@@ -196,11 +196,11 @@ def build_desired_state_revision(
         raise ValueError("desired state recorded_at must be timezone-aware")
     recorded = recorded_at.astimezone(timezone.utc)
     expected_tickers = {row.ticker for row in change.members}
-    if set(security_ids) != expected_tickers or any(
+    if not set(security_ids).issubset(expected_tickers) or any(
         not isinstance(value, UUID) or value.int == 0
         for value in security_ids.values()
     ):
-        raise ValueError("desired state stored security identities are incomplete")
+        raise ValueError("desired state stored security identities are invalid")
     policy_reference = selection_policy_reference.strip()
     if not policy_reference:
         raise ValueError("desired state selection policy reference cannot be blank")
@@ -224,7 +224,7 @@ def build_desired_state_revision(
                 row.kind.value,
                 row.priority,
                 row.enabled,
-                security_ids[row.ticker],
+                security_ids.get(row.ticker),
             )
             for row in change.members
         ),
@@ -245,4 +245,23 @@ def build_desired_state_revision(
         recorded_at=recorded,
         members=change.members,
         security_ids=tuple(sorted(security_ids.items())),
+    )
+
+
+def desired_member_intent_id(
+    revision_id: UUID,
+    ticker: str,
+    kind: DesiredMemberKind,
+) -> UUID:
+    if not isinstance(revision_id, UUID) or revision_id.int == 0:
+        raise ValueError("desired member intent revision is invalid")
+    if not isinstance(kind, DesiredMemberKind):
+        raise TypeError("desired member intent kind is invalid")
+    normalized = ticker.strip().upper()
+    if not _SYMBOL_PATTERN.fullmatch(normalized):
+        raise ValueError("desired member intent ticker is invalid")
+    return uuid5(
+        NAMESPACE_URL,
+        "stockscreener:advanced-realtime-desired-intent:"
+        f"{revision_id}:{normalized}:{kind.value}",
     )

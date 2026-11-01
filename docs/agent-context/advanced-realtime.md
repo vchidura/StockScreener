@@ -10,8 +10,8 @@ self-reconciling continuous worker for local and Docker development.
 Canonical design and assessment:
 [REALTIME_V3_PIPELINE.md](../REALTIME_V3_PIPELINE.md).
 
-Mode: C0/C1 committed at `eafe5f7`; C2 committed at `3754337`; C3 implemented
-and validated, review pending.
+Mode: C0/C1 committed at `eafe5f7`; C2 committed at `3754337`; reviewed C3
+committed at `d8fd82d`; C4 implemented and validated, review pending.
 
 ## Settled Runtime Decisions
 
@@ -205,6 +205,71 @@ and validated, review pending.
   and long-lived recovery in C8. C3 intentionally retains the global WARMING gate.
   No migration or new coordination table was added.
 
+## C4 Completion Evidence
+
+- Any exact Equity/sector-ETF target from 1 through 400 now gets an immutable
+  exact-target runtime profile. The next reviewed capacity point supplies unchanged
+  finite technical settings; known 1/9/25/50/100/200/400 identities stay unchanged.
+- Migration `040_realtime_equity_preparation` adds mutable per-member/per-stage work
+  plus immutable member intents, resolved identity bindings and chunk lineage.
+  Watermarks, coverage, total attempts, independent failure streak, retry time,
+  leases, terminal/blocked reasons, provider requests/bytes and exact source hashes
+  survive restart; completed chunks are not reset or replayed.
+- One desired-state edit set-creates work only for changed warming Equity members.
+  A syntactically valid absent ticker is accepted provider-free; its REFERENCE stage
+  persists canonical reference/instrument identity through existing owners, refuses
+  ambiguity/conflict and binds the immutable intent before history stages continue.
+  The resident runs reference, adjusted daily, native intraday, existing interval
+  derivation and declared technical warmup stages in bounded chunks. It is
+  provider-aware/injectable, uses exact request/decoded-byte/member ceilings and does
+  no work during market-hours or drain phases.
+- Before any REFERENCE/adjusted/native provider I/O, C4 reserves deterministic
+  per-call slots in the existing account-wide `provider_request_ledger`, bound to
+  revision, intent, stage, lease epoch, attempt and request slot. Successful and
+  handled-failure paths reconcile actual calls/bytes transactionally with work;
+  process loss leaves the maximum reservation durable and the next claim marks prior
+  unresolved effects ambiguous. Completed, failed, reserved and ambiguous rows all
+  consume member/account ceilings; DERIVED/WARMUP reserve zero provider scope.
+- Intended membership stays immutable while readiness changes. Post-close drain
+  commits future intent/capability/work but never pins the future plan. One activation
+  boundary (`open - controller warmup`) selects the session snapshot/plan; readiness
+  before it joins that snapshot, while readiness after it rolls to the next XNYS
+  session. Current active snapshots, plans, budgets and usage are never mutated.
+- Retryable coverage/reference/derivation availability uses durable backoff from a
+  separate failure streak, which resets after progress. Permanent identity/policy and
+  exhausted member-budget failures remain blocked; progress resumes from its watermark.
+- Exact changed membership still requires exact capability evidence. The controller
+  derives/registers a non-ladder profile automatically and uses an exact promotion
+  ladder; current-session plans, budgets and usage remain pinned.
+- Stored portal status exposes every desired Equity member, per-stage state, available
+  intervals, bounded first/last/count/latest OHLC identities, reference/source lineage,
+  durable watermark, attempts, failure streak, reasons and retry timing. Ready
+  non-target9 members remain explicitly preparation-only with a required C7 handoff;
+  the prior canonical release remains readable and no provider call occurs.
+- C3-R13 preserves the cached progress-derived next incomplete cutoff and refreshes
+  only at session/scope change, cutoff availability, retry due time or bounded
+  reconciliation expiry. C3-R14 routes typed connection-lease loss through pump drain,
+  final offsets, WAL checkpoint/journal seal, ownership gap, conservative usage,
+  terminal stream status and a durable failure report.
+- Focused provider-free C4/desired/lifecycle/repair/scheduler/portal/schema selection:
+  250 passed, 1 skipped and the one documented malformed delayed-pong fake deselected,
+  with 11 existing warnings. Owned disposable PostgreSQL
+  desired/lifecycle/plan/preparation selection: 40 passed with 5 existing warnings.
+  Evidence covers absent-ticker onboarding, non-ladder profiles, activation timing,
+  one plan/usage ledger per session, established-member continuity, bounded chunks,
+  retry/backoff/reset, restart resume, reservation idempotency, crashes before calls
+  and after responses, handled HTTP failure, successful reconciliation, concurrent
+  account work, no duplicate bars/derivations, stored availability/C7 handoff, live
+  priority and lease-loss closure. No provider, production, Docker or publication
+  effects ran.
+- Supplemental live-024/schema/security/C4 relation compatibility selection:
+  72 passed with 4 existing warnings. All committed C2 desired-state and C4
+  preparation relations are excluded from the historical through-024 registry;
+  its accepted migrations and pinned registry SHA remain unchanged.
+- C5 remains Options PostgreSQL session state, membership, sharding and daily
+  catalog/OI/reference revalidation. C7 remains canonical release merge,
+  pointer/retry/outbox, delivery and broker/trading boundaries; C4 adds no publisher.
+
 ## Exact Anchors
 
 - `backend/realtime/advanced_equity_capability_refresh.py`
@@ -222,14 +287,22 @@ and validated, review pending.
 - `backend/realtime/advanced_options_p8_runtime.py`
 - `backend/realtime/advanced_realtime_desired_state.py`
 - `backend/realtime/advanced_realtime_desired_state_repository.py`
+- `backend/realtime/advanced_equity_preparation.py`
+- `backend/realtime/advanced_ingress_runtime_profile.py`
+- `backend/realtime/provider_budget.py`
 - `backend/realtime/sql_v2/039_realtime_desired_state.sql`
+- `backend/realtime/sql_v2/040_realtime_equity_preparation.sql`
+- `backend/scripts/run_realtime_v2_advanced_equity_preparation.py`
 - `backend/scripts/manage_advanced_realtime_desired_state.py`
 - `docker-compose.realtime-v2.yml`
 
-Focused completion check: PASS. Provider-free continuous Equity startup needs no
-manual session/cohort/cutoff identity, selects the effective C2 snapshot, refuses a
-duplicate leader, preserves active stream ownership and durable usage, idles across
-close/weekend, rolls a missed session during market hours with catch-up still
-required, pins same-session budgets, preserves a full processing drain, serializes
-snapshot creation and performs zero provider, production, Docker or publication
-effects.
+Focused completion check: PASS. Adding a truly absent tenth ticker after close creates
+durable unresolved intent and bounded preparation automatically, resolves canonical
+identity, exposes stored availability while the established nine remain active,
+reserves worst-case provider effects before I/O, conservatively retains crash
+effects, resumes from committed watermark/failure state and joins exactly one
+session snapshot/plan at the activation boundary (or the following session when
+late). It
+requires no manual reference/snapshot/cohort/hash/date, does no live-message desired
+work, does not mutate active state or the canonical release and performs zero
+provider, production, Docker or publication effects.

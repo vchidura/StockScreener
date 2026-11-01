@@ -113,6 +113,21 @@ RELATIONS: dict[str, Relation] = {
     "rt.realtime_desired_session_snapshots": _r(
         "control", "BOUNDED", append=True, api=True
     ),
+    "rt.realtime_desired_member_intents": _r(
+        "control", "BOUNDED", append=True, api=True
+    ),
+    "rt.realtime_desired_intent_readiness": _r(
+        "control", "BOUNDED", mutable=True, api=True
+    ),
+    "rt.realtime_desired_member_bindings": _r(
+        "control", "BOUNDED", append=True, api=True
+    ),
+    "rt.realtime_equity_preparation_work": _r(
+        "control", "BOUNDED", mutable=True, api=True
+    ),
+    "rt.realtime_equity_preparation_chunks": _r(
+        "control", "BOUNDED", append=True, api=True
+    ),
     "rt.cohorts": _r("control", "BOUNDED", append=True, api=True),
     "rt.cohort_history_bindings": _r(
         "control", "BOUNDED", append=True, api=True

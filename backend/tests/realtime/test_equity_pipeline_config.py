@@ -126,6 +126,32 @@ def test_developer_pipeline_does_not_activate_advanced_runtime_values():
             },
         ),
         (
+            RealtimeV2Process.CAPABILITY_REFRESH,
+            {
+                "REALTIME_V2_APP_DSN",
+                "POLYGON_API_KEY",
+            },
+            {
+                "REALTIME_V2_API_DSN",
+                "REALTIME_V2_ADVANCED_JOURNAL_DIR",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_VERSION",
+            },
+        ),
+        (
+            RealtimeV2Process.EQUITY_PREPARATION,
+            {
+                "REALTIME_V2_APP_DSN",
+                "POLYGON_API_KEY",
+            },
+            {
+                "REALTIME_V2_API_DSN",
+                "REALTIME_V2_ADVANCED_JOURNAL_DIR",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH",
+                "REALTIME_V2_ADVANCED_INGRESS_POLICY_VERSION",
+            },
+        ),
+        (
             RealtimeV2Process.APP_WORKER,
             {"REALTIME_V2_APP_DSN"},
             {

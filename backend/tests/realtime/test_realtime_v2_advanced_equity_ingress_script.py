@@ -1,6 +1,7 @@
 import importlib
 import asyncio
 import threading
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -154,6 +155,157 @@ def test_journal_progress_commits_before_diagnostic_session_failure(
 
     assert events == ["journal", "reconnect", "session"]
     assert provider.transaction.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("raw_offset", "event_offset", "during_drain"),
+    (
+        (0, 0, False),
+        (5, 0, False),
+        (5, 4, False),
+        (8, 7, True),
+    ),
+)
+def test_connection_lease_loss_uses_durable_failure_closure(
+    tmp_path,
+    monkeypatch,
+    raw_offset,
+    event_offset,
+    during_drain,
+):
+    watermark = (
+        None
+        if event_offset == 0
+        else datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc)
+    )
+    progress = SimpleNamespace(
+        last_raw_offset=raw_offset,
+        last_event_offset=event_offset,
+        event_time_watermark=watermark,
+    )
+    pump = MagicMock()
+    pump.progress = progress
+    if during_drain:
+        pump.join.side_effect = TimeoutError("drain timeout")
+    else:
+        pump.join.return_value = progress
+    reporter = MagicMock(
+        failure_count=0,
+        last_failure_name=None,
+    )
+    events = []
+    journal_path = tmp_path / "lease-loss.sqlite"
+    journal_path.touch()
+    report_path = tmp_path / "lease-loss.json"
+    generation = UUID(int=90)
+    provider = SimpleNamespace(
+        transaction=lambda *_args, **_kwargs: nullcontext(
+            SimpleNamespace(cursor=object())
+        )
+    )
+    monkeypatch.setattr(
+        script,
+        "checkpoint_journal_wal",
+        lambda path: events.append(("checkpoint", path)),
+    )
+    monkeypatch.setattr(
+        script,
+        "journal_files_sha256",
+        lambda _path: "a" * 64,
+    )
+    monkeypatch.setattr(
+        script,
+        "seal_advanced_journal_cursor",
+        lambda _cursor, _generation, **kwargs: events.append((
+            "seal",
+            _generation,
+            kwargs,
+        )),
+    )
+    monkeypatch.setattr(
+        script,
+        "record_advanced_stream_gap_cursor",
+        lambda _cursor, _session, **kwargs: events.append((
+            "gap",
+            kwargs,
+        )),
+    )
+    monkeypatch.setattr(
+        script,
+        "update_advanced_stream_session_cursor",
+        lambda _cursor, _session, _usage, **kwargs: events.append((
+            "session",
+            kwargs,
+        )),
+    )
+    monkeypatch.setattr(
+        script,
+        "write_report",
+        lambda path, report: events.append(("report", path, report)),
+    )
+    monkeypatch.setattr(
+        script,
+        "classify_advanced_ingress_failure",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            disposition=SimpleNamespace(value="RETRY"),
+            terminal_outcome="FAILED_INFRASTRUCTURE",
+        ),
+    )
+    usage = SimpleNamespace(
+        last_raw_offset=raw_offset,
+        event_time_watermark=watermark,
+        received_frame_count=max(raw_offset, 0),
+        received_byte_count=max(raw_offset, 0) * 10,
+    )
+
+    failure = script._durably_close_failed_ingress(
+        provider=provider,
+        error=script.AdvancedConnectionLeaseLost(),
+        pump=pump,
+        status_reporter=reporter,
+        registration=SimpleNamespace(
+            journal_generation=generation,
+        ),
+        journal_path=journal_path,
+        session=SimpleNamespace(),
+        gateway=SimpleNamespace(),
+        usage=lambda: usage,
+        runtime_profile=SimpleNamespace(
+            settings=SimpleNamespace(
+                shutdown_deadline_seconds=30,
+                database_statement_timeout_ms=30_000,
+            )
+        ),
+        started_at=datetime(
+            2026, 10, 30, 14, 30, tzinfo=timezone.utc
+        ),
+        live_started_at=None,
+        report_path=report_path,
+    )
+
+    assert [event[0] for event in events] == [
+        "checkpoint",
+        "seal",
+        "gap",
+        "session",
+        "report",
+    ]
+    seal = events[1][2]
+    assert seal["raw_committed_offset"] == raw_offset
+    assert seal["normalized_committed_offset"] == event_offset
+    assert events[2][1]["reason"] == "CONNECTION_LEASE_LOST"
+    assert events[2][1]["last_durable_offset"] == raw_offset
+    assert events[3][1]["status"] == "FAILED"
+    assert events[3][1]["failure_code"] == "CONNECTION_LEASE_LOST"
+    assert events[3][1]["terminal"] is True
+    assert failure["failure_code"] == "CONNECTION_LEASE_LOST"
+    assert failure["journal_sealed"] is True
+    assert failure["last_raw_offset"] == raw_offset
+    assert failure["last_event_offset"] == event_offset
+    assert failure["drain_failure"] == (
+        "TimeoutError" if during_drain else None
+    )
+    assert failure["terminal_outcome"] == "FAILED_INFRASTRUCTURE"
 
 
 def test_ingress_paths_are_plan_session_attempt_derived_and_non_overwriting(

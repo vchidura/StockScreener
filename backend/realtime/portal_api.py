@@ -21,6 +21,9 @@ from .advanced_options_api import (
     advanced_options_v2_disabled_payload,
     advanced_options_v2_status_payload,
 )
+from .advanced_equity_preparation import (
+    AdvancedEquityPreparationStatusRepository,
+)
 from .database_access import RealtimeDatabaseRole
 from .migrations import EXPECTED_DATABASE_NAME
 from .portal_compatibility_repository import (
@@ -58,6 +61,9 @@ class RealtimePortalRepositories:
     option_alert_views: RealtimeOptionsAlertsPageRepository | None = None
     daily_strategies: RealtimeDailyStrategyRepository | None = None
     advanced_options: AdvancedOptionsStoredProjectionRepository | None = None
+    equity_preparation: (
+        AdvancedEquityPreparationStatusRepository | None
+    ) = None
 
 
 def build_realtime_portal_repositories(
@@ -119,6 +125,9 @@ def build_realtime_portal_repositories(
         advanced_options=AdvancedOptionsStoredProjectionRepository(
             cursor_factory,
             require_read_pin=True,
+        ),
+        equity_preparation=AdvancedEquityPreparationStatusRepository(
+            cursor_factory,
         ),
     )
 
@@ -885,11 +894,61 @@ def create_realtime_portal_app(
         except Exception as error:
             raise unavailable(error) from error
 
+    @app.get("/api/realtime/equity-preparation")
+    def equity_preparation(ticker: str | None = None):
+        if repositories.equity_preparation is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Equity preparation status is unavailable",
+            )
+        try:
+            result = repositories.equity_preparation.read(
+                active_on=cutoff().date(),
+                ticker=ticker,
+            )
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        except Exception as error:
+            raise unavailable(error) from error
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Equity preparation status is unavailable",
+            )
+        return result
+
     @app.get("/api/realtime/tickers/{ticker}")
     def ticker_page(ticker: str, cohort_id: UUID | None = None):
         symbol = ticker.strip().upper()
         if symbol not in set(EQUITY_VALIDATION_UNIVERSE.equity_tickers):
-            raise HTTPException(status_code=422, detail="Ticker is outside the canary")
+            if repositories.equity_preparation is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Ticker is outside the canary",
+                )
+            try:
+                preparation = repositories.equity_preparation.read(
+                    active_on=cutoff().date(),
+                    ticker=symbol,
+                )
+            except Exception as error:
+                raise unavailable(error) from error
+            if preparation is None or not preparation["members"]:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Ticker is not in desired membership",
+                )
+            member = preparation["members"][0]
+            return {
+                "payload": {"ticker": symbol, "setups": []},
+                "is_fresh": False,
+                "is_serveable": False,
+                "available_intervals": member["available_intervals"],
+                "preparation": member,
+                "active_snapshot": preparation["active_snapshot"],
+                "canonical_fallback": False,
+                "provider_fetch_performed": False,
+            }
         try:
             row = repositories.ticker_screener.ticker_page(
                 symbol,

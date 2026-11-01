@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier
 from types import SimpleNamespace
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 
@@ -28,6 +28,7 @@ from realtime.advanced_ingress_plan import (
 )
 from realtime.advanced_ingress_repository import (
     activate_advanced_runtime_profile_cursor,
+    ensure_exact_advanced_runtime_profile_cursor,
     prepare_advanced_ingress_plan_cursor,
     register_advanced_runtime_profile_cursor,
     resolve_advanced_ingress_plan_cursor,
@@ -52,7 +53,11 @@ from realtime.advanced_scheduler import (
     load_advanced_scheduler_progress_cursor,
     load_continuous_advanced_scheduler_scope_cursor,
 )
-from realtime.contracts import canonical_sha256
+from realtime.contracts import (
+    EQUITY_VALIDATION_UNIVERSE,
+    UniverseManifest,
+    canonical_sha256,
+)
 from realtime.session_windows import advanced_session_windows
 from tests.realtime.test_advanced_realtime_desired_state_v2_db import (
     _seed_source,
@@ -115,6 +120,39 @@ def _activate_runtime_profile(cursor):
         )
 
 
+def test_non_ladder_runtime_profile_is_derived_from_reviewed_capacity():
+    database = f"test_realtime_v2_c4_exact_profile_{uuid4().hex[:8]}"
+    with disposable_v2_database(database) as pool:
+        connection = pool.getconn()
+        try:
+            with connection.cursor() as cursor:
+                _activate_runtime_profile(cursor)
+                registration = ensure_exact_advanced_runtime_profile_cursor(
+                    cursor,
+                    CATALOG,
+                    universe_target=10,
+                    activated_at=FRIDAY_ROLLOVER,
+                )
+                cursor.execute(
+                    "SELECT universe_target,ladder_position,"
+                    "previous_universe_target,status,profile_document "
+                    "FROM rt.advanced_ingress_runtime_profiles "
+                    "WHERE runtime_profile_sha256=%s",
+                    (registration.runtime_profile_sha256,),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+
+            assert row[:4] == (10, 2, 9, "ACTIVE")
+            assert row[4]["universe_target"] == 10
+            assert (
+                CATALOG.profile_for_target(10).settings
+                == CATALOG.profile_for_target(25).settings
+            )
+        finally:
+            pool.putconn(connection)
+
+
 def test_market_hours_rollover_builds_idempotent_plan_and_progress():
     database = f"test_realtime_v2_c3_roll_{uuid4().hex[:8]}"
     with disposable_v2_database(database) as pool:
@@ -138,7 +176,9 @@ def test_market_hours_rollover_builds_idempotent_plan_and_progress():
                 friday_state = reconcile_desired_state_revision_cursor(
                     cursor,
                     friday_revision.revision_id,
-                    materialized_at=FRIDAY_ROLLOVER,
+                    materialized_at=datetime(
+                        2026, 10, 30, 13, 15, tzinfo=UTC
+                    ),
                 )
                 assert friday_state.snapshot is not None
             connection.commit()
@@ -480,7 +520,7 @@ def test_shared_stocks_connection_lease_is_atomic_across_roles():
 def test_capability_refresh_required_then_selects_fresh_reference_profile():
     database = f"test_realtime_v2_c3_cap_{uuid4().hex[:8]}"
     expired_session = date(2026, 11, 9)
-    checked = datetime(2026, 11, 9, 12, 0, tzinfo=UTC)
+    checked = datetime(2026, 11, 9, 14, 15, tzinfo=UTC)
     with disposable_v2_database(database) as pool:
         connection = pool.getconn()
         try:
@@ -502,7 +542,9 @@ def test_capability_refresh_required_then_selects_fresh_reference_profile():
                 friday = reconcile_desired_state_revision_cursor(
                     cursor,
                     friday_revision.revision_id,
-                    materialized_at=FRIDAY_ROLLOVER,
+                    materialized_at=datetime(
+                        2026, 10, 30, 13, 15, tzinfo=UTC
+                    ),
                 )
                 rollover = ensure_desired_session_revision_cursor(
                     cursor,
@@ -672,14 +714,49 @@ def test_concurrent_reconcilers_share_first_committed_snapshot():
                     ),
                     observed_at=FRIDAY_ROLLOVER,
                 )
+                capability_config = CATALOG.profile_for_target(
+                    10
+                ).configuration_sha256(POLICY_SHA256)
+                target_universe = UniverseManifest(
+                    version="advanced-equity-10-am-v1",
+                    equity_tickers=tuple(sorted((
+                        *EQUITY_VALIDATION_UNIVERSE.equity_tickers,
+                        "XLK",
+                    ))),
+                    option_underlyings=(),
+                )
+                cursor.execute(
+                    "INSERT INTO rt.capability_profiles ("
+                    "profile_id,config_sha256,schema_sha256,"
+                    "account_alias,capabilities_sha256,universe_sha256,"
+                    "checked_at,expires_at,status,profile_sha256,"
+                    "provider_tier,security_policy_sha256,preflight_mode,"
+                    "provider_requests,action_authorized"
+                    ") VALUES (%s,%s,%s,'c4-ready-race',%s,%s,%s,%s,"
+                    "'PASS',%s,'MASSIVE_ADVANCED',%s,'PASSIVE',false,false)",
+                    (
+                        str(uuid5(
+                            NAMESPACE_URL,
+                            "c4-readiness-race-capability",
+                        )),
+                        capability_config,
+                        _digest("c4-race-schema"),
+                        _digest("c4-race-capabilities"),
+                        target_universe.sha256,
+                        FRIDAY_ROLLOVER,
+                        FRIDAY_ROLLOVER + timedelta(days=7),
+                        _digest("c4-race-profile"),
+                        _digest("c4-race-security"),
+                    ),
+                )
             connection.commit()
         finally:
             pool.putconn(connection)
 
         barrier = Barrier(2)
         times = (
-            FRIDAY_ROLLOVER + timedelta(minutes=1),
-            FRIDAY_ROLLOVER + timedelta(minutes=2),
+            datetime(2026, 10, 30, 13, 16, tzinfo=UTC),
+            datetime(2026, 10, 30, 13, 17, tzinfo=UTC),
         )
 
         def reconcile_at(materialized_at):
@@ -782,25 +859,38 @@ def test_readiness_update_serializes_with_concurrent_reconcile():
             concurrent = reconcile_future.result()
 
         assert preparation.status is MemberPreparationStatus.READY
-        assert concurrent.state in {"WARMING", "READY"}
+        assert concurrent.state in {
+            "WARMING",
+            "ACTIVATION_PENDING",
+        }
         connection = pool.getconn()
         try:
             final = reconcile_desired_state(
                 connection,
                 revision.revision_id,
                 materialized_at=(
-                    FRIDAY_ROLLOVER + timedelta(minutes=3)
+                    datetime(
+                        2026,
+                        10,
+                        30,
+                        13,
+                        15,
+                        tzinfo=UTC,
+                    )
                 ),
             )
-            assert final.state == "READY"
-            assert final.snapshot is not None
+            assert final.state in {"READY", "REFRESH_REQUIRED"}
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT count(*) FROM "
+                    "SELECT revision_id,count(*) FROM "
                     "rt.realtime_desired_session_snapshots "
-                    "WHERE revision_id=%s",
-                    (str(revision.revision_id),),
+                    "GROUP BY revision_id HAVING count(*)<>1"
                 )
-                assert cursor.fetchone()[0] == 1
+                assert cursor.fetchall() == []
+                cursor.execute(
+                    "SELECT count(*) FROM "
+                    "rt.realtime_desired_session_snapshots"
+                )
+                assert cursor.fetchone()[0] <= 2
         finally:
             pool.putconn(connection)

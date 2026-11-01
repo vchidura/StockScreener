@@ -29,6 +29,7 @@ class RealtimeV2Process(str, Enum):
     BRIDGE = "BRIDGE"
     SCHEDULER = "SCHEDULER"
     CAPABILITY_REFRESH = "CAPABILITY_REFRESH"
+    EQUITY_PREPARATION = "EQUITY_PREPARATION"
     APP_WORKER = "APP_WORKER"
     API = "API"
 
@@ -87,6 +88,7 @@ class RealtimeV2PipelineConfig:
                 RealtimeV2Process.BRIDGE,
                 RealtimeV2Process.SCHEDULER,
                 RealtimeV2Process.CAPABILITY_REFRESH,
+                RealtimeV2Process.EQUITY_PREPARATION,
                 RealtimeV2Process.APP_WORKER,
             }
             and self.app_dsn is None
@@ -104,6 +106,7 @@ class RealtimeV2PipelineConfig:
                 RealtimeV2Process.CONTROLLER,
                 RealtimeV2Process.INGRESS,
                 RealtimeV2Process.CAPABILITY_REFRESH,
+                RealtimeV2Process.EQUITY_PREPARATION,
             }
             and self.massive_api_key is None
         ):
@@ -193,6 +196,8 @@ class RealtimeV2PipelineConfig:
                 RealtimeV2Process.INGRESS,
                 RealtimeV2Process.BRIDGE,
                 RealtimeV2Process.SCHEDULER,
+                RealtimeV2Process.CAPABILITY_REFRESH,
+                RealtimeV2Process.EQUITY_PREPARATION,
                 RealtimeV2Process.APP_WORKER,
             }
             else None
@@ -209,6 +214,8 @@ class RealtimeV2PipelineConfig:
                 RealtimeV2Process.FULL,
                 RealtimeV2Process.CONTROLLER,
                 RealtimeV2Process.INGRESS,
+                RealtimeV2Process.CAPABILITY_REFRESH,
+                RealtimeV2Process.EQUITY_PREPARATION,
             }
             else None
         )

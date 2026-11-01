@@ -555,7 +555,7 @@ Rollback: select the legacy bounded runtime mode; no durable data conversion req
 ##### C3 Review Findings And Resolutions
 
 Status: `IMPLEMENTED_PROVIDER_FREE_REVIEWED`; manual/runtime validation remains
-separate before C4.
+separate.
 
 | ID | Finding | Resolution | Status |
 | --- | --- | --- | --- |
@@ -571,6 +571,8 @@ separate before C4.
 | C3-R10 | Subscription acknowledgements may arrive across frames, while a generic `success` does not prove exact member acceptance. | The bounded probe accumulates explicit accepted/rejected/unconfirmed membership across frames; generic success alone is not exact-membership PASS. | `RESOLVED_PROVIDER_FREE` |
 | C3-R11 | Processing drain can end at close plus completion budget while the final window deadline also includes finality delay. | Processing ownership is derived from the actual final-window deadline and any longer provider drain. | `RESOLVED_PROVIDER_FREE` |
 | C3-R12 | Lifecycle, refresh, scheduler and health coordination can repeat more often than their state can change. | Lease heartbeat is separated from expensive reconciliation; capability/scheduler work is paced by pointer, expiry, retry and next-window times; immutable session state is cached and health stays scoped to active work. | `RESOLVED_PROVIDER_FREE` |
+| C3-R13 | The scheduler overwrites its progress-derived cutoff with the session's first cutoff before evaluating the cache condition, so progress reloads every poll after the first interval. | Cached progress retains the next incomplete cutoff and refreshes only when cutoff/retry/scope/reconciliation time becomes due. | `RESOLVED_PROVIDER_FREE` |
+| C3-R14 | A Stocks connection-lease renewal failure is raised before journal sealing and terminal stream-session accounting, and its `RuntimeError` bypasses the normal failure closure handler. | Typed lease loss drains the pump, checkpoints/seals valid progress, persists conservative gap/usage/terminal session state and writes a failure report. | `RESOLVED_PROVIDER_FREE` |
 
 #### C4 - Complete Equity Catch-Up And Off-Hours Warmup
 
@@ -620,6 +622,20 @@ Exit:
 - current pointer and detector state remain monotonic.
 
 Rollback: stop automatic repair and retain explicit gaps; live capture continues.
+
+##### C4 Open Review Findings
+
+Status: `IMPLEMENTED_PROVIDER_FREE_REVIEWED`; manual/provider/runtime validation and
+the C7 canonical publication handoff remain separate.
+
+| ID | Finding | Resolution | Status |
+| --- | --- | --- | --- |
+| C4-R1 | Desired-state apply still requires a pre-existing stored security/instrument identity, so entering a genuinely new ticker is not yet the only operator action. | Unresolved syntactically valid intent is durable; REFERENCE preparation resolves/persists canonical security/instrument identity before later stages. | `RESOLVED_DISPOSABLE_DB` |
+| C4-R2 | The controller can pin a baseline next-session plan during drain before a warming member becomes ready; later same-session promotion can create a newer snapshot/second scope after budgets were pinned. | Future intent/capability/work remains unpinned until the pre-open activation boundary; late readiness rolls to the following session and each session keeps one plan/usage ledger. | `RESOLVED_DISPOSABLE_DB` |
+| C4-R3 | Coverage-incomplete, derivation-unavailable and reference-warmup conditions use terminal `BLOCKED`, although several are retryable data-availability outcomes. | Retryable unavailability has a durable failure streak/backoff separate from total attempts and resets after progress; permanent identity/policy/budget conflicts remain blocked. | `RESOLVED_PROVIDER_FREE` |
+| C4-R4 | The preparation process reuses the capability-refresh process identity/secret scope. | A dedicated `EQUITY_PREPARATION` process kind and native/container secret contract owns preparation. | `RESOLVED_PROVIDER_FREE` |
+| C4-R5 | The warming portal route exposes preparation metadata/counts but not bounded stored bar/reference samples; a ready non-target9 member still follows the preparation-only branch until C7. | Portal preparation status exposes bounded first/last/latest stored bar/reference values and lineage, plus an explicit durable C7 handoff state without adding another publisher. | `RESOLVED_PROVIDER_FREE` |
+| C4-R6 | Provider request/byte accounting is committed only after a preparation chunk returns; a crash after provider I/O but before commit can repeat unaccounted work and exceed member bounds. | Each provider chunk reserves maximum requests/bytes in the account-wide ledger before I/O; stale reservations become ambiguous, actual outcomes reconcile on commit, and restart retains the same watermark and burned effects. | `RESOLVED_DISPOSABLE_DB` |
 
 #### C5 - Move Options Session State To PostgreSQL
 

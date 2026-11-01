@@ -116,6 +116,11 @@ from scripts.realtime_script_support import write_report  # noqa: E402
 UTC = timezone.utc
 
 
+class AdvancedConnectionLeaseLost(RuntimeError):
+    def __init__(self, detail: str = "CONNECTION_LEASE_LOST") -> None:
+        super().__init__(detail)
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -428,6 +433,192 @@ def _persist_progress(
             )
 
 
+def _durably_close_failed_ingress(
+    *,
+    provider,
+    error,
+    pump,
+    status_reporter,
+    registration,
+    journal_path,
+    session,
+    gateway,
+    usage,
+    runtime_profile,
+    started_at,
+    live_started_at,
+    report_path,
+):
+    drain_failure = None
+    seal_failure = None
+    progress = pump.progress if pump is not None else None
+    if pump is not None:
+        pump.request_stop()
+        try:
+            progress = pump.join(
+                runtime_profile.settings.shutdown_deadline_seconds
+            )
+        except Exception as drain_error:
+            drain_failure = type(drain_error).__name__
+            progress = pump.progress
+    if status_reporter is not None:
+        if progress is not None:
+            try:
+                status_reporter.publish(progress)
+            except Exception as status_error:
+                drain_failure = (
+                    drain_failure or type(status_error).__name__
+                )
+        try:
+            status_reporter.stop(
+                max(
+                    runtime_profile.settings.shutdown_deadline_seconds,
+                    runtime_profile.settings.database_statement_timeout_ms
+                    / 1_000
+                    + 1,
+                )
+            )
+        except TimeoutError as status_error:
+            drain_failure = (
+                drain_failure or type(status_error).__name__
+            )
+    journal_sealed = False
+    if (
+        progress is not None
+        and registration is not None
+        and journal_path.is_file()
+    ):
+        try:
+            checkpoint_journal_wal(journal_path)
+            with provider.transaction(APP_ROLE) as unit:
+                seal_advanced_journal_cursor(
+                    unit.cursor,
+                    registration.journal_generation,
+                    raw_committed_offset=progress.last_raw_offset,
+                    normalized_committed_offset=(
+                        progress.last_event_offset
+                    ),
+                    sealed_files_sha256=journal_files_sha256(
+                        journal_path
+                    ),
+                    checked_at=_now(),
+                )
+            journal_sealed = True
+        except Exception as journal_error:
+            seal_failure = type(journal_error).__name__
+    failure_code = (
+        "CONNECTION_LEASE_LOST"
+        if isinstance(error, AdvancedConnectionLeaseLost)
+        else str(error)
+        if isinstance(
+            error,
+            (
+                AdvancedJournalDecodeError,
+                GatewayControlError,
+                GatewayOverload,
+            ),
+        )
+        else type(error).__name__.upper()
+    )[:64]
+    final_usage = None
+    if session is not None and gateway is not None and pump is not None:
+        final_usage = usage()
+        with provider.transaction(APP_ROLE) as unit:
+            record_advanced_stream_gap_cursor(
+                unit.cursor,
+                session,
+                gap_start=(
+                    final_usage.event_time_watermark or started_at
+                ),
+                gap_end=None,
+                last_durable_offset=final_usage.last_raw_offset,
+                reason=failure_code,
+                last_durable_watermark=(
+                    final_usage.event_time_watermark
+                ),
+            )
+            update_advanced_stream_session_cursor(
+                unit.cursor,
+                session,
+                final_usage,
+                status=(
+                    "BLOCKED"
+                    if isinstance(
+                        error,
+                        (
+                            AdvancedJournalDecodeError,
+                            GatewayControlError,
+                            GatewayOverload,
+                        ),
+                    )
+                    else "FAILED"
+                ),
+                checked_at=_now(),
+                failure_code=failure_code,
+                terminal=True,
+            )
+    failure = {
+        "status": "FAILED",
+        "failure_code": failure_code,
+        "failure_type": type(error).__name__,
+        "failure_detail": str(error)[:160],
+        "live_seconds": (
+            max(0.0, (_now() - live_started_at).total_seconds())
+            if live_started_at is not None
+            else 0.0
+        ),
+        "last_raw_offset": (
+            None if progress is None else progress.last_raw_offset
+        ),
+        "last_event_offset": (
+            None if progress is None else progress.last_event_offset
+        ),
+        "event_time_watermark": (
+            None
+            if progress is None
+            or progress.event_time_watermark is None
+            else progress.event_time_watermark.isoformat()
+        ),
+        "journal_sealed": journal_sealed,
+        "drain_failure": drain_failure,
+        "seal_failure": seal_failure,
+        "received_frames": (
+            None
+            if final_usage is None
+            else final_usage.received_frame_count
+        ),
+        "received_bytes": (
+            None
+            if final_usage is None
+            else final_usage.received_byte_count
+        ),
+        "credentials_exposed": False,
+        "publication_advanced": False,
+        "status_update_failures": (
+            status_reporter.failure_count
+            if status_reporter is not None
+            else 0
+        ),
+        "last_status_update_failure": (
+            status_reporter.last_failure_name
+            if status_reporter is not None
+            else None
+        ),
+    }
+    classification = classify_advanced_ingress_failure(
+        failure["failure_code"],
+        detail=failure["failure_detail"],
+        live_seconds=failure["live_seconds"],
+    )
+    failure["failure_disposition"] = (
+        classification.disposition.value
+    )
+    failure["terminal_outcome"] = classification.terminal_outcome
+    if report_path is not None:
+        write_report(report_path, failure)
+    return failure
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     config = RealtimeV2PipelineConfig.from_mapping(
@@ -557,12 +748,22 @@ def main(argv=None) -> int:
                             lease_seconds=connection_lease_seconds,
                         )
                     if renewed is None:
-                        raise RuntimeError(
+                        raise AdvancedConnectionLeaseLost(
                             "Advanced Stocks provider connection "
                             "lease was lost"
                         )
                 except Exception as error:
-                    connection_lease_failures.append(error)
+                    connection_lease_failures.append(
+                        error
+                        if isinstance(
+                            error,
+                            AdvancedConnectionLeaseLost,
+                        )
+                        else AdvancedConnectionLeaseLost(
+                            f"CONNECTION_LEASE_LOST:"
+                            f"{type(error).__name__}"
+                        )
+                    )
                     stop.set()
                     return
 
@@ -713,14 +914,14 @@ def main(argv=None) -> int:
         pump.request_stop()
         progress = pump.join(settings.drain_deadline_seconds)
         status_reporter.publish(progress)
+        if connection_lease_failures:
+            raise connection_lease_failures[0]
         status_reporter.stop(
             max(
                 settings.shutdown_deadline_seconds,
                 settings.database_statement_timeout_ms / 1_000 + 1,
             )
         )
-        if connection_lease_failures:
-            raise connection_lease_failures[0]
         checkpoint_journal_wal(journal_path)
         with provider.transaction(APP_ROLE) as unit:
             seal_advanced_journal_cursor(
@@ -796,121 +997,23 @@ def main(argv=None) -> int:
         TimeoutError,
         ValueError,
         JournalCapacityError,
+        AdvancedConnectionLeaseLost,
     ) as error:
-        if pump is not None:
-            pump.request_stop()
-            with suppress(Exception):
-                pump.join(
-                    runtime_profile.settings.shutdown_deadline_seconds
-                )
-            if registration is not None and journal_path.is_file():
-                progress = pump.progress
-                with suppress(Exception):
-                    checkpoint_journal_wal(journal_path)
-                    with provider.transaction(APP_ROLE) as unit:
-                        seal_advanced_journal_cursor(
-                            unit.cursor,
-                            registration.journal_generation,
-                            raw_committed_offset=(
-                                progress.last_raw_offset
-                            ),
-                            normalized_committed_offset=(
-                                progress.last_event_offset
-                            ),
-                            sealed_files_sha256=journal_files_sha256(
-                                journal_path
-                            ),
-                            checked_at=_now(),
-                        )
-        if status_reporter is not None:
-            with suppress(TimeoutError):
-                status_reporter.stop(
-                    max(
-                        runtime_profile.settings.shutdown_deadline_seconds,
-                        runtime_profile.settings.database_statement_timeout_ms
-                        / 1_000
-                        + 1,
-                    )
-                )
-        if session is not None and gateway is not None and pump is not None:
-            failure_code = (
-                str(error)
-                if isinstance(
-                    error,
-                    (
-                        AdvancedJournalDecodeError,
-                        GatewayControlError,
-                        GatewayOverload,
-                    ),
-                )
-                else type(error).__name__.upper()
-            )[:64]
-            final_usage = usage()
-            with provider.transaction(APP_ROLE) as unit:
-                record_advanced_stream_gap_cursor(
-                    unit.cursor,
-                    session,
-                    gap_start=(
-                        final_usage.event_time_watermark or started_at
-                    ),
-                    gap_end=None,
-                    last_durable_offset=final_usage.last_raw_offset,
-                    reason=failure_code,
-                    last_durable_watermark=(
-                        final_usage.event_time_watermark
-                    ),
-                )
-                update_advanced_stream_session_cursor(
-                    unit.cursor,
-                    session,
-                    final_usage,
-                    status=(
-                        "BLOCKED"
-                        if isinstance(
-                            error,
-                            (
-                                AdvancedJournalDecodeError,
-                                GatewayControlError,
-                                GatewayOverload,
-                            ),
-                        )
-                        else "FAILED"
-                    ),
-                    checked_at=_now(),
-                    failure_code=failure_code,
-                    terminal=True,
-                )
-        failure = {
-            "status": "FAILED",
-            "failure_code": type(error).__name__,
-            "failure_detail": str(error)[:160],
-            "live_seconds": (
-                max(0.0, (_now() - live_started_at).total_seconds())
-                if live_started_at is not None
-                else 0.0
-            ),
-            "credentials_exposed": False,
-            "publication_advanced": False,
-            "status_update_failures": (
-                status_reporter.failure_count
-                if status_reporter is not None
-                else 0
-            ),
-            "last_status_update_failure": (
-                status_reporter.last_failure_name
-                if status_reporter is not None
-                else None
-            ),
-        }
-        classification = classify_advanced_ingress_failure(
-            failure["failure_code"],
-            detail=failure["failure_detail"],
-            live_seconds=failure["live_seconds"],
+        failure = _durably_close_failed_ingress(
+            provider=provider,
+            error=error,
+            pump=pump,
+            status_reporter=status_reporter,
+            registration=registration,
+            journal_path=journal_path,
+            session=session,
+            gateway=gateway,
+            usage=usage if pump is not None else None,
+            runtime_profile=runtime_profile,
+            started_at=started_at,
+            live_started_at=live_started_at,
+            report_path=report_path,
         )
-        failure["failure_disposition"] = classification.disposition.value
-        failure["terminal_outcome"] = classification.terminal_outcome
-        if report_path is not None:
-            write_report(report_path, failure)
         print(json.dumps(failure, indent=2))
         return 2
     finally:

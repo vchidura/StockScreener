@@ -126,6 +126,7 @@ def test_continuous_supervisor_has_same_resident_roles_without_daily_scope(
         "bridge",
         "controller",
         "capability-refresh",
+        "preparation",
         "ingress",
         "scheduler",
     }
@@ -163,6 +164,10 @@ def test_process_environments_scope_provider_and_database_secrets():
         environment,
         "capability-refresh",
     )
+    preparation = script.process_environment(
+        environment,
+        "preparation",
+    )
     ingress = script.process_environment(environment, "ingress")
     bridge = script.process_environment(environment, "bridge")
     api = script.process_environment(environment, "api")
@@ -180,6 +185,11 @@ def test_process_environments_scope_provider_and_database_secrets():
         "PATH",
     }
     assert set(capability_refresh) >= {
+        "POLYGON_API_KEY",
+        "REALTIME_V2_APP_DSN",
+        "PATH",
+    }
+    assert set(preparation) >= {
         "POLYGON_API_KEY",
         "REALTIME_V2_APP_DSN",
         "PATH",

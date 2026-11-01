@@ -9,6 +9,7 @@ import sys
 import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 from uuid import UUID
 
 
@@ -184,7 +185,36 @@ def _authorized_windows(windows, *, first_cutoff, started, ended):
     return selected
 
 
-def main(argv=None) -> int:
+def _next_progress_check(
+    windows,
+    *,
+    first_cutoff,
+    now,
+    retry_not_before,
+    reconciliation_expires_at,
+):
+    candidates = [reconciliation_expires_at]
+    if retry_not_before is not None:
+        candidates.append(max(now, retry_not_before))
+    if first_cutoff is not None:
+        window = next(
+            (
+                candidate
+                for candidate in windows
+                if candidate.cutoff == first_cutoff
+            ),
+            None,
+        )
+        if window is not None and window.available_after > now:
+            candidates.append(window.available_after)
+    return min(candidates)
+
+
+def main(
+    argv=None,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> int:
     args = parse_args(argv)
     args.report_directory.mkdir(parents=True, exist_ok=True)
     config = RealtimeV2PipelineConfig.from_mapping(
@@ -197,7 +227,11 @@ def main(argv=None) -> int:
     )
     provider, pool = _provider(config)
     calendar = OptionExchangeCalendar("XNYS")
-    planner = AdvancedEquityLifecyclePlanner(calendar=calendar)
+    utc_now = clock or (lambda: datetime.now(timezone.utc))
+    planner = AdvancedEquityLifecyclePlanner(
+        calendar=calendar,
+        clock=utc_now,
+    )
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -211,9 +245,11 @@ def main(argv=None) -> int:
     cached_windows = None
     cached_progress = None
     next_scope_reconcile_at = None
+    next_progress_check_at = None
+    pending_retry_not_before = None
     try:
         while not stop.is_set():
-            now = datetime.now(timezone.utc)
+            now = utc_now()
             if continuous:
                 bootstrap_profile = catalog.profile_for_target(9)
                 lifecycle = planner.plan(
@@ -226,7 +262,6 @@ def main(argv=None) -> int:
                     ),
                 )
                 session_date = lifecycle.target_session_date
-                first_cutoff = lifecycle.first_due_cutoff
             refresh_scope = (
                 not continuous
                 or cached_session_date != session_date
@@ -234,6 +269,8 @@ def main(argv=None) -> int:
                 or now >= next_scope_reconcile_at
             )
             if refresh_scope:
+                prior_session_date = cached_session_date
+                prior_scope = cached_scope
                 with provider.transaction(
                     APP_ROLE,
                     read_only=True,
@@ -251,10 +288,21 @@ def main(argv=None) -> int:
                         )
                     )
                 if continuous:
+                    scope_changed = (
+                        prior_session_date != session_date
+                        or prior_scope is None
+                        or scope is None
+                        or prior_scope["cohort_id"] != scope["cohort_id"]
+                        or prior_scope["plan_id"] != scope["plan_id"]
+                    )
                     cached_session_date = session_date
                     cached_scope = scope
-                    cached_windows = None
-                    cached_progress = None
+                    if scope_changed:
+                        cached_windows = None
+                        cached_progress = None
+                        first_cutoff = None
+                        next_progress_check_at = None
+                        pending_retry_not_before = None
                     next_scope_reconcile_at = (
                         now
                         + timedelta(
@@ -305,10 +353,8 @@ def main(argv=None) -> int:
                 refresh_progress = (
                     cached_progress is None
                     or refresh_scope
-                    or (
-                        first_cutoff is not None
-                        and first_cutoff <= now
-                    )
+                    or next_progress_check_at is None
+                    or now >= next_progress_check_at
                 )
                 if refresh_progress:
                     with provider.transaction(
@@ -342,6 +388,18 @@ def main(argv=None) -> int:
                     continue
                 first_cutoff = lifecycle.first_due_cutoff
                 drain_deadline = lifecycle.processing_deadline
+                if (
+                    pending_retry_not_before is not None
+                    and pending_retry_not_before <= now
+                ):
+                    pending_retry_not_before = None
+                next_progress_check_at = _next_progress_check(
+                    all_windows,
+                    first_cutoff=first_cutoff,
+                    now=now,
+                    retry_not_before=pending_retry_not_before,
+                    reconciliation_expires_at=next_scope_reconcile_at,
+                )
             own_first_cutoff = (
                 first_cutoff
                 if continuous or initial_session
@@ -456,8 +514,21 @@ def main(argv=None) -> int:
                         ),
                     )
                     if recovery.complete:
+                        next_progress_check_at = now
                         continue
                     if now < recovery.retry_not_before:
+                        pending_retry_not_before = (
+                            recovery.retry_not_before
+                            if pending_retry_not_before is None
+                            else min(
+                                pending_retry_not_before,
+                                recovery.retry_not_before,
+                            )
+                        )
+                        next_progress_check_at = min(
+                            next_progress_check_at,
+                            pending_retry_not_before,
+                        )
                         continue
                     if recovery.next_attempt > (
                         runtime_profile.settings
@@ -471,6 +542,9 @@ def main(argv=None) -> int:
                             next_action="OPERATOR_REVIEW",
                             last_discovered_cutoff=window.cutoff,
                             checked_at=now,
+                        )
+                        next_progress_check_at = (
+                            next_scope_reconcile_at
                         )
                         continue
                     retry = ensure_advanced_window_retry_cursor(
@@ -532,7 +606,7 @@ def main(argv=None) -> int:
                         unit.cursor,
                         cohort_id=scope["cohort_id"],
                         cutoff=window.cutoff,
-                        checked_at=datetime.now(timezone.utc),
+                        checked_at=utc_now(),
                         retry_initial_backoff_seconds=(
                             runtime_profile.settings
                             .scheduler_window_retry_initial_backoff_seconds
@@ -551,7 +625,7 @@ def main(argv=None) -> int:
                             if after.complete
                             else f"WINDOW_EXIT_{result}"
                         ),
-                        checked_at=datetime.now(timezone.utc),
+                        checked_at=utc_now(),
                     )
                     persist_advanced_scheduler_lifecycle_cursor(
                         unit.cursor,
@@ -564,8 +638,9 @@ def main(argv=None) -> int:
                         ),
                         next_action="DISCOVER_DUE_WINDOWS",
                         last_discovered_cutoff=window.cutoff,
-                        checked_at=datetime.now(timezone.utc),
+                        checked_at=utc_now(),
                     )
+                next_progress_check_at = now
             stop.wait(args.poll_seconds)
         return 0
     finally:

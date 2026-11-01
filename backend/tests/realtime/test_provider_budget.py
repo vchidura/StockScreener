@@ -14,6 +14,7 @@ from realtime.advanced_ingress_repository import (
 from realtime.provider_budget import (
     ProviderBudgetExceeded,
     ProviderBudgetScope,
+    account_provider_budget_status_cursor,
     provider_budget_status_cursor,
     reserve_coordinated_provider_request_cursor,
 )
@@ -170,6 +171,29 @@ def test_status_is_bound_to_the_exact_authorized_budget_scope():
         scope.session_date,
         scope.sha256,
     )
+
+
+def test_account_status_includes_all_coordinated_scopes_and_states():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (4, 3_500, 1, 1, 1, 1)
+
+    status = account_provider_budget_status_cursor(
+        cursor,
+        _scope(request_ceiling=10, decoded_byte_ceiling=10_000),
+    )
+
+    assert status.requests_reserved == 4
+    assert status.bytes_reserved == 3_500
+    assert (status.reserved, status.complete, status.failed, status.ambiguous) == (
+        1,
+        1,
+        1,
+        1,
+    )
+    query, parameters = cursor.execute.call_args.args
+    assert "budget_scope_sha256 IS NOT NULL" in query
+    assert "budget_scope_sha256=%s" not in query
+    assert parameters == ("MASSIVE_DEVELOPER", date(2026, 10, 16))
 
 
 def test_advanced_incremental_budget_exhaustion_blocks_before_reservation():

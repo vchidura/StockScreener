@@ -508,26 +508,40 @@ def persist_advanced_equity_control_plane_cursor(
         ),
     )
     for ticker, security_id in plan.security_ids:
-        cursor.execute(
-            "INSERT INTO rt.instruments (asset_class,security_id) "
-            "VALUES ('EQUITY',%s) ON CONFLICT DO NOTHING",
-            (str(security_id),),
+        instrument_id = ensure_equity_instrument_cursor(
+            cursor,
+            security_id,
         )
-        cursor.execute(
-            "SELECT instrument_id FROM rt.instruments "
-            "WHERE asset_class='EQUITY' AND security_id=%s",
-            (str(security_id),),
-        )
-        instrument = cursor.fetchone()
-        if instrument is None:
-            raise ValueError(
-                "Advanced control plane instrument is unavailable"
-            )
         cursor.execute(
             "INSERT INTO rt.subscription_members ("
             "manifest_id,instrument_id,channel,priority,purpose,"
             "option_underlying) VALUES (%s,%s,'AM',1,'PRIMARY',false) "
             "ON CONFLICT DO NOTHING",
-            (str(plan.manifest_id), int(instrument[0])),
+            (str(plan.manifest_id), instrument_id),
         )
     persist_tier_cohort_binding_cursor(cursor, plan.binding)
+
+
+def ensure_equity_instrument_cursor(
+    cursor,
+    security_id: UUID,
+) -> int:
+    if not isinstance(security_id, UUID) or security_id.int == 0:
+        raise ValueError("Equity instrument security identity is invalid")
+    cursor.execute(
+        "INSERT INTO rt.instruments (asset_class,security_id) "
+        "VALUES ('EQUITY',%s) ON CONFLICT DO NOTHING",
+        (str(security_id),),
+    )
+    cursor.execute(
+        "SELECT instrument_id FROM rt.instruments "
+        "WHERE asset_class='EQUITY' AND security_id=%s "
+        "ORDER BY instrument_id",
+        (str(security_id),),
+    )
+    rows = tuple(cursor.fetchall())
+    if len(rows) != 1:
+        raise ValueError(
+            "Advanced control plane instrument identity is ambiguous"
+        )
+    return int(rows[0][0])

@@ -237,25 +237,69 @@ class AdvancedIngressRuntimeCatalog:
         self,
         universe_target: int,
     ) -> AdvancedIngressRuntimeProfile:
+        if type(universe_target) is not int or not 1 <= universe_target <= 400:
+            raise ValueError("runtime profile target must be in [1, 400]")
         matches = tuple(
             profile
             for profile in self.profiles
             if profile.universe_target == universe_target
         )
-        if len(matches) != 1:
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
             raise ValueError(
-                "runtime profile catalog must contain exactly one target profile"
+                "runtime profile catalog contains duplicate target profiles"
             )
-        return matches[0]
+        capacity = next(
+            (
+                profile
+                for profile in self.profiles
+                if profile.universe_target >= universe_target
+            ),
+            None,
+        )
+        if capacity is None:
+            raise ValueError("runtime profile target exceeds reviewed capacity")
+        return AdvancedIngressRuntimeProfile(
+            version=(
+                f"{self.version}-exact-{universe_target}"
+                f"-capacity-{capacity.universe_target}"
+            ),
+            universe_target=universe_target,
+            provider_tier=capacity.provider_tier,
+            feed=capacity.feed,
+            channels=capacity.channels,
+            settings=capacity.settings,
+        )
+
+    def capacity_target_for(self, universe_target: int) -> int:
+        profile = self.profile_for_target(universe_target)
+        return next(
+            known.universe_target
+            for known in self.profiles
+            if known.settings == profile.settings
+            and known.universe_target >= universe_target
+        )
+
+    def promotion_ladder_for_target(
+        self,
+        universe_target: int,
+    ) -> tuple[int, ...]:
+        self.profile_for_target(universe_target)
+        return tuple(
+            target
+            for target in self.scale_policy.universe_ladder
+            if target < universe_target
+        ) + (universe_target,)
 
     def profile_for_sha(
         self,
         profile_sha256: str,
     ) -> AdvancedIngressRuntimeProfile:
         matches = tuple(
-            profile
-            for profile in self.profiles
-            if profile.sha256 == profile_sha256
+            self.profile_for_target(target)
+            for target in range(1, 401)
+            if self.profile_for_target(target).sha256 == profile_sha256
         )
         if len(matches) != 1:
             raise ValueError("runtime profile SHA is unavailable")

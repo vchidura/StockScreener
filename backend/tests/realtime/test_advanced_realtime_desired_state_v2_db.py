@@ -2,6 +2,7 @@ from datetime import date, datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
+from options.calendar import OptionExchangeCalendar
 
 from realtime.advanced_realtime_desired_state import (
     DesiredMemberIntent,
@@ -306,11 +307,23 @@ def test_after_close_default_revision_materializes_and_replays_exact_snapshot():
                 change,
                 observed_at=AFTER_CLOSE + timedelta(hours=2),
             )
+            activated = reconcile_desired_state(
+                connection,
+                result.revision.revision_id,
+                materialized_at=(
+                    OptionExchangeCalendar("XNYS").session_open(
+                        result.revision.effective_session_date
+                    )
+                    - timedelta(minutes=15)
+                ),
+            )
 
-            assert result.state == "READY"
+            assert result.state == "ACTIVATION_PENDING"
             assert result.revision.effective_session_date == date(2026, 11, 2)
-            assert result.snapshot is not None
-            assert replay.snapshot == result.snapshot
+            assert result.snapshot is None
+            assert replay.revision == result.revision
+            assert replay.snapshot is None
+            assert activated.snapshot is not None
             assert all(
                 row.status is MemberPreparationStatus.READY
                 for row in result.preparations
@@ -319,20 +332,20 @@ def test_after_close_default_revision_materializes_and_replays_exact_snapshot():
                 cursor.execute(
                     "SELECT stock_count,option_underlying_count,member_count "
                     "FROM rt.subscription_manifests WHERE manifest_id=%s",
-                    (str(result.snapshot.manifest_id),),
+                    (str(activated.snapshot.manifest_id),),
                 )
                 assert cursor.fetchone() == (9, 2, 9)
                 cursor.execute(
                     "SELECT primary_contract_count,reserve_contract_count "
                     "FROM rt.slot_set_versions "
                     "WHERE cohort_id=%s AND version=1",
-                    (str(result.snapshot.cohort_id),),
+                    (str(activated.snapshot.cohort_id),),
                 )
                 assert cursor.fetchone() == (4, 0)
                 cursor.execute(
                     "SELECT count(*) FROM rt.slot_set_members "
                     "WHERE cohort_id=%s AND version=1",
-                    (str(result.snapshot.cohort_id),),
+                    (str(activated.snapshot.cohort_id),),
                 )
                 assert cursor.fetchone()[0] == 8
                 cursor.execute(
@@ -374,7 +387,7 @@ def test_market_hours_change_defers_and_failed_new_member_preserves_active_snaps
                 observed_at=MARKET_HOURS,
             )
 
-            assert warming.state == "WARMING"
+            assert warming.state == "ACTIVATION_PENDING"
             assert warming.snapshot is None
             assert warming.revision.effective_session_date == date(2026, 11, 3)
             assert next(
@@ -391,10 +404,21 @@ def test_market_hours_change_defers_and_failed_new_member_preserves_active_snaps
                 reasons=("HISTORY_NOT_READY",),
                 checked_at=MARKET_HOURS + timedelta(minutes=1),
             )
-            ready = reconcile_desired_state(
+            pending = reconcile_desired_state(
                 connection,
                 warming.revision.revision_id,
                 materialized_at=MARKET_HOURS + timedelta(minutes=2),
+            )
+            assert pending.state == "ACTIVATION_PENDING"
+            ready = reconcile_desired_state(
+                connection,
+                warming.revision.revision_id,
+                materialized_at=(
+                    OptionExchangeCalendar("XNYS").session_open(
+                        warming.revision.effective_session_date
+                    )
+                    - timedelta(minutes=15)
+                ),
             )
 
             assert ready.state == "READY"
@@ -428,7 +452,7 @@ def test_market_hours_change_defers_and_failed_new_member_preserves_active_snaps
             pool.putconn(connection)
 
 
-def test_unknown_stored_identity_is_rejected_without_snapshot_or_source_change():
+def test_ambiguous_stored_identity_is_rejected_without_source_change():
     with disposable_v2_database(
         f"test_realtime_v2_c2_identity_{uuid4().hex[:8]}"
     ) as pool:
@@ -436,6 +460,37 @@ def test_unknown_stored_identity_is_rejected_without_snapshot_or_source_change()
         try:
             with connection.cursor() as cursor:
                 source_cohort_id, source_manifest_id = _seed_source(cursor)
+                for index in (1, 2):
+                    security_id = uuid5(
+                        NAMESPACE_URL,
+                        f"c4-ambiguous-zzzz:{index}",
+                    )
+                    cursor.execute(
+                        "INSERT INTO ref.securities ("
+                        "security_id,asset_type,source_origin,created_at"
+                        ") VALUES (%s,'STOCK','c4-ambiguous',%s)",
+                        (str(security_id), SOURCE_EFFECTIVE),
+                    )
+                    cursor.execute(
+                        "INSERT INTO ref.security_revisions ("
+                        "revision_id,security_id,ticker,exchange,"
+                        "calendar_id,effective_from,observed_at,"
+                        "payload_sha256,security_type,active"
+                        ") VALUES (%s,%s,'ZZZZ','XNYS','XNYS',"
+                        "%s,%s,%s,'CS',true)",
+                        (
+                            str(uuid4()),
+                            str(security_id),
+                            SOURCE_EFFECTIVE,
+                            SOURCE_EFFECTIVE,
+                            _digest(f"ambiguous-zzzz:{index}"),
+                        ),
+                    )
+                    cursor.execute(
+                        "INSERT INTO rt.instruments "
+                        "(asset_class,security_id) VALUES ('EQUITY',%s)",
+                        (str(security_id),),
+                    )
             connection.commit()
             change = DesiredStateChange(
                 source_cohort_id=source_cohort_id,

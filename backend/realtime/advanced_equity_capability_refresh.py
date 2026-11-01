@@ -5,6 +5,7 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Protocol
 from uuid import UUID
 
@@ -20,6 +21,10 @@ from .advanced_equity_control_plane import (
 from .advanced_gateway import (
     AdvancedGateway,
     GatewayConfiguration,
+)
+from .advanced_ingress_runtime_profile import (
+    AdvancedIngressRuntimeCatalog,
+    load_advanced_ingress_runtime_catalog,
 )
 from .advanced_realtime_desired_state import DesiredMemberKind
 from .advanced_realtime_desired_state_repository import (
@@ -297,6 +302,7 @@ def load_capability_refresh_request_cursor(
     refresh_before_seconds: int,
     evidence_validity_seconds: int = 86_400,
     calendar: OptionExchangeCalendar | None = None,
+    runtime_catalog: AdvancedIngressRuntimeCatalog | None = None,
 ) -> AdvancedCapabilityRefreshRequest | None:
     checked = _utc(checked_at, "capability refresh checked_at")
     if refresh_before_seconds < 0 or evidence_validity_seconds < 300:
@@ -315,12 +321,11 @@ def load_capability_refresh_request_cursor(
             DesiredMemberKind.SECTOR_ETF,
         }
     ))
-    if not tickers or set(tickers) != set(security_ids):
-        selected_security_ids = tuple(
-            (ticker, security_ids[ticker]) for ticker in tickers
-        )
-    else:
-        selected_security_ids = tuple(sorted(security_ids.items()))
+    if not tickers:
+        return None
+    if set(tickers) != set(security_ids):
+        return None
+    selected_security_ids = tuple(sorted(security_ids.items()))
     universe = UniverseManifest(
         version=f"advanced-equity-{len(tickers)}-am-v1",
         equity_tickers=tickers,
@@ -328,7 +333,8 @@ def load_capability_refresh_request_cursor(
     )
     cursor.execute(
         "SELECT manifest.profile_id::text,cohort.configuration_sha256,"
-        "profile.schema_sha256,profile.security_policy_sha256 "
+        "profile.schema_sha256,profile.security_policy_sha256,"
+        "manifest.stock_count "
         "FROM rt.cohorts AS cohort "
         "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
         "JOIN rt.capability_profiles AS profile USING(profile_id) "
@@ -340,6 +346,19 @@ def load_capability_refresh_request_cursor(
         raise ValueError(
             "capability refresh source control plane is unavailable"
         )
+    configuration_sha256 = str(source[1])
+    if len(tickers) != int(source[4]):
+        catalog = (
+            runtime_catalog
+            or load_advanced_ingress_runtime_catalog(
+                Path(__file__).resolve().parent
+                / "policies"
+                / "advanced_equity_ingress_v1.json"
+            )
+        )
+        configuration_sha256 = catalog.profile_for_target(
+            len(tickers)
+        ).configuration_sha256(catalog.scale_policy.sha256)
     exchange = calendar or OptionExchangeCalendar("XNYS")
     required_through = exchange.session_close(
         revision.effective_session_date
@@ -357,7 +376,7 @@ def load_capability_refresh_request_cursor(
         "AND status='PASS' "
         "ORDER BY expires_at DESC,checked_at DESC,profile_id DESC "
         "LIMIT 1",
-        (str(source[1]), universe.sha256),
+        (configuration_sha256, universe.sha256),
     )
     current = cursor.fetchone()
     current_profile_id = (
@@ -380,7 +399,7 @@ def load_capability_refresh_request_cursor(
         current_expires_at=current_expires_at,
         required_through=required_through,
         probe_not_before=probe_not_before,
-        configuration_sha256=str(source[1]),
+        configuration_sha256=configuration_sha256,
         schema_sha256=str(source[2]),
         security_policy_sha256=str(source[3]),
         requires_refresh=(

@@ -337,6 +337,49 @@ def test_native_clock_aligned_1h_bars_are_rejected():
         )
 
 
+def test_native_adjusted_daily_bar_uses_exact_exchange_session():
+    session = FakeSession([FakeResponse({"results": []})])
+    client = PolygonEquityClient("test-key", session=session)
+    provider_start = datetime(2026, 8, 28, 4, 0, tzinfo=UTC)
+
+    client.fetch_native_bars(
+        "AAPL",
+        "1d",
+        date(2026, 8, 28),
+        date(2026, 8, 28),
+        adjusted=True,
+    )
+    (daily,) = normalize_native_bars(
+        uuid4(),
+        "AAPL",
+        "1d",
+        [{
+            "t": int(provider_start.timestamp() * 1000),
+            "o": 100,
+            "h": 102,
+            "l": 99,
+            "c": 101,
+            "v": 5000,
+        }],
+        observed_at=datetime(2026, 8, 29, tzinfo=UTC),
+        adjusted=True,
+        availability_mode=(
+            BarAvailabilityMode.HISTORICAL_RECONSTRUCTED
+        ),
+    )
+
+    assert "/range/1/day/" in session.calls[0][0]
+    assert session.calls[0][1]["adjusted"] == "true"
+    assert daily.bar_start == datetime(
+        2026, 8, 28, 13, 30, tzinfo=UTC
+    )
+    assert daily.bar_end == datetime(
+        2026, 8, 28, 20, 0, tzinfo=UTC
+    )
+    assert daily.session_date == date(2026, 8, 28)
+    assert daily.adjusted is True
+
+
 def test_native_monthly_bar_waits_for_final_exchange_session_close():
     row = {
         "t": int(datetime(2026, 8, 1, 4, 0, tzinfo=UTC).timestamp() * 1000),

@@ -245,6 +245,111 @@ def test_dedicated_routes_reject_unreviewed_ticker_and_expose_no_fallback():
     with pytest.raises(HTTPException) as error:
         _endpoint(app, "/api/realtime/tickers/{ticker}")("META")
     assert error.value.status_code == 422
+
+
+def test_warming_desired_ticker_exposes_partial_stored_coverage():
+    preparation = MagicMock()
+    preparation.read.return_value = {
+        "members": [{
+            "ticker": "XLK",
+            "readiness": "WARMING",
+            "available_intervals": {"1d:ADJUSTED": 120},
+            "stages": [{"stage": "ADJUSTED_DAILY", "status": "PENDING"}],
+        }],
+        "active_snapshot": {"cohort_id": str(uuid4())},
+        "provider_fetch_performed": False,
+    }
+    repositories = replace(
+        _repositories(),
+        equity_preparation=preparation,
+    )
+    app = create_realtime_portal_app(
+        repositories,
+        clock=lambda: NOW,
+    )
+
+    result = _endpoint(
+        app,
+        "/api/realtime/tickers/{ticker}",
+    )("XLK")
+
+    assert result["payload"]["ticker"] == "XLK"
+    assert result["is_serveable"] is False
+    assert result["available_intervals"] == {"1d:ADJUSTED": 120}
+    assert result["preparation"]["readiness"] == "WARMING"
+    preparation.read.assert_called_once_with(
+        active_on=NOW.date(),
+        ticker="XLK",
+    )
+
+
+def test_equity_preparation_route_reads_stored_status_only():
+    preparation = MagicMock()
+    preparation.read.return_value = {
+        "members": [],
+        "provider_fetch_performed": False,
+    }
+    app = create_realtime_portal_app(
+        replace(
+            _repositories(),
+            equity_preparation=preparation,
+        ),
+        clock=lambda: NOW,
+    )
+
+    result = _endpoint(
+        app,
+        "/api/realtime/equity-preparation",
+    )()
+
+    assert result["provider_fetch_performed"] is False
+    preparation.read.assert_called_once_with(
+        active_on=NOW.date(),
+        ticker=None,
+    )
+
+
+def test_ready_non_target9_member_exposes_required_c7_handoff():
+    preparation = MagicMock()
+    preparation.read.return_value = {
+        "members": [{
+            "ticker": "XLK",
+            "readiness": "READY",
+            "publication_state": (
+                "PREPARATION_ONLY_READY_AWAITING_C7"
+            ),
+            "c7_handoff_required": True,
+            "stored_availability": [{
+                "interval": "1d",
+                "count": 283,
+            }],
+        }],
+        "c7_handoff": {
+            "contract": "advanced-equity-c7-handoff-v1",
+            "status": "REQUIRED",
+            "members": ["XLK"],
+            "owner": "C7_CANONICAL_RELEASE_MERGE",
+        },
+        "provider_fetch_performed": False,
+    }
+    app = create_realtime_portal_app(
+        replace(
+            _repositories(),
+            equity_preparation=preparation,
+        ),
+        clock=lambda: NOW,
+    )
+
+    result = _endpoint(
+        app,
+        "/api/realtime/equity-preparation",
+    )()
+
+    assert result["c7_handoff"]["status"] == "REQUIRED"
+    assert result["members"][0]["publication_state"] == (
+        "PREPARATION_ONLY_READY_AWAITING_C7"
+    )
+    assert result["provider_fetch_performed"] is False
     health = _endpoint(app, "/api/realtime/health")()
     assert health == {
         "status": "READY",

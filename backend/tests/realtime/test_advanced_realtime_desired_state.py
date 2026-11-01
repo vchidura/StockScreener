@@ -368,18 +368,33 @@ def test_c2_preparation_uses_bounded_statements_for_400_names(monkeypatch):
         ),
     )
 
+    persist_cursor = MagicMock()
+    persist_cursor.fetchall.return_value = [
+        (
+            str(security_ids[ticker]),
+            str(uuid5(NAMESPACE_URL, f"c2-bounded-revision:{ticker}")),
+        )
+        for ticker in tickers
+    ]
     repository._persist_desired_members_cursor(
-        object(),
+        persist_cursor,
         revision,
         security_ids=security_ids,
+        instrument_ids={
+            ticker: index + 1
+            for index, ticker in enumerate(tickers)
+        },
         source_base=set(security_ids.values()),
         source_underlyings=set(),
         ready_option_securities=set(),
         checked_at=observed_at,
     )
 
-    assert len(batches) == 2
+    assert len(batches) == 5
     assert [len(values) for _statement, values, _page_size in batches] == [
+        400,
+        400,
+        400,
         400,
         400,
     ]

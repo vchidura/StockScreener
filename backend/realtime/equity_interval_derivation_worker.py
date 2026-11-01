@@ -55,7 +55,7 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _load_current_five_minute_facts(
+def load_current_five_minute_facts_cursor(
     cursor,
     *,
     cohort_id: UUID,
@@ -122,6 +122,21 @@ def _load_current_five_minute_facts(
     )
 
 
+def load_derivation_security_cursor(
+    cursor,
+    *,
+    instrument_id: int,
+    window_end: datetime,
+    as_of: datetime,
+):
+    return _load_finalizer_security_cursor(
+        cursor,
+        instrument_id=instrument_id,
+        window_end=window_end,
+        as_of=as_of,
+    )
+
+
 def _output_fact(
     fact: RealtimeEquityBarFact,
     *,
@@ -165,7 +180,7 @@ def enqueue_interval_derivation_jobs_cursor(
         raise ValueError("derivation job scope is invalid")
     jobs = []
     for instrument_id in sorted(instrument_ids):
-        sources = _load_current_five_minute_facts(
+        sources = load_current_five_minute_facts_cursor(
             cursor,
             cohort_id=cohort_id,
             instrument_id=instrument_id,
@@ -254,7 +269,7 @@ def prepare_interval_derivation_output(
         source = cursor.fetchone()
         if source is None:
             raise ValueError("derivation job source revision is unavailable")
-        sources = _load_current_five_minute_facts(
+        sources = load_current_five_minute_facts_cursor(
             cursor,
             cohort_id=job.cohort_id,
             instrument_id=job.instrument_id,

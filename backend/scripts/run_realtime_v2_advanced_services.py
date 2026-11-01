@@ -241,6 +241,20 @@ def build_commands(args):
             "stocks_realtime_v2",
             "--execute",
         ],
+        "preparation": [
+            str(PYTHON),
+            "-B",
+            str(
+                BACKEND_DIR
+                / "scripts"
+                / "run_realtime_v2_advanced_equity_preparation.py"
+            ),
+            "--database",
+            "stocks_realtime_v2",
+            "--confirm-database-name",
+            "stocks_realtime_v2",
+            "--execute",
+        ],
         "ingress": [
             str(PYTHON),
             "-B",
@@ -283,6 +297,7 @@ def build_commands(args):
     }
     if args.runtime_mode == "legacy-diagnostic":
         commands.pop("capability-refresh")
+        commands.pop("preparation")
         controller_scope = (
             commands["controller"].index("--runtime-mode") + 2
         )
@@ -330,6 +345,10 @@ def process_environment(
             "REALTIME_V2_APP_DSN",
         },
         "capability-refresh": {
+            "POLYGON_API_KEY",
+            "REALTIME_V2_APP_DSN",
+        },
+        "preparation": {
             "POLYGON_API_KEY",
             "REALTIME_V2_APP_DSN",
         },
@@ -409,6 +428,7 @@ def main(argv=None):
     try:
         for name in (
             "capability-refresh",
+            "preparation",
             "controller",
             "ingress",
             "bridge",

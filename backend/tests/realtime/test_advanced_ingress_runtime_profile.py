@@ -1,6 +1,8 @@
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from realtime.advanced_ingress_runtime_profile import (
     load_advanced_ingress_runtime_catalog,
 )
@@ -27,6 +29,41 @@ def test_runtime_catalog_exactly_covers_the_versioned_ladder():
         profile.universe_target for profile in catalog.profiles
     ) == catalog.scale_policy.universe_ladder
     assert len({profile.sha256 for profile in catalog.profiles}) == 7
+
+
+@pytest.mark.parametrize(
+    ("target", "capacity_target", "promotion_ladder"),
+    (
+        (10, 25, (1, 9, 10)),
+        (37, 50, (1, 9, 25, 37)),
+        (399, 400, (1, 9, 25, 50, 100, 200, 399)),
+    ),
+)
+def test_non_ladder_targets_use_exact_identity_and_reviewed_capacity_settings(
+    target,
+    capacity_target,
+    promotion_ladder,
+):
+    catalog = load_advanced_ingress_runtime_catalog(POLICY)
+
+    profile = catalog.profile_for_target(target)
+    capacity = catalog.profile_for_target(capacity_target)
+
+    assert profile.universe_target == target
+    assert profile.settings == capacity.settings
+    assert profile.sha256 != capacity.sha256
+    assert catalog.capacity_target_for(target) == capacity_target
+    assert catalog.promotion_ladder_for_target(target) == promotion_ladder
+    assert catalog.profile_for_sha(profile.sha256) == profile
+
+
+def test_known_capacity_profiles_keep_their_reviewed_identities():
+    catalog = load_advanced_ingress_runtime_catalog(POLICY)
+
+    assert tuple(
+        catalog.profile_for_target(target)
+        for target in (1, 9, 25, 50, 100, 200, 400)
+    ) == catalog.profiles
 
 
 def test_profile_sha_contains_behavior_but_no_operational_scope():

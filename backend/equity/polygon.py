@@ -35,6 +35,7 @@ _ALLOWED_API_HOSTS = REST_HOSTS
 _INTRADAY_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30}
 _NATIVE_AGGREGATES = {
     **{interval: (minutes, "minute") for interval, minutes in _INTRADAY_MINUTES.items()},
+    "1d": (1, "day"),
     "1wk": (1, "week"),
     "1mo": (1, "month"),
 }
@@ -573,7 +574,20 @@ def normalize_native_bars(
     results: list[EquityBarRevision] = []
     for row in rows:
         provider_start = pd.Timestamp(row["t"], unit="ms", tz="UTC")
-        if interval in {"1wk", "1mo"}:
+        if interval == "1d":
+            provider_date = provider_start.tz_convert(
+                "America/New_York"
+            ).date()
+            session_date = pd.Timestamp(provider_date)
+            if not calendar.is_session(session_date):
+                continue
+            start = calendar.session_open(
+                session_date
+            ).to_pydatetime().astimezone(timezone.utc)
+            end = calendar.session_close(
+                session_date
+            ).to_pydatetime().astimezone(timezone.utc)
+        elif interval in {"1wk", "1mo"}:
             provider_date = provider_start.tz_convert("America/New_York").date()
             if interval == "1wk":
                 if provider_date.weekday() == 6:
@@ -617,7 +631,7 @@ def normalize_native_bars(
             continue
         if not calendar.is_session(session_date):
             continue
-        if interval not in {"1wk", "1mo"}:
+        if interval not in {"1d", "1wk", "1mo"}:
             session_open = calendar.session_open(session_date).to_pydatetime().astimezone(timezone.utc)
             session_close = calendar.session_close(session_date).to_pydatetime().astimezone(timezone.utc)
             if start < session_open or end > session_close:

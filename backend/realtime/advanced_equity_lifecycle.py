@@ -230,6 +230,7 @@ def load_or_roll_effective_desired_session_cursor(
     target_session_date: date,
     checked_at: datetime,
     calendar: OptionExchangeCalendar | None = None,
+    allow_partial_activation: bool = False,
 ) -> EffectiveDesiredSession:
     checked = _utc(checked_at, "desired session checked_at")
     exchange = calendar or OptionExchangeCalendar("XNYS")
@@ -244,6 +245,7 @@ def load_or_roll_effective_desired_session_cursor(
         revision.revision_id,
         materialized_at=checked,
         calendar=exchange,
+        allow_partial_activation=allow_partial_activation,
     )
     if effective.state != "READY" or effective.snapshot is None:
         reasons = ",".join(effective.reason_codes)

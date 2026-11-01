@@ -70,6 +70,7 @@ from realtime.advanced_ingress_repository import (  # noqa: E402
     load_advanced_ingress_runtime_plan_cursor,
     load_advanced_stream_authorization_cursor,
     prepare_advanced_ingress_plan_cursor,
+    ensure_exact_advanced_runtime_profile_cursor,
     resolve_advanced_ingress_plan_cursor,
 )
 from realtime.advanced_ingress_runtime_profile import (  # noqa: E402
@@ -114,6 +115,10 @@ ACTIVE_EXTERNAL_INGRESS_STATUSES = frozenset({
     "LIVE",
     "BACKOFF",
 })
+
+
+class AdvancedSessionActivationPending(RuntimeError):
+    pass
 
 
 def _now() -> datetime:
@@ -811,11 +816,42 @@ def _prepare_continuous_session_cursor(
     session_date,
     checked_at,
 ):
+    exchange = calendar or OptionExchangeCalendar("XNYS")
+    intended = load_effective_desired_state_reconciliation_cursor(
+        cursor,
+        session_date=session_date,
+    )
+    if intended is None:
+        raise ValueError(
+            "Advanced realtime desired intent is unavailable"
+        )
+    intended_target = len({
+        member.ticker
+        for member in intended.revision.members
+        if member.enabled
+        and member.kind.value in {"EQUITY", "SECTOR_ETF"}
+    })
+    activation_profile = catalog.profile_for_target(
+        intended_target
+    )
+    activation_at = exchange.session_open(
+        session_date
+    ) - timedelta(
+        seconds=(
+            activation_profile.settings.controller_warmup_seconds
+        )
+    )
+    if checked_at < activation_at:
+        raise AdvancedSessionActivationPending(
+            "SESSION_ACTIVATION_PENDING:"
+            f"{activation_at.isoformat()}"
+        )
     desired = load_or_roll_effective_desired_session_cursor(
         cursor,
         target_session_date=session_date,
         checked_at=checked_at,
-        calendar=calendar,
+        calendar=exchange,
+        allow_partial_activation=True,
     )
     plan = load_pinned_advanced_ingress_plan_cursor(
         cursor,
@@ -824,6 +860,12 @@ def _prepare_continuous_session_cursor(
         session_date=session_date,
     )
     if plan is None:
+        ensure_exact_advanced_runtime_profile_cursor(
+            cursor,
+            catalog,
+            universe_target=desired.equity_member_count,
+            activated_at=checked_at,
+        )
         budgets = _continuous_session_budgets(
             args,
             desired.equity_member_count,
@@ -834,9 +876,11 @@ def _prepare_continuous_session_cursor(
             budgets=budgets,
             runtime_policy_sha256=catalog.scale_policy.sha256,
             promotion_ladder=(
-                catalog.scale_policy.universe_ladder
+                catalog.promotion_ladder_for_target(
+                    desired.equity_member_count
+                )
             ),
-            calendar=calendar,
+            calendar=exchange,
         )
         plan = resolve_advanced_ingress_plan_cursor(
             cursor,
@@ -852,7 +896,7 @@ def _prepare_continuous_session_cursor(
                 ),
             ),
             runtime_catalog=catalog,
-            calendar=calendar,
+            calendar=exchange,
         )
     runtime_profile = catalog.profile_for_sha(
         plan.runtime_profile_sha256
@@ -1724,17 +1768,6 @@ def main(argv=None) -> int:
                                     checked_at=now,
                                     calendar=calendar,
                                 )
-                            with provider.transaction(APP_ROLE) as unit:
-                                _prepare_continuous_session_cursor(
-                                    unit.cursor,
-                                    args=args,
-                                    catalog=catalog,
-                                    calendar=calendar,
-                                    session_date=(
-                                        lifecycle.preparation_session_date
-                                    ),
-                                    checked_at=now,
-                                )
                             last_preparation_error = None
                         except (
                             AdvancedCohortResolutionError,
@@ -1767,7 +1800,11 @@ def main(argv=None) -> int:
                             seconds=args.lifecycle_reconcile_seconds
                         )
                     )
-                except (AdvancedCohortResolutionError, ValueError) as error:
+                except (
+                    AdvancedCohortResolutionError,
+                    AdvancedSessionActivationPending,
+                    ValueError,
+                ) as error:
                     detail = str(error)
                     if detail != last_reconcile_error:
                         print(
