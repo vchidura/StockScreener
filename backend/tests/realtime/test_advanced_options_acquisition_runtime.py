@@ -4,6 +4,7 @@ import json
 import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
@@ -42,6 +43,10 @@ from realtime.contracts import (
     canonical_sha256,
 )
 from realtime.normalizer import InstrumentAdmission
+from realtime.advanced_options_selection_c6 import (
+    C6SelectionPlan,
+    C6SubscriptionShard,
+)
 from scripts.run_advanced_options_v3_acquisition import (
     _FixtureConnection,
 )
@@ -173,6 +178,78 @@ class _Transaction:
 class _Provider:
     def transaction(self, *_args, **_kwargs):
         return _Transaction()
+
+
+def test_catalog_scope_uses_persisted_logical_shards():
+    binding = _binding()
+    physical_id = UUID(
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    )
+    shards = tuple(
+        C6SubscriptionShard(
+            shard_id=UUID(
+                f"00000000-0000-0000-0000-00000000000{index + 1}"
+            ),
+            shard_slot=index + 1,
+            physical_subscription_id=physical_id,
+            contract_tickers=tuple(
+                binding.contract_tickers[index * 2:index * 2 + 2]
+            ),
+            member_sha256=canonical_sha256({
+                "contract_tickers": tuple(
+                    binding.contract_tickers[
+                        index * 2:index * 2 + 2
+                    ]
+                ),
+            }),
+        )
+        for index in range(2)
+    )
+    plan = C6SelectionPlan.__new__(C6SelectionPlan)
+    object.__setattr__(plan, "shards", shards)
+    rows = [
+        {
+            "contract_ticker": ticker,
+            "underlying_security_id": str(UUID(int=index + 1)),
+            "version_id": 100 + index,
+            "instrument_id": 200 + index,
+        }
+        for index, ticker in enumerate(binding.contract_tickers)
+    ]
+
+    class _Cursor:
+        def execute(self, *_args, **_kwargs):
+            return None
+
+        def fetchall(self):
+            return rows
+
+    class _CatalogTransaction:
+        def __enter__(self):
+            return SimpleNamespace(cursor=_Cursor())
+
+        def __exit__(self, *_args):
+            return False
+
+    class _CatalogProvider:
+        def transaction(self, *_args, **_kwargs):
+            return _CatalogTransaction()
+
+    admissions, _manifest = runtime._catalog_scope(
+        _CatalogProvider(),
+        binding,
+        plan,
+    )
+
+    assert {
+        ticker: admission.shard_id
+        for ticker, admission in admissions.items()
+    } == {
+        binding.contract_tickers[0]: 0,
+        binding.contract_tickers[1]: 0,
+        binding.contract_tickers[2]: 1,
+        binding.contract_tickers[3]: 1,
+    }
 
 
 class _DisconnectConnection:

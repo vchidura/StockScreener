@@ -141,6 +141,8 @@ def test_activate_session_cli_dispatches_postgres_state(
         str(paths[2]),
         "--sealed-selection",
         str(paths[3]),
+        "--maximum-contracts-per-logical-shard",
+        "100",
         "--execute",
     ]) == 0
 

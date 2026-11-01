@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -30,8 +31,16 @@ from .advanced_journal_registry import (
     update_advanced_journal_offsets_cursor,
 )
 from .advanced_options_consumers import (
+    AdvancedOptionsBoundedDetectorRouter,
     AdvancedOptionsMarketStateConsumer,
+    load_advanced_options_detector_routing_state_cursor,
+    load_advanced_options_market_state_cursor,
+    persist_advanced_options_detector_routing_state_cursor,
     persist_advanced_options_market_state_slice_cursor,
+)
+from .advanced_options_activity_momentum_c6 import (
+    ACTIVITY_MOMENTUM_PROFILE_VERSION,
+    activity_momentum_allocation_from_payload,
 )
 from .advanced_options_control_plane import (
     CANONICAL_MARKET_STATE_OWNER,
@@ -71,6 +80,15 @@ from .advanced_options_v3_deployment import (
 )
 from .advanced_options_service import AdvancedOptionsProcessKind
 from .advanced_options_service import AdvancedOptionsPostgresLeasePort
+from .advanced_options_selection_c6 import (
+    C6ConsumerState,
+    C6SelectionPlan,
+    C6ShardState,
+    C6SubscriptionShard,
+    persist_c6_consumer_state_cursor,
+    persist_c6_physical_subscription_state_cursor,
+    persist_c6_shard_state_cursor,
+)
 from .buffer import BufferLimits, RawMessageBuffer
 from .contracts import (
     AssetClass,
@@ -91,6 +109,7 @@ from .journal import RawJournalReader
 from .migrations import EXPECTED_V2_DATABASE_NAME
 from .normalizer import InstrumentAdmission, NORMALIZER_VERSION
 from .option_flow.conditions import load_default_live_semantics
+from .option_flow.checkpoint_state import shard_map_sha256
 from .option_flow.consumer import ConsumerLimits
 from .option_flow.volume import BaselineKind
 from .option_source_flow import (
@@ -162,9 +181,11 @@ def _snapshot_v3_resident_windows(
     owner_epoch: int,
     reader: RawJournalReader,
     raw_offset: int,
-    event_offset: int,
+    normalized_offset: int,
+    flow_checkpoint_offset: int | None = None,
     connection_attempts: int = 1,
     shard_map_sha256_value: str | None = None,
+    shard_ids_value: tuple[int, ...] | None = None,
     evidence_ref: str | None = None,
 ) -> int:
     if (
@@ -194,7 +215,7 @@ def _snapshot_v3_resident_windows(
         if member is ResidentCompletionMember.INGRESS:
             ready = (
                 raw_offset >= target_raw
-                and event_offset >= target_event
+                and normalized_offset >= target_event
             )
             evidence = {
                 "status": "COMPLETE",
@@ -206,8 +227,11 @@ def _snapshot_v3_resident_windows(
             }
             ending_offset = target_event
         elif member is ResidentCompletionMember.MARKET_STATE:
-            ready = event_offset >= target_event
-            if shard_map_sha256_value is None:
+            ready = normalized_offset >= target_event
+            if (
+                shard_map_sha256_value is None
+                or shard_ids_value is None
+            ):
                 raise RuntimeError(
                     "V3 market-state snapshot lacks shard identity"
                 )
@@ -223,15 +247,22 @@ def _snapshot_v3_resident_windows(
                     "normalized_end_offset": target_event,
                 }),
                 "shard_map_sha256": shard_map_sha256_value,
+                "shard_ids": list(shard_ids_value),
                 "effects": dict(_EFFECTS),
             }
             ending_offset = target_event
         else:
             ready = (
                 raw_offset >= target_raw
-                and event_offset >= target_raw
+                and normalized_offset >= target_event
+                and flow_checkpoint_offset is not None
+                and flow_checkpoint_offset >= target_raw
             )
-            if evidence_ref is None:
+            if (
+                evidence_ref is None
+                or shard_map_sha256_value is None
+                or shard_ids_value is None
+            ):
                 raise RuntimeError(
                     "V3 flow snapshot lacks durable evidence"
                 )
@@ -239,12 +270,15 @@ def _snapshot_v3_resident_windows(
                 "status": "COMPLETE",
                 "kind": member.value,
                 "raw_end_offset": target_raw,
+                "normalized_end_offset": target_event,
                 "checkpoint_end_offset": target_raw,
                 "owner_epoch": owner_epoch,
                 "evidence_ref": (
                     f"{evidence_ref}:window:{target.target_window_id}:"
-                    f"{target_raw}"
+                    f"{target_raw}:{target_event}"
                 ),
+                "shard_map_sha256": shard_map_sha256_value,
+                "shard_ids": list(shard_ids_value),
                 "effects": dict(_EFFECTS),
             }
             ending_offset = target_raw
@@ -558,6 +592,7 @@ def _run_v3_acquisition_observer(
         or acquisition.contract_tickers != contracts
     ):
         raise RuntimeError("V3 acquisition/downstream identity changed")
+    selection_plan = _selection_plan(session_state)
     _owner_id, owner_epoch = _lease(
         provider,
         bundle,
@@ -574,7 +609,7 @@ def _run_v3_acquisition_observer(
         stop_event.wait(0.1)
     if not path.is_file():
         raise RuntimeError("V3 acquisition journal is unavailable")
-    shard_map = _shard_map(binding)
+    shard_map = _shard_map(binding, selection_plan)
     registration = _registration(
         provider,
         acquisition.authority.journal_generation,
@@ -591,7 +626,7 @@ def _run_v3_acquisition_observer(
             session_date=control.session_date,
             owner_epoch=owner_epoch,
             normalizer_version=NORMALIZER_VERSION,
-            shard_ids=(0,),
+            shard_ids=tuple(range(shard_map.shard_count)),
             shard_map_sha256=shard_map.sha256,
         )
         with provider.transaction(APP_ROLE) as unit:
@@ -601,6 +636,14 @@ def _run_v3_acquisition_observer(
                 registration.journal_generation,
                 checked_at=datetime.now(UTC),
             )
+    elif (
+        registration.shard_ids
+        != tuple(range(shard_map.shard_count))
+        or registration.shard_map_sha256 != shard_map.sha256
+    ):
+        raise RuntimeError(
+            "V3 acquisition journal logical shard registration changed"
+        )
     status_path = Path(str(environment.get(
         "REALTIME_V3_OPTIONS_ACQUISITION_STATUS_PATH",
         "/var/lib/realtime-v2-reports/options-acquisition-status.json",
@@ -608,6 +651,7 @@ def _run_v3_acquisition_observer(
     last_raw_offset = 0
     last_event_offset = 0
     connection_attempts = 0
+    last_physical_signature = None
     while not stop_event.is_set():
         try:
             status = json.loads(status_path.read_text(encoding="utf-8"))
@@ -629,6 +673,20 @@ def _run_v3_acquisition_observer(
         connection_attempts = int(
             status.get("connection_attempts", 0)
         )
+        decoded_messages = int(status.get("decoded_messages", 0))
+        decoded_bytes = int(status.get("decoded_bytes", 0))
+        transport_gaps = tuple(
+            dict(row)
+            for row in (status.get("transport_gaps") or ())
+        )
+        physical_signature = canonical_sha256({
+            "state": status.get("state"),
+            "decoded_messages": decoded_messages,
+            "decoded_bytes": decoded_bytes,
+            "connection_attempts": connection_attempts,
+            "transport_gaps": transport_gaps,
+        })
+        observed_at = datetime.now(UTC)
         with provider.transaction(APP_ROLE) as unit:
             update_advanced_journal_offsets_cursor(
                 unit.cursor,
@@ -636,8 +694,38 @@ def _run_v3_acquisition_observer(
                 raw_committed_offset=last_raw_offset,
                 normalized_committed_offset=last_event_offset,
                 bridge_committed_offset=None,
-                checked_at=datetime.now(UTC),
+                checked_at=observed_at,
             )
+            if (
+                selection_plan is not None
+                and physical_signature != last_physical_signature
+            ):
+                persist_c6_physical_subscription_state_cursor(
+                    unit.cursor,
+                    selection_generation_id=(
+                        selection_plan.generation_id
+                    ),
+                    subscription_id=(
+                        selection_plan
+                        .physical_subscription
+                        .subscription_id
+                    ),
+                    state=(
+                        C6ShardState.READY
+                        if status.get("state") == "COMPLETE"
+                        else C6ShardState.WARMING
+                    ),
+                    message_count=decoded_messages,
+                    byte_count=decoded_bytes,
+                    reconnect_count=max(
+                        len(transport_gaps),
+                        connection_attempts - 1,
+                    ),
+                    gaps=transport_gaps,
+                    reason_codes=(),
+                    observed_at=observed_at,
+                )
+                last_physical_signature = physical_signature
         if last_raw_offset > 0 and last_event_offset > 0:
             _snapshot_v3_resident_windows(
                 provider,
@@ -647,7 +735,7 @@ def _run_v3_acquisition_observer(
                 owner_epoch=owner_epoch,
                 reader=RawJournalReader(path),
                 raw_offset=last_raw_offset,
-                event_offset=last_event_offset,
+                normalized_offset=last_event_offset,
                 connection_attempts=connection_attempts,
             )
         if status.get("state") == "COMPLETE":
@@ -719,29 +807,173 @@ def _manifest(binding):
     )
 
 
-def _admissions(binding):
+@dataclass(frozen=True, slots=True)
+class _C6ShardLayout:
+    shard_map: MaterializerShardMap
+    persistent_shards: tuple[C6SubscriptionShard, ...]
+
+
+def _selection_plan(session_state) -> C6SelectionPlan | None:
+    if session_state is None:
+        return None
+    loader = getattr(session_state, "load_c6_selection_plan", None)
+    if not callable(loader):
+        return None
+    plan = loader()
+    if plan is not None and not isinstance(plan, C6SelectionPlan):
+        raise TypeError("C6 session selection plan is invalid")
+    return plan
+
+
+def _shard_layout(binding, selection_plan=None) -> _C6ShardLayout:
+    contracts = tuple(
+        binding.enrollment.activity_selection.contracts
+    )
+    if selection_plan is None:
+        return _C6ShardLayout(
+            MaterializerShardMap(
+                "advanced-options-p8-market-state-v1",
+                1,
+                tuple((row.instrument_id, 0) for row in contracts),
+            ),
+            (),
+        )
+    selected_tickers = {
+        row.contract_ticker for row in contracts
+    }
+    if selected_tickers != {
+        row.contract_ticker for row in selection_plan.members
+    }:
+        raise ValueError(
+            "C6 logical shard membership diverges from enrollment"
+        )
+    shards = tuple(sorted(
+        selection_plan.shards,
+        key=lambda row: row.shard_slot,
+    ))
+    shard_index_by_ticker = {
+        ticker: index
+        for index, shard in enumerate(shards)
+        for ticker in shard.contract_tickers
+    }
+    if set(shard_index_by_ticker) != selected_tickers:
+        raise ValueError("C6 logical shard routing is incomplete")
+    return _C6ShardLayout(
+        MaterializerShardMap(
+            "advanced-options-c6-logical-shards-v1",
+            len(shards),
+            tuple(
+                (
+                    row.instrument_id,
+                    shard_index_by_ticker[row.contract_ticker],
+                )
+                for row in contracts
+            ),
+        ),
+        shards,
+    )
+
+
+def _admissions(binding, selection_plan=None):
+    shard_map = _shard_layout(binding, selection_plan).shard_map
     return {
         row.contract_ticker: InstrumentAdmission(
             row.instrument_id,
             row.contract_ticker,
             row.underlyer,
             AssetClass.OPTION,
-            0,
+            shard_map.shard_for(row.instrument_id),
         )
         for row in binding.enrollment.activity_selection.contracts
     }
 
 
-def _shard_map(binding):
-    members = tuple(
-        (row.instrument_id, 0)
-        for row in binding.enrollment.activity_selection.contracts
+def _shard_map(binding, selection_plan=None):
+    return _shard_layout(binding, selection_plan).shard_map
+
+
+def _source_timestamp_ns(value, unit):
+    multipliers = {
+        "s": 1_000_000_000,
+        "SECOND": 1_000_000_000,
+        "ms": 1_000_000,
+        "MILLISECOND": 1_000_000,
+        "us": 1_000,
+        "MICROSECOND": 1_000,
+        "ns": 1,
+        "NANOSECOND": 1,
+    }
+    multiplier = multipliers.get(str(unit))
+    return (
+        None
+        if type(value) is not int or multiplier is None
+        else value * multiplier
     )
-    return MaterializerShardMap(
-        "advanced-options-p8-market-state-v1",
-        1,
-        members,
-    )
+
+
+def _persist_c6_market_progress_cursor(
+    cursor,
+    *,
+    selection_plan,
+    layout,
+    planned,
+    state,
+    observed_at,
+):
+    if selection_plan is None:
+        return
+    for materialized, checkpoint in zip(
+        planned.states,
+        planned.checkpoints,
+    ):
+        shard = layout.persistent_shards[materialized.shard_id]
+        events = (
+            *materialized.quotes,
+            *materialized.trades,
+        )
+        event_times = tuple(row.event_at for row in events)
+        watermarks = tuple(
+            value
+            for value in (
+                _source_timestamp_ns(
+                    row.source_timestamp,
+                    row.source_timestamp_unit,
+                )
+                for row in events
+            )
+            if value is not None
+        )
+        persist_c6_shard_state_cursor(
+            cursor,
+            selection_generation_id=selection_plan.generation_id,
+            shard_id=shard.shard_id,
+            state=state,
+            message_count=checkpoint.committed_offset,
+            byte_count=0,
+            reason_codes=(),
+            observed_at=observed_at,
+        )
+        persist_c6_consumer_state_cursor(
+            cursor,
+            selection_generation_id=selection_plan.generation_id,
+            shard_id=shard.shard_id,
+            state=C6ConsumerState(
+                consumer_name=CANONICAL_MARKET_STATE_OWNER,
+                state_version=planned.shard_map.sha256,
+                committed_offset=checkpoint.committed_offset,
+                event_watermark_ns=(
+                    None if not watermarks else max(watermarks)
+                ),
+                history_start=(
+                    None if not event_times else min(event_times)
+                ),
+                history_end=(
+                    None if not event_times else max(event_times)
+                ),
+                missing_feed_states=(),
+                updated_at=observed_at,
+            ),
+        )
 
 
 def _run_ingress(
@@ -821,7 +1053,7 @@ def _run_ingress(
             owner_epoch=owner_epoch,
             reader=RawJournalReader(path),
             raw_offset=value.last_raw_offset,
-            event_offset=value.last_event_offset,
+            normalized_offset=value.last_event_offset,
             connection_attempts=attempts_state[0],
         )
 
@@ -925,7 +1157,7 @@ def _run_ingress(
                         owner_epoch=owner_epoch,
                         reader=RawJournalReader(path),
                         raw_offset=value.last_raw_offset,
-                        event_offset=value.last_event_offset,
+                        normalized_offset=value.last_event_offset,
                         connection_attempts=max(1, attempts),
                     )
                 await asyncio.sleep(0.1)
@@ -977,7 +1209,7 @@ def _run_ingress(
             owner_epoch=owner_epoch,
             reader=RawJournalReader(path),
             raw_offset=final.last_raw_offset,
-            event_offset=final.last_event_offset,
+            normalized_offset=final.last_event_offset,
             connection_attempts=attempts,
         )
     else:
@@ -995,7 +1227,14 @@ def _run_ingress(
 
 
 def _run_market_state(
-    *, package, bundle, binding, provider, environment, stop_event
+    *,
+    package,
+    bundle,
+    binding,
+    provider,
+    environment,
+    stop_event,
+    session_state=None,
 ):
     control = binding.enrollment.control_plane
     owner_id, owner_epoch = _lease(
@@ -1013,9 +1252,11 @@ def _run_market_state(
         registration=registration,
         source_flow=control.source_flow,
     )
+    selection_plan = _selection_plan(session_state)
+    layout = _shard_layout(binding, selection_plan)
     resource = (
         f"{CANONICAL_MARKET_STATE_OWNER}:{control.cohort_id}:"
-        f"{registration.journal_generation}:0"
+        f"{registration.journal_generation}:{layout.shard_map.sha256}"
     )
     leases = AdvancedOptionsPostgresLeasePort(provider)
     shard_epoch = leases.acquire(
@@ -1026,11 +1267,45 @@ def _run_market_state(
     )
     if shard_epoch is None:
         raise RuntimeError("P8 market-state shard lease is unavailable")
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        restored_states = load_advanced_options_market_state_cursor(
+            unit.cursor,
+            consumer_name=CANONICAL_MARKET_STATE_OWNER,
+            cohort_id=control.cohort_id,
+            journal_generation=registration.journal_generation,
+            shard_map=layout.shard_map,
+        )
+        detector_routing_state = (
+            None
+            if selection_plan is None
+            or selection_plan.admission_profile_version
+            != ACTIVITY_MOMENTUM_PROFILE_VERSION
+            else load_advanced_options_detector_routing_state_cursor(
+                unit.cursor,
+                selection_generation_id=(
+                    selection_plan.generation_id
+                ),
+            )
+        )
+    detector_router = None
+    if (
+        selection_plan is not None
+        and selection_plan.admission_profile_version
+        == ACTIVITY_MOMENTUM_PROFILE_VERSION
+    ):
+        detector_router = AdvancedOptionsBoundedDetectorRouter(
+            allocation=activity_momentum_allocation_from_payload(
+                selection_plan.allocation_document
+            ),
+            state=detector_routing_state,
+        )
     consumer = AdvancedOptionsMarketStateConsumer(
         source=source,
         cohort_id=control.cohort_id,
-        shard_map=_shard_map(binding),
+        shard_map=layout.shard_map,
         owner_epoch=shard_epoch,
+        states=restored_states,
+        detector_router=detector_router,
     )
     planned = None
     try:
@@ -1043,6 +1318,7 @@ def _run_market_state(
                 source.registration = current
             planned = consumer.plan_slice(maximum_records=10_000)
             if planned.record_count:
+                observed_at = datetime.now(UTC)
                 with provider.transaction(APP_ROLE) as unit:
                     persist_advanced_options_market_state_slice_cursor(
                         unit.cursor,
@@ -1051,7 +1327,27 @@ def _run_market_state(
                         planned=planned,
                         owner_id=owner_id,
                         batch_executor=execute_batch,
+                        lease_resource_key=resource,
                     )
+                    _persist_c6_market_progress_cursor(
+                        unit.cursor,
+                        selection_plan=selection_plan,
+                        layout=layout,
+                        planned=planned,
+                        state=C6ShardState.WARMING,
+                        observed_at=observed_at,
+                    )
+                    if planned.detector_routing is not None:
+                        persist_advanced_options_detector_routing_state_cursor(
+                            unit.cursor,
+                            selection_generation_id=(
+                                selection_plan.generation_id
+                            ),
+                            state=(
+                                planned.detector_routing.state
+                            ),
+                            updated_at=observed_at,
+                        )
                 consumer.commit_slice(planned)
             if not leases.renew(
                 resource,
@@ -1069,8 +1365,11 @@ def _run_market_state(
                 owner_epoch=owner_epoch,
                 reader=RawJournalReader(source.path),
                 raw_offset=0,
-                event_offset=consumer.committed_offset,
+                normalized_offset=consumer.committed_offset,
                 shard_map_sha256_value=consumer.shard_map.sha256,
+                shard_ids_value=tuple(range(
+                    consumer.shard_map.shard_count
+                )),
             )
             if (
                 current is not None
@@ -1088,12 +1387,97 @@ def _run_market_state(
         leases.release(resource, owner_id, shard_epoch)
     if consumer.committed_offset <= 0 or planned is None:
         raise RuntimeError("P8 market-state consumed no normalized data")
+    with provider.transaction(APP_ROLE) as unit:
+        _persist_c6_market_progress_cursor(
+            unit.cursor,
+            selection_plan=selection_plan,
+            layout=layout,
+            planned=planned,
+            state=C6ShardState.READY,
+            observed_at=datetime.now(UTC),
+        )
+    routing_state = (
+        None
+        if consumer.detector_router is None
+        else consumer.detector_router.state
+    )
+    routing_duration_seconds = (
+        None
+        if routing_state is None
+        or routing_state.first_event_ns is None
+        or routing_state.last_event_ns is None
+        or routing_state.last_event_ns
+        <= routing_state.first_event_ns
+        else (
+            routing_state.last_event_ns
+            - routing_state.first_event_ns
+        )
+        / 1_000_000_000
+    )
     evidence = {
         "status": "COMPLETE",
         "kind": AdvancedOptionsProcessKind.MARKET_STATE.value,
         "normalized_end_offset": consumer.committed_offset,
         "state_sha256": planned.state_sha256,
         "shard_map_sha256": consumer.shard_map.sha256,
+        "shard_ids": list(range(consumer.shard_map.shard_count)),
+        "detector_routing": (
+            None
+            if routing_state is None
+            else {
+                "allocation_sha256": (
+                    routing_state.allocation_sha256
+                ),
+                "route_entry_count": (
+                    consumer.detector_router.route_entry_count
+                ),
+                "scanned_event_count": (
+                    routing_state.scanned_event_count
+                ),
+                "processed_detail_bytes": (
+                    routing_state.processed_detail_bytes
+                ),
+                "detector_invocation_counts": dict(
+                    routing_state.detector_invocation_counts
+                ),
+                "irrelevant_event_count": (
+                    routing_state.irrelevant_event_count
+                ),
+                "cadence_skip_count": (
+                    routing_state.cadence_skip_count
+                ),
+                "readiness_skip_count": (
+                    routing_state.readiness_skip_count
+                ),
+                "quote_cache_size": len(
+                    routing_state.quote_contract_tickers
+                ),
+                "factual_volume_cache_size": len(
+                    routing_state.factual_volume
+                ),
+                "observed_duration_seconds": (
+                    routing_duration_seconds
+                ),
+                "observed_events_per_second": (
+                    None
+                    if routing_duration_seconds is None
+                    else routing_state.scanned_event_count
+                    / routing_duration_seconds
+                ),
+                "observed_detail_bytes_per_second": (
+                    None
+                    if routing_duration_seconds is None
+                    else routing_state.processed_detail_bytes
+                    / routing_duration_seconds
+                ),
+                "checkpoint_lag_events": max(
+                    0,
+                    source.registration.normalized_committed_offset
+                    - routing_state.committed_event_offset,
+                ),
+                "safe_capacity_claimed": False,
+            }
+        ),
         "effects": dict(_EFFECTS),
     }
     if (
@@ -1108,8 +1492,11 @@ def _run_market_state(
             owner_epoch=owner_epoch,
             reader=RawJournalReader(source.path),
             raw_offset=0,
-            event_offset=consumer.committed_offset,
+            normalized_offset=consumer.committed_offset,
             shard_map_sha256_value=consumer.shard_map.sha256,
+            shard_ids_value=tuple(range(
+                consumer.shard_map.shard_count
+            )),
         )
     else:
         _record_v3_resident_completion(
@@ -1125,17 +1512,46 @@ def _run_market_state(
     return evidence
 
 
-def _contract_scope(binding, policy):
+@dataclass(frozen=True, slots=True)
+class _FlowUnavailableContract:
+    contract_ticker: str
+    underlyer: str
+    reason_code: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FlowScopeResolution:
+    scope: AdvancedOptionsContractScope | None
+    unavailable: tuple[_FlowUnavailableContract, ...]
+
+
+def _contract_scope_resolution(binding, policy):
     control = binding.enrollment.control_plane
     entries = []
+    unavailable = []
     for row in binding.enrollment.activity_selection.contracts:
         dte = (row.expiration_date - control.session_date).days
-        lane = policy.lane_for(dte)
-        tier = policy.tier_for(row.underlyer)
+        try:
+            lane = policy.lane_for(dte)
+        except ValueError:
+            lane = None
+        try:
+            tier = policy.tier_for(row.underlyer)
+        except ValueError:
+            tier = None
         if lane is None or tier is None:
-            raise RuntimeError(
-                "P8 selected contract is outside canonical flow policy"
-            )
+            unavailable.append(_FlowUnavailableContract(
+                row.contract_ticker,
+                row.underlyer,
+                (
+                    "FLOW_V1_DTE_UNAVAILABLE"
+                    if 0 <= dte <= 60
+                    else "FLOW_V1_DTE_OUTSIDE_POLICY"
+                )
+                if tier is not None
+                else "FLOW_V1_UNDERLYING_UNAVAILABLE",
+            ))
+            continue
         entries.append(AdvancedOptionsContractScopeEntry(
             row.contract_ticker,
             row.underlyer,
@@ -1143,21 +1559,38 @@ def _contract_scope(binding, policy):
             tier,
             lane,
         ))
-    return AdvancedOptionsContractScope(
-        version="advanced-options-contract-scope-v1",
-        session_date=control.session_date,
-        manifest_sha256=control.manifest_sha256,
-        slot_sha256=control.slot_set_sha256,
-        flow_policy_sha256=policy.sha256,
-        contracts=tuple(entries),
+    return _FlowScopeResolution(
+        (
+            None
+            if not entries
+            else AdvancedOptionsContractScope(
+                version="advanced-options-contract-scope-v1",
+                session_date=control.session_date,
+                manifest_sha256=control.manifest_sha256,
+                slot_sha256=control.slot_set_sha256,
+                flow_policy_sha256=policy.sha256,
+                contracts=tuple(entries),
+            )
+        ),
+        tuple(unavailable),
     )
+
+
+def _contract_scope(binding, policy):
+    return _contract_scope_resolution(binding, policy).scope
 
 
 def _flow_environment(provider, binding, source, owner_epoch):
     advanced_policy = load_advanced_options_flow_policy()
     semantics = load_default_live_semantics()
     exchange = load_default_options_exchange_reference()
-    scope = _contract_scope(binding, advanced_policy)
+    resolution = _contract_scope_resolution(
+        binding,
+        advanced_policy,
+    )
+    scope = resolution.scope
+    if scope is None:
+        return None, resolution, advanced_policy
     base_policy = FlowStrategyPolicy(
         minimum_print_notional=Decimal("50000"),
         minimum_sweep_prints=3,
@@ -1205,20 +1638,92 @@ def _flow_environment(provider, binding, source, owner_epoch):
         contract_scope_sha256=scope.sha256,
         exchange_reference_sha256=exchange.sha256,
     )
-    return RunnerEnvironment(
-        provider,
-        build_id="advanced-options-p8-flow-v1",
-        options_flow_source=source,
-        options_flow_semantics=semantics,
-        options_flow_policy=base_policy,
-        options_flow_settings=settings,
-        options_flow_advanced_policy=advanced_policy,
-        options_flow_contract_scope=scope,
-        options_flow_exchange_reference=exchange,
+    return (
+        RunnerEnvironment(
+            provider,
+            build_id="advanced-options-p8-flow-v1",
+            options_flow_source=source,
+            options_flow_semantics=semantics,
+            options_flow_policy=base_policy,
+            options_flow_settings=settings,
+            options_flow_advanced_policy=advanced_policy,
+            options_flow_contract_scope=scope,
+            options_flow_exchange_reference=exchange,
+        ),
+        resolution,
+        advanced_policy,
     )
 
 
-def _run_flow(*, package, bundle, binding, provider, environment, stop_event):
+def _flow_unavailable_payload(resolution):
+    return [
+        {
+            "contract_ticker": row.contract_ticker,
+            "underlyer": row.underlyer,
+            "state": "UNAVAILABLE",
+            "reason_code": row.reason_code,
+        }
+        for row in resolution.unavailable
+    ]
+
+
+def _persist_c6_flow_consumers_cursor(
+    cursor,
+    *,
+    selection_plan,
+    layout,
+    resolution,
+    committed_offset,
+    policy_sha256,
+    observed_at,
+):
+    if selection_plan is None:
+        return
+    eligible = (
+        set()
+        if resolution.scope is None
+        else {
+            row.contract_ticker
+            for row in resolution.scope.contracts
+        }
+    )
+    unavailable = {
+        row.contract_ticker for row in resolution.unavailable
+    }
+    for shard in layout.persistent_shards:
+        shard_contracts = set(shard.contract_tickers)
+        missing = []
+        if not shard_contracts & eligible:
+            missing.append("FLOW_POLICY_UNAVAILABLE_FOR_SHARD")
+        elif shard_contracts & unavailable:
+            missing.append("FLOW_POLICY_PARTIAL_MEMBERSHIP")
+        persist_c6_consumer_state_cursor(
+            cursor,
+            selection_generation_id=selection_plan.generation_id,
+            shard_id=shard.shard_id,
+            state=C6ConsumerState(
+                consumer_name="advanced-options-flow-v1",
+                state_version=policy_sha256,
+                committed_offset=committed_offset,
+                event_watermark_ns=None,
+                history_start=None,
+                history_end=None,
+                missing_feed_states=tuple(missing),
+                updated_at=observed_at,
+            ),
+        )
+
+
+def _run_flow(
+    *,
+    package,
+    bundle,
+    binding,
+    provider,
+    environment,
+    stop_event,
+    session_state=None,
+):
     control = binding.enrollment.control_plane
     _owner_id, owner_epoch = _lease(
         provider,
@@ -1235,12 +1740,120 @@ def _run_flow(*, package, bundle, binding, provider, environment, stop_event):
         registration=registration,
         source_flow=control.source_flow,
     )
-    runner_environment = _flow_environment(
+    selection_plan = _selection_plan(session_state)
+    layout = _shard_layout(binding, selection_plan)
+    (
+        runner_environment,
+        resolution,
+        advanced_policy,
+    ) = _flow_environment(
         provider,
         binding,
         source,
         owner_epoch,
     )
+    if runner_environment is None:
+        current = registration
+        unavailable = _flow_unavailable_payload(resolution)
+        evidence_ref = canonical_sha256({
+            "kind": AdvancedOptionsProcessKind.FLOW.value,
+            "flow_state": "UNAVAILABLE",
+            "flow_unavailable_contracts": unavailable,
+            "policy_sha256": advanced_policy.sha256,
+        })
+        last_progress = None
+        next_target_check = 0.0
+        target_check_interval_seconds = 0.5
+        flow_shard_ids = tuple(range(
+            OptionsFlowSettings().shard_count
+        ))
+        flow_shard_map_sha256 = shard_map_sha256(
+            len(flow_shard_ids)
+        )
+        while not stop_event.is_set():
+            progress = (
+                current.raw_committed_offset,
+                current.normalized_committed_offset,
+            )
+            progress_changed = progress != last_progress
+            if progress_changed:
+                with provider.transaction(APP_ROLE) as unit:
+                    _persist_c6_flow_consumers_cursor(
+                        unit.cursor,
+                        selection_plan=selection_plan,
+                        layout=layout,
+                        resolution=resolution,
+                        committed_offset=(
+                            current.normalized_committed_offset
+                        ),
+                        policy_sha256=advanced_policy.sha256,
+                        observed_at=datetime.now(UTC),
+                    )
+                last_progress = progress
+            now_monotonic = time.monotonic()
+            if (
+                bundle.get("orchestration", {}).get("catalog_version")
+                == STAGE_CATALOG_VERSION_V5
+                and (
+                    progress_changed
+                    or now_monotonic >= next_target_check
+                )
+            ):
+                _snapshot_v3_resident_windows(
+                    provider,
+                    binding,
+                    bundle=bundle,
+                    member=ResidentCompletionMember.FLOW,
+                    owner_epoch=owner_epoch,
+                    reader=RawJournalReader(source.path),
+                    raw_offset=current.raw_committed_offset,
+                    normalized_offset=current.normalized_committed_offset,
+                    flow_checkpoint_offset=current.raw_committed_offset,
+                    shard_map_sha256_value=flow_shard_map_sha256,
+                    shard_ids_value=flow_shard_ids,
+                    evidence_ref=evidence_ref,
+                )
+                next_target_check = (
+                    now_monotonic + target_check_interval_seconds
+                )
+            if current.status in {"DRAINING", "DRAINED"}:
+                break
+            stop_event.wait(0.1)
+            observed = _registration(
+                provider,
+                registration.journal_generation,
+            )
+            if observed is not None:
+                current = observed
+                source.registration = observed
+        committed_offset = current.raw_committed_offset
+        evidence = {
+            "status": "COMPLETE",
+            "kind": AdvancedOptionsProcessKind.FLOW.value,
+            "flow_state": "UNAVAILABLE",
+            "raw_end_offset": current.raw_committed_offset,
+            "normalized_end_offset": current.normalized_committed_offset,
+            "checkpoint_end_offset": committed_offset,
+            "shard_map_sha256": flow_shard_map_sha256,
+            "shard_ids": list(flow_shard_ids),
+            "flow_unavailable_contracts": unavailable,
+            "effects": dict(_EFFECTS),
+        }
+        if (
+            bundle.get("orchestration", {}).get("catalog_version")
+            != STAGE_CATALOG_VERSION_V5
+        ):
+            _record_v3_resident_completion(
+                provider,
+                binding,
+                bundle=bundle,
+                member=ResidentCompletionMember.FLOW,
+                journal_generation=registration.journal_generation,
+                owner_epoch=owner_epoch,
+                ending_offset=committed_offset,
+                evidence=evidence,
+            )
+        return evidence
     plan = PostgresOrchestrationRepository(provider).load_plan(
         control.plan_id
     )
@@ -1292,7 +1905,18 @@ def _run_flow(*, package, bundle, binding, provider, environment, stop_event):
                 owner_epoch=owner_epoch,
                 reader=RawJournalReader(source.path),
                 raw_offset=session.consumer.fed_offset,
-                event_offset=session.consumer.checkpointed_offset,
+                normalized_offset=(
+                    source.registration.normalized_committed_offset
+                ),
+                flow_checkpoint_offset=(
+                    session.consumer.checkpointed_offset
+                ),
+                shard_map_sha256_value=shard_map_sha256(
+                    runner_environment.options_flow_settings.shard_count
+                ),
+                shard_ids_value=tuple(range(
+                    runner_environment.options_flow_settings.shard_count
+                )),
                 evidence_ref=outcome.evidence_ref,
             )
         if (
@@ -1316,11 +1940,33 @@ def _run_flow(*, package, bundle, binding, provider, environment, stop_event):
         "status": "COMPLETE",
         "kind": AdvancedOptionsProcessKind.FLOW.value,
         "raw_end_offset": session.consumer.fed_offset,
+        "normalized_end_offset": (
+            source.registration.normalized_committed_offset
+        ),
         "checkpoint_end_offset": session.consumer.checkpointed_offset,
         "owner_epoch": owner_epoch,
         "evidence_ref": outcome.evidence_ref,
+        "shard_map_sha256": shard_map_sha256(
+            runner_environment.options_flow_settings.shard_count
+        ),
+        "shard_ids": list(range(
+            runner_environment.options_flow_settings.shard_count
+        )),
+        "flow_unavailable_contracts": (
+            _flow_unavailable_payload(resolution)
+        ),
         "effects": dict(_EFFECTS),
     }
+    with provider.transaction(APP_ROLE) as unit:
+        _persist_c6_flow_consumers_cursor(
+            unit.cursor,
+            selection_plan=selection_plan,
+            layout=layout,
+            resolution=resolution,
+            committed_offset=session.consumer.checkpointed_offset,
+            policy_sha256=advanced_policy.sha256,
+            observed_at=datetime.now(UTC),
+        )
     if (
         bundle.get("orchestration", {}).get("catalog_version")
         == STAGE_CATALOG_VERSION_V5
@@ -1333,7 +1979,16 @@ def _run_flow(*, package, bundle, binding, provider, environment, stop_event):
             owner_epoch=owner_epoch,
             reader=RawJournalReader(source.path),
             raw_offset=session.consumer.fed_offset,
-            event_offset=session.consumer.checkpointed_offset,
+            normalized_offset=(
+                source.registration.normalized_committed_offset
+            ),
+            flow_checkpoint_offset=session.consumer.checkpointed_offset,
+            shard_map_sha256_value=shard_map_sha256(
+                runner_environment.options_flow_settings.shard_count
+            ),
+            shard_ids_value=tuple(range(
+                runner_environment.options_flow_settings.shard_count
+            )),
             evidence_ref=outcome.evidence_ref,
         )
     else:
@@ -1404,6 +2059,7 @@ def _run_window(
 
         results: dict[str, dict[str, object]] = {}
         observed_bindings: set[UUID] = set()
+        terminal_windows: set[UUID] = set()
         while not stop_event.is_set():
             windows = load_v3_pending_window_bindings(
                 provider=provider,
@@ -1416,6 +2072,8 @@ def _run_window(
                 continue
             progressed = False
             for window_binding in windows:
+                if window_binding.window_id in terminal_windows:
+                    continue
                 if (
                     callable(binding_observer)
                     and window_binding.window_id
@@ -1450,7 +2108,18 @@ def _run_window(
                     dependency_evidence=dependencies,
                 )
                 results[window_key] = dict(result)
-                progressed = True
+                if result.get("window_state") in {
+                    "COMPLETE",
+                    "FAILED",
+                    "MISSED",
+                    "RETAINED_GAP",
+                    "UNAVAILABLE",
+                }:
+                    terminal_windows.add(window_binding.window_id)
+                progressed = progressed or (
+                    result.get("status") != "NOT_CLAIMED"
+                    and result.get("persisted", True) is not False
+                )
             if not progressed:
                 stop_event.wait(0.1)
         return {
@@ -1651,9 +2320,15 @@ def run_p8_role(
                 session_state=session_state,
             )
         if kind is AdvancedOptionsProcessKind.MARKET_STATE:
-            return _run_market_state(**arguments)
+            return _run_market_state(
+                **arguments,
+                session_state=session_state,
+            )
         if kind is AdvancedOptionsProcessKind.FLOW:
-            return _run_flow(**arguments)
+            return _run_flow(
+                **arguments,
+                session_state=session_state,
+            )
         if kind is AdvancedOptionsProcessKind.WINDOW:
             return _run_window(**arguments, pool=pool)
         raise RuntimeError("P8 Docker role kind is invalid")

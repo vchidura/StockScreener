@@ -9,6 +9,9 @@ from psycopg2.extras import Json, RealDictCursor
 
 from option_flow_support import advanced_policy
 from options.calendar import OptionExchangeCalendar
+from realtime.advanced_equity_control_plane import (
+    persist_advanced_equity_control_plane_cursor,
+)
 from realtime.advanced_options_control_plane import (
     persist_advanced_options_enrollment_cursor,
 )
@@ -25,6 +28,7 @@ from realtime.contracts import canonical_sha256
 from realtime.database_access_v2 import (
     API_ROLE,
     APP_ROLE,
+    OWNER_POOL,
     V2AccessConfig,
     V2ConnectionProvider,
 )
@@ -44,6 +48,9 @@ from tests.realtime.test_option_slot_sets_v2_db import (
     _prohibited_effect_counts,
     _role_cursor,
     cursor,
+)
+from tests.realtime.test_advanced_options_reference_producer import (
+    _mixed_enrollment,
 )
 from tests.realtime.v2_database import (
     _connect,
@@ -86,6 +93,103 @@ def _contract_scope(enrollment, policy):
     )
 
 
+def _mixed_contract_scope(enrollment, policy):
+    control = enrollment.control_plane
+    entries = tuple(
+        AdvancedOptionsContractScopeEntry(
+            contract_ticker=row.contract_ticker,
+            underlyer=row.underlyer,
+            expiration=row.expiration_date,
+            universe_tier=policy.tier_for(row.underlyer),
+            dte_lane=policy.lane_for(
+                (row.expiration_date - control.session_date).days
+            ),
+        )
+        for row in enrollment.activity_selection.contracts
+        if row.underlyer == "SPY"
+    )
+    return AdvancedOptionsContractScope(
+        version="advanced-options-contract-scope-v1",
+        session_date=control.session_date,
+        manifest_sha256=control.manifest_sha256,
+        slot_sha256=control.slot_set_sha256,
+        flow_policy_sha256=policy.sha256,
+        contracts=entries,
+    )
+
+
+def _persist_mixed_enrollment_inputs(database_cursor, enrollment):
+    for ticker, security_id in enrollment.equity_plan.security_ids:
+        database_cursor.execute(
+            "INSERT INTO ref.securities ("
+            "security_id,asset_type,source_origin,created_at"
+            ") VALUES (%s,'STOCK','mixed-c6-fixture',%s)",
+            (
+                str(security_id),
+                enrollment.control_plane.checked_at
+                - timedelta(days=10),
+            ),
+        )
+        database_cursor.execute(
+            "INSERT INTO ref.security_revisions ("
+            "revision_id,security_id,ticker,calendar_id,"
+            "effective_from,observed_at,payload_sha256"
+            ") VALUES (%s,%s,%s,'XNYS',%s,%s,%s)",
+            (
+                str(uuid4()),
+                str(security_id),
+                ticker,
+                enrollment.control_plane.checked_at
+                - timedelta(days=9),
+                enrollment.control_plane.checked_at
+                - timedelta(days=9),
+                canonical_sha256(("mixed-security", ticker)),
+            ),
+        )
+    persist_advanced_equity_control_plane_cursor(
+        database_cursor,
+        enrollment.equity_plan,
+    )
+    security_ids = dict(enrollment.equity_plan.security_ids)
+    for contract in enrollment.activity_selection.contracts:
+        database_cursor.execute(
+            "INSERT INTO ref.option_contracts ("
+            "contract_id,underlying_security_id,provider,"
+            "contract_ticker,first_observed_at,source_origin"
+            ") VALUES (%s,%s,'massive',%s,%s,'mixed-c6-fixture')",
+            (
+                contract.contract_id,
+                str(security_ids[contract.underlyer]),
+                contract.contract_ticker,
+                contract.catalog_effective_from,
+            ),
+        )
+        database_cursor.execute(
+            "INSERT INTO ref.option_contract_versions ("
+            "version_id,contract_id,call_put,expiration,strike,"
+            "exercise_style,multiplier,deliverables,eligibility,"
+            "effective_from,observed_at,payload_sha256"
+            ") VALUES (%s,%s,%s,%s,%s,'AMERICAN',100,'[]'::jsonb,"
+            "'VALIDATED_ACTIVE',%s,%s,%s)",
+            (
+                contract.catalog_version_id,
+                contract.contract_id,
+                contract.call_put,
+                contract.expiration_date,
+                contract.strike,
+                contract.catalog_effective_from,
+                contract.catalog_observed_at,
+                contract.catalog_payload_sha256,
+            ),
+        )
+        database_cursor.execute(
+            "INSERT INTO rt.instruments ("
+            "instrument_id,asset_class,contract_id"
+            ") VALUES (%s,'OPTION',%s)",
+            (contract.instrument_id, contract.contract_id),
+        )
+
+
 def _seed_reference_inputs(
     database_cursor,
     enrollment,
@@ -93,6 +197,8 @@ def _seed_reference_inputs(
     *,
     history_source_cohort_id=None,
     include_optional_metrics=True,
+    ticker="SPY",
+    include_treasury=True,
 ):
     control = enrollment.control_plane
     session = control.session_date
@@ -101,7 +207,6 @@ def _seed_reference_inputs(
         history_source_cohort_id
         or enrollment.equity_plan.cohort_id
     )
-    ticker = "SPY"
     security_id = dict(enrollment.equity_plan.security_ids)[ticker]
     database_cursor.execute(
         "SELECT instrument.instrument_id FROM rt.subscription_members AS member "
@@ -119,7 +224,7 @@ def _seed_reference_inputs(
             "report_id,security_id,timeframe,period_end,availability_time,"
             "observed_at,source,source_key,metrics,raw_payload,payload_sha256,"
             "quality_codes) VALUES (%s,%s,'quarterly',%s,%s,%s,"
-            "'canonical-fundamentals','SPY:SHORT_INTEREST',%s,%s,%s,"
+            "'canonical-fundamentals',%s,%s,%s,%s,"
             "ARRAY[]::text[])",
             (
                 str(uuid4()),
@@ -127,48 +232,62 @@ def _seed_reference_inputs(
                 session - timedelta(days=1),
                 known - timedelta(days=2),
                 known - timedelta(days=1),
+                f"{ticker}:SHORT_INTEREST",
                 Json(metrics),
                 Json(raw_report),
                 canonical_sha256(raw_report),
             ),
         )
-    for tenor, rate in ((30, Decimal("0.0400")), (60, Decimal("0.0410"))):
+    if include_treasury:
+        for tenor, rate in (
+            (30, Decimal("0.0400")),
+            (60, Decimal("0.0410")),
+        ):
+            database_cursor.execute(
+                "INSERT INTO ref.risk_free_rate_observations ("
+                "observation_id,rate_date,tenor_days,annual_rate,source,"
+                "source_key,source_observed_at,received_at,payload_sha256"
+                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    str(uuid4()),
+                    plan.prior_oi_session,
+                    tenor,
+                    rate,
+                    "us_treasury_par_yield_v1",
+                    (
+                        f"{plan.prior_oi_session.isoformat()}:"
+                        f"{tenor}d"
+                    ),
+                    known - timedelta(minutes=25),
+                    known - timedelta(minutes=20),
+                    _digest(("treasury", tenor)),
+                ),
+            )
+    selected = tuple(
+        row
+        for row in enrollment.activity_selection.contracts
+        if row.underlyer == ticker
+    )
+    assert selected
+    for contract in selected:
         database_cursor.execute(
-            "INSERT INTO ref.risk_free_rate_observations ("
-            "observation_id,rate_date,tenor_days,annual_rate,source,"
-            "source_key,source_observed_at,received_at,payload_sha256"
-            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO ref.oi_baselines ("
+            "baseline_id,contract_id,settlement_session,open_interest,"
+            "source,date_basis,observed_session,observed_at,received_at,"
+            "payload_sha256,supersedes_baseline_id) VALUES ("
+            "%s,%s,%s,2500,'massive',"
+            "'PROVIDER_CHAIN_SNAPSHOT_PRIOR_SESSION',%s,%s,%s,%s,NULL)",
             (
                 str(uuid4()),
-                session - timedelta(days=1),
-                tenor,
-                rate,
-                "us_treasury_par_yield_v1",
-                f"{(session - timedelta(days=1)).isoformat()}:{tenor}d",
-                known - timedelta(minutes=25),
-                known - timedelta(minutes=20),
-                _digest(("treasury", tenor)),
+                contract.contract_id,
+                plan.prior_oi_session,
+                session,
+                known - timedelta(minutes=15),
+                known - timedelta(minutes=10),
+                _digest(("oi", contract.contract_ticker)),
             ),
         )
-    selected = enrollment.activity_selection.contracts[0]
-    database_cursor.execute(
-        "INSERT INTO ref.oi_baselines ("
-        "baseline_id,contract_id,settlement_session,open_interest,source,"
-        "date_basis,observed_session,observed_at,received_at,"
-        "payload_sha256,supersedes_baseline_id) VALUES ("
-        "%s,%s,%s,2500,'massive',"
-        "'PROVIDER_CHAIN_SNAPSHOT_PRIOR_SESSION',%s,%s,%s,%s,NULL)",
-        (
-            str(uuid4()),
-            selected.contract_id,
-            plan.prior_oi_session,
-            session,
-            known - timedelta(minutes=15),
-            known - timedelta(minutes=10),
-            _digest("oi"),
-        ),
-    )
-    expiration = selected.expiration_date
+    expiration = max(row.expiration_date for row in selected)
     spot = Decimal("500")
     corridor = Decimal("0.20")
     database_cursor.execute(
@@ -179,7 +298,7 @@ def _seed_reference_inputs(
         "spot_price,strike_corridor_fraction,strike_min,strike_max,"
         "request_filter_sha256,policy_sha256,started_at,completed_at,"
         "page_count,row_count,response_bytes,evidence_sha256) VALUES ("
-        "%s,%s,%s,%s,%s,'MASSIVE_ADVANCED','massive','SPY',%s,%s,%s,"
+        "%s,%s,%s,%s,%s,'MASSIVE_ADVANCED','massive',%s,%s,%s,%s,"
         "%s,%s,%s,%s,%s,%s,%s,%s,%s,1,1,128,%s)",
         (
             str(uuid4()),
@@ -187,23 +306,24 @@ def _seed_reference_inputs(
             str(control.profile_id),
             control.profile_sha256,
             control.universe.sha256,
+            ticker,
             plan.discovery_scheduled_cycle,
-            expiration,
+            min(row.expiration_date for row in selected),
             expiration,
             (expiration - session).days,
             spot,
             corridor,
             spot * (Decimal("1") - corridor),
             spot * (Decimal("1") + corridor),
-            _digest("discovery-filter"),
+            _digest(("discovery-filter", ticker)),
             control.manifest_policy.sha256,
             known - timedelta(minutes=4),
             known - timedelta(minutes=3),
-            _digest("discovery"),
+            _digest(("discovery", ticker)),
         ),
     )
     response_sha256 = canonical_sha256(())
-    source_key = "SPY:DIVIDEND:COVERAGE"
+    source_key = f"{ticker}:DIVIDEND:COVERAGE"
     coverage_payload_sha256 = canonical_sha256({
         "source_key": source_key,
         "response_action_count": 0,
@@ -251,7 +371,7 @@ def _seed_reference_inputs(
         )
         observed_at = bar_end + timedelta(minutes=5)
         close = Decimal("470") + Decimal(index)
-        payload_sha256 = _digest(("bar", index))
+        payload_sha256 = _digest(("bar", ticker, index))
         database_cursor.execute(
             "INSERT INTO rt.bar_catalog ("
             "bar_revision_id,cohort_id,provider_tier,instrument_id,"
@@ -275,7 +395,7 @@ def _seed_reference_inputs(
             "low_price,close_price,volume,vwap,transaction_count,"
             "source_kind,availability_mode,is_final,observed_at,"
             "ingestion_segment_id,source_revision_ids,payload_sha256"
-            ") VALUES (%s,%s,'MASSIVE_ADVANCED',%s,%s,'SPY','1d',%s,"
+            ") VALUES (%s,%s,'MASSIVE_ADVANCED',%s,%s,%s,'1d',%s,"
             "'FULL_DAY','ADJUSTED',%s,%s,%s,%s,%s,%s,%s,%s,100,"
             "'DERIVED','HISTORICAL_RECONSTRUCTED',true,%s,%s,%s,%s)",
             (
@@ -283,6 +403,7 @@ def _seed_reference_inputs(
                 str(history_cohort_id),
                 str(security_id),
                 equity_instrument_id,
+                ticker,
                 bar_session,
                 bar_start,
                 bar_end,
@@ -314,6 +435,83 @@ def _seed_reference_inputs(
                 observed_at,
                 observed_at,
             ),
+        )
+
+
+def test_reference_producer_persists_broad_data_with_narrow_flow_scope():
+    with disposable_v2_database(
+        f"test_realtime_v2_c6_mixed_reference_{uuid4().hex[:8]}"
+    ) as database_pool:
+        flow_policy = advanced_policy()
+        enrollment = _mixed_enrollment(
+            flow_policy_sha256=flow_policy.sha256
+        )
+        scope = _mixed_contract_scope(enrollment, flow_policy)
+        control = enrollment.control_plane
+        plan = build_advanced_options_reference_producer_plan(
+            enrollment=enrollment,
+            contract_scope=scope,
+            reference_generation=1,
+            known_at=control.planned_at,
+            valid_until=control.expires_at,
+            discovery_scheduled_cycle=control.planned_at,
+            prior_oi_session=control.session_date - timedelta(days=1),
+            model_version="black-scholes-merton-v1",
+        )
+        with cursor(database_pool) as database_cursor:
+            _persist_mixed_enrollment_inputs(
+                database_cursor,
+                enrollment,
+            )
+            persist_advanced_options_enrollment_cursor(
+                database_cursor,
+                enrollment,
+            )
+            persist_option_flow_policy_cursor(
+                database_cursor,
+                flow_policy,
+            )
+            persist_option_contract_scope_cursor(
+                database_cursor,
+                scope,
+            )
+            _seed_reference_inputs(
+                database_cursor,
+                enrollment,
+                plan,
+                ticker="SPY",
+            )
+            _seed_reference_inputs(
+                database_cursor,
+                enrollment,
+                plan,
+                ticker="AMD",
+                include_treasury=False,
+            )
+        provider = V2ConnectionProvider(
+            {OWNER_POOL: database_pool},
+            V2AccessConfig(allow_disposable=True),
+        )
+
+        state = PostgresAdvancedOptionsReferenceProducer(
+            provider,
+            plan,
+            retry_initial_seconds=0,
+        ).produce()
+
+        assert state.data_membership_sha256 == (
+            enrollment.activity_selection.selection_sha256
+        )
+        assert state.contract_scope_sha256 == scope.sha256
+        assert {
+            row.contract_ticker for row in state.open_interest
+        } == {
+            "O:AMD261019C00100000",
+            "O:AMD261020P00095000",
+            "O:SPY261120C00500000",
+        }
+        assert tuple(scope.contract_map) == (
+            "O:SPY261120C00500000",
         )
 
 

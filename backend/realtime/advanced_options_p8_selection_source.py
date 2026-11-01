@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from options.data.polygon_http import PolygonHttpTransport
 
@@ -22,7 +23,6 @@ from .contracts import canonical_sha256
 
 
 MASSIVE_OPTIONS_SNAPSHOT_BASE_URL = "https://api.massive.com"
-P8_SELECTION_REQUEST_COUNT = 2
 P8_EXACT_CONTRACT_REQUEST_COUNT = 1
 P8_SELECTION_MAXIMUM_DECODED_BYTES = 100_000_000
 P8_SELECTION_MAXIMUM_RESULTS_PER_UNDERLYING = 250
@@ -31,6 +31,9 @@ P8_SELECTION_MAXIMUM_PROVIDER_CLOCK_SKEW_SECONDS = 5
 P8_SELECTION_POLICY = P7TransportSelectionPolicy(
     version="advanced-options-p8-same-day-activity-v1",
     maximum_dte=0,
+)
+_OPTION_TICKER = re.compile(
+    r"^O:([A-Z][A-Z0-9.-]{0,14})\d{6}([CP])\d{8}$"
 )
 
 
@@ -82,14 +85,15 @@ class P8ActivitySelectionCapture:
     def __post_init__(self) -> None:
         if (
             self.selection.status is not P7TransportSelectionStatus.READY
-            or self.request_count not in {
-                P8_SELECTION_REQUEST_COUNT,
-                P8_EXACT_CONTRACT_REQUEST_COUNT,
-            }
+            or type(self.request_count) is not int
+            or self.request_count <= 0
             or not 0 < self.decoded_bytes
             <= P8_SELECTION_MAXIMUM_DECODED_BYTES
             or self.pages != self.request_count
-            or self.pagination_requests != 0
+            or type(self.pagination_requests) is not int
+            or not 0
+            <= self.pagination_requests
+            < self.request_count
             or set(self.selected_snapshots) != set(self.selection.contracts)
         ):
             raise ValueError("P8 activity selection capture is incomplete")
@@ -127,13 +131,19 @@ def _candidate_from_snapshot(
     bid = _decimal(quote_row["bid"], "last_quote.bid")
     ask = _decimal(quote_row["ask"], "last_quote.ask")
     day_volume = int(day_row.get("volume", 0))
-    open_interest = int(row.get("open_interest", 0))
+    raw_open_interest = row.get("open_interest")
+    open_interest = (
+        None
+        if raw_open_interest is None
+        else int(raw_open_interest)
+    )
     if (
         bid < 0
         or ask <= 0
         or ask < bid
         or day_volume < 0
-        or open_interest < 0
+        or open_interest is not None
+        and open_interest < 0
     ):
         return None
     return P7TransportCandidate(
@@ -168,25 +178,51 @@ def _select_exact_call_put_contracts(
     reviewed_at: datetime,
     policy: P7TransportSelectionPolicy,
 ) -> P7TransportSelection:
-    selected = []
-    for option_type in ("C", "P"):
-        selection = select_p7_transport_contracts(
-            tuple(
-                row
-                for row in candidates
-                if row.option_type == option_type
-            ),
-            reviewed_at=reviewed_at,
-            policy=policy,
+    configured_pairs = {
+        (underlyer, option_type)
+        for underlyer in policy.underlyings
+        for option_type in ("C", "P")
+    }
+    observed_pairs = {
+        (row.underlyer, row.option_type) for row in candidates
+    }
+    legacy_exact_four = (
+        policy == P8_SELECTION_POLICY
+        and len(candidates) == P8_EXACT_CONTRACT_RESULT_COUNT
+    )
+    if (
+        legacy_exact_four
+        and observed_pairs != configured_pairs
+        or not legacy_exact_four
+        and {
+            row.underlyer for row in candidates
+        }
+        != set(policy.underlyings)
+    ):
+        raise RuntimeError(
+            "P8 configured exact-contract sides are incomplete"
         )
-        if selection.status is not P7TransportSelectionStatus.READY:
-            raise RuntimeError(
-                "P8 Massive exact-contract activity blocked: "
-                + ",".join(selection.reason_codes)
+    if legacy_exact_four:
+        for option_type in ("C", "P"):
+            selection = select_p7_transport_contracts(
+                tuple(
+                    row
+                    for row in candidates
+                    if row.option_type == option_type
+                ),
+                reviewed_at=reviewed_at,
+                policy=policy,
             )
-        selected.extend(selection.selected)
+            if (
+                selection.status
+                is not P7TransportSelectionStatus.READY
+            ):
+                raise RuntimeError(
+                    "P8 Massive exact-contract activity blocked: "
+                    + ",".join(selection.reason_codes)
+                )
     selected_rows = tuple(sorted(
-        selected,
+        candidates,
         key=lambda row: (
             row.underlyer,
             row.option_type,
@@ -233,14 +269,14 @@ def p8_activity_selection_capture_from_sealed(
     if (
         value.get("contract")
         != "advanced-options-v3-pre-session-capture-v1"
-        or value.get("provider_requests") != P8_SELECTION_REQUEST_COUNT
+        or type(value.get("provider_requests")) is not int
+        or value["provider_requests"] <= 0
         or type(value.get("decoded_bytes")) is not int
         or not 0 < value["decoded_bytes"]
         <= P8_SELECTION_MAXIMUM_DECODED_BYTES
         or not isinstance(value.get("responses"), list)
-        or len(value["responses"]) != P8_SELECTION_REQUEST_COUNT
         or not isinstance(value.get("selected_snapshots"), Mapping)
-        or len(value["selected_snapshots"]) != 4
+        or not value["selected_snapshots"]
     ):
         raise ValueError("sealed P8 activity selection scope changed")
     session_date = date.fromisoformat(str(value["session_date"]))
@@ -255,8 +291,10 @@ def p8_activity_selection_capture_from_sealed(
     responses = value["responses"]
     if (
         any(not isinstance(row, Mapping) for row in responses)
-        or tuple(row.get("underlyer") for row in responses)
-        != P8_SELECTION_POLICY.underlyings
+        or sum(
+            int(row.get("page_count", 1)) for row in responses
+        )
+        != value["provider_requests"]
     ):
         raise ValueError("sealed P8 response membership changed")
     snapshots = value["selected_snapshots"]
@@ -280,13 +318,40 @@ def p8_activity_selection_capture_from_sealed(
         (row.underlyer, row.option_type)
         for row in candidates
     }
-    if pairs != {
-        ("QQQ", "C"),
-        ("QQQ", "P"),
-        ("SPY", "C"),
-        ("SPY", "P"),
-    }:
+    underlyings = tuple(sorted({
+        row.underlyer for row in candidates
+    }))
+    legacy_sealed_capture = (
+        value.get("activity_momentum_allocation") is None
+    )
+    if (
+        not pairs
+        or (
+            legacy_sealed_capture
+            and pairs != {
+                (underlyer, option_type)
+                for underlyer in underlyings
+                for option_type in ("C", "P")
+            }
+        )
+        or tuple(sorted(
+            str(row.get("underlyer", "")).strip().upper()
+            for row in responses
+        ))
+        != underlyings
+    ):
         raise ValueError("sealed P8 call/put membership changed")
+    policy = (
+        P8_SELECTION_POLICY
+        if underlyings == P8_SELECTION_POLICY.underlyings
+        and len(candidates) == P8_EXACT_CONTRACT_RESULT_COUNT
+        else P7TransportSelectionPolicy(
+            version="advanced-options-c6-configured-capture-v1",
+            underlyings=underlyings,
+            minimum_dte=0,
+            maximum_dte=60,
+        )
+    )
     latest_market_time = max(
         row.market_data_time for row in candidates
     )
@@ -300,20 +365,24 @@ def p8_activity_selection_capture_from_sealed(
                 "sealed P8 provider clock skew exceeded"
             )
         reviewed_at = latest_market_time
-    for option_type in ("C", "P"):
-        selection = select_p7_transport_contracts(
-            tuple(
-                row
-                for row in candidates
-                if row.option_type == option_type
-            ),
-            reviewed_at=reviewed_at,
-            policy=P8_SELECTION_POLICY,
-        )
-        if selection.status is not P7TransportSelectionStatus.READY:
-            raise ValueError(
-                "sealed P8 activity selection is no longer eligible"
+    if policy == P8_SELECTION_POLICY:
+        for option_type in ("C", "P"):
+            selection = select_p7_transport_contracts(
+                tuple(
+                    row
+                    for row in candidates
+                    if row.option_type == option_type
+                ),
+                reviewed_at=reviewed_at,
+                policy=policy,
             )
+            if (
+                selection.status
+                is not P7TransportSelectionStatus.READY
+            ):
+                raise ValueError(
+                    "sealed P8 activity selection is no longer eligible"
+                )
     selected = tuple(sorted(
         candidates,
         key=lambda row: (
@@ -340,13 +409,13 @@ def p8_activity_selection_capture_from_sealed(
     valid_until = min(
         row.market_data_time
         + timedelta(
-            seconds=P8_SELECTION_POLICY.maximum_snapshot_age_seconds
+            seconds=policy.maximum_snapshot_age_seconds
         )
         for row in selected
     )
     selection_sha256 = canonical_sha256({
         "status": P7TransportSelectionStatus.READY,
-        "policy_sha256": P8_SELECTION_POLICY.sha256,
+        "policy_sha256": policy.sha256,
         "reviewed_at": reviewed_at,
         "valid_until": valid_until,
         "source_sha256": source_sha256,
@@ -355,7 +424,7 @@ def p8_activity_selection_capture_from_sealed(
     })
     selection = P7TransportSelection(
         P7TransportSelectionStatus.READY,
-        P8_SELECTION_POLICY,
+        policy,
         reviewed_at,
         valid_until,
         selected,
@@ -371,12 +440,14 @@ def p8_activity_selection_capture_from_sealed(
         "source_snapshot_at_utc": source_snapshot_at.isoformat(),
         "selected_at_utc": reviewed_at.isoformat(),
         "valid_until_utc": valid_until.isoformat(),
-        "policy_sha256": P8_SELECTION_POLICY.sha256,
+        "policy_sha256": policy.sha256,
         "source_snapshot_sha256": canonical_sha256(responses),
-        "request_count": P8_SELECTION_REQUEST_COUNT,
+        "request_count": value["provider_requests"],
         "decoded_bytes": value["decoded_bytes"],
-        "pages": P8_SELECTION_REQUEST_COUNT,
-        "pagination_requests": 0,
+        "pages": value["provider_requests"],
+        "pagination_requests": (
+            value["provider_requests"] - len(responses)
+        ),
         "sealed_capture_semantic_sha256": value.get("semantic_sha256"),
         "selected": [
             {
@@ -389,10 +460,12 @@ def p8_activity_selection_capture_from_sealed(
     evidence["selection_sha256"] = canonical_sha256(evidence)
     return P8ActivitySelectionCapture(
         selection=selection,
-        request_count=P8_SELECTION_REQUEST_COUNT,
+        request_count=value["provider_requests"],
         decoded_bytes=value["decoded_bytes"],
-        pages=P8_SELECTION_REQUEST_COUNT,
-        pagination_requests=0,
+        pages=value["provider_requests"],
+        pagination_requests=(
+            value["provider_requests"] - len(responses)
+        ),
         source_snapshot_at=source_snapshot_at,
         evidence=evidence,
         selected_snapshots=selected_snapshots,
@@ -416,6 +489,8 @@ class MassiveAdvancedOptionsSelectionSource:
         maximum_total_decoded_bytes: int = (
             P8_SELECTION_MAXIMUM_DECODED_BYTES
         ),
+        maximum_provider_requests: int | None = None,
+        deadline: datetime | None = None,
     ) -> None:
         if not callable(getattr(transport, "get", None)):
             raise TypeError("P8 Massive transport is invalid")
@@ -438,9 +513,22 @@ class MassiveAdvancedOptionsSelectionSource:
             raise ValueError(
                 "P8 selection decoded-byte ceilings are invalid"
             )
+        selected_policy = policy or P8_SELECTION_POLICY
+        request_ceiling = (
+            len(selected_policy.underlyings)
+            if maximum_provider_requests is None
+            else maximum_provider_requests
+        )
+        if (
+            type(request_ceiling) is not int
+            or request_ceiling < len(selected_policy.underlyings)
+        ):
+            raise ValueError(
+                "P8 selection provider request ceiling is invalid"
+            )
         self._transport = transport
         self._spots = spots
-        self._policy = policy or P8_SELECTION_POLICY
+        self._policy = selected_policy
         self._base_url = normalized_base
         self._clock = clock
         self._maximum_response_decoded_bytes = (
@@ -449,6 +537,10 @@ class MassiveAdvancedOptionsSelectionSource:
         self._maximum_total_decoded_bytes = (
             maximum_total_decoded_bytes
         )
+        self._maximum_provider_requests = request_ceiling
+        self._deadline = (
+            None if deadline is None else _utc(deadline, "deadline")
+        )
 
     def _request(
         self,
@@ -456,6 +548,8 @@ class MassiveAdvancedOptionsSelectionSource:
         *,
         spot: Decimal,
         session_date: date,
+        maximum_requests: int | None = None,
+        maximum_total_decoded_bytes: int | None = None,
     ) -> tuple[
         tuple[P7TransportCandidate, ...],
         int,
@@ -466,80 +560,191 @@ class MassiveAdvancedOptionsSelectionSource:
         policy = self._policy
         lower = spot * (Decimal("1") - policy.maximum_moneyness_fraction)
         upper = spot * (Decimal("1") + policy.maximum_moneyness_fraction)
-        response = self._transport.get(
-            (
-                f"{self._base_url}/v3/snapshot/options/"
-                f"{quote(underlyer, safe='')}"
-            ),
-            {
-                "expiration_date.gte": (
-                    session_date
-                    + timedelta(days=policy.minimum_dte)
-                ).isoformat(),
-                "expiration_date.lte": (
-                    session_date
-                    + timedelta(days=policy.maximum_dte)
-                ).isoformat(),
-                "strike_price.gte": str(lower),
-                "strike_price.lte": str(upper),
-                "limit": str(P8_SELECTION_MAXIMUM_RESULTS_PER_UNDERLYING),
-                "sort": "ticker",
-                "order": "asc",
-            },
+        request_limit = (
+            self._maximum_provider_requests
+            if maximum_requests is None
+            else maximum_requests
         )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"P8 Massive selection failed for {underlyer}: "
-                f"HTTP {response.status_code}"
-            )
-        if not 0 < len(response.body) <= (
-            self._maximum_response_decoded_bytes
-        ):
-            raise ValueError(
-                "P8 Massive selection response decoded-byte ceiling "
-                "exceeded"
-            )
-        try:
-            payload = json.loads(response.body)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(
-                f"P8 Massive selection returned invalid JSON for {underlyer}"
-            ) from error
+        byte_limit = (
+            self._maximum_total_decoded_bytes
+            if maximum_total_decoded_bytes is None
+            else maximum_total_decoded_bytes
+        )
         if (
-            not isinstance(payload, dict)
-            or payload.get("status") not in {"OK", "DELAYED"}
-            or payload.get("next_url")
-            or not isinstance(payload.get("results"), list)
-            or len(payload["results"])
-            > P8_SELECTION_MAXIMUM_RESULTS_PER_UNDERLYING
+            type(request_limit) is not int
+            or request_limit <= 0
+            or type(byte_limit) is not int
+            or byte_limit <= 0
         ):
-            raise ValueError(
-                f"P8 Massive selection scope or pagination changed for {underlyer}"
-            )
+            raise ValueError("P8 pagination budgets are invalid")
+        next_url = (
+            f"{self._base_url}/v3/snapshot/options/"
+            f"{quote(underlyer, safe='')}"
+        )
+        next_params = {
+            "expiration_date.gte": (
+                session_date
+                + timedelta(days=policy.minimum_dte)
+            ).isoformat(),
+            "expiration_date.lte": (
+                session_date
+                + timedelta(days=policy.maximum_dte)
+            ).isoformat(),
+            "strike_price.gte": str(lower),
+            "strike_price.lte": str(upper),
+            "limit": str(P8_SELECTION_MAXIMUM_RESULTS_PER_UNDERLYING),
+            "sort": "ticker",
+            "order": "asc",
+        }
         candidates: list[P7TransportCandidate] = []
         snapshots: dict[str, Mapping[str, object]] = {}
         snapshot_clocks: list[datetime] = []
-        for row in payload["results"]:
-            if not isinstance(row, dict):
-                raise TypeError("P8 option snapshot row must be an object")
-            candidate = _candidate_from_snapshot(
-                row,
-                session_date=session_date,
+        pages = []
+        page_received_times = []
+        seen_urls = set()
+        decoded_bytes = 0
+        while next_url is not None:
+            if len(pages) >= request_limit:
+                raise ValueError(
+                    "P8 Massive selection provider request ceiling "
+                    "exceeded during pagination"
+                )
+            if self._deadline is not None:
+                now = (
+                    datetime.now(timezone.utc)
+                    if self._clock is None
+                    else _utc(self._clock(), "selection clock")
+                )
+                if now > self._deadline:
+                    raise TimeoutError(
+                        "P8 Massive selection pagination deadline expired"
+                    )
+            if next_url in seen_urls:
+                raise ValueError(
+                    "P8 Massive selection pagination cycle detected"
+                )
+            seen_urls.add(next_url)
+            parsed = urlsplit(next_url)
+            if (
+                parsed.scheme != "https"
+                or f"{parsed.scheme}://{parsed.netloc}"
+                not in {
+                    "https://api.massive.com",
+                    "https://api.polygon.io",
+                }
+                or parsed.fragment
+                or not parsed.path.startswith(
+                    "/v3/snapshot/options/"
+                )
+            ):
+                raise ValueError(
+                    "P8 Massive selection next_url is not approved"
+                )
+            response = self._transport.get(next_url, next_params)
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"P8 Massive selection failed for {underlyer}: "
+                    f"HTTP {response.status_code}"
+                )
+            response_bytes = len(response.body)
+            if not 0 < response_bytes <= (
+                self._maximum_response_decoded_bytes
+            ):
+                raise ValueError(
+                    "P8 Massive selection response decoded-byte ceiling "
+                    "exceeded"
+                )
+            decoded_bytes += response_bytes
+            if decoded_bytes > byte_limit:
+                raise ValueError(
+                    "P8 Massive selection exceeded decoded-byte ceiling"
+                )
+            try:
+                payload = json.loads(response.body)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    "P8 Massive selection returned invalid JSON for "
+                    f"{underlyer}"
+                ) from error
+            page_received_at = (
+                datetime.now(timezone.utc)
+                if self._clock is None
+                else _utc(self._clock(), "selection clock")
             )
-            if candidate is None:
-                continue
-            snapshot_clocks.append(candidate.market_data_time)
-            candidates.append(candidate)
-            snapshots[candidate.contract_ticker] = row
+            if (
+                not isinstance(payload, dict)
+                or payload.get("status") not in {"OK", "DELAYED"}
+                or not isinstance(payload.get("results"), list)
+                or len(payload["results"])
+                > P8_SELECTION_MAXIMUM_RESULTS_PER_UNDERLYING
+            ):
+                raise ValueError(
+                    "P8 Massive selection scope changed for "
+                    f"{underlyer}"
+                )
+            for row in payload["results"]:
+                if not isinstance(row, dict):
+                    raise TypeError(
+                        "P8 option snapshot row must be an object"
+                    )
+                candidate = _candidate_from_snapshot(
+                    row,
+                    session_date=session_date,
+                )
+                if candidate is None:
+                    continue
+                if candidate.contract_ticker in snapshots:
+                    raise ValueError(
+                        "P8 Massive pagination repeated a contract"
+                    )
+                snapshot_clocks.append(candidate.market_data_time)
+                candidates.append(candidate)
+                snapshots[candidate.contract_ticker] = row
+            if (
+                snapshot_clocks
+                and max(snapshot_clocks) - page_received_at
+                > timedelta(
+                    seconds=(
+                        P8_SELECTION_MAXIMUM_PROVIDER_CLOCK_SKEW_SECONDS
+                    )
+                )
+            ):
+                raise ValueError("P8 provider clock skew exceeded")
+            pages.append(payload)
+            page_received_times.append(page_received_at)
+            raw_next_url = payload.get("next_url")
+            next_url = (
+                None
+                if raw_next_url in {None, ""}
+                else str(raw_next_url)
+            )
+            next_params = {}
         if not candidates or not snapshot_clocks:
             raise ValueError(
                 f"P8 Massive selection has no usable contracts for {underlyer}"
             )
+        aggregate = {
+            "status": "OK",
+            "request_id": [
+                page.get("request_id") for page in pages
+            ],
+            "results": [
+                row
+                for page in pages
+                for row in page["results"]
+            ],
+            "page_count": len(pages),
+            "pagination_requests": max(0, len(pages) - 1),
+            "pages_sha256": canonical_sha256(pages),
+            "received_at_utc": max(
+                page_received_times
+            ).isoformat(),
+        }
         return (
             tuple(candidates),
-            len(response.body),
+            decoded_bytes,
             max(snapshot_clocks),
-            payload,
+            aggregate,
             snapshots,
         )
 
@@ -563,11 +768,24 @@ class MassiveAdvancedOptionsSelectionSource:
         snapshot_clocks: list[datetime] = []
         responses = []
         snapshots: dict[str, Mapping[str, object]] = {}
+        request_count = 0
+        pagination_requests = 0
         for underlyer in self._policy.underlyings:
             rows, byte_count, snapshot_at, payload, raw_snapshots = self._request(
                 underlyer,
                 spot=_decimal(spots[underlyer], f"{underlyer} spot"),
                 session_date=session_date,
+                maximum_requests=(
+                    self._maximum_provider_requests - request_count
+                ),
+                maximum_total_decoded_bytes=(
+                    self._maximum_total_decoded_bytes - decoded_bytes
+                ),
+            )
+            page_count = int(payload["page_count"])
+            request_count += page_count
+            pagination_requests += int(
+                payload["pagination_requests"]
             )
             candidates.extend(rows)
             decoded_bytes += byte_count
@@ -577,6 +795,7 @@ class MassiveAdvancedOptionsSelectionSource:
                 "request_id": payload.get("request_id"),
                 "response_sha256": canonical_sha256(payload),
                 "row_count": len(payload["results"]),
+                "page_count": page_count,
             })
             snapshots.update(raw_snapshots)
             if decoded_bytes > self._maximum_total_decoded_bytes:
@@ -612,10 +831,10 @@ class MassiveAdvancedOptionsSelectionSource:
             "valid_until_utc": selection.valid_until.isoformat(),
             "policy_sha256": self._policy.sha256,
             "source_snapshot_sha256": canonical_sha256(responses),
-            "request_count": P8_SELECTION_REQUEST_COUNT,
+            "request_count": request_count,
             "decoded_bytes": decoded_bytes,
-            "pages": P8_SELECTION_REQUEST_COUNT,
-            "pagination_requests": 0,
+            "pages": request_count,
+            "pagination_requests": pagination_requests,
             "selected": [
                 {
                     "underlyer": row.underlyer,
@@ -627,10 +846,10 @@ class MassiveAdvancedOptionsSelectionSource:
         evidence["selection_sha256"] = canonical_sha256(evidence)
         return P8ActivitySelectionCapture(
             selection=selection,
-            request_count=P8_SELECTION_REQUEST_COUNT,
+            request_count=request_count,
             decoded_bytes=decoded_bytes,
-            pages=P8_SELECTION_REQUEST_COUNT,
-            pagination_requests=0,
+            pages=request_count,
+            pagination_requests=pagination_requests,
             source_snapshot_at=source_snapshot_at,
             evidence=evidence,
             selected_snapshots={
@@ -641,7 +860,7 @@ class MassiveAdvancedOptionsSelectionSource:
 
 
 class MassiveAdvancedOptionsExactContractSource:
-    """One unified snapshot request for the exact four admitted contracts."""
+    """One unified snapshot request for configured admitted contracts."""
 
     def __init__(
         self,
@@ -687,21 +906,23 @@ class MassiveAdvancedOptionsExactContractSource:
             str(value).strip().upper()
             for value in contract_tickers
         ))
+        memberships = {
+            (
+                match.group(1),
+                match.group(2),
+            )
+            for ticker in tickers
+            if (match := _OPTION_TICKER.fullmatch(ticker)) is not None
+        }
+        underlyings = tuple(sorted({
+            underlyer for underlyer, _ in memberships
+        }))
         if (
             reviewed.date() != session_date
-            or len(tickers) != P8_EXACT_CONTRACT_RESULT_COUNT
-            or len(set(tickers)) != P8_EXACT_CONTRACT_RESULT_COUNT
-            or {
-                (ticker[2:5], ticker[11:12])
-                for ticker in tickers
-                if len(ticker) >= 12 and ticker.startswith("O:")
-            }
-            != {
-                ("QQQ", "C"),
-                ("QQQ", "P"),
-                ("SPY", "C"),
-                ("SPY", "P"),
-            }
+            or not tickers
+            or len(set(tickers)) != len(tickers)
+            or not memberships
+            or not underlyings
         ):
             raise ValueError(
                 "P8 exact-contract request membership changed"
@@ -710,7 +931,7 @@ class MassiveAdvancedOptionsExactContractSource:
             f"{self._base_url}/v3/snapshot",
             {
                 "ticker.any_of": ",".join(tickers),
-                "limit": str(P8_EXACT_CONTRACT_RESULT_COUNT),
+                "limit": str(len(tickers)),
                 "sort": "ticker",
                 "order": "asc",
             },
@@ -735,8 +956,7 @@ class MassiveAdvancedOptionsExactContractSource:
             or payload.get("status") not in {"OK", "DELAYED"}
             or payload.get("next_url")
             or not isinstance(payload.get("results"), list)
-            or len(payload["results"])
-            != P8_EXACT_CONTRACT_RESULT_COUNT
+            or len(payload["results"]) != len(tickers)
         ):
             raise ValueError(
                 "P8 Massive exact-contract scope or pagination changed"
@@ -778,10 +998,22 @@ class MassiveAdvancedOptionsExactContractSource:
         ).total_seconds() > P8_SELECTION_MAXIMUM_PROVIDER_CLOCK_SKEW_SECONDS:
             raise ValueError("P8 provider clock skew exceeded")
         selected_at = max(local_completed_at, latest_snapshot_at)
+        selection_policy = (
+            self._policy
+            if self._policy.underlyings == underlyings
+            else P7TransportSelectionPolicy(
+                version=(
+                    "advanced-options-c6-configured-capture-v1"
+                ),
+                underlyings=underlyings,
+                minimum_dte=0,
+                maximum_dte=60,
+            )
+        )
         selection = _select_exact_call_put_contracts(
             tuple(candidates),
             reviewed_at=selected_at,
-            policy=self._policy,
+            policy=selection_policy,
         )
         if (
             set(selection.contracts) != set(tickers)
@@ -799,7 +1031,7 @@ class MassiveAdvancedOptionsExactContractSource:
             ).isoformat(),
             "selected_at_utc": selected_at.isoformat(),
             "valid_until_utc": selection.valid_until.isoformat(),
-            "policy_sha256": self._policy.sha256,
+            "policy_sha256": selection_policy.sha256,
             "source_snapshot_sha256": canonical_sha256(payload),
             "request_id": payload.get("request_id"),
             "request_count": P8_EXACT_CONTRACT_REQUEST_COUNT,

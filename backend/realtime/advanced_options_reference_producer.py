@@ -25,7 +25,10 @@ from .advanced_options_control_plane import (
     AdvancedOptionsEnrollmentPlan,
     advanced_options_enrollment_plan_payload,
 )
-from .advanced_options_flow_policy import AdvancedOptionsContractScope
+from .advanced_options_flow_policy import (
+    AdvancedOptionsContractScope,
+    flow_contract_scope_matches_data_membership,
+)
 from .advanced_options_reference_repository import (
     persist_advanced_options_reference_state_cursor,
 )
@@ -153,6 +156,7 @@ class AdvancedOptionsReferenceProducerPlan:
     plan_sha256: str
     enrollment: AdvancedOptionsEnrollmentPlan
     contract_scope: AdvancedOptionsContractScope
+    data_membership_sha256: str
     reference_generation: int
     known_at: datetime
     valid_until: datetime
@@ -225,6 +229,7 @@ def _plan_identity(
     *,
     enrollment: AdvancedOptionsEnrollmentPlan,
     contract_scope: AdvancedOptionsContractScope,
+    data_membership_sha256: str,
     reference_generation: int,
     known_at: datetime,
     valid_until: datetime,
@@ -250,6 +255,7 @@ def _plan_identity(
         "slot_set_version": control.slot_set.version,
         "slot_set_sha256": control.slot_set_sha256,
         "slot_member_sha256": control.slot_set.member_sha256,
+        "data_membership_sha256": data_membership_sha256,
         "contract_scope_sha256": contract_scope.sha256,
         "reference_generation": reference_generation,
         "session_date": control.session_date,
@@ -277,17 +283,17 @@ def _validate_plan(
         raise TypeError("Advanced Options reference producer plan is invalid")
     advanced_options_enrollment_plan_payload(plan.enrollment)
     control = plan.control_plane
-    selected_tickers = tuple(
-        row.contract_ticker
-        for row in plan.enrollment.activity_selection.contracts
-    )
     if (
-        plan.contract_scope.session_date != control.session_date
-        or plan.contract_scope.manifest_sha256 != control.manifest_sha256
-        or plan.contract_scope.slot_sha256 != control.slot_set_sha256
-        or plan.contract_scope.flow_policy_sha256
-        != control.pins.flow_policy_sha256
-        or tuple(plan.contract_scope.contract_map) != selected_tickers
+        plan.data_membership_sha256
+        != plan.enrollment.activity_selection.selection_sha256
+        or not flow_contract_scope_matches_data_membership(
+            plan.contract_scope,
+            plan.enrollment.activity_selection.contracts,
+            session_date=control.session_date,
+            manifest_sha256=control.manifest_sha256,
+            slot_sha256=control.slot_set_sha256,
+            flow_policy_sha256=control.pins.flow_policy_sha256,
+        )
     ):
         raise ValueError("reference producer contract scope changed")
     known = _utc(plan.known_at, "known_at")
@@ -332,6 +338,7 @@ def _validate_plan(
     reference_policy_sha256 = canonical_sha256({
         "contract": "advanced-options-reference-policy-v1",
         "enrollment_sha256": plan.enrollment.enrollment_sha256,
+        "data_membership_sha256": plan.data_membership_sha256,
         "contract_scope_sha256": plan.contract_scope.sha256,
         "catalog_sha256": control.pins.catalog_sha256,
         "flow_policy_sha256": control.pins.flow_policy_sha256,
@@ -354,6 +361,7 @@ def _validate_plan(
     identity = _plan_identity(
         enrollment=plan.enrollment,
         contract_scope=plan.contract_scope,
+        data_membership_sha256=plan.data_membership_sha256,
         reference_generation=plan.reference_generation,
         known_at=known,
         valid_until=valid,
@@ -410,9 +418,13 @@ def build_advanced_options_reference_producer_plan(
         "known_at": known,
         "valid_until": valid,
     })
+    data_membership_sha256 = (
+        enrollment.activity_selection.selection_sha256
+    )
     reference_policy_sha256 = canonical_sha256({
         "contract": "advanced-options-reference-policy-v1",
         "enrollment_sha256": enrollment.enrollment_sha256,
+        "data_membership_sha256": data_membership_sha256,
         "contract_scope_sha256": contract_scope.sha256,
         "catalog_sha256": enrollment.control_plane.pins.catalog_sha256,
         "flow_policy_sha256": (
@@ -434,6 +446,7 @@ def build_advanced_options_reference_producer_plan(
     identity = _plan_identity(
         enrollment=enrollment,
         contract_scope=contract_scope,
+        data_membership_sha256=data_membership_sha256,
         reference_generation=reference_generation,
         known_at=known,
         valid_until=valid,
@@ -455,6 +468,7 @@ def build_advanced_options_reference_producer_plan(
         plan_sha256=plan_sha256,
         enrollment=enrollment,
         contract_scope=contract_scope,
+        data_membership_sha256=data_membership_sha256,
         reference_generation=reference_generation,
         known_at=known,
         valid_until=valid,
@@ -798,6 +812,10 @@ def _load_open_interest(
     by_contract: dict[int, list] = {}
     for row in rows:
         by_contract.setdefault(int(row["contract_id"]), []).append(row)
+    data_contracts = {
+        row.contract_ticker: row
+        for row in plan.enrollment.activity_selection.contracts
+    }
     references = []
     missing = False
     for contract in contracts:
@@ -836,12 +854,11 @@ def _load_open_interest(
             )
         ):
             raise ValueError("dated OI scope, supersession, or clocks changed")
+        data_contract = data_contracts[str(contract["contract_ticker"])]
         reference = AdvancedOptionsOpenInterestReference(
             contract_id=contract_id,
             contract_ticker=str(contract["contract_ticker"]),
-            underlyer=plan.contract_scope.contract_map[
-                str(contract["contract_ticker"])
-            ].underlyer,
+            underlyer=data_contract.underlyer,
             availability=ReferenceAvailability.AVAILABLE,
             known_at=plan.known_at,
             baseline_id=UUID(str(row["baseline_id"])),
@@ -981,11 +998,17 @@ def _load_discovery_spots(
         ))
         return {}
     expirations: dict[str, list[date]] = {}
+    data_contracts = {
+        row.contract_ticker: row
+        for row in plan.enrollment.activity_selection.contracts
+    }
     for contract in contracts:
-        entry = plan.contract_scope.contract_map[
+        entry = data_contracts[
             str(contract["contract_ticker"])
         ]
-        expirations.setdefault(entry.underlyer, []).append(entry.expiration)
+        expirations.setdefault(entry.underlyer, []).append(
+            entry.expiration_date
+        )
     spots = {}
     for row in rows:
         underlyer = str(row["underlyer"])
@@ -1301,11 +1324,17 @@ def _load_valuations(
     valuations = []
     missing = False
     by_underlyer: dict[str, set[date]] = {}
+    data_contracts = {
+        row.contract_ticker: row
+        for row in plan.enrollment.activity_selection.contracts
+    }
     for contract in contracts:
-        entry = plan.contract_scope.contract_map[
+        entry = data_contracts[
             str(contract["contract_ticker"])
         ]
-        by_underlyer.setdefault(entry.underlyer, set()).add(entry.expiration)
+        by_underlyer.setdefault(entry.underlyer, set()).add(
+            entry.expiration_date
+        )
     for ticker in plan.control_plane.universe.option_underlyings:
         spot, security_id = spots[ticker]
         expirations = tuple(sorted(by_underlyer[ticker]))
@@ -1476,6 +1505,7 @@ def assemble_advanced_options_reference_state_cursor(
         known_at=plan.known_at,
         valid_until=plan.valid_until,
         reference_policy_sha256=plan.reference_policy_sha256,
+        data_membership_sha256=plan.data_membership_sha256,
         contract_scope_sha256=plan.contract_scope.sha256,
         underlyings=plan.control_plane.universe.option_underlyings,
         open_interest=open_interest,

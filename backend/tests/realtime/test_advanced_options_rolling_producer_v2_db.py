@@ -24,6 +24,7 @@ from realtime.contracts import canonical_sha256
 from realtime.database_access_v2 import (
     API_ROLE,
     APP_ROLE,
+    OWNER_POOL,
     V2AccessConfig,
     V2ConnectionProvider,
 )
@@ -44,7 +45,12 @@ from scripts import audit_advanced_options_input_readiness as audit
 from tests.realtime.test_advanced_options_reference_producer_v2_db import (
     _contract_scope,
     _disposable_audit,
+    _mixed_contract_scope,
+    _persist_mixed_enrollment_inputs,
     _seed_reference_inputs,
+)
+from tests.realtime.test_advanced_options_reference_producer import (
+    _mixed_enrollment,
 )
 from tests.realtime.test_option_slot_sets_v2_db import (
     _owp4_enrollment,
@@ -67,16 +73,82 @@ def _digest(value) -> str:
     return canonical_sha256(("owp4c", value))
 
 
+def _seed_consumer_checkpoint(
+    database_cursor,
+    *,
+    owner,
+    control,
+    source_flow,
+    shard_id,
+    shard_map_sha256,
+    owner_epoch,
+    committed_offset,
+    known_at,
+):
+    database_cursor.execute(
+        "INSERT INTO rt.consumer_checkpoints ("
+        "consumer_name,cohort_id,journal_generation,shard_id,"
+        "shard_map_sha256,owner_epoch,committed_offset,checkpoint_id,"
+        "state_codec,state_hash,state_payload,committed_at) VALUES ("
+        "%s,%s,%s,%s,%s,%s,%s,%s,'owp4c-disposable-v1',%s,%s,%s)",
+        (
+            owner,
+            str(control.cohort_id),
+            str(source_flow.journal_generation),
+            shard_id,
+            shard_map_sha256,
+            owner_epoch,
+            committed_offset,
+            str(uuid4()),
+            _digest(("checkpoint", owner, shard_id)),
+            b"owp4c",
+            known_at,
+        ),
+    )
+
+
 def _seed_rolling_inputs(
     database_cursor,
     enrollment,
     source_flow,
     *,
     owner_epoch,
-    committed_offset,
-    shard_map_sha256,
     known_at,
+    committed_offset=None,
+    market_state_committed_offset=None,
+    flow_committed_offset=None,
+    market_state_shard_ids=(0,),
+    market_state_shard_map_sha256=None,
+    flow_shard_ids=(0,),
+    flow_shard_map_sha256=None,
+    shard_map_sha256=None,
 ):
+    if committed_offset is not None:
+        if (
+            market_state_committed_offset is not None
+            or flow_committed_offset is not None
+        ):
+            raise ValueError("checkpoint offsets are ambiguous")
+        market_state_committed_offset = committed_offset
+        flow_committed_offset = committed_offset
+    if (
+        market_state_committed_offset is None
+        or flow_committed_offset is None
+    ):
+        raise ValueError("checkpoint offsets are required")
+    if shard_map_sha256 is not None:
+        if (
+            market_state_shard_map_sha256 is not None
+            or flow_shard_map_sha256 is not None
+        ):
+            raise ValueError("checkpoint shard maps are ambiguous")
+        market_state_shard_map_sha256 = shard_map_sha256
+        flow_shard_map_sha256 = shard_map_sha256
+    if (
+        market_state_shard_map_sha256 is None
+        or flow_shard_map_sha256 is None
+    ):
+        raise ValueError("checkpoint shard maps are required")
     control = enrollment.control_plane
     session_id = source_flow.stream_session_ids[0]
     database_cursor.execute(
@@ -102,34 +174,44 @@ def _seed_rolling_inputs(
             known_at,
             str(source_flow.journal_generation),
             _digest("budget"),
-            committed_offset,
-            committed_offset,
+            flow_committed_offset,
+            market_state_committed_offset,
             known_at - timedelta(milliseconds=80),
             known_at - timedelta(milliseconds=20),
         ),
     )
-    selected = enrollment.activity_selection.contracts[0]
-    database_cursor.execute(
-        "SELECT instrument.instrument_id FROM rt.subscription_members AS member "
-        "JOIN rt.instruments AS instrument "
-        "ON instrument.instrument_id=member.instrument_id "
-        "WHERE member.manifest_id=%s AND instrument.security_id=%s",
+    selected = tuple(enrollment.activity_selection.contracts)
+    security_ids = dict(enrollment.equity_plan.security_ids)
+    equity_instrument_ids = []
+    for ticker in control.universe.option_underlyings:
+        database_cursor.execute(
+            "SELECT instrument.instrument_id "
+            "FROM rt.subscription_members AS member "
+            "JOIN rt.instruments AS instrument "
+            "ON instrument.instrument_id=member.instrument_id "
+            "WHERE member.manifest_id=%s "
+            "AND instrument.security_id=%s",
+            (
+                str(enrollment.equity_plan.manifest_id),
+                str(security_ids[ticker]),
+            ),
+        )
+        equity_instrument_ids.append(
+            int(database_cursor.fetchone()[0])
+        )
+    option_instruments = tuple(
         (
-            str(enrollment.equity_plan.manifest_id),
-            str(dict(enrollment.equity_plan.security_ids)["SPY"]),
-        ),
-    )
-    equity_instrument_id = int(database_cursor.fetchone()[0])
-    instruments = (
-        (
-            selected.instrument_id,
+            contract.instrument_id,
             known_at - timedelta(milliseconds=90),
             known_at - timedelta(milliseconds=85),
             Decimal("2.00"),
             Decimal("2.10"),
             Decimal("2.05"),
             "option-trade-v1",
-        ),
+        )
+        for contract in selected
+    )
+    equity_instruments = tuple(
         (
             equity_instrument_id,
             known_at - timedelta(milliseconds=100),
@@ -138,8 +220,10 @@ def _seed_rolling_inputs(
             Decimal("500.10"),
             Decimal("500.00"),
             "equity-trade-v1",
-        ),
+        )
+        for equity_instrument_id in equity_instrument_ids
     )
+    instruments = option_instruments + equity_instruments
     for (
         instrument_id,
         quote_at,
@@ -191,42 +275,197 @@ def _seed_rolling_inputs(
                 _digest(("trade", instrument_id)),
             ),
         )
-    for owner in (
-        CANONICAL_MARKET_STATE_OWNER,
-        CANONICAL_OPTION_FLOW_OWNER,
+    for owner, shard_ids, checkpoint_map_sha256 in (
+        (
+            CANONICAL_MARKET_STATE_OWNER,
+            market_state_shard_ids,
+            market_state_shard_map_sha256,
+        ),
+        (
+            CANONICAL_OPTION_FLOW_OWNER,
+            flow_shard_ids,
+            flow_shard_map_sha256,
+        ),
     ):
+        checkpoint_offset = (
+            market_state_committed_offset
+            if owner == CANONICAL_MARKET_STATE_OWNER
+            else flow_committed_offset
+        )
+        for shard_id in shard_ids:
+            _seed_consumer_checkpoint(
+                database_cursor,
+                owner=owner,
+                control=control,
+                source_flow=source_flow,
+                shard_id=shard_id,
+                shard_map_sha256=checkpoint_map_sha256,
+                owner_epoch=owner_epoch,
+                committed_offset=checkpoint_offset,
+                known_at=known_at,
+            )
+    for contract in selected:
         database_cursor.execute(
-            "INSERT INTO rt.consumer_checkpoints ("
-            "consumer_name,cohort_id,journal_generation,shard_id,"
-            "shard_map_sha256,owner_epoch,committed_offset,checkpoint_id,"
-            "state_codec,state_hash,state_payload,committed_at) VALUES ("
-            "%s,%s,%s,0,%s,%s,%s,%s,'owp4c-disposable-v1',%s,%s,%s)",
+            "INSERT INTO rt.option_volume_checkpoints ("
+            "cohort_id,session_date,contract_ticker,cumulative_volume,"
+            "last_source_seq,last_event_time,baseline_kind,"
+            "snapshot_volume,snapshot_watermark_seq) VALUES ("
+            "%s,%s,%s,0,0,NULL,'SESSION_COMPLETE',NULL,NULL)",
             (
-                owner,
                 str(control.cohort_id),
-                str(source_flow.journal_generation),
-                shard_map_sha256,
-                owner_epoch,
-                committed_offset,
-                str(uuid4()),
-                _digest(("checkpoint", owner)),
-                b"owp4c",
-                known_at,
+                control.session_date,
+                contract.contract_ticker,
             ),
         )
-    database_cursor.execute(
-        "INSERT INTO rt.option_volume_checkpoints ("
-        "cohort_id,session_date,contract_ticker,cumulative_volume,"
-        "last_source_seq,last_event_time,baseline_kind,snapshot_volume,"
-        "snapshot_watermark_seq) VALUES (%s,%s,%s,0,0,NULL,"
-        "'SESSION_COMPLETE',NULL,NULL)",
-        (
-            str(control.cohort_id),
-            control.session_date,
-            selected.contract_ticker,
-        ),
-    )
-    return equity_instrument_id
+    return equity_instrument_ids[0]
+
+
+def test_mixed_scope_rolling_producer_restores_distinct_shard_sets():
+    with disposable_v2_database(
+        f"test_realtime_v2_c6_mixed_rolling_{uuid4().hex[:8]}"
+    ) as database_pool:
+        flow_policy = advanced_policy()
+        enrollment = _mixed_enrollment(
+            flow_policy_sha256=flow_policy.sha256
+        )
+        scope = _mixed_contract_scope(enrollment, flow_policy)
+        control = enrollment.control_plane
+        reference_plan = build_advanced_options_reference_producer_plan(
+            enrollment=enrollment,
+            contract_scope=scope,
+            reference_generation=1,
+            known_at=control.planned_at,
+            valid_until=control.expires_at,
+            discovery_scheduled_cycle=control.planned_at,
+            prior_oi_session=control.session_date - timedelta(days=1),
+            model_version="black-scholes-merton-v1",
+        )
+        source_flow = build_option_source_flow_identity(
+            journal_generation=control.source_flow.journal_generation,
+            stream_session_ids=control.source_flow.stream_session_ids,
+            condition_semantics_sha256=(
+                control.pins.condition_semantics_sha256
+            ),
+            flow_policy_sha256=_digest("mixed-flow-engine"),
+            advanced_flow_policy_sha256=flow_policy.sha256,
+            contract_scope_sha256=scope.sha256,
+        )
+        with cursor(database_pool) as database_cursor:
+            _persist_mixed_enrollment_inputs(
+                database_cursor,
+                enrollment,
+            )
+            persist_advanced_options_enrollment_cursor(
+                database_cursor,
+                enrollment,
+            )
+            persist_option_flow_policy_cursor(
+                database_cursor,
+                flow_policy,
+            )
+            persist_option_contract_scope_cursor(
+                database_cursor,
+                scope,
+            )
+            persist_option_source_flow_cursor(
+                database_cursor,
+                source_flow,
+                source_cohort_id=control.cohort_id,
+                contract_scope=scope,
+            )
+            _seed_reference_inputs(
+                database_cursor,
+                enrollment,
+                reference_plan,
+                ticker="SPY",
+            )
+            _seed_reference_inputs(
+                database_cursor,
+                enrollment,
+                reference_plan,
+                ticker="AMD",
+                include_treasury=False,
+            )
+        provider = V2ConnectionProvider(
+            {OWNER_POOL: database_pool},
+            V2AccessConfig(allow_disposable=True),
+        )
+        reference = PostgresAdvancedOptionsReferenceProducer(
+            provider,
+            reference_plan,
+            retry_initial_seconds=0,
+        ).produce()
+        market_state_shard_map_sha256 = _digest(
+            "mixed-market-state-map"
+        )
+        flow_shard_map_sha256 = _digest("mixed-flow-map")
+        rolling_plan = build_advanced_options_rolling_producer_plan(
+            enrollment=enrollment,
+            contract_scope=scope,
+            reference_state=reference,
+            source_flow=source_flow,
+            owner_epoch=3,
+            market_state_committed_offset=9,
+            flow_committed_offset=11,
+            market_state_shard_ids=(0, 1),
+            flow_shard_ids=(0,),
+            market_state_shard_map_sha256=(
+                market_state_shard_map_sha256
+            ),
+            flow_shard_map_sha256=flow_shard_map_sha256,
+            known_at=control.planned_at,
+            valid_until=control.expires_at,
+        )
+        with cursor(database_pool) as database_cursor:
+            _seed_rolling_inputs(
+                database_cursor,
+                enrollment,
+                source_flow,
+                owner_epoch=3,
+                market_state_committed_offset=9,
+                flow_committed_offset=11,
+                market_state_shard_ids=(0, 1),
+                market_state_shard_map_sha256=(
+                    market_state_shard_map_sha256
+                ),
+                flow_shard_ids=(0,),
+                flow_shard_map_sha256=flow_shard_map_sha256,
+                known_at=control.planned_at,
+            )
+        producer = PostgresAdvancedOptionsRollingProducer(
+            provider,
+            rolling_plan,
+            retry_initial_seconds=0,
+        )
+
+        state = producer.produce()
+
+        assert producer.produce() == state
+        assert {
+            row.checkpoint.contract_ticker
+            for row in state.contract_volumes
+        } == {
+            "O:AMD261019C00100000",
+            "O:AMD261020P00095000",
+            "O:SPY261120C00500000",
+        }
+        assert rolling_plan.market_state_shard_ids == (0, 1)
+        assert rolling_plan.flow_shard_ids == (0,)
+        assert rolling_plan.market_state_committed_offset == 9
+        assert rolling_plan.flow_committed_offset == 11
+        assert state.committed_offset == 11
+        with provider.transaction(APP_ROLE, read_only=True) as unit:
+            unit.cursor.execute(
+                "SELECT consumer_name,committed_offset "
+                "FROM rt.consumer_checkpoints "
+                "WHERE cohort_id=%s ORDER BY consumer_name,shard_id",
+                (str(control.cohort_id),),
+            )
+            assert tuple(unit.cursor.fetchall()) == (
+                (CANONICAL_MARKET_STATE_OWNER, 9),
+                (CANONICAL_MARKET_STATE_OWNER, 9),
+                (CANONICAL_OPTION_FLOW_OWNER, 11),
+            )
 
 
 def test_owp4c_rolling_producer_and_disposable_readiness_audit(monkeypatch):
@@ -266,7 +505,12 @@ def test_owp4c_rolling_producer_and_disposable_readiness_audit(monkeypatch):
             )
             owner_epoch = 3
             committed_offset = 11
-            shard_map_sha256 = _digest("shard-map")
+            market_state_shard_ids = (0, 1)
+            flow_shard_ids = (0,)
+            market_state_shard_map_sha256 = _digest(
+                "market-state-shard-map"
+            )
+            flow_shard_map_sha256 = _digest("flow-shard-map")
             with cursor(database_pool) as database_cursor:
                 persist_advanced_options_enrollment_cursor(
                     database_cursor,
@@ -325,10 +569,14 @@ def test_owp4c_rolling_producer_and_disposable_readiness_audit(monkeypatch):
                 reference_state=reference,
                 source_flow=source_flow,
                 owner_epoch=owner_epoch,
-                committed_offset=committed_offset,
-                shard_ids=(0,),
-                market_state_shard_map_sha256=shard_map_sha256,
-                flow_shard_map_sha256=shard_map_sha256,
+                market_state_committed_offset=committed_offset,
+                flow_committed_offset=committed_offset,
+                market_state_shard_ids=market_state_shard_ids,
+                flow_shard_ids=flow_shard_ids,
+                market_state_shard_map_sha256=(
+                    market_state_shard_map_sha256
+                ),
+                flow_shard_map_sha256=flow_shard_map_sha256,
                 known_at=control.planned_at,
                 valid_until=control.expires_at,
             )
@@ -358,7 +606,66 @@ def test_owp4c_rolling_producer_and_disposable_readiness_audit(monkeypatch):
                     source_flow,
                     owner_epoch=owner_epoch,
                     committed_offset=committed_offset,
-                    shard_map_sha256=shard_map_sha256,
+                    market_state_shard_ids=market_state_shard_ids,
+                    market_state_shard_map_sha256=(
+                        market_state_shard_map_sha256
+                    ),
+                    flow_shard_ids=flow_shard_ids,
+                    flow_shard_map_sha256=flow_shard_map_sha256,
+                    known_at=control.planned_at,
+                )
+            with _role_cursor(
+                database_pool,
+                roles.name("admin"),
+            ) as database_cursor:
+                database_cursor.execute(
+                    "DELETE FROM rt.consumer_checkpoints "
+                    "WHERE consumer_name=%s AND shard_id=1",
+                    (CANONICAL_MARKET_STATE_OWNER,),
+                )
+            missing_market = producer.preflight()
+            assert missing_market.status is RollingProducerStatus.BLOCKED
+            assert "MARKET_STATE_CHECKPOINT_INCOMPLETE" in (
+                missing_market.reason_codes
+            )
+            with _role_cursor(
+                database_pool,
+                roles.name("admin"),
+            ) as database_cursor:
+                _seed_consumer_checkpoint(
+                    database_cursor,
+                    owner=CANONICAL_MARKET_STATE_OWNER,
+                    control=control,
+                    source_flow=source_flow,
+                    shard_id=1,
+                    shard_map_sha256=market_state_shard_map_sha256,
+                    owner_epoch=owner_epoch,
+                    committed_offset=committed_offset,
+                    known_at=control.planned_at,
+                )
+                database_cursor.execute(
+                    "DELETE FROM rt.consumer_checkpoints "
+                    "WHERE consumer_name=%s",
+                    (CANONICAL_OPTION_FLOW_OWNER,),
+                )
+            missing_flow = producer.preflight()
+            assert missing_flow.status is RollingProducerStatus.BLOCKED
+            assert "FLOW_CHECKPOINT_INCOMPLETE" in (
+                missing_flow.reason_codes
+            )
+            with _role_cursor(
+                database_pool,
+                roles.name("admin"),
+            ) as database_cursor:
+                _seed_consumer_checkpoint(
+                    database_cursor,
+                    owner=CANONICAL_OPTION_FLOW_OWNER,
+                    control=control,
+                    source_flow=source_flow,
+                    shard_id=0,
+                    shard_map_sha256=flow_shard_map_sha256,
+                    owner_epoch=owner_epoch,
+                    committed_offset=committed_offset,
                     known_at=control.planned_at,
                 )
             preflight = producer.preflight()

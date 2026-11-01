@@ -817,6 +817,9 @@ class _ProductionPort:
             stock_alert_reason_codes_exact=(
                 value["stock_alert_reason_codes_exact"] is True
             ),
+            expected_stored_reader_count=int(
+                value.get("expected_stored_reader_count", 4)
+            ),
         )
 
     def load_equity_receipt(self, window):
@@ -1022,7 +1025,7 @@ class _ProductionPort:
                         outcome=ProviderRequestOutcome.OK,
                         http_status=response.status_code,
                         response_bytes=len(response.body),
-                        row_count=4,
+                        row_count=len(capture.selection.contracts),
                         pages_fetched=1,
                         requested_from=window.equity_cutoff,
                         requested_to=capture.selection.reviewed_at,

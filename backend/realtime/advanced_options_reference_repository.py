@@ -21,6 +21,9 @@ from .advanced_options_reference_state import (
     AdvancedOptionsReferenceStateRepository,
     AdvancedOptionsValuationReference,
     EquityMetricKind,
+    REFERENCE_STATE_VERSION,
+    REFERENCE_STATE_VERSION_V1,
+    REFERENCE_STATE_VERSIONS,
     ReferenceAvailability,
 )
 from .contracts import canonical_json
@@ -216,17 +219,37 @@ def decode_advanced_options_reference_state(
     state_sha256: str,
     document: Mapping[str, object],
 ) -> AdvancedOptionsReferenceState:
-    if document.get("contract") != "advanced-options-reference-state-v1":
+    version = document.get("contract")
+    if version not in REFERENCE_STATE_VERSIONS:
         raise ValueError("stored reference state version changed")
+    if (
+        version == REFERENCE_STATE_VERSION
+        and "data_membership_sha256" not in document
+    ):
+        raise ValueError(
+            "stored v2 reference state lacks data membership identity"
+        )
+    if (
+        version == REFERENCE_STATE_VERSION_V1
+        and "data_membership_sha256" in document
+    ):
+        raise ValueError(
+            "stored v1 reference state has a v2 membership identity"
+        )
     return AdvancedOptionsReferenceState(
         state_id=state_id,
         state_sha256=state_sha256,
-        version=document["contract"],
+        version=str(version),
         reference_generation=document["reference_generation"],
         session_date=_date(document["session_date"]),
         known_at=_datetime(document["known_at"]),
         valid_until=_datetime(document["valid_until"]),
         reference_policy_sha256=document["reference_policy_sha256"],
+        data_membership_sha256=(
+            None
+            if version == REFERENCE_STATE_VERSION_V1
+            else str(document["data_membership_sha256"])
+        ),
         contract_scope_sha256=document["contract_scope_sha256"],
         underlyings=tuple(document["underlyings"]),
         open_interest=tuple(

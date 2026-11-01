@@ -1,0 +1,161 @@
+{
+  "version": "c6_activity_momentum_v1",
+  "status": "C6_RUNTIME_LOADED",
+  "purpose": "Bounded fair-share admission for participation, short-dated sweep-like activity and directional momentum.",
+  "compatibility": {
+    "selection_policy_version": "advanced-options-selection-c6-v1",
+    "selection_policy_sha256": "2ed9cc0f5f3ca27ab18b8c8c748e7515ced01760d89b5b779f4add95a03130c8",
+    "flow_policy_version": "advanced-options-flow-v1",
+    "flow_policy_sha256": "a09fa7207c4cff7e028e54ae42ff87400ea1670247906bd2b4b4c3ebbd3d2833",
+    "mutate_compatible_policies": false,
+    "exact_four_supported": true
+  },
+  "provider_capacity": {
+    "provider_cluster": "OPTIONS",
+    "default_connection_limit": 1,
+    "quote_contract_ceiling": 1000,
+    "active_quote_contract_budget": 900,
+    "quote_slot_reserve": 100,
+    "channels": [
+      "T",
+      "Q"
+    ],
+    "wildcard_subscriptions": false,
+    "reconnect_requires_simultaneous_connection": false,
+    "stocks_connection_consumes_options_allowance": false,
+    "logical_shards_consume_connections": false
+  },
+  "allocation": {
+    "operator": "EQUAL_INITIAL_SHARE_THEN_DETERMINISTIC_ROUNDS",
+    "initial_share": "FLOOR_ACTIVE_BUDGET_DIVIDED_BY_READY_UNDERLYINGS_WITH_ELIGIBLE_GROUPS",
+    "atomic_group_owner": "VERSIONED_STRATEGY_REQUIREMENT_RESOLVER",
+    "complete_groups_only": true,
+    "shared_contract_slots": "COUNT_INCREMENTAL_UNIQUE_CONTRACTS_ONCE",
+    "unused_share_redistribution": true,
+    "round_rotation": "PERSISTED_SESSION_DERIVED_KEY",
+    "tie_breaker": "EXACT_CONTRACT_TICKER_THEN_GROUP_ID",
+    "logical_shard_maximum_contracts": "EXPLICIT_DEPLOYMENT_INPUT",
+    "candidate_output_caps_apply": false
+  },
+  "live_baskets": [
+    {
+      "id": "SHORT_DATED_ACTIVITY",
+      "priority": 1,
+      "minimum_dte": 0,
+      "maximum_dte": 5,
+      "roles": [
+        "PARTICIPATION_CONTEXT",
+        "SHORT_DATED_SWEEP_LIKE",
+        "DIRECTIONAL_MOMENTUM"
+      ],
+      "call_priority": true,
+      "put_coverage_required_when_available": true
+    },
+    {
+      "id": "CORE_MOMENTUM",
+      "priority": 2,
+      "minimum_dte": 6,
+      "maximum_dte": 21,
+      "roles": [
+        "PARTICIPATION_CONTEXT",
+        "DIRECTIONAL_MOMENTUM"
+      ],
+      "call_priority": false,
+      "put_coverage_required_when_available": true
+    },
+    {
+      "id": "STRATEGY_EXTENSION",
+      "priority": 3,
+      "minimum_dte": 22,
+      "maximum_dte": 60,
+      "roles": [
+        "STRATEGY_REQUIRED"
+      ],
+      "remaining_budget_only": true,
+      "put_coverage_required_when_available": false
+    }
+  ],
+  "role_priority": [
+    "PARTICIPATION_CONTEXT",
+    "SHORT_DATED_SWEEP_LIKE",
+    "DIRECTIONAL_MOMENTUM",
+    "STRATEGY_REQUIRED"
+  ],
+  "strategy_group_resolvers": {
+    "enabled_by_default": [],
+    "supported": [
+      "DIRECTIONAL_LONG_PREMIUM",
+      "DIRECTIONAL_DEBIT_SPREAD",
+      "SPREAD_RANGE_LOCATOR",
+      "INCOME_WHEEL",
+      "VOLATILITY_SMILE_DISTORTION"
+    ],
+    "policy_source": "backend/options/policies/strategy_o3_credit_v2.json",
+    "complete_groups_only": true,
+    "unknown_strategy": "UNAVAILABLE_NO_IMPLIED_IMPLEMENTATION"
+  },
+  "ranking": {
+    "operator": "LEXICOGRAPHIC_ASCENDING",
+    "fields": [
+      "STRUCTURAL_AND_CAPABILITY_READY",
+      "USABLE_DATED_QUOTE_FIRST",
+      "NARROWER_RELATIVE_SPREAD",
+      "RELIABLE_PRIOR_OI_FIRST",
+      "HIGHER_COMPLETED_SESSION_NOTIONAL",
+      "HIGHER_COMPLETED_SESSION_VOLUME",
+      "TARGET_DELTA_OR_MONEYNESS_DISTANCE",
+      "TARGET_EXPIRY_DISTANCE",
+      "EXACT_CONTRACT_TICKER"
+    ],
+    "missing_prior_oi": "EXPLICIT_AVAILABLE_FOR_CAPTURE_RATIO_UNAVAILABLE",
+    "missing_delta": "USE_RESOLVED_MONEYNESS_TARGET_OR_RANK_AFTER_KNOWN_DELTA",
+    "off_hours_quote": "SELECTION_EVIDENCE_NOT_LIVE_EXECUTABLE_MARK",
+    "provider_ordering_affects_selection": false
+  },
+  "flow_boundary": {
+    "flow_v1_eligible_only": true,
+    "dte_3_4": "CAPTURE_MARKET_AND_MOMENTUM_FLOW_UNAVAILABLE",
+    "unknown_flow_underlying": "CAPTURE_MARKET_AND_MOMENTUM_FLOW_UNAVAILABLE",
+    "silent_flow_policy_expansion": false
+  },
+  "pagination": {
+    "chain_endpoint": "/v3/snapshot/options/{underlyingAsset}",
+    "maximum_page_results": 250,
+    "follow_next_url": true,
+    "total_request_budget_required": true,
+    "total_decoded_byte_budget_required": true,
+    "deadline_required": true,
+    "provider_requests_during_planning": false
+  },
+  "coverage_persistence": {
+    "normalized_per_underlying_role_rows": true,
+    "immutable_allocation_document": true,
+    "bounded_rejected_group_samples": 20,
+    "states": [
+      "FULL",
+      "PARTIAL",
+      "UNCOVERED",
+      "UNAVAILABLE"
+    ],
+    "counts": [
+      "PLANNED_GROUPS",
+      "ADMITTED_GROUPS",
+      "PLANNED_CONTRACTS",
+      "ADMITTED_CONTRACTS",
+      "READY_CONTRACTS"
+    ]
+  },
+  "deferrals": {
+    "silent_accumulation": {
+      "minimum_dte": 120,
+      "maximum_dte": 730,
+      "capture_enabled": false,
+      "history_jobs_enabled": false,
+      "detector_enabled": false,
+      "live_quote_slots": 0
+    },
+    "intraday_rotation": false,
+    "trade_only_discovery": false,
+    "future_50ms_detector": false
+  }
+}

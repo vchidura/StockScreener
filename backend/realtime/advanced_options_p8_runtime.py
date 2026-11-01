@@ -43,6 +43,7 @@ from .advanced_options_service import (
     AdvancedOptionsResidentLauncher,
     build_owp3_advanced_options_resident_plan,
 )
+from .advanced_options_selection_c6 import C6SelectionPlan
 from .advanced_options_underlying_snapshot import (
     underlying_snapshot_binding_payload,
 )
@@ -156,8 +157,8 @@ class P8PreopenSessionBinding:
                     self.journal_generation,
                 )
             )
-            or len(contracts) != 4
-            or len(set(contracts)) != 4
+            or not contracts
+            or len(set(contracts)) != len(contracts)
             or [kind for kind, _owner_id in owners]
             != sorted(kind.value for kind in AdvancedOptionsProcessKind)
             or any(
@@ -1308,6 +1309,12 @@ class SessionRuntimeStatePort(Protocol):
         session_binding: P8PreopenSessionBinding,
     ) -> P8DownstreamBinding | None: ...
 
+    def load_c6_selection_plan(self) -> C6SelectionPlan | None: ...
+
+    def load_c6_selection_health(
+        self,
+    ) -> Mapping[str, object] | None: ...
+
     def attach_downstream_binding(
         self,
         session_binding: P8PreopenSessionBinding,
@@ -1400,6 +1407,14 @@ class LegacyArtifactSessionStateAdapter:
                 )
             )
         )
+
+    def load_c6_selection_plan(self) -> C6SelectionPlan | None:
+        return None
+
+    def load_c6_selection_health(
+        self,
+    ) -> Mapping[str, object] | None:
+        return None
 
     def load_preopen_session_binding(
         self,

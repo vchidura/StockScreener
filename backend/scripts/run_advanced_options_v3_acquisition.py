@@ -309,6 +309,7 @@ def main(argv=None) -> int:
         state_source=args.state_source,
     )
     binding = state.load_acquisition_binding()
+    selection_plan = state.load_c6_selection_plan()
     diagnostic_clock = (
         binding.authority.acquisition_start + timedelta(seconds=1)
         if (
@@ -374,6 +375,7 @@ def main(argv=None) -> int:
                 else (lambda: datetime.now(UTC))
             ),
             diagnostic=diagnostic,
+            selection_plan=selection_plan,
         )
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
+import re
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from psycopg2.extras import Json
@@ -45,6 +46,7 @@ PROSPECTIVE_OPENING_CHANNELS = (
     MarketChannel.QUOTE,
     MarketChannel.TRADE,
 )
+_OPTION_UNDERLYING = re.compile(r"^O:([A-Z]{1,6})")
 
 
 class OpeningAdmissionStatus(str, Enum):
@@ -94,6 +96,15 @@ def _text(value: str, name: str, *, maximum: int = 160) -> str:
     return normalized
 
 
+def _option_membership(ticker: str) -> tuple[str, str]:
+    value = ticker.strip().upper()
+    match = _OPTION_UNDERLYING.match(value)
+    side = value[-9:-8]
+    if match is None or side not in {"C", "P"}:
+        raise ValueError("option contract ticker is invalid")
+    return match.group(1), side
+
+
 @dataclass(frozen=True, slots=True)
 class ProspectiveOpeningAdmissionPolicy:
     version: str = PROSPECTIVE_OPENING_ADMISSION_VERSION
@@ -110,14 +121,30 @@ class ProspectiveOpeningAdmissionPolicy:
     )
 
     def __post_init__(self) -> None:
+        underlyings = tuple(
+            _text(value, "prospective underlying", maximum=16).upper()
+            for value in self.underlyings
+        )
         if self.version != PROSPECTIVE_OPENING_ADMISSION_VERSION:
             raise ValueError("prospective opening admission version changed")
-        if self.underlyings != PROSPECTIVE_OPENING_UNDERLYINGS:
-            raise ValueError("prospective opening admission requires QQQ and SPY")
-        if self.contracts_per_underlying != 1:
-            raise ValueError("initial opening admission requires one contract per underlyer")
+        if (
+            not underlyings
+            or len(underlyings) != len(set(underlyings))
+            or tuple(sorted(underlyings)) != underlyings
+        ):
+            raise ValueError(
+                "prospective opening underlyings are invalid"
+            )
+        if (
+            type(self.contracts_per_underlying) is not int
+            or self.contracts_per_underlying <= 0
+        ):
+            raise ValueError(
+                "prospective opening contract count is invalid"
+            )
         if self.channels != PROSPECTIVE_OPENING_CHANNELS:
             raise ValueError("prospective opening admission requires exact T/Q channels")
+        object.__setattr__(self, "underlyings", underlyings)
 
     @property
     def sha256(self) -> str:
@@ -248,10 +275,10 @@ class ProspectiveOpeningContract:
     spot: Decimal
     absolute_moneyness: Decimal
     day_volume: int
-    open_interest: int
+    open_interest: int | None
     catalog_payload_sha256: str
     snapshot_payload_sha256: str
-    open_interest_member_sha256: str
+    open_interest_member_sha256: str | None
 
     def __post_init__(self) -> None:
         ticker = _text(self.contract_ticker, "contract_ticker", maximum=80).upper()
@@ -268,8 +295,21 @@ class ProspectiveOpeningContract:
             or self.absolute_moneyness < 0
             or type(self.day_volume) is not int
             or self.day_volume < 0
-            or type(self.open_interest) is not int
-            or self.open_interest < 0
+            or (
+                self.open_interest is not None
+                and (
+                    type(self.open_interest) is not int
+                    or self.open_interest < 0
+                )
+            )
+            or (
+                self.open_interest is None
+                and self.open_interest_member_sha256 is not None
+            )
+            or (
+                self.open_interest is not None
+                and self.open_interest_member_sha256 is None
+            )
         ):
             raise ValueError("prospective opening contract identity is invalid")
         object.__setattr__(self, "contract_ticker", ticker)
@@ -277,9 +317,17 @@ class ProspectiveOpeningContract:
         for name in (
             "catalog_payload_sha256",
             "snapshot_payload_sha256",
-            "open_interest_member_sha256",
         ):
             object.__setattr__(self, name, _sha256(getattr(self, name), name))
+        if self.open_interest_member_sha256 is not None:
+            object.__setattr__(
+                self,
+                "open_interest_member_sha256",
+                _sha256(
+                    self.open_interest_member_sha256,
+                    "open_interest_member_sha256",
+                ),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,7 +354,13 @@ class ProspectiveOpeningAdmission:
         boundary = _utc(self.capture_boundary, "capture_boundary")
         contracts = tuple(sorted(
             self.contracts,
-            key=lambda row: (row.underlyer, row.contract_type),
+            key=lambda row: (
+                row.underlyer,
+                row.contract_type,
+                row.expiration_date,
+                row.strike,
+                row.contract_ticker,
+            ),
         ))
         reasons = tuple(dict.fromkeys(
             _text(value, "reason_code", maximum=96).upper()
@@ -349,15 +403,10 @@ class ProspectiveOpeningAdmission:
                 or self.pre_session_selection_sha256 is None
                 or self.source_evidence_sha256 is None
                 or self.reference_evidence_sha256 is None
-                or {
-                    (row.underlyer, row.contract_type)
-                    for row in contracts
-                }
-                != {
-                    (underlyer, contract_type)
-                    for underlyer in PROSPECTIVE_OPENING_UNDERLYINGS
-                    for contract_type in ("CALL", "PUT")
-                }
+                or not contracts
+                or len({
+                    row.contract_ticker for row in contracts
+                }) != len(contracts)
             ):
                 raise ValueError("ready opening admission is incomplete")
         elif self.opening_capture_ready or contracts or not reasons:
@@ -486,15 +535,21 @@ def prospective_opening_admission_from_payload(
                 str(row["absolute_moneyness"])
             ),
             day_volume=int(row["day_volume"]),
-            open_interest=int(row["open_interest"]),
+            open_interest=(
+                None
+                if row.get("open_interest") is None
+                else int(row["open_interest"])
+            ),
             catalog_payload_sha256=str(
                 row["catalog_payload_sha256"]
             ),
             snapshot_payload_sha256=str(
                 row["snapshot_payload_sha256"]
             ),
-            open_interest_member_sha256=str(
-                row["open_interest_member_sha256"]
+            open_interest_member_sha256=(
+                None
+                if row.get("open_interest_member_sha256") is None
+                else str(row["open_interest_member_sha256"])
             ),
         )
         for row in contracts_value
@@ -520,6 +575,7 @@ def prospective_opening_admission_from_payload(
         ),
         contracts=contracts,
         reason_codes=tuple(value.get("reason_codes") or ()),
+        policy_sha256=str(value["policy_sha256"]),
     )
     if prospective_opening_admission_payload(admission) != value:
         raise ValueError("prospective opening admission payload changed")
@@ -538,7 +594,13 @@ def _opening_admission(
     reference_evidence_sha256: str | None,
     contracts: tuple[ProspectiveOpeningContract, ...] = (),
     reason_codes: tuple[str, ...] = (),
+    policy: ProspectiveOpeningAdmissionPolicy = (
+        PROSPECTIVE_OPENING_ADMISSION_POLICY
+    ),
+    policy_sha256: str | None = None,
 ) -> ProspectiveOpeningAdmission:
+    if not isinstance(policy, ProspectiveOpeningAdmissionPolicy):
+        raise TypeError("prospective opening policy is invalid")
     unsigned = ProspectiveOpeningAdmission.__new__(ProspectiveOpeningAdmission)
     object.__setattr__(unsigned, "admission_id", UUID(int=1))
     object.__setattr__(unsigned, "admission_sha256", "0" * 64)
@@ -553,7 +615,11 @@ def _opening_admission(
     object.__setattr__(
         unsigned,
         "policy_sha256",
-        PROSPECTIVE_OPENING_ADMISSION_POLICY.sha256,
+        (
+            policy.sha256
+            if policy_sha256 is None
+            else _sha256(policy_sha256, "policy_sha256")
+        ),
     )
     object.__setattr__(
         unsigned,
@@ -602,7 +668,11 @@ def _opening_admission(
         session_date=session_date,
         prepared_at=prepared_at,
         capture_boundary=capture_boundary,
-        policy_sha256=PROSPECTIVE_OPENING_ADMISSION_POLICY.sha256,
+        policy_sha256=(
+            policy.sha256
+            if policy_sha256 is None
+            else _sha256(policy_sha256, "policy_sha256")
+        ),
         pre_session_selection_id=pre_session_selection_id,
         pre_session_selection_sha256=pre_session_selection_sha256,
         source_evidence_sha256=source_evidence_sha256,
@@ -620,6 +690,9 @@ def unavailable_prospective_opening_admission(
     capture_boundary: datetime,
     reason_codes: tuple[str, ...],
     source_evidence_sha256: str | None = None,
+    policy: ProspectiveOpeningAdmissionPolicy = (
+        PROSPECTIVE_OPENING_ADMISSION_POLICY
+    ),
 ) -> ProspectiveOpeningAdmission:
     return _opening_admission(
         status=OpeningAdmissionStatus.UNAVAILABLE,
@@ -631,6 +704,7 @@ def unavailable_prospective_opening_admission(
         source_evidence_sha256=source_evidence_sha256,
         reference_evidence_sha256=None,
         reason_codes=reason_codes,
+        policy=policy,
     )
 
 
@@ -663,7 +737,12 @@ def build_prospective_opening_admission(
     *,
     prepared_at: datetime,
     capture_boundary: datetime,
+    policy: ProspectiveOpeningAdmissionPolicy = (
+        PROSPECTIVE_OPENING_ADMISSION_POLICY
+    ),
 ) -> ProspectiveOpeningAdmission:
+    if not isinstance(policy, ProspectiveOpeningAdmissionPolicy):
+        raise TypeError("prospective opening policy is invalid")
     prepared = _utc(prepared_at, "prepared_at")
     boundary = _utc(capture_boundary, "capture_boundary")
     if prepared >= boundary:
@@ -675,6 +754,7 @@ def build_prospective_opening_admission(
             prepared_at=prepared,
             capture_boundary=boundary,
             reason_codes=("PRE_SESSION_SELECTION_UNAVAILABLE",),
+            policy=policy,
         )
     if result.plan.session_date != session_date:
         raise ValueError("pre-session selection belongs to another session")
@@ -685,6 +765,7 @@ def build_prospective_opening_admission(
             capture_boundary=boundary,
             source_evidence_sha256=result.plan.source_evidence_sha256,
             reason_codes=("PRE_SESSION_SELECTION_BLOCKED",),
+            policy=policy,
         )
     if not result.catalog or not result.snapshots:
         return unavailable_prospective_opening_admission(
@@ -693,6 +774,7 @@ def build_prospective_opening_admission(
             capture_boundary=boundary,
             source_evidence_sha256=result.plan.source_evidence_sha256,
             reason_codes=("PRE_SESSION_RANKING_INPUTS_UNAVAILABLE",),
+            policy=policy,
         )
     if reference is None:
         return unavailable_prospective_opening_admission(
@@ -701,6 +783,7 @@ def build_prospective_opening_admission(
             capture_boundary=boundary,
             source_evidence_sha256=result.plan.source_evidence_sha256,
             reason_codes=("PRE_OPEN_REFERENCE_UNAVAILABLE",),
+            policy=policy,
         )
     if (
         reference.session_date != session_date
@@ -716,17 +799,20 @@ def build_prospective_opening_admission(
         row
         for row in result.plan.dispositions
         if row.status is ContractSelectionStatus.INCLUDED
-        and row.underlyer in PROSPECTIVE_OPENING_UNDERLYINGS
+        and row.underlyer in policy.underlyings
     )
     if {row.underlyer for row in included} != set(
-        PROSPECTIVE_OPENING_UNDERLYINGS
+        policy.underlyings
     ):
         return unavailable_prospective_opening_admission(
             session_date=session_date,
             prepared_at=prepared,
             capture_boundary=boundary,
             source_evidence_sha256=result.plan.source_evidence_sha256,
-            reason_codes=("QQQ_SPY_PRE_SESSION_COVERAGE_UNAVAILABLE",),
+            reason_codes=(
+                "CONFIGURED_PRE_SESSION_COVERAGE_UNAVAILABLE",
+            ),
+            policy=policy,
         )
     if any(
         row.contract_id not in catalog
@@ -740,10 +826,11 @@ def build_prospective_opening_admission(
             capture_boundary=boundary,
             source_evidence_sha256=result.plan.source_evidence_sha256,
             reason_codes=("EXACT_PRE_SESSION_RANKING_INPUT_UNAVAILABLE",),
+            policy=policy,
         )
 
     candidates: dict[str, list[ProspectiveOpeningContract]] = {
-        ticker: [] for ticker in PROSPECTIVE_OPENING_UNDERLYINGS
+        ticker: [] for ticker in policy.underlyings
     }
     for disposition in included:
         catalog_row = catalog[disposition.contract_id]
@@ -772,6 +859,7 @@ def build_prospective_opening_admission(
                 capture_boundary=boundary,
                 source_evidence_sha256=result.plan.source_evidence_sha256,
                 reason_codes=("EXACT_OI_LIQUIDITY_IDENTITY_UNAVAILABLE",),
+                policy=policy,
             )
         candidates[disposition.underlyer].append(
             ProspectiveOpeningContract(
@@ -797,7 +885,7 @@ def build_prospective_opening_admission(
         )
 
     selected = []
-    for underlyer in PROSPECTIVE_OPENING_UNDERLYINGS:
+    for underlyer in policy.underlyings:
         for contract_type in ("CALL", "PUT"):
             ranked = sorted(
                 (
@@ -813,7 +901,7 @@ def build_prospective_opening_admission(
                     row.contract_ticker,
                 ),
             )
-            if not ranked:
+            if len(ranked) < policy.contracts_per_underlying:
                 return unavailable_prospective_opening_admission(
                     session_date=session_date,
                     prepared_at=prepared,
@@ -824,8 +912,11 @@ def build_prospective_opening_admission(
                     reason_codes=(
                         "PROSPECTIVE_RANKING_RESULT_UNAVAILABLE",
                     ),
+                    policy=policy,
                 )
-            selected.append(ranked[0])
+            selected.extend(
+                ranked[:policy.contracts_per_underlying]
+            )
 
     return _opening_admission(
         status=OpeningAdmissionStatus.READY,
@@ -837,6 +928,7 @@ def build_prospective_opening_admission(
         source_evidence_sha256=result.plan.source_evidence_sha256,
         reference_evidence_sha256=reference.sha256,
         contracts=tuple(selected),
+        policy=policy,
     )
 
 
@@ -859,6 +951,12 @@ class OpeningSubscriptionReadiness:
         ready = _utc(self.ready_at, "ready_at")
         boundary = _utc(self.capture_boundary, "capture_boundary")
         slots = tuple(sorted(self.slots, key=lambda row: row[2]))
+        try:
+            memberships = tuple(
+                _option_membership(row[2]) for row in slots
+            )
+        except ValueError:
+            memberships = ()
         if (
             not isinstance(self.admission_id, UUID)
             or not isinstance(self.cohort_id, UUID)
@@ -868,17 +966,10 @@ class OpeningSubscriptionReadiness:
             or self.journal_generation.int == 0
             or self.slot_set_version != 1
             or ready > boundary
-            or len(slots) != 4
-            or len({row[2] for row in slots}) != 4
+            or not slots
+            or len({row[2] for row in slots}) != len(slots)
             or any(row[4] != ("Q", "T") for row in slots)
-            or any(
-                sum(
-                    row[2].startswith(f"O:{underlyer}")
-                    for row in slots
-                )
-                != 2
-                for underlyer in PROSPECTIVE_OPENING_UNDERLYINGS
-            )
+            or not memberships
         ):
             raise ValueError("opening subscription readiness is incomplete")
         object.__setattr__(self, "ready_at", ready)

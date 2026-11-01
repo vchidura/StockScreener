@@ -59,7 +59,11 @@ from .advanced_options_underlying_snapshot import (
     underlying_snapshot_binding_from_payload,
     underlying_snapshot_binding_payload,
 )
-from .advanced_options_service import OPTIONS_NON_SERVING_STAGE_ORDER
+from .advanced_options_service import (
+    OPTIONS_LATE_CANARY_V4_STAGE_ORDER,
+    OPTIONS_NON_SERVING_STAGE_ORDER,
+    OPTIONS_V3_STAGE_ORDER,
+)
 from .advanced_options_projection import (
     OPTIONS_PAGE_SNAPSHOT_TYPES,
     OPTIONS_PROJECTION_TYPES,
@@ -258,7 +262,12 @@ class _DockerWindowOrchestrator:
                         status="FINISHED",
                         window_state="COMPLETE",
                     )
-                if state in {"FAILED", "MISSED", "RETAINED_GAP"}:
+                if state in {
+                    "FAILED",
+                    "MISSED",
+                    "RETAINED_GAP",
+                    "UNAVAILABLE",
+                }:
                     return SimpleNamespace(
                         status="FINISHED",
                         window_state=state,
@@ -289,6 +298,60 @@ def run_p8_production_role(**kwargs):
     return run_p8_role(**kwargs)
 
 
+def _unavailable_serial_window(
+    *,
+    provider,
+    binding,
+    stage_order,
+    flow_resolution,
+    dependency_evidence,
+):
+    unavailable = [
+        {
+            "contract_ticker": row.contract_ticker,
+            "underlyer": row.underlyer,
+            "state": "UNAVAILABLE",
+            "reason_code": row.reason_code,
+        }
+        for row in flow_resolution.unavailable
+    ]
+    stage_results = {}
+    for stage_id in stage_order:
+        evidence_sha256 = canonical_sha256({
+            "contract": "advanced-options-unavailable-stage-v1",
+            "window_id": str(binding.window_id),
+            "stage_id": stage_id,
+            "flow_unavailable_contracts": unavailable,
+            "dependency_evidence": dependency_evidence,
+        })
+        stage_results[stage_id] = {
+            "state": "UNAVAILABLE",
+            "reason_codes": [
+                "FLOW_POLICY_NO_ELIGIBLE_CONTRACTS",
+                f"UNAVAILABLE_EVIDENCE:{evidence_sha256}",
+            ],
+            "evidence_sha256": evidence_sha256,
+        }
+    persisted = PostgresOrchestrationRepository(
+        provider
+    ).finish_unavailable_window(
+        binding.window_id,
+        stage_results,
+        now=datetime.now(UTC),
+    )
+    return {
+        "status": "FINISHED" if persisted else "NOT_CLAIMED",
+        "window_state": "UNAVAILABLE",
+        "window_id": str(binding.window_id),
+        "stage_order": list(stage_order),
+        "stage_results": stage_results,
+        "flow_state": "UNAVAILABLE",
+        "flow_unavailable_contracts": unavailable,
+        "dependency_evidence": dependency_evidence,
+        "persisted": persisted,
+    }
+
+
 def run_p8_serial_window(
     *,
     provider,
@@ -302,7 +365,6 @@ def run_p8_serial_window(
     )
     from .advanced_options_ingress import AdvancedOptionsJournalSource
     from .advanced_options_p8_roles import (
-        _contract_scope,
         _flow_environment,
         _journal_root,
     )
@@ -329,12 +391,24 @@ def run_p8_serial_window(
     flow_owner_epoch = int(
         dependency_evidence["FLOW"].get("owner_epoch", 1)
     )
-    flow_environment = _flow_environment(
+    (
+        flow_environment,
+        flow_resolution,
+        _advanced_policy,
+    ) = _flow_environment(
         provider,
         binding,
         source,
         flow_owner_epoch,
     )
+    if flow_environment is None:
+        return _unavailable_serial_window(
+            provider=provider,
+            binding=binding,
+            stage_order=OPTIONS_LATE_CANARY_V4_STAGE_ORDER,
+            flow_resolution=flow_resolution,
+            dependency_evidence=dependency_evidence,
+        )
     return build_and_run_p8_serial_window(
         provider=provider,
         binding=binding,
@@ -361,7 +435,6 @@ def run_v3_serial_window(
     )
     from .advanced_options_ingress import AdvancedOptionsJournalSource
     from .advanced_options_p8_roles import (
-        _contract_scope,
         _flow_environment,
         _journal_root,
     )
@@ -435,12 +508,24 @@ def run_v3_serial_window(
     flow_owner_epoch = int(
         dependency_evidence["FLOW"].get("owner_epoch", 1)
     )
-    flow_environment = _flow_environment(
+    (
+        flow_environment,
+        flow_resolution,
+        _advanced_policy,
+    ) = _flow_environment(
         provider,
         binding,
         source,
         flow_owner_epoch,
     )
+    if flow_environment is None:
+        return _unavailable_serial_window(
+            provider=provider,
+            binding=binding,
+            stage_order=OPTIONS_V3_STAGE_ORDER,
+            flow_resolution=flow_resolution,
+            dependency_evidence=dependency_evidence,
+        )
     role_provider = RoleScopedConnectionProvider(
         {RealtimeDatabasePrincipal.RUNTIME: pool},
         {

@@ -35,6 +35,9 @@ from realtime.advanced_options_p8_canary_authorization import (  # noqa: E402
 from realtime.advanced_options_p8_production import (  # noqa: E402
     build_advanced_options_p8_production_components,
 )
+from realtime.advanced_options_activity_momentum_c6 import (  # noqa: E402
+    activity_momentum_allocation_from_payload,
+)
 from realtime.advanced_options_p8_selection_source import (  # noqa: E402
     p8_activity_selection_capture_from_sealed,
 )
@@ -390,15 +393,20 @@ def _prepare_session_authority(
 ):
     snapshots = capture["selected_snapshots"]
     tickers = tuple(sorted(snapshots))
+    allocation_value = capture.get("activity_momentum_allocation")
+    allocation = (
+        None
+        if allocation_value is None
+        else activity_momentum_allocation_from_payload(
+            allocation_value
+        )
+    )
     if (
-        len(tickers) != 4
-        or {
-            value["underlying_asset"]["ticker"]
-            for value in snapshots.values()
-        }
-        != {"QQQ", "SPY"}
+        not tickers
+        or allocation is not None
+        and tuple(allocation.selected_contract_tickers) != tickers
     ):
-        raise ValueError("pre-session four-contract admission changed")
+        raise ValueError("pre-session configured admission changed")
     with provider.transaction(
         APP_ROLE,
         read_only=True,
@@ -426,17 +434,27 @@ def _prepare_session_authority(
         contract_type = str(
             snapshot["details"]["contract_type"]
         ).upper()
-        open_interest = int(snapshot["open_interest"])
-        member_sha256 = canonical_sha256({
-            "ticker": ticker,
-            "open_interest": open_interest,
-            "settlement_session": (
-                OptionExchangeCalendar()
-                .previous_session_date(args.session_date)
-                .isoformat()
-            ),
-            "capture_sha256": capture["semantic_sha256"],
-        })
+        raw_open_interest = snapshot.get("open_interest")
+        open_interest = (
+            int(raw_open_interest)
+            if isinstance(raw_open_interest, int)
+            and raw_open_interest >= 0
+            else None
+        )
+        member_sha256 = (
+            None
+            if open_interest is None
+            else canonical_sha256({
+                "ticker": ticker,
+                "open_interest": open_interest,
+                "settlement_session": (
+                    OptionExchangeCalendar()
+                    .previous_session_date(args.session_date)
+                    .isoformat()
+                ),
+                "capture_sha256": capture["semantic_sha256"],
+            })
+        )
         contracts.append(ProspectiveOpeningContract(
             contract_id=int(row["contract_id"]),
             catalog_version_id=int(row["version_id"]),
@@ -476,6 +494,11 @@ def _prepare_session_authority(
             ),
         }),
         contracts=tuple(contracts),
+        policy_sha256=(
+            None
+            if allocation is None
+            else allocation.profile_sha256
+        ),
     )
     journal_generation = uuid5(
         NAMESPACE_URL,
@@ -517,9 +540,9 @@ def _prepare_session_authority(
         session_date=args.session_date,
         authorization_reference=args.authorization_reference,
         provider_authorization_reference=args.authorization_reference,
-        expected_cost="exact two-request post-E activity selection",
-        request_ceiling=2,
-        decoded_byte_ceiling=100_000_000,
+        expected_cost="bounded paginated activity/momentum selection",
+        request_ceiling=int(capture["provider_requests"]),
+        decoded_byte_ceiling=int(capture["decoded_bytes"]),
         lanes=ADVANCED_OPTIONS_REST_LANES,
         authorized_until=args.hard_stop,
     )

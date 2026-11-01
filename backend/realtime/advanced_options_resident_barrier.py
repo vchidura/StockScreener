@@ -64,6 +64,20 @@ def _nonnegative_offset(evidence, name: str) -> int:
     return value
 
 
+def _shard_ids(evidence) -> tuple[int, ...]:
+    values = evidence.get("shard_ids")
+    if not isinstance(values, list):
+        raise ValueError("resident completion shard_ids is invalid")
+    shard_ids = tuple(values)
+    if (
+        not shard_ids
+        or any(type(value) is not int for value in shard_ids)
+        or shard_ids != tuple(range(len(shard_ids)))
+    ):
+        raise ValueError("resident completion shard_ids is invalid")
+    return shard_ids
+
+
 def _validate_complete_evidence(
     completion: "ResidentCompletion",
 ) -> None:
@@ -93,6 +107,7 @@ def _validate_complete_evidence(
             evidence,
             "normalized_end_offset",
         )
+        _shard_ids(evidence)
         if (
             normalized != completion.ending_offset
             or any(
@@ -110,16 +125,24 @@ def _validate_complete_evidence(
             )
     else:
         raw = _nonnegative_offset(evidence, "raw_end_offset")
+        _nonnegative_offset(evidence, "normalized_end_offset")
         checkpoint = _nonnegative_offset(
             evidence,
             "checkpoint_end_offset",
         )
+        _shard_ids(evidence)
         if (
             checkpoint != completion.ending_offset
             or checkpoint > raw
             or evidence.get("owner_epoch") != completion.owner_epoch
             or not isinstance(evidence.get("evidence_ref"), str)
             or not evidence["evidence_ref"].strip()
+            or not isinstance(evidence.get("shard_map_sha256"), str)
+            or len(evidence["shard_map_sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in evidence["shard_map_sha256"]
+            )
         ):
             raise ValueError(
                 "FLOW resident completion evidence changed"
@@ -426,7 +449,10 @@ def evaluate_resident_completion_barrier_cursor(
     flow = evidence_by_member[ResidentCompletionMember.FLOW]
     if (
         ingress["raw_end_offset"] != flow["raw_end_offset"]
+        or ingress["raw_end_offset"] != flow["checkpoint_end_offset"]
         or ingress["normalized_end_offset"]
+        != market_state["normalized_end_offset"]
+        or flow["normalized_end_offset"]
         != market_state["normalized_end_offset"]
     ):
         raise ResidentCompletionDivergence(
@@ -595,7 +621,13 @@ def advanced_options_v3_session_status_cursor(
     market_offset = checkpoints.get("market-state-materializer-v1", 0)
     flow_offset = checkpoints.get("option_flow_stream_v1", 0)
     windows_complete = all(
-        row["state"] in {"COMPLETE", "FAILED", "MISSED", "RETAINED_GAP"}
+        row["state"] in {
+            "COMPLETE",
+            "FAILED",
+            "MISSED",
+            "RETAINED_GAP",
+            "UNAVAILABLE",
+        }
         and len(row["residents"]) == len(ResidentCompletionMember)
         for row in windows
     )

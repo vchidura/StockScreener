@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
@@ -18,6 +19,13 @@ from .advanced_options_acquisition_runtime import (
     AdvancedOptionsAcquisitionBinding,
     acquisition_binding_from_payload,
     acquisition_binding_payload,
+)
+from .advanced_options_activity_momentum_c6 import (
+    activity_momentum_allocation_from_payload,
+    activity_momentum_allocation_payload,
+    c6_coverage_from_activity_allocation,
+    c6_members_from_activity_allocation,
+    load_activity_momentum_profile,
 )
 from .advanced_options_p8_runtime import (
     LegacyArtifactSessionStateAdapter,
@@ -38,6 +46,20 @@ from .advanced_options_p8_selection_source import (
 from .advanced_options_reference_repository import (
     PostgresAdvancedOptionsReferenceStateRepository,
 )
+from .advanced_options_selection_c6 import (
+    C6ConnectionCapacity,
+    C6ReadinessState,
+    C6SelectionMember,
+    C6SelectionPlan,
+    C6UnderlyingReadiness,
+    OptionSide,
+    build_c6_selection_plan,
+    c6_selection_health_cursor,
+    load_c6_selection_cursor,
+    load_advanced_options_selection_c6_policy,
+    load_strategy_policy_identity,
+    persist_c6_selection_cursor,
+)
 from .advanced_options_service import AdvancedOptionsProcessKind
 from .advanced_options_v3_authority import (
     AdvancedOptionsAuthorityBundle,
@@ -52,11 +74,14 @@ from .advanced_options_v3_history import (
     advanced_options_v3_history_binding_from_payload,
 )
 from .advanced_realtime_desired_state import (
-    DEFAULT_OPTION_UNDERLYINGS,
     DesiredMemberKind,
 )
 from .advanced_realtime_desired_state_repository import (
     load_effective_desired_state_reconciliation_cursor,
+)
+from .advanced_options_flow_policy import (
+    EXPECTED_UNDERLYINGS,
+    load_advanced_options_flow_policy,
 )
 from .contracts import (
     EQUITY_VALIDATION_UNIVERSE,
@@ -80,6 +105,12 @@ OPTIONS_STATE_SOURCE_ENV = "REALTIME_V3_OPTIONS_STATE_SOURCE"
 ACTIVATION_SERIALIZATION_ATTEMPTS = 3
 _DEFAULT_PACKAGE_PATH_REFERENCE = (
     "/run/advanced-options-p8/package.json"
+)
+_DEFAULT_C6_STRATEGY_POLICY_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "options"
+    / "policies"
+    / "strategy_o3_credit_v2.json"
 )
 
 
@@ -154,6 +185,8 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
         self._head_checked_at: float | None = None
         self._head_sequence = 0
         self._head_binding: P8DownstreamBinding | None = None
+        self._c6_selection_loaded = False
+        self._c6_selection: C6SelectionPlan | None = None
 
     def _load_stored(self) -> _StoredContinuousSession:
         if self._stored is not None:
@@ -363,6 +396,7 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
         package: Mapping[str, object],
         authority_bundle: AdvancedOptionsAuthorityBundle,
         reference: OpeningReferenceEvidence,
+        selection_plan: C6SelectionPlan | None = None,
     ):
         authority = authority_bundle.session
         admission = authority_bundle.admission
@@ -396,15 +430,41 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
             if row.enabled
             and row.kind is DesiredMemberKind.OPTION_UNDERLYING
         }
+        configured_option_underlyings = (
+            set(selection_plan.broad_underlyings)
+            if selection_plan is not None
+            else {
+                row.underlyer for row in admission.contracts
+            }
+        )
         if (
             equity_members
             != set(EQUITY_VALIDATION_UNIVERSE.equity_tickers)
-            or option_underlyings != set(DEFAULT_OPTION_UNDERLYINGS)
+            or option_underlyings != configured_option_underlyings
         ):
             raise ValueError(
-                "C5 requires the exact target-9 plus QQQ/SPY snapshot"
+                "continuous Options requires target-9 Equity plus "
+                "the configured Options snapshot"
             )
         snapshot = reconciliation.snapshot
+        if selection_plan is not None and (
+            selection_plan.session_date != authority.session_date
+            or selection_plan.desired_revision_id
+            != snapshot.revision_id
+            or selection_plan.desired_snapshot_sha256
+            != snapshot.snapshot_sha256
+            or {
+                row.contract_ticker
+                for row in selection_plan.members
+            }
+            != {
+                row.contract_ticker
+                for row in admission.contracts
+            }
+        ):
+            raise ValueError(
+                "C6 selection plan diverges from current session"
+            )
         cursor.execute(
             "SELECT manifest.session_date,manifest.manifest_id::text,"
             "snapshot.snapshot_sha256 "
@@ -589,12 +649,22 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
             row.contract_ticker: row for row in reference.open_interest
         }
         if (
-            set(reference_by_ticker) != set(contracts)
+            not set(reference_by_ticker).issubset(contracts)
             or any(
-                reference_by_ticker[ticker].open_interest
-                != contract.open_interest
-                or reference_by_ticker[ticker].member_sha256
-                != contract.open_interest_member_sha256
+                (
+                    contract.open_interest is None
+                    and ticker in reference_by_ticker
+                )
+                or (
+                    contract.open_interest is not None
+                    and (
+                        ticker not in reference_by_ticker
+                        or reference_by_ticker[ticker].open_interest
+                        != contract.open_interest
+                        or reference_by_ticker[ticker].member_sha256
+                        != contract.open_interest_member_sha256
+                    )
+                )
                 for ticker, contract in contracts.items()
             )
         ):
@@ -624,6 +694,7 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
         authority_document: Mapping[str, object],
         acquisition_document: Mapping[str, object],
         session_document: Mapping[str, object],
+        selection_plan: C6SelectionPlan | None,
     ) -> None:
         cursor.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
@@ -637,6 +708,7 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
             package=package_document,
             authority_bundle=authority_bundle,
             reference=reference,
+            selection_plan=selection_plan,
         )
         persist_session_acquisition_authorization_cursor(
             cursor,
@@ -742,6 +814,12 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
             raise ValueError(
                 "continuous Options downstream head is invalid"
             )
+        if selection_plan is not None:
+            persist_c6_selection_cursor(
+                cursor,
+                session_binding_id=session_binding.binding_id,
+                plan=selection_plan,
+            )
 
     def activate_session(
         self,
@@ -752,6 +830,7 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
         reference: OpeningReferenceEvidence,
         sealed_selection: Mapping[str, object],
         written_at: datetime,
+        selection_plan: C6SelectionPlan | None = None,
         package_path_reference: str = (
             _DEFAULT_PACKAGE_PATH_REFERENCE
         ),
@@ -771,6 +850,15 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
             != tuple(
                 row.contract_ticker
                 for row in authority_bundle.admission.contracts
+            )
+            or selection_plan is not None
+            and not isinstance(selection_plan, C6SelectionPlan)
+            or selection_plan is not None
+            and (
+                selection_plan.physical_subscription.owner_id
+                != acquisition_binding.owner_id
+                or selection_plan.physical_subscription.journal_generation
+                != authority_bundle.session.journal_generation
             )
         ):
             raise ValueError(
@@ -829,6 +917,7 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
                         authority_document=authority_document,
                         acquisition_document=acquisition_document,
                         session_document=session_document,
+                        selection_plan=selection_plan,
                     )
                 break
             except PsycopgError as error:
@@ -846,6 +935,8 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
         self._checked_at = authority_bundle.session.prepared_at
         self._stored = None
         self._head_checked_at = None
+        self._c6_selection_loaded = False
+        self._c6_selection = None
         self._load_stored()
         return session_binding
 
@@ -857,6 +948,8 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
         acquisition_binding: AdvancedOptionsAcquisitionBinding,
         sealed_selection: Mapping[str, object],
         written_at: datetime,
+        selection_plan: C6SelectionPlan | None = None,
+        selection_capacity: C6ConnectionCapacity | None = None,
         package_path_reference: str = (
             _DEFAULT_PACKAGE_PATH_REFERENCE
         ),
@@ -902,6 +995,12 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
                 (str(session.cohort_id),),
             )
             slot_rows = unit.cursor.fetchall()
+            reconciliation = (
+                load_effective_desired_state_reconciliation_cursor(
+                    unit.cursor,
+                    session_date=session.session_date,
+                )
+            )
         if version is None or str(version[0]) != "PRE_SESSION":
             raise ValueError(
                 "current-session pre-open slot set is unavailable"
@@ -983,6 +1082,228 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
             admission=admission,
             readiness=readiness,
         )
+        if selection_plan is None and selection_capacity is not None:
+            if (
+                reconciliation is None
+                or reconciliation.snapshot is None
+                or reconciliation.state != "READY"
+            ):
+                raise ValueError(
+                    "C6 effective desired snapshot is unavailable"
+                )
+            flow_policy = load_advanced_options_flow_policy()
+            selection_policy = (
+                load_advanced_options_selection_c6_policy()
+            )
+            allocation_value = sealed_selection.get(
+                "activity_momentum_allocation"
+            )
+            allocation = (
+                None
+                if allocation_value is None
+                else activity_momentum_allocation_from_payload(
+                    allocation_value
+                )
+            )
+            if allocation is not None:
+                profile = load_activity_momentum_profile(
+                    selection_policy=selection_policy,
+                    version=allocation.profile_version,
+                    profile_sha256=allocation.profile_sha256,
+                )
+                if (
+                    allocation.profile_sha256
+                    != profile.profile_sha256
+                    or allocation.session_date != session.session_date
+                    or set(allocation.selected_contract_tickers)
+                    != {
+                        row.contract_ticker
+                        for row in admission.contracts
+                    }
+                ):
+                    raise ValueError(
+                        "C6 activity/momentum allocation diverged"
+                    )
+                catalog_members = {
+                    row.contract_ticker: C6SelectionMember(
+                        contract_id=row.contract_id,
+                        contract_ticker=row.contract_ticker,
+                        underlying=row.underlyer,
+                        expiration=row.expiration_date,
+                        strike=row.strike,
+                        option_side=(
+                            OptionSide.CALL
+                            if row.contract_type == "CALL"
+                            else OptionSide.PUT
+                        ),
+                        multiplier=Decimal("100"),
+                        deliverable="STANDARD",
+                        catalog_version_id=row.catalog_version_id,
+                        catalog_payload_sha256=(
+                            row.catalog_payload_sha256
+                        ),
+                        matching_strategies=(),
+                        contract_roles=("ALLOCATED_CONTRACT",),
+                        selection_reasons=("CATALOG_IDENTITY",),
+                        evidence_references=(
+                            row.snapshot_payload_sha256,
+                            row.open_interest_member_sha256,
+                        ),
+                        flow_eligible=False,
+                    )
+                    for row in admission.contracts
+                }
+                members = c6_members_from_activity_allocation(
+                    allocation,
+                    catalog_members=catalog_members,
+                )
+                admission_by_ticker = {
+                    row.contract_ticker: row
+                    for row in admission.contracts
+                }
+                if any(
+                    member.contract_id
+                    != admission_by_ticker[
+                        member.contract_ticker
+                    ].contract_id
+                    or member.catalog_version_id
+                    != admission_by_ticker[
+                        member.contract_ticker
+                    ].catalog_version_id
+                    or member.catalog_payload_sha256
+                    != admission_by_ticker[
+                        member.contract_ticker
+                    ].catalog_payload_sha256
+                    for member in members
+                ):
+                    raise ValueError(
+                        "C6 allocation catalog identity diverged"
+                    )
+                admission_profile_version = profile.version
+                admission_profile_sha256 = profile.profile_sha256
+                allocation_document = (
+                    activity_momentum_allocation_payload(allocation)
+                )
+                allocation_coverage = (
+                    c6_coverage_from_activity_allocation(allocation)
+                )
+            else:
+                if len(admission.contracts) != 4:
+                    raise ValueError(
+                        "configured C6 admission requires persisted "
+                        "activity/momentum allocation"
+                    )
+                members = tuple(
+                    C6SelectionMember(
+                        contract_id=row.contract_id,
+                        contract_ticker=row.contract_ticker,
+                        underlying=row.underlyer,
+                        expiration=row.expiration_date,
+                        strike=row.strike,
+                        option_side=(
+                            OptionSide.CALL
+                            if row.contract_type == "CALL"
+                            else OptionSide.PUT
+                        ),
+                        multiplier=Decimal("100"),
+                        deliverable="STANDARD",
+                        catalog_version_id=row.catalog_version_id,
+                        catalog_payload_sha256=(
+                            row.catalog_payload_sha256
+                        ),
+                        matching_strategies=(),
+                        contract_roles=(
+                            "CALL_ANCHOR"
+                            if row.contract_type == "CALL"
+                            else "PUT_ANCHOR",
+                        ),
+                        selection_reasons=(
+                            "EXACT_FOUR_COMPATIBILITY",
+                        ),
+                        evidence_references=(
+                            row.snapshot_payload_sha256,
+                            row.open_interest_member_sha256,
+                        ),
+                        flow_eligible=(
+                            row.underlyer in EXPECTED_UNDERLYINGS
+                            and 0
+                            <= (
+                                row.expiration_date
+                                - session.session_date
+                            ).days
+                            <= 60
+                            and flow_policy.lane_for(
+                                (
+                                    row.expiration_date
+                                    - session.session_date
+                                ).days
+                            )
+                            is not None
+                        ),
+                    )
+                    for row in admission.contracts
+                )
+                admission_profile_version = None
+                admission_profile_sha256 = None
+                allocation_document = None
+                allocation_coverage = ()
+            underlyings = tuple(sorted({
+                row.underlyer for row in admission.contracts
+            }))
+            selection_plan = build_c6_selection_plan(
+                session_date=session.session_date,
+                desired_revision_id=(
+                    reconciliation.snapshot.revision_id
+                ),
+                desired_snapshot_sha256=(
+                    reconciliation.snapshot.snapshot_sha256
+                ),
+                selection_policy=selection_policy,
+                members=members,
+                readiness=tuple(
+                    C6UnderlyingReadiness(
+                        underlying=underlying,
+                        catalog=C6ReadinessState.AVAILABLE,
+                        open_interest=(
+                            C6ReadinessState.AVAILABLE
+                        ),
+                        history=C6ReadinessState.AVAILABLE,
+                        feed_states=(
+                            (
+                                "OPTION_QUOTE",
+                                C6ReadinessState.AVAILABLE,
+                            ),
+                            (
+                                "OPTION_TRADE",
+                                C6ReadinessState.AVAILABLE,
+                            ),
+                        ),
+                        reason_codes=(),
+                        observed_at=admission.prepared_at,
+                        source_as_of=reference.known_at,
+                    )
+                    for underlying in underlyings
+                ),
+                capacity=selection_capacity,
+                strategy_policies=(
+                    load_strategy_policy_identity(
+                        _DEFAULT_C6_STRATEGY_POLICY_PATH
+                    ),
+                ),
+                catalog_identity=readiness.slot_set_member_sha256,
+                reference_identity=reference.state_sha256,
+                source_as_of=admission.prepared_at,
+                admission_profile_version=(
+                    admission_profile_version
+                ),
+                admission_profile_sha256=(
+                    admission_profile_sha256
+                ),
+                allocation_document=allocation_document,
+                allocation_coverage=allocation_coverage,
+                physical_owner_id=acquisition_binding.owner_id,
+                journal_generation=session.journal_generation,
+            )
         return self.activate_session(
             package=package,
             authority_bundle=authority_bundle,
@@ -990,8 +1311,38 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
             reference=reference,
             sealed_selection=sealed_selection,
             written_at=written_at,
+            selection_plan=selection_plan,
             package_path_reference=package_path_reference,
         )
+
+    def load_c6_selection_plan(self) -> C6SelectionPlan | None:
+        if self._c6_selection_loaded:
+            return self._c6_selection
+        stored = self._load_stored()
+        with self._provider.transaction(
+            APP_ROLE,
+            read_only=True,
+        ) as unit:
+            selection = load_c6_selection_cursor(
+                unit.cursor,
+                session_binding_id=stored.session_binding_id,
+            )
+        self._c6_selection = selection
+        self._c6_selection_loaded = True
+        return selection
+
+    def load_c6_selection_health(
+        self,
+    ) -> Mapping[str, object] | None:
+        stored = self._load_stored()
+        with self._provider.transaction(
+            APP_ROLE,
+            read_only=True,
+        ) as unit:
+            return c6_selection_health_cursor(
+                unit.cursor,
+                session_binding_id=stored.session_binding_id,
+            )
 
     def load_package(self) -> Mapping[str, object]:
         return dict(self._load_stored().package)

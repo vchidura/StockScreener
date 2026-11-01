@@ -95,6 +95,10 @@ C5_SESSION_STATE_SQL_PATH = (
     Path(V2_MIGRATIONS_DIR)
     / "041_advanced_options_continuous_session_state.sql"
 )
+C6_SELECTION_SQL_PATH = (
+    Path(V2_MIGRATIONS_DIR)
+    / "042_advanced_options_selection_shards.sql"
+)
 
 
 def _source_flow(base_config=None, *, generation=JOURNAL_GENERATION):
@@ -225,6 +229,55 @@ def test_migration_041_adds_only_session_envelope_chain_and_head():
         "options_outbox",
         "options_release",
         "options_shard",
+        "broker",
+        "trading",
+    ):
+        assert f"CREATE TABLE rt.{prohibited}" not in text
+
+
+def test_migration_042_adds_selection_readiness_shards_and_consumers():
+    text = " ".join(
+        C6_SELECTION_SQL_PATH.read_text(encoding="utf-8").split()
+    )
+
+    append_relations = (
+        "advanced_options_selection_generations",
+        "advanced_options_selection_members",
+        "advanced_options_selection_coverage",
+        "advanced_options_physical_subscriptions",
+        "advanced_options_subscription_shards",
+    )
+    mutable_relations = (
+        "advanced_options_underlying_readiness",
+        "advanced_options_physical_subscription_states",
+        "advanced_options_shard_states",
+        "advanced_options_consumer_states",
+        "advanced_options_detector_routing_states",
+    )
+    for relation in append_relations:
+        assert f"CREATE TABLE rt.{relation}" in text
+        assert RELATIONS[f"rt.{relation}"].writes == "APPEND"
+        assert f"trg_rt_{relation}_immutable" in text
+    for relation in mutable_relations:
+        assert f"CREATE TABLE rt.{relation}" in text
+        assert RELATIONS[f"rt.{relation}"].writes == "MUTABLE"
+    assert "flow_eligible boolean NOT NULL" in text
+    assert "owner_id uuid NOT NULL UNIQUE" in text
+    assert "journal_generation uuid NOT NULL UNIQUE" in text
+    assert "provider_cluster text NOT NULL" in text
+    assert "physical_subscription_id uuid NOT NULL" in text
+    assert "reconnect_count integer NOT NULL" in text
+    assert (
+        "CREATE TABLE rt.advanced_options_shard_states "
+        "( selection_generation_id uuid NOT NULL, shard_id uuid NOT NULL, "
+        "state text NOT NULL, message_count bigint NOT NULL, "
+        "byte_count bigint NOT NULL, reason_codes text[] NOT NULL"
+        in text
+    )
+    assert "event_watermark_ns numeric(30,0)" in text
+    for prohibited in (
+        "options_outbox",
+        "options_release",
         "broker",
         "trading",
     ):

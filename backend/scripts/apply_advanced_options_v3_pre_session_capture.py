@@ -20,6 +20,9 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from options.calendar import OptionExchangeCalendar  # noqa: E402
+from realtime.advanced_options_activity_momentum_c6 import (  # noqa: E402
+    activity_momentum_allocation_from_payload,
+)
 from realtime.contracts import UniverseManifest, canonical_sha256  # noqa: E402
 from realtime.database_access_v2 import (  # noqa: E402
     APP_ROLE,
@@ -52,7 +55,6 @@ from scripts.realtime_script_support import write_report  # noqa: E402
 
 
 UTC = timezone.utc
-UNDERLYINGS = ("QQQ", "SPY")
 
 
 def parse_args(argv=None):
@@ -127,17 +129,40 @@ def _load_capture(args):
         or canonical_sha256(unsigned) != semantic
         or capture.get("contract")
         != "advanced-options-v3-pre-session-capture-v1"
-        or capture.get("provider_requests") != 2
-        or len(capture.get("selected_snapshots") or {}) != 4
+        or type(capture.get("provider_requests")) is not int
+        or capture["provider_requests"] <= 0
+        or not isinstance(capture.get("selected_snapshots"), dict)
+        or not capture["selected_snapshots"]
     ):
         raise ValueError("sealed V3 pre-session capture identity changed")
+    allocation_value = capture.get("activity_momentum_allocation")
+    if allocation_value is not None:
+        allocation = activity_momentum_allocation_from_payload(
+            allocation_value
+        )
+        if set(allocation.selected_contract_tickers) != set(
+            capture["selected_snapshots"]
+        ):
+            raise ValueError(
+                "sealed allocation and snapshot membership diverged"
+            )
     return capture
+
+
+def _capture_underlyings(capture):
+    values = tuple(sorted({
+        str(raw["underlying_asset"]["ticker"]).strip().upper()
+        for raw in capture["selected_snapshots"].values()
+    }))
+    if not values:
+        raise ValueError("sealed capture underlyings are absent")
+    return values
 
 
 def _hydration_manifest(capture):
     responses = []
     snapshots = capture["selected_snapshots"]
-    for underlyer in UNDERLYINGS:
+    for underlyer in _capture_underlyings(capture):
         candidates = []
         for ticker, raw in sorted(snapshots.items()):
             details = dict(raw["details"])
@@ -160,7 +185,7 @@ def _hydration_manifest(capture):
                 "provider_payload_sha256": _canonical_sha256(payload),
                 "provider_payload": payload,
             })
-        if len(candidates) != 2:
+        if not candidates:
             raise ValueError("sealed capture underlyer membership changed")
         responses.append({
             "underlyer": underlyer,
@@ -170,8 +195,12 @@ def _hydration_manifest(capture):
         "schema": SCHEMA,
         "captured_at_utc": capture["captured_at_utc"],
         "session_date": capture["session_date"],
-        "provider_requests": 2,
-        "pagination_requests": 0,
+        "provider_requests": capture["provider_requests"],
+        "pagination_requests": max(
+            0,
+            capture["provider_requests"]
+            - len(capture.get("responses") or ()),
+        ),
         "database_writes": 0,
         "responses": responses,
     }
@@ -194,7 +223,7 @@ def _oi_facts(capture, request):
         contract_id = dict(catalog.values)["contract_id"]
         open_interest = raw.get("open_interest")
         if not isinstance(open_interest, int) or open_interest < 0:
-            raise ValueError("sealed capture open interest is invalid")
+            continue
         digest = canonical_sha256(raw)
         facts.append(ReferenceFact.build(
             ReferenceFactRelation.OI_BASELINE,
@@ -291,8 +320,8 @@ def main(argv=None) -> int:
     request = ReferenceSeedRequest(
         UniverseManifest(
             "advanced-options-v3-pre-session-v1",
-            UNDERLYINGS,
-            UNDERLYINGS,
+            _capture_underlyings(capture),
+            _capture_underlyings(capture),
         ),
         session_date,
         captured_at,
@@ -300,7 +329,10 @@ def main(argv=None) -> int:
         args.reference_valid_until,
     )
     oi_facts, settlement = _oi_facts(capture, request)
-    entries = _entries(manifest, expected_candidate_count=4)
+    entries = _entries(
+        manifest,
+        expected_candidate_count=len(capture["selected_snapshots"]),
+    )
     provider, pool = _provider()
     try:
         with provider.transaction(

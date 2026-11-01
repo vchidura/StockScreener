@@ -16,11 +16,17 @@ from .advanced_options_control_plane import (
     AdvancedOptionsEnrollmentPlan,
     advanced_options_enrollment_plan_payload,
 )
-from .advanced_options_flow_policy import AdvancedOptionsContractScope
+from .advanced_options_flow_policy import (
+    AdvancedOptionsContractScope,
+    flow_contract_scope_matches_data_membership,
+)
 from .advanced_options_reference_repository import (
     decode_advanced_options_reference_state,
 )
-from .advanced_options_reference_state import AdvancedOptionsReferenceState
+from .advanced_options_reference_state import (
+    AdvancedOptionsReferenceState,
+    REFERENCE_STATE_VERSION_V1,
+)
 from .advanced_options_rolling_repository import (
     persist_advanced_options_rolling_state_cursor,
 )
@@ -312,11 +318,14 @@ class AdvancedOptionsRollingProducerPlan:
     plan_sha256: str
     enrollment: AdvancedOptionsEnrollmentPlan
     contract_scope: AdvancedOptionsContractScope
+    data_membership_sha256: str
     reference_state: AdvancedOptionsReferenceState
     source_flow: OptionSourceFlowIdentity
     owner_epoch: int
-    committed_offset: int
-    shard_ids: tuple[int, ...]
+    market_state_committed_offset: int
+    flow_committed_offset: int
+    market_state_shard_ids: tuple[int, ...]
+    flow_shard_ids: tuple[int, ...]
     market_state_shard_map_sha256: str
     flow_shard_map_sha256: str
     known_at: datetime
@@ -389,11 +398,14 @@ def _plan_identity(
     *,
     enrollment: AdvancedOptionsEnrollmentPlan,
     contract_scope: AdvancedOptionsContractScope,
+    data_membership_sha256: str,
     reference_state: AdvancedOptionsReferenceState,
     source_flow: OptionSourceFlowIdentity,
     owner_epoch: int,
-    committed_offset: int,
-    shard_ids: tuple[int, ...],
+    market_state_committed_offset: int,
+    flow_committed_offset: int,
+    market_state_shard_ids: tuple[int, ...],
+    flow_shard_ids: tuple[int, ...],
     market_state_shard_map_sha256: str,
     flow_shard_map_sha256: str,
     known_at: datetime,
@@ -420,6 +432,7 @@ def _plan_identity(
         "slot_set_version": control.slot_set.version,
         "slot_set_sha256": control.slot_set_sha256,
         "slot_member_sha256": control.slot_set.member_sha256,
+        "data_membership_sha256": data_membership_sha256,
         "contract_scope_sha256": contract_scope.sha256,
         "reference_state_id": reference_state.state_id,
         "reference_state_sha256": reference_state.state_sha256,
@@ -429,8 +442,12 @@ def _plan_identity(
         "journal_generation": source_flow.journal_generation,
         "stream_session_ids": source_flow.stream_session_ids,
         "owner_epoch": owner_epoch,
-        "committed_offset": committed_offset,
-        "shard_ids": shard_ids,
+        "market_state_committed_offset": (
+            market_state_committed_offset
+        ),
+        "flow_committed_offset": flow_committed_offset,
+        "market_state_shard_ids": market_state_shard_ids,
+        "flow_shard_ids": flow_shard_ids,
         "market_state_shard_map_sha256": (
             market_state_shard_map_sha256
         ),
@@ -461,23 +478,40 @@ def _validate_plan(
     control = plan.control_plane
     known = _utc(plan.known_at, "known_at")
     valid = _utc(plan.valid_until, "valid_until")
-    shards = tuple(sorted(set(plan.shard_ids)))
-    selected_tickers = tuple(
-        row.contract_ticker
-        for row in plan.enrollment.activity_selection.contracts
-    )
+    market_state_shards = tuple(sorted(set(
+        plan.market_state_shard_ids
+    )))
+    flow_shards = tuple(sorted(set(plan.flow_shard_ids)))
     if (
-        plan.contract_scope.session_date != control.session_date
-        or plan.contract_scope.manifest_sha256 != control.manifest_sha256
-        or plan.contract_scope.slot_sha256 != control.slot_set_sha256
-        or plan.contract_scope.flow_policy_sha256
-        != control.pins.flow_policy_sha256
-        or tuple(plan.contract_scope.contract_map) != selected_tickers
+        plan.data_membership_sha256
+        != plan.enrollment.activity_selection.selection_sha256
+        or not flow_contract_scope_matches_data_membership(
+            plan.contract_scope,
+            plan.enrollment.activity_selection.contracts,
+            session_date=control.session_date,
+            manifest_sha256=control.manifest_sha256,
+            slot_sha256=control.slot_set_sha256,
+            flow_policy_sha256=control.pins.flow_policy_sha256,
+        )
     ):
         raise ValueError("rolling producer contract scope changed")
     if (
         not isinstance(plan.reference_state, AdvancedOptionsReferenceState)
         or plan.reference_state.session_date != control.session_date
+        or (
+            plan.reference_state.data_membership_sha256
+            != plan.data_membership_sha256
+            and not (
+                plan.reference_state.version
+                == REFERENCE_STATE_VERSION_V1
+                and plan.reference_state.data_membership_sha256 is None
+                and tuple(plan.contract_scope.contract_map)
+                == tuple(
+                    row.contract_ticker
+                    for row in plan.enrollment.activity_selection.contracts
+                )
+            )
+        )
         or plan.reference_state.contract_scope_sha256
         != plan.contract_scope.sha256
         or plan.reference_state.underlyings
@@ -512,11 +546,17 @@ def _validate_plan(
     if (
         type(plan.owner_epoch) is not int
         or plan.owner_epoch <= 0
-        or type(plan.committed_offset) is not int
-        or plan.committed_offset < 0
-        or not shards
-        or shards != plan.shard_ids
-        or shards != tuple(range(len(shards)))
+        or type(plan.market_state_committed_offset) is not int
+        or plan.market_state_committed_offset < 0
+        or type(plan.flow_committed_offset) is not int
+        or plan.flow_committed_offset < 0
+        or not market_state_shards
+        or market_state_shards != plan.market_state_shard_ids
+        or market_state_shards
+        != tuple(range(len(market_state_shards)))
+        or not flow_shards
+        or flow_shards != plan.flow_shard_ids
+        or flow_shards != tuple(range(len(flow_shards)))
         or type(plan.maximum_underlying_age_ms) is not int
         or plan.maximum_underlying_age_ms <= 0
         or type(plan.maximum_option_spot_skew_ms) is not int
@@ -563,11 +603,16 @@ def _validate_plan(
     identity = _plan_identity(
         enrollment=plan.enrollment,
         contract_scope=plan.contract_scope,
+        data_membership_sha256=plan.data_membership_sha256,
         reference_state=plan.reference_state,
         source_flow=plan.source_flow,
         owner_epoch=plan.owner_epoch,
-        committed_offset=plan.committed_offset,
-        shard_ids=shards,
+        market_state_committed_offset=(
+            plan.market_state_committed_offset
+        ),
+        flow_committed_offset=plan.flow_committed_offset,
+        market_state_shard_ids=market_state_shards,
+        flow_shard_ids=flow_shards,
         market_state_shard_map_sha256=(
             market_state_shard_map_sha256
         ),
@@ -601,8 +646,10 @@ def build_advanced_options_rolling_producer_plan(
     reference_state: AdvancedOptionsReferenceState,
     source_flow: OptionSourceFlowIdentity,
     owner_epoch: int,
-    committed_offset: int,
-    shard_ids: tuple[int, ...],
+    market_state_committed_offset: int,
+    flow_committed_offset: int,
+    market_state_shard_ids: tuple[int, ...],
+    flow_shard_ids: tuple[int, ...],
     market_state_shard_map_sha256: str,
     flow_shard_map_sha256: str,
     known_at: datetime,
@@ -618,15 +665,22 @@ def build_advanced_options_rolling_producer_plan(
 ) -> AdvancedOptionsRollingProducerPlan:
     known = _utc(known_at, "known_at")
     valid = _utc(valid_until, "valid_until")
-    shards = tuple(shard_ids)
+    data_membership_sha256 = (
+        enrollment.activity_selection.selection_sha256
+    )
+    market_state_shards = tuple(market_state_shard_ids)
+    flow_shards = tuple(flow_shard_ids)
     identity = _plan_identity(
         enrollment=enrollment,
         contract_scope=contract_scope,
+        data_membership_sha256=data_membership_sha256,
         reference_state=reference_state,
         source_flow=source_flow,
         owner_epoch=owner_epoch,
-        committed_offset=committed_offset,
-        shard_ids=shards,
+        market_state_committed_offset=market_state_committed_offset,
+        flow_committed_offset=flow_committed_offset,
+        market_state_shard_ids=market_state_shards,
+        flow_shard_ids=flow_shards,
         market_state_shard_map_sha256=(
             market_state_shard_map_sha256
         ),
@@ -647,11 +701,14 @@ def build_advanced_options_rolling_producer_plan(
         plan_sha256=digest,
         enrollment=enrollment,
         contract_scope=contract_scope,
+        data_membership_sha256=data_membership_sha256,
         reference_state=reference_state,
         source_flow=source_flow,
         owner_epoch=owner_epoch,
-        committed_offset=committed_offset,
-        shard_ids=shards,
+        market_state_committed_offset=market_state_committed_offset,
+        flow_committed_offset=flow_committed_offset,
+        market_state_shard_ids=market_state_shards,
+        flow_shard_ids=flow_shards,
         market_state_shard_map_sha256=(
             market_state_shard_map_sha256
         ),
@@ -1068,8 +1125,9 @@ def _source_watermarks(
             raise ValueError("rolling source session or generation drifted")
         if (
             str(row["status"]) not in {"LIVE", "STOPPED"}
-            or int(row["last_event_offset"]) != plan.committed_offset
-            or int(row["last_raw_offset"]) < plan.committed_offset
+            or int(row["last_event_offset"])
+            != plan.market_state_committed_offset
+            or int(row["last_raw_offset"]) < plan.flow_committed_offset
             or row["event_time_watermark"] is None
             or row["event_time_watermark"] > plan.known_at
             or row["heartbeat_at"] is None
@@ -1186,7 +1244,15 @@ def _checkpoints(
             row for row in rows if str(row["consumer_name"]) == owner
         )
         reasons = []
-        if tuple(int(row["shard_id"]) for row in selected) != plan.shard_ids:
+        expected_shard_ids = (
+            plan.market_state_shard_ids
+            if owner == CANONICAL_MARKET_STATE_OWNER
+            else plan.flow_shard_ids
+        )
+        if (
+            tuple(int(row["shard_id"]) for row in selected)
+            != expected_shard_ids
+        ):
             reasons.append(reason)
         for row in selected:
             expected_shard_map_sha256 = (
@@ -1203,7 +1269,12 @@ def _checkpoints(
                 raise ValueError("rolling consumer checkpoint scope drifted")
             if (
                 int(row["owner_epoch"]) != plan.owner_epoch
-                or int(row["committed_offset"]) != plan.committed_offset
+                or int(row["committed_offset"])
+                != (
+                    plan.market_state_committed_offset
+                    if owner == CANONICAL_MARKET_STATE_OWNER
+                    else plan.flow_committed_offset
+                )
             ):
                 reasons.append("CONSUMER_CHECKPOINT_OFFSET_MISMATCH")
             if (
@@ -1451,7 +1522,7 @@ def _market_state(
                 "rolling current source session or generation drifted"
             )
         maximum_offset = (
-            plan.committed_offset
+            plan.flow_committed_offset
             if not is_equity or equity_binding is None or snapshot_based
             else equity_binding.committed_offset
         )
@@ -1677,7 +1748,7 @@ def _volumes(
         ) or (
             event is not None
             and (
-                int(event["last_offset"]) > plan.committed_offset
+                int(event["last_offset"]) > plan.flow_committed_offset
                 or int(event["last_source_seq"])
                 != int(row["last_source_seq"])
                 or event["last_event_time"] != row["last_event_time"]
@@ -1810,7 +1881,7 @@ def _order_windows(
             or str(row["source_flow_id"]) != str(plan.source_flow.source_flow_id)
         ):
             raise ValueError("rolling cluster source identity drifted")
-        if int(row["source_offset"]) > plan.committed_offset:
+        if int(row["source_offset"]) > plan.flow_committed_offset:
             reasons.append("CLUSTER_WINDOW_AHEAD_OF_CHECKPOINT")
     for row in headers:
         if int(row["window_seconds"]) not in CANONICAL_ORDER_WINDOWS_SECONDS:
@@ -1884,7 +1955,7 @@ def _order_windows(
         return None
     return AdvancedOptionsOrderWindowState(
         owner_epoch=plan.owner_epoch,
-        committed_offset=plan.committed_offset,
+        committed_offset=plan.flow_committed_offset,
         checkpoint_sha256=digest,
         windows_seconds=CANONICAL_ORDER_WINDOWS_SECONDS,
         members=tuple(
@@ -1971,7 +2042,7 @@ def assemble_advanced_options_rolling_state_cursor(
         session_date=plan.control_plane.session_date,
         journal_generation=plan.source_flow.journal_generation,
         owner_epoch=plan.owner_epoch,
-        committed_offset=plan.committed_offset,
+        committed_offset=plan.flow_committed_offset,
         committed_at=plan.known_at,
         market_state_checkpoint_sha256=market_checkpoint_sha256,
         flow_checkpoint_sha256=flow_checkpoint_sha256,

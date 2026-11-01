@@ -1,5 +1,6 @@
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from unittest.mock import MagicMock
 from uuid import UUID
 
@@ -19,8 +20,20 @@ from realtime.advanced_options_provider_contract import (
 )
 from option_flow_support import advanced_policy, policy
 from test_advanced_options_ingress import _write_options_journal
+from test_advanced_options_activity_momentum_c6 import (
+    SESSION_DATE,
+    _candidate,
+    _group,
+)
+from realtime.advanced_options_activity_momentum_c6 import (
+    allocate_activity_momentum,
+    load_activity_momentum_profile,
+)
 from realtime.advanced_options_consumers import (
+    AdvancedOptionsBoundedDetectorRouter,
     AdvancedOptionsMarketStateConsumer,
+    advanced_options_detector_routing_state_from_payload,
+    advanced_options_detector_routing_state_payload,
     persist_advanced_options_market_state_slice_cursor,
 )
 from realtime.advanced_options_ingress import (
@@ -31,6 +44,8 @@ from realtime.materialization import (
     MaterializerShardMap,
     restore_materializer_checkpoint,
 )
+from realtime.contracts import AssetClass, MarketChannel
+from realtime.journal import NormalizedJournalRecord
 from realtime.normalizer import NORMALIZER_VERSION
 from realtime.option_flow.engine import EngineConfig
 from realtime.option_flow.volume import VolumeConfig
@@ -79,6 +94,367 @@ def _shard_map():
         1,
         ((101, 0),),
     )
+
+
+def _normalized_record(
+    offset,
+    ticker,
+    event_kind,
+    event_at,
+    *,
+    size=None,
+):
+    return NormalizedJournalRecord(
+        event_offset=offset,
+        raw_offset=offset,
+        event_index=0,
+        normalizer_version=NORMALIZER_VERSION,
+        journal_generation=FLOW_STREAM,
+        stream_session_id=FLOW_STREAM,
+        instrument_id=offset,
+        provider_symbol=ticker,
+        underlying="SPY",
+        asset_class=AssetClass.OPTION,
+        shard_id=0,
+        event_kind=event_kind,
+        source_session=SESSION_DATE,
+        source_sequence=offset,
+        source_timestamp=int(event_at.timestamp() * 1_000_000_000),
+        source_timestamp_unit="ns",
+        event_at=event_at,
+        price=Decimal("1.05"),
+        size=size,
+        bid=Decimal("1.00"),
+        ask=Decimal("1.10"),
+        bid_size=10,
+        ask_size=10,
+        exchange=11,
+        conditions=(),
+        quality="ACCEPTED",
+        reason_codes=(),
+        details_json='{"fixture":true}',
+        payload_sha256=f"{offset:064x}",
+        received_at=event_at,
+        committed_at=event_at,
+    )
+
+
+def _routing_allocation():
+    profile = load_activity_momentum_profile()
+    first = _candidate("SPY", 0, dte=7)
+    second = _candidate("SPY", 1, dte=30)
+    third = _candidate("SPY", 2, dte=30)
+    directional = _group(
+        "SPY",
+        0,
+        candidates=(first,),
+    )
+    package = _group(
+        "SPY",
+        1,
+        dte=30,
+        role="STRATEGY_REQUIRED",
+        candidates=(second, third),
+        matching_strategies=("DIRECTIONAL_DEBIT_SPREAD",),
+    )
+    allocation = allocate_activity_momentum(
+        profile,
+        session_date=SESSION_DATE,
+        rotation_key="router-replay",
+        ready_underlyings=("SPY",),
+        groups=(directional, package),
+    )
+    return allocation, first, second, third
+
+
+def test_bounded_detector_router_restart_matches_unoptimized_replay():
+    allocation, first, second, third = _routing_allocation()
+    records = (
+        _normalized_record(
+            1,
+            second.contract_ticker,
+            MarketChannel.QUOTE,
+            NOW,
+        ),
+        _normalized_record(
+            2,
+            third.contract_ticker,
+            MarketChannel.QUOTE,
+            NOW + timedelta(milliseconds=50),
+        ),
+        _normalized_record(
+            3,
+            second.contract_ticker,
+            MarketChannel.QUOTE,
+            NOW + timedelta(milliseconds=100),
+        ),
+        _normalized_record(
+            4,
+            second.contract_ticker,
+            MarketChannel.TRADE,
+            NOW + timedelta(milliseconds=200),
+            size=Decimal("7"),
+        ),
+        _normalized_record(
+            5,
+            first.contract_ticker,
+            MarketChannel.QUOTE,
+            NOW + timedelta(milliseconds=300),
+        ),
+        _normalized_record(
+            6,
+            first.contract_ticker,
+            MarketChannel.TRADE,
+            NOW + timedelta(milliseconds=600),
+            size=Decimal("5"),
+        ),
+    )
+
+    uninterrupted = AdvancedOptionsBoundedDetectorRouter(
+        allocation=allocation
+    )
+    assert set(allocation.selected_contract_tickers) == {
+        first.contract_ticker,
+        second.contract_ticker,
+        third.contract_ticker,
+    }
+    assert tuple(row.event_offset for row in records) == (
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    )
+    uninterrupted_result = uninterrupted.process(records)
+
+    first_run = AdvancedOptionsBoundedDetectorRouter(
+        allocation=allocation
+    )
+    first_run.process(records[:3])
+    restarted = AdvancedOptionsBoundedDetectorRouter(
+        allocation=allocation,
+        state=advanced_options_detector_routing_state_from_payload(
+            advanced_options_detector_routing_state_payload(
+                first_run.state
+            )
+        ),
+    )
+    restarted_result = restarted.process(records[3:])
+
+    assert restarted_result.state == uninterrupted_result.state
+    assert uninterrupted_result.end_offset == 6
+    assert dict(uninterrupted_result.state.factual_volume) == {
+        first.contract_ticker: Decimal("5"),
+        second.contract_ticker: Decimal("7"),
+    }
+    assert uninterrupted_result.state.irrelevant_event_count == 1
+    assert uninterrupted_result.state.cadence_skip_count >= 1
+    assert uninterrupted_result.state.readiness_skip_count == 1
+    assert uninterrupted_result.quote_cache_size == 3
+    assert uninterrupted_result.factual_volume_cache_size == 2
+    assert uninterrupted_result.state.scanned_event_count == 6
+    assert uninterrupted_result.state.processed_detail_bytes == (
+        6 * len('{"fixture":true}'.encode("utf-8"))
+    )
+    assert uninterrupted_result.state.first_event_ns == int(
+        NOW.timestamp() * 1_000_000_000
+    )
+    assert uninterrupted_result.state.last_event_ns == int(
+        (NOW + timedelta(milliseconds=600)).timestamp()
+        * 1_000_000_000
+    )
+    assert uninterrupted_result.route_entry_count <= (
+        len(allocation.selected_contract_tickers)
+        * (
+            len(tuple(
+                row
+                for row in allocation.consumer_eligibility
+                if row.enabled
+            ))
+            + len(allocation.selected_groups)
+        )
+        * 2
+    )
+    counts = dict(
+        uninterrupted_result.state.detector_invocation_counts
+    )
+    assert counts["directional-momentum-v2"] == 2
+    assert counts["strategy-package-model-v2"] == 1
+    assert "future-50ms-detector" not in counts
+    assert "silent-accumulation" not in counts
+
+
+def test_detector_output_cap_does_not_stop_volume_or_checkpoint():
+    allocation, first, second, third = _routing_allocation()
+    records = (
+        _normalized_record(
+            1,
+            first.contract_ticker,
+            MarketChannel.QUOTE,
+            NOW,
+        ),
+        _normalized_record(
+            2,
+            second.contract_ticker,
+            MarketChannel.QUOTE,
+            NOW + timedelta(seconds=1),
+        ),
+        _normalized_record(
+            3,
+            first.contract_ticker,
+            MarketChannel.QUOTE,
+            NOW + timedelta(seconds=2),
+        ),
+        _normalized_record(
+            4,
+            first.contract_ticker,
+            MarketChannel.TRADE,
+            NOW + timedelta(seconds=3),
+            size=Decimal("9"),
+        ),
+    )
+    router = AdvancedOptionsBoundedDetectorRouter(
+        allocation=allocation
+    )
+
+    result = router.process(
+        records,
+        maximum_output_invocations=0,
+    )
+
+    assert result.invocations == ()
+    assert result.end_offset == 4
+    assert result.state.scanned_event_count == 4
+    assert dict(result.state.factual_volume)[
+        first.contract_ticker
+    ] == Decimal("9")
+    assert result.state.suppressed_output_count > 0
+    assert sum(
+        count
+        for _, count in result.state.detector_invocation_counts
+    ) > 0
+
+
+def test_irrelevant_boundary_events_define_replay_rate_window():
+    allocation, first, second, third = _routing_allocation()
+    records = (
+        _normalized_record(
+            1,
+            second.contract_ticker,
+            MarketChannel.TRADE,
+            NOW,
+            size=Decimal("1"),
+        ),
+        _normalized_record(
+            2,
+            first.contract_ticker,
+            MarketChannel.QUOTE,
+            NOW + timedelta(seconds=1),
+        ),
+        _normalized_record(
+            3,
+            first.contract_ticker,
+            MarketChannel.TRADE,
+            NOW + timedelta(seconds=2),
+            size=Decimal("2"),
+        ),
+        _normalized_record(
+            4,
+            third.contract_ticker,
+            MarketChannel.TRADE,
+            NOW + timedelta(seconds=3),
+            size=Decimal("3"),
+        ),
+    )
+    uninterrupted = AdvancedOptionsBoundedDetectorRouter(
+        allocation=allocation
+    )
+    uninterrupted.process(records)
+
+    first_run = AdvancedOptionsBoundedDetectorRouter(
+        allocation=allocation
+    )
+    first_run.process(records[:2])
+    restarted = AdvancedOptionsBoundedDetectorRouter(
+        allocation=allocation,
+        state=advanced_options_detector_routing_state_from_payload(
+            advanced_options_detector_routing_state_payload(
+                first_run.state
+            )
+        ),
+    )
+    restarted.process(records[2:])
+
+    assert restarted.state == uninterrupted.state
+    assert uninterrupted.state.scanned_event_count == 4
+    assert uninterrupted.state.processed_detail_bytes == (
+        4 * len('{"fixture":true}'.encode("utf-8"))
+    )
+    assert uninterrupted.state.irrelevant_event_count == 2
+    assert uninterrupted.state.first_event_ns == int(
+        NOW.timestamp() * 1_000_000_000
+    )
+    assert uninterrupted.state.last_event_ns == int(
+        (NOW + timedelta(seconds=3)).timestamp()
+        * 1_000_000_000
+    )
+    assert dict(
+        uninterrupted.state.detector_invocation_counts
+    ) == {"directional-momentum-v2": 2}
+
+
+def test_all_unrouted_admitted_slice_retains_rate_window_on_restart():
+    allocation, _first, second, third = _routing_allocation()
+    records = (
+        _normalized_record(
+            1,
+            second.contract_ticker,
+            MarketChannel.TRADE,
+            NOW,
+            size=Decimal("4"),
+        ),
+        _normalized_record(
+            2,
+            third.contract_ticker,
+            MarketChannel.TRADE,
+            NOW + timedelta(seconds=2),
+            size=Decimal("6"),
+        ),
+    )
+    uninterrupted = AdvancedOptionsBoundedDetectorRouter(
+        allocation=allocation
+    )
+    uninterrupted.process(records)
+
+    first_run = AdvancedOptionsBoundedDetectorRouter(
+        allocation=allocation
+    )
+    first_run.process(records[:1])
+    restarted = AdvancedOptionsBoundedDetectorRouter(
+        allocation=allocation,
+        state=advanced_options_detector_routing_state_from_payload(
+            advanced_options_detector_routing_state_payload(
+                first_run.state
+            )
+        ),
+    )
+    restarted.process(records[1:])
+
+    assert restarted.state == uninterrupted.state
+    assert uninterrupted.state.scanned_event_count == 2
+    assert uninterrupted.state.processed_detail_bytes == (
+        2 * len('{"fixture":true}'.encode("utf-8"))
+    )
+    assert uninterrupted.state.irrelevant_event_count == 2
+    assert uninterrupted.state.first_event_ns == int(
+        NOW.timestamp() * 1_000_000_000
+    )
+    assert uninterrupted.state.last_event_ns == int(
+        (NOW + timedelta(seconds=2)).timestamp()
+        * 1_000_000_000
+    )
+    assert uninterrupted.state.detector_invocation_counts == ()
 
 
 def test_market_state_restart_and_uninterrupted_replay_are_identical(
@@ -162,9 +538,17 @@ def test_market_state_persistence_delegates_to_canonical_current_owner(
         planned=planned,
         owner_id=OWNER,
         batch_executor=_batch_executor,
+        lease_resource_key="market-state:shared-shard-map",
     )
 
     statements = tuple(call.args[0] for call in cursor.execute.call_args_list)
+    assert any(
+        call.args[1][0] == "market-state:shared-shard-map"
+        for call in cursor.execute.call_args_list
+        if len(call.args) > 1
+        and isinstance(call.args[1], tuple)
+        and call.args[1]
+    )
     quote_index = next(
         index for index, value in enumerate(statements)
         if "INSERT INTO rt.quote_current" in value

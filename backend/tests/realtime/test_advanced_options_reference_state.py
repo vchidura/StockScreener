@@ -26,6 +26,8 @@ from realtime.advanced_options_reference_state import (
     AdvancedOptionsEquityMetric,
     AdvancedOptionsHistoricalVolatilityFact,
     InMemoryAdvancedOptionsReferenceStateRepository,
+    REFERENCE_STATE_VERSION,
+    REFERENCE_STATE_VERSION_V1,
     ReferenceAvailability,
     dividend_coverage_reference_from_window,
     open_interest_reference_from_fact,
@@ -65,6 +67,20 @@ def test_persistence_document_round_trip_preserves_exact_state():
         state_sha256=state.state_sha256,
         document=document,
     ) == state
+
+
+def test_legacy_v1_document_decodes_without_changing_immutable_identity():
+    legacy = reference_state(data_membership_sha256=None)
+    document = json.loads(canonical_json(legacy.identity))
+
+    assert legacy.version == REFERENCE_STATE_VERSION_V1
+    assert "data_membership_sha256" not in document
+    assert decode_advanced_options_reference_state(
+        state_id=legacy.state_id,
+        state_sha256=legacy.state_sha256,
+        document=document,
+    ) == legacy
+    assert reference_state().version == REFERENCE_STATE_VERSION
 
 
 def test_missing_oi_and_equity_metrics_never_receive_zero_defaults():

@@ -47,11 +47,17 @@ from realtime.advanced_options_p8_runtime import (  # noqa: E402
 from realtime.advanced_options_acquisition_runtime import (  # noqa: E402
     acquisition_binding_from_payload,
 )
+from realtime.advanced_options_activity_momentum_c6 import (  # noqa: E402
+    activity_momentum_allocation_from_payload,
+)
 from realtime.advanced_options_session_state import (  # noqa: E402
     LEGACY_DIAGNOSTIC_STATE_SOURCE,
     POSTGRES_STATE_SOURCE,
     PostgresContinuousSessionStateRepository,
     select_options_session_state,
+)
+from realtime.advanced_options_selection_c6 import (
+    C6ConnectionCapacity,
 )
 from realtime.advanced_options_resident_barrier import (  # noqa: E402
     advanced_options_v3_session_status_cursor,
@@ -168,6 +174,35 @@ def parse_args(argv=None):
     activate.add_argument(
         "--package-path-reference",
         default="/run/advanced-options-p8/package.json",
+    )
+    activate.add_argument(
+        "--configured-options-connection-limit",
+        type=int,
+        default=1,
+    )
+    activate.add_argument(
+        "--provider-options-connection-limit",
+        type=int,
+        default=1,
+    )
+    activate.add_argument(
+        "--active-options-connections",
+        type=int,
+        default=0,
+    )
+    activate.add_argument(
+        "--options-quote-contract-ceiling",
+        type=int,
+        default=1000,
+    )
+    activate.add_argument(
+        "--options-active-quote-contract-budget",
+        type=int,
+    )
+    activate.add_argument(
+        "--maximum-contracts-per-logical-shard",
+        type=int,
+        required=True,
     )
     activate.add_argument("--execute", action="store_true")
 
@@ -525,8 +560,9 @@ def _validate_pre_session_identity(package, binding, session) -> None:
         or not isinstance(admitted_contracts, list)
         or sorted(str(value) for value in admitted_contracts)
         != selected_contracts
-        or len(binding.enrollment.activity_selection.contracts) != 4
-        or control.slot_set.contract_count != 4
+        or len(binding.enrollment.activity_selection.contracts)
+        != len(selected_contracts)
+        or control.slot_set.contract_count != len(selected_contracts)
     ):
         raise ValueError("V3 pre-open acquisition identity changed")
 
@@ -720,6 +756,45 @@ def _activate_session(args) -> dict[str, object]:
         _load(args.acquisition_binding)
     )
     sealed_selection = _load(args.sealed_selection)
+    allocation_value = sealed_selection.get(
+        "activity_momentum_allocation"
+    )
+    allocation = (
+        None
+        if allocation_value is None
+        else activity_momentum_allocation_from_payload(
+            allocation_value
+        )
+    )
+    effective_active_budget = (
+        900
+        if allocation is None
+        and args.options_active_quote_contract_budget is None
+        else (
+            allocation.active_contract_budget
+            if allocation is not None
+            else args.options_active_quote_contract_budget
+        )
+    )
+    if effective_active_budget is None:
+        raise ValueError(
+            "Options active quote contract budget is unavailable"
+        )
+    if (
+        allocation is not None
+        and (
+            args.options_quote_contract_ceiling
+            != allocation.quote_contract_ceiling
+            or (
+                args.options_active_quote_contract_budget is not None
+                and args.options_active_quote_contract_budget
+                != allocation.active_contract_budget
+            )
+        )
+    ):
+        raise ValueError(
+            "activation capacity diverges from frozen allocation"
+        )
     provider, pool = _provider()
     try:
         repository = PostgresContinuousSessionStateRepository(
@@ -732,9 +807,37 @@ def _activate_session(args) -> dict[str, object]:
             acquisition_binding=acquisition,
             sealed_selection=sealed_selection,
             written_at=acquisition.authority.prepared_at,
+            selection_capacity=C6ConnectionCapacity(
+                account_alias="MASSIVE_ADVANCED",
+                provider_cluster="OPTIONS",
+                configured_cluster_connection_limit=(
+                    args.configured_options_connection_limit
+                ),
+                provider_cluster_connection_limit=(
+                    args.provider_options_connection_limit
+                ),
+                active_cluster_connections=(
+                    args.active_options_connections
+                ),
+                proposed_physical_connections=1,
+                quote_contract_ceiling=(
+                    args.options_quote_contract_ceiling
+                ),
+                active_quote_contract_budget=(
+                    effective_active_budget
+                ),
+                quote_slot_reserve=(
+                    args.options_quote_contract_ceiling
+                    - effective_active_budget
+                ),
+                maximum_contracts_per_logical_shard=(
+                    args.maximum_contracts_per_logical_shard
+                ),
+            ),
             package_path_reference=args.package_path_reference,
         )
         bundle = repository.load_execution_bundle()
+        selection_plan = repository.load_c6_selection_plan()
     finally:
         pool.closeall()
     return _report({
@@ -752,6 +855,21 @@ def _activate_session(args) -> dict[str, object]:
             session_binding.binding_sha256
         ),
         "state_source": POSTGRES_STATE_SOURCE,
+        "selection_generation_sha256": (
+            None
+            if selection_plan is None
+            else selection_plan.generation_sha256
+        ),
+        "selection_underlying_count": (
+            0
+            if selection_plan is None
+            else len(selection_plan.broad_underlyings)
+        ),
+        "selection_shard_count": (
+            0
+            if selection_plan is None
+            else len(selection_plan.shards)
+        ),
         "provider_effects": 0,
         "publication_effects": 0,
         "delivery_effects": 0,

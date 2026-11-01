@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+import re
 from typing import Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -38,6 +39,7 @@ ADVANCED_SESSION_OPTIONS_UNDERLYINGS = ("QQQ", "SPY")
 ADVANCED_SESSION_EQUITY_SYMBOLS = (
     EQUITY_VALIDATION_UNIVERSE.equity_tickers
 )
+_OPTION_UNDERLYING = re.compile(r"^O:([A-Z]{1,6})")
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -62,6 +64,19 @@ def _text(value: str, name: str, *, maximum: int = 160) -> str:
     if not isinstance(value, str) or not 1 <= len(value.strip()) <= maximum:
         raise ValueError(f"{name} is invalid")
     return value.strip()
+
+
+def _option_membership(ticker: str) -> tuple[str, str]:
+    value = _text(
+        ticker,
+        "contract ticker",
+        maximum=48,
+    ).upper()
+    match = _OPTION_UNDERLYING.match(value)
+    side = value[-9:-8]
+    if match is None or side not in {"C", "P"}:
+        raise ValueError("option contract ticker is invalid")
+    return match.group(1), side
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +171,15 @@ class AdvancedSessionProviderContract:
             _text(value, "contract ticker", maximum=48).upper()
             for value in self.contract_tickers
         ))
+        try:
+            membership = {
+                _option_membership(ticker) for ticker in tickers
+            }
+        except ValueError:
+            membership = set()
+        underlyings = {
+            underlyer for underlyer, _ in membership
+        }
         if (
             not isinstance(self.budget, ProviderBudgetScope)
             or self.budget.lanes
@@ -165,19 +189,10 @@ class AdvancedSessionProviderContract:
             or self.budget.decoded_byte_ceiling
             != self.budget.request_ceiling
             * self.response_byte_ceiling
-            or len(tickers) != 4
-            or len(set(tickers)) != 4
-            or {
-                (ticker[2:5], ticker[11:12])
-                for ticker in tickers
-                if ticker.startswith("O:") and len(ticker) >= 12
-            }
-            != {
-                ("QQQ", "C"),
-                ("QQQ", "P"),
-                ("SPY", "C"),
-                ("SPY", "P"),
-            }
+            or not tickers
+            or len(set(tickers)) != len(tickers)
+            or not membership
+            or not underlyings
             or any(not ticker.startswith("O:") for ticker in tickers)
             or self.endpoint_path != ADVANCED_SESSION_OPTIONS_ENDPOINT
             or self.policy_version
@@ -376,9 +391,10 @@ def advanced_realtime_session_authorization_payload(
             "channels": ["AM"],
         },
         "options": {
-            "underlyings": list(
-                ADVANCED_SESSION_OPTIONS_UNDERLYINGS
-            ),
+            "underlyings": sorted({
+                _option_membership(ticker)[0]
+                for ticker in provider.contract_tickers
+            }),
             "contract_tickers": list(provider.contract_tickers),
             "session_authorization_id": str(
                 authority.options_session_authorization_id
@@ -735,8 +751,9 @@ class SchedulerOptionsCapture:
             or self.request_count
             != ADVANCED_SESSION_OPTIONS_REQUESTS_PER_CYCLE
             or self.pagination_requests != 0
-            or len(self.contract_tickers) != 4
-            or len(set(self.contract_tickers)) != 4
+            or not self.contract_tickers
+            or len(set(self.contract_tickers))
+            != len(self.contract_tickers)
             or not reviewed <= options_cutoff
             or (options_cutoff - reviewed).total_seconds() > 300
         ):
@@ -762,6 +779,7 @@ class SchedulerPublishedCycle:
     stock_alert_evaluation_count: int
     stock_alert_unavailable_count: int
     stock_alert_reason_codes_exact: bool
+    expected_stored_reader_count: int = 4
 
     def __post_init__(self) -> None:
         cutoff = _utc(self.release_cutoff, "release_cutoff")
@@ -776,7 +794,10 @@ class SchedulerPublishedCycle:
                 )
             )
             or self.release_id != self.read_pin_release_id
-            or self.stored_reader_count != 4
+            or type(self.expected_stored_reader_count) is not int
+            or self.expected_stored_reader_count <= 0
+            or self.stored_reader_count
+            != self.expected_stored_reader_count
             or _sha256(
                 self.stock_alert_batch_sha256,
                 "stock_alert_batch_sha256",
@@ -921,7 +942,21 @@ class AdvancedRealtimeSessionScheduler:
             "read_pin_release_id": str(
                 published.read_pin_release_id
             ),
+            "configured_options_underlying_count": len({
+                _option_membership(ticker)[0]
+                for ticker in (
+                    self._authority
+                    .provider_contract
+                    .contract_tickers
+                )
+            }),
+            "configured_options_contract_count": len(
+                self._authority.provider_contract.contract_tickers
+            ),
             "stored_reader_count": published.stored_reader_count,
+            "expected_stored_reader_count": (
+                published.expected_stored_reader_count
+            ),
             "stock_alert_batch_id": str(
                 published.stock_alert_batch_id
             ),

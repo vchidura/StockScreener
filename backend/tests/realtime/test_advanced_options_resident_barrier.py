@@ -148,13 +148,17 @@ def _completion(
             normalized_end_offset=ending_offset,
             state_sha256="a" * 64,
             shard_map_sha256="b" * 64,
+            shard_ids=[0],
         )
     else:
         evidence.update(
             raw_end_offset=ending_offset,
+            normalized_end_offset=ending_offset,
             checkpoint_end_offset=ending_offset,
             owner_epoch=3,
             evidence_ref=f"flow:{ending_offset}",
+            shard_map_sha256="c" * 64,
+            shard_ids=[0],
         )
     return ResidentCompletion(
         target_window_id=window_id,
@@ -367,6 +371,7 @@ def test_complete_resident_evidence_requires_downstream_offset_keys():
         "status": "COMPLETE",
         "kind": "FLOW",
         "raw_end_offset": 10,
+        "normalized_end_offset": 10,
         "owner_epoch": 3,
         "evidence_ref": "flow:10",
         "effects": {

@@ -11,8 +11,8 @@ Canonical design and assessment:
 [REALTIME_V3_PIPELINE.md](../REALTIME_V3_PIPELINE.md).
 
 Mode: C0/C1 committed at `eafe5f7`; C2 committed at `3754337`; reviewed C3
-committed at `d8fd82d`; reviewed C4 committed at `d78dcf2`; C5 reviewed and
-validated in the current package.
+committed at `d8fd82d`; reviewed C4 committed at `d78dcf2`; reviewed C5
+committed at `56cd1a9`; C6 reviewed and validated in the current package.
 
 ## Settled Runtime Decisions
 
@@ -331,6 +331,113 @@ validated in the current package.
   effective-session activation, waiting without restart exhaustion and XNYS resident
   rebinding. C9 removes manual `activate-session`/daily supervisor paths only after
   C8 parity. C5 keeps exact-four QQQ/SPY and adds none of those behaviors.
+
+## C6 Completion Evidence
+
+The
+[C6 early-selection addendum](../REALTIME_V3_PIPELINE.md#c6-addendum-early-selection-and-bounded-detector-work)
+is implemented by the separately versioned `c6_activity_momentum_v2` profile. It
+supersedes the earlier initial 900-slot and proposed 300/600/900 rollout targets for
+new configurable preparation while preserving frozen v1/exact-four sessions.
+
+The [weekly-expiry and criterion refinement](../ADVANCED_OPTIONS_FLOW_POLICY.md#weekly-expiry-coverage-and-criterion-tuning-2026-11-01-recommendation)
+is implemented by separately versioned, explicit-opt-in `c6_activity_momentum_v3`;
+preparation still defaults to v2. Scheduled preparation alone resolves listed
+near-target/EOW expiries and dated last-trading evidence, persists the frozen
+allocation, and restart reloads it without recomputation. Short/core remain disjoint
+at 0-5/6-21 DTE. V3 uses the documented short 0.50 delta/ATM/7.5% moneyness/20% spread
+and core 0.60 delta/ATM/10% moneyness/20% spread offline seeds. Ingestion and detector
+hot paths perform no chain/calendar work or v2-v3 profile comparison.
+
+- V2 derives default `B` from 8 times eligible ready names plus configured/measured/
+  provider ceilings, producing 80/200/400 for 10/25/50 names. Explicit persisted
+  expansion to 12 per name permits 120/300/600; deterministic redistribution never
+  exceeds 12 per name or B and never pads missing quality coverage.
+- Typed selection criteria own discovery DTEs, role expiry/delta/moneyness targets,
+  quote/liquidity checks, coverage targets, candidate/shortlist/group bounds and
+  tie-breakers. Provider queries default to 0-21 DTE and extend to 60 only for enabled
+  strategy/required groups. Candidate DTE is never its own expiry target. Required and
+  enabled complete groups resolve from the bounded pool before coverage shortlisting;
+  accepted groups protect all legs, and bound overflow is explicit rather than partial.
+- The immutable allocation records profile identity, effective/configured capacity,
+  expansion, ranking clocks, discovery/filter/pool/shortlist/group/admission counts,
+  bounded rejection totals, complete groups, coverage and per-consumer eligibility.
+  Activation loads by frozen identity; residents never expand an existing session.
+- Market-state residents build one bounded in-memory contract/group route map from the
+  persisted allocation, share quote/factual-volume state, scan checkpoints contiguously
+  and persist restart state once per batch. Disabled 50 ms/silent-accumulation
+  consumers have empty routes. Output caps suppress returned detector outputs only,
+  never journaling, volume accounting, invocation accounting or checkpoint progress.
+  Equal-offset routing replay is idempotent only when equivalent; divergent/stale
+  replay fails. Traffic clocks cover all admitted events, including unrouted boundaries.
+- Addendum evidence: the affected provider-free admission/routing/C6/C5/downstream/
+  schema/security/live-024 selection is 283 passed with 5 existing warnings. The clean
+  owned-disposable C6/C5/reference/rolling/integration slice is 25 passed with 6
+  existing warnings and proves preparation allocation -> activation -> plan/routing
+  reload. Fixture evidence records event/detail-byte counts, invocation/skip counts,
+  bounded cache sizes and checkpoint lag. It does not claim safe full-session capacity.
+
+- The generic C6 policy and frozen flow-v1 identity remain unchanged. The separately
+  versioned `c6_activity_momentum_v1` profile implements 900 active/100 reserve quote
+  slots, 50/100-name fair shares, deterministic unused-slot rounds, resolver-owned
+  complete groups, 0-5 then 6-21 then strategy-required 22-60 DTE priority, explicit
+  missing OI and capture-only flow unavailability for 3-4 DTE/new flow underlyings.
+- Migration `042_advanced_options_selection_shards` now persists immutable selection,
+  member, normalized coverage, one physical subscription and logical shard generations;
+  mutable reconnect/gap state belongs to the physical owner while logical processing
+  state and consumer offsets remain independent. C5 SERIALIZABLE activation owns the
+  write and immutable state is cached outside message processing.
+- Capacity is `(account, provider cluster)`: Stocks does not consume Options allowance,
+  reconnect needs no simultaneous spare connection, T/Q share one quote slot per exact
+  contract, and logical shards create no sockets. Baseline defaults are one Options
+  connection and 1,000 quote slots; deployment values are persisted/configurable and a
+  second Options producer or over-budget selection fails without truncation.
+- Chain discovery follows bounded `next_url` pagination under total request/byte/deadline
+  limits. Authority, acquisition, P7/P8 replay, scheduler, capture application and
+  session activation accept configured asymmetric membership. QQQ/SPY exact four
+  remains the compatibility fixture.
+- Preparation uses per-response receipt clocks and a separate completion/deadline; a
+  valid quote arriving after preparation start is not mislabeled future data. Missing
+  OI remains unavailable context instead of becoming zero or aborting discovery.
+- Flow residents consume only flow-v1-eligible contracts and persist/report explicit
+  `UNAVAILABLE` states for 3-4 DTE or unknown flow underlyings. Reference and rolling
+  producers bind the broad enrolled data membership separately from its exact frozen
+  flow-v1 subset. New reference documents are v2; immutable v1 documents decode with
+  their original identity and remain valid for exact broad-equals-flow membership.
+  Unknown/divergent flow members still fail closed.
+- A wholly ineligible universe advances raw and normalized barriers independently,
+  discovers newly registered quiet-period targets on a bounded cadence, and persists
+  one transactional `UNAVAILABLE` window plus exact stage evidence. Equivalent replay
+  is idempotent, divergent replay fails, and both serial-window callers bypass flow
+  products without publication effects.
+- Persisted logical shards drive acquisition normalization, journal registration,
+  materializer fanout, aligned lease ownership, batched shard/consumer health and
+  checkpoint restore. Rolling production validates separate market-state and flow
+  shard-id sets/map hashes and separate normalized-market/raw-flow checkpoint offsets;
+  neither side assumes shard zero or one shared offset. Physical message/byte/reconnect
+  counters and actual transport gaps update when durable status changes.
+- The strategy resolver emits atomic debit/credit wings, long-premium/income singles,
+  explicit required-leg groups and smile expiry neighborhoods only for explicitly
+  enabled strategies. A synthetic consumer reads the real durable journal, commits its
+  own PostgreSQL checkpoint and resumes after restart without acquisition changes.
+- Generic journal records preserve raw timestamp value/unit, source schema, sequences,
+  trade IDs, conditions, corrections, exchange metadata and receive time. Future
+  consumers retain independent offsets, event-time watermarks, history bounds and
+  explicit missing-feed states. Silent accumulation remains 120-730 DTE foundation
+  only with zero live slots/history/detector work; registration alone adds no work.
+- Provider-free C6/C5/policy/runtime/schema/security/live-024 selection: 379 passed,
+  4 expected PostgreSQL skips and 5 existing warnings. Owned disposable PostgreSQL
+  corrected C6 plus exact-four C5 session/authority/catalog/desired selection:
+  33 passed with 6 existing warnings. This includes the weekly-expiry successor,
+  corrected routing/restart boundaries and exact C5 session regressions.
+  No provider/network, production Docker, publication, delivery, broker or trading
+  effect ran.
+- Account-specific provider extras and full-session message/byte/memory/journal/drain
+  measurements remain operational validation, not a startup software qualification
+  gate or a claim made by C6.
+- C7 still owns product/release/pointer/outbox/publication/delivery changes. C8 owns
+  unattended lifecycle, automatic next-session activation and resident rollover.
+  C9 owns retirement of manual activation, daily supervisors and duplicate paths.
 
 ## Exact Anchors
 

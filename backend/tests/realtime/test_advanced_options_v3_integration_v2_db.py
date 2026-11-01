@@ -532,6 +532,7 @@ def _exact_reference(authority, security_ids):
         known_at=known,
         valid_until=known + timedelta(hours=4),
         reference_policy_sha256="f" * 64,
+        data_membership_sha256="e" * 64,
         contract_scope_sha256="0" * 64,
         underlyings=("QQQ", "SPY"),
         open_interest=tuple(facts_oi),
@@ -1933,6 +1934,7 @@ def test_v3_exact_provider_free_restart_publication_and_cleanup(
                         "normalized_end_offset": market_slice.end_offset,
                         "state_sha256": _digest(flow_rows),
                         "shard_map_sha256": market_map.sha256,
+                        "shard_ids": [0],
                         "effects": {
                             "dispatch": False,
                             "delivery": False,
@@ -1951,12 +1953,15 @@ def test_v3_exact_provider_free_restart_publication_and_cleanup(
                         "status": "COMPLETE",
                         "kind": "FLOW",
                         "raw_end_offset": len(frames),
+                        "normalized_end_offset": market_slice.end_offset,
                         "checkpoint_end_offset": len(frames),
                         "owner_epoch": 1,
                         "evidence_ref": (
                             f"flow:{source_flow.source_flow_id}:"
                             f"{len(frames)}"
                         ),
+                        "shard_map_sha256": "c" * 64,
+                        "shard_ids": [0],
                         "effects": {
                             "dispatch": False,
                             "delivery": False,

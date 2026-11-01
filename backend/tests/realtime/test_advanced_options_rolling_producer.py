@@ -10,6 +10,9 @@ from psycopg2 import Error as PsycopgError
 
 from advanced_options_reference_support import reference_state
 from advanced_options_rolling_support import rolling_state
+from realtime.advanced_options_reference_state import (
+    REFERENCE_STATE_VERSION_V1,
+)
 from realtime.advanced_options_rolling_producer import (
     AdvancedOptionsEquityLiveHeadBinding,
     AdvancedOptionsRollingProducerPreflight,
@@ -24,6 +27,8 @@ from realtime.database_access_v2 import V2ConnectionProvider
 from realtime.option_source_flow import build_option_source_flow_identity
 from tests.realtime.test_advanced_options_reference_producer import (
     _contract_scope,
+    _mixed_enrollment,
+    _mixed_reference_state,
 )
 from tests.realtime.test_advanced_options_control_plane import (
     EXPIRES,
@@ -56,12 +61,17 @@ def _plan(**changes):
             generation=1,
             known_at=PLANNED,
             valid_until=EXPIRES,
+            data_membership_sha256=(
+                enrollment.activity_selection.selection_sha256
+            ),
             contract_scope_sha256=scope.sha256,
         ),
         source_flow=source_flow,
         owner_epoch=3,
-        committed_offset=11,
-        shard_ids=(0,),
+        market_state_committed_offset=9,
+        flow_committed_offset=11,
+        market_state_shard_ids=(0,),
+        flow_shard_ids=(0,),
         market_state_shard_map_sha256="e" * 64,
         flow_shard_map_sha256="f" * 64,
         known_at=PLANNED,
@@ -94,9 +104,68 @@ def test_rolling_producer_plan_freezes_scope_clocks_and_zero_authority():
     assert payload["identity"]["market_state_shard_map_sha256"] != (
         payload["identity"]["flow_shard_map_sha256"]
     )
+    assert payload["identity"]["market_state_committed_offset"] == 9
+    assert payload["identity"]["flow_committed_offset"] == 11
     assert set(payload["effect_counts"].values()) == {0}
     assert first.provider_calls_authorized is False
     assert first.runtime_actions_authorized is False
+
+
+def test_rolling_plan_separates_data_scope_and_consumer_shards():
+    enrollment = _mixed_enrollment()
+    scope = _contract_scope(enrollment)
+    plan = _plan(
+        enrollment=enrollment,
+        contract_scope=scope,
+        reference_state=_mixed_reference_state(
+            data_membership_sha256=(
+                enrollment.activity_selection.selection_sha256
+            ),
+            contract_scope_sha256=scope.sha256,
+            known_at=PLANNED,
+            valid_until=EXPIRES,
+        ),
+        market_state_shard_ids=(0, 1),
+        flow_shard_ids=(0,),
+    )
+
+    assert plan.data_membership_sha256 == (
+        enrollment.activity_selection.selection_sha256
+    )
+    assert plan.market_state_shard_ids == (0, 1)
+    assert plan.flow_shard_ids == (0,)
+    assert plan.market_state_committed_offset == 9
+    assert plan.flow_committed_offset == 11
+    with pytest.raises(
+        ValueError,
+        match="clocks, bounds or authority changed",
+    ):
+        _plan(
+            enrollment=enrollment,
+            contract_scope=plan.contract_scope,
+            reference_state=plan.reference_state,
+            flow_shard_ids=(),
+        )
+
+
+def test_rolling_plan_accepts_immutable_v1_reference_for_exact_membership():
+    enrollment = _enrollment_plan()
+    scope = _contract_scope(enrollment)
+    legacy = reference_state(
+        generation=1,
+        known_at=PLANNED,
+        valid_until=EXPIRES,
+        data_membership_sha256=None,
+        contract_scope_sha256=scope.sha256,
+    )
+
+    plan = _plan(
+        enrollment=enrollment,
+        contract_scope=scope,
+        reference_state=legacy,
+    )
+
+    assert plan.reference_state.version == REFERENCE_STATE_VERSION_V1
 
 
 def test_rolling_producer_plan_rejects_divergence_and_stale_bounds():

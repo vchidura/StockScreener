@@ -139,14 +139,18 @@ def test_continuous_session_windows_are_deterministic_and_failure_isolated():
                                 "normalized_end_offset": offset,
                                 "state_sha256": "a" * 64,
                                 "shard_map_sha256": "b" * 64,
+                                "shard_ids": [0],
                             }
                             if member
                             is ResidentCompletionMember.MARKET_STATE
                             else {
                                 "raw_end_offset": offset,
+                                "normalized_end_offset": offset,
                                 "checkpoint_end_offset": offset,
                                 "owner_epoch": owner_epoch,
                                 "evidence_ref": f"flow:{offset}",
+                                "shard_map_sha256": "c" * 64,
+                                "shard_ids": [0],
                             }
                         ),
                         "effects": {
@@ -249,6 +253,109 @@ def test_continuous_session_windows_are_deterministic_and_failure_isolated():
             "COMPLETE",
             windows[3].release_at,
         )
+
+
+def test_unavailable_window_completion_is_atomic_and_idempotent():
+    with disposable_v2_database(
+        f"test_realtime_v2_c6_unavailable_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            cohort_id = insert_cohort(database_cursor, OPENING)
+            enabled = {"OPTIONS_FLOW", "OPTIONS_INPUT_GATE"}
+            plan_id = _service_plan(
+                database_cursor,
+                cohort_id,
+                OPENING.date(),
+                enabled,
+                catalog_version="stages_v5",
+            )
+            database_cursor.connection.commit()
+        provider = V2ConnectionProvider(
+            {OWNER_POOL: pool},
+            V2AccessConfig(allow_disposable=True),
+        )
+        repository = PostgresOrchestrationRepository(provider)
+        window = repository.ensure_window(
+            plan_id,
+            WindowSpec(
+                cohort_id,
+                "MASSIVE_ADVANCED",
+                "C6-UNAVAILABLE",
+                OPENING,
+                OPENING,
+                OPENING + timedelta(minutes=2),
+            ),
+        )
+        stage_results = {
+            stage_id: {
+                "state": "UNAVAILABLE",
+                "reason_codes": (
+                    "FLOW_POLICY_NO_ELIGIBLE_CONTRACTS",
+                    (
+                        "UNAVAILABLE_EVIDENCE:"
+                        + canonical_sha256((str(window.window_id), stage_id))
+                    ),
+                ),
+            }
+            for stage_id in enabled
+        }
+
+        assert repository.finish_unavailable_window(
+            window.window_id,
+            stage_results,
+            now=OPENING,
+        )
+        assert not repository.finish_unavailable_window(
+            window.window_id,
+            stage_results,
+            now=OPENING + timedelta(seconds=1),
+        )
+        with pytest.raises(
+            ValueError,
+            match="replay diverged",
+        ):
+            repository.finish_unavailable_window(
+                window.window_id,
+                {
+                    **stage_results,
+                    "OPTIONS_FLOW": {
+                        "state": "UNAVAILABLE",
+                        "reason_codes": (
+                            "FLOW_POLICY_NO_ELIGIBLE_CONTRACTS",
+                            "UNAVAILABLE_EVIDENCE:" + "f" * 64,
+                        ),
+                    },
+                },
+                now=OPENING + timedelta(seconds=2),
+            )
+        with provider.transaction(read_only=True) as unit:
+            unit.cursor.execute(
+                "SELECT state FROM rt.window_runs WHERE window_id=%s",
+                (str(window.window_id),),
+            )
+            assert unit.cursor.fetchone()[0] == "UNAVAILABLE"
+            unit.cursor.execute(
+                "SELECT stage_id,state,reason_codes "
+                "FROM rt.stage_runs WHERE window_id=%s "
+                "ORDER BY stage_id",
+                (str(window.window_id),),
+            )
+            assert tuple(unit.cursor.fetchall()) == tuple(
+                (
+                    stage_id,
+                    "UNAVAILABLE",
+                    list(stage_results[stage_id]["reason_codes"]),
+                )
+                for stage_id in sorted(enabled)
+            )
+            unit.cursor.execute(
+                "SELECT count(*) FROM rt.window_runs "
+                "WHERE window_id=%s "
+                "AND state IN ('PENDING','RUNNING')",
+                (str(window.window_id),),
+            )
+            assert unit.cursor.fetchone()[0] == 0
+        assert not repository.open_windows(cohort_id)
 
 
 def test_split_authorities_are_one_use_idempotent_and_cleanup_with_database():
@@ -570,14 +677,18 @@ def test_split_authorities_are_one_use_idempotent_and_cleanup_with_database():
                             "normalized_end_offset": 10,
                             "state_sha256": "a" * 64,
                             "shard_map_sha256": "b" * 64,
+                            "shard_ids": [0],
                         }
                         if member
                         is ResidentCompletionMember.MARKET_STATE
                         else {
                             "raw_end_offset": 10,
+                            "normalized_end_offset": 10,
                             "checkpoint_end_offset": 10,
                             "owner_epoch": index,
                             "evidence_ref": "flow:10",
+                            "shard_map_sha256": "c" * 64,
+                            "shard_ids": [0],
                         }
                     ),
                     "effects": {

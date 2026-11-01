@@ -243,6 +243,7 @@ def reference_state(
     known_at=KNOWN,
     valid_until=VALID_UNTIL,
     short_interest=Decimal("0.08"),
+    data_membership_sha256="1" * 64,
     contract_scope_sha256="0" * 64,
 ):
     return build_advanced_options_reference_state(
@@ -251,6 +252,7 @@ def reference_state(
         known_at=known_at,
         valid_until=valid_until,
         reference_policy_sha256="f" * 64,
+        data_membership_sha256=data_membership_sha256,
         contract_scope_sha256=contract_scope_sha256,
         underlyings=("SPY",),
         open_interest=open_interest(known_at, session_date),

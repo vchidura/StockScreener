@@ -21,6 +21,7 @@ from realtime.advanced_options_v3_authority import (
     advanced_options_authority_bundle_payload,
     advanced_options_authority_preflight_cursor,
     advanced_options_authority_status_cursor,
+    _opening_admission,
     build_opening_subscription_readiness,
     build_prospective_opening_admission,
     build_session_acquisition_authorization,
@@ -125,6 +126,53 @@ def _admission():
         prepared_at=MARKET_TIME + timedelta(minutes=10),
         capture_boundary=OPENING,
     )
+
+
+def test_configured_admission_round_trips_asymmetric_missing_oi():
+    base = _admission()
+    contracts = tuple(
+        (
+            replace(
+                row,
+                open_interest=None,
+                open_interest_member_sha256=None,
+            )
+            if row.underlyer == "QQQ"
+            else row
+        )
+        for row in base.contracts
+        if row.contract_type == "CALL"
+    )
+    admission = _opening_admission(
+        status=OpeningAdmissionStatus.READY,
+        session_date=base.session_date,
+        prepared_at=base.prepared_at,
+        capture_boundary=base.capture_boundary,
+        pre_session_selection_id=base.pre_session_selection_id,
+        pre_session_selection_sha256=(
+            base.pre_session_selection_sha256
+        ),
+        source_evidence_sha256=base.source_evidence_sha256,
+        reference_evidence_sha256=(
+            base.reference_evidence_sha256
+        ),
+        contracts=contracts,
+        policy_sha256="9" * 64,
+    )
+
+    restored = prospective_opening_admission_from_payload(
+        prospective_opening_admission_payload(admission)
+    )
+
+    assert restored == admission
+    assert {
+        row.contract_type for row in restored.contracts
+    } == {"CALL"}
+    assert next(
+        row
+        for row in restored.contracts
+        if row.underlyer == "QQQ"
+    ).open_interest is None
 
 
 def _session_authority(cohort_id=None, *, decoded_messages=100_000):

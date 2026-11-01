@@ -16,7 +16,13 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from .database_access_v2 import V2ConnectionProvider
 from .stage_graph import StageDefinition
 
-TERMINAL_WINDOW_STATES = frozenset({"COMPLETE", "FAILED", "MISSED", "RETAINED_GAP"})
+TERMINAL_WINDOW_STATES = frozenset({
+    "COMPLETE",
+    "FAILED",
+    "MISSED",
+    "RETAINED_GAP",
+    "UNAVAILABLE",
+})
 OWNER_LOST = "OWNER_LOST"
 EQUITY_WINDOW_BUILD_ID = "v2-10-developer-window-v1"
 OPTIONS_INPUT_READY = "OPTIONS_INPUT_READY"
@@ -341,6 +347,14 @@ class OrchestrationRepository(Protocol):
 
     def finish_window(self, claim: WindowClaim, state: str, now: datetime) -> None: ...
 
+    def finish_unavailable_window(
+        self,
+        window_id: UUID,
+        stage_results: Mapping[str, Mapping[str, object]],
+        *,
+        now: datetime,
+    ) -> bool: ...
+
     def release_window(self, claim: WindowClaim, now: datetime) -> None: ...
 
 
@@ -487,6 +501,139 @@ class PostgresOrchestrationRepository:
                 f"SELECT DISTINCT ON (stage_id) {_RUN_COLUMNS} FROM rt.stage_runs WHERE window_id = %s "
                 "ORDER BY stage_id, attempt DESC", (str(window_id),))
             return {row[2]: _run(row) for row in unit.cursor.fetchall()}
+
+    def finish_unavailable_window(
+        self,
+        window_id: UUID,
+        stage_results: Mapping[str, Mapping[str, object]],
+        *,
+        now: datetime,
+    ) -> bool:
+        if (
+            not isinstance(window_id, UUID)
+            or window_id.int == 0
+            or not isinstance(stage_results, Mapping)
+            or not stage_results
+        ):
+            raise ValueError("unavailable window result is invalid")
+        normalized: dict[str, tuple[str, ...]] = {}
+        for stage_id, result in stage_results.items():
+            if (
+                not isinstance(stage_id, str)
+                or not stage_id.strip()
+                or not isinstance(result, Mapping)
+                or result.get("state") != "UNAVAILABLE"
+            ):
+                raise ValueError("unavailable stage result is invalid")
+            reasons = result.get("reason_codes")
+            if (
+                not isinstance(reasons, Sequence)
+                or isinstance(reasons, (str, bytes))
+                or not reasons
+                or any(
+                    not isinstance(reason, str) or not reason.strip()
+                    for reason in reasons
+                )
+            ):
+                raise ValueError("unavailable stage reasons are invalid")
+            normalized[stage_id] = tuple(reasons)
+        with self._transaction() as unit:
+            unit.cursor.execute(
+                "SELECT window_run.state,plan.stage_catalog_version,"
+                "plan.enabled_stages "
+                "FROM rt.window_runs AS window_run "
+                "JOIN rt.service_plans AS plan USING(plan_id) "
+                "WHERE window_run.window_id=%s FOR UPDATE",
+                (str(window_id),),
+            )
+            row = unit.cursor.fetchone()
+            if row is None:
+                raise LookupError(f"window {window_id} does not exist")
+            state = str(row[0])
+            stage_version = str(row[1])
+            enabled = frozenset(str(value) for value in row[2])
+            if enabled != frozenset(normalized):
+                raise ValueError(
+                    "unavailable window stage membership changed"
+                )
+            unit.cursor.execute(
+                "SELECT stage_id,stage_version,attempt,state,reason_codes "
+                "FROM rt.stage_runs WHERE window_id=%s "
+                "ORDER BY stage_id,attempt",
+                (str(window_id),),
+            )
+            existing = tuple(unit.cursor.fetchall())
+            expected = tuple(
+                (
+                    stage_id,
+                    stage_version,
+                    1,
+                    "UNAVAILABLE",
+                    normalized[stage_id],
+                )
+                for stage_id in sorted(normalized)
+            )
+            actual = tuple(
+                (
+                    str(value[0]),
+                    str(value[1]),
+                    int(value[2]),
+                    str(value[3]),
+                    tuple(value[4] or ()),
+                )
+                for value in existing
+            )
+            if state == "UNAVAILABLE":
+                if actual != expected:
+                    raise ValueError(
+                        "unavailable window replay diverged"
+                    )
+                return False
+            if state != "PENDING" or existing:
+                raise ValueError(
+                    "unavailable window transition diverged"
+                )
+            unit.cursor.executemany(
+                "INSERT INTO rt.stage_runs ("
+                "stage_run_id,window_id,stage_id,stage_version,attempt,"
+                "state,started_at,finished_at,reason_codes,"
+                "original_deadline,maximum_attempts,updated_at"
+                ") SELECT %s,%s,%s,%s,1,'UNAVAILABLE',%s,%s,%s,"
+                "window_run.deadline,1,%s "
+                "FROM rt.window_runs AS window_run "
+                "WHERE window_run.window_id=%s",
+                tuple(
+                    (
+                        str(uuid5(
+                            NAMESPACE_URL,
+                            (
+                                "stockscreener:unavailable-stage:"
+                                f"{window_id}:{stage_id}"
+                            ),
+                        )),
+                        str(window_id),
+                        stage_id,
+                        stage_version,
+                        now,
+                        now,
+                        list(normalized[stage_id]),
+                        now,
+                        str(window_id),
+                    )
+                    for stage_id in sorted(normalized)
+                ),
+            )
+            unit.cursor.execute(
+                "UPDATE rt.window_runs SET state='UNAVAILABLE',"
+                "owner_id=NULL,lease_until=NULL,updated_at=%s "
+                "WHERE window_id=%s AND state='PENDING'",
+                (now, str(window_id)),
+            )
+            if unit.cursor.rowcount != 1:
+                raise ValueError(
+                    "unavailable window transition diverged"
+                )
+        return True
 
     def recover_orphans(self, claim: WindowClaim, now: datetime) -> Sequence[StageRunRecord]:
         with self._transaction() as unit:

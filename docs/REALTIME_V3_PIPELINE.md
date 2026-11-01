@@ -671,16 +671,62 @@ Rollback: use the legacy file adapter against the same immutable session snapsho
 Purpose: support maintenance-time additions without weakening current exact-four
 behavior.
 
+Selection authority: follow the research-backed C6 recommendation in
+[ADVANCED_OPTIONS_FLOW_POLICY.md](ADVANCED_OPTIONS_FLOW_POLICY.md#c6-recommendation-strategy-coverage-before-opportunity-ranking)
+and its `advanced_options_selection_c6_v1.json` design specification. The specification
+is runtime-loaded only by the typed C6 planner and C5 persistence path; future capture
+and detectors remain separately disabled by default.
+Preserve frozen flow-v1 identities and existing detector acceptance/ranking behavior.
+
+The 2026-11-01
+[finalized activity/momentum rollout](ADVANCED_OPTIONS_FLOW_POLICY.md#finalized-near-term-rollout-activity-and-momentum-2026-11-01)
+is implemented as a separate admission-profile contract: one entitled Options
+connection, a supported
+900 active / 100 spare quote-slot ceiling (subject to measured throughput), fair-share
+ranked admission with unused-slot redistribution, and priority for participation,
+short-dated sweep-like activity and directional momentum. The generic selection JSON
+and frozen flow-v1 remain unchanged; `c6_activity_momentum_v1` supplies a separate
+runtime-loaded identity and preserves existing state compatibility. The C6 addendum
+below supersedes this ceiling as an initial allocation target: the next profile must
+filter earlier and start with smaller per-underlying coverage. The current v1 profile
+still defaults to 900; the addendum is a requirement, not a claim of deployed behavior.
+Silent accumulation remains post-stability work: foundation/tests only, zero live
+capture/history/detector workload in this initial profile.
+
+C6 must also establish the
+[seven-detector foundation](ADVANCED_OPTIONS_FLOW_POLICY.md#c6-foundation-for-the-seven-future-detectors):
+registered requirements, optional capture-only collection and detector enablement are
+separate. This delivers stable ingestion/consumer interfaces now, with extra adapters,
+shared features and detector logic implemented in later work packages. Registration
+alone creates no subscription or readiness gate.
+
 Actions:
 
 - replace hard-coded QQQ/SPY/four-member validation with configured membership;
 - retain the exact-four selection policy as one supported default;
+- derive bounded contract coverage from enabled strategy requirements plus flow,
+  preserving supporting legs and surface neighbors; candidate output caps never
+  limit ingress, factual accounting or retained flow evidence;
+- separate the broad market-data scope from the flow-eligible subset, including
+  strategy-required 3-4 DTE and explicit unavailability for unsupported flow tiers;
+- persist selection reasons, policy/reference identities and per-capability readiness
+  through C5 without duplicating market facts or adding per-message database reads;
+- add generalized per-underlying catalog/OI/history readiness and durable shard state;
+- support future requirement declarations for 0-5 and 120-730 DTE, paired calls/puts,
+  expiry neighborhoods, raw equity trades and index observations without hard-coded
+  flow-v1 eligibility or a 60-DTE ceiling in generic ingress;
+- preserve source timestamp precision, corrections/conditions and provenance in
+  journal interfaces; define independent consumer offsets, event-time watermarks,
+  history coverage, feature ownership and explicit missing-feed states;
 - generalize scheduler expected counts and stored-reader coverage;
-- calculate account-wide connection capacity before shard construction, including
-  concurrently active Equity and Options owners, reconnect headroom and provider
-  entitlement limits;
+- calculate provider connection capacity by account and asset-class cluster before
+  constructing physical subscriptions, plus shared processing/network resource limits;
+  correct the current combined Equity/Options connection sum and do not require a
+  spare simultaneous socket for reconnect on a one-connection Options entitlement;
 - build deterministic contract shards within the configured/provider maximum;
-- give every shard independent owner, journal generation, counters and reconnect gaps;
+- distinguish logical processing shards from physical socket owners; logical shards
+  cannot create extra provider connections. Preserve journal identity, consumer
+  checkpoints, counters and reconnect-gap attribution through the single socket owner;
 - aggregate readiness without hiding a failed shard;
 - extend fixtures from four contracts to representative 1/9/50-underlying plans.
 
@@ -688,6 +734,18 @@ Exit:
 
 - exact-four tests still pass;
 - a larger provider-free membership partitions deterministically and rehydrates;
+- the activity/momentum allocator demonstrates 50/100-name fair shares, deterministic
+  redistribution, complete leg groups, planned/admitted/ready coverage and quote budget
+  enforcement; one Stocks plus one Options connection is allowed when separately
+  entitled, while a second Options connection is refused under the baseline allowance;
+- the seven foundation fixtures prove disabled requirements add no workload,
+  capture-only does not enable detectors, 49/50/51 ms evidence survives replay,
+  long-dated and paired contracts rehydrate, and a new synthetic consumer attaches
+  without editing acquisition loops or creating duplicate provider owners;
+- multiple strikes/expiries and complete package legs reach the appropriate strategy;
+  zero morning volume/missing OI do not stop valid capture or weaken detector gates;
+- candidate-output limits do not stop subsequent capture or evaluation; realistic
+  burst/slow-consumer tests measure message/byte rates, memory, journal growth and drain;
 - adding one Options underlying during maintenance backfills catalog/OI and becomes
   ready without changing existing shard identities unnecessarily;
 - the session refuses an over-capacity shard plan explicitly rather than truncating
@@ -695,6 +753,251 @@ Exit:
 - removing an underlying affects the next session only and retains old evidence.
 
 Rollback: configure the exact-four default membership; generic schema remains additive.
+
+Implementation evidence (2026-11-01): C6 uses the typed generic selection foundation,
+the separate `c6_activity_momentum_v1` allocator, corrected migration 042 and the C5
+PostgreSQL session-state port. Capacity is per provider cluster; one physical Options
+owner/journal serves deterministic logical shards. Preparation follows bounded chain
+pagination, persists fair-share allocation/coverage and keeps missing OI and unsupported
+flow explicit. Flow workers consume the eligible subset and advance window-scoped
+unavailable completion live when no contracts qualify. Persisted logical shards drive
+acquisition routing, materializer/checkpoint ownership, aligned leases and batched
+health; physical counters retain transport-gap evidence during the session. Strategy
+resolution emits complete enabled groups, and a synthetic consumer proves actual
+journal attachment plus PostgreSQL checkpoint recovery without acquisition changes.
+QQQ/SPY exact four remains a compatibility regression. Provider-free
+C6/C5/policy/runtime/schema/security/live-024 selection passed 329 tests with 3 expected
+skips; the owned disposable PostgreSQL
+corrected C6 plus exact-four C5 selection passed 31 tests. No provider/network,
+production Docker, publication, delivery, broker or trading effect ran. Account-specific
+entitlement and full-session load/drain are not claimed. C7 product/publication work,
+C8 unattended lifecycle/rollover and C9 retirement remain explicitly excluded.
+
+##### C6 Addendum: Early Selection And Bounded Detector Work
+
+Status: **IMPLEMENTED; OFFLINE TECHNICAL ACCEPTANCE COMPLETE, OPERATIONAL CAPACITY
+EVIDENCE STILL REQUIRED**.
+This addendum takes precedence over the earlier initial 900-slot recommendation and
+the proposed 300/600/900 rollout budgets for 10/25/50 underlyings. Preserve the existing
+C6 foundation and exact-four compatibility. Implement this as a separately versioned
+admission profile and consumer-routing refinement; do not mutate pinned v1 profiles,
+existing session selections, or frozen flow-v1 thresholds.
+
+Implementation evidence:
+
+- New configurable preparation defaults to the separately pinned
+  `c6_activity_momentum_v2` profile. The frozen `c6_activity_momentum_v1` JSON,
+  payload and stored-state decoder remain independently selectable and unchanged.
+- Default configuration derives `B=min(8*N, configured total, established measured
+  capacity when present, effective provider/project ceiling)`. Examples: no expansion
+  flags produce 80/200/400 for 10/25/50 eligible names; explicit
+  `--per-underlying-contract-limit 12` permits 120/300/600 within the configured total
+  and supported ceiling; `--active-quote-contract-budget 200` is an explicit smaller
+  total. The persisted allocation records configured and effective values.
+- Provider expiry and strike filters use the profile discovery range before bounded
+  pagination. Default discovery ends at 21 DTE; 22-60 is requested only for an enabled
+  strategy or required group. Typed criteria own target expiries, delta/moneyness,
+  dated quote/liquidity checks, shortlist/group bounds and tie-breaks. Missing OI,
+  Greeks or zero volume alone does not reject capture.
+- Required and enabled complete strategy groups resolve from the bounded candidate pool
+  before coverage shortlisting. Accepted groups protect every dependency leg through
+  per-side and per-underlying bounds; explicit required overflow fails, while optional
+  complete-group overflow records one whole-group unavailable reason.
+- C5 activation reloads the allocation's exact profile version/hash and derives its
+  capacity from the frozen allocation. Residents load the immutable routing map once,
+  journal before routing, share quote/factual-volume state, checkpoint every scanned
+  event, and evaluate only relevant contracts or complete groups at declared cadence.
+  A mutable routing checkpoint in migration `042` preserves deterministic restart:
+  equal equivalent replay is idempotent, equal divergent or stale replay fails, and
+  only forward progress updates durable evidence.
+- Focused addendum tests cover default and expanded 10/25/50 budgets, smaller totals,
+  deterministic 12-contract redistribution, no eligible names, sparse quality,
+  provider-order independence, role-target expiry ranking, complete/shared groups,
+  bounded enumeration, disabled consumers, output caps, cadence, replay and restart.
+  Owned disposable PostgreSQL proves allocation/profile/routing identity through
+  activation and reload. The affected provider-free selection is 283 passed with the
+  existing 5 warnings; the clean owned-disposable C6/C5/reference/rolling/integration
+  slice is 25 passed with 6 existing warnings. No provider, live database, Docker,
+  publication, broker or trading effect was used.
+- Observed test fixtures persist event/detail-byte counts and first/last clocks for
+  every admitted record, including irrelevant and wholly unrouted slices, plus detector
+  invocation/skip counts, bounded cache sizes and checkpoint lag. They are deterministic
+  technical evidence only; no full-session CPU/RSS/journal/drain run or safe-capacity
+  claim is made. Intraday rotation, additional feeds, the 50 ms detector and live
+  silent accumulation remain deferred.
+
+Weekly-expiry/ranking-anchor successor evidence (2026-11-01):
+
+- `c6_activity_momentum_v3` is a separately hashed, explicitly selected calibration
+  profile. Preparation still defaults to `c6_activity_momentum_v2`; v1/v2 JSON,
+  allocation decode and frozen-session behavior are unchanged. An offline v3 example
+  adds `--admission-profile-version c6_activity_momentum_v3
+  --last-trading-convention SPY=US_EQUITY_STANDARD_PM
+  --last-trading-convention QQQ=US_EQUITY_STANDARD_PM`. Optional comparison settings
+  include `--short-delta-override 0.45` and `--disable-same-day`; all are persisted in
+  the immutable allocation evidence rather than changing an existing session.
+- V3 retains disjoint 0-5 short, 6-21 core and explicitly required 22-60 strategy
+  envelopes. It resolves listed near-target and exchange-calendar end-of-week
+  expirations against the target session date. Distinct dates softly receive 2+2
+  contracts inside the four short slots; a coincident or sole listed expiry receives
+  up to four distinct quality-ranked contracts. The evidence records candidate and
+  eligible expiry sets, resolution reason, coincidence/single-expiry state, selected
+  expiry/side counts and shortfalls. No provider weekly label or synthesized Friday is
+  used.
+- Same-day admission defaults enabled only for configured supported conventions and
+  requires persisted last-trading session/timestamp evidence at the explicit
+  preparation clock. Disabled, expired, missing or unsupported dependent short
+  coverage fails closed without blocking another underlying or core/strategy work.
+  Prior-evening preparation is anchored to the target XNYS session rather than the
+  machine UTC date.
+- V3 seeds are offline calibration values: short delta anchor 0.50, ATM fallback,
+  7.5% maximum moneyness and 20% spread; core delta anchor 0.60, ATM fallback,
+  10% maximum moneyness and 20% spread. Delta remains a ranking anchor, not a cutoff.
+  Missing Greeks use the typed ATM fallback and are counted in persisted evidence;
+  missing OI and zero volume remain nonblocking. Strategy-extension criteria remain
+  owned by the enabled strategy policy.
+- The immutable allocation carries the exact v3 profile/hash, resolved expiry and
+  last-trading evidence, ranking-anchor/fallback counts, selected expiry/side counts
+  and required-group displacement. Existing C5 activation and C6 selection-plan
+  reload use that document directly; restart does not rescan the chain, rotate
+  contracts or recompute dates.
+- The focused guarded file passed 50 tests with 5 existing warnings. The directly
+  affected guarded C6/C5 allocator, selection, consumer/routing, session, acquisition,
+  runtime, Docker-binding, control-plane and authority slice passed 208 tests with
+  5 existing warnings. With `STOCKS_V2_DB_TESTS=1`, the coordinator independently
+  reran the owned-disposable C6/C5 selection/session/authority/integration slice:
+  14 passed with 6 warnings in 39.55 seconds. It used only owned disposable PostgreSQL;
+  no live database or provider effect occurred.
+- Bounded-overhead evidence is deterministic and offline: the coordinator reran the
+  50-test focused weekly-selection file with `--durations=10` in 3.88 seconds
+  (5 existing warnings), and a synthetic v3 50-name allocation filled the bounded
+  400-contract budget in 0.08 seconds. These timings do not establish production
+  capacity; full-session CPU/RSS/journal/drain and live-traffic capacity remain
+  operational validation.
+- The deterministic six-contract v2/v3 calibration fixture records 6 v2 admissions
+  versus 4 v3 admissions, 2 v3 role/side/expiry rejections (spread and moneyness),
+  one ATM fallback and routed-event invocation units of 30 versus 20. It also records
+  filter/pool/shortlist/group work counts and distributions. This is offline comparison
+  evidence only, not production superiority, safe capacity or live-market validation.
+  Provider access, live database mutation, Docker restart, activation, publication,
+  delivery, broker/trading effects, intraday rotation, new feeds and C7-C9 work were
+  not performed.
+
+Goal: reduce subscription traffic, storage growth and repeated detector computation
+by selecting useful coverage before WebSocket subscription and routing downstream work
+by capability. A smaller contract set reduces coverage as well as work; it does not
+guarantee the best opportunities or detect activity outside the subscribed set.
+
+**Initial admission budget**
+
+| Ready underlyings with eligible candidates | Default total budget: up to 8 each | Reviewed expansion ceiling: up to 12 each |
+| ---: | ---: | ---: |
+| 10 | 80 unique contracts | 120 unique contracts |
+| 25 | 200 unique contracts | 300 unique contracts |
+| 50 | 400 unique contracts | 600 unique contracts |
+
+- These are engineering starting limits, not measured safe capacities or minimums
+  to fill. Calls, puts, expiries and supporting legs all count toward the same unique
+  contract budget; a contract used by multiple detectors counts once.
+- For N eligible ready underlyings, the default B is the minimum of 8*N, the configured
+  total budget, any established measured capacity limit, and the effective provider/
+  project ceiling. Without a measured limit, use the small configured budget for
+  bounded validation; do not invent a new startup qualification gate. The existing
+  900 ceiling remains an upper bound, not an allocation target.
+  N=0 produces explicit no-eligible coverage and no subscription attempt.
+- Start each underlying at no more than 8 slots (or its deterministic fair share when
+  B is smaller). Redistribute genuinely unused slots in deterministic rounds, with
+  at most 12 unique contracts per underlying and never more than B overall. Do not
+  automatically raise B because fewer names qualify, and do not pad weak candidates.
+- Expanding B toward 12*N is an explicit persisted configuration change after load
+  and coverage evidence, not an automatic daily step or a new daily approval gate.
+  Larger allocations require a later profile revision. The exact-four profile remains
+  independently selectable; activating new code alone must not expand a frozen session.
+
+**Selection stages, in order**
+
+1. Resolve ready underlying membership, enabled consumer requirements and dated inputs
+   once at preparation. Exclude invalid/expired/unsupported contract identities. Missing
+   optional context affects only the capability that needs it; do not block an otherwise
+   ready underlying or unrelated consumers.
+2. Apply provider-supported expiry/strike query filters before downloading chains.
+   The initial activity profile searches 0-5 and 6-21 DTE; include 22-60 only for an
+   explicitly enabled strategy or required group. Keep generic future 120-730 DTE
+   support, but no live silent-accumulation collection. Use bounded pagination across
+   the declared discovery range; a request/byte/deadline stop is incomplete discovery,
+   not evidence that the first returned rows were the best candidates.
+3. Apply cheap contract-level checks before expensive group construction: catalog
+   validity, supported deliverables, dated quote quality, and the versioned role's
+   liquidity/strike-distance criteria. Reuse declared strategy criteria where applicable;
+   do not add hidden hard-coded thresholds. Record filter reasons and distinguish a
+   pre-selection quote from a live executable mark. Missing OI/Greeks or zero morning
+   volume must not alone disqualify valid activity capture; missing inputs disable the
+   dependent ratio/model. Do not require an unusual-volume signal before subscribing.
+4. Rank within coverage roles using dated quote/spread evidence, reliable prior OI,
+   completed-session participation and strike/delta relevance. Preserve complete
+   strategy-required groups and their dependency legs before pruning the shortlist.
+   Bound the candidate pool and package enumeration by explicit profile limits; do
+   not construct all strike/expiry combinations or truncate by provider response order.
+5. Allocate the small live set. The initial 8-slot coverage target is up to 4 contracts
+   in 0-5 DTE and up to 4 in 6-21 DTE. Prefer calls in the short basket while preserving
+   put coverage in both baskets when eligible; share slots across applicable roles.
+   These are soft coverage targets: missing expiries do not create fake minimums, and
+   complete required groups can change the split within B and the 12-contract ceiling.
+   A group that cannot fit is deferred intact with partial/uncovered strategy evidence.
+6. Persist the resolved unique membership, profile hash, ranking inputs/as-of times,
+   complete groups, per-detector eligible subsets and selection/coverage reasons through
+   C5, then subscribe to those exact T/Q contracts. Restart reloads that same selection.
+   Keep membership stable within the session; intraday rotation remains deferred.
+
+**Consumer work after admission**
+
+- Journal all received admitted traffic before applying detector filters. Selection
+  limits are subscription admission limits, not permission to drop small prints,
+  stop factual volume accounting, or discard events after an alert-output cap is hit.
+- Build an in-memory contract/group-to-consumer routing map from persisted membership
+  and capabilities. No per-message database lookup or full-chain/strategy cross product.
+  Flow-v1's nine-name/DTE scope stays distinct from broad data capture.
+- Compute shared quote state, factual volume and reference joins once. Event-sensitive
+  consumers process relevant events; heavier package models evaluate only affected
+  complete groups at their declared cadence/readiness boundary. Do not repeatedly run
+  every strategy against every selected contract on every quote.
+- Consumers must declare their inputs, group dependencies, event kinds and timing needs.
+  Routing may skip irrelevant evaluation, but checkpoint scanning must remain contiguous
+  and replay deterministic. Preserve raw/normalized offset coordinates, original event
+  precision and independent consumer recovery; never downsample the journal to save
+  detector CPU. A later consumer using captured inputs attaches without a new provider
+  owner; missing feeds/history remain explicit future collection requirements.
+- Keep optional/future consumers disabled unless configured. In particular, the future
+  50 ms detector and SILENT_ACCUMULATION add no initial runtime workload. Shared-feature
+  caches are bounded and rebuildable; avoid duplicating tick facts per consumer.
+
+**Implementation and acceptance requirements**
+
+- Add a new typed admission-profile version with explicit total/per-underlying budgets,
+  discovery ranges, coverage targets, shortlist/group bounds and routing requirements.
+  Preparation, activation and resident loading must agree on and persist its identity.
+  Update the CLI's default-budget derivation and the small-budget allocator together;
+  passing a lower total to the current fill-to-budget allocator alone is insufficient.
+- Verify 10/25/50-name plans stay within 80/200/400 by default, enforce the per-name 12
+  ceiling on redistribution, allow fewer than 8 quality contracts, and do not spill
+  beyond B when another underlying is unavailable. Test complete groups, no eligible
+  members, sparse expiry coverage, missing OI and provider-order independence.
+- Test preparation through durable activation, actual acquisition routing, materializer,
+  eligible/unavailable consumers and window completion, including multiple shards,
+  unequal raw/event offsets, restart and idempotent terminal evidence. Preserve existing
+  exact-four behavior, stored-state compatibility and future-consumer attachment tests.
+- Demonstrate that irrelevant detector evaluations are skipped, relevant triggers and
+  factual volumes match a replay of the same admitted data, and output caps never stop
+  capture. Measure event/byte rates, detector invocation counts, CPU, memory, journal
+  growth and checkpoint lag during burst/drain tests; counts alone prove no safe load.
+- Persist counts at discovery, filtered, shortlisted, admitted and detector-ready stages,
+  bounded rejection reasons, missing role/group coverage, and the effective budgets.
+  C7 can project these facts without presenting partial coverage as the full chain.
+  Do not block unaffected live work because an optional expansion lacks capacity.
+
+Completion evidence above describes the existing C6 implementation only. Closing this
+addendum requires its own source changes and behavioral evidence; documentation alone
+does not enable the new admission or routing behavior.
 
 #### C7 - Integrate Products, Publication And Context
 

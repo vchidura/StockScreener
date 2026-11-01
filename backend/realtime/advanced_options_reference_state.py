@@ -19,7 +19,12 @@ from .dividend_reference import DividendReferenceWindow
 from .reference_facts import ReferenceFact, ReferenceFactRelation
 
 
-REFERENCE_STATE_VERSION = "advanced-options-reference-state-v1"
+REFERENCE_STATE_VERSION_V1 = "advanced-options-reference-state-v1"
+REFERENCE_STATE_VERSION = "advanced-options-reference-state-v2"
+REFERENCE_STATE_VERSIONS = frozenset({
+    REFERENCE_STATE_VERSION_V1,
+    REFERENCE_STATE_VERSION,
+})
 
 
 class ReferenceAvailability(str, Enum):
@@ -634,6 +639,7 @@ class AdvancedOptionsReferenceState:
     known_at: datetime
     valid_until: datetime
     reference_policy_sha256: str
+    data_membership_sha256: str | None
     contract_scope_sha256: str
     underlyings: tuple[str, ...]
     open_interest: tuple[AdvancedOptionsOpenInterestReference, ...]
@@ -658,8 +664,10 @@ class AdvancedOptionsReferenceState:
             self.equity_metrics,
             key=lambda row: (row.ticker, row.metric_kind.value),
         ))
+        legacy = self.version == REFERENCE_STATE_VERSION_V1
         if (
-            self.version != REFERENCE_STATE_VERSION
+            self.version not in REFERENCE_STATE_VERSIONS
+            or legacy != (self.data_membership_sha256 is None)
             or type(self.reference_generation) is not int
             or self.reference_generation <= 0
             or not isinstance(self.session_date, date)
@@ -721,6 +729,15 @@ class AdvancedOptionsReferenceState:
             "reference_policy_sha256",
             _sha256(self.reference_policy_sha256, "reference_policy_sha256"),
         )
+        if self.data_membership_sha256 is not None:
+            object.__setattr__(
+                self,
+                "data_membership_sha256",
+                _sha256(
+                    self.data_membership_sha256,
+                    "data_membership_sha256",
+                ),
+            )
         object.__setattr__(
             self,
             "contract_scope_sha256",
@@ -742,7 +759,7 @@ class AdvancedOptionsReferenceState:
     @property
     def identity(self) -> dict[str, object]:
         return {
-            "contract": REFERENCE_STATE_VERSION,
+            "contract": self.version,
             "reference_generation": self.reference_generation,
             "session_date": self.session_date,
             "known_at": self.known_at,
@@ -754,6 +771,15 @@ class AdvancedOptionsReferenceState:
             "historical_volatility": self.historical_volatility,
             "valuation_inputs": self.valuation_inputs,
             "equity_metrics": self.equity_metrics,
+            **(
+                {}
+                if self.data_membership_sha256 is None
+                else {
+                    "data_membership_sha256": (
+                        self.data_membership_sha256
+                    )
+                }
+            ),
         }
 
     @property
@@ -935,6 +961,7 @@ def build_advanced_options_reference_state(
     known_at: datetime,
     valid_until: datetime,
     reference_policy_sha256: str,
+    data_membership_sha256: str | None,
     contract_scope_sha256: str,
     underlyings: tuple[str, ...],
     open_interest: tuple[AdvancedOptionsOpenInterestReference, ...],
@@ -956,8 +983,13 @@ def build_advanced_options_reference_state(
         equity_metrics,
         key=lambda row: (row.ticker, row.metric_kind.value),
     ))
+    version = (
+        REFERENCE_STATE_VERSION_V1
+        if data_membership_sha256 is None
+        else REFERENCE_STATE_VERSION
+    )
     identity = {
-        "contract": REFERENCE_STATE_VERSION,
+        "contract": version,
         "reference_generation": reference_generation,
         "session_date": session_date,
         "known_at": known_at,
@@ -969,6 +1001,11 @@ def build_advanced_options_reference_state(
         "historical_volatility": normalized_volatility,
         "valuation_inputs": normalized_valuations,
         "equity_metrics": normalized_metrics,
+        **(
+            {}
+            if data_membership_sha256 is None
+            else {"data_membership_sha256": data_membership_sha256}
+        ),
     }
     state_sha256 = canonical_sha256(identity)
     return AdvancedOptionsReferenceState(
@@ -977,12 +1014,13 @@ def build_advanced_options_reference_state(
             f"stockscreener:advanced-options-reference-state:{state_sha256}",
         ),
         state_sha256=state_sha256,
-        version=REFERENCE_STATE_VERSION,
+        version=version,
         reference_generation=reference_generation,
         session_date=session_date,
         known_at=known_at,
         valid_until=valid_until,
         reference_policy_sha256=reference_policy_sha256,
+        data_membership_sha256=data_membership_sha256,
         contract_scope_sha256=contract_scope_sha256,
         underlyings=normalized_underlyings,
         open_interest=normalized_oi,

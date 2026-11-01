@@ -355,18 +355,17 @@ def test_scheduler_contract_refuses_naive_156_request_budget():
         )
 
 
-def test_scheduler_contract_refuses_nine_underlying_options_scope():
-    with pytest.raises(
-        ValueError,
-        match="provider contract is invalid",
-    ):
-        replace(
-            _provider_contract(),
-            contract_tickers=tuple(
-                f"O:{symbol}261028C00100000"
-                for symbol in ADVANCED_SESSION_EQUITY_SYMBOLS
-            ),
-        )
+def test_scheduler_contract_accepts_configured_nine_underlying_scope():
+    configured = replace(
+        _provider_contract(),
+        contract_tickers=tuple(
+            f"O:{symbol}261028C00100000"
+            for symbol in ADVANCED_SESSION_EQUITY_SYMBOLS
+        ),
+    )
+
+    assert len(configured.contract_tickers) == 9
+    assert configured.sha256 != _provider_contract().sha256
 
 
 def test_provider_free_plan_reports_exact_grant_without_effects(

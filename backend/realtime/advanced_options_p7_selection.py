@@ -51,10 +51,11 @@ class P7TransportSelectionPolicy:
         }))
         if (
             not version
-            or underlyings != ("QQQ", "SPY")
+            or not underlyings
+            or len(underlyings) != len(self.underlyings)
             or type(self.minimum_dte) is not int
             or type(self.maximum_dte) is not int
-            or not 0 <= self.minimum_dte <= self.maximum_dte <= 2
+            or not 0 <= self.minimum_dte <= self.maximum_dte <= 60
             or not Decimal("0")
             < self.maximum_moneyness_fraction
             <= Decimal("0.10")
@@ -89,7 +90,7 @@ class P7TransportCandidate:
     bid: Decimal
     ask: Decimal
     day_volume: int
-    open_interest: int
+    open_interest: int | None
     calendar_dte: int
     market_data_time: datetime
     source_sha256: str
@@ -114,7 +115,7 @@ class P7TransportCandidate:
             or match.group("option_type") != option_type
             or Decimal(match.group("strike")) / Decimal("1000")
             != self.strike
-            or underlyer not in {"QQQ", "SPY"}
+            or not underlyer
             or option_type not in {"C", "P"}
             or not isinstance(self.expiration_date, date)
             or isinstance(self.expiration_date, datetime)
@@ -125,8 +126,13 @@ class P7TransportCandidate:
             or self.ask < self.bid
             or type(self.day_volume) is not int
             or self.day_volume < 0
-            or type(self.open_interest) is not int
-            or self.open_interest < 0
+            or (
+                self.open_interest is not None
+                and (
+                    type(self.open_interest) is not int
+                    or self.open_interest < 0
+                )
+            )
             or type(self.calendar_dte) is not int
             or self.calendar_dte < 0
             or len(self.source_sha256) != 64
@@ -210,6 +216,47 @@ def _policy_payload(
     }
 
 
+def _policy_from_payload(
+    value: object,
+) -> P7TransportSelectionPolicy:
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "underlyings",
+        "minimum_dte",
+        "maximum_dte",
+        "maximum_moneyness_fraction",
+        "minimum_day_volume",
+        "minimum_open_interest",
+        "maximum_relative_spread",
+        "maximum_snapshot_age_seconds",
+        "review_cadence",
+    }:
+        raise ValueError("P7 transport policy fields are not exact")
+    policy = P7TransportSelectionPolicy(
+        version=str(value["version"]),
+        underlyings=tuple(
+            str(item) for item in value["underlyings"]
+        ),
+        minimum_dte=int(value["minimum_dte"]),
+        maximum_dte=int(value["maximum_dte"]),
+        maximum_moneyness_fraction=Decimal(
+            str(value["maximum_moneyness_fraction"])
+        ),
+        minimum_day_volume=int(value["minimum_day_volume"]),
+        minimum_open_interest=int(value["minimum_open_interest"]),
+        maximum_relative_spread=Decimal(
+            str(value["maximum_relative_spread"])
+        ),
+        maximum_snapshot_age_seconds=int(
+            value["maximum_snapshot_age_seconds"]
+        ),
+        review_cadence=str(value["review_cadence"]),
+    )
+    if _policy_payload(policy) != value:
+        raise ValueError("P7 transport policy payload changed")
+    return policy
+
+
 def p7_transport_selection_payload(
     selection: P7TransportSelection,
 ) -> dict[str, object]:
@@ -265,7 +312,11 @@ def p7_transport_candidate_from_payload(
         bid=Decimal(str(value["bid"])),
         ask=Decimal(str(value["ask"])),
         day_volume=int(value["day_volume"]),
-        open_interest=int(value["open_interest"]),
+        open_interest=(
+            None
+            if value.get("open_interest") is None
+            else int(value["open_interest"])
+        ),
         calendar_dte=int(value["calendar_dte"]),
         market_data_time=datetime.fromisoformat(
             str(value["market_data_time"]).replace("Z", "+00:00")
@@ -292,7 +343,7 @@ def validate_p7_transport_selection_payload(
         "reason_codes",
     }:
         raise ValueError("P7 transport selection fields are not exact")
-    policy = P7TransportSelectionPolicy()
+    policy = _policy_from_payload(value.get("policy"))
     if (
         value["contract_version"]
         != "advanced-options-p7-transport-selection-v1"
@@ -301,7 +352,7 @@ def validate_p7_transport_selection_payload(
         or value["policy_sha256"] != policy.sha256
         or value["reason_codes"] != []
         or not isinstance(value["selected"], list)
-        or len(value["selected"]) != 2
+        or len(value["selected"]) != len(policy.underlyings)
     ):
         raise ValueError("P7 transport selection is not ready")
     selected = tuple(
@@ -367,7 +418,11 @@ def validate_p7_transport_selection_payload(
 def _rank(candidate: P7TransportCandidate) -> tuple:
     return (
         -candidate.day_volume,
-        -candidate.open_interest,
+        -(
+            -1
+            if candidate.open_interest is None
+            else candidate.open_interest
+        ),
         candidate.moneyness_fraction,
         candidate.relative_spread,
         candidate.calendar_dte,
@@ -423,7 +478,9 @@ def select_p7_transport_contracts(
             and row.moneyness_fraction
             <= selected_policy.maximum_moneyness_fraction
             and row.day_volume >= selected_policy.minimum_day_volume
-            and row.open_interest >= selected_policy.minimum_open_interest
+            and row.open_interest is not None
+            and row.open_interest
+            >= selected_policy.minimum_open_interest
             and row.relative_spread
             <= selected_policy.maximum_relative_spread
         )

@@ -4,6 +4,7 @@ import copy
 import json
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,6 +49,9 @@ from realtime.advanced_options_v3_deployment import (
 )
 import realtime.advanced_options_p8_runtime as runtime_module
 import realtime.advanced_options_p8_roles as roles_module
+from realtime.advanced_options_flow_policy import (
+    load_advanced_options_flow_policy,
+)
 from realtime.advanced_options_service import (
     AdvancedOptionsProcessKind,
     AdvancedOptionsProcessSpec,
@@ -68,6 +72,446 @@ START = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=1)
 STOP = START + timedelta(minutes=10)
 CONTAINER_ID = "a" * 64
 ROOT = Path(__file__).resolve().parents[3]
+
+
+def test_flow_scope_keeps_eligible_subset_and_marks_unavailable():
+    session_date = START.date()
+    binding = SimpleNamespace(
+        enrollment=SimpleNamespace(
+            control_plane=SimpleNamespace(
+                session_date=session_date,
+                manifest_sha256="1" * 64,
+                slot_set_sha256="2" * 64,
+            ),
+            activity_selection=SimpleNamespace(
+                contracts=(
+                    SimpleNamespace(
+                        contract_ticker=(
+                            f"O:SPY{session_date + timedelta(days=5):%y%m%d}"
+                            "C00100000"
+                        ),
+                        underlyer="SPY",
+                        expiration_date=(
+                            session_date + timedelta(days=5)
+                        ),
+                    ),
+                    SimpleNamespace(
+                        contract_ticker=(
+                            f"O:SPY{session_date + timedelta(days=3):%y%m%d}"
+                            "C00101000"
+                        ),
+                        underlyer="SPY",
+                        expiration_date=(
+                            session_date + timedelta(days=3)
+                        ),
+                    ),
+                    SimpleNamespace(
+                        contract_ticker=(
+                            f"O:XYZ{session_date + timedelta(days=5):%y%m%d}"
+                            "P00100000"
+                        ),
+                        underlyer="XYZ",
+                        expiration_date=(
+                            session_date + timedelta(days=5)
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    resolved = roles_module._contract_scope_resolution(
+        binding,
+        load_advanced_options_flow_policy(),
+    )
+
+    assert resolved.scope is not None
+    assert tuple(
+        row.contract_ticker for row in resolved.scope.contracts
+    ) == (
+        binding.enrollment.activity_selection.contracts[
+            0
+        ].contract_ticker,
+    )
+    assert {
+        row.reason_code for row in resolved.unavailable
+    } == {
+        "FLOW_V1_DTE_UNAVAILABLE",
+        "FLOW_V1_UNDERLYING_UNAVAILABLE",
+    }
+
+
+def test_persisted_logical_shards_drive_materializer_assignments():
+    contracts = (
+        SimpleNamespace(
+            instrument_id=101,
+            contract_ticker="O:QQQ261106C00100000",
+        ),
+        SimpleNamespace(
+            instrument_id=102,
+            contract_ticker="O:QQQ261106P00100000",
+        ),
+        SimpleNamespace(
+            instrument_id=201,
+            contract_ticker="O:SPY261106C00100000",
+        ),
+    )
+    binding = SimpleNamespace(
+        enrollment=SimpleNamespace(
+            activity_selection=SimpleNamespace(
+                contracts=contracts,
+            ),
+        ),
+    )
+    plan = SimpleNamespace(
+        members=tuple(
+            SimpleNamespace(contract_ticker=row.contract_ticker)
+            for row in contracts
+        ),
+        shards=(
+            SimpleNamespace(
+                shard_slot=1,
+                contract_tickers=(
+                    contracts[0].contract_ticker,
+                    contracts[1].contract_ticker,
+                ),
+            ),
+            SimpleNamespace(
+                shard_slot=2,
+                contract_tickers=(
+                    contracts[2].contract_ticker,
+                ),
+            ),
+        ),
+    )
+
+    layout = roles_module._shard_layout(binding, plan)
+
+    assert layout.shard_map.shard_count == 2
+    assert layout.shard_map.assignments == (
+        (101, 0),
+        (102, 0),
+        (201, 1),
+    )
+
+
+def test_flow_unavailable_window_persists_terminal_stage_evidence(
+    monkeypatch,
+):
+    from realtime import advanced_options_p8_production as production
+
+    binding = SimpleNamespace(
+        window_id=UUID("11111111-2222-3333-4444-555555555555"),
+    )
+    resolution = SimpleNamespace(
+        unavailable=(
+            SimpleNamespace(
+                contract_ticker="O:AMD261106C00100000",
+                underlyer="AMD",
+                reason_code="FLOW_V1_UNDERLYING_UNAVAILABLE",
+            ),
+        ),
+    )
+    persisted = []
+
+    class Repository:
+        def finish_unavailable_window(
+            self,
+            window_id,
+            stage_results,
+            *,
+            now,
+        ):
+            persisted.append((window_id, stage_results, now))
+            return True
+
+    monkeypatch.setattr(
+        production,
+        "PostgresOrchestrationRepository",
+        lambda _provider: Repository(),
+    )
+
+    result = production._unavailable_serial_window(
+        provider=object(),
+        binding=binding,
+        stage_order=("OPTIONS_FLOW", "OPTIONS_INPUT_GATE"),
+        flow_resolution=resolution,
+        dependency_evidence={
+            "FLOW": {"flow_state": "UNAVAILABLE"},
+        },
+    )
+
+    assert result["status"] == "FINISHED"
+    assert result["window_state"] == "UNAVAILABLE"
+    assert result["flow_state"] == "UNAVAILABLE"
+    assert result["persisted"] is True
+    assert result["stage_results"]["OPTIONS_FLOW"]["state"] == (
+        "UNAVAILABLE"
+    )
+    assert result["stage_results"]["OPTIONS_FLOW"][
+        "reason_codes"
+    ][1].startswith("UNAVAILABLE_EVIDENCE:")
+    assert len(persisted) == 1
+
+
+def test_flow_resident_targets_raw_and_normalized_offsets_independently(
+    monkeypatch,
+):
+    target = SimpleNamespace(
+        target_window_id=UUID(
+            "11111111-2222-3333-4444-555555555555"
+        ),
+        journal_generation=UUID(
+            "22222222-3333-4444-5555-666666666666"
+        ),
+        options_cutoff=START,
+    )
+
+    class Provider:
+        @contextmanager
+        def transaction(self, *_args, **_kwargs):
+            yield SimpleNamespace(cursor=object())
+
+    monkeypatch.setattr(
+        roles_module,
+        "session_acquisition_authorization_from_payload",
+        lambda _value: SimpleNamespace(authorization_id=UUID(int=1)),
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "load_ready_resident_window_targets_cursor",
+        lambda *_args, **_kwargs: (target,),
+    )
+    recorded = []
+    monkeypatch.setattr(
+        roles_module,
+        "_record_v3_resident_completion",
+        lambda *_args, **kwargs: recorded.append(kwargs),
+    )
+    kwargs = {
+        "bundle": {
+            "orchestration": {"catalog_version": "stages_v5"},
+            "v3_authorities": {"session_acquisition": {}},
+        },
+        "member": roles_module.ResidentCompletionMember.FLOW,
+        "owner_epoch": 7,
+        "reader": SimpleNamespace(
+            offsets_at=lambda _cutoff: (100, 90)
+        ),
+        "shard_map_sha256_value": "a" * 64,
+        "shard_ids_value": (0,),
+        "evidence_ref": "flow-checkpoint",
+    }
+
+    assert roles_module._snapshot_v3_resident_windows(
+        Provider(),
+        object(),
+        raw_offset=100,
+        normalized_offset=90,
+        flow_checkpoint_offset=100,
+        **kwargs,
+    ) == 1
+    evidence = recorded[-1]["evidence"]
+    assert evidence["raw_end_offset"] == 100
+    assert evidence["normalized_end_offset"] == 90
+    assert evidence["checkpoint_end_offset"] == 100
+    assert recorded[-1]["ending_offset"] == 100
+
+    recorded.clear()
+    assert roles_module._snapshot_v3_resident_windows(
+        Provider(),
+        object(),
+        raw_offset=99,
+        normalized_offset=90,
+        flow_checkpoint_offset=100,
+        **kwargs,
+    ) == 0
+    assert roles_module._snapshot_v3_resident_windows(
+        Provider(),
+        object(),
+        raw_offset=100,
+        normalized_offset=89,
+        flow_checkpoint_offset=100,
+        **kwargs,
+    ) == 0
+    assert roles_module._snapshot_v3_resident_windows(
+        Provider(),
+        object(),
+        raw_offset=100,
+        normalized_offset=90,
+        flow_checkpoint_offset=99,
+        **kwargs,
+    ) == 0
+    assert not recorded
+
+
+def test_window_separates_market_and_flow_shard_expectations():
+    from realtime.advanced_options_p8_window import (
+        _resident_shard_expectations,
+    )
+
+    market = {
+        "shard_ids": [0, 1],
+        "shard_map_sha256": "a" * 64,
+    }
+    flow = {
+        "shard_ids": [0],
+        "shard_map_sha256": "b" * 64,
+    }
+
+    assert _resident_shard_expectations(
+        market,
+        flow,
+        flow_shard_count=1,
+    ) == ((0, 1), (0,), "a" * 64, "b" * 64)
+    with pytest.raises(
+        RuntimeError,
+        match="market-state resident shard evidence changed",
+    ):
+        _resident_shard_expectations(
+            {},
+            flow,
+            flow_shard_count=1,
+        )
+    with pytest.raises(
+        RuntimeError,
+        match="flow resident shard evidence changed",
+    ):
+        _resident_shard_expectations(
+            market,
+            {},
+            flow_shard_count=1,
+        )
+
+
+def test_unavailable_flow_discovers_quiet_period_target_on_cadence(
+    monkeypatch,
+):
+    generation = UUID("22222222-3333-4444-5555-666666666666")
+    registration = SimpleNamespace(
+        journal_generation=generation,
+        raw_committed_offset=100,
+        normalized_committed_offset=90,
+        status="WRITING",
+    )
+    control = SimpleNamespace(
+        cohort_id=UUID("33333333-4444-5555-6666-777777777777"),
+        source_flow=SimpleNamespace(journal_generation=generation),
+    )
+    binding = SimpleNamespace(
+        enrollment=SimpleNamespace(control_plane=control),
+    )
+    resolution = SimpleNamespace(
+        scope=None,
+        unavailable=(
+            SimpleNamespace(
+                contract_ticker="O:AMD261019C00100000",
+                underlyer="AMD",
+                reason_code="FLOW_V1_UNDERLYING_UNAVAILABLE",
+            ),
+        ),
+    )
+    policy = SimpleNamespace(sha256="a" * 64)
+    writes = []
+
+    class Provider:
+        @contextmanager
+        def transaction(self, *_args, **_kwargs):
+            writes.append("progress")
+            yield SimpleNamespace(cursor=object())
+
+    monkeypatch.setattr(
+        roles_module,
+        "_lease",
+        lambda *_args, **_kwargs: (UUID(int=1), 3),
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_wait_registration",
+        lambda *_args, **_kwargs: registration,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "AdvancedOptionsJournalSource",
+        lambda **_kwargs: SimpleNamespace(
+            path=Path("quiet.sqlite"),
+            registration=registration,
+        ),
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_journal_root",
+        lambda _environment: Path("."),
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_selection_plan",
+        lambda _session_state: None,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_shard_layout",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            persistent_shards=()
+        ),
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_flow_environment",
+        lambda *_args, **_kwargs: (None, resolution, policy),
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_registration",
+        lambda *_args, **_kwargs: registration,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "RawJournalReader",
+        lambda _path: object(),
+    )
+    snapshots = []
+    stop = threading.Event()
+
+    def snapshot(*_args, **_kwargs):
+        snapshots.append(True)
+        if len(snapshots) == 2:
+            stop.set()
+        return int(len(snapshots) == 2)
+
+    monkeypatch.setattr(
+        roles_module,
+        "_snapshot_v3_resident_windows",
+        snapshot,
+    )
+    monotonic = iter((0.0, 0.25, 0.5))
+    monkeypatch.setattr(
+        roles_module.time,
+        "monotonic",
+        lambda: next(monotonic),
+    )
+
+    result = roles_module._run_flow(
+        package={},
+        bundle={
+            "orchestration": {"catalog_version": "stages_v5"},
+            "services": [
+                {
+                    "kind": "FLOW",
+                    "owner_id": str(UUID(int=1)),
+                    "lease_resource_key": "flow",
+                },
+            ],
+        },
+        binding=binding,
+        provider=Provider(),
+        environment={},
+        stop_event=stop,
+    )
+
+    assert result["flow_state"] == "UNAVAILABLE"
+    assert len(snapshots) == 2
+    assert writes == ["progress"]
 
 
 def test_target_window_id_binds_session_cohort_key_and_cutoff():
@@ -860,6 +1304,93 @@ def test_v5_window_uses_durable_barrier_and_exact_v3_identity(
     assert result["status"] == "COMPLETE"
     assert observed["dependency_evidence"] == dependencies
     assert observed["pool"] is not None
+
+
+def test_v5_window_does_not_reprocess_stale_terminal_binding(
+    monkeypatch,
+):
+    package = _package()
+    package.update({
+        "equity_input_binding": {
+            "symbols": list(
+                EQUITY_VALIDATION_UNIVERSE.equity_tickers
+            ),
+        },
+        "cohort": {
+            **package["cohort"],
+            "underlyings": ["QQQ", "SPY"],
+        },
+        "v3_deployment": {
+            "profile": advanced_options_v3_profile_payload(),
+            "profile_sha256": ADVANCED_OPTIONS_V3_PROFILE_SHA256,
+            "state": ADVANCED_OPTIONS_V3_QUALIFICATION_STATE,
+            "window_role_authorized": True,
+            "qualification_verdict": "PASS",
+        },
+    })
+    package["orchestration"].update({
+        "catalog_version": STAGE_CATALOG_VERSION_V5,
+        "stage_order": list(OPTIONS_V3_STAGE_ORDER),
+    })
+    bundle = {
+        "package_sha256": package["package_sha256"],
+        "orchestration": dict(package["orchestration"]),
+        "production_binding": {
+            "control": {"option_underlyings": ["QQQ", "SPY"]},
+        },
+    }
+    monkeypatch.setattr(
+        roles_module,
+        "_v3_resident_dependencies",
+        lambda *_args, **_kwargs: {
+            name: {"status": "COMPLETE"}
+            for name in ("INGRESS", "MARKET_STATE", "FLOW")
+        },
+    )
+    binding = SimpleNamespace(
+        window_id=UUID("11111111-2222-3333-4444-555555555555"),
+    )
+    stopped = threading.Event()
+    pending_calls = []
+
+    def pending(**_kwargs):
+        pending_calls.append(True)
+        if len(pending_calls) == 2:
+            stopped.set()
+        return (binding,)
+
+    serial_calls = []
+
+    def serial(**_kwargs):
+        serial_calls.append(True)
+        return {
+            "status": "FINISHED",
+            "window_state": "UNAVAILABLE",
+            "persisted": True,
+            "stage_order": list(OPTIONS_V3_STAGE_ORDER),
+        }
+
+    from realtime import advanced_options_p8_production as production
+
+    monkeypatch.setattr(
+        production,
+        "load_v3_pending_window_bindings",
+        pending,
+    )
+    monkeypatch.setattr(production, "run_v3_serial_window", serial)
+
+    roles_module._run_window(
+        package=package,
+        bundle=bundle,
+        binding=binding,
+        provider=object(),
+        pool=object(),
+        environment={},
+        stop_event=stopped,
+    )
+
+    assert len(pending_calls) == 2
+    assert len(serial_calls) == 1
 
 
 def test_v5_window_loop_isolates_four_successive_deterministic_windows(

@@ -153,6 +153,36 @@ RELATIONS: dict[str, Relation] = {
     "rt.advanced_options_downstream_heads": _r(
         "control", "BOUNDED", mutable=True
     ),
+    "rt.advanced_options_selection_generations": _r(
+        "control", "BOUNDED", append=True, api=True
+    ),
+    "rt.advanced_options_selection_members": _r(
+        "options", "BOUNDED", append=True, api=True
+    ),
+    "rt.advanced_options_selection_coverage": _r(
+        "options", "BOUNDED", append=True, api=True
+    ),
+    "rt.advanced_options_underlying_readiness": _r(
+        "options", "BOUNDED", mutable=True, api=True
+    ),
+    "rt.advanced_options_physical_subscriptions": _r(
+        "control", "BOUNDED", append=True, api=True
+    ),
+    "rt.advanced_options_physical_subscription_states": _r(
+        "options", "BOUNDED", mutable=True, api=True
+    ),
+    "rt.advanced_options_subscription_shards": _r(
+        "control", "BOUNDED", append=True, api=True
+    ),
+    "rt.advanced_options_shard_states": _r(
+        "options", "BOUNDED", mutable=True, api=True
+    ),
+    "rt.advanced_options_consumer_states": _r(
+        "options", "BOUNDED", mutable=True
+    ),
+    "rt.advanced_options_detector_routing_states": _r(
+        "options", "BOUNDED", mutable=True
+    ),
     "rt.advanced_options_resident_completions": _r(
         "options", "BOUNDED", append=True
     ),

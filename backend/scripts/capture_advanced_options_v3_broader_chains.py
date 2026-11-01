@@ -169,6 +169,10 @@ def execute(args):
                 underlyer,
                 spot=spots[underlyer],
                 session_date=args.session_date,
+                maximum_requests=1,
+                maximum_total_decoded_bytes=(
+                    args.maximum_total_bytes - total_bytes
+                ),
             )
         )
         total_bytes += response_bytes

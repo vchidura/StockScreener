@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -47,6 +48,7 @@ from .provider_socket_lease import (
     MASSIVE_OPTIONS_SOCKET_RESOURCE,
     HostProviderSocketLease,
 )
+from .advanced_options_selection_c6 import C6SelectionPlan
 
 
 UTC = timezone.utc
@@ -71,6 +73,7 @@ ZERO_FORBIDDEN_EFFECTS = {
     "broker": 0,
     "trading": 0,
 }
+_OPTION_UNDERLYING = re.compile(r"^O:([A-Z]{1,6})")
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -100,9 +103,15 @@ def _image_id(value: object) -> str:
 
 def _contract_underlyer(ticker: str) -> str:
     value = ticker.strip().upper()
-    if not value.startswith("O:") or len(value) < 5:
+    match = _OPTION_UNDERLYING.match(value)
+    if match is None or value[-9:-8] not in {"C", "P"}:
         raise ValueError("option contract ticker is invalid")
-    return value[2:5]
+    return match.group(1)
+
+
+def _contract_side(ticker: str) -> str:
+    _contract_underlyer(ticker)
+    return ticker.strip().upper()[-9:-8]
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,9 +145,11 @@ class AdvancedOptionsAcquisitionBinding:
             for value in self.equity_tickers
         ))
         membership = {
-            (_contract_underlyer(ticker), ticker[11:12])
+            (_contract_underlyer(ticker), _contract_side(ticker))
             for ticker in contracts
-            if len(ticker) >= 12
+        }
+        underlyings = {
+            underlyer for underlyer, _ in membership
         }
         if (
             not isinstance(self.binding_id, UUID)
@@ -151,17 +162,12 @@ class AdvancedOptionsAcquisitionBinding:
             or not self.owner_id.int
             or not isinstance(self.stream_session_id, UUID)
             or not self.stream_session_id.int
-            or len(contracts) != 4
-            or len(set(contracts)) != 4
+            or not contracts
+            or len(set(contracts)) != len(contracts)
             or equities
             != tuple(sorted(EQUITY_VALIDATION_UNIVERSE.equity_tickers))
-            or membership
-            != {
-                ("QQQ", "C"),
-                ("QQQ", "P"),
-                ("SPY", "C"),
-                ("SPY", "P"),
-            }
+            or not membership
+            or not underlyings
             or type(self.connection_attempt_ceiling) is not int
             or self.connection_attempt_ceiling <= 0
             or type(self.decoded_message_ceiling) is not int
@@ -523,7 +529,7 @@ def _transient_transport_failure(error: BaseException) -> bool:
     )
 
 
-def _catalog_scope(provider, binding):
+def _catalog_scope(provider, binding, selection_plan=None):
     with provider.transaction(
         APP_ROLE,
         read_only=True,
@@ -545,7 +551,7 @@ def _catalog_scope(provider, binding):
         )
         rows = unit.cursor.fetchall()
     if (
-        len(rows) != 4
+        len(rows) != len(binding.contract_tickers)
         or tuple(str(row["contract_ticker"]) for row in rows)
         != binding.contract_tickers
         or any(
@@ -554,14 +560,36 @@ def _catalog_scope(provider, binding):
             for row in rows
         )
     ):
-        raise RuntimeError("exact-four acquisition catalog is unavailable")
+        raise RuntimeError(
+            "configured acquisition catalog is unavailable"
+        )
+    if selection_plan is None:
+        shard_by_ticker = {
+            ticker: 0 for ticker in binding.contract_tickers
+        }
+    else:
+        if not isinstance(selection_plan, C6SelectionPlan):
+            raise TypeError("C6 acquisition selection plan is invalid")
+        shards = tuple(sorted(
+            selection_plan.shards,
+            key=lambda row: row.shard_slot,
+        ))
+        shard_by_ticker = {
+            ticker: shard_id
+            for shard_id, shard in enumerate(shards)
+            for ticker in shard.contract_tickers
+        }
+        if set(shard_by_ticker) != set(binding.contract_tickers):
+            raise RuntimeError(
+                "configured acquisition logical shards diverged"
+            )
     admissions = {
         str(row["contract_ticker"]): InstrumentAdmission(
             int(row["instrument_id"]),
             str(row["contract_ticker"]),
             _contract_underlyer(str(row["contract_ticker"])),
             AssetClass.OPTION,
-            0,
+            shard_by_ticker[str(row["contract_ticker"])],
         )
         for row in rows
     }
@@ -581,8 +609,14 @@ def _catalog_scope(provider, binding):
         session_date=binding.authority.session_date,
         universe=UniverseManifest(
             ACQUISITION_BINDING_SCHEMA,
-            ("QQQ", "SPY"),
-            ("QQQ", "SPY"),
+            tuple(sorted({
+                _contract_underlyer(ticker)
+                for ticker in binding.contract_tickers
+            })),
+            tuple(sorted({
+                _contract_underlyer(ticker)
+                for ticker in binding.contract_tickers
+            })),
         ),
         capability_profile_sha256=(
             binding.authority.provider_budget_sha256
@@ -591,7 +625,9 @@ def _catalog_scope(provider, binding):
             binding.authority.slot_set_member_sha256
         ),
         members=members,
-        maximum_option_quote_contracts=4,
+        maximum_option_quote_contracts=len(
+            binding.contract_tickers
+        ),
     )
     return admissions, manifest
 
@@ -662,6 +698,7 @@ def run_acquisition(
     stop_event: Event,
     connection_factory=None,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    selection_plan: C6SelectionPlan | None = None,
     monotonic_ns: Callable[[], int] = time.monotonic_ns,
     diagnostic: bool = False,
 ) -> dict[str, object]:
@@ -672,7 +709,15 @@ def run_acquisition(
         binding.authority.acquisition_stop
     ):
         raise RuntimeError("Options acquisition is outside authority")
-    admissions, manifest = _catalog_scope(provider, binding)
+    admissions, manifest = (
+        _catalog_scope(provider, binding)
+        if selection_plan is None
+        else _catalog_scope(
+            provider,
+            binding,
+            selection_plan,
+        )
+    )
     status = _load_status(status_path, binding)
     attempts = int(status["connection_attempts"])
     (

@@ -159,6 +159,20 @@ def test_p6d3db_02_repository_round_trip_is_exact(
         assert cursor.fetchone()[0] == len(state.member_identities)
 
 
+def test_p6d3db_02b_legacy_v1_document_round_trip_preserves_identity(
+    stored_reference_state,
+):
+    repository, _, scope = stored_reference_state
+    legacy = reference_state(
+        generation=9,
+        data_membership_sha256=None,
+        contract_scope_sha256=scope.sha256,
+    )
+
+    assert repository.put(legacy) == legacy
+    assert repository.load_generation(9) == legacy
+
+
 def test_p6d3db_03_generation_and_session_freeze_are_immutable(
     p6d3_database,
     stored_reference_state,

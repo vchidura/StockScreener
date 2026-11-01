@@ -1,6 +1,7 @@
 """Post-E late-canary stages_v4 assembly for the P8 WINDOW Docker role."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from decimal import Decimal
@@ -65,7 +66,6 @@ from .advanced_options_service import OPTIONS_V3_STAGE_ORDER
 from .contracts import canonical_sha256
 from .database_access_v2 import APP_ROLE
 from .option_discovery_scope import RealtimeOptionDiscoveryScope
-from .option_flow.checkpoint_state import shard_map_sha256
 from .option_flow.records import FlowEvent
 from .option_flow.volume import BaselineKind, COMPLETE_BASELINES
 from .materialization import MaterializedQuote
@@ -92,6 +92,47 @@ from .stage_runners_v2 import (
 
 
 UTC = timezone.utc
+
+
+def _resident_shard_expectations(
+    market: Mapping[str, object],
+    flow: Mapping[str, object],
+    *,
+    flow_shard_count: int,
+) -> tuple[tuple[int, ...], tuple[int, ...], str, str]:
+    values = []
+    for kind, evidence in (
+        ("market-state", market),
+        ("flow", flow),
+    ):
+        shard_ids = evidence.get("shard_ids")
+        shard_map = evidence.get("shard_map_sha256")
+        if (
+            not isinstance(shard_ids, list)
+            or not shard_ids
+            or any(type(value) is not int for value in shard_ids)
+            or tuple(shard_ids) != tuple(range(len(shard_ids)))
+            or not isinstance(shard_map, str)
+            or len(shard_map) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in shard_map
+            )
+        ):
+            raise RuntimeError(
+                f"P8 {kind} resident shard evidence changed"
+            )
+        values.append((tuple(shard_ids), shard_map))
+    market_value, flow_value = values
+    expected_flow_shard_ids = tuple(range(flow_shard_count))
+    if flow_value[0] != expected_flow_shard_ids:
+        raise RuntimeError("P8 flow resident shard layout changed")
+    return (
+        market_value[0],
+        flow_value[0],
+        market_value[1],
+        flow_value[1],
+    )
 BUILD_ID = "advanced-options-p8-live-canary-v1"
 
 
@@ -470,20 +511,40 @@ def build_and_run_p8_serial_window(
         != dependency_evidence["INGRESS"]["normalized_end_offset"]
         or flow["raw_end_offset"]
         != dependency_evidence["INGRESS"]["raw_end_offset"]
+        or flow["checkpoint_end_offset"]
+        != dependency_evidence["INGRESS"]["raw_end_offset"]
+        or flow["normalized_end_offset"]
+        != market["normalized_end_offset"]
     ):
         raise RuntimeError("P8 resident role offsets did not converge")
+    (
+        market_state_shard_ids,
+        flow_shard_ids,
+        market_state_shard_map_sha256,
+        flow_shard_map_sha256,
+    ) = _resident_shard_expectations(
+        market,
+        flow,
+        flow_shard_count=(
+            flow_environment.options_flow_settings.shard_count
+        ),
+    )
     rolling_plan = build_advanced_options_rolling_producer_plan(
         enrollment=binding.enrollment,
         contract_scope=contract_scope,
         reference_state=reference,
         source_flow=source_flow,
         owner_epoch=1,
-        committed_offset=int(flow["checkpoint_end_offset"]),
-        shard_ids=(0,),
-        market_state_shard_map_sha256=str(market["shard_map_sha256"]),
-        flow_shard_map_sha256=shard_map_sha256(
-            flow_environment.options_flow_settings.shard_count
+        market_state_committed_offset=int(
+            market["normalized_end_offset"]
         ),
+        flow_committed_offset=int(flow["checkpoint_end_offset"]),
+        market_state_shard_ids=market_state_shard_ids,
+        flow_shard_ids=flow_shard_ids,
+        market_state_shard_map_sha256=(
+            market_state_shard_map_sha256
+        ),
+        flow_shard_map_sha256=flow_shard_map_sha256,
         known_at=cutoff,
         valid_until=expires,
         maximum_underlying_age_ms=(

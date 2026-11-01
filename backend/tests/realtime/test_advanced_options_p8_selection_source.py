@@ -20,6 +20,9 @@ from realtime.advanced_options_p8_production import (
     _open_interest_sha256,
     _p8_manifest_policy,
 )
+from realtime.advanced_options_flow_policy import (
+    load_advanced_options_flow_policy,
+)
 from realtime.contracts import canonical_sha256
 from scripts import prepare_advanced_options_v3_pre_session
 from scripts import replay_advanced_options_v3_capture_local
@@ -203,8 +206,12 @@ def test_pre_session_cli_accepts_stricter_granted_byte_ceilings(
         "1048576",
         "--maximum-decoded-bytes",
         "18874386",
+        "--maximum-moneyness-fraction",
+        "0.05",
         "--authorization-reference",
         "grant-test",
+        "--enabled-strategy",
+        "DIRECTIONAL_DEBIT_SPREAD",
         "--capture-path",
         str(tmp_path / "capture.json"),
         "--report-path",
@@ -213,6 +220,9 @@ def test_pre_session_cli_accepts_stricter_granted_byte_ceilings(
 
     assert args.maximum_response_decoded_bytes == 1_048_576
     assert args.maximum_decoded_bytes == 18_874_386
+    assert args.enabled_strategies == (
+        "DIRECTIONAL_DEBIT_SPREAD",
+    )
 
 
 def test_pre_session_cli_accepts_capture_only_mode(tmp_path):
@@ -235,6 +245,8 @@ def test_pre_session_cli_accepts_capture_only_mode(tmp_path):
         "50000000",
         "--maximum-decoded-bytes",
         "100000000",
+        "--maximum-moneyness-fraction",
+        "0.05",
         "--authorization-reference",
         "local-capture-test",
         "--capture-path",
@@ -276,7 +288,36 @@ def test_chain_candidate_skips_unquoted_contract():
     ) is None
 
 
-def test_advanced_source_rejects_pagination_or_incomplete_activity():
+def test_activity_candidate_keeps_missing_oi_explicit():
+    raw = _contract(
+        "QQQ",
+        "O:QQQ261021C00600000",
+        "call",
+        600,
+        600,
+    )
+    raw.pop("open_interest")
+    candidate = _candidate_from_snapshot(
+        raw,
+        session_date=SESSION,
+    )
+    assert candidate is not None
+
+    activity = (
+        prepare_advanced_options_v3_pre_session._activity_candidate(
+            candidate,
+            raw,
+            session_date=SESSION,
+            observed_at=REVIEWED,
+            flow_policy=load_advanced_options_flow_policy(),
+        )
+    )
+
+    assert activity.prior_open_interest is None
+    assert "MISSING_PRIOR_OPEN_INTEREST" in activity.missing_inputs
+
+
+def test_advanced_source_follows_bounded_pagination():
     paginated = _Transport([
         _payload(
             "QQQ",
@@ -287,15 +328,114 @@ def test_advanced_source_rejects_pagination_or_incomplete_activity():
                 600,
                 600,
             )],
-            next_url="https://api.massive.com/next",
+            next_url=(
+                "https://api.massive.com/v3/snapshot/options/"
+                "QQQ?cursor=page-2"
+            ),
         ),
+        _payload("QQQ-page-2", [
+            _contract(
+                "QQQ",
+                "O:QQQ261021P00600000",
+                "put",
+                600,
+                600,
+            ),
+        ]),
+        _payload("SPY", [
+            _contract(
+                "SPY",
+                "O:SPY261021P00670000",
+                "put",
+                670,
+                670,
+            ),
+        ]),
     ])
-    with pytest.raises(ValueError, match="pagination"):
+    capture = MassiveAdvancedOptionsSelectionSource(
+        paginated,
+        _Spots(),
+        maximum_provider_requests=3,
+    ).capture(reviewed_at=REVIEWED, session_date=SESSION)
+
+    assert capture.request_count == capture.pages == 3
+    assert capture.pagination_requests == 1
+    assert paginated.calls[1] == (
+        (
+            "https://api.massive.com/v3/snapshot/options/"
+            "QQQ?cursor=page-2"
+        ),
+        {},
+    )
+
+
+def test_advanced_source_rejects_pagination_over_request_ceiling():
+    paginated = _Transport([
+        _payload(
+            "QQQ",
+            [_contract(
+                "QQQ",
+                "O:QQQ261021C00600000",
+                "call",
+                600,
+                600,
+            )],
+            next_url=(
+                "https://api.massive.com/v3/snapshot/options/"
+                "QQQ?cursor=page-2"
+            ),
+        ),
+        _payload("QQQ-page-2", [
+            _contract(
+                "QQQ",
+                "O:QQQ261021P00600000",
+                "put",
+                600,
+                600,
+            ),
+        ]),
+    ])
+    with pytest.raises(ValueError, match="budgets"):
         MassiveAdvancedOptionsSelectionSource(
             paginated,
             _Spots(),
+            maximum_provider_requests=2,
         ).capture(reviewed_at=REVIEWED, session_date=SESSION)
 
+
+def test_advanced_source_enforces_pagination_deadline_and_scope():
+    source = MassiveAdvancedOptionsSelectionSource(
+        _Transport([]),
+        _Spots(),
+        maximum_provider_requests=3,
+        deadline=REVIEWED,
+        clock=lambda: REVIEWED + timedelta(seconds=1),
+    )
+    with pytest.raises(TimeoutError, match="deadline"):
+        source.capture(reviewed_at=REVIEWED, session_date=SESSION)
+
+    unapproved = _Transport([
+        _payload(
+            "QQQ",
+            [_contract(
+                "QQQ",
+                "O:QQQ261021C00600000",
+                "call",
+                600,
+                600,
+            )],
+            next_url="https://example.com/v3/snapshot/options/QQQ",
+        ),
+    ])
+    with pytest.raises(ValueError, match="next_url"):
+        MassiveAdvancedOptionsSelectionSource(
+            unapproved,
+            _Spots(),
+            maximum_provider_requests=3,
+        ).capture(reviewed_at=REVIEWED, session_date=SESSION)
+
+
+def test_advanced_source_rejects_incomplete_activity():
     blocked = _Transport([
         _payload("QQQ", [
             _contract(

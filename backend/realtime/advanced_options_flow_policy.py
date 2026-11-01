@@ -12,6 +12,7 @@ from types import MappingProxyType
 from typing import Mapping
 
 from .contracts import canonical_sha256
+from .option_session_manifest import OptionActivityContract
 
 
 DEFAULT_ADVANCED_OPTIONS_FLOW_POLICY_PATH = (
@@ -548,6 +549,40 @@ class AdvancedOptionsContractScope:
                 raise ValueError(
                     "contract scope tier or DTE lane does not match policy"
                 )
+
+
+def flow_contract_scope_matches_data_membership(
+    scope: AdvancedOptionsContractScope,
+    contracts: tuple[OptionActivityContract, ...],
+    *,
+    session_date: date,
+    manifest_sha256: str,
+    slot_sha256: str,
+    flow_policy_sha256: str,
+) -> bool:
+    if (
+        not isinstance(scope, AdvancedOptionsContractScope)
+        or any(not isinstance(row, OptionActivityContract) for row in contracts)
+        or scope.session_date != session_date
+        or scope.manifest_sha256 != manifest_sha256
+        or scope.slot_sha256 != slot_sha256
+        or scope.flow_policy_sha256 != flow_policy_sha256
+    ):
+        return False
+    data_members = {
+        row.contract_ticker: row
+        for row in contracts
+    }
+    if len(data_members) != len(contracts):
+        return False
+    return all(
+        entry.contract_ticker in data_members
+        and entry.underlyer
+        == data_members[entry.contract_ticker].underlyer
+        and entry.expiration
+        == data_members[entry.contract_ticker].expiration_date
+        for entry in scope.contracts
+    )
 
 
 _ROOT_KEYS = frozenset({
