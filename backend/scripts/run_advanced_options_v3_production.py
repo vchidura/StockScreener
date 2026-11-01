@@ -8,7 +8,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -46,6 +46,12 @@ from realtime.advanced_options_p8_runtime import (  # noqa: E402
 )
 from realtime.advanced_options_acquisition_runtime import (  # noqa: E402
     acquisition_binding_from_payload,
+)
+from realtime.advanced_options_session_state import (  # noqa: E402
+    LEGACY_DIAGNOSTIC_STATE_SOURCE,
+    POSTGRES_STATE_SOURCE,
+    PostgresContinuousSessionStateRepository,
+    select_options_session_state,
 )
 from realtime.advanced_options_resident_barrier import (  # noqa: E402
     advanced_options_v3_session_status_cursor,
@@ -141,6 +147,30 @@ def parse_args(argv=None):
     waiting.add_argument("--output-directory", type=Path, required=True)
     waiting.add_argument("--execute", action="store_true")
 
+    activate = subparsers.add_parser("activate-session")
+    _add_database_scope(activate)
+    activate.add_argument("--package-source", type=Path, required=True)
+    activate.add_argument(
+        "--pre-session-authority",
+        type=Path,
+        required=True,
+    )
+    activate.add_argument(
+        "--acquisition-binding",
+        type=Path,
+        required=True,
+    )
+    activate.add_argument(
+        "--sealed-selection",
+        type=Path,
+        required=True,
+    )
+    activate.add_argument(
+        "--package-path-reference",
+        default="/run/advanced-options-p8/package.json",
+    )
+    activate.add_argument("--execute", action="store_true")
+
     residents = subparsers.add_parser("start-residents")
     _add_artifacts(residents)
     residents.add_argument(
@@ -195,6 +225,12 @@ def parse_args(argv=None):
     _add_database_scope(status)
     _add_artifacts(status)
 
+    export = subparsers.add_parser("export-session")
+    _add_database_scope(export)
+    export.add_argument("--session-date", type=date.fromisoformat)
+    export.add_argument("--output-directory", type=Path, required=True)
+    export.add_argument("--execute", action="store_true")
+
     args = parser.parse_args(argv)
     for name in (
         "package",
@@ -202,6 +238,8 @@ def parse_args(argv=None):
         "package_source",
         "production_binding",
         "acquisition_binding",
+        "pre_session_authority",
+        "sealed_selection",
         "live_observation",
         "output_directory",
         "docker_executable",
@@ -222,13 +260,30 @@ def parse_args(argv=None):
         and args.output_directory.exists()
     ):
         parser.error("--output-directory must be new")
+    if args.command == "activate-session" and (
+        not all(
+            path.is_file()
+            for path in (
+                args.package_source,
+                args.pre_session_authority,
+                args.acquisition_binding,
+                args.sealed_selection,
+            )
+        )
+        or not args.package_path_reference.strip()
+    ):
+        parser.error(
+            "activate-session requires exact sealed input documents"
+        )
     if (
         args.command in {
             "prepare",
             "prepare-waiting",
+            "activate-session",
             "start-residents",
             "authorize-window",
             "run-window",
+            "export-session",
         }
         and not args.execute
     ):
@@ -277,25 +332,72 @@ def _docker_service_main(argv) -> int | None:
         "--docker-health-kind",
         choices=tuple(kind.value for kind in AdvancedOptionsProcessKind),
     )
-    parser.add_argument("--package", type=Path, required=True)
-    parser.add_argument("--execution-bundle", type=Path, required=True)
+    parser.add_argument(
+        "--state-source",
+        choices=(
+            POSTGRES_STATE_SOURCE,
+            LEGACY_DIAGNOSTIC_STATE_SOURCE,
+        ),
+        default=POSTGRES_STATE_SOURCE,
+    )
+    parser.add_argument("--package", type=Path)
+    parser.add_argument("--execution-bundle", type=Path)
     args = parser.parse_args(values)
+    if (
+        args.state_source == POSTGRES_STATE_SOURCE
+        and (
+            args.package is not None
+            or args.execution_bundle is not None
+        )
+    ) or (
+        args.state_source == LEGACY_DIAGNOSTIC_STATE_SOURCE
+        and (
+            args.package is None
+            or args.execution_bundle is None
+        )
+    ):
+        parser.error("Options state source and artifacts cannot be mixed")
     kind = AdvancedOptionsProcessKind(
         args.docker_service_kind or args.docker_health_kind
     )
-    if service_mode:
-        return run_p8_docker_service(
-            kind,
-            args.package.resolve(),
-            args.execution_bundle.resolve(),
-        )
-    health = check_p8_docker_service_health(
-        kind,
-        args.package.resolve(),
-        args.execution_bundle.resolve(),
+    provider = None
+    pool = None
+    if args.state_source == POSTGRES_STATE_SOURCE:
+        provider, pool = _provider()
+    state = select_options_session_state(
+        environment=os.environ,
+        provider=provider,
+        package_path=(
+            args.package.resolve()
+            if args.package is not None
+            else None
+        ),
+        bundle_path=(
+            args.execution_bundle.resolve()
+            if args.execution_bundle is not None
+            else None
+        ),
+        state_source=args.state_source,
     )
-    print(json.dumps(health, indent=2, sort_keys=True))
-    return 0
+    try:
+        if service_mode:
+            return run_p8_docker_service(
+                kind,
+                args.package,
+                args.execution_bundle,
+                session_state=state,
+            )
+        health = check_p8_docker_service_health(
+            kind,
+            args.package,
+            args.execution_bundle,
+            session_state=state,
+        )
+        print(json.dumps(health, indent=2, sort_keys=True))
+        return 0
+    finally:
+        if pool is not None:
+            pool.closeall()
 
 
 def _load(path: Path) -> dict[str, object]:
@@ -608,6 +710,53 @@ def _compose(args, kinds) -> dict[str, object]:
         ).hexdigest(),
         "stored_reads": "NOT_AUTHORIZED",
         "effects": dict(ZERO_EFFECTS),
+    })
+
+
+def _activate_session(args) -> dict[str, object]:
+    package = _load(args.package_source)
+    pre_session_authority = _load(args.pre_session_authority)
+    acquisition = acquisition_binding_from_payload(
+        _load(args.acquisition_binding)
+    )
+    sealed_selection = _load(args.sealed_selection)
+    provider, pool = _provider()
+    try:
+        repository = PostgresContinuousSessionStateRepository(
+            provider,
+            session_date=acquisition.authority.session_date,
+        )
+        session_binding = repository.activate_session_from_documents(
+            package=package,
+            pre_session_authority=pre_session_authority,
+            acquisition_binding=acquisition,
+            sealed_selection=sealed_selection,
+            written_at=acquisition.authority.prepared_at,
+            package_path_reference=args.package_path_reference,
+        )
+        bundle = repository.load_execution_bundle()
+    finally:
+        pool.closeall()
+    return _report({
+        "contract": (
+            "advanced-options-v3-postgres-session-activation-v1"
+        ),
+        "status": "ACTIVATED",
+        "session_date": acquisition.authority.session_date,
+        "package_sha256": package["package_sha256"],
+        "bundle_sha256": bundle["bundle_sha256"],
+        "acquisition_binding_sha256": (
+            acquisition.binding_sha256
+        ),
+        "session_binding_sha256": (
+            session_binding.binding_sha256
+        ),
+        "state_source": POSTGRES_STATE_SOURCE,
+        "provider_effects": 0,
+        "publication_effects": 0,
+        "delivery_effects": 0,
+        "broker_effects": 0,
+        "trading_effects": 0,
     })
 
 
@@ -989,6 +1138,20 @@ def _status(args) -> dict[str, object]:
     })
 
 
+def _export_session(args) -> dict[str, object]:
+    provider, pool = _provider()
+    try:
+        repository = PostgresContinuousSessionStateRepository(
+            provider,
+            session_date=args.session_date,
+        )
+        return dict(
+            repository.export_artifacts(args.output_directory)
+        )
+    finally:
+        pool.closeall()
+
+
 def main(argv=None) -> int:
     docker_result = _docker_service_main(argv)
     if docker_result is not None:
@@ -998,6 +1161,8 @@ def main(argv=None) -> int:
         result = _prepare(args)
     elif args.command == "prepare-waiting":
         result = _prepare_waiting(args)
+    elif args.command == "activate-session":
+        result = _activate_session(args)
     elif args.command == "start-residents":
         result = _compose(args, RESIDENT_KINDS)
     elif args.command == "authorize-window":
@@ -1007,6 +1172,8 @@ def main(argv=None) -> int:
             args,
             (AdvancedOptionsProcessKind.WINDOW,),
         )
+    elif args.command == "export-session":
+        result = _export_session(args)
     else:
         result = _status(args)
     print(json.dumps(result, indent=2, sort_keys=True))

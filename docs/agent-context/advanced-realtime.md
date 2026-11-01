@@ -1,6 +1,6 @@
 # Advanced Realtime V3 - Current Runtime Checkpoint
 
-Updated: 2026-10-31 UTC
+Updated: 2026-11-01 UTC
 
 ## Objective And Mode
 
@@ -11,7 +11,8 @@ Canonical design and assessment:
 [REALTIME_V3_PIPELINE.md](../REALTIME_V3_PIPELINE.md).
 
 Mode: C0/C1 committed at `eafe5f7`; C2 committed at `3754337`; reviewed C3
-committed at `d8fd82d`; C4 implemented and validated, review pending.
+committed at `d8fd82d`; reviewed C4 committed at `d78dcf2`; C5 reviewed and
+validated in the current package.
 
 ## Settled Runtime Decisions
 
@@ -266,9 +267,70 @@ committed at `d8fd82d`; C4 implemented and validated, review pending.
   72 passed with 4 existing warnings. All committed C2 desired-state and C4
   preparation relations are excluded from the historical through-024 registry;
   its accepted migrations and pinned registry SHA remain unchanged.
-- C5 remains Options PostgreSQL session state, membership, sharding and daily
-  catalog/OI/reference revalidation. C7 remains canonical release merge,
+- C5 remains Options PostgreSQL session state and daily catalog/OI/reference
+  revalidation. C6 remains Options membership/count generalization, account-capacity
+  planning and deterministic sharding. C7 remains canonical release merge,
   pointer/retry/outbox, delivery and broker/trading boundaries; C4 adds no publisher.
+
+## C5 Completion Evidence
+
+- Migration `041_advanced_options_continuous_session_state` adds only an immutable
+  current-session envelope, immutable downstream binding rows and one mutable
+  transactional head. The envelope references the effective desired snapshot plus
+  existing service plan, session authority and reference-state owners; downstream
+  rows retain canonical window, Equity receipt and E/O authority identities.
+- `PostgresContinuousSessionStateRepository` implements the existing
+  `SessionRuntimeStatePort`. Immutable package/acquisition/pre-open/bundle state is
+  parsed once and cached; resident polls read only the indexed head on a bounded
+  cadence. An unchanged head refreshes cadence without fetching/parsing the immutable
+  document; changed identity hydrates by exact session/sequence/hash. Append locks one
+  head row, validates existing normalized E/O facts, inserts one immutable sequence
+  row and advances the head in the same transaction.
+- Same-binding retries are idempotent, concurrent retries serialize, divergent
+  replay fails, rollback leaves no row/head advance and an exact committed
+  unpointed tail is recoverable. An identical older committed-prefix replay succeeds
+  without revalidation or head regression. Restart rehydrates the same typed
+  acquisition, session binding, sequence and hash chain without recreating stages.
+  Full-chain reads capture head plus rows through that sequence in one database
+  snapshot, so concurrent append cannot create false divergence or incoherent export.
+- Session activation hashes immutable `prepared_at`, not the caller attempt clock,
+  and runs under explicit SERIALIZABLE isolation plus the per-session advisory lock.
+  SQLSTATE 40001 receives at most three whole-transaction retries, preserving
+  concurrent idempotency. Activation revalidates the effective
+  exact target-9 plus QQQ/SPY desired snapshot, exact-four current catalog/slot
+  identity, sealed quote usability, current-session prior OI/reference validity,
+  prior-session history coverage and session clocks before persisting state.
+  Prior-session or divergent catalog/OI/reference facts fail explicitly.
+- Normal acquisition, scheduler, P8 role and health commands select `postgres`.
+  Normal Compose services mount no package, bundle, acquisition or downstream
+  artifacts. The original `realtime-v2-options-p8` profile remains explicit
+  `legacy-diagnostic`; source selection refuses mixed file/database authority.
+  One optional export command writes the existing payloads/hashes and binding-chain
+  layout from committed PostgreSQL state without becoming a mutable replica.
+- Acquisition journals, offsets, resident barriers, sole publisher/read pins,
+  lane isolation and effect denials are unchanged. State is not queried per market
+  message; database interruption is surfaced and restart resumes from existing
+  journal/checkpoint ownership.
+- C5 intentionally stores and serves one explicitly activated validated session. It
+  does not provide unattended next-session materialization/activation or resident
+  rebinding across XNYS rollover.
+- Focused provider-free C5/Options/scheduler/schema/live-024 selection: 214 passed
+  with 5 existing warnings. Owned disposable PostgreSQL C5/authority/catalog/desired
+  selection: 16 passed with 6 existing warnings. Evidence includes typed file/DB
+  parity, strict selection, deterministic retry identity, observed SERIALIZABLE
+  activation/retry, document/readiness reconstruction, stale-session rejection,
+  bounded binding discovery, cheap unchanged-head polling, captured-head export under
+  concurrent append, older-prefix replay parity without head regression, same-owner
+  restart, interruption visibility, concurrent append, rollback retry and unpointed-
+  tail recovery. No provider, production, Docker, publication, delivery, broker or
+  trading effects ran.
+- C6 remains generalized per-underlying catalog/OI/history readiness, exact-count
+  generalization, shard state/construction and account-wide connection capacity.
+  C7 remains product/release merge, publisher pointer/retry/outbox, delivery and
+  broker/trading effects. C8 owns the long-lived Options lifecycle, automatic next
+  effective-session activation, waiting without restart exhaustion and XNYS resident
+  rebinding. C9 removes manual `activate-session`/daily supervisor paths only after
+  C8 parity. C5 keeps exact-four QQQ/SPY and adds none of those behaviors.
 
 ## Exact Anchors
 
@@ -285,6 +347,7 @@ committed at `d8fd82d`; C4 implemented and validated, review pending.
 - `backend/realtime/advanced_realtime_session_scheduler.py`
 - `backend/realtime/advanced_options_acquisition_runtime.py`
 - `backend/realtime/advanced_options_p8_runtime.py`
+- `backend/realtime/advanced_options_session_state.py`
 - `backend/realtime/advanced_realtime_desired_state.py`
 - `backend/realtime/advanced_realtime_desired_state_repository.py`
 - `backend/realtime/advanced_equity_preparation.py`
@@ -292,17 +355,19 @@ committed at `d8fd82d`; C4 implemented and validated, review pending.
 - `backend/realtime/provider_budget.py`
 - `backend/realtime/sql_v2/039_realtime_desired_state.sql`
 - `backend/realtime/sql_v2/040_realtime_equity_preparation.sql`
+- `backend/realtime/sql_v2/041_advanced_options_continuous_session_state.sql`
+- `backend/scripts/run_advanced_options_v3_acquisition.py`
+- `backend/scripts/run_advanced_options_v3_production.py`
+- `backend/scripts/run_advanced_realtime_session_scheduler.py`
 - `backend/scripts/run_realtime_v2_advanced_equity_preparation.py`
 - `backend/scripts/manage_advanced_realtime_desired_state.py`
 - `docker-compose.realtime-v2.yml`
 
-Focused completion check: PASS. Adding a truly absent tenth ticker after close creates
-durable unresolved intent and bounded preparation automatically, resolves canonical
-identity, exposes stored availability while the established nine remain active,
-reserves worst-case provider effects before I/O, conservatively retains crash
-effects, resumes from committed watermark/failure state and joins exactly one
-session snapshot/plan at the activation boundary (or the following session when
-late). It
-requires no manual reference/snapshot/cohort/hash/date, does no live-message desired
-work, does not mutate active state or the canonical release and performs zero
-provider, production, Docker or publication effects.
+Focused completion check: PASS. The exact-four provider-free workflow commits one
+current-session typed acquisition/pre-open state in PostgreSQL, starts residents in
+`READY_WAITING_FOR_E`, appends successive E/O bindings transactionally and discovers
+the head after restart. Deterministic export preserves existing typed payloads and
+hashes; normal services require no artifact mounts; stale prior-session
+catalog/OI/reference proof fails explicitly. Journals/checkpoints and existing
+publication/read-pin boundaries remain intact, and validation performed zero
+provider, production, Docker, publication, delivery, broker or trading effects.

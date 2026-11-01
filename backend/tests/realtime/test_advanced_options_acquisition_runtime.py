@@ -1108,7 +1108,7 @@ def test_compose_exposes_only_the_acquisition_role():
     ).read_text(encoding="utf-8")
     start = compose.index("  realtime-v3-options-acquisition:")
     end = compose.index(
-        "\n  realtime-v2-options-p8-market-state:",
+        "\n  realtime-v3-options-p8-market-state:",
         start,
     )
     block = compose[start:end]
@@ -1121,7 +1121,7 @@ def test_compose_exposes_only_the_acquisition_role():
     assert "--docker-service-kind" not in block
     assert "publication" not in block
 
-    ingress_start = compose.index("  realtime-v2-options-p8-ingress:")
+    ingress_start = compose.index("  realtime-v3-options-p8-ingress:")
     ingress_end = compose.index(
         "\n  realtime-v3-options-acquisition:",
         ingress_start,

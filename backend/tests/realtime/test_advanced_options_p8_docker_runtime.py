@@ -222,39 +222,51 @@ def test_compose_has_exact_four_p8_services_commands_and_isolated_secrets():
     assert set(P8_SERVICE_NAMES) == set(AdvancedOptionsProcessKind)
     assert len(set(P8_SERVICE_NAMES.values())) == 4
     for kind in AdvancedOptionsProcessKind:
-        block = _service_block(text, P8_SERVICE_NAMES[kind])
-        assert (
-            f'profiles: ["{P8_COMPOSE_PROFILE}", '
-            f'"{ADVANCED_OPTIONS_V3_COMPOSE_PROFILE}"]'
-        ) in block
-        assert 'restart: "on-failure:3"' in block
-        assert "- --docker-service-kind" in block
-        assert f"- {kind.value}" in block
-        assert "- --docker-health-kind" in block
+        diagnostic = _service_block(text, P8_SERVICE_NAMES[kind])
+        normal_name = (
+            "realtime-v3-options-p8-"
+            + kind.value.casefold().replace("_", "-")
+        )
+        normal = _service_block(text, normal_name)
+        assert f'profiles: ["{P8_COMPOSE_PROFILE}"]' in diagnostic
+        assert f"service: {normal_name}" in diagnostic
+        assert "- legacy-diagnostic" in diagnostic
         assert (
             "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: "
             "/run/advanced-options-downstream"
-        ) in block
+        ) in diagnostic
         assert (
             "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH"
             ":?set REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH"
-        ) in block
+        ) in diagnostic
+        assert "- /run/advanced-options-p8/package.json" in diagnostic
+        assert "- /run/advanced-options-p8/execution-bundle.json" in diagnostic
+
+        assert (
+            f'profiles: ["{ADVANCED_OPTIONS_V3_COMPOSE_PROFILE}"]'
+            in normal
+        )
+        assert 'restart: "on-failure:3"' in normal
+        assert "- --docker-service-kind" in normal
+        assert f"- {kind.value}" in normal
+        assert "- --docker-health-kind" in normal
+        assert "- postgres" in normal
         assert (
             "- scripts/run_advanced_options_v3_production.py"
-            in block
+            in normal
         )
-        assert "- scripts/run_advanced_options_p8_canary.py" not in block
-        assert "- /run/advanced-options-p8/package.json" in block
-        assert "- /run/advanced-options-p8/execution-bundle.json" in block
-        assert "REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED" in block
-        assert "REALTIME_V2_EQUITY_PIPELINE: DISABLED" in block
-        assert "- realtime_v2_app_dsn" in block
-        assert "- realtime_v2_provider_key" not in block
+        assert "- scripts/run_advanced_options_p8_canary.py" not in normal
+        assert "/run/advanced-options-p8/package.json" not in normal
+        assert "/run/advanced-options-p8/execution-bundle.json" not in normal
+        assert "REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED" in normal
+        assert "REALTIME_V2_EQUITY_PIPELINE: DISABLED" in normal
+        assert "- realtime_v2_app_dsn" in normal
+        assert "- realtime_v2_provider_key" not in normal
         if kind is AdvancedOptionsProcessKind.INGRESS:
-            assert "REALTIME_V3_ACQUISITION_SPLIT: ENABLED" in block
+            assert "REALTIME_V3_ACQUISITION_SPLIT: ENABLED" in normal
             assert (
                 "/run/advanced-options-acquisition/binding.json:ro"
-                in block
+                in diagnostic
             )
         assert tuple(P8_COMPONENT_NAMES) == tuple(
             AdvancedOptionsProcessKind

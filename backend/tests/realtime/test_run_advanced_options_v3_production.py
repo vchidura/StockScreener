@@ -12,6 +12,9 @@ from realtime.advanced_options_control_plane import (
     advanced_options_history_binding_payload,
     build_advanced_options_history_binding,
 )
+from realtime.advanced_options_p8_runtime import (
+    LegacyArtifactSessionStateAdapter,
+)
 from realtime.advanced_options_service import AdvancedOptionsProcessKind
 from realtime.advanced_options_v3_history import (
     AdvancedOptionsHistoryBindingIdentityError,
@@ -105,6 +108,44 @@ def test_prepare_waiting_cli_dispatches_receipt_free_command(
 
     assert len(calls) == 1
     assert calls[0][0].command == "prepare-waiting"
+    assert json.loads(capsys.readouterr().out) == expected
+
+
+def test_activate_session_cli_dispatches_postgres_state(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    expected = {"status": "ACTIVATED"}
+    calls = _capture(monkeypatch, "_activate_session", expected)
+    paths = [
+        tmp_path / name
+        for name in (
+            "package.json",
+            "authority.json",
+            "acquisition.json",
+            "selection.json",
+        )
+    ]
+    for path in paths:
+        path.write_text("{}", encoding="utf-8")
+
+    assert cli.main([
+        "activate-session",
+        *_database_args(),
+        "--package-source",
+        str(paths[0]),
+        "--pre-session-authority",
+        str(paths[1]),
+        "--acquisition-binding",
+        str(paths[2]),
+        "--sealed-selection",
+        str(paths[3]),
+        "--execute",
+    ]) == 0
+
+    assert len(calls) == 1
+    assert calls[0][0].command == "activate-session"
     assert json.loads(capsys.readouterr().out) == expected
 
 
@@ -305,23 +346,30 @@ def test_docker_role_mode_uses_production_service_boundary(
     monkeypatch.setattr(
         cli,
         "run_p8_docker_service",
-        lambda *args: calls.append(args) or 0,
+        lambda *args, **kwargs: calls.append((args, kwargs)) or 0,
     )
 
     assert cli.main([
         "--docker-service-kind",
         "FLOW",
+        "--state-source",
+        "legacy-diagnostic",
         "--package",
         str(tmp_path / "PACKAGE.json"),
         "--execution-bundle",
         str(tmp_path / "SESSION-BUNDLE.json"),
     ]) == 0
 
-    assert calls == [(
+    assert len(calls) == 1
+    assert calls[0][0] == (
         AdvancedOptionsProcessKind.FLOW,
         Path(tmp_path / "PACKAGE.json").resolve(),
         Path(tmp_path / "SESSION-BUNDLE.json").resolve(),
-    )]
+    )
+    assert isinstance(
+        calls[0][1]["session_state"],
+        LegacyArtifactSessionStateAdapter,
+    )
 
 
 def test_prepare_rejects_runtime_contracts_outside_admission():

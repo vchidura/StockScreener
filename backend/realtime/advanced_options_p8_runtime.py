@@ -921,63 +921,12 @@ class P8ExecutionBundleStore:
             raise TypeError(
                 "P8 waiting bundle requires an acquisition binding"
             )
-        checked = _utc(written_at, "written_at")
-        session_binding = build_p8_preopen_session_binding(
+        payload = build_p8_waiting_execution_bundle(
             package=self.package,
             acquisition_binding=acquisition_binding,
+            written_at=written_at,
+            package_path_reference=str(self.package_path),
         )
-        payload = {
-            "schema": P8_EXECUTION_BUNDLE_SCHEMA,
-            "package_sha256": self.package["package_sha256"],
-            "package_nonce": self.package["package_nonce"],
-            "package_path": str(self.package_path),
-            "window": dict(self.package["window"]),
-            "cohort_id": str(session_binding.cohort_id),
-            "plan_id": str(session_binding.plan_id),
-            "window_id": None,
-            "orchestration": dict(self.package["orchestration"]),
-            "v3_authorities": dict(self.package["v3_authorities"]),
-            "v3_authority_references": None,
-            "validation_mode": self.package.get("validation_mode"),
-            "written_at_utc": checked.isoformat(),
-            "services": [
-                {
-                    "kind": row["kind"],
-                    "owner_name": row["owner_name"],
-                    "lease_resource_key": row["lease_resource_key"],
-                    "owner_id": str(_owner_ids(self.package)[
-                        AdvancedOptionsProcessKind(str(row["kind"]))
-                    ]),
-                    "service_name": P8_SERVICE_NAMES[
-                        AdvancedOptionsProcessKind(str(row["kind"]))
-                    ],
-                }
-                for row in self.package["owners"]["processes"]
-            ],
-            "session_binding": p8_preopen_session_binding_payload(
-                session_binding
-            ),
-            "acquisition_binding": acquisition_binding_payload(
-                acquisition_binding
-            ),
-            "enrollment": None,
-            "history_binding": None,
-            "equity_input_binding": None,
-            "underlying_price_binding": None,
-            "production_binding": None,
-            "live_observation_sha256": canonical_sha256({
-                "schema": P8_PREOPEN_SESSION_BINDING_SCHEMA,
-                "session_binding_sha256": (
-                    session_binding.binding_sha256
-                ),
-                "acquisition_binding_sha256": (
-                    acquisition_binding.binding_sha256
-                ),
-                "state": P8_READY_WAITING_FOR_E,
-            }),
-            "effect_authorizations": dict(P8_EFFECT_DENIALS),
-        }
-        payload["bundle_sha256"] = canonical_sha256(payload)
         encoded = (
             json.dumps(payload, indent=2, sort_keys=True) + "\n"
         ).encode("utf-8")
@@ -1106,6 +1055,87 @@ class P8ExecutionBundleStore:
         )
 
 
+def build_p8_waiting_execution_bundle(
+    *,
+    package: Mapping[str, object],
+    acquisition_binding: AdvancedOptionsAcquisitionBinding,
+    written_at: datetime,
+    package_path_reference: str,
+) -> dict[str, object]:
+    validate_p8_service_membership(package)
+    if not isinstance(
+        acquisition_binding,
+        AdvancedOptionsAcquisitionBinding,
+    ):
+        raise TypeError("P8 waiting bundle requires an acquisition binding")
+    reference = package_path_reference.strip()
+    if not reference:
+        raise ValueError("P8 package path reference is unavailable")
+    checked = _utc(written_at, "written_at")
+    session_binding = build_p8_preopen_session_binding(
+        package=package,
+        acquisition_binding=acquisition_binding,
+    )
+    payload = {
+        "schema": P8_EXECUTION_BUNDLE_SCHEMA,
+        "package_sha256": package["package_sha256"],
+        "package_nonce": package["package_nonce"],
+        "package_path": reference,
+        "window": dict(package["window"]),
+        "cohort_id": str(session_binding.cohort_id),
+        "plan_id": str(session_binding.plan_id),
+        "window_id": None,
+        "orchestration": dict(package["orchestration"]),
+        "v3_authorities": dict(package["v3_authorities"]),
+        "v3_authority_references": None,
+        "validation_mode": package.get("validation_mode"),
+        "written_at_utc": checked.isoformat(),
+        "services": [
+            {
+                "kind": row["kind"],
+                "owner_name": row["owner_name"],
+                "lease_resource_key": row["lease_resource_key"],
+                "owner_id": str(_owner_ids(package)[
+                    AdvancedOptionsProcessKind(str(row["kind"]))
+                ]),
+                "service_name": P8_SERVICE_NAMES[
+                    AdvancedOptionsProcessKind(str(row["kind"]))
+                ],
+            }
+            for row in package["owners"]["processes"]
+        ],
+        "session_binding": p8_preopen_session_binding_payload(
+            session_binding
+        ),
+        "acquisition_binding": acquisition_binding_payload(
+            acquisition_binding
+        ),
+        "enrollment": None,
+        "history_binding": None,
+        "equity_input_binding": None,
+        "underlying_price_binding": None,
+        "production_binding": None,
+        "live_observation_sha256": canonical_sha256({
+            "schema": P8_PREOPEN_SESSION_BINDING_SCHEMA,
+            "session_binding_sha256": session_binding.binding_sha256,
+            "acquisition_binding_sha256": (
+                acquisition_binding.binding_sha256
+            ),
+            "state": P8_READY_WAITING_FOR_E,
+        }),
+        "effect_authorizations": dict(P8_EFFECT_DENIALS),
+    }
+    payload["bundle_sha256"] = canonical_sha256(payload)
+    encoded = json.dumps(
+        payload,
+        indent=2,
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(encoded) + 1 > P8_EXECUTION_BUNDLE_MAX_BYTES:
+        raise ValueError("P8 execution bundle exceeded its byte ceiling")
+    return payload
+
+
 def validate_p8_execution_bundle(
     package_path: Path,
     bundle_path: Path,
@@ -1121,6 +1151,23 @@ def validate_p8_execution_bundle(
     ):
         raise ValueError("P8 execution bundle is absent or oversized")
     bundle = _json(bundle_file)
+    return validate_p8_execution_bundle_document(
+        package,
+        bundle,
+        expected_kind=expected_kind,
+        checked_at=checked_at,
+    )
+
+
+def validate_p8_execution_bundle_document(
+    package: Mapping[str, object],
+    bundle: Mapping[str, object],
+    *,
+    expected_kind: AdvancedOptionsProcessKind | None = None,
+    checked_at: datetime | None = None,
+) -> dict[str, object]:
+    package = dict(package)
+    bundle = dict(bundle)
     digest = bundle.get("bundle_sha256")
     unsigned = dict(bundle)
     unsigned.pop("bundle_sha256", None)

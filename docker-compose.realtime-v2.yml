@@ -527,10 +527,10 @@ services:
       retries: 6
       start_period: 10s
 
-  realtime-v2-options-p8-ingress:
+  realtime-v3-options-p8-ingress:
     <<: *backend-service
-    profiles: ["realtime-v2-options-p8", "realtime-v3-options"]
-    container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-ingress
+    profiles: ["realtime-v3-options"]
+    container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v3-options-p8-ingress
     restart: "on-failure:3"
     command:
       - python
@@ -546,26 +546,19 @@ services:
       - scripts/run_advanced_options_v3_production.py
       - --docker-service-kind
       - INGRESS
-      - --package
-      - /run/advanced-options-p8/package.json
-      - --execution-bundle
-      - /run/advanced-options-p8/execution-bundle.json
+      - --state-source
+      - postgres
     environment:
       REALTIME_V2_EQUITY_PIPELINE: DISABLED
       REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
       REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
+      REALTIME_V3_OPTIONS_STATE_SOURCE: postgres
       REALTIME_V3_ACQUISITION_SPLIT: ENABLED
-      REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH: /run/advanced-options-acquisition/binding.json
       REALTIME_V3_OPTIONS_ACQUISITION_STATUS_PATH: /var/lib/realtime-v2-reports/options-acquisition-status.json
-      REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: /run/advanced-options-downstream
       REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
     secrets:
       - realtime_v2_app_dsn
     volumes:
-      - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
-      - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
-      - ${REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH:?set REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH}:/run/advanced-options-acquisition/binding.json:ro
-      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:?set REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH}:/run/advanced-options-downstream:ro
       - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
       - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
     healthcheck:
@@ -578,10 +571,8 @@ services:
         - scripts/run_advanced_options_v3_production.py
         - --docker-health-kind
         - INGRESS
-        - --package
-        - /run/advanced-options-p8/package.json
-        - --execution-bundle
-        - /run/advanced-options-p8/execution-bundle.json
+        - --state-source
+        - postgres
       interval: 5s
       timeout: 15s
       retries: 6
@@ -612,8 +603,8 @@ services:
       - stocks_realtime_v2
       - --confirm-database-name
       - stocks_realtime_v2
-      - --binding
-      - /run/advanced-options-acquisition/binding.json
+      - --state-source
+      - postgres
       - --journal-root
       - /var/lib/realtime-v2-advanced
       - --status-path
@@ -626,12 +617,12 @@ services:
       REALTIME_V2_EQUITY_PIPELINE: DISABLED
       REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
       REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
+      REALTIME_V3_OPTIONS_STATE_SOURCE: postgres
       REALTIME_V2_ROLE_PREFIX: ${REALTIME_V2_ROLE_PREFIX:-stocks_realtime_v2}
     secrets:
       - realtime_v2_app_dsn
       - realtime_v2_provider_key
     volumes:
-      - ${REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH:?set REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH}:/run/advanced-options-acquisition/binding.json:ro
       - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
       - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
     healthcheck:
@@ -645,8 +636,8 @@ services:
         - stocks_realtime_v2
         - --confirm-database-name
         - stocks_realtime_v2
-        - --binding
-        - /run/advanced-options-acquisition/binding.json
+        - --state-source
+        - postgres
         - --status-path
         - /var/lib/realtime-v2-reports/options-acquisition-status.json
       interval: 5s
@@ -654,10 +645,10 @@ services:
       retries: 6
       start_period: 10s
 
-  realtime-v2-options-p8-market-state:
+  realtime-v3-options-p8-market-state:
     <<: *backend-service
-    profiles: ["realtime-v2-options-p8", "realtime-v3-options"]
-    container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-market-state
+    profiles: ["realtime-v3-options"]
+    container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v3-options-p8-market-state
     restart: "on-failure:3"
     command:
       - python
@@ -673,18 +664,215 @@ services:
       - scripts/run_advanced_options_v3_production.py
       - --docker-service-kind
       - MARKET_STATE
+      - --state-source
+      - postgres
+    environment:
+      REALTIME_V2_EQUITY_PIPELINE: DISABLED
+      REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
+      REALTIME_V3_OPTIONS_STATE_SOURCE: postgres
+      REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
+    secrets:
+      - realtime_v2_app_dsn
+    volumes:
+      - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
+      - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -W
+        - ignore
+        - -B
+        - scripts/run_advanced_options_v3_production.py
+        - --docker-health-kind
+        - MARKET_STATE
+        - --state-source
+        - postgres
+      interval: 5s
+      timeout: 15s
+      retries: 6
+      start_period: 10s
+
+  realtime-v3-options-p8-flow:
+    <<: *backend-service
+    labels: *downstream-labels
+    profiles: ["realtime-v3-options"]
+    container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v3-options-p8-flow
+    restart: "on-failure:3"
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - options-p8-flow
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --
+      - python
+      - -B
+      - scripts/run_advanced_options_v3_production.py
+      - --docker-service-kind
+      - FLOW
+      - --state-source
+      - postgres
+    environment:
+      REALTIME_V2_EQUITY_PIPELINE: DISABLED
+      REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
+      REALTIME_V3_OPTIONS_STATE_SOURCE: postgres
+      REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
+    secrets:
+      - realtime_v2_app_dsn
+    volumes:
+      - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
+      - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -W
+        - ignore
+        - -B
+        - scripts/run_advanced_options_v3_production.py
+        - --docker-health-kind
+        - FLOW
+        - --state-source
+        - postgres
+      interval: 5s
+      timeout: 15s
+      retries: 6
+      start_period: 10s
+
+  realtime-v3-options-p8-window:
+    <<: *backend-service
+    labels: *downstream-labels
+    profiles: ["realtime-v3-options"]
+    container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v3-options-p8-window
+    restart: "on-failure:3"
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - options-p8-window
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --
+      - python
+      - -B
+      - scripts/run_advanced_options_v3_production.py
+      - --docker-service-kind
+      - WINDOW
+      - --state-source
+      - postgres
+    environment:
+      REALTIME_V2_EQUITY_PIPELINE: DISABLED
+      REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
+      REALTIME_V3_OPTIONS_STATE_SOURCE: postgres
+    secrets:
+      - realtime_v2_app_dsn
+    volumes:
+      - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -W
+        - ignore
+        - -B
+        - scripts/run_advanced_options_v3_production.py
+        - --docker-health-kind
+        - WINDOW
+        - --state-source
+        - postgres
+      interval: 5s
+      timeout: 15s
+      retries: 6
+      start_period: 10s
+
+  realtime-v2-options-p8-ingress:
+    extends:
+      service: realtime-v3-options-p8-ingress
+    profiles: ["realtime-v2-options-p8"]
+    container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-ingress
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - options-p8-ingress
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --
+      - python
+      - -B
+      - scripts/run_advanced_options_v3_production.py
+      - --docker-service-kind
+      - INGRESS
+      - --state-source
+      - legacy-diagnostic
       - --package
       - /run/advanced-options-p8/package.json
       - --execution-bundle
       - /run/advanced-options-p8/execution-bundle.json
     environment:
-      REALTIME_V2_EQUITY_PIPELINE: DISABLED
-      REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
-      REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
+      REALTIME_V3_OPTIONS_STATE_SOURCE: legacy-diagnostic
+      REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH: /run/advanced-options-acquisition/binding.json
       REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: /run/advanced-options-downstream
-      REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
-    secrets:
-      - realtime_v2_app_dsn
+    volumes:
+      - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
+      - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
+      - ${REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH:?set REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH}:/run/advanced-options-acquisition/binding.json:ro
+      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:?set REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH}:/run/advanced-options-downstream:ro
+      - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
+      - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -W
+        - ignore
+        - -B
+        - scripts/run_advanced_options_v3_production.py
+        - --docker-health-kind
+        - INGRESS
+        - --state-source
+        - legacy-diagnostic
+        - --package
+        - /run/advanced-options-p8/package.json
+        - --execution-bundle
+        - /run/advanced-options-p8/execution-bundle.json
+
+  realtime-v2-options-p8-market-state:
+    extends:
+      service: realtime-v3-options-p8-market-state
+    profiles: ["realtime-v2-options-p8"]
+    container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-market-state
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - options-p8-market-state
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --
+      - python
+      - -B
+      - scripts/run_advanced_options_v3_production.py
+      - --docker-service-kind
+      - MARKET_STATE
+      - --state-source
+      - legacy-diagnostic
+      - --package
+      - /run/advanced-options-p8/package.json
+      - --execution-bundle
+      - /run/advanced-options-p8/execution-bundle.json
+    environment:
+      REALTIME_V3_OPTIONS_STATE_SOURCE: legacy-diagnostic
+      REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: /run/advanced-options-downstream
     volumes:
       - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
       - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
@@ -701,21 +889,18 @@ services:
         - scripts/run_advanced_options_v3_production.py
         - --docker-health-kind
         - MARKET_STATE
+        - --state-source
+        - legacy-diagnostic
         - --package
         - /run/advanced-options-p8/package.json
         - --execution-bundle
         - /run/advanced-options-p8/execution-bundle.json
-      interval: 5s
-      timeout: 15s
-      retries: 6
-      start_period: 10s
 
   realtime-v2-options-p8-flow:
-    <<: *backend-service
-    labels: *downstream-labels
-    profiles: ["realtime-v2-options-p8", "realtime-v3-options"]
+    extends:
+      service: realtime-v3-options-p8-flow
+    profiles: ["realtime-v2-options-p8"]
     container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-flow
-    restart: "on-failure:3"
     command:
       - python
       - -B
@@ -730,18 +915,15 @@ services:
       - scripts/run_advanced_options_v3_production.py
       - --docker-service-kind
       - FLOW
+      - --state-source
+      - legacy-diagnostic
       - --package
       - /run/advanced-options-p8/package.json
       - --execution-bundle
       - /run/advanced-options-p8/execution-bundle.json
     environment:
-      REALTIME_V2_EQUITY_PIPELINE: DISABLED
-      REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
-      REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
+      REALTIME_V3_OPTIONS_STATE_SOURCE: legacy-diagnostic
       REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: /run/advanced-options-downstream
-      REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
-    secrets:
-      - realtime_v2_app_dsn
     volumes:
       - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
       - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
@@ -758,21 +940,18 @@ services:
         - scripts/run_advanced_options_v3_production.py
         - --docker-health-kind
         - FLOW
+        - --state-source
+        - legacy-diagnostic
         - --package
         - /run/advanced-options-p8/package.json
         - --execution-bundle
         - /run/advanced-options-p8/execution-bundle.json
-      interval: 5s
-      timeout: 15s
-      retries: 6
-      start_period: 10s
 
   realtime-v2-options-p8-window:
-    <<: *backend-service
-    labels: *downstream-labels
-    profiles: ["realtime-v2-options-p8", "realtime-v3-options"]
+    extends:
+      service: realtime-v3-options-p8-window
+    profiles: ["realtime-v2-options-p8"]
     container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-window
-    restart: "on-failure:3"
     command:
       - python
       - -B
@@ -787,17 +966,15 @@ services:
       - scripts/run_advanced_options_v3_production.py
       - --docker-service-kind
       - WINDOW
+      - --state-source
+      - legacy-diagnostic
       - --package
       - /run/advanced-options-p8/package.json
       - --execution-bundle
       - /run/advanced-options-p8/execution-bundle.json
     environment:
-      REALTIME_V2_EQUITY_PIPELINE: DISABLED
-      REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
-      REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
+      REALTIME_V3_OPTIONS_STATE_SOURCE: legacy-diagnostic
       REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: /run/advanced-options-downstream
-    secrets:
-      - realtime_v2_app_dsn
     volumes:
       - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
       - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
@@ -813,14 +990,12 @@ services:
         - scripts/run_advanced_options_v3_production.py
         - --docker-health-kind
         - WINDOW
+        - --state-source
+        - legacy-diagnostic
         - --package
         - /run/advanced-options-p8/package.json
         - --execution-bundle
         - /run/advanced-options-p8/execution-bundle.json
-      interval: 5s
-      timeout: 15s
-      retries: 6
-      start_period: 10s
 
   realtime-v2-retention:
     <<: *backend-service

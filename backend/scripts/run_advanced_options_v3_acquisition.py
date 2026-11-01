@@ -31,6 +31,11 @@ from realtime.advanced_options_acquisition_runtime import (  # noqa: E402
 from realtime.advanced_options_p8_runtime import (  # noqa: E402
     LegacyArtifactSessionStateAdapter,
 )
+from realtime.advanced_options_session_state import (  # noqa: E402
+    LEGACY_DIAGNOSTIC_STATE_SOURCE,
+    POSTGRES_STATE_SOURCE,
+    select_options_session_state,
+)
 from realtime.advanced_options_v3_authority import (  # noqa: E402
     session_acquisition_authorization_from_payload,
 )
@@ -82,7 +87,15 @@ def parse_args(argv=None):
         command = commands.add_parser(name)
         command.add_argument("--database", required=True)
         command.add_argument("--confirm-database-name", required=True)
-        command.add_argument("--binding", type=Path, required=True)
+        command.add_argument(
+            "--state-source",
+            choices=(
+                POSTGRES_STATE_SOURCE,
+                LEGACY_DIAGNOSTIC_STATE_SOURCE,
+            ),
+            default=POSTGRES_STATE_SOURCE,
+        )
+        command.add_argument("--binding", type=Path)
         command.add_argument("--status-path", type=Path, required=True)
         if name == "run":
             command.add_argument("--journal-root", type=Path, required=True)
@@ -119,7 +132,17 @@ def parse_args(argv=None):
     )
     if (
         args.database != EXPECTED_V2_DATABASE_NAME
-        or not args.binding.is_file()
+        or (
+            args.state_source == POSTGRES_STATE_SOURCE
+            and args.binding is not None
+        )
+        or (
+            args.state_source == LEGACY_DIAGNOSTIC_STATE_SOURCE
+            and (
+                args.binding is None
+                or not args.binding.is_file()
+            )
+        )
     ):
         parser.error("Options acquisition runtime scope is invalid")
     if args.command == "run" and (
@@ -265,7 +288,27 @@ def main(argv=None) -> int:
             "output": str(args.output),
         }, indent=2, sort_keys=True))
         return 0
-    binding = _binding(args.binding)
+    state_provider = None
+    pool = None
+    diagnostic = False
+    if (
+        args.state_source == POSTGRES_STATE_SOURCE
+        or args.command == "run"
+    ):
+        provider, pool, diagnostic = _provider()
+        if args.state_source == POSTGRES_STATE_SOURCE:
+            state_provider = provider
+    state = select_options_session_state(
+        environment=os.environ,
+        provider=state_provider,
+        acquisition_binding_path=(
+            args.binding
+            if args.state_source == LEGACY_DIAGNOSTIC_STATE_SOURCE
+            else None
+        ),
+        state_source=args.state_source,
+    )
+    binding = state.load_acquisition_binding()
     diagnostic_clock = (
         binding.authority.acquisition_start + timedelta(seconds=1)
         if (
@@ -279,17 +322,22 @@ def main(argv=None) -> int:
         else None
     )
     if args.command == "health":
-        print(json.dumps(
-            acquisition_health(
-                args.status_path,
-                binding,
-                checked_at=diagnostic_clock or datetime.now(UTC),
-            ),
-            indent=2,
-            sort_keys=True,
-        ))
-        return 0
-    provider, pool, diagnostic = _provider()
+        try:
+            print(json.dumps(
+                acquisition_health(
+                    args.status_path,
+                    binding,
+                    checked_at=diagnostic_clock or datetime.now(UTC),
+                ),
+                indent=2,
+                sort_keys=True,
+            ))
+            return 0
+        finally:
+            if pool is not None:
+                pool.closeall()
+    if pool is None:
+        raise RuntimeError("Options acquisition database is unavailable")
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())

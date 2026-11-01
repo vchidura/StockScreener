@@ -652,6 +652,8 @@ Actions:
 - keep the file adapter and export command for replay;
 - start Options residents from effective session state and keep them waiting when no
   window E exists;
+- store and serve one explicitly activated validated Options session; unattended
+  next-session materialization/activation and XNYS rollover remain outside C5;
 - preserve current append ordering, resident barriers, journal offsets and rehydration.
 
 Exit:
@@ -734,6 +736,9 @@ Actions:
   not stop healthy acquisition or processing children;
 - replace bounded restart exhaustion for long-lived residents with per-role degraded
   state, bounded backoff and explicit operator-visible terminal conditions;
+- add the long-lived lifecycle that materializes and activates the next effective
+  Options session from durable state, waits without exhausting restarts when no
+  session envelope or window E exists, and rebinds residents across XNYS rollover;
 - expose one status summary with per-service, per-shard and per-member readiness;
 - configure ordinary partition creation, retention and archive cadence;
 - document one startup, status, stop, backup and restore workflow.
@@ -755,6 +760,8 @@ Actions:
 
 - prove no supported launcher, Compose profile, task or test uses the daily supervisor,
   dated task or normal package-file runtime;
+- remove manual `activate-session` and daily supervisor paths only after the C8
+  unattended Options lifecycle and rollover path proves parity;
 - move retained replay helpers under explicit diagnostic naming;
 - delete obsolete runtime branches and duplicated lifecycle status code;
 - remove temporary runtime-mode switch and compatibility adapter if no diagnostic

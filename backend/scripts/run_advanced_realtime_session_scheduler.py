@@ -68,7 +68,13 @@ from realtime.advanced_options_p8_runtime import (  # noqa: E402
     LegacyArtifactSessionStateAdapter,
     SessionRuntimeStatePort,
     build_p8_downstream_binding,
+    p8_preopen_session_binding_from_payload,
     validate_p8_execution_bundle,
+)
+from realtime.advanced_options_session_state import (  # noqa: E402
+    LEGACY_DIAGNOSTIC_STATE_SOURCE,
+    POSTGRES_STATE_SOURCE,
+    select_options_session_state,
 )
 from realtime.advanced_options_v3_deployment import (  # noqa: E402
     validate_advanced_options_v3_runtime_identity,
@@ -136,10 +142,10 @@ OPTIONS_RESIDENT_KINDS = (
 OPTIONS_ACQUISITION_SERVICE = "realtime-v3-options-acquisition"
 OPTIONS_SERVICES = (
     OPTIONS_ACQUISITION_SERVICE,
-    "realtime-v2-options-p8-ingress",
-    "realtime-v2-options-p8-market-state",
-    "realtime-v2-options-p8-flow",
-    "realtime-v2-options-p8-window",
+    "realtime-v3-options-p8-ingress",
+    "realtime-v3-options-p8-market-state",
+    "realtime-v3-options-p8-flow",
+    "realtime-v3-options-p8-window",
 )
 PROVIDER_SERVICES = (
     "realtime-v2-advanced-controller",
@@ -199,22 +205,33 @@ def _session_state(args) -> SessionRuntimeStatePort:
     state = getattr(args, "session_state", None)
     if state is not None:
         return state
-    return LegacyArtifactSessionStateAdapter(
-        package_path=getattr(args, "package", None),
-        bundle_path=getattr(args, "bundle", None),
-        acquisition_binding_path=getattr(
-            args,
-            "acquisition_binding",
-            None,
-        ),
-        downstream_binding_directory=getattr(
-            args,
-            "downstream_binding_directory",
-            None,
-        ),
-        json_loader=_read_json,
-        bundle_validator=validate_p8_execution_bundle,
-        acquisition_parser=acquisition_binding_from_payload,
+    source = getattr(
+        args,
+        "state_source",
+        LEGACY_DIAGNOSTIC_STATE_SOURCE,
+    )
+    if source == LEGACY_DIAGNOSTIC_STATE_SOURCE:
+        return LegacyArtifactSessionStateAdapter(
+            package_path=getattr(args, "package", None),
+            bundle_path=getattr(args, "bundle", None),
+            acquisition_binding_path=getattr(
+                args,
+                "acquisition_binding",
+                None,
+            ),
+            downstream_binding_directory=getattr(
+                args,
+                "downstream_binding_directory",
+                None,
+            ),
+            json_loader=_read_json,
+            bundle_validator=validate_p8_execution_bundle,
+            acquisition_parser=acquisition_binding_from_payload,
+        )
+    return select_options_session_state(
+        environment=os.environ,
+        provider=getattr(args, "state_provider", None),
+        state_source=source,
     )
 
 
@@ -421,12 +438,19 @@ def parse_args(argv=None):
     run.add_argument("--database", required=True)
     run.add_argument("--confirm-database-name", required=True)
     run.add_argument("--authorization", type=Path, required=True)
-    run.add_argument("--package", type=Path, required=True)
-    run.add_argument("--bundle", type=Path, required=True)
+    run.add_argument(
+        "--state-source",
+        choices=(
+            POSTGRES_STATE_SOURCE,
+            LEGACY_DIAGNOSTIC_STATE_SOURCE,
+        ),
+        default=POSTGRES_STATE_SOURCE,
+    )
+    run.add_argument("--package", type=Path)
+    run.add_argument("--bundle", type=Path)
     run.add_argument(
         "--acquisition-binding",
         type=Path,
-        required=True,
     )
     run.add_argument("--freeze-report", type=Path, required=True)
     run.add_argument("--env-file", type=Path, required=True)
@@ -557,7 +581,28 @@ def parse_args(argv=None):
                     or not args.output_directory.is_dir()
                 )
             )
-            or not args.acquisition_binding.is_file()
+            or (
+                args.state_source == POSTGRES_STATE_SOURCE
+                and any(
+                    path is not None
+                    for path in (
+                        args.package,
+                        args.bundle,
+                        args.acquisition_binding,
+                    )
+                )
+            )
+            or (
+                args.state_source == LEGACY_DIAGNOSTIC_STATE_SOURCE
+                and not all(
+                    path is not None and path.is_file()
+                    for path in (
+                        args.package,
+                        args.bundle,
+                        args.acquisition_binding,
+                    )
+                )
+            )
             or not args.secret_directory.is_dir()
             or not args.freeze_report.is_file()
             or not args.env_file.is_file()
@@ -1347,9 +1392,19 @@ def _compose_command(
     check=True,
     backend_image_id=None,
 ):
-    runtime_environment = {}
+    state_source = getattr(
+        args,
+        "state_source",
+        LEGACY_DIAGNOSTIC_STATE_SOURCE,
+    )
+    runtime_environment = {
+        "REALTIME_V3_OPTIONS_STATE_SOURCE": state_source,
+    }
     acquisition_binding = getattr(args, "acquisition_binding", None)
-    if acquisition_binding is not None:
+    if (
+        state_source == LEGACY_DIAGNOSTIC_STATE_SOURCE
+        and acquisition_binding is not None
+    ):
         runtime_environment[
             "REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH"
         ] = str(acquisition_binding)
@@ -1371,6 +1426,11 @@ def _compose_command(
         "realtime-v3-options-acquisition",
         *values,
     )
+    if state_source == LEGACY_DIAGNOSTIC_STATE_SOURCE:
+        runtime_environment.update({
+            "REALTIME_V2_P8_PACKAGE_PATH": str(args.package),
+            "REALTIME_V2_P8_BUNDLE_PATH": str(args.bundle),
+        })
     completed = subprocess.run(
         command,
         cwd=REPOSITORY_ROOT,
@@ -1382,8 +1442,6 @@ def _compose_command(
                 else {}
             ),
             **runtime_environment,
-            "REALTIME_V2_P8_PACKAGE_PATH": str(args.package),
-            "REALTIME_V2_P8_BUNDLE_PATH": str(args.bundle),
         },
         check=False,
         timeout=180,
@@ -2704,10 +2762,12 @@ def _remove_secret_directory(path):
 
 
 def _cleanup_database_state(provider, authority, bundle):
-    session_binding = LegacyArtifactSessionStateAdapter(
-        json_loader=_read_json,
-        acquisition_parser=acquisition_binding_from_payload,
-    ).load_preopen_session_binding(bundle)
+    session_payload = bundle.get("session_binding")
+    session_binding = (
+        None
+        if session_payload is None
+        else p8_preopen_session_binding_from_payload(session_payload)
+    )
     if session_binding is None:
         raise TypeError("P8 pre-open session binding must be an object")
     owner_ids = [
@@ -2866,14 +2926,25 @@ def _write_cycle_deadline_report(
 
 def _run(args):
     load_dotenv(args.env_file, override=False)
+    provider, pool = production_cli._provider()
+    args.state_provider = (
+        provider
+        if args.state_source == POSTGRES_STATE_SOURCE
+        else None
+    )
     authority = args.scheduler_authority
     freeze_report = _load_go_freeze_report(args.freeze_report)
     frozen_identities = freeze_report.get("frozen_identities")
     if not isinstance(frozen_identities, dict):
         raise ValueError("pre-open frozen identities are unavailable")
-    initial_session_state = _session_state(args)
-    package = initial_session_state.load_package()
-    bundle = initial_session_state.load_execution_bundle()
+    try:
+        initial_session_state = _session_state(args)
+        args.session_state = initial_session_state
+        package = initial_session_state.load_package()
+        bundle = initial_session_state.load_execution_bundle()
+    except Exception:
+        pool.closeall()
+        raise
     validate_advanced_options_v3_runtime_identity(package, bundle)
     session = session_acquisition_authorization_from_payload(
         bundle["v3_authorities"]["session_acquisition"]
@@ -2926,22 +2997,28 @@ def _run(args):
         or session.acquisition_start > authority.acquisition_start
         or session.acquisition_stop < authority.decision_stop
     ):
+        pool.closeall()
         raise ValueError("session scheduler artifact identity changed")
-    resuming = _initialize_coordinator_identity(args, authority)
-    args.downstream_binding_directory = (
-        args.output_directory / "downstream-bindings"
-    )
-    if resuming:
-        if not args.downstream_binding_directory.is_dir():
-            raise RuntimeError(
-                "coordinator downstream binding state is unavailable"
-            )
-    else:
-        args.downstream_binding_directory.mkdir()
-    os.environ[
-        "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH"
-    ] = str(args.downstream_binding_directory)
-    if getattr(args, "session_state", None) is None:
+    try:
+        resuming = _initialize_coordinator_identity(args, authority)
+    except Exception:
+        pool.closeall()
+        raise
+    if args.state_source == LEGACY_DIAGNOSTIC_STATE_SOURCE:
+        args.downstream_binding_directory = (
+            args.output_directory / "downstream-bindings"
+        )
+        if resuming:
+            if not args.downstream_binding_directory.is_dir():
+                pool.closeall()
+                raise RuntimeError(
+                    "coordinator downstream binding state is unavailable"
+                )
+        else:
+            args.downstream_binding_directory.mkdir()
+        os.environ[
+            "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH"
+        ] = str(args.downstream_binding_directory)
         args.session_state = LegacyArtifactSessionStateAdapter(
             package_path=args.package,
             bundle_path=args.bundle,
@@ -2953,7 +3030,6 @@ def _run(args):
             bundle_validator=validate_p8_execution_bundle,
             acquisition_parser=acquisition_binding_from_payload,
         )
-    provider, pool = production_cli._provider()
     stop = threading.Event()
     monitor_stop = threading.Event()
     preopen_monitor_stop = threading.Event()

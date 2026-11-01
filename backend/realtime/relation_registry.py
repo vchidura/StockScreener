@@ -144,6 +144,15 @@ RELATIONS: dict[str, Relation] = {
     "rt.advanced_options_authority_receipts": _r(
         "control", "BOUNDED", append=True
     ),
+    "rt.advanced_options_continuous_sessions": _r(
+        "control", "BOUNDED", append=True
+    ),
+    "rt.advanced_options_downstream_bindings": _r(
+        "control", "BOUNDED", append=True
+    ),
+    "rt.advanced_options_downstream_heads": _r(
+        "control", "BOUNDED", mutable=True
+    ),
     "rt.advanced_options_resident_completions": _r(
         "options", "BOUNDED", append=True
     ),

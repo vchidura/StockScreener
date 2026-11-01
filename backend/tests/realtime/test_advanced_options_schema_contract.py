@@ -91,6 +91,10 @@ V3_STAGE_BARRIER_SQL_PATH = (
     Path(V2_MIGRATIONS_DIR)
     / "035_advanced_options_v3_stage_barrier.sql"
 )
+C5_SESSION_STATE_SQL_PATH = (
+    Path(V2_MIGRATIONS_DIR)
+    / "041_advanced_options_continuous_session_state.sql"
+)
 
 
 def _source_flow(base_config=None, *, generation=JOURNAL_GENERATION):
@@ -105,9 +109,9 @@ def _source_flow(base_config=None, *, generation=JOURNAL_GENERATION):
 
 def test_p2_is_one_forward_migration_with_no_parallel_lifecycle_tables():
     migrations = load_realtime_migrations(Path(V2_MIGRATIONS_DIR))
-    assert migrations[-1].version == (
-        "035_advanced_options_v3_stage_barrier"
-    )
+    assert "035_advanced_options_v3_stage_barrier" in {
+        migration.version for migration in migrations
+    }
     text = SQL_PATH.read_text(encoding="utf-8")
     assert "CREATE TABLE rt.option_source_flows" in text
     for prohibited in (
@@ -178,6 +182,51 @@ def test_migration_035_adds_one_bounded_resident_barrier_and_deferred_state():
         "options_jobs",
         "options_lifecycle",
         "options_status_files",
+    ):
+        assert f"CREATE TABLE rt.{prohibited}" not in text
+
+
+def test_migration_041_adds_only_session_envelope_chain_and_head():
+    text = " ".join(
+        C5_SESSION_STATE_SQL_PATH.read_text(encoding="utf-8").split()
+    )
+
+    for relation in (
+        "advanced_options_continuous_sessions",
+        "advanced_options_downstream_bindings",
+        "advanced_options_downstream_heads",
+    ):
+        assert f"CREATE TABLE rt.{relation}" in text
+        assert RELATIONS[f"rt.{relation}"].retention == "BOUNDED"
+    assert (
+        RELATIONS[
+            "rt.advanced_options_continuous_sessions"
+        ].writes
+        == "APPEND"
+    )
+    assert (
+        RELATIONS[
+            "rt.advanced_options_downstream_bindings"
+        ].writes
+        == "APPEND"
+    )
+    assert (
+        RELATIONS["rt.advanced_options_downstream_heads"].writes
+        == "MUTABLE"
+    )
+    assert "desired_revision_id uuid NOT NULL" in text
+    assert "reference_state_id uuid NOT NULL" in text
+    assert "previous_binding_sha256 char(64)" in text
+    assert "UNIQUE (session_binding_id, sequence, binding_sha256)" in text
+    assert "trg_rt_advanced_options_continuous_sessions_immutable" in text
+    assert "trg_rt_advanced_options_downstream_bindings_immutable" in text
+    for prohibited in (
+        "options_scheduler",
+        "options_outbox",
+        "options_release",
+        "options_shard",
+        "broker",
+        "trading",
     ):
         assert f"CREATE TABLE rt.{prohibited}" not in text
 
