@@ -39,6 +39,7 @@ from realtime.advanced_options_activity_momentum_c6 import (  # noqa: E402
     activity_momentum_allocation_from_payload,
 )
 from realtime.advanced_options_p8_selection_source import (  # noqa: E402
+    SEALED_CAPTURE_EXACT_FOUR_PROFILE,
     p8_activity_selection_capture_from_sealed,
 )
 from realtime.advanced_options_api import (  # noqa: E402
@@ -959,7 +960,13 @@ def _wait_for_window(provider, window_id, deadline, hard_stop):
 
 
 def _validate_sealed_capture_scope(capture, args, *, checked_at):
-    selection_capture = p8_activity_selection_capture_from_sealed(capture)
+    selection_capture = p8_activity_selection_capture_from_sealed(
+        capture,
+        compatibility_profile=str(
+            capture.get("compatibility_profile")
+            or SEALED_CAPTURE_EXACT_FOUR_PROFILE
+        ),
+    )
     selection = selection_capture.selection
     equity_age = (
         selection.reviewed_at - args.equity_cutoff

@@ -17,6 +17,12 @@ class ProviderBudgetExceeded(RuntimeError):
     pass
 
 
+MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING = 64_000
+MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING = (
+    512 * 1024 * 1024 * 1024
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderBudgetScope:
     account_alias: str
@@ -29,6 +35,8 @@ class ProviderBudgetScope:
     lanes: frozenset[ProviderRequestLane]
     authorized_until: datetime
     policy_version: str = "v2-provider-budget-v1"
+    account_request_ceiling: int | None = None
+    account_decoded_byte_ceiling: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -64,12 +72,40 @@ class ProviderBudgetScope:
                 not isinstance(lane, ProviderRequestLane)
                 for lane in self.lanes
             )
+            or (
+                (self.account_request_ceiling is None)
+                != (self.account_decoded_byte_ceiling is None)
+            )
+            or self.account_request_ceiling is not None
+            and (
+                type(self.account_request_ceiling) is not int
+                or type(self.account_decoded_byte_ceiling) is not int
+                or self.account_request_ceiling < self.request_ceiling
+                or self.account_decoded_byte_ceiling
+                < self.decoded_byte_ceiling
+            )
         ):
             raise ValueError("provider budget limits or lanes are invalid")
 
     @property
+    def effective_account_request_ceiling(self) -> int:
+        return (
+            self.request_ceiling
+            if self.account_request_ceiling is None
+            else self.account_request_ceiling
+        )
+
+    @property
+    def effective_account_decoded_byte_ceiling(self) -> int:
+        return (
+            self.decoded_byte_ceiling
+            if self.account_decoded_byte_ceiling is None
+            else self.account_decoded_byte_ceiling
+        )
+
+    @property
     def sha256(self) -> str:
-        return canonical_sha256({
+        identity = {
             "policy_version": self.policy_version,
             "account_alias": self.account_alias,
             "session_date": self.session_date,
@@ -82,7 +118,15 @@ class ProviderBudgetScope:
             "decoded_byte_ceiling": self.decoded_byte_ceiling,
             "lanes": tuple(sorted(lane.value for lane in self.lanes)),
             "authorized_until": self.authorized_until,
-        })
+        }
+        if self.account_request_ceiling is not None:
+            identity["account_request_ceiling"] = (
+                self.account_request_ceiling
+            )
+            identity["account_decoded_byte_ceiling"] = (
+                self.account_decoded_byte_ceiling
+            )
+        return canonical_sha256(identity)
 
     def bind(
         self,
@@ -100,8 +144,12 @@ class ProviderBudgetScope:
             budget_session_date=self.session_date,
             authorization_reference=self.authorization_reference,
             reserved_response_bytes=reserved_response_bytes,
-            account_request_ceiling=self.request_ceiling,
-            account_decoded_byte_ceiling=self.decoded_byte_ceiling,
+            account_request_ceiling=(
+                self.effective_account_request_ceiling
+            ),
+            account_decoded_byte_ceiling=(
+                self.effective_account_decoded_byte_ceiling
+            ),
         )
 
 
@@ -143,6 +191,8 @@ def _budget_status_cursor(
     expected_scope_sha256: str,
     expected_request_ceiling: int,
     expected_byte_ceiling: int,
+    expected_account_request_ceiling: int,
+    expected_account_byte_ceiling: int,
 ) -> ProviderBudgetStatus:
     cursor.execute(
         "SELECT COUNT(*), COALESCE(SUM(reserved_response_bytes),0), "
@@ -170,10 +220,10 @@ def _budget_status_cursor(
         maximum_bytes,
     ) = cursor.fetchone()
     if requests_reserved and (
-        minimum_requests != expected_request_ceiling
-        or maximum_requests != expected_request_ceiling
-        or minimum_bytes != expected_byte_ceiling
-        or maximum_bytes != expected_byte_ceiling
+        minimum_requests != expected_account_request_ceiling
+        or maximum_requests != expected_account_request_ceiling
+        or minimum_bytes != expected_account_byte_ceiling
+        or maximum_bytes != expected_account_byte_ceiling
     ):
         raise ValueError(
             "provider budget ceilings conflict for this authorization scope"
@@ -203,6 +253,12 @@ def provider_budget_status_cursor(
         expected_scope_sha256=scope.sha256,
         expected_request_ceiling=scope.request_ceiling,
         expected_byte_ceiling=scope.decoded_byte_ceiling,
+        expected_account_request_ceiling=(
+            scope.effective_account_request_ceiling
+        ),
+        expected_account_byte_ceiling=(
+            scope.effective_account_decoded_byte_ceiling
+        ),
     )
 
 
@@ -215,18 +271,31 @@ def account_provider_budget_status_cursor(
         "COUNT(*) FILTER (WHERE state='RESERVED'),"
         "COUNT(*) FILTER (WHERE state='COMPLETE'),"
         "COUNT(*) FILTER (WHERE state='FAILED'),"
-        "COUNT(*) FILTER (WHERE state='AMBIGUOUS') "
+        "COUNT(*) FILTER (WHERE state='AMBIGUOUS'),"
+        "MIN(account_request_ceiling),MAX(account_request_ceiling),"
+        "MIN(account_decoded_byte_ceiling),"
+        "MAX(account_decoded_byte_ceiling) "
         "FROM rt.provider_request_ledger "
         "WHERE account_alias=%s AND budget_session_date=%s "
         "AND budget_scope_sha256 IS NOT NULL",
         (scope.account_alias, scope.session_date),
     )
-    values = tuple(int(value) for value in cursor.fetchone())
+    row = cursor.fetchone()
+    values = tuple(int(value) for value in row[:6])
+    if values[0] and (
+        row[6] != scope.effective_account_request_ceiling
+        or row[7] != scope.effective_account_request_ceiling
+        or row[8] != scope.effective_account_decoded_byte_ceiling
+        or row[9] != scope.effective_account_decoded_byte_ceiling
+    ):
+        raise ValueError(
+            "provider account ceilings conflict for this session"
+        )
     return ProviderBudgetStatus(
         scope.account_alias,
         scope.session_date,
-        scope.request_ceiling,
-        scope.decoded_byte_ceiling,
+        scope.effective_account_request_ceiling,
+        scope.effective_account_decoded_byte_ceiling,
         *values,
     )
 
@@ -239,6 +308,10 @@ def reserve_coordinated_provider_request_cursor(
     reserved_response_bytes: int,
     account_wide: bool = False,
 ) -> ProviderBudgetAdmission:
+    if scope.account_alias == "MASSIVE_ADVANCED" and not account_wide:
+        raise ValueError(
+            "MASSIVE_ADVANCED reservations require account-wide enforcement"
+        )
     coordinated = scope.bind(
         reservation,
         reserved_response_bytes=reserved_response_bytes,
@@ -267,22 +340,40 @@ def reserve_coordinated_provider_request_cursor(
                 else provider_budget_status_cursor(cursor, scope)
             ),
         )
-    status = (
-        account_provider_budget_status_cursor(cursor, scope)
-        if account_wide
-        else provider_budget_status_cursor(cursor, scope)
-    )
-    if status.requests_reserved + 1 > scope.request_ceiling:
+    scope_status = provider_budget_status_cursor(cursor, scope)
+    if scope_status.requests_reserved + 1 > scope.request_ceiling:
         raise ProviderBudgetExceeded(
-            "provider account request ceiling is exhausted"
+            "provider scope request ceiling is exhausted"
         )
     if (
-        status.bytes_reserved + coordinated.reserved_response_bytes
+        scope_status.bytes_reserved + coordinated.reserved_response_bytes
         > scope.decoded_byte_ceiling
     ):
         raise ProviderBudgetExceeded(
-            "provider account decoded-byte ceiling is exhausted"
+            "provider scope decoded-byte ceiling is exhausted"
         )
+    status = scope_status
+    if account_wide:
+        account_status = account_provider_budget_status_cursor(
+            cursor,
+            scope,
+        )
+        if (
+            account_status.requests_reserved + 1
+            > scope.effective_account_request_ceiling
+        ):
+            raise ProviderBudgetExceeded(
+                "provider account request ceiling is exhausted"
+            )
+        if (
+            account_status.bytes_reserved
+            + coordinated.reserved_response_bytes
+            > scope.effective_account_decoded_byte_ceiling
+        ):
+            raise ProviderBudgetExceeded(
+                "provider account decoded-byte ceiling is exhausted"
+            )
+        status = account_status
     reserve_provider_request_cursor(cursor, coordinated)
     return ProviderBudgetAdmission(
         coordinated.request_id,

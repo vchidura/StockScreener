@@ -432,6 +432,19 @@ def advanced_realtime_session_authorization_payload(
                 "decoded_byte_ceiling": (
                     provider.budget.decoded_byte_ceiling
                 ),
+                **(
+                    {}
+                    if provider.budget.account_request_ceiling is None
+                    else {
+                        "account_request_ceiling": (
+                            provider.budget.account_request_ceiling
+                        ),
+                        "account_decoded_byte_ceiling": (
+                            provider.budget
+                            .account_decoded_byte_ceiling
+                        ),
+                    }
+                ),
                 "lanes": sorted(
                     lane.value for lane in provider.budget.lanes
                 ),
@@ -544,6 +557,12 @@ def advanced_realtime_session_authorization_from_payload(
             str(budget["authorized_until"])
         ),
         policy_version=str(budget["policy_version"]),
+        account_request_ceiling=budget.get(
+            "account_request_ceiling"
+        ),
+        account_decoded_byte_ceiling=budget.get(
+            "account_decoded_byte_ceiling"
+        ),
     )
     provider_contract = AdvancedSessionProviderContract(
         budget=provider_scope,

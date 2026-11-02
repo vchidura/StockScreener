@@ -15,6 +15,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from realtime.advanced_options_p8_selection_source import (  # noqa: E402
+    SEALED_CAPTURE_EXACT_FOUR_PROFILE,
     p8_activity_selection_capture_from_sealed,
 )
 from realtime.contracts import canonical_sha256  # noqa: E402
@@ -63,7 +64,13 @@ def execute(args):
         or canonical_sha256(document) != semantic_sha256
     ):
         raise ValueError("sealed capture semantic identity changed")
-    capture = p8_activity_selection_capture_from_sealed(value)
+    capture = p8_activity_selection_capture_from_sealed(
+        value,
+        compatibility_profile=str(
+            value.get("compatibility_profile")
+            or SEALED_CAPTURE_EXACT_FOUR_PROFILE
+        ),
+    )
     report = {
         "schema": "advanced-options-v3-local-capture-replay-v1",
         "status": "PASS",

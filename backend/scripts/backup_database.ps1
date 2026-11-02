@@ -1,5 +1,6 @@
 param(
     [string]$Version = "v4",
+    [string]$Database,
     [ValidateSet("Full", "SchemaOnly", "MarketSchema")]
     [string]$Mode = "Full",
     [ValidateSet("gzip", "zstd")]
@@ -33,7 +34,31 @@ Get-Content $envFile | ForEach-Object {
     }
 }
 
-foreach ($name in @("DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME")) {
+foreach ($name in @("DB_HOST", "DB_PORT")) {
+    if (-not $settings.ContainsKey($name) -or -not $settings[$name]) {
+        throw "Missing $name in $envFile"
+    }
+}
+$databaseName = if ($Database) {
+    $Database
+} elseif ($settings.ContainsKey("DB_NAME") -and $settings["DB_NAME"]) {
+    $settings["DB_NAME"]
+} else {
+    throw "Missing -Database or DB_NAME in $envFile"
+}
+$userKey = if ($settings.ContainsKey("DB_USER") -and $settings["DB_USER"]) {
+    "DB_USER"
+} else {
+    "POSTGRES_ADMIN_USER"
+}
+$passwordKey = if (
+    $settings.ContainsKey("DB_PASSWORD") -and $settings["DB_PASSWORD"]
+) {
+    "DB_PASSWORD"
+} else {
+    "POSTGRES_ADMIN_PASSWORD"
+}
+foreach ($name in @($userKey, $passwordKey)) {
     if (-not $settings.ContainsKey($name) -or -not $settings[$name]) {
         throw "Missing $name in $envFile"
     }
@@ -87,15 +112,15 @@ if (Test-Path $backup) {
 }
 Remove-Item $partial -Force -ErrorAction SilentlyContinue
 
-$env:PGPASSWORD = $settings["DB_PASSWORD"]
-$settings.Remove("DB_PASSWORD")
+$env:PGPASSWORD = $settings[$passwordKey]
+$settings.Remove($passwordKey)
 try {
     $compressionOption = "${Compression}:level=${CompressionLevel}"
     $dumpArgs = @(
         "--host=$($settings["DB_HOST"])",
         "--port=$($settings["DB_PORT"])",
-        "--username=$($settings["DB_USER"])",
-        "--dbname=$($settings["DB_NAME"])",
+        "--username=$($settings[$userKey])",
+        "--dbname=$databaseName",
         "--format=custom",
         "--compress=$compressionOption",
         "--no-owner",

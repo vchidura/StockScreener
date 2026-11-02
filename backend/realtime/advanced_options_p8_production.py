@@ -793,6 +793,21 @@ def _production_binding_payload(
                     control.provider_budget.authorized_until.isoformat()
                 ),
                 "policy_version": control.provider_budget.policy_version,
+                **(
+                    {}
+                    if control.provider_budget.account_request_ceiling
+                    is None
+                    else {
+                        "account_request_ceiling": (
+                            control.provider_budget
+                            .account_request_ceiling
+                        ),
+                        "account_decoded_byte_ceiling": (
+                            control.provider_budget
+                            .account_decoded_byte_ceiling
+                        ),
+                    }
+                ),
             },
             "journal_generation": str(
                 control.source_flow.journal_generation
@@ -1015,6 +1030,12 @@ def p8_production_binding_from_payload(value):
                 provider_value["authorized_until"]
             ),
             policy_version=provider_value["policy_version"],
+            account_request_ceiling=provider_value.get(
+                "account_request_ceiling"
+            ),
+            account_decoded_byte_ceiling=provider_value.get(
+                "account_decoded_byte_ceiling"
+            ),
         ),
         owners=AdvancedOptionsOwnerNames(),
         journal_generation=UUID(control_value["journal_generation"]),

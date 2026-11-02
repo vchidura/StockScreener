@@ -37,6 +37,7 @@ from .acquisition_ledger import (
 from .contracts import canonical_sha256
 from .database_access_v2 import APP_ROLE, V2ConnectionProvider
 from .provider_budget import (
+    ProviderBudgetExceeded,
     ProviderBudgetScope,
     reserve_coordinated_provider_request_cursor,
 )
@@ -50,6 +51,8 @@ OPTIONS_PREPARATION_STAGES = (
     ("CAPACITY_SHARDS", 40),
     ("SESSION_ACTIVATION", 50),
 )
+OPTIONS_REFRESH_INITIAL_BACKOFF_SECONDS = 30
+OPTIONS_REFRESH_MAXIMUM_BACKOFF_SECONDS = 300
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +195,29 @@ class AdvancedOptionsPreparationRetryable(RuntimeError):
     pass
 
 
+class AdvancedOptionsPreparationRefreshRequired(RuntimeError):
+    def __init__(
+        self,
+        reason_code: str,
+        affected_underlyings: tuple[str, ...],
+    ) -> None:
+        reason = reason_code.strip().upper()
+        underlyings = tuple(sorted({
+            ticker.strip().upper()
+            for ticker in affected_underlyings
+            if ticker.strip()
+        }))
+        if not reason or not underlyings:
+            raise ValueError(
+                "Options preparation refresh request is invalid"
+            )
+        self.reason_code = reason
+        self.affected_underlyings = underlyings
+        super().__init__(
+            f"{reason}: {','.join(underlyings)}"
+        )
+
+
 class AdvancedOptionsPreparationTerminal(ValueError):
     pass
 
@@ -273,7 +299,16 @@ def _upsert_session(
     cohort_id: UUID | None = None,
     session_binding_id: UUID | None = None,
     last_error: str | None = None,
+    next_retry_at: datetime | None = None,
 ) -> None:
+    retry_at = (
+        _next_retry(checked_at)
+        if next_retry_at is None
+        else _utc(
+            next_retry_at,
+            "Options preparation session next_retry_at",
+        )
+    )
     cursor.execute(
         "INSERT INTO rt.advanced_options_preparation_sessions ("
         "revision_id,session_date,desired_snapshot_sha256,"
@@ -299,7 +334,7 @@ def _upsert_session(
             status,
             current_stage,
             list(option_underlyings),
-            _next_retry(checked_at),
+            retry_at,
             checked_at,
             (
                 None
@@ -377,6 +412,7 @@ def claim_advanced_options_preparation_cursor(
         "JOIN rt.advanced_options_preparation_sessions AS session "
         "USING(revision_id) "
         "WHERE work.next_retry_at<=%s "
+        "AND session.expiration_state IS NULL "
         "AND (work.status IN ('PENDING','RETRY') "
         "OR (work.status='RUNNING' AND work.lease_until<=%s)) "
         "AND (work.stage<>'SESSION_ACTIVATION' "
@@ -399,7 +435,7 @@ def claim_advanced_options_preparation_cursor(
         "status='RUNNING',attempts=work.attempts+1,"
         "lease_owner=%s,lease_epoch=work.lease_epoch+1,"
         "lease_until=%s,next_retry_at=%s,"
-        "blocked_reason=NULL,terminal_reason=NULL,"
+        "blocked_reason=NULL,terminal_reason=NULL,retry_reason=NULL,"
         "updated_at=clock_timestamp() "
         "FROM candidate,rt.advanced_options_preparation_sessions AS session,"
         "rt.realtime_desired_revisions AS revision "
@@ -570,6 +606,22 @@ def complete_advanced_options_preparation_cursor(
         "session_binding_id": result.session_binding_id,
     }
     evidence_sha256 = canonical_sha256(evidence_document)
+    evidence_parameters = (
+        str(claim.revision_id),
+        str(claim.intent_id),
+        claim.stage,
+        claim.attempt,
+        str(claim.owner_id),
+        claim.owner_epoch,
+        Json(claim.watermark),
+        Json(result.watermark),
+        Json(result.evidence),
+        evidence_sha256,
+        [str(value) for value in provider_request_ids],
+        len(provider_request_ids),
+        sum(row.response_bytes for row in result.provider_results),
+        completed,
+    )
     cursor.execute(
         "INSERT INTO rt.advanced_options_preparation_evidence ("
         "revision_id,intent_id,stage,attempt,owner_id,owner_epoch,"
@@ -579,31 +631,29 @@ def complete_advanced_options_preparation_cursor(
         ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
         "%s::uuid[],%s,%s,%s) "
         "ON CONFLICT (revision_id,intent_id,stage) DO NOTHING",
+        evidence_parameters,
+    )
+    cursor.execute(
+        "INSERT INTO rt.advanced_options_preparation_evidence_history ("
+        "revision_id,intent_id,stage,attempt,owner_id,owner_epoch,"
+        "watermark_before,watermark_after,evidence,evidence_sha256,"
+        "provider_request_ids,provider_request_count,response_bytes,"
+        "completed_at"
+        ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+        "%s::uuid[],%s,%s,%s) "
+        "ON CONFLICT (revision_id,intent_id,stage,attempt) DO NOTHING",
+        evidence_parameters,
+    )
+    cursor.execute(
+        "SELECT evidence_sha256 FROM "
+        "rt.advanced_options_preparation_evidence_history "
+        "WHERE revision_id=%s AND intent_id=%s AND stage=%s "
+        "AND attempt=%s",
         (
             str(claim.revision_id),
             str(claim.intent_id),
             claim.stage,
             claim.attempt,
-            str(claim.owner_id),
-            claim.owner_epoch,
-            Json(claim.watermark),
-            Json(result.watermark),
-            Json(result.evidence),
-            evidence_sha256,
-            [str(value) for value in provider_request_ids],
-            len(provider_request_ids),
-            sum(row.response_bytes for row in result.provider_results),
-            completed,
-        ),
-    )
-    cursor.execute(
-        "SELECT evidence_sha256 FROM "
-        "rt.advanced_options_preparation_evidence "
-        "WHERE revision_id=%s AND intent_id=%s AND stage=%s",
-        (
-            str(claim.revision_id),
-            str(claim.intent_id),
-            claim.stage,
         ),
     )
     stored = cursor.fetchone()
@@ -619,7 +669,7 @@ def complete_advanced_options_preparation_cursor(
         "lease_owner=NULL,lease_until=NULL,"
         "failure_streak=0,next_retry_at=%s,"
         "completed_at=%s,blocked_reason=NULL,terminal_reason=NULL,"
-        "updated_at=clock_timestamp() "
+        "retry_reason=NULL,updated_at=clock_timestamp() "
         "WHERE revision_id=%s AND intent_id=%s AND stage=%s "
         "AND status='RUNNING' AND lease_owner=%s AND lease_epoch=%s "
         "AND lease_until>%s",
@@ -687,7 +737,7 @@ def fail_advanced_options_preparation_cursor(
         "UPDATE rt.advanced_options_preparation_work SET "
         "status=%s,failure_streak=failure_streak+1,"
         "next_retry_at=%s,lease_owner=NULL,lease_until=NULL,"
-        "terminal_reason=%s,blocked_reason=NULL,"
+        "terminal_reason=%s,blocked_reason=NULL,retry_reason=%s,"
         "completed_at=%s,updated_at=clock_timestamp() "
         "WHERE revision_id=%s AND intent_id=%s AND stage=%s "
         "AND status='RUNNING' AND lease_owner=%s AND lease_epoch=%s",
@@ -695,6 +745,7 @@ def fail_advanced_options_preparation_cursor(
             status,
             failed + timedelta(seconds=delay),
             None if retryable else normalized,
+            normalized if retryable else None,
             None if retryable else failed,
             str(claim.revision_id),
             str(claim.intent_id),
@@ -705,6 +756,328 @@ def fail_advanced_options_preparation_cursor(
     )
     if cursor.rowcount != 1:
         raise ValueError("Options preparation failure lost its fence")
+
+
+def advanced_options_preparation_retry_schedule(
+    *,
+    session_date: date,
+    requested_at: datetime,
+    attempt: int,
+    calendar: OptionExchangeCalendar | None = None,
+) -> tuple[datetime, int]:
+    requested = _utc(
+        requested_at,
+        "Options preparation retry requested_at",
+    )
+    if type(attempt) is not int or attempt < 1:
+        raise ValueError("Options preparation retry attempt is invalid")
+    exchange = calendar or OptionExchangeCalendar("XNYS")
+    session_open = exchange.session_open(session_date)
+    backoff_seconds = min(
+        OPTIONS_REFRESH_MAXIMUM_BACKOFF_SECONDS,
+        OPTIONS_REFRESH_INITIAL_BACKOFF_SECONDS
+        * (2 ** min(attempt - 1, 4)),
+    )
+    retry_at = max(
+        session_open,
+        requested + timedelta(seconds=backoff_seconds),
+    )
+    return retry_at, backoff_seconds
+
+
+def request_advanced_options_preparation_refresh_cursor(
+    cursor,
+    claim: AdvancedOptionsPreparationClaim,
+    *,
+    affected_underlyings: tuple[str, ...],
+    requested_at: datetime,
+    reason_code: str,
+) -> bool:
+    requested = _utc(
+        requested_at,
+        "Options preparation refresh requested_at",
+    )
+    underlyings = tuple(sorted({
+        ticker.strip().upper()
+        for ticker in affected_underlyings
+        if ticker.strip()
+    }))
+    reason = reason_code.strip().upper()[:160]
+    if (
+        claim.stage != "CAPACITY_SHARDS"
+        or not underlyings
+        or not set(underlyings).issubset(claim.option_underlyings)
+        or not reason
+    ):
+        raise ValueError("Options preparation refresh scope is invalid")
+    cursor.execute(
+        "SELECT activated_session_binding_id FROM "
+        "rt.advanced_options_preparation_sessions "
+        "WHERE revision_id=%s FOR UPDATE",
+        (str(claim.revision_id),),
+    )
+    session = cursor.fetchone()
+    if session is None:
+        raise ValueError("Options preparation refresh session is missing")
+    cursor.execute(
+        "SELECT count(*) FROM rt.advanced_options_preparation_work "
+        "WHERE revision_id=%s AND stage='CAPACITY_SHARDS' "
+        "AND status='COMPLETE'",
+        (str(claim.revision_id),),
+    )
+    frozen = cursor.fetchone()
+    if session[0] is not None or frozen is None or int(frozen[0]) > 0:
+        return False
+    cursor.execute(
+        "SELECT 1 FROM rt.advanced_options_preparation_work "
+        "WHERE revision_id=%s AND intent_id=%s AND stage=%s "
+        "AND status='RUNNING' AND lease_owner=%s AND lease_epoch=%s "
+        "FOR UPDATE",
+        (
+            str(claim.revision_id),
+            str(claim.intent_id),
+            claim.stage,
+            str(claim.owner_id),
+            claim.owner_epoch,
+        ),
+    )
+    if cursor.fetchone() is None:
+        raise ValueError("Options preparation refresh lost its fence")
+    retry_at, backoff_seconds = (
+        advanced_options_preparation_retry_schedule(
+            session_date=claim.session_date,
+            requested_at=requested,
+            attempt=claim.attempt,
+        )
+    )
+    request_id = uuid5(
+        NAMESPACE_URL,
+        "stockscreener:advanced-options-preparation-refresh:"
+        f"{claim.revision_id}:{claim.intent_id}:{claim.attempt}",
+    )
+    request_document = {
+        "version": "advanced-options-preparation-refresh-v1",
+        "request_id": str(request_id),
+        "revision_id": str(claim.revision_id),
+        "source_intent_id": str(claim.intent_id),
+        "source_stage": claim.stage,
+        "source_attempt": claim.attempt,
+        "affected_underlyings": list(underlyings),
+        "reason_code": reason,
+        "requested_at": requested.isoformat(),
+        "retry_at": retry_at.isoformat(),
+        "backoff_seconds": backoff_seconds,
+        "source_watermark": claim.watermark,
+        "source_evidence": claim.prior_evidence,
+    }
+    cursor.execute(
+        "INSERT INTO rt.advanced_options_preparation_refresh_requests ("
+        "request_id,revision_id,source_intent_id,source_stage,"
+        "source_attempt,affected_underlyings,reason_code,"
+        "request_document,request_sha256,requested_at,retry_at,"
+        "backoff_seconds"
+        ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (revision_id,source_intent_id,source_attempt) "
+        "DO NOTHING",
+        (
+            str(request_id),
+            str(claim.revision_id),
+            str(claim.intent_id),
+            claim.stage,
+            claim.attempt,
+            list(underlyings),
+            reason,
+            Json(request_document),
+            canonical_sha256(request_document),
+            requested,
+            retry_at,
+            backoff_seconds,
+        ),
+    )
+    cursor.execute(
+        "UPDATE rt.advanced_options_preparation_work SET "
+        "status='RETRY',watermark='{}'::jsonb,evidence='{}'::jsonb,"
+        "next_retry_at=%s,lease_owner=NULL,lease_until=NULL,"
+        "completed_at=NULL,terminal_reason=NULL,blocked_reason=NULL,"
+        "retry_reason=%s,"
+        "updated_at=clock_timestamp() "
+        "WHERE revision_id=%s AND ("
+        "(ticker=ANY(%s) AND stage IN ('CATALOG_QUOTE','REFERENCE_OI')) "
+        "OR stage='CAPACITY_SHARDS')",
+        (
+            retry_at,
+            reason,
+            str(claim.revision_id),
+            list(underlyings),
+        ),
+    )
+    cursor.execute(
+        "UPDATE rt.advanced_options_preparation_sessions SET "
+        "status='PREPARING',current_stage='CATALOG_QUOTE',"
+        "next_retry_at=%s,checked_at=%s,last_error=%s,"
+        "updated_at=clock_timestamp() WHERE revision_id=%s",
+        (
+            retry_at,
+            requested,
+            reason,
+            str(claim.revision_id),
+        ),
+    )
+    return True
+
+
+def wait_advanced_options_preparation_budget_cursor(
+    cursor,
+    claim: AdvancedOptionsPreparationClaim,
+    *,
+    retry_at: datetime,
+    checked_at: datetime,
+    reason: str,
+) -> None:
+    checked = _utc(
+        checked_at,
+        "Options preparation budget checked_at",
+    )
+    retry = _utc(
+        retry_at,
+        "Options preparation budget retry_at",
+    )
+    normalized = reason.strip().upper()[:160]
+    if retry <= checked or not normalized:
+        raise ValueError("Options preparation budget wait is invalid")
+    cursor.execute(
+        "UPDATE rt.advanced_options_preparation_work SET "
+        "status='RETRY',failure_streak=failure_streak+1,"
+        "next_retry_at=%s,lease_owner=NULL,lease_until=NULL,"
+        "terminal_reason=NULL,blocked_reason=NULL,completed_at=NULL,"
+        "retry_reason=%s,"
+        "updated_at=clock_timestamp() "
+        "WHERE revision_id=%s AND intent_id=%s AND stage=%s "
+        "AND status='RUNNING' AND lease_owner=%s AND lease_epoch=%s",
+        (
+            retry,
+            normalized,
+            str(claim.revision_id),
+            str(claim.intent_id),
+            claim.stage,
+            str(claim.owner_id),
+            claim.owner_epoch,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("Options preparation budget wait lost its fence")
+    cursor.execute(
+        "UPDATE rt.advanced_options_preparation_sessions SET "
+        "status='DEGRADED',current_stage=%s,next_retry_at=%s,"
+        "checked_at=%s,last_error=%s,updated_at=clock_timestamp() "
+        "WHERE revision_id=%s",
+        (
+            claim.stage,
+            retry,
+            checked,
+            normalized,
+            str(claim.revision_id),
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("Options preparation budget session is missing")
+
+
+def expire_obsolete_advanced_options_preparation_cursor(
+    cursor,
+    *,
+    checked_at: datetime,
+    calendar: OptionExchangeCalendar | None = None,
+) -> tuple[dict[str, object], ...]:
+    checked = _utc(
+        checked_at,
+        "Options preparation expiration checked_at",
+    )
+    exchange = calendar or OptionExchangeCalendar("XNYS")
+    cursor.execute(
+        "SELECT session.revision_id::text,session.session_date,"
+        "(SELECT max(newest.session_date) FROM "
+        "rt.advanced_options_preparation_sessions AS newest "
+        "WHERE newest.expiration_state IS NULL) "
+        "FROM rt.advanced_options_preparation_sessions AS session "
+        "WHERE session.activated_session_binding_id IS NULL "
+        "AND session.expiration_state IS NULL "
+        "AND EXISTS ("
+        "SELECT 1 FROM rt.advanced_options_preparation_work AS work "
+        "WHERE work.revision_id=session.revision_id "
+        "AND work.status IN ('PENDING','RUNNING','RETRY')) "
+        "ORDER BY session.session_date,session.revision_id "
+        "FOR UPDATE OF session"
+    )
+    candidates = tuple(cursor.fetchall())
+    expired = []
+    for revision_id, session_date, newest_session_date in candidates:
+        expires_at = (
+            exchange.session_close(session_date)
+            + timedelta(minutes=5)
+        )
+        expiration_state = (
+            "SUPERSEDED"
+            if newest_session_date is not None
+            and session_date < newest_session_date
+            else "EXPIRED"
+            if checked >= expires_at
+            else None
+        )
+        if expiration_state is None:
+            continue
+        reason = (
+            f"{expiration_state}_OPTIONS_PREPARATION:"
+            f"{session_date.isoformat()}"
+        )
+        cursor.execute(
+            "UPDATE rt.advanced_options_preparation_work SET "
+            "status='BLOCKED',lease_owner=NULL,lease_until=NULL,"
+            "retry_reason=NULL,terminal_reason=NULL,"
+            "blocked_reason=%s,completed_at=%s,"
+            "expiration_state=%s,expired_at=%s,"
+            "expiration_reason=%s,updated_at=clock_timestamp() "
+            "WHERE revision_id=%s "
+            "AND status IN ('PENDING','RUNNING','RETRY')",
+            (
+                expiration_state,
+                checked,
+                expiration_state,
+                checked,
+                reason,
+                revision_id,
+            ),
+        )
+        expired_work_count = cursor.rowcount
+        cursor.execute(
+            "UPDATE rt.advanced_options_preparation_sessions SET "
+            "status='DEGRADED',next_retry_at=%s,checked_at=%s,"
+            "last_error=%s,expiration_state=%s,expired_at=%s,"
+            "expiration_reason=%s,updated_at=clock_timestamp() "
+            "WHERE revision_id=%s "
+            "AND activated_session_binding_id IS NULL "
+            "AND expiration_state IS NULL",
+            (
+                checked,
+                checked,
+                reason,
+                expiration_state,
+                checked,
+                reason,
+                revision_id,
+            ),
+        )
+        if cursor.rowcount != 1 or expired_work_count <= 0:
+            raise ValueError(
+                "Options preparation expiration lost its scope"
+            )
+        expired.append({
+            "revision_id": revision_id,
+            "session_date": session_date.isoformat(),
+            "expiration_state": expiration_state,
+            "expired_work_count": expired_work_count,
+        })
+    return tuple(expired)
 
 
 def _reserve_stage_provider_budget(
@@ -754,12 +1127,20 @@ def run_advanced_options_preparation_cycle(
     checked_at: datetime,
     lease_seconds: int = 60,
     clock=lambda: datetime.now(UTC),
+    calendar: OptionExchangeCalendar | None = None,
 ) -> dict[str, object]:
     checked = _utc(checked_at, "Options preparation cycle checked_at")
     with provider.transaction(
         APP_ROLE,
         isolation_level="SERIALIZABLE",
     ) as unit:
+        expired_sessions = (
+            expire_obsolete_advanced_options_preparation_cursor(
+                unit.cursor,
+                checked_at=checked,
+                calendar=calendar,
+            )
+        )
         mark_stale_provider_requests_ambiguous_cursor(
             unit.cursor,
             reserved_before=(
@@ -777,18 +1158,8 @@ def run_advanced_options_preparation_cycle(
             "status": "IDLE",
             "checked_at_utc": checked.isoformat(),
             "provider_requests": 0,
+            "expired_sessions": list(expired_sessions),
         }
-    budget = executor.provider_budget(claim)
-    with provider.transaction(
-        APP_ROLE,
-        isolation_level="SERIALIZABLE",
-    ) as unit:
-        provider_request_ids = _reserve_stage_provider_budget(
-            unit.cursor,
-            claim,
-            budget,
-            checked_at=checked,
-        )
     heartbeat = _PreparationClaimHeartbeat(
         provider,
         claim,
@@ -796,11 +1167,61 @@ def run_advanced_options_preparation_cycle(
         clock=clock,
     )
     heartbeat.start()
+    provider_request_ids: tuple[UUID, ...] = ()
+    budget: AdvancedOptionsStageProviderBudget | None = None
     try:
+        budget = executor.provider_budget(claim)
+        with provider.transaction(
+            APP_ROLE,
+            isolation_level="SERIALIZABLE",
+        ) as unit:
+            provider_request_ids = _reserve_stage_provider_budget(
+                unit.cursor,
+                claim,
+                budget,
+                checked_at=checked,
+            )
         result = executor.execute(
             claim,
             provider_request_ids=provider_request_ids,
         )
+    except ProviderBudgetExceeded as error:
+        heartbeat.close()
+        if heartbeat.lost:
+            raise RuntimeError(
+                "Options preparation fence was lost"
+            ) from error
+        retry_at, _backoff_seconds = (
+            advanced_options_preparation_retry_schedule(
+                session_date=claim.session_date,
+                requested_at=checked,
+                attempt=claim.attempt,
+            )
+        )
+        if budget is not None:
+            retry_at = max(
+                retry_at,
+                budget.scope.authorized_until,
+            )
+        with provider.transaction(
+            APP_ROLE,
+            isolation_level="SERIALIZABLE",
+        ) as unit:
+            wait_advanced_options_preparation_budget_cursor(
+                unit.cursor,
+                claim,
+                retry_at=retry_at,
+                checked_at=checked,
+                reason="PROVIDER_BUDGET_EXHAUSTED",
+            )
+        return {
+            "status": "WAITING_BUDGET",
+            "stage": claim.stage,
+            "ticker": claim.ticker,
+            "reason": str(error),
+            "retry_at_utc": retry_at.isoformat(),
+            "provider_requests": 0,
+        }
     except AdvancedOptionsPreparationTerminal as error:
         heartbeat.close()
         if heartbeat.lost:
@@ -843,6 +1264,58 @@ def run_advanced_options_preparation_cycle(
             "stage": claim.stage,
             "ticker": claim.ticker,
             "reason": str(error),
+            "provider_requests": len(provider_request_ids),
+        }
+    except AdvancedOptionsPreparationRefreshRequired as error:
+        heartbeat.close()
+        if heartbeat.lost:
+            raise RuntimeError(
+                "Options preparation fence was lost"
+            ) from error
+        with provider.transaction(
+            APP_ROLE,
+            isolation_level="SERIALIZABLE",
+        ) as unit:
+            refreshed = request_advanced_options_preparation_refresh_cursor(
+                unit.cursor,
+                claim,
+                affected_underlyings=error.affected_underlyings,
+                requested_at=checked,
+                reason_code=error.reason_code,
+            )
+            if not refreshed:
+                fail_advanced_options_preparation_cursor(
+                    unit.cursor,
+                    claim,
+                    failed_at=checked,
+                    reason="ALLOCATION_ALREADY_FROZEN",
+                    retryable=False,
+                    provider_request_ids=provider_request_ids,
+                )
+        retry_at, _backoff_seconds = (
+            advanced_options_preparation_retry_schedule(
+                session_date=claim.session_date,
+                requested_at=checked,
+                attempt=claim.attempt,
+            )
+        )
+        return {
+            "status": (
+                "REFRESH_REQUIRED" if refreshed else "FAILED"
+            ),
+            "stage": claim.stage,
+            "ticker": claim.ticker,
+            "reason": (
+                str(error)
+                if refreshed
+                else "ALLOCATION_ALREADY_FROZEN"
+            ),
+            "affected_underlyings": list(
+                error.affected_underlyings
+            ),
+            "retry_at_utc": (
+                retry_at.isoformat() if refreshed else None
+            ),
             "provider_requests": len(provider_request_ids),
         }
     except Exception as error:
@@ -927,6 +1400,28 @@ def reconcile_advanced_options_lifecycle_cursor(
     ))
     if not underlyings:
         return None
+    cursor.execute(
+        "SELECT expiration_state,current_stage,expiration_reason "
+        "FROM rt.advanced_options_preparation_sessions "
+        "WHERE revision_id=%s AND expiration_state IS NOT NULL",
+        (str(revision.revision_id),),
+    )
+    expired_session = cursor.fetchone()
+    if expired_session is not None:
+        return AdvancedOptionsLifecycleStatus(
+            revision.revision_id,
+            target_session_date,
+            str(expired_session[0]),
+            str(expired_session[1]),
+            underlyings,
+            None,
+            None,
+            None,
+            (
+                f"{expired_session[0]}:"
+                f"{expired_session[2]}",
+            ),
+        )
     preparations = load_desired_member_preparations_cursor(
         cursor,
         revision.revision_id,
@@ -1043,7 +1538,8 @@ def reconcile_advanced_options_lifecycle_cursor(
         checked_at=checked,
     )
     cursor.execute(
-        "SELECT stage,status FROM rt.advanced_options_preparation_work "
+        "SELECT stage,status,retry_reason,next_retry_at "
+        "FROM rt.advanced_options_preparation_work "
         "WHERE revision_id=%s "
         "ORDER BY stage_order,ticker",
         (str(revision.revision_id),),
@@ -1098,6 +1594,23 @@ def reconcile_advanced_options_lifecycle_cursor(
     failed = tuple(
         str(row[0]) for row in work if str(row[1]) == "FAILED"
     )
+    budget_wait = next(
+        (
+            (str(row[0]), str(row[2]), row[3])
+            for row in work
+            if str(row[1]) == "RETRY"
+            and row[2] == "PROVIDER_BUDGET_EXHAUSTED"
+        ),
+        None,
+    )
+    scheduled_retry_at = min(
+        (
+            row[3]
+            for row in work
+            if str(row[1]) == "RETRY"
+        ),
+        default=None,
+    )
     pending = next(
         (
             str(row[0])
@@ -1113,7 +1626,7 @@ def reconcile_advanced_options_lifecycle_cursor(
     )
     status = (
         "DEGRADED"
-        if failed
+        if failed or budget_wait is not None
         else "WAITING_DESIRED"
         if waiting_snapshot
         else "READY"
@@ -1133,16 +1646,22 @@ def reconcile_advanced_options_lifecycle_cursor(
             None if snapshot is None else snapshot.snapshot_sha256
         ),
         cohort_id=None if snapshot is None else snapshot.cohort_id,
+        next_retry_at=scheduled_retry_at,
         last_error=(
             (
                 snapshot_refresh_error
                 or "effective desired snapshot is not READY"
             )
             if waiting_snapshot
-            else None
-            if not failed
             else "failed Options preparation stages: "
             + ",".join(sorted(set(failed)))
+            if failed
+            else (
+                f"{budget_wait[1]}:{budget_wait[0]}:"
+                f"{budget_wait[2].isoformat()}"
+                if budget_wait is not None
+                else None
+            )
         ),
     )
     return AdvancedOptionsLifecycleStatus(
@@ -1157,6 +1676,10 @@ def reconcile_advanced_options_lifecycle_cursor(
         (
             ("DESIRED_SNAPSHOT_NOT_READY",)
             if waiting_snapshot
+            else (
+                f"WAITING_PROVIDER_BUDGET:{budget_wait[0]}",
+            )
+            if budget_wait is not None
             else tuple(f"FAILED_STAGE:{stage}" for stage in failed)
         ),
     )

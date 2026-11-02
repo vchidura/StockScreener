@@ -1626,17 +1626,6 @@ Evaluate the exact product cohorts as separate FDR families:
 
 ## Production Compose
 
-Set the production values documented in
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md), then run:
-
-```powershell
-docker compose --env-file backend/.env --profile equity up -d --build
-docker compose --env-file backend/.env ps
-```
-
-The `equity` profile starts both canonical workers. Do not enable the
-`equity-stream` profile.
-
 Advanced Realtime V3 has one normal native launcher and one consolidated
 Compose profile. Both derive the XNYS session, desired snapshot, cohorts,
 Options session state, bindings and publication work from PostgreSQL; neither
@@ -1673,6 +1662,27 @@ XNYS rollover. The retained
 `realtime-v2-options-p8` and daily/manual activation paths are diagnostics only;
 do not run them beside the consolidated topology.
 
+The Options lifecycle freezes one canonical C6 allocation before activation.
+Post-open observations update consumer readiness only; they do not change the
+subscription. Missing OI remains explicit unavailable context and does not
+become zero or block unrelated capture. These cumulative session ceilings may
+be set in `backend/.env` or the process environment and are persisted in the
+session/acquisition binding:
+
+- `REALTIME_V3_OPTIONS_CONNECTION_ATTEMPT_CEILING`
+- `REALTIME_V3_OPTIONS_DECODED_MESSAGE_CEILING`
+- `REALTIME_V3_OPTIONS_DECODED_BYTE_CEILING`
+- `REALTIME_V3_OPTIONS_ACTIVE_QUOTE_CONTRACT_BUDGET`
+- `REALTIME_V3_OPTIONS_PER_UNDERLYING_CONTRACT_LIMIT`
+- `REALTIME_V3_OPTIONS_ESTABLISHED_MEASURED_CAPACITY`
+- `REALTIME_V3_OPTIONS_EFFECTIVE_PROVIDER_PROJECT_CEILING`
+
+The stream ceilings have finite engineering defaults. The allocation overrides
+are optional and feed the same native/Compose C6 allocator; when omitted, the
+pinned profile and B=min(8*N, configured/measured/provider ceilings) rules apply.
+Set deployment values from full-session account/provider measurements plus
+headroom; do not turn measurement into a daily startup qualification gate.
+
 See [deployment](docs/DEPLOYMENT.md) for the single status, graceful stop,
 backup, isolated restore verification and rollback workflow. Starting the
 provider-owning topology still requires the normal operational authorization;
@@ -1680,20 +1690,23 @@ documentation is not permission to call the provider or change a live database.
 
 ## Verification
 
-Run the storage validator after schema installation, ingestion, restoration, or
-worker recovery:
+Validate the current V2 schema and hardened security policy after migration or
+restore:
 
 ```powershell
-.\backend\.venv\Scripts\python.exe .\backend\scripts\validate_equity_storage.py
+.\backend\.venv\Scripts\python.exe -B `
+  .\backend\scripts\validate_realtime_v2_schema.py `
+  --database stocks_realtime_v2 `
+  --confirm-database-name stocks_realtime_v2 `
+  --security-mode hardened `
+  --validate-existing `
+  --execute
 ```
 
-Expected state includes:
-
-- Eight current interval cohorts with 386 members each.
-- Twenty fresh portal snapshot types.
-- No invalid bars, unresolved derived lineage, publication-count mismatch,
-  analysis evidence mismatch, or current projection/run mismatch.
-- No retired legacy price or scanner relations.
+The validator must report `VERIFIED`. This proves schema/security state, not
+market-data freshness or full product readiness. Use the stored-only V3 status
+report for current processing, future preparation, members, feeds, shards,
+publication and retention.
 
 Run regression checks:
 
@@ -1717,12 +1730,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
   .\backend\scripts\verify_database_backup.ps1 `
-  -BackupPath C:\Backups\StockScreener\stocks_db_backup_current.dump
+  -Database stocks_realtime_v2 `
+  -BackupPath C:\Backups\StockScreener\stocks_db_backup_current.dump `
+  -ValidationScope RealtimeV3
 ```
 
 Keep the previous known-good backup until the replacement database passes restore
-verification. The verifier must report both `CANONICAL_RESTORE_VALIDATED` and
-`RESTORE_VERIFIED`.
+verification. The verifier must report
+`ADVANCED_REALTIME_V3_RESTORE_VALIDATED` and `RESTORE_VERIFIED`. Retain the
+matching journal/report/retention volume snapshots; a database dump alone does
+not prove checkpoint-to-journal recoverability.
 
 ## Documentation
 

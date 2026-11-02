@@ -74,7 +74,11 @@ from realtime.migrations import (  # noqa: E402
     validate_target_database_v2,
 )
 from realtime.preflight import ProviderTier  # noqa: E402
-from realtime.provider_budget import ProviderBudgetScope  # noqa: E402
+from realtime.provider_budget import (  # noqa: E402
+    MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING,
+    MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING,
+    ProviderBudgetScope,
+)
 from realtime.stage_database_v2 import V2WorkerDatabase  # noqa: E402
 from realtime.stage_runners_ingest import (  # noqa: E402
     EquityAcquisitionRequest,
@@ -238,6 +242,16 @@ def _scope(args):
         expected_cost=args.expected_cost,
         request_ceiling=args.account_request_ceiling,
         decoded_byte_ceiling=args.account_decoded_byte_ceiling,
+        account_request_ceiling=(
+            MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING
+            if advanced
+            else None
+        ),
+        account_decoded_byte_ceiling=(
+            MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING
+            if advanced
+            else None
+        ),
         lanes=frozenset({
             ProviderRequestLane.EQUITY_HISTORY
             if advanced

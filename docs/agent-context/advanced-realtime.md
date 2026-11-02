@@ -1,6 +1,6 @@
 # Advanced Realtime V3 - Current Runtime Checkpoint
 
-Updated: 2026-11-01 UTC
+Updated: 2026-11-02 UTC
 
 ## Objective And Mode
 
@@ -12,8 +12,9 @@ Canonical design and assessment:
 
 Mode: C0/C1 committed at `eafe5f7`; C2 committed at `3754337`; reviewed C3
 committed at `d8fd82d`; reviewed C4 committed at `d78dcf2`; reviewed C5
-committed at `56cd1a9`; reviewed C6 committed at `b2ff055`; C7 implemented and
-validated in the current uncommitted package.
+committed at `56cd1a9`; reviewed C6 committed at `b2ff055`; C7 at `2c39ace`; C8 at
+`7d399cd`. Post-C8 corrections and migration 045 remain uncommitted. Current
+blockers: [Post-C8 Market-Readiness Corrections](#post-c8-market-readiness-corrections).
 
 ## Settled Runtime Decisions
 
@@ -523,6 +524,25 @@ hot paths perform no chain/calendar work or v2-v3 profile comparison.
   shards, physical feeds, publication, retention and non-null per-service
   native/Compose health. C7 retry directly covers pending, retry, expired,
   terminal and restart-idempotent work.
+- The market-readiness correction retains the profile-filtered candidate pool
+  but runs the canonical C6 allocator exactly once in the durable
+  `CAPACITY_SHARDS` authority row. C5 activation reloads that frozen capture and
+  allocation; no post-open allocator or detector-allocation migration exists,
+  and window H/E/O processing depends only on the resident barrier. Missing OI
+  is stored as explicit unavailable reference context, never zero, while
+  capture and unrelated products continue.
+- Equity preparation treats the default local `.env` as optional so the
+  Compose secret/environment path starts without `/app/.env`. Options
+  connection-attempt, decoded-message and decoded-byte session ceilings are
+  environment-configurable, frozen into the session/acquisition binding and
+  cumulative across restart. Defaults remain engineering starting values;
+  full-session measurement plus headroom is operational evidence, not a daily
+  qualification gate.
+- Isolated restore verification now covers V3 desired/session lifecycle,
+  journal/checkpoint bounds, selection/physical/shard membership, publication
+  pointers/work, read pins and service state in addition to canonical Equity
+  storage. Database verification still requires the separately retained
+  journal/report/retention volume snapshots before any provider owner starts.
 - Provider-blocked C8 selections: 147 passed with 5 existing warnings,
   including native `main()` fence setup/initial scheduling with an isolated
   launch failure. Affected provider-blocked C6 allocator/routing/session:
@@ -534,9 +554,140 @@ hot paths perform no chain/calendar work or v2-v3 profile comparison.
   exact-four retains `c6_exact_four_regression_v1`. Targeted compile passed.
   No provider/network, live database, Docker/service restart, publication,
   delivery, broker or trading effect ran.
+- Market-readiness correction provider-blocked C5-C8, schema, security,
+  live-024, startup and restore selection: 255 passed with 5 existing warnings.
+  It covers B<N, 12-per-name redistribution, one frozen allocation, schema-valid
+  activation, missing-OI activation, product-gate removal, environment-only
+  startup, configurable cumulative acquisition ceilings and V3 restore checks.
+  Final owned-disposable C5/C6/C8 and desired-state selection: 29 passed with
+  6 existing warnings, including generalized missing-OI activation and exact
+  allocation generation reload after restart.
+  No provider/network, live database or Docker/service effect ran.
+
+## Post-C8 Market-Readiness Corrections
+
+Status: **NOT CODE_READY for the recorded universe; NOT READY_FOR_SUPERVISED_RUN**
+(2026-11-02 review below supersedes the earlier code-level claim).
+
+### First-Run Readiness Review (2026-11-02)
+
+Evidence matrix, decisions and first-run plan:
+[ADVANCED_REALTIME_V3_FIRST_RUN_READINESS_2026-11-02.md](../ADVANCED_REALTIME_V3_FIRST_RUN_READINESS_2026-11-02.md).
+Earliest realistic first session: Tuesday 2026-11-03, after authorized fixes.
+
+Blockers, in execution order:
+
+- B1: the live ledger records `045_advanced_options_detector_allocation`, whose file
+  no longer exists; the tree's 045 differs. Planner, status and audit all fail.
+- B2: Equity `REFERENCE` fetches whole-market splits/dividends under a 3-request
+  chunk, so it can never complete (81 failed ledger rows; reproduced offline).
+- B3: `TECHNICAL_WARMUP` requires a sector, and SPY/QQQ/IWM have none, so the only
+  Options underlyings can never become READY.
+- B4: the 4-page discovery ceiling fails on QQQ/SPY (about 16-18 pages estimated).
+- B5: `extends` merges profiles, so the V3 Compose profile renders 23 services, not
+  19, and the documented render exits 1. Fix validated on a scratch copy.
+- B6: retention exits 2 on both paths (native lacks DSN files; Compose needs two
+  undocumented variables). Daily partitions end at `p20261105`.
+- B7: the frontend pins one build-time cohort, but cohorts change per session.
+- B8: no commit or image contains the current code.
+
+Decisions D1-D7 are open and are the user's to make. Results: focused 43 passed;
+broad provider-blocked 551 passed, 4 failed, 1 skipped; owned-disposable 67 passed,
+4 failed; C7 and drain additions 103 and 5 passed. Failures are classified in the
+readiness document: stale tests, except one unresolved reconciliation test outside
+the 19 roles. No provider, service, migration, publication or restore effect ran in
+this review.
+
+Stored state contradicts the "no live database effect" notes below: 043-045 were
+applied at 03:26-04:09 UTC on 2026-11-02, then one desired revision and 81 provider
+requests ran. Do not start provider-owning services until the blockers are fixed.
+
+### Earlier Post-C8 Corrections
+
+- Capture/date freshness is evaluated at the immutable capture/review clock.
+  Capture-fresh evidence still allocates after a delayed worker retry. Evidence
+  already quote-stale at capture time records one durable pre-freeze refresh
+  request, resets only affected catalog/reference work plus unfrozen capacity
+  work, preserves append-only attempt evidence and reserves provider budget
+  before refreshed I/O. Its persisted retry waits for target XNYS open and then
+  applies capped 30-300 second backoff. Restart resumes the transition without
+  spending closed-market budget. Completed allocation or activation refuses
+  refresh, so the frozen session membership never rotates.
+- Provider-budget exhaustion is caught after claim but before execution. The
+  reservation transaction rolls back, the work lease is released to durable
+  `RETRY` with `PROVIDER_BUDGET_EXHAUSTED`, and reconciliation preserves a
+  `DEGRADED` session plus exact retry time. No executor/provider I/O occurs and
+  no ceiling is bypassed.
+- Provider accounting now separates each scope allowance from one shared
+  `MASSIVE_ADVANCED` account ceiling. Options keeps `4*N*3` local requests;
+  Equity/Options/repair/scheduler scopes consistently persist and enforce the
+  reviewed 64,000-request/512-GiB account limits under the shared lock. The
+  helper fails closed if any Advanced caller omits account-wide enforcement;
+  an account-exhausted repair performs no insert and does not advance plan usage.
+- Before claim selection, unfinished preparation is persisted as `EXPIRED`
+  after target close plus five minutes or `SUPERSEDED` by a newer session.
+  Obsolete work becomes terminal `BLOCKED` with expiration metadata and cannot
+  starve new work; completed evidence and active session/drain state are kept.
+- Runtime lifecycle timing is centralized at 30 seconds drain, 5 seconds
+  finality and 300 seconds completion. At November 2 16:02 ET, status and the
+  scheduler both retain November 2 as `DRAINING`, while November 3 remains
+  separately visible as future preparation. Status rolls only after the exact
+  final processing deadline.
+- Sealed captures persist `GENERALIZED_C6` or `EXACT_FOUR_QQQ_SPY_V1` plus
+  configured underlyings. Generalized four-contract, sparse/one-sided and
+  missing-OI pools reach canonical C6; ticker names, count, sides and OI shape
+  never infer exact-four mode.
+- The lifecycle Compose service inherits the shared Advanced environment for
+  configured total, per-underlying, measured and provider/project allocation
+  ceilings plus finite cumulative stream ceilings. Native and Compose feed the
+  same executor inputs; no new secret or qualification gate was added.
+- Backup verification requires explicit `Legacy`, `RealtimeV3` or `Both` scope.
+  `RealtimeV3` omits legacy `public.*` counts and the legacy validator. The V3
+  validator covers desired/session/preparation history, journals and explicit
+  raw/normalized checkpoints, C6 selection/shards, C7 publication, retention,
+  migrations, roles and stale service status. Unknown checkpoint coordinates
+  fail; no `GREATEST(raw, normalized)` fallback remains.
+- Provider-blocked command:
+  `.\backend\.venv\Scripts\python.exe -B -m pytest -p backend.tests.realtime.offline_io_guard backend\tests\realtime\test_advanced_options_lifecycle.py backend\tests\realtime\test_advanced_options_p8_selection_source.py backend\tests\realtime\test_advanced_options_activity_momentum_c6.py backend\tests\realtime\test_realtime_v2_advanced_services.py backend\tests\realtime\test_advanced_options_schema_contract.py backend\tests\realtime\test_security_v2_roles.py backend\tests\realtime\test_equity_live024_compatibility.py backend\tests\realtime\test_check_scripts_against_v2_registry.py backend\tests\test_equity_storage_validation_scripts.py -q --tb=short --disable-warnings -p no:cacheprovider`
+  passed 169 tests with 5 existing warnings.
+- Owned-disposable command (with `STOCKS_V2_DB_TESTS=1`):
+  `.\backend\.venv\Scripts\python.exe -B -m pytest backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_real_executor_provider_free_end_to_end_with_retry backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_real_executor_uses_v2_allocation_for_generalized_membership backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_stale_capture_refresh_survives_restart_before_allocation_freeze backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_budget_exhaustion_persists_wait_and_releases_claim -q --tb=short --disable-warnings -p no:cacheprovider`
+  passed 4 tests with 6 existing warnings.
+- Follow-up P1 provider-blocked command:
+  `.\backend\.venv\Scripts\python.exe -B -m pytest -p backend.tests.realtime.offline_io_guard backend\tests\realtime\test_advanced_options_lifecycle.py backend\tests\realtime\test_advanced_options_schema_contract.py backend\tests\realtime\test_security_v2_roles.py backend\tests\realtime\test_equity_live024_compatibility.py backend\tests\realtime\test_check_scripts_against_v2_registry.py -q --tb=short --disable-warnings -p no:cacheprovider`
+  passed 75 tests with 5 existing warnings.
+- Dual-budget/expiration provider-blocked command:
+  `.\backend\.venv\Scripts\python.exe -B -m pytest -p backend.tests.realtime.offline_io_guard backend\tests\realtime\test_provider_budget.py backend\tests\realtime\test_advanced_options_lifecycle.py backend\tests\realtime\test_realtime_v2_advanced_services.py backend\tests\realtime\test_advanced_options_schema_contract.py backend\tests\realtime\test_security_v2_roles.py backend\tests\realtime\test_equity_live024_compatibility.py backend\tests\realtime\test_check_scripts_against_v2_registry.py backend\tests\realtime\test_realtime_v2_incremental_script.py backend\tests\realtime\test_advanced_intraday_repair.py backend\tests\realtime\test_advanced_gap_repair.py backend\tests\realtime\test_advanced_options_p8_canary_authorization.py backend\tests\realtime\test_advanced_realtime_session_scheduler.py -q --tb=short --disable-warnings -p no:cacheprovider`
+  passed 177 tests with 5 existing warnings. This includes the corrected
+  long-lived Compose restart contract (`unless-stopped`, never bounded
+  `on-failure`).
+- Final owned-disposable dual-budget/lifecycle command (with
+  `STOCKS_V2_DB_TESTS=1`):
+  `.\backend\.venv\Scripts\python.exe -B -m pytest backend\tests\realtime\test_provider_budget_v2_db.py backend\tests\realtime\test_advanced_ingress_plan_v2_db.py::test_incremental_repair_account_exhaustion_preserves_ledger_and_usage backend\tests\realtime\test_advanced_equity_preparation_v2_db.py::test_preparation_reservation_counts_concurrent_account_work backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_real_executor_provider_free_end_to_end_with_retry backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_real_executor_uses_v2_allocation_for_generalized_membership backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_stale_capture_refresh_survives_restart_before_allocation_freeze backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_budget_exhaustion_persists_wait_and_releases_claim backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_obsolete_unfinished_session_expires_once_and_is_not_reclaimed -q --tb=short --disable-warnings -p no:cacheprovider`
+  passed 10 tests with 5 existing warnings.
+- Final focused rerun:
+  `.\backend\.venv\Scripts\python.exe -B -m pytest -p backend.tests.realtime.offline_io_guard backend\tests\realtime\test_advanced_options_lifecycle.py backend\tests\realtime\test_advanced_options_p8_selection_source.py backend\tests\realtime\test_realtime_v2_advanced_services.py backend\tests\test_equity_storage_validation_scripts.py -q --tb=short --disable-warnings -p no:cacheprovider`
+  passed 60 tests with 5 existing warnings.
+- Compile command:
+  `.\backend\.venv\Scripts\python.exe -B -m py_compile backend\realtime\provider_budget.py backend\realtime\advanced_ingress_repository.py backend\realtime\advanced_gap_repair.py backend\realtime\advanced_realtime_v3_runtime.py backend\scripts\repair_realtime_v2_advanced_intraday.py backend\scripts\run_advanced_realtime_session_scheduler.py backend\scripts\run_realtime_v2_advanced_equity_scheduler.py backend\scripts\run_advanced_options_v3_lifecycle.py backend\scripts\report_advanced_realtime_v3_status.py`
+  passed. `git --no-pager diff --check` passed.
+- No provider/network, live database, Docker/service, publication, delivery,
+  broker or trading effect ran. C9 was not started.
+- `docs/DEPLOYMENT.md` is now a current-only V2/V3 deployment authority:
+  one native launcher, one `advanced-realtime-v3` Compose profile, V2
+  migration/security/credential lifecycle, desired-state preconditions,
+  status/drain, V3-scoped backup/restore, upgrade and non-legacy rollback.
+  Legacy deployment is explicitly unsupported here; code retirement remains
+  C9 after stability. README production commands and the V3 operations runbook
+  are aligned with that boundary.
+- Four authorized operational evidence items remain: full-session traffic and
+  reconnect measurement; deployment ceiling/headroom selection; isolated
+  database plus journal/report/retention-volume restore; and native/Compose
+  startup/drain smoke. None was performed here.
 
 ## Exact Anchors
 
+- `docs/ADVANCED_REALTIME_V3_FIRST_RUN_READINESS_2026-11-02.md`
 - `backend/realtime/advanced_equity_capability_refresh.py`
 - `backend/realtime/advanced_equity_lifecycle.py`
 - `backend/scripts/run_realtime_v2_advanced_capability_refresh.py`

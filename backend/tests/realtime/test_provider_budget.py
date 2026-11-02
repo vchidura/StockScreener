@@ -72,6 +72,22 @@ def test_scope_binds_authorization_and_exact_account_limits():
         )
 
 
+def test_scope_separates_local_allowance_from_shared_account_limit():
+    scope = _scope(
+        account_request_ceiling=10,
+        account_decoded_byte_ceiling=20_000,
+    )
+    bound = scope.bind(
+        _reservation(),
+        reserved_response_bytes=2_001,
+    )
+
+    assert scope.request_ceiling == 2
+    assert scope.effective_account_request_ceiling == 10
+    assert bound.account_request_ceiling == 10
+    assert bound.account_decoded_byte_ceiling == 20_000
+
+
 def test_admission_reserves_under_account_lock_and_returns_updated_status():
     cursor = MagicMock()
     reservation = _reservation()
@@ -175,7 +191,18 @@ def test_status_is_bound_to_the_exact_authorized_budget_scope():
 
 def test_account_status_includes_all_coordinated_scopes_and_states():
     cursor = MagicMock()
-    cursor.fetchone.return_value = (4, 3_500, 1, 1, 1, 1)
+    cursor.fetchone.return_value = (
+        4,
+        3_500,
+        1,
+        1,
+        1,
+        1,
+        10,
+        10,
+        10_000,
+        10_000,
+    )
 
     status = account_provider_budget_status_cursor(
         cursor,
@@ -238,4 +265,66 @@ def test_advanced_incremental_budget_exhaustion_blocks_before_reservation():
     assert not any(
         "UPDATE rt.advanced_ingress_plan_usage" in call.args[0]
         for call in cursor.execute.call_args_list
+    )
+
+
+def test_advanced_repair_rejects_exhausted_account_without_usage_update():
+    cursor = MagicMock()
+    plan_id = uuid4()
+    cohort_id = uuid4()
+    scope = _scope(
+        account_alias="MASSIVE_ADVANCED",
+        provider_authorization_reference="stocks-advanced",
+        request_ceiling=2,
+        decoded_byte_ceiling=4_002,
+        account_request_ceiling=3,
+        account_decoded_byte_ceiling=10_000,
+        lanes=frozenset({ProviderRequestLane.EQUITY_HISTORY}),
+    )
+    reservation = _reservation(
+        account_alias="MASSIVE_ADVANCED",
+        lane=ProviderRequestLane.EQUITY_HISTORY,
+        cohort_id=cohort_id,
+    )
+    cursor.fetchone.side_effect = [
+        (
+            cohort_id,
+            scope.session_date,
+            scope.request_ceiling,
+            scope.decoded_byte_ceiling,
+            scope.authorized_until,
+            "ACTIVE",
+            "READY",
+            scope.authorization_reference,
+            0,
+            0,
+        ),
+        None,
+        None,
+        (0, 0, 0, 0, 0, 0, None, None, None, None),
+        (3, 6_003, 0, 3, 0, 0, 3, 3, 10_000, 10_000),
+    ]
+
+    with pytest.raises(
+        ProviderBudgetExceeded,
+        match="account request ceiling",
+    ):
+        reserve_advanced_incremental_request_cursor(
+            cursor,
+            scope,
+            reservation,
+            plan_id=plan_id,
+            reserved_response_bytes=2_001,
+        )
+
+    statements = [
+        call.args[0] for call in cursor.execute.call_args_list
+    ]
+    assert not any(
+        "INSERT INTO rt.provider_request_ledger" in statement
+        for statement in statements
+    )
+    assert not any(
+        "UPDATE rt.advanced_ingress_plan_usage" in statement
+        for statement in statements
     )

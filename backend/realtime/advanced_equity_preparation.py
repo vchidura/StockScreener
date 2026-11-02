@@ -55,6 +55,8 @@ from .equity_interval_derivation_worker import (
 )
 from .preflight import ProviderTier
 from .provider_budget import (
+    MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING,
+    MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING,
     ProviderBudgetExceeded,
     ProviderBudgetScope,
     reserve_coordinated_provider_request_cursor,
@@ -162,8 +164,12 @@ class EquityPreparationLimits:
     maximum_facts_per_chunk: int = 1_000
     maximum_requests_per_member: int = 160
     maximum_response_bytes_per_member: int = 2 * 1024 * 1024 * 1024
-    maximum_account_requests: int = 64_000
-    maximum_account_response_bytes: int = 512 * 1024 * 1024 * 1024
+    maximum_account_requests: int = (
+        MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING
+    )
+    maximum_account_response_bytes: int = (
+        MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING
+    )
     lease_seconds: int = 300
     retry_initial_seconds: int = 15
     retry_maximum_seconds: int = 900
@@ -525,6 +531,10 @@ def reserve_equity_preparation_provider_requests_cursor(
         expected_cost="EXISTING_SUBSCRIPTION",
         request_ceiling=limits.maximum_account_requests,
         decoded_byte_ceiling=(
+            limits.maximum_account_response_bytes
+        ),
+        account_request_ceiling=limits.maximum_account_requests,
+        account_decoded_byte_ceiling=(
             limits.maximum_account_response_bytes
         ),
         lanes=frozenset({lane}),

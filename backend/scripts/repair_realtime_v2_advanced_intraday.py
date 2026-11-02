@@ -60,6 +60,8 @@ from realtime.equity_interval_finalizer import (  # noqa: E402
     _load_finalizer_security_cursor,
 )
 from realtime.provider_budget import (  # noqa: E402
+    MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING,
+    MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING,
     ProviderBudgetAdmission,
     ProviderBudgetScope,
     reserve_coordinated_provider_request_cursor,
@@ -101,6 +103,7 @@ def _reserve_or_load_sealed_response_cursor(
             scope,
             reservation,
             reserved_response_bytes=RESERVED_BYTES_PER_REQUEST,
+            account_wide=True,
         )
         return admission, None
 
@@ -238,6 +241,12 @@ def main(argv=None):
             expected_cost="no incremental charge expected",
             request_ceiling=REQUEST_CEILING,
             decoded_byte_ceiling=TOTAL_BYTE_CEILING,
+            account_request_ceiling=(
+                MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING
+            ),
+            account_decoded_byte_ceiling=(
+                MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING
+            ),
             lanes=frozenset({ProviderRequestLane.EQUITY_CURRENT}),
             authorized_until=datetime.now(timezone.utc).replace(
                 hour=23, minute=59, second=59

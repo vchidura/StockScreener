@@ -118,6 +118,18 @@ def _reference(result):
     )
 
 
+def test_opening_reference_can_expose_no_available_oi_members():
+    reference = _reference(_pre_session_result())
+
+    unavailable = replace(
+        reference,
+        open_interest_sha256=canonical_sha256(()),
+        open_interest=(),
+    )
+
+    assert unavailable.open_interest == ()
+
+
 def _admission():
     result = _pre_session_result()
     return build_prospective_opening_admission(

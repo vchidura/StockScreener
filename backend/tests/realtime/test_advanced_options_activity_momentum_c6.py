@@ -1436,6 +1436,27 @@ def test_v2_smaller_configured_total_and_redistribution_are_bounded():
     assert len(sparse.selected_contract_tickers) == 13
 
 
+def test_v2_budget_smaller_than_eligible_names_never_overallocates():
+    profile = load_activity_momentum_profile()
+    allocation = allocate_activity_momentum(
+        profile,
+        session_date=SESSION_DATE,
+        rotation_key="v2-budget-smaller-than-n",
+        ready_underlyings=("A", "B", "C"),
+        groups=tuple(
+            _group(underlying, 0)
+            for underlying in ("A", "B", "C")
+        ),
+        active_contract_budget=2,
+    )
+
+    assert allocation.active_contract_budget == 2
+    assert len(allocation.selected_contract_tickers) == 2
+    assert len({
+        group.underlying for group in allocation.selected_groups
+    }) == 2
+
+
 def test_v2_no_eligible_names_persists_zero_budget_coverage():
     profile = load_activity_momentum_profile()
     allocation = allocate_activity_momentum(

@@ -28,6 +28,12 @@ P8_SELECTION_MAXIMUM_DECODED_BYTES = 100_000_000
 P8_SELECTION_MAXIMUM_RESULTS_PER_UNDERLYING = 250
 P8_EXACT_CONTRACT_RESULT_COUNT = 4
 P8_SELECTION_MAXIMUM_PROVIDER_CLOCK_SKEW_SECONDS = 5
+SEALED_CAPTURE_GENERALIZED_C6_PROFILE = "GENERALIZED_C6"
+SEALED_CAPTURE_EXACT_FOUR_PROFILE = "EXACT_FOUR_QQQ_SPY_V1"
+SEALED_CAPTURE_COMPATIBILITY_PROFILES = frozenset({
+    SEALED_CAPTURE_GENERALIZED_C6_PROFILE,
+    SEALED_CAPTURE_EXACT_FOUR_PROFILE,
+})
 P8_SELECTION_POLICY = P7TransportSelectionPolicy(
     version="advanced-options-p8-same-day-activity-v1",
     maximum_dte=0,
@@ -265,10 +271,21 @@ def _select_exact_call_put_contracts(
 
 def p8_activity_selection_capture_from_sealed(
     value: Mapping[str, object],
+    *,
+    compatibility_profile: str | None = None,
 ) -> P8ActivitySelectionCapture:
+    recorded_profile = value.get("compatibility_profile")
+    resolved_profile = (
+        recorded_profile
+        if compatibility_profile is None
+        else compatibility_profile
+    )
     if (
         value.get("contract")
         != "advanced-options-v3-pre-session-capture-v1"
+        or resolved_profile not in SEALED_CAPTURE_COMPATIBILITY_PROFILES
+        or recorded_profile is not None
+        and recorded_profile != resolved_profile
         or type(value.get("provider_requests")) is not int
         or value["provider_requests"] <= 0
         or type(value.get("decoded_bytes")) is not int
@@ -297,6 +314,29 @@ def p8_activity_selection_capture_from_sealed(
         != value["provider_requests"]
     ):
         raise ValueError("sealed P8 response membership changed")
+    recorded_underlyings = value.get("configured_underlyings")
+    if recorded_underlyings is None:
+        configured_underlyings = tuple(sorted({
+            str(row.get("underlyer", "")).strip().upper()
+            for row in responses
+        }))
+    elif (
+        not isinstance(recorded_underlyings, list)
+        or not recorded_underlyings
+    ):
+        raise ValueError("sealed P8 configured underlyings changed")
+    else:
+        configured_underlyings = tuple(
+            str(underlying).strip().upper()
+            for underlying in recorded_underlyings
+        )
+    if (
+        not configured_underlyings
+        or len(configured_underlyings)
+        != len(set(configured_underlyings))
+        or any(not underlying for underlying in configured_underlyings)
+    ):
+        raise ValueError("sealed P8 configured underlyings changed")
     snapshots = value["selected_snapshots"]
     candidates = []
     selected_snapshots = {}
@@ -321,37 +361,38 @@ def p8_activity_selection_capture_from_sealed(
     underlyings = tuple(sorted({
         row.underlyer for row in candidates
     }))
-    legacy_sealed_capture = (
-        value.get("activity_momentum_allocation") is None
-    )
+    response_underlyings = {
+        str(row.get("underlyer", "")).strip().upper()
+        for row in responses
+    }
+    expected_exact_pairs = {
+        (underlying, option_type)
+        for underlying in P8_SELECTION_POLICY.underlyings
+        for option_type in ("C", "P")
+    }
     if (
         not pairs
-        or (
-            legacy_sealed_capture
-            and pairs != {
-                (underlyer, option_type)
-                for underlyer in underlyings
-                for option_type in ("C", "P")
-            }
-        )
-        or tuple(sorted(
-            str(row.get("underlyer", "")).strip().upper()
-            for row in responses
-        ))
-        != underlyings
+        or not set(underlyings).issubset(configured_underlyings)
+        or response_underlyings != set(configured_underlyings)
     ):
         raise ValueError("sealed P8 call/put membership changed")
-    policy = (
-        P8_SELECTION_POLICY
-        if underlyings == P8_SELECTION_POLICY.underlyings
-        and len(candidates) == P8_EXACT_CONTRACT_RESULT_COUNT
-        else P7TransportSelectionPolicy(
+    if resolved_profile == SEALED_CAPTURE_EXACT_FOUR_PROFILE:
+        if (
+            configured_underlyings != P8_SELECTION_POLICY.underlyings
+            or len(candidates) != P8_EXACT_CONTRACT_RESULT_COUNT
+            or pairs != expected_exact_pairs
+        ):
+            raise ValueError(
+                "sealed P8 explicit exact-four membership changed"
+            )
+        policy = P8_SELECTION_POLICY
+    else:
+        policy = P7TransportSelectionPolicy(
             version="advanced-options-c6-configured-capture-v1",
-            underlyings=underlyings,
+            underlyings=configured_underlyings,
             minimum_dte=0,
             maximum_dte=60,
         )
-    )
     latest_market_time = max(
         row.market_data_time for row in candidates
     )
@@ -365,7 +406,7 @@ def p8_activity_selection_capture_from_sealed(
                 "sealed P8 provider clock skew exceeded"
             )
         reviewed_at = latest_market_time
-    if policy == P8_SELECTION_POLICY:
+    if resolved_profile == SEALED_CAPTURE_EXACT_FOUR_PROFILE:
         for option_type in ("C", "P"):
             selection = select_p7_transport_contracts(
                 tuple(
@@ -437,6 +478,8 @@ def p8_activity_selection_capture_from_sealed(
     )
     evidence = {
         "schema": "advanced-options-p8-activity-selection-v1",
+        "compatibility_profile": resolved_profile,
+        "configured_underlyings": list(configured_underlyings),
         "source_snapshot_at_utc": source_snapshot_at.isoformat(),
         "selected_at_utc": reviewed_at.isoformat(),
         "valid_until_utc": valid_until.isoformat(),
@@ -491,6 +534,10 @@ class MassiveAdvancedOptionsSelectionSource:
         ),
         maximum_provider_requests: int | None = None,
         deadline: datetime | None = None,
+        retain_candidate_pool: bool = False,
+        query_minimum_dte: int | None = None,
+        query_maximum_dte: int | None = None,
+        query_maximum_moneyness_fraction: Decimal | None = None,
     ) -> None:
         if not callable(getattr(transport, "get", None)):
             raise TypeError("P8 Massive transport is invalid")
@@ -514,6 +561,21 @@ class MassiveAdvancedOptionsSelectionSource:
                 "P8 selection decoded-byte ceilings are invalid"
             )
         selected_policy = policy or P8_SELECTION_POLICY
+        minimum_dte = (
+            selected_policy.minimum_dte
+            if query_minimum_dte is None
+            else query_minimum_dte
+        )
+        maximum_dte = (
+            selected_policy.maximum_dte
+            if query_maximum_dte is None
+            else query_maximum_dte
+        )
+        maximum_moneyness = (
+            selected_policy.maximum_moneyness_fraction
+            if query_maximum_moneyness_fraction is None
+            else query_maximum_moneyness_fraction
+        )
         request_ceiling = (
             len(selected_policy.underlyings)
             if maximum_provider_requests is None
@@ -522,6 +584,13 @@ class MassiveAdvancedOptionsSelectionSource:
         if (
             type(request_ceiling) is not int
             or request_ceiling < len(selected_policy.underlyings)
+            or type(retain_candidate_pool) is not bool
+            or type(minimum_dte) is not int
+            or type(maximum_dte) is not int
+            or not 0 <= minimum_dte <= maximum_dte <= 60
+            or not Decimal("0")
+            < maximum_moneyness
+            <= Decimal("0.25")
         ):
             raise ValueError(
                 "P8 selection provider request ceiling is invalid"
@@ -538,6 +607,10 @@ class MassiveAdvancedOptionsSelectionSource:
             maximum_total_decoded_bytes
         )
         self._maximum_provider_requests = request_ceiling
+        self._retain_candidate_pool = retain_candidate_pool
+        self._query_minimum_dte = minimum_dte
+        self._query_maximum_dte = maximum_dte
+        self._query_maximum_moneyness_fraction = maximum_moneyness
         self._deadline = (
             None if deadline is None else _utc(deadline, "deadline")
         )
@@ -558,8 +631,12 @@ class MassiveAdvancedOptionsSelectionSource:
         dict[str, Mapping[str, object]],
     ]:
         policy = self._policy
-        lower = spot * (Decimal("1") - policy.maximum_moneyness_fraction)
-        upper = spot * (Decimal("1") + policy.maximum_moneyness_fraction)
+        lower = spot * (
+            Decimal("1") - self._query_maximum_moneyness_fraction
+        )
+        upper = spot * (
+            Decimal("1") + self._query_maximum_moneyness_fraction
+        )
         request_limit = (
             self._maximum_provider_requests
             if maximum_requests is None
@@ -584,11 +661,11 @@ class MassiveAdvancedOptionsSelectionSource:
         next_params = {
             "expiration_date.gte": (
                 session_date
-                + timedelta(days=policy.minimum_dte)
+                + timedelta(days=self._query_minimum_dte)
             ).isoformat(),
             "expiration_date.lte": (
                 session_date
-                + timedelta(days=policy.maximum_dte)
+                + timedelta(days=self._query_maximum_dte)
             ).isoformat(),
             "strike_price.gte": str(lower),
             "strike_price.lte": str(upper),
@@ -813,19 +890,79 @@ class MassiveAdvancedOptionsSelectionSource:
         ).total_seconds() > P8_SELECTION_MAXIMUM_PROVIDER_CLOCK_SKEW_SECONDS:
             raise ValueError("P8 provider clock skew exceeded")
         selected_at = max(local_completed_at, latest_snapshot_at)
-        selection = select_p7_transport_contracts(
-            tuple(candidates),
-            reviewed_at=selected_at,
-            policy=self._policy,
-        )
-        if selection.status is not P7TransportSelectionStatus.READY:
-            raise RuntimeError(
-                "P8 Massive activity selection blocked: "
-                + ",".join(selection.reason_codes)
+        if self._retain_candidate_pool:
+            selected_rows = tuple(sorted(
+                candidates,
+                key=lambda row: (
+                    row.underlyer,
+                    row.expiration_date,
+                    row.option_type,
+                    row.strike,
+                    row.contract_ticker,
+                ),
+            ))
+            missing = tuple(
+                underlyer
+                for underlyer in self._policy.underlyings
+                if not any(
+                    row.underlyer == underlyer
+                    for row in selected_rows
+                )
             )
+            if missing:
+                raise RuntimeError(
+                    "P8 Massive C6 candidate pool is unavailable: "
+                    + ",".join(missing)
+                )
+            source_sha256 = canonical_sha256(tuple(
+                (
+                    row.contract_ticker,
+                    row.market_data_time,
+                    row.source_sha256,
+                )
+                for row in selected_rows
+            ))
+            reason_codes = ("C6_CANDIDATE_POOL_RETAINED",)
+            valid_until = selected_at + timedelta(
+                seconds=self._policy.maximum_snapshot_age_seconds
+            )
+            selection = P7TransportSelection(
+                P7TransportSelectionStatus.READY,
+                self._policy,
+                selected_at,
+                valid_until,
+                selected_rows,
+                source_sha256,
+                canonical_sha256({
+                    "status": P7TransportSelectionStatus.READY,
+                    "policy_sha256": self._policy.sha256,
+                    "reviewed_at": selected_at,
+                    "valid_until": valid_until,
+                    "source_sha256": source_sha256,
+                    "selected": selected_rows,
+                    "reason_codes": reason_codes,
+                    "selection_mode": "C6_CANDIDATE_POOL",
+                }),
+                reason_codes,
+            )
+        else:
+            selection = select_p7_transport_contracts(
+                tuple(candidates),
+                reviewed_at=selected_at,
+                policy=self._policy,
+            )
+            if selection.status is not P7TransportSelectionStatus.READY:
+                raise RuntimeError(
+                    "P8 Massive activity selection blocked: "
+                    + ",".join(selection.reason_codes)
+                )
         source_snapshot_at = min(snapshot_clocks)
         evidence = {
-            "schema": "advanced-options-p8-activity-selection-v1",
+            "schema": (
+                "advanced-options-c6-candidate-pool-v1"
+                if self._retain_candidate_pool
+                else "advanced-options-p8-activity-selection-v1"
+            ),
             "source_snapshot_at_utc": source_snapshot_at.isoformat(),
             "selected_at_utc": selected_at.isoformat(),
             "valid_until_utc": selection.valid_until.isoformat(),
@@ -835,6 +972,14 @@ class MassiveAdvancedOptionsSelectionSource:
             "decoded_bytes": decoded_bytes,
             "pages": request_count,
             "pagination_requests": pagination_requests,
+            "candidate_count": len(selection.selected),
+            "query": {
+                "minimum_dte": self._query_minimum_dte,
+                "maximum_dte": self._query_maximum_dte,
+                "maximum_moneyness_fraction": str(
+                    self._query_maximum_moneyness_fraction
+                ),
+            },
             "selected": [
                 {
                     "underlyer": row.underlyer,

@@ -20,6 +20,11 @@ if str(BACKEND_DIR) not in sys.path:
 from realtime.advanced_equity_lifecycle import (  # noqa: E402
     AdvancedEquityLifecyclePlanner,
 )
+from realtime.advanced_realtime_v3_runtime import (  # noqa: E402
+    ADVANCED_REALTIME_V3_COMPLETION_BUDGET_SECONDS,
+    ADVANCED_REALTIME_V3_DRAIN_SECONDS,
+    ADVANCED_REALTIME_V3_FINALITY_DELAY_SECONDS,
+)
 from realtime.database_access_v2 import (  # noqa: E402
     APP_ROLE,
     V2AccessConfig,
@@ -97,17 +102,25 @@ def _compose_services(path: Path | None) -> list[dict[str, object]]:
     ]
 
 
+def advanced_realtime_v3_status_lifecycle(checked_at: datetime):
+    planner = AdvancedEquityLifecyclePlanner(clock=lambda: checked_at)
+    return planner.plan(
+        drain_seconds=ADVANCED_REALTIME_V3_DRAIN_SECONDS,
+        finality_delay_seconds=(
+            ADVANCED_REALTIME_V3_FINALITY_DELAY_SECONDS
+        ),
+        completion_budget_seconds=(
+            ADVANCED_REALTIME_V3_COMPLETION_BUDGET_SECONDS
+        ),
+    )
+
+
 def build_advanced_realtime_v3_status_cursor(
     cursor,
     *,
     checked_at: datetime,
 ) -> dict[str, object]:
-    planner = AdvancedEquityLifecyclePlanner(clock=lambda: checked_at)
-    lifecycle = planner.plan(
-        drain_seconds=30,
-        finality_delay_seconds=5,
-        completion_budget_seconds=60,
-    )
+    lifecycle = advanced_realtime_v3_status_lifecycle(checked_at)
     cursor.execute(
         "SELECT revision.revision_id::text,"
         "revision.effective_session_date,intent.ticker,"
@@ -127,7 +140,8 @@ def build_advanced_realtime_v3_status_cursor(
     cursor.execute(
         "SELECT session_date,status,current_stage,option_underlyings,"
         "desired_snapshot_sha256,desired_cohort_id::text,"
-        "activated_session_binding_id::text,last_error,checked_at "
+        "activated_session_binding_id::text,last_error,checked_at,"
+        "expiration_state,expired_at,expiration_reason "
         "FROM rt.advanced_options_preparation_sessions "
         "WHERE session_date IN (%s,%s) ORDER BY session_date",
         (
@@ -136,6 +150,16 @@ def build_advanced_realtime_v3_status_cursor(
         ),
     )
     preparations = tuple(cursor.fetchall())
+    cursor.execute(
+        "SELECT session_date,status,current_stage,option_underlyings,"
+        "desired_snapshot_sha256,desired_cohort_id::text,"
+        "activated_session_binding_id::text,last_error,checked_at,"
+        "expiration_state,expired_at,expiration_reason "
+        "FROM rt.advanced_options_preparation_sessions "
+        "WHERE expiration_state IS NOT NULL "
+        "ORDER BY session_date DESC,expired_at DESC LIMIT 10"
+    )
+    expired_preparations = tuple(cursor.fetchall())
     cursor.execute(
         "SELECT generation.selection_generation_id::text,"
         "generation.session_date,generation.broad_underlyings,"
@@ -234,10 +258,34 @@ def build_advanced_realtime_v3_status_cursor(
                     "session_binding_id": row[6],
                     "last_error": row[7],
                     "checked_at_utc": row[8].isoformat(),
+                    "expiration_state": row[9],
+                    "expired_at_utc": (
+                        None
+                        if row[10] is None
+                        else row[10].isoformat()
+                    ),
+                    "expiration_reason": row[11],
                 }
                 for row in preparations
             ],
         },
+        "expired_preparation": [
+            {
+                "session_date": row[0].isoformat(),
+                "status": row[1],
+                "current_stage": row[2],
+                "option_underlyings": list(row[3]),
+                "desired_snapshot_sha256": row[4],
+                "desired_cohort_id": row[5],
+                "session_binding_id": row[6],
+                "last_error": row[7],
+                "checked_at_utc": row[8].isoformat(),
+                "expiration_state": row[9],
+                "expired_at_utc": row[10].isoformat(),
+                "expiration_reason": row[11],
+            }
+            for row in expired_preparations
+        ],
         "members": [
             {
                 "revision_id": row[0],

@@ -104,6 +104,7 @@ def reserve_advanced_incremental_request_cursor(
         scope,
         reservation,
         reserved_response_bytes=reserved_response_bytes,
+        account_wide=True,
     )
     if admission.newly_reserved:
         cursor.execute(

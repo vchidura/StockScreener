@@ -731,8 +731,10 @@ def test_preparation_reservation_counts_concurrent_account_work():
             authorization_reference="concurrent-account-work",
             provider_authorization_reference="shared-account",
             expected_cost="existing",
-            request_ceiling=10,
-            decoded_byte_ceiling=10_000,
+            request_ceiling=3,
+            decoded_byte_ceiling=1_000,
+            account_request_ceiling=3,
+            account_decoded_byte_ceiling=1_000,
             lanes=frozenset({ProviderRequestLane.EQUITY_HISTORY}),
             authorized_until=datetime(
                 2026, 11, 3, tzinfo=UTC
@@ -751,6 +753,7 @@ def test_preparation_reservation_counts_concurrent_account_work():
                     reserved_at=WORK_AT,
                 ),
                 reserved_response_bytes=100,
+                account_wide=True,
             )
             claim = claim_equity_preparation_work_cursor(
                 unit.cursor,

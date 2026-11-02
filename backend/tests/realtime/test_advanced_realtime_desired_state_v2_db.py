@@ -3,6 +3,9 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 from options.calendar import OptionExchangeCalendar
+from realtime.advanced_options_lifecycle import (
+    reconcile_advanced_options_lifecycle_cursor,
+)
 
 from realtime.advanced_realtime_desired_state import (
     DesiredMemberIntent,
@@ -16,6 +19,7 @@ from realtime.advanced_realtime_desired_state_repository import (
     load_current_desired_state_revision_cursor,
     record_desired_state_revision_cursor,
     reconcile_desired_state,
+    reconcile_desired_state_revision_cursor,
     update_desired_member_preparation,
 )
 from realtime.contracts import (
@@ -295,7 +299,10 @@ def test_after_close_default_revision_materializes_and_replays_exact_snapshot():
             with connection.cursor() as cursor:
                 source_cohort_id, source_manifest_id = _seed_source(cursor)
             connection.commit()
-            change = default_advanced_realtime_desired_state(source_cohort_id)
+            change = default_advanced_realtime_desired_state(
+                source_cohort_id,
+                source_slot_version=1,
+            )
 
             result = apply_desired_state(
                 connection,
@@ -354,6 +361,89 @@ def test_after_close_default_revision_materializes_and_replays_exact_snapshot():
                     (str(source_manifest_id),),
                 )
                 assert cursor.fetchone()[0] == 9
+        finally:
+            pool.putconn(connection)
+
+
+def test_automatic_options_bootstrap_materializes_equity_snapshot_without_slots():
+    with disposable_v2_database(
+        f"test_realtime_v2_c2_automatic_options_{uuid4().hex[:8]}"
+    ) as pool:
+        connection = pool.getconn()
+        try:
+            with connection.cursor() as cursor:
+                source_cohort_id, _source_manifest_id = _seed_source(cursor)
+            connection.commit()
+            change = default_advanced_realtime_desired_state(
+                source_cohort_id,
+                source_slot_version=None,
+            )
+
+            pending = apply_desired_state(
+                connection,
+                change,
+                observed_at=AFTER_CLOSE,
+            )
+            activation_at = (
+                OptionExchangeCalendar("XNYS").session_open(
+                    pending.revision.effective_session_date
+                )
+                - timedelta(minutes=15)
+            )
+            with connection.cursor() as cursor:
+                activated = reconcile_desired_state_revision_cursor(
+                    cursor,
+                    pending.revision.revision_id,
+                    materialized_at=activation_at,
+                    allow_partial_activation=True,
+                )
+                lifecycle = reconcile_advanced_options_lifecycle_cursor(
+                    cursor,
+                    target_session_date=(
+                        pending.revision.effective_session_date
+                    ),
+                    checked_at=activation_at,
+                )
+            connection.commit()
+
+            assert change.source_slot_version is None
+            assert activated.state == "READY"
+            assert activated.snapshot is not None
+            assert activated.snapshot.slot_set_version is None
+            assert lifecycle is not None
+            assert lifecycle.status == "PREPARING"
+            assert lifecycle.current_stage == "CATALOG_QUOTE"
+            assert {
+                row.status
+                for row in pending.preparations
+                if row.kind is DesiredMemberKind.EQUITY
+            } == {MemberPreparationStatus.READY}
+            assert {
+                row.status
+                for row in pending.preparations
+                if row.kind is DesiredMemberKind.OPTION_UNDERLYING
+            } == {MemberPreparationStatus.WARMING}
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT stock_count,option_underlying_count,member_count "
+                    "FROM rt.subscription_manifests WHERE manifest_id=%s",
+                    (str(activated.snapshot.manifest_id),),
+                )
+                assert cursor.fetchone() == (9, 0, 9)
+                cursor.execute(
+                    "SELECT count(*) FROM rt.slot_set_versions "
+                    "WHERE cohort_id=%s",
+                    (str(activated.snapshot.cohort_id),),
+                )
+                assert cursor.fetchone()[0] == 0
+                cursor.execute(
+                    "SELECT count(*),"
+                    "bool_and(intent.member_kind='OPTION_UNDERLYING') "
+                    "FROM rt.advanced_options_preparation_work AS work "
+                    "JOIN rt.realtime_desired_member_intents AS intent "
+                    "USING(intent_id)"
+                )
+                assert cursor.fetchone() == (9, True)
         finally:
             pool.putconn(connection)
 

@@ -97,8 +97,6 @@ class DesiredStateChange:
             raise ValueError(
                 "enabled Options underlyings require an enabled Equity or sector ETF role"
             )
-        if underlyings and self.source_slot_version is None:
-            raise ValueError("Options desired state requires a stored slot-set reference")
         if not underlyings and self.source_slot_version is not None:
             raise ValueError("Equity-only desired state cannot reference a slot set")
         object.__setattr__(self, "members", members)
@@ -145,7 +143,7 @@ class DesiredSessionSnapshot:
 def default_advanced_realtime_desired_state(
     source_cohort_id: UUID,
     *,
-    source_slot_version: int = 1,
+    source_slot_version: int | None = 1,
 ) -> DesiredStateChange:
     members = [
         DesiredMemberIntent(ticker, DesiredMemberKind.EQUITY)

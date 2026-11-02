@@ -1,8 +1,16 @@
 import importlib
+import inspect
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from options.calendar import OptionExchangeCalendar
+
 from realtime.equity_pipeline_config import RealtimeV2PipelineConfig
+from realtime.advanced_equity_lifecycle import (
+    AdvancedEquityLifecyclePhase,
+)
 from realtime.advanced_realtime_v3_runtime import (
     ADVANCED_REALTIME_V3_COMPOSE_PROFILE,
     ADVANCED_REALTIME_V3_ROLES,
@@ -11,6 +19,18 @@ from realtime.advanced_realtime_v3_runtime import (
 
 script = importlib.import_module("scripts.run_realtime_v2_advanced_services")
 selector = importlib.import_module("scripts.run_realtime_v2_equity_services")
+equity_preparation = importlib.import_module(
+    "scripts.run_realtime_v2_advanced_equity_preparation"
+)
+options_lifecycle = importlib.import_module(
+    "scripts.run_advanced_options_v3_lifecycle"
+)
+equity_scheduler = importlib.import_module(
+    "scripts.run_realtime_v2_advanced_equity_scheduler"
+)
+status_report = importlib.import_module(
+    "scripts.report_advanced_realtime_v3_status"
+)
 BASE = [
     "--runtime-mode",
     "legacy-diagnostic",
@@ -66,6 +86,150 @@ def _config(pipeline):
             ),
         })
     return RealtimeV2PipelineConfig.from_mapping(values)
+
+
+def test_equity_preparation_default_environment_file_is_optional(tmp_path):
+    args = equity_preparation.parse_args([
+        "--database",
+        "stocks_realtime_v2",
+        "--confirm-database-name",
+        "stocks_realtime_v2",
+        "--execute",
+    ])
+
+    assert args.env_file is None
+
+    with pytest.raises(SystemExit):
+        equity_preparation.parse_args([
+            "--database",
+            "stocks_realtime_v2",
+            "--confirm-database-name",
+            "stocks_realtime_v2",
+            "--env-file",
+            str(tmp_path / "missing.env"),
+            "--execute",
+        ])
+
+
+def test_options_lifecycle_stream_ceilings_are_configurable():
+    environment = {
+        "REALTIME_V3_OPTIONS_CONNECTION_ATTEMPT_CEILING": "24",
+        "REALTIME_V3_OPTIONS_DECODED_MESSAGE_CEILING": "8000000",
+        "REALTIME_V3_OPTIONS_DECODED_BYTE_CEILING": "8589934592",
+        "REALTIME_V3_OPTIONS_ACTIVE_QUOTE_CONTRACT_BUDGET": "400",
+        "REALTIME_V3_OPTIONS_PER_UNDERLYING_CONTRACT_LIMIT": "12",
+        "REALTIME_V3_OPTIONS_ESTABLISHED_MEASURED_CAPACITY": "350",
+        "REALTIME_V3_OPTIONS_EFFECTIVE_PROVIDER_PROJECT_CEILING": "500",
+    }
+
+    assert options_lifecycle._positive_environment_int(
+        environment,
+        "REALTIME_V3_OPTIONS_CONNECTION_ATTEMPT_CEILING",
+        12,
+    ) == 24
+    assert options_lifecycle._positive_environment_int(
+        environment,
+        "REALTIME_V3_OPTIONS_DECODED_MESSAGE_CEILING",
+        1_000_000,
+    ) == 8_000_000
+    with pytest.raises(RuntimeError):
+        options_lifecycle._positive_environment_int(
+            {"LIMIT": "0"},
+            "LIMIT",
+            1,
+        )
+    assert options_lifecycle._optional_positive_environment_int(
+        environment,
+        "REALTIME_V3_OPTIONS_ACTIVE_QUOTE_CONTRACT_BUDGET",
+    ) == 400
+    assert options_lifecycle._optional_positive_environment_int(
+        {},
+        "REALTIME_V3_OPTIONS_ACTIVE_QUOTE_CONTRACT_BUDGET",
+    ) is None
+
+
+def test_close_status_retains_current_processing_until_scheduler_deadline():
+    session_date = date(2026, 11, 2)
+    calendar = OptionExchangeCalendar("XNYS")
+    checked_at = (
+        calendar.session_close(session_date)
+        + timedelta(minutes=2)
+    )
+
+    lifecycle = status_report.advanced_realtime_v3_status_lifecycle(
+        checked_at
+    )
+
+    assert lifecycle.phase is AdvancedEquityLifecyclePhase.DRAINING
+    assert lifecycle.processing_session_date == session_date
+    assert lifecycle.preparation_session_date == date(2026, 11, 3)
+    assert lifecycle.processing_deadline > checked_at
+    assert (
+        status_report.ADVANCED_REALTIME_V3_COMPLETION_BUDGET_SECONDS
+        == 300
+    )
+
+    after_deadline = (
+        status_report.advanced_realtime_v3_status_lifecycle(
+            lifecycle.processing_deadline + timedelta(microseconds=1)
+        )
+    )
+    assert after_deadline.processing_session_date == date(2026, 11, 3)
+
+
+def test_scheduler_options_lifecycle_and_status_share_runtime_timing():
+    scheduler_args = equity_scheduler.parse_args([
+        "--database",
+        "stocks_realtime_v2",
+        "--confirm-database-name",
+        "stocks_realtime_v2",
+        "--continuous",
+        "--execute",
+    ])
+    lifecycle_args = options_lifecycle.parse_args([
+        "--database",
+        "stocks_realtime_v2",
+        "--confirm-database-name",
+        "stocks_realtime_v2",
+        "--continuous",
+        "--execute",
+    ])
+
+    assert scheduler_args.finality_delay_seconds == 5
+    assert lifecycle_args.finality_delay_seconds == 5
+    assert scheduler_args.completion_budget_seconds == 300
+    assert lifecycle_args.completion_budget_seconds == 300
+
+
+def test_compose_lifecycle_inherits_all_options_ceiling_configuration():
+    compose = (
+        Path(__file__).resolve().parents[3]
+        / "docker-compose.realtime-v2.yml"
+    ).read_text(encoding="utf-8")
+
+    ceiling_names = (
+        "REALTIME_V3_OPTIONS_CONNECTION_ATTEMPT_CEILING",
+        "REALTIME_V3_OPTIONS_DECODED_MESSAGE_CEILING",
+        "REALTIME_V3_OPTIONS_DECODED_BYTE_CEILING",
+        "REALTIME_V3_OPTIONS_ACTIVE_QUOTE_CONTRACT_BUDGET",
+        "REALTIME_V3_OPTIONS_PER_UNDERLYING_CONTRACT_LIMIT",
+        "REALTIME_V3_OPTIONS_ESTABLISHED_MEASURED_CAPACITY",
+        "REALTIME_V3_OPTIONS_EFFECTIVE_PROVIDER_PROJECT_CEILING",
+    )
+    shared_environment = compose.split(
+        "x-advanced-environment: &advanced-environment",
+        1,
+    )[1].split("x-downstream-labels:", 1)[0]
+    lifecycle_service = compose.split(
+        "  realtime-v3-options-lifecycle:",
+        1,
+    )[1].split("  realtime-v3-publication-retry:", 1)[0]
+    script_source = inspect.getsource(options_lifecycle)
+
+    assert "<<: *advanced-environment" in lifecycle_service
+    for name in ceiling_names:
+        assert name in shared_environment
+        assert name in script_source
 
 
 def test_advanced_supervisor_has_no_developer_rest_process(

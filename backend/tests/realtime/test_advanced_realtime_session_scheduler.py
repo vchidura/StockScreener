@@ -1363,7 +1363,7 @@ def test_secret_cleanup_removes_exact_owned_directory(tmp_path):
     assert not secret_directory.exists()
 
 
-def test_equity_full_session_services_cap_restarts_at_three():
+def test_equity_full_session_services_are_long_lived_until_stopped():
     compose = (
         Path(__file__).resolve().parents[3]
         / "docker-compose.realtime-v2.yml"
@@ -1377,7 +1377,9 @@ def test_equity_full_session_services_cap_restarts_at_three():
             flags=re.MULTILINE | re.DOTALL,
         )
         assert match is not None
-        assert 'restart: "on-failure:3"' in match.group("body")
+        body = match.group("body")
+        assert "restart: unless-stopped" in body
+        assert "on-failure" not in body
 
 
 def test_runtime_status_reads_latest_sample_without_mutation(tmp_path):

@@ -788,6 +788,10 @@ Implementation evidence:
 - New configurable preparation defaults to the separately pinned
   `c6_activity_momentum_v2` profile. The frozen `c6_activity_momentum_v1` JSON,
   payload and stored-state decoder remain independently selectable and unchanged.
+- Sealed candidate captures carry an explicit generalized or exact-four
+  compatibility identity plus configured underlying scope. Generalized decoding
+  permits sparse and one-sided candidate pools and missing OI; no contract count,
+  ticker name or call/put shape infers legacy validation.
 - Default configuration derives `B=min(8*N, configured total, established measured
   capacity when present, effective provider/project ceiling)`. Examples: no expansion
   flags produce 80/200/400 for 10/25/50 eligible names; explicit
@@ -810,6 +814,12 @@ Implementation evidence:
   A mutable routing checkpoint in migration `042` preserves deterministic restart:
   equal equivalent replay is idempotent, equal divergent or stale replay fails, and
   only forward progress updates durable evidence.
+- Quote/date quality is evaluated at the persisted capture/review clock. A later
+  pre-freeze worker retry does not age valid off-hours evidence. If an underlying's
+  captured candidates were already quote-stale at that clock, the durable lifecycle
+  records a refresh request, retries that underlying's catalog/reference work under
+  newly reserved provider budget and retains every prior immutable stage attempt.
+  A completed `CAPACITY_SHARDS` allocation rejects refresh and remains frozen.
 - Focused addendum tests cover default and expanded 10/25/50 budgets, smaller totals,
   deterministic 12-contract redistribution, no eligible names, sparse quality,
   provider-order independence, role-target expiry ranking, complete/shared groups,
@@ -1196,6 +1206,70 @@ Implementation evidence:
   per-service state/health. C7 retry has direct pending/retry/expired/terminal
   and idempotent-restart coverage. README and deployment document one
   startup/status/stop/backup/isolated-restore workflow.
+- The market-readiness correction keeps the profile-filtered dated candidate
+  pool, resolves the canonical C6 v2/v3 allocation once in the authoritative
+  `CAPACITY_SHARDS` work item and reloads that exact capture/allocation during
+  C5 activation. It removes the proposed premarket/fresh detector allocators,
+  their migration and the global window gate. Fresh Q/T observations affect
+  existing consumer/router readiness and product-local `UNAVAILABLE` evidence;
+  they never rotate or shrink the frozen physical subscription.
+- Capture freshness is anchored to immutable capture/review time. Capture-stale
+  evidence triggers a durable pre-freeze catalog refresh transition with append-only
+  attempt history. The immutable refresh request, mutable work and session status
+  persist the next retry: before open it waits for the target XNYS open, then uses
+  30-300 second capped exponential backoff. Restart resumes that schedule, so stale
+  closed-market responses do not consume the request budget in a tight loop.
+  Provider reservations still precede I/O, and no refresh transition is permitted
+  after canonical allocation freeze.
+- Sealed candidate-pool compatibility is explicit. Generalized sparse, one-sided and
+  missing-OI candidates reach canonical C6 filtering/allocation, while QQQ/SPY
+  exact-four checks run only under the explicit compatibility identity.
+- Missing prior OI persists as typed `UNAVAILABLE` reference evidence and as
+  `NOT_REQUIRED` capture readiness with
+  `MISSING_PRIOR_OPEN_INTEREST`. It remains `None`, not zero. Catalog, history
+  and required feed facts remain mandatory; OI-dependent ratios/models may be
+  unavailable without blocking unrelated capture or products.
+- The default local Equity preparation `.env` is optional; explicit missing
+  overrides still fail. Compose continues to supply secrets/environment only.
+  Options connection-attempt, decoded-message and decoded-byte ceilings are
+  explicit environment inputs frozen into each session/acquisition binding and
+  reloaded with cumulative usage. Configured total, per-underlying, measured and
+  provider/project allocation ceilings use the same shared native/Compose
+  environment and feed the sole C6 allocator. Operational full-session measurement
+  and headroom select their values without becoming a daily startup gate.
+- Provider-budget exhaustion is handled inside the claimed stage boundary. The
+  reservation transaction rolls back, the claim lease is released to durable
+  `RETRY`, `retry_reason=PROVIDER_BUDGET_EXHAUSTED` and the session remains visibly
+  `DEGRADED` until its persisted retry time. The executor is not called, no limit is
+  raised or bypassed, and restart observes the same wait.
+- Coordinated budgets enforce two independent limits under the same account lock:
+  the Options preparation scope keeps its bounded `4*N*3` request allowance, while
+  every new `MASSIVE_ADVANCED` Equity/Options/repair/scheduler scope records and
+  enforces the shared reviewed account ceiling of 64,000 requests and 512 GiB
+  decoded bytes. Earlier Equity usage consumes only the shared ceiling; it cannot
+  consume the smaller Options-local allowance. The coordinated helper now rejects
+  every Advanced call that omits account-wide enforcement; incremental recovery,
+  gap repair, schedulers and diagnostic repair all opt in explicitly. An
+  account-exhausted repair inserts no request and advances no plan usage.
+- Unfinished session-specific preparation becomes immutable `EXPIRED` after its
+  target close plus five minutes, or `SUPERSEDED` when a newer preparation session
+  exists. Nonterminal work is blocked with persisted expiration metadata and is
+  excluded from claims; completed evidence and active session/drain state are left
+  unchanged. Stored status exposes the outcome and reason.
+- Status, continuous scope loading, Equity scheduling and Options lifecycle share
+  the V3 timing contract: 30-second drain, 5-second finality delay and 300-second
+  completion budget. During close-to-deadline processing, `current_processing`
+  remains on today's session while `future_preparation` independently shows the
+  next session; only after the exact processing deadline does status roll forward.
+- Full isolated restore verification covers V3 desired/session lifecycle,
+  journal/checkpoint bounds, selection/shards, publication pointers/work, read
+  pins, retention/security state, migrations, roles and stale-until-released service
+  state. `RealtimeV3` scope does not require legacy `public.*` relations or run the
+  legacy validator; `Both` is explicit. Raw-flow, normalized-market and rolling/
+  routing checkpoints compare only with their declared durable coordinates, and an
+  unknown coordinate fails visibly. PostgreSQL proof complements,
+  but does not replace, separately retained journal/report/retention volume
+  snapshots.
 - Consolidated provider-blocked C8 lifecycle, role-isolation, publication,
   status, container, acquisition, schema and registry selection: 147 passed
   with 5 existing warnings. Affected provider-blocked C6 allocator/routing/
@@ -1210,6 +1284,32 @@ Implementation evidence:
   and initial scheduling while isolating a launch failure. Targeted compile
   passed. No provider/network, live database, Docker/service, publication,
   delivery, broker or trading effect ran.
+- Market-readiness correction provider-blocked C5-C8, schema, security,
+  live-024, startup and restore selection: 255 passed with 5 existing warnings.
+  The correction adds direct B<N, frozen-allocation, optional-OI, schema-status,
+  environment-only startup, cumulative-budget configuration and restore-proof
+  regressions. Final owned-disposable C5/C6/C8 and desired-state selection:
+  29 passed with 6 existing warnings, including generalized missing-OI
+  activation and identical allocation generation after restart. No
+  provider/network, live database, Docker/service, publication, delivery,
+  broker or trading effect ran.
+- Remaining market-readiness corrections are code-level ready, not
+  `MARKET_READY`. The focused provider-blocked allocator/decoder/lifecycle/
+  Compose/schema/security/live-024/restore selection passed 169 tests with 5
+  existing warnings. The follow-up refresh-scheduling/budget-wait plus adjacent
+  schema/security/live-024 selection passed 75 tests with 5 existing warnings.
+  The final dual-budget/expiration/timing plus caller compatibility selection
+  passed 177 tests with 5 existing warnings, including the full scheduler file
+  and current long-lived `restart: unless-stopped` Compose contract.
+  Owned-disposable account/scope budget,
+  exact-four, generalized v2, capture-stale refresh/restart, exhausted-budget
+  recovery, repair no-mutation enforcement and obsolete-session expiration
+  passed 10 tests with 5 warnings;
+  targeted compile and `git diff --check` passed. No provider,
+  live-database, Docker/service, publication, delivery, broker or trading
+  effect ran. Full-session traffic/reconnect measurement, deployment
+  ceiling/headroom selection, isolated database-plus-volume restore and
+  native/Compose startup/drain smoke remain authorized operational evidence.
 
 #### C9 - Retire Duplicate Control Paths
 
@@ -1256,6 +1356,12 @@ reverting schema or data-plane changes.
 | Backfill interruption | Retry resumes from the member's durable watermark/attempt and preserves completed intervals. |
 | Add Options underlying after close | The ticker is already a READY Equity member; no Equity backfill or technical work is repeated. Target-session Options catalog/quote, OI/reference/history, allocation and capacity reconcile; deterministic contracts/shards activate while existing members remain unchanged. |
 | Options next-session rollover | Contract/catalog/OI/reference evidence is revalidated for the new session; stale prior slot membership is not reused as current proof. |
+| Delayed pre-freeze retry | Capture-fresh quote/date evidence is evaluated at its persisted review clock and still allocates after wall-clock delay. |
+| Capture-stale pre-freeze retry | The affected catalog/reference work is durably refreshed under a reserved provider budget; restart resumes it and immutable prior evidence remains. |
+| Retry after allocation freeze | The exact frozen C6 membership is reused and no catalog refresh or intraday rotation occurs. |
+| Equity preparation used the shared account earlier | Options still receives its independent local preparation allowance while both lanes remain bounded by the same shared account ceiling. |
+| Old unfinished Options preparation | It becomes `EXPIRED` after close-plus-five or `SUPERSEDED` by a newer session and is never selected again; active drain/recovery remains intact. |
+| Two minutes after close with unfinished final processing | Status and scheduler both report `DRAINING` for the current session while tomorrow remains separately visible as future preparation. |
 | Equity ingress crash | Same journal generation/owner recovery or explicit new fenced generation; no duplicate bars. |
 | Options logical shard crash | The physical socket/journal remains owned and healthy logical shards continue. Only the failed processing shard releases/reclaims its lease and resumes its checkpoint; shard failure remains visible. |
 | Options physical transport crash | The sole socket owner reconnects once for the account/feed, records one shared transport gap and preserves every logical checkpoint; logical shards never open replacement sockets. |
@@ -1276,6 +1382,8 @@ reverting schema or data-plane changes.
 | Retention/archive failure | Alarm/status visible; source rows and live ingestion remain intact. |
 | Exact-four regression | Current validated QQQ/SPY path remains equivalent. |
 | Larger membership | Deterministic sharding, bounded memory, visible partial readiness and no silent truncation. |
+| V3-only isolated restore | Legacy `public.*` relations and the legacy validator are not required; all V3 lifecycle, journal, C6, C7, retention, migration and role checks run. |
+| Unequal raw/normalized restore offsets | Each checkpoint is bounded only by its declared raw or normalized stream; unknown coordinates fail instead of using a maximum fallback. |
 
 ### Focused Regression Suites To Preserve
 
@@ -1313,11 +1421,20 @@ exact-four and target-9 fixtures as known examples.
 | Old catch-up release wins pointer race | Compare cutoff/generation in the sole publisher transaction. |
 | Exact count assumptions remain in readers | Inventory validators, health, result counts, tests and UI summaries before generic activation. |
 | Options membership exceeds one connection | Deterministic shards; no truncation; explicit over-limit status. |
+| Delayed allocation reinterprets fresh evidence as stale | Persist capture/review clocks; refresh only evidence already stale at capture time and only before allocation freeze. |
+| Candidate shape silently selects exact-four mode | Persist explicit compatibility identity; generalized decoding never infers legacy mode from tickers, count, sides or missing OI. |
 | Equity breadth invalidates unchanged Options | Options validates only its configured underlyings against READY desired/package Equity context; unrelated Equity members neither rotate nor block Options. |
 | One Options shard blocks all products | Independent logical-shard leases/checkpoints/retry plus product-declared completeness; the one physical socket remains shared and is not a logical-shard restart mechanism. |
 | Intended membership and readiness collapse | Immutable desired membership remains intact while operational readiness changes independently. |
 | P8 file append guarantees are lost in DB move | Transactional append sequence, previous hash and idempotent replay tests. |
 | Session rollover resets cumulative usage after crash | Session-keyed counters persist independently of process lifetime. |
+| Compose omits C6 allocation overrides | The lifecycle service inherits the shared configured/measured/provider/per-underlying/total ceiling mapping used by native startup. |
+| V3 restore requires unrelated legacy tables | Require explicit `Legacy`, `RealtimeV3` or `Both` validation scope; only `Both` combines validators. |
+| Restore accepts a normalized checkpoint against the raw tail | Classify each checkpoint coordinate and reject unknown owners; never compare against `GREATEST(raw, normalized)`. |
+| Small Options allowance is applied to all account traffic | Enforce scope-local and shared-account ceilings separately under one account lock and persist the shared ceiling consistently on every Advanced scope. |
+| Old RETRY work starves the next session | Persist `EXPIRED`/`SUPERSEDED` metadata and block obsolete nonterminal work before claim selection without changing completed evidence or active sessions. |
+| Advanced caller omits account enforcement | Fail closed in the coordinated helper; every Advanced reservation path must explicitly enforce both scope and account ceilings. |
+| Status rolls before scheduler completion | Use one shared 30/5/300-second runtime timing contract and keep current processing separate from future preparation. |
 | Same-day budget change creates another plan | First session plan/budgets remain pinned; changed configuration is next-session intent. |
 | Provider close switches processing too early | Separate acquisition, processing-drain and future-preparation clocks retain the current final window through completion. |
 | Rollover rollback hides capability demand | Pending target-session intent is durable before capability-dependent snapshot reconciliation. |
@@ -1360,6 +1477,14 @@ The consolidation is complete when:
    duplicate Equity preparation.
 15. logical Options processing shards recover independently from the shared durable
    journal, while exactly one physical Options socket owns reconnect and gap evidence.
+16. capture-fresh premarket evidence remains valid across delayed pre-freeze retries;
+   capture-stale evidence has a durable restart-safe refresh path, and frozen
+   allocations never refresh intraday;
+17. generalized sealed captures never infer exact-four compatibility and retain sparse,
+   one-sided and missing-OI candidates for canonical C6 decisions;
+18. native and Compose lifecycle owners receive the same C6 allocation ceiling inputs;
+19. restore verification has explicit legacy/V3 scopes and validates every checkpoint
+   only against its declared raw or normalized durable boundary.
 
 ## Existing Detailed Pipeline Reference
 

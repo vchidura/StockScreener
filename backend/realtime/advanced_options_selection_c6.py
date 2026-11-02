@@ -851,19 +851,19 @@ class C6UnderlyingReadiness:
 
     @property
     def ready(self) -> bool:
-        required = (
-            self.catalog,
-            self.open_interest,
-            self.history,
-            *(
-                state
+        return (
+            self.catalog is C6ReadinessState.AVAILABLE
+            and self.history is C6ReadinessState.AVAILABLE
+            and self.open_interest
+            in {
+                C6ReadinessState.AVAILABLE,
+                C6ReadinessState.NOT_REQUIRED,
+            }
+            and all(
+                state is C6ReadinessState.AVAILABLE
                 for _, state in self.feed_states
                 if state is not C6ReadinessState.NOT_REQUIRED
-            ),
-        )
-        return all(
-            state is C6ReadinessState.AVAILABLE
-            for state in required
+            )
         )
 
 

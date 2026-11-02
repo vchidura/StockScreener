@@ -120,7 +120,7 @@ def test_effective_snapshot_selection_is_bounded_when_pointer_is_next_session(
     load_snapshot.assert_called_once_with(cursor, active_revision_id)
 
 
-def test_desired_state_rejects_invalid_or_unbacked_options_membership():
+def test_desired_state_accepts_automatic_or_stored_options_membership():
     with pytest.raises(ValueError, match="invalid syntax"):
         DesiredMemberIntent("bad symbol!", DesiredMemberKind.EQUITY)
     with pytest.raises(ValueError, match="requires an enabled Equity"):
@@ -134,17 +134,24 @@ def test_desired_state_rejects_invalid_or_unbacked_options_membership():
                 ),
             ),
         )
-    with pytest.raises(ValueError, match="stored slot-set"):
-        DesiredStateChange(
-            source_cohort_id=SOURCE_COHORT,
-            members=(
-                DesiredMemberIntent("SPY", DesiredMemberKind.EQUITY),
-                DesiredMemberIntent(
-                    "SPY",
-                    DesiredMemberKind.OPTION_UNDERLYING,
-                ),
+    automatic = DesiredStateChange(
+        source_cohort_id=SOURCE_COHORT,
+        members=(
+            DesiredMemberIntent("SPY", DesiredMemberKind.EQUITY),
+            DesiredMemberIntent(
+                "SPY",
+                DesiredMemberKind.OPTION_UNDERLYING,
             ),
-        )
+        ),
+    )
+    stored = DesiredStateChange(
+        source_cohort_id=SOURCE_COHORT,
+        source_slot_version=1,
+        members=automatic.members,
+    )
+
+    assert automatic.source_slot_version is None
+    assert stored.source_slot_version == 1
 
 
 def test_same_desired_revision_identity_is_replayable_across_record_times():
@@ -173,6 +180,17 @@ def test_same_desired_revision_identity_is_replayable_across_record_times():
     assert replay.revision_id == first.revision_id
     assert replay.revision_sha256 == first.revision_sha256
     assert replay.recorded_at != first.recorded_at
+
+
+def test_management_command_assumes_hardened_app_role():
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+
+    command._set_app_role(connection)
+
+    cursor.execute.assert_called_once_with(
+        "SET ROLE stocks_realtime_v2_app"
+    )
 
 
 def test_maintenance_command_is_provider_free_and_reports_zero_effects(monkeypatch):

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from dotenv import dotenv_values
 from psycopg2.pool import ThreadedConnectionPool
 
 
@@ -53,6 +54,10 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
     parser.add_argument("--confirm-database-name", required=True)
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+    )
     parser.add_argument("--poll-seconds", type=float, default=15.0)
     parser.add_argument("--maximum-concurrency", type=int, default=1)
     parser.add_argument(
@@ -83,9 +88,15 @@ def parse_args(argv=None):
     parser.add_argument("--lease-seconds", type=int, default=300)
     parser.add_argument("--retry-initial-seconds", type=int, default=15)
     parser.add_argument("--retry-maximum-seconds", type=int, default=900)
-    parser.add_argument("--once", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true")
+    mode.add_argument("--until-idle", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
+    if args.env_file is not None:
+        args.env_file = args.env_file.resolve()
+        if not args.env_file.is_file():
+            parser.error("--env-file is unavailable")
     validate_target_database_v2(
         args.database,
         args.confirm_database_name,
@@ -169,8 +180,20 @@ def _payload(result) -> str:
 
 def main(argv=None):
     args = parse_args(argv)
-    config = RealtimeV2PipelineConfig.from_mapping(
-        os.environ,
+    env_file = args.env_file or BACKEND_DIR / ".env"
+    file_environment = (
+        {
+            key: value
+            for key, value in dotenv_values(env_file).items()
+            if value is not None
+        }
+        if env_file.is_file()
+        else {}
+    )
+    config = RealtimeV2PipelineConfig.from_mapping({
+        **file_environment,
+        **os.environ,
+    },
         process=RealtimeV2Process.EQUITY_PREPARATION,
     )
     if (
@@ -202,6 +225,8 @@ def main(argv=None):
             print(_payload(result))
             if args.once:
                 return 0 if result.status != "BLOCKED" else 1
+            if args.until_idle and result.status in {"IDLE", "BLOCKED"}:
+                return 0 if result.status == "IDLE" else 1
             wait_seconds = args.poll_seconds
             if result.next_retry_at is not None:
                 wait_seconds = min(

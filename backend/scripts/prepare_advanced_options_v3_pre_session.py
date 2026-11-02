@@ -47,6 +47,7 @@ from realtime.advanced_options_p8_production import (  # noqa: E402
 from realtime.advanced_options_p8_selection_source import (  # noqa: E402
     MassiveAdvancedOptionsSelectionSource,
     P8_SELECTION_MAXIMUM_DECODED_BYTES,
+    SEALED_CAPTURE_GENERALIZED_C6_PROFILE,
 )
 from realtime.advanced_options_selection_c6 import OptionSide  # noqa: E402
 from realtime.contracts import UniverseManifest, canonical_sha256  # noqa: E402
@@ -976,6 +977,10 @@ def main(argv=None) -> int:
         })
         capture_document = {
             "contract": "advanced-options-v3-pre-session-capture-v1",
+            "compatibility_profile": (
+                SEALED_CAPTURE_GENERALIZED_C6_PROFILE
+            ),
+            "configured_underlyings": list(args.underlyings),
             "captured_at_utc": completed_at.isoformat(),
             "session_date": args.session_date.isoformat(),
             "source_cohort_id": str(args.source_cohort_id),

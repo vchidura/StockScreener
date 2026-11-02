@@ -41,6 +41,8 @@ from .advanced_options_p8_runtime import (
     validate_p8_execution_bundle_document,
 )
 from .advanced_options_p8_selection_source import (
+    SEALED_CAPTURE_EXACT_FOUR_PROFILE,
+    SEALED_CAPTURE_GENERALIZED_C6_PROFILE,
     p8_activity_selection_capture_from_sealed,
 )
 from .advanced_options_reference_repository import (
@@ -318,7 +320,12 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
         unsigned.pop("semantic_sha256", None)
         if canonical_sha256(unsigned) != semantic_sha256:
             raise ValueError("sealed selection semantic identity changed")
-        capture = p8_activity_selection_capture_from_sealed(document)
+        capture = p8_activity_selection_capture_from_sealed(
+            document,
+            compatibility_profile=str(
+                document.get("compatibility_profile") or ""
+            ),
+        )
         pre_session = package["v3_pre_session_authority"]
         admission = authority_bundle.admission
         if (
@@ -576,18 +583,36 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
             )
             for row in cursor.fetchall()
         }
-        if set(stored_oi) != {
-            row.contract_id for row in reference.open_interest
-        } or any(
-            stored_oi[row.contract_id][0] != row.member_sha256
-            or stored_oi[row.contract_id][1] != "AVAILABLE"
-            or stored_oi[row.contract_id][2].get(
-                "contract_ticker"
+        contracts_by_id = {
+            row.contract_id: row for row in admission.contracts
+        }
+        reference_by_id = {
+            row.contract_id: row for row in reference.open_interest
+        }
+        if set(stored_oi) != set(contracts_by_id) or any(
+            stored_oi[contract_id][2].get("contract_ticker")
+            != contract.contract_ticker
+            or (
+                contract.open_interest is None
+                and (
+                    stored_oi[contract_id][1] != "UNAVAILABLE"
+                    or contract_id in reference_by_id
+                    or stored_oi[contract_id][2].get("open_interest")
+                    is not None
+                )
             )
-            != row.contract_ticker
-            or stored_oi[row.contract_id][2].get("open_interest")
-            != row.open_interest
-            for row in reference.open_interest
+            or (
+                contract.open_interest is not None
+                and (
+                    contract_id not in reference_by_id
+                    or stored_oi[contract_id][1] != "AVAILABLE"
+                    or stored_oi[contract_id][0]
+                    != reference_by_id[contract_id].member_sha256
+                    or stored_oi[contract_id][2].get("open_interest")
+                    != contract.open_interest
+                )
+            )
+            for contract_id, contract in contracts_by_id.items()
         ):
             raise ValueError(
                 "stored current-session prior OI members changed"
@@ -1133,6 +1158,12 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
                 )
             )
             if allocation is not None:
+                if sealed_selection.get(
+                    "compatibility_profile"
+                ) != SEALED_CAPTURE_GENERALIZED_C6_PROFILE:
+                    raise ValueError(
+                        "generalized C6 compatibility identity changed"
+                    )
                 profile = load_activity_momentum_profile(
                     selection_policy=selection_policy,
                     version=allocation.profile_version,
@@ -1215,10 +1246,14 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
                     c6_coverage_from_activity_allocation(allocation)
                 )
             else:
-                if len(admission.contracts) != 4:
+                if (
+                    sealed_selection.get("compatibility_profile")
+                    != SEALED_CAPTURE_EXACT_FOUR_PROFILE
+                    or len(admission.contracts) != 4
+                ):
                     raise ValueError(
-                        "configured C6 admission requires persisted "
-                        "activity/momentum allocation"
+                        "configured C6 admission requires an explicit "
+                        "compatibility identity or persisted allocation"
                     )
                 members = tuple(
                     C6SelectionMember(

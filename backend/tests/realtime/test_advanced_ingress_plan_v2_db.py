@@ -29,9 +29,19 @@ from realtime.advanced_ingress_repository import (
     load_advanced_ingress_runtime_plan_cursor,
     finish_advanced_ingress_plan_cursor,
     register_advanced_runtime_profile_cursor,
+    reserve_advanced_incremental_request_cursor,
     record_advanced_ingress_usage_cursor,
     resolve_advanced_ingress_plan_cursor,
     revoke_advanced_stream_authorization_cursor,
+)
+from realtime.acquisition_ledger import (
+    ProviderRequestLane,
+    ProviderRequestReservation,
+)
+from realtime.provider_budget import (
+    ProviderBudgetExceeded,
+    ProviderBudgetScope,
+    reserve_coordinated_provider_request_cursor,
 )
 from realtime.advanced_ingress_runtime_profile import (
     load_advanced_ingress_runtime_catalog,
@@ -423,6 +433,107 @@ def _admit(provider, plan, *, attempt, owner_epoch, session_id):
             owner_epoch=owner_epoch,
             checked_at=SESSION_OPEN + timedelta(minutes=1),
         )
+
+
+def test_incremental_repair_account_exhaustion_preserves_ledger_and_usage(
+    hardened_database,
+):
+    pool, provider, roles, _cohort_id, _manifest_id = hardened_database
+    budgets = AdvancedIngressBudgets(2, 2, 100, 2, 20)
+    authorization = _create_authorization(
+        pool,
+        roles,
+        "account-exhausted-incremental-repair",
+        budgets=budgets,
+    )
+    plan = _prepare_plan(
+        provider,
+        authorization,
+        budgets=budgets,
+    )
+    account_request_ceiling = 3
+    account_byte_ceiling = 300
+    other_scope = ProviderBudgetScope(
+        account_alias="MASSIVE_ADVANCED",
+        session_date=SESSION_DATE,
+        authorization_reference="other-advanced-scope",
+        provider_authorization_reference="stocks-advanced",
+        expected_cost="existing subscription",
+        request_ceiling=3,
+        decoded_byte_ceiling=300,
+        account_request_ceiling=account_request_ceiling,
+        account_decoded_byte_ceiling=account_byte_ceiling,
+        lanes=frozenset({ProviderRequestLane.REFERENCE}),
+        authorized_until=plan.authorized_end_at,
+    )
+    repair_scope = ProviderBudgetScope(
+        account_alias="MASSIVE_ADVANCED",
+        session_date=SESSION_DATE,
+        authorization_reference=plan.authorization_reference,
+        provider_authorization_reference="stocks-advanced",
+        expected_cost="existing subscription",
+        request_ceiling=2,
+        decoded_byte_ceiling=20,
+        account_request_ceiling=account_request_ceiling,
+        account_decoded_byte_ceiling=account_byte_ceiling,
+        lanes=frozenset({ProviderRequestLane.EQUITY_HISTORY}),
+        authorized_until=plan.authorized_end_at,
+    )
+    rejected_request_id = uuid4()
+    with provider.transaction(APP_ROLE) as unit:
+        for index in range(account_request_ceiling):
+            reserve_coordinated_provider_request_cursor(
+                unit.cursor,
+                other_scope,
+                ProviderRequestReservation(
+                    request_id=uuid4(),
+                    account_alias="MASSIVE_ADVANCED",
+                    lane=ProviderRequestLane.REFERENCE,
+                    endpoint_class="OTHER_ADVANCED_SCOPE",
+                    request_sha256=f"{index + 1:064x}",
+                    reserved_at=SESSION_OPEN,
+                ),
+                reserved_response_bytes=10,
+                account_wide=True,
+            )
+        with pytest.raises(
+            ProviderBudgetExceeded,
+            match="account request ceiling",
+        ):
+            reserve_advanced_incremental_request_cursor(
+                unit.cursor,
+                repair_scope,
+                ProviderRequestReservation(
+                    request_id=rejected_request_id,
+                    account_alias="MASSIVE_ADVANCED",
+                    lane=ProviderRequestLane.EQUITY_HISTORY,
+                    endpoint_class="ADVANCED_INCREMENTAL_REPAIR",
+                    request_sha256="f" * 64,
+                    reserved_at=SESSION_OPEN + timedelta(minutes=1),
+                    cohort_id=plan.cohort_id,
+                ),
+                plan_id=plan.plan_id,
+                reserved_response_bytes=10,
+            )
+        unit.cursor.execute(
+            "SELECT count(*),count(*) FILTER (WHERE request_id=%s) "
+            "FROM rt.provider_request_ledger",
+            (str(rejected_request_id),),
+        )
+        ledger_count, rejected_count = unit.cursor.fetchone()
+        unit.cursor.execute(
+            "SELECT rest_repair_request_count,"
+            "rest_repair_decoded_byte_count "
+            "FROM rt.advanced_ingress_plan_usage WHERE plan_id=%s",
+            (str(plan.plan_id),),
+        )
+        usage = unit.cursor.fetchone()
+
+    assert (ledger_count, rejected_count) == (
+        account_request_ceiling,
+        0,
+    )
+    assert usage == (0, 0)
 
 
 def test_controller_status_reports_active_external_stream(

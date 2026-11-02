@@ -17,6 +17,9 @@ from .advanced_realtime_desired_state_repository import (
 UTC = timezone.utc
 ADVANCED_REALTIME_V3_COMPOSE_PROFILE = "advanced-realtime-v3"
 ADVANCED_REALTIME_V3_RUNTIME_RESOURCE = "advanced-realtime-v3:runtime"
+ADVANCED_REALTIME_V3_DRAIN_SECONDS = 30
+ADVANCED_REALTIME_V3_FINALITY_DELAY_SECONDS = 5
+ADVANCED_REALTIME_V3_COMPLETION_BUDGET_SECONDS = 300
 
 
 class AdvancedRealtimeRoleGroup(str, Enum):
@@ -241,9 +244,13 @@ def load_current_advanced_realtime_session_scope_cursor(
     cursor,
     *,
     checked_at: datetime,
-    drain_seconds: int = 30,
-    finality_delay_seconds: int = 5,
-    completion_budget_seconds: int = 60,
+    drain_seconds: int = ADVANCED_REALTIME_V3_DRAIN_SECONDS,
+    finality_delay_seconds: int = (
+        ADVANCED_REALTIME_V3_FINALITY_DELAY_SECONDS
+    ),
+    completion_budget_seconds: int = (
+        ADVANCED_REALTIME_V3_COMPLETION_BUDGET_SECONDS
+    ),
 ) -> AdvancedRealtimeSessionScope | None:
     if checked_at.tzinfo is None or checked_at.utcoffset() is None:
         raise ValueError("Advanced V3 scope clock must be timezone-aware")

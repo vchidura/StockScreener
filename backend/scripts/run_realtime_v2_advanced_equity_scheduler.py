@@ -21,6 +21,10 @@ from options.calendar import OptionExchangeCalendar  # noqa: E402
 from realtime.advanced_ingress_runtime_profile import (  # noqa: E402
     load_advanced_ingress_runtime_catalog,
 )
+from realtime.advanced_realtime_v3_runtime import (  # noqa: E402
+    ADVANCED_REALTIME_V3_COMPLETION_BUDGET_SECONDS,
+    ADVANCED_REALTIME_V3_FINALITY_DELAY_SECONDS,
+)
 from realtime.advanced_scheduler import (  # noqa: E402
     audit_completed_session_coverage_cursor,
     discover_advanced_window_recovery_cursor,
@@ -77,10 +81,14 @@ def parse_args(argv=None):
         type=int,
         default=int(
             os.getenv("REALTIME_V2_ADVANCED_FINALITY_DELAY_SECONDS")
-            or 5
+            or ADVANCED_REALTIME_V3_FINALITY_DELAY_SECONDS
         ),
     )
-    parser.add_argument("--completion-budget-seconds", type=int, default=300)
+    parser.add_argument(
+        "--completion-budget-seconds",
+        type=int,
+        default=ADVANCED_REALTIME_V3_COMPLETION_BUDGET_SECONDS,
+    )
     parser.add_argument("--authorization-reference")
     parser.add_argument(
         "--publication-mode",

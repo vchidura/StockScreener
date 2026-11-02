@@ -107,7 +107,7 @@ def test_concurrent_v2_lanes_cannot_spend_the_same_last_reservation(pool):
     ),)
 
 
-def test_fresh_authorization_has_an_independent_explicit_budget_scope(pool):
+def test_fresh_authorizations_have_independent_scope_and_shared_account(pool):
     session = date(2026, 10, 16)
     first_scope = ProviderBudgetScope(
         account_alias="MASSIVE_ADVANCED",
@@ -117,6 +117,8 @@ def test_fresh_authorization_has_an_independent_explicit_budget_scope(pool):
         expected_cost="bounded repair",
         request_ceiling=1,
         decoded_byte_ceiling=2_001,
+        account_request_ceiling=2,
+        account_decoded_byte_ceiling=4_002,
         lanes=frozenset({ProviderRequestLane.EQUITY_HISTORY}),
         authorized_until=datetime(2026, 10, 16, 15, tzinfo=timezone.utc),
     )
@@ -128,6 +130,8 @@ def test_fresh_authorization_has_an_independent_explicit_budget_scope(pool):
         expected_cost="bounded repair",
         request_ceiling=1,
         decoded_byte_ceiling=2_001,
+        account_request_ceiling=2,
+        account_decoded_byte_ceiling=4_002,
         lanes=frozenset({ProviderRequestLane.EQUITY_HISTORY}),
         authorized_until=datetime(2026, 10, 16, 16, tzinfo=timezone.utc),
     )
@@ -135,7 +139,10 @@ def test_fresh_authorization_has_an_independent_explicit_budget_scope(pool):
     connection = pool.getconn()
     try:
         with connection.cursor() as cursor:
-            for scope in (first_scope, second_scope):
+            for expected_account_requests, scope in enumerate(
+                (first_scope, second_scope),
+                start=1,
+            ):
                 admission = reserve_coordinated_provider_request_cursor(
                     cursor,
                     scope,
@@ -148,9 +155,123 @@ def test_fresh_authorization_has_an_independent_explicit_budget_scope(pool):
                         reserved_at=datetime.now(timezone.utc),
                     ),
                     reserved_response_bytes=2_001,
+                    account_wide=True,
                 )
                 assert admission.newly_reserved
-                assert admission.status.requests_reserved == 1
+                assert (
+                    admission.status.requests_reserved
+                    == expected_account_requests
+                )
         connection.commit()
+    finally:
+        pool.putconn(connection)
+
+
+def test_local_options_allowance_is_independent_of_shared_account_usage(
+    pool,
+):
+    session = date(2026, 10, 16)
+    account_requests = 3
+    account_bytes = 10_000
+    equity_scope = ProviderBudgetScope(
+        account_alias="MASSIVE_ADVANCED",
+        session_date=session,
+        authorization_reference="equity-preparation",
+        provider_authorization_reference="massive-advanced-account",
+        expected_cost="existing subscription",
+        request_ceiling=2,
+        decoded_byte_ceiling=4_000,
+        account_request_ceiling=account_requests,
+        account_decoded_byte_ceiling=account_bytes,
+        lanes=frozenset({ProviderRequestLane.EQUITY_HISTORY}),
+        authorized_until=datetime(2026, 10, 16, 20, tzinfo=timezone.utc),
+    )
+    options_scope = ProviderBudgetScope(
+        account_alias="MASSIVE_ADVANCED",
+        session_date=session,
+        authorization_reference="options-preparation",
+        provider_authorization_reference="massive-advanced-account",
+        expected_cost="existing subscription",
+        request_ceiling=1,
+        decoded_byte_ceiling=2_000,
+        account_request_ceiling=account_requests,
+        account_decoded_byte_ceiling=account_bytes,
+        lanes=frozenset({ProviderRequestLane.OPTIONS_CHAIN}),
+        authorized_until=datetime(2026, 10, 16, 20, tzinfo=timezone.utc),
+    )
+    connection = pool.getconn()
+    try:
+        with connection.cursor() as cursor:
+            for index in range(2):
+                reserve_coordinated_provider_request_cursor(
+                    cursor,
+                    equity_scope,
+                    ProviderRequestReservation(
+                        request_id=uuid4(),
+                        account_alias="MASSIVE_ADVANCED",
+                        lane=ProviderRequestLane.EQUITY_HISTORY,
+                        endpoint_class="EQUITY_PREPARATION",
+                        request_sha256=f"{index + 1:064x}",
+                        reserved_at=datetime.now(timezone.utc),
+                    ),
+                    reserved_response_bytes=2_000,
+                    account_wide=True,
+                )
+            admission = reserve_coordinated_provider_request_cursor(
+                cursor,
+                options_scope,
+                ProviderRequestReservation(
+                    request_id=uuid4(),
+                    account_alias="MASSIVE_ADVANCED",
+                    lane=ProviderRequestLane.OPTIONS_CHAIN,
+                    endpoint_class="OPTIONS_PREPARATION",
+                    request_sha256="f" * 64,
+                    reserved_at=datetime.now(timezone.utc),
+                ),
+                reserved_response_bytes=2_000,
+                account_wide=True,
+            )
+            assert admission.status.requests_reserved == 3
+            with pytest.raises(
+                ProviderBudgetExceeded,
+                match="account request ceiling",
+            ):
+                reserve_coordinated_provider_request_cursor(
+                    cursor,
+                    ProviderBudgetScope(
+                        account_alias="MASSIVE_ADVANCED",
+                        session_date=session,
+                        authorization_reference="another-scope",
+                        provider_authorization_reference=(
+                            "massive-advanced-account"
+                        ),
+                        expected_cost="existing subscription",
+                        request_ceiling=1,
+                        decoded_byte_ceiling=2_000,
+                        account_request_ceiling=account_requests,
+                        account_decoded_byte_ceiling=account_bytes,
+                        lanes=frozenset({
+                            ProviderRequestLane.REFERENCE,
+                        }),
+                        authorized_until=datetime(
+                            2026,
+                            10,
+                            16,
+                            20,
+                            tzinfo=timezone.utc,
+                        ),
+                    ),
+                    ProviderRequestReservation(
+                        request_id=uuid4(),
+                        account_alias="MASSIVE_ADVANCED",
+                        lane=ProviderRequestLane.REFERENCE,
+                        endpoint_class="REFERENCE_PREPARATION",
+                        request_sha256="e" * 64,
+                        reserved_at=datetime.now(timezone.utc),
+                    ),
+                    reserved_response_bytes=1_000,
+                    account_wide=True,
+                )
+        connection.rollback()
     finally:
         pool.putconn(connection)

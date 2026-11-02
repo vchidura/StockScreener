@@ -30,6 +30,7 @@ from realtime.advanced_realtime_desired_state_repository import (  # noqa: E402
     reconcile_desired_state,
     update_desired_member_preparation,
 )
+from realtime.migrations import EXPECTED_V2_DATABASE_NAME  # noqa: E402
 
 
 def _datetime(value: str) -> datetime:
@@ -49,7 +50,7 @@ def parse_args(argv=None):
 
     apply = subparsers.add_parser("apply")
     apply.add_argument("--source-cohort-id", type=UUID, required=True)
-    apply.add_argument("--source-slot-version", type=int, default=1)
+    apply.add_argument("--source-slot-version", type=int)
     apply.add_argument("--observed-at", type=_datetime)
     apply.add_argument("--equity", action="append", default=[])
     apply.add_argument("--sector-etf", action="append", default=[])
@@ -200,9 +201,17 @@ def _dsn() -> str:
     return dsn
 
 
+def _set_app_role(connection) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"SET ROLE {EXPECTED_V2_DATABASE_NAME}_app"
+        )
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     with psycopg2.connect(dsn=_dsn(), options="-c timezone=UTC") as connection:
+        _set_app_role(connection)
         result = execute(args, connection)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0

@@ -25,6 +25,8 @@ from .equity_interval_derivation import derive_realtime_interval_facts
 from .gap_repair_plan import plan_gap_repair_cursor
 from .provider_budget import (
     ProviderBudgetExceeded,
+    MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING,
+    MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING,
     ProviderBudgetScope,
     reserve_coordinated_provider_request_cursor,
 )
@@ -390,6 +392,12 @@ def reserve_advanced_gap_repair_cursor(
         expected_cost="standing authorization repair allocation",
         request_ceiling=int(row[2]),
         decoded_byte_ceiling=int(row[3]),
+        account_request_ceiling=(
+            MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING
+        ),
+        account_decoded_byte_ceiling=(
+            MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING
+        ),
         lanes=frozenset({ProviderRequestLane.EQUITY_HISTORY}),
         authorized_until=row[4],
     )
@@ -406,6 +414,7 @@ def reserve_advanced_gap_repair_cursor(
             cohort_id=UUID(str(row[1])),
         ),
         reserved_response_bytes=repair.reserved_response_bytes,
+        account_wide=True,
     )
     cursor.execute(
         "UPDATE rt.advanced_ingress_plan_usage SET "

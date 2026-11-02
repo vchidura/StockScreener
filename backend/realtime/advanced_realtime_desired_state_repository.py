@@ -1130,7 +1130,7 @@ def _record_desired_state_revision_cursor(
         and member.kind is DesiredMemberKind.OPTION_UNDERLYING
         and member.ticker not in security_ids
     )
-    if unresolved_options:
+    if unresolved_options and change.source_slot_version is not None:
         raise ValueError(
             "Options desired members require stored identities: "
             + ",".join(sorted(unresolved_options))
@@ -1496,6 +1496,72 @@ def bind_desired_member_identity_cursor(
             str(intent_id),
         ),
     )
+    cursor.execute(
+        "SELECT intent.intent_id::text,intent.priority,intent.enabled,"
+        "readiness.status,readiness.reasons,readiness.checked_at "
+        "FROM rt.realtime_desired_member_intents AS intent "
+        "JOIN rt.realtime_desired_intent_readiness AS readiness "
+        "USING(intent_id) "
+        "WHERE intent.revision_id=%s AND intent.ticker=%s "
+        "AND intent.member_kind='OPTION_UNDERLYING'",
+        (str(revision_id), normalized_ticker),
+    )
+    option_intent = cursor.fetchone()
+    if option_intent is not None:
+        option_intent_id = UUID(str(option_intent[0]))
+        option_identity_sha256 = canonical_sha256({
+            "version": "advanced-realtime-member-binding-v1",
+            "intent_id": option_intent_id,
+            "security_id": security_id,
+            "security_revision_id": security_revision_id,
+            "instrument_id": instrument_id,
+        })
+        cursor.execute(
+            "INSERT INTO rt.realtime_desired_member_bindings ("
+            "intent_id,revision_id,security_id,security_revision_id,"
+            "instrument_id,identity_sha256,source_lineage,resolved_at"
+            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (intent_id) DO NOTHING",
+            (
+                str(option_intent_id),
+                str(revision_id),
+                str(security_id),
+                str(security_revision_id),
+                instrument_id,
+                option_identity_sha256,
+                Json({
+                    **source_lineage,
+                    "inherited_from_member_kind": kind.value,
+                }),
+                checked,
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO rt.realtime_desired_members ("
+            "revision_id,security_id,ticker,member_kind,priority,enabled"
+            ") VALUES (%s,%s,%s,'OPTION_UNDERLYING',%s,%s) "
+            "ON CONFLICT DO NOTHING",
+            (
+                str(revision_id),
+                str(security_id),
+                normalized_ticker,
+                int(option_intent[1]),
+                bool(option_intent[2]),
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO rt.realtime_desired_member_readiness ("
+            "revision_id,security_id,member_kind,status,reasons,checked_at"
+            ") VALUES (%s,%s,'OPTION_UNDERLYING',%s,%s,%s) "
+            "ON CONFLICT DO NOTHING",
+            (
+                str(revision_id),
+                str(security_id),
+                str(option_intent[3]),
+                list(option_intent[4]),
+                option_intent[5],
+            ),
+        )
     return DesiredMemberPreparation(
         revision_id=revision_id,
         security_id=security_id,
@@ -1953,11 +2019,6 @@ def reconcile_desired_state_revision_cursor(
             ),
         )
     capability_profile_id, capability_profile_sha256 = capability
-    universe = UniverseManifest(
-        version="advanced-realtime-desired-session-v1",
-        equity_tickers=base_tickers,
-        option_underlyings=option_tickers,
-    )
     security_ids = dict(revision.security_ids)
     equity_members = tuple(
         SubscriptionMember(
@@ -1990,7 +2051,11 @@ def reconcile_desired_state_revision_cursor(
         row for row in stored_options
         if ticker_by_security.get(row.security_id) in option_tickers
     )
-    if option_tickers and not selected_options:
+    if (
+        option_tickers
+        and revision.source_slot_version is not None
+        and not selected_options
+    ):
         raise ValueError("desired Options underlyings have no stored slot members")
     if any(row.purpose is SlotSetPurpose.RESERVE for row in selected_options):
         raise ValueError("C2 cannot generalize stored reserve-slot policy")
@@ -2011,20 +2076,32 @@ def reconcile_desired_state_revision_cursor(
         "revision_sha256": revision.revision_sha256,
         "selection_policy_sha256": revision.selection_policy_sha256,
     })
+    snapshot_option_tickers = (
+        option_tickers
+        if revision.source_slot_version is not None
+        else ()
+    )
+    snapshot_universe = UniverseManifest(
+        version="advanced-realtime-desired-session-v1",
+        equity_tickers=base_tickers,
+        option_underlyings=snapshot_option_tickers,
+    )
     manifest = SubscriptionManifest(
         version="advanced-realtime-desired-session-v1",
         session_date=revision.effective_session_date,
-        universe=universe,
+        universe=snapshot_universe,
         capability_profile_sha256=capability_profile_sha256,
         allocation_policy_sha256=allocation_policy_sha256,
         members=equity_members + option_members,
-        maximum_option_quote_contracts=1000 if option_tickers else 0,
+        maximum_option_quote_contracts=(
+            1000 if snapshot_option_tickers else 0
+        ),
     )
     instrument_ids = _equity_instrument_ids_cursor(
         cursor,
         {ticker: security_ids[ticker] for ticker in base_tickers},
     )
-    if option_tickers:
+    if snapshot_option_tickers:
         manifest_id = option_universe_manifest_id(manifest)
         persist_option_universe_manifest_cursor(
             cursor,
@@ -2052,7 +2129,7 @@ def reconcile_desired_state_revision_cursor(
         valuation_sha256=source.valuation_sha256,
         effective_at=effective_at,
     )
-    options_enabled = bool(option_tickers)
+    options_enabled = bool(snapshot_option_tickers)
     options_tier = source.provider_tier if options_enabled else None
     persist_tier_cohort_binding_cursor(
         cursor,
@@ -2067,7 +2144,7 @@ def reconcile_desired_state_revision_cursor(
             ),
             source_manifest_sha256=(
                 option_universe_manifest_sha256(manifest)
-                if option_tickers
+                if snapshot_option_tickers
                 else manifest.sha256
             ),
             valuation_policy_sha256=source.valuation_sha256,
@@ -2129,7 +2206,7 @@ def reconcile_desired_state_revision_cursor(
                 "desired preparation history binding conflicts"
             )
     slot_set_version = None
-    if option_tickers:
+    if snapshot_option_tickers:
         slot_set = SlotSetVersion(
             cohort_id=cohort_id,
             version=1,

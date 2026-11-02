@@ -23,6 +23,11 @@ if str(BACKEND_DIR) not in sys.path:
 from realtime.advanced_equity_lifecycle import (  # noqa: E402
     AdvancedEquityLifecyclePlanner,
 )
+from realtime.advanced_realtime_v3_runtime import (  # noqa: E402
+    ADVANCED_REALTIME_V3_COMPLETION_BUDGET_SECONDS,
+    ADVANCED_REALTIME_V3_DRAIN_SECONDS,
+    ADVANCED_REALTIME_V3_FINALITY_DELAY_SECONDS,
+)
 from realtime.advanced_options_lifecycle import (  # noqa: E402
     reconcile_advanced_options_lifecycle_cursor,
     run_advanced_options_preparation_cycle,
@@ -51,6 +56,9 @@ from realtime.migrations import (  # noqa: E402
 
 
 UTC = timezone.utc
+DEFAULT_CONNECTION_ATTEMPT_CEILING = 12
+DEFAULT_DECODED_MESSAGE_CEILING = 1_000_000
+DEFAULT_DECODED_BYTE_CEILING = 1_073_741_824
 
 
 def parse_args(argv=None):
@@ -58,9 +66,21 @@ def parse_args(argv=None):
     parser.add_argument("--database", required=True)
     parser.add_argument("--confirm-database-name", required=True)
     parser.add_argument("--poll-seconds", type=float, default=2.0)
-    parser.add_argument("--drain-seconds", type=int, default=30)
-    parser.add_argument("--finality-delay-seconds", type=int, default=5)
-    parser.add_argument("--completion-budget-seconds", type=int, default=60)
+    parser.add_argument(
+        "--drain-seconds",
+        type=int,
+        default=ADVANCED_REALTIME_V3_DRAIN_SECONDS,
+    )
+    parser.add_argument(
+        "--finality-delay-seconds",
+        type=int,
+        default=ADVANCED_REALTIME_V3_FINALITY_DELAY_SECONDS,
+    )
+    parser.add_argument(
+        "--completion-budget-seconds",
+        type=int,
+        default=ADVANCED_REALTIME_V3_COMPLETION_BUDGET_SECONDS,
+    )
     parser.add_argument("--continuous", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -164,20 +184,49 @@ def _status_payload(status, lifecycle):
     }
 
 
+def _positive_environment_int(
+    environment,
+    name: str,
+    default: int,
+) -> int:
+    raw = str(environment.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise RuntimeError(f"{name} must be a positive integer") from error
+    if value <= 0:
+        raise RuntimeError(f"{name} must be a positive integer")
+    return value
+
+
+def _optional_positive_environment_int(
+    environment,
+    name: str,
+) -> int | None:
+    raw = str(environment.get(name) or "").strip()
+    if not raw:
+        return None
+    return _positive_environment_int(environment, name, 1)
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     provider, pool = _provider()
-    api_key = str(
-        os.environ.get("POLYGON_API_KEY")
-        or dotenv_values(BACKEND_DIR / ".env").get("POLYGON_API_KEY")
-        or ""
-    ).strip()
+    file_environment = {
+        key: value
+        for key, value in dotenv_values(BACKEND_DIR / ".env").items()
+        if value is not None
+    }
+    environment = {**file_environment, **os.environ}
+    api_key = str(environment.get("POLYGON_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError(
             "continuous Options preparation requires POLYGON_API_KEY"
         )
     configured_image = str(
-        os.environ.get("REALTIME_V2_BACKEND_IMAGE") or ""
+        environment.get("REALTIME_V2_BACKEND_IMAGE") or ""
     ).strip()
     if "@sha256:" in configured_image:
         backend_image_id = "sha256:" + configured_image.rsplit(
@@ -197,22 +246,61 @@ def main(argv=None) -> int:
         backend_image_id=backend_image_id,
         admission_profile_version=(
             LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION
-            if os.environ.get(
+            if str(environment.get(
                 "REALTIME_V3_OPTIONS_EXACT_FOUR_COMPATIBILITY",
                 "",
-            ).strip().upper()
+            )).strip().upper()
             == "ENABLED"
-            else os.environ.get(
+            else str(environment.get(
                 "REALTIME_V3_OPTIONS_ADMISSION_PROFILE",
                 ACTIVITY_MOMENTUM_PROFILE_VERSION,
-            ).strip()
+            )).strip()
         ),
         exact_four_compatibility=(
-            os.environ.get(
+            str(environment.get(
                 "REALTIME_V3_OPTIONS_EXACT_FOUR_COMPATIBILITY",
                 "",
-            ).strip().upper()
+            )).strip().upper()
             == "ENABLED"
+        ),
+        active_quote_contract_budget=(
+            _optional_positive_environment_int(
+                environment,
+                "REALTIME_V3_OPTIONS_ACTIVE_QUOTE_CONTRACT_BUDGET",
+            )
+        ),
+        per_underlying_contract_limit=(
+            _optional_positive_environment_int(
+                environment,
+                "REALTIME_V3_OPTIONS_PER_UNDERLYING_CONTRACT_LIMIT",
+            )
+        ),
+        measured_capacity_limit=(
+            _optional_positive_environment_int(
+                environment,
+                "REALTIME_V3_OPTIONS_ESTABLISHED_MEASURED_CAPACITY",
+            )
+        ),
+        effective_provider_project_ceiling=(
+            _optional_positive_environment_int(
+                environment,
+                "REALTIME_V3_OPTIONS_EFFECTIVE_PROVIDER_PROJECT_CEILING",
+            )
+        ),
+        connection_attempt_ceiling=_positive_environment_int(
+            environment,
+            "REALTIME_V3_OPTIONS_CONNECTION_ATTEMPT_CEILING",
+            DEFAULT_CONNECTION_ATTEMPT_CEILING,
+        ),
+        decoded_message_ceiling=_positive_environment_int(
+            environment,
+            "REALTIME_V3_OPTIONS_DECODED_MESSAGE_CEILING",
+            DEFAULT_DECODED_MESSAGE_CEILING,
+        ),
+        decoded_byte_ceiling=_positive_environment_int(
+            environment,
+            "REALTIME_V3_OPTIONS_DECODED_BYTE_CEILING",
+            DEFAULT_DECODED_BYTE_CEILING,
         ),
     )
     owner_id = uuid4()

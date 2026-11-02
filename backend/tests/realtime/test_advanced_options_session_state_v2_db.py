@@ -46,6 +46,8 @@ from realtime.advanced_options_activity_momentum_c6 import (
     LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION,
 )
 from realtime.advanced_options_p8_selection_source import (
+    SEALED_CAPTURE_EXACT_FOUR_PROFILE,
+    SEALED_CAPTURE_GENERALIZED_C6_PROFILE,
     p8_activity_selection_capture_from_sealed,
 )
 from realtime.advanced_realtime_desired_state import (
@@ -74,6 +76,7 @@ from realtime.contracts import (
     canonical_sha256,
 )
 from realtime.database_access_v2 import (
+    APP_ROLE,
     OWNER_POOL,
     V2AccessConfig,
     V2ConnectionProvider,
@@ -85,8 +88,14 @@ from realtime.option_slot_set import (
     SlotSetPurpose,
     SlotSetVersion,
 )
-from realtime.provider_budget import ProviderBudgetScope
-from realtime.acquisition_ledger import ProviderRequestLane
+from realtime.provider_budget import (
+    ProviderBudgetScope,
+    reserve_coordinated_provider_request_cursor,
+)
+from realtime.acquisition_ledger import (
+    ProviderRequestLane,
+    ProviderRequestReservation,
+)
 from realtime.reference_adapters import (
     _security_id as reference_security_id,
 )
@@ -162,6 +171,8 @@ def _sealed_selection(admission):
         }
     document = {
         "contract": "advanced-options-v3-pre-session-capture-v1",
+        "compatibility_profile": SEALED_CAPTURE_EXACT_FOUR_PROFILE,
+        "configured_underlyings": ["QQQ", "SPY"],
         "captured_at_utc": admission.prepared_at.isoformat(),
         "session_date": admission.session_date.isoformat(),
         "provider_requests": 2,
@@ -1311,11 +1322,30 @@ def _seed_complete_c8_reference(
                 int(cursor.fetchone()[0]),
                 ticker,
                 str(raw["underlying_asset"]["ticker"]),
-                int(raw["open_interest"]),
+                (
+                    None
+                    if raw.get("open_interest") is None
+                    else int(raw["open_interest"])
+                ),
             ))
         contract_inputs = tuple(contract_inputs)
-    open_interest = tuple(
-        AdvancedOptionsOpenInterestReference(
+
+    def open_interest_reference(
+        contract_id,
+        contract_ticker,
+        underlyer,
+        open_interest_value,
+    ):
+        if open_interest_value is None:
+            return AdvancedOptionsOpenInterestReference(
+                contract_id=contract_id,
+                contract_ticker=contract_ticker,
+                underlyer=underlyer,
+                availability=ReferenceAvailability.UNAVAILABLE,
+                known_at=known_at,
+                reason_codes=("MISSING_PRIOR_OPEN_INTEREST",),
+            )
+        return AdvancedOptionsOpenInterestReference(
             contract_id=contract_id,
             contract_ticker=contract_ticker,
             underlyer=underlyer,
@@ -1335,6 +1365,13 @@ def _seed_complete_c8_reference(
             payload_sha256=_digest(
                 f"c8-reference-oi:{contract_ticker}"
             ),
+        )
+    open_interest = tuple(
+        open_interest_reference(
+            contract_id,
+            contract_ticker,
+            underlyer,
+            open_interest_value,
         )
         for (
             contract_id,
@@ -1945,6 +1982,8 @@ def _provider_free_selection_capture(seed, ticker):
             }
     document = {
         "contract": "advanced-options-v3-pre-session-capture-v1",
+        "compatibility_profile": SEALED_CAPTURE_GENERALIZED_C6_PROFILE,
+        "configured_underlyings": [ticker],
         "captured_at_utc": seed[
             "authority_bundle"
         ].session.prepared_at.isoformat(),
@@ -1961,7 +2000,10 @@ def _provider_free_selection_capture(seed, ticker):
         "selected_snapshots": snapshots,
     }
     document["semantic_sha256"] = canonical_sha256(document)
-    return p8_activity_selection_capture_from_sealed(document)
+    return p8_activity_selection_capture_from_sealed(
+        document,
+        compatibility_profile=SEALED_CAPTURE_GENERALIZED_C6_PROFILE,
+    )
 
 
 class _ProviderFreeSelectionSource:
@@ -2103,6 +2145,26 @@ def test_c8_real_executor_provider_free_end_to_end_with_retry():
         assert exact_selection[1]["schema"] == (
             "c6_exact_four_regression_v1"
         )
+        late_cycle = run_advanced_options_preparation_cycle(
+            provider,
+            executor,
+            owner_id=uuid4(),
+            checked_at=(
+                OptionExchangeCalendar("XNYS").session_close(
+                    SESSION_DATE
+                )
+                + timedelta(minutes=6)
+            ),
+            clock=lambda: checked_at,
+        )
+        assert late_cycle["status"] == "IDLE"
+        assert late_cycle["expired_sessions"] == []
+        with cursor(pool) as database_cursor:
+            database_cursor.execute(
+                "SELECT status,expiration_state FROM "
+                "rt.advanced_options_preparation_sessions"
+            )
+            assert database_cursor.fetchone() == ("ACTIVE", None)
 
 
 def test_c8_real_executor_uses_v2_allocation_for_generalized_membership():
@@ -2140,6 +2202,19 @@ def test_c8_real_executor_uses_v2_allocation_for_generalized_membership():
             ticker: _provider_free_selection_capture(seed, ticker)
             for ticker in underlyings
         }
+        spy_capture = captures["SPY"]
+        captures["SPY"] = replace(
+            spy_capture,
+            selected_snapshots={
+                contract_ticker: {
+                    key: value
+                    for key, value in raw.items()
+                    if key != "open_interest"
+                }
+                for contract_ticker, raw
+                in spy_capture.selected_snapshots.items()
+            },
+        )
         executor = PostgresAutomaticOptionsPreparationExecutor(
             provider,
             api_key="provider-free",
@@ -2223,6 +2298,12 @@ def test_c8_real_executor_uses_v2_allocation_for_generalized_membership():
                 "rt.advanced_options_physical_subscriptions"
             )
             physical_count = int(database_cursor.fetchone()[0])
+            database_cursor.execute(
+                "SELECT open_interest_state,reason_codes "
+                "FROM rt.advanced_options_underlying_readiness "
+                "WHERE underlying='SPY'"
+            )
+            spy_readiness = database_cursor.fetchone()
         allocation = dict(generation[4])
         selected_tickers = {
             str(row[1]) for row in selected_rows
@@ -2269,6 +2350,10 @@ def test_c8_real_executor_uses_v2_allocation_for_generalized_membership():
             if value is not None
         )
         assert allocation["consumer_eligibility"]
+        assert spy_readiness == (
+            "NOT_REQUIRED",
+            ["MISSING_PRIOR_OPEN_INTEREST"],
+        )
         assert all(
             set(group["contract_tickers"]).issubset(
                 selected_tickers
@@ -2290,6 +2375,192 @@ def test_c8_real_executor_uses_v2_allocation_for_generalized_membership():
         assert restarted is not None
         assert first.generation_sha256 == generation[0]
         assert restarted.generation_sha256 == first.generation_sha256
+
+
+def test_c8_stale_capture_refresh_survives_restart_before_allocation_freeze():
+    underlyings = ("QQQ", "SPY")
+    with disposable_v2_database(
+        f"test_realtime_v2_c8_refresh_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            seed = _seed_session(
+                database_cursor,
+                options_ready=False,
+            )
+            _seed_c8_equity_history(
+                database_cursor,
+                seed,
+                underlyings=underlyings,
+            )
+            checked_at = seed[
+                "authority_bundle"
+            ].session.prepared_at
+            reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=checked_at,
+            )
+            database_cursor.connection.commit()
+
+        provider = _provider(pool)
+        fresh_captures = {
+            ticker: _provider_free_selection_capture(seed, ticker)
+            for ticker in underlyings
+        }
+        stale_spy = fresh_captures["SPY"]
+        stale_captures = {
+            **fresh_captures,
+            "SPY": replace(
+                stale_spy,
+                selected_snapshots={
+                    contract_ticker: {
+                        **raw,
+                        "last_quote": {
+                            **raw["last_quote"],
+                            "last_updated": int(
+                                (
+                                    checked_at - timedelta(hours=2)
+                                ).timestamp()
+                                * 1_000_000_000
+                            ),
+                        },
+                    }
+                    for contract_ticker, raw
+                    in stale_spy.selected_snapshots.items()
+                },
+            ),
+        }
+        source_state = {
+            "interrupted": True,
+            "reserved_before_io": False,
+        }
+        source_calls = {ticker: 0 for ticker in underlyings}
+
+        def source_factory(claim):
+            source_calls[claim.ticker] += 1
+            capture = (
+                stale_captures[claim.ticker]
+                if source_calls[claim.ticker] == 1
+                else fresh_captures[claim.ticker]
+            )
+            return _ProviderFreeSelectionSource(
+                provider,
+                capture,
+                source_state,
+            )
+
+        def build_executor():
+            return PostgresAutomaticOptionsPreparationExecutor(
+                provider,
+                api_key="provider-free",
+                backend_image_id="sha256:" + "d" * 64,
+                maximum_provider_requests_per_underlying=1,
+                maximum_decoded_bytes_per_underlying=4096,
+                clock=lambda: checked_at,
+                selection_source_factory=source_factory,
+            )
+
+        executor = build_executor()
+        owner_id = uuid4()
+        reference_seeded = False
+        refresh_report = None
+        lifecycle = None
+        for attempt in range(40):
+            cycle_at = checked_at + timedelta(minutes=attempt * 10)
+            report = run_advanced_options_preparation_cycle(
+                provider,
+                executor,
+                owner_id=owner_id,
+                checked_at=cycle_at,
+                clock=lambda: checked_at,
+            )
+            if report["status"] == "REFRESH_REQUIRED":
+                refresh_report = report
+                executor = build_executor()
+                owner_id = uuid4()
+            with cursor(pool) as database_cursor:
+                if not reference_seeded:
+                    database_cursor.execute(
+                        "SELECT count(*) FROM "
+                        "rt.advanced_options_preparation_work "
+                        "WHERE stage='CATALOG_QUOTE' "
+                        "AND status='COMPLETE'"
+                    )
+                    if int(database_cursor.fetchone()[0]) == 2:
+                        snapshots = {
+                            ticker: raw
+                            for capture in fresh_captures.values()
+                            for ticker, raw
+                            in capture.selected_snapshots.items()
+                        }
+                        _seed_complete_c8_reference(
+                            database_cursor,
+                            seed,
+                            underlyings=underlyings,
+                            snapshots=snapshots,
+                        )
+                        reference_seeded = True
+                lifecycle = reconcile_advanced_options_lifecycle_cursor(
+                    database_cursor,
+                    target_session_date=SESSION_DATE,
+                    checked_at=cycle_at,
+                )
+                database_cursor.connection.commit()
+            if lifecycle is not None and lifecycle.status == "ACTIVE":
+                break
+        else:
+            raise AssertionError(
+                "refreshed C8 executor did not activate: "
+                f"report={report!r}, lifecycle={lifecycle!r}"
+            )
+
+        assert refresh_report is not None
+        assert refresh_report["affected_underlyings"] == ["SPY"]
+        assert source_state["reserved_before_io"] is True
+        assert source_calls == {"QQQ": 1, "SPY": 2}
+        with cursor(pool) as database_cursor:
+            database_cursor.execute(
+                "SELECT requested_at,retry_at,backoff_seconds,"
+                "request_document->>'retry_at' FROM "
+                "rt.advanced_options_preparation_refresh_requests"
+            )
+            refresh_request = database_cursor.fetchone()
+            database_cursor.execute(
+                "SELECT count(*) FROM "
+                "rt.advanced_options_preparation_evidence_history "
+                "WHERE stage='CATALOG_QUOTE' AND intent_id=("
+                "SELECT intent_id FROM "
+                "rt.advanced_options_preparation_work "
+                "WHERE ticker='SPY' AND stage='CATALOG_QUOTE')"
+            )
+            refreshed_catalog_evidence = int(
+                database_cursor.fetchone()[0]
+            )
+            database_cursor.execute(
+                "SELECT count(*) FROM "
+                "rt.advanced_options_selection_generations"
+            )
+            allocation_count = int(database_cursor.fetchone()[0])
+
+        assert refresh_request[1] > refresh_request[0]
+        assert refresh_request[2] == 30
+        assert refresh_request[3] == refresh_request[1].isoformat()
+        assert refresh_report["retry_at_utc"] == (
+            refresh_request[1].isoformat()
+        )
+        assert refreshed_catalog_evidence == 2
+        assert allocation_count == 1
+
+        calls_after_freeze = dict(source_calls)
+        idle = run_advanced_options_preparation_cycle(
+            provider,
+            build_executor(),
+            owner_id=uuid4(),
+            checked_at=checked_at + timedelta(hours=12),
+            clock=lambda: checked_at,
+        )
+        assert idle["status"] == "IDLE"
+        assert source_calls == calls_after_freeze
 
 
 def test_c8_stage_worker_reclaims_crashed_attempt_with_new_epoch():
@@ -2394,6 +2665,44 @@ class _BudgetProbeExecutor:
         )
 
 
+class _ExhaustedBudgetExecutor:
+    def __init__(self, session_date, authorized_until):
+        self.scope = ProviderBudgetScope(
+            account_alias="MASSIVE_ADVANCED",
+            session_date=session_date,
+            authorization_reference="c8-budget-exhausted",
+            provider_authorization_reference="c8-budget-exhausted",
+            expected_cost="owned provider-free exhaustion",
+            request_ceiling=1,
+            decoded_byte_ceiling=2_000,
+            lanes=frozenset({
+                ProviderRequestLane.OPTIONS_CHAIN,
+            }),
+            authorized_until=authorized_until,
+        )
+        self.executed = False
+
+    def provider_budget(self, _claim):
+        return AdvancedOptionsStageProviderBudget(
+            self.scope,
+            (
+                AdvancedOptionsProviderRequestPlan(
+                    ProviderRequestLane.OPTIONS_CHAIN,
+                    "OPTIONS_CHAIN_SNAPSHOT",
+                    _digest("c8-budget-exhausted-request"),
+                    1_000,
+                ),
+            ),
+        )
+
+    def execute(self, _claim, *, provider_request_ids):
+        self.executed = True
+        raise AssertionError(
+            f"executor received exhausted reservations: "
+            f"{provider_request_ids!r}"
+        )
+
+
 def test_c8_provider_budget_is_reserved_before_stage_io():
     with disposable_v2_database(
         f"test_realtime_v2_c8_budget_{uuid4().hex[:8]}"
@@ -2429,6 +2738,208 @@ def test_c8_provider_budget_is_reserved_before_stage_io():
                 "rt.provider_request_ledger"
             )
             assert database_cursor.fetchone() == ("COMPLETE", 100)
+
+
+def test_c8_budget_exhaustion_persists_wait_and_releases_claim():
+    with disposable_v2_database(
+        f"test_realtime_v2_c8_budget_wait_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            seed = _seed_session(database_cursor)
+            checked_at = seed[
+                "authority_bundle"
+            ].session.prepared_at
+            reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=checked_at,
+            )
+            database_cursor.connection.commit()
+        provider = _provider(pool)
+        authorized_until = checked_at + timedelta(hours=2)
+        executor = _ExhaustedBudgetExecutor(
+            SESSION_DATE,
+            authorized_until,
+        )
+        with provider.transaction(
+            APP_ROLE,
+            isolation_level="SERIALIZABLE",
+        ) as unit:
+            reserve_coordinated_provider_request_cursor(
+                unit.cursor,
+                executor.scope,
+                ProviderRequestReservation(
+                    request_id=uuid4(),
+                    account_alias="MASSIVE_ADVANCED",
+                    lane=ProviderRequestLane.OPTIONS_CHAIN,
+                    endpoint_class="OPTIONS_CHAIN_SNAPSHOT",
+                    request_sha256=_digest(
+                        "c8-budget-existing-reservation"
+                    ),
+                    reserved_at=checked_at - timedelta(minutes=1),
+                    attempt=1,
+                ),
+                reserved_response_bytes=1_000,
+                account_wide=True,
+            )
+
+        report = run_advanced_options_preparation_cycle(
+            provider,
+            executor,
+            owner_id=uuid4(),
+            checked_at=checked_at,
+            clock=lambda: checked_at,
+        )
+
+        assert report["status"] == "WAITING_BUDGET"
+        assert report["provider_requests"] == 0
+        assert report["retry_at_utc"] == authorized_until.isoformat()
+        assert executor.executed is False
+        with cursor(pool) as database_cursor:
+            lifecycle = reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=checked_at + timedelta(seconds=1),
+            )
+            database_cursor.execute(
+                "SELECT status,next_retry_at,lease_owner,lease_until,"
+                "failure_streak,retry_reason FROM "
+                "rt.advanced_options_preparation_work "
+                "WHERE stage='CATALOG_QUOTE' "
+                "ORDER BY ticker LIMIT 1"
+            )
+            work = database_cursor.fetchone()
+            database_cursor.execute(
+                "SELECT status,current_stage,next_retry_at,last_error "
+                "FROM rt.advanced_options_preparation_sessions"
+            )
+            session = database_cursor.fetchone()
+            database_cursor.execute(
+                "SELECT count(*) FROM rt.provider_request_ledger"
+            )
+            ledger_count = int(database_cursor.fetchone()[0])
+            database_cursor.connection.commit()
+
+        assert work == (
+            "RETRY",
+            authorized_until,
+            None,
+            None,
+            1,
+            "PROVIDER_BUDGET_EXHAUSTED",
+        )
+        assert session == (
+            "DEGRADED",
+            "CATALOG_QUOTE",
+            authorized_until,
+            "PROVIDER_BUDGET_EXHAUSTED:CATALOG_QUOTE:"
+            f"{authorized_until.isoformat()}",
+        )
+        assert ledger_count == 1
+        assert lifecycle is not None
+        assert lifecycle.status == "DEGRADED"
+        assert lifecycle.reason_codes == (
+            "WAITING_PROVIDER_BUDGET:CATALOG_QUOTE",
+        )
+
+
+def test_c8_obsolete_unfinished_session_expires_once_and_is_not_reclaimed():
+    with disposable_v2_database(
+        f"test_realtime_v2_c8_expired_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            seed = _seed_session(
+                database_cursor,
+                options_ready=False,
+            )
+            checked_at = seed[
+                "authority_bundle"
+            ].session.prepared_at
+            initial = reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=checked_at,
+            )
+            database_cursor.connection.commit()
+        provider = _provider(pool)
+        executor = _AutomaticC8Executor(pool, seed)
+        expired_at = (
+            OptionExchangeCalendar("XNYS").session_close(
+                SESSION_DATE
+            )
+            + timedelta(minutes=6)
+        )
+
+        first = run_advanced_options_preparation_cycle(
+            provider,
+            executor,
+            owner_id=uuid4(),
+            checked_at=expired_at,
+            clock=lambda: expired_at,
+        )
+        second = run_advanced_options_preparation_cycle(
+            provider,
+            executor,
+            owner_id=uuid4(),
+            checked_at=expired_at + timedelta(minutes=10),
+            clock=lambda: expired_at,
+        )
+        with cursor(pool) as database_cursor:
+            lifecycle = reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=expired_at + timedelta(minutes=10),
+            )
+            summary = build_advanced_realtime_v3_status_cursor(
+                database_cursor,
+                checked_at=expired_at + timedelta(minutes=10),
+            )
+            database_cursor.execute(
+                "SELECT DISTINCT status,expiration_state,"
+                "expiration_reason,lease_owner,lease_until "
+                "FROM rt.advanced_options_preparation_work"
+            )
+            work = tuple(database_cursor.fetchall())
+            database_cursor.execute(
+                "SELECT status,expiration_state,expiration_reason "
+                "FROM rt.advanced_options_preparation_sessions"
+            )
+            session = database_cursor.fetchone()
+            database_cursor.execute(
+                "SELECT count(*) FROM "
+                "rt.advanced_options_preparation_evidence"
+            )
+            evidence_count = int(database_cursor.fetchone()[0])
+            database_cursor.connection.commit()
+
+        assert first["status"] == "IDLE"
+        assert first["expired_sessions"] == [{
+            "revision_id": str(initial.revision_id),
+            "session_date": SESSION_DATE.isoformat(),
+            "expiration_state": "EXPIRED",
+            "expired_work_count": 9,
+        }]
+        assert second["status"] == "IDLE"
+        assert second["expired_sessions"] == []
+        assert work == ((
+            "BLOCKED",
+            "EXPIRED",
+            f"EXPIRED_OPTIONS_PREPARATION:{SESSION_DATE.isoformat()}",
+            None,
+            None,
+        ),)
+        assert session == (
+            "DEGRADED",
+            "EXPIRED",
+            f"EXPIRED_OPTIONS_PREPARATION:{SESSION_DATE.isoformat()}",
+        )
+        assert evidence_count == 0
+        assert lifecycle is not None
+        assert lifecycle.status == "EXPIRED"
+        expired_record = summary["expired_preparation"][0]
+        assert expired_record["session_date"] == SESSION_DATE.isoformat()
+        assert expired_record["expiration_state"] == "EXPIRED"
+        assert expired_record["expired_at_utc"] == expired_at.isoformat()
 
 
 def test_equity_only_addition_does_not_change_options_activation():

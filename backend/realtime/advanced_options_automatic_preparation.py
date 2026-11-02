@@ -50,6 +50,7 @@ from .advanced_options_activity_momentum_c6 import (
     ACTIVITY_MOMENTUM_PROFILE_VERSION,
     LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION,
     SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+    activity_momentum_allocation_from_payload,
     activity_momentum_allocation_payload,
     allocate_activity_momentum,
     c6_coverage_from_activity_allocation,
@@ -60,6 +61,7 @@ from .advanced_options_activity_momentum_c6 import (
 from .advanced_options_lifecycle import (
     AdvancedOptionsPreparationClaim,
     AdvancedOptionsPreparationExecutor,
+    AdvancedOptionsPreparationRefreshRequired,
     AdvancedOptionsPreparationRetryable,
     AdvancedOptionsPreparationTerminal,
     AdvancedOptionsProviderRequestPlan,
@@ -70,6 +72,8 @@ from .advanced_options_lifecycle import (
 from .advanced_options_p7_selection import P7TransportSelectionPolicy
 from .advanced_options_p8_selection_source import (
     MassiveAdvancedOptionsSelectionSource,
+    SEALED_CAPTURE_EXACT_FOUR_PROFILE,
+    SEALED_CAPTURE_GENERALIZED_C6_PROFILE,
     p8_activity_selection_capture_from_sealed,
 )
 from .advanced_options_reference_repository import (
@@ -107,7 +111,11 @@ from .advanced_options_v3_authority import (
 )
 from .contracts import canonical_sha256
 from .database_access_v2 import APP_ROLE, V2ConnectionProvider
-from .provider_budget import ProviderBudgetScope
+from .provider_budget import (
+    MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING,
+    MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING,
+    ProviderBudgetScope,
+)
 from .reference_repository import persist_reference_facts_cursor
 from .reference_facts import (
     ReferenceFact,
@@ -160,6 +168,9 @@ class PostgresAutomaticOptionsPreparationExecutor(
         effective_provider_project_ceiling: int | None = None,
         enabled_strategies: tuple[str, ...] = (),
         exact_four_compatibility: bool = False,
+        connection_attempt_ceiling: int = 12,
+        decoded_message_ceiling: int = 1_000_000,
+        decoded_byte_ceiling: int = 1_073_741_824,
         clock=lambda: datetime.now(UTC),
         selection_source_factory=None,
         combined_capture_factory=None,
@@ -182,6 +193,12 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 and admission_profile_version
                 != LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION
             )
+            or type(connection_attempt_ceiling) is not int
+            or connection_attempt_ceiling <= 0
+            or type(decoded_message_ceiling) is not int
+            or decoded_message_ceiling <= 0
+            or type(decoded_byte_ceiling) is not int
+            or decoded_byte_ceiling <= 0
         ):
             raise ValueError(
                 "automatic Options preparation configuration is invalid"
@@ -207,6 +224,9 @@ class PostgresAutomaticOptionsPreparationExecutor(
         )
         self._enabled_strategies = tuple(enabled_strategies)
         self._exact_four_compatibility = exact_four_compatibility
+        self._connection_attempt_ceiling = connection_attempt_ceiling
+        self._decoded_message_ceiling = decoded_message_ceiling
+        self._decoded_byte_ceiling = decoded_byte_ceiling
         self._clock = clock
         self._selection_source_factory = selection_source_factory
         self._combined_capture_factory = combined_capture_factory
@@ -242,6 +262,12 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 * len(claim.option_underlyings)
                 * 3
             ),
+            account_request_ceiling=(
+                MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING
+            ),
+            account_decoded_byte_ceiling=(
+                MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING
+            ),
             lanes=frozenset({ProviderRequestLane.OPTIONS_CHAIN}),
             authorized_until=(
                 OptionExchangeCalendar("XNYS").session_close(
@@ -271,6 +297,27 @@ class PostgresAutomaticOptionsPreparationExecutor(
     def _source(self, claim):
         if self._selection_source_factory is not None:
             return self._selection_source_factory(claim)
+        selection_policy = load_advanced_options_selection_c6_policy()
+        profile = load_activity_momentum_profile(
+            selection_policy=selection_policy,
+            version=self._admission_profile_version,
+        )
+        discovery_maximum_dte = (
+            profile.strategy_discovery_maximum_dte
+            if self._enabled_strategies
+            else profile.default_discovery_maximum_dte
+        )
+        discovery_moneyness = (
+            max(
+                criterion.maximum_moneyness_fraction
+                for criterion in profile.selection_criteria
+                if criterion.minimum_dte <= discovery_maximum_dte
+                and criterion.maximum_dte
+                >= profile.default_discovery_minimum_dte
+            )
+            if profile.selection_criteria
+            else Decimal("0.05")
+        )
         transport = RequestsPolygonHttpTransport(
             self._api_key,
             timeout_seconds=30,
@@ -285,13 +332,25 @@ class PostgresAutomaticOptionsPreparationExecutor(
             policy=P7TransportSelectionPolicy(
                 version="advanced-realtime-v3-c8-preparation-v1",
                 underlyings=(claim.ticker,),
-                minimum_dte=0,
-                maximum_dte=60,
+                minimum_dte=(
+                    profile.default_discovery_minimum_dte
+                ),
+                maximum_dte=discovery_maximum_dte,
+                maximum_moneyness_fraction=min(
+                    discovery_moneyness,
+                    Decimal("0.10"),
+                ),
             ),
             clock=self._clock,
             maximum_response_decoded_bytes=self._byte_limit,
             maximum_total_decoded_bytes=self._byte_limit,
             maximum_provider_requests=self._request_limit,
+            retain_candidate_pool=not self._exact_four_compatibility,
+            query_minimum_dte=(
+                profile.default_discovery_minimum_dte
+            ),
+            query_maximum_dte=discovery_maximum_dte,
+            query_maximum_moneyness_fraction=discovery_moneyness,
             deadline=(
                 OptionExchangeCalendar("XNYS").session_close(
                     claim.session_date
@@ -300,8 +359,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
             ),
         )
 
-    @staticmethod
-    def _capture_document(claim, capture):
+    def _capture_document(self, claim, capture):
         reviewed_at = capture.selection.reviewed_at
         responses = [{
             "underlyer": claim.ticker,
@@ -313,6 +371,12 @@ class PostgresAutomaticOptionsPreparationExecutor(
         }]
         document = {
             "contract": "advanced-options-v3-pre-session-capture-v1",
+            "compatibility_profile": (
+                SEALED_CAPTURE_EXACT_FOUR_PROFILE
+                if self._exact_four_compatibility
+                else SEALED_CAPTURE_GENERALIZED_C6_PROFILE
+            ),
+            "configured_underlyings": [claim.ticker],
             "captured_at_utc": reviewed_at.isoformat(),
             "session_date": claim.session_date.isoformat(),
             "source_cohort_id": str(
@@ -536,21 +600,26 @@ class PostgresAutomaticOptionsPreparationExecutor(
             if not isinstance(row.get("open_interest"), int)
             or row["open_interest"] < 0
         ]
-        if missing:
-            raise AdvancedOptionsPreparationRetryable(
-                "prior OI is unavailable: " + ",".join(missing)
-            )
         return AdvancedOptionsStageResult(
             watermark={
                 "capture_sha256": capture["semantic_sha256"],
                 "oi_contract_count": len(
                     capture["selected_snapshots"]
                 ),
+                "oi_available_contract_count": (
+                    len(capture["selected_snapshots"]) - len(missing)
+                ),
+                "oi_unavailable_contract_count": len(missing),
             },
             evidence={
                 "capture_sha256": capture["semantic_sha256"],
                 "contracts": sorted(capture["selected_snapshots"]),
-                "status": "READY",
+                "oi_unavailable_contracts": sorted(missing),
+                "status": (
+                    "READY"
+                    if not missing
+                    else "READY_WITH_UNAVAILABLE_CONTEXT"
+                ),
             },
         )
 
@@ -617,23 +686,63 @@ class PostgresAutomaticOptionsPreparationExecutor(
         )
 
     def _capacity(self, claim):
-        catalog = self._load_completed_evidence(
-            claim,
-            "CATALOG_QUOTE",
-        )
-        tickers = tuple(sorted(
-            catalog["capture"]["selected_snapshots"]
-        ))
-        if len(tickers) > self._maximum_contracts_per_logical_shard:
-            raise AdvancedOptionsPreparationTerminal(
-                f"{claim.ticker} exceeds one logical shard bound"
+        allocation_ticker = claim.option_underlyings[0]
+        if claim.ticker != allocation_ticker:
+            frozen = self._load_completed_evidence(
+                claim,
+                "CAPACITY_SHARDS",
+                ticker=allocation_ticker,
             )
+            return AdvancedOptionsStageResult(
+                watermark=dict(frozen["watermark"]),
+                evidence={
+                    "status": "READY",
+                    "source_capacity_ticker": allocation_ticker,
+                    "allocation_sha256": frozen[
+                        "allocation_sha256"
+                    ],
+                },
+            )
+        capture, allocation = self._allocate_capture(
+            claim,
+            self._combined_capture(claim),
+        )
+        tickers = tuple(sorted(capture["selected_snapshots"]))
+        logical_shards = max(
+            1,
+            (
+                len(tickers)
+                + self._maximum_contracts_per_logical_shard
+                - 1
+            )
+            // self._maximum_contracts_per_logical_shard,
+        )
+        allocation_document = (
+            None
+            if allocation is None
+            else activity_momentum_allocation_payload(allocation)
+        )
+        allocation_sha256 = (
+            canonical_sha256({
+                "profile": "EXACT_FOUR_COMPATIBILITY",
+                "contracts": tickers,
+            })
+            if allocation is None
+            else allocation.allocation_sha256
+        )
         return AdvancedOptionsStageResult(
             watermark={
                 "contract_count": len(tickers),
-                "logical_shards": 1,
+                "logical_shards": logical_shards,
             },
             evidence={
+                "watermark": {
+                    "contract_count": len(tickers),
+                    "logical_shards": logical_shards,
+                },
+                "capture": capture,
+                "allocation": allocation_document,
+                "allocation_sha256": allocation_sha256,
                 "contracts": list(tickers),
                 "maximum_contracts_per_logical_shard": (
                     self._maximum_contracts_per_logical_shard
@@ -650,7 +759,10 @@ class PostgresAutomaticOptionsPreparationExecutor(
     ) -> AdvancedOptionsStageResult:
         if claim.stage == "CATALOG_QUOTE":
             return self._catalog_quote(claim, provider_request_ids)
-        if provider_request_ids:
+        if (
+            provider_request_ids
+            and claim.stage != "SESSION_ACTIVATION"
+        ):
             raise AdvancedOptionsPreparationTerminal(
                 "provider-free stage received provider reservations"
             )
@@ -685,6 +797,14 @@ class PostgresAutomaticOptionsPreparationExecutor(
             return document
         document = {
             "contract": "advanced-options-v3-pre-session-capture-v1",
+            "compatibility_profile": (
+                SEALED_CAPTURE_EXACT_FOUR_PROFILE
+                if self._exact_four_compatibility
+                else SEALED_CAPTURE_GENERALIZED_C6_PROFILE
+            ),
+            "configured_underlyings": list(
+                claim.option_underlyings
+            ),
             "captured_at_utc": max(
                 row["captured_at_utc"] for row in captures
             ),
@@ -717,15 +837,26 @@ class PostgresAutomaticOptionsPreparationExecutor(
         return document
 
     def _allocate_capture(self, claim, capture):
-        if self._exact_four_compatibility:
-            if len(capture["selected_snapshots"]) != 4:
-                raise AdvancedOptionsPreparationTerminal(
-                    "exact-four compatibility requires four contracts"
-                )
-            return capture, None
-        selection = p8_activity_selection_capture_from_sealed(
-            capture
+        compatibility_profile = (
+            SEALED_CAPTURE_EXACT_FOUR_PROFILE
+            if self._exact_four_compatibility
+            else SEALED_CAPTURE_GENERALIZED_C6_PROFILE
         )
+        capture = {
+            **capture,
+            "compatibility_profile": compatibility_profile,
+            "configured_underlyings": list(
+                claim.option_underlyings
+            ),
+        }
+        capture.pop("semantic_sha256", None)
+        capture["semantic_sha256"] = canonical_sha256(capture)
+        selection = p8_activity_selection_capture_from_sealed(
+            capture,
+            compatibility_profile=compatibility_profile,
+        )
+        if self._exact_four_compatibility:
+            return capture, None
         selection_policy = (
             load_advanced_options_selection_c6_policy()
         )
@@ -746,6 +877,42 @@ class PostgresAutomaticOptionsPreparationExecutor(
             )
             for row in selection.selection.selected
         )
+        refresh_underlyings = []
+        for underlying in claim.option_underlyings:
+            scoped = tuple(
+                candidate
+                for candidate in candidates
+                if candidate.underlying == underlying
+                and any(
+                    criterion.minimum_dte
+                    <= candidate.dte_for(claim.session_date)
+                    <= criterion.maximum_dte
+                    for criterion in profile.selection_criteria
+                )
+            )
+            if scoped and not any(
+                candidate.bid is not None
+                and candidate.ask is not None
+                and candidate.quote_as_of is not None
+                and any(
+                    criterion.minimum_dte
+                    <= candidate.dte_for(claim.session_date)
+                    <= criterion.maximum_dte
+                    and (
+                        candidate.observed_at
+                        - candidate.quote_as_of
+                    ).total_seconds()
+                    <= criterion.maximum_quote_age_seconds
+                    for criterion in profile.selection_criteria
+                )
+                for candidate in scoped
+            ):
+                refresh_underlyings.append(underlying)
+        if refresh_underlyings:
+            raise AdvancedOptionsPreparationRefreshRequired(
+                "CATALOG_QUOTE_CAPTURE_STALE",
+                tuple(refresh_underlyings),
+            )
         resolution_arguments = {}
         if (
             profile.version
@@ -835,9 +1002,18 @@ class PostgresAutomaticOptionsPreparationExecutor(
             raise AdvancedOptionsPreparationRetryable(
                 "desired snapshot is not materialized"
             )
-        capture, allocation = self._allocate_capture(
+        capacity = self._load_completed_evidence(
             claim,
-            self._combined_capture(claim),
+            "CAPACITY_SHARDS",
+            ticker=claim.option_underlyings[0],
+        )
+        capture = dict(capacity["capture"])
+        allocation = (
+            None
+            if capacity.get("allocation") is None
+            else activity_momentum_allocation_from_payload(
+                capacity["allocation"]
+            )
         )
         captured_at = datetime.fromisoformat(
             capture["captured_at_utc"]
@@ -914,7 +1090,9 @@ class PostgresAutomaticOptionsPreparationExecutor(
             replace(
                 row,
                 open_interest_member_sha256=(
-                    reference_by_ticker[
+                    None
+                    if row.open_interest is None
+                    else reference_by_ticker[
                         row.contract_ticker
                     ].member_sha256
                 ),
@@ -992,6 +1170,12 @@ class PostgresAutomaticOptionsPreparationExecutor(
             expected_cost="bounded desired-state Options preparation",
             request_ceiling=int(capture["provider_requests"]),
             decoded_byte_ceiling=int(capture["decoded_bytes"]),
+            account_request_ceiling=(
+                MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING
+            ),
+            account_decoded_byte_ceiling=(
+                MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING
+            ),
             lanes=ADVANCED_OPTIONS_REST_LANES,
             authorized_until=hard_stop,
         )
@@ -1001,10 +1185,10 @@ class PostgresAutomaticOptionsPreparationExecutor(
             final_budget,
             AdvancedOptionsSocketBudget(
                 stream_sessions=1,
-                connection_attempts=12,
-                reconnects=11,
-                decoded_messages=1_000_000,
-                decoded_bytes=1_073_741_824,
+                connection_attempts=self._connection_attempt_ceiling,
+                reconnects=self._connection_attempt_ceiling - 1,
+                decoded_messages=self._decoded_message_ceiling,
+                decoded_bytes=self._decoded_byte_ceiling,
             ),
             authorization_reference=authorization_reference,
             prepared_at=final_prepared_at,
@@ -1128,9 +1312,9 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 row.contract_ticker
                 for row in final_admission.contracts
             ),
-            connection_attempt_ceiling=12,
-            decoded_message_ceiling=1_000_000,
-            decoded_byte_ceiling=1_073_741_824,
+            connection_attempt_ceiling=self._connection_attempt_ceiling,
+            decoded_message_ceiling=self._decoded_message_ceiling,
+            decoded_byte_ceiling=self._decoded_byte_ceiling,
         )
         selection_plan = self._selection_plan(
             claim,
@@ -1168,6 +1352,9 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 ),
                 "selection_generation_sha256": (
                     selection_plan.generation_sha256
+                ),
+                "selection_profile": (
+                    selection_plan.admission_profile_version
                 ),
                 "status": "ACTIVE",
             },
@@ -1581,8 +1768,6 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 and {
                     row.contract_ticker
                     for row in decoded_existing.open_interest
-                    if row.availability
-                    is ReferenceAvailability.AVAILABLE
                 }
                 == {
                     row.contract_ticker
@@ -1593,12 +1778,13 @@ class PostgresAutomaticOptionsPreparationExecutor(
                     decoded_existing
                 )
             cursor.execute(
-                "SELECT member_sha256,member_document "
+                "SELECT member_sha256,member_document,availability "
                 "FROM rt.advanced_options_reference_state_members "
                 "WHERE state_id=%s AND member_kind='OPEN_INTEREST' "
-                "AND availability='AVAILABLE' ORDER BY member_key",
+                "ORDER BY member_key",
                 (str(existing_row[0]),),
             )
+            stored_oi = tuple(cursor.fetchall())
             existing_oi = tuple(
                 OpeningOpenInterestEvidence(
                     contract_id=int(row[1]["contract_id"]),
@@ -1610,12 +1796,13 @@ class PostgresAutomaticOptionsPreparationExecutor(
                     known_at=existing_row[4],
                     member_sha256=str(row[0]),
                 )
-                for row in cursor.fetchall()
+                for row in stored_oi
+                if str(row[2]) == "AVAILABLE"
             )
             if (
                 {
-                    row.contract_ticker
-                    for row in existing_oi
+                    str(row[1]["contract_ticker"])
+                    for row in stored_oi
                 }
                 == {
                     row.contract_ticker
@@ -1631,14 +1818,20 @@ class PostgresAutomaticOptionsPreparationExecutor(
                     valid_until=existing_row[5],
                     reference_policy_sha256=str(existing_row[6]),
                     contract_scope_sha256=str(existing_row[7]),
-                    open_interest_sha256=canonical_sha256(
-                        existing_oi
-                    ),
+                    open_interest_sha256=canonical_sha256(tuple(
+                        str(row[0])
+                        for row in sorted(
+                            stored_oi,
+                            key=lambda value: int(
+                                value[1]["contract_id"]
+                            ),
+                        )
+                    )),
                     open_interest=existing_oi,
                 )
             raise AdvancedOptionsPreparationRetryable(
                 "stored reference membership differs: "
-                f"stored={sorted(row.contract_ticker for row in existing_oi)},"
+                f"stored={sorted(str(row[1]['contract_ticker']) for row in stored_oi)},"
                 f"prepared={sorted(row.contract_ticker for row in admission.contracts)}"
             )
         cursor.execute(
@@ -1676,8 +1869,17 @@ class PostgresAutomaticOptionsPreparationExecutor(
         settlement = OptionExchangeCalendar(
             "XNYS"
         ).previous_session_date(claim.session_date)
-        oi = tuple(
-            AdvancedOptionsOpenInterestReference(
+        def open_interest_reference(row):
+            if row.open_interest is None:
+                return AdvancedOptionsOpenInterestReference(
+                    contract_id=row.contract_id,
+                    contract_ticker=row.contract_ticker,
+                    underlyer=row.underlyer,
+                    availability=ReferenceAvailability.UNAVAILABLE,
+                    known_at=prepared_at,
+                    reason_codes=("MISSING_PRIOR_OPEN_INTEREST",),
+                )
+            return AdvancedOptionsOpenInterestReference(
                 contract_id=row.contract_id,
                 contract_ticker=row.contract_ticker,
                 underlyer=row.underlyer,
@@ -1699,13 +1901,10 @@ class PostgresAutomaticOptionsPreparationExecutor(
                     snapshots[row.contract_ticker]
                 ),
             )
+        oi = tuple(
+            open_interest_reference(row)
             for row in admission.contracts
-            if row.open_interest is not None
         )
-        if len(oi) != len(admission.contracts):
-            raise AdvancedOptionsPreparationRetryable(
-                "complete prior OI is required for activation"
-            )
         cursor.execute(
             "SELECT COALESCE(MAX(reference_generation),0)+1 "
             "FROM rt.advanced_options_reference_states"
@@ -1779,9 +1978,13 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 matching_strategies=(),
                 contract_roles=("ALLOCATED_CONTRACT",),
                 selection_reasons=("C8_DESIRED_STATE",),
-                evidence_references=(
-                    row.snapshot_payload_sha256,
-                    row.open_interest_member_sha256,
+                evidence_references=tuple(
+                    value
+                    for value in (
+                        row.snapshot_payload_sha256,
+                        row.open_interest_member_sha256,
+                    )
+                    if value is not None
                 ),
                 flow_eligible=(
                     row.underlyer in EXPECTED_UNDERLYINGS
@@ -1857,6 +2060,11 @@ class PostgresAutomaticOptionsPreparationExecutor(
             admission.prepared_at,
             reference.known_at,
         )
+        missing_oi_underlyings = {
+            row.underlyer
+            for row in admission.contracts
+            if row.open_interest is None
+        }
         return build_c6_selection_plan(
             session_date=claim.session_date,
             desired_revision_id=claim.revision_id,
@@ -1867,13 +2075,21 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 C6UnderlyingReadiness(
                     underlying=ticker,
                     catalog=C6ReadinessState.AVAILABLE,
-                    open_interest=C6ReadinessState.AVAILABLE,
+                    open_interest=(
+                        C6ReadinessState.NOT_REQUIRED
+                        if ticker in missing_oi_underlyings
+                        else C6ReadinessState.AVAILABLE
+                    ),
                     history=C6ReadinessState.AVAILABLE,
                     feed_states=(
                         ("OPTION_QUOTE", C6ReadinessState.AVAILABLE),
                         ("OPTION_TRADE", C6ReadinessState.AVAILABLE),
                     ),
-                    reason_codes=(),
+                    reason_codes=(
+                        ("MISSING_PRIOR_OPEN_INTEREST",)
+                        if ticker in missing_oi_underlyings
+                        else ()
+                    ),
                     observed_at=selection_observed_at,
                     source_as_of=reference.known_at,
                 )

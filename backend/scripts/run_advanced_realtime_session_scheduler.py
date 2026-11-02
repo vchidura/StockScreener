@@ -112,6 +112,8 @@ from realtime.advanced_realtime_session_operations import (  # noqa: E402
 from realtime.contracts import canonical_sha256  # noqa: E402
 from realtime.database_access_v2 import APP_ROLE  # noqa: E402
 from realtime.provider_budget import (  # noqa: E402
+    MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING,
+    MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING,
     ProviderBudgetScope,
     reserve_coordinated_provider_request_cursor,
 )
@@ -684,6 +686,12 @@ def _prepare_authorization(args):
             decoded_byte_ceiling=(
                 len(windows) * args.response_byte_ceiling
             ),
+            account_request_ceiling=(
+                MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING
+            ),
+            account_decoded_byte_ceiling=(
+                MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING
+            ),
             lanes=frozenset({ADVANCED_SESSION_OPTIONS_LANE}),
             authorized_until=decision_stop,
         ),
@@ -923,6 +931,7 @@ class _ProductionPort:
                 contract.budget,
                 reservation,
                 reserved_response_bytes=contract.response_byte_ceiling,
+                account_wide=True,
             )
             recorded = (
                 None

@@ -156,6 +156,12 @@ RELATIONS: dict[str, Relation] = {
     "rt.advanced_options_preparation_evidence": _r(
         "control", "BOUNDED", append=True
     ),
+    "rt.advanced_options_preparation_evidence_history": _r(
+        "control", "BOUNDED", append=True
+    ),
+    "rt.advanced_options_preparation_refresh_requests": _r(
+        "control", "BOUNDED", append=True
+    ),
     "rt.advanced_realtime_service_states": _r(
         "control", "BOUNDED", mutable=True
     ),

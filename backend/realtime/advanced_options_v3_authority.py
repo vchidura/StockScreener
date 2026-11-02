@@ -209,7 +209,6 @@ class OpeningReferenceEvidence:
             or self.reference_generation <= 0
             or not isinstance(self.session_date, date)
             or known >= valid
-            or not members
             or len({row.contract_id for row in members}) != len(members)
             or any(row.known_at > known for row in members)
         ):

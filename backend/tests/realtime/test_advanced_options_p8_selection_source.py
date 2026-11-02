@@ -12,6 +12,8 @@ from options.data.polygon_http import PolygonHttpResponse
 from realtime.advanced_options_p8_selection_source import (
     MassiveAdvancedOptionsExactContractSource,
     MassiveAdvancedOptionsSelectionSource,
+    SEALED_CAPTURE_EXACT_FOUR_PROFILE,
+    SEALED_CAPTURE_GENERALIZED_C6_PROFILE,
     _candidate_from_snapshot,
     p8_activity_selection_capture_from_sealed,
 )
@@ -22,6 +24,9 @@ from realtime.advanced_options_p8_production import (
 )
 from realtime.advanced_options_flow_policy import (
     load_advanced_options_flow_policy,
+)
+from realtime.advanced_options_p7_selection import (
+    P7TransportSelectionPolicy,
 )
 from realtime.contracts import canonical_sha256
 from scripts import prepare_advanced_options_v3_pre_session
@@ -140,6 +145,77 @@ def test_advanced_source_uses_exact_two_filtered_requests_without_pagination():
     assert transport.calls[0][1]["strike_price.lte"] == "630.00"
     assert transport.calls[1][1]["strike_price.gte"] == "636.50"
     assert transport.calls[1][1]["strike_price.lte"] == "703.50"
+
+
+def test_advanced_source_can_retain_profile_scoped_c6_candidate_pool():
+    transport = _Transport([
+        _payload("QQQ", [
+            _contract(
+                "QQQ",
+                "O:QQQ261021C00600000",
+                "call",
+                600,
+                600,
+            ),
+            _contract(
+                "QQQ",
+                "O:QQQ261021P00595000",
+                "put",
+                595,
+                600,
+            ),
+        ]),
+        _payload("SPY", [
+            _contract(
+                "SPY",
+                "O:SPY261021C00670000",
+                "call",
+                670,
+                670,
+            ),
+            _contract(
+                "SPY",
+                "O:SPY261021P00665000",
+                "put",
+                665,
+                670,
+            ),
+        ]),
+    ])
+    capture = MassiveAdvancedOptionsSelectionSource(
+        transport,
+        _Spots(),
+        policy=P7TransportSelectionPolicy(
+            version="c6-candidate-pool-test-v1",
+            underlyings=("QQQ", "SPY"),
+            minimum_dte=0,
+            maximum_dte=21,
+            maximum_moneyness_fraction=Decimal("0.10"),
+        ),
+        retain_candidate_pool=True,
+        query_minimum_dte=0,
+        query_maximum_dte=21,
+        query_maximum_moneyness_fraction=Decimal("0.10"),
+    ).capture(reviewed_at=REVIEWED, session_date=SESSION)
+
+    assert capture.selection.contracts == (
+        "O:QQQ261021C00600000",
+        "O:QQQ261021P00595000",
+        "O:SPY261021C00670000",
+        "O:SPY261021P00665000",
+    )
+    assert capture.evidence["schema"] == (
+        "advanced-options-c6-candidate-pool-v1"
+    )
+    assert capture.evidence["candidate_count"] == 4
+    assert capture.evidence["query"] == {
+        "minimum_dte": 0,
+        "maximum_dte": 21,
+        "maximum_moneyness_fraction": "0.10",
+    }
+    assert transport.calls[0][1]["expiration_date.lte"] == "2026-11-11"
+    assert transport.calls[0][1]["strike_price.gte"] == "540.00"
+    assert transport.calls[0][1]["strike_price.lte"] == "660.00"
 
 
 def test_advanced_source_enforces_granted_response_and_total_bytes():
@@ -631,6 +707,8 @@ def test_sealed_capture_reconstructs_exact_call_put_scope_provider_free():
     )
     capture = p8_activity_selection_capture_from_sealed({
         "contract": "advanced-options-v3-pre-session-capture-v1",
+        "compatibility_profile": SEALED_CAPTURE_EXACT_FOUR_PROFILE,
+        "configured_underlyings": ["QQQ", "SPY"],
         "captured_at_utc": REVIEWED.isoformat(),
         "session_date": SESSION.isoformat(),
         "provider_requests": 2,
@@ -641,7 +719,7 @@ def test_sealed_capture_reconstructs_exact_call_put_scope_provider_free():
         ],
         "selected_snapshots": selected_snapshots,
         "semantic_sha256": "a" * 64,
-    })
+    }, compatibility_profile=SEALED_CAPTURE_EXACT_FOUR_PROFILE)
 
     assert capture.request_count == 2
     assert capture.pagination_requests == 0
@@ -680,6 +758,8 @@ def test_sealed_capture_rejects_provider_clock_skew_over_five_seconds():
     with pytest.raises(ValueError, match="clock skew exceeded"):
         p8_activity_selection_capture_from_sealed({
             "contract": "advanced-options-v3-pre-session-capture-v1",
+            "compatibility_profile": SEALED_CAPTURE_EXACT_FOUR_PROFILE,
+            "configured_underlyings": ["QQQ", "SPY"],
             "captured_at_utc": REVIEWED.isoformat(),
             "session_date": SESSION.isoformat(),
             "provider_requests": 2,
@@ -690,7 +770,7 @@ def test_sealed_capture_rejects_provider_clock_skew_over_five_seconds():
             ],
             "selected_snapshots": selected_snapshots,
             "semantic_sha256": "a" * 64,
-        })
+        }, compatibility_profile=SEALED_CAPTURE_EXACT_FOUR_PROFILE)
 
 
 def test_local_replay_cli_is_provider_and_database_free(tmp_path):
@@ -710,6 +790,8 @@ def test_local_replay_cli_is_provider_and_database_free(tmp_path):
             )
     document = {
         "contract": "advanced-options-v3-pre-session-capture-v1",
+        "compatibility_profile": SEALED_CAPTURE_EXACT_FOUR_PROFILE,
+        "configured_underlyings": ["QQQ", "SPY"],
         "captured_at_utc": REVIEWED.isoformat(),
         "session_date": SESSION.isoformat(),
         "provider_requests": 2,
@@ -741,7 +823,7 @@ def test_local_replay_cli_is_provider_and_database_free(tmp_path):
     assert all(value == 0 for value in result["effects"].values())
 
 
-def test_sealed_capture_rejects_missing_call_put_member():
+def test_explicit_exact_four_rejects_missing_call_put_member():
     snapshots = {}
     for underlyer, strikes in (
         ("QQQ", (600, 601)),
@@ -756,9 +838,11 @@ def test_sealed_capture_rejects_missing_call_put_member():
                 strike,
                 strikes[0],
             )
-    with pytest.raises(ValueError, match="call/put membership"):
+    with pytest.raises(ValueError, match="explicit exact-four"):
         p8_activity_selection_capture_from_sealed({
             "contract": "advanced-options-v3-pre-session-capture-v1",
+            "compatibility_profile": SEALED_CAPTURE_EXACT_FOUR_PROFILE,
+            "configured_underlyings": ["QQQ", "SPY"],
             "captured_at_utc": REVIEWED.isoformat(),
             "session_date": SESSION.isoformat(),
             "provider_requests": 2,
@@ -768,7 +852,57 @@ def test_sealed_capture_rejects_missing_call_put_member():
                 {"underlyer": "SPY"},
             ],
             "selected_snapshots": snapshots,
-        })
+        }, compatibility_profile=SEALED_CAPTURE_EXACT_FOUR_PROFILE)
+
+
+def test_generalized_four_contract_capture_allows_one_sided_and_missing_oi():
+    snapshots = {}
+    for underlyer, kind, option_type, strikes in (
+        ("QQQ", "call", "C", (600, 601)),
+        ("SPY", "put", "P", (669, 670)),
+    ):
+        for index, strike in enumerate(strikes):
+            ticker = (
+                f"O:{underlyer}261021{option_type}"
+                f"{strike * 1000:08d}"
+            )
+            snapshots[ticker] = _contract(
+                underlyer,
+                ticker,
+                kind,
+                strike,
+                strikes[0],
+            )
+            if index == 0:
+                snapshots[ticker].pop("open_interest")
+    capture = p8_activity_selection_capture_from_sealed({
+        "contract": "advanced-options-v3-pre-session-capture-v1",
+        "compatibility_profile": SEALED_CAPTURE_GENERALIZED_C6_PROFILE,
+        "configured_underlyings": ["QQQ", "SPY"],
+        "captured_at_utc": REVIEWED.isoformat(),
+        "session_date": SESSION.isoformat(),
+        "provider_requests": 2,
+        "decoded_bytes": 4096,
+        "responses": [
+            {"underlyer": "QQQ"},
+            {"underlyer": "SPY"},
+        ],
+        "selected_snapshots": snapshots,
+    }, compatibility_profile=SEALED_CAPTURE_GENERALIZED_C6_PROFILE)
+
+    assert len(capture.selection.selected) == 4
+    assert {
+        row.option_type for row in capture.selection.selected
+        if row.underlyer == "QQQ"
+    } == {"C"}
+    assert {
+        row.option_type for row in capture.selection.selected
+        if row.underlyer == "SPY"
+    } == {"P"}
+    assert sum(
+        row.open_interest is None
+        for row in capture.selection.selected
+    ) == 2
 
 
 def test_open_interest_identity_serializes_market_time():
