@@ -4,10 +4,33 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
+from uuid import uuid4
 
 from dotenv import dotenv_values
+from psycopg2.pool import ThreadedConnectionPool
+
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from realtime.advanced_realtime_fencing import (
+    PostgresLeaseHeartbeat,
+    RUNTIME_GROUP_RESOURCE,
+    role_resource_key,
+)
+from realtime.database_access_v2 import (
+    APP_ROLE,
+    V2AccessConfig,
+    V2ConnectionProvider,
+)
+from realtime.migrations import EXPECTED_V2_DATABASE_NAME
 
 
 OWNED_SECRETS = {
@@ -20,6 +43,8 @@ OWNED_SECRETS = {
     "finalizer": frozenset({"app_dsn"}),
     "detectors": frozenset({"app_dsn"}),
     "canonical-stock-alerts": frozenset({"app_dsn"}),
+    "publication-retry": frozenset({"app_dsn"}),
+    "options-lifecycle": frozenset({"app_dsn", "provider_key"}),
     "options-v3-acquisition": frozenset({
         "app_dsn",
         "provider_key",
@@ -35,6 +60,24 @@ SECRET_ENVIRONMENT = {
     "app_dsn": "REALTIME_V2_APP_DSN",
     "api_dsn": "REALTIME_V2_API_DSN",
     "provider_key": "POLYGON_API_KEY",
+}
+FENCED_ROLE_NAMES = {
+    "controller": "controller",
+    "capability-refresh": "capability-refresh",
+    "preparation": "equity-preparation",
+    "ingress": "equity-ingress",
+    "bridge": "bridge",
+    "scheduler": "scheduler",
+    "finalizer": "finalizer",
+    "detectors": "detectors",
+    "canonical-stock-alerts": "canonical-stock-alerts",
+    "publication-retry": "publication-retry",
+    "options-lifecycle": "options-lifecycle",
+    "options-v3-acquisition": "options-acquisition",
+    "options-p8-ingress": "options-ingress",
+    "options-p8-market-state": "options-market-state",
+    "options-p8-flow": "options-flow",
+    "options-p8-window": "options-window",
 }
 
 
@@ -145,6 +188,98 @@ def run_child(command, environment, *, windows: bool | None = None) -> int:
     raise RuntimeError("container child replacement unexpectedly returned")
 
 
+def run_fenced_child(
+    component,
+    command,
+    environment,
+    *,
+    process_factory=subprocess.Popen,
+    clock=time.monotonic,
+) -> int:
+    role_name = FENCED_ROLE_NAMES[component]
+    pool = ThreadedConnectionPool(
+        1,
+        3 if component == "options-lifecycle" else 2,
+        dsn=environment["REALTIME_V2_APP_DSN"],
+        options="-c timezone=UTC",
+    )
+    provider = V2ConnectionProvider(
+        {APP_ROLE: pool},
+        V2AccessConfig(
+            security_mode="hardened",
+            role_prefix=EXPECTED_V2_DATABASE_NAME,
+            statement_timeout_ms=30_000,
+        ),
+    )
+    provider.verify()
+    stop = threading.Event()
+    owner_id = uuid4()
+    identity = (
+        f"compose:{component}:{os.getpid()}:{environment.get('HOSTNAME','')}"
+    )
+    group = (
+        PostgresLeaseHeartbeat(
+            provider,
+            resource_key=RUNTIME_GROUP_RESOURCE,
+            owner_id=owner_id,
+            runtime_kind="COMPOSE",
+            role_name="runtime",
+            process_identity=identity,
+            stop_event=stop,
+        )
+        if component == "options-lifecycle"
+        else None
+    )
+    role = PostgresLeaseHeartbeat(
+        provider,
+        resource_key=role_resource_key(role_name),
+        owner_id=owner_id,
+        runtime_kind="COMPOSE",
+        role_name=role_name,
+        process_identity=identity,
+        stop_event=stop,
+    )
+    process = None
+
+    def request_stop(*_unused):
+        stop.set()
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+    prior_int = signal.getsignal(signal.SIGINT)
+    prior_term = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    try:
+        if group is not None:
+            group.start()
+        role.start()
+        process = process_factory(command, env=environment)
+        if group is not None:
+            group.mark_running()
+        role.mark_running()
+        while process.poll() is None:
+            if stop.wait(0.5):
+                if process.poll() is None:
+                    process.terminate()
+                break
+        return process.wait()
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        role.close()
+        if group is not None:
+            group.close()
+        pool.closeall()
+        signal.signal(signal.SIGINT, prior_int)
+        signal.signal(signal.SIGTERM, prior_term)
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     environment = (
@@ -160,6 +295,12 @@ def main(argv=None) -> int:
             os.environ,
         )
     )
+    if args.component in FENCED_ROLE_NAMES:
+        return run_fenced_child(
+            args.component,
+            args.command,
+            environment,
+        )
     return run_child(args.command, environment)
 
 

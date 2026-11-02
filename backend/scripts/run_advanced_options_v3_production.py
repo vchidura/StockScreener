@@ -6,8 +6,10 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
 from uuid import UUID
@@ -377,6 +379,8 @@ def _docker_service_main(argv) -> int | None:
     )
     parser.add_argument("--package", type=Path)
     parser.add_argument("--execution-bundle", type=Path)
+    parser.add_argument("--continuous", action="store_true")
+    parser.add_argument("--poll-seconds", type=float, default=2.0)
     args = parser.parse_args(values)
     if (
         args.state_source == POSTGRES_STATE_SOURCE
@@ -392,6 +396,17 @@ def _docker_service_main(argv) -> int | None:
         )
     ):
         parser.error("Options state source and artifacts cannot be mixed")
+    if (
+        args.poll_seconds <= 0
+        or service_mode
+        and args.state_source == POSTGRES_STATE_SOURCE
+        and not args.continuous
+        or args.state_source == LEGACY_DIAGNOSTIC_STATE_SOURCE
+        and args.continuous
+        or health_mode
+        and args.continuous
+    ):
+        parser.error("continuous Options roles require PostgreSQL state")
     kind = AdvancedOptionsProcessKind(
         args.docker_service_kind or args.docker_health_kind
     )
@@ -399,29 +414,100 @@ def _docker_service_main(argv) -> int | None:
     pool = None
     if args.state_source == POSTGRES_STATE_SOURCE:
         provider, pool = _provider()
-    state = select_options_session_state(
-        environment=os.environ,
-        provider=provider,
-        package_path=(
-            args.package.resolve()
-            if args.package is not None
-            else None
-        ),
-        bundle_path=(
-            args.execution_bundle.resolve()
-            if args.execution_bundle is not None
-            else None
-        ),
-        state_source=args.state_source,
-    )
     try:
         if service_mode:
+            if args.continuous:
+                stop = threading.Event()
+                active_stop = [None]
+
+                def request_stop(*_unused):
+                    stop.set()
+                    if active_stop[0] is not None:
+                        active_stop[0].set()
+
+                signal.signal(signal.SIGINT, request_stop)
+                signal.signal(signal.SIGTERM, request_stop)
+                while not stop.is_set():
+                    session_stop = threading.Event()
+                    active_stop[0] = session_stop
+                    state = select_options_session_state(
+                        environment=os.environ,
+                        provider=provider,
+                        checked_at=datetime.now(UTC),
+                        state_source=args.state_source,
+                    )
+                    try:
+                        run_p8_docker_service(
+                            kind,
+                            None,
+                            None,
+                            session_state=state,
+                            stop_event=session_stop,
+                        )
+                    except RuntimeError as error:
+                        if (
+                            str(error)
+                            != "current PostgreSQL Options session "
+                            "state is unavailable"
+                        ):
+                            raise
+                        print(json.dumps({
+                            "status": "READY_WAITING_FOR_SESSION",
+                            "kind": kind.value,
+                            "provider_effects": 0,
+                        }, sort_keys=True), flush=True)
+                    finally:
+                        active_stop[0] = None
+                    if not stop.is_set():
+                        stop.wait(args.poll_seconds)
+                return 0
+            state = select_options_session_state(
+                environment=os.environ,
+                package_path=args.package.resolve(),
+                bundle_path=args.execution_bundle.resolve(),
+                state_source=args.state_source,
+            )
             return run_p8_docker_service(
                 kind,
                 args.package,
                 args.execution_bundle,
                 session_state=state,
             )
+        state = select_options_session_state(
+            environment=os.environ,
+            provider=provider,
+            package_path=(
+                args.package.resolve()
+                if args.package is not None
+                else None
+            ),
+            bundle_path=(
+                args.execution_bundle.resolve()
+                if args.execution_bundle is not None
+                else None
+            ),
+            checked_at=datetime.now(UTC),
+            state_source=args.state_source,
+        )
+        if args.state_source == POSTGRES_STATE_SOURCE:
+            try:
+                state.load_execution_bundle(
+                    expected_kind=kind,
+                    checked_at=datetime.now(UTC),
+                )
+            except RuntimeError as error:
+                if (
+                    str(error)
+                    != "current PostgreSQL Options session "
+                    "state is unavailable"
+                ):
+                    raise
+                print(json.dumps({
+                    "status": "READY_WAITING_FOR_SESSION",
+                    "kind": kind.value,
+                    "provider_effects": 0,
+                }, sort_keys=True))
+                return 0
         health = check_p8_docker_service_health(
             kind,
             args.package,

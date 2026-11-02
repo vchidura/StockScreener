@@ -1190,8 +1190,9 @@ def test_compose_exposes_only_the_acquisition_role():
     )
     block = compose[start:end]
 
-    assert 'profiles: ["realtime-v3-options-acquisition"]' in block
-    assert 'restart: "on-failure:3"' in block
+    assert "realtime-v3-options-acquisition" in block
+    assert "advanced-realtime-v3" in block
+    assert "restart: unless-stopped" in block
     assert "run_advanced_options_v3_acquisition.py" in block
     assert "--component\n      - options-v3-acquisition" in block
     assert "run_advanced_options_v3_production.py" not in block

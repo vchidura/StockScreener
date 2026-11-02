@@ -474,8 +474,66 @@ hot paths perform no chain/calendar work or v2-v3 profile comparison.
   exact-Options selection: 24 passed with 5 existing warnings. Targeted Python compile
   also passed. No provider/network, live database, Docker, dispatch, delivery, broker
   or trading effect ran.
-- C8 still owns long-lived lifecycle/Compose/status consolidation. C9 still owns
+- C8 now owns long-lived lifecycle/Compose/status consolidation. C9 still owns
   retirement of manual activation, daily supervisors and duplicate paths.
+
+## Post-C7 Integration Corrections
+
+- Equity-only desired membership changes no longer invalidate unchanged Options
+  activation. Options package Equity context may be a subset of the effective READY
+  Equity universe, must include every configured Options underlying and must not name
+  members outside that universe.
+- Adding an Options-underlying role requires that ticker's Equity role to be READY.
+  It schedules no duplicate Equity reference/history/technical preparation; the
+  target-session Options catalog/quote, prior OI/reference/history, bounded selection
+  and capacity checks still run.
+- C6 market-state logical shards now own independent leases and checkpoints over the
+  one shared physical Options journal. A logical shard failure is persisted and
+  retried locally while healthy shards continue; physical reconnect remains one
+  account/feed action and never creates a socket per logical shard.
+- Focused provider-blocked C5/C6/P8 tests: 169 passed with 5 existing warnings.
+  Complete owned-disposable C5/C6 files: 12 passed with 6 existing warnings. The
+  owned-disposable exact V3 restart/publication integration also passed with 6
+  existing warnings. No provider/network, live database, Docker, live publication,
+  delivery, broker or trading effect ran.
+
+## C8 Completion Evidence
+
+- One 19-role inventory drives the normal native command and the
+  `advanced-realtime-v3` Compose profile. Neither normal path accepts a session
+  date or package/bundle/binding/release/pointer artifact.
+- Migration 044 durably records per-underlying Options catalog/quote,
+  reference/OI, history, capacity/shard and activation progress. Only an
+  already-READY Equity role can schedule Options work; the work table contains
+  only `OPTION_UNDERLYING` intents. Stage claims are lease/epoch fenced,
+  provider-aware work reserves account-wide request/byte scope before I/O,
+  immutable evidence/watermarks survive crashes and the final stage activates
+  the PostgreSQL session without manual artifacts.
+- Equity detectors and canonical Stock Alerts derive the current durable
+  processing scope. C7 retry resumes due publication work. Options acquisition
+  and residents wait for and rebind to PostgreSQL session envelopes across
+  rollover. The physical socket remains acquisition-owned; logical shards keep
+  independent leases/checkpoints.
+- Native and Compose share PostgreSQL runtime, role and physical Options-socket
+  fences; host locks are defense in depth. Initial and restart launch failures
+  use the same per-role state machine: transient failures back off independently
+  while explicit configuration failures terminalize without draining healthy
+  provider/processing roles.
+- One stored-only status reports current/future sessions, members, logical
+  shards, physical feeds, publication, retention and non-null per-service
+  native/Compose health. C7 retry directly covers pending, retry, expired,
+  terminal and restart-idempotent work.
+- Provider-blocked C8 selections: 147 passed with 5 existing warnings,
+  including native `main()` fence setup/initial scheduling with an isolated
+  launch failure. Affected provider-blocked C6 allocator/routing/session:
+  100 passed with 5 existing warnings. Owned-disposable C6 plus complete C5/C8
+  lifecycle/fencing: 25 passed with 6 existing warnings. Generalized automatic
+  activation uses `c6_activity_momentum_v2`, B<=8*N/default ceilings, 8/12
+  configured/effective per-underlying limits, whole groups, consumer evidence,
+  one physical subscription and identical restart generation; explicit
+  exact-four retains `c6_exact_four_regression_v1`. Targeted compile passed.
+  No provider/network, live database, Docker/service restart, publication,
+  delivery, broker or trading effect ran.
 
 ## Exact Anchors
 
@@ -493,6 +551,10 @@ hot paths perform no chain/calendar work or v2-v3 profile comparison.
 - `backend/realtime/advanced_options_acquisition_runtime.py`
 - `backend/realtime/advanced_options_p8_runtime.py`
 - `backend/realtime/advanced_options_session_state.py`
+- `backend/realtime/advanced_options_lifecycle.py`
+- `backend/realtime/advanced_options_automatic_preparation.py`
+- `backend/realtime/advanced_realtime_fencing.py`
+- `backend/realtime/advanced_realtime_v3_runtime.py`
 - `backend/realtime/advanced_realtime_desired_state.py`
 - `backend/realtime/advanced_realtime_desired_state_repository.py`
 - `backend/realtime/advanced_equity_preparation.py`
@@ -501,8 +563,13 @@ hot paths perform no chain/calendar work or v2-v3 profile comparison.
 - `backend/realtime/sql_v2/039_realtime_desired_state.sql`
 - `backend/realtime/sql_v2/040_realtime_equity_preparation.sql`
 - `backend/realtime/sql_v2/041_advanced_options_continuous_session_state.sql`
+- `backend/realtime/sql_v2/044_advanced_realtime_v3_lifecycle.sql`
 - `backend/scripts/run_advanced_options_v3_acquisition.py`
 - `backend/scripts/run_advanced_options_v3_production.py`
+- `backend/scripts/run_advanced_options_v3_lifecycle.py`
+- `backend/scripts/run_realtime_v2_portal_publication_retry.py`
+- `backend/scripts/report_advanced_realtime_v3_status.py`
+- `backend/scripts/check_advanced_realtime_v3_service.py`
 - `backend/scripts/run_advanced_realtime_session_scheduler.py`
 - `backend/scripts/run_realtime_v2_advanced_equity_preparation.py`
 - `backend/scripts/manage_advanced_realtime_desired_state.py`

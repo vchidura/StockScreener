@@ -47,6 +47,9 @@ from realtime.migrations import (  # noqa: E402
     EXPECTED_V2_DATABASE_NAME,
     validate_target_database_v2,
 )
+from realtime.advanced_realtime_v3_runtime import (  # noqa: E402
+    load_current_advanced_realtime_session_scope_cursor,
+)
 
 
 UTC = timezone.utc
@@ -80,8 +83,9 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
     parser.add_argument("--confirm-database-name", required=True)
-    parser.add_argument("--cohort-id", type=UUID, required=True)
-    parser.add_argument("--session-date", type=date.fromisoformat, required=True)
+    parser.add_argument("--cohort-id", type=UUID)
+    parser.add_argument("--session-date", type=date.fromisoformat)
+    parser.add_argument("--dynamic-scope", action="store_true")
     parser.add_argument("--maximum-records", type=int, default=100)
     parser.add_argument("--lease-seconds", type=int, default=60)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
@@ -101,6 +105,23 @@ def parse_args(argv=None):
         parser.error("--lease-seconds must be in [30, 3600]")
     if args.poll_seconds <= 0:
         parser.error("--poll-seconds must be positive")
+    if (
+        args.dynamic_scope
+        and (
+            args.cohort_id is not None
+            or args.session_date is not None
+        )
+    ) or (
+        not args.dynamic_scope
+        and (
+            args.cohort_id is None
+            or args.session_date is None
+        )
+    ):
+        parser.error(
+            "Advanced Equity detectors require dynamic scope or "
+            "an explicit cohort and session"
+        )
     if not args.continuous or not args.execute:
         parser.error(
             "Advanced Equity detectors require --continuous --execute"
@@ -358,17 +379,41 @@ def main(argv=None) -> int:
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    session_close = OptionExchangeCalendar("XNYS").session_close(
-        args.session_date
-    )
+    calendar = OptionExchangeCalendar("XNYS")
     code_sha256 = detector_code_sha256()
     try:
         while not stop.is_set():
+            if args.dynamic_scope:
+                with provider.transaction(
+                    APP_ROLE,
+                    read_only=True,
+                ) as unit:
+                    scope = (
+                        load_current_advanced_realtime_session_scope_cursor(
+                            unit.cursor,
+                            checked_at=datetime.now(UTC),
+                        )
+                    )
+                if scope is None:
+                    print(json.dumps({
+                        "status": "WAITING_FOR_READY_SESSION",
+                        "provider_requests": 0,
+                        "alert_writes": 0,
+                        "outbox_writes": 0,
+                        "publication_writes": 0,
+                    }, separators=(",", ":"), sort_keys=True))
+                    stop.wait(args.poll_seconds)
+                    continue
+                cohort_id = scope.cohort_id
+                session_date = scope.session_date
+            else:
+                cohort_id = args.cohort_id
+                session_date = args.session_date
             result = run_detector_cycle(
                 provider,
-                cohort_id=args.cohort_id,
-                session_date=args.session_date,
-                session_close=session_close,
+                cohort_id=cohort_id,
+                session_date=session_date,
+                session_close=calendar.session_close(session_date),
                 owner_id=owner_id,
                 code_sha256=code_sha256,
                 maximum_records=args.maximum_records,

@@ -61,6 +61,7 @@ from realtime.buffer import BufferLimits, RawMessageBuffer
 from realtime.portal_publisher import PortalPublicationConfig
 from realtime.preflight import ProviderTier
 from realtime.contracts import EQUITY_VALIDATION_UNIVERSE
+from realtime.materialization import MaterializerShardMap
 from realtime.orchestration_repository import WindowSpec
 from realtime.stage_graph import STAGE_CATALOG_VERSION_V5
 from realtime.advanced_options_service import OPTIONS_V3_STAGE_ORDER
@@ -686,13 +687,12 @@ def test_compose_has_exact_four_p8_services_commands_and_isolated_secrets():
         assert "- /run/advanced-options-p8/package.json" in diagnostic
         assert "- /run/advanced-options-p8/execution-bundle.json" in diagnostic
 
-        assert (
-            f'profiles: ["{ADVANCED_OPTIONS_V3_COMPOSE_PROFILE}"]'
-            in normal
-        )
-        assert 'restart: "on-failure:3"' in normal
+        assert ADVANCED_OPTIONS_V3_COMPOSE_PROFILE in normal
+        assert "advanced-realtime-v3" in normal
+        assert "restart: unless-stopped" in normal
         assert "- --docker-service-kind" in normal
         assert f"- {kind.value}" in normal
+        assert "- --continuous" in normal
         assert "- --docker-health-kind" in normal
         assert "- postgres" in normal
         assert (
@@ -2000,3 +2000,230 @@ def test_production_live_state_uses_the_current_selection_capture():
         [],
         [],
     )
+
+
+def test_market_state_retries_only_failed_logical_shard(
+    monkeypatch,
+    tmp_path,
+):
+    cohort_id = UUID("11111111-1111-1111-1111-111111111111")
+    generation = UUID("22222222-2222-2222-2222-222222222222")
+    owner_id = UUID("33333333-3333-3333-3333-333333333333")
+    selection_id = UUID("44444444-4444-4444-4444-444444444444")
+    shard_map = MaterializerShardMap(
+        "test-isolated-market-state-v1",
+        2,
+        ((101, 0), (202, 1)),
+    )
+    registration = SimpleNamespace(
+        journal_generation=generation,
+        normalized_committed_offset=1,
+        status="DRAINING",
+    )
+    source = SimpleNamespace(
+        registration=registration,
+        path=tmp_path / "options.sqlite",
+    )
+    binding = SimpleNamespace(
+        enrollment=SimpleNamespace(
+            control_plane=SimpleNamespace(
+                cohort_id=cohort_id,
+                source_flow=SimpleNamespace(
+                    journal_generation=generation,
+                ),
+            ),
+        ),
+    )
+    selection_plan = SimpleNamespace(
+        generation_id=selection_id,
+        admission_profile_version="test-no-router",
+    )
+    layout = roles_module._C6ShardLayout(
+        shard_map,
+        (
+            SimpleNamespace(shard_id=UUID(
+                "55555555-5555-5555-5555-555555555555"
+            )),
+            SimpleNamespace(shard_id=UUID(
+                "66666666-6666-6666-6666-666666666666"
+            )),
+        ),
+    )
+
+    class Provider:
+        @contextmanager
+        def transaction(self, *_args, **_kwargs):
+            yield SimpleNamespace(cursor=object())
+
+    class Leases:
+        released = []
+
+        def __init__(self, _provider):
+            pass
+
+        def acquire(self, *_args, **_kwargs):
+            return 1
+
+        def renew(self, *_args, **_kwargs):
+            return True
+
+        def release(self, resource, _owner_id, _owner_epoch):
+            self.released.append(resource)
+
+    class Consumer:
+        def __init__(self, *args, owned_shard_ids, **kwargs):
+            self.shard_id = owned_shard_ids[0]
+            self.committed_offset = 0
+            self.states = ({
+                "shard_id": self.shard_id,
+                "committed_offset": 0,
+            },)
+
+        def plan_slice(self, *, maximum_records):
+            assert maximum_records == 10_000
+            record_count = int(self.committed_offset == 0)
+            return SimpleNamespace(
+                record_count=record_count,
+                states=(SimpleNamespace(shard_id=self.shard_id),),
+                checkpoints=(SimpleNamespace(committed_offset=1),),
+                dirty_instrument_ids=(frozenset(),),
+                shard_map=shard_map,
+                state_sha256=f"state-{self.shard_id}",
+            )
+
+        def commit_slice(self, _planned):
+            self.committed_offset = 1
+            self.states = ({
+                "shard_id": self.shard_id,
+                "committed_offset": 1,
+            },)
+
+    attempts = {0: 0, 1: 0}
+    failures = []
+    progress = []
+    monotonic = [0.0]
+
+    def persist_slice(*_args, planned, **_kwargs):
+        shard_id = planned.states[0].shard_id
+        attempts[shard_id] += 1
+        if shard_id == 0 and attempts[shard_id] == 1:
+            raise RuntimeError("injected shard zero persistence failure")
+
+    def next_monotonic():
+        monotonic[0] += 2.0
+        return monotonic[0]
+
+    monkeypatch.setattr(
+        roles_module,
+        "_lease",
+        lambda *_args, **_kwargs: (owner_id, 1),
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_wait_registration",
+        lambda *_args, **_kwargs: registration,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_registration",
+        lambda *_args, **_kwargs: registration,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_journal_root",
+        lambda *_args, **_kwargs: tmp_path,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "AdvancedOptionsJournalSource",
+        lambda **_kwargs: source,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_selection_plan",
+        lambda *_args, **_kwargs: selection_plan,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_shard_layout",
+        lambda *_args, **_kwargs: layout,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "AdvancedOptionsPostgresLeasePort",
+        Leases,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "load_advanced_options_market_state_cursor",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "load_advanced_options_detector_routing_state_cursor",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "AdvancedOptionsMarketStateConsumer",
+        Consumer,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "persist_advanced_options_market_state_slice_cursor",
+        persist_slice,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "persist_c6_shard_state_cursor",
+        lambda *_args, **kwargs: failures.append(kwargs),
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "persist_c6_consumer_state_cursor",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_persist_c6_market_progress_cursor",
+        lambda *_args, **kwargs: progress.append(
+            kwargs["planned"].states[0].shard_id
+        ),
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_snapshot_v3_resident_windows",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "_record_v3_resident_completion",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        roles_module,
+        "RawJournalReader",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        roles_module.time,
+        "monotonic",
+        next_monotonic,
+    )
+
+    report = roles_module._run_market_state(
+        package={},
+        bundle={"orchestration": {"catalog_version": "test"}},
+        binding=binding,
+        provider=Provider(),
+        environment={},
+        stop_event=threading.Event(),
+        session_state=object(),
+    )
+
+    assert report["normalized_end_offset"] == 1
+    assert attempts == {0: 2, 1: 1}
+    assert failures[0]["shard_id"] == layout.persistent_shards[
+        0
+    ].shard_id
+    assert progress[:2] == [1, 0]

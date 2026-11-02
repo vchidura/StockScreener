@@ -774,7 +774,7 @@ def test_compose_advanced_services_are_independent_and_secret_scoped():
     assert "VITE_REALTIME_COHORT_ID: ${REALTIME_V2_ADVANCED_COHORT_ID" in blocks[
         "realtime-v2-advanced-frontend"
     ]
-    assert "extends:" not in standalone
+    assert all("extends:" not in block for block in blocks.values())
     assert "services.backend.environment" not in standalone
     assert {
         f"  {service}:"

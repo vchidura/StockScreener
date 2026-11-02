@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 from uuid import UUID
 
 import pytest
+import realtime.advanced_options_consumers as consumers
 import realtime.stage_runners_options as option_runners
 
 from option_flow_runner_support import (
@@ -504,6 +505,69 @@ def test_market_state_restart_and_uninterrupted_replay_are_identical(
     assert len(state.quotes) == 1
     assert len(state.trades) == 1
     assert state.quotes[0].provider_symbol == state.trades[0].provider_symbol
+
+
+def test_market_state_logical_shards_advance_independently(
+    tmp_path,
+    monkeypatch,
+):
+    control, source = _source(tmp_path)
+    shard_map = MaterializerShardMap(
+        "advanced-options-market-state-isolated-v1",
+        2,
+        ((101, 0), (202, 1)),
+    )
+    source.registration = replace(
+        source.registration,
+        shard_ids=(0, 1),
+        shard_map_sha256=shard_map.sha256,
+    )
+    first = AdvancedOptionsMarketStateConsumer(
+        source=source,
+        cohort_id=control.cohort_id,
+        shard_map=shard_map,
+        owner_epoch=1,
+        owned_shard_ids=(0,),
+        clock=lambda: NOW,
+    )
+    second = AdvancedOptionsMarketStateConsumer(
+        source=source,
+        cohort_id=control.cohort_id,
+        shard_map=shard_map,
+        owner_epoch=2,
+        owned_shard_ids=(1,),
+        clock=lambda: NOW,
+    )
+
+    first_slice = first.plan_slice(maximum_records=10)
+    second_slice = second.plan_slice(maximum_records=10)
+    first.commit_slice(first_slice)
+
+    assert first.committed_offset == source.last_event_offset() == 2
+    assert second.committed_offset == 0
+    assert first_slice.states[0].shard_id == 0
+    assert second_slice.states[0].shard_id == 1
+    assert not second_slice.dirty_instrument_ids[0]
+
+    persisted = []
+    monkeypatch.setattr(
+        consumers,
+        "persist_quote_materialization_cursor",
+        lambda *args, **kwargs: persisted.append(kwargs),
+    )
+    persist_advanced_options_market_state_slice_cursor(
+        MagicMock(),
+        cohort_id=control.cohort_id,
+        journal_generation=source.generation,
+        planned=first_slice,
+        owner_id=OWNER,
+        batch_executor=_batch_executor,
+    )
+    second.commit_slice(second_slice)
+
+    assert len(persisted) == 1
+    assert persisted[0]["checkpoint"].shard_id == 0
+    assert second.committed_offset == 2
 
 
 def _batch_executor(cursor, statement, parameters, *, page_size):

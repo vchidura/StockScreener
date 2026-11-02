@@ -119,3 +119,4 @@ backend/Dockerfile.p6e.dockerignore
 docker-compose.options-p6.yml
 docker-compose.realtime-v2.yml
 docker-compose.realtime-v2.yml
+docs/agent-context/advanced-realtime.md

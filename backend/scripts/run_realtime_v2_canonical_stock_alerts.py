@@ -8,7 +8,7 @@ import os
 import signal
 import sys
 import threading
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -42,14 +42,21 @@ from realtime.migrations import (  # noqa: E402
     EXPECTED_V2_DATABASE_NAME,
     validate_target_database_v2,
 )
+from realtime.advanced_realtime_v3_runtime import (  # noqa: E402
+    load_current_advanced_realtime_session_scope_cursor,
+)
+
+
+UTC = timezone.utc
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
     parser.add_argument("--confirm-database-name", required=True)
-    parser.add_argument("--cohort-id", type=UUID, required=True)
-    parser.add_argument("--session-date", type=date.fromisoformat, required=True)
+    parser.add_argument("--cohort-id", type=UUID)
+    parser.add_argument("--session-date", type=date.fromisoformat)
+    parser.add_argument("--dynamic-scope", action="store_true")
     parser.add_argument(
         "--operation",
         type=AdvancedSessionOperation,
@@ -82,7 +89,21 @@ def parse_args(argv=None):
         args.database != EXPECTED_V2_DATABASE_NAME
         or args.poll_seconds <= 0
         or not 1 <= args.claim_limit <= 32
-        or args.cohort_id.int == 0
+        or (
+            args.dynamic_scope
+            and (
+                args.cohort_id is not None
+                or args.session_date is not None
+            )
+        )
+        or (
+            not args.dynamic_scope
+            and (
+                args.cohort_id is None
+                or args.session_date is None
+                or args.cohort_id.int == 0
+            )
+        )
         or (args.health and (args.continuous or args.execute))
         or (
             not args.health
@@ -199,11 +220,41 @@ def _provider(args):
     return provider, pool
 
 
+def _runtime_scope(provider, args):
+    if not args.dynamic_scope:
+        return args.cohort_id, args.session_date
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        scope = load_current_advanced_realtime_session_scope_cursor(
+            unit.cursor,
+            checked_at=datetime.now(UTC),
+        )
+    return (
+        (None, None)
+        if scope is None
+        else (scope.cohort_id, scope.session_date)
+    )
+
+
 def _health(provider, args) -> int:
+    cohort_id, _session_date = _runtime_scope(provider, args)
+    if cohort_id is None:
+        print(json.dumps({
+            "status": "READY_WAITING_FOR_SESSION",
+            "operation": args.operation.value,
+            "effects": {
+                "provider": 0,
+                "publication": 0,
+                "pointer": 0,
+                "read_pin": 0,
+                "delivery": 0,
+                "execution": 0,
+            },
+        }, sort_keys=True), flush=True)
+        return 0
     with provider.transaction(APP_ROLE, read_only=True) as unit:
         status = canonical_stock_alert_health_cursor(
             unit.cursor,
-            cohort_id=args.cohort_id,
+            cohort_id=cohort_id,
         )
     status["operation"] = args.operation.value
     status["diagnostic_authorization_id"] = (
@@ -244,6 +295,10 @@ def main(argv=None) -> int:
         signal.signal(signal.SIGINT, lambda *_: stop.set())
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         while not stop.is_set():
+            cohort_id, session_date = _runtime_scope(provider, args)
+            if cohort_id is None:
+                stop.wait(args.poll_seconds)
+                continue
             reports = []
             with provider.transaction(
                 APP_ROLE,
@@ -252,15 +307,15 @@ def main(argv=None) -> int:
             ) as unit:
                 receipts = load_due_canonical_stock_alert_receipts_cursor(
                     unit.cursor,
-                    cohort_id=args.cohort_id,
-                    session_date=args.session_date,
+                    cohort_id=cohort_id,
+                    session_date=session_date,
                     limit=args.claim_limit,
                 )
                 for receipt in receipts:
                     batch = build_canonical_stock_alert_batch_cursor(
                         unit.cursor,
                         receipt,
-                        session_date=args.session_date,
+                        session_date=session_date,
                     )
                     reports.append(
                         persist_canonical_stock_alert_batch_cursor(

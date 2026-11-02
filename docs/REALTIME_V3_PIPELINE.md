@@ -1077,7 +1077,42 @@ Implemented C7 evidence (2026-11-01):
   Docker, delivery, broker or trading effect ran. Long-lived lifecycle/Compose/status
   consolidation remains C8; old-path retirement remains C9.
 
+##### Pre-C8 Integration Corrections
+
+Status: `IMPLEMENTED; FOCUSED VALIDATION COMPLETE`.
+
+- Equity/sector-ETF membership and Options-underlying membership are separate
+  lifecycle scopes. Adding or removing an Equity-only member must not change,
+  invalidate or rebuild an otherwise unchanged Options session.
+- An Options underlying must already be an enabled, `READY` Equity/sector-ETF member
+  with its required Equity history and technical materialization complete. Adding
+  that ticker to the Options-underlying role does not create another Equity backfill
+  or technical-warmup job.
+- The Options package Equity binding may be a strict subset of the effective READY
+  Equity universe. It must contain every configured Options underlying and must not
+  name an Equity member outside that effective universe. This preserves exact
+  H/E/O context without coupling Options activation to unrelated Equity breadth.
+- Options enrollment still performs the normal target-session Options work:
+  current catalog and quote selection, prior OI/reference validation, required
+  Options history coverage, bounded contract allocation, account capacity and shard
+  construction. "No additional Equity work" does not waive those Options facts.
+- One physical Options socket and journal remain authoritative. Logical market-state
+  shards own independent leases and checkpoints, scan the shared journal from their
+  own durable offsets and persist independently. A logical shard failure is recorded
+  and retried without stopping healthy logical shards. A physical transport failure
+  remains one account/feed reconnect affecting all logical shards and retains shared
+  gap evidence.
+- Focused provider-blocked C5/C6/P8 selection, consumer, acquisition, allocator,
+  canary, Docker-runtime and schema tests passed 169 tests with 5 existing warnings.
+  The complete owned-disposable C5 session-state and C6 selection files passed 12
+  tests with 6 existing warnings, including Equity-superset activation and required
+  underlying-context rejection. The owned-disposable exact V3 restart/publication
+  integration passed with 6 existing warnings. No provider/network, live database,
+  Docker, delivery, broker or trading effect ran.
+
 #### C8 - Consolidate Docker, Maintenance And Status
+
+Status: `IMPLEMENTED; BLOCKER REMEDIATION VALIDATED`.
 
 Purpose: provide one understandable local/Docker operating path.
 
@@ -1091,9 +1126,24 @@ Actions:
   not stop healthy acquisition or processing children;
 - replace bounded restart exhaustion for long-lived residents with per-role degraded
   state, bounded backoff and explicit operator-visible terminal conditions;
+- reconcile Equity/sector-ETF and Options-underlying desired roles independently.
+  An Equity-only membership change must not rotate or invalidate unchanged Options
+  state. An Options-underlying addition is eligible only after that ticker's Equity
+  role is already READY; it schedules no duplicate Equity history or technical work;
+- add durable per-underlying Options preparation from the effective desired state:
+  reserve account-wide provider request/byte scope before I/O, resolve current
+  catalog/quote candidates, validate prior OI/reference and required Options history,
+  persist bounded selection/capacity/shard evidence, resume from durable stage
+  progress and promote only the prepared Options member;
 - add the long-lived lifecycle that materializes and activates the next effective
   Options session from durable state, waits without exhausting restarts when no
   session envelope or window E exists, and rebinds residents across XNYS rollover;
+- bind and rebind Equity detectors, canonical Stock Alerts, C7 publication retry and
+  every Options resident from the same current durable session instead of fixed
+  cohort/date arguments;
+- retain one physical Options socket owner while running each logical processing
+  shard under an independent lease/checkpoint/retry scope. Logical-shard failure must
+  not reconnect the socket or stop healthy shards; physical reconnect remains shared;
 - expose one status summary with per-service, per-shard and per-member readiness;
 - configure ordinary partition creation, retention and archive cadence;
 - document one startup, status, stop, backup and restore workflow.
@@ -1102,10 +1152,64 @@ Exit:
 
 - native and Docker paths produce the same stage ownership and durable results;
 - process/container restart does not duplicate sockets or publications;
+- an Equity-only addition leaves the current Options selection/session identity
+  unchanged, while adding an already-ready Equity ticker to the Options role performs
+  only target-session Options preparation before activation;
+- one injected logical Options shard failure leaves the physical feed and healthy
+  logical shards advancing, then resumes from only the failed shard's checkpoint;
 - maintenance failure leaves live ingestion running;
 - backup/restore verification succeeds against consolidated state.
 
 Rollback: retain old Compose profiles until parity and use them only one at a time.
+
+Implementation evidence:
+
+- `run_realtime_v2_advanced_services.py` is the one normal native command.
+  `advanced-realtime-v3` is the one normal Compose profile. Both use the same
+  19-role ownership inventory and accept no normal date, package, bundle,
+  binding, release or pointer input.
+- Migration `044_advanced_realtime_v3_lifecycle` adds durable per-revision,
+  per-underlying Options preparation stages for catalog/quote, reference/OI,
+  history, capacity/shards and session activation. The lifecycle admits an
+  Options role only after its existing Equity/sector-ETF role is `READY`; all
+  scheduled work remains `OPTION_UNDERLYING`, so no Equity preparation is
+  duplicated. Each stage has a fenced lease/owner epoch, immutable evidence and
+  watermark, bounded retry, expired-claim takeover and provider-ledger
+  reservation before provider-aware execution. Completion promotes only the
+  prepared Options intent and the final worker transaction activates the
+  PostgreSQL session without a manual document or command.
+- Detectors and canonical Stock Alerts resolve the current processing scope
+  from the effective desired snapshot. C7 retry scans durable due work. Options
+  acquisition and all four residents wait for a PostgreSQL session envelope,
+  drain the bounded session and select the next current envelope on the next
+  loop. The retained artifact adapters and manual activation commands are
+  diagnostic-only.
+- Resident services use `restart: unless-stopped`. Native and Compose use the
+  same PostgreSQL group, per-role and physical Options-socket fences with
+  heartbeat/owner epoch; host locks remain defense in depth. Native supervision
+  applies one independent state machine from initial launch onward, retries
+  transient launch failures with bounded backoff and terminalizes explicit
+  configuration exits without draining healthy provider/processing roles.
+- `report_advanced_realtime_v3_status.py` reports current processing, future
+  preparation, member readiness, logical shard progress, the physical Options
+  subscription, publication work, retention and non-null native/Compose
+  per-service state/health. C7 retry has direct pending/retry/expired/terminal
+  and idempotent-restart coverage. README and deployment document one
+  startup/status/stop/backup/isolated-restore workflow.
+- Consolidated provider-blocked C8 lifecycle, role-isolation, publication,
+  status, container, acquisition, schema and registry selection: 147 passed
+  with 5 existing warnings. Affected provider-blocked C6 allocator/routing/
+  session selection: 100 passed with 5 existing warnings. Owned-disposable C6
+  selection plus complete C5/C8 lifecycle/fencing selection: 25 passed with 6
+  existing warnings. The generalized three-underlying real executor persists
+  `c6_activity_momentum_v2`, B bounded by 8*N and all configured/measured/
+  provider ceilings, configured/effective per-underlying limits 8/12, whole
+  protected groups, consumer eligibility, one physical subscription and an
+  identical generation after restart. Explicit exact-four rehydration retains
+  `c6_exact_four_regression_v1`. The native `main()` proof reaches fence setup
+  and initial scheduling while isolating a launch failure. Targeted compile
+  passed. No provider/network, live database, Docker/service, publication,
+  delivery, broker or trading effect ran.
 
 #### C9 - Retire Duplicate Control Paths
 
@@ -1146,13 +1250,15 @@ reverting schema or data-plane changes.
 | Same-day configuration change | Current plan/budgets/usage remain pinned; new values apply only to the next session. |
 | Add Equity/ETF after close | History/warmup progresses per member; next session snapshot includes only ready/effective state as designed. |
 | Add non-ladder Equity/ETF member | Any supported 1-400 count receives a deterministic profile; ready existing members continue while the new member warms. |
+| Equity-only addition while Options is active | The Equity member prepares and activates independently; unchanged Options package, selection, session and resident identities remain valid. |
 | Automatic member onboarding | One desired-state edit triggers history repair, derived warmup, readiness, immutable session state and portal inclusion with no manual snapshot/cohort/hash/authorization step. |
 | Warming member with established universe | Established acquisition, detectors and portal releases continue; the warming member exposes partial stored coverage/readiness independently. |
 | Backfill interruption | Retry resumes from the member's durable watermark/attempt and preserves completed intervals. |
-| Add Options underlying after close | Catalog/OI/history reconcile; deterministic contracts/shards; existing members unchanged. |
+| Add Options underlying after close | The ticker is already a READY Equity member; no Equity backfill or technical work is repeated. Target-session Options catalog/quote, OI/reference/history, allocation and capacity reconcile; deterministic contracts/shards activate while existing members remain unchanged. |
 | Options next-session rollover | Contract/catalog/OI/reference evidence is revalidated for the new session; stale prior slot membership is not reused as current proof. |
 | Equity ingress crash | Same journal generation/owner recovery or explicit new fenced generation; no duplicate bars. |
-| Options shard crash | Only that shard reconnects; gaps/counters survive; other shards continue. |
+| Options logical shard crash | The physical socket/journal remains owned and healthy logical shards continue. Only the failed processing shard releases/reclaims its lease and resumes its checkpoint; shard failure remains visible. |
+| Options physical transport crash | The sole socket owner reconnects once for the account/feed, records one shared transport gap and preserves every logical checkpoint; logical shards never open replacement sockets. |
 | Lifecycle supervisor crash | Existing live children are detected; no second coordinator/socket starts. |
 | Capability profile expires | Refresh owner performs one bounded exact-scope `STOCKS/AM` subscription probe within the valid pre-session window, supplies a fresh profile or leaves lifecycle visibly blocked; validity is never silently extended and weekends do not cause repeated premature provider calls. |
 | Capability refresh while ingress is live | No second Stocks connection is opened under the default account limit; ingress evidence is reused or a probe waits for the shared asset-class connection owner. |
@@ -1207,7 +1313,8 @@ exact-four and target-9 fixtures as known examples.
 | Old catch-up release wins pointer race | Compare cutoff/generation in the sole publisher transaction. |
 | Exact count assumptions remain in readers | Inventory validators, health, result counts, tests and UI summaries before generic activation. |
 | Options membership exceeds one connection | Deterministic shards; no truncation; explicit over-limit status. |
-| One Options shard blocks all products | Per-shard and per-underlying readiness with product-declared completeness. |
+| Equity breadth invalidates unchanged Options | Options validates only its configured underlyings against READY desired/package Equity context; unrelated Equity members neither rotate nor block Options. |
+| One Options shard blocks all products | Independent logical-shard leases/checkpoints/retry plus product-declared completeness; the one physical socket remains shared and is not a logical-shard restart mechanism. |
 | Intended membership and readiness collapse | Immutable desired membership remains intact while operational readiness changes independently. |
 | P8 file append guarantees are lost in DB move | Transactional append sequence, previous hash and idempotent replay tests. |
 | Session rollover resets cumulative usage after crash | Session-keyed counters persist independently of process lifetime. |
@@ -1248,6 +1355,11 @@ The consolidation is complete when:
    publications visible without stopping unrelated work;
 13. README, deployment, canonical design and compact checkpoint all name only the
     consolidated normal runtime.
+14. Equity-only membership changes do not alter unchanged Options session identity;
+   an Options addition requires an already-READY Equity role and schedules no
+   duplicate Equity preparation.
+15. logical Options processing shards recover independently from the shared durable
+   journal, while exactly one physical Options socket owns reconnect and gap evidence.
 
 ## Existing Detailed Pipeline Reference
 

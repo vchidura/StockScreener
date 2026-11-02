@@ -28,6 +28,7 @@ from .materialization import (
     restore_materializer_checkpoint,
     dirty_materializer_instruments,
     initial_materializer_state,
+    materialize_shard_batch,
     materialize_shard_fanout,
 )
 from .materialization_repository import (
@@ -660,6 +661,7 @@ class AdvancedOptionsMarketStateConsumer:
         detector_router: (
             AdvancedOptionsBoundedDetectorRouter | None
         ) = None,
+        owned_shard_ids: tuple[int, ...] | None = None,
         clock: Callable[[], datetime] = (
             lambda: datetime.now(timezone.utc)
         ),
@@ -685,18 +687,39 @@ class AdvancedOptionsMarketStateConsumer:
             raise ValueError(
                 "Advanced Options market-state shard map is not registered"
             )
+        owned = (
+            tuple(range(shard_map.shard_count))
+            if owned_shard_ids is None
+            else tuple(sorted(set(owned_shard_ids)))
+        )
+        if (
+            not owned
+            or len(owned) != len(
+                owned_shard_ids
+                if owned_shard_ids is not None
+                else owned
+            )
+            or any(
+                type(shard_id) is not int
+                or not 0 <= shard_id < shard_map.shard_count
+                for shard_id in owned
+            )
+        ):
+            raise ValueError(
+                "Advanced Options owned shard identities are invalid"
+            )
         initial = (
             tuple(
                 initial_materializer_state(shard_map, shard_id)
-                for shard_id in range(shard_map.shard_count)
+                for shard_id in owned
             )
             if states is None
             else tuple(states)
         )
         if (
-            len(initial) != shard_map.shard_count
+            len(initial) != len(owned)
             or {state.shard_id for state in initial}
-            != set(range(shard_map.shard_count))
+            != set(owned)
             or len({state.scanned_offset for state in initial}) != 1
             or any(
                 state.shard_map_sha256 != shard_map.sha256
@@ -711,11 +734,15 @@ class AdvancedOptionsMarketStateConsumer:
         self.shard_map = shard_map
         self.owner_epoch = owner_epoch
         self.consumer_name = name
+        self.owned_shard_ids = owned
         self._states = tuple(sorted(initial, key=lambda state: state.shard_id))
         if (
             detector_router is not None
-            and detector_router.state.committed_event_offset
-            != self._states[0].scanned_offset
+            and (
+                owned != tuple(range(shard_map.shard_count))
+                or detector_router.state.committed_event_offset
+                != self._states[0].scanned_offset
+            )
         ):
             raise ValueError(
                 "detector routing checkpoint is not aligned"
@@ -748,10 +775,21 @@ class AdvancedOptionsMarketStateConsumer:
             self.committed_offset,
             limit=maximum_records,
         ))
-        next_states = materialize_shard_fanout(
-            self._states,
-            self.shard_map,
-            records,
+        next_states = (
+            materialize_shard_fanout(
+                self._states,
+                self.shard_map,
+                records,
+            )
+            if len(self._states) == self.shard_map.shard_count
+            else tuple(
+                materialize_shard_batch(
+                    state,
+                    self.shard_map,
+                    records,
+                )
+                for state in self._states
+            )
         )
         dirty = tuple(
             dirty_materializer_instruments(previous, current)
@@ -827,11 +865,22 @@ def persist_advanced_options_market_state_slice_cursor(
 ) -> None:
     if not isinstance(planned, AdvancedOptionsMarketStateSlice):
         raise TypeError("Advanced Options market-state slice is invalid")
-    if not (
-        len(planned.states)
-        == len(planned.checkpoints)
-        == len(planned.dirty_instrument_ids)
-        == planned.shard_map.shard_count
+    state_ids = tuple(state.shard_id for state in planned.states)
+    if (
+        not planned.states
+        or len(planned.states)
+        != len(planned.checkpoints)
+        or len(planned.states) != len(planned.dirty_instrument_ids)
+        or len(state_ids) != len(set(state_ids))
+        or any(
+            not 0 <= shard_id < planned.shard_map.shard_count
+            for shard_id in state_ids
+        )
+        or tuple(
+            checkpoint.shard_id
+            for checkpoint in planned.checkpoints
+        )
+        != state_ids
     ):
         raise ValueError("market-state slice checkpoint membership is incomplete")
     for state, checkpoint, dirty in zip(
@@ -873,13 +922,28 @@ def load_advanced_options_market_state_cursor(
     cohort_id: UUID,
     journal_generation: UUID,
     shard_map: MaterializerShardMap,
+    shard_ids: tuple[int, ...] | None = None,
 ) -> tuple[MaterializerShardState, ...] | None:
     name = consumer_name.strip()
+    requested_shards = (
+        tuple(range(shard_map.shard_count))
+        if shard_ids is None
+        else tuple(sorted(set(shard_ids)))
+    )
     if (
         not name
         or not isinstance(cohort_id, UUID)
         or not isinstance(journal_generation, UUID)
         or not isinstance(shard_map, MaterializerShardMap)
+        or not requested_shards
+        or len(requested_shards) != len(
+            shard_ids if shard_ids is not None else requested_shards
+        )
+        or any(
+            type(shard_id) is not int
+            or not 0 <= shard_id < shard_map.shard_count
+            for shard_id in requested_shards
+        )
     ):
         raise ValueError(
             "Advanced Options market-state restore scope is invalid"
@@ -891,8 +955,14 @@ def load_advanced_options_market_state_cursor(
         "state_payload,committed_at "
         "FROM rt.consumer_checkpoints "
         "WHERE consumer_name=%s AND cohort_id=%s "
-        "AND journal_generation=%s ORDER BY shard_id",
-        (name, str(cohort_id), str(journal_generation)),
+        "AND journal_generation=%s AND shard_id=ANY(%s) "
+        "ORDER BY shard_id",
+        (
+            name,
+            str(cohort_id),
+            str(journal_generation),
+            list(requested_shards),
+        ),
     )
     rows = cursor.fetchall()
     if not rows:
@@ -914,9 +984,9 @@ def load_advanced_options_market_state_cursor(
         for row in rows
     )
     if (
-        len(checkpoints) != shard_map.shard_count
+        len(checkpoints) != len(requested_shards)
         or tuple(row.shard_id for row in checkpoints)
-        != tuple(range(shard_map.shard_count))
+        != requested_shards
     ):
         raise ValueError(
             "Advanced Options persisted shard checkpoints are incomplete"

@@ -11,7 +11,7 @@ import threading
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from dotenv import dotenv_values
 from psycopg2.pool import ThreadedConnectionPool
@@ -27,6 +27,11 @@ from realtime.advanced_options_acquisition_runtime import (  # noqa: E402
     acquisition_health,
     build_acquisition_binding,
     run_acquisition,
+)
+from realtime.advanced_realtime_fencing import (  # noqa: E402
+    DurableLeaseUnavailable,
+    OPTIONS_PHYSICAL_SOCKET_RESOURCE,
+    PostgresLeaseHeartbeat,
 )
 from realtime.advanced_options_p8_runtime import (  # noqa: E402
     LegacyArtifactSessionStateAdapter,
@@ -96,10 +101,10 @@ def parse_args(argv=None):
             default=POSTGRES_STATE_SOURCE,
         )
         command.add_argument("--binding", type=Path)
-        command.add_argument("--status-path", type=Path, required=True)
+        command.add_argument("--status-path", type=Path)
         if name == "run":
-            command.add_argument("--journal-root", type=Path, required=True)
-            command.add_argument("--lock-path", type=Path, required=True)
+            command.add_argument("--journal-root", type=Path)
+            command.add_argument("--lock-path", type=Path)
             command.add_argument("--continuous", action="store_true")
             command.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -145,6 +150,35 @@ def parse_args(argv=None):
         )
     ):
         parser.error("Options acquisition runtime scope is invalid")
+    if args.state_source == POSTGRES_STATE_SOURCE:
+        journal_root = Path(
+            os.environ.get(
+                "REALTIME_V2_ADVANCED_JOURNAL_DIR",
+                BACKEND_DIR / ".realtime-canary" / "advanced-journals",
+            )
+        )
+        status_path = Path(
+            os.environ.get(
+                "REALTIME_V3_OPTIONS_ACQUISITION_STATUS_PATH",
+                journal_root / "options-acquisition-status.json",
+            )
+        )
+        lock_path = Path(
+            os.environ.get(
+                "REALTIME_V3_OPTIONS_ACQUISITION_LOCK_PATH",
+                journal_root / "options-acquisition-provider.lock",
+            )
+        )
+        args.status_path = args.status_path or status_path
+        if args.command == "run":
+            args.journal_root = args.journal_root or journal_root
+            args.lock_path = args.lock_path or lock_path
+    if args.status_path is None:
+        parser.error("Options acquisition status path is unavailable")
+    args.status_path = args.status_path.resolve()
+    if args.command == "run":
+        args.journal_root = args.journal_root.resolve()
+        args.lock_path = args.lock_path.resolve()
     if args.command == "run" and (
         not args.continuous or not args.execute
     ):
@@ -298,32 +332,40 @@ def main(argv=None) -> int:
         provider, pool, diagnostic = _provider()
         if args.state_source == POSTGRES_STATE_SOURCE:
             state_provider = provider
-    state = select_options_session_state(
-        environment=os.environ,
-        provider=state_provider,
-        acquisition_binding_path=(
-            args.binding
-            if args.state_source == LEGACY_DIAGNOSTIC_STATE_SOURCE
-            else None
-        ),
-        state_source=args.state_source,
-    )
-    binding = state.load_acquisition_binding()
-    selection_plan = state.load_c6_selection_plan()
-    diagnostic_clock = (
-        binding.authority.acquisition_start + timedelta(seconds=1)
-        if (
-            os.environ.get("REALTIME_V3_VALIDATION_MODE")
-            == "DEVELOPMENT_DIAGNOSTIC"
-            and os.environ.get(
-                "REALTIME_V3_PROVIDER_FREE_QUALIFICATION"
-            )
-            == "ENABLED"
-        )
-        else None
-    )
     if args.command == "health":
         try:
+            state = select_options_session_state(
+                environment=os.environ,
+                provider=state_provider,
+                acquisition_binding_path=(
+                    args.binding
+                    if args.state_source
+                    == LEGACY_DIAGNOSTIC_STATE_SOURCE
+                    else None
+                ),
+                checked_at=datetime.now(UTC),
+                state_source=args.state_source,
+            )
+            try:
+                binding = state.load_acquisition_binding()
+            except RuntimeError as error:
+                if (
+                    str(error)
+                    != "current PostgreSQL Options session "
+                    "state is unavailable"
+                ):
+                    raise
+                print(json.dumps({
+                    "status": "READY_WAITING_FOR_SESSION",
+                    "provider_effects": 0,
+                }, indent=2, sort_keys=True))
+                return 0
+            diagnostic_clock = (
+                binding.authority.acquisition_start
+                + timedelta(seconds=1)
+                if diagnostic
+                else None
+            )
             print(json.dumps(
                 acquisition_health(
                     args.status_path,
@@ -340,8 +382,16 @@ def main(argv=None) -> int:
     if pool is None:
         raise RuntimeError("Options acquisition database is unavailable")
     stop = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    active_stop = [None]
+    physical_owner_id = uuid4()
+
+    def request_stop(*_unused):
+        stop.set()
+        if active_stop[0] is not None:
+            active_stop[0].set()
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
     values = dotenv_values(BACKEND_DIR / ".env")
     api_key = str(
         os.environ.get("POLYGON_API_KEY")
@@ -351,33 +401,93 @@ def main(argv=None) -> int:
     if diagnostic:
         api_key = "provider-free-diagnostic"
     try:
-        report = run_acquisition(
-            binding,
-            provider=provider,
-            api_key=api_key,
-            journal_root=args.journal_root,
-            status_path=args.status_path,
-            lock_path=args.lock_path,
-            stop_event=stop,
-            connection_factory=(
-                (
-                    lambda _: _FixtureConnection(
-                        binding,
-                        now=diagnostic_clock,
-                    )
-                )
+        while not stop.is_set():
+            state = select_options_session_state(
+                environment=os.environ,
+                provider=state_provider,
+                acquisition_binding_path=(
+                    args.binding
+                    if args.state_source
+                    == LEGACY_DIAGNOSTIC_STATE_SOURCE
+                    else None
+                ),
+                checked_at=datetime.now(UTC),
+                state_source=args.state_source,
+            )
+            try:
+                binding = state.load_acquisition_binding()
+            except RuntimeError as error:
+                if (
+                    str(error)
+                    != "current PostgreSQL Options session "
+                    "state is unavailable"
+                ):
+                    raise
+                print(json.dumps({
+                    "status": "READY_WAITING_FOR_SESSION",
+                    "provider_effects": 0,
+                }, sort_keys=True), flush=True)
+                stop.wait(2.0)
+                continue
+            selection_plan = state.load_c6_selection_plan()
+            diagnostic_clock = (
+                binding.authority.acquisition_start
+                + timedelta(seconds=1)
                 if diagnostic
                 else None
-            ),
-            clock=(
-                (lambda: diagnostic_clock)
-                if diagnostic_clock is not None
-                else (lambda: datetime.now(UTC))
-            ),
-            diagnostic=diagnostic,
-            selection_plan=selection_plan,
-        )
-        print(json.dumps(report, indent=2, sort_keys=True))
+            )
+            session_stop = threading.Event()
+            active_stop[0] = session_stop
+            physical_fence = PostgresLeaseHeartbeat(
+                provider,
+                resource_key=OPTIONS_PHYSICAL_SOCKET_RESOURCE,
+                owner_id=physical_owner_id,
+                stop_event=session_stop,
+            )
+            try:
+                physical_fence.start()
+            except DurableLeaseUnavailable as error:
+                active_stop[0] = None
+                print(json.dumps({
+                    "status": "READY_WAITING_FOR_PHYSICAL_OWNER",
+                    "reason": str(error),
+                    "provider_effects": 0,
+                }, sort_keys=True), flush=True)
+                stop.wait(2.0)
+                continue
+            try:
+                report = run_acquisition(
+                    binding,
+                    provider=provider,
+                    api_key=api_key,
+                    journal_root=args.journal_root,
+                    status_path=args.status_path,
+                    lock_path=args.lock_path,
+                    stop_event=session_stop,
+                    connection_factory=(
+                        (
+                            lambda _: _FixtureConnection(
+                                binding,
+                                now=diagnostic_clock,
+                            )
+                        )
+                        if diagnostic
+                        else None
+                    ),
+                    clock=(
+                        (lambda: diagnostic_clock)
+                        if diagnostic_clock is not None
+                        else (lambda: datetime.now(UTC))
+                    ),
+                    diagnostic=diagnostic,
+                    selection_plan=selection_plan,
+                )
+            finally:
+                physical_fence.close()
+                active_stop[0] = None
+            print(json.dumps(report, indent=2, sort_keys=True))
+            if args.state_source == LEGACY_DIAGNOSTIC_STATE_SOURCE:
+                break
         return 0
     finally:
         pool.closeall()

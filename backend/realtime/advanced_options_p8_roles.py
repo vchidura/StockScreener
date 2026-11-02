@@ -1254,27 +1254,8 @@ def _run_market_state(
     )
     selection_plan = _selection_plan(session_state)
     layout = _shard_layout(binding, selection_plan)
-    resource = (
-        f"{CANONICAL_MARKET_STATE_OWNER}:{control.cohort_id}:"
-        f"{registration.journal_generation}:{layout.shard_map.sha256}"
-    )
     leases = AdvancedOptionsPostgresLeasePort(provider)
-    shard_epoch = leases.acquire(
-        resource,
-        owner_id,
-        lease_seconds=30,
-        now=datetime.now(UTC),
-    )
-    if shard_epoch is None:
-        raise RuntimeError("P8 market-state shard lease is unavailable")
     with provider.transaction(APP_ROLE, read_only=True) as unit:
-        restored_states = load_advanced_options_market_state_cursor(
-            unit.cursor,
-            consumer_name=CANONICAL_MARKET_STATE_OWNER,
-            cohort_id=control.cohort_id,
-            journal_generation=registration.journal_generation,
-            shard_map=layout.shard_map,
-        )
         detector_routing_state = (
             None
             if selection_plan is None
@@ -1299,15 +1280,132 @@ def _run_market_state(
             ),
             state=detector_routing_state,
         )
-    consumer = AdvancedOptionsMarketStateConsumer(
-        source=source,
-        cohort_id=control.cohort_id,
-        shard_map=layout.shard_map,
-        owner_epoch=shard_epoch,
-        states=restored_states,
-        detector_router=detector_router,
-    )
-    planned = None
+    shard_ids = tuple(range(layout.shard_map.shard_count))
+    resources = {
+        shard_id: (
+            f"{CANONICAL_MARKET_STATE_OWNER}:{control.cohort_id}:"
+            f"{registration.journal_generation}:"
+            f"{layout.shard_map.sha256}:{shard_id}"
+        )
+        for shard_id in shard_ids
+    }
+    consumers: dict[int, AdvancedOptionsMarketStateConsumer] = {}
+    shard_epochs: dict[int, int] = {}
+    committed_offsets = {shard_id: 0 for shard_id in shard_ids}
+    last_planned = {}
+    retry_not_before = {shard_id: 0.0 for shard_id in shard_ids}
+    routing_retry_not_before = 0.0
+    routing_failure = None
+
+    def claim_shard(shard_id, now):
+        shard_epoch = leases.acquire(
+            resources[shard_id],
+            owner_id,
+            lease_seconds=30,
+            now=now,
+        )
+        if shard_epoch is None:
+            return False
+        try:
+            with provider.transaction(APP_ROLE, read_only=True) as unit:
+                restored = load_advanced_options_market_state_cursor(
+                    unit.cursor,
+                    consumer_name=CANONICAL_MARKET_STATE_OWNER,
+                    cohort_id=control.cohort_id,
+                    journal_generation=registration.journal_generation,
+                    shard_map=layout.shard_map,
+                    shard_ids=(shard_id,),
+                )
+            consumer = AdvancedOptionsMarketStateConsumer(
+                source=source,
+                cohort_id=control.cohort_id,
+                shard_map=layout.shard_map,
+                owner_epoch=shard_epoch,
+                states=restored,
+                owned_shard_ids=(shard_id,),
+            )
+        except Exception:
+            leases.release(
+                resources[shard_id],
+                owner_id,
+                shard_epoch,
+            )
+            raise
+        consumers[shard_id] = consumer
+        shard_epochs[shard_id] = shard_epoch
+        committed_offsets[shard_id] = consumer.committed_offset
+        return True
+
+    def record_shard_failure(shard_id, consumer, error, observed_at):
+        if selection_plan is None:
+            raise error
+        reason = (
+            "MARKET_STATE_"
+            + type(error).__name__.upper()
+        )[:160]
+        shard = layout.persistent_shards[shard_id]
+        with provider.transaction(APP_ROLE) as unit:
+            persist_c6_shard_state_cursor(
+                unit.cursor,
+                selection_generation_id=selection_plan.generation_id,
+                shard_id=shard.shard_id,
+                state=C6ShardState.FAILED,
+                message_count=consumer.committed_offset,
+                byte_count=0,
+                reason_codes=(reason,),
+                observed_at=observed_at,
+            )
+            persist_c6_consumer_state_cursor(
+                unit.cursor,
+                selection_generation_id=selection_plan.generation_id,
+                shard_id=shard.shard_id,
+                state=C6ConsumerState(
+                    consumer_name=CANONICAL_MARKET_STATE_OWNER,
+                    state_version=layout.shard_map.sha256,
+                    committed_offset=consumer.committed_offset,
+                    event_watermark_ns=None,
+                    history_start=None,
+                    history_end=None,
+                    missing_feed_states=(reason,),
+                    updated_at=observed_at,
+                ),
+            )
+
+    def record_routing_failure(error, observed_at):
+        if selection_plan is None:
+            raise error
+        reason = (
+            "DETECTOR_ROUTING_"
+            + type(error).__name__.upper()
+        )[:160]
+        with provider.transaction(APP_ROLE) as unit:
+            for shard_id, shard in enumerate(
+                layout.persistent_shards
+            ):
+                persist_c6_consumer_state_cursor(
+                    unit.cursor,
+                    selection_generation_id=(
+                        selection_plan.generation_id
+                    ),
+                    shard_id=shard.shard_id,
+                    state=C6ConsumerState(
+                        consumer_name=(
+                            "advanced-options-detector-routing-v1"
+                        ),
+                        state_version=layout.shard_map.sha256,
+                        committed_offset=(
+                            committed_offsets[shard_id]
+                        ),
+                        event_watermark_ns=None,
+                        history_start=None,
+                        history_end=None,
+                        missing_feed_states=(reason,),
+                        updated_at=observed_at,
+                    ),
+                )
+        return reason
+
+    completed_offset = 0
     try:
         while True:
             current = _registration(
@@ -1316,47 +1414,123 @@ def _run_market_state(
             )
             if current is not None:
                 source.registration = current
-            planned = consumer.plan_slice(maximum_records=10_000)
-            if planned.record_count:
-                observed_at = datetime.now(UTC)
-                with provider.transaction(APP_ROLE) as unit:
-                    persist_advanced_options_market_state_slice_cursor(
-                        unit.cursor,
-                        cohort_id=control.cohort_id,
-                        journal_generation=registration.journal_generation,
-                        planned=planned,
-                        owner_id=owner_id,
-                        batch_executor=execute_batch,
-                        lease_resource_key=resource,
-                    )
-                    _persist_c6_market_progress_cursor(
-                        unit.cursor,
-                        selection_plan=selection_plan,
-                        layout=layout,
-                        planned=planned,
-                        state=C6ShardState.WARMING,
-                        observed_at=observed_at,
-                    )
-                    if planned.detector_routing is not None:
-                        persist_advanced_options_detector_routing_state_cursor(
-                            unit.cursor,
-                            selection_generation_id=(
-                                selection_plan.generation_id
-                            ),
-                            state=(
-                                planned.detector_routing.state
-                            ),
-                            updated_at=observed_at,
+            now = datetime.now(UTC)
+            monotonic_now = time.monotonic()
+            made_progress = False
+            for shard_id in shard_ids:
+                if (
+                    shard_id not in consumers
+                    and monotonic_now
+                    >= retry_not_before[shard_id]
+                ):
+                    if not claim_shard(shard_id, now):
+                        retry_not_before[shard_id] = (
+                            monotonic_now + 1.0
                         )
-                consumer.commit_slice(planned)
-            if not leases.renew(
-                resource,
-                owner_id,
-                shard_epoch,
-                lease_seconds=30,
-                now=datetime.now(UTC),
+            if selection_plan is None and not consumers:
+                raise RuntimeError(
+                    "P8 market-state shard lease is unavailable"
+                )
+            for shard_id, consumer in tuple(consumers.items()):
+                observed_at = datetime.now(UTC)
+                try:
+                    planned = consumer.plan_slice(
+                        maximum_records=10_000
+                    )
+                    last_planned[shard_id] = planned
+                    if planned.record_count:
+                        with provider.transaction(APP_ROLE) as unit:
+                            persist_advanced_options_market_state_slice_cursor(
+                                unit.cursor,
+                                cohort_id=control.cohort_id,
+                                journal_generation=(
+                                    registration.journal_generation
+                                ),
+                                planned=planned,
+                                owner_id=owner_id,
+                                batch_executor=execute_batch,
+                                lease_resource_key=resources[shard_id],
+                            )
+                            _persist_c6_market_progress_cursor(
+                                unit.cursor,
+                                selection_plan=selection_plan,
+                                layout=layout,
+                                planned=planned,
+                                state=C6ShardState.WARMING,
+                                observed_at=observed_at,
+                            )
+                        consumer.commit_slice(planned)
+                        committed_offsets[shard_id] = (
+                            consumer.committed_offset
+                        )
+                        made_progress = True
+                    if not leases.renew(
+                        resources[shard_id],
+                        owner_id,
+                        shard_epochs[shard_id],
+                        lease_seconds=30,
+                        now=datetime.now(UTC),
+                    ):
+                        raise RuntimeError(
+                            "P8 market-state logical shard lease was lost"
+                        )
+                except Exception as error:
+                    record_shard_failure(
+                        shard_id,
+                        consumer,
+                        error,
+                        observed_at,
+                    )
+                    leases.release(
+                        resources[shard_id],
+                        owner_id,
+                        shard_epochs.pop(shard_id),
+                    )
+                    consumers.pop(shard_id)
+                    retry_not_before[shard_id] = (
+                        time.monotonic() + 1.0
+                    )
+            if (
+                detector_router is not None
+                and monotonic_now >= routing_retry_not_before
             ):
-                raise RuntimeError("P8 market-state shard lease was lost")
+                try:
+                    routing_records = tuple(
+                        source.read_normalized_after(
+                            detector_router.state.committed_event_offset,
+                            limit=10_000,
+                        )
+                    )
+                    if routing_records:
+                        routed = detector_router.process(
+                            routing_records
+                        )
+                        with provider.transaction(APP_ROLE) as unit:
+                            persist_advanced_options_detector_routing_state_cursor(
+                                unit.cursor,
+                                selection_generation_id=(
+                                    selection_plan.generation_id
+                                ),
+                                state=routed.state,
+                                updated_at=now,
+                            )
+                        detector_router = (
+                            AdvancedOptionsBoundedDetectorRouter(
+                                allocation=detector_router.allocation,
+                                state=routed.state,
+                            )
+                        )
+                        made_progress = True
+                    routing_failure = None
+                except Exception as error:
+                    routing_failure = record_routing_failure(
+                        error,
+                        now,
+                    )
+                    routing_retry_not_before = (
+                        time.monotonic() + 1.0
+                    )
+            completed_offset = min(committed_offsets.values())
             _snapshot_v3_resident_windows(
                 provider,
                 binding,
@@ -1365,41 +1539,58 @@ def _run_market_state(
                 owner_epoch=owner_epoch,
                 reader=RawJournalReader(source.path),
                 raw_offset=0,
-                normalized_offset=consumer.committed_offset,
-                shard_map_sha256_value=consumer.shard_map.sha256,
-                shard_ids_value=tuple(range(
-                    consumer.shard_map.shard_count
-                )),
+                normalized_offset=completed_offset,
+                shard_map_sha256_value=layout.shard_map.sha256,
+                shard_ids_value=shard_ids,
             )
             if (
                 current is not None
                 and current.status in {"DRAINING", "DRAINED"}
-                and consumer.committed_offset
-                >= current.normalized_committed_offset
+                and all(
+                    offset >= current.normalized_committed_offset
+                    for offset in committed_offsets.values()
+                )
+                and (
+                    detector_router is None
+                    or (
+                        routing_failure is None
+                        and detector_router.state.committed_event_offset
+                        >= current.normalized_committed_offset
+                    )
+                )
             ):
                 break
-            if not planned.record_count:
+            if not made_progress:
                 if stop_event.is_set():
                     time.sleep(0.05)
                 else:
                     stop_event.wait(0.1)
     finally:
-        leases.release(resource, owner_id, shard_epoch)
-    if consumer.committed_offset <= 0 or planned is None:
+        for shard_id, shard_epoch in tuple(shard_epochs.items()):
+            leases.release(
+                resources[shard_id],
+                owner_id,
+                shard_epoch,
+            )
+    if (
+        completed_offset <= 0
+        or len(last_planned) != layout.shard_map.shard_count
+    ):
         raise RuntimeError("P8 market-state consumed no normalized data")
     with provider.transaction(APP_ROLE) as unit:
-        _persist_c6_market_progress_cursor(
-            unit.cursor,
-            selection_plan=selection_plan,
-            layout=layout,
-            planned=planned,
-            state=C6ShardState.READY,
-            observed_at=datetime.now(UTC),
-        )
+        for planned in last_planned.values():
+            _persist_c6_market_progress_cursor(
+                unit.cursor,
+                selection_plan=selection_plan,
+                layout=layout,
+                planned=planned,
+                state=C6ShardState.READY,
+                observed_at=datetime.now(UTC),
+            )
     routing_state = (
         None
-        if consumer.detector_router is None
-        else consumer.detector_router.state
+        if detector_router is None
+        else detector_router.state
     )
     routing_duration_seconds = (
         None
@@ -1417,10 +1608,13 @@ def _run_market_state(
     evidence = {
         "status": "COMPLETE",
         "kind": AdvancedOptionsProcessKind.MARKET_STATE.value,
-        "normalized_end_offset": consumer.committed_offset,
-        "state_sha256": planned.state_sha256,
-        "shard_map_sha256": consumer.shard_map.sha256,
-        "shard_ids": list(range(consumer.shard_map.shard_count)),
+        "normalized_end_offset": completed_offset,
+        "state_sha256": canonical_sha256(tuple(
+            consumer.states[0]
+            for _, consumer in sorted(consumers.items())
+        )),
+        "shard_map_sha256": layout.shard_map.sha256,
+        "shard_ids": list(shard_ids),
         "detector_routing": (
             None
             if routing_state is None
@@ -1429,7 +1623,7 @@ def _run_market_state(
                     routing_state.allocation_sha256
                 ),
                 "route_entry_count": (
-                    consumer.detector_router.route_entry_count
+                    detector_router.route_entry_count
                 ),
                 "scanned_event_count": (
                     routing_state.scanned_event_count
@@ -1492,11 +1686,9 @@ def _run_market_state(
             owner_epoch=owner_epoch,
             reader=RawJournalReader(source.path),
             raw_offset=0,
-            normalized_offset=consumer.committed_offset,
-            shard_map_sha256_value=consumer.shard_map.sha256,
-            shard_ids_value=tuple(range(
-                consumer.shard_map.shard_count
-            )),
+            normalized_offset=completed_offset,
+            shard_map_sha256_value=layout.shard_map.sha256,
+            shard_ids_value=shard_ids,
         )
     else:
         _record_v3_resident_completion(
@@ -1506,7 +1698,7 @@ def _run_market_state(
             member=ResidentCompletionMember.MARKET_STATE,
             journal_generation=registration.journal_generation,
             owner_epoch=owner_epoch,
-            ending_offset=consumer.committed_offset,
+            ending_offset=completed_offset,
             evidence=evidence,
         )
     return evidence

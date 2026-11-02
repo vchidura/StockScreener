@@ -128,7 +128,7 @@ def test_compose_owns_canonical_service_without_legacy_sources():
     ).read_text(encoding="utf-8")
     start = compose.index("  realtime-v2-canonical-stock-alerts:")
     end = compose.index(
-        "\n  realtime-v2-options-p8-ingress:",
+        "\n  realtime-v3-options-lifecycle:",
         start,
     )
     block = compose[start:end]
@@ -137,7 +137,10 @@ def test_compose_owns_canonical_service_without_legacy_sources():
     assert "--health" in block
     assert block.count("PRIMARY_SERVING") == 2
     assert "labels: *downstream-labels" in block
-    assert 'restart: "on-failure:3"' in block
+    assert "restart: unless-stopped" in block
+    assert "--dynamic-scope" in block
+    assert "--cohort-id" not in block
+    assert "--session-date" not in block
     assert "project_stock_alert_results.py" not in block
     assert "stock-ideas-forward" not in block
     assert "stock-ideas-swing" not in block

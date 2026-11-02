@@ -84,7 +84,6 @@ from .advanced_options_flow_policy import (
     load_advanced_options_flow_policy,
 )
 from .contracts import (
-    EQUITY_VALIDATION_UNIVERSE,
     MarketChannel,
     canonical_sha256,
 )
@@ -268,6 +267,14 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
         history = value.get("v3_history_binding")
         equity = value.get("equity_input_binding")
         authorities = value.get("v3_authorities")
+        equity_symbols = (
+            ()
+            if not isinstance(equity, Mapping)
+            or not isinstance(equity.get("symbols"), list)
+            else tuple(
+                str(ticker) for ticker in equity["symbols"]
+            )
+        )
         if (
             canonical_sha256(unsigned) != package_digest
             or not isinstance(pre_session, Mapping)
@@ -283,13 +290,12 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
                 for ticker in value.get("v3_admitted_contracts", ())
             ))
             != acquisition_binding.contract_tickers
-            or tuple(sorted(
-                str(ticker)
-                for ticker in equity.get("symbols", ())
-            ))
-            != tuple(sorted(
-                EQUITY_VALIDATION_UNIVERSE.equity_tickers
-            ))
+            or not equity_symbols
+            or len(equity_symbols) != len(set(equity_symbols))
+            or any(
+                ticker != ticker.strip().upper()
+                for ticker in equity_symbols
+            )
         ):
             raise ValueError(
                 "continuous Options package identity is invalid"
@@ -415,15 +421,6 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
             raise ValueError(
                 "effective current-session desired snapshot is unavailable"
             )
-        equity_members = {
-            row.ticker
-            for row in reconciliation.revision.members
-            if row.enabled
-            and row.kind in {
-                DesiredMemberKind.EQUITY,
-                DesiredMemberKind.SECTOR_ETF,
-            }
-        }
         option_underlyings = {
             row.ticker
             for row in reconciliation.revision.members
@@ -437,16 +434,46 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
                 row.underlyer for row in admission.contracts
             }
         )
+        package_equity_symbols = set(
+            package["equity_input_binding"]["symbols"]
+        )
+        snapshot = reconciliation.snapshot
+        cursor.execute(
+            "SELECT DISTINCT instrument.security_id::text "
+            "FROM rt.subscription_members AS member "
+            "JOIN rt.instruments AS instrument "
+            "ON instrument.instrument_id=member.instrument_id "
+            "WHERE member.manifest_id=%s "
+            "AND member.channel='AM' "
+            "AND member.option_underlying=false",
+            (str(snapshot.manifest_id),),
+        )
+        ticker_by_security = {
+            str(row.security_id): row.ticker
+            for row in reconciliation.preparations
+            if row.security_id is not None
+        }
+        effective_equity_members = {
+            ticker_by_security[str(row[0])]
+            for row in cursor.fetchall()
+            if str(row[0]) in ticker_by_security
+        }
         if (
-            equity_members
-            != set(EQUITY_VALIDATION_UNIVERSE.equity_tickers)
-            or option_underlyings != configured_option_underlyings
+            option_underlyings != configured_option_underlyings
+            or not configured_option_underlyings.issubset(
+                effective_equity_members
+            )
+            or not configured_option_underlyings.issubset(
+                package_equity_symbols
+            )
+            or not package_equity_symbols.issubset(
+                effective_equity_members
+            )
         ):
             raise ValueError(
-                "continuous Options requires target-9 Equity plus "
-                "the configured Options snapshot"
+                "continuous Options requires configured underlyings "
+                "to have READY desired and package Equity context"
             )
-        snapshot = reconciliation.snapshot
         if selection_plan is not None and (
             selection_plan.session_date != authority.session_date
             or selection_plan.desired_revision_id

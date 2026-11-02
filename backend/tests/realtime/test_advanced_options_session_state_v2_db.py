@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
@@ -27,6 +28,32 @@ from realtime.advanced_options_p8_runtime import (
 )
 from realtime.advanced_options_session_state import (
     PostgresContinuousSessionStateRepository,
+)
+from realtime.advanced_options_lifecycle import (
+    AdvancedOptionsPreparationRetryable,
+    AdvancedOptionsProviderRequestPlan,
+    AdvancedOptionsProviderRequestResult,
+    AdvancedOptionsStageProviderBudget,
+    AdvancedOptionsStageResult,
+    claim_advanced_options_preparation_cursor,
+    reconcile_advanced_options_lifecycle_cursor,
+    run_advanced_options_preparation_cycle,
+)
+from realtime.advanced_options_automatic_preparation import (
+    PostgresAutomaticOptionsPreparationExecutor,
+)
+from realtime.advanced_options_activity_momentum_c6 import (
+    LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+)
+from realtime.advanced_options_p8_selection_source import (
+    p8_activity_selection_capture_from_sealed,
+)
+from realtime.advanced_realtime_desired_state import (
+    DesiredMemberKind,
+    desired_member_intent_id,
+)
+from scripts.report_advanced_realtime_v3_status import (
+    build_advanced_realtime_v3_status_cursor,
 )
 from realtime import advanced_options_session_state as session_state_module
 from realtime.advanced_options_v3_authority import (
@@ -59,6 +86,26 @@ from realtime.option_slot_set import (
     SlotSetVersion,
 )
 from realtime.provider_budget import ProviderBudgetScope
+from realtime.acquisition_ledger import ProviderRequestLane
+from realtime.reference_adapters import (
+    _security_id as reference_security_id,
+)
+from realtime.advanced_options_reference_repository import (
+    persist_advanced_options_reference_state_cursor,
+)
+from realtime.advanced_options_reference_state import (
+    AdvancedOptionsAdjustedDailyBarIdentity,
+    AdvancedOptionsCorporateActionIdentity,
+    AdvancedOptionsDividendCoverageReference,
+    AdvancedOptionsEquityMetric,
+    AdvancedOptionsOpenInterestReference,
+    AdvancedOptionsRateReference,
+    AdvancedOptionsValuationReference,
+    EquityMetricKind,
+    ReferenceAvailability,
+    build_advanced_options_reference_state,
+    build_historical_volatility_fact,
+)
 from tests.realtime.test_advanced_options_acquisition_runtime import (
     _production_binding,
 )
@@ -82,7 +129,7 @@ def _digest(label: str) -> str:
 
 
 def _security_id(ticker: str) -> UUID:
-    return uuid5(NAMESPACE_URL, f"c5-security:{ticker}")
+    return reference_security_id(ticker)
 
 
 def _sealed_selection(admission):
@@ -275,7 +322,14 @@ def _authority_fixture(options_cohort_id):
     return admission, readiness, session, reference
 
 
-def _seed_session(cursor, *, stale_catalog: bool = False):
+def _seed_session(
+    cursor,
+    *,
+    stale_catalog: bool = False,
+    extra_equity_tickers: tuple[str, ...] = (),
+    options_ready: bool = True,
+    materialize_desired_snapshot: bool = True,
+):
     desired_cohort_id = insert_cohort(
         cursor,
         OPENING - timedelta(minutes=20),
@@ -298,7 +352,11 @@ def _seed_session(cursor, *, stale_catalog: bool = False):
     security_ids = {}
     security_revision_ids = {}
     equity_instrument_ids = {}
-    for ticker in EQUITY_VALIDATION_UNIVERSE.equity_tickers:
+    equity_tickers = (
+        *EQUITY_VALIDATION_UNIVERSE.equity_tickers,
+        *extra_equity_tickers,
+    )
+    for ticker in equity_tickers:
         security_id = _security_id(ticker)
         security_revision_id = uuid4()
         security_ids[ticker] = security_id
@@ -335,6 +393,16 @@ def _seed_session(cursor, *, stale_catalog: bool = False):
             (str(security_id),),
         )
         equity_instrument_ids[ticker] = int(cursor.fetchone()[0])
+    for ticker in EQUITY_VALIDATION_UNIVERSE.equity_tickers:
+        cursor.execute(
+            "INSERT INTO rt.subscription_members ("
+            "manifest_id,instrument_id,channel,priority,purpose,"
+            "option_underlying) VALUES (%s,%s,'AM',1,'PRIMARY',false)",
+            (
+                str(desired_manifest_id),
+                equity_instrument_ids[ticker],
+            ),
+        )
 
     revision_id = uuid5(NAMESPACE_URL, "c5-desired-revision")
     recorded_at = OPENING - timedelta(minutes=30)
@@ -355,13 +423,19 @@ def _seed_session(cursor, *, stale_catalog: bool = False):
     )
     members = [
         (ticker, "EQUITY")
-        for ticker in EQUITY_VALIDATION_UNIVERSE.equity_tickers
+        for ticker in equity_tickers
     ]
     members.extend((ticker, "OPTION_UNDERLYING") for ticker in ("QQQ", "SPY"))
     for priority, (ticker, kind) in enumerate(members, start=1):
-        intent_id = uuid5(
-            NAMESPACE_URL,
-            f"c5-intent:{ticker}:{kind}",
+        readiness_status = (
+            "WARMING"
+            if kind == "OPTION_UNDERLYING" and not options_ready
+            else "READY"
+        )
+        intent_id = desired_member_intent_id(
+            revision_id,
+            ticker,
+            DesiredMemberKind(kind),
         )
         cursor.execute(
             "INSERT INTO rt.realtime_desired_members ("
@@ -378,11 +452,12 @@ def _seed_session(cursor, *, stale_catalog: bool = False):
         cursor.execute(
             "INSERT INTO rt.realtime_desired_member_readiness ("
             "revision_id,security_id,member_kind,status,checked_at"
-            ") VALUES (%s,%s,%s,'READY',%s)",
+            ") VALUES (%s,%s,%s,%s,%s)",
             (
                 str(revision_id),
                 str(security_ids[ticker]),
                 kind,
+                readiness_status,
                 recorded_at,
             ),
         )
@@ -403,8 +478,8 @@ def _seed_session(cursor, *, stale_catalog: bool = False):
         cursor.execute(
             "INSERT INTO rt.realtime_desired_intent_readiness ("
             "intent_id,status,checked_at"
-            ") VALUES (%s,'READY',%s)",
-            (str(intent_id), recorded_at),
+            ") VALUES (%s,%s,%s)",
+            (str(intent_id), readiness_status, recorded_at),
         )
         cursor.execute(
             "INSERT INTO rt.realtime_desired_member_bindings ("
@@ -434,20 +509,21 @@ def _seed_session(cursor, *, stale_catalog: bool = False):
             recorded_at,
         ),
     )
-    cursor.execute(
-        "INSERT INTO rt.realtime_desired_session_snapshots ("
-        "revision_id,session_date,manifest_id,cohort_id,"
-        "snapshot_sha256,materialized_at"
-        ") VALUES (%s,%s,%s,%s,%s,%s)",
-        (
-            str(revision_id),
-            SESSION_DATE,
-            str(desired_manifest_id),
-            str(desired_cohort_id),
-            _digest("desired-snapshot"),
-            recorded_at,
-        ),
-    )
+    if materialize_desired_snapshot:
+        cursor.execute(
+            "INSERT INTO rt.realtime_desired_session_snapshots ("
+            "revision_id,session_date,manifest_id,cohort_id,"
+            "snapshot_sha256,materialized_at"
+            ") VALUES (%s,%s,%s,%s,%s,%s)",
+            (
+                str(revision_id),
+                SESSION_DATE,
+                str(desired_manifest_id),
+                str(desired_cohort_id),
+                _digest("desired-snapshot"),
+                recorded_at,
+            ),
+        )
 
     admission, readiness, session, reference = _authority_fixture(
         options_cohort_id
@@ -799,6 +875,511 @@ def _seed_session(cursor, *, stale_catalog: bool = False):
     }
 
 
+def _seed_c8_equity_history(
+    cursor,
+    seed,
+    *,
+    underlyings=("QQQ", "SPY"),
+):
+    calendar = OptionExchangeCalendar("XNYS")
+    sessions = calendar.trailing_sessions_before(SESSION_DATE, 31)
+    cursor.execute(
+        "SELECT intent.ticker,binding.security_id::text,"
+        "binding.instrument_id "
+        "FROM rt.realtime_desired_member_intents AS intent "
+        "JOIN rt.realtime_desired_member_bindings AS binding "
+        "USING(intent_id) "
+        "WHERE intent.ticker=ANY(%s) "
+        "AND intent.member_kind='EQUITY'",
+        (list(underlyings),),
+    )
+    rows = tuple(cursor.fetchall())
+    instruments = {
+        str(row[0]): (str(row[1]), int(row[2]))
+        for row in rows
+    }
+    generation = uuid4()
+    stream_session = uuid4()
+    cursor.execute(
+        "INSERT INTO rt.stream_sessions ("
+        "session_id,provider,feed,manifest_id,owner_id,owner_epoch,"
+        "started_at,ended_at,status"
+        ") VALUES (%s,'c8-provider-free','STOCKS',%s,%s,1,%s,%s,"
+        "'STOPPED')",
+        (
+            str(stream_session),
+            str(seed["desired_manifest_id"]),
+            str(uuid4()),
+            calendar.session_open(sessions[0]),
+            calendar.session_close(sessions[-1]),
+        ),
+    )
+    source_offset = 1
+    for session in sessions:
+        opened = calendar.session_open(session)
+        closed = calendar.session_close(session)
+        cursor.execute(
+            "SELECT rt.ensure_partitions('rt.bar_revisions',%s)",
+            (session,),
+        )
+        for ticker, (security_id, instrument_id) in instruments.items():
+            bases = (
+                ("ADJUSTED",)
+                if session != sessions[-1]
+                else ("ADJUSTED", "RAW_UNADJUSTED")
+            )
+            for basis in bases:
+                revision_id = uuid4()
+                payload_sha256 = _digest(
+                    f"c8-history:{ticker}:{session}:{basis}"
+                )
+                cursor.execute(
+                    "INSERT INTO rt.bar_catalog ("
+                    "bar_revision_id,cohort_id,provider_tier,"
+                    "instrument_id,interval,bar_start,bar_end,"
+                    "observed_at,session_date"
+                    ") VALUES (%s,%s,'MASSIVE_ADVANCED',%s,'1d',"
+                    "%s,%s,%s,%s)",
+                    (
+                        str(revision_id),
+                        str(seed["desired_cohort_id"]),
+                        instrument_id,
+                        opened,
+                        closed,
+                        closed,
+                        session,
+                    ),
+                )
+                cursor.execute(
+                    "INSERT INTO rt.bar_revisions ("
+                    "bar_revision_id,cohort_id,provider_tier,"
+                    "security_id,instrument_id,ticker,interval,"
+                    "session_date,session_scope,adjustment_basis,"
+                    "bar_start,bar_end,open_price,high_price,"
+                    "low_price,close_price,volume,vwap,"
+                    "transaction_count,source_kind,"
+                    "availability_mode,is_final,observed_at,"
+                    "replay_available_at,journal_generation,"
+                    "stream_session_id,source_offset,payload_sha256,"
+                    "created_at"
+                    ") VALUES (%s,%s,'MASSIVE_ADVANCED',%s,%s,%s,"
+                    "'1d',%s,'RTH',%s,%s,%s,500,501,499,500,"
+                    "1000000,500,100,'REALTIME_STREAM',"
+                    "'HISTORICAL_RECONSTRUCTED',true,%s,%s,%s,%s,"
+                    "%s,%s,%s)",
+                    (
+                        str(revision_id),
+                        str(seed["desired_cohort_id"]),
+                        security_id,
+                        instrument_id,
+                        ticker,
+                        session,
+                        basis,
+                        opened,
+                        closed,
+                        closed,
+                        closed,
+                        str(generation),
+                        str(stream_session),
+                        source_offset,
+                        payload_sha256,
+                        closed,
+                    ),
+                )
+                cursor.execute(
+                    "INSERT INTO rt.bar_current ("
+                    "cohort_id,provider_tier,instrument_id,interval,"
+                    "bar_start,session_scope,adjustment_basis,"
+                    "source_kind,bar_revision_id,bar_end,observed_at,"
+                    "updated_at"
+                    ") VALUES (%s,'MASSIVE_ADVANCED',%s,'1d',%s,"
+                    "'RTH',%s,'REALTIME_STREAM',%s,%s,%s,%s)",
+                    (
+                        str(seed["desired_cohort_id"]),
+                        instrument_id,
+                        opened,
+                        basis,
+                        str(revision_id),
+                        closed,
+                        closed,
+                        closed,
+                    ),
+                )
+                source_offset += 1
+
+
+def _add_desired_option_underlying(cursor, ticker):
+    cursor.execute(
+        "SELECT current.revision_id::text,binding.security_id::text,"
+        "binding.security_revision_id::text,binding.instrument_id "
+        "FROM rt.realtime_desired_current AS current "
+        "JOIN rt.realtime_desired_member_intents AS intent "
+        "USING(revision_id) "
+        "JOIN rt.realtime_desired_member_bindings AS binding "
+        "USING(intent_id) "
+        "WHERE current.scope_key='ADVANCED_REALTIME' "
+        "AND intent.ticker=%s "
+        "AND intent.member_kind='EQUITY'",
+        (ticker,),
+    )
+    row = cursor.fetchone()
+    revision_id = UUID(str(row[0]))
+    security_id = UUID(str(row[1]))
+    security_revision_id = UUID(str(row[2]))
+    instrument_id = int(row[3])
+    intent_id = desired_member_intent_id(
+        revision_id,
+        ticker,
+        DesiredMemberKind.OPTION_UNDERLYING,
+    )
+    cursor.execute(
+        "SELECT COALESCE(MAX(priority),0)+1 "
+        "FROM rt.realtime_desired_member_intents "
+        "WHERE revision_id=%s",
+        (str(revision_id),),
+    )
+    priority = int(cursor.fetchone()[0])
+    cursor.execute(
+        "INSERT INTO rt.realtime_desired_members ("
+        "revision_id,security_id,ticker,member_kind,priority,enabled"
+        ") VALUES (%s,%s,%s,'OPTION_UNDERLYING',%s,true)",
+        (
+            str(revision_id),
+            str(security_id),
+            ticker,
+            priority,
+        ),
+    )
+    cursor.execute(
+        "INSERT INTO rt.realtime_desired_member_readiness ("
+        "revision_id,security_id,member_kind,status,checked_at"
+        ") SELECT %s,%s,'OPTION_UNDERLYING','WARMING',recorded_at "
+        "FROM rt.realtime_desired_revisions WHERE revision_id=%s",
+        (str(revision_id), str(security_id), str(revision_id)),
+    )
+    cursor.execute(
+        "INSERT INTO rt.realtime_desired_member_intents ("
+        "intent_id,revision_id,ticker,member_kind,priority,enabled,"
+        "requested_at"
+        ") SELECT %s,%s,%s,'OPTION_UNDERLYING',%s,true,recorded_at "
+        "FROM rt.realtime_desired_revisions WHERE revision_id=%s",
+        (
+            str(intent_id),
+            str(revision_id),
+            ticker,
+            priority,
+            str(revision_id),
+        ),
+    )
+    cursor.execute(
+        "INSERT INTO rt.realtime_desired_intent_readiness ("
+        "intent_id,status,checked_at"
+        ") SELECT %s,'WARMING',recorded_at "
+        "FROM rt.realtime_desired_revisions WHERE revision_id=%s",
+        (str(intent_id), str(revision_id)),
+    )
+    cursor.execute(
+        "INSERT INTO rt.realtime_desired_member_bindings ("
+        "intent_id,revision_id,security_id,security_revision_id,"
+        "instrument_id,identity_sha256,source_lineage,resolved_at"
+        ") SELECT %s,%s,%s,%s,%s,%s,%s,recorded_at "
+        "FROM rt.realtime_desired_revisions WHERE revision_id=%s",
+        (
+            str(intent_id),
+            str(revision_id),
+            str(security_id),
+            str(security_revision_id),
+            instrument_id,
+            _digest(f"c8-option-identity:{ticker}"),
+            Json({"fixture": "c8-generalized"}),
+            str(revision_id),
+        ),
+    )
+
+
+def _seed_complete_c8_reference(
+    cursor,
+    seed,
+    *,
+    underlyings=("QQQ", "SPY"),
+    snapshots=None,
+):
+    calendar = OptionExchangeCalendar("XNYS")
+    session_open = calendar.session_open(SESSION_DATE)
+    known_at = session_open - timedelta(minutes=2)
+    sessions = calendar.trailing_sessions_before(SESSION_DATE, 31)
+    cursor.execute(
+        "SELECT intent.ticker,binding.security_id::text "
+        "FROM rt.realtime_desired_member_intents AS intent "
+        "JOIN rt.realtime_desired_member_bindings AS binding "
+        "USING(intent_id) WHERE intent.ticker=ANY(%s) "
+        "AND intent.member_kind='EQUITY'",
+        (list(underlyings),),
+    )
+    security_ids = {
+        str(row[0]): UUID(str(row[1]))
+        for row in cursor.fetchall()
+    }
+    bars_by_ticker = {}
+    volatility = []
+    valuations = []
+    metrics = []
+    for ticker in underlyings:
+        bars = tuple(
+            AdvancedOptionsAdjustedDailyBarIdentity(
+                bar_revision_id=uuid5(
+                    NAMESPACE_URL,
+                    f"c8-reference-bar:{ticker}:{session}",
+                ),
+                security_id=security_ids[ticker],
+                ticker=ticker,
+                session_date=session,
+                adjusted_close=Decimal("500") + index,
+                market_close_at=calendar.session_close(session),
+                known_at=min(
+                    known_at,
+                    calendar.session_close(session)
+                    + timedelta(minutes=1),
+                ),
+                adjustment_lineage_sha256=_digest(
+                    f"c8-lineage:{ticker}:{session}"
+                ),
+                finality_sha256=_digest(
+                    f"c8-finality:{ticker}:{session}"
+                ),
+                payload_sha256=_digest(
+                    f"c8-payload:{ticker}:{session}"
+                ),
+            )
+            for index, session in enumerate(sessions)
+        )
+        bars_by_ticker[ticker] = bars
+        volatility.extend((
+            build_historical_volatility_fact(
+                security_id=security_ids[ticker],
+                ticker=ticker,
+                window_sessions=20,
+                market_cutoff=bars[-1].market_close_at,
+                known_at=known_at,
+                bars=bars[-21:],
+            ),
+            build_historical_volatility_fact(
+                security_id=security_ids[ticker],
+                ticker=ticker,
+                window_sessions=30,
+                market_cutoff=bars[-1].market_close_at,
+                known_at=known_at,
+                bars=bars,
+            ),
+        ))
+        expiration = SESSION_DATE + timedelta(days=30)
+        action = AdvancedOptionsCorporateActionIdentity(
+            action_id=uuid5(
+                NAMESPACE_URL,
+                f"c8-action:{ticker}",
+            ),
+            payload_sha256=_digest(f"c8-action:{ticker}"),
+            observed_at=known_at - timedelta(minutes=4),
+            received_at=known_at - timedelta(minutes=3),
+        )
+        coverage = AdvancedOptionsDividendCoverageReference(
+            coverage_id=uuid5(
+                NAMESPACE_URL,
+                f"c8-dividend:{ticker}",
+            ),
+            security_id=security_ids[ticker],
+            ticker=ticker,
+            window_start=SESSION_DATE,
+            window_end=expiration,
+            status="AVAILABLE",
+            observed_at=known_at - timedelta(minutes=4),
+            received_at=known_at - timedelta(minutes=3),
+            payload_sha256=_digest(f"c8-dividend:{ticker}"),
+            response_sha256=_digest(
+                f"c8-dividend-response:{ticker}"
+            ),
+            actions=(action,),
+        )
+        rates = tuple(
+            AdvancedOptionsRateReference(
+                observation_id=uuid5(
+                    NAMESPACE_URL,
+                    f"c8-rate:{ticker}:{tenor}",
+                ),
+                rate_date=sessions[-1],
+                tenor_days=tenor,
+                annual_rate=Decimal("0.04"),
+                source="us_treasury_par_yield_v1",
+                source_key=f"{sessions[-1]}:{tenor}d",
+                observed_at=known_at - timedelta(minutes=5),
+                received_at=known_at - timedelta(minutes=4),
+                payload_sha256=_digest(
+                    f"c8-rate:{ticker}:{tenor}"
+                ),
+            )
+            for tenor in (30, 60)
+        )
+        valuations.append(AdvancedOptionsValuationReference(
+            security_id=security_ids[ticker],
+            ticker=ticker,
+            valuation_date=SESSION_DATE,
+            expiration_date=expiration,
+            risk_free_rate=Decimal("0.04"),
+            dividend_yield=Decimal("0.01"),
+            rate_observations=rates,
+            dividend_coverage=coverage,
+            model_version="black-scholes-merton-v1",
+            model_bundle_sha256=_digest(
+                f"c8-model:{ticker}"
+            ),
+            valuation_policy_sha256=_digest(
+                f"c8-valuation:{ticker}"
+            ),
+            known_at=known_at,
+        ))
+        metric_sessions = sessions[-30:]
+        metrics.extend((
+            AdvancedOptionsEquityMetric(
+                security_id=security_ids[ticker],
+                ticker=ticker,
+                metric_kind=(
+                    EquityMetricKind.SHORT_INTEREST_PERCENT
+                ),
+                as_of_session=sessions[-1],
+                availability=ReferenceAvailability.AVAILABLE,
+                known_at=known_at,
+                value=Decimal("0.08"),
+                source="provider-free",
+                source_key=f"{ticker}:short-interest",
+                observed_at=known_at - timedelta(minutes=3),
+                received_at=known_at - timedelta(minutes=2),
+                payload_sha256=_digest(
+                    f"c8-short-interest:{ticker}"
+                ),
+            ),
+            AdvancedOptionsEquityMetric(
+                security_id=security_ids[ticker],
+                ticker=ticker,
+                metric_kind=EquityMetricKind.TOTAL_FLOAT,
+                as_of_session=sessions[-1],
+                availability=ReferenceAvailability.UNAVAILABLE,
+                known_at=known_at,
+                reason_codes=(
+                    "REVIEWED_FLOAT_SOURCE_UNAVAILABLE",
+                ),
+            ),
+            AdvancedOptionsEquityMetric(
+                security_id=security_ids[ticker],
+                ticker=ticker,
+                metric_kind=EquityMetricKind.AVERAGE_DAILY_VOLUME_30,
+                as_of_session=sessions[-1],
+                availability=ReferenceAvailability.AVAILABLE,
+                known_at=known_at,
+                value=Decimal("1000000"),
+                source="finalized_adjusted_daily_bars",
+                source_key=f"{ticker}:ADV30",
+                observed_at=known_at - timedelta(minutes=3),
+                received_at=known_at - timedelta(minutes=2),
+                payload_sha256=_digest(f"c8-adv30:{ticker}"),
+                calculation_version="adv30-v1",
+                member_sessions=metric_sessions,
+                member_sha256=_digest(
+                    f"c8-adv30-members:{ticker}"
+                ),
+            ),
+        ))
+    if snapshots is None:
+        contract_inputs = tuple(
+            (
+                row.contract_id,
+                row.contract_ticker,
+                row.underlyer,
+                row.open_interest,
+            )
+            for row in seed["authority_bundle"].admission.contracts
+        )
+    else:
+        contract_inputs = []
+        for ticker, raw in sorted(snapshots.items()):
+            cursor.execute(
+                "SELECT contract.contract_id "
+                "FROM ref.option_contracts AS contract "
+                "WHERE contract.contract_ticker=%s",
+                (ticker,),
+            )
+            contract_inputs.append((
+                int(cursor.fetchone()[0]),
+                ticker,
+                str(raw["underlying_asset"]["ticker"]),
+                int(raw["open_interest"]),
+            ))
+        contract_inputs = tuple(contract_inputs)
+    open_interest = tuple(
+        AdvancedOptionsOpenInterestReference(
+            contract_id=contract_id,
+            contract_ticker=contract_ticker,
+            underlyer=underlyer,
+            availability=ReferenceAvailability.AVAILABLE,
+            known_at=known_at,
+            baseline_id=uuid5(
+                NAMESPACE_URL,
+                f"c8-reference-oi:{contract_ticker}",
+            ),
+            settlement_session=sessions[-1],
+            observed_session=SESSION_DATE,
+            open_interest=open_interest_value,
+            source="provider-free",
+            date_basis="PROVIDER_CHAIN_SNAPSHOT_PRIOR_SESSION",
+            observed_at=known_at - timedelta(minutes=3),
+            received_at=known_at - timedelta(minutes=2),
+            payload_sha256=_digest(
+                f"c8-reference-oi:{contract_ticker}"
+            ),
+        )
+        for (
+            contract_id,
+            contract_ticker,
+            underlyer,
+            open_interest_value,
+        ) in contract_inputs
+    )
+    cursor.execute(
+        "SELECT COALESCE(MAX(reference_generation),0)+1 "
+        "FROM rt.advanced_options_reference_states"
+    )
+    generation = int(cursor.fetchone()[0])
+    state = build_advanced_options_reference_state(
+        reference_generation=generation,
+        session_date=SESSION_DATE,
+        known_at=known_at,
+        valid_until=calendar.session_close(SESSION_DATE),
+        reference_policy_sha256=_digest(
+            "c8-complete-reference-policy"
+        ),
+        data_membership_sha256=None,
+        contract_scope_sha256=(
+            seed["reference"].contract_scope_sha256
+        ),
+        underlyings=tuple(underlyings),
+        open_interest=open_interest,
+        historical_volatility=tuple(volatility),
+        valuation_inputs=tuple(valuations),
+        equity_metrics=tuple(metrics),
+    )
+    persist_advanced_options_reference_state_cursor(cursor, state)
+    cursor.execute(
+        "INSERT INTO rt.advanced_options_reference_session_freezes ("
+        "session_date,state_id,first_cycle_id,consumed_at"
+        ") VALUES (%s,%s,%s,%s)",
+        (
+            SESSION_DATE,
+            str(state.state_id),
+            str(uuid4()),
+            known_at,
+        ),
+    )
+
+
 def _provider(pool):
     return V2ConnectionProvider(
         {OWNER_POOL: pool},
@@ -1111,6 +1692,815 @@ def test_session_activation_is_idempotent_typed_and_current_session():
                 "rt.advanced_options_downstream_bindings"
             )
             assert database_cursor.fetchone()[0] == 0
+
+
+class _AutomaticC8Executor:
+    def __init__(self, pool, seed, *, fail_stage=None):
+        self.repository = PostgresContinuousSessionStateRepository(
+            _provider(pool),
+            session_date=SESSION_DATE,
+        )
+        self.seed = seed
+        self.fail_stage = fail_stage
+        self.failed_once = False
+        self.binding = None
+
+    def provider_budget(self, _claim):
+        return None
+
+    def execute(self, claim, *, provider_request_ids):
+        assert provider_request_ids == ()
+        if (
+            claim.stage == self.fail_stage
+            and not self.failed_once
+        ):
+            self.failed_once = True
+            raise AdvancedOptionsPreparationRetryable(
+                f"fixture interruption at {claim.stage}"
+            )
+        if claim.stage == "SESSION_ACTIVATION":
+            self.binding = self.repository.activate_session(
+                package=self.seed["package"],
+                authority_bundle=self.seed["authority_bundle"],
+                acquisition_binding=self.seed["acquisition"],
+                reference=self.seed["reference"],
+                sealed_selection=self.seed["sealed_selection"],
+                written_at=(
+                    self.seed["authority_bundle"].session.prepared_at
+                ),
+            )
+        return AdvancedOptionsStageResult(
+            watermark={
+                "stage": claim.stage,
+                "attempt": claim.attempt,
+            },
+            evidence={
+                "stage": claim.stage,
+                "ticker": claim.ticker,
+                "fixture": "owned-disposable-c8",
+            },
+            session_binding_id=(
+                None if self.binding is None else self.binding.binding_id
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "fail_stage",
+    (
+        None,
+        "CATALOG_QUOTE",
+        "REFERENCE_OI",
+        "HISTORY",
+        "CAPACITY_SHARDS",
+        "SESSION_ACTIVATION",
+    ),
+)
+def test_c8_lifecycle_automates_stage_recovery_and_activation(fail_stage):
+    with disposable_v2_database(
+        f"test_realtime_v2_c8_lifecycle_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            seed = _seed_session(
+                database_cursor,
+                options_ready=False,
+            )
+            prepared = reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=(
+                    seed["authority_bundle"].session.prepared_at
+                ),
+            )
+            database_cursor.execute(
+                "SELECT DISTINCT intent.member_kind "
+                "FROM rt.advanced_options_preparation_work AS work "
+                "JOIN rt.realtime_desired_member_intents AS intent "
+                "USING(intent_id)"
+            )
+            scheduled_kinds = {
+                str(row[0]) for row in database_cursor.fetchall()
+            }
+            database_cursor.execute(
+                "SELECT count(*) "
+                "FROM rt.advanced_options_preparation_work"
+            )
+            scheduled_count = int(database_cursor.fetchone()[0])
+            database_cursor.connection.commit()
+
+        assert prepared is not None
+        assert prepared.status == "PREPARING"
+        assert prepared.current_stage == "CATALOG_QUOTE"
+        assert scheduled_kinds == {"OPTION_UNDERLYING"}
+        assert scheduled_count == (
+            len(prepared.option_underlyings) * 4 + 1
+        )
+
+        executor = _AutomaticC8Executor(
+            pool,
+            seed,
+            fail_stage=fail_stage,
+        )
+        owner_id = uuid4()
+        checked_at = seed["authority_bundle"].session.prepared_at
+        reports = []
+        for attempt in range(20):
+            cycle_at = checked_at + timedelta(
+                minutes=attempt * 10
+            )
+            report = run_advanced_options_preparation_cycle(
+                _provider(pool),
+                executor,
+                owner_id=owner_id,
+                checked_at=cycle_at,
+                clock=lambda value=cycle_at: value,
+            )
+            reports.append(report)
+            with cursor(pool) as database_cursor:
+                active = reconcile_advanced_options_lifecycle_cursor(
+                    database_cursor,
+                    target_session_date=SESSION_DATE,
+                    checked_at=cycle_at,
+                )
+                database_cursor.connection.commit()
+            if active is not None and active.status == "ACTIVE":
+                break
+        else:
+            with cursor(pool) as database_cursor:
+                database_cursor.execute(
+                    "SELECT last_error FROM "
+                    "rt.advanced_options_preparation_sessions"
+                )
+                lifecycle_error = database_cursor.fetchone()[0]
+            raise AssertionError(
+                "C8 lifecycle did not activate: "
+                f"reports={reports!r}, active={active!r}, "
+                f"error={lifecycle_error!r}"
+            )
+
+        if fail_stage is not None:
+            assert any(
+                row["status"] == "RETRY"
+                and row["stage"] == fail_stage
+                for row in reports
+            )
+        assert executor.binding is not None
+
+        with cursor(pool) as database_cursor:
+            status_at = (
+                seed["authority_bundle"].session.prepared_at
+                + timedelta(hours=4)
+            )
+            active = reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=status_at,
+            )
+            summary = build_advanced_realtime_v3_status_cursor(
+                database_cursor,
+                checked_at=status_at,
+            )
+            database_cursor.execute(
+                "SELECT count(*) FROM "
+                "rt.advanced_options_preparation_evidence"
+            )
+            evidence_count = int(database_cursor.fetchone()[0])
+            database_cursor.execute(
+                "SELECT DISTINCT readiness.status "
+                "FROM rt.realtime_desired_intent_readiness AS readiness "
+                "JOIN rt.realtime_desired_member_intents AS intent "
+                "USING(intent_id) "
+                "WHERE intent.member_kind='OPTION_UNDERLYING'"
+            )
+            option_readiness = {
+                str(row[0]) for row in database_cursor.fetchall()
+            }
+            database_cursor.execute(
+                "SELECT count(*) FROM "
+                "rt.realtime_equity_preparation_work"
+            )
+            equity_preparation_count = int(
+                database_cursor.fetchone()[0]
+            )
+            database_cursor.connection.commit()
+
+        assert active is not None
+        assert active.status == "ACTIVE"
+        assert active.current_stage == "COMPLETE"
+        assert active.session_binding_id == executor.binding.binding_id
+        assert evidence_count == scheduled_count
+        assert option_readiness == {"READY"}
+        assert equity_preparation_count == 0
+        assert summary["current_processing"]["session_date"] == (
+            SESSION_DATE.isoformat()
+        )
+        assert summary["future_preparation"]["records"][0][
+            "status"
+        ] == "ACTIVE"
+        assert summary["physical_feeds"] == []
+        assert summary["publication"] == {}
+
+
+def _provider_free_selection_capture(seed, ticker):
+    snapshots = {}
+    for contract_ticker, raw in seed[
+        "sealed_selection"
+    ]["selected_snapshots"].items():
+        if raw["underlying_asset"]["ticker"] != ticker:
+            continue
+        snapshots[contract_ticker] = dict(raw)
+    if not snapshots:
+        market_time = (
+            seed["authority_bundle"].session.prepared_at
+            - timedelta(seconds=1)
+        )
+        market_ns = int(
+            market_time.timestamp() * 1_000_000_000
+        )
+        expiration = SESSION_DATE + timedelta(days=7)
+        for option_type, side in (("call", "C"), ("put", "P")):
+            contract_ticker = (
+                f"O:{ticker}{expiration:%y%m%d}{side}00200000"
+            )
+            snapshots[contract_ticker] = {
+                "details": {
+                    "ticker": contract_ticker,
+                    "contract_type": option_type,
+                    "expiration_date": expiration.isoformat(),
+                    "strike_price": "200",
+                },
+                "last_quote": {
+                    "bid": 1,
+                    "ask": 1.1,
+                    "last_updated": market_ns,
+                },
+                "day": {"volume": 10_000},
+                "open_interest": 5_000,
+                "underlying_asset": {
+                    "ticker": ticker,
+                    "price": "200",
+                    "last_updated": market_ns,
+                    "timeframe": "REAL-TIME",
+                },
+            }
+    document = {
+        "contract": "advanced-options-v3-pre-session-capture-v1",
+        "captured_at_utc": seed[
+            "authority_bundle"
+        ].session.prepared_at.isoformat(),
+        "session_date": SESSION_DATE.isoformat(),
+        "provider_requests": 1,
+        "decoded_bytes": 2048,
+        "responses": [
+            {
+                "underlyer": ticker,
+                "request_id": f"provider-free-{ticker}",
+                "page_count": 1,
+            },
+        ],
+        "selected_snapshots": snapshots,
+    }
+    document["semantic_sha256"] = canonical_sha256(document)
+    return p8_activity_selection_capture_from_sealed(document)
+
+
+class _ProviderFreeSelectionSource:
+    def __init__(self, provider, capture, state):
+        self.provider = provider
+        self.capture_value = capture
+        self.state = state
+
+    def capture(self, **_scope):
+        if not self.state["interrupted"]:
+            self.state["interrupted"] = True
+            raise AdvancedOptionsPreparationRetryable(
+                "provider-free injected interruption"
+            )
+        with self.provider.transaction(read_only=True) as unit:
+            unit.cursor.execute(
+                "SELECT count(*) FROM rt.provider_request_ledger "
+                "WHERE state='RESERVED'"
+            )
+            self.state["reserved_before_io"] = (
+                int(unit.cursor.fetchone()[0]) > 0
+            )
+        return self.capture_value
+
+
+def test_c8_real_executor_provider_free_end_to_end_with_retry():
+    with disposable_v2_database(
+        f"test_realtime_v2_c8_real_executor_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            seed = _seed_session(
+                database_cursor,
+                options_ready=False,
+            )
+            _seed_c8_equity_history(database_cursor, seed)
+            _seed_complete_c8_reference(database_cursor, seed)
+            checked_at = seed[
+                "authority_bundle"
+            ].session.prepared_at
+            reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=checked_at,
+            )
+            database_cursor.connection.commit()
+
+        provider = _provider(pool)
+        source_state = {
+            "interrupted": False,
+            "reserved_before_io": False,
+        }
+        captures = {
+            ticker: _provider_free_selection_capture(seed, ticker)
+            for ticker in ("QQQ", "SPY")
+        }
+        executor = PostgresAutomaticOptionsPreparationExecutor(
+            provider,
+            api_key="provider-free",
+            backend_image_id="sha256:" + "f" * 64,
+            maximum_provider_requests_per_underlying=1,
+            maximum_decoded_bytes_per_underlying=4096,
+            admission_profile_version=(
+                LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            ),
+            exact_four_compatibility=True,
+            clock=lambda: checked_at,
+            selection_source_factory=lambda claim: (
+                _ProviderFreeSelectionSource(
+                    provider,
+                    captures[claim.ticker],
+                    source_state,
+                )
+            ),
+            combined_capture_factory=(
+                lambda _claim, _captures: dict(
+                    seed["sealed_selection"]
+                )
+            ),
+        )
+        owner_id = uuid4()
+        reports = []
+        for attempt in range(20):
+            cycle_at = checked_at + timedelta(minutes=attempt * 10)
+            report = run_advanced_options_preparation_cycle(
+                provider,
+                executor,
+                owner_id=owner_id,
+                checked_at=cycle_at,
+                clock=lambda: checked_at,
+            )
+            reports.append(report)
+            with cursor(pool) as database_cursor:
+                lifecycle = reconcile_advanced_options_lifecycle_cursor(
+                    database_cursor,
+                    target_session_date=SESSION_DATE,
+                    checked_at=cycle_at,
+                )
+                database_cursor.connection.commit()
+            if lifecycle is not None and lifecycle.status == "ACTIVE":
+                break
+        else:
+            raise AssertionError(
+                "real C8 executor did not activate: "
+                f"reports={reports!r}, lifecycle={lifecycle!r}"
+            )
+
+        assert any(row["status"] == "RETRY" for row in reports)
+        assert source_state["reserved_before_io"] is True
+        assert lifecycle.session_binding_id is not None
+        with cursor(pool) as database_cursor:
+            database_cursor.execute(
+                "SELECT count(*) FROM "
+                "rt.advanced_options_continuous_sessions"
+            )
+            session_count = int(database_cursor.fetchone()[0])
+            database_cursor.execute(
+                "SELECT count(*) FILTER (WHERE state='COMPLETE'),"
+                "count(*) FILTER (WHERE state='FAILED') "
+                "FROM rt.provider_request_ledger"
+            )
+            provider_states = database_cursor.fetchone()
+            database_cursor.execute(
+                "SELECT count(*) FROM "
+                "rt.advanced_options_preparation_evidence"
+            )
+            evidence_count = int(database_cursor.fetchone()[0])
+            database_cursor.execute(
+                "SELECT admission_profile_version,"
+                "allocation_document "
+                "FROM rt.advanced_options_selection_generations"
+            )
+            exact_selection = database_cursor.fetchone()
+
+        assert session_count == 1
+        assert provider_states[0] >= 2
+        assert provider_states[1] >= 1
+        assert evidence_count == 9
+        assert exact_selection[0] == "c6_exact_four_regression_v1"
+        assert exact_selection[1]["schema"] == (
+            "c6_exact_four_regression_v1"
+        )
+
+
+def test_c8_real_executor_uses_v2_allocation_for_generalized_membership():
+    underlyings = ("IWM", "QQQ", "SPY")
+    with disposable_v2_database(
+        f"test_realtime_v2_c8_generalized_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            seed = _seed_session(
+                database_cursor,
+                options_ready=False,
+            )
+            _add_desired_option_underlying(database_cursor, "IWM")
+            _seed_c8_equity_history(
+                database_cursor,
+                seed,
+                underlyings=underlyings,
+            )
+            checked_at = seed[
+                "authority_bundle"
+            ].session.prepared_at
+            reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=checked_at,
+            )
+            database_cursor.connection.commit()
+
+        provider = _provider(pool)
+        source_state = {
+            "interrupted": True,
+            "reserved_before_io": False,
+        }
+        captures = {
+            ticker: _provider_free_selection_capture(seed, ticker)
+            for ticker in underlyings
+        }
+        executor = PostgresAutomaticOptionsPreparationExecutor(
+            provider,
+            api_key="provider-free",
+            backend_image_id="sha256:" + "e" * 64,
+            maximum_provider_requests_per_underlying=1,
+            maximum_decoded_bytes_per_underlying=4096,
+            clock=lambda: checked_at,
+            selection_source_factory=lambda claim: (
+                _ProviderFreeSelectionSource(
+                    provider,
+                    captures[claim.ticker],
+                    source_state,
+                )
+            ),
+        )
+        owner_id = uuid4()
+        reference_seeded = False
+        for attempt in range(30):
+            cycle_at = checked_at + timedelta(minutes=attempt * 10)
+            report = run_advanced_options_preparation_cycle(
+                provider,
+                executor,
+                owner_id=owner_id,
+                checked_at=cycle_at,
+                clock=lambda: checked_at,
+            )
+            with cursor(pool) as database_cursor:
+                if not reference_seeded:
+                    database_cursor.execute(
+                        "SELECT count(*) FROM "
+                        "rt.advanced_options_preparation_work "
+                        "WHERE stage='CATALOG_QUOTE' "
+                        "AND status='COMPLETE'"
+                    )
+                    if int(database_cursor.fetchone()[0]) == 3:
+                        snapshots = {
+                            ticker: raw
+                            for capture in captures.values()
+                            for ticker, raw
+                            in capture.selected_snapshots.items()
+                        }
+                        _seed_complete_c8_reference(
+                            database_cursor,
+                            seed,
+                            underlyings=underlyings,
+                            snapshots=snapshots,
+                        )
+                        reference_seeded = True
+                lifecycle = reconcile_advanced_options_lifecycle_cursor(
+                    database_cursor,
+                    target_session_date=SESSION_DATE,
+                    checked_at=cycle_at,
+                )
+                database_cursor.connection.commit()
+            if lifecycle is not None and lifecycle.status == "ACTIVE":
+                break
+        else:
+            raise AssertionError(
+                "generalized C8 executor did not activate: "
+                f"report={report!r}, lifecycle={lifecycle!r}"
+            )
+
+        assert source_state["reserved_before_io"] is True
+        with cursor(pool) as database_cursor:
+            database_cursor.execute(
+                "SELECT selection_generation_sha256,"
+                "admission_profile_version,"
+                "admission_profile_sha256,allocation_sha256,"
+                "allocation_document,capacity_document "
+                "FROM rt.advanced_options_selection_generations"
+            )
+            generation = database_cursor.fetchone()
+            database_cursor.execute(
+                "SELECT underlying,contract_ticker "
+                "FROM rt.advanced_options_selection_members "
+                "ORDER BY underlying,contract_ticker"
+            )
+            selected_rows = tuple(database_cursor.fetchall())
+            database_cursor.execute(
+                "SELECT count(*) FROM "
+                "rt.advanced_options_physical_subscriptions"
+            )
+            physical_count = int(database_cursor.fetchone()[0])
+        allocation = dict(generation[4])
+        selected_tickers = {
+            str(row[1]) for row in selected_rows
+        }
+        by_underlying = {
+            ticker: sum(
+                str(row[0]) == ticker for row in selected_rows
+            )
+            for ticker in underlyings
+        }
+
+        assert generation[1] == "c6_activity_momentum_v2"
+        assert generation[2] == allocation["profile_sha256"]
+        assert generation[3] == allocation["allocation_sha256"]
+        assert allocation["active_contract_budget"] <= 8 * len(
+            underlyings
+        )
+        assert allocation["selected_contract_count"] <= allocation[
+            "active_contract_budget"
+        ]
+        assert all(value <= 12 for value in by_underlying.values())
+        assert allocation["admission_evidence"][
+            "configured_contracts_per_underlying"
+        ] == 8
+        assert allocation["admission_evidence"][
+            "effective_per_underlying_limit"
+        ] == 12
+        assert allocation["admission_evidence"][
+            "effective_total_budget"
+        ] == min(
+            value
+            for value in (
+                8 * len(underlyings),
+                allocation["admission_evidence"][
+                    "configured_total_budget"
+                ],
+                allocation["admission_evidence"][
+                    "effective_provider_project_ceiling"
+                ],
+                allocation["admission_evidence"][
+                    "established_measured_capacity"
+                ],
+            )
+            if value is not None
+        )
+        assert allocation["consumer_eligibility"]
+        assert all(
+            set(group["contract_tickers"]).issubset(
+                selected_tickers
+            )
+            for group in allocation["selected_groups"]
+        )
+        assert physical_count == 1
+
+        first = PostgresContinuousSessionStateRepository(
+            _provider(pool),
+            session_date=SESSION_DATE,
+        ).load_c6_selection_plan()
+        restarted = PostgresContinuousSessionStateRepository(
+            _provider(pool),
+            session_date=SESSION_DATE,
+        ).load_c6_selection_plan()
+
+        assert first is not None
+        assert restarted is not None
+        assert first.generation_sha256 == generation[0]
+        assert restarted.generation_sha256 == first.generation_sha256
+
+
+def test_c8_stage_worker_reclaims_crashed_attempt_with_new_epoch():
+    with disposable_v2_database(
+        f"test_realtime_v2_c8_crash_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            seed = _seed_session(database_cursor)
+            checked_at = seed[
+                "authority_bundle"
+            ].session.prepared_at
+            reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=checked_at,
+            )
+            crashed = claim_advanced_options_preparation_cursor(
+                database_cursor,
+                owner_id=uuid4(),
+                checked_at=checked_at,
+                lease_seconds=10,
+            )
+            database_cursor.connection.commit()
+
+        assert crashed is not None
+        assert crashed.stage == "CATALOG_QUOTE"
+        assert crashed.attempt == 1
+        assert crashed.owner_epoch == 1
+
+        restarted_at = checked_at + timedelta(seconds=11)
+        report = run_advanced_options_preparation_cycle(
+            _provider(pool),
+            _AutomaticC8Executor(pool, seed),
+            owner_id=uuid4(),
+            checked_at=restarted_at,
+            lease_seconds=10,
+            clock=lambda: restarted_at,
+        )
+
+        assert report["status"] == "COMPLETE"
+        assert report["stage"] == "CATALOG_QUOTE"
+        assert report["attempt"] == 2
+        assert report["owner_epoch"] == 2
+
+
+class _BudgetProbeExecutor:
+    def __init__(self, provider):
+        self.provider = provider
+        self.reserved_before_io = False
+
+    def provider_budget(self, claim):
+        return AdvancedOptionsStageProviderBudget(
+            ProviderBudgetScope(
+                account_alias="MASSIVE_ADVANCED",
+                session_date=claim.session_date,
+                authorization_reference="c8-budget-probe",
+                provider_authorization_reference="c8-budget-probe",
+                expected_cost="owned provider-free reservation",
+                request_ceiling=8,
+                decoded_byte_ceiling=8_000,
+                lanes=frozenset({
+                    ProviderRequestLane.OPTIONS_CHAIN,
+                }),
+                authorized_until=(
+                    claim.lease_until + timedelta(hours=1)
+                ),
+            ),
+            (
+                AdvancedOptionsProviderRequestPlan(
+                    ProviderRequestLane.OPTIONS_CHAIN,
+                    "OPTIONS_CHAIN_SNAPSHOT",
+                    _digest("c8-budget-request"),
+                    1_000,
+                ),
+            ),
+        )
+
+    def execute(self, claim, *, provider_request_ids):
+        assert len(provider_request_ids) == 1
+        with self.provider.transaction(
+            read_only=True,
+        ) as unit:
+            unit.cursor.execute(
+                "SELECT state,reserved_response_bytes "
+                "FROM rt.provider_request_ledger "
+                "WHERE request_id=%s",
+                (str(provider_request_ids[0]),),
+            )
+            self.reserved_before_io = (
+                unit.cursor.fetchone() == ("RESERVED", 1_000)
+            )
+        return AdvancedOptionsStageResult(
+            watermark={"stage": claim.stage, "reserved": True},
+            evidence={"status": "READY", "provider_io": "BLOCKED"},
+            provider_results=(
+                AdvancedOptionsProviderRequestResult(
+                    provider_request_ids[0],
+                    100,
+                    2,
+                ),
+            ),
+        )
+
+
+def test_c8_provider_budget_is_reserved_before_stage_io():
+    with disposable_v2_database(
+        f"test_realtime_v2_c8_budget_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            seed = _seed_session(database_cursor)
+            checked_at = seed[
+                "authority_bundle"
+            ].session.prepared_at
+            reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=checked_at,
+            )
+            database_cursor.connection.commit()
+        provider = _provider(pool)
+        executor = _BudgetProbeExecutor(provider)
+
+        report = run_advanced_options_preparation_cycle(
+            provider,
+            executor,
+            owner_id=uuid4(),
+            checked_at=checked_at,
+            clock=lambda: checked_at,
+        )
+
+        assert report["status"] == "COMPLETE"
+        assert report["provider_requests"] == 1
+        assert executor.reserved_before_io is True
+        with cursor(pool) as database_cursor:
+            database_cursor.execute(
+                "SELECT state,response_bytes FROM "
+                "rt.provider_request_ledger"
+            )
+            assert database_cursor.fetchone() == ("COMPLETE", 100)
+
+
+def test_equity_only_addition_does_not_change_options_activation():
+    with disposable_v2_database(
+        f"test_realtime_v2_c5_equity_superset_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            seed = _seed_session(
+                database_cursor,
+                extra_equity_tickers=("XLF",),
+            )
+            database_cursor.connection.commit()
+
+        repository = PostgresContinuousSessionStateRepository(
+            _provider(pool),
+            session_date=SESSION_DATE,
+        )
+        binding = repository.activate_session(
+            package=seed["package"],
+            authority_bundle=seed["authority_bundle"],
+            acquisition_binding=seed["acquisition"],
+            reference=seed["reference"],
+            sealed_selection=seed["sealed_selection"],
+            written_at=seed["authority_bundle"].session.prepared_at,
+        )
+
+        assert binding.cohort_id == seed[
+            "authority_bundle"
+        ].session.cohort_id
+        assert binding.contract_tickers == seed[
+            "acquisition"
+        ].contract_tickers
+        assert tuple(
+            seed["package"]["equity_input_binding"]["symbols"]
+        ) == EQUITY_VALIDATION_UNIVERSE.equity_tickers
+        assert "XLF" not in seed[
+            "package"
+        ]["equity_input_binding"]["symbols"]
+
+
+def test_options_activation_requires_equity_context_for_each_underlying():
+    with disposable_v2_database(
+        f"test_realtime_v2_c5_missing_equity_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            seed = _seed_session(database_cursor)
+            database_cursor.connection.commit()
+        package = {
+            **seed["package"],
+            "equity_input_binding": {"symbols": ["SPY"]},
+        }
+        package.pop("package_sha256")
+        package["package_sha256"] = canonical_sha256(package)
+        repository = PostgresContinuousSessionStateRepository(
+            _provider(pool),
+            session_date=SESSION_DATE,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="READY desired and package Equity context",
+        ):
+            repository.activate_session(
+                package=package,
+                authority_bundle=seed["authority_bundle"],
+                acquisition_binding=seed["acquisition"],
+                reference=seed["reference"],
+                sealed_selection=seed["sealed_selection"],
+                written_at=(
+                    seed["authority_bundle"].session.prepared_at
+                ),
+            )
 
 
 def test_document_activation_reconstructs_exact_readiness(

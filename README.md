@@ -1637,33 +1637,46 @@ docker compose --env-file backend/.env ps
 The `equity` profile starts both canonical workers. Do not enable the
 `equity-stream` profile.
 
-Advanced Equity V2 uses a separate Compose project and process-scoped Docker
-secrets. The initial authorized mode is provider-free and projection-only:
+Advanced Realtime V3 has one normal native launcher and one consolidated
+Compose profile. Both derive the XNYS session, desired snapshot, cohorts,
+Options session state, bindings and publication work from PostgreSQL; neither
+accepts a normal session date or mounted package/bundle/binding.
+
+Native startup:
 
 ```powershell
-$env:REALTIME_V2_ADVANCED_COHORT_ID = `
-  "713278f5-e83d-55f5-98c3-c930be03e9c8"
-$env:REALTIME_V2_BACKEND_IMAGE = `
-  "alpha-research-realtime-v2-p8-qualification:<approved-run-id>"
-docker compose -f docker-compose.realtime-v2.yml up -d --no-build `
-  realtime-v2-advanced-api realtime-v2-advanced-frontend `
-  realtime-v2-advanced-bridge realtime-v2-advanced-finalizer
+$run = "C:\StockScreenerRuntime\advanced-v3\run-$(Get-Date -Format yyyyMMddTHHmmss)"
+$retention = "C:\StockScreenerRuntime\advanced-v3\retention"
+.\backend\.venv\Scripts\python.exe -B `
+  .\backend\scripts\run_realtime_v2_advanced_services.py `
+  --run-directory $run `
+  --retention-directory $retention `
+  --execute
 ```
 
-See [deployment](docs/DEPLOYMENT.md) for secret preparation, redaction checks,
-health/status commands, stop, backup and rollback. Do not start
-`realtime-v2-advanced-provider` or the Advanced scheduler without an exact
-provider/session/cutoff authorization.
+Compose startup:
 
-Advanced Options V3 is a separate disabled four-role profile. Its retained
-2026-10-23 package is `DISABLED_NOT_PREPARED` and operations readiness is
-`BLOCKED`; do not start `realtime-v3-options`. Validate the package with the
-provider-free `inspect_advanced_options_v3_package.py` PLAN/preflight/status
-modes documented in [deployment](docs/DEPLOYMENT.md). A later run requires a
-reviewed immutable image ID, `--no-build`, applied migrations 033-035, complete
-H/reference inputs, a passing owned Docker rehearsal and separate session,
-window, publication and stored-read authorities. Nine-underlying Options
-expansion remains unauthorized; Equity remains exact target 9.
+```powershell
+$env:REALTIME_V2_BACKEND_IMAGE = "<approved-immutable-image>"
+docker compose -f .\docker-compose.realtime-v2.yml `
+  --profile advanced-realtime-v3 up -d --no-build
+```
+
+The profile starts the same long-lived Equity, Options, detector, Stock Alert,
+C7 publication-retry, API/frontend and retention ownership as the native
+launcher. PostgreSQL owner epochs fence the runtime, each role and the sole
+physical Options socket across native and Compose. Desired Options members run
+durable catalog/quote, OI/reference, history, capacity/shard and activation
+stages after their existing Equity role is READY; no duplicate Equity warmup is
+scheduled. Options residents wait when no session is active and rebind after
+XNYS rollover. The retained
+`realtime-v2-options-p8` and daily/manual activation paths are diagnostics only;
+do not run them beside the consolidated topology.
+
+See [deployment](docs/DEPLOYMENT.md) for the single status, graceful stop,
+backup, isolated restore verification and rollback workflow. Starting the
+provider-owning topology still requires the normal operational authorization;
+documentation is not permission to call the provider or change a live database.
 
 ## Verification
 
