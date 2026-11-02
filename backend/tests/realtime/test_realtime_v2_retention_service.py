@@ -456,7 +456,7 @@ def test_retention_compose_service_is_isolated_disabled_and_fail_closed():
     )
     assert match is not None
     block = match.group("body")
-    assert 'profiles: ["realtime-v2-retention"]' in block
+    assert 'profiles: ["realtime-v2-retention", "advanced-realtime-v3"]' in block
     assert "scripts/run_realtime_v2_retention_service.py" in block
     assert "realtime_v2_app_dsn" in block
     assert "realtime_v2_admin_dsn" in block

@@ -23,6 +23,7 @@ x-advanced-environment: &advanced-environment
   REALTIME_V3_OPTIONS_PER_UNDERLYING_CONTRACT_LIMIT: "${REALTIME_V3_OPTIONS_PER_UNDERLYING_CONTRACT_LIMIT:-}"
   REALTIME_V3_OPTIONS_ESTABLISHED_MEASURED_CAPACITY: "${REALTIME_V3_OPTIONS_ESTABLISHED_MEASURED_CAPACITY:-}"
   REALTIME_V3_OPTIONS_EFFECTIVE_PROVIDER_PROJECT_CEILING: "${REALTIME_V3_OPTIONS_EFFECTIVE_PROVIDER_PROJECT_CEILING:-}"
+  REALTIME_V3_OPTIONS_MAXIMUM_PROVIDER_REQUESTS_PER_UNDERLYING: "${REALTIME_V3_OPTIONS_MAXIMUM_PROVIDER_REQUESTS_PER_UNDERLYING:-}"
 
 x-downstream-labels: &downstream-labels
   stockscreener.realtime.transition-plane: downstream
@@ -892,7 +893,7 @@ services:
   realtime-v2-options-p8-ingress:
     extends:
       service: realtime-v3-options-p8-ingress
-    profiles: ["realtime-v2-options-p8"]
+    profiles: !override ["realtime-v2-options-p8"]
     container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-ingress
     command:
       - python
@@ -919,10 +920,10 @@ services:
       REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH: /run/advanced-options-acquisition/binding.json
       REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: /run/advanced-options-downstream
     volumes:
-      - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
-      - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
-      - ${REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH:?set REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH}:/run/advanced-options-acquisition/binding.json:ro
-      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:?set REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH}:/run/advanced-options-downstream:ro
+      - ${REALTIME_V2_P8_PACKAGE_PATH:-/diagnostic-only-unset}:/run/advanced-options-p8/package.json:ro
+      - ${REALTIME_V2_P8_BUNDLE_PATH:-/diagnostic-only-unset}:/run/advanced-options-p8/execution-bundle.json:ro
+      - ${REALTIME_V3_OPTIONS_ACQUISITION_BINDING_PATH:-/diagnostic-only-unset}:/run/advanced-options-acquisition/binding.json:ro
+      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:-/diagnostic-only-unset}:/run/advanced-options-downstream:ro
       - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
       - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
     healthcheck:
@@ -945,7 +946,7 @@ services:
   realtime-v2-options-p8-market-state:
     extends:
       service: realtime-v3-options-p8-market-state
-    profiles: ["realtime-v2-options-p8"]
+    profiles: !override ["realtime-v2-options-p8"]
     container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-market-state
     command:
       - python
@@ -971,9 +972,9 @@ services:
       REALTIME_V3_OPTIONS_STATE_SOURCE: legacy-diagnostic
       REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: /run/advanced-options-downstream
     volumes:
-      - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
-      - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
-      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:?set REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH}:/run/advanced-options-downstream:ro
+      - ${REALTIME_V2_P8_PACKAGE_PATH:-/diagnostic-only-unset}:/run/advanced-options-p8/package.json:ro
+      - ${REALTIME_V2_P8_BUNDLE_PATH:-/diagnostic-only-unset}:/run/advanced-options-p8/execution-bundle.json:ro
+      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:-/diagnostic-only-unset}:/run/advanced-options-downstream:ro
       - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
       - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
     healthcheck:
@@ -996,7 +997,7 @@ services:
   realtime-v2-options-p8-flow:
     extends:
       service: realtime-v3-options-p8-flow
-    profiles: ["realtime-v2-options-p8"]
+    profiles: !override ["realtime-v2-options-p8"]
     container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-flow
     command:
       - python
@@ -1022,9 +1023,9 @@ services:
       REALTIME_V3_OPTIONS_STATE_SOURCE: legacy-diagnostic
       REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: /run/advanced-options-downstream
     volumes:
-      - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
-      - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
-      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:?set REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH}:/run/advanced-options-downstream:ro
+      - ${REALTIME_V2_P8_PACKAGE_PATH:-/diagnostic-only-unset}:/run/advanced-options-p8/package.json:ro
+      - ${REALTIME_V2_P8_BUNDLE_PATH:-/diagnostic-only-unset}:/run/advanced-options-p8/execution-bundle.json:ro
+      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:-/diagnostic-only-unset}:/run/advanced-options-downstream:ro
       - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
       - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
     healthcheck:
@@ -1047,7 +1048,7 @@ services:
   realtime-v2-options-p8-window:
     extends:
       service: realtime-v3-options-p8-window
-    profiles: ["realtime-v2-options-p8"]
+    profiles: !override ["realtime-v2-options-p8"]
     container_name: ${REALTIME_V2_P8_CONTAINER_PREFIX:-stock-screener}-realtime-v2-options-p8-window
     command:
       - python
@@ -1073,9 +1074,9 @@ services:
       REALTIME_V3_OPTIONS_STATE_SOURCE: legacy-diagnostic
       REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_DIR: /run/advanced-options-downstream
     volumes:
-      - ${REALTIME_V2_P8_PACKAGE_PATH:?set REALTIME_V2_P8_PACKAGE_PATH}:/run/advanced-options-p8/package.json:ro
-      - ${REALTIME_V2_P8_BUNDLE_PATH:?set REALTIME_V2_P8_BUNDLE_PATH}:/run/advanced-options-p8/execution-bundle.json:ro
-      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:?set REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH}:/run/advanced-options-downstream:ro
+      - ${REALTIME_V2_P8_PACKAGE_PATH:-/diagnostic-only-unset}:/run/advanced-options-p8/package.json:ro
+      - ${REALTIME_V2_P8_BUNDLE_PATH:-/diagnostic-only-unset}:/run/advanced-options-p8/execution-bundle.json:ro
+      - ${REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH:-/diagnostic-only-unset}:/run/advanced-options-downstream:ro
       - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
     healthcheck:
       test:

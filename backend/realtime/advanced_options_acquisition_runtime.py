@@ -277,7 +277,9 @@ def build_acquisition_binding(
         "source_sha256": source_sha256,
         "backend_image_id": backend_image_id,
         "authority": authority,
-        "contract_tickers": contract_tickers,
+        "contract_tickers": tuple(sorted(
+            str(value).strip().upper() for value in contract_tickers
+        )),
         "owner_id": uuid5(
             NAMESPACE_URL,
             (

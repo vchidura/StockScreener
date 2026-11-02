@@ -53,6 +53,7 @@ OPTIONS_PREPARATION_STAGES = (
 )
 OPTIONS_REFRESH_INITIAL_BACKOFF_SECONDS = 30
 OPTIONS_REFRESH_MAXIMUM_BACKOFF_SECONDS = 300
+OPTIONS_REFRESH_OPEN_FLOOR_SECONDS = 90
 
 
 @dataclass(frozen=True, slots=True)
@@ -779,7 +780,7 @@ def advanced_options_preparation_retry_schedule(
         * (2 ** min(attempt - 1, 4)),
     )
     retry_at = max(
-        session_open,
+        session_open + timedelta(seconds=OPTIONS_REFRESH_OPEN_FLOOR_SECONDS),
         requested + timedelta(seconds=backoff_seconds),
     )
     return retry_at, backoff_seconds

@@ -44,6 +44,7 @@ from realtime.migrations import (  # noqa: E402
 
 
 UTC = timezone.utc
+COMPLETED_CHUNK_PAUSE_SECONDS = 0.25
 
 
 def _now() -> datetime:
@@ -178,6 +179,17 @@ def _payload(result) -> str:
     }, sort_keys=True)
 
 
+def _wait_seconds(result, *, poll_seconds: float, now: datetime) -> float:
+    if result.status in {"PROGRESSED", "COMPLETE"}:
+        return min(poll_seconds, COMPLETED_CHUNK_PAUSE_SECONDS)
+    if result.next_retry_at is None:
+        return poll_seconds
+    return min(
+        poll_seconds,
+        max(0.0, (result.next_retry_at - now).total_seconds()),
+    )
+
+
 def main(argv=None):
     args = parse_args(argv)
     env_file = args.env_file or BACKEND_DIR / ".env"
@@ -227,16 +239,13 @@ def main(argv=None):
                 return 0 if result.status != "BLOCKED" else 1
             if args.until_idle and result.status in {"IDLE", "BLOCKED"}:
                 return 0 if result.status == "IDLE" else 1
-            wait_seconds = args.poll_seconds
-            if result.next_retry_at is not None:
-                wait_seconds = min(
-                    wait_seconds,
-                    max(
-                        0.0,
-                        (result.next_retry_at - _now()).total_seconds(),
-                    ),
+            stop.wait(
+                _wait_seconds(
+                    result,
+                    poll_seconds=args.poll_seconds,
+                    now=_now(),
                 )
-            stop.wait(wait_seconds)
+            )
     finally:
         pool.closeall()
     return 0

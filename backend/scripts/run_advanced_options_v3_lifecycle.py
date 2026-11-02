@@ -59,6 +59,8 @@ UTC = timezone.utc
 DEFAULT_CONNECTION_ATTEMPT_CEILING = 12
 DEFAULT_DECODED_MESSAGE_CEILING = 1_000_000
 DEFAULT_DECODED_BYTE_CEILING = 1_073_741_824
+GENERALIZED_PROVIDER_REQUESTS_PER_UNDERLYING = 32
+EXACT_FOUR_PROVIDER_REQUESTS_PER_UNDERLYING = 4
 
 
 def parse_args(argv=None):
@@ -211,6 +213,28 @@ def _optional_positive_environment_int(
     return _positive_environment_int(environment, name, 1)
 
 
+def _exact_four_compatibility(environment) -> bool:
+    return (
+        str(environment.get(
+            "REALTIME_V3_OPTIONS_EXACT_FOUR_COMPATIBILITY",
+            "",
+        )).strip().upper()
+        == "ENABLED"
+    )
+
+
+def _maximum_provider_requests_per_underlying(environment) -> int:
+    return _positive_environment_int(
+        environment,
+        "REALTIME_V3_OPTIONS_MAXIMUM_PROVIDER_REQUESTS_PER_UNDERLYING",
+        (
+            EXACT_FOUR_PROVIDER_REQUESTS_PER_UNDERLYING
+            if _exact_four_compatibility(environment)
+            else GENERALIZED_PROVIDER_REQUESTS_PER_UNDERLYING
+        ),
+    )
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     provider, pool = _provider()
@@ -244,25 +268,18 @@ def main(argv=None) -> int:
         provider,
         api_key=api_key,
         backend_image_id=backend_image_id,
+        maximum_provider_requests_per_underlying=(
+            _maximum_provider_requests_per_underlying(environment)
+        ),
         admission_profile_version=(
             LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION
-            if str(environment.get(
-                "REALTIME_V3_OPTIONS_EXACT_FOUR_COMPATIBILITY",
-                "",
-            )).strip().upper()
-            == "ENABLED"
+            if _exact_four_compatibility(environment)
             else str(environment.get(
                 "REALTIME_V3_OPTIONS_ADMISSION_PROFILE",
                 ACTIVITY_MOMENTUM_PROFILE_VERSION,
             )).strip()
         ),
-        exact_four_compatibility=(
-            str(environment.get(
-                "REALTIME_V3_OPTIONS_EXACT_FOUR_COMPATIBILITY",
-                "",
-            )).strip().upper()
-            == "ENABLED"
-        ),
+        exact_four_compatibility=_exact_four_compatibility(environment),
         active_quote_contract_budget=(
             _optional_positive_environment_int(
                 environment,

@@ -473,6 +473,7 @@ def preflight(manifest, output):
         schema_inventory_cursor,
         source_bundle_identity,
     )
+    from realtime.migrations import is_retired_realtime_migration
     from realtime.security_v2 import (
         audit_database_security_v2,
         build_role_names_v2,
@@ -530,7 +531,14 @@ def preflight(manifest, output):
                 else live024_migration_rows()
             )
             if compatibility is None:
-                live_migrations = observed_live_migrations
+                live_migrations = [
+                    row
+                    for row in observed_live_migrations
+                    if not is_retired_realtime_migration(
+                        row["version"],
+                        row["checksum_sha256"].strip(),
+                    )
+                ]
                 post024_live_migrations = []
             else:
                 expected_versions = {

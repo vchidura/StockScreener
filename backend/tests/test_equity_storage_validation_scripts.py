@@ -5,14 +5,30 @@ from pathlib import Path
 
 import pytest
 
+from realtime.migrations import RETIRED_REALTIME_MIGRATIONS
 from scripts.validate_advanced_realtime_v3_restore import (
     NORMALIZED_CHECKPOINT,
     RAW_CHECKPOINT,
+    _migration_mismatches,
     checkpoint_exceeds_boundary,
 )
 
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
+
+
+def test_restore_validator_ignores_only_the_exact_retired_ledger_row():
+    retired, checksum = next(iter(RETIRED_REALTIME_MIGRATIONS.items()))
+    expected = {"000_realtime_baseline": "a" * 64}
+
+    assert _migration_mismatches(expected, {**expected, retired: checksum}) == []
+    assert _migration_mismatches(expected, {**expected, retired: "b" * 64}) == [
+        retired
+    ]
+    assert _migration_mismatches(expected, {**expected, "x": checksum}) == ["x"]
+    assert _migration_mismatches(expected, {retired: checksum}) == [
+        "000_realtime_baseline"
+    ]
 
 
 def test_canonical_validator_requires_lineage_only_for_canonical_derivations():

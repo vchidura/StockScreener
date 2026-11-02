@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from psycopg2.extras import Json
+from psycopg2.extras import Json, RealDictCursor
 from dataclasses import replace
 
 from options.calendar import OptionExchangeCalendar
@@ -76,6 +76,9 @@ from .advanced_options_p8_selection_source import (
     SEALED_CAPTURE_GENERALIZED_C6_PROFILE,
     p8_activity_selection_capture_from_sealed,
 )
+from .advanced_options_reference_producer import (
+    load_opening_reference_inputs_cursor,
+)
 from .advanced_options_reference_repository import (
     decode_advanced_options_reference_state,
     persist_advanced_options_reference_state_cursor,
@@ -111,6 +114,7 @@ from .advanced_options_v3_authority import (
 )
 from .contracts import canonical_sha256
 from .database_access_v2 import APP_ROLE, V2ConnectionProvider
+from .option_source_flow import persist_option_flow_policy_cursor
 from .provider_budget import (
     MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING,
     MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING,
@@ -139,6 +143,8 @@ _C6_STRATEGY_POLICY_PATH = (
     / "policies"
     / "strategy_o3_credit_v2.json"
 )
+_C8_MODEL_BUNDLE_SHA256 = canonical_sha256({"model": "C8_OPTIONS_V3"})
+_C8_VALUATION_POLICY_SHA256 = canonical_sha256({"valuation": "C8_OPTIONS_V3"})
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -1018,6 +1024,15 @@ class PostgresAutomaticOptionsPreparationExecutor(
         captured_at = datetime.fromisoformat(
             capture["captured_at_utc"]
         )
+        reference_known_at = self._clock()
+        if (
+            reference_known_at.tzinfo is None
+            or reference_known_at.utcoffset() is None
+            or reference_known_at < captured_at
+        ):
+            raise AdvancedOptionsPreparationTerminal(
+                "reference observation clock precedes capture"
+            )
         calendar = OptionExchangeCalendar("XNYS")
         session_open = calendar.session_open(claim.session_date)
         prepared_at = min(
@@ -1065,6 +1080,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
             readiness=readiness,
             options_cohort_id=options_cohort_id,
             prepared_at=prepared_at,
+            reference_known_at=reference_known_at,
             hard_stop=hard_stop,
             authorization_reference=authorization_reference,
             capture=capture,
@@ -1369,6 +1385,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
         readiness,
         options_cohort_id,
         prepared_at,
+        reference_known_at,
         hard_stop,
         authorization_reference,
         capture,
@@ -1524,8 +1541,8 @@ class PostgresAutomaticOptionsPreparationExecutor(
                         "revision_id": claim.revision_id,
                         "configuration": "C8",
                     }),
-                    canonical_sha256({"model": "C8_OPTIONS_V3"}),
-                    canonical_sha256({"valuation": "C8_OPTIONS_V3"}),
+                    _C8_MODEL_BUNDLE_SHA256,
+                    _C8_VALUATION_POLICY_SHA256,
                     prepared_at,
                 ),
             )
@@ -1652,8 +1669,9 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 readiness=readiness,
                 manifest_sha256=manifest_sha256,
                 capture=capture,
-                prepared_at=prepared_at,
+                known_at=reference_known_at,
                 hard_stop=hard_stop,
+                history_source_cohort_id=history_source_cohort_id,
             )
         return plan_id, history_binding, history_evidence, reference
 
@@ -1727,8 +1745,9 @@ class PostgresAutomaticOptionsPreparationExecutor(
         readiness,
         manifest_sha256,
         capture,
-        prepared_at,
+        known_at,
         hard_stop,
+        history_source_cohort_id,
     ):
         cursor.execute(
             "SELECT state.state_id::text,state.state_sha256,"
@@ -1834,16 +1853,11 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 f"stored={sorted(str(row[1]['contract_ticker']) for row in stored_oi)},"
                 f"prepared={sorted(row.contract_ticker for row in admission.contracts)}"
             )
-        cursor.execute(
-            "SELECT policy_sha256 FROM rt.option_flow_policies "
-            "ORDER BY created_at DESC LIMIT 1"
-        )
-        policy_row = cursor.fetchone()
-        if policy_row is None:
-            raise AdvancedOptionsPreparationRetryable(
-                "Options flow policy is unavailable"
-            )
-        flow_policy_sha256 = str(policy_row[0])
+        # The flow role only records the policy after activation, and the
+        # contract scope below references it, so activation records it first.
+        flow_policy = load_advanced_options_flow_policy()
+        persist_option_flow_policy_cursor(cursor, flow_policy)
+        flow_policy_sha256 = flow_policy.sha256
         contract_scope_sha256 = canonical_sha256({
             "session_date": claim.session_date,
             "manifest_sha256": manifest_sha256,
@@ -1866,6 +1880,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
             ),
         )
         snapshots = capture["selected_snapshots"]
+        captured_at = datetime.fromisoformat(capture["captured_at_utc"])
         settlement = OptionExchangeCalendar(
             "XNYS"
         ).previous_session_date(claim.session_date)
@@ -1876,7 +1891,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
                     contract_ticker=row.contract_ticker,
                     underlyer=row.underlyer,
                     availability=ReferenceAvailability.UNAVAILABLE,
-                    known_at=prepared_at,
+                    known_at=known_at,
                     reason_codes=("MISSING_PRIOR_OPEN_INTEREST",),
                 )
             return AdvancedOptionsOpenInterestReference(
@@ -1884,7 +1899,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 contract_ticker=row.contract_ticker,
                 underlyer=row.underlyer,
                 availability=ReferenceAvailability.AVAILABLE,
-                known_at=prepared_at,
+                known_at=known_at,
                 baseline_id=uuid5(
                     NAMESPACE_URL,
                     f"stockscreener:c8-oi:{row.contract_ticker}:"
@@ -1895,8 +1910,8 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 open_interest=row.open_interest,
                 source="massive",
                 date_basis="PROVIDER_CHAIN_SNAPSHOT_PRIOR_SESSION",
-                observed_at=prepared_at,
-                received_at=prepared_at,
+                observed_at=captured_at,
+                received_at=captured_at,
                 payload_sha256=canonical_sha256(
                     snapshots[row.contract_ticker]
                 ),
@@ -1904,6 +1919,14 @@ class PostgresAutomaticOptionsPreparationExecutor(
         oi = tuple(
             open_interest_reference(row)
             for row in admission.contracts
+        )
+        volatility, valuations, metrics = self._opening_reference_inputs(
+            cursor,
+            claim,
+            admission=admission,
+            known_at=known_at,
+            hard_stop=hard_stop,
+            history_source_cohort_id=history_source_cohort_id,
         )
         cursor.execute(
             "SELECT COALESCE(MAX(reference_generation),0)+1 "
@@ -1913,7 +1936,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
         state = build_advanced_options_reference_state(
             reference_generation=generation,
             session_date=claim.session_date,
-            known_at=prepared_at,
+            known_at=known_at,
             valid_until=hard_stop,
             reference_policy_sha256=canonical_sha256({
                 "policy": "C8_OPTIONS_REFERENCE",
@@ -1923,9 +1946,9 @@ class PostgresAutomaticOptionsPreparationExecutor(
             contract_scope_sha256=contract_scope_sha256,
             underlyings=claim.option_underlyings,
             open_interest=oi,
-            historical_volatility=(),
-            valuation_inputs=(),
-            equity_metrics=(),
+            historical_volatility=volatility,
+            valuation_inputs=valuations,
+            equity_metrics=metrics,
         )
         persist_advanced_options_reference_state_cursor(cursor, state)
         first_cycle_id = uuid5(
@@ -1941,10 +1964,77 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 claim.session_date,
                 str(state.state_id),
                 str(first_cycle_id),
-                prepared_at,
+                known_at,
             ),
         )
         return OpeningReferenceEvidence.from_reference_state(state)
+
+    def _opening_reference_inputs(
+        self,
+        cursor,
+        claim,
+        *,
+        admission,
+        known_at,
+        hard_stop,
+        history_source_cohort_id,
+    ):
+        cursor.execute(
+            "SELECT intent.ticker,binding.security_id::text "
+            "FROM rt.realtime_desired_member_intents AS intent "
+            "JOIN rt.realtime_desired_member_bindings AS binding "
+            "USING(intent_id) "
+            "WHERE intent.revision_id=%s "
+            "AND intent.ticker=ANY(%s) "
+            "AND intent.member_kind IN ('EQUITY','SECTOR_ETF')",
+            (
+                str(claim.revision_id),
+                list(claim.option_underlyings),
+            ),
+        )
+        security_ids = {
+            str(row[0]): UUID(str(row[1])) for row in cursor.fetchall()
+        }
+        spots = {
+            row.underlyer: (row.spot, security_ids[row.underlyer])
+            for row in admission.contracts
+        }
+        if set(spots) != set(claim.option_underlyings):
+            raise AdvancedOptionsPreparationRetryable(
+                "opening reference needs an admitted contract "
+                "per Options underlying"
+            )
+        with cursor.connection.cursor(
+            cursor_factory=RealDictCursor,
+        ) as reference_cursor:
+            try:
+                (
+                    volatility,
+                    valuations,
+                    metrics,
+                    missing,
+                ) = load_opening_reference_inputs_cursor(
+                    reference_cursor,
+                    session_date=claim.session_date,
+                    known_at=known_at,
+                    valid_until=hard_stop,
+                    underlyings=claim.option_underlyings,
+                    contracts=admission.contracts,
+                    spots=spots,
+                    history_cohort_id=UUID(str(history_source_cohort_id)),
+                    model_bundle_sha256=_C8_MODEL_BUNDLE_SHA256,
+                    valuation_policy_sha256=_C8_VALUATION_POLICY_SHA256,
+                )
+            except ValueError as error:
+                raise AdvancedOptionsPreparationRetryable(
+                    f"opening reference inputs rejected: {error}"
+                ) from error
+        if missing:
+            raise AdvancedOptionsPreparationRetryable(
+                "opening reference inputs unavailable: "
+                + ",".join(missing)
+            )
+        return volatility, valuations, metrics
 
     def _selection_plan(
         self,

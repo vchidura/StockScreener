@@ -7,13 +7,16 @@ from pathlib import Path
 import pytest
 
 from realtime.migrations import (
+    EXPECTED_V2_DATABASE_NAME,
     PHASE_SECURITY,
     PHASE_STRUCTURE,
+    RETIRED_REALTIME_MIGRATIONS,
     SECURITY_MODE_DEFERRED,
     SECURITY_MODE_HARDENED,
     SECURITY_MODES_V2,
     V2_MIGRATIONS_DIR,
     load_realtime_migrations,
+    plan_realtime_migrations,
     schema_fingerprint,
     v2_provisioning_phases,
     validate_target_database_v2,
@@ -57,6 +60,43 @@ def test_v2_migration_chain_is_contiguous_and_fingerprinted():
     assert migrations[0].version == "000_realtime_baseline"
     assert [migration.sequence for migration in migrations] == list(range(len(migrations)))
     assert len(schema_fingerprint(migrations)) == 64
+
+
+def test_planner_accepts_only_the_exact_retired_ledger_row():
+    migrations = load_realtime_migrations(SQL_DIR)
+    retired = "045_advanced_options_detector_allocation"
+    retired_checksum = RETIRED_REALTIME_MIGRATIONS[retired]
+    applied = {
+        migration.version: migration.checksum_sha256
+        for migration in migrations
+        if migration.sequence <= 44
+    }
+    applied[retired] = retired_checksum
+
+    plan = plan_realtime_migrations(
+        EXPECTED_V2_DATABASE_NAME,
+        applied,
+        migrations,
+    )
+
+    assert [migration.version for migration in plan.pending][:2] == [
+        "045_advanced_options_preparation_refresh",
+        "046_retire_advanced_options_detector_allocation",
+    ]
+    assert retired not in plan.applied_versions
+    assert plan.schema_sha256 == schema_fingerprint(migrations)
+    with pytest.raises(ValueError, match="unknown realtime migration"):
+        plan_realtime_migrations(
+            EXPECTED_V2_DATABASE_NAME,
+            {**applied, retired: "0" * 64},
+            migrations,
+        )
+    with pytest.raises(ValueError, match="unknown realtime migration"):
+        plan_realtime_migrations(
+            EXPECTED_V2_DATABASE_NAME,
+            {**applied, "045_other": retired_checksum},
+            migrations,
+        )
 
 
 def test_session_archive_ledger_identity_includes_build_and_horizon():

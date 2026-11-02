@@ -111,30 +111,30 @@ class PolygonEquityClient:
         )
 
     def fetch_splits(
-        self, start_date: date, end_date: date
+        self, start_date: date, end_date: date, *, ticker: str | None = None
     ) -> tuple[dict[str, Any], ...]:
-        return self._get_results(
-            "/stocks/v1/splits",
-            {
-                "execution_date.gte": start_date.isoformat(),
-                "execution_date.lte": end_date.isoformat(),
-                "limit": 5000,
-                "sort": "execution_date.asc,ticker.asc",
-            },
-        )
+        params = {
+            "execution_date.gte": start_date.isoformat(),
+            "execution_date.lte": end_date.isoformat(),
+            "limit": 5000,
+            "sort": "execution_date.asc,ticker.asc",
+        }
+        if ticker is not None:
+            params["ticker"] = ticker.upper()
+        return self._get_results("/stocks/v1/splits", params)
 
     def fetch_dividends(
-        self, start_date: date, end_date: date
+        self, start_date: date, end_date: date, *, ticker: str | None = None
     ) -> tuple[dict[str, Any], ...]:
-        return self._get_results(
-            "/stocks/v1/dividends",
-            {
-                "ex_dividend_date.gte": start_date.isoformat(),
-                "ex_dividend_date.lte": end_date.isoformat(),
-                "limit": 5000,
-                "sort": "ex_dividend_date.asc,ticker.asc",
-            },
-        )
+        params = {
+            "ex_dividend_date.gte": start_date.isoformat(),
+            "ex_dividend_date.lte": end_date.isoformat(),
+            "limit": 5000,
+            "sort": "ex_dividend_date.asc,ticker.asc",
+        }
+        if ticker is not None:
+            params["ticker"] = ticker.upper()
+        return self._get_results("/stocks/v1/dividends", params)
 
     def fetch_float(self, tickers: Sequence[str]) -> tuple[dict[str, Any], ...]:
         if not tickers:

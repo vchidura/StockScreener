@@ -53,6 +53,7 @@ from realtime.contracts import canonical_sha256  # noqa: E402
 from realtime.migrations import (  # noqa: E402
     EXPECTED_V2_DATABASE_NAME,
     V2_MIGRATIONS_DIR,
+    is_retired_realtime_migration,
     load_realtime_migrations,
     schema_fingerprint,
 )
@@ -347,7 +348,14 @@ def _production_identity(cursor, expected_migrations):
     applied_by_version = {
         row["version"]: row["checksum_sha256"] for row in applied
     }
-    unknown = tuple(sorted(set(applied_by_version) - set(expected_by_version)))
+    retired = tuple(sorted(
+        version
+        for version, checksum in applied_by_version.items()
+        if is_retired_realtime_migration(version, checksum)
+    ))
+    unknown = tuple(sorted(
+        set(applied_by_version) - set(expected_by_version) - set(retired)
+    ))
     drift = tuple(sorted(
         version
         for version in set(applied_by_version) & set(expected_by_version)
@@ -389,6 +397,7 @@ def _production_identity(cursor, expected_migrations):
             "applied": len(applied),
         },
         "pending_migrations": pending,
+        "retired_migrations": retired,
         "unknown_migrations": unknown,
         "checksum_drift": drift,
         "v3_migrations": {

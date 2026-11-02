@@ -11,7 +11,11 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from realtime.migrations import V2_MIGRATIONS_DIR, load_realtime_migrations
+from realtime.migrations import (
+    V2_MIGRATIONS_DIR,
+    is_retired_realtime_migration,
+    load_realtime_migrations,
+)
 
 
 REQUIRED_RELATIONS = (
@@ -273,6 +277,24 @@ INTEGRITY_CHECKS = {
 }
 
 
+def _migration_mismatches(
+    expected_migrations: dict[str, str],
+    stored_migrations: dict[str, str],
+) -> list[str]:
+    return sorted(
+        version
+        for version, checksum in expected_migrations.items()
+        if stored_migrations.get(version) != checksum
+    ) + sorted(
+        version
+        for version in set(stored_migrations) - set(expected_migrations)
+        if not is_retired_realtime_migration(
+            version,
+            stored_migrations[version],
+        )
+    )
+
+
 def validate() -> dict[str, object]:
     from database import get_db_cursor
 
@@ -307,14 +329,9 @@ def validate() -> dict[str, object]:
                 str(row["version"]): str(row["checksum_sha256"])
                 for row in cursor.fetchall()
             }
-            migration_mismatches = sorted(
-                version
-                for version, checksum in expected_migrations.items()
-                if stored_migrations.get(version) != checksum
-            ) + sorted(
-                version
-                for version in set(stored_migrations)
-                - set(expected_migrations)
+            migration_mismatches = _migration_mismatches(
+                expected_migrations,
+                stored_migrations,
             )
             cursor.execute(
                 "SELECT rolname FROM pg_roles WHERE rolname=ANY(%s)",

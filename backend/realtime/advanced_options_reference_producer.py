@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
+from types import SimpleNamespace
 from typing import Callable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -1455,6 +1456,79 @@ def _load_valuations(
                 valid_until=plan.valid_until,
             ))
     return tuple(valuations), missing
+
+
+def load_opening_reference_inputs_cursor(
+    cursor,
+    *,
+    session_date: date,
+    known_at: datetime,
+    valid_until: datetime,
+    underlyings: tuple[str, ...],
+    contracts,
+    spots: dict[str, tuple[Decimal, UUID]],
+    history_cohort_id: UUID,
+    model_bundle_sha256: str,
+    valuation_policy_sha256: str,
+    model_version: str = "black-scholes-merton-v1",
+):
+    """Read HV, valuation and metric inputs for an opening reference state.
+
+    Session activation has no enrollment plan yet, so this supplies only the
+    scope the producer's own readers use. Requires a dictionary cursor.
+    """
+    scope = SimpleNamespace(
+        control_plane=SimpleNamespace(
+            session_date=session_date,
+            universe=SimpleNamespace(option_underlyings=underlyings),
+            pins=SimpleNamespace(
+                model_bundle_sha256=model_bundle_sha256,
+                valuation_policy_sha256=valuation_policy_sha256,
+            ),
+        ),
+        enrollment=SimpleNamespace(
+            activity_selection=SimpleNamespace(contracts=contracts),
+        ),
+        known_at=known_at,
+        valid_until=valid_until,
+        history_source_cohort_id=history_cohort_id,
+        treasury_freshness_policy=_TREASURY_FRESHNESS_POLICY,
+        dividend_maximum_age_seconds=_DIVIDEND_MAXIMUM_AGE_SECONDS,
+        model_version=model_version,
+    )
+    evidence: list[AdvancedOptionsReferenceProducerEvidence] = []
+    curve, rate_date = _load_treasury_curve(cursor, scope, evidence)
+    volatility, metrics, metric_missing = _load_bars_and_metrics(
+        cursor,
+        scope,
+        spots,
+        evidence,
+    )
+    valuations, valuation_missing = (
+        _load_valuations(
+            cursor,
+            scope,
+            tuple(
+                {"contract_ticker": row.contract_ticker}
+                for row in contracts
+            ),
+            spots,
+            curve,
+            rate_date,
+            evidence,
+        )
+        if curve and rate_date is not None
+        else ((), True)
+    )
+    missing = tuple(sorted({
+        reason
+        for row in evidence
+        if not _accepted_unavailable_metric(row)
+        for reason in row.reason_codes
+    }))
+    if metric_missing or valuation_missing or not curve:
+        return (), (), (), missing or ("REFERENCE_INPUTS_INCOMPLETE",)
+    return volatility, valuations, metrics, missing
 
 
 def assemble_advanced_options_reference_state_cursor(

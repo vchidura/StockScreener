@@ -1,12 +1,15 @@
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from urllib.parse import urlparse
 from uuid import UUID
 
 import pytest
 
 from realtime.advanced_equity_preparation import (
     AdvancedEquityPreparationResident,
+    BoundedPolygonEquityPreparationClient,
     EquityPreparationChunk,
     EquityPreparationClaim,
     EquityPreparationFetchRequest,
@@ -246,6 +249,235 @@ def test_adjusted_extension_chunks_use_provider_bucket_boundaries(
         f"{interval}:ADJUSTED": 1,
     }
     assert len(chunk.bars) == 1
+
+
+class _JsonResponse:
+    status_code = 200
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def json(self):
+        return self.payload
+
+
+class _WholeMarketPaginatingSession:
+    """Paginates corporate actions forever unless the ticker filter is sent."""
+
+    def __init__(self, overview):
+        self.overview = overview
+        self.calls = []
+
+    def get(self, url, *, params, headers, timeout):
+        self.calls.append((urlparse(url).path, dict(params)))
+        path = urlparse(url).path
+        if path.startswith("/v3/reference/tickers/"):
+            return _JsonResponse({"results": self.overview})
+        if params.get("ticker") == self.overview["ticker"]:
+            return _JsonResponse({"results": []})
+        return _JsonResponse({
+            "results": [{"ticker": "ZZZ"}],
+            "next_url": f"https://api.massive.com{path}?cursor=next",
+        })
+
+
+def _reference_chunk(overview):
+    session = _WholeMarketPaginatingSession(overview)
+    source = MassiveEquityPreparationSource(
+        BoundedPolygonEquityPreparationClient("test-key", session=session)
+    )
+    chunk = source.fetch(
+        EquityPreparationFetchRequest(
+            _claim(
+                ticker=overview["ticker"],
+                stage=EquityPreparationStage.REFERENCE,
+                stage_order=10,
+                security_id=None,
+                target={
+                    "history_through_session": "2026-10-30",
+                    "window_start": "2026-05-03",
+                    "window_end": "2026-10-30",
+                },
+            ),
+            datetime(2026, 11, 2, 12, 0, tzinfo=UTC),
+            EquityPreparationLimits(),
+        )
+    )
+    return chunk, session.calls
+
+
+ETF_OVERVIEW = {"ticker": "SPY", "type": "ETF", "active": True}
+STOCK_OVERVIEW = {
+    "ticker": "AAPL",
+    "type": "CS",
+    "active": True,
+    "sic_code": "3571",
+}
+
+
+@pytest.mark.parametrize("overview", (ETF_OVERVIEW, STOCK_OVERVIEW))
+def test_reference_chunk_needs_exactly_three_ticker_filtered_requests(overview):
+    chunk, calls = _reference_chunk(overview)
+
+    assert chunk.complete is True
+    assert chunk.provider_requests == 3
+    assert [path for path, _params in calls] == [
+        f"/v3/reference/tickers/{overview['ticker']}",
+        "/stocks/v1/splits",
+        "/stocks/v1/dividends",
+    ]
+    assert calls[1][1]["ticker"] == overview["ticker"]
+    assert calls[2][1]["ticker"] == overview["ticker"]
+    assert chunk.coverage_after["corporate_actions_ready"] is True
+
+
+def test_reference_chunk_fails_closed_on_filtered_corporate_action_drift():
+    class DriftingSession(_WholeMarketPaginatingSession):
+        def get(self, url, *, params, headers, timeout):
+            if "splits" in url:
+                return _JsonResponse({"results": [{"ticker": "ZZZ"}]})
+            return super().get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=timeout,
+            )
+
+    source = MassiveEquityPreparationSource(
+        BoundedPolygonEquityPreparationClient(
+            "test-key",
+            session=DriftingSession(ETF_OVERVIEW),
+        )
+    )
+    with pytest.raises(
+        EquityPreparationSourceError,
+        match="REFERENCE_SOURCE_REQUEST_FAILED",
+    ):
+        source.fetch(
+            EquityPreparationFetchRequest(
+                _claim(
+                    ticker="SPY",
+                    stage=EquityPreparationStage.REFERENCE,
+                    stage_order=10,
+                    security_id=None,
+                    target={
+                        "history_through_session": "2026-10-30",
+                        "window_start": "2026-05-03",
+                        "window_end": "2026-10-30",
+                    },
+                ),
+                datetime(2026, 11, 2, 12, 0, tzinfo=UTC),
+                EquityPreparationLimits(),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("overview", "sector_ready", "sector_not_applicable"),
+    (
+        (ETF_OVERVIEW, False, True),
+        ({**ETF_OVERVIEW, "ticker": "VIX", "type": "INDEX"}, False, True),
+        (STOCK_OVERVIEW, True, False),
+        ({**STOCK_OVERVIEW, "sic_code": None}, False, False),
+    ),
+)
+def test_reference_coverage_records_sector_applicability_explicitly(
+    overview,
+    sector_ready,
+    sector_not_applicable,
+):
+    chunk, _calls = _reference_chunk(overview)
+
+    assert chunk.coverage_after["sector_ready"] is sector_ready
+    assert (
+        chunk.coverage_after["sector_not_applicable"]
+        is sector_not_applicable
+    )
+
+
+def _warmup_request(reference_coverage):
+    stage_rows = [
+        ("REFERENCE", "COMPLETE", reference_coverage),
+        (
+            "ADJUSTED_DAILY",
+            "COMPLETE",
+            {"available_intervals": {"1d:ADJUSTED": 2}},
+        ),
+        ("NATIVE_INTRADAY", "COMPLETE", {"available_intervals": {}}),
+        (
+            "DERIVED_INTERVALS",
+            "COMPLETE",
+            {"available_intervals": {"1h:RAW_UNADJUSTED": 2}},
+        ),
+    ]
+    cursor = MagicMock()
+    cursor.fetchall.return_value = stage_rows
+
+    @contextmanager
+    def transaction(*_args, **_kwargs):
+        yield SimpleNamespace(cursor=cursor)
+
+    resident = AdvancedEquityPreparationResident(
+        SimpleNamespace(transaction=transaction),
+        MagicMock(),
+        owner_id=UUID(int=9),
+    )
+    return resident._warmup(
+        EquityPreparationFetchRequest(
+            _claim(
+                ticker="SPY",
+                stage=EquityPreparationStage.TECHNICAL_WARMUP,
+                stage_order=50,
+                target={
+                    "required_adjusted_daily_bars": 2,
+                    "required_derived_hourly_bars": 2,
+                    "required_adjusted_intervals": {},
+                    "declared_products": ["EQUITY_BARS"],
+                },
+            ),
+            datetime(2026, 11, 2, 12, 0, tzinfo=UTC),
+            EquityPreparationLimits(),
+        )
+    )
+
+
+def test_warmup_accepts_recorded_sector_not_applicable_member():
+    chunk = _warmup_request({
+        "sector_ready": False,
+        "sector_not_applicable": True,
+        "corporate_actions_ready": True,
+    })
+
+    assert chunk.complete is True
+    assert chunk.coverage_after["sector_ready"] is False
+    assert chunk.coverage_after["sector_not_applicable"] is True
+
+
+def test_warmup_keeps_sector_requirement_for_stocks_and_old_coverage():
+    with pytest.raises(
+        EquityPreparationUnavailableError,
+        match="SECTOR_REFERENCE_UNAVAILABLE",
+    ):
+        _warmup_request({
+            "sector_ready": False,
+            "sector_not_applicable": False,
+            "corporate_actions_ready": True,
+        })
+    with pytest.raises(
+        EquityPreparationUnavailableError,
+        match="SECTOR_REFERENCE_UNAVAILABLE",
+    ):
+        _warmup_request({
+            "sector_ready": False,
+            "corporate_actions_ready": True,
+        })
+    chunk = _warmup_request({
+        "sector_ready": True,
+        "sector_not_applicable": False,
+        "corporate_actions_ready": True,
+    })
+    assert chunk.coverage_after["sector_ready"] is True
+    assert chunk.coverage_after["sector_not_applicable"] is False
 
 
 def test_preparation_chunk_enforces_request_byte_fact_and_watermark_bounds():

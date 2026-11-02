@@ -519,7 +519,11 @@ def _prepare_session_authority(
                 index + 1,
                 contract.catalog_version_id,
             )
-            for index, contract in enumerate(admission.contracts)
+            # Readiness slots are in ticker order, and priority is hashed.
+            for index, contract in enumerate(sorted(
+                admission.contracts,
+                key=lambda row: row.contract_ticker,
+            ))
             for channel in (MarketChannel.QUOTE, MarketChannel.TRADE)
         ),
     )

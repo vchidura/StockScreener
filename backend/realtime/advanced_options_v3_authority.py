@@ -329,6 +329,16 @@ class ProspectiveOpeningContract:
             )
 
 
+def _opening_contract_order(row: ProspectiveOpeningContract) -> tuple:
+    return (
+        row.underlyer,
+        row.contract_type,
+        row.expiration_date,
+        row.strike,
+        row.contract_ticker,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ProspectiveOpeningAdmission:
     admission_id: UUID
@@ -351,16 +361,7 @@ class ProspectiveOpeningAdmission:
     def __post_init__(self) -> None:
         prepared = _utc(self.prepared_at, "prepared_at")
         boundary = _utc(self.capture_boundary, "capture_boundary")
-        contracts = tuple(sorted(
-            self.contracts,
-            key=lambda row: (
-                row.underlyer,
-                row.contract_type,
-                row.expiration_date,
-                row.strike,
-                row.contract_ticker,
-            ),
-        ))
+        contracts = tuple(sorted(self.contracts, key=_opening_contract_order))
         reasons = tuple(dict.fromkeys(
             _text(value, "reason_code", maximum=96).upper()
             for value in self.reason_codes
@@ -600,6 +601,7 @@ def _opening_admission(
 ) -> ProspectiveOpeningAdmission:
     if not isinstance(policy, ProspectiveOpeningAdmissionPolicy):
         raise TypeError("prospective opening policy is invalid")
+    contracts = tuple(sorted(contracts, key=_opening_contract_order))
     unsigned = ProspectiveOpeningAdmission.__new__(ProspectiveOpeningAdmission)
     object.__setattr__(unsigned, "admission_id", UUID(int=1))
     object.__setattr__(unsigned, "admission_sha256", "0" * 64)

@@ -196,13 +196,33 @@ def test_refresh_retry_schedule_waits_for_open_and_caps_backoff():
         )
     )
 
-    assert preopen_retry == CHECKED + timedelta(hours=2)
+    assert preopen_retry == CHECKED + timedelta(hours=2, seconds=90)
     assert preopen_backoff == 30
     assert open_retry == CHECKED + timedelta(
         hours=3,
         seconds=300,
     )
     assert open_backoff == 300
+    for after_open_seconds, expected_after_open_seconds in (
+        (10, 90),
+        (60, 90),
+        (80, 110),
+    ):
+        just_after_open, _backoff = (
+            advanced_options_preparation_retry_schedule(
+                session_date=CHECKED.date(),
+                requested_at=CHECKED + timedelta(
+                    hours=2,
+                    seconds=after_open_seconds,
+                ),
+                attempt=1,
+                calendar=_Calendar(),
+            )
+        )
+        assert just_after_open == CHECKED + timedelta(
+            hours=2,
+            seconds=expected_after_open_seconds,
+        )
 
 
 def test_newer_session_supersedes_only_older_unfinished_work():

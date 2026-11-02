@@ -6,6 +6,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import pytest
 from psycopg2.extras import Json
 
+from realtime import advanced_equity_preparation as preparation_module
 from equity.domain import (
     BarAvailabilityMode,
     BarSessionScope,
@@ -89,6 +90,23 @@ DESIRED_CHANGE_AT = datetime(2026, 10, 30, 21, 0, tzinfo=UTC)
 WORK_AT = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
 HISTORY_SESSION = date(2026, 10, 30)
 EFFECTIVE_SESSION = date(2026, 11, 2)
+
+
+@pytest.fixture(autouse=True)
+def _derivation_reads_stored_bars_at_the_wall_clock(monkeypatch):
+    # WORK_AT is a fixed simulated clock, but bar created_at is the database wall
+    # clock, so stored facts would look future-dated once the real date passes it.
+    original = preparation_module.load_current_five_minute_facts_cursor
+
+    def wall_clock_read(cursor, **scope):
+        scope["checked_at"] = max(scope["checked_at"], datetime.now(UTC))
+        return original(cursor, **scope)
+
+    monkeypatch.setattr(
+        preparation_module,
+        "load_current_five_minute_facts_cursor",
+        wall_clock_read,
+    )
 
 
 def _provider(pool):
@@ -255,10 +273,12 @@ class _FakeSource:
         retry_adjusted_once=False,
         retry_native_at_offset=None,
         block_reference=False,
+        reference_failures=0,
     ):
         self.retry_adjusted_once = retry_adjusted_once
         self.retry_native_at_offset = retry_native_at_offset
         self.block_reference = block_reference
+        self.reference_failures = reference_failures
         self.calls = []
         self.native_offsets = []
 
@@ -277,6 +297,13 @@ class _FakeSource:
             }),
         }
         if stage is EquityPreparationStage.REFERENCE:
+            if self.reference_failures:
+                self.reference_failures -= 1
+                raise EquityPreparationSourceError(
+                    "FAKE_REFERENCE_CEILING",
+                    provider_requests=3,
+                    response_bytes=64,
+                )
             if self.block_reference:
                 raise EquityPreparationBlockedError(
                     "REFERENCE_IDENTITY_BLOCKED"
@@ -1253,6 +1280,57 @@ def test_member_ready_after_activation_rolls_to_following_session():
                     ),
                 )
                 assert cursor.fetchone()[0] == 2
+        finally:
+            pool.putconn(connection)
+
+
+def test_reference_work_resumes_after_repeated_failures_without_a_reset():
+    with disposable_v2_database(
+        f"test_realtime_v2_c4_resume_{uuid4().hex[:8]}"
+    ) as pool:
+        _baseline, desired = _setup_desired_change(pool)
+        source = _FakeSource(reference_failures=3)
+        clock = [WORK_AT]
+
+        def run_once():
+            return AdvancedEquityPreparationResident(
+                _provider(pool),
+                source,
+                owner_id=uuid4(),
+                clock=lambda: clock[0],
+            ).run_once()
+
+        for attempt in (1, 2, 3):
+            failed = run_once()
+            assert (failed.status, failed.stage, failed.attempts) == (
+                "RETRY",
+                "REFERENCE",
+                attempt,
+            )
+            clock[0] = failed.next_retry_at
+        resumed = run_once()
+
+        assert (resumed.status, resumed.stage, resumed.attempts) == (
+            "COMPLETE",
+            "REFERENCE",
+            4,
+        )
+        assert run_once().stage == "ADJUSTED_DAILY"
+        connection = pool.getconn()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT count(*),"
+                    "count(*) FILTER (WHERE state='RESERVED') "
+                    "FROM rt.provider_request_ledger "
+                    "WHERE authorization_reference LIKE %s "
+                    "AND lane='REFERENCE'",
+                    (
+                        "equity-preparation:"
+                        f"{desired.revision.revision_id}:%",
+                    ),
+                )
+                assert cursor.fetchone() == (12, 0)
         finally:
             pool.putconn(connection)
 

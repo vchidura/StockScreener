@@ -76,6 +76,7 @@ PREPARATION_STAGES = (
     "DERIVED_INTERVALS",
     "TECHNICAL_WARMUP",
 )
+SECTOR_NOT_APPLICABLE_ASSET_TYPES = frozenset({"ETF", "INDEX"})
 
 
 class EquityPreparationStage(str, Enum):
@@ -1246,17 +1247,17 @@ class MassiveEquityPreparationSource:
                 )
             ),
             fetch_splits=(
-                lambda ticker, start, end: tuple(
-                    row
-                    for row in self.client.fetch_splits(start, end)
-                    if str(row.get("ticker") or "").upper() == ticker
+                lambda ticker, start, end: self.client.fetch_splits(
+                    start,
+                    end,
+                    ticker=ticker,
                 )
             ),
             fetch_dividends=(
-                lambda ticker, start, end: tuple(
-                    row
-                    for row in self.client.fetch_dividends(start, end)
-                    if str(row.get("ticker") or "").upper() == ticker
+                lambda ticker, start, end: self.client.fetch_dividends(
+                    start,
+                    end,
+                    ticker=ticker,
                 )
             ),
             fetch_option_catalog=no_options,
@@ -1302,8 +1303,13 @@ class MassiveEquityPreparationSource:
             fact.relation
             for fact in generation.facts
         }
+        security_values = dict(security.values)
         coverage = {
-            "sector_ready": bool(dict(security.values).get("sector")),
+            "sector_ready": bool(security_values.get("sector")),
+            "sector_not_applicable": (
+                security_values.get("asset_type")
+                in SECTOR_NOT_APPLICABLE_ASSET_TYPES
+            ),
             "corporate_actions_ready": (
                 ReferenceFactRelation.CORPORATE_ACTION_COVERAGE
                 in coverage_relations
@@ -1963,7 +1969,10 @@ class AdvancedEquityPreparationResident:
             "required adjusted intervals",
         )
         reasons = []
-        if not reference.get("sector_ready"):
+        if not (
+            reference.get("sector_ready")
+            or reference.get("sector_not_applicable")
+        ):
             reasons.append("SECTOR_REFERENCE_UNAVAILABLE")
         if not reference.get("corporate_actions_ready"):
             reasons.append("CORPORATE_ACTION_COVERAGE_UNAVAILABLE")
@@ -1984,7 +1993,10 @@ class AdvancedEquityPreparationResident:
                 **daily,
                 **derived,
             },
-            "sector_ready": True,
+            "sector_ready": bool(reference.get("sector_ready")),
+            "sector_not_applicable": bool(
+                reference.get("sector_not_applicable")
+            ),
             "corporate_actions_ready": True,
             "declared_products": claim.target["declared_products"],
             "technical_warmup": {

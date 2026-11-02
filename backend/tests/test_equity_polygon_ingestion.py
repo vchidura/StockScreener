@@ -153,6 +153,21 @@ def test_client_fetches_bounded_splits_and_dividends():
     assert session.calls[0][1]["execution_date.lte"] == "2024-01-31"
     assert session.calls[1][1]["ex_dividend_date.gte"] == "2024-01-01"
     assert session.calls[1][1]["ex_dividend_date.lte"] == "2024-01-31"
+    assert "ticker" not in session.calls[0][1]
+    assert "ticker" not in session.calls[1][1]
+
+
+def test_client_sends_optional_corporate_action_ticker_filter():
+    session = FakeSession([
+        FakeResponse({"results": []}), FakeResponse({"results": []}),
+    ])
+    client = PolygonEquityClient("test-key", session=session)
+
+    client.fetch_splits(date(2024, 1, 1), date(2024, 1, 31), ticker="aapl")
+    client.fetch_dividends(date(2024, 1, 1), date(2024, 1, 31), ticker="aapl")
+
+    assert session.calls[0][1]["ticker"] == "AAPL"
+    assert session.calls[1][1]["ticker"] == "AAPL"
 
 
 def test_normalized_split_is_replay_explicit_and_idempotent():

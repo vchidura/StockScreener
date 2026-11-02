@@ -573,9 +573,20 @@ Status: **NOT CODE_READY for the recorded universe; NOT READY_FOR_SUPERVISED_RUN
 
 Evidence matrix, decisions and first-run plan:
 [ADVANCED_REALTIME_V3_FIRST_RUN_READINESS_2026-11-02.md](../ADVANCED_REALTIME_V3_FIRST_RUN_READINESS_2026-11-02.md).
-Earliest realistic first session: Tuesday 2026-11-03, after authorized fixes.
+Section 11 holds the implementation brief and its status.
 
-Blockers, in execution order:
+Implementation status: items 1-9 are done in the working tree on `0b1e009`, not
+committed or deployed, and there is no live evidence. B2-B5 and D1/D4 have code
+fixes; B1 still needs the live migration; B6-B8 remain. Migration chain is now 046,
+with the old 045 ledger row accepted only by exact version and full checksum. The
+full-size Options test reached `ACTIVE` after five activation defects were fixed
+(contract-order identity in three places, slot priority order, and an empty
+reference state). New go-live items: the live Treasury curve ends 2026-10-29 and
+must reach 2026-10-30 before activation; no Compose role attaches per-E downstream
+bindings, so expect no Options WINDOW or products; roles after a real automatic
+activation are unexercised. Warmup is 4,401 chunks, estimated 25-45 min.
+
+Blockers as found by the review, in execution order:
 
 - B1: the live ledger records `045_advanced_options_detector_allocation`, whose file
   no longer exists; the tree's 045 differs. Planner, status and audit all fail.

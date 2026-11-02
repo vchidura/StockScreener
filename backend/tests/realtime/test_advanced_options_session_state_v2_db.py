@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import json
+import math
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 from options.calendar import OptionExchangeCalendar
+from options.data.polygon_http import PolygonHttpResponse
 from psycopg2 import errors
 from psycopg2.extras import Json
 
@@ -57,6 +61,7 @@ from realtime.advanced_realtime_desired_state import (
 from scripts.report_advanced_realtime_v3_status import (
     build_advanced_realtime_v3_status_cursor,
 )
+from realtime import advanced_options_automatic_preparation as preparation_module
 from realtime import advanced_options_session_state as session_state_module
 from realtime.advanced_options_v3_authority import (
     AdvancedOptionsAuthorityBundle,
@@ -73,6 +78,7 @@ from realtime.advanced_options_v3_authority import (
 from realtime.contracts import (
     EQUITY_VALIDATION_UNIVERSE,
     MarketChannel,
+    UniverseManifest,
     canonical_sha256,
 )
 from realtime.database_access_v2 import (
@@ -97,9 +103,13 @@ from realtime.acquisition_ledger import (
     ProviderRequestReservation,
 )
 from realtime.reference_adapters import (
+    _corporate_action_coverage_fact,
     _security_id as reference_security_id,
 )
+from realtime.reference_repository import persist_reference_facts_cursor
+from realtime.reference_service import ReferenceSeedRequest
 from realtime.advanced_options_reference_repository import (
+    PostgresAdvancedOptionsReferenceStateRepository,
     persist_advanced_options_reference_state_cursor,
 )
 from realtime.advanced_options_reference_state import (
@@ -2375,6 +2385,515 @@ def test_c8_real_executor_uses_v2_allocation_for_generalized_membership():
         assert restarted is not None
         assert first.generation_sha256 == generation[0]
         assert restarted.generation_sha256 == first.generation_sha256
+
+
+FULL_SIZE_SPOTS = {"QQQ": 600, "SPY": 680}
+FULL_SIZE_CHAIN_ROWS = {"QQQ": 3_840, "SPY": 4_352}
+
+
+def _seed_c8_minute_spots(cursor, seed):
+    calendar = OptionExchangeCalendar("XNYS")
+    session = calendar.trailing_sessions_before(SESSION_DATE, 1)[-1]
+    closed = calendar.session_close(session)
+    opened = closed - timedelta(minutes=1)
+    cursor.execute(
+        "SELECT intent.ticker,binding.security_id::text,"
+        "binding.instrument_id "
+        "FROM rt.realtime_desired_member_intents AS intent "
+        "JOIN rt.realtime_desired_member_bindings AS binding "
+        "USING(intent_id) "
+        "WHERE intent.ticker=ANY(%s) "
+        "AND intent.member_kind='EQUITY'",
+        (list(FULL_SIZE_SPOTS),),
+    )
+    instruments = tuple(cursor.fetchall())
+    stream_session = uuid4()
+    cursor.execute(
+        "INSERT INTO rt.stream_sessions ("
+        "session_id,provider,feed,manifest_id,owner_id,owner_epoch,"
+        "started_at,ended_at,status"
+        ") VALUES (%s,'c8-provider-free','STOCKS',%s,%s,1,%s,%s,"
+        "'STOPPED')",
+        (
+            str(stream_session),
+            str(seed["desired_manifest_id"]),
+            str(uuid4()),
+            opened,
+            closed,
+        ),
+    )
+    for source_offset, (ticker, security_id, instrument_id) in enumerate(
+        instruments,
+        start=1,
+    ):
+        spot = FULL_SIZE_SPOTS[str(ticker)]
+        revision_id = uuid4()
+        cursor.execute(
+            "INSERT INTO rt.bar_catalog ("
+            "bar_revision_id,cohort_id,provider_tier,instrument_id,"
+            "interval,bar_start,bar_end,observed_at,session_date"
+            ") VALUES (%s,%s,'MASSIVE_ADVANCED',%s,'1m',%s,%s,%s,%s)",
+            (
+                str(revision_id),
+                str(seed["desired_cohort_id"]),
+                int(instrument_id),
+                opened,
+                closed,
+                closed,
+                session,
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO rt.bar_revisions ("
+            "bar_revision_id,cohort_id,provider_tier,"
+            "security_id,instrument_id,ticker,interval,"
+            "session_date,session_scope,adjustment_basis,"
+            "bar_start,bar_end,open_price,high_price,"
+            "low_price,close_price,volume,vwap,"
+            "transaction_count,source_kind,"
+            "availability_mode,is_final,observed_at,"
+            "replay_available_at,journal_generation,"
+            "stream_session_id,source_offset,payload_sha256,"
+            "created_at"
+            ") VALUES (%s,%s,'MASSIVE_ADVANCED',%s,%s,%s,"
+            "'1m',%s,'RTH','RAW_UNADJUSTED',%s,%s,%s,%s,%s,%s,"
+            "1000000,%s,100,'REALTIME_STREAM',"
+            "'HISTORICAL_RECONSTRUCTED',true,%s,%s,%s,%s,"
+            "%s,%s,%s)",
+            (
+                str(revision_id),
+                str(seed["desired_cohort_id"]),
+                str(security_id),
+                int(instrument_id),
+                str(ticker),
+                session,
+                opened,
+                closed,
+                spot,
+                spot,
+                spot,
+                spot,
+                spot,
+                closed,
+                closed,
+                str(uuid4()),
+                str(stream_session),
+                source_offset,
+                _digest(f"c8-minute-spot:{ticker}"),
+                closed,
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO rt.bar_current ("
+            "cohort_id,provider_tier,instrument_id,interval,"
+            "bar_start,session_scope,adjustment_basis,"
+            "source_kind,bar_revision_id,bar_end,observed_at,"
+            "updated_at"
+            ") VALUES (%s,'MASSIVE_ADVANCED',%s,'1m',%s,"
+            "'RTH','RAW_UNADJUSTED','REALTIME_STREAM',%s,%s,%s,%s)",
+            (
+                str(seed["desired_cohort_id"]),
+                int(instrument_id),
+                opened,
+                str(revision_id),
+                closed,
+                closed,
+                closed,
+            ),
+        )
+
+
+def _seed_c8_treasury_curve(cursor, rate_date, *, received_at=None):
+    received_at = received_at or OptionExchangeCalendar("XNYS").session_open(
+        SESSION_DATE
+    ) - timedelta(hours=2)
+    for tenor_days, annual_rate in (
+        (30, "0.0410"),
+        (60, "0.0405"),
+        (90, "0.0400"),
+        (180, "0.0390"),
+        (365, "0.0380"),
+    ):
+        cursor.execute(
+            "INSERT INTO ref.risk_free_rate_observations ("
+            "observation_id,rate_date,tenor_days,annual_rate,source,"
+            "source_key,source_observed_at,received_at,payload_sha256"
+            ") VALUES (%s,%s,%s,%s,'us_treasury_par_yield_v1',%s,%s,%s,%s)",
+            (
+                str(uuid4()),
+                rate_date,
+                tenor_days,
+                annual_rate,
+                f"{rate_date.isoformat()}:{tenor_days}d",
+                received_at - timedelta(minutes=1),
+                received_at,
+                _digest(f"c8-treasury:{rate_date}:{tenor_days}"),
+            ),
+        )
+
+
+def _seed_c8_dividend_coverage(cursor):
+    """What the Equity REFERENCE stage leaves for each Options underlying."""
+    calendar = OptionExchangeCalendar("XNYS")
+    rate_date = calendar.previous_session_date(SESSION_DATE)
+    received_at = calendar.session_open(SESSION_DATE) - timedelta(hours=2)
+    request = ReferenceSeedRequest(
+        universe=UniverseManifest(
+            version="c8-reference-inputs",
+            equity_tickers=tuple(FULL_SIZE_SPOTS),
+            option_underlyings=(),
+        ),
+        session_date=rate_date,
+        created_at=received_at,
+        effective_at=received_at,
+        valid_until=received_at + timedelta(days=7),
+    )
+    persist_reference_facts_cursor(
+        cursor,
+        tuple(
+            _corporate_action_coverage_fact(
+                ticker,
+                action_type,
+                (),
+                rate_date - timedelta(days=180),
+                rate_date + timedelta(days=365),
+                request,
+            )
+            for ticker in FULL_SIZE_SPOTS
+            for action_type in ("SPLIT", "DIVIDEND")
+        ),
+    )
+
+
+def _full_size_chain(ticker, quote_at, *, underlying_at):
+    spot = FULL_SIZE_SPOTS[ticker]
+    quote_ns = int(quote_at.timestamp() * 1_000_000_000)
+    underlying_ns = int(underlying_at.timestamp() * 1_000_000_000)
+    expirations = tuple(
+        SESSION_DATE + timedelta(days=days)
+        for days in range(22)
+        if (SESSION_DATE + timedelta(days=days)).weekday() < 5
+    )
+    rows = []
+    for expiration in expirations:
+        for strike in range(int(spot * 0.9) + 1, int(spot * 1.1) + 1):
+            distance = (strike - spot) / spot
+            for option_type, side, signed in (
+                ("call", "C", -distance),
+                ("put", "P", distance),
+            ):
+                delta = 1 / (1 + math.exp(-signed * 40))
+                midpoint = max(0.05, delta * spot * 0.03)
+                half_spread = 0.01 + 0.002 * midpoint + 0.5 * abs(distance)
+                rows.append({
+                    "break_even_price": strike + midpoint,
+                    "day": {
+                        "volume": 500 if abs(distance) < 0.03 else 5,
+                        "last_updated": quote_ns,
+                    },
+                    "details": {
+                        "contract_type": option_type,
+                        "exercise_style": "american",
+                        "expiration_date": expiration.isoformat(),
+                        "shares_per_contract": 100,
+                        "strike_price": strike,
+                        "ticker": (
+                            f"O:{ticker}{expiration:%y%m%d}{side}"
+                            f"{strike * 1000:08d}"
+                        ),
+                    },
+                    "greeks": {
+                        "delta": round(
+                            delta if side == "C" else -delta,
+                            4,
+                        ),
+                        "gamma": 0.01,
+                        "theta": -0.1,
+                        "vega": 0.2,
+                    },
+                    "implied_volatility": 0.2,
+                    "last_quote": {
+                        "bid": round(max(0.01, midpoint - half_spread), 2),
+                        "ask": round(midpoint + half_spread, 2),
+                        "last_updated": quote_ns,
+                    },
+                    "open_interest": 1_000,
+                    "underlying_asset": {
+                        "ticker": ticker,
+                        "price": spot,
+                        "last_updated": underlying_ns,
+                        "timeframe": "REAL-TIME",
+                    },
+                })
+    rows.sort(key=lambda row: row["details"]["ticker"])
+    return rows
+
+
+class _FullSizeChainTransport:
+    """Serves one 250-row page per call, as the provider does."""
+
+    instances = []
+
+    def __init__(self, *_args, **_kwargs):
+        self.rows = None
+        self.offset = 0
+        self.calls = 0
+        self.bytes = 0
+        type(self).instances.append(self)
+
+    def get(self, url, params):
+        ticker = urlsplit(url).path.rsplit("/", 1)[1]
+        if self.rows is None:
+            self.ticker = ticker
+            self.params = dict(params)
+            self.rows = self.chain_for(ticker)
+        self.calls += 1
+        page = self.rows[self.offset:self.offset + 250]
+        self.offset += 250
+        document = {
+            "status": "OK",
+            "request_id": f"provider-free-{ticker}-{self.calls}",
+            "results": page,
+        }
+        if self.offset < len(self.rows):
+            document["next_url"] = (
+                f"https://api.massive.com/v3/snapshot/options/{ticker}"
+                f"?cursor={self.offset}"
+            )
+        body = json.dumps(document).encode("utf-8")
+        self.bytes += len(body)
+        return PolygonHttpResponse(status_code=200, body=body)
+
+
+def test_c8_real_executor_activates_from_full_size_paginated_chains(
+    monkeypatch,
+):
+    calendar = OptionExchangeCalendar("XNYS")
+    prior_close = calendar.session_close(
+        calendar.trailing_sessions_before(SESSION_DATE, 1)[-1]
+    )
+    captures = {ticker: 0 for ticker in FULL_SIZE_SPOTS}
+    transports = type(
+        "_Transport",
+        (_FullSizeChainTransport,),
+        {"instances": []},
+    )
+    with disposable_v2_database(
+        f"test_realtime_v2_c8_full_size_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            seed = _seed_session(
+                database_cursor,
+                options_ready=False,
+            )
+            _seed_c8_equity_history(database_cursor, seed)
+            _seed_c8_minute_spots(database_cursor, seed)
+            _seed_c8_dividend_coverage(database_cursor)
+            # As on the live ledger: the latest curve is older than the prior
+            # session, so activation must wait for it without failing terminally.
+            _seed_c8_treasury_curve(
+                database_cursor,
+                calendar.previous_session_date(
+                    calendar.previous_session_date(SESSION_DATE)
+                ),
+            )
+            checked_at = seed[
+                "authority_bundle"
+            ].session.prepared_at
+            reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=checked_at,
+            )
+            database_cursor.connection.commit()
+
+        now = {"value": checked_at}
+
+        def chain_for(_transport, ticker):
+            # First round: every quote still carries the prior close, so
+            # allocation must refresh. Second round: quotes are current.
+            captures[ticker] += 1
+            quote_at = (
+                prior_close if captures[ticker] == 1 else now["value"]
+            )
+            rows = _full_size_chain(
+                ticker,
+                quote_at,
+                underlying_at=now["value"],
+            )
+            assert len(rows) == FULL_SIZE_CHAIN_ROWS[ticker]
+            return rows
+
+        transports.chain_for = chain_for
+        monkeypatch.setattr(
+            preparation_module,
+            "RequestsPolygonHttpTransport",
+            transports,
+        )
+        provider = _provider(pool)
+        executor = PostgresAutomaticOptionsPreparationExecutor(
+            provider,
+            api_key="provider-free",
+            backend_image_id="sha256:" + "c" * 64,
+            maximum_provider_requests_per_underlying=32,
+            clock=lambda: now["value"],
+        )
+        owner_id = uuid4()
+        reports = []
+        lifecycle = None
+        replacement_received_at = None
+        frozen_capture = None
+        for attempt in range(40):
+            now["value"] = checked_at + timedelta(minutes=attempt * 10)
+            report = run_advanced_options_preparation_cycle(
+                provider,
+                executor,
+                owner_id=owner_id,
+                checked_at=now["value"],
+                clock=lambda: now["value"],
+            )
+            reports.append((
+                report["status"],
+                report.get("stage"),
+                report.get("reason"),
+            ))
+            with cursor(pool) as database_cursor:
+                if (
+                    report["status"] == "RETRY"
+                    and report["stage"] == "SESSION_ACTIVATION"
+                ):
+                    assert replacement_received_at is None
+                    replacement_received_at = now["value"] + timedelta(seconds=1)
+                    assert replacement_received_at > calendar.session_open(
+                        SESSION_DATE
+                    )
+                    database_cursor.execute(
+                        "SELECT evidence_document FROM "
+                        "rt.advanced_options_preparation_attempts "
+                        "WHERE stage='CAPACITY_SHARDS' AND state='COMPLETE' "
+                        "ORDER BY completed_at DESC LIMIT 1"
+                    )
+                    frozen_capture = database_cursor.fetchone()[0]
+                    _seed_c8_treasury_curve(
+                        database_cursor,
+                        calendar.previous_session_date(SESSION_DATE),
+                        received_at=replacement_received_at,
+                    )
+                lifecycle = reconcile_advanced_options_lifecycle_cursor(
+                    database_cursor,
+                    target_session_date=SESSION_DATE,
+                    checked_at=now["value"],
+                )
+                database_cursor.connection.commit()
+            if lifecycle is not None and lifecycle.status == "ACTIVE":
+                break
+        else:
+            raise AssertionError(
+                "full-size C8 executor did not activate: "
+                f"reports={reports!r}, lifecycle={lifecycle!r}"
+            )
+
+        assert captures == {"QQQ": 2, "SPY": 2}
+        assert {
+            transport.ticker: transport.calls
+            for transport in transports.instances
+        } == {"QQQ": 16, "SPY": 18}
+        for transport in transports.instances:
+            spot = Decimal(FULL_SIZE_SPOTS[transport.ticker])
+            assert transport.params["expiration_date.gte"] == (
+                SESSION_DATE.isoformat()
+            )
+            assert transport.params["expiration_date.lte"] == (
+                SESSION_DATE + timedelta(days=21)
+            ).isoformat()
+            assert Decimal(transport.params["strike_price.gte"]) == (
+                spot * Decimal("0.90")
+            )
+            assert Decimal(transport.params["strike_price.lte"]) == (
+                spot * Decimal("1.10")
+            )
+            assert transport.bytes < 25_000_000
+        assert any(row[0] == "REFRESH_REQUIRED" for row in reports)
+        assert [
+            row[2] for row in reports if row[0] == "RETRY"
+        ] == [
+            "opening reference inputs rejected: "
+            "Treasury curve identity, freshness, or clocks changed"
+        ]
+        with cursor(pool) as database_cursor:
+            database_cursor.execute(
+                "SELECT count(*) FROM ref.option_contracts "
+                "WHERE contract_ticker LIKE ANY(%s)",
+                (["O:QQQ%", "O:SPY%"],),
+            )
+            contract_count = int(database_cursor.fetchone()[0])
+            database_cursor.execute(
+                "SELECT state,count(*) FROM rt.provider_request_ledger "
+                "WHERE authorization_reference LIKE "
+                "'advanced-realtime-v3-options:%%' GROUP BY state"
+            )
+            ledger = {
+                str(row[0]): int(row[1])
+                for row in database_cursor.fetchall()
+            }
+            database_cursor.execute(
+                "SELECT allocation_document "
+                "FROM rt.advanced_options_selection_generations"
+            )
+            allocation = dict(database_cursor.fetchone()[0])
+            database_cursor.execute(
+                "SELECT underlying,count(*) "
+                "FROM rt.advanced_options_selection_members "
+                "GROUP BY underlying"
+            )
+            selected = dict(database_cursor.fetchall())
+
+        # Two rounds of 32 slots per underlying, inside the K*N*3 allowance.
+        assert ledger == {
+            "COMPLETE": 2 * (16 + 18),
+            "FAILED": 2 * (2 * 32 - 16 - 18),
+        }
+        assert sum(ledger.values()) <= 32 * 2 * 3
+        assert contract_count >= sum(FULL_SIZE_CHAIN_ROWS.values())
+        assert all(0 < value <= 12 for value in selected.values())
+        reference = PostgresAdvancedOptionsReferenceStateRepository(
+            _provider(pool)
+        ).load_for_session(SESSION_DATE, known_at=now["value"])
+        assert {
+            (row.ticker, row.window_sessions)
+            for row in reference.historical_volatility
+        } == {
+            (ticker, window)
+            for ticker in FULL_SIZE_SPOTS
+            for window in (20, 30)
+        }
+        assert {row.ticker for row in reference.valuation_inputs} == set(
+            FULL_SIZE_SPOTS
+        )
+        assert len(reference.equity_metrics) == 3 * len(FULL_SIZE_SPOTS)
+        assert len(reference.open_interest) == sum(selected.values())
+        assert reference.known_at == now["value"]
+        assert reference.known_at > replacement_received_at
+        assert all(
+            rate.first_observed_at == replacement_received_at
+            for valuation in reference.valuation_inputs
+            for rate in valuation.rate_observations
+        )
+        assert set(selected) == set(FULL_SIZE_SPOTS)
+        assert allocation["selected_contract_count"] == sum(
+            selected.values()
+        )
+        restarted = PostgresContinuousSessionStateRepository(
+            _provider(pool),
+            session_date=SESSION_DATE,
+        )
+        assert restarted.load_c6_selection_plan() is not None
+        acquisition = restarted.load_acquisition_binding()
+        assert len(acquisition.contract_tickers) == sum(selected.values())
+        assert restarted.load_package()["v3_admitted_contracts"]
+        assert restarted.load_preopen_session_binding(
+            restarted.load_bundle_document()
+        ) is not None
 
 
 def test_c8_stale_capture_refresh_survives_restart_before_allocation_freeze():

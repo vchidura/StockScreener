@@ -776,7 +776,7 @@ def test_market_loop_rejects_sealed_capture_outside_frozen_equity_age(
     monkeypatch.setattr(
         market_loop,
         "p8_activity_selection_capture_from_sealed",
-        lambda _capture: selection_capture,
+        lambda _capture, **_scope: selection_capture,
     )
     args = SimpleNamespace(
         equity_cutoff=market_loop.datetime(

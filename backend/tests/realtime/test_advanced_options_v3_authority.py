@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import timedelta
+from functools import partial
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid5
 from unittest.mock import MagicMock
 
 import pytest
 
+from realtime.advanced_options_acquisition_runtime import (
+    build_acquisition_binding,
+)
 from realtime.advanced_options_control_plane import (
     ADVANCED_OPTIONS_REST_LANES,
     AdvancedOptionsSocketBudget,
@@ -185,6 +189,79 @@ def test_configured_admission_round_trips_asymmetric_missing_oi():
         for row in restored.contracts
         if row.underlyer == "QQQ"
     ).open_interest is None
+
+
+def test_admission_identity_does_not_depend_on_caller_contract_order():
+    base = _admission()
+    template = base.contracts[0]
+    near_put, far_call = (
+        replace(
+            template,
+            contract_id=contract_id,
+            contract_ticker=(
+                f"O:{template.underlyer}{expiration:%y%m%d}{side}00500000"
+            ),
+            expiration_date=expiration,
+            contract_type=contract_type,
+        )
+        for contract_id, expiration, side, contract_type in (
+            (9_001, base.session_date, "P", "PUT"),
+            (9_002, base.session_date + timedelta(days=7), "C", "CALL"),
+        )
+    )
+    assert near_put.contract_ticker < far_call.contract_ticker
+
+    def admit(contracts):
+        return _opening_admission(
+            status=OpeningAdmissionStatus.READY,
+            session_date=base.session_date,
+            prepared_at=base.prepared_at,
+            capture_boundary=base.capture_boundary,
+            pre_session_selection_id=base.pre_session_selection_id,
+            pre_session_selection_sha256=(
+                base.pre_session_selection_sha256
+            ),
+            source_evidence_sha256=base.source_evidence_sha256,
+            reference_evidence_sha256=base.reference_evidence_sha256,
+            contracts=contracts,
+            policy_sha256="9" * 64,
+        )
+
+    ticker_order = admit((near_put, far_call))
+
+    assert ticker_order == admit((far_call, near_put))
+    assert [row.contract_type for row in ticker_order.contracts] == [
+        "CALL",
+        "PUT",
+    ]
+    assert (
+        prospective_opening_admission_from_payload(
+            prospective_opening_admission_payload(ticker_order)
+        )
+        == ticker_order
+    )
+
+
+def test_acquisition_binding_identity_does_not_depend_on_caller_order():
+    tickers = (
+        "O:SPY261005P00500000",
+        "O:SPY261012C00500000",
+        "O:QQQ261005C00400000",
+    )
+    build = partial(
+        build_acquisition_binding,
+        source_sha256="a" * 64,
+        backend_image_id="sha256:" + "b" * 64,
+        authority=_session_authority()[2],
+        connection_attempt_ceiling=12,
+        decoded_message_ceiling=1_000_000,
+        decoded_byte_ceiling=1_073_741_824,
+    )
+
+    binding = build(contract_tickers=tickers)
+
+    assert binding == build(contract_tickers=tuple(reversed(tickers)))
+    assert binding.contract_tickers == tuple(sorted(tickers))
 
 
 def _session_authority(cohort_id=None, *, decoded_messages=100_000):

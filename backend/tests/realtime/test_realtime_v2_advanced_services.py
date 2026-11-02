@@ -1,16 +1,27 @@
 import importlib
 import inspect
-from datetime import date, timedelta
+import os
+import re
+import shutil
+import subprocess
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from options.calendar import OptionExchangeCalendar
 
-from realtime.equity_pipeline_config import RealtimeV2PipelineConfig
+from realtime.database_access_v2 import V2ConnectionProvider
+from realtime.equity_pipeline_config import (
+    EquityPipeline,
+    OptionsPipeline,
+    RealtimeV2PipelineConfig,
+)
 from realtime.advanced_equity_lifecycle import (
     AdvancedEquityLifecyclePhase,
 )
+from realtime.advanced_equity_preparation import EquityPreparationRunResult
 from realtime.advanced_realtime_v3_runtime import (
     ADVANCED_REALTIME_V3_COMPOSE_PROFILE,
     ADVANCED_REALTIME_V3_ROLES,
@@ -24,6 +35,9 @@ equity_preparation = importlib.import_module(
 )
 options_lifecycle = importlib.import_module(
     "scripts.run_advanced_options_v3_lifecycle"
+)
+options_preparation = importlib.import_module(
+    "realtime.advanced_options_automatic_preparation"
 )
 equity_scheduler = importlib.import_module(
     "scripts.run_realtime_v2_advanced_equity_scheduler"
@@ -111,6 +125,91 @@ def test_equity_preparation_default_environment_file_is_optional(tmp_path):
         ])
 
 
+@pytest.mark.parametrize(
+    ("status", "next_retry_after_seconds", "expected_wait"),
+    (
+        ("PROGRESSED", None, equity_preparation.COMPLETED_CHUNK_PAUSE_SECONDS),
+        ("COMPLETE", None, equity_preparation.COMPLETED_CHUNK_PAUSE_SECONDS),
+        ("IDLE", None, 15.0),
+        ("LIVE_PRIORITY", None, 15.0),
+        ("BLOCKED", None, 15.0),
+        ("RETRY", 4.0, 4.0),
+        ("RETRY", 60.0, 15.0),
+    ),
+)
+def test_equity_preparation_waits_the_poll_only_without_completed_work(
+    monkeypatch,
+    status,
+    next_retry_after_seconds,
+    expected_wait,
+):
+    checked = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+    stop = SimpleNamespace(
+        waits=[],
+        is_set=lambda: bool(stop.waits),
+        set=lambda: None,
+        wait=lambda seconds: stop.waits.append(seconds),
+    )
+    resident = SimpleNamespace(
+        run_once=lambda: EquityPreparationRunResult(
+            status,
+            checked,
+            next_retry_at=(
+                None
+                if next_retry_after_seconds is None
+                else checked + timedelta(seconds=next_retry_after_seconds)
+            ),
+        )
+    )
+    monkeypatch.setattr(equity_preparation, "_now", lambda: checked)
+    monkeypatch.setattr(
+        equity_preparation,
+        "threading",
+        SimpleNamespace(Event=lambda: stop),
+    )
+    monkeypatch.setattr(
+        equity_preparation,
+        "RealtimeV2PipelineConfig",
+        SimpleNamespace(
+            from_mapping=lambda *_args, **_kwargs: SimpleNamespace(
+                equity_pipeline=EquityPipeline.MASSIVE_ADVANCED,
+                options_pipeline=OptionsPipeline.DISABLED,
+                massive_api_key="configured",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        equity_preparation,
+        "_provider",
+        lambda _config: (object(), SimpleNamespace(closeall=lambda: None)),
+    )
+    monkeypatch.setattr(
+        equity_preparation,
+        "BoundedPolygonEquityPreparationClient",
+        lambda _key: object(),
+    )
+    monkeypatch.setattr(
+        equity_preparation,
+        "MassiveEquityPreparationSource",
+        lambda _client: object(),
+    )
+    monkeypatch.setattr(
+        equity_preparation,
+        "AdvancedEquityPreparationResident",
+        lambda *_args, **_kwargs: resident,
+    )
+
+    assert equity_preparation.main([
+        "--database",
+        "stocks_realtime_v2",
+        "--confirm-database-name",
+        "stocks_realtime_v2",
+        "--execute",
+    ]) == 0
+
+    assert stop.waits == [expected_wait]
+
+
 def test_options_lifecycle_stream_ceilings_are_configurable():
     environment = {
         "REALTIME_V3_OPTIONS_CONNECTION_ATTEMPT_CEILING": "24",
@@ -146,6 +245,66 @@ def test_options_lifecycle_stream_ceilings_are_configurable():
         {},
         "REALTIME_V3_OPTIONS_ACTIVE_QUOTE_CONTRACT_BUDGET",
     ) is None
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    (
+        ({}, 32),
+        ({"REALTIME_V3_OPTIONS_EXACT_FOUR_COMPATIBILITY": "enabled"}, 4),
+        (
+            {"REALTIME_V3_OPTIONS_MAXIMUM_PROVIDER_REQUESTS_PER_UNDERLYING": ""},
+            32,
+        ),
+        (
+            {"REALTIME_V3_OPTIONS_MAXIMUM_PROVIDER_REQUESTS_PER_UNDERLYING": "20"},
+            20,
+        ),
+    ),
+)
+def test_options_discovery_request_limit_defaults_by_compatibility_mode(
+    environment,
+    expected,
+):
+    assert (
+        options_lifecycle._maximum_provider_requests_per_underlying(
+            environment
+        )
+        == expected
+    )
+
+
+def test_options_discovery_budget_scales_with_the_configured_request_limit():
+    session_date = date(2026, 11, 2)
+    executor = options_preparation.PostgresAutomaticOptionsPreparationExecutor(
+        V2ConnectionProvider.__new__(V2ConnectionProvider),
+        api_key="configured",
+        backend_image_id="sha256:" + "0" * 64,
+        maximum_provider_requests_per_underlying=(
+            options_lifecycle._maximum_provider_requests_per_underlying({})
+        ),
+        clock=lambda: datetime(2026, 11, 2, 14, 0, tzinfo=timezone.utc),
+    )
+
+    budget = executor.provider_budget(
+        SimpleNamespace(
+            stage="CATALOG_QUOTE",
+            session_date=session_date,
+            revision_id=UUID(int=1),
+            ticker="SPY",
+            option_underlyings=("QQQ", "SPY"),
+        )
+    )
+
+    assert budget.scope.request_ceiling == 32 * 2 * 3
+    assert len(budget.requests) == 32
+    with pytest.raises(ValueError, match="configuration is invalid"):
+        options_preparation.PostgresAutomaticOptionsPreparationExecutor(
+            V2ConnectionProvider.__new__(V2ConnectionProvider),
+            api_key="configured",
+            backend_image_id="sha256:" + "0" * 64,
+            maximum_provider_requests_per_underlying=33,
+        )
 
 
 def test_close_status_retains_current_processing_until_scheduler_deadline():
@@ -215,6 +374,7 @@ def test_compose_lifecycle_inherits_all_options_ceiling_configuration():
         "REALTIME_V3_OPTIONS_PER_UNDERLYING_CONTRACT_LIMIT",
         "REALTIME_V3_OPTIONS_ESTABLISHED_MEASURED_CAPACITY",
         "REALTIME_V3_OPTIONS_EFFECTIVE_PROVIDER_PROJECT_CEILING",
+        "REALTIME_V3_OPTIONS_MAXIMUM_PROVIDER_REQUESTS_PER_UNDERLYING",
     )
     shared_environment = compose.split(
         "x-advanced-environment: &advanced-environment",
@@ -397,6 +557,105 @@ def test_continuous_native_and_compose_own_the_same_c8_topology(
             "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH",
         ):
             assert forbidden not in block
+
+
+def _compose_service_blocks():
+    compose = (
+        Path(__file__).resolve().parents[3]
+        / "docker-compose.realtime-v2.yml"
+    ).read_text(encoding="utf-8")
+    section = compose.split("\nservices:\n", 1)[1].split("\nvolumes:\n", 1)[0]
+    names = re.findall(r"^  ([a-z0-9-]+):$", section, flags=re.MULTILINE)
+    return {
+        name: re.split(
+            r"^  [a-z0-9-]+:$",
+            section.split(f"  {name}:\n", 1)[1],
+            maxsplit=1,
+            flags=re.MULTILINE,
+        )[0]
+        for name in names
+    }
+
+
+def test_v3_profile_services_do_not_leak_through_compose_extends():
+    # Compose merges `profiles` across `extends`, so each service extending a
+    # V3-profile service must replace the list or it joins the V3 topology.
+    blocks = _compose_service_blocks()
+
+    def declares_v3(block):
+        return bool(re.search(
+            r"^    profiles: .*\b"
+            + re.escape(ADVANCED_REALTIME_V3_COMPOSE_PROFILE),
+            block,
+            flags=re.MULTILINE,
+        ))
+
+    effective = set()
+    extending = set()
+    for name, block in blocks.items():
+        if declares_v3(block):
+            effective.add(name)
+        extended = re.search(
+            r"^    extends:\n      service: (\S+)$",
+            block,
+            flags=re.MULTILINE,
+        )
+        if extended is None or not declares_v3(blocks[extended.group(1)]):
+            continue
+        extending.add(name)
+        if not re.search(r"^    profiles: !override \[", block, flags=re.MULTILINE):
+            effective.add(name)
+
+    assert extending == {
+        "realtime-v2-options-p8-ingress",
+        "realtime-v2-options-p8-market-state",
+        "realtime-v2-options-p8-flow",
+        "realtime-v2-options-p8-window",
+    }
+    assert not extending & effective
+    assert len(effective) == len(ADVANCED_REALTIME_V3_ROLES) == 19
+
+
+@pytest.mark.skipif(
+    shutil.which("docker") is None,
+    reason="the Docker CLI is required to render Compose",
+)
+def test_rendered_v3_profile_has_exactly_the_runtime_role_services():
+    root = Path(__file__).resolve().parents[3]
+    completed = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--file",
+            str(root / "docker-compose.realtime-v2.yml"),
+            "--profile",
+            ADVANCED_REALTIME_V3_COMPOSE_PROFILE,
+            "config",
+            "--services",
+        ],
+        cwd=root,
+        env={
+            **{
+                name: value
+                for name, value in os.environ.items()
+                if not name.startswith("COMPOSE_")
+            },
+            "REALTIME_V2_BACKEND_IMAGE": "sha256:" + "0" * 64,
+            "REALTIME_V2_DOCKER_SECRET_DIR": str(root),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stderr[-2000:]
+    services = set(completed.stdout.split())
+    assert len(services) == len(ADVANCED_REALTIME_V3_ROLES) == 19
+    assert not any(
+        name.startswith("realtime-v2-options-p8") for name in services
+    )
 
 
 def test_process_environments_scope_provider_and_database_secrets():

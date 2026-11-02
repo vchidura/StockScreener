@@ -20,6 +20,13 @@ PHASE_STRUCTURE = "STRUCTURE"
 PHASE_SECURITY = "SECURITY"
 _MIGRATION_PATTERN = re.compile(r"^(\d{3})_([a-z0-9_]+)\.sql$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+# Ledger rows whose migration file was withdrawn. Migration history is never rewritten:
+# each entry is an exact version and full checksum, and a later migration undoes its effect.
+RETIRED_REALTIME_MIGRATIONS: Mapping[str, str] = {
+    "045_advanced_options_detector_allocation": (
+        "17d2ef0c8ea784e7b1c16e8c5efd0a7d516a020035fe191ea08aad6020dc3856"
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +138,11 @@ def schema_fingerprint(migrations: tuple[RealtimeMigration, ...]) -> str:
     return hashlib.sha256(manifest.encode("ascii")).hexdigest()
 
 
+def is_retired_realtime_migration(version: str, checksum: str) -> bool:
+    """True only for an exact retired version and full checksum, never a version alone."""
+    return RETIRED_REALTIME_MIGRATIONS.get(version) == checksum
+
+
 def plan_realtime_migrations(
     database_name: str,
     applied: Mapping[str, str],
@@ -139,6 +151,8 @@ def plan_realtime_migrations(
     catalog = migrations or load_realtime_migrations()
     by_version = {migration.version: migration for migration in catalog}
     for version, checksum in applied.items():
+        if is_retired_realtime_migration(version, checksum):
+            continue
         migration = by_version.get(version)
         if migration is None:
             raise ValueError(f"database records unknown realtime migration: {version}")

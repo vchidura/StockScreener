@@ -673,7 +673,7 @@ def test_compose_has_exact_four_p8_services_commands_and_isolated_secrets():
             + kind.value.casefold().replace("_", "-")
         )
         normal = _service_block(text, normal_name)
-        assert f'profiles: ["{P8_COMPOSE_PROFILE}"]' in diagnostic
+        assert f'profiles: !override ["{P8_COMPOSE_PROFILE}"]' in diagnostic
         assert f"service: {normal_name}" in diagnostic
         assert "- legacy-diagnostic" in diagnostic
         assert (
@@ -682,7 +682,7 @@ def test_compose_has_exact_four_p8_services_commands_and_isolated_secrets():
         ) in diagnostic
         assert (
             "REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH"
-            ":?set REALTIME_V3_OPTIONS_DOWNSTREAM_BINDING_PATH"
+            ":-/diagnostic-only-unset"
         ) in diagnostic
         assert "- /run/advanced-options-p8/package.json" in diagnostic
         assert "- /run/advanced-options-p8/execution-bundle.json" in diagnostic

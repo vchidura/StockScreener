@@ -899,10 +899,10 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
             or acquisition_binding.authority
             != authority_bundle.session
             or acquisition_binding.contract_tickers
-            != tuple(
+            != tuple(sorted(
                 row.contract_ticker
                 for row in authority_bundle.admission.contracts
-            )
+            ))
             or selection_plan is not None
             and not isinstance(selection_plan, C6SelectionPlan)
             or selection_plan is not None
